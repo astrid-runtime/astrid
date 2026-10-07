@@ -163,6 +163,8 @@ async fn run_redeem(args: RedeemArgs) -> Result<ExitCode> {
                 .context("decode local invitation public key")
         })
         .transpose()?;
+    let expected_fingerprint =
+        astrid_crypto::PublicKeyFingerprint::from_ed25519_hex(&public_key_hex)?;
 
     // Redemption is intentionally unauthenticated kernel-side — the
     // token IS the auth. A fresh-machine redeemer typically has no
@@ -183,6 +185,7 @@ async fn run_redeem(args: RedeemArgs) -> Result<ExitCode> {
     let body = into_result(resp)?;
     match body {
         AdminResponseBody::InviteRedeemed(redeemed) => {
+            validate_redeemed_fingerprint(&expected_fingerprint, &redeemed.public_key_fingerprint)?;
             println!(
                 "{} principal: {} (group: {}, key fp: {})",
                 Theme::success("redeemed"),
@@ -218,6 +221,33 @@ async fn run_redeem(args: RedeemArgs) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         },
         other => anyhow::bail!("unexpected response shape: {other:?}"),
+    }
+}
+
+fn validate_redeemed_fingerprint(
+    expected: &astrid_crypto::PublicKeyFingerprint,
+    fingerprint: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        fingerprint == expected.as_str(),
+        "invitation response did not match the supplied public key; token may be consumed, no local credential activated"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod redemption_tests {
+    use super::*;
+
+    #[test]
+    fn invitation_response_must_match_the_submitted_key() {
+        let expected =
+            astrid_crypto::PublicKeyFingerprint::from_ed25519_hex(&"23".repeat(32)).unwrap();
+        assert!(validate_redeemed_fingerprint(&expected, expected.as_str()).is_ok());
+        let foreign =
+            astrid_crypto::PublicKeyFingerprint::from_ed25519_hex(&"24".repeat(32)).unwrap();
+        assert!(validate_redeemed_fingerprint(&expected, foreign.as_str()).is_err());
+        assert!(validate_redeemed_fingerprint(&expected, "").is_err());
     }
 }
 

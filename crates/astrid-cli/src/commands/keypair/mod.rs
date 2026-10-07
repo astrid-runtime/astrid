@@ -204,6 +204,7 @@ impl KeyPaths {
 // ── Command dispatch ─────────────────────────────────────────────
 
 pub(crate) fn run(command: KeypairCommand) -> Result<ExitCode> {
+    let _mutation = lock_key_store(&local_keys_dir()?)?;
     match command {
         KeypairCommand::Generate(args) => run_generate(args),
         KeypairCommand::List(args) => run_list(&args),
@@ -217,6 +218,11 @@ fn run_generate(args: GenerateArgs) -> Result<ExitCode> {
     let name = args.name.unwrap_or_else(default_name);
     validate_name(&name)?;
     let paths = KeyPaths::new(&name)?;
+    if args.force && paths.meta.exists() && read_meta(&paths)?.bound_principal.is_some() {
+        bail!(
+            "delete the bound keypair before replacing it; its activated credential must be retired"
+        );
+    }
     if paths.exists_any() && !args.force {
         bail!(
             "keypair {name:?} already exists at {} — pass --force to overwrite",
@@ -351,12 +357,7 @@ fn run_delete(args: &DeleteArgs) -> Result<ExitCode> {
     }
     if paths.meta.exists() {
         let meta = read_meta(&paths)?;
-        if let Some(bound) = meta.bound_principal {
-            let principal = PrincipalId::new(bound).context("invalid bound key principal")?;
-            let home = AstridHome::resolve()?;
-            let public = PublicKey::from_hex(&read_public(&paths.public_hex)?)?;
-            remove_activated_key(&home, &principal, &public)?;
-        }
+        remove_bound_key(&paths, &AstridHome::resolve()?, &meta)?;
     }
     // Best-effort remove every component — a partially-corrupt store
     // (missing pub but present priv) should still let the operator
@@ -405,6 +406,17 @@ fn record_binding_at(
     principal: &PrincipalId,
     redeemed_key: &PublicKey,
 ) -> Result<()> {
+    record_binding_with_commit(paths, home, principal, redeemed_key, write_meta)
+}
+
+fn record_binding_with_commit(
+    paths: &KeyPaths,
+    home: &AstridHome,
+    principal: &PrincipalId,
+    redeemed_key: &PublicKey,
+    commit: impl FnOnce(&Path, &KeyMeta) -> Result<()>,
+) -> Result<()> {
+    let _mutation = lock_key_store(paths.meta.parent().context("key metadata has no parent")?)?;
     let mut meta = read_meta(paths)?;
     if let Some(bound) = &meta.bound_principal
         && bound != principal.as_str()
@@ -419,10 +431,64 @@ fn record_binding_at(
         bail!("local signing key does not match the public key redeemed by the daemon");
     }
     let destination = home.keys_dir().join(format!("{principal}.key"));
-    activate_invited_key(&destination, &secret)?;
     meta.bound_principal = Some(principal.to_string());
-    write_meta(&paths.meta, &meta)?;
+    // Persist recovery ownership before publishing a usable credential. A crash
+    // or failed activation then leaves a deletable binding, never an untracked key.
+    commit(&paths.meta, &meta)?;
+    activate_invited_key(&destination, &secret)?;
     Ok(())
+}
+
+/// All cooperating CLI mutations share a stable lock inode. Never unlink it:
+/// replacement would let two processes acquire locks on different inodes.
+fn lock_key_store(directory: &Path) -> Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let lock = options.open(directory.join(".mutation.lock"))?;
+    if !lock.metadata()?.is_file() {
+        bail!("key store mutation lock is not a regular file");
+    }
+    lock.try_lock()
+        .context("key store is busy; retry after the other operation completes")?;
+    Ok(lock)
+}
+
+fn remove_bound_key(paths: &KeyPaths, home: &AstridHome, meta: &KeyMeta) -> Result<()> {
+    let Some(bound) = &meta.bound_principal else {
+        return Ok(());
+    };
+    let principal = PrincipalId::new(bound.clone()).context("invalid bound key principal")?;
+    let (secret, verify_metadata) = match fs::read(&paths.private) {
+        Ok(secret) => (zeroize::Zeroizing::new(secret), false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Partial deletion may have removed the private sidecar already.
+            // The persisted fingerprint still identifies the credential to retire.
+            let destination = home.keys_dir().join(format!("{principal}.key"));
+            match fs::symlink_metadata(&destination) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error.into()),
+                Ok(metadata) if !metadata.file_type().is_file() => {
+                    bail!("activated credential is not a regular file")
+                },
+                Ok(_) => (),
+            }
+            (zeroize::Zeroizing::new(fs::read(destination)?), true)
+        },
+        Err(error) => return Err(error).context("read key being deleted"),
+    };
+    let key = astrid_crypto::KeyPair::from_secret_key(&secret)?;
+    let public = key.export_public_key();
+    if verify_metadata
+        && PublicKeyFingerprint::from_public_key(&public).as_str() != meta.fingerprint
+    {
+        bail!("private credential does not match bound key metadata; refusing deletion");
+    }
+    remove_activated_key(home, &principal, &public)
 }
 
 /// Publish complete secret bytes without replacing another device's credential.
@@ -532,20 +598,18 @@ fn write_public(path: &Path, hex: &str) -> Result<()> {
 }
 
 fn write_meta(path: &Path, meta: &KeyMeta) -> Result<()> {
+    use std::io::Write;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let text = toml::to_string_pretty(meta).context("serialise keypair meta")?;
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-    fs::write(&tmp, text.as_bytes())?;
+    let parent = path.parent().context("key metadata has no parent")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(text.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-    }
-    fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = fs::remove_file(&tmp);
-    })?;
+    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -728,232 +792,4 @@ fn encode_openssh_ed25519(pubkey: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn invited_key_binding_activates_native_signing_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(dir.path());
-        let local = home.keys_dir().join("local");
-        fs::create_dir_all(&local).unwrap();
-        let paths = KeyPaths {
-            private: local.join("invite.ed25519"),
-            public_hex: local.join("invite.pub.hex"),
-            meta: local.join("invite.meta.toml"),
-        };
-        let signing = SigningKey::from_bytes(&[23; 32]);
-        write_secret(&paths.private, &signing.to_bytes()).unwrap();
-        let public = hex::encode(signing.verifying_key().to_bytes());
-        write_public(&paths.public_hex, &public).unwrap();
-        write_meta(
-            &paths.meta,
-            &KeyMeta {
-                schema_version: META_SCHEMA_VERSION,
-                fingerprint: fingerprint_pubkey(&public).unwrap(),
-                created_at_epoch: 0,
-                backend: "file".to_owned(),
-                note: None,
-                bound_principal: None,
-            },
-        )
-        .unwrap();
-        let principal = PrincipalId::new("invited-client").unwrap();
-        let redeemed = PublicKey::from_hex(&public).unwrap();
-        let foreign = astrid_crypto::KeyPair::generate().export_public_key();
-        assert!(record_binding_at(&paths, &home, &principal, &foreign).is_err());
-        assert!(!home.keys_dir().join("invited-client.key").exists());
-        record_binding_at(&paths, &home, &principal, &redeemed).unwrap();
-        let activated = fs::read(home.keys_dir().join("invited-client.key")).unwrap();
-        assert_eq!(activated, signing.to_bytes());
-        record_binding_at(&paths, &home, &principal, &redeemed).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                fs::metadata(home.keys_dir().join("invited-client.key"))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
-        }
-        let other = PrincipalId::new("different-client").unwrap();
-        assert!(record_binding_at(&paths, &home, &other, &redeemed).is_err());
-        assert!(!home.keys_dir().join("different-client.key").exists());
-        assert!(remove_activated_key(&home, &principal, &foreign).is_err());
-        assert!(home.keys_dir().join("invited-client.key").exists());
-        remove_activated_key(&home, &principal, &redeemed).unwrap();
-        assert!(!home.keys_dir().join("invited-client.key").exists());
-    }
-
-    #[test]
-    fn invited_key_activation_never_replaces_existing_credential() {
-        let dir = tempfile::tempdir().unwrap();
-        let destination = dir.path().join("principal.key");
-        fs::write(&destination, [11; 32]).unwrap();
-        assert!(activate_invited_key(&destination, &[12; 32]).is_err());
-        assert_eq!(fs::read(&destination).unwrap(), [11; 32]);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn invited_key_activation_refuses_symlink() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("target.key");
-        let destination = dir.path().join("principal.key");
-        fs::write(&target, [11; 32]).unwrap();
-        std::os::unix::fs::symlink(&target, &destination).unwrap();
-        assert!(activate_invited_key(&destination, &[11; 32]).is_err());
-        assert_eq!(fs::read(target).unwrap(), [11; 32]);
-    }
-
-    #[test]
-    fn wire_format_is_ed25519_base64_and_parser_roundtrips() {
-        // The `wire` output must be exactly what the distro signing
-        // verifier parses back — same 32 bytes, STANDARD base64,
-        // `ed25519:` prefix.
-        let hex = "0".repeat(64);
-        let wire = pubkey_hex_to_wire(&hex).unwrap();
-        assert!(wire.starts_with("ed25519:"));
-        let b64 = wire.strip_prefix("ed25519:").unwrap();
-        assert_eq!(
-            astrid_crypto::PublicKey::from_base64(b64).unwrap(),
-            astrid_crypto::PublicKey::from_hex(&hex).unwrap(),
-        );
-    }
-
-    #[test]
-    fn validate_name_accepts_well_formed() {
-        validate_name("laptop").unwrap();
-        validate_name("a").unwrap();
-        validate_name("key-2026-05").unwrap();
-        validate_name(&"a".repeat(MAX_NAME_LEN)).unwrap();
-    }
-
-    #[test]
-    fn validate_name_rejects_bad_input() {
-        assert!(validate_name("").is_err());
-        assert!(validate_name("UPPER").is_err());
-        assert!(validate_name("has space").is_err());
-        assert!(validate_name("../etc/passwd").is_err());
-        assert!(validate_name(&"a".repeat(MAX_NAME_LEN + 1)).is_err());
-    }
-
-    #[test]
-    fn fingerprint_is_stable_and_distinct() {
-        let a = fingerprint_pubkey(&"a".repeat(64)).unwrap();
-        let b = fingerprint_pubkey(&"a".repeat(64)).unwrap();
-        let c = fingerprint_pubkey(&"b".repeat(64)).unwrap();
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-        assert_eq!(a.len(), 71);
-    }
-
-    #[test]
-    fn legacy_key_metadata_self_heals_from_the_public_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths {
-            private: dir.path().join("laptop.ed25519"),
-            public_hex: dir.path().join("laptop.pub.hex"),
-            meta: dir.path().join("laptop.meta.toml"),
-        };
-        let public_hex = "ab".repeat(32);
-        write_public(&paths.public_hex, &public_hex).unwrap();
-        write_meta(
-            &paths.meta,
-            &KeyMeta {
-                schema_version: 1,
-                fingerprint: "a4182c80cf8467d91a58382943715d4062d3c6f4464c8b346a3f7b1b11164c7a"
-                    .into(),
-                created_at_epoch: 1,
-                backend: "file".into(),
-                note: Some("offline release key".into()),
-                bound_principal: Some("operator".into()),
-            },
-        )
-        .unwrap();
-
-        let migrated = read_meta(&paths).unwrap();
-        assert_eq!(migrated.schema_version, META_SCHEMA_VERSION);
-        assert_eq!(migrated.note.as_deref(), Some("offline release key"));
-        assert_eq!(migrated.bound_principal.as_deref(), Some("operator"));
-        assert_eq!(
-            migrated.fingerprint,
-            fingerprint_pubkey(&public_hex).unwrap()
-        );
-        let persisted = fs::read_to_string(&paths.meta).unwrap();
-        assert!(persisted.contains("schema_version = 2"));
-        assert!(!persisted.contains("a4182c80cf8467d"));
-    }
-
-    #[test]
-    fn legacy_metadata_without_public_key_remains_readable_and_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths {
-            private: dir.path().join("laptop.ed25519"),
-            public_hex: dir.path().join("laptop.pub.hex"),
-            meta: dir.path().join("laptop.meta.toml"),
-        };
-        write_meta(
-            &paths.meta,
-            &KeyMeta {
-                schema_version: 1,
-                fingerprint: "a4182c80cf8467d91a58382943715d4062d3c6f4464c8b346a3f7b1b11164c7a"
-                    .into(),
-                created_at_epoch: 1,
-                backend: "file".into(),
-                note: Some("preserve me".into()),
-                bound_principal: Some("operator".into()),
-            },
-        )
-        .unwrap();
-        let before = fs::read(&paths.meta).unwrap();
-
-        let deferred = read_meta(&paths).unwrap();
-        assert_eq!(deferred.schema_version, 1);
-        assert_eq!(deferred.note.as_deref(), Some("preserve me"));
-        assert_eq!(fs::read(&paths.meta).unwrap(), before);
-    }
-
-    #[test]
-    fn legacy_metadata_with_malformed_public_key_remains_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = KeyPaths {
-            private: dir.path().join("laptop.ed25519"),
-            public_hex: dir.path().join("laptop.pub.hex"),
-            meta: dir.path().join("laptop.meta.toml"),
-        };
-        write_public(&paths.public_hex, "not-a-public-key").unwrap();
-        write_meta(
-            &paths.meta,
-            &KeyMeta {
-                schema_version: 1,
-                fingerprint: "a4182c80cf8467d91a58382943715d4062d3c6f4464c8b346a3f7b1b11164c7a"
-                    .into(),
-                created_at_epoch: 1,
-                backend: "file".into(),
-                note: None,
-                bound_principal: None,
-            },
-        )
-        .unwrap();
-        let before = fs::read(&paths.meta).unwrap();
-
-        let deferred = read_meta(&paths).unwrap();
-        assert_eq!(deferred.schema_version, 1);
-        assert_eq!(fs::read(&paths.meta).unwrap(), before);
-    }
-
-    #[test]
-    fn openssh_encoding_round_trips_against_a_known_vector() {
-        // ed25519 zero pubkey → "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-        let pubkey = [0u8; 32];
-        let encoded = encode_openssh_ed25519(&pubkey);
-        assert!(encoded.starts_with("ssh-ed25519 "));
-        // Length: SSH-wire = 4 + 11 + 4 + 32 = 51 bytes → base64 = ceil(51/3)*4 = 68 chars
-        let body = encoded.trim_start_matches("ssh-ed25519 ");
-        assert_eq!(body.len(), 68);
-    }
-}
+mod tests;
