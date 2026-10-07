@@ -83,6 +83,12 @@ const REVOCATION_PRINCIPAL_PREFIX: &str = "principal/";
 const HOST_SECRET_RECEIPT_NAME: &str = "system-host-secrets-v1.receipt";
 const CAPSULE_AUTHORITY_RECEIPT_NAME: &str = "capsule-authority-v1.receipt";
 
+// These errors cross into the boot API's io::Error. Preserve every anyhow
+// context frame here so the operator sees the cause, not only the capsule.
+fn capsule_migration_error(stage: &str, error: &anyhow::Error) -> io::Error {
+    io::Error::other(format!("{stage}: {error:#}"))
+}
+
 /// Layout state captured before `AstridHome::ensure` can create a v2
 /// sentinel.  A bool cannot distinguish a brand-new home from a cut-over
 /// home that lost its completion ledger.
@@ -391,14 +397,13 @@ async fn migrate_legacy_layout(
     let workspace_targets = workspace_portal_targets(workspace_root, workspace_layout)?;
     let capsule_report =
         migrate_all_native_capsules_with_report(&store_arc, home, directory, &workspace_targets)
-            .map_err(|error| {
-                io::Error::other(format!("legacy capsule migration failed: {error}"))
-            })?;
+            .map_err(|error| capsule_migration_error("legacy capsule migration failed", &error))?;
     retire_unmatched_legacy_authority_receipts(&store_arc, home, directory, &workspace_targets)
         .map_err(|error| {
-            io::Error::other(format!(
-                "legacy leftover capsule authority retirement failed: {error}"
-            ))
+            capsule_migration_error(
+                "legacy leftover capsule authority retirement failed",
+                &error,
+            )
         })?;
     for (alias, uid) in &bindings {
         let owner = astrid_storage::StateOwner::Principal(*uid);
@@ -535,7 +540,7 @@ fn ensure_no_unretired_authority_receipts(
 ) -> io::Result<()> {
     let workspace_targets = workspace_portal_targets(workspace_root, workspace_layout)?;
     let status = legacy_capsule_authority_status(home, &workspace_targets).map_err(|error| {
-        io::Error::other(format!("legacy capsule authority status failed: {error}"))
+        capsule_migration_error("legacy capsule authority status failed", &error)
     })?;
     if let Some(path) = status
         .pending
