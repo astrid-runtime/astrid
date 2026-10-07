@@ -235,22 +235,6 @@ fn validate_redeemed_fingerprint(
     Ok(())
 }
 
-#[cfg(test)]
-mod redemption_tests {
-    use super::*;
-
-    #[test]
-    fn invitation_response_must_match_the_submitted_key() {
-        let expected =
-            astrid_crypto::PublicKeyFingerprint::from_ed25519_hex(&"23".repeat(32)).unwrap();
-        assert!(validate_redeemed_fingerprint(&expected, expected.as_str()).is_ok());
-        let foreign =
-            astrid_crypto::PublicKeyFingerprint::from_ed25519_hex(&"24".repeat(32)).unwrap();
-        assert!(validate_redeemed_fingerprint(&expected, foreign.as_str()).is_err());
-        assert!(validate_redeemed_fingerprint(&expected, "").is_err());
-    }
-}
-
 async fn run_list(args: ListArgs) -> Result<ExitCode> {
     let mut client = connect_as_active_agent().await?;
     let resp = client
@@ -302,5 +286,21 @@ async fn run_revoke(args: RevokeArgs) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         },
         other => anyhow::bail!("unexpected response shape: {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod redemption_tests {
+    use super::*;
+
+    #[test]
+    fn invitation_response_must_match_the_submitted_key() {
+        let expected =
+            astrid_crypto::PublicKeyFingerprint::from_ed25519_hex(&"23".repeat(32)).unwrap();
+        assert!(validate_redeemed_fingerprint(&expected, expected.as_str()).is_ok());
+        let foreign =
+            astrid_crypto::PublicKeyFingerprint::from_ed25519_hex(&"24".repeat(32)).unwrap();
+        assert!(validate_redeemed_fingerprint(&expected, foreign.as_str()).is_err());
+        assert!(validate_redeemed_fingerprint(&expected, "").is_err());
     }
 }
