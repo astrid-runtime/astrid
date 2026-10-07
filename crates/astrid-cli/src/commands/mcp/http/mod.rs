@@ -43,7 +43,8 @@ pub(crate) async fn run(
     token_file: Option<&Path>,
     workspace: Option<&Path>,
 ) -> Result<ExitCode> {
-    let root = std::env::current_dir().context("read MCP runtime directory")?;
+    let cwd = std::env::current_dir().context("read MCP project directory")?;
+    let root = crate::daemon_workspace::selected(Some(&cwd))?;
     let config =
         astrid_config::Config::load_with_layout(Some(&root), crate::workspace_layout::current())?
             .config;
@@ -57,7 +58,7 @@ pub(crate) async fn run(
     );
     let mode = prepare_auth(token_file, settings, principal.clone()).await?;
     let workspace = workspace
-        .unwrap_or(&root)
+        .unwrap_or(&cwd)
         .canonicalize()
         .context("resolve MCP workspace")?;
     // Bind after credentials/JWKS are validated and before starting any runtime process.

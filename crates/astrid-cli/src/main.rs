@@ -34,6 +34,7 @@ mod bootstrap;
 mod cli;
 mod commands;
 mod context;
+mod daemon_workspace;
 mod dispatch;
 mod formatter;
 mod principal;
@@ -67,6 +68,10 @@ async fn main() -> ExitCode {
         },
     };
     let hook_invocation = matches!(&parsed.command, Some(cli::Commands::Hook(_)));
+    if daemon_workspace::initialize(parsed.daemon_workspace.clone()).is_err() {
+        eprintln!("error: daemon workspace was already initialized");
+        return ExitCode::from(1);
+    }
     if !hook_invocation {
         if workspace_layout::initialize(parsed.workspace_state_dir.clone()).is_err() {
             eprintln!("error: workspace layout was already initialized");

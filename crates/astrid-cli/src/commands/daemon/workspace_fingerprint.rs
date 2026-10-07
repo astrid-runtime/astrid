@@ -1,6 +1,6 @@
 //! Workspace identity checks for an already-running daemon.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use astrid_core::dirs::{
@@ -45,10 +45,7 @@ pub(crate) fn layouts_for_workspace_root(
 pub(crate) fn expected_workspace_fingerprints(
     workspace_root: Option<&Path>,
 ) -> Result<Vec<String>> {
-    let root = workspace_root.map_or_else(
-        || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        Path::to_path_buf,
-    );
+    let root = crate::daemon_workspace::selected(workspace_root)?;
     let resolved_home = AstridHome::resolve().context("failed to resolve Astrid home")?;
     let mut fingerprints = Vec::new();
     for layout in layouts_for_workspace_root(&root, &resolved_home) {

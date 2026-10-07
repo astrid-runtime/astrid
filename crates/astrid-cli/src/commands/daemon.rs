@@ -93,10 +93,7 @@ async fn spawn_daemon_inner(
     if announce {
         println!("{}", theme::Theme::info("Booting Astrid daemon..."));
     }
-    let ws = workspace_root.map_or_else(
-        || std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-        Path::to_path_buf,
-    );
+    let ws = crate::daemon_workspace::selected(workspace_root)?;
     let daemon_bin = find_companion_binary("astrid-daemon")?;
     let mut cmd = ephemeral_daemon_command(&daemon_bin, &ws);
 
@@ -122,7 +119,7 @@ async fn spawn_daemon_inner(
     // The readiness file is written only after load_all_capsules()
     // completes (including await_capsule_readiness()), so the accept
     // loop is guaranteed to be running by the time we connect.
-    let timeout_secs = configured_spawn_timeout_secs(workspace_root);
+    let timeout_secs = configured_spawn_timeout_secs(Some(&ws));
     match wait_for_ready(ready_path, &mut child, timeout_secs).await {
         ReadyWaitOutcome::Ready => Ok(child),
         ReadyWaitOutcome::ChildExited(status) => {
@@ -187,8 +184,10 @@ async fn ensure_daemon_inner(
     spawn_mode: DaemonSpawnMode,
     workspace_root: Option<&Path>,
 ) -> Result<()> {
+    let workspace_root = crate::daemon_workspace::selected(workspace_root)?;
     let start_fence = acquire_daemon_start_fence().await?;
-    let result = ensure_daemon_inner_locked(label, announce, spawn_mode, workspace_root).await;
+    let result =
+        ensure_daemon_inner_locked(label, announce, spawn_mode, Some(&workspace_root)).await;
     drop(start_fence);
     result
 }
@@ -236,9 +235,9 @@ async fn ensure_daemon_inner_locked(
     if needs_boot {
         match spawn_mode {
             DaemonSpawnMode::Ephemeral => {
-                spawn_daemon_inner(&ready_path, announce, None).await?;
+                spawn_daemon_inner(&ready_path, announce, workspace_root).await?;
             },
-            DaemonSpawnMode::Persistent => spawn_persistent_daemon().await?,
+            DaemonSpawnMode::Persistent => spawn_persistent_daemon_inner(workspace_root).await?,
         }
         ensure_daemon_workspace_matches(workspace_root).await?;
     }
@@ -275,12 +274,16 @@ pub(crate) async fn ensure_daemon_workspace_matches(workspace_root: Option<&Path
 
 /// Spawn a persistent (non-ephemeral) daemon and wait for readiness.
 pub(crate) async fn spawn_persistent_daemon() -> Result<()> {
+    spawn_persistent_daemon_inner(None).await
+}
+
+async fn spawn_persistent_daemon_inner(workspace_root: Option<&Path>) -> Result<()> {
     let ready_path = socket_client::readiness_path();
     println!(
         "{}",
         theme::Theme::info("Starting Astrid daemon (persistent mode)...")
     );
-    let ws = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let ws = crate::daemon_workspace::selected(workspace_root)?;
     let daemon_bin = find_companion_binary("astrid-daemon")?;
 
     let mut cmd = std::process::Command::new(daemon_bin);
@@ -290,9 +293,7 @@ pub(crate) async fn spawn_persistent_daemon() -> Result<()> {
         crate::workspace_layout::current().state_dir_name(),
     );
 
-    if let Some(ws_path) = ws.to_str() {
-        cmd.arg("--workspace").arg(ws_path);
-    }
+    cmd.arg("--workspace").arg(&ws);
 
     // Capture the daemon's stderr to an append log so a boot failure (lock
     // contention, panic before tracing init) leaves a record instead of

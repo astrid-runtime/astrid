@@ -776,6 +776,8 @@ fn spawn_gateway(principal: &PrincipalId) -> Result<()> {
         // The gateway is shared: cancelling its first host's process group
         // must not disconnect other hosts. Idle retirement remains in run().
         .process_group(0)
+        .arg("--daemon-workspace")
+        .arg(crate::daemon_workspace::selected(None)?)
         .arg("--principal")
         .arg(principal.to_string())
         .arg("mcp")
