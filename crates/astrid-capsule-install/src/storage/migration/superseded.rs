@@ -49,6 +49,7 @@ pub(super) fn preserve_native_package(
     }
     // Persist the root's own directory entry before the helper moves source
     // into the recovery directory. Neither new directory may vanish on crash.
+    #[cfg(unix)]
     sync_recovery_root(&home.migrations_dir())?;
     let destination = recovery.join("source");
     astrid_core::dirs::preserve_legacy_source_tree(target, &destination)
@@ -66,16 +67,9 @@ pub(super) fn preserve_native_package(
     Ok(())
 }
 
+#[cfg(unix)]
 fn sync_recovery_root(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        fs::File::open(path)?.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
-    }
+    fs::File::open(path)?.sync_all()
 }
 
 #[cfg(test)]
