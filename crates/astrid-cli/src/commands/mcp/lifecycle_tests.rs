@@ -4,6 +4,29 @@ use tokio::net::UnixStream;
 use super::*;
 
 #[test]
+fn gateway_child_preserves_selected_workspace_layout() {
+    let layout = astrid_core::dirs::WorkspaceLayout::new(".custom").expect("valid layout");
+    let principal = PrincipalId::new("default").expect("valid principal");
+    let command = gateway_command(
+        Path::new("/qa/astrid"),
+        &principal,
+        Path::new("/qa/runtime"),
+        &layout,
+    );
+    assert_eq!(
+        command
+            .get_envs()
+            .find(|(key, _)| *key == "ASTRID_WORKSPACE_STATE_DIR")
+            .and_then(|(_, value)| value),
+        Some(std::ffi::OsStr::new(".custom")),
+        "gateway child must not reparse the default or an inherited layout"
+    );
+    let args: Vec<_> = command.get_args().collect();
+    assert_eq!(args[0], "--daemon-workspace");
+    assert_eq!(args[1], "/qa/runtime");
+}
+
+#[test]
 fn gateway_lifecycle_admits_only_one_generation() {
     let first = try_acquire_gateway_lifecycle()
         .expect("lifecycle probe")
