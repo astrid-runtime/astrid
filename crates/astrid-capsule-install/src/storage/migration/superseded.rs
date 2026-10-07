@@ -35,8 +35,12 @@ pub(super) fn preserve_native_package(
     let receipt = read_installed_authority_bytes(home, target)?;
     let root = home.migrations_dir().join("superseded-native-capsules");
     astrid_core::platform_fs::ensure_private_directory(&root)?;
+    // A valid legacy ID may already approach the filesystem component limit.
+    // Bound the recovery name without truncating either identity; the retained
+    // manifest/receipt still contain the original capsule ID.
+    let id_digest = blake3::hash(id.as_str().as_bytes()).to_hex();
     let recovery = tempfile::Builder::new()
-        .prefix(&format!("{uid}-{id}-"))
+        .prefix(&format!("{uid}-{id_digest}-"))
         .tempdir_in(&root)
         .context("create private obsolete capsule recovery directory")?
         .keep();
@@ -75,4 +79,31 @@ fn sync_recovery_root(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 thread_local! {
     pub(super) static FAIL_AFTER_PRESERVATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preservation_accepts_a_long_valid_capsule_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(temp.path().join("home"));
+        home.ensure().unwrap();
+        let id = CapsuleId::new("a".repeat(200)).unwrap();
+        let target = home
+            .principal_home(&astrid_core::PrincipalId::default())
+            .capsules_dir()
+            .join(id.as_str());
+        astrid_core::platform_fs::ensure_private_directory(&target).unwrap();
+        fs::write(target.join("local-note.txt"), b"retained legacy bytes").unwrap();
+        preserve_native_package(&home, &target, PrincipalUid::from_bytes([0x31; 32]), &id).unwrap();
+        assert!(!target.exists());
+        let root = home.migrations_dir().join("superseded-native-capsules");
+        let recovery = fs::read_dir(root).unwrap().next().unwrap().unwrap().path();
+        assert_eq!(
+            fs::read(recovery.join("source/local-note.txt")).unwrap(),
+            b"retained legacy bytes"
+        );
+    }
 }

@@ -587,6 +587,14 @@ pub fn retire_legacy_source_tree(path: &Path) -> io::Result<()> {
 /// destination. A synchronization error leaves the preserved tree available at
 /// the destination; callers must not delete it during error recovery.
 pub fn preserve_legacy_source_tree(path: &Path, destination: &Path) -> io::Result<()> {
+    preserve_legacy_source_tree_with_sync(path, destination, retirement::sync_directory)
+}
+
+fn preserve_legacy_source_tree_with_sync(
+    path: &Path,
+    destination: &Path,
+    mut sync: impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     validate_legacy_retirement_candidate(path)?;
     crate::platform_fs::verify_no_redirects(path)?;
     let source_parent = path
@@ -609,11 +617,13 @@ pub fn preserve_legacy_source_tree(path: &Path, destination: &Path) -> io::Resul
     // Persist the recovery directory's own name before removing the source
     // name. Otherwise a crash could lose a newly created recovery parent.
     if let Some(parent) = destination_parent.parent() {
-        retirement::sync_directory(parent)?;
+        sync(parent)?;
     }
     crate::platform_fs::rename_with_write_through(path, destination)?;
-    retirement::sync_directory(source_parent)?;
-    retirement::sync_directory(destination_parent)
+    // Make the preserved entry durable before committing removal of its old
+    // name. A source-parent sync failure must not skip recovery durability.
+    sync(destination_parent)?;
+    sync(source_parent)
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
@@ -677,6 +687,38 @@ mod tests {
         assert!(!source.exists());
         assert_eq!(
             std::fs::read(absent.join("data")).unwrap(),
+            b"retained state"
+        );
+    }
+
+    #[test]
+    fn preservation_syncs_recovery_before_a_source_parent_sync_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_parent = temp.path().join("native");
+        let source = source_parent.join("capsule");
+        let recovery = temp.path().join("recovery");
+        let destination = recovery.join("saved");
+        crate::platform_fs::ensure_private_directory(&source).unwrap();
+        crate::platform_fs::ensure_private_directory(&recovery).unwrap();
+        std::fs::write(source.join("data"), b"retained state").unwrap();
+        let mut synced = Vec::new();
+        let error = preserve_legacy_source_tree_with_sync(&source, &destination, |path| {
+            if path == source_parent {
+                return Err(io::Error::other("injected source sync failure"));
+            }
+            retirement::sync_directory(path)?;
+            synced.push(path.to_path_buf());
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("injected source sync failure"));
+        assert!(
+            synced.contains(&recovery),
+            "recovery entry must already be synchronized"
+        );
+        assert!(!source.exists());
+        assert_eq!(
+            std::fs::read(destination.join("data")).unwrap(),
             b"retained state"
         );
     }
