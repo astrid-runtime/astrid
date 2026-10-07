@@ -72,6 +72,7 @@ pub(super) async fn import_env_and_secrets(
             .map(|summary| CapsuleId::new(summary.id()).map_err(storage_io))
             .collect::<io::Result<Vec<_>>>()?;
         include_legacy_scopes(&mut capsules, *uid, snapshots)?;
+        let retained = super::env_inventory::record(home, *uid, &capsules, snapshots)?;
         for capsule in &capsules {
             let env = env_root.join(format!("{capsule}.env.json"));
             let secret = secret_root.join(capsule.as_str());
@@ -87,6 +88,21 @@ pub(super) async fn import_env_and_secrets(
             )?;
             let env_arg = path_exists(&env)?.then_some(env);
             let secret_arg = path_exists(&secret)?.then_some(secret);
+            if env_arg.is_none() && secret_arg.is_none() && retained.contains(capsule) {
+                let scope =
+                    astrid_storage::env::principal_env_store(store.kv(), *uid, capsule.as_str())
+                        .map_err(storage_io)?;
+                if scope
+                    .get(astrid_storage::env::LEGACY_IMPORT_MARKER_KEY)
+                    .await
+                    .map_err(storage_io)?
+                    .is_none()
+                {
+                    return Err(io::Error::other(format!(
+                        "retired legacy scope has no completion receipt: {alias}/{capsule}"
+                    )));
+                }
+            }
             astrid_storage::env::import_legacy_scope(
                 store.kv(),
                 *uid,
@@ -360,6 +376,77 @@ mod tests {
         .expect("complete destination proofs");
         assert!(!proofs[&format!("principal:{uid}:env:{capsule}")].is_absent());
         assert!(!proofs[&format!("principal:{uid}:secret:{capsule}")].is_absent());
+        assert_scope_retry(&home, &store, uid, capsule, &proofs).await;
+    }
+
+    async fn assert_scope_retry(
+        home: &super::AstridHome,
+        store: &super::RuntimePrincipalStore,
+        uid: super::PrincipalUid,
+        capsule: &str,
+        proofs: &BTreeMap<String, crate::legacy_migration_barrier::DestinationProof>,
+    ) {
+        let alias = super::PrincipalId::default();
+        let scope = astrid_storage::env::principal_env_store(store.kv(), uid, capsule)
+            .expect("principal scope");
+        // A later barrier stage fails after both native sources are retired.
+        // Retry must rebuild discovery from durable state, not the old map.
+        crate::legacy_migration_barrier::inject_tmp_retirement_interruption_once(home);
+        let error =
+            crate::legacy_migration_barrier::interrupt_after_tmp_retirement_if_requested(home)
+                .expect_err("later barrier interruption");
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        let retry = crate::legacy_migration_barrier::preflight_sources(
+            home,
+            store,
+            &[(alias.clone(), uid)],
+        )
+        .expect("retry inventory from retired sources");
+        assert!(retry.contains_key(&format!("principal:{uid}:env:{capsule}")));
+        assert!(retry.contains_key(&format!("principal:{uid}:secret:{capsule}")));
+        super::import_env_and_secrets(
+            home,
+            store,
+            &[(alias, uid)],
+            &retry,
+            &super::SourceIdentity::absent(),
+        )
+        .await
+        .expect("resume completed scope");
+        let retry_proofs = crate::legacy_migration_barrier::ledger::collect_destination_proofs(
+            home,
+            store,
+            &store.principal_directory(),
+            &retry,
+            true,
+        )
+        .await
+        .expect("retry includes orphan receipts");
+        for kind in ["env", "secret"] {
+            let name = format!("principal:{uid}:{kind}:{capsule}");
+            assert_eq!(retry_proofs[&name], proofs[&name]);
+        }
+        scope
+            .delete(astrid_storage::env::LEGACY_IMPORT_MARKER_KEY)
+            .await
+            .expect("remove completion receipt negative fixture");
+        let error = super::import_env_and_secrets(
+            home,
+            store,
+            &[(super::PrincipalId::default(), uid)],
+            &retry,
+            &super::SourceIdentity::absent(),
+        )
+        .await
+        .expect_err("inventory must not replace a missing receipt");
+        assert!(error.to_string().contains("no completion receipt"));
+        assert!(
+            scope
+                .get(astrid_storage::env::LEGACY_IMPORT_MARKER_KEY)
+                .await
+                .expect("missing receipt remains missing")
+                .is_none()
+        );
     }
 
     #[tokio::test]

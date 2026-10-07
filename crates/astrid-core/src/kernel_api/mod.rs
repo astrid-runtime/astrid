@@ -641,7 +641,8 @@ pub enum AdminRequestKind {
         /// Principal whose agent-scoped entries are listed.
         principal: PrincipalId,
         /// Optional capsule filter. Omitted means all currently loaded
-        /// capsules; arbitrary namespace strings are never accepted.
+        /// capsules plus the principal-local legacy default scope;
+        /// arbitrary namespace strings are never accepted.
         #[serde(default)]
         capsule: Option<String>,
     },

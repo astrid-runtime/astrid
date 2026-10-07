@@ -39,7 +39,13 @@ pub(super) fn add_principal_scope_sources(
     uid: PrincipalUid,
     capsule_ids: &[String],
 ) -> io::Result<()> {
-    for capsule in native_env_secret_scope_ids(home, alias, capsule_ids)? {
+    let mut capsule_ids = capsule_ids.to_vec();
+    capsule_ids.extend(
+        super::env_inventory::read(home, uid)?
+            .into_iter()
+            .map(|id| id.to_string()),
+    );
+    for capsule in native_env_secret_scope_ids(home, alias, &capsule_ids)? {
         add_source(
             sources,
             format!("principal:{uid}:env:{capsule}"),
