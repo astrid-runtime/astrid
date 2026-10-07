@@ -343,7 +343,8 @@ pub(super) async fn env_list(
     principal: PrincipalId,
     capsule_filter: Option<String>,
 ) -> AdminResponseBody {
-    let capsules = if let Some(capsule) = capsule_filter {
+    let list_all = capsule_filter.is_none();
+    let mut capsules = if let Some(capsule) = capsule_filter {
         if let Err(error) = astrid_capsule::capsule::CapsuleId::new(capsule.clone()) {
             return AdminResponseBody::Error(format!("invalid capsule id: {error}"));
         }
@@ -358,6 +359,12 @@ pub(super) async fn env_list(
             .map(ToString::to_string)
             .collect()
     };
+    // Released no-capsule CLI writes used the principal-local `default`
+    // scope. Migration retains it even without an installed default capsule;
+    // listing keys must not make those retained values disappear from the UI.
+    if list_all && !capsules.iter().any(|capsule| capsule == "default") {
+        capsules.push("default".to_owned());
+    }
     let mut entries = Vec::<EnvEntry>::new();
     for capsule in capsules {
         for scope in [EnvStorageScope::Agent, EnvStorageScope::Shared] {
