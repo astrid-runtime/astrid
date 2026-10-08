@@ -8,6 +8,32 @@ use std::os::unix::fs::PermissionsExt;
 
 use super::*;
 
+#[test]
+fn capsule_migration_boot_error_retains_every_context_frame() {
+    for stage in [
+        "legacy capsule migration failed",
+        "legacy leftover capsule authority retirement failed",
+        "legacy capsule authority status failed",
+    ] {
+        let error = anyhow::anyhow!(
+            "installed capsule identity/version differs from its authority receipt (approved example 0.1.0, found example 0.2.0)"
+        )
+        .context("verify legacy capsule authority example")
+        .context("import principal default");
+        let message = capsule_migration_error(stage, &error).to_string();
+        assert!(message.starts_with(stage), "{message}");
+        assert!(message.contains("import principal default"), "{message}");
+        assert!(
+            message.contains("verify legacy capsule authority example"),
+            "{message}"
+        );
+        assert!(
+            message.contains("approved example 0.1.0, found example 0.2.0"),
+            "{message}"
+        );
+    }
+}
+
 fn test_home() -> (tempfile::TempDir, AstridHome) {
     let root = tempfile::tempdir().expect("temporary home");
     make_private_dir(root.path());
