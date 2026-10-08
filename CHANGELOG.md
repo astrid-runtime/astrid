@@ -8,7 +8,7 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ## [Unreleased]
 
-## [2026.10.0] - 2026-10-05
+## [2026.10.0] - 2026-10-08
 
 ### Added
 
@@ -115,6 +115,33 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 - Refresh linked-worktree build-provenance metrics when the selected commit
   changes, including packed refs. Improve runtime shutdown failure diagnostics
   and keep Windows named-pipe test helpers warning-free.
+
+- Preserve legacy principal-local environment and secret scopes during volume
+  migration even when their capsule is absent or shared from another principal,
+  including the old no-capsule default scope. Keep its keys visible in environment
+  listings without making those values a global fallback.
+  Keep retired scope receipts discoverable when a later migration stage is
+  interrupted, and refuse retry if a required completion receipt is missing.
+
+- Preserve recognized direct representation catalogues when migrating historical principal stores, including the pre-fleet-owner format, instead of refusing upgrades after their format specification advances.
+
+- Preserve the complete capsule migration error context in boot diagnostics, including the underlying cause of authority and retirement failures.
+
+- Allow regular Finder `.DS_Store` metadata in legacy SurrealKV directories during layout migration and interrupted retirement, while preserving receipt hashing and rejecting redirected, special, or unexpected entries.
+
+- Preserve resolved capsule references when migrating legacy distro locks written with `resolved_ref`. New TOML locks consistently use `resolved-ref`; historical spelling remains readable without accepting unknown or duplicate fields. Preserve the released v1 signature bytes independently of TOML presentation changes so existing signed shuttles remain verifiable.
+
+- Preserve obsolete native capsule directories and stale receipts during migration when a verified durable package already exists, without rejecting the upgrade, downgrading the package, or silently reapproving native content. Bound recovery names for long legacy identifiers and synchronize preserved directory entries before the source removal.
+
+- Stop the verified running macOS filesystem app before replacing its bundle, avoiding activation failures from an old process executing a removed backup. Refuse disruptive replacement while Astrid filesystems are mounted or the app identity cannot be verified.
+
+- Preserve oversized historical principal logs during layout migration without the former 64 MiB importer or 1 GiB log-preflight byte ceilings. File contents remain streamed and verified, with private-path checks, conflict detection, receipts and retry behavior retained.
+
+- Keep an explicitly selected daemon workspace consistent across CLI startup, warm attachment and MCP gateway children without changing relative file arguments or client project context.
+
+- Local invitation redemption with a named keypair now validates the returned fingerprint and activates the redeemed principal's native signing credential, so switching to it authenticates instead of connecting anonymously. Key-store mutations are serialized, and recovery binding is persisted before credential publication. Existing credentials are never replaced, and deleting the named key removes its matching activated credential even when its public sidecar is missing or stale.
+
+- Require global environment-write authority in addition to capsule-install authority before an installation can overwrite or delete shared capsule secrets. Reject unauthorized requests before staging principal configuration.
 
 ### Security
 
