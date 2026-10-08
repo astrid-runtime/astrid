@@ -21,6 +21,8 @@ use crate::meta::CapsuleMeta;
 
 use super::{canonical_legacy_archive, read_dir_sorted, read_verified_durable_package_for_owner};
 
+mod superseded;
+
 /// One exact legacy authority receipt retired after its durable package was
 /// read back and verified.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -128,6 +130,24 @@ pub fn migrate_native_capsules_with_report(
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow::anyhow!("legacy capsule entry has a non-UTF-8 name"))?;
+        let capsule_id = astrid_capsule::capsule::CapsuleId::new(id)?;
+        // A completed storage-backed install owns this UID's package already.
+        // A legacy cache/receipt cannot downgrade or re-authorize that package.
+        // Verify its immutable snapshot, then preserve the obsolete native tree
+        // rather than interpreting it as a second authoritative install.
+        if let Some(package) = read_verified_durable_package_for_owner(store, &owner, id)? {
+            superseded::preserve_native_package(home, &target, uid, &capsule_id)?;
+            report
+                .retired_authorities
+                .push(LegacyCapsuleAuthorityReceipt {
+                    uid,
+                    capsule_id: id.to_owned(),
+                    authority_digest: blake3::hash(&package.snapshot().package().authority)
+                        .to_hex()
+                        .to_string(),
+                });
+            continue;
+        }
         let manifest = astrid_capsule::discovery::load_manifest(&target.join("Capsule.toml"))
             .with_context(|| format!("read legacy capsule manifest {id}"))?;
         if manifest.package.name != id {
@@ -476,6 +496,368 @@ mod tests {
                 ))
                 .unwrap(),
         )
+    }
+
+    struct StaleNativeFixture {
+        _temp: tempfile::TempDir,
+        home: astrid_core::dirs::AstridHome,
+        principal: PrincipalId,
+        uid: PrincipalUid,
+        store: Arc<RuntimePrincipalStore>,
+        native: std::path::PathBuf,
+        old_receipt: Vec<u8>,
+    }
+
+    const UPGRADED_ID: &str = "upgraded-capsule";
+
+    fn stale_native_fixture(native_version: &str) -> StaleNativeFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let home = astrid_core::dirs::AstridHome::from_path(temp.path().join("home"));
+        home.ensure().unwrap();
+        let principal = PrincipalId::default();
+        let uid = PrincipalUid::from_bytes([0x31; 32]);
+        let directory = PrincipalDirectory::default();
+        directory.register(principal.clone(), uid).unwrap();
+        let store = test_store(&home, directory);
+        store
+            .principal_directory()
+            .register(principal.clone(), uid)
+            .unwrap();
+        let id = UPGRADED_ID;
+        let native = home.principal_home(&principal).capsules_dir().join(id);
+        astrid_core::platform_fs::ensure_private_directory(&native).unwrap();
+        let write_version = |path: &Path, version: &str| {
+            fs::write(
+                path.join("Capsule.toml"),
+                format!("[package]\nname = \"{id}\"\nversion = \"{version}\"\n"),
+            )
+            .unwrap();
+            let meta = CapsuleMeta {
+                version: version.to_owned(),
+                ..CapsuleMeta::default()
+            };
+            fs::write(
+                path.join("meta.json"),
+                serde_json::to_vec_pretty(&meta).unwrap(),
+            )
+            .unwrap();
+        };
+        write_version(&native, "1.0.0");
+        let old_manifest =
+            astrid_capsule::discovery::load_manifest(&native.join("Capsule.toml")).unwrap();
+        verify_installed_authority(&home, &native, &old_manifest).unwrap();
+        let old_receipt = read_installed_authority_bytes(&home, &native)
+            .unwrap()
+            .unwrap();
+
+        // Recreate the released installer's mixed state: advanced native cache
+        // and durable package, but a global receipt for the previous version.
+        write_version(&native, native_version);
+        fs::write(
+            native.join("local-note.txt"),
+            b"retain even unapproved local bytes",
+        )
+        .unwrap();
+        let source = tempfile::tempdir().unwrap();
+        write_version(source.path(), "2.0.0");
+        crate::install_from_local_path(
+            source.path(),
+            &home,
+            crate::InstallOptions {
+                storage: Some(Arc::clone(&store)),
+                ..crate::InstallOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_installed_authority_bytes(&home, &native)
+                .unwrap()
+                .unwrap(),
+            old_receipt
+        );
+        StaleNativeFixture {
+            _temp: temp,
+            home,
+            principal,
+            uid,
+            store,
+            native,
+            old_receipt,
+        }
+    }
+
+    #[test]
+    fn durable_upgrade_survives_a_stale_native_authority_receipt() {
+        for version in ["1.0.0", "2.0.0"] {
+            let fixture = stale_native_fixture(version);
+            assert_preserved_durable_upgrade(&fixture, version);
+        }
+    }
+
+    fn assert_preserved_durable_upgrade(fixture: &StaleNativeFixture, version: &str) {
+        let StaleNativeFixture {
+            home,
+            principal,
+            uid,
+            store,
+            native,
+            old_receipt,
+            ..
+        } = fixture;
+        let owner = StateOwner::Principal(*uid);
+        let id = UPGRADED_ID;
+        let before = store.capsules().get_snapshot(&owner, id).unwrap().unwrap();
+        assert_eq!(
+            read_verified_durable_package_for_owner(store, &owner, id)
+                .unwrap()
+                .unwrap()
+                .manifest()
+                .package
+                .version,
+            "2.0.0"
+        );
+
+        let report = migrate_native_capsules_with_report(store, home, principal, &[])
+            .expect("verified durable upgrade must not be rejected by its stale native receipt");
+        let after = store.capsules().get_snapshot(&owner, id).unwrap().unwrap();
+        assert_eq!(after.generation(), before.generation());
+        assert_eq!(after.package(), before.package());
+        assert!(!native.exists());
+        assert!(read_installed_authority(home, native).unwrap().is_none());
+        assert_eq!(report.retired_authorities.len(), 1);
+        let root = home.migrations_dir().join("superseded-native-capsules");
+        let recovery = fs::read_dir(root).unwrap().next().unwrap().unwrap().path();
+        assert_eq!(
+            fs::read(recovery.join("authority.json")).unwrap(),
+            *old_receipt
+        );
+        assert_eq!(
+            fs::read(recovery.join("source/local-note.txt")).unwrap(),
+            b"retain even unapproved local bytes"
+        );
+        let preserved =
+            astrid_capsule::discovery::load_manifest(&recovery.join("source/Capsule.toml"))
+                .unwrap();
+        assert_eq!(preserved.package.version, version);
+        // Retry cannot reimport the preserved cache or create a new generation.
+        assert!(
+            migrate_native_capsules_with_report(store, home, principal, &[])
+                .unwrap()
+                .retired_authorities
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .capsules()
+                .get_snapshot(&owner, id)
+                .unwrap()
+                .unwrap()
+                .package(),
+            before.package()
+        );
+    }
+
+    #[test]
+    fn corrupt_durable_package_cannot_retire_native_source() {
+        let fixture = stale_native_fixture("2.0.0");
+        let owner = StateOwner::Principal(fixture.uid);
+        let registry = fixture.store.capsules();
+        let snapshot = registry.get_snapshot(&owner, UPGRADED_ID).unwrap().unwrap();
+        let mut package = snapshot.package().clone();
+        package.authority = b"not a receipt".to_vec();
+        registry
+            .install(
+                &owner,
+                UPGRADED_ID,
+                &package,
+                CapsuleInstallExpectation::Generation(snapshot.generation()),
+            )
+            .unwrap();
+        assert!(
+            migrate_native_capsules_with_report(
+                &fixture.store,
+                &fixture.home,
+                &fixture.principal,
+                &[]
+            )
+            .is_err()
+        );
+        assert!(fixture.native.exists());
+        assert_eq!(
+            read_installed_authority_bytes(&fixture.home, &fixture.native)
+                .unwrap()
+                .unwrap(),
+            fixture.old_receipt
+        );
+        assert!(
+            !fixture
+                .home
+                .migrations_dir()
+                .join("superseded-native-capsules")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn incomplete_authority_transaction_cannot_retire_native_source() {
+        let fixture = stale_native_fixture("2.0.0");
+        let paths = crate::authority::authority_paths(&fixture.home, &fixture.native).unwrap();
+        fs::write(&paths.previous, &fixture.old_receipt).unwrap();
+        let error = migrate_native_capsules_with_report(
+            &fixture.store,
+            &fixture.home,
+            &fixture.principal,
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("incomplete authority transaction")
+        );
+        assert!(fixture.native.exists());
+        assert_eq!(fs::read(paths.active).unwrap(), fixture.old_receipt);
+    }
+
+    #[test]
+    fn other_principal_package_does_not_approve_stale_native_source() {
+        let fixture = stale_native_fixture("2.0.0");
+        let owner = StateOwner::Principal(fixture.uid);
+        let other = StateOwner::Principal(PrincipalUid::from_bytes([0x52; 32]));
+        let registry = fixture.store.capsules();
+        let snapshot = registry.get_snapshot(&owner, UPGRADED_ID).unwrap().unwrap();
+        registry
+            .install(
+                &other,
+                UPGRADED_ID,
+                snapshot.package(),
+                CapsuleInstallExpectation::Absent,
+            )
+            .unwrap();
+        registry.remove(&owner, UPGRADED_ID).unwrap();
+        let error = migrate_native_capsules_with_report(
+            &fixture.store,
+            &fixture.home,
+            &fixture.principal,
+            &[],
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("identity/version differs"));
+        assert!(fixture.native.exists());
+        assert!(
+            registry
+                .get_snapshot(&owner, UPGRADED_ID)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            registry
+                .get_snapshot(&other, UPGRADED_ID)
+                .unwrap()
+                .unwrap()
+                .package(),
+            snapshot.package()
+        );
+    }
+
+    #[test]
+    fn interrupted_native_preservation_keeps_bytes_and_retry_keeps_durable_package() {
+        let fixture = stale_native_fixture("2.0.0");
+        let owner = StateOwner::Principal(fixture.uid);
+        let before = fixture
+            .store
+            .capsules()
+            .get_snapshot(&owner, UPGRADED_ID)
+            .unwrap()
+            .unwrap();
+        superseded::FAIL_AFTER_PRESERVATION.with(|fault| fault.set(true));
+        let error = migrate_native_capsules_with_report(
+            &fixture.store,
+            &fixture.home,
+            &fixture.principal,
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("injected interruption"));
+        assert!(!fixture.native.exists());
+        assert_eq!(
+            read_installed_authority_bytes(&fixture.home, &fixture.native)
+                .unwrap()
+                .unwrap(),
+            fixture.old_receipt
+        );
+        let recovery = fs::read_dir(
+            fixture
+                .home
+                .migrations_dir()
+                .join("superseded-native-capsules"),
+        )
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+        assert_eq!(
+            fs::read(recovery.join("source/local-note.txt")).unwrap(),
+            b"retain even unapproved local bytes"
+        );
+        assert_eq!(
+            fs::read(recovery.join("authority.json")).unwrap(),
+            fixture.old_receipt
+        );
+        migrate_native_capsules_with_report(&fixture.store, &fixture.home, &fixture.principal, &[])
+            .unwrap();
+        crate::retire_unmatched_legacy_authority_receipts(
+            &fixture.store,
+            &fixture.home,
+            &fixture.store.principal_directory(),
+            &[],
+        )
+        .unwrap();
+        assert!(
+            legacy_capsule_authority_status(&fixture.home, &[])
+                .unwrap()
+                .unknown_active
+                .is_empty()
+        );
+        let after = fixture
+            .store
+            .capsules()
+            .get_snapshot(&owner, UPGRADED_ID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.generation(), before.generation());
+        assert_eq!(after.package(), before.package());
+        assert!(recovery.join("source/local-note.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn redirected_native_source_cannot_be_preserved_or_retired() {
+        let fixture = stale_native_fixture("2.0.0");
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("external"), b"must stay outside").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("external"), fixture.native.join("link"))
+            .unwrap();
+        let error = migrate_native_capsules_with_report(
+            &fixture.store,
+            &fixture.home,
+            &fixture.principal,
+            &[],
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("redirect"));
+        assert!(fixture.native.exists());
+        assert_eq!(
+            fs::read(outside.path().join("external")).unwrap(),
+            b"must stay outside"
+        );
+        assert_eq!(
+            read_installed_authority_bytes(&fixture.home, &fixture.native)
+                .unwrap()
+                .unwrap(),
+            fixture.old_receipt
+        );
     }
 
     #[test]
