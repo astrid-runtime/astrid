@@ -59,6 +59,161 @@ fn env_pair(plain: &str, secret: &str) -> Vec<CapsuleInstallEnv> {
     ]
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn self_install_cannot_overwrite_another_principals_shared_secret() {
+    check_shared_secret_install_authority(&["self:capsule:install"], false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_secret_install_requires_global_env_write_not_self_env_write() {
+    check_shared_secret_install_authority(&["self:capsule:install", "self:env:write"], false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_secret_install_preserves_authorized_operator_updates() {
+    check_shared_secret_install_authority(&["self:capsule:install", "env:write"], true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_env_authority_does_not_substitute_for_install_authority() {
+    check_shared_secret_install_authority(&["env:write"], false).await;
+}
+
+async fn check_shared_secret_install_authority(grants: &[&str], allowed: bool) {
+    check_secret_install_authority(grants, allowed, "self-secret").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn self_install_cannot_delete_shared_secret_with_empty_value() {
+    check_secret_install_authority(&["self:capsule:install"], false, "").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operator_empty_secret_install_rolls_back_when_activation_requires_it() {
+    check_secret_install_authority(&["self:capsule:install", "env:write"], false, "").await;
+}
+
+async fn check_secret_install_authority(grants: &[&str], allowed: bool, secret: &str) {
+    use astrid_core::kernel_api::KernelRequest;
+    use astrid_core::profile::PrincipalProfile;
+
+    let directory = tempfile::tempdir().expect("home");
+    let kernel = crate::test_kernel_with_home(AstridHome::from_path(directory.path())).await;
+    seed_operator(&kernel).await;
+    write_runtime_signing_key(&kernel);
+    let caller = PrincipalId::new("self-installer").unwrap();
+    kernel
+        .principal_directory
+        .register(
+            caller.clone(),
+            astrid_core::PrincipalUid::from_bytes([23; 32]),
+        )
+        .unwrap();
+    PrincipalProfile {
+        groups: Vec::new(),
+        grants: grants.iter().map(|grant| (*grant).to_owned()).collect(),
+        ..PrincipalProfile::default()
+    }
+    .save_to_path(&PrincipalProfile::path_for(&kernel.astrid_home, &caller))
+    .unwrap();
+    kernel.profile_cache.invalidate(&caller);
+    assert!(super::authorize_request(&kernel, &caller, None, "capsule:install").is_err());
+
+    let work = directory.path().join("src");
+    std::fs::create_dir_all(&work).unwrap();
+    let archive = signed_capsule_archive(&kernel, &work, "isolation-secret");
+    let namespace = astrid_storage::env::system_secret_namespace("isolation-secret");
+    let key = format!("{}SECRET", astrid_storage::env::SECRET_KEY_PREFIX);
+    let existing = b"operator-provisioned-site-secret";
+    kernel
+        .kv
+        .set(&namespace, &key, existing.to_vec())
+        .await
+        .unwrap();
+    let request = KernelRequest::InstallCapsule {
+        source: archive.to_string_lossy().into_owned(),
+        workspace: false,
+        target_principal: None,
+        provenance: None,
+        authority: CapsuleInstallAuthority::Automatic,
+        env: env_pair("self-text", secret),
+        expected_generation: None,
+        batch: None,
+    };
+    let topic = astrid_events::ipc::Topic::from_raw("astrid.v1.request.install");
+    let response_topic = super::response_topic_for(&topic);
+    let mut responses = kernel.event_bus.subscribe_topic(response_topic.as_str());
+    // Exercise the real management dispatcher, including its capability check.
+    super::handle_request(
+        &kernel,
+        &mut super::ManagementRateLimiter::new(),
+        &mut super::install_batch::InstallBatchRegistry::default(),
+        topic,
+        caller,
+        None,
+        request,
+    )
+    .await;
+    let event = tokio::time::timeout(Duration::from_secs(1), responses.recv())
+        .await
+        .expect("terminal install response")
+        .expect("response bus remains open");
+    assert_secret_install_response(&event, grants, allowed);
+    let uid = astrid_core::PrincipalUid::from_bytes([23; 32]);
+    let agent_env = astrid_storage::env::principal_capsule_namespace(uid, "isolation-secret");
+    assert_eq!(
+        kernel
+            .kv
+            .get(&agent_env, &astrid_storage::env::env_key("PLAIN"))
+            .await
+            .unwrap()
+            .as_deref(),
+        allowed.then_some(b"self-text".as_slice()),
+        "a rejected shared-secret install must not stage principal env"
+    );
+    assert_eq!(
+        kernel.kv.get(&namespace, &key).await.unwrap().as_deref(),
+        if allowed {
+            (!secret.is_empty()).then_some(secret.as_bytes())
+        } else {
+            Some(existing.as_slice())
+        },
+        "self-install authority must not overwrite a host-wide credential"
+    );
+}
+
+fn assert_secret_install_response(
+    event: &astrid_events::AstridEvent,
+    grants: &[&str],
+    allowed: bool,
+) {
+    let astrid_events::AstridEvent::Ipc { message, .. } = event else {
+        panic!("expected IPC response");
+    };
+    let astrid_events::ipc::IpcPayload::RawJson(value) = &message.payload else {
+        panic!("expected JSON response");
+    };
+    let response: KernelResponse = serde_json::from_value(value.clone()).unwrap();
+    if allowed {
+        assert!(
+            matches!(response, KernelResponse::Success(_)),
+            "{response:?}"
+        );
+    } else {
+        let KernelResponse::Error(error) = response else {
+            panic!("expected install refusal: {response:?}");
+        };
+        if grants.contains(&"env:write") && grants.contains(&"self:capsule:install") {
+            assert!(error.contains("not configured"), "{error}");
+        } else {
+            assert!(
+                error.contains("capability") || error.contains("permission"),
+                "{error}"
+            );
+        }
+    }
+}
+
 async fn take_loaded_events(
     events: &mut astrid_events::EventReceiver,
     first: Duration,
