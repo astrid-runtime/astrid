@@ -772,20 +772,41 @@ fn emit_ready(format: ReadyFormat, record: &GatewayReady) -> Result<()> {
 fn spawn_gateway(principal: &PrincipalId) -> Result<()> {
     let executable =
         std::env::current_exe().context("failed to resolve the Astrid CLI executable")?;
-    Command::new(executable)
+    gateway_command(
+        &executable,
+        principal,
+        &crate::daemon_workspace::selected(None)?,
+        crate::workspace_layout::current(),
+    )
+    .spawn()
+    .context("failed to start MCP gateway")?;
+    Ok(())
+}
+
+fn gateway_command(
+    executable: &Path,
+    principal: &PrincipalId,
+    workspace: &Path,
+    layout: &astrid_core::dirs::WorkspaceLayout,
+) -> Command {
+    let mut command = Command::new(executable);
+    command
+        // CLI-selected layouts are process-local; propagate the resolved
+        // value rather than let the child inherit a conflicting environment.
+        .env("ASTRID_WORKSPACE_STATE_DIR", layout.state_dir_name())
         // The gateway is shared: cancelling its first host's process group
         // must not disconnect other hosts. Idle retirement remains in run().
         .process_group(0)
+        .arg("--daemon-workspace")
+        .arg(workspace)
         .arg("--principal")
         .arg(principal.to_string())
         .arg("mcp")
         .arg("gateway")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to start MCP gateway")?;
-    Ok(())
+        .stderr(Stdio::null());
+    command
 }
 
 /// Entry point for `mcp ready`.

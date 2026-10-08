@@ -441,7 +441,7 @@ pub(crate) async fn run(principal: Option<&str>) -> Result<ExitCode> {
     let lifecycle = try_acquire_gateway_lifecycle()?.ok_or_else(|| {
         anyhow::anyhow!("another MCP gateway startup or lifecycle is already active")
     })?;
-    let daemon_root = std::env::current_dir().context("failed to read MCP gateway cwd")?;
+    let daemon_root = crate::daemon_workspace::selected(None)?;
 
     let boot_token = mint_boot_token();
     let gateway_exe = std::env::current_exe()

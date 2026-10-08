@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 
+use clap::builder::TypedValueParser as _;
 use clap::{Parser, Subcommand};
 
 use crate::commands::UpdateChannel;
@@ -61,6 +62,12 @@ pub(crate) struct Cli {
         default_value = astrid_core::dirs::DEFAULT_WORKSPACE_STATE_DIR
     )]
     pub workspace_state_dir: astrid_core::dirs::WorkspaceLayout,
+
+    /// Absolute daemon workspace root, independent of file arguments and MCP
+    /// project context. Defaults to the invoking directory when omitted.
+    #[arg(long, global = true, value_parser = clap::builder::PathBufValueParser::new()
+        .try_map(crate::daemon_workspace::DaemonWorkspace::new))]
+    pub daemon_workspace: Option<crate::daemon_workspace::DaemonWorkspace>,
 
     /// Non-interactive prompt. Sends the prompt, prints the response, and exits.
     /// Forces headless mode (no TUI). Stdin is appended to the prompt if piped.

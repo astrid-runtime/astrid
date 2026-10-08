@@ -159,13 +159,13 @@ fn broker_readiness_required(caller: &astrid_core::PrincipalId) -> bool {
     *caller != astrid_core::PrincipalId::anonymous()
 }
 
-/// Daemon identity for `mcp serve` is the process cwd at invocation.
+/// Daemon identity uses the explicit invocation selector or the original cwd.
 ///
 /// AOS host plugins `cd` into the product runtime home, then pass the host
 /// project as `--workspace`. The live daemon is that runtime-home process.
 /// `--workspace` is project context after attach, not a second daemon.
-pub(crate) fn mcp_serve_daemon_root(cwd: &Path, _workspace: Option<&Path>) -> PathBuf {
-    cwd.to_path_buf()
+pub(crate) fn mcp_serve_daemon_root(cwd: &Path, _workspace: Option<&Path>) -> Result<PathBuf> {
+    crate::daemon_workspace::selected(Some(cwd))
 }
 
 /// Run the MCP stdio server until the client closes stdin (EOF), its launching
@@ -199,7 +199,7 @@ pub(crate) async fn serve(
     // Attach to the daemon for *this* cwd (runtime home after the plugin `cd`),
     // not `--workspace` (the host project).
     let cwd = std::env::current_dir().context("failed to read mcp serve cwd")?;
-    let daemon_root = mcp_serve_daemon_root(&cwd, workspace);
+    let daemon_root = mcp_serve_daemon_root(&cwd, workspace)?;
     let workspace_context = workspace
         .map(std::fs::canonicalize)
         .transpose()
@@ -378,7 +378,7 @@ mod daemon_root_tests {
     fn mcp_serve_daemon_root_is_cwd_not_host_project() {
         let runtime = Path::new("/tmp/aos-runtime");
         let project = Path::new("/tmp/host-project");
-        let daemon_root = mcp_serve_daemon_root(runtime, Some(project));
+        let daemon_root = mcp_serve_daemon_root(runtime, Some(project)).expect("daemon root");
         assert_eq!(daemon_root.as_path(), runtime);
         assert_ne!(daemon_root.as_path(), project);
     }
