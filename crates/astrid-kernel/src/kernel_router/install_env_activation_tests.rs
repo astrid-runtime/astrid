@@ -79,6 +79,11 @@ async fn shared_env_authority_does_not_substitute_for_install_authority() {
     check_shared_secret_install_authority(&["env:write"], false).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_only_self_install_preserves_shared_secret_without_global_env_authority() {
+    check_install_authority(&["self:capsule:install"], true, None).await;
+}
+
 async fn check_shared_secret_install_authority(grants: &[&str], allowed: bool) {
     check_secret_install_authority(grants, allowed, "self-secret").await;
 }
@@ -94,6 +99,10 @@ async fn operator_empty_secret_install_rolls_back_when_activation_requires_it() 
 }
 
 async fn check_secret_install_authority(grants: &[&str], allowed: bool, secret: &str) {
+    check_install_authority(grants, allowed, Some(secret)).await;
+}
+
+async fn check_install_authority(grants: &[&str], allowed: bool, secret: Option<&str>) {
     use astrid_core::kernel_api::KernelRequest;
     use astrid_core::profile::PrincipalProfile;
 
@@ -136,7 +145,10 @@ async fn check_secret_install_authority(grants: &[&str], allowed: bool, secret: 
         target_principal: None,
         provenance: None,
         authority: CapsuleInstallAuthority::Automatic,
-        env: env_pair("self-text", secret),
+        env: env_pair("self-text", secret.unwrap_or_default())
+            .into_iter()
+            .filter(|value| secret.is_some() || value.kind == EnvValueKind::Text)
+            .collect(),
         expected_generation: None,
         batch: None,
     };
@@ -173,8 +185,8 @@ async fn check_secret_install_authority(grants: &[&str], allowed: bool, secret: 
     );
     assert_eq!(
         kernel.kv.get(&namespace, &key).await.unwrap().as_deref(),
-        if allowed {
-            (!secret.is_empty()).then_some(secret.as_bytes())
+        if allowed && secret.is_some() {
+            secret.filter(|value| !value.is_empty()).map(str::as_bytes)
         } else {
             Some(existing.as_slice())
         },
