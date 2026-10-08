@@ -144,20 +144,72 @@ validate_companion() {
 }
 
 app_process_matches() {
-  local pid=$1 process_path loaded_path signature installed_version
+  local pid=$1 require_version=${2:-1} process_path loaded_path signature installed_version
   process_path="$(/bin/ps -p "$pid" -o comm=)" || return 1
   [[ "$process_path" == "$APP_EXECUTABLE" ]] || return 1
   loaded_path="$(/usr/sbin/lsof -p "$pid" -a -d txt -Fn \
-    | /usr/bin/sed -n 's/^n//p' | /usr/bin/head -n 1)"
+    | /usr/bin/sed -n 's/^n//p' | /usr/bin/head -n 1)" || return 1
   [[ "$loaded_path" == "$APP_EXECUTABLE" ]] || return 1
-  signature="$(/usr/bin/codesign --display --verbose=4 "$process_path" 2>&1)"
-  grep -Fx "Identifier=$APP_IDENTIFIER" <<<"$signature" >/dev/null
-  grep -Fx "TeamIdentifier=$CODE_SIGN_TEAM" <<<"$signature" >/dev/null
+  signature="$(/usr/bin/codesign --display --verbose=4 "$process_path" 2>&1)" || return 1
+  grep -Fx "Identifier=$APP_IDENTIFIER" <<<"$signature" >/dev/null || return 1
+  grep -Fx "TeamIdentifier=$CODE_SIGN_TEAM" <<<"$signature" >/dev/null || return 1
   installed_version="$(plutil -extract CFBundleShortVersionString raw -expect string \
-    "$DESTINATION_APP/Contents/Info.plist")"
-  [[ -n "$installed_version" ]]
-  if [[ -n "${ASTRID_FSKIT_EXPECTED_VERSION:-}" ]]; then
-    [[ "$installed_version" == "${ASTRID_FSKIT_EXPECTED_VERSION%%-*}" ]]
+    "$DESTINATION_APP/Contents/Info.plist")" || return 1
+  [[ -n "$installed_version" ]] || return 1
+  if [[ "$require_version" == 1 && -n "${ASTRID_FSKIT_EXPECTED_VERSION:-}" ]]; then
+    [[ "$installed_version" == "${ASTRID_FSKIT_EXPECTED_VERSION%%-*}" ]] || return 1
+  fi
+  return 0
+}
+
+stop_app_before_replacement() {
+  local pids pid started current_started attempts mount_records status
+  # Mounts can outlive the host app process. Inspect them even on cold install.
+  mount_records="$(/sbin/mount)" || return 1
+  if /usr/bin/grep -Fq astridfs <<<"$mount_records"; then
+    echo "Unmount Astrid filesystems before updating the running AstridFS app." >&2
+    return 1
+  fi
+  if pids="$(/usr/bin/pgrep -x AstridFS)"; then
+    :
+  else
+    status=$?
+    [[ "$status" == 1 ]] && return 0
+    echo "Cannot inspect running AstridFS processes; refusing replacement." >&2
+    return 1
+  fi
+  # Validate every process before signalling any. The old installed version is
+  # legitimate here; the new expected version is checked after activation.
+  while IFS= read -r pid; do
+    app_process_matches "$pid" 0 || {
+      echo "Cannot safely stop AstridFS PID $pid; its loaded app identity differs from $DESTINATION_APP. Quit that app and retry the update." >&2
+      return 1
+    }
+  done <<<"$pids"
+  while IFS= read -r pid; do
+    started="$(/bin/ps -p "$pid" -o lstart=)" || return 1
+    app_process_matches "$pid" 0 || return 1
+    current_started="$(/bin/ps -p "$pid" -o lstart=)" || return 1
+    [[ -n "$started" && "$started" == "$current_started" ]] || return 1
+    /bin/kill -TERM "$pid" || return 1
+    for ((attempts = 0; attempts < 50; attempts++)); do
+      current_started="$(/bin/ps -p "$pid" -o lstart=)" || break
+      [[ "$current_started" == "$started" ]] || break
+      /bin/sleep 0.1
+    done
+    current_started="$(/bin/ps -p "$pid" -o lstart=)" || current_started=
+    if [[ "$current_started" == "$started" ]]; then
+      echo "AstridFS PID $pid did not exit; the installed app has not been replaced. Quit it and retry." >&2
+      return 1
+    fi
+  done <<<"$pids"
+  # A concurrent launch must not survive while we move its executable away.
+  if /usr/bin/pgrep -x AstridFS >/dev/null; then
+    echo "AstridFS launched during the update; retry after closing it." >&2
+    return 1
+  else
+    status=$?
+    [[ "$status" == 1 ]] || return 1
   fi
 }
 
@@ -258,6 +310,7 @@ install_app() {
   /usr/bin/ditto "$SOURCE_APP" "$APP_STAGE"
   validate_app "$APP_STAGE"
   /usr/bin/install -m 0755 "$companion_source" "$COMPANION_STAGE"
+  stop_app_before_replacement
   if [[ -e "$DESTINATION_APP" ]]; then
     /bin/mv "$DESTINATION_APP" "$APP_BACKUP"
     APP_BACKED_UP=1
