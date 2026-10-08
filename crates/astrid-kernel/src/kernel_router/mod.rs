@@ -195,43 +195,56 @@ async fn handle_request(
     let scope = resolve_scope(&req, &caller);
     let requested_target = request_target_principal(&req, &caller);
     let required_cap = required_capability(&req, scope);
-    let authorization =
-        match authorize_request(kernel, &caller, device_key_id.as_deref(), required_cap) {
-            Ok(authorization) => authorization,
-            Err(e) => {
-                warn!(
-                    security_event = true,
-                    method = method,
-                    principal = %caller,
-                    required = required_cap,
-                    "Permission check denied admin request"
-                );
-                record_admin_audit(
-                    kernel,
-                    AdminAuditEntry {
-                        caller: &caller,
-                        method,
-                        required_cap,
-                        device_key_id: device_key_id.as_deref(),
-                        target_principal: requested_target.clone(),
-                        params: None,
-                        authorization: AuthorizationProof::Denied {
-                            reason: e.to_string(),
-                        },
-                        outcome: AuditOutcome::failure(e.to_string()),
+    let install_authorization =
+        authorize_request(kernel, &caller, device_key_id.as_deref(), required_cap);
+    // Install secrets are staged in the host-wide Shared namespace, not the
+    // target principal's namespace. Install permission must never substitute
+    // for the same global env authority required by an explicit Shared write.
+    let (required_cap, checked_authorization) = match install_authorization {
+        Ok(authorization)
+            if matches!(&req, KernelRequest::InstallCapsule { env, .. }
+                if env.iter().any(|value| value.kind == astrid_core::kernel_api::EnvValueKind::Secret)) =>
+        {
+            ("env:write", authorization.require_shared_env_write())
+        },
+        result => (required_cap, result),
+    };
+    let authorization = match checked_authorization {
+        Ok(authorization) => authorization,
+        Err(e) => {
+            warn!(
+                security_event = true,
+                method = method,
+                principal = %caller,
+                required = required_cap,
+                "Permission check denied admin request"
+            );
+            record_admin_audit(
+                kernel,
+                AdminAuditEntry {
+                    caller: &caller,
+                    method,
+                    required_cap,
+                    device_key_id: device_key_id.as_deref(),
+                    target_principal: requested_target.clone(),
+                    params: None,
+                    authorization: AuthorizationProof::Denied {
+                        reason: e.to_string(),
                     },
-                )
-                .await;
-                publish_response(
-                    kernel,
-                    response_topic,
-                    caller.as_str(),
-                    device_key_id.as_deref(),
-                    KernelResponse::Error(e.to_string()),
-                );
-                return;
-            },
-        };
+                    outcome: AuditOutcome::failure(e.to_string()),
+                },
+            )
+            .await;
+            publish_response(
+                kernel,
+                response_topic,
+                caller.as_str(),
+                device_key_id.as_deref(),
+                KernelResponse::Error(e.to_string()),
+            );
+            return;
+        },
+    };
 
     let authorization_proof = AuthorizationProof::System {
         reason: format!("policy allow: {caller} holds {required_cap}"),
@@ -699,6 +712,13 @@ struct AuthorizedRequest {
 }
 
 impl AuthorizedRequest {
+    fn require_shared_env_write(self) -> Result<Self, PermissionError> {
+        // Supplementary authority must come from the same profile, groups and
+        // device scope that permitted install, never a second policy snapshot.
+        self.capability_check().require("env:write")?;
+        Ok(self)
+    }
+
     fn capability_check(&self) -> CapabilityCheck<'_> {
         let check = CapabilityCheck::new(
             self.profile.as_ref(),
