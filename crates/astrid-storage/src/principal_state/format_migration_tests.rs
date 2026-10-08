@@ -148,6 +148,100 @@ fn assert_pre_fleet_owner_format_is_selected() {
     );
 }
 
+#[tokio::test]
+async fn pre_fleet_active_catalogue_survives_full_runtime_open() {
+    use crate::storage_model::{ObjectClass, ObjectFormatVersion, ObjectKind, ObjectRecord};
+    use std::sync::Arc;
+
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    super::runtime_tests::seed_legacy_layout(&home);
+    let path = home.principal_store_path();
+    let prior = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        include_bytes!("../../tests/fixtures/principal-store-pre-fleet-v1.txt").to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let prior_id = Blake3ObjectIdentityV1.identify(&prior);
+    assert_eq!(
+        prior_id, PRE_FLEET_OWNER_FORMAT_SPEC_ID,
+        "fixture must be the real predecessor"
+    );
+    let catalog = bootstrap::content_catalog_format_specification().unwrap();
+    let catalog_id = Blake3ObjectIdentityV1.identify(&catalog);
+    let engine = RuntimeEngine::open(
+        &path,
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    engine.persist_standalone_object(&prior).unwrap();
+    engine.persist_standalone_object(&catalog).unwrap();
+    let engine = Arc::new(engine);
+    let legacy_kv = super::RuntimeStore::from_engine(
+        Arc::clone(&engine),
+        super::StateOwnerResolver::new(super::PrincipalDirectory::default()),
+    );
+    crate::KvStore::set(
+        &legacy_kv,
+        "system:identity",
+        "catalogue-upgrade",
+        b"retained-state".to_vec(),
+    )
+    .await
+    .unwrap();
+    drop(legacy_kv);
+    engine
+        .ensure_direct_representation_catalogue(prior_id, &[prior_id, catalog_id])
+        .unwrap();
+    engine.close().unwrap();
+    drop(engine);
+    std::fs::write(
+        path.join(STORE_METADATA_FILE),
+        pre_fleet_owner_store_metadata(prior_id, catalog_id),
+    )
+    .unwrap();
+    std::fs::write(
+        path.join(super::migrations::MIGRATION_MARKER_FILE),
+        super::migrations::KV_TRANSITION_CHECKPOINT_MARKER,
+    )
+    .unwrap();
+
+    let store =
+        super::open_runtime_principal_store(&home, Arc::new(|_: &super::StateOwner| Ok(None)))
+            .await
+            .expect("recognized predecessor with its original active catalogue must migrate");
+    assert_eq!(
+        store
+            .kv()
+            .get("system:identity", "catalogue-upgrade")
+            .await
+            .unwrap(),
+        Some(b"retained-state".to_vec())
+    );
+    store.engine.close().unwrap();
+    drop(store);
+    let reopened =
+        super::open_runtime_principal_store(&home, Arc::new(|_: &super::StateOwner| Ok(None)))
+            .await
+            .expect("migrated store must reopen");
+    assert_eq!(
+        reopened
+            .kv()
+            .get("system:identity", "catalogue-upgrade")
+            .await
+            .unwrap(),
+        Some(b"retained-state".to_vec())
+    );
+    reopened.engine.close().unwrap();
+    drop(reopened);
+}
+
 fn assert_pre_representation_format_is_selected(prior: ObjectId) {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
