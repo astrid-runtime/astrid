@@ -4,6 +4,43 @@ use astrid_core::dirs::AstridHome;
 use astrid_core::kernel_api::AdminRequestKind;
 
 #[tokio::test]
+async fn env_list_retains_legacy_default_keys_without_a_default_capsule() {
+    let (_dir, kernel) = fixture().await;
+    let scope = env_scope(
+        &kernel,
+        &PrincipalId::default(),
+        "default",
+        EnvValueKind::Text,
+        EnvStorageScope::Agent,
+    )
+    .expect("default scope");
+    astrid_storage::env::set_env(&scope, "LEGACY_KEY", "private-value")
+        .await
+        .expect("legacy value");
+    let AdminResponseBody::EnvList(entries) = env_list(&kernel, PrincipalId::default(), None).await
+    else {
+        panic!("expected key listing")
+    };
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.capsule == "default"
+                && entry.key == "LEGACY_KEY"
+                && entry.scope == EnvStorageScope::Agent)
+            .count(),
+        1
+    );
+    let serialized = serde_json::to_string(&entries).expect("serialize keys");
+    assert!(!serialized.contains("private-value"));
+    let AdminResponseBody::EnvList(filtered) =
+        env_list(&kernel, PrincipalId::default(), Some("provider".to_owned())).await
+    else {
+        panic!("expected filtered listing")
+    };
+    assert!(!filtered.iter().any(|entry| entry.key == "LEGACY_KEY"));
+}
+
+#[tokio::test]
 async fn failed_refresh_retries_without_overwriting_the_committed_default() {
     let (_dir, kernel) = fixture().await;
     let first = env_set_with_refresh(

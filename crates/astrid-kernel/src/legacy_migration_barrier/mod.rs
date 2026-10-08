@@ -26,6 +26,7 @@ use astrid_core::principal::PrincipalId;
 use astrid_storage::{IdentityStore, KvStore, PrincipalDirectory, RuntimePrincipalStore};
 
 mod env_import;
+mod env_inventory;
 mod fs_hooks;
 mod hooks;
 mod host_fs;

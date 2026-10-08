@@ -39,7 +39,13 @@ pub(super) fn add_principal_scope_sources(
     uid: PrincipalUid,
     capsule_ids: &[String],
 ) -> io::Result<()> {
-    for capsule in capsule_ids {
+    let mut capsule_ids = capsule_ids.to_vec();
+    capsule_ids.extend(
+        super::env_inventory::read(home, uid)?
+            .into_iter()
+            .map(|id| id.to_string()),
+    );
+    for capsule in native_env_secret_scope_ids(home, alias, &capsule_ids)? {
         add_source(
             sources,
             format!("principal:{uid}:env:{capsule}"),
@@ -50,10 +56,69 @@ pub(super) fn add_principal_scope_sources(
         add_source(
             sources,
             format!("principal:{uid}:secret:{capsule}"),
-            home.secrets_dir().join(alias.as_str()).join(capsule),
+            home.secrets_dir()
+                .join(alias.as_str())
+                .join(capsule.as_str()),
         )?;
     }
     Ok(())
+}
+
+/// Released settings could precede an install, survive removal, or belong to
+/// another principal than the shared capsule package. The containing principal
+/// fixes ownership; package presence must not decide whether data is preserved.
+fn native_env_secret_scope_ids(
+    home: &AstridHome,
+    alias: &PrincipalId,
+    capsule_ids: &[String],
+) -> io::Result<Vec<astrid_capsule_types::CapsuleId>> {
+    let mut scopes: std::collections::BTreeSet<_> = capsule_ids.iter().cloned().collect();
+    for (root, env_files) in [
+        (home.principal_home(alias).env_dir(), true),
+        (home.secrets_dir().join(alias.as_str()), false),
+    ] {
+        if !path_exists(&root)? {
+            continue;
+        }
+        astrid_core::platform_fs::verify_no_redirects(&root)?;
+        if !fs::symlink_metadata(&root)?.is_dir() {
+            return Err(io::Error::other(format!(
+                "legacy scope root is not a directory: {}",
+                root.display()
+            )));
+        }
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let name = file_name.to_str().ok_or_else(|| {
+                io::Error::other(format!(
+                    "legacy scope name is not UTF-8: {}",
+                    entry.path().display()
+                ))
+            })?;
+            let capsule = if env_files {
+                name.strip_suffix(".env.json").ok_or_else(|| {
+                    io::Error::other(format!(
+                        "unexpected legacy env source: {}",
+                        entry.path().display()
+                    ))
+                })?
+            } else {
+                name
+            };
+            astrid_capsule_types::CapsuleId::new(capsule.to_owned()).map_err(|error| {
+                io::Error::other(format!(
+                    "invalid legacy scope {}: {error}",
+                    entry.path().display()
+                ))
+            })?;
+            scopes.insert(capsule.to_owned());
+        }
+    }
+    scopes
+        .into_iter()
+        .map(|scope| astrid_capsule_types::CapsuleId::new(scope).map_err(storage_io))
+        .collect()
 }
 
 pub(super) fn retire_empty_directory(path: &Path) -> io::Result<()> {
