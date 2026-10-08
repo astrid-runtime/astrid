@@ -205,11 +205,7 @@ async fn handle_request(
             if matches!(&req, KernelRequest::InstallCapsule { env, .. }
                 if env.iter().any(|value| value.kind == astrid_core::kernel_api::EnvValueKind::Secret)) =>
         {
-            (
-                "env:write",
-                authorize_request(kernel, &caller, device_key_id.as_deref(), "env:write")
-                    .map(|_| authorization),
-            )
+            ("env:write", authorization.require_shared_env_write())
         },
         result => (required_cap, result),
     };
@@ -716,6 +712,13 @@ struct AuthorizedRequest {
 }
 
 impl AuthorizedRequest {
+    fn require_shared_env_write(self) -> Result<Self, PermissionError> {
+        // Supplementary authority must come from the same profile, groups and
+        // device scope that permitted install, never a second policy snapshot.
+        self.capability_check().require("env:write")?;
+        Ok(self)
+    }
+
     fn capability_check(&self) -> CapabilityCheck<'_> {
         let check = CapabilityCheck::new(
             self.profile.as_ref(),
