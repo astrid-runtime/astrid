@@ -11,7 +11,7 @@
 //!
 //! ## Canonical JSON (DECISION)
 //!
-//! `canonical_json` is `serde_json::to_vec(lock)`. `serde_json`
+//! `canonical_json` serializes the frozen v1 signing view below. `serde_json`
 //! serializes struct fields in declaration order and that order is
 //! stable across builds, so the same lock value always serializes to
 //! the same bytes. We do not sort map keys because the lock contains no
@@ -19,6 +19,10 @@
 //! fixed struct). This is intentionally simple and auditable; if a
 //! free-form map is ever added to the lock, this function must switch
 //! to a key-sorting canonicalizer.
+//!
+//! The signing view must remain independent of TOML field renames: released
+//! v1 signatures include `resolved_ref`, while the current TOML writer uses
+//! `resolved-ref`. Changing presentation must not invalidate signed shuttles.
 //!
 //! ## `Distro.sig` format (DECISION)
 //!
@@ -41,6 +45,7 @@
 
 use anyhow::Context;
 use astrid_crypto::{KeyPair, PublicKey, Signature};
+use serde::Serialize;
 
 use super::lock::DistroLock;
 
@@ -51,9 +56,60 @@ use super::lock::DistroLock;
 /// the lock payload. Bumping the `-vN` suffix is a wire-breaking change.
 const SIG_DOMAIN_TAG: &[u8] = b"astrid-distro-lock-sig-v1\x00";
 
+// Declaration order, wire names and optional-field omission are the released
+// v1 signature contract. Do not inherit mutable file-format serde attributes.
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct SigningLockV1<'a> {
+    schema_version: u32,
+    distro: SigningMetaV1<'a>,
+    #[serde(rename = "capsule")]
+    capsules: Vec<SigningCapsuleV1<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest_hash: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct SigningMetaV1<'a> {
+    id: &'a str,
+    version: &'a str,
+    resolved_at: &'a str,
+}
+
+#[derive(Serialize)]
+struct SigningCapsuleV1<'a> {
+    name: &'a str,
+    version: &'a str,
+    source: &'a str,
+    hash: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved_ref: Option<&'a str>,
+}
+
 /// Serialize the lock to its canonical signing bytes.
 pub(crate) fn canonical_lock_bytes(lock: &DistroLock) -> anyhow::Result<Vec<u8>> {
-    serde_json::to_vec(lock).context("failed to canonicalize Distro.lock for signing")
+    let wire = SigningLockV1 {
+        schema_version: lock.schema_version,
+        distro: SigningMetaV1 {
+            id: &lock.distro.id,
+            version: &lock.distro.version,
+            resolved_at: &lock.distro.resolved_at,
+        },
+        capsules: lock
+            .capsules
+            .iter()
+            .map(|capsule| SigningCapsuleV1 {
+                name: &capsule.name,
+                version: &capsule.version,
+                source: &capsule.source,
+                hash: &capsule.hash,
+                resolved_ref: capsule.resolved_ref.as_deref(),
+            })
+            .collect(),
+        manifest_hash: lock.manifest_hash.as_deref(),
+    };
+    serde_json::to_vec(&wire).context("failed to canonicalize Distro.lock for signing")
 }
 
 /// The 32-byte domain-separated blake3 digest the signature is computed
@@ -109,6 +165,43 @@ pub(crate) fn verify_lock(
 mod tests {
     use super::*;
     use crate::commands::distro::lock::{DistroLock, DistroLockMeta, LockedCapsule};
+
+    // Frozen independently of the current TOML serde annotations. V1 signed
+    // the capsule ref as resolved_ref, even though new TOML uses resolved-ref.
+    const V1_SAMPLE_BYTES: &[u8] = br#"{"schema-version":1,"distro":{"id":"test","version":"0.1.0","resolved-at":"2026-01-01T00:00:00Z"},"capsule":[{"name":"astrid-capsule-cli","version":"0.1.0","source":"@org/cli","hash":"blake3:abc","resolved_ref":"v0.1.0"}],"manifest-hash":"blake3:def"}"#;
+
+    #[test]
+    fn canonical_v1_signing_bytes_preserve_historical_field_spelling() {
+        assert_eq!(
+            canonical_lock_bytes(&sample_lock()).unwrap(),
+            V1_SAMPLE_BYTES
+        );
+    }
+
+    #[test]
+    fn canonical_v1_omits_absent_optional_fields() {
+        let mut lock = sample_lock();
+        lock.manifest_hash = None;
+        lock.capsules[0].resolved_ref = None;
+        let expected = br#"{"schema-version":1,"distro":{"id":"test","version":"0.1.0","resolved-at":"2026-01-01T00:00:00Z"},"capsule":[{"name":"astrid-capsule-cli","version":"0.1.0","source":"@org/cli","hash":"blake3:abc"}]}"#;
+        assert_eq!(canonical_lock_bytes(&lock).unwrap(), expected);
+    }
+
+    #[test]
+    fn historical_signature_verifies_both_toml_spellings_without_resigning() {
+        let key = KeyPair::generate();
+        let mut digest = blake3::Hasher::new();
+        digest.update(SIG_DOMAIN_TAG);
+        digest.update(V1_SAMPLE_BYTES);
+        let signature = key.sign(digest.finalize().as_bytes()).to_hex();
+        let toml = toml::to_string(&sample_lock()).unwrap();
+        for text in [toml.clone(), toml.replace("resolved-ref", "resolved_ref")] {
+            let mut lock: DistroLock = toml::from_str(&text).unwrap();
+            verify_lock(&lock, &signature, &key.export_public_key()).unwrap();
+            lock.capsules[0].resolved_ref = Some("tampered".into());
+            assert!(verify_lock(&lock, &signature, &key.export_public_key()).is_err());
+        }
+    }
 
     fn sample_lock() -> DistroLock {
         DistroLock {

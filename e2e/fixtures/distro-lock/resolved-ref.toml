@@ -1,0 +1,13 @@
+schema-version = 1
+
+[distro]
+id = "example"
+version = "1.0.0"
+resolved-at = "2026-01-01T00:00:00Z"
+
+[[capsule]]
+name = "example-tool"
+version = "1.0.0"
+source = "@example/tool"
+hash = "blake3:0000000000000000000000000000000000000000000000000000000000000000"
+resolved-ref = "v1.0.0"

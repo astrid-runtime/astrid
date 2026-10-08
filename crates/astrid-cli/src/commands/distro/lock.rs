@@ -48,6 +48,7 @@ pub(crate) struct DistroLockMeta {
 
 /// A resolved capsule entry in the lockfile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub(crate) struct LockedCapsule {
     /// Capsule package name.
     pub(crate) name: String,
@@ -61,7 +62,11 @@ pub(crate) struct LockedCapsule {
     /// branch name, or a commit SHA). Distinct from `version` because
     /// the manifest may pin a tag/branch/rev that doesn't equal the
     /// semver string. `None` for legacy locks.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "resolved_ref",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub(crate) resolved_ref: Option<String>,
 }
 
@@ -257,6 +262,20 @@ pub(crate) fn manifest_hash(toml_bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolved_ref_writer_matches_shared_migration_fixture() {
+        let canonical = include_str!("../../../../../e2e/fixtures/distro-lock/resolved-ref.toml");
+        let historical = canonical.replace("resolved-ref", "resolved_ref");
+        let lock: DistroLock = toml::from_str(&historical).unwrap();
+        assert_eq!(lock.capsules[0].resolved_ref.as_deref(), Some("v1.0.0"));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("distro.lock");
+        write_lock(&path, &lock).unwrap();
+        let written: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let expected: toml::Value = toml::from_str(canonical).unwrap();
+        assert_eq!(written, expected);
+    }
 
     #[test]
     fn write_and_load_lock_roundtrip() {
