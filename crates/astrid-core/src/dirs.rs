@@ -49,6 +49,7 @@ pub const LEGACY_LAYOUT_VERSION: &str = "1";
 mod dirs_layout;
 pub use dirs_layout::{
     LayoutMigrationTarget, preserve_legacy_source_tree, retire_legacy_source_tree,
+    retire_runtime_run_directory,
 };
 #[path = "dirs_projection_retirement.rs"]
 mod projection_retirement;

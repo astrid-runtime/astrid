@@ -29,6 +29,7 @@ pub(super) fn decode_layout_receipt_path_for_test(
 }
 use retirement::{
     retire_legacy_source_tree as retire_legacy_source_tree_impl,
+    retire_runtime_run_directory as retire_runtime_run_directory_impl,
     validate_legacy_retirement_candidate,
 };
 
@@ -572,6 +573,22 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// redirect, special entry, filesystem boundary, or active mount.
 pub fn retire_legacy_source_tree(path: &Path) -> io::Result<()> {
     retire_legacy_source_tree_impl(path)
+}
+
+/// Retire transient runtime state while allowing Finder's regular root metadata to remain.
+///
+/// Unlike legacy source retirement, the daemon's run directory may be touched
+/// by Finder after its contents have been enumerated. A lone regular
+/// `.DS_Store` is non-runtime metadata and must not be unlinked after a
+/// path-based type check; all other residual entries remain errors.
+///
+/// # Errors
+///
+/// Returns an I/O error if the run directory contains unexpected state,
+/// redirects, special entries, crosses a filesystem boundary, or is an active
+/// mount.
+pub fn retire_runtime_run_directory(path: &Path) -> io::Result<()> {
+    retire_runtime_run_directory_impl(path)
 }
 
 /// Preserve a legacy directory at an absent destination instead of deleting it.
