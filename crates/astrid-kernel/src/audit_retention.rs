@@ -15,19 +15,51 @@ use astrid_config::types::{AuditConfig, AuditRetentionConfig};
 use astrid_core::PrincipalId;
 use async_trait::async_trait;
 
-/// Read `[audit]` from the daemon's config, or the defaults when it cannot
-/// be loaded.
+/// Read `[audit]` from the daemon's layered config under `astrid_home`.
+///
+/// When the workspace layer cannot be merged (invalid TOML, validation
+/// failure, etc.), fall back to operator layers only (system + user +
+/// defaults). Never substitute [`AuditConfig::default`]: that would clear
+/// operator `require_anchor`, `archive_dir`, and `host_fail_closed`. If
+/// operator layers also cannot be read, boot must stop.
 pub(crate) fn load_audit_config(
     workspace_root: &Path,
+    astrid_home: &Path,
     workspace_layout: &astrid_core::dirs::WorkspaceLayout,
-) -> AuditConfig {
-    astrid_config::Config::load_with_layout(Some(workspace_root), workspace_layout).map_or_else(
-        |error| {
-            tracing::warn!(error = %error, "config unavailable; using default audit settings");
-            AuditConfig::default()
+) -> std::io::Result<AuditConfig> {
+    match astrid_config::Config::load_with_home_and_layout(
+        Some(workspace_root),
+        astrid_home,
+        workspace_layout,
+    ) {
+        Ok(resolved) => Ok(resolved.config.audit),
+        Err(workspace_error) => {
+            tracing::warn!(
+                error = %workspace_error,
+                "workspace config unavailable for audit settings; retrying without workspace layer"
+            );
+            match astrid_config::Config::load_with_home_and_layout(
+                None,
+                astrid_home,
+                workspace_layout,
+            ) {
+                Ok(resolved) => {
+                    tracing::warn!(
+                        "using operator audit settings without the workspace overlay"
+                    );
+                    Ok(resolved.config.audit)
+                },
+                Err(operator_error) => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "cannot read audit settings from configuration \
+                         (workspace: {workspace_error}; operator: {operator_error}); \
+                         refusing to clear operator retention and host-audit policy"
+                    ),
+                )),
+            }
         },
-        |resolved| resolved.config.audit,
-    )
+    }
 }
 
 /// Apply `[audit.retention]` to the kernel's audit log.
