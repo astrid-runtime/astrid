@@ -954,7 +954,7 @@ async fn cleanup_daemon_runtime_for_home(
         }
     }
     drop(lock);
-    astrid_core::dirs::retire_legacy_source_tree(&home.run_dir()).with_context(|| {
+    astrid_core::dirs::retire_runtime_run_directory(&home.run_dir()).with_context(|| {
         format!(
             "shutdown stage daemon.runtime_cleanup: {}",
             home.run_dir().display()

@@ -87,7 +87,12 @@ pub(super) fn validate_legacy_tree(path: &Path, root_device: u64) -> io::Result<
     Ok(())
 }
 
-pub(super) fn delete_legacy_tree(path: &Path, root_device: u64) -> io::Result<()> {
+fn delete_tree(
+    path: &Path,
+    root_device: u64,
+    preserve_root_finder_metadata: bool,
+    before_runtime_run_removal: &mut impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -116,8 +121,20 @@ pub(super) fn delete_legacy_tree(path: &Path, root_device: u64) -> io::Result<()
             ));
         }
         ensure_legacy_tree_boundary(&child, root_device, &child_metadata)?;
+        if preserve_root_finder_metadata && entry.file_name() == std::ffi::OsStr::new(".DS_Store") {
+            if !child_metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "runtime directory Finder metadata is not a regular file: {}",
+                        child.display()
+                    ),
+                ));
+            }
+            continue;
+        }
         if child_metadata.is_dir() {
-            delete_legacy_tree(&child, root_device)?;
+            delete_tree(&child, root_device, false, before_runtime_run_removal)?;
         } else if child_metadata.is_file() {
             crate::platform_fs::verify_no_redirects(&child)?;
             std::fs::remove_file(&child)?;
@@ -135,7 +152,41 @@ pub(super) fn delete_legacy_tree(path: &Path, root_device: u64) -> io::Result<()
     // Flush the directory's child removals before removing the directory
     // entry itself. The caller also flushes the containing `var/` directory.
     sync_directory(path)?;
-    std::fs::remove_dir(path)
+    if preserve_root_finder_metadata {
+        before_runtime_run_removal(path)?;
+        remove_runtime_run_directory(path)
+    } else {
+        std::fs::remove_dir(path)
+    }
+}
+
+fn remove_runtime_run_directory(path: &Path) -> io::Result<()> {
+    match std::fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error.kind() == io::ErrorKind::DirectoryNotEmpty
+                && contains_only_regular_finder_metadata(path)? =>
+        {
+            // Finder may recreate this metadata after the walk. Leave it in
+            // place: accepting it is safe, while validating then unlinking it
+            // would introduce a replacement race.
+            sync_directory(path)
+        },
+        Err(error) => Err(error),
+    }
+}
+
+fn contains_only_regular_finder_metadata(path: &Path) -> io::Result<bool> {
+    let mut entries = std::fs::read_dir(path)?;
+    let Some(entry) = entries.next() else {
+        return Ok(false);
+    };
+    let entry = entry?;
+    if entry.file_name() != std::ffi::OsStr::new(".DS_Store") || entries.next().is_some() {
+        return Ok(false);
+    }
+    let metadata = std::fs::symlink_metadata(entry.path())?;
+    Ok(metadata.is_file() && !metadata.file_type().is_symlink())
 }
 
 pub(super) fn validate_legacy_surrealkv_entry(
@@ -198,6 +249,22 @@ fn is_numbered_legacy_file(name: &std::ffi::OsStr, extension: &[u8]) -> bool {
 }
 
 pub(super) fn retire_legacy_source_tree(path: &Path) -> io::Result<()> {
+    retire_tree_root(path, false)
+}
+
+pub(super) fn retire_runtime_run_directory(path: &Path) -> io::Result<()> {
+    retire_tree_root_with_hook(path, true, &mut |_| Ok(()))
+}
+
+fn retire_tree_root(path: &Path, preserve_root_finder_metadata: bool) -> io::Result<()> {
+    retire_tree_root_with_hook(path, preserve_root_finder_metadata, &mut |_| Ok(()))
+}
+
+fn retire_tree_root_with_hook(
+    path: &Path,
+    preserve_root_finder_metadata: bool,
+    before_runtime_run_removal: &mut impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -223,7 +290,12 @@ pub(super) fn retire_legacy_source_tree(path: &Path) -> io::Result<()> {
     // later operator repair or an idempotent restart.
     let root_device = legacy_tree_device(&metadata);
     validate_legacy_tree(path, root_device)?;
-    delete_legacy_tree(path, root_device)?;
+    delete_tree(
+        path,
+        root_device,
+        preserve_root_finder_metadata,
+        before_runtime_run_removal,
+    )?;
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("legacy state source has no parent"))?;
@@ -334,4 +406,89 @@ pub(super) fn sync_directory(path: &Path) -> io::Result<()> {
 #[allow(clippy::unnecessary_wraps)]
 pub(super) fn sync_directory(_path: &Path) -> io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        remove_runtime_run_directory, retire_runtime_run_directory, retire_tree_root_with_hook,
+    };
+
+    #[test]
+    fn runtime_run_retirement_keeps_regular_finder_metadata_without_failing_stop() {
+        let temp = tempfile::tempdir().unwrap();
+        let run = temp.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        std::fs::write(run.join("stale-socket"), b"stale transient").unwrap();
+        std::fs::write(run.join(".DS_Store"), b"Finder metadata").unwrap();
+
+        retire_runtime_run_directory(&run).unwrap();
+
+        assert_eq!(
+            std::fs::read(run.join(".DS_Store")).unwrap(),
+            b"Finder metadata"
+        );
+        assert!(!run.join("stale-socket").exists());
+    }
+
+    #[test]
+    fn runtime_run_retirement_keeps_finder_metadata_created_after_the_walk() {
+        let temp = tempfile::tempdir().unwrap();
+        let run = temp.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        std::fs::write(run.join("stale-socket"), b"stale transient").unwrap();
+
+        retire_tree_root_with_hook(&run, true, &mut |path| {
+            std::fs::write(path.join(".DS_Store"), b"late Finder metadata")
+        })
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(run.join(".DS_Store")).unwrap(),
+            b"late Finder metadata"
+        );
+        assert!(!run.join("stale-socket").exists());
+    }
+
+    #[test]
+    fn runtime_run_final_removal_rejects_nonmetadata_residue() {
+        let temp = tempfile::tempdir().unwrap();
+        let run = temp.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        std::fs::write(run.join("late-runtime-marker"), b"keep me").unwrap();
+
+        let error = remove_runtime_run_directory(&run).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::DirectoryNotEmpty);
+        assert_eq!(
+            std::fs::read(run.join("late-runtime-marker")).unwrap(),
+            b"keep me"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_run_final_removal_rejects_finder_symlink_impostor() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let run = temp.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        std::fs::write(temp.path().join("target"), b"outside").unwrap();
+        symlink(temp.path().join("target"), run.join(".DS_Store")).unwrap();
+
+        let error = remove_runtime_run_directory(&run).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::DirectoryNotEmpty);
+        assert!(
+            std::fs::symlink_metadata(run.join(".DS_Store"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("target")).unwrap(),
+            b"outside"
+        );
+    }
 }
