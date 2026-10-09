@@ -90,14 +90,20 @@ fn markdown_to_spans<'a>(line: &str, theme: &Theme) -> Vec<Span<'a>> {
     }
 
     // Numbered list: 1. item
-    if let Some(rest) = trimmed
-        .strip_prefix(|c: char| c.is_ascii_digit())
-        .and_then(|s| s.strip_prefix(". "))
-    {
+    let digit_end = trimmed
+        .char_indices()
+        .find(|(_, c)| !c.is_ascii_digit())
+        .map_or(trimmed.len(), |(index, _)| index);
+    let (number, suffix) = trimmed.split_at(digit_end);
+    let numbered_rest = if number.is_empty() {
+        None
+    } else {
+        suffix.strip_prefix(". ")
+    };
+    if let Some(rest) = numbered_rest {
         let indent = &line[..line.len().saturating_sub(trimmed.len())];
-        let num_char = trimmed.chars().next().expect("trimmed matched a digit");
         spans.push(Span::styled(
-            format!("{indent}{num_char}. "),
+            format!("{indent}{number}. "),
             Style::default().fg(theme.tool),
         ));
         spans.extend(parse_inline_markdown(rest, theme));
@@ -164,6 +170,10 @@ fn parse_inline_markdown<'a>(text: &str, theme: &Theme) -> Vec<Span<'a>> {
 
     spans
 }
+
+#[cfg(test)]
+#[path = "render_tests.rs"]
+mod tests;
 
 /// Render a completed tool inline in the message stream.
 fn render_inline_tool(lines: &mut Vec<Line<'_>>, app: &App, idx: usize, theme: &Theme) {
