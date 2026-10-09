@@ -8,7 +8,7 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ## [Unreleased]
 
-## [2026.10.0] - 2026-10-08
+## [2026.10.0] - 2026-10-10
 
 ### Added
 
@@ -142,6 +142,10 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 - Local invitation redemption with a named keypair now validates the returned fingerprint and activates the redeemed principal's native signing credential, so switching to it authenticates instead of connecting anonymously. Key-store mutations are serialized, and recovery binding is persisted before credential publication. Existing credentials are never replaced, and deleting the named key removes its matching activated credential even when its public sidecar is missing or stale.
 
 - Require global environment-write authority in addition to capsule-install authority before an installation can overwrite or delete shared capsule secrets. Reject unauthorized requests before staging principal configuration.
+
+- Runtime shutdown now tolerates Finder recreating a regular `.DS_Store` in the
+  transient runtime directory during cleanup. It leaves that metadata untouched
+  and still fails closed for any other residual file, directory, or symlink.
 
 ### Security
 
