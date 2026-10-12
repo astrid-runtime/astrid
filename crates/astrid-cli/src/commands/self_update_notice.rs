@@ -1,4 +1,4 @@
-//! Cached stable-channel notices and package-manager handoff.
+//! Cached release-train notices and package-manager handoff.
 
 use std::path::PathBuf;
 
@@ -50,15 +50,14 @@ pub(super) fn write_cache(channel: UpdateChannel, version: &str) {
 }
 
 pub(crate) async fn check_for_update_cached() -> Option<String> {
+    let channel = notice_channel(CURRENT_VERSION)?;
     let path = cache_path().ok()?;
     if let Ok(data) = std::fs::read_to_string(&path)
         && let Ok(cache) = serde_json::from_str::<UpdateCache>(&data)
         && now_epoch().saturating_sub(cache.checked_at) < CHECK_TTL_SECS
-        && cache.channel == UpdateChannel::Stable.as_str()
+        && cache.channel == channel.as_str()
     {
-        let current = semver::Version::parse(CURRENT_VERSION).ok()?;
-        let selected = semver::Version::parse(&cache.latest_version).ok()?;
-        return (selected != current).then_some(cache.latest_version);
+        return newer_notice_version(CURRENT_VERSION, &cache.latest_version);
     }
 
     let target = platform_target().ok()?;
@@ -70,22 +69,38 @@ pub(crate) async fn check_for_update_cached() -> Option<String> {
         .ok()?;
     let resolved = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        update_channel::resolve_signed_channel(
-            &client,
-            &owner,
-            &repo,
-            UpdateChannel::Stable,
-            target,
-        ),
+        update_channel::resolve_signed_channel(&client, &owner, &repo, channel, target),
     )
     .await
     .ok()?
     .ok()?;
     let version = resolved.version;
-    write_cache(UpdateChannel::Stable, &version);
-    let current = semver::Version::parse(CURRENT_VERSION).ok()?;
-    let selected = semver::Version::parse(&version).ok()?;
-    (selected != current).then_some(version)
+    write_cache(channel, &version);
+    newer_notice_version(CURRENT_VERSION, &version)
+}
+
+// Automatic notices do not request a channel switch. Explicit updates still
+// honor the signed channel in either direction, including operator rollbacks.
+fn notice_channel(version: &str) -> Option<UpdateChannel> {
+    let version = semver::Version::parse(version).ok()?;
+    if version.pre.is_empty() {
+        Some(UpdateChannel::Stable)
+    } else if version.pre.as_str().starts_with("rc.") {
+        Some(UpdateChannel::Dev)
+    } else if version.pre.as_str().starts_with("nightly.") {
+        Some(UpdateChannel::Nightly)
+    } else {
+        None
+    }
+}
+
+fn newer_notice_version(current: &str, selected: &str) -> Option<String> {
+    let current = semver::Version::parse(current).ok()?;
+    let candidate = semver::Version::parse(selected).ok()?;
+    candidate
+        .cmp_precedence(&current)
+        .is_gt()
+        .then(|| selected.to_owned())
 }
 
 pub(crate) async fn print_update_banner() {
@@ -94,14 +109,21 @@ pub(crate) async fn print_update_banner() {
     };
     let current = semver::Version::parse(CURRENT_VERSION).ok();
     let selected = semver::Version::parse(&latest).ok();
+    let Some(channel) = notice_channel(CURRENT_VERSION) else {
+        return;
+    };
     let how = running_binary()
         .ok()
         .map(|executable| InstallMethod::detect(&executable))
         .and_then(|method| {
             managed_update_command(method, current.as_ref()?, selected.as_ref()?, &latest)
-                .or_else(|| Some(method.upgrade_command(UpdateChannel::Stable).to_owned()))
+                .or_else(|| Some(method.upgrade_command(channel).to_owned()))
         })
-        .unwrap_or_else(|| "astrid update".to_owned());
+        .unwrap_or_else(|| {
+            InstallMethod::SelfManaged
+                .upgrade_command(channel)
+                .to_owned()
+        });
     eprintln!(
         "{}",
         Theme::warning(&format!(
@@ -177,6 +199,42 @@ pub(super) fn handle_managed_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_notice_follows_the_running_release_train() {
+        for (version, expected) in [
+            ("2026.9.4", Some(UpdateChannel::Stable)),
+            ("2026.10.0-rc.3", Some(UpdateChannel::Dev)),
+            (
+                "2026.10.0-nightly.20261012.g0123456789abcdef0123456789abcdef01234567",
+                Some(UpdateChannel::Nightly),
+            ),
+            ("2026.10.0-custom.1", None),
+            ("invalid", None),
+        ] {
+            assert_eq!(notice_channel(version), expected, "{version}");
+        }
+    }
+
+    #[test]
+    fn automatic_notice_only_advertises_newer_precedence() {
+        for (current, selected, expected) in [
+            ("2026.10.0-rc.3", "2026.9.4", false),
+            ("2026.10.0-rc.3", "2026.10.0-rc.2", false),
+            ("2026.10.0-rc.3", "2026.10.0-rc.3", false),
+            ("2026.10.0-rc.3", "2026.10.0-rc.4", true),
+            ("2026.10.0-rc.3", "2026.10.0", true),
+            ("2026.9.4", "2026.9.5", true),
+            ("2026.9.4+build.1", "2026.9.4+build.2", false),
+            ("2026.9.4", "invalid", false),
+        ] {
+            assert_eq!(
+                newer_notice_version(current, selected).is_some(),
+                expected,
+                "{current} -> {selected}"
+            );
+        }
+    }
 
     #[test]
     fn update_notice_does_not_initialize_an_undeclared_home() {
