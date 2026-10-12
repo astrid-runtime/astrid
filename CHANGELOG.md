@@ -50,6 +50,9 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ### Fixed
 
+- Show the authenticated principal in ingress-consent prompts and display
+  metadata for both legacy and modern MCP clients. Label the ingress source
+  as a source identity rather than claiming it is a unique session ID.
 - Use the same runtime compatibility rules for capsule and distro manifests,
   so dev release candidates can load capsules with satisfied stable minimum
   versions while preserving explicit prerelease ordering and version bounds.

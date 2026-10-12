@@ -410,12 +410,18 @@ mod tests {
                 .expect("ingress mrtr"),
         );
         let ingress_legacy = consent_from_params(
-            &form_params::<IngressForm>("Allow?", &ConsentDisplay::ingress().with_tool("fs.read"))
-                .expect("legacy ingress"),
+            &form_params::<IngressForm>(
+                "Allow?",
+                &ConsentDisplay::ingress()
+                    .with_tool("fs.read")
+                    .with_principal(principal.to_string()),
+            )
+            .expect("legacy ingress"),
         );
         assert_eq!(ingress, ingress_legacy);
         assert_eq!(ingress["kind"], "ingress");
         assert_eq!(ingress["tool"], "fs.read");
+        assert_eq!(ingress["principal"], "codex-code");
 
         let GrantSignal::Present(grant_request) = GrantRequest::classify(&json!({
             "grant_required": {

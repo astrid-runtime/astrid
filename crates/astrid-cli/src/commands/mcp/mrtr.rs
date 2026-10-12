@@ -184,8 +184,8 @@ impl MrtrBridge {
             )
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
 
-        let params =
-            form_params::<T>(prompt, &consent_display_for(pending, tool)).map_err(|error| {
+        let params = form_params::<T>(prompt, &consent_display_for(pending, tool, principal))
+            .map_err(|error| {
                 McpError::internal_error(format!("failed to build consent schema: {error}"), None)
             })?;
         let request = ElicitRequest::new(params);
@@ -259,9 +259,15 @@ impl MrtrBridge {
     }
 }
 
-fn consent_display_for(pending: &PendingConsent, tool: &str) -> ConsentDisplay {
+fn consent_display_for(
+    pending: &PendingConsent,
+    tool: &str,
+    principal: &PrincipalId,
+) -> ConsentDisplay {
     match pending {
-        PendingConsent::Ingress => ConsentDisplay::ingress().with_tool(tool),
+        PendingConsent::Ingress => ConsentDisplay::ingress()
+            .with_tool(tool)
+            .with_principal(principal.to_string()),
         PendingConsent::Grant { request, .. } => request.consent_display(),
         PendingConsent::Approval { request } => request.consent_display(),
     }
