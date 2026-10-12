@@ -26,6 +26,9 @@
 //! * The broker acks on `astrid.v1.response.<req_id>` with
 //!   `{ kind:"ingress.respond", req_id, granted:bool }`. The shim only
 //!   re-sends the parked `tools/call` when `granted` is true.
+//! * Accepted ingress trust is persisted by the broker for this principal
+//!   and kernel-stamped source. Closing an MCP connection or restarting the
+//!   runtime does not expire it; presentation must disclose that duration.
 //!
 //! ## Capability gating and fail-secure
 //!
@@ -67,7 +70,7 @@ pub(super) const INGRESS_RESPOND_TOPIC: &str = "astrid.v1.request.mcp.ingress.re
 /// enum, see `elicit::ApprovalForm`).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(super) struct IngressForm {
-    /// Whether to allow Astrid tool calls from this session's ingress.
+    /// Whether to persist trust for tool calls through this ingress.
     pub(super) allow: bool,
 }
 
@@ -140,7 +143,9 @@ impl IngressRequest {
         if !self.source_id.is_empty() {
             let _ = write!(p, "\nIngress source: {}", self.source_id);
         }
-        p.push_str("\n\nAllow Astrid tool calls from this session?");
+        p.push_str(
+            "\n\nApproval trusts this ingress for this principal and persists across reconnects and runtime restarts. Individual tool and capsule permissions still apply.\n\nAllow Astrid tool calls through this ingress?",
+        );
         p
     }
 
@@ -281,5 +286,21 @@ mod tests {
         let display = serde_json::to_value(request.consent_display()).expect("display");
         assert_eq!(display["principal"], "claude-code");
         assert!(display.get("source_id").is_none());
+    }
+
+    #[test]
+    fn ingress_consent_discloses_persistent_trust() {
+        let request = IngressRequest::from_reply(&json!({
+            "ingress_approval_required": true,
+            "source_id": "src-1",
+            "tool_name": "fs.read"
+        }))
+        .expect("ingress signal");
+        let prompt = request.prompt();
+        assert!(prompt.contains("persists across reconnects and runtime restarts"));
+        assert!(!prompt.contains("from this session?"));
+        let display = serde_json::to_value(request.consent_display()).expect("display");
+        assert_eq!(display["choices"][0]["lifetime"], "durable");
+        assert_eq!(display["choices"][1]["lifetime"], "none");
     }
 }

@@ -123,12 +123,13 @@ impl ConsentDisplay {
         )
     }
 
-    /// Ingress trust: `{allow: bool}`. `true` lasts this MCP session.
+    /// Ingress trust: `{allow: bool}`. The broker persists `true` for the
+    /// kernel-stamped source in the principal's KV store before acknowledging.
     pub(super) fn ingress() -> Self {
         Self::base(
             ConsentKind::Ingress,
             vec![
-                choice_bool(true, ConsentLifetime::Session),
+                choice_bool(true, ConsentLifetime::Durable),
                 choice_bool(false, ConsentLifetime::None),
             ],
         )
@@ -322,7 +323,7 @@ mod tests {
         assert_eq!(
             consent["choices"],
             json!([
-                {"value": true, "lifetime": "session"},
+                {"value": true, "lifetime": "durable"},
                 {"value": false, "lifetime": "none"}
             ])
         );
@@ -422,6 +423,8 @@ mod tests {
         assert_eq!(ingress["kind"], "ingress");
         assert_eq!(ingress["tool"], "fs.read");
         assert_eq!(ingress["principal"], "codex-code");
+        assert_eq!(ingress["choices"][0]["lifetime"], "durable");
+        assert_eq!(ingress["choices"][1]["lifetime"], "none");
 
         let GrantSignal::Present(grant_request) = GrantRequest::classify(&json!({
             "grant_required": {
