@@ -15,6 +15,7 @@ use crate::{socket_client, theme};
 mod boot_log;
 pub(crate) mod projection;
 mod ready;
+mod start_fence;
 mod temporary;
 mod workspace_fingerprint;
 use boot_log::prepare_boot_stderr;
@@ -420,29 +421,10 @@ fn start_clears_sentinels(action: StartAction) -> bool {
 pub(crate) async fn acquire_daemon_start_fence() -> Result<Arc<std::fs::File>> {
     let home = astrid_core::dirs::AstridHome::resolve().context("failed to resolve Astrid home")?;
     let path = daemon_start_fence_path(&home)?;
-    let file = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-            }
-        }
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options.open(&path)?;
-        file.lock()?;
-        Ok(file)
-    })
-    .await
-    .context("daemon start fence task failed")?
-    .map_err(|error| anyhow::anyhow!("failed to acquire daemon start fence: {error}"))?;
+    let file = tokio::task::spawn_blocking(move || start_fence::open(&path))
+        .await
+        .context("daemon start fence task failed")?
+        .map_err(|error| anyhow::anyhow!("failed to acquire daemon start fence: {error}"))?;
     Ok(Arc::new(file))
 }
 

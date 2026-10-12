@@ -131,3 +131,27 @@ fn redirected_temporary_directory_is_refused_before_runtime_mutation() {
         assert!(!home.join("run").exists());
     }
 }
+
+#[test]
+fn symlinked_fence_directory_is_refused_without_mutating_home() {
+    let directory = tempfile::tempdir().expect("owned test root");
+    let home = directory.path().join("runtime");
+    let temporary = directory.path().join("temporary");
+    std::fs::create_dir(&home).expect("fresh runtime");
+    std::fs::create_dir(&temporary).expect("temporary root");
+    std::os::unix::fs::symlink(&home, temporary.join("astrid-start-fences"))
+        .expect("redirect fence directory");
+    let output = cli(&home)
+        .arg("start")
+        .env("TMPDIR", &temporary)
+        .env("TMP", &temporary)
+        .env("TEMP", &temporary)
+        .output()
+        .expect("refused startup");
+    assert!(!output.status.success(), "redirected startup must fail");
+    assert_eq!(
+        std::fs::read_dir(&home).expect("runtime entries").count(),
+        0,
+        "start fence must not follow a directory alias into runtime"
+    );
+}
