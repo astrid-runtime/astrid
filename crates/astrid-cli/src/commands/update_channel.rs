@@ -547,7 +547,7 @@ fn validate_pointer(
     Ok(())
 }
 
-fn is_release_candidate(version: &semver::Version) -> bool {
+pub(super) fn is_release_candidate(version: &semver::Version) -> bool {
     version
         .pre
         .as_str()
@@ -559,7 +559,7 @@ fn is_release_candidate(version: &semver::Version) -> bool {
         })
 }
 
-fn nightly_source_commit(version: &semver::Version) -> Option<&str> {
+pub(super) fn nightly_source_commit(version: &semver::Version) -> Option<&str> {
     let mut parts = version.pre.as_str().split('.');
     let kind = parts.next()?;
     let date = parts.next()?;

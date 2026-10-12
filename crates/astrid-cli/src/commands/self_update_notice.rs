@@ -85,9 +85,9 @@ fn notice_channel(version: &str) -> Option<UpdateChannel> {
     let version = semver::Version::parse(version).ok()?;
     if version.pre.is_empty() {
         Some(UpdateChannel::Stable)
-    } else if version.pre.as_str().starts_with("rc.") {
+    } else if update_channel::is_release_candidate(&version) {
         Some(UpdateChannel::Dev)
-    } else if version.pre.as_str().starts_with("nightly.") {
+    } else if update_channel::nightly_source_commit(&version).is_some() {
         Some(UpdateChannel::Nightly)
     } else {
         None
@@ -210,6 +210,15 @@ mod tests {
                 Some(UpdateChannel::Nightly),
             ),
             ("2026.10.0-custom.1", None),
+            ("2026.10.0-rc.foo", None),
+            ("2026.10.0-rc.0", None),
+            ("2026.10.0-rc.1.extra", None),
+            ("2026.10.0-nightly.foo", None),
+            (
+                "2026.10.0-nightly.20260230.g0123456789abcdef0123456789abcdef01234567",
+                None,
+            ),
+            ("2026.10.0-nightly.20261012.gdeadbeef", None),
             ("invalid", None),
         ] {
             assert_eq!(notice_channel(version), expected, "{version}");
