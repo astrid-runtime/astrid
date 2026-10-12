@@ -240,10 +240,12 @@ impl AstridMcpServer {
         // daemon died while we waited) apart from a legitimate slow-broker
         // deadline.
         match client
-            .read_until_topic_typed(&reply_topic, REQUEST_DEADLINE)
+            .read_until_matching_typed(REQUEST_DEADLINE, |raw| {
+                super::terminal_failure::accepts(raw, &reply_topic, req_id, self.principal.as_str())
+            })
             .await
         {
-            Ok(raw) => Ok(unwrap_reply_payload(&raw)),
+            Ok(raw) => super::terminal_failure::reply(&raw, req_id, self.principal.as_str()),
 
             // Connection died mid-wait. The held socket is now unusable, so the
             // NEXT request must reconnect first — always flag that. Whether we
@@ -268,7 +270,9 @@ impl AstridMcpServer {
                         )
                     })?;
                     let raw = client
-                        .read_until_topic_typed(&reply_topic, REQUEST_DEADLINE)
+                        .read_until_matching_typed(REQUEST_DEADLINE, |raw| {
+                            super::terminal_failure::accepts(raw, &reply_topic, req_id, self.principal.as_str())
+                        })
                         .await
                         .map_err(|re| {
                             // Flag again — the retry's connection may also be dead.
@@ -281,7 +285,7 @@ impl AstridMcpServer {
                                 None,
                             )
                         })?;
-                    Ok(unwrap_reply_payload(&raw))
+                    super::terminal_failure::reply(&raw, req_id, self.principal.as_str())
                 } else {
                     // Mutating / side-effecting request: surface the loss to the
                     // MCP client (it must decide whether to re-issue), but keep

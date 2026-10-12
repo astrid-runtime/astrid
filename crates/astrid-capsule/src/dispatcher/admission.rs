@@ -98,6 +98,7 @@ impl ReservedEventDelivery for CommittedDelivery {
 enum Delivery {
     Queues(Vec<(mpsc::OwnedPermit<InterceptorWork>, InterceptorWork)>),
     Chain {
+        bus: Arc<EventBus>,
         queues: CapsuleQueues,
         locks: ChainLocks,
         matches: InterceptorMatches,
@@ -120,13 +121,14 @@ impl ReservedEventDelivery for Delivery {
                 }
             },
             Self::Chain {
+                bus,
                 queues,
                 locks,
                 matches,
                 topic,
                 payload,
             } => {
-                dispatch_to_capsule_queues(&queues, &locks, matches, topic, payload, message);
+                dispatch_to_capsule_queues(&bus, &queues, &locks, matches, topic, payload, message);
             },
         }
     }
@@ -196,6 +198,7 @@ impl EventDeliveryAdmitter for Admitter {
         {
             // Preserve the existing ordered middleware-chain semantics.
             return Ok(committed(Delivery::Chain {
+                bus: Arc::clone(&bus),
                 queues: Arc::clone(&self.queues),
                 locks: Arc::clone(&self.chain_locks),
                 matches,
@@ -224,6 +227,7 @@ impl EventDeliveryAdmitter for Admitter {
             None
         };
         let mut reservations = Vec::with_capacity(matches.len());
+        let sole_consumer = matches.len() == 1;
         for (runtime_id, capsule, action, _) in matches {
             let requested = (runtime_id, principal.map(str::to_owned));
             let (key, sender) = get_or_spawn_consumer(&self.queues, &capsule, requested);
@@ -256,6 +260,9 @@ impl EventDeliveryAdmitter for Admitter {
                     payload: Arc::clone(&payload),
                     topic: Arc::clone(&topic),
                     ipc_message: None,
+                    failure: sole_consumer
+                        .then(|| failure::TerminalFailure::capture(&bus, message))
+                        .flatten(),
                 },
             ));
         }

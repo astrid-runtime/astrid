@@ -718,6 +718,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn terminal_failure_is_delivered_only_to_its_captured_owner() {
+        let owner = RequestOwnerId::generate();
+        let foreign = RequestOwnerId::generate();
+        let request = IpcMessage::new(
+            Topic::from_raw("astrid.v1.request.example"),
+            IpcPayload::RawJson(serde_json::json!({"req_id":"1234567890abcdef1234567890abcdef"})),
+            uuid::Uuid::nil(),
+        )
+        .with_principal("alice")
+        .with_request_owner(owner)
+        .with_origin(astrid_types::ipc::MessageOrigin::LocalSocket);
+        let reply = astrid_types::ipc::request_failure::RequestFailureBinding::capture(&request)
+            .unwrap()
+            .message("deadline exceeded");
+        assert!(request_owner_allows(&reply, owner));
+        assert!(!request_owner_allows(&reply, foreign));
+    }
+
+    #[test]
     fn unanswered_human_requests_have_a_bounded_lifetime_on_the_connection() {
         let queue = EgressQueue::new();
         let owner = RequestOwnerId::generate();

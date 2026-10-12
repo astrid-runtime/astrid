@@ -22,6 +22,8 @@ use astrid_events::ipc::Topic;
 
 #[path = "dispatcher/delivery_tests.rs"]
 mod delivery_tests;
+#[path = "dispatcher/failure_tests.rs"]
+mod failure_tests;
 
 /// A minimal mock capsule for dispatch tests.
 #[derive(Clone)]
@@ -965,10 +967,13 @@ async fn dispatch_respawns_when_mapped_consumer_is_closed() {
         &queues,
         (runtime_id, Some("alice".to_string())),
         Arc::clone(&capsule),
-        "test_action".to_string(),
-        Arc::new("respawn.topic".to_string()),
-        Arc::new(Vec::new()),
-        None,
+        InterceptorWork {
+            action: "test_action".to_string(),
+            topic: Arc::new("respawn.topic".to_string()),
+            payload: Arc::new(Vec::new()),
+            ipc_message: None,
+            failure: None,
+        },
     );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(2);

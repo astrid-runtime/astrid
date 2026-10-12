@@ -7,6 +7,8 @@ use uuid::Uuid;
 
 use crate::topic::Topic;
 
+pub mod request_failure;
+
 /// Opaque host-minted owner of an authenticated request scope.
 ///
 /// The value is internal routing metadata, not a credential. It is minted by
