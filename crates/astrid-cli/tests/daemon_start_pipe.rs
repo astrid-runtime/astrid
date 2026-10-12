@@ -1,4 +1,4 @@
-//! A detached persistent daemon must not retain its launcher's output stream.
+//! A detached daemon must not retain its launcher's output stream.
 #![cfg(unix)]
 
 use std::io::Read as _;
@@ -29,16 +29,23 @@ impl Drop for StopOnDrop<'_> {
     }
 }
 
-fn start_and_check_eof(home: &Path) {
+fn start_and_check_eof(home: &Path, ephemeral: bool) {
     let (mut reader, writer) = UnixStream::pair().expect("captured stderr");
     reader
         .set_read_timeout(Some(Duration::from_secs(3)))
         .expect("read deadline");
-    let mut launcher = cli(home)
-        .arg("start")
+    let mut command = cli(home);
+    command.arg("start");
+    if ephemeral {
+        command.arg("--ephemeral");
+    }
+    let mut launcher = command
         .stderr(Stdio::from(OwnedFd::from(writer)))
         .spawn()
         .expect("start launcher");
+    // Command retains its configured Stdio after spawn; the test itself must
+    // release that writer before checking the child's inherited descriptors.
+    drop(command);
     let _cleanup = StopOnDrop(home);
     let started = Instant::now();
     loop {
@@ -66,14 +73,61 @@ fn start_and_check_eof(home: &Path) {
     );
 }
 
-#[test]
-fn captured_start_returns_for_fresh_and_volume_only_homes() {
+fn check_fresh_and_volume_only_homes(ephemeral: bool) {
     let directory = tempfile::tempdir().expect("owned test root");
     let home = directory.path().join("runtime");
     std::fs::create_dir(&home).expect("runtime root");
-    start_and_check_eof(&home);
+    start_and_check_eof(&home, ephemeral);
     assert_eq!(std::fs::read_dir(&home).expect("stopped root").count(), 1);
     assert!(home.join("astrid.volume").is_file());
-    start_and_check_eof(&home);
+    start_and_check_eof(&home, ephemeral);
     assert_eq!(std::fs::read_dir(&home).expect("stopped root").count(), 1);
+}
+
+#[test]
+fn captured_persistent_start_returns_for_fresh_and_volume_only_homes() {
+    check_fresh_and_volume_only_homes(false);
+}
+
+#[test]
+fn captured_ephemeral_start_returns_for_fresh_and_volume_only_homes() {
+    check_fresh_and_volume_only_homes(true);
+}
+
+#[test]
+fn redirected_temporary_directory_is_refused_before_runtime_mutation() {
+    for ephemeral in [false, true] {
+        let directory = tempfile::tempdir().expect("owned test root");
+        let home = directory.path().join("runtime");
+        let temporary = home.join("temporary");
+        std::fs::create_dir_all(&temporary).expect("configured temporary directory");
+        let mut command = cli(&home);
+        command
+            .arg("start")
+            .env("TMPDIR", &temporary)
+            .env("TMP", &temporary)
+            .env("TEMP", &temporary);
+        if ephemeral {
+            command.arg("--ephemeral");
+        }
+        let output = command.output().expect("refused startup");
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("daemon temporary directory must be outside Astrid home"),
+            "unexpected refusal: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_dir(&home).expect("runtime entries").count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_dir(&temporary)
+                .expect("temporary entries")
+                .count(),
+            0
+        );
+        assert!(!home.join("run").exists());
+    }
 }

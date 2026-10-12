@@ -15,6 +15,7 @@ use crate::{socket_client, theme};
 mod boot_log;
 pub(crate) mod projection;
 mod ready;
+mod temporary;
 mod workspace_fingerprint;
 use boot_log::prepare_boot_stderr;
 use projection::pack_stopped_projection;
@@ -418,7 +419,7 @@ fn start_clears_sentinels(action: StartAction) -> bool {
 /// that the same pathname is dead and race their children onto the singleton.
 pub(crate) async fn acquire_daemon_start_fence() -> Result<Arc<std::fs::File>> {
     let home = astrid_core::dirs::AstridHome::resolve().context("failed to resolve Astrid home")?;
-    let path = daemon_start_fence_path(&home);
+    let path = daemon_start_fence_path(&home)?;
     let file = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -455,11 +456,11 @@ pub(crate) fn validate_runtime_admission() -> Result<()> {
 }
 
 /// Keep the start fence outside the home until the kernel admits its layout.
-fn daemon_start_fence_path(home: &astrid_core::dirs::AstridHome) -> std::path::PathBuf {
+fn daemon_start_fence_path(home: &astrid_core::dirs::AstridHome) -> Result<std::path::PathBuf> {
     let digest = blake3::hash(home.root().to_string_lossy().as_bytes());
-    std::env::temp_dir()
+    Ok(temporary::outside_home(home)?
         .join("astrid-start-fences")
-        .join(format!("{digest}.lock"))
+        .join(format!("{digest}.lock")))
 }
 
 /// Handle `astrid start`.

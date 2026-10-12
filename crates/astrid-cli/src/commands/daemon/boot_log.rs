@@ -9,12 +9,13 @@ pub(super) struct BootLog {
 }
 
 pub(super) fn prepare_boot_stderr() -> Result<(Stdio, BootLog)> {
-    let home = astrid_core::dirs::AstridHome::resolve().ok();
-    prepare_for_home(home.as_ref())
+    let home = astrid_core::dirs::AstridHome::resolve()
+        .context("failed to resolve Astrid home for boot diagnostics")?;
+    prepare_for_home(&home)
 }
 
-fn prepare_for_home(home: Option<&astrid_core::dirs::AstridHome>) -> Result<(Stdio, BootLog)> {
-    if let Some(stderr) = home.and_then(initialized_home_stderr) {
+fn prepare_for_home(home: &astrid_core::dirs::AstridHome) -> Result<(Stdio, BootLog)> {
+    if let Some(stderr) = initialized_home_stderr(home) {
         return Ok((stderr, BootLog { temporary: None }));
     }
 
@@ -24,7 +25,7 @@ fn prepare_for_home(home: Option<&astrid_core::dirs::AstridHome>) -> Result<(Std
     // its open descriptor. Retain it only when startup needs operator recovery.
     let temporary = tempfile::Builder::new()
         .prefix("astrid-daemon-boot-")
-        .tempfile()
+        .tempfile_in(super::temporary::outside_home(home)?)
         .context("failed to create detached daemon boot log")?;
     let (file, path) = temporary.into_parts();
     Ok((
@@ -79,7 +80,7 @@ mod tests {
     fn fresh_home_capture_stays_outside_layout_and_cleans_up() {
         let root = tempfile::tempdir().expect("test root");
         let home = astrid_core::dirs::AstridHome::from_path(root.path().join("home"));
-        let (stderr, log) = prepare_for_home(Some(&home)).expect("detached stderr");
+        let (stderr, log) = prepare_for_home(&home).expect("detached stderr");
         let path = log
             .temporary
             .as_ref()
@@ -103,7 +104,9 @@ mod tests {
 
     #[test]
     fn failed_boot_retains_capture_file() {
-        let (stderr, mut log) = prepare_for_home(None).expect("detached stderr");
+        let root = tempfile::tempdir().expect("test root");
+        let home = astrid_core::dirs::AstridHome::from_path(root.path().join("home"));
+        let (stderr, mut log) = prepare_for_home(&home).expect("detached stderr");
         let path = log
             .temporary
             .as_ref()
