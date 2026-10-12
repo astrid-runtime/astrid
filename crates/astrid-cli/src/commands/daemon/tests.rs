@@ -39,7 +39,7 @@ fn fresh_home_boot_log_does_not_preinitialize_layout() {
     let root = temp.path().join("astrid-home");
     let home = astrid_core::dirs::AstridHome::from_path(&root);
 
-    assert!(boot_log_stderr_for_home(&home).is_none());
+    assert!(boot_log::initialized_home_stderr(&home).is_none());
     assert!(
         !root.exists(),
         "boot-log capture must not create content before kernel admission"

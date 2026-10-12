@@ -12,9 +12,11 @@ use crate::commands::daemon_control;
 use crate::formatter::OutputFormat;
 use crate::{socket_client, theme};
 
+mod boot_log;
 pub(crate) mod projection;
 mod ready;
 mod workspace_fingerprint;
+use boot_log::prepare_boot_stderr;
 use projection::pack_stopped_projection;
 pub(crate) use projection::retire_disconnected_projection;
 pub(crate) use projection::with_persistent_daemon_projection;
@@ -32,41 +34,6 @@ fn log_hint() -> String {
     astrid_core::dirs::AstridHome::resolve()
         .map(|h| format!(" Check logs: {}", h.log_dir().display()))
         .unwrap_or_default()
-}
-
-/// Open the daemon boot log (`log/daemon-boot.log`) for append in an already
-/// initialized Astrid home, so the spawned daemon's stderr is captured.
-///
-/// A lock-acquisition failure (or any panic) before the kernel's own tracing
-/// subscriber initializes prints to stderr and is otherwise lost when stderr
-/// is detached. A fresh home must remain untouched until the kernel captures
-/// its layout origin and durably admits it, so callers inherit stderr when no
-/// layout sentinel exists instead of creating `log/` prematurely.
-fn boot_log_stderr_for_home(home: &astrid_core::dirs::AstridHome) -> Option<std::process::Stdio> {
-    if !matches!(home.layout_version(), Ok(Some(_))) {
-        return None;
-    }
-    let log_dir = home.log_dir();
-    std::fs::create_dir_all(&log_dir).ok()?;
-    let path = log_dir.join("daemon-boot.log");
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).append(true);
-    // Boot stderr can carry sensitive paths/state (home layout, lock paths,
-    // panic backtraces) — create it owner-only so other users can't read it.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    let file = opts.open(path).ok()?;
-    Some(std::process::Stdio::from(file))
-}
-
-fn boot_log_stderr() -> std::process::Stdio {
-    astrid_core::dirs::AstridHome::resolve()
-        .ok()
-        .and_then(|home| boot_log_stderr_for_home(&home))
-        .unwrap_or_else(std::process::Stdio::inherit)
 }
 
 /// Spawn the daemon process and wait for it to signal readiness.
@@ -100,9 +67,9 @@ async fn spawn_daemon_inner(
     // Capture the daemon's stderr to an append log so a boot failure (lock
     // contention, panic before tracing init) leaves a record instead of
     // vanishing into /dev/null. Stdout stays null — the daemon logs through
-    // tracing, not stdout. A fresh home inherits stderr so opening the boot log
-    // cannot preempt the kernel's durable fresh-layout admission.
-    let stderr = boot_log_stderr();
+    // tracing, not stdout. The fallback log lives outside the runtime layout,
+    // preserving admission without retaining the caller's output pipe.
+    let (stderr, mut boot_log) = prepare_boot_stderr()?;
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(stderr);
@@ -123,15 +90,18 @@ async fn spawn_daemon_inner(
     match wait_for_ready(ready_path, &mut child, timeout_secs).await {
         ReadyWaitOutcome::Ready => Ok(child),
         ReadyWaitOutcome::ChildExited(status) => {
-            anyhow::bail!("Daemon exited prematurely ({status}).{}", log_hint());
+            anyhow::bail!(
+                "Daemon exited prematurely ({status}).{}",
+                boot_log.failure_hint()?
+            );
         },
         ReadyWaitOutcome::StillRunning => {
+            let hint = boot_log.failure_hint()?;
             // Do not SIGKILL a live first cutover (layout-1 audit import
             // can outlive the wait). Disown and tell the operator.
             disown_if_still_running(child);
             anyhow::bail!(
-                "Daemon is still starting after {timeout_secs} seconds; it was left running. Check logs or run `astrid status` / retry later.{}",
-                log_hint()
+                "Daemon is still starting after {timeout_secs} seconds; it was left running. Check logs or run `astrid status` / retry later.{hint}"
             );
         },
     }
@@ -298,9 +268,9 @@ async fn spawn_persistent_daemon_inner(workspace_root: Option<&Path>) -> Result<
     // Capture the daemon's stderr to an append log so a boot failure (lock
     // contention, panic before tracing init) leaves a record instead of
     // vanishing into /dev/null. Stdout stays null — the daemon logs through
-    // tracing, not stdout. A fresh home inherits stderr so opening the boot log
-    // cannot preempt the kernel's durable fresh-layout admission.
-    let stderr = boot_log_stderr();
+    // tracing, not stdout. The fallback log lives outside the runtime layout,
+    // preserving admission without retaining the caller's output pipe.
+    let (stderr, mut boot_log) = prepare_boot_stderr()?;
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(stderr);
@@ -321,15 +291,19 @@ async fn spawn_persistent_daemon_inner(workspace_root: Option<&Path>) -> Result<
             Ok(())
         },
         ReadyWaitOutcome::ChildExited(status) => {
-            anyhow::bail!("Daemon exited prematurely ({status}).{}", log_hint());
+            anyhow::bail!(
+                "Daemon exited prematurely ({status}).{}",
+                boot_log.failure_hint()?
+            );
         },
         ReadyWaitOutcome::StillRunning => {
+            let hint = boot_log.failure_hint()?;
             // First cutover can outlive the wait. Never SIGKILL a live migrator.
             disown_if_still_running(child);
             println!(
                 "{}",
                 theme::Theme::warning(&format!(
-                    "Astrid daemon is still starting after {timeout_secs} seconds (first cutover can outlive this wait). It was left running. Check logs or run `astrid status` later."
+                    "Astrid daemon is still starting after {timeout_secs} seconds (first cutover can outlive this wait). It was left running.{hint} Run `astrid status` later."
                 ))
             );
             Ok(())
