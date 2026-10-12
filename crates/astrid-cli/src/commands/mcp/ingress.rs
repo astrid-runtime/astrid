@@ -130,7 +130,7 @@ impl IngressRequest {
     /// secret.
     pub(super) fn prompt(&self) -> String {
         let mut p = String::from(
-            "An MCP client is asking Astrid to run tool calls through this ingress for the first time.",
+            "This MCP ingress approval persists across reconnects and runtime restarts.\nIndividual tool and capsule permissions still apply.",
         );
         if let Some(principal) = &self.principal {
             let _ = write!(p, "\nPrincipal: {principal}");
@@ -143,9 +143,7 @@ impl IngressRequest {
         if !self.source_id.is_empty() {
             let _ = write!(p, "\nIngress source: {}", self.source_id);
         }
-        p.push_str(
-            "\n\nApproval trusts this ingress for this principal and persists across reconnects and runtime restarts. Individual tool and capsule permissions still apply.\n\nAllow Astrid tool calls through this ingress?",
-        );
+        p.push_str("\n\nAllow Astrid tool calls through this ingress for this principal?");
         p
     }
 
@@ -297,7 +295,9 @@ mod tests {
         }))
         .expect("ingress signal");
         let prompt = request.prompt();
-        assert!(prompt.contains("persists across reconnects and runtime restarts"));
+        assert!(prompt.starts_with(
+            "This MCP ingress approval persists across reconnects and runtime restarts."
+        ));
         assert!(!prompt.contains("from this session?"));
         let display = serde_json::to_value(request.consent_display()).expect("display");
         assert_eq!(display["choices"][0]["lifetime"], "durable");
