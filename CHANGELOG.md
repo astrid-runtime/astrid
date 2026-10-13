@@ -157,6 +157,8 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 - Disclose that approved MCP ingress trust persists across reconnects and runtime restarts, and label it as durable in consent metadata for both legacy and async elicitation.
 
+- Embed the selected release source commit in the CLI version output on native, GNU and MUSL builds, including prepare-only builds of an explicitly selected source.
+
 ### Security
 
 - Update Wasmtime and WASI to 48.0.4, incorporating the September and October
