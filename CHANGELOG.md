@@ -8,7 +8,7 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ## [Unreleased]
 
-## [2026.10.0] - 2026-10-10
+## [2026.10.0] - 2026-10-13
 
 ### Added
 
@@ -146,6 +146,16 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 - Runtime shutdown now tolerates Finder recreating a regular `.DS_Store` in the
   transient runtime directory during cleanup. It leaves that metadata untouched
   and still fails closed for any other residual file, directory, or symlink.
+
+- Automatic update notices follow the running stable, release-candidate or nightly train and no longer advertise an older version as an upgrade. Explicit channel switches and signed rollbacks remain supported. The dependency lock includes the patched QUIC protocol release already adopted on main.
+
+- Detach daemon boot stderr from piped CLI callers so successful startup returns promptly without changing fresh-home admission. Preserve early startup failure diagnostics in a private temporary log. Refuse aliased Unix start-fence directories and files before runtime mutation. Update the locked optional QUIC protocol dependency to its patched release without enabling QUIC. Closes #2115.
+
+- Report authenticated native request invocation failures promptly to MCP callers instead of waiting for the outer reply timeout. Preserve request ownership, independent fan-out and at-most-once tool invocation; do not replay interrupted calls.
+
+- Show the authenticated principal in MCP ingress-consent prompts and display metadata for legacy and modern clients. Label the caller source honestly instead of presenting it as a unique session identifier.
+
+- Disclose that approved MCP ingress trust persists across reconnects and runtime restarts, and label it as durable in consent metadata for both legacy and async elicitation.
 
 ### Security
 
