@@ -7,6 +7,7 @@ workflow="${1:-$repo_root/.github/workflows/ci.yml}"
 
 ruby - "$workflow" <<'RB'
 require "yaml"
+require "shellwords"
 
 workflow_path = ARGV.fetch(0)
 
@@ -61,6 +62,31 @@ fail("PR Checks must allow stacked bases") if pr_events.key?("branches") || pr_e
 %w[ci.yml release.yml].each do |name|
   text = File.read(File.join(File.dirname(workflow_path), name))
   fail("#{name} must use shared GNU package setup") unless text.include?('bash scripts/ci/install_gnu_build_packages.sh "${packages[@]}"')
+end
+
+# The selected checkout can differ from github.sha on prepare-only dispatches.
+# Native builds inherit the selected source; Docker builds must forward it.
+release = YAML.safe_load(File.read(File.join(File.dirname(workflow_path), "release.yml")), aliases: false)
+build = release.fetch("jobs").fetch("build")
+def release_provenance?(build)
+  source = "${{ needs.classify.outputs.source-commit }}"
+  return false unless build.fetch("env", {})["ASTRID_GIT_COMMIT"] == source
+  checkout = build.fetch("steps").find { |step| step.fetch("uses", "").start_with?("actions/checkout@") }
+  return false unless checkout && checkout.fetch("with", {})["ref"] == source
+  containers = build.fetch("steps").select { |step| step.fetch("run", "").include?("cargo build") && step.fetch("run", "").include?("docker run") }
+  return false unless containers.length == 2
+  containers.all? { |step| Shellwords.split(step.fetch("run")).each_cons(2).include?(["--env", "ASTRID_GIT_COMMIT"]) }
+end
+fail("Release builds must embed the selected checkout commit on native, GNU and MUSL targets") unless release_provenance?(build)
+
+wrong_source = Marshal.load(Marshal.dump(build))
+wrong_source.fetch("env")["ASTRID_GIT_COMMIT"] = "${{ github.sha }}"
+fail("event SHA must not satisfy selected-source provenance") if release_provenance?(wrong_source)
+build.fetch("steps").each_with_index do |step, index|
+  next unless step.fetch("run", "").include?("docker run") && step.fetch("run", "").include?("cargo build")
+  missing_forward = Marshal.load(Marshal.dump(build))
+  missing_forward.fetch("steps")[index]["run"] = step.fetch("run").gsub("--env ASTRID_GIT_COMMIT", "")
+  fail("every Linux container must receive source provenance") if release_provenance?(missing_forward)
 end
 
 def group(workflow_name, event_name, pr_number, run_id, run_attempt)
