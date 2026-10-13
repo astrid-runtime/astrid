@@ -57,6 +57,7 @@ pub mod host;
 pub mod host_state;
 #[cfg(test)]
 mod interruption_tests;
+mod invocation_failure;
 #[cfg(test)]
 #[path = "lifecycle_audit_tests.rs"]
 mod lifecycle_audit_tests;
@@ -3857,13 +3858,7 @@ impl ExecutionEngine for WasmEngine {
                         &mut *s,
                         (action.to_string(), payload.to_vec())
                     ) => called.map(|(cr,)| cr).map_err(|e| {
-                        interruption_reason = match e.downcast_ref::<wasmtime::Trap>() {
-                            Some(wasmtime::Trap::OutOfFuel) => Some("interceptor exhausted its fuel budget"),
-                            Some(wasmtime::Trap::Interrupt) => Some("interceptor exceeded its execution deadline"),
-                            // Panics and allocator failures can also trap:
-                            // no completed guest decision means no permission.
-                            _ => Some("interceptor execution failed"),
-                        };
+                        interruption_reason = Some(invocation_failure::reason(&e));
                         CapsuleError::WasmError(format!("astrid_hook_trigger failed: {e:?}"))
                     }),
                 }
