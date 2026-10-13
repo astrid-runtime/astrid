@@ -240,6 +240,10 @@ async fn publish_inner(
     if !state.invocation_authority_active() {
         return Err(ErrorCode::CapabilityDenied);
     }
+    // Reserved receipts are emitted only by the dispatcher, never by guests.
+    if astrid_events::ipc::delivery_failure::is_failure_topic(&topic) {
+        return Err(ErrorCode::CapabilityDenied);
+    }
     if topic.len() > 256 {
         return Err(ErrorCode::InvalidInput);
     }
@@ -280,8 +284,21 @@ async fn publish_inner(
         return Err(ErrorCode::InvalidInput);
     }
 
+    let mut delivery_id = None;
     let ipc_payload = match serde_json::from_slice::<serde_json::Value>(payload_bytes) {
-        Ok(data) => IpcPayload::from_json_value(data),
+        Ok(mut data) => {
+            if let Some(object) = data.as_object_mut()
+                && let Some(id) =
+                    object.remove(astrid_events::ipc::delivery_failure::DELIVERY_ID_FIELD)
+            {
+                delivery_id = Some(
+                    id.as_str()
+                        .and_then(astrid_events::ipc::delivery_failure::DeliveryId::parse)
+                        .ok_or(ErrorCode::InvalidInput)?,
+                );
+            }
+            IpcPayload::from_json_value(data)
+        },
         Err(_) => return Err(ErrorCode::InvalidInput),
     };
     // Prepare the bounded audit capture, but do not record a result unless
@@ -308,6 +325,8 @@ async fn publish_inner(
     if let Some(owner) = request_owner {
         message = message.with_request_owner(owner);
     }
+
+    message.delivery_id = delivery_id;
 
     let event = AstridEvent::Ipc {
         metadata: EventMetadata::new("wasm_guest").with_session_id(state.capsule_uuid),
@@ -476,6 +495,11 @@ impl ipc::Host for HostState {
         }
 
         check_subscribe_acl(self, &topic_pattern)?;
+        let topic_pattern = astrid_events::ipc::delivery_failure::subscription_topic(
+            &topic_pattern,
+            self.capsule_uuid,
+        )
+        .ok_or(ErrorCode::CapabilityDenied)?;
 
         if self.subscription_count >= MAX_SUBSCRIPTIONS {
             return Err(ErrorCode::Quota);
@@ -636,6 +660,9 @@ impl HostSubscription for HostState {
                 .try_recv_one()
                 .iter()
                 .filter_map(extract_message)
+                .filter(|message| {
+                    astrid_events::ipc::delivery_failure::visible_to(message, self.capsule_uuid)
+                })
                 .collect()
         };
         let lagged = {
@@ -729,6 +756,7 @@ impl HostSubscription for HostState {
         let mut messages: Vec<InternalIpcMessage> = Vec::new();
         if let Some(event) = first
             && let Some(msg) = extract_message(&event)
+            && astrid_events::ipc::delivery_failure::visible_to(&msg, self.capsule_uuid)
         {
             messages.push(msg);
         }
@@ -779,3 +807,7 @@ impl HostSubscription for HostState {
 #[cfg(test)]
 #[path = "ipc_tests.rs"]
 mod audit_scope_tests;
+
+#[cfg(test)]
+#[path = "ipc/delivery_tests.rs"]
+mod delivery_tests;

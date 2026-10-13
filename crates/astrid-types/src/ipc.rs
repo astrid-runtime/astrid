@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::topic::Topic;
 
+pub mod delivery_failure;
 pub mod request_failure;
 
 /// Opaque host-minted owner of an authenticated request scope.
@@ -106,6 +107,9 @@ pub struct IpcMessage {
     pub topic: Topic,
     /// Standardized payload structure.
     pub payload: IpcPayload,
+    /// Opt-in correlation captured by the IPC host; external wire data cannot set it.
+    #[serde(skip)]
+    pub delivery_id: Option<delivery_failure::DeliveryId>,
     /// Optional cryptographic signature for stateless verification across a distributed swarm.
     #[serde(default)]
     pub signature: Option<Vec<u8>>,
@@ -209,6 +213,7 @@ impl IpcMessage {
         Self {
             topic: topic.into(),
             payload,
+            delivery_id: None,
             signature: None,
             source_id,
             timestamp: Utc::now(),

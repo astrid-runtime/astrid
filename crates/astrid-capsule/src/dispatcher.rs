@@ -721,6 +721,10 @@ async fn collect_matching_interceptors(
     caller_device_key_id: Option<&str>,
     access_resolver: Option<&CapsuleAccessResolver>,
 ) -> (InterceptorMatches, Vec<String>) {
+    // Receipts belong to publisher resource subscriptions, never broad handlers.
+    if astrid_events::ipc::delivery_failure::is_failure_topic(topic) {
+        return (Vec::new(), Vec::new());
+    }
     // Compute the gate once per event, not per capsule. Principal-stamped
     // dispatch is view-scoped when a resolver is present; grant-on-use only
     // engages for the narrower user-invocable surface.
