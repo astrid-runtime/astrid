@@ -159,6 +159,8 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 - Embed the selected release source commit in the CLI version output on native, GNU and MUSL builds, including prepare-only builds of an explicitly selected source.
 
+- Report opt-in nested capsule delivery failures promptly to their authenticated publisher without waiting for the successful reply timeout. Closes #2128.
+
 ### Security
 
 - Update Wasmtime and WASI to 48.0.4, incorporating the September and October
