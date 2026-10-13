@@ -7,6 +7,7 @@ workflow="${1:-$repo_root/.github/workflows/ci.yml}"
 
 ruby - "$workflow" <<'RB'
 require "yaml"
+require "shellwords"
 
 workflow_path = ARGV.fetch(0)
 
@@ -74,7 +75,7 @@ def release_provenance?(build)
   return false unless checkout && checkout.fetch("with", {})["ref"] == source
   containers = build.fetch("steps").select { |step| step.fetch("run", "").include?("cargo build") && step.fetch("run", "").include?("docker run") }
   return false unless containers.length == 2
-  containers.all? { |step| step.fetch("run").lines.any? { |line| line.strip == '--env ASTRID_GIT_COMMIT \\' } }
+  containers.all? { |step| Shellwords.split(step.fetch("run")).each_cons(2).include?(["--env", "ASTRID_GIT_COMMIT"]) }
 end
 fail("Release builds must embed the selected checkout commit on native, GNU and MUSL targets") unless release_provenance?(build)
 
@@ -84,7 +85,7 @@ fail("event SHA must not satisfy selected-source provenance") if release_provena
 build.fetch("steps").each_with_index do |step, index|
   next unless step.fetch("run", "").include?("docker run") && step.fetch("run", "").include?("cargo build")
   missing_forward = Marshal.load(Marshal.dump(build))
-  missing_forward.fetch("steps")[index]["run"] = step.fetch("run").lines.reject { |line| line.include?("--env ASTRID_GIT_COMMIT") }.join
+  missing_forward.fetch("steps")[index]["run"] = step.fetch("run").gsub("--env ASTRID_GIT_COMMIT", "")
   fail("every Linux container must receive source provenance") if release_provenance?(missing_forward)
 end
 

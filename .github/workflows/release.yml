@@ -119,8 +119,7 @@ jobs:
     name: Build (${{ matrix.target }})
     needs: classify
     runs-on: ${{ matrix.os }}
-    env:
-      ASTRID_GIT_COMMIT: ${{ needs.classify.outputs.source-commit }}
+    env: { ASTRID_GIT_COMMIT: '${{ needs.classify.outputs.source-commit }}' }
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.classify.outputs.build-matrix) }}
@@ -257,8 +256,7 @@ jobs:
         run: |
           SOURCE_SHA=$(git rev-parse --short=12 HEAD)
           docker run --rm \
-            --env CARGO_TERM_COLOR=always \
-            --env ASTRID_GIT_COMMIT \
+            --env CARGO_TERM_COLOR=always --env ASTRID_GIT_COMMIT \
             --env SOURCE_SHA="$SOURCE_SHA" \
             --env TARGET \
             --volume "$PWD:/workspace" \
