@@ -161,7 +161,7 @@ mod tests {
                 3 => request.principal = None,
                 4 => request.topic = Topic::from_raw("astrid.v1.requestevil"),
                 _ => {
-                    request.payload = IpcPayload::RawJson(serde_json::json!({"req_id":"../other"}))
+                    request.payload = IpcPayload::RawJson(serde_json::json!({"req_id":"../other"}));
                 },
             }
             assert!(RequestFailureBinding::capture(&request).is_none());
