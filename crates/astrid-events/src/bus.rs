@@ -593,7 +593,8 @@ impl EventBus {
                 capsule_id_label.into(),
                 Some(Some(principal.into())),
             )
-            .with_request_owner(request_owner),
+            .with_request_owner(request_owner)
+            .with_receipt_publisher(capsule_uuid),
         ));
         let notify = Arc::clone(&entry.lock().notify);
         self.routes
@@ -610,6 +611,9 @@ impl EventBus {
     }
 
     /// Routed subscription controlled by a runtime-generation publication gate.
+    /// Private delivery receipts must match `capsule_uuid` before queue admission,
+    /// including on broad topic patterns. Ordinary events retain their scope.
+    /// Host diagnostic observers can use the broadcast feed instead.
     ///
     /// While `gate` is staged, matching events are rejected rather than queued.
     /// Opening the gate admits only future publishes, so a prepared generation
@@ -633,7 +637,9 @@ impl EventBus {
         };
         let matcher = TopicMatcher::new(topic_pattern);
         let entry = Arc::new(parking_lot::Mutex::new(
-            RouteEntry::new(matcher, capsule_label, scope).with_gate(gate),
+            RouteEntry::new(matcher, capsule_label, scope)
+                .with_gate(gate)
+                .with_receipt_publisher(capsule_uuid),
         ));
         let notify = Arc::clone(&entry.lock().notify);
         {
@@ -721,7 +727,8 @@ impl EventBus {
         let matcher = TopicMatcher::new(topic_pattern);
         let entry = Arc::new(parking_lot::Mutex::new(
             RouteEntry::new_principal_or_system(matcher, capsule_label, principal.into())
-                .with_gate(gate),
+                .with_gate(gate)
+                .with_receipt_publisher(capsule_uuid),
         ));
         let notify = Arc::clone(&entry.lock().notify);
         self.routes
