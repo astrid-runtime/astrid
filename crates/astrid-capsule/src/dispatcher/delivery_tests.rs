@@ -52,6 +52,7 @@ async fn verify_retired_reservation(wait_for_capacity: bool) {
                 payload: Arc::new(Vec::new()),
                 topic: Arc::new("occupied".into()),
                 ipc_message: None,
+                failure: None,
             })
             .unwrap();
     }
@@ -223,6 +224,7 @@ async fn shared_fallback_queues_detect_cross_principal_wait_cycles() {
                 payload: Arc::new(Vec::new()),
                 topic: Arc::new("occupied".into()),
                 ipc_message: None,
+                failure: None,
             })
             .unwrap();
         receivers.push(receiver);

@@ -100,6 +100,7 @@ mod parent_death;
 mod readiness;
 mod server;
 mod session_guard;
+mod terminal_failure;
 mod watch;
 
 #[allow(unused_imports)]
