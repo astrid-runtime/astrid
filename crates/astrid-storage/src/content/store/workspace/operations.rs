@@ -725,8 +725,18 @@ where
                 .map_or(0, |catalog| catalog.summary.quota_bytes);
             let new_quota = root.map_or(0, |catalog| catalog.summary.quota_bytes);
             self.enforce_quota_change(owner, &header, old_quota, new_quota)?;
-            let branch_record =
-                make_branch_record(id, branch.target_prefix.as_ref(), branch.base, root)?;
+            let branch_record = branch.binding_uid.map_or_else(
+                || make_branch_record(id, branch.target_prefix.as_ref(), branch.base, root),
+                |binding_uid| {
+                    make_branch_record_for_uid(
+                        binding_uid,
+                        id,
+                        branch.target_prefix.as_ref(),
+                        branch.base,
+                        root,
+                    )
+                },
+            )?;
             let branch_id = self.content.engine.identify_object(&branch_record);
             records.insert(branch_id, branch_record);
             let mut next = header.as_ref().clone();

@@ -816,6 +816,45 @@ fn workspace_file_rename_resolves_pending_catalog_nodes() {
 }
 
 #[test]
+fn workspace_rename_preserves_authenticated_principal_binding() {
+    let content = content();
+    let branches = WorkspaceBranchStore::new(Arc::clone(&content));
+    let owner = owner();
+    let binding_uid = PrincipalUid::from_bytes([0x93; 32]);
+    let prefix = ContentName::new("workspace").unwrap();
+    let id = WorkspaceUid::from_bytes([0x94; 16]);
+    branches
+        .begin_for_uid_at(&owner, binding_uid, id, prefix.clone())
+        .unwrap();
+    let fs = branches.filesystem(owner, id);
+    fs.write(&FilesystemPath::new("before").unwrap(), b"bound")
+        .unwrap();
+    fs.rename(
+        &FilesystemPath::new("before").unwrap(),
+        &FilesystemPath::new("after").unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        branches.describe(&owner, id).unwrap().binding_uid(),
+        Some(binding_uid)
+    );
+    assert!(
+        branches
+            .binding_for_uid(&owner, binding_uid, &prefix)
+            .unwrap()
+            .is_some()
+    );
+    fs.write(&FilesystemPath::new("next").unwrap(), b"still bound")
+        .unwrap();
+    assert_eq!(
+        fs.read(&FilesystemPath::new("after").unwrap(), 0, 5)
+            .unwrap(),
+        b"bound"
+    );
+}
+
+#[test]
 fn workspace_subtree_replacement_resolves_all_pending_catalog_mutations() {
     let content = content();
     let branches = WorkspaceBranchStore::new(Arc::clone(&content));
