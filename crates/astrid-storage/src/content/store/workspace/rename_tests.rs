@@ -105,7 +105,7 @@ fn public_rename_batch_keeps_its_existing_signature_and_result() {
 #[test]
 fn directory_rename_replans_source_after_root_conflict() {
     let (engine, branches, owner, id) = fixture();
-    let fs = branches.filesystem(owner.clone(), id);
+    let fs = branches.filesystem(owner, id);
     let old = FilesystemPath::new("old").unwrap();
     let new = FilesystemPath::new("new").unwrap();
     let late = FilesystemPath::new("old/late").unwrap();
@@ -138,7 +138,7 @@ fn directory_rename_replans_source_after_root_conflict() {
 #[test]
 fn replacing_directory_rechecks_empty_destination_after_root_conflict() {
     let (engine, branches, owner, id) = fixture();
-    let fs = branches.filesystem(owner.clone(), id);
+    let fs = branches.filesystem(owner, id);
     let old = FilesystemPath::new("old").unwrap();
     let new = FilesystemPath::new("new").unwrap();
     fs.create_dir(&old).unwrap();
@@ -166,7 +166,7 @@ fn replacing_directory_rechecks_empty_destination_after_root_conflict() {
 #[test]
 fn rename_rechecks_destination_parent_after_root_conflict() {
     let (engine, branches, owner, id) = fixture();
-    let fs = branches.filesystem(owner.clone(), id);
+    let fs = branches.filesystem(owner, id);
     let parent = FilesystemPath::new("parent").unwrap();
     let source = FilesystemPath::new("source").unwrap();
     let destination = FilesystemPath::new("parent/file").unwrap();
@@ -194,12 +194,12 @@ fn rename_rechecks_destination_parent_after_root_conflict() {
 #[test]
 fn file_rename_rejects_new_source_directory_alias() {
     let (engine, branches, owner, id) = fixture();
-    let fs = branches.filesystem(owner.clone(), id);
+    let fs = branches.filesystem(owner, id);
     let old = FilesystemPath::new("old").unwrap();
     let new = FilesystemPath::new("new").unwrap();
     fs.write(&old, b"file").unwrap();
     let interleaving_branches = branches.clone();
-    let interleaving_owner = owner.clone();
+    let interleaving_owner = owner;
     *engine.before_commit.lock() = Some(Box::new(move || {
         interleaving_branches
             .write(
@@ -239,12 +239,12 @@ fn file_rename_rejects_new_source_directory_alias() {
 #[test]
 fn directory_rename_rejects_new_source_file_alias() {
     let (engine, branches, owner, id) = fixture();
-    let fs = branches.filesystem(owner.clone(), id);
+    let fs = branches.filesystem(owner, id);
     let old = FilesystemPath::new("old").unwrap();
     let new = FilesystemPath::new("new").unwrap();
     fs.create_dir(&old).unwrap();
     let interleaving_branches = branches.clone();
-    let interleaving_owner = owner.clone();
+    let interleaving_owner = owner;
     *engine.before_commit.lock() = Some(Box::new(move || {
         interleaving_branches
             .write(
@@ -284,7 +284,7 @@ fn directory_rename_rejects_new_source_file_alias() {
 #[test]
 fn rename_replans_when_source_disappears() {
     let (engine, branches, owner, id) = fixture();
-    let fs = branches.filesystem(owner.clone(), id);
+    let fs = branches.filesystem(owner, id);
     let old = FilesystemPath::new("old").unwrap();
     let new = FilesystemPath::new("new").unwrap();
     fs.write(&old, b"file").unwrap();
@@ -310,7 +310,7 @@ fn rename_replans_when_source_disappears() {
 #[test]
 fn rename_replans_when_replacement_disappears() {
     let (engine, branches, owner, id) = fixture();
-    let fs = branches.filesystem(owner.clone(), id);
+    let fs = branches.filesystem(owner, id);
     let old = FilesystemPath::new("old").unwrap();
     let new = FilesystemPath::new("new").unwrap();
     fs.write(&old, b"old!").unwrap();
@@ -333,14 +333,14 @@ fn rename_replans_when_replacement_disappears() {
 #[test]
 fn rename_rejects_new_destination_ancestor_alias() {
     let (engine, branches, owner, id) = fixture();
-    let fs = branches.filesystem(owner.clone(), id);
+    let fs = branches.filesystem(owner, id);
     let source = FilesystemPath::new("source").unwrap();
     let destination = FilesystemPath::new("a/b/destination").unwrap();
     fs.create_dir(&FilesystemPath::new("a").unwrap()).unwrap();
     fs.create_dir(&FilesystemPath::new("a/b").unwrap()).unwrap();
     fs.write(&source, b"file").unwrap();
     let interleaving_branches = branches.clone();
-    let interleaving_owner = owner.clone();
+    let interleaving_owner = owner;
     *engine.before_commit.lock() = Some(Box::new(move || {
         interleaving_branches
             .write(
@@ -374,14 +374,14 @@ fn rename_rejects_new_destination_ancestor_alias() {
 #[test]
 fn rename_rejects_new_source_ancestor_alias() {
     let (engine, branches, owner, id) = fixture();
-    let fs = branches.filesystem(owner.clone(), id);
+    let fs = branches.filesystem(owner, id);
     let source = FilesystemPath::new("a/b/source").unwrap();
     let destination = FilesystemPath::new("destination").unwrap();
     fs.create_dir(&FilesystemPath::new("a").unwrap()).unwrap();
     fs.create_dir(&FilesystemPath::new("a/b").unwrap()).unwrap();
     fs.write(&source, b"file").unwrap();
     let interleaving_branches = branches.clone();
-    let interleaving_owner = owner.clone();
+    let interleaving_owner = owner;
     *engine.before_commit.lock() = Some(Box::new(move || {
         interleaving_branches
             .write(
