@@ -682,6 +682,7 @@ where
                 records.extend(mutation.records);
             }
             self.enforce_quota(principal, &header)?;
+            pending_catalog::retain_final_catalog_records(header.catalog, &mut records);
             let transaction =
                 self.encode_transaction(principal.clone(), header.clone(), None, records)?;
             match self.engine.commit_root(transaction) {
@@ -959,6 +960,7 @@ mod bulk;
 mod constructors;
 mod internals;
 mod native;
+mod pending_catalog;
 mod projection;
 mod read_handle;
 mod workspace;

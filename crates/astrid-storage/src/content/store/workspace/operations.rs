@@ -11,6 +11,8 @@ use crate::content_dag::{
 use crate::engine::{PrincipalProjectionEngine, PrincipalProjectionError};
 use crate::storage_model::{ModelError, ObjectId, ObjectRecord, ObjectReference};
 
+use super::super::pending_catalog::retain_final_catalog_records;
+
 use super::{
     EngineIdentity, EngineSource, MAX_WORKSPACE_BRANCHES, WorkspaceBindingLifecycle,
     WorkspaceBranchBinding, WorkspaceBranchDescriptor, WorkspaceBranchError, WorkspaceBranchStore,
@@ -717,6 +719,7 @@ where
                 root = mutation.root;
                 records.extend(mutation.records);
             }
+            retain_final_catalog_records(root, &mut records);
             let old_quota = branch
                 .working
                 .map_or(0, |catalog| catalog.summary.quota_bytes);

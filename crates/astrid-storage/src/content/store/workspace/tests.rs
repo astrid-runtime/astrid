@@ -785,14 +785,23 @@ fn workspace_file_rename_resolves_pending_catalog_nodes() {
     )
     .unwrap();
     assert_eq!(
-        fs.read(&FilesystemPath::new("delta").unwrap(), 0, 20)
-            .unwrap(),
+        fs.read(
+            &FilesystemPath::new("delta").unwrap(),
+            0,
+            u64::try_from(b"alpha".len()).unwrap(),
+        )
+        .unwrap(),
         b"alpha"
     );
     assert!(fs.stat(&FilesystemPath::new("alpha").unwrap()).is_err());
     for name in ["beta", "gamma"] {
         assert_eq!(
-            fs.read(&FilesystemPath::new(name).unwrap(), 0, 20).unwrap(),
+            fs.read(
+                &FilesystemPath::new(name).unwrap(),
+                0,
+                u64::try_from(name.len()).unwrap(),
+            )
+            .unwrap(),
             name.as_bytes()
         );
     }
@@ -832,7 +841,12 @@ fn workspace_subtree_replacement_resolves_all_pending_catalog_mutations() {
         ("untouched", "untouched"),
     ] {
         assert_eq!(
-            fs.read(&FilesystemPath::new(name).unwrap(), 0, 20).unwrap(),
+            fs.read(
+                &FilesystemPath::new(name).unwrap(),
+                0,
+                u64::try_from(bytes.len()).unwrap(),
+            )
+            .unwrap(),
             bytes.as_bytes()
         );
     }
