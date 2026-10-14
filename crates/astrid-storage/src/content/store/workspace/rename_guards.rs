@@ -12,6 +12,7 @@ pub(super) struct RenamePlan<'a> {
     pub(super) moves: &'a [(ContentName, ContentName)],
     pub(super) replacements: &'a [ContentName],
     pub(super) source_prefix: Option<&'a str>,
+    pub(super) source_path: &'a FilesystemPath,
     pub(super) source_name: &'a ContentName,
     pub(super) source_directory_prefix: &'a str,
     pub(super) destination_prefix: &'a str,
@@ -40,6 +41,11 @@ where
         sources: &BTreeSet<&ContentName>,
         replacements: &BTreeSet<&ContentName>,
     ) -> Result<bool, WorkspaceBranchError> {
+        if !self.rename_ancestors_clear(owner, root, plan.source_path.parent())?
+            || !self.rename_ancestors_clear(owner, root, plan.destination_parent.clone())?
+        {
+            return Ok(false);
+        }
         if let Some(prefix) = plan.source_prefix {
             let prefix =
                 ContentName::new(prefix.to_owned()).map_err(PrincipalContentError::InvalidName)?;
@@ -109,6 +115,25 @@ where
             if !marker && !implied {
                 return Ok(false);
             }
+        }
+        Ok(true)
+    }
+
+    fn rename_ancestors_clear(
+        &self,
+        owner: &P,
+        root: Option<CatalogRoot>,
+        mut ancestor: FilesystemPath,
+    ) -> Result<bool, WorkspaceBranchError> {
+        while !ancestor.as_str().is_empty() {
+            if lookup(root, &ancestor.file_name()?, &mut |object| {
+                self.content.load_required_for(owner, object)
+            })?
+            .is_some()
+            {
+                return Ok(false);
+            }
+            ancestor = ancestor.parent();
         }
         Ok(true)
     }

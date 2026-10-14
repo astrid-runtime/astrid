@@ -236,12 +236,12 @@ where
         if path.as_str().is_empty() {
             return Err(FilesystemError::IsDirectory(path.clone()).into());
         }
-        let parent = path.parent();
-        if parent.as_str().is_empty() {
-            return Ok(());
-        }
-        if self.stat(&parent)?.kind() != FilesystemEntryKind::Directory {
-            return Err(FilesystemError::NotDirectory(parent).into());
+        let mut parent = path.parent();
+        while !parent.as_str().is_empty() {
+            if self.stat(&parent)?.kind() != FilesystemEntryKind::Directory {
+                return Err(FilesystemError::NotDirectory(parent).into());
+            }
+            parent = parent.parent();
         }
         Ok(())
     }
@@ -259,6 +259,7 @@ where
             return Ok(());
         }
         loop {
+            self.require_parent(from)?;
             self.require_parent(to)?;
             let source = self.stat(from)?;
             let destination = match self.stat(to) {
@@ -317,6 +318,7 @@ where
                 moves: &moves,
                 replacements: &replacements,
                 source_prefix: source_prefix.as_deref(),
+                source_path: from,
                 source_name: &source_name,
                 source_directory_prefix: &source_directory_prefix,
                 destination_prefix: &destination_prefix,

@@ -307,3 +307,85 @@ fn rename_replans_when_replacement_disappears() {
     ));
     assert_eq!(fs.read(&new, 0, 4).unwrap(), b"old!");
 }
+
+#[test]
+fn rename_rejects_new_destination_ancestor_alias() {
+    let (engine, branches, owner, id) = fixture();
+    let fs = branches.filesystem(owner.clone(), id);
+    let source = FilesystemPath::new("source").unwrap();
+    let destination = FilesystemPath::new("a/b/destination").unwrap();
+    fs.create_dir(&FilesystemPath::new("a").unwrap()).unwrap();
+    fs.create_dir(&FilesystemPath::new("a/b").unwrap()).unwrap();
+    fs.write(&source, b"file").unwrap();
+    let interleaving_branches = branches.clone();
+    let interleaving_owner = owner.clone();
+    *engine.before_commit.lock() = Some(Box::new(move || {
+        interleaving_branches
+            .write(
+                &interleaving_owner,
+                id,
+                &ContentName::new("a").unwrap(),
+                b"alias",
+            )
+            .unwrap();
+    }));
+    assert!(matches!(
+        fs.rename(&source, &destination),
+        Err(super::WorkspaceBranchError::Filesystem(
+            FilesystemError::NamespaceConflict(_)
+        ))
+    ));
+    assert!(
+        branches
+            .describe_name(&owner, id, &ContentName::new("source").unwrap())
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        branches
+            .describe_name(&owner, id, &ContentName::new("a/b/destination").unwrap())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn rename_rejects_new_source_ancestor_alias() {
+    let (engine, branches, owner, id) = fixture();
+    let fs = branches.filesystem(owner.clone(), id);
+    let source = FilesystemPath::new("a/b/source").unwrap();
+    let destination = FilesystemPath::new("destination").unwrap();
+    fs.create_dir(&FilesystemPath::new("a").unwrap()).unwrap();
+    fs.create_dir(&FilesystemPath::new("a/b").unwrap()).unwrap();
+    fs.write(&source, b"file").unwrap();
+    let interleaving_branches = branches.clone();
+    let interleaving_owner = owner.clone();
+    *engine.before_commit.lock() = Some(Box::new(move || {
+        interleaving_branches
+            .write(
+                &interleaving_owner,
+                id,
+                &ContentName::new("a").unwrap(),
+                b"alias",
+            )
+            .unwrap();
+    }));
+    assert!(matches!(
+        fs.rename(&source, &destination),
+        Err(super::WorkspaceBranchError::Filesystem(
+            FilesystemError::NamespaceConflict(_)
+        ))
+    ));
+    assert!(
+        branches
+            .describe_name(&owner, id, &ContentName::new("a/b/source").unwrap())
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        branches
+            .describe_name(&owner, id, &ContentName::new("destination").unwrap())
+            .unwrap()
+            .is_none()
+    );
+}
