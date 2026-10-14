@@ -78,7 +78,7 @@ fn directory_for_user(
     let metadata = fstatat(root, legacy_name, AtFlags::AT_SYMLINK_NOFOLLOW)
         .context("inspect non-aliased start fence directory")?;
     ensure!(
-        SFlag::from_bits_truncate(metadata.st_mode).contains(SFlag::S_IFDIR),
+        metadata.st_mode & SFlag::S_IFMT.bits() == SFlag::S_IFDIR.bits(),
         "start fence directory must be a real directory"
     );
     if metadata.st_uid == nix::unistd::getuid().as_raw() {

@@ -150,3 +150,48 @@ fn foreign_owner_child() {
     );
     std::fs::remove_file(&private).unwrap();
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn foreign_socket_cannot_select_a_fallback_directory() {
+    use std::os::unix::{net::UnixListener, process::CommandExt};
+
+    if !nix::unistd::getuid().is_root() {
+        eprintln!("requires root Linux runner for real foreign socket regression");
+        return;
+    }
+    let root = tempfile::tempdir().expect("shared temporary root");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
+    let legacy = root.path().join("astrid-start-fences");
+    let _listener = UnixListener::bind(&legacy).expect("foreign owned socket");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "commands::daemon::start_fence::tests::foreign_socket_child",
+            "--nocapture",
+        ])
+        .env("ASTRID_TEST_FOREIGN_SOCKET", legacy.join("fixture.lock"))
+        .uid(65534)
+        .gid(65534)
+        .output()
+        .expect("second OS user");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!root.path().join("astrid-start-fences-65534").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn foreign_socket_child() {
+    let Some(path) = std::env::var_os("ASTRID_TEST_FOREIGN_SOCKET") else {
+        return;
+    };
+    assert_eq!(nix::unistd::getuid().as_raw(), 65534);
+    assert!(
+        open(Path::new(&path)).is_err(),
+        "foreign socket must not be admitted as a directory"
+    );
+}
