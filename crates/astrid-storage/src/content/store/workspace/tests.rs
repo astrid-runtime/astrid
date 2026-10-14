@@ -766,3 +766,82 @@ async fn durable_reopen_retains_live_branch_dag() {
         Some(b"base".to_vec())
     );
 }
+
+#[test]
+fn workspace_file_rename_resolves_pending_catalog_nodes() {
+    let content = content();
+    let branches = WorkspaceBranchStore::new(Arc::clone(&content));
+    let owner = owner();
+    let id = WorkspaceUid::from_bytes([91; 16]);
+    branches.begin_with_uid(&owner, id).unwrap();
+    let fs = branches.filesystem(owner, id);
+    for name in ["alpha", "beta", "gamma"] {
+        fs.write(&FilesystemPath::new(name).unwrap(), name.as_bytes())
+            .unwrap();
+    }
+    fs.rename(
+        &FilesystemPath::new("alpha").unwrap(),
+        &FilesystemPath::new("delta").unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        fs.read(&FilesystemPath::new("delta").unwrap(), 0, 20)
+            .unwrap(),
+        b"alpha"
+    );
+    assert!(fs.stat(&FilesystemPath::new("alpha").unwrap()).is_err());
+    for name in ["beta", "gamma"] {
+        assert_eq!(
+            fs.read(&FilesystemPath::new(name).unwrap(), 0, 20).unwrap(),
+            name.as_bytes()
+        );
+    }
+    assert!(content.list_prefix(&owner, "").unwrap().is_empty());
+    fs.promote().unwrap();
+    assert_eq!(
+        content
+            .read(&owner, &ContentName::new("delta").unwrap())
+            .unwrap(),
+        Some(b"alpha".to_vec())
+    );
+}
+
+#[test]
+fn workspace_subtree_replacement_resolves_all_pending_catalog_mutations() {
+    let content = content();
+    let branches = WorkspaceBranchStore::new(Arc::clone(&content));
+    let owner = owner();
+    let id = WorkspaceUid::from_bytes([92; 16]);
+    branches.begin_with_uid(&owner, id).unwrap();
+    let fs = branches.filesystem(owner, id);
+    for name in ["old", "new"] {
+        fs.create_dir(&FilesystemPath::new(name).unwrap()).unwrap();
+    }
+    for name in ["old/alpha", "old/beta", "untouched"] {
+        fs.write(&FilesystemPath::new(name).unwrap(), name.as_bytes())
+            .unwrap();
+    }
+    fs.rename_replacing(
+        &FilesystemPath::new("old").unwrap(),
+        &FilesystemPath::new("new").unwrap(),
+    )
+    .unwrap();
+    for (name, bytes) in [
+        ("new/alpha", "old/alpha"),
+        ("new/beta", "old/beta"),
+        ("untouched", "untouched"),
+    ] {
+        assert_eq!(
+            fs.read(&FilesystemPath::new(name).unwrap(), 0, 20).unwrap(),
+            bytes.as_bytes()
+        );
+    }
+    assert!(fs.stat(&FilesystemPath::new("old").unwrap()).is_err());
+    fs.promote().unwrap();
+    assert_eq!(
+        content
+            .read(&owner, &ContentName::new("new/alpha").unwrap())
+            .unwrap(),
+        Some(b"old/alpha".to_vec())
+    );
+}

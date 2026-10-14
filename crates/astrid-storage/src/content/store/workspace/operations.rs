@@ -9,7 +9,7 @@ use crate::content_dag::{
     build_content, open_content, read_opened_content, read_opened_content_range,
 };
 use crate::engine::{PrincipalProjectionEngine, PrincipalProjectionError};
-use crate::storage_model::{ModelError, ObjectReference};
+use crate::storage_model::{ModelError, ObjectId, ObjectRecord, ObjectReference};
 
 use super::{
     EngineIdentity, EngineSource, MAX_WORKSPACE_BRANCHES, WorkspaceBindingLifecycle,
@@ -660,13 +660,19 @@ where
                 }
                 values.push(value);
             }
-            let mut records = BTreeMap::new();
+            // Every path-copy mutation may return a new root that is not yet
+            // committed. Later deletes/inserts must resolve those pending nodes
+            // before falling back to the published owner graph.
+            let mut records = BTreeMap::<ObjectId, ObjectRecord>::new();
             let mut root = branch.working;
             for (source, _) in moves {
                 let mutation = super::delete(
                     root,
                     source,
-                    &mut |object| self.content.load_required_for(owner, object),
+                    &mut |object| match records.get(&object) {
+                        Some(record) => Ok(record.clone()),
+                        None => self.content.load_required_for(owner, object),
+                    },
                     &|record| self.content.engine.identify_object(record),
                 )?;
                 if mutation.previous.is_none() {
@@ -682,7 +688,10 @@ where
                 let mutation = super::delete(
                     root,
                     replacement,
-                    &mut |object| self.content.load_required_for(owner, object),
+                    &mut |object| match records.get(&object) {
+                        Some(record) => Ok(record.clone()),
+                        None => self.content.load_required_for(owner, object),
+                    },
                     &|record| self.content.engine.identify_object(record),
                 )?;
                 if mutation.previous.is_none() {
@@ -696,7 +705,10 @@ where
                     root,
                     destination,
                     value,
-                    &mut |object| self.content.load_required_for(owner, object),
+                    &mut |object| match records.get(&object) {
+                        Some(record) => Ok(record.clone()),
+                        None => self.content.load_required_for(owner, object),
+                    },
                     &|record| self.content.engine.identify_object(record),
                 )?;
                 if mutation.previous.is_some() {
