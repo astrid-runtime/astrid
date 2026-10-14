@@ -681,7 +681,13 @@ jobs:
           paths = [m["executable"] for line in sys.stdin if (m := json.loads(line)).get("executable") and m.get("target", {}).get("name") == "astrid" and m.get("profile", {}).get("test")]
           assert len(paths) == 1, paths
           print(paths[0])')
-          sudo "$test_binary" commands::daemon::start_fence::tests:: --nocapture
+          # The child runs as UID 65534 and must be able to execute the test
+          # binary without traversing private checkout or Cargo cache paths.
+          fence_test_dir=$(mktemp -d /tmp/astrid-fence-tests.XXXXXXXX)
+          trap 'rm -rf -- "$fence_test_dir"' EXIT
+          chmod 755 "$fence_test_dir"
+          install -m 755 "$test_binary" "$fence_test_dir/astrid-tests"
+          sudo "$fence_test_dir/astrid-tests" commands::daemon::start_fence::tests:: --nocapture
 
       - name: Run tests (macOS serial)
         if: matrix.os == 'macos-latest'
