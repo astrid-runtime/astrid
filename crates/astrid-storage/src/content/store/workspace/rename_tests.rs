@@ -81,6 +81,28 @@ fn fixture() -> (
 }
 
 #[test]
+fn public_rename_batch_keeps_its_existing_signature_and_result() {
+    let (_engine, branches, owner, id) = fixture();
+    let source = ContentName::new("source").unwrap();
+    let destination = ContentName::new("destination").unwrap();
+    branches.write(&owner, id, &source, b"value").unwrap();
+    assert!(
+        branches
+            .rename_batch(&owner, id, &[(source.clone(), destination.clone())], &[])
+            .unwrap()
+    );
+    assert_eq!(
+        branches.read(&owner, id, &destination).unwrap(),
+        Some(b"value".to_vec())
+    );
+    assert!(
+        !branches
+            .rename_batch(&owner, id, &[(source, destination)], &[])
+            .unwrap()
+    );
+}
+
+#[test]
 fn directory_rename_replans_source_after_root_conflict() {
     let (engine, branches, owner, id) = fixture();
     let fs = branches.filesystem(owner.clone(), id);

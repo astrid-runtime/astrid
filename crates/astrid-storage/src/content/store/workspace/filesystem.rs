@@ -327,7 +327,7 @@ where
             };
             match self
                 .branches
-                .rename_batch(&self.owner, self.branch, &plan)?
+                .rename_batch_guarded(&self.owner, self.branch, &plan)?
             {
                 RenameBatchOutcome::Committed => return Ok(()),
                 RenameBatchOutcome::DestinationConflict => {

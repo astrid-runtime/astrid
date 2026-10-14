@@ -612,16 +612,42 @@ where
 
     /// Atomically rename exact branch names, optionally replacing admitted
     /// destinations.  The operation never reconstructs immutable file bytes.
-    #[allow(clippy::too_many_lines)]
-    pub(super) fn rename_batch(
+    pub fn rename_batch(
+        &self,
+        owner: &P,
+        id: WorkspaceUid,
+        moves: &[(ContentName, ContentName)],
+        replacements: &[ContentName],
+    ) -> Result<bool, WorkspaceBranchError> {
+        use super::rename_guards::RenameBatchOutcome;
+        if moves.is_empty() {
+            return Ok(true);
+        }
+        Ok(matches!(
+            self.rename_batch_inner(owner, id, moves, replacements, None)?,
+            RenameBatchOutcome::Committed
+        ))
+    }
+
+    pub(super) fn rename_batch_guarded(
         &self,
         owner: &P,
         id: WorkspaceUid,
         plan: &super::rename_guards::RenamePlan<'_>,
     ) -> Result<super::rename_guards::RenameBatchOutcome, WorkspaceBranchError> {
+        self.rename_batch_inner(owner, id, plan.moves, plan.replacements, Some(plan))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn rename_batch_inner(
+        &self,
+        owner: &P,
+        id: WorkspaceUid,
+        moves: &[(ContentName, ContentName)],
+        replacements: &[ContentName],
+        plan: Option<&super::rename_guards::RenamePlan<'_>>,
+    ) -> Result<super::rename_guards::RenameBatchOutcome, WorkspaceBranchError> {
         use super::rename_guards::RenameBatchOutcome;
-        let moves = plan.moves;
-        let replacements = plan.replacements;
         if moves.is_empty() {
             return Ok(RenameBatchOutcome::Replan);
         }
@@ -645,13 +671,15 @@ where
         loop {
             let header = self.content.header(owner)?;
             let branch = self.branch(owner, &header, id)?;
-            if !self.rename_membership_matches(
-                owner,
-                branch.working,
-                plan,
-                &sources,
-                &replacement_set,
-            )? {
+            if let Some(plan) = plan
+                && !self.rename_membership_matches(
+                    owner,
+                    branch.working,
+                    plan,
+                    &sources,
+                    &replacement_set,
+                )?
+            {
                 return Ok(RenameBatchOutcome::Replan);
             }
             let mut values = Vec::with_capacity(moves.len());
