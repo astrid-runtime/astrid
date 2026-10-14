@@ -6,9 +6,8 @@ use anyhow::{Context, Result, ensure};
 
 #[cfg(unix)]
 pub(super) fn open(path: &Path) -> Result<File> {
-    use nix::errno::Errno;
     use nix::fcntl::{OFlag, open, openat};
-    use nix::sys::stat::{Mode, mkdirat};
+    use nix::sys::stat::Mode;
     use std::os::unix::fs::MetadataExt;
 
     let parent = path.parent().context("start fence has no directory")?;
@@ -22,16 +21,13 @@ pub(super) fn open(path: &Path) -> Result<File> {
     )
     .context("open temporary root")?;
     let directory_name = parent.file_name().context("start fence directory name")?;
-    match mkdirat(&root, directory_name, Mode::S_IRWXU) {
-        Ok(()) | Err(Errno::EEXIST) => {},
-        Err(error) => return Err(error).context("create start fence directory"),
-    }
+    let directory_name = directory_for_user(&root, directory_name)?;
     // All later operations are relative to the captured directory descriptor.
     // Never chmod a pathname that may redirect into an unadmitted runtime.
     let directory = File::from(
         openat(
             &root,
-            directory_name,
+            directory_name.as_os_str(),
             OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             Mode::empty(),
         )
@@ -68,43 +64,45 @@ pub(super) fn open(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
+/// Keep the legacy lock for its owner so old and new CLIs still serialize.
+/// Other users cannot use that private directory; give each a private sibling.
+#[cfg(unix)]
+fn directory_for_user(
+    root: &std::os::fd::OwnedFd,
+    legacy_name: &std::ffi::OsStr,
+) -> Result<std::ffi::OsString> {
+    use nix::fcntl::AtFlags;
+    use nix::sys::stat::{SFlag, fstatat};
 
-    #[test]
-    fn lock_leaf_alias_is_refused_without_mutating_target() {
-        let root = tempfile::tempdir().expect("owned root");
-        let target = root.path().join("target");
-        std::fs::write(&target, b"retained").expect("target contents");
-        let directory = root.path().join("astrid-start-fences");
-        std::fs::create_dir(&directory).expect("directory");
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
-            .expect("private directory");
-        let path = directory.join("fixture.lock");
-        std::os::unix::fs::symlink(&target, &path).expect("leaf alias");
-        assert!(open(&path).is_err());
-        assert_eq!(
-            std::fs::read(&target).expect("retained target"),
-            b"retained"
-        );
-        assert!(
-            path.symlink_metadata()
-                .expect("retained alias")
-                .is_symlink()
-        );
+    create_directory(root, legacy_name)?;
+    let metadata = fstatat(root, legacy_name, AtFlags::AT_SYMLINK_NOFOLLOW)
+        .context("inspect non-aliased start fence directory")?;
+    ensure!(
+        SFlag::from_bits_truncate(metadata.st_mode).contains(SFlag::S_IFDIR),
+        "start fence directory must be a real directory"
+    );
+    if metadata.st_uid == nix::unistd::getuid().as_raw() {
+        return Ok(legacy_name.to_owned());
     }
+    let mut name = legacy_name.to_owned();
+    name.push(format!("-{}", nix::unistd::getuid()));
+    create_directory(root, &name)?;
+    Ok(name)
+}
 
-    #[test]
-    fn private_fence_can_be_reused_after_unlock() {
-        let root = tempfile::tempdir().expect("owned root");
-        let path = root.path().join("astrid-start-fences/fixture.lock");
-        drop(open(&path).expect("first fence"));
-        drop(open(&path).expect("reused fence"));
-        assert!(path.is_file());
+#[cfg(unix)]
+fn create_directory(root: &std::os::fd::OwnedFd, name: &std::ffi::OsStr) -> Result<()> {
+    use nix::errno::Errno;
+    use nix::sys::stat::{Mode, mkdirat};
+
+    match mkdirat(root, name, Mode::S_IRWXU) {
+        Ok(()) | Err(Errno::EEXIST) => Ok(()),
+        Err(error) => Err(error).context("create start fence directory"),
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests;
 
 #[cfg(not(unix))]
 pub(super) fn open(path: &Path) -> Result<File> {

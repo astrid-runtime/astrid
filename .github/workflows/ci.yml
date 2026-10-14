@@ -671,6 +671,18 @@ jobs:
         if: matrix.os != 'macos-latest'
         run: cargo test --workspace --locked
 
+      - name: Check startup fence across Linux OS users
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_binary=$(cargo test --locked -p astrid --bin astrid --no-run --message-format=json | python3 -c '
+          import json, sys
+          paths = [m["executable"] for line in sys.stdin if (m := json.loads(line)).get("executable") and m.get("target", {}).get("name") == "astrid" and m.get("profile", {}).get("test")]
+          assert len(paths) == 1, paths
+          print(paths[0])')
+          sudo "$test_binary" --exact commands::daemon::start_fence::tests::foreign_owner_uses_private_fence_without_changing_legacy --nocapture
+
       - name: Run tests (macOS serial)
         if: matrix.os == 'macos-latest'
         env:
