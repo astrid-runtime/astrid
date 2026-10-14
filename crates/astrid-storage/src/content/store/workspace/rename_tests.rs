@@ -4,6 +4,7 @@ use astrid_core::PrincipalUid;
 use parking_lot::Mutex;
 
 use crate::StateOwner;
+use crate::content::ContentName;
 use crate::engine::{
     CommitOutcome, InMemoryEngine, PrincipalProjectionEngine, PrincipalProjectionError,
     RootTransaction,
@@ -166,4 +167,143 @@ fn rename_rechecks_destination_parent_after_root_conflict() {
             FilesystemError::NotFound(_)
         ))
     ));
+}
+
+#[test]
+fn file_rename_rejects_new_source_directory_alias() {
+    let (engine, branches, owner, id) = fixture();
+    let fs = branches.filesystem(owner.clone(), id);
+    let old = FilesystemPath::new("old").unwrap();
+    let new = FilesystemPath::new("new").unwrap();
+    fs.write(&old, b"file").unwrap();
+    let interleaving_branches = branches.clone();
+    let interleaving_owner = owner.clone();
+    *engine.before_commit.lock() = Some(Box::new(move || {
+        interleaving_branches
+            .write(
+                &interleaving_owner,
+                id,
+                &ContentName::new("old/child").unwrap(),
+                b"child",
+            )
+            .unwrap();
+    }));
+    assert!(matches!(
+        fs.rename(&old, &new),
+        Err(super::WorkspaceBranchError::Filesystem(
+            FilesystemError::NamespaceConflict(_)
+        ))
+    ));
+    assert!(
+        branches
+            .describe_name(&owner, id, &ContentName::new("old").unwrap())
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        branches
+            .describe_name(&owner, id, &ContentName::new("old/child").unwrap())
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        branches
+            .describe_name(&owner, id, &ContentName::new("new").unwrap())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn directory_rename_rejects_new_source_file_alias() {
+    let (engine, branches, owner, id) = fixture();
+    let fs = branches.filesystem(owner.clone(), id);
+    let old = FilesystemPath::new("old").unwrap();
+    let new = FilesystemPath::new("new").unwrap();
+    fs.create_dir(&old).unwrap();
+    let interleaving_branches = branches.clone();
+    let interleaving_owner = owner.clone();
+    *engine.before_commit.lock() = Some(Box::new(move || {
+        interleaving_branches
+            .write(
+                &interleaving_owner,
+                id,
+                &ContentName::new("old").unwrap(),
+                b"file",
+            )
+            .unwrap();
+    }));
+    assert!(matches!(
+        fs.rename(&old, &new),
+        Err(super::WorkspaceBranchError::Filesystem(
+            FilesystemError::NamespaceConflict(_)
+        ))
+    ));
+    assert!(
+        branches
+            .describe_name(&owner, id, &ContentName::new("old/").unwrap())
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        branches
+            .describe_name(&owner, id, &ContentName::new("old").unwrap())
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        branches
+            .describe_name(&owner, id, &ContentName::new("new/").unwrap())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn rename_replans_when_source_disappears() {
+    let (engine, branches, owner, id) = fixture();
+    let fs = branches.filesystem(owner.clone(), id);
+    let old = FilesystemPath::new("old").unwrap();
+    let new = FilesystemPath::new("new").unwrap();
+    fs.write(&old, b"file").unwrap();
+    let interleaving_fs = branches.filesystem(owner, id);
+    let removed = old.clone();
+    *engine.before_commit.lock() = Some(Box::new(move || {
+        interleaving_fs.remove(&removed).unwrap();
+    }));
+    assert!(matches!(
+        fs.rename(&old, &new),
+        Err(super::WorkspaceBranchError::Filesystem(
+            FilesystemError::NotFound(_)
+        ))
+    ));
+    assert!(matches!(
+        fs.stat(&new),
+        Err(super::WorkspaceBranchError::Filesystem(
+            FilesystemError::NotFound(_)
+        ))
+    ));
+}
+
+#[test]
+fn rename_replans_when_replacement_disappears() {
+    let (engine, branches, owner, id) = fixture();
+    let fs = branches.filesystem(owner.clone(), id);
+    let old = FilesystemPath::new("old").unwrap();
+    let new = FilesystemPath::new("new").unwrap();
+    fs.write(&old, b"old!").unwrap();
+    fs.write(&new, b"new!").unwrap();
+    let interleaving_fs = branches.filesystem(owner, id);
+    let removed = new.clone();
+    *engine.before_commit.lock() = Some(Box::new(move || {
+        interleaving_fs.remove(&removed).unwrap();
+    }));
+    fs.rename_replacing(&old, &new).unwrap();
+    assert!(matches!(
+        fs.stat(&old),
+        Err(super::WorkspaceBranchError::Filesystem(
+            FilesystemError::NotFound(_)
+        ))
+    ));
+    assert_eq!(fs.read(&new, 0, 4).unwrap(), b"old!");
 }

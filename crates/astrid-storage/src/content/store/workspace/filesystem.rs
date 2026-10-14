@@ -311,10 +311,14 @@ where
             let destination_prefix = to.directory_prefix();
             let destination_name = to.file_name()?;
             let destination_parent = to.parent();
+            let source_name = from.file_name()?;
+            let source_directory_prefix = from.directory_prefix();
             let plan = RenamePlan {
                 moves: &moves,
                 replacements: &replacements,
                 source_prefix: source_prefix.as_deref(),
+                source_name: &source_name,
+                source_directory_prefix: &source_directory_prefix,
                 destination_prefix: &destination_prefix,
                 destination_name: &destination_name,
                 destination_parent: &destination_parent,

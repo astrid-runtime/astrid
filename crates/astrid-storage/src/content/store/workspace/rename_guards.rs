@@ -12,6 +12,8 @@ pub(super) struct RenamePlan<'a> {
     pub(super) moves: &'a [(ContentName, ContentName)],
     pub(super) replacements: &'a [ContentName],
     pub(super) source_prefix: Option<&'a str>,
+    pub(super) source_name: &'a ContentName,
+    pub(super) source_directory_prefix: &'a str,
     pub(super) destination_prefix: &'a str,
     pub(super) destination_name: &'a ContentName,
     pub(super) destination_parent: &'a FilesystemPath,
@@ -50,6 +52,21 @@ where
                 .collect::<BTreeSet<_>>()
                 != *sources
             {
+                return Ok(false);
+            }
+            if lookup(root, plan.source_name, &mut |object| {
+                self.content.load_required_for(owner, object)
+            })?
+            .is_some()
+            {
+                return Ok(false);
+            }
+        } else {
+            let prefix = ContentName::new(plan.source_directory_prefix.to_owned())
+                .map_err(PrincipalContentError::InvalidName)?;
+            if prefix_exists(root, &prefix, &mut |object| {
+                self.content.load_required_for(owner, object)
+            })? {
                 return Ok(false);
             }
         }

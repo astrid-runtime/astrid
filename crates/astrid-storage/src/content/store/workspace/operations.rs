@@ -660,7 +660,7 @@ where
                     self.content.load_required_for(owner, object)
                 })?
                 else {
-                    return Ok(RenameBatchOutcome::DestinationConflict);
+                    return Ok(RenameBatchOutcome::Replan);
                 };
                 if !sources.contains(destination)
                     && !replacement_set.contains(destination)
@@ -689,7 +689,7 @@ where
                     &|record| self.content.engine.identify_object(record),
                 )?;
                 if mutation.previous.is_none() {
-                    return Ok(RenameBatchOutcome::DestinationConflict);
+                    return Ok(RenameBatchOutcome::Replan);
                 }
                 root = mutation.root;
                 records.extend(mutation.records);
@@ -708,7 +708,7 @@ where
                     &|record| self.content.engine.identify_object(record),
                 )?;
                 if mutation.previous.is_none() {
-                    return Ok(RenameBatchOutcome::DestinationConflict);
+                    return Ok(RenameBatchOutcome::Replan);
                 }
                 root = mutation.root;
                 records.extend(mutation.records);
