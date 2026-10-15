@@ -29,6 +29,13 @@ pub mod native_input;
 pub fn run_to_completion() -> Result<()> {
     // Help/version must not acquire ownership of a running installation.
     let args = Args::parse();
+    if args.setup_sandbox_probe {
+        anyhow::ensure!(
+            astrid_workspace::sandbox::probe_native_process_sandbox(),
+            "native-process sandbox setup probe failed"
+        );
+        return Ok(());
+    }
     let home = astrid_core::dirs::AstridHome::resolve()?;
     let lifecycle = astrid_storage::principal_state::RuntimeLifecycleGuard::acquire(&home)?;
     {
@@ -57,6 +64,9 @@ const DAEMON_LOG_TARGET_ENV: &str = "ASTRID_DAEMON_LOG_TARGET";
 #[command(name = "astrid-daemon")]
 #[command(author, version, about)]
 pub struct Args {
+    /// Run the disposable native-process setup probe before touching a home.
+    #[arg(long, hide = true)]
+    pub setup_sandbox_probe: bool,
     /// The session ID to bind the daemon to
     #[arg(short, long, default_value = "00000000-0000-0000-0000-000000000000")]
     pub session: String,

@@ -1,199 +1,204 @@
-//! `astrid setup` — privileged one-time host configuration.
+//! Diagnose the native-process sandbox in the CLI and daemon contexts.
 //!
-//! Detects the OS-level sandbox prerequisites Astrid needs (the only
-//! non-trivial one today: Linux unprivileged user namespaces, which
-//! Ubuntu 23.10+ blocks by default — see issue #655) and prints the
-//! exact commands the operator should run via `sudo` to satisfy them.
-//!
-//! The subcommand deliberately does **not** auto-elevate. Installing
-//! an `AppArmor` profile is a privileged, host-wide change; we make it
-//! easy to do, but never surprising. The operator either copy-pastes
-//! the printed commands or runs `astrid setup --apply`, which re-execs
-//! itself via `sudo` after confirming.
+//! Ubuntu's `AppArmor` restriction requires a policy for the sandbox launcher.
+//! Granting `userns` to Astrid itself would also grant it to arbitrary children.
 
 use std::fs::OpenOptions;
+use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 
 use anyhow::Result;
 use clap::Args;
 use colored::Colorize;
 
-/// The packaged `AppArmor` profile, bundled into the binary at build
-/// time so `astrid setup` can write a path-correct copy to /tmp for
-/// the operator to install.
-const APPARMOR_PROFILE_TEMPLATE: &str = include_str!("../../apparmor/astrid");
+const UBUNTU_BWRAP_PROFILE: &str = "/usr/share/apparmor/extra-profiles/bwrap-userns-restrict";
 
 #[derive(Args, Debug, Clone)]
+#[allow(clippy::struct_excessive_bools, reason = "independent CLI flags")]
 pub(crate) struct SetupArgs {
-    /// Print the `AppArmor` profile to stdout and exit (skip detection).
-    /// Useful for distro packagers who want the profile content for
-    /// inclusion in a .deb / .rpm / etc.
-    #[arg(long)]
+    /// Probe the CLI executable's actual Linux sandbox context.
+    #[arg(long, hide = true)]
+    pub probe_sandbox_context: bool,
+    /// Retired: Astrid-wide `AppArmor` grants are unsafe.
+    #[arg(long, hide = true)]
+    pub install_apparmor_root: bool,
+    /// Retired: use a protected Bubblewrap profile instead.
+    #[arg(long, hide = true)]
     pub print_apparmor: bool,
-
-    /// Actually run the privileged install steps via `sudo`. Without
-    /// this flag, the subcommand prints the commands it would run and
-    /// exits — operators stay in control of when privilege escalation
-    /// happens.
+    /// Retired: use a protected Bubblewrap profile instead.
+    #[arg(long, hide = true)]
+    pub print_apparmor_current: bool,
+    /// Show operator instructions if the sandbox probe fails.
     #[arg(long)]
     pub apply: bool,
 }
 
 pub(crate) fn run(args: &SetupArgs) -> Result<ExitCode> {
-    if args.print_apparmor {
-        println!("{APPARMOR_PROFILE_TEMPLATE}");
-        return Ok(ExitCode::SUCCESS);
+    if args.probe_sandbox_context {
+        return Ok(
+            if astrid_workspace::sandbox::probe_native_process_sandbox() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            },
+        );
+    }
+    if args.install_apparmor_root || args.print_apparmor || args.print_apparmor_current {
+        anyhow::bail!(
+            "Astrid-wide AppArmor userns profiles are unsafe; use a protected Bubblewrap profile and rerun `astrid setup`"
+        );
     }
 
-    println!("{}", "Astrid host setup".bold());
-    println!();
-
+    println!("{}\n", "Astrid host setup".bold());
     let report = diagnose();
-    run_report(args, &report)
+    Ok(run_report(args, &report))
 }
 
-fn run_report(args: &SetupArgs, report: &Report) -> Result<ExitCode> {
+fn run_report(args: &SetupArgs, report: &Report) -> ExitCode {
     report.print();
-
-    if setup_exit(report) == ExitCode::FAILURE {
-        println!();
-        for line in fuse_guidance(report) {
-            println!("{line}");
-        }
-        return Ok(ExitCode::FAILURE);
-    }
-
-    if !report.needs_apparmor_profile {
-        println!();
+    if report.ready() {
         if report.os == "linux" {
             println!(
-                "{}",
+                "\n{}",
                 "All checks pass for this user and environment.".green()
             );
         } else {
-            println!("{}", "All checks pass. No host setup required.".green());
+            println!("\n{}", "All checks pass. No host setup required.".green());
         }
-        return Ok(ExitCode::SUCCESS);
+        return ExitCode::SUCCESS;
     }
-
-    println!();
-    println!("{}", "Recommended commands:".bold());
-    let cmds = install_commands();
-    for line in &cmds {
-        println!("  {line}");
+    if report.os == "linux" {
+        if !report.fuse_helper_available || !report.fuse_device_accessible {
+            println!();
+            for line in fuse_guidance(report) {
+                println!("{line}");
+            }
+        }
+        if !report.bwrap_installed || !report.bwrap_bind_fd_supported {
+            println!(
+                "\nInstall or update Bubblewrap. On Ubuntu: `sudo apt-get install bubblewrap`."
+            );
+        }
+        if report.apparmor_restriction_active && !report.bwrap_probe_passed {
+            println!("\nAppArmor is restricting unprivileged user namespaces.");
+            println!(
+                "If an old Astrid-wide AppArmor userns profile is attached, have an administrator remove it and restart the daemon."
+            );
+            if Path::new(UBUNTU_BWRAP_PROFILE).is_file() || ubuntu_family() {
+                if Path::new(UBUNTU_BWRAP_PROFILE).is_file() {
+                    println!(
+                        "Ubuntu supplies a Bubblewrap-specific profile at {UBUNTU_BWRAP_PROFILE}."
+                    );
+                } else {
+                    println!(
+                        "On Ubuntu, `sudo apt-get install apparmor-profiles` supplies a Bubblewrap-specific profile."
+                    );
+                }
+                println!("Ask an administrator to review the distro profile and load it:");
+                for line in ubuntu_profile_commands() {
+                    println!("  {line}");
+                }
+            } else {
+                println!(
+                    "Ask an administrator for this distribution's protected Bubblewrap user-namespace policy; do not grant userns to Astrid."
+                );
+            }
+            println!(
+                "This grants user namespaces to Bubblewrap, not Astrid or arbitrary child programs."
+            );
+        }
+        if args.apply {
+            println!(
+                "\n`--apply` no longer installs an Astrid-wide policy; use the reviewed administrator commands above."
+            );
+        }
     }
-
-    if !args.apply {
-        println!();
-        println!("Run `astrid setup --apply` to execute these via sudo,");
-        println!("or copy/paste them yourself.");
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    println!();
-    println!("{}", "Applying via sudo...".bold());
-    apply_install()
+    ExitCode::FAILURE
 }
 
-// ── Diagnosis ──────────────────────────────────────────────────────
+fn ubuntu_profile_commands() -> [&'static str; 4] {
+    [
+        "sudo apt-get install bubblewrap apparmor-profiles",
+        "sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict",
+        "sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict",
+        "astrid setup",
+    ]
+}
+
+fn ubuntu_family() -> bool {
+    let Ok(release) = std::fs::read_to_string("/etc/os-release") else {
+        return false;
+    };
+    ubuntu_family_release(&release)
+}
+
+fn ubuntu_family_release(release: &str) -> bool {
+    release.lines().any(|line| {
+        line.strip_prefix("ID=")
+            .is_some_and(|id| id.trim_matches('"') == "ubuntu")
+            || line.strip_prefix("ID_LIKE=").is_some_and(|ids| {
+                ids.trim_matches('"')
+                    .split_whitespace()
+                    .any(|id| id == "ubuntu")
+            })
+    })
+}
 
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "report struct — one bool per probe is the clearest shape"
+    reason = "one result per independent probe"
 )]
 struct Report {
     os: &'static str,
     bwrap_installed: bool,
     bwrap_probe_passed: bool,
+    bwrap_bind_fd_supported: bool,
     fuse_helper_available: bool,
     fuse_device_accessible: bool,
     apparmor_restriction_active: bool,
-    apparmor_profile_loaded: bool,
-    needs_apparmor_profile: bool,
 }
 
 impl Report {
+    fn ready(&self) -> bool {
+        self.os != "linux"
+            || (self.bwrap_installed
+                && self.bwrap_probe_passed
+                && self.bwrap_bind_fd_supported
+                && self.fuse_helper_available
+                && self.fuse_device_accessible)
+    }
+
     fn print(&self) {
         println!("  OS:                                {}", self.os);
         if self.os != "linux" {
-            println!(
-                "  {}",
-                "Linux-specific sandbox checks skipped (macOS uses Seatbelt).".dimmed()
-            );
+            println!("  Linux-specific sandbox checks skipped (macOS uses Seatbelt).");
             return;
         }
+        check_line("bwrap binary installed", self.bwrap_installed);
         check_line(
-            "bwrap binary installed",
-            self.bwrap_installed,
-            if self.bwrap_installed {
-                "found"
-            } else {
-                "missing — install the `bubblewrap` package"
-            },
+            "bwrap descriptor-bind support",
+            self.bwrap_bind_fd_supported,
         );
-        check_line(
-            "bwrap user-namespace probe",
-            self.bwrap_probe_passed,
-            if self.bwrap_probe_passed {
-                "passes"
-            } else if !self.bwrap_installed {
-                "skipped (bwrap missing)"
-            } else {
-                "FAILS — sandbox cannot be applied"
-            },
-        );
-        check_line(
-            "FUSE mount helper",
-            self.fuse_helper_available,
-            if self.fuse_helper_available {
-                "helper executable starts"
-            } else {
-                "missing — install `fuse3` or configure FUSERMOUNT_PATH"
-            },
-        );
-        check_line(
-            "/dev/fuse access",
-            self.fuse_device_accessible,
-            if self.fuse_device_accessible {
-                "read/write open succeeds for this user"
-            } else {
-                "unavailable to this user"
-            },
-        );
-        check_line(
-            "AppArmor restriction on unprivileged userns",
-            !self.apparmor_restriction_active,
+        check_line("CLI and daemon sandbox probes", self.bwrap_probe_passed);
+        check_line("FUSE mount helper executable", self.fuse_helper_available);
+        check_line("/dev/fuse read/write access", self.fuse_device_accessible);
+        println!(
+            "  AppArmor userns restriction:      {}",
             if self.apparmor_restriction_active {
-                "active (sysctl=1) — Astrid needs an AppArmor profile"
+                "active"
             } else {
-                "inactive (sysctl=0 or AppArmor not present)"
-            },
+                "inactive or unavailable"
+            }
         );
-        check_line(
-            "Astrid AppArmor profile loaded",
-            self.apparmor_profile_loaded || !self.apparmor_restriction_active,
-            if self.apparmor_profile_loaded {
-                "loaded"
-            } else if self.apparmor_restriction_active {
-                "missing — needs install"
-            } else {
-                "not required (restriction inactive)"
-            },
-        );
+        if self.apparmor_restriction_active && self.bwrap_probe_passed {
+            println!("  Bubblewrap policy:                 effective in both execution contexts");
+        }
     }
 }
 
-fn check_line(label: &str, ok: bool, detail: &str) {
+fn check_line(label: &str, ok: bool) {
     let marker = if ok { "✓".green() } else { "✗".red() };
-    println!("  {marker} {label:<48} {detail}");
-}
-
-fn setup_exit(report: &Report) -> ExitCode {
-    if report.os == "linux" && !(report.fuse_helper_available && report.fuse_device_accessible) {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    }
+    println!("  {marker} {label}");
 }
 
 fn fuse_guidance(report: &Report) -> Vec<&'static str> {
@@ -211,34 +216,22 @@ fn fuse_guidance(report: &Report) -> Vec<&'static str> {
 
 fn diagnose() -> Report {
     let os = std::env::consts::OS;
-    let bwrap_installed = which("bwrap").is_some();
-    let bwrap_probe_passed = bwrap_installed && bwrap_probe_succeeds();
-    let fuse_helper_available = os == "linux" && fuse_helper_available();
-    let fuse_device_accessible = os == "linux" && fuse_device_accessible();
-    let apparmor_restriction_active = read_apparmor_sysctl().is_some_and(|v| v == 1);
-    let apparmor_profile_loaded = is_astrid_profile_loaded();
-    let needs_apparmor_profile = os == "linux"
-        && bwrap_installed
-        && !bwrap_probe_passed
-        && apparmor_restriction_active
-        && !apparmor_profile_loaded;
+    let bwrap_installed = astrid_workspace::sandbox::packaged_bwrap_path().is_some();
     Report {
         os,
         bwrap_installed,
-        bwrap_probe_passed,
-        fuse_helper_available,
-        fuse_device_accessible,
-        apparmor_restriction_active,
-        apparmor_profile_loaded,
-        needs_apparmor_profile,
+        bwrap_probe_passed: bwrap_installed && bwrap_probe_succeeds(),
+        bwrap_bind_fd_supported: bwrap_installed && bwrap_bind_fd_supported(),
+        fuse_helper_available: os == "linux" && fuse_helper_available(),
+        fuse_device_accessible: os == "linux" && fuse_device_accessible(),
+        apparmor_restriction_active: read_apparmor_sysctl() == Some(1),
     }
 }
 
 fn fuse_helper_available() -> bool {
-    // The storage provider uses fuser's direct-mount-then-helper path. AOS
-    // supports ordinary-user native tools, so setup requires a helper even
-    // if the current process could mount directly with elevated privilege.
-    // Follow fuser 0.18's Linux fusermount candidates, including its override.
+    // Ordinary-user native tools require a helper even if this process could
+    // mount directly with elevated privilege. Match fuser 0.18's Linux
+    // fusermount candidates, including its explicit override.
     if let Some(path) = std::env::var_os("FUSERMOUNT_PATH") {
         if path.to_str().is_none() {
             return false;
@@ -275,25 +268,54 @@ fn fuse_device_accessible() -> bool {
         .is_ok()
 }
 
-fn which(bin: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(bin);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
+fn bwrap_probe_succeeds() -> bool {
+    let Ok(executable) = std::env::current_exe() else {
+        return false;
+    };
+    if !probe_cli_sandbox(&executable) {
+        return false;
     }
-    None
+    let Ok(daemon) = crate::bootstrap::find_companion_binary("astrid-daemon") else {
+        return false;
+    };
+    probe_daemon_sandbox(&daemon)
 }
 
-fn bwrap_probe_succeeds() -> bool {
-    Command::new("bwrap")
-        .args(["--unshare-user", "--ro-bind", "/", "/", "--", "/bin/true"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+fn probe_cli_sandbox(executable: &Path) -> bool {
+    Command::new(executable)
+        .args(["setup", "--probe-sandbox-context"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
-        .is_ok_and(|s| s.success())
+        .is_ok_and(|status| status.success())
+}
+
+fn probe_daemon_sandbox(daemon: &Path) -> bool {
+    Command::new(daemon)
+        .arg("--setup-sandbox-probe")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn bwrap_bind_fd_supported() -> bool {
+    let Some(path) = astrid_workspace::sandbox::packaged_bwrap_path() else {
+        return false;
+    };
+    Command::new(path)
+        .arg("--help")
+        .output()
+        .is_ok_and(|output| output.status.success() && has_bind_fd_flags(&output.stdout))
+}
+
+fn has_bind_fd_flags(help: &[u8]) -> bool {
+    let help = String::from_utf8_lossy(help);
+    ["--bind-fd ", "--ro-bind-fd "]
+        .iter()
+        .all(|flag| help.lines().any(|line| line.trim_start().starts_with(flag)))
 }
 
 fn read_apparmor_sysctl() -> Option<u8> {
@@ -302,158 +324,92 @@ fn read_apparmor_sysctl() -> Option<u8> {
     raw.trim().parse().ok()
 }
 
-fn is_astrid_profile_loaded() -> bool {
-    // aa-status output lists profile names one per line. Match on the
-    // profile name we generate.
-    Command::new("aa-status")
-        .arg("--profiled")
-        .output()
-        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("astrid"))
-}
-
-// ── Install commands ───────────────────────────────────────────────
-
-/// Operator-facing copy-paste install recipe. Uses `mktemp` so a hostile
-/// local user can't pre-seed a symlink at the temp path and trick the
-/// later `sudo install` into reading from (or the redirect into writing
-/// over) an attacker-chosen file — the failure mode that motivates the
-/// `tempfile` crate in [`apply_install`].
-fn install_commands() -> Vec<String> {
-    vec![
-        format!("# 1. Stage the profile in a fresh per-invocation temp file (mktemp avoids"),
-        format!("#    the classic /tmp symlink-pre-seed race):"),
-        format!("TMPFILE=$(mktemp -t astrid-apparmor.XXXXXX)"),
-        format!("astrid setup --print-apparmor > \"$TMPFILE\""),
-        format!("# 2. Install it system-wide and load it (sudo required):"),
-        format!("sudo install -m 644 \"$TMPFILE\" /etc/apparmor.d/astrid"),
-        format!("sudo apparmor_parser -r /etc/apparmor.d/astrid"),
-        format!("rm -f \"$TMPFILE\""),
-        format!("# 3. Verify:"),
-        format!("sudo aa-status | grep astrid"),
-    ]
-}
-
-fn apply_install() -> Result<ExitCode> {
-    // Auto-apply runs the privileged steps via sudo, prompting once for
-    // the password. The profile is staged through `tempfile::NamedTempFile`
-    // so the source path is created with `O_EXCL` in a randomised
-    // location — a local attacker can't pre-create a symlink at a
-    // predictable path and trick the later `sudo install` into copying
-    // (or the write into clobbering) an attacker-chosen file.
-    use std::io::Write;
-
-    let mut tmp = tempfile::Builder::new()
-        .prefix("astrid-apparmor-")
-        .suffix(".profile")
-        .tempfile()?;
-    tmp.write_all(APPARMOR_PROFILE_TEMPLATE.as_bytes())?;
-    tmp.flush()?;
-    let tmp_path = tmp.path().to_owned();
-
-    let install = Command::new("sudo")
-        .args(["install", "-m", "644"])
-        .arg(&tmp_path)
-        .arg("/etc/apparmor.d/astrid")
-        .status()?;
-    if !install.success() {
-        eprintln!("{}", "sudo install failed".red());
-        return Ok(ExitCode::FAILURE);
-    }
-
-    let load = Command::new("sudo")
-        .args(["apparmor_parser", "-r", "/etc/apparmor.d/astrid"])
-        .status()?;
-    if !load.success() {
-        eprintln!("{}", "apparmor_parser failed".red());
-        return Ok(ExitCode::FAILURE);
-    }
-
-    // tmp drops here, removing the staged file.
-    drop(tmp);
-
-    println!("{}", "Profile installed and loaded.".green());
-    println!("Re-run `astrid setup` to verify the bwrap probe now passes.");
-    Ok(ExitCode::SUCCESS)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn missing_linux_fuse_prerequisite_makes_setup_fail() {
+    fn setup_requires_both_descriptor_bind_flags() {
+        assert!(has_bind_fd_flags(
+            b"    --bind-fd FD DEST\n    --ro-bind-fd FD DEST\n"
+        ));
+        assert!(!has_bind_fd_flags(b"    --bind-fd FD DEST\n"));
+    }
+
+    #[test]
+    fn active_apparmor_is_not_a_failure_when_real_probes_pass() {
         let mut report = Report {
             os: "linux",
             bwrap_installed: true,
             bwrap_probe_passed: true,
+            bwrap_bind_fd_supported: true,
+            fuse_helper_available: true,
+            fuse_device_accessible: true,
+            apparmor_restriction_active: true,
+        };
+        assert!(report.ready());
+        report.bwrap_probe_passed = false;
+        assert!(!report.ready());
+    }
+
+    #[test]
+    fn linux_fuse_prerequisites_gate_setup_exit() {
+        let args = SetupArgs {
+            probe_sandbox_context: false,
+            install_apparmor_root: false,
+            print_apparmor: false,
+            print_apparmor_current: false,
+            apply: false,
+        };
+        let mut report = Report {
+            os: "linux",
+            bwrap_installed: true,
+            bwrap_probe_passed: true,
+            bwrap_bind_fd_supported: true,
             fuse_helper_available: false,
             fuse_device_accessible: true,
             apparmor_restriction_active: false,
-            apparmor_profile_loaded: false,
-            needs_apparmor_profile: false,
         };
-        let args = SetupArgs {
-            print_apparmor: false,
-            apply: false,
-        };
-        assert_eq!(run_report(&args, &report).unwrap(), ExitCode::FAILURE);
+        assert_eq!(run_report(&args, &report), ExitCode::FAILURE);
         report.fuse_helper_available = true;
-        assert_eq!(run_report(&args, &report).unwrap(), ExitCode::SUCCESS);
+        assert_eq!(run_report(&args, &report), ExitCode::SUCCESS);
         report.fuse_device_accessible = false;
-        assert_eq!(run_report(&args, &report).unwrap(), ExitCode::FAILURE);
+        assert_eq!(run_report(&args, &report), ExitCode::FAILURE);
         let device_guidance = fuse_guidance(&report).join("\n");
         assert!(device_guidance.contains("grant this user read/write access"));
         assert!(device_guidance.contains("expose /dev/fuse"));
         assert!(!device_guidance.contains("apt-get install fuse3"));
         report.os = "macos";
-        assert_eq!(run_report(&args, &report).unwrap(), ExitCode::SUCCESS);
+        assert_eq!(run_report(&args, &report), ExitCode::SUCCESS);
     }
 
     #[test]
-    fn embedded_profile_has_required_userns_grant() {
-        // If a future edit accidentally drops the `userns,` line, the
-        // profile compiles but Astrid silently regresses to the #655
-        // failure mode. Pin the contract here.
-        assert!(
-            APPARMOR_PROFILE_TEMPLATE.contains("userns,"),
-            "AppArmor profile must grant the `userns,` capability"
-        );
-        assert!(
-            APPARMOR_PROFILE_TEMPLATE.contains("profile astrid"),
-            "AppArmor profile must declare a profile named `astrid`"
-        );
-        assert!(
-            APPARMOR_PROFILE_TEMPLATE.contains("flags=(unconfined)"),
-            "AppArmor profile must keep Astrid otherwise unconfined; \
-             tighter confinement belongs in bwrap, not this profile"
-        );
+    fn setup_does_not_offer_an_astrid_wide_profile() {
+        let commands = ubuntu_profile_commands().join("\n");
+        assert!(commands.contains("bwrap-userns-restrict"));
+        assert!(!commands.contains("/etc/apparmor.d/astrid"));
+        assert!(!commands.contains("apparmor_restrict_unprivileged_userns=0"));
     }
 
     #[test]
-    fn install_commands_reference_aa_status_for_verification() {
-        // The verify step is the only feedback an operator has that the
-        // profile is actually loaded; regressing it leaves them blind.
-        let cmds = install_commands();
-        assert!(cmds.iter().any(|c| c.contains("aa-status")));
-        assert!(cmds.iter().any(|c| c.contains("apparmor_parser -r")));
+    fn ubuntu_recipe_is_only_for_ubuntu_family() {
+        assert!(ubuntu_family_release("ID=ubuntu\n"));
+        assert!(ubuntu_family_release("ID=\"ubuntu\"\n"));
+        assert!(ubuntu_family_release("ID=pop\nID_LIKE=\"ubuntu debian\"\n"));
+        assert!(!ubuntu_family_release("ID=debian\nID_LIKE=debian\n"));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn install_commands_use_mktemp_not_predictable_tmp_path() {
-        // Symlink-attack hardening: a hardcoded /tmp path lets a local
-        // attacker pre-seed a symlink and trick `sudo install` into
-        // reading from (or the redirect into clobbering) a sensitive
-        // file. Pin the mktemp pattern so a future edit can't quietly
-        // re-introduce the predictable path.
-        let cmds = install_commands();
-        let joined = cmds.join("\n");
-        assert!(
-            joined.contains("mktemp"),
-            "install_commands must stage via mktemp, not a hardcoded /tmp path: {joined}"
-        );
-        assert!(
-            !joined.contains("/tmp/astrid-apparmor-profile"),
-            "install_commands must not reference the legacy predictable temp path: {joined}"
-        );
+    fn failed_daemon_probe_cannot_claim_setup_readiness() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let daemon = directory.path().join("astrid-daemon");
+        std::fs::write(&daemon, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&daemon, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!probe_daemon_sandbox(&daemon));
+        std::fs::write(&daemon, "#!/bin/sh\n[ \"$1\" = '--setup-sandbox-probe' ]\n").unwrap();
+        assert!(probe_daemon_sandbox(&daemon));
     }
 }

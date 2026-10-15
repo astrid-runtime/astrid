@@ -160,7 +160,10 @@ fn build_persistent_child(
         inject_env,
         extra_masks,
     )
-    .map_err(|_| ErrorCode::InvalidInput)?;
+    .map_err(|error| {
+        tracing::warn!(%error, "native process sandbox construction failed");
+        ErrorCode::InvalidInput
+    })?;
     // `configure_piped` sets the process group + stdout/stderr pipes.
     configure_piped(&mut sandboxed);
     if want_stdin {
@@ -293,9 +296,10 @@ impl process::Host for HostState {
             &self.spawn_mask_paths,
         ) {
             Ok(cmd) => cmd,
-            Err(_) => {
+            Err(error) => {
                 // Sandbox construction failed before exec — audit the attempt as
                 // Failed instead of returning silently via `?`.
+                tracing::warn!(%error, "native process sandbox construction failed");
                 let result: Result<ProcessResult, ErrorCode> = Err(ErrorCode::InvalidInput);
                 audit_spawn_result(
                     self,
@@ -530,9 +534,10 @@ impl process::Host for HostState {
             &self.spawn_mask_paths,
         ) {
             Ok(cmd) => cmd,
-            Err(_) => {
+            Err(error) => {
                 // Sandbox construction failed before exec — audit the attempt as
                 // Failed instead of returning silently via `?`.
+                tracing::warn!(%error, "native process sandbox construction failed");
                 let result: Result<Resource<ProcessHandle>, ErrorCode> =
                     Err(ErrorCode::InvalidInput);
                 audit_spawn_result(

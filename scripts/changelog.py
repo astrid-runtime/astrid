@@ -15,7 +15,11 @@ from pathlib import Path
 
 KINDS = ("added", "changed", "deprecated", "removed", "fixed", "security")
 KIND_HEADING = {kind: kind.title() for kind in KINDS}
-FRAGMENT_NAME = re.compile(rf"^(\d+)\.({'|'.join(KINDS)})\.md$")
+FRAGMENT_NAME = re.compile(
+    rf"^(?:(?P<issue>\d+)\.(?P<kind>{'|'.join(KINDS)})"
+    r"|(?P<advisory>ghsa-[a-z0-9]{4}(?:-[a-z0-9]{4}){2})\.(?P<advisory_kind>security))\.md$"
+)
+FRAGMENT_FORMAT = "{issue}.{kind}.md or ghsa-xxxx-xxxx-xxxx.security.md"
 VERSION_HEADER_PREFIX = "## ["
 UNRELEASED_HEADER = "## [Unreleased]"
 CODE_FILENAMES = {"Cargo.toml", "Cargo.lock"}
@@ -97,7 +101,7 @@ def check_pr(
             added_fragments.append(path)
         else:
             errors.append(
-                f"{path}: name must be {{issue}}.{{kind}}.md with kind "
+                f"{path}: name must be {FRAGMENT_FORMAT} with kind "
                 f"{'|'.join(KINDS)}"
             )
 
@@ -257,8 +261,9 @@ def load_fragments(changes_dir: Path) -> list[tuple[Path, str, str]]:
     for path in pending_fragment_paths(changes_dir):
         match = FRAGMENT_NAME.fullmatch(path.name)
         if match is None:
-            raise ValueError(f"{path}: name must be {{issue}}.{{kind}}.md")
-        loaded.append((path, match.group(2), path.read_text(encoding="utf-8")))
+            raise ValueError(f"{path}: name must be {FRAGMENT_FORMAT}")
+        kind = match.group("kind") or match.group("advisory_kind")
+        loaded.append((path, kind, path.read_text(encoding="utf-8")))
     return loaded
 
 

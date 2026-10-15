@@ -2,8 +2,97 @@ use std::ffi::OsString;
 use std::io;
 use std::process::Command;
 use std::sync::OnceLock;
+use std::{
+    fs::File,
+    os::fd::AsRawFd,
+    os::unix::process::CommandExt,
+    path::{Path, PathBuf},
+};
 
 use super::{ProcessSandboxConfig, SandboxPrefix};
+
+/// Select only package-managed Linux locations. A PATH-selected binary can
+/// impersonate a successful probe or omit the sandbox entirely.
+const PACKAGED_BWRAP_PATHS: [&str; 3] = [
+    "/usr/bin/bwrap",
+    "/bin/bwrap",
+    "/run/current-system/sw/bin/bwrap",
+];
+
+/// Find Bubblewrap at an absolute Linux distribution path, never via `PATH`.
+#[must_use]
+pub fn packaged_bwrap_path() -> Option<&'static str> {
+    PACKAGED_BWRAP_PATHS
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+}
+
+/// A grant needs descriptor binds; older bwrap builds may only support path
+/// binds. Detect that before returning a command that cannot launch safely.
+pub(super) fn require_bind_fd_support() -> io::Result<()> {
+    let path = packaged_bwrap_path().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "packaged Bubblewrap binary not found",
+        )
+    })?;
+    let output = Command::new(path).arg("--help").output()?;
+    let help = String::from_utf8_lossy(&output.stdout);
+    if output.status.success() && help.contains("--bind-fd ") && help.contains("--ro-bind-fd ") {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "installed bubblewrap lacks --bind-fd/--ro-bind-fd; update bubblewrap before spawning a process with home or shared paths",
+        ))
+    }
+}
+
+/// Open the bind source before checking its identity. A path validated first
+/// could be changed to a symlink before bwrap resolves a later `--bind`.
+pub(super) fn open_bind_source(path: &Path) -> io::Result<(PathBuf, File)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let file = File::open(path)?;
+    let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+    let source = fd_path.read_link()?;
+    if !source.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "process bind source did not resolve to an absolute path",
+        ));
+    }
+    let opened = file.metadata()?;
+    let named = source.metadata()?;
+    if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "process bind source changed during validation",
+        ));
+    }
+    Ok((super::resolve_sandbox_path(&source)?, file))
+}
+
+/// Keep verified bind objects open until bwrap consumes the file descriptors.
+/// The command owns this closure, including its descriptors, if spawn is delayed.
+#[allow(unsafe_code)]
+pub(super) fn inherit_bind_sources(command: &mut Command, files: Vec<File>) {
+    if files.is_empty() {
+        return;
+    }
+    // SAFETY: the child hook performs only async-signal-safe fcntl calls. The
+    // owned descriptors stay alive in this closure until bwrap has started.
+    unsafe {
+        command.pre_exec(move || {
+            for file in &files {
+                if libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+}
 
 /// Detects the Linux distro's package manager and returns install instructions
 /// for bubblewrap.
@@ -75,8 +164,8 @@ fn interpret_bwrap_probe(result: io::Result<std::process::Output>) -> bool {
                 "bwrap sandbox unavailable: user namespace creation failed. \
                  On Ubuntu 24.04+, this is likely caused by \
                  kernel.apparmor_restrict_unprivileged_userns=1. \
-                 Fix with: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 \
-                 Capsules will run without OS-level sandboxing."
+                 Install and load Ubuntu's packaged bwrap-userns-restrict \
+                 AppArmor profile, then rerun astrid setup."
             );
             false
         },
@@ -90,7 +179,7 @@ fn interpret_bwrap_probe(result: io::Result<std::process::Output>) -> bool {
             tracing::warn!(
                 error = %e,
                 install_hint = %hint,
-                "{msg} Capsules will run without OS-level sandboxing."
+                "{msg} Native subprocesses require Bubblewrap under the default sandbox policy."
             );
             false
         },
@@ -109,7 +198,15 @@ fn interpret_bwrap_probe(result: io::Result<std::process::Output>) -> bool {
 pub(super) fn bwrap_available() -> bool {
     static RESULT: OnceLock<bool> = OnceLock::new();
     *RESULT.get_or_init(|| {
-        let result = Command::new("bwrap")
+        if unsafe_legacy_astrid_profile() {
+            tracing::error!("retired Astrid AppArmor profile is attached; remove its userns grant before running native subprocesses");
+            return false;
+        }
+        let Some(path) = packaged_bwrap_path() else {
+            tracing::warn!("packaged Bubblewrap binary not found at a supported system path");
+            return false;
+        };
+        let result = Command::new(path)
             .arg("--unshare-user")
             .arg("--ro-bind")
             .arg("/")
@@ -122,6 +219,42 @@ pub(super) fn bwrap_available() -> bool {
             .output();
         interpret_bwrap_probe(result)
     })
+}
+
+/// The old Astrid-wide `userns` grant followed arbitrary exec children. A
+/// working bwrap probe cannot certify isolation while this profile is active.
+pub(super) fn unsafe_legacy_astrid_profile() -> bool {
+    let Ok(current) = std::fs::read_to_string("/proc/self/attr/current") else {
+        return false;
+    };
+    unsafe_legacy_profile_name(current.trim())
+}
+
+fn unsafe_legacy_profile_name(current: &str) -> bool {
+    ["astrid", "astrid-daemon"].iter().any(|name| {
+        current == *name
+            || current.starts_with(&format!("{name} "))
+            || current.starts_with(&format!("{name}//"))
+    })
+}
+
+#[cfg(test)]
+mod legacy_profile_tests {
+    use super::unsafe_legacy_profile_name;
+
+    #[test]
+    fn rejects_retired_astrid_attachments_without_rejecting_bwrap() {
+        for profile in [
+            "astrid (unconfined)",
+            "astrid-daemon (unconfined)",
+            "astrid//child (enforce)",
+        ] {
+            assert!(unsafe_legacy_profile_name(profile));
+        }
+        for profile in ["unconfined", "bwrap (enforce)", "astrid-other (unconfined)"] {
+            assert!(!unsafe_legacy_profile_name(profile));
+        }
+    }
 }
 
 impl ProcessSandboxConfig {
@@ -196,7 +329,7 @@ impl ProcessSandboxConfig {
         args.push(OsString::from("--"));
 
         SandboxPrefix {
-            program: OsString::from("bwrap"),
+            program: OsString::from(packaged_bwrap_path().unwrap_or(PACKAGED_BWRAP_PATHS[0])),
             args,
         }
     }
@@ -211,7 +344,10 @@ mod tests {
         let config = ProcessSandboxConfig::new("/project");
         let prefix = config.build_bwrap_prefix();
 
-        assert_eq!(prefix.program, OsString::from("bwrap"));
+        assert_eq!(
+            prefix.program,
+            OsString::from(packaged_bwrap_path().unwrap_or(PACKAGED_BWRAP_PATHS[0]))
+        );
 
         let args_str: Vec<String> = prefix
             .args

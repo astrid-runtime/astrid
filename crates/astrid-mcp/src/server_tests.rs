@@ -652,7 +652,11 @@ fn test_build_sandboxed_command_adds_sandbox_prefix() {
     let program = cmd.as_std().get_program().to_string_lossy().to_string();
 
     #[cfg(target_os = "linux")]
-    assert_eq!(program, "bwrap", "expected bwrap wrapper, got: {program}");
+    assert_eq!(
+        Some(program.as_str()),
+        astrid_workspace::sandbox::packaged_bwrap_path(),
+        "expected packaged bwrap wrapper, got: {program}"
+    );
     #[cfg(target_os = "macos")]
     assert_eq!(program, "sandbox-exec");
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -667,13 +671,15 @@ fn test_build_sandboxed_command_adds_sandbox_prefix() {
 /// but inlined here so the test doesn't depend on internal symbols.
 #[cfg(target_os = "linux")]
 fn linux_sandbox_actually_available() -> bool {
-    std::process::Command::new("bwrap")
-        .args(["--unshare-user", "--ro-bind", "/", "/", "--", "/bin/true"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    std::process::Command::new(
+        astrid_workspace::sandbox::packaged_bwrap_path().unwrap_or("/usr/bin/bwrap"),
+    )
+    .args(["--unshare-user", "--ro-bind", "/", "/", "--", "/bin/true"])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .status()
+    .is_ok_and(|s| s.success())
 }
 
 #[test]
