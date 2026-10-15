@@ -46,7 +46,7 @@ jobs:
       contents: read
     steps:
       - name: Harden runner
-        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
           egress-policy: audit
 
@@ -155,7 +155,7 @@ jobs:
             | grep -Fq 'io.containerd.snapshotter.v1'
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build one immutable arm64 OCI archive
         run: |
@@ -199,7 +199,7 @@ jobs:
           exit-code: '1'
 
       - name: Generate SPDX SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ${{ env.BOUND_IMAGE }}
           format: spdx-json
@@ -237,7 +237,7 @@ jobs:
           )
 
       - name: Upload immutable arm64 build evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: astrid-${{ env.VERSION }}-arm64-oci-build
           path: |
@@ -269,7 +269,7 @@ jobs:
       VERSION: ${{ inputs.version }}
     steps:
       - name: Harden runner
-        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
           egress-policy: audit
 
@@ -277,7 +277,7 @@ jobs:
         run: test "$(uname -m)" = aarch64
 
       - name: Download exact build evidence
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: astrid-${{ env.VERSION }}-arm64-oci-build
           path: dist
@@ -311,7 +311,7 @@ jobs:
             "dist/astrid-${VERSION}-arm64.evidence.sha256"
 
       - name: Upload signed arm64 evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: astrid-${{ env.VERSION }}-arm64-oci-signed
           path: |
