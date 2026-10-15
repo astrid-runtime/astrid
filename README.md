@@ -150,7 +150,8 @@ Download the archive for your machine from
 companion binaries and platform files together when extracting it; add the
 extracted directory to your `PATH`.
 
-The 2026.9.0 release targets are:
+The current stable release, [v2026.10.0](https://github.com/astrid-runtime/astrid/releases/tag/v2026.10.0),
+publishes these targets:
 
 | Platform | Architectures | Filesystem frontend |
 |---|---|---|
@@ -158,10 +159,16 @@ The 2026.9.0 release targets are:
 | Linux GNU | x86_64, ARM64 | FUSE |
 | Linux MUSL | x86_64, ARM64 | FUSE |
 
-Windows is tested in CI but is **not included in this release's archives**.
-For migration and platform limitations, read the
-[2026.9.0 upgrade notes](release/UPGRADING-2026.9.0.md). Versions now follow
-[year.month.patch](release/VERSIONING.md).
+Windows is tested in CI but is **not included in the release archives**.
+For older runtime-layout migration and platform limitations, read the
+[2026.9.0 upgrade notes](release/UPGRADING-2026.9.0.md); for changes in this
+release, read the [2026.10.0 changelog](CHANGELOG.md).
+Versions follow [year.month.patch](release/VERSIONING.md).
+
+Existing self-managed installations can run `astrid update --check` to inspect
+their signed channel, then `astrid update` to apply an available update.
+Homebrew and Cargo installations are updated by their respective package
+managers.
 
 **Homebrew (macOS and Linux):**
 
@@ -338,23 +345,22 @@ astrid capsule list --verbose              # installed capsules with capability 
 astrid capsule tree                        # imports/exports dependency graph
 ```
 
-## What's new in 2026.9.0
+## What's new in 2026.10.0
 
-- **Volume-backed state:** content-addressed data, deduplication, journal recovery,
-  and migration from the previous runtime layout.
-- **Native mounts:** macOS FSKit and Linux FUSE, with principal and administrative
-  views, configurable volume branding, and useful filesystem metadata.
-- **Linux MUSL archives:** x86_64 and ARM64, alongside GNU Linux and macOS.
-- **Resumable capsule installation:** verified durable identities and
-  principal-scoped completion tracking.
-- **Connection-owned MCP lifetime:** shared session-aware gateways, quiet-client
-  retention, and automatic retirement after the last client disconnects.
-- **Storage performance work:** bounded range writes, prefix-chunk reuse, and
-  verified subtree caching while retaining durability checks.
+- **Accountable user budgets:** operators can configure an optional shared WASM
+  fuel-rate budget per accountable user in `[resources]`, applied on restart.
+  Principal-level `astrid quota set --cpu-rate` remains separate.
+- **Capsule update discovery:** `astrid capsule update --check --json` reports
+  available releases without installing them or granting new authority.
+- **Audit evidence:** signed audit-head snapshots and paged exports make chain
+  history inspectable; opt-in v2 entries add deterministic CBOR and committed
+  fields while retaining existing v1 history.
+- **Release and recovery work:** numbered dev-channel release candidates,
+  corrected update notices, and repairs to storage migration, native mounts,
+  nested capsule failures, and concurrent runtime work.
 
-See the [full changelog](CHANGELOG.md),
-[upgrade notes](release/UPGRADING-2026.9.0.md), and
-[dependency inventory](release/DEPENDENCIES-2026.9.0.md) for the release details.
+See the [full 2026.10.0 changelog](CHANGELOG.md) for
+the exact changes and migration limits.
 
 ## Documentation
 
