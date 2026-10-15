@@ -150,7 +150,7 @@ Download the archive for your machine from
 companion binaries and platform files together when extracting it; add the
 extracted directory to your `PATH`.
 
-The current stable release, [v2026.10.0](https://github.com/astrid-runtime/astrid/releases/tag/v2026.10.0),
+The current stable release, [v2026.10.1](https://github.com/astrid-runtime/astrid/releases/tag/v2026.10.1),
 publishes these targets:
 
 | Platform | Architectures | Filesystem frontend |
@@ -162,7 +162,7 @@ publishes these targets:
 Windows is tested in CI but is **not included in the release archives**.
 For older runtime-layout migration and platform limitations, read the
 [2026.9.0 upgrade notes](release/UPGRADING-2026.9.0.md); for changes in this
-release, read the [2026.10.0 changelog](CHANGELOG.md).
+release, read the [2026.10.1 changelog](CHANGELOG.md).
 Versions follow [year.month.patch](release/VERSIONING.md).
 
 Existing self-managed installations can run `astrid update --check` to inspect
@@ -344,6 +344,20 @@ astrid capsule remove my-capsule           # live-unload, no restart
 astrid capsule list --verbose              # installed capsules with capability metadata
 astrid capsule tree                        # imports/exports dependency graph
 ```
+
+## What's new in 2026.10.1
+
+- **Native-tool readiness:** Linux setup now checks ordinary-user Bubblewrap
+  and FUSE prerequisites and explains repairs before approved tools fail.
+  Multiple Unix users can start their own runtimes on a shared host.
+- **Workspace reliability:** macOS Node can resolve authorized script files,
+  and populated-workspace renames preserve pending content during the atomic
+  transaction.
+- **Sandbox and dependencies:** native process grants no longer expose runtime
+  backing media; Rustls and Wasmtime include upstream security fixes.
+
+See the [full 2026.10.1 changelog](CHANGELOG.md) for the exact fixes and
+operational limits.
 
 ## What's new in 2026.10.0
 

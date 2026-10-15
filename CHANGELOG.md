@@ -8,6 +8,26 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ## [Unreleased]
 
+## [2026.10.1] - 2026-10-15
+
+### Fixed
+
+- Allow separate Unix OS users to start their own runtimes when sharing a temporary directory, while retaining the existing startup lock for its owner and all private-file checks. Closes #2132.
+
+- Allow metadata traversal to authorized macOS process sandbox paths so Node can resolve and execute workspace script files, while preserving directory-content and hidden-path isolation.
+
+- Fix file and directory renames in populated workspaces by resolving pending catalog nodes throughout the atomic rename transaction. Closes #2137.
+
+- Fail Linux host setup with package and device instructions when ordinary-user FUSE mounts are unavailable, before approved native tools encounter an opaque capability error. Closes #2144.
+
+### Security
+
+- Update Rustls to 0.23.46 to include the upstream fixes for RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348 and RUSTSEC-2026-0349. Closes #1516.
+
+- Update Wasmtime and wasmtime-wasi to 48.0.6 for the upstream component-runtime and WASI security fixes published October 14, 2026. Closes #2141.
+
+- Mask canonical and retired runtime backing volumes from native sandboxed commands and reject grants that would reopen protected media. On Linux, diagnose sandbox readiness in both executable contexts and use a protected Bubblewrap profile instead of an Astrid-wide user-namespace grant. Closes #2146.
+
 ## [2026.10.0] - 2026-10-13
 
 ### Added
