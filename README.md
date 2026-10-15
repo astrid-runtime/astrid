@@ -347,8 +347,9 @@ astrid capsule tree                        # imports/exports dependency graph
 
 ## What's new in 2026.10.0
 
-- **Accountable user budgets:** principals can share an optional cooperative
-  WASM fuel-rate budget; `astrid quota set --cpu-rate` configures it.
+- **Accountable user budgets:** operators can configure an optional shared WASM
+  fuel-rate budget per accountable user in `[resources]`, applied on restart.
+  Principal-level `astrid quota set --cpu-rate` remains separate.
 - **Capsule update discovery:** `astrid capsule update --check --json` reports
   available releases without installing them or granting new authority.
 - **Audit evidence:** signed audit-head snapshots and paged exports make chain
