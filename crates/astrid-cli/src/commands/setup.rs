@@ -11,7 +11,8 @@
 //! the printed commands or runs `astrid setup --apply`, which re-execs
 //! itself via `sudo` after confirming.
 
-use std::process::{Command, ExitCode};
+use std::fs::OpenOptions;
+use std::process::{Command, ExitCode, Stdio};
 
 use anyhow::Result;
 use clap::Args;
@@ -48,7 +49,19 @@ pub(crate) fn run(args: &SetupArgs) -> Result<ExitCode> {
     println!();
 
     let report = diagnose();
+    run_report(args, &report)
+}
+
+fn run_report(args: &SetupArgs, report: &Report) -> Result<ExitCode> {
     report.print();
+
+    if setup_exit(report) == ExitCode::FAILURE {
+        println!();
+        println!("Native tools need an unprivileged FUSE helper and /dev/fuse access.");
+        println!("On Debian/Ubuntu: `sudo apt-get install fuse3`.");
+        println!("On Alpine: `sudo apk add fuse3`. Then rerun `astrid setup` as the AOS user.");
+        return Ok(ExitCode::FAILURE);
+    }
 
     if !report.needs_apparmor_profile {
         println!();
@@ -85,6 +98,8 @@ struct Report {
     os: &'static str,
     bwrap_installed: bool,
     bwrap_probe_passed: bool,
+    fuse_helper_available: bool,
+    fuse_device_accessible: bool,
     apparmor_restriction_active: bool,
     apparmor_profile_loaded: bool,
     needs_apparmor_profile: bool,
@@ -121,6 +136,24 @@ impl Report {
             },
         );
         check_line(
+            "FUSE mount helper",
+            self.fuse_helper_available,
+            if self.fuse_helper_available {
+                "helper executable starts"
+            } else {
+                "missing — install `fuse3` or configure FUSERMOUNT_PATH"
+            },
+        );
+        check_line(
+            "/dev/fuse access",
+            self.fuse_device_accessible,
+            if self.fuse_device_accessible {
+                "read/write open succeeds for this user"
+            } else {
+                "unavailable to this user"
+            },
+        );
+        check_line(
             "AppArmor restriction on unprivileged userns",
             !self.apparmor_restriction_active,
             if self.apparmor_restriction_active {
@@ -148,10 +181,20 @@ fn check_line(label: &str, ok: bool, detail: &str) {
     println!("  {marker} {label:<48} {detail}");
 }
 
+fn setup_exit(report: &Report) -> ExitCode {
+    if report.os == "linux" && !(report.fuse_helper_available && report.fuse_device_accessible) {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
 fn diagnose() -> Report {
     let os = std::env::consts::OS;
     let bwrap_installed = which("bwrap").is_some();
     let bwrap_probe_passed = bwrap_installed && bwrap_probe_succeeds();
+    let fuse_helper_available = os == "linux" && fuse_helper_available();
+    let fuse_device_accessible = os == "linux" && fuse_device_accessible();
     let apparmor_restriction_active = read_apparmor_sysctl().is_some_and(|v| v == 1);
     let apparmor_profile_loaded = is_astrid_profile_loaded();
     let needs_apparmor_profile = os == "linux"
@@ -163,10 +206,53 @@ fn diagnose() -> Report {
         os,
         bwrap_installed,
         bwrap_probe_passed,
+        fuse_helper_available,
+        fuse_device_accessible,
         apparmor_restriction_active,
         apparmor_profile_loaded,
         needs_apparmor_profile,
     }
+}
+
+fn fuse_helper_available() -> bool {
+    // The storage provider uses fuser's direct-mount-then-helper path. AOS
+    // supports ordinary-user native tools, so setup requires a helper even
+    // if the current process could mount directly with elevated privilege.
+    // Follow fuser 0.18's Linux fusermount candidates, including its override.
+    if let Some(path) = std::env::var_os("FUSERMOUNT_PATH") {
+        if path.to_str().is_none() {
+            return false;
+        }
+        return helper_spawns(&path);
+    }
+    [
+        "fusermount3",
+        "fusermount",
+        "/sbin/fusermount3",
+        "/sbin/fusermount",
+        "/bin/fusermount3",
+        "/bin/fusermount",
+    ]
+    .iter()
+    .any(helper_spawns)
+}
+
+fn helper_spawns(path: impl AsRef<std::ffi::OsStr>) -> bool {
+    Command::new(path)
+        .arg("-h")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
+fn fuse_device_accessible() -> bool {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/fuse")
+        .is_ok()
 }
 
 fn which(bin: &str) -> Option<std::path::PathBuf> {
@@ -273,6 +359,31 @@ fn apply_install() -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_linux_fuse_prerequisite_makes_setup_fail() {
+        let mut report = Report {
+            os: "linux",
+            bwrap_installed: true,
+            bwrap_probe_passed: true,
+            fuse_helper_available: false,
+            fuse_device_accessible: true,
+            apparmor_restriction_active: false,
+            apparmor_profile_loaded: false,
+            needs_apparmor_profile: false,
+        };
+        let args = SetupArgs {
+            print_apparmor: false,
+            apply: false,
+        };
+        assert_eq!(run_report(&args, &report).unwrap(), ExitCode::FAILURE);
+        report.fuse_helper_available = true;
+        assert_eq!(run_report(&args, &report).unwrap(), ExitCode::SUCCESS);
+        report.fuse_device_accessible = false;
+        assert_eq!(run_report(&args, &report).unwrap(), ExitCode::FAILURE);
+        report.os = "macos";
+        assert_eq!(run_report(&args, &report).unwrap(), ExitCode::SUCCESS);
+    }
 
     #[test]
     fn embedded_profile_has_required_userns_grant() {
