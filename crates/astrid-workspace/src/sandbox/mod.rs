@@ -613,6 +613,7 @@ impl SandboxCommand {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
 }
