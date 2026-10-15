@@ -243,6 +243,9 @@ fn wrap_with_injections_emits_ro_bind_pair() {
 #[cfg(target_os = "linux")]
 #[test]
 fn process_write_path_is_bound_read_write() {
+    if super::bwrap::require_bind_fd_support().is_err() {
+        return; // Argument generation requires the packaged descriptor-bind launcher.
+    }
     let root = tempfile::tempdir().expect("root");
     let workspace = root.path().join("workspace");
     let principal = root.path().join("principal");

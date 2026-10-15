@@ -7,6 +7,10 @@ use std::{fs::File, os::fd::AsRawFd};
 
 #[cfg(target_os = "linux")]
 mod bwrap;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod runtime_media;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod runtime_media_unsupported;
 #[cfg(target_os = "macos")]
 mod seatbelt;
 mod setup_probe;
@@ -122,11 +126,10 @@ impl SandboxCommand {
     /// # Errors
     /// Propagates a failure to locate the Astrid home — a spawn whose security
     /// boundary cannot be established is refused (fail-secure), mirroring the
-    /// MCP-server spawn path (`astrid-mcp`'s `with_hidden(astrid_home)`).
+    /// MCP-server spawn path (`astrid-mcp`'s protected runtime home).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn sensitive_astrid_paths() -> io::Result<Vec<PathBuf>> {
-        let home = astrid_core::dirs::AstridHome::resolve()?;
-        Ok(Self::sensitive_astrid_paths_in(&home))
+        runtime_media::sensitive_astrid_paths()
     }
 
     /// The masked set for a given home, filtered to paths that exist on disk.
@@ -489,7 +492,10 @@ impl SandboxCommand {
                     .arg(destination);
             }
 
-            let held_grants: Vec<File> = opened_grants.into_iter().map(|(_, file)| file).collect();
+            let held_grants = opened_grants
+                .into_iter()
+                .map(|(_, file)| std::sync::Arc::new(file))
+                .collect();
             bwrap::inherit_bind_sources(&mut bwrap, held_grants);
 
             bwrap
@@ -648,10 +654,12 @@ fn resolve_sandbox_path(path: &Path) -> io::Result<PathBuf> {
 /// The caller appends the original program and its arguments after these args.
 #[derive(Debug, Clone)]
 pub struct SandboxPrefix {
-    /// The sandbox wrapper program (e.g., `bwrap` or `sandbox-exec`).
+    /// The sandbox wrapper program.
     pub program: OsString,
-    /// Arguments to the sandbox wrapper, NOT including the inner command.
+    /// Arguments before the inner command.
     pub args: Vec<OsString>,
+    #[cfg(target_os = "linux")]
+    bind_sources: Vec<std::sync::Arc<File>>,
 }
 
 /// Data-oriented sandbox configuration that produces a wrapper program + args
@@ -665,11 +673,10 @@ pub struct SandboxPrefix {
 /// ```rust,ignore
 /// let config = ProcessSandboxConfig::new("/home/user/project")
 ///     .with_network(true)
-///     .with_hidden("/home/user/.astrid");
+///     .with_protected_runtime_home("/home/user/.astrid");
 ///
 /// if let Some(prefix) = config.sandbox_prefix()? {
-///     let mut cmd = tokio::process::Command::new(&prefix.program);
-///     cmd.args(&prefix.args);
+///     let mut cmd = tokio::process::Command::from(prefix.into_command());
 ///     cmd.arg("npx").args(["@anthropics/mcp-server-filesystem", "/tmp"]);
 /// }
 /// ```
@@ -791,6 +798,7 @@ pub struct ProcessSandboxConfig {
     allow_network: bool,
     /// Paths to overlay with empty tmpfs (Linux) or exclude (macOS), blocking access.
     hidden_paths: Vec<PathBuf>,
+    protected_runtime_home: Option<PathBuf>,
     /// Read-only file injections: host-verified bytes exposed at an in-sandbox
     /// `target`. On macOS the snapshot is materialized at `target` (so
     /// `source == target`) and the profile gets a read-allow plus a trailing
@@ -816,6 +824,7 @@ impl ProcessSandboxConfig {
             extra_write_paths: Vec::new(),
             allow_network: true,
             hidden_paths: Vec::new(),
+            protected_runtime_home: None,
             ro_injections: Vec::new(),
             policy: SandboxPolicy::from_env(),
         }
@@ -905,10 +914,7 @@ impl ProcessSandboxConfig {
     ///   on Ubuntu 24.04+) and the remediation (`sysctl` command or
     ///   explicit policy override).
     pub fn sandbox_prefix(&self) -> io::Result<Option<SandboxPrefix>> {
-        // Validate all configured paths up front, regardless of platform.
-        // This ensures the doc contract ("returns Err for non-UTF-8 or
-        // forbidden chars") holds on every OS, not just macOS where SBPL
-        // interpolation makes it exploitable.
+        // Validate before building any platform profile.
         self.validate_all_paths()?;
 
         // `Off` short-circuits before any probe so the no-warn contract
@@ -918,10 +924,13 @@ impl ProcessSandboxConfig {
             return Ok(None);
         }
 
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        self.validate_protected_runtime_grants()?;
+
         #[cfg(target_os = "linux")]
         {
             if bwrap::bwrap_available() {
-                return Ok(Some(self.build_bwrap_prefix()));
+                return self.build_pinned_bwrap_prefix().map(Some);
             }
             self.handle_unavailable_sandbox(linux_unavailable_hint())
         }

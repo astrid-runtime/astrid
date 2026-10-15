@@ -1,11 +1,11 @@
 use std::ffi::OsString;
 use std::io;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::{
-    fs::File,
-    os::fd::AsRawFd,
+    fs::{File, OpenOptions},
     os::unix::process::CommandExt,
+    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::{Path, PathBuf},
 };
 
@@ -53,7 +53,12 @@ pub(super) fn require_bind_fd_support() -> io::Result<()> {
 pub(super) fn open_bind_source(path: &Path) -> io::Result<(PathBuf, File)> {
     use std::os::unix::fs::MetadataExt;
 
-    let file = File::open(path)?;
+    // O_PATH pins the object without performing I/O. O_RDONLY would block on
+    // a FIFO with no writer and reject a legitimate write-only grant.
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+        .open(path)?;
     let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
     let source = fd_path.read_link()?;
     if !source.is_absolute() {
@@ -76,7 +81,7 @@ pub(super) fn open_bind_source(path: &Path) -> io::Result<(PathBuf, File)> {
 /// Keep verified bind objects open until bwrap consumes the file descriptors.
 /// The command owns this closure, including its descriptors, if spawn is delayed.
 #[allow(unsafe_code)]
-pub(super) fn inherit_bind_sources(command: &mut Command, files: Vec<File>) {
+pub(super) fn inherit_bind_sources(command: &mut Command, files: Vec<Arc<File>>) {
     if files.is_empty() {
         return;
     }
@@ -258,7 +263,27 @@ mod legacy_profile_tests {
 }
 
 impl ProcessSandboxConfig {
+    pub(super) fn build_pinned_bwrap_prefix(&self) -> io::Result<SandboxPrefix> {
+        let mut pins = Vec::new();
+        for path in std::iter::once(&self.writable_root).chain(&self.extra_write_paths) {
+            let (resolved, file) = open_bind_source(path)?;
+            if let Some(root) = &self.protected_runtime_home {
+                let home = astrid_core::dirs::AstridHome::from_path(root);
+                super::runtime_media::validate_mcp_grants(&home, [resolved.as_path()])?;
+                super::runtime_media::require_private_volume_links(&home)?;
+            }
+            pins.push((resolved, Arc::new(file)));
+        }
+        require_bind_fd_support()?;
+        Ok(self.build_bwrap_prefix_with_pins(Some(&pins)))
+    }
+
+    #[cfg(test)]
     pub(super) fn build_bwrap_prefix(&self) -> SandboxPrefix {
+        self.build_bwrap_prefix_with_pins(None)
+    }
+
+    fn build_bwrap_prefix_with_pins(&self, pins: Option<&[(PathBuf, Arc<File>)]>) -> SandboxPrefix {
         let mut args: Vec<OsString> = Vec::new();
 
         // Read-only access to host OS (for binaries like /usr/bin/node)
@@ -286,19 +311,24 @@ impl ProcessSandboxConfig {
         }
 
         // Write access to the writable root (after hidden tmpfs so it punches through)
-        args.extend([
-            OsString::from("--bind"),
-            self.writable_root.as_os_str().into(),
-            self.writable_root.as_os_str().into(),
-        ]);
-
-        // Additional writable paths (also after hidden tmpfs)
-        for path in &self.extra_write_paths {
-            args.extend([
-                OsString::from("--bind"),
-                path.as_os_str().into(),
-                path.as_os_str().into(),
-            ]);
+        for (index, path) in std::iter::once(&self.writable_root)
+            .chain(&self.extra_write_paths)
+            .enumerate()
+        {
+            if let Some(pins) = pins {
+                let (resolved, file) = &pins[index];
+                args.extend([
+                    OsString::from("--bind-fd"),
+                    file.as_raw_fd().to_string().into(),
+                    resolved.as_os_str().into(),
+                ]);
+            } else {
+                args.extend([
+                    OsString::from("--bind"),
+                    path.as_os_str().into(),
+                    path.as_os_str().into(),
+                ]);
+            }
         }
 
         // Read-only file injections: bind each host-owned verified snapshot at
@@ -331,6 +361,9 @@ impl ProcessSandboxConfig {
         SandboxPrefix {
             program: OsString::from(packaged_bwrap_path().unwrap_or(PACKAGED_BWRAP_PATHS[0])),
             args,
+            bind_sources: pins
+                .map(|pins| pins.iter().map(|(_, file)| Arc::clone(file)).collect())
+                .unwrap_or_default(),
         }
     }
 }
@@ -588,6 +621,28 @@ mod tests {
         assert!(
             hint.contains("bubblewrap"),
             "install hint should mention 'bubblewrap': {hint}"
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn bind_source_opath_pins_fifo_without_waiting_for_writer() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+
+        let temp = tempfile::tempdir().expect("temporary bind source");
+        let fifo = temp.path().join("grant-fifo");
+        let name = CString::new(fifo.as_os_str().as_bytes()).expect("FIFO name");
+        // SAFETY: name is a NUL-terminated owned path inside the temp dir.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (resolved, pin) = open_bind_source(&fifo).expect("O_PATH must not block on FIFO");
+        assert_eq!(resolved, fifo);
+        assert!(
+            pin.metadata()
+                .expect("pinned metadata")
+                .file_type()
+                .is_fifo()
         );
     }
 }

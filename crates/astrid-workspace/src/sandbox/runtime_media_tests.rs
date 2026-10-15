@@ -4,6 +4,60 @@ use super::*;
 const PROBE_HOME: &str = "ASTRID_TEST_RUNTIME_MEDIA_HOME";
 const MARKER: &[u8] = b"qa-private-runtime-media";
 
+#[test]
+fn native_spawns_reject_linked_runtime_media() {
+    let root = tempfile::tempdir().expect("isolated home");
+    let home = astrid_core::dirs::AstridHome::from_path(root.path());
+    let volume = home.storage_volume_path();
+    std::fs::write(&volume, MARKER).expect("synthetic backing volume");
+    let alias = root.path().join("capsules").join("alias");
+    std::fs::create_dir_all(alias.parent().expect("capsule directory")).expect("capsule dir");
+    std::fs::hard_link(&volume, &alias).expect("second name for backing volume");
+    let error = super::runtime_media::require_private_volume_links(&home)
+        .expect_err("hard-linked backing volume must stop native spawn");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    let config = ProcessSandboxConfig::new(root.path().join("capsules"))
+        .with_protected_runtime_home(root.path());
+    let error = config
+        .sandbox_prefix()
+        .expect_err("native MCP must reject linked backing volume");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    std::fs::remove_file(&alias).expect("remove extra link");
+    super::runtime_media::require_private_volume_links(&home)
+        .expect("single-link backing volume remains usable");
+}
+
+#[test]
+fn native_mcp_rejects_runtime_grants_and_aliases() {
+    let root = tempfile::tempdir().expect("isolated home");
+    let home = astrid_core::dirs::AstridHome::from_path(root.path());
+    let volume = home.storage_volume_path();
+    std::fs::write(&volume, MARKER).expect("synthetic backing volume");
+    let alias = tempfile::tempdir().expect("external alias");
+    let alias_path = alias.path().join("volume-link");
+    std::os::unix::fs::symlink(&volume, &alias_path).expect("volume alias");
+    let safe = root.path().join("capsules").join("safe");
+    std::fs::create_dir_all(&safe).expect("safe capsule path");
+    for denied in [&volume, root.path(), alias_path.as_path()] {
+        for config in [
+            ProcessSandboxConfig::new(denied).with_protected_runtime_home(root.path()),
+            ProcessSandboxConfig::new(&safe)
+                .with_protected_runtime_home(root.path())
+                .with_extra_write(denied),
+            ProcessSandboxConfig::new(&safe)
+                .with_protected_runtime_home(root.path())
+                .with_extra_read(denied),
+        ] {
+            let error = config
+                .sandbox_prefix()
+                .expect_err("runtime-media grant must be denied");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+    }
+    super::runtime_media::validate_mcp_grants(&home, [safe.as_path()])
+        .expect("scoped capsule path remains authorized");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn attached_legacy_profile_blocks_capsule_native_wrapper() {
@@ -19,6 +73,7 @@ fn attached_legacy_profile_blocks_capsule_native_wrapper() {
 }
 
 #[test]
+#[ignore = "requires a provisioned native sandbox; run in platform QA"]
 fn runtime_media_remains_private_in_native_processes() {
     let temp_root = if cfg!(target_os = "linux") {
         PathBuf::from("/var/tmp")
@@ -120,6 +175,12 @@ fn runtime_media_child() {
         .expect_err("injection target must not reopen sensitive media");
     assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     assert_alias_grants_rejected(&root, &volume);
+    let hard_link = root.join("linked-media");
+    std::fs::hard_link(&volume, &hard_link).expect("synthetic hard link");
+    let error = SandboxCommand::wrap(Command::new("/bin/true"), &root)
+        .expect_err("native wrapper must refuse a second backing-volume name");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    std::fs::remove_file(&hard_link).expect("remove synthetic hard link");
     #[cfg(target_os = "macos")]
     assert_seatbelt_retarget_remains_private(&root, &volume);
     let mut healthy = Command::new("/bin/sh");
@@ -138,6 +199,35 @@ fn runtime_media_child() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout, b"healthy");
+
+    assert_native_mcp_scoped_grant(&root, &volume);
+}
+
+fn assert_native_mcp_scoped_grant(root: &Path, volume: &Path) {
+    let mcp_root = root.join("capsules").join("mcp-safe");
+    std::fs::create_dir_all(&mcp_root).expect("scoped MCP root");
+    let prefix = ProcessSandboxConfig::new(&mcp_root)
+        .with_protected_runtime_home(root)
+        .sandbox_prefix()
+        .expect("native MCP sandbox")
+        .expect("required native MCP prefix");
+    let mut mcp = prefix.into_command();
+    mcp.args([
+        "/bin/sh",
+        "-c",
+        "cat \"$1\" 2>/dev/null; printf changed > \"$1\" 2>/dev/null; printf mcp-healthy > qa-mcp-file; cat qa-mcp-file",
+        "qa-mcp",
+    ]);
+    mcp.arg(volume);
+    mcp.current_dir(&mcp_root);
+    let output = mcp.output().expect("run native MCP command");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"mcp-healthy");
+    assert_eq!(std::fs::read(volume).expect("host media"), MARKER);
 }
 
 #[cfg(target_os = "macos")]
