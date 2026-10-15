@@ -150,7 +150,7 @@ Download the archive for your machine from
 companion binaries and platform files together when extracting it; add the
 extracted directory to your `PATH`.
 
-The current stable release, [v2026.10.1](https://github.com/astrid-runtime/astrid/releases/tag/v2026.10.1),
+The current stable release, [v2026.10.0](https://github.com/astrid-runtime/astrid/releases/tag/v2026.10.0),
 publishes these targets:
 
 | Platform | Architectures | Filesystem frontend |
@@ -162,7 +162,7 @@ publishes these targets:
 Windows is tested in CI but is **not included in the release archives**.
 For older runtime-layout migration and platform limitations, read the
 [2026.9.0 upgrade notes](release/UPGRADING-2026.9.0.md); for changes in this
-release, read the [2026.10.1 changelog](CHANGELOG.md).
+release, read the [2026.10.0 changelog](CHANGELOG.md).
 Versions follow [year.month.patch](release/VERSIONING.md).
 
 Existing self-managed installations can run `astrid update --check` to inspect
