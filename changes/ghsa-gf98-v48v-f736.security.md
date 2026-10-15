@@ -1,1 +1,0 @@
-Mask canonical and retired runtime backing volumes from native sandboxed commands and reject grants that would reopen protected media. On Linux, diagnose sandbox readiness in both executable contexts and use a protected Bubblewrap profile instead of an Astrid-wide user-namespace grant.

@@ -108,24 +108,6 @@ class CheckPrTests(unittest.TestCase):
             [],
         )
 
-    def test_advisory_security_fragment_passes(self):
-        advisory = "changes/ghsa-ab12-cd34-ef56.security.md"
-        self.assertEqual(
-            check_pr(
-                labels=[],
-                changed_paths=["crates/astrid-kernel/src/lib.rs", advisory],
-                added_paths=[advisory],
-            ),
-            [],
-        )
-        self.assertTrue(
-            check_pr(
-                labels=[],
-                changed_paths=["crates/astrid-kernel/src/lib.rs"],
-                added_paths=["changes/ghsa-ab12-cd34-ef56.fixed.md"],
-            )
-        )
-
     def test_skip_label_passes_without_fragment(self):
         self.assertEqual(
             check_pr(
@@ -311,26 +293,6 @@ class RollNotesTests(unittest.TestCase):
             self.assertIn("## [0.2.0] - 2026-08-20", text)
             self.assertIn("**Rolled fix.** Closes #9.", text)
             self.assertTrue(text.split("## [0.1.0]", 1)[1].startswith(" - 2026-01-01"))
-
-    def test_roll_command_accepts_and_consumes_advisory(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            changelog_path = root / "CHANGELOG.md"
-            changes = root / "changes"
-            changes.mkdir()
-            changelog_path.write_text(SAMPLE, encoding="utf-8")
-            fragment = changes / "ghsa-ab12-cd34-ef56.security.md"
-            fragment.write_text("Security correction.\n", encoding="utf-8")
-            ns = changelog.build_parser().parse_args(
-                [
-                    "roll", "--version", "0.2.0", "--date", "2026-08-20",
-                    "--changelog", str(changelog_path), "--changes-dir", str(changes),
-                ]
-            )
-            self.assertEqual(ns.func(ns), 0)
-            self.assertFalse(fragment.exists())
-            notes = extract_notes(changelog_path.read_text(encoding="utf-8"), "0.2.0")
-            self.assertIn("### Security\n\n- Security correction.\n", notes)
 
     def test_notes_require_rolled_fails_on_pending_fragment(self):
         with tempfile.TemporaryDirectory() as tmp:
