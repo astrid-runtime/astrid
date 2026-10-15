@@ -459,7 +459,7 @@ impl ServerManager {
         // Build sandbox config
         let mut sandbox_config = ProcessSandboxConfig::new(&writable_root)
             .with_network(config.allow_network)
-            .with_hidden(astrid_home);
+            .with_protected_runtime_home(astrid_home);
         if let Some(policy) = self.sandbox_policy_override {
             sandbox_config = sandbox_config.with_policy(policy);
         }
@@ -546,10 +546,7 @@ impl ServerManager {
 
         // Build the command
         let mut cmd = if let Some(prefix) = sandbox_prefix {
-            let mut cmd = tokio::process::Command::new(&prefix.program);
-            for arg in &prefix.args {
-                cmd.arg(arg);
-            }
+            let mut cmd = tokio::process::Command::from(prefix.into_command());
             cmd.arg(&resolved_command);
             cmd.args(&config.args);
             cmd
@@ -1028,3 +1025,7 @@ impl std::fmt::Debug for ServerManager {
 #[cfg(test)]
 #[path = "server_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "server_security_tests.rs"]
+mod security_tests;

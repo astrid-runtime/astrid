@@ -667,6 +667,10 @@ jobs:
           python3 -m unittest scripts/test_macos_release_packaging.py
           scripts/test_manage_macos_fskit.sh
 
+      - name: Verify native media isolation on macOS
+        if: matrix.os == 'macos-latest'
+        run: cargo test --locked -p astrid-workspace runtime_media_remains_private_in_native_processes -- --ignored
+
       - name: Run tests
         if: matrix.os != 'macos-latest'
         run: cargo test --workspace --locked

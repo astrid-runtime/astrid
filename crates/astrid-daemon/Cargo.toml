@@ -16,6 +16,7 @@ name = "astrid-daemon"
 path = "src/main.rs"
 
 [dependencies]
+astrid-workspace = { workspace = true }
 anyhow = { workspace = true }
 astrid-capsule = { workspace = true }
 astrid-capsule-install = { workspace = true }
