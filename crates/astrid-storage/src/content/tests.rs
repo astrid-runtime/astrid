@@ -949,6 +949,7 @@ fn source_fingerprint(
 }
 
 mod bulk_admission;
+mod rename;
 
 #[test]
 fn trusted_change_token_reuses_a_byte_verified_descriptor_without_reading() {

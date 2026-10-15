@@ -766,3 +766,135 @@ async fn durable_reopen_retains_live_branch_dag() {
         Some(b"base".to_vec())
     );
 }
+
+#[test]
+fn workspace_file_rename_resolves_pending_catalog_nodes() {
+    let content = content();
+    let branches = WorkspaceBranchStore::new(Arc::clone(&content));
+    let owner = owner();
+    let id = WorkspaceUid::from_bytes([91; 16]);
+    branches.begin_with_uid(&owner, id).unwrap();
+    let fs = branches.filesystem(owner, id);
+    for name in ["alpha", "beta", "gamma"] {
+        fs.write(&FilesystemPath::new(name).unwrap(), name.as_bytes())
+            .unwrap();
+    }
+    fs.rename(
+        &FilesystemPath::new("alpha").unwrap(),
+        &FilesystemPath::new("delta").unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        fs.read(
+            &FilesystemPath::new("delta").unwrap(),
+            0,
+            u64::try_from(b"alpha".len()).unwrap(),
+        )
+        .unwrap(),
+        b"alpha"
+    );
+    assert!(fs.stat(&FilesystemPath::new("alpha").unwrap()).is_err());
+    for name in ["beta", "gamma"] {
+        assert_eq!(
+            fs.read(
+                &FilesystemPath::new(name).unwrap(),
+                0,
+                u64::try_from(name.len()).unwrap(),
+            )
+            .unwrap(),
+            name.as_bytes()
+        );
+    }
+    assert!(content.list_prefix(&owner, "").unwrap().is_empty());
+    fs.promote().unwrap();
+    assert_eq!(
+        content
+            .read(&owner, &ContentName::new("delta").unwrap())
+            .unwrap(),
+        Some(b"alpha".to_vec())
+    );
+}
+
+#[test]
+fn workspace_rename_preserves_authenticated_principal_binding() {
+    let content = content();
+    let branches = WorkspaceBranchStore::new(Arc::clone(&content));
+    let owner = owner();
+    let binding_uid = PrincipalUid::from_bytes([0x93; 32]);
+    let prefix = ContentName::new("workspace").unwrap();
+    let id = WorkspaceUid::from_bytes([0x94; 16]);
+    branches
+        .begin_for_uid_at(&owner, binding_uid, id, prefix.clone())
+        .unwrap();
+    let fs = branches.filesystem(owner, id);
+    fs.write(&FilesystemPath::new("before").unwrap(), b"bound")
+        .unwrap();
+    fs.rename(
+        &FilesystemPath::new("before").unwrap(),
+        &FilesystemPath::new("after").unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        branches.describe(&owner, id).unwrap().binding_uid(),
+        Some(binding_uid)
+    );
+    assert!(
+        branches
+            .binding_for_uid(&owner, binding_uid, &prefix)
+            .unwrap()
+            .is_some()
+    );
+    fs.write(&FilesystemPath::new("next").unwrap(), b"still bound")
+        .unwrap();
+    assert_eq!(
+        fs.read(&FilesystemPath::new("after").unwrap(), 0, 5)
+            .unwrap(),
+        b"bound"
+    );
+}
+
+#[test]
+fn workspace_subtree_replacement_resolves_all_pending_catalog_mutations() {
+    let content = content();
+    let branches = WorkspaceBranchStore::new(Arc::clone(&content));
+    let owner = owner();
+    let id = WorkspaceUid::from_bytes([92; 16]);
+    branches.begin_with_uid(&owner, id).unwrap();
+    let fs = branches.filesystem(owner, id);
+    for name in ["old", "new"] {
+        fs.create_dir(&FilesystemPath::new(name).unwrap()).unwrap();
+    }
+    for name in ["old/alpha", "old/beta", "untouched"] {
+        fs.write(&FilesystemPath::new(name).unwrap(), name.as_bytes())
+            .unwrap();
+    }
+    fs.rename_replacing(
+        &FilesystemPath::new("old").unwrap(),
+        &FilesystemPath::new("new").unwrap(),
+    )
+    .unwrap();
+    for (name, bytes) in [
+        ("new/alpha", "old/alpha"),
+        ("new/beta", "old/beta"),
+        ("untouched", "untouched"),
+    ] {
+        assert_eq!(
+            fs.read(
+                &FilesystemPath::new(name).unwrap(),
+                0,
+                u64::try_from(bytes.len()).unwrap(),
+            )
+            .unwrap(),
+            bytes.as_bytes()
+        );
+    }
+    assert!(fs.stat(&FilesystemPath::new("old").unwrap()).is_err());
+    fs.promote().unwrap();
+    assert_eq!(
+        content
+            .read(&owner, &ContentName::new("new/alpha").unwrap())
+            .unwrap(),
+        Some(b"old/alpha".to_vec())
+    );
+}

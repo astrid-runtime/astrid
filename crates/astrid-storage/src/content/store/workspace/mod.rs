@@ -23,7 +23,10 @@ mod helpers;
 mod lifecycle;
 mod model;
 mod operations;
+mod rename_guards;
 
+#[cfg(test)]
+mod rename_tests;
 #[cfg(test)]
 mod tests;
 

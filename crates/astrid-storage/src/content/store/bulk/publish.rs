@@ -1,11 +1,11 @@
 //! Owner-root publication for prepared bulk ingests.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
+use super::super::pending_catalog::retain_final_catalog_records;
 use super::super::{
-    CatalogRoot, CatalogValue, EngineIdentity, ModelError, ObjectId, ObjectRecord, ObjectReference,
-    PrincipalContentStore, PrincipalProjectionEngine, ReferenceKind, delete, insert, invalid,
-    lookup,
+    CatalogRoot, CatalogValue, EngineIdentity, ModelError, ObjectId, ObjectRecord,
+    PrincipalContentStore, PrincipalProjectionEngine, delete, insert, invalid, lookup,
 };
 use super::{BatchPublicationContext, BulkPhaseObserver, PreparedContent};
 use crate::content::{
@@ -202,33 +202,6 @@ where
         );
         Ok((completed, records))
     }
-}
-
-pub(super) fn retain_final_catalog_records(
-    catalog: Option<CatalogRoot>,
-    records: &mut BTreeMap<ObjectId, ObjectRecord>,
-) {
-    let mut reachable = BTreeSet::new();
-    let mut pending = catalog
-        .map(|root| root.object)
-        .into_iter()
-        .collect::<Vec<_>>();
-    while let Some(object) = pending.pop() {
-        if !reachable.insert(object) {
-            continue;
-        }
-        let Some(record) = records.get(&object) else {
-            continue;
-        };
-        pending.extend(
-            record
-                .references()
-                .iter()
-                .filter(|reference| reference.kind() == ReferenceKind::Owns)
-                .map(ObjectReference::target),
-        );
-    }
-    records.retain(|object, _| reachable.contains(object));
 }
 
 pub(super) fn batch_outcome(

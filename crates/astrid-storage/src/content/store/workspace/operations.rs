@@ -9,7 +9,9 @@ use crate::content_dag::{
     build_content, open_content, read_opened_content, read_opened_content_range,
 };
 use crate::engine::{PrincipalProjectionEngine, PrincipalProjectionError};
-use crate::storage_model::{ModelError, ObjectReference};
+use crate::storage_model::{ModelError, ObjectId, ObjectRecord, ObjectReference};
+
+use super::super::pending_catalog::retain_final_catalog_records;
 
 use super::{
     EngineIdentity, EngineSource, MAX_WORKSPACE_BRANCHES, WorkspaceBindingLifecycle,
@@ -610,7 +612,6 @@ where
 
     /// Atomically rename exact branch names, optionally replacing admitted
     /// destinations.  The operation never reconstructs immutable file bytes.
-    #[allow(clippy::too_many_lines)]
     pub fn rename_batch(
         &self,
         owner: &P,
@@ -618,8 +619,37 @@ where
         moves: &[(ContentName, ContentName)],
         replacements: &[ContentName],
     ) -> Result<bool, WorkspaceBranchError> {
+        use super::rename_guards::RenameBatchOutcome;
         if moves.is_empty() {
             return Ok(true);
+        }
+        Ok(matches!(
+            self.rename_batch_inner(owner, id, moves, replacements, None)?,
+            RenameBatchOutcome::Committed
+        ))
+    }
+
+    pub(super) fn rename_batch_guarded(
+        &self,
+        owner: &P,
+        id: WorkspaceUid,
+        plan: &super::rename_guards::RenamePlan<'_>,
+    ) -> Result<super::rename_guards::RenameBatchOutcome, WorkspaceBranchError> {
+        self.rename_batch_inner(owner, id, plan.moves, plan.replacements, Some(plan))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn rename_batch_inner(
+        &self,
+        owner: &P,
+        id: WorkspaceUid,
+        moves: &[(ContentName, ContentName)],
+        replacements: &[ContentName],
+        plan: Option<&super::rename_guards::RenamePlan<'_>>,
+    ) -> Result<super::rename_guards::RenameBatchOutcome, WorkspaceBranchError> {
+        use super::rename_guards::RenameBatchOutcome;
+        if moves.is_empty() {
+            return Ok(RenameBatchOutcome::Replan);
         }
         let sources = moves
             .iter()
@@ -636,18 +666,29 @@ where
             || destinations.len() != moves.len()
             || replacement_set.len() != replacements.len()
         {
-            return Ok(false);
+            return Ok(RenameBatchOutcome::DestinationConflict);
         }
         loop {
             let header = self.content.header(owner)?;
             let branch = self.branch(owner, &header, id)?;
+            if let Some(plan) = plan
+                && !self.rename_membership_matches(
+                    owner,
+                    branch.working,
+                    plan,
+                    &sources,
+                    &replacement_set,
+                )?
+            {
+                return Ok(RenameBatchOutcome::Replan);
+            }
             let mut values = Vec::with_capacity(moves.len());
             for (source, destination) in moves {
                 let Some(value) = lookup(branch.working, source, &mut |object| {
                     self.content.load_required_for(owner, object)
                 })?
                 else {
-                    return Ok(false);
+                    return Ok(RenameBatchOutcome::Replan);
                 };
                 if !sources.contains(destination)
                     && !replacement_set.contains(destination)
@@ -656,21 +697,27 @@ where
                     })?
                     .is_some()
                 {
-                    return Ok(false);
+                    return Ok(RenameBatchOutcome::DestinationConflict);
                 }
                 values.push(value);
             }
-            let mut records = BTreeMap::new();
+            // Every path-copy mutation may return a new root that is not yet
+            // committed. Later deletes/inserts must resolve those pending nodes
+            // before falling back to the published owner graph.
+            let mut records = BTreeMap::<ObjectId, ObjectRecord>::new();
             let mut root = branch.working;
             for (source, _) in moves {
                 let mutation = super::delete(
                     root,
                     source,
-                    &mut |object| self.content.load_required_for(owner, object),
+                    &mut |object| match records.get(&object) {
+                        Some(record) => Ok(record.clone()),
+                        None => self.content.load_required_for(owner, object),
+                    },
                     &|record| self.content.engine.identify_object(record),
                 )?;
                 if mutation.previous.is_none() {
-                    return Ok(false);
+                    return Ok(RenameBatchOutcome::Replan);
                 }
                 root = mutation.root;
                 records.extend(mutation.records);
@@ -682,11 +729,14 @@ where
                 let mutation = super::delete(
                     root,
                     replacement,
-                    &mut |object| self.content.load_required_for(owner, object),
+                    &mut |object| match records.get(&object) {
+                        Some(record) => Ok(record.clone()),
+                        None => self.content.load_required_for(owner, object),
+                    },
                     &|record| self.content.engine.identify_object(record),
                 )?;
                 if mutation.previous.is_none() {
-                    return Ok(false);
+                    return Ok(RenameBatchOutcome::Replan);
                 }
                 root = mutation.root;
                 records.extend(mutation.records);
@@ -696,22 +746,36 @@ where
                     root,
                     destination,
                     value,
-                    &mut |object| self.content.load_required_for(owner, object),
+                    &mut |object| match records.get(&object) {
+                        Some(record) => Ok(record.clone()),
+                        None => self.content.load_required_for(owner, object),
+                    },
                     &|record| self.content.engine.identify_object(record),
                 )?;
                 if mutation.previous.is_some() {
-                    return Ok(false);
+                    return Ok(RenameBatchOutcome::DestinationConflict);
                 }
                 root = mutation.root;
                 records.extend(mutation.records);
             }
+            retain_final_catalog_records(root, &mut records);
             let old_quota = branch
                 .working
                 .map_or(0, |catalog| catalog.summary.quota_bytes);
             let new_quota = root.map_or(0, |catalog| catalog.summary.quota_bytes);
             self.enforce_quota_change(owner, &header, old_quota, new_quota)?;
-            let branch_record =
-                make_branch_record(id, branch.target_prefix.as_ref(), branch.base, root)?;
+            let branch_record = branch.binding_uid.map_or_else(
+                || make_branch_record(id, branch.target_prefix.as_ref(), branch.base, root),
+                |binding_uid| {
+                    make_branch_record_for_uid(
+                        binding_uid,
+                        id,
+                        branch.target_prefix.as_ref(),
+                        branch.base,
+                        root,
+                    )
+                },
+            )?;
             let branch_id = self.content.engine.identify_object(&branch_record);
             records.insert(branch_id, branch_record);
             let mut next = header.as_ref().clone();
@@ -723,7 +787,7 @@ where
                 self.content
                     .encode_transaction(owner.clone(), next, None, records)?;
             match self.content.engine.commit_root(transaction) {
-                Ok(_) => return Ok(true),
+                Ok(_) => return Ok(RenameBatchOutcome::Committed),
                 Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
                 Err(error) => return Err(error.into()),
             }
