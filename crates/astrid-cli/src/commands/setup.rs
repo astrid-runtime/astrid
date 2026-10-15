@@ -57,15 +57,22 @@ fn run_report(args: &SetupArgs, report: &Report) -> Result<ExitCode> {
 
     if setup_exit(report) == ExitCode::FAILURE {
         println!();
-        println!("Native tools need an unprivileged FUSE helper and /dev/fuse access.");
-        println!("On Debian/Ubuntu: `sudo apt-get install fuse3`.");
-        println!("On Alpine: `sudo apk add fuse3`. Then rerun `astrid setup` as the AOS user.");
+        for line in fuse_guidance(report) {
+            println!("{line}");
+        }
         return Ok(ExitCode::FAILURE);
     }
 
     if !report.needs_apparmor_profile {
         println!();
-        println!("{}", "All checks pass. No host setup required.".green());
+        if report.os == "linux" {
+            println!(
+                "{}",
+                "All checks pass for this user and environment.".green()
+            );
+        } else {
+            println!("{}", "All checks pass. No host setup required.".green());
+        }
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -187,6 +194,19 @@ fn setup_exit(report: &Report) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+fn fuse_guidance(report: &Report) -> Vec<&'static str> {
+    let mut lines = vec!["Native tools need a FUSE helper and /dev/fuse access."];
+    if !report.fuse_helper_available {
+        lines.push("Install a FUSE helper: Debian/Ubuntu `sudo apt-get install fuse3`; Alpine `sudo apk add fuse3`.");
+    }
+    if !report.fuse_device_accessible {
+        lines.push("Ask an administrator to inspect `ls -l /dev/fuse` and grant this user read/write access through the host's device policy.");
+        lines.push("If /dev/fuse is absent, load the FUSE kernel module (`sudo modprobe fuse`); in a container, expose /dev/fuse and allow FUSE mounts in its policy.");
+    }
+    lines.push("Rerun `astrid setup` as the AOS user after the host is repaired.");
+    lines
 }
 
 fn diagnose() -> Report {
@@ -381,6 +401,10 @@ mod tests {
         assert_eq!(run_report(&args, &report).unwrap(), ExitCode::SUCCESS);
         report.fuse_device_accessible = false;
         assert_eq!(run_report(&args, &report).unwrap(), ExitCode::FAILURE);
+        let device_guidance = fuse_guidance(&report).join("\n");
+        assert!(device_guidance.contains("grant this user read/write access"));
+        assert!(device_guidance.contains("expose /dev/fuse"));
+        assert!(!device_guidance.contains("apt-get install fuse3"));
         report.os = "macos";
         assert_eq!(run_report(&args, &report).unwrap(), ExitCode::SUCCESS);
     }
