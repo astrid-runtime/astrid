@@ -345,6 +345,20 @@ astrid capsule list --verbose              # installed capsules with capability 
 astrid capsule tree                        # imports/exports dependency graph
 ```
 
+## What's new in 2026.10.1
+
+- **Native-tool readiness:** Linux setup now checks ordinary-user Bubblewrap
+  and FUSE prerequisites and explains repairs before approved tools fail.
+  Multiple Unix users can start their own runtimes on a shared host.
+- **Workspace reliability:** macOS Node can resolve authorized script files,
+  and populated-workspace renames preserve pending content during the atomic
+  transaction.
+- **Sandbox and dependencies:** native process grants no longer expose runtime
+  backing media; Rustls and Wasmtime include upstream security fixes.
+
+See the [full 2026.10.1 changelog](CHANGELOG.md) for the exact fixes and
+operational limits.
+
 ## What's new in 2026.10.0
 
 - **Accountable user budgets:** operators can configure an optional shared WASM
