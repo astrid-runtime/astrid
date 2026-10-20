@@ -296,3 +296,51 @@ async fn implied_directory_lookup_does_not_list_the_owner_catalog() {
     assert_eq!(filesystem.content.list_invocations(), 0);
     assert_eq!(filesystem.read(&extra, 0, 4).unwrap(), b"more");
 }
+
+#[tokio::test]
+async fn independent_view_removal_invalidates_directory_presence() {
+    let (_directory, filesystem) = filesystem().await;
+    let directory = FilesystemPath::new("shared-dir").unwrap();
+    let child = FilesystemPath::new("shared-dir/child").unwrap();
+    filesystem.create_dir(&directory).unwrap();
+    let peer = AstridFilesystem::new(Arc::clone(&filesystem.content), filesystem.owner);
+    peer.remove(&directory).unwrap();
+    assert!(matches!(
+        filesystem.stat(&directory),
+        Err(FilesystemError::NotFound(_))
+    ));
+    assert!(matches!(
+        filesystem.write(&child, b"must not recreate parent"),
+        Err(FilesystemError::NotFound(_))
+    ));
+    assert!(
+        filesystem
+            .content
+            .describe(&filesystem.owner, &child.file_name().unwrap())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn direct_content_replacement_cannot_leave_a_cached_directory() {
+    let (_directory, filesystem) = filesystem().await;
+    let path = FilesystemPath::new("replaced-dir").unwrap();
+    filesystem.create_dir(&path).unwrap();
+    filesystem
+        .content
+        .delete(&filesystem.owner, &path.directory_marker().unwrap())
+        .unwrap();
+    filesystem
+        .content
+        .put(&filesystem.owner, &path.file_name().unwrap(), b"file")
+        .unwrap();
+    assert_eq!(
+        filesystem.stat(&path).unwrap().kind(),
+        FilesystemEntryKind::File
+    );
+    assert!(matches!(
+        filesystem.write(&FilesystemPath::new("replaced-dir/child").unwrap(), b"no"),
+        Err(FilesystemError::NotDirectory(_))
+    ));
+}
