@@ -365,6 +365,13 @@ pub struct CommandInfo {
     /// predate the field.
     #[serde(default, skip_serializing_if = "CommandKind::is_default")]
     pub kind: CommandKind,
+    /// Authenticated caller's invocation timeout policy when enumerated.
+    /// Set by the kernel, never supplied by the command manifest. This is an
+    /// advisory client wait budget, not an execution receipt: policy can change,
+    /// dispatch can queue, and daemon handlers are exempt from guest deadlines.
+    /// Absent on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_max_timeout_secs: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------

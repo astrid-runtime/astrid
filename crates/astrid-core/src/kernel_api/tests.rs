@@ -33,6 +33,7 @@ fn command_info_kind_defaults_to_slash_on_wire() {
     });
     let info: CommandInfo = serde_json::from_value(json).unwrap();
     assert_eq!(info.kind, CommandKind::Slash);
+    assert_eq!(info.caller_max_timeout_secs, None);
 }
 
 #[test]
@@ -42,12 +43,14 @@ fn command_info_kind_roundtrips_cli() {
         description: "deploy it".into(),
         provider_capsule: "ops".into(),
         kind: CommandKind::Cli,
+        caller_max_timeout_secs: Some(600),
     };
     let json = serde_json::to_value(&info).unwrap();
     // `cli` is not the default, so it is serialized.
     assert_eq!(json.get("kind").and_then(|k| k.as_str()), Some("cli"));
     let back: CommandInfo = serde_json::from_value(json).unwrap();
     assert_eq!(back.kind, CommandKind::Cli);
+    assert_eq!(back.caller_max_timeout_secs, Some(600));
 }
 
 #[test]
@@ -57,9 +60,11 @@ fn command_info_default_kind_omitted_from_wire() {
         description: "git ops".into(),
         provider_capsule: "git-capsule".into(),
         kind: CommandKind::Slash,
+        caller_max_timeout_secs: None,
     };
     let json = serde_json::to_value(&info).unwrap();
     // Default kind is skipped so the wire shape is byte-compatible with
     // pre-field consumers.
     assert!(json.get("kind").is_none());
+    assert!(json.get("caller_max_timeout_secs").is_none());
 }
