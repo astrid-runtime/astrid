@@ -191,8 +191,10 @@ impl SocketClient {
     /// bypassing the token handshake. Test-only: lets the crate's own tests drive
     /// the framed read/write path over a local-stream pair without a
     /// live daemon.
-    #[cfg(all(test, unix))]
-    pub(crate) fn from_stream_for_test(
+    #[cfg(all(any(test, feature = "test-support"), unix))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_stream_for_test(
         stream: LocalStream,
         session_id: SessionId,
         principal: PrincipalId,
