@@ -1,3 +1,5 @@
+mod file;
+
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -122,6 +124,16 @@ impl Default for HostVfs {
 
 #[async_trait]
 impl Vfs for HostVfs {
+    async fn open_file(
+        &self,
+        handle: &DirHandle,
+        path: &str,
+        mode: crate::file::OpenMode,
+        guard: crate::file::FileOperationGuard,
+    ) -> VfsResult<Arc<dyn crate::file::VfsFile>> {
+        file::open(self, handle, path, mode, guard).await
+    }
+
     async fn exists(&self, handle: &DirHandle, path: &str) -> VfsResult<bool> {
         let dir = self.get_dir(handle).await?;
         let safe_path = make_relative(path).to_path_buf();

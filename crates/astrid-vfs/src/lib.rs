@@ -15,6 +15,8 @@
 pub(crate) mod boundary;
 /// Virtual filesystem error types.
 pub mod error;
+/// Owned file objects and positional I/O independent of namespace lookups.
+pub mod file;
 /// Host-backed virtual filesystem implementation.
 pub mod host;
 /// Overlay (copy-on-write) virtual filesystem implementation.
@@ -68,6 +70,23 @@ pub struct VfsDirEntry {
 /// A core virtual filesystem providing sandboxed operations.
 #[async_trait]
 pub trait Vfs: Send + Sync {
+    /// Open an owned file object with explicit create and access semantics.
+    ///
+    /// Unlike the legacy cursor-based [`Self::open`], this interface must
+    /// preserve opened-object identity across namespace changes. Providers
+    /// without that implementation fail closed rather than buffering a whole
+    /// file and publishing it on drop. Caller authority and quota enforcement
+    /// remain the responsibility of the admitted mount's host-call boundary.
+    async fn open_file(
+        &self,
+        _handle: &DirHandle,
+        _path: &str,
+        _mode: file::OpenMode,
+        _guard: file::FileOperationGuard,
+    ) -> VfsResult<std::sync::Arc<dyn file::VfsFile>> {
+        Err(VfsError::NotSupported("owned file objects".to_owned()))
+    }
+
     /// Check if a path exists within the sandbox.
     async fn exists(&self, handle: &DirHandle, path: &str) -> VfsResult<bool>;
 
