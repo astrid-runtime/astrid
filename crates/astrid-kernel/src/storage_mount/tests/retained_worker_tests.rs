@@ -312,3 +312,73 @@ async fn a_later_join_failure_upgrades_a_latched_drain_timeout() {
     assert!(!kernel.storage_mounts.contains_key(&lease.mount_id));
     assert!(!lease.resource_path.exists());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listener_close_at_observation_boundary_is_not_lost() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
+    let kernel = Arc::new(crate::test_kernel_with_home(home).await);
+    let caller = PrincipalId::default();
+    let (lease, state, _gate) =
+        worker_fixture(&temporary, &kernel, &caller, "close-observation-race").await;
+    state.set_drain_timeouts_for_test(Duration::from_secs(10));
+    let weak = Arc::downgrade(&state);
+    let (published, publication) = tokio::sync::oneshot::channel();
+    state.drain_attempts.lock().await.before_observation_wait = Some(Box::pin(async move {
+        let state = weak.upgrade().unwrap();
+        let mut closed = state.listener_closed_tx.subscribe();
+        state.shutdown_tx.send_replace(true);
+        let wait = async {
+            while !*closed.borrow() {
+                closed.changed().await.unwrap();
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .unwrap();
+        published.send(()).unwrap();
+    }));
+    let observed = tokio::select! {
+        biased;
+        observed = state.await_listener_settlement() => observed,
+        _ = publication => panic!("a published close must be observed in the same poll"),
+    };
+    assert_eq!(
+        observed,
+        crate::storage_mount::drain_state::DrainSettlement::Closed
+    );
+    revoke(&kernel, &caller, lease.mount_id).await.unwrap();
+    assert!(!kernel.storage_mounts.contains_key(&lease.mount_id));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drain_failure_at_observation_boundary_is_not_lost() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
+    let kernel = Arc::new(crate::test_kernel_with_home(home).await);
+    let caller = PrincipalId::default();
+    let (lease, state, _gate) =
+        worker_fixture(&temporary, &kernel, &caller, "failure-observation-race").await;
+    state.set_drain_timeouts_for_test(Duration::from_secs(10));
+    let weak = Arc::downgrade(&state);
+    let (published, publication) = tokio::sync::oneshot::channel();
+    state.drain_attempts.lock().await.before_observation_wait = Some(Box::pin(async move {
+        weak.upgrade()
+            .unwrap()
+            .record_drain_failure(BlockingJobDrain::JoinFailed);
+        published.send(()).unwrap();
+    }));
+    let observed = tokio::select! {
+        biased;
+        observed = state.await_listener_settlement() => observed,
+        _ = publication => panic!("a published failure must be observed in the same poll"),
+    };
+    assert_eq!(
+        observed,
+        crate::storage_mount::drain_state::DrainSettlement::Failure(
+            crate::storage_mount::drain_state::DrainFailureKind::JoinFailed
+        )
+    );
+    revoke(&kernel, &caller, lease.mount_id).await.unwrap();
+    assert!(!kernel.storage_mounts.contains_key(&lease.mount_id));
+}
