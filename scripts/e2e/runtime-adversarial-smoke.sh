@@ -579,7 +579,7 @@ run_adversarial_capsule_smoke() {
     cat "$timeout_out" >&2 2>/dev/null || true
     fail "adversarial approval command exceeded the bounded timeout"
   fi
-  grep -Eqi 'timed out|timeout|cancelled' "$timeout_out" \
+  grep -Eqi 'timed out|timeout|cancelled' "$timeout_out" "${timeout_out}.stderr" \
     || fail "adversarial approval command did not report a timeout"
 
 }

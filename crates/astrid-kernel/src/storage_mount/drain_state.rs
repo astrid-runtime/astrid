@@ -29,11 +29,18 @@ pub(super) enum DrainSettlement {
 #[derive(Default)]
 pub(super) struct DrainAttemptState {
     retry_armed: Option<DrainFailureKind>,
+    #[cfg(test)]
+    pub(super) before_observation_wait:
+        Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
 }
 
 impl StorageMountLeaseState {
     pub(super) async fn await_listener_settlement(&self) -> DrainSettlement {
         let mut attempt = self.drain_attempts.lock().await;
+        // Subscribe before sampling either state: a publication between a
+        // sample and subscribe would otherwise be treated as already seen.
+        let mut failure_changed = self.drain_failure_tx.subscribe();
+        let mut closed = self.listener_closed_tx.subscribe();
         if let Some(failure) = self.sample_failure() {
             if attempt.retry_armed.is_none_or(|armed| armed < failure) {
                 attempt.retry_armed = Some(failure);
@@ -47,8 +54,11 @@ impl StorageMountLeaseState {
             return DrainSettlement::Closed;
         }
 
-        let mut failure_changed = self.drain_failure_tx.subscribe();
-        let mut closed = self.listener_closed_tx.subscribe();
+        #[cfg(test)]
+        if let Some(interleaving) = attempt.before_observation_wait.take() {
+            interleaving.await;
+        }
+
         let wait = async {
             loop {
                 tokio::select! {

@@ -90,7 +90,7 @@ run_live_elicit_cancel_smoke() {
     cat "$out" >&2 2>/dev/null || true
     fail "adversarial elicit command hung after capsule unload cancellation"
   fi
-  grep -Eqi 'timed out|timeout|cancelled' "$out" \
+  grep -Eqi 'timed out|timeout|cancelled' "$out" "${out}.stderr" \
     || fail "adversarial elicit command did not report cancellation"
 
   status="$(http_status GET /api/capsules "$user_bearer" "" \

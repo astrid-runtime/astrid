@@ -298,14 +298,21 @@ jobs:
         shell: pwsh
         run: |
           cargo build --locked --target ${{ matrix.target }} -p astrid-storage-provider-winfsp
+          if ($LASTEXITCODE -ne 0) {
+            throw "the Windows process storage provider build failed with exit code $LASTEXITCODE"
+          }
           $provider = "target/${{ matrix.target }}/debug/astrid-storage-provider-winfsp.exe"
           $messages = cargo test --locked --message-format=json --target ${{ matrix.target }} -p astrid-kernel --lib storage_mount --no-run
+          $compileExitCode = $LASTEXITCODE
           $artifacts = foreach ($message in $messages) {
             $artifact = $null
             try {
               $artifact = $message | ConvertFrom-Json -ErrorAction Stop
             } catch {
               continue
+            }
+            if ($artifact.reason -eq "compiler-message" -and $artifact.message.rendered) {
+              Write-Host $artifact.message.rendered
             }
             if ($artifact.reason -eq "compiler-artifact" -and
                 $artifact.profile.test -eq $true -and
@@ -314,6 +321,9 @@ jobs:
                 $artifact.executable) {
               $artifact
             }
+          }
+          if ($compileExitCode -ne 0) {
+            throw "the kernel storage callback test build failed with exit code $compileExitCode"
           }
           $executables = @($artifacts | Where-Object { $_.executable })
           if ($executables.Count -ne 1) {
