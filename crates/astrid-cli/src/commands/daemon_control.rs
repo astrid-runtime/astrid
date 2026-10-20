@@ -245,7 +245,8 @@ pub(crate) enum KillOutcome {
 ///
 /// 1. Read the recorded PID; if absent/garbage/dead → [`KillOutcome::NotRunning`].
 /// 2. Confirm the live process is the daemon (its executable matches the one
-///    recorded in the PID file); if not → [`KillOutcome::Unverified`] (no signal).
+///    recorded in the PID file); if not, observe up to [`GRACE`] for natural
+///    exit before returning [`KillOutcome::Unverified`] (no signal).
 /// 3. Send `SIGTERM` and poll up to [`GRACE`] for the process to exit.
 /// 4. If still alive, escalate to `SIGKILL` and poll again up to [`GRACE`].
 ///
@@ -275,7 +276,9 @@ pub(crate) async fn terminate_orphan(pid_path: &Path) -> KillOutcome {
 ///
 /// Steps: confirm the PID is a live, identity-matched daemon; `SIGTERM` and poll
 /// up to [`GRACE`]; if still alive, re-verify identity (grace-window PID-reuse
-/// guard) and escalate to `SIGKILL`, polling up to [`GRACE`] again.
+/// guard) and escalate to `SIGKILL`, polling up to [`GRACE`] again. If either
+/// executable probe cannot confirm identity, observe natural exit for up to
+/// [`GRACE`] without signalling before reporting an unverified live process.
 pub(crate) async fn terminate_known(pid: u32, recorded_exe: Option<&Path>) -> KillOutcome {
     if !is_process_alive(pid) {
         return KillOutcome::NotRunning;
@@ -287,7 +290,13 @@ pub(crate) async fn terminate_known(pid: u32, recorded_exe: Option<&Path>) -> Ki
     // unconfirmable → leave it alone.
     let live_exe = exe_path_of_pid(pid);
     if !exe_matches(recorded_exe, live_exe.as_deref()) {
-        return KillOutcome::Unverified(pid);
+        // The process may have exited between the liveness and executable
+        // probes. Observe exit without ever signalling an unverified identity.
+        return if wait_for_exit(pid, GRACE).await {
+            KillOutcome::NotRunning
+        } else {
+            KillOutcome::Unverified(pid)
+        };
     }
 
     // Politely ask it to exit; it may be wedged but still able to handle the
@@ -306,7 +315,13 @@ pub(crate) async fn terminate_known(pid: u32, recorded_exe: Option<&Path>) -> Ki
     // signal unless it still provably matches the recorded daemon exe.
     let live_exe = exe_path_of_pid(pid);
     if !exe_matches(recorded_exe, live_exe.as_deref()) {
-        return KillOutcome::Unverified(pid);
+        // A failed executable probe is not proof of a live replacement. The
+        // verified SIGTERM already sent may be completing; never escalate here.
+        return if wait_for_exit(pid, GRACE).await {
+            KillOutcome::TermExited
+        } else {
+            KillOutcome::Unverified(pid)
+        };
     }
 
     // Escalate. A truly wedged process (e.g. stuck in uninterruptible IO) may
@@ -345,6 +360,37 @@ pub(crate) async fn wait_for_exit(pid: u32, budget: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unverified_process_can_finish_without_being_signalled() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read value; exit 0"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn child waiting for input");
+        let pid = child.id();
+        let input = child.stdin.take().expect("owned child input");
+        let reaper = std::thread::spawn(move || child.wait().expect("reap child"));
+        let mut termination = Box::pin(terminate_known(pid, None));
+        // The input keeps the real child alive through the first identity
+        // probe. Releasing it models natural exit after that observation.
+        let first = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(termination.as_mut(), cx))
+        })
+        .await;
+        drop(input);
+        let outcome = match first {
+            std::task::Poll::Ready(outcome) => outcome,
+            std::task::Poll::Pending => termination.await,
+        };
+        let status = reaper.join().expect("reaper joined");
+        assert!(
+            status.success(),
+            "unverified process must never be signalled"
+        );
+        assert_eq!(outcome, KillOutcome::NotRunning);
+    }
 
     #[test]
     fn parse_pid_accepts_plain_integer() {
