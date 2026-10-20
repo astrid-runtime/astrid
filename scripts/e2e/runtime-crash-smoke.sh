@@ -53,24 +53,31 @@ principal = sys.argv[2]
 timeout_secs = float(sys.argv[3])
 out_path = Path(sys.argv[4])
 args = sys.argv[5:]
+stderr_path = out_path.with_name(out_path.name + ".stderr")
+
+def write_output(path, data):
+    if isinstance(data, bytes):
+        data = data.decode("utf-8", errors="replace")
+    path.write_text(data or "", encoding="utf-8")
 
 try:
     proc = subprocess.run(
         [binary, "--principal", principal, *args],
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE,
         text=True,
         timeout=timeout_secs,
         check=False,
     )
 except subprocess.TimeoutExpired as exc:
-    stdout = exc.stdout or ""
-    if isinstance(stdout, bytes):
-        stdout = stdout.decode("utf-8", errors="replace")
-    out_path.write_text(stdout, encoding="utf-8")
+    write_output(out_path, exc.stdout)
+    write_output(stderr_path, exc.stderr)
     raise SystemExit(124) from exc
 
-out_path.write_text(proc.stdout, encoding="utf-8")
+write_output(out_path, proc.stdout)
+write_output(stderr_path, proc.stderr)
+if proc.returncode:
+    sys.stderr.write(proc.stderr)
 raise SystemExit(proc.returncode)
 PY
 }
