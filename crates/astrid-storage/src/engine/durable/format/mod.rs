@@ -19,12 +19,17 @@ const CURRENT_DIGEST_BYTES_USIZE: usize = 32;
 const MIN_REFERENCE_WIRE_BYTES: usize =
     std::mem::size_of::<u64>() + IDENTITY_PREFIX_BYTES + CURRENT_DIGEST_BYTES_USIZE + 1;
 
+#[cfg(test)]
+thread_local! {
+    static RECOVERY_ARENA_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 mod indexed;
 mod prepared;
 mod reader;
 
 #[cfg(test)]
-pub(super) use indexed::last_batch_spans;
+pub(super) use indexed::{last_batch_spans, reset_last_batch_spans};
 pub(super) use indexed::{
     read_indexed_object, read_indexed_object_with_payload, read_indexed_objects,
     visit_indexed_objects,
@@ -240,6 +245,8 @@ pub(super) fn recover_arena<I: PersistentObjectIdentity, F: DurableIo>(
     limits: RecoveryLimits,
     protected_len: u64,
 ) -> Result<(BTreeMap<ObjectId, ArenaLocation>, Option<ArenaLocation>), DurableError> {
+    #[cfg(test)]
+    RECOVERY_ARENA_SCANS.with(|scans| scans.set(scans.get().saturating_add(1)));
     let scheme = identity.scheme();
     let mut index = BTreeMap::<ObjectId, ArenaLocation>::new();
     let mut tail = None;
@@ -286,6 +293,16 @@ pub(super) fn recover_arena<I: PersistentObjectIdentity, F: DurableIo>(
         },
     )?;
     Ok((index, tail))
+}
+
+#[cfg(test)]
+pub(in crate::engine::durable) fn reset_recovery_arena_scans() {
+    RECOVERY_ARENA_SCANS.with(|scans| scans.set(0));
+}
+
+#[cfg(test)]
+pub(in crate::engine::durable) fn recovery_arena_scans() -> usize {
+    RECOVERY_ARENA_SCANS.with(std::cell::Cell::get)
 }
 
 pub(super) fn scan_frames<F: DurableIo>(
