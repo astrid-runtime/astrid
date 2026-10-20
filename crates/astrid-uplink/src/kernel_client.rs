@@ -452,8 +452,14 @@ impl KernelClient {
     /// an explicit inactivity `timeout`. Test-only: lets the crate's tests drive
     /// [`request`](Self::request) over a loopback socket pair with a short
     /// timeout, no live daemon.
-    #[cfg(all(test, unix))]
-    fn from_socket_for_test(inner: SocketClient, caller: PrincipalId, timeout: Duration) -> Self {
+    #[cfg(all(any(test, feature = "test-support"), unix))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_socket_for_test(
+        inner: SocketClient,
+        caller: PrincipalId,
+        timeout: Duration,
+    ) -> Self {
         Self {
             inner,
             caller,
