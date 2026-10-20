@@ -18,7 +18,6 @@ const STDERR_NEGATIVE_CONTROL: std::time::Duration = std::time::Duration::from_m
 const OWNED_CHILD_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 #[cfg(unix)]
 const OWNED_CHILD_REAP_ESCALATION: std::time::Duration = std::time::Duration::from_millis(500);
-#[cfg(unix)]
 const RESPONDER_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(unix)]
