@@ -3,7 +3,10 @@
 use std::sync::{Arc, atomic::Ordering};
 
 use astrid_capsule::context::ProcessStorageMountBroker as _;
-use astrid_core::{PrincipalId, storage_filesystem::StorageFilesystemOutcomeV1};
+use astrid_core::{
+    PrincipalId,
+    storage_filesystem::{StorageFilesystemOperationV1, StorageFilesystemOutcomeV1},
+};
 
 use super::*;
 use crate::storage_mount::process_broker::PROCESS_MOUNT_TEST_ID;
@@ -74,9 +77,7 @@ fn spawn_panicking_workers(
                 .value(),
         );
         state.set_drain_timeouts_for_test(std::time::Duration::from_millis(80));
-        let gate = state
-            .blocking_worker_gate_for_test()
-            .expect("test worker gate");
+        let gate = state.arm_blocking_worker_gate_for_test();
         let kernel = Arc::clone(kernel);
         let operation = create(match index {
             0 => "panic-branch.bin",
@@ -254,4 +255,46 @@ async fn successful_lease_cleanup_with_failed_root_retains_retry_blocker() {
     replacement_mount.close_async().await;
     assert!(kernel.storage_mounts.is_empty());
     assert!(broker.projections.lock().await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicitly_armed_lease_gate_holds_actual_worker_until_release() {
+    let fixture = super::super::exact_fence_fixture().await;
+    let state = Arc::clone(&fixture.states[0]);
+    let gate = state.arm_blocking_worker_gate_for_test();
+    let worker_state = Arc::clone(&state);
+    let worker_kernel = Arc::clone(&fixture.kernel);
+    let worker = tokio::spawn(async move {
+        crate::storage_mount::execute_operation_for_test(
+            worker_kernel,
+            worker_state,
+            StorageFilesystemOperationV1::Stat {
+                path: String::new(),
+            },
+        )
+        .await
+    });
+    let entered = Arc::clone(&gate);
+    tokio::task::spawn_blocking(move || entered.wait_entered(1))
+        .await
+        .expect("worker entry");
+    assert!(
+        !worker.is_finished(),
+        "the armed lease must hold its actual native worker"
+    );
+    gate.release_workers();
+    assert!(matches!(
+        worker.await.expect("worker join"),
+        StorageFilesystemOutcomeV1::Success(_)
+    ));
+    for lease in [&fixture.branch, &fixture.owner, &fixture.shared] {
+        revoke_lease(
+            &fixture.kernel,
+            &fixture.caller,
+            MountOwnerScope::CrossOwnerWrite,
+            lease.mount_id,
+        )
+        .await
+        .expect("fixture cleanup");
+    }
 }

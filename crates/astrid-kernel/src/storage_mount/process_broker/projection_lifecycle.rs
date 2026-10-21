@@ -20,6 +20,8 @@ use crate::storage_mount::lifecycle::cleanup_mapped_lease_resources;
 use crate::storage_mount::lifecycle::{complete_cleanup_ledger, force_fence_projection_lease};
 
 use super::projection_root_removal::remove_projection_root;
+#[cfg(all(test, any(unix, windows)))]
+use super::retained_diagnostics::{self, Component, Stage, report};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ParentTokenSlot {
@@ -132,6 +134,12 @@ async fn cleanup_projection(state: &mut ProjectionCleanupState) -> bool {
         (false, false, false)
     };
     if !(binding_valid && branch_stopped && owner_stopped && shared_stopped) {
+        #[cfg(all(test, any(unix, windows)))]
+        retained_diagnostics::provider_failures(
+            state,
+            binding_valid,
+            [branch_stopped, owner_stopped, shared_stopped],
+        );
         tracing::error!(
             binding_valid,
             branch_stopped,
@@ -143,10 +151,14 @@ async fn cleanup_projection(state: &mut ProjectionCleanupState) -> bool {
         return false;
     }
     if !super::native_unmount::confirm_projection_unmounted(&state.paths, state.stop_policy).await {
+        #[cfg(all(test, any(unix, windows)))]
+        retained_diagnostics::projection(Stage::NativeUnmount, state.branch.lease.mount_id);
         fence_retained_projection(state).await;
         return false;
     }
     let Some(kernel) = state.kernel.upgrade() else {
+        #[cfg(all(test, any(unix, windows)))]
+        retained_diagnostics::projection(Stage::KernelUnavailable, state.branch.lease.mount_id);
         tracing::error!("kernel shut down before process storage projection leases were revoked");
         return false;
     };
@@ -163,6 +175,8 @@ async fn cleanup_projection(state: &mut ProjectionCleanupState) -> bool {
         return false;
     }
     if let Err(error) = remove_projection_root(&state.paths.mount_root) {
+        #[cfg(all(test, any(unix, windows)))]
+        retained_diagnostics::root_failure(state.branch.lease.mount_id, &error);
         tracing::error!(%error, "failed to remove process storage projection root");
         return false;
     }
@@ -296,10 +310,22 @@ pub(crate) fn retain_failed_issue_projection(
         let mount_root = mount_root.clone();
         Box::pin(async move {
             let Some(kernel) = kernel.upgrade() else {
+                #[cfg(all(test, any(unix, windows)))]
+                retained_diagnostics::projection(Stage::KernelUnavailable, branch.mount_id);
                 return false;
             };
-            cleanup_uncommitted_issue_lease_set(&kernel, &binding, &branch, owner.as_ref()).await
-                && remove_projection_root(&mount_root).is_ok()
+            if !cleanup_uncommitted_issue_lease_set(&kernel, &binding, &branch, owner.as_ref())
+                .await
+            {
+                return false;
+            }
+            if let Err(error) = remove_projection_root(&mount_root) {
+                #[cfg(all(test, any(unix, windows)))]
+                retained_diagnostics::root_failure(branch.mount_id, &error);
+                drop(error);
+                return false;
+            }
+            true
         })
     });
     projections.insert(
@@ -360,7 +386,14 @@ async fn drain_projection_states(states: &[Arc<super::StorageMountLeaseState>]) 
     let mut listener_checks = tokio::task::JoinSet::new();
     for state in states {
         let state = Arc::clone(state);
-        listener_checks.spawn(async move { state.drain_is_settled_for_cleanup().await });
+        listener_checks.spawn(async move {
+            let closed = state.drain_is_settled_for_cleanup().await;
+            #[cfg(all(test, any(unix, windows)))]
+            if !closed {
+                report(Stage::LeaseDrain, Component::Lease, state.mount_id, None);
+            }
+            closed
+        });
     }
     let mut listeners_closed = true;
     while let Some(closed) = listener_checks.join_next().await {
@@ -376,27 +409,50 @@ pub(crate) async fn cleanup_uncommitted_issue_lease_set(
     owner: Option<&ProjectionLeaseTarget>,
 ) -> bool {
     if binding.validate().is_err() {
+        #[cfg(all(test, any(unix, windows)))]
+        retained_diagnostics::projection(Stage::Binding, branch.mount_id);
         return false;
     }
     // A recorded issued member can disappear between issue failure and the
     // bounded retry. Absence is already clean; a present member must still
     // prove the exact actor, owner, target, access, and provider identity.
     let Ok(states) = mapped_projection_leases(kernel, binding, branch, owner, None) else {
+        #[cfg(all(test, any(unix, windows)))]
+        retained_diagnostics::projection(Stage::ExactIdentity, branch.mount_id);
         return false;
     };
     fence_projection_states(&states, true);
     let listeners_closed = drain_projection_states(&states).await;
     if !listeners_closed {
+        #[cfg(all(test, any(unix, windows)))]
+        retained_diagnostics::projection(Stage::LeaseDrain, branch.mount_id);
         return false;
     }
     let _mutation_guard = kernel.storage_mount_mutations.lock().await;
     for state in &states {
-        if cleanup_mapped_lease_resources(state).is_err() {
+        if let Err(error) = cleanup_mapped_lease_resources(state) {
+            #[cfg(all(test, any(unix, windows)))]
+            report(
+                Stage::Resource(error.stage),
+                Component::Lease,
+                state.mount_id,
+                Some(&error.source),
+            );
+            drop(error);
             return false;
         }
     }
     for state in &states {
-        if complete_cleanup_ledger(state).is_err() {
+        if let Err((stage, error)) = complete_cleanup_ledger(state) {
+            #[cfg(all(test, any(unix, windows)))]
+            report(
+                Stage::Ledger(stage),
+                Component::Lease,
+                state.mount_id,
+                Some(&error),
+            );
+            let _ = stage;
+            drop(error);
             return false;
         }
     }
@@ -417,11 +473,15 @@ pub(crate) async fn revoke_projection_leases(
     shared: Option<&ProjectionLeaseTarget>,
 ) -> bool {
     let Ok(states) = mapped_projection_leases(kernel, binding, branch, Some(owner), shared) else {
+        #[cfg(all(test, any(unix, windows)))]
+        retained_diagnostics::projection(Stage::ExactIdentity, branch.mount_id);
         return false;
     };
     fence_projection_states(&states, true);
     let listeners_closed = drain_projection_states(&states).await;
     if !listeners_closed {
+        #[cfg(all(test, any(unix, windows)))]
+        retained_diagnostics::projection(Stage::LeaseDrain, branch.mount_id);
         tracing::error!(
             "failed to drain an authorized process storage projection listener before cleanup"
         );
@@ -430,12 +490,29 @@ pub(crate) async fn revoke_projection_leases(
     // Resource removal and unmap are two phases. A resource fault therefore
     // leaves the complete exact set mapped as the bounded-retry authority.
     for state in &states {
-        if cleanup_mapped_lease_resources(state).is_err() {
+        if let Err(error) = cleanup_mapped_lease_resources(state) {
+            #[cfg(all(test, any(unix, windows)))]
+            report(
+                Stage::Resource(error.stage),
+                Component::Lease,
+                state.mount_id,
+                Some(&error.source),
+            );
+            drop(error);
             return false;
         }
     }
     for state in &states {
-        if complete_cleanup_ledger(state).is_err() {
+        if let Err((stage, error)) = complete_cleanup_ledger(state) {
+            #[cfg(all(test, any(unix, windows)))]
+            report(
+                Stage::Ledger(stage),
+                Component::Lease,
+                state.mount_id,
+                Some(&error),
+            );
+            let _ = stage;
+            drop(error);
             return false;
         }
     }
@@ -595,6 +672,8 @@ async fn fence_projection_leases(
     shared: Option<&ProjectionLeaseTarget>,
 ) -> bool {
     let Ok(states) = mapped_projection_leases(kernel, binding, branch, Some(owner), shared) else {
+        #[cfg(all(test, any(unix, windows)))]
+        retained_diagnostics::projection(Stage::ExactIdentity, branch.mount_id);
         return false;
     };
     if states.is_empty() {
@@ -651,6 +730,10 @@ pub(crate) async fn invalidate_unhealthy_projection(
     let (_, _, authorized) =
         exact_projection_lease_states(kernel, &projection.binding, &projection.component_mount_ids);
     if !authorized {
+        #[cfg(all(test, any(unix, windows)))]
+        if let Some(mount_id) = projection.component_mount_ids.first() {
+            retained_diagnostics::projection(Stage::ExactIdentity, *mount_id);
+        }
         projection.cleanup_failed.store(true, Ordering::Release);
         return false;
     }
@@ -661,6 +744,10 @@ pub(crate) async fn invalidate_unhealthy_projection(
     )
     .await
     {
+        #[cfg(all(test, any(unix, windows)))]
+        if let Some(mount_id) = projection.component_mount_ids.first() {
+            retained_diagnostics::projection(Stage::InitialDrain, *mount_id);
+        }
         projection.cleanup_failed.store(true, Ordering::Release);
         return false;
     }

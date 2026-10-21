@@ -35,6 +35,21 @@ impl StorageMountLeaseState {
     }
 
     #[cfg(any(unix, windows))]
+    pub(crate) fn arm_blocking_worker_gate_for_test(&self) -> Arc<BlockingWorkerTestGate> {
+        let mut installed = self
+            .blocking_worker_test_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            installed.is_none(),
+            "a worker gate is already armed for this lease"
+        );
+        let gate = Arc::new(BlockingWorkerTestGate::new());
+        *installed = Some(Arc::clone(&gate));
+        gate
+    }
+
+    #[cfg(any(unix, windows))]
     pub(crate) fn arm_stale_join_failure_for_test(&self) {
         self.record_drain_failure(BlockingJobDrain::JoinFailed);
         let _ = self.shutdown_tx.send(true);

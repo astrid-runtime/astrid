@@ -40,6 +40,8 @@ mod projection_release;
 #[cfg(all(test, any(unix, windows)))]
 mod retain_test_gates;
 #[cfg(all(test, any(unix, windows)))]
+mod retained_diagnostics;
+#[cfg(all(test, any(unix, windows)))]
 pub(crate) use retain_test_gates::{
     RetainTestGates, arm_retain_reference_gate, arm_retain_validation_gate,
 };
