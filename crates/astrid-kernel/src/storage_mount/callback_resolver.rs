@@ -4,7 +4,24 @@ use std::path::PathBuf;
 
 use astrid_core::storage_provider::StorageMountId;
 
-pub(super) async fn resolve(mount_id: StorageMountId) -> Result<PathBuf, String> {
+#[cfg(test)]
+mod lease_tests;
+#[cfg(test)]
+pub(crate) mod test_support;
+
+pub(super) async fn resolve(
+    kernel: &crate::Kernel,
+    mount_id: StorageMountId,
+) -> Result<PathBuf, String> {
+    #[cfg(not(test))]
+    let _ = kernel;
+    #[cfg(test)]
+    if let Some(result) = kernel
+        .storage_mount_callback_test_resolver
+        .resolve(mount_id)
+    {
+        return result;
+    }
     resolve_with(move || astrid_core::fskit_socket::callback_path(mount_id)).await
 }
 

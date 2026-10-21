@@ -454,6 +454,9 @@ pub struct Kernel {
     /// mounts so concurrent views cannot lose non-overlapping writes.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) storage_mount_mutations: Arc<tokio::sync::Mutex<()>>,
+    /// Explicit callback dependency for controlled-provider tests, never a native fallback.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) storage_mount_callback_test_resolver: storage_mount::CallbackTestResolver,
     /// Typed process-provider STOP/reap budgets resolved at kernel boot.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) process_stop_policy: storage_mount::ProcessStopPolicy,
@@ -1767,6 +1770,8 @@ impl Kernel {
             storage_mounts: Arc::new(DashMap::new()),
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             storage_mount_mutations: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(all(test, target_os = "macos"))]
+            storage_mount_callback_test_resolver: storage_mount::CallbackTestResolver::default(),
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             process_stop_policy,
             profile_cache: profile_cache
@@ -4084,6 +4089,8 @@ pub(crate) async fn test_kernel_with_user_cpu_budget(
         storage_mounts: Arc::new(DashMap::new()),
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         storage_mount_mutations: Arc::new(tokio::sync::Mutex::new(())),
+        #[cfg(all(test, target_os = "macos"))]
+        storage_mount_callback_test_resolver: storage_mount::CallbackTestResolver::default(),
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         process_stop_policy: storage_mount::ProcessStopPolicy::default(),
         profile_cache: Arc::new(PrincipalProfileCache::with_home(home.clone())),

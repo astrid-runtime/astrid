@@ -94,6 +94,10 @@ async fn projection_cleanup_revokes_every_lease_on_fault(fault: MountCleanupStag
     let temporary = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(temporary.path().join(".astrid"));
     let kernel = Arc::new(crate::test_kernel_with_home(home).await);
+    #[cfg(target_os = "macos")]
+    kernel
+        .storage_mount_callback_test_resolver
+        .use_private_callbacks();
     let caller = PrincipalId::default();
     let binding = projection_binding(&kernel, &caller);
     let branch = issue_home_lease(

@@ -87,6 +87,8 @@ use retained_jobs::{
 mod admin_projection;
 #[cfg(target_os = "macos")]
 mod callback_resolver;
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use callback_resolver::test_support::CallbackTestResolver;
 #[cfg(any(unix, windows))]
 mod process_broker;
 #[cfg(any(unix, windows))]
@@ -289,7 +291,7 @@ pub(crate) async fn issue_lease(
     let mount_id = StorageMountId::new();
     #[cfg(target_os = "macos")]
     let callback_override = if provider == "astrid-storage-provider-fskit" {
-        Some(callback_resolver::resolve(mount_id).await?)
+        Some(callback_resolver::resolve(kernel, mount_id).await?)
     } else {
         None
     };
