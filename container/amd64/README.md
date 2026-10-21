@@ -51,6 +51,12 @@ BLAKE3, manifest SHA-256, and release-workflow identity) during the build.
 Those values are repeated as immutable OCI labels, so an image digest cannot be
 detached from the exact signed release/source provenance that was tested.
 
+The current platform-specific base includes Ubuntu's OpenSSL package
+`libssl3t64` version `3.0.13-0ubuntu3.16`, which fixes
+[CVE-2026-84782](https://ubuntu.com/security/CVE-2026-84782). The image remains
+package-free at build time; the exact exported image must still pass the
+required vulnerability scan before publication.
+
 ## Run
 
 Astrid Runtime intentionally has no default distro. Mount an operator-selected

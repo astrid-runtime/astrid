@@ -1,4 +1,4 @@
-FROM docker.io/library/ubuntu@sha256:52df9b1ee71626e0088f7d400d5c6b5f7bb916f8f0c82b474289a4ece6cf3faf
+FROM docker.io/library/ubuntu@sha256:a2d43bffc46670d7108bb3c0468c67c5557c4c92e83e1e34cbff1322ad1b94dc
 
 ARG ASTRID_VERSION
 ARG ASTRID_SOURCE_COMMIT
