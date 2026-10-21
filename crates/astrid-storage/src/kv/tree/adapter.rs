@@ -203,6 +203,25 @@ where
     }
 }
 
+impl<P, I, R, E> TreeKvStore<P, I, R, E>
+where
+    P: Clone + Ord + Send + Sync + 'static,
+    E: KvProjectionEngine<P> + 'static,
+{
+    pub(crate) async fn clear_namespace_for_owner(
+        &self,
+        owner: &P,
+        namespace: &str,
+    ) -> StorageResult<u64> {
+        validate_namespace(namespace)?;
+        let start = namespace_range_start(namespace);
+        let end = namespace_range_end(namespace);
+        let owner = owner.clone();
+        let blocking = self.blocking_store();
+        run_blocking(move || blocking.clear_range(&owner, &start, &end)).await
+    }
+}
+
 fn resolve_batch_owner<P, I, R, E>(
     store: &TreeKvStore<P, I, R, E>,
     batch: &KvMutationBatch,

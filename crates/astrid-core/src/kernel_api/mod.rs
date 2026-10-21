@@ -9,15 +9,34 @@
 //! `wasm32-unknown-unknown` without dragging in the kernel).
 
 mod agent;
+mod audit_anchor;
+mod audit_export;
+mod capsule_metadata;
 mod impls;
 mod install;
+mod pairing;
+pub use pairing::PairScopeArg;
+use pairing::default_pair_scope;
 mod projection_names;
 mod readiness;
 mod response_types;
+mod status;
 pub use agent::{AgentDeriveKernelRequest, AgentDeriveRequest};
+pub use audit_anchor::{
+    AUDIT_ANCHOR_MARK_MAX_CHAINS, AuditAnchorChainStatus, AuditAnchorEvidence,
+    AuditAnchorMarkChain, AuditAnchorMarkOutcome, AuditAnchorMarkRequest, AuditAnchorMarkResult,
+    AuditAnchorMarkStatus, AuditAnchorStatusReport,
+};
+pub use audit_export::{
+    AUDIT_HEADS_DOMAIN_V1, AUDIT_OMITTED_TOTAL_UNKNOWN, AuditExportEntry, AuditExportPage,
+    AuditExportReceipt, AuditExportRequest, AuditHeadsChain, AuditHeadsPrune, AuditHeadsSnapshot,
+};
+pub use capsule_metadata::CapsuleEnvOptionsFromMetadata;
 pub use install::{
-    CapsuleInstallAuthority, CapsuleInstallEnv, CapsuleInstallProvenance, EnvEntry,
-    EnvStorageScope, EnvValueKind,
+    CAPSULE_INSTALL_BATCH_PROTOCOL_V1, CapsuleInstallAuthority, CapsuleInstallBatchContext,
+    CapsuleInstallBatchId, CapsuleInstallBatchMember, CapsuleInstallEnv, CapsuleInstallProvenance,
+    CapsuleInstallResumeReceipt, EnvEntry, EnvStorageScope, EnvValueKind,
+    InstalledCapsuleGeneration, InstalledCapsuleIdentity,
 };
 pub use projection_names::{
     PROJECTION_NAME_DIAGNOSTIC_METHOD, PROJECTION_NAME_DIAGNOSTIC_TOPIC,
@@ -26,10 +45,11 @@ pub use projection_names::{
 };
 pub use readiness::{AgentLoopReadiness, AgentReadinessProbe, CapsuleTopicProbe, MissingImport};
 pub use response_types::{
-    AdminResponseBody, AgentSummary, AuditHealth, AuditPruneResult, AuditStats,
-    DistroCapsuleProvenance, DistroProvenance, GroupSummary, InviteIssued, InviteRedeemed,
-    InviteSummary, PairTokenIssued, PairTokenRedeemed, ResourceUsage,
+    AdminKernelResponse, AdminResponseBody, AgentSummary, AuditHealth, AuditPruneResult,
+    AuditStats, DeviceKeyInfo, DistroCapsuleProvenance, DistroProvenance, GroupSummary,
+    InviteIssued, InviteRedeemed, InviteSummary, PairTokenIssued, PairTokenRedeemed, ResourceUsage,
 };
+pub use status::{DaemonStatus, PrincipalConnectionCount};
 
 use crate::PrincipalId;
 use crate::profile::Quotas;
@@ -48,20 +68,24 @@ pub const SYSTEM_SESSION_UUID: &str = "00000000-0000-0000-0000-000000000000";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum KernelRequest {
+    /// Open a short lease for an exact set of local capsule archives.
+    BeginCapsuleInstallBatch {
+        /// Optional durable principal target. Absent means the caller.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_principal: Option<PrincipalId>,
+        /// Fixed capsule identities admitted by this lease.
+        members: Vec<CapsuleInstallBatchMember>,
+    },
     /// Request to install a capsule from a local or remote path.
     InstallCapsule {
         /// The path or URL to the `.capsule` archive.
         source: String,
         /// True if this should be installed locally in the workspace.
         workspace: bool,
-        /// Optional durable principal target.  When absent, the
-        /// authenticated caller is the target.  Selecting another principal
-        /// requires the global capsule-install capability and is resolved to
-        /// that principal's immutable UID by the kernel.
+        /// Optional durable principal target. Absent means the caller; selecting another requires the global capsule-install capability.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_principal: Option<PrincipalId>,
-        /// Optional bounded distro/source provenance.  This is integrity
-        /// evidence only; it never widens install authority.
+        /// Bounded distro/source provenance; never widens install authority.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provenance: Option<CapsuleInstallProvenance>,
         /// Authenticated one-install authority decision. The kernel binds it
@@ -73,6 +97,38 @@ pub enum KernelRequest {
         /// kernel's environment limits.
         #[serde(default)]
         env: Vec<CapsuleInstallEnv>,
+        /// Observed package generation; filtered refresh fail-closes on mismatch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_generation: Option<InstalledCapsuleGeneration>,
+        /// Optional bounded request-frequency lease; never grants authority.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch: Option<CapsuleInstallBatchContext>,
+    },
+    /// Close a batch after every declared member is durably complete.
+    FinishCapsuleInstallBatch {
+        /// Kernel-issued lease identifier.
+        batch_id: CapsuleInstallBatchId,
+        /// Optional lease target; absent means the caller.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_principal: Option<PrincipalId>,
+    },
+    /// Read the authenticated caller's complete durable package identity.
+    ///
+    /// The kernel resolves the owner from the authenticated request context;
+    /// this request never accepts a principal or target selector.
+    GetInstalledCapsuleIdentity {
+        /// Capsule identifier to inspect.
+        id: String,
+    },
+    /// Read the authenticated caller's durable capsule-install resume receipt.
+    GetCapsuleInstallResumeReceipt {
+        /// Capsule identifier used as the receipt key.
+        id: String,
+    },
+    /// Replace the authenticated caller's durable capsule-install resume receipt.
+    PutCapsuleInstallResumeReceipt {
+        /// Complete receipt to store under its capsule identifier.
+        receipt: CapsuleInstallResumeReceipt,
     },
     /// Request to approve a capability grant (usually following an `ApprovalNeeded` response).
     ApproveCapability {
@@ -111,6 +167,12 @@ pub enum KernelRequest {
         /// Force removal even when dependency metadata is unavailable.
         #[serde(default)]
         force: bool,
+        /// Also erase this capsule's principal-scoped guest KV state.
+        ///
+        /// The request remains retryable after the package is gone so an
+        /// interrupted purge can finish without reinstalling the capsule.
+        #[serde(default)]
+        purge: bool,
     },
     /// Promote a capsule's OS-level copy-on-write workspace changes into the
     /// pristine workspace — the gate's "approve" (Fix #2). For a non-git
@@ -134,6 +196,14 @@ pub enum KernelRequest {
     /// Request metadata about loaded capsules (manifests, providers, interceptors).
     /// The kernel's equivalent of `/proc` — exposing process table info.
     GetCapsuleMetadata,
+    /// Request metadata for one explicitly selected principal.
+    ///
+    /// Selecting another principal requires global `capsule:list` authority;
+    /// the authenticated caller remains the audited actor.
+    GetCapsuleMetadataForPrincipal {
+        /// Principal whose durable and live capsule registry is inspected.
+        target_principal: PrincipalId,
+    },
     /// Request the daemon to shut down gracefully.
     Shutdown {
         /// Optional reason for shutdown.
@@ -156,6 +226,19 @@ pub enum KernelResponse {
     Commands(Vec<CommandInfo>),
     /// Metadata about loaded capsules.
     CapsuleMetadata(Vec<CapsuleMetadataEntry>),
+    /// Caller-scoped identity of one complete durable package, or `None` when
+    /// the identifier is not installed for the authenticated caller.
+    InstalledCapsuleIdentity(Option<InstalledCapsuleIdentity>),
+    /// Caller-scoped durable capsule-install resume receipt, or `None` when absent
+    /// or when the stored bytes are malformed and therefore not completion proof.
+    CapsuleInstallResumeReceipt(Option<CapsuleInstallResumeReceipt>),
+    /// A bounded capsule-install batch lease was opened.
+    CapsuleInstallBatchStarted {
+        /// Kernel-issued lease identifier.
+        batch_id: CapsuleInstallBatchId,
+        /// Remaining lease lifetime at issue time.
+        expires_in_secs: u64,
+    },
     /// The request failed.
     Error(String),
     /// Daemon status information.
@@ -184,40 +267,6 @@ pub enum KernelResponse {
     /// A stray late `Working` that races out after the terminal response is
     /// harmless: the uplink skips it and returns the already-received terminal.
     Working,
-}
-
-/// Daemon runtime status information.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DaemonStatus {
-    /// Process ID of the daemon.
-    pub pid: u32,
-    /// Daemon uptime in seconds.
-    pub uptime_secs: u64,
-    /// Daemon version string.
-    pub version: String,
-    /// Whether the daemon is running in ephemeral mode.
-    pub ephemeral: bool,
-    /// Number of currently connected clients.
-    pub connected_clients: u32,
-    /// Per-principal breakdown of `connected_clients`. Each entry is
-    /// `(principal, count)`; the sum equals `connected_clients`. Empty
-    /// on daemons that don't yet expose per-principal connection
-    /// attribution (older builds, or when no clients are connected).
-    /// Used by `astrid who` to show who is actually on the daemon
-    /// rather than the bare count.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub connections_by_principal: Vec<PrincipalConnectionCount>,
-    /// Names of loaded capsules.
-    pub loaded_capsules: Vec<String>,
-}
-
-/// Per-principal connection count entry on [`DaemonStatus`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrincipalConnectionCount {
-    /// The principal (agent) holding the connections.
-    pub principal: String,
-    /// Number of active connections owned by this principal.
-    pub count: u32,
 }
 
 /// Metadata entry for a loaded capsule.
@@ -291,6 +340,9 @@ pub struct CapsuleEnvMetadata {
     /// Optional input placeholder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placeholder: Option<String>,
+    /// Dynamic option-discovery metadata for select fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options_from: Option<CapsuleEnvOptionsFromMetadata>,
 }
 
 /// How a capsule-declared command is surfaced to operators.
@@ -388,83 +440,6 @@ pub struct AdminKernelRequest {
     pub kind: AdminRequestKind,
 }
 
-/// Requested capability scope for a [`AdminRequestKind::PairDeviceIssue`]
-/// token — what the redeemed device is allowed to do with the principal's
-/// authority.
-///
-/// The kernel resolves this against the ISSUER's *effective* capability set at
-/// issue time (no-escalation: a device can never confer more than the issuer
-/// holds, where the issuer's effective set is itself narrowed by the issuer's
-/// own authenticating device scope) and stamps the resolved
-/// [`DeviceScope`](crate::DeviceScope) onto the minted token, so the redeemed
-/// device is attenuated to exactly the granted scope on every transport.
-///
-/// On the wire it is an internally-tagged object: `{ "kind": "full" }`,
-/// `{ "kind": "preset", "name": "use-only" }`, or
-/// `{ "kind": "explicit", "allow": [...], "deny": [...] }`. The `scope` field
-/// on `PairDeviceIssue` defaults to [`PairScopeArg::Full`] when omitted, so
-/// pre-scope callers (and single-tenant admin flows) keep their existing
-/// behaviour — but minting a `Full` device additionally requires the issuer to
-/// hold `self:auth:pair:admin`, enforced by the authorization preamble and
-/// rechecked with the issuer's pinned policy snapshot before persistence.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum PairScopeArg {
-    /// Mint an unattenuated device — it acts with the principal's full
-    /// effective capability set. Requires the issuer to hold
-    /// `self:auth:pair:admin`. The default when `scope` is omitted (the
-    /// permissive default is still gated on the admin cap, so it does not
-    /// relax authority).
-    #[default]
-    Full,
-    /// Resolve a named scope preset (e.g. `"use-only"`) via
-    /// [`DeviceScope::preset`](crate::DeviceScope::preset). An unknown name is
-    /// rejected at issue time.
-    Preset {
-        /// The preset name.
-        name: String,
-    },
-    /// An explicit allow/deny capability scope. Every `allow` pattern must be
-    /// held by the issuer (subset check); `deny` patterns purely restrict.
-    Explicit {
-        /// Capability patterns the device may exercise.
-        #[serde(default)]
-        allow: Vec<String>,
-        /// Capability patterns the device is forbidden to exercise (deny wins).
-        #[serde(default)]
-        deny: Vec<String>,
-    },
-}
-
-/// Serde default for [`AdminRequestKind::PairDeviceIssue::scope`] — `Full`,
-/// for back-compat with callers that predate the `scope` field. A `Full` mint
-/// is independently gated on `self:auth:pair:admin`, so the permissive
-/// *default* does not relax the *authority* required to use it.
-fn default_pair_scope() -> PairScopeArg {
-    PairScopeArg::Full
-}
-
-/// Per-device summary returned by [`AdminRequestKind::PairDeviceList`].
-///
-/// Carries only non-secret, fingerprint-level identity — the deterministic
-/// `key_id`, the operator label, the granted [`DeviceScope`](crate::DeviceScope),
-/// and the pairing timestamp. The raw ed25519 public key is **never** surfaced;
-/// the `key_id` (derived from the already-public pubkey) is the stable handle
-/// for listing and revocation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceKeyInfo {
-    /// Deterministic per-device fingerprint handle.
-    pub key_id: String,
-    /// Operator/user-facing label captured at pairing time, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    /// Capability attenuation scope the device authenticates under.
-    pub scope: crate::DeviceScope,
-    /// Unix epoch seconds when the device was paired (`0` for migrated
-    /// legacy keys that predate pairing-time recording).
-    pub created_at: i64,
-}
-
 /// Typed admin request body — flattened into [`AdminKernelRequest`] on
 /// the wire as `{ "method": "...", "params": {...} }`.
 ///
@@ -548,6 +523,17 @@ pub enum AdminRequestKind {
     },
     /// List every agent principal with a profile on disk.
     AgentList,
+    /// List principals in the authenticated human's current fleets. Requires
+    /// an explicitly user-delegated device; never falls back to global listing.
+    /// Discovery does not grant acting or approval authority.
+    UserPrincipalList,
+    /// Assign one named unowned principal to the authenticated human's fleet.
+    /// Requires current user delegation and fleet management authority.
+    /// Never transfers an existing owner; key possession is not authority.
+    UserPrincipalClaim {
+        /// Admitted principal that currently has no fleet owner.
+        principal: PrincipalId,
+    },
     /// Partial-update an existing agent's group memberships. Built-in
     /// group names (`admin`, `agent`, `restricted`) and custom groups
     /// loaded from `groups.toml` are both accepted as identifiers;
@@ -581,8 +567,18 @@ pub enum AdminRequestKind {
         #[serde(default)]
         remove_capsules: Vec<String>,
     },
-    /// Replace the target principal's [`Quotas`] block. Values are
-    /// validated before the atomic profile write.
+    /// List existing user identities for explicit operator resource attribution.
+    /// Requires global quota administration, never ordinary principal discovery.
+    QuotaUserList,
+    /// Resolve missing legacy resource attribution using operator authority.
+    /// Idempotent for the same user; never transfers an existing allocation.
+    QuotaAssignUser {
+        /// Existing principal with unresolved legacy resource accountability.
+        principal: PrincipalId,
+        /// Explicit accountable user. Fleet access alone cannot authorize this.
+        user: crate::UserUid,
+    },
+    /// Replace principal limits after capability and ceiling validation.
     QuotaSet {
         /// Principal whose quotas are being set.
         principal: PrincipalId,
@@ -624,12 +620,29 @@ pub enum AdminRequestKind {
         #[serde(default)]
         append: bool,
     },
+    /// Seed an agent value only when neither agent nor shared scope contains
+    /// the same typed key. Serialized with environment writes; requires write
+    /// authority, not permission to list configuration. Older kernels reject
+    /// this operation rather than silently overwriting a value.
+    EnvSetIfAbsent {
+        /// Target principal.
+        principal: PrincipalId,
+        /// Capsule id.
+        capsule: String,
+        /// Manifest field key.
+        key: String,
+        /// Default value, redacted from audit.
+        value: String,
+        /// Text or secret namespace.
+        kind: EnvValueKind,
+    },
     /// List redacted keys in host-owned capsule projections.
     EnvList {
         /// Principal whose agent-scoped entries are listed.
         principal: PrincipalId,
         /// Optional capsule filter. Omitted means all currently loaded
-        /// capsules; arbitrary namespace strings are never accepted.
+        /// capsules plus the principal-local legacy default scope;
+        /// arbitrary namespace strings are never accepted.
         #[serde(default)]
         capsule: Option<String>,
     },
@@ -663,6 +676,13 @@ pub enum AdminRequestKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_hash: Option<String>,
     },
+    /// Grant the authenticated caller invoke access to exactly the capsule
+    /// set in that caller's kernel-admitted Distro lock.
+    ///
+    /// The request deliberately carries no principal or capsule list: the
+    /// caller is the only target and the admitted lock is the only source of
+    /// member identities.
+    DistroSelfGrant,
     /// Create a custom group, validated through the same rules the boot
     /// loader applies to `groups.toml`.
     GroupCreate {
@@ -895,6 +915,14 @@ pub enum AdminRequestKind {
     },
     /// Read bounded ingestion queue health for the system audit writer.
     AuditHealth,
+    /// Runtime-key-signed snapshot of every audit chain head. Read-only.
+    AuditHeads,
+    /// One page of a chain's raw signed audit entries. Read-only.
+    AuditExport(AuditExportRequest),
+    /// Record how far chains are externally anchored; see `audit_anchor`.
+    AuditAnchorMark(AuditAnchorMarkRequest),
+    /// Every chain's anchored watermark and the retention state. Read-only.
+    AuditAnchorStatus,
     /// Issue an authenticated native filesystem lease. The handler resolves
     /// the selected view to a typed store owner and starts a private callback
     /// endpoint; the provider never receives a general daemon session token.
@@ -923,19 +951,6 @@ pub enum AdminRequestKind {
         /// Kernel-issued mount identity.
         mount_id: StorageMountId,
     },
-}
-
-/// Admin management API response wrapper carrying the echoed
-/// correlation ID and the typed response body.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AdminKernelResponse {
-    /// Echoed `request_id` from the [`AdminKernelRequest`] this response
-    /// answers. `None` when the client did not provide one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<String>,
-    /// The typed response body — `tag = "status", content = "data"`.
-    #[serde(flatten)]
-    pub body: AdminResponseBody,
 }
 
 #[cfg(test)]

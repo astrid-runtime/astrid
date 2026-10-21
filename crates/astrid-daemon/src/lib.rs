@@ -15,6 +15,44 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 
+/// Explicitly bound native secret responder; not enabled by default.
+pub mod native_input;
+
+/// Run the daemon and finalize its durable home after all runtime tasks stop.
+///
+/// Both binary entry points use this path for API, signal, and idle shutdown.
+/// The lifecycle fence outlives the task runtime and the final volume pack.
+///
+/// # Errors
+/// Returns boot, shutdown, or durable-finalization errors without claiming a
+/// successful retirement. Failed boots retain their recovery evidence.
+pub fn run_to_completion() -> Result<()> {
+    // Help/version must not acquire ownership of a running installation.
+    let args = Args::parse();
+    if args.setup_sandbox_probe {
+        anyhow::ensure!(
+            astrid_workspace::sandbox::probe_native_process_sandbox(),
+            "native-process sandbox setup probe failed"
+        );
+        return Ok(());
+    }
+    let home = astrid_core::dirs::AstridHome::resolve()?;
+    let lifecycle = astrid_storage::principal_state::RuntimeLifecycleGuard::acquire(&home)?;
+    {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(run_with_args(args))?;
+        // Drop joins blocking work and cancels remaining async tasks before any
+        // projection file can be retired. No kernel handles cross this scope.
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(lifecycle.finish())?;
+    Ok(())
+}
+
 #[cfg(unix)]
 mod signal;
 
@@ -26,6 +64,9 @@ const DAEMON_LOG_TARGET_ENV: &str = "ASTRID_DAEMON_LOG_TARGET";
 #[command(name = "astrid-daemon")]
 #[command(author, version, about)]
 pub struct Args {
+    /// Run the disposable native-process setup probe before touching a home.
+    #[arg(long, hide = true)]
+    pub setup_sandbox_probe: bool,
     /// The session ID to bind the daemon to
     #[arg(short, long, default_value = "00000000-0000-0000-0000-000000000000")]
     pub session: String,
@@ -190,20 +231,23 @@ fn write_readiness_then_arm_ephemeral<T, E>(
 
 /// Run the Astrid daemon with the given arguments.
 ///
-/// This is the shared entry point used by both the standalone `astrid-daemon`
-/// binary and the `astrid` CLI's bundled daemon binary.
+/// Async service loop. Binary hosts use [`run_to_completion`] so task-runtime
+/// teardown and durable finalization are also completed before process exit.
 ///
 /// # Errors
 ///
 /// Returns an error if the kernel fails to boot, the native local uplink cannot
 /// claim its listener, or the readiness file cannot be written.
+pub async fn run() -> Result<()> {
+    run_with_args(Args::parse()).await
+}
+
 #[cfg(unix)]
 #[expect(
     clippy::too_many_lines,
     reason = "boot sequence: sequential config resolution + kernel/capsule setup that does not benefit from splitting"
 )]
-pub async fn run() -> Result<()> {
-    let args = Args::parse();
+async fn run_with_args(args: Args) -> Result<()> {
     let workspace_layout = match std::env::var("ASTRID_WORKSPACE_STATE_DIR") {
         Ok(value) => astrid_core::dirs::WorkspaceLayout::new(value)
             .context("invalid ASTRID_WORKSPACE_STATE_DIR")?,
@@ -251,14 +295,6 @@ pub async fn run() -> Result<()> {
     // Done before `args.workspace` is consumed below.
     let runtime_limits = resolve_capsule_limits(&args, unified_cfg.as_ref());
 
-    // Operator-approved per-capsule local-egress allowlist (SSRF-airlock
-    // exemptions). Operator config only — the kernel hands each capsule its
-    // own slice at load time. Absent config = empty = no exemptions.
-    let local_egress = unified_cfg
-        .as_ref()
-        .map(|c| c.security.capsule_local_egress.clone())
-        .unwrap_or_default();
-
     // Operator ceilings for the astrid:http host (global; absent `[http]`
     // config = the host's historical constants). Forwarded to every capsule.
     let http_limits = resolve_http_limits(unified_cfg.as_ref());
@@ -266,12 +302,26 @@ pub async fn run() -> Result<()> {
         session_id.clone(),
         workspace_root,
         runtime_limits,
-        local_egress,
+        std::collections::HashMap::new(),
         http_limits,
         workspace_layout,
     )
     .await
     .map_err(|e| anyhow::anyhow!("Failed to boot Kernel: {e}"))?;
+
+    // Local egress is security policy at durable-root authority, so read it
+    // only after admission and bind it once before any capsule can load.
+    let admitted_config = astrid_config::Config::load_with_home_and_layout(
+        Some(&kernel.workspace_root),
+        astrid_home.root(),
+        kernel.workspace_layout(),
+    )
+    .map_err(|error| anyhow::anyhow!("Failed to load admitted-home boot policy: {error:#}"))?;
+    let private_inputs = native_input::configure(&kernel, &admitted_config.config)?;
+    kernel
+        .bind_boot_local_egress(admitted_config.config.security.capsule_local_egress)
+        .map_err(|error| anyhow::anyhow!("Failed to bind boot policy: {error}"))?;
+
     if defer_logging {
         init_logging(&log_config);
     }
@@ -291,14 +341,17 @@ pub async fn run() -> Result<()> {
     let native_listener = kernel
         .claim_native_uplink_listener()
         .ok_or_else(|| anyhow::anyhow!("native local uplink listener is unavailable"))?;
-    let native_uplink_task = astrid_uplink::native::NativeUplink {
+    let native_uplink = astrid_uplink::native::NativeUplink {
         listener: native_listener,
         session_token: std::sync::Arc::clone(&kernel.session_token),
         home: astrid_home.clone(),
         event_bus: std::sync::Arc::clone(&kernel.event_bus),
         shutdown: kernel.shutdown_tx.subscribe(),
-    }
-    .spawn();
+    };
+    let native_uplink_task = match private_inputs {
+        Some(responder) => native_uplink.spawn_with_private_elicits(responder),
+        None => native_uplink.spawn(),
+    };
 
     // In ephemeral mode, shut down immediately when the last client disconnects.
     if args.ephemeral {
@@ -464,7 +517,7 @@ pub async fn run() -> Result<()> {
     clippy::unused_async,
     reason = "the cross-platform daemon entry point remains async even when startup is unsupported"
 )]
-pub async fn run() -> Result<()> {
+async fn run_with_args(_args: Args) -> Result<()> {
     anyhow::bail!("native Astrid daemon startup is not yet supported on this platform")
 }
 

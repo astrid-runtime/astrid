@@ -1,0 +1,81 @@
+name: Supervised native storage certification
+
+on:
+  workflow_call:
+    inputs:
+      source_commit:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  identify:
+    name: Identify archive for supervised FSKit test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: binary-aarch64-apple-darwin
+          path: archive
+      - name: Record exact archive identity
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          test "$SOURCE_COMMIT" = "$GITHUB_SHA"
+          python3 scripts/supervised_fskit.py manifest archive "$SOURCE_COMMIT" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > fskit-manifest.json
+          {
+            echo '## Supervised FSKit certification required'
+            echo 'Download the binary-aarch64-apple-darwin and supervised-fskit-manifest artifacts from this run.'
+            echo 'Follow release/SUPERVISED-FSKIT.md. Do not approve until local certification passes.'
+            echo 'Paste the complete PASS receipt JSON as the protected release approval comment.'
+            echo 'A generic approval, stale attempt, or different archive is rejected.'
+            echo '```json'
+            cat fskit-manifest.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: supervised-fskit-manifest-${{ github.run_attempt }}
+          path: fskit-manifest.json
+
+  certify:
+    name: Native FSKit mount certification
+    needs: identify
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: binary-aarch64-apple-darwin
+          path: archive
+      - name: Verify protected approval against these exact bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          python3 scripts/supervised_fskit.py manifest archive "$SOURCE_COMMIT" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > fskit-manifest.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/approvals" > approvals.json
+          python3 scripts/supervised_fskit.py verify fskit-manifest.json approvals.json > fskit-receipt.json
+          echo 'Supervised operator-attested FSKit certification passed; this hosted job did not execute FSKit.' >> "$GITHUB_STEP_SUMMARY"
+          cat fskit-receipt.json >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: supervised-fskit-receipt-${{ github.run_attempt }}
+          path: fskit-receipt.json

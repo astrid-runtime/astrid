@@ -17,6 +17,22 @@ pub fn enforce_restrictions(
     baseline: &toml::Value,
     workspace_layer: &toml::Value,
 ) {
+    // Workspaces cannot create or move the operator's resource allocations.
+    block_workspace_override(
+        merged,
+        baseline,
+        workspace_layer,
+        &["resources"],
+        "resources",
+    );
+    // A project cannot select the device entrusted with human secret input.
+    block_workspace_override(
+        merged,
+        baseline,
+        workspace_layer,
+        &["native_input"],
+        "native_input",
+    );
     // Budget: can only decrease.
     clamp_max(
         merged,
@@ -64,6 +80,16 @@ pub fn enforce_restrictions(
         "workspace.never_allow",
     );
 
+    // audit.host_fail_closed: union (a workspace may make more host-call
+    // classes fail closed, never fewer).
+    union_string_arrays(
+        merged,
+        baseline,
+        workspace_layer,
+        &["audit", "host_fail_closed"],
+        "audit.host_fail_closed",
+    );
+
     // security.require_signatures: can only become true.
     enforce_bool_only_true(
         merged,
@@ -90,6 +116,26 @@ pub fn enforce_restrictions(
         workspace_layer,
         &["security", "capsule_local_egress"],
         "security.capsule_local_egress",
+    );
+
+    // audit.retention: operator-only. A project layer must not turn off
+    // anchor-before-prune or redirect where pruned audit history is written.
+    block_workspace_override(
+        merged,
+        baseline,
+        workspace_layer,
+        &["audit", "retention"],
+        "audit.retention",
+    );
+
+    // audit.entry_format: enabling v2 creates the key registry and closes v1.
+    // Only the operator may make this one-way transition.
+    block_workspace_override(
+        merged,
+        baseline,
+        workspace_layer,
+        &["audit", "entry_format"],
+        "audit.entry_format",
     );
 
     // http: operator-only host HTTP ceilings (timeouts, redirect/stream caps,
@@ -124,24 +170,6 @@ pub fn enforce_restrictions(
         workspace_layer,
         &["workspace", "auto_allow_write"],
         "workspace.auto_allow_write",
-    );
-
-    // model.api_key: workspace cannot override.
-    block_workspace_override(
-        merged,
-        baseline,
-        workspace_layer,
-        &["model", "api_key"],
-        "model.api_key",
-    );
-
-    // model.api_url: workspace cannot override.
-    block_workspace_override(
-        merged,
-        baseline,
-        workspace_layer,
-        &["model", "api_url"],
-        "model.api_url",
     );
 
     // hooks.allow_wasm_hooks: cannot enable (only disable).
@@ -253,6 +281,7 @@ pub fn enforce_restrictions(
         "process_stop_ack_secs",
         "process_reap_grace_secs",
         "process_killed_reap_secs",
+        "process_unmount_confirm_secs",
     ] {
         clamp_max_int(
             merged,

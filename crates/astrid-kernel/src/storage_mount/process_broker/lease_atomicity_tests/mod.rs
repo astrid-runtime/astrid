@@ -756,7 +756,12 @@ fn retained_cleanup_state(
             },
         },
         shared: None,
-        mount_root,
+        paths: super::ProjectionMountPaths {
+            workspace: mount_root.join("workspace"),
+            owner: mount_root.join("owner"),
+            fleet_shared: None,
+            mount_root,
+        },
         cleaned: false,
     }
 }

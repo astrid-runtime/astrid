@@ -135,27 +135,42 @@ pub(super) fn append_new_reachable_map_nodes(
     map: &CanonicalPhysicalMap,
     durable: &BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
-) -> Result<(), DurableError> {
+    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+) -> Result<usize, DurableError> {
     let Some(root) = map.root() else {
-        return Ok(());
+        return Ok(0);
     };
     let mut pending = vec![(root, false)];
     let mut visited = BTreeSet::new();
     while let Some((id, expanded)) = pending.pop() {
         if expanded {
+            let node = map
+                .nodes()
+                .get(&id)
+                .ok_or(DurableError::InvalidRepresentationState(
+                    "active physical map is missing a reachable node",
+                ))?;
+            // A persisted parent alone does not establish durable descendants.
+            // Cache only closures checked against the append-only persisted set.
+            let children_complete = match node {
+                PhysicalMapNode::Branch { zero, one, .. } => {
+                    complete.contains(zero) && complete.contains(one)
+                },
+                PhysicalMapNode::Radix { children, .. } => {
+                    children.iter().all(|child| complete.contains(child))
+                },
+                PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => true,
+            };
+            if durable.contains(&id) && children_complete {
+                complete.insert(id);
+            }
             if !durable.contains(&id) && !appended.contains(&id) {
-                let node = map
-                    .nodes()
-                    .get(&id)
-                    .ok_or(DurableError::InvalidRepresentationState(
-                        "active physical map is missing a reachable node",
-                    ))?;
                 metadata.push(MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?);
                 appended.insert(id);
             }
             continue;
         }
-        if !visited.insert(id) {
+        if complete.contains(&id) || !visited.insert(id) {
             continue;
         }
         let node = map
@@ -176,7 +191,7 @@ pub(super) fn append_new_reachable_map_nodes(
             PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => {},
         }
     }
-    Ok(())
+    Ok(visited.len())
 }
 
 pub(super) trait MapNodeRef {
@@ -227,15 +242,88 @@ mod tests {
     }
 
     #[test]
+    fn verified_durable_subtrees_skip_unchanged_nodes() {
+        let mut map = dense_map();
+        let durable = map.nodes().keys().copied().collect();
+        let mut complete = BTreeSet::new();
+        let mut metadata = Vec::new();
+        let mut appended = BTreeSet::new();
+        let cold = append_new_reachable_map_nodes(
+            &mut metadata,
+            &map,
+            &durable,
+            &mut appended,
+            &mut complete,
+        )
+        .unwrap();
+        assert_eq!(cold, map.nodes().len());
+        assert!(metadata.is_empty());
+        let warm = append_new_reachable_map_nodes(
+            &mut metadata,
+            &map,
+            &durable,
+            &mut appended,
+            &mut complete,
+        )
+        .unwrap();
+        assert_eq!(warm, 0);
+
+        map.insert(
+            &Blake3PhysicalIdentity,
+            PhysicalMapKey::new([42; 32]),
+            vec![7],
+        )
+        .unwrap();
+        let changed = append_new_reachable_map_nodes(
+            &mut metadata,
+            &map,
+            &durable,
+            &mut appended,
+            &mut complete,
+        )
+        .unwrap();
+        assert!(changed > 0 && changed < cold);
+        let mut cold_metadata = Vec::new();
+        let mut cold_appended = BTreeSet::new();
+        append_new_reachable_map_nodes(
+            &mut cold_metadata,
+            &map,
+            &durable,
+            &mut cold_appended,
+            &mut BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(appended, cold_appended);
+        assert_eq!(
+            metadata
+                .iter()
+                .map(|frame| frame.encode().unwrap())
+                .collect::<Vec<_>>(),
+            cold_metadata
+                .iter()
+                .map(|frame| frame.encode().unwrap())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn durable_parent_does_not_hide_missing_descendants() {
         let map = dense_map();
         let root = map.root().unwrap();
         let mut metadata = Vec::new();
         let mut appended = BTreeSet::new();
 
-        append_new_reachable_map_nodes(&mut metadata, &map, &BTreeSet::from([root]), &mut appended)
-            .unwrap();
+        let mut complete = BTreeSet::new();
+        append_new_reachable_map_nodes(
+            &mut metadata,
+            &map,
+            &BTreeSet::from([root]),
+            &mut appended,
+            &mut complete,
+        )
+        .unwrap();
 
+        assert!(!complete.contains(&root));
         assert!(!appended.contains(&root));
         assert_eq!(appended.len(), map.nodes().len().checked_sub(1).unwrap());
         assert_eq!(metadata.len(), appended.len());
@@ -247,8 +335,14 @@ mod tests {
         let root = map.root().unwrap();
         let mut metadata = Vec::new();
         let mut appended = BTreeSet::new();
-        append_new_reachable_map_nodes(&mut metadata, &map, &BTreeSet::new(), &mut appended)
-            .unwrap();
+        append_new_reachable_map_nodes(
+            &mut metadata,
+            &map,
+            &BTreeSet::new(),
+            &mut appended,
+            &mut BTreeSet::new(),
+        )
+        .unwrap();
 
         let positions = metadata
             .iter()

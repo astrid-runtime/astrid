@@ -26,6 +26,9 @@
 //! * The broker acks on `astrid.v1.response.<req_id>` with
 //!   `{ kind:"ingress.respond", req_id, granted:bool }`. The shim only
 //!   re-sends the parked `tools/call` when `granted` is true.
+//! * Accepted ingress trust is persisted by the broker for this principal
+//!   and kernel-stamped source. Closing an MCP connection or restarting the
+//!   runtime does not expire it; presentation must disclose that duration.
 //!
 //! ## Capability gating and fail-secure
 //!
@@ -45,11 +48,15 @@
 
 use std::fmt::Write as _;
 
+use astrid_core::PrincipalId;
+
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::service::{ElicitationError, Peer, RoleServer};
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, warn};
+
+use super::consent_display::ConsentDisplay;
 
 /// Broker front door for the shim's elicited ingress-consent decision. Maps
 /// to `sage-mcp::SageMcp::handle_mcp_ingress_respond`.
@@ -63,7 +70,7 @@ pub(super) const INGRESS_RESPOND_TOPIC: &str = "astrid.v1.request.mcp.ingress.re
 /// enum, see `elicit::ApprovalForm`).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(super) struct IngressForm {
-    /// Whether to allow Astrid tool calls from this session's ingress.
+    /// Whether to persist trust for tool calls through this ingress.
     pub(super) allow: bool,
 }
 
@@ -82,6 +89,9 @@ pub(super) struct IngressRequest {
     /// The tool the user was trying to call, for the prompt context.
     #[serde(default)]
     tool_name: String,
+    /// Only the authenticated shim context may populate this display label.
+    #[serde(skip)]
+    principal: Option<PrincipalId>,
 }
 
 impl IngressRequest {
@@ -109,6 +119,7 @@ impl IngressRequest {
                 Some(IngressRequest {
                     source_id: String::new(),
                     tool_name: String::new(),
+                    principal: None,
                 })
             },
         }
@@ -119,18 +130,35 @@ impl IngressRequest {
     /// secret.
     pub(super) fn prompt(&self) -> String {
         let mut p = String::from(
-            "An MCP client is asking Astrid to run tool calls through this session for the first time.",
+            "This MCP ingress approval persists across reconnects and runtime restarts.\nIndividual tool and capsule permissions still apply.",
         );
+        if let Some(principal) = &self.principal {
+            let _ = write!(p, "\nPrincipal: {principal}");
+        }
         // `write!` to a `String` is infallible; the `let _` discards the
         // always-`Ok` result without an `unwrap`.
         if !self.tool_name.is_empty() {
             let _ = write!(p, "\n\nFirst tool requested: {}", self.tool_name);
         }
         if !self.source_id.is_empty() {
-            let _ = write!(p, "\nSession ingress: {}", self.source_id);
+            let _ = write!(p, "\nIngress source: {}", self.source_id);
         }
-        p.push_str("\n\nAllow Astrid tool calls from this session?");
+        p.push_str("\n\nAllow Astrid tool calls through this ingress for this principal?");
         p
+    }
+
+    /// Display-only consent metadata. Ingress `source_id` stays off this map.
+    pub(super) fn consent_display(&self) -> ConsentDisplay {
+        let display = ConsentDisplay::ingress().with_tool(&self.tool_name);
+        match &self.principal {
+            Some(principal) => display.with_principal(principal.to_string()),
+            None => display,
+        }
+    }
+
+    pub(super) fn with_principal(mut self, principal: &PrincipalId) -> Self {
+        self.principal = Some(principal.clone());
+        self
     }
 }
 
@@ -145,7 +173,13 @@ pub(super) async fn elicit_consent(peer: &Peer<RoleServer>, request: &IngressReq
         return false;
     }
 
-    match super::form_elicitation::elicit::<IngressForm>(peer, request.prompt()).await {
+    match super::form_elicitation::elicit::<IngressForm>(
+        peer,
+        request.prompt(),
+        &request.consent_display(),
+    )
+    .await
+    {
         Ok(Some(form)) => {
             debug!(allow = form.allow, "MCP shim: ingress consent resolved");
             form.allow
@@ -223,9 +257,50 @@ mod tests {
         let req = IngressRequest {
             source_id: "src-1".into(),
             tool_name: "shell.exec".into(),
+            principal: None,
         };
         let p = req.prompt();
         assert!(p.contains("shell.exec"));
         assert!(p.contains("Allow Astrid tool calls"));
+    }
+
+    #[test]
+    fn ingress_identity_comes_from_authenticated_context_not_reply_fields() {
+        let request = IngressRequest::from_reply(&json!({
+            "ingress_approval_required": true,
+            "source_id": "00000000-0000-0000-0000-000000000000",
+            "tool_name": "fs.read",
+            "principal": "foreign-owner"
+        }))
+        .expect("ingress signal");
+        assert!(request.principal.is_none());
+        let principal = PrincipalId::new("claude-code").expect("principal");
+        let request = request.with_principal(&principal);
+        let prompt = request.prompt();
+        assert!(prompt.contains("Principal: claude-code"));
+        assert!(prompt.contains("Ingress source: 00000000-0000-0000-0000-000000000000"));
+        assert!(!prompt.contains("Session ingress:"));
+        assert!(!prompt.contains("foreign-owner"));
+        let display = serde_json::to_value(request.consent_display()).expect("display");
+        assert_eq!(display["principal"], "claude-code");
+        assert!(display.get("source_id").is_none());
+    }
+
+    #[test]
+    fn ingress_consent_discloses_persistent_trust() {
+        let request = IngressRequest::from_reply(&json!({
+            "ingress_approval_required": true,
+            "source_id": "src-1",
+            "tool_name": "fs.read"
+        }))
+        .expect("ingress signal");
+        let prompt = request.prompt();
+        assert!(prompt.starts_with(
+            "This MCP ingress approval persists across reconnects and runtime restarts."
+        ));
+        assert!(!prompt.contains("from this session?"));
+        let display = serde_json::to_value(request.consent_display()).expect("display");
+        assert_eq!(display["choices"][0]["lifetime"], "durable");
+        assert_eq!(display["choices"][1]["lifetime"], "none");
     }
 }

@@ -8,11 +8,19 @@ mod identity;
 /// `astrid-capsule-install` library so the daemon and the CLI reach
 /// disk through the same code path.
 mod install;
+mod install_batch;
+mod install_batch_archive;
+mod install_generation;
+#[cfg(test)]
+mod install_generation_cas_tests;
+mod installed_identity;
 mod inventory;
 mod projection_names;
 mod rate_limit;
+mod request_policy;
 /// Kernel-response publishing envelope + the long-request keepalive pinger.
 mod response;
+mod resume_receipt;
 mod visibility;
 
 pub(crate) use identity::{
@@ -24,6 +32,10 @@ pub(crate) use identity::{arm_authorize_identity_gate, arm_confirm_policy_identi
 pub(crate) use rate_limit::ManagementRateLimiter;
 #[cfg(test)]
 pub(crate) use rate_limit::rate_limit_for_request;
+pub use request_policy::{
+    AuthorityScope, kernel_request_method, required_capability, resolve_scope,
+};
+use request_policy::{omit_success_admin_audit, request_target_principal};
 pub(crate) use response::{
     KeepalivePinger, publish_response, publish_response_value, workspace_commit_response,
 };
@@ -31,6 +43,7 @@ pub(crate) use response::{
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use KernelRequest::{GetCapsuleInstallResumeReceipt as G, PutCapsuleInstallResumeReceipt as P};
 use astrid_audit::{AuditAction, AuditOutcome, AuthorizationProof};
 use astrid_core::principal::PrincipalId;
 use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
@@ -44,11 +57,13 @@ use connection_tracker::register_connection_tracker;
 #[cfg(test)]
 use connection_tracker::{ConnectionSignal, connection_signal};
 use device_scope::resolve_device_scope;
-use inventory::{durable_package_details, visible_inventory_manifests};
+use inventory::visible_inventory_manifests;
+use resume_receipt::{get as rg, put as rp};
 use visibility::CapsuleVisibility;
 
 #[cfg(test)]
 mod capability_catalog_tests;
+mod capsule_metadata;
 #[cfg(test)]
 mod connection_tracker_tests;
 #[cfg(test)]
@@ -86,6 +101,7 @@ pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> astrid_runtime:
 
     astrid_runtime::spawn(async move {
         let mut rate_limiter = ManagementRateLimiter::from_kernel(&kernel);
+        let mut install_batches = install_batch::InstallBatchRegistry::default();
 
         while let Some(event) = receiver.recv().await {
             let astrid_events::AstridEvent::Ipc { message, .. } = &*event else {
@@ -126,6 +142,7 @@ pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> astrid_runtime:
                     handle_request(
                         &kernel,
                         &mut rate_limiter,
+                        &mut install_batches,
                         message.topic.clone(),
                         caller,
                         device_key_id,
@@ -168,6 +185,7 @@ fn response_topic_for(request_topic: &str) -> Topic {
 async fn handle_request(
     kernel: &Arc<crate::Kernel>,
     rate_limiter: &mut ManagementRateLimiter,
+    install_batches: &mut install_batch::InstallBatchRegistry,
     topic: Topic,
     caller: PrincipalId,
     device_key_id: Option<String>,
@@ -183,48 +201,104 @@ async fn handle_request(
     let scope = resolve_scope(&req, &caller);
     let requested_target = request_target_principal(&req, &caller);
     let required_cap = required_capability(&req, scope);
-    let authorization =
-        match authorize_request(kernel, &caller, device_key_id.as_deref(), required_cap) {
-            Ok(authorization) => authorization,
-            Err(e) => {
-                warn!(
-                    security_event = true,
-                    method = method,
-                    principal = %caller,
-                    required = required_cap,
-                    "Permission check denied admin request"
-                );
-                record_admin_audit(
-                    kernel,
-                    AdminAuditEntry {
-                        caller: &caller,
-                        method,
-                        required_cap,
-                        device_key_id: device_key_id.as_deref(),
-                        target_principal: requested_target.clone(),
-                        params: None,
-                        authorization: AuthorizationProof::Denied {
-                            reason: e.to_string(),
-                        },
-                        outcome: AuditOutcome::failure(e.to_string()),
+    let install_authorization =
+        authorize_request(kernel, &caller, device_key_id.as_deref(), required_cap);
+    // Install secrets are staged in the host-wide Shared namespace, not the
+    // target principal's namespace. Install permission must never substitute
+    // for the same global env authority required by an explicit Shared write.
+    let (required_cap, checked_authorization) = match install_authorization {
+        Ok(authorization)
+            if matches!(&req, KernelRequest::InstallCapsule { env, .. }
+                if env.iter().any(|value| value.kind == astrid_core::kernel_api::EnvValueKind::Secret)) =>
+        {
+            ("env:write", authorization.require_shared_env_write())
+        },
+        result => (required_cap, result),
+    };
+    let authorization = match checked_authorization {
+        Ok(authorization) => authorization,
+        Err(e) => {
+            warn!(
+                security_event = true,
+                method = method,
+                principal = %caller,
+                required = required_cap,
+                "Permission check denied admin request"
+            );
+            record_admin_audit(
+                kernel,
+                AdminAuditEntry {
+                    caller: &caller,
+                    method,
+                    required_cap,
+                    device_key_id: device_key_id.as_deref(),
+                    target_principal: requested_target.clone(),
+                    params: None,
+                    authorization: AuthorizationProof::Denied {
+                        reason: e.to_string(),
                     },
-                )
-                .await;
-                publish_response(
-                    kernel,
-                    response_topic,
-                    caller.as_str(),
-                    device_key_id.as_deref(),
-                    KernelResponse::Error(e.to_string()),
-                );
-                return;
-            },
-        };
+                    outcome: AuditOutcome::failure(e.to_string()),
+                },
+            )
+            .await;
+            publish_response(
+                kernel,
+                response_topic,
+                caller.as_str(),
+                device_key_id.as_deref(),
+                KernelResponse::Error(e.to_string()),
+            );
+            return;
+        },
+    };
 
     let authorization_proof = AuthorizationProof::System {
         reason: format!("policy allow: {caller} holds {required_cap}"),
     };
-    let (rate_method, limit) = rate_limiter.limit_for(&req);
+    let batch_reservation = match &req {
+        KernelRequest::InstallCapsule {
+            source,
+            target_principal,
+            provenance,
+            batch: Some(context),
+            ..
+        } => {
+            let target = target_principal.as_ref().unwrap_or(&caller);
+            match install_batches.reserve(&caller, target, context, source, provenance.as_ref()) {
+                Ok(member) => Some(member),
+                Err(reason) => {
+                    record_admin_audit(
+                        kernel,
+                        AdminAuditEntry {
+                            caller: &caller,
+                            method,
+                            required_cap,
+                            device_key_id: device_key_id.as_deref(),
+                            target_principal: requested_target.clone(),
+                            params: None,
+                            authorization: authorization_proof.clone(),
+                            outcome: AuditOutcome::failure(reason.clone()),
+                        },
+                    )
+                    .await;
+                    publish_response(
+                        kernel,
+                        response_topic,
+                        caller.as_str(),
+                        device_key_id.as_deref(),
+                        KernelResponse::Error(reason),
+                    );
+                    return;
+                },
+            }
+        },
+        _ => None,
+    };
+    let (rate_method, ordinary_limit) = rate_limiter.limit_for(&req);
+    let limit = batch_reservation
+        .is_none()
+        .then_some(ordinary_limit)
+        .flatten();
     if let Some(max) = limit
         && !rate_limiter.check(&caller, rate_method, max)
     {
@@ -293,8 +367,25 @@ async fn handle_request(
         &caller,
         device_key_id.as_deref(),
     );
-
     let res = match req {
+        KernelRequest::BeginCapsuleInstallBatch {
+            target_principal,
+            members,
+        } => {
+            let target = target_principal.as_ref().unwrap_or(&caller);
+            match kernel.principal_directory.uid_for(target) {
+                Err(error) => KernelResponse::Error(format!(
+                    "resolve capsule install batch target {target}: {error}"
+                )),
+                Ok(_) => match install_batches.begin(&caller, target, members) {
+                    Ok(lease) => KernelResponse::CapsuleInstallBatchStarted {
+                        batch_id: lease.batch_id,
+                        expires_in_secs: lease.expires_in_secs,
+                    },
+                    Err(error) => KernelResponse::Error(error),
+                },
+            }
+        },
         KernelRequest::InstallCapsule {
             source,
             workspace,
@@ -302,6 +393,8 @@ async fn handle_request(
             provenance,
             authority,
             env,
+            expected_generation,
+            batch,
         } => {
             info!(
                 source = %source,
@@ -309,20 +402,63 @@ async fn handle_request(
                 target = ?target_principal,
                 "Kernel received install request"
             );
-            install::handle_install_capsule(
-                kernel,
-                install::InstallCapsuleRequest {
-                    caller: &caller,
-                    requested_target: target_principal.as_ref(),
-                    source: &source,
-                    workspace,
-                    provenance: provenance.as_ref(),
-                    authority,
-                    env: &env,
-                },
-            )
-            .await
+            let target = target_principal.as_ref().unwrap_or(&caller);
+            if let Some(install_batch::InstallBatchReservation::Completed(member)) =
+                batch_reservation.as_ref()
+            {
+                match install_batch::verified_installed_member(kernel, target, member) {
+                    Ok(Some(installed)) => KernelResponse::Success(installed.response_json()),
+                    Ok(None) => KernelResponse::Error(format!(
+                        "completed capsule install batch member '{}' no longer matches its durable package",
+                        member.id
+                    )),
+                    Err(error) => KernelResponse::Error(error),
+                }
+            } else {
+                let response = install::handle_install_capsule(
+                    kernel,
+                    install::InstallCapsuleRequest {
+                        caller: &caller,
+                        requested_target: target_principal.as_ref(),
+                        source: &source,
+                        workspace,
+                        provenance: provenance.as_ref(),
+                        authority,
+                        env: &env,
+                        expected_generation: expected_generation.as_ref(),
+                        batch_member: batch_reservation
+                            .as_ref()
+                            .map(install_batch::InstallBatchReservation::member),
+                    },
+                )
+                .await;
+                if matches!(response, KernelResponse::Success(_))
+                    && let Some(context) = batch.as_ref()
+                    && let Err(error) = install_batches.complete(context)
+                {
+                    KernelResponse::Error(error)
+                } else {
+                    response
+                }
+            }
         },
+        KernelRequest::FinishCapsuleInstallBatch {
+            batch_id,
+            target_principal,
+        } => {
+            let target = target_principal.as_ref().unwrap_or(&caller);
+            match install_batches.finish(&caller, target, batch_id, |target, member| {
+                install_batch::installed_member_matches(kernel, target, member)
+            }) {
+                Ok(()) => KernelResponse::Success(serde_json::json!({"status": "complete"})),
+                Err(error) => KernelResponse::Error(error),
+            }
+        },
+        KernelRequest::GetInstalledCapsuleIdentity { id } => {
+            installed_identity::handle(kernel, &caller, &id)
+        },
+        G { id } => rg(kernel, &caller, &id).await,
+        P { receipt } => rp(kernel, &caller, receipt).await,
         KernelRequest::ApproveCapability {
             request_id,
             signature: _,
@@ -413,21 +549,23 @@ async fn handle_request(
                 Err(e) => KernelResponse::Error(format!("invalid capsule id '{id}': {e}")),
             }
         },
-        KernelRequest::RemoveCapsule { id, force: _ } => {
-            match astrid_capsule::capsule::CapsuleId::new(id.clone()) {
-                Ok(cap_id) => match kernel.remove_one_capsule(&cap_id, &caller).await {
-                    Ok(true) => KernelResponse::Success(
-                        serde_json::json!({"status": "removed", "capsule": id}),
-                    ),
-                    Ok(false) => KernelResponse::Error(format!(
-                        "capsule '{id}' is not installed for principal '{caller}'"
-                    )),
-                    Err(error) => {
-                        KernelResponse::Error(format!("remove of capsule '{id}' failed: {error}"))
-                    },
+        KernelRequest::RemoveCapsule {
+            id,
+            force: _,
+            purge,
+        } => match astrid_capsule::capsule::CapsuleId::new(id.clone()) {
+            Ok(cap_id) => match kernel.remove_one_capsule(&cap_id, &caller, purge).await {
+                Ok(true) => {
+                    KernelResponse::Success(serde_json::json!({"status": "removed", "capsule": id}))
                 },
-                Err(error) => KernelResponse::Error(format!("invalid capsule id '{id}': {error}")),
-            }
+                Ok(false) => KernelResponse::Error(format!(
+                    "capsule '{id}' is not installed for principal '{caller}'"
+                )),
+                Err(error) => {
+                    KernelResponse::Error(format!("remove of capsule '{id}' failed: {error}"))
+                },
+            },
+            Err(error) => KernelResponse::Error(format!("invalid capsule id '{id}': {error}")),
         },
         KernelRequest::PromoteWorkspace { id } => {
             workspace_commit_response(kernel, &caller, &id, true).await
@@ -479,86 +617,17 @@ async fn handle_request(
                     .unwrap_or(u32::MAX),
                 connections_by_principal: by_principal,
                 loaded_capsules: loaded,
+                capsule_install_batch_protocol: Some(
+                    astrid_core::kernel_api::CAPSULE_INSTALL_BATCH_PROTOCOL_V1,
+                ),
             };
             KernelResponse::Status(status)
         },
         KernelRequest::GetCapsuleMetadata => {
-            let visibility = CapsuleVisibility::new(&authorization);
-            let manifests = visible_inventory_manifests(kernel, &visibility).await;
-            let registry = kernel.capsules.read().await;
-            let owner_uid = kernel.principal_directory.uid_for(&caller).ok();
-            let mut entries = Vec::new();
-            for manifest in manifests {
-                let source_id =
-                    astrid_capsule::capsule::CapsuleId::new(manifest.package.name.clone())
-                        .ok()
-                        .and_then(|id| registry.source_id_for(&caller, &id));
-                let env = manifest
-                    .env
-                    .iter()
-                    .map(|(name, def)| {
-                        (
-                            name.clone(),
-                            astrid_events::kernel_api::CapsuleEnvMetadata {
-                                env_type: def.env_type.clone(),
-                                request: def.request.clone(),
-                                description: def.description.clone(),
-                                default: def.default.clone(),
-                                enum_values: def.enum_values.clone(),
-                                placeholder: def.placeholder.clone(),
-                            },
-                        )
-                    })
-                    .collect();
-                let (wit_hashes, wasm_hash, update_source) =
-                    durable_package_details(kernel, owner_uid, &manifest.package.name);
-                entries.push(astrid_events::kernel_api::CapsuleMetadataEntry {
-                    name: manifest.package.name.clone(),
-                    capabilities: serde_json::to_value(&manifest.capabilities)
-                        .unwrap_or(serde_json::Value::Null),
-                    version: manifest.package.version.clone(),
-                    description: manifest.package.description.clone(),
-                    interceptor_events: manifest
-                        .subscribes
-                        .iter()
-                        .filter(|(_, def)| def.handler.is_some())
-                        .map(|(topic, _)| topic.clone())
-                        .collect(),
-                    imports: manifest
-                        .imports
-                        .iter()
-                        .map(|(namespace, interfaces)| {
-                            (
-                                namespace.clone(),
-                                interfaces
-                                    .iter()
-                                    .map(|(name, def)| (name.clone(), def.version.to_string()))
-                                    .collect(),
-                            )
-                        })
-                        .collect(),
-                    exports: manifest
-                        .exports
-                        .iter()
-                        .map(|(namespace, interfaces)| {
-                            (
-                                namespace.clone(),
-                                interfaces
-                                    .iter()
-                                    .map(|(name, def)| (name.clone(), def.version.to_string()))
-                                    .collect(),
-                            )
-                        })
-                        .collect(),
-                    env,
-                    wit_hashes,
-                    wasm_hash,
-                    update_source,
-                    source_id,
-                    owner_uid,
-                });
-            }
-            KernelResponse::CapsuleMetadata(entries)
+            capsule_metadata::response(kernel, &authorization, None).await
+        },
+        KernelRequest::GetCapsuleMetadataForPrincipal { target_principal } => {
+            capsule_metadata::response(kernel, &authorization, Some(&target_principal)).await
         },
         KernelRequest::GetAgentReadiness => {
             let visibility = CapsuleVisibility::new(&authorization);
@@ -623,137 +692,6 @@ async fn unregister_failed_capsules(kernel: &crate::Kernel) {
     let mut reg = kernel.capsules.write().await;
     for (principal, id) in failed {
         let _ = reg.unregister_for(&principal, &id);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Management API capability enforcement (issue #670)
-// ---------------------------------------------------------------------------
-
-/// The authority surface a given [`KernelRequest`] operates over.
-///
-/// Most `KernelRequest` variants carry no target-principal field, so
-/// [`resolve_scope`] treats caller-scoped requests as [`AuthorityScope::Self_`].
-/// Full-daemon mutations stay global.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthorityScope {
-    /// Request operates on the caller's own principal.
-    Self_,
-    /// Request operates on global/system-wide state (e.g. shutdown).
-    Global,
-}
-
-/// Return the authority scope the caller is exercising for `req`.
-///
-/// A daemon-side capsule install defaults to the authenticated caller's
-/// principal. Selecting another principal is a global operation and therefore
-/// requires the global install capability. Workspace installs remain
-/// self-scoped; the daemon rejects them later because it has no meaningful
-/// current workspace.
-#[must_use]
-pub fn resolve_scope(req: &KernelRequest, caller: &PrincipalId) -> AuthorityScope {
-    match req {
-        KernelRequest::ReloadCapsules => AuthorityScope::Global,
-        KernelRequest::InstallCapsule {
-            target_principal: Some(target),
-            ..
-        } if target != caller => AuthorityScope::Global,
-        _ => AuthorityScope::Self_,
-    }
-}
-
-/// Return an explicit cross-principal target for audit records.
-fn request_target_principal(req: &KernelRequest, caller: &PrincipalId) -> Option<PrincipalId> {
-    match req {
-        KernelRequest::InstallCapsule {
-            target_principal: Some(target),
-            ..
-        } if target != caller => Some(target.clone()),
-        _ => None,
-    }
-}
-
-/// Return the static capability string required to satisfy `req` under
-/// `scope`.
-///
-/// Pure function so the capability mapping can be unit-tested in
-/// isolation. Every `KernelRequest` variant is covered; there is no
-/// default-allow branch.
-#[must_use]
-pub fn required_capability(req: &KernelRequest, scope: AuthorityScope) -> &'static str {
-    match (req, scope) {
-        (KernelRequest::Shutdown { .. }, _) => "system:shutdown",
-        (KernelRequest::GetStatus, _) => "system:status",
-        (
-            KernelRequest::ReloadCapsules | KernelRequest::ReloadCapsule { .. },
-            AuthorityScope::Self_,
-        ) => "self:capsule:reload",
-        (KernelRequest::ReloadCapsules | KernelRequest::ReloadCapsule { .. }, _) => {
-            "capsule:reload"
-        },
-        (
-            KernelRequest::UnloadCapsule { .. } | KernelRequest::RemoveCapsule { .. },
-            AuthorityScope::Self_,
-        ) => "self:capsule:remove",
-        (KernelRequest::UnloadCapsule { .. } | KernelRequest::RemoveCapsule { .. }, _) => {
-            "capsule:remove"
-        },
-        // Promote/rollback are self-scoped (no target-principal field), so
-        // `resolve_scope` always yields `Self_`; the `_` arm is for exhaustiveness.
-        (KernelRequest::PromoteWorkspace { .. }, _) => "self:workspace:promote",
-        (KernelRequest::RollbackWorkspace { .. }, _) => "self:workspace:rollback",
-        (KernelRequest::InstallCapsule { .. }, AuthorityScope::Self_) => "self:capsule:install",
-        (KernelRequest::InstallCapsule { .. }, _) => "capsule:install",
-        (
-            KernelRequest::ListCapsules
-            | KernelRequest::GetCommands
-            | KernelRequest::GetCapsuleMetadata
-            | KernelRequest::GetAgentReadiness,
-            AuthorityScope::Self_,
-        ) => "self:capsule:list",
-        (
-            KernelRequest::ListCapsules
-            | KernelRequest::GetCommands
-            | KernelRequest::GetCapsuleMetadata
-            | KernelRequest::GetAgentReadiness,
-            _,
-        ) => "capsule:list",
-        (KernelRequest::ApproveCapability { .. }, _) => "self:approval:respond",
-    }
-}
-
-/// Successful liveness probes are not durable admin rows.
-///
-/// `GetStatus` is `aos status` / `astrid status` / doctor roundtrip.
-/// `GetAgentReadiness` is doctor + gateway `/api/sys/readiness`.
-/// `GetCapsuleMetadata`, `Shutdown`, install/reload, and `admin.group.*`
-/// stay audited on success.
-fn omit_success_admin_audit(req: &KernelRequest) -> bool {
-    matches!(
-        req,
-        KernelRequest::GetStatus | KernelRequest::GetAgentReadiness
-    )
-}
-
-/// Short identifier for a [`KernelRequest`] variant, used for rate-limit
-/// labels and audit method names.
-#[must_use]
-pub fn kernel_request_method(req: &KernelRequest) -> &'static str {
-    match req {
-        KernelRequest::ReloadCapsules => "ReloadCapsules",
-        KernelRequest::ReloadCapsule { .. } => "ReloadCapsule",
-        KernelRequest::UnloadCapsule { .. } => "UnloadCapsule",
-        KernelRequest::RemoveCapsule { .. } => "RemoveCapsule",
-        KernelRequest::PromoteWorkspace { .. } => "PromoteWorkspace",
-        KernelRequest::RollbackWorkspace { .. } => "RollbackWorkspace",
-        KernelRequest::InstallCapsule { .. } => "InstallCapsule",
-        KernelRequest::ApproveCapability { .. } => "ApproveCapability",
-        KernelRequest::ListCapsules => "ListCapsules",
-        KernelRequest::GetCommands => "GetCommands",
-        KernelRequest::GetCapsuleMetadata => "GetCapsuleMetadata",
-        KernelRequest::GetAgentReadiness => "GetAgentReadiness",
-        KernelRequest::Shutdown { .. } => "Shutdown",
-        KernelRequest::GetStatus => "GetStatus",
     }
 }
 
@@ -886,6 +824,10 @@ async fn record_admin_audit(kernel: &crate::Kernel, entry: AdminAuditEntry<'_>) 
 }
 #[cfg(test)]
 mod get_status_audit_tests;
+#[cfg(test)]
+mod install_audit_tests;
+#[cfg(test)]
+mod install_env_activation_tests;
 #[cfg(test)]
 mod reload_rate_limit_tests;
 #[cfg(test)]

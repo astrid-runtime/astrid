@@ -4,6 +4,8 @@
 
 pub(crate) mod headless;
 mod input;
+#[cfg(test)]
+mod registry_label_tests;
 mod render;
 pub(crate) mod state;
 mod theme;
@@ -334,6 +336,7 @@ pub(crate) fn handle_daemon_event(app: &mut App, message: &IpcMessage) {
             action,
             resource,
             reason,
+            ..
         } = &message.payload
         {
             let approval = state::ApprovalRequest {

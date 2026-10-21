@@ -35,6 +35,7 @@ async fn fixture() -> (TempDir, Arc<Kernel>) {
         ))
         .expect("seed default admin profile");
     kernel.profile_cache.invalidate(&PrincipalId::default());
+    super::test_support::seed_operator(&kernel).await;
     (dir, kernel)
 }
 
@@ -64,7 +65,7 @@ fn assert_error_contains(res: &AdminResponseBody, needle: &str) {
 
 /// Create an agent principal so a token can be minted for it.
 async fn create_agent(kernel: &Arc<Kernel>, name: &str) {
-    let res = handlers::dispatch(
+    let res = super::test_support::dispatch_as_operator(
         kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentCreate {

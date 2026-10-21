@@ -15,6 +15,9 @@ use crate::formatter::OutputFormat;
 use crate::socket_client;
 use crate::theme;
 
+/// The host owns no model identity. Registry IPC owns the first real label.
+const INITIAL_TUI_MODEL_LABEL: &str = "";
+
 /// Ensure `~/.astrid/` exists without selecting product composition.
 #[allow(clippy::unused_async)]
 pub(crate) async fn ensure_global_config() -> Result<()> {
@@ -33,44 +36,22 @@ pub(crate) fn init_logging(cli: &Cli) {
     .ok()
     .map(|r| r.config);
 
-    let needs_file_log = matches!(cli.command, Some(crate::cli::Commands::Chat { .. }) | None);
-
-    let log_config = if let Some(cfg) = &unified_cfg {
+    let mut log_config = if let Some(cfg) = &unified_cfg {
         let mut lc = astrid_telemetry::log_config_from(cfg);
         if cli.verbose {
             "debug".clone_into(&mut lc.level);
         }
-        if needs_file_log && let Ok(home) = astrid_core::dirs::AstridHome::resolve() {
-            lc.target = astrid_telemetry::LogTarget::File(home.log_dir());
-        }
         lc
     } else {
         let level = if cli.verbose { "debug" } else { "info" };
-        let mut lc = astrid_telemetry::LogConfig::new(level)
-            .with_format(astrid_telemetry::LogFormat::Compact);
-        if needs_file_log && let Ok(home) = astrid_core::dirs::AstridHome::resolve() {
-            lc.target = astrid_telemetry::LogTarget::File(home.log_dir());
-        }
-        lc
+        astrid_telemetry::LogConfig::new(level).with_format(astrid_telemetry::LogFormat::Compact)
     };
 
-    // `mcp serve` owns stdout for the MCP JSON-RPC stream. A stray log
-    // frame on stdout corrupts the protocol irrecoverably, so force
-    // diagnostics off stdout regardless of operator config — to the log
-    // file when a home is resolvable, else stderr.
-    let mut log_config = log_config;
-    if matches!(
-        cli.command,
-        Some(crate::cli::Commands::Mcp {
-            command: crate::cli::McpCommands::Serve { .. }
-        })
-    ) && matches!(log_config.target, astrid_telemetry::LogTarget::Stdout)
-    {
-        log_config.target = match astrid_core::dirs::AstridHome::resolve() {
-            Ok(home) => astrid_telemetry::LogTarget::File(home.log_dir()),
-            Err(_) => astrid_telemetry::LogTarget::Stderr,
-        };
-    }
+    // Only the daemon owns the durable home's running projection. Opening a
+    // CLI file logger before admission creates a sidecar in a stopped root;
+    // keeping one open can also race the daemon's retirement. CLI diagnostics
+    // stay on stderr, preserving stdout for JSON, headless output and MCP.
+    log_config.target = astrid_telemetry::LogTarget::Stderr;
 
     if let Err(e) = astrid_telemetry::setup_logging(&log_config) {
         eprintln!("Failed to initialize logging: {e}");
@@ -253,19 +234,17 @@ pub(crate) async fn run_or_connect(
         },
     };
 
-    let model_name = astrid_config::Config::load_with_layout(
-        workspace_root.as_deref(),
-        crate::workspace_layout::current(),
-    )
-    .ok()
-    .map_or_else(|| "unknown".to_string(), |r| r.config.model.model);
-
-    crate::commands::chat::run_chat(&mut client, &session_id, &model_name, format).await
+    crate::commands::chat::run_chat(&mut client, &session_id, INITIAL_TUI_MODEL_LABEL, format).await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::selected_workspace_root;
+    use super::{INITIAL_TUI_MODEL_LABEL, selected_workspace_root};
+
+    #[test]
+    fn interactive_tui_starts_without_a_host_model_label() {
+        assert_eq!(INITIAL_TUI_MODEL_LABEL, "");
+    }
 
     #[test]
     fn explicit_workspace_root_wins_over_current_directory() {

@@ -154,7 +154,7 @@ impl RepresentationStore {
     }
 }
 
-fn generation_region(generation: &str, file: &str) -> String {
+pub(super) fn generation_region(generation: &str, file: &str) -> String {
     format!("{DIRECTORY}/{GENERATIONS_DIRECTORY}/{generation}/{file}")
 }
 
@@ -166,7 +166,7 @@ fn region_exists(volume: &Arc<dyn AstridVolume>, name: &str) -> Result<bool, Dur
         .map_err(|source| io_error("inspect volume representation region", source))
 }
 
-fn remove_region_if_present(
+pub(super) fn remove_region_if_present(
     volume: &Arc<dyn AstridVolume>,
     name: &str,
 ) -> Result<(), DurableError> {

@@ -20,7 +20,41 @@ Each `AuditEntry` contains:
 
 Verification checks three invariants per session: valid genesis (first entry has zero previous hash), valid signatures (each entry's embedded public key verifies its signature), and unbroken links (each entry's `previous_hash` matches the preceding entry's content hash). Each failure is a typed `ChainIssue`.
 
-Entries embed the signing key, so verification works across key rotations. A log started under key A and continued under key B verifies correctly because each entry carries the key that signed it.
+Format v1 entries embed the signing key, so verification works across key rotations. A log started under key A and continued under key B verifies correctly because each entry carries the key that signed it. Format v2 entries also name their key, but only as a selector: the key must be registered for the audit role (see below).
+
+## Entry format v2
+
+Format v1 has limits for verification outside Astrid:
+
+- it signs a mix of binary fields and JSON;
+- it signs one success bit instead of the outcome;
+- it signs whole-second time;
+- it has no sequence number;
+- it trusts the key embedded in each entry, so anyone who can write the store
+  can re-sign a rewritten chain.
+
+Format v2 (`entry_v2`, off by default) replaces that with:
+
+- a deterministic CBOR body (RFC 8949 §4.2.1) that covers every stored field:
+  - chain id bound to the registry, session, principal UID and alias;
+  - per-chain sequence number and previous hash;
+  - nanosecond time;
+  - acting capsule;
+  - action, authorization and full outcome;
+- a salted commitment for every field value, so one field can be
+  disclosed without the others;
+- SHA-256 entry hashes and Ed25519 signatures checked with strict
+  verification, made by a dedicated audit key;
+- a key registry: a cross-signed chain of records that binds keys to roles
+  (audit, capability, build, v1 audit). `ChainVerifier` rejects entries
+  signed by a key the registry does not list for the audit role at the
+  entry's key epoch.
+
+`AuditLog::enable_entry_v2` switches a log to v2. v1 history is kept as it is
+and hash-linked into the v2 chains that follow it; after that the log refuses
+v1 appends. The crate documentation of `entry_v2` is the byte-level
+specification, with a known-answer test for implementations in other
+languages.
 
 ## What gets audited
 

@@ -175,7 +175,9 @@ run_old_capsule_build_bounded() {
     || fail "capsule build toolchain was not initialized"
   (
     cd -- "${WORKSPACE}"
-    run_with_timeout "${limit}" env ASTRID_HOME="${ASTRID_HOME}" HOME="${POISON_HOME}" \
+    # Isolate runtime state, not Cargo's shared host cache and configuration.
+    # Runtime-only calls below still use POISON_HOME to test home resolution.
+    run_with_timeout "${limit}" env ASTRID_HOME="${ASTRID_HOME}" \
       RUSTUP_HOME="${CAPSULE_RUSTUP_HOME}" "${OLD_BIN_DIR}/astrid" "$@"
   )
 }
@@ -461,20 +463,24 @@ grep -Fq 'upgrade-restart-probe' "${TEST_ROOT}/agents-after-restart.json" \
   || fail "post-upgrade write did not survive restart"
 grep -Fq 'upgrade-second-alias' "${TEST_ROOT}/agents-after-restart.json" \
   || fail "second post-upgrade principal did not survive restart"
-run_current_bounded 20s stop
 
 python3 - "${ASTRID_HOME}" <<'PY'
 import json
+import stat
 import pathlib
 import sys
 
 home = pathlib.Path(sys.argv[1])
-if (home / "etc/layout-version").read_bytes() != b"2":
-    raise SystemExit("layout-version is not exactly 2")
-if not (home / "var/astrid.volume").is_file():
-    raise SystemExit("Astrid volume is absent after upgrade")
-if (home / "var/astrid.volume").stat().st_size == 0:
+volume = home / "astrid.volume"
+volume_meta = volume.lstat()
+if stat.S_ISLNK(volume_meta.st_mode) or not stat.S_ISREG(volume_meta.st_mode):
+    raise SystemExit("Astrid volume is redirected or not a regular file")
+if volume_meta.st_size == 0:
     raise SystemExit("Astrid volume is empty after upgrade")
+if stat.S_IMODE(volume_meta.st_mode) != 0o600:
+    raise SystemExit("Astrid volume is not private")
+if (home / "etc/layout-version").read_bytes() != b"2":
+    raise SystemExit("projected layout-version is not exactly 2")
 if (home / "var/state.db").exists():
     raise SystemExit("released var/state.db survived verified retirement")
 if (home / "var/principal-store").exists():
@@ -677,6 +683,28 @@ if receipt.get("destination", {}).get("bytes", 0) <= 0:
     raise SystemExit("migration receipt does not bind a non-empty volume")
 PY
 
+run_current_bounded 20s stop
+
+python3 - "${ASTRID_HOME}" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+home = pathlib.Path(sys.argv[1])
+entries = sorted(os.listdir(home))
+if entries != ["astrid.volume"]:
+    raise SystemExit(f"stopped Astrid root has sidecars: {entries}")
+volume = home / "astrid.volume"
+meta = volume.lstat()
+if stat.S_ISLNK(meta.st_mode) or not stat.S_ISREG(meta.st_mode):
+    raise SystemExit("stopped Astrid volume is redirected or not a regular file")
+if stat.S_IMODE(meta.st_mode) != 0o600:
+    raise SystemExit(f"stopped Astrid volume mode is {stat.S_IMODE(meta.st_mode):04o}, expected 0600")
+if meta.st_size == 0:
+    raise SystemExit("stopped Astrid volume is empty")
+PY
+
 
 attempt_mount_round_trip() {
   local provider="${CURRENT_BIN_DIR}/astrid-storage-provider-fskit"
@@ -702,7 +730,11 @@ attempt_mount_round_trip() {
   if [[ ${mount_status} -eq 0 ]]; then
     grep -Eq '^mounted [0-9a-f-]{36} at ' "${TEST_ROOT}/mount.log" \
       || fail "mount succeeded without a lease id"
-    [[ "$(stat -f %T "${MOUNTPOINT}")" == astridfs ]] \
+    # BSD stat's %T is a file-type marker ("/" for directories), not the
+    # filesystem name. Bind the kernel mount table to the canonical target.
+    local canonical_mountpoint
+    canonical_mountpoint="$(cd -- "${MOUNTPOINT}" && pwd -P)"
+    [[ "$(/sbin/mount)" == *" on ${canonical_mountpoint} (astridfs,"* ]] \
       || fail "mount succeeded but the mountpoint is not astridfs"
     printf 'upgrade-mount-probe\n' >"${MOUNTPOINT}/upgrade-mount-probe.txt"
     run_current storage sync "${MOUNTPOINT}"

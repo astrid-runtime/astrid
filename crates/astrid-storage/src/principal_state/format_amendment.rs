@@ -99,6 +99,32 @@ const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 14] = [
     PRE_RESERVED_REPRESENTATION_TAG_FORMAT_SPEC_ID,
 ];
 
+/// Known predecessors whose direct-canonical recipe is unchanged.
+///
+/// Older arena-only specifications are not catalogue compatibility grants.
+/// Owner and object-kind amendments after dense-radix activation preserve the
+/// canonical object encoding; the engine still verifies persisted bootstrap
+/// objects and every representation before retaining an active profile.
+pub(super) const DIRECT_CATALOGUE_PREDECESSORS: &[ObjectId] = &[
+    PRE_DENSE_RADIX_FORMAT_SPEC_ID,
+    PRE_FLEET_OWNER_FORMAT_SPEC_ID,
+    PRE_WORKSPACE_BRANCH_FORMAT_SPEC_ID,
+    PRE_RESERVED_REPRESENTATION_TAG_FORMAT_SPEC_ID,
+];
+
+#[cfg(test)]
+#[test]
+fn direct_catalogue_predecessors_cover_post_dense_format_amendments() {
+    let dense = PRIOR_V1_FORMAT_SPEC_IDS
+        .iter()
+        .position(|id| *id == PRE_DENSE_RADIX_FORMAT_SPEC_ID)
+        .unwrap();
+    assert_eq!(
+        DIRECT_CATALOGUE_PREDECESSORS,
+        &PRIOR_V1_FORMAT_SPEC_IDS[dense..]
+    );
+}
+
 pub(super) fn format_spec_record() -> StorageResult<ObjectRecord> {
     ObjectRecord::new(
         ObjectKind::Evidence,

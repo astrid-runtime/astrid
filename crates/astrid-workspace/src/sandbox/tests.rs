@@ -243,6 +243,9 @@ fn wrap_with_injections_emits_ro_bind_pair() {
 #[cfg(target_os = "linux")]
 #[test]
 fn process_write_path_is_bound_read_write() {
+    if super::bwrap::require_bind_fd_support().is_err() {
+        return; // Argument generation requires the packaged descriptor-bind launcher.
+    }
     let root = tempfile::tempdir().expect("root");
     let workspace = root.path().join("workspace");
     let principal = root.path().join("principal");
@@ -260,8 +263,8 @@ fn process_write_path_is_bound_read_write() {
     .expect("wrap");
     let args: Vec<_> = wrapped.get_args().collect();
     assert!(args.windows(3).any(|window| {
-        window[0] == "--bind"
-            && window[1] == principal.as_os_str()
+        window[0] == "--bind-fd"
+            && window[1].to_string_lossy().parse::<i32>().is_ok()
             && window[2] == principal.as_os_str()
     }));
 }
@@ -767,14 +770,15 @@ fn mask_arg_uses_tmpfs_for_dir_and_dev_null_bind_for_file() {
 }
 
 /// On Linux the `--ro-bind / /` mount exposes the whole host FS read-only, so
-/// each sensitive Astrid subpath must be overlaid with an empty tmpfs. Without
+/// each sensitive Astrid path must be masked (empty tmpfs for directories, or
+/// a read-only /dev/null bind for files). Without
 /// this a spawned agent reads `~/.astrid/keys/<principal>.key` and impersonates
 /// any principal (issue #856). The masked set is existence-filtered, so this
 /// asserts every path the filter actually returns is wired into the bwrap args
 /// (rather than hardcoding dirs the test runner's home may not have).
 #[cfg(target_os = "linux")]
 #[test]
-fn linux_spawn_masks_sensitive_astrid_paths_with_tmpfs() {
+fn linux_spawn_masks_sensitive_astrid_paths() {
     let expected = SandboxCommand::sensitive_astrid_paths().expect("resolve astrid home");
     let wrapped = SandboxCommand::wrap(Command::new("echo"), Path::new("/tmp/ws")).expect("wrap");
     let args: Vec<String> = wrapped
@@ -783,12 +787,16 @@ fn linux_spawn_masks_sensitive_astrid_paths_with_tmpfs() {
         .collect();
     for path in &expected {
         let path_str = path.to_string_lossy();
-        let masked = args
-            .windows(2)
-            .any(|w| w[0] == "--tmpfs" && w[1] == path_str);
+        let masked = if path.is_dir() {
+            args.windows(2)
+                .any(|w| w[0] == "--tmpfs" && w[1] == path_str)
+        } else {
+            args.windows(3)
+                .any(|w| w[0] == "--ro-bind" && w[1] == "/dev/null" && w[2] == path_str)
+        };
         assert!(
             masked,
-            "expected `--tmpfs {path_str}` in bwrap args: {args:?}"
+            "expected sensitive-path mask for {path_str} in bwrap args: {args:?}"
         );
     }
 }

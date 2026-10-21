@@ -24,31 +24,107 @@ expect_principal_cli_success() {
   fi
 }
 
+expect_principal_cli_failure_containing() {
+  local principal=$1 label=$2 needle=$3
+  shift 3
+  expect_principal_cli_failure "$principal" "$label" "$@"
+  if ! grep -Fq -- "$needle" "$ARTIFACTS/$label.err" "$ARTIFACTS/$label.out"; then
+    cat "$ARTIFACTS/$label.out" >&2 || true
+    cat "$ARTIFACTS/$label.err" >&2 || true
+    fail "$label did not report: $needle"
+  fi
+}
+
 assert_principal_profile_absent() {
   local principal=$1
   local path="$ASTRID_HOME/etc/profiles/$principal.toml"
   [[ ! -e "$path" ]] || fail "denied principal create left profile behind: $path"
 }
 
-mint_admin_bearer() {
-  local token pubkey status
+bootstrap_device_pubkey() {
+  "$PYTHON" - "$ASTRID_HOME/etc/profiles/default.toml" <<'PY'
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+match = re.search(r'(?m)^\s*pubkey\s*=\s*"([0-9a-fA-F]{64})"', text)
+if match is None:
+    raise SystemExit(f"missing bootstrap device pubkey in {sys.argv[1]}")
+print(match.group(1).lower())
+PY
+}
+
+mint_pair_device_bearer() {
+  local label=$1
+  local pubkey=$2
+  local redeem_out=$3
+  local token status
   token="$("$CORE_DIR/target/debug/astrid" --principal default pair-device issue \
     --scope full \
-    --label "runtime e2e admin adversarial device" \
+    --label "$label" \
     --expires-secs 120 \
     --raw 2>> "$ARTIFACTS/cli-transcript.log")"
   printf '$ astrid --principal default pair-device issue --scope full --label <e2e> --expires-secs 120 --raw\n<redacted pair token>\n' \
     >> "$ARTIFACTS/cli-transcript.log"
+  status="$(http_status POST /api/auth/pair-device/redeem "" \
+    "{\"token\":\"$token\",\"public_key\":\"$pubkey\"}" \
+    "$redeem_out")"
+  assert_status "$label pair-device redeem" "$status" 200
+  json_field "$redeem_out" session_token
+}
+
+mint_admin_bearer() {
+  local pubkey
   pubkey="$("$PYTHON" - <<'PY'
 import secrets
 print(secrets.token_hex(32))
 PY
 )"
-  status="$(http_status POST /api/auth/pair-device/redeem "" \
-    "{\"token\":\"$token\",\"public_key\":\"$pubkey\"}" \
-    "$ARTIFACTS/adversarial-admin-pair-redeem.json")"
-  assert_status "admin pair-device redeem for adversarial checks" "$status" 200
-  json_field "$ARTIFACTS/adversarial-admin-pair-redeem.json" session_token
+  mint_pair_device_bearer "runtime e2e admin adversarial device" "$pubkey" \
+    "$ARTIFACTS/adversarial-admin-pair-redeem.json"
+}
+
+mint_local_user_device_bearer() {
+  local pubkey
+  pubkey="$(bootstrap_device_pubkey)"
+  mint_pair_device_bearer "runtime e2e local user device" "$pubkey" \
+    "$ARTIFACTS/local-user-device-pair-redeem.json"
+}
+
+assert_unbound_invite_reason() {
+  local file=$1
+  "$PYTHON" - "$file" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+reason = data.get("reason")
+prefix = "authenticated device has no user delegation for principal "
+if not isinstance(reason, str) or not reason.startswith(prefix) or len(reason) <= len(prefix):
+    raise SystemExit(f"expected UserDeviceNotBound invite denial, got {data!r}")
+PY
+}
+
+mint_delegated_invite_issuer_bearer() {
+  local ops_bearer=$1 status pair_only_bearer admin_bearer
+  status="$(http_status POST /api/sys/invites "$ops_bearer" \
+    '{"group":"agent","max_uses":1,"expires_secs":600}' \
+    "$ARTIFACTS/operator-issued-invite.json")"
+  assert_status "operator session invite issue denied" "$status" 403
+  json_assert_field_equals "$ARTIFACTS/operator-issued-invite.json" reason \
+    "invite issuance requires a user-delegated device"
+  pair_only_bearer="$(mint_admin_bearer)"
+  status="$(http_status POST /api/sys/invites "$pair_only_bearer" \
+    '{"group":"agent","max_uses":1,"expires_secs":600}' \
+    "$ARTIFACTS/admin-issued-invite-unbound.json")"
+  assert_status "pair-only device invite issue denied" "$status" 403
+  assert_unbound_invite_reason "$ARTIFACTS/admin-issued-invite-unbound.json"
+  admin_bearer="$(mint_local_user_device_bearer)"
+  status="$(http_status POST /api/sys/invites "$admin_bearer" \
+    '{"group":"agent","max_uses":1,"expires_secs":600}' \
+    "$ARTIFACTS/admin-issued-invite.json")"
+  assert_status "delegated-device invite issue" "$status" 200
+  printf '%s\n' "$admin_bearer"
 }
 
 json_assert_inheritance_and_clone_state() {
@@ -221,52 +297,28 @@ wait_for_sse_ready() {
   done
 }
 
-wait_for_approval_request_id() {
-  local path=$1
-  local deadline=$((SECONDS + 20))
-  local python_bin="${PYTHON:-python3}"
-  local request_id
-  until request_id="$("$python_bin" - "$path" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-if not path.exists():
-    raise SystemExit(1)
-
-text = path.read_text(encoding="utf-8", errors="replace")
-for block in text.split("\n\n"):
-    event = None
-    data_lines = []
-    for line in block.splitlines():
-        if line.startswith("event:"):
-            event = line.split(":", 1)[1].strip()
-        elif line.startswith("data:"):
-            data_lines.append(line.split(":", 1)[1].strip())
-    if event != "approval" or not data_lines:
-        continue
-    try:
-        payload = json.loads("\n".join(data_lines))
-    except json.JSONDecodeError:
-        continue
-    if payload.get("type") != "approval_required":
-        continue
-    if payload.get("action") != "runtime-e2e-approval":
-        continue
-    request_id = payload.get("request_id")
-    if request_id:
-        print(request_id)
-        raise SystemExit(0)
-raise SystemExit(1)
-PY
-  )"; do
-    if (( SECONDS >= deadline )); then
-      return 1
+# GET /api/models is a principal-scoped registry round-trip. The storage
+# fallback assert fails closed on the first non-200, so wait until the
+# caller's registry actually answers before checking governed model scope.
+wait_for_http_models_catalog() {
+  local bearer=$1
+  local label=$2
+  local out=$3
+  local deadline=$((SECONDS + 45))
+  local status
+  while true; do
+    status="$(http_status GET /api/models "$bearer" "" "$out")"
+    if [[ "$status" == 200 ]]; then
+      return
     fi
-    sleep 0.1
+    if (( SECONDS >= deadline )); then
+      if [[ -f "$out" ]]; then
+        sed -n '1,80p' "$out" >&2 || true
+      fi
+      fail "$label model catalog not ready (last HTTP $status)"
+    fi
+    sleep 1
   done
-  printf '%s\n' "$request_id"
 }
 
 wait_for_elicit_request_id() {
@@ -397,7 +449,7 @@ run_adversarial_capsule_smoke() {
   esac
   assert_no_adversarial_session_poison "$ARTIFACTS/adversarial-capsule-session-list.json"
 
-  note "checking live approval responder principal isolation"
+  note "checking native approval ownership is not leaked to an HTTP bearer session"
   local approval_sse="$ARTIFACTS/adversarial-approval-requests.sse"
   local approval_out="$ARTIFACTS/adversarial-approval-cli.txt"
   curl -sN --max-time 45 \
@@ -415,42 +467,48 @@ run_adversarial_capsule_smoke() {
     fail "approval request stream ready event did not carry caller principal"
   }
 
-  bounded_principal_cli "$user_principal" 20 "$approval_out" \
+  bounded_principal_cli_with_tty "$user_principal" 20 "$approval_out" \
     capsule run astrid-capsule-adversarial adversarial-approval &
   local cli_pid=$!
-  local approval_request_id
-  approval_request_id="$(wait_for_approval_request_id "$approval_sse")" || {
+  wait_for_cli_approval_prompt "$approval_out" || {
+    terminate_pid "$cli_pid"
+    terminate_pid "$stream_pid"
+    tail_daemon_diagnostics
+    fail "owning native CLI did not receive approval before the isolation check"
+  }
+  # The owner prompt proves publication. Give a broken peer stream a bounded
+  # chance to dequeue before asserting that ownership filtering kept it empty.
+  sleep 1
+  if grep -q '"type":"approval_required"' "$approval_sse"; then
     terminate_pid "$cli_pid"
     terminate_pid "$stream_pid"
     cat "$approval_sse" >&2 2>/dev/null || true
-    fail "approval request stream did not forward adversarial approval request"
-  }
-
-  status="$(http_status POST /api/agent/approval-response "$ops_bearer" \
-    "{\"request_id\":\"$approval_request_id\",\"decision\":\"approve\",\"reason\":\"wrong principal must not satisfy\"}" \
-    "$ARTIFACTS/adversarial-approval-wrong-principal.json")"
-  assert_status "wrong-principal approval response accepted but ignored by waiter" "$status" 202
-  sleep 0.5
+    fail "HTTP bearer session observed a native connection's approval request"
+  fi
   if ! kill -0 "$cli_pid" 2>/dev/null; then
     wait "$cli_pid" || true
     terminate_pid "$stream_pid"
     cat "$approval_out" >&2 2>/dev/null || true
-    fail "wrong-principal approval response satisfied the capsule approval waiter"
+    fail "native approval request did not remain pending without its owning responder"
   fi
-
-  status="$(http_status POST /api/agent/approval-response "$user_bearer" \
-    "{\"request_id\":\"$approval_request_id\",\"decision\":\"approve\",\"reason\":\"runtime e2e approve\"}" \
-    "$ARTIFACTS/adversarial-approval-user.json")"
-  assert_status "same-principal approval response accepted" "$status" 202
+  printf 'n\n' > "$approval_out.input.tmp"
+  mv "$approval_out.input.tmp" "$approval_out.input"
   local approval_rc=0
   wait "$cli_pid" || approval_rc=$?
-  terminate_pid "$stream_pid"
-  if [[ "$approval_rc" -ne 0 ]]; then
+  if [[ "$approval_rc" -eq 124 ]]; then
+    terminate_pid "$stream_pid"
     cat "$approval_out" >&2 2>/dev/null || true
-    fail "adversarial approval command failed after same-principal response"
+    fail "owning native CLI did not finish after denying its approval request"
   fi
-  grep -q '"approved":true' "$approval_out" \
-    || fail "adversarial approval command did not report approved decision"
+  if [[ "$approval_rc" -eq 0 ]]; then
+    cat "$approval_out" >&2 2>/dev/null || true
+    fail "denied native approval unexpectedly allowed the capsule command"
+  fi
+  grep -Fq '"approved":false' "$approval_out" || {
+    cat "$approval_out" >&2 2>/dev/null || true
+    fail "denied native approval did not report approved=false"
+  }
+  terminate_pid "$stream_pid"
 
   note "checking live runtime elicit responder principal isolation"
   local elicit_sse="$ARTIFACTS/adversarial-elicit-requests.sse"
@@ -508,69 +566,13 @@ run_adversarial_capsule_smoke() {
   grep -q "\"value\":\"$elicit_answer\"" "$elicit_out" \
     || fail "adversarial elicit command did not report same-principal answer"
 
-  note "checking live approval denial path"
-  local denial_sse="$ARTIFACTS/adversarial-approval-deny-requests.sse"
-  local denial_out="$ARTIFACTS/adversarial-approval-deny-cli.txt"
-  curl -sN --max-time 45 \
-    -H "Authorization: Bearer $user_bearer" \
-    "$GATEWAY/api/agent/requests" \
-    > "$denial_sse" 2>&1 &
-  local denial_stream_pid=$!
-  wait_for_sse_ready "$denial_sse" || {
-    terminate_pid "$denial_stream_pid"
-    cat "$denial_sse" >&2 2>/dev/null || true
-    fail "approval deny request stream did not become ready"
-  }
-  bounded_principal_cli "$user_principal" 20 "$denial_out" \
-    capsule run astrid-capsule-adversarial adversarial-approval &
-  local denial_cli_pid=$!
-  local denial_request_id
-  denial_request_id="$(wait_for_approval_request_id "$denial_sse")" || {
-    terminate_pid "$denial_cli_pid"
-    terminate_pid "$denial_stream_pid"
-    cat "$denial_sse" >&2 2>/dev/null || true
-    fail "approval deny request stream did not forward adversarial approval request"
-  }
-  status="$(http_status POST /api/agent/approval-response "$user_bearer" \
-    "{\"request_id\":\"$denial_request_id\",\"decision\":\"deny\",\"reason\":\"runtime e2e deny\"}" \
-    "$ARTIFACTS/adversarial-approval-deny-user.json")"
-  assert_status "same-principal approval denial response accepted" "$status" 202
-  local denial_rc=0
-  wait "$denial_cli_pid" || denial_rc=$?
-  terminate_pid "$denial_stream_pid"
-  if [[ "$denial_rc" -eq 0 ]]; then
-    cat "$denial_out" >&2 2>/dev/null || true
-    fail "adversarial approval command succeeded after same-principal deny"
-  fi
-  grep -q '"approved":false' "$denial_out" \
-    || fail "adversarial approval command did not report denied decision"
-
   note "checking live approval timeout path"
-  local timeout_sse="$ARTIFACTS/adversarial-approval-timeout-requests.sse"
   local timeout_out="$ARTIFACTS/adversarial-approval-timeout-cli.txt"
-  curl -sN --max-time 75 \
-    -H "Authorization: Bearer $user_bearer" \
-    "$GATEWAY/api/agent/requests" \
-    > "$timeout_sse" 2>&1 &
-  local timeout_stream_pid=$!
-  wait_for_sse_ready "$timeout_sse" || {
-    terminate_pid "$timeout_stream_pid"
-    cat "$timeout_sse" >&2 2>/dev/null || true
-    fail "approval timeout request stream did not become ready"
-  }
-  bounded_principal_cli "$user_principal" 75 "$timeout_out" \
+  bounded_principal_cli_with_tty "$user_principal" 75 "$timeout_out" \
     capsule run astrid-capsule-adversarial adversarial-approval &
   local timeout_cli_pid=$!
-  wait_for_approval_request_id "$timeout_sse" \
-    > "$ARTIFACTS/adversarial-approval-timeout-request-id.txt" || {
-    terminate_pid "$timeout_cli_pid"
-    terminate_pid "$timeout_stream_pid"
-    cat "$timeout_sse" >&2 2>/dev/null || true
-    fail "approval timeout request stream did not forward adversarial approval request"
-  }
   local timeout_rc=0
   wait "$timeout_cli_pid" || timeout_rc=$?
-  terminate_pid "$timeout_stream_pid"
   if [[ "$timeout_rc" -eq 0 ]]; then
     cat "$timeout_out" >&2 2>/dev/null || true
     fail "adversarial approval command succeeded without a response"
@@ -607,36 +609,60 @@ run_adversarial_principal_smoke() {
   local creator_principal
   creator_principal="$(json_field "$ARTIFACTS/creator-redeem.json" principal)"
 
-  expect_principal_cli_failure "$user_principal" adversarial-agent-create-denied \
+  # Regular invitees hold no agent:create. An invited creator can hold that
+  # cap without being a user-delegated device; principal creation still
+  # fail-closes on current user delegation. The only public user-bound
+  # identity is the local bootstrap default, whose admin `*` already includes
+  # create/inherit/clone, so allowed creates run as default rather than
+  # inventing a second bind API.
+  expect_principal_cli_failure_containing "$user_principal" adversarial-agent-create-denied \
+    "missing capability agent:create" \
     agent create e2e-regular-create-denied -y
   assert_principal_profile_absent e2e-regular-create-denied
 
-  expect_principal_cli_success "$creator_principal" adversarial-agent-create-plain \
+  expect_principal_cli_failure_containing "$creator_principal" adversarial-agent-create-unbound \
+    "principal creation requires a current user delegation" \
     agent create e2e-plain-created -y
-  [[ -f "$ASTRID_HOME/etc/profiles/e2e-plain-created.toml" ]] \
-    || fail "plain agent:create did not create e2e-plain-created profile"
+  assert_principal_profile_absent e2e-plain-created
 
-  expect_principal_cli_failure "$creator_principal" adversarial-agent-inherit-denied \
+  expect_principal_cli_failure_containing "$creator_principal" adversarial-agent-inherit-denied \
+    "missing capability agent:create:inherit" \
     agent create e2e-inherit-denied --inherit-from "$user_principal" -y
   assert_principal_profile_absent e2e-inherit-denied
 
   run_cli caps grant "$creator_principal" agent:create:inherit
-  expect_principal_cli_success "$creator_principal" adversarial-agent-inherit-allowed \
+  expect_principal_cli_failure_containing "$creator_principal" adversarial-agent-inherit-unbound \
+    "principal creation requires a current user delegation" \
     agent create e2e-inherited --inherit-from "$user_principal" -y
+  assert_principal_profile_absent e2e-inherited
 
-  expect_principal_cli_failure "$creator_principal" adversarial-agent-clone-denied \
+  expect_principal_cli_failure_containing "$creator_principal" adversarial-agent-clone-denied \
+    "missing capability agent:create:clone" \
     agent create e2e-clone-denied --clone "$user_principal" -y
   assert_principal_profile_absent e2e-clone-denied
 
   run_cli caps grant "$creator_principal" agent:create:clone
-  expect_principal_cli_success "$creator_principal" adversarial-agent-clone-allowed \
+  expect_principal_cli_failure_containing "$creator_principal" adversarial-agent-clone-unbound \
+    "principal creation requires a current user delegation" \
+    agent create e2e-cloned --clone "$user_principal" -y
+  assert_principal_profile_absent e2e-cloned
+
+  expect_principal_cli_success default adversarial-agent-create-plain \
+    agent create e2e-plain-created -y
+  [[ -f "$ASTRID_HOME/etc/profiles/e2e-plain-created.toml" ]] \
+    || fail "plain agent:create did not create e2e-plain-created profile"
+
+  expect_principal_cli_success default adversarial-agent-inherit-allowed \
+    agent create e2e-inherited --inherit-from "$user_principal" -y
+
+  expect_principal_cli_success default adversarial-agent-clone-allowed \
     agent create e2e-cloned --clone "$user_principal" -y
 
   json_assert_inheritance_and_clone_state "$ASTRID_HOME" "$user_principal" \
     e2e-inherited e2e-cloned astrid-capsule-openai-compat "$user_secret"
 
   local admin_bearer status
-  admin_bearer="$(mint_admin_bearer)"
+  admin_bearer="$(mint_local_user_device_bearer)"
 
   note "checking regular principal cannot mutate foreign principal lifecycle"
   status="$(http_status PATCH /api/sys/principals/e2e-plain-created "$user_bearer" \
@@ -839,6 +865,13 @@ run_adversarial_principal_postcondition_smoke() {
 
   note "checking spoofed principal fields cannot mutate foreign env or quota state"
 
+  wait_for_http_models_catalog "$admin_bearer" "admin" \
+    "$ARTIFACTS/adversarial-env-model-default-warm.json"
+  wait_for_http_models_catalog "$user_bearer" "user" \
+    "$ARTIFACTS/adversarial-env-model-user-warm.json"
+  wait_for_http_models_catalog "$ops_bearer" "operator" \
+    "$ARTIFACTS/adversarial-env-model-ops-warm.json"
+
   status="$(http_status POST /api/capsules/astrid-capsule-openai-compat/env/base_url \
     "$user_bearer" \
     "{\"value\":\"$fake_base_url/empty-models\"}" \
@@ -850,6 +883,12 @@ run_adversarial_principal_postcondition_smoke() {
     "{\"value\":\"fake-spoof-query\",\"principal\":\"$ops_principal\"}" \
     "$ARTIFACTS/adversarial-env-query-body-spoof.json")"
   assert_status "agent env query and body principal spoof ignored" "$status" 204
+  wait_for_http_models_catalog "$admin_bearer" "admin-after-empty-models" \
+    "$ARTIFACTS/adversarial-env-model-default.json"
+  wait_for_http_models_catalog "$user_bearer" "user-after-empty-models" \
+    "$ARTIFACTS/adversarial-env-model-user.json"
+  wait_for_http_models_catalog "$ops_bearer" "operator-after-empty-models" \
+    "$ARTIFACTS/adversarial-env-model-ops.json"
   assert_user_only_model_fallback_in_storage astrid-capsule-openai-compat default \
     "$user_principal" "$ops_principal" "$admin_bearer" "$user_bearer" "$ops_bearer" \
     fake-spoof-query user-only
@@ -879,22 +918,25 @@ run_adversarial_principal_postcondition_smoke() {
   status="$(http_status GET "/api/sys/principals/$user_principal/quotas" "$user_bearer" "" \
     "$ARTIFACTS/adversarial-user-quota-before-spoof.json")"
   assert_status "agent quota read before spoof" "$status" 200
-  body="$(quota_request_body_with_principal "$ARTIFACTS/adversarial-user-quota-before-spoof.json" 7 "$ops_principal")"
+  # Use an allowed attenuation so a quota-escalation denial cannot hide a
+  # routing bug: the URL principal must win over both spoofed values.
+  body="$(quota_request_body_with_principal "$ARTIFACTS/adversarial-user-quota-before-spoof.json" 3 "$ops_principal")"
   status="$(http_status PUT "/api/sys/principals/$user_principal/quotas?principal=$ops_principal" \
     "$user_bearer" "$body" "$ARTIFACTS/adversarial-quota-query-body-spoof.json")"
   assert_status "agent quota query and body principal spoof only touches caller path" "$status" 200
   status="$(http_status GET "/api/sys/principals/$user_principal/quotas" "$user_bearer" "" \
     "$ARTIFACTS/adversarial-user-quota-after-spoof.json")"
   assert_status "agent quota read after spoof" "$status" 200
-  json_assert_field_equals "$ARTIFACTS/adversarial-user-quota-after-spoof.json" max_background_processes 7
+  json_assert_field_equals "$ARTIFACTS/adversarial-user-quota-after-spoof.json" max_background_processes 3
   status="$(http_status GET "/api/sys/principals/$ops_principal/quotas" "$admin_bearer" "" \
     "$ARTIFACTS/adversarial-ops-quota-after-spoof.json")"
   assert_status "operator quota read after spoof" "$status" 200
   json_assert_field_equals "$ARTIFACTS/adversarial-ops-quota-after-spoof.json" max_background_processes 8
-  body="$(quota_request_body "$ARTIFACTS/adversarial-user-quota-before-spoof.json" 4)"
-  status="$(http_status PUT "/api/sys/principals/$user_principal/quotas" "$user_bearer" "$body" \
+  body="$(quota_request_body "$ARTIFACTS/adversarial-user-quota-before-spoof.json" \
+    "$(json_field "$ARTIFACTS/adversarial-user-quota-before-spoof.json" max_background_processes)")"
+  status="$(http_status PUT "/api/sys/principals/$user_principal/quotas" "$admin_bearer" "$body" \
     "$ARTIFACTS/adversarial-user-quota-spoof-restore.json")"
-  assert_status "agent quota restore after spoof" "$status" 200
+  assert_status "admin quota restore after spoof" "$status" 200
   body="$(quota_request_body "$ARTIFACTS/adversarial-ops-quota-before-spoof.json" \
     "$(json_field "$ARTIFACTS/adversarial-ops-quota-before-spoof.json" max_background_processes)")"
   status="$(http_status PUT "/api/sys/principals/$ops_principal/quotas" "$admin_bearer" "$body" \

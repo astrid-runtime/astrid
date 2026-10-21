@@ -18,6 +18,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+tempfile = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

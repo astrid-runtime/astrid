@@ -67,6 +67,7 @@ async fn targeted_capsule_inventory_describes_only_the_selected_principal() {
     let kernel = test_kernel_with_home(home).await;
     let target = PrincipalId::new("fleet-73").unwrap();
     let mut counters = Vec::with_capacity(FLEET_SIZE);
+    let expected_source_id;
 
     {
         let mut registry = kernel.capsules.write().await;
@@ -87,6 +88,13 @@ async fn targeted_capsule_inventory_describes_only_the_selected_principal() {
                 .unwrap();
             counters.push(calls);
         }
+        expected_source_id = registry
+            .source_id_for(
+                &target,
+                &CapsuleId::new("inventory-probe-73").expect("target capsule id"),
+            )
+            .expect("registered capsule has a live source identity")
+            .to_string();
     }
 
     let mut events = kernel
@@ -112,6 +120,13 @@ async fn targeted_capsule_inventory_describes_only_the_selected_principal() {
         panic!("capsule inventory must be an IPC event");
     };
     assert_eq!(message.principal.as_deref(), Some(target.as_str()));
+    let astrid_events::ipc::IpcPayload::RawJson(payload) = &message.payload else {
+        panic!("capsule inventory must carry raw JSON");
+    };
+    let capsules = payload["capsules"].as_array().expect("capsule inventory");
+    assert_eq!(capsules.len(), 1);
+    assert_eq!(capsules[0]["name"], "inventory-probe-73");
+    assert_eq!(capsules[0]["source_id"], expected_source_id);
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(20), events.recv())
             .await

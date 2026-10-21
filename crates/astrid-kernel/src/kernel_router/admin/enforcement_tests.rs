@@ -337,6 +337,7 @@ async fn admin_request_id_echoed_on_deny_path_too() {
 #[tokio::test(flavor = "multi_thread")]
 async fn additive_derive_endpoint_preserves_correlation_and_authorization() {
     let (_dir, kernel) = fixture().await;
+    super::test_support::seed_operator(&kernel).await;
     seed_profile(
         &kernel,
         &PrincipalId::default(),

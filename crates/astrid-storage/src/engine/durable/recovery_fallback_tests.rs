@@ -405,3 +405,193 @@ fn startup_fallback_does_not_swallow_unrelated_model_errors() {
         })
     ));
 }
+
+#[test]
+fn volume_index_rebuild_preserves_fallback_lineage_across_commit_and_reopen() {
+    use super::format::{recovery_arena_scans, reset_recovery_arena_scans};
+
+    let source = tempfile::tempdir().unwrap();
+    let (volume, engine) = open_volume(source.path());
+    let (_, initial) = transaction("alice", None, b"before-missing-root");
+    let first = engine.commit(initial).unwrap().root();
+    drop(engine);
+
+    // A complete journal transition may outlive the owning object closure.
+    // Keep its lineage while forcing the independently disposable index to rebuild.
+    let missing = RootState {
+        generation: first.generation.checked_next().unwrap(),
+        commit: ObjectId::new([0xD1; 32]),
+    };
+    let payload = encode_root_record(TEST_IDENTITY_SCHEME, b"alice", Some(first), missing).unwrap();
+    let mut journal = super::File::volume(Arc::clone(&volume), ROOT_FILE, false).unwrap();
+    append_frame(&mut journal, ROOT_MAGIC, &payload).unwrap();
+    journal.sync_data().unwrap();
+    drop(journal);
+    volume
+        .remove_region(&VolumeRegion::new(INDEX_FILE).unwrap())
+        .unwrap();
+    volume.sync().unwrap();
+    drop(volume);
+
+    reset_recovery_arena_scans();
+    let (volume, recovered) = open_volume(source.path());
+    assert_eq!(recovery_arena_scans(), 1);
+    assert_eq!(recovered.root(&"alice".to_owned()).unwrap(), Some(first));
+    let rejected = recovered.rejected_recovery_candidates().unwrap();
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0].root, missing);
+    assert_eq!(rejected[0].missing, missing.commit);
+    assert!(
+        volume
+            .region_len(&VolumeRegion::new(INDEX_FILE).unwrap())
+            .unwrap()
+            > 0
+    );
+
+    let (_, after_fallback) = transaction("alice", Some(first), b"after-index-rebuild");
+    let committed = recovered.commit(after_fallback).unwrap().root();
+    assert_eq!(
+        committed.generation,
+        missing.generation.checked_next().unwrap()
+    );
+    let snapshot = source.path().join("snapshot.volume");
+    std::fs::copy(source.path().join("astrid.volume"), &snapshot).unwrap();
+    drop(recovered);
+    drop(volume);
+
+    reset_recovery_arena_scans();
+    let fresh_volume: Arc<dyn AstridVolume> = HostedFileVolume::open(&snapshot).unwrap();
+    let reopened = DurableEngine::open_volume(
+        fresh_volume,
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        DurableEnginePolicy::default(),
+    )
+    .unwrap();
+    assert_eq!(recovery_arena_scans(), 0);
+    assert_eq!(reopened.root(&"alice".to_owned()).unwrap(), Some(committed));
+    assert!(reopened.object(committed.commit).unwrap().is_some());
+}
+
+#[test]
+fn candidate_checksum_failure_does_not_select_an_older_valid_root() {
+    let directory = tempfile::tempdir().unwrap();
+    let (engine, _first, newest, _) = commit_pair(directory.path());
+    // Keep the damaged candidate away from the arena tail, so index recovery
+    // cannot interpret this as an interrupted final append.
+    let sentinel = compaction_evidence(b"valid-tail-after-damaged-candidate");
+    engine.persist_standalone_object(&sentinel).unwrap();
+    engine.flush().unwrap();
+    let location = engine.inner.lock().index[&newest.commit];
+    let damaged_byte = location.offset + FRAME_HEADER_LEN + location.payload_len - 1;
+    drop(engine);
+    flip_byte(&directory.path().join(ARENA_FILE), damaged_byte);
+
+    assert!(matches!(
+        DurableEngine::open(directory.path(), TestIdentity, Utf8Codec, limits()),
+        Err(DurableError::Corrupt {
+            file: ARENA_FILE,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn non_commit_candidate_does_not_select_an_older_valid_root() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let (_, initial) = transaction("alice", None, b"valid-prior-root");
+    let first = engine.commit(initial).unwrap().root();
+    let evidence = compaction_evidence(b"not-a-commit");
+    let (id, _) = engine.persist_standalone_object(&evidence).unwrap();
+    engine.flush().unwrap();
+    drop(engine);
+    let invalid = RootState {
+        generation: first.generation.checked_next().unwrap(),
+        commit: id,
+    };
+    append_root_frame(&directory.path().join(ROOT_FILE), Some(first), invalid);
+
+    assert!(matches!(
+        DurableEngine::open(directory.path(), TestIdentity, Utf8Codec, limits()),
+        Err(DurableError::RecoveryModel {
+            source: ModelError::RootNotCommit { .. },
+            ..
+        })
+    ));
+}
+
+#[test]
+fn index_publication_failure_after_fallback_recovers_the_published_journal() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug, Default)]
+    struct FailIndexPublication(AtomicBool);
+    impl FaultInjector for FailIndexPublication {
+        fn should_fail(&self, point: FaultPoint) -> bool {
+            point == FaultPoint::BeforeIndexCachePublication && self.0.load(Ordering::Acquire)
+        }
+    }
+
+    let source = tempfile::tempdir().unwrap();
+    let (volume, engine) = open_volume(source.path());
+    let (_, initial) = transaction("alice", None, b"prior-root");
+    let first = engine.commit(initial).unwrap().root();
+    drop(engine);
+    let missing = RootState {
+        generation: first.generation.checked_next().unwrap(),
+        commit: ObjectId::new([0xD2; 32]),
+    };
+    let payload = encode_root_record(TEST_IDENTITY_SCHEME, b"alice", Some(first), missing).unwrap();
+    let mut journal = super::File::volume(Arc::clone(&volume), ROOT_FILE, false).unwrap();
+    append_frame(&mut journal, ROOT_MAGIC, &payload).unwrap();
+    journal.sync_data().unwrap();
+    drop(journal);
+    volume.sync().unwrap();
+
+    let faults = Arc::new(FailIndexPublication::default());
+    let recovered = DurableEngine::open_volume_with_faults(
+        Arc::clone(&volume),
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        DurableEnginePolicy::default(),
+        faults.clone(),
+    )
+    .unwrap();
+    assert_eq!(recovered.root(&"alice".to_owned()).unwrap(), Some(first));
+    // Force replacement rather than a valid delta append, after startup has
+    // selected the fallback and captured the newer journal head.
+    volume
+        .set_region_len(&VolumeRegion::new(INDEX_FILE).unwrap(), 0)
+        .unwrap();
+    faults.0.store(true, Ordering::Release);
+    let (commit, next) = transaction("alice", Some(first), b"failed-index-publication");
+    assert!(matches!(
+        recovered.commit(next),
+        Err(DurableError::FaultInjected(
+            FaultPoint::BeforeIndexCachePublication
+        ))
+    ));
+    // Failure does not promise rollback. Explicitly preserve the already
+    // published bytes and recover through an independent backend.
+    volume.sync().unwrap();
+    let snapshot = source.path().join("failed-publication.volume");
+    std::fs::copy(source.path().join("astrid.volume"), &snapshot).unwrap();
+    drop(recovered);
+    drop(volume);
+    let fresh_volume: Arc<dyn AstridVolume> = HostedFileVolume::open(&snapshot).unwrap();
+    let fresh = DurableEngine::open_volume(
+        fresh_volume,
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        DurableEnginePolicy::default(),
+    )
+    .unwrap();
+    let root = fresh.root(&"alice".to_owned()).unwrap().unwrap();
+    assert_eq!(root.commit, commit);
+    assert_eq!(root.generation, missing.generation.checked_next().unwrap());
+    assert!(fresh.object(commit).unwrap().is_some());
+}

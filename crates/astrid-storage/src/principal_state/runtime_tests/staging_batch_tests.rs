@@ -2,6 +2,7 @@
 
 use std::io::Write as _;
 
+use super::super::content_staging_tests::volume_file_len;
 use super::*;
 
 #[tokio::test]

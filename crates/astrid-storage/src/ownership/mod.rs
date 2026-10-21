@@ -27,6 +27,16 @@ pub use ownership_error::OwnershipError;
 #[path = "helpers.rs"]
 mod ownership_helpers;
 
+mod deletion;
+mod derived;
+mod provision;
+mod resources;
+pub use derived::DerivedPrincipalOwnership;
+mod upgrade;
+pub use upgrade::{UnownedPrincipalDeferral, UnownedPrincipalReconciliation};
+mod user_bindings;
+pub use user_bindings::CreationDelegation;
+
 /// Namespace reserved for the authoritative ownership graph.
 pub const OWNERSHIP_NAMESPACE: &str = "system:ownership";
 const GRAPH_KEY: &str = "graph-v1";
@@ -69,6 +79,8 @@ pub struct OwnershipSnapshot {
     users: BTreeMap<UserUid, UserIdentity>,
     fleets: BTreeMap<FleetUid, FleetRecord>,
     principal_ownership: BTreeMap<PrincipalUid, PrincipalOwnership>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    accountable_users: BTreeMap<PrincipalUid, UserUid>,
     #[serde(default)]
     principal_deletions: BTreeMap<PrincipalUid, PrincipalDeletionReservation>,
     /// First-owner enrollment is optional only while reading an empty v1
@@ -83,12 +95,18 @@ pub struct OwnershipSnapshot {
     /// authority epoch so stale claims cannot become valid after reopen.
     #[serde(default = "default_authority_generation")]
     authority_generation: FirstOwnerGeneration,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    user_bindings: Vec<user_bindings::UserDeviceBinding>,
+    #[serde(default, skip_serializing_if = "user_bindings::not_initialized")]
+    local_user_binding_initialized: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PrincipalDeletionReservation {
     alias: Option<PrincipalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fleet: Option<FleetUid>,
 }
 
 impl Default for OwnershipSnapshot {
@@ -98,10 +116,13 @@ impl Default for OwnershipSnapshot {
             users: BTreeMap::new(),
             fleets: BTreeMap::new(),
             principal_ownership: BTreeMap::new(),
+            accountable_users: BTreeMap::new(),
             principal_deletions: BTreeMap::new(),
             enrollment: Some(FirstOwnerEnrollment::Unenrolled),
             authority_epoch: default_authority_epoch(),
             authority_generation: default_authority_generation(),
+            user_bindings: Vec::new(),
+            local_user_binding_initialized: false,
         }
     }
 }
@@ -160,7 +181,32 @@ impl OwnershipSnapshot {
         self.authority_generation
     }
 
+    /// Iterate over active assignments in fleets containing this user.
+    ///
+    /// This is a point-in-time ownership query, not authentication or a grant
+    /// to act as a principal. Callers must authenticate the user independently
+    /// and check operation/device permissions at use time. Reload the snapshot
+    /// after membership changes; never treat a cached picker row as authority.
+    /// Unknown users and principals being deleted are excluded.
+    pub fn principal_owners_for_user(
+        &self,
+        user: UserUid,
+    ) -> impl Iterator<Item = &PrincipalOwnership> {
+        self.principal_ownership.values().filter(move |ownership| {
+            self.users.contains_key(&user)
+                && !self
+                    .principal_deletions
+                    .contains_key(&ownership.principal_uid)
+                && self
+                    .fleets
+                    .get(&ownership.fleet_uid)
+                    .is_some_and(|fleet| fleet.membership(user).is_some())
+        })
+    }
+
     fn validate(&self, principals: &PrincipalDirectory) -> Result<(), OwnershipError> {
+        self.validate_accountable_users()?;
+        self.validate_user_bindings(principals)?;
         if self.format_version != GRAPH_FORMAT_VERSION {
             return Err(OwnershipError::UnsupportedFormat(self.format_version));
         }
@@ -237,6 +283,11 @@ impl OwnershipSnapshot {
         }
         let mut deletion_aliases = BTreeMap::new();
         for (principal_uid, reservation) in &self.principal_deletions {
+            if let Some(fleet) = reservation.fleet
+                && !self.fleets.contains_key(&fleet)
+            {
+                return Err(OwnershipError::FleetNotFound(fleet));
+            }
             if self.principal_ownership.contains_key(principal_uid) {
                 return Err(OwnershipError::CorruptGraph(format!(
                     "principal {principal_uid} is both owned and reserved for deletion"
@@ -347,6 +398,13 @@ impl OwnershipStore {
     /// graph cannot be loaded and validated.
     pub async fn enrolled_authority(&self) -> Result<EnrolledAuthority, OwnershipError> {
         let graph = self.load().await?;
+        self.authority_from_snapshot(&graph)
+    }
+
+    fn authority_from_snapshot(
+        &self,
+        graph: &OwnershipSnapshot,
+    ) -> Result<EnrolledAuthority, OwnershipError> {
         let enrollment = graph.first_owner_state();
         let Some(claim) = enrollment.claim() else {
             return Err(OwnershipError::AuthorityNotEnrolled);
@@ -373,266 +431,6 @@ impl OwnershipStore {
     pub async fn load(&self) -> Result<OwnershipSnapshot, OwnershipError> {
         let raw = self.storage.get(GRAPH_KEY).await?;
         self.decode(raw.as_deref())
-    }
-
-    /// Reserve an unowned principal for durable identity deletion.
-    ///
-    /// The reservation changes the graph's CAS version, so a writer that read
-    /// the unowned graph before this call must retry and observe the deletion.
-    /// Call [`PrincipalDeletionGuard::finish`] only after durable identity
-    /// removal succeeds. Dropping the guard leaves the reservation in place so
-    /// a partial deletion fails closed and can be retried safely.
-    ///
-    /// # Errors
-    ///
-    /// Rejects a principal that already belongs to a fleet and fails closed on
-    /// invalid or unavailable ownership state.
-    pub async fn guard_principal_deletion(
-        &self,
-        principal_uid: PrincipalUid,
-    ) -> Result<PrincipalDeletionGuard, OwnershipError> {
-        let authority = self.enrolled_authority().await?;
-        self.guard_principal_deletion_inner(&authority, principal_uid, None)
-            .await
-    }
-
-    /// Reserve an unowned principal and retain its alias for crash recovery.
-    ///
-    /// The alias allows a later deletion retry to remove the reservation even
-    /// when the durable identity record and live directory entry were already
-    /// deleted.
-    ///
-    /// # Errors
-    ///
-    /// Rejects an owned or unknown principal, a conflicting retry alias, and
-    /// invalid or unavailable ownership state.
-    pub async fn guard_principal_deletion_for_alias(
-        &self,
-        principal_uid: PrincipalUid,
-        alias: PrincipalId,
-    ) -> Result<PrincipalDeletionGuard, OwnershipError> {
-        let authority = self.enrolled_authority().await?;
-        self.guard_principal_deletion_inner(&authority, principal_uid, Some(alias))
-            .await
-    }
-
-    /// Reserve an alias whose legacy identity generation is already missing.
-    ///
-    /// Recovery code uses this before touching alias-keyed files so a failed
-    /// cleanup cannot make an old key, home, or secret tree available to a new
-    /// identity. The synthetic UID exists only as the durable map key for this
-    /// reservation and is derived in a separate domain from real identities.
-    ///
-    /// # Errors
-    ///
-    /// Fails closed if the alias is already reserved, the synthetic key
-    /// collides with a live principal, or the ownership graph cannot be saved.
-    pub async fn guard_legacy_alias_deletion(
-        &self,
-        alias: PrincipalId,
-    ) -> Result<PrincipalDeletionGuard, OwnershipError> {
-        let authority = self.enrolled_authority().await?;
-        let mut hasher =
-            blake3::Hasher::new_derive_key("astrid legacy alias deletion reservation v1");
-        hasher.update(alias.as_str().as_bytes());
-        let reservation_uid = PrincipalUid::from_bytes(*hasher.finalize().as_bytes());
-        let guard = Arc::clone(&self.mutation_lock).lock_owned().await;
-        self.mutate_unlocked(|graph| {
-            self.validate_authority(graph, &authority)?;
-            if self.principals.contains_uid(reservation_uid) {
-                return Err(OwnershipError::CorruptGraph(format!(
-                    "legacy deletion reservation for alias {alias} collides with live principal {reservation_uid}"
-                )));
-            }
-            if let Some((principal, _)) = graph
-                .principal_deletions
-                .iter()
-                .find(|(_, reservation)| reservation.alias.as_ref() == Some(&alias))
-            {
-                if *principal != reservation_uid {
-                    return Err(OwnershipError::DeletionAliasReserved {
-                        alias: alias.clone(),
-                        principal: *principal,
-                    });
-                }
-            } else {
-                graph.principal_deletions.insert(
-                    reservation_uid,
-                    PrincipalDeletionReservation {
-                        alias: Some(alias.clone()),
-                    },
-                );
-            }
-            Ok(())
-        })
-        .await?;
-        Ok(PrincipalDeletionGuard {
-            store: self.clone(),
-            principal_uid: reservation_uid,
-            authority,
-            _guard: guard,
-        })
-    }
-
-    /// Finish a previously interrupted deletion using its durable alias.
-    ///
-    /// Returns `true` when a matching reservation was removed and `false`
-    /// when no interrupted deletion exists for this alias.
-    ///
-    /// # Errors
-    ///
-    /// Fails closed when the graph cannot be read, validated, or atomically
-    /// updated.
-    pub async fn finish_principal_deletion_by_alias(
-        &self,
-        alias: &PrincipalId,
-    ) -> Result<bool, OwnershipError> {
-        let alias = alias.clone();
-        let authority = self.enrolled_authority().await?;
-        self.mutate_with_authority(&authority, |graph| {
-            let principal_uid = graph
-                .principal_deletions
-                .iter()
-                .find_map(|(uid, reservation)| {
-                    (reservation.alias.as_ref() == Some(&alias)).then_some(*uid)
-                });
-            if let Some(uid) = principal_uid
-                && self.principals.contains_uid(uid)
-            {
-                return Err(OwnershipError::PrincipalDeletionStillLive(uid));
-            }
-            Ok(principal_uid
-                .and_then(|uid| graph.principal_deletions.remove(&uid))
-                .is_some())
-        })
-        .await
-    }
-
-    /// Reacquire an interrupted deletion reservation by its retained alias.
-    ///
-    /// Unlike [`finish_principal_deletion_by_alias`](Self::finish_principal_deletion_by_alias),
-    /// this does not remove the reservation. The caller must first finish all
-    /// generation-scoped reclamation and then call [`PrincipalDeletionGuard::finish`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an ownership error if the graph cannot be loaded or the retired
-    /// principal is unexpectedly live again.
-    pub async fn resume_principal_deletion_by_alias(
-        &self,
-        alias: &PrincipalId,
-    ) -> Result<Option<PrincipalDeletionGuard>, OwnershipError> {
-        let authority = self.enrolled_authority().await?;
-        let guard = Arc::clone(&self.mutation_lock).lock_owned().await;
-        let graph = self.load().await?;
-        self.validate_authority(&graph, &authority)?;
-        let principal_uid = graph
-            .principal_deletions
-            .iter()
-            .find_map(|(uid, reservation)| {
-                (reservation.alias.as_ref() == Some(alias)).then_some(*uid)
-            });
-        let Some(principal_uid) = principal_uid else {
-            return Ok(None);
-        };
-        if self.principals.contains_uid(principal_uid) {
-            return Err(OwnershipError::PrincipalDeletionStillLive(principal_uid));
-        }
-        Ok(Some(PrincipalDeletionGuard {
-            store: self.clone(),
-            principal_uid,
-            authority,
-            _guard: guard,
-        }))
-    }
-
-    /// Reject creation while an interrupted deletion still owns `alias`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an ownership error if the graph cannot be loaded or `alias` is
-    /// still reserved by an incomplete deletion.
-    pub async fn ensure_alias_available(&self, alias: &PrincipalId) -> Result<(), OwnershipError> {
-        let graph = self.load().await?;
-        if let Some((principal, _)) = graph
-            .principal_deletions
-            .iter()
-            .find(|(_, reservation)| reservation.alias.as_ref() == Some(alias))
-        {
-            return Err(OwnershipError::DeletionAliasReserved {
-                alias: alias.clone(),
-                principal: *principal,
-            });
-        }
-        Ok(())
-    }
-
-    async fn guard_principal_deletion_inner(
-        &self,
-        authority: &EnrolledAuthority,
-        principal_uid: PrincipalUid,
-        alias: Option<PrincipalId>,
-    ) -> Result<PrincipalDeletionGuard, OwnershipError> {
-        let guard = Arc::clone(&self.mutation_lock).lock_owned().await;
-        self.mutate_unlocked(|graph| {
-            self.validate_authority(graph, authority)?;
-            if let Some(ownership) = graph.principal_owner(principal_uid) {
-                return Err(OwnershipError::PrincipalAlreadyOwned {
-                    principal: principal_uid,
-                    fleet: ownership.fleet_uid,
-                });
-            }
-            if let Some(requested) = &alias
-                && let Ok(live_alias) = self.principals.alias_for(principal_uid)
-                && &live_alias != requested
-            {
-                return Err(OwnershipError::DeletionReservationConflict {
-                    principal: principal_uid,
-                    alias: live_alias,
-                });
-            }
-            if let Some(reservation) = graph.principal_deletions.get_mut(&principal_uid) {
-                match (&reservation.alias, &alias) {
-                    (Some(existing), Some(requested)) if existing != requested => {
-                        return Err(OwnershipError::DeletionReservationConflict {
-                            principal: principal_uid,
-                            alias: existing.clone(),
-                        });
-                    },
-                    (None, Some(requested)) => reservation.alias = Some(requested.clone()),
-                    _ => {},
-                }
-            } else {
-                if !self.principals.contains_uid(principal_uid) {
-                    return Err(OwnershipError::PrincipalNotFound(principal_uid));
-                }
-                if let Some(requested) = &alias
-                    && let Some((reserved_uid, _)) = graph
-                        .principal_deletions
-                        .iter()
-                        .find(|(_, reservation)| reservation.alias.as_ref() == Some(requested))
-                {
-                    return Err(OwnershipError::DeletionAliasReserved {
-                        alias: requested.clone(),
-                        principal: *reserved_uid,
-                    });
-                }
-                graph.principal_deletions.insert(
-                    principal_uid,
-                    PrincipalDeletionReservation {
-                        alias: alias.clone(),
-                    },
-                );
-            }
-            Ok(())
-        })
-        .await?;
-        Ok(PrincipalDeletionGuard {
-            store: self.clone(),
-            principal_uid,
-            authority: authority.clone(),
-            _guard: guard,
-        })
     }
 
     /// Register one durable human identity, idempotently.
@@ -784,7 +582,11 @@ impl OwnershipStore {
             if existing_role == Some(FleetRole::Owner) && Self::owner_count(fleet) == 1 {
                 return Err(OwnershipError::LastOwner(fleet_uid));
             }
-            Ok(fleet.memberships.remove(&user_uid).is_some())
+            let removed = fleet.memberships.remove(&user_uid).is_some();
+            graph
+                .user_bindings
+                .retain(|binding| !binding.belongs_to(user_uid, fleet_uid));
+            Ok(removed)
         })
         .await
     }
@@ -827,6 +629,9 @@ impl OwnershipStore {
                     fleet: existing.fleet_uid,
                 }),
                 None => {
+                    graph
+                        .accountable_users
+                        .insert(ownership.principal_uid, ownership.assigned_by);
                     graph
                         .principal_ownership
                         .insert(ownership.principal_uid, ownership.clone());
@@ -880,6 +685,11 @@ impl OwnershipStore {
                     assigned_by: actor,
                 },
             );
+            if source_fleet != destination_fleet {
+                graph
+                    .user_bindings
+                    .retain(|binding| !binding.for_principal(principal_uid));
+            }
             Ok(())
         })
         .await
@@ -915,6 +725,17 @@ impl OwnershipStore {
             return Err(OwnershipError::AuthorityStale);
         }
         Ok(())
+    }
+
+    // Capture authority once, then revalidate that original proof on each CAS
+    // attempt. First-owner transitions deliberately keep the raw mutation path.
+    async fn mutate_enrolled<T, F>(&self, apply: F) -> Result<T, OwnershipError>
+    where
+        T: Clone,
+        F: Fn(&mut OwnershipSnapshot) -> Result<T, OwnershipError>,
+    {
+        let authority = self.enrolled_authority().await?;
+        self.mutate_with_authority(&authority, apply).await
     }
 
     async fn mutate_with_authority<T, F>(
@@ -987,6 +808,8 @@ impl OwnershipStore {
 #[cfg(test)]
 #[path = "first_owner_tests.rs"]
 mod first_owner_tests;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;

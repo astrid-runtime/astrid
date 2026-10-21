@@ -8,7 +8,7 @@ use astrid_core::profile::{DeviceScope, PrincipalProfile};
 use astrid_core::{PrincipalUid, principal::PrincipalId};
 use tracing::warn;
 
-use super::device_scope::resolve_device_scope;
+use super::device_scope::resolve_device;
 
 const REQUIRED_PRINCIPAL_IDENTITY: &str = "principal:identity";
 
@@ -71,9 +71,17 @@ pub(crate) struct AuthorizedRequest {
     pub(crate) profile: Arc<PrincipalProfile>,
     pub(crate) groups: Arc<GroupConfig>,
     pub(crate) device_scope: Option<DeviceScope>,
+    pub(crate) device_key_id: Option<astrid_core::profile::DeviceKeyId>,
+    pub(crate) authenticated_public_key: Option<[u8; 32]>,
 }
 
 impl AuthorizedRequest {
+    pub(crate) fn require_shared_env_write(self) -> Result<Self, PermissionError> {
+        // Use the same policy snapshot that authorized installation.
+        self.capability_check().require("env:write")?;
+        Ok(self)
+    }
+
     #[cfg(test)]
     pub(crate) fn principal_uid(&self) -> Option<PrincipalUid> {
         self.identity.as_ref().map(|identity| identity.uid)
@@ -160,7 +168,25 @@ pub(crate) fn authorize_request_with_identity(
     }
     let groups = kernel.groups.load_full();
 
-    let device_scope = resolve_device_scope(profile.as_ref(), caller, device_key_id, required_cap)?;
+    let device = resolve_device(profile.as_ref(), caller, device_key_id, required_cap)?;
+    let device_scope = device.map(|device| device.scope.clone());
+    let authenticated_device_id = device
+        .map(|device| astrid_core::profile::DeviceKeyId::new(device.key_id.clone()))
+        .transpose()
+        .map_err(|_| PermissionError::DeviceScopeDenied {
+            principal: caller.clone(),
+            required: required_cap.to_owned(),
+        })?;
+    let authenticated_public_key = device
+        .map(|device| {
+            astrid_crypto::PublicKey::from_hex(&device.pubkey)
+                .map(Into::into)
+                .map_err(|_| PermissionError::DeviceScopeDenied {
+                    principal: caller.clone(),
+                    required: required_cap.to_owned(),
+                })
+        })
+        .transpose()?;
 
     let mut check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone());
     if let Some(scope) = &device_scope {
@@ -183,6 +209,8 @@ pub(crate) fn authorize_request_with_identity(
         profile,
         groups,
         device_scope,
+        device_key_id: authenticated_device_id,
+        authenticated_public_key,
     })
 }
 

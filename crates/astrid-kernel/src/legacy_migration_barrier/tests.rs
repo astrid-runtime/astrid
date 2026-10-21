@@ -8,6 +8,32 @@ use std::os::unix::fs::PermissionsExt;
 
 use super::*;
 
+#[test]
+fn capsule_migration_boot_error_retains_every_context_frame() {
+    for stage in [
+        "legacy capsule migration failed",
+        "legacy leftover capsule authority retirement failed",
+        "legacy capsule authority status failed",
+    ] {
+        let error = anyhow::anyhow!(
+            "installed capsule identity/version differs from its authority receipt (approved example 0.1.0, found example 0.2.0)"
+        )
+        .context("verify legacy capsule authority example")
+        .context("import principal default");
+        let message = capsule_migration_error(stage, &error).to_string();
+        assert!(message.starts_with(stage), "{message}");
+        assert!(message.contains("import principal default"), "{message}");
+        assert!(
+            message.contains("verify legacy capsule authority example"),
+            "{message}"
+        );
+        assert!(
+            message.contains("approved example 0.1.0, found example 0.2.0"),
+            "{message}"
+        );
+    }
+}
+
 fn test_home() -> (tempfile::TempDir, AstridHome) {
     let root = tempfile::tempdir().expect("temporary home");
     make_private_dir(root.path());
@@ -52,18 +78,14 @@ fn origin_is_captured_before_fresh_home_ensure() {
     let origin = capture_layout_origin(&home).expect("fresh origin");
     assert_eq!(origin, LayoutOrigin::Fresh);
     home.ensure().expect("initialize fresh home");
-    assert_eq!(
-        home.layout_version().expect("layout version").as_deref(),
-        Some("2")
-    );
-    // The origin remains Fresh even though ensure has now written v2. The
-    // native composition root carries this captured value through boot so it
-    // can write the explicit fresh-layout ledger instead of treating the home
-    // as a failed upgrade.
+    assert_eq!(home.layout_version().expect("layout version"), None);
+    // A fresh home stays sentinel-free through ensure. The captured value
+    // lets the native composition root write the explicit fresh-layout ledger
+    // instead of treating the home as a failed upgrade.
     assert_eq!(origin, LayoutOrigin::Fresh);
     assert_eq!(
-        capture_layout_origin(&home).expect("v2 origin"),
-        LayoutOrigin::ExistingV2
+        capture_layout_origin(&home).expect("fresh origin"),
+        LayoutOrigin::Fresh
     );
 }
 
@@ -486,6 +508,7 @@ async fn post_barrier_retirement_resumes_after_crash_and_rejects_reappeared_cow(
     make_private_dir(root.path());
     let home = AstridHome::from_path(root.path());
     home.ensure().expect("fresh home");
+    fs::create_dir_all(home.migrations_dir()).expect("migrations");
     let quota: std::sync::Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
         std::sync::Arc::new(|_: &astrid_storage::StateOwner| Ok(None));
     let store = astrid_storage::open_runtime_principal_store(&home, quota)
@@ -506,7 +529,6 @@ async fn post_barrier_retirement_resumes_after_crash_and_rejects_reappeared_cow(
     )
     .expect("ledger");
 
-    assert!(home.principal_store_path().is_dir());
     retire_post_barrier_sources(&home, &store).expect("first retirement");
     assert!(!home.principal_store_path().exists());
     assert!(!home.cow_dir().exists());
@@ -807,6 +829,79 @@ fn owner_controlled_snapshot_accepts_historical_read_only_modes() {
     let error = snapshot_owner_controlled_path(&state_db)
         .expect_err("externally writable database bytes must fail closed");
     assert!(error.to_string().contains("group/world writable"));
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_cow_snapshot_and_retirement_accept_released_workspace_modes() {
+    let (_root, home) = test_home();
+    let merged = home.cow_dir().join("workspace").join("merged");
+    fs::create_dir_all(&merged).expect("released CoW directories");
+    fs::set_permissions(home.cow_dir(), fs::Permissions::from_mode(0o755))
+        .expect("released CoW root mode");
+    fs::set_permissions(
+        merged.parent().expect("workspace directory"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .expect("released workspace mode");
+    fs::set_permissions(&merged, fs::Permissions::from_mode(0o755)).expect("released merged mode");
+    let file = merged.join("file");
+    fs::write(&file, b"discardable workspace bytes").expect("released CoW file");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).expect("released CoW file mode");
+
+    assert!(snapshot_path(&home.cow_dir()).is_err());
+    let snapshot = snapshot_owner_controlled_path(&home.cow_dir())
+        .expect("released CoW modes remain eligible for digest-bound retirement");
+    assert!(snapshot.present);
+    assert_eq!(snapshot.entries, 3);
+    super::retirement::retire_owner_controlled_tree(&home.cow_dir(), &snapshot, &[])
+        .expect("retire released CoW modes against the same access contract");
+    assert!(!home.cow_dir().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_owner_controlled_snapshot_tightens_umask_0002_modes() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (_root, home) = test_home();
+    let state = home.state_db_path();
+    fs::create_dir_all(state.join("nested")).expect("legacy state tree");
+    fs::write(state.join("nested/record"), b"durable-state").expect("legacy state bytes");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o775)).expect("0775 root");
+    fs::set_permissions(state.join("nested"), fs::Permissions::from_mode(0o775))
+        .expect("0775 nested");
+    fs::set_permissions(
+        state.join("nested/record"),
+        fs::Permissions::from_mode(0o664),
+    )
+    .expect("0664 record");
+
+    let error = snapshot_owner_controlled_path(&state).expect_err("writable tree must fail");
+    assert!(error.to_string().contains("group/world writable"));
+
+    tighten_owner_controlled_path(&state).expect("tighten released modes");
+    snapshot_owner_controlled_path(&state).expect("snapshot tightened tree");
+    assert_eq!(
+        fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::metadata(state.join("nested"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::metadata(state.join("nested/record"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
 }
 
 #[test]

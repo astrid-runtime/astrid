@@ -9,6 +9,8 @@
 
 /// Capsule-level approval requests.
 pub(crate) mod approval;
+/// Audit records for approval checks.
+pub(crate) mod approval_audit;
 /// Producer-side tests for the per-action host-audit seam (the sink trait
 /// itself lives at [`crate::audit_sink`]).
 #[cfg(test)]
@@ -36,6 +38,8 @@ pub(crate) mod kv;
 pub(crate) mod net;
 /// Process spawning and sandboxing.
 pub mod process;
+/// Authenticated request ownership for local connection routing.
+pub(crate) mod request_context;
 /// Sentinel `Pollable` / `InputStream` / `OutputStream` impls used as
 /// no-panic placeholders by resource methods whose full implementation
 /// is still pending (stream-half adapter + per-resource pollable
@@ -43,6 +47,8 @@ pub mod process;
 pub(crate) mod stubs;
 /// System configuration primitives.
 pub mod sys;
+/// Audit of tool invocations delivered to tool capsules.
+pub mod tool_audit;
 /// Uplink communications with host capabilities.
 pub(crate) mod uplink;
 /// Utility functions for WASM host implementations.

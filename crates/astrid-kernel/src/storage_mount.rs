@@ -84,10 +84,14 @@ use retained_jobs::{
     BlockingJobDrain, drain_accepted_tasks, drain_blocking_jobs, endpoint_became_absent,
     finish_retained_jobs,
 };
+mod admin_projection;
+#[cfg(target_os = "macos")]
+mod callback_resolver;
 #[cfg(any(unix, windows))]
 mod process_broker;
 #[cfg(any(unix, windows))]
 mod retained_jobs;
+mod volume_info;
 #[cfg(all(test, any(unix, windows)))]
 pub(crate) use blocking_worker_gate::BlockingWorkerTestGate;
 #[cfg(any(unix, windows))]
@@ -282,6 +286,15 @@ pub(crate) async fn issue_lease(
     admission::record_authorized_caller(kernel, admission.caller().uid());
     refuse_if_retiring(kernel, admission.alias(), &view).await?;
     let (owner, target, proof) = resolve_owner(kernel, admission, access, &view, target).await?;
+    let mount_id = StorageMountId::new();
+    #[cfg(target_os = "macos")]
+    let callback_override = if provider == "astrid-storage-provider-fskit" {
+        Some(callback_resolver::resolve(mount_id).await?)
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "macos"))]
+    let callback_override = None;
     #[cfg(test)]
     admission::pause_issue_admission_for_test(kernel).await;
     // Publication and drain share this lock. Recheck the authorized UID
@@ -292,6 +305,8 @@ pub(crate) async fn issue_lease(
     revalidate_publication(kernel, admission, owner, &proof).await?;
     publish_issued_lease(
         kernel,
+        mount_id,
+        callback_override,
         admission.caller(),
         owner,
         view,
@@ -324,6 +339,8 @@ fn validate_issue_request(provider: &str, mountpoint: &Path) -> Result<(), Strin
 #[allow(clippy::too_many_arguments)]
 fn publish_issued_lease(
     kernel: &Arc<Kernel>,
+    mount_id: StorageMountId,
+    callback_override: Option<PathBuf>,
     caller: &PrincipalBinding,
     owner: StateOwner,
     view: StorageProviderViewV1,
@@ -332,7 +349,6 @@ fn publish_issued_lease(
     provider: String,
     mountpoint: PathBuf,
 ) -> Result<StorageMountLeaseV1, String> {
-    let mount_id = StorageMountId::new();
     #[cfg(unix)]
     let resource_path = private_mount_resource_path(mount_id)?;
     #[cfg(not(unix))]
@@ -341,8 +357,6 @@ fn publish_issued_lease(
         .run_dir()
         .join("mounts")
         .join(mount_id.to_string());
-    astrid_core::platform_fs::ensure_private_directory(&resource_path)
-        .map_err(|error| format!("create private mount resource: {error}"))?;
     let (token, token_hash) = generate_lease_token()?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (listener_closed_tx, _) = watch::channel(false);
@@ -354,9 +368,11 @@ fn publish_issued_lease(
         .join("mount-cleanup")
         .join(format!("{mount_id}.cleaned"));
     #[cfg(unix)]
-    let callback_path = resource_path.join("control.sock");
+    let callback_path = callback_override.unwrap_or_else(|| resource_path.join("control.sock"));
     #[cfg(not(unix))]
-    let callback_path = resource_path.join("control.endpoint");
+    let callback_path = callback_override.unwrap_or_else(|| resource_path.join("control.endpoint"));
+    astrid_core::platform_fs::ensure_private_directory(&resource_path)
+        .map_err(|error| format!("create private mount resource: {error}"))?;
     let state = Arc::new(StorageMountLeaseState {
         mount_id,
         requested_by: caller.alias().clone(),
@@ -752,6 +768,9 @@ async fn execute_operation(
     state: Arc<StorageMountLeaseState>,
     operation: StorageFilesystemOperationV1,
 ) -> StorageFilesystemOutcomeV1 {
+    if matches!(&operation, StorageFilesystemOperationV1::VolumeInfo) {
+        return volume_info::read(&kernel).await;
+    }
     let is_mutation = is_mutation(&operation);
     if !requires_mutation_serialization(&operation) && state.try_admit().is_none() {
         return failure("stale-lease", "storage mount lease is expired or revoked");
@@ -775,6 +794,7 @@ async fn execute_operation(
     };
     let owner = state.owner;
     let target = state.target.clone();
+    let runtime_home = kernel.astrid_home.clone();
     let retained_state = Arc::clone(&state);
     #[cfg(all(test, any(unix, windows)))]
     let blocking_worker_gate = state.blocking_worker_gate_for_test();
@@ -796,7 +816,11 @@ async fn execute_operation(
             match target {
                 StorageFilesystemTargetV1::OwnerRoot => {
                     let filesystem = AstridFilesystem::new(store.content(), owner);
-                    execute_blocking(&filesystem, operation)
+                    if owner == StateOwner::System && is_mutation {
+                        admin_projection::execute(&runtime_home, &store, operation)
+                    } else {
+                        execute_blocking(&filesystem, operation)
+                    }
                 },
                 StorageFilesystemTargetV1::WorkspaceBranch { workspace } => {
                     let branches = WorkspaceBranchStore::new(store.content());

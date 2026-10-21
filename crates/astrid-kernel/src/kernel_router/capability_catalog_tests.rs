@@ -1,7 +1,7 @@
 //! Drift checks for enforcement capability mappings and registry definitions.
 
 use astrid_core::capability_grammar::known_capabilities;
-use astrid_core::capability_registry::capability_registry_revision_1;
+use astrid_core::capability_registry::capability_registry_revision_2;
 use std::collections::BTreeSet;
 
 use crate::kernel_router::admin::required_capability_for_admin_request;
@@ -9,8 +9,8 @@ use crate::kernel_router::test_util::{all_admin_request_variants, all_kernel_req
 use crate::kernel_router::{AuthorityScope, required_capability};
 
 #[test]
-fn registry_revision_1_covers_every_kernel_request_cap() {
-    let registry = capability_registry_revision_1().unwrap();
+fn registry_revision_2_covers_every_kernel_request_cap() {
+    let registry = capability_registry_revision_2().unwrap();
     let registered = registry
         .entries()
         .iter()
@@ -22,15 +22,15 @@ fn registry_revision_1_covers_every_kernel_request_cap() {
             let cap = required_capability(&req, scope);
             assert!(
                 registered.contains(cap),
-                "kernel returns capability {cap:?} without a registry revision 1 entry"
+                "kernel returns capability {cap:?} without a registry revision 2 entry"
             );
         }
     }
 }
 
 #[test]
-fn registry_revision_1_covers_every_admin_request_cap() {
-    let registry = capability_registry_revision_1().unwrap();
+fn registry_revision_2_covers_every_admin_request_cap() {
+    let registry = capability_registry_revision_2().unwrap();
     let registered = registry
         .entries()
         .iter()
@@ -42,14 +42,14 @@ fn registry_revision_1_covers_every_admin_request_cap() {
             let cap = required_capability_for_admin_request(req, scope);
             assert!(
                 registered.contains(cap),
-                "admin op returns capability {cap:?} without a registry revision 1 entry"
+                "admin op returns capability {cap:?} without a registry revision 2 entry"
             );
         }
     }
 }
 
 #[test]
-fn registry_revision_1_freezes_the_complete_role_partition() {
+fn registry_revision_2_freezes_the_complete_role_partition() {
     let primary = BTreeSet::from([
         "system:shutdown",
         "system:status",
@@ -69,6 +69,7 @@ fn registry_revision_1_freezes_the_complete_role_partition() {
         "agent:disable",
         "agent:modify",
         "self:agent:list",
+        "self:distro:grant",
         "quota:set",
         "self:quota:set",
         "quota:get",
@@ -125,7 +126,7 @@ fn registry_revision_1_freezes_the_complete_role_partition() {
         .into_iter()
         .flat_map(|class| class.iter().copied())
         .collect::<BTreeSet<_>>();
-    let revision = capability_registry_revision_1().unwrap();
+    let revision = capability_registry_revision_2().unwrap();
     let revision_ids = revision
         .entries()
         .iter()

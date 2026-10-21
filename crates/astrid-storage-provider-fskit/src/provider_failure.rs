@@ -25,7 +25,7 @@ pub(crate) fn provider_failure(error: &anyhow::Error) -> StorageProviderFailureV
     };
     StorageProviderFailureV1 {
         code: code.to_owned(),
-        message: sanitize_provider_message(&error.to_string()),
+        message: sanitize_provider_message(&chained),
     }
 }
 
@@ -52,6 +52,18 @@ mod tests {
     use crate::mount_failure::{
         NativeMountFailure, classify_native_mount_failure, native_mount_failure_message,
     };
+
+    #[test]
+    fn native_busy_cause_survives_context_and_wire_encoding() {
+        let error = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ResourceBusy))
+            .context("unmount native filesystem /private/qa/mount");
+        let failure = provider_failure(&error);
+        let encoded = serde_json::to_vec(&failure).expect("encode native failure");
+        let decoded: StorageProviderFailureV1 =
+            serde_json::from_slice(&encoded).expect("decode native failure");
+        assert!(decoded.message.contains("/private/qa/mount"));
+        assert!(decoded.message.contains("busy"), "{}", decoded.message);
+    }
 
     #[test]
     fn helper_output_round_trips_json_as_a_named_cli_valid_gap() {

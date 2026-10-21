@@ -26,6 +26,12 @@ status = "covered"
 mode = "mutating"
 principal = "admin"
 
+[commands."agent claim"]
+scenario = "ownership_claim"
+status = "covered"
+mode = "mutating"
+principal = "admin"
+
 [commands."agent spawn"]
 scenario = "ephemeral_spawn"
 status = "mapped"
@@ -214,6 +220,18 @@ status = "covered"
 mode = "mutating"
 principal = "admin"
 
+[commands."quota assign-user"]
+scenario = "quota_user_recovery"
+status = "mapped"
+mode = "mutating"
+principal = "admin"
+
+[commands."quota users"]
+scenario = "quota_user_recovery"
+status = "mapped"
+mode = "read"
+principal = "admin"
+
 [commands."invite issue"]
 scenario = "invite_lifecycle"
 status = "covered"
@@ -285,6 +303,12 @@ scenario = "pair_device_lifecycle"
 status = "covered"
 mode = "mutating"
 principal = "agent_and_admin"
+
+[commands."pair-device redeem"]
+scenario = "pair_device_lifecycle"
+status = "covered"
+mode = "mutating"
+principal = "local_cli"
 
 [commands."secret set"]
 scenario = "secret_redaction"
@@ -368,6 +392,24 @@ principal = "admin"
 scenario = "audit_operator_controls"
 status = "mapped"
 mode = "mutating"
+principal = "admin"
+
+[commands."audit heads"]
+scenario = "audit_operator_controls"
+status = "mapped"
+mode = "read"
+principal = "admin"
+
+[commands."audit export"]
+scenario = "audit_operator_controls"
+status = "mapped"
+mode = "read"
+principal = "admin"
+
+[commands."audit anchor-status"]
+scenario = "audit_operator_controls"
+status = "mapped"
+mode = "read"
 principal = "admin"
 
 [commands."budget show"]
@@ -489,6 +531,37 @@ status = "covered"
 mode = "long_running"
 principal = "agent"
 
+[commands."mcp attach"]
+scenario = "mcp_bounded_smoke"
+status = "mapped"
+mode = "long_running"
+principal = "agent"
+
+[commands."mcp http"]
+scenario = "mcp_http_loopback_admission"
+status = "covered"
+mode = "bounded_failure"
+principal = "agent"
+reason = "Runtime CLI smoke executes public-bind refusal; scripts/test_mcp_http_live.py separately rehearses authenticated discovery and invocation against an installed broker."
+
+[commands."mcp gateway"]
+scenario = "mcp_bounded_smoke"
+status = "mapped"
+mode = "long_running"
+principal = "agent"
+
+[commands."mcp ready"]
+scenario = "mcp_bounded_smoke"
+status = "mapped"
+mode = "read"
+principal = "agent"
+
+[commands."mcp gc"]
+scenario = "mcp_bounded_smoke"
+status = "mapped"
+mode = "mutating"
+principal = "agent"
+
 [commands."distro apply"]
 scenario = "distro_lifecycle"
 status = "waived"
@@ -512,9 +585,9 @@ reason = "Remote distro update requires network release state; CI covers local l
 [commands."distro seal"]
 scenario = "distro_lifecycle"
 status = "covered"
-mode = "bounded_failure"
+mode = "filesystem"
 principal = "local_cli"
-reason = "The current seal resolver only accepts GitHub-backed capsule sources; the harness asserts that local archive sources fail before any network fetch."
+reason = "The harness seals authenticated relative capsules/*.capsule members from the Distro.toml directory and asserts that absolute sources escaping that directory fail closed."
 
 [commands."init"]
 scenario = "distro_onboarding"

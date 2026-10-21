@@ -7,48 +7,27 @@
 # 1. Selected project config — can only tighten security
 # 2. User config (~/.astrid/config.toml)
 # 3. System config (/etc/astrid/config.toml)
-# 4. Environment variables (ASTRID_*, ANTHROPIC_*) — fallback only, not override
+# 4. Environment variables (ASTRID_*) — fallback only, not override
 # 5. This defaults file (embedded in binary)
-
-# ============================================================================
-# Model Configuration
-# ============================================================================
-# Controls which LLM provider and model to use, along with generation settings.
-
-[model]
-# LLM provider to use. Currently supported: "claude"
-provider = "unknown"
-
-# Model identifier. Examples:
-# - "claude-sonnet-4-20250514" (Claude Sonnet 4)
-# - "claude-opus-4-6" (Claude Opus 4.6)
-# - "claude-sonnet-4-5-20250929" (Claude Sonnet 4.5)
-model = "unknown"
-
-# API key for the provider. If not set here, will be read from:
-# - ANTHROPIC_API_KEY environment variable (for Claude)
-# - OPENAI_API_KEY environment variable (for OpenAI, future)
-# api_key = ""
-
-# Custom API endpoint URL. Leave empty to use provider's default.
-# Useful for proxies, local models, or alternative endpoints.
-# api_url = ""
-
-# Maximum tokens to generate per response
-max_tokens = 4096
-
-# Sampling temperature (0.0-1.0). Higher = more random, lower = more deterministic
-temperature = 0.7
-
-# Pricing information for budget tracking (USD per million tokens)
-[model.pricing]
-input_per_million = 3.0
-output_per_million = 15.0
 
 # ============================================================================
 # Runtime Configuration
 # ============================================================================
+
+# Aggregate user execution budgets (operator-only; workspace overrides rejected).
+# Omitted limits preserve existing personal-install behavior. These meter WASM
+# guest fuel, not native host CPU time. Cooperative scheduling permits a
+# one-second burst; scheduling overshoot is repaid before further execution.
+# Changes apply on daemon restart.
+[resources]
+# default_user_cpu_fuel_per_sec = 2000000000
+# [resources.user_cpu_fuel_per_sec]
+# "<64-character canonical user UID>" = 4000000000
 # Controls the agent runtime behavior, context management, and system prompts.
+
+[filesystem]
+# Display label only; does not change provider identity or access control.
+volume_name = "Astrid"
 
 [runtime]
 # Maximum context window size in tokens (soft limit for summarization)
@@ -236,6 +215,30 @@ host_queue_capacity = 4096
 # Allowed stat/exists/readdir are not signed FileRead rows. Denied path
 # probes still persist. Set true to record every allowed probe.
 host_path_probes = false
+# Signed layout of new audit entries: "v1" (default) or "v2". v2 signs a
+# canonical CBOR body covering every field with keys/audit.key and verifies
+# entries against a cross-signed key registry. Enabling v2 is one-way for a
+# node: existing v1 entries stay as they are, and once the registry exists
+# the daemon keeps writing v2 even if this is set back to "v1". Only the
+# operator's global config can set it; a workspace config cannot.
+entry_format = "v1"
+# Host-call classes that fail closed. For these classes the effect runs only
+# after a write-ahead audit entry is durable; if it cannot be recorded, the
+# host call fails. Classes: file_read, file_write, file_delete, net_connect,
+# net_bind, process_spawn. Default: none (best-effort recording).
+host_fail_closed = []
+
+# Anchor-aware retention. A chain that an anchoring service has marked with
+# `audit.anchor_mark` is never pruned past its anchored watermark. These keys
+# are operator-only: a workspace config cannot change them.
+[audit.retention]
+# Refuse to prune chains that have no anchored watermark. At the global cap,
+# entries are then kept over the cap and `astrid audit stats` reports
+# degraded, instead of deleting unanchored history.
+require_anchor = false
+# Absolute directory that receives every pruned segment (signed receipt plus
+# the removed entries, one JSON line each) before deletion.
+# archive_dir = "/var/lib/astrid/audit-archive"
 
 # ============================================================================
 # Cryptographic Keys
@@ -378,8 +381,20 @@ health_interval_secs = 30
 # Grace period in seconds for clean shutdown before force-kill
 shutdown_timeout_secs = 30
 
+# MCP gateway shutdown grace after the final host connection closes.
+# Connected hosts stay alive even when they are not sending tool requests.
+idle_shutdown_secs = 30
+
 # Interval (seconds) between stale session cleanup sweeps.
 session_cleanup_interval_secs = 60
+
+# Starts only with `astrid mcp http`; no listener is enabled automatically.
+[gateway.mcp_http]
+listen = "127.0.0.1:8081"
+# Private file containing a random bearer token (at least 32 bytes).
+# token_file = "/path/to/mcp-http.token"
+# OAuth deployments configure [gateway.mcp_http.oauth]. Its JWKS policy defaults
+# to refresh_backoff=60s, cache_ttl=300s, timeout=10s, and max_response=1 MiB.
 
 # ============================================================================
 # Timeout Configuration
@@ -420,6 +435,10 @@ process_stop_ack_secs = 10
 # killed, and the maximum wait to reap it after the kill.
 process_reap_grace_secs = 10
 process_killed_reap_secs = 10
+
+# Allow short native unmount propagation after provider exit; persistent mounts
+# retain fenced leases instead of allowing cleanup to remove their roots.
+process_unmount_confirm_secs = 5
 
 # ============================================================================
 # Session Management

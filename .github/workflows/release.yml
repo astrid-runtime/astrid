@@ -6,6 +6,24 @@ on:
       - 'v[0-9]+.*'
       - '!v[0-9]+.*-nightly.*'
   workflow_dispatch:
+    inputs:
+      prepare_only:
+        description: Build Darwin binaries without certification or publication
+        required: false
+        default: false
+        type: boolean
+      prepare_set:
+        description: Prepare-only build set
+        required: false
+        default: darwin
+        type: choice
+        options:
+          - darwin
+          - musl
+      source_commit:
+        description: Exact protected-main commit to build
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -26,10 +44,12 @@ jobs:
       contents: read
     outputs:
       nightly: ${{ steps.release.outputs.nightly }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
       version: ${{ steps.release.outputs.version }}
       source-commit: ${{ steps.release.outputs.source-commit }}
+      build-matrix: ${{ steps.release.outputs.build-matrix }}
     steps:
-      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+      - uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -42,36 +62,56 @@ jobs:
         id: release
         env:
           EVENT_NAME: ${{ github.event_name }}
+          PREPARE_ONLY: ${{ inputs.prepare_only }}
+          PREPARE_SET: ${{ inputs.prepare_set }}
+          REQUESTED_SOURCE: ${{ inputs.source_commit }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          [[ "$GITHUB_REF" == refs/tags/v* ]]
-          VERSION="${GITHUB_REF_NAME#v}"
-          SOURCE_COMMIT=$(git rev-parse 'HEAD^{commit}')
-          if [[ "$EVENT_NAME" == push ]]; then
-            [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
-            NIGHTLY=false
-          elif [[ "$EVENT_NAME" == workflow_dispatch ]]; then
-            NIGHTLY_DATE="${VERSION#*-nightly.}"
-            NIGHTLY_DATE="${NIGHTLY_DATE%%.g*}"
-            RUN_CREATED_AT=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .created_at)
-            python3 scripts/nightly_version.py validate-dispatch \
-              --date "$NIGHTLY_DATE" \
-              --created-at "$RUN_CREATED_AT"
-            EXPECTED=$(python3 scripts/nightly_version.py derive \
-              --date "$NIGHTLY_DATE" \
-              --source-commit "$SOURCE_COMMIT")
-            [[ "$VERSION" == "$EXPECTED" ]]
+          BUILD_MATRIX=$(python3 scripts/classify_release_build_matrix.py)
+          if [[ "$EVENT_NAME" == workflow_dispatch && "$PREPARE_ONLY" == true ]]; then
+            [[ "$GITHUB_REF" == refs/heads/main ]]
+            [[ "$REQUESTED_SOURCE" =~ ^[0-9a-f]{40}$ ]]
             git fetch --no-tags origin main
-            git merge-base --is-ancestor "$SOURCE_COMMIT" origin/main
-            NIGHTLY=true
+            git merge-base --is-ancestor "$REQUESTED_SOURCE" origin/main
+            git checkout --detach --force "$REQUESTED_SOURCE"
+            [[ "$(git rev-parse 'HEAD^{commit}')" == "$REQUESTED_SOURCE" ]]
+            VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+            SOURCE_COMMIT="$REQUESTED_SOURCE"
+            NIGHTLY=false
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            SOURCE_COMMIT=$(git rev-parse 'HEAD^{commit}')
+            if [[ "$EVENT_NAME" == push ]]; then
+              python3 scripts/release_candidate.py validate-tag --version "$VERSION"
+              NIGHTLY=false
+            elif [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+              NIGHTLY_DATE="${VERSION#*-nightly.}"
+              NIGHTLY_DATE="${NIGHTLY_DATE%%.g*}"
+              RUN_CREATED_AT=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .created_at)
+              python3 scripts/nightly_version.py validate-dispatch \
+                --date "$NIGHTLY_DATE" \
+                --created-at "$RUN_CREATED_AT"
+              EXPECTED=$(python3 scripts/nightly_version.py derive \
+                --date "$NIGHTLY_DATE" \
+                --source-commit "$SOURCE_COMMIT")
+              [[ "$VERSION" == "$EXPECTED" ]]
+              git fetch --no-tags origin main
+              git merge-base --is-ancestor "$SOURCE_COMMIT" origin/main
+              NIGHTLY=true
+            else
+              echo "unsupported release event: $EVENT_NAME" >&2
+              exit 1
+            fi
           else
             echo "unsupported release event: $EVENT_NAME" >&2
             exit 1
           fi
           {
             echo "nightly=$NIGHTLY"
+            echo "prerelease=$([[ "$VERSION" == *-* ]] && echo true || echo false)"
             echo "version=$VERSION"
             echo "source-commit=$SOURCE_COMMIT"
+            echo "build-matrix=$BUILD_MATRIX"
           } >> "$GITHUB_OUTPUT"
 
   # ── Build binaries for each platform ──────────────────────────────
@@ -79,50 +119,19 @@ jobs:
     name: Build (${{ matrix.target }})
     needs: classify
     runs-on: ${{ matrix.os }}
+    env: { ASTRID_GIT_COMMIT: '${{ needs.classify.outputs.source-commit }}' }
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            archive: tar.gz
-            libc: native
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            archive: tar.gz
-            libc: native
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            archive: tar.gz
-            libc: native
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            archive: tar.gz
-            libc: gnu
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            archive: tar.gz
-            libc: gnu
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            archive: tar.gz
-            libc: musl
-            platform: linux/amd64
-            image: docker.io/library/rust@sha256:e98196986adced5602f6e21c54babdbf2a8700400c7a78868324a3630e0c5d15
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-24.04-arm
-            archive: tar.gz
-            libc: musl
-            platform: linux/arm64
-            image: docker.io/library/rust@sha256:594694ee6b07747b63b5c265be2616b62e814180b66227e2c18c6ee85e4136be
+      matrix: ${{ fromJSON(needs.classify.outputs.build-matrix) }}
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.classify.outputs.source-commit }}
           # astrid-capsule's build.rs stages WIT files from the
           # `wit/` submodule (astrid-runtime/wit) before bindgen
           # consumes them. Without recursive submodule checkout the
@@ -155,6 +164,9 @@ jobs:
       - name: Stage deterministic nightly version
         if: needs.classify.outputs.nightly == 'true'
         run: python3 scripts/nightly_version.py stage --version "${GITHUB_REF_NAME#v}"
+      - name: Stage release candidate version
+        if: needs.classify.outputs.prerelease == 'true' && needs.classify.outputs.nightly != 'true'
+        run: python3 scripts/release_candidate.py stage --version "${GITHUB_REF_NAME#v}"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -191,7 +203,13 @@ jobs:
       - name: Build, sign, and notarize AstridFS
         if: contains(matrix.target, 'apple-darwin')
         env:
-          ASTRID_FSKIT_DEVELOPMENT_TEAM: ${{ secrets.ASTRID_MACOS_DEVELOPMENT_TEAM_ID }}
+          ASTRID_MACOS_APP_PROVISIONING_PROFILE: ${{ secrets.ASTRID_MACOS_APP_PROVISIONING_PROFILE }}
+          ASTRID_MACOS_EXTENSION_PROVISIONING_PROFILE: ${{ secrets.ASTRID_MACOS_EXTENSION_PROVISIONING_PROFILE }}
+          ASTRID_MACOS_DEVELOPMENT_TEAM_ID: ${{ secrets.ASTRID_MACOS_DEVELOPMENT_TEAM_ID }}
+          ASTRID_MACOS_DEVELOPER_ID_P12: ${{ secrets.ASTRID_MACOS_DEVELOPER_ID_P12 }}
+          ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD }}
+          ASTRID_MACOS_NOTARY_APPLE_ID: ${{ secrets.ASTRID_MACOS_NOTARY_APPLE_ID }}
+          ASTRID_MACOS_NOTARY_APP_PASSWORD: ${{ secrets.ASTRID_MACOS_NOTARY_APP_PASSWORD }}
           ASTRID_FSKIT_CODE_SIGN_IDENTITY: ${{ vars.ASTRID_MACOS_DEVELOPER_ID_IDENTITY || 'Developer ID Application' }}
           ASTRID_FSKIT_ARCHS: ${{ matrix.target == 'x86_64-apple-darwin' && 'x86_64' || 'arm64' }}
           ASTRID_FSKIT_NOTARIZE: "1"
@@ -199,39 +217,35 @@ jobs:
           ASTRID_FSKIT_NOTARY_ISSUER_ID: ${{ secrets.ASTRID_MACOS_NOTARY_ISSUER_ID }}
           ASTRID_FSKIT_NOTARY_KEY: ${{ secrets.ASTRID_MACOS_NOTARY_KEY }}
         run: |
-          NOTARY_KEY_PATH="$RUNNER_TEMP/astrid-notary.p8"
-          printf '%s' "$ASTRID_FSKIT_NOTARY_KEY" > "$NOTARY_KEY_PATH"
-          chmod 0600 "$NOTARY_KEY_PATH"
-          export ASTRID_FSKIT_NOTARY_KEY_PATH="$NOTARY_KEY_PATH"
-          trap 'rm -f "$NOTARY_KEY_PATH"' EXIT
-          scripts/build-macos-fskit.sh
+          python3 scripts/ci/with_macos_profiles.py scripts/ci/import_macos_signing.sh
           echo "ASTRID_FSKIT_APP=$PWD/target/macos-fskit/DerivedData/Build/Products/Release/AstridFS.app" >> "$GITHUB_ENV"
+
+      - name: Sign the macOS FSKit companion
+        if: contains(matrix.target, 'apple-darwin')
+        env:
+          ASTRID_MACOS_DEVELOPMENT_TEAM_ID: ${{ secrets.ASTRID_MACOS_DEVELOPMENT_TEAM_ID }}
+          ASTRID_MACOS_DEVELOPER_ID_P12: ${{ secrets.ASTRID_MACOS_DEVELOPER_ID_P12 }}
+          ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD }}
+          MACOS_DEVELOPER_ID_IDENTITY: ${{ vars.ASTRID_MACOS_DEVELOPER_ID_IDENTITY }}
+        run: |
+          set -euo pipefail
+          COMPANION_TEAM=9BDSL5BJAP
+          COMPANION_IDENTIFIER=org.astrid.runtime.fs.storage-provider-fskit
+          COMPANION="$PWD/target/${{ matrix.target }}/release/astrid-storage-provider-fskit"
+          [[ -f "$COMPANION" && -x "$COMPANION" ]]
+          IDENTITY="${MACOS_DEVELOPER_ID_IDENTITY:-Developer ID Application}"
+          scripts/ci/import_macos_signing.sh --identity-only \
+            codesign --force --options runtime --timestamp \
+              --identifier "$COMPANION_IDENTIFIER" \
+              --sign "$IDENTITY" "$COMPANION"
+          COMPANION_SIGNATURE="$(codesign --display --verbose=4 "$COMPANION" 2>&1)"
+          grep -Fx "Identifier=$COMPANION_IDENTIFIER" <<<"$COMPANION_SIGNATURE" >/dev/null
+          grep -Fx "TeamIdentifier=$COMPANION_TEAM" <<<"$COMPANION_SIGNATURE" >/dev/null
+          codesign --verify --strict --verbose=2 "$COMPANION"
 
       - name: Select native binary root
         if: matrix.libc == 'native'
         run: echo "BINARY_ROOT=target/${{ matrix.target }}/release" >> "$GITHUB_ENV"
-
-      - name: Build the Windows WinFsp provider
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        run: cargo build --release --target ${{ matrix.target }} -p astrid-storage-provider-winfsp --locked
-
-      - name: Stage the pinned Windows WinFsp runtime
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: pwsh
-        run: |
-          $msi = Join-Path $env:RUNNER_TEMP "winfsp-2.1.25156.msi"
-          Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi" -OutFile $msi
-          $hash = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash
-          if ($hash -ne "073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A") {
-            throw "WinFsp MSI digest mismatch: $hash"
-          }
-          $exitCode = (Start-Process -FilePath "msiexec.exe" -ArgumentList @("/i", "`"$msi`"", "/qn", "/norestart") -Wait -PassThru).ExitCode
-          if ($exitCode -ne 0 -and $exitCode -ne 3010) {
-            throw "WinFsp installation failed with exit code $exitCode"
-          }
-          $installRoot = (Get-ItemProperty -Path "HKLM:\SOFTWARE\WOW6432Node\WinFsp").InstallDir
-          "WINFSP_MSI=$msi" | Add-Content -Encoding ascii -Path $env:GITHUB_ENV
-          "WINFSP_ROOT=$installRoot" | Add-Content -Encoding ascii -Path $env:GITHUB_ENV
 
       - name: Build Linux binaries against the glibc 2.31 baseline
         if: matrix.libc == 'gnu'
@@ -242,7 +256,7 @@ jobs:
         run: |
           SOURCE_SHA=$(git rev-parse --short=12 HEAD)
           docker run --rm \
-            --env CARGO_TERM_COLOR=always \
+            --env CARGO_TERM_COLOR=always --env ASTRID_GIT_COMMIT \
             --env SOURCE_SHA="$SOURCE_SHA" \
             --env TARGET \
             --volume "$PWD:/workspace" \
@@ -255,8 +269,7 @@ jobs:
                 packages+=(gcc-aarch64-linux-gnu libc6-dev-arm64-cross)
                 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
               fi
-              apt-get update
-              apt-get install -y --no-install-recommends "${packages[@]}"
+              bash scripts/ci/install_gnu_build_packages.sh "${packages[@]}"
               git config --global --add safe.directory /workspace
               [[ "$(git rev-parse --short=12 HEAD)" == "$SOURCE_SHA" ]]
               cargo build \
@@ -291,6 +304,7 @@ jobs:
           docker run --rm \
             --platform "$PLATFORM" \
             --env CARGO_TERM_COLOR=always \
+            --env ASTRID_GIT_COMMIT \
             --env SOURCE_SHA="$SOURCE_SHA" \
             --env TARGET \
             --volume "$PWD:/workspace" \
@@ -338,19 +352,13 @@ jobs:
 
       - name: Package binaries
         shell: bash
+        env:
+          VERSION: ${{ needs.classify.outputs.version }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
           TARGET="${{ matrix.target }}"
           DIR="astrid-${VERSION}-${{ matrix.target }}"
           mkdir "$DIR"
           EXE=""
-          if [[ "$TARGET" == x86_64-pc-windows-msvc ]]; then
-            EXE=".exe"
-            cp "$BINARY_ROOT/astrid-storage-provider-winfsp.exe" "$DIR/"
-            cp "$WINFSP_ROOT/bin/winfsp-x64.dll" "$DIR/"
-            cp "$WINFSP_MSI" "$DIR/winfsp-2.1.25156.msi"
-            cp scripts/install-windows.ps1 scripts/uninstall-windows.ps1 "$DIR/"
-          fi
           cp "$BINARY_ROOT/astrid$EXE" "$DIR/"
           cp "$BINARY_ROOT/astrid-daemon$EXE" "$DIR/"
           cp "$BINARY_ROOT/astrid-build$EXE" "$DIR/"
@@ -374,6 +382,7 @@ jobs:
             rm -rf "$EXTRACTION"
             mkdir -p "$EXTRACTION"
             tar -xzf "${DIR}.tar.gz" -C "$EXTRACTION"
+            export ASTRID_FSKIT_EXPECTED_VERSION="$VERSION"
             scripts/validate-macos-fskit.sh "$EXTRACTION/$DIR/AstridFS.app"
           else
             if [[ "$TARGET" == *-unknown-linux-* ]]; then
@@ -391,10 +400,54 @@ jobs:
           name: binary-${{ matrix.target }}
           path: ${{ env.ASSET }}
 
+  musl-certification:
+    name: Musl archive certification (${{ matrix.architecture }})
+    needs: [classify, build]
+    if: ${{ inputs.prepare_only == true && inputs.prepare_set == 'musl' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { architecture: x86_64, target: x86_64-unknown-linux-musl, runs-on: ubuntu-latest }
+          - { architecture: aarch64, target: aarch64-unknown-linux-musl, runs-on: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 30
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { ref: '${{ needs.classify.outputs.source-commit }}' }
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95.0"
+      - name: Set up certification tools
+        run: scripts/ci/setup_musl_certification.sh
+      - name: Download the packaged musl archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: 'binary-${{ matrix.target }}', path: '${{ runner.temp }}/musl-cert-artifact' }
+      - name: Certify the packaged musl archive
+        run: |
+          EXPECTED_VERSION='${{ needs.classify.outputs.version }}'
+          scripts/certify_musl_release_archive.sh --architecture "${{ matrix.architecture }}" --target "${{ matrix.target }}" --artifact-dir "$RUNNER_TEMP/musl-cert-artifact" --expected-version "$EXPECTED_VERSION"
+  fskit-certification:
+    name: Native FSKit mount certification
+    needs: [classify, build]
+    if: ${{ !inputs.prepare_only }}
+    uses: ./.github/workflows/supervised-storage-certification.yml
+    permissions:
+      contents: read
+      actions: read
+    with:
+      source_commit: ${{ needs.classify.outputs.source-commit }}
+
   # ── Create the GitHub release with all binaries ───────────────────
   github-release:
     name: GitHub Release
-    needs: [classify, build]
+    needs: [classify, build, fskit-certification]
+    if: ${{ !inputs.prepare_only }}
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -403,7 +456,7 @@ jobs:
       attestations: write
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
@@ -427,6 +480,9 @@ jobs:
       - name: Stage deterministic nightly version
         if: needs.classify.outputs.nightly == 'true'
         run: python3 scripts/nightly_version.py stage --version "${GITHUB_REF_NAME#v}"
+      - name: Stage release candidate version
+        if: needs.classify.outputs.prerelease == 'true' && needs.classify.outputs.nightly != 'true'
+        run: python3 scripts/release_candidate.py stage --version "${GITHUB_REF_NAME#v}"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -434,7 +490,7 @@ jobs:
           toolchain: "1.95.0"
 
       - name: Install pinned b3sum
-        run: cargo install b3sum --version 1.8.5 --locked
+        run: scripts/ci/setup_musl_certification.sh --b3sum-only
 
       - name: Download all binary artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -443,16 +499,11 @@ jobs:
           pattern: binary-*
           merge-multiple: true
 
-      # The whole notes document is assembled into a FILE and handed to the
-      # release action via `body_path`. An inline `body:` input reaches the
-      # action as an environment variable on its node process, and a large
-      # changelog section blows past the kernel's per-string env/arg ceiling
-      # (E2BIG, "Argument list too long") before the step can even start —
-      # exactly what killed the v0.9.0 release (#1105).
+      # Use body_path: inline notes can exceed the E2BIG environment limit (#1105).
       - name: Compose release notes
         env:
           GH_TOKEN: ${{ github.token }}
-          NIGHTLY: ${{ needs.classify.outputs.nightly }}
+          PRERELEASE: ${{ needs.classify.outputs.prerelease }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           NOTES=release-notes.md
@@ -460,7 +511,7 @@ jobs:
           # string, never a regex, so dots (or any metacharacter in a tag name)
           # cannot widen the match. Fragments must already be rolled into
           # CHANGELOG.md; this step refuses leftover files in changes/.
-          python3 scripts/changelog.py notes --version "$VERSION" --require-rolled > "$NOTES"
+          python3 scripts/changelog.py notes --version "${VERSION%%-rc.*}" --require-rolled > "$NOTES"
           if [ ! -s "$NOTES" ]; then
             echo "See [CHANGELOG.md](https://github.com/astrid-runtime/astrid/blob/${GITHUB_REF_NAME}/CHANGELOG.md) for details." > "$NOTES"
           fi
@@ -469,11 +520,11 @@ jobs:
           ## Install
           INSTALL
 
-          if [[ "$NIGHTLY" == true ]]; then
+          if [[ "$PRERELEASE" == true ]]; then
             cat >> "$NOTES" <<'INSTALL'
 
-          Nightly releases are available only as signed pre-built binaries and
-          through `astrid update --channel nightly`. They are not published to
+          Prereleases are available only as signed pre-built binaries and
+          through `astrid update --channel dev` (RCs) or `--channel nightly`. They are not published to
           crates.io or Homebrew.
           INSTALL
           else
@@ -504,14 +555,6 @@ jobs:
             astrid-*/astrid-build astrid-*/astrid-emit /usr/local/bin/
           astrid-*/macos/manage-macos-fskit.sh install
           astrid-*/macos/manage-macos-fskit.sh enable
-          ```
-
-          **Windows pre-built archive (PowerShell):**
-          ```powershell
-          tar -xzf astrid-*-x86_64-pc-windows-msvc.tar.gz
-          $release = Get-ChildItem -Directory "astrid-*-x86_64-pc-windows-msvc" |
-            Select-Object -First 1
-          & (Join-Path $release.FullName "install-windows.ps1")
           ```
 
           Astrid Runtime does not bundle a product distro. To compose it with a
@@ -565,6 +608,13 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           CARGO_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)
           test "$VERSION" = "$CARGO_VERSION"
+          if compgen -G "artifacts/*x86_64-pc-windows-msvc*" >/dev/null || \
+            compgen -G "artifacts/astrid-*-windows-release.toml*" >/dev/null || \
+            grep -Eq 'x86_64-pc-windows-msvc' \
+              artifacts/BLAKE3SUMS.txt artifacts/SHA256SUMS.txt; then
+            echo "stable release rejects Windows archives and Windows metadata" >&2
+            exit 1
+          fi
           SOURCE_COMMIT=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
           CONTRACTS_COMMIT=$(git -C wit rev-parse HEAD)
           python3 scripts/release_manifest.py generate \
@@ -587,15 +637,6 @@ jobs:
             --legacy-manifest "artifacts/astrid-${VERSION}-release.toml" \
             --artifacts artifacts \
             --verify-artifacts
-          python3 scripts/windows_release_manifest.py generate \
-            --artifacts artifacts \
-            --legacy-manifest "artifacts/astrid-${VERSION}-release.toml" \
-            --output "artifacts/astrid-${VERSION}-windows-release.toml"
-          python3 scripts/windows_release_manifest.py validate \
-            "artifacts/astrid-${VERSION}-windows-release.toml" \
-            --legacy-manifest "artifacts/astrid-${VERSION}-release.toml" \
-            --artifacts artifacts \
-            --verify-artifacts
           {
             echo "VERSION=$VERSION"
             echo "SOURCE_COMMIT=$SOURCE_COMMIT"
@@ -605,7 +646,7 @@ jobs:
       - name: Detect an interrupted never-published draft
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.nightly }}
+          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.prerelease }}
         run: |
           RELEASES="$RUNNER_TEMP/releases-preflight.json"
           gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
@@ -650,7 +691,7 @@ jobs:
       - name: Select and authenticate the exact release candidate
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.nightly }}
+          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.prerelease }}
         run: |
           CANDIDATE="$GITHUB_WORKSPACE/artifacts"
           PAYLOADS="$RUNNER_TEMP/release-payloads.txt"
@@ -811,7 +852,8 @@ jobs:
             --arg name "$CERTIFICATION_CHECK" \
             --arg source "$SOURCE_COMMIT" \
             '[.[] | .check_runs[] |
-              select(.name == $name and .head_sha == $source and
+              select((.name == $name or (.name | endswith(" / " + $name))) and
+                     .head_sha == $source and
                      .app.slug == "github-actions")] |
              sort_by(.started_at) | last |
              .status == "completed" and .conclusion == "success"' \
@@ -836,7 +878,7 @@ jobs:
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           draft: true
-          prerelease: ${{ needs.classify.outputs.nightly == 'true' }}
+          prerelease: ${{ needs.classify.outputs.prerelease == 'true' }}
           make_latest: false
           overwrite_files: false
           preserve_order: true
@@ -853,7 +895,7 @@ jobs:
         if: env.EXISTING_RELEASE != '1'
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.nightly }}
+          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.prerelease }}
         run: |
           RELEASES="$RUNNER_TEMP/releases-after-create.json"
           gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
@@ -866,7 +908,8 @@ jobs:
       - name: Reauthenticate and publish the exact immutable release
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.nightly }}
+          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.prerelease }}
+          NIGHTLY: ${{ needs.classify.outputs.nightly }}
           EXPECTED_SOURCE: ${{ needs.classify.outputs.source-commit }}
         run: |
           EXPECTED_LATEST=true
@@ -884,7 +927,7 @@ jobs:
           done
           [[ "$TAG_TYPE" == commit ]]
           [[ "$TAG_COMMIT" == "$EXPECTED_SOURCE" ]]
-          if [[ "$EXPECTED_PRERELEASE" == true ]]; then
+          if [[ "$NIGHTLY" == true ]]; then
             BASE_VERSION=$(python3 - <<'PY'
           import tomllib
           with open("release/nightly.toml", "rb") as file:

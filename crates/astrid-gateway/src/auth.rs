@@ -1,33 +1,26 @@
 //! Bearer-token signing, verification, and the principal-extraction
 //! middleware.
 //!
-//! ## Wire format (v2)
+//! ## Wire format (v3)
 //!
 //! ```text
-//! base64url(principal_id) "." base64url(issued_at_epoch) "." base64url(expires_at_epoch) "." hex(ed25519_sig)
+//! b64(principal) "." b64(iat) "." b64(exp) "." b64(key_id)-or-`~` "." request_owner_uuid "." hex(sig)
 //! ```
 //!
 //! The signature covers
-//! `principal_id || ":" || issued_at_epoch || ":" || expires_at_epoch`
-//! as raw bytes. Compact, easy to debug by eye, and tied to the
-//! same ed25519 primitive the rest of Astrid uses.
+//! `principal_id:issued_at_epoch:expires_at_epoch:key_id-or-~:request_owner_uuid`.
+//! The random request owner makes independently minted bearers distinct even
+//! when they are issued for the same principal during the same second.
 //!
 //! ## Device-scoped bearers (v2.1)
 //!
 //! A bearer may OPTIONALLY carry the `key_id` of the registered device key it
 //! was minted for, so a paired device's per-device scope can be enforced at
-//! the kernel cap-gate. This adds a fifth segment:
-//!
-//! ```text
-//! b64(principal) "." b64(iat) "." b64(exp) "." b64(key_id) "." hex(sig)
-//! ```
-//!
-//! whose signature covers `principal:iat:exp:key_id`. The two arities are
-//! distinguished by segment count alone — a 4-segment token is a legacy
-//! full-authority bearer (`device_key_id = None`), a 5-segment token is
-//! device-scoped. The `key_id` is part of the signed message, so it cannot be
-//! tampered with or stripped without invalidating the signature. Legacy
-//! 4-segment bearers keep verifying unchanged.
+//! the kernel cap-gate. The fourth segment is `~` for full-authority sessions
+//! and contains the base64url key id for device-scoped sessions. Legacy
+//! 4-segment full-authority and 5-segment device-scoped bearers keep verifying
+//! unchanged; their request owner is deterministically derived from the signed
+//! bearer because those formats did not carry a session nonce.
 //!
 //! The `issued_at_epoch` (`iat`) claim was added in v0.7.1 so the
 //! gateway can mint cryptographically-scoped revocations: when an
@@ -52,6 +45,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use astrid_core::PrincipalId;
+use astrid_events::ipc::RequestOwnerId;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
@@ -82,6 +76,26 @@ pub struct CallerContext {
     /// attenuation floor. Cryptographically bound: it is part of the signed
     /// message, so a tampered or stripped `key_id` fails verification.
     pub device_key_id: Option<String>,
+    /// Opaque owner of this authenticated bearer session.
+    ///
+    /// Derived from the verified bearer rather than supplied by an HTTP body,
+    /// so two independently authenticated sessions for one principal cannot
+    /// observe or answer each other's approval prompts. Reusing the same bearer
+    /// intentionally means reusing the same authenticated session.
+    pub request_owner: RequestOwnerId,
+}
+
+/// Stable, non-secret comparison handle for one authenticated bearer.
+///
+/// UUID v5 is used only as a compact deterministic encoding. The namespace is
+/// private to this protocol and the bearer contains an Ed25519 signature, so
+/// the resulting handle is not a credential and does not expose the bearer.
+fn request_owner_for_bearer(raw: &str) -> RequestOwnerId {
+    const NAMESPACE: uuid::Uuid = uuid::uuid!("b5742a04-3466-5af3-a65c-42b062736f86");
+    uuid::Uuid::new_v5(&NAMESPACE, raw.as_bytes())
+        .to_string()
+        .parse()
+        .expect("UUID v5 always parses as a request owner")
 }
 
 /// Mint a fresh session bearer for `principal`.
@@ -91,14 +105,15 @@ pub fn mint_bearer(signer: &SigningKey, principal: &PrincipalId, lifetime_secs: 
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let expires = now.saturating_add(lifetime_secs);
-    let msg = format!("{principal}:{now}:{expires}");
+    let request_owner = RequestOwnerId::generate();
+    let msg = format!("{principal}:{now}:{expires}:~:{request_owner}");
     let sig: Signature = signer.sign(msg.as_bytes());
 
     let p_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(principal.as_str());
     let i_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(now.to_string());
     let e_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(expires.to_string());
     let s_hex = hex::encode(sig.to_bytes());
-    format!("{p_b64}.{i_b64}.{e_b64}.{s_hex}")
+    format!("{p_b64}.{i_b64}.{e_b64}.~.{request_owner}.{s_hex}")
 }
 
 /// Mint a device-scoped session bearer for `principal` bound to the registered
@@ -120,7 +135,8 @@ pub fn mint_bearer_scoped(
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let expires = now.saturating_add(lifetime_secs);
-    let msg = format!("{principal}:{now}:{expires}:{key_id}");
+    let request_owner = RequestOwnerId::generate();
+    let msg = format!("{principal}:{now}:{expires}:{key_id}:{request_owner}");
     let sig: Signature = signer.sign(msg.as_bytes());
 
     let p_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(principal.as_str());
@@ -128,7 +144,7 @@ pub fn mint_bearer_scoped(
     let e_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(expires.to_string());
     let k_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_id);
     let s_hex = hex::encode(sig.to_bytes());
-    format!("{p_b64}.{i_b64}.{e_b64}.{k_b64}.{s_hex}")
+    format!("{p_b64}.{i_b64}.{e_b64}.{k_b64}.{request_owner}.{s_hex}")
 }
 
 /// Parse and verify a bearer token. Returns the [`CallerContext`] on
@@ -142,21 +158,22 @@ pub fn mint_bearer_scoped(
 /// snapshot would be worse than crashing the request handler, so we
 /// fail-stop on the auth path.
 pub fn verify_bearer(state: &GatewayState, raw: &str) -> Result<CallerContext, GatewayError> {
-    // `splitn(6, '.')` caps allocation at six slices regardless of input
+    // `splitn(7, '.')` caps allocation at seven slices regardless of input
     // length. Without the cap, an attacker sending an Authorization header
     // packed with dots would coerce `split('.')` into materialising millions
     // of empty slices — a cheap path to memory / CPU exhaustion against an
-    // unauthenticated route. Six is one beyond the largest valid arity (5), so
-    // a 6+ segment input still collapses to exactly six slices (the surplus
+    // unauthenticated route. Seven is one beyond the largest valid arity (6), so
+    // a 7+ segment input still collapses to exactly seven slices (the surplus
     // dots ride in the final slice) and is then rejected by the arity check
     // below — a malformed token never allocates unboundedly.
-    let parts: Vec<&str> = raw.splitn(6, '.').collect();
-    // Two valid arities: 4 = legacy full-authority bearer (no key_id), 5 =
-    // device-scoped bearer carrying a key_id. Any other length — including the
-    // capped 6-slice case above — is malformed and rejected before any decode.
-    let (key_id_seg, sig_seg) = match parts.len() {
-        4 => (None, 3),
-        5 => (Some(3usize), 4),
+    let parts: Vec<&str> = raw.splitn(7, '.').collect();
+    // Legacy arities are retained for sessions minted before this release.
+    // Current six-segment bearers carry both the optional key id and the signed
+    // request-owner nonce.
+    let (key_id_seg, owner_seg, sig_seg) = match parts.len() {
+        4 => (None, None, 3),
+        5 => (Some(3usize), None, 4),
+        6 => (Some(3usize), Some(4usize), 5),
         _ => return Err(GatewayError::Unauthorized),
     };
 
@@ -172,6 +189,7 @@ pub fn verify_bearer(state: &GatewayState, raw: &str) -> Result<CallerContext, G
     // The device key_id segment (5-segment form only). Decoded BEFORE the
     // signature so the signed message can be reconstructed exactly.
     let device_key_id = match key_id_seg {
+        Some(idx) if owner_seg.is_some() && parts[idx] == "~" => None,
         Some(idx) => {
             let k_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(parts[idx])
@@ -183,6 +201,10 @@ pub fn verify_bearer(state: &GatewayState, raw: &str) -> Result<CallerContext, G
         },
         None => None,
     };
+    let request_owner = owner_seg
+        .map(|idx| parts[idx].parse::<RequestOwnerId>())
+        .transpose()
+        .map_err(|_| GatewayError::Unauthorized)?;
     let s_bytes = hex::decode(parts[sig_seg]).map_err(|_| GatewayError::Unauthorized)?;
     if s_bytes.len() != ed25519_dalek::SIGNATURE_LENGTH {
         return Err(GatewayError::Unauthorized);
@@ -195,17 +217,26 @@ pub fn verify_bearer(state: &GatewayState, raw: &str) -> Result<CallerContext, G
     let expires_at_epoch: u64 = expires_str
         .parse()
         .map_err(|_| GatewayError::Unauthorized)?;
+    if issued_str != issued_at_epoch.to_string() || expires_str != expires_at_epoch.to_string() {
+        return Err(GatewayError::Unauthorized);
+    }
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
 
-    // Reconstruct the signed message for the bearer's arity. A 5-segment
-    // token signs `principal:iat:exp:key_id`, so a tampered or stripped
-    // key_id (or a 4-vs-5 arity swap) invalidates the signature.
-    let msg = match &device_key_id {
-        Some(key_id) => format!("{principal_str}:{issued_at_epoch}:{expires_at_epoch}:{key_id}"),
-        None => format!("{principal_str}:{issued_at_epoch}:{expires_at_epoch}"),
+    // Reconstruct the signed message for the bearer's generation. Current
+    // tokens bind both the optional key id and request-owner nonce. Legacy
+    // tokens retain their historical message shape.
+    let msg = match (&request_owner, &device_key_id) {
+        (Some(owner), key_id) => format!(
+            "{principal_str}:{issued_at_epoch}:{expires_at_epoch}:{}:{owner}",
+            key_id.as_deref().unwrap_or("~")
+        ),
+        (None, Some(key_id)) => {
+            format!("{principal_str}:{issued_at_epoch}:{expires_at_epoch}:{key_id}")
+        },
+        (None, None) => format!("{principal_str}:{issued_at_epoch}:{expires_at_epoch}"),
     };
     let mut sig_arr = [0u8; ed25519_dalek::SIGNATURE_LENGTH];
     sig_arr.copy_from_slice(&s_bytes);
@@ -264,6 +295,7 @@ pub fn verify_bearer(state: &GatewayState, raw: &str) -> Result<CallerContext, G
         issued_at_epoch,
         expires_at_epoch,
         device_key_id,
+        request_owner: request_owner.unwrap_or_else(|| request_owner_for_bearer(raw)),
     })
 }
 
@@ -307,6 +339,33 @@ mod tests {
     use super::*;
     use crate::state::SigningMaterial;
 
+    fn mint_legacy_bearer(
+        signer: &SigningKey,
+        principal: &PrincipalId,
+        key_id: Option<&str>,
+    ) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let expires = now.saturating_add(3600);
+        let msg = key_id.map_or_else(
+            || format!("{principal}:{now}:{expires}"),
+            |key_id| format!("{principal}:{now}:{expires}:{key_id}"),
+        );
+        let sig: Signature = signer.sign(msg.as_bytes());
+        let p = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(principal.as_str());
+        let i = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(now.to_string());
+        let e = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(expires.to_string());
+        let sig = hex::encode(sig.to_bytes());
+        match key_id {
+            Some(key_id) => {
+                let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_id);
+                format!("{p}.{i}.{e}.{key}.{sig}")
+            },
+            None => format!("{p}.{i}.{e}.{sig}"),
+        }
+    }
+
     fn test_state() -> Arc<GatewayState> {
         let cfg = crate::config::GatewayConfig::default();
         Arc::new(GatewayState {
@@ -343,20 +402,34 @@ mod tests {
     }
 
     #[test]
-    fn legacy_bearer_carries_no_device_key_id() {
-        // A 4-segment (legacy / full-authority) bearer verifies and resolves to
-        // `device_key_id = None` — unattenuated at the cap-gate, the existing
-        // behaviour for every pre-pairing session.
+    fn request_owner_is_stable_per_bearer_and_distinct_across_sessions() {
+        let state = test_state();
+        let alice = PrincipalId::new("alice").unwrap();
+        let alice_raw = mint_bearer(&state.signing.signer, &alice, 3600);
+        let other_alice_raw = mint_bearer(&state.signing.signer, &alice, 3600);
+
+        let first = verify_bearer(&state, &alice_raw).expect("first verify");
+        let repeated = verify_bearer(&state, &alice_raw).expect("repeated verify");
+        let other = verify_bearer(&state, &other_alice_raw).expect("other verify");
+
+        assert_ne!(alice_raw, other_alice_raw);
+        assert_eq!(first.request_owner, repeated.request_owner);
+        assert_ne!(first.request_owner, other.request_owner);
+    }
+
+    #[test]
+    fn unscoped_bearer_carries_no_device_key_id() {
         let state = test_state();
         let principal = PrincipalId::new("alice").unwrap();
         let raw = mint_bearer(&state.signing.signer, &principal, 3600);
+        assert_eq!(raw.split('.').count(), 6);
         let caller = verify_bearer(&state, &raw).expect("verify");
         assert_eq!(caller.device_key_id, None);
     }
 
     #[test]
     fn scoped_bearer_round_trips_and_carries_key_id() {
-        // A 5-segment device-scoped bearer verifies and surfaces the bound
+        // A current device-scoped bearer verifies and surfaces the bound
         // key_id, so the cap-gate can apply that device's scope.
         let state = test_state();
         let principal = PrincipalId::new("alice").unwrap();
@@ -371,6 +444,48 @@ mod tests {
     }
 
     #[test]
+    fn legacy_bearers_remain_valid_after_session_owner_upgrade() {
+        let state = test_state();
+        let principal = PrincipalId::new("alice").unwrap();
+        let unscoped = mint_legacy_bearer(&state.signing.signer, &principal, None);
+        let scoped = mint_legacy_bearer(&state.signing.signer, &principal, Some("dev-legacy"));
+
+        let unscoped_caller = verify_bearer(&state, &unscoped).expect("legacy unscoped verify");
+        let scoped_caller = verify_bearer(&state, &scoped).expect("legacy scoped verify");
+
+        assert_eq!(unscoped_caller.device_key_id, None);
+        assert_eq!(scoped_caller.device_key_id.as_deref(), Some("dev-legacy"));
+        assert_eq!(
+            unscoped_caller.request_owner,
+            request_owner_for_bearer(&unscoped)
+        );
+        assert_eq!(
+            scoped_caller.request_owner,
+            request_owner_for_bearer(&scoped)
+        );
+    }
+
+    #[test]
+    fn legacy_bearer_with_non_canonical_numeric_claim_rejected() {
+        let state = test_state();
+        let principal = PrincipalId::new("alice").unwrap();
+        let raw = mint_legacy_bearer(&state.signing.signer, &principal, None);
+        let parts: Vec<&str> = raw.split('.').collect();
+        let issued = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .expect("issued claim decodes");
+        let issued = std::str::from_utf8(&issued).expect("issued claim utf8");
+        let tampered_issued =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("0{issued}"));
+        let tampered = format!("{}.{tampered_issued}.{}.{}", parts[0], parts[2], parts[3]);
+
+        assert!(
+            verify_bearer(&state, &tampered).is_err(),
+            "legacy numeric claims must use their canonical signed encoding"
+        );
+    }
+
+    #[test]
     fn scoped_bearer_tampered_key_id_rejected() {
         // The key_id is part of the signed message, so swapping it for a
         // different (e.g. full-scope) device's id invalidates the signature —
@@ -379,13 +494,13 @@ mod tests {
         let principal = PrincipalId::new("alice").unwrap();
         let raw = mint_bearer_scoped(&state.signing.signer, &principal, "dev-scoped", 3600);
         let parts: Vec<&str> = raw.split('.').collect();
-        assert_eq!(parts.len(), 5, "scoped bearer must be 5 segments");
+        assert_eq!(parts.len(), 6, "scoped bearer must be 6 segments");
         // Replace the encoded key_id with a different device id but keep the
         // original signature.
         let forged_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("dev-full-admin");
         let tampered = format!(
-            "{}.{}.{}.{forged_key}.{}",
-            parts[0], parts[1], parts[2], parts[4]
+            "{}.{}.{}.{forged_key}.{}.{}",
+            parts[0], parts[1], parts[2], parts[4], parts[5]
         );
         assert!(
             verify_bearer(&state, &tampered).is_err(),
@@ -394,16 +509,17 @@ mod tests {
     }
 
     #[test]
-    fn scoped_bearer_stripped_to_legacy_rejected() {
-        // Dropping the key_id segment to forge a full-authority (4-seg) bearer
-        // out of a scoped one must fail: the signature was computed over the
-        // 5-segment message, so the reconstructed 4-segment message won't match.
+    fn scoped_bearer_stripped_to_unscoped_rejected() {
+        // Emptying the key_id segment to forge a full-authority bearer must
+        // fail because the key id is part of the signed message.
         let state = test_state();
         let principal = PrincipalId::new("alice").unwrap();
         let raw = mint_bearer_scoped(&state.signing.signer, &principal, "dev-scoped", 3600);
         let parts: Vec<&str> = raw.split('.').collect();
-        // Reassemble as 4 segments (principal.iat.exp.sig), dropping key_id.
-        let stripped = format!("{}.{}.{}.{}", parts[0], parts[1], parts[2], parts[4]);
+        let stripped = format!(
+            "{}.{}.{}.~.{}.{}",
+            parts[0], parts[1], parts[2], parts[4], parts[5]
+        );
         assert!(
             verify_bearer(&state, &stripped).is_err(),
             "stripping the key_id to forge a legacy bearer must fail"
@@ -442,7 +558,10 @@ mod tests {
         // segment-count guard.
         let parts: Vec<&str> = raw.split('.').collect();
         let eve = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("eve");
-        let tampered = format!("{eve}.{}.{}.{}", parts[1], parts[2], parts[3]);
+        let tampered = std::iter::once(eve.as_str())
+            .chain(parts[1..].iter().copied())
+            .collect::<Vec<_>>()
+            .join(".");
         assert!(verify_bearer(&state, &tampered).is_err());
     }
 
@@ -455,8 +574,8 @@ mod tests {
 
     #[test]
     fn dot_flood_does_not_allocate_unboundedly() {
-        // 10k dots → 10k+1 slices under split, but splitn(5) caps the
-        // alloc at 5 slices. We only assert behaviour (rejection +
+        // 10k dots → 10k+1 slices under split, but splitn(7) caps the
+        // alloc at 7 slices. We only assert behaviour (rejection +
         // bounded work); the real DoS proof is in the splitn contract.
         let state = test_state();
         let dot_bomb = ".".repeat(10_000);

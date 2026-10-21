@@ -19,6 +19,8 @@ use wasmtime::component::Resource;
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
 
+use super::audit::{HttpExchange, error_text};
+use super::credentials::strip_injected;
 use super::options::{
     ResolvedOptions, check_scheme, same_origin, strip_credentials, verify_integrity,
 };
@@ -27,6 +29,7 @@ use super::{
     ErrorCode, HttpMethod, HttpRequestData, HttpResponseData, HttpStream, KeyValuePair,
     RedirectPolicy, ResponseMeta,
 };
+use crate::audit_sink::HostAuditOutcome;
 
 /// Map an [`HttpMethod`] WIT variant to a `reqwest::Method`.
 pub(super) fn map_method(m: &HttpMethod) -> Result<reqwest::Method, ErrorCode> {
@@ -98,6 +101,10 @@ pub struct ActiveHttpStream {
     /// `timeout-config.between-bytes-ms`; defaults to the host
     /// [`HttpLimits::stream_read_timeout`](crate::engine::wasm::limits::HttpLimits::stream_read_timeout).
     pub read_timeout: Duration,
+    /// Audit exchange of the request that opened this stream. The response
+    /// hash is extended as chunks are delivered and the completion is
+    /// recorded at end of body, on a read error, or when the stream is closed.
+    pub(crate) audit: Arc<std::sync::Mutex<HttpExchange>>,
 }
 
 impl ActiveHttpStream {
@@ -121,6 +128,7 @@ impl ActiveHttpStream {
             status: 200,
             headers: Vec::new(),
             read_timeout: Duration::from_secs(120),
+            audit: Arc::default(),
         }
     }
 }
@@ -153,6 +161,9 @@ struct WireResponse {
     /// allowlist (or a runtime consent grant) — i.e. `egress_decision_*`
     /// returned an exempt host.
     exempt: bool,
+    /// Audit exchange opened by this hop's pre-commit; the consumer of the
+    /// response records its completion.
+    exchange: HttpExchange,
 }
 
 impl HostState {
@@ -211,6 +222,11 @@ impl HostState {
     /// Shared by the unified manual-redirect loop on BOTH the buffered and
     /// streaming paths. The egress decision is re-evaluated per hop, so a
     /// redirect to a different host re-runs the full airlock.
+    ///
+    /// A hop refused by the scheme check or the egress or security gate is
+    /// recorded as a denied HTTP request. A hop that passes is pre-committed to the audit log —
+    /// the host waits for the durable append — before it is sent; the
+    /// returned [`WireResponse`] carries the open exchange.
     async fn send_one_hop(
         &mut self,
         url: &str,
@@ -218,25 +234,66 @@ impl HostState {
         headers: &HeaderMap,
         body: Option<&[u8]>,
         opts: &ResolvedOptions,
+        redirect_hop: u32,
     ) -> Result<WireResponse, ErrorCode> {
-        check_scheme(url, opts.https_only)?;
+        if let Err(error) = check_scheme(url, opts.https_only) {
+            // A refused scheme is a refused request: record it like the other
+            // refusals whenever the URL parses at all.
+            if let Ok(parsed) = reqwest::Url::parse(url)
+                && let Some(precommit) =
+                    self.http_precommit(&parsed, method, headers, body, redirect_hop, &[])
+            {
+                precommit.deny("scheme denied");
+            }
+            return Err(error);
+        }
 
         let parsed = reqwest::Url::parse(url).map_err(|_| ErrorCode::InvalidRequest)?;
         let host = parsed.host_str().ok_or(ErrorCode::InvalidRequest)?;
         let port = parsed
             .port_or_known_default()
             .ok_or(ErrorCode::InvalidRequest)?;
+        let deny = |state: &Self, reason: &str| {
+            if let Some(precommit) =
+                state.http_precommit(&parsed, method, headers, body, redirect_hop, &[])
+            {
+                precommit.deny(reason);
+            }
+        };
         if !self.principal_egress_allows(host, Some(port)) {
+            deny(self, "principal egress denied");
             return Err(ErrorCode::CapabilityDenied);
         }
 
         let capsule_id = self.capsule_id.as_str().to_owned();
         let security = self.security.clone();
         let io_semaphore = self.io_semaphore.clone();
-        check_http_security(&security, capsule_id, url, method.as_str(), &io_semaphore).await?;
+        if let Err(error) =
+            check_http_security(&security, capsule_id, url, method.as_str(), &io_semaphore).await
+        {
+            deny(self, "security gate denied");
+            return Err(error);
+        }
 
-        let exempt_host = self.egress_decision_with_consent(url)?;
+        let exempt_host = match self.egress_decision_with_consent(url) {
+            Ok(exempt_host) => exempt_host,
+            Err(error) => {
+                deny(self, &error_text(&error));
+                return Err(error);
+            },
+        };
         let exempt = exempt_host.is_some();
+
+        // Host-side credential injection: `{{secret:NAME}}` placeholders in
+        // header values become the secret on the wire only. The audit
+        // commitment below is computed over the placeholder form.
+        let injected = match self.inject_credentials(headers) {
+            Ok(injected) => injected,
+            Err(error) => {
+                deny(self, &format!("credential injection refused: {error:?}"));
+                return Err(error.code());
+            },
+        };
 
         let tripped = Arc::new(AtomicBool::new(false));
         // Out-of-band DNS-miss flag: reqwest collapses a `dns_resolver` failure
@@ -254,10 +311,27 @@ impl HostState {
             reqwest::redirect::Policy::none(),
         )?;
 
-        let mut request_builder = client.request(method.clone(), url).headers(headers.clone());
+        let mut request_builder = client
+            .request(method.clone(), url)
+            .headers(injected.headers);
         if let Some(b) = body {
             request_builder = request_builder.body(b.to_vec());
         }
+
+        // Pre-commit: the request entry is durable before anything leaves
+        // the host (DNS resolution included).
+        let precommit = self.http_precommit(
+            &parsed,
+            method,
+            headers,
+            body,
+            redirect_hop,
+            &injected.names,
+        );
+        let mut exchange = match precommit {
+            Some(precommit) => precommit.commit().await,
+            None => HttpExchange::default(),
+        };
 
         // Header (time-to-first-byte) deadline — see [`header_deadline`].
         // `send().await` resolves once the response HEADERS arrive; the body is
@@ -266,19 +340,30 @@ impl HostState {
         // hangs before sending headers would block this future forever
         // (executor starvation).
         let header_deadline = header_deadline(opts, self.http_limits.header_deadline_floor);
-        let response = util::bounded_await(&io_semaphore, async move {
+        let sent = util::bounded_await(&io_semaphore, async move {
             match tokio::time::timeout(header_deadline, request_builder.send()).await {
                 Ok(result) => result.map_err(|e| airlock_or(&tripped, &dns_failed, &e)),
                 Err(_elapsed) => Err(ErrorCode::Timeout),
             }
         })
-        .await?;
+        .await;
+        let response = match sent {
+            Ok(response) => response,
+            Err(error) => {
+                exchange
+                    .finish(false, HostAuditOutcome::Failed(&error_text(&error)))
+                    .await;
+                return Err(error);
+            },
+        };
+        exchange.observe_response(&response);
 
         let content_length = response.content_length();
         Ok(WireResponse {
             response,
             content_length,
             exempt,
+            exchange,
         })
     }
 
@@ -304,6 +389,9 @@ impl HostState {
     /// - EXEMPT-NO-FOLLOW (both paths): if the hop that produced the 3xx was
     ///   operator-exempt, the response is returned as terminal without
     ///   following — the port-scoped allowlist must not widen via a redirect.
+    ///
+    /// The audit exchange of every followed or failed hop is completed here;
+    /// the terminal hop's exchange travels with the returned response.
     async fn follow_redirects(
         &mut self,
         request: &HttpRequestData,
@@ -321,84 +409,67 @@ impl HostState {
         let mut redirect_count: u32 = 0;
 
         loop {
-            let wire = self
+            let mut wire = self
                 .send_one_hop(
                     current_url.as_str(),
                     &method,
                     &headers,
                     body.as_deref(),
                     opts,
+                    redirect_count,
                 )
                 .await?;
             let status = wire.response.status();
 
             // A 3xx WITH a Location is a redirect; anything else (or a 3xx with
             // no Location) is the terminal response.
-            if status.is_redirection()
-                && let Some(location) = wire.response.headers().get(reqwest::header::LOCATION)
-            {
-                match opts.redirect {
-                    // Return the 3xx as-is.
-                    RedirectPolicy::Manual => return Ok((wire, redirect_count, current_url)),
-                    RedirectPolicy::Error => return Err(ErrorCode::RedirectBlocked),
-                    RedirectPolicy::Follow => {
-                        // Exempt-no-follow: an operator-blessed (allowlisted /
-                        // consent-granted) endpoint must not redirect past its
-                        // port-scoped allowlist — the resolver exemption is
-                        // host-only, so a 30x to a different port/host would
-                        // widen it. Return the 3xx as the terminal response
-                        // instead of following. (Only `Follow` is affected;
-                        // `Error`/`Manual` already encode the caller's intent.)
-                        if wire.exempt {
-                            return Ok((wire, redirect_count, current_url));
-                        }
-                        if redirect_count as usize >= opts.max_redirects {
-                            return Err(ErrorCode::TooManyRedirects);
-                        }
-                        let loc_str = location
-                            .to_str()
-                            .map_err(|_| ErrorCode::Protocol("invalid Location header".into()))?;
-                        // Resolve relative → absolute against the current URL.
-                        let next_url = current_url
-                            .join(loc_str)
-                            .map_err(|_| ErrorCode::Protocol("invalid redirect target".into()))?;
-                        // Per-hop SSRF re-validation on an IP-literal target
-                        // (hostnames are airlocked at resolution by the next
-                        // hop's `send_one_hop`). The hop ceiling is already
-                        // enforced above via `opts.max_redirects`.
-                        if redirect_target_blocked(next_url.host_str()) {
-                            return Err(ErrorCode::RedirectBlocked);
-                        }
-                        // Strip credentials on a cross-origin hop.
-                        if !same_origin(&current_url, &next_url) {
-                            strip_credentials(&mut headers);
-                        }
-                        // RFC 7231 method downgrade: 303 always → GET; 301/302
-                        // → GET except for GET/HEAD (de-facto browser behaviour
-                        // reqwest's default policy implements). 307/308 preserve
-                        // method + body. On a downgrade, drop the request body
-                        // and its content headers.
-                        let downgrade = status == reqwest::StatusCode::SEE_OTHER
-                            || ((status == reqwest::StatusCode::MOVED_PERMANENTLY
-                                || status == reqwest::StatusCode::FOUND)
-                                && method != reqwest::Method::GET
-                                && method != reqwest::Method::HEAD);
-                        if downgrade {
-                            method = reqwest::Method::GET;
-                            body = None;
-                            headers.remove(reqwest::header::CONTENT_TYPE);
-                            headers.remove(reqwest::header::CONTENT_LENGTH);
-                            headers.remove(reqwest::header::TRANSFER_ENCODING);
-                        }
-                        current_url = next_url;
-                        redirect_count += 1;
-                        continue;
+            let Some(location) = status
+                .is_redirection()
+                .then(|| wire.response.headers().get(reqwest::header::LOCATION))
+                .flatten()
+                .cloned()
+            else {
+                return Ok((wire, redirect_count, current_url));
+            };
+            let next_url =
+                match redirect_step(opts, wire.exempt, redirect_count, &current_url, &location) {
+                    Ok(Some(next_url)) => next_url,
+                    // Terminal 3xx (manual policy or exempt-no-follow).
+                    Ok(None) => return Ok((wire, redirect_count, current_url)),
+                    Err(error) => {
+                        wire.exchange
+                            .finish(false, HostAuditOutcome::Failed(&error_text(&error)))
+                            .await;
+                        return Err(error);
                     },
-                }
+                };
+            // The redirect body is discarded unread; this hop is complete.
+            wire.exchange.finish(false, HostAuditOutcome::Allowed).await;
+            // Strip credentials on a cross-origin hop, including every header
+            // that would carry a host-injected secret.
+            if !same_origin(&current_url, &next_url) {
+                strip_credentials(&mut headers);
+                strip_injected(&mut headers);
             }
-
-            // Terminal (non-redirect) response.
-            return Ok((wire, redirect_count, current_url));
+            // RFC 7231 method downgrade: 303 always → GET; 301/302
+            // → GET except for GET/HEAD (de-facto browser behaviour
+            // reqwest's default policy implements). 307/308 preserve
+            // method + body. On a downgrade, drop the request body
+            // and its content headers.
+            let downgrade = status == reqwest::StatusCode::SEE_OTHER
+                || ((status == reqwest::StatusCode::MOVED_PERMANENTLY
+                    || status == reqwest::StatusCode::FOUND)
+                    && method != reqwest::Method::GET
+                    && method != reqwest::Method::HEAD);
+            if downgrade {
+                method = reqwest::Method::GET;
+                body = None;
+                headers.remove(reqwest::header::CONTENT_TYPE);
+                headers.remove(reqwest::header::CONTENT_LENGTH);
+                headers.remove(reqwest::header::TRANSFER_ENCODING);
+            }
+            current_url = next_url;
+            redirect_count += 1;
         }
     }
 
@@ -432,6 +503,7 @@ impl HostState {
             response,
             content_length,
             exempt: _,
+            mut exchange,
         } = wire;
         let status = response.status().as_u16();
 
@@ -457,30 +529,50 @@ impl HostState {
         } else {
             None
         };
-        let body = util::bounded_await(&io_semaphore, async move {
+        // The loop hands back the bytes read so far even on failure, so the
+        // completion commits to exactly what the host received.
+        let (body, read_error) = util::bounded_await(&io_semaphore, async move {
             let mut response = response;
             let mut bytes = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(|e| map_reqwest_err(&e))? {
+            loop {
+                let chunk = match response.chunk().await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => return (bytes, None),
+                    Err(e) => return (bytes, Some(map_reqwest_err(&e))),
+                };
                 // `chunk()` yields decoded bytes when auto-decompress is on.
                 // Enforce the decompressed ceiling first (bomb defence), then
                 // the response cap. Both are hard limits.
                 if let Some(cap) = max_decompressed
                     && bytes.len() as u64 + chunk.len() as u64 > cap
                 {
-                    return Err(ErrorCode::DecompressionBomb);
+                    return (bytes, Some(ErrorCode::DecompressionBomb));
                 }
                 if bytes.len() as u64 + chunk.len() as u64 > max_response {
-                    return Err(ErrorCode::BodyTooLarge);
+                    return (bytes, Some(ErrorCode::BodyTooLarge));
                 }
                 bytes.extend_from_slice(&chunk);
             }
-            Ok(bytes)
         })
-        .await?;
-
-        if let Some(integrity) = &opts.integrity {
-            verify_integrity(integrity, &body)?;
+        .await;
+        exchange.begin_body();
+        exchange.digest(&body);
+        if let Some(error) = read_error {
+            exchange
+                .finish(false, HostAuditOutcome::Failed(&error_text(&error)))
+                .await;
+            return Err(error);
         }
+
+        if let Some(integrity) = &opts.integrity
+            && let Err(error) = verify_integrity(integrity, &body)
+        {
+            exchange
+                .finish(true, HostAuditOutcome::Failed(&error_text(&error)))
+                .await;
+            return Err(error);
+        }
+        exchange.finish(true, HostAuditOutcome::Allowed).await;
 
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         // wire-bytes is best-effort: content-length when the server sent it,
@@ -551,6 +643,8 @@ impl HostState {
             self.follow_redirects(&request, &stream_opts).await?;
 
         let response = wire.response;
+        let mut exchange = wire.exchange;
+        exchange.begin_body();
         let status = response.status().as_u16();
         let mut resp_headers = Vec::new();
         for (k, v) in response.headers() {
@@ -568,6 +662,7 @@ impl HostState {
             status,
             headers: resp_headers,
             read_timeout,
+            audit: Arc::new(std::sync::Mutex::new(exchange)),
         };
         let resource = self
             .resource_table
@@ -583,6 +678,50 @@ impl HostState {
         self.active_http_streams
             .insert(u64::from(resource.rep()), active);
         Ok(Resource::new_own(resource.rep()))
+    }
+}
+
+/// Decide what to do with a 3xx that carries a `Location`: `Ok(Some(url))`
+/// to follow it, `Ok(None)` to return it as the terminal response, or an
+/// error that ends the request.
+///
+/// - `Manual` → terminal.
+/// - `Error` → `RedirectBlocked`.
+/// - `Follow` → terminal when the hop was operator-exempt (an exempt endpoint
+///   must not redirect past its port-scoped allowlist — the resolver
+///   exemption is host-only, so a 30x to a different port/host would widen
+///   it); else bounded by `max_redirects` (`TooManyRedirects`), the
+///   `Location` resolved relative→absolute, and an IP-literal target blocked
+///   (`RedirectBlocked`; hostnames are airlocked at resolution by the next
+///   hop's `send_one_hop`).
+fn redirect_step(
+    opts: &ResolvedOptions,
+    exempt: bool,
+    redirect_count: u32,
+    current_url: &reqwest::Url,
+    location: &HeaderValue,
+) -> Result<Option<reqwest::Url>, ErrorCode> {
+    match opts.redirect {
+        RedirectPolicy::Manual => Ok(None),
+        RedirectPolicy::Error => Err(ErrorCode::RedirectBlocked),
+        RedirectPolicy::Follow => {
+            if exempt {
+                return Ok(None);
+            }
+            if redirect_count as usize >= opts.max_redirects {
+                return Err(ErrorCode::TooManyRedirects);
+            }
+            let loc_str = location
+                .to_str()
+                .map_err(|_| ErrorCode::Protocol("invalid Location header".into()))?;
+            let next_url = current_url
+                .join(loc_str)
+                .map_err(|_| ErrorCode::Protocol("invalid redirect target".into()))?;
+            if redirect_target_blocked(next_url.host_str()) {
+                return Err(ErrorCode::RedirectBlocked);
+            }
+            Ok(Some(next_url))
+        },
     }
 }
 
@@ -613,6 +752,7 @@ pub(super) async fn stream_read_chunk(
         .get::<ActiveHttpStream>(&Resource::new_borrow(rep))
         .map_err(|_| ErrorCode::Closed)?;
     let response_arc = stream.response.clone();
+    let audit = Arc::clone(&stream.audit);
     let read_timeout = stream.read_timeout;
     let cancel = state.effective_cancel_token();
     let sem = state.io_semaphore.clone();
@@ -622,12 +762,28 @@ pub(super) async fn stream_read_chunk(
         tokio::time::timeout(read_timeout, resp.chunk()).await
     })
     .await;
+    // The audit exchange hashes each delivered chunk and is completed at end
+    // of body or on a read error. A per-chunk timeout leaves it open: the
+    // guest may read again.
     let bytes_result: Result<Vec<u8>, ErrorCode> = match result {
-        None => Ok(Vec::new()), // cancelled
+        None => {
+            complete_stream(&audit, false, HostAuditOutcome::Failed("cancelled")).await;
+            Ok(Vec::new())
+        },
         Some(Err(_)) => Err(ErrorCode::Timeout),
-        Some(Ok(Err(e))) => Err(map_reqwest_err(&e)),
-        Some(Ok(Ok(Some(bytes)))) => Ok(bytes.to_vec()),
-        Some(Ok(Ok(None))) => Ok(Vec::new()), // EOF
+        Some(Ok(Err(e))) => {
+            let error = map_reqwest_err(&e);
+            complete_stream(&audit, false, HostAuditOutcome::Failed(&error_text(&error))).await;
+            Err(error)
+        },
+        Some(Ok(Ok(Some(bytes)))) => {
+            with_exchange(&audit, |exchange| exchange.digest(&bytes));
+            Ok(bytes.to_vec())
+        },
+        Some(Ok(Ok(None))) => {
+            complete_stream(&audit, true, HostAuditOutcome::Allowed).await;
+            Ok(Vec::new())
+        },
     };
     let bytes = bytes_result.as_ref().map(|v| v.len() as u64).unwrap_or(0);
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -656,19 +812,57 @@ pub(super) async fn stream_read_chunk(
     bytes_result
 }
 
+/// Run `f` on a stream's audit exchange (skipped if the lock is poisoned).
+fn with_exchange(audit: &std::sync::Mutex<HttpExchange>, f: impl FnOnce(&mut HttpExchange)) {
+    if let Ok(mut exchange) = audit.lock() {
+        f(&mut exchange);
+    }
+}
+
+/// Complete the audit exchange of a stream the guest closed or dropped. Not
+/// reading to the end is the guest's choice (for example after an SSE
+/// terminator), so the completion is successful but marked incomplete.
+fn close_stream_exchange(stream: &ActiveHttpStream) {
+    with_exchange(&stream.audit, |exchange| {
+        exchange.finish_detached(false, HostAuditOutcome::Allowed);
+    });
+}
+
+/// Complete a stream's audit exchange and wait until the record is durable.
+/// The lock is held only to take the record.
+async fn complete_stream(
+    audit: &std::sync::Mutex<HttpExchange>,
+    complete: bool,
+    outcome: HostAuditOutcome<'_>,
+) {
+    let completion = audit
+        .lock()
+        .ok()
+        .and_then(|mut exchange| exchange.take_completion(complete, outcome));
+    if let Some(completion) = completion {
+        completion.commit().await;
+    }
+}
+
 pub(super) fn stream_close(state: &mut HostState, rep: u32) -> Result<(), ErrorCode> {
-    let _ = state
+    if let Ok(stream) = state
         .resource_table
-        .delete::<ActiveHttpStream>(Resource::new_own(rep));
+        .delete::<ActiveHttpStream>(Resource::new_own(rep))
+    {
+        close_stream_exchange(&stream);
+    }
     // Release the quota slot (see the mirror insert in `http_stream_backend`).
     state.active_http_streams.remove(&u64::from(rep));
     Ok(())
 }
 
 pub(super) fn stream_drop(state: &mut HostState, rep: u32) {
-    let _ = state
+    if let Ok(stream) = state
         .resource_table
-        .delete::<ActiveHttpStream>(Resource::new_own(rep));
+        .delete::<ActiveHttpStream>(Resource::new_own(rep))
+    {
+        close_stream_exchange(&stream);
+    }
     // Release the quota slot (see the mirror insert in `http_stream_backend`).
     state.active_http_streams.remove(&u64::from(rep));
 }

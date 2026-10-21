@@ -23,6 +23,10 @@ use astrid_types::ipc::{IpcMessage, IpcPayload};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::warn;
 
+#[cfg(all(test, unix))]
+#[path = "socket_client/read_tests.rs"]
+mod read_tests;
+
 /// Path to the kernel's Unix-domain socket. Falls back to
 /// `/tmp/.astrid/run/system.sock` if `ASTRID_HOME` can't be resolved
 /// — matches the pre-existing CLI behaviour so single-host development
@@ -339,6 +343,22 @@ impl SocketClient {
         want_topic: &str,
         timeout: std::time::Duration,
     ) -> std::result::Result<serde_json::Value, ReadError> {
+        self.read_until_matching_typed(timeout, |raw| {
+            raw.get("topic").and_then(|t| t.as_str()) == Some(want_topic)
+        })
+        .await
+    }
+
+    /// Await a caller-validated response without restarting the deadline when
+    /// unrelated frames arrive. Used for success-or-terminal-failure waits.
+    ///
+    /// # Errors
+    /// Returns the same connection-loss and deadline errors as the topic wait.
+    pub async fn read_until_matching_typed(
+        &mut self,
+        timeout: std::time::Duration,
+        accepts: impl Fn(&serde_json::Value) -> bool,
+    ) -> std::result::Result<serde_json::Value, ReadError> {
         let deadline = tokio::time::Instant::now()
             .checked_add(timeout)
             .unwrap_or_else(tokio::time::Instant::now);
@@ -355,7 +375,7 @@ impl SocketClient {
                 // half-open socket), which is a connection-loss, not a timeout.
                 Ok(Ok(None)) => {
                     return Err(ReadError::ConnectionLost(anyhow::anyhow!(
-                        "connection closed before {want_topic}"
+                        "connection closed before matching response"
                     )));
                 },
                 // A read error (reset / broken pipe / over-large frame) is also
@@ -369,7 +389,7 @@ impl SocketClient {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            if raw.get("topic").and_then(|t| t.as_str()) == Some(want_topic) {
+            if accepts(&raw) {
                 return Ok(raw);
             }
         }

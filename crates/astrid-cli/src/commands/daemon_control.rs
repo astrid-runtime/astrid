@@ -33,9 +33,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// How long to wait for a signalled daemon to exit before escalating /
-/// giving up. Kept just above the kernel's own graceful-shutdown budget so a
-/// daemon mid-shutdown gets a fair chance to release the lock cleanly.
+/// Wait after a termination signal. Acknowledged graceful finalization uses
+/// the separate pre-mount client shutdown budget, not this escalation window.
 pub(crate) const GRACE: Duration = Duration::from_secs(3);
 
 /// Poll interval while waiting for a signalled process to exit.
@@ -52,6 +51,84 @@ const POLL: Duration = Duration::from_millis(100);
 pub(crate) fn read_pid_file(pid_path: &Path) -> Option<(u32, Option<PathBuf>)> {
     let contents = std::fs::read_to_string(pid_path).ok()?;
     parse_pid_file(&contents)
+}
+
+/// A recorded PID can become ready only while it still identifies the recorded
+/// executable. This is a non-signalling probe; reused or incomplete records
+/// must not justify waiting for an unrelated process to boot a daemon.
+pub(crate) fn recorded_process_matches(pid_path: &Path) -> bool {
+    read_pid_file(pid_path).is_some_and(|(pid, recorded_exe)| {
+        is_process_alive(pid)
+            && exe_matches(recorded_exe.as_deref(), exe_path_of_pid(pid).as_deref())
+    })
+}
+
+/// A captured daemon generation. The nonce is minted and published while the
+/// singleton lock is held; PID and executable path alone do not own it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DaemonIdentity {
+    pub pid: u32,
+    pub exe: Option<PathBuf>,
+    pub boot_nonce: Option<String>,
+}
+
+pub(crate) fn read_daemon_identity(pid_path: &Path) -> Option<DaemonIdentity> {
+    let contents = std::fs::read_to_string(pid_path).ok()?;
+    let mut lines = contents.lines();
+    let pid = parse_pid(lines.next()?)?;
+    let exe = lines
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let boot_nonce = lines
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .map(str::to_owned);
+    Some(DaemonIdentity {
+        pid,
+        exe,
+        boot_nonce,
+    })
+}
+
+pub(crate) async fn terminate_identity(identity: &DaemonIdentity, pid_path: &Path) -> KillOutcome {
+    if let Some(expected) = &identity.boot_nonce
+        && read_daemon_identity_from_contents(
+            &std::fs::read_to_string(pid_path).unwrap_or_default(),
+        )
+        .is_none_or(|current| current.boot_nonce.as_deref() != Some(expected.as_str()))
+    {
+        // Clean shutdown retires markers before the process exits. A missing
+        // generation forbids signalling, but does not prove the PID is live.
+        // Wait without signalling; cleanup still takes the singleton fence.
+        if wait_for_exit(identity.pid, GRACE).await {
+            return KillOutcome::NotRunning;
+        }
+        return KillOutcome::Unverified(identity.pid);
+    }
+    terminate_known(identity.pid, identity.exe.as_deref()).await
+}
+
+fn read_daemon_identity_from_contents(contents: &str) -> Option<DaemonIdentity> {
+    let mut lines = contents.lines();
+    let pid = parse_pid(lines.next()?)?;
+    let exe = lines
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let boot_nonce = lines
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    Some(DaemonIdentity {
+        pid,
+        exe,
+        boot_nonce,
+    })
 }
 
 /// Parse the PID-file body: first line = PID (required), optional second line =
@@ -93,6 +170,10 @@ pub(crate) fn is_process_alive(pid: u32) -> bool {
     if raw <= 0 {
         return false;
     }
+    #[cfg(target_os = "linux")]
+    if linux_process_is_reaped(pid) {
+        return false;
+    }
     let target = nix::unistd::Pid::from_raw(raw);
     // `kill(pid, 0)` succeeds when we may signal the process, and fails with
     // `EPERM` when the process exists but is owned by another user — both mean
@@ -102,6 +183,24 @@ pub(crate) fn is_process_alive(pid: u32) -> bool {
         nix::sys::signal::kill(target, None),
         Err(e) if e != nix::errno::Errno::EPERM
     )
+}
+
+/// Linux keeps an exited child in the process table as a zombie until its
+/// parent reaps it. `kill(pid, 0)` still succeeds for that entry even though it
+/// has released every lock and can never handle a signal. Container PID 1 is
+/// not necessarily an init/reaper, so treating that state as live makes a clean
+/// daemon shutdown time out and then fail its executable-identity check (a
+/// zombie has no `/proc/<pid>/exe`).
+#[cfg(target_os = "linux")]
+fn linux_process_is_reaped(pid: u32) -> bool {
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    status.lines().any(|line| {
+        line.strip_prefix("State:")
+            .and_then(|value| value.trim_start().as_bytes().first().copied())
+            .is_some_and(|state| matches!(state, b'Z' | b'X'))
+    })
 }
 
 #[cfg(not(unix))]
@@ -255,10 +354,10 @@ pub(crate) enum KillOutcome {
 /// state db), so the function is self-contained and unit-testable against any
 /// PID.
 pub(crate) async fn terminate_orphan(pid_path: &Path) -> KillOutcome {
-    let Some((pid, recorded_exe)) = read_pid_file(pid_path) else {
+    let Some(identity) = read_daemon_identity(pid_path) else {
         return KillOutcome::NotRunning;
     };
-    terminate_known(pid, recorded_exe.as_deref()).await
+    terminate_identity(&identity, pid_path).await
 }
 
 /// Terminate a daemon whose PID and recorded exe are ALREADY in hand — the
@@ -346,6 +445,40 @@ pub(crate) async fn wait_for_exit(pid: u32, budget: Duration) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn readiness_probe_requires_the_recorded_live_executable() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("system.pid");
+        assert!(!recorded_process_matches(&path));
+        let pid = std::process::id();
+        std::fs::write(&path, format!("{pid}\n")).unwrap();
+        assert!(!recorded_process_matches(&path));
+        std::fs::write(&path, format!("{pid}\n/nonexistent/astrid-daemon\n")).unwrap();
+        assert!(!recorded_process_matches(&path));
+        let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
+        std::fs::write(&path, format!("{pid}\n{}\n", exe.display())).unwrap();
+        assert!(recorded_process_matches(&path));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exited_unreaped_child_is_not_alive() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !linux_process_is_reaped(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(linux_process_is_reaped(pid), "child never became a zombie");
+        assert!(!is_process_alive(pid), "zombie must count as exited");
+        child.wait().expect("reap child after assertion");
+    }
+
     #[test]
     fn parse_pid_accepts_plain_integer() {
         assert_eq!(parse_pid("12345"), Some(12345));
@@ -376,6 +509,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("system.pid");
         assert_eq!(read_pid_file(&path), None);
+    }
+
+    #[test]
+    fn daemon_identity_binds_pid_exe_and_boot_nonce() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("system.pid");
+        std::fs::write(&path, "42\n/daemon\nnonce\n").unwrap();
+        assert_eq!(
+            read_daemon_identity(&path),
+            Some(DaemonIdentity {
+                pid: 42,
+                exe: Some(PathBuf::from("/daemon")),
+                boot_nonce: Some("nonce".into()),
+            })
+        );
     }
 
     #[test]
@@ -513,6 +661,63 @@ mod tests {
         std::fs::write(&path, format!("{me}")).unwrap();
         assert_eq!(terminate_orphan(&path).await, KillOutcome::Unverified(me));
         assert!(is_process_alive(me));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retired_generation_can_finish_exiting_without_being_signalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("system.pid");
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 0.05"])
+            .spawn()
+            .unwrap();
+        let identity = DaemonIdentity {
+            pid: child.id(),
+            exe: None,
+            boot_nonce: Some("retired-generation".into()),
+        };
+        // Reap concurrently: kill(pid, 0) can otherwise observe a zombie.
+        let reaper = std::thread::spawn(move || child.wait().unwrap());
+        assert_eq!(
+            terminate_identity(&identity, &path).await,
+            KillOutcome::NotRunning
+        );
+        assert!(reaper.join().unwrap().success(), "no signal may be sent");
+    }
+
+    #[tokio::test]
+    async fn captured_nonce_fails_closed_when_current_pid_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("system.pid");
+        let identity = DaemonIdentity {
+            pid: std::process::id(),
+            exe: std::env::current_exe().ok(),
+            boot_nonce: Some("captured-generation".into()),
+        };
+
+        assert_eq!(
+            terminate_identity(&identity, &path).await,
+            KillOutcome::Unverified(identity.pid)
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_nonce_fails_closed_when_current_pid_file_is_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("system.pid");
+        std::fs::write(&path, b"not-a-daemon-generation\n").unwrap();
+        let identity = DaemonIdentity {
+            pid: std::process::id(),
+            exe: std::env::current_exe().ok(),
+            boot_nonce: Some("captured-generation".into()),
+        };
+
+        assert_eq!(
+            terminate_identity(&identity, &path).await,
+            KillOutcome::Unverified(identity.pid)
+        );
+        assert!(is_process_alive(std::process::id()));
     }
 
     #[test]

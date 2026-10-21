@@ -112,6 +112,9 @@ pub(crate) struct AstridMcpServer {
     principal: PrincipalId,
     /// Runtime-home daemon identity. Host `--workspace` is the project, not this.
     daemon_root: PathBuf,
+    /// Host project root used by broker requests that resolve `cwd://` paths.
+    /// This is supplied by `mcp attach` and is never used as the daemon root.
+    workspace: PathBuf,
     /// Set when a prior round trip ended in a connection-loss condition (a
     /// failed send, or a reply read that hit EOF / reset). The NEXT round trip
     /// re-handshakes (`reconnect()`) before sending, so a request never goes
@@ -133,14 +136,16 @@ impl AstridMcpServer {
         client: Arc<Mutex<SocketClient>>,
         principal: PrincipalId,
         daemon_root: PathBuf,
-    ) -> Self {
-        Self {
+        workspace: PathBuf,
+    ) -> Result<Self, McpError> {
+        Ok(Self {
             client,
             principal,
             daemon_root,
+            workspace,
             needs_reconnect: AtomicBool::new(false),
-            mrtr: MrtrBridge::new(),
-        }
+            mrtr: MrtrBridge::new()?,
+        })
     }
 
     /// Reconnect the held uplink without ever retaining a client authenticated
@@ -180,6 +185,7 @@ impl AstridMcpServer {
         body: Value,
     ) -> Result<Value, McpError> {
         let reply_topic = astrid_types::Topic::kernel_response(req_id);
+        let body = self.with_workspace(body);
 
         let msg = astrid_types::ipc::IpcMessage::new(
             astrid_types::Topic::from_raw(request_topic),
@@ -235,10 +241,12 @@ impl AstridMcpServer {
         // daemon died while we waited) apart from a legitimate slow-broker
         // deadline.
         match client
-            .read_until_topic_typed(&reply_topic, REQUEST_DEADLINE)
+            .read_until_matching_typed(REQUEST_DEADLINE, |raw| {
+                super::terminal_failure::accepts(raw, &reply_topic, req_id, self.principal.as_str())
+            })
             .await
         {
-            Ok(raw) => Ok(unwrap_reply_payload(&raw)),
+            Ok(raw) => super::terminal_failure::reply(&raw, req_id, self.principal.as_str()),
 
             // Connection died mid-wait. The held socket is now unusable, so the
             // NEXT request must reconnect first — always flag that. Whether we
@@ -263,7 +271,9 @@ impl AstridMcpServer {
                         )
                     })?;
                     let raw = client
-                        .read_until_topic_typed(&reply_topic, REQUEST_DEADLINE)
+                        .read_until_matching_typed(REQUEST_DEADLINE, |raw| {
+                            super::terminal_failure::accepts(raw, &reply_topic, req_id, self.principal.as_str())
+                        })
                         .await
                         .map_err(|re| {
                             // Flag again — the retry's connection may also be dead.
@@ -276,7 +286,7 @@ impl AstridMcpServer {
                                 None,
                             )
                         })?;
-                    Ok(unwrap_reply_payload(&raw))
+                    super::terminal_failure::reply(&raw, req_id, self.principal.as_str())
                 } else {
                     // Mutating / side-effecting request: surface the loss to the
                     // MCP client (it must decide whether to re-issue), but keep
@@ -301,6 +311,19 @@ impl AstridMcpServer {
                 ))
             },
         }
+    }
+
+    /// Add host project context to each broker request without changing the
+    /// existing request envelope. The broker can ignore this field on older
+    /// versions; newer `cwd://` handlers use it as the explicit project root.
+    fn with_workspace(&self, mut body: Value) -> Value {
+        if let Value::Object(object) = &mut body {
+            object.insert(
+                "workspace".to_owned(),
+                Value::String(self.workspace.to_string_lossy().into_owned()),
+            );
+        }
+        body
     }
 }
 
@@ -428,6 +451,27 @@ fn next_grant_step(reply: &Value, grants_resolved: usize) -> GrantStep {
 }
 
 impl ServerHandler for AstridMcpServer {
+    fn accepted_subscription_filter(
+        &self,
+        requested: &rmcp::model::SubscriptionFilter,
+    ) -> Option<rmcp::model::SubscriptionFilter> {
+        (requested.tools_list_changed == Some(true)).then(|| {
+            rmcp::model::SubscriptionFilter::builder()
+                .tools_list_changed()
+                .build()
+        })
+    }
+
+    async fn listen(&self, context: rmcp::service::SubscriptionContext) -> Result<(), McpError> {
+        super::watch::run_subscription(
+            context,
+            self.principal.to_string(),
+            self.daemon_root.clone(),
+        )
+        .await;
+        Ok(())
+    }
+
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Borrowed(ASTRID_MCP_PROTOCOL_VERSIONS)
     }

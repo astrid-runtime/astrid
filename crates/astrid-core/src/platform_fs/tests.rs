@@ -141,6 +141,26 @@ fn unix_private_atomic_write_repairs_permissive_replacement() {
 
 #[cfg(unix)]
 #[test]
+fn unix_private_file_validation_rejects_external_hard_links() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().unwrap();
+    let volume = root.path().join("astrid.volume");
+    let external = root.path().join("external.volume");
+    std::fs::write(&volume, b"durable media").unwrap();
+    std::fs::set_permissions(&volume, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::hard_link(&volume, &external).unwrap();
+
+    let error = validate_private_file(&volume)
+        .expect_err("durable media with a second link must fail closed");
+    assert!(error.to_string().contains("2 links"), "{error}");
+
+    std::fs::remove_file(&external).unwrap();
+    assert!(validate_private_file(&volume).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
 fn unix_private_directory_validation_rejects_permissive_modes() {
     use std::os::unix::fs::PermissionsExt as _;
 

@@ -13,6 +13,8 @@ use rmcp::service::{
     ElicitationError, ElicitationMode, ElicitationSafe, Peer, RoleServer, ServiceError,
 };
 
+use super::consent_display::ConsentDisplay;
+
 /// Build the restricted form schema accepted by strict MCP clients.
 pub(super) fn interoperable_schema<T>() -> Result<ElicitationSchema, ElicitationError>
 where
@@ -36,14 +38,34 @@ where
     Ok(schema)
 }
 
+/// Build form elicitation params with structured consent display metadata.
+///
+/// Both the legacy `elicitation/create` path and MRTR `inputRequests` must
+/// use this helper so `params._meta["org.astrid/consent"]` cannot drift.
+pub(super) fn form_params<T>(
+    message: impl Into<String>,
+    display: &ConsentDisplay,
+) -> Result<ElicitRequestParams, ElicitationError>
+where
+    T: ElicitationSafe,
+{
+    Ok(ElicitRequestParams::FormElicitationParams {
+        meta: Some(display.to_request_meta()),
+        message: message.into(),
+        requested_schema: interoperable_schema::<T>()?,
+    })
+}
+
 /// Elicit a typed form while using the restricted interoperable wire schema.
 ///
 /// This intentionally mirrors `rmcp::Peer::elicit`: the capability check,
 /// response decoding, and error semantics remain identical. Only optional
-/// top-level schema annotations are removed.
+/// top-level schema annotations are removed. Consent display metadata rides
+/// in request `_meta`, never in `requestedSchema`.
 pub(super) async fn elicit<T>(
     peer: &Peer<RoleServer>,
     message: impl Into<String>,
+    display: &ConsentDisplay,
 ) -> Result<Option<T>, ElicitationError>
 where
     T: ElicitationSafe + for<'de> serde::Deserialize<'de>,
@@ -56,11 +78,7 @@ where
     }
 
     let response = peer
-        .create_elicitation(ElicitRequestParams::FormElicitationParams {
-            meta: None,
-            message: message.into(),
-            requested_schema: interoperable_schema::<T>()?,
-        })
+        .create_elicitation(form_params::<T>(message, display)?)
         .await?;
 
     match response.action {

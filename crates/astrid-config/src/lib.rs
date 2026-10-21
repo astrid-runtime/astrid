@@ -12,7 +12,10 @@
 //! // Load with full precedence chain (defaults → system → user → workspace → env).
 //! let resolved = Config::load(Some(std::path::Path::new("."))).unwrap();
 //! let config = resolved.config;
-//! println!("Using model: {}", config.model.model);
+//! println!(
+//!     "Max context tokens: {}",
+//!     config.runtime.max_context_tokens
+//! );
 //! ```
 //!
 //! # Configuration Precedence
@@ -22,7 +25,7 @@
 //! 1. **Workspace** (selected project state config) — can only *tighten* security
 //! 2. **User** (`~/.astrid/config.toml`)
 //! 3. **System** (`/etc/astrid/config.toml`)
-//! 4. **Environment variables** (`ASTRID_*`, `ANTHROPIC_*`) — fallback only
+//! 4. **Environment variables** (`ASTRID_*`) — fallback only
 //! 5. **Embedded defaults** (`defaults.toml` compiled into binary)
 //!
 //! Workspace file discovery accepts the runtime's validated
@@ -35,14 +38,25 @@
 #![deny(clippy::unwrap_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+/// Audit log settings, including anchor-aware retention.
+pub mod audit;
+/// Pre-mount client configuration.
+pub mod client;
 /// Environment variable fallback resolution.
 pub mod env;
 /// Configuration error types.
 pub mod error;
+/// Native filesystem presentation settings.
+pub mod filesystem;
+/// Gateway and MCP listener configuration.
+pub mod gateway;
 /// Configuration file discovery and loading.
 pub mod loader;
 /// Layered configuration merging with precedence.
 pub mod merge;
+/// Operator-selected native secret responders.
+pub mod native_input;
+pub mod resources;
 /// Resolved configuration display and serialization.
 pub mod show;
 /// Configuration struct definitions.
@@ -51,6 +65,7 @@ pub mod types;
 pub mod validate;
 
 // Re-export primary types at the crate root.
+pub use client::{ClientConfig, MAX_RUN_IDLE_TIMEOUT_SECS};
 pub use error::{ConfigError, ConfigResult};
 pub use show::{ResolvedConfig, ShowFormat};
 pub use types::*;

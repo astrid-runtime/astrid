@@ -52,7 +52,12 @@ fn capability_registry_revision_1_freezes_current_and_dormant_exact_ids() {
         .map(|entry| entry.id)
         .collect::<BTreeSet<_>>();
     assert_eq!(catalog.len(), KNOWN_CAPABILITIES_COUNT);
-    assert!(catalog.is_subset(&baseline));
+    let revision_1_catalog = {
+        let mut catalog = catalog.clone();
+        catalog.remove("self:distro:grant");
+        catalog
+    };
+    assert!(revision_1_catalog.is_subset(&baseline));
 
     let additions = baseline
         .difference(&catalog)
@@ -69,6 +74,55 @@ fn capability_registry_revision_1_freezes_current_and_dormant_exact_ids() {
             "authority:repair",
         ])
     );
+}
+
+#[test]
+fn capability_registry_revision_2_adds_only_distro_self_grant() {
+    let revision_1 = capability_registry_revision_1().unwrap();
+    let revision_2 = capability_registry_revision_2().unwrap();
+    let previous = revision_1
+        .entries()
+        .iter()
+        .map(|entry| entry.id().as_str())
+        .collect::<BTreeSet<_>>();
+    let current = revision_2
+        .entries()
+        .iter()
+        .map(|entry| entry.id().as_str())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(revision_2.schema_revision(), CAPABILITY_REGISTRY_REVISION_2);
+    assert_eq!(revision_2.entries().len(), 52);
+    assert_eq!(
+        current.difference(&previous).copied().collect::<Vec<_>>(),
+        ["self:distro:grant"]
+    );
+    assert!(previous.difference(&current).next().is_none());
+    revision_2.verify().unwrap();
+}
+
+#[test]
+fn capability_registry_revision_2_preserves_catalog_scope_and_danger() {
+    let manifest = capability_registry_revision_2().unwrap();
+    for catalog_entry in CAPABILITY_CATALOG {
+        let registered = manifest
+            .entries()
+            .iter()
+            .find(|entry| entry.id().as_str() == catalog_entry.id)
+            .unwrap_or_else(|| panic!("missing catalog capability {}", catalog_entry.id));
+        assert_eq!(
+            registered.scope(),
+            catalog_entry.scope,
+            "{}",
+            catalog_entry.id
+        );
+        assert_eq!(
+            registered.danger(),
+            catalog_entry.danger,
+            "{}",
+            catalog_entry.id
+        );
+    }
 }
 
 #[test]
@@ -100,6 +154,9 @@ fn capability_registry_revision_1_contains_every_fixed_definition() {
 fn capability_registry_revision_1_preserves_catalog_scope_and_danger() {
     let manifest = capability_registry_revision_1().unwrap();
     for catalog_entry in CAPABILITY_CATALOG {
+        if catalog_entry.id == "self:distro:grant" {
+            continue;
+        }
         let registered = manifest
             .entries()
             .iter()
@@ -392,6 +449,31 @@ fn capability_registry_revision_1_digest_vectors_are_stable() {
     assert_eq!(
         manifest.digest().to_hex(),
         "111cf3fe35104ccd25767d3f0b85778c0bb2561d10016f56ac868de4607940e6"
+    );
+}
+
+#[test]
+fn capability_registry_revision_2_distro_self_grant_digest_is_stable() {
+    let revision_1 = capability_registry_revision_1().unwrap();
+    let revision_2 = capability_registry_revision_2().unwrap();
+    let added = revision_2
+        .entries()
+        .iter()
+        .find(|entry| entry.id().as_str() == "self:distro:grant")
+        .unwrap();
+    assert!(
+        !revision_1
+            .entries()
+            .iter()
+            .any(|entry| entry.id().as_str() == "self:distro:grant")
+    );
+    assert_eq!(
+        added.entry_digest().to_hex().as_str(),
+        "e7693d5a7054a15f5ddea24eabf5b1ba884c221a9f5fe9a241b9f1437b7a413e"
+    );
+    assert_eq!(
+        revision_2.digest().to_hex().as_str(),
+        "1dcbe2d457f510e0f425c5f6372977636196d654688067feb9ae64ec72892279"
     );
 }
 

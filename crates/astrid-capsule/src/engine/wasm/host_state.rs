@@ -192,6 +192,9 @@ pub struct ConnectionIdentity {
     /// The `key_id` of the device key that verified the challenge, if the
     /// principal authenticated via the keypair challenge.
     pub device_key_id: Option<String>,
+    /// Opaque owner minted for this authenticated connection. Interactive
+    /// responses must carry this exact host-stamped value.
+    pub request_owner: astrid_events::ipc::RequestOwnerId,
 }
 
 /// Caller-supplied inputs for [`HostState::for_hook`].
@@ -291,6 +294,11 @@ pub struct HostState {
     /// path) share one filesystem, and a spawned `cargo` sees the CoW writes.
     /// See `astrid_vfs::workspace_cow`.
     pub workspace_root: PathBuf,
+    /// Pristine hosted portal path for durable command grants.
+    /// Distinct from [`Self::workspace_root`] (runtime-effective merged/git
+    /// path used for FS confinement). `HostedPortal`: the source before `CoW`.
+    /// Git-managed: same as `workspace_root`. Astrid filesystem: empty.
+    pub hosted_workspace_root: PathBuf,
     /// Copy-on-write bookkeeping dirs (the overlayfs upper/work, or the pristine
     /// workspace under APFS) that the OS sandbox MUST mask from spawned
     /// children, so a child cannot write them directly and bypass the workspace
@@ -413,6 +421,8 @@ pub struct HostState {
     pub invocation_env_overlay: Option<HashMap<String, String>>,
     /// System Event Bus for IPC publish/subscribe.
     pub event_bus: astrid_events::EventBus,
+    /// Private secret replies; unset until an authenticated responder is bound.
+    pub secret_elicits: Option<Arc<crate::elicitation::PendingSecretElicits>>,
     /// Shared generation-publication fence for every routed subscription this
     /// Store creates. Prepared runtimes keep it staged until registry publish.
     pub route_admission_gate: astrid_events::RouteAdmissionGate,
@@ -443,6 +453,11 @@ pub struct HostState {
     /// first and falls through to host-wide regardless of where the
     /// operator stored the value.
     pub secret_env: std::collections::HashSet<String>,
+    /// Secret values `get_config` handed to this instance, kept host-side so
+    /// the HTTP audit redacts them from request commitments.
+    pub revealed_secrets: crate::engine::wasm::host::http::RevealedSecrets,
+    /// Tool result published during the current invocation, for its audit.
+    pub tool_result: Option<crate::engine::wasm::host::tool_audit::ToolResultCapture>,
     /// Legacy secret-root context retained for migration compatibility.
     /// Runtime secret lookup never reads this path; released homes must be
     /// imported explicitly with [`astrid_storage::env::import_legacy_scope`].
@@ -712,6 +727,10 @@ pub struct HostState {
     /// effective capabilities. `None` for an unbound connection or a binding
     /// that carried no specific device.
     pub ingress_device_key_id: Option<String>,
+    /// Host-minted request owner for the source connection whose inbound frame
+    /// is currently in flight. Set and cleared with the other ingress identity
+    /// fields; `publish-as` propagates it without accepting a guest override.
+    pub ingress_request_owner: Option<astrid_events::ipc::RequestOwnerId>,
     /// The transport origin of the source connection whose inbound frame is
     /// currently in flight — the per-frame companion to
     /// [`ingress_principal`](Self::ingress_principal), feeding the host-stamped
@@ -767,21 +786,21 @@ pub struct HostState {
     /// `bind_workers > 1` worker Stores. N=1 (and interceptor/lifecycle
     /// HostStates) keep the historical AddressInUse on a second bind.
     pub share_tcp_listeners: bool,
-    /// Bound run-loop CPU-bound signal: set `true` by the ipc `recv` host fn
-    /// each time the guest blocks on recv, read + cleared by the run-loop's
+    /// Bound run-loop CPU-bound signal: set by recv/accept or a completed
+    /// nonzero sleep, read + cleared by the run-loop's
     /// epoch-deadline callback once per window.
     ///
     /// This is the cooperative-yield signal that distinguishes a legitimate
-    /// recv/accept loop (sets it every iteration → never trapped) from a
+    /// recv/accept/sleep loop (sets it every iteration → never trapped) from a
     /// no-recv spinner (never sets it → interrupt-trapped after
     /// `MAX_NO_YIELD_WINDOWS`). Only the dedicated, mutex-guarded run-loop
     /// Store reads it; pooled/lifecycle Stores leave it inert. Single Store =
     /// single thread, so the callback and the host fn never race.
     pub recv_yielded: bool,
     /// Bound run-loop CPU-bound counter: consecutive epoch windows in which
-    /// the guest burned CPU without a single `recv` (`recv_yielded` stayed
+    /// the guest burned CPU without a cooperative wait (`recv_yielded` stayed
     /// false). The run-loop epoch callback increments it each no-recv window
-    /// and traps the guest once it reaches `MAX_NO_YIELD_WINDOWS`; a recv
+    /// and traps the guest once it reaches `MAX_NO_YIELD_WINDOWS`; a wait
     /// resets it to 0. Inert for pooled/lifecycle Stores.
     pub no_yield_windows: u32,
     /// Synchronous sink for sensitive per-action host calls (fs read/write/
@@ -944,37 +963,6 @@ mod effective;
 mod hook;
 #[path = "host_state_invocation.rs"]
 mod invocation;
-
-impl std::fmt::Debug for HostState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HostState")
-            .field("capsule_id", &self.capsule_id)
-            .field("workspace_root", &self.workspace_root)
-            .field("vfs_root_handle", &self.vfs_root_handle)
-            .field("has_home", &self.home.is_some())
-            .field("has_tmp", &self.tmp.is_some())
-            .field("has_security", &self.security.is_some())
-            .field("has_uplink_capability", &self.has_uplink_capability)
-            .field("audit_firehose", &self.audit_firehose)
-            .field("has_inbound_tx", &self.inbound_tx.is_some())
-            .field("registered_uplinks", &self.registered_uplinks.len())
-            .field(
-                "blocking_semaphore_permits",
-                &self.blocking_semaphore.available_permits(),
-            )
-            .field(
-                "io_semaphore_permits",
-                &self.io_semaphore.available_permits(),
-            )
-            .field("cancel_token_cancelled", &self.cancel_token.is_cancelled())
-            .field("has_identity_store", &self.identity_store.is_some())
-            .field("active_http_streams", &self.active_http_streams.len())
-            .field("http_limits", &self.http_limits)
-            .field("process_tracker", &self.process_tracker)
-            .field("persistent_processes", &self.persistent_processes)
-            .finish_non_exhaustive()
-    }
-}
 
 #[cfg(test)]
 #[path = "host_state_tests.rs"]

@@ -43,9 +43,16 @@ impl WorkspaceMountResolver for WorkspaceBranchResolver {
     }
 }
 
+mod accounted_store;
 mod bind_workers;
 #[allow(unreachable_pub)]
 pub(crate) mod bindings;
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "catalog_load_tests.rs"]
+mod catalog_load_tests;
+mod content_source;
+#[cfg(test)]
+mod fuel_scheduling_tests;
 pub mod host;
 pub mod host_state;
 mod host_state_authority;
@@ -53,11 +60,22 @@ mod host_state_authority;
 #[path = "host_state_authority_tests.rs"]
 mod host_state_authority_tests;
 mod host_state_types;
+#[cfg(test)]
+mod interruption_tests;
+mod invocation_failure;
+#[cfg(test)]
+#[path = "lifecycle_audit_tests.rs"]
+mod lifecycle_audit_tests;
+#[cfg(test)]
+mod lifecycle_cpu_tests;
 pub mod limits;
 mod pool;
 mod storage_vfs;
 #[cfg(test)]
 mod test_fixtures;
+#[cfg(all(test, unix))]
+#[path = "workspace_git_discovery_tests.rs"]
+mod workspace_git_discovery_tests;
 
 /// Today's date as `YYYY-MM-DD` for daily log rotation.
 fn today_date_string() -> String {
@@ -112,32 +130,6 @@ fn prune_old_logs(log_dir: &std::path::Path, max_days: u64) {
         {
             let _ = std::fs::remove_file(entry.path());
         }
-    }
-}
-
-/// Read the expected WASM hash from `meta.json` in the capsule directory.
-fn read_expected_wasm_hash(capsule_dir: &std::path::Path) -> Option<String> {
-    let meta_path = capsule_dir.join("meta.json");
-    let content = std::fs::read_to_string(&meta_path).ok()?;
-    let meta: serde_json::Value = serde_json::from_str(&content).ok()?;
-    meta.get("wasm_hash")?.as_str().map(String::from)
-}
-
-/// Resolve a content-addressed WASM binary from `lib/{hash}.wasm`.
-///
-/// Reads `meta.json` in the capsule dir to find the `wasm_hash` field,
-/// then resolves the path in the Astrid home `lib/` directory.
-fn resolve_content_addressed_wasm(capsule_dir: &std::path::Path) -> Option<PathBuf> {
-    let meta_path = capsule_dir.join("meta.json");
-    let content = std::fs::read_to_string(&meta_path).ok()?;
-    let meta: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let hash = meta.get("wasm_hash")?.as_str()?;
-    let home = astrid_core::dirs::AstridHome::resolve().ok()?;
-    let wasm_path = home.bin_dir().join(format!("{hash}.wasm"));
-    if wasm_path.exists() {
-        Some(wasm_path)
-    } else {
-        None
     }
 }
 
@@ -335,6 +327,7 @@ pub struct WasmEngine {
     /// Fail-OPEN on the window math (non-poisoning `parking_lot` + saturating
     /// arithmetic); the orthogonal exemption decision fails CLOSED.
     fuel_rate: crate::FuelRateLimiter,
+    user_cpu: Option<Arc<crate::user_cpu::UserCpuAccounting>>,
     /// Live group config from [`CapsuleContext`].
     ///
     /// `invoke_interceptor` loads this for [`resolve_exemption`] so the CPU-rate
@@ -566,6 +559,7 @@ impl WasmEngine {
             fuel_ledger,
             memory_ledger,
             fuel_rate,
+            user_cpu: None,
             group_config: None,
             runtime_limits,
             http_limits,
@@ -768,7 +762,7 @@ const WASM_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 ///
 /// One tick is [`EPOCH_TICK_INTERVAL`] (100 ms), so the default ~5 s window is
 /// `5000 / 100 = 50` ticks. Each window the bound run-loop's
-/// `epoch_deadline_callback` fires: a recv/accept loop (which set
+/// `epoch_deadline_callback` fires: a recv/accept/sleep loop (which set
 /// `recv_yielded` since the last window) is re-extended and cooperatively
 /// yields the tokio worker; a no-recv spinner accrues `no_yield_windows` and
 /// is interrupt-trapped once it reaches [`MAX_NO_YIELD_WINDOWS`]. The window
@@ -777,11 +771,11 @@ const WASM_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_RUN_LOOP_WINDOW_TICKS: u64 = 50;
 
 /// Number of consecutive windows a bound run-loop may burn CPU **without**
-/// calling `recv` (i.e. without setting `recv_yielded`) before its epoch
-/// callback returns [`UpdateDeadline::Interrupt`](wasmtime::UpdateDeadline) and
-/// traps the guest.
+/// cooperating through recv/accept or a completed nonzero sleep (setting
+/// `recv_yielded`) before its epoch callback returns
+/// [`UpdateDeadline::Interrupt`](wasmtime::UpdateDeadline) and traps the guest.
 ///
-/// A legitimate run loop calls `recv` every iteration, so it resets the
+/// A legitimate run loop waits through recv/accept or sleep, so it resets the
 /// counter every window and is never trapped. A pure `loop {}` (or any
 /// no-recv burner) never resets it and is interrupt-trapped after this many
 /// windows. With the default window (~5 s) this is a ~15 s grace before a
@@ -1085,7 +1079,7 @@ fn cpu_rate_deny(
 ///
 /// `0` means unlimited (the capability-driven exemption set). A bounded caller
 /// uses its profile quota, or the process default when no cache is configured.
-fn cpu_rate_budget(
+pub fn cpu_rate_budget(
     invocation_profile: Option<&astrid_core::profile::PrincipalProfile>,
     group_config: Option<&astrid_core::GroupConfig>,
     principal: &astrid_core::PrincipalId,
@@ -1176,11 +1170,11 @@ pub(crate) enum EpochAction {
 /// Called once per elapsed window with the run-loop's current
 /// `(recv_yielded, no_yield_windows)`:
 ///
-/// * If the guest called `recv` since the last window (`recv_yielded`), it is
-///   a legitimate recv/accept loop: clear the flag, reset the no-yield counter
-///   to 0, and **`Yield`** (cooperatively yield the worker + re-arm). Such a
-///   loop is never trapped.
-/// * Otherwise it burned the whole window without a single `recv`: increment
+/// * If the guest waited through recv/accept or completed a nonzero sleep
+///   since the last window (`recv_yielded`): clear the flag, reset the no-yield
+///   counter to 0, and **`Yield`** (cooperatively yield the worker + re-arm).
+///   Such a loop is never trapped.
+/// * Otherwise it burned the whole window without a cooperative wait: increment
 ///   `no_yield_windows`. Once it reaches `max` (`MAX_NO_YIELD_WINDOWS`),
 ///   **`Interrupt`** (trap the runaway); below `max`, still **`Yield`** — so
 ///   even a pure `loop {}` cooperatively yields the worker every window and can
@@ -1194,7 +1188,7 @@ pub(crate) fn epoch_decision(
     max: u32,
 ) -> (EpochAction, bool, u32) {
     if recv_yielded {
-        // Legit recv/accept loop: reset and keep running.
+        // Cooperative wait: reset and keep running.
         (EpochAction::Yield(window_ticks), false, 0)
     } else {
         let next = no_yield_windows.saturating_add(1);
@@ -1236,7 +1230,7 @@ pub(crate) const fn exempt_epoch_action(window_ticks: u64) -> EpochAction {
 /// is configured identically.
 ///
 /// BOUND run-loop (`window_ticks = Some`): the callback runs the pure
-/// [`epoch_decision`] each window — a recv/accept loop `Yield`s (never trapped),
+/// [`epoch_decision`] each window — a recv/accept/sleep loop `Yield`s (never trapped),
 /// a no-recv spinner accrues toward `Interrupt` after `MAX_NO_YIELD_WINDOWS` but
 /// still `Yield`s during the grace windows, so it can never starve the daemon.
 ///
@@ -1245,32 +1239,30 @@ pub(crate) const fn exempt_epoch_action(window_ticks: u64) -> EpochAction {
 /// worker every window. `UpdateDeadline::Yield` is async-legal because the run
 /// loop drives the guest via `call_async`.
 fn configure_run_store(store: &mut Store<HostState>, run_budget: &RunLoopBudget) {
-    if let Some(window_ticks) = run_budget.window_ticks {
-        store.set_epoch_deadline(window_ticks);
-        store.epoch_deadline_callback(move |mut store_ctx| {
-            let st = store_ctx.data_mut();
-            let (action, recv_yielded, no_yield_windows) = epoch_decision(
-                st.recv_yielded,
-                st.no_yield_windows,
-                window_ticks,
-                MAX_NO_YIELD_WINDOWS,
-            );
-            st.recv_yielded = recv_yielded;
-            st.no_yield_windows = no_yield_windows;
-            Ok(match action {
-                EpochAction::Yield(ticks) => wasmtime::UpdateDeadline::Yield(ticks),
-                EpochAction::Interrupt => wasmtime::UpdateDeadline::Interrupt,
-            })
-        });
+    let window = run_budget.window_ticks;
+    store.set_epoch_deadline(window.unwrap_or(DEFAULT_RUN_LOOP_WINDOW_TICKS));
+    store.epoch_deadline_callback(move |mut context| {
+        Ok(match run_epoch_action(context.data_mut(), window) {
+            EpochAction::Yield(ticks) => wasmtime::UpdateDeadline::Yield(ticks),
+            EpochAction::Interrupt => wasmtime::UpdateDeadline::Interrupt,
+        })
+    });
+}
+
+/// One watchdog policy for both personal and user-accounted run loops.
+fn run_epoch_action(state: &mut HostState, window: Option<u64>) -> EpochAction {
+    if let Some(window) = window {
+        let (action, recv_yielded, no_yield_windows) = epoch_decision(
+            state.recv_yielded,
+            state.no_yield_windows,
+            window,
+            MAX_NO_YIELD_WINDOWS,
+        );
+        state.recv_yielded = recv_yielded;
+        state.no_yield_windows = no_yield_windows;
+        action
     } else {
-        let window_ticks = DEFAULT_RUN_LOOP_WINDOW_TICKS;
-        store.set_epoch_deadline(window_ticks);
-        store.epoch_deadline_callback(move |_store_ctx| {
-            Ok(match exempt_epoch_action(window_ticks) {
-                EpochAction::Yield(ticks) => wasmtime::UpdateDeadline::Yield(ticks),
-                EpochAction::Interrupt => wasmtime::UpdateDeadline::Interrupt,
-            })
-        });
+        exempt_epoch_action(DEFAULT_RUN_LOOP_WINDOW_TICKS)
     }
 }
 
@@ -1726,7 +1718,10 @@ struct CompiledWasmArtifact {
     _epoch_ticker: EpochTickerGuard,
 }
 
-const COMPILED_ENGINE_ABI: &str = "astrid-wasmtime48-component-abi-v1";
+/// Identity of the wasmtime engine configuration and linked host ABI that
+/// compiled capsule code is built for. Part of the compiled-code cache key,
+/// and recorded as the engine profile of loaded capsules.
+pub const COMPILED_ENGINE_ABI: &str = "astrid-wasmtime48-component-abi-v1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CompiledArtifactKey(String);
@@ -1985,15 +1980,31 @@ impl ExecutionEngine for WasmEngine {
             )
         })?;
 
-        let wasm_path = if component.path.is_absolute() {
-            component.path.clone()
+        let expected_hash = content_source::read_expected_hash(&self._capsule_dir);
+        #[cfg(not(target_family = "wasm"))]
+        let catalog_bytes =
+            content_source::catalog_bytes(ctx.principal_store.as_ref(), expected_hash.as_deref());
+        #[cfg(target_family = "wasm")]
+        let catalog_bytes = None;
+        let wasm_source = if let Some(bytes) = catalog_bytes {
+            content_source::WasmSource::Bytes(bytes)
+        } else if ctx.principal_store.is_some() {
+            let hash = expected_hash.as_deref().unwrap_or("<missing>");
+            return Err(CapsuleError::UnsupportedEntryPoint(format!(
+                "WASM catalog entry 'bin/{hash}.wasm' is missing; refusing to load from a host path"
+            )));
+        } else if component.path.is_absolute() {
+            content_source::WasmSource::Path(component.path.clone())
         } else {
             let local = self._capsule_dir.join(&component.path);
             if local.exists() {
-                local
+                content_source::WasmSource::Path(local)
             } else {
-                // WASM may be content-addressed in lib/ — check meta.json for hash.
-                resolve_content_addressed_wasm(&self._capsule_dir).unwrap_or(local)
+                // Compatibility fallback for homes not yet admitted to the
+                // packed catalog. New runtime loads prefer catalog bytes.
+                content_source::WasmSource::Path(
+                    content_source::host_path(expected_hash.as_deref()).unwrap_or(local),
+                )
             }
         };
 
@@ -2027,7 +2038,7 @@ impl ExecutionEngine for WasmEngine {
             wasm_config.insert(key, serde_json::Value::String(val));
         }
 
-        let wasm_hash = read_expected_wasm_hash(&self._capsule_dir)
+        let wasm_hash = expected_hash
             .map(crate::registry::WasmHash::from_raw)
             .unwrap_or_else(|| {
                 crate::registry::WasmHash::synthetic(
@@ -2135,13 +2146,16 @@ impl ExecutionEngine for WasmEngine {
             process_tracker_for_engine,
             persistent_registry_for_engine,
         ) = async {
-            let wasm_bytes = std::fs::read(&wasm_path).map_err(|e| {
-                CapsuleError::UnsupportedEntryPoint(format!("Failed to read WASM: {e}"))
-            })?;
+            let wasm_bytes = match wasm_source {
+                content_source::WasmSource::Bytes(bytes) => bytes,
+                content_source::WasmSource::Path(path) => std::fs::read(&path).map_err(|e| {
+                    CapsuleError::UnsupportedEntryPoint(format!("Failed to read WASM: {e}"))
+                })?,
+            };
 
             // BLAKE3 integrity verification. Fail-secure: no hash = no load.
             let actual_hash = blake3::hash(&wasm_bytes).to_hex().to_string();
-            match read_expected_wasm_hash(&capsule_dir_for_verify) {
+            match content_source::read_expected_hash(&capsule_dir_for_verify) {
                 Some(expected_hash) if actual_hash == expected_hash => {
                     // Hash matches — verified.
                 },
@@ -2399,7 +2413,7 @@ impl ExecutionEngine for WasmEngine {
             // rebuild let the initial linear memory escape the cap). The CPU
             // bound is a wasmtime EPOCH deadline + interrupt callback on the
             // dedicated run-loop Store (see the run-loop Store setup below): a
-            // recv/accept loop sets `recv_yielded` and is re-armed every
+            // recv/accept/sleep loop sets `recv_yielded` and is re-armed every
             // window; a no-recv spinner is interrupt-trapped after
             // MAX_NO_YIELD_WINDOWS, and even a pure `loop {}` cooperatively
             // yields the tokio worker every window (UpdateDeadline::Yield) so it
@@ -2459,6 +2473,12 @@ impl ExecutionEngine for WasmEngine {
                 &ctx.principal,
                 has_run_export,
             );
+            let user_throttle = if !system_runtime && let Some(accounting) = &ctx.user_cpu {
+                let rate = cpu_rate_budget(owner_profile.as_deref(), load_group_config.as_ref().map(Arc::as_ref), &ctx.principal);
+                let throttle = accounting.execution_throttle(&ctx.principal, rate).await
+                    .map_err(CapsuleError::ExecutionFailed)?;
+                throttle.has_user_limit().then_some(throttle)
+            } else { None };
             // Memory cap captured by `make_state` (Copy usize). For a bound
             // run-loop this is the owner quota; pool_size is 1 for run-loop
             // capsules so the single Store `make_state` builds IS the run-loop
@@ -2578,9 +2598,21 @@ impl ExecutionEngine for WasmEngine {
             let st_system_runtime = system_runtime;
             let st_capsule_registry = ctx.capsule_registry.clone();
             let st_allowance_store = ctx.allowance_store.clone();
+            let st_secret_elicits = ctx.secret_elicits.clone();
             let st_identity_store = ctx.identity_store.clone();
             let st_profile_cache = ctx.profile_cache.clone();
-            let st_audit_sink = ctx.audit_sink.clone();
+            // Bind the host-audit sink to this capsule's verified code
+            // identity so every host-call entry names the capsule and wasm
+            // hash that acted.
+            let st_audit_sink = ctx.audit_sink.as_ref().map(|sink| {
+                crate::audit_sink::attribute_sink(
+                    sink,
+                    crate::audit_sink::HostAuditActor {
+                        capsule_id: manifest.package.name.clone(),
+                        wasm_hash: astrid_crypto::ContentHash::from_hex(&actual_hash).ok(),
+                    },
+                )
+            });
             let st_owner_home = owner_vfs.home.clone();
             let st_owner_tmp = owner_vfs.tmp.clone();
             let st_principal_directory = ctx.principal_directory.clone();
@@ -2622,6 +2654,7 @@ impl ExecutionEngine for WasmEngine {
             let tcp_listener_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let capsule_net_stream_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let st_route_admission_gate = self.route_admission_gate.clone();
+            let hosted_workspace_root = workspace_root.clone();
             let make_state: Arc<dyn Fn() -> HostState + Send + Sync> = Arc::new(move || HostState {
                 wasi_ctx: build_wasi_ctx(),
                 resource_table: wasmtime::component::ResourceTable::new(),
@@ -2653,6 +2686,8 @@ impl ExecutionEngine for WasmEngine {
                 // spawned processes AND the fs-host confinement root, so both
                 // see ONE filesystem (see the VFS-branch selection above).
                 workspace_root: effective_workspace_root.clone(),
+                // Durable command grants bind the pristine portal, not `CoW` merge.
+                hosted_workspace_root: hosted_workspace_root.clone(),
                 spawn_mask_paths: spawn_mask_paths.clone(),
                 vfs: Arc::clone(&workspace_vfs),
                 vfs_root_handle: root_handle.clone(),
@@ -2697,6 +2732,8 @@ impl ExecutionEngine for WasmEngine {
                 ipc_limiter: Arc::clone(&ipc_limiter),
                 config: wasm_config.clone(),
                 secret_env: secret_env_set.clone(),
+                revealed_secrets: crate::engine::wasm::host::http::RevealedSecrets::default(),
+                tool_result: None,
                 // Kept only for explicit legacy-migration fixtures; runtime
                 // secret resolution never consults a native path.
                 file_secret_root: None,
@@ -2725,6 +2762,7 @@ impl ExecutionEngine for WasmEngine {
                     .unwrap_or_else(HostState::neutral_secret_store),
                 ready_tx: None,
                 blocking_semaphore: blocking_semaphore.clone(),
+                secret_elicits: st_secret_elicits.clone(),
                 io_semaphore: io_semaphore.clone(),
                 cancel_token: cancel_token_for_state.clone(),
                 principal_cancel_tokens: principal_cancel_tokens_for_state.clone(),
@@ -2757,12 +2795,13 @@ impl ExecutionEngine for WasmEngine {
                 // framed read.
                 ingress_principal: None,
                 ingress_device_key_id: None,
+                ingress_request_owner: None,
                 ingress_origin: None,
                 // Run-loop epoch-interrupt state. `recv_yielded` is set true by
-                // the ipc `recv` host fn each time the guest blocks on recv;
-                // the bound run-loop's epoch callback reads + clears it to
-                // distinguish a legit recv loop from a no-recv spinner.
-                // `no_yield_windows` counts consecutive windows with no recv.
+                // a cooperative recv/accept or completed nonzero sleep; the
+                // bound run-loop's epoch callback reads + clears it to
+                // distinguish a legitimate waiter from a spinner.
+                // `no_yield_windows` counts consecutive windows with no wait.
                 recv_yielded: false,
                 no_yield_windows: 0,
                 // Synchronous per-action audit sink (fs/net/process). Shared
@@ -2840,7 +2879,7 @@ impl ExecutionEngine for WasmEngine {
                 Arc::clone(&make_state),
                 pool_epoch_policy,
                 INTERCEPTOR_FUEL_BUDGET,
-            );
+            ).with_throttle(user_throttle);
             // Run-loop capsules build one dedicated Store per worker (default 1);
             // pools build their `min_idle` warm set. `worker_count == 1` for
             // every non-eligible capsule, so this is `pool_min_idle` (today's
@@ -2875,7 +2914,7 @@ impl ExecutionEngine for WasmEngine {
             // All N share the bound listener via `shared_listeners` and each
             // blocks on `accept()` against the one OS accept queue.
             let mut run_stores: Vec<(
-                Arc<AsyncMutex<Store<HostState>>>,
+                Arc<AsyncMutex<accounted_store::AccountedStore<HostState>>>,
                 wasmtime::component::Instance,
             )> = Vec::new();
             if has_run {
@@ -2885,8 +2924,9 @@ impl ExecutionEngine for WasmEngine {
                 // was seeded to INTERCEPTOR_FUEL_BUDGET above for instantiation;
                 // the run loop is NOT fuel-bound, so re-seed it to
                 // effectively-infinite (a 0-fuel Store traps, and a run loop must
-                // never fuel-out). CPU is bounded by the epoch interrupt
-                // (`configure_run_store`), not fuel. For the single-worker
+                // never fuel-out). Configured user budgets account sampled
+                // fuel and wait without resetting the guest. Both retain the
+                // existing runaway epoch policy. For the single-worker
                 // default this drains exactly one instance — identical to the
                 // prior `pop()` path.
                 for mut pi in initial_instances.drain(..) {
@@ -2895,7 +2935,7 @@ impl ExecutionEngine for WasmEngine {
                             "Failed to set run-loop fuel: {e}"
                         ))
                     })?;
-                    configure_run_store(&mut pi.store, &run_budget);
+                    pi.store.configure_run_epochs(&run_budget);
                     run_stores.push((Arc::new(AsyncMutex::new(pi.store)), pi.instance));
                 }
             } else {
@@ -3236,6 +3276,7 @@ impl ExecutionEngine for WasmEngine {
         }
         self.inbound_rx = rx;
         self.profile_cache = ctx.profile_cache.clone();
+        self.user_cpu = ctx.user_cpu.clone();
         self.overlay_registry = ctx.overlay_registry.clone();
         self.owner_principal = Some(ctx.principal.clone());
         // Keep the OS-level CoW backend alive for promote/rollback and for
@@ -3553,24 +3594,50 @@ impl ExecutionEngine for WasmEngine {
         );
         let invocation_fuel_budget =
             crate::invocation_fuel_share(rate_budget, INTERCEPTOR_FUEL_BUDGET, max_in_flight);
-        let mut fuel_reservation = match self.fuel_rate.try_reserve(
-            &invoking_principal,
+        let invocation_throttle = if let Some(accounting) = &self.user_cpu {
+            match accounting
+                .execution_throttle(&invoking_principal, rate_budget)
+                .await
+            {
+                Ok(throttle) => throttle.has_user_limit().then_some(throttle),
+                Err(reason) => return Ok(crate::capsule::InterceptResult::Deny { reason }),
+            }
+        } else {
+            None
+        };
+        let execution_allocation = crate::user_cpu::execution::ExecutionAllocation::new(
+            invoking_principal.clone(),
             rate_budget,
-            invocation_fuel_budget,
-            now,
-        ) {
-            Some(reservation) => reservation,
-            None => {
-                let reason = format!(
-                    "principal '{invoking_principal}' exceeded in-flight CPU budget of {rate_budget} fuel/sec"
-                );
+            self.fuel_rate.clone(),
+            None,
+        );
+        // invocation_fuel_share is positive: both its finite share floor and
+        // the unlimited interceptor ceiling are at least one fuel unit.
+        let allowance = std::num::NonZeroU64::new(invocation_fuel_budget)
+            .expect("invocation fuel share is positive");
+        let admission_timeout = std::time::Duration::from_secs(
+            invocation_profile
+                .as_deref()
+                .map_or(astrid_core::profile::DEFAULT_MAX_TIMEOUT_SECS, |profile| {
+                    profile.quotas.max_timeout_secs
+                }),
+        )
+        .saturating_sub(invoke_start.elapsed());
+        let mut fuel_reservation = match execution_allocation
+            .reserve_with_timeout(allowance, admission_timeout)
+            .await
+        {
+            Ok(reservation) => reservation,
+            Err(error) => {
                 tracing::warn!(
                     principal = %invoking_principal,
                     capsule = %self.manifest.package.name,
                     action,
-                    "CPU-rate reservation exceeded; denying invocation"
+                    "CPU-rate admission failed; denying invocation"
                 );
-                return Ok(crate::capsule::InterceptResult::Deny { reason });
+                return Ok(crate::capsule::InterceptResult::Deny {
+                    reason: error.to_string(),
+                });
             },
         };
 
@@ -3626,11 +3693,8 @@ impl ExecutionEngine for WasmEngine {
         // invocation on a *different* pooled Store can never observe this
         // invocation's `caller_context` between SET and CALL — the
         // cross-principal race that #813 collapsed the orchestration cliff
-        // onto. CLEAR (resetting every `invocation_*` field) and return-to-
-        // pool are handled by `PoolCheckout::drop` (see [`pool`]), which runs
-        // on every exit path — normal return, `?`, panic-unwind, and
-        // future-drop on caller cancellation — preserving the invariant that
-        // the next lease of this instance observes `caller_context = None`.
+        // onto. `PoolCheckout::drop` clears completed calls before reuse and
+        // discards interrupted guests, preserving host and guest isolation.
         //
         // SAFETY: each pooled Store is leased exclusively for the duration of
         // this call (the pool semaphore guarantees no two invocations share a
@@ -3642,51 +3706,79 @@ impl ExecutionEngine for WasmEngine {
         // — up to the pool size of invocations run concurrently on independent
         // Stores (issue #816). `instance` (a `Copy` handle) is taken before
         // borrowing the store mutably for the SET/CALL block; `PoolCheckout`
-        // clears the invocation state and returns the instance on drop.
+        // clears or discards the instance on drop.
         let checkout_start = std::time::Instant::now();
-        let mut checkout = pool.checkout().await.ok_or_else(|| {
-            // `checkout` returns `None` for any of: the capsule is unloading
-            // (semaphore closed), a lazy pool-grow instantiation failed, or a
-            // size-1 carve-out found no warm instance. The true cause is logged
-            // at the checkout site; keep the surfaced error generic rather than
-            // asserting "unloading", which misleads when the real cause was a
-            // transient grow failure on a fully-loaded capsule.
-            CapsuleError::NotSupported("no capsule instance available".into())
-        })?;
+        let remaining = std::time::Duration::from_secs(
+            invocation_profile
+                .as_deref()
+                .map_or(astrid_core::profile::DEFAULT_MAX_TIMEOUT_SECS, |profile| {
+                    profile.quotas.max_timeout_secs
+                }),
+        )
+        .saturating_sub(invoke_start.elapsed());
+        let checked_out = match astrid_runtime::time::timeout(remaining, pool.checkout()).await {
+            Ok(checkout) => checkout,
+            Err(_) => {
+                // No invocation guest ran; return unused admission capacity.
+                fuel_reservation.settle(0, std::time::Instant::now());
+                return Ok(crate::capsule::InterceptResult::Deny {
+                    reason: "invocation deadline expired waiting for capsule instance".into(),
+                });
+            },
+        };
+        let Some(mut checkout) = checked_out else {
+            // A failed replacement must not skip the guard on the next request.
+            return Ok(crate::capsule::InterceptResult::Deny {
+                reason: "no capsule instance available".into(),
+            });
+        };
         // Time spent waiting for a free pooled instance — a rising
         // `pool_wait_ms` is the signal the pool is saturated (all instances
         // busy), distinct from a slow guest call.
         let pool_wait_ms = checkout_start.elapsed().as_millis() as u64;
         let typed_instance = checkout.instance();
-        let result: CapsuleResult<HookTriggerResult> = {
+        let mut interruption_reason = None;
+        // Armed below when this invocation is a tool call; records one
+        // `ToolCall` audit entry when the invocation ends (or is cancelled).
+        let tool_audit;
+        {
             let s = checkout.store_mut();
             // ── Phase 1: SET ──────────────────────────────────────
+            //
+            // This phase is host-only. A cancellation here cannot poison the
+            // component instance, so the checkout remains reusable.
             let applied_profile: Arc<astrid_core::profile::PrincipalProfile> =
                 invocation_profile.clone().unwrap_or_else(|| {
                     Arc::new(astrid_core::profile::PrincipalProfile::default_ref().clone())
                 });
 
             if !is_daemon {
-                let deadline = applied_profile.quotas.max_timeout_secs.saturating_mul(1000)
-                    / EPOCH_TICK_INTERVAL.as_millis() as u64;
+                // Admission and pool checkout spend the same invocation budget
+                // as guest execution; neither can grant a second full timeout.
+                let remaining =
+                    std::time::Duration::from_secs(applied_profile.quotas.max_timeout_secs)
+                        .saturating_sub(invoke_start.elapsed());
+                let deadline = remaining.as_millis() / EPOCH_TICK_INTERVAL.as_millis();
                 // Component initialization may have installed the exempt
                 // continue callback. A short-lived interceptor invocation is
                 // always deadline-bound, so restore Wasmtime's trapping policy
                 // before applying its caller-profile timeout.
                 s.epoch_deadline_trap();
-                s.set_epoch_deadline(deadline);
+                s.set_epoch_deadline(u64::try_from(deadline).unwrap_or(u64::MAX));
             }
 
-            // Per-invocation CPU: fuel is engine-wide, so re-seed the leased
-            // Store to a known budget before the call. This (a) bounds a
-            // runaway single interceptor call, and (b) makes
-            // `invocation_fuel_budget - get_fuel()` after the call the EXACT
-            // deterministic instruction count for THIS invocation, attributable
-            // to the invoking principal — independent of whatever the previous
-            // leaseholder of this pooled Store consumed. Errors only if fuel is
-            // disabled (it is not); on the impossible error we leave fuel as-is
-            // (fail-secure: a smaller budget traps sooner).
-            let _ = s.set_fuel(invocation_fuel_budget);
+            // Bind the authenticated caller before guest execution. Accounted
+            // stores separate the finite call allowance from a large fuel
+            // measurement counter, so a bulk operation cannot clamp away its
+            // overshoot. A failed bind denies the interceptor chain.
+            if let Err(error) = s
+                .bind_throttle(invocation_throttle)
+                .and_then(|()| s.set_fuel(invocation_fuel_budget))
+            {
+                return Ok(crate::capsule::InterceptResult::Deny {
+                    reason: format!("cannot bind invocation CPU accounting: {error}"),
+                });
+            }
 
             {
                 let state = s.data_mut();
@@ -3738,59 +3830,77 @@ impl ExecutionEngine for WasmEngine {
                 .cloned();
 
                 install_principal_overlays(state, invocation_principal.as_ref()).await;
-            }
-
-            // ── Phase 2: CALL ─────────────────────────────────────
-            //
-            // Cancellation safety: the `call_async` future below may be
-            // dropped by the dispatcher (e.g. tokio task abort). Dropping it
-            // drops `checkout`, whose `Drop` synchronously runs Phase 3 CLEAR
-            // *before* the wasm fiber is torn down and returns the instance to
-            // the pool, so the next lease observes `caller_context = None` and
-            // every `invocation_*` field cleared.
-            let typed_lookup = typed_instance
-                .get_typed_func::<(String, Vec<u8>), (HookTriggerResult,)>(
-                    &mut *s,
-                    "astrid-hook-trigger",
+                state.tool_result = None;
+                tool_audit = crate::engine::wasm::host::tool_audit::ToolCallAudit::arm(
+                    state,
+                    caller,
+                    &invoking_principal,
                 );
-            match typed_lookup {
-                Ok(func) => {
-                    let invocation_cancel = s.data().effective_cancel_token();
-                    tokio::select! {
-                        biased;
-                        () = invocation_cancel.cancelled() => Err(CapsuleError::WasmError(
-                            "principal capsule view retired during invocation".to_string()
-                        )),
-                        called = func.call_async(
-                            &mut *s,
-                            (action.to_string(), payload.to_vec())
-                        ) => called.map(|(cr,)| cr).map_err(|e| {
-                            CapsuleError::WasmError(format!("astrid_hook_trigger failed: {e:?}"))
-                        }),
-                    }
-                },
-                Err(e) => Err(CapsuleError::UnsupportedEntryPoint(format!(
-                    "capsule does not export `astrid-hook-trigger`: {e}"
-                ))),
             }
+        }
+
+        // ── Phase 2: CALL ─────────────────────────────────────
+        //
+        // Typed-function lookup does not enter the guest. Keep the checkout
+        // reusable if the export is absent or this future is cancelled before
+        // the call begins.
+        let invocation_fuel_seed = checkout.store_mut().get_fuel().unwrap_or(0);
+        let typed_lookup = {
+            let s = checkout.store_mut();
+            typed_instance.get_typed_func::<(String, Vec<u8>), (HookTriggerResult,)>(
+                &mut *s,
+                "astrid-hook-trigger",
+            )
         };
-        // Per-invocation CPU measurement: fuel counts DOWN from the seed, so
-        // `seed - remaining` is the exact deterministic instruction count for
-        // this call. Read while `checkout` is still alive (the `s` borrow above
-        // has ended). Charge it to the invoking principal in the shared,
-        // cross-capsule fuel ledger (telemetry only — the run-loop CPU bound is
-        // ENFORCED by the epoch interrupt mechanism, not fuel; windowed
-        // deny/throttle on this aggregate is the deliberate follow-up).
+        let result: CapsuleResult<HookTriggerResult> = match typed_lookup {
+            Ok(func) => {
+                let invocation_cancel = checkout.store_mut().data().effective_cancel_token();
+                // From this point a trap, panic, or future-drop may leave
+                // Wasmtime's component-entry state non-reentrant. Drop must
+                // discard the Store unless the call returns successfully.
+                checkout.begin_call();
+                let s = checkout.store_mut();
+                tokio::select! {
+                    biased;
+                    () = invocation_cancel.cancelled() => {
+                        interruption_reason = Some("principal capsule view retired during invocation");
+                        Err(CapsuleError::WasmError(
+                            "principal capsule view retired during invocation".to_string()
+                        ))
+                    },
+                    called = func.call_async(
+                        &mut *s,
+                        (action.to_string(), payload.to_vec())
+                    ) => called.map(|(cr,)| cr).map_err(|e| {
+                        interruption_reason = Some(invocation_failure::reason(&e));
+                        CapsuleError::WasmError(format!("astrid_hook_trigger failed: {e:?}"))
+                    }),
+                }
+            },
+            Err(e) => Err(CapsuleError::UnsupportedEntryPoint(format!(
+                "capsule does not export `astrid-hook-trigger`: {e}"
+            ))),
+        };
+        // Measure from the actual counter seed, not the call allowance:
+        // accounted stores keep those separate to retain overshoot. This is
+        // Wasmtime fuel, not complete host CPU or an exact instruction count.
+        // The Store-owned meter independently charges the shared user debt.
         let fuel_after = checkout.store_mut().get_fuel().unwrap_or(0);
-        let fuel_used = invocation_fuel_budget.saturating_sub(fuel_after);
+        let fuel_used = invocation_fuel_seed.saturating_sub(fuel_after);
         self.fuel_ledger.charge(&invoking_principal, fuel_used);
         // Settle exact usage in the live window at completion. If the future is
         // dropped before this point, the reservation's Drop charges its full
         // conservative amount, so cancellation cannot reclaim budget that an
         // in-flight guest may already have spent.
         fuel_reservation.settle(fuel_used, std::time::Instant::now());
-        // Drop the lease: Phase 3 CLEAR runs and the instance returns to the
-        // pool, so a parallel invocation can lease it with clean state.
+        if let Some(audit) = tool_audit {
+            let captured = checkout.store_mut().data_mut().tool_result.take();
+            let error = result.as_ref().err().map(ToString::to_string);
+            audit.finish(captured, error.as_deref());
+        }
+        if result.is_ok() {
+            checkout.complete_call();
+        }
         drop(checkout);
 
         // ── Per-invocation diagnostic span (observability brick #1, #816) ──
@@ -3821,6 +3931,13 @@ impl ExecutionEngine for WasmEngine {
             "interceptor invocation"
         );
 
+        if let Some(reason) = interruption_reason {
+            // Like quota admission denial, interruption must halt an ordered
+            // chain; returning Err here would let the protected action proceed.
+            return Ok(crate::capsule::InterceptResult::Deny {
+                reason: reason.to_string(),
+            });
+        }
         result.map(|cr| {
             crate::capsule::InterceptResult::from_capsule_result(&cr.action, cr.data.as_deref())
         })
@@ -3877,8 +3994,8 @@ pub struct LifecycleConfig {
 ///
 /// Kept separate from [`LifecycleConfig`] so existing callers constructing that
 /// public config retain source compatibility. Lifecycle execution is a
-/// one-shot context: this carries identity and filesystem lookup roots, not a
-/// kernel profile, quota ledger, or persistent runtime accounting handle.
+/// one-shot context: identity, filesystem roots, and optional kernel-owned
+/// execution accounting. Standalone callers retain their existing defaults.
 #[derive(Clone)]
 pub struct LifecyclePrincipalContext {
     principal: astrid_core::PrincipalId,
@@ -3886,6 +4003,7 @@ pub struct LifecyclePrincipalContext {
     file_secret_root: Option<PathBuf>,
     principal_directory: astrid_storage::PrincipalDirectory,
     principal_store: Option<astrid_storage::RuntimePrincipalStore>,
+    execution_throttle: Option<crate::user_cpu::throttle::ExecutionThrottle>,
 }
 
 impl LifecyclePrincipalContext {
@@ -3899,7 +4017,19 @@ impl LifecyclePrincipalContext {
             file_secret_root: None,
             principal_directory: astrid_storage::PrincipalDirectory::default(),
             principal_store: None,
+            execution_throttle: None,
         }
+    }
+
+    /// Bind the kernel's existing shared user/principal ledger. Never create a
+    /// fresh allowance merely because this is an install or upgrade hook.
+    #[must_use]
+    pub fn with_execution_throttle(
+        mut self,
+        throttle: Option<crate::user_cpu::throttle::ExecutionThrottle>,
+    ) -> Self {
+        self.execution_throttle = throttle;
+        self
     }
 
     /// Supply the manifest-declared secret-typed env key set.
@@ -3943,6 +4073,7 @@ async fn build_lifecycle_host_state(
         file_secret_root,
         principal_directory,
         principal_store,
+        execution_throttle: _,
     } = context;
 
     let vfs = astrid_vfs::HostVfs::new();
@@ -3985,6 +4116,7 @@ async fn build_lifecycle_host_state(
         capsule_log: None,
         capsule_id: cfg.capsule_id.clone(),
         workspace_root: cfg.workspace_root.clone(),
+        hosted_workspace_root: cfg.workspace_root.clone(),
         // Lifecycle hooks run on a plain HostVfs with no CoW, so nothing to mask.
         spawn_mask_paths: Vec::new(),
         vfs: Arc::new(vfs),
@@ -4022,6 +4154,8 @@ async fn build_lifecycle_host_state(
         ipc_limiter: Arc::new(astrid_events::ipc::IpcRateLimiter::new()),
         config: cfg.config.clone(),
         secret_env,
+        revealed_secrets: crate::engine::wasm::host::http::RevealedSecrets::default(),
+        tool_result: None,
         file_secret_root,
         ipc_publish_patterns: Vec::new(),
         ipc_subscribe_patterns: Vec::new(),
@@ -4054,6 +4188,7 @@ async fn build_lifecycle_host_state(
         secret_store: cfg.secret_store.clone(),
         ready_tx: None,
         blocking_semaphore: HostState::default_blocking_semaphore(),
+        secret_elicits: None,
         io_semaphore: HostState::default_io_semaphore(),
         cancel_token: tokio_util::sync::CancellationToken::new(),
         // Lifecycle hooks run a ONE-SHOT, single-principal instance: no
@@ -4093,6 +4228,7 @@ async fn build_lifecycle_host_state(
         // or authenticating device.
         ingress_principal: None,
         ingress_device_key_id: None,
+        ingress_request_owner: None,
         ingress_origin: None,
         // Lifecycle hooks are not run loops; the epoch-interrupt run-loop
         // state is inert here but initialised for completeness.
@@ -4100,8 +4236,17 @@ async fn build_lifecycle_host_state(
         no_yield_windows: 0,
         // Per-action audit sink (fs/net/process). The install/upgrade path
         // may thread the kernel sink in; `None` for the standalone install
-        // CLI, which has no audit log in scope.
-        audit_sink: cfg.audit_sink.clone(),
+        // CLI, which has no audit log in scope. Bound to the hook's code
+        // identity like the runtime sink.
+        audit_sink: cfg.audit_sink.as_ref().map(|sink| {
+            crate::audit_sink::attribute_sink(
+                sink,
+                crate::audit_sink::HostAuditActor {
+                    capsule_id: cfg.capsule_id.as_str().to_owned(),
+                    wasm_hash: Some(astrid_crypto::ContentHash::hash(&cfg.wasm_bytes)),
+                },
+            )
+        }),
     })
 }
 
@@ -4130,8 +4275,11 @@ pub async fn run_lifecycle(
 /// This additive principal-aware entry point preserves [`run_lifecycle`] as
 /// the default-principal compatibility wrapper while allowing install callers
 /// to keep lifecycle IPC and host identity in the same principal scope as the
-/// target installation. The lifecycle store meter remains finite but uses a
-/// throwaway ledger, not the kernel's persistent per-principal accounting.
+/// target installation. Kernel-managed callers supply the shared execution
+/// throttle through `context`, charging lifecycle fuel to the same principal
+/// and accountable-user budgets as active capsules. Standalone callers without
+/// that throttle do not participate in shared accounting. Both paths retain
+/// the lifecycle execution deadline.
 ///
 /// # Errors
 ///
@@ -4160,6 +4308,7 @@ pub async fn run_lifecycle_for_principal(
         return Ok(());
     }
 
+    let execution_throttle = context.execution_throttle.clone();
     let host_state =
         build_lifecycle_host_state(&cfg, phase, context, crate::MemoryLedger::default()).await?;
 
@@ -4172,13 +4321,17 @@ pub async fn run_lifecycle_for_principal(
     let deadline_ticks = LIFECYCLE_TIMEOUT_SECS * 10; // 100ms per tick
     store.set_epoch_deadline(deadline_ticks);
     // Fuel is engine-wide (consume_fuel), so a fresh Store starts at 0 fuel and
-    // would trap on the first instruction. Lifecycle hooks are operator-driven
-    // and human-interactive (elicit) — they are bounded by the generous epoch
-    // safety-net deadline above, NOT by a CPU rate — so fuel them to
-    // effectively-infinite. The epoch deadline remains the runaway guard.
+    // would trap on the first instruction. Keep a large measurement counter:
+    // configured lifecycle execution repays shared user debt through the same
+    // call-hook sampler as active capsules. The epoch safety-net still bounds
+    // runaway hooks, including unconfigured standalone callers.
     store.set_fuel(u64::MAX).map_err(|e| {
         CapsuleError::UnsupportedEntryPoint(format!("Failed to set lifecycle fuel: {e}"))
     })?;
+    let mut store =
+        accounted_store::AccountedStore::new(store, execution_throttle).map_err(|error| {
+            CapsuleError::ExecutionFailed(format!("bind lifecycle CPU accounting: {error}"))
+        })?;
     let _epoch_guard = spawn_epoch_ticker(&wt_engine);
 
     let mut linker: Linker<HostState> = Linker::new(&wt_engine);
@@ -6335,6 +6488,88 @@ mod epoch_integration_tests {
 
     fn unit_module(engine: &Engine, wat: &str) -> Module {
         Module::new(engine, wat).expect("valid wat module")
+    }
+
+    async fn sleep_watchdog_guest(
+        duration_ns: u64,
+        sleep_every_iteration: bool,
+    ) -> wasmtime::Result<()> {
+        use super::bindings::astrid::sys::host::Host;
+        use super::host_state::HostState;
+        use super::test_fixtures::minimal_host_state;
+
+        let engine = build_wasmtime_engine().expect("engine");
+        let module = unit_module(
+            &engine,
+            r#"(module
+                (import "host" "wait" (func $wait))
+                (func (export "run") (local $remaining i32)
+                    (local.set $remaining (i32.const 12))
+                    (loop $next
+                        (call $wait)
+                        (local.set $remaining (i32.sub (local.get $remaining) (i32.const 1)))
+                        (br_if $next (local.get $remaining)))))"#,
+        );
+        let mut store = Store::new(
+            &engine,
+            minimal_host_state(tokio::runtime::Handle::current()),
+        );
+        store.set_fuel(u64::MAX).unwrap();
+        super::configure_run_store(
+            &mut store,
+            &super::RunLoopBudget {
+                exempt: false,
+                bound_run_loop: true,
+                window_ticks: Some(1),
+                mem_bytes: super::WASM_MAX_MEMORY_BYTES,
+            },
+        );
+        let mut linker: Linker<HostState> = Linker::new(&engine);
+        let first = std::sync::atomic::AtomicBool::new(true);
+        linker
+            .func_wrap(
+                "host",
+                "wait",
+                move |mut caller: wasmtime::Caller<'_, HostState>| {
+                    if first.swap(false, Ordering::Relaxed) || sleep_every_iteration {
+                        caller
+                            .data_mut()
+                            .sleep_ns(duration_ns)
+                            .expect("sleep succeeds");
+                    }
+                    caller.engine().increment_epoch();
+                },
+            )
+            .unwrap();
+        let instance = linker.instantiate_async(&mut store, &module).await.unwrap();
+        instance
+            .get_typed_func::<(), ()>(&mut store, "run")
+            .unwrap()
+            .call_async(&mut store, ())
+            .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sleep_watchdog_completed_sleeps_survive_many_windows() {
+        sleep_watchdog_guest(1_000_000, true)
+            .await
+            .expect("sleeping guest must survive");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sleep_watchdog_zero_sleep_cannot_bypass_interrupt() {
+        let err = sleep_watchdog_guest(0, true)
+            .await
+            .expect_err("zero sleep is not progress");
+        assert_interrupt(&err);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sleep_watchdog_spin_after_sleep_still_interrupts() {
+        let err = sleep_watchdog_guest(1_000_000, false)
+            .await
+            .expect_err("progress must expire");
+        assert_interrupt(&err);
     }
 
     /// FIX 2 / DEFECT 3, the core guarantee: a PURE `loop {}` with no recv —

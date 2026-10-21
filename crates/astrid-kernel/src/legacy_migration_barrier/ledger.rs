@@ -185,27 +185,29 @@ pub(super) async fn collect_destination_proofs(
             format!("principal:{uid}:secrets"),
             principal_secret_migration_proof(store, uid, sources).await?,
         );
-        for summary in &summaries {
-            let marker = astrid_storage::env::principal_env_store(store.kv(), uid, summary.id())
-                .map_err(storage_io)?
-                .get(astrid_storage::env::LEGACY_IMPORT_MARKER_KEY)
-                .await
-                .map_err(storage_io)?;
+        let mut capsules = summaries
+            .iter()
+            .map(|summary| astrid_capsule_types::CapsuleId::new(summary.id()).map_err(storage_io))
+            .collect::<io::Result<Vec<_>>>()?;
+        super::env_import::include_legacy_scopes(&mut capsules, uid, sources)?;
+        for capsule in &capsules {
+            let marker =
+                astrid_storage::env::principal_env_store(store.kv(), uid, capsule.as_str())
+                    .map_err(storage_io)?
+                    .get(astrid_storage::env::LEGACY_IMPORT_MARKER_KEY)
+                    .await
+                    .map_err(storage_io)?;
             let Some(marker) = marker else {
                 if strict_env_markers {
                     return Err(io::Error::other(format!(
-                        "environment destination receipt is missing for {alias}/{}",
-                        summary.id()
+                        "environment destination receipt is missing for {alias}/{capsule}"
                     )));
                 }
                 continue;
             };
             let proof = DestinationProof::from_hashed_bytes(&marker);
-            proofs.insert(
-                format!("principal:{uid}:env:{}", summary.id()),
-                proof.clone(),
-            );
-            proofs.insert(format!("principal:{uid}:secret:{}", summary.id()), proof);
+            proofs.insert(format!("principal:{uid}:env:{capsule}"), proof.clone());
+            proofs.insert(format!("principal:{uid}:secret:{capsule}"), proof);
         }
         proofs.insert(
             format!("principal:{uid}:audit"),

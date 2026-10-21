@@ -15,6 +15,7 @@ use crate::cli::{
     Cli, Commands, ConfigCommands, DistroCommands, McpCommands, SessionCommands, WitCommands,
 };
 use crate::commands;
+use crate::commands::headless;
 use crate::commands::stub::TrackingIssue;
 use crate::formatter::OutputFormat;
 use crate::theme::{self, print_banner};
@@ -39,6 +40,15 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    let headless_route = cli.prompt.is_some()
+        || (cli.command.is_none() && !std::io::stdin().is_terminal())
+        || matches!(cli.command, Some(Commands::Run(_)));
+    let run_auto_approve = matches!(
+        &cli.command,
+        Some(Commands::Run(args)) if args.auto_approve
+    );
+    ensure_headless_auto_approve_rejected(cli.auto_approve || run_auto_approve, headless_route)?;
+
     if should_check_for_update(&cli) {
         commands::self_update::print_update_banner().await;
     }
@@ -53,7 +63,6 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
         if cli.snapshot_tui {
             commands::headless::run_snapshot_tui(
                 prompt_text,
-                cli.auto_approve,
                 cli.session_name,
                 cli.tui_width,
                 cli.tui_height,
@@ -64,7 +73,6 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
         commands::headless::run_headless(
             prompt_text,
             output_format,
-            cli.auto_approve,
             cli.session_name,
             cli.print_session,
         )
@@ -81,7 +89,6 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
             commands::headless::run_headless(
                 stdin_text,
                 output_format,
-                cli.auto_approve,
                 cli.session_name,
                 cli.print_session,
             )
@@ -93,12 +100,20 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
     dispatch_subcommand(cli.command, output_format).await
 }
 
+fn ensure_headless_auto_approve_rejected(auto_approve: bool, headless_route: bool) -> Result<()> {
+    if auto_approve && headless_route {
+        anyhow::bail!(headless::AUTO_APPROVE_UNSUPPORTED_MESSAGE);
+    }
+    Ok(())
+}
+
 fn should_check_for_update(cli: &Cli) -> bool {
     cli.prompt.is_none()
         && !matches!(
             cli.command,
             Some(
                 Commands::Update(_)
+                    | Commands::Hook(_)
                     | Commands::Completions(_)
                     | Commands::Mcp { .. }
                     | Commands::Init { offline: true, .. }
@@ -150,6 +165,7 @@ async fn dispatch_subcommand(
         Some(Commands::Voucher { command }) => commands::voucher::run(command),
         Some(Commands::Trust { command }) => commands::trust::run(command),
         Some(Commands::Audit(args)) => commands::audit::run(&args).await,
+        Some(Commands::Hook(args)) => commands::hook::run(args).await,
         Some(Commands::Budget { command }) => commands::budget::run(command),
         Some(Commands::Build {
             path,
@@ -192,8 +208,10 @@ async fn dispatch_subcommand(
                     .transpose()?
                     .unwrap_or_else(crate::principal::current),
                 grant_capsules,
+                require_signed: false,
+                selected_capsules: Vec::new(),
             };
-            commands::init::run_init(&distro, &opts).await?;
+            let _daemon_lease = commands::init::run_init(&distro, &opts).await?;
             commands::self_update::ensure_path_setup()?;
             Ok(ExitCode::SUCCESS)
         },
@@ -204,19 +222,26 @@ async fn dispatch_subcommand(
         Some(Commands::Gc(args)) => commands::gc::run(&args),
         Some(Commands::Config { command }) => dispatch_config(command),
         Some(Commands::Session { command }) => dispatch_session(command),
-        Some(Commands::Start) => {
-            commands::daemon::handle_start().await?;
+        Some(Commands::Start { ephemeral }) => {
+            if ephemeral {
+                commands::daemon::ensure_daemon("start").await?;
+            } else {
+                commands::daemon::handle_start().await?;
+            }
             Ok(ExitCode::SUCCESS)
         },
         Some(Commands::Status) => {
-            commands::daemon::handle_status().await?;
+            commands::daemon::handle_status(output_format).await?;
             Ok(ExitCode::SUCCESS)
         },
         Some(Commands::Stop) => {
             commands::daemon::handle_stop().await?;
             Ok(ExitCode::SUCCESS)
         },
-        Some(Commands::Restart) => commands::restart::run().await,
+        Some(Commands::Restart) => {
+            commands::daemon::validate_runtime_admission()?;
+            commands::restart::run().await
+        },
         Some(Commands::Storage { command }) => commands::storage::run(command),
         Some(Commands::Logs(args)) => commands::logs::run(&args).await,
         Some(Commands::Ps(args)) => commands::ps::run(args).await,
@@ -358,7 +383,12 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
             target,
             workspace,
             approve_untrusted,
+            check,
+            json,
         } => {
+            if check {
+                return commands::capsule::updates::check(target.as_deref(), json).await;
+            }
             commands::capsule::install::update_capsule(
                 target.as_deref(),
                 workspace,
@@ -421,6 +451,7 @@ async fn dispatch_capsule_remove(
         .request(astrid_core::kernel_api::KernelRequest::RemoveCapsule {
             id: name.clone(),
             force,
+            purge,
         })
         .await?
     {
@@ -448,11 +479,25 @@ async fn dispatch_capsule_remove(
 }
 
 async fn dispatch_mcp(command: McpCommands) -> Result<ExitCode> {
+    if !matches!(command, McpCommands::Gc) {
+        commands::daemon::validate_runtime_admission()?;
+    }
     match command {
         McpCommands::Serve {
             workspace,
             request_timeout: _,
         } => commands::mcp::serve(None, workspace.as_deref()).await,
+        McpCommands::Attach { workspace } => {
+            commands::mcp::attach(None, workspace.as_deref()).await
+        },
+        McpCommands::Gateway => commands::mcp::gateway(None).await,
+        McpCommands::Http {
+            listen,
+            token_file,
+            workspace,
+        } => commands::mcp::http::run(listen, token_file.as_deref(), workspace.as_deref()).await,
+        McpCommands::Ready { format } => commands::mcp::ready(None, &format).await,
+        McpCommands::Gc => commands::mcp::gc(),
     }
 }
 
@@ -466,6 +511,7 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
             allow_unsigned,
             accept_new_key,
             vars,
+            capsules,
         } => {
             if agent.is_some() {
                 return Ok(commands::stub::deferred(
@@ -473,11 +519,18 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
                     &[tracker_657()],
                 ));
             }
+            if allow_unsigned {
+                anyhow::bail!(
+                    "astrid distro apply requires a signed Distro; --allow-unsigned is not acceptance"
+                );
+            }
             let distro = non_empty_distro_source(name).ok_or_else(|| {
                 anyhow::anyhow!(
                     "astrid distro apply requires an explicit distro source: @owner/repo, URL, local Distro.toml, or .shuttle; Astrid Runtime does not choose a product distro"
                 )
             })?;
+            commands::init::reject_filtered_shuttle(&distro, &capsules)?;
+            let filtered = !capsules.is_empty();
             let opts = commands::init::InitOpts {
                 yes,
                 offline,
@@ -486,10 +539,14 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
                 vars: commands::init::parse_cli_vars(&vars)?,
                 target_principal: crate::principal::current(),
                 // `distro apply` has no `--grant-capsules` surface; granting
-                // stays on `astrid init`. Capsules install without grants here.
                 grant_capsules: false,
+                require_signed: true,
+                selected_capsules: capsules,
             };
-            commands::init::run_init(&distro, &opts).await?;
+            let _daemon_lease = commands::init::run_init(&distro, &opts).await?;
+            if !filtered && apply_self_grant_required(&distro) {
+                commands::init::apply_self_grant(&opts.target_principal).await?;
+            }
             Ok(ExitCode::SUCCESS)
         },
         DistroCommands::Show { agent } => {
@@ -532,6 +589,12 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         },
     }
+}
+
+/// Source-manifest apply completes with `DistroSelfGrant`; `.shuttle` remains a
+/// packaging/install vehicle and must never gain grant authority in this path.
+fn apply_self_grant_required(distro_source: &str) -> bool {
+    !distro_source.ends_with(".shuttle")
 }
 
 fn dispatch_wit(command: &WitCommands) -> Result<ExitCode> {
@@ -596,6 +659,35 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    #[test]
+    fn headless_auto_approve_is_rejected_before_execution() {
+        let error = ensure_headless_auto_approve_rejected(true, true)
+            .expect_err("prompt automation must be rejected");
+        assert!(error.to_string().contains("unsupported"));
+        assert!(error.to_string().contains("correlated"));
+    }
+
+    #[test]
+    fn non_headless_auto_approve_is_not_rejected_by_the_headless_guard() {
+        ensure_headless_auto_approve_rejected(true, false).unwrap();
+    }
+
+    #[test]
+    fn root_auto_approve_before_the_run_subcommand_is_rejected() {
+        for flag in ["--yes", "--yolo", "--autonomous"] {
+            let cli = Cli::try_parse_from(["astrid", flag, "run", "hello"])
+                .expect("root-level automation parses before subcommand dispatch");
+            assert!(cli.auto_approve);
+            assert!(matches!(cli.command, Some(Commands::Run(_))));
+
+            let headless_route = cli.prompt.is_some()
+                || (cli.command.is_none() && !std::io::stdin().is_terminal())
+                || matches!(cli.command, Some(Commands::Run(_)));
+            ensure_headless_auto_approve_rejected(cli.auto_approve, headless_route)
+                .expect_err("run automation must be rejected");
+        }
+    }
 
     #[test]
     fn offline_commands_never_check_for_updates() {
@@ -798,6 +890,7 @@ mod tests {
                 allow_unsigned: false,
                 accept_new_key: false,
                 vars: Vec::new(),
+                capsules: Vec::new(),
             })
             .await
             .expect_err("standalone distro apply must require a non-empty explicit distro");
@@ -807,5 +900,56 @@ mod tests {
                 "astrid distro apply requires an explicit distro source: @owner/repo, URL, local Distro.toml, or .shuttle; Astrid Runtime does not choose a product distro"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn distro_apply_rejects_unsigned_acceptance_before_install() {
+        let error = dispatch_distro(DistroCommands::Apply {
+            name: Some("/tmp/product.shuttle".into()),
+            agent: None,
+            yes: true,
+            offline: true,
+            allow_unsigned: true,
+            accept_new_key: false,
+            vars: Vec::new(),
+            capsules: Vec::new(),
+        })
+        .await
+        .expect_err("--allow-unsigned must not make Distro apply acceptance-capable");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--allow-unsigned is not acceptance")
+        );
+    }
+
+    #[test]
+    fn self_grant_follows_source_manifests_but_not_shuttle_packages() {
+        assert!(apply_self_grant_required("/tmp/product/Distro.toml"));
+        assert!(!apply_self_grant_required("/tmp/product.shuttle"));
+    }
+
+    #[tokio::test]
+    async fn distro_apply_rejects_filtered_shuttle_before_install() {
+        let error = dispatch_distro(DistroCommands::Apply {
+            name: Some("/tmp/product.shuttle".into()),
+            agent: None,
+            yes: true,
+            offline: true,
+            allow_unsigned: false,
+            accept_new_key: false,
+            vars: Vec::new(),
+            capsules: vec!["aos-mcp".into()],
+        })
+        .await
+        .expect_err("filtered apply must not use shuttle sources");
+
+        assert!(
+            error
+                .to_string()
+                .contains("not supported for .shuttle sources"),
+            "got: {error:#}"
+        );
     }
 }

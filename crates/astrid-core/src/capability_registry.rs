@@ -17,6 +17,7 @@ use util::{
 };
 
 mod revision_1;
+mod revision_2;
 mod util;
 
 const ENTRY_DIGEST_DOMAIN: &[u8] = b"astrid-capability-entry\0";
@@ -119,6 +120,9 @@ const CAPABILITY_REGISTRY_REVISION_1_IDS: [&str; 51] = [
 pub const CAPABILITY_REGISTRY_REVISION_1: CapabilityRegistryRevision =
     CapabilityRegistryRevision::new(NonZeroU32::MIN);
 
+/// Schema revision for the 52-ID authority registry.
+pub const CAPABILITY_REGISTRY_REVISION_2: CapabilityRegistryRevision = revision_2::REVISION;
+
 #[derive(Clone, Copy)]
 struct RevisionSemantics {
     scope: CapabilityScope,
@@ -135,13 +139,39 @@ struct RevisionSemantics {
 /// any definition fails registry validation.
 pub fn capability_registry_revision_1() -> Result<CapabilityRegistryManifest, AuthorityRegistryError>
 {
-    let entries = CAPABILITY_REGISTRY_REVISION_1_IDS
-        .into_iter()
+    capability_registry(
+        CAPABILITY_REGISTRY_REVISION_1,
+        &CAPABILITY_REGISTRY_REVISION_1_IDS,
+    )
+}
+
+/// Build the content-addressed registry for the 52 fixed capability IDs.
+///
+/// # Errors
+///
+/// Returns an error if an ID lacks fixed semantics or display metadata, or if
+/// any definition fails registry validation.
+pub fn capability_registry_revision_2() -> Result<CapabilityRegistryManifest, AuthorityRegistryError>
+{
+    capability_registry(CAPABILITY_REGISTRY_REVISION_2, &revision_2::IDS)
+}
+
+fn capability_registry(
+    revision: CapabilityRegistryRevision,
+    ids: &[&str],
+) -> Result<CapabilityRegistryManifest, AuthorityRegistryError> {
+    let entries = ids
+        .iter()
         .map(|id| {
             let semantics = revision_1_semantics(id).ok_or_else(|| {
                 AuthorityRegistryError::MissingRevisionDefinition { id: id.to_string() }
             })?;
-            let danger = revision_1::danger(id).ok_or_else(|| {
+            let danger = if revision == CAPABILITY_REGISTRY_REVISION_2 {
+                revision_2::danger(id)
+            } else {
+                revision_1::danger(id)
+            };
+            let danger = danger.ok_or_else(|| {
                 AuthorityRegistryError::MissingRevisionDisplayMetadata { id: id.to_string() }
             })?;
             RegisteredCapability::new(
@@ -156,7 +186,7 @@ pub fn capability_registry_revision_1() -> Result<CapabilityRegistryManifest, Au
         })
         .collect::<Result<Vec<_>, AuthorityRegistryError>>()?;
 
-    CapabilityRegistryManifest::new(CAPABILITY_REGISTRY_REVISION_1, entries)
+    CapabilityRegistryManifest::new(revision, entries)
 }
 
 fn revision_1_semantics(id: &str) -> Option<RevisionSemantics> {
@@ -188,6 +218,7 @@ fn revision_1_semantics(id: &str) -> Option<RevisionSemantics> {
         | "self:agent:list"
         | "self:group:list"
         | "self:quota:get"
+        | "self:distro:grant"
         | "self:approval:respond" => RevisionSemantics::new(Self_, &[Principal], true, false),
         "agent:create" | "agent:create:clone" | "agent:modify" => {
             RevisionSemantics::new(Global, &[Principal, Group, CapsulePackage], true, true)

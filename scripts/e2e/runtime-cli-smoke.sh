@@ -28,6 +28,17 @@ run_cli_semantic_smoke() {
   json_assert_cli_agent_enabled \
     "$ARTIFACTS/cli-agent-lifecycle-after-denied-delete.json" \
     e2e-cli-lifecycle true
+  # Capability and a registered CLI key do not establish first ownership.
+  # The authorized named-claim path is covered by signed-enrollment handler
+  # tests; a fresh OS runtime must leave this already-admitted target intact.
+  assert_cli_exit_contains "cli-agent-claim-unenrolled-denied" 1 \
+    "principal creation requires a current user delegation" \
+    agent claim e2e-cli-lifecycle
+  run_cli agent show e2e-cli-lifecycle --format json \
+    > "$ARTIFACTS/cli-agent-lifecycle-after-denied-claim.json"
+  json_assert_cli_agent_show \
+    "$ARTIFACTS/cli-agent-lifecycle-after-denied-claim.json" \
+    e2e-cli-lifecycle agent
   run_cli caps grant "$ops_principal" caps:token:mint
   run_cli caps grant "$ops_principal" caps:token:list
   run_cli caps grant "$ops_principal" caps:token:revoke
@@ -161,7 +172,16 @@ PY
   run_cli keypair delete e2e-cli-redeem-key --yes
 
   run_cli quota show --agent "$user_principal" --format json > "$ARTIFACTS/cli-quota-show-user.json"
+  run_cli quota users --format json > "$ARTIFACTS/cli-quota-users.json"
   json_assert_cli_quota "$ARTIFACTS/cli-quota-show-user.json" "$user_principal" 4
+  # A syntactically valid but unrelated user cannot replace the payer, even
+  # when the principal being changed is the authenticated caller itself.
+  local unrelated_user
+  unrelated_user="$(printf '%064d' 0)"
+  assert_principal_cli_failure "$user_principal" "cli-quota-assign-self-denied" \
+    quota assign-user --agent "$user_principal" --user "$unrelated_user"
+  grep -q 'missing capability' "$ARTIFACTS/cli-quota-assign-self-denied.err" \
+    || fail "resource attribution failed for an unexpected reason"
   run_cli secret list --agent "$user_principal" --format json > "$ARTIFACTS/cli-secret-list-user.json"
   json_assert_secret_list_metadata "$ARTIFACTS/cli-secret-list-user.json" astrid-capsule-openai-compat api_key
   run_cli secret set e2e_cli_delete_marker e2e-value --agent "$user_principal" \
@@ -218,11 +238,18 @@ import secrets
 print(secrets.token_hex(32))
 PY
 )"
-  status="$(http_status POST /api/auth/pair-device/redeem "" \
-    "{\"token\":\"$pair_token\",\"public_key\":\"$pair_pubkey\"}" \
-    "$ARTIFACTS/cli-pair-device-redeem.json")"
-  assert_status "CLI-issued pair token redeem" "$status" 200
+  # pair-device redeem is a CLI leaf: token on stdin. HTTP redeem stays in the
+  # HTTP pair-device lifecycle and must not stand in for this command row.
+  printf '$ astrid pair-device redeem --public-key <hex> < <redacted pair token>\n' \
+    >> "$ARTIFACTS/cli-transcript.log"
+  if ! printf '%s\n' "$pair_token" | "$CORE_DIR/target/debug/astrid" pair-device redeem \
+    --public-key "$pair_pubkey" \
+    > "$ARTIFACTS/cli-pair-device-redeem.json" \
+    2>> "$ARTIFACTS/cli-transcript.log"; then
+    fail "CLI pair-device redeem from stdin failed"
+  fi
   pair_key_id="$(json_field "$ARTIFACTS/cli-pair-device-redeem.json" key_id)"
+  [[ -n "$pair_key_id" ]] || fail "CLI pair-device redeem missed key_id"
   run_cli pair-device list --agent default --json > "$ARTIFACTS/cli-pair-device-list.json"
   json_assert_pair_device_list "$ARTIFACTS/cli-pair-device-list.json" "$pair_key_id" present
   run_cli pair-device revoke "$pair_key_id" --agent default
@@ -276,6 +303,10 @@ PY
   run_cli_stdin_timeout "cli-chat-eof" 20 --format json chat
   grep -q "Goodbye" "$ARTIFACTS/cli-chat-eof.out" || fail "chat EOF path did not exit cleanly"
   run_cli_mcp_stdio_smoke "cli-mcp-serve-handshake" 20 --principal anonymous mcp serve
+  assert_principal_cli_failure "$user_principal" "cli-mcp-http-public-bind-denied" \
+    mcp http --listen 0.0.0.0:0
+  grep -Fq "MCP HTTP must bind to loopback" "$ARTIFACTS/cli-mcp-http-public-bind-denied.err" \
+    || fail "MCP HTTP public bind missed the loopback diagnostic"
   run_cli_daemon_lifecycle_smoke
 }
 
@@ -357,7 +388,8 @@ run_cli_distro_seal_smoke() {
   registry_version="$(capsule_archive_version "$registry_archive")"
   local distro_dir="$ARTIFACTS/cli-distro-seal"
   local key="$distro_dir/signing.key"
-  mkdir -p "$distro_dir"
+  mkdir -p "$distro_dir/capsules"
+  cp "$registry_archive" "$distro_dir/capsules/astrid-capsule-registry.capsule"
   cat > "$distro_dir/Distro.toml" <<EOF
 schema-version = 1
 
@@ -368,7 +400,7 @@ version = "0.1.0"
 
 [[capsule]]
 name = "astrid-capsule-registry"
-source = "$registry_archive"
+source = "capsules/astrid-capsule-registry.capsule"
 version = "$registry_version"
 role = "uplink"
 EOF
@@ -376,9 +408,29 @@ EOF
 import sys
 open(sys.argv[1], "wb").write(bytes(range(32)))
 PY
-  assert_cli_exit_contains "cli-distro-seal-local-source" 1 \
-    "seal can only resolve GitHub-backed capsule sources" \
+
+  assert_cli_exit_contains "cli-distro-seal-relative-source" 0 "Sealed" \
     distro seal "$distro_dir/Distro.toml" --output "$distro_dir/e2e.shuttle" --key "$key"
+
+  local escape_dir="$ARTIFACTS/cli-distro-seal-escape"
+  mkdir -p "$escape_dir"
+  cat > "$escape_dir/Distro.toml" <<EOF
+schema-version = 1
+
+[distro]
+id = "e2e-seal-escape"
+name = "E2E Seal Escape"
+version = "0.1.0"
+
+[[capsule]]
+name = "astrid-capsule-registry"
+source = "$registry_archive"
+version = "$registry_version"
+role = "uplink"
+EOF
+  assert_cli_exit_contains "cli-distro-seal-escape-source" 1 \
+    "escapes the authenticated Distro.toml directory" \
+    distro seal "$escape_dir/Distro.toml" --output "$escape_dir/e2e.shuttle" --key "$key"
 }
 
 run_cli_daemon_lifecycle_smoke() {
@@ -650,6 +702,23 @@ if data.get("principal") != sys.argv[2]:
     raise SystemExit(f"unexpected principal: {data!r}")
 if data.get("enabled") is not want:
     raise SystemExit(f"unexpected enabled state: {data!r}")
+PY
+}
+
+json_assert_cli_agent_owned() {
+  local file=$1 principal=$2
+  "$PYTHON" - "$file" "$principal" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+want = sys.argv[2]
+entries = data if isinstance(data, list) else [data]
+found = next((entry for entry in entries if entry.get("principal") == want), None)
+if found is None:
+    raise SystemExit(f"missing principal {want!r}: {data!r}")
+if not found.get("owner_uid"):
+    raise SystemExit(f"principal {want!r} missing owner_uid: {found!r}")
 PY
 }
 

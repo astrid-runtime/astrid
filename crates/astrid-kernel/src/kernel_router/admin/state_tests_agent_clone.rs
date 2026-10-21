@@ -20,7 +20,6 @@ use astrid_core::profile::PrincipalProfile;
 use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody};
 use tempfile::TempDir;
 
-use super::handlers;
 use crate::Kernel;
 
 /// Build a kernel and seed `default` into the built-in `admin` group, mirroring
@@ -41,6 +40,7 @@ async fn fixture() -> (TempDir, Arc<Kernel>) {
         ))
         .expect("seed default admin profile");
     kernel.profile_cache.invalidate(&PrincipalId::default());
+    super::test_support::seed_operator(&kernel).await;
     (dir, kernel)
 }
 
@@ -135,7 +135,7 @@ async fn agent_create_clone_copies_capability_profile() {
     publish_source_capsule(&kernel, &pid("src"), "astrid-capsule-openai-compat");
     kernel.profile_cache.invalidate(&pid("src"));
 
-    let res = handlers::dispatch(
+    let res = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -194,7 +194,7 @@ async fn agent_create_clone_copies_capability_profile() {
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_create_clone_rejects_admin_source_without_ack() {
     let (_dir, kernel) = fixture().await;
-    let res = handlers::dispatch(
+    let res = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -219,7 +219,7 @@ async fn agent_create_clone_rejects_admin_source_without_ack() {
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_create_clone_admin_source_with_ack_succeeds() {
     let (_dir, kernel) = fixture().await;
-    let res = handlers::dispatch(
+    let res = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -245,7 +245,7 @@ async fn agent_create_clone_admin_source_with_ack_succeeds() {
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_create_clone_rejects_nonexistent_source() {
     let (_dir, kernel) = fixture().await;
-    let res = handlers::dispatch(
+    let res = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -266,7 +266,7 @@ async fn agent_create_clone_rejects_nonexistent_source() {
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_create_clone_rejects_self() {
     let (_dir, kernel) = fixture().await;
-    let res = handlers::dispatch(
+    let res = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -289,7 +289,7 @@ async fn agent_create_clone_rejects_self() {
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_create_clone_rejects_combined_with_groups() {
     let (_dir, kernel) = fixture().await;
-    let res = handlers::dispatch(
+    let res = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentCreate {

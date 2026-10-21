@@ -721,6 +721,19 @@ fn ipc_evt(topic: &str, principal: Option<&str>) -> AstridEvent {
     }
 }
 
+fn ipc_evt_with_owner(
+    topic: &str,
+    principal: &str,
+    owner: crate::ipc::RequestOwnerId,
+) -> AstridEvent {
+    let mut event = ipc_evt(topic, Some(principal));
+    let AstridEvent::Ipc { message, .. } = &mut event else {
+        unreachable!("ipc_evt always returns IPC")
+    };
+    message.request_owner = Some(owner);
+    event
+}
+
 #[tokio::test]
 async fn routed_demux_no_broadcast_storm() {
     // 5 routed subs, each with a distinct capsule_uuid on the same
@@ -1046,6 +1059,29 @@ async fn cross_principal_audit_isolation_at_bus() {
 }
 
 #[tokio::test]
+async fn request_owner_scope_rejects_peer_before_queue_admission() {
+    let bus = EventBus::new();
+    let owner = crate::ipc::RequestOwnerId::generate();
+    let peer = crate::ipc::RequestOwnerId::generate();
+    let mut sub = bus.subscribe_topic_routed_for_request_owner(
+        uuid::Uuid::new_v4(),
+        "astrid.v1.approval",
+        "gateway",
+        "test_sub",
+        "alice",
+        owner,
+    );
+
+    bus.publish(ipc_evt_with_owner("astrid.v1.approval", "alice", peer));
+    bus.publish(ipc_evt_with_owner("astrid.v1.approval", "bob", owner));
+    assert_eq!(sub.active_principals(), 0);
+
+    bus.publish(ipc_evt_with_owner("astrid.v1.approval", "alice", owner));
+    assert_eq!(sub.active_principals(), 1);
+    assert_eq!(sub.try_drain(MAX_SUBSCRIPTION_BUDGET_BYTES).len(), 1);
+}
+
+#[tokio::test]
 async fn unscoped_route_unchanged_regression() {
     // The unscoped path (subscribe_topic_routed, scope=None) over the same
     // publish mix delivers EVERY event — the gateway firehose path is
@@ -1096,4 +1132,86 @@ async fn scoped_drop_no_spurious_notify() {
     let got = sub.recv(Some(std::time::Duration::from_millis(50))).await;
     assert!(got.is_none(), "foreign-only burst must not wake the owner");
     assert_eq!(sub.active_principals(), 0, "no bucket ever allocated");
+}
+
+#[tokio::test]
+async fn delivery_receipt_peer_flood_never_enters_or_wakes_broad_route() {
+    use crate::ipc::{IpcMessage, IpcPayload, delivery_failure};
+    for mode in 0..3 {
+        let bus = EventBus::new();
+        let owner = uuid::Uuid::new_v4();
+        let peer = uuid::Uuid::new_v4();
+        let id = delivery_failure::DeliveryId::parse("123456781234123412341234567890ab").unwrap();
+        let mut route = match mode {
+            0 => bus.subscribe_topic_routed(owner, "astrid.*", "owner", "test"),
+            1 => bus.subscribe_topic_routed_for_principal_gated(
+                owner,
+                "astrid.*",
+                "owner",
+                "test",
+                &PrincipalId::default(),
+                RouteAdmissionGate::published(),
+            ),
+            _ => bus.subscribe_topic_routed_principal_or_system_gated(
+                owner,
+                "astrid.*",
+                "owner",
+                "test",
+                "alice",
+                RouteAdmissionGate::published(),
+            ),
+        };
+        let principal = if mode == 1 {
+            PrincipalId::default().to_string()
+        } else {
+            "alice".into()
+        };
+        let receipt = |publisher| AstridEvent::Ipc {
+            message: IpcMessage::new(
+                delivery_failure::failure_topic(publisher, id),
+                IpcPayload::RawJson(serde_json::json!({"reason": "x".repeat(8192)})),
+                uuid::Uuid::nil(),
+            )
+            .with_principal(&principal),
+            metadata: EventMetadata::new("test"),
+        };
+        for _ in 0..256 {
+            bus.publish(receipt(peer));
+        }
+        assert_eq!(
+            route.total_bytes(),
+            0,
+            "peer receipts must not consume byte budget"
+        );
+        assert_eq!(route.active_principals(), 0, "no peer bucket allocation");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                route.notify.notified()
+            )
+            .await
+            .is_err(),
+            "no peer wakeup permit"
+        );
+
+        bus.publish(ipc_evt("astrid.v1.normal", Some(&principal)));
+        for _ in 0..256 {
+            bus.publish(receipt(peer));
+        }
+        bus.publish(receipt(owner));
+        let received = route.try_drain(super::MAX_SUBSCRIPTION_BUDGET_BYTES);
+        assert_eq!(
+            received.len(),
+            2,
+            "peer flood must not evict normal traffic"
+        );
+        let AstridEvent::Ipc { message, .. } = received[0].as_ref() else {
+            panic!("IPC");
+        };
+        assert_eq!(message.topic.as_str(), "astrid.v1.normal");
+        let AstridEvent::Ipc { message, .. } = received[1].as_ref() else {
+            panic!("IPC");
+        };
+        assert_eq!(message.topic, delivery_failure::failure_topic(owner, id));
+    }
 }

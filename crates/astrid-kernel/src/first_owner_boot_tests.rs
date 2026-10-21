@@ -6,12 +6,14 @@ use astrid_core::dirs::AstridHome;
 
 fn scratch_home() -> (tempfile::TempDir, AstridHome) {
     let dir = tempfile::tempdir().expect("test home root");
-    let home = AstridHome::from_path(dir.path());
+    // Admit the empty durable root once, before tests seed runtime state.
+    // Keep sibling attack targets outside that admitted root.
+    let home = AstridHome::from_path(dir.path().join("home"));
+    home.ensure().expect("ensure test home");
     (dir, home)
 }
 
 fn injected_kernel_resources(home: &AstridHome) -> crate::KernelResources {
-    home.ensure().expect("ensure test home");
     let kv: Arc<dyn astrid_storage::KvStore> = Arc::new(astrid_storage::MemoryKvStore::new());
     let runtime_key = Arc::new(astrid_crypto::KeyPair::generate());
     let audit_log = Arc::new(

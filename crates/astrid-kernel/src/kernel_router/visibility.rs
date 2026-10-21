@@ -10,6 +10,7 @@ use super::AuthorizedRequest;
 pub(super) struct CapsuleVisibility {
     pub(super) principal: PrincipalId,
     is_admin: bool,
+    all_principals: bool,
     capsule_grants: BTreeSet<String>,
 }
 
@@ -21,10 +22,27 @@ impl CapsuleVisibility {
         let profile = authorization.profile.as_ref();
         let check = authorization.capability_check();
 
+        let is_admin = check.has("capsule:list");
         Self {
             principal: authorization.principal.clone(),
-            is_admin: check.has("capsule:list"),
+            is_admin,
+            all_principals: is_admin,
             capsule_grants: profile.capsules.iter().cloned().collect(),
+        }
+    }
+
+    pub(super) fn for_target(authorization: &AuthorizedRequest, target: &PrincipalId) -> Self {
+        if target == &authorization.principal {
+            let mut visibility = Self::new(authorization);
+            visibility.all_principals = false;
+            return visibility;
+        }
+        debug_assert!(authorization.capability_check().has("capsule:list"));
+        Self {
+            principal: target.clone(),
+            is_admin: true,
+            all_principals: false,
+            capsule_grants: BTreeSet::new(),
         }
     }
 
@@ -32,6 +50,7 @@ impl CapsuleVisibility {
         Self {
             principal: caller.clone(),
             is_admin: false,
+            all_principals: false,
             capsule_grants: BTreeSet::new(),
         }
     }
@@ -44,7 +63,7 @@ impl CapsuleVisibility {
         &self,
         registry: &astrid_capsule::registry::CapsuleRegistry,
     ) -> Vec<Arc<dyn astrid_capsule::capsule::Capsule>> {
-        if self.is_admin {
+        if self.is_admin && self.all_principals {
             registry.cloned_values()
         } else {
             registry.cloned_values_for(&self.principal)

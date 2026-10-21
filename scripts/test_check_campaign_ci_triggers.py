@@ -12,6 +12,7 @@ from pathlib import Path
 from check_campaign_ci_triggers import (
     CI_YML_LINE_CAP,
     OWNED_WORKFLOWS,
+    UNFILTERED_PR_WORKFLOWS,
     check_repository,
     load_workflows,
     validate_workflows,
@@ -31,9 +32,51 @@ class CampaignCiTriggerTests(unittest.TestCase):
     def test_current_workflows_pass(self):
         self.assertEqual(check_repository(ROOT), [])
 
+    def test_windows_filesystem_checks_keep_one_native_job(self):
+        workflows = load_workflows(ROOT)
+        self.assertNotIn("  windows-filesystem-native:\n", workflows["ci.yml"])
+        native = workflows["windows-filesystem-native.yml"]
+        self.assertIn("  windows-filesystem-native:\n", native)
+        self.assertIn("Check the non-test kernel for the Windows target", native)
+        self.assertIn("Run storage callback transport tests in trusted staging", native)
+        self.assertIn("Run the native WinFsp filesystem round trip", native)
+        self.assertIn(
+            "& $stagedTestExecutable storage_mount --nocapture --test-threads=1", native
+        )
+        self.assertNotIn("& $stagedTestExecutable storage_mount -- --nocapture", native)
+
+    def test_required_pr_checks_allow_stacked_bases(self):
+        workflows = load_workflows(ROOT)
+        self.assertEqual(validate_workflows(workflows), [])
+        for name in UNFILTERED_PR_WORKFLOWS:
+            with self.subTest(workflow=name):
+                self.assertNotIn("    branches:", workflows[name].split("  pull_request:\n", 1)[1].split("\npermissions:", 1)[0])
+
+    def test_required_pr_checks_reject_filters(self):
+        workflows = load_workflows(ROOT)
+        for name in UNFILTERED_PR_WORKFLOWS:
+            for field, value in (
+                ("branches", "[main, os/universal]"),
+                ("branches", "[]"),
+                ("branches-ignore", "[os/universal]"),
+                ("paths", "['**.rs']"),
+                ("paths-ignore", "['docs/**']"),
+            ):
+                with self.subTest(workflow=name, field=field, value=value):
+                    mutated = dict(workflows)
+                    mutated[name] = workflows[name].replace(
+                        "  pull_request:\n",
+                        f"  pull_request:\n    {field}: {value}\n",
+                        1,
+                    )
+                    self.assertIn(
+                        f"{name}: pull_request.{field} must remain unfiltered",
+                        validate_workflows(mutated),
+                    )
+
     def test_pull_request_requires_campaign_branch(self):
         temp_root = self._copy_workflows()
-        workflow = temp_root / ".github" / "workflows" / "ci.yml"
+        workflow = temp_root / ".github" / "workflows" / "dependency-review.yml"
         workflow.write_text(
             workflow.read_text(encoding="utf-8").replace(
                 "branches: [main, os/universal]", "branches: [main]", 1
@@ -43,14 +86,14 @@ class CampaignCiTriggerTests(unittest.TestCase):
         errors = check_repository(temp_root)
         self.assertTrue(
             any(
-                "ci.yml: pull_request.branches is missing os/universal" in error
+                "dependency-review.yml: pull_request.branches is missing os/universal" in error
                 for error in errors
             )
         )
 
     def test_pull_request_requires_main_branch(self):
         temp_root = self._copy_workflows()
-        workflow = temp_root / ".github" / "workflows" / "pr-checks.yml"
+        workflow = temp_root / ".github" / "workflows" / "dependency-review.yml"
         workflow.write_text(
             workflow.read_text(encoding="utf-8").replace(
                 "branches: [main, os/universal]", "branches: [os/universal]", 1
@@ -60,14 +103,14 @@ class CampaignCiTriggerTests(unittest.TestCase):
         errors = check_repository(temp_root)
         self.assertTrue(
             any(
-                "pr-checks.yml: pull_request.branches is missing main" in error
+                "dependency-review.yml: pull_request.branches is missing main" in error
                 for error in errors
             )
         )
 
     def test_codex_filter_is_rejected(self):
         temp_root = self._copy_workflows()
-        workflow = temp_root / ".github" / "workflows" / "pr-checks.yml"
+        workflow = temp_root / ".github" / "workflows" / "dependency-review.yml"
         workflow.write_text(
             workflow.read_text(encoding="utf-8").replace(
                 "branches: [main, os/universal]",
@@ -79,7 +122,7 @@ class CampaignCiTriggerTests(unittest.TestCase):
         errors = check_repository(temp_root)
         self.assertTrue(
             any(
-                "pr-checks.yml: pull_request.branches must not include codex branch filters"
+                "dependency-review.yml: pull_request.branches must not include codex branch filters"
                 in error
                 for error in errors
             )
@@ -87,7 +130,7 @@ class CampaignCiTriggerTests(unittest.TestCase):
 
     def test_branchless_pull_request_is_rejected(self):
         temp_root = self._copy_workflows()
-        workflow = temp_root / ".github" / "workflows" / "pr-checks.yml"
+        workflow = temp_root / ".github" / "workflows" / "dependency-review.yml"
         workflow.write_text(
             workflow.read_text(encoding="utf-8").replace(
                 "    branches: [main, os/universal]\n", "", 1
@@ -96,7 +139,7 @@ class CampaignCiTriggerTests(unittest.TestCase):
         )
         errors = check_repository(temp_root)
         self.assertTrue(
-            any("pr-checks.yml: pull_request.branches is required" in error for error in errors)
+            any("dependency-review.yml: pull_request.branches is required" in error for error in errors)
         )
 
     def test_all_owned_branchless_pull_request_is_rejected(self):
@@ -114,7 +157,8 @@ class CampaignCiTriggerTests(unittest.TestCase):
         }
         errors = validate_workflows(mutated)
         required = {
-            f"{name}: pull_request.branches is required" for name in OWNED_WORKFLOWS
+            f"{name}: pull_request.branches is required"
+            for name in OWNED_WORKFLOWS - UNFILTERED_PR_WORKFLOWS
         }
         self.assertTrue(required.issubset(set(errors)), errors)
 
@@ -123,8 +167,8 @@ class CampaignCiTriggerTests(unittest.TestCase):
         workflow = temp_root / ".github" / "workflows" / "ci.yml"
         workflow.write_text(
             workflow.read_text(encoding="utf-8").replace(
-                "    branches: [main, os/universal]",
-                "    branches-ignore: [main]",
+                "  pull_request:\n",
+                "  pull_request:\n    branches-ignore: [main]\n",
                 1,
             ),
             encoding="utf-8",

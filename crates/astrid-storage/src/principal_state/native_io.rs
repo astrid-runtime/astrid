@@ -778,6 +778,62 @@ pub(super) fn open_private_file(path: &Path) -> StorageResult<File> {
     open_private_file_with_access(path, false)
 }
 
+pub(super) fn snapshot_private_file(path: &Path) -> StorageResult<Option<Vec<u8>>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => {
+            let parent = path.parent().ok_or_else(|| {
+                connection(format!("private file {} has no parent", path.display()))
+            })?;
+            let name = path.file_name().ok_or_else(|| {
+                connection(format!("private file {} has no name", path.display()))
+            })?;
+            let directory = PrivateDirectory::open(parent)?;
+            let mut file = directory.open_file(Path::new(name))?;
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|error| {
+                connection(format!("read private file {}: {error}", path.display()))
+            })?;
+            Ok(Some(bytes))
+        },
+        Ok(_) => Err(connection(format!(
+            "private projection destination is not a regular file: {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(connection(format!(
+            "inspect private projection destination {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+pub(super) fn rollback_private_file(path: &Path, previous: Option<Vec<u8>>) -> StorageResult<()> {
+    if let Some(bytes) = previous {
+        return astrid_core::platform_fs::atomic_write_private_file(path, &bytes).map_err(
+            |error| connection(format!("restore private file {}: {error}", path.display())),
+        );
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| connection(format!("private file {} has no parent", path.display())))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| connection(format!("private file {} has no name", path.display())))?;
+    PrivateDirectory::open(parent)?.remove_file(Path::new(name))
+}
+
+pub(super) fn rollback_private_files(written: Vec<(PathBuf, Option<Vec<u8>>)>) -> Vec<String> {
+    written
+        .into_iter()
+        .rev()
+        .filter_map(|(path, previous)| {
+            rollback_private_file(&path, previous)
+                .err()
+                .map(|error| format!("{}: {error}", path.display()))
+        })
+        .collect()
+}
+
 fn open_private_file_with_access(path: &Path, write: bool) -> StorageResult<File> {
     validate_private_regular_file(path)?;
     let mut options = OpenOptions::new();

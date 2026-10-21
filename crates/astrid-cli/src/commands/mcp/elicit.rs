@@ -53,6 +53,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
+use super::consent_display::ConsentDisplay;
+
 /// Broker front door for the shim's elicited approval choice. Maps to
 /// `sage-mcp::SageMcp::handle_mcp_approval`.
 pub(super) const APPROVAL_RESPOND_TOPIC: &str = "astrid.v1.request.mcp.approval.respond";
@@ -122,7 +124,7 @@ impl ApprovalChoice {
 /// echoed verbatim back to the broker so it can route the decision and
 /// re-establish the result drain; `action` / `resource` / `reason` are
 /// rendered into the elicitation prompt for the user.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct ApprovalRequest {
     /// Host-minted approval correlation id; echoed onto the respond body.
     request_id: String,
@@ -201,6 +203,15 @@ impl ApprovalRequest {
         p.push_str("\n\nApprove this request?");
         p
     }
+
+    /// Display-only consent metadata. Routing tokens stay off this map.
+    pub(super) fn consent_display(&self) -> ConsentDisplay {
+        ConsentDisplay::action_approval()
+            .with_action(&self.action)
+            .with_resource(&self.resource)
+            .with_reason(&self.reason)
+            .with_tool(&self.tool_name)
+    }
 }
 
 /// Resolve an approval `request` by eliciting a choice from `peer` and
@@ -239,7 +250,13 @@ async fn elicit_choice(peer: &Peer<RoleServer>, request: &ApprovalRequest) -> Ap
         return ApprovalChoice::Deny;
     }
 
-    match super::form_elicitation::elicit::<ApprovalForm>(peer, request.prompt()).await {
+    match super::form_elicitation::elicit::<ApprovalForm>(
+        peer,
+        request.prompt(),
+        &request.consent_display(),
+    )
+    .await
+    {
         Ok(Some(form)) => form.choice,
         Ok(None) => {
             // Accepted but no content — treat as no decision -> deny.
