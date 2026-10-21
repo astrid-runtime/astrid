@@ -39,7 +39,7 @@ class DockerfileContractTests(unittest.TestCase):
         self.assertEqual(
             first_line,
             "FROM docker.io/library/ubuntu@sha256:"
-            "7f622ca8766bccb22f04242ecb6f19f770b2f08827dc4b8c707de5e78a6da7ab",
+            "18b33ff3829707f31ada654a963b9ee35f2e6f0241b964bd17a22a9b330cb63d",
         )
 
     def test_is_non_root_distro_neutral_and_exposes_no_ports(self) -> None:
