@@ -695,4 +695,54 @@ mod tests {
             "Expected ValidationError for oversized config, got: {result:?}"
         );
     }
+
+    #[test]
+    fn workspace_poison_out_of_range_queue_fails_entire_load() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = workspace.path().join(".astrid");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            r#"
+[audit]
+host_fail_closed = ["file_write", "process_spawn"]
+[audit.retention]
+require_anchor = true
+archive_dir = "/srv/audit-archive"
+"#,
+        )
+        .unwrap();
+        // Workspace may set host_queue_capacity (not blocked). An out-of-range
+        // value fails whole-config validation — including operator retention.
+        std::fs::write(state.join("config.toml"), "[audit]\nhost_queue_capacity = 1\n").unwrap();
+        let err = load_with_layout(
+            Some(workspace.path()),
+            Some(home.path()),
+            &WorkspaceLayout::default(),
+        );
+        assert!(err.is_err(), "expected validation failure, got {err:?}");
+    }
+
+    #[test]
+    fn workspace_invalid_toml_fails_entire_load() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = workspace.path().join(".astrid");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[audit.retention]\nrequire_anchor = true\n",
+        )
+        .unwrap();
+        std::fs::write(state.join("config.toml"), "[[[not valid").unwrap();
+        assert!(
+            load_with_layout(
+                Some(workspace.path()),
+                Some(home.path()),
+                &WorkspaceLayout::default(),
+            )
+            .is_err()
+        );
+    }
 }
