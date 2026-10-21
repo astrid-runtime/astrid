@@ -13,13 +13,17 @@ use astrid_storage::{
 };
 
 use crate::authority::{
-    LegacyAuthorityReceiptStatus, legacy_authority_receipt_status, read_installed_authority,
-    read_installed_authority_bytes, rebind_relocated_legacy_authority_receipt,
-    retire_legacy_authority_receipt, verify_installed_authority,
+    AuthoritySource, LegacyAuthorityReceiptStatus, legacy_authority_receipt_status,
+    read_installed_authority, read_installed_authority_bytes,
+    rebind_relocated_legacy_authority_receipt, retire_legacy_authority_receipt,
+    verify_installed_authority,
 };
 use crate::meta::CapsuleMeta;
 
-use super::{canonical_legacy_archive, read_dir_sorted, read_verified_durable_package_for_owner};
+use super::{
+    canonical_legacy_archive, read_dir_sorted, read_verified_durable_package_for_owner,
+    verify_package_contents,
+};
 
 mod superseded;
 
@@ -184,12 +188,25 @@ pub fn migrate_native_capsules_with_report(
         let verification = artifact::verify_archive_bytes(&archive)
             .with_context(|| format!("verify canonical legacy capsule archive {id}"))?;
         let mut durable_authority = authority;
+        // Pre-authority installs have no provenance decision to preserve. Bind
+        // the verified archive's descriptive signer without changing their
+        // legacy source or any manifest, capability or executable ceiling.
+        // Explicit and partially populated receipts must still match exactly.
+        if durable_authority.source == AuthoritySource::LegacyMigration
+            && durable_authority.signer.is_none()
+            && durable_authority.signature.is_none()
+            && let artifact::ArtifactVerification::Signed(provenance) = &verification
+        {
+            durable_authority.signer = Some(provenance.signer.to_string());
+            durable_authority.signature = Some(provenance.signature.to_string());
+        }
         verification
             .content_digest()
             .clone_into(&mut durable_authority.content_digest);
         let durable_authority_bytes = serde_json::to_vec_pretty(&durable_authority)
             .with_context(|| format!("serialize durable legacy capsule authority {id}"))?;
         let package = CapsulePackage::new(archive, meta_bytes, durable_authority_bytes);
+        verify_package_contents(id, &package)?;
         let expectation = match registry.get_snapshot(&owner, id)? {
             None => CapsuleInstallExpectation::Absent,
             Some(snapshot) if snapshot.package() == &package => {
@@ -955,3 +972,7 @@ mod tests {
         assert_eq!(fs::read(&quarantined[0]).unwrap(), ghost_bytes);
     }
 }
+
+#[cfg(test)]
+#[path = "migration/provenance_tests.rs"]
+mod provenance_tests;

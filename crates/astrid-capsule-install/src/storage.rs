@@ -158,44 +158,18 @@ pub fn read_verified_durable_package_for_owner(
     let Some(snapshot) = registry.get_snapshot(owner, id)? else {
         return Ok(None);
     };
-    let package = snapshot.package();
-    let verification = artifact::verify_archive_bytes(&package.archive)
-        .with_context(|| format!("verify durable capsule archive {id}"))?;
-    let inventory = read_archive_files(&package.archive)?;
-    let ArchiveInventory { files, directories } = inventory;
-    let manifest_bytes = files
-        .get("Capsule.toml")
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("durable capsule {id} is missing Capsule.toml"))?;
-    let manifest_text = String::from_utf8(manifest_bytes.clone())
-        .with_context(|| format!("durable capsule {id} manifest is not UTF-8"))?;
-    let manifest: CapsuleManifest = toml::from_str(&manifest_text)
-        .with_context(|| format!("decode durable capsule {id} manifest"))?;
-    let metadata: CapsuleMeta = serde_json::from_slice(&package.metadata)
-        .with_context(|| format!("decode durable capsule {id} metadata"))?;
-    let authority: InstalledAuthority = serde_json::from_slice(&package.authority)
-        .with_context(|| format!("decode durable capsule {id} authority"))?;
-    let metadata_bytes = package.metadata.clone();
-    verify_package_identity(
-        id,
-        &manifest,
-        &metadata,
-        &authority,
-        &manifest_bytes,
-        &verification,
-        &files,
-    )?;
-    verify_wit_files(id, &metadata, &files)?;
+    let contents = verify_package_contents(id, snapshot.package())?;
+    let metadata_bytes = snapshot.package().metadata.clone();
     Ok(Some(VerifiedDurableCapsulePackage {
         id: id.to_owned(),
         snapshot,
-        manifest,
-        manifest_bytes,
-        archive_files: files,
-        archive_directories: directories,
-        metadata,
+        manifest: contents.manifest,
+        manifest_bytes: contents.manifest_bytes,
+        archive_files: contents.files,
+        archive_directories: contents.directories,
+        metadata: contents.metadata,
         metadata_bytes,
-        authority,
+        authority: contents.authority,
     }))
 }
 
@@ -455,6 +429,7 @@ pub fn publish_directory_package(
         expected_generation,
     );
     let package = CapsulePackage::new(archive, metadata, authority);
+    verify_package_contents(&id, &package)?;
     let materialization = tempfile::Builder::new()
         .prefix(".capsule-materialization-")
         .tempdir_in(
@@ -515,6 +490,7 @@ pub fn publish_package_with_expected_generation(
         registry.get_snapshot(&owner, id)?.as_ref(),
         expected_generation,
     );
+    verify_package_contents(id, package)?;
     registry.install(&owner, id, package, expected)?;
     read_verified_durable_package(store, uid, id)?
         .ok_or_else(|| anyhow::anyhow!("durable capsule {id} disappeared after publish"))?;
@@ -631,6 +607,8 @@ fn reject_symlink_ancestors(root: &Path, path: &Path) -> anyhow::Result<()> {
 }
 
 mod expectation;
+mod verification;
+use verification::verify_package_contents;
 mod leftover;
 mod migration;
 
