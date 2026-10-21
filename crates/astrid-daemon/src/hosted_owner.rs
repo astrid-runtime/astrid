@@ -1,13 +1,15 @@
 //! Explicit native administration and direct socket responder composition.
 
 use anyhow::{Context, Result};
+#[cfg(unix)]
 use astrid_core::{
     PrincipalId,
-    dirs::AstridHome,
-    identity::hosted_owner::HostedOwnerConfiguration,
     kernel_api::hosted_owner::{HostedOwnerRequest, HostedOwnerResponse},
 };
-use std::{io::Read, sync::Arc};
+use astrid_core::{dirs::AstridHome, identity::hosted_owner::HostedOwnerConfiguration};
+use std::io::Read;
+#[cfg(unix)]
+use std::sync::Arc;
 
 /// Offline ownership administration never shares the ordinary daemon boot path.
 #[derive(clap::Args)]
@@ -39,8 +41,10 @@ pub(super) async fn configure(home: &AstridHome, target_default: bool) -> Result
     Ok(())
 }
 
+#[cfg(unix)]
 pub(super) struct NativeOwnerResponder(pub(super) Arc<astrid_kernel::Kernel>);
 
+#[cfg(unix)]
 #[async_trait::async_trait]
 impl astrid_uplink::native::hosted_owner::HostedOwnerResponder for NativeOwnerResponder {
     async fn respond(
