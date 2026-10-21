@@ -17,28 +17,19 @@ run_cli_semantic_smoke() {
   run_cli agent enable e2e-cli-lifecycle
   run_cli agent show e2e-cli-lifecycle --format json > "$ARTIFACTS/cli-agent-lifecycle-enabled.json"
   json_assert_cli_agent_enabled "$ARTIFACTS/cli-agent-lifecycle-enabled.json" e2e-cli-lifecycle true
-  assert_cli_exit_contains "cli-agent-lifecycle-delete-denied" 1 \
-    "ownership mutation requires an enrolled authority" \
-    agent delete e2e-cli-lifecycle -y
-  run_cli agent show e2e-cli-lifecycle --format json \
-    > "$ARTIFACTS/cli-agent-lifecycle-after-denied-delete.json"
-  json_assert_cli_agent_show \
-    "$ARTIFACTS/cli-agent-lifecycle-after-denied-delete.json" \
-    e2e-cli-lifecycle agent
-  json_assert_cli_agent_enabled \
-    "$ARTIFACTS/cli-agent-lifecycle-after-denied-delete.json" \
-    e2e-cli-lifecycle true
-  # Capability and a registered CLI key do not establish first ownership.
-  # The authorized named-claim path is covered by signed-enrollment handler
-  # tests; a fresh OS runtime must leave this already-admitted target intact.
-  assert_cli_exit_contains "cli-agent-claim-unenrolled-denied" 1 \
-    "principal creation requires a current user delegation" \
-    agent claim e2e-cli-lifecycle
-  run_cli agent show e2e-cli-lifecycle --format json \
-    > "$ARTIFACTS/cli-agent-lifecycle-after-denied-claim.json"
-  json_assert_cli_agent_show \
-    "$ARTIFACTS/cli-agent-lifecycle-after-denied-claim.json" \
-    e2e-cli-lifecycle agent
+  run_cli agent delete e2e-cli-lifecycle -y
+  if run_cli agent show e2e-cli-lifecycle --format json > "$ARTIFACTS/cli-agent-lifecycle-deleted.json"; then
+    fail "deleted agent e2e-cli-lifecycle remained visible"
+  fi
+  run_cli agent create e2e-cli-claim-owned -y
+  run_cli agent claim e2e-cli-claim-owned
+  run_cli agent list --mine --format json > "$ARTIFACTS/cli-agent-claim-mine.json"
+  json_assert_cli_agent_owned "$ARTIFACTS/cli-agent-claim-mine.json" e2e-cli-claim-owned
+  assert_principal_cli_failure "$user_principal" "cli-agent-claim-user-denied" agent claim e2e-cli-claim-owned
+  if run_cli agent claim e2e-cli-claim-missing; then
+    fail "claim of missing principal e2e-cli-claim-missing succeeded"
+  fi
+  run_cli agent delete e2e-cli-claim-owned -y
   run_cli caps grant "$ops_principal" caps:token:mint
   run_cli caps grant "$ops_principal" caps:token:list
   run_cli caps grant "$ops_principal" caps:token:revoke
@@ -459,6 +450,7 @@ run_standalone_admin_smoke() {
     cd "$standalone_workspace"
     export ASTRID_HOME="$standalone_home" HOME="$standalone_poison"
     "$CORE_DIR/target/debug/astrid" start
+    assert_unenrolled_hosted_owner_ci "$ARTIFACTS/unenrolled-owner" "$CORE_DIR/target/debug/astrid"
     "$CORE_DIR/target/debug/astrid" status > "$ARTIFACTS/standalone-status-first.txt"
     grep -q '0 loaded' "$ARTIFACTS/standalone-status-first.txt"
     "$CORE_DIR/target/debug/astrid" stop

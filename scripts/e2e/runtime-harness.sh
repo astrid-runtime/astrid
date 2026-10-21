@@ -78,6 +78,7 @@ run_forced_failure_staging_regression() {
 . "$SCRIPT_DIR/runtime-storage-asserts.sh"
 . "$SCRIPT_DIR/runtime-gateway-smoke.sh"
 . "$SCRIPT_DIR/runtime-cli-smoke.sh"
+. "$SCRIPT_DIR/hosted-owner-ci.sh"
 . "$SCRIPT_DIR/runtime-multi-home-smoke.sh"
 . "$SCRIPT_DIR/runtime-llm-smoke.sh"
 . "$SCRIPT_DIR/runtime-adversarial-smoke.sh"
@@ -352,6 +353,7 @@ main() {
   note "admitting primary Astrid home through the public lifecycle"
   "$CORE_DIR/target/debug/astrid" start
   "$CORE_DIR/target/debug/astrid" stop
+  configure_hosted_owner_ci "$ARTIFACTS/hosted-owner" run_cli
   mkdir -p "$ARTIFACTS"
 
   run_standalone_admin_smoke
@@ -374,6 +376,7 @@ main() {
   curl --connect-timeout 2 --max-time 5 -fsS "$fake_base_url/v1/models" >/dev/null
   note "writing gateway and local-egress config"
   run_cli start
+  provision_hosted_owner_ci "$ARTIFACTS/hosted-owner" run_cli
 
   note "building runtime-signed .capsule artifact for lifecycle coverage"
   local capsule_dist="$ARTIFACTS/capsule-dist"

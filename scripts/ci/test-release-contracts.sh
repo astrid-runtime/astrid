@@ -27,3 +27,4 @@ python3 scripts/test_fskit_app_handoff.py
 python3 scripts/test_macos_profiles.py
 python3 scripts/test_runtime_crash_capture.py
 python3 scripts/test_runtime_shutdown_diagnostics.py
+python3 scripts/test_hosted_owner_ci.py

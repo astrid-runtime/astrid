@@ -76,6 +76,7 @@ readonly FIXTURE_SOURCE_REL="crates/astrid-storage/fixtures/v0.10.4-macos-aarch6
 
 REPOSITORY_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly REPOSITORY_ROOT
+. "$REPOSITORY_ROOT/scripts/e2e/hosted-owner-ci.sh"
 readonly CURRENT_BIN_DIR="${ASTRID_CURRENT_BIN_DIR:-${REPOSITORY_ROOT}/target/debug}"
 readonly CAPSULE_SOURCE="${REPOSITORY_ROOT}/e2e/fixtures/astrid-capsule-adversarial"
 CAPSULE_RUSTUP_HOME=""
@@ -451,6 +452,15 @@ fi
 run_current agent list --format json >"${TEST_ROOT}/agents-after-upgrade.json"
 grep -Fq 'default' "${TEST_ROOT}/agents-after-upgrade.json" \
   || fail "the released default principal is not visible after upgrade"
+# Explicit CI deployment authority is installed only after the real migration.
+# A populated ownership graph must refuse; never replace or erase it to enroll.
+run_current_bounded 20s stop
+configure_hosted_owner_ci "$TEST_ROOT/hosted-owner" run_current
+if ! run_current_bounded 90s start; then
+  dump_daemon_logs
+  fail "current daemon could not restart for explicit owner enrollment"
+fi
+provision_hosted_owner_ci "$TEST_ROOT/hosted-owner" run_current
 run_current agent create upgrade-restart-probe --yes
 run_current agent create upgrade-second-alias --yes
 run_current_bounded 20s stop

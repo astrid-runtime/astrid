@@ -1,0 +1,11 @@
+{
+  "purpose": "Public disposable CI fixture only; never configure these keys on a user installation",
+  "owner": {
+    "seed_hex": "5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b",
+    "public_key_hex": "6b734a8eff246fe734b38d4046c148eee5f04fe87b3a0a423955a77956de066b"
+  },
+  "deployment": {
+    "seed_hex": "5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+    "public_key_hex": "ed6a47a39da869b5446155e40b2d93f1e3f0167be26732bae7a3ef9d8e3a3fd3"
+  }
+}

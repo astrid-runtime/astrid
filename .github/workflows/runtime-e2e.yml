@@ -22,6 +22,7 @@ on:
       - 'crates/astrid-uplink/**'
       - 'e2e/**'
       - 'scripts/e2e/**'
+      - 'scripts/test_hosted_owner_ci.py'
   pull_request:
     branches: [main, os/universal]
     paths:
@@ -43,6 +44,7 @@ on:
       - 'crates/astrid-uplink/**'
       - 'e2e/**'
       - 'scripts/e2e/**'
+      - 'scripts/test_hosted_owner_ci.py'
 
 permissions:
   contents: read
