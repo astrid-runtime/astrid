@@ -30,6 +30,10 @@ on:
       - 'scripts/check_glibc.py'
       - 'scripts/test_check_glibc.py'
       - 'scripts/test_gnu_build_packages.py'
+      - 'scripts/test_runtime_cli_capture.py'
+      - 'scripts/test_windows_cargo_diagnostics.py'
+      - '.github/workflows/windows-filesystem-native.yml'
+      - 'scripts/e2e/runtime-crash-smoke.sh'
       - 'scripts/check_dco.py'
       - 'scripts/test_check_dco.py'
       - 'scripts/changelog.py'
@@ -88,6 +92,10 @@ on:
       - 'scripts/check_glibc.py'
       - 'scripts/test_check_glibc.py'
       - 'scripts/test_gnu_build_packages.py'
+      - 'scripts/test_runtime_cli_capture.py'
+      - 'scripts/test_windows_cargo_diagnostics.py'
+      - '.github/workflows/windows-filesystem-native.yml'
+      - 'scripts/e2e/runtime-crash-smoke.sh'
       - 'scripts/check_dco.py'
       - 'scripts/test_check_dco.py'
       - 'scripts/changelog.py'
@@ -375,6 +383,12 @@ jobs:
 
       - name: Test release manifest contract
         run: scripts/ci/test-release-contracts.sh
+
+      - name: Test CI capture contracts
+        run: |
+          command -v pwsh
+          python3 scripts/test_runtime_cli_capture.py
+          python3 scripts/test_windows_cargo_diagnostics.py
 
   wasm-portability:
     name: Wasm portability

@@ -298,8 +298,21 @@ jobs:
         shell: pwsh
         run: |
           cargo build --locked --target ${{ matrix.target }} -p astrid-storage-provider-winfsp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $provider = "target/${{ matrix.target }}/debug/astrid-storage-provider-winfsp.exe"
           $messages = cargo test --locked --message-format=json --target ${{ matrix.target }} -p astrid-kernel --lib storage_mount --no-run
+          $compileExit = $LASTEXITCODE
+          foreach ($message in $messages) {
+            try {
+              $diagnostic = $message | ConvertFrom-Json -ErrorAction Stop
+            } catch {
+              continue
+            }
+            if ($diagnostic.reason -eq "compiler-message" -and $diagnostic.message.rendered) {
+              Write-Host $diagnostic.message.rendered
+            }
+          }
+          if ($compileExit -ne 0) { exit $compileExit }
           $artifacts = foreach ($message in $messages) {
             $artifact = $null
             try {
