@@ -1142,7 +1142,7 @@ impl Kernel {
         .await
     }
 
-    #[cfg(unix)]
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     fn storage_quota_resolver(
         profile_cache: Arc<PrincipalProfileCache>,
         principals: astrid_storage::PrincipalDirectory,

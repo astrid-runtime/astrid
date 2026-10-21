@@ -723,3 +723,51 @@ status = "waived"
 mode = "network"
 principal = "local_cli"
 reason = "Install path mutates the runner and depends on GitHub release state; CI covers check/dry-run shape only."
+
+[commands."owner inspect"]
+scenario = "hosted_owner_provisioning"
+status = "covered"
+mode = "read"
+principal = "local_cli"
+
+[commands."owner configure"]
+scenario = "hosted_owner_provisioning"
+status = "covered"
+mode = "host_mutating"
+principal = "local_cli"
+
+[commands."owner prepare"]
+scenario = "hosted_owner_provisioning"
+status = "covered"
+mode = "filesystem"
+principal = "local_cli"
+
+[commands."owner challenge"]
+scenario = "hosted_owner_provisioning"
+status = "covered"
+mode = "mutating"
+principal = "local_cli"
+
+[commands."owner sign-owner"]
+scenario = "hosted_owner_provisioning"
+status = "covered"
+mode = "filesystem"
+principal = "local_cli"
+
+[commands."owner authorize"]
+scenario = "hosted_owner_provisioning"
+status = "covered"
+mode = "filesystem"
+principal = "local_cli"
+
+[commands."owner provision"]
+scenario = "hosted_owner_provisioning"
+status = "covered"
+mode = "mutating"
+principal = "local_cli"
+
+[commands."owner cancel"]
+scenario = "hosted_owner_provisioning"
+status = "covered"
+mode = "mutating"
+principal = "local_cli"

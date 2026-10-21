@@ -593,3 +593,12 @@ success = ["voucher command parses and reports bounded unsupported/runtime behav
 denial = ["invalid voucher id or missing authority is rejected"]
 state = ["no voucher state mutates unless feature is live"]
 evidence = ["CLI transcript and explicit TODO/waiver if still unsupported"]
+
+[scenarios.hosted_owner_provisioning]
+status = "covered"
+surfaces = ["cli"]
+auth = ["explicit offline controlling-account configuration and independently authenticated native device", "independent external owner and deployment signatures"]
+success = ["the eight owner commands configure and complete fresh enrollment, enabling native principal lifecycle"]
+denial = ["one signature cannot enroll", "cancelled signed evidence cannot enroll after restart", "invalid offline policy creates no execution identity"]
+state = ["Pending and enrolled state survive restart", "cancellation leaves no ownership grant", "offline inspection does not create a home"]
+evidence = ["crates/astrid-cli/tests/hosted_owner.rs and hosted_owner/cancel.rs execute actual CLI and daemon binaries in disposable homes"]

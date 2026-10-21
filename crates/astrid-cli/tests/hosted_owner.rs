@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[path = "hosted_owner/cancel.rs"]
+mod cancel;
 #[path = "hosted_owner/pending.rs"]
 mod pending;
 

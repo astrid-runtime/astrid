@@ -143,6 +143,7 @@ mod tests {
         "chat",
         "run",
         "agent",
+        "owner",
         "group",
         "caps",
         "quota",
