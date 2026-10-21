@@ -62,8 +62,15 @@ impl Capsule for ReadyCapsule {
 }
 
 async fn fixture() -> (tempfile::TempDir, Arc<Kernel>) {
+    fixture_with_user_budget(None).await
+}
+
+async fn fixture_with_user_budget(
+    limit: Option<std::num::NonZeroU64>,
+) -> (tempfile::TempDir, Arc<Kernel>) {
     let dir = tempfile::tempdir().unwrap();
-    let kernel = crate::test_kernel_with_home(AstridHome::from_path(dir.path())).await;
+    let kernel =
+        crate::test_kernel_with_user_cpu_budget(AstridHome::from_path(dir.path()), limit).await;
     let admin = PrincipalProfile {
         groups: vec![BUILTIN_ADMIN.to_string()],
         ..Default::default()
@@ -463,7 +470,9 @@ async fn derive_rejects_unowned_caller_before_provisioning() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn derive_rolls_back_when_required_capsule_cannot_load() {
-    let (_dir, kernel) = fixture().await;
+    let (_dir, kernel) = fixture_with_user_budget(std::num::NonZeroU64::new(1_000_000_000)).await;
+    let mut users_before = kernel.identity_store.list_users().await.unwrap();
+    users_before.sort_by_key(|user| user.id);
     let ownership_before = kernel.ownership_store.load().await.unwrap();
     let source = PrincipalId::default();
     let install = kernel
@@ -526,6 +535,17 @@ file = "missing.wasm"
             .root()
             .exists()
     );
+    assert!(kernel.principal_directory.uid_for(&principal).is_err());
+    assert!(
+        !kernel
+            .astrid_home
+            .keys_dir()
+            .join("broken-worker.key")
+            .exists()
+    );
+    let mut users_after = kernel.identity_store.list_users().await.unwrap();
+    users_after.sort_by_key(|user| user.id);
+    assert_eq!(users_before, users_after);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -583,4 +603,55 @@ type = "string"
         .to_string();
     assert!(error.contains("failed to load:"), "got: {error}");
     assert!(error.contains("not configured"), "got: {error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn derive_loads_real_wasm_with_configured_user_cpu_accountability() {
+    let (_dir, kernel) = fixture_with_user_budget(std::num::NonZeroU64::new(1_000_000_000)).await;
+    let source = PrincipalId::default();
+    let caller = separate_fleet_caller(&kernel).await;
+    seed_capsule(&kernel, &source, "budgeted-harness");
+    let wasm = wat::parse_str("(component)").unwrap();
+    kernel
+        .principal_store
+        .as_ref()
+        .unwrap()
+        .content()
+        .put(
+            &StateOwner::System,
+            &ContentName::new(format!("bin/{}.wasm", blake3::hash(&wasm).to_hex())).unwrap(),
+            &wasm,
+        )
+        .unwrap();
+    let response = super::agent_derive::agent_derive_from_req(
+        &kernel,
+        &caller,
+        AgentDeriveRequest {
+            name: "budgeted-worker".into(),
+            source: source.clone(),
+            load_capsules: vec!["budgeted-harness".into()],
+            allow_capsules: Vec::new(),
+            inherit_capsule_state: Vec::new(),
+            network_egress: Vec::new(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(response, AdminResponseBody::Success(_)),
+        "real WASM derive failed: {response:?}"
+    );
+    let derived = PrincipalId::new("budgeted-worker").unwrap();
+    let uid = kernel.principal_directory.uid_for(&derived).unwrap();
+    assert_spawn_ownership(&kernel, &caller, uid).await;
+    assert!(kernel.user_cpu.resolve(&derived).await.unwrap().is_some());
+    assert_eq!(
+        kernel
+            .capsules
+            .read()
+            .await
+            .get_for(&derived, &CapsuleId::new("budgeted-harness").unwrap())
+            .map(|capsule| capsule.state()),
+        Some(CapsuleState::Ready)
+    );
+    kernel.unload_principal_capsules(&derived).await.unwrap();
 }

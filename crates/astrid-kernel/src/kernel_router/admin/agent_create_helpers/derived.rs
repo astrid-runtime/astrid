@@ -139,17 +139,6 @@ async fn finish_derived_principal(
     profile: PrincipalProfile,
     ownership: &astrid_storage::ownership::DerivedPrincipalOwnership,
 ) -> AdminResponseBody {
-    if let Err(error) = kernel
-        .ensure_principal_capsules_ready(&principal, &load_capsules)
-        .await
-    {
-        return rollback_after_failure(
-            kernel,
-            &principal,
-            err_internal(format!("derived capsule readiness failed: {error}")),
-        )
-        .await;
-    }
     let uid = match kernel.principal_directory.uid_for(&principal) {
         Ok(uid) => uid,
         Err(error) => {
@@ -157,18 +146,38 @@ async fn finish_derived_principal(
                 .await;
         },
     };
-    if let Err(error) = kernel
+    // WASM lifecycle CPU admission resolves the child's accountable user.
+    // Publish the captured assignment first; keep its exact rollback receipt
+    // private until readiness succeeds. Cancellation preserves an owned child
+    // for diagnosis rather than silently deleting or reassigning authority.
+    let provision = match kernel
         .ownership_store
-        .assign_derived_principal(uid, ownership)
+        .assign_derived_principal_for_provisioning(uid, ownership)
         .await
     {
-        return rollback_after_failure(
+        Ok(provision) => provision,
+        Err(error) => {
+            return rollback_after_failure(
+                kernel,
+                &principal,
+                err_internal(format!("spawn ownership assignment failed: {error}")),
+            )
+            .await;
+        },
+    };
+    if let Err(error) = kernel
+        .ensure_principal_capsules_ready(&principal, &load_capsules)
+        .await
+    {
+        return super::rollback::rollback_assigned_derivation(
             kernel,
             &principal,
-            err_internal(format!("spawn ownership assignment failed: {error}")),
+            err_internal(format!("derived capsule readiness failed: {error}")),
+            provision,
         )
         .await;
     }
+    drop(provision);
     kernel.publish_capsules_loaded_for(&principal).await;
     info!(%principal, %source, ?load_capsules, "Layer 6 agent.derive");
     success_json(serde_json::json!({

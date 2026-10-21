@@ -11,7 +11,25 @@ pub(super) async fn rollback_after_failure(
     principal: &PrincipalId,
     original: AdminResponseBody,
 ) -> AdminResponseBody {
-    match rollback_derived_principal(kernel, principal).await {
+    rollback_with_provision(kernel, principal, original, None).await
+}
+
+pub(super) async fn rollback_assigned_derivation(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    original: AdminResponseBody,
+    provision: astrid_storage::ownership::DerivedPrincipalProvision,
+) -> AdminResponseBody {
+    rollback_with_provision(kernel, principal, original, Some(provision)).await
+}
+
+async fn rollback_with_provision(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    original: AdminResponseBody,
+    provision: Option<astrid_storage::ownership::DerivedPrincipalProvision>,
+) -> AdminResponseBody {
+    match rollback_derived_principal(kernel, principal, provision).await {
         Ok(()) => original,
         Err(error) => err_internal(format!(
             "derived principal provisioning failed and rollback could not complete: {error}"
@@ -22,6 +40,7 @@ pub(super) async fn rollback_after_failure(
 async fn rollback_derived_principal(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
+    provision: Option<astrid_storage::ownership::DerivedPrincipalProvision>,
 ) -> Result<(), String> {
     crate::legacy_migration_barrier::ensure_principal_delete_allowed(
         &kernel.astrid_home,
@@ -29,9 +48,7 @@ async fn rollback_derived_principal(
     )
     .map_err(|error| format!("legacy migration barrier blocked rollback: {error}"))?;
     ensure_legacy_secret_rollback_allowed(kernel, principal)?;
-    let pending = super::super::agent_delete::prepare_identity_removal(kernel, principal)
-        .await
-        .map_err(|response| format!("identity removal preparation returned {response:?}"))?;
+    let pending = prepare_rollback_identity_removal(kernel, principal, provision).await?;
     kernel
         .capabilities
         .begin_principal_retirement(principal.clone())
@@ -122,6 +139,23 @@ async fn rollback_derived_principal(
     super::super::agent_delete::finish_identity_removal(kernel, principal, pending)
         .await
         .map_err(|response| format!("identity removal completion returned {response:?}"))
+}
+
+async fn prepare_rollback_identity_removal(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    provision: Option<astrid_storage::ownership::DerivedPrincipalProvision>,
+) -> Result<super::super::agent_delete::PendingIdentityRemoval, String> {
+    match provision {
+        Some(provision) => {
+            super::super::agent_delete::prepare_derived_identity_removal(
+                kernel, principal, provision,
+            )
+            .await
+        },
+        None => super::super::agent_delete::prepare_identity_removal(kernel, principal).await,
+    }
+    .map_err(|response| format!("identity removal preparation returned {response:?}"))
 }
 
 fn ensure_legacy_secret_rollback_allowed(

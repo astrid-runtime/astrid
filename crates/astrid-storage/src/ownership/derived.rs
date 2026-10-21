@@ -4,8 +4,10 @@ use astrid_core::{PrincipalOwnership, PrincipalUid, UserUid};
 
 use super::{EnrolledAuthority, OwnershipError, OwnershipStore};
 
+mod provisioning;
 #[cfg(test)]
 mod tests;
+pub use provisioning::DerivedPrincipalProvision;
 
 /// Pinned ownership of an authenticated spawning principal, not a human login.
 /// Capturing this does not authorize spawning; the kernel must separately
@@ -62,7 +64,37 @@ impl OwnershipStore {
         child: PrincipalUid,
         ownership: &DerivedPrincipalOwnership,
     ) -> Result<(), OwnershipError> {
+        self.assign_derived_principal_for_provisioning(child, ownership)
+            .await
+            .map(|_| ())
+    }
+
+    /// Assign a child and retain an opaque, single-use provisional rollback proof.
+    /// The caller must discard this proof after successful provisioning.
+    ///
+    /// # Errors
+    /// Refuses stale captured ownership or a child without an exact live alias.
+    pub async fn assign_derived_principal_for_provisioning(
+        &self,
+        child: PrincipalUid,
+        ownership: &DerivedPrincipalOwnership,
+    ) -> Result<DerivedPrincipalProvision, OwnershipError> {
+        let alias = self
+            .principals
+            .alias_for(child)
+            .map_err(|_| OwnershipError::PrincipalNotFound(child))?;
         self.mutate_with_authority(&ownership.authority, |graph| {
+            if self
+                .principals
+                .uid_for(&alias)
+                .map_err(|_| OwnershipError::PrincipalNotFound(child))?
+                != child
+            {
+                return Err(OwnershipError::IdentityConflict(
+                    "derived alias",
+                    alias.to_string(),
+                ));
+            }
             let creator = ownership.creator.principal_uid;
             for uid in [creator, child] {
                 if graph.principal_deletions.contains_key(&uid) {
@@ -99,6 +131,7 @@ impl OwnershipStore {
             );
             Ok(())
         })
-        .await
+        .await?;
+        Ok(DerivedPrincipalProvision::new(child, alias, ownership))
     }
 }

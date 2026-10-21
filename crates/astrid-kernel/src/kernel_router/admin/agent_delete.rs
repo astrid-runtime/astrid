@@ -160,6 +160,40 @@ pub(super) async fn prepare_identity_removal(
     prepare_identity_removal_with_authority(kernel, principal, None).await
 }
 
+pub(super) async fn prepare_derived_identity_removal(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    provision: astrid_storage::ownership::DerivedPrincipalProvision,
+) -> Result<PendingIdentityRemoval, AdminResponseBody> {
+    let guard = kernel
+        .ownership_store
+        .guard_derived_principal_rollback(provision)
+        .await
+        .map_err(|error| err_internal(format!("derived rollback reservation failed: {error}")))?;
+    let user = kernel
+        .identity_store
+        .resolve(AGENT_IDENTITY_PLATFORM, principal.as_str())
+        .await
+        .map_err(|error| err_internal(error.to_string()))?
+        .ok_or_else(|| err_internal("derived rollback identity link is missing".to_owned()))?;
+    let identity = kernel
+        .identity_store
+        .get_principal_identity(user.id)
+        .await
+        .map_err(|error| err_internal(error.to_string()))?
+        .ok_or_else(|| err_internal("derived rollback identity is missing".to_owned()))?;
+    if identity.uid != guard.principal_uid() {
+        return Err(err_internal(
+            "derived rollback identity generation changed".to_owned(),
+        ));
+    }
+    Ok(PendingIdentityRemoval {
+        user: Some(user),
+        principal_uid: Some(identity.uid),
+        ownership_guard: Some(guard),
+    })
+}
+
 async fn prepare_identity_removal_with_authority(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,

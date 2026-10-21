@@ -32,8 +32,8 @@ python3 "$script_root/crate_publication.py" \
   --metadata "$work_root/cargo-metadata.json" \
   --version "$version" > "$work_root/crates.txt"
 crate_count=$(wc -l < "$work_root/crates.txt")
-if [[ "$crate_count" != 29 ]]; then
-  echo "expected 29 publishable workspace crates, found $crate_count" >&2
+if [[ "$crate_count" != 33 ]]; then
+  echo "expected 33 publishable workspace crates, found $crate_count" >&2
   exit 1
 fi
 

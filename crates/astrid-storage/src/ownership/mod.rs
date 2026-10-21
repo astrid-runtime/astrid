@@ -32,7 +32,7 @@ mod derived;
 mod hosted;
 mod provision;
 mod resources;
-pub use derived::DerivedPrincipalOwnership;
+pub use derived::{DerivedPrincipalOwnership, DerivedPrincipalProvision};
 pub use hosted::{HostedOwnerCompletion, HostedOwnerRecord};
 mod upgrade;
 pub use upgrade::{UnownedPrincipalDeferral, UnownedPrincipalReconciliation};

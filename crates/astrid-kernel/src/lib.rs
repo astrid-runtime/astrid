@@ -3905,11 +3905,19 @@ fn test_workspace_selection(home: &astrid_core::dirs::AstridHome) -> WorkspaceSe
 }
 
 #[cfg(test)]
+pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -> Arc<Kernel> {
+    test_kernel_with_user_cpu_budget(home, None).await
+}
+
+#[cfg(test)]
 #[expect(
     clippy::too_many_lines,
     reason = "the complete kernel test fixture keeps every security-relevant dependency explicit"
 )]
-pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -> Arc<Kernel> {
+pub(crate) async fn test_kernel_with_user_cpu_budget(
+    home: astrid_core::dirs::AstridHome,
+    user_budget: Option<std::num::NonZeroU64>,
+) -> Arc<Kernel> {
     use astrid_capsule::profile_cache::PrincipalProfileCache;
 
     home.ensure()
@@ -4070,7 +4078,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         user_cpu: Arc::new(astrid_capsule::user_cpu::UserCpuAccounting::new(
             Arc::clone(&ownership_store),
             principal_directory.clone(),
-            None,
+            user_budget,
             std::collections::BTreeMap::default(),
         )),
         ownership_store,
