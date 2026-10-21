@@ -141,5 +141,82 @@ class EnrollmentShellTests(unittest.TestCase):
             self.assertIn('stop', script[max(0, configure - 100):configure])
 
 
+class LegacyArchiveStagingTests(unittest.TestCase):
+    def run_stage(self, platform, failure=''):
+        script = (ROOT / f'scripts/test_v0104_{platform}_upgrade.sh').read_text()
+        name = 'prepare_legacy_capsule_fixture'
+        start = script.index(name + '() {')
+        function = script[start:script.index('\n}\n', start) + 3]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            body = r'''set -euo pipefail
+TEST_ROOT=$1
+CAPSULE_SOURCE="$TEST_ROOT/source"
+ensure_capsule_build_target() { printf 'toolchain\n' >> "$TEST_ROOT/calls"; }
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+run_current_capsule_build_bounded() {
+  printf 'build:%s\n' "$*" >> "$TEST_ROOT/calls"
+  [[ "$FAILURE" != build ]] || return 23
+  [[ "$FAILURE" == missing ]] || printf 'real-archive-placeholder' > "$4/astrid-capsule-adversarial.capsule"
+}
+run_old_bounded() {
+  printf 'install:%s\n' "$*" >> "$TEST_ROOT/calls"
+  [[ "$FAILURE" != install ]] || return 24
+  [[ "$7" == "$TEST_ROOT/capsule-dist/astrid-capsule-adversarial.capsule" ]]
+  [[ -f "$7" ]]
+}
+'''
+            result = subprocess.run(['bash', '-c', body + function + '\nprepare_legacy_capsule_fixture',
+                                     'test', str(root)], env=dict(os.environ, FAILURE=failure),
+                                    capture_output=True, text=True, timeout=10)
+            calls = (root / 'calls').read_text().splitlines()
+            return result, calls
+
+    def test_current_archive_then_real_old_install_command(self):
+        for platform in ['linux', 'macos']:
+            with self.subTest(platform=platform):
+                result, calls = self.run_stage(platform)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(calls), 3)
+                self.assertTrue(calls[1].startswith('build:180s '))
+                self.assertIn('--output ', calls[1])
+                self.assertIn('install:180s capsule install --yes --var adversarial_lifecycle_probe=runtime-lifecycle-ok ', calls[2])
+
+    def test_build_or_missing_archive_failure_never_installs(self):
+        for platform in ['linux', 'macos']:
+            for failure in ['build', 'missing']:
+                with self.subTest(platform=platform, failure=failure):
+                    result, calls = self.run_stage(platform, failure)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(any(call.startswith('install:') for call in calls))
+
+    def test_old_install_failure_still_fails_the_journey(self):
+        for platform in ['linux', 'macos']:
+            result, calls = self.run_stage(platform, 'install')
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(len(calls), 3)
+
+    def test_builder_wrapper_uses_current_companion_and_inherited_home(self):
+        for platform in ['linux', 'macos']:
+            script = (ROOT / f'scripts/test_v0104_{platform}_upgrade.sh').read_text()
+            start = script.index('run_current_capsule_build_bounded() {')
+            function = script[start:script.index('\n}\n', start) + 3]
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                binary = root / 'astrid-build'
+                binary.write_text('#!/usr/bin/env python3\nimport json,os,sys\nprint(json.dumps({"home":os.environ["HOME"],"target":os.environ.get("CARGO_TARGET_DIR"),"args":sys.argv[1:]}))\n')
+                binary.chmod(0o700)
+                body = 'set -euo pipefail; CURRENT_BIN_DIR=$1; WORKSPACE=$1; ASTRID_HOME=$1/app; CAPSULE_RUSTUP_HOME=$2; fail(){ exit 1; }; run_with_timeout(){ shift; "$@"; }; timeout(){ shift; "$@"; }; '
+                result = subprocess.run(['bash', '-c', body + function + '\nrun_current_capsule_build_bounded 180s source --output archive-output',
+                                         'test', str(root), os.environ.get('RUSTUP_HOME', str(Path.home() / '.rustup'))],
+                                        env=dict(os.environ, HOME=str(Path.home()), CARGO_TARGET_DIR='inherited-target-marker'),
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                actual = json.loads(result.stdout)
+                self.assertEqual(actual['home'], str(Path.home()))
+                self.assertEqual(actual['target'], 'inherited-target-marker')
+                self.assertEqual(actual['args'], ['source', '--output', 'archive-output'])
+
+
 if __name__ == '__main__':
     unittest.main()

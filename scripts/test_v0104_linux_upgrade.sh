@@ -71,7 +71,7 @@ ensure_capsule_build_target() {
   [[ -d "${CAPSULE_RUSTUP_HOME}" ]] \
     || fail "Rustup home is not a directory: ${CAPSULE_RUSTUP_HOME}"
 
-  # The published astrid-build runs Cargo with the capsule source as its
+  # The current canonical builder runs Cargo with the capsule source as its
   # current directory. Resolve the toolchain from that exact directory rather
   # than mutating rustup's default toolchain, which can be different in CI.
   active_toolchain="$(cd -- "${CAPSULE_SOURCE}" && rustup show active-toolchain)" \
@@ -95,7 +95,7 @@ ensure_capsule_build_target() {
     || fail "Rust core library for ${CAPSULE_BUILD_TARGET} is missing from ${toolchain}"
 }
 
-run_old_capsule_build_bounded() {
+run_current_capsule_build_bounded() {
   local limit="$1"
   shift
   [[ -n "${CAPSULE_RUSTUP_HOME}" ]] \
@@ -105,8 +105,27 @@ run_old_capsule_build_bounded() {
     # Isolate runtime state, not Cargo's shared host cache and configuration.
     # Runtime-only calls below still use POISON_HOME to test home resolution.
     timeout "${limit}" env ASTRID_HOME="${ASTRID_HOME}" \
-      RUSTUP_HOME="${CAPSULE_RUSTUP_HOME}" "${OLD_BIN_DIR}/astrid" "$@"
+      RUSTUP_HOME="${CAPSULE_RUSTUP_HOME}" "${CURRENT_BIN_DIR}/astrid-build" "$@"
   )
+}
+
+prepare_legacy_capsule_fixture() {
+  ensure_capsule_build_target
+  local dist="${TEST_ROOT}/capsule-dist"
+  local archive="${dist}/astrid-capsule-adversarial.capsule"
+  mkdir -- "${dist}" || fail "capsule archive output already exists"
+  if ! run_current_capsule_build_bounded 180s "${CAPSULE_SOURCE}" --output "${dist}" \
+    >"${TEST_ROOT}/current-capsule-build.log" 2>&1; then
+    cat "${TEST_ROOT}/current-capsule-build.log" >&2
+    fail "current canonical builder could not package the migration fixture"
+  fi
+  [[ -f "${archive}" ]] || fail "current builder did not produce the expected capsule archive"
+  if ! run_old_bounded 180s capsule install --yes \
+    --var adversarial_lifecycle_probe=runtime-lifecycle-ok "${archive}" \
+    >"${TEST_ROOT}/v0104-capsule-install.log" 2>&1; then
+    cat "${TEST_ROOT}/v0104-capsule-install.log" >&2
+    fail "published v0.10.4 CLI could not install the capsule migration fixture archive"
+  fi
 }
 
 run_old() {
@@ -258,7 +277,7 @@ mkdir -p -- "${RELEASE_ROOT}" "${ASTRID_HOME}" "${POISON_HOME}" "${WORKSPACE}"
 : >"${TEST_ROOT}/legacy-capsules"
 : >"${TEST_ROOT}/legacy-profiles"
 
-for binary in astrid astrid-daemon; do
+for binary in astrid astrid-daemon astrid-build; do
   [[ -x "${CURRENT_BIN_DIR}/${binary}" ]] \
     || fail "current ${binary} binary is missing from ${CURRENT_BIN_DIR}"
 done
@@ -299,18 +318,13 @@ compgen -G "${ASTRID_HOME}/var/state.db/manifest/*.manifest" >/dev/null \
 compgen -G "${ASTRID_HOME}/var/state.db/wal/*.wal" >/dev/null \
   || fail "published release did not create a SurrealKV WAL"
 
-# The checked-in adversarial capsule is a real Rust capsule source, so the
-# released CLI can build and install it into the legacy native tree. Do not
-# silently skip package/authority/WIT coverage when the published CLI loses
-# this capability: that is a release-fixture failure, not an optional branch.
-ensure_capsule_build_target
-if ! run_old_capsule_build_bounded 180s capsule install --yes \
-  --var adversarial_lifecycle_probe=runtime-lifecycle-ok \
-  "${CAPSULE_SOURCE}" \
-  >"${TEST_ROOT}/v0104-capsule-install.log" 2>&1; then
-  cat "${TEST_ROOT}/v0104-capsule-install.log" >&2
-  fail "published v0.10.4 CLI could not create the capsule migration fixture"
-fi
+# Build a real archive with the current canonical builder and shared Cargo
+# configuration. The immutable old source builder only searches local target/
+# directories, so it cannot stage this fixture on hosts with a shared target.
+# The actual released CLI must still install the archive and create every
+# legacy package, authority and WIT byte checked below; this is not evidence
+# that the released source builder supports a shared Cargo target directory.
+prepare_legacy_capsule_fixture
 validate_published_capsule_fixture
 printf 'astrid-capsule-adversarial\n' >"${TEST_ROOT}/legacy-capsules"
 
