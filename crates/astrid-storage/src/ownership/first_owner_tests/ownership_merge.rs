@@ -323,3 +323,36 @@ async fn different_signed_ceremony_with_same_counters_does_not_revive_invite() {
         Some(bytes)
     );
 }
+
+#[tokio::test]
+async fn provisional_rollback_cannot_adopt_a_new_enrollment_authority() {
+    let fixture = enrolled().await;
+    let child = admit_child(&fixture);
+    let captured = fixture
+        .store
+        .capture_derived_ownership(fixture.principal_uid)
+        .await
+        .unwrap();
+    let provision = fixture
+        .store
+        .assign_derived_principal_for_provisioning(child, &captured)
+        .await
+        .unwrap();
+    let bytes = advance_authority(&fixture).await;
+    assert!(matches!(
+        fixture
+            .store
+            .guard_derived_principal_rollback(provision)
+            .await,
+        Err(OwnershipError::AuthorityStale)
+    ));
+    assert_eq!(
+        fixture
+            .backend
+            .get(OWNERSHIP_NAMESPACE, GRAPH_KEY)
+            .await
+            .unwrap()
+            .unwrap(),
+        bytes
+    );
+}
