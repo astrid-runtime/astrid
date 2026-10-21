@@ -730,9 +730,9 @@ pub(crate) async fn retain_locked_projection(
             .into());
     }
     #[cfg(all(test, any(unix, windows)))]
-    pause_retain_validation_for_test().await;
+    super::retain_test_gates::pause_validation(kernel).await;
     #[cfg(all(test, any(unix, windows)))]
-    pause_retain_reference_for_test().await;
+    super::retain_test_gates::pause_reference(kernel).await;
     if !projection_leases_are_live(kernel, &projection) {
         // The revocation/expiry interval is closed before a reference exists.
         // Drop the writer fence first because bounded invalidation must drain
@@ -757,105 +757,6 @@ pub(crate) async fn retain_locked_projection(
             .into());
     }
     Ok(projection_mount(projection, cache, key))
-}
-
-#[cfg(all(test, any(unix, windows)))]
-#[derive(Default)]
-struct RetainValidationGate {
-    entered: Arc<tokio::sync::Notify>,
-    release: Arc<tokio::sync::Notify>,
-}
-
-#[cfg(all(test, any(unix, windows)))]
-static RETAIN_VALIDATION_GATE: std::sync::Mutex<Option<Arc<RetainValidationGate>>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(all(test, any(unix, windows)))]
-static RETAIN_REFERENCE_GATE: std::sync::Mutex<Option<Arc<RetainValidationGate>>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(all(test, any(unix, windows)))]
-pub(crate) struct RetainValidationGateGuard {
-    gate: Arc<RetainValidationGate>,
-}
-
-#[cfg(all(test, any(unix, windows)))]
-impl RetainValidationGateGuard {
-    pub(crate) fn entered(&self) -> Arc<tokio::sync::Notify> {
-        Arc::clone(&self.gate.entered)
-    }
-
-    pub(crate) fn release(&self) -> Arc<tokio::sync::Notify> {
-        Arc::clone(&self.gate.release)
-    }
-}
-
-#[cfg(all(test, any(unix, windows)))]
-impl Drop for RetainValidationGateGuard {
-    fn drop(&mut self) {
-        let mut installed = RETAIN_VALIDATION_GATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if installed
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &self.gate))
-        {
-            *installed = None;
-        }
-        let mut reference_gate = RETAIN_REFERENCE_GATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if reference_gate
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &self.gate))
-        {
-            *reference_gate = None;
-        }
-    }
-}
-
-#[cfg(all(test, any(unix, windows)))]
-pub(crate) fn arm_retain_validation_gate() -> RetainValidationGateGuard {
-    let gate = Arc::new(RetainValidationGate::default());
-    *RETAIN_VALIDATION_GATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&gate));
-    RetainValidationGateGuard { gate }
-}
-
-#[cfg(all(test, any(unix, windows)))]
-pub(crate) fn arm_retain_reference_gate() -> RetainValidationGateGuard {
-    let gate = Arc::new(RetainValidationGate::default());
-    *RETAIN_REFERENCE_GATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&gate));
-    RetainValidationGateGuard { gate }
-}
-
-#[cfg(all(test, any(unix, windows)))]
-async fn pause_retain_validation_for_test() {
-    let gate = RETAIN_VALIDATION_GATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .map(Arc::clone);
-    if let Some(gate) = gate {
-        gate.entered.notify_one();
-        gate.release.notified().await;
-    }
-}
-
-#[cfg(all(test, any(unix, windows)))]
-async fn pause_retain_reference_for_test() {
-    let gate = RETAIN_REFERENCE_GATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .map(Arc::clone);
-    if let Some(gate) = gate {
-        gate.entered.notify_one();
-        gate.release.notified().await;
-    }
 }
 
 #[allow(clippy::needless_pass_by_value)]

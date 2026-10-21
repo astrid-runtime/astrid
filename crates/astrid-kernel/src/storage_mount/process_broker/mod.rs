@@ -33,6 +33,12 @@ mod cache_tests;
 mod projection_identity;
 #[cfg(any(unix, windows))]
 mod projection_lifecycle;
+#[cfg(all(test, any(unix, windows)))]
+mod retain_test_gates;
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) use retain_test_gates::{
+    RetainTestGates, arm_retain_reference_gate, arm_retain_validation_gate,
+};
 mod projection_root_removal;
 #[cfg(all(test, any(unix, windows)))]
 mod test_faults;
@@ -43,8 +49,7 @@ pub(crate) use projection_lifecycle::cached_projection_mount;
 pub(crate) use projection_lifecycle::retain_failed_launch_projection;
 #[cfg(all(test, any(unix, windows)))]
 pub(crate) use projection_lifecycle::{
-    ParentTokenSlot, arm_parent_token_failure, arm_retain_reference_gate,
-    arm_retain_validation_gate, revoke_projection_leases,
+    ParentTokenSlot, arm_parent_token_failure, revoke_projection_leases,
 };
 #[cfg(any(unix, windows))]
 pub(crate) use projection_lifecycle::{
