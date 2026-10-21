@@ -8,6 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[path = "hosted_owner/cancel.rs"]
 mod cancel;
+#[path = "hosted_owner/existing_home.rs"]
+mod existing_home;
 #[path = "hosted_owner/pending.rs"]
 mod pending;
 
