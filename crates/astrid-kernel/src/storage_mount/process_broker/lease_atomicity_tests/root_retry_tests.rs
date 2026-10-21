@@ -25,10 +25,18 @@ async fn concurrent_worker_panics_block_cleanup_until_settled_retries() {
     let stale_root = uuid_mount_root(&stale_mount);
 
     let (mut workers, gates) = spawn_panicking_workers(&kernel, &stale_projection);
-    fail_all_workers(&gates).await;
-    await_join_failure_publication(&kernel, &stale_projection).await;
+    let (held_worker, failed_workers) = gates.split_last().expect("projection workers");
+    let held_entry = Arc::clone(held_worker);
+    tokio::task::spawn_blocking(move || held_entry.wait_entered(1))
+        .await
+        .expect("held worker entry");
+    fail_workers(failed_workers).await;
+    await_join_failure_publication(&kernel, &stale_projection, failed_workers.len()).await;
     stale_mount.close_async().await;
     assert_unsettled_blocker(&kernel, &broker, &caller, &stale_projection, &stale_root).await;
+    held_worker.arm_panic_on_release();
+    held_worker.release_workers();
+    await_join_failure_publication(&kernel, &stale_projection, gates.len()).await;
     while let Some(worker) = workers.join_next().await {
         let _ = worker.expect("worker task joined");
     }
@@ -83,7 +91,7 @@ fn spawn_panicking_workers(
     (workers, gates)
 }
 
-async fn fail_all_workers(gates: &[Arc<crate::storage_mount::BlockingWorkerTestGate>]) {
+async fn fail_workers(gates: &[Arc<crate::storage_mount::BlockingWorkerTestGate>]) {
     let gates_for_entry = gates.to_vec();
     tokio::task::spawn_blocking(move || {
         for gate in &gates_for_entry {
@@ -109,8 +117,9 @@ async fn fail_all_workers(gates: &[Arc<crate::storage_mount::BlockingWorkerTestG
 async fn await_join_failure_publication(
     kernel: &Arc<crate::Kernel>,
     projection: &CachedProcessProjection,
+    count: usize,
 ) {
-    for mount_id in &projection.component_mount_ids {
+    for mount_id in projection.component_mount_ids.iter().take(count) {
         let state = kernel
             .storage_mounts
             .get(mount_id)
@@ -219,6 +228,7 @@ async fn successful_lease_cleanup_with_failed_root_retains_retry_blocker() {
         "zero lease maps must remain after successful exact-lease cleanup"
     );
     assert!(stale_root.exists());
+    fail_next_root_removal_for_test(stale_root.clone());
     let Err(denied) =
         tokio::time::timeout(std::time::Duration::from_secs(2), broker.mount(&caller))
             .await

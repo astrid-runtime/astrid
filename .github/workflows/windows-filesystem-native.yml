@@ -405,7 +405,7 @@ jobs:
           # Harness deadline, not product policy: preserve the real failure and
           # diagnostics if native work prevents the test runtime from exiting.
           & ./scripts/run-bounded-native-test.ps1 -FilePath $stagedTestExecutable `
-            -TimeoutSeconds 600 -Arguments @("storage_mount", "--", "--nocapture", "--test-threads=1")
+            -TimeoutSeconds 600 -Arguments @("storage_mount", "--nocapture", "--test-threads=1")
           if ($LASTEXITCODE -ne 0) {
             throw "the trusted process storage provider tests failed with exit code $LASTEXITCODE"
           }

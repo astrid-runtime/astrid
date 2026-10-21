@@ -75,8 +75,7 @@ async fn pause(slot: &Slot) {
     let gate = slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .map(Arc::clone);
+        .take();
     if let Some(gate) = gate {
         gate.entered.notify_one();
         gate.release.notified().await;
@@ -89,4 +88,25 @@ pub(super) async fn pause_validation(kernel: &crate::Kernel) {
 
 pub(super) async fn pause_reference(kernel: &crate::Kernel) {
     pause(&kernel.projection_retain_test_gates.reference).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn one_retain_gate_pauses_only_one_admission() {
+        let slot = Slot::default();
+        let gate = arm(&slot);
+        let task = tokio::spawn({
+            let slot = Arc::clone(&slot);
+            async move { pause(&slot).await }
+        });
+        gate.entered().notified().await;
+        gate.release().notify_one();
+        task.await.expect("first admission released");
+        tokio::time::timeout(std::time::Duration::from_secs(1), pause(&slot))
+            .await
+            .expect("a replacement admission must not hit the consumed gate");
+    }
 }

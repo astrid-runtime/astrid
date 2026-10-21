@@ -493,47 +493,46 @@ fn prepare_projection_paths(
         fleet_shared: None,
     };
     validate_projection_mount_root(kernel, projections, key, &paths)?;
-    #[cfg(not(windows))]
-    {
-        #[cfg(all(test, any(unix, windows)))]
-        if take_preparation_failure_for_test(process_launch::ProcessLaunchStage::Branch) {
-            return Err(retain_projection_path_failure(
-                kernel,
-                projections,
-                key,
-                &paths,
-                "workspace mountpoint preparation fault",
-            ));
-        }
-        astrid_core::platform_fs::ensure_private_directory(&workspace).map_err(|error| {
-            retain_projection_path_failure(
-                kernel,
-                projections,
-                key,
-                &paths,
-                format!("create workspace mountpoint: {error}"),
-            )
-        })?;
-        #[cfg(all(test, any(unix, windows)))]
-        if take_preparation_failure_for_test(process_launch::ProcessLaunchStage::OwnerHome) {
-            return Err(retain_projection_path_failure(
-                kernel,
-                projections,
-                key,
-                &paths,
-                "owner mountpoint preparation fault",
-            ));
-        }
-        astrid_core::platform_fs::ensure_private_directory(&owner).map_err(|error| {
-            retain_projection_path_failure(
-                kernel,
-                projections,
-                key,
-                &paths,
-                format!("create owner mountpoint: {error}"),
-            )
-        })?;
+    #[cfg(all(test, any(unix, windows)))]
+    if take_preparation_failure_for_test(process_launch::ProcessLaunchStage::Branch) {
+        return Err(retain_projection_path_failure(
+            kernel,
+            projections,
+            key,
+            &paths,
+            "workspace mountpoint preparation fault",
+        ));
     }
+    #[cfg(not(windows))]
+    astrid_core::platform_fs::ensure_private_directory(&workspace).map_err(|error| {
+        retain_projection_path_failure(
+            kernel,
+            projections,
+            key,
+            &paths,
+            format!("create workspace mountpoint: {error}"),
+        )
+    })?;
+    #[cfg(all(test, any(unix, windows)))]
+    if take_preparation_failure_for_test(process_launch::ProcessLaunchStage::OwnerHome) {
+        return Err(retain_projection_path_failure(
+            kernel,
+            projections,
+            key,
+            &paths,
+            "owner mountpoint preparation fault",
+        ));
+    }
+    #[cfg(not(windows))]
+    astrid_core::platform_fs::ensure_private_directory(&owner).map_err(|error| {
+        retain_projection_path_failure(
+            kernel,
+            projections,
+            key,
+            &paths,
+            format!("create owner mountpoint: {error}"),
+        )
+    })?;
     let fleet_shared = if matches!(key.binding.owner, StateOwner::Fleet(_)) {
         let path = mount_root.join("shared");
         paths.fleet_shared = Some(path.clone());

@@ -3,6 +3,8 @@
 
 from pathlib import Path
 import shutil
+import os
+import re
 import queue
 import threading
 import subprocess
@@ -23,6 +25,32 @@ class NativeWatchdogWorkflowTests(unittest.TestCase):
         self.assertIn("-FilePath $stagedTestExecutable", step)
         self.assertIn("-TimeoutSeconds 600", step)
         self.assertNotIn("& $stagedTestExecutable storage_mount", step)
+
+
+    @unittest.skipUnless(POWERSHELL and shutil.which("rustc"), "PowerShell and rustc required")
+    def test_workflow_runs_raw_libtest_with_live_success_output(self):
+        workflow = (ROOT / ".github/workflows/windows-filesystem-native.yml").read_text()
+        step = workflow.split("      - name: Run storage callback transport tests in trusted staging\n", 1)[1].split("\n      - name:", 1)[0]
+        arguments = re.search(r'-Arguments @\(([^)]*)\)', step).group(1)
+        arguments = re.findall(r'"([^"]*)"', arguments)
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "fixture.rs"
+            binary = Path(temporary) / ("fixture.exe" if os.name == "nt" else "fixture")
+            source.write_text('#[test] fn storage_mount_output() { println!("native-output-is-live"); }')
+            compiled = subprocess.run(["rustc", "--test", str(source), "-o", str(binary)],
+                                      capture_output=True, text=True, timeout=60, check=False)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            def quote(value):
+                return "'" + str(value).replace("'", "''") + "'"
+            code = (f"& {quote(WATCHDOG)} -FilePath {quote(binary)} -TimeoutSeconds 20 "
+                    f"-Arguments @({', '.join(map(quote, arguments))}); exit $LASTEXITCODE")
+            result = subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", code],
+                                    capture_output=True, text=True, timeout=40, check=False)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("native-output-is-live", result.stdout,
+                          "raw libtest did not apply --nocapture; Cargo's separator hides it")
+            self.assertNotIn("--", arguments, "raw libtest must receive its flags directly")
+            self.assertIn("--test-threads=1", arguments)
 
 
 @unittest.skipUnless(POWERSHELL, "PowerShell required for actual owned-process tests")
