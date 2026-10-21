@@ -224,6 +224,12 @@ jobs:
         shell: pwsh
         run: cargo test --locked --target ${{ matrix.target }} -p astrid-storage-provider-winfsp -- --nocapture
 
+      - name: Exercise fresh hosted owner provisioning and restart natively
+        shell: pwsh
+        run: >-
+          cargo test --locked --target ${{ matrix.target }} -p astrid
+          --test hosted_owner -- --nocapture --test-threads=1
+
       - name: Run Windows updater tests natively
         shell: pwsh
         run: >-

@@ -16,6 +16,8 @@ name = "astrid-daemon"
 path = "src/main.rs"
 
 [dependencies]
+serde_json = { workspace = true }
+async-trait = { workspace = true }
 astrid-workspace = { workspace = true }
 anyhow = { workspace = true }
 astrid-capsule = { workspace = true }
@@ -55,7 +57,6 @@ mimalloc = { workspace = true }
 astrid-crypto = { workspace = true }
 astrid-events = { workspace = true }
 astrid-types = { workspace = true }
-serde_json = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

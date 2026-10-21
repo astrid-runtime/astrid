@@ -40,6 +40,14 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // Ownership inspection and external signing must never trigger config,
+    // installation, update checks, daemon autostart or default-user bootstrap.
+    if matches!(&cli.command, Some(Commands::Owner { .. }))
+        && let Some(Commands::Owner { command }) = cli.command
+    {
+        return commands::owner::run(command).await;
+    }
+
     let headless_route = cli.prompt.is_some()
         || (cli.command.is_none() && !std::io::stdin().is_terminal())
         || matches!(cli.command, Some(Commands::Run(_)));
@@ -242,6 +250,7 @@ async fn dispatch_subcommand(
             commands::daemon::validate_runtime_admission()?;
             commands::restart::run().await
         },
+        Some(Commands::Owner { command }) => commands::owner::run(command).await,
         Some(Commands::Storage { command }) => commands::storage::run(command),
         Some(Commands::Logs(args)) => commands::logs::run(&args).await,
         Some(Commands::Ps(args)) => commands::ps::run(args).await,

@@ -6,6 +6,8 @@
 
 /// Signed first-owner provisioning facts.
 pub mod first_owner;
+/// Explicit host-administered first-owner provisioning facts.
+pub mod hosted_owner;
 /// Durable human and fleet ownership identities.
 pub mod ownership;
 /// Stable principal identity.

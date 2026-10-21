@@ -13,6 +13,7 @@ default = []
 test-support = []
 
 [dependencies]
+async-trait = { workspace = true }
 anyhow = { workspace = true }
 astrid-config = { workspace = true }
 astrid-core = { workspace = true }
@@ -30,7 +31,6 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-async-trait = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

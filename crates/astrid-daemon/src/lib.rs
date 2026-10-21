@@ -15,6 +15,7 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 
+mod hosted_owner;
 /// Explicitly bound native secret responder; not enabled by default.
 pub mod native_input;
 
@@ -42,7 +43,14 @@ pub fn run_to_completion() -> Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        runtime.block_on(run_with_args(args))?;
+        if args.owner.configure_hosted_owner {
+            runtime.block_on(hosted_owner::configure(
+                &home,
+                args.owner.owner_target_default,
+            ))?;
+        } else {
+            runtime.block_on(run_with_args(args))?;
+        }
         // Drop joins blocking work and cancels remaining async tasks before any
         // projection file can be retired. No kernel handles cross this scope.
     }
@@ -64,6 +72,9 @@ const DAEMON_LOG_TARGET_ENV: &str = "ASTRID_DAEMON_LOG_TARGET";
 #[command(name = "astrid-daemon")]
 #[command(author, version, about)]
 pub struct Args {
+    /// Explicit offline hosted ownership administration.
+    #[command(flatten)]
+    pub owner: hosted_owner::AdministrationArgs,
     /// Run the disposable native-process setup probe before touching a home.
     #[arg(long, hide = true)]
     pub setup_sandbox_probe: bool,
@@ -348,10 +359,12 @@ async fn run_with_args(args: Args) -> Result<()> {
         event_bus: std::sync::Arc::clone(&kernel.event_bus),
         shutdown: kernel.shutdown_tx.subscribe(),
     };
-    let native_uplink_task = match private_inputs {
-        Some(responder) => native_uplink.spawn_with_private_elicits(responder),
-        None => native_uplink.spawn(),
-    };
+    let native_uplink_task = native_uplink.spawn_with_native_controls(
+        private_inputs,
+        std::sync::Arc::new(hosted_owner::NativeOwnerResponder(std::sync::Arc::clone(
+            &kernel,
+        ))),
+    );
 
     // In ephemeral mode, shut down immediately when the last client disconnects.
     if args.ephemeral {

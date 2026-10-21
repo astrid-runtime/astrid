@@ -564,6 +564,7 @@ dependencies = [
  "astrid-types",
  "astrid-uplink",
  "astrid-workspace",
+ "async-trait",
  "clap",
  "colored",
  "mimalloc",

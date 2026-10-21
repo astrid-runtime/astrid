@@ -139,7 +139,7 @@ async fn socket_answers_delivered_approval_while_ordinary_input_is_blocked() {
         receiver,
         watch,
         admission,
-        None,
+        NativeControls::default(),
     ));
     write_message(
         &mut write,
@@ -534,7 +534,7 @@ async fn pending_socket_admission_drains_egress_and_releases_on_eof_or_shutdown(
             receiver,
             watch,
             admission,
-            None,
+            NativeControls::default(),
         ));
         write_message(
             &mut write,
@@ -1041,7 +1041,7 @@ async fn socket_cancels_active_turn_with_both_other_input_slots_blocked() {
         receiver,
         watch,
         admission,
-        None,
+        NativeControls::default(),
     ));
     let approval = reader.read_message().await.unwrap().unwrap();
     assert_eq!(approval.topic, Topic::approval_request());
@@ -1214,7 +1214,7 @@ async fn assert_buffered_prompt_after_cancel(extra_frame: bool) {
         receiver,
         watch,
         admission,
-        None,
+        NativeControls::default(),
     ));
     write_inbound_frame(
         &mut writer,

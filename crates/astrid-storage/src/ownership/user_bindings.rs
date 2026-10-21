@@ -33,6 +33,26 @@ pub(super) struct UserDeviceBinding {
 }
 
 impl UserDeviceBinding {
+    pub(super) fn first_owner(
+        generation: uuid::Uuid,
+        principal: PrincipalUid,
+        public_key: [u8; 32],
+        user: UserUid,
+        fleet: FleetUid,
+    ) -> Self {
+        Self {
+            generation,
+            principal,
+            public_key,
+            user,
+            fleet,
+            granted_by: user,
+        }
+    }
+
+    pub(super) fn matches_device(&self, principal: PrincipalUid, public_key: &[u8; 32]) -> bool {
+        self.principal == principal && &self.public_key == public_key
+    }
     pub(super) fn belongs_to(&self, user: UserUid, fleet: FleetUid) -> bool {
         self.user == user && self.fleet == fleet
     }

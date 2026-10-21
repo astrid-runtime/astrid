@@ -124,6 +124,11 @@ pub(crate) struct Cli {
     reason = "clap subcommand enum, constructed once per process"
 )]
 pub(crate) enum Commands {
+    /// Explicit host-administered first-owner provisioning.
+    Owner {
+        #[command(subcommand)]
+        command: crate::commands::owner::OwnerCommand,
+    },
     /// Start an interactive chat session
     Chat {
         /// Resume a specific session

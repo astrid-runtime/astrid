@@ -68,6 +68,8 @@ mod grant_audit;
 /// (`kernel_router::admin`), which is itself native.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod grant_on_use;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod hosted_owner;
 /// Persistent invite-token store (issue #756).
 pub mod invite;
 /// The Management API router listening to the `EventBus`.

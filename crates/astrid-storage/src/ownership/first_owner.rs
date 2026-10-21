@@ -257,6 +257,7 @@ impl super::OwnershipStore {
         claim.verify_signature().map_err(FirstOwnerError::from)?;
         let claim = *claim;
         self.mutate(move |graph| {
+            graph.require_standalone_enrollment()?;
             let state = graph.first_owner_state();
             match state {
                 FirstOwnerEnrollment::Unenrolled | FirstOwnerEnrollment::Cancelled { .. } => {
@@ -306,6 +307,7 @@ impl super::OwnershipStore {
     ) -> Result<FirstOwnerEnrollment, OwnershipError> {
         claim.verify_signature().map_err(FirstOwnerError::from)?;
         self.mutate(|graph| {
+            graph.require_standalone_enrollment()?;
             if !matches!(
                 graph.first_owner_state(),
                 FirstOwnerEnrollment::Pending {
@@ -332,6 +334,7 @@ impl super::OwnershipStore {
         now: u64,
     ) -> Result<FirstOwnerEnrollment, OwnershipError> {
         self.mutate(|graph| {
+            graph.require_standalone_enrollment()?;
             let FirstOwnerEnrollment::Pending { claim } = graph.first_owner_state() else {
                 return Ok(graph.first_owner_state());
             };
@@ -345,7 +348,7 @@ impl super::OwnershipStore {
         .await
     }
 
-    fn advance_counters(graph: &mut OwnershipSnapshot) -> Result<(), OwnershipError> {
+    pub(super) fn advance_counters(graph: &mut OwnershipSnapshot) -> Result<(), OwnershipError> {
         graph.authority_epoch = graph
             .authority_epoch
             .checked_next()
@@ -397,12 +400,13 @@ impl super::OwnershipStore {
         }
         let principals = &self.principals;
         self.mutate(move |graph| {
+            graph.require_standalone_enrollment()?;
             Self::apply_first_owner_commit(principals, graph, &claim, &user, &fleet, &now)
         })
         .await
     }
 
-    fn apply_first_owner_commit(
+    pub(super) fn apply_first_owner_commit(
         principals: &PrincipalDirectory,
         graph: &mut OwnershipSnapshot,
         claim: &FirstOwnerClaim,

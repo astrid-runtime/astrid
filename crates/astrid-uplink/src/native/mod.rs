@@ -6,6 +6,8 @@
 mod egress;
 mod framing;
 mod handshake;
+/// Direct native hosted-owner provisioning, separate from capsule IPC.
+pub mod hosted_owner;
 mod input;
 pub mod private_elicit;
 #[cfg(all(test, unix))]
@@ -64,6 +66,7 @@ struct ConnectionAdmission {
 
 struct ConnectionRuntime {
     private_elicits: Option<Arc<dyn private_elicit::PrivateElicitResponder>>,
+    hosted_owner: Option<Arc<dyn hosted_owner::HostedOwnerResponder>>,
     session_token: Arc<SessionToken>,
     home: AstridHome,
     event_bus: Arc<EventBus>,
@@ -127,7 +130,10 @@ impl ConnectionRuntime {
             egress,
             shutdown,
             admission,
-            self.private_elicits.clone(),
+            NativeControls {
+                private_elicits: self.private_elicits.clone(),
+                hosted_owner: self.hosted_owner.clone(),
+            },
         )
         .await;
     }
@@ -188,7 +194,7 @@ impl NativeUplink {
     /// requested or the listener becomes unusable.
     #[must_use]
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(self.run(None))
+        tokio::spawn(self.run(None, None))
     }
 
     /// Attach a runtime-owned private reply handler without changing legacy
@@ -198,12 +204,23 @@ impl NativeUplink {
         self,
         handler: Arc<dyn private_elicit::PrivateElicitResponder>,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(self.run(Some(handler)))
+        tokio::spawn(self.run(Some(handler), None))
+    }
+
+    /// Attach direct native controls before capsules can publish any bus message.
+    #[must_use]
+    pub fn spawn_with_native_controls(
+        self,
+        private: Option<Arc<dyn private_elicit::PrivateElicitResponder>>,
+        owner: Arc<dyn hosted_owner::HostedOwnerResponder>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(self.run(private, Some(owner)))
     }
 
     async fn run(
         mut self,
         private_elicits: Option<Arc<dyn private_elicit::PrivateElicitResponder>>,
+        hosted_owner: Option<Arc<dyn hosted_owner::HostedOwnerResponder>>,
     ) {
         let handshake_permits = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
         let established_permits =
@@ -214,6 +231,7 @@ impl NativeUplink {
         let (connection_shutdown_tx, connection_shutdown_rx) = tokio::sync::watch::channel(false);
         let runtime = Arc::new(ConnectionRuntime {
             private_elicits,
+            hosted_owner,
             session_token: Arc::clone(&self.session_token),
             home: self.home.clone(),
             event_bus: Arc::clone(&self.event_bus),
@@ -448,6 +466,12 @@ async fn process_inbound(
     Ok(())
 }
 
+#[derive(Default)]
+struct NativeControls {
+    private_elicits: Option<Arc<dyn private_elicit::PrivateElicitResponder>>,
+    hosted_owner: Option<Arc<dyn hosted_owner::HostedOwnerResponder>>,
+}
+
 async fn serve_connection(
     stream: LocalStream,
     identity: AuthenticatedIdentity,
@@ -455,7 +479,7 @@ async fn serve_connection(
     receiver: egress::Subscription,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     mut admission: ConnectionAdmission,
-    private_elicits: Option<Arc<dyn private_elicit::PrivateElicitResponder>>,
+    controls: NativeControls,
 ) {
     let principal = identity.principal.to_string();
     let (reader, mut writer) = local_transport::split(stream);
@@ -524,8 +548,13 @@ async fn serve_connection(
                         tracing::warn!(%principal, "reserved admin connection attempted multiple requests");
                         break;
                     }
+                    if message.topic.as_str() == hosted_owner::REQUEST_TOPIC {
+                        let response = hosted_owner::respond(&identity, controls.hosted_owner.as_ref(), message).await;
+                        if write_message(&mut writer, &response).await.is_err() { break; }
+                        continue;
+                    }
                     if handle_connection_input(&mut writer, &event_bus, &identity,
-                        &receiver, private_elicits.as_deref(), message,
+                        &receiver, controls.private_elicits.as_deref(), message,
                         (&mut pending, &mut control, &mut cancellation)).await.is_err()
                     {
                         break;
@@ -556,10 +585,14 @@ async fn serve_connection(
     drop(pending); // Abandon any unpublished turn before disconnect notification.
     drop(control);
     drop(cancellation);
+    close_connection(&event_bus, &principal);
+}
+
+fn close_connection(event_bus: &EventBus, principal: &str) {
     publish_lifecycle(
-        &event_bus,
+        event_bus,
         Topic::client_disconnect(),
-        &principal,
+        principal,
         Some("socket closed"),
     );
     tracing::info!(%principal, "local client disconnected");

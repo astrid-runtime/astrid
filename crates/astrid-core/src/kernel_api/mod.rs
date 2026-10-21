@@ -12,6 +12,8 @@ mod agent;
 mod audit_anchor;
 mod audit_export;
 mod capsule_metadata;
+/// Native hosted-owner control DTOs; never dispatched over the capsule bus.
+pub mod hosted_owner;
 mod impls;
 mod install;
 mod pairing;

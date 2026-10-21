@@ -29,9 +29,11 @@ mod ownership_helpers;
 
 mod deletion;
 mod derived;
+mod hosted;
 mod provision;
 mod resources;
 pub use derived::DerivedPrincipalOwnership;
+pub use hosted::{HostedOwnerCompletion, HostedOwnerRecord};
 mod upgrade;
 pub use upgrade::{UnownedPrincipalDeferral, UnownedPrincipalReconciliation};
 mod user_bindings;
@@ -41,6 +43,7 @@ pub use user_bindings::CreationDelegation;
 pub const OWNERSHIP_NAMESPACE: &str = "system:ownership";
 const GRAPH_KEY: &str = "graph-v1";
 const GRAPH_FORMAT_VERSION: u16 = 2;
+const HOSTED_GRAPH_FORMAT_VERSION: u16 = 3;
 const LEGACY_GRAPH_FORMAT_VERSION: u16 = 1;
 const MAX_CAS_ATTEMPTS: usize = 64;
 
@@ -99,6 +102,9 @@ pub struct OwnershipSnapshot {
     user_bindings: Vec<user_bindings::UserDeviceBinding>,
     #[serde(default, skip_serializing_if = "user_bindings::not_initialized")]
     local_user_binding_initialized: bool,
+    /// Presence fences old readers before the first hosted Pending write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hosted: Option<HostedOwnerRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +129,7 @@ impl Default for OwnershipSnapshot {
             authority_generation: default_authority_generation(),
             user_bindings: Vec::new(),
             local_user_binding_initialized: false,
+            hosted: None,
         }
     }
 }
@@ -207,10 +214,14 @@ impl OwnershipSnapshot {
     fn validate(&self, principals: &PrincipalDirectory) -> Result<(), OwnershipError> {
         self.validate_accountable_users()?;
         self.validate_user_bindings(principals)?;
-        if self.format_version != GRAPH_FORMAT_VERSION {
+        if !matches!(
+            self.format_version,
+            GRAPH_FORMAT_VERSION | HOSTED_GRAPH_FORMAT_VERSION
+        ) {
             return Err(OwnershipError::UnsupportedFormat(self.format_version));
         }
         self.validate_first_owner()?;
+        self.validate_hosted()?;
         for (uid, identity) in &self.users {
             identity.validate()?;
             if *uid != identity.uid {
@@ -262,25 +273,7 @@ impl OwnershipSnapshot {
                 )));
             }
         }
-        for (principal_uid, ownership) in &self.principal_ownership {
-            if *principal_uid != ownership.principal_uid {
-                return Err(OwnershipError::CorruptGraph(format!(
-                    "principal ownership key {principal_uid} disagrees with its record"
-                )));
-            }
-            if !principals.contains_uid(*principal_uid) {
-                return Err(OwnershipError::CorruptGraph(format!(
-                    "principal {principal_uid} is absent from the admitted principal directory"
-                )));
-            }
-            if !self.fleets.contains_key(&ownership.fleet_uid)
-                || !self.users.contains_key(&ownership.assigned_by)
-            {
-                return Err(OwnershipError::CorruptGraph(format!(
-                    "principal {principal_uid} ownership references an absent identity"
-                )));
-            }
-        }
+        self.validate_principal_ownership(principals)?;
         let mut deletion_aliases = BTreeMap::new();
         for (principal_uid, reservation) in &self.principal_deletions {
             if let Some(fleet) = reservation.fleet
@@ -299,6 +292,32 @@ impl OwnershipSnapshot {
             {
                 return Err(OwnershipError::CorruptGraph(format!(
                     "principal deletion alias {alias} is reserved by both {existing_uid} and {principal_uid}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_principal_ownership(
+        &self,
+        principals: &PrincipalDirectory,
+    ) -> Result<(), OwnershipError> {
+        for (principal_uid, ownership) in &self.principal_ownership {
+            if *principal_uid != ownership.principal_uid {
+                return Err(OwnershipError::CorruptGraph(format!(
+                    "principal ownership key {principal_uid} disagrees with its record"
+                )));
+            }
+            if !principals.contains_uid(*principal_uid) {
+                return Err(OwnershipError::CorruptGraph(format!(
+                    "principal {principal_uid} is absent from the admitted principal directory"
+                )));
+            }
+            if !self.fleets.contains_key(&ownership.fleet_uid)
+                || !self.users.contains_key(&ownership.assigned_by)
+            {
+                return Err(OwnershipError::CorruptGraph(format!(
+                    "principal {principal_uid} ownership references an absent identity"
                 )));
             }
         }
@@ -792,7 +811,10 @@ impl OwnershipStore {
             }
             graph.format_version = GRAPH_FORMAT_VERSION;
             graph.enrollment = Some(FirstOwnerEnrollment::Unenrolled);
-        } else if graph.format_version != GRAPH_FORMAT_VERSION {
+        } else if !matches!(
+            graph.format_version,
+            GRAPH_FORMAT_VERSION | HOSTED_GRAPH_FORMAT_VERSION
+        ) {
             return Err(OwnershipError::UnsupportedFormat(graph.format_version));
         } else if graph.enrollment.is_none() {
             if graph.has_legacy_authority() {

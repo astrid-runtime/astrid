@@ -569,6 +569,26 @@ pub(crate) async fn pair_device_revoke(
         Err(e) => return err_internal(format!("profile load failed: {e}")),
     };
 
+    if let Some(device) = profile.auth.device_by_typed_key_id(&key_id) {
+        let Ok(bytes) = hex::decode(&device.pubkey) else {
+            return err_internal("invalid registered device key".into());
+        };
+        let Ok(public_key) = <[u8; 32]>::try_from(bytes) else {
+            return err_internal("invalid registered device key".into());
+        };
+        let Ok(uid) = kernel.principal_directory.uid_for(principal) else {
+            return err_internal("missing admitted principal".into());
+        };
+        if kernel
+            .ownership_store
+            .retire_hosted_owner_device(uid, public_key)
+            .await
+            .is_err()
+        {
+            return err_internal("hosted authority retirement failed".into());
+        }
+    }
+
     let before = profile.auth.public_keys.len();
     profile
         .auth

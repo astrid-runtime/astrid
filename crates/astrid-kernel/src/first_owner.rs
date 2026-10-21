@@ -217,7 +217,8 @@ pub(crate) async fn commit_first_owner(
 pub(crate) async fn legacy_root_bootstrap_allowed(
     store: &OwnershipStore,
 ) -> Result<bool, OwnershipError> {
-    Ok(store.first_owner_state().await?.is_enrolled())
+    let graph = store.load().await?;
+    Ok(graph.hosted_owner().is_none() && store.first_owner_state().await?.is_enrolled())
 }
 
 #[cfg(test)]

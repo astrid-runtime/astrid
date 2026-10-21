@@ -7,6 +7,9 @@ use super::FirstOwnerError;
 /// Rejection from ownership graph persistence or invariant enforcement.
 #[derive(Debug, thiserror::Error)]
 pub enum OwnershipError {
+    /// Explicit hosted provisioning authorization failed closed.
+    #[error(transparent)]
+    HostedOwner(#[from] astrid_core::identity::hosted_owner::HostedOwnerError),
     /// Canonical identity material was invalid.
     #[error(transparent)]
     Identity(#[from] OwnershipIdentityError),
