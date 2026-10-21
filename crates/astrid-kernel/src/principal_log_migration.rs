@@ -19,7 +19,8 @@ const RECEIPT_SCHEMA: u32 = 1;
 const RECEIPT_PREFIX: &str = "principal-logs-";
 const RECEIPT_SUFFIX: &str = ".json";
 const MAX_ENTRIES: u64 = 100_000;
-const MAX_BYTES: u64 = 64 * 1024 * 1024;
+// Log bytes are streamed in a fixed buffer, not decoded or retained in memory.
+// Historical volume therefore must not become an implicit boot-time quota.
 const MAX_PATH_BYTES: usize = 4096;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_RECEIPT_BYTES: u64 = 1024 * 1024;
@@ -51,7 +52,7 @@ struct LogEntry {
 /// # Errors
 ///
 /// Returns an error for redirected or special entries, source mutation,
-/// destination conflicts, size-limit violations, or a receipt mismatch.
+/// destination conflicts, entry/path-limit violations, or a receipt mismatch.
 pub(crate) fn migrate_legacy_principal_logs(
     home: &AstridHome,
     directory: &PrincipalDirectory,
@@ -164,8 +165,7 @@ fn inventory(source: &Path, source_device: u64) -> io::Result<Vec<LogEntry>> {
     astrid_core::platform_fs::ensure_private_directory_tree(source)?;
     astrid_core::platform_fs::verify_no_redirects(source)?;
     let mut entries = Vec::new();
-    let mut total = 0_u64;
-    walk_inventory(source, source, source_device, &mut entries, &mut total)?;
+    walk_inventory(source, source, source_device, &mut entries)?;
     Ok(entries)
 }
 
@@ -174,7 +174,6 @@ fn walk_inventory(
     current: &Path,
     source_device: u64,
     entries: &mut Vec<LogEntry>,
-    total: &mut u64,
 ) -> io::Result<()> {
     let mut children = fs::read_dir(current)?.collect::<Result<Vec<_>, _>>()?;
     children.sort_by_key(std::fs::DirEntry::file_name);
@@ -204,19 +203,10 @@ fn walk_inventory(
             return Err(invalid(&path, "non-canonical relative log path"));
         }
         if metadata.is_dir() {
-            walk_inventory(root, &path, source_device, entries, total)?;
+            walk_inventory(root, &path, source_device, entries)?;
             continue;
         }
         let (bytes, digest) = digest_file(&path, source_device)?;
-        *total = total
-            .checked_add(bytes)
-            .ok_or_else(|| io::Error::other("legacy log byte count overflow"))?;
-        if *total > MAX_BYTES {
-            return Err(invalid(
-                root,
-                "legacy log tree exceeds migration byte limit",
-            ));
-        }
         entries.push(LogEntry {
             relative,
             bytes,
@@ -560,6 +550,84 @@ fn conflict(path: &Path, detail: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_historical_logs_are_preserved_and_retry_is_idempotent() {
+        use std::io::{Seek, SeekFrom};
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(temp.path().join("astrid"));
+        let principal = PrincipalId::new("alice").unwrap();
+        let uid = PrincipalUid::from_bytes([0x96; 32]);
+        let directory = PrincipalDirectory::default();
+        directory.register(principal.clone(), uid).unwrap();
+        let source = home.principal_home(&principal).log_dir();
+        astrid_core::platform_fs::ensure_private_directory(&source).unwrap();
+        let source_file = source.join("removed-capsule.log");
+        let length = 65 * 1024 * 1024;
+        astrid_core::platform_fs::atomic_write_private_file(&source_file, b"").unwrap();
+        let mut file = OpenOptions::new().write(true).open(&source_file).unwrap();
+        file.set_len(length).unwrap();
+        file.seek(SeekFrom::End(-4)).unwrap();
+        file.write_all(b"tail").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let expected = digest_file(
+            &source_file,
+            device_id(&fs::metadata(&source_file).unwrap()),
+        )
+        .unwrap();
+
+        migrate_legacy_principal_logs(&home, &directory).unwrap();
+
+        let destination = destination_root(&home, uid).join("removed-capsule.log");
+        assert_eq!(
+            digest_file(
+                &destination,
+                device_id(&fs::metadata(&destination).unwrap())
+            )
+            .unwrap(),
+            expected
+        );
+        assert!(!source.exists());
+        let receipt = fs::read(receipt_path(&home, uid)).unwrap();
+        // Recreate the receipt-committed/source-not-yet-retired crash boundary.
+        astrid_core::platform_fs::ensure_private_directory(&source).unwrap();
+        fs::copy(&destination, &source_file).unwrap();
+        migrate_legacy_principal_logs(&home, &directory).unwrap();
+        assert!(!source.exists());
+        assert_eq!(fs::read(receipt_path(&home, uid)).unwrap(), receipt);
+    }
+
+    #[test]
+    fn conflicting_log_destination_preserves_source_and_does_not_publish_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(temp.path().join("astrid"));
+        let principal = PrincipalId::new("alice").unwrap();
+        let uid = PrincipalUid::from_bytes([0x97; 32]);
+        let directory = PrincipalDirectory::default();
+        directory.register(principal.clone(), uid).unwrap();
+        let source = home.principal_home(&principal).log_dir();
+        let destination = destination_root(&home, uid);
+        for root in [&source, &destination] {
+            astrid_core::platform_fs::ensure_private_directory(root).unwrap();
+        }
+        astrid_core::platform_fs::atomic_write_private_file(&source.join("capsule.log"), b"source")
+            .unwrap();
+        astrid_core::platform_fs::atomic_write_private_file(
+            &destination.join("capsule.log"),
+            b"conflict",
+        )
+        .unwrap();
+
+        assert!(migrate_legacy_principal_logs(&home, &directory).is_err());
+        assert_eq!(fs::read(source.join("capsule.log")).unwrap(), b"source");
+        assert_eq!(
+            fs::read(destination.join("capsule.log")).unwrap(),
+            b"conflict"
+        );
+        assert!(!receipt_path(&home, uid).exists());
+    }
 
     #[test]
     fn migrates_logs_to_uid_projection_and_is_idempotent() {

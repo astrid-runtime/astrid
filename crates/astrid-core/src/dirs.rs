@@ -2,10 +2,12 @@
 //!
 //! Two key directory structures:
 //!
-//! - [`AstridHome`]: Global state at `~/.astrid/` (or `$ASTRID_HOME`).
-//!   Linux FHS-aligned layout with `etc/`, `var/`, `run/`, `log/`, `keys/`,
-//!   `bin/`, and `lib/`. Principal content is stored in the authoritative
-//!   `AstridFilesystem`; a native `home/` tree is only a legacy import source.
+//! - [`AstridHome`]: Global durable root at `~/.astrid/` (or `$ASTRID_HOME`).
+//!   Stopped state is exactly the private `astrid.volume` media file. Before
+//!   that volume exists, capsule signing may leave only the private runtime-key
+//!   bootstrap that storage ingests on first open. While a daemon runs,
+//!   volume-backed files are projected at their historical paths; transients
+//!   use `ASTRID_RUN_DIR` or a disposable runtime directory.
 //!
 //! - [`WorkspaceDir`]: Selected per-project state directory.
 //!   Holds project configuration, capsules, hooks, and instructions.
@@ -19,27 +21,7 @@
 //!
 //! ```text
 //! ~/.astrid/                           (AstridHome)
-//! ├── etc/
-//! │   ├── config.toml                    deployment config
-//! │   ├── servers.toml                   MCP server config
-//! │   ├── gateway.toml                   daemon config
-//! │   ├── hooks/                         system hooks
-//! │   └── layout-version                 layout version sentinel
-//! ├── var/
-//! │   ├── astrid.volume                  hosted Astrid-owned storage volume
-//! │   ├── content-staging/                private acknowledged-write staging
-//! │   ├── migrations/                     durable layout intents and receipts
-//! │   └── state.db/                      temporary legacy import source (removed after verification)
-//! ├── run/                               ephemeral runtime state
-//! │   ├── system.sock
-//! │   ├── system.token
-//! │   ├── system.ready
-//! │   ├── deferred.db/                   deferred queue (ephemeral)
-//! │   └── principals/                    disposable UID-scoped process scratch
-//! ├── log/                               system logs
-//! ├── keys/                              runtime signing key
-//! ├── bin/                               content-addressed compiled WASM binaries
-//! └── lib/                               shared WASM component libraries (WIT, future)
+//! └── astrid.volume                    Astrid-owned durable media (stopped)
 //!
 //! Principal `home/` content is projected from the durable owner catalog and
 //! is not represented by a native directory in a fresh v2 layout.
@@ -58,15 +40,26 @@ use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
 use crate::principal::PrincipalId;
-use uuid::Uuid;
 
-/// Current layout version. Written to `etc/layout-version` on first boot.
+/// Current layout version. Historical sentinels are migration inputs only.
 pub const LAYOUT_VERSION: &str = "2";
 /// Latest released layout accepted for an in-place upgrade.
 pub const LEGACY_LAYOUT_VERSION: &str = "1";
 #[path = "dirs_layout.rs"]
 mod dirs_layout;
-pub use dirs_layout::{LayoutMigrationTarget, retire_legacy_source_tree};
+pub use dirs_layout::{
+    LayoutMigrationTarget, preserve_legacy_source_tree, retire_legacy_source_tree,
+    retire_runtime_run_directory,
+};
+#[path = "dirs_projection_retirement.rs"]
+mod projection_retirement;
+pub use projection_retirement::retire_projection_root;
+#[path = "dirs_run_dir.rs"]
+mod run_dir;
+mod stopped_key;
+#[path = "dirs_workspace.rs"]
+mod workspace_dir;
+pub use workspace_dir::WorkspaceDir;
 /// Default per-project runtime state directory.
 pub const DEFAULT_WORKSPACE_STATE_DIR: &str = ".astrid";
 
@@ -258,6 +251,14 @@ pub struct AstridHome {
     root: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnsentinelledRootState {
+    Empty,
+    RuntimeKeyBootstrap,
+    StoppedVolume,
+    StoppedKeyRecovery,
+}
+
 impl AstridHome {
     /// Resolve the home directory.
     ///
@@ -325,18 +326,43 @@ impl AstridHome {
         Self { root: root.into() }
     }
 
-    /// Ensure the system directory structure exists with secure permissions.
+    /// Stable control lock outside the disposable runtime projection.
     ///
-    /// Creates the common private skeleton. New homes initialize at the current
-    /// layout; released v1 homes remain there until the kernel verifies durable
-    /// migration and calls [`Self::complete_layout_v2`]. Directories are `0o700`
-    /// on Unix. `capsules/` is not created eagerly; user installs use principal
-    /// storage until an operator install mechanism exists.
+    /// Unlike `run/system.lock`, this inode survives volume-only retirement.
+    /// Physical path resolution makes aliases of the same home share a fence.
+    /// The private sibling control directory is independent of process TMPDIR.
+    ///
+    /// # Errors
+    /// Returns an error if the existing ancestor cannot be resolved.
+    pub fn lifecycle_lock_path(&self) -> io::Result<PathBuf> {
+        let root = run_dir::physical_path(self.root())?;
+        let digest = blake3::hash(root.as_os_str().as_encoded_bytes());
+        let parent = root.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "runtime root has no control parent",
+            )
+        })?;
+        Ok(parent
+            .join(format!("astrid-lifecycle-{digest}"))
+            .join("runtime.lock"))
+    }
+
+    /// Validate the durable root without creating a parallel state tree.
+    ///
+    /// Fresh initialization leaves only the private root for the storage layer
+    /// to fill with `astrid.volume`. The sole pre-volume exception is the
+    /// private runtime-key bootstrap that storage ingests on first open.
+    /// Released homes retain their historical directories and sentinel as
+    /// one-time migration inputs until verified cutover. Running projections
+    /// are created later from mounted volume state, never by this admission
+    /// boundary.
     ///
     /// # Errors
     ///
     /// Returns an error if directory creation or permission setting fails.
     pub fn ensure(&self) -> io::Result<()> {
+        self.validate_run_dir()?;
         let existing_layout = self.layout_version()?;
         if let Some(version) = existing_layout.as_deref()
             && version != LEGACY_LAYOUT_VERSION
@@ -358,52 +384,36 @@ impl AstridHome {
                         ),
                     ));
                 },
-                Ok(_)
-                    if std::fs::read_dir(self.root())?
-                        .next()
-                        .transpose()?
-                        .is_some() =>
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "refusing to initialize non-empty Astrid home without etc/layout-version: {}",
-                            self.root().display()
-                        ),
-                    ));
-                },
                 Ok(_) => {},
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {},
                 Err(error) => return Err(error),
             }
         }
-        let dirs = [
-            self.etc_dir(),
-            self.hooks_dir(),
-            self.var_dir(),
-            self.run_dir(),
-            self.log_dir(),
-            self.keys_dir(),
-            self.bin_dir(),
-            self.wit_dir(),
-            self.wit_store_dir(),
-        ];
-
-        #[cfg(windows)]
+        let mut dirs = Vec::<PathBuf>::new();
+        if existing_layout.as_deref() == Some(LEGACY_LAYOUT_VERSION) {
+            dirs.extend([
+                self.etc_dir(),
+                self.hooks_dir(),
+                self.var_dir(),
+                self.run_dir(),
+                self.log_dir(),
+                self.keys_dir(),
+                self.bin_dir(),
+                self.wit_dir(),
+                self.wit_store_dir(),
+            ]);
+        }
         crate::platform_fs::ensure_private_directory(self.root())?;
-
         for dir in &dirs {
             crate::platform_fs::ensure_private_directory(dir)?;
         }
 
         match existing_layout.as_deref() {
             None => {
-                self.ensure_layout_v2_dirs()?;
-                self.write_layout_version(LAYOUT_VERSION)?;
+                self.validate_fresh_root_entries()?;
             },
             Some(LEGACY_LAYOUT_VERSION) => {},
             Some(LAYOUT_VERSION) => {
-                self.ensure_layout_v2_dirs()?;
                 // Before the singleton-owned migration barrier, v2 boot only
                 // validates legacy paths (redirects/special entries fail closed).
                 // The barrier owns source admission/receipts; complete_layout_v2
@@ -413,7 +423,9 @@ impl AstridHome {
             Some(_) => unreachable!("layout version was validated before directory creation"),
         }
         #[cfg(windows)]
-        crate::platform_fs::restrict_private_file(&self.layout_version_path())?;
+        if self.layout_version_path().exists() {
+            crate::platform_fs::restrict_private_file(&self.layout_version_path())?;
+        }
 
         #[cfg(unix)]
         {
@@ -432,6 +444,129 @@ impl AstridHome {
                     crate::platform_fs::validate_private_file(&private_file)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Validate that this home may provision or reuse a runtime identity.
+    ///
+    /// A sentinel-free root containing only `astrid.volume` is the canonical
+    /// stopped representation. Creating `keys/runtime.key` beside that volume
+    /// would turn the stopped root into an inadmissible mixed state, so callers
+    /// must pass this read-only preflight before creating either sidecar.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported layouts, unsafe fresh-root entries, or
+    /// the stopped volume-only representation.
+    pub fn validate_runtime_identity_provisioning(&self) -> io::Result<()> {
+        match self.layout_version()?.as_deref() {
+            Some(LEGACY_LAYOUT_VERSION | LAYOUT_VERSION) => return Ok(()),
+            Some(version) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported Astrid home layout version {version:?}"),
+                ));
+            },
+            None => {},
+        }
+
+        match std::fs::symlink_metadata(self.root()) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Astrid home without a layout sentinel is redirected or not a directory: {}",
+                        self.root().display()
+                    ),
+                ));
+            },
+            Ok(_) => {},
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        crate::platform_fs::validate_private_directory(self.root())?;
+
+        if matches!(
+            self.validate_fresh_root_entries()?,
+            UnsentinelledRootState::StoppedVolume | UnsentinelledRootState::StoppedKeyRecovery
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stopped Astrid durable root cannot provision runtime identity sidecars",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_fresh_root_entries(&self) -> io::Result<UnsentinelledRootState> {
+        if self.requires_stopped_key_recovery()? {
+            return Ok(UnsentinelledRootState::StoppedKeyRecovery);
+        }
+        let mut entries = self.root().read_dir()?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        if entries.len() == 1 && entries[0].file_name() == std::ffi::OsStr::new("keys") {
+            self.validate_runtime_key_bootstrap(&entries[0].path())?;
+            return Ok(UnsentinelledRootState::RuntimeKeyBootstrap);
+        }
+        let mut state = UnsentinelledRootState::Empty;
+        for entry in entries {
+            let path = entry.path();
+            if entry.file_name() != std::ffi::OsStr::new("astrid.volume") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unadmitted entry in a fresh Astrid durable root: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Astrid durable media is redirected or not a regular file: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            crate::platform_fs::validate_private_file(&path)?;
+            state = UnsentinelledRootState::StoppedVolume;
+        }
+        Ok(state)
+    }
+
+    /// Recognize the precise replacement-key residue left by older installers.
+    ///
+    /// This is structural recognition, not admission of either file's bytes.
+    /// Storage must validate existing volume authority under the boot singleton
+    /// before preserving the sidecar and restoring the volume-owned key.
+    /// Identity provisioning remains forbidden for this stopped representation.
+    ///
+    /// # Errors
+    /// Returns an error for redirected, foreign-owned, writable or malformed
+    /// entries in the otherwise exact volume-and-runtime-key shape.
+    pub fn requires_stopped_key_recovery(&self) -> io::Result<bool> {
+        stopped_key::recognize(self)
+    }
+
+    fn validate_runtime_key_bootstrap(&self, keys_dir: &Path) -> io::Result<()> {
+        crate::platform_fs::validate_private_directory(keys_dir)?;
+        let mut entries = keys_dir.read_dir()?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            if path != self.runtime_key_path() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unadmitted entry in the fresh runtime-key bootstrap: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            crate::platform_fs::validate_private_file(&path)?;
         }
         Ok(())
     }
@@ -531,7 +666,23 @@ impl AstridHome {
     /// Ephemeral runtime directory (`run/`).
     #[must_use]
     pub fn run_dir(&self) -> PathBuf {
-        self.root.join("run")
+        run_dir::configured_path(self).unwrap_or_else(|_| self.root.join("run"))
+    }
+
+    /// Reject an `ASTRID_RUN_DIR` override that can overlap durable authority.
+    ///
+    /// Admission calls this before creating the durable root or any running
+    /// projection. Path-only callers get a disposable fallback below the root
+    /// rather than a sentinel file, but they must never drive lifecycle work
+    /// without first passing [`Self::ensure`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the override is empty, relative, traverses a
+    /// parent, is redirected, or is physically equal to, inside, or a parent
+    /// of the durable root.
+    pub fn validate_run_dir(&self) -> io::Result<()> {
+        run_dir::validate(self)
     }
 
     /// Portable endpoint token for the kernel's host-local transport.
@@ -795,185 +946,6 @@ impl PrincipalHome {
     #[must_use]
     pub fn env_dir(&self) -> PathBuf {
         self.root.join(".config").join("env")
-    }
-}
-
-// ── WorkspaceDir (per-project) ───────────────────────────────────────────
-
-/// Selected per-project workspace state directory.
-///
-/// Contains project-local runtime state. A `workspace-id` UUID links the
-/// project to its global state in `~/.astrid/`.
-#[derive(Debug, Clone)]
-pub struct WorkspaceDir {
-    /// The project root containing the selected state directory.
-    project_root: PathBuf,
-    layout: WorkspaceLayout,
-}
-
-impl WorkspaceDir {
-    /// Detect the workspace directory by walking up from `start_dir`.
-    ///
-    /// Detection order:
-    /// 1. Directory containing the selected state directory
-    /// 2. Directory containing `.git`
-    /// 3. Directory containing `ASTRID.md`
-    /// 4. Fallback to `start_dir` itself
-    #[must_use]
-    pub fn detect(start_dir: &Path) -> Self {
-        Self::detect_with_layout(start_dir, WorkspaceLayout::default())
-    }
-
-    /// Detect the workspace directory using `layout`.
-    #[must_use]
-    pub fn detect_with_layout(start_dir: &Path, layout: WorkspaceLayout) -> Self {
-        let start = if start_dir.is_absolute() {
-            start_dir.to_path_buf()
-        } else {
-            std::env::current_dir().unwrap_or_default().join(start_dir)
-        };
-
-        let mut current = start.as_path();
-
-        loop {
-            if layout.state_dir(current).is_dir() {
-                return Self {
-                    project_root: current.to_path_buf(),
-                    layout,
-                };
-            }
-            if current.join(".git").exists() {
-                return Self {
-                    project_root: current.to_path_buf(),
-                    layout,
-                };
-            }
-            if current.join("ASTRID.md").exists() {
-                return Self {
-                    project_root: current.to_path_buf(),
-                    layout,
-                };
-            }
-            match current.parent() {
-                Some(parent) if parent != current => current = parent,
-                _ => break,
-            }
-        }
-
-        Self {
-            project_root: start,
-            layout,
-        }
-    }
-
-    /// Create from an explicit project root (useful for testing).
-    #[must_use]
-    pub fn from_path(project_root: impl Into<PathBuf>) -> Self {
-        Self::from_path_with_layout(project_root, WorkspaceLayout::default())
-    }
-
-    /// Create from an explicit project root and layout.
-    #[must_use]
-    pub fn from_path_with_layout(
-        project_root: impl Into<PathBuf>,
-        layout: WorkspaceLayout,
-    ) -> Self {
-        Self {
-            project_root: project_root.into(),
-            layout,
-        }
-    }
-
-    /// Ensure the selected state directory exists and generate a workspace ID
-    /// if one does not already exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if directory creation or workspace ID generation fails.
-    pub fn ensure(&self) -> io::Result<()> {
-        let selection = self.layout.resolve(&self.project_root)?;
-        selection.ensure_state_dir()?;
-        let _ = self.workspace_id()?;
-        selection.verify()?;
-        Ok(())
-    }
-
-    /// Resolve this workspace through the checked filesystem boundary.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the project root or selected state path is unsafe.
-    pub fn selection(&self) -> io::Result<WorkspaceSelection> {
-        self.layout.resolve(&self.project_root)
-    }
-
-    /// Project root directory containing the selected state directory.
-    #[must_use]
-    pub fn root(&self) -> &Path {
-        &self.project_root
-    }
-
-    /// The selected project state directory.
-    #[must_use]
-    pub fn dot_astrid(&self) -> PathBuf {
-        self.layout.state_dir(&self.project_root)
-    }
-
-    /// The active per-project runtime state directory.
-    #[must_use]
-    pub fn state_dir(&self) -> PathBuf {
-        self.layout.state_dir(&self.project_root)
-    }
-
-    /// The active workspace layout.
-    #[must_use]
-    pub fn layout(&self) -> &WorkspaceLayout {
-        &self.layout
-    }
-
-    /// Capsules under the selected project state directory.
-    #[must_use]
-    pub fn capsules_dir(&self) -> PathBuf {
-        self.dot_astrid().join("capsules")
-    }
-
-    /// Path to the workspace-id file under selected project state.
-    #[must_use]
-    pub fn workspace_id_path(&self) -> PathBuf {
-        self.dot_astrid().join("workspace-id")
-    }
-
-    /// Read or generate the workspace ID.
-    ///
-    /// If the file exists (e.g. cloned from a repo), its UUID is adopted.
-    /// Otherwise a new UUID is generated and written.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the file cannot be read or written.
-    pub fn workspace_id(&self) -> io::Result<Uuid> {
-        let selection = self.selection()?;
-        selection.ensure_state_dir()?;
-        let path = selection.resolve_file("workspace-id")?;
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            let trimmed = content.trim();
-            if let Ok(id) = Uuid::parse_str(trimmed) {
-                selection.verify()?;
-                return Ok(id);
-            }
-        }
-        let id = Uuid::new_v4();
-        selection.verify()?;
-        std::fs::write(&path, id.to_string())?;
-        selection.resolve_file("workspace-id")?;
-        selection.verify()?;
-        Ok(id)
-    }
-
-    /// Path to project instructions under selected project state.
-    #[must_use]
-    pub fn instructions_path(&self) -> PathBuf {
-        self.dot_astrid().join("ASTRID.md")
     }
 }
 

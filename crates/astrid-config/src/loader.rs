@@ -87,6 +87,7 @@ pub fn load_with_layout(
     // 2. System config (/etc/astrid/config.toml).
     let system_path = PathBuf::from("/etc/astrid/config.toml");
     if let Some(overlay) = try_load_file(&system_path)? {
+        reject_legacy_model_section(&overlay, &system_path.display().to_string())?;
         deep_merge_tracking(
             &mut merged,
             &overlay,
@@ -108,6 +109,7 @@ pub fn load_with_layout(
     };
 
     if let Some((overlay, path)) = user_config {
+        reject_legacy_model_section(&overlay, &path.display().to_string())?;
         deep_merge_tracking(
             &mut merged,
             &overlay,
@@ -145,8 +147,10 @@ pub fn load_with_layout(
                 source,
             })?;
         if let Some(mut overlay) = workspace_overlay {
+            reject_legacy_model_section(&overlay, &ws_path.display().to_string())?;
+
             // Resolve ${VAR} references in workspace overlay with restricted
-            // env vars (only ASTRID_* and ANTHROPIC_*). This prevents a
+            // env vars (only ASTRID_*). This prevents a
             // malicious workspace config from exfiltrating sensitive env vars.
             resolve_env_references_restricted(&mut overlay, &env_vars);
 
@@ -228,10 +232,19 @@ pub fn load_file(path: &Path) -> ConfigResult<Config> {
         source: e,
     })?;
 
-    let config: Config = toml::from_str(&content).map_err(|e| ConfigError::ParseError {
+    let value: toml::Value = toml::from_str(&content).map_err(|e| ConfigError::ParseError {
         path: path.display().to_string(),
         source: e,
     })?;
+    reject_legacy_model_section(&value, &path.display().to_string())?;
+
+    let config: Config =
+        value
+            .try_into()
+            .map_err(|e: toml::de::Error| ConfigError::ParseError {
+                path: path.display().to_string(),
+                source: e,
+            })?;
 
     validate::validate(&config)?;
     Ok(config)
@@ -329,6 +342,24 @@ fn validate_astrid_home(raw_path: &str, home_dir: &Path) -> Option<PathBuf> {
     Some(canonical)
 }
 
+/// Reject host-owned model configuration before any credential can be merged.
+///
+/// Model execution is capsule-owned. The old host `[model]` table is not a
+/// compatibility surface: accepting it would either silently ignore operator
+/// settings or carry provider credentials through the host config pipeline.
+fn reject_legacy_model_section(config: &toml::Value, path: &str) -> ConfigResult<()> {
+    if config.get("model").is_some() {
+        return Err(ConfigError::ValidationError {
+            field: "model".to_owned(),
+            message: format!(
+                "legacy host [model] in {path} is no longer supported; move model/provider \
+                 selection to a principal-scoped capsule using capsule [env] and the model registry"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Determine the user's home directory.
 fn home_directory() -> ConfigResult<PathBuf> {
     directories::BaseDirs::new()
@@ -359,7 +390,7 @@ mod tests {
     #[test]
     fn test_defaults_parse() {
         let val: toml::Value = toml::from_str(DEFAULTS_TOML).unwrap();
-        assert!(val.as_table().unwrap().contains_key("model"));
+        assert!(!val.as_table().unwrap().contains_key("model"));
         assert!(val.as_table().unwrap().contains_key("runtime"));
         assert!(val.as_table().unwrap().contains_key("security"));
     }
@@ -367,8 +398,7 @@ mod tests {
     #[test]
     fn test_defaults_deserialize_to_config() {
         let config: Config = toml::from_str(DEFAULTS_TOML).unwrap();
-        assert_eq!(config.model.provider, "unknown");
-        assert_eq!(config.model.max_tokens, 4096);
+        assert_eq!(config.runtime.max_context_tokens, 100_000);
         assert!((config.budget.session_max_usd - 100.0).abs() < f64::EPSILON);
         assert_eq!(config.timeouts.request_secs, 120);
         assert_eq!(config.timeouts.daemon_ready_secs, 600);
@@ -393,12 +423,12 @@ mod tests {
         std::fs::create_dir_all(&alternate_dir).unwrap();
         std::fs::write(
             default_dir.join("config.toml"),
-            "[model]\nprovider = \"openai\"\n",
+            "[runtime]\nsystem_prompt = \"default\"\n",
         )
         .unwrap();
         std::fs::write(
             alternate_dir.join("config.toml"),
-            "[model]\nprovider = \"claude\"\n",
+            "[runtime]\nsystem_prompt = \"alternate\"\n",
         )
         .unwrap();
 
@@ -406,7 +436,7 @@ mod tests {
         let resolved =
             load_with_layout(Some(workspace.path()), Some(home.path()), &layout).unwrap();
 
-        assert_eq!(resolved.config.model.provider, "claude");
+        assert_eq!(resolved.config.runtime.system_prompt, "alternate");
         assert!(
             resolved
                 .loaded_files
@@ -471,7 +501,7 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(
             outside.path().join("config.toml"),
-            "[model]\nprovider = \"claude\"\n",
+            "[runtime]\nsystem_prompt = \"outside\"\n",
         )
         .unwrap();
         symlink(outside.path(), workspace.path().join(".alternate-runtime")).unwrap();
@@ -490,7 +520,7 @@ mod tests {
         let state = workspace.path().join(".alternate-runtime");
         std::fs::create_dir(&state).unwrap();
         let outside = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(outside.path(), "[model]\nprovider = \"claude\"\n").unwrap();
+        std::fs::write(outside.path(), "[runtime]\nsystem_prompt = \"outside\"\n").unwrap();
         symlink(outside.path(), state.join("config.toml")).unwrap();
 
         let layout = WorkspaceLayout::new(".alternate-runtime").unwrap();
@@ -518,16 +548,16 @@ mod tests {
         std::fs::write(
             home_astrid.join("config.toml"),
             r#"
-            [model]
-            provider = "home"
+            [runtime]
+            system_prompt = "home"
             "#,
         )
         .unwrap();
         std::fs::write(
             astrid_home.path().join("config.toml"),
             r#"
-            [model]
-            provider = "astrid-home"
+            [runtime]
+            system_prompt = "astrid-home"
             "#,
         )
         .unwrap();
@@ -551,9 +581,9 @@ mod tests {
     fn test_record_defaults() {
         let val: toml::Value = toml::from_str(
             r#"
-            [model]
-            provider = "claude"
-            max_tokens = 4096
+            [runtime]
+            system_prompt = "seed"
+            keep_recent_count = 10
         "#,
         )
         .unwrap();
@@ -561,57 +591,75 @@ mod tests {
         let mut sources = FieldSources::new();
         record_defaults(&val, "", &mut sources);
 
-        assert_eq!(sources.get("model.provider"), Some(&ConfigLayer::Defaults));
         assert_eq!(
-            sources.get("model.max_tokens"),
+            sources.get("runtime.system_prompt"),
+            Some(&ConfigLayer::Defaults)
+        );
+        assert_eq!(
+            sources.get("runtime.keep_recent_count"),
             Some(&ConfigLayer::Defaults)
         );
     }
 
-    // ---- Step 1: Debug/Serialize redaction ----
+    // ---- Legacy host model configuration ----
 
     #[test]
-    fn test_model_config_debug_redacts_api_key() {
-        use crate::types::ModelConfig;
-        let cfg = ModelConfig {
-            api_key: Some("sk-secret-12345".to_owned()),
-            api_url: Some("https://my-proxy.example.com".to_owned()),
-            ..ModelConfig::default()
-        };
+    fn legacy_user_model_section_fails_with_migration_guidance() {
+        let astrid_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            astrid_home.path().join("config.toml"),
+            r#"
+            [model]
+            provider = "claude"
+            api_key = "sk-host-secret"
+            "#,
+        )
+        .unwrap();
 
-        let debug_str = format!("{cfg:?}");
-        assert!(
-            !debug_str.contains("sk-secret-12345"),
-            "Debug output must not contain API key value"
-        );
-        assert!(
-            !debug_str.contains("my-proxy.example.com"),
-            "Debug output must not contain API URL value"
-        );
-        assert!(debug_str.contains("has_api_key: true"));
-        assert!(debug_str.contains("has_api_url: true"));
+        let result = load_with_layout(None, Some(astrid_home.path()), &WorkspaceLayout::default());
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("legacy host [model]"));
+        assert!(error.contains("principal-scoped capsule"));
+        assert!(error.contains("model registry"));
+        assert!(!error.contains("sk-host-secret"));
     }
 
     #[test]
-    fn test_model_config_serialize_omits_api_key() {
-        use crate::types::ModelConfig;
-        let cfg = ModelConfig {
-            api_key: Some("sk-secret-12345".to_owned()),
-            api_url: Some("https://my-proxy.example.com".to_owned()),
-            ..ModelConfig::default()
-        };
+    fn legacy_workspace_model_section_fails_before_env_resolution() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = workspace.path().join(".astrid");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            state.join("config.toml"),
+            r#"
+            [model]
+            api_key = "${ANTHROPIC_API_KEY}"
+            "#,
+        )
+        .unwrap();
 
-        let json = serde_json::to_string(&cfg).unwrap();
-        assert!(
-            !json.contains("sk-secret-12345"),
-            "Serialized output must not contain API key"
+        let result = load_with_layout(
+            Some(workspace.path()),
+            Some(home.path()),
+            &WorkspaceLayout::default(),
         );
-        assert!(
-            !json.contains("my-proxy.example.com"),
-            "Serialized output must not contain API URL"
-        );
-        assert!(!json.contains("api_key"));
-        assert!(!json.contains("api_url"));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn legacy_model_section_fails_single_file_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[model]\napi_key = \"sk-host-secret\"\n").unwrap();
+
+        let error = load_file(&path).unwrap_err().to_string();
+
+        assert!(error.contains("legacy host [model]"));
+        assert!(error.contains("capsule [env]"));
+        assert!(!error.contains("sk-host-secret"));
     }
 
     #[test]

@@ -27,7 +27,8 @@ MUSL_TARGETS = (
     "x86_64-unknown-linux-musl",
 )
 WINDOWS_TARGETS = ("x86_64-pc-windows-msvc",)
-EXTENSION_TARGETS = (*MUSL_TARGETS, *WINDOWS_TARGETS)
+EXTENSION_TARGETS = MUSL_TARGETS
+PARKED_WINDOWS_TARGETS = WINDOWS_TARGETS
 ROOT_KEYS = {
     "schema-version",
     "kind",
@@ -80,6 +81,22 @@ def canonical_version(value: object) -> str:
     return value
 
 
+def is_release_candidate(version: str) -> bool:
+    return re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)-rc\.[1-9][0-9]*", version) is not None
+
+
+def validate_channel_version(channel: str, version: str) -> None:
+    canonical_version(version)
+    if channel == "nightly":
+        if nightly_source_commit(version) is None:
+            fail("nightly channel must point to an exact nightly prerelease")
+    elif channel not in ("stable", "dev"):
+        fail("unknown release channel")
+    elif "-" in version or "+" in version:
+        if channel != "dev" or not is_release_candidate(version):
+            fail("stable and dev require canonical releases; only dev permits X.Y.Z-rc.N")
+
+
 def nightly_source_commit(version: str) -> str | None:
     match = NIGHTLY.fullmatch(version)
     if match is None:
@@ -112,13 +129,15 @@ def expected_asset(version: str, target: str) -> str:
 
 
 def validate_release_checksum_names(entries: dict[str, str], version: str, label: str) -> None:
-    """Keep the fixed-platform manifest compatible with combined checksums."""
+    """Keep fixed and musl manifests compatible with parked combined checksums."""
     legacy = {expected_asset(version, target) for target in TARGETS}
-    combined = legacy | {expected_asset(version, target) for target in EXTENSION_TARGETS}
-    if set(entries) not in (legacy, combined):
+    musl = legacy | {expected_asset(version, target) for target in EXTENSION_TARGETS}
+    parked = musl | {expected_asset(version, target) for target in PARKED_WINDOWS_TARGETS}
+    if set(entries) not in (legacy, musl, parked):
         fail(
             f"{label} must contain exactly the four fixed release archives, "
-            "optionally plus all three extension archives"
+            "optionally plus both musl extension archives, or the parked "
+            "seven-archive Windows shape"
         )
 
 

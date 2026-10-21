@@ -117,6 +117,20 @@ fn streaming_matches_slice_for_boundary_and_multilevel_inputs() {
 }
 
 #[test]
+fn streaming_matches_slice_for_a_legacy_odd_profile() {
+    let profile = ChunkingProfile::fastcdc_v2020(65, 256, 1024, 17).unwrap();
+    assert!(profile.uses_legacy_fastcdc_v4());
+    for length in [
+        0, 1, 63, 64, 65, 255, 256, 1023, 1024, 1025, 16_384, 262_144,
+    ] {
+        let bytes = deterministic_bytes(length);
+        for fragment in [1, 7, 257, 4096] {
+            assert_stream_matches_slice(profile, &bytes, fragment);
+        }
+    }
+}
+
+#[test]
 fn streaming_preserves_the_whole_small_file_rule() {
     let profile = ChunkingProfile::ASTRID_V1;
     let bytes = deterministic_bytes(usize::try_from(profile.maximum_bytes()).unwrap());

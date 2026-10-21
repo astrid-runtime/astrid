@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import re
+import subprocess
 import sys
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -41,6 +45,19 @@ def metadata(*packages: dict[str, object]) -> dict[str, object]:
 
 
 class CratePublicationTests(unittest.TestCase):
+    def test_release_guard_matches_actual_workspace_publication_inventory(self) -> None:
+        root = Path(__file__).resolve().parent.parent
+        result = subprocess.run(
+            ["cargo", "metadata", "--locked", "--offline", "--no-deps", "--format-version", "1"],
+            cwd=root, check=True, capture_output=True, text=True,
+        )
+        version = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["package"]["version"]
+        order = crate_publication.publication_order(json.loads(result.stdout), version)
+        script = (root / "scripts/publish_crates_io.sh").read_text()
+        guard = re.search(r'if \[\[ "\$crate_count" != (\d+) \]\]; then', script)
+        self.assertIsNotNone(guard, "publication must retain an explicit inventory guard")
+        self.assertEqual(int(guard.group(1)), len(order), order)
+
     def test_orders_dependencies_before_dependents(self) -> None:
         value = metadata(
             package("astrid-cli", ("astrid-core", None), ("astrid-build", "build")),

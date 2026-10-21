@@ -100,6 +100,8 @@ impl KvAuditStorage {
         }
         let _guard = DURABLE_APPEND_LOCK.lock().await;
         self.recover_append_intents().await?;
+        self.check_registry_state(entries.iter().map(|(entry, _)| *entry))
+            .await?;
         let Some(prepared) = self.prepare_batch(entries).await? else {
             return Ok(vec![false; entries.len()]);
         };
@@ -128,6 +130,9 @@ impl KvAuditStorage {
         entries: &[(&AuditEntry, Option<&AuditEntryId>)],
     ) -> AuditResult<Option<PreparedBatch>> {
         let (global_expected, global) = self.load_global_metadata().await?;
+        // Admission follows the hold as loaded; sealing a segment in this
+        // batch clears it only for later appends.
+        let hold = global.retention_hold.clone();
         let mut prepared = PreparedBatch::new(global_expected, global, entries.len());
         let mut seen_entries = HashSet::with_capacity(entries.len());
         for (entry, expected) in entries {
@@ -149,7 +154,12 @@ impl KvAuditStorage {
         if prepared.global.total_count > prepared.global.cap_entries
             || prepared.global.total_bytes > prepared.global.cap_bytes
         {
-            return Err(AuditError::RetentionCapReached);
+            let Some(hold) = hold else {
+                return Err(AuditError::RetentionCapReached);
+            };
+            // Keep unanchored history over the cap rather than drop it.
+            prepared.global.degraded = true;
+            prepared.global.last_error = Some(hold);
         }
         Ok(Some(prepared))
     }
@@ -433,6 +443,8 @@ fn next_chain_metadata(
         } else {
             prior.seal_ordinal
         },
+        omitted_total: prior.omitted_total,
+        omitted_generation: prior.omitted_generation,
     }
 }
 
@@ -450,6 +462,7 @@ fn update_global_metadata(
     if next.sealed {
         global.sealed_segments = global.sealed_segments.saturating_add(1);
         global.eligible_segments = global.eligible_segments.saturating_add(1);
+        global.retention_hold = None;
     }
 }
 
@@ -565,6 +578,7 @@ mod tests {
             principal.clone(),
             AuditAction::FileRead {
                 path: "/a".to_owned(),
+                actor: None,
             },
             AuthorizationProof::System {
                 reason: "test".to_owned(),
@@ -597,6 +611,7 @@ mod tests {
             principal.clone(),
             AuditAction::FileRead {
                 path: "/b".to_owned(),
+                actor: None,
             },
             AuthorizationProof::System {
                 reason: "test".to_owned(),
@@ -635,6 +650,7 @@ mod tests {
             principal.clone(),
             AuditAction::FileRead {
                 path: path.to_owned(),
+                actor: None,
             },
             AuthorizationProof::System {
                 reason: "test".to_owned(),

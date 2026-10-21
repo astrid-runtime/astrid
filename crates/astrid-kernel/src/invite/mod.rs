@@ -60,6 +60,10 @@ pub const MAX_EXPIRY_SECS: u64 = 60 * 60 * 24 * 30;
 /// only its domain-separated BLAKE3 identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Invite {
+    /// Trusted issuer ownership captured at issue time. Legacy tokens lack it
+    /// and must be reissued rather than attributed to an arbitrary operator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership: Option<astrid_storage::ownership::CreationDelegation>,
     /// `blake3:<hex>` identifier of the complete `astrid_inv_` bearer token.
     pub token_hash: String,
     /// Group new redeemers join.
@@ -808,6 +812,7 @@ mod tests {
     fn prune_removes_expired_and_consumed() {
         let mut v = vec![
             Invite {
+                ownership: None,
                 token_hash: "a".into(),
                 group: "agent".into(),
                 remaining_uses: 1,
@@ -816,6 +821,7 @@ mod tests {
                 metadata: None,
             },
             Invite {
+                ownership: None,
                 token_hash: "b".into(),
                 group: "agent".into(),
                 remaining_uses: 0,
@@ -824,6 +830,7 @@ mod tests {
                 metadata: None,
             },
             Invite {
+                ownership: None,
                 token_hash: "c".into(),
                 group: "agent".into(),
                 remaining_uses: 1,
@@ -844,6 +851,7 @@ mod tests {
         let store = InviteStore::new(dir.path().join("invites.toml"));
         let now = now_epoch();
         let invite = Invite {
+            ownership: None,
             token_hash: hash_token("alice invite"),
             group: "agent".into(),
             remaining_uses: 2,

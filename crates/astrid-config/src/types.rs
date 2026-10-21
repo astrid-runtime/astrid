@@ -8,7 +8,6 @@
 
 use std::collections::HashMap;
 
-use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 
 /// Provider teardown remains bounded even when every phase is slowed.
@@ -25,8 +24,12 @@ pub(crate) const MAX_PROCESS_STOP_PHASE_SECS: u64 = 60;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// LLM model selection and pricing.
-    pub model: ModelConfig,
+    /// Operator-only aggregate resource allocations; absent preserves defaults.
+    pub resources: crate::resources::ResourceConfig,
+    /// Operator-only principal to native responder device bindings; empty disables.
+    pub native_input: crate::native_input::NativeInputConfig,
+    /// Native filesystem presentation, independent of provider identity.
+    pub filesystem: crate::filesystem::FilesystemSection,
     /// Runtime behaviour (context limits, summarisation).
     pub runtime: RuntimeSection,
     /// Signature requirements and approval timeout.
@@ -72,103 +75,6 @@ pub struct Config {
     pub uplinks: Vec<UplinkConfig>,
     /// Pre-configured platform identity links applied at every startup.
     pub identity: IdentitySection,
-}
-
-// ---------------------------------------------------------------------------
-// ModelConfig
-// ---------------------------------------------------------------------------
-
-/// LLM provider selection, endpoint, and token pricing.
-#[derive(Clone, Deserialize)]
-#[serde(default)]
-pub struct ModelConfig {
-    /// Provider identifier (e.g. `"claude"`, `"openai"`).
-    pub provider: String,
-    /// Model name sent to the provider API.
-    pub model: String,
-    /// API key. Prefer environment variables over storing this in a file.
-    #[serde(skip_serializing)]
-    pub api_key: Option<String>,
-    /// Base URL for the provider API (overrides the default endpoint).
-    #[serde(skip_serializing)]
-    pub api_url: Option<String>,
-    /// Maximum tokens to request per completion.
-    pub max_tokens: usize,
-    /// Sampling temperature.
-    pub temperature: f64,
-    /// Context window size in tokens. When set, overrides the provider's
-    /// built-in default for the model. Useful for OpenAI-compatible providers
-    /// where the model name is not recognized.
-    pub context_window: Option<usize>,
-    /// Token pricing used for budget tracking.
-    pub pricing: PricingConfig,
-}
-
-impl std::fmt::Debug for ModelConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ModelConfig")
-            .field("provider", &self.provider)
-            .field("model", &self.model)
-            .field("has_api_key", &self.api_key.is_some())
-            .field("has_api_url", &self.api_url.is_some())
-            .field("max_tokens", &self.max_tokens)
-            .field("temperature", &self.temperature)
-            .field("context_window", &self.context_window)
-            .field("pricing", &self.pricing)
-            .finish()
-    }
-}
-
-impl Serialize for ModelConfig {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("ModelConfig", 6)?;
-        state.serialize_field("provider", &self.provider)?;
-        state.serialize_field("model", &self.model)?;
-        // api_key and api_url are intentionally omitted.
-        state.serialize_field("max_tokens", &self.max_tokens)?;
-        state.serialize_field("temperature", &self.temperature)?;
-        state.serialize_field("context_window", &self.context_window)?;
-        state.serialize_field("pricing", &self.pricing)?;
-        state.end()
-    }
-}
-
-impl Default for ModelConfig {
-    fn default() -> Self {
-        Self {
-            provider: "unknown".to_owned(),
-            model: "unknown".to_owned(),
-            api_key: None,
-            api_url: None,
-            max_tokens: 4096,
-            temperature: 0.7,
-            context_window: None,
-            pricing: PricingConfig::default(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PricingConfig
-// ---------------------------------------------------------------------------
-
-/// Per-token pricing used to compute spend against budget limits.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PricingConfig {
-    /// USD cost per 1 million input tokens.
-    pub input_per_million: f64,
-    /// USD cost per 1 million output tokens.
-    pub output_per_million: f64,
-}
-
-impl Default for PricingConfig {
-    fn default() -> Self {
-        Self {
-            input_per_million: 3.0,
-            output_per_million: 15.0,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -500,44 +406,11 @@ impl Default for ServerSection {
 // AuditConfig
 // ---------------------------------------------------------------------------
 
-/// Audit log storage settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AuditConfig {
-    /// Path to the on-disk audit log. `None` means in-memory only.
-    pub path: Option<String>,
-    /// Maximum size of the audit log in megabytes before rotation.
-    pub max_size_mb: u64,
-    /// Wait after the first queued host-audit event so concurrent host
-    /// calls share one volume persist. Layout-2 signing plus `sync_volume`
-    /// is on-CPU; 50ms left a 27-capsule home at 100% and starved `GetStatus`.
-    pub host_coalesce_ms: u64,
-    /// Max signed host-audit entries per writer flush. Capped at the
-    /// durable audit atomic-batch size (128) so one persist stays one
-    /// `apply_batch` instead of falling back to per-entry CAS.
-    pub host_batch_max: u64,
-    /// In-memory host-audit queue. Producers never block the WASM/tokio
-    /// workers: overflow folds into a pending count instead of `send()`.
-    pub host_queue_capacity: u64,
-    /// Persist allowed `stat`/`exists`/`readdir` as signed `FileRead`
-    /// entries. Default off: POSIX path probes are not OS-level security
-    /// events, and aos-fs issues thousands per second. Denied probes still
-    /// persist as FileRead-Denied.
-    pub host_path_probes: bool,
-}
+pub use crate::audit::{AuditConfig, AuditRetentionConfig};
 
-impl Default for AuditConfig {
-    fn default() -> Self {
-        Self {
-            path: None,
-            max_size_mb: 100,
-            host_coalesce_ms: 5_000,
-            host_batch_max: 128,
-            host_queue_capacity: 4096,
-            host_path_probes: false,
-        }
-    }
-}
+#[path = "audit_format.rs"]
+mod audit_format;
+pub use audit_format::AuditEntryFormat;
 
 // ---------------------------------------------------------------------------
 // KeysConfig
@@ -706,51 +579,7 @@ impl Default for LoggingSection {
 // GatewaySection
 // ---------------------------------------------------------------------------
 
-/// Gateway daemon configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct GatewaySection {
-    /// Directory for gateway runtime state (PID file, socket). `None` uses
-    /// the platform default (e.g. `$XDG_STATE_HOME/astrid`).
-    pub state_dir: Option<String>,
-    /// Path to a secrets file for credential management.
-    pub secrets_file: Option<String>,
-    /// Whether to watch configuration files and reload on change.
-    pub hot_reload: bool,
-    /// Whether to watch plugin directories and hot-reload on file changes.
-    pub watch_plugins: bool,
-    /// Interval (in seconds) between health checks for managed servers.
-    pub health_interval_secs: u64,
-    /// Grace period (in seconds) for a clean shutdown before force-killing
-    /// child processes.
-    pub shutdown_timeout_secs: u64,
-    /// Legacy compatibility field. Ephemeral lifetime is connection-owned and
-    /// this value is ignored; it is omitted from serialized configuration.
-    #[serde(skip_serializing)]
-    pub idle_shutdown_secs: u64,
-    /// Interval (in seconds) between stale session cleanup sweeps.
-    pub session_cleanup_interval_secs: u64,
-    /// When `true`, `send_input` publishes a `user.prompt` IPC event to the
-    /// capsule pipeline instead of running the monolithic runtime turn.
-    /// Default: `false`. Use for testing the capsule pipeline.
-    pub use_capsule_pipeline: bool,
-}
-
-impl Default for GatewaySection {
-    fn default() -> Self {
-        Self {
-            state_dir: None,
-            secrets_file: None,
-            hot_reload: true,
-            watch_plugins: true,
-            health_interval_secs: 30,
-            shutdown_timeout_secs: 30,
-            idle_shutdown_secs: 30,
-            session_cleanup_interval_secs: 60,
-            use_capsule_pipeline: false,
-        }
-    }
-}
+pub use crate::gateway::GatewaySection;
 
 // ---------------------------------------------------------------------------
 // TimeoutsSection
@@ -787,6 +616,10 @@ pub struct TimeoutsSection {
     /// Maximum wait to reap a process-storage provider after it is killed. The
     /// hard ceiling is 60 seconds; workspace config can only tighten it.
     pub process_killed_reap_secs: u64,
+    /// Maximum wait for each native unmount command, killed-child reap, and
+    /// post-command confirmation phase, separately for each projection path.
+    /// The hard ceiling is 60 seconds; workspace config can only tighten it.
+    pub process_unmount_confirm_secs: u64,
 }
 
 impl Default for TimeoutsSection {
@@ -804,6 +637,7 @@ impl Default for TimeoutsSection {
             process_stop_ack_secs: 10,
             process_reap_grace_secs: 10,
             process_killed_reap_secs: 10,
+            process_unmount_confirm_secs: 5,
         }
     }
 }

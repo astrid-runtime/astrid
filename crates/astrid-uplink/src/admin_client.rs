@@ -33,10 +33,6 @@ use uuid::Uuid;
 
 use crate::socket_client::SocketClient;
 
-/// Default timeout for the response read loop. Generous because admin
-/// writes can block on the kernel write lock.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
-
 /// Stable wire-name suffix for an [`AdminRequestKind`].
 ///
 /// Mirrors `admin_request_method` on the kernel side — the suffix is
@@ -52,14 +48,20 @@ pub const fn topic_suffix(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::AgentDisable { .. } => "agent.disable",
         AdminRequestKind::AgentModify { .. } => "agent.modify",
         AdminRequestKind::AgentList => "agent.list",
+        AdminRequestKind::UserPrincipalList => "user.principals",
+        AdminRequestKind::UserPrincipalClaim { .. } => "user.principal.claim",
         AdminRequestKind::QuotaSet { .. } => "quota.set",
+        AdminRequestKind::QuotaAssignUser { .. } => "quota.assign_user",
+        AdminRequestKind::QuotaUserList => "quota.user_list",
         AdminRequestKind::QuotaGet { .. } => "quota.get",
         AdminRequestKind::UsageGet { .. } => "usage.get",
         AdminRequestKind::EnvSet { .. } => "env.set",
+        AdminRequestKind::EnvSetIfAbsent { .. } => "env.set_if_absent",
         AdminRequestKind::EnvList { .. } => "env.list",
         AdminRequestKind::EnvDelete { .. } => "env.delete",
         AdminRequestKind::DistroLockGet { .. } => "distro.lock.get",
         AdminRequestKind::DistroLockSet { .. } => "distro.lock.set",
+        AdminRequestKind::DistroSelfGrant => "distro.self.grant",
         AdminRequestKind::GroupCreate { .. } => "group.create",
         AdminRequestKind::GroupDelete { .. } => "group.delete",
         AdminRequestKind::GroupModify { .. } => "group.modify",
@@ -80,6 +82,10 @@ pub const fn topic_suffix(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::AuditStats => "audit.stats",
         AdminRequestKind::AuditPrune { .. } => "audit.prune",
         AdminRequestKind::AuditHealth => "audit.health",
+        AdminRequestKind::AuditHeads => "audit.heads",
+        AdminRequestKind::AuditExport(_) => "audit.export",
+        AdminRequestKind::AuditAnchorMark(_) => "audit.anchor_mark",
+        AdminRequestKind::AuditAnchorStatus => "audit.anchor_status",
         AdminRequestKind::StorageMountIssue { .. } => "storage.mount.issue",
         AdminRequestKind::StorageMountStatus { .. } => "storage.mount.status",
         AdminRequestKind::StorageMountSync { .. } => "storage.mount.sync",
@@ -115,8 +121,9 @@ impl AdminClient {
     ///
     /// # Errors
     /// Returns an error if the socket file is missing (no daemon),
-    /// connection fails, or the handshake is rejected.
+    /// connection fails, the handshake is rejected, or client configuration is invalid.
     pub async fn connect(caller: PrincipalId) -> Result<Self> {
+        let timeout = Duration::from_secs(astrid_config::client::production_admin_timeout()?);
         let session_id = astrid_core::SessionId::from_uuid(Uuid::new_v4());
         let inner = SocketClient::connect(session_id, caller.clone())
             .await
@@ -124,7 +131,7 @@ impl AdminClient {
         Ok(Self {
             inner,
             caller,
-            timeout: DEFAULT_TIMEOUT,
+            timeout,
         })
     }
 
@@ -311,7 +318,21 @@ mod tests {
             "agent.create"
         );
         assert_eq!(topic_suffix(&AdminRequestKind::AgentList), "agent.list");
+        assert_eq!(
+            topic_suffix(&AdminRequestKind::UserPrincipalList),
+            "user.principals"
+        );
+        assert_eq!(
+            topic_suffix(&AdminRequestKind::UserPrincipalClaim {
+                principal: PrincipalId::default(),
+            }),
+            "user.principal.claim"
+        );
         assert_eq!(topic_suffix(&AdminRequestKind::GroupList), "group.list");
+        assert_eq!(
+            topic_suffix(&AdminRequestKind::QuotaUserList),
+            "quota.user_list"
+        );
         let p = PrincipalId::default();
         assert_eq!(
             topic_suffix(&AdminRequestKind::QuotaGet { principal: p }),

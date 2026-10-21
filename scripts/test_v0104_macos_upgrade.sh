@@ -76,6 +76,7 @@ readonly FIXTURE_SOURCE_REL="crates/astrid-storage/fixtures/v0.10.4-macos-aarch6
 
 REPOSITORY_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly REPOSITORY_ROOT
+. "$REPOSITORY_ROOT/scripts/e2e/hosted-owner-ci.sh"
 readonly CURRENT_BIN_DIR="${ASTRID_CURRENT_BIN_DIR:-${REPOSITORY_ROOT}/target/debug}"
 readonly CAPSULE_SOURCE="${REPOSITORY_ROOT}/e2e/fixtures/astrid-capsule-adversarial"
 CAPSULE_RUSTUP_HOME=""
@@ -144,7 +145,7 @@ ensure_capsule_build_target() {
   [[ -d "${CAPSULE_RUSTUP_HOME}" ]] \
     || fail "Rustup home is not a directory: ${CAPSULE_RUSTUP_HOME}"
 
-  # The published astrid-build runs Cargo with the capsule source as its
+  # The current canonical builder runs Cargo with the capsule source as its
   # current directory. Resolve the toolchain from that exact directory rather
   # than mutating rustup's default toolchain, which can be different in CI.
   active_toolchain="$(cd -- "${CAPSULE_SOURCE}" && rustup show active-toolchain)" \
@@ -168,16 +169,37 @@ ensure_capsule_build_target() {
     || fail "Rust core library for ${CAPSULE_BUILD_TARGET} is missing from ${toolchain}"
 }
 
-run_old_capsule_build_bounded() {
+run_current_capsule_build_bounded() {
   local limit="$1"
   shift
   [[ -n "${CAPSULE_RUSTUP_HOME}" ]] \
     || fail "capsule build toolchain was not initialized"
   (
     cd -- "${WORKSPACE}"
-    run_with_timeout "${limit}" env ASTRID_HOME="${ASTRID_HOME}" HOME="${POISON_HOME}" \
-      RUSTUP_HOME="${CAPSULE_RUSTUP_HOME}" "${OLD_BIN_DIR}/astrid" "$@"
+    # Isolate runtime state, not Cargo's shared host cache and configuration.
+    # Runtime-only calls below still use POISON_HOME to test home resolution.
+    run_with_timeout "${limit}" env ASTRID_HOME="${ASTRID_HOME}" \
+      RUSTUP_HOME="${CAPSULE_RUSTUP_HOME}" "${CURRENT_BIN_DIR}/astrid-build" "$@"
   )
+}
+
+prepare_legacy_capsule_fixture() {
+  ensure_capsule_build_target
+  local dist="${TEST_ROOT}/capsule-dist"
+  local archive="${dist}/astrid-capsule-adversarial.capsule"
+  mkdir -- "${dist}" || fail "capsule archive output already exists"
+  if ! run_current_capsule_build_bounded 180s "${CAPSULE_SOURCE}" --output "${dist}" \
+    >"${TEST_ROOT}/current-capsule-build.log" 2>&1; then
+    cat "${TEST_ROOT}/current-capsule-build.log" >&2
+    fail "current canonical builder could not package the migration fixture"
+  fi
+  [[ -f "${archive}" ]] || fail "current builder did not produce the expected capsule archive"
+  if ! run_old_bounded 180s capsule install --yes \
+    --var adversarial_lifecycle_probe=runtime-lifecycle-ok "${archive}" \
+    >"${TEST_ROOT}/v0104-capsule-install.log" 2>&1; then
+    cat "${TEST_ROOT}/v0104-capsule-install.log" >&2
+    fail "published v0.10.4 CLI could not install the capsule migration fixture archive"
+  fi
 }
 
 run_old() {
@@ -336,7 +358,7 @@ mkdir -p -- "${RELEASE_ROOT}" "${ASTRID_HOME}" "${POISON_HOME}" "${WORKSPACE}"
 : >"${TEST_ROOT}/legacy-capsules"
 : >"${TEST_ROOT}/legacy-profiles"
 
-for binary in astrid astrid-daemon; do
+for binary in astrid astrid-daemon astrid-build; do
   [[ -x "${CURRENT_BIN_DIR}/${binary}" ]] \
     || fail "current ${binary} binary is missing from ${CURRENT_BIN_DIR}"
 done
@@ -383,18 +405,13 @@ compgen -G "${ASTRID_HOME}/var/state.db/manifest/*.manifest" >/dev/null \
 compgen -G "${ASTRID_HOME}/var/state.db/wal/*.wal" >/dev/null \
   || fail "published release did not create a SurrealKV WAL"
 
-# The checked-in adversarial capsule is a real Rust capsule source, so the
-# released CLI can build and install it into the legacy native tree. Do not
-# silently skip package/authority/WIT coverage when the published CLI loses
-# this capability: that is a release-fixture failure, not an optional branch.
-ensure_capsule_build_target
-if ! run_old_capsule_build_bounded 180s capsule install --yes \
-  --var adversarial_lifecycle_probe=runtime-lifecycle-ok \
-  "${CAPSULE_SOURCE}" \
-  >"${TEST_ROOT}/v0104-capsule-install.log" 2>&1; then
-  cat "${TEST_ROOT}/v0104-capsule-install.log" >&2
-  fail "published v0.10.4 CLI could not create the capsule migration fixture"
-fi
+# Build a real archive with the current canonical builder and shared Cargo
+# configuration. The immutable old source builder only searches local target/
+# directories, so it cannot stage this fixture on hosts with a shared target.
+# The actual released CLI must still install the archive and create every
+# legacy package, authority and WIT byte checked below; this is not evidence
+# that the released source builder supports a shared Cargo target directory.
+prepare_legacy_capsule_fixture
 validate_published_capsule_fixture
 printf 'astrid-capsule-adversarial\n' >"${TEST_ROOT}/legacy-capsules"
 
@@ -449,6 +466,15 @@ fi
 run_current agent list --format json >"${TEST_ROOT}/agents-after-upgrade.json"
 grep -Fq 'default' "${TEST_ROOT}/agents-after-upgrade.json" \
   || fail "the released default principal is not visible after upgrade"
+# Explicit CI deployment authority is installed only after the real migration.
+# A populated ownership graph must refuse; never replace or erase it to enroll.
+run_current_bounded 20s stop
+configure_hosted_owner_ci "$TEST_ROOT/hosted-owner" run_current
+if ! run_current_bounded 90s start; then
+  dump_daemon_logs
+  fail "current daemon could not restart for explicit owner enrollment"
+fi
+provision_hosted_owner_ci "$TEST_ROOT/hosted-owner" run_current
 run_current agent create upgrade-restart-probe --yes
 run_current agent create upgrade-second-alias --yes
 run_current_bounded 20s stop
@@ -461,20 +487,24 @@ grep -Fq 'upgrade-restart-probe' "${TEST_ROOT}/agents-after-restart.json" \
   || fail "post-upgrade write did not survive restart"
 grep -Fq 'upgrade-second-alias' "${TEST_ROOT}/agents-after-restart.json" \
   || fail "second post-upgrade principal did not survive restart"
-run_current_bounded 20s stop
 
 python3 - "${ASTRID_HOME}" <<'PY'
 import json
+import stat
 import pathlib
 import sys
 
 home = pathlib.Path(sys.argv[1])
-if (home / "etc/layout-version").read_bytes() != b"2":
-    raise SystemExit("layout-version is not exactly 2")
-if not (home / "var/astrid.volume").is_file():
-    raise SystemExit("Astrid volume is absent after upgrade")
-if (home / "var/astrid.volume").stat().st_size == 0:
+volume = home / "astrid.volume"
+volume_meta = volume.lstat()
+if stat.S_ISLNK(volume_meta.st_mode) or not stat.S_ISREG(volume_meta.st_mode):
+    raise SystemExit("Astrid volume is redirected or not a regular file")
+if volume_meta.st_size == 0:
     raise SystemExit("Astrid volume is empty after upgrade")
+if stat.S_IMODE(volume_meta.st_mode) != 0o600:
+    raise SystemExit("Astrid volume is not private")
+if (home / "etc/layout-version").read_bytes() != b"2":
+    raise SystemExit("projected layout-version is not exactly 2")
 if (home / "var/state.db").exists():
     raise SystemExit("released var/state.db survived verified retirement")
 if (home / "var/principal-store").exists():
@@ -677,6 +707,28 @@ if receipt.get("destination", {}).get("bytes", 0) <= 0:
     raise SystemExit("migration receipt does not bind a non-empty volume")
 PY
 
+run_current_bounded 20s stop
+
+python3 - "${ASTRID_HOME}" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+home = pathlib.Path(sys.argv[1])
+entries = sorted(os.listdir(home))
+if entries != ["astrid.volume"]:
+    raise SystemExit(f"stopped Astrid root has sidecars: {entries}")
+volume = home / "astrid.volume"
+meta = volume.lstat()
+if stat.S_ISLNK(meta.st_mode) or not stat.S_ISREG(meta.st_mode):
+    raise SystemExit("stopped Astrid volume is redirected or not a regular file")
+if stat.S_IMODE(meta.st_mode) != 0o600:
+    raise SystemExit(f"stopped Astrid volume mode is {stat.S_IMODE(meta.st_mode):04o}, expected 0600")
+if meta.st_size == 0:
+    raise SystemExit("stopped Astrid volume is empty")
+PY
+
 
 attempt_mount_round_trip() {
   local provider="${CURRENT_BIN_DIR}/astrid-storage-provider-fskit"
@@ -702,7 +754,11 @@ attempt_mount_round_trip() {
   if [[ ${mount_status} -eq 0 ]]; then
     grep -Eq '^mounted [0-9a-f-]{36} at ' "${TEST_ROOT}/mount.log" \
       || fail "mount succeeded without a lease id"
-    [[ "$(stat -f %T "${MOUNTPOINT}")" == astridfs ]] \
+    # BSD stat's %T is a file-type marker ("/" for directories), not the
+    # filesystem name. Bind the kernel mount table to the canonical target.
+    local canonical_mountpoint
+    canonical_mountpoint="$(cd -- "${MOUNTPOINT}" && pwd -P)"
+    [[ "$(/sbin/mount)" == *" on ${canonical_mountpoint} (astridfs,"* ]] \
       || fail "mount succeeded but the mountpoint is not astridfs"
     printf 'upgrade-mount-probe\n' >"${MOUNTPOINT}/upgrade-mount-probe.txt"
     run_current storage sync "${MOUNTPOINT}"

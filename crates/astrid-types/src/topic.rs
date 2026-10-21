@@ -69,6 +69,13 @@ impl Topic {
         Self("astrid.v1.elicit".to_string())
     }
 
+    /// Native secret-input notification, separate from legacy MCP elicitation.
+    /// Carries a schema only; answers must use the authenticated private responder.
+    #[must_use]
+    pub fn private_elicit_request() -> Self {
+        Self("astrid.v1.private.elicit.request".to_string())
+    }
+
     /// The elicit response topic for `request_id`:
     /// `astrid.v1.elicit.response.<request_id>`.
     #[must_use]
@@ -92,6 +99,13 @@ impl Topic {
     #[must_use]
     pub fn approval_response(request_id: impl std::fmt::Display) -> Self {
         Self(format!("astrid.v1.approval.response.{request_id}"))
+    }
+
+    /// Grant completion acknowledgement for `request_id`:
+    /// `astrid.v1.grant.result.<request_id>`.
+    #[must_use]
+    pub fn grant_result(request_id: impl std::fmt::Display) -> Self {
+        Self(format!("astrid.v1.grant.result.{request_id}"))
     }
 
     // --- audit family ----------------------------------------------------
@@ -304,6 +318,19 @@ mod tests {
         assert_eq!(
             Topic::approval_response(&rid).as_str(),
             "astrid.v1.approval.response.req-1"
+        );
+    }
+
+    #[test]
+    fn grant_result_string_accepts_string_and_uuid() {
+        let id = Uuid::nil();
+        assert_eq!(
+            Topic::grant_result(id).as_str(),
+            format!("astrid.v1.grant.result.{id}")
+        );
+        assert_eq!(
+            Topic::grant_result("req-1").as_str(),
+            "astrid.v1.grant.result.req-1"
         );
     }
 

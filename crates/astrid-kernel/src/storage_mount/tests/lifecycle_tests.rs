@@ -230,7 +230,6 @@ async fn internal_workspace_branch_lease_fixes_branch_target() {
         &kernel.principal_directory,
         user,
         identity,
-        false,
     )
     .await
     .unwrap();

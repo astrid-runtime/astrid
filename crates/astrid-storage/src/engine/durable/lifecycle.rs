@@ -5,7 +5,7 @@ use super::{
     ARENA_MAGIC, DurableEngine, DurableError, DurableInner, FRAME_HEADER_LEN,
     FRAME_HEADER_LEN_USIZE, File, IndexState, LIFECYCLE_CLOSED, PersistentObjectIdentity,
     PrincipalCodec, ROOT_MAGIC, StoreLock, append_frames, io_error, live_files_mut,
-    read_indexed_object_with_payload, replace_index, replace_volume_index,
+    read_indexed_object_with_payload,
 };
 
 impl<P, I, C> DurableEngine<P, I, C>
@@ -26,7 +26,10 @@ where
             self.mark_requires_recovery(&mut inner);
             return Err(error);
         }
-        self.checkpoint_index(&mut inner, VolumeIndexPersist::RetainDeltas);
+        if let Err(error) = self.checkpoint_index(&mut inner, VolumeIndexPersist::RetainDeltas) {
+            self.mark_requires_recovery(&mut inner);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -46,7 +49,7 @@ where
             return Ok(());
         }
         let poisoned = inner.poisoned;
-        let result = if inner.files.is_some() {
+        let mut result = if inner.files.is_some() {
             if poisoned {
                 Err(DurableError::RequiresRecovery)
             } else {
@@ -57,8 +60,13 @@ where
         } else {
             Err(DurableError::Closed)
         };
-        if result.is_ok() && inner.files.is_some() {
-            self.checkpoint_index(&mut inner, VolumeIndexPersist::CompactSnapshot);
+        if result.is_ok()
+            && inner.files.is_some()
+            && let Err(error) =
+                self.checkpoint_index(&mut inner, VolumeIndexPersist::CompactSnapshot)
+        {
+            self.mark_requires_recovery(&mut inner);
+            result = Err(error);
         }
         drop(self.wal.lock().take());
         drop(inner.representations.take());
@@ -123,7 +131,7 @@ where
             if let Some(writer) = wal.as_mut() {
                 writer.checkpoint().map_err(wal_durable_error)?;
             }
-            self.checkpoint_index(inner, VolumeIndexPersist::RetainDeltas);
+            self.checkpoint_index(inner, VolumeIndexPersist::RetainDeltas)?;
             Ok(())
         })();
         if result.is_err() {
@@ -212,22 +220,24 @@ where
         self.sync_volume()
     }
 
-    fn checkpoint_index(&self, inner: &mut DurableInner<P>, persist: VolumeIndexPersist) {
+    fn checkpoint_index(
+        &self,
+        inner: &mut DurableInner<P>,
+        persist: VolumeIndexPersist,
+    ) -> Result<(), DurableError> {
         if inner.pending_index_locations.is_empty() && inner.pending_direct_objects.is_empty() {
-            let Ok(files) = live_files_mut(&mut inner.files) else {
-                return;
-            };
+            let files = live_files_mut(&mut inner.files)?;
             if files
                 .index_cache
                 .as_mut()
                 .is_some_and(index_cache_has_one_frame)
             {
-                return;
+                return Ok(());
             }
             if persist == VolumeIndexPersist::RetainDeltas
                 && volume_index_cache_present(self, files)
             {
-                return;
+                return Ok(());
             }
         }
         let arena_tail = inner
@@ -247,31 +257,21 @@ where
             && self.on_volume_media()
             && retain_volume_index_deltas(self, inner, arena_len, arena_tail)
         {
-            return;
+            return Ok(());
         }
         let state = IndexState {
             arena_len,
             arena_tail,
             objects: inner.index.clone(),
         };
-        let Ok(files) = live_files_mut(&mut inner.files) else {
-            return;
-        };
+        let files = live_files_mut(&mut inner.files)?;
         drop(files.index_cache.take());
-        let volume = self.volume.read();
-        files.index_cache = match (self.directory_capability.as_deref(), volume.as_ref()) {
-            (Some(directory), None) => replace_index(directory, &state, self.identity.scheme()),
-            (None, Some(volume)) => replace_volume_index(
-                std::sync::Arc::clone(volume),
-                &state,
-                self.identity.scheme(),
-            ),
-            _ => None,
-        };
+        files.index_cache = Some(self.replace_index_cache(&state)?);
         files.arena_len = arena_len;
         files.arena_tail = arena_tail;
         inner.pending_index_locations.clear();
         inner.pending_direct_objects.clear();
+        Ok(())
     }
 
     fn on_volume_media(&self) -> bool {
@@ -295,7 +295,11 @@ where
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
-    engine.on_volume_media() && files.index_cache.is_some()
+    engine.on_volume_media()
+        && files
+            .index_cache
+            .as_ref()
+            .is_some_and(super::index::index_cache_starts_with_snapshot)
 }
 
 fn retain_volume_index_deltas<P, I, C>(
@@ -313,7 +317,11 @@ where
         let Ok(files) = live_files_mut(&mut inner.files) else {
             return false;
         };
-        if files.index_cache.is_none() {
+        if files
+            .index_cache
+            .as_ref()
+            .is_none_or(|cache| !super::index::index_cache_starts_with_snapshot(cache))
+        {
             return false;
         }
     }
@@ -328,6 +336,9 @@ where
 }
 
 fn index_cache_has_one_frame(file: &mut File) -> bool {
+    if !super::index::index_cache_starts_with_snapshot(file) {
+        return false;
+    }
     let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
         return false;
     };

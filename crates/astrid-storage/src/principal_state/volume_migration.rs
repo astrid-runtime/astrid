@@ -12,27 +12,17 @@ use super::{Blake3ObjectIdentityV1, RuntimeEngine, StateOwner, StateOwnerCodecV2
 const CUTOVER_RECEIPT_REGION: &str = "system/migrations/directory-store-to-volume-v1";
 const MAX_CUTOVER_RECEIPT_BYTES: u64 = 256;
 
+pub(super) fn existing_volume_available(home: &AstridHome) -> StorageResult<bool> {
+    Ok(promote_legacy_volume(home)?.is_some())
+}
+
 pub(super) fn open_existing(
     home: &AstridHome,
     policy: DurableEnginePolicy<StateOwner>,
 ) -> StorageResult<Option<(RuntimeEngine, String)>> {
-    let path = home.storage_volume_path();
-    match std::fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err(connection(format!(
-                "Astrid storage volume is redirected or not a regular file: {}",
-                path.display()
-            )));
-        },
-        Ok(_) => {},
-        Err(error) => {
-            return Err(connection(format!(
-                "inspect Astrid storage volume {}: {error}",
-                path.display()
-            )));
-        },
-    }
+    let Some(path) = promote_legacy_volume(home)? else {
+        return Ok(None);
+    };
     let volume = HostedFileVolume::open(&path).map_err(|error| {
         connection(format!(
             "open Astrid storage volume {}: {error}",
@@ -54,6 +44,136 @@ pub(super) fn open_existing(
     Ok(Some((engine, receipt)))
 }
 
+/// Resolve the canonical volume and promote a released legacy path once.
+///
+/// Promotion happens before recovery so the runtime-tree admission walk can
+/// exclude the canonical media file and cannot mistake the legacy file for
+/// ordinary content. Seeing both paths is ambiguous and fails closed.
+fn promote_legacy_volume(home: &AstridHome) -> StorageResult<Option<std::path::PathBuf>> {
+    let canonical = home.storage_volume_path();
+    let legacy = legacy_volume_path(home)?;
+    let canonical_present = inspect_volume_entry(&canonical)?;
+    let legacy_present = inspect_volume_entry(&legacy)?;
+
+    match (canonical_present, legacy_present) {
+        (true, true) => Err(connection(format!(
+            "Astrid storage has both canonical and legacy volumes: {} and {}",
+            canonical.display(),
+            legacy.display()
+        ))),
+        (true, false) => Ok(Some(canonical)),
+        (false, true) => {
+            super::native_io::rename_private_entry(&legacy, &canonical)?;
+            let legacy_parent = legacy.parent().ok_or_else(|| {
+                connection(format!(
+                    "legacy Astrid volume has no parent: {}",
+                    legacy.display()
+                ))
+            })?;
+            super::native_io::sync_directory(legacy_parent)?;
+            super::native_io::sync_directory(home.root())?;
+            Ok(Some(canonical))
+        },
+        (false, false) => Ok(None),
+    }
+}
+
+/// Choose the older media path while refusing ambiguous simultaneous inputs.
+fn legacy_volume_path(home: &AstridHome) -> StorageResult<std::path::PathBuf> {
+    let var_path = home.legacy_storage_volume_path();
+    let root_path = home.retired_root_storage_volume_path();
+    let var_present = inspect_volume_entry(&var_path)?;
+    let root_present = inspect_volume_entry(&root_path)?;
+    if var_present && root_present {
+        return Err(connection(format!(
+            "Astrid storage has both released legacy volumes: {} and {}",
+            var_path.display(),
+            root_path.display()
+        )));
+    }
+    Ok(if root_present { root_path } else { var_path })
+}
+
+/// Create and verify a fresh empty durable volume.
+pub(super) fn initialize_volume(
+    home: &AstridHome,
+    policy: DurableEnginePolicy<StateOwner>,
+) -> StorageResult<(RuntimeEngine, String)> {
+    let destination = home.storage_volume_path();
+    let temporary = destination.with_extension("migrating");
+    if temporary.exists() {
+        return Err(connection(format!(
+            "incomplete Astrid volume already exists: {}",
+            temporary.display()
+        )));
+    }
+    let volume = HostedFileVolume::open(&temporary).map_err(|error| {
+        connection(format!(
+            "create fresh Astrid volume {}: {error}",
+            temporary.display()
+        ))
+    })?;
+    let engine = RuntimeEngine::open_volume(
+        volume.clone(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+        DurableEnginePolicy::default(),
+    )
+    .map_err(|error| connection(format!("open fresh Astrid volume: {error}")))?;
+    for bootstrap in super::bootstrap::RuntimeBootstrapObject::registered() {
+        let record = bootstrap.record()?;
+        engine
+            .persist_standalone_object(&record)
+            .map_err(|error| connection(format!("persist volume bootstrap object: {error}")))?;
+    }
+    engine
+        .flush()
+        .map_err(|error| connection(format!("flush fresh Astrid volume: {error}")))?;
+    write_cutover_receipt(volume.as_ref(), &[])?;
+    engine
+        .close()
+        .map_err(|error| connection(format!("close fresh Astrid volume: {error}")))?;
+    drop(engine);
+    drop(volume);
+
+    super::native_io::rename_private_entry(&temporary, &destination)?;
+    super::native_io::sync_directory(home.root())?;
+    let volume = HostedFileVolume::open(&destination).map_err(|error| {
+        connection(format!(
+            "reopen fresh Astrid volume {}: {error}",
+            destination.display()
+        ))
+    })?;
+    let engine = RuntimeEngine::open_volume(
+        volume.clone(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+        policy,
+    )
+    .map_err(|error| connection(format!("open verified fresh Astrid volume: {error}")))?;
+    let receipt = require_cutover_receipt(volume.as_ref(), Some(&[]))?;
+    Ok((engine, receipt))
+}
+
+fn inspect_volume_entry(path: &std::path::Path) -> StorageResult<bool> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err(connection(format!(
+                "Astrid storage volume is redirected or not a regular file: {}",
+                path.display()
+            )))
+        },
+        Ok(_) => Ok(true),
+        Err(error) => Err(connection(format!(
+            "inspect Astrid storage volume {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
 pub(super) fn migrate_directory_store(
     home: &AstridHome,
     source: Arc<RuntimeEngine>,
@@ -61,7 +181,7 @@ pub(super) fn migrate_directory_store(
 ) -> StorageResult<(RuntimeEngine, String)> {
     let snapshots = snapshots(&source)?;
     let destination = home.storage_volume_path();
-    let temporary = destination.with_extension("volume.migrating");
+    let temporary = destination.with_extension("migrating");
     if temporary.exists() {
         std::fs::remove_file(&temporary).map_err(|error| {
             connection(format!(
@@ -106,7 +226,7 @@ pub(super) fn migrate_directory_store(
     drop(volume);
 
     super::native_io::rename_private_entry(&temporary, &destination)?;
-    super::native_io::sync_directory(home.var_dir().as_path())?;
+    super::native_io::sync_directory(home.root())?;
 
     let volume = HostedFileVolume::open(&destination).map_err(|error| {
         connection(format!(

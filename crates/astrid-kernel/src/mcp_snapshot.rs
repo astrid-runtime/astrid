@@ -197,6 +197,15 @@ impl crate::Kernel {
                     "tool surface for capsule '{capsule_id}' is unavailable for principal '{principal}'"
                 );
             };
+            if !described.is_empty() {
+                let interceptors = capsule.manifest().effective_interceptors();
+                for tool in astrid_capsule::tools_missing_execute_route(&described, &interceptors) {
+                    tracing::warn!(
+                        %capsule_id,
+                        "capsule advertises tool '{tool}' but no `tool.v1.execute.{tool}` subscription routes it; add the tool_execute handler to Capsule.toml [subscribe]"
+                    );
+                }
+            }
             tools.append(&mut described);
         }
 
@@ -364,16 +373,24 @@ impl crate::Kernel {
                 None
             },
         };
-        let runtimes = if *principal == PrincipalId::anonymous() {
-            Vec::new()
+        let (runtimes, capsules) = if *principal == PrincipalId::anonymous() {
+            (Vec::new(), Vec::new())
         } else {
             let reg = self.capsules.read().await;
-            reg.cloned_runtimes_for(principal)
+            let runtimes = reg.cloned_runtimes_for(principal);
+            // Capture provenance under the same registry lock as the runtime;
+            // a later reload must not lend its source ID to an older instance.
+            let capsules: Vec<_> = runtimes
+                .iter()
+                .map(|(_, capsule)| {
+                    let source_id = reg
+                        .source_id_for(principal, capsule.id())
+                        .map(|id| id.to_string());
+                    (principal.clone(), Arc::clone(capsule), source_id)
+                })
+                .collect();
+            (runtimes, capsules)
         };
-        let capsules: Vec<(PrincipalId, Arc<dyn astrid_capsule::capsule::Capsule>)> = runtimes
-            .iter()
-            .map(|(_, capsule)| (principal.clone(), Arc::clone(capsule)))
-            .collect();
         let epoch = match generation {
             Some(generation) => match self
                 .refresh_mcp_snapshot_with_generation(principal, runtimes, generation)
@@ -384,7 +401,7 @@ impl crate::Kernel {
                     tracing::warn!(%principal, %error, "MCP snapshot refresh failed; publishing non-authoritative hint");
                     // Keep the legacy inventory signal useful to diagnostics
                     // even when policy or descriptor inputs are unavailable.
-                    for (entry_principal, capsule) in &capsules {
+                    for (entry_principal, capsule, _) in &capsules {
                         let _ = astrid_capsule::describe_loaded_capsule_status_for(
                             capsule.as_ref(),
                             entry_principal,
@@ -402,13 +419,19 @@ impl crate::Kernel {
 
     fn publish_capsules_loaded_snapshot(
         &self,
-        capsules: &[(PrincipalId, Arc<dyn astrid_capsule::capsule::Capsule>)],
+        capsules: &[(
+            PrincipalId,
+            Arc<dyn astrid_capsule::capsule::Capsule>,
+            Option<String>,
+        )],
         empty_principal: &PrincipalId,
         epoch: Option<McpNamespaceEpoch>,
     ) {
-        let mut by_principal =
-            BTreeMap::<String, Vec<(String, String, Option<serde_json::Value>)>>::new();
-        for (principal, capsule) in capsules {
+        let mut by_principal = BTreeMap::<
+            String,
+            Vec<(String, String, Option<String>, Option<serde_json::Value>)>,
+        >::new();
+        for (principal, capsule, source_id) in capsules {
             let name = capsule.id().to_string();
             let mut meta = capsule.source_dir().and_then(|source_dir| {
                 self.verify_workspace_capsule_tree(source_dir).ok()?;
@@ -424,7 +447,7 @@ impl crate::Kernel {
             by_principal
                 .entry(principal.to_string())
                 .or_default()
-                .push((principal.to_string(), name, meta));
+                .push((principal.to_string(), name, source_id.clone(), meta));
         }
         if by_principal.is_empty() {
             by_principal.insert(empty_principal.to_string(), Vec::new());

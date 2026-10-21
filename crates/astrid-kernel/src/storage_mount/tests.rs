@@ -8,6 +8,13 @@ use astrid_core::storage_filesystem::{
     StorageFilesystemRequestV2, StorageFilesystemResponseV2, StorageFilesystemSuccessV2,
 };
 
+#[cfg(unix)]
+#[path = "cleanup_tests.rs"]
+mod cleanup_tests;
+
+#[path = "runtime_tree_tests.rs"]
+mod runtime_tree_tests;
+
 async fn callback(
     lease: &StorageMountLeaseV1,
     token: &str,
@@ -67,6 +74,7 @@ async fn callback_v1(
 
 fn encode_operation_v2(operation: StorageFilesystemOperationV1) -> StorageFilesystemOperationV2 {
     match operation {
+        StorageFilesystemOperationV1::VolumeInfo => StorageFilesystemOperationV2::VolumeInfo,
         StorageFilesystemOperationV1::Stat { path } => StorageFilesystemOperationV2::Stat { path },
         StorageFilesystemOperationV1::ReadDirectory { path } => {
             StorageFilesystemOperationV2::ReadDirectory { path }
@@ -180,6 +188,15 @@ impl<F: CallbackFilesystem> CallbackFilesystem for ReadBoundarySpy<F> {
         self.inner.create_dir(path)
     }
 
+    fn write_streaming(
+        &self,
+        path: &FilesystemPath,
+        source: impl std::io::Read,
+    ) -> Result<(), FilesystemError> {
+        self.writes.fetch_add(1, Ordering::AcqRel);
+        self.inner.write_streaming(path, source)
+    }
+
     fn remove(&self, path: &FilesystemPath) -> Result<(), FilesystemError> {
         self.inner.remove(path)
     }
@@ -232,7 +249,7 @@ async fn oversized_set_length_and_random_write_preflight_before_full_read() {
         &spy,
         StorageFilesystemOperationV1::SetLength {
             path: "probe.bin".to_owned(),
-            length: STORAGE_FILESYSTEM_MAX_IO_BYTES.saturating_add(1),
+            length: (i64::MAX as u64) + 1,
         },
     );
     let set_length_preflighted =
@@ -244,7 +261,7 @@ async fn oversized_set_length_and_random_write_preflight_before_full_read() {
         &spy,
         StorageFilesystemOperationV1::Write {
             path: "probe.bin".to_owned(),
-            offset: STORAGE_FILESYSTEM_MAX_IO_BYTES,
+            offset: i64::MAX as u64,
             data: vec![0x5A],
         },
     );
@@ -255,7 +272,7 @@ async fn oversized_set_length_and_random_write_preflight_before_full_read() {
 
     assert!(
         set_length_preflighted,
-        "SetLength above the callback/quota ceiling must fail during preflight"
+        "SetLength outside the native offset domain must fail during preflight"
     );
     assert_eq!(
         set_length_reads, 0,
@@ -286,8 +303,8 @@ async fn oversized_set_length_and_random_write_preflight_before_full_read() {
         },
     );
     assert!(
-        matches!(truncation, Err(FilesystemError::InvalidPath(path)) if path == "oversized.bin"),
-        "truncating an already oversized file must fail before rebuilding its contents"
+        truncation.is_ok(),
+        "truncating a large file must succeed without reading its old contents"
     );
     assert_eq!(
         reads.load(Ordering::Acquire),
@@ -296,8 +313,8 @@ async fn oversized_set_length_and_random_write_preflight_before_full_read() {
     );
     assert_eq!(
         writes.load(Ordering::Acquire),
-        0,
-        "oversized truncation must not publish replacement bytes"
+        1,
+        "truncation publishes the empty replacement"
     );
 }
 

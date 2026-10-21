@@ -84,6 +84,7 @@ fn decode_operation_v2(
     operation: StorageFilesystemOperationV2,
 ) -> io::Result<StorageFilesystemOperationV1> {
     Ok(match operation {
+        StorageFilesystemOperationV2::VolumeInfo => StorageFilesystemOperationV1::VolumeInfo,
         StorageFilesystemOperationV2::Stat { path } => StorageFilesystemOperationV1::Stat { path },
         StorageFilesystemOperationV2::ReadDirectory { path } => {
             StorageFilesystemOperationV1::ReadDirectory { path }

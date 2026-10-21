@@ -51,6 +51,8 @@ pub enum FaultPoint {
     AfterCompactionRepresentationRebase,
     /// The transaction WAL has been published but canonical files are not folded.
     AfterWalPublication,
+    /// A disposable object-index checkpoint is about to be published.
+    BeforeIndexCachePublication,
 }
 
 /// Injectable crash decision used by recovery tests and harnesses.
@@ -101,6 +103,7 @@ mod tests {
             FaultPoint::BeforeInProcessRecoveryRootFlush,
             FaultPoint::AfterCompactionRepresentationRebase,
             FaultPoint::AfterWalPublication,
+            FaultPoint::BeforeIndexCachePublication,
         ];
 
         for (expected, point) in points.into_iter().enumerate() {

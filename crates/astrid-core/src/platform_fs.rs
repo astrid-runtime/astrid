@@ -395,6 +395,20 @@ pub fn atomic_write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
+/// Recognize the Unix private atomic writer's temporary basename.
+///
+/// This is only a naming check, not authority to read or discard the file.
+/// Recovery must separately validate private ownership and durable intent.
+#[must_use]
+pub fn is_private_atomic_staging_name(name: &std::ffi::OsStr) -> bool {
+    cfg!(unix)
+        && name.to_str().is_some_and(|name| {
+            name.strip_prefix(".astrid-private-").is_some_and(|suffix| {
+                suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+        })
+}
+
 /// Reject redirecting path components at a security-sensitive boundary.
 ///
 /// Windows checks the reparse attribute on every existing component, covering
@@ -567,6 +581,15 @@ fn validate_private_file_unix(path: &Path) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("private file is not owner-only: {}", path.display()),
+        ));
+    }
+    if metadata.st_nlink != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "private file has {} links; durable media must have exactly one",
+                metadata.st_nlink
+            ),
         ));
     }
     validate_no_extended_acl(path)?;

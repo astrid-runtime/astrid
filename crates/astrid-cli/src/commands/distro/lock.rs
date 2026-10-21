@@ -48,6 +48,7 @@ pub(crate) struct DistroLockMeta {
 
 /// A resolved capsule entry in the lockfile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub(crate) struct LockedCapsule {
     /// Capsule package name.
     pub(crate) name: String,
@@ -61,7 +62,11 @@ pub(crate) struct LockedCapsule {
     /// branch name, or a commit SHA). Distinct from `version` because
     /// the manifest may pin a tag/branch/rev that doesn't equal the
     /// semver string. `None` for legacy locks.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "resolved_ref",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub(crate) resolved_ref: Option<String>,
 }
 
@@ -203,13 +208,34 @@ pub(crate) async fn write_lock_to_daemon(
     }
 }
 
-/// Check if a lockfile is fresh (name and version match the manifest).
-pub(crate) fn is_lock_fresh(lock: &DistroLock, manifest: &DistroManifest) -> bool {
-    lock.distro.id == manifest.distro.id && lock.distro.version == manifest.distro.version
+/// Check whether a lock is fresh for the exact authenticated manifest bytes.
+///
+/// A legacy unbound lock is deliberately stale so it can never satisfy the
+/// caller-only `DistroSelfGrant` admission gate.
+pub(crate) fn is_lock_fresh(
+    lock: &DistroLock,
+    manifest: &DistroManifest,
+    manifest_hash: &str,
+) -> bool {
+    lock.distro.id == manifest.distro.id
+        && lock.distro.version == manifest.distro.version
+        && lock.manifest_hash.as_deref() == Some(manifest_hash)
+        && lock.capsules.len() == manifest.capsules.len()
+        && manifest.capsules.iter().all(|declared| {
+            lock.capsules.iter().any(|locked| {
+                locked.name == declared.name
+                    && locked.version == declared.version
+                    && locked.source == declared.source
+            })
+        })
 }
 
 /// Create a new lockfile from resolved capsule data.
-pub(crate) fn create_lock(manifest: &DistroManifest, capsules: Vec<LockedCapsule>) -> DistroLock {
+pub(crate) fn create_lock(
+    manifest: &DistroManifest,
+    manifest_hash: &str,
+    capsules: Vec<LockedCapsule>,
+) -> DistroLock {
     DistroLock {
         schema_version: manifest.schema_version,
         distro: DistroLockMeta {
@@ -218,7 +244,7 @@ pub(crate) fn create_lock(manifest: &DistroManifest, capsules: Vec<LockedCapsule
             resolved_at: chrono::Utc::now().to_rfc3339(),
         },
         capsules,
-        manifest_hash: None,
+        manifest_hash: Some(manifest_hash.to_string()),
     }
 }
 
@@ -236,6 +262,20 @@ pub(crate) fn manifest_hash(toml_bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolved_ref_writer_matches_shared_migration_fixture() {
+        let canonical = include_str!("../../../../../e2e/fixtures/distro-lock/resolved-ref.toml");
+        let historical = canonical.replace("resolved-ref", "resolved_ref");
+        let lock: DistroLock = toml::from_str(&historical).unwrap();
+        assert_eq!(lock.capsules[0].resolved_ref.as_deref(), Some("v1.0.0"));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("distro.lock");
+        write_lock(&path, &lock).unwrap();
+        let written: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let expected: toml::Value = toml::from_str(canonical).unwrap();
+        assert_eq!(written, expected);
+    }
 
     #[test]
     fn write_and_load_lock_roundtrip() {
@@ -319,7 +359,7 @@ role = "uplink"
             capsules: vec![],
             manifest_hash: None,
         };
-        assert!(is_lock_fresh(&lock, &manifest));
+        assert!(!is_lock_fresh(&lock, &manifest, "blake3:manifest"));
     }
 
     #[test]
@@ -352,7 +392,84 @@ role = "uplink"
             capsules: vec![],
             manifest_hash: None,
         };
-        assert!(!is_lock_fresh(&lock, &manifest));
+        assert!(!is_lock_fresh(&lock, &manifest, "blake3:manifest"));
+    }
+
+    #[test]
+    fn lock_is_fresh_only_for_matching_manifest_bytes() {
+        let manifest = super::super::manifest::parse_manifest(
+            r#"
+schema-version = 1
+
+[distro]
+id = "test"
+name = "Test"
+version = "0.1.0"
+
+[[capsule]]
+name = "cli"
+source = "@org/cli"
+version = "0.1.0"
+role = "uplink"
+"#,
+        )
+        .unwrap();
+        let bytes = b"schema-version = 1\n";
+        let hash = manifest_hash(bytes);
+        let mut lock = create_lock(
+            &manifest,
+            &hash,
+            vec![LockedCapsule {
+                name: "cli".into(),
+                version: "0.1.0".into(),
+                source: "@org/cli".into(),
+                hash: String::new(),
+                resolved_ref: None,
+            }],
+        );
+        assert_eq!(lock.manifest_hash.as_deref(), Some(hash.as_str()));
+        assert!(is_lock_fresh(&lock, &manifest, &hash));
+        lock.manifest_hash = Some("blake3:tampered".into());
+        assert!(!is_lock_fresh(&lock, &manifest, &hash));
+    }
+
+    #[test]
+    fn partial_lock_is_never_fresh_even_when_distro_hash_matches() {
+        let manifest = super::super::manifest::parse_manifest(
+            r#"
+schema-version = 1
+
+[distro]
+id = "test"
+name = "Test"
+version = "0.1.0"
+
+[[capsule]]
+name = "cli"
+source = "@org/cli"
+version = "0.1.0"
+role = "uplink"
+
+[[capsule]]
+name = "worker"
+source = "@org/worker"
+version = "0.1.0"
+"#,
+        )
+        .unwrap();
+        let hash = manifest_hash(b"manifest");
+        let lock = create_lock(
+            &manifest,
+            &hash,
+            vec![LockedCapsule {
+                name: "cli".into(),
+                version: "0.1.0".into(),
+                source: "@org/cli".into(),
+                hash: String::new(),
+                resolved_ref: None,
+            }],
+        );
+        assert!(!is_lock_fresh(&lock, &manifest, &hash));
     }
 
     #[test]

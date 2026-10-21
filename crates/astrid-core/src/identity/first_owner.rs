@@ -122,14 +122,14 @@ impl FirstOwnerGeneration {
     }
 }
 
-fn serialize_signature<S>(signature: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
+pub(super) fn serialize_signature<S>(signature: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
     serializer.serialize_str(&hex::encode(signature))
 }
 
-fn deserialize_signature<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
+pub(super) fn deserialize_signature<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -149,6 +149,12 @@ where
 }
 
 impl FirstOwnerClaim {
+    /// Attach an external signature without changing the frozen signing statement.
+    #[must_use]
+    pub const fn with_signature(mut self, signature: [u8; 64]) -> Self {
+        self.signature = signature;
+        self
+    }
     /// Construct a claim from its fixed fields and detached Ed25519 signature.
     ///
     /// The caller must obtain the signature over [`Self::canonical_message`]

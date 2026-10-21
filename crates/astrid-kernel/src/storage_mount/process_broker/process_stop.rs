@@ -19,6 +19,13 @@ pub(crate) struct ProcessStopPolicy {
     stop_acknowledgement: std::time::Duration,
     reap_grace: std::time::Duration,
     killed_reap: std::time::Duration,
+    unmount_confirmation: Duration,
+}
+
+impl ProcessStopPolicy {
+    pub(super) fn unmount_confirmation(self) -> Duration {
+        self.unmount_confirmation
+    }
 }
 
 impl Default for ProcessStopPolicy {
@@ -30,6 +37,7 @@ impl Default for ProcessStopPolicy {
             stop_acknowledgement: timeout,
             reap_grace: timeout,
             killed_reap: timeout,
+            unmount_confirmation: Duration::from_secs(5),
         }
     }
 }
@@ -40,6 +48,7 @@ impl From<&astrid_config::TimeoutsSection> for ProcessStopPolicy {
             stop_acknowledgement: Duration::from_secs(timeouts.process_stop_ack_secs),
             reap_grace: Duration::from_secs(timeouts.process_reap_grace_secs),
             killed_reap: Duration::from_secs(timeouts.process_killed_reap_secs),
+            unmount_confirmation: Duration::from_secs(timeouts.process_unmount_confirm_secs),
         }
     }
 }

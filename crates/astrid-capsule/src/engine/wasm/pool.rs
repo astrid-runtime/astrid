@@ -41,6 +41,7 @@ use tokio_util::sync::CancellationToken;
 use wasmtime::Store;
 use wasmtime::component::{Instance, InstancePre};
 
+use super::accounted_store::AccountedStore;
 use super::host_state::HostState;
 use crate::error::{CapsuleError, CapsuleResult};
 
@@ -55,7 +56,7 @@ const EVICT_INTERVAL: Duration = Duration::from_secs(30);
 /// into `store`'s resource table, so the two are bound together for the
 /// instance's lifetime.
 pub(super) struct PooledInstance {
-    pub(super) store: Store<HostState>,
+    pub(super) store: AccountedStore<HostState>,
     pub(super) instance: Instance,
 }
 
@@ -106,6 +107,7 @@ pub(super) struct InstanceBuilder {
     /// Fuel seed so `instantiate_async` (which runs guest component-init code)
     /// does not trap a fresh, zero-fuel Store on its first instruction.
     fuel_budget: u64,
+    throttle: Option<crate::user_cpu::throttle::ExecutionThrottle>,
 }
 
 impl InstanceBuilder {
@@ -122,7 +124,16 @@ impl InstanceBuilder {
             make_state,
             epoch_policy,
             fuel_budget,
+            throttle: None,
         }
+    }
+
+    pub(super) fn with_throttle(
+        mut self,
+        throttle: Option<crate::user_cpu::throttle::ExecutionThrottle>,
+    ) -> Self {
+        self.throttle = throttle;
+        self
     }
 
     /// Instantiate one fresh pooled instance. Identical to the eager warm-start
@@ -137,6 +148,9 @@ impl InstanceBuilder {
         // budget re-sets fuel afterwards.
         store.set_fuel(self.fuel_budget).map_err(|e| {
             CapsuleError::UnsupportedEntryPoint(format!("Failed to seed store fuel: {e}"))
+        })?;
+        let mut store = AccountedStore::new(store, self.throttle.clone()).map_err(|e| {
+            CapsuleError::ExecutionFailed(format!("Failed to initialize CPU accounting: {e}"))
         })?;
         let instance = self
             .instance_pre
@@ -196,12 +210,6 @@ pub(super) struct CapsuleInstancePool {
     reset_resources_on_return: bool,
     /// On-demand instance factory for lazy growth.
     builder: Arc<InstanceBuilder>,
-    /// Whether a checkout that finds no warm instance may build one. `false`
-    /// for the size-1 `host_process` carve-out (`max == min_idle == 1`): its
-    /// single instance is always warm, so this is belt-and-suspenders — if a
-    /// build were ever reached it would mint a *second* Store and violate the
-    /// carve-out, so we fail closed instead.
-    allow_grow: bool,
     /// Idle-eviction timer; aborted on drop. `None` when the pool cannot grow
     /// (`max == min_idle`) — `available` can then never exceed `min_idle`, so
     /// there is nothing to evict.
@@ -245,7 +253,6 @@ impl CapsuleInstancePool {
             max,
             reset_resources_on_return,
             builder: Arc::new(builder),
-            allow_grow,
             evict_task,
         }
     }
@@ -267,9 +274,9 @@ impl CapsuleInstancePool {
     ///
     /// With a permit in hand the pool is below `max`, so this pops a warm
     /// instance or — when none is warm — builds a fresh one (lazy grow).
-    /// Returns `None` if the semaphore is closed (capsule unloading), if a
-    /// lazy build fails, or if a non-growable pool somehow finds no warm
-    /// instance — all treated by the caller as "not invocable".
+    /// A discarded instance is replaced on demand, including in a size-1 pool.
+    /// The held permit still bounds the total number of live instances.
+    /// Returns `None` if the semaphore is closed or instantiation fails.
     pub(super) async fn checkout(&self) -> Option<PoolCheckout> {
         let permit = Arc::clone(&self.permits).acquire_owned().await.ok()?;
         // Pop the most-recently-returned instance (the BACK — return pushes
@@ -284,25 +291,19 @@ impl CapsuleInstancePool {
             .pop_back();
         let pooled = match warm {
             Some(pooled) => pooled,
-            None => {
-                if !self.allow_grow {
-                    // Unreachable for a size-1 carve-out (its instance is
-                    // always warm); fail closed rather than mint a second Store.
+            None => match self.builder.build().await {
+                Ok(pooled) => pooled,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to instantiate capsule checkout");
                     return None;
-                }
-                match self.builder.build().await {
-                    Ok(pooled) => pooled,
-                    Err(e) => {
-                        tracing::error!(error = %e, "failed to grow capsule instance pool");
-                        return None;
-                    },
-                }
+                },
             },
         };
         Some(PoolCheckout {
             pooled: Some(pooled),
             available: Arc::clone(&self.available),
             reset_resources_on_return: self.reset_resources_on_return,
+            reusable: true,
             _permit: permit,
         })
     }
@@ -372,22 +373,28 @@ fn drain_excess<T>(queue: &mut VecDeque<T>, min_idle: usize) -> Vec<T> {
 
 /// RAII lease of one pooled instance.
 ///
-/// On drop — through every exit path: normal return, `?`, panic-unwind, or
-/// future-drop on caller cancellation — it runs the Phase-3 CLEAR (resets the
-/// per-invocation `HostState` fields) and returns the instance to the pool.
-/// Folding the clear into the return guarantees the next lease of this
-/// instance observes a clean `HostState`, and that no instance (or permit) is
-/// leaked on an error path.
+/// Completed calls clear their host state and return to the pool. Interrupted
+/// calls discard the entire Store: clearing host fields cannot repair guest
+/// state or Wasmtime's component-entry state after a trap or cancellation.
 pub(super) struct PoolCheckout {
     pooled: Option<PooledInstance>,
     available: Arc<Mutex<VecDeque<PooledInstance>>>,
     /// Mirrors [`CapsuleInstancePool::reset_resources_on_return`]; copied at
     /// checkout so the drop path needs no back-pointer to the pool.
     reset_resources_on_return: bool,
+    reusable: bool,
     _permit: OwnedSemaphorePermit,
 }
 
 impl PoolCheckout {
+    pub(super) fn begin_call(&mut self) {
+        self.reusable = false;
+    }
+
+    pub(super) fn complete_call(&mut self) {
+        self.reusable = true;
+    }
+
     /// The leased instance handle (`Copy`), for typed-func lookup. Taking it
     /// by copy leaves `store_mut` free to borrow the store mutably.
     pub(super) fn instance(&self) -> Instance {
@@ -396,7 +403,7 @@ impl PoolCheckout {
 
     /// Mutable access to the leased store for the SET phase and the guest
     /// call.
-    pub(super) fn store_mut(&mut self) -> &mut Store<HostState> {
+    pub(super) fn store_mut(&mut self) -> &mut AccountedStore<HostState> {
         &mut self.pooled.as_mut().expect("active checkout").store
     }
 }
@@ -404,21 +411,24 @@ impl PoolCheckout {
 impl Drop for PoolCheckout {
     fn drop(&mut self) {
         if let Some(mut pooled) = self.pooled.take() {
-            // Phase 3: CLEAR. Reset every per-invocation field before the
-            // instance returns to the pool so the next lease starts clean.
-            // Mirrors the old `ClearOnDrop` guard from the single-Store path.
-            clear_on_return(pooled.store.data_mut(), self.reset_resources_on_return);
-            self.available
-                .lock()
-                .expect("instance pool mutex poisoned")
-                .push_back(pooled);
+            // Discard also releases shared resource quota, even for a size-1
+            // pool that normally preserves handles between successful calls.
+            clear_on_return(
+                pooled.store.data_mut(),
+                self.reset_resources_on_return || !self.reusable,
+            );
+            if self.reusable {
+                self.available
+                    .lock()
+                    .expect("instance pool mutex poisoned")
+                    .push_back(pooled);
+            }
         }
     }
 }
 
 /// Tear down a returned instance's per-invocation [`HostState`] so the next
-/// lease starts clean. Runs on **every** [`PoolCheckout`] exit path — normal
-/// return, `?`, panic-unwind, future-drop on caller cancellation.
+/// lease starts clean. Interrupted guests are instead discarded entirely.
 ///
 /// Two layers:
 ///
@@ -427,10 +437,10 @@ impl Drop for PoolCheckout {
 ///    plain `Option`/`bool` references to shared services, not live OS
 ///    resources, but a stale one would mis-scope the next call's reads/writes.
 ///
-/// 2. When `reset_resources` is set (free-checkout pools only): the
-///    per-Store-lifetime *resource* state — the wasmtime `ResourceTable` and
-///    the O(1) resource-table-mirror counters. A cancelled or panicked
-///    invocation can return here while it still holds live handles (an HTTP
+/// 2. When `reset_resources` is set (for free-checkout pools and every
+///    interrupted call): the per-Store-lifetime *resource* state — the
+///    wasmtime `ResourceTable` and the O(1) resource-table-mirror counters. A
+///    cancelled or panicked invocation can return here with live handles (an HTTP
 ///    stream, an IPC subscription, a net stream, a background process, a WASI
 ///    fd) it never got to `drop`. Replacing the table with a fresh one runs
 ///    `Drop` on every orphaned entry — closing fds/streams and killing+reaping
@@ -441,10 +451,10 @@ impl Drop for PoolCheckout {
 ///    Resetting an already-empty table (the normal subscribe→use→drop path) is
 ///    a cheap no-op: a fresh `ResourceTable` allocation and a few field writes.
 ///
-/// `reset_resources` is `false` for the `host_process` carve-out, whose
-/// `ManagedProcess` handles legitimately persist across invocations; it is
-/// sound to skip there because that capsule never leases a second Store, so no
-/// cross-principal reuse can occur (see [`CapsuleInstancePool`]).
+/// `reset_resources` is normally `false` for a successfully completed
+/// `host_process` call, whose `ManagedProcess` handles legitimately persist
+/// across invocations. An interrupted call overrides that setting and resets
+/// the resources before discarding the Store.
 ///
 /// NOTE: the per-Store *owner* state (`vfs`, `kv`, `secret_store`,
 /// `ipc_limiter`, `blocking_semaphore`, `io_semaphore`, `process_tracker`,
@@ -460,6 +470,7 @@ pub(super) fn clear_on_return(state: &mut HostState, reset_resources: bool) {
     state.semantic_authorities.prepare_for_replacement();
     state.caller_context = None;
     state.stamped_invocation = None;
+    state.tool_result = None;
     state.interceptor_active = false;
     state.invocation_kv = None;
     state.invocation_home = None;
@@ -479,6 +490,7 @@ pub(super) fn clear_on_return(state: &mut HostState, reset_resources: bool) {
     // (issue #45/#852).
     state.ingress_principal = None;
     state.ingress_device_key_id = None;
+    state.ingress_request_owner = None;
     // The in-flight transport origin is the same per-frame state: a fresh lease
     // must never inherit a stale `LocalSocket`, or a later request on a
     // different (remote) connection could be mis-attributed as a local operator
@@ -655,6 +667,43 @@ mod tests {
         assert!(!state.interceptor_active);
     }
 
+    /// Cancellation during host-only setup must return a healthy carve-out
+    /// Store without destroying resources that intentionally persist between
+    /// guest calls.
+    #[tokio::test]
+    async fn checkout_dropped_before_guest_entry_remains_reusable() {
+        let cancel = CancellationToken::new();
+        let mut pool = empty_pool(1, 1, &cancel).await;
+        pool.reset_resources_on_return = false;
+
+        let mut checkout = pool.checkout().await.expect("checkout");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let resource = checkout
+            .store_mut()
+            .data_mut()
+            .resource_table
+            .push(DropFlag(Arc::clone(&dropped)))
+            .expect("push test resource");
+        checkout.store_mut().data_mut().process_count_total = 1;
+
+        // Simulate cancellation before `begin_call`: no guest code ran.
+        drop(checkout);
+
+        assert!(!dropped.load(Ordering::SeqCst));
+        let mut next = pool.checkout().await.expect("returned checkout");
+        let state = next.store_mut().data_mut();
+        assert!(
+            state
+                .resource_table
+                .get::<DropFlag>(&Resource::<DropFlag>::new_borrow(resource.rep()))
+                .is_ok(),
+            "pre-entry cancellation must preserve carve-out resources"
+        );
+        assert_eq!(state.process_count_total, 1);
+        drop(next);
+        cancel.cancel();
+    }
+
     /// The in-flight transport origin is per-frame state: a pool return must
     /// clear `ingress_origin` (alongside `ingress_principal` /
     /// `ingress_device_key_id`) so a fresh lease never inherits a stale
@@ -673,6 +722,7 @@ mod tests {
             let mut state = minimal_host_state(rt.handle().clone());
             state.ingress_principal = Some(astrid_core::PrincipalId::default());
             state.ingress_device_key_id = Some("dev-abc".to_string());
+            state.ingress_request_owner = Some(astrid_events::ipc::RequestOwnerId::generate());
             state.ingress_origin = Some(astrid_events::ipc::MessageOrigin::LocalSocket);
 
             clear_on_return(&mut state, reset_resources);
@@ -683,6 +733,7 @@ mod tests {
             );
             assert_eq!(state.ingress_principal, None);
             assert_eq!(state.ingress_device_key_id, None);
+            assert_eq!(state.ingress_request_owner, None);
         }
     }
 
@@ -882,14 +933,11 @@ mod tests {
         cancel.cancel();
     }
 
-    /// A size-1 carve-out (`max == min_idle == 1`, `allow_grow == false`) never
-    /// builds a second Store: its single warm instance serialises checkouts and
-    /// is always the same one, but it is never grown.
+    /// A size-1 carve-out never holds two Stores concurrently.
     #[tokio::test(flavor = "multi_thread")]
     async fn carveout_pool_never_grows() {
         let cancel = CancellationToken::new();
         let pool = empty_pool(1, 1, &cancel).await;
-        assert!(!pool.allow_grow, "size-1 pool must not be growable");
         assert!(
             pool.evict_task.is_none(),
             "non-growable pool spawns no evictor"
@@ -905,6 +953,31 @@ mod tests {
             .expect("unblocks on return")
             .expect("same instance again");
         drop(c2);
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn discarding_checkout_releases_shared_stream_quota_and_the_permit() {
+        let cancel = CancellationToken::new();
+        let mut pool = empty_pool(1, 1, &cancel).await;
+        pool.reset_resources_on_return = false;
+        let mut checkout = pool.checkout().await.expect("checkout");
+        let state = checkout.store_mut().data_mut();
+        state.local_net_stream_count.store(2, Ordering::Release);
+        state.capsule_net_stream_count.store(3, Ordering::Release);
+        let shared = Arc::clone(&state.capsule_net_stream_count);
+        checkout.begin_call();
+        drop(checkout);
+        assert_eq!(
+            shared.load(Ordering::Acquire),
+            1,
+            "release only this Store's slots"
+        );
+        assert!(pool.available.lock().unwrap().is_empty());
+        assert!(
+            pool.checkout().await.is_some(),
+            "replacement obtains the released permit"
+        );
         cancel.cancel();
     }
 }

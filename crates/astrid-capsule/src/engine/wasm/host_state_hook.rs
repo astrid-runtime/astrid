@@ -1,6 +1,8 @@
 //! [`HostState::for_hook`] — the transient WASM-hook `HostState` constructor.
 //! Split out of `host_state.rs` to stay under the 1000-line CI cap; included via
 //! `#[path]`. See [`HookHostStateParams`] for the caller-supplied inputs.
+//! `Debug` for [`HostState`] lives here for the same cap: the struct gained
+//! `hosted_workspace_root` on main and `secret_elicits` in this change.
 
 use super::*;
 
@@ -65,6 +67,7 @@ impl HostState {
             invocation_kv: None,
             capsule_log: None,
             capsule_id,
+            hosted_workspace_root: workspace_root.clone(),
             workspace_root,
             // Hooks run a transient one-shot on a plain HostVfs with no CoW.
             spawn_mask_paths: Vec::new(),
@@ -93,10 +96,13 @@ impl HostState {
             kv_backend,
             kv,
             event_bus,
+            secret_elicits: None,
             route_admission_gate: astrid_events::RouteAdmissionGate::default(),
             ipc_limiter: Arc::new(astrid_events::ipc::IpcRateLimiter::new()),
             config: HashMap::new(),
             secret_env: std::collections::HashSet::new(),
+            revealed_secrets: crate::engine::wasm::host::http::RevealedSecrets::default(),
+            tool_result: None,
             file_secret_root: None,
             ipc_publish_patterns: vec!["hook.v1.result.*".into()],
             ipc_subscribe_patterns: Vec::new(),
@@ -159,7 +165,40 @@ impl HostState {
             // neither the ingress principal nor its device id / origin is set.
             ingress_principal: None,
             ingress_device_key_id: None,
+            ingress_request_owner: None,
             ingress_origin: None,
         }
+    }
+}
+
+impl std::fmt::Debug for HostState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostState")
+            .field("capsule_id", &self.capsule_id)
+            .field("workspace_root", &self.workspace_root)
+            .field("hosted_workspace_root", &self.hosted_workspace_root)
+            .field("vfs_root_handle", &self.vfs_root_handle)
+            .field("has_home", &self.home.is_some())
+            .field("has_tmp", &self.tmp.is_some())
+            .field("has_security", &self.security.is_some())
+            .field("has_uplink_capability", &self.has_uplink_capability)
+            .field("audit_firehose", &self.audit_firehose)
+            .field("has_inbound_tx", &self.inbound_tx.is_some())
+            .field("registered_uplinks", &self.registered_uplinks.len())
+            .field(
+                "blocking_semaphore_permits",
+                &self.blocking_semaphore.available_permits(),
+            )
+            .field(
+                "io_semaphore_permits",
+                &self.io_semaphore.available_permits(),
+            )
+            .field("cancel_token_cancelled", &self.cancel_token.is_cancelled())
+            .field("has_identity_store", &self.identity_store.is_some())
+            .field("active_http_streams", &self.active_http_streams.len())
+            .field("http_limits", &self.http_limits)
+            .field("process_tracker", &self.process_tracker)
+            .field("persistent_processes", &self.persistent_processes)
+            .finish_non_exhaustive()
     }
 }

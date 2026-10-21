@@ -13,7 +13,9 @@ default = []
 test-support = []
 
 [dependencies]
+async-trait = { workspace = true }
 anyhow = { workspace = true }
+astrid-config = { workspace = true }
 astrid-core = { workspace = true }
 astrid-crypto = { workspace = true }
 astrid-events = { workspace = true }

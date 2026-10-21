@@ -22,6 +22,61 @@ pub(super) enum BoundaryMode<'a> {
     Reuse(&'a ContentVerificationState),
 }
 
+/// Enumerate immutable chunk identities without loading their payloads.
+/// The caller holds a full canonical-boundary proof and pins its source closure.
+pub(in crate::content_dag) fn verified_chunks<S: ContentSource>(
+    source: &S,
+    verified: crate::content_dag::VerifiedContent,
+) -> Result<Vec<crate::content_dag::build::Child>, ContentReadError<S::Error>> {
+    let opened = verified.opened_content();
+    let descriptor = opened.descriptor();
+    let Some(root) = opened.content_root() else {
+        return Ok(Vec::new());
+    };
+    let shape = ExpectedShape {
+        logical_bytes: descriptor.logical_bytes(),
+        chunk_count: descriptor.chunk_count(),
+        tree_depth: canonical_tree_depth(descriptor.chunk_count()),
+        profile: descriptor.profile(),
+        ends_file: true,
+    };
+    let mut pending = vec![(root, shape)];
+    let mut chunks = Vec::new();
+    while let Some((object, shape)) = pending.pop() {
+        if shape.tree_depth == 0 {
+            chunks.push(crate::content_dag::build::Child {
+                id: object,
+                logical_bytes: shape.logical_bytes,
+                chunk_count: 1,
+            });
+            continue;
+        }
+        let record = load(source, object)?;
+        if record.kind() != ObjectKind::ChunkTree {
+            return Err(ContentError::InvalidObject {
+                object,
+                detail: "expected verified chunk-tree object",
+            }
+            .into());
+        }
+        let children = decode_tree(object, &record, shape)?;
+        let last = children.len().saturating_sub(1);
+        for (index, (id, logical_bytes, chunk_count)) in children.into_iter().enumerate().rev() {
+            pending.push((
+                id,
+                ExpectedShape {
+                    logical_bytes,
+                    chunk_count,
+                    tree_depth: shape.tree_depth.strict_sub(1),
+                    profile: shape.profile,
+                    ends_file: shape.ends_file && index == last,
+                },
+            ));
+        }
+    }
+    Ok(chunks)
+}
+
 pub(super) fn read_decoded_range<S: ContentSource>(
     source: &S,
     file: ObjectId,

@@ -1,5 +1,39 @@
-use super::{DeviceKeyInfo, EnvEntry, PrincipalId, Quotas, StorageMountLeaseV1};
+use super::{EnvEntry, PrincipalId, Quotas, StorageMountLeaseV1};
 use serde::{Deserialize, Serialize};
+
+/// Per-device summary returned by [`super::AdminRequestKind::PairDeviceList`].
+///
+/// Carries only non-secret, fingerprint-level identity — the deterministic
+/// `key_id`, the operator label, the granted [`DeviceScope`](crate::DeviceScope),
+/// and the pairing timestamp. The raw ed25519 public key is **never** surfaced;
+/// the `key_id` (derived from the already-public pubkey) is the stable handle
+/// for listing and revocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceKeyInfo {
+    /// Deterministic per-device fingerprint handle.
+    pub key_id: String,
+    /// Operator/user-facing label captured at pairing time, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Capability attenuation scope the device authenticates under.
+    pub scope: crate::DeviceScope,
+    /// Unix epoch seconds when the device was paired (`0` for migrated
+    /// legacy keys that predate pairing-time recording).
+    pub created_at: i64,
+}
+
+/// Admin management API response wrapper carrying the echoed
+/// correlation ID and the typed response body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminKernelResponse {
+    /// Echoed `request_id` from the [`super::AdminKernelRequest`] this response
+    /// answers. `None` when the client did not provide one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// The typed response body — `tag = "status", content = "data"`.
+    #[serde(flatten)]
+    pub body: AdminResponseBody,
+}
 
 /// Durable provenance for one authenticated principal's distro installation.
 ///
@@ -91,6 +125,14 @@ pub enum AdminResponseBody {
     AuditPruned(Box<AuditPruneResult>),
     /// Bounded audit ingestion queue health.
     AuditHealth(AuditHealth),
+    /// Signed snapshot of every audit chain head.
+    AuditHeads(Box<super::AuditHeadsSnapshot>),
+    /// One page of a chain's raw signed audit entries.
+    AuditExport(Box<super::AuditExportPage>),
+    /// Per-chain outcomes of `AuditAnchorMark`.
+    AuditAnchorMarked(Box<super::AuditAnchorMarkResult>),
+    /// Every chain's anchored watermark and the retention state.
+    AuditAnchorStatus(Box<super::AuditAnchorStatusReport>),
     /// Response for [`AdminRequestKind::StorageMountIssue`].
     StorageMountLease(Box<StorageMountLeaseV1>),
     /// The request failed.
@@ -120,6 +162,10 @@ pub struct AuditStats {
     /// Most recent retention/accounting error, when degraded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Set while the cap is exceeded because every prunable segment holds
+    /// history that is not anchored; says why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_hold: Option<String>,
 }
 
 /// Signed archive receipt summary returned after an audit prune operation.
@@ -154,7 +200,8 @@ pub struct AuditPruneResult {
     pub logical_reclaimed_bytes: u64,
     /// Physical bytes reclaimed by the storage engine compactor, if known.
     pub physical_reclaimed_bytes: u64,
-    /// Whether physical compaction is still pending or unavailable.
+    /// Whether physical compaction or its complete evidence archive is pending.
+    /// Reclaimed bytes can be nonzero while evidence delivery remains pending.
     pub physical_reclaim_pending: bool,
 }
 
@@ -235,6 +282,10 @@ pub struct AgentSummary {
     /// This is optional for compatibility with pre-UID profile fixtures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_uid: Option<crate::identity::PrincipalUid>,
+    /// User charged for execution, independent of fleet access or delegation.
+    /// Absent for old servers or principals requiring explicit attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accountable_user: Option<crate::UserUid>,
     /// Whether the principal is currently enabled (master switch).
     pub enabled: bool,
     /// Group memberships as written to `profile.toml`.

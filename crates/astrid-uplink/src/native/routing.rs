@@ -27,6 +27,7 @@ const ALLOWED_EGRESS_EXACT: &[&str] = &[
     CHAT_DELTA_TOPIC,
     CHAT_RESPONSE_TOPIC,
     "astrid.v1.elicit",
+    "astrid.v1.private.elicit.request",
     "astrid.v1.onboarding.required",
     "astrid.v1.approval",
     "astrid.v1.capsules_loaded",
@@ -39,6 +40,7 @@ const ALLOWED_EGRESS_PREFIXES: &[&str] = &[
     "registry.v1.selection.",
     "session.v1.response.",
     "cli.v1.command.result.",
+    "astrid.v1.grant.result.",
 ];
 
 const SYSTEM_BROADCAST_EXACT: &[&str] = &["registry.v1.active_model_changed"];
@@ -267,6 +269,9 @@ mod tests {
     #[test]
     fn routes_elicit_requests_but_not_client_responses_on_egress() {
         assert!(egress_allowed("astrid.v1.elicit"));
+        assert!(egress_allowed("astrid.v1.private.elicit.request"));
+        assert!(!ingress_allowed("astrid.v1.private.elicit.request"));
+        assert!(!egress_allowed("astrid.v1.private.elicit.reply"));
         assert!(!egress_allowed("astrid.v1.elicit.response.fake"));
     }
 

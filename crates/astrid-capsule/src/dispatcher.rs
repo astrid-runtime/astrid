@@ -39,10 +39,15 @@ use crate::capsule::{Capsule, CapsuleId};
 use crate::dispatcher::locks::{ChainLocks, acquire_chain_lock};
 use crate::registry::{CapsuleRegistry, RuntimeId};
 use astrid_events::PrincipalKey;
-use astrid_events::{AstridEvent, EventBus, EventReceiver};
+use astrid_events::{AstridEvent, EventBus, OrderedDeliveryReceiver};
 
+mod admission;
+mod consumer;
+mod failure;
+use consumer::run_consumer;
 mod locks;
 mod provision;
+mod wait_graph;
 
 /// Capacity of each per-(capsule, principal) event dispatch queue.
 ///
@@ -110,6 +115,7 @@ struct InterceptorWork {
     /// `invoke_interceptor` so the kernel can set per-invocation
     /// principal context on `HostState`.
     ipc_message: Option<Arc<astrid_events::ipc::IpcMessage>>,
+    failure: Option<failure::TerminalFailure>,
 }
 
 /// Routes events from the `EventBus` to capsule interceptors.
@@ -121,7 +127,8 @@ pub struct EventDispatcher {
     registry: Arc<RwLock<CapsuleRegistry>>,
     event_bus: Arc<EventBus>,
     /// Pre-created receiver so the subscription is counted before `run()` is spawned.
-    receiver: EventReceiver,
+    receiver: OrderedDeliveryReceiver,
+    admitter: Arc<admission::DeferredAdmitter>,
     /// Identity-store presence enables the legacy single-tenant admission
     /// gate. Durable identity and home storage remain kernel-owned; dispatch
     /// never creates or inspects native home paths.
@@ -149,11 +156,18 @@ impl EventDispatcher {
     /// accurate before `run()` is spawned on a background task.
     #[must_use]
     pub fn new(registry: Arc<RwLock<CapsuleRegistry>>, event_bus: Arc<EventBus>) -> Self {
-        let receiver = event_bus.subscribe_as("capsule_dispatcher");
+        let admitter = Arc::new(admission::DeferredAdmitter::default());
+        let delivery: Arc<dyn astrid_events::EventDeliveryAdmitter> = admitter.clone();
+        assert!(
+            event_bus.register_delivery_admitter(&delivery),
+            "one capsule dispatcher per bus"
+        );
+        let receiver = event_bus.subscribe_ordered_delivery();
         Self {
             registry,
             event_bus,
             receiver,
+            admitter,
             identity_store: None,
             chain_locks: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             access_resolver: None,
@@ -200,12 +214,26 @@ impl EventDispatcher {
         // is N independent FIFO consumers, not a single class-keyed
         // queue collapsing the load (#813 Layer 3).
         let capsule_queues: CapsuleQueues = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        assert!(
+            self.admitter
+                .active
+                .set(admission::Admitter {
+                    registry: Arc::clone(&self.registry),
+                    event_bus: Arc::downgrade(&self.event_bus),
+                    queues: Arc::clone(&capsule_queues),
+                    chain_locks: Arc::clone(&self.chain_locks),
+                    access_resolver: self.access_resolver.clone(),
+                    waits: wait_graph::WaitGraph::default(),
+                })
+                .is_ok(),
+            "dispatcher admission activates once"
+        );
         // Admission is intentionally filesystem-free. Durable principal
         // homes are bound by the kernel's UID-backed storage view.
         let mut provisioner = provision::PrincipalProvisioner::new(self.identity_store.is_some());
         debug!("Event dispatcher started");
 
-        while let Some(event) = self.receiver.recv().await {
+        while let Some(delivery) = self.receiver.recv().await {
             // Check for broadcast channel overflow (lost messages).
             let lagged = self.receiver.drain_lagged();
             if lagged > 0 && last_lag_notification.elapsed() >= std::time::Duration::from_secs(10) {
@@ -233,6 +261,9 @@ impl EventDispatcher {
                 });
             }
 
+            let Some(event) = delivery.into_unreserved() else {
+                continue;
+            };
             let (topic, payload_bytes, ipc_message) = match &*event {
                 AstridEvent::Ipc { message, .. } => {
                     // Dispatch-internal topic representation is `Arc<String>`;
@@ -271,16 +302,19 @@ impl EventDispatcher {
             let caller_device_key_id: Option<&str> = ipc_message
                 .as_deref()
                 .and_then(|m| m.device_key_id.as_deref());
+            let caller_request_owner = ipc_message.as_deref().and_then(|m| m.request_owner);
             let matches = find_matching_interceptors(
                 &self.registry,
                 &topic,
                 caller_principal,
                 caller_device_key_id,
+                caller_request_owner,
                 self.access_resolver.as_ref(),
                 &self.event_bus,
             )
             .await;
             dispatch_to_capsule_queues(
+                &self.event_bus,
                 &capsule_queues,
                 &self.chain_locks,
                 matches,
@@ -313,6 +347,7 @@ impl EventDispatcher {
 /// per-(capsule, principal) mpsc queues (preserving IPC `seq` ordering and
 /// isolating principals from one another).
 fn dispatch_to_capsule_queues(
+    event_bus: &Arc<EventBus>,
     queues: &CapsuleQueues,
     chain_locks: &ChainLocks,
     matches: Vec<(RuntimeId, Arc<dyn Capsule>, String, u32)>,
@@ -333,10 +368,13 @@ fn dispatch_to_capsule_queues(
             queues,
             (runtime_id, principal_key),
             capsule,
-            action,
-            topic,
-            payload_bytes,
-            ipc_message,
+            InterceptorWork {
+                action,
+                topic,
+                payload: payload_bytes,
+                failure: failure::TerminalFailure::capture(event_bus, ipc_message.as_deref()),
+                ipc_message,
+            },
         );
         return;
     }
@@ -364,10 +402,13 @@ fn dispatch_to_capsule_queues(
                 queues,
                 (runtime_id, principal_key.clone()),
                 capsule,
-                action,
-                Arc::clone(&topic),
-                Arc::clone(&payload_bytes),
-                ipc_message.clone(),
+                InterceptorWork {
+                    action,
+                    topic: Arc::clone(&topic),
+                    payload: Arc::clone(&payload_bytes),
+                    ipc_message: ipc_message.clone(),
+                    failure: None,
+                },
             );
         }
         return;
@@ -382,6 +423,7 @@ fn dispatch_to_capsule_queues(
     let topic_clone = Arc::clone(&topic);
     let ipc_clone = ipc_message.clone();
     let chain_locks_clone = Arc::clone(chain_locks);
+    let terminal_failure = failure::TerminalFailure::capture(event_bus, ipc_message.as_deref());
     astrid_runtime::spawn(async move {
         let mut current_payload = (*payload_bytes).clone();
 
@@ -440,6 +482,9 @@ fn dispatch_to_capsule_queues(
                         reason = %reason,
                         "Interceptor: Deny — chain halted"
                     );
+                    if let Some(failure) = &terminal_failure {
+                        failure.report(&reason);
+                    }
                     return; // Short-circuit — no further interceptors
                 },
                 Err(crate::error::CapsuleError::NotSupported(ref msg)) => {
@@ -490,7 +535,7 @@ fn get_or_spawn_consumer(
     queues: &CapsuleQueues,
     capsule: &Arc<dyn Capsule>,
     key: (RuntimeId, PrincipalKey),
-) -> mpsc::Sender<InterceptorWork> {
+) -> (wait_graph::ConsumerKey, mpsc::Sender<InterceptorWork>) {
     let mut guard = queues.lock();
     // Never hand back a CLOSED sender. The mapped entry can be stale: an
     // idle-evicting consumer that exited (or, defensively, a consumer task that
@@ -503,7 +548,7 @@ fn get_or_spawn_consumer(
     // `(capsule, Some(principal))` entry — the dead `Sender` and its
     // `PrincipalKey` string would leak and slow `queues_per_capsule`'s scan.
     match guard.get(&key) {
-        Some(s) if !s.is_closed() => return s.clone(),
+        Some(s) if !s.is_closed() => return (key, s.clone()),
         Some(_) => {
             guard.remove(&key);
         },
@@ -529,7 +574,7 @@ fn get_or_spawn_consumer(
         );
         effective_key.1 = None;
         match guard.get(&effective_key) {
-            Some(s) if !s.is_closed() => return s.clone(),
+            Some(s) if !s.is_closed() => return (effective_key, s.clone()),
             // A closed shared sender is removed too. The insert below would
             // overwrite it anyway, but removing keeps the handling uniform with
             // the per-principal path and avoids a transient dead entry.
@@ -550,142 +595,7 @@ fn get_or_spawn_consumer(
     astrid_runtime::spawn(async move {
         run_consumer(rx, capsule_arc, queues_arc, cleanup_key).await;
     });
-    tx
-}
-
-/// Consumer loop for one `(capsule, principal_key)` queue. Idle-evicts
-/// itself after [`IDLE_CONSUMER_GRACE`] of inactivity, atomically
-/// removing its sender from the queue map under the same lock that
-/// `get_or_spawn_consumer` takes — closes the race where an event
-/// arrives between timeout and unmap.
-async fn run_consumer(
-    mut rx: mpsc::Receiver<InterceptorWork>,
-    capsule: Arc<dyn Capsule>,
-    queues: CapsuleQueues,
-    key: (RuntimeId, PrincipalKey),
-) {
-    loop {
-        match astrid_runtime::time::timeout(idle_consumer_grace(), rx.recv()).await {
-            Ok(Some(work)) => {
-                debug!(
-                    capsule_id = %capsule.id(),
-                    action = %work.action,
-                    topic = %work.topic,
-                    "Dispatching interceptor (ordered)"
-                );
-
-                let caller = work.ipc_message.as_deref();
-                match capsule
-                    .invoke_interceptor(&work.action, &work.payload, caller)
-                    .await
-                {
-                    Ok(crate::capsule::InterceptResult::Continue(_)) => {
-                        debug!(
-                            capsule_id = %capsule.id(),
-                            action = %work.action,
-                            "Interceptor completed (Continue)"
-                        );
-                    },
-                    Ok(crate::capsule::InterceptResult::Final(_)) => {
-                        debug!(
-                            capsule_id = %capsule.id(),
-                            action = %work.action,
-                            "Interceptor completed (Final)"
-                        );
-                    },
-                    Ok(crate::capsule::InterceptResult::Deny { reason }) => {
-                        warn!(
-                            capsule_id = %capsule.id(),
-                            action = %work.action,
-                            topic = %work.topic,
-                            reason = %reason,
-                            "Interceptor: Deny"
-                        );
-                    },
-                    Err(crate::error::CapsuleError::NotSupported(ref msg)) => {
-                        debug!(
-                            capsule_id = %capsule.id(),
-                            action = %work.action,
-                            reason = %msg,
-                            "Interceptor skipped (NotSupported)"
-                        );
-                    },
-                    Err(e) => {
-                        warn!(
-                            capsule_id = %capsule.id(),
-                            action = %work.action,
-                            topic = %work.topic,
-                            error = %e,
-                            "Interceptor invocation failed"
-                        );
-                    },
-                }
-            },
-            Ok(None) => {
-                // Sender side hung up (capsule unloaded). Drain
-                // anything queued and exit. Don't bother cleaning
-                // the map entry — the sender is already gone.
-                debug!(
-                    capsule_id = %capsule.id(),
-                    "Per-principal consumer exiting: sender dropped"
-                );
-                return;
-            },
-            Err(_elapsed) => {
-                // Idle-evict — but only when it is provably safe to drop
-                // `rx`, i.e. no queued item AND no other live `Sender`.
-                //
-                // Holding the `queues` lock across the check stops a NEW
-                // `get_or_spawn_consumer` from cloning our sender, but it
-                // does NOT stop a `dispatch_single` that already cloned the
-                // sender (under an earlier lock acquisition) from calling
-                // `try_send` after we remove the entry and drop `rx`: that
-                // send would fail and the event would be lost silently
-                // (TOCTOU). `sender_strong_count` closes it — the map holds
-                // exactly one `Sender` for this key, so a count of 1 means
-                // the map's copy is the ONLY sender and no in-flight
-                // dispatch can still send. Any in-flight clone bumps the
-                // count to ≥2 and we keep running, so the racing `try_send`
-                // lands in `rx` and is drained next iteration. The clone's
-                // count drops back when that dispatch finishes, so a stale
-                // sender can delay eviction by at most one grace window —
-                // bounded, and it always errs toward NOT dropping events.
-                let mut guard = queues.lock();
-                if rx.try_recv().is_err() && rx.sender_strong_count() == 1 {
-                    // KNOWN RESIDUAL (bounded, non-correctness): this `remove` is
-                    // identity-blind — unlike `ChainLockGuard::drop`'s
-                    // `Arc::ptr_eq` guard above, it removes whatever sits at
-                    // `key` even if a *newer* consumer generation was cold-spawned
-                    // (and re-`insert`ed) for this key in the gap between the
-                    // grace timeout firing and this lock acquisition. The
-                    // `sender_strong_count()==1` check reads THIS consumer's own
-                    // channel, decoupled from the map entry, so it cannot catch
-                    // the cross-generation case. Consequence is bounded churn (a
-                    // transient orphaned consumer + a re-spawn), NOT event loss:
-                    // `get_or_spawn_consumer` skips `is_closed()` senders and
-                    // re-spawns, so no dispatch is ever dropped to a reclaimed
-                    // generation. A complete root fix would tag each generation
-                    // (e.g. an `Arc<()>` stored beside the sender) and only
-                    // remove when it matches, mirroring the chain-lock identity
-                    // discipline. Tracked separately; left here so the
-                    // already-shipped, live-verified detect-and-replace fix is
-                    // not entangled with a deeper map-shape change.
-                    guard.remove(&key);
-                    drop(guard);
-                    debug!(
-                        capsule_id = %capsule.id(),
-                        "Per-principal consumer idle-evicted after grace"
-                    );
-                    return;
-                }
-                // Either a racing dispatch landed between the timeout and
-                // the map-lock acquisition, or an in-flight dispatch still
-                // holds a sender clone that may `try_send` — keep running.
-                // The map entry stays valid.
-                drop(guard);
-            },
-        }
-    }
+    (effective_key, tx)
 }
 
 /// Fast path for single-interceptor dispatch — uses per-(capsule,
@@ -697,19 +607,10 @@ fn dispatch_single(
     queues: &CapsuleQueues,
     key: (RuntimeId, PrincipalKey),
     capsule: Arc<dyn Capsule>,
-    action: String,
-    topic: Arc<String>,
-    payload_bytes: Arc<Vec<u8>>,
-    ipc_message: Option<Arc<astrid_events::ipc::IpcMessage>>,
+    work: InterceptorWork,
 ) {
-    let sender = get_or_spawn_consumer(queues, &capsule, key.clone());
-
-    let work = InterceptorWork {
-        action,
-        payload: Arc::clone(&payload_bytes),
-        topic: Arc::clone(&topic),
-        ipc_message: ipc_message.clone(),
-    };
+    let (_, sender) = get_or_spawn_consumer(queues, &capsule, key.clone());
+    let topic = Arc::clone(&work.topic);
     match sender.try_send(work) {
         Ok(()) => {},
         Err(mpsc::error::TrySendError::Closed(work)) => {
@@ -724,7 +625,7 @@ fn dispatch_single(
             // stall under a 100-wide prompt burst — the route's consumer closed
             // and every later prompt was dropped.) The re-spawn just spawned its
             // consumer, so the retry cannot hit the same race.
-            let sender = get_or_spawn_consumer(queues, &capsule, key);
+            let (_, sender) = get_or_spawn_consumer(queues, &capsule, key);
             match sender.try_send(work) {
                 Ok(()) => {},
                 // `Full` after a fresh re-spawn is the same intended shed-load
@@ -782,9 +683,48 @@ async fn find_matching_interceptors(
     topic: &str,
     caller_principal: Option<&str>,
     caller_device_key_id: Option<&str>,
+    caller_request_owner: Option<astrid_events::ipc::RequestOwnerId>,
     access_resolver: Option<&CapsuleAccessResolver>,
     event_bus: &EventBus,
 ) -> Vec<(RuntimeId, Arc<dyn crate::capsule::Capsule>, String, u32)> {
+    let (matches, grants) = collect_matching_interceptors(
+        registry,
+        topic,
+        caller_principal,
+        caller_device_key_id,
+        access_resolver,
+    )
+    .await;
+    if let Some(principal) = caller_principal {
+        for capsule_key in grants {
+            crate::access::emit_grant_required(
+                event_bus,
+                access_resolver,
+                principal,
+                capsule_key,
+                caller_request_owner,
+            )
+            .await;
+        }
+    }
+    matches
+}
+
+type InterceptorMatches = Vec<(RuntimeId, Arc<dyn Capsule>, String, u32)>;
+
+/// Resolve routing without publishing prompts or recording an attempted invocation.
+/// Reservations may be cancelled before their event is committed.
+async fn collect_matching_interceptors(
+    registry: &RwLock<CapsuleRegistry>,
+    topic: &str,
+    caller_principal: Option<&str>,
+    caller_device_key_id: Option<&str>,
+    access_resolver: Option<&CapsuleAccessResolver>,
+) -> (InterceptorMatches, Vec<String>) {
+    // Receipts belong to publisher resource subscriptions, never broad handlers.
+    if astrid_events::ipc::delivery_failure::is_failure_topic(topic) {
+        return (Vec::new(), Vec::new());
+    }
     // Compute the gate once per event, not per capsule. Principal-stamped
     // dispatch is view-scoped when a resolver is present; grant-on-use only
     // engages for the narrower user-invocable surface.
@@ -800,7 +740,7 @@ async fn find_matching_interceptors(
         None
     };
     if access_resolver.is_some() && identity_stamped && resolved_access.is_none() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let registry = registry.read().await;
     let mut matches: Vec<(RuntimeId, Arc<dyn crate::capsule::Capsule>, String, u32)> = Vec::new();
@@ -863,14 +803,12 @@ async fn find_matching_interceptors(
                 .as_ref()
                 .is_some_and(|access| access.is_capsule_allowed(capsule.id()))
         {
-            // Valid resolved callers receive one signal for this matching capsule.
-            if resolved_access.is_some()
-                && let Some(principal) = caller_principal
-            {
+            // Valid resolved callers receive one signal for this matching
+            // capsule, published after the registry lock is released.
+            if resolved_access.is_some() && caller_principal.is_some() {
                 let capsule_key = capsule.id().to_string();
                 if !grant_signalled.contains(&capsule_key) {
-                    grant_signalled.push(capsule_key.clone());
-                    crate::access::emit_grant_required(event_bus, principal, capsule_key);
+                    grant_signalled.push(capsule_key);
                 }
             }
             continue;
@@ -879,6 +817,7 @@ async fn find_matching_interceptors(
             matches.push((runtime_id.clone(), Arc::clone(&capsule), action, priority));
         }
     }
+    drop(registry);
     // Sort by priority (lower fires first), then by capsule id and action as a
     // STABLE tiebreak so equal-priority members have a deterministic order.
     // `registry.list()` iterates a HashMap (arbitrary per run), so a
@@ -895,7 +834,7 @@ async fn find_matching_interceptors(
             .then_with(|| a_cap.id().as_str().cmp(b_cap.id().as_str()))
             .then_with(|| a_act.cmp(b_act))
     });
-    matches
+    (matches, grant_signalled)
 }
 
 fn candidate_capsules_for_dispatch(

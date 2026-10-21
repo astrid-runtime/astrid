@@ -68,6 +68,7 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 # out of the `wasm32-unknown-unknown` browser host profile, which supplies its
 # own execution engine, VFS, and install path.
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+cap-std = "4.0.3"
 astrid-capsule-install = { workspace = true }
 astrid-mcp = { workspace = true }
 astrid-vfs = { workspace = true }
@@ -84,6 +85,9 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 async-trait = { workspace = true }
+astrid-build = { workspace = true }
+sha2 = { workspace = true }
+wat = { workspace = true }
 
 [lints]
 workspace = true

@@ -5,7 +5,7 @@ export PATH
 
 usage() {
   cat >&2 <<'EOF'
-usage: manage-macos-fskit.sh install|update|enable|status|uninstall|validate
+usage: manage-macos-fskit.sh install|update|enable|status|check-process|uninstall|validate
 environment: ASTRID_FSKIT_APP_DEST, ASTRID_FSKIT_BIN_DIR
 EOF
 }
@@ -31,6 +31,11 @@ fi
 SOURCE_APP="$RELEASE_ROOT/AstridFS.app"
 DESTINATION_APP="${ASTRID_FSKIT_APP_DEST:-/Applications/AstridFS.app}"
 VALIDATOR="$RELEASE_ROOT/scripts/validate-macos-fskit.sh"
+EXTENSION_IDENTIFIER=org.astrid.runtime.fs.AppEx
+APP_IDENTIFIER=org.astrid.runtime.fs
+COMPANION_IDENTIFIER=org.astrid.runtime.fs.storage-provider-fskit
+CODE_SIGN_TEAM=9BDSL5BJAP
+APP_EXECUTABLE="$DESTINATION_APP/Contents/MacOS/AstridFS"
 if [[ ! -x "$VALIDATOR" ]]; then
   VALIDATOR="$MANAGER_DIR/validate-macos-fskit.sh"
 fi
@@ -43,18 +48,59 @@ validate_app() {
   "$VALIDATOR" "$1"
 }
 
+extension_record() {
+  /usr/bin/pluginkit -m -A -D -v -i "$EXTENSION_IDENTIFIER"
+}
+
+extension_is_elected() {
+  local extension_path records elected_record elected_info elected_path
+  local installed_short version_token expected_prefix
+  extension_path="$DESTINATION_APP/Contents/Extensions/AstridFSAppEx.appex"
+  records="$(extension_record)" || return 1
+  elected_record="$(printf '%s\n' "$records" | /usr/bin/awk -F '\t' '
+    $1 ~ /^\+[[:space:]]*/ {
+      elected = $0
+      count++
+    }
+    END {
+      if (count != 1) {
+        exit 1
+      }
+      print elected
+    }')" || return 1
+  IFS=$'\t' read -r elected_info _ _ elected_path <<<"$elected_record"
+  [[ "$elected_path" == "$extension_path" ]] || return 1
+  expected_prefix="+    $EXTENSION_IDENTIFIER("
+  case "$elected_info" in
+    "$expected_prefix"*) ;;
+    *) return 1 ;;
+  esac
+  version_token="${elected_info#"$expected_prefix"}"
+  version_token="${version_token%)}"
+  [[ "$version_token" != "$elected_info" && -n "$version_token" ]] || return 1
+  installed_short="$(plutil -extract CFBundleShortVersionString raw -expect string \
+    "$extension_path/Contents/Info.plist")"
+  # PlugInKit's parenthetical binds to the extension's short version only.
+  [[ "$version_token" == "$installed_short" ]]
+}
+
+require_extension_elected() {
+  if extension_is_elected; then
+    return 0
+  fi
+  echo "AstridFS is installed but macOS has not elected $EXTENSION_IDENTIFIER from $DESTINATION_APP." >&2
+  echo "Open System Settings > General > Login Items & Extensions > File System Extensions, enable AstridFS, then rerun this command." >&2
+  extension_record >&2 || true
+  return 1
+}
+
 companion_path() {
   if [[ -x "$RELEASE_ROOT/astrid-storage-provider-fskit" ]]; then
     printf '%s\n' "$RELEASE_ROOT/astrid-storage-provider-fskit"
     return
   fi
-  local companion
-  companion="$(command -v astrid-storage-provider-fskit || true)"
-  [[ -n "$companion" && -x "$companion" ]] || {
-    echo "missing co-installed astrid-storage-provider-fskit" >&2
-    return 1
-  }
-  printf '%s\n' "$companion"
+  echo "missing co-installed astrid-storage-provider-fskit beside AstridFS.app" >&2
+  return 1
 }
 
 companion_target() {
@@ -65,6 +111,121 @@ companion_target() {
   else
     printf '%s\n' "/usr/local/bin/astrid-storage-provider-fskit"
   fi
+}
+
+validate_companion() {
+  local companion=$1 app_version provider_output provider_version request_id
+  /usr/bin/codesign --verify --strict --verbose=2 "$companion"
+  provider_output="$(/usr/bin/codesign --display --verbose=4 "$companion" 2>&1)"
+  grep -Fx "Identifier=$COMPANION_IDENTIFIER" <<<"$provider_output" >/dev/null
+  grep -Fx "TeamIdentifier=$CODE_SIGN_TEAM" <<<"$provider_output" >/dev/null
+  app_version="$(plutil -extract CFBundleShortVersionString raw -expect string \
+    "$SOURCE_APP/Contents/Info.plist")"
+  request_id="$(/usr/bin/uuidgen)" || {
+    echo "unable to generate a request ID for the FSKit companion probe" >&2
+    return 1
+  }
+  provider_output="$(printf '%s\n' \
+    "{\"protocol_version\":1,\"request_id\":\"$request_id\",\"acting_principal_hint\":\"default\",\"operation\":{\"operation\":\"status\",\"selector\":{\"kind\":\"native-path\",\"value\":\"/\"}}}" \
+    | "$companion" --astrid-provider-stdio-v1)" || {
+    echo "the FSKit companion failed its provider identity probe" >&2
+    return 1
+  }
+  provider_version="$(sed -nE 's/.*"name":"astrid-storage-provider-fskit","version":"([^"]+)".*/\1/p' \
+    <<<"$provider_output" | head -n 1)"
+  [[ -n "$provider_version" && "${provider_version%%-*}" == "$app_version" ]] || {
+    echo "FSKit companion version $provider_version does not match AstridFS $app_version" >&2
+    return 1
+  }
+  if [[ -n "${ASTRID_FSKIT_EXPECTED_VERSION:-}" && "$provider_version" != "$ASTRID_FSKIT_EXPECTED_VERSION" ]]; then
+    echo "FSKit companion version $provider_version does not match the exact expected runtime" >&2
+    return 1
+  fi
+}
+
+app_process_matches() {
+  local pid=$1 require_version=${2:-1} process_path loaded_path signature installed_version
+  process_path="$(/bin/ps -p "$pid" -o comm=)" || return 1
+  [[ "$process_path" == "$APP_EXECUTABLE" ]] || return 1
+  loaded_path="$(/usr/sbin/lsof -p "$pid" -a -d txt -Fn \
+    | /usr/bin/sed -n 's/^n//p' | /usr/bin/head -n 1)" || return 1
+  [[ "$loaded_path" == "$APP_EXECUTABLE" ]] || return 1
+  signature="$(/usr/bin/codesign --display --verbose=4 "$process_path" 2>&1)" || return 1
+  grep -Fx "Identifier=$APP_IDENTIFIER" <<<"$signature" >/dev/null || return 1
+  grep -Fx "TeamIdentifier=$CODE_SIGN_TEAM" <<<"$signature" >/dev/null || return 1
+  installed_version="$(plutil -extract CFBundleShortVersionString raw -expect string \
+    "$DESTINATION_APP/Contents/Info.plist")" || return 1
+  [[ -n "$installed_version" ]] || return 1
+  if [[ "$require_version" == 1 && -n "${ASTRID_FSKIT_EXPECTED_VERSION:-}" ]]; then
+    [[ "$installed_version" == "${ASTRID_FSKIT_EXPECTED_VERSION%%-*}" ]] || return 1
+  fi
+  return 0
+}
+
+stop_app_before_replacement() {
+  local pids pid started current_started attempts mount_records status
+  # Mounts can outlive the host app process. Inspect them even on cold install.
+  mount_records="$(/sbin/mount)" || return 1
+  if /usr/bin/grep -Fq astridfs <<<"$mount_records"; then
+    echo "Unmount Astrid filesystems before updating the running AstridFS app." >&2
+    return 1
+  fi
+  if pids="$(/usr/bin/pgrep -x AstridFS)"; then
+    :
+  else
+    status=$?
+    [[ "$status" == 1 ]] && return 0
+    echo "Cannot inspect running AstridFS processes; refusing replacement." >&2
+    return 1
+  fi
+  # Validate every process before signalling any. The old installed version is
+  # legitimate here; the new expected version is checked after activation.
+  while IFS= read -r pid; do
+    app_process_matches "$pid" 0 || {
+      echo "Cannot safely stop AstridFS PID $pid; its loaded app identity differs from $DESTINATION_APP. Quit that app and retry the update." >&2
+      return 1
+    }
+  done <<<"$pids"
+  while IFS= read -r pid; do
+    started="$(/bin/ps -p "$pid" -o lstart=)" || return 1
+    app_process_matches "$pid" 0 || return 1
+    current_started="$(/bin/ps -p "$pid" -o lstart=)" || return 1
+    [[ -n "$started" && "$started" == "$current_started" ]] || return 1
+    /bin/kill -TERM "$pid" || return 1
+    for ((attempts = 0; attempts < 50; attempts++)); do
+      current_started="$(/bin/ps -p "$pid" -o lstart=)" || break
+      [[ "$current_started" == "$started" ]] || break
+      /bin/sleep 0.1
+    done
+    current_started="$(/bin/ps -p "$pid" -o lstart=)" || current_started=
+    if [[ "$current_started" == "$started" ]]; then
+      echo "AstridFS PID $pid did not exit; the installed app has not been replaced. Quit it and retry." >&2
+      return 1
+    fi
+  done <<<"$pids"
+  # A concurrent launch must not survive while we move its executable away.
+  if /usr/bin/pgrep -x AstridFS >/dev/null; then
+    echo "AstridFS launched during the update; retry after closing it." >&2
+    return 1
+  else
+    status=$?
+    [[ "$status" == 1 ]] || return 1
+  fi
+}
+
+check_app_processes() {
+  local pid pids
+  pids="$(/usr/bin/pgrep -x AstridFS)" || {
+    echo "AstridFS is not running at $APP_EXECUTABLE" >&2
+    return 1
+  }
+  while IFS= read -r pid; do
+    app_process_matches "$pid" || {
+      echo "AstridFS PID $pid does not match $APP_EXECUTABLE, $APP_IDENTIFIER, team $CODE_SIGN_TEAM, and the installed Astrid version" >&2
+      return 1
+    }
+  done <<<"$pids"
+  printf 'AstridFS process identity verified: %s\n' "$(printf '%s\n' "$pids" | paste -sd, -)"
 }
 
 TRANSACTION_ACTIVE=0
@@ -122,6 +283,7 @@ install_app() {
   validate_app "$SOURCE_APP"
   local companion_source
   companion_source="$(companion_path)"
+  validate_companion "$companion_source"
   COMPANION_TARGET="$(companion_target)"
   [[ ! -L "$DESTINATION_APP" && ! -L "$COMPANION_TARGET" ]] || {
     echo "refusing to replace a redirected AstridFS app or companion" >&2
@@ -148,6 +310,7 @@ install_app() {
   /usr/bin/ditto "$SOURCE_APP" "$APP_STAGE"
   validate_app "$APP_STAGE"
   /usr/bin/install -m 0755 "$companion_source" "$COMPANION_STAGE"
+  stop_app_before_replacement
   if [[ -e "$DESTINATION_APP" ]]; then
     /bin/mv "$DESTINATION_APP" "$APP_BACKUP"
     APP_BACKED_UP=1
@@ -181,12 +344,25 @@ case "$COMMAND" in
     ;;
   enable)
     validate_app "$DESTINATION_APP"
-    open "$DESTINATION_APP"
-    echo "AstridFS launched. Enable AstridFS in System Settings when macOS prompts you."
+    open -gj "$DESTINATION_APP"
+    for _ in {1..30}; do
+      if extension_is_elected && check_app_processes; then
+        echo "AstridFS is elected for CLI-controlled mounts."
+        exit 0
+      fi
+      sleep 1
+    done
+    require_extension_elected
+    check_app_processes
+    ;;
+  check-process)
+    validate_app "$DESTINATION_APP"
+    check_app_processes
     ;;
   status)
     validate_app "$DESTINATION_APP"
-    echo "AstridFS is installed, signed, and notarized at $DESTINATION_APP"
+    require_extension_elected
+    echo "AstridFS is installed, signed, notarized, and elected at $DESTINATION_APP"
     if /sbin/mount | grep -Fq astridfs; then
       /sbin/mount | grep -F astridfs
     else

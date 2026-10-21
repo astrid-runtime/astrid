@@ -114,7 +114,7 @@ async fn handle_request(
                 },
             )
             .await;
-            agent_derive_from_req(kernel, request.request).await
+            agent_derive_from_req(kernel, &caller, request.request).await
         },
         Err(error) => {
             let error = error.to_string();
@@ -166,6 +166,7 @@ fn publish(
 
 pub(super) async fn agent_derive_from_req(
     kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
     req: AgentDeriveRequest,
 ) -> AdminResponseBody {
     let AgentDeriveRequest {
@@ -188,10 +189,25 @@ pub(super) async fn agent_derive_from_req(
     if profile_path.exists() {
         return err_bad_input(format!("principal `{principal}` already exists"));
     }
+    let creator = match kernel.principal_directory.uid_for(caller) {
+        Ok(uid) => uid,
+        Err(error) => return err_bad_input(error.to_string()),
+    };
+    let ownership = match kernel
+        .ownership_store
+        .capture_derived_ownership(creator)
+        .await
+    {
+        Ok(ownership) => ownership,
+        Err(error) => return err_bad_input(format!("spawn ownership rejected: {error}")),
+    };
     super::agent_create_helpers::provision_derived_principal(
         kernel,
-        principal,
-        profile_path,
+        super::agent_create_helpers::DerivedPrincipalTarget {
+            principal,
+            profile_path,
+            ownership,
+        },
         source,
         load_capsules,
         allow_capsules,

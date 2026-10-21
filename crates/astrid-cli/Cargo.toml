@@ -24,7 +24,11 @@ path = "src/build.rs"
 name = "astrid-emit"
 path = "src/emit.rs"
 
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { workspace = true }
+
 [dependencies]
+astrid-workspace = { workspace = true }
 astrid-build = { workspace = true }
 astrid-emit = { workspace = true }
 anyhow = { workspace = true }
@@ -62,7 +66,10 @@ nix = { workspace = true }
 ratatui = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true, features = ["json", "stream"] }
-rmcp = { workspace = true }
+rmcp = { workspace = true, features = ["transport-streamable-http-server"] }
+axum = { workspace = true }
+subtle = { workspace = true }
+jsonwebtoken = { workspace = true }
 rustyline = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
@@ -77,6 +84,7 @@ thiserror = { workspace = true }
 # `net` (socket/TCP clients), `rt-multi-thread` (`#[tokio::main]`): native-only,
 # no longer in the workspace tokio base.
 tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
+tokio-util = { workspace = true }
 toml = { workspace = true }
 toml_edit = "0.25.3"
 tracing = { workspace = true }
@@ -86,6 +94,7 @@ uuid = { workspace = true }
 which = { workspace = true }
 
 [dev-dependencies]
+astrid-uplink = { workspace = true, features = ["test-support"] }
 insta = { workspace = true }
 
 [lints]

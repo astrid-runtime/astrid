@@ -16,12 +16,15 @@ pub mod context;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod discovery;
 pub mod dispatcher;
+pub mod elicitation;
 pub mod engine;
 // The loader constructs the Wasmtime/process-backed engines, so it is
 // native-only. An alternate host wires its own engines into `CompositeCapsule`.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod loader;
 pub mod memory_ledger;
+#[cfg(test)]
+mod ownership_test_support;
 
 // Engine-agnostic capsule types live in `astrid-capsule-types` so the browser
 // WebAssembly host can share them without pulling Wasmtime. Re-exported here at
@@ -40,6 +43,7 @@ pub mod stamp;
 pub mod tool_discovery;
 pub mod topic;
 pub mod toposort;
+pub mod user_cpu;
 // The manifest watcher drives hot-reload via the native `notify` crate; an
 // alternate host has no OS filesystem-watch facility.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -47,7 +51,11 @@ pub(crate) mod watcher;
 
 pub use access::CapsuleAccessResolver;
 pub use astrid_capsule_types::limits::{CapsuleRuntimeLimits, HttpLimits};
-pub use audit_sink::{HostAuditEvent, HostAuditOutcome, HostAuditSink};
+pub use audit_sink::{
+    HostApprovalDecision, HostApprovalScope, HostAuditActor, HostAuditEvent, HostAuditOutcome,
+    HostAuditReceipt, HostAuditRefusal, HostAuditSink, HostHttpRequest, HostHttpResponse,
+    attribute_sink,
+};
 pub use fuel_ledger::{FuelLedger, FuelRateLimiter, invocation_fuel_share};
 pub use memory_ledger::MemoryLedger;
 // `StoreMemoryMeter` is the Wasmtime `ResourceLimiter`; native-only.

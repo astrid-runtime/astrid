@@ -1,17 +1,14 @@
-/*
-See the LICENSE.txt file for this sample’s licensing information.
+import AppKit
 
-Abstract:
-The app's top-level SwiftUI body.
-*/
-
-import SwiftUI
-
+/// The macOS-required container for Astrid's FSKit extension.
+///
+/// Storage lifecycle is controlled exclusively by `astrid storage`. The
+/// containing process has no scenes, windows, menu-bar item, or Dock presence.
 @main
-struct AstridFSApp: App {
-    var body: some Scene {
-        WindowGroup {
-            ContentView()
-        }
+enum AstridFSApp {
+    static func main() {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.prohibited)
+        application.run()
     }
 }

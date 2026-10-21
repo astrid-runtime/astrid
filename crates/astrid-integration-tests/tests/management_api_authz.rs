@@ -63,10 +63,15 @@ fn all_requests() -> Vec<KernelRequest> {
             provenance: None,
             authority: CapsuleInstallAuthority::default(),
             env: Vec::new(),
+            expected_generation: None,
+            batch: None,
         },
         KernelRequest::ListCapsules,
         KernelRequest::GetCommands,
         KernelRequest::GetCapsuleMetadata,
+        KernelRequest::GetCapsuleMetadataForPrincipal {
+            target_principal: PrincipalId::default(),
+        },
         KernelRequest::ApproveCapability {
             request_id: "r".to_string(),
             signature: "s".to_string(),
@@ -137,6 +142,8 @@ fn agent_group_allows_self_scoped_capsule_surface() {
             provenance: None,
             authority: CapsuleInstallAuthority::default(),
             env: Vec::new(),
+            expected_generation: None,
+            batch: None,
         },
         KernelRequest::ReloadCapsule {
             id: "astrid-capsule-registry".to_string(),
@@ -169,6 +176,8 @@ fn agent_group_allows_self_scoped_capsule_surface() {
                 provenance: None,
                 authority: CapsuleInstallAuthority::default(),
                 env: Vec::new(),
+                expected_generation: None,
+                batch: None,
             }
         )
         .is_err(),
@@ -307,6 +316,8 @@ fn custom_group_capabilities_gate_admin_surface() {
             provenance: None,
             authority: CapsuleInstallAuthority::default(),
             env: Vec::new(),
+            expected_generation: None,
+            batch: None,
         },
     )
     .unwrap();
@@ -324,7 +335,9 @@ fn custom_group_capabilities_gate_admin_surface() {
                 target_principal: None,
                 provenance: None,
                 authority: CapsuleInstallAuthority::default(),
-                env: Vec::new()
+                env: Vec::new(),
+                expected_generation: None,
+                batch: None,
             }
         )
         .is_err()
@@ -341,6 +354,8 @@ fn custom_group_capabilities_gate_admin_surface() {
             provenance: None,
             authority: CapsuleInstallAuthority::default(),
             env: Vec::new(),
+            expected_generation: None,
+            batch: None,
         },
     )
     .unwrap();
@@ -366,6 +381,7 @@ fn admin_vs_agent_cross_tenant_matrix() {
             KernelRequest::Shutdown { .. }
             | KernelRequest::GetStatus
             | KernelRequest::ReloadCapsules
+            | KernelRequest::GetCapsuleMetadataForPrincipal { .. }
             | KernelRequest::InstallCapsule {
                 workspace: false,
                 target_principal: Some(_),
@@ -386,6 +402,8 @@ fn admin_vs_agent_cross_tenant_matrix() {
         provenance: None,
         authority: CapsuleInstallAuthority::default(),
         env: Vec::new(),
+        expected_generation: None,
+        batch: None,
     };
     assert!(
         authorize(&agent, &groups, &agent_principal(), &cross_target_install,).is_err(),

@@ -397,7 +397,7 @@ async fn failed_stop_retains_blocker_until_provider_cleanup_succeeds() {
             },
         },
         shared: None,
-        mount_root: mount_root.clone(),
+        paths: retained_provider_mount_paths(&mount_root),
         cleaned: false,
     };
     let mut projections = BTreeMap::new();
@@ -439,6 +439,17 @@ async fn failed_stop_retains_blocker_until_provider_cleanup_succeeds() {
     );
     assert!(!guard.contains_key(&key));
     assert!(!mount_root.exists());
+}
+
+fn retained_provider_mount_paths(
+    mount_root: &Path,
+) -> crate::storage_mount::process_broker::ProjectionMountPaths {
+    crate::storage_mount::process_broker::ProjectionMountPaths {
+        mount_root: mount_root.to_path_buf(),
+        workspace: mount_root.join("workspace"),
+        owner: mount_root.join("owner"),
+        fleet_shared: None,
+    }
 }
 
 #[cfg(unix)]

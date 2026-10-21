@@ -11,7 +11,6 @@ from pathlib import Path
 
 import release_manifest
 import musl_release_manifest
-import windows_release_manifest
 
 
 FIXED_PAYLOADS = ("BLAKE3SUMS.txt", "SHA256SUMS.txt")
@@ -68,12 +67,15 @@ def validate_release_assets(
         "release manifest contracts commit does not match the tagged submodule",
     )
 
-    archives = {target["asset"] for target in metadata["targets"]}
-    payloads = archives | set(FIXED_PAYLOADS) | {metadata_name}
-    extension_contracts = (
-        (musl_release_manifest, release_manifest.MUSL_TARGETS),
-        (windows_release_manifest, release_manifest.WINDOWS_TARGETS),
-    )
+    windows_assets = {
+        release_manifest.expected_asset(version, target)
+        for target in release_manifest.WINDOWS_TARGETS
+    }
+    windows_markers = {
+        f"astrid-{version}-windows-release.toml",
+        *windows_assets,
+    }
+    windows_markers |= {f"{name}.sigstore.json" for name in windows_markers}
     checksum_assets = set(
         release_manifest.read_checksums(
             directory / "BLAKE3SUMS.txt", "BLAKE3"
@@ -83,8 +85,19 @@ def validate_release_assets(
             directory / "SHA256SUMS.txt", "SHA-256"
         )
     )
-    extension_metadata = []
     entry_names = {path.name for path in entries}
+    forbidden_windows = sorted((entry_names | checksum_assets) & windows_markers)
+    require(
+        not forbidden_windows,
+        f"stable publication rejects Windows release assets: {forbidden_windows}",
+    )
+
+    archives = {target["asset"] for target in metadata["targets"]}
+    payloads = archives | set(FIXED_PAYLOADS) | {metadata_name}
+    extension_contracts = (
+        (musl_release_manifest, release_manifest.MUSL_TARGETS),
+    )
+    extension_metadata = []
     for module, extension_targets in extension_contracts:
         extension_name = module.metadata_name(version)
         extension_archives = {

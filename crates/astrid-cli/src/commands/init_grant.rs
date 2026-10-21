@@ -12,7 +12,6 @@ use std::future::Future;
 
 use anyhow::{Context, bail};
 use astrid_capsule::capsule::CapsuleId;
-#[cfg(test)]
 use astrid_capsule::manifest::CapsuleManifest;
 use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
@@ -20,6 +19,23 @@ use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
 use fs2::FileExt;
 
 use crate::theme::Theme;
+
+/// Called only after the complete selected set earned its durable lock.
+/// Explicit grants include verified resumed members; plain resume remains inert.
+pub(super) fn completed_grant_names(
+    explicit: bool,
+    completed: &[super::LockedCapsule],
+    newly_installed: &[String],
+) -> Vec<String> {
+    if explicit {
+        completed
+            .iter()
+            .map(|capsule| capsule.name.clone())
+            .collect()
+    } else {
+        newly_installed.to_vec()
+    }
+}
 
 /// Guard: `--grant-capsules` may only be honoured alongside a distro
 /// install, because the grant set is exactly the capsules that distro
@@ -40,6 +56,36 @@ pub(super) fn validate_grant_capsules(
         );
     }
     Ok(())
+}
+
+/// Complete the mandatory second Distro Apply stage for the authenticated
+/// caller. The kernel derives both target and member set from its admitted
+/// lock; no capsule names cross this boundary.
+pub(crate) async fn apply_self_grant(caller: &PrincipalId) -> anyhow::Result<()> {
+    eprintln!(
+        "{}",
+        Theme::info(&format!("Granting Distro capsule access to '{caller}'..."))
+    );
+    let mut client = crate::admin_client::connect_for_workspace_as(caller.clone())
+        .await
+        .context("Distro install committed, but connecting for the self grant failed")?;
+    let body = client
+        .request(AdminRequestKind::DistroSelfGrant)
+        .await
+        .context("Distro install committed, but the self-grant request failed")?;
+    match crate::admin_client::into_result(body)? {
+        AdminResponseBody::Success(_) => {
+            eprintln!(
+                "{}",
+                Theme::success("Distro apply and self grant completed.")
+            );
+            Ok(())
+        },
+        other => bail!(
+            "Distro install committed, but the self grant failed unexpectedly: {other:?}; \
+             the installed set is not invokable until a retry completes"
+        ),
+    }
 }
 
 /// What the post-install grant step should do, given the flag and how many
@@ -166,11 +212,19 @@ impl ProvisioningLock {
 
 /// Prove that every fresh-lock entry still describes an installed capsule for
 /// the target before those names become an authorization grant set.
-#[cfg(test)]
 pub(super) fn validate_locked_capsules(
     home: &AstridHome,
     target: &PrincipalId,
     locked: &[super::LockedCapsule],
+) -> anyhow::Result<Vec<String>> {
+    validate_locked_capsules_with_store(home, target, locked, None)
+}
+
+fn validate_locked_capsules_with_store(
+    home: &AstridHome,
+    target: &PrincipalId,
+    locked: &[super::LockedCapsule],
+    store: Option<&astrid_storage::RuntimePrincipalStore>,
 ) -> anyhow::Result<Vec<String>> {
     let mut installed = Vec::with_capacity(locked.len());
     for capsule in locked {
@@ -223,6 +277,7 @@ pub(super) fn validate_locked_capsules(
             &manifest,
             meta.wasm_hash.as_deref(),
             &capsule.hash,
+            store,
         )?;
         installed.push(expected.as_str().to_string());
     }
@@ -295,13 +350,13 @@ pub(super) async fn validated_grant_set_for_reuse(
     }
 }
 
-#[cfg(test)]
 fn validate_locked_wasm(
     home: &AstridHome,
     capsule: &CapsuleId,
     manifest: &CapsuleManifest,
     meta_hash: Option<&str>,
     locked_hash: &str,
+    store: Option<&astrid_storage::RuntimePrincipalStore>,
 ) -> anyhow::Result<()> {
     let declares_wasm = manifest_declares_wasm(manifest);
     let Some(meta_hash) = meta_hash else {
@@ -324,14 +379,41 @@ fn validate_locked_wasm(
     if meta_hash != locked_hex {
         bail!("Distro.lock capsule '{capsule}' hash disagrees with installed metadata");
     }
-    let blob_path = home.bin_dir().join(format!("{locked_hex}.wasm"));
-    let bytes = std::fs::read(&blob_path).with_context(|| {
-        format!(
-            "Distro.lock capsule '{}' content blob is missing or unreadable at {}",
-            capsule,
-            blob_path.display()
-        )
-    })?;
+    let bytes = if let Some(store) = store {
+        let name = astrid_storage::ContentName::new(format!("bin/{locked_hex}.wasm"))?;
+        let descriptor = store
+            .content()
+            .describe(&astrid_storage::StateOwner::System, &name)
+            .map_err(|error| anyhow::anyhow!(error))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Distro.lock capsule '{capsule}' catalog entry is missing: bin/{locked_hex}.wasm"
+                )
+            })?;
+        store
+            .content()
+            .read_range(
+                &astrid_storage::StateOwner::System,
+                &name,
+                0,
+                descriptor.logical_bytes(),
+            )
+            .map_err(|error| anyhow::anyhow!(error))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Distro.lock capsule '{capsule}' catalog entry has no readable bytes: bin/{locked_hex}.wasm"
+                )
+            })?
+    } else {
+        let blob_path = home.bin_dir().join(format!("{locked_hex}.wasm"));
+        std::fs::read(&blob_path).with_context(|| {
+            format!(
+                "Distro.lock capsule '{}' content blob is missing or unreadable at {}",
+                capsule,
+                blob_path.display()
+            )
+        })?
+    };
     let actual = blake3::hash(&bytes);
     if actual != locked {
         bail!("Distro.lock capsule '{capsule}' content blob bytes do not match hash {locked_hash}");
@@ -339,7 +421,6 @@ fn validate_locked_wasm(
     Ok(())
 }
 
-#[cfg(test)]
 fn parse_locked_blake3(capsule: &CapsuleId, value: &str) -> anyhow::Result<blake3::Hash> {
     let Some(hex) = value.strip_prefix("blake3:") else {
         bail!("Distro.lock capsule '{capsule}' requires a canonical blake3:<hex> WASM hash");
@@ -353,7 +434,6 @@ fn parse_locked_blake3(capsule: &CapsuleId, value: &str) -> anyhow::Result<blake
     Ok(hash)
 }
 
-#[cfg(test)]
 fn manifest_declares_wasm(manifest: &CapsuleManifest) -> bool {
     manifest
         .components
@@ -462,6 +542,32 @@ mod tests {
     use super::*;
     use crate::commands::capsule::{install, meta};
     use crate::commands::init::LockedCapsule;
+
+    #[test]
+    fn explicit_grants_include_completed_batches_and_idempotent_resume() {
+        let completed: Vec<_> = (0..22)
+            .map(|i| LockedCapsule {
+                name: format!("capsule-{i}"),
+                version: "1.0.0".into(),
+                source: "local.capsule".into(),
+                hash: "verified".into(),
+                resolved_ref: None,
+            })
+            .collect();
+        let expected: Vec<_> = completed.iter().map(|cap| cap.name.clone()).collect();
+        let final_batch = expected[20..].to_vec();
+        assert_eq!(
+            completed_grant_names(true, &completed, &final_batch),
+            expected
+        );
+        assert_eq!(completed_grant_names(true, &completed, &[]), expected);
+        assert_eq!(
+            completed_grant_names(false, &completed, &final_batch),
+            final_batch
+        );
+        assert!(completed_grant_names(false, &completed, &[]).is_empty());
+    }
+    use std::sync::Arc;
 
     /// (c) The flag is only meaningful with a distro to resolve the grant
     /// set: setting it without a distro source is a hard error.
@@ -674,6 +780,76 @@ mod tests {
         std::fs::remove_file(blob).unwrap();
         let err = validate_locked_capsules(&home, &target, &locked).unwrap_err();
         assert!(err.to_string().contains("missing or unreadable"));
+    }
+
+    #[test]
+    fn fresh_lock_rehashes_catalog_wasm_bytes_when_store_is_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(dir.path());
+        home.ensure().unwrap();
+        let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
+            Arc::new(|owner: &astrid_storage::StateOwner| {
+                Ok(match owner {
+                    astrid_storage::StateOwner::User(_) => {
+                        return Err(astrid_storage::StorageError::Internal(
+                            "test quota resolver rejects user StateOwner".to_owned(),
+                        ));
+                    },
+                    astrid_storage::StateOwner::System => None,
+                    astrid_storage::StateOwner::Principal(_)
+                    | astrid_storage::StateOwner::Fleet(_) => Some(u64::MAX),
+                })
+            });
+        let store = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(astrid_storage::open_runtime_principal_store(&home, quota))
+            .unwrap();
+        let target = PrincipalId::new("alice").unwrap();
+        let install_dir = install::resolve_target_dir_for(&home, &target, "cli", false).unwrap();
+        std::fs::create_dir_all(&install_dir).unwrap();
+        std::fs::write(
+            install_dir.join("Capsule.toml"),
+            "[package]\nname = \"cli\"\nversion = \"1.0.0\"\n\n[[component]]\nfile = \"cli.wasm\"\n",
+        )
+        .unwrap();
+        let wasm = b"catalog wasm bytes".to_vec();
+        let hash = blake3::hash(&wasm).to_hex().to_string();
+        meta::write_meta(
+            &install_dir,
+            &meta::CapsuleMeta {
+                version: "1.0.0".to_string(),
+                wasm_hash: Some(hash.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let locked = vec![LockedCapsule {
+            name: "cli".to_string(),
+            version: "1.0.0".to_string(),
+            source: "@example/cli".to_string(),
+            hash: format!("blake3:{hash}"),
+            resolved_ref: Some("v1.0.0".to_string()),
+        }];
+        let name = astrid_storage::ContentName::new(format!("bin/{hash}.wasm")).unwrap();
+        store
+            .content()
+            .put(&astrid_storage::StateOwner::System, &name, &wasm)
+            .unwrap();
+        let staging_intent = home.content_staging_path().join("intents.v1.log");
+        std::fs::create_dir_all(staging_intent.parent().unwrap()).unwrap();
+        std::fs::write(&staging_intent, b"catalog fixture").unwrap();
+        store
+            .publish_runtime_projection(&home)
+            .expect("admit catalog fixture projection");
+
+        assert_eq!(
+            validate_locked_capsules_with_store(&home, &target, &locked, Some(&store)).unwrap(),
+            vec!["cli"]
+        );
+        assert!(
+            !home.bin_dir().join(format!("{hash}.wasm")).exists(),
+            "Distro.lock verification must not require a POSIX WASM blob"
+        );
     }
 
     #[test]

@@ -10,6 +10,8 @@ on:
       - 'crates/astrid-storage-provider-fskit/**'
       - 'e2e/fixtures/astrid-capsule-adversarial/**'
       - 'scripts/test_v0104_macos_upgrade.sh'
+      - 'scripts/e2e/hosted-owner-ci.sh'
+      - 'scripts/e2e/fixtures/hosted-owner-ci-keys.json'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - '.github/workflows/macos-v0104-upgrade.yml'
@@ -22,6 +24,8 @@ on:
       - 'crates/astrid-storage-provider-fskit/**'
       - 'e2e/fixtures/astrid-capsule-adversarial/**'
       - 'scripts/test_v0104_macos_upgrade.sh'
+      - 'scripts/e2e/hosted-owner-ci.sh'
+      - 'scripts/e2e/fixtures/hosted-owner-ci-keys.json'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - '.github/workflows/macos-v0104-upgrade.yml'
@@ -38,7 +42,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 

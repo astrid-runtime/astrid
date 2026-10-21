@@ -68,16 +68,18 @@ pub(crate) fn inject_tools(meta: Option<Value>, tools: Value) -> Value {
 }
 
 /// Build the `astrid.v1.capsules_loaded` payload from per-capsule
-/// `(principal, name, opaque meta)` tuples.
+/// `(principal, name, live source_id, opaque meta)` tuples.
 ///
 /// Retains the legacy `status: "ready"` field so subscribers that treat the
 /// event as a bare signal (the `astrid mcp serve` shim, the TUI) keep working;
 /// `capsules` is additive. Each `meta` value is forwarded verbatim. The
 /// per-entry `principal` field lets newer clients verify the payload belongs
-/// to their principal view while preserving the old `name`/`meta` shape for
-/// compatibility.
+/// to their principal view, while `source_id` identifies the live capsule
+/// instance that the kernel stamps onto its IPC. Existing `name`/`meta` fields
+/// remain unchanged for compatibility. A missing source identity is encoded as
+/// `null` so consumers that require provenance can fall back or fail closed.
 pub(crate) fn build_capsules_loaded_payload(
-    entries: Vec<(String, String, Option<Value>)>,
+    entries: Vec<(String, String, Option<String>, Option<Value>)>,
 ) -> Value {
     build_capsules_loaded_payload_with_optional_epoch(entries, None)
 }
@@ -86,21 +88,26 @@ pub(crate) fn build_capsules_loaded_payload(
 /// MCP namespace epoch.  The epoch is omitted when snapshot production failed;
 /// consumers must treat that hint as malformed and perform a full resnapshot.
 pub(crate) fn build_capsules_loaded_payload_with_epoch(
-    entries: Vec<(String, String, Option<Value>)>,
+    entries: Vec<(String, String, Option<String>, Option<Value>)>,
     epoch: u64,
 ) -> Value {
     build_capsules_loaded_payload_with_optional_epoch(entries, Some(epoch))
 }
 
 fn build_capsules_loaded_payload_with_optional_epoch(
-    entries: Vec<(String, String, Option<Value>)>,
+    entries: Vec<(String, String, Option<String>, Option<Value>)>,
     epoch: Option<u64>,
 ) -> Value {
     let capsules: Vec<Value> = entries
         .into_iter()
-        .map(
-            |(principal, name, meta)| json!({ "principal": principal, "name": name, "meta": meta }),
-        )
+        .map(|(principal, name, source_id, meta)| {
+            json!({
+                "principal": principal,
+                "name": name,
+                "source_id": source_id,
+                "meta": meta,
+            })
+        })
         .collect();
     match epoch {
         Some(epoch) => json!({ "status": "ready", "epoch": epoch, "capsules": capsules }),
@@ -161,9 +168,10 @@ mod tests {
             (
                 "alice".to_string(),
                 "astrid-capsule-fs".to_string(),
+                Some("0191f3a2-b4c7-7d8e-9f01-234567890abc".to_string()),
                 Some(meta.clone()),
             ),
-            ("bob".to_string(), "no-meta".to_string(), None),
+            ("bob".to_string(), "no-meta".to_string(), None, None),
         ]);
         // Legacy bare-signal field is preserved for existing subscribers.
         assert_eq!(payload["status"], "ready");
@@ -171,12 +179,30 @@ mod tests {
         assert_eq!(caps.len(), 2);
         assert_eq!(caps[0]["principal"], "alice");
         assert_eq!(caps[0]["name"], "astrid-capsule-fs");
+        assert_eq!(caps[0]["source_id"], "0191f3a2-b4c7-7d8e-9f01-234567890abc");
         // Meta is forwarded verbatim (the consumer extracts `tools`).
         assert_eq!(caps[0]["meta"], meta);
         // A capsule with no readable meta carries an explicit null.
         assert_eq!(caps[1]["principal"], "bob");
         assert_eq!(caps[1]["name"], "no-meta");
+        assert!(caps[1]["source_id"].is_null());
         assert!(caps[1]["meta"].is_null());
+    }
+
+    #[test]
+    fn epoch_inventory_preserves_provenance_and_opaque_metadata() {
+        let entries = vec![(
+            "alice".to_owned(),
+            "tools".to_owned(),
+            Some("live-source".to_owned()),
+            Some(json!({"version": "1", "tools": []})),
+        )];
+        let legacy = build_capsules_loaded_payload(entries.clone());
+        let scoped = build_capsules_loaded_payload_with_epoch(entries, 42);
+        assert!(legacy.get("epoch").is_none());
+        assert_eq!(scoped["epoch"], 42);
+        assert_eq!(scoped["capsules"], legacy["capsules"]);
+        assert_eq!(scoped["capsules"][0]["source_id"], "live-source");
     }
 
     #[test]

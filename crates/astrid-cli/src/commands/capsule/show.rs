@@ -66,7 +66,7 @@ pub(crate) async fn run(args: &ShowArgs) -> Result<ExitCode> {
     let principal = context::resolve_agent(args.agent.as_deref())?;
     let format = ValueFormat::parse(&args.format);
     let mut client = crate::socket_client::connect_kernel_for_workspace(None).await?;
-    let entries = match client.request(KernelRequest::GetCapsuleMetadata).await? {
+    let entries = match client.request(metadata_request(&principal)).await? {
         KernelResponse::CapsuleMetadata(entries) => entries,
         KernelResponse::Error(message) => {
             anyhow::bail!("daemon rejected capsule metadata request: {message}")
@@ -130,6 +130,12 @@ pub(crate) async fn run(args: &ShowArgs) -> Result<ExitCode> {
         println!("  {line}");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn metadata_request(principal: &astrid_core::PrincipalId) -> KernelRequest {
+    KernelRequest::GetCapsuleMetadataForPrincipal {
+        target_principal: principal.clone(),
+    }
 }
 
 fn print_permissions(permissions: &[SemanticCapability]) {
@@ -284,5 +290,15 @@ mod tests {
         assert_eq!(parsed["name"], "x");
         assert_eq!(parsed["version"], "0.1.0");
         assert_eq!(parsed["contracts_status"], "match");
+    }
+
+    #[test]
+    fn metadata_query_is_scoped_to_the_selected_principal() {
+        let principal = astrid_core::PrincipalId::new("codewall-owner").unwrap();
+        assert!(matches!(
+            metadata_request(&principal),
+            KernelRequest::GetCapsuleMetadataForPrincipal { target_principal }
+                if target_principal == principal
+        ));
     }
 }

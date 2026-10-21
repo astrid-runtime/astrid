@@ -2,11 +2,29 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::{fs::File, os::fd::AsRawFd};
 
 #[cfg(target_os = "linux")]
 mod bwrap;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod runtime_media;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod runtime_media_unsupported;
 #[cfg(target_os = "macos")]
 mod seatbelt;
+mod setup_probe;
+
+#[cfg(target_os = "linux")]
+pub use bwrap::packaged_bwrap_path;
+pub use setup_probe::probe_native_process_sandbox;
+
+/// Bubblewrap is a Linux-only sandbox launcher.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn packaged_bwrap_path() -> Option<&'static str> {
+    None
+}
 
 /// Validate a path for safe interpolation into sandbox profiles (SBPL/bwrap).
 ///
@@ -18,6 +36,18 @@ fn validate_sandbox_str<'a>(path: &'a Path, label: &str) -> io::Result<&'a str> 
             io::ErrorKind::InvalidInput,
             format!(
                 "sandbox {label} must be an absolute path, got: {}",
+                path.display()
+            ),
+        ));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "sandbox {label} contains a parent-directory component: {}",
                 path.display()
             ),
         ));
@@ -87,7 +117,8 @@ impl SandboxCommand {
     /// whole host filesystem read-only, which exposed these): `keys/` (ed25519
     /// private keys → principal impersonation), `secrets/` (the secret store →
     /// credential theft), and `var/` (the kernel state DB → every principal's
-    /// KV). `run/` (socket + token) and `etc/` (config) are deliberately left
+    /// KV), plus canonical and retired root backing volumes. `run/` (socket +
+    /// token) and `etc/` (config) are deliberately left
     /// reachable so a spawned agent can still reach the daemon; once fd-passing
     /// (issue #45/#852) lets the agent drop direct socket access, the whole home
     /// is masked instead.
@@ -95,11 +126,10 @@ impl SandboxCommand {
     /// # Errors
     /// Propagates a failure to locate the Astrid home — a spawn whose security
     /// boundary cannot be established is refused (fail-secure), mirroring the
-    /// MCP-server spawn path (`astrid-mcp`'s `with_hidden(astrid_home)`).
+    /// MCP-server spawn path (`astrid-mcp`'s protected runtime home).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn sensitive_astrid_paths() -> io::Result<Vec<PathBuf>> {
-        let home = astrid_core::dirs::AstridHome::resolve()?;
-        Ok(Self::sensitive_astrid_paths_in(&home))
+        runtime_media::sensitive_astrid_paths()
     }
 
     /// The masked set for a given home, filtered to paths that exist on disk.
@@ -117,6 +147,8 @@ impl SandboxCommand {
             home.secrets_dir(),
             home.var_dir(),
             home.home_dir(),
+            home.storage_volume_path(),
+            home.retired_root_storage_volume_path(),
         ]
         .into_iter()
         .filter(|p| p.exists())
@@ -251,6 +283,13 @@ impl SandboxCommand {
         extra_write_paths: &[PathBuf],
         clear_env: bool,
     ) -> io::Result<Command> {
+        #[cfg(target_os = "linux")]
+        if bwrap::unsafe_legacy_astrid_profile() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "retired Astrid AppArmor profile is attached; remove its inherited userns grant before spawning native processes",
+            ));
+        }
         // Validate on all platforms for defense in depth and API consistency.
         // On macOS the validated string is needed for SBPL interpolation.
         // On Linux bwrap passes paths as argv entries (no injection risk),
@@ -299,18 +338,91 @@ impl SandboxCommand {
                 ));
             }
         }
-        for granted in extra_read_paths.iter().chain(extra_write_paths) {
-            if extra_masks
+        // Validate before either platform assembles grants. A later explicit
+        // grant must not reopen durable media or other cross-principal state.
+        // Only the selected principal subtree may pierce the home container.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let built_in_masks = Self::masked_paths()?;
+        #[cfg(target_os = "linux")]
+        let opened_grants = extra_read_paths
+            .iter()
+            .chain(extra_write_paths)
+            .map(|path| bwrap::open_bind_source(path))
+            .collect::<io::Result<Vec<_>>>()?;
+        #[cfg(target_os = "linux")]
+        if !opened_grants.is_empty() {
+            bwrap::require_bind_fd_support()?;
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let home_root = astrid_core::dirs::AstridHome::resolve()?.home_dir();
+            let resolved_home_root = resolve_sandbox_path(&home_root)?;
+            let resolved_masks = built_in_masks
                 .iter()
-                .any(|masked| paths_overlap(granted, masked))
+                .map(|masked| resolve_sandbox_path(masked))
+                .collect::<io::Result<Vec<_>>>()?;
+            let resolved_extra_masks = extra_masks
+                .iter()
+                .map(|masked| resolve_sandbox_path(masked))
+                .collect::<io::Result<Vec<_>>>()?;
+            #[cfg(target_os = "linux")]
+            let resolved_grants = opened_grants
+                .iter()
+                .map(|(resolved, _)| Ok(resolved.clone()))
+                .chain(
+                    injections
+                        .iter()
+                        .map(|injection| resolve_sandbox_path(&injection.target)),
+                )
+                .collect::<io::Result<Vec<_>>>()?;
+            #[cfg(target_os = "macos")]
+            let resolved_grants = extra_read_paths
+                .iter()
+                .chain(extra_write_paths)
+                .chain(injections.iter().map(|injection| &injection.target))
+                .map(|granted| resolve_sandbox_path(granted))
+                .collect::<io::Result<Vec<_>>>()?;
+            for (granted, resolved_grant) in extra_read_paths
+                .iter()
+                .chain(extra_write_paths)
+                .chain(injections.iter().map(|injection| &injection.target))
+                .zip(&resolved_grants)
             {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "process path {} overlaps a copy-on-write mask",
-                        granted.display()
-                    ),
-                ));
+                if extra_masks
+                    .iter()
+                    .zip(&resolved_extra_masks)
+                    .any(|(masked, resolved_mask)| {
+                        paths_overlap(granted, masked)
+                            || paths_overlap(resolved_grant, resolved_mask)
+                    })
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "process path {} overlaps a copy-on-write mask",
+                            granted.display()
+                        ),
+                    ));
+                }
+                if built_in_masks
+                    .iter()
+                    .zip(&resolved_masks)
+                    .any(|(masked, resolved_mask)| {
+                        (paths_overlap(granted, masked)
+                            || paths_overlap(resolved_grant, resolved_mask))
+                            && !(masked == &home_root
+                                && granted.starts_with(masked)
+                                && resolved_grant.starts_with(&resolved_home_root))
+                    })
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "process path {} overlaps a sensitive runtime path",
+                            granted.display()
+                        ),
+                    ));
+                }
             }
         }
 
@@ -318,7 +430,11 @@ impl SandboxCommand {
         {
             // Bubblewrap implementation - paths are passed as separate argv entries (no injection).
             // The process can only read the root OS, but can only write to the worktree and /tmp.
-            let mut bwrap = Command::new("bwrap");
+            // Constructing the wrapper remains possible without bwrap (for
+            // inspection/tests); spawning it still fails closed at this
+            // absolute path when the package is absent.
+            let path = bwrap::packaged_bwrap_path().unwrap_or("/usr/bin/bwrap");
+            let mut bwrap = Command::new(path);
             if clear_env {
                 bwrap.env_clear();
             }
@@ -346,22 +462,6 @@ impl SandboxCommand {
             // and the worktree/injection binds; `run/` (socket+token) and `etc/`
             // stay reachable for daemon access. Fail-secure: refuse the spawn if
             // the home is unresolvable.
-            let built_in_masks = Self::masked_paths()?;
-            let home_root = astrid_core::dirs::AstridHome::resolve()?.home_dir();
-            for granted in extra_read_paths.iter().chain(extra_write_paths) {
-                if built_in_masks.iter().any(|masked| {
-                    paths_overlap(granted, masked)
-                        && !(masked == &home_root && granted.starts_with(masked))
-                }) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!(
-                            "process path {} overlaps a sensitive runtime path",
-                            granted.display()
-                        ),
-                    ));
-                }
-            }
             for masked in &built_in_masks {
                 Self::push_mask_arg(&mut bwrap, masked);
             }
@@ -379,12 +479,24 @@ impl SandboxCommand {
             // cross-principal home container is masked above. Re-bind only the
             // authorized principal path, then punch through its explicitly
             // declared writable subpaths.
-            for path in extra_read_paths {
-                bwrap.arg("--ro-bind").arg(path).arg(path);
+            for (destination, file) in opened_grants.iter().take(extra_read_paths.len()) {
+                bwrap
+                    .arg("--ro-bind-fd")
+                    .arg(file.as_raw_fd().to_string())
+                    .arg(destination);
             }
-            for path in extra_write_paths {
-                bwrap.arg("--bind").arg(path).arg(path);
+            for (destination, file) in opened_grants.iter().skip(extra_read_paths.len()) {
+                bwrap
+                    .arg("--bind-fd")
+                    .arg(file.as_raw_fd().to_string())
+                    .arg(destination);
             }
+
+            let held_grants = opened_grants
+                .into_iter()
+                .map(|(_, file)| std::sync::Arc::new(file))
+                .collect();
+            bwrap::inherit_bind_sources(&mut bwrap, held_grants);
 
             bwrap
                 .arg("--unshare-all")               // Drop namespaces (network, pid, etc.)
@@ -444,7 +556,7 @@ impl SandboxCommand {
             // macOS seatbelt is already `(deny default)` + an allowlist that
             // excludes ~/.astrid, so these denies are belt-and-suspenders that
             // still hold if the allowlist ever widens to include the home.
-            for masked in Self::masked_paths()? {
+            for masked in built_in_masks {
                 config = config.with_hidden(masked);
             }
             // Caller-supplied masks (the CoW pristine workspace / upper dirs).
@@ -507,8 +619,34 @@ impl SandboxCommand {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
+}
+
+/// Resolve symlink aliases before deciding whether a grant reopens a mask.
+/// Injection targets may not exist yet, so preserve their absent suffix after
+/// canonicalizing the nearest existing ancestor.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn resolve_sandbox_path(path: &Path) -> io::Result<PathBuf> {
+    let mut cursor = path;
+    let mut missing = Vec::new();
+    loop {
+        match cursor.canonicalize() {
+            Ok(mut resolved) => {
+                for component in missing.into_iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let name = cursor.file_name().ok_or(error.kind())?;
+                missing.push(name.to_os_string());
+                cursor = cursor.parent().ok_or(error.kind())?;
+            },
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// The sandbox wrapper program and its argument prefix.
@@ -516,10 +654,12 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
 /// The caller appends the original program and its arguments after these args.
 #[derive(Debug, Clone)]
 pub struct SandboxPrefix {
-    /// The sandbox wrapper program (e.g., `bwrap` or `sandbox-exec`).
+    /// The sandbox wrapper program.
     pub program: OsString,
-    /// Arguments to the sandbox wrapper, NOT including the inner command.
+    /// Arguments before the inner command.
     pub args: Vec<OsString>,
+    #[cfg(target_os = "linux")]
+    bind_sources: Vec<std::sync::Arc<File>>,
 }
 
 /// Data-oriented sandbox configuration that produces a wrapper program + args
@@ -533,11 +673,10 @@ pub struct SandboxPrefix {
 /// ```rust,ignore
 /// let config = ProcessSandboxConfig::new("/home/user/project")
 ///     .with_network(true)
-///     .with_hidden("/home/user/.astrid");
+///     .with_protected_runtime_home("/home/user/.astrid");
 ///
 /// if let Some(prefix) = config.sandbox_prefix()? {
-///     let mut cmd = tokio::process::Command::new(&prefix.program);
-///     cmd.args(&prefix.args);
+///     let mut cmd = tokio::process::Command::from(prefix.into_command());
 ///     cmd.arg("npx").args(["@anthropics/mcp-server-filesystem", "/tmp"]);
 /// }
 /// ```
@@ -550,9 +689,9 @@ pub struct SandboxPrefix {
 fn linux_unavailable_hint() -> &'static str {
     "On Ubuntu 24.04+, this is most often caused by \
      `kernel.apparmor_restrict_unprivileged_userns=1`. \
-     Fix with: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` \
-     (or persist via /etc/sysctl.d/). On other distros, ensure the \
-     `bubblewrap` package is installed."
+     On Ubuntu, install the `apparmor-profiles` package and have an administrator \
+     review and load its `bwrap-userns-restrict` profile. On other distros, \
+     ensure `bubblewrap` is installed with a policy that permits its user namespace."
 }
 
 /// Hint string for platforms without a supported OS-level sandbox
@@ -659,6 +798,7 @@ pub struct ProcessSandboxConfig {
     allow_network: bool,
     /// Paths to overlay with empty tmpfs (Linux) or exclude (macOS), blocking access.
     hidden_paths: Vec<PathBuf>,
+    protected_runtime_home: Option<PathBuf>,
     /// Read-only file injections: host-verified bytes exposed at an in-sandbox
     /// `target`. On macOS the snapshot is materialized at `target` (so
     /// `source == target`) and the profile gets a read-allow plus a trailing
@@ -684,6 +824,7 @@ impl ProcessSandboxConfig {
             extra_write_paths: Vec::new(),
             allow_network: true,
             hidden_paths: Vec::new(),
+            protected_runtime_home: None,
             ro_injections: Vec::new(),
             policy: SandboxPolicy::from_env(),
         }
@@ -773,10 +914,7 @@ impl ProcessSandboxConfig {
     ///   on Ubuntu 24.04+) and the remediation (`sysctl` command or
     ///   explicit policy override).
     pub fn sandbox_prefix(&self) -> io::Result<Option<SandboxPrefix>> {
-        // Validate all configured paths up front, regardless of platform.
-        // This ensures the doc contract ("returns Err for non-UTF-8 or
-        // forbidden chars") holds on every OS, not just macOS where SBPL
-        // interpolation makes it exploitable.
+        // Validate before building any platform profile.
         self.validate_all_paths()?;
 
         // `Off` short-circuits before any probe so the no-warn contract
@@ -786,10 +924,13 @@ impl ProcessSandboxConfig {
             return Ok(None);
         }
 
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        self.validate_protected_runtime_grants()?;
+
         #[cfg(target_os = "linux")]
         {
             if bwrap::bwrap_available() {
-                return Ok(Some(self.build_bwrap_prefix()));
+                return self.build_pinned_bwrap_prefix().map(Some);
             }
             self.handle_unavailable_sandbox(linux_unavailable_hint())
         }
@@ -854,3 +995,6 @@ impl ProcessSandboxConfig {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod runtime_media_tests;

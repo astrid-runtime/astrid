@@ -43,24 +43,7 @@ pub(super) const VERIFIED_CONTENT_CACHE_KEY: ProjectionCacheKey = ProjectionCach
 pub(super) const PARTIAL_VERIFICATION_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(2);
 const DECODED_HEADER_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(3);
 
-fn validated_rename_sets<'a>(
-    moves: &'a [(ContentName, ContentName)],
-    replacements: &'a [ContentName],
-) -> Option<(BTreeSet<&'a ContentName>, BTreeSet<&'a ContentName>)> {
-    let sources = moves
-        .iter()
-        .map(|(source, _)| source)
-        .collect::<BTreeSet<_>>();
-    let destinations = moves
-        .iter()
-        .map(|(_, destination)| destination)
-        .collect::<BTreeSet<_>>();
-    let replacement_set = replacements.iter().collect::<BTreeSet<_>>();
-    (sources.len() == moves.len()
-        && destinations.len() == moves.len()
-        && replacement_set.len() == replacements.len())
-    .then_some((sources, replacement_set))
-}
+use internals::validated_rename_sets;
 
 /// Named content projection over one shared principal-state engine.
 pub struct PrincipalContentStore<P: Ord, E> {
@@ -396,10 +379,26 @@ where
         verified: VerifiedContent,
         staged_records: &[ObjectRecord],
     ) -> Result<ContentWriteOutcome, PrincipalContentError> {
+        self.publish_deferred_expected(principal, name, verified, staged_records, None)
+    }
+
+    fn publish_deferred_expected(
+        &self,
+        principal: &P,
+        name: &ContentName,
+        verified: VerifiedContent,
+        staged_records: &[ObjectRecord],
+        expected_file: Option<ObjectId>,
+    ) -> Result<ContentWriteOutcome, PrincipalContentError> {
         let descriptor = verified.descriptor();
         loop {
             let mut header = self.header(principal)?.as_ref().clone();
             let previous = self.catalog_lookup(principal, header.catalog, name)?;
+            if let Some(expected) = expected_file
+                && previous.is_none_or(|entry| entry.file != expected)
+            {
+                return Err(PrincipalContentError::BatchPreconditionFailed);
+            }
             if previous.is_some_and(|entry| entry.file == descriptor.file()) {
                 let root = header.root.ok_or_else(|| {
                     invalid(
@@ -677,6 +676,7 @@ where
                 records.extend(mutation.records);
             }
             self.enforce_quota(principal, &header)?;
+            pending_catalog::retain_final_catalog_records(header.catalog, &mut records);
             let transaction =
                 self.encode_transaction(principal.clone(), header.clone(), None, records)?;
             match self.engine.commit_root(transaction) {
@@ -967,10 +967,12 @@ where
     }
 }
 
+mod append;
 mod bulk;
 mod constructors;
 mod internals;
 mod native;
+mod pending_catalog;
 mod projection;
 mod read_handle;
 mod workspace;

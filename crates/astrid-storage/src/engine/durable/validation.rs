@@ -2,12 +2,16 @@
 
 use crate::storage_model::{ModelError, ObjectId, ObjectKind, ObjectRecord, PrincipalUsage, World};
 
-use super::format::read_indexed_object;
+use super::format::{read_indexed_object, visit_indexed_objects};
 use super::wal::PendingWalOverlay;
 use super::{
     ArenaLocation, BTreeMap, BTreeSet, DurableError, File, PersistentObjectIdentity, ROOT_FILE,
     RecoveryLimits,
 };
+
+// This is an I/O coalescing target, not an authenticity or allocation limit.
+// Each indexed frame is still checksum- and identity-verified independently.
+const RECOVERY_CLOSURE_READ_TARGET_BYTES: u64 = 8 * 1024 * 1024;
 
 pub(super) struct ClosureObjects<'a, I, P: Ord> {
     pub(super) arena: &'a mut File,
@@ -60,6 +64,59 @@ pub(super) fn materialize_closure<I: PersistentObjectIdentity, P: Ord>(
         records.insert(id, record);
     }
     Ok(records.into_iter().collect())
+}
+
+/// Load the indexed objects reachable from a set of roots in coalesced spans.
+///
+/// The frontier is expanded one owning-reference level at a time so the
+/// reader can sort adjacent locations into a single positional read without
+/// scanning unrelated arena bytes. `visit_indexed_objects` retains the same
+/// frame checksum, canonical decoding, and identity checks as a one-object
+/// load.
+pub(super) fn preload_indexed_closures<I: PersistentObjectIdentity>(
+    arena: &File,
+    index: &BTreeMap<ObjectId, ArenaLocation>,
+    roots: impl IntoIterator<Item = ObjectId>,
+    identity: &I,
+    limits: RecoveryLimits,
+) -> Result<BTreeMap<ObjectId, ObjectRecord>, DurableError> {
+    let mut loaded = BTreeMap::new();
+    let mut frontier = roots.into_iter().collect::<BTreeSet<_>>();
+    while !frontier.is_empty() {
+        let mut requested = Vec::new();
+        for id in frontier {
+            if loaded.contains_key(&id) {
+                continue;
+            }
+            let location = index
+                .get(&id)
+                .copied()
+                .ok_or(ModelError::MissingObject(id))?;
+            requested.push((id, location));
+        }
+        if requested.is_empty() {
+            break;
+        }
+        let mut next = BTreeSet::new();
+        visit_indexed_objects(
+            arena,
+            &requested,
+            RECOVERY_CLOSURE_READ_TARGET_BYTES,
+            identity,
+            limits,
+            |id, _location, record, _payload| {
+                for child in record.owning_references() {
+                    if !loaded.contains_key(&child) {
+                        next.insert(child);
+                    }
+                }
+                loaded.insert(id, record);
+                Ok(())
+            },
+        )?;
+        frontier = next;
+    }
+    Ok(loaded)
 }
 
 pub(super) fn validate_commit_closure(

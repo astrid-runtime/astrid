@@ -14,6 +14,7 @@ pub(super) struct ProjectionLaunchTokens {
     pub(super) shared: Option<String>,
 }
 
+#[derive(Clone)]
 pub(super) struct ProjectionMountPaths {
     pub(super) mount_root: PathBuf,
     pub(super) workspace: PathBuf,
@@ -101,7 +102,7 @@ fn cleanup_state_for_failed_launch(
         branch: branch_provider,
         owner: owner_provider,
         shared: shared_provider,
-        mount_root: paths.mount_root.clone(),
+        paths: paths.clone(),
         cleaned: false,
     }
 }
@@ -383,7 +384,7 @@ fn successful_cleanup_state(
                     lease,
                 )
             }),
-        mount_root: paths.mount_root.clone(),
+        paths: paths.clone(),
         cleaned: false,
     }))
 }

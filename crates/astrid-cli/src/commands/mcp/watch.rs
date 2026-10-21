@@ -1,52 +1,29 @@
-//! Hot-reload bridge: kernel `capsules_loaded` -> MCP `tools/list_changed`.
+//! Hot-reload bridge from kernel hints to MCP `tools/list_changed`.
 //!
-//! The kernel broadcasts [`CAPSULES_LOADED_TOPIC`] whenever it finishes a
-//! (re)load of the capsule set — e.g. after `astrid refresh` installs or
-//! swaps a capsule that contributes tools. An MCP client that connected
-//! earlier holds a stale `tools/list`; the MCP spec lets the server push
-//! `notifications/tools/list_changed` to invite a re-fetch.
+//! A dedicated watcher uplink uses the same principal authentication policy
+//! as request traffic. Initial enumeration establishes a complete baseline;
+//! failed enumeration leaves it unknown rather than inventing an empty list.
 //!
-//! The kernel stamps that broadcast with the affected **principal**, and the
-//! cli-proxy delivers a principal-stamped event only to uplinks BOUND to that
-//! principal. A connection binds on the first ingress message it *sends* — so a
-//! watch uplink that only ever READ would stay unbound and never be delivered
-//! the broadcast at all. The watcher therefore seeds its baseline by
-//! enumerating ON the watch uplink (that first `tools/list` request binds the
-//! connection), and only then falls into a pure read loop.
+//! `capsules_loaded` broadcasts are hints, never tool authority. Each hint
+//! triggers a full `tools/list` snapshot on this uplink. Malformed snapshots
+//! retain the previous state; only a valid snapshot can replace its epoch and
+//! tool names. Changed names notify the stdio peer, request subscription, or
+//! gateway peers through one shared loop. Schema-only changes retain the
+//! existing name-based notification behavior.
 //!
-//! The `capsules_loaded` payload already carries each capsule's described tool
-//! surface (`meta.tools`, injected kernel-side — see
-//! [`astrid_kernel::capsules_loaded`]), so the watcher reads the new tool set
-//! straight from the broadcast rather than issuing a second broker round trip.
-//! That is the signal's intended contract ("a sandboxed consumer derives a
-//! deterministic tool surface from this signal, instead of a racy describe
-//! fan-out") and it means a reload never depends on a follow-up request that
-//! could time out while the broker is busy. It pushes a `tools/list_changed`
-//! notification through the held [`Peer<RoleServer>`] **only when the
-//! tool-name set actually changed**, diffing against a baseline seeded from
-//! the live surface at startup (so the first post-connect reload is not
-//! swallowed).
-//!
-//! ## Why a coarse signal
-//!
-//! The MCP notification carries no payload — it is a pure "re-fetch" hint.
-//! We diff the set of tool *names* (a cheap, order-insensitive signature)
-//! to suppress no-op notifications when a reload doesn't touch the tool
-//! surface. Schema-only edits that keep every name identical are not
-//! detected; that is acceptable for a coarse reload hint, and the client
-//! always re-fetches the full, authoritative list when it does react.
-//!
-//! ## stdout discipline
-//!
-//! This task never touches stdout — that channel belongs to the MCP
-//! transport. Every diagnostic goes through `tracing` (stderr).
+//! Gateway cancellation drops pending connection, enumeration and notification
+//! work. Peer-map locks are released before network notifications. This task
+//! writes diagnostics only to tracing; stdout belongs to MCP transport.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rmcp::service::{Peer, RoleServer};
 use serde_json::{Value, json};
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -73,6 +50,79 @@ const ENUMERATE_DEADLINE: Duration = Duration::from_secs(55);
 /// handlers. The function owns a freshly-connected [`SocketClient`] and
 /// drives it to EOF; it returns when the daemon closes the watch uplink.
 pub(super) async fn run(peer: Peer<RoleServer>, principal: String, daemon_root: PathBuf) {
+    run_with_sink(ChangeSink::Legacy(peer), principal, daemon_root).await;
+}
+
+/// The 2026 subscription is request-scoped on both stdio and HTTP. Cancelling
+/// it drops its watcher uplink; it never owns the shared broker connection.
+pub(super) async fn run_subscription(
+    context: rmcp::service::SubscriptionContext,
+    principal: String,
+    daemon_root: PathBuf,
+) {
+    tokio::select! {
+        () = context.cancelled() => {},
+        () = run_with_sink(ChangeSink::Subscription(context.sink().clone()), principal, daemon_root) => {},
+    }
+}
+
+enum ChangeSink {
+    Legacy(Peer<RoleServer>),
+    Subscription(rmcp::service::SubscriptionSink),
+    Many(Arc<Mutex<HashMap<String, Peer<RoleServer>>>>),
+}
+
+impl ChangeSink {
+    async fn notify(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Legacy(peer) => peer.notify_tool_list_changed().await?,
+            Self::Subscription(sink) => sink.notify_tool_list_changed().await?,
+            Self::Many(peers) => notify_peers(peers).await,
+        }
+        Ok(())
+    }
+}
+
+/// Share one authenticated, epoch-aware watcher across gateway sessions.
+/// Cancelling the gateway drops its pending connection/read and notification work.
+pub(super) async fn run_many(
+    peers: Arc<Mutex<HashMap<String, Peer<RoleServer>>>>,
+    principal: String,
+    daemon_root: PathBuf,
+    shutdown: CancellationToken,
+) {
+    tokio::select! {
+        () = shutdown.cancelled() => {},
+        () = run_with_sink(ChangeSink::Many(peers), principal, daemon_root) => {},
+    }
+}
+
+async fn notify_peers(peers: &Arc<Mutex<HashMap<String, Peer<RoleServer>>>>) {
+    // Do not hold the map lock across network notifications. Snapshot the
+    // keyed peers, notify independently, then remove only sessions whose
+    // transport has closed. An attach that reaches stdin EOF is therefore
+    // unregistered on the next reload signal without disturbing other peers.
+    let snapshot = peers
+        .lock()
+        .await
+        .iter()
+        .map(|(id, peer)| (id.clone(), peer.clone()))
+        .collect::<Vec<_>>();
+    let mut closed = Vec::new();
+    for (id, peer) in snapshot {
+        if peer.notify_tool_list_changed().await.is_err() {
+            closed.push(id);
+        }
+    }
+    if !closed.is_empty() {
+        let mut guard = peers.lock().await;
+        for id in closed {
+            guard.remove(&id);
+        }
+    }
+}
+
+async fn run_with_sink(sink: ChangeSink, principal: String, daemon_root: PathBuf) {
     // The watch uplink's session id is ephemeral — it only keys this
     // transport's frames. Bind the connection to the SAME principal the
     // request handlers use: the native uplink binds that principal during the
@@ -87,7 +137,7 @@ pub(super) async fn run(peer: Peer<RoleServer>, principal: String, daemon_root: 
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
     let mut watch_client = match crate::socket_client::connect_for_workspace(
         session,
-        caller,
+        caller.clone(),
         Some(daemon_root.as_path()),
     )
     .await
@@ -101,26 +151,17 @@ pub(super) async fn run(peer: Peer<RoleServer>, principal: String, daemon_root: 
         },
     };
 
+    if let Err(error) =
+        super::require_authenticated_unless_anonymous(&caller, watch_client.is_authenticated())
+    {
+        warn!(%error, %principal, "MCP hot-reload watcher: authentication policy refused uplink");
+        return;
+    }
+
     info!("MCP hot-reload watcher: watching for {CAPSULES_LOADED_TOPIC} broadcasts");
 
-    // Seed the baseline from the live surface NOW — AND bind this uplink. Two
-    // jobs in one round trip:
-    //
-    //  1. Baseline: capture the current tool-name set so the FIRST reload after
-    //     the client connected is diffed against reality and pushed when it
-    //     changed, rather than swallowed as a synthetic baseline.
-    //  2. Bind: the cli-proxy binds a connection to its principal on the first
-    //     ingress message the connection *sends*, and delivers a
-    //     principal-stamped `capsules_loaded` only to uplinks bound to that
-    //     principal. Running the seed enumeration ON `watch_client` sends that
-    //     first message, so this uplink is bound and later broadcasts actually
-    //     reach the read loop below. Seeding on a *separate* uplink (as an
-    //     earlier version did) left this one unbound — and silently starved of
-    //     every broadcast, so no `tools/list_changed` ever fired.
-    //
-    // A failed seed leaves the baseline unknown.  Keep that distinction: an
-    // empty set is authority-bearing only after a valid epoch and complete
-    // snapshot have been received.
+    // A valid empty snapshot is meaningful authority. Failed enumeration
+    // remains unknown, so the first later valid snapshot can notify peers.
     let mut last_known = match enumerate_on(&mut watch_client, &principal).await {
         Ok(state) => Some(state),
         Err(e) => {
@@ -187,7 +228,7 @@ pub(super) async fn run(peer: Peer<RoleServer>, principal: String, daemon_root: 
             continue;
         }
 
-        if let Err(e) = peer.notify_tool_list_changed().await {
+        if let Err(e) = sink.notify().await {
             // Peer channel closed -> the transport is gone; stop.
             warn!(error = %e, "MCP hot-reload watcher: notify failed (peer closed); stopping");
             return;

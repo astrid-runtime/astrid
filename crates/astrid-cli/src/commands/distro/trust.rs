@@ -1,8 +1,8 @@
 //! Distro signing-key trust store and verification policy.
 //!
-//! Trust is per-distro and pinned on first use (TOFU), with a small set
-//! of compiled-in official keys that pin without prompting. The store
-//! lives at `~/.astrid/trust/<distro-id>.pub`, one file per distro,
+//! Trust is per-distro. Product paths require the pin to exist before
+//! use; ordinary signed paths may create the first pin. The store lives
+//! as the mounted durable projection `$ASTRID_HOME/trust/<distro-id>.pub`,
 //! containing a single `ed25519:<base64>` line.
 //!
 //! ## Threat model
@@ -15,9 +15,10 @@
 //!   signature under a different key is a hard fail (defends against a
 //!   compromised-mirror swapping the maintainer key) unless the operator
 //!   explicitly opts in with `--accept-new-key`.
-//! - An **official** key (compiled in) pins without prompting.
-//! - A **third-party** key with no prior pin is trusted on first use and
-//!   pinned, with the key reported so the operator can verify out of band.
+//! - A **missing** pin fails closed on product paths. Ordinary signed
+//!   init and shuttle paths trust a valid first key on first use and
+//!   write the pin, while keeping the first-contact choice visible in
+//!   operator output.
 //!
 //! ## Not a chain of trust (yet)
 //!
@@ -34,29 +35,28 @@ use astrid_crypto::PublicKey;
 use super::lock::DistroLock;
 use super::sign;
 
-/// Built-in official signing keys. A key here pins
-/// without prompting on first use. Changing this set requires rebuilding
-/// the binary — that is the point: official trust is not runtime-mutable.
-///
-/// DECISION: empty placeholder — the real official key(s) are not part
-/// of issue #964's spec. With this empty, official distros currently
-/// take the TOFU path like any third party until a key is added here.
-const OFFICIAL_KEYS: &[&str] = &[
-    // "ed25519:<base64>",
-];
-
 /// What the trust check decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TrustAction {
     /// Signature valid against the already-pinned key.
     PinnedMatch,
-    /// No prior pin; key is an official key → verified and pinned.
-    OfficialPinned,
-    /// No prior pin; third-party key → trusted on first use and pinned.
+    /// Ordinary signed path saw a valid key with no prior pin and wrote
+    /// the first pin.
     ToFuTrusted,
     /// Signature valid but key differed from the pin; operator passed
     /// `--accept-new-key` → re-pinned.
     NewKeyAccepted,
+}
+
+/// Whether the verifier may create the first pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrustPolicy {
+    /// Product and other explicit signed paths fail closed when no pin
+    /// exists; the operator installs it out of band first.
+    RequireExistingPin,
+    /// Ordinary signed init and shuttle paths may trust and pin the
+    /// first valid key.
+    TofuFirstPin,
 }
 
 /// Outcome of a successful trust check.
@@ -91,7 +91,7 @@ fn read_pinned(home: &AstridHome, distro_id: &str) -> anyhow::Result<Option<Publ
 }
 
 /// Pin `key_str` for `distro_id`, atomically.
-fn pin(home: &AstridHome, distro_id: &str, key_str: &str) -> anyhow::Result<()> {
+fn write_pin(home: &AstridHome, distro_id: &str, key_str: &str) -> anyhow::Result<()> {
     let path = trust_path(home, distro_id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -118,11 +118,6 @@ fn pin(home: &AstridHome, distro_id: &str, key_str: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Is `key_str` one of the compiled-in official keys?
-fn is_official(key_str: &str) -> bool {
-    OFFICIAL_KEYS.contains(&key_str)
-}
-
 /// Verify a sealed distro's signature and apply the trust policy.
 ///
 /// `manifest_pubkey` is the `[distro.signing].pubkey` declared in the
@@ -133,6 +128,7 @@ fn is_official(key_str: &str) -> bool {
 ///
 /// - signature does not verify (no override),
 /// - key differs from the pin and `accept_new_key` is false,
+/// - no trust pin exists,
 /// - malformed key/signature.
 pub(crate) fn verify_and_pin(
     home: &AstridHome,
@@ -141,6 +137,7 @@ pub(crate) fn verify_and_pin(
     sig_hex: &str,
     lock: &DistroLock,
     accept_new_key: bool,
+    policy: TrustPolicy,
 ) -> anyhow::Result<TrustOutcome> {
     let pubkey = sign::parse_pubkey(manifest_pubkey)?;
     let key_str = sign::pubkey_to_wire(&pubkey);
@@ -163,16 +160,18 @@ pub(crate) fn verify_and_pin(
                     key_str,
                 );
             }
-            pin(home, distro_id, &key_str)?;
+            write_pin(home, distro_id, &key_str)?;
             TrustAction::NewKeyAccepted
         },
-        None if is_official(&key_str) => {
-            pin(home, distro_id, &key_str)?;
-            TrustAction::OfficialPinned
+        None if policy == TrustPolicy::RequireExistingPin => {
+            bail!(
+                "distro '{distro_id}' has no signing-key pin at {} — install the operator-verified \
+                 key before use; this path does not create a first-use pin",
+                trust_path(home, distro_id).display()
+            );
         },
         None => {
-            // TOFU: pin and report.
-            pin(home, distro_id, &key_str)?;
+            write_pin(home, distro_id, &key_str)?;
             TrustAction::ToFuTrusted
         },
     };
@@ -213,6 +212,18 @@ mod tests {
     fn home() -> (tempfile::TempDir, AstridHome) {
         let dir = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(dir.path());
+        std::fs::create_dir_all(home.root()).unwrap();
+        std::fs::write(home.storage_volume_path(), b"mounted-test-volume").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                home.storage_volume_path(),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(home.root().join("trust")).unwrap();
         (dir, home)
     }
 
@@ -235,34 +246,64 @@ mod tests {
         }
     }
 
+    fn seed_pin(home: &AstridHome, distro_id: &str, kp: &KeyPair) {
+        let path = home.root().join("trust").join(format!("{distro_id}.pub"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!("{}\n", sign::pubkey_to_wire(&kp.export_public_key())),
+        )
+        .unwrap();
+    }
+
     #[test]
-    fn tofu_pins_on_first_use() {
+    fn existing_matching_pin_verifies_without_implicit_write() {
         let (_d, home) = home();
         let kp = KeyPair::generate();
-        let pubkey = sign::pubkey_to_wire(&kp.export_public_key());
+        seed_pin(&home, "test", &kp);
+        let before = std::fs::read_to_string(trust_path(&home, "test")).unwrap();
         let lock = sample_lock();
         let sig = sign::sign_lock(&lock, &kp).unwrap();
 
-        let out = verify_and_pin(&home, "test", &pubkey, &sig, &lock, false).unwrap();
-        assert_eq!(out.action, TrustAction::ToFuTrusted);
-        // Pinned now.
+        let out = verify_and_pin(
+            &home,
+            "test",
+            &sign::pubkey_to_wire(&kp.export_public_key()),
+            &sig,
+            &lock,
+            false,
+            TrustPolicy::RequireExistingPin,
+        )
+        .unwrap();
+
+        assert_eq!(out.action, TrustAction::PinnedMatch);
         assert_eq!(
-            read_pinned(&home, "test").unwrap().unwrap(),
-            kp.export_public_key()
+            std::fs::read_to_string(trust_path(&home, "test")).unwrap(),
+            before
         );
     }
 
     #[test]
-    fn pinned_match_proceeds() {
+    fn product_missing_pin_fails_closed_without_writing_a_pin() {
         let (_d, home) = home();
         let kp = KeyPair::generate();
-        let pubkey = sign::pubkey_to_wire(&kp.export_public_key());
         let lock = sample_lock();
         let sig = sign::sign_lock(&lock, &kp).unwrap();
 
-        verify_and_pin(&home, "test", &pubkey, &sig, &lock, false).unwrap();
-        let out = verify_and_pin(&home, "test", &pubkey, &sig, &lock, false).unwrap();
-        assert_eq!(out.action, TrustAction::PinnedMatch);
+        for accept_new_key in [false, true] {
+            let err = verify_and_pin(
+                &home,
+                "test",
+                &sign::pubkey_to_wire(&kp.export_public_key()),
+                &sig,
+                &lock,
+                accept_new_key,
+                TrustPolicy::RequireExistingPin,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("no signing-key pin"), "got: {err}");
+            assert!(!trust_path(&home, "test").exists());
+        }
     }
 
     #[test]
@@ -270,18 +311,7 @@ mod tests {
         let (_d, home) = home();
         let kp = KeyPair::generate();
         let lock = sample_lock();
-
-        // Pin kp first.
-        let sig = sign::sign_lock(&lock, &kp).unwrap();
-        verify_and_pin(
-            &home,
-            "test",
-            &sign::pubkey_to_wire(&kp.export_public_key()),
-            &sig,
-            &lock,
-            false,
-        )
-        .unwrap();
+        seed_pin(&home, "test", &kp);
 
         // A different key, validly signing, must be refused.
         let kp2 = KeyPair::generate();
@@ -293,9 +323,14 @@ mod tests {
             &sig2,
             &lock,
             false,
+            TrustPolicy::RequireExistingPin,
         )
         .unwrap_err();
         assert!(err.to_string().contains("pinned"), "got: {err}");
+        assert_eq!(
+            read_pinned(&home, "test").unwrap().unwrap(),
+            kp.export_public_key()
+        );
     }
 
     #[test]
@@ -303,16 +338,7 @@ mod tests {
         let (_d, home) = home();
         let kp = KeyPair::generate();
         let lock = sample_lock();
-        let sig = sign::sign_lock(&lock, &kp).unwrap();
-        verify_and_pin(
-            &home,
-            "test",
-            &sign::pubkey_to_wire(&kp.export_public_key()),
-            &sig,
-            &lock,
-            false,
-        )
-        .unwrap();
+        seed_pin(&home, "test", &kp);
 
         let kp2 = KeyPair::generate();
         let sig2 = sign::sign_lock(&lock, &kp2).unwrap();
@@ -323,6 +349,7 @@ mod tests {
             &sig2,
             &lock,
             true,
+            TrustPolicy::RequireExistingPin,
         )
         .unwrap();
         assert_eq!(out.action, TrustAction::NewKeyAccepted);
@@ -349,8 +376,79 @@ mod tests {
             &sig,
             &tampered,
             true, // even with override
+            TrustPolicy::RequireExistingPin,
         )
         .unwrap_err();
         assert!(err.to_string().contains("invalid"), "got: {err}");
+    }
+
+    #[test]
+    fn signed_lock_substitution_fails_without_override() {
+        let (_d, home) = home();
+        let kp = KeyPair::generate();
+        seed_pin(&home, "test", &kp);
+        let lock = sample_lock();
+        let sig = sign::sign_lock(&lock, &kp).unwrap();
+
+        let wrong_hash = {
+            let mut tampered = sample_lock();
+            tampered.manifest_hash = Some("blake3:TAMPERED".into());
+            tampered
+        };
+        let wrong_member_hash = {
+            let mut tampered = sample_lock();
+            tampered.capsules[0].hash = "blake3:TAMPERED".into();
+            tampered
+        };
+        let extra_member = {
+            let mut tampered = sample_lock();
+            tampered.capsules.push(LockedCapsule {
+                name: "extra".into(),
+                version: "0.1.0".into(),
+                source: "@org/extra".into(),
+                hash: "blake3:abc".into(),
+                resolved_ref: Some("v0.1.0".into()),
+            });
+            tampered
+        };
+
+        for tampered in [wrong_hash, wrong_member_hash, extra_member] {
+            let err = verify_and_pin(
+                &home,
+                "test",
+                &sign::pubkey_to_wire(&kp.export_public_key()),
+                &sig,
+                &tampered,
+                true,
+                TrustPolicy::RequireExistingPin,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("invalid"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn ordinary_missing_pin_performs_first_use_tofu() {
+        let (_d, home) = home();
+        let kp = KeyPair::generate();
+        let lock = sample_lock();
+        let sig = sign::sign_lock(&lock, &kp).unwrap();
+
+        let out = verify_and_pin(
+            &home,
+            "test",
+            &sign::pubkey_to_wire(&kp.export_public_key()),
+            &sig,
+            &lock,
+            false,
+            TrustPolicy::TofuFirstPin,
+        )
+        .unwrap();
+
+        assert_eq!(out.action, TrustAction::ToFuTrusted);
+        assert_eq!(
+            read_pinned(&home, "test").unwrap().unwrap(),
+            kp.export_public_key()
+        );
     }
 }

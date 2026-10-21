@@ -13,8 +13,8 @@ use std::{
 use super::{
     CachedProcessProjection, Kernel, ProcessProjectionBinding, ProcessProjectionKey,
     ProcessProjectionTarget, ProcessProjectionTargetSet, ProcessStopPolicy, ProjectionCleanup,
-    StorageMountId, StorageProviderAccessV1, generate_lease_token, local_transport,
-    platform_process_provider_name, stop_process_provider,
+    ProjectionMountPaths, StorageMountId, StorageProviderAccessV1, generate_lease_token,
+    local_transport, platform_process_provider_name, stop_process_provider,
 };
 use crate::storage_mount::lifecycle::cleanup_mapped_lease_resources;
 use crate::storage_mount::lifecycle::{complete_cleanup_ledger, force_fence_projection_lease};
@@ -45,7 +45,7 @@ pub(crate) struct ProjectionCleanupState {
     pub(super) branch: ProjectionLeaseProvider,
     pub(super) owner: ProjectionLeaseProvider,
     pub(super) shared: Option<ProjectionLeaseProvider>,
-    pub(super) mount_root: PathBuf,
+    pub(super) paths: ProjectionMountPaths,
     pub(super) cleaned: bool,
 }
 
@@ -142,6 +142,10 @@ async fn cleanup_projection(state: &mut ProjectionCleanupState) -> bool {
         fence_retained_projection(state).await;
         return false;
     }
+    if !super::native_unmount::confirm_projection_unmounted(&state.paths, state.stop_policy).await {
+        fence_retained_projection(state).await;
+        return false;
+    }
     let Some(kernel) = state.kernel.upgrade() else {
         tracing::error!("kernel shut down before process storage projection leases were revoked");
         return false;
@@ -158,7 +162,7 @@ async fn cleanup_projection(state: &mut ProjectionCleanupState) -> bool {
         tracing::error!("failed to revoke process storage projection leases; retaining resources");
         return false;
     }
-    if let Err(error) = remove_projection_root(&state.mount_root) {
+    if let Err(error) = remove_projection_root(&state.paths.mount_root) {
         tracing::error!(%error, "failed to remove process storage projection root");
         return false;
     }
@@ -873,35 +877,11 @@ pub(crate) fn projection_mount(
     let fleet_shared_mountpoint = projection.fleet_shared_mountpoint.clone();
     let cleanup_projection = Arc::clone(&projection);
     let cleanup = move || -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        Box::pin(async move {
-            {
-                let projections = projections.lock().await;
-                if cleanup_projection.refs.fetch_sub(1, Ordering::AcqRel) != 1 {
-                    return;
-                }
-                if !projections
-                    .get(&key)
-                    .is_some_and(|current| Arc::ptr_eq(current, &cleanup_projection))
-                {
-                    return;
-                }
-                cleanup_projection.closing.store(true, Ordering::Release);
-            }
-            let cleanup_ok = (cleanup_projection.cleanup)().await;
-            if !cleanup_ok {
-                cleanup_projection
-                    .cleanup_failed
-                    .store(true, Ordering::Release);
-                return;
-            }
-            let mut projections = projections.lock().await;
-            if projections
-                .get(&key)
-                .is_some_and(|current| Arc::ptr_eq(current, &cleanup_projection))
-            {
-                projections.remove(&key);
-            }
-        })
+        Box::pin(super::projection_release::release_owned_projection(
+            cleanup_projection,
+            projections,
+            key,
+        ))
     };
     let mut mount = astrid_capsule::context::ProcessStorageMount::new_async(
         workspace_mountpoint,

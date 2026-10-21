@@ -109,8 +109,9 @@ mod tests {
     }
 
     async fn create_admin_grouped(kernel: &Arc<crate::Kernel>, name: &str) -> PrincipalId {
+        super::super::test_support::seed_operator(kernel).await;
         let caller = PrincipalId::new(name).unwrap();
-        let created = handlers::dispatch(
+        let created = super::super::test_support::dispatch_as_operator(
             kernel,
             &PrincipalId::default(),
             AdminRequestKind::AgentCreate {
@@ -131,7 +132,7 @@ mod tests {
     }
 
     async fn delete_principal(kernel: &Arc<crate::Kernel>, principal: &PrincipalId) {
-        let deleted = handlers::dispatch(
+        let deleted = super::super::test_support::dispatch_as_operator(
             kernel,
             &PrincipalId::default(),
             AdminRequestKind::AgentDelete {
@@ -203,8 +204,9 @@ mod tests {
         .await
         .unwrap();
 
+        super::super::test_support::seed_operator(&kernel).await;
         let reader = PrincipalId::new("reader").unwrap();
-        let created = handlers::dispatch(
+        let created = super::super::test_support::dispatch_as_operator(
             &kernel,
             &PrincipalId::default(),
             AdminRequestKind::AgentCreate {

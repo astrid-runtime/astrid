@@ -17,7 +17,7 @@ use astrid_build::artifact::{self, ArtifactVerification};
 use astrid_capsule::manifest::CapsuleManifest;
 use astrid_core::PrincipalId;
 use astrid_storage::{
-    CapsuleInstallExpectation, CapsulePackage, CapsulePackageSnapshot, RuntimePrincipalStore,
+    CapsulePackage, CapsulePackageGeneration, CapsulePackageSnapshot, RuntimePrincipalStore,
     StateOwner,
 };
 use flate2::Compression;
@@ -39,6 +39,7 @@ pub struct VerifiedDurableCapsulePackage {
     manifest: CapsuleManifest,
     manifest_bytes: Vec<u8>,
     archive_files: std::collections::BTreeMap<String, Vec<u8>>,
+    archive_directories: std::collections::BTreeSet<String>,
     metadata: CapsuleMeta,
     metadata_bytes: Vec<u8>,
     authority: InstalledAuthority,
@@ -101,6 +102,18 @@ impl VerifiedDurableCapsulePackage {
         self.archive_files.get(relative).map(Vec::as_slice)
     }
 
+    /// Iterate every verified archive member without exposing internal storage.
+    pub fn archive_entries(&self) -> impl Iterator<Item = (&str, &[u8])> + '_ {
+        self.archive_files
+            .iter()
+            .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+    }
+
+    /// Iterate authenticated archive directory names without exposing storage.
+    pub fn archive_directories(&self) -> impl Iterator<Item = &str> + '_ {
+        self.archive_directories.iter().map(String::as_str)
+    }
+
     /// Return the exact durable metadata bytes.
     #[must_use]
     pub fn metadata_bytes(&self) -> &[u8] {
@@ -145,42 +158,18 @@ pub fn read_verified_durable_package_for_owner(
     let Some(snapshot) = registry.get_snapshot(owner, id)? else {
         return Ok(None);
     };
-    let package = snapshot.package();
-    let verification = artifact::verify_archive_bytes(&package.archive)
-        .with_context(|| format!("verify durable capsule archive {id}"))?;
-    let files = read_archive_files(&package.archive)?;
-    let manifest_bytes = files
-        .get("Capsule.toml")
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("durable capsule {id} is missing Capsule.toml"))?;
-    let manifest_text = String::from_utf8(manifest_bytes.clone())
-        .with_context(|| format!("durable capsule {id} manifest is not UTF-8"))?;
-    let manifest: CapsuleManifest = toml::from_str(&manifest_text)
-        .with_context(|| format!("decode durable capsule {id} manifest"))?;
-    let metadata: CapsuleMeta = serde_json::from_slice(&package.metadata)
-        .with_context(|| format!("decode durable capsule {id} metadata"))?;
-    let authority: InstalledAuthority = serde_json::from_slice(&package.authority)
-        .with_context(|| format!("decode durable capsule {id} authority"))?;
-    let metadata_bytes = package.metadata.clone();
-    verify_package_identity(
-        id,
-        &manifest,
-        &metadata,
-        &authority,
-        &manifest_bytes,
-        &verification,
-        &files,
-    )?;
-    verify_wit_files(id, &metadata, &files)?;
+    let contents = verify_package_contents(id, snapshot.package())?;
+    let metadata_bytes = snapshot.package().metadata.clone();
     Ok(Some(VerifiedDurableCapsulePackage {
         id: id.to_owned(),
         snapshot,
-        manifest,
-        manifest_bytes,
-        archive_files: files,
-        metadata,
+        manifest: contents.manifest,
+        manifest_bytes: contents.manifest_bytes,
+        archive_files: contents.files,
+        archive_directories: contents.directories,
+        metadata: contents.metadata,
         metadata_bytes,
-        authority,
+        authority: contents.authority,
     }))
 }
 
@@ -333,12 +322,16 @@ fn verify_package_identity(
     Ok(())
 }
 
-fn read_archive_files(
-    archive_bytes: &[u8],
-) -> anyhow::Result<std::collections::BTreeMap<String, Vec<u8>>> {
+struct ArchiveInventory {
+    files: std::collections::BTreeMap<String, Vec<u8>>,
+    directories: std::collections::BTreeSet<String>,
+}
+
+fn read_archive_files(archive_bytes: &[u8]) -> anyhow::Result<ArchiveInventory> {
     let decoder = flate2::read::GzDecoder::new(Cursor::new(archive_bytes));
     let mut archive = tar::Archive::new(decoder);
     let mut files = std::collections::BTreeMap::new();
+    let mut directories = std::collections::BTreeSet::new();
     for entry in archive.entries().context("read durable capsule archive")? {
         let mut entry = entry.context("read durable capsule archive entry")?;
         let path = entry.path().context("read durable capsule archive path")?;
@@ -352,26 +345,33 @@ fn read_archive_files(
         {
             bail!("durable capsule archive contains unsafe path");
         }
-        if entry.header().entry_type().is_dir() {
-            continue;
-        }
-        if !entry.header().entry_type().is_file() {
+
+        let entry_type = entry.header().entry_type();
+        if !entry_type.is_dir() && !entry_type.is_file() {
             bail!("durable capsule archive contains a link or special file");
         }
+
         let name = path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("durable capsule archive path is not UTF-8"))?
             .replace('\\', "/");
-        if files.contains_key(&name) {
+        if files.contains_key(&name) || directories.contains(&name) {
             bail!("durable capsule archive contains duplicate path {name}");
         }
+        if entry_type.is_dir() {
+            if !directories.insert(name) {
+                bail!("durable capsule archive contains duplicate directory path");
+            }
+            continue;
+        }
+
         let mut bytes = Vec::new();
         entry
             .read_to_end(&mut bytes)
             .with_context(|| format!("read durable capsule archive file {name}"))?;
         files.insert(name, bytes);
     }
-    Ok(files)
+    Ok(ArchiveInventory { files, directories })
 }
 
 /// Publish one source directory into the target principal's durable registry.
@@ -388,6 +388,7 @@ pub fn publish_directory_package(
     target_dir: &Path,
     meta: &CapsuleMeta,
     authority: &InstalledAuthority,
+    expected_generation: Option<CapsulePackageGeneration>,
 ) -> anyhow::Result<()> {
     let uid = store
         .principal_directory()
@@ -423,12 +424,12 @@ pub fn publish_directory_package(
     let registry = store.capsules();
     let owner = StateOwner::Principal(uid);
     let id = authority_capsule_id(&authority)?;
-    let expected = registry
-        .get_snapshot(&owner, &id)?
-        .map_or(CapsuleInstallExpectation::Absent, |snapshot| {
-            CapsuleInstallExpectation::Generation(snapshot.generation())
-        });
+    let expected = expectation::install_expectation(
+        registry.get_snapshot(&owner, &id)?.as_ref(),
+        expected_generation,
+    );
     let package = CapsulePackage::new(archive, metadata, authority);
+    verify_package_contents(&id, &package)?;
     let materialization = tempfile::Builder::new()
         .prefix(".capsule-materialization-")
         .tempdir_in(
@@ -472,13 +473,24 @@ pub fn publish_package(
     id: &str,
     package: &CapsulePackage,
 ) -> anyhow::Result<()> {
+    publish_package_with_expected_generation(store, uid, id, package, None)
+}
+
+/// Publish a package, fail-closing when `expected_generation` no longer matches.
+pub fn publish_package_with_expected_generation(
+    store: &Arc<RuntimePrincipalStore>,
+    uid: astrid_core::identity::PrincipalUid,
+    id: &str,
+    package: &CapsulePackage,
+    expected_generation: Option<CapsulePackageGeneration>,
+) -> anyhow::Result<()> {
     let owner = StateOwner::Principal(uid);
     let registry = store.capsules();
-    let expected = registry
-        .get_snapshot(&owner, id)?
-        .map_or(CapsuleInstallExpectation::Absent, |snapshot| {
-            CapsuleInstallExpectation::Generation(snapshot.generation())
-        });
+    let expected = expectation::install_expectation(
+        registry.get_snapshot(&owner, id)?.as_ref(),
+        expected_generation,
+    );
+    verify_package_contents(id, package)?;
     registry.install(&owner, id, package, expected)?;
     read_verified_durable_package(store, uid, id)?
         .ok_or_else(|| anyhow::anyhow!("durable capsule {id} disappeared after publish"))?;
@@ -594,6 +606,9 @@ fn reject_symlink_ancestors(root: &Path, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+mod expectation;
+mod verification;
+use verification::verify_package_contents;
 mod leftover;
 mod migration;
 

@@ -63,6 +63,7 @@ impl HostState {
             ConnectionIdentity {
                 principal,
                 device_key_id,
+                request_owner: astrid_events::ipc::RequestOwnerId::generate(),
             },
         );
     }

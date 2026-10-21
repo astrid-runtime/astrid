@@ -134,7 +134,11 @@ class DockerfileContractTests(unittest.TestCase):
 
     def test_base_image_is_digest_pinned(self) -> None:
         first_line = DOCKERFILE.splitlines()[0]
-        self.assertRegex(first_line, r"^FROM .+@sha256:[0-9a-f]{64}$")
+        self.assertEqual(
+            first_line,
+            "FROM docker.io/library/ubuntu@sha256:"
+            "a2d43bffc46670d7108bb3c0468c67c5557c4c92e83e1e34cbff1322ad1b94dc",
+        )
 
     def test_release_receipt_binds_image_to_exact_source_and_archive(self) -> None:
         for field in (

@@ -137,6 +137,12 @@ pub trait Capsule: Send + Sync {
     /// Close externally visible route admission for this generation.
     fn retire(&self) {}
 
+    /// Generation-local fence for reserved interceptor delivery. Implementors
+    /// exposing a fence must close it before retiring execution authority.
+    fn delivery_admission_gate(&self) -> Option<astrid_events::RouteAdmissionGate> {
+        None
+    }
+
     /// Promote this capsule's OS-level copy-on-write workspace changes into the
     /// pristine workspace (the gate's "approve"). Returns `Ok(true)` if a
     /// copy-on-write workspace was committed, `Ok(false)` if the capsule has
@@ -256,6 +262,7 @@ pub(crate) struct CompositeCapsule {
     state: CapsuleState,
     engines: Vec<Box<dyn crate::engine::ExecutionEngine>>,
     capsule_dir: Option<PathBuf>,
+    delivery_gate: astrid_events::RouteAdmissionGate,
 }
 
 impl CompositeCapsule {
@@ -268,6 +275,7 @@ impl CompositeCapsule {
             state: CapsuleState::Unloaded,
             engines: Vec::new(),
             capsule_dir: None,
+            delivery_gate: astrid_events::RouteAdmissionGate::published(),
         })
     }
 
@@ -297,6 +305,10 @@ impl Capsule for CompositeCapsule {
     }
 
     async fn load(&mut self, ctx: &CapsuleContext) -> CapsuleResult<()> {
+        // A reloaded object is a new execution generation. Never reopen a
+        // gate captured by reservations for the previous load.
+        self.delivery_gate.retire();
+        self.delivery_gate = astrid_events::RouteAdmissionGate::staged();
         self.state = CapsuleState::Loading;
         for index in 0..self.engines.len() {
             if let Err(load_error) = self.engines[index].load(ctx).await {
@@ -319,10 +331,12 @@ impl Capsule for CompositeCapsule {
             }
         }
         self.state = CapsuleState::Ready;
+        self.delivery_gate.publish();
         Ok(())
     }
 
     async fn unload(&mut self) -> CapsuleResult<()> {
+        self.delivery_gate.retire();
         self.state = CapsuleState::Unloading;
         let mut errors = Vec::new();
         for engine in self.engines.iter_mut().rev() {
@@ -368,12 +382,18 @@ impl Capsule for CompositeCapsule {
         for engine in &self.engines {
             engine.publish();
         }
+        self.delivery_gate.publish();
     }
 
     fn retire(&self) {
+        self.delivery_gate.retire();
         for engine in &self.engines {
             engine.retire();
         }
+    }
+
+    fn delivery_admission_gate(&self) -> Option<astrid_events::RouteAdmissionGate> {
+        Some(self.delivery_gate.clone())
     }
 
     async fn promote_workspace(&self, caller: &astrid_core::PrincipalId) -> CapsuleResult<bool> {
@@ -558,6 +578,19 @@ mod tests {
         capsule.add_engine(Box::new(HealthyEngine));
 
         assert_eq!(capsule.check_health(), CapsuleState::Ready);
+    }
+
+    #[tokio::test]
+    async fn composite_retirement_and_unload_close_delivery_admission() {
+        let capsule = CompositeCapsule::new(test_manifest()).unwrap();
+        let gate = capsule.delivery_admission_gate().unwrap();
+        assert!(gate.commit_guard().is_some());
+        capsule.retire();
+        assert!(gate.commit_guard().is_none());
+        let mut direct_unload = CompositeCapsule::new(test_manifest()).unwrap();
+        let unload_gate = direct_unload.delivery_admission_gate().unwrap();
+        direct_unload.unload().await.unwrap();
+        assert!(unload_gate.commit_guard().is_none());
     }
 
     #[test]

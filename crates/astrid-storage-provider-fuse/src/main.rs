@@ -9,6 +9,79 @@ fn main() -> std::process::ExitCode {
     std::process::ExitCode::from(2)
 }
 
+#[cfg(any(target_os = "linux", test))]
+const MAX_FUSE_STDERR_BYTES: usize = 1024;
+
+#[cfg(any(target_os = "linux", test))]
+const MAX_PROVIDER_FAILURE_BYTES: usize = 4096;
+
+#[cfg(any(target_os = "linux", test))]
+fn bounded_utf8(input: impl Iterator<Item = char>, max_bytes: usize) -> String {
+    let mut bounded = String::with_capacity(max_bytes);
+    for character in input {
+        if bounded
+            .len()
+            .checked_add(character.len_utf8())
+            .is_none_or(|length| length > max_bytes)
+        {
+            break;
+        }
+        bounded.push(character);
+    }
+    bounded
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn bounded_stderr_snippet(bytes: &[u8]) -> String {
+    bounded_utf8(
+        String::from_utf8_lossy(bytes)
+            .chars()
+            .filter(|character| !character.is_control()),
+        MAX_FUSE_STDERR_BYTES,
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn bounded_failure_message(message: &str) -> String {
+    bounded_utf8(message.chars(), MAX_PROVIDER_FAILURE_BYTES)
+}
+
+#[cfg(test)]
+mod stderr_tests {
+    use super::{
+        MAX_FUSE_STDERR_BYTES, MAX_PROVIDER_FAILURE_BYTES, bounded_failure_message,
+        bounded_stderr_snippet,
+    };
+
+    #[test]
+    fn bounded_stderr_snippet_is_lossy_control_free_and_secret_bounded() {
+        let secret = format!("lease-token={}", "a".repeat(MAX_FUSE_STDERR_BYTES));
+        let mut bytes = vec![0, 0xff, b'\n'];
+        bytes.extend_from_slice(secret.as_bytes());
+
+        let snippet = bounded_stderr_snippet(&bytes);
+
+        assert_eq!(snippet.len(), MAX_FUSE_STDERR_BYTES);
+        assert!(snippet.starts_with('\u{fffd}'));
+        assert!(snippet.chars().all(|character| !character.is_control()));
+        assert!(!snippet.contains(&secret));
+        assert_ne!(snippet, String::from_utf8_lossy(&bytes));
+    }
+
+    #[test]
+    fn bounded_messages_respect_protocol_byte_limits_for_multibyte_text() {
+        let multibyte = "😀".repeat(MAX_PROVIDER_FAILURE_BYTES);
+
+        let snippet = bounded_stderr_snippet(multibyte.as_bytes());
+        let failure = bounded_failure_message(&multibyte);
+
+        assert_eq!(snippet.len(), MAX_FUSE_STDERR_BYTES);
+        assert_eq!(failure.len(), MAX_PROVIDER_FAILURE_BYTES);
+        assert!(snippet.is_char_boundary(snippet.len()));
+        assert!(failure.is_char_boundary(failure.len()));
+    }
+}
+
 #[cfg(target_os = "linux")]
 macro_rules! linux_only {
     ($($item:item)*) => {
@@ -50,6 +123,7 @@ mod control;
 mod filesystem;
 mod mountpoint;
 mod registry;
+mod rollback;
 mod service;
 
 const PROVIDER_NAME: &str = "astrid-storage-provider-fuse";
@@ -96,7 +170,7 @@ async fn run_stdio() -> Result<()> {
         Ok(success) => StorageProviderOutcomeV1::Success(success),
         Err(error) => StorageProviderOutcomeV1::Failure(StorageProviderFailureV1 {
             code: "provider-operation".to_owned(),
-            message: error.to_string().chars().take(4096).collect(),
+            message: bounded_failure_message(&error.to_string()),
         }),
     };
     let response = StorageProviderResponseV1 {
@@ -174,50 +248,104 @@ async fn mount(
     let ready = match startup {
         Ok(ready) => ready,
         Err(error) => {
-            let _ = client
-                .request(AdminRequestKind::StorageMountRevoke {
-                    mount_id: lease.mount_id,
-                })
-                .await;
-            cleanup_mountpoint(&mountpoint, auto_created)?;
-            return Err(error);
+            return Err(rollback_mount_error(error, client, &launch, &control_path).await);
         },
     };
     if ready.mount_id != lease.mount_id || ready.access != lease.access {
-        let _ = control_unmount(&control_path, &launch.requested_by);
-        let _ = client
-            .request(AdminRequestKind::StorageMountRevoke {
-                mount_id: lease.mount_id,
-            })
-            .await;
-        cleanup_mountpoint(&mountpoint, auto_created)?;
-        bail!("detached FUSE service returned a mismatched lease identity");
+        let error = anyhow::anyhow!("detached FUSE service returned a mismatched lease identity");
+        return Err(rollback_mount_error(error, client, &launch, &control_path).await);
     }
     if ready.pid == 0 {
-        bail!("detached FUSE service returned an invalid process identity");
+        let error = anyhow::anyhow!("detached FUSE service returned an invalid process identity");
+        return Err(rollback_mount_error(error, client, &launch, &control_path).await);
+    }
+    let control_ready = call_control(
+        &control_path,
+        &ControlRequest::Status {
+            requested_by: launch.requested_by.clone(),
+        },
+    )
+    .and_then(|response| require_ready_control_response(response, lease.access));
+    if let Err(error) = control_ready {
+        let error = error.context("detached FUSE service failed its readiness handshake");
+        return Err(rollback_mount_error(error, client, &launch, &control_path).await);
     }
     let record = registry::MountRecord {
         mount_id: lease.mount_id,
-        requested_by: launch.requested_by,
+        requested_by: launch.requested_by.clone(),
         mountpoint: mountpoint.clone(),
         access: lease.access,
         auto_created_mountpoint: auto_created,
         control_path: control_path.clone(),
     };
     if let Err(error) = registry::write_record(&record) {
-        let _ = control_unmount(&control_path, &record.requested_by);
-        let _ = client
-            .request(AdminRequestKind::StorageMountRevoke {
-                mount_id: lease.mount_id,
-            })
-            .await;
-        cleanup_mountpoint(&mountpoint, auto_created)?;
-        return Err(error);
+        return Err(rollback_mount_error(error, client, &launch, &control_path).await);
     }
     Ok(StorageProviderSuccessV1::Mounted {
         mount_id: lease.mount_id,
         mountpoint,
     })
+}
+
+async fn rollback_mount_error(
+    error: anyhow::Error,
+    client: &mut AdminClient,
+    launch: &ServiceLaunch,
+    control_path: &Path,
+) -> anyhow::Error {
+    rollback::preserve_launch_error(
+        error,
+        rollback_unregistered_mount(client, launch, control_path).await,
+    )
+}
+
+async fn rollback_unregistered_mount(
+    client: &mut AdminClient,
+    launch: &ServiceLaunch,
+    control_path: &Path,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    if let Err(error) = control_unmount(control_path, &launch.requested_by) {
+        failures.push(format!("control unmount: {error:#}"));
+    }
+    if let Err(error) = client
+        .request(AdminRequestKind::StorageMountRevoke {
+            mount_id: launch.lease.mount_id,
+        })
+        .await
+        .and_then(into_success)
+    {
+        failures.push(format!("revoke mount lease: {error:#}"));
+    }
+    rollback::finish_cleanup(
+        failures,
+        mountpoint::lazy_unmount(&launch.mountpoint),
+        || {
+            cleanup_service_artifacts(
+                control_path,
+                &launch.mountpoint,
+                launch.auto_created_mountpoint,
+            )
+        },
+    )
+}
+
+fn require_ready_control_response(
+    response: ControlResponse,
+    expected_access: StorageProviderAccessV1,
+) -> Result<()> {
+    match response {
+        ControlResponse::Status { access } if access == expected_access => Ok(()),
+        ControlResponse::Status { access } => {
+            bail!("detached FUSE service readiness access {access:?} does not match its lease")
+        },
+        ControlResponse::Failure { code, message } => {
+            bail!("detached FUSE service readiness failed [{code}]: {message}")
+        },
+        ControlResponse::Done => {
+            bail!("detached FUSE service returned an incompatible readiness response")
+        },
+    }
 }
 
 async fn sync(
@@ -344,6 +472,12 @@ async fn run_public_service() -> Result<()> {
             return Err(error);
         },
     };
+    let stderr_sink = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .context("open detached FUSE stderr sink")?;
+    nix::unistd::dup2_stderr(&stderr_sink).context("hand off detached FUSE stderr sink")?;
+    drop(stderr_sink);
     let startup = ServiceStartup::Ready {
         mount_id: lease.mount_id,
         pid: std::process::id(),
@@ -441,7 +575,7 @@ async fn live_control_status(
 fn failure_response(code: &str, message: &str) -> ControlResponse {
     ControlResponse::Failure {
         code: code.to_owned(),
-        message: message.chars().take(4096).collect(),
+        message: bounded_failure_message(message),
     }
 }
 
@@ -454,21 +588,86 @@ async fn launch_service(launch: &ServiceLaunch, control_path: &Path) -> Result<C
         .arg(PUBLIC_SERVICE_ARGUMENT)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
     command.as_std_mut().process_group(0);
     let mut child = command.spawn()?;
+    let Some(mut stderr) = child.stderr.take() else {
+        let _ = child.kill().await;
+        let status = child.wait().await;
+        return Err(anyhow::anyhow!("FUSE service stderr is unavailable")
+            .context(format!("detached FUSE service status: {status:?}")));
+    };
+    let mut stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::with_capacity(MAX_FUSE_STDERR_BYTES + 1);
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let read = stderr.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            let remaining = (MAX_FUSE_STDERR_BYTES + 1).saturating_sub(bytes.len());
+            bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+        }
+        std::io::Result::Ok(bytes)
+    });
     let startup = read_service_startup(&mut child, launch, control_path).await;
     match startup {
         Ok(ready) => {
-            tokio::spawn(async move {
-                let _ = child.wait().await;
-            });
-            Ok(ready)
+            match tokio::time::timeout(Duration::from_secs(1), &mut stderr_task).await {
+                Ok(Ok(Ok(_))) => require_service_running_after_handoff(&mut child)
+                    .await
+                    .map(|()| ready),
+                Ok(Ok(Err(error))) => {
+                    let _ = child.kill().await;
+                    let status = child.wait().await;
+                    Err(anyhow::Error::new(error)
+                        .context("read detached FUSE stderr during sink handoff")
+                        .context(format!("detached FUSE service status: {status:?}")))
+                },
+                Ok(Err(error)) => {
+                    let _ = child.kill().await;
+                    let status = child.wait().await;
+                    Err(anyhow::anyhow!("detached FUSE stderr drain failed: {error}")
+                        .context(format!("detached FUSE service status: {status:?}")))
+                },
+                Err(_) => {
+                    stderr_task.abort();
+                    let _ = child.kill().await;
+                    let status = child.wait().await;
+                    Err(anyhow::anyhow!("detached FUSE stderr sink handoff timed out")
+                        .context(format!("detached FUSE service status: {status:?}")))
+                },
+            }
         },
         Err(error) => {
             let _ = child.kill().await;
             let status = child.wait().await;
-            Err(error.context(format!("detached FUSE service status: {status:?}")))
+            let stderr = match stderr_task.await {
+                Ok(Ok(bytes)) => bounded_stderr_snippet(&bytes),
+                Ok(Err(_)) | Err(_) => String::new(),
+            };
+            let status_context = format!("detached FUSE service status: {status:?}");
+            if stderr.is_empty() {
+                Err(error.context(status_context))
+            } else {
+                Err(error.context(format!("{status_context}; stderr: {stderr}")))
+            }
+        },
+    }
+}
+
+async fn require_service_running_after_handoff(
+    child: &mut tokio::process::Child,
+) -> Result<()> {
+    match child.try_wait() {
+        Ok(None) => Ok(()),
+        Ok(Some(status)) => bail!("detached FUSE service exited after readiness: {status}"),
+        Err(error) => {
+            let _ = child.kill().await;
+            let status = child.wait().await;
+            Err(anyhow::Error::new(error)
+                .context("inspect detached FUSE service after stderr sink handoff")
+                .context(format!("detached FUSE service status: {status:?}")))
         },
     }
 }
@@ -707,6 +906,67 @@ fn into_success(body: AdminResponseBody) -> Result<serde_json::Value> {
             bail!("kernel refused storage lifecycle request: {error}")
         },
         _ => bail!("kernel returned an unexpected storage lifecycle response"),
+    }
+}
+
+#[cfg(test)]
+mod launcher_tests {
+    use super::{
+        ControlResponse, StorageProviderAccessV1, require_ready_control_response,
+        require_service_running_after_handoff,
+    };
+    use anyhow::Result;
+
+    #[tokio::test]
+    async fn stderr_handoff_rejects_a_service_that_already_exited() -> Result<()> {
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()?;
+        let status = child.wait().await?;
+        assert!(status.success());
+
+        let error = require_service_running_after_handoff(&mut child)
+            .await
+            .expect_err("an exited service must not be registered as ready");
+        assert!(error.to_string().contains("exited after readiness"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stderr_handoff_accepts_a_service_that_is_still_running() -> Result<()> {
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .spawn()?;
+
+        require_service_running_after_handoff(&mut child).await?;
+        child.kill().await?;
+        let _ = child.wait().await?;
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_requires_a_matching_authenticated_status_response() {
+        require_ready_control_response(
+            ControlResponse::Status {
+                access: StorageProviderAccessV1::ReadWrite,
+            },
+            StorageProviderAccessV1::ReadWrite,
+        )
+        .expect("matching status must prove control readiness");
+
+        for response in [
+            ControlResponse::Status {
+                access: StorageProviderAccessV1::ReadOnly,
+            },
+            ControlResponse::Failure {
+                code: "not-ready".to_owned(),
+                message: "service rejected readiness".to_owned(),
+            },
+            ControlResponse::Done,
+        ] {
+            require_ready_control_response(response, StorageProviderAccessV1::ReadWrite)
+                .expect_err("non-matching control responses must fail closed");
+        }
     }
 }
 

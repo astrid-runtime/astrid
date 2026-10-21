@@ -669,7 +669,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_import_is_explicit_receipted_and_retires_only_verified_sources() {
+    async fn legacy_import_is_receipted_and_resumes_after_verified_retirement() {
         let root = tempfile::tempdir().unwrap();
         let env_path = root.path().join("runner.env.json");
         let secret_root = root.path().join("secrets");
@@ -698,8 +698,41 @@ mod tests {
         assert_eq!(count, 2);
         assert!(!env_path.exists());
         assert!(!secret_root.exists());
-        let scope = principal_env_store(backend, principal("agent-alice"), "runner").unwrap();
+        let scope =
+            principal_env_store(backend.clone(), principal("agent-alice"), "runner").unwrap();
         assert!(scope.get(LEGACY_IMPORT_MARKER_KEY).await.unwrap().is_some());
+        let receipt = scope.get(LEGACY_IMPORT_MARKER_KEY).await.unwrap();
+        // A later boot stage can fail after this scope retires its sources.
+        // The barrier then invokes the importer again with no native sources.
+        let repeated = import_legacy_scope(
+            backend.clone(),
+            principal("agent-alice"),
+            "runner",
+            None,
+            None,
+            true,
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .expect("retired scope must remain resumable");
+        assert_eq!(repeated, 0);
+        assert_eq!(scope.get(LEGACY_IMPORT_MARKER_KEY).await.unwrap(), receipt);
+        assert_eq!(
+            get_env(&scope, "OWNER").await.unwrap().as_deref(),
+            Some("alice")
+        );
+        let secrets = ScopedKvStore::new(
+            backend,
+            principal_secret_namespace(principal("agent-alice"), "runner"),
+        )
+        .unwrap();
+        assert_eq!(
+            get_control_secret(&secrets, "TOKEN")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("secret-value")
+        );
     }
 
     #[tokio::test]
@@ -723,6 +756,19 @@ mod tests {
         .unwrap();
         assert_eq!(count, 1);
         assert!(!secret_root.exists());
+        assert_eq!(
+            import_legacy_system_scope(
+                backend.clone(),
+                "runner",
+                None,
+                None,
+                true,
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .expect("retired system scope must remain resumable"),
+            0
+        );
 
         let system = system_env_store(backend.clone(), "runner").unwrap();
         assert!(
@@ -749,6 +795,42 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn retired_legacy_import_rejects_malformed_completion_receipt() {
+        for receipt in [
+            "legacy-import-v2 env=1 secrets=1",
+            "legacy-import-v1 env= secrets=1",
+            "legacy-import-v1 env=1 secrets=-1",
+            "legacy-import-v1 env=1 secrets=1 trailing",
+        ] {
+            let backend = Arc::new(MemoryKvStore::new());
+            let scope = principal_env_store(backend.clone(), principal("alice"), "runner").unwrap();
+            scope
+                .set(LEGACY_IMPORT_MARKER_KEY, receipt.as_bytes().to_vec())
+                .await
+                .unwrap();
+            let result = import_legacy_scope(
+                backend,
+                principal("alice"),
+                "runner",
+                None,
+                None,
+                true,
+                tokio::runtime::Handle::current(),
+            )
+            .await;
+            assert!(result.is_err(), "{receipt}");
+            assert_eq!(
+                scope
+                    .get(LEGACY_IMPORT_MARKER_KEY)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(receipt.as_bytes())
+            );
+        }
     }
 
     #[cfg(unix)]

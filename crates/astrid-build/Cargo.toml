@@ -20,6 +20,7 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 astrid-core = { workspace = true }
 astrid-crypto = { workspace = true }
+astrid-storage = { workspace = true }
 blake3 = { workspace = true }
 cargo_metadata = "0.23.1"
 clap = { workspace = true }

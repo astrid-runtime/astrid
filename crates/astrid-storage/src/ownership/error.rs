@@ -7,6 +7,9 @@ use super::FirstOwnerError;
 /// Rejection from ownership graph persistence or invariant enforcement.
 #[derive(Debug, thiserror::Error)]
 pub enum OwnershipError {
+    /// Explicit hosted provisioning authorization failed closed.
+    #[error(transparent)]
+    HostedOwner(#[from] astrid_core::identity::hosted_owner::HostedOwnerError),
     /// Canonical identity material was invalid.
     #[error(transparent)]
     Identity(#[from] OwnershipIdentityError),
@@ -44,9 +47,20 @@ pub enum OwnershipError {
     /// A referenced user does not exist.
     #[error("user not found: {0}")]
     UserNotFound(UserUid),
+    /// No current user delegation exists for the authenticated creator device.
+    #[error("authenticated device has no user delegation for principal {0}")]
+    UserDeviceNotBound(PrincipalUid),
     /// A referenced fleet does not exist.
     #[error("fleet not found: {0}")]
     FleetNotFound(FleetUid),
+    /// The target user does not currently belong to the fleet.
+    #[error("user {user} is not a member of fleet {fleet}")]
+    NotFleetMember {
+        /// User missing current membership.
+        user: UserUid,
+        /// Fleet required by the operation.
+        fleet: FleetUid,
+    },
     /// The acting user cannot administer the fleet.
     #[error("user {user} is not a manager of fleet {fleet}")]
     NotFleetManager {
@@ -97,6 +111,11 @@ pub enum OwnershipError {
         /// Durable UID owned by the existing deletion.
         principal: PrincipalUid,
     },
+    /// An operator must explicitly resolve a legacy principal's resource owner.
+    #[error(
+        "principal {0} needs an explicit accountable user before spawning; assign resource ownership without recreating its home"
+    )]
+    AccountableUserRequired(PrincipalUid),
     /// Sustained concurrent writes prevented an atomic commit.
     #[error("ownership graph changed concurrently too many times")]
     ConcurrentModification,

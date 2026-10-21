@@ -126,16 +126,38 @@ fn sign_archive_with_runtime_key_in_home(
     archive_path: &Path,
     home: &AstridHome,
 ) -> anyhow::Result<VerifiedProvenance> {
-    #[cfg(windows)]
-    home.ensure()
+    home.validate_runtime_identity_provisioning()
         .context("failed to provision private Astrid home for capsule signing")?;
 
     let key_path = home.runtime_key_path();
+    if key_path.try_exists()? {
+        astrid_core::platform_fs::validate_private_file(&key_path)
+            .context("failed to validate private runtime-signing key")?;
+        let key_bytes =
+            std::fs::read(&key_path).context("failed to read the runtime capsule-signing key")?;
+        let keypair = KeyPair::from_secret_key(&key_bytes)
+            .context("failed to decode the runtime capsule-signing key")?;
+        return sign_archive(archive_path, &keypair);
+    }
+
+    // A daemon owns this fence from before it projects the durable volume until
+    // the projection is packed and retired. Hold the same fence across the
+    // read-only admission recheck and first sidecar creation so signing cannot
+    // revive a root that became volume-only after the initial preflight.
+    let lifecycle = astrid_storage::principal_state::RuntimeLifecycleGuard::acquire(home)
+        .context("failed to acquire runtime lifecycle for capsule signing")?;
+    home.validate_runtime_identity_provisioning()
+        .context("failed to provision private Astrid home for capsule signing")?;
+    home.ensure()
+        .context("failed to provision private Astrid home for capsule signing")?;
+    astrid_core::platform_fs::ensure_private_directory(&home.keys_dir())
+        .context("failed to provision private runtime-signing key directory")?;
+
     let keypair = astrid_crypto::load_or_generate_keypair(&key_path)
         .context("failed to load the runtime capsule-signing key")?;
-    #[cfg(windows)]
     astrid_core::platform_fs::restrict_private_file(&key_path)
         .context("failed to secure the runtime capsule-signing key")?;
+    drop(lifecycle);
 
     sign_archive(archive_path, &keypair)
 }
@@ -203,7 +225,21 @@ pub fn verify_directory(source_dir: &Path) -> anyhow::Result<ArtifactVerificatio
 pub fn read_archive_text(archive_path: &Path, requested: &str) -> anyhow::Result<String> {
     let file = File::open(archive_path)
         .with_context(|| format!("failed to open {}", archive_path.display()))?;
-    let mut archive = tar::Archive::new(GzDecoder::new(file));
+    read_archive_text_reader(file, requested)
+}
+
+/// Read one regular UTF-8 file from capsule archive bytes.
+///
+/// # Errors
+///
+/// Fails when the archive is malformed, contains duplicate matching entries,
+/// or the requested entry is absent or not UTF-8.
+pub fn read_archive_text_bytes(archive: &[u8], requested: &str) -> anyhow::Result<String> {
+    read_archive_text_reader(Cursor::new(archive), requested)
+}
+
+fn read_archive_text_reader(reader: impl Read, requested: &str) -> anyhow::Result<String> {
+    let mut archive = tar::Archive::new(GzDecoder::new(reader));
     let mut found = None;
     for entry in archive
         .entries()
@@ -591,8 +627,20 @@ mod tests {
         let fresh = FreshWindowsHome::new();
         let home = AstridHome::from_path(&fresh.path);
 
-        sign_archive_with_runtime_key_in_home(&archive, &home)
+        let first = sign_archive_with_runtime_key_in_home(&archive, &home)
             .expect("runtime signing should provision its private home");
+
+        home.ensure()
+            .expect("runtime signing bootstrap must remain admitted");
+        let second_archive = dir.path().join("second.capsule");
+        unsigned_archive(
+            &second_archive,
+            b"[package]\nname='second'\nversion='1.0.0'\n",
+            b"wasm",
+        );
+        let second = sign_archive_with_runtime_key_in_home(&second_archive, &home)
+            .expect("repeated runtime signing should reuse the admitted private key");
+        assert_eq!(second.signer, first.signer);
 
         for path in [home.root(), home.keys_dir().as_path()] {
             astrid_core::platform_fs::ensure_private_directory(path)
@@ -600,6 +648,96 @@ mod tests {
         }
         astrid_core::platform_fs::validate_private_file(&home.runtime_key_path())
             .expect("runtime signing key must retain its exact private ACL");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_signing_provisions_fresh_private_unix_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("test.capsule");
+        unsigned_archive(
+            &archive,
+            b"[package]\nname='test'\nversion='1.0.0'\n",
+            b"wasm",
+        );
+        let home = AstridHome::from_path(dir.path().join("home"));
+
+        let first = sign_archive_with_runtime_key_in_home(&archive, &home)
+            .expect("runtime signing should provision its private home");
+
+        home.ensure()
+            .expect("runtime signing bootstrap must remain admitted");
+        let second_archive = dir.path().join("second.capsule");
+        unsigned_archive(
+            &second_archive,
+            b"[package]\nname='second'\nversion='1.0.0'\n",
+            b"wasm",
+        );
+        let second = sign_archive_with_runtime_key_in_home(&second_archive, &home)
+            .expect("repeated runtime signing should reuse the admitted private key");
+        assert_eq!(second.signer, first.signer);
+
+        for path in [home.root(), home.keys_dir().as_path()] {
+            astrid_core::platform_fs::validate_private_directory(path)
+                .expect("runtime signing directory must be owner-only");
+        }
+        astrid_core::platform_fs::validate_private_file(&home.runtime_key_path())
+            .expect("runtime signing key must be owner-only");
+    }
+
+    #[test]
+    fn runtime_signing_cannot_create_sidecars_while_lifecycle_is_owned() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("test.capsule");
+        unsigned_archive(
+            &archive,
+            b"[package]\nname='test'\nversion='1.0.0'\n",
+            b"wasm",
+        );
+        let home = AstridHome::from_path(dir.path().join("home"));
+        let _lifecycle = astrid_storage::principal_state::RuntimeLifecycleGuard::acquire(&home)
+            .expect("test must own the runtime lifecycle");
+
+        let error = sign_archive_with_runtime_key_in_home(&archive, &home)
+            .expect_err("first-time signing must not race an active runtime lifecycle");
+
+        assert!(
+            format!("{error:#}").contains("runtime is running or finalizing"),
+            "unexpected error: {error:#}"
+        );
+        assert!(!home.root().exists(), "signing must not create the home");
+        assert!(!home.keys_dir().exists(), "signing must not create keys/");
+        assert!(
+            !home.runtime_key_path().exists(),
+            "signing must not create runtime.key"
+        );
+    }
+
+    #[test]
+    fn runtime_signing_reuses_existing_key_while_lifecycle_is_owned() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_archive = dir.path().join("first.capsule");
+        unsigned_archive(
+            &first_archive,
+            b"[package]\nname='first'\nversion='1.0.0'\n",
+            b"wasm",
+        );
+        let home = AstridHome::from_path(dir.path().join("home"));
+        let first = sign_archive_with_runtime_key_in_home(&first_archive, &home)
+            .expect("first signing should provision the runtime key");
+        let _lifecycle = astrid_storage::principal_state::RuntimeLifecycleGuard::acquire(&home)
+            .expect("test must own the runtime lifecycle");
+        let second_archive = dir.path().join("second.capsule");
+        unsigned_archive(
+            &second_archive,
+            b"[package]\nname='second'\nversion='1.0.0'\n",
+            b"wasm",
+        );
+
+        let second = sign_archive_with_runtime_key_in_home(&second_archive, &home)
+            .expect("existing runtime identity remains readable while the daemon is active");
+
+        assert_eq!(second.signer, first.signer);
     }
 
     #[cfg(windows)]
@@ -628,6 +766,100 @@ mod tests {
         assert!(
             !home.runtime_key_path().exists(),
             "fail-closed provisioning must not generate a key"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn runtime_signing_rejects_stopped_volume_without_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("test.capsule");
+        unsigned_archive(
+            &archive,
+            b"[package]\nname='test'\nversion='1.0.0'\n",
+            b"wasm",
+        );
+        let fresh = FreshWindowsHome::new();
+        let home = AstridHome::from_path(&fresh.path);
+        astrid_core::platform_fs::ensure_private_directory(home.root()).unwrap();
+        let volume_bytes = b"stopped-volume";
+        std::fs::write(home.storage_volume_path(), volume_bytes).unwrap();
+        astrid_core::platform_fs::restrict_private_file(&home.storage_volume_path()).unwrap();
+        let volume_before = std::fs::read(home.storage_volume_path()).unwrap();
+        let entries_before = home
+            .root()
+            .read_dir()
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+
+        let error = sign_archive_with_runtime_key_in_home(&archive, &home)
+            .expect_err("runtime signing must not revive a stopped durable root");
+
+        assert!(
+            format!("{error:#}")
+                .contains("stopped Astrid durable root cannot provision runtime identity sidecars"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read(home.storage_volume_path()).unwrap(),
+            volume_before
+        );
+        assert!(!home.keys_dir().exists(), "signing must not create keys/");
+        assert!(
+            !home.runtime_key_path().exists(),
+            "signing must not create runtime.key"
+        );
+        let entries_after = home
+            .root()
+            .read_dir()
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries_after, entries_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_signing_rejects_stopped_unix_volume_without_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("test.capsule");
+        unsigned_archive(
+            &archive,
+            b"[package]\nname='test'\nversion='1.0.0'\n",
+            b"wasm",
+        );
+        let home = AstridHome::from_path(dir.path().join("home"));
+        astrid_core::platform_fs::ensure_private_directory(home.root()).unwrap();
+        let volume_bytes = b"stopped-volume";
+        std::fs::write(home.storage_volume_path(), volume_bytes).unwrap();
+        astrid_core::platform_fs::restrict_private_file(&home.storage_volume_path()).unwrap();
+        let volume_before = std::fs::read(home.storage_volume_path()).unwrap();
+
+        let error = sign_archive_with_runtime_key_in_home(&archive, &home)
+            .expect_err("runtime signing must not revive a stopped durable root");
+
+        assert!(
+            format!("{error:#}")
+                .contains("stopped Astrid durable root cannot provision runtime identity sidecars"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read(home.storage_volume_path()).unwrap(),
+            volume_before
+        );
+        assert!(!home.keys_dir().exists(), "signing must not create keys/");
+        assert!(
+            !home.runtime_key_path().exists(),
+            "signing must not create runtime.key"
+        );
+        assert_eq!(
+            home.root()
+                .read_dir()
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            [std::ffi::OsString::from("astrid.volume")]
         );
     }
 

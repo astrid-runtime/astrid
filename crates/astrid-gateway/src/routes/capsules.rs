@@ -239,6 +239,8 @@ pub async fn install_capsule(
             provenance: None,
             authority: CapsuleInstallAuthority::default(),
             env: Vec::new(),
+            expected_generation: None,
+            batch: None,
         })
         .await
         .map_err(daemon_kernel_error)?;

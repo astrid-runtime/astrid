@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use astrid_capsule_install::{
     ArtifactProvenance, AuthorityDecision, InstallInspection,
     inspect_archive_for_principal_with_layout, inspect_directory_for_principal_with_layout,
@@ -79,35 +79,53 @@ pub(super) fn authority_decision(
     }
 }
 
-pub(super) fn daemon_install_authority(
+pub(super) async fn daemon_install_authority(
     source: &str,
     principal: &astrid_core::PrincipalId,
     prompt: &ManualInstallOptions,
-) -> anyhow::Result<CapsuleInstallAuthority> {
-    let home = AstridHome::resolve()?;
-    let path = Path::new(source.strip_prefix("file://").unwrap_or(source));
-    let inspection = if path.is_file() {
-        inspect_archive_for_principal_with_layout(
-            path,
-            &home,
-            principal,
-            false,
-            crate::workspace_layout::current(),
-        )?
-    } else {
-        inspect_directory_for_principal_with_layout(
-            path,
-            &home,
-            principal,
-            false,
-            crate::workspace_layout::current(),
-        )?
-    };
-    Ok(match authority_decision(&inspection, prompt)? {
+) -> anyhow::Result<(
+    CapsuleInstallAuthority,
+    crate::commands::daemon::projection::DaemonLease,
+)> {
+    // The stopped home stores its identity inside the volume. Restore the
+    // daemon-owned projection and retain the start fence through inspection.
+    // Otherwise a concurrent stop could retire the key before inspection reads
+    // it, generating a replacement identity outside the stopped volume.
+    let (inspection, lease) = crate::commands::daemon::with_persistent_daemon_projection(
+        "capsule install authority",
+        || {
+            let home = AstridHome::resolve()?;
+            let path = Path::new(source.strip_prefix("file://").unwrap_or(source));
+            if path.is_file() {
+                inspect_archive_for_principal_with_layout(
+                    path,
+                    &home,
+                    principal,
+                    false,
+                    crate::workspace_layout::current(),
+                )
+            } else {
+                inspect_directory_for_principal_with_layout(
+                    path,
+                    &home,
+                    principal,
+                    false,
+                    crate::workspace_layout::current(),
+                )
+            }
+        },
+    )
+    .await
+    .context("capsule authority inspection could not use the runtime projection")?;
+    // A human can leave this prompt unanswered indefinitely. Let the lease
+    // reader drain broadcasts even when the runtime has only one worker.
+    let decision = tokio::task::block_in_place(|| authority_decision(&inspection, prompt))?;
+    let authority = match decision {
         AuthorityDecision::Automatic => CapsuleInstallAuthority::Automatic,
         AuthorityDecision::ExplicitApproval { .. } => CapsuleInstallAuthority::ExplicitApproval,
         AuthorityDecision::OperatorDistribution { .. } => {
             CapsuleInstallAuthority::OperatorDistribution
         },
-    })
+    };
+    Ok((authority, lease))
 }

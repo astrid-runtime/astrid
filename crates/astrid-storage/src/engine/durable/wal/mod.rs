@@ -84,6 +84,9 @@ pub(super) fn durable_error(error: WalError) -> DurableError {
 }
 
 #[cfg(test)]
+mod lz4_compat_tests;
+
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]

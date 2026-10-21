@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, fmt};
 
+use super::rename_guards::{RenameBatchOutcome, RenamePlan};
 use super::{
     ContentName, FilesystemEntry, FilesystemEntryKind, FilesystemError, FilesystemPath,
     PrincipalProjectionEngine, WorkspaceBranchDescriptor, WorkspaceBranchError,
@@ -143,6 +144,20 @@ where
             .write(&self.owner, self.branch, &path.file_name()?, bytes)
     }
 
+    /// Atomically publish streamed bytes into this branch, preserving quota checks.
+    pub fn write_streaming<R: std::io::Read>(
+        &self,
+        path: &FilesystemPath,
+        source: R,
+    ) -> Result<(), WorkspaceBranchError> {
+        self.require_parent(path)?;
+        if self.directory_exists(path)? {
+            return Err(FilesystemError::IsDirectory(path.clone()).into());
+        }
+        self.branches
+            .write_streaming(&self.owner, self.branch, &path.file_name()?, source)
+    }
+
     /// Create an explicit empty directory marker.
     pub fn create_dir(&self, path: &FilesystemPath) -> Result<(), WorkspaceBranchError> {
         if path.as_str().is_empty() {
@@ -221,12 +236,12 @@ where
         if path.as_str().is_empty() {
             return Err(FilesystemError::IsDirectory(path.clone()).into());
         }
-        let parent = path.parent();
-        if parent.as_str().is_empty() {
-            return Ok(());
-        }
-        if self.stat(&parent)?.kind() != FilesystemEntryKind::Directory {
-            return Err(FilesystemError::NotDirectory(parent).into());
+        let mut parent = path.parent();
+        while !parent.as_str().is_empty() {
+            if self.stat(&parent)?.kind() != FilesystemEntryKind::Directory {
+                return Err(FilesystemError::NotDirectory(parent).into());
+            }
+            parent = parent.parent();
         }
         Ok(())
     }
@@ -243,59 +258,84 @@ where
         if from == to {
             return Ok(());
         }
-        self.require_parent(to)?;
-        let source = self.stat(from)?;
-        let destination = match self.stat(to) {
-            Ok(_) if !replace => return Err(FilesystemError::AlreadyExists(to.clone()).into()),
-            Ok(destination) => Some(destination),
-            Err(WorkspaceBranchError::Filesystem(FilesystemError::NotFound(_))) => None,
-            Err(error) => return Err(error),
-        };
-        let replacements = match (source.kind(), destination.map(|entry| entry.kind())) {
-            (_, None) => Vec::new(),
-            (FilesystemEntryKind::File, Some(FilesystemEntryKind::File)) => {
-                vec![to.file_name()?]
-            },
-            (FilesystemEntryKind::Directory, Some(FilesystemEntryKind::Directory)) => {
-                if !self.read_dir(to)?.is_empty() {
-                    return Err(FilesystemError::DirectoryNotEmpty(to.clone()).into());
-                }
-                vec![to.directory_marker()?]
-            },
-            (FilesystemEntryKind::File, Some(FilesystemEntryKind::Directory)) => {
-                return Err(FilesystemError::IsDirectory(to.clone()).into());
-            },
-            (FilesystemEntryKind::Directory, Some(FilesystemEntryKind::File)) => {
-                return Err(FilesystemError::NotDirectory(to.clone()).into());
-            },
-        };
-        let moves = match source.kind() {
-            FilesystemEntryKind::File => vec![(from.file_name()?, to.file_name()?)],
-            FilesystemEntryKind::Directory => {
-                let from_prefix = from.directory_prefix();
-                let to_prefix = to.directory_prefix();
-                if to_prefix.starts_with(&from_prefix) {
-                    return Err(FilesystemError::InvalidPath(to.as_str().to_owned()).into());
-                }
-                self.branches
-                    .list_prefix(&self.owner, self.branch, &from_prefix)?
-                    .into_iter()
-                    .filter_map(|entry| {
-                        let source = entry.name().clone();
-                        let suffix = source.as_str().strip_prefix(&from_prefix)?;
-                        let destination = ContentName::new(format!("{to_prefix}{suffix}")).ok()?;
-                        Some((source, destination))
-                    })
-                    .collect::<Vec<_>>()
-            },
-        };
-        if !self
-            .branches
-            .rename_batch(&self.owner, self.branch, &moves, &replacements)?
-        {
-            return Err(FilesystemError::AlreadyExists(to.clone()).into());
+        loop {
+            self.require_parent(from)?;
+            self.require_parent(to)?;
+            let source = self.stat(from)?;
+            let destination = match self.stat(to) {
+                Ok(_) if !replace => return Err(FilesystemError::AlreadyExists(to.clone()).into()),
+                Ok(destination) => Some(destination),
+                Err(WorkspaceBranchError::Filesystem(FilesystemError::NotFound(_))) => None,
+                Err(error) => return Err(error),
+            };
+            let replacements = match (source.kind(), destination.map(|entry| entry.kind())) {
+                (_, None) => Vec::new(),
+                (FilesystemEntryKind::File, Some(FilesystemEntryKind::File)) => {
+                    vec![to.file_name()?]
+                },
+                (FilesystemEntryKind::Directory, Some(FilesystemEntryKind::Directory)) => {
+                    if !self.read_dir(to)?.is_empty() {
+                        return Err(FilesystemError::DirectoryNotEmpty(to.clone()).into());
+                    }
+                    vec![to.directory_marker()?]
+                },
+                (FilesystemEntryKind::File, Some(FilesystemEntryKind::Directory)) => {
+                    return Err(FilesystemError::IsDirectory(to.clone()).into());
+                },
+                (FilesystemEntryKind::Directory, Some(FilesystemEntryKind::File)) => {
+                    return Err(FilesystemError::NotDirectory(to.clone()).into());
+                },
+            };
+            let source_prefix =
+                (source.kind() == FilesystemEntryKind::Directory).then(|| from.directory_prefix());
+            let moves = match source.kind() {
+                FilesystemEntryKind::File => vec![(from.file_name()?, to.file_name()?)],
+                FilesystemEntryKind::Directory => {
+                    let from_prefix = from.directory_prefix();
+                    let to_prefix = to.directory_prefix();
+                    if to_prefix.starts_with(&from_prefix) {
+                        return Err(FilesystemError::InvalidPath(to.as_str().to_owned()).into());
+                    }
+                    self.branches
+                        .list_prefix(&self.owner, self.branch, &from_prefix)?
+                        .into_iter()
+                        .filter_map(|entry| {
+                            let source = entry.name().clone();
+                            let suffix = source.as_str().strip_prefix(&from_prefix)?;
+                            let destination =
+                                ContentName::new(format!("{to_prefix}{suffix}")).ok()?;
+                            Some((source, destination))
+                        })
+                        .collect::<Vec<_>>()
+                },
+            };
+            let destination_prefix = to.directory_prefix();
+            let destination_name = to.file_name()?;
+            let destination_parent = to.parent();
+            let source_name = from.file_name()?;
+            let source_directory_prefix = from.directory_prefix();
+            let plan = RenamePlan {
+                moves: &moves,
+                replacements: &replacements,
+                source_prefix: source_prefix.as_deref(),
+                source_path: from,
+                source_name: &source_name,
+                source_directory_prefix: &source_directory_prefix,
+                destination_prefix: &destination_prefix,
+                destination_name: &destination_name,
+                destination_parent: &destination_parent,
+            };
+            match self
+                .branches
+                .rename_batch_guarded(&self.owner, self.branch, &plan)?
+            {
+                RenameBatchOutcome::Committed => return Ok(()),
+                RenameBatchOutcome::DestinationConflict => {
+                    return Err(FilesystemError::AlreadyExists(to.clone()).into());
+                },
+                RenameBatchOutcome::Replan => {},
+            }
         }
-        Ok(())
     }
 
     fn entry_exists(&self, path: &FilesystemPath) -> Result<bool, WorkspaceBranchError> {

@@ -53,12 +53,15 @@ principal = sys.argv[2]
 timeout_secs = float(sys.argv[3])
 out_path = Path(sys.argv[4])
 args = sys.argv[5:]
+# Structured output must not absorb update notices or other stderr diagnostics.
+json_output = any(a == "--format" and b == "json" for a, b in zip(args, args[1:]))
+stderr_path = out_path.with_name(out_path.name + ".stderr")
 
 try:
     proc = subprocess.run(
         [binary, "--principal", principal, *args],
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE if json_output else subprocess.STDOUT,
         text=True,
         timeout=timeout_secs,
         check=False,
@@ -68,11 +71,84 @@ except subprocess.TimeoutExpired as exc:
     if isinstance(stdout, bytes):
         stdout = stdout.decode("utf-8", errors="replace")
     out_path.write_text(stdout, encoding="utf-8")
+    if json_output:
+        stderr = exc.stderr or b""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        stderr_path.write_text(stderr, encoding="utf-8")
     raise SystemExit(124) from exc
 
 out_path.write_text(proc.stdout, encoding="utf-8")
+if json_output:
+    stderr_path.write_text(proc.stderr, encoding="utf-8")
 raise SystemExit(proc.returncode)
 PY
+}
+
+bounded_principal_cli_with_tty() {
+  local principal=$1
+  local timeout_secs=$2
+  local out=$3
+  shift 3
+  "$PYTHON" - "$CORE_DIR/target/debug/astrid" "$principal" "$timeout_secs" "$out" "$@" <<'PY'
+import os
+import pty
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+binary = sys.argv[1]
+principal = sys.argv[2]
+timeout_secs = float(sys.argv[3])
+out_path = Path(sys.argv[4])
+input_path = out_path.with_name(out_path.name + ".input")
+input_path.unlink(missing_ok=True)
+args = sys.argv[5:]
+master_fd, slave_fd = pty.openpty()
+with out_path.open("wb") as output:
+    try:
+        proc = subprocess.Popen(
+            [binary, "--principal", principal, *args],
+            stdin=slave_fd,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    finally:
+        os.close(slave_fd)
+
+    deadline = time.monotonic() + timeout_secs
+    while proc.poll() is None and time.monotonic() < deadline:
+        if input_path.exists():
+            os.write(master_fd, input_path.read_bytes())
+            input_path.unlink()
+        time.sleep(0.05)
+    if proc.poll() is None:
+        os.killpg(proc.pid, 15)
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, 9)
+            proc.wait()
+        raise SystemExit(124)
+    return_code = proc.returncode
+
+os.close(master_fd)
+input_path.unlink(missing_ok=True)
+raise SystemExit(return_code)
+PY
+}
+
+wait_for_cli_approval_prompt() {
+  local path=$1
+  local deadline=$((SECONDS + 20))
+  until grep -Fq 'Approve this operation once? [y/N]' "$path" 2>/dev/null; do
+    if (( SECONDS >= deadline )); then
+      return 1
+    fi
+    sleep 0.1
+  done
 }
 
 wait_for_adversarial_command_route() {
@@ -187,34 +263,19 @@ run_mid_capsule_command_crash_smoke() {
 
 run_mid_approval_wait_crash_smoke() {
   local principal=$1
-  local bearer=$2
-  local sse="$ARTIFACTS/crash-approval-requests.sse"
   local out="$ARTIFACTS/crash-approval-command.txt"
   local rc=0
 
   note "checking crash recovery while an approval request is waiting"
-  curl -sN --max-time 20 \
-    -H "Authorization: Bearer $bearer" \
-    "$GATEWAY/api/agent/requests" \
-    > "$sse" 2>&1 &
-  local stream_pid=$!
-  wait_for_sse_ready "$sse" || {
-    terminate_pid "$stream_pid"
-    cat "$sse" >&2 2>/dev/null || true
-    fail "approval crash request stream did not become ready"
-  }
-  bounded_principal_cli "$principal" 12 "$out" \
+  bounded_principal_cli_with_tty "$principal" 12 "$out" \
     capsule run astrid-capsule-adversarial adversarial-approval &
   local run_pid=$!
-  wait_for_approval_request_id "$sse" > "$ARTIFACTS/crash-approval-request-id.txt" || {
+  wait_for_cli_approval_prompt "$out" || {
     terminate_pid "$run_pid"
-    terminate_pid "$stream_pid"
-    cat "$sse" >&2 2>/dev/null || true
-    fail "approval request was not forwarded before crash deadline"
+    fail "owning CLI did not receive approval before crash deadline"
   }
 
   crash_daemon_process
-  terminate_pid "$stream_pid"
   wait "$run_pid" || rc=$?
   if [[ "$rc" -eq 0 ]]; then
     cat "$out" >&2

@@ -16,6 +16,9 @@ name = "astrid-daemon"
 path = "src/main.rs"
 
 [dependencies]
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+astrid-workspace = { workspace = true }
 anyhow = { workspace = true }
 astrid-capsule = { workspace = true }
 astrid-capsule-install = { workspace = true }
@@ -23,6 +26,7 @@ astrid-config = { workspace = true }
 astrid-core = { workspace = true }
 astrid-gateway = { workspace = true }
 astrid-kernel = { workspace = true }
+astrid-storage = { workspace = true }
 astrid-telemetry = { workspace = true, features = ["config"] }
 astrid-uplink = { workspace = true }
 clap = { workspace = true }
@@ -45,6 +49,15 @@ uuid = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
 signal-hook = { workspace = true }
+
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { workspace = true }
+
+[dev-dependencies]
+astrid-crypto = { workspace = true }
+astrid-events = { workspace = true }
+astrid-types = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

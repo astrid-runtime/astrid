@@ -73,7 +73,9 @@ struct LegacyCapsule {
     version: String,
     source: String,
     hash: String,
-    #[serde(default)]
+    // Released CLI writers used snake_case here; preserve their exact value
+    // without accepting unrelated fields or conflicting duplicate spellings.
+    #[serde(default, alias = "resolved_ref")]
     resolved_ref: Option<String>,
 }
 
@@ -575,6 +577,99 @@ fn conflict(path: &Path, detail: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn resolved_ref_migration_preserves_provenance_and_retries_after_retirement() {
+        use astrid_storage::{IdentityStore, KvIdentityStore, ScopedKvStore};
+
+        let canonical = include_str!("../../../e2e/fixtures/distro-lock/resolved-ref.toml");
+        for text in [
+            canonical.to_owned(),
+            canonical.replace("resolved-ref", "resolved_ref"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let home = AstridHome::from_path(root.path().join("runtime"));
+            home.ensure().unwrap();
+            let alias = PrincipalId::new("alice").unwrap();
+            let directory = PrincipalDirectory::default();
+            let quota: std::sync::Arc<
+                dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>,
+            > = std::sync::Arc::new(|_: &astrid_storage::StateOwner| Ok(None));
+            let store = astrid_storage::open_runtime_principal_store_with_directory(
+                &home,
+                quota,
+                directory.clone(),
+            )
+            .await
+            .unwrap();
+            let identities = KvIdentityStore::with_principal_directory(
+                ScopedKvStore::new(store.kv(), "system:identity").unwrap(),
+                directory.clone(),
+            );
+            let principal = identities
+                .create_principal(alias.clone(), [0x47; 32])
+                .await
+                .unwrap();
+            let uid = identities
+                .get_principal_identity(principal.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .uid;
+            let source = distro_path(&home, &alias);
+            astrid_core::platform_fs::ensure_private_directory(source.parent().unwrap()).unwrap();
+            astrid_core::platform_fs::atomic_write_private_file(&source, text.as_bytes()).unwrap();
+
+            migrate_legacy_distro_locks(&home, &store, &directory)
+                .await
+                .unwrap();
+            assert!(!source.exists());
+            let scoped = store.principal_control_kv(uid, "distro").unwrap();
+            let bytes = scoped.get(KEY).await.unwrap().unwrap();
+            let provenance: DistroProvenance = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                provenance.capsules[0].resolved_ref.as_deref(),
+                Some("v1.0.0")
+            );
+            let receipt = fs::read(receipt_path(&home, uid)).unwrap();
+            migrate_legacy_distro_locks(&home, &store, &directory)
+                .await
+                .unwrap();
+            assert_eq!(scoped.get(KEY).await.unwrap().unwrap(), bytes);
+            assert_eq!(fs::read(receipt_path(&home, uid)).unwrap(), receipt);
+        }
+    }
+
+    #[test]
+    fn resolved_ref_migration_accepts_both_released_spellings() {
+        let canonical = include_str!("../../../e2e/fixtures/distro-lock/resolved-ref.toml");
+        for text in [
+            canonical.to_owned(),
+            canonical.replace("resolved-ref", "resolved_ref"),
+        ] {
+            let lock: LegacyLock = toml::from_str(&text).unwrap();
+            let provenance = convert_lock(lock).unwrap();
+            assert_eq!(
+                provenance.capsules[0].resolved_ref.as_deref(),
+                Some("v1.0.0")
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_ref_migration_rejects_duplicate_alias_and_unknown_fields() {
+        let canonical = include_str!("../../../e2e/fixtures/distro-lock/resolved-ref.toml");
+        for extra in ["resolved_ref = \"foreign\"", "unrecognized = \"value\""] {
+            assert!(toml::from_str::<LegacyLock>(&format!("{canonical}\n{extra}\n")).is_err());
+        }
+        let absent = canonical.replace("resolved-ref = \"v1.0.0\"", "");
+        let lock: LegacyLock = toml::from_str(&absent).unwrap();
+        assert!(
+            convert_lock(lock).unwrap().capsules[0]
+                .resolved_ref
+                .is_none()
+        );
+    }
 
     fn lock_text() -> &'static str {
         "schema-version = 1\n\n[distro]\nid = \"example\"\nversion = \"1.0.0\"\nresolved-at = \"2026-01-01T00:00:00Z\"\n"

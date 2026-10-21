@@ -112,9 +112,9 @@ pub(super) fn cleanup_resource_paths(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {},
         Err(error) => return Err((MountCleanupStage::Directory, error)),
     }
-    if let Some(root) = resource_path.parent() {
-        let _ = std::fs::remove_dir(root);
-    }
+    // The parent is shared across leases and daemon processes. A concurrent
+    // creator may already hold it open before creating its UUID directory;
+    // unlinking the empty parent would strand that creator's directory handle.
     Ok(())
 }
 

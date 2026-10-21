@@ -523,6 +523,9 @@ async fn publish_as_verified_principal_overrides_claimed_name() {
     state.ipc_subscribe_patterns = vec!["client.v1.*".to_string()];
     // The framed read recorded the connection's verified principal.
     state.ingress_principal = Some(astrid_core::PrincipalId::new("claude").unwrap());
+    let request_owner = astrid_events::ipc::RequestOwnerId::generate();
+    state.ingress_request_owner = Some(request_owner);
+    let mut bus_receiver = state.event_bus.subscribe_topic("client.v1.connect");
 
     let sub = IpcHost::subscribe(&mut state, "client.v1.connect".to_string())
         .expect("subscribe allowed by ACL");
@@ -534,12 +537,22 @@ async fn publish_as_verified_principal_overrides_claimed_name() {
         "{}".to_string(),
         "default".to_string(),
     )
+    .await
     .expect("publish_as should succeed");
 
     assert_eq!(
         drained_principals(&mut state, &sub),
         vec!["claude".to_string()],
         "the verified principal must override the claimed name (no escalation)"
+    );
+    let event = bus_receiver.try_recv().expect("one published message");
+    let AstridEvent::Ipc { message, .. } = &*event else {
+        panic!("expected an Ipc event");
+    };
+    assert_eq!(
+        message.request_owner,
+        Some(request_owner),
+        "publish-as must carry the authenticated connection owner"
     );
 }
 
@@ -569,6 +582,7 @@ async fn publish_as_unbound_connection_is_stamped_anonymous() {
         "{}".to_string(),
         "default".to_string(),
     )
+    .await
     .expect("publish_as should succeed");
 
     assert_eq!(
@@ -620,6 +634,7 @@ async fn publish_as_stamps_host_derived_device_key_id() {
         "{}".to_string(),
         "default".to_string(),
     )
+    .await
     .expect("publish_as should succeed");
 
     let (principal, device_key_id) = first_device_key_id(&mut receiver);
@@ -651,6 +666,7 @@ async fn publish_as_unbound_stamps_no_device_key_id() {
         "{}".to_string(),
         "default".to_string(),
     )
+    .await
     .expect("publish_as should succeed");
 
     let (_principal, device_key_id) = first_device_key_id(&mut receiver);
@@ -672,6 +688,7 @@ async fn self_triggered_publish_stamps_no_device_key_id() {
     let mut receiver = state.event_bus.subscribe_topic("capsule.v1.ping");
 
     IpcHost::publish(&mut state, "capsule.v1.ping".to_string(), "{}".to_string())
+        .await
         .expect("publish should succeed");
 
     let (_principal, device_key_id) = first_device_key_id(&mut receiver);
@@ -695,10 +712,34 @@ async fn publish_inherits_device_key_id_from_caller_context() {
 
     let mut receiver = state.event_bus.subscribe_topic("capsule.v1.ping");
     IpcHost::publish(&mut state, "capsule.v1.ping".to_string(), "{}".to_string())
+        .await
         .expect("publish should succeed");
 
     let (_principal, device_key_id) = first_device_key_id(&mut receiver);
     assert_eq!(device_key_id.as_deref(), Some("dev-abc123"));
+}
+
+#[tokio::test]
+async fn publish_inherits_authenticated_request_owner_from_caller_context() {
+    let rt = tokio::runtime::Handle::current();
+    let mut state = minimal_host_state(rt);
+    state.ipc_publish_patterns = vec!["capsule.v1.*".to_string()];
+    let owner = astrid_events::ipc::RequestOwnerId::generate();
+    state.caller_context = Some(
+        caller_with_origin(astrid_events::ipc::MessageOrigin::LocalSocket)
+            .with_request_owner(owner),
+    );
+
+    let mut receiver = state.event_bus.subscribe_topic("capsule.v1.ping");
+    IpcHost::publish(&mut state, "capsule.v1.ping".to_string(), "{}".to_string())
+        .await
+        .expect("publish should succeed");
+
+    let event = receiver.try_recv().expect("one published message");
+    let AstridEvent::Ipc { message, .. } = &*event else {
+        panic!("expected an Ipc event");
+    };
+    assert_eq!(message.request_owner, Some(owner));
 }
 
 /// Pull the `origin` off the first published message.
@@ -740,6 +781,7 @@ async fn publish_preserves_remote_gateway_origin_through_fanout() {
 
     let mut receiver = state.event_bus.subscribe_topic("capsule.v1.ping");
     IpcHost::publish(&mut state, "capsule.v1.ping".to_string(), "{}".to_string())
+        .await
         .expect("publish should succeed");
 
     assert_eq!(
@@ -784,6 +826,7 @@ async fn remote_gateway_origin_survives_fanout_and_consent_declines() {
     // publish path. Subscribe first to capture the republished message verbatim.
     let mut downstream = react.event_bus.subscribe_topic("capsule.v1.infer");
     IpcHost::publish(&mut react, "capsule.v1.infer".to_string(), "{}".to_string())
+        .await
         .expect("fan-out publish should succeed");
 
     // The republished bus message — exactly what the kernel routes to capsule B.
@@ -833,6 +876,7 @@ async fn publish_without_caller_context_is_system_origin() {
 
     let mut receiver = state.event_bus.subscribe_topic("capsule.v1.ping");
     IpcHost::publish(&mut state, "capsule.v1.ping".to_string(), "{}".to_string())
+        .await
         .expect("publish should succeed");
 
     assert_eq!(
@@ -861,6 +905,7 @@ async fn publish_as_bound_connection_stamps_local_socket_origin() {
         "{}".to_string(),
         "default".to_string(),
     )
+    .await
     .expect("publish_as should succeed");
 
     assert_eq!(
@@ -888,6 +933,7 @@ async fn publish_as_unbound_connection_stamps_system_origin() {
         "{}".to_string(),
         "default".to_string(),
     )
+    .await
     .expect("publish_as should succeed");
 
     assert_eq!(
@@ -914,7 +960,7 @@ async fn retired_principal_cannot_publish_after_view_release() {
     );
 
     assert!(matches!(
-        IpcHost::publish(&mut state, "capsule.v1.effect".into(), "{}".into()),
+        IpcHost::publish(&mut state, "capsule.v1.effect".into(), "{}".into()).await,
         Err(ErrorCode::CapabilityDenied)
     ));
 }
@@ -927,7 +973,7 @@ async fn unresolved_invocation_profile_cannot_publish() {
     state.invocation_profile_authorized = false;
 
     assert!(matches!(
-        IpcHost::publish(&mut state, "capsule.v1.effect".into(), "{}".into()),
+        IpcHost::publish(&mut state, "capsule.v1.effect".into(), "{}".into()).await,
         Err(ErrorCode::CapabilityDenied)
     ));
 }

@@ -20,6 +20,12 @@ pub(crate) struct GlobalMetadata {
     pub(crate) cap_bytes: u64,
     pub(crate) degraded: bool,
     pub(crate) last_error: Option<String>,
+    /// Why appends are admitted over the cap: it was reached and every
+    /// prune candidate would remove history that is not anchored. Absent
+    /// when not held, so metadata without a hold re-encodes to the bytes it
+    /// was stored with, which append-intent recovery compares exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retention_hold: Option<String>,
 }
 
 impl Default for GlobalMetadata {
@@ -36,6 +42,7 @@ impl Default for GlobalMetadata {
             cap_bytes: DEFAULT_GLOBAL_MAX_BYTES,
             degraded: false,
             last_error: None,
+            retention_hold: None,
         }
     }
 }

@@ -1,4 +1,7 @@
 use super::*;
+use std::io::Read;
+
+mod range;
 
 pub(super) trait CallbackFilesystem {
     fn stat(&self, path: &FilesystemPath) -> Result<FilesystemEntry, FilesystemError>;
@@ -10,6 +13,19 @@ pub(super) trait CallbackFilesystem {
         length: u64,
     ) -> Result<Vec<u8>, FilesystemError>;
     fn write(&self, path: &FilesystemPath, bytes: &[u8]) -> Result<(), FilesystemError>;
+    fn try_append(
+        &self,
+        _path: &FilesystemPath,
+        _expected_length: u64,
+        _bytes: &[u8],
+    ) -> Result<bool, FilesystemError> {
+        Ok(false)
+    }
+    fn write_streaming(
+        &self,
+        path: &FilesystemPath,
+        source: impl Read,
+    ) -> Result<(), FilesystemError>;
     fn create_dir(&self, path: &FilesystemPath) -> Result<(), FilesystemError>;
     fn remove(&self, path: &FilesystemPath) -> Result<(), FilesystemError>;
     fn rename(
@@ -45,6 +61,23 @@ where
 
     fn write(&self, path: &FilesystemPath, bytes: &[u8]) -> Result<(), FilesystemError> {
         AstridFilesystem::write(self, path, bytes)
+    }
+
+    fn try_append(
+        &self,
+        path: &FilesystemPath,
+        expected_length: u64,
+        bytes: &[u8],
+    ) -> Result<bool, FilesystemError> {
+        AstridFilesystem::try_append(self, path, expected_length, bytes)
+    }
+
+    fn write_streaming(
+        &self,
+        path: &FilesystemPath,
+        source: impl Read,
+    ) -> Result<(), FilesystemError> {
+        AstridFilesystem::write_streaming(self, path, source)
     }
 
     fn create_dir(&self, path: &FilesystemPath) -> Result<(), FilesystemError> {
@@ -97,6 +130,15 @@ where
 
     fn write(&self, path: &FilesystemPath, bytes: &[u8]) -> Result<(), FilesystemError> {
         self.write(path, bytes).map_err(map_workspace_error)
+    }
+
+    fn write_streaming(
+        &self,
+        path: &FilesystemPath,
+        source: impl Read,
+    ) -> Result<(), FilesystemError> {
+        self.write_streaming(path, source)
+            .map_err(map_workspace_error)
     }
 
     fn create_dir(&self, path: &FilesystemPath) -> Result<(), FilesystemError> {
@@ -152,6 +194,23 @@ where
         OwnerSubtreeFilesystem::write(self, path, bytes)
     }
 
+    fn try_append(
+        &self,
+        path: &FilesystemPath,
+        expected_length: u64,
+        bytes: &[u8],
+    ) -> Result<bool, FilesystemError> {
+        OwnerSubtreeFilesystem::try_append(self, path, expected_length, bytes)
+    }
+
+    fn write_streaming(
+        &self,
+        path: &FilesystemPath,
+        source: impl Read,
+    ) -> Result<(), FilesystemError> {
+        OwnerSubtreeFilesystem::write_streaming(self, path, source)
+    }
+
     fn create_dir(&self, path: &FilesystemPath) -> Result<(), FilesystemError> {
         OwnerSubtreeFilesystem::create_dir(self, path)
     }
@@ -198,6 +257,15 @@ impl<F> PrefixedFilesystem<F> {
 }
 
 impl<F: CallbackFilesystem> CallbackFilesystem for PrefixedFilesystem<F> {
+    fn try_append(
+        &self,
+        path: &FilesystemPath,
+        expected_length: u64,
+        bytes: &[u8],
+    ) -> Result<bool, FilesystemError> {
+        self.inner
+            .try_append(&self.path(path)?, expected_length, bytes)
+    }
     fn stat(&self, path: &FilesystemPath) -> Result<FilesystemEntry, FilesystemError> {
         self.inner.stat(&self.path(path)?)
     }
@@ -217,6 +285,14 @@ impl<F: CallbackFilesystem> CallbackFilesystem for PrefixedFilesystem<F> {
 
     fn write(&self, path: &FilesystemPath, bytes: &[u8]) -> Result<(), FilesystemError> {
         self.inner.write(&self.path(path)?, bytes)
+    }
+
+    fn write_streaming(
+        &self,
+        path: &FilesystemPath,
+        source: impl Read,
+    ) -> Result<(), FilesystemError> {
+        self.inner.write_streaming(&self.path(path)?, source)
     }
 
     fn create_dir(&self, path: &FilesystemPath) -> Result<(), FilesystemError> {
@@ -247,6 +323,9 @@ pub(super) fn execute_blocking(
     operation: StorageFilesystemOperationV1,
 ) -> Result<StorageFilesystemSuccessV1, FilesystemError> {
     match operation {
+        StorageFilesystemOperationV1::VolumeInfo => Err(FilesystemError::Staging(
+            "volume info requires the hosted backing store".to_owned(),
+        )),
         StorageFilesystemOperationV1::Stat { path } => {
             let path = FilesystemPath::new(path)?;
             Ok(StorageFilesystemSuccessV1::Entry(entry(
@@ -279,22 +358,15 @@ pub(super) fn execute_blocking(
             write_range(filesystem, path, offset, &data)
         },
         StorageFilesystemOperationV1::SetLength { path, length } => {
-            if length > STORAGE_FILESYSTEM_MAX_IO_BYTES {
+            if length > i64::MAX as u64 {
                 return Err(FilesystemError::InvalidPath(path));
             }
             let path = FilesystemPath::new(path)?;
             let current_length = require_file(filesystem, &path)?;
-            if current_length > STORAGE_FILESYSTEM_MAX_IO_BYTES {
-                return Err(FilesystemError::InvalidPath(path.as_str().to_owned()));
-            }
             if current_length == length {
                 return Ok(StorageFilesystemSuccessV1::Written(length));
             }
-            let mut bytes = filesystem.read(&path, 0, current_length)?;
-            let target = usize::try_from(length)
-                .map_err(|_| FilesystemError::InvalidPath(path.as_str().to_owned()))?;
-            bytes.resize(target, 0);
-            filesystem.write(&path, &bytes)?;
+            range::replace(filesystem, &path, current_length, length, length, &[])?;
             Ok(StorageFilesystemSuccessV1::Written(length))
         },
         StorageFilesystemOperationV1::Create { path, kind } => {
@@ -347,20 +419,20 @@ fn write_range(
     let end_offset = offset
         .checked_add(data_length)
         .ok_or_else(|| FilesystemError::InvalidPath(path.as_str().to_owned()))?;
-    if current_length.max(end_offset) > STORAGE_FILESYSTEM_MAX_IO_BYTES {
+    if current_length.max(end_offset) > i64::MAX as u64 {
         return Err(FilesystemError::InvalidPath(path.as_str().to_owned()));
     }
-    let mut bytes = filesystem.read(&path, 0, current_length)?;
-    let start = usize::try_from(offset)
-        .map_err(|_| FilesystemError::InvalidPath(path.as_str().to_owned()))?;
-    let end = start
-        .checked_add(data.len())
-        .ok_or_else(|| FilesystemError::InvalidPath(path.as_str().to_owned()))?;
-    if end > bytes.len() {
-        bytes.resize(end, 0);
+    if offset == current_length && filesystem.try_append(&path, current_length, data)? {
+        return Ok(StorageFilesystemSuccessV1::Written(end_offset));
     }
-    bytes[start..end].copy_from_slice(data);
-    filesystem.write(&path, &bytes)?;
+    range::replace(
+        filesystem,
+        &path,
+        current_length,
+        current_length.max(end_offset),
+        offset,
+        data,
+    )?;
     Ok(StorageFilesystemSuccessV1::Written(
         current_length.max(end_offset),
     ))

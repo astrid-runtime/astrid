@@ -42,6 +42,12 @@ on `ubuntu-24.04-arm`, asserts both host and Docker daemon architecture, runs
 the authenticated native `astrid-build`, and never installs an emulator or
 binary-format translation handler.
 
+The current platform-specific base includes Ubuntu's OpenSSL package
+`libssl3t64` version `3.0.13-0ubuntu3.16`, which fixes
+[CVE-2026-84782](https://ubuntu.com/security/CVE-2026-84782). The image remains
+package-free at build time; the exact exported image must still pass the
+required vulnerability scan before publication.
+
 ## Run
 
 Astrid Runtime intentionally has no default distro. Mount an

@@ -56,4 +56,24 @@ impl KvAuditStorage {
         }
         Ok(result)
     }
+
+    /// The entry whose session-index key is `key`, or `None` when no such
+    /// key is stored: it was never written, or a prune removed it.
+    pub(crate) async fn indexed_entry(&self, key: &str) -> AuditResult<Option<AuditEntry>> {
+        let Some(id) = key
+            .rsplit_once(':')
+            .and_then(|(_, id)| uuid::Uuid::parse_str(id).ok())
+        else {
+            return Ok(None);
+        };
+        if !self
+            .store
+            .exists(NS_SESSION_ENTRIES, key)
+            .await
+            .map_err(|error| AuditError::StorageError(error.to_string()))?
+        {
+            return Ok(None);
+        }
+        self.get(&AuditEntryId(id)).await
+    }
 }

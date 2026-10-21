@@ -8,6 +8,7 @@ use astrid_core::session_token::{
     HandshakeRequest, HandshakeResponse, PRINCIPAL_AUTH_NONCE_LEN, PROTOCOL_VERSION, SessionToken,
     principal_auth_challenge_message,
 };
+use astrid_types::ipc::RequestOwnerId;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -21,6 +22,8 @@ pub struct AuthenticatedIdentity {
     pub principal: PrincipalId,
     /// Fingerprint of the device key that signed the challenge.
     pub device_key_id: Option<String>,
+    /// Opaque owner unique to this accepted local connection.
+    pub request_owner: RequestOwnerId,
 }
 
 impl AuthenticatedIdentity {
@@ -49,10 +52,12 @@ pub async fn authenticate(
         Some((principal, device_key_id)) => AuthenticatedIdentity {
             principal,
             device_key_id: Some(device_key_id),
+            request_owner: RequestOwnerId::generate(),
         },
         None => AuthenticatedIdentity {
             principal: PrincipalId::anonymous(),
             device_key_id: None,
+            request_owner: RequestOwnerId::generate(),
         },
     })
 }

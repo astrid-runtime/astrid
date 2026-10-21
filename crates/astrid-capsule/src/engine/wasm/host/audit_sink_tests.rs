@@ -19,12 +19,14 @@ use crate::engine::wasm::test_fixtures::minimal_host_state;
 enum CapturedEvent {
     FileRead(String),
     FileProbe(String),
-    FileWrite(String),
+    FileWrite(String, Option<astrid_crypto::ContentHash>),
     FileDelete(String),
     NetConnect(String, u16),
     NetBind(String),
     NetAccept(String, String),
     ProcessSpawn(String),
+    /// Events with their own dedicated tests.
+    Other,
 }
 
 impl CapturedEvent {
@@ -32,7 +34,9 @@ impl CapturedEvent {
         match event {
             HostAuditEvent::FileRead { path } => Self::FileRead(path.to_owned()),
             HostAuditEvent::FileProbe { path } => Self::FileProbe(path.to_owned()),
-            HostAuditEvent::FileWrite { path } => Self::FileWrite(path.to_owned()),
+            HostAuditEvent::FileWrite { path, content_hash } => {
+                Self::FileWrite(path.to_owned(), content_hash)
+            },
             HostAuditEvent::FileDelete { path } => Self::FileDelete(path.to_owned()),
             HostAuditEvent::NetConnect { host, port } => Self::NetConnect(host.to_owned(), port),
             HostAuditEvent::NetBind { addr } => Self::NetBind(addr.to_owned()),
@@ -41,6 +45,11 @@ impl CapturedEvent {
                 local_addr,
                 peer_addr,
             } => Self::NetAccept(local_addr.to_owned(), peer_addr.to_owned()),
+            HostAuditEvent::HttpRequest(_)
+            | HostAuditEvent::HttpResponse(_)
+            | HostAuditEvent::ToolCall { .. }
+            | HostAuditEvent::ApprovalRequested { .. }
+            | HostAuditEvent::ApprovalDecided(_) => Self::Other,
         }
     }
 }
@@ -123,7 +132,7 @@ async fn audit_fs_reports_read_write_delete() {
         records[1],
         (
             alice.clone(),
-            CapturedEvent::FileWrite("/w/w".into()),
+            CapturedEvent::FileWrite("/w/w".into(), None),
             CapturedOutcome::Allowed
         )
     );
@@ -223,6 +232,39 @@ async fn audit_net_reports_bind_denied() {
         matches!(records[0].2, CapturedOutcome::Denied(_)),
         "denied bind must report Denied, got {:?}",
         records[0].2
+    );
+}
+
+#[tokio::test]
+async fn oversized_spawn_stdin_reports_one_failed_audit() {
+    use crate::engine::wasm::bindings::astrid::process1_1_0::host::{
+        ErrorCode, Host, SpawnRequest,
+    };
+    let (mut state, sink) = state_with_sink(tokio::runtime::Handle::current());
+    let result = state.spawn(SpawnRequest {
+        cmd: "must-not-execute".into(),
+        args: vec![],
+        stdin: Some(vec![0; 4 * 1024 * 1024 + 1]),
+        env: vec![],
+        cwd: None,
+        limits: None,
+        file_injections: vec![],
+        label: None,
+        keep_stdin_open: None,
+        overflow: None,
+        log_ring_bytes: None,
+        exit_retention_ms: None,
+        idle_timeout_ms: None,
+        max_lifetime_ms: None,
+    });
+    assert!(matches!(result, Err(ErrorCode::TooLarge)));
+    assert_eq!(
+        sink.snapshot(),
+        vec![(
+            PrincipalId::new("alice").unwrap(),
+            CapturedEvent::ProcessSpawn("must-not-execute".into()),
+            CapturedOutcome::Failed("ErrorCode::TooLarge".into()),
+        )]
     );
 }
 
@@ -356,4 +398,170 @@ async fn connect_tcp_denial_lands_on_the_chain() {
         "gate-denied connect must report Denied, got {:?}",
         records[0].2
     );
+}
+
+/// Sink double for fail-closed admission: records `admit` calls and either
+/// admits or refuses them.
+struct AdmittingSink {
+    inner: RecordingSink,
+    admits: Mutex<Vec<CapturedEvent>>,
+    refuse: bool,
+}
+
+impl HostAuditSink for AdmittingSink {
+    fn record(
+        &self,
+        principal: &PrincipalId,
+        event: HostAuditEvent<'_>,
+        outcome: HostAuditOutcome<'_>,
+    ) {
+        self.inner.record(principal, event, outcome);
+    }
+
+    fn admit(
+        &self,
+        _principal: &PrincipalId,
+        event: HostAuditEvent<'_>,
+    ) -> Result<(), crate::audit_sink::HostAuditRefusal> {
+        self.admits
+            .lock()
+            .expect("admits mutex")
+            .push(CapturedEvent::from(event));
+        if self.refuse {
+            Err(crate::audit_sink::HostAuditRefusal::new("log unavailable"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn state_with_admitting_sink(refuse: bool) -> (HostState, Arc<AdmittingSink>) {
+    let sink = Arc::new(AdmittingSink {
+        inner: RecordingSink::default(),
+        admits: Mutex::new(Vec::new()),
+        refuse,
+    });
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.principal = PrincipalId::new("alice").expect("valid principal");
+    state.audit_sink = Some(sink.clone() as Arc<dyn HostAuditSink>);
+    (state, sink)
+}
+
+/// A gated connect asks for admission before it touches the network, and
+/// reports its outcome afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_tcp_is_admitted_before_the_effect() {
+    use crate::engine::wasm::bindings::astrid::net::host::Host as _;
+
+    let (mut state, sink) = state_with_admitting_sink(false);
+    // Loopback is refused by the egress airlock after admission, so no real
+    // connection is made.
+    let result = state.connect_tcp("127.0.0.1".to_string(), 9);
+    assert!(result.is_err(), "loopback connect is airlocked: {result:?}");
+    assert_eq!(
+        *sink.admits.lock().expect("admits"),
+        [CapturedEvent::NetConnect("127.0.0.1".into(), 9)]
+    );
+    let records = sink.inner.snapshot();
+    assert_eq!(records.len(), 1, "the outcome is still recorded");
+    assert!(matches!(records[0].2, CapturedOutcome::Failed(_)));
+}
+
+/// A refused admission fails the call before any effect, without leaking the
+/// kernel-side reason to the guest; the host fn records nothing itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_admission_fails_the_call_before_the_effect() {
+    use crate::engine::wasm::bindings::astrid::net::host::{ErrorCode, Host as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("addr").port();
+    let (mut state, sink) = state_with_admitting_sink(true);
+
+    let result = state.connect_tcp("127.0.0.1".to_string(), port);
+    assert!(
+        matches!(&result, Err(ErrorCode::Unknown(detail)) if detail == "audit unavailable"),
+        "{result:?}"
+    );
+    let bound = state.bind_tcp("127.0.0.1".to_string(), 0);
+    assert!(
+        matches!(&bound, Err(ErrorCode::Unknown(detail)) if detail == "audit unavailable"),
+        "{bound:?}"
+    );
+    assert_eq!(
+        *sink.admits.lock().expect("admits"),
+        [
+            CapturedEvent::NetConnect("127.0.0.1".into(), port),
+            CapturedEvent::NetBind("tcp:127.0.0.1:0".into()),
+        ]
+    );
+    assert!(
+        sink.inner.snapshot().is_empty(),
+        "the sink records a refusal itself"
+    );
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "no connection was attempted"
+    );
+}
+
+/// `write-file` reports the BLAKE3 of the bytes it wrote, so the signed
+/// `FileWrite` entry commits to the content and not only the path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_file_reports_the_content_hash() {
+    use crate::engine::wasm::bindings::astrid::fs::host::Host as _;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    let (mut state, sink) = state_with_sink(tokio::runtime::Handle::current());
+    let vfs = astrid_vfs::HostVfs::new();
+    let handle = astrid_capabilities::DirHandle::new();
+    vfs.register_dir(handle.clone(), root.clone())
+        .await
+        .expect("register workspace");
+    let vfs: Arc<dyn astrid_vfs::Vfs> = Arc::new(vfs);
+    state.workspace = Some(crate::engine::wasm::host_state::PrincipalMount {
+        location: crate::engine::wasm::host_state::PrincipalMountLocation::Native(root.clone()),
+        vfs: Arc::clone(&vfs),
+        handle: handle.clone(),
+    });
+    state.vfs = vfs;
+    state.vfs_root_handle = handle;
+    state.workspace_root.clone_from(&root);
+    state.hosted_workspace_root.clone_from(&root);
+    state.invocation_profile_authorized = true;
+
+    let result = tokio::task::spawn_blocking(move || {
+        let result = state.write_file("note.txt".into(), b"hello".to_vec());
+        (state, result)
+    })
+    .await
+    .expect("join");
+    result.1.expect("write succeeds");
+
+    let records = sink.snapshot();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let CapturedEvent::FileWrite(path, content_hash) = &records[0].1 else {
+        panic!("unexpected event {:?}", records[0].1);
+    };
+    assert!(path.ends_with("note.txt"), "{path}");
+    assert_eq!(
+        *content_hash,
+        Some(astrid_crypto::ContentHash::hash(b"hello"))
+    );
+}
+
+/// A sink without attribution support is handed back unchanged, so engines
+/// can bind every sink the same way.
+#[test]
+fn attribute_sink_falls_back_to_the_unattributed_sink() {
+    let sink: Arc<dyn HostAuditSink> = Arc::new(RecordingSink::default());
+    let bound = crate::audit_sink::attribute_sink(
+        &sink,
+        crate::audit_sink::HostAuditActor {
+            capsule_id: "fetcher".into(),
+            wasm_hash: None,
+        },
+    );
+    assert!(Arc::ptr_eq(&sink, &bound));
 }
