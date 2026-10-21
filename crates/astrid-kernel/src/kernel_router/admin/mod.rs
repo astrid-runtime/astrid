@@ -34,7 +34,8 @@ mod distro_handlers;
 mod distro_self_grant_tests;
 #[cfg(test)]
 mod enforcement_tests;
-#[cfg(test)]
+// The fresh native boot fixture calls the Unix-only Kernel::new constructor.
+#[cfg(all(test, unix))]
 mod first_owner_tests;
 mod group;
 pub(crate) mod handlers;
