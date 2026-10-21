@@ -33,10 +33,19 @@ class WindowsCargoDiagnosticTests(unittest.TestCase):
             )
             environment = os.environ.copy()
             environment.update(FIXTURE_BUILD_EXIT=str(build_exit))
-            return subprocess.run(
-                [POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(script)],
-                cwd=root, env=environment, capture_output=True, text=True, timeout=20, check=False,
-            )
+            try:
+                # This bounds a cold PowerShell process, not the tested Cargo gate.
+                # Hosted execution of this inert fixture exceeded the former 20 seconds.
+                return subprocess.run(
+                    [POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(script)],
+                    cwd=root, env=environment, capture_output=True, text=True,
+                    timeout=60, check=False,
+                )
+            except subprocess.TimeoutExpired as error:
+                self.fail(
+                    "inert PowerShell gate timed out; "
+                    f"stdout={error.stdout!r}; stderr={error.stderr!r}"
+                )
 
     def test_compile_error_is_rendered_and_original_exit_precedes_artifact_selection(self):
         result = self.run_gate()
