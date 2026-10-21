@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use super::workspace::{is_workspace_branch_label, workspace_branch_quota};
 use super::{
     BTreeMap, BuiltContent, CONTENT_COMPONENT_LABEL, CatalogRoot, CatalogSummary, CatalogValue,
@@ -437,4 +439,23 @@ where
         }
         Ok(id)
     }
+}
+
+pub(super) fn validated_rename_sets<'a>(
+    moves: &'a [(ContentName, ContentName)],
+    replacements: &'a [ContentName],
+) -> Option<(BTreeSet<&'a ContentName>, BTreeSet<&'a ContentName>)> {
+    let sources = moves
+        .iter()
+        .map(|(source, _)| source)
+        .collect::<BTreeSet<_>>();
+    let destinations = moves
+        .iter()
+        .map(|(_, destination)| destination)
+        .collect::<BTreeSet<_>>();
+    let replacement_set = replacements.iter().collect::<BTreeSet<_>>();
+    (sources.len() == moves.len()
+        && destinations.len() == moves.len()
+        && replacement_set.len() == replacements.len())
+    .then_some((sources, replacement_set))
 }

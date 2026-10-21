@@ -43,24 +43,7 @@ pub(super) const VERIFIED_CONTENT_CACHE_KEY: ProjectionCacheKey = ProjectionCach
 pub(super) const PARTIAL_VERIFICATION_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(2);
 const DECODED_HEADER_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(3);
 
-fn validated_rename_sets<'a>(
-    moves: &'a [(ContentName, ContentName)],
-    replacements: &'a [ContentName],
-) -> Option<(BTreeSet<&'a ContentName>, BTreeSet<&'a ContentName>)> {
-    let sources = moves
-        .iter()
-        .map(|(source, _)| source)
-        .collect::<BTreeSet<_>>();
-    let destinations = moves
-        .iter()
-        .map(|(_, destination)| destination)
-        .collect::<BTreeSet<_>>();
-    let replacement_set = replacements.iter().collect::<BTreeSet<_>>();
-    (sources.len() == moves.len()
-        && destinations.len() == moves.len()
-        && replacement_set.len() == replacements.len())
-    .then_some((sources, replacement_set))
-}
+use internals::validated_rename_sets;
 
 /// Named content projection over one shared principal-state engine.
 pub struct PrincipalContentStore<P: Ord, E> {
