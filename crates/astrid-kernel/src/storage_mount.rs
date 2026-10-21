@@ -50,6 +50,7 @@ use filesystem::{PrefixedFilesystem, execute_blocking};
 #[cfg(test)]
 mod admission;
 mod cleanup;
+mod ledger_diagnostics;
 mod lifecycle;
 mod mutation;
 #[cfg(test)]

@@ -9,6 +9,7 @@ use astrid_core::{
 };
 
 use super::*;
+use crate::storage_mount::drain_state::DrainFailureKind;
 use crate::storage_mount::process_broker::PROCESS_MOUNT_TEST_ID;
 
 type WorkerJobs = tokio::task::JoinSet<StorageFilesystemOutcomeV1>;
@@ -36,7 +37,16 @@ async fn concurrent_worker_panics_block_cleanup_until_settled_retries() {
     fail_workers(failed_workers).await;
     await_join_failure_publication(&kernel, &stale_projection, failed_workers.len()).await;
     stale_mount.close_async().await;
+    let held_state = Arc::clone(
+        kernel
+            .storage_mounts
+            .get(stale_projection.component_mount_ids.last().unwrap())
+            .unwrap()
+            .value(),
+    );
+    let held_timeout = observe_held_timeout(&held_state).await;
     assert_unsettled_blocker(&kernel, &broker, &caller, &stale_projection, &stale_root).await;
+    let acknowledged_timeout = held_state.failure_observation_for_test().await;
     held_worker.arm_panic_on_release();
     held_worker.release_workers();
     await_join_failure_publication(&kernel, &stale_projection, gates.len()).await;
@@ -44,6 +54,17 @@ async fn concurrent_worker_panics_block_cleanup_until_settled_retries() {
         let _ = worker.expect("worker task joined");
     }
 
+    observe_listener_closure(&kernel, &stale_projection).await;
+    held_timeout.expect("held actual worker causally published TimedOut");
+    assert_eq!(
+        acknowledged_timeout,
+        (
+            Some(DrainFailureKind::TimedOut),
+            Some(DrainFailureKind::TimedOut)
+        ),
+        "public unsettled admission must acknowledge held TimedOut before release"
+    );
+    assert_public_join_upgrade(&kernel, &broker, &caller, &held_state).await;
     let mounts = retry_concurrently(&broker, &caller).await;
     assert_settled_replacement(&kernel, &broker, &stale_projection, &stale_root, &mounts);
     for mount in mounts {
@@ -126,7 +147,7 @@ async fn await_join_failure_publication(
             .get(mount_id)
             .map(|entry| entry.value().clone())
             .expect("retained component");
-        state.wait_join_failure_publication_for_test().await;
+        state.wait_join_failure_classification_for_test().await;
     }
 }
 
@@ -156,6 +177,84 @@ async fn assert_unsettled_blocker(
         panic!("an unsettled retained panic must deny replacement");
     };
     assert!(denied.contains("administrative cleanup"), "{denied}");
+}
+
+// Observe, never consume, classifier state. The public broker owns refusals.
+async fn observe_held_timeout(
+    state: &Arc<crate::storage_mount::StorageMountLeaseState>,
+) -> Result<(), String> {
+    let mut changed = state.drain_failure_tx.subscribe();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let (failure, _) = state.failure_observation_for_test().await;
+            if failure == Some(DrainFailureKind::TimedOut) {
+                return Ok(());
+            }
+            if failure == Some(DrainFailureKind::JoinFailed) {
+                return Err("held worker unexpectedly classified JoinFailed before release".into());
+            }
+            changed.changed().await.map_err(|e| e.to_string())?;
+        }
+    })
+    .await
+    .map_err(|_| "held timeout publication missing".to_owned())?
+}
+
+async fn observe_listener_closure(
+    kernel: &Arc<crate::Kernel>,
+    projection: &CachedProcessProjection,
+) {
+    for mount_id in &projection.component_mount_ids {
+        let state = Arc::clone(kernel.storage_mounts.get(mount_id).unwrap().value());
+        let mut closed = state.listener_closed_tx.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !*closed.borrow_and_update() {
+                closed.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("actual retained listener and endpoint settle");
+    }
+}
+
+async fn assert_public_join_upgrade(
+    kernel: &Arc<crate::Kernel>,
+    broker: &KernelProcessStorageMountBroker,
+    caller: &PrincipalId,
+    held: &Arc<crate::storage_mount::StorageMountLeaseState>,
+) {
+    use crate::storage_mount::drain_state::DrainFailureKind;
+    assert_eq!(
+        held.failure_observation_for_test().await,
+        (
+            Some(DrainFailureKind::JoinFailed),
+            Some(DrainFailureKind::TimedOut)
+        ),
+        "new JoinFailed severity must remain unacknowledged before public retry"
+    );
+    let (result, diagnostic) = crate::storage_mount::process_broker::retained_diagnostics::capture(
+        PROCESS_MOUNT_TEST_ID.scope(656, broker.mount(caller)),
+    )
+    .await;
+    let Err(error) = result else {
+        panic!("new JoinFailed severity skipped public refusal");
+    };
+    assert!(
+        error.contains("administrative cleanup"),
+        "{error}; {diagnostic:?}"
+    );
+    assert_eq!(
+        held.failure_observation_for_test().await,
+        (
+            Some(DrainFailureKind::JoinFailed),
+            Some(DrainFailureKind::JoinFailed)
+        ),
+        "actual public admission must acknowledge the new severity"
+    );
+    assert!(
+        kernel.storage_mounts.contains_key(&held.mount_id),
+        "failed public retry must retain exact mapped authority"
+    );
 }
 
 async fn retry_concurrently(

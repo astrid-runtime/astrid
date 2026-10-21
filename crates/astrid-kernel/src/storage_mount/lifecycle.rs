@@ -20,6 +20,7 @@ use super::cleanup::MountCleanupStage;
 use super::cleanup::{MountCleanupError, cleanup_error, cleanup_resource_paths};
 use super::drain_state::{DrainFailureKind, DrainSettlement};
 use super::filesystem::{CallbackFilesystem, PrefixedFilesystem};
+use super::ledger_diagnostics::{LedgerOperation, cleanup_ledger_io_error};
 use crate::Kernel;
 
 const PUBLICATION_CLOSED: &str = "cannot issue a storage mount lease for a retiring principal";
@@ -374,7 +375,11 @@ fn record_cleanup_ledger(
     astrid_core::platform_fs::ensure_private_directory(parent).map_err(|error| {
         (
             MountCleanupStage::Manifest,
-            std::io::Error::other(format!("create cleanup ledger directory: {error}")),
+            cleanup_ledger_io_error(
+                Some(state.mount_id),
+                LedgerOperation::EnsureDirectory,
+                error,
+            ),
         )
     })?;
     astrid_core::platform_fs::atomic_write_private_file(
@@ -384,7 +389,7 @@ fn record_cleanup_ledger(
     .map_err(|error| {
         (
             MountCleanupStage::Manifest,
-            std::io::Error::other(format!("write cleanup ledger: {error}")),
+            cleanup_ledger_io_error(Some(state.mount_id), LedgerOperation::AtomicWrite, error),
         )
     })
 }
@@ -398,7 +403,7 @@ pub(crate) fn complete_cleanup_ledger(
         Err(error) => {
             return Err((
                 MountCleanupStage::Manifest,
-                std::io::Error::other(format!("remove cleanup ledger: {error}")),
+                cleanup_ledger_io_error(Some(state.mount_id), LedgerOperation::RemoveFile, error),
             ));
         },
     }

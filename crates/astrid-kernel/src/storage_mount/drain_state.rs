@@ -128,6 +128,15 @@ impl StorageMountLeaseState {
         *self.listener_closed_tx.borrow()
     }
 
+    /// Read-only evidence: tests must acknowledge failures through public teardown.
+    #[cfg(test)]
+    pub(super) async fn failure_observation_for_test(
+        &self,
+    ) -> (Option<DrainFailureKind>, Option<DrainFailureKind>) {
+        let attempt = self.drain_attempts.lock().await;
+        (self.sample_failure(), attempt.retry_armed)
+    }
+
     /// Retire a latched failure only after a retry has proven cleanup complete.
     pub(super) fn complete_drain_retry(&self) {
         let mut latch = self
