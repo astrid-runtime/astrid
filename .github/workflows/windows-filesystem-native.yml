@@ -6,6 +6,8 @@ on:
     paths:
       - '**.rs'
       - 'scripts/install-windows.ps1'
+      - 'scripts/run-bounded-native-test.ps1'
+      - 'scripts/test_native_test_watchdog.py'
       - 'scripts/uninstall-windows.ps1'
       - 'scripts/windows_release_manifest.py'
       - 'scripts/test_windows_release_manifest.py'
@@ -64,6 +66,8 @@ on:
     paths:
       - '**.rs'
       - 'scripts/install-windows.ps1'
+      - 'scripts/run-bounded-native-test.ps1'
+      - 'scripts/test_native_test_watchdog.py'
       - 'scripts/uninstall-windows.ps1'
       - 'scripts/windows_release_manifest.py'
       - 'scripts/test_windows_release_manifest.py'
@@ -146,6 +150,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
+
+      - name: Test the owned native-process watchdog
+        shell: pwsh
+        run: python -m unittest scripts.test_native_test_watchdog
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -394,7 +402,10 @@ jobs:
           Get-Item -LiteralPath $stagedProvider, $stagedTestExecutable |
             Select-Object FullName, Length
           $env:ASTRID_PROCESS_PROVIDER_TESTS = "1"
-          & $stagedTestExecutable storage_mount -- --nocapture --test-threads=1
+          # Harness deadline, not product policy: preserve the real failure and
+          # diagnostics if native work prevents the test runtime from exiting.
+          & ./scripts/run-bounded-native-test.ps1 -FilePath $stagedTestExecutable `
+            -TimeoutSeconds 600 -Arguments @("storage_mount", "--", "--nocapture", "--test-threads=1")
           if ($LASTEXITCODE -ne 0) {
             throw "the trusted process storage provider tests failed with exit code $LASTEXITCODE"
           }
