@@ -569,7 +569,10 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           path: trusted-dco
-          sparse-checkout: scripts/check_dco.py
+          fetch-depth: 0
+          sparse-checkout: |
+            scripts/check_dco.py
+            scripts/check_dco_import_scope.py
           sparse-checkout-cone-mode: false
 
       - name: Fetch pull request commit metadata
@@ -581,7 +584,12 @@ jobs:
           gh api --paginate --slurp \
             "repos/$REPO/pulls/$PR_NUMBER/commits?per_page=100" \
             > "$RUNNER_TEMP/pr-commits.json"
-          if [ -f trusted-dco/scripts/check_dco.py ]; then
+          # The policy helper must already exist in the trusted base. A PR
+          # introducing it is still checked by the previous strict policy.
+          if [ -f trusted-dco/scripts/check_dco_import_scope.py ]; then
+            python3 trusted-dco/scripts/check_dco.py "$RUNNER_TEMP/pr-commits.json" \
+              --event-json "$GITHUB_EVENT_PATH" --git-repo "$GITHUB_WORKSPACE/trusted-dco"
+          elif [ -f trusted-dco/scripts/check_dco.py ]; then
             python3 trusted-dco/scripts/check_dco.py "$RUNNER_TEMP/pr-commits.json"
           else
             # Bootstrap path for the PR that first introduces the checker.

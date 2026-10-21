@@ -76,10 +76,25 @@ def check_commits(payload: object) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("commits_json", type=Path)
+    parser.add_argument("--event-json", type=Path)
+    parser.add_argument("--git-repo", type=Path)
     args = parser.parse_args()
 
     try:
         payload = json.loads(args.commits_json.read_text(encoding="utf-8"))
+        if (args.event_json is None) != (args.git_repo is None):
+            raise ValueError("event and trusted Git checkout must be supplied together")
+        if args.event_json is not None:
+            from check_dco_import_scope import protected_main_imports
+
+            commits = tuple(_flatten_commits(payload))
+            event = json.loads(args.event_json.read_text(encoding="utf-8"))
+            scope = protected_main_imports(commits, event, args.git_repo)
+            if scope.main_sha is not None:
+                print(f"Protected main import pin: {scope.main_sha}")
+                for sha in sorted(scope.imported):
+                    print(f"Already admitted on protected main: {sha}")
+            payload = [item for item in commits if item.get("sha") not in scope.imported]
         errors = check_commits(payload)
     except (OSError, json.JSONDecodeError, ValueError) as error:
         print(f"::error::Unable to validate DCO commits: {error}")
