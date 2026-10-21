@@ -270,8 +270,8 @@ wasmparser = "0.256"
 windows-sys = "0.61"
 wit-component = "0.256"
 wit-parser = "0.256"
-wasmtime = { version = "48.0.1", features = ["component-model", "cranelift"] }
-wasmtime-wasi = "48.0.1"
+wasmtime = { version = "48.0.7", features = ["component-model", "cranelift"] }
+wasmtime-wasi = "48.0.7"
 unicode-normalization = "=0.1.25"
 unicode-width = "0.2"
 which = "8"
