@@ -39,11 +39,21 @@ PY
 }
 
 bounded_principal_cli() {
+  bounded_principal_cli_capture auto "$@"
+}
+
+bounded_principal_cli_json() {
+  bounded_principal_cli_capture separate "$@"
+}
+
+bounded_principal_cli_capture() {
+  local capture=$1
+  shift
   local principal=$1
   local timeout_secs=$2
   local out=$3
   shift 3
-  "$PYTHON" - "$CORE_DIR/target/debug/astrid" "$principal" "$timeout_secs" "$out" "$@" <<'PY'
+  "$PYTHON" - "$CORE_DIR/target/debug/astrid" "$principal" "$timeout_secs" "$out" "$capture" "$@" <<'PY'
 import subprocess
 import sys
 from pathlib import Path
@@ -52,35 +62,37 @@ binary = sys.argv[1]
 principal = sys.argv[2]
 timeout_secs = float(sys.argv[3])
 out_path = Path(sys.argv[4])
-args = sys.argv[5:]
-# Structured output must not absorb update notices or other stderr diagnostics.
-json_output = any(a == "--format" and b == "json" for a, b in zip(args, args[1:]))
-stderr_path = out_path.with_name(out_path.name + ".stderr")
+capture = sys.argv[5]
+args = sys.argv[6:]
+if capture == "auto":
+    json_output = any(a == "--format" and b == "json" for a, b in zip(args, args[1:]))
+    capture = "separate" if json_output else "combined"
+if capture not in {"combined", "separate"}:
+    raise SystemExit("invalid CLI capture mode")
+
+
+def save(stdout, stderr):
+    def text(value):
+        return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or ""
+
+    out_path.write_text(text(stdout), encoding="utf-8")
+    if capture == "separate":
+        Path(str(out_path) + ".stderr").write_text(text(stderr), encoding="utf-8")
 
 try:
     proc = subprocess.run(
         [binary, "--principal", principal, *args],
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE if json_output else subprocess.STDOUT,
+        stderr=subprocess.PIPE if capture == "separate" else subprocess.STDOUT,
         text=True,
         timeout=timeout_secs,
         check=False,
     )
 except subprocess.TimeoutExpired as exc:
-    stdout = exc.stdout or ""
-    if isinstance(stdout, bytes):
-        stdout = stdout.decode("utf-8", errors="replace")
-    out_path.write_text(stdout, encoding="utf-8")
-    if json_output:
-        stderr = exc.stderr or b""
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode("utf-8", errors="replace")
-        stderr_path.write_text(stderr, encoding="utf-8")
+    save(exc.stdout, exc.stderr)
     raise SystemExit(124) from exc
 
-out_path.write_text(proc.stdout, encoding="utf-8")
-if json_output:
-    stderr_path.write_text(proc.stderr, encoding="utf-8")
+save(proc.stdout, proc.stderr)
 raise SystemExit(proc.returncode)
 PY
 }
@@ -172,7 +184,7 @@ wait_for_principal_log_marker() {
   local principal=$1 marker=$2
   local roster="$ARTIFACTS/crash-principal-roster.json"
   local principal_uid
-  bounded_principal_cli default 8 "$roster" agent list --format json || return 1
+  bounded_principal_cli_json default 8 "$roster" agent list --format json || return 1
   principal_uid="$($PYTHON - "$roster" "$principal" <<'PY'
 import json
 import sys

@@ -100,6 +100,8 @@ pub(crate) use blocking_worker_gate::BlockingWorkerTestGate;
 pub(crate) use process_broker::KernelProcessStorageMountBroker;
 pub(crate) use process_broker::ProcessStopPolicy;
 #[cfg(all(test, any(unix, windows)))]
+pub(crate) use process_broker::RetainTestGates;
+#[cfg(all(test, any(unix, windows)))]
 pub(super) use process_broker::{platform_process_provider_name, validate_process_provider_ready};
 
 const LEASE_IDLE_TTL_SECS: u64 = 60 * 60;

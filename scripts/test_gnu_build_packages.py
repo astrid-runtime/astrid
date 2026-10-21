@@ -60,6 +60,21 @@ class PackageSetupTests(unittest.TestCase):
                          ["install", "-y", "--no-install-recommends",
                           "cmake", "gcc-aarch64-linux-gnu"])
 
+    def test_ci_and_release_share_the_pinned_glibc_baseline_setup(self):
+        root = SCRIPT.parent.parent.parent
+        for workflow in ["ci.yml", "release.yml"]:
+            text = (root / ".github/workflows" / workflow).read_text()
+            self.assertIn(
+                'bash scripts/ci/install_gnu_build_packages.sh "${packages[@]}"', text
+            )
+            self.assertIn(
+                "docker.io/library/rust@sha256:646e8ceea789b00c5cfa339816a3ed44940dbf1651dc167b78f3c0aefcae0025",
+                text,
+            )
+            self.assertNotIn(
+                'apt-get install -y --no-install-recommends "${packages[@]}"', text
+            )
+
     def test_failed_update_never_installs(self):
         code, calls = self.run_setup(fail_update=True)
         self.assertEqual(code, 100)

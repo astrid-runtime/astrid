@@ -37,7 +37,7 @@ async fn revocation_published_under_the_fence() {
         projection_leases_are_live(&fixture.kernel, &fixture.projection),
         "the exact platform-provider set must start live"
     );
-    let gate = arm_retain_validation_gate();
+    let gate = arm_retain_validation_gate(&fixture.kernel);
     let retain_kernel = Arc::clone(&fixture.kernel);
     let retain_projection = Arc::clone(&fixture.projection);
     let retain_cache = Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
@@ -92,7 +92,7 @@ async fn expiry_published_under_the_fence() {
         projection_leases_are_live(&fixture.kernel, &fixture.projection),
         "the exact platform-provider set must start live"
     );
-    let gate = arm_retain_validation_gate();
+    let gate = arm_retain_validation_gate(&fixture.kernel);
     let retain_kernel = Arc::clone(&fixture.kernel);
     let retain_projection = Arc::clone(&fixture.projection);
     let retain_cache = Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
@@ -239,4 +239,83 @@ async fn linearization_fixture() -> LinearizationFixture {
 
 fn projection_cleanup() -> ProjectionCleanup {
     Arc::new(|| Box::pin(async { true }))
+}
+
+#[tokio::test]
+async fn retain_scheduling_gates_are_bound_to_their_kernel() {
+    use std::future::{Future as _, poll_fn};
+    use std::task::Poll;
+
+    for reference in [false, true] {
+        let first = linearization_fixture().await;
+        let second = linearization_fixture().await;
+        let arm = if reference {
+            super::arm_retain_reference_gate
+        } else {
+            arm_retain_validation_gate
+        };
+        let first_gate = arm(&first.kernel);
+        let second_gate = arm(&second.kernel);
+        let cache = || Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let mut first_retain = Box::pin(retain_locked_projection(
+            &first.kernel,
+            Arc::clone(&first.projection),
+            cache(),
+            first.key.clone(),
+        ));
+        poll_fn(|cx| {
+            assert!(first_retain.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let first_entered = first_gate.entered();
+        let second_entered = second_gate.entered();
+        let mut observed_first = Box::pin(first_entered.notified());
+        let mut observed_second = Box::pin(second_entered.notified());
+        poll_fn(|cx| {
+            assert!(
+                observed_first.as_mut().poll(cx).is_ready(),
+                "the first kernel must enter only its own gate"
+            );
+            assert!(
+                observed_second.as_mut().poll(cx).is_pending(),
+                "the second kernel gate must remain untouched"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        first_gate.release().notify_one();
+        let first_mount = first_retain.await.expect("first kernel retain");
+        // A second independently armed kernel must still reach its own gate.
+        let mut second_retain = Box::pin(retain_locked_projection(
+            &second.kernel,
+            Arc::clone(&second.projection),
+            cache(),
+            second.key.clone(),
+        ));
+        poll_fn(|cx| {
+            assert!(second_retain.as_mut().poll(cx).is_pending());
+            assert!(observed_second.as_mut().poll(cx).is_ready());
+            Poll::Ready(())
+        })
+        .await;
+        second_gate.release().notify_one();
+        let second_mount = second_retain.await.expect("second kernel retain");
+        drop(first_gate);
+        drop(second_gate);
+        first_mount.close_async().await;
+        second_mount.close_async().await;
+        for fixture in [&first, &second] {
+            for mount_id in &fixture.projection.component_mount_ids {
+                crate::storage_mount::revoke_lease(
+                    &fixture.kernel,
+                    &fixture.caller,
+                    MountOwnerScope::CrossOwnerWrite,
+                    *mount_id,
+                )
+                .await
+                .expect("revoke exact fixture lease");
+            }
+        }
+    }
 }

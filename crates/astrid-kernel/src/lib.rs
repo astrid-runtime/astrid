@@ -450,6 +450,9 @@ pub struct Kernel {
             Arc<storage_mount::StorageMountLeaseState>,
         >,
     >,
+    /// Instance-local scheduling controls for projection retain regressions.
+    #[cfg(all(test, any(unix, windows)))]
+    pub(crate) projection_retain_test_gates: storage_mount::RetainTestGates,
     /// Linearizes read-modify-publish filesystem mutations across all native
     /// mounts so concurrent views cannot lose non-overlapping writes.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -1768,6 +1771,8 @@ impl Kernel {
             user_cpu,
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             storage_mounts: Arc::new(DashMap::new()),
+            #[cfg(all(test, any(unix, windows)))]
+            projection_retain_test_gates: storage_mount::RetainTestGates::default(),
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             storage_mount_mutations: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(all(test, target_os = "macos"))]
@@ -4087,6 +4092,8 @@ pub(crate) async fn test_kernel_with_user_cpu_budget(
         ownership_store,
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         storage_mounts: Arc::new(DashMap::new()),
+        #[cfg(all(test, any(unix, windows)))]
+        projection_retain_test_gates: storage_mount::RetainTestGates::default(),
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         storage_mount_mutations: Arc::new(tokio::sync::Mutex::new(())),
         #[cfg(all(test, target_os = "macos"))]

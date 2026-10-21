@@ -80,3 +80,62 @@ async fn mountpoint_preparation_failure_retains_root_until_exact_retry() {
         assert!(kernel.storage_mounts.is_empty());
     }
 }
+
+#[tokio::test]
+async fn preparation_faults_retain_exact_root_without_native_provider() {
+    use super::super::{ProcessProjectionKey, binding_on};
+    use astrid_storage::StateOwner;
+    use std::collections::BTreeMap;
+
+    let (_temporary, kernel) = fleet_shared_kernel().await;
+    let actor = kernel
+        .principal_directory
+        .uid_for(&PrincipalId::default())
+        .expect("test principal UID");
+    let assignment = kernel
+        .ownership_store
+        .load()
+        .await
+        .expect("ownership graph")
+        .principal_owner(actor)
+        .expect("principal owner")
+        .clone();
+    let owner = StateOwner::Fleet(assignment.fleet_uid);
+    let key = ProcessProjectionKey {
+        binding: binding_on(
+            actor,
+            owner,
+            astrid_core::WorkspaceUid::from_bytes([0xAB; 16]),
+            Some(assignment.fleet_uid),
+        ),
+        read_write: true,
+    };
+    for (stage, test_id) in [
+        (ProcessLaunchStage::Branch, 8001),
+        (ProcessLaunchStage::OwnerHome, 8002),
+        (ProcessLaunchStage::FleetShared, 8003),
+    ] {
+        let mut projections = BTreeMap::new();
+        arm_preparation_failure_for_test(stage, test_id);
+        let result = PROCESS_MOUNT_TEST_ID
+            .scope(test_id, async {
+                super::super::super::prepare_projection_paths(&kernel, &mut projections, &key)
+            })
+            .await;
+        let Err(error) = result else {
+            panic!("{stage:?} must inject its pre-lease preparation fault");
+        };
+        assert!(error.contains("preparation fault"), "{error}");
+        assert!(kernel.storage_mounts.is_empty());
+        assert_eq!(projections.len(), 1);
+        let retained = Arc::clone(projections.values().next().expect("retained root"));
+        assert!(retained.component_mount_ids.is_empty());
+        let root = retained.workspace_mountpoint.parent().expect("exact root");
+        assert!(root.is_dir());
+        assert!(
+            super::super::super::retry_failed_projection(&retained, &mut projections, &key).await
+        );
+        assert!(!root.exists());
+        assert!(projections.is_empty());
+    }
+}

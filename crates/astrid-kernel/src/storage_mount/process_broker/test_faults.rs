@@ -88,11 +88,15 @@ pub(super) fn take_preparation_failure_for_test(stage: ProcessLaunchStage) -> bo
     let current_test_id = PROCESS_MOUNT_TEST_ID
         .try_with(|test_id| *test_id)
         .unwrap_or(0);
-    PREPARATION_FAILURES
+    let mut failures = PREPARATION_FAILURES
         .lock()
-        .expect("preparation failure selector")
-        .remove(&current_test_id)
-        == Some(stage)
+        .expect("preparation failure selector");
+    if failures.get(&current_test_id) == Some(&stage) {
+        failures.remove(&current_test_id);
+        true
+    } else {
+        false
+    }
 }
 
 pub(crate) fn arm_mount_root_creation_failure_for_test(test_id: u64) {
