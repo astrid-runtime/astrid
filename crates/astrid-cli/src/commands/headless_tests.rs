@@ -10,6 +10,7 @@ use super::*;
 
 enum ReadStep {
     Message(Box<IpcMessage>),
+    DelayedMessage(Duration, Box<IpcMessage>),
     Timeout,
 }
 
@@ -28,9 +29,15 @@ impl DeterministicSource {
 }
 
 impl ResponseSource for DeterministicSource {
-    async fn read_message_before(&mut self, _remaining: Duration) -> ReadOutcome {
+    async fn read_message_before(&mut self, remaining: Duration) -> ReadOutcome {
         match self.steps.pop_front() {
             Some(ReadStep::Message(message)) => ReadOutcome::Message(message),
+            Some(ReadStep::DelayedMessage(delay, message)) => {
+                match tokio::time::timeout(remaining, tokio::time::sleep(delay)).await {
+                    Ok(()) => ReadOutcome::Message(message),
+                    Err(_) => ReadOutcome::Timeout,
+                }
+            },
             Some(ReadStep::Timeout) => ReadOutcome::Timeout,
             None => ReadOutcome::Closed,
         }
@@ -152,26 +159,58 @@ fn idle_timeout_preserves_default_and_fails_closed() {
     assert!(idle_timeout(86_401).is_err());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn active_run_messages_refresh_the_idle_boundary() {
     let session_id = SessionId::from_uuid(Uuid::new_v4());
     let mut source = DeterministicSource::new([
-        ReadStep::Message(Box::new(response("first", false, &session_id))),
-        ReadStep::Message(Box::new(response("done", true, &session_id))),
+        ReadStep::DelayedMessage(
+            Duration::from_millis(6),
+            Box::new(response("first", false, &session_id)),
+        ),
+        ReadStep::DelayedMessage(
+            Duration::from_millis(6),
+            Box::new(response("done", true, &session_id)),
+        ),
     ]);
+    let started = tokio::time::Instant::now();
     let (text, _) = collect_response(
         &mut source,
         &session_id,
         formatter::OutputFormat::Json,
-        Duration::from_millis(1),
+        Duration::from_millis(10),
     )
     .await
     .unwrap();
 
     assert_eq!(text, "firstdone");
+    assert!(started.elapsed() > Duration::from_millis(10));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
+async fn foreign_traffic_does_not_refresh_elapsed_idle_budget() {
+    let session_id = SessionId::from_uuid(Uuid::new_v4());
+    let mut source = DeterministicSource::new([
+        ReadStep::DelayedMessage(
+            Duration::from_millis(6),
+            Box::new(foreign_message(&session_id)),
+        ),
+        ReadStep::DelayedMessage(
+            Duration::from_millis(6),
+            Box::new(response("late", true, &session_id)),
+        ),
+    ]);
+    let error = collect_response(
+        &mut source,
+        &session_id,
+        formatter::OutputFormat::Json,
+        Duration::from_millis(10),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, HeadlessError::IdleTimeout { .. }));
+}
+
+#[tokio::test(start_paused = true)]
 async fn session_raw_json_stream_delta_is_active_run_traffic() {
     let session_id = SessionId::from_uuid(Uuid::new_v4());
     let mut source = DeterministicSource::new([
@@ -190,7 +229,7 @@ async fn session_raw_json_stream_delta_is_active_run_traffic() {
     assert_eq!(text, "done");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn typed_stream_deltas_reconcile_with_remainder_terminal() {
     let session_id = SessionId::from_uuid(Uuid::new_v4());
     let mut source = DeterministicSource::new([
@@ -220,7 +259,7 @@ async fn typed_stream_deltas_reconcile_with_remainder_terminal() {
     assert_eq!(text, "partial streamed remainder");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn typed_stream_deltas_reconcile_with_empty_remainder_terminal() {
     let session_id = SessionId::from_uuid(Uuid::new_v4());
     let mut source = DeterministicSource::new([
@@ -244,7 +283,7 @@ async fn typed_stream_deltas_reconcile_with_empty_remainder_terminal() {
     assert_eq!(text, "partial streamed");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn final_typed_delta_topic_frame_is_not_a_terminal() {
     let session_id = SessionId::from_uuid(Uuid::new_v4());
     let mut source = DeterministicSource::new([
@@ -268,7 +307,7 @@ async fn final_typed_delta_topic_frame_is_not_a_terminal() {
     assert_eq!(text, "done");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn raw_json_terminal_response_surfaces_text_and_finalizes() {
     let session_id = SessionId::from_uuid(Uuid::new_v4());
     let mut source = DeterministicSource::new([
@@ -287,7 +326,7 @@ async fn raw_json_terminal_response_surfaces_text_and_finalizes() {
     assert_eq!(text, "hello");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn spoofed_typed_response_is_not_active_run_traffic() {
     let session_id = SessionId::from_uuid(Uuid::new_v4());
     let mut source = DeterministicSource::new([
@@ -307,7 +346,7 @@ async fn spoofed_typed_response_is_not_active_run_traffic() {
     assert!(source.sent.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn spoofed_raw_json_response_is_not_active_run_traffic() {
     let session_id = SessionId::from_uuid(Uuid::new_v4());
     let mut source = DeterministicSource::new([
@@ -327,7 +366,7 @@ async fn spoofed_raw_json_response_is_not_active_run_traffic() {
     assert!(source.sent.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn missing_active_run_message_returns_timeout_without_process_exit() {
     let session_id = SessionId::from_uuid(Uuid::new_v4());
     let mut source = DeterministicSource::new([ReadStep::Timeout]);
@@ -343,7 +382,7 @@ async fn missing_active_run_message_returns_timeout_without_process_exit() {
     assert!(matches!(error, HeadlessError::IdleTimeout { .. }));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn foreign_frame_then_injected_timeout_returns_idle_timeout() {
     let session_id = SessionId::from_uuid(Uuid::new_v4());
     let mut source = DeterministicSource::new([
@@ -362,7 +401,7 @@ async fn foreign_frame_then_injected_timeout_returns_idle_timeout() {
     assert!(matches!(error, HeadlessError::IdleTimeout { .. }));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn foreign_same_principal_approval_is_ignored() {
     let session_id = SessionId::from_uuid(Uuid::new_v4());
     let foreign_session = SessionId::from_uuid(Uuid::new_v4());
@@ -386,7 +425,7 @@ async fn foreign_same_principal_approval_is_ignored() {
     assert!(source.sent.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn session_source_approval_is_also_ignored() {
     let session_id = SessionId::from_uuid(Uuid::new_v4());
     let mut source = DeterministicSource::new([
@@ -409,7 +448,7 @@ async fn session_source_approval_is_also_ignored() {
     assert!(source.sent.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn timeout_cleanup_sends_disconnect_within_injected_budget() {
     let session_id = SessionId::from_uuid(Uuid::new_v4());
     let mut source = DeterministicSource::new([ReadStep::Timeout]);
@@ -431,7 +470,7 @@ async fn timeout_cleanup_sends_disconnect_within_injected_budget() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn wedged_cleanup_send_returns_the_injected_idle_timeout() {
     struct WedgedSource;
 
@@ -460,7 +499,7 @@ async fn wedged_cleanup_send_returns_the_injected_idle_timeout() {
     assert!(matches!(error, HeadlessError::IdleTimeout { .. }));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn wedged_success_disconnect_is_bounded() {
     struct WedgedSource;
 
