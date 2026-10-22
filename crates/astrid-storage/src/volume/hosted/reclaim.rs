@@ -13,59 +13,102 @@ use super::{
     ContainerState, HostedFileVolume, Operation, RegionState, VOLUME_MAGIC, overlay_extent,
 };
 
-// Reclaim closes the old inode before swapping the active path. Tests pause
-// at that narrow boundary to prove a concurrent opener cannot acquire the
-// retired inode while the swap is in flight. This hook is test-only.
+// Tests pause immediately before atomic publication, with both inode locks
+// held.
 #[cfg(test)]
-type UnlockHook = Box<dyn FnOnce() + Send + 'static>;
+type SwapHook = Box<dyn FnOnce() + Send + 'static>;
 
 #[cfg(test)]
-static UNLOCK_HOOK: OnceLock<Mutex<Option<(PathBuf, UnlockHook)>>> = OnceLock::new();
+static SWAP_HOOK: OnceLock<Mutex<BTreeMap<PathBuf, SwapHook>>> = OnceLock::new();
 
 #[cfg(test)]
-pub(super) fn set_test_unlock_hook(path: PathBuf, hook: UnlockHook) {
-    *UNLOCK_HOOK
-        .get_or_init(|| Mutex::new(None))
+pub(super) fn set_test_swap_hook(path: PathBuf, hook: SwapHook) {
+    SWAP_HOOK
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
-        .expect("hosted reclaim test hook lock") = Some((path, hook));
+        .expect("hosted reclaim test hook lock")
+        .insert(path, hook);
 }
 
 #[cfg(test)]
-fn run_test_unlock_hook(path: &Path) {
-    let mut hook = UNLOCK_HOOK
-        .get_or_init(|| Mutex::new(None))
+fn run_test_swap_hook(path: &Path) {
+    let hook = SWAP_HOOK
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
-        .expect("hosted reclaim test hook lock");
-    if hook.as_ref().is_some_and(|(target, _)| target == path)
-        && let Some((_, hook)) = hook.take()
-    {
+        .expect("hosted reclaim test hook lock")
+        .remove(path);
+    if let Some(hook) = hook {
         hook();
     }
 }
 
 #[cfg(not(test))]
 #[inline]
-fn run_test_unlock_hook(_path: &Path) {}
+fn run_test_swap_hook(_path: &Path) {}
 
 pub(super) fn temp_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.compacting", path.display()))
+    sibling_path(path, ".compacting")
 }
 
 pub(super) fn previous_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.previous", path.display()))
+    sibling_path(path, ".previous")
 }
 
-pub(super) fn recover_artifacts(path: &Path) -> io::Result<()> {
+fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+pub(super) fn recover_artifacts(path: &Path) -> io::Result<File> {
     let temporary = temp_path(path);
     let previous = previous_path(path);
     let active = std::fs::symlink_metadata(path).is_ok();
     if !active {
-        if std::fs::symlink_metadata(&temporary).is_ok() {
-            std::fs::rename(&temporary, path)?;
-        } else if std::fs::symlink_metadata(&previous).is_ok() {
-            std::fs::rename(&previous, path)?;
+        let candidate = if std::fs::symlink_metadata(&temporary).is_ok() {
+            &temporary
+        } else {
+            &previous
+        };
+        if std::fs::symlink_metadata(candidate).is_ok() {
+            let file = super::open::open_regular(candidate, false)?;
+            lock_active(&file)?;
+            super::open::require_current(&file, candidate)?;
+            // No overwrite: a concurrent opener may have just created or
+            // promoted the active path. Keep the locked source until recovery
+            // validates the active container and removes obsolete artifacts.
+            match promote(candidate, path) {
+                Ok(()) => {},
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
+                Err(error) => return Err(error),
+            }
+            super::open::require_current(&file, path)?;
+            // Transfer the locked descriptor itself. Closing and reopening
+            // creates a lock handoff gap; a concurrent fork can also retain
+            // the old open description until its exec closes inherited FDs.
+            return Ok(file);
         }
     }
+    let file = super::open::open_regular(path, !active)?;
+    lock_active(&file)?;
+    Ok(file)
+}
+
+fn lock_active(file: &File) -> io::Result<()> {
+    file.try_lock_exclusive().map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            io::Error::new(io::ErrorKind::WouldBlock, "Astrid volume is already open")
+        } else {
+            error
+        }
+    })
+}
+
+// Only after the active container has recovered successfully, while holding
+// the verified active inode lock, may obsolete swap artifacts be removed.
+pub(super) fn cleanup_artifacts(path: &Path) -> io::Result<()> {
+    let temporary = temp_path(path);
+    let previous = previous_path(path);
     if std::fs::symlink_metadata(path).is_ok() {
         if std::fs::symlink_metadata(&temporary).is_ok() {
             std::fs::remove_file(&temporary)?;
@@ -95,7 +138,7 @@ fn create_file(path: &Path) -> io::Result<File> {
 }
 
 fn read_region(
-    state: &mut ContainerState,
+    file: &mut File,
     region: &RegionState,
     offset: u64,
     buffer: &mut [u8],
@@ -107,7 +150,12 @@ fn read_region(
                 .map_err(|_| io::Error::other("volume reclaim buffer length overflow"))?,
         )
         .ok_or_else(|| io::Error::other("volume reclaim range overflow"))?;
-    for (start, extent) in region.extents.range(..end) {
+    let first = region
+        .extents
+        .range(..=offset)
+        .next_back()
+        .map_or(offset, |(start, _)| *start);
+    for (start, extent) in region.extents.range(first..end) {
         if extent.logical_end <= offset {
             continue;
         }
@@ -127,10 +175,8 @@ fn read_region(
         let destination_end = destination
             .checked_add(length)
             .ok_or_else(|| io::Error::other("volume reclaim destination range overflow"))?;
-        state.file.seek(SeekFrom::Start(physical))?;
-        state
-            .file
-            .read_exact(&mut buffer[destination..destination_end])?;
+        file.seek(SeekFrom::Start(physical))?;
+        file.read_exact(&mut buffer[destination..destination_end])?;
     }
     Ok(())
 }
@@ -138,8 +184,13 @@ fn read_region(
 pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
     let _open_guard = volume.open_lock.lock();
     let mut state = volume.state.lock();
-    let temporary = temp_path(&volume.path);
-    let previous = previous_path(&volume.path);
+    reclaim_locked(&volume.path, &mut state)
+}
+
+pub(super) fn reclaim_locked(path: &Path, state: &mut ContainerState) -> io::Result<()> {
+    finish_publication(path, state)?;
+    let temporary = temp_path(path);
+    let previous = previous_path(path);
     if std::fs::symlink_metadata(&temporary).is_ok() {
         std::fs::remove_file(&temporary)?;
     }
@@ -157,83 +208,177 @@ pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
         boundary_pending: false,
         footer_pending: true,
         flush_state: super::FlushState::Required,
+        publication_pending: false,
         regions: BTreeMap::new(),
     };
     rebuilt.file.write_all(&VOLUME_MAGIC)?;
     rebuilt.valid_len = u64::try_from(VOLUME_MAGIC.len())
         .map_err(|_| io::Error::other("volume header length overflow"))?;
-    let source_regions = state.regions.clone();
-    for (region, source) in &source_regions {
+    for (region, source) in &state.regions {
         HostedFileVolume::append(&mut rebuilt, Operation::Create, region, 0, &[])?;
         rebuilt
             .regions
             .insert(region.clone(), RegionState::default());
-        let mut offset = 0_u64;
-        while offset < source.length {
-            let remaining = source
-                .length
-                .checked_sub(offset)
-                .ok_or_else(|| io::Error::other("volume reclaim source range underflow"))?;
-            let length = usize::try_from(remaining.min(64 * 1024))
-                .map_err(|_| io::Error::other("volume reclaim chunk length overflow"))?;
-            let mut bytes = vec![0_u8; length];
-            read_region(&mut state, source, offset, &mut bytes)?;
-            let (physical, _) =
-                HostedFileVolume::append(&mut rebuilt, Operation::Write, region, offset, &bytes)?;
-            let end = offset
-                .checked_add(
-                    u64::try_from(length)
-                        .map_err(|_| io::Error::other("volume reclaim write length overflow"))?,
-                )
-                .ok_or_else(|| io::Error::other("volume reclaim write range overflow"))?;
+        if source.length != 0 {
+            let mut reader = RegionReader {
+                file: &mut state.file,
+                region: source,
+                offset: 0,
+            };
+            let (physical, _) = super::stream::append_from(
+                &mut rebuilt,
+                Operation::Write,
+                region,
+                0,
+                source.length,
+                &mut reader,
+            )?;
             let destination = rebuilt
                 .regions
                 .get_mut(region)
                 .ok_or_else(|| io::Error::other("rebuilt volume region disappeared"))?;
-            overlay_extent(&mut destination.extents, offset, end, physical);
-            destination.length = destination.length.max(end);
-            offset = end;
+            overlay_extent(&mut destination.extents, 0, source.length, physical);
+            destination.length = source.length;
         }
     }
     HostedFileVolume::make_durable(&mut rebuilt)?;
-    let rebuilt_regions = rebuilt.regions.clone();
-    let rebuilt_sequence = rebuilt.sequence;
-    let rebuilt_len = rebuilt.valid_len;
-    let rebuilt_commit_offset = rebuilt.last_commit_offset;
-    let rebuilt_snapshot_end = rebuilt.last_snapshot_end;
     rebuilt.file.sync_all()?;
-    drop(rebuilt);
+    rebuilt.file.try_lock_exclusive()?;
+    run_test_swap_hook(path);
+    // Atomic replacement leaves the old state usable on failure. Both inode
+    // handles stay locked through publication; open verifies inode identity after locking
+    // before performing recovery or cleanup. Install state before any fallible operation.
+    publish(&temporary, path)?;
+    rebuilt.flush_state = super::FlushState::Required;
+    rebuilt.publication_pending = true;
+    *state = rebuilt;
+    finish_publication(path, state)
+}
 
-    // Close the old locked inode before replacement. Recovery of the sibling
-    // artifacts handles a process crash between either rename.
-    let placeholder = OpenOptions::new().read(true).write(true).open(&temporary)?;
-    // From here on the file handle may change even if reclaim returns an
-    // error. Never carry the previous inode's flush proof across that swap.
-    state.flush_state = super::FlushState::Required;
-    let old_file = std::mem::replace(&mut state.file, placeholder);
-    old_file.unlock()?;
-    drop(old_file);
-    run_test_unlock_hook(&volume.path);
-    std::fs::rename(&volume.path, &previous)?;
-    if let Err(error) = std::fs::rename(&temporary, &volume.path) {
-        let _ = std::fs::rename(&previous, &volume.path);
-        return Err(error);
+pub(super) fn finish_publication(path: &Path, state: &mut ContainerState) -> io::Result<()> {
+    if state.publication_pending {
+        sync_parent(path)?;
+        state.publication_pending = false;
     }
-    let replacement = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&volume.path)?;
-    replacement.try_lock_exclusive()?;
-    let placeholder = std::mem::replace(&mut state.file, replacement);
-    drop(placeholder);
-    state.sequence = rebuilt_sequence;
-    state.valid_len = rebuilt_len;
-    state.durable_len = rebuilt_len;
-    state.last_commit_offset = rebuilt_commit_offset;
-    state.last_snapshot_end = rebuilt_snapshot_end;
-    state.boundary_pending = false;
-    state.footer_pending = false;
-    state.regions = rebuilt_regions;
-    std::fs::remove_file(previous)?;
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static FAIL_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn sync_parent(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_DIRECTORY_SYNC.with(|fail| fail.replace(false)) {
+        return Err(io::Error::other("injected directory flush failure"));
+    }
+    #[cfg(unix)]
+    {
+        File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()?;
+    }
+    #[cfg(windows)]
+    {
+        // Both replacement and artifact promotion use MoveFileExW with
+        // MOVEFILE_WRITE_THROUGH: its documented contract completes the move
+        // on disk before returning. There is no deferred parent flush here.
+        let _ = path;
+    }
+    #[cfg(not(any(unix, windows)))]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "volume publication durability is unsupported",
+    ));
+    Ok(())
+}
+
+struct RegionReader<'a> {
+    file: &'a mut File,
+    region: &'a RegionState,
+    offset: u64,
+}
+
+impl Read for RegionReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let remaining = self.region.length.saturating_sub(self.offset);
+        let length = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| io::Error::other("volume reclaim read length overflow"))?;
+        if length == 0 {
+            return Ok(0);
+        }
+        read_region(self.file, self.region, self.offset, &mut buffer[..length])?;
+        self.offset = self.offset.strict_add(length as u64);
+        Ok(length)
+    }
+}
+
+#[cfg(unix)]
+fn publish(source: &Path, destination: &Path) -> io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn publish(source: &Path, destination: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    rename_windows(
+        source,
+        destination,
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+    )
+}
+
+#[cfg(windows)]
+fn promote(source: &Path, destination: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH;
+    rename_windows(source, destination, MOVEFILE_WRITE_THROUGH)
+}
+
+#[cfg(unix)]
+fn promote(source: &Path, destination: &Path) -> io::Result<()> {
+    std::fs::hard_link(source, destination)?;
+    sync_parent(destination)
+}
+
+#[cfg(windows)]
+fn rename_windows(source: &Path, destination: &Path, flags: u32) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+    let wide = |path: &Path| -> io::Result<Vec<u16>> {
+        let mut value: Vec<_> = path.as_os_str().encode_wide().collect();
+        if value.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "volume path contains NUL",
+            ));
+        }
+        value.push(0);
+        Ok(value)
+    };
+    let source = wide(source)?;
+    let destination = wide(destination)?;
+    // SAFETY: both NUL-terminated buffers remain live for this call. No
+    // cross-volume copy fallback is allowed; staging is a sibling file.
+    #[allow(unsafe_code)]
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn publish(_source: &Path, _destination: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic volume publication is unsupported",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn promote(_source: &Path, _destination: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "volume artifact promotion is unsupported",
+    ))
 }
