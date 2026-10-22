@@ -133,3 +133,5 @@ async fn closed_lifecycle_rejects_health_restart_before_registry_or_storage_acce
     assert_eq!(error.to_string(), "runtime is shutting down");
     kernel.shutdown(Some("closed restart".into())).await;
 }
+
+mod idle_dispatcher;
