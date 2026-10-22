@@ -140,6 +140,9 @@ impl EventDeliveryAdmitter for Admitter {
         &self,
         event: &AstridEvent,
     ) -> Result<Box<dyn ReservedEventDelivery>, DeliveryAdmissionError> {
+        if !self.queues.stopping().is_published() {
+            return Err(DeliveryAdmissionError::Closed);
+        }
         let bus = self
             .event_bus
             .upgrade()
@@ -171,7 +174,7 @@ impl EventDeliveryAdmitter for Admitter {
         // Capture each runtime once even if several of its handlers match.
         // These gates are not locked until commit, after every capacity wait.
         let mut seen = std::collections::HashSet::new();
-        let gates = matches
+        let mut gates: Vec<_> = matches
             .iter()
             .filter_map(|(runtime, capsule, _, _)| {
                 seen.insert(runtime.clone())
@@ -179,6 +182,9 @@ impl EventDeliveryAdmitter for Admitter {
                     .flatten()
             })
             .collect();
+        // Fence both FIFO and priority-chain publication against dispatcher
+        // shutdown, including capsules without a generation admission gate.
+        gates.push(self.queues.stopping().clone());
         let committed = |delivery| -> Box<dyn ReservedEventDelivery> {
             Box::new(CommittedDelivery {
                 delivery,

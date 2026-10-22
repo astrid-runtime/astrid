@@ -2,7 +2,7 @@
 
 use super::{
     AuthenticatedIdentity, EventBus, IpcMessage, IpcPayload, LocalWriteHalf, Topic, egress,
-    private_elicit, process_inbound, routing, validate_ingress, write_ingress_refusal,
+    private_elicit, process_inbound, readiness, routing, validate_ingress, write_ingress_refusal,
     write_message,
 };
 
@@ -26,18 +26,33 @@ impl<'a> PendingInput<'a> {
         receiver: &'a egress::Subscription,
         message: IpcMessage,
     ) -> Self {
+        Self::with_readiness(bus, identity, receiver, message, None)
+    }
+
+    pub(super) fn with_readiness(
+        bus: &'a EventBus,
+        identity: &'a AuthenticatedIdentity,
+        receiver: &'a egress::Subscription,
+        message: IpcMessage,
+        probe: Option<&'a astrid_core::kernel_api::CapsuleTopicProbe>,
+    ) -> Self {
         let chat_session = input_chat_session(&message);
         let starts_turn = chat_session.is_some() && !routing::is_cancel_turn(&message.payload);
         Self {
             chat_session,
             starts_turn,
-            future: Box::pin(process_inbound(
-                bus,
-                identity,
-                identity.principal.as_str(),
-                receiver,
-                message,
-            )),
+            future: Box::pin(async move {
+                validate_ingress(&message)?;
+                readiness::ensure(probe, identity, &message).await?;
+                process_inbound(
+                    bus,
+                    identity,
+                    identity.principal.as_str(),
+                    receiver,
+                    message,
+                )
+                .await
+            }),
         }
     }
 }
@@ -76,10 +91,11 @@ pub(super) async fn handle_connection_input<'a>(
     bus: &'a EventBus,
     identity: &'a AuthenticatedIdentity,
     receiver: &'a egress::Subscription,
-    private_elicits: Option<&dyn private_elicit::PrivateElicitResponder>,
+    services: impl Into<readiness::InputServices<'a>>,
     message: IpcMessage,
     inputs: InputSlots<'a, '_>,
 ) -> std::io::Result<()> {
+    let services = services.into();
     let (pending, control, cancellation) = inputs;
     // A buffered next frame may win select! before the newly created future
     // has ever been polled. Settle ready admission before calling it blocked.
@@ -97,7 +113,7 @@ pub(super) async fn handle_connection_input<'a>(
         settle_ready_input(writer, identity, pending).await?;
     }
     if message.topic.as_str() == private_elicit::REPLY_TOPIC {
-        let response = private_elicit::respond(identity, private_elicits, message);
+        let response = private_elicit::respond(identity, services.private_elicits, message);
         write_message(writer, &response).await
     } else if message.topic.as_str() == routing::CHAT_REQUEST_TOPIC
         && routing::is_cancel_turn(&message.payload)
@@ -151,7 +167,13 @@ pub(super) async fn handle_connection_input<'a>(
         )
         .await
     } else {
-        *pending = Some(PendingInput::new(bus, identity, receiver, message));
+        *pending = Some(PendingInput::with_readiness(
+            bus,
+            identity,
+            receiver,
+            message,
+            services.topic_probe,
+        ));
         Ok(())
     }
 }

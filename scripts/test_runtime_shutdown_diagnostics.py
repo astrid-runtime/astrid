@@ -15,14 +15,19 @@ source "$1"
 scenario=$2
 DAEMON_PID=12345
 killed=false
+polls=0
 kill() {
   if [[ $1 == -KILL ]]; then killed=true; return 0; fi
-  if [[ $1 == -0 ]]; then [[ $scenario == timeout ]]; return; fi
+  if [[ $1 == -0 ]]; then
+    polls=$((polls + 1))
+    if [[ $scenario == delayed ]]; then (( polls <= 120 )); return; fi
+    [[ $scenario == timeout ]]; return
+  fi
   return 0
 }
 sleep() { :; }
 wait() {
-  case $scenario in clean) return 0;; nonzero) return 7;; timeout) return 137;; esac
+  case $scenario in clean|delayed) return 0;; nonzero) return 7;; timeout) return 137;; esac
 }
 status=0
 stop_daemon || status=$?
@@ -37,6 +42,11 @@ exit "$status"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("pid= killed=false", result.stdout)
         self.assertEqual(result.stderr, "")
+
+    def test_harness_allows_finalization_beyond_old_ten_second_deadline(self):
+        result = self.run_stop("delayed")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("pid= killed=false", result.stdout)
 
     def test_nonzero_exit_is_reported_and_remains_failure(self):
         result = self.run_stop("nonzero")

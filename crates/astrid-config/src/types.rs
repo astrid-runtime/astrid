@@ -604,6 +604,9 @@ pub struct TimeoutsSection {
     /// instead of SIGKILL. Unlike `idle_secs` / `approval_secs`, workspace
     /// config may raise this value.
     pub daemon_ready_secs: u64,
+    /// Operator-only whole-process shutdown budget, including task teardown
+    /// and durable volume finalization. Must be between 1 and 600 seconds.
+    pub daemon_shutdown_secs: u64,
 }
 
 impl Default for TimeoutsSection {
@@ -618,6 +621,9 @@ impl Default for TimeoutsSection {
             // 10 minutes: layout-1 audit import on a multi-principal home
             // exceeds the old hardcoded 60s CLI killer.
             daemon_ready_secs: std::time::Duration::from_mins(10).as_secs(),
+            // Match the normal client finalization wait; the previous 8-second
+            // watchdog interrupted healthy multi-principal volume packing.
+            daemon_shutdown_secs: std::time::Duration::from_mins(1).as_secs(),
         }
     }
 }

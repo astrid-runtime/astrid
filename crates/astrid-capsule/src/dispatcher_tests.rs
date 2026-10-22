@@ -20,6 +20,8 @@ use crate::manifest::{CapabilitiesDef, CapsuleManifest, PackageDef, SubscribeDef
 use astrid_events::ipc::IpcPayload;
 use astrid_events::ipc::Topic;
 
+#[path = "dispatcher/consumer_lifecycle_tests.rs"]
+mod consumer_lifecycle_tests;
 #[path = "dispatcher/delivery_tests.rs"]
 mod delivery_tests;
 #[path = "dispatcher/failure_tests.rs"]
@@ -950,7 +952,7 @@ async fn dispatch_respawns_when_mapped_consumer_is_closed() {
     let capsule: Arc<dyn Capsule> = Arc::new(capsule);
 
     // Pre-seed the queue map with a CLOSED sender for the key (receiver dropped).
-    let queues: CapsuleQueues = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let queues: CapsuleQueues = Arc::default();
     let runtime_id = RuntimeId::for_test(capsule.id().clone(), 1);
     let key = (runtime_id.clone(), Some("alice".to_string()));
     let (dead_tx, dead_rx) = mpsc::channel::<InterceptorWork>(CAPSULE_EVENT_QUEUE_CAPACITY);

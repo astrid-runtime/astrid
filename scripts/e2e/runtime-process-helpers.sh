@@ -67,11 +67,11 @@ stop_daemon() {
   local started=$SECONDS
 
   # This process was launched directly by the harness, so exercise its native
-  # signal-to-finalization path and wait beyond the daemon's eight-second hard
+  # signal-to-finalization path and wait beyond the daemon's default 60-second hard
   # deadline. The generic process reaper waits only five seconds and can kill
   # the daemon while it is still packing the projection into astrid.volume.
   kill "$pid" 2>/dev/null || true
-  for _ in {1..100}; do
+  for _ in {1..750}; do
     if ! kill -0 "$pid" 2>/dev/null; then
       local exit_status=0
       wait "$pid" 2>/dev/null || exit_status=$?

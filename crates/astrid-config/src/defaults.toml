@@ -427,6 +427,9 @@ idle_secs = 3600  # 1 hour
 # daemon; it disowns the child and tells the operator to check status.
 # Workspace config may raise this (not decrease-only like idle_secs).
 daemon_ready_secs = 600
+# Operator-only signal watchdog budget: task drain plus durable home packing.
+# Bounded to 1..600 seconds; a second termination signal still forces exit.
+daemon_shutdown_secs = 60
 
 # ============================================================================
 # Session Management

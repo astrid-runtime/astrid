@@ -87,3 +87,51 @@ fn unlimited_quota()
         })
     })
 }
+
+#[tokio::test]
+async fn shutdown_joins_admitted_writers_before_closing_storage() {
+    let root = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(root.path());
+    let kernel = test_kernel_with_home(home).await;
+    let writer = kernel.runtime_work.admit().unwrap();
+    let mut shutdown = Box::pin(kernel.shutdown(Some("writer barrier".into())));
+    assert!(
+        std::future::Future::poll(
+            shutdown.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending()
+    );
+    assert!(kernel.runtime_work.admit().is_none());
+    kernel
+        .kv
+        .set("shutdown-regression", "admitted", b"committed".to_vec())
+        .await
+        .unwrap();
+    drop(writer);
+    shutdown.await;
+    assert!(
+        kernel
+            .kv
+            .set("shutdown-regression", "late", b"rejected".to_vec())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn closed_lifecycle_rejects_health_restart_before_registry_or_storage_access() {
+    let root = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(root.path());
+    let kernel = test_kernel_with_home(home).await;
+    kernel.runtime_work.close().await;
+    let id = astrid_capsule_types::CapsuleId::new("not-loaded").unwrap();
+    let error = kernel
+        .restart_capsule(&id, &astrid_core::PrincipalId::default(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "runtime is shutting down");
+    kernel.shutdown(Some("closed restart".into())).await;
+}
+
+mod idle_dispatcher;
