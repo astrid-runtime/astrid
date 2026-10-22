@@ -7,6 +7,14 @@ use crate::principal_state::{RuntimeStore, StateOwnerResolver, bootstrap};
 use crate::storage_model::{ObjectClass, ObjectFormatVersion, ObjectKind, ObjectRecord};
 
 fn seed_volume(home: &AstridHome, specification: &ObjectRecord) -> RuntimeEngine {
+    seed_volume_with_catalog(home, specification, true)
+}
+
+fn seed_volume_with_catalog(
+    home: &AstridHome,
+    specification: &ObjectRecord,
+    include_catalog: bool,
+) -> RuntimeEngine {
     let volume = HostedFileVolume::open(home.storage_volume_path()).unwrap();
     let engine = RuntimeEngine::open_volume(
         volume.clone(),
@@ -18,7 +26,10 @@ fn seed_volume(home: &AstridHome, specification: &ObjectRecord) -> RuntimeEngine
     .unwrap();
     let (spec_id, _) = engine.persist_standalone_object(specification).unwrap();
     let catalog = bootstrap::content_catalog_format_specification().unwrap();
-    let (catalog_id, _) = engine.persist_standalone_object(&catalog).unwrap();
+    let catalog_id = engine.identify(&catalog);
+    if include_catalog {
+        engine.persist_standalone_object(&catalog).unwrap();
+    }
     engine
         .ensure_direct_representation_catalogue(spec_id, &[spec_id, catalog_id])
         .unwrap();
@@ -157,6 +168,9 @@ async fn volume_without_profile_cannot_recreate_a_missing_current_bootstrap() {
         DurableEnginePolicy::default(),
     )
     .unwrap();
+    engine
+        .persist_standalone_object(&bootstrap::content_catalog_format_specification().unwrap())
+        .unwrap();
     write_cutover_receipt(volume.as_ref(), &[]).unwrap();
     engine.close().unwrap();
     drop(engine);
@@ -206,5 +220,32 @@ async fn bootstrap_amendment_preserves_every_principal_root_and_prior_profile() 
             profile
         );
     }
+    engine.close().unwrap();
+}
+
+#[tokio::test]
+async fn missing_catalog_bootstrap_rejects_before_successor_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let prior = crate::principal_state::format_migration_tests::pre_chunked_specification();
+    let engine = seed_volume_with_catalog(&home, &prior, false);
+    let current = bootstrap::format_specification().unwrap();
+    let current_id = engine.identify(&current);
+    let result =
+        crate::principal_state::format_amendment::prepare_volume_format_specification(&engine);
+    assert!(
+        result.is_err(),
+        "missing catalogue bootstrap was silently accepted"
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("missing its content catalog specification")
+    );
+    assert!(
+        engine.object(current_id).unwrap().is_none(),
+        "a rejected upgrade admitted successor evidence"
+    );
     engine.close().unwrap();
 }
