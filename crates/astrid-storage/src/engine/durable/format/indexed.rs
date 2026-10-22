@@ -185,6 +185,11 @@ pub(in crate::engine::durable) fn last_batch_spans() -> usize {
     LAST_BATCH_SPANS.get()
 }
 
+#[cfg(test)]
+pub(in crate::engine::durable) fn reset_last_batch_spans() {
+    LAST_BATCH_SPANS.set(0);
+}
+
 fn decode_indexed_frame<I: PersistentObjectIdentity>(
     frame: &[u8],
     expected_id: ObjectId,
