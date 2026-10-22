@@ -161,3 +161,104 @@ fn process_crash_before_publication_recovers_acknowledged_bytes() {
     }
     assert!(!staged.exists());
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_detached_active_name_remains_fenced_by_both_inode_locks() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("astrid.volume");
+    let volume = HostedFileVolume::open(&path).unwrap();
+    let captured = path.clone();
+    reclaim::AFTER_DETACH.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            assert!(!captured.exists());
+            let result = super::open_tests::try_foreign_open(&captured);
+            assert!(result.status.success(), "{result:?}");
+            assert!(
+                !captured.exists(),
+                "contender must not create an empty active volume"
+            );
+            assert!(reclaim::temp_path(&captured).exists());
+        }))
+    });
+    volume.reclaim().unwrap();
+    assert!(path.exists());
+    assert!(!reclaim::previous_path(&path).exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_failed_restore_blocks_flush_until_old_name_is_durable_again() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("astrid.volume");
+    let volume = HostedFileVolume::open(&path).unwrap();
+    let region = VolumeRegion::new("objects").unwrap();
+    volume.create_region(&region, true).unwrap();
+    volume.write_region_at(&region, 0, b"before").unwrap();
+    volume.sync().unwrap();
+    reclaim::FAIL_PROMOTIONS.with(|fail| *fail.borrow_mut() = [false, true, true, true].into());
+    assert!(volume.reclaim().is_err());
+    assert!(volume.state.lock().restore_pending);
+    // reclaim has returned and dropped the rebuilt descriptor. The still
+    // locked previous inode must fence even this unlocked staging artifact.
+    let contender = super::open_tests::try_foreign_open(&path);
+    assert!(contender.status.success(), "{contender:?}");
+    assert!(!path.exists());
+    volume.write_region_at(&region, 0, b"after!").unwrap();
+    assert!(volume.sync().is_err());
+    assert!(volume.state.lock().restore_pending);
+    volume.sync().unwrap();
+    assert!(!volume.state.lock().restore_pending);
+    assert!(path.exists());
+    drop(volume);
+    let reopened = HostedFileVolume::open(&path).unwrap();
+    let mut bytes = [0; 6];
+    reopened.read_region_at(&region, 0, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"after!");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_effective_move_error_adopts_current_inode_and_retries_flush() {
+    for failed_move in [0, 1] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("astrid.volume");
+        let volume = HostedFileVolume::open(&path).unwrap();
+        let region = VolumeRegion::new("objects").unwrap();
+        volume.create_region(&region, true).unwrap();
+        volume.write_region_at(&region, 0, b"before").unwrap();
+        volume.sync().unwrap();
+        reclaim::FAIL_AFTER_PROMOTIONS.with(|fail| {
+            *fail.borrow_mut() = (0..=failed_move)
+                .map(|index| index == failed_move)
+                .collect();
+        });
+        assert!(volume.reclaim().is_err());
+        if failed_move == 0 {
+            assert!(volume.state.lock().restore_pending);
+        } else {
+            assert!(volume.state.lock().publication_pending);
+            assert!(!volume.state.lock().restore_pending);
+            super::open::require_current(&volume.state.lock().file, &path).unwrap();
+        }
+        let contender = super::open_tests::try_foreign_open(&path);
+        assert!(contender.status.success(), "{contender:?}");
+        reclaim::FAIL_PUBLICATION_FLUSH.with(|fail| fail.set(true));
+        assert!(volume.sync().is_err());
+        {
+            let state = volume.state.lock();
+            assert!(state.restore_pending || state.publication_pending);
+        }
+        volume.write_region_at(&region, 0, b"after!").unwrap();
+        volume.sync().unwrap();
+        assert!(!volume.state.lock().restore_pending);
+        assert!(!volume.state.lock().publication_pending);
+        assert!(!reclaim::temp_path(&path).exists());
+        assert!(!reclaim::previous_path(&path).exists());
+        drop(volume);
+        let reopened = HostedFileVolume::open(&path).unwrap();
+        let mut bytes = [0; 6];
+        reopened.read_region_at(&region, 0, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"after!");
+    }
+}

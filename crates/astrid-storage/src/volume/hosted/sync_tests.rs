@@ -99,7 +99,7 @@ fn new_write_after_failed_flush_is_durable_before_drop() {
     // Copy before Drop can do any additional work. The acknowledged boundary
     // must be sufficient for a fresh recovery, including the later write.
     let copy = directory.path().join("recovered.volume");
-    std::fs::copy(&path, &copy).unwrap();
+    super::test_support::copy_container(&volume, &copy);
     let recovered = HostedFileVolume::open(copy).unwrap();
     let mut actual = [0; 6];
     assert_eq!(

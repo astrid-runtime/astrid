@@ -77,8 +77,10 @@ struct ContainerState {
     // Process-local proof only: set after a successful full flush, cleared
     // before any file mutation. A recovered footer is not this proof.
     flush_state: FlushState,
-    // Atomic publication is acknowledged only after the parent directory flush.
+    // Publication is acknowledged only after its platform durability barrier.
     publication_pending: bool,
+    #[cfg(windows)]
+    restore_pending: bool,
     regions: BTreeMap<VolumeRegion, RegionState>,
 }
 
@@ -237,8 +239,9 @@ impl HostedFileVolume {
 impl Drop for HostedFileVolume {
     fn drop(&mut self) {
         let state = self.state.get_mut();
-        let _ = reclaim::finish_publication(&self.path, state);
-        let _ = Self::make_durable(state);
+        if reclaim::finish_publication(&self.path, state).is_ok() {
+            let _ = Self::make_durable(state);
+        }
         let _ = fs2::FileExt::unlock(&state.file);
     }
 }
@@ -741,6 +744,8 @@ mod sync_tests;
 
 #[cfg(test)]
 mod checkpoint_tests;
+#[cfg(test)]
+mod test_support;
 
 #[cfg(test)]
 mod extent_mutation_tests;
