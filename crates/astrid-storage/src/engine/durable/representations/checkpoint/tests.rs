@@ -22,7 +22,7 @@ fn advance(store: &mut RepresentationStore, offset: u64) {
 fn volume_checkpoints_bound_metadata_and_preserve_authority_across_restart() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("test.volume");
-    let volume: Arc<dyn AstridVolume> = HostedFileVolume::open(&path).unwrap();
+    let mut volume: Arc<dyn AstridVolume> = HostedFileVolume::open(&path).unwrap();
     let limits = RecoveryLimits::process_addressable();
     let mut store =
         RepresentationStore::activate_volume(&volume, limits, ObjectId::new([1; 32]), []).unwrap();
@@ -46,18 +46,16 @@ fn volume_checkpoints_bound_metadata_and_preserve_authority_across_restart() {
             2
         );
         drop(store);
-        // Independent file reopen, not merely replay from the live region map.
-        std::fs::copy(&path, directory.path().join("reopen.volume")).unwrap();
-        let reopened: Arc<dyn AstridVolume> =
-            HostedFileVolume::open(directory.path().join("reopen.volume")).unwrap();
-        let recovered = RepresentationStore::open_volume(&reopened, limits)
+        // Close the owned handle before independent recovery. Windows holds
+        // mandatory byte-range locks, so copying a live volume is not portable.
+        drop(volume);
+        volume = HostedFileVolume::open(&path).unwrap();
+        let recovered = RepresentationStore::open_volume(&volume, limits)
             .unwrap()
             .unwrap();
         assert_eq!(recovered.active, active);
         assert_eq!(recovered.reverse, reverse);
-        store = RepresentationStore::open_volume(&volume, limits)
-            .unwrap()
-            .unwrap();
+        store = recovered;
     }
 }
 
@@ -192,4 +190,47 @@ fn published_checkpoint_recovers_before_cleanup_and_does_not_fall_back_on_corrup
         .unwrap();
     volume.sync().unwrap();
     assert!(RepresentationStore::open_volume(&volume, limits).is_err());
+}
+
+#[test]
+fn recovered_maps_retain_only_their_active_closures() {
+    let directory = tempfile::tempdir().unwrap();
+    let volume: Arc<dyn AstridVolume> =
+        HostedFileVolume::open(directory.path().join("residency.volume")).unwrap();
+    let limits = RecoveryLimits::process_addressable();
+    let mut store =
+        RepresentationStore::activate_volume(&volume, limits, ObjectId::new([1; 32]), []).unwrap();
+    for offset in 1..=40 {
+        advance(&mut store, offset);
+    }
+    let active = store.active;
+    let reverse = store.reverse.clone();
+    let historical_nodes = store.persisted_map_nodes.len();
+    assert!(historical_nodes > 3);
+    drop(store);
+
+    let mut recovered = RepresentationStore::open_volume(&volume, limits)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.active, active);
+    assert_eq!(recovered.reverse, reverse);
+    for map in [
+        &recovered.profiles,
+        &recovered.representations,
+        &recovered.placement_entries,
+    ] {
+        assert_eq!(map.entry_count(), 1);
+        assert_eq!(map.nodes().len(), 1, "retain only this root's active page");
+    }
+    assert_eq!(recovered.persisted_map_nodes.len(), historical_nodes);
+
+    advance(&mut recovered, 41);
+    let active = recovered.active;
+    drop(recovered);
+    let reopened = RepresentationStore::open_volume(&volume, limits)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reopened.active, active);
+    assert_eq!(reopened.reverse, reverse);
+    assert_eq!(reopened.placement_entries.nodes().len(), 1);
 }
