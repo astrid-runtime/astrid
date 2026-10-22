@@ -15,6 +15,7 @@ use super::identity::{
 
 mod legacy;
 mod radix;
+mod residency;
 
 const LEGACY_MAP_NODE_VERSION: u16 = 1;
 const RADIX_MAP_NODE_VERSION: u16 = 2;

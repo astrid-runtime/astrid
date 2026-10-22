@@ -31,6 +31,7 @@ mod checkpoint;
 mod format;
 mod index_validation;
 mod recovery;
+mod residency;
 
 use activation::{append_new_reachable_map_nodes, build_initial_state, generation_name};
 use recovery::{
@@ -171,7 +172,7 @@ impl RepresentationStore {
             current.journal_generation,
             active,
             state,
-            &index,
+            index,
         )?;
         Ok(Some(recovered))
     }
@@ -667,6 +668,7 @@ impl RepresentationStore {
                 self.reverse.entry(object).or_default().push(representation);
             }
         }
+        self.reclaim_map_history()?;
         Ok(())
     }
 
@@ -780,7 +782,7 @@ impl RepresentationStore {
         journal_generation: u64,
         active: RepresentationStateId,
         state: RepresentationState,
-        index: &MetadataIndex,
+        mut index: MetadataIndex,
     ) -> Result<Self, DurableError> {
         let catalogue = RepresentationCatalogueRoot::decode(
             index.value(MetadataKind::Catalogue, state.catalogue().as_bytes())?,
@@ -788,23 +790,21 @@ impl RepresentationStore {
         let placements = PlacementSet::decode(
             index.value(MetadataKind::Placement, state.placements().as_bytes())?,
         )?;
-        let profiles = CanonicalPhysicalMap::recover(
-            &Blake3PhysicalIdentity,
+        let persisted_map_nodes = index.nodes.keys().copied().collect();
+        let profiles = residency::recover_active_map(
             PhysicalMapDomain::Profile,
             catalogue.profiles_root(),
-            index.nodes.clone(),
+            &mut index.nodes,
         )?;
-        let representations = CanonicalPhysicalMap::recover(
-            &Blake3PhysicalIdentity,
+        let representations = residency::recover_active_map(
             PhysicalMapDomain::Representation,
             catalogue.representations_root(),
-            index.nodes.clone(),
+            &mut index.nodes,
         )?;
-        let placement_entries = CanonicalPhysicalMap::recover(
-            &Blake3PhysicalIdentity,
+        let placement_entries = residency::recover_active_map(
             PhysicalMapDomain::Placement,
             placements.entries_root(),
-            index.nodes.clone(),
+            &mut index.nodes,
         )?;
         if profiles.entry_count() != catalogue.profile_count()
             || representations.entry_count() != catalogue.representation_count()
@@ -833,7 +833,7 @@ impl RepresentationStore {
             profiles,
             representations,
             placement_entries,
-            persisted_map_nodes: index.nodes.keys().copied().collect(),
+            persisted_map_nodes,
             complete_map_subtrees: BTreeSet::new(),
             direct_profile,
             reverse,

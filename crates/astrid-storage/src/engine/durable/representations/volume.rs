@@ -52,7 +52,7 @@ impl RepresentationStore {
             current.journal_generation,
             active,
             state,
-            &index,
+            index,
         )?;
         Ok(Some(recovered))
     }
