@@ -471,7 +471,8 @@ where
             Self::advance_wal_arena_frontier(inner, arena_len)
         } else {
             self.advance_index_frontier(inner, arena_len)?;
-            self.sync_volume()
+            self.sync_volume()?;
+            self.checkpoint_physical_history(inner)
         }
     }
 

@@ -109,7 +109,8 @@ where
             .roots
             .sync_data()
             .map_err(|source| io_error("flush root journal", source))?;
-        self.sync_volume()
+        self.sync_volume()?;
+        self.checkpoint_physical_history(inner)
     }
 
     pub(super) fn sync_volume(&self) -> Result<(), DurableError> {
@@ -132,7 +133,7 @@ where
                 writer.checkpoint().map_err(wal_durable_error)?;
             }
             self.checkpoint_index(inner, VolumeIndexPersist::RetainDeltas)?;
-            Ok(())
+            self.checkpoint_physical_history(inner)
         })();
         if result.is_err() {
             self.mark_requires_recovery(inner);

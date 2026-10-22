@@ -22,7 +22,7 @@ fn advance(store: &mut RepresentationStore, offset: u64) {
 fn volume_checkpoints_bound_metadata_and_preserve_authority_across_restart() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("test.volume");
-    let volume: Arc<dyn AstridVolume> = HostedFileVolume::open(&path).unwrap();
+    let mut volume: Arc<dyn AstridVolume> = HostedFileVolume::open(&path).unwrap();
     let limits = RecoveryLimits::process_addressable();
     let mut store =
         RepresentationStore::activate_volume(&volume, limits, ObjectId::new([1; 32]), []).unwrap();
@@ -46,18 +46,16 @@ fn volume_checkpoints_bound_metadata_and_preserve_authority_across_restart() {
             2
         );
         drop(store);
-        // Independent file reopen, not merely replay from the live region map.
-        std::fs::copy(&path, directory.path().join("reopen.volume")).unwrap();
-        let reopened: Arc<dyn AstridVolume> =
-            HostedFileVolume::open(directory.path().join("reopen.volume")).unwrap();
-        let recovered = RepresentationStore::open_volume(&reopened, limits)
+        // Close the owned handle before independent recovery. Windows holds
+        // mandatory byte-range locks, so copying a live volume is not portable.
+        drop(volume);
+        volume = HostedFileVolume::open(&path).unwrap();
+        let recovered = RepresentationStore::open_volume(&volume, limits)
             .unwrap()
             .unwrap();
         assert_eq!(recovered.active, active);
         assert_eq!(recovered.reverse, reverse);
-        store = RepresentationStore::open_volume(&volume, limits)
-            .unwrap()
-            .unwrap();
+        store = recovered;
     }
 }
 

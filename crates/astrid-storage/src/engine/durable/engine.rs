@@ -424,6 +424,7 @@ where
                     return Err(error);
                 },
             }
+            self.finish_standalone_publication(inner)?;
         }
         Ok((id, InsertOutcome::AlreadyPresent))
     }
@@ -481,7 +482,19 @@ where
             self.mark_requires_recovery(inner);
             return Err(error);
         }
+        self.finish_standalone_publication(inner)?;
         Ok((id, InsertOutcome::Inserted))
+    }
+
+    fn finish_standalone_publication(
+        &self,
+        inner: &mut DurableInner<P>,
+    ) -> Result<(), DurableError> {
+        if let Err(error) = self.sync_volume() {
+            self.mark_requires_recovery(inner);
+            return Err(error);
+        }
+        self.checkpoint_physical_history(inner)
     }
 
     pub(super) fn flush_standalone(

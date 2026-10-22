@@ -11,6 +11,27 @@ use super::RepresentationStore;
 use super::format::Blake3PhysicalIdentity;
 
 impl RepresentationStore {
+    #[cfg(test)]
+    pub(in crate::engine::durable) fn persisted_physical_node_count(&self) -> usize {
+        self.persisted_map_nodes.len()
+    }
+
+    pub(in crate::engine::durable) fn checkpoint_required(&self) -> bool {
+        // At most 2n-1 nodes are reachable in either canonical construction.
+        // Rewrite only when at least half this conservative bound is history;
+        // work is amortized over path-copy mutations, not scheduled per agent.
+        let active_bound = [
+            &self.profiles,
+            &self.representations,
+            &self.placement_entries,
+        ]
+        .into_iter()
+        .map(|map| map.entry_count().saturating_mul(2).saturating_sub(1))
+        .fold(0_u64, u64::saturating_add);
+        u64::try_from(self.persisted_map_nodes.len()).unwrap_or(u64::MAX)
+            > active_bound.saturating_mul(2)
+    }
+
     pub(super) fn reclaim_map_history(&mut self) -> Result<(), DurableError> {
         let mut reclaimed = false;
         for map in [
