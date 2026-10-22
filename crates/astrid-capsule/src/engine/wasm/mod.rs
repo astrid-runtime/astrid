@@ -51,6 +51,7 @@ pub(crate) mod bindings;
 #[path = "catalog_load_tests.rs"]
 mod catalog_load_tests;
 mod compiled;
+mod construction;
 mod content_source;
 use compiled::CompiledWasmArtifact;
 pub use compiled::{COMPILED_ENGINE_ABI, CompiledWasmCache};
@@ -192,7 +193,7 @@ fn runtime_id_is_system(runtime_id: Option<&crate::registry::RuntimeId>) -> bool
 /// `astrid-sys` host interfaces (WIT imports) so the component can interact
 /// securely with the OS Event Bus and VFS.
 pub struct WasmEngine {
-    manifest: CapsuleManifest,
+    manifest: Arc<CapsuleManifest>,
     _capsule_dir: PathBuf,
     /// The wasmtime engine shared between the store and epoch incrementer.
     wasmtime_engine: Option<wasmtime::Engine>,
@@ -503,72 +504,6 @@ impl Drop for PrincipalInvocationGuard {
 }
 
 impl WasmEngine {
-    /// Construct a WASM engine for one capsule.
-    ///
-    /// `fuel_ledger` is the kernel-owned, shared per-principal CPU ledger; the
-    /// kernel passes the *same* handle to every capsule's engine so per-principal
-    /// CPU is aggregated cross-capsule. Tests that don't care about aggregation
-    /// pass `FuelLedger::default()` for an isolated ledger.
-    ///
-    /// `fuel_rate` is the matching kernel-owned, shared per-principal CPU-rate
-    /// limiter (the deny side); pass `FuelRateLimiter::default()` for an
-    /// isolated limiter in tests.
-    ///
-    /// `runtime_limits` is the host-derived (operator-overridable) concurrency
-    /// ceiling pair the daemon resolves once and hands to every engine; pass
-    /// [`CapsuleRuntimeLimits::default`](limits::CapsuleRuntimeLimits::default)
-    /// for all-host-derived sizing in tests.
-    ///
-    /// `http_limits` is the resolved `astrid:http` host ceilings (timeouts,
-    /// redirect/stream caps, buffered-body limit) from the `[http]` config
-    /// section — a global value, the same for every engine; pass
-    /// [`HttpLimits::default`](limits::HttpLimits::default) for the host's
-    /// historical constants in tests.
-    pub fn new(
-        manifest: CapsuleManifest,
-        capsule_dir: PathBuf,
-        fuel_ledger: crate::FuelLedger,
-        fuel_rate: crate::FuelRateLimiter,
-        memory_ledger: crate::MemoryLedger,
-        runtime_limits: limits::CapsuleRuntimeLimits,
-        http_limits: limits::HttpLimits,
-    ) -> Self {
-        Self {
-            manifest,
-            _capsule_dir: capsule_dir,
-            wasmtime_engine: None,
-            compiled_cache: CompiledWasmCache::default(),
-            compiled_artifact: None,
-            pool: None,
-            inbound_rx: None,
-            run_handles: Vec::new(),
-            activation_tx: None,
-            defer_activation: false,
-            route_admission_gate: astrid_events::RouteAdmissionGate::default(),
-            ready_rxs: Vec::new(),
-            cancel_token: None,
-            principal_cancel_tokens: None,
-            principal_invocations: None,
-            profile_cache: None,
-            owner_principal: None,
-            system_runtime: false,
-            runtime_id: None,
-            overlay_registry: None,
-            fuel_ledger,
-            memory_ledger,
-            fuel_rate,
-            user_cpu: None,
-            group_config: None,
-            runtime_limits,
-            http_limits,
-            workspace_cow: None,
-            #[cfg(not(target_family = "wasm"))]
-            workspace_branches: None,
-            process_tracker: None,
-            persistent_processes: None,
-        }
-    }
-
     /// Use a kernel-shared cache for verified immutable compiled artifacts.
     #[must_use]
     pub fn with_compiled_cache(mut self, cache: CompiledWasmCache) -> Self {
