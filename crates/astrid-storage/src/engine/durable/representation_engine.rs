@@ -11,6 +11,8 @@ use super::{
     visit_indexed_objects,
 };
 
+mod maintenance;
+
 const ACTIVATION_READ_TARGET_BYTES: u64 = 8 * 1024 * 1024;
 
 impl<P, I, C> DurableEngine<P, I, C>

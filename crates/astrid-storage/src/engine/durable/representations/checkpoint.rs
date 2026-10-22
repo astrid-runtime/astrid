@@ -133,7 +133,6 @@ impl RepresentationStore {
         })
     }
 
-    #[cfg(test)]
     pub(in crate::engine::durable) fn checkpoint_volume(
         &mut self,
         volume: &std::sync::Arc<dyn crate::volume::AstridVolume>,
