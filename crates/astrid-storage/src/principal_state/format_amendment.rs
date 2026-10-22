@@ -449,6 +449,36 @@ pub(super) fn prepare_format_specification(
     }
 }
 
+/// Hosted volumes carry their format identity in the authoritative direct
+/// profile rather than a directory's store.meta. Only that recovered identity
+/// can authorize an amendment; finding an unrelated old Evidence object is
+/// insufficient. A missing current bootstrap under a current profile remains
+/// corruption, not permission to recreate it.
+pub(super) fn prepare_volume_format_specification(engine: &RuntimeEngine) -> StorageResult<()> {
+    let current = format_spec_record()?;
+    let current_id = engine.identify(&current);
+    let active = engine
+        .direct_representation_specification()
+        .map_err(|error| {
+            StorageError::Connection(format!("read volume format profile: {error}"))
+        })?;
+    let destination = match active {
+        Some(prior) if DIRECT_CATALOGUE_PREDECESSORS.contains(&prior) => {
+            DestinationFormat::PriorV1 {
+                format_spec: prior,
+                catalog_spec_was_declared: true,
+            }
+        },
+        Some(id) if id != current_id => {
+            return Err(StorageError::Connection(
+                "volume direct profile selects an unsupported format".to_owned(),
+            ));
+        },
+        _ => DestinationFormat::Current,
+    };
+    prepare_format_specification(engine, destination, &current, current_id)
+}
+
 pub(super) fn prepare_catalog_specification(
     engine: &RuntimeEngine,
     destination_format: DestinationFormat,

@@ -21,6 +21,19 @@ where
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
+    /// Return the specification named by the recovered authoritative profile.
+    /// Runtime composition uses this identity to select an explicit format
+    /// amendment before admitting new bootstrap objects.
+    pub(crate) fn direct_representation_specification(
+        &self,
+    ) -> Result<Option<ObjectId>, DurableError> {
+        self.lock_usable()?
+            .representations
+            .as_ref()
+            .map(RepresentationStore::frozen_specification)
+            .transpose()
+    }
+
     /// Ensure the authoritative direct-representation catalogue is active.
     ///
     /// Activation describes the already-verified generation-zero object arena
