@@ -107,7 +107,7 @@ impl HostedFileVolume {
             flush_state: super::FlushState::Required,
             publication_pending: false,
             #[cfg(windows)]
-            restore_pending: false,
+            restore: super::RestoreState::NotRequired,
             regions: recovery.regions,
         };
         if footer_pending {
