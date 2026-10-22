@@ -453,7 +453,9 @@ pub(super) fn prepare_format_specification(
 /// profile rather than a directory's store.meta. Only that recovered identity
 /// can authorize an amendment; finding an unrelated old Evidence object is
 /// insufficient. A missing current bootstrap under a current profile remains
-/// corruption, not permission to recreate it.
+/// corruption, not permission to recreate it. Compatible catalogue admission
+/// intentionally retains the original direct profile identity; only record-local
+/// value decoding, not a new volume-wide open gate, fences older readers.
 pub(super) fn prepare_volume_format_specification(engine: &RuntimeEngine) -> StorageResult<()> {
     let current = format_spec_record()?;
     let current_id = engine.identify(&current);
