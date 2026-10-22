@@ -518,15 +518,22 @@ impl WorkspaceBranchService {
     /// survive this cleanup; a completed promotion remains retryable and
     /// idempotent while only disposable live branches are discarded.
     pub async fn cleanup_orphaned(&self) -> Result<(), String> {
+        // This pass only classifies UID-bound branches for diagnostics; it
+        // never promotes or removes them. Read one validated snapshot for the
+        // inventory instead of decoding the full graph once per branch.
+        // Bind and finish retain their current-ownership checks.
+        let ownership =
+            match self.ownership.as_ref() {
+                Some(store) => Some(store.load().await.map_err(|error| {
+                    format!("load ownership graph for branch cleanup: {error}")
+                })?),
+                None => None,
+            };
         let mut owners = std::collections::BTreeSet::new();
         for (_, uid) in self.directory.bindings() {
             owners.insert(astrid_storage::StateOwner::Principal(uid));
         }
-        if let Some(ownership) = self.ownership.as_ref() {
-            let snapshot = ownership
-                .load()
-                .await
-                .map_err(|error| format!("load ownership graph for branch cleanup: {error}"))?;
+        if let Some(snapshot) = &ownership {
             for assignment in snapshot.principal_owners() {
                 owners.insert(astrid_storage::StateOwner::Fleet(assignment.fleet_uid));
             }
@@ -548,7 +555,13 @@ impl WorkspaceBranchService {
                         .map_err(|error| format!("roll back unbound workspace branch: {error}"))?;
                     continue;
                 };
-                let owner_now = self.owner_for(binding_uid).await?;
+                let owner_now = ownership
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.principal_owner(binding_uid))
+                    .map_or(
+                        astrid_storage::StateOwner::Principal(binding_uid),
+                        |assignment| astrid_storage::StateOwner::Fleet(assignment.fleet_uid),
+                    );
                 if owner_now != owner
                     || branch.target_prefix().map(ToString::to_string)
                         != Some(Self::ATTACHMENT_PREFIX.to_owned())
@@ -891,3 +904,6 @@ impl CapsuleContext {
         self
     }
 }
+
+#[cfg(test)]
+mod workspace_cleanup_tests;

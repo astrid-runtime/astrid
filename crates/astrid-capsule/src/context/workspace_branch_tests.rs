@@ -4,16 +4,16 @@ use astrid_storage::{KvQuotaResolver, StateOwner};
 use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
-struct Fixture {
+pub(super) struct Fixture {
     _home: tempfile::TempDir,
-    store: astrid_storage::RuntimePrincipalStore,
-    directory: astrid_storage::PrincipalDirectory,
+    pub(super) store: astrid_storage::RuntimePrincipalStore,
+    pub(super) directory: astrid_storage::PrincipalDirectory,
     service: Arc<WorkspaceBranchService>,
     alice: PrincipalId,
     bob: PrincipalId,
 }
 
-async fn fixture() -> Fixture {
+pub(super) async fn fixture() -> Fixture {
     let root = tempfile::tempdir().expect("workspace service tempdir");
     let home = astrid_core::dirs::AstridHome::from_path(root.path());
     home.ensure().expect("workspace service home");
@@ -62,7 +62,7 @@ async fn fixture() -> Fixture {
     }
 }
 
-fn fleet_identity(id: u128, creator: astrid_core::UserUid) -> FleetIdentity {
+pub(super) fn fleet_identity(id: u128, creator: astrid_core::UserUid) -> FleetIdentity {
     FleetIdentity::from_genesis(FleetGenesis::from_parts(
         Uuid::from_u128(id),
         Utc.timestamp_opt(1_700_000_001, 0)
@@ -73,7 +73,7 @@ fn fleet_identity(id: u128, creator: astrid_core::UserUid) -> FleetIdentity {
     .expect("fleet identity")
 }
 
-fn user_identity(id: u128, key: u8) -> UserIdentity {
+pub(super) fn user_identity(id: u128, key: u8) -> UserIdentity {
     UserIdentity::from_genesis(UserGenesis::from_parts(
         Uuid::from_u128(id),
         Utc.timestamp_opt(1_700_000_000, 0)
