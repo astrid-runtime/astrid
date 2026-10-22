@@ -12,12 +12,48 @@ use std::num::NonZeroU64;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ResourceConfig {
+    /// Optional total decoded-object cache budget for this daemon, in bytes.
+    /// Omitted retains the storage engine default (one `GiB`); zero is invalid.
+    /// This limits reconstructible cache residency, not durable history.
+    pub decoded_object_cache_bytes: Option<DecodedObjectCacheBytes>,
     /// Default fuel/second rate for users without an explicit override.
     /// Omitted means no new aggregate limit; existing principal limits remain.
     pub default_user_cpu_fuel_per_sec: Option<NonZeroU64>,
     /// Per-user aggregate fuel/second rates, indexed by immutable user UID.
     /// Zero is invalid, never an unlimited sentinel.
     pub user_cpu_fuel_per_sec: BTreeMap<UserUid, NonZeroU64>,
+}
+
+/// Positive finite byte target for the daemon's shared decoded storage cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
+pub struct DecodedObjectCacheBytes(NonZeroU64);
+
+impl DecodedObjectCacheBytes {
+    /// Validated finite byte budget.
+    #[must_use]
+    pub const fn get(self) -> NonZeroU64 {
+        self.0
+    }
+}
+
+impl TryFrom<u64> for DecodedObjectCacheBytes {
+    type Error = &'static str;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        if value == u64::MAX {
+            return Err("decoded object cache budget must be finite");
+        }
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or("decoded object cache budget must be positive")
+    }
+}
+
+impl From<DecodedObjectCacheBytes> for u64 {
+    fn from(value: DecodedObjectCacheBytes) -> Self {
+        value.0.get()
+    }
 }
 
 impl ResourceConfig {
@@ -40,6 +76,32 @@ impl ResourceConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoded_cache_budget_is_positive_finite_and_operator_only() {
+        assert!(
+            ResourceConfig::default()
+                .decoded_object_cache_bytes
+                .is_none()
+        );
+        assert!(toml::from_str::<ResourceConfig>("decoded_object_cache_bytes = 0").is_err());
+        assert!(DecodedObjectCacheBytes::try_from(u64::MAX).is_err());
+        let config: ResourceConfig =
+            toml::from_str("decoded_object_cache_bytes = 8388608").unwrap();
+        assert_eq!(
+            config.decoded_object_cache_bytes.unwrap().get().get(),
+            8_388_608
+        );
+        for baseline in ["", "[resources]\ndecoded_object_cache_bytes = 8388608"] {
+            let baseline: toml::Value = toml::from_str(baseline).unwrap();
+            let workspace: toml::Value =
+                toml::from_str("[resources]\ndecoded_object_cache_bytes = 99999999").unwrap();
+            let mut merged = baseline.clone();
+            crate::merge::deep_merge(&mut merged, &workspace);
+            crate::merge::enforce_restrictions(&mut merged, &baseline, &workspace);
+            assert_eq!(merged.get("resources"), baseline.get("resources"));
+        }
+    }
 
     #[test]
     fn personal_default_is_unchanged_and_zero_is_not_unlimited() {

@@ -1406,6 +1406,15 @@ impl Kernel {
             &workspace_root,
             &workspace_layout,
         )?;
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(store) = principal_store.as_ref() {
+            user_resources::configure_object_cache(
+                store,
+                &home,
+                &workspace_root,
+                &workspace_layout,
+            )?;
+        }
         let kernel = Arc::new(Self {
             session_id: session_id.clone(),
             event_bus,
