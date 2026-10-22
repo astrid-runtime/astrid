@@ -25,13 +25,43 @@ async fn concurrent_worker_panics_block_cleanup_until_settled_retries() {
     let stale_root = uuid_mount_root(&stale_mount);
 
     let (mut workers, gates) = spawn_panicking_workers(&kernel, &stale_projection);
-    fail_all_workers(&gates).await;
-    await_join_failure_publication(&kernel, &stale_projection).await;
+    let (held_worker, failed_workers) = gates.split_last().expect("projection workers");
+    let held_entry = Arc::clone(held_worker);
+    tokio::task::spawn_blocking(move || held_entry.wait_entered(1))
+        .await
+        .expect("held worker entry");
+    fail_workers(failed_workers).await;
+    await_join_failure_publication(&kernel, &stale_projection, failed_workers.len()).await;
     stale_mount.close_async().await;
     assert_unsettled_blocker(&kernel, &broker, &caller, &stale_projection, &stale_root).await;
+    held_worker.arm_panic_on_release();
+    held_worker.release_workers();
+    await_join_failure_publication(&kernel, &stale_projection, gates.len()).await;
     while let Some(worker) = workers.join_next().await {
         let _ = worker.expect("worker task joined");
     }
+
+    // The held worker's later JoinFailed escalates the earlier TimedOut
+    // observation. That new failure must consume one exact retry before any
+    // replacement is admitted; otherwise a caller could skip its drain fence.
+    let Err(denied) = PROCESS_MOUNT_TEST_ID
+        .scope(650, broker.mount(&caller))
+        .await
+    else {
+        panic!("escalated failure must block its first retry");
+    };
+    assert!(denied.contains("administrative cleanup"), "{denied}");
+    assert!(
+        stale_root.exists(),
+        "failed exact retry must retain the root"
+    );
+    assert!(
+        stale_projection
+            .component_mount_ids
+            .iter()
+            .all(|mount_id| kernel.storage_mounts.contains_key(mount_id)),
+        "failed exact retry must retain every lease"
+    );
 
     let mounts = retry_concurrently(&broker, &caller).await;
     assert_settled_replacement(&kernel, &broker, &stale_projection, &stale_root, &mounts);
@@ -49,15 +79,9 @@ fn spawn_panicking_workers(
     WorkerJobs,
     Vec<Arc<crate::storage_mount::BlockingWorkerTestGate>>,
 ) {
-    let create = |path: &'static str| {
-        astrid_core::storage_filesystem::StorageFilesystemOperationV1::Create {
-            path: path.to_owned(),
-            kind: astrid_core::storage_filesystem::StorageFilesystemEntryKindV1::File,
-        }
-    };
     let mut workers = WorkerJobs::new();
     let mut gates = Vec::new();
-    for (index, mount_id) in projection.component_mount_ids.iter().enumerate() {
+    for mount_id in &projection.component_mount_ids {
         let state = Arc::clone(
             kernel
                 .storage_mounts
@@ -66,15 +90,14 @@ fn spawn_panicking_workers(
                 .value(),
         );
         state.set_drain_timeouts_for_test(std::time::Duration::from_millis(80));
-        let gate = state
-            .blocking_worker_gate_for_test()
-            .expect("test worker gate");
+        let gate = Arc::new(crate::storage_mount::BlockingWorkerTestGate::new());
+        *state.blocking_worker_test_gate.lock().unwrap() = Some(Arc::clone(&gate));
         let kernel = Arc::clone(kernel);
-        let operation = create(match index {
-            0 => "panic-branch.bin",
-            1 => "panic-owner.bin",
-            _ => "panic-shared.bin",
-        });
+        // Stat enters the same blocking-worker gate without taking the
+        // global namespace-mutation lock before the other workers can enter.
+        let operation = astrid_core::storage_filesystem::StorageFilesystemOperationV1::Stat {
+            path: String::new(),
+        };
         workers.spawn(async move {
             crate::storage_mount::execute_operation_for_test(kernel, state, operation).await
         });
@@ -83,7 +106,7 @@ fn spawn_panicking_workers(
     (workers, gates)
 }
 
-async fn fail_all_workers(gates: &[Arc<crate::storage_mount::BlockingWorkerTestGate>]) {
+async fn fail_workers(gates: &[Arc<crate::storage_mount::BlockingWorkerTestGate>]) {
     let gates_for_entry = gates.to_vec();
     tokio::task::spawn_blocking(move || {
         for gate in &gates_for_entry {
@@ -109,14 +132,15 @@ async fn fail_all_workers(gates: &[Arc<crate::storage_mount::BlockingWorkerTestG
 async fn await_join_failure_publication(
     kernel: &Arc<crate::Kernel>,
     projection: &CachedProcessProjection,
+    count: usize,
 ) {
-    for mount_id in &projection.component_mount_ids {
+    for mount_id in projection.component_mount_ids.iter().take(count) {
         let state = kernel
             .storage_mounts
             .get(mount_id)
             .map(|entry| entry.value().clone())
             .expect("retained component");
-        state.wait_join_failure_publication_for_test().await;
+        state.wait_join_failure_classification_for_test().await;
     }
 }
 
@@ -219,6 +243,7 @@ async fn successful_lease_cleanup_with_failed_root_retains_retry_blocker() {
         "zero lease maps must remain after successful exact-lease cleanup"
     );
     assert!(stale_root.exists());
+    fail_next_root_removal_for_test(stale_root.clone());
     let Err(denied) =
         tokio::time::timeout(std::time::Duration::from_secs(2), broker.mount(&caller))
             .await

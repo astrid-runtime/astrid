@@ -29,6 +29,11 @@ on:
       - 'scripts/fixtures/windows-release-extension.toml'
       - 'scripts/check_glibc.py'
       - 'scripts/test_check_glibc.py'
+      - 'scripts/test_gnu_build_packages.py'
+      - 'scripts/test_runtime_cli_capture.py'
+      - 'scripts/test_windows_cargo_diagnostics.py'
+      - '.github/workflows/windows-filesystem-native.yml'
+      - 'scripts/e2e/runtime-crash-smoke.sh'
       - 'scripts/check_dco.py'
       - 'scripts/test_check_dco.py'
       - 'scripts/changelog.py'
@@ -86,6 +91,11 @@ on:
       - 'scripts/fixtures/windows-release-extension.toml'
       - 'scripts/check_glibc.py'
       - 'scripts/test_check_glibc.py'
+      - 'scripts/test_gnu_build_packages.py'
+      - 'scripts/test_runtime_cli_capture.py'
+      - 'scripts/test_windows_cargo_diagnostics.py'
+      - '.github/workflows/windows-filesystem-native.yml'
+      - 'scripts/e2e/runtime-crash-smoke.sh'
       - 'scripts/check_dco.py'
       - 'scripts/test_check_dco.py'
       - 'scripts/changelog.py'
@@ -183,8 +193,7 @@ jobs:
                 packages+=(gcc-aarch64-linux-gnu libc6-dev-arm64-cross)
                 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
               fi
-              apt-get update
-              apt-get install -y --no-install-recommends "${packages[@]}"
+              bash scripts/ci/install_gnu_build_packages.sh "${packages[@]}"
               git config --global --add safe.directory /workspace
               [[ "$(git rev-parse --short=12 HEAD)" == "$SOURCE_SHA" ]]
               cargo build \
@@ -374,6 +383,12 @@ jobs:
 
       - name: Test release manifest contract
         run: scripts/ci/test-release-contracts.sh
+
+      - name: Test CI capture contracts
+        run: |
+          command -v pwsh
+          python3 scripts/test_runtime_cli_capture.py
+          python3 scripts/test_windows_cargo_diagnostics.py
 
   wasm-portability:
     name: Wasm portability

@@ -29,26 +29,45 @@ pub(super) enum DrainSettlement {
 #[derive(Default)]
 pub(super) struct DrainAttemptState {
     retry_armed: Option<DrainFailureKind>,
+    #[cfg(test)]
+    before_wait: Option<ObservationGate>,
+    #[cfg(test)]
+    after_sample: Option<ObservationGate>,
+}
+
+#[cfg(test)]
+struct ObservationGate {
+    entered: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl StorageMountLeaseState {
     pub(super) async fn await_listener_settlement(&self) -> DrainSettlement {
         let mut attempt = self.drain_attempts.lock().await;
-        if let Some(failure) = self.sample_failure() {
-            if attempt.retry_armed.is_none_or(|armed| armed < failure) {
-                attempt.retry_armed = Some(failure);
-                return DrainSettlement::Failure(failure);
-            }
-            if self.listener_is_closed() {
-                return DrainSettlement::Closed;
-            }
-        }
-        if self.listener_is_closed() {
-            return DrainSettlement::Closed;
-        }
-
+        // Subscribe before sampling: a publication between sampling and waiting
+        // must remain unseen by the receiver rather than become its baseline.
         let mut failure_changed = self.drain_failure_tx.subscribe();
         let mut closed = self.listener_closed_tx.subscribe();
+        if let Some(failure) = self.sample_failure()
+            && attempt.retry_armed.is_none_or(|armed| armed < failure)
+        {
+            attempt.retry_armed = Some(failure);
+            return DrainSettlement::Failure(failure);
+        }
+        #[cfg(test)]
+        if let Some(gate) = attempt.after_sample.take() {
+            let _ = gate.entered.send(());
+            let _ = gate.resume.await;
+        }
+        if self.listener_is_closed() {
+            return self.closed_settlement(&mut attempt);
+        }
+
+        #[cfg(test)]
+        if let Some(gate) = attempt.before_wait.take() {
+            let _ = gate.entered.send(());
+            let _ = gate.resume.await;
+        }
         let wait = async {
             loop {
                 tokio::select! {
@@ -56,34 +75,46 @@ impl StorageMountLeaseState {
                     changed = failure_changed.changed() => {
                         if changed.is_err() {
                             return if self.listener_is_closed() {
-                                Observed::Closed
+                                self.closed_settlement(&mut attempt)
                             } else {
-                                Observed::Failure(DrainFailureKind::TimedOut)
+                                DrainSettlement::Failure(DrainFailureKind::TimedOut)
                             };
                         }
                         if let Some(failure) = self.sample_failure() {
                             remember_retry_failure(&mut attempt, failure);
-                            return Observed::Failure(failure);
+                            return DrainSettlement::Failure(failure);
                         }
                     },
                     _changed = closed.changed() => {
                         if self.listener_is_closed() {
-                            return Observed::Closed;
+                            return self.closed_settlement(&mut attempt);
                         }
                     },
                 }
             }
         };
-        match tokio::time::timeout(self.drain_timeouts().listener_shutdown, wait).await {
-            Ok(Observed::Closed) => DrainSettlement::Closed,
-            Ok(Observed::Failure(failure)) => DrainSettlement::Failure(failure),
-            Err(_) => {
-                self.record_drain_failure(BlockingJobDrain::TimedOut);
-                let failure = self.sample_failure().unwrap_or(DrainFailureKind::TimedOut);
-                remember_retry_failure(&mut attempt, failure);
-                DrainSettlement::Failure(failure)
-            },
+        if let Ok(settlement) =
+            tokio::time::timeout(self.drain_timeouts().listener_shutdown, wait).await
+        {
+            settlement
+        } else {
+            self.record_drain_failure(BlockingJobDrain::TimedOut);
+            let failure = self.sample_failure().unwrap_or(DrainFailureKind::TimedOut);
+            remember_retry_failure(&mut attempt, failure);
+            DrainSettlement::Failure(failure)
         }
+    }
+
+    // A true closure publication follows worker settlement, so sample its
+    // preceding failure only after observing closure, before authorizing cleanup.
+    fn closed_settlement(&self, attempt: &mut DrainAttemptState) -> DrainSettlement {
+        if let Some(failure) = self.sample_failure()
+            && attempt.retry_armed.is_none_or(|armed| armed < failure)
+        {
+            remember_retry_failure(attempt, failure);
+            return DrainSettlement::Failure(failure);
+        }
+        DrainSettlement::Closed
     }
 
     fn sample_failure(&self) -> Option<DrainFailureKind> {
@@ -124,7 +155,5 @@ fn remember_retry_failure(attempt: &mut DrainAttemptState, failure: DrainFailure
     }
 }
 
-enum Observed {
-    Failure(DrainFailureKind),
-    Closed,
-}
+#[cfg(test)]
+mod tests;

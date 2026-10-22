@@ -100,13 +100,22 @@ async fn assert_replacement_after_unhealthy_hit(
     stale: CachedMount,
     test_id: u64,
 ) {
-    let stale_root = stale.mount.workspace_root.clone();
-    let stale_mount_root = uuid_mount_root(&stale.mount);
-    let stale_projection = stale.projection;
     let replacement_mount = super::PROCESS_MOUNT_TEST_ID
         .scope(test_id, broker.mount(caller))
         .await
         .expect("unhealthy hit must clean and admit a replacement");
+    assert_replacement_mount(kernel, broker, stale, replacement_mount).await;
+}
+
+async fn assert_replacement_mount(
+    kernel: &Arc<crate::Kernel>,
+    broker: &KernelProcessStorageMountBroker,
+    stale: CachedMount,
+    replacement_mount: astrid_capsule::context::ProcessStorageMount,
+) {
+    let stale_root = stale.mount.workspace_root.clone();
+    let stale_mount_root = uuid_mount_root(&stale.mount);
+    let stale_projection = stale.projection;
     assert_ne!(
         replacement_mount.workspace_root, stale_root,
         "a replacement must not return the stale provider root"
@@ -322,7 +331,7 @@ async fn revocation_cannot_interleave_validation_and_cached_reference() {
         .map(|entry| Arc::clone(entry.value()))
         .expect("owner component");
 
-    let gate = arm_retain_validation_gate();
+    let gate = arm_retain_validation_gate(&kernel);
     let mount_broker = broker.clone();
     let mount_caller = caller.clone();
     let mount_task = tokio::spawn(async move {
@@ -389,7 +398,7 @@ async fn expiry_cannot_interleave_validation_and_cached_reference() {
     let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
     let stale = successful_fleet_mount(&kernel, &caller, &broker, 611).await;
 
-    let gate = arm_retain_validation_gate();
+    let gate = arm_retain_validation_gate(&kernel);
     let mount_broker = broker.clone();
     let mount_caller = caller.clone();
     let mount_task = tokio::spawn(async move {
@@ -412,8 +421,7 @@ async fn expiry_cannot_interleave_validation_and_cached_reference() {
         .await
         .expect("mount admission task")
         .expect("validated expiry must admit a replacement after exact cleanup");
-    assert_replacement_after_unhealthy_hit(&kernel, &caller, &broker, stale, 613).await;
-    replacement_mount.close_async().await;
+    assert_replacement_mount(&kernel, &broker, stale, replacement_mount).await;
     assert!(kernel.storage_mounts.is_empty());
     assert!(broker.projections.lock().await.is_empty());
 }
@@ -766,8 +774,8 @@ async fn revocation_after_validation_before_reference_admits_replacement() {
         .map(|entry| Arc::clone(entry.value()))
         .expect("owner component");
 
-    let validation_gate = arm_retain_validation_gate();
-    let reference_gate = arm_retain_reference_gate();
+    let validation_gate = arm_retain_validation_gate(&kernel);
+    let reference_gate = arm_retain_reference_gate(&kernel);
     let mount_broker = broker.clone();
     let mount_caller = caller.clone();
     let mount_task = tokio::spawn(async move {
@@ -807,8 +815,7 @@ async fn revocation_after_validation_before_reference_admits_replacement() {
         .await
         .expect("post-validation revocation task")
         .expect("post-validation revocation");
-    assert_replacement_after_unhealthy_hit(&kernel, &caller, &broker, stale, 623).await;
-    replacement_mount.close_async().await;
+    assert_replacement_mount(&kernel, &broker, stale, replacement_mount).await;
     assert!(kernel.storage_mounts.is_empty());
     assert!(broker.projections.lock().await.is_empty());
 }
@@ -823,8 +830,8 @@ async fn first_mount_revocation_between_validation_and_reference_admits_replacem
     let (_temporary, kernel) = fleet_shared_kernel().await;
     let caller = PrincipalId::default();
     let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
-    let validation_gate = arm_retain_validation_gate();
-    let reference_gate = arm_retain_reference_gate();
+    let validation_gate = arm_retain_validation_gate(&kernel);
+    let reference_gate = arm_retain_reference_gate(&kernel);
     let mount_broker = broker.clone();
     let mount_caller = caller.clone();
     let mount_task = tokio::spawn(async move {
@@ -919,8 +926,8 @@ async fn first_mount_expiry_between_validation_and_reference_admits_replacement(
     let (_temporary, kernel) = fleet_shared_kernel().await;
     let caller = PrincipalId::default();
     let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
-    let validation_gate = arm_retain_validation_gate();
-    let reference_gate = arm_retain_reference_gate();
+    let validation_gate = arm_retain_validation_gate(&kernel);
+    let reference_gate = arm_retain_reference_gate(&kernel);
     let mount_broker = broker.clone();
     let mount_caller = caller.clone();
     let mount_task = tokio::spawn(async move {

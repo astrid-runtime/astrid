@@ -17,3 +17,4 @@ python3 scripts/test_channel_metadata.py
 python3 scripts/test_channel_publication.py
 python3 scripts/test_nightly_version.py
 bash scripts/test_channel_workflow_contract.sh
+python3 scripts/test_gnu_build_packages.py
