@@ -473,6 +473,7 @@ pub struct Kernel {
     pub(crate) admin_write_lock: Mutex<()>,
     /// Admission fence for work that must finish before durable stores close.
     runtime_work: runtime_work::RuntimeWork,
+    dispatcher_control: std::sync::OnceLock<astrid_capsule::dispatcher::DispatcherControl>,
     /// Installs hold an exclusive guard until environment commit or rollback.
     /// Installs and conditional defaults acquire without waiting, so neither
     /// snapshots staged values as committed configuration nor deadlocks activation.
@@ -1495,6 +1496,7 @@ impl Kernel {
             astrid_home: home,
             admin_write_lock: Mutex::new(()),
             runtime_work: runtime_work::RuntimeWork::default(),
+            dispatcher_control: std::sync::OnceLock::new(),
             env_install_fence: Arc::new(tokio::sync::RwLock::new(())),
             env_refresh_pending: DashMap::new(),
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -1559,6 +1561,7 @@ impl Kernel {
         )
         .with_identity_store(Arc::clone(&kernel.identity_store))
         .with_access_resolver(access_resolver);
+        assert!(kernel.dispatcher_control.set(dispatcher.control()).is_ok());
         drop(astrid_runtime::spawn(dispatcher.run()));
 
         debug_assert_eq!(
@@ -3713,6 +3716,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         astrid_home: home,
         admin_write_lock: Mutex::new(()),
         runtime_work: runtime_work::RuntimeWork::default(),
+        dispatcher_control: std::sync::OnceLock::new(),
         env_install_fence: Arc::new(tokio::sync::RwLock::new(())),
         env_refresh_pending: DashMap::new(),
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]

@@ -43,6 +43,9 @@ use astrid_events::{AstridEvent, EventBus, OrderedDeliveryReceiver};
 
 mod admission;
 mod consumer;
+mod queues;
+use queues::ConsumerQueues;
+pub use queues::DispatcherControl;
 mod failure;
 use consumer::run_consumer;
 mod locks;
@@ -102,8 +105,7 @@ pub(crate) fn set_idle_consumer_grace_for_test(ms: u64) {
 /// closes the race where an idle-evicting consumer exits between the
 /// dispatcher's `entry().or_insert_with(...)` and the subsequent
 /// `try_send`.
-type CapsuleQueues =
-    Arc<parking_lot::Mutex<HashMap<(RuntimeId, PrincipalKey), mpsc::Sender<InterceptorWork>>>>;
+type CapsuleQueues = Arc<ConsumerQueues>;
 
 /// Work item sent to a per-capsule ordered queue.
 struct InterceptorWork {
@@ -129,6 +131,7 @@ pub struct EventDispatcher {
     /// Pre-created receiver so the subscription is counted before `run()` is spawned.
     receiver: OrderedDeliveryReceiver,
     admitter: Arc<admission::DeferredAdmitter>,
+    queues: CapsuleQueues,
     /// Identity-store presence enables the legacy single-tenant admission
     /// gate. Durable identity and home storage remain kernel-owned; dispatch
     /// never creates or inspects native home paths.
@@ -168,10 +171,17 @@ impl EventDispatcher {
             event_bus,
             receiver,
             admitter,
+            queues: Arc::default(),
             identity_store: None,
             chain_locks: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             access_resolver: None,
         }
+    }
+
+    /// Obtain a control handle before spawning the dispatcher.
+    #[must_use]
+    pub fn control(&self) -> DispatcherControl {
+        DispatcherControl::new(Arc::clone(&self.queues))
     }
 
     /// Set the identity store used to enable the legacy default-principal
@@ -213,7 +223,7 @@ impl EventDispatcher {
         // means the dispatcher's worst case at N distinct principals
         // is N independent FIFO consumers, not a single class-keyed
         // queue collapsing the load (#813 Layer 3).
-        let capsule_queues: CapsuleQueues = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let capsule_queues = Arc::clone(&self.queues);
         assert!(
             self.admitter
                 .active
@@ -233,7 +243,10 @@ impl EventDispatcher {
         let mut provisioner = provision::PrincipalProvisioner::new(self.identity_store.is_some());
         debug!("Event dispatcher started");
 
-        while let Some(delivery) = self.receiver.recv().await {
+        while let Some(delivery) = tokio::select! {
+            () = capsule_queues.stopping().wait_until_retired() => None,
+            next = self.receiver.recv() => next,
+        } {
             // Check for broadcast channel overflow (lost messages).
             let lagged = self.receiver.drain_lagged();
             if lagged > 0 && last_lag_notification.elapsed() >= std::time::Duration::from_secs(10) {
@@ -537,6 +550,11 @@ fn get_or_spawn_consumer(
     key: (RuntimeId, PrincipalKey),
 ) -> (wait_graph::ConsumerKey, mpsc::Sender<InterceptorWork>) {
     let mut guard = queues.lock();
+    if !queues.stopping().is_published() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        return (key, sender);
+    }
     // Never hand back a CLOSED sender. The mapped entry can be stale: an
     // idle-evicting consumer that exited (or, defensively, a consumer task that
     // ended abnormally) leaves its `Sender` in the map with the receiver gone.
@@ -592,8 +610,9 @@ fn get_or_spawn_consumer(
     let capsule_arc = Arc::clone(capsule);
     let queues_arc = Arc::clone(queues);
     let cleanup_key = effective_key.clone();
+    let identity = tx.downgrade();
     astrid_runtime::spawn(async move {
-        run_consumer(rx, capsule_arc, queues_arc, cleanup_key).await;
+        run_consumer(rx, capsule_arc, queues_arc, cleanup_key, identity).await;
     });
     (effective_key, tx)
 }
@@ -614,6 +633,9 @@ fn dispatch_single(
     match sender.try_send(work) {
         Ok(()) => {},
         Err(mpsc::error::TrySendError::Closed(work)) => {
+            if !queues.stopping().is_published() {
+                return;
+            }
             // The consumer idle-evicted in the window between
             // `get_or_spawn_consumer` cloning its sender and this send. The
             // `sender_strong_count` guard in `run_consumer` narrows that TOCTOU
@@ -644,6 +666,9 @@ fn dispatch_single(
                 // dropped" invariant. Flag it as a security/correctness event
                 // rather than folding it into the benign backpressure log.
                 Err(e @ mpsc::error::TrySendError::Closed(_)) => {
+                    if !queues.stopping().is_published() {
+                        return;
+                    }
                     warn!(
                         capsule_id = %capsule.id(),
                         topic = %topic,

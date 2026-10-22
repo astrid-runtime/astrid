@@ -99,13 +99,18 @@ impl Kernel {
             let mut reg = self.capsules.write().await;
             reg.drain()
         };
+        for capsule in &capsules {
+            capsule.retire();
+            capsule.request_cancel();
+        }
+        if let Some(dispatcher) = self.dispatcher_control.get() {
+            dispatcher.stop();
+        }
         let mut drain_set = tokio::task::JoinSet::new();
         for mut arc in capsules {
             drain_set.spawn(async move {
                 let id = arc.id().clone();
 
-                arc.retire();
-                arc.request_cancel();
                 let mut retries = 0_u32;
                 loop {
                     if let Some(capsule) = Arc::get_mut(&mut arc) {
