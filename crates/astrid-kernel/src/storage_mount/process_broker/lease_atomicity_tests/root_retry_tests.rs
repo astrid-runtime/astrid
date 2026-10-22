@@ -118,7 +118,7 @@ async fn await_join_failure_publication(
             .get(mount_id)
             .map(|entry| entry.value().clone())
             .expect("retained component");
-        state.wait_join_failure_publication_for_test().await;
+        state.wait_join_failure_classification_for_test().await;
     }
 }
 
