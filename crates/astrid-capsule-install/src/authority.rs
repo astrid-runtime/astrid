@@ -16,12 +16,18 @@ use astrid_capsule::capsule::CapsuleId;
 use astrid_capsule::manifest::{CapabilitiesDef, CapabilityExpansion, CapsuleManifest};
 use astrid_core::PrincipalId;
 use astrid_core::dirs::{AstridHome, WorkspaceLayout};
+use astrid_storage::RuntimePrincipalStore;
 use serde::{Deserialize, Serialize};
 
 use crate::paths::resolve_target_dir_for_in_workspace;
-
+mod archive_bytes;
 mod leftover;
+#[cfg(windows)]
+mod runtime_identity;
 mod status;
+pub use archive_bytes::{
+    inspect_archive_bytes_for_principal_in_workspace, read_archive_manifest_bytes,
+};
 pub(crate) use leftover::{
     parse_legacy_authority_receipt, quarantine_legacy_authority_receipt,
     rebind_relocated_legacy_authority_receipt, retire_unmatched_authority_receipt_file,
@@ -100,11 +106,7 @@ pub struct InstallInspection {
 /// performed by the artifact reader and manifest validation by discovery.
 pub fn read_archive_manifest(archive_path: &Path) -> anyhow::Result<CapsuleManifest> {
     let manifest_text = artifact::read_archive_text(archive_path, "Capsule.toml")?;
-    let staged = tempfile::tempdir().context("failed to stage capsule manifest")?;
-    let manifest_path = staged.path().join("Capsule.toml");
-    std::fs::write(&manifest_path, manifest_text)?;
-    astrid_capsule::discovery::load_manifest(&manifest_path)
-        .context("failed to validate capsule manifest")
+    archive_bytes::parse_archive_manifest(&manifest_text)
 }
 
 /// How a successfully-installed authority snapshot was accepted.
@@ -508,10 +510,19 @@ pub fn verify_installed_authority(
     target_dir: &Path,
     manifest: &CapsuleManifest,
 ) -> anyhow::Result<()> {
+    verify_installed_authority_inner(home, target_dir, manifest, None)
+}
+
+pub(crate) fn verify_installed_authority_inner(
+    home: &AstridHome,
+    target_dir: &Path,
+    manifest: &CapsuleManifest,
+    store: Option<&RuntimePrincipalStore>,
+) -> anyhow::Result<()> {
     let manifest_bytes = std::fs::read(target_dir.join("Capsule.toml"))
         .context("failed to read installed capsule manifest")?;
     let current_manifest_digest = digest_manifest(&manifest_bytes);
-    let executable_hash = verified_installed_wasm_hash(home, target_dir, manifest)?;
+    let executable_hash = verified_installed_wasm_hash(home, target_dir, manifest, store)?;
     let Some(authority) = read_installed_authority(home, target_dir)? else {
         // Snapshot pre-authority installs once. The receipt is outside the
         // capsule VFS, so absence is a migration state rather than a permanent
@@ -598,6 +609,7 @@ fn verified_installed_wasm_hash(
     home: &AstridHome,
     target_dir: &Path,
     manifest: &CapsuleManifest,
+    store: Option<&RuntimePrincipalStore>,
 ) -> anyhow::Result<Option<String>> {
     let Some(component) = manifest.components.first() else {
         return Ok(None);
@@ -605,6 +617,12 @@ fn verified_installed_wasm_hash(
     let Some(expected) = crate::read_meta(target_dir).and_then(|meta| meta.wasm_hash) else {
         bail!("WASM capsule has no BLAKE3 hash in meta.json");
     };
+    if let Some(store) = store {
+        return Ok(Some(
+            crate::wasm::catalog_wasm_hash(store, &expected)
+                .context("read installed WASM from system catalog")?,
+        ));
+    }
     let executable = if component.path.is_absolute() {
         component.path.clone()
     } else {
@@ -831,8 +849,7 @@ fn inspect_manifest(
     workspace_layout: &WorkspaceLayout,
 ) -> anyhow::Result<InstallInspection> {
     #[cfg(windows)]
-    home.ensure()
-        .context("failed to provision private Astrid home for capsule inspection")?;
+    runtime_identity::prepare(home)?;
 
     let key_path = home.runtime_key_path();
     let keypair = astrid_crypto::load_or_generate_keypair(&key_path)

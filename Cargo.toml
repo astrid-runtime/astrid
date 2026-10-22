@@ -41,7 +41,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.10.4"
+version = "2026.10.1"
 edition = "2024"
 authors = ["Joshua J. Bouw <dev@joshuajbouw.com>", "Unicity Labs <info@unicity-labs.com>"]
 license = "MIT OR Apache-2.0"
@@ -49,42 +49,42 @@ repository = "https://github.com/astrid-runtime/astrid"
 rust-version = "1.95"
 
 [workspace.dependencies]
-astrid-approval = { path = "crates/astrid-approval", version = "0.10.4" }
-astrid-audit = { path = "crates/astrid-audit", version = "0.10.4" }
-astrid-capabilities = { path = "crates/astrid-capabilities", version = "0.10.4" }
-astrid-build = { path = "crates/astrid-build", version = "0.10.4" }
-astrid-capsule = { path = "crates/astrid-capsule", version = "0.10.4" }
-astrid-capsule-install = { path = "crates/astrid-capsule-install", version = "0.10.4" }
-astrid-capsule-types = { path = "crates/astrid-capsule-types", version = "0.10.4" }
-astrid-config = { path = "crates/astrid-config", version = "0.10.4" }
-astrid-daemon = { path = "crates/astrid-daemon", version = "0.10.4" }
-astrid-core = { path = "crates/astrid-core", version = "0.10.4" }
-astrid-crypto = { path = "crates/astrid-crypto", version = "0.10.4" }
-astrid-emit = { path = "crates/astrid-emit", version = "0.10.4" }
-astrid-events = { path = "crates/astrid-events", version = "0.10.4" }
-astrid-hooks = { path = "crates/astrid-hooks", version = "0.10.4" }
-astrid-kernel = { path = "crates/astrid-kernel", version = "0.10.4" }
-astrid-mcp = { path = "crates/astrid-mcp", version = "0.10.4" }
-astrid-package-service = { path = "crates/astrid-package-service", version = "0.10.4" }
-astrid-prelude = { path = "crates/astrid-prelude", version = "0.10.4" }
-astrid-projection = { path = "crates/astrid-projection", version = "0.10.4" }
-astrid-provider = { path = "crates/astrid-provider", version = "0.10.4" }
-astrid-realm-compat = { path = "crates/astrid-realm-compat", version = "0.10.4" }
-astrid-resource-types = { path = "crates/astrid-resource-types", version = "0.10.4" }
-astrid-runtime = { path = "crates/astrid-runtime", version = "0.10.4" }
-astrid-storage = { path = "crates/astrid-storage", version = "0.10.4" }
-astrid-storage-provider-winfsp = { path = "crates/astrid-storage-provider-winfsp", version = "0.10.4" }
-astrid-telemetry = { path = "crates/astrid-telemetry", version = "0.10.4" }
+astrid-approval = { path = "crates/astrid-approval", version = "2026.10.1" }
+astrid-audit = { path = "crates/astrid-audit", version = "2026.10.1" }
+astrid-capabilities = { path = "crates/astrid-capabilities", version = "2026.10.1" }
+astrid-build = { path = "crates/astrid-build", version = "2026.10.1" }
+astrid-capsule = { path = "crates/astrid-capsule", version = "2026.10.1" }
+astrid-capsule-install = { path = "crates/astrid-capsule-install", version = "2026.10.1" }
+astrid-capsule-types = { path = "crates/astrid-capsule-types", version = "2026.10.1" }
+astrid-config = { path = "crates/astrid-config", version = "2026.10.1" }
+astrid-daemon = { path = "crates/astrid-daemon", version = "2026.10.1" }
+astrid-core = { path = "crates/astrid-core", version = "2026.10.1" }
+astrid-crypto = { path = "crates/astrid-crypto", version = "2026.10.1" }
+astrid-emit = { path = "crates/astrid-emit", version = "2026.10.1" }
+astrid-events = { path = "crates/astrid-events", version = "2026.10.1" }
+astrid-hooks = { path = "crates/astrid-hooks", version = "2026.10.1" }
+astrid-kernel = { path = "crates/astrid-kernel", version = "2026.10.1" }
+astrid-mcp = { path = "crates/astrid-mcp", version = "2026.10.1" }
+astrid-package-service = { path = "crates/astrid-package-service", version = "2026.10.1" }
+astrid-prelude = { path = "crates/astrid-prelude", version = "2026.10.1" }
+astrid-projection = { path = "crates/astrid-projection", version = "2026.10.1" }
+astrid-provider = { path = "crates/astrid-provider", version = "2026.10.1" }
+astrid-realm-compat = { path = "crates/astrid-realm-compat", version = "2026.10.1" }
+astrid-resource-types = { path = "crates/astrid-resource-types", version = "2026.10.1" }
+astrid-runtime = { path = "crates/astrid-runtime", version = "2026.10.1" }
+astrid-storage = { path = "crates/astrid-storage", version = "2026.10.1" }
+astrid-storage-provider-winfsp = { path = "crates/astrid-storage-provider-winfsp", version = "2026.10.1" }
+astrid-telemetry = { path = "crates/astrid-telemetry", version = "2026.10.1" }
 astrid-test = { path = "crates/astrid-test" }
-astrid-types = { path = "crates/astrid-types", version = "0.10.4", features = ["clock"] }
-astrid-uplink = { path = "crates/astrid-uplink", version = "0.10.4" }
-astrid-gateway = { path = "crates/astrid-gateway", version = "0.10.4" }
-astrid-vfs = { path = "crates/astrid-vfs", version = "0.10.4" }
-astrid-workspace = { path = "crates/astrid-workspace", version = "0.10.4" }
+astrid-types = { path = "crates/astrid-types", version = "2026.10.1", features = ["clock"] }
+astrid-uplink = { path = "crates/astrid-uplink", version = "2026.10.1" }
+astrid-gateway = { path = "crates/astrid-gateway", version = "2026.10.1" }
+astrid-vfs = { path = "crates/astrid-vfs", version = "2026.10.1" }
+astrid-workspace = { path = "crates/astrid-workspace", version = "2026.10.1" }
 anyhow = "1.0"
 arboard = "3"
 arc-swap = "1.7"
-lz4_flex = "0.12"
+lz4_flex = "0.14"
 # Streaming + HTTP-server deps (async-stream, axum, tokio-stream,
 # tower, tower-http, utoipa) all back the new `astrid-gateway` crate
 # and have no in-workspace substitute. They are scoped to
@@ -128,13 +128,17 @@ directories = "6.0"
 ed25519-dalek = { version = "3.0", features = ["rand_core", "zeroize", "serde"] }
 flate2 = "1.0"
 # Chunk boundaries are persistent principal-store format, not merely an
-# implementation detail. Exact-pin the audited FastCDC 2020 implementation;
-# upgrades require golden-boundary verification and a new chunking profile.
-fastcdc = "=4.0.1"
+# implementation detail. Exact-pin FastCDC 5 for even profiles and preserve the
+# audited FastCDC 4 scan for the legacy odd revision-1 compatibility edge.
+fastcdc = "=5.0.0"
+fastcdc-v4 = { package = "fastcdc", version = "=4.0.1" }
 fs2 = "0.4"
 futures = "0.3"
 globset = "0.4"
 hex = "0.4"
+# HMAC-SHA256 derives the per-field salts of v2 audit entries. 0.13 pairs with
+# sha2 0.11 (digest 0.11) and is already in the lock through other crates.
+hmac = "0.13"
 ignore = "0.4"
 indicatif = "0.18"
 insta = { version = "1.40", features = ["yaml", "json"] }
@@ -155,7 +159,7 @@ keyring = { version = "3", features = [
 landlock = "0.4"
 libc = "0.2"
 nix = { version = "0.31", features = ["process", "signal", "user", "fs", "resource"] }
-process-wrap = { version = "9", features = ["tokio1"] }
+process-wrap = { version = "10", features = ["tokio1"] }
 # Async-signal-safe signal handling on a dedicated OS thread. Used by the
 # daemon's SIGTERM/SIGINT/SIGHUP watchdog, which owns those signals off the
 # tokio runtime so the daemon is killable even when every worker is pinned.
@@ -167,6 +171,7 @@ signal-hook = "0.4"
 # capsules to record into the same recorder the gateway exports —
 # Prometheus integration is intended to go deep into Astrid, not stay
 # at the HTTP surface.
+mimalloc = "0.1.52"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 # Pull-based process collector (`process_cpu_seconds_total`, resident
@@ -205,11 +210,11 @@ rcgen = "0.14"
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 regex = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
-# Pinned to the 2.2.x patch range (~). RMCP releases breaking protocol and API
+# Pinned to the 3.2.x patch range (~). RMCP releases breaking protocol and API
 # changes in minor versions. Cargo.lock is committed, but the patch range also
 # prevents fresh resolution from silently adopting a future incompatible minor.
 # It still admits compatible bug and security fixes.
-rmcp = { version = "~3.1.2", features = ["server", "client", "transport-io", "transport-child-process", "elicitation", "macros", "request-state", "schemars"] }
+rmcp = { version = "~3.2.0", features = ["server", "client", "transport-io", "elicitation", "macros", "request-state", "schemars"] }
 rustyline = { version = "18", features = ["derive"] }
 semver = "1"
 serde = { version = "1.0", features = ["derive"] }
@@ -220,9 +225,13 @@ sha2 = "0.11"
 # exact-pinned: it sits on the self-update trust boundary, and its TUF support
 # refreshes the public-good trust root without invoking an external verifier.
 sigstore-verify = { version = "=0.11.0", default-features = false, features = ["rustls", "tuf"] }
+# Asymmetric JWT/JWKS validation for the MCP HTTP OAuth resource server.
+# Application code rejects `alg=none` and HMAC; this crate only verifies
+# asymmetric signatures from a configured JWKS document.
+jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 subtle = "2"
 surrealkv = "0.21"
-syn = { version = "3", features = ["full", "visit"] }
+syn = { version = "~3.0.4", features = ["full", "visit"] }
 syntect = { version = "5", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-fancy"] }
 tar = "0.4"
 teloxide = { version = "0.13", default-features = false, features = ["macros", "rustls", "ctrlc_handler"] }
@@ -242,7 +251,7 @@ thiserror = "2.0"
 # `rt-multi-thread`).
 tokio = { version = "1.49", features = ["sync", "macros", "time", "rt", "io-util"] }
 tokio-util = "0.7"
-toml = "0.9"
+toml = "~1.1.4"
 # Middleware substrate axum is built on (`Service` trait composition,
 # request-id, trace, CORS, body-size limit, response-header injection).
 # Dropping `tower-http` means re-implementing each middleware by hand;
@@ -262,15 +271,15 @@ url = "2"
 # other OpenAPI generator. `axum_extras` plugs into axum's extractor
 # system so `#[utoipa::path]` annotations on handlers carry through.
 utoipa = { version = "5", features = ["axum_extras"] }
-uuid = { version = "1.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
+uuid = { version = "~1.25.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
 walkdir = "2.5"
-wasm-encoder = "0.256"
-wat = "1.256"
-wasmparser = "0.256"
+wasm-encoder = "0.257.1"
+wat = "=1.257.1"
+wasmparser = "0.257.1"
 windows-sys = "0.61"
-wit-component = "0.256"
-wit-parser = "0.256"
-wasmtime = { version = "48.0.7", features = ["component-model", "cranelift"] }
+wit-component = "0.257.1"
+wit-parser = "0.257.1"
+wasmtime = { version = "48.0.7", features = ["component-model", "cranelift", "call-hook"] }
 wasmtime-wasi = "48.0.7"
 unicode-normalization = "=0.1.25"
 unicode-width = "0.2"

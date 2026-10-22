@@ -26,7 +26,7 @@ async fn agent_delete_observes_pre_latched_panic_with_stale_listener_then_retrie
     state.arm_stale_join_failure_for_test();
     assert!(!state.is_revoked_for_test());
 
-    let failed = handlers::dispatch(
+    let failed = super::super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentDelete {
@@ -54,7 +54,7 @@ async fn agent_delete_observes_pre_latched_panic_with_stale_listener_then_retrie
     assert!(kernel.storage_mounts.contains_key(&lease.mount_id));
     assert!(state.is_revoked_for_test());
     assert!(lease.resource_path.exists());
-    let retried = handlers::dispatch(
+    let retried = super::super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentDelete {

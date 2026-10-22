@@ -4,6 +4,7 @@
 //! The lockfile (`Distro.lock`) pins exact resolved versions and BLAKE3 hashes
 //! for reproducible installs.
 
+pub(crate) mod local_source;
 pub(crate) mod lock;
 pub(crate) mod manifest;
 pub(crate) mod seal;

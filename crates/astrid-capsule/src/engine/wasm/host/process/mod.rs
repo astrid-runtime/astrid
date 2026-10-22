@@ -31,6 +31,7 @@ mod handle;
 mod inject;
 mod managed;
 mod persistent;
+mod synchronous;
 mod tracker;
 
 use std::collections::VecDeque;
@@ -52,7 +53,7 @@ use context::{PreparedSpawnContext, prepare_spawn_context_with_roots};
 use managed::{ManagedProcess, attach_pipes, configure_piped, prepare_sandboxed_command};
 
 pub(crate) use audit::{
-    audit_process, audit_process_id, audit_process_injections, audit_spawn_result,
+    admit_spawn, audit_process, audit_process_id, audit_process_injections, audit_spawn_result,
     record_process_denied,
 };
 pub use persistent::PersistentProcessRegistry;
@@ -159,7 +160,10 @@ fn build_persistent_child(
         inject_env,
         extra_masks,
     )
-    .map_err(|_| ErrorCode::InvalidInput)?;
+    .map_err(|error| {
+        tracing::warn!(%error, "native process sandbox construction failed");
+        ErrorCode::InvalidInput
+    })?;
     // `configure_piped` sets the process group + stdout/stderr pipes.
     configure_piped(&mut sandboxed);
     if want_stdin {
@@ -178,6 +182,16 @@ include!("host_ops_methods.rs");
 
 impl process::Host for HostState {
     fn spawn(&mut self, request: SpawnRequest) -> Result<ProcessResult, ErrorCode> {
+        let cmd_for_audit = request.cmd.clone();
+        if request
+            .stdin
+            .as_ref()
+            .is_some_and(|input| input.len() > MAX_SPAWN_STDIN_BYTES)
+        {
+            let result: Result<ProcessResult, ErrorCode> = Err(ErrorCode::TooLarge);
+            audit_process(self, "astrid:process/host.spawn", &cmd_for_audit, &result);
+            return result;
+        }
         let security = self.security.clone();
         let capsule_id = self.capsule_id.as_str().to_owned();
         let handle = self.runtime_handle.clone();
@@ -186,7 +200,6 @@ impl process::Host for HostState {
         let process_tracker = self.process_tracker.clone();
         let call_id = extract_call_id(self);
 
-        let cmd_for_audit = request.cmd.clone();
         let _env_for_audit = env_summary(&request.env);
 
         if !self.principal_process_allows(&request.cmd) {
@@ -221,6 +234,7 @@ impl process::Host for HostState {
             return Err(ErrorCode::CapabilityDenied);
         }
 
+        admit_spawn(self, &cmd_for_audit)?;
         let process_mount =
             prepare_process_storage_mount(self, "astrid:process/host.spawn", request.cmd.as_str())?;
         let workspace_root = process_mount.as_ref().map_or_else(
@@ -282,9 +296,10 @@ impl process::Host for HostState {
             &self.spawn_mask_paths,
         ) {
             Ok(cmd) => cmd,
-            Err(_) => {
+            Err(error) => {
                 // Sandbox construction failed before exec — audit the attempt as
                 // Failed instead of returning silently via `?`.
+                tracing::warn!(%error, "native process sandbox construction failed");
                 let result: Result<ProcessResult, ErrorCode> = Err(ErrorCode::InvalidInput);
                 audit_spawn_result(
                     self,
@@ -298,6 +313,11 @@ impl process::Host for HostState {
         };
         sandboxed_cmd.stdout(Stdio::piped());
         sandboxed_cmd.stderr(Stdio::piped());
+        sandboxed_cmd.stdin(if request.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
 
         let child = match sandboxed_cmd.spawn() {
             Ok(child) => child,
@@ -321,10 +341,12 @@ impl process::Host for HostState {
 
         let output_result =
             util::bounded_block_on_cancellable(&handle, &semaphore, &cancel_token, async move {
-                tokio::task::spawn_blocking(move || child.wait_with_output())
-                    .await
-                    .map_err(std::io::Error::other)
-                    .and_then(|r| r)
+                tokio::task::spawn_blocking(move || {
+                    synchronous::wait_with_input(child, request.stdin)
+                })
+                .await
+                .map_err(std::io::Error::other)
+                .and_then(|r| r)
             });
 
         let result: Result<ProcessResult, ErrorCode> = match output_result {
@@ -439,6 +461,7 @@ impl process::Host for HostState {
             return Err(ErrorCode::Cancelled);
         }
 
+        admit_spawn(self, &cmd_for_audit)?;
         let process_mount = prepare_process_storage_mount(
             self,
             "astrid:process/host.spawn-background",
@@ -511,9 +534,10 @@ impl process::Host for HostState {
             &self.spawn_mask_paths,
         ) {
             Ok(cmd) => cmd,
-            Err(_) => {
+            Err(error) => {
                 // Sandbox construction failed before exec — audit the attempt as
                 // Failed instead of returning silently via `?`.
+                tracing::warn!(%error, "native process sandbox construction failed");
                 let result: Result<Resource<ProcessHandle>, ErrorCode> =
                     Err(ErrorCode::InvalidInput);
                 audit_spawn_result(
@@ -718,6 +742,7 @@ impl process::Host for HostState {
             return Err(ErrorCode::Cancelled);
         }
 
+        admit_spawn(self, &cmd_for_audit)?;
         let process_mount = prepare_process_storage_mount(
             self,
             "astrid:process/host.spawn-persistent",

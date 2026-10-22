@@ -256,6 +256,7 @@ mod tests {
         let home = AstridHome::from_path(dir.path());
         home.ensure().unwrap();
         let path = PairTokenStore::path_for(&home);
+        std::fs::create_dir_all(home.etc_dir()).unwrap();
         private_write(&path, "schema_version = 1\n[[pair_token]]\n");
         let backend: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
         let store = DurablePairTokenStore::new(Arc::clone(&backend)).unwrap();

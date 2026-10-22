@@ -3,14 +3,14 @@
 use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
 
-use crate::volume::{AstridVolume, VolumeRegion};
+use crate::volume::{AstridVolume, VolumeMetadataMutation, VolumeRegion};
 
 use super::{
     ARENA_COMPACTING, ARENA_FILE, ARENA_MAGIC, BTreeMap, BTreeSet, CompactionReport, DurableEngine,
     DurableError, DurableFiles, DurableInner, File, IndexState, ObjectId, PersistentObjectIdentity,
-    PrincipalCodec, ROOT_FILE, ReplacementState, VerifiedCompactionPlan, append_frame,
-    encode_object_frame, ensure_payload_limit, evidence, io_error, live_files_mut, outbox,
-    replace_volume_index, root_journal_digest, validate_replacement,
+    PrincipalCodec, ROOT_FILE, ROOTS_COMPACTING, ReplacementState, VerifiedCompactionPlan,
+    append_frame, encode_object_frame, ensure_payload_limit, evidence, io_error, live_files_mut,
+    outbox, replace_volume_index, root_journal_digest, validate_replacement,
 };
 
 impl<P, I, C> DurableEngine<P, I, C>
@@ -81,10 +81,18 @@ where
         arena
             .sync_data()
             .map_err(|source| io_error("flush compacted volume arena", source))?;
-        let mut roots = live_files_mut(&mut inner.files)?
-            .roots
-            .try_clone()
-            .map_err(|source| io_error("clone volume roots for compaction", source))?;
+        let temporary_roots = VolumeRegion::new(ROOTS_COMPACTING)
+            .map_err(|source| io_error("validate compacting roots region", source))?;
+        if volume
+            .region_exists(&temporary_roots)
+            .map_err(|source| io_error("inspect compacting roots region", source))?
+        {
+            volume
+                .remove_region(&temporary_roots)
+                .map_err(|source| io_error("remove stale compacting roots region", source))?;
+        }
+        let mut roots = File::volume(Arc::clone(volume), ROOTS_COMPACTING, true)?;
+        self.write_root_snapshot(&mut roots, &inner.roots_by_principal)?;
         let replacement = validate_replacement(
             &mut arena,
             &mut roots,
@@ -140,26 +148,66 @@ where
         )?;
         outbox::prepare_volume(Arc::clone(volume), &bundle, &self.identity, self.limits)?;
 
+        // Never rebase the published generation against an unpublished arena.
+        // Stage a private copy, then publish its pointer, arena and GC evidence
+        // together. Every durable prefix consequently has matching placements.
+        let staged_representations = inner
+            .representations
+            .as_mut()
+            .map(|store| {
+                let mut staged = store.prepare_checkpoint_volume(volume, self.limits)?;
+                staged.rebase_compacted_arena(
+                    &arena,
+                    &replacement.index,
+                    &self.identity,
+                    self.limits,
+                )?;
+                // Discard the old placement closure copied for isolated rebasing.
+                // Both private generations remain unreachable until publication;
+                // reclamation below removes the intermediate one as well.
+                staged.prepare_checkpoint_volume(volume, self.limits)
+            })
+            .transpose()?;
+        self.fail_if(super::FaultPoint::AfterCompactionEvidencePrepare)?;
+        let representation_publication = staged_representations
+            .as_ref()
+            .map(|_| {
+                super::super::representations::RepresentationStore::checkpoint_volume_publication()
+            })
+            .transpose()?;
         drop(arena);
+        drop(roots);
         let active = VolumeRegion::new(ARENA_FILE)
             .map_err(|source| io_error("validate active volume arena region", source))?;
+        let active_roots = VolumeRegion::new(ROOT_FILE)
+            .map_err(|source| io_error("validate active roots region", source))?;
+        let mut publication = vec![
+            VolumeMetadataMutation::Replace {
+                source: temporary,
+                destination: active,
+            },
+            VolumeMetadataMutation::Replace {
+                source: temporary_roots,
+                destination: active_roots,
+            },
+        ];
+        publication.extend(representation_publication);
+        // Publication may succeed even if its subsequent verification fails.
+        // Every error from here must reopen authority rather than leave old
+        // handles usable; compact() also marks files=None as recovery-required.
+        inner.files = None;
         outbox::commit_volume_replacement(
             Arc::clone(volume),
-            temporary,
-            active,
+            publication,
             &bundle,
             &self.identity,
             self.limits,
         )?;
+        self.fail_if(super::FaultPoint::AfterCompactionArenaPromote)?;
+        inner.representations = staged_representations;
         self.install_volume_replacement(inner, replacement, Arc::clone(volume))?;
-        if let Some(representations) = inner.representations.as_mut() {
-            let files = live_files_mut(&mut inner.files)?;
-            representations.rebase_compacted_arena(
-                &files.arena,
-                &inner.index,
-                &self.identity,
-                self.limits,
-            )?;
+        if let Some(representations) = inner.representations.as_ref() {
+            representations.reclaim_checkpoint_volume(volume)?;
         }
         volume
             .sync()
@@ -189,8 +237,12 @@ where
             arena_tail: replacement.arena_tail,
             objects: replacement.index.clone(),
         };
-        let index_cache =
-            replace_volume_index(Arc::clone(&volume), &index_state, self.identity.scheme());
+        let index_cache = replace_volume_index(
+            Arc::clone(&volume),
+            &index_state,
+            self.identity.scheme(),
+            self.faults.as_ref(),
+        )?;
         let mut arena = File::volume(Arc::clone(&volume), ARENA_FILE, false)?;
         let mut roots = File::volume(volume, ROOT_FILE, false)?;
         arena
@@ -213,7 +265,7 @@ where
         inner.files = Some(DurableFiles {
             arena,
             roots,
-            index_cache,
+            index_cache: Some(index_cache),
             arena_len: replacement.arena_len,
             arena_tail: replacement.arena_tail,
         });

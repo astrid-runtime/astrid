@@ -73,6 +73,20 @@ pub struct CapsulePackageGeneration {
 }
 
 impl CapsulePackageGeneration {
+    /// Construct a generation from the three fixed package object IDs.
+    #[must_use]
+    pub const fn new(
+        archive: crate::storage_model::ObjectId,
+        metadata: crate::storage_model::ObjectId,
+        authority: crate::storage_model::ObjectId,
+    ) -> Self {
+        Self {
+            archive,
+            metadata,
+            authority,
+        }
+    }
+
     /// Return the archive object ID.
     #[must_use]
     pub const fn archive(&self) -> crate::storage_model::ObjectId {

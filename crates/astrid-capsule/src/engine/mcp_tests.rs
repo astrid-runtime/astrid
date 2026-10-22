@@ -136,6 +136,7 @@ mod tests {
             #[cfg(not(target_family = "wasm"))]
             process_storage_mount_broker: None,
             event_bus: bus,
+            secret_elicits: None,
             kv,
             cli_socket_listener: None,
             capsule_registry: None,
@@ -144,6 +145,7 @@ mod tests {
             identity_store: None,
             schema_catalog: std::sync::Arc::new(crate::schema_catalog::SchemaCatalog::new()),
             profile_cache: None,
+            user_cpu: None,
             overlay_registry: None,
             group_config: None,
             local_egress: Vec::new(),
@@ -213,6 +215,7 @@ mod tests {
             #[cfg(not(target_family = "wasm"))]
             process_storage_mount_broker: None,
             event_bus: bus,
+            secret_elicits: None,
             kv,
             cli_socket_listener: None,
             capsule_registry: None,
@@ -221,6 +224,7 @@ mod tests {
             identity_store: None,
             schema_catalog: std::sync::Arc::new(crate::schema_catalog::SchemaCatalog::new()),
             profile_cache: None,
+            user_cpu: None,
             overlay_registry: None,
             group_config: None,
             local_egress: Vec::new(),
@@ -304,6 +308,7 @@ mod tests {
             #[cfg(not(target_family = "wasm"))]
             process_storage_mount_broker: None,
             event_bus: bus,
+            secret_elicits: None,
             kv,
             cli_socket_listener: None,
             capsule_registry: None,
@@ -312,6 +317,7 @@ mod tests {
             identity_store: None,
             schema_catalog: std::sync::Arc::new(crate::schema_catalog::SchemaCatalog::new()),
             profile_cache: None,
+            user_cpu: None,
             overlay_registry: None,
             group_config: None,
             local_egress: Vec::new(),

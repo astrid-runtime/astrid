@@ -30,7 +30,12 @@ OWNED_WORKFLOWS = frozenset(
         "runtime-e2e.yml",
         "macos-v0104-upgrade.yml",
         "windows-local-transport.yml",
+        "windows-filesystem-native.yml",
     }
+)
+# Required checks must run on stacked bases as well as main and OS.
+UNFILTERED_PR_WORKFLOWS = frozenset(
+    {"ci.yml", "pr-checks.yml", "windows-filesystem-native.yml"}
 )
 PUSH_CAMPAIGN_WORKFLOWS = frozenset(
     {
@@ -39,6 +44,7 @@ PUSH_CAMPAIGN_WORKFLOWS = frozenset(
         "macos-v0104-upgrade.yml",
         "runtime-e2e.yml",
         "windows-local-transport.yml",
+        "windows-filesystem-native.yml",
     }
 )
 PROTECTED_WORKFLOWS = frozenset({"release.yml", "scorecard.yml", "native-kernel.yml"})
@@ -283,7 +289,11 @@ def validate_workflows(workflows: Mapping[str, str]) -> list[str]:
                     )
             continue
 
-        if pull_request_branches is not None:
+        if name in UNFILTERED_PR_WORKFLOWS:
+            for field in ("branches", "branches-ignore", "paths", "paths-ignore"):
+                if _event_field_values(text, "pull_request", field) is not None:
+                    errors.append(f"{name}: pull_request.{field} must remain unfiltered")
+        elif pull_request_branches is not None:
             missing = {MAIN_BRANCH, CAMPAIGN_BRANCH}.difference(pull_request_branches)
             if missing:
                 errors.append(
@@ -307,7 +317,7 @@ def validate_workflows(workflows: Mapping[str, str]) -> list[str]:
             errors.append(f"{name}: pull_request event is required")
             continue
         branches = _event_field_values(text, "pull_request", "branches")
-        if branches is None:
+        if branches is None and name not in UNFILTERED_PR_WORKFLOWS:
             errors.append(f"{name}: pull_request.branches is required")
 
     for name in PUSH_CAMPAIGN_WORKFLOWS:

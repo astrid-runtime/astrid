@@ -1,5 +1,8 @@
 //! Recovery and closed-world validation for physical representation authority.
 
+#[cfg(test)]
+mod tests;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::SeekFrom;
 
@@ -112,28 +115,17 @@ pub(super) fn recover_journal<F: DurableIo>(
     let first = entries.first().map(|(_, entry)| *entry).ok_or(
         DurableError::InvalidRepresentationState("representation journal is empty"),
     )?;
-    let (mut active, mut generation) = match first {
-        JournalEntry::Checkpoint {
-            journal_generation,
-            active,
-            state_generation,
-            prior_journal_digest,
-        } if journal_generation == current.journal_generation
-            && journal_generation == FIRST_JOURNAL_GENERATION
-            && active.is_none()
-            && state_generation == 0
-            && prior_journal_digest.is_none() =>
-        {
-            (active, state_generation)
-        },
-        _ => {
-            return Err(DurableError::InvalidRepresentationState(
-                "representation journal begins with an invalid checkpoint",
-            ));
-        },
-    };
+    let (mut active, mut generation) = recover_checkpoint(first, current, metadata)?;
     validate_tail_budget(entries.len(), bytes.len(), checkpoint_end, current)?;
-    let mut previous_state = None;
+    let mut previous_state = active
+        .map(|id| {
+            RepresentationState::decode(metadata.value(MetadataKind::State, id.as_bytes())?)
+                .map_err(DurableError::from)
+        })
+        .transpose()?;
+    // Metadata is immutable for this replay. Only successfully checked closures
+    // may be reused across historical states; CAS and generation checks still run.
+    let mut complete_maps = BTreeSet::new();
     let entry_count = entries.len();
     for (position, (offset, entry)) in entries.into_iter().enumerate().skip(1) {
         let JournalEntry::StateCas {
@@ -151,7 +143,7 @@ pub(super) fn recover_journal<F: DurableIo>(
                 "representation journal CAS conflict",
             ));
         }
-        if !state_metadata_closure_complete(replacement, metadata)? {
+        if !state_metadata_closure_complete(replacement, metadata, &mut complete_maps)? {
             if position.checked_add(1) != Some(entry_count) {
                 return Err(DurableError::InvalidRepresentationState(
                     "interior representation journal state has an incomplete metadata closure",
@@ -184,9 +176,58 @@ pub(super) fn recover_journal<F: DurableIo>(
     Ok((active, state))
 }
 
+fn recover_checkpoint(
+    first: JournalEntry,
+    current: CurrentPointer,
+    metadata: &MetadataIndex,
+) -> Result<(Option<RepresentationStateId>, u64), DurableError> {
+    match first {
+        JournalEntry::Checkpoint {
+            journal_generation,
+            active,
+            state_generation,
+            prior_journal_digest,
+        } if journal_generation == current.journal_generation
+            && journal_generation == FIRST_JOURNAL_GENERATION
+            && active.is_none()
+            && state_generation == 0
+            && prior_journal_digest.is_none() =>
+        {
+            Ok((active, state_generation))
+        },
+        JournalEntry::Checkpoint {
+            journal_generation,
+            active: Some(active),
+            state_generation,
+            prior_journal_digest: Some(_),
+        } if journal_generation == current.journal_generation
+            && journal_generation > FIRST_JOURNAL_GENERATION =>
+        {
+            if !state_metadata_closure_complete(active, metadata, &mut BTreeSet::new())? {
+                return Err(DurableError::InvalidRepresentationState(
+                    "representation checkpoint has an incomplete metadata closure",
+                ));
+            }
+            let state = RepresentationState::decode(
+                metadata.value(MetadataKind::State, active.as_bytes())?,
+            )?;
+            if state.generation() != state_generation {
+                return Err(DurableError::InvalidRepresentationState(
+                    "representation checkpoint state generation mismatch",
+                ));
+            }
+            Ok((Some(active), state_generation))
+        },
+        _ => Err(DurableError::InvalidRepresentationState(
+            "representation journal begins with an invalid checkpoint",
+        )),
+    }
+}
+
 fn state_metadata_closure_complete(
     state_id: RepresentationStateId,
     metadata: &MetadataIndex,
+    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
 ) -> Result<bool, DurableError> {
     let Some(state_bytes) = metadata
         .values
@@ -214,7 +255,7 @@ fn state_metadata_closure_complete(
         catalogue.representations_root(),
         placements.entries_root(),
     ] {
-        if !map_closure_complete(root, &metadata.nodes) {
+        if !map_closure_complete(root, &metadata.nodes, complete) {
             return Ok(false);
         }
     }
@@ -224,6 +265,7 @@ fn state_metadata_closure_complete(
 fn map_closure_complete(
     root: Option<crate::storage_model::PhysicalMapNodeId>,
     nodes: &BTreeMap<crate::storage_model::PhysicalMapNodeId, PhysicalMapNode>,
+    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
 ) -> bool {
     let Some(root) = root else {
         return true;
@@ -231,7 +273,7 @@ fn map_closure_complete(
     let mut pending = vec![root];
     let mut visited = BTreeSet::new();
     while let Some(id) = pending.pop() {
-        if !visited.insert(id) {
+        if complete.contains(&id) || !visited.insert(id) {
             continue;
         }
         let Some(node) = nodes.get(&id) else {
@@ -245,6 +287,8 @@ fn map_closure_complete(
             PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => {},
         }
     }
+    // Never remember a partial traversal that encountered a missing descendant.
+    complete.extend(visited);
     true
 }
 

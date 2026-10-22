@@ -16,6 +16,7 @@ pub(crate) mod doctor;
 pub(crate) mod gc;
 pub(crate) mod group;
 pub(crate) mod headless;
+pub(crate) mod hook;
 pub(crate) mod init;
 pub(crate) mod invite;
 pub(crate) mod keypair;

@@ -115,7 +115,7 @@ migration records, transient ingestion staging, and ephemeral mount leases. The
 volume contains the authoritative object arena, root journal, disposable index,
 cutover receipt, and GC outbox as named regions; those are not separate host
 files or directories. On bare metal, the same `AstridVolume` contract is backed
-directly by governed storage media instead of `var/astrid.volume`. Neither form
+directly by governed storage media instead of `runtime/volume`. Neither form
 is the filesystem served to a principal, fleet, or sysadmin. In particular,
 layout two has no physical `srv/fleets/...`, `principal-store/`, or other
 host-directory copy of mounted files.

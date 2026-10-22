@@ -304,28 +304,8 @@ pub(crate) fn distro_astrid_version_satisfied(req: &str, running: &Version) -> a
         anyhow::anyhow!("distro.astrid-version {req:?} is not a valid requirement: {e}")
     })?;
 
-    // If any comparator in the requirement carries a prerelease, the operator
-    // is gating on an exact prerelease — honour real semver semantics (no
-    // triple-strip) so a lower prerelease of the same triple is not lifted past
-    // the floor. Otherwise apply the dev-build footgun fix below.
-    let req_names_prerelease = version_req.comparators.iter().any(|c| !c.pre.is_empty());
-    if req_names_prerelease {
-        if version_req.matches(running) {
-            return Ok(());
-        }
-        return Err(AstridVersionTooOld {
-            req: req.to_string(),
-            running: running.to_string(),
-        }
-        .into());
-    }
-
-    // Plain release floor: strip prerelease / build metadata and compare on the
-    // release triple so a dev / prerelease CLI at or above the floor is not
-    // falsely rejected.
-    let release_triple = Version::new(running.major, running.minor, running.patch);
-
-    if version_req.matches(&release_triple) {
+    if astrid_capsule_types::runtime_compatibility::runtime_version_satisfied(&version_req, running)
+    {
         return Ok(());
     }
 

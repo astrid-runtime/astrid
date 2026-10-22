@@ -14,6 +14,9 @@ use astrid_core::{
     UserIdentity,
 };
 
+#[path = "first_owner_tests/ownership_merge.rs"]
+mod ownership_merge;
+
 fn at(seconds: i64) -> chrono::DateTime<Utc> {
     Utc.timestamp_opt(seconds, 0).single().unwrap()
 }

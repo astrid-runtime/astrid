@@ -55,70 +55,8 @@ on:
       - 'scripts/test_channel_workflow_contract.sh'
       - 'scripts/*campaign_ci_triggers.py'
       - 'scripts/*linked_issue.py'
-      - 'scripts/nightly_version.py'
-      - 'scripts/test_nightly_version.py'
-      - 'release/nightly.toml'
-      - 'crates/astrid-storage-provider-fskit/**'
-      - 'native/macos/**'
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-      - '.github/workflows/ci.yml'
-      - '.github/workflows/native-storage-certification.yml'
-      - '.github/workflows/release.yml'
-  pull_request:
-    branches: [main, os/universal]
-    paths:
-      - '**.rs'
-      - 'scripts/install-windows.ps1'
-      - 'scripts/uninstall-windows.ps1'
-      - 'scripts/windows_release_manifest.py'
-      - 'scripts/test_windows_release_manifest.py'
-      - 'scripts/release_manifest.py'
-      - 'scripts/test_release_manifest.py'
-      - 'scripts/musl_release_manifest.py'
-      - 'scripts/test_musl_release_manifest.py'
-      - 'scripts/package_release_archive.py'
-      - 'scripts/test_validate_release_archive.py'
-      - 'scripts/validate_release_archive.py'
-      - 'scripts/build-macos-fskit.sh'
-      - 'scripts/check-macos-fskit.sh'
-      - 'scripts/manage-macos-fskit.sh'
-      - 'scripts/test_manage_macos_fskit.sh'
-      - 'scripts/validate-macos-fskit.sh'
-      - 'scripts/validate_macos_release.py'
-      - 'scripts/test_macos_release_packaging.py'
-      - 'scripts/test_v0104_linux_upgrade.sh'
-      - 'scripts/test_v0104_macos_upgrade.sh'
-      - 'scripts/ci/**'
-      - 'scripts/fixtures/windows-release-extension.toml'
-      - 'scripts/check_glibc.py'
-      - 'scripts/test_check_glibc.py'
+      - 'scripts/test_ci_workflow_contract.sh'
       - 'scripts/test_gnu_build_packages.py'
-      - 'scripts/test_runtime_cli_capture.py'
-      - 'scripts/test_windows_cargo_diagnostics.py'
-      - '.github/workflows/windows-filesystem-native.yml'
-      - 'scripts/e2e/runtime-crash-smoke.sh'
-      - 'scripts/check_dco.py'
-      - 'scripts/test_check_dco.py'
-      - 'scripts/check_dco_import_scope.py'
-      - 'scripts/test_check_dco_import_scope.py'
-      - 'scripts/changelog.py'
-      - 'scripts/test_changelog.py'
-      - 'scripts/check_static_elf.py'
-      - 'scripts/test_check_static_elf.py'
-      - 'scripts/release_publication.py'
-      - 'scripts/test_release_publication.py'
-      - 'scripts/release_draft_recovery.py'
-      - 'scripts/test_release_draft_recovery.py'
-      - 'scripts/crate_publication.py'
-      - 'scripts/test_crate_publication.py'
-      - 'scripts/channel_metadata.py'
-      - 'scripts/test_channel_metadata.py'
-      - 'scripts/channel_publication.py'
-      - 'scripts/test_channel_publication.py'
-      - 'scripts/test_channel_workflow_contract.sh'
-      - 'scripts/*campaign_ci_triggers.py'
-      - 'scripts/*linked_issue.py'
       - 'scripts/nightly_version.py'
       - 'scripts/test_nightly_version.py'
       - 'release/nightly.toml'
@@ -129,13 +67,17 @@ on:
       - '.github/workflows/ci.yml'
       - '.github/workflows/native-storage-certification.yml'
       - '.github/workflows/release.yml'
-
+  # Required build/test checks must also run for stacked and docs-only PRs.
+  pull_request:
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.run_attempt == '1' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}-attempt-{1}', github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == '1' }}
 
 jobs:
   linux-release-smoke:
@@ -163,7 +105,7 @@ jobs:
             image: docker.io/library/rust@sha256:594694ee6b07747b63b5c265be2616b62e814180b66227e2c18c6ee85e4136be
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
@@ -287,7 +229,7 @@ jobs:
       contents: read
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
@@ -324,7 +266,7 @@ jobs:
       RUST_BACKTRACE: "1"
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
@@ -359,7 +301,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
@@ -399,7 +341,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
@@ -427,7 +369,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
@@ -449,7 +391,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
@@ -490,7 +432,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
@@ -528,9 +470,31 @@ jobs:
           python3 -m unittest scripts/test_macos_release_packaging.py
           scripts/test_manage_macos_fskit.sh
 
+      - name: Verify native media isolation on macOS
+        if: matrix.os == 'macos-latest'
+        run: cargo test --locked -p astrid-workspace runtime_media_remains_private_in_native_processes -- --ignored
+
       - name: Run tests
         if: matrix.os != 'macos-latest'
         run: cargo test --workspace --locked
+
+      - name: Check startup fence across Linux OS users
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_binary=$(cargo test --locked -p astrid --bin astrid --no-run --message-format=json | python3 -c '
+          import json, sys
+          paths = [m["executable"] for line in sys.stdin if (m := json.loads(line)).get("executable") and m.get("target", {}).get("name") == "astrid" and m.get("profile", {}).get("test")]
+          assert len(paths) == 1, paths
+          print(paths[0])')
+          # The child runs as UID 65534 and must be able to execute the test
+          # binary without traversing private checkout or Cargo cache paths.
+          fence_test_dir=$(mktemp -d /tmp/astrid-fence-tests.XXXXXXXX)
+          trap 'rm -rf -- "$fence_test_dir"' EXIT
+          chmod 755 "$fence_test_dir"
+          install -m 755 "$test_binary" "$fence_test_dir/astrid-tests"
+          sudo "$fence_test_dir/astrid-tests" commands::daemon::start_fence::tests:: --nocapture
 
       - name: Run tests (macOS serial)
         if: matrix.os == 'macos-latest'
@@ -543,7 +507,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
@@ -572,7 +536,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
@@ -628,7 +592,7 @@ jobs:
       - name: Install cargo-semver-checks for core report
         id: install-internal-semver
         if: always() && steps.api-inputs.outputs.run == 'true'
-        uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2
+        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2
         with:
           tool: cargo-semver-checks
 
@@ -665,7 +629,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
@@ -704,7 +668,7 @@ jobs:
 
       - name: Install cargo-public-api
         if: steps.api-inputs.outputs.run == 'true'
-        uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2
+        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2
         with:
           tool: cargo-public-api
 
@@ -722,7 +686,7 @@ jobs:
       CARGO_TARGET_DIR: .openapi-target
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
@@ -790,7 +754,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 

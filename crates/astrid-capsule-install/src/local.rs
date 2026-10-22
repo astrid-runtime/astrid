@@ -54,7 +54,7 @@ use crate::authority::{
     authority_for_install_source, authorize_install, inspect_directory_for_principal_in_workspace,
 };
 use crate::copy::copy_capsule_dir;
-use crate::lifecycle::{run_lifecycle_for_principal, run_lifecycle_for_principal_with_storage};
+use crate::lifecycle::{InstallLifecycle, LifecycleServices, run_install_lifecycle};
 use crate::manifest_check::{
     ExportConflict, MissingImport, check_export_conflicts_in_storage,
     check_export_conflicts_in_workspace, validate_imports_in_storage,
@@ -143,6 +143,14 @@ pub struct InstallOptions {
     pub provenance_distro: Option<String>,
     /// Canonical source-artifact digest copied into durable metadata.
     pub provenance_source_digest: Option<String>,
+    /// Observed package generation; filtered refresh fail-closes on mismatch.
+    pub expected_package_generation: Option<astrid_storage::CapsulePackageGeneration>,
+    /// Host-audit sink for the lifecycle hook's host calls. The daemon passes
+    /// its signed audit sink; `None` leaves them on observability tracing.
+    pub audit_sink: Option<Arc<dyn astrid_capsule::HostAuditSink>>,
+    /// Kernel-owned execution accounting, shared with active capsules rather
+    /// than reset for each installation. Absent for standalone previews.
+    pub lifecycle_cpu: Option<astrid_capsule::user_cpu::throttle::ExecutionThrottle>,
 }
 
 /// What an install produced.
@@ -718,7 +726,7 @@ pub(crate) fn install_from_local_path_internal(
     // Source-direct content-addressing. Nothing under target_dir is
     // touched yet — if any of these fail the existing install (if
     // any) is intact.
-    let wasm = content_address_wasm(home, source_dir, &manifest)
+    let wasm = content_address_wasm(home, source_dir, &manifest, options.storage.as_deref())
         .context("failed to content-address WASM binary")?;
     installed_authority.wasm_hash_pinned = true;
     installed_authority.approved_wasm_hash = wasm.as_ref().map(|w| w.hash.clone());
@@ -781,33 +789,21 @@ pub(crate) fn install_from_local_path_internal(
 
     // Lifecycle hook — bytes from the content store, not the target.
     if let Some(ref w) = wasm {
-        let lifecycle_result = options.storage.as_ref().map_or_else(
-            || {
-                run_lifecycle_for_principal(
-                    &target_dir,
-                    w.bytes.clone(),
-                    &manifest,
-                    home,
-                    target_principal,
-                    phase.to_lifecycle(),
-                    previous_version.as_deref(),
-                    options.lifecycle_bus.clone(),
-                )
+        let lifecycle_result = run_install_lifecycle(InstallLifecycle {
+            target_dir: &target_dir,
+            wasm_bytes: w.bytes.clone(),
+            manifest: &manifest,
+            home,
+            target_principal,
+            storage: options.storage.as_deref(),
+            phase: phase.to_lifecycle(),
+            previous_version: previous_version.as_deref(),
+            services: LifecycleServices {
+                event_bus: options.lifecycle_bus.clone(),
+                audit_sink: options.audit_sink.clone(),
+                cpu: options.lifecycle_cpu.clone(),
             },
-            |storage| {
-                run_lifecycle_for_principal_with_storage(
-                    &target_dir,
-                    w.bytes.clone(),
-                    &manifest,
-                    home,
-                    target_principal,
-                    storage,
-                    phase.to_lifecycle(),
-                    previous_version.as_deref(),
-                    options.lifecycle_bus.clone(),
-                )
-            },
-        );
+        });
         if let Err(e) = lifecycle_result {
             rollback(&target_dir, backup_dir.as_deref());
             return Err(e);
@@ -856,6 +852,7 @@ pub(crate) fn install_from_local_path_internal(
             &target_dir,
             &meta,
             &installed_authority,
+            options.expected_package_generation,
         )
     {
         rollback(&target_dir, backup_dir.as_deref());

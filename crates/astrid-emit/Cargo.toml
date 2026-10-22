@@ -22,8 +22,9 @@ astrid-types = { workspace = true }
 astrid-uplink = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
-# `rt-multi-thread`: `#[tokio::main]`; native-only, not in the tokio base.
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+# `rt-multi-thread`: `#[tokio::main]`; `time` bounds policy-hook waits.
+# Native-only, not in the tokio base.
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
 
 [lints]
 workspace = true

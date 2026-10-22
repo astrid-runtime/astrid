@@ -1,10 +1,11 @@
 //! Host function implementation for plugin-level approval requests.
 //!
 //! Called by WASM guests via the `request_approval` trait method when a plugin
-//! needs human consent for a sensitive action. Checks the shared
-//! [`AllowanceStore`] first (instant path), then publishes an
+//! needs human consent for a sensitive action. Checks persisted always-grants,
+//! then the shared [`AllowanceStore`] (instant path), then publishes an
 //! [`ApprovalRequired`] IPC event and blocks until the frontend responds.
 
+use crate::audit_sink::HostApprovalScope;
 use crate::engine::wasm::bindings::astrid::approval::host::{
     self as approval, ApprovalDecision, ApprovalRequest, ApprovalResponse, ErrorCode,
 };
@@ -13,6 +14,7 @@ use crate::engine::wasm::host_state::HostState;
 use astrid_approval::action::SensitiveAction;
 use astrid_approval::{Allowance, AllowanceId, AllowancePattern, AllowanceStore};
 use astrid_core::principal::PrincipalId;
+use astrid_core::profile::CommandApprovalLocation;
 use astrid_core::types::Timestamp;
 use astrid_crypto::KeyPair;
 use astrid_events::AstridEvent;
@@ -58,6 +60,104 @@ fn check_allowance(
     store
         .find_matching_and_consume(principal, &action, workspace_root)
         .is_some()
+}
+
+/// Reuse the saved command family with the same principal/workspace matching
+/// contract as an in-memory allowance. Do not import it into the session store:
+/// the profile cache remains the single source for durable approvals.
+fn check_persisted_allowance(
+    state: &HostState,
+    principal: &PrincipalId,
+    resource: &str,
+) -> Result<bool, ErrorCode> {
+    let Some(cache) = &state.profile_cache else {
+        return Ok(false);
+    };
+    let profile = cache.resolve(principal).map_err(|error| {
+        tracing::warn!(%error, "Cannot load durable action approvals");
+        ErrorCode::StoreUnavailable
+    })?;
+    if !profile.enabled {
+        return Ok(false);
+    }
+    let action = SensitiveAction::ExecuteCommand {
+        command: resource.to_owned(),
+        args: vec![],
+    };
+    let location = approval_location(state);
+    let hosted_identity = state.hosted_workspace_root.as_path();
+    if location == CommandApprovalLocation::Hosted
+        && (hosted_identity.as_os_str().is_empty() || hosted_identity.to_str().is_none())
+    {
+        return Ok(false);
+    }
+    Ok(profile.approvals.command_always.iter().any(|grant| {
+        if grant.location != location {
+            return false;
+        }
+        let workspace_ok = match (&grant.workspace_root, location) {
+            (Some(workspace), CommandApprovalLocation::Hosted) => {
+                std::path::Path::new(workspace) == hosted_identity
+            },
+            (None, CommandApprovalLocation::AstridWorkspace) => true,
+            _ => false,
+        };
+        if !workspace_ok {
+            return false;
+        }
+        let pattern = AllowancePattern::CommandPattern {
+            command: format!("{} *", escape_glob_metacharacters(&grant.command)),
+        };
+        pattern.matches(&action, Some(hosted_identity))
+    }))
+}
+
+/// Hosted durable grants bind the pristine portal path, never the `CoW` merged
+/// path used for FS confinement. Empty or non-UTF-8 identity cannot persist.
+fn hosted_workspace_identity(state: &HostState) -> Result<&str, ErrorCode> {
+    let path = state.hosted_workspace_root.as_path();
+    if path.as_os_str().is_empty() {
+        return Err(ErrorCode::InvalidInput);
+    }
+    path.to_str().ok_or(ErrorCode::InvalidInput)
+}
+
+fn approval_location(state: &HostState) -> CommandApprovalLocation {
+    use crate::engine::wasm::host_state::PrincipalMountLocation;
+    if state
+        .effective_workspace()
+        .is_some_and(|mount| matches!(mount.location, PrincipalMountLocation::AstridFilesystem))
+    {
+        CommandApprovalLocation::AstridWorkspace
+    } else {
+        CommandApprovalLocation::Hosted
+    }
+}
+
+/// An Always response is truthful only after its profile write succeeds.
+/// Failed persistence is an error, not a silently downgraded approval.
+fn persist_always(
+    state: &HostState,
+    principal: &PrincipalId,
+    action: &str,
+) -> Result<(), ErrorCode> {
+    let cache = state
+        .profile_cache
+        .as_ref()
+        .ok_or(ErrorCode::StoreUnavailable)?;
+    let persisted = match approval_location(state) {
+        CommandApprovalLocation::AstridWorkspace => {
+            cache.persist_astrid_command_always(principal, action)
+        },
+        CommandApprovalLocation::Hosted => {
+            let workspace = hosted_workspace_identity(state)?;
+            cache.persist_command_always(principal, action, Some(workspace))
+        },
+    };
+    persisted.map_err(|error| {
+        tracing::warn!(%error, "Cannot persist Always approval");
+        ErrorCode::StoreUnavailable
+    })
 }
 
 /// Sanitize a guest-supplied display field in place.
@@ -196,13 +296,26 @@ fn event_principal(event: &AstridEvent) -> Option<&str> {
     }
 }
 
-fn response_principal_matches(expected: &str, event: &AstridEvent) -> bool {
-    event_principal(event) == Some(expected)
+fn event_request_owner(event: &AstridEvent) -> Option<astrid_events::ipc::RequestOwnerId> {
+    match event {
+        AstridEvent::Ipc { message, .. } => message.request_owner,
+        _ => None,
+    }
+}
+
+fn response_identity_matches(
+    expected_principal: &str,
+    expected_owner: astrid_events::ipc::RequestOwnerId,
+    event: &AstridEvent,
+) -> bool {
+    event_principal(event) == Some(expected_principal)
+        && event_request_owner(event) == Some(expected_owner)
 }
 
 async fn await_matching_approval_response(
     receiver: &mut astrid_events::EventReceiver,
     expected_principal: &str,
+    expected_owner: astrid_events::ipc::RequestOwnerId,
     capsule_id: &str,
     request_id: &str,
     timeout: std::time::Duration,
@@ -216,10 +329,11 @@ async fn await_matching_approval_response(
         let Ok(Some(event)) = tokio::time::timeout(remaining, receiver.recv()).await else {
             return None;
         };
-        if response_principal_matches(expected_principal, &event) {
+        if response_identity_matches(expected_principal, expected_owner, &event) {
             return Some(event);
         }
         let got = event_principal(&event);
+        let got_owner = event_request_owner(&event).map(|owner| owner.to_string());
         tracing::warn!(
             target: "astrid.audit.approval",
             security_event = true,
@@ -227,7 +341,9 @@ async fn await_matching_approval_response(
             request_id = %request_id,
             expected_principal = %expected_principal,
             got_principal = got.unwrap_or("<none>"),
-            "approval: rejected cross-principal response; continuing to wait",
+            expected_request_owner = %expected_owner,
+            got_request_owner = got_owner.as_deref().unwrap_or("<none>"),
+            "approval: rejected response from the wrong principal or authenticated request owner",
         );
     }
 }
@@ -271,6 +387,19 @@ impl approval::Host for HostState {
         );
 
         let ws_path = Some(workspace_root.as_path());
+        let mut audit = super::approval_audit::ApprovalAudit::new(
+            self,
+            &principal,
+            &request.action,
+            &request.target_resource,
+        );
+
+        if check_persisted_allowance(self, &principal, &request.target_resource)? {
+            audit.granted(HostApprovalScope::Always, "remembered_consent");
+            return Ok(ApprovalResponse {
+                decision: ApprovalDecision::Allowance,
+            });
+        }
 
         // Fast path: check existing allowances.
         if let Some(ref store) = allowance_store
@@ -282,6 +411,7 @@ impl approval::Host for HostState {
                 resource = %request.target_resource,
                 "Approval auto-granted via existing allowance"
             );
+            audit.granted(HostApprovalScope::Session, "session_allowance");
 
             return Ok(ApprovalResponse {
                 decision: ApprovalDecision::Allowance,
@@ -289,14 +419,34 @@ impl approval::Host for HostState {
         }
 
         // Slow path: publish ApprovalRequired and wait for response.
+        let Some(request_owner) = self
+            .caller_context
+            .as_ref()
+            .and_then(|message| message.request_owner)
+        else {
+            tracing::warn!(
+                target: "astrid.audit.approval",
+                security_event = true,
+                capsule_id = %capsule_id,
+                principal = %principal,
+                "approval request has no authenticated owner; denying"
+            );
+            audit.denied("no_request_owner", "no authenticated request owner");
+            return Ok(ApprovalResponse {
+                decision: ApprovalDecision::Denied,
+            });
+        };
         let request_id = Uuid::new_v4().to_string();
         let response_topic = Topic::approval_response(&request_id);
+        // Durable before the prompt is published.
+        audit.requested(&request_id);
 
         // Subscribe BEFORE publishing to prevent a race.
         let mut receiver = event_bus.subscribe_topic(response_topic.as_str());
 
         let request_payload = IpcPayload::ApprovalRequired {
             request_id: request_id.clone(),
+            request_owner: request_owner.to_string(),
             action: request.action.clone(),
             resource: request.target_resource.clone(),
             reason: format!("Capsule '{capsule_id}' requests approval"),
@@ -306,18 +456,22 @@ impl approval::Host for HostState {
             request_payload,
             Uuid::nil(), // Kernel-originated
         )
-        .with_principal(principal.to_string());
+        .with_principal(principal.to_string())
+        .with_request_owner(request_owner);
         event_bus.publish(AstridEvent::Ipc {
             message,
             metadata: astrid_events::EventMetadata::default(),
         });
 
-        tracing::debug!(
+        tracing::info!(
             plugin = %capsule_id,
+            %request_id,
+            "Approval request pending"
+        );
+        tracing::debug!(
             action = %request.action,
             resource = %request.target_resource,
-            %request_id,
-            "Published approval request, waiting for response"
+            "Approval request details"
         );
 
         // Block until response, timeout, or cancellation.
@@ -329,6 +483,7 @@ impl approval::Host for HostState {
                 await_matching_approval_response(
                     &mut receiver,
                     principal.as_str(),
+                    request_owner,
                     &capsule_id,
                     &request_id,
                     std::time::Duration::from_millis(MAX_APPROVAL_TIMEOUT_MS),
@@ -345,7 +500,26 @@ impl approval::Host for HostState {
                         IpcPayload::ApprovalResponse {
                             decision, reason, ..
                         } => {
+                            if decision == "approve_always"
+                                && let Err(error) =
+                                    persist_always(self, &principal, &request.action)
+                            {
+                                audit.denied("user", "approve_always could not be persisted");
+                                return Err(error);
+                            }
                             let typed = decision_from_str(decision);
+                            match typed {
+                                ApprovalDecision::Approved => {
+                                    audit.granted(HostApprovalScope::Once, "user");
+                                },
+                                ApprovalDecision::ApprovedSession => {
+                                    audit.granted(HostApprovalScope::Session, "user");
+                                },
+                                ApprovalDecision::ApprovedAlways => {
+                                    audit.granted(HostApprovalScope::Always, "user");
+                                },
+                                _ => audit.denied("user", "denied by user"),
+                            }
                             let approved = matches!(
                                 typed,
                                 ApprovalDecision::Approved
@@ -353,8 +527,12 @@ impl approval::Host for HostState {
                                     | ApprovalDecision::ApprovedAlways
                             );
 
-                            // Create allowance for session/always decisions.
-                            if approved && let Some(ref store) = allowance_store {
+                            // Persistent choices were saved above; keep temporary
+                            // allowances in the session store only.
+                            if approved
+                                && decision != "approve_always"
+                                && let Some(ref store) = allowance_store
+                            {
                                 create_allowance_from_decision(
                                     store,
                                     &principal,
@@ -391,6 +569,11 @@ impl approval::Host for HostState {
                     action = %request.action,
                     "Approval request timed out or was cancelled"
                 );
+                if cancel_token.is_cancelled() {
+                    audit.denied("cancelled", "invocation cancelled");
+                } else {
+                    audit.denied("timeout", "no response before the timeout");
+                }
                 // Per WIT: timeout returns the typed `timeout` ErrorCode arm.
                 Err(ErrorCode::Timeout)
             },
@@ -401,3 +584,11 @@ impl approval::Host for HostState {
 #[cfg(test)]
 #[path = "approval_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "approval_hosted_identity_tests.rs"]
+mod hosted_identity_tests;
+
+#[cfg(test)]
+#[path = "approval_audit_tests.rs"]
+mod audit_tests;

@@ -242,9 +242,15 @@ pub(super) fn resolve_path(state: &HostState, raw_path: &str) -> Result<Resolved
 }
 
 fn resolve_logical_workspace(raw_path: &str) -> Result<ResolvedPath, String> {
-    let relative = raw_path.trim_start_matches('/');
-    let path = astrid_storage::FilesystemPath::new(relative.to_owned())
-        .map_err(|error| error.to_string())?;
+    // Guest paths use ordinary current-directory spelling; storage names
+    // remain canonical. Do not collapse parent traversal or empty components.
+    let relative = raw_path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|component| *component != ".")
+        .collect::<Vec<_>>()
+        .join("/");
+    let path = astrid_storage::FilesystemPath::new(relative).map_err(|error| error.to_string())?;
     let gate_path = if path.as_str().is_empty() {
         WORKSPACE_SCHEME.to_owned()
     } else {
@@ -288,4 +294,42 @@ pub(super) fn resolve_vfs(
         vfs,
         handle,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logical_workspace_accepts_current_directory_spellings() {
+        for raw in ["", "/", ".", "./", "/.", "././"] {
+            let resolved = resolve_logical_workspace(raw).expect("workspace root resolves");
+            assert_eq!(resolved.gate_path, WORKSPACE_SCHEME, "{raw:?}");
+            assert_eq!(resolved.relative, PathBuf::new(), "{raw:?}");
+            assert!(resolved.physical.is_none());
+            assert!(matches!(resolved.target, VfsTarget::Workspace));
+        }
+        for raw in ["file", "./file", "././file", "/./file"] {
+            let resolved = resolve_logical_workspace(raw).expect("workspace file resolves");
+            assert_eq!(resolved.gate_path, "workspace://file", "{raw:?}");
+            assert_eq!(resolved.relative, PathBuf::from("file"), "{raw:?}");
+        }
+        let nested = resolve_logical_workspace("dir/./file").expect("nested current directory");
+        assert_eq!(nested.gate_path, "workspace://dir/file");
+        assert_eq!(nested.relative, PathBuf::from("dir/file"));
+    }
+
+    #[test]
+    fn logical_workspace_rejects_noncanonical_or_parent_paths() {
+        for raw in [
+            "..",
+            "../file",
+            "./../file",
+            "dir/../file",
+            "dir//file",
+            "file\0",
+        ] {
+            assert!(resolve_logical_workspace(raw).is_err(), "{raw:?}");
+        }
+    }
 }

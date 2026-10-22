@@ -50,6 +50,18 @@ pub(crate) fn audit_fs<T, E: std::fmt::Debug>(
     path: &str,
     result: &Result<T, E>,
 ) {
+    audit_fs_content(state, op, path, None, result);
+}
+
+/// [`audit_fs`] for a write that carried content: `content_hash` is the BLAKE3
+/// of the bytes written and is recorded on the `FileWrite` entry.
+pub(crate) fn audit_fs_content<T, E: std::fmt::Debug>(
+    state: &HostState,
+    op: &str,
+    path: &str,
+    content_hash: Option<astrid_crypto::ContentHash>,
+    result: &Result<T, E>,
+) {
     let capsule_id = state.capsule_id.as_str();
     let principal = state.effective_principal();
     match result {
@@ -75,7 +87,7 @@ pub(crate) fn audit_fs<T, E: std::fmt::Debug>(
     let Some(sink) = state.audit_sink.as_ref() else {
         return;
     };
-    let Some(event) = fs_event_for_op(op, path) else {
+    let Some(event) = fs_event_for_op(op, path, content_hash) else {
         return;
     };
     let err_buf;
@@ -92,7 +104,11 @@ pub(crate) fn audit_fs<T, E: std::fmt::Debug>(
 /// Map a path-based fs op string to its typed audit event class. Returns
 /// `None` for ops with no clear fs-effect mapping (handle-based ops, no-op
 /// stubs) so the sink is skipped rather than fed a guessed variant.
-fn fs_event_for_op<'a>(op: &str, path: &'a str) -> Option<HostAuditEvent<'a>> {
+fn fs_event_for_op<'a>(
+    op: &str,
+    path: &'a str,
+    content_hash: Option<astrid_crypto::ContentHash>,
+) -> Option<HostAuditEvent<'a>> {
     // `op` is a fully-qualified WIT path (`astrid:fs/host.read-file`) or a
     // bare verb in tests (`read-file`); match on the trailing verb so both
     // forms classify identically.
@@ -103,7 +119,7 @@ fn fs_event_for_op<'a>(op: &str, path: &'a str) -> Option<HostAuditEvent<'a>> {
             Some(HostAuditEvent::FileProbe { path })
         },
         "write-file" | "fs-mkdir" | "mkdir" | "fs-mkdir-all" => {
-            Some(HostAuditEvent::FileWrite { path })
+            Some(HostAuditEvent::FileWrite { path, content_hash })
         },
         "fs-unlink" | "unlink" | "remove" | "remove-dir" => {
             Some(HostAuditEvent::FileDelete { path })
@@ -132,6 +148,13 @@ pub(crate) fn record_fs_denied(
             HostAuditOutcome::Denied(reason),
         );
     }
+}
+
+/// Write-ahead admission for a gated fs effect (fail-closed classes only).
+/// The kernel records a refusal itself; the guest sees a generic `unknown`.
+fn admit(state: &HostState, event: HostAuditEvent<'_>) -> Result<(), ErrorCode> {
+    util::admit_effect(state, event)
+        .map_err(|_| ErrorCode::Unknown(util::AUDIT_UNAVAILABLE.to_owned()))
 }
 
 /// Map a path-resolution error into an `ErrorCode`. Boundary escapes and
@@ -283,7 +306,10 @@ fn gate_write_path(
         if let Err(reason) = check {
             let path = gate_path;
             let event = match kind {
-                WriteKind::Write => HostAuditEvent::FileWrite { path },
+                WriteKind::Write => HostAuditEvent::FileWrite {
+                    path,
+                    content_hash: None,
+                },
                 WriteKind::Delete => HostAuditEvent::FileDelete { path },
             };
             record_fs_denied(state, event, &reason);
@@ -385,6 +411,13 @@ impl fs::Host for HostState {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
         let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Write)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        admit(
+            self,
+            HostAuditEvent::FileWrite {
+                path: &resolved.gate_path,
+                content_hash: None,
+            },
+        )?;
 
         // Strict-create semantics per `astrid:fs@1.0.0` (fs-mkdir
         // distinguished from fs-mkdir-all by failing when an
@@ -445,6 +478,13 @@ impl fs::Host for HostState {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
         let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Write)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        admit(
+            self,
+            HostAuditEvent::FileWrite {
+                path: &resolved.gate_path,
+                content_hash: None,
+            },
+        )?;
         let result =
             util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
                 vfs_path
@@ -520,6 +560,12 @@ impl fs::Host for HostState {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
         let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Delete)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        admit(
+            self,
+            HostAuditEvent::FileDelete {
+                path: &resolved.gate_path,
+            },
+        )?;
         let result =
             util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
                 vfs_path
@@ -544,6 +590,12 @@ impl fs::Host for HostState {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
         let _operation = gate_read_path(self, &resolved.gate_path)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        admit(
+            self,
+            HostAuditEvent::FileRead {
+                path: &resolved.gate_path,
+            },
+        )?;
         // Sentinel string used to encode the "too large at stat time"
         // case as a `PermissionDenied` payload so we can re-raise it
         // as `TooLarge` outside the async block. Keep the marker on a
@@ -615,6 +667,13 @@ impl fs::Host for HostState {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
         let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Write)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        admit(
+            self,
+            HostAuditEvent::FileWrite {
+                path: &resolved.gate_path,
+                content_hash: Some(astrid_crypto::ContentHash::hash(&content)),
+            },
+        )?;
         let result =
             util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
                 let handle = vfs_path
@@ -632,10 +691,11 @@ impl fs::Host for HostState {
                 close_result
             })
             .map_err(map_vfs_err);
-        audit_fs(
+        audit_fs_content(
             self,
             "astrid:fs/host.write-file",
             &resolved.gate_path,
+            Some(astrid_crypto::ContentHash::hash(&content)),
             &result,
         );
         result

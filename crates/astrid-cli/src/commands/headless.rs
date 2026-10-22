@@ -2,10 +2,90 @@
 
 use std::io::IsTerminal;
 
+use std::future::Future;
+use std::time::Duration;
+
 use anyhow::{Context, Result};
+use thiserror::Error;
+
+use astrid_config::MAX_RUN_IDLE_TIMEOUT_SECS;
 
 use super::daemon;
 use crate::{formatter, socket_client, tui};
+
+/// The established headless timeout exit code.
+pub(crate) const TIMEOUT_EXIT_CODE: u8 = 53;
+pub(crate) const AUTO_APPROVE_UNSUPPORTED_MESSAGE: &str = "headless approval automation is unsupported: approvals cannot be \
+     correlated to this run; remove --yes, --yolo, or --autonomous";
+const SUCCESS_EXIT_CODE: u8 = 0;
+/// Best-effort budget for sends during collection cleanup and normal exit.
+const MESSAGE_SEND_BUDGET: Duration = Duration::from_secs(5);
+
+/// Why response collection stopped without a terminal response.
+#[derive(Debug, Error)]
+pub(crate) enum HeadlessError {
+    /// No active-run message arrived within the configured idle budget.
+    #[error("timed out waiting for response after {timeout_secs}s idle")]
+    IdleTimeout {
+        /// The configured idle budget in whole seconds.
+        timeout_secs: u64,
+    },
+    /// The daemon connection failed while collecting the response.
+    #[error(transparent)]
+    Read(#[from] anyhow::Error),
+}
+
+/// Validate and convert a whole-second run idle timeout.
+///
+/// # Errors
+/// Returns an error for zero or values above the one-day operational ceiling.
+pub(crate) fn idle_timeout(timeout_secs: u64) -> Result<Duration> {
+    if timeout_secs == 0 {
+        anyhow::bail!("idle timeout must be greater than 0 seconds");
+    }
+    if timeout_secs > MAX_RUN_IDLE_TIMEOUT_SECS {
+        anyhow::bail!("idle timeout must be at most {MAX_RUN_IDLE_TIMEOUT_SECS} seconds");
+    }
+    Ok(Duration::from_secs(timeout_secs))
+}
+
+/// Source of daemon messages consumed by headless response collection.
+pub(crate) trait ResponseSource {
+    /// Read the next daemon message or report timeout at the source boundary.
+    fn read_message_before(
+        &mut self,
+        remaining: Duration,
+    ) -> impl Future<Output = ReadOutcome> + Send;
+
+    /// Send a message to the daemon.
+    fn send_message(
+        &mut self,
+        message: astrid_types::ipc::IpcMessage,
+    ) -> impl Future<Output = Result<()>> + Send;
+}
+
+/// A deterministic read outcome used to apply the idle deadline at the source.
+pub(crate) enum ReadOutcome {
+    Message(Box<astrid_types::ipc::IpcMessage>),
+    Closed,
+    Timeout,
+    Error(anyhow::Error),
+}
+
+impl ResponseSource for socket_client::SocketClient {
+    async fn read_message_before(&mut self, remaining: Duration) -> ReadOutcome {
+        match tokio::time::timeout(remaining, self.read_message()).await {
+            Ok(Ok(Some(message))) => ReadOutcome::Message(Box::new(message)),
+            Ok(Ok(None)) => ReadOutcome::Closed,
+            Ok(Err(error)) => ReadOutcome::Error(error),
+            Err(_) => ReadOutcome::Timeout,
+        }
+    }
+
+    async fn send_message(&mut self, message: astrid_types::ipc::IpcMessage) -> Result<()> {
+        socket_client::SocketClient::send_message(self, message).await
+    }
+}
 
 /// Resolve the `--session` flag value into a [`uuid::Uuid`].
 ///
@@ -35,7 +115,6 @@ fn resolve_session_arg(s: &str) -> (uuid::Uuid, bool) {
 /// ratatui's `TestBackend` and dumps each significant event as a text frame.
 pub(crate) async fn run_snapshot_tui(
     prompt: String,
-    auto_approve: bool,
     session_name: Option<String>,
     width: u16,
     height: u16,
@@ -64,7 +143,6 @@ pub(crate) async fn run_snapshot_tui(
         prompt: &prompt,
         width,
         height,
-        auto_approve,
     })
     .await
 }
@@ -81,10 +159,31 @@ pub(crate) async fn run_snapshot_tui(
 pub(crate) async fn run_headless(
     prompt: String,
     format: formatter::OutputFormat,
-    auto_approve: bool,
     session_name: Option<String>,
     print_session: bool,
 ) -> Result<()> {
+    // Legacy bare-prompt callers retain the historical process boundary.
+    let code = run_headless_with_timeout(
+        prompt,
+        format,
+        session_name,
+        print_session,
+        Duration::from_mins(2),
+    )
+    .await?;
+    if code != SUCCESS_EXIT_CODE {
+        std::process::exit(code.into());
+    }
+    Ok(())
+}
+
+pub(crate) async fn run_headless_with_timeout(
+    prompt: String,
+    format: formatter::OutputFormat,
+    session_name: Option<String>,
+    print_session: bool,
+    idle_timeout: Duration,
+) -> Result<u8> {
     use astrid_core::SessionId;
 
     daemon::ensure_daemon("headless").await?;
@@ -133,8 +232,16 @@ pub(crate) async fn run_headless(
 
     // Send the prompt and collect the streaming response
     crate::socket_client::send_input_as_active_agent(&mut client, full_prompt).await?;
-    let (response_text, tool_calls) =
-        collect_response(&mut client, &session_id, format, auto_approve).await?;
+    let collected =
+        collect_response_with_cleanup(&mut client, &session_id, format, idle_timeout).await;
+    let (response_text, tool_calls) = match collected {
+        Ok(collected) => collected,
+        Err(HeadlessError::IdleTimeout { timeout_secs }) => {
+            eprintln!("[headless] Timed out waiting for response after {timeout_secs}s idle");
+            return Ok(TIMEOUT_EXIT_CODE);
+        },
+        Err(HeadlessError::Read(error)) => return Err(error),
+    };
 
     // Final output
     match format {
@@ -152,7 +259,28 @@ pub(crate) async fn run_headless(
         },
     }
 
-    // Send disconnect
+    send_disconnect(&mut client, &session_id).await;
+
+    Ok(SUCCESS_EXIT_CODE)
+}
+
+async fn send_message_bounded(
+    client: &mut impl ResponseSource,
+    message: astrid_types::ipc::IpcMessage,
+    budget: Duration,
+) {
+    let _ = tokio::time::timeout(budget, client.send_message(message)).await;
+}
+
+async fn send_disconnect(client: &mut impl ResponseSource, session_id: &astrid_core::SessionId) {
+    send_disconnect_with_budget(client, session_id, MESSAGE_SEND_BUDGET).await;
+}
+
+async fn send_disconnect_with_budget(
+    client: &mut impl ResponseSource,
+    session_id: &astrid_core::SessionId,
+    budget: Duration,
+) {
     let disconnect = astrid_types::ipc::IpcMessage::new(
         astrid_types::Topic::client_disconnect(),
         astrid_types::ipc::IpcPayload::Disconnect {
@@ -160,35 +288,79 @@ pub(crate) async fn run_headless(
         },
         session_id.0,
     );
-    let _ = client.send_message(disconnect).await;
+    send_message_bounded(client, disconnect, budget).await;
+}
 
-    Ok(())
+/// Ensure an idle timeout performs cleanup before its typed error propagates.
+async fn collect_response_with_cleanup(
+    client: &mut impl ResponseSource,
+    session_id: &astrid_core::SessionId,
+    format: formatter::OutputFormat,
+    idle_timeout: Duration,
+) -> std::result::Result<(String, Vec<serde_json::Value>), HeadlessError> {
+    collect_response_with_cleanup_budget(
+        client,
+        session_id,
+        format,
+        idle_timeout,
+        MESSAGE_SEND_BUDGET,
+    )
+    .await
+}
+
+async fn collect_response_with_cleanup_budget(
+    client: &mut impl ResponseSource,
+    session_id: &astrid_core::SessionId,
+    format: formatter::OutputFormat,
+    idle_timeout: Duration,
+    send_budget: Duration,
+) -> std::result::Result<(String, Vec<serde_json::Value>), HeadlessError> {
+    let collected = collect_response(client, session_id, format, idle_timeout).await;
+    if let Err(HeadlessError::IdleTimeout { .. }) = &collected {
+        send_disconnect_with_budget(client, session_id, send_budget).await;
+    }
+    collected
 }
 
 /// Collect the streaming response from the daemon in headless mode.
 ///
-/// Returns `(response_text, tool_calls)`. Auto-denies any approval requests.
-/// Times out after 120 seconds of no data.
+/// Returns `(response_text, tool_calls)`. Approval requests are unsupported
+/// because production cannot prove they belong to this run; they are ignored
+/// without a response and do not reset the idle deadline.
 async fn collect_response(
-    client: &mut socket_client::SocketClient,
+    client: &mut impl ResponseSource,
     session_id: &astrid_core::SessionId,
     format: formatter::OutputFormat,
-    auto_approve: bool,
-) -> Result<(String, Vec<serde_json::Value>)> {
+    idle_timeout: Duration,
+) -> std::result::Result<(String, Vec<serde_json::Value>), HeadlessError> {
     let mut response_text = String::new();
     let mut tool_calls: Vec<serde_json::Value> = Vec::new();
-    let timeout_duration = std::time::Duration::from_mins(2);
+    let timeout_secs = idle_timeout.as_secs();
+    let now = tokio::time::Instant::now();
+    let mut deadline = now.checked_add(idle_timeout).unwrap_or(now);
 
     loop {
-        let message = match tokio::time::timeout(timeout_duration, client.read_message()).await {
-            Ok(Ok(Some(msg))) => msg,
-            Ok(Ok(None)) => break,
-            Ok(Err(e)) => return Err(e.context("Failed to read from daemon")),
-            Err(_) => {
-                eprintln!("[headless] Timed out waiting for response (120s)");
-                std::process::exit(53);
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(HeadlessError::IdleTimeout { timeout_secs });
+        }
+        let message = match client.read_message_before(remaining).await {
+            ReadOutcome::Message(message) => message,
+            ReadOutcome::Closed => break,
+            ReadOutcome::Error(error) => {
+                return Err(HeadlessError::Read(
+                    error.context("Failed to read from daemon"),
+                ));
             },
+            ReadOutcome::Timeout => return Err(HeadlessError::IdleTimeout { timeout_secs }),
         };
+
+        if !is_active_run_message(&message, session_id) {
+            continue;
+        }
+        deadline = tokio::time::Instant::now()
+            .checked_add(idle_timeout)
+            .unwrap_or_else(tokio::time::Instant::now);
 
         match &message.payload {
             astrid_types::ipc::IpcPayload::AgentResponse { text, is_final, .. } => {
@@ -198,6 +370,19 @@ async fn collect_response(
                 }
                 response_text.push_str(text);
                 if *is_final {
+                    break;
+                }
+            },
+            astrid_types::ipc::IpcPayload::RawJson(value)
+                if message.topic.as_str() == astrid_types::Topic::agent_response().as_str() =>
+            {
+                let text = raw_json_response_text(value).unwrap_or_default();
+                if format == formatter::OutputFormat::Pretty {
+                    print!("{text}");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
+                response_text.push_str(text);
+                if raw_json_response_is_final(value) {
                     break;
                 }
             },
@@ -219,33 +404,83 @@ async fn collect_response(
                     "is_error": result.is_error,
                 }));
             },
-            astrid_types::ipc::IpcPayload::ApprovalRequired {
-                request_id, action, ..
-            } => {
-                let decision = if auto_approve { "approve" } else { "deny" };
-                eprintln!(
-                    "[headless] Auto-{} approval for: {action}",
-                    if auto_approve { "approved" } else { "denied" }
-                );
-                let response = astrid_types::ipc::IpcPayload::ApprovalResponse {
-                    request_id: request_id.clone(),
-                    decision: decision.to_string(),
-                    reason: Some(
-                        if auto_approve {
-                            "headless --yes mode"
-                        } else {
-                            "headless mode"
-                        }
-                        .to_string(),
-                    ),
-                };
-                let topic = astrid_types::Topic::approval_response(request_id);
-                let msg = astrid_types::ipc::IpcMessage::new(topic, response, session_id.0);
-                client.send_message(msg).await?;
-            },
             _ => {},
         }
     }
 
     Ok((response_text, tool_calls))
 }
+
+/// A nonterminal control frame must not extend the run's idle budget.
+fn is_active_run_message(
+    message: &astrid_types::ipc::IpcMessage,
+    session_id: &astrid_core::SessionId,
+) -> bool {
+    // Approval requests are never active-run traffic. No run correlation is
+    // currently authenticated, so answering or resetting on one would cross a
+    // security boundary.
+    if matches!(
+        &message.payload,
+        astrid_types::ipc::IpcPayload::ApprovalRequired { .. }
+    ) {
+        return false;
+    }
+
+    match &message.payload {
+        astrid_types::ipc::IpcPayload::AgentResponse {
+            is_final,
+            session_id: target,
+            ..
+        } => {
+            if target != &session_id.0.to_string() {
+                return false;
+            }
+            if message.topic.as_str() == astrid_types::Topic::agent_response().as_str() {
+                return true;
+            }
+            // Typed deltas are active-run traffic only while non-final; a
+            // final frame on the delta topic is never a terminal.
+            message.topic.as_str() == astrid_types::Topic::agent_stream_delta().as_str()
+                && !is_final
+        },
+        astrid_types::ipc::IpcPayload::RawJson(value) => {
+            if !raw_json_session_matches(value, session_id) {
+                return false;
+            }
+            let topic = message.topic.as_str();
+            topic == astrid_types::Topic::agent_stream_delta().as_str()
+                || (topic == astrid_types::Topic::agent_response().as_str()
+                    && raw_json_response_is_final(value))
+        },
+        astrid_types::ipc::IpcPayload::LlmStreamEvent { .. }
+        | astrid_types::ipc::IpcPayload::ToolExecuteResult { .. } => {
+            message.source_id == session_id.0
+        },
+        _ => false,
+    }
+}
+
+/// Cross-runtime producers may send the native chat wire shape instead of a
+/// typed `AgentResponse`; the raw fields mirror the typed response fields.
+fn raw_json_session_matches(
+    value: &serde_json::Value,
+    session_id: &astrid_core::SessionId,
+) -> bool {
+    value.get("session_id").and_then(serde_json::Value::as_str)
+        == Some(session_id.0.to_string().as_str())
+}
+
+fn raw_json_response_text(value: &serde_json::Value) -> Option<&str> {
+    value.get("text").and_then(serde_json::Value::as_str)
+}
+
+fn raw_json_response_is_final(value: &serde_json::Value) -> bool {
+    value
+        .get("is_final")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+#[path = "headless_tests.rs"]
+mod tests;

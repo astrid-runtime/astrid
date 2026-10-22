@@ -3,9 +3,13 @@
 use std::sync::{Arc, atomic::Ordering};
 
 use astrid_capsule::context::ProcessStorageMountBroker as _;
-use astrid_core::{PrincipalId, storage_filesystem::StorageFilesystemOutcomeV1};
+use astrid_core::{
+    PrincipalId,
+    storage_filesystem::{StorageFilesystemOperationV1, StorageFilesystemOutcomeV1},
+};
 
 use super::*;
+use crate::storage_mount::drain_state::DrainFailureKind;
 use crate::storage_mount::process_broker::PROCESS_MOUNT_TEST_ID;
 
 type WorkerJobs = tokio::task::JoinSet<StorageFilesystemOutcomeV1>;
@@ -33,7 +37,16 @@ async fn concurrent_worker_panics_block_cleanup_until_settled_retries() {
     fail_workers(failed_workers).await;
     await_join_failure_publication(&kernel, &stale_projection, failed_workers.len()).await;
     stale_mount.close_async().await;
+    let held_state = Arc::clone(
+        kernel
+            .storage_mounts
+            .get(stale_projection.component_mount_ids.last().unwrap())
+            .unwrap()
+            .value(),
+    );
+    let held_timeout = observe_held_timeout(&held_state).await;
     assert_unsettled_blocker(&kernel, &broker, &caller, &stale_projection, &stale_root).await;
+    let acknowledged_timeout = held_state.failure_observation_for_test().await;
     held_worker.arm_panic_on_release();
     held_worker.release_workers();
     await_join_failure_publication(&kernel, &stale_projection, gates.len()).await;
@@ -41,28 +54,17 @@ async fn concurrent_worker_panics_block_cleanup_until_settled_retries() {
         let _ = worker.expect("worker task joined");
     }
 
-    // The held worker's later JoinFailed escalates the earlier TimedOut
-    // observation. That new failure must consume one exact retry before any
-    // replacement is admitted; otherwise a caller could skip its drain fence.
-    let Err(denied) = PROCESS_MOUNT_TEST_ID
-        .scope(650, broker.mount(&caller))
-        .await
-    else {
-        panic!("escalated failure must block its first retry");
-    };
-    assert!(denied.contains("administrative cleanup"), "{denied}");
-    assert!(
-        stale_root.exists(),
-        "failed exact retry must retain the root"
+    observe_listener_closure(&kernel, &stale_projection).await;
+    held_timeout.expect("held actual worker causally published TimedOut");
+    assert_eq!(
+        acknowledged_timeout,
+        (
+            Some(DrainFailureKind::TimedOut),
+            Some(DrainFailureKind::TimedOut)
+        ),
+        "public unsettled admission must acknowledge held TimedOut before release"
     );
-    assert!(
-        stale_projection
-            .component_mount_ids
-            .iter()
-            .all(|mount_id| kernel.storage_mounts.contains_key(mount_id)),
-        "failed exact retry must retain every lease"
-    );
-
+    assert_public_join_upgrade(&kernel, &broker, &caller, &held_state).await;
     let mounts = retry_concurrently(&broker, &caller).await;
     assert_settled_replacement(&kernel, &broker, &stale_projection, &stale_root, &mounts);
     for mount in mounts {
@@ -90,11 +92,10 @@ fn spawn_panicking_workers(
                 .value(),
         );
         state.set_drain_timeouts_for_test(std::time::Duration::from_millis(80));
-        let gate = Arc::new(crate::storage_mount::BlockingWorkerTestGate::new());
-        *state.blocking_worker_test_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        let gate = state.arm_blocking_worker_gate_for_test();
         let kernel = Arc::clone(kernel);
-        // Stat enters the same blocking-worker gate without taking the
-        // global namespace-mutation lock before the other workers can enter.
+        // Stat reaches the worker gate without taking the global namespace
+        // mutation lock, so each component can enter before one is released.
         let operation = astrid_core::storage_filesystem::StorageFilesystemOperationV1::Stat {
             path: String::new(),
         };
@@ -170,6 +171,84 @@ async fn assert_unsettled_blocker(
         panic!("an unsettled retained panic must deny replacement");
     };
     assert!(denied.contains("administrative cleanup"), "{denied}");
+}
+
+// Observe, never consume, classifier state. The public broker owns refusals.
+async fn observe_held_timeout(
+    state: &Arc<crate::storage_mount::StorageMountLeaseState>,
+) -> Result<(), String> {
+    let mut changed = state.drain_failure_tx.subscribe();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let (failure, _) = state.failure_observation_for_test().await;
+            if failure == Some(DrainFailureKind::TimedOut) {
+                return Ok(());
+            }
+            if failure == Some(DrainFailureKind::JoinFailed) {
+                return Err("held worker unexpectedly classified JoinFailed before release".into());
+            }
+            changed.changed().await.map_err(|e| e.to_string())?;
+        }
+    })
+    .await
+    .map_err(|_| "held timeout publication missing".to_owned())?
+}
+
+async fn observe_listener_closure(
+    kernel: &Arc<crate::Kernel>,
+    projection: &CachedProcessProjection,
+) {
+    for mount_id in &projection.component_mount_ids {
+        let state = Arc::clone(kernel.storage_mounts.get(mount_id).unwrap().value());
+        let mut closed = state.listener_closed_tx.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !*closed.borrow_and_update() {
+                closed.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("actual retained listener and endpoint settle");
+    }
+}
+
+async fn assert_public_join_upgrade(
+    kernel: &Arc<crate::Kernel>,
+    broker: &KernelProcessStorageMountBroker,
+    caller: &PrincipalId,
+    held: &Arc<crate::storage_mount::StorageMountLeaseState>,
+) {
+    use crate::storage_mount::drain_state::DrainFailureKind;
+    assert_eq!(
+        held.failure_observation_for_test().await,
+        (
+            Some(DrainFailureKind::JoinFailed),
+            Some(DrainFailureKind::TimedOut)
+        ),
+        "new JoinFailed severity must remain unacknowledged before public retry"
+    );
+    let (result, diagnostic) = crate::storage_mount::process_broker::retained_diagnostics::capture(
+        PROCESS_MOUNT_TEST_ID.scope(656, broker.mount(caller)),
+    )
+    .await;
+    let Err(error) = result else {
+        panic!("new JoinFailed severity skipped public refusal");
+    };
+    assert!(
+        error.contains("administrative cleanup"),
+        "{error}; {diagnostic:?}"
+    );
+    assert_eq!(
+        held.failure_observation_for_test().await,
+        (
+            Some(DrainFailureKind::JoinFailed),
+            Some(DrainFailureKind::JoinFailed)
+        ),
+        "actual public admission must acknowledge the new severity"
+    );
+    assert!(
+        kernel.storage_mounts.contains_key(&held.mount_id),
+        "failed public retry must retain exact mapped authority"
+    );
 }
 
 async fn retry_concurrently(
@@ -269,4 +348,46 @@ async fn successful_lease_cleanup_with_failed_root_retains_retry_blocker() {
     replacement_mount.close_async().await;
     assert!(kernel.storage_mounts.is_empty());
     assert!(broker.projections.lock().await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicitly_armed_lease_gate_holds_actual_worker_until_release() {
+    let fixture = super::super::exact_fence_fixture().await;
+    let state = Arc::clone(&fixture.states[0]);
+    let gate = state.arm_blocking_worker_gate_for_test();
+    let worker_state = Arc::clone(&state);
+    let worker_kernel = Arc::clone(&fixture.kernel);
+    let worker = tokio::spawn(async move {
+        crate::storage_mount::execute_operation_for_test(
+            worker_kernel,
+            worker_state,
+            StorageFilesystemOperationV1::Stat {
+                path: String::new(),
+            },
+        )
+        .await
+    });
+    let entered = Arc::clone(&gate);
+    tokio::task::spawn_blocking(move || entered.wait_entered(1))
+        .await
+        .expect("worker entry");
+    assert!(
+        !worker.is_finished(),
+        "the armed lease must hold its actual native worker"
+    );
+    gate.release_workers();
+    assert!(matches!(
+        worker.await.expect("worker join"),
+        StorageFilesystemOutcomeV1::Success(_)
+    ));
+    for lease in [&fixture.branch, &fixture.owner, &fixture.shared] {
+        revoke_lease(
+            &fixture.kernel,
+            &fixture.caller,
+            MountOwnerScope::CrossOwnerWrite,
+            lease.mount_id,
+        )
+        .await
+        .expect("fixture cleanup");
+    }
 }

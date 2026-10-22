@@ -23,11 +23,15 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(any(test, target_os = "macos"))]
 mod mount_failure;
+#[cfg(target_os = "macos")]
+mod native_unmount;
 mod provider_failure;
 mod service;
 
 #[cfg(target_os = "macos")]
 use mount_failure::{classify_native_mount_failure, native_mount_failure_message};
+#[cfg(target_os = "macos")]
+pub(crate) use native_unmount::unmount as native_unmount;
 
 const PROVIDER_NAME: &str = "astrid-storage-provider-fskit";
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
@@ -572,19 +576,6 @@ pub(crate) fn native_mount(
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) async fn native_unmount(mountpoint: &Path) -> Result<()> {
-    let status = tokio::process::Command::new("/sbin/umount")
-        .arg(mountpoint)
-        .status()
-        .await
-        .context("invoke macOS unmount")?;
-    if !status.success() {
-        bail!("macOS unmount failed with {status}");
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
 fn native_mount_is_active(mountpoint: &Path) -> Result<bool> {
     let status = nix::sys::statfs::statfs(mountpoint)
         .with_context(|| format!("inspect native mountpoint {}", mountpoint.display()))?;
@@ -932,6 +923,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "actual FSKit runtime: requires macOS 26, a signed enabled extension, and a live lease resource"]
     async fn actual_fskit_mount_and_unmount_round_trip() {
+        let expected_mount_id: StorageMountId = std::env::var("ASTRID_FSKIT_ACTUAL_MOUNT_ID")
+            .context("ASTRID_FSKIT_ACTUAL_MOUNT_ID must name the live mount identity")
+            .expect("live mount identity is available")
+            .parse()
+            .expect("live mount identity must be a UUID");
         let resource = PathBuf::from(
             std::env::var("ASTRID_FSKIT_ACTUAL_RESOURCE")
                 .expect("ASTRID_FSKIT_ACTUAL_RESOURCE must name a live lease resource"),
@@ -944,17 +940,24 @@ mod tests {
             .expect("ASTRID_FSKIT_ACTUAL_TOKEN must name the live lease bearer token");
         astrid_core::platform_fs::validate_private_directory(&resource)
             .expect("live lease resource must be private");
-        astrid_core::platform_fs::validate_private_file(&resource.join("lease.json"))
+        let manifest_path = resource.join("lease.json");
+        astrid_core::platform_fs::validate_private_file(&manifest_path)
             .expect("live lease manifest must be private");
-        let lease = StorageMountLeaseV1 {
-            mount_id: StorageMountId::new(),
-            view: astrid_core::storage_provider::StorageProviderViewV1::Admin,
-            access: astrid_core::storage_provider::StorageProviderAccessV1::ReadOnly,
-            callback_path: resource.join("control.sock"),
-            resource_path: resource,
-            lease_token: token,
-            expires_at_epoch_secs: u64::MAX,
-        };
+        let manifest_bytes = std::fs::read(&manifest_path)
+            .context("read the live lease manifest")
+            .expect("live lease manifest is readable");
+        let lease: StorageMountLeaseV1 = serde_json::from_slice(&manifest_bytes)
+            .context("decode the live lease manifest")
+            .expect("live lease manifest is valid");
+        assert_eq!(lease.mount_id, expected_mount_id, "stale mount identity");
+        assert_eq!(lease.resource_path, resource, "stale lease resource");
+        astrid_core::fskit_socket::validate_callback_path(lease.mount_id, &lease.callback_path)
+            .expect("live callback must be the private managed container endpoint");
+        assert_eq!(lease.lease_token, token, "stale lease callback token");
+        assert!(
+            !lease.callback_path.as_os_str().is_empty() && lease.callback_path.is_absolute(),
+            "the live callback endpoint must be absolute"
+        );
 
         native_mount(&lease, &mountpoint)
             .await

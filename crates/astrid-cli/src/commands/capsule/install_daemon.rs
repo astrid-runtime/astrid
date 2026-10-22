@@ -3,25 +3,55 @@
 //! The CLI must not open the principal package store for a normal install:
 //! the running kernel is the sole durable writer.  This module validates
 //! `--var` against the source manifest and sends the values through the typed
-//! typed daemon install transaction.  Values are staged before the install
-//! lifecycle runs and written again after a successful install through the
-//! typed admin API so a lifecycle and the newly loaded runtime observe the
-//! same projection.
+//! daemon install transaction. The kernel stages the complete environment
+//! before the install lifecycle runs. Do not reapply those values through
+//! admin `EnvSet` after success: each `EnvSet` reloads the runtime and would
+//! restart the capsule once per field.
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, bail};
 use astrid_capsule::capsule::CapsuleId;
 use astrid_capsule::manifest::CapsuleManifest;
 use astrid_core::PrincipalId;
 use astrid_core::kernel_api::{
-    AdminRequestKind, AdminResponseBody, CapsuleInstallAuthority, CapsuleInstallEnv,
-    CapsuleInstallProvenance, EnvStorageScope, EnvValueKind, KernelRequest, KernelResponse,
+    AdminRequestKind, AdminResponseBody, CapsuleInstallAuthority, CapsuleInstallBatchContext,
+    CapsuleInstallEnv, CapsuleInstallProvenance, CapsuleInstallResumeReceipt, EnvValueKind,
+    InstalledCapsuleGeneration, InstalledCapsuleIdentity, KernelRequest, KernelResponse,
 };
 
 use super::install::ManualInstallOptions;
 use super::install_batch::InstalledCapsuleOutcome;
+
+const MAX_BATCH_INSTALL_REQUESTS: usize = 10;
+pub(crate) const BATCH_INSTALL_WINDOW: std::time::Duration = std::time::Duration::from_secs(61);
+static BATCH_INSTALL_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, thiserror::Error)]
+#[error("batch install pass reached the ten-request kernel budget")]
+pub(crate) struct BatchInstallBudgetExhausted;
+
+pub(crate) fn reset_batch_install_budget() {
+    BATCH_INSTALL_REQUESTS.store(0, Ordering::Relaxed);
+}
+
+pub(crate) fn batch_install_budget_exhausted(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<BatchInstallBudgetExhausted>()
+        .is_some()
+}
+
+fn reserve_batch_install_request() -> bool {
+    BATCH_INSTALL_REQUESTS
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            (count < MAX_BATCH_INSTALL_REQUESTS)
+                .then(|| count.checked_add(1))
+                .flatten()
+        })
+        .is_ok()
+}
 
 /// A validated operator value ready for the typed daemon API.
 #[derive(Debug, Clone)]
@@ -37,15 +67,17 @@ struct DaemonEnvValue {
 pub(super) async fn install_local_via_daemon_outcome(
     source: &str,
     prompt: &ManualInstallOptions,
+    target: &PrincipalId,
     authority: CapsuleInstallAuthority,
+    expected_generation: Option<&InstalledCapsuleGeneration>,
+    batch: Option<CapsuleInstallBatchContext>,
 ) -> anyhow::Result<InstalledCapsuleOutcome> {
-    let principal = crate::principal::current();
     crate::commands::daemon::ensure_persistent_daemon("capsule install")
         .await
         .context("capsule install could not ensure the runtime daemon")?;
     let manifest = load_source_manifest(source)?;
     let capsule_id = CapsuleId::new(manifest.package.name.clone())?;
-    let existing_keys = list_existing_keys(&principal, capsule_id.as_str()).await?;
+    let existing_keys = list_existing_keys(target, capsule_id.as_str()).await?;
     let vars = if super::install::BATCH_MODE.load(std::sync::atomic::Ordering::Relaxed) {
         prompt
             .vars
@@ -62,7 +94,16 @@ pub(super) async fn install_local_via_daemon_outcome(
             &astrid_core::dirs::AstridHome::resolve()?.config_path(),
         )?
     };
-    install_local_via_daemon_for_target(source, &vars, &principal, None, authority).await
+    install_local_via_daemon_for_target_in_batch(
+        source,
+        &vars,
+        target,
+        None,
+        authority,
+        expected_generation.cloned(),
+        batch,
+    )
+    .await
 }
 
 async fn list_existing_keys(
@@ -93,6 +134,46 @@ pub(crate) async fn install_local_via_daemon_for_target(
     provenance: Option<CapsuleInstallProvenance>,
     authority: CapsuleInstallAuthority,
 ) -> anyhow::Result<InstalledCapsuleOutcome> {
+    install_local_via_daemon_for_target_in_batch(
+        source, vars, target, provenance, authority, None, None,
+    )
+    .await
+}
+
+async fn install_local_via_daemon_for_target_in_batch(
+    source: &str,
+    vars: &[String],
+    target: &PrincipalId,
+    provenance: Option<CapsuleInstallProvenance>,
+    authority: CapsuleInstallAuthority,
+    expected_generation: Option<InstalledCapsuleGeneration>,
+    batch: Option<CapsuleInstallBatchContext>,
+) -> anyhow::Result<InstalledCapsuleOutcome> {
+    install_local_via_daemon_for_target_with_generation(
+        source,
+        vars,
+        target,
+        provenance,
+        authority,
+        expected_generation,
+        batch,
+    )
+    .await
+}
+
+/// Install through the daemon after checking the authenticated caller's
+/// durable completion receipt. The optional generation is a test/distro
+/// consistency hint; production derives the expected generation exclusively
+/// from the caller-scoped receipt returned by the kernel.
+pub(crate) async fn install_local_via_daemon_for_target_with_generation(
+    source: &str,
+    vars: &[String],
+    target: &PrincipalId,
+    provenance: Option<CapsuleInstallProvenance>,
+    authority: CapsuleInstallAuthority,
+    expected_generation: Option<InstalledCapsuleGeneration>,
+    batch: Option<CapsuleInstallBatchContext>,
+) -> anyhow::Result<InstalledCapsuleOutcome> {
     crate::commands::daemon::ensure_persistent_daemon("capsule install")
         .await
         .context("capsule install could not ensure the runtime daemon")?;
@@ -101,6 +182,59 @@ pub(crate) async fn install_local_via_daemon_for_target(
     let values = validate_values(&manifest, vars)?;
 
     let mut client = crate::socket_client::connect_kernel_for_workspace(None).await?;
+    // A cross-principal install may be authorized, but the read-only query is
+    // deliberately bound to the authenticated caller and never to a request
+    // supplied target. Do not compare the caller's package with another owner.
+    let caller = crate::principal::current();
+    if resume_skip_allowed(&caller, target, &values) {
+        let source_path = source.strip_prefix("file://").unwrap_or(source);
+        // Digest calculation is only evidence for the skip decision. If the
+        // local source is unreadable or malformed, fail closed for resume but
+        // continue with the ordinary daemon install path so the kernel can
+        // return its canonical install error.
+        if let Ok(source_digest) =
+            astrid_capsule_install::archive_digest_for_source(Path::new(source_path))
+        {
+            let receipt = match client
+                .request(KernelRequest::GetCapsuleInstallResumeReceipt {
+                    id: capsule_id.to_string(),
+                })
+                .await
+            {
+                Ok(KernelResponse::CapsuleInstallResumeReceipt(receipt)) => receipt,
+                _ => None,
+            };
+            let receipt_generation = resume_generation_from_receipt(
+                receipt,
+                &capsule_id,
+                &source_digest,
+                expected_generation.as_ref(),
+            );
+            if let Some(receipt_generation) = receipt_generation
+                && let Ok(KernelResponse::InstalledCapsuleIdentity(Some(identity))) = client
+                    .request(KernelRequest::GetInstalledCapsuleIdentity {
+                        id: capsule_id.to_string(),
+                    })
+                    .await
+                && let Some(outcome) = matching_skip_outcome(
+                    &identity,
+                    &capsule_id,
+                    &manifest.package.version,
+                    &source_digest,
+                    Some(&receipt_generation),
+                )
+            {
+                return Ok(outcome);
+            }
+        }
+    }
+    let provenance = bind_batch_provenance(source, &capsule_id, provenance, batch.as_ref())?;
+    if batch.is_none()
+        && super::install::BATCH_MODE.load(Ordering::Relaxed)
+        && !reserve_batch_install_request()
+    {
+        return Err(BatchInstallBudgetExhausted.into());
+    }
     let response = client
         .request(KernelRequest::InstallCapsule {
             source: source.to_owned(),
@@ -116,14 +250,18 @@ pub(crate) async fn install_local_via_daemon_for_target(
                     kind: value.kind,
                 })
                 .collect(),
+            expected_generation,
+            batch,
         })
         .await?;
     match response {
         KernelResponse::Success(output) => {
-            if !values.is_empty() {
-                let mut admin = crate::admin_client::connect_as_active_agent().await?;
-                apply_values(&mut admin, target, capsule_id.as_str(), &values).await?;
-            }
+            // A successful install is completion proof only after the kernel
+            // returns the fresh caller-scoped identity. Receipt persistence is
+            // best effort: a receipt outage must never turn an installed
+            // capsule into a reported failure. Cross-principal installs do not
+            // write a caller-owned receipt for the selected target.
+            persist_resume_receipt(&mut client, &caller, target, &capsule_id).await;
             let version = output
                 .get("installed_version")
                 .and_then(serde_json::Value::as_str)
@@ -137,6 +275,7 @@ pub(crate) async fn install_local_via_daemon_for_target(
                 id: capsule_id,
                 version,
                 wasm_hash,
+                skipped: false,
             })
         },
         KernelResponse::Error(message) => bail!("daemon rejected capsule install: {message}"),
@@ -144,39 +283,145 @@ pub(crate) async fn install_local_via_daemon_for_target(
     }
 }
 
-async fn apply_values(
-    client: &mut crate::admin_client::AdminClient,
-    principal: &PrincipalId,
-    capsule: &str,
-    values: &[DaemonEnvValue],
-) -> anyhow::Result<()> {
-    for value in values {
-        let response = if value.kind == EnvValueKind::Secret && value.value.is_empty() {
-            client
-                .request(AdminRequestKind::EnvDelete {
-                    principal: principal.clone(),
-                    capsule: capsule.to_owned(),
-                    key: value.key.clone(),
-                    kind: value.kind,
-                    scope: EnvStorageScope::Agent,
-                })
-                .await?
-        } else {
-            client
-                .request(AdminRequestKind::EnvSet {
-                    principal: principal.clone(),
-                    capsule: capsule.to_owned(),
-                    key: value.key.clone(),
-                    value: value.value.clone(),
-                    kind: value.kind,
-                    scope: EnvStorageScope::Agent,
-                    append: false,
-                })
-                .await?
-        };
-        crate::admin_client::into_result(response)?;
+fn bind_batch_provenance(
+    source: &str,
+    capsule_id: &CapsuleId,
+    provenance: Option<CapsuleInstallProvenance>,
+    batch: Option<&CapsuleInstallBatchContext>,
+) -> anyhow::Result<Option<CapsuleInstallProvenance>> {
+    let Some(context) = batch else {
+        return Ok(provenance);
+    };
+    let source_path = source.strip_prefix("file://").unwrap_or(source);
+    let digest = format!(
+        "blake3:{}",
+        astrid_capsule_install::source_digest_for_archive(std::path::Path::new(source_path))
+            .with_context(|| format!("digest batch source {source_path}"))?
+    );
+    let mut provenance = provenance.unwrap_or(CapsuleInstallProvenance {
+        distro: None,
+        source_digest: None,
+    });
+    if let Some(existing) = provenance.source_digest.as_deref() {
+        anyhow::ensure!(
+            existing == digest,
+            "batch source digest conflicts with provenance"
+        );
     }
-    Ok(())
+    anyhow::ensure!(
+        context.member_id == capsule_id.as_str(),
+        "batch context member does not match source capsule"
+    );
+    provenance.source_digest = Some(digest);
+    Ok(Some(provenance))
+}
+
+fn resume_generation_from_receipt(
+    receipt: Option<CapsuleInstallResumeReceipt>,
+    expected_id: &CapsuleId,
+    source_digest: &str,
+    expected_generation_hint: Option<&InstalledCapsuleGeneration>,
+) -> Option<InstalledCapsuleGeneration> {
+    let receipt = receipt?;
+    if receipt.id != expected_id.as_str()
+        || !is_digest(source_digest)
+        || receipt.archive_digest != source_digest
+        || !is_generation_well_formed(&receipt.generation)
+        || expected_generation_hint.is_some_and(|hint| hint != &receipt.generation)
+    {
+        return None;
+    }
+    Some(receipt.generation)
+}
+
+async fn persist_resume_receipt(
+    client: &mut astrid_uplink::KernelClient,
+    caller: &PrincipalId,
+    target: &PrincipalId,
+    capsule_id: &CapsuleId,
+) {
+    if caller != target {
+        return;
+    }
+    let Ok(KernelResponse::InstalledCapsuleIdentity(Some(identity))) = client
+        .request(KernelRequest::GetInstalledCapsuleIdentity {
+            id: capsule_id.to_string(),
+        })
+        .await
+    else {
+        return;
+    };
+    if identity.id != capsule_id.as_str()
+        || !is_digest(&identity.archive_digest)
+        || !is_generation_well_formed(&identity.generation)
+    {
+        return;
+    }
+    let _ = client
+        .request(KernelRequest::PutCapsuleInstallResumeReceipt {
+            receipt: CapsuleInstallResumeReceipt {
+                id: identity.id,
+                archive_digest: identity.archive_digest,
+                generation: identity.generation,
+            },
+        })
+        .await;
+}
+
+fn resume_matches(
+    identity: &InstalledCapsuleIdentity,
+    expected_id: &CapsuleId,
+    source_digest: &str,
+    expected_generation: Option<&InstalledCapsuleGeneration>,
+) -> bool {
+    identity.id == expected_id.as_str()
+        && is_digest(source_digest)
+        && identity.archive_digest == source_digest
+        && is_generation_well_formed(&identity.generation)
+        && expected_generation.is_some_and(|expected| expected == &identity.generation)
+}
+
+fn matching_skip_outcome(
+    identity: &InstalledCapsuleIdentity,
+    expected_id: &CapsuleId,
+    version: &str,
+    source_digest: &str,
+    expected_generation: Option<&InstalledCapsuleGeneration>,
+) -> Option<InstalledCapsuleOutcome> {
+    if !resume_matches(identity, expected_id, source_digest, expected_generation) {
+        return None;
+    }
+    Some(InstalledCapsuleOutcome {
+        id: expected_id.clone(),
+        version: version.to_owned(),
+        wasm_hash: identity.wasm_hash.clone(),
+        skipped: true,
+    })
+}
+
+fn resume_skip_allowed(
+    caller: &PrincipalId,
+    target: &PrincipalId,
+    values: &[DaemonEnvValue],
+) -> bool {
+    values.is_empty() && resume_query_allowed(caller, target)
+}
+
+fn resume_query_allowed(caller: &PrincipalId, target: &PrincipalId) -> bool {
+    caller == target
+}
+
+fn is_generation_well_formed(generation: &InstalledCapsuleGeneration) -> bool {
+    is_digest(&generation.archive)
+        && is_digest(&generation.metadata)
+        && is_digest(&generation.authority)
+}
+
+fn is_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn load_source_manifest(source: &str) -> anyhow::Result<CapsuleManifest> {
@@ -252,6 +497,24 @@ fn validate_values(
 mod tests {
     use super::*;
 
+    fn identity(digest: &str, generation: InstalledCapsuleGeneration) -> InstalledCapsuleIdentity {
+        InstalledCapsuleIdentity {
+            id: "example".into(),
+            generation,
+            archive_digest: digest.into(),
+            wasm_hash: Some("e".repeat(64)),
+        }
+    }
+
+    fn generation(seed: char) -> InstalledCapsuleGeneration {
+        let value = seed.to_string().repeat(64);
+        InstalledCapsuleGeneration {
+            archive: value.clone(),
+            metadata: value.clone(),
+            authority: value,
+        }
+    }
+
     fn manifest() -> CapsuleManifest {
         toml::from_str(
             r#"
@@ -284,5 +547,203 @@ mod tests {
     fn vars_reject_unknown_and_invalid_select_values() {
         assert!(validate_values(&manifest(), &["UNKNOWN=x".into()]).is_err());
         assert!(validate_values(&manifest(), &["MODEL=other".into()]).is_err());
+    }
+
+    #[test]
+    fn matching_durable_generation_skips_before_install_capsule() {
+        let id = CapsuleId::new("example").expect("id");
+        let generation = generation('a');
+        let digest = "b".repeat(64);
+        let installed = identity(&digest, generation.clone());
+        assert!(resume_matches(&installed, &id, &digest, Some(&generation)));
+    }
+
+    #[test]
+    fn matching_receipt_supplies_expected_generation() {
+        let id = CapsuleId::new("example").expect("id");
+        let generation = generation('a');
+        let digest = "b".repeat(64);
+        let receipt = CapsuleInstallResumeReceipt {
+            id: id.to_string(),
+            archive_digest: digest.clone(),
+            generation: generation.clone(),
+        };
+        assert_eq!(
+            resume_generation_from_receipt(Some(receipt), &id, &digest, None),
+            Some(generation)
+        );
+    }
+
+    #[test]
+    fn missing_or_mismatched_receipt_does_not_supply_generation() {
+        let id = CapsuleId::new("example").expect("id");
+        let digest = "b".repeat(64);
+        let receipt = CapsuleInstallResumeReceipt {
+            id: id.to_string(),
+            archive_digest: "c".repeat(64),
+            generation: generation('a'),
+        };
+        assert!(resume_generation_from_receipt(None, &id, &digest, None).is_none());
+        assert!(resume_generation_from_receipt(Some(receipt), &id, &digest, None).is_none());
+    }
+
+    #[test]
+    fn matching_skip_carries_canonical_wasm_hash() {
+        let id = CapsuleId::new("example").expect("id");
+        let generation = generation('a');
+        let digest = "b".repeat(64);
+        let installed = identity(&digest, generation.clone());
+        let outcome = matching_skip_outcome(&installed, &id, "1.0.0", &digest, Some(&generation))
+            .expect("matching identity should produce a skip outcome");
+        let expected_hash = "e".repeat(64);
+        assert!(outcome.skipped);
+        assert!(outcome.wasm_hash.as_deref().is_some_and(is_digest));
+        assert_eq!(outcome.wasm_hash.as_deref(), Some(expected_hash.as_str()));
+    }
+
+    #[test]
+    fn matching_identity_skips_when_wasm_hash_absent() {
+        let id = CapsuleId::new("example").expect("id");
+        let generation = generation('a');
+        let digest = "b".repeat(64);
+        let receipt = CapsuleInstallResumeReceipt {
+            id: id.to_string(),
+            archive_digest: digest.clone(),
+            generation: generation.clone(),
+        };
+        let expected_generation = resume_generation_from_receipt(Some(receipt), &id, &digest, None)
+            .expect("matching receipt should supply generation");
+        let mut installed = identity(&digest, generation.clone());
+        installed.wasm_hash = None;
+        assert!(resume_matches(
+            &installed,
+            &id,
+            &digest,
+            Some(&expected_generation)
+        ));
+        let outcome = matching_skip_outcome(
+            &installed,
+            &id,
+            "1.0.0",
+            &digest,
+            Some(&expected_generation),
+        )
+        .expect("matching identity should produce a skip outcome");
+        assert!(outcome.skipped);
+        assert!(outcome.wasm_hash.is_none());
+    }
+
+    #[test]
+    fn archive_digest_mismatch_does_not_skip() {
+        let id = CapsuleId::new("example").expect("id");
+        let installed = identity(&"a".repeat(64), generation('b'));
+        assert!(!resume_matches(&installed, &id, &"c".repeat(64), None));
+    }
+
+    #[test]
+    fn generation_mismatch_does_not_skip() {
+        let id = CapsuleId::new("example").expect("id");
+        let digest = "a".repeat(64);
+        let installed = identity(&digest, generation('b'));
+        assert!(!resume_matches(
+            &installed,
+            &id,
+            &digest,
+            Some(&generation('c'))
+        ));
+    }
+
+    #[test]
+    fn none_expected_generation_does_not_skip() {
+        let id = CapsuleId::new("example").expect("id");
+        let digest = "a".repeat(64);
+        let installed = identity(&digest, generation('b'));
+        assert!(!resume_matches(&installed, &id, &digest, None));
+    }
+
+    #[test]
+    fn malformed_generation_does_not_skip() {
+        let id = CapsuleId::new("example").expect("id");
+        let digest = "a".repeat(64);
+        let installed = identity(
+            &digest,
+            InstalledCapsuleGeneration {
+                archive: "not-a-digest".into(),
+                metadata: "b".repeat(64),
+                authority: "c".repeat(64),
+            },
+        );
+        assert!(!resume_matches(&installed, &id, &digest, None));
+    }
+
+    #[test]
+    fn principal_b_does_not_skip_from_principal_a_snapshot() {
+        let principal_a = PrincipalId::new("alice").expect("principal");
+        let principal_b = PrincipalId::new("bob").expect("principal");
+        assert!(!resume_query_allowed(&principal_b, &principal_a));
+    }
+
+    #[test]
+    fn non_empty_values_do_not_attempt_resume_skip() {
+        let principal = PrincipalId::new("alice").expect("principal");
+        let values = validate_values(&manifest(), &["MODEL=small".into()]).expect("valid vars");
+        assert!(!resume_skip_allowed(&principal, &principal, &values));
+    }
+
+    #[test]
+    fn batch_provenance_binds_exact_source_and_member() {
+        let package = tempfile::tempdir().expect("package");
+        std::fs::write(
+            package.path().join("Capsule.toml"),
+            b"[package]\nname='example'\nversion='1.0.0'\n",
+        )
+        .expect("manifest");
+        let source = tempfile::NamedTempFile::new().expect("source");
+        let archive = astrid_capsule_install::canonical_capsule_archive(package.path())
+            .expect("canonical archive");
+        std::fs::write(source.path(), archive).expect("archive bytes");
+        let id = CapsuleId::new("example").expect("capsule id");
+        let context = CapsuleInstallBatchContext {
+            batch_id: astrid_core::kernel_api::CapsuleInstallBatchId::new(),
+            member_id: id.to_string(),
+        };
+        let provenance =
+            bind_batch_provenance(source.path().to_str().unwrap(), &id, None, Some(&context))
+                .expect("batch provenance")
+                .expect("bound provenance");
+        assert_eq!(
+            provenance.source_digest,
+            Some(format!(
+                "blake3:{}",
+                astrid_capsule_install::source_digest_for_archive(source.path())
+                    .expect("source digest")
+            ))
+        );
+
+        let wrong = CapsuleInstallBatchContext {
+            member_id: "other".to_owned(),
+            ..context
+        };
+        assert!(
+            bind_batch_provenance(source.path().to_str().unwrap(), &id, None, Some(&wrong),)
+                .unwrap_err()
+                .to_string()
+                .contains("member does not match")
+        );
+    }
+
+    #[test]
+    fn install_success_does_not_replay_env_through_admin() {
+        let source = include_str!("install_daemon.rs");
+        let replay = "apply_values".to_owned() + "(";
+        assert!(
+            !source.contains(&replay),
+            "post-success env replay must stay deleted"
+        );
+        let env_set = "AdminRequestKind::".to_owned() + "EnvSet";
+        assert!(
+            !source.contains(&env_set),
+            "install success must not issue per-field admin env writes"
+        );
     }
 }

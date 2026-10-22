@@ -109,6 +109,8 @@ impl ProcessSandboxConfig {
             .collect::<io::Result<Vec<_>>>()?
             .join("\n");
 
+        let ancestor_metadata_rules = self.ancestor_metadata_rules()?;
+
         let profile = format!(
             r#"(version 1)
 (deny default)
@@ -136,6 +138,9 @@ impl ProcessSandboxConfig {
     (literal "/dev/null")
 )
 {scoped_hidden_deny_rules}
+(allow file-read-metadata
+{ancestor_metadata_rules}
+)
 (allow file-read*
     (subpath "{writable_root_str}")
 {extra_read_rules}
@@ -156,6 +161,44 @@ impl ProcessSandboxConfig {
             program: OsString::from("sandbox-exec"),
             args,
         })
+    }
+
+    /// Path canonicalization walks each ancestor with lstat. Permit that
+    /// metadata without opening ancestor directory listings or file contents.
+    /// Keep these literals before trailing hidden-path denies, just like the
+    /// existing exact read/write grants.
+    fn ancestor_metadata_rules(&self) -> io::Result<String> {
+        use std::collections::BTreeSet;
+        use std::path::{Path, PathBuf};
+
+        // Canonical macOS temporary roots also need /private and /private/var
+        // metadata when the broad /tmp and /var aliases are resolved.
+        let temporary_roots = [
+            Path::new("/private/tmp"),
+            Path::new("/private/var/folders"),
+            Path::new("/var/folders"),
+        ];
+        let roots = std::iter::once(self.writable_root.as_path())
+            .chain(self.extra_read_paths.iter().map(PathBuf::as_path))
+            .chain(self.extra_write_paths.iter().map(PathBuf::as_path))
+            .chain(
+                self.ro_injections
+                    .iter()
+                    .map(|injection| injection.target.as_path()),
+            )
+            .chain(temporary_roots);
+        let ancestors: BTreeSet<_> = roots
+            .flat_map(|root| root.ancestors().skip(1))
+            .filter(|path| path.is_absolute())
+            .collect();
+        ancestors
+            .into_iter()
+            .map(|path| {
+                validate_sandbox_str(path, "ancestor metadata path")
+                    .map(|path| format!("    (literal \"{path}\")"))
+            })
+            .collect::<io::Result<Vec<_>>>()
+            .map(|rules| rules.join("\n"))
     }
 }
 
@@ -300,6 +343,99 @@ mod tests {
         assert!(!profile.contains("/private/tmp/aos/home/bob"));
     }
 
+    #[test]
+    fn metadata_traversal_does_not_grant_ancestor_contents() {
+        let prefix = ProcessSandboxConfig::new("/Users/operator/projects/owned")
+            .with_extra_read("/Users/operator/runtime/selected")
+            .with_extra_write("/Users/operator/runtime/selected/cache")
+            .with_hidden("/Users/operator/runtime")
+            .with_hidden("/Users/operator/private")
+            .build_seatbelt_prefix()
+            .unwrap();
+        let profile = prefix.args[1].to_string_lossy();
+        let metadata = profile.find("(allow file-read-metadata").unwrap();
+        let containing_deny = profile
+            .find(r#"(deny file-read* (subpath "/Users/operator/runtime"))"#)
+            .unwrap();
+        let sibling_deny = profile
+            .find(r#"(deny file-read* (subpath "/Users/operator/private"))"#)
+            .unwrap();
+        assert!(containing_deny < metadata);
+        assert!(metadata < sibling_deny);
+        for ancestor in [
+            "/Users",
+            "/Users/operator",
+            "/Users/operator/projects",
+            "/private",
+        ] {
+            assert!(profile.contains(&format!("(literal \"{ancestor}\")")));
+            assert!(!profile.contains(&format!("(subpath \"{ancestor}\")")));
+        }
+    }
+
+    /// A version or inline-expression smoke test never canonicalizes a script
+    /// filename. Exercise the real script loader and preserve content denials.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn node_script_traverses_metadata_without_reading_hidden_contents() {
+        if !sandbox_exec_can_apply() {
+            return;
+        }
+        let Some(node) = which_node() else { return };
+        let root = tempfile::Builder::new()
+            .prefix("astrid-seatbelt-script-")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let workspace = root.path().join("workspace");
+        let hidden = root.path().join("hidden");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&hidden).unwrap();
+        let secret = hidden.join("private.txt");
+        std::fs::write(&secret, "owned-test-marker").unwrap();
+        let script = workspace.join("entry.js");
+        let source = format!(
+            r"const fs = require('fs');
+function denied(op) {{
+  try {{ op(); process.exit(9); }} catch (e) {{
+    if (!['EPERM', 'EACCES'].includes(e.code)) throw e;
+  }}
+}}
+denied(() => fs.readdirSync('/private'));
+denied(() => fs.readFileSync({secret}));
+fs.writeFileSync('created.txt', 'owned-state');
+if (fs.readFileSync('created.txt', 'utf8') !== 'owned-state') process.exit(10);
+fs.renameSync('created.txt', 'renamed.txt');
+fs.unlinkSync('renamed.txt');
+",
+            secret = serde_json::to_string(&secret).unwrap(),
+        );
+        std::fs::write(&script, source).unwrap();
+        let prefix = ProcessSandboxConfig::new(&workspace)
+            .with_hidden(&hidden)
+            .build_seatbelt_prefix()
+            .unwrap();
+        let status = std::process::Command::new(&prefix.program)
+            .args(&prefix.args)
+            .arg(node)
+            .arg(script)
+            .current_dir(&workspace)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .status_bounded()
+            .unwrap()
+            .expect("bounded script execution");
+        assert!(
+            status.success(),
+            "authorized Node script failed: {status:?}"
+        );
+        assert!(!workspace.join("created.txt").exists());
+        assert!(!workspace.join("renamed.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(secret).unwrap(),
+            "owned-test-marker"
+        );
+    }
+
     /// Locate a `node` binary for the enforcement test, or `None` to skip.
     #[cfg(target_os = "macos")]
     fn which_node() -> Option<std::path::PathBuf> {
@@ -362,6 +498,8 @@ mod tests {
             .args(&prefix.args)
             .arg(&node)
             .args(["-e", "process.stdout.write(\"ran\")"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .status_bounded()
             .expect("spawn sandbox-exec")
             .expect("sandbox-exec must exit under the valid profile");
@@ -379,6 +517,8 @@ mod tests {
             .args(["-p", &broken])
             .arg(&node)
             .args(["-e", "process.stdout.write(\"ran\")"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .status_bounded()
             .expect("spawn sandbox-exec")
         else {

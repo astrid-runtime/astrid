@@ -19,6 +19,29 @@ fn egress_event(principal: &str, payload_bytes: usize) -> AstridEvent {
 }
 
 #[test]
+fn native_wire_frame_preserves_request_owner() {
+    let owner = astrid_types::ipc::RequestOwnerId::generate();
+    let message = IpcMessage::new(
+        Topic::grant_result("request-1"),
+        IpcPayload::GrantResult {
+            request_id: "request-1".to_owned(),
+            request_owner: owner.to_string(),
+            principal: "alice".to_owned(),
+            capsule_id: "capsule".to_owned(),
+            granted: true,
+        },
+        Uuid::nil(),
+    )
+    .with_principal("alice")
+    .with_request_owner(owner);
+
+    let frame = message_frame(&message).expect("serialize native frame");
+    assert_eq!(frame["request_owner"], owner.to_string());
+    assert_eq!(frame["principal"], "alice");
+    assert_eq!(frame["payload"]["request_owner"], owner.to_string());
+}
+
+#[test]
 fn general_connection_limit_does_not_consume_the_admin_reserve() {
     let established = Arc::new(tokio::sync::Semaphore::new(1));
     let reserved = Arc::new(tokio::sync::Semaphore::new(1));
@@ -125,15 +148,308 @@ fn kernel_reserved_completion_uses_private_response_topic() {
     );
 }
 
-#[test]
-fn cancel_turn_is_forwarded_only_by_the_active_connection() {
+#[tokio::test]
+async fn elicitation_reply_retains_completed_turn_owner() {
     let bus = Arc::new(EventBus::new());
     let registry = egress::Registry::install(&bus);
-    let owner = registry.subscribe("alice".to_owned(), None);
-    let other = registry.subscribe("alice".to_owned(), None);
+    let connection_owner = astrid_types::ipc::RequestOwnerId::generate();
+    let receiver = registry.subscribe("alice".to_owned(), None, connection_owner);
+    let identity = AuthenticatedIdentity {
+        principal: PrincipalId::new("alice").expect("principal"),
+        device_key_id: None,
+        request_owner: connection_owner,
+    };
+    assert!(receiver.begin_turn("old-chat"));
+    let owner = receiver.turn_owner().expect("turn owner");
+    let id = Uuid::new_v4();
+    let payload = IpcPayload::ElicitRequest {
+        request_id: id,
+        capsule_id: "test".to_owned(),
+        field: astrid_types::OnboardingField {
+            key: "name".to_owned(),
+            prompt: "Name".to_owned(),
+            field_type: astrid_types::OnboardingFieldType::Text,
+            description: None,
+            default: None,
+            placeholder: None,
+        },
+    };
+    bus.publish(AstridEvent::Ipc {
+        metadata: EventMetadata::new("test"),
+        message: IpcMessage::new(Topic::elicit_request(), payload, Uuid::nil())
+            .with_principal("alice")
+            .with_request_owner(owner),
+    });
+    receiver.abandon_unpublished_turn(owner);
+    assert!(receiver.begin_turn("new-chat"));
+    let topic = Topic::elicit_response(id);
+    let mut replies = bus.subscribe_topic(topic.as_str());
+    process_inbound(
+        &bus,
+        &identity,
+        "alice",
+        &receiver,
+        IpcMessage::new(
+            topic,
+            IpcPayload::ElicitResponse {
+                request_id: id,
+                value: Some("Alice".to_owned()),
+                values: None,
+            },
+            Uuid::nil(),
+        ),
+    )
+    .await
+    .expect("reply");
+    let event = replies.try_recv().expect("published reply");
+    let AstridEvent::Ipc { message, .. } = event.as_ref() else {
+        panic!("IPC reply")
+    };
+    assert_eq!(message.request_owner, Some(owner));
+    assert_ne!(receiver.turn_owner(), Some(owner));
+}
+
+#[tokio::test]
+async fn management_approval_reply_preserves_request_owner_during_chat() {
+    let bus = Arc::new(EventBus::new());
+    let registry = egress::Registry::install(&bus);
+    let connection_owner = astrid_types::ipc::RequestOwnerId::generate();
+    let receiver = registry.subscribe("alice".to_owned(), None, connection_owner);
+    let foreign = registry.subscribe(
+        "alice".to_owned(),
+        None,
+        astrid_types::ipc::RequestOwnerId::generate(),
+    );
+    let identity = AuthenticatedIdentity {
+        principal: PrincipalId::new("alice").expect("principal"),
+        device_key_id: None,
+        request_owner: connection_owner,
+    };
+    assert!(receiver.begin_turn("chat"));
+    assert_ne!(receiver.turn_owner(), Some(connection_owner));
+    for decision in ["approve", "deny"] {
+        let request_id = format!("management-{decision}");
+        bus.publish(AstridEvent::Ipc {
+            metadata: EventMetadata::new("test"),
+            message: IpcMessage::new(
+                Topic::approval_request(),
+                IpcPayload::ApprovalRequired {
+                    request_id: request_id.clone(),
+                    request_owner: connection_owner.to_string(),
+                    action: "install".to_owned(),
+                    resource: "capsule".to_owned(),
+                    reason: "test".to_owned(),
+                },
+                Uuid::nil(),
+            )
+            .with_principal("alice")
+            .with_request_owner(connection_owner),
+        });
+        let topic = Topic::approval_response(&request_id);
+        let mut replies = bus.subscribe_topic(topic.as_str());
+        let response = || {
+            IpcMessage::new(
+                topic.clone(),
+                IpcPayload::ApprovalResponse {
+                    request_id: request_id.clone(),
+                    decision: decision.to_owned(),
+                    reason: None,
+                },
+                Uuid::nil(),
+            )
+        };
+        let mut mismatched = response();
+        mismatched.topic = Topic::approval_response("another-request");
+        assert!(
+            process_inbound(&bus, &identity, "alice", &receiver, mismatched)
+                .await
+                .is_err()
+        );
+        assert!(
+            process_inbound(&bus, &identity, "alice", &foreign, response())
+                .await
+                .is_err()
+        );
+        process_inbound(&bus, &identity, "alice", &receiver, response())
+            .await
+            .expect("reply");
+        let event = replies.try_recv().expect("published reply");
+        let AstridEvent::Ipc { message, .. } = event.as_ref() else {
+            panic!("IPC reply")
+        };
+        assert_eq!(message.request_owner, Some(connection_owner));
+        assert!(
+            process_inbound(&bus, &identity, "alice", &receiver, response())
+                .await
+                .is_err(),
+            "replay refused"
+        );
+    }
+}
+
+#[tokio::test]
+async fn legacy_kernel_elicitation_gets_connection_reply_ownership_outside_chat() {
+    let bus = Arc::new(EventBus::new());
+    let registry = egress::Registry::install(&bus);
+    let identity = AuthenticatedIdentity {
+        principal: PrincipalId::new("alice").unwrap(),
+        device_key_id: None,
+        request_owner: astrid_types::ipc::RequestOwnerId::generate(),
+    };
+    let mut receiver = registry.subscribe("alice".into(), None, identity.request_owner);
+    let id = Uuid::new_v4();
+    // Exact shape emitted by the legacy Wasm host: nil source, principal,
+    // typed field, no request owner, and no active chat.
+    bus.publish(AstridEvent::Ipc {
+        metadata: EventMetadata::new("test"),
+        message: IpcMessage::new(
+            Topic::elicit_request(),
+            IpcPayload::ElicitRequest {
+                request_id: id,
+                capsule_id: "test".into(),
+                field: astrid_types::OnboardingField {
+                    key: "name".into(),
+                    prompt: "Name".into(),
+                    field_type: astrid_types::OnboardingFieldType::Text,
+                    description: None,
+                    default: None,
+                    placeholder: None,
+                },
+            },
+            Uuid::nil(),
+        )
+        .with_principal("alice"),
+    });
+    let delivered = receiver.try_recv().unwrap();
+    let AstridEvent::Ipc { message, .. } = &*delivered else {
+        panic!("IPC request")
+    };
+    assert_eq!(message.request_owner, Some(identity.request_owner));
+    let mut replies = bus.subscribe_topic(Topic::elicit_response(id).as_str());
+    process_inbound(
+        &bus,
+        &identity,
+        "alice",
+        &receiver,
+        IpcMessage::new(
+            Topic::elicit_response(id),
+            IpcPayload::ElicitResponse {
+                request_id: id,
+                value: Some("Alice".into()),
+                values: None,
+            },
+            Uuid::nil(),
+        ),
+    )
+    .await
+    .unwrap();
+    let response_event = replies.try_recv().unwrap();
+    let AstridEvent::Ipc { message, .. } = &*response_event else {
+        panic!("IPC reply")
+    };
+    assert_eq!(message.request_owner, Some(identity.request_owner));
+    assert_eq!(receiver.session(), None);
+}
+
+#[tokio::test]
+async fn selection_reply_keeps_picker_owner_and_standalone_selection_stays_connection_scoped() {
+    let bus = Arc::new(EventBus::new());
+    let registry = egress::Registry::install(&bus);
+    let identity = AuthenticatedIdentity {
+        principal: PrincipalId::new("alice").unwrap(),
+        device_key_id: None,
+        request_owner: astrid_types::ipc::RequestOwnerId::generate(),
+    };
+    let receiver = registry.subscribe("alice".into(), None, identity.request_owner);
+    let foreign = registry.subscribe(
+        "alice".into(),
+        None,
+        astrid_types::ipc::RequestOwnerId::generate(),
+    );
+    assert!(receiver.begin_turn("chat"));
+    let topic = Topic::from_raw("registry.v1.selection.callback");
+    bus.publish(picker_event("picker", &topic, identity.request_owner));
+    bus.publish(picker_event("second", &topic, identity.request_owner));
+    let response = |id| {
+        IpcMessage::new(
+            topic.clone(),
+            IpcPayload::Custom {
+                data: serde_json::json!({"request_id":id,"selected_id":"model"}),
+            },
+            Uuid::nil(),
+        )
+    };
+    assert!(receiver.human_reply_owner(&response("wrong")).is_err());
+    assert!(foreign.human_reply_owner(&response("picker")).is_err());
+    let mut replies = bus.subscribe_topic(topic.as_str());
+    process_inbound(&bus, &identity, "alice", &receiver, response("picker"))
+        .await
+        .unwrap();
+    let event = replies.try_recv().unwrap();
+    let AstridEvent::Ipc { message, .. } = &*event else {
+        panic!("IPC reply")
+    };
+    assert_eq!(message.request_owner, Some(identity.request_owner));
+    assert_ne!(message.request_owner, receiver.turn_owner());
+    assert!(
+        receiver.human_reply_owner(&response("picker")).is_err(),
+        "picker reply is single use"
+    );
+    assert_eq!(
+        receiver.human_reply_owner(&response("second")).unwrap(),
+        Some(identity.request_owner),
+        "replying to one picker preserves another on the same callback topic"
+    );
+    process_inbound(
+        &bus,
+        &identity,
+        "alice",
+        &receiver,
+        IpcMessage::new(
+            topic,
+            IpcPayload::RawJson(serde_json::json!({"selected_id":"another-model"})),
+            Uuid::nil(),
+        ),
+    )
+    .await
+    .unwrap();
+    let event = replies.try_recv().unwrap();
+    let AstridEvent::Ipc { message, .. } = &*event else {
+        panic!("IPC command")
+    };
+    assert_eq!(message.request_owner, Some(identity.request_owner));
+}
+
+fn picker_event(id: &str, topic: &Topic, owner: astrid_types::ipc::RequestOwnerId) -> AstridEvent {
+    AstridEvent::Ipc {
+        metadata: EventMetadata::new("test"),
+        message: IpcMessage::new(
+            Topic::from_raw("registry.v1.response.picker"),
+            IpcPayload::SelectionRequired {
+                request_id: id.into(),
+                title: "Model".into(),
+                options: vec![],
+                callback_topic: topic.clone(),
+            },
+            Uuid::nil(),
+        )
+        .with_principal("alice")
+        .with_request_owner(owner),
+    }
+}
+
+#[tokio::test]
+async fn cancel_turn_is_forwarded_only_by_the_active_connection() {
+    let bus = Arc::new(EventBus::new());
+    let registry = egress::Registry::install(&bus);
+    let owner_id = astrid_types::ipc::RequestOwnerId::generate();
+    let other_owner_id = astrid_types::ipc::RequestOwnerId::generate();
+    let owner = registry.subscribe("alice".to_owned(), None, owner_id);
+    let other = registry.subscribe("alice".to_owned(), None, other_owner_id);
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").expect("valid principal"),
         device_key_id: None,
+        request_owner: owner_id,
     };
     let mut inbound = bus.subscribe_topic(routing::CHAT_REQUEST_TOPIC);
     let prompt = |context| {
@@ -148,7 +464,9 @@ fn cancel_turn_is_forwarded_only_by_the_active_connection() {
         )
     };
 
-    process_inbound(&bus, &identity, "alice", &owner, prompt(None)).expect("start turn");
+    process_inbound(&bus, &identity, "alice", &owner, prompt(None))
+        .await
+        .expect("start turn");
     process_inbound(
         &bus,
         &identity,
@@ -156,6 +474,7 @@ fn cancel_turn_is_forwarded_only_by_the_active_connection() {
         &owner,
         prompt(Some(serde_json::json!({"action": "cancel_turn"}))),
     )
+    .await
     .expect("owner cancellation is forwarded");
     assert!(
         process_inbound(
@@ -165,6 +484,7 @@ fn cancel_turn_is_forwarded_only_by_the_active_connection() {
             &other,
             prompt(Some(serde_json::json!({"action": "cancel_turn"}))),
         )
+        .await
         .is_err(),
         "another connection cannot cancel the owner's turn"
     );
@@ -180,8 +500,16 @@ fn cancel_turn_is_forwarded_only_by_the_active_connection() {
 async fn egress_registry_preserves_full_payloads_and_isolates_principals() {
     let bus = Arc::new(EventBus::new());
     let registry = egress::Registry::install(&bus);
-    let mut alice_rx = registry.subscribe("alice".to_owned(), None);
-    let mut bob_rx = registry.subscribe("bob".to_owned(), None);
+    let mut alice_rx = registry.subscribe(
+        "alice".to_owned(),
+        None,
+        astrid_types::ipc::RequestOwnerId::generate(),
+    );
+    let mut bob_rx = registry.subscribe(
+        "bob".to_owned(),
+        None,
+        astrid_types::ipc::RequestOwnerId::generate(),
+    );
 
     // Publishing both events without yielding makes this a deterministic
     // regression for the former shared 1 MiB routed budget: Bob's event
@@ -220,7 +548,11 @@ async fn egress_registry_preserves_full_payloads_and_isolates_principals() {
 async fn unrelated_bus_burst_cannot_lag_client_egress() {
     let bus = Arc::new(EventBus::with_capacity(1));
     let registry = egress::Registry::install(&bus);
-    let mut egress_rx = registry.subscribe("alice".to_owned(), None);
+    let mut egress_rx = registry.subscribe(
+        "alice".to_owned(),
+        None,
+        astrid_types::ipc::RequestOwnerId::generate(),
+    );
 
     for _ in 0..2048 {
         let mut event = egress_event("alice", 1);
@@ -243,7 +575,11 @@ async fn unrelated_bus_burst_cannot_lag_client_egress() {
 async fn one_principal_burst_cannot_lag_another_principal() {
     let bus = Arc::new(EventBus::new());
     let registry = egress::Registry::install(&bus);
-    let mut bob_rx = registry.subscribe("bob".to_owned(), None);
+    let mut bob_rx = registry.subscribe(
+        "bob".to_owned(),
+        None,
+        astrid_types::ipc::RequestOwnerId::generate(),
+    );
 
     for _ in 0..=CLIENT_EGRESS_CAPACITY {
         bus.publish(egress_event("alice", 1));
@@ -265,6 +601,7 @@ async fn token_only_peer_is_anonymous_and_can_round_trip() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = AstridHome::from_path(temp.path().join("home"));
     home.ensure().expect("create Astrid home");
+    std::fs::create_dir_all(home.run_dir()).expect("create ephemeral runtime directory");
     let token = Arc::new(SessionToken::generate());
     token
         .write_to_file(&home.token_path())
@@ -361,6 +698,7 @@ async fn stalled_handshake_does_not_block_later_clients() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = AstridHome::from_path(temp.path().join("home"));
     home.ensure().expect("create Astrid home");
+    std::fs::create_dir_all(home.run_dir()).expect("create ephemeral runtime directory");
     let token = Arc::new(SessionToken::generate());
     token
         .write_to_file(&home.token_path())
@@ -410,6 +748,7 @@ async fn established_connections_release_handshake_capacity() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = AstridHome::from_path(temp.path().join("home"));
     home.ensure().expect("create Astrid home");
+    std::fs::create_dir_all(home.run_dir()).expect("create ephemeral runtime directory");
     let token = Arc::new(SessionToken::generate());
     token
         .write_to_file(&home.token_path())

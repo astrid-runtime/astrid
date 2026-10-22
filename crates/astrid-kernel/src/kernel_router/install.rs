@@ -31,8 +31,8 @@ use astrid_capsule_install::{
     read_archive_manifest,
 };
 use astrid_core::kernel_api::{
-    CapsuleInstallAuthority, CapsuleInstallEnv, CapsuleInstallProvenance, EnvStorageScope,
-    EnvValueKind,
+    CapsuleInstallAuthority, CapsuleInstallBatchMember, CapsuleInstallEnv,
+    CapsuleInstallProvenance, EnvStorageScope, EnvValueKind, InstalledCapsuleGeneration,
 };
 use astrid_events::kernel_api::KernelResponse;
 use astrid_storage::{KvBatchCondition, KvBatchMutation, KvEntryKey, KvMutationBatch};
@@ -50,6 +50,7 @@ struct EnvTransaction {
     uid: astrid_core::identity::PrincipalUid,
     capsule: String,
     snapshots: Vec<EnvSnapshot>,
+    _default_fence: tokio::sync::OwnedRwLockWriteGuard<()>,
 }
 
 impl EnvTransaction {
@@ -70,12 +71,21 @@ pub(super) struct InstallCapsuleRequest<'a> {
     pub(super) provenance: Option<&'a CapsuleInstallProvenance>,
     pub(super) authority: CapsuleInstallAuthority,
     pub(super) env: &'a [CapsuleInstallEnv],
+    pub(super) expected_generation: Option<&'a InstalledCapsuleGeneration>,
+    pub(super) batch_member: Option<&'a CapsuleInstallBatchMember>,
 }
 
 pub(super) async fn handle_install_capsule(
     kernel: &Arc<crate::Kernel>,
     request: InstallCapsuleRequest<'_>,
 ) -> KernelResponse {
+    let expected_package_generation = match super::install_generation::expected_package_generation(
+        request.expected_generation,
+        request.batch_member,
+    ) {
+        Ok(generation) => generation,
+        Err(error) => return KernelResponse::Error(error),
+    };
     let InstallCapsuleRequest {
         caller,
         requested_target,
@@ -84,6 +94,8 @@ pub(super) async fn handle_install_capsule(
         provenance,
         authority,
         env,
+        expected_generation: _,
+        batch_member,
     } = request;
     if workspace {
         return KernelResponse::Error(
@@ -98,8 +110,24 @@ pub(super) async fn handle_install_capsule(
         Err(error) => return KernelResponse::Error(error),
     };
 
+    // Batch callers control the source pathname. Copy its one safely-opened
+    // file description into memory before any digest, manifest, authority,
+    // environment, or install work. Every later archive stage consumes these
+    // immutable bytes and never reopens a temporary pathname.
+    let batch_archive =
+        match super::install_batch_archive::prepare_batch_archive(&path, batch_member) {
+            Ok(archive) => archive,
+            Err(error) => return KernelResponse::Error(error),
+        };
+
     let target = requested_target.unwrap_or(caller);
-    if let Err(error) = validate_install_provenance(&path, provenance) {
+    if let Err(error) = validate_install_provenance(
+        &path,
+        batch_archive
+            .as_ref()
+            .map(|archive| archive.bytes.as_slice()),
+        provenance,
+    ) {
         return KernelResponse::Error(error);
     }
     // Resolve the immutable UID before any environment or package mutation.
@@ -113,38 +141,92 @@ pub(super) async fn handle_install_capsule(
         return KernelResponse::Error(error);
     }
 
-    let env_transaction = match stage_env_values(kernel, target, &path, env).await {
+    let lifecycle_cpu = match crate::user_resources::execution_throttle(
+        &kernel.user_cpu,
+        &kernel.profile_cache,
+        &kernel.groups,
+        target,
+    )
+    .await
+    {
+        Ok(throttle) => throttle,
+        Err(error) => return KernelResponse::Error(error),
+    };
+    let env_transaction = match stage_env_values(
+        kernel,
+        target,
+        &path,
+        batch_archive.as_ref().map(|archive| &archive.manifest),
+        env,
+    )
+    .await
+    {
         Ok(transaction) => transaction,
         Err(error) => return KernelResponse::Error(error),
     };
 
-    let home = match astrid_core::dirs::AstridHome::resolve() {
-        Ok(h) => h,
-        Err(e) => return KernelResponse::Error(format!("resolve AstridHome: {e}")),
-    };
-
-    let options = InstallOptions {
-        workspace: false,
-        original_source: Some(source.to_string()),
-        skip_import_check: false,
-        // Kernel-side installs run unattended — no human to answer
-        // elicit() during the lifecycle hook. A capsule that depends
-        // on install-time elicit must be configured via env before
-        // being installed through this path.
-        lifecycle_bus: None,
-        storage: kernel.principal_store.clone().map(Arc::new),
-        provenance_distro: provenance.and_then(|value| value.distro.clone()),
-        provenance_source_digest: provenance.and_then(|value| value.source_digest.clone()),
-    };
-
-    let output = match run_authorized_install(kernel, target, path, home, options, authority).await
+    match install_and_activate(
+        kernel,
+        target,
+        source,
+        path,
+        batch_archive,
+        provenance,
+        authority,
+        env_transaction,
+        expected_package_generation,
+        lifecycle_cpu,
+    )
+    .await
     {
+        Ok(output) => KernelResponse::Success(install_output_json(&output)),
+        Err(error) => KernelResponse::Error(error),
+    }
+}
+
+/// Install against the kernel-bound home, then activate once, rolling env back on failure.
+#[allow(clippy::too_many_arguments)]
+async fn install_and_activate(
+    kernel: &Arc<crate::Kernel>,
+    target: &astrid_core::principal::PrincipalId,
+    source: &str,
+    path: std::path::PathBuf,
+    batch_archive: Option<super::install_batch_archive::BatchArchive>,
+    provenance: Option<&CapsuleInstallProvenance>,
+    authority: CapsuleInstallAuthority,
+    env_transaction: Option<EnvTransaction>,
+    expected_package_generation: Option<astrid_storage::CapsulePackageGeneration>,
+    lifecycle_cpu: Option<astrid_capsule::user_cpu::throttle::ExecutionThrottle>,
+) -> Result<InstallOutput, String> {
+    let home = kernel.astrid_home.clone();
+    let options = daemon_install_options(
+        kernel,
+        source,
+        provenance,
+        expected_package_generation,
+        lifecycle_cpu,
+    );
+    let install = match batch_archive {
+        Some(archive) => {
+            super::install_batch_archive::run_authorized_archive_install(
+                kernel,
+                target,
+                archive.bytes,
+                home,
+                options,
+                authority,
+            )
+            .await
+        },
+        None => run_authorized_install(kernel, target, path, home, options, authority).await,
+    };
+    let output = match install {
         Ok(output) => output,
         Err(error) => {
             if let Some(transaction) = env_transaction {
                 transaction.rollback(kernel).await;
             }
-            return KernelResponse::Error(error);
+            return Err(error);
         },
     };
 
@@ -156,10 +238,35 @@ pub(super) async fn handle_install_capsule(
         if let Some(transaction) = env_transaction {
             transaction.rollback(kernel).await;
         }
-        return KernelResponse::Error(error);
+        return Err(error);
     }
+    crate::capsule_audit::record_capsule_installed(kernel, target, &output).await;
+    Ok(output)
+}
 
-    KernelResponse::Success(install_output_json(&output))
+fn daemon_install_options(
+    kernel: &Arc<crate::Kernel>,
+    source: &str,
+    provenance: Option<&CapsuleInstallProvenance>,
+    expected_package_generation: Option<astrid_storage::CapsulePackageGeneration>,
+    lifecycle_cpu: Option<astrid_capsule::user_cpu::throttle::ExecutionThrottle>,
+) -> InstallOptions {
+    InstallOptions {
+        workspace: false,
+        original_source: Some(source.to_string()),
+        skip_import_check: false,
+        // Kernel installs run unattended. Capsules needing install-time
+        // elicitation must receive configuration through the request env.
+        lifecycle_bus: None,
+        storage: kernel.principal_store.clone().map(Arc::new),
+        provenance_distro: provenance.and_then(|value| value.distro.clone()),
+        provenance_source_digest: provenance.and_then(|value| value.source_digest.clone()),
+        expected_package_generation,
+        // Install and upgrade hooks record their host calls (file writes,
+        // network, HTTP) on the signed audit log like a running capsule.
+        audit_sink: Some(Arc::new(kernel.audit_sink.as_ref().clone())),
+        lifecycle_cpu,
+    }
 }
 
 fn local_install_path(source: &str) -> Result<std::path::PathBuf, String> {
@@ -272,6 +379,7 @@ const MAX_SOURCE_DIGEST_BYTES: u64 = 64 * 1024 * 1024;
 /// callers cannot use a path or an arbitrary label as a digest.
 fn validate_install_provenance(
     source: &std::path::Path,
+    archive: Option<&[u8]>,
     provenance: Option<&CapsuleInstallProvenance>,
 ) -> Result<(), String> {
     let Some(provenance) = provenance else {
@@ -301,22 +409,33 @@ fn validate_install_provenance(
                 .to_owned(),
         );
     }
-    let metadata = std::fs::metadata(source)
-        .map_err(|error| format!("inspect provenance source {}: {error}", source.display()))?;
-    if !metadata.is_file() {
-        return Err(
-            "install provenance source_digest is supported only for a local capsule archive"
-                .to_owned(),
-        );
-    }
-    if metadata.len() > MAX_SOURCE_DIGEST_BYTES {
+    let bytes = if let Some(bytes) = archive {
+        std::borrow::Cow::Borrowed(bytes)
+    } else {
+        let metadata = std::fs::metadata(source)
+            .map_err(|error| format!("inspect provenance source {}: {error}", source.display()))?;
+        if !metadata.is_file() {
+            return Err(
+                "install provenance source_digest is supported only for a local capsule archive"
+                    .to_owned(),
+            );
+        }
+        if metadata.len() > MAX_SOURCE_DIGEST_BYTES {
+            return Err(format!(
+                "install provenance source exceeds {MAX_SOURCE_DIGEST_BYTES}-byte digest limit"
+            ));
+        }
+        std::borrow::Cow::Owned(
+            std::fs::read(source)
+                .map_err(|error| format!("read provenance source {}: {error}", source.display()))?,
+        )
+    };
+    if bytes.len() as u64 > MAX_SOURCE_DIGEST_BYTES {
         return Err(format!(
             "install provenance source exceeds {MAX_SOURCE_DIGEST_BYTES}-byte digest limit"
         ));
     }
-    let bytes = std::fs::read(source)
-        .map_err(|error| format!("read provenance source {}: {error}", source.display()))?;
-    let actual = format!("blake3:{}", blake3::hash(&bytes).to_hex());
+    let actual = format!("blake3:{}", blake3::hash(bytes.as_ref()).to_hex());
     if actual != expected {
         return Err(format!(
             "install provenance source_digest mismatch: expected {expected}, got {actual}"
@@ -329,24 +448,40 @@ async fn stage_env_values(
     kernel: &Arc<crate::Kernel>,
     caller: &astrid_core::principal::PrincipalId,
     source: &std::path::Path,
+    batch_manifest: Option<&astrid_capsule::manifest::CapsuleManifest>,
     values: &[CapsuleInstallEnv],
 ) -> Result<Option<EnvTransaction>, String> {
-    if values.is_empty() {
-        return Ok(None);
-    }
-    let manifest = if source.is_dir() {
-        astrid_capsule::discovery::load_manifest(&source.join("Capsule.toml"))
-            .map_err(|error| format!("validate capsule manifest: {error}"))?
+    let loaded_manifest;
+    let manifest = if let Some(manifest) = batch_manifest {
+        manifest
     } else {
-        read_archive_manifest(source)
-            .map_err(|error| format!("validate capsule manifest: {error:#}"))?
+        loaded_manifest = if source.is_dir() {
+            astrid_capsule::discovery::load_manifest(&source.join("Capsule.toml"))
+                .map_err(|error| format!("validate capsule manifest: {error}"))?
+        } else {
+            read_archive_manifest(source)
+                .map_err(|error| format!("validate capsule manifest: {error:#}"))?
+        };
+        &loaded_manifest
     };
     let capsule = manifest.package.name.clone();
     let uid = kernel
         .principal_directory
         .uid_for(caller)
         .map_err(|error| format!("resolve durable principal UID: {error}"))?;
-    validate_env_values(&manifest, values)?;
+    validate_env_values(manifest, values)?;
+
+    // Keep defaults, inherited grants and other installs out through commit/rollback,
+    // including installs with no environment changes. Package publication must not
+    // race a grant's absence check and inherited configuration copy.
+    // Otherwise one rollback can restore another failed install's staged value.
+    // Never wait here: activation may itself request an install.
+    let default_fence = Arc::clone(&kernel.env_install_fence)
+        .try_write_owned()
+        .map_err(|_| "environment transaction in progress; retry the install".to_owned())?;
+    // Serialize shared/agent environment staging with admin default writes.
+    // Keep the lock only for the KV transaction, never capsule activation.
+    let _env_guard = kernel.admin_write_lock.lock().await;
 
     let mut snapshots = Vec::with_capacity(values.len());
     for value in values {
@@ -380,9 +515,6 @@ async fn stage_env_values(
             staged,
         });
     }
-    if snapshots.is_empty() {
-        return Ok(None);
-    }
     let (agent, shared) = partition_env_snapshots(snapshots);
     if !apply_env_snapshot_group(kernel, uid, &capsule, &agent, false).await? {
         return Err(
@@ -410,6 +542,7 @@ async fn stage_env_values(
         uid,
         capsule,
         snapshots,
+        _default_fence: default_fence,
     }))
 }
 
@@ -550,17 +683,24 @@ async fn rollback_env_snapshot_group(
     capsule: &str,
     snapshots: Vec<EnvSnapshot>,
 ) {
-    match apply_env_snapshot_group(kernel, uid, capsule, &snapshots, true).await {
-        Ok(true) => {},
-        Ok(false) => tracing::warn!(
-            capsule = %capsule,
-            "environment rollback skipped after a concurrent value change"
-        ),
-        Err(error) => tracing::error!(
-            capsule = %capsule,
-            error = %error,
-            "failed to restore pre-install environment values atomically"
-        ),
+    // Staging is all-or-nothing, but rollback must preserve each later edit
+    // independently. One changed key must not strand unrelated staged values.
+    // Each single-key batch still atomically compares and restores its snapshot.
+    for snapshot in snapshots {
+        match apply_env_snapshot_group(kernel, uid, capsule, std::slice::from_ref(&snapshot), true)
+            .await
+        {
+            Ok(true) => {},
+            Ok(false) => tracing::warn!(
+                capsule = %capsule,
+                "environment rollback preserved a concurrently changed key"
+            ),
+            Err(error) => tracing::error!(
+                capsule = %capsule,
+                error = %error,
+                "failed to restore a pre-install environment value"
+            ),
+        }
     }
 }
 
@@ -604,287 +744,5 @@ fn install_output_json(o: &InstallOutput) -> serde_json::Value {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use astrid_core::PrincipalId;
-
-    #[tokio::test]
-    async fn install_env_transaction_restores_existing_text_and_secret_values() {
-        let root = tempfile::tempdir().unwrap();
-        let home = astrid_core::dirs::AstridHome::from_path(root.path());
-        let kernel = crate::test_kernel_with_home(home.clone()).await;
-        let principal = PrincipalId::new("install-env").unwrap();
-        kernel
-            .principal_directory
-            .register(
-                principal.clone(),
-                astrid_core::identity::PrincipalUid::from_bytes([7; 32]),
-            )
-            .unwrap();
-        astrid_core::profile::PrincipalProfile::default()
-            .save_to_path(&astrid_core::profile::PrincipalProfile::path_for(
-                &home, &principal,
-            ))
-            .unwrap();
-        let source = root.path().join("fixture");
-        std::fs::create_dir_all(&source).unwrap();
-        std::fs::write(
-            source.join("Capsule.toml"),
-            r#"
-                [package]
-                name = "fixture"
-                version = "1.0.0"
-                [env.PLAIN]
-                type = "text"
-                [env.SECRET]
-                type = "secret"
-            "#,
-        )
-        .unwrap();
-        let uid = kernel.principal_directory.uid_for(&principal).unwrap();
-        let plain = astrid_storage::ScopedKvStore::new(
-            Arc::clone(&kernel.kv),
-            astrid_storage::env::principal_capsule_namespace(uid, "fixture"),
-        )
-        .unwrap();
-        plain
-            .set(&astrid_storage::env::env_key("PLAIN"), b"old".to_vec())
-            .await
-            .unwrap();
-        let secret = astrid_storage::ScopedKvStore::new(
-            Arc::clone(&kernel.kv),
-            astrid_storage::env::system_secret_namespace("fixture"),
-        )
-        .unwrap();
-        secret
-            .set(
-                &format!("{}SECRET", astrid_storage::env::SECRET_KEY_PREFIX),
-                b"old-secret".to_vec(),
-            )
-            .await
-            .unwrap();
-
-        let values = vec![
-            CapsuleInstallEnv {
-                key: "PLAIN".into(),
-                value: "new".into(),
-                kind: EnvValueKind::Text,
-            },
-            CapsuleInstallEnv {
-                key: "SECRET".into(),
-                value: "new-secret".into(),
-                kind: EnvValueKind::Secret,
-            },
-        ];
-        let transaction = stage_env_values(&kernel, &principal, &source, &values)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            plain
-                .get(&astrid_storage::env::env_key("PLAIN"))
-                .await
-                .unwrap(),
-            Some(b"new".to_vec())
-        );
-        assert_eq!(
-            secret
-                .get(&format!("{}SECRET", astrid_storage::env::SECRET_KEY_PREFIX))
-                .await
-                .unwrap(),
-            Some(b"new-secret".to_vec())
-        );
-        transaction.rollback(&kernel).await;
-        assert_eq!(
-            plain
-                .get(&astrid_storage::env::env_key("PLAIN"))
-                .await
-                .unwrap(),
-            Some(b"old".to_vec())
-        );
-        assert_eq!(
-            secret
-                .get(&format!("{}SECRET", astrid_storage::env::SECRET_KEY_PREFIX))
-                .await
-                .unwrap(),
-            Some(b"old-secret".to_vec())
-        );
-    }
-
-    #[tokio::test]
-    async fn env_rollback_does_not_clobber_a_concurrent_edit() {
-        let root = tempfile::tempdir().unwrap();
-        let home = astrid_core::dirs::AstridHome::from_path(root.path());
-        let kernel = crate::test_kernel_with_home(home.clone()).await;
-        let principal = PrincipalId::new("rollback-edit").unwrap();
-        kernel
-            .principal_directory
-            .register(
-                principal.clone(),
-                astrid_core::identity::PrincipalUid::from_bytes([8; 32]),
-            )
-            .unwrap();
-        astrid_core::profile::PrincipalProfile::default()
-            .save_to_path(&astrid_core::profile::PrincipalProfile::path_for(
-                &home, &principal,
-            ))
-            .unwrap();
-        let source = root.path().join("fixture");
-        std::fs::create_dir_all(&source).unwrap();
-        std::fs::write(
-            source.join("Capsule.toml"),
-            r#"
-                [package]
-                name = "fixture"
-                version = "1.0.0"
-                [env.PLAIN]
-                type = "text"
-                [env.SECRET]
-                type = "secret"
-            "#,
-        )
-        .unwrap();
-        let uid = kernel.principal_directory.uid_for(&principal).unwrap();
-        let plain_namespace = astrid_storage::env::principal_capsule_namespace(uid, "fixture");
-        let plain_key = astrid_storage::env::env_key("PLAIN");
-        let secret_namespace = astrid_storage::env::system_secret_namespace("fixture");
-        let secret_key = format!("{}SECRET", astrid_storage::env::SECRET_KEY_PREFIX);
-        kernel
-            .kv
-            .set(&plain_namespace, &plain_key, b"old".to_vec())
-            .await
-            .unwrap();
-        kernel
-            .kv
-            .set(&secret_namespace, &secret_key, b"old-secret".to_vec())
-            .await
-            .unwrap();
-        let values = vec![
-            CapsuleInstallEnv {
-                key: "PLAIN".into(),
-                value: "staged".into(),
-                kind: EnvValueKind::Text,
-            },
-            CapsuleInstallEnv {
-                key: "SECRET".into(),
-                value: "staged-secret".into(),
-                kind: EnvValueKind::Secret,
-            },
-        ];
-        let transaction = stage_env_values(&kernel, &principal, &source, &values)
-            .await
-            .unwrap()
-            .unwrap();
-        kernel
-            .kv
-            .set(&plain_namespace, &plain_key, b"operator-edit".to_vec())
-            .await
-            .unwrap();
-        transaction.rollback(&kernel).await;
-        assert_eq!(
-            kernel.kv.get(&plain_namespace, &plain_key).await.unwrap(),
-            Some(b"operator-edit".to_vec())
-        );
-        assert_eq!(
-            kernel.kv.get(&secret_namespace, &secret_key).await.unwrap(),
-            Some(b"old-secret".to_vec()),
-            "Shared secret rollback is a separate owner batch from Agent text"
-        );
-    }
-
-    #[test]
-    fn provenance_source_digest_is_checked_before_install_mutation() {
-        let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("fixture.capsule");
-        std::fs::write(&source, b"capsule-bytes").unwrap();
-        let provenance = CapsuleInstallProvenance {
-            distro: Some("sealed-distro".into()),
-            source_digest: Some(format!("blake3:{}", blake3::hash(b"different").to_hex())),
-        };
-        let error = validate_install_provenance(&source, Some(&provenance)).unwrap_err();
-        assert!(error.contains("source_digest mismatch"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn install_secret_is_staged_in_system_secret_namespace() {
-        let root = tempfile::tempdir().unwrap();
-        let home = astrid_core::dirs::AstridHome::from_path(root.path());
-        let kernel = crate::test_kernel_with_home(home.clone()).await;
-        let principal = PrincipalId::new("install-shared-secret").unwrap();
-        kernel
-            .principal_directory
-            .register(
-                principal.clone(),
-                astrid_core::identity::PrincipalUid::from_bytes([9; 32]),
-            )
-            .unwrap();
-        astrid_core::profile::PrincipalProfile::default()
-            .save_to_path(&astrid_core::profile::PrincipalProfile::path_for(
-                &home, &principal,
-            ))
-            .unwrap();
-        let source = root.path().join("fixture");
-        std::fs::create_dir_all(&source).unwrap();
-        std::fs::write(
-            source.join("Capsule.toml"),
-            r#"
-                [package]
-                name = "fixture"
-                version = "1.0.0"
-                [env.PLAIN]
-                type = "text"
-                [env.SECRET]
-                type = "secret"
-            "#,
-        )
-        .unwrap();
-        let values = vec![
-            CapsuleInstallEnv {
-                key: "PLAIN".into(),
-                value: "site-text".into(),
-                kind: EnvValueKind::Text,
-            },
-            CapsuleInstallEnv {
-                key: "SECRET".into(),
-                value: "site-secret".into(),
-                kind: EnvValueKind::Secret,
-            },
-        ];
-        stage_env_values(&kernel, &principal, &source, &values)
-            .await
-            .unwrap()
-            .unwrap();
-
-        let uid = kernel.principal_directory.uid_for(&principal).unwrap();
-        let shared_secret = kernel
-            .kv
-            .get(
-                &astrid_storage::env::system_secret_namespace("fixture"),
-                &format!("{}SECRET", astrid_storage::env::SECRET_KEY_PREFIX),
-            )
-            .await
-            .unwrap();
-        assert_eq!(shared_secret.as_deref(), Some(b"site-secret".as_slice()));
-        let installer_secret = kernel
-            .kv
-            .get(
-                &astrid_storage::env::principal_secret_namespace(uid, "fixture"),
-                &format!("{}SECRET", astrid_storage::env::SECRET_KEY_PREFIX),
-            )
-            .await
-            .unwrap();
-        assert!(
-            installer_secret.is_none(),
-            "install secrets must not land in the installer principal secret namespace"
-        );
-        let installer_text = kernel
-            .kv
-            .get(
-                &astrid_storage::env::principal_capsule_namespace(uid, "fixture"),
-                &astrid_storage::env::env_key("PLAIN"),
-            )
-            .await
-            .unwrap();
-        assert_eq!(installer_text.as_deref(), Some(b"site-text".as_slice()));
-    }
-}
+#[path = "install_internal_tests.rs"]
+mod tests;

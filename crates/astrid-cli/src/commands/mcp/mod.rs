@@ -30,13 +30,68 @@
 //! The MCP transport owns stdout: only JSON-RPC frames may be written
 //! there. Every diagnostic in this module goes through `tracing` — never
 //! `println!`. `bootstrap::init_logging` forces the log target off stdout
-//! for `mcp serve` (to the log file, else stderr) regardless of operator
-//! config, so a stray diagnostic can never corrupt the protocol stream.
+//! to stderr regardless of operator config, so a stray diagnostic can never
+//! corrupt the protocol stream or materialize stopped-runtime sidecars.
 
+// The persistent gateway uses Unix-domain sockets. Keep those implementations
+// out of non-Unix builds while preserving the CLI command surface with an
+// actionable unsupported-target error.
+#[cfg(unix)]
+mod attach;
+#[cfg(not(unix))]
+mod attach {
+    use std::path::Path;
+    use std::process::ExitCode;
+
+    use anyhow::Result;
+
+    pub(crate) async fn run(
+        _principal: Option<&str>,
+        _workspace: Option<&Path>,
+    ) -> Result<ExitCode> {
+        anyhow::bail!("MCP gateway attach is only supported on Unix hosts")
+    }
+}
+mod consent_display;
 mod elicit;
 mod form_elicitation;
+#[cfg(unix)]
+mod gateway;
+#[cfg(unix)]
+mod idle;
+#[cfg(not(unix))]
+mod gateway {
+    use std::process::ExitCode;
+
+    use anyhow::Result;
+
+    pub(crate) async fn run(_principal: Option<&str>) -> Result<ExitCode> {
+        anyhow::bail!("MCP gateway is only supported on Unix hosts")
+    }
+}
 mod grant;
+pub(crate) mod http;
 mod ingress;
+#[cfg(unix)]
+mod lifecycle;
+#[cfg(not(unix))]
+mod lifecycle {
+    use std::process::ExitCode;
+
+    use anyhow::Result;
+
+    pub(crate) async fn ready(_principal: Option<&str>, _format: &str) -> Result<ExitCode> {
+        anyhow::bail!("MCP gateway readiness is only supported on Unix hosts")
+    }
+
+    pub(crate) async fn stop_gateway() -> Result<()> {
+        Ok(())
+    }
+
+    pub(crate) fn gc() -> Result<ExitCode> {
+        anyhow::bail!("MCP gateway cleanup is only supported on Unix hosts")
+    }
+}
 mod mrtr;
 // Parent-death detection reads `getppid()` (Unix-only); the module and its use
 // site are target-gated so the CLI still compiles on non-Unix targets.
@@ -48,7 +103,15 @@ mod session_guard;
 #[cfg(test)]
 #[path = "snapshot_epoch_tests.rs"]
 mod snapshot_epoch_tests;
+mod terminal_failure;
 mod watch;
+
+#[allow(unused_imports)]
+pub(crate) use attach::run as attach;
+#[allow(unused_imports)]
+pub(crate) use gateway::run as gateway;
+#[allow(unused_imports)]
+pub(crate) use lifecycle::{gc, ready, stop_gateway};
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -100,13 +163,13 @@ fn broker_readiness_required(caller: &astrid_core::PrincipalId) -> bool {
     *caller != astrid_core::PrincipalId::anonymous()
 }
 
-/// Daemon identity for `mcp serve` is the process cwd at invocation.
+/// Daemon identity uses the explicit invocation selector or the original cwd.
 ///
 /// AOS host plugins `cd` into the product runtime home, then pass the host
 /// project as `--workspace`. The live daemon is that runtime-home process.
 /// `--workspace` is project context after attach, not a second daemon.
-pub(crate) fn mcp_serve_daemon_root(cwd: &Path, _workspace: Option<&Path>) -> PathBuf {
-    cwd.to_path_buf()
+pub(crate) fn mcp_serve_daemon_root(cwd: &Path, _workspace: Option<&Path>) -> Result<PathBuf> {
+    crate::daemon_workspace::selected(Some(cwd))
 }
 
 /// Run the MCP stdio server until the client closes stdin (EOF), its launching
@@ -140,7 +203,17 @@ pub(crate) async fn serve(
     // Attach to the daemon for *this* cwd (runtime home after the plugin `cd`),
     // not `--workspace` (the host project).
     let cwd = std::env::current_dir().context("failed to read mcp serve cwd")?;
-    let daemon_root = mcp_serve_daemon_root(&cwd, workspace);
+    let daemon_root = mcp_serve_daemon_root(&cwd, workspace)?;
+    let workspace_context = workspace
+        .map(std::fs::canonicalize)
+        .transpose()
+        .with_context(|| {
+            workspace.map_or_else(
+                || "failed to resolve MCP workspace".to_owned(),
+                |path| format!("failed to resolve MCP workspace {}", path.display()),
+            )
+        })?
+        .unwrap_or_else(|| cwd.clone());
     crate::commands::daemon::ensure_daemon_quiet("mcp-serve", Some(&daemon_root))
         .await
         .context("failed to ensure Astrid daemon for `astrid mcp serve`")?;
@@ -188,13 +261,18 @@ pub(crate) async fn serve(
         "astrid mcp serve: uplink established, starting MCP stdio transport"
     );
 
-    tokio::spawn(session_guard::run(caller.clone(), daemon_root.clone()));
+    let session_guard = tokio::spawn(session_guard::run(caller.clone(), daemon_root.clone()));
+    let daemon_pid =
+        crate::commands::daemon_control::read_pid_file(&crate::socket_client::pid_path())
+            .map(|(pid, _)| pid);
 
     let server = AstridMcpServer::new(
         Arc::new(Mutex::new(client)),
         caller.clone(),
         daemon_root.clone(),
-    );
+        workspace_context,
+    )
+    .context("Failed to initialize the MCP request-state codec")?;
 
     // `rmcp::transport::stdio()` yields the (stdin, stdout) pair the MCP
     // transport drives. `serve` performs the MCP handshake and spawns the
@@ -210,11 +288,11 @@ pub(crate) async fn serve(
     // uplink and push `tools/list_changed` to the connected client whenever
     // the broker's tool surface changes. The held
     // peer (cloned from the running service) is the only handle the
-    // background task needs; it never touches stdout. The task is detached —
+    // background task needs; it never touches stdout. The task is session-owned —
     // if the watch uplink dies, tool-list pushes simply stop, but the server
     // keeps serving `tools/list`/`tools/call` on demand.
     let peer = running.peer().clone();
-    tokio::spawn(watch::run(peer, caller.to_string(), daemon_root));
+    let watcher = tokio::spawn(watch::run(peer, caller.to_string(), daemon_root));
 
     // Race the normal stdin-EOF quit against parent-death. `waiting()` only
     // returns when the client closes stdin; an MCP client that DIES without
@@ -229,7 +307,7 @@ pub(crate) async fn serve(
     #[cfg(not(unix))]
     let parent_death_fut = std::future::pending::<()>();
 
-    tokio::select! {
+    let result = tokio::select! {
         biased;
         () = parent_death_fut => {
             info!("astrid mcp serve: launching session ended (reparented); closing MCP bridge");
@@ -238,11 +316,18 @@ pub(crate) async fn serve(
             Ok(ExitCode::SUCCESS)
         }
         quit = running.waiting() => {
-            let quit_reason = quit.context("MCP stdio transport terminated abnormally")?;
-            info!(?quit_reason, "astrid mcp serve: MCP transport closed");
-            Ok(ExitCode::SUCCESS)
+            quit.context("MCP stdio transport terminated abnormally").map(|quit_reason| {
+                info!(?quit_reason, "astrid mcp serve: MCP transport closed");
+                ExitCode::SUCCESS
+            })
         }
-    }
+    };
+    session_guard.abort();
+    watcher.abort();
+    let _ = session_guard.await;
+    let _ = watcher.await;
+    crate::commands::daemon::retire_disconnected_projection(daemon_pid).await?;
+    result
 }
 
 #[cfg(test)]
@@ -297,7 +382,7 @@ mod daemon_root_tests {
     fn mcp_serve_daemon_root_is_cwd_not_host_project() {
         let runtime = Path::new("/tmp/aos-runtime");
         let project = Path::new("/tmp/host-project");
-        let daemon_root = mcp_serve_daemon_root(runtime, Some(project));
+        let daemon_root = mcp_serve_daemon_root(runtime, Some(project)).expect("daemon root");
         assert_eq!(daemon_root.as_path(), runtime);
         assert_ne!(daemon_root.as_path(), project);
     }

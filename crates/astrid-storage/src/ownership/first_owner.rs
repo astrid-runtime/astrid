@@ -486,6 +486,11 @@ impl super::OwnershipStore {
         if claim.is_expired_at(now()) {
             return Err(FirstOwnerError::Expired.into());
         }
+        // First ownership and its resource payer become visible in the same CAS.
+        // The already-enrolled replay branch above preserves later reassignment.
+        graph
+            .accountable_users
+            .insert(claim.principal_uid(), user.uid);
         graph.set_first_owner_state(&FirstOwnerEnrollment::Enrolled { claim: *claim });
         Ok(graph.first_owner_state())
     }

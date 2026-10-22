@@ -26,16 +26,20 @@ use astrid_core::principal::PrincipalId;
 use astrid_storage::{IdentityStore, KvStore, PrincipalDirectory, RuntimePrincipalStore};
 
 mod env_import;
+mod env_inventory;
 mod fs_hooks;
 mod hooks;
 mod host_fs;
 mod ledger;
 mod legacy_audit;
 use legacy_audit::handle_non_default_audit_source;
+mod legacy_permissions;
+use legacy_permissions::tighten_owner_controlled_path;
 mod legacy_tmp;
 #[cfg(test)]
 pub(super) use legacy_tmp::tighten_legacy_dedicated_directories;
 mod proof;
+mod retirement;
 mod secret;
 mod source;
 #[cfg(unix)]
@@ -44,12 +48,11 @@ use env_import::import_env_and_secrets;
 #[cfg(test)]
 pub(crate) use hooks::inject_tmp_retirement_interruption_once;
 pub(crate) use hooks::interrupt_after_tmp_retirement_if_requested;
-use host_fs::retire_tree;
 use host_fs::{
-    add_principal_scope_sources, add_source, collect_workspace_targets,
+    add_log_source, add_principal_scope_sources, add_source, collect_workspace_targets,
     ensure_legacy_secret_aliases, path_exists, read_bounded_file, require_layout_provenance,
-    retire_empty_directory, snapshot_owner_controlled_path, snapshot_path, storage_io, sync_parent,
-    validate_source_path,
+    retire_empty_directory, snapshot_log_path, snapshot_owner_controlled_path, snapshot_path,
+    storage_io, sync_parent, validate_source_path,
 };
 #[cfg(not(unix))]
 use host_fs::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
@@ -60,6 +63,9 @@ use ledger::{
 };
 #[cfg(test)]
 use ledger::{MigrationComponent, canonical_json};
+use retirement::retire_owner_controlled_tree;
+#[cfg(test)]
+use retirement::retire_tree;
 
 #[cfg(test)]
 pub(crate) use secret::record_absent_legacy_secret_for_test;
@@ -77,6 +83,12 @@ const REVOCATION_RECEIPT_KEY: &str = "migration/legacy-json-v1";
 const REVOCATION_PRINCIPAL_PREFIX: &str = "principal/";
 const HOST_SECRET_RECEIPT_NAME: &str = "system-host-secrets-v1.receipt";
 const CAPSULE_AUTHORITY_RECEIPT_NAME: &str = "capsule-authority-v1.receipt";
+
+// These errors cross into the boot API's io::Error. Preserve every anyhow
+// context frame here so the operator sees the cause, not only the capsule.
+fn capsule_migration_error(stage: &str, error: &anyhow::Error) -> io::Error {
+    io::Error::other(format!("{stage}: {error:#}"))
+}
 
 /// Layout state captured before `AstridHome::ensure` can create a v2
 /// sentinel.  A bool cannot distinguish a brand-new home from a cut-over
@@ -195,9 +207,15 @@ pub(crate) async fn run(
         )
         .await?;
         legacy_tmp::tighten_legacy_dedicated_directories(home, directory)?;
+        // The released layout inherited the caller's umask for the secrets
+        // root itself. Child sources are normalized individually as they enter
+        // the migration manifest, but the root also survives until retirement
+        // and must satisfy the same strict-private contract.
+        legacy_permissions::tighten_private_path(&home.secrets_dir())?;
     }
 
     let bindings = directory.bindings();
+    tighten_legacy_owner_controlled_sources(home, &bindings)?;
     let snapshots = preflight_sources(home, store, &bindings)?;
 
     if matches!(layout_origin, LayoutOrigin::Fresh) {
@@ -228,6 +246,20 @@ pub(crate) async fn run(
     retire_post_barrier_sources(home, store)
 }
 
+fn tighten_legacy_owner_controlled_sources(
+    home: &AstridHome,
+    bindings: &[(PrincipalId, PrincipalUid)],
+) -> io::Result<()> {
+    tighten_owner_controlled_path(&home.state_db_path())?;
+    tighten_owner_controlled_path(&home.cow_dir())?;
+    for (alias, _) in bindings {
+        let principal = home.principal_home(alias);
+        tighten_owner_controlled_path(&principal.audit_dir())?;
+        tighten_owner_controlled_path(&principal.capsules_dir())?;
+    }
+    Ok(())
+}
+
 /// Retire sources whose deletion is authorized only by the complete global
 /// component ledger. Re-reading the canonical ledger makes crash re-entry use
 /// the same durable authorization as the first boot. `CoW` retirement is tied
@@ -249,7 +281,7 @@ fn retire_post_barrier_sources(home: &AstridHome, store: &RuntimePrincipalStore)
         .iter()
         .find(|component| component.name == "system:cow")
         .ok_or_else(|| io::Error::other("migration ledger has no CoW source identity"))?;
-    retire_tree(&home.cow_dir(), &cow.source, &[])?;
+    retire_owner_controlled_tree(&home.cow_dir(), &cow.source, &[])?;
     store
         .retire_verified_legacy_directory_store(home)
         .map_err(storage_io)
@@ -366,14 +398,13 @@ async fn migrate_legacy_layout(
     let workspace_targets = workspace_portal_targets(workspace_root, workspace_layout)?;
     let capsule_report =
         migrate_all_native_capsules_with_report(&store_arc, home, directory, &workspace_targets)
-            .map_err(|error| {
-                io::Error::other(format!("legacy capsule migration failed: {error}"))
-            })?;
+            .map_err(|error| capsule_migration_error("legacy capsule migration failed", &error))?;
     retire_unmatched_legacy_authority_receipts(&store_arc, home, directory, &workspace_targets)
         .map_err(|error| {
-            io::Error::other(format!(
-                "legacy leftover capsule authority retirement failed: {error}"
-            ))
+            capsule_migration_error(
+                "legacy leftover capsule authority retirement failed",
+                &error,
+            )
         })?;
     for (alias, uid) in &bindings {
         let owner = astrid_storage::StateOwner::Principal(*uid);
@@ -510,7 +541,7 @@ fn ensure_no_unretired_authority_receipts(
 ) -> io::Result<()> {
     let workspace_targets = workspace_portal_targets(workspace_root, workspace_layout)?;
     let status = legacy_capsule_authority_status(home, &workspace_targets).map_err(|error| {
-        io::Error::other(format!("legacy capsule authority status failed: {error}"))
+        capsule_migration_error("legacy capsule authority status failed", &error)
     })?;
     if let Some(path) = status
         .pending
@@ -672,7 +703,15 @@ fn preflight_sources(
         "system:state-db".to_owned(),
         snapshot_owner_controlled_path(&home.state_db_path())?,
     );
-    add_source(&mut sources, "system:cow".to_owned(), home.cow_dir())?;
+    // Released workspace CoW trees were created with ordinary owner-controlled
+    // workspace modes (typically 0755 directories and 0644 files). They are
+    // disposable retirement sources, not secret state. Bind their exact bytes
+    // and ownership without requiring permissions the released runtime never
+    // established.
+    sources.insert(
+        "system:cow".to_owned(),
+        snapshot_owner_controlled_path(&home.cow_dir())?,
+    );
     add_source(
         &mut sources,
         "system:invites".to_owned(),
@@ -748,7 +787,7 @@ fn preflight_sources(
             format!("principal:{uid}:audit"),
             snapshot_owner_controlled_path(&home.principal_home(alias).audit_dir())?,
         );
-        add_source(
+        add_log_source(
             &mut sources,
             format!("principal:{uid}:logs"),
             home.principal_home(alias).log_dir(),
@@ -868,7 +907,11 @@ fn ensure_no_unretired_component_sources(
             ("secrets", home.secrets_dir().join(alias.as_str())),
         ] {
             if path_exists(&path)? {
-                let snapshot = snapshot_path(&path)?;
+                let snapshot = if name == "logs" {
+                    snapshot_log_path(&path)?
+                } else {
+                    snapshot_path(&path)?
+                };
                 if snapshot.entries != 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -946,5 +989,7 @@ fn ensure_no_unretired_component_sources(
     Ok(())
 }
 
+#[cfg(test)]
+mod log_tests;
 #[cfg(test)]
 mod tests;

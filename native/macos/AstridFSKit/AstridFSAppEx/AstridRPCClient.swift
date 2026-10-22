@@ -5,6 +5,7 @@ See LICENSE.txt for the scaffold licensing information.
 
 import Darwin
 import Foundation
+import OSLog
 
 struct AstridLease: Decodable {
     let mount_id: String
@@ -17,6 +18,16 @@ struct AstridEntry: Decodable {
     let name: String
     let kind: String
     let logical_bytes: UInt64
+}
+
+struct AstridVolumeInfo: Decodable {
+    let volume_name: String
+    let block_size: UInt64
+    let total_blocks: UInt64
+    let free_blocks: UInt64
+    let available_blocks: UInt64
+    let created_secs: UInt64?
+    let modified_secs: UInt64?
 }
 
 enum AstridRPCSuccess {
@@ -48,6 +59,15 @@ final class AstridRPCClient {
             throw POSIXError(.EIO)
         }
         return value
+    }
+
+    func volumeInfo() throws -> AstridVolumeInfo {
+        guard case let .data(bytes) = try call(["operation": "volume-info"]) else {
+            throw POSIXError(.EIO)
+        }
+        let info = try JSONDecoder().decode(AstridVolumeInfo.self, from: bytes)
+        guard info.block_size > 0, info.block_size <= UInt64(Int.max), !info.volume_name.isEmpty else { throw POSIXError(.EIO) }
+        return info
     }
 
     func readDirectory(path: String) throws -> [AstridEntry] {
@@ -139,7 +159,11 @@ final class AstridRPCClient {
 
     private func connectSocket() throws -> Int32 {
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard descriptor >= 0 else { throw currentPOSIXError() }
+        guard descriptor >= 0 else {
+            let error = currentPOSIXError()
+            Logger.astridfs.error("Callback socket creation failed errno=\(error.code.rawValue)")
+            throw error
+        }
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
         let pathBytes = Array(socketPath.utf8CString)
@@ -162,6 +186,7 @@ final class AstridRPCClient {
         }
         guard result == 0 else {
             let error = currentPOSIXError()
+            Logger.astridfs.error("Callback socket connection failed errno=\(error.code.rawValue)")
             Darwin.close(descriptor)
             throw error
         }

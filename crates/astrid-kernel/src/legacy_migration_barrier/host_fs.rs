@@ -19,7 +19,6 @@ struct SourceInventory {
     bytes: SourceCount,
 }
 
-use super::fs_hooks::run_test_retire_leaf_hook;
 #[cfg(test)]
 pub(super) use super::fs_hooks::set_test_retire_leaf_hook;
 
@@ -28,7 +27,18 @@ pub(super) fn add_source(
     name: String,
     path: impl AsRef<Path>,
 ) -> io::Result<()> {
+    super::legacy_permissions::tighten_private_path(path.as_ref())?;
     sources.insert(name, snapshot_path(path.as_ref())?);
+    Ok(())
+}
+
+pub(super) fn add_log_source(
+    sources: &mut BTreeMap<String, SourceIdentity>,
+    name: String,
+    path: impl AsRef<Path>,
+) -> io::Result<()> {
+    super::legacy_permissions::tighten_private_path(path.as_ref())?;
+    sources.insert(name, snapshot_log_path(path.as_ref())?);
     Ok(())
 }
 
@@ -39,7 +49,13 @@ pub(super) fn add_principal_scope_sources(
     uid: PrincipalUid,
     capsule_ids: &[String],
 ) -> io::Result<()> {
-    for capsule in capsule_ids {
+    let mut capsule_ids = capsule_ids.to_vec();
+    capsule_ids.extend(
+        super::env_inventory::read(home, uid)?
+            .into_iter()
+            .map(|id| id.to_string()),
+    );
+    for capsule in native_env_secret_scope_ids(home, alias, &capsule_ids)? {
         add_source(
             sources,
             format!("principal:{uid}:env:{capsule}"),
@@ -50,10 +66,69 @@ pub(super) fn add_principal_scope_sources(
         add_source(
             sources,
             format!("principal:{uid}:secret:{capsule}"),
-            home.secrets_dir().join(alias.as_str()).join(capsule),
+            home.secrets_dir()
+                .join(alias.as_str())
+                .join(capsule.as_str()),
         )?;
     }
     Ok(())
+}
+
+/// Released settings could precede an install, survive removal, or belong to
+/// another principal than the shared capsule package. The containing principal
+/// fixes ownership; package presence must not decide whether data is preserved.
+fn native_env_secret_scope_ids(
+    home: &AstridHome,
+    alias: &PrincipalId,
+    capsule_ids: &[String],
+) -> io::Result<Vec<astrid_capsule_types::CapsuleId>> {
+    let mut scopes: std::collections::BTreeSet<_> = capsule_ids.iter().cloned().collect();
+    for (root, env_files) in [
+        (home.principal_home(alias).env_dir(), true),
+        (home.secrets_dir().join(alias.as_str()), false),
+    ] {
+        if !path_exists(&root)? {
+            continue;
+        }
+        astrid_core::platform_fs::verify_no_redirects(&root)?;
+        if !fs::symlink_metadata(&root)?.is_dir() {
+            return Err(io::Error::other(format!(
+                "legacy scope root is not a directory: {}",
+                root.display()
+            )));
+        }
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let name = file_name.to_str().ok_or_else(|| {
+                io::Error::other(format!(
+                    "legacy scope name is not UTF-8: {}",
+                    entry.path().display()
+                ))
+            })?;
+            let capsule = if env_files {
+                name.strip_suffix(".env.json").ok_or_else(|| {
+                    io::Error::other(format!(
+                        "unexpected legacy env source: {}",
+                        entry.path().display()
+                    ))
+                })?
+            } else {
+                name
+            };
+            astrid_capsule_types::CapsuleId::new(capsule.to_owned()).map_err(|error| {
+                io::Error::other(format!(
+                    "invalid legacy scope {}: {error}",
+                    entry.path().display()
+                ))
+            })?;
+            scopes.insert(capsule.to_owned());
+        }
+    }
+    scopes
+        .into_iter()
+        .map(|scope| astrid_capsule_types::CapsuleId::new(scope).map_err(storage_io))
+        .collect()
 }
 
 pub(super) fn retire_empty_directory(path: &Path) -> io::Result<()> {
@@ -230,122 +305,6 @@ pub(super) fn require_layout_provenance(migrations: &Path, fresh_layout: bool) -
         }
     }
     Ok(())
-}
-
-pub(super) fn retire_tree(
-    path: &Path,
-    expected: &SourceIdentity,
-    protected: &[PathBuf],
-) -> io::Result<()> {
-    let actual = snapshot_path(path)?;
-    if !actual.present {
-        // A prior post-ledger attempt completed its unlink before a crash.
-        // Absence is the idempotent terminal state regardless of whether the
-        // historical source identity was present.
-        return Ok(());
-    }
-    if &actual != expected {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "legacy source changed before retirement: {}",
-                path.display()
-            ),
-        ));
-    }
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "legacy retirement root is not a directory: {}",
-                path.display()
-            ),
-        ));
-    }
-    if active_mountpoint(path)? {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("legacy source is an active mount: {}", path.display()),
-        ));
-    }
-    let device = device_id(&metadata);
-    for entry in fs::read_dir(path).map_err(io::Error::other)? {
-        let child = entry.map_err(io::Error::other)?.path();
-        if protected.iter().any(|candidate| candidate == &child) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "legacy component source reappeared during ordinary retirement: {}",
-                    child.display()
-                ),
-            ));
-        }
-        let child_meta = fs::symlink_metadata(&child).map_err(io::Error::other)?;
-        if child_meta.file_type().is_symlink() || (!child_meta.is_file() && !child_meta.is_dir()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "legacy source contains redirect or special entry: {}",
-                    child.display()
-                ),
-            ));
-        }
-        if active_mountpoint(&child)? || device_id(&child_meta) != device {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "legacy source crosses a mount or device boundary: {}",
-                    child.display()
-                ),
-            ));
-        }
-        if child_meta.is_dir() {
-            let child_snapshot = snapshot_path(&child)?;
-            retire_tree(&child, &child_snapshot, protected)?;
-        } else {
-            astrid_core::platform_fs::verify_no_redirects(&child)?;
-            let leaf_snapshot = snapshot_path(&child)?;
-            if leaf_snapshot.entries != 1 || leaf_snapshot.bytes != child_meta.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "legacy source changed before retirement: {}",
-                        child.display()
-                    ),
-                ));
-            }
-            retire_leaf(&child, child_meta.len(), &leaf_snapshot)?;
-        }
-    }
-    sync_directory(path)?;
-    fs::remove_dir(path).map_err(io::Error::other)
-}
-
-fn retire_leaf(child: &Path, expected_len: u64, leaf_snapshot: &SourceIdentity) -> io::Result<()> {
-    run_test_retire_leaf_hook(child);
-    let replacement_meta = fs::symlink_metadata(child).map_err(io::Error::other)?;
-    if replacement_meta.file_type().is_symlink()
-        || (!replacement_meta.is_file() && !replacement_meta.is_dir())
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "legacy source contains redirect or special entry: {}",
-                child.display()
-            ),
-        ));
-    }
-    if replacement_meta.len() != expected_len || snapshot_path(child)? != *leaf_snapshot {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "legacy source changed before retirement: {}",
-                child.display()
-            ),
-        ));
-    }
-    fs::remove_file(child).map_err(io::Error::other)
 }
 
 /// Validate the released audit-source boundary on every native host.  Unix
@@ -578,7 +537,7 @@ fn delete_audit_tree(path: &Path, root_device: u64) -> io::Result<()> {
     fs::remove_dir(path).map_err(io::Error::other)
 }
 
-fn device_id(metadata: &fs::Metadata) -> u64 {
+pub(super) fn device_id(metadata: &fs::Metadata) -> u64 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
@@ -595,6 +554,13 @@ pub(super) fn snapshot_path(path: &Path) -> io::Result<SourceIdentity> {
     snapshot_path_with_access(path, SourceAccess::Private)
 }
 
+/// Operational logs are hashed with fixed-buffer reads, not decoded into
+/// memory. Keep the private-entry, count, redirect and device checks, but do
+/// not apply the generic component byte ceiling to accumulated log history.
+pub(super) fn snapshot_log_path(path: &Path) -> io::Result<SourceIdentity> {
+    snapshot_path_with_access(path, SourceAccess::PrivateLogs)
+}
+
 /// Snapshot a released non-secret tree without requiring permissions that the
 /// released binary never set. Historical database and capsule-package children
 /// were commonly `0755` directories and `0644` files. They remain admissible
@@ -607,6 +573,7 @@ pub(super) fn snapshot_owner_controlled_path(path: &Path) -> io::Result<SourceId
 #[derive(Clone, Copy)]
 enum SourceAccess {
     Private,
+    PrivateLogs,
     OwnerControlled,
 }
 
@@ -635,7 +602,7 @@ fn snapshot_path_with_access(path: &Path, access: SourceAccess) -> io::Result<So
         // cardinality here lets retirement bind a single-file source to the
         // exact preflight manifest as well.
         identity.entries = SourceCount::new(1);
-        read_regular_file(path, &mut hasher, &mut identity)?;
+        read_regular_file(path, access, &mut hasher, &mut identity)?;
     } else if metadata.is_dir() {
         snapshot_dir(path, path, device, access, &mut hasher, &mut identity)?;
     } else {
@@ -740,7 +707,7 @@ fn snapshot_dir(
             snapshot_dir(root, &path, device, access, hasher, identity)?;
         } else if metadata.is_file() {
             hasher.update(b"file");
-            read_regular_file(&path, hasher, identity)?;
+            read_regular_file(&path, access, hasher, identity)?;
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -757,7 +724,7 @@ fn validate_source_entry(
     access: SourceAccess,
 ) -> io::Result<()> {
     match access {
-        SourceAccess::Private => validate_private_entry(path, metadata),
+        SourceAccess::Private | SourceAccess::PrivateLogs => validate_private_entry(path, metadata),
         SourceAccess::OwnerControlled => validate_owner_controlled_entry(path, metadata),
     }
 }
@@ -802,6 +769,7 @@ fn validate_owner_controlled_entry(path: &Path, metadata: &fs::Metadata) -> io::
 
 fn read_regular_file(
     path: &Path,
+    access: SourceAccess,
     hasher: &mut blake3::Hasher,
     identity: &mut SourceInventory,
 ) -> io::Result<()> {
@@ -829,7 +797,7 @@ fn read_regular_file(
             .bytes
             .checked_add(read as u64)
             .ok_or_else(|| io::Error::other("legacy source byte limit exceeded"))?;
-        if identity.bytes.get() > MAX_BYTES {
+        if !matches!(access, SourceAccess::PrivateLogs) && identity.bytes.get() > MAX_BYTES {
             return Err(io::Error::other("legacy source byte limit exceeded"));
         }
         hasher.update(&buffer[..read]);
@@ -851,7 +819,7 @@ fn validate_private_entry(path: &Path, metadata: &fs::Metadata) -> io::Result<()
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
-fn active_mountpoint(path: &Path) -> io::Result<bool> {
+pub(super) fn active_mountpoint(path: &Path) -> io::Result<bool> {
     #[cfg(target_os = "linux")]
     {
         let canonical = fs::canonicalize(path)?;

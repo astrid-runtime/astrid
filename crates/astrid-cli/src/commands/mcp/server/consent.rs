@@ -92,6 +92,7 @@ impl AstridMcpServer {
         let Some(request) = ingress::IngressRequest::from_reply(&reply) else {
             return Ok(CallFlow::Continue(reply));
         };
+        let request = request.with_principal(&self.principal);
         match protocol {
             ConsentProtocol::Modern {
                 supports_form: true,

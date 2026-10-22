@@ -14,6 +14,10 @@ import release_manifest
 
 
 KIND = "astrid-release-windows-extension"
+PARKED_EXTENSION_TARGETS = (
+    *release_manifest.MUSL_TARGETS,
+    *release_manifest.WINDOWS_TARGETS,
+)
 ROOT_KEYS = {
     "schema-version",
     "kind",
@@ -74,7 +78,7 @@ def build_manifest(
     )
     expected_all = {
         release_manifest.expected_asset(version, target)
-        for target in (*release_manifest.TARGETS, *release_manifest.EXTENSION_TARGETS)
+        for target in (*release_manifest.TARGETS, *PARKED_EXTENSION_TARGETS)
     }
     if set(blake3) != expected_all or set(sha256) != expected_all:
         fail("Windows metadata requires checksums for exactly all seven release archives")

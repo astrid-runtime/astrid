@@ -29,17 +29,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use astrid_core::capability_grammar::validate_capability;
-use astrid_core::principal::PrincipalId;
-use astrid_core::profile::{
-    CapabilityPattern, CapsuleGrant, GroupName, PrincipalProfile, ProfileError,
-};
+use astrid_core::profile::{CapabilityPattern, CapsuleGrant, GroupName, PrincipalProfile};
+use astrid_core::{DeviceKeyId, principal::PrincipalId};
 use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody, AgentSummary};
 use tracing::{info, warn};
 
 use crate::kernel_router::AuthorizedRequest;
 
+mod capsule_assignment;
+pub(super) mod creation_authority;
+mod distro_dispatch;
 mod env_handlers;
-use super::inheritance::copy_modify_env;
+mod responses;
+pub(super) use responses::{err_bad_input, err_internal, err_profile, success_json};
+mod user_principals;
+use capsule_assignment::materialize_added_capsule_installs;
 use env_handlers::{EnvSetRequest, env_delete, env_list, env_set};
 
 /// Platform label used by the identity store for agent principals
@@ -78,7 +82,10 @@ pub(super) async fn dispatch_authorized(
         kernel,
         &authorization.principal,
         Some(authorization),
-        None,
+        authorization
+            .device_key_id
+            .as_ref()
+            .map(DeviceKeyId::as_str),
         req,
     )
     .await
@@ -102,10 +109,17 @@ async fn dispatch_inner(
     device_key_id: Option<&str>,
     req: AdminRequestKind,
 ) -> AdminResponseBody {
+    if let Some(response) = distro_dispatch::dispatch(kernel, caller, &req).await {
+        return response;
+    }
     match req {
-        req @ AdminRequestKind::AgentCreate { .. } => agent_create_from_req(kernel, req).await,
+        req @ AdminRequestKind::AgentCreate { .. } => {
+            creation_authority::create_from_req(kernel, caller, authorization, device_key_id, req)
+                .await
+        },
         AdminRequestKind::AgentDelete { principal } => {
-            super::agent_delete::agent_delete(kernel, principal).await
+            super::agent_delete::dispatch(kernel, caller, authorization, device_key_id, principal)
+                .await
         },
         AdminRequestKind::AgentEnable { principal } => {
             agent_set_enabled(kernel, principal, true).await
@@ -113,18 +127,50 @@ async fn dispatch_inner(
         AdminRequestKind::AgentDisable { principal } => {
             agent_set_enabled(kernel, principal, false).await
         },
-        AdminRequestKind::AgentList => agent_list(kernel, caller, authorization, device_key_id),
+        AdminRequestKind::AgentList => {
+            agent_list(kernel, caller, authorization, device_key_id).await
+        },
+        AdminRequestKind::UserPrincipalList => {
+            user_principals::list(kernel, caller, authorization, device_key_id).await
+        },
+        AdminRequestKind::UserPrincipalClaim { principal } => {
+            user_principals::claim(kernel, caller, authorization, device_key_id, principal).await
+        },
         req @ AdminRequestKind::AgentModify { .. } => agent_modify_from_req(kernel, req).await,
         AdminRequestKind::QuotaSet { principal, quotas } => {
-            super::quota::quota_set(kernel, principal, quotas).await
+            super::quota::quota_set(
+                kernel,
+                caller,
+                authorization,
+                device_key_id,
+                principal,
+                quotas,
+            )
+            .await
         },
         AdminRequestKind::QuotaGet { principal } => super::quota::quota_get(kernel, &principal),
+        AdminRequestKind::QuotaUserList => {
+            super::quota::users::list(kernel, caller, authorization, device_key_id).await
+        },
+        AdminRequestKind::QuotaAssignUser { principal, user } => {
+            super::quota::assign_user::assign(
+                kernel,
+                caller,
+                authorization,
+                device_key_id,
+                principal,
+                user,
+            )
+            .await
+        },
         AdminRequestKind::UsageGet { principal } => super::quota::usage_get(kernel, &principal),
         req @ (AdminRequestKind::EnvSet { .. }
+        | AdminRequestKind::EnvSetIfAbsent { .. }
         | AdminRequestKind::EnvList { .. }
         | AdminRequestKind::EnvDelete { .. }
         | AdminRequestKind::DistroLockGet { .. }
         | AdminRequestKind::DistroLockSet { .. }
+        | AdminRequestKind::DistroSelfGrant
         | AdminRequestKind::GroupCreate { .. }
         | AdminRequestKind::GroupDelete { .. }
         | AdminRequestKind::GroupModify { .. }
@@ -150,7 +196,11 @@ async fn dispatch_inner(
         | AdminRequestKind::StorageMountRevoke { .. }
         | AdminRequestKind::AuditStats
         | AdminRequestKind::AuditPrune { .. }
-        | AdminRequestKind::AuditHealth) => {
+        | AdminRequestKind::AuditHealth
+        | AdminRequestKind::AuditHeads
+        | AdminRequestKind::AuditExport(_)
+        | AdminRequestKind::AuditAnchorMark(_)
+        | AdminRequestKind::AuditAnchorStatus) => {
             dispatch_services(kernel, caller, authorization, device_key_id, req).await
         },
     }
@@ -183,10 +233,18 @@ async fn dispatch_policy(
                     kind,
                     scope,
                     append,
+                    only_if_absent: false,
                 },
             )
             .await
         },
+        AdminRequestKind::EnvSetIfAbsent {
+            principal,
+            capsule,
+            key,
+            value,
+            kind,
+        } => env_handlers::env_set_default(kernel, principal, capsule, key, value, kind).await,
         AdminRequestKind::EnvList { principal, capsule } => {
             env_list(kernel, principal, capsule).await
         },
@@ -197,14 +255,6 @@ async fn dispatch_policy(
             kind,
             scope,
         } => env_delete(kernel, principal, capsule, key, kind, scope).await,
-        AdminRequestKind::DistroLockGet { principal } => {
-            super::distro_handlers::get(kernel, &principal).await
-        },
-        AdminRequestKind::DistroLockSet {
-            principal,
-            lock,
-            expected_hash,
-        } => super::distro_handlers::set(kernel, &principal, lock, expected_hash).await,
         AdminRequestKind::GroupCreate {
             name,
             capabilities,
@@ -265,8 +315,26 @@ async fn dispatch_services(
             max_uses,
             metadata,
         } => {
-            super::invite_handlers::invite_issue(kernel, group, expires_secs, max_uses, metadata)
-                .await
+            let ownership = match super::invite_handlers::ownership::capture(
+                kernel,
+                caller,
+                authorization,
+                device_key_id,
+            )
+            .await
+            {
+                Ok(ownership) => ownership,
+                Err(response) => return response,
+            };
+            super::invite_handlers::invite_issue(
+                kernel,
+                group,
+                expires_secs,
+                max_uses,
+                metadata,
+                ownership,
+            )
+            .await
         },
         AdminRequestKind::InviteRedeem {
             token,
@@ -295,6 +363,16 @@ async fn dispatch_services(
             retain_bytes,
         } => super::audit_handlers::prune(kernel, retain_entries, retain_bytes).await,
         AdminRequestKind::AuditHealth => super::audit_handlers::health(kernel),
+        AdminRequestKind::AuditHeads => super::audit_handlers::heads(kernel).await,
+        AdminRequestKind::AuditExport(request) => {
+            super::audit_handlers::export(kernel, request).await
+        },
+        AdminRequestKind::AuditAnchorMark(request) => {
+            super::audit_anchor_handlers::anchor_mark(kernel, request).await
+        },
+        AdminRequestKind::AuditAnchorStatus => {
+            super::audit_anchor_handlers::anchor_status(kernel).await
+        },
         _ => AdminResponseBody::Error("not a service request".to_owned()),
     }
 }
@@ -340,135 +418,6 @@ async fn pair_device_dispatch(
 }
 
 // ── Agent lifecycle ────────────────────────────────────────────────────
-
-/// Destructure an [`AdminRequestKind::AgentCreate`] and forward to
-/// [`agent_create`]. Split from the `dispatch` match arm to keep that
-/// router under the per-function line cap; the caller guarantees the
-/// variant, so the fallback is unreachable in practice.
-async fn agent_create_from_req(
-    kernel: &Arc<crate::Kernel>,
-    req: AdminRequestKind,
-) -> AdminResponseBody {
-    let AdminRequestKind::AgentCreate {
-        name,
-        groups,
-        grants,
-        inherit_from,
-        clone_from,
-        allow_admin_clone,
-    } = req
-    else {
-        return err_internal(
-            "agent_create_from_req received a non-AgentCreate variant".to_string(),
-        );
-    };
-    agent_create(
-        kernel,
-        name,
-        groups,
-        grants,
-        inherit_from,
-        clone_from,
-        allow_admin_clone,
-    )
-    .await
-}
-
-async fn agent_create(
-    kernel: &Arc<crate::Kernel>,
-    name: String,
-    groups: Vec<String>,
-    grants: Vec<String>,
-    inherit_from: Option<PrincipalId>,
-    clone_from: Option<PrincipalId>,
-    allow_admin_clone: bool,
-) -> AdminResponseBody {
-    let principal = match PrincipalId::new(name.clone()) {
-        Ok(p) => p,
-        Err(e) => return err_bad_input(format!("invalid principal name: {e}")),
-    };
-
-    // `default` (the bootstrap anchor) and `anonymous` (the no-capability
-    // identity stamped on unauthenticated connections, #45/#852) are reserved.
-    if let Some(reason) = principal.reserved_reason() {
-        return err_bad_input(format!("principal {name:?} is {reason}"));
-    }
-
-    // `clone_from` is a full replica: the source supplies groups, grants,
-    // revokes, network, process, quotas, AND the state copy. Mixing it with
-    // the profile-shaping inputs is ambiguous, so reject rather than silently
-    // pick a winner. The CLI also enforces this via clap `conflicts_with`; the
-    // kernel enforces it too — defense in depth against a hand-built request.
-    if clone_from.is_some() && (inherit_from.is_some() || !groups.is_empty() || !grants.is_empty())
-    {
-        return err_bad_input(
-            "clone_from is mutually exclusive with inherit_from, groups, and grants".to_string(),
-        );
-    }
-
-    // Acquire the admin write lock BEFORE validating the inheritance source.
-    // The source's existence is state this lock protects: every admin mutator
-    // (create/delete/...) takes it, so checking the source outside the lock
-    // would let a concurrent delete remove it between the existence check and
-    // the inheritance copy below (TOCTOU) — the creation would then silently
-    // produce an empty agent instead of inheriting. Holding the lock pins the
-    // source in place across the check-then-copy.
-    let _guard = kernel.admin_write_lock.lock().await;
-
-    // Self-inherit is meaningless (the source home tree does not exist yet),
-    // and a non-existent source must fail loudly rather than silently
-    // producing an empty agent the operator believes was provisioned.
-    if let Some(ref source) = inherit_from {
-        if *source == principal {
-            return err_bad_input(format!(
-                "inherit_from source {source} is the same as the new principal"
-            ));
-        }
-        let source_path = principal_profile_path(kernel, source);
-        if let Err(e) = require_principal_exists(source, &source_path) {
-            return err_bad_input(format!("inherit_from source rejected: {e}"));
-        }
-    }
-
-    let profile_path = principal_profile_path(kernel, &principal);
-
-    // Collision: a profile on disk means this principal already exists. Rather
-    // than unconditionally reject, defer to the keypair-backfill heal — a bare
-    // re-create of an existing KEYLESS (pre-#45/#852) principal surgically adds
-    // its missing keypair so `astrid-up`'s per-boot re-run auto-heals upgraders;
-    // an already-keyed principal (or any shaping input) still errors. See
-    // `agent_create_helpers::backfill_keypair` for the full rationale + invariants.
-    if profile_path.exists() {
-        // A backfill is not a re-create: any profile-shaping input (last arg)
-        // keeps the hard "already exists" error rather than being silently
-        // dropped.
-        return super::agent_create_helpers::backfill_keypair(
-            kernel,
-            &principal,
-            &profile_path,
-            clone_from.is_some()
-                || inherit_from.is_some()
-                || !groups.is_empty()
-                || !grants.is_empty(),
-        )
-        .await;
-    }
-
-    // A genuinely new principal: build its profile, mint its keypair, register
-    // its identity, and provision its home tree + state.
-    super::agent_create_helpers::provision_new_principal(
-        kernel,
-        principal,
-        profile_path,
-        groups,
-        grants,
-        inherit_from,
-        clone_from,
-        allow_admin_clone,
-        true,
-    )
-    .await
-}
 
 async fn agent_set_enabled(
     kernel: &Arc<crate::Kernel>,
@@ -542,6 +491,7 @@ async fn agent_modify_from_req(
         Ok(p) => p,
         Err(e) => return err_profile(&principal, &e),
     };
+    let (groups_before, capsules_before) = (profile.groups.clone(), profile.capsules.clone());
 
     // Capsule grants mirror the group mechanism EXACTLY via the shared
     // `apply_set_delta`: idempotent remove-then-add, set-based change
@@ -552,17 +502,8 @@ async fn agent_modify_from_req(
             Ok(changed) => changed,
             Err(e) => return err_bad_input(format!("group delta rejected: {e}")),
         };
-    if principal == PrincipalId::default()
-        && !profile
-            .groups
-            .iter()
-            .any(|group| group == astrid_core::groups::BUILTIN_ADMIN)
-    {
-        return err_bad_input(
-            "cannot remove the built-in `admin` group from the `default` principal — it is the \
-             single-tenant bootstrap anchor"
-                .to_string(),
-        );
+    if let Some(response) = reject_default_admin_group_removal(&principal, &profile) {
+        return response;
     }
     let capsules_changed = match apply_set_delta::<CapsuleGrant>(
         &mut profile.capsules,
@@ -585,17 +526,41 @@ async fn agent_modify_from_req(
         return err_bad_input(format!("profile rejected: {e}"));
     }
     if capsules_changed
-        && let Err(e) = materialize_added_capsule_installs(kernel, &principal, &add_capsules)
+        && let Err(e) = materialize_added_capsule_installs(kernel, &principal, &add_capsules).await
     {
-        return err_bad_input(e);
+        return err_internal(e);
     }
-    if capsules_changed && let Err(e) = copy_modify_env(kernel, &principal, &add_capsules).await {
+    // HTTP inventory discovers published cache directories, not store
+    // snapshots. Project added packages before returning so an immediate
+    // env write can see the capsule. WASM warmup stays asynchronous.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    if capsules_changed
+        && let Err(e) =
+            project_added_capsule_publications_before_return(kernel, &principal, &add_capsules)
+                .await
+    {
         return err_internal(e);
     }
     if let Err(e) = profile.save_to_path(&path) {
         return err_profile(&principal, &e);
     }
     kernel.profile_cache.invalidate(&principal);
+    for (kind, before, after) in [
+        ("group", &groups_before, &profile.groups),
+        ("capsule", &capsules_before, &profile.capsules),
+    ] {
+        let change = crate::grant_audit::set_diff(before, after);
+        let reason = crate::grant_audit::ADMIN_REQUEST_REASON;
+        crate::grant_audit::record_grant_change(
+            kernel,
+            &principal,
+            kind,
+            change,
+            "admin.agent.modify",
+            reason,
+        )
+        .await;
+    }
     if capsules_changed {
         warm_principal_capsules(kernel, principal.clone());
     }
@@ -612,62 +577,47 @@ async fn agent_modify_from_req(
     modify_response(&principal, &profile, true)
 }
 
+fn reject_default_admin_group_removal(
+    principal: &PrincipalId,
+    profile: &PrincipalProfile,
+) -> Option<AdminResponseBody> {
+    if principal == &PrincipalId::default()
+        && !profile
+            .groups
+            .iter()
+            .any(|group| group == astrid_core::groups::BUILTIN_ADMIN)
+    {
+        return Some(err_bad_input(
+            "cannot remove the built-in `admin` group from the `default` principal — it is the \
+             single-tenant bootstrap anchor"
+                .to_string(),
+        ));
+    }
+    None
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+async fn project_added_capsule_publications_before_return(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    add_capsules: &[String],
+) -> Result<(), String> {
+    let kernel = Arc::clone(kernel);
+    let principal = principal.clone();
+    let add_capsules = add_capsules.to_vec();
+    tokio::task::spawn_blocking(move || {
+        kernel.project_added_capsule_publications(&principal, &add_capsules)
+    })
+    .await
+    .unwrap_or_else(|error| Err(format!("project added capsules: {error}")))
+}
+
 fn warm_principal_capsules(kernel: &Arc<crate::Kernel>, principal: PrincipalId) {
     let kernel = Arc::clone(kernel);
     astrid_runtime::spawn(async move {
         kernel.ensure_principal_loaded(&principal).await;
         kernel.publish_capsules_loaded_for(&principal).await;
     });
-}
-
-fn materialize_added_capsule_installs(
-    kernel: &crate::Kernel,
-    principal: &PrincipalId,
-    add_capsules: &[String],
-) -> Result<(), String> {
-    let store = kernel
-        .principal_store
-        .as_ref()
-        .ok_or_else(|| "authoritative principal store is unavailable".to_owned())?;
-    let source_uid = kernel
-        .principal_directory
-        .uid_for(&PrincipalId::default())
-        .map_err(|error| format!("resolve default principal UID: {error}"))?;
-    let target_uid = kernel
-        .principal_directory
-        .uid_for(principal)
-        .map_err(|error| format!("resolve target principal UID: {error}"))?;
-    let source_owner = astrid_storage::StateOwner::Principal(source_uid);
-    let target_owner = astrid_storage::StateOwner::Principal(target_uid);
-    for capsule in add_capsules {
-        if store
-            .capsules()
-            .get_snapshot(&target_owner, capsule)
-            .map_err(|error| format!("read target capsule '{capsule}': {error}"))?
-            .is_some()
-        {
-            continue;
-        }
-        let Some(snapshot) = store
-            .capsules()
-            .get_snapshot(&source_owner, capsule)
-            .map_err(|error| format!("read default capsule '{capsule}': {error}"))?
-        else {
-            continue;
-        };
-        store
-            .capsules()
-            .install(
-                &target_owner,
-                capsule,
-                snapshot.package(),
-                astrid_storage::CapsuleInstallExpectation::Absent,
-            )
-            .map_err(|error| {
-                format!("copy durable capsule '{capsule}' for {principal}: {error}")
-            })?;
-    }
-    Ok(())
 }
 
 /// Build the `agent.modify` success body reporting the principal's
@@ -779,7 +729,7 @@ fn caller_has_global_agent_list(
     check.has("agent:list")
 }
 
-fn agent_list(
+async fn agent_list(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
     authorization: Option<&AuthorizedRequest>,
@@ -826,6 +776,7 @@ fn agent_list(
         };
         summaries.push(AgentSummary {
             owner_uid: kernel.principal_directory.uid_for(&principal).ok(),
+            accountable_user: None,
             principal,
             enabled: profile.enabled,
             groups: profile.groups.clone(),
@@ -853,7 +804,7 @@ fn agent_list(
         summaries.retain(|s| s.principal == *caller);
     }
 
-    AdminResponseBody::AgentList(summaries)
+    user_principals::with_accountability(kernel, AdminResponseBody::AgentList(summaries)).await
 }
 
 // ── Per-principal grants / revokes ─────────────────────────────────────
@@ -936,6 +887,7 @@ async fn mutate_caps(
         CapsMutation::Grant { .. } => &mut profile.grants,
         CapsMutation::Revoke => &mut profile.revokes,
     };
+    let mut added = Vec::new();
     for cap in &capabilities {
         if !target.iter().any(|existing| existing.as_str() == cap) {
             let pattern = match CapabilityPattern::new(cap.clone()) {
@@ -943,6 +895,7 @@ async fn mutate_caps(
                 Err(e) => return err_bad_input(format!("capability {cap:?} rejected: {e}")),
             };
             target.push(pattern.into());
+            added.push(cap.clone());
         }
     }
 
@@ -950,6 +903,13 @@ async fn mutate_caps(
         return err_profile(principal, &e);
     }
     kernel.profile_cache.invalidate(principal);
+    let (change, via) = match which {
+        CapsMutation::Grant { .. } => ((added, Vec::new()), "admin.caps.grant"),
+        CapsMutation::Revoke => ((Vec::new(), added), "admin.caps.revoke"),
+    };
+    let reason = crate::grant_audit::ADMIN_REQUEST_REASON;
+    crate::grant_audit::record_grant_change(kernel, principal, "capability", change, via, reason)
+        .await;
     success_json(serde_json::json!({
         "principal": principal.as_str(),
         "capabilities": capabilities,
@@ -979,22 +939,4 @@ pub(crate) fn require_principal_exists(principal: &PrincipalId, path: &Path) -> 
             path.display()
         ))
     }
-}
-
-pub(super) fn err_bad_input(msg: String) -> AdminResponseBody {
-    warn!(error = %msg, "admin request rejected: bad input");
-    AdminResponseBody::Error(msg)
-}
-
-pub(super) fn err_internal(msg: String) -> AdminResponseBody {
-    warn!(error = %msg, "admin request failed: internal error");
-    AdminResponseBody::Error(msg)
-}
-
-pub(super) fn err_profile(principal: &PrincipalId, e: &ProfileError) -> AdminResponseBody {
-    err_internal(format!("profile error for {principal}: {e}"))
-}
-
-pub(super) fn success_json(val: serde_json::Value) -> AdminResponseBody {
-    AdminResponseBody::Success(val)
 }

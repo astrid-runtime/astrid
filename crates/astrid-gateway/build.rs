@@ -7,7 +7,7 @@
 //! isn't reachable (e.g. a source-tarball build), so `env!` never fails
 //! and the metric is always populated.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -26,22 +26,11 @@ fn main() {
     // Re-run when the resolved commit changes. `.git/HEAD` is usually a
     // symbolic ref (`ref: refs/heads/<branch>`) whose *content* doesn't
     // change on a new commit — only the pointed-to ref file does — so we
-    // track that file too, plus `packed-refs` as a fallback for a ref with
-    // no loose file (e.g. a fresh clone). Best-effort: a tarball or worktree
-    // build with no reachable `.git` simply refreshes on the next clean build.
-    if let Some(head) = locate_git_head() {
-        println!("cargo:rerun-if-changed={}", head.display());
-        if let (Some(git_dir), Ok(contents)) = (head.parent(), std::fs::read_to_string(&head))
-            && let Some(ref_path) = contents.strip_prefix("ref:")
-        {
-            println!(
-                "cargo:rerun-if-changed={}",
-                git_dir.join(ref_path.trim()).display()
-            );
-            println!(
-                "cargo:rerun-if-changed={}",
-                git_dir.join("packed-refs").display()
-            );
+    // track that file too, plus `packed-refs` for a packed branch. Git resolves
+    // the paths: linked worktrees have their own HEAD but share branch refs.
+    if let Some(manifest_dir) = std::env::var_os("CARGO_MANIFEST_DIR") {
+        for path in git_dependency_paths(Path::new(&manifest_dir)) {
+            println!("cargo:rerun-if-changed={}", path.display());
         }
     }
     println!("cargo:rerun-if-changed=build.rs");
@@ -87,16 +76,26 @@ fn run(cmd: &mut Command) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Walk up from the crate manifest dir to the first `.git/HEAD` file.
-fn locate_git_head() -> Option<PathBuf> {
-    let mut dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").ok()?);
-    loop {
-        let head = dir.join(".git").join("HEAD");
-        if head.is_file() {
-            return Some(head);
-        }
-        if !dir.pop() {
-            return None;
-        }
+/// Resolve paths that can change HEAD without modifying source files.
+pub(crate) fn git_dependency_paths(root: &Path) -> Vec<PathBuf> {
+    let git_path = |name: &str| {
+        let resolved = run(Command::new("git").current_dir(root).args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            name,
+        ]));
+        (resolved != "unknown").then(|| PathBuf::from(resolved))
+    };
+    let Some(head) = git_path("HEAD") else {
+        return Vec::new();
+    };
+    let mut paths = vec![head.clone()];
+    if let Ok(contents) = std::fs::read_to_string(head)
+        && let Some(reference) = contents.strip_prefix("ref:")
+    {
+        paths.extend(git_path(reference.trim()));
+        paths.extend(git_path("packed-refs"));
     }
+    paths
 }

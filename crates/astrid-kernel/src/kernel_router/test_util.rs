@@ -11,6 +11,10 @@ pub(crate) fn all_kernel_request_variants() -> Vec<KernelRequest> {
         KernelRequest::UnloadCapsule { id: "x".into() },
         KernelRequest::PromoteWorkspace { id: "x".into() },
         KernelRequest::RollbackWorkspace { id: "x".into() },
+        KernelRequest::BeginCapsuleInstallBatch {
+            target_principal: None,
+            members: Vec::new(),
+        },
         KernelRequest::InstallCapsule {
             source: "x".into(),
             workspace: false,
@@ -18,10 +22,32 @@ pub(crate) fn all_kernel_request_variants() -> Vec<KernelRequest> {
             provenance: None,
             authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
             env: Vec::new(),
+            expected_generation: None,
+            batch: None,
+        },
+        KernelRequest::FinishCapsuleInstallBatch {
+            batch_id: astrid_core::kernel_api::CapsuleInstallBatchId::new(),
+            target_principal: None,
+        },
+        KernelRequest::GetInstalledCapsuleIdentity { id: "x".into() },
+        KernelRequest::GetCapsuleInstallResumeReceipt { id: "x".into() },
+        KernelRequest::PutCapsuleInstallResumeReceipt {
+            receipt: astrid_core::kernel_api::CapsuleInstallResumeReceipt {
+                id: "x".into(),
+                archive_digest: "a".repeat(64),
+                generation: astrid_core::kernel_api::InstalledCapsuleGeneration {
+                    archive: "b".repeat(64),
+                    metadata: "c".repeat(64),
+                    authority: "d".repeat(64),
+                },
+            },
         },
         KernelRequest::ListCapsules,
         KernelRequest::GetCommands,
         KernelRequest::GetCapsuleMetadata,
+        KernelRequest::GetCapsuleMetadataForPrincipal {
+            target_principal: PrincipalId::default(),
+        },
         KernelRequest::GetAgentReadiness,
         KernelRequest::ApproveCapability {
             request_id: "r".into(),
@@ -65,6 +91,11 @@ fn identity_and_policy_variants(principal: &PrincipalId) -> Vec<AdminRequestKind
             remove_capsules: vec![],
         },
         AdminRequestKind::AgentList,
+        AdminRequestKind::UserPrincipalList,
+        AdminRequestKind::QuotaUserList,
+        AdminRequestKind::UserPrincipalClaim {
+            principal: principal.clone(),
+        },
         AdminRequestKind::QuotaSet {
             principal: principal.clone(),
             quotas: Quotas::default(),
@@ -90,6 +121,7 @@ fn identity_and_policy_variants(principal: &PrincipalId) -> Vec<AdminRequestKind
             },
             expected_hash: None,
         },
+        AdminRequestKind::DistroSelfGrant,
         AdminRequestKind::GroupCreate {
             name: "group".into(),
             capabilities: vec![],

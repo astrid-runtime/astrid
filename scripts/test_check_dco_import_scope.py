@@ -12,18 +12,21 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent))
 import check_dco_import_scope as scope
 from check_dco import check_commits
-from check_campaign_ci_triggers import _event_field_values
+from check_campaign_ci_triggers import _event_field_values, _has_event
 
 
 class PolicyCiCoverageTests(unittest.TestCase):
     def test_policy_only_changes_trigger_regressions(self):
         workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml").read_text()
         for event in ("push", "pull_request"):
+            self.assertTrue(_has_event(workflow, event), f"CI lacks {event} trigger")
             paths = _event_field_values(workflow, event, "paths")
-            self.assertIsNotNone(paths)
             for source in ("scripts/check_dco_import_scope.py",
                            "scripts/test_check_dco_import_scope.py"):
                 with self.subTest(event=event, source=source):
+                    # An event without path filters runs for every changed file.
+                    if paths is None:
+                        continue
                     self.assertTrue(any(fnmatch.fnmatchcase(source, pattern) for pattern in paths),
                                     f"{event} does not run policy regressions for {source}")
 

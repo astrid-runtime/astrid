@@ -184,8 +184,57 @@ fn rate_limit_for_request_returns_correct_limits() {
     assert_eq!(name, "ListCapsules");
     assert_eq!(limit, None);
 
+    let (name, limit) =
+        rate_limit_for_request(&KernelRequest::GetInstalledCapsuleIdentity { id: "demo".into() });
+    assert_eq!(name, "GetInstalledCapsuleIdentity");
+    assert_eq!(limit, None);
+
+    let (name, limit) = rate_limit_for_request(&KernelRequest::GetCapsuleInstallResumeReceipt {
+        id: "demo".into(),
+    });
+    assert_eq!(name, "GetCapsuleInstallResumeReceipt");
+    assert_eq!(limit, None);
+
+    let (name, limit) = rate_limit_for_request(&KernelRequest::PutCapsuleInstallResumeReceipt {
+        receipt: astrid_core::kernel_api::CapsuleInstallResumeReceipt {
+            id: "demo".into(),
+            archive_digest: "a".repeat(64),
+            generation: astrid_core::kernel_api::InstalledCapsuleGeneration {
+                archive: "b".repeat(64),
+                metadata: "c".repeat(64),
+                authority: "d".repeat(64),
+            },
+        },
+    });
+    assert_eq!(name, "PutCapsuleInstallResumeReceipt");
+    assert_eq!(limit, None);
+
     let (_, shutdown) = rate_limit_for_request(&KernelRequest::Shutdown { reason: None });
     assert_eq!(shutdown, Some(1));
+
+    let (_, begin) = rate_limit_for_request(&KernelRequest::BeginCapsuleInstallBatch {
+        target_principal: None,
+        members: Vec::new(),
+    });
+    assert_eq!(begin, Some(2));
+
+    let (_, install) = rate_limit_for_request(&KernelRequest::InstallCapsule {
+        source: "demo.capsule".into(),
+        workspace: false,
+        target_principal: None,
+        provenance: None,
+        authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
+        env: Vec::new(),
+        expected_generation: None,
+        batch: None,
+    });
+    assert_eq!(install, Some(10), "ordinary installs retain their limit");
+
+    let (_, finish) = rate_limit_for_request(&KernelRequest::FinishCapsuleInstallBatch {
+        batch_id: astrid_core::kernel_api::CapsuleInstallBatchId::new(),
+        target_principal: None,
+    });
+    assert_eq!(finish, Some(4));
 }
 
 // ── Capability mapping (issue #670) ──────────────────────────────
@@ -234,6 +283,8 @@ fn required_capability_mapping_per_variant_self_scope() {
                 provenance: None,
                 authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
                 env: Vec::new(),
+                expected_generation: None,
+                batch: None,
             },
             AuthorityScope::Self_
         ),
@@ -254,6 +305,37 @@ fn required_capability_mapping_per_variant_self_scope() {
     assert_eq!(
         required_capability(&KernelRequest::GetAgentReadiness, AuthorityScope::Self_),
         "self:capsule:list"
+    );
+    assert_eq!(
+        required_capability(
+            &KernelRequest::GetInstalledCapsuleIdentity { id: String::new() },
+            AuthorityScope::Self_,
+        ),
+        "self:capsule:install"
+    );
+    assert_eq!(
+        required_capability(
+            &KernelRequest::GetCapsuleInstallResumeReceipt { id: String::new() },
+            AuthorityScope::Self_,
+        ),
+        "self:capsule:install"
+    );
+    assert_eq!(
+        required_capability(
+            &KernelRequest::PutCapsuleInstallResumeReceipt {
+                receipt: astrid_core::kernel_api::CapsuleInstallResumeReceipt {
+                    id: String::new(),
+                    archive_digest: "a".repeat(64),
+                    generation: astrid_core::kernel_api::InstalledCapsuleGeneration {
+                        archive: "b".repeat(64),
+                        metadata: "c".repeat(64),
+                        authority: "d".repeat(64),
+                    },
+                },
+            },
+            AuthorityScope::Self_,
+        ),
+        "self:capsule:install"
     );
     assert_eq!(
         required_capability(
@@ -291,6 +373,8 @@ fn required_capability_mapping_global_scope() {
                 provenance: None,
                 authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
                 env: Vec::new(),
+                expected_generation: None,
+                batch: None,
             },
             AuthorityScope::Global
         ),
@@ -318,7 +402,10 @@ fn required_capability_mapping_global_scope() {
 fn resolve_scope_defaults_to_self_for_caller_owned_lifecycle() {
     let caller = PrincipalId::new("alice").unwrap();
     for req in all_kernel_request_variants() {
-        if matches!(req, KernelRequest::ReloadCapsules) {
+        if matches!(
+            req,
+            KernelRequest::ReloadCapsules | KernelRequest::GetCapsuleMetadataForPrincipal { .. }
+        ) {
             continue;
         }
         assert_eq!(
@@ -343,6 +430,8 @@ fn resolve_scope_requires_global_authority_only_for_cross_principal_install() {
         provenance: None,
         authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
         env: Vec::new(),
+        expected_generation: None,
+        batch: None,
     };
     assert_eq!(resolve_scope(&self_install, &caller), AuthorityScope::Self_);
     let cross_install = KernelRequest::InstallCapsule {
@@ -352,9 +441,24 @@ fn resolve_scope_requires_global_authority_only_for_cross_principal_install() {
         provenance: None,
         authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
         env: Vec::new(),
+        expected_generation: None,
+        batch: None,
     };
     assert_eq!(
         resolve_scope(&cross_install, &caller),
+        AuthorityScope::Global
+    );
+    let cross_batch = KernelRequest::BeginCapsuleInstallBatch {
+        target_principal: Some(PrincipalId::new("bob").unwrap()),
+        members: Vec::new(),
+    };
+    assert_eq!(resolve_scope(&cross_batch, &caller), AuthorityScope::Global);
+    let cross_finish = KernelRequest::FinishCapsuleInstallBatch {
+        batch_id: astrid_core::kernel_api::CapsuleInstallBatchId::new(),
+        target_principal: Some(PrincipalId::new("bob").unwrap()),
+    };
+    assert_eq!(
+        resolve_scope(&cross_finish, &caller),
         AuthorityScope::Global
     );
     for req in [self_install, cross_install] {
@@ -375,6 +479,34 @@ fn resolve_scope_requires_global_authority_only_for_cross_principal_install() {
             "full-daemon lifecycle should be global for {req:?}"
         );
     }
+}
+
+#[test]
+fn cross_principal_metadata_requires_global_authority() {
+    let caller = PrincipalId::new("alice").unwrap();
+    let self_metadata = KernelRequest::GetCapsuleMetadataForPrincipal {
+        target_principal: caller.clone(),
+    };
+    assert_eq!(
+        resolve_scope(&self_metadata, &caller),
+        AuthorityScope::Self_
+    );
+
+    let cross_metadata = KernelRequest::GetCapsuleMetadataForPrincipal {
+        target_principal: PrincipalId::new("bob").unwrap(),
+    };
+    assert_eq!(
+        resolve_scope(&cross_metadata, &caller),
+        AuthorityScope::Global
+    );
+    assert_eq!(
+        request_target_principal(&cross_metadata, &caller),
+        Some(PrincipalId::new("bob").unwrap())
+    );
+    assert_eq!(
+        required_capability(&cross_metadata, AuthorityScope::Global),
+        "capsule:list"
+    );
 }
 
 #[test]
@@ -408,6 +540,8 @@ fn resolve_scope_treats_workspace_capsule_install_as_self() {
                 provenance: None,
                 authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
                 env: Vec::new(),
+                expected_generation: None,
+                batch: None,
             },
             &caller,
         ),
@@ -1038,6 +1172,72 @@ async fn capsule_visibility_precomputes_admin_and_capsule_grants() {
     assert!(global_lister_visibility.allows(&default_only));
     assert!(limited_visibility.allows(&allowed));
     assert!(!limited_visibility.allows(&default_only));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn targeted_metadata_never_collapses_another_principals_registry() {
+    let (_dir, kernel) = kernel_with_inventory_capsules().await;
+    let admin = PrincipalId::new("metadata-admin").expect("valid principal");
+    let bob = PrincipalId::new("bob").expect("valid principal");
+    let carol = PrincipalId::new("carol").expect("valid principal");
+    seed_profile(
+        &kernel,
+        &admin,
+        &PrincipalProfile {
+            grants: vec!["capsule:list".to_string()],
+            ..Default::default()
+        },
+    );
+    seed_capsule_inventory_profile(&kernel, &bob, &["bob-provider"]).await;
+    seed_capsule_inventory_profile(&kernel, &carol, &["carol-provider"]).await;
+
+    let response = request_kernel(
+        &kernel,
+        &admin,
+        "bob_targeted_metadata",
+        KernelRequest::GetCapsuleMetadataForPrincipal {
+            target_principal: bob,
+        },
+    )
+    .await;
+    let KernelResponse::CapsuleMetadata(entries) = response else {
+        panic!("expected targeted metadata response, got {response:?}");
+    };
+    let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
+    assert_eq!(names, ["bob-provider"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_self_target_metadata_never_expands_to_global_inventory() {
+    let (_dir, kernel) = kernel_with_inventory_capsules().await;
+    let admin = PrincipalId::new("metadata-admin").expect("valid principal");
+    let carol = PrincipalId::new("carol").expect("valid principal");
+    seed_capsule_inventory_profile(&kernel, &admin, &["admin-provider"]).await;
+    seed_profile(
+        &kernel,
+        &admin,
+        &PrincipalProfile {
+            grants: vec!["*".to_string()],
+            capsules: vec!["admin-provider".to_string()],
+            ..Default::default()
+        },
+    );
+    seed_capsule_inventory_profile(&kernel, &carol, &["carol-provider"]).await;
+
+    let response = request_kernel(
+        &kernel,
+        &admin,
+        "admin_explicit_self_metadata",
+        KernelRequest::GetCapsuleMetadataForPrincipal {
+            target_principal: admin.clone(),
+        },
+    )
+    .await;
+    let KernelResponse::CapsuleMetadata(entries) = response else {
+        panic!("expected targeted metadata response, got {response:?}");
+    };
+    let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
+    assert_eq!(names, ["admin-provider"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -646,6 +646,9 @@ pub struct CapsuleContext {
     pub process_storage_mount_broker: Option<Arc<dyn ProcessStorageMountBroker>>,
     pub kv: ScopedKvStore,
     pub event_bus: Arc<EventBus>,
+    /// Private secret replies. Enable only with an authenticated responder.
+    /// Unset contexts retain the existing CLI/TUI elicitation transport.
+    pub secret_elicits: Option<Arc<crate::elicitation::PendingSecretElicits>>,
     pub cli_socket_listener: Option<UplinkListener>,
     /// Shared capsule registry for `hooks::trigger` fan-out.
     ///
@@ -673,6 +676,8 @@ pub struct CapsuleContext {
     /// with an autonomous `run` export requires it so owner authority and
     /// sub-budgets cannot silently fall back to another context.
     pub profile_cache: Option<Arc<PrincipalProfileCache>>,
+    /// Kernel-wide aggregate user execution accounting, when configured.
+    pub user_cpu: Option<Arc<crate::user_cpu::UserCpuAccounting>>,
     /// Shared per-principal overlay VFS registry (Layer 4, issue #668).
     ///
     /// One instance per kernel boot. The engine resolves the invoking
@@ -728,6 +733,7 @@ impl CapsuleContext {
             process_storage_mount_broker: None,
             kv,
             event_bus,
+            secret_elicits: None,
             cli_socket_listener,
             capsule_registry: None,
             session_token: None,
@@ -735,6 +741,7 @@ impl CapsuleContext {
             identity_store: None,
             schema_catalog: Arc::new(SchemaCatalog::new()),
             profile_cache: None,
+            user_cpu: None,
             overlay_registry: None,
             group_config: None,
             local_egress: Vec::new(),

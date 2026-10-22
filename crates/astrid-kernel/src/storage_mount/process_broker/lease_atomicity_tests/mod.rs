@@ -659,6 +659,10 @@ async fn fleet_shared_kernel() -> (tempfile::TempDir, Arc<crate::Kernel>) {
     let temporary = tempfile::tempdir().expect("test home root");
     let home = AstridHome::from_path(temporary.path().join(".astrid"));
     let kernel = crate::test_kernel_with_home(home).await;
+    #[cfg(target_os = "macos")]
+    kernel
+        .storage_mount_callback_test_resolver
+        .use_callbacks_for_controlled_provider(process_provider_test_lane_enabled());
     let caller = PrincipalId::default();
     let actor = kernel
         .principal_directory
@@ -756,7 +760,12 @@ fn retained_cleanup_state(
             },
         },
         shared: None,
-        mount_root,
+        paths: super::ProjectionMountPaths {
+            workspace: mount_root.join("workspace"),
+            owner: mount_root.join("owner"),
+            fleet_shared: None,
+            mount_root,
+        },
         cleaned: false,
     }
 }

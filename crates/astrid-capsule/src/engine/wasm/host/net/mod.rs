@@ -344,6 +344,13 @@ pub(crate) fn audit_net_accept<T, E: std::fmt::Debug>(
     );
 }
 
+/// Write-ahead admission for a gated net effect (fail-closed classes only).
+/// The kernel records a refusal itself; the guest sees a generic `unknown`.
+fn admit_net(state: &HostState, event: HostAuditEvent<'_>) -> Result<(), ErrorCode> {
+    util::admit_effect(state, event)
+        .map_err(|_| ErrorCode::Unknown(util::AUDIT_UNAVAILABLE.to_owned()))
+}
+
 /// Report a denied net operation to the per-action audit sink. The connect
 /// gate rejects before any socket effect and early-returns, so this is the
 /// only audit report a denied connect makes (exactly-once recording).
@@ -452,6 +459,8 @@ impl net::Host for HostState {
             }
         }
 
+        admit_net(self, HostAuditEvent::NetBind { addr: bind_addr })?;
+
         // Native astrid-daemon claims the control socket first. Capsules that
         // still call bind_unix (aos-cli) must not fail the run loop: accept()
         // on this handle returns Closed and the capsule backs off.
@@ -502,6 +511,7 @@ impl net::Host for HostState {
             audit_net_bind(self, &bind_addr, HostAuditOutcome::Failed(reason));
             return Err(ErrorCode::AirlockRejected);
         }
+        admit_net(self, HostAuditEvent::NetBind { addr: &bind_addr })?;
 
         // Resolve the listener via the shared registry so a run-loop capsule's
         // N worker Stores dedupe onto ONE bound socket (Approach B): the first
@@ -736,6 +746,7 @@ impl net::Host for HostState {
             audit_net_connect(self, &host, port, &result);
             return result;
         }
+        admit_net(self, HostAuditEvent::NetConnect { host: &host, port })?;
 
         let rt_handle = self.runtime_handle.clone();
         let blocking_semaphore = self.blocking_semaphore.clone();

@@ -65,7 +65,12 @@ async fn failed_stop_retains_blocker_until_provider_cleanup_succeeds() {
             },
         },
         shared: None,
-        mount_root: mount_root.clone(),
+        paths: crate::storage_mount::process_broker::ProjectionMountPaths {
+            mount_root: mount_root.clone(),
+            workspace: mount_root.join("workspace"),
+            owner: mount_root.join("owner"),
+            fleet_shared: None,
+        },
         cleaned: false,
     };
     let mut projections = BTreeMap::new();

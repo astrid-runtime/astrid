@@ -36,6 +36,31 @@ SAMPLE = """# Changelog
 - **Historical.** Must not change.
 """
 
+STAGED = """# Changelog
+
+## [Unreleased]
+
+## [2026.9.0] - Unreleased
+
+### Fixed
+
+- **Distinctive staged fix.** Refs #2026.
+
+### Added
+
+- **Staged add.**
+
+### Fixed
+
+- **Repeated staged fix.** Refs #2027.
+
+## [0.10.4] - 2026-08-01
+
+### Fixed
+
+- **Historical.** Must not change.
+"""
+
 
 class CheckPrTests(unittest.TestCase):
     def test_parse_labels_accepts_github_escaped_newline(self):
@@ -182,6 +207,54 @@ class RollNotesTests(unittest.TestCase):
         self.assertIn("## [0.1.0] - 2026-01-01", rest)
         self.assertEqual(rest.count("**Historical.** Must not change."), 1)
         self.assertNotIn("**Historical.** Must not change.", rolled[: rolled.index("## [0.1.0]")])
+
+    def test_roll_finalizes_matching_staged_version_in_place(self):
+        fragments = [
+            (
+                Path("changes/9.added.md"),
+                "added",
+                "**Fragment add.**\nCloses #9.\n",
+            )
+        ]
+        rolled = roll_changelog(
+            STAGED,
+            version="2026.9.0",
+            date="2026-09-05",
+            fragments=fragments,
+        )
+        self.assertEqual(rolled.count("## [2026.9.0] - 2026-09-05"), 1)
+        self.assertNotIn("## [2026.9.0] - Unreleased", rolled)
+        self.assertIn("- **Distinctive staged fix.** Refs #2026.", rolled)
+        self.assertIn("- **Repeated staged fix.** Refs #2027.", rolled)
+        self.assertIn("- **Fragment add.**\n  Closes #9.", rolled)
+        self.assertLess(
+            rolled.index("**Distinctive staged fix.**"),
+            rolled.index("**Fragment add.**"),
+        )
+        self.assertLess(
+            rolled.index("**Fragment add.**"),
+            rolled.index("**Repeated staged fix.**"),
+        )
+        self.assertEqual(extract_notes(rolled, "2026.9.0").count("2026.9.0"), 0)
+        self.assertIn("### Fixed", extract_notes(rolled, "2026.9.0"))
+
+    def test_roll_rejects_duplicate_version_headings(self):
+        duplicate = STAGED.replace(
+            "## [2026.9.0] - Unreleased",
+            "## [2026.9.0] - Unreleased\n\n## [2026.9.0] - Unreleased",
+            1,
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            roll_changelog(duplicate, version="2026.9.0", date="2026-09-05", fragments=[])
+
+    def test_roll_rejects_staged_and_dated_version_headings(self):
+        ambiguous = STAGED.replace(
+            "## [2026.9.0] - Unreleased",
+            "## [2026.9.0] - Unreleased\n\n## [2026.9.0] - 2026-09-04",
+            1,
+        )
+        with self.assertRaisesRegex(ValueError, "staged and dated"):
+            roll_changelog(ambiguous, version="2026.9.0", date="2026-09-05", fragments=[])
 
     def test_notes_match_awk_style_section_body(self):
         rolled = roll_changelog(SAMPLE, version="0.2.0", date="2026-08-20", fragments=[])

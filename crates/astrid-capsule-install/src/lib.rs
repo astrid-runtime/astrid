@@ -9,8 +9,9 @@
 //!
 //! * File layout — copying the capsule tree into its target dir under
 //!   `~/.astrid/<principal>/capsules/<id>/`, with rollback on failure.
-//! * Content-addressing — `wasm` binaries go to `~/.astrid/bin/`,
-//!   `wit` blobs go to `~/.astrid/wit/store/`, both keyed by BLAKE3.
+//! * Content-addressing — storage-backed `wasm` binaries go to the system
+//!   `bin/<hash>.wasm` catalog, while workspace-only compatibility installs
+//!   retain their native cache; WIT content remains keyed by BLAKE3.
 //! * Contracts retention/skew — seeding the daemon canonical
 //!   `astrid-contracts.wit` and comparing capsule pins against it
 //!   (warn-only; see [`contracts`]).
@@ -61,6 +62,7 @@
 
 pub mod archive;
 pub mod authority;
+mod authority_store;
 pub mod contracts;
 pub mod copy;
 pub mod github_source;
@@ -70,12 +72,14 @@ pub mod manifest_check;
 pub mod meta;
 pub mod paths;
 pub mod principal_introspection;
+pub mod source_digest;
 pub mod storage;
 pub mod wasm;
 pub mod wit;
 
 pub use archive::{
-    unpack_and_install, unpack_and_install_authorized_for_principal_in_workspace,
+    unpack_and_install, unpack_and_install_authorized_bytes_for_principal_in_workspace,
+    unpack_and_install_authorized_for_principal_in_workspace,
     unpack_and_install_authorized_for_principal_with_layout,
     unpack_and_install_checked_authorized_for_principal_in_workspace,
     unpack_and_install_checked_authorized_for_principal_with_layout,
@@ -85,11 +89,14 @@ pub use archive::{
 };
 pub use authority::{
     ArtifactProvenance, AuthorityDecision, AuthoritySource, InstallInspection, InstalledAuthority,
-    LegacyAuthorityReceiptStatus, authorize_install, inspect_archive_for_principal_in_workspace,
+    LegacyAuthorityReceiptStatus, authorize_install,
+    inspect_archive_bytes_for_principal_in_workspace, inspect_archive_for_principal_in_workspace,
     inspect_archive_for_principal_with_layout, inspect_directory_for_principal_in_workspace,
-    inspect_directory_for_principal_with_layout, read_archive_manifest, read_installed_authority,
-    remove_installed_authority, verify_installed_authority,
+    inspect_directory_for_principal_with_layout, read_archive_manifest,
+    read_archive_manifest_bytes, read_installed_authority, remove_installed_authority,
+    verify_installed_authority,
 };
+pub use authority_store::verify_installed_authority_with_store;
 #[cfg(test)]
 pub use contracts::refresh_canonical_contracts;
 pub use contracts::{
@@ -129,6 +136,7 @@ pub use paths::{
 pub use principal_introspection::{
     DurableCapsuleIntrospection, list_durable_capsule_packages, read_durable_capsule_package,
 };
+pub use source_digest::{archive_digest_for_source, source_digest_for_archive};
 pub use storage::{
     LegacyCapsuleAuthorityReceipt, LegacyCapsuleMigrationReport, LegacyEnvSecretImportStatus,
     VerifiedDurableCapsulePackage, canonical_capsule_archive, legacy_capsule_authority_status,

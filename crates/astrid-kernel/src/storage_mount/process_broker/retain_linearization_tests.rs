@@ -146,6 +146,10 @@ async fn linearization_fixture() -> LinearizationFixture {
     let temporary = tempfile::tempdir().expect("linearization scratch root");
     let home = AstridHome::from_path(temporary.path().join(".astrid"));
     let kernel = crate::test_kernel_with_home(home).await;
+    #[cfg(target_os = "macos")]
+    kernel
+        .storage_mount_callback_test_resolver
+        .use_private_callbacks();
     let caller = PrincipalId::default();
     let actor = kernel
         .principal_directory

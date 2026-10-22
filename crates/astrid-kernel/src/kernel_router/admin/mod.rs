@@ -14,7 +14,9 @@
 //! # Audit trail
 //!
 //! Every admin topic — allow or deny — appends an
-//! [`AuditAction::AdminRequest`] entry. `method` is the wire name
+//! [`AuditAction::AdminRequest`] entry, except a successful `audit.heads`
+//! or `audit.export` read or `audit.anchor_mark`, which would grow the log
+//! being anchored with every poll. `method` is the wire name
 //! (`"admin.agent.create"`, etc.); `target_principal` is `Some` for
 //! variants that operate on another principal and `None` otherwise.
 //! `params` captures the full request payload (capabilities granted,
@@ -24,11 +26,17 @@
 mod agent_create_helpers;
 mod agent_delete;
 mod agent_derive;
+mod audit_anchor_handlers;
 mod audit_handlers;
 mod caps_tokens;
 mod distro_handlers;
 #[cfg(test)]
+mod distro_self_grant_tests;
+#[cfg(test)]
 mod enforcement_tests;
+// The fresh native boot fixture calls the Unix-only Kernel::new constructor.
+#[cfg(all(test, unix))]
+mod first_owner_tests;
 mod group;
 pub(crate) mod handlers;
 mod inheritance;
@@ -36,7 +44,10 @@ mod invite_handlers;
 mod pair_device_handlers;
 #[cfg(test)]
 mod pair_device_tests;
+#[cfg(test)]
+mod principal_ownership;
 mod quota;
+mod request_authorization;
 #[cfg(test)]
 mod state_tests;
 #[cfg(test)]
@@ -50,14 +61,24 @@ mod state_tests_agent_derive;
 #[cfg(test)]
 mod state_tests_agent_modify;
 #[cfg(test)]
+mod state_tests_anchor;
+#[cfg(test)]
+mod state_tests_audit;
+#[cfg(test)]
 mod state_tests_caps;
 #[cfg(test)]
 mod state_tests_caps_tokens;
+#[cfg(test)]
+mod state_tests_grant_audit;
 #[cfg(test)]
 mod state_tests_group;
 #[cfg(test)]
 mod state_tests_usage;
 mod storage_mount_handlers;
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+pub(crate) use test_support::{dispatch_as_operator, seed_operator};
 #[cfg(test)]
 mod tests;
 
@@ -67,15 +88,17 @@ use astrid_audit::{AuditOutcome, AuthorizationProof};
 use astrid_core::principal::PrincipalId;
 use astrid_events::ipc::{IpcPayload, Topic};
 use astrid_events::kernel_api::{
-    AdminKernelRequest, AdminKernelResponse, AdminRequestKind, AdminResponseBody,
+    AdminKernelRequest, AdminKernelResponse, AdminRequestKind, AdminResponseBody, EnvStorageScope,
 };
 use tracing::warn;
 
 use super::caller::{CallerResolutionError, MANAGEMENT_CALLER_REQUIRED};
 use super::{
-    AdminAuditEntry, AuthorityScope, AuthorizedPrincipal, authorize_request,
-    authorize_request_with_identity, pause_authorize_identity_for_test, publish_response,
-    record_admin_audit, resolve_caller, resolve_device_key_id,
+    AdminAuditEntry, AuthorityScope, authorize_request, publish_response, record_admin_audit,
+    resolve_caller, resolve_device_key_id,
+};
+use request_authorization::{
+    AdminAuthorizationContext, authorize_admin_request, record_admin_request_failure,
 };
 
 /// Admin IPC input topic prefix.
@@ -228,12 +251,33 @@ fn admin_response_topic(input_topic: &str) -> Topic {
 #[must_use]
 pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> AuthorityScope {
     match req {
+        // Host-wide shared env/secret namespaces are not principal-scoped
+        // storage: the `principal` field is ignored for `Shared` writes and
+        // every capsule falls back to `system:control:*` on miss. Require the
+        // global `env:write` form even when the caller names themselves —
+        // otherwise `self:*` (builtin agent) can poison every principal's
+        // shared secret resolution for a capsule.
+        AdminRequestKind::EnvSet {
+            principal,
+            scope,
+            ..
+        }
+        | AdminRequestKind::EnvDelete {
+            principal,
+            scope,
+            ..
+        } => {
+            if *scope == EnvStorageScope::Shared || principal != caller {
+                AuthorityScope::Global
+            } else {
+                AuthorityScope::Self_
+            }
+        }
         AdminRequestKind::QuotaGet { principal }
         | AdminRequestKind::QuotaSet { principal, .. }
         | AdminRequestKind::UsageGet { principal }
-        | AdminRequestKind::EnvSet { principal, .. }
         | AdminRequestKind::EnvList { principal, .. }
-        | AdminRequestKind::EnvDelete { principal, .. }
+        | AdminRequestKind::EnvSetIfAbsent { principal, .. }
         | AdminRequestKind::DistroLockGet { principal }
         | AdminRequestKind::DistroLockSet { principal, .. }
         // Device management is self-scoped when the target IS the caller —
@@ -264,10 +308,12 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         // `group:delete`, `group:modify`) and remain
         // `AuthorityScope::Global` below, so this widening is read-only.
         AdminRequestKind::AgentList
+        | AdminRequestKind::UserPrincipalList
         | AdminRequestKind::GroupList
         // EnvList is self-scoped when the target is the caller; the target
         // arm above handles cross-principal admin reads.
         | AdminRequestKind::PairDeviceIssue { .. }
+        | AdminRequestKind::DistroSelfGrant
         | AdminRequestKind::StorageMountStatus { .. }
         | AdminRequestKind::StorageMountSync { .. }
         | AdminRequestKind::StorageMountRevoke { .. }
@@ -276,6 +322,9 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
             ..
         } => AuthorityScope::Self_,
         AdminRequestKind::AgentCreate { .. }
+        | AdminRequestKind::QuotaAssignUser { .. }
+        | AdminRequestKind::QuotaUserList
+        | AdminRequestKind::UserPrincipalClaim { .. }
         | AdminRequestKind::AgentDelete { .. }
         | AdminRequestKind::AgentEnable { .. }
         | AdminRequestKind::AgentDisable { .. }
@@ -296,6 +345,10 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         | AdminRequestKind::AuditStats
         | AdminRequestKind::AuditPrune { .. }
         | AdminRequestKind::AuditHealth
+        | AdminRequestKind::AuditHeads
+        | AdminRequestKind::AuditExport(_)
+        | AdminRequestKind::AuditAnchorMark(_)
+        | AdminRequestKind::AuditAnchorStatus
         | AdminRequestKind::StorageMountIssue {
             view: astrid_core::storage_provider::StorageProviderViewV1::Admin,
             ..
@@ -317,6 +370,10 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
 /// unscoped `quota:set` / `caps:grant` forms. Group admin is always
 /// global — there is no "self" variant of `group:create`.
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per admin request: the complete capability table in one place"
+)]
 pub fn required_capability_for_admin_request(
     req: &AdminRequestKind,
     scope: AuthorityScope,
@@ -336,21 +393,32 @@ pub fn required_capability_for_admin_request(
             },
             _,
         ) => "agent:create:inherit",
-        (AdminRequestKind::AgentCreate { .. }, _) => "agent:create",
+        (AdminRequestKind::AgentCreate { .. } | AdminRequestKind::UserPrincipalClaim { .. }, _) => {
+            "agent:create"
+        },
         (AdminRequestKind::AgentDelete { .. }, _) => "agent:delete",
         (AdminRequestKind::AgentEnable { .. }, _) => "agent:enable",
         (AdminRequestKind::AgentDisable { .. }, _) => "agent:disable",
         (AdminRequestKind::AgentModify { .. }, _) => "agent:modify",
-        (AdminRequestKind::AgentList, AuthorityScope::Self_) => "self:agent:list",
+        (AdminRequestKind::AgentList, AuthorityScope::Self_)
+        | (AdminRequestKind::UserPrincipalList, _) => "self:agent:list",
         (AdminRequestKind::AgentList, AuthorityScope::Global) => "agent:list",
+        (AdminRequestKind::DistroSelfGrant, _) => "self:distro:grant",
         (AdminRequestKind::QuotaSet { .. }, AuthorityScope::Self_) => "self:quota:set",
-        (AdminRequestKind::QuotaSet { .. }, AuthorityScope::Global) => "quota:set",
+        (AdminRequestKind::QuotaSet { .. }, AuthorityScope::Global)
+        | (AdminRequestKind::QuotaAssignUser { .. } | AdminRequestKind::QuotaUserList, _) => {
+            "quota:set"
+        },
         (
-            AdminRequestKind::EnvSet { .. } | AdminRequestKind::EnvDelete { .. },
+            AdminRequestKind::EnvSet { .. }
+            | AdminRequestKind::EnvSetIfAbsent { .. }
+            | AdminRequestKind::EnvDelete { .. },
             AuthorityScope::Self_,
         ) => "self:env:write",
         (
-            AdminRequestKind::EnvSet { .. } | AdminRequestKind::EnvDelete { .. },
+            AdminRequestKind::EnvSet { .. }
+            | AdminRequestKind::EnvSetIfAbsent { .. }
+            | AdminRequestKind::EnvDelete { .. },
             AuthorityScope::Global,
         ) => "env:write",
         (AdminRequestKind::EnvList { .. }, AuthorityScope::Self_) => "self:env:read",
@@ -424,6 +492,9 @@ pub fn required_capability_for_admin_request(
         (AdminRequestKind::AuditStats, _) => "audit:stats",
         (AdminRequestKind::AuditPrune { .. }, _) => "audit:prune",
         (AdminRequestKind::AuditHealth, _) => "audit:health",
+        (AdminRequestKind::AuditHeads | AdminRequestKind::AuditAnchorStatus, _) => "audit:heads",
+        (AdminRequestKind::AuditExport(_), _) => "audit:export",
+        (AdminRequestKind::AuditAnchorMark(_), _) => "audit:anchor",
         (
             request @ (AdminRequestKind::StorageMountIssue { .. }
             | AdminRequestKind::StorageMountStatus { .. }
@@ -496,14 +567,20 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::AgentDisable { .. } => "admin.agent.disable",
         AdminRequestKind::AgentModify { .. } => "admin.agent.modify",
         AdminRequestKind::AgentList => "admin.agent.list",
+        AdminRequestKind::UserPrincipalList => "admin.user.principals",
+        AdminRequestKind::UserPrincipalClaim { .. } => "admin.user.principal.claim",
         AdminRequestKind::QuotaSet { .. } => "admin.quota.set",
+        AdminRequestKind::QuotaUserList => "admin.quota.user_list",
+        AdminRequestKind::QuotaAssignUser { .. } => "admin.quota.assign_user",
         AdminRequestKind::QuotaGet { .. } => "admin.quota.get",
         AdminRequestKind::UsageGet { .. } => "admin.usage.get",
         AdminRequestKind::EnvSet { .. } => "admin.env.set",
+        AdminRequestKind::EnvSetIfAbsent { .. } => "admin.env.set_if_absent",
         AdminRequestKind::EnvList { .. } => "admin.env.list",
         AdminRequestKind::EnvDelete { .. } => "admin.env.delete",
         AdminRequestKind::DistroLockGet { .. } => "admin.distro.lock.get",
         AdminRequestKind::DistroLockSet { .. } => "admin.distro.lock.set",
+        AdminRequestKind::DistroSelfGrant => "admin.distro.self.grant",
         AdminRequestKind::GroupCreate { .. } => "admin.group.create",
         AdminRequestKind::GroupDelete { .. } => "admin.group.delete",
         AdminRequestKind::GroupModify { .. } => "admin.group.modify",
@@ -524,6 +601,10 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::AuditStats => "admin.audit.stats",
         AdminRequestKind::AuditPrune { .. } => "admin.audit.prune",
         AdminRequestKind::AuditHealth => "admin.audit.health",
+        AdminRequestKind::AuditHeads => "admin.audit.heads",
+        AdminRequestKind::AuditExport(_) => "admin.audit.export",
+        AdminRequestKind::AuditAnchorMark(_) => "admin.audit.anchor_mark",
+        AdminRequestKind::AuditAnchorStatus => "admin.audit.anchor_status",
         AdminRequestKind::StorageMountIssue { .. } => "admin.storage.mount.issue",
         AdminRequestKind::StorageMountStatus { .. } => "admin.storage.mount.status",
         AdminRequestKind::StorageMountSync { .. } => "admin.storage.mount.sync",
@@ -601,12 +682,18 @@ fn sanitize_admin_audit_params(req: &AdminRequestKind) -> Option<serde_json::Val
                 serde_json::Value::String(crate::pair_token::hash_token(token)),
             );
         },
-        AdminRequestKind::EnvSet { .. } => {
+        AdminRequestKind::EnvSet { .. } | AdminRequestKind::EnvSetIfAbsent { .. } => {
             params.remove("value");
             params.insert(
                 "value".to_string(),
                 serde_json::Value::String("<redacted>".to_owned()),
             );
+        },
+        // Up to thousands of chains: keep the row bounded. A rejection row's
+        // outcome names the chains that failed.
+        AdminRequestKind::AuditAnchorMark(request) => {
+            params.remove("chains");
+            params.insert("chain_count".to_string(), request.chains.len().into());
         },
         _ => {},
     }
@@ -632,10 +719,13 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         | AdminRequestKind::AgentEnable { principal }
         | AdminRequestKind::AgentDisable { principal }
         | AdminRequestKind::AgentModify { principal, .. }
+        | AdminRequestKind::UserPrincipalClaim { principal }
+        | AdminRequestKind::QuotaAssignUser { principal, .. }
         | AdminRequestKind::QuotaSet { principal, .. }
         | AdminRequestKind::QuotaGet { principal }
         | AdminRequestKind::UsageGet { principal }
         | AdminRequestKind::EnvSet { principal, .. }
+        | AdminRequestKind::EnvSetIfAbsent { principal, .. }
         | AdminRequestKind::EnvList { principal, .. }
         | AdminRequestKind::EnvDelete { principal, .. }
         | AdminRequestKind::DistroLockGet { principal }
@@ -649,8 +739,11 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         // `CapsTokenRevoke` carries a token id, not a principal — the token's
         // owner is recovered from the store, not the request body.
         AdminRequestKind::CapsTokenRevoke { .. }
+        | AdminRequestKind::QuotaUserList
         | AdminRequestKind::AgentCreate { .. }
         | AdminRequestKind::AgentList
+        | AdminRequestKind::UserPrincipalList
+        | AdminRequestKind::DistroSelfGrant
         | AdminRequestKind::GroupCreate { .. }
         | AdminRequestKind::GroupDelete { .. }
         | AdminRequestKind::GroupModify { .. }
@@ -664,6 +757,10 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         | AdminRequestKind::AuditStats
         | AdminRequestKind::AuditPrune { .. }
         | AdminRequestKind::AuditHealth
+        | AdminRequestKind::AuditHeads
+        | AdminRequestKind::AuditExport(_)
+        | AdminRequestKind::AuditAnchorMark(_)
+        | AdminRequestKind::AuditAnchorStatus
         | AdminRequestKind::StorageMountIssue { .. }
         | AdminRequestKind::StorageMountStatus { .. }
         | AdminRequestKind::StorageMountSync { .. }
@@ -733,148 +830,6 @@ async fn handle_redeem_admin_request(
     );
 }
 
-struct AdminAuthorizationContext<'a> {
-    caller: &'a PrincipalId,
-    device_key_id: Option<&'a str>,
-    kind: &'a AdminRequestKind,
-    method: &'static str,
-    required_cap: &'static str,
-    target_principal: Option<&'a PrincipalId>,
-    audit_params: Option<&'a serde_json::Value>,
-}
-
-fn allowed_admin_authorization(context: &AdminAuthorizationContext<'_>) -> AuthorizationProof {
-    AuthorizationProof::System {
-        reason: format!(
-            "policy allow: {} holds {}",
-            context.caller, context.required_cap
-        ),
-    }
-}
-
-async fn record_admin_authorization_failure(
-    kernel: &Arc<crate::Kernel>,
-    context: &AdminAuthorizationContext<'_>,
-    error: &str,
-) {
-    warn!(
-        security_event = true,
-        method = context.method,
-        principal = %context.caller,
-        required = context.required_cap,
-        error,
-        "Permission check denied admin request"
-    );
-    record_admin_audit(
-        kernel,
-        AdminAuditEntry {
-            caller: context.caller,
-            method: context.method,
-            required_cap: context.required_cap,
-            device_key_id: context.device_key_id,
-            target_principal: context.target_principal.cloned(),
-            params: context.audit_params.cloned(),
-            authorization: AuthorizationProof::Denied {
-                reason: error.to_string(),
-            },
-            outcome: AuditOutcome::failure(error),
-        },
-    )
-    .await;
-}
-
-async fn record_admin_bad_input_failure(
-    kernel: &Arc<crate::Kernel>,
-    context: &AdminAuthorizationContext<'_>,
-    error: &str,
-) {
-    record_admin_audit(
-        kernel,
-        AdminAuditEntry {
-            caller: context.caller,
-            method: context.method,
-            required_cap: context.required_cap,
-            device_key_id: context.device_key_id,
-            target_principal: context.target_principal.cloned(),
-            params: context.audit_params.cloned(),
-            authorization: allowed_admin_authorization(context),
-            outcome: AuditOutcome::failure(error),
-        },
-    )
-    .await;
-}
-
-async fn authorize_admin_request(
-    kernel: &Arc<crate::Kernel>,
-    context: &AdminAuthorizationContext<'_>,
-) -> Result<super::AuthorizedRequest, String> {
-    let identity = if context.kind.requires_principal_identity() {
-        match AuthorizedPrincipal::bind(kernel, context.caller) {
-            Ok(identity) => Some(identity),
-            Err(error) => {
-                let error = error.to_string();
-                record_admin_authorization_failure(kernel, context, &error).await;
-                return Err(error);
-            },
-        }
-    } else {
-        None
-    };
-    pause_authorize_identity_for_test(kernel).await;
-    let authorization = match authorize_request_with_identity(
-        kernel,
-        context.caller,
-        context.device_key_id,
-        context.required_cap,
-        identity,
-    ) {
-        Ok(authorization) => authorization,
-        Err(error) => {
-            let error = error.to_string();
-            record_admin_authorization_failure(kernel, context, &error).await;
-            return Err(error);
-        },
-    };
-
-    let preflight = if let AdminRequestKind::PairDeviceIssue {
-        expires_secs,
-        scope,
-        ..
-    } = context.kind
-    {
-        pair_device_handlers::preflight_pair_device_issue(&authorization, *expires_secs, scope)
-    } else {
-        Ok(())
-    };
-    match preflight {
-        Ok(()) => {},
-        Err(pair_device_handlers::PairIssuePreflightError::BadInput(error)) => {
-            record_admin_bad_input_failure(kernel, context, &error).await;
-            return Err(error);
-        },
-        Err(pair_device_handlers::PairIssuePreflightError::Unauthorized(error)) => {
-            record_admin_authorization_failure(kernel, context, &error).await;
-            return Err(error);
-        },
-    }
-
-    record_admin_audit(
-        kernel,
-        AdminAuditEntry {
-            caller: context.caller,
-            method: context.method,
-            required_cap: context.required_cap,
-            device_key_id: context.device_key_id,
-            target_principal: context.target_principal.cloned(),
-            params: context.audit_params.cloned(),
-            authorization: allowed_admin_authorization(context),
-            outcome: AuditOutcome::success(),
-        },
-    )
-    .await;
-    Ok(authorization)
-}
-
 async fn handle_admin_request(
     kernel: &Arc<crate::Kernel>,
     topic: Topic,
@@ -915,13 +870,12 @@ async fn handle_admin_request(
     let context = AdminAuthorizationContext {
         caller: &caller,
         device_key_id: device_key_id.as_deref(),
-        kind: &req.kind,
         method,
         required_cap,
         target_principal: target.as_ref(),
         audit_params: audit_params.as_ref(),
     };
-    let authorization = match authorize_admin_request(kernel, &context).await {
+    let authorization = match authorize_admin_request(kernel, &context, &req.kind).await {
         Ok(authorization) => authorization,
         Err(error) => {
             publish_response(
@@ -935,7 +889,11 @@ async fn handle_admin_request(
         },
     };
 
+    let success_row_skipped = audit_handlers::omit_success_admin_audit(&req.kind);
     let body = handlers::dispatch_authorized(kernel, &authorization, req.kind).await;
+    if success_row_skipped && let Some(error) = audit_handlers::skipped_row_failure(&body) {
+        record_admin_request_failure(kernel, &context, &error).await;
+    }
     publish_response(
         kernel,
         response_topic,

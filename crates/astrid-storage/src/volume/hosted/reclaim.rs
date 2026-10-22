@@ -152,7 +152,11 @@ pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
         sequence: 0,
         valid_len: 0,
         durable_len: 0,
+        last_commit_offset: 0,
+        last_snapshot_end: 0,
         boundary_pending: false,
+        footer_pending: true,
+        flush_state: super::FlushState::Required,
         regions: BTreeMap::new(),
     };
     rebuilt.file.write_all(&VOLUME_MAGIC)?;
@@ -195,12 +199,17 @@ pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
     let rebuilt_regions = rebuilt.regions.clone();
     let rebuilt_sequence = rebuilt.sequence;
     let rebuilt_len = rebuilt.valid_len;
+    let rebuilt_commit_offset = rebuilt.last_commit_offset;
+    let rebuilt_snapshot_end = rebuilt.last_snapshot_end;
     rebuilt.file.sync_all()?;
     drop(rebuilt);
 
     // Close the old locked inode before replacement. Recovery of the sibling
     // artifacts handles a process crash between either rename.
     let placeholder = OpenOptions::new().read(true).write(true).open(&temporary)?;
+    // From here on the file handle may change even if reclaim returns an
+    // error. Never carry the previous inode's flush proof across that swap.
+    state.flush_state = super::FlushState::Required;
     let old_file = std::mem::replace(&mut state.file, placeholder);
     old_file.unlock()?;
     drop(old_file);
@@ -220,7 +229,10 @@ pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
     state.sequence = rebuilt_sequence;
     state.valid_len = rebuilt_len;
     state.durable_len = rebuilt_len;
+    state.last_commit_offset = rebuilt_commit_offset;
+    state.last_snapshot_end = rebuilt_snapshot_end;
     state.boundary_pending = false;
+    state.footer_pending = false;
     state.regions = rebuilt_regions;
     std::fs::remove_file(previous)?;
     Ok(())

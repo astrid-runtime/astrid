@@ -257,6 +257,7 @@ fn elicit_response_rejects_both_value_and_values() {
 async fn approval_response_publishes_stamped_reply_on_topic() {
     let bus = astrid_events::EventBus::with_capacity(64);
     let request_id = Uuid::new_v4().to_string();
+    let request_owner = RequestOwnerId::generate();
     let mut rx = bus.subscribe_topic(Topic::approval_response(&request_id).as_str());
 
     publish_approval_response(
@@ -267,6 +268,7 @@ async fn approval_response_publishes_stamped_reply_on_topic() {
             decision: "approve_session".to_string(),
             reason: Some("ok for this run".to_string()),
         },
+        request_owner,
     );
 
     let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -277,6 +279,7 @@ async fn approval_response_publishes_stamped_reply_on_topic() {
         panic!("expected IPC event");
     };
     assert_eq!(message.principal.as_deref(), Some("agent-alice"));
+    assert_eq!(message.request_owner, Some(request_owner));
     match &message.payload {
         BusIpcPayload::ApprovalResponse {
             request_id: got_id,
@@ -317,19 +320,23 @@ fn approval_response_rejects_unsupported_decisions() {
 
 #[test]
 fn control_request_stream_filters_to_caller_principal() {
+    let owner = RequestOwnerId::generate();
+    let peer_owner = RequestOwnerId::generate();
     let own_request = Arc::new(AstridEvent::Ipc {
         metadata: EventMetadata::default(),
         message: IpcMessage::new(
             Topic::approval_request(),
             IpcPayload::ApprovalRequired {
                 request_id: "req-1".to_string(),
+                request_owner: owner.to_string(),
                 action: "run".to_string(),
                 resource: "command".to_string(),
                 reason: "needs consent".to_string(),
             },
             Uuid::nil(),
         )
-        .with_principal("agent-alice"),
+        .with_principal("agent-alice")
+        .with_request_owner(owner),
     });
     let peer_request = Arc::new(AstridEvent::Ipc {
         metadata: EventMetadata::default(),
@@ -337,15 +344,78 @@ fn control_request_stream_filters_to_caller_principal() {
             Topic::approval_request(),
             IpcPayload::ApprovalRequired {
                 request_id: "req-2".to_string(),
+                request_owner: peer_owner.to_string(),
                 action: "run".to_string(),
                 resource: "other command".to_string(),
                 reason: "needs consent".to_string(),
             },
             Uuid::nil(),
         )
-        .with_principal("agent-bob"),
+        .with_principal("agent-bob")
+        .with_request_owner(peer_owner),
     });
-    let response_event = Arc::new(AstridEvent::Ipc {
+    let grant_request = Arc::new(AstridEvent::Ipc {
+        metadata: EventMetadata::default(),
+        message: IpcMessage::new(
+            Topic::approval_request(),
+            IpcPayload::GrantRequired {
+                request_id: "grant-1".to_string(),
+                request_owner: owner.to_string(),
+                principal: "agent-alice".to_string(),
+                capsule_id: "astrid-capsule-extra".to_string(),
+            },
+            Uuid::nil(),
+        )
+        .with_principal("agent-alice")
+        .with_request_owner(owner),
+    });
+    let forged_grant_request = Arc::new(AstridEvent::Ipc {
+        metadata: EventMetadata::default(),
+        message: IpcMessage::new(
+            Topic::approval_request(),
+            IpcPayload::GrantRequired {
+                request_id: "grant-2".to_string(),
+                request_owner: peer_owner.to_string(),
+                principal: "agent-alice".to_string(),
+                capsule_id: "astrid-capsule-extra".to_string(),
+            },
+            Uuid::new_v4(),
+        )
+        .with_principal("agent-alice")
+        .with_request_owner(peer_owner),
+    });
+    let mismatched_grant_request = Arc::new(AstridEvent::Ipc {
+        metadata: EventMetadata::default(),
+        message: IpcMessage::new(
+            Topic::approval_request(),
+            IpcPayload::GrantRequired {
+                request_id: "grant-3".to_string(),
+                request_owner: owner.to_string(),
+                principal: "agent-bob".to_string(),
+                capsule_id: "astrid-capsule-extra".to_string(),
+            },
+            Uuid::nil(),
+        )
+        .with_principal("agent-alice")
+        .with_request_owner(owner),
+    });
+
+    assert!(forward_control_request(&own_request, "agent-alice", owner, "approval").is_some());
+    assert!(forward_control_request(&peer_request, "agent-alice", owner, "approval").is_none());
+    assert!(forward_control_request(&grant_request, "agent-alice", owner, "approval").is_some());
+    assert!(
+        forward_control_request(&forged_grant_request, "agent-alice", owner, "approval").is_none()
+    );
+    assert!(
+        forward_control_request(&mismatched_grant_request, "agent-alice", owner, "approval")
+            .is_none()
+    );
+}
+
+#[test]
+fn control_request_stream_never_forwards_approval_responses() {
+    let owner = RequestOwnerId::generate();
+    let response = Arc::new(AstridEvent::Ipc {
         metadata: EventMetadata::default(),
         message: IpcMessage::new(
             Topic::approval_response("req-1"),
@@ -356,56 +426,61 @@ fn control_request_stream_filters_to_caller_principal() {
             },
             Uuid::nil(),
         )
-        .with_principal("agent-alice"),
-    });
-    let grant_request = Arc::new(AstridEvent::Ipc {
-        metadata: EventMetadata::default(),
-        message: IpcMessage::new(
-            Topic::approval_request(),
-            IpcPayload::GrantRequired {
-                request_id: "grant-1".to_string(),
-                principal: "agent-alice".to_string(),
-                capsule_id: "astrid-capsule-extra".to_string(),
-            },
-            Uuid::nil(),
-        )
-        .with_principal("agent-alice"),
-    });
-    let forged_grant_request = Arc::new(AstridEvent::Ipc {
-        metadata: EventMetadata::default(),
-        message: IpcMessage::new(
-            Topic::approval_request(),
-            IpcPayload::GrantRequired {
-                request_id: "grant-2".to_string(),
-                principal: "agent-alice".to_string(),
-                capsule_id: "astrid-capsule-extra".to_string(),
-            },
-            Uuid::new_v4(),
-        )
-        .with_principal("agent-alice"),
-    });
-    let mismatched_grant_request = Arc::new(AstridEvent::Ipc {
-        metadata: EventMetadata::default(),
-        message: IpcMessage::new(
-            Topic::approval_request(),
-            IpcPayload::GrantRequired {
-                request_id: "grant-3".to_string(),
-                principal: "agent-bob".to_string(),
-                capsule_id: "astrid-capsule-extra".to_string(),
-            },
-            Uuid::nil(),
-        )
-        .with_principal("agent-alice"),
+        .with_principal("agent-alice")
+        .with_request_owner(owner),
     });
 
-    assert!(forward_control_request(&own_request, "agent-alice", "approval").is_some());
-    assert!(forward_control_request(&peer_request, "agent-alice", "approval").is_none());
-    assert!(forward_control_request(&response_event, "agent-alice", "approval").is_none());
-    assert!(forward_control_request(&grant_request, "agent-alice", "approval").is_some());
-    assert!(forward_control_request(&forged_grant_request, "agent-alice", "approval").is_none());
+    assert!(forward_control_request(&response, "agent-alice", owner, "approval").is_none());
+}
+
+#[test]
+fn control_request_stream_rejects_another_bearer_session_for_the_same_principal() {
+    let expected_owner = RequestOwnerId::generate();
+    let peer_owner = RequestOwnerId::generate();
+    let peer_request = Arc::new(AstridEvent::Ipc {
+        metadata: EventMetadata::default(),
+        message: IpcMessage::new(
+            Topic::approval_request(),
+            IpcPayload::ApprovalRequired {
+                request_id: "req-peer".to_string(),
+                request_owner: peer_owner.to_string(),
+                action: "run".to_string(),
+                resource: "peer command".to_string(),
+                reason: "needs consent".to_string(),
+            },
+            Uuid::nil(),
+        )
+        .with_principal("agent-alice")
+        .with_request_owner(peer_owner),
+    });
+
     assert!(
-        forward_control_request(&mismatched_grant_request, "agent-alice", "approval").is_none()
+        forward_control_request(&peer_request, "agent-alice", expected_owner, "approval",)
+            .is_none()
     );
+}
+
+#[test]
+fn control_request_stream_rejects_wrong_principal_even_with_matching_owner() {
+    let owner = RequestOwnerId::generate();
+    let request = Arc::new(AstridEvent::Ipc {
+        metadata: EventMetadata::default(),
+        message: IpcMessage::new(
+            Topic::approval_request(),
+            IpcPayload::ApprovalRequired {
+                request_id: "req-peer".to_string(),
+                request_owner: owner.to_string(),
+                action: "run".to_string(),
+                resource: "peer command".to_string(),
+                reason: "needs consent".to_string(),
+            },
+            Uuid::nil(),
+        )
+        .with_principal("agent-bob")
+        .with_request_owner(owner),
+    });
+
+    assert!(forward_control_request(&request, "agent-alice", owner, "approval").is_none());
 }
 
 /// The fail-fast stream emits exactly one `error` event and then closes.

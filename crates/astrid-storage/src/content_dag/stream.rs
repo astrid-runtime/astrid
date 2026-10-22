@@ -5,6 +5,7 @@ use std::io::{self, Cursor, Read};
 
 use crate::storage_model::{ObjectId, ObjectRecord};
 use fastcdc::v2020::{Normalization, StreamCDC};
+use fastcdc_v4::v2020::{Normalization as NormalizationV4, StreamCDC as StreamCDCV4};
 
 use crate::content_dag::build::{Child, chunk_record, file_record, tree_record};
 use crate::content_dag::{
@@ -138,6 +139,21 @@ where
     if prefix.len() <= maximum {
         if !prefix.is_empty() {
             let child = stage_chunk(sink, &prefix, &mut logical_bytes)?;
+            tree.push(sink, child)?;
+        }
+    } else if profile.uses_legacy_fastcdc_v4() {
+        let chunker = StreamCDCV4::with_level_and_seed(
+            Cursor::new(prefix).chain(source),
+            minimum,
+            average,
+            maximum,
+            NormalizationV4::Level1,
+            profile.gear_seed(),
+        );
+        for result in chunker {
+            let chunk =
+                result.map_err(|error| ContentStreamError::Source(io::Error::from(error)))?;
+            let child = stage_chunk(sink, &chunk.data, &mut logical_bytes)?;
             tree.push(sink, child)?;
         }
     } else {

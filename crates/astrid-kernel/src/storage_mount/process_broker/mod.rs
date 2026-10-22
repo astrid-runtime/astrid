@@ -30,11 +30,17 @@ pub(crate) use process_stop::ProcessStopPolicy;
 #[cfg(all(test, any(unix, windows)))]
 mod cache_tests;
 #[cfg(any(unix, windows))]
+mod native_unmount;
+#[cfg(any(unix, windows))]
 mod projection_identity;
 #[cfg(any(unix, windows))]
 mod projection_lifecycle;
+#[cfg(any(unix, windows))]
+mod projection_release;
 #[cfg(all(test, any(unix, windows)))]
 mod retain_test_gates;
+#[cfg(all(test, any(unix, windows)))]
+mod retained_diagnostics;
 #[cfg(all(test, any(unix, windows)))]
 pub(crate) use retain_test_gates::{
     RetainTestGates, arm_retain_reference_gate, arm_retain_validation_gate,
@@ -42,6 +48,8 @@ pub(crate) use retain_test_gates::{
 mod projection_root_removal;
 #[cfg(all(test, any(unix, windows)))]
 mod test_faults;
+#[cfg(all(test, any(unix, windows)))]
+mod unmount_lifecycle_tests;
 #[cfg(all(test, any(unix, windows)))]
 pub(crate) use projection_lifecycle::cached_projection_mount;
 #[cfg(any(unix, windows))]

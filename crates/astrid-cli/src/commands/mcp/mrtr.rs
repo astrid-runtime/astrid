@@ -14,15 +14,16 @@ use astrid_core::PrincipalId;
 use rand::RngExt;
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
-    CallToolResponse, ElicitRequest, ElicitRequestParams, ElicitResult, ElicitationAction,
-    InputRequest, InputRequiredResult, InputResponses, RequestStateCodec, SealOptions,
+    CallToolResponse, ElicitRequest, ElicitResult, ElicitationAction, InputRequest,
+    InputRequiredResult, InputResponses, RequestStateCodec, SealOptions,
 };
 use rmcp::service::ElicitationSafe;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::consent_display::ConsentDisplay;
 use super::elicit::{ApprovalChoice, ApprovalForm, ApprovalRequest};
-use super::form_elicitation::interoperable_schema;
+use super::form_elicitation::form_params;
 use super::grant::{GrantForm, GrantRequest};
 use super::ingress::IngressForm;
 
@@ -91,13 +92,20 @@ pub(super) struct MrtrBridge {
 }
 
 impl MrtrBridge {
-    pub(super) fn new() -> Self {
-        let mut key = [0_u8; 32];
+    pub(super) fn new() -> Result<Self, McpError> {
+        let mut key = [0_u8; RequestStateCodec::MIN_KEY_LENGTH];
         rand::rng().fill(&mut key);
-        Self {
-            codec: RequestStateCodec::new(key),
+        Self::from_key(key)
+    }
+
+    fn from_key(key: impl Into<Vec<u8>>) -> Result<Self, McpError> {
+        let codec = RequestStateCodec::try_new(key).map_err(|error| {
+            McpError::internal_error(format!("invalid MRTR signing key: {error}"), None)
+        })?;
+        Ok(Self {
+            codec,
             redeemed: Arc::new(Mutex::new(HashMap::new())),
-        }
+        })
     }
 
     pub(super) fn ingress_required(
@@ -176,14 +184,11 @@ impl MrtrBridge {
             )
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
 
-        let schema = interoperable_schema::<T>().map_err(|error| {
-            McpError::internal_error(format!("failed to build consent schema: {error}"), None)
-        })?;
-        let request = ElicitRequest::new(ElicitRequestParams::FormElicitationParams {
-            meta: None,
-            message: prompt,
-            requested_schema: schema,
-        });
+        let params = form_params::<T>(prompt, &consent_display_for(pending, tool, principal))
+            .map_err(|error| {
+                McpError::internal_error(format!("failed to build consent schema: {error}"), None)
+            })?;
+        let request = ElicitRequest::new(params);
         let mut requests = BTreeMap::new();
         requests.insert(INPUT_KEY.to_owned(), InputRequest::Elicitation(request));
         Ok(InputRequiredResult::new(Some(requests), Some(state)).into())
@@ -254,6 +259,20 @@ impl MrtrBridge {
     }
 }
 
+fn consent_display_for(
+    pending: &PendingConsent,
+    tool: &str,
+    principal: &PrincipalId,
+) -> ConsentDisplay {
+    match pending {
+        PendingConsent::Ingress => ConsentDisplay::ingress()
+            .with_tool(tool)
+            .with_principal(principal.to_string()),
+        PendingConsent::Grant { request, .. } => request.consent_display(),
+        PendingConsent::Approval { request } => request.consent_display(),
+    }
+}
+
 fn accepted_form<T>(response: Option<&Value>) -> Option<T>
 where
     T: for<'de> Deserialize<'de>,
@@ -304,7 +323,7 @@ mod tests {
 
     #[test]
     fn state_is_bound_to_principal_tool_and_arguments() {
-        let bridge = MrtrBridge::new();
+        let bridge = MrtrBridge::new().expect("random signing key is length-validated");
         let alice = PrincipalId::new("alice").unwrap();
         let bob = PrincipalId::new("bob").unwrap();
         let arguments = json!({ "path": "/tmp/report" });
@@ -354,7 +373,7 @@ mod tests {
 
     #[test]
     fn cancelled_redemption_can_retry_but_completed_redemption_cannot() {
-        let bridge = MrtrBridge::new();
+        let bridge = MrtrBridge::new().expect("random signing key is length-validated");
         let alice = PrincipalId::new("alice").unwrap();
         let arguments = json!({ "path": "/tmp/report" });
         let state = state_from(
@@ -383,8 +402,20 @@ mod tests {
     }
 
     #[test]
+    fn short_signing_key_is_rejected_before_a_bridge_is_created() {
+        let actual = RequestStateCodec::MIN_KEY_LENGTH - 1;
+
+        let Err(error) = MrtrBridge::from_key(vec![0_u8; actual]) else {
+            panic!("a short signing key must not construct a codec");
+        };
+
+        assert_eq!(error.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert!(error.message.contains("expected at least 32 bytes, got 31"));
+    }
+
+    #[test]
     fn missing_declined_or_malformed_input_fails_closed() {
-        let bridge = MrtrBridge::new();
+        let bridge = MrtrBridge::new().expect("random signing key is length-validated");
         let alice = PrincipalId::new("alice").unwrap();
         let arguments = json!({});
         for responses in [

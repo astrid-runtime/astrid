@@ -31,7 +31,6 @@ use crate::storage_mount::{
     issue_lease, last_authorized_caller_uid, test_mount_admission,
 };
 
-use super::handlers;
 use crate::Kernel;
 
 async fn fixture() -> (tempfile::TempDir, Arc<Kernel>) {
@@ -48,6 +47,7 @@ async fn fixture() -> (tempfile::TempDir, Arc<Kernel>) {
         ))
         .expect("seed default admin profile");
     kernel.profile_cache.invalidate(&PrincipalId::default());
+    super::test_support::seed_operator(&kernel).await;
     (dir, kernel)
 }
 
@@ -70,7 +70,7 @@ fn seed_footprint(kernel: &Kernel, principal: &PrincipalId) -> (PathBuf, PathBuf
 }
 
 async fn create(kernel: &Arc<Kernel>, principal: &PrincipalId) {
-    let response = handlers::dispatch(
+    let response = super::test_support::dispatch_as_operator(
         kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -102,7 +102,7 @@ async fn agent_delete_reclaims_home_key_and_secrets_and_reports_them() {
         .await
         .unwrap();
 
-    let response = handlers::dispatch(
+    let response = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentDelete {
@@ -142,7 +142,7 @@ async fn agent_delete_closes_authz_before_reclaiming() {
         vec![BUILTIN_AGENT.to_string()]
     );
 
-    let response = handlers::dispatch(
+    let response = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentDelete {
@@ -182,7 +182,7 @@ async fn agent_delete_rejects_reappeared_legacy_secret_after_completed_ledger() 
     let secret = reappeared.join("api_key");
     std::fs::write(&secret, b"must-survive").expect("reappeared secret");
 
-    let retried = handlers::dispatch(
+    let retried = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentDelete {
@@ -264,7 +264,7 @@ async fn agent_delete_purges_every_token_and_allowance_scope() {
             .unwrap();
     }
 
-    let response = handlers::dispatch(
+    let response = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentDelete {
@@ -307,7 +307,7 @@ async fn failed_reclamation_keeps_alias_reserved_until_retry_succeeds() {
     let original_mode = std::fs::metadata(&homes).unwrap().permissions().mode();
     std::fs::set_permissions(&homes, std::fs::Permissions::from_mode(0o500)).unwrap();
 
-    let failed = handlers::dispatch(
+    let failed = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentDelete {
@@ -316,7 +316,7 @@ async fn failed_reclamation_keeps_alias_reserved_until_retry_succeeds() {
     )
     .await;
     assert!(matches!(failed, AdminResponseBody::Error(_)));
-    let recreate = handlers::dispatch(
+    let recreate = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -332,7 +332,7 @@ async fn failed_reclamation_keeps_alias_reserved_until_retry_succeeds() {
     assert!(matches!(recreate, AdminResponseBody::Error(_)));
 
     std::fs::set_permissions(&homes, std::fs::Permissions::from_mode(original_mode)).unwrap();
-    let retried = handlers::dispatch(
+    let retried = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentDelete {
@@ -400,7 +400,7 @@ async fn issue_principal_mount(
 
 #[cfg(any(unix, windows))]
 async fn delete_principal(kernel: &std::sync::Arc<Kernel>, principal: &PrincipalId) {
-    let response = handlers::dispatch(
+    let response = super::test_support::dispatch_as_operator(
         kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentDelete {
@@ -536,7 +536,7 @@ async fn paused_issue_after_owner_resolve_cannot_publish_after_caller_drain() {
         issue_principal_mount(&issue_kernel, &issue_principal, mountpoint).await
     });
     gate.gate().wait_until_entered().await;
-    let deleted = handlers::dispatch(
+    let deleted = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentDelete {
@@ -588,7 +588,7 @@ async fn paused_issue_after_owner_resolve_cannot_publish_after_viewed_principal_
         .await
     });
     gate.gate().wait_until_entered().await;
-    let deleted = handlers::dispatch(
+    let deleted = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentDelete {
@@ -670,7 +670,7 @@ async fn delete_fails_closed_on_cleanup_fault_then_retries(
             .value(),
     );
     inject_cleanup_fault_for_test(&state, fault);
-    let failed = handlers::dispatch(
+    let failed = super::test_support::dispatch_as_operator(
         kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentDelete {
@@ -709,7 +709,7 @@ async fn delete_fails_closed_on_cleanup_fault_then_retries(
     }
     assert_cleanup_fault_retained(&lease, label, fault);
     clear_cleanup_fault_for_test(&state);
-    let retried = handlers::dispatch(
+    let retried = super::test_support::dispatch_as_operator(
         kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentDelete {
@@ -784,7 +784,7 @@ async fn paused_issue_after_owner_resolve_cannot_publish_after_admin_caller_drai
         .await
     });
     gate.gate().wait_until_entered().await;
-    let deleted = handlers::dispatch(
+    let deleted = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentDelete {
@@ -816,6 +816,19 @@ async fn paused_issue_after_owner_resolve_cannot_publish_after_self_fleet_alias_
     let manager = PrincipalId::new("fleet-manager").unwrap();
     create(&kernel, &manager).await;
     let (fleet, assigned_by) = assign_current_uid_to_new_fleet(&kernel, &manager).await;
+    let operator = kernel
+        .ownership_store
+        .first_owner_state()
+        .await
+        .unwrap()
+        .claim()
+        .unwrap()
+        .user_uid();
+    kernel
+        .ownership_store
+        .set_membership(fleet, operator, astrid_core::FleetRole::Owner, assigned_by)
+        .await
+        .unwrap();
     let caller = PrincipalId::new("fleet-self").unwrap();
     create(&kernel, &caller).await;
     let uid_x = kernel.principal_directory.uid_for(&caller).unwrap();
@@ -837,7 +850,6 @@ async fn paused_issue_after_owner_resolve_cannot_publish_after_self_fleet_alias_
         .await
     });
     gate.gate().wait_until_entered().await;
-    drop_principal_ownership_for_test(&kernel, uid_x).await;
     delete_principal(&kernel, &caller).await;
     create(&kernel, &caller).await;
     let uid_y = kernel.principal_directory.uid_for(&caller).unwrap();
@@ -859,7 +871,7 @@ async fn paused_issue_after_owner_resolve_cannot_publish_after_self_fleet_alias_
 
 #[cfg(any(unix, windows))]
 async fn create_with_groups(kernel: &Arc<Kernel>, principal: &PrincipalId, groups: Vec<String>) {
-    let response = handlers::dispatch(
+    let response = super::test_support::dispatch_as_operator(
         kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -928,49 +940,32 @@ async fn assign_uid_to_fleet(
     fleet_uid: astrid_core::FleetUid,
     assigned_by: UserUid,
 ) {
-    kernel
-        .ownership_store
-        .assign_principal(PrincipalOwnership {
-            principal_uid,
-            fleet_uid,
-            assigned_by,
-        })
-        .await
-        .unwrap();
-}
-
-#[cfg(any(unix, windows))]
-async fn drop_principal_ownership_for_test(kernel: &Kernel, uid: PrincipalUid) {
-    const NAMESPACE: &str = "system:ownership";
-    const KEY: &str = "graph-v1";
-    let current = kernel
-        .kv
-        .get(NAMESPACE, KEY)
-        .await
-        .expect("load ownership graph")
-        .expect("ownership graph present");
-    let mut graph: serde_json::Value = serde_json::from_slice(&current).expect("ownership json");
-    let removed = graph
-        .get_mut("principal_ownership")
-        .and_then(serde_json::Value::as_object_mut)
-        .and_then(|map| map.remove(&uid.to_string()));
-    assert!(removed.is_some(), "expected fleet assignment for {uid}");
-    let encoded = serde_json::to_vec(&graph).expect("encode ownership graph");
-    assert!(
+    let graph = kernel.ownership_store.load().await.unwrap();
+    if let Some(existing) = graph.principal_owner(principal_uid) {
         kernel
-            .kv
-            .compare_and_swap(NAMESPACE, KEY, Some(current.as_slice()), encoded)
+            .ownership_store
+            .set_membership(
+                existing.fleet_uid,
+                assigned_by,
+                astrid_core::FleetRole::Owner,
+                existing.assigned_by,
+            )
             .await
-            .expect("cas ownership graph"),
-        "ownership graph cas must apply"
-    );
-    assert!(
+            .unwrap();
         kernel
-            .ownership_store()
-            .load()
+            .ownership_store
+            .transfer_principal(principal_uid, existing.fleet_uid, fleet_uid, assigned_by)
             .await
-            .unwrap()
-            .principal_owner(uid)
-            .is_none()
-    );
+            .unwrap();
+    } else {
+        kernel
+            .ownership_store
+            .assign_principal(PrincipalOwnership {
+                principal_uid,
+                fleet_uid,
+                assigned_by,
+            })
+            .await
+            .unwrap();
+    }
 }

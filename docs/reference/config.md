@@ -6,7 +6,7 @@ Astrid uses a layered configuration system powered by TOML. Configuration is loa
 2. **System Config** (`/etc/astrid/config.toml`)
 3. **User Config** (`~/.astrid/config.toml` or `$ASTRID_HOME/config.toml`)
 4. **Workspace Config** (`.astrid/config.toml` in the project root — can only **tighten** security, never loosen)
-5. **Environment Variables** (`ASTRID_*`, `ANTHROPIC_*` — fill in unset fields only, do not override)
+5. **Environment Variables** (`ASTRID_*` — fill in unset fields only, do not override)
 
 ## Connectors
 
@@ -48,34 +48,9 @@ method = "admin"
 
 ## Model
 
-Configure the LLM provider and model parameters.
+Host configuration has no model section. Model selection and provider execution are owned by principal-scoped capsules. Configure capsule-specific provider settings in that capsule's `[env]`, then select and discover models through the model registry.
 
-```toml
-[model]
-provider = "claude"
-model = "claude-sonnet-4-20250514"
-max_tokens = 4096
-temperature = 0.7
-# api_key = ""  # Optional: use env var ANTHROPIC_API_KEY instead
-# api_url = ""  # Optional: custom endpoint for proxies or local models
-# context_window = 200000  # Optional: override provider's context window size
-
-[model.pricing]
-input_per_million = 3.0
-output_per_million = 15.0
-```
-
-| Field | Type | Description |
-|---|---|---|
-| `provider` | string | The model provider (e.g., `"claude"`). |
-| `model` | string | The model identifier sent to the API. |
-| `max_tokens` | integer | Maximum tokens to generate per response. |
-| `temperature` | float | Sampling temperature (0.0 - 1.0). |
-| `api_key` | string | (Optional) API key. Prefer env var `ANTHROPIC_API_KEY`. |
-| `api_url` | string | (Optional) Base URL for proxies or alternative endpoints. |
-| `context_window` | integer | (Optional) Override the provider's default context window size. |
-| `pricing.input_per_million` | float | USD per million input tokens (for budget tracking). |
-| `pricing.output_per_million` | float | USD per million output tokens (for budget tracking). |
+Legacy host `[model]` configuration is rejected with migration guidance. It is not silently ignored, and provider credentials are never loaded into core host configuration.
 
 ## Runtime
 
@@ -134,7 +109,52 @@ Configure audit log storage.
 [audit]
 # path = "~/.local/share/astrid/audit.db"  # Optional: omit for in-memory only
 max_size_mb = 100
+entry_format = "v1"  # "v1" (default) or "v2"
 ```
+
+`entry_format` selects the signed layout of new audit entries.
+
+- `v1` keeps the original layout: signed by the runtime key and verified
+  against the key embedded in each entry.
+- `v2` signs a canonical CBOR body that covers every field. The body
+  includes a per-chain sequence number, nanosecond time, the full outcome,
+  and salted commitments to every field value. v2 entries are signed by a
+  separate audit key, `keys/audit.key`, and verified against a cross-signed
+  key registry kept in the audit store. The byte-level format is specified in the
+  `astrid_audit::entry_v2` crate documentation.
+
+When the daemon first boots with `v2`, it:
+
+1. creates `keys/audit.key`;
+2. writes the key registry, which binds the audit key and records the runtime
+   key as the capability, build and v1-audit key.
+
+Existing v1 entries are kept unchanged. The next entry of each chain starts
+a v2 chain linked to the last v1 entry. From then on, verification also
+requires v1 entries to be signed by the registered v1-audit key (the runtime
+key at enablement), so a v1 chain re-signed under another key is reported. v1
+entries signed by an earlier runtime key, for example one replaced before v2
+was enabled, are reported the same way.
+
+Enabling v2 is one-way for a node. Once the registry exists:
+
+- the daemon keeps writing v2 even if `entry_format` is set back to `v1`,
+  because a v1 entry after a v2 entry would reopen a chain under the weaker
+  format;
+- `keys/audit.key` must be kept: the daemon refuses to boot if it is missing
+  or replaced, since only the registered key can authorize its successor.
+
+If the configuration cannot be read, the daemon refuses to start rather than
+assume `v1`, unless the node is already on v2.
+
+Once v2 is enabled, going back to an Astrid release without v2 support is
+not supported: such a release cannot verify v2 entries and would append v1
+entries after them.
+
+Only the operator's own configuration can set `entry_format`. A workspace
+`.astrid/config.toml` cannot. The daemon applies the setting at boot; an
+embedder that builds the kernel around its own audit log (such as the browser
+profile) enables v2 with `AuditLog::enable_entry_v2`.
 
 ## Keys
 
@@ -226,6 +246,47 @@ approval_secs = 300
 idle_secs = 3600
 daemon_ready_secs = 600
 ```
+
+Capsule HTTP controls remain independent. `[http].default_timeout_secs` sets
+the buffered request default; a capsule request's `total-ms` sets that
+request's whole-response budget. `[http].header_deadline_secs` and
+`first-byte-ms` cover time to response headers, while
+`[http].stream_read_timeout_secs` and `between-bytes-ms` cover gaps between
+response bytes.
+
+## Client Configuration
+
+`astrid run`'s no-message idle timeout is client behavior, not runtime policy.
+It loads from an isolated pre-mount TOML file and never parses the full runtime
+configuration. The canonical AOS location is
+`~/.aos/etc/astrid/client.toml`; set `ASTRID_CLIENT_CONFIG_PATH` to select a
+different absolute path. The path must be a current-user-owned, mode `0600`
+regular file with no redirects.
+
+```toml
+run_idle_secs = 120
+daemon_shutdown_secs = 60
+```
+
+The default remains 120 seconds and values must be between 1 and 86400
+seconds. `--idle-timeout-secs` has the highest precedence and bypasses client
+file parsing. Workspace and runtime configuration cannot set or raise this
+timeout.
+
+`daemon_shutdown_secs` bounds the wait after `astrid stop` or `astrid restart`
+receives a shutdown acknowledgement, including durable volume finalization.
+It defaults to 60 seconds and accepts 1–600 seconds. This is a client wait,
+not a daemon operation timeout or permission to kill an unverified process.
+The admin response timeout and identity-checked signal escalation remain separate.
+
+The idle deadline applies only to gaps between messages belonging to the active
+run. Chat responses and `agent.v1.stream.delta` frames must carry the matching
+session; unattributed control frames cannot extend the run. Headless approval
+requests cannot be correlated in production, so they are ignored without an
+approval response and cannot extend the run. `--yes`, `--yolo`, and
+`--autonomous` are rejected before headless execution. Disconnect and approval
+sends use a bounded best-effort budget so a wedged socket cannot defer the
+established timeout result indefinitely.
 
 ## Sessions
 

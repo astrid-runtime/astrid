@@ -112,6 +112,9 @@ pub(crate) struct AstridMcpServer {
     principal: PrincipalId,
     /// Runtime-home daemon identity. Host `--workspace` is the project, not this.
     daemon_root: PathBuf,
+    /// Host project root used by broker requests that resolve `cwd://` paths.
+    /// This is supplied by `mcp attach` and is never used as the daemon root.
+    workspace: PathBuf,
     /// Set when a prior round trip ended in a connection-loss condition (a
     /// failed send, or a reply read that hit EOF / reset). The NEXT round trip
     /// re-handshakes (`reconnect()`) before sending, so a request never goes
@@ -133,14 +136,16 @@ impl AstridMcpServer {
         client: Arc<Mutex<SocketClient>>,
         principal: PrincipalId,
         daemon_root: PathBuf,
-    ) -> Self {
-        Self {
+        workspace: PathBuf,
+    ) -> Result<Self, McpError> {
+        Ok(Self {
             client,
             principal,
             daemon_root,
+            workspace,
             needs_reconnect: AtomicBool::new(false),
-            mrtr: MrtrBridge::new(),
-        }
+            mrtr: MrtrBridge::new()?,
+        })
     }
 
     /// Reconnect the held uplink without ever retaining a client authenticated
@@ -180,6 +185,7 @@ impl AstridMcpServer {
         body: Value,
     ) -> Result<Value, McpError> {
         let reply_topic = astrid_types::Topic::kernel_response(req_id);
+        let body = self.with_workspace(body);
 
         let msg = astrid_types::ipc::IpcMessage::new(
             astrid_types::Topic::from_raw(request_topic),
@@ -235,10 +241,12 @@ impl AstridMcpServer {
         // daemon died while we waited) apart from a legitimate slow-broker
         // deadline.
         match client
-            .read_until_topic_typed(&reply_topic, REQUEST_DEADLINE)
+            .read_until_matching_typed(REQUEST_DEADLINE, |raw| {
+                super::terminal_failure::accepts(raw, &reply_topic, req_id, self.principal.as_str())
+            })
             .await
         {
-            Ok(raw) => Ok(unwrap_reply_payload(&raw)),
+            Ok(raw) => super::terminal_failure::reply(&raw, req_id, self.principal.as_str()),
 
             // Connection died mid-wait. The held socket is now unusable, so the
             // NEXT request must reconnect first — always flag that. Whether we
@@ -263,7 +271,9 @@ impl AstridMcpServer {
                         )
                     })?;
                     let raw = client
-                        .read_until_topic_typed(&reply_topic, REQUEST_DEADLINE)
+                        .read_until_matching_typed(REQUEST_DEADLINE, |raw| {
+                            super::terminal_failure::accepts(raw, &reply_topic, req_id, self.principal.as_str())
+                        })
                         .await
                         .map_err(|re| {
                             // Flag again — the retry's connection may also be dead.
@@ -276,7 +286,7 @@ impl AstridMcpServer {
                                 None,
                             )
                         })?;
-                    Ok(unwrap_reply_payload(&raw))
+                    super::terminal_failure::reply(&raw, req_id, self.principal.as_str())
                 } else {
                     // Mutating / side-effecting request: surface the loss to the
                     // MCP client (it must decide whether to re-issue), but keep
@@ -301,6 +311,19 @@ impl AstridMcpServer {
                 ))
             },
         }
+    }
+
+    /// Add host project context to each broker request without changing the
+    /// existing request envelope. The broker can ignore this field on older
+    /// versions; newer `cwd://` handlers use it as the explicit project root.
+    fn with_workspace(&self, mut body: Value) -> Value {
+        if let Value::Object(object) = &mut body {
+            object.insert(
+                "workspace".to_owned(),
+                Value::String(self.workspace.to_string_lossy().into_owned()),
+            );
+        }
+        body
     }
 }
 
@@ -428,6 +451,27 @@ fn next_grant_step(reply: &Value, grants_resolved: usize) -> GrantStep {
 }
 
 impl ServerHandler for AstridMcpServer {
+    fn accepted_subscription_filter(
+        &self,
+        requested: &rmcp::model::SubscriptionFilter,
+    ) -> Option<rmcp::model::SubscriptionFilter> {
+        (requested.tools_list_changed == Some(true)).then(|| {
+            rmcp::model::SubscriptionFilter::builder()
+                .tools_list_changed()
+                .build()
+        })
+    }
+
+    async fn listen(&self, context: rmcp::service::SubscriptionContext) -> Result<(), McpError> {
+        super::watch::run_subscription(
+            context,
+            self.principal.to_string(),
+            self.daemon_root.clone(),
+        )
+        .await;
+        Ok(())
+    }
+
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Borrowed(ASTRID_MCP_PROTOCOL_VERSIONS)
     }
@@ -829,149 +873,4 @@ fn content_from_block(block: &Value) -> ContentBlock {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn inbound_protocol_prefers_modern_and_retains_legacy_fallback() {
-        assert_eq!(
-            ASTRID_MCP_PROTOCOL_VERSIONS,
-            &[ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25,]
-        );
-        assert_eq!(ASTRID_MCP_PROTOCOL_VERSION, ProtocolVersion::V_2026_07_28);
-    }
-
-    #[test]
-    fn failed_reconnect_remains_armed_until_a_checked_replacement_succeeds() {
-        let needs_reconnect = AtomicBool::new(false);
-        record_reconnect_outcome(&needs_reconnect, &Err::<(), _>("mismatch"));
-        assert!(needs_reconnect.load(Ordering::Relaxed));
-
-        record_reconnect_outcome(&needs_reconnect, &Ok::<_, &str>(()));
-        assert!(!needs_reconnect.load(Ordering::Relaxed));
-    }
-
-    /// The read-only tool-enumeration front door (MCP `tools/list`) is the only
-    /// round trip safe to transparently re-issue after a mid-wait connection
-    /// loss: it never mutates state.
-    #[test]
-    fn tools_list_is_retriable() {
-        assert!(is_request_retriable(TOOLS_LIST_TOPIC));
-    }
-
-    /// Running a tool (MCP `tools/call`) may have ALREADY executed on the
-    /// broker before the connection died — never auto-retry it, or a mutating
-    /// tool could run twice.
-    #[test]
-    fn tool_call_is_not_retriable() {
-        assert!(!is_request_retriable(TOOL_CALL_TOPIC));
-    }
-
-    /// Recording a capability-approval, ingress-consent, or grant-on-use
-    /// decision is a state mutation on the broker (grant additionally persists
-    /// a capsule on the principal); re-issuing could double-apply, so these are
-    /// not retriable either.
-    #[test]
-    fn respond_front_doors_are_not_retriable() {
-        assert!(!is_request_retriable(elicit::APPROVAL_RESPOND_TOPIC));
-        assert!(!is_request_retriable(ingress::INGRESS_RESPOND_TOPIC));
-        assert!(!is_request_retriable(grant::GRANT_RESPOND_TOPIC));
-    }
-
-    /// Default-deny: an unrecognized topic must never be treated as retriable.
-    #[test]
-    fn unknown_topic_is_not_retriable() {
-        assert!(!is_request_retriable("astrid.v1.request.mcp.something.new"));
-        assert!(!is_request_retriable(""));
-    }
-
-    // ── Bounded grant-on-use loop (#1117) ───────────────────────────
-
-    /// A well-formed, still-present `grant_required` signal.
-    fn grant_reply(capsule: &str) -> Value {
-        json!({
-            "kind": "tool.call",
-            "content": [],
-            "isError": false,
-            "grant_required": {
-                "request_id": format!("grant-{capsule}"),
-                "capsule_id": capsule,
-                "principal": "claude-code",
-                "tool_name": "some.tool",
-                "call_id": "call-1"
-            }
-        })
-    }
-
-    /// A grant-free reply — the terminal / already-granted shape.
-    fn terminal_reply() -> Value {
-        json!({ "kind": "tool.call", "content": [], "isError": false })
-    }
-
-    /// No grant signal → `Terminal`: proceed to the approval/terminal path.
-    #[test]
-    fn grant_step_terminal_when_no_signal() {
-        assert!(matches!(
-            next_grant_step(&terminal_reply(), 0),
-            GrantStep::Terminal
-        ));
-    }
-
-    /// A well-formed grant under the bound → `Resolve` (elicit + re-send).
-    #[test]
-    fn grant_step_resolves_present_signal_under_bound() {
-        assert!(matches!(
-            next_grant_step(&grant_reply("shell"), 0),
-            GrantStep::Resolve(_)
-        ));
-        // Still resolvable right up to the last permitted resolution.
-        assert!(matches!(
-            next_grant_step(&grant_reply("shell"), MAX_GRANT_RESOLUTIONS - 1),
-            GrantStep::Resolve(_)
-        ));
-    }
-
-    /// At or above the bound, a still-present grant signal must `Fail` with the
-    /// bound-exceeded message — never resolve again, never go `Terminal`.
-    #[test]
-    fn grant_step_fails_when_bound_exceeded() {
-        let GrantStep::Fail(message) =
-            next_grant_step(&grant_reply("shell"), MAX_GRANT_RESOLUTIONS)
-        else {
-            panic!("a present grant signal at the bound must Fail, not Resolve/Terminal");
-        };
-        assert_eq!(message, GRANT_BOUND_EXCEEDED_MESSAGE);
-        // Well above the bound too.
-        assert!(matches!(
-            next_grant_step(&grant_reply("shell"), MAX_GRANT_RESOLUTIONS + 5),
-            GrantStep::Fail(_)
-        ));
-    }
-
-    /// A present-but-unanswerable (malformed) signal fails with the malformed
-    /// message — it is never returned as an empty success.
-    #[test]
-    fn grant_step_fails_on_malformed_signal() {
-        let malformed = json!({ "grant_required": { "request_id": "" } });
-        let GrantStep::Fail(message) = next_grant_step(&malformed, 0) else {
-            panic!("a malformed grant signal must Fail");
-        };
-        assert_eq!(message, MALFORMED_GRANT_MESSAGE);
-    }
-
-    /// The core #1117 invariant: as long as a grant signal is present, NO
-    /// resolved-count ever yields `Terminal`. If it did, the loop would hand a
-    /// `grant_required` reply to `call_tool_result_from_reply`, which would
-    /// reshape it into an empty `isError:false` success — the phantom result
-    /// the bug produced.
-    #[test]
-    fn grant_step_never_terminal_while_grant_present() {
-        let reply = grant_reply("shell");
-        for resolved in 0..=(MAX_GRANT_RESOLUTIONS + 2) {
-            assert!(
-                !matches!(next_grant_step(&reply, resolved), GrantStep::Terminal),
-                "a present grant signal must never classify as Terminal (resolved={resolved})"
-            );
-        }
-    }
-}
+mod tests;

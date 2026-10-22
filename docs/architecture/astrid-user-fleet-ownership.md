@@ -1,7 +1,9 @@
 # Astrid user and fleet ownership
 
-Status: implemented foundation. CLI and HTTP management surfaces are not yet
-exposed. AOS is not part of this change.
+Status: implemented foundation. Native local upgrade assigns leftover
+principals to the bound CLI-root operator; CLI exposes authenticated discovery
+and named first-assignment for deferred leftovers. HTTP ownership-management
+endpoints are not yet exposed. AOS is not part of this change.
 
 The proposed filesystem, desktop, team, and optional Linux Realm composition built on this
 foundation is described in [Astrid fleet computer and principal
@@ -22,9 +24,11 @@ A principal has at most one fleet owner. It cannot be silently assigned to a
 second fleet. Moving it is an explicit transfer authorized in both the source
 and destination fleets. Groups remain independent of fleets: changing fleet
 membership does not rewrite a principal's capability groups, and assigning a
-group does not convey ownership. The existing `agent.delete` path rejects a
-principal while it has a fleet assignment, so identity removal cannot leave a
-dangling ownership edge.
+group does not convey ownership. Deleting a fleet-owned principal requires
+both the existing deletion capability and an authenticated device delegated to
+a current manager of the target fleet. Removing ownership and reserving the
+identity for deletion commit atomically, so removal cannot leave a dangling
+ownership edge or an interval in which another fleet can adopt the identity.
 
 Fleet membership has three roles:
 
@@ -34,6 +38,79 @@ Fleet membership has three roles:
 - members hold no ownership-management authority.
 
 Every fleet must retain at least one owner.
+
+## Resource accountability
+
+Fleet access and resource accountability are separate. Each newly assigned
+principal records an accountable `UserUid`; background children inherit that
+user from their creator without needing a human login. Fleet transfers and
+membership changes do not change who pays for execution. The historical
+`assigned_by` field records provenance, not a live billing decision.
+
+Older ownership graphs remain readable. Boot fills missing resource attribution
+only for the unambiguous, currently bound local operator described below. A
+shared installation with unresolved attribution needs an explicit operator
+decision, not a fresh home:
+
+```sh
+astrid agent list --format json
+astrid quota users --format json
+astrid quota assign-user --agent worker --user <user-uid>
+```
+
+Authorized listings expose `accountable_user` as the immutable user UID;
+`owner_uid` is the principal UID and must not be used in its place. `--mine`
+lists only principals accessible to the authenticated user. An absent
+`accountable_user` means attribution is unresolved (or the server predates this
+field), not that the principal may spend another user's allowance. Select the
+intended existing user explicitly; do not infer it from fleet membership.
+`quota users` lists existing user UIDs and their public genesis records, including
+identity UUID and initial public key, so the operator can identify the intended
+user even when no principal has an `accountable_user` yet. This is an
+operator-only recovery roster, not a tenant-visible directory.
+
+This requires global `quota:set`, including when `worker` is the caller.
+A self-scoped device cannot borrow the principal's broader administrator grant.
+The command only resolves missing attribution: repeating the same assignment
+is safe, but replacing an existing accountable user is refused. It preserves
+fleet membership, principal identity, keys, profiles, and capsule state.
+
+Aggregate execution accounting measures Wasmtime guest fuel, not host CPU time,
+I/O, or subprocess use. Personal installations have no new aggregate limit by
+default; existing principal limits remain in effect.
+
+An operator can configure the runtime's `config.toml` while its projection is
+running, then stop and restart to apply the boot-bound policy:
+
+```toml
+[resources]
+default_user_cpu_fuel_per_sec = 100000000
+
+# Optional overrides use immutable UserUid values, not principal aliases.
+# [resources.user_cpu_fuel_per_sec]
+# "<user-uid>" = 200000000
+```
+
+The numbers above are examples, not recommended defaults or CPU percentages.
+Zero is invalid. Workspace configuration cannot add or replace these operator
+allocations. A configured installation refuses execution requiring attribution
+when the principal has no accountable user; use the explicit recovery command
+above instead of inferring a payer from fleet access.
+
+All charged principals share their user's rate ledger. It allows one second of
+initial credit and throttles cooperatively at Wasmtime scheduling boundaries.
+A guest operation may exceed the available credit before yielding; that excess
+remains debt and delays subsequent execution. Cancellation, a new invocation,
+or a new principal does not refund that debt. This is **not** a strict ceiling
+on instructions in every one-second interval. The ledger is runtime-local,
+not persistent billing across daemon restarts or multiple hosts.
+
+User accounting covers capsule initialization, background execution,
+authenticated invocations, and daemon-managed install/upgrade lifecycle hooks.
+Principal-level administrator exemptions do not waive a configured user rate.
+Kernel system-resident startup is distinct from user execution; authenticated
+calls are rebound to their caller. Native host work and subprocess CPU require
+separate OS-level accounting and are not covered by this fuel policy.
 
 ## Persistence and recovery
 
@@ -64,22 +141,117 @@ existing CLI root principal identity is loaded, Astrid deterministically and
 idempotently creates:
 
 1. a user from the existing root UUID, creation time, and initial public key;
-2. a default fleet owned by that user; and
-3. an ownership edge from the existing stable `PrincipalUid` to that fleet.
+2. a default fleet owned by that user;
+3. an ownership edge from the existing stable `PrincipalUid` to that fleet; and
+4. the trusted local-operator device binding on `cli/local`, then local upgrade
+   of remaining unowned admitted principals when that binding is current and
+   the graph is still unambiguous.
 
 The `default` alias, `cli/local` link, admin group, profile, keys, home, and
 current CLI/API behavior do not change. Corrupt ownership state fails kernel
 boot instead of being ignored or overwritten.
 
+## Released-home upgrade
+
+Native boot no longer uses `LayoutOrigin::Legacy` as a blanket adoption switch,
+and it does not infer ownership of historical principals from a singleton
+graph. After the deterministic CLI-root user and fleet exist, the durable
+`default` principal is assigned and the trusted `cli/local` device is bound as
+the local operator. Unowned admitted leftovers are then adopted only when that
+bound local-operator device currently resolves to a manager of `default`'s
+fleet **and** the graph still contains exactly that user, exactly that fleet,
+and no assignment to any other fleet. Existing assignments, transfers, and deletion reservations are never
+moved or adopted. Disabled is a profile flag, not a graph filter: an
+unowned admitted principal remains an adoption leftover even when
+`profile.enabled` is false.
+
+Released homes have no personal-versus-hosted marker. Extra users, extra
+fleets, or a foreign assignment make bulk adoption ambiguous; those leftovers
+stay unowned and remain actionable through named confirmation. A missing or
+revoked local-operator device binding is the same: no mutation, leftovers stay
+claimable. `UserPrincipalList` / `astrid agent list --mine` is read-only and
+does not reconcile.
+
+```
+astrid agent claim <name>
+```
+
+That command remains the remainder path for deferred leftovers. It reuses
+ordinary first assignment (`UserPrincipalClaim` /
+`assign_created_principal_for_device`). It requires a current user-delegated
+device, fleet management authority, and `agent:create`. It is idempotent when
+the named principal is already in the caller's fleet, never transfers another
+fleet's assignment, and does not copy human-device delegation onto the claimed
+principal. Extra users or fleets in the graph do not block a named claim.
+
+`scripts/test-user-principal-discovery.sh` can seed a disposable packed home
+with a released CLI and then start the candidate against the same volume. The
+upgrade path first uses a leftover principal on the released CLI, then asserts
+preserved keys and the same use after candidate start, that packed leftovers
+are visible in `--mine` without `astrid agent claim`, that an undelegated child
+cannot claim, and that restart keeps the local-operator assignments.
+
 ## Intentionally not included yet
 
-- no interactive onboarding or new CLI commands;
+- no interactive onboarding or hosted login;
 - no HTTP ownership-management endpoints;
-- no AOS plugin or downstream migration;
-- no automatic fleet assignment for newly created non-root principals;
+- no AOS plugin or downstream migration; local Oracle/CLI daemon start is enough;
+- no hosted-versus-personal config marker;
 - no change to capability evaluation, storage quota ownership, or capsule IPC;
 - no claim that a fleet is a capability group.
 
 Those surfaces should be added only after the substrate has shipped with a
 read-only inspection API and the migration behavior has been exercised against
 real existing homes.
+
+## In-progress creation integration
+
+The development CLI now exposes `astrid agent list --mine --format json` via
+`UserPrincipalList` on `admin.user.principals`, and `astrid agent claim <name>`
+via `UserPrincipalClaim` on `admin.user.principal.claim`. Discovery requires
+the normal registered-device/capability check and an explicit current user
+delegation. It returns only assignments in that user's current fleets, even
+when the credential also has administrator capabilities. The existing
+`agent list` self/global behavior is unchanged. Rows confer no permission to
+switch, approve, answer a form, or use another principal's signing key. Named
+claim is the remainder path for leftovers that automatic local upgrade deferred.
+Old runtimes do not support the new requests; clients must not fall back to a
+global list.
+
+`scripts/test-user-principal-discovery.sh` exercises real candidate CLI/daemon
+startup, principal creation, scoped discovery, rejection without human
+delegation, and restart persistence in a disposable home. With a released CLI
+as the second argument it also seeds a packed volume, upgrades it in place,
+checks that signing keys are unchanged, refuses undelegated claim, and expects
+packed leftovers to appear in `--mine` after candidate start without a named
+claim. It is not an Oracle installation, GUI picker, hosted login, or a claim
+that a singleton graph alone owns historical principals.
+
+Agent spawning keeps its existing `agent:create:inherit` capability gate.
+The child joins the authenticated spawning principal's fleet, not the template
+source's fleet. It retains the creator's historical human assignment provenance
+without gaining a human-device delegation or broader capabilities. Creator
+ownership is pinned before provisioning and rechecked atomically on assignment;
+a transfer during provisioning rejects the stale assignment. An unowned caller
+cannot create another unowned principal. Capsule-load failure remains on the
+existing rollback path before ownership is assigned.
+
+Deletion reservations retain the target fleet even after the principal's
+identity has been removed. Retrying cleanup checks current user delegation and
+fleet management authority; revocation or demotion cannot be bypassed through
+an alias-only retry. Target device bindings are removed with ownership. Failed
+cleanup keeps the alias reserved until generation-scoped reclamation finishes.
+Legacy unowned deletion keeps its capability-based path; an unauthenticated
+human context cannot delete an owned principal through that path.
+
+Stateful admin tests use `admin::test_support::seed_operator` and explicitly
+call `dispatch_as_operator` when creation requires an authenticated operator.
+The fixture registers a device, human and fleet binding; it does not bypass
+production capability or ownership checks. Tests enter below transport
+signature verification and therefore do not prove the socket authentication
+journey. Missing/revoked-delegation tests use the raw dispatch path or revoke
+the binding, and continue to require rejection without creating an identity.
+
+Deletion tests retain their original success and cleanup assertions. They must
+not be made green by silently stripping ownership from the fixture or accepting
+the new deletion refusal as success.

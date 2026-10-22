@@ -108,3 +108,5 @@ async fn failure_in_observation_gap_is_not_missed() {
 }
 
 mod closure_priority;
+
+mod typed_join_publication;

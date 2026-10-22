@@ -15,7 +15,7 @@ The WASM sandbox protects against malicious capsule code. This sandbox protects 
 
 `SandboxCommand` takes a `std::process::Command` and returns a new command prepended with the platform's sandbox wrapper. On Linux, it prepends `bwrap` with `--ro-bind / /` for read access, `--bind` for the writable root, `--tmpfs /tmp`, `--unshare-all`, `--share-net`, and `--die-with-parent`. On macOS, it generates an SBPL profile inline (passed via `-p`, not a temp file) that denies by default and allows reads/writes only to the workspace and `/tmp`.
 
-`ProcessSandboxConfig` is a data-oriented builder for when you need a `tokio::process::Command` or finer control. It produces a `SandboxPrefix` (program + args) that you prepend to any command type.
+`ProcessSandboxConfig` is a data-oriented builder for `tokio::process::Command` or finer control. Consume its `SandboxPrefix` through `into_command()` so verified Linux bind descriptors remain alive until Bubblewrap starts.
 
 ## Injection-safe profile generation
 
@@ -38,11 +38,10 @@ let config = ProcessSandboxConfig::new("/home/user/project")
     .with_network(true)
     .with_extra_read("/usr/local/share/myapp")
     .with_extra_write("/data/output")
-    .with_hidden("/home/user/.astrid");
+    .with_protected_runtime_home("/home/user/.astrid");
 
 if let Some(prefix) = config.sandbox_prefix()? {
-    let mut cmd = tokio::process::Command::new(&prefix.program);
-    cmd.args(&prefix.args);
+    let mut cmd = tokio::process::Command::from(prefix.into_command());
     cmd.arg("npx").arg("@anthropic/mcp-server-filesystem");
 }
 ```

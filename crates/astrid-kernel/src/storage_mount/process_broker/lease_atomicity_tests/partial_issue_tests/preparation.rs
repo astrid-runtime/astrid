@@ -61,6 +61,13 @@ async fn mountpoint_preparation_failure_retains_root_until_exact_retry() {
                 Some(blocker_root.as_path())
             );
         }
+        super::super::super::fail_next_root_removal_for_test(blocker_root.clone());
+        let Err(denied) = broker.mount(&caller).await else {
+            panic!("{stage:?} retained preparation blocker must deny replacement");
+        };
+        assert!(denied.contains("requires administrative cleanup"));
+        assert!(blocker_root.exists());
+
         let replacement_mount = PROCESS_MOUNT_TEST_ID
             .scope(test_id + 1000, broker.mount(&caller))
             .await
@@ -132,4 +139,75 @@ async fn preparation_faults_retain_exact_root_without_native_provider() {
         assert!(!root.exists());
         assert!(projections.is_empty());
     }
+}
+
+#[tokio::test]
+async fn retained_root_failure_reports_exact_cleanup_stage_and_mount() {
+    use super::super::super::projection_lifecycle::{
+        RetainedIssuePaths, retain_failed_issue_projection,
+    };
+    use super::super::super::retained_diagnostics::{self, Component, Stage};
+    use super::super::{ProcessProjectionKey, ProjectionLeaseTarget, binding_on};
+    use astrid_core::storage_provider::StorageMountId;
+    use astrid_storage::StateOwner;
+    use std::collections::BTreeMap;
+
+    let (_temporary, kernel) = fleet_shared_kernel().await;
+    let actor = kernel
+        .principal_directory
+        .uid_for(&PrincipalId::default())
+        .expect("test UID");
+    let key = ProcessProjectionKey {
+        binding: binding_on(
+            actor,
+            StateOwner::Principal(actor),
+            astrid_core::WorkspaceUid::from_bytes([0xCD; 16]),
+            None,
+        ),
+        read_write: true,
+    };
+    let root = kernel
+        .astrid_home
+        .run_dir()
+        .join("diagnostic-retained-root");
+    std::fs::create_dir_all(&root).expect("test root");
+    let mount_id = StorageMountId::new();
+    let mut projections = BTreeMap::new();
+    retain_failed_issue_projection(
+        &mut projections,
+        &key,
+        &kernel,
+        Vec::new(),
+        RetainedIssuePaths {
+            workspace: root.join("workspace"),
+            home: root.join("owner"),
+            fleet_shared: None,
+        },
+        ProjectionLeaseTarget {
+            mount_id,
+            target: key.binding.targets.workspace.clone(),
+        },
+        None,
+    );
+    let retained = Arc::clone(projections.get(&key).expect("retained cleanup"));
+    super::super::super::fail_next_root_removal_for_test(root.clone());
+    let (cleaned, diagnostic) = retained_diagnostics::capture(
+        super::super::super::retry_failed_projection(&retained, &mut projections, &key),
+    )
+    .await;
+    assert!(!cleaned);
+    let diagnostic = diagnostic.expect("actual cleanup must report its refusal");
+    assert_eq!(diagnostic.stage, Stage::RootRemoval);
+    assert_eq!(diagnostic.component, Component::Branch);
+    assert_eq!(diagnostic.mount_id, mount_id);
+    assert_eq!(
+        diagnostic.error_kind,
+        Some(std::io::Error::from_raw_os_error(5).kind())
+    );
+    assert_eq!(diagnostic.os_error, Some(5));
+    assert!(root.is_dir());
+    assert!(projections.contains_key(&key));
+    assert!(super::super::super::retry_failed_projection(&retained, &mut projections, &key).await);
+    assert!(!root.exists());
+    assert!(projections.is_empty());
 }

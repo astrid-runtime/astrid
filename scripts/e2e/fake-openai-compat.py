@@ -31,9 +31,46 @@ MODELS = [
     {"id": "fake-error", "object": "model", "owned_by": "astrid-e2e"},
     {"id": "fake-malformed", "object": "model", "owned_by": "astrid-e2e"},
     {"id": "fake-toolish", "object": "model", "owned_by": "astrid-e2e"},
+    {"id": "fake-fast", "object": "model", "owned_by": "astrid-e2e"},
+    {"id": "fake-burst", "object": "model", "owned_by": "astrid-e2e"},
     {"id": "duplicate-name", "object": "model", "owned_by": "astrid-e2e-a"},
     {"id": "duplicate-name", "object": "model", "owned_by": "astrid-e2e-b"},
 ]
+
+# Synthetic token-shaped units, not tokenizer measurements. One unit per SSE
+# event exposes event-queue pressure independently of a model's tokenizer.
+FAST_STREAM_UNITS = 4096
+FAST_STREAM_UNITS_PER_SECOND = 5000
+FAST_STREAM_BATCH_UNITS = 50
+
+
+def stream_event(model: str, content: str, finish_reason: str | None = None) -> bytes:
+    event = {
+        "id": "chatcmpl-fake",
+        "object": "chat.completion.chunk",
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"content": content},
+            "finish_reason": finish_reason,
+        }],
+    }
+    return b"data: " + json.dumps(event).encode("utf-8") + b"\n\n"
+
+
+def fast_stream_units() -> list[str]:
+    return [f"unit-{index:05d} " for index in range(FAST_STREAM_UNITS)]
+
+
+def holds_current_request(body: dict[str, Any]) -> bool:
+    # A cancelled prompt remains in conversation history. Holding that history
+    # would also stall the next turn and hide whether recovery actually works.
+    for message in reversed(body.get("messages", [])):
+        if message.get("role") == "user":
+            return "ASTRID_E2E_INFLIGHT_CRASH_" in json.dumps(
+                message.get("content", ""), sort_keys=True
+            )
+    return False
 
 
 class State:
@@ -166,9 +203,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("cache-control", "no-cache")
         self.end_headers()
 
-        if "ASTRID_E2E_INFLIGHT_CRASH_" in json.dumps(
-            body.get("messages", []), sort_keys=True
-        ):
+        if holds_current_request(body):
             self.wfile.write(
                 b'data: {"id":"chatcmpl-fake","object":"chat.completion.chunk",'
                 b'"model":"fake-crash-hold","choices":[{"index":0,'
@@ -179,6 +214,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if model == "fake-slow":
             time.sleep(2)
+
+        if model in {"fake-fast", "fake-burst"}:
+            self.send_fast_stream(model)
+            return
 
         for token in completion_text(model, body).split(" "):
             event = {
@@ -198,6 +237,27 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
+    def send_fast_stream(self, model: str) -> None:
+        frames = [stream_event(model, unit) for unit in fast_stream_units()]
+        terminal = stream_event(model, "", "stop") + b"data: [DONE]\n\n"
+        if model == "fake-burst":
+            # A single application write/flush exercises SSE framing when the
+            # transport does not offer one read per provider event.
+            self.wfile.write(b"".join(frames) + terminal)
+            self.wfile.flush()
+            return
+
+        started = time.monotonic()
+        for offset in range(0, len(frames), FAST_STREAM_BATCH_UNITS):
+            batch = frames[offset:offset + FAST_STREAM_BATCH_UNITS]
+            self.wfile.write(b"".join(batch))
+            self.wfile.flush()
+            emitted = offset + len(batch)
+            deadline = started + emitted / FAST_STREAM_UNITS_PER_SECOND
+            time.sleep(max(0, deadline - time.monotonic()))
+        self.wfile.write(terminal)
+        self.wfile.flush()
+
 
 def completion_text(model: str, body: dict[str, Any]) -> str:
     messages = body.get("messages") or []
@@ -208,6 +268,8 @@ def completion_text(model: str, body: dict[str, Any]) -> str:
             last = content
     if model == "fake-toolish":
         return '{"tool_calls":[{"name":"fake_tool","arguments":{"echo":true}}]}'
+    if model in {"fake-fast", "fake-burst"}:
+        return "".join(fast_stream_units())
     return f"fake echo: {last}".strip()
 
 

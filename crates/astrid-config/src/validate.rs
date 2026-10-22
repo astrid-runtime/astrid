@@ -15,7 +15,8 @@ use crate::types::Config;
 ///
 /// Returns the first validation error found.
 pub fn validate(config: &Config) -> ConfigResult<()> {
-    validate_model(config)?;
+    config.native_input.bindings()?;
+    config.filesystem.validate()?;
     validate_budget(config)?;
     validate_workspace(config)?;
     validate_git(config)?;
@@ -27,59 +28,7 @@ pub fn validate(config: &Config) -> ConfigResult<()> {
     validate_retry(config)?;
     validate_audit(config)?;
     validate_rate_limits(config)?;
-    Ok(())
-}
-
-/// Maximum allowed `max_tokens` value (16 million).
-const MAX_TOKENS_UPPER_BOUND: usize = 16_000_000;
-
-fn validate_model(config: &Config) -> ConfigResult<()> {
-    let m = &config.model;
-
-    if !matches!(
-        m.provider.as_str(),
-        "claude" | "openai" | "openai-compat" | "zai" | "unknown"
-    ) {
-        return Err(ConfigError::ValidationError {
-            field: "model.provider".to_owned(),
-            message: format!(
-                "unsupported provider '{}'; expected one of: claude, openai, openai-compat, zai, unknown",
-                m.provider
-            ),
-        });
-    }
-
-    if !(0.0..=1.0).contains(&m.temperature) {
-        return Err(ConfigError::ValidationError {
-            field: "model.temperature".to_owned(),
-            message: format!(
-                "temperature {} is out of range; must be between 0.0 and 1.0",
-                m.temperature
-            ),
-        });
-    }
-
-    if m.max_tokens == 0 || m.max_tokens > MAX_TOKENS_UPPER_BOUND {
-        return Err(ConfigError::ValidationError {
-            field: "model.max_tokens".to_owned(),
-            message: format!("max_tokens must be between 1 and {MAX_TOKENS_UPPER_BOUND}"),
-        });
-    }
-
-    if !m.pricing.input_per_million.is_finite() || m.pricing.input_per_million <= 0.0 {
-        return Err(ConfigError::ValidationError {
-            field: "model.pricing.input_per_million".to_owned(),
-            message: "input_per_million must be a finite positive number".to_owned(),
-        });
-    }
-
-    if !m.pricing.output_per_million.is_finite() || m.pricing.output_per_million <= 0.0 {
-        return Err(ConfigError::ValidationError {
-            field: "model.pricing.output_per_million".to_owned(),
-            message: "output_per_million must be a finite positive number".to_owned(),
-        });
-    }
-
+    validate_mcp_http(config)?;
     Ok(())
 }
 
@@ -280,6 +229,10 @@ fn validate_timeouts(config: &Config) -> ConfigResult<()> {
     bounded_stop_phase("process_stop_ack_secs", t.process_stop_ack_secs)?;
     bounded_stop_phase("process_reap_grace_secs", t.process_reap_grace_secs)?;
     bounded_stop_phase("process_killed_reap_secs", t.process_killed_reap_secs)?;
+    bounded_stop_phase(
+        "process_unmount_confirm_secs",
+        t.process_unmount_confirm_secs,
+    )?;
 
     Ok(())
 }
@@ -418,8 +371,42 @@ fn validate_audit(config: &Config) -> ConfigResult<()> {
             ),
         });
     }
+    if let Some(dir) = &audit.retention.archive_dir
+        && !std::path::Path::new(dir).is_absolute()
+    {
+        return Err(ConfigError::ValidationError {
+            field: "audit.retention.archive_dir".to_owned(),
+            message: format!("archive_dir {dir:?} must be an absolute path"),
+        });
+    }
+    if let Some(class) = audit
+        .host_fail_closed
+        .iter()
+        .find(|class| !HOST_AUDIT_FAIL_CLOSED_CLASSES.contains(&class.as_str()))
+    {
+        return Err(ConfigError::ValidationError {
+            field: "audit.host_fail_closed".to_owned(),
+            message: format!(
+                "unsupported host-call class '{class}'; expected one of: {}",
+                HOST_AUDIT_FAIL_CLOSED_CLASSES.join(", ")
+            ),
+        });
+    }
     Ok(())
 }
+
+/// Host-call classes accepted by `audit.host_fail_closed`, spelled as the
+/// kernel's host-audit records spell them. `net_accept` is not listed: the
+/// remote peer has already connected when the host call sees it, so there is
+/// no effect left to hold back.
+pub const HOST_AUDIT_FAIL_CLOSED_CLASSES: [&str; 6] = [
+    "file_read",
+    "file_write",
+    "file_delete",
+    "net_connect",
+    "net_bind",
+    "process_spawn",
+];
 
 fn validate_rate_limits(config: &Config) -> ConfigResult<()> {
     let limits = &config.rate_limits;
@@ -442,6 +429,91 @@ fn validate_rate_limits(config: &Config) -> ConfigResult<()> {
     Ok(())
 }
 
+fn validate_mcp_http(config: &Config) -> ConfigResult<()> {
+    let http = &config.gateway.mcp_http;
+    let Some(oauth) = http.oauth.as_ref() else {
+        return Ok(());
+    };
+    if http.token_file.is_some() {
+        return Err(ConfigError::ValidationError {
+            field: "gateway.mcp_http.oauth".to_owned(),
+            message: "token_file and oauth are mutually exclusive".to_owned(),
+        });
+    }
+    if !crate::gateway::issuer_url_is_valid(&oauth.issuer) {
+        return Err(ConfigError::ValidationError {
+            field: "gateway.mcp_http.oauth.issuer".to_owned(),
+            message: "must be an HTTPS URL with a host and without userinfo or a query".to_owned(),
+        });
+    }
+    for (field, value) in [
+        ("gateway.mcp_http.oauth.resource", oauth.resource.as_str()),
+        ("gateway.mcp_http.oauth.jwks_url", oauth.jwks_url.as_str()),
+    ] {
+        if !crate::gateway::https_url_is_valid(value) {
+            return Err(ConfigError::ValidationError {
+                field: field.to_owned(),
+                message: "must be an HTTPS URL with a host and without userinfo".to_owned(),
+            });
+        }
+    }
+    if oauth.principal_claim.is_empty() || matches!(oauth.principal_claim.as_str(), "scope" | "azp")
+    {
+        return Err(ConfigError::ValidationError {
+            field: "gateway.mcp_http.oauth.principal_claim".to_owned(),
+            message: "principal_claim must not be empty or use the reserved scope/azp claims"
+                .to_owned(),
+        });
+    }
+    if oauth.scopes.iter().any(|scope| {
+        scope.is_empty()
+            || !scope.bytes().all(|byte| {
+                byte == b'!' || (b'#'..=b'[').contains(&byte) || (b']'..=b'~').contains(&byte)
+            })
+    }) {
+        return Err(ConfigError::ValidationError {
+            field: "gateway.mcp_http.oauth.scopes".to_owned(),
+            message: "each scope must be one valid OAuth scope token".to_owned(),
+        });
+    }
+    if oauth.allowed_azp.iter().any(String::is_empty) {
+        return Err(ConfigError::ValidationError {
+            field: "gateway.mcp_http.oauth.allowed_azp".to_owned(),
+            message: "allowed_azp entries must not be empty".to_owned(),
+        });
+    }
+    for (field, value, maximum) in [
+        (
+            "gateway.mcp_http.oauth.jwks_refresh_backoff_secs",
+            oauth.jwks_refresh_backoff_secs,
+            crate::gateway::McpHttpOauthSection::MAX_JWKS_REFRESH_BACKOFF_SECS,
+        ),
+        (
+            "gateway.mcp_http.oauth.jwks_cache_ttl_secs",
+            oauth.jwks_cache_ttl_secs,
+            crate::gateway::McpHttpOauthSection::MAX_JWKS_CACHE_TTL_SECS,
+        ),
+        (
+            "gateway.mcp_http.oauth.jwks_timeout_secs",
+            oauth.jwks_timeout_secs,
+            crate::gateway::McpHttpOauthSection::MAX_JWKS_TIMEOUT_SECS,
+        ),
+        (
+            "gateway.mcp_http.oauth.jwks_max_response_bytes",
+            oauth.jwks_max_response_bytes,
+            crate::gateway::McpHttpOauthSection::MAX_JWKS_RESPONSE_BYTES,
+        ),
+    ] {
+        if value == 0 || value > maximum {
+            return Err(ConfigError::ValidationError {
+                field: field.to_owned(),
+                message: format!("must be between 1 and {maximum}"),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,18 +525,21 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_provider() {
+    fn test_host_fail_closed_accepts_known_classes_only() {
         let mut config = Config::default();
-        config.model.provider = "grok".to_owned();
-        let err = validate(&config).unwrap_err();
-        assert!(matches!(err, ConfigError::ValidationError { .. }));
-    }
-
-    #[test]
-    fn test_invalid_temperature() {
-        let mut config = Config::default();
-        config.model.temperature = 1.5;
-        assert!(validate(&config).is_err());
+        config.audit.host_fail_closed = vec!["process_spawn".to_owned(), "file_delete".to_owned()];
+        assert!(validate(&config).is_ok());
+        config.audit.host_fail_closed.push("payments".to_owned());
+        let error = validate(&config).expect_err("unknown class");
+        assert!(
+            error.to_string().contains("audit.host_fail_closed"),
+            "{error}"
+        );
+        config.audit.host_fail_closed = vec!["net_accept".to_owned()];
+        assert!(
+            validate(&config).is_err(),
+            "net_accept has no effect to hold back"
+        );
     }
 
     #[test]
@@ -472,6 +547,22 @@ mod tests {
         let mut config = Config::default();
         config.budget.per_action_max_usd = 200.0;
         assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_audit_archive_dir_must_be_absolute() {
+        let mut config = Config::default();
+        config.audit.retention.archive_dir = Some("relative/archive".to_owned());
+        let err = validate(&config).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::ValidationError { field, .. }
+                if field == "audit.retention.archive_dir"
+        ));
+        let absolute = std::env::temp_dir().join("audit-archive");
+        config.audit.retention.archive_dir = Some(absolute.to_string_lossy().into_owned());
+        config.audit.retention.require_anchor = true;
+        assert!(validate(&config).is_ok());
     }
 
     #[test]
@@ -596,12 +687,14 @@ mod tests {
             "process_stop_ack_secs",
             "process_reap_grace_secs",
             "process_killed_reap_secs",
+            "process_unmount_confirm_secs",
         ] {
             let mut config = Config::default();
             match field {
                 "process_stop_ack_secs" => config.timeouts.process_stop_ack_secs = 0,
                 "process_reap_grace_secs" => config.timeouts.process_reap_grace_secs = 0,
                 "process_killed_reap_secs" => config.timeouts.process_killed_reap_secs = 0,
+                "process_unmount_confirm_secs" => config.timeouts.process_unmount_confirm_secs = 0,
                 _ => unreachable!("test timeout field"),
             }
             assert!(validate(&config).is_err(), "zero {field} must be rejected");
@@ -614,12 +707,14 @@ mod tests {
             "process_stop_ack_secs",
             "process_reap_grace_secs",
             "process_killed_reap_secs",
+            "process_unmount_confirm_secs",
         ] {
             let mut config = Config::default();
             match field {
                 "process_stop_ack_secs" => config.timeouts.process_stop_ack_secs = 61,
                 "process_reap_grace_secs" => config.timeouts.process_reap_grace_secs = 61,
                 "process_killed_reap_secs" => config.timeouts.process_killed_reap_secs = 61,
+                "process_unmount_confirm_secs" => config.timeouts.process_unmount_confirm_secs = 61,
                 _ => unreachable!("test timeout field"),
             }
             assert!(
@@ -640,27 +735,6 @@ mod tests {
     fn test_invalid_log_format() {
         let mut config = Config::default();
         config.logging.format = "yaml".to_owned();
-        assert!(validate(&config).is_err());
-    }
-
-    #[test]
-    fn test_zero_max_tokens() {
-        let mut config = Config::default();
-        config.model.max_tokens = 0;
-        assert!(validate(&config).is_err());
-    }
-
-    #[test]
-    fn test_negative_pricing() {
-        let mut config = Config::default();
-        config.model.pricing.input_per_million = -1.0;
-        assert!(validate(&config).is_err());
-    }
-
-    #[test]
-    fn test_zero_pricing_rejected() {
-        let mut config = Config::default();
-        config.model.pricing.input_per_million = 0.0;
         assert!(validate(&config).is_err());
     }
 
@@ -686,23 +760,9 @@ mod tests {
     }
 
     #[test]
-    fn test_nan_pricing_rejected() {
-        let mut config = Config::default();
-        config.model.pricing.output_per_million = f64::NAN;
-        assert!(validate(&config).is_err());
-    }
-
-    #[test]
     fn test_budget_upper_bound() {
         let mut config = Config::default();
         config.budget.session_max_usd = 20_000.0;
-        assert!(validate(&config).is_err());
-    }
-
-    #[test]
-    fn test_max_tokens_upper_bound() {
-        let mut config = Config::default();
-        config.model.max_tokens = 100_000_000;
         assert!(validate(&config).is_err());
     }
 
@@ -739,5 +799,75 @@ mod tests {
         config.rate_limits.capsule_reload_per_min =
             crate::types::RateLimitsConfig::MAX_CAPSULE_RELOAD_PER_MIN.saturating_add(1);
         assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_mcp_http_oauth_empty_principal_claim_rejected() {
+        let mut config = Config::default();
+        config.gateway.mcp_http.oauth = Some(crate::gateway::McpHttpOauthSection {
+            resource: "https://mcp.example.com/mcp".to_owned(),
+            issuer: "https://issuer.example.com".to_owned(),
+            jwks_url: "https://issuer.example.com/jwks".to_owned(),
+            scopes: Vec::new(),
+            principal_claim: String::new(),
+            allowed_azp: Vec::new(),
+            jwks_refresh_backoff_secs: 60,
+            jwks_cache_ttl_secs: 300,
+            jwks_timeout_secs: 10,
+            jwks_max_response_bytes: 1024 * 1024,
+        });
+        let err = validate(&config).unwrap_err();
+        match err {
+            ConfigError::ValidationError { field, .. } => {
+                assert_eq!(field, "gateway.mcp_http.oauth.principal_claim");
+            },
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_mcp_http_oauth_reserved_principal_claim_rejected() {
+        for principal_claim in ["scope", "azp"] {
+            let mut config = Config::default();
+            config.gateway.mcp_http.oauth = Some(crate::gateway::McpHttpOauthSection {
+                resource: "https://mcp.example.com/mcp".to_owned(),
+                issuer: "https://issuer.example.com".to_owned(),
+                jwks_url: "https://issuer.example.com/jwks".to_owned(),
+                scopes: Vec::new(),
+                principal_claim: principal_claim.to_owned(),
+                allowed_azp: Vec::new(),
+                jwks_refresh_backoff_secs: 60,
+                jwks_cache_ttl_secs: 300,
+                jwks_timeout_secs: 10,
+                jwks_max_response_bytes: 1024 * 1024,
+            });
+            let err = validate(&config).unwrap_err();
+            assert!(err.to_string().contains("principal_claim"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_mcp_http_oauth_rejects_invalid_scope_and_empty_azp() {
+        let mut config = Config::default();
+        config.gateway.mcp_http.oauth = Some(crate::gateway::McpHttpOauthSection {
+            resource: "https://mcp.example.com/mcp".to_owned(),
+            issuer: "https://issuer.example.com".to_owned(),
+            jwks_url: "https://issuer.example.com/jwks".to_owned(),
+            scopes: vec!["mcp read".to_owned()],
+            principal_claim: "sub".to_owned(),
+            allowed_azp: Vec::new(),
+            jwks_refresh_backoff_secs: 60,
+            jwks_cache_ttl_secs: 300,
+            jwks_timeout_secs: 10,
+            jwks_max_response_bytes: 1024 * 1024,
+        });
+        let err = validate(&config).unwrap_err();
+        assert!(err.to_string().contains("oauth.scopes"), "{err}");
+
+        let oauth = config.gateway.mcp_http.oauth.as_mut().unwrap();
+        oauth.scopes = vec!["mcp:read".to_owned()];
+        oauth.allowed_azp = vec![String::new()];
+        let err = validate(&config).unwrap_err();
+        assert!(err.to_string().contains("allowed_azp"), "{err}");
     }
 }

@@ -1,4 +1,8 @@
-use super::{AuditEntry, AuditError, AuditLog, AuditResult, ChainIssue, ChainVerificationResult};
+use super::{
+    AuditEntry, AuditError, AuditLog, AuditPruneReceipt, AuditResult, ChainIssue,
+    ChainVerificationResult, prune,
+};
+use crate::entry_v2::{ChainVerifier, KeyRegistry, KeyRole};
 use astrid_core::{PrincipalId, SessionId};
 use tracing::{error, warn};
 
@@ -33,11 +37,24 @@ impl VerificationState {
     }
 }
 
+fn log_issue(issue: &ChainIssue) {
+    match issue {
+        ChainIssue::InvalidSignature { entry_id } => {
+            error!(entry_id = %entry_id, "Invalid signature");
+        },
+        ChainIssue::BrokenLink { entry_id, .. } => {
+            warn!(current = %entry_id, "Chain link broken");
+        },
+        other => warn!(issue = %other, "Audit chain issue"),
+    }
+}
+
 impl AuditLog {
     pub(super) async fn verify_chain_impl(
         &self,
         session_id: &SessionId,
     ) -> AuditResult<ChainVerificationResult> {
+        let registry = self.verification_registry().await?;
         let mut after = None;
         let mut state = VerificationState::new();
         loop {
@@ -60,8 +77,13 @@ impl AuditLog {
                 break;
             };
             for (_, principal) in chains {
-                self.verify_indexed_chain(session_id, principal.as_ref(), &mut state)
-                    .await?;
+                self.verify_indexed_chain(
+                    session_id,
+                    principal.as_ref(),
+                    registry.as_deref(),
+                    &mut state,
+                )
+                .await?;
             }
             after = Some(last);
             if chain_count < PAGE_SIZE {
@@ -83,6 +105,7 @@ impl AuditLog {
         &self,
         session_id: &SessionId,
         principal: Option<&PrincipalId>,
+        registry: Option<&KeyRegistry>,
         state: &mut VerificationState,
     ) -> AuditResult<()> {
         let mut cursor = None;
@@ -96,8 +119,11 @@ impl AuditLog {
                 break;
             };
             for (_, entry) in entries {
-                self.verify_indexed_entry(&entry, previous.as_ref(), state)
-                    .await?;
+                self.verify_stored_entry(&entry, previous.as_ref(), registry, &mut |issue| {
+                    state.push_issue(issue);
+                })
+                .await?;
+                state.entries_verified = state.entries_verified.saturating_add(1);
                 previous = Some(entry);
             }
             cursor = Some(last_entry);
@@ -105,45 +131,117 @@ impl AuditLog {
         Ok(())
     }
 
-    async fn verify_indexed_entry(
+    /// Check one stored entry of a chain: the first entry's anchoring (zero
+    /// genesis hash or a signed archive receipt) and every format rule
+    /// [`ChainVerifier`] applies against `previous`.
+    pub(super) async fn verify_stored_entry(
         &self,
         entry: &AuditEntry,
         previous: Option<&AuditEntry>,
-        state: &mut VerificationState,
+        registry: Option<&KeyRegistry>,
+        report: &mut impl FnMut(ChainIssue),
     ) -> AuditResult<()> {
-        if previous.is_none()
-            && !self
-                .verify_archive_anchor(
-                    &entry.session_id,
-                    entry.principal.as_ref(),
-                    &entry.previous_hash,
-                )
-                .await?
-        {
-            state.push_issue(ChainIssue::InvalidGenesis {
+        if previous.is_none() && !self.verify_archive_anchor(entry, registry).await? {
+            report(ChainIssue::InvalidGenesis {
                 entry_id: entry.id.clone(),
             });
         }
-        if let Err(error) = entry.verify_signature()
-            && state.issues.len() < MAX_ISSUES
-        {
-            error!(entry_id = %entry.id, error = %error, "Invalid signature");
-            state.push_issue(ChainIssue::InvalidSignature {
-                entry_id: entry.id.clone(),
-            });
+        for issue in ChainVerifier::new(registry).check_entry(entry, previous) {
+            log_issue(&issue);
+            report(issue);
         }
-        if let Some(previous_entry) = previous
-            && !entry.follows(previous_entry)
-            && state.issues.len() < MAX_ISSUES
-        {
-            warn!(current = %entry.id, previous = %previous_entry.id, "Chain link broken");
-            state.push_issue(ChainIssue::BrokenLink {
-                entry_id: entry.id.clone(),
-                expected_previous: previous_entry.content_hash(),
-                actual_previous: entry.previous_hash,
-            });
-        }
-        state.entries_verified = state.entries_verified.saturating_add(1);
         Ok(())
+    }
+
+    pub(super) async fn verify_principal_chain_impl(
+        &self,
+        session_id: &SessionId,
+        principal: Option<&PrincipalId>,
+    ) -> AuditResult<ChainVerificationResult> {
+        let registry = self.verification_registry().await?;
+        let entries = self.get_principal_entries(session_id, principal).await?;
+        let mut issues = Vec::new();
+        let mut previous: Option<&AuditEntry> = None;
+        // Storage order is the durable append order. Wall-clock timestamps are
+        // signed evidence, not an ordering primitive: clocks can move backward.
+        for entry in &entries {
+            self.verify_stored_entry(entry, previous, registry.as_deref(), &mut |issue| {
+                issues.push(issue);
+            })
+            .await?;
+            previous = Some(entry);
+        }
+        Ok(ChainVerificationResult {
+            valid: issues.is_empty(),
+            entries_verified: entries.len(),
+            issues,
+        })
+    }
+
+    /// Whether the first stored entry of a chain is anchored: its previous
+    /// hash is zero, or a signed archive receipt for this chain names it.
+    ///
+    /// Once the store has a key registry, the receipt's key must be one it
+    /// lists, like the keys of the entries themselves:
+    ///
+    /// - a receipt written before v2 was enabled carries no key epoch and must
+    ///   be signed by the registered v1-audit key;
+    /// - a receipt written under v2 must name a key epoch at which its key
+    ///   held the audit role, and for a v2 first entry that epoch must be no
+    ///   earlier than the entry's (a receipt is written after the entries it
+    ///   keeps), so a retired key cannot anchor a suffix that starts after
+    ///   its retirement.
+    ///
+    /// Without a registry, receipts are checked under their embedded key, as
+    /// format v1 did.
+    async fn verify_archive_anchor(
+        &self,
+        first: &AuditEntry,
+        registry: Option<&KeyRegistry>,
+    ) -> AuditResult<bool> {
+        if first.previous_hash.is_zero() {
+            return Ok(true);
+        }
+        let principal = first.principal.as_ref();
+        let Some(raw) = self
+            .storage
+            .prune_receipt(&first.session_id, principal)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let receipt: AuditPruneReceipt = serde_json::from_slice(&raw)
+            .map_err(|error| AuditError::SerializationError(error.to_string()))?;
+        let expected_principal = principal.map(ToString::to_string);
+        if receipt.session != first.session_id.to_string()
+            || receipt.principal.as_deref() != expected_principal.as_deref()
+        {
+            return Ok(false);
+        }
+        if !receipt_key_registered(&receipt, first, registry) {
+            return Ok(false);
+        }
+        prune::verify_anchor(&receipt, &first.previous_hash)
+    }
+}
+
+/// Whether `receipt` is signed by a key the registry lists for it; see
+/// `AuditLog::verify_archive_anchor`.
+fn receipt_key_registered(
+    receipt: &AuditPruneReceipt,
+    first: &AuditEntry,
+    registry: Option<&KeyRegistry>,
+) -> bool {
+    let Some(registry) = registry else {
+        return first.v2.is_none();
+    };
+    let key = &receipt.public_key;
+    match (receipt.key_epoch, &first.v2) {
+        (Some(epoch), Some(seal)) => {
+            epoch >= seal.key_epoch && registry.is_active(KeyRole::Audit, key, epoch)
+        },
+        (Some(epoch), None) => registry.is_active(KeyRole::Audit, key, epoch),
+        (None, Some(_)) => false,
+        (None, None) => registry.was_registered(KeyRole::AuditV1, key),
     }
 }
