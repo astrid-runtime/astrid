@@ -27,7 +27,11 @@ pub(super) const FOOTER_BYTES: usize = FOOTER_MAGIC.len() + 8 + 8 + 8 + 32;
 #[cfg(test)]
 thread_local! {
     static READ_HEADER_COUNT: Cell<usize> = const { Cell::new(0) };
+    static READ_AT_COUNT: Cell<usize> = const { Cell::new(0) };
 }
+
+#[cfg(test)]
+mod scan_tests;
 
 #[cfg(test)]
 pub(super) fn reset_read_header_count() {
@@ -70,9 +74,32 @@ pub(super) fn recover_container(file: &mut File) -> io::Result<Recovery> {
     recover_from_headers(file)
 }
 
+/// Exact encoded namespace size, without allocating the snapshot. This is
+/// format accounting, shared by the encoder and physical maintenance.
+pub(super) fn snapshot_bytes(regions: &BTreeMap<VolumeRegion, RegionState>) -> io::Result<u64> {
+    regions.iter().try_fold(12_u64, |total, (region, state)| {
+        let name = u64::try_from(region.as_str().len())
+            .map_err(|_| invalid_transition("snapshot region name length overflow"))?;
+        let extents = u64::try_from(state.extents.len())
+            .map_err(|_| invalid_transition("snapshot extent count overflow"))?;
+        total
+            .checked_add(14)
+            .and_then(|value| value.checked_add(name))
+            .and_then(|value| {
+                extents
+                    .checked_mul(24)
+                    .and_then(|bytes| value.checked_add(bytes))
+            })
+            .ok_or_else(|| invalid_transition("commit snapshot size overflow"))
+    })
+}
+
 pub(super) fn encode_region_snapshot(
     regions: &BTreeMap<VolumeRegion, RegionState>,
 ) -> io::Result<Vec<u8>> {
+    if snapshot_bytes(regions)? > MAX_COMMIT_SNAPSHOT_BYTES {
+        return Err(invalid_transition("commit snapshot exceeds format bound"));
+    }
     let region_count = u32::try_from(regions.len())
         .map_err(|_| invalid_transition("too many regions in commit snapshot"))?;
     let mut output = Vec::new();
@@ -701,24 +728,28 @@ fn decode_region_snapshot(
 
 fn has_physically_valid_record_after(file: &File, start: u64, end: u64) -> io::Result<bool> {
     let mut offset = start;
+    let mut buffer = vec![0_u8; RECOVERY_BUFFER_BYTES].into_boxed_slice();
     while end.saturating_sub(offset) >= RECORD_MAGIC.len() as u64 {
-        let mut magic = [0_u8; 8];
-        let mut cursor = offset;
-        while cursor < end {
-            let remaining = usize::try_from(end.saturating_sub(cursor)).unwrap_or(0);
-            if remaining < magic.len() {
-                return Ok(false);
-            }
-            read_exact_at(file, cursor, &mut magic)?;
-            if magic == RECORD_MAGIC && physically_valid_record_at(file, cursor, end)? {
-                return Ok(true);
-            }
-            cursor = cursor.saturating_add(1);
-            if cursor.saturating_sub(offset) >= RECOVERY_BUFFER_BYTES as u64 {
-                break;
+        let length = usize::try_from(end.saturating_sub(offset).min(RECOVERY_BUFFER_BYTES as u64))
+            .map_err(|_| invalid_transition("volume suffix scan length overflow"))?;
+        read_exact_at(file, offset, &mut buffer[..length])?;
+        for (position, magic) in buffer[..length].windows(RECORD_MAGIC.len()).enumerate() {
+            if magic == RECORD_MAGIC {
+                let candidate = offset
+                    .checked_add(position as u64)
+                    .ok_or_else(|| invalid_transition("volume suffix candidate offset overflow"))?;
+                if physically_valid_record_at(file, candidate, end)? {
+                    return Ok(true);
+                }
             }
         }
-        offset = cursor;
+        // Retain every possible start whose magic crosses the read boundary.
+        // Candidate framing/checksum validation is unchanged: a valid later
+        // record still makes interior corruption fatal instead of a torn tail.
+        let consumed = length.strict_sub(RECORD_MAGIC.len().strict_sub(1));
+        offset = offset
+            .checked_add(consumed as u64)
+            .ok_or_else(|| invalid_transition("volume suffix scan offset overflow"))?;
     }
     Ok(false)
 }
@@ -852,6 +883,8 @@ fn read_exact_at(file: &File, offset: u64, buffer: &mut [u8]) -> io::Result<()> 
         let read_offset = offset
             .checked_add(done as u64)
             .ok_or_else(|| io::Error::other("volume positional read offset overflow"))?;
+        #[cfg(test)]
+        READ_AT_COUNT.with(|count| count.set(count.get().strict_add(1)));
         let read = file_read_at(file, &mut buffer[done..], read_offset)?;
         if read == 0 {
             return Err(io::Error::new(

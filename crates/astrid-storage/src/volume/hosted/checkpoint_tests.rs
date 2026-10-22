@@ -1,15 +1,15 @@
+use super::test_support::{copy_container, read_container};
 use super::*;
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"ASTMAP1\0";
-fn snapshot_count(path: &std::path::Path) -> usize {
-    let bytes = std::fs::read(path).unwrap();
+fn snapshot_count(bytes: &[u8]) -> usize {
     bytes
         .windows(SNAPSHOT_MAGIC.len())
         .filter(|window| *window == SNAPSHOT_MAGIC)
         .count()
 }
 
-fn append_legacy_record(
+pub(super) fn append_legacy_record(
     path: &std::path::Path,
     sequence: u64,
     operation: Operation,
@@ -48,8 +48,7 @@ fn append_legacy_record(
     file.sync_all().unwrap();
 }
 
-fn footer_fields(path: &std::path::Path) -> (u64, u64, u64) {
-    let bytes = std::fs::read(path).unwrap();
+fn footer_fields(bytes: &[u8]) -> (u64, u64, u64) {
     assert!(bytes.len() >= recover::FOOTER_BYTES);
     let start = bytes.len().strict_sub(recover::FOOTER_BYTES);
     let footer = &bytes[start..];
@@ -61,8 +60,7 @@ fn footer_fields(path: &std::path::Path) -> (u64, u64, u64) {
     )
 }
 
-fn record_sequence(path: &std::path::Path, offset: u64) -> u64 {
-    let bytes = std::fs::read(path).unwrap();
+fn record_sequence(bytes: &[u8], offset: u64) -> u64 {
     let start = usize::try_from(offset).unwrap();
     let seq_start = start.strict_add(16);
     let seq_end = start.strict_add(24);
@@ -85,20 +83,20 @@ fn tiny_overwrite_commits_are_empty_and_recover() {
     volume.sync().unwrap();
     let snapshot_offset = volume.state.lock().last_commit_offset;
     let snapshot_end = volume.state.lock().last_snapshot_end;
-    assert_eq!(snapshot_count(&path), 1);
+    assert_eq!(snapshot_count(&read_container(&volume)), 1);
 
     volume.write_region_at(&region, 0, b"world").unwrap();
     volume.sync().unwrap();
     assert_eq!(volume.state.lock().last_commit_offset, snapshot_offset);
     assert_eq!(volume.state.lock().last_snapshot_end, snapshot_end);
-    assert_eq!(snapshot_count(&path), 1);
-    let (named, _, sequence) = footer_fields(&path);
+    assert_eq!(snapshot_count(&read_container(&volume)), 1);
+    let (named, _, sequence) = footer_fields(&read_container(&volume));
     assert_eq!(named, snapshot_offset);
-    assert!(sequence > record_sequence(&path, snapshot_offset));
+    assert!(sequence > record_sequence(&read_container(&volume), snapshot_offset));
     // Copy before Drop can flush again. Close-triggered durability must not
     // be what makes the empty commit recoverable.
     let copy = temporary.path().join("after-sync.volume");
-    std::fs::copy(&path, &copy).unwrap();
+    copy_container(&volume, &copy);
     let recovered = HostedFileVolume::open(&copy).unwrap();
     let mut actual = [0_u8; 5];
     recovered.read_region_at(&region, 0, &mut actual).unwrap();
@@ -117,7 +115,7 @@ fn reopen_keeps_empty_commits_without_extra_snapshots() {
     volume.sync().unwrap();
     let snapshot_offset = volume.state.lock().last_commit_offset;
     let copy = temporary.path().join("after-first.volume");
-    std::fs::copy(&path, &copy).unwrap();
+    copy_container(&volume, &copy);
     let recovered = HostedFileVolume::open(&copy).unwrap();
     assert_eq!(recovered.state.lock().last_commit_offset, snapshot_offset);
     drop(volume);
@@ -127,14 +125,14 @@ fn reopen_keeps_empty_commits_without_extra_snapshots() {
         volume.sync().unwrap();
         assert_eq!(volume.state.lock().last_commit_offset, snapshot_offset);
     }
-    assert_eq!(snapshot_count(&copy), 1);
+    assert_eq!(snapshot_count(&read_container(&volume)), 1);
     let after = temporary.path().join("after-loop.volume");
-    std::fs::copy(&copy, &after).unwrap();
+    copy_container(&volume, &after);
     let recovered = HostedFileVolume::open(&after).unwrap();
     let mut actual = [0_u8; 1];
     recovered.read_region_at(&region, 0, &mut actual).unwrap();
     assert_eq!(actual, [5]);
-    assert_eq!(snapshot_count(&after), 1);
+    assert_eq!(snapshot_count(&read_container(&recovered)), 1);
 }
 
 #[test]
@@ -160,7 +158,7 @@ fn damaged_footer_after_sparse_commits_scans_and_reinstalls() {
     let mut recovered = [0_u8; 5];
     volume.read_region_at(&region, 0, &mut recovered).unwrap();
     assert_eq!(&recovered, b"later");
-    let restored = std::fs::read(&path).unwrap();
+    let restored = read_container(&volume);
     assert_eq!(
         &restored[restored.len() - recover::FOOTER_BYTES..][..8],
         b"ASTFTR1\0"
@@ -225,7 +223,7 @@ fn torn_footer_after_sparse_commits_scans_and_reinstalls() {
     let mut recovered = [0_u8; 5];
     volume.read_region_at(&region, 0, &mut recovered).unwrap();
     assert_eq!(&recovered, b"later");
-    let restored = std::fs::read(&path).unwrap();
+    let restored = read_container(&volume);
     assert_eq!(
         &restored[restored.len().strict_sub(recover::FOOTER_BYTES)..][..8],
         b"ASTFTR1\0"
@@ -276,18 +274,18 @@ fn legacy_empty_commit_file_upgrades_to_named_snapshot_on_open() {
         0,
         &[],
     );
-    assert_eq!(snapshot_count(&path), 0);
+    assert_eq!(snapshot_count(&std::fs::read(&path).unwrap()), 0);
 
     let volume = HostedFileVolume::open(&path).unwrap();
     let region = VolumeRegion::new("objects").unwrap();
     let mut recovered = [0_u8; 4];
     volume.read_region_at(&region, 0, &mut recovered).unwrap();
     assert_eq!(&recovered, b"old!");
-    assert_eq!(snapshot_count(&path), 1);
+    assert_eq!(snapshot_count(&read_container(&volume)), 1);
     assert_ne!(volume.state.lock().last_snapshot_end, 0);
     volume.write_region_at(&region, 0, b"new!").unwrap();
     volume.sync().unwrap();
-    assert_eq!(snapshot_count(&path), 1);
+    assert_eq!(snapshot_count(&read_container(&volume)), 1);
 }
 
 #[test]
@@ -298,14 +296,14 @@ fn snapshot_rollover_after_format_bound_write() {
     volume.create_region(&region, true).unwrap();
     volume.write_region_at(&region, 0, &[0x11]).unwrap();
     volume.sync().unwrap();
-    assert_eq!(snapshot_count(&path), 1);
+    assert_eq!(snapshot_count(&read_container(&volume)), 1);
 
     let length = recover::MAX_COMMIT_SNAPSHOT_BYTES;
     volume
         .write_region_from(&region, 0, length, &mut io::repeat(0x5A).take(length))
         .unwrap();
     volume.sync().unwrap();
-    assert_eq!(snapshot_count(&path), 2);
+    assert_eq!(snapshot_count(&read_container(&volume)), 2);
     drop(volume);
 
     let volume = HostedFileVolume::open(&path).unwrap();
@@ -332,7 +330,7 @@ fn legacy_reader_rejects_sparse_file_but_open_succeeds() {
     volume.sync().unwrap();
     drop(volume);
 
-    let (named, durable_len, sequence) = footer_fields(&path);
+    let (named, durable_len, sequence) = footer_fields(&std::fs::read(&path).unwrap());
     let file = File::open(&path).unwrap();
     assert!(
         !recover::legacy_reader_accepts_terminal_snapshot(&file, named, durable_len, sequence,)
@@ -389,7 +387,7 @@ fn sparse_tail_rejects_corrupt_write_header_checksum_and_payload() {
         volume.write_region_at(&region, 0, &payload).unwrap();
         volume.sync().unwrap();
         let copy = temporary.path().join("corrupt.volume");
-        std::fs::copy(&path, &copy).unwrap();
+        copy_container(&volume, &copy);
         let mut bytes = std::fs::read(&copy).unwrap();
         let offset = usize::try_from(tail_start + relative_offset).unwrap();
         bytes[offset] ^= 1;
