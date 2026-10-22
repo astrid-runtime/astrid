@@ -446,7 +446,7 @@ async fn pre_chunked_kv_catalogue_upgrade_preserves_root_and_accepts_large_value
     reopened.engine.close().unwrap();
 }
 
-fn pre_chunked_specification() -> crate::storage_model::ObjectRecord {
+pub(super) fn pre_chunked_specification() -> crate::storage_model::ObjectRecord {
     use crate::storage_model::{ObjectClass, ObjectFormatVersion, ObjectKind, ObjectRecord};
     // Reconstruct the published predecessor from the amended grammar and
     // bind it to its real identity without duplicating the full specification.
