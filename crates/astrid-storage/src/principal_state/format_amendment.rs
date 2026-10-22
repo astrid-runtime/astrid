@@ -82,7 +82,12 @@ pub(super) const PRE_RESERVED_REPRESENTATION_TAG_FORMAT_SPEC_ID: ObjectId = Obje
     88, 114, 107, 60, 36, 60, 48, 235, 192, 148, 31, 101, 100, 39, 82, 0, 148, 166, 187, 16, 231,
     178, 25, 11, 231, 50, 181, 166, 19, 0, 20, 77,
 ]);
-const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 14] = [
+/// Specification identity before chunked KV spilled values were registered.
+pub(super) const PRE_CHUNKED_KV_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
+    172, 62, 26, 177, 232, 43, 226, 77, 174, 124, 222, 249, 73, 105, 141, 213, 77, 36, 7, 188, 127,
+    57, 251, 48, 112, 157, 195, 102, 119, 238, 166, 29,
+]);
+const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 15] = [
     PRE_DERIVATION_FORMAT_SPEC_ID,
     PRE_COMPACTION_FORMAT_SPEC_ID,
     PRE_GC_OUTBOX_FORMAT_SPEC_ID,
@@ -97,6 +102,7 @@ const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 14] = [
     PRE_FLEET_OWNER_FORMAT_SPEC_ID,
     PRE_WORKSPACE_BRANCH_FORMAT_SPEC_ID,
     PRE_RESERVED_REPRESENTATION_TAG_FORMAT_SPEC_ID,
+    PRE_CHUNKED_KV_FORMAT_SPEC_ID,
 ];
 
 /// Known predecessors whose direct-canonical recipe is unchanged.
@@ -110,6 +116,7 @@ pub(super) const DIRECT_CATALOGUE_PREDECESSORS: &[ObjectId] = &[
     PRE_FLEET_OWNER_FORMAT_SPEC_ID,
     PRE_WORKSPACE_BRANCH_FORMAT_SPEC_ID,
     PRE_RESERVED_REPRESENTATION_TAG_FORMAT_SPEC_ID,
+    PRE_CHUNKED_KV_FORMAT_SPEC_ID,
 ];
 
 #[cfg(test)]
