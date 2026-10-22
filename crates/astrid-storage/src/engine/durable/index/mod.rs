@@ -25,6 +25,12 @@ use super::{
 use crate::volume::AstridVolume;
 use std::sync::Arc;
 
+#[cfg(test)]
+mod tests;
+mod validation;
+
+use validation::validate_state;
+
 const SNAPSHOT_RECORD: u8 = 1;
 const DELTA_RECORD: u8 = 2;
 const CURRENT_DIGEST_BYTES: u32 = 32;
@@ -242,26 +248,7 @@ pub(super) fn recover_index(
         INDEX_MAGIC,
         RecoveryLimits::process_addressable(),
         |offset, payload| {
-            let mut reader = WireReader::new(payload);
-            let record = reader.u8().map_err(|detail| corrupt(offset, detail))?;
-            let decoded = match record {
-                SNAPSHOT_RECORD if state.is_none() => decode_snapshot(&mut reader, scheme, offset)?,
-                DELTA_RECORD => {
-                    let current = state
-                        .take()
-                        .ok_or_else(|| corrupt(offset, "index delta precedes snapshot"))?;
-                    apply_delta(current, &mut reader, scheme, offset)?
-                },
-                SNAPSHOT_RECORD => {
-                    return Err(corrupt(offset, "index contains more than one snapshot"));
-                },
-                _ => return Err(corrupt(offset, "unknown index record kind")),
-            };
-            if reader.remaining() != 0 {
-                return Err(corrupt(offset, "trailing index-record bytes"));
-            }
-            validate_state(&decoded, offset)?;
-            state = Some(decoded);
+            state = Some(decode_record(state.take(), payload, scheme, offset)?);
             Ok(())
         },
     );
@@ -289,6 +276,33 @@ pub(super) fn recover_index(
         _ => {},
     }
     Some(state)
+}
+
+fn decode_record(
+    state: Option<IndexState>,
+    payload: &[u8],
+    scheme: IdentityScheme,
+    offset: u64,
+) -> Result<IndexState, DurableError> {
+    let mut reader = WireReader::new(payload);
+    let record = reader.u8().map_err(|detail| corrupt(offset, detail))?;
+    let decoded = match (record, state) {
+        (SNAPSHOT_RECORD, None) => {
+            let snapshot = decode_snapshot(&mut reader, scheme, offset)?;
+            validate_state(&snapshot, offset)?;
+            snapshot
+        },
+        (DELTA_RECORD, Some(current)) => apply_delta(current, &mut reader, scheme, offset)?,
+        (DELTA_RECORD, None) => return Err(corrupt(offset, "index delta precedes snapshot")),
+        (SNAPSHOT_RECORD, Some(_)) => {
+            return Err(corrupt(offset, "index contains more than one snapshot"));
+        },
+        _ => return Err(corrupt(offset, "unknown index record kind")),
+    };
+    if reader.remaining() != 0 {
+        return Err(corrupt(offset, "trailing index-record bytes"));
+    }
+    Ok(decoded)
 }
 
 /// Replace the disposable index with one complete, flushed checkpoint.
@@ -554,6 +568,11 @@ fn apply_delta(
     }
     let arena_tail = decode_location(reader, offset)?;
     let additions = decode_locations(reader, scheme, offset)?;
+    // The prior prefix was validated and arena length cannot decrease. Old
+    // locations therefore remain bounded; only additions and the new tail
+    // need bounds checks. Authoritative arena verification still follows.
+    validation::validate_locations(additions.values(), arena_len, offset)?;
+    validation::validate_tail(Some(arena_tail), arena_len, offset)?;
     for (id, location) in additions {
         match state.objects.get(&id) {
             Some(existing) if same_location(*existing, location) => {},
@@ -647,42 +666,6 @@ fn decode_locations(
         previous = Some(id);
     }
     Ok(locations)
-}
-
-fn validate_state(state: &IndexState, offset: u64) -> Result<(), DurableError> {
-    for location in state.objects.values() {
-        let end = location
-            .offset
-            .checked_add(FRAME_HEADER_LEN)
-            .and_then(|value| value.checked_add(location.payload_len))
-            .ok_or(DurableError::EncodingOverflow)?;
-        if end > state.arena_len {
-            return Err(corrupt(
-                offset,
-                "indexed object extends beyond covered arena",
-            ));
-        }
-    }
-    match state.arena_tail {
-        Some(location) => {
-            let end = location
-                .offset
-                .checked_add(FRAME_HEADER_LEN)
-                .and_then(|value| value.checked_add(location.payload_len))
-                .ok_or(DurableError::EncodingOverflow)?;
-            if end != state.arena_len {
-                return Err(corrupt(
-                    offset,
-                    "indexed arena tail does not end at covered length",
-                ));
-            }
-        },
-        None if state.arena_len != 0 => {
-            return Err(corrupt(offset, "non-empty arena has no indexed tail"));
-        },
-        None => {},
-    }
-    Ok(())
 }
 
 fn encode_len(bytes: &mut Vec<u8>, len: usize) -> Result<(), DurableError> {
