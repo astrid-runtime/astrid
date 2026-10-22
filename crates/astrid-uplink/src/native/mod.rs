@@ -8,6 +8,7 @@ mod framing;
 mod handshake;
 mod input;
 pub mod private_elicit;
+mod readiness;
 #[cfg(all(test, unix))]
 mod recovery_tests;
 #[cfg(all(test, unix))]
@@ -34,6 +35,7 @@ use handshake::AuthenticatedIdentity;
 #[cfg(all(test, unix))]
 use input::input_chat_session;
 use input::{PendingInput, complete_pending, handle_connection_input, wait_pending};
+use readiness::ConnectionServices;
 
 const MAX_PENDING_HANDSHAKES: usize = 8;
 const MAX_ESTABLISHED_CONNECTIONS: usize = 128;
@@ -63,7 +65,7 @@ struct ConnectionAdmission {
 }
 
 struct ConnectionRuntime {
-    private_elicits: Option<Arc<dyn private_elicit::PrivateElicitResponder>>,
+    services: ConnectionServices,
     session_token: Arc<SessionToken>,
     home: AstridHome,
     event_bus: Arc<EventBus>,
@@ -127,7 +129,7 @@ impl ConnectionRuntime {
             egress,
             shutdown,
             admission,
-            self.private_elicits.clone(),
+            self.services.clone(),
         )
         .await;
     }
@@ -188,7 +190,7 @@ impl NativeUplink {
     /// requested or the listener becomes unusable.
     #[must_use]
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(self.run(None))
+        tokio::spawn(self.run(ConnectionServices::default()))
     }
 
     /// Attach a runtime-owned private reply handler without changing legacy
@@ -198,13 +200,24 @@ impl NativeUplink {
         self,
         handler: Arc<dyn private_elicit::PrivateElicitResponder>,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(self.run(Some(handler)))
+        tokio::spawn(self.run(Some(handler).into()))
     }
 
-    async fn run(
-        mut self,
+    /// Attach principal-scoped capsule readiness to native input admission.
+    /// Management and cancellation stay independent of capsule loading.
+    #[must_use]
+    pub fn spawn_with_capsule_readiness(
+        self,
+        probe: astrid_core::kernel_api::CapsuleTopicProbe,
         private_elicits: Option<Arc<dyn private_elicit::PrivateElicitResponder>>,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(self.run(ConnectionServices {
+            private_elicits,
+            topic_probe: Some(probe),
+        }))
+    }
+
+    async fn run(mut self, services: ConnectionServices) {
         let handshake_permits = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
         let established_permits =
             Arc::new(tokio::sync::Semaphore::new(MAX_ESTABLISHED_CONNECTIONS));
@@ -213,7 +226,7 @@ impl NativeUplink {
         let egress_registry = egress::Registry::install(&self.event_bus);
         let (connection_shutdown_tx, connection_shutdown_rx) = tokio::sync::watch::channel(false);
         let runtime = Arc::new(ConnectionRuntime {
-            private_elicits,
+            services,
             session_token: Arc::clone(&self.session_token),
             home: self.home.clone(),
             event_bus: Arc::clone(&self.event_bus),
@@ -455,8 +468,9 @@ async fn serve_connection(
     receiver: egress::Subscription,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     mut admission: ConnectionAdmission,
-    private_elicits: Option<Arc<dyn private_elicit::PrivateElicitResponder>>,
+    services: impl Into<ConnectionServices>,
 ) {
+    let services = services.into();
     let principal = identity.principal.to_string();
     let (reader, mut writer) = local_transport::split(stream);
     let mut reader = FramedReader::new(reader);
@@ -525,7 +539,7 @@ async fn serve_connection(
                         break;
                     }
                     if handle_connection_input(&mut writer, &event_bus, &identity,
-                        &receiver, private_elicits.as_deref(), message,
+                        &receiver, services.input_services(), message,
                         (&mut pending, &mut control, &mut cancellation)).await.is_err()
                     {
                         break;

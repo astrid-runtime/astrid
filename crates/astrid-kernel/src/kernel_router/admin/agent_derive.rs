@@ -55,6 +55,17 @@ async fn reject_without_caller(
     request: AgentDeriveKernelRequest,
     error: CallerResolutionError,
 ) {
+    let Some(_work) = kernel.runtime_work.admit() else {
+        publish(
+            kernel,
+            response_topic,
+            &PrincipalId::anonymous(),
+            device_key_id.as_deref(),
+            request.request_id,
+            AdminResponseBody::Error("runtime is shutting down".to_owned()),
+        );
+        return;
+    };
     let caller = PrincipalId::anonymous();
     let reason = format!("{MANAGEMENT_CALLER_REQUIRED}: {}", error.reason());
     super::record_admin_audit(
@@ -90,6 +101,17 @@ async fn handle_request(
     device_key_id: Option<String>,
     request: AgentDeriveKernelRequest,
 ) {
+    let Some(_work) = kernel.runtime_work.admit() else {
+        publish(
+            kernel,
+            response_topic,
+            &caller,
+            device_key_id.as_deref(),
+            request.request_id,
+            AdminResponseBody::Error("runtime is shutting down".to_owned()),
+        );
+        return;
+    };
     let params = serde_json::to_value(&request.request).ok();
     let body = match super::authorize_request(
         kernel,

@@ -46,10 +46,13 @@ pub fn run_to_completion() -> Result<()> {
         // Drop joins blocking work and cancels remaining async tasks before any
         // projection file can be retired. No kernel handles cross this scope.
     }
+    tracing::info!("Runtime tasks stopped; finalizing durable home");
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
         .block_on(lifecycle.finish())?;
+    // Tracing can recreate a retired log projection; stderr cannot reopen it.
+    eprintln!("Astrid durable home finalized");
     Ok(())
 }
 
@@ -348,10 +351,8 @@ async fn run_with_args(args: Args) -> Result<()> {
         event_bus: std::sync::Arc::clone(&kernel.event_bus),
         shutdown: kernel.shutdown_tx.subscribe(),
     };
-    let native_uplink_task = match private_inputs {
-        Some(responder) => native_uplink.spawn_with_private_elicits(responder),
-        None => native_uplink.spawn(),
-    };
+    let native_uplink_task = native_uplink
+        .spawn_with_capsule_readiness(kernel.capsule_ingress_readiness(), private_inputs);
 
     // In ephemeral mode, shut down immediately when the last client disconnects.
     if args.ephemeral {
@@ -468,7 +469,10 @@ async fn run_with_args(args: Args) -> Result<()> {
         // watchdog AND by an in-process API shutdown request. No tokio signal
         // registration here — that avoids double-handling the same signals the
         // watchdog owns.
-        signal::spawn_signal_watchdog(kernel.shutdown_tx.clone());
+        signal::spawn_signal_watchdog(
+            kernel.shutdown_tx.clone(),
+            std::time::Duration::from_secs(admitted_config.config.timeouts.daemon_shutdown_secs),
+        );
         let _ = shutdown_rx.wait_for(|v| *v).await;
         tracing::info!("Shutdown requested, shutting down");
     }
@@ -500,6 +504,7 @@ async fn run_with_args(args: Args) -> Result<()> {
         tracing::warn!(%error, "native local uplink task did not exit cleanly");
     }
 
+    tracing::info!("Kernel services and native uplink stopped");
     Ok(())
 }
 
