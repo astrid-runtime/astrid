@@ -33,6 +33,9 @@ pub(super) struct MetadataIndex {
 
 impl MetadataIndex {
     fn insert(&mut self, frame: MetadataFrame) -> Result<(), DurableError> {
+        if frame.kind == MetadataKind::MapNode {
+            return self.insert_map_node(&frame);
+        }
         frame.verify(&Blake3PhysicalIdentity)?;
         let key = (frame.kind, frame.identity);
         if let Some(existing) = self.values.get(&key) {
@@ -43,13 +46,30 @@ impl MetadataIndex {
             }
             return Ok(());
         }
-        if frame.kind == MetadataKind::MapNode {
-            self.nodes.insert(
-                map_node_id(frame.identity),
-                PhysicalMapNode::decode(&frame.value)?,
-            );
-        }
         self.values.insert(key, frame.value);
+        Ok(())
+    }
+
+    fn insert_map_node(&mut self, frame: &MetadataFrame) -> Result<(), DurableError> {
+        let node = PhysicalMapNode::decode(&frame.value)?;
+        let id = node.identify(&Blake3PhysicalIdentity)?;
+        if id != map_node_id(frame.identity) {
+            return Err(DurableError::InvalidRepresentationState(
+                "metadata identity does not match canonical value",
+            ));
+        }
+        if let Some(existing) = self.nodes.get(&id) {
+            if existing != &node {
+                return Err(DurableError::InvalidRepresentationState(
+                    "physical metadata identity collision",
+                ));
+            }
+        } else {
+            self.nodes.insert(id, node);
+        }
+        // Canonical decoding and identity checks establish the same collision
+        // invariant as encoded values. Keep one decoded owner: recovery never
+        // requests a MapNode through value(), only the authenticated node map.
         Ok(())
     }
 
