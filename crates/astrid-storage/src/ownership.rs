@@ -760,3 +760,7 @@ pub enum OwnershipError {
 #[cfg(test)]
 #[path = "ownership_tests.rs"]
 mod tests;
+
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "ownership/chunked_value_tests.rs"]
+mod chunked_value_tests;
