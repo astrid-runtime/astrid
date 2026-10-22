@@ -140,7 +140,16 @@ pub(super) fn open_regular(path: &Path, create: bool) -> io::Result<std::fs::Fil
         use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    let file = options.open(path)?;
+    let file = match options.open(path) {
+        Ok(file) => file,
+        // Another process can win first creation after absence was observed.
+        // Open its inode without creation and let the common lock/identity
+        // checks decide ownership. Never truncate or retry creation.
+        Err(error) if create && error.kind() == io::ErrorKind::AlreadyExists => {
+            return open_regular(path, false);
+        },
+        Err(error) => return Err(error),
+    };
     if !file.metadata()?.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
