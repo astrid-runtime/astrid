@@ -75,6 +75,7 @@ where
         self.object_cache.clear();
         self.lifecycle
             .store(LIFECYCLE_CLOSED, std::sync::atomic::Ordering::Release);
+        self.discard_closed_metadata(&mut inner);
         let unlock = match inner.lock.take() {
             Some(StoreLock::Native(lock)) => fs2::FileExt::unlock(&lock)
                 .map_err(|source| io_error("unlock principal store while closing", source)),
@@ -82,6 +83,19 @@ where
         };
         drop(self.volume.write().take());
         result.and(unlock)
+    }
+
+    fn discard_closed_metadata(&self, inner: &mut DurableInner<P>) {
+        // Retained engine Arcs must not retain the entire historical locator
+        // index after close. On a failed flush the arena/WAL remain authority
+        // for a new engine; the closed instance can never serve these views.
+        inner.index.clear();
+        inner.validated.clear();
+        inner.roots_by_principal.clear();
+        inner.pending_direct_objects.clear();
+        inner.pending_index_locations = Vec::new();
+        drop(inner.pending_wal.take());
+        self.published_roots.replace(&inner.roots_by_principal);
     }
 
     fn flush_authority(&self, inner: &mut DurableInner<P>) -> Result<(), DurableError> {
@@ -355,3 +369,9 @@ fn index_cache_has_one_frame(file: &mut File) -> bool {
         .checked_add(payload_len)
         .is_some_and(|frame_end| frame_end == length)
 }
+
+#[cfg(test)]
+mod retention_tests;
+
+#[cfg(test)]
+mod root_read_tests;

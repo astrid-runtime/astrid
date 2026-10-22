@@ -7,12 +7,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::SeekFrom;
 
 use super::super::DurableIo;
+use super::reverse_index::{self, ReverseIndex};
 
 use crate::storage_model::{
-    CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapKey, PhysicalMapNode, PlacementEntry,
-    PlacementSet, Recipe, RepresentationCatalogueRoot, RepresentationProfile,
-    RepresentationProfileId, RepresentationRecord, RepresentationRecordId, RepresentationState,
-    RepresentationStateId,
+    CanonicalPhysicalMap, Coverage, PhysicalMapKey, PhysicalMapNode, PlacementEntry, PlacementSet,
+    Recipe, RepresentationCatalogueRoot, RepresentationProfile, RepresentationProfileId,
+    RepresentationRecord, RepresentationState, RepresentationStateId,
 };
 
 use super::super::{FRAME_HEADER_LEN, scan_frames};
@@ -33,6 +33,9 @@ pub(super) struct MetadataIndex {
 
 impl MetadataIndex {
     fn insert(&mut self, frame: MetadataFrame) -> Result<(), DurableError> {
+        if frame.kind == MetadataKind::MapNode {
+            return self.insert_map_node(&frame);
+        }
         frame.verify(&Blake3PhysicalIdentity)?;
         let key = (frame.kind, frame.identity);
         if let Some(existing) = self.values.get(&key) {
@@ -43,13 +46,30 @@ impl MetadataIndex {
             }
             return Ok(());
         }
-        if frame.kind == MetadataKind::MapNode {
-            self.nodes.insert(
-                map_node_id(frame.identity),
-                PhysicalMapNode::decode(&frame.value)?,
-            );
-        }
         self.values.insert(key, frame.value);
+        Ok(())
+    }
+
+    fn insert_map_node(&mut self, frame: &MetadataFrame) -> Result<(), DurableError> {
+        let node = PhysicalMapNode::decode(&frame.value)?;
+        let id = node.identify(&Blake3PhysicalIdentity)?;
+        if id != map_node_id(frame.identity) {
+            return Err(DurableError::InvalidRepresentationState(
+                "metadata identity does not match canonical value",
+            ));
+        }
+        if let Some(existing) = self.nodes.get(&id) {
+            if existing != &node {
+                return Err(DurableError::InvalidRepresentationState(
+                    "physical metadata identity collision",
+                ));
+            }
+        } else {
+            self.nodes.insert(id, node);
+        }
+        // Canonical decoding and identity checks establish the same collision
+        // invariant as encoded values. Keep one decoded owner: recovery never
+        // requests a MapNode through value(), only the authenticated node map.
         Ok(())
     }
 
@@ -412,7 +432,7 @@ pub(super) fn validate_representations(
     profiles: &CanonicalPhysicalMap,
     representations: &CanonicalPhysicalMap,
     placements: &CanonicalPhysicalMap,
-) -> Result<(BTreeMap<ObjectId, Vec<RepresentationRecordId>>, u64), DurableError> {
+) -> Result<(ReverseIndex, u64), DurableError> {
     let mut placement_by_blob = BTreeMap::new();
     let mut extent_count = 0_u64;
     for (key, bytes) in active_entries(placements)? {
@@ -438,7 +458,7 @@ pub(super) fn validate_representations(
             .ok_or(DurableError::EncodingOverflow)?;
         placement_by_blob.insert(entry.blob(), entry);
     }
-    let mut reverse = BTreeMap::<ObjectId, Vec<RepresentationRecordId>>::new();
+    let mut reverse = ReverseIndex::new();
     for (key, bytes) in active_entries(representations)? {
         let record = RepresentationRecord::decode(bytes)?;
         let id = record.identify(&Blake3PhysicalIdentity)?;
@@ -474,7 +494,7 @@ pub(super) fn validate_representations(
                 "direct representation placement does not match its record",
             ));
         }
-        reverse.entry(object).or_default().push(id);
+        reverse_index::insert(&mut reverse, object, id);
     }
     Ok((reverse, extent_count))
 }
