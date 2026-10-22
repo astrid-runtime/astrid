@@ -68,9 +68,8 @@ fn spawn_panicking_workers(
                 .value(),
         );
         state.set_drain_timeouts_for_test(std::time::Duration::from_millis(80));
-        let gate = state
-            .blocking_worker_gate_for_test()
-            .expect("test worker gate");
+        let gate = Arc::new(crate::storage_mount::BlockingWorkerTestGate::new());
+        *state.blocking_worker_test_gate.lock().unwrap() = Some(Arc::clone(&gate));
         let kernel = Arc::clone(kernel);
         // Stat enters the same blocking-worker gate without taking the
         // global namespace-mutation lock before the other workers can enter.
