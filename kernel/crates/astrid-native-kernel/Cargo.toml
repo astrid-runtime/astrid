@@ -31,7 +31,10 @@ raw-cpuid = "=11.6.0"
 astrid-native-closure = { path = "../astrid-native-closure" }
 astrid-system-generation = { path = "../astrid-system-generation", default-features = false, features = ["emulator-fixture"] }
 # Rolling audit root. Same frozen pure backend as the sibling kernel crates.
-blake3 = { version = "=1.8.5", default-features = false, features = ["pure"] }
+# Zeroize makes custody erasure explicit for Hasher and digest state.
+blake3 = { version = "=1.8.5", default-features = false, features = ["pure", "zeroize"] }
+# Exact-pinned volatile erasure for seed/key temporaries.
+zeroize = { version = "=1.9.0", default-features = false }
 
 [dev-dependencies]
 # Private host verifier: kernel audit tests cross-check the canonical frames,

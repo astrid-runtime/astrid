@@ -92,26 +92,26 @@ impl AuditRelay {
         }
     }
 
-    /// Restores flow-control state from a trusted checkpoint without losing
-    /// its relay generation. Outstanding evidence is explicitly not carried
-    /// across the restart; a verifier restarts from this checkpoint.
-    pub(super) fn restore(
-        boot: BootSessionId,
-        generation: u64,
-        next_seq: u64,
-    ) -> Result<Self, AuditError> {
-        if generation == 0 {
-            return Err(AuditError::MalformedFrame);
+    pub(super) fn can_publish(&self, seq: u64, mandatory: bool) -> Result<(), AuditError> {
+        if seq != self.next_seq {
+            return Err(AuditError::RelayInvalidCursor);
         }
-        Ok(Self {
-            boot,
-            generation,
-            next_seq,
-            oldest_seq: next_seq,
-            outstanding: 0,
-            credits: 0,
-            slots: [None; AUDIT_RELAY_SLOTS],
-        })
+        if self.outstanding == AUDIT_RELAY_SLOTS {
+            return Err(AuditError::HandoffIncomplete);
+        }
+        if !mandatory && self.outstanding >= AUDIT_RELAY_SLOTS - MAX_TERMINAL_RECORDS_PER_BATCH {
+            return Err(AuditError::HandoffIncomplete);
+        }
+        Ok(())
+    }
+
+    /// Immediate-retire mode is exclusive of any retained evidence. Mixing it
+    /// with buffered/in-flight records would make cursor semantics ambiguous.
+    pub(super) fn require_empty_for_immediate_retire(&self) -> Result<(), AuditError> {
+        if self.outstanding != 0 {
+            return Err(AuditError::RelayMixedMode);
+        }
+        Ok(())
     }
 
     /// Publishes one already-rooted record. Window overflow keeps the
@@ -123,16 +123,8 @@ impl AuditRelay {
         root: [u8; root::ROOT_LEN],
         mandatory: bool,
     ) -> Result<(), AuditError> {
-        if seq != self.next_seq {
-            return Err(AuditError::RelayInvalidCursor);
-        }
         let next_seq = seq.checked_add(1).ok_or(AuditError::SequenceOverflow)?;
-        if self.outstanding == AUDIT_RELAY_SLOTS {
-            return Err(AuditError::HandoffIncomplete);
-        }
-        if !mandatory && self.outstanding >= AUDIT_RELAY_SLOTS - MAX_TERMINAL_RECORDS_PER_BATCH {
-            return Err(AuditError::HandoffIncomplete);
-        }
+        self.can_publish(seq, mandatory)?;
         let index = Self::slot_index(seq);
         self.slots[index] = Some(Slot {
             record: RelayRecord::new(seq, root, frame),
@@ -140,6 +132,31 @@ impl AuditRelay {
         });
         self.next_seq = next_seq;
         self.outstanding += 1;
+        Ok(())
+    }
+
+    /// Publishes a verifier-retired record. Every check, including receipt
+    /// authentication, completes before cursors move; successful retirement
+    /// leaves no key-bearing or frame evidence in the kernel relay.
+    pub(super) fn publish_retired(
+        &mut self,
+        seq: u64,
+        frame: &[u8],
+        root: [u8; root::ROOT_LEN],
+        mandatory: bool,
+        receipt_tag: [u8; root::ROOT_LEN],
+        context: &CheckpointAuthContext,
+    ) -> Result<(), AuditError> {
+        let next_seq = seq.checked_add(1).ok_or(AuditError::SequenceOverflow)?;
+        self.can_publish(seq, mandatory)?;
+        if context.ack_tag(self.boot, self.generation, seq, root, frame) != receipt_tag {
+            return Err(AuditError::RootMismatch);
+        }
+
+        // Buffered -> in-flight -> acknowledged is atomic here. The net state
+        // advances the record window while retaining no redeliverable copy.
+        self.next_seq = next_seq;
+        self.oldest_seq = next_seq;
         Ok(())
     }
 
@@ -182,7 +199,7 @@ impl AuditRelay {
         seq: u64,
         folded_root: [u8; root::ROOT_LEN],
         receipt_tag: [u8; root::ROOT_LEN],
-        context: CheckpointAuthContext,
+        context: &CheckpointAuthContext,
     ) -> Result<(), AuditError> {
         if self.outstanding == 0 || seq != self.oldest_seq {
             return Err(AuditError::RelayStaleCursor);
@@ -198,13 +215,12 @@ impl AuditRelay {
         if slot.record.root() != folded_root {
             return Err(AuditError::RootMismatch);
         }
-        if root::ack_tag(
+        if context.ack_tag(
             self.boot,
             self.generation,
             slot.record.seq(),
             slot.record.root(),
             slot.record.frame(),
-            &context,
         ) != receipt_tag
         {
             return Err(AuditError::RootMismatch);
@@ -222,7 +238,7 @@ impl AuditRelay {
         &mut self,
         current_root: [u8; root::ROOT_LEN],
         current_seq: u64,
-        context: CheckpointAuthContext,
+        context: &CheckpointAuthContext,
     ) -> Result<AuditCheckpoint, AuditError> {
         let next_seq = current_seq
             .checked_add(1)
@@ -245,7 +261,7 @@ impl AuditRelay {
         &self,
         current_root: [u8; root::ROOT_LEN],
         current_seq: u64,
-        context: CheckpointAuthContext,
+        context: &CheckpointAuthContext,
     ) -> AuditCheckpoint {
         AuditCheckpoint::seal(
             self.boot,

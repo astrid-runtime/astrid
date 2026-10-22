@@ -86,7 +86,12 @@ const CANCEL_TAIL_EVENTS: &[&str] = &[
 ];
 const IPC_PARK_EVENT: &str = "ipc.park";
 const IPC_SERVER_RESUME_TAIL_EVENTS: &[&str] = &["ipc.wake", "ipc.resume", "ipc.op", "ipc.park"];
-const IPC_PARK_TAIL_EVENTS: &[&str] = &["relations.projection", "ipc.op", "ipc.park"];
+const IPC_PARK_TAIL_EVENTS: &[&str] = &[
+    "relations.projection",
+    "audit.observed",
+    "ipc.op",
+    "ipc.park",
+];
 const IPC_CLIENT_RESUME_TAIL_EVENTS: &[&str] = &[
     "ipc.wake",
     "ipc.resume",
@@ -105,12 +110,14 @@ const IPC_FAULT_CLIENT_TAIL_EVENTS: &[&str] = &[
     "domain.restore",
     "domain.reclaim",
 ];
-const IPC_CANCEL_GUEST_OPS: &[&str] = &["relations.projection", "ipc.op", "ipc.op"];
+const IPC_CANCEL_GUEST_OPS: &[&str] =
+    &["relations.projection", "audit.observed", "ipc.op", "ipc.op"];
 const IPC_CLIENT_OPS: &[&str] = &[
     "ipc.op",
     "ipc.op",
     "ipc.op",
     "relations.projection",
+    "audit.observed",
     "ipc.op",
     "ipc.op",
     "ipc.op",
@@ -163,6 +170,7 @@ pub(super) fn full_sequence() -> Vec<SequenceStep> {
         SequenceStep::Many(BOOT_MILESTONE_EVENTS),
         SequenceStep::Repeated("apic.timer.tick", 8),
         SequenceStep::One("entropy.seeded"),
+        SequenceStep::One("audit.boot"),
         SequenceStep::One("fault"),
         SequenceStep::Pass(REQUIRED_PASSES[0]),
         SequenceStep::One("fault"),

@@ -11,5 +11,8 @@ bench = false
 
 [dependencies]
 # Same frozen pure backend as the kernel crates so digests cannot differ by
-# feature selection.
-blake3 = { version = "=1.8.5", default-features = false, features = ["pure"] }
+# feature selection. Zeroize makes anchor and hasher teardown explicit.
+blake3 = { version = "=1.8.5", default-features = false, features = ["pure", "zeroize"] }
+# Bounded native verifier hashing state stays out of the small domain stack.
+spin = "=0.9.9"
+zeroize = { version = "=1.9.0", default-features = false }

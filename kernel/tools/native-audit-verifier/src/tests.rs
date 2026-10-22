@@ -2,6 +2,7 @@
 
 use super::*;
 use blake3::Hasher;
+use std::{vec, vec::Vec};
 
 const BOOT: [u8; 16] = [7; 16];
 
@@ -17,6 +18,10 @@ fn context() -> AuthContext {
     AuthContext::from_trusted_anchor(1, BOOT, trusted_key()).unwrap()
 }
 
+fn genesis_root(boot: [u8; 16]) -> [u8; 32] {
+    RootHasher::new().genesis(boot)
+}
+
 /// Seals a genuine handoff for the test anchor. Only the byte layout is
 /// mirrored from the kernel; the tag comes from this crate's own keyed
 /// implementation, and kernel cross-checks bind the real layout.
@@ -25,7 +30,7 @@ fn handoff() -> [u8; AUTHORITY_HANDOFF_BYTES] {
     bytes[..8].copy_from_slice(b"ASAUDCTX");
     bytes[8..16].copy_from_slice(&1u64.to_le_bytes());
     bytes[16..32].copy_from_slice(&BOOT);
-    let tag = verifier_handoff_tag(BOOT, 1, &trusted_key());
+    let tag = TagHasher::new(BOOT, &trusted_key()).verifier_handoff_tag(BOOT, 1);
     bytes[32..].copy_from_slice(&tag);
     bytes
 }
@@ -105,12 +110,20 @@ fn expected_root(previous: [u8; 32], seq: u64, frame: &[u8]) -> [u8; 32] {
 
 #[test]
 fn genesis_fold_requires_boot_previous_root_and_source_root() {
-    let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff()).unwrap();
+    let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff())
+        .unwrap()
+        .into_retained_evidence();
     let genesis = verifier.root();
 
     let frame1 = body(BOOT, 1, 1, Object::None, 0, &[], Some(genesis));
     let root1 = expected_root(genesis, 1, &frame1);
-    assert_eq!(verifier.fold(&frame1, root1).unwrap().seq(), 1);
+    assert_eq!(
+        verifier
+            .fold_retained_evidence(&frame1, root1)
+            .unwrap()
+            .seq(),
+        1
+    );
 
     let frame2 = body(
         BOOT,
@@ -122,46 +135,58 @@ fn genesis_fold_requires_boot_previous_root_and_source_root() {
         Some(root1),
     );
     let root2 = expected_root(root1, 2, &frame2);
-    assert_eq!(verifier.fold(&frame2, root2).unwrap().seq(), 2);
+    assert_eq!(
+        verifier
+            .fold_retained_evidence(&frame2, root2)
+            .unwrap()
+            .seq(),
+        2
+    );
     assert_eq!(verifier.root(), root2);
 }
 
 #[test]
 fn tamper_without_a_valid_claimed_root_is_invalid() {
-    let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff()).unwrap();
+    let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff())
+        .unwrap()
+        .into_retained_evidence();
     let frame = body(BOOT, 1, 1, Object::None, 0, &[], Some(verifier.root()));
     assert_eq!(
-        verifier.fold(&frame, [0; 32]),
+        verifier.fold_retained_evidence(&frame, [0; 32]),
         Err(FoldFailure::Invalid(InvalidReason::RootMismatch))
     );
 }
 
 #[test]
 fn cross_boot_and_missing_previous_root_are_invalid() {
-    let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff()).unwrap();
+    let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff())
+        .unwrap()
+        .into_retained_evidence();
     let foreign = body([8; 16], 1, 1, Object::None, 0, &[], Some(verifier.root()));
     let foreign_root = expected_root(verifier.root(), 1, &foreign);
     assert_eq!(
-        verifier.fold(&foreign, foreign_root),
+        verifier.fold_retained_evidence(&foreign, foreign_root),
         Err(FoldFailure::Invalid(InvalidReason::ForeignBoot))
     );
 
     let missing_previous = body(BOOT, 1, 1, Object::None, 0, &[], None);
     let missing_root = expected_root(verifier.root(), 1, &missing_previous);
     assert_eq!(
-        verifier.fold(&missing_previous, missing_root),
+        verifier.fold_retained_evidence(&missing_previous, missing_root),
         Err(FoldFailure::Invalid(InvalidReason::PreviousRootMismatch))
     );
 }
 
 #[test]
 fn explicitly_mismatched_previous_root_is_invalid() {
-    let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff()).unwrap();
+    let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff())
+        .unwrap()
+        .into_retained_evidence();
     let wrong_previous = [0xAA; 32];
     let frame = body(BOOT, 1, 1, Object::None, 0, &[], Some(wrong_previous));
     let claimed = expected_root(wrong_previous, 1, &frame);
     assert_eq!(
-        verifier.fold(&frame, claimed),
+        verifier.fold_retained_evidence(&frame, claimed),
         Err(FoldFailure::Invalid(InvalidReason::PreviousRootMismatch))
     );
     assert_eq!(verifier.next_seq(), 1);
@@ -179,7 +204,9 @@ fn fold_overflow_is_fail_closed_without_state_change() {
         1,
         sealed_tag(BOOT, u64::MAX - 1, checkpoint_root, 1),
     );
-    let mut verifier = AuditVerifier::from_checkpoint(&checkpoint, context(), &handoff()).unwrap();
+    let mut verifier = AuditVerifier::from_checkpoint(&checkpoint, context(), &handoff())
+        .unwrap()
+        .into_retained_evidence();
     let frame = body(
         BOOT,
         u64::MAX,
@@ -192,11 +219,11 @@ fn fold_overflow_is_fail_closed_without_state_change() {
     let claimed = expected_root(checkpoint_root, u64::MAX, &frame);
     let before = (verifier.next_seq(), verifier.root());
     assert_eq!(
-        verifier.fold(&frame, claimed),
+        verifier.fold_retained_evidence(&frame, claimed),
         Err(FoldFailure::SequenceOverflow)
     );
     assert_eq!(
-        verifier.fold(&frame, claimed),
+        verifier.fold_retained_evidence(&frame, claimed),
         Err(FoldFailure::SequenceOverflow)
     );
     assert_eq!((verifier.next_seq(), verifier.root()), before);
@@ -204,26 +231,30 @@ fn fold_overflow_is_fail_closed_without_state_change() {
 
 #[test]
 fn gap_is_incomplete_and_duplicate_is_invalid() {
-    let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff()).unwrap();
+    let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff())
+        .unwrap()
+        .into_retained_evidence();
     let genesis = verifier.root();
     let frame1 = body(BOOT, 1, 1, Object::None, 0, &[], Some(genesis));
     let root1 = expected_root(genesis, 1, &frame1);
     let frame3 = body(BOOT, 3, 3, Object::None, 0, &[], Some(root1));
     let root3 = expected_root(root1, 3, &frame3);
-    verifier.fold(&frame1, root1).unwrap();
+    verifier.fold_retained_evidence(&frame1, root1).unwrap();
     assert_eq!(
-        verifier.fold(&frame3, root3),
+        verifier.fold_retained_evidence(&frame3, root3),
         Err(FoldFailure::Incomplete(IncompleteReason::SequenceGap))
     );
     assert_eq!(
-        verifier.fold(&frame1, root1),
+        verifier.fold_retained_evidence(&frame1, root1),
         Err(FoldFailure::Invalid(InvalidReason::DuplicateOrReorder))
     );
 }
 
 #[test]
 fn denial_must_not_disclose_a_foreign_identity() {
-    let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff()).unwrap();
+    let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff())
+        .unwrap()
+        .into_retained_evidence();
     let mut payload = vec![4, 0];
     payload.extend_from_slice(&[9; 8]);
     let denial = body(
@@ -236,9 +267,15 @@ fn denial_must_not_disclose_a_foreign_identity() {
         Some(verifier.root()),
     );
     let denial_root = expected_root(verifier.root(), 1, &denial);
-    assert!(verifier.fold(&denial, denial_root).is_ok());
+    assert!(
+        verifier
+            .fold_retained_evidence(&denial, denial_root)
+            .is_ok()
+    );
 
-    let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff()).unwrap();
+    let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff())
+        .unwrap()
+        .into_retained_evidence();
     let disclosing = body(
         BOOT,
         1,
@@ -249,7 +286,7 @@ fn denial_must_not_disclose_a_foreign_identity() {
         Some(verifier.root()),
     );
     assert_eq!(
-        verifier.fold(&disclosing, [0; 32]),
+        verifier.fold_retained_evidence(&disclosing, [0; 32]),
         Err(FoldFailure::Invalid(InvalidReason::DenialDisclosure))
     );
 }
@@ -257,16 +294,18 @@ fn denial_must_not_disclose_a_foreign_identity() {
 #[test]
 fn non_canonical_inputs_fail_closed() {
     let valid = body(BOOT, 1, 1, Object::None, 0, &[], Some(genesis_root(BOOT)));
-    let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff()).unwrap();
+    let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff())
+        .unwrap()
+        .into_retained_evidence();
 
     assert!(matches!(
-        verifier.fold(&valid[..valid.len() - 1], [0; 32]),
+        verifier.fold_retained_evidence(&valid[..valid.len() - 1], [0; 32]),
         Err(FoldFailure::Invalid(InvalidReason::Malformed))
     ));
     let mut slack = valid.clone();
     slack.push(0);
     assert!(matches!(
-        verifier.fold(&slack, [0; 32]),
+        verifier.fold_retained_evidence(&slack, [0; 32]),
         Err(FoldFailure::Invalid(InvalidReason::Malformed))
     ));
 
@@ -374,9 +413,11 @@ fn non_canonical_inputs_fail_closed() {
         ),
     ];
     for case in cases {
-        let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff()).unwrap();
+        let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff())
+            .unwrap()
+            .into_retained_evidence();
         assert!(matches!(
-            verifier.fold(&case, [0; 32]),
+            verifier.fold_retained_evidence(&case, [0; 32]),
             Err(FoldFailure::Invalid(InvalidReason::Malformed))
         ));
     }
@@ -384,7 +425,7 @@ fn non_canonical_inputs_fail_closed() {
     let mut bad_version = valid.clone();
     bad_version[4..6].copy_from_slice(&2u16.to_le_bytes());
     assert!(matches!(
-        verifier.fold(&bad_version, [0; 32]),
+        verifier.fold_retained_evidence(&bad_version, [0; 32]),
         Err(FoldFailure::Invalid(InvalidReason::Malformed))
     ));
 }
@@ -411,7 +452,9 @@ fn checkpoint_wire(
 }
 
 fn sealed_tag(boot: [u8; 16], seq: u64, root: [u8; 32], relay_generation: u64) -> [u8; 32] {
-    checkpoint_tag(boot, seq, root, relay_generation, &context())
+    context()
+        .tag_hasher
+        .checkpoint_tag(boot, seq, root, relay_generation, 1)
 }
 
 fn unkeyed_tag(boot: [u8; 16], seq: u64, root: [u8; 32], relay_generation: u64) -> [u8; 32] {
@@ -432,12 +475,14 @@ fn checkpoint_restart_and_mandatory_source_root_match() {
         .unwrap()
         .root();
     let start = checkpoint_wire(BOOT, 0, genesis, 1, sealed_tag(BOOT, 0, genesis, 1));
-    let mut verifier = AuditVerifier::from_checkpoint(&start, context(), &handoff()).unwrap();
+    let mut verifier = AuditVerifier::from_checkpoint(&start, context(), &handoff())
+        .unwrap()
+        .into_retained_evidence();
     assert_eq!(verifier.root(), genesis);
 
     let frame = body(BOOT, 1, 1, Object::None, 0, &[], Some(genesis));
     let root1 = expected_root(genesis, 1, &frame);
-    verifier.fold(&frame, root1).unwrap();
+    verifier.fold_retained_evidence(&frame, root1).unwrap();
 
     let next = checkpoint_wire(BOOT, 1, root1, 1, sealed_tag(BOOT, 1, root1, 1));
     assert_eq!(verifier.accept_checkpoint(&next), Ok(()));
@@ -483,10 +528,12 @@ fn stale_and_future_relay_generations_fail_closed() {
         .unwrap()
         .root();
     let start = checkpoint_wire(BOOT, 0, genesis, 1, sealed_tag(BOOT, 0, genesis, 1));
-    let mut verifier = AuditVerifier::from_checkpoint(&start, context(), &handoff()).unwrap();
+    let mut verifier = AuditVerifier::from_checkpoint(&start, context(), &handoff())
+        .unwrap()
+        .into_retained_evidence();
     let frame = body(BOOT, 1, 1, Object::None, 0, &[], Some(genesis));
     let root1 = expected_root(genesis, 1, &frame);
-    verifier.fold(&frame, root1).unwrap();
+    verifier.fold_retained_evidence(&frame, root1).unwrap();
 
     let resync = checkpoint_wire(BOOT, 1, root1, 2, sealed_tag(BOOT, 1, root1, 2));
     assert_eq!(verifier.accept_resync_checkpoint(&resync), Ok(()));
@@ -546,18 +593,18 @@ fn zero_boot_genesis_is_rejected() {
 
 #[test]
 fn trusted_anchor_rejects_zero_material() {
-    assert_eq!(
+    assert!(matches!(
         AuthContext::from_trusted_anchor(0, BOOT, trusted_key()),
         Err(VerifyFailure::Malformed)
-    );
-    assert_eq!(
+    ));
+    assert!(matches!(
         AuthContext::from_trusted_anchor(1, [0; 16], trusted_key()),
         Err(VerifyFailure::Malformed)
-    );
-    assert_eq!(
+    ));
+    assert!(matches!(
         AuthContext::from_trusted_anchor(1, BOOT, [0; 32]),
         Err(VerifyFailure::Malformed)
-    );
+    ));
 }
 
 #[test]
@@ -569,7 +616,8 @@ fn structurally_valid_self_authenticated_handoff_is_rejected() {
     // Structurally valid: correct magic, the anchored identity, and a tag
     // an attacker computed under a self-chosen key.
     let mut forged = genuine;
-    let attacker_tag = verifier_handoff_tag(BOOT, anchor.authority_id, &[0xB0; 32]);
+    let attacker_tag =
+        TagHasher::new(BOOT, &[0xB0; 32]).verifier_handoff_tag(BOOT, anchor.authority_id);
     forged[32..].copy_from_slice(&attacker_tag);
     assert_eq!(
         anchor.bind_handoff(&forged),
@@ -602,7 +650,9 @@ fn checkpoint_under_forged_context_is_rejected() {
     // Arbitrary attacker-chosen root and sequence sealed under an
     // attacker-chosen key reusing only the public identity fields.
     let forged = AuthContext::from_trusted_anchor(1, BOOT, [0xB0; 32]).unwrap();
-    let tag = checkpoint_tag(BOOT, 999, [0xAA; 32], 1, &forged);
+    let tag = forged
+        .tag_hasher
+        .checkpoint_tag(BOOT, 999, [0xAA; 32], 1, 1);
     let wire = checkpoint_wire(BOOT, 999, [0xAA; 32], 1, tag);
 
     assert_eq!(

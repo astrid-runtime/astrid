@@ -143,6 +143,61 @@ pub fn ev_entropy(seeded: bool) {
     }
 }
 
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+fn encode_hex16(bytes: &[u8; 16]) -> [u8; 32] {
+    let mut output = [0u8; 32];
+    encode_hex(bytes, &mut output);
+    output
+}
+
+fn encode_hex32(bytes: &[u8; 32]) -> [u8; 64] {
+    let mut output = [0u8; 64];
+    encode_hex(bytes, &mut output);
+    output
+}
+
+fn encode_hex(bytes: &[u8], output: &mut [u8]) {
+    assert_eq!(output.len(), bytes.len() * 2, "hex output is sized exactly");
+    for (index, byte) in bytes.iter().enumerate() {
+        output[index * 2] = HEX_DIGITS[usize::from(byte >> 4)];
+        output[(index * 2) + 1] = HEX_DIGITS[usize::from(byte & 0x0f)];
+    }
+}
+
+/// Public boot/authority identity only; key and anchor bytes are never input.
+pub fn ev_audit_boot(boot: &[u8; 16], authority_id: u64) {
+    let boot = encode_hex16(boot);
+    let boot = core::str::from_utf8(&boot).expect("hex digits are ascii");
+    emit(format_args!(
+        "\"ev\":\"audit.boot\",\"boot\":\"{boot}\",\"authority_id\":{authority_id}"
+    ));
+}
+
+pub fn ev_audit_install_failed() {
+    emit(format_args!("\"ev\":\"audit.install.failed\""));
+}
+
+/// Public observation identity and position. `retired` distinguishes a real
+/// verifier fold/ack from a merely rooted event; no key or anchor is emitted.
+pub fn ev_audit_observed(
+    boot: &[u8; 16],
+    authority_id: u64,
+    seq: u64,
+    class: u16,
+    root: &[u8; 32],
+    retired: bool,
+) {
+    let boot = encode_hex16(boot);
+    let boot = core::str::from_utf8(&boot).expect("hex digits are ascii");
+    let root = encode_hex32(root);
+    let root = core::str::from_utf8(&root).expect("hex digits are ascii");
+    emit(format_args!(
+        "\"ev\":\"audit.observed\",\"boot\":\"{boot}\",\"authority_id\":{authority_id},\
+        \"audit_seq\":{seq},\"class\":{class},\"root\":\"{root}\",\"retired\":{retired}"
+    ));
+}
+
 pub fn ev_fault(vector: u8, code: u64, rip: u64) {
     emit(format_args!(
         "\"ev\":\"fault\",\"vector\":{vector},\"code\":{code},\"rip\":\"{rip:#x}\""

@@ -154,7 +154,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     x86_64::instructions::interrupts::disable();
     apic::mask_timer();
 
-    serial::ev_entropy(entropy::seed());
+    let Some(seed) = entropy::provision() else {
+        serial::ev_entropy(false);
+        serial::ev_halt(false);
+        serial::exit_qemu(false);
+    };
+    let audit_identity = match entropy::install(seed) {
+        Ok(identity) => identity,
+        Err(_) => {
+            serial::ev_entropy(true);
+            serial::ev_audit_install_failed();
+            serial::ev_halt(false);
+            serial::exit_qemu(false);
+        },
+    };
+    serial::ev_entropy(true);
+    serial::ev_audit_boot(
+        &audit_identity.boot().bytes(),
+        audit_identity.authority_id(),
+    );
 
     let wx_ok = !rodata_nx_w && !text_w && !data_exec;
     let tests_ok = tests::run_all(data_exec);
