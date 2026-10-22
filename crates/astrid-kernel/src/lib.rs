@@ -41,7 +41,8 @@ mod capsule_materialization;
 mod capsule_removal;
 #[cfg(test)]
 mod capsule_removal_tests;
-/// `astrid.v1.capsules_loaded` payload assembly (opaque per-capsule metadata).
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod capsule_restart;
 mod capsules_loaded;
 #[cfg(test)]
 mod capsules_loaded_tests;
@@ -57,6 +58,9 @@ mod grant_audit;
 /// (`kernel_router::admin`), which is itself native.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod grant_on_use;
+/// Caller-scoped capsule readiness at native ingress.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod ingress_readiness;
 /// Persistent invite-token store (issue #756).
 pub mod invite;
 /// The Management API router listening to the `EventBus`.
@@ -71,6 +75,8 @@ mod kernel_shutdown_tests;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod legacy_migration_barrier;
 mod native_input;
+mod runtime_work;
+mod shutdown;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod user_resources;
 pub use native_input::native_input_device_is_live;
@@ -465,6 +471,8 @@ pub struct Kernel {
     /// cover reads. Tokio's `Mutex` is not poisonable — no
     /// `PoisonError::into_inner` dance required.
     pub(crate) admin_write_lock: Mutex<()>,
+    /// Admission fence for work that must finish before durable stores close.
+    runtime_work: runtime_work::RuntimeWork,
     /// Installs hold an exclusive guard until environment commit or rollback.
     /// Installs and conditional defaults acquire without waiting, so neither
     /// snapshots staged values as committed configuration nor deadlocks activation.
@@ -1477,6 +1485,7 @@ impl Kernel {
             groups,
             astrid_home: home,
             admin_write_lock: Mutex::new(()),
+            runtime_work: runtime_work::RuntimeWork::default(),
             env_install_fence: Arc::new(tokio::sync::RwLock::new(())),
             env_refresh_pending: DashMap::new(),
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -1810,6 +1819,10 @@ impl Kernel {
         dir: PathBuf,
         principal: &PrincipalId,
     ) -> Result<(), anyhow::Error> {
+        let _work = self
+            .runtime_work
+            .admit()
+            .ok_or_else(|| anyhow::anyhow!("runtime is shutting down"))?;
         self.verify_workspace_capsule_tree(&dir)?;
         let manifest_path = dir.join("Capsule.toml");
         let manifest = astrid_capsule::discovery::load_manifest(&manifest_path)
@@ -2218,138 +2231,6 @@ impl Kernel {
         })
     }
 
-    /// Restart the exact runtime generation visible to `principal`. Principal
-    /// failures affect only that immutable UID. A `SystemResident` failure
-    /// rebuilds its explicit singleton and restores its dependent views.
-    ///
-    /// The replacement is activated behind a closed route-admission gate and
-    /// must become ready before it is atomically published. Returns
-    /// [`RestartOutcome::Clean`] when the old runtime was then fully unloaded,
-    /// or [`RestartOutcome::OldInstanceLingering`] when another `Arc` still
-    /// holds its already-cancelled resources.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the capsule has no source directory, cannot be
-    /// unregistered, or fails to reload.
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    async fn restart_capsule(
-        &self,
-        id: &astrid_capsule_types::CapsuleId,
-        principal: &PrincipalId,
-        expected_runtime: Option<&astrid_capsule::registry::RuntimeId>,
-    ) -> Result<RestartOutcome, anyhow::Error> {
-        let (source_dir, current_runtime) = {
-            let registry = self.capsules.read().await;
-            let capsule = registry
-                .get_for(principal, id)
-                .ok_or_else(|| anyhow::anyhow!("capsule '{id}' not found in registry"))?;
-            let runtime_id = registry
-                .runtime_id_for(principal, id)
-                .ok_or_else(|| anyhow::anyhow!("capsule '{id}' not found in registry"))?;
-            if expected_runtime.is_some_and(|expected| expected != &runtime_id) {
-                return Ok(RestartOutcome::Superseded);
-            }
-            let source_dir = capsule
-                .source_dir()
-                .map(std::path::Path::to_path_buf)
-                .ok_or_else(|| anyhow::anyhow!("capsule '{id}' has no source directory"))?;
-            (source_dir, runtime_id)
-        };
-
-        // Prepare and prove a route-gated replacement while the current
-        // generation remains visible and healthy. A preparation or readiness
-        // failure leaves the running view untouched.
-        let mut prepared = self
-            .prepare_runtime_replacement(id, &source_dir, principal, current_runtime.key().scope())
-            .await?;
-
-        let identity = capsule_audit::CapsuleIdentity::of(prepared.capsule.as_ref());
-        let load_guard = self.capsule_load_lock.lock().await;
-        if self.capabilities.is_principal_retiring(principal).await {
-            drop(load_guard);
-            prepared.capsule.retire();
-            prepared.capsule.request_cancel();
-            if let Err(cleanup) = prepared.capsule.unload().await {
-                tracing::warn!(capsule_id = %id, %cleanup, "Failed to unload replacement rejected by principal retirement");
-            }
-            anyhow::bail!("cannot replace capsule '{id}' for retiring principal '{principal}'");
-        }
-        let (mut previous, replacement) = {
-            let mut registry = self.capsules.write().await;
-            if registry.runtime_id_for(principal, id).as_ref() != Some(&current_runtime) {
-                drop(registry);
-                drop(load_guard);
-                prepared.capsule.request_cancel();
-                prepared.capsule.unload().await?;
-                return Ok(RestartOutcome::Superseded);
-            }
-            if prepared.system_runtime
-                && let Err(error) = registry.validate_system_runtime_replacement(
-                    &current_runtime,
-                    prepared.capsule.as_ref(),
-                    &prepared.runtime_id,
-                )
-            {
-                drop(registry);
-                drop(load_guard);
-                prepared.capsule.retire();
-                prepared.capsule.request_cancel();
-                if let Err(cleanup) = prepared.capsule.unload().await {
-                    tracing::warn!(capsule_id = %id, %cleanup, "Failed to unload rejected replacement publication");
-                }
-                return Err(anyhow::anyhow!(error));
-            }
-            let replaced = if prepared.system_runtime {
-                registry.replace_system_runtime_reserved(
-                    &current_runtime,
-                    prepared.capsule,
-                    prepared.runtime_id,
-                )?
-            } else {
-                registry.replace_principal_runtime_reserved(
-                    &current_runtime,
-                    prepared.capsule,
-                    prepared.runtime_id,
-                    principal,
-                    prepared
-                        .principal_uid
-                        .expect("principal replacement resolved durable uid"),
-                )?
-            };
-            let replacement = registry
-                .get_for(principal, id)
-                .expect("replacement generation was atomically published");
-
-            // Close the old generation before publishing the candidate's
-            // already-ready routes. Dispatcher lookups already resolve the new
-            // view, so no interval admits fresh work to both generations.
-            replaced.previous.retire();
-            replaced.previous.request_cancel();
-            for viewer in registry.principals_viewing_runtime(&replaced.runtime_id) {
-                replacement.resume_for(&viewer);
-            }
-            replacement.publish();
-            (replaced.previous, replacement)
-        };
-        drop(load_guard);
-        capsule_audit::record_capsule_loaded(self, principal, identity, "replace").await;
-
-        let outcome = unload_replaced_runtime(id, &mut previous).await;
-        if let Err(error) = replacement
-            .invoke_interceptor("handle_lifecycle_restart", &[], None)
-            .await
-        {
-            tracing::debug!(
-                capsule_id = %id,
-                error = %error,
-                "Capsule does not handle lifecycle restart (optional)"
-            );
-        }
-
-        Ok(outcome)
-    }
-
     /// Auto-discover and load the default principal's boot-critical view.
     ///
     /// Daemon readiness depends on the default view because it owns system
@@ -2371,6 +2252,9 @@ impl Kernel {
     pub fn schedule_profile_principal_warm(self: &Arc<Self>) {
         let kernel = Arc::clone(self);
         astrid_runtime::spawn(async move {
+            let Some(_work) = kernel.runtime_work.admit() else {
+                return;
+            };
             let principals: Vec<_> = kernel
                 .enumerate_profile_principals()
                 .into_iter()
@@ -2378,11 +2262,17 @@ impl Kernel {
                 .collect();
 
             for principal in &principals {
+                if *kernel.shutdown_tx.borrow() {
+                    return;
+                }
                 kernel.ensure_principal_uplinks_loaded(principal).await;
                 kernel.publish_capsules_loaded_for(principal).await;
             }
 
             for principal in principals {
+                if *kernel.shutdown_tx.borrow() {
+                    return;
+                }
                 if principal != PrincipalId::default() {
                     kernel.ensure_principal_loaded(&principal).await;
                     kernel.publish_capsules_loaded_for(&principal).await;
@@ -2436,6 +2326,9 @@ impl Kernel {
     /// Build or refresh one principal's capsule view from its own install set.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub async fn ensure_principal_loaded(&self, principal: &PrincipalId) {
+        let Some(_work) = self.runtime_work.admit() else {
+            return;
+        };
         if *principal != PrincipalId::default() {
             // The retirement fence is authoritative while deletion retains the
             // profile long enough for quota-aware state reclamation. Check it
@@ -2556,6 +2449,9 @@ impl Kernel {
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     async fn ensure_principal_uplinks_loaded(&self, principal: &PrincipalId) {
+        let Some(_work) = self.runtime_work.admit() else {
+            return;
+        };
         if *principal != PrincipalId::default()
             && self.capabilities.is_principal_retiring(principal).await
         {
@@ -3452,156 +3348,6 @@ impl Kernel {
             .collect()
     }
 
-    /// Gracefully shut down the kernel.
-    ///
-    /// 1. Publish `KernelShutdown` event on the bus.
-    /// 2. Drain and unload all capsules (stops MCP child processes, WASM engines).
-    /// 3. Flush and close the persistent KV store.
-    /// 4. Remove the Unix socket file.
-    pub async fn shutdown(&self, reason: Option<String>) {
-        tracing::info!(reason = ?reason, "Kernel shutting down");
-
-        // 1. Notify all subscribers so capsules can react.
-        let _ = self
-            .event_bus
-            .publish(astrid_events::AstridEvent::KernelShutdown {
-                metadata: astrid_events::EventMetadata::new("kernel"),
-                reason: reason.clone(),
-            });
-
-        // Clear every principal's session-only state in one sweep. Belt-
-        // and-suspenders for a process that is exiting anyway, but load-
-        // bearing the moment session allowances are ever persisted
-        // (Layer 7) — without this call a persisted-allowance layer would
-        // inherit stale per-session grants from the previous process.
-        self.allowance_store.clear_all_session_allowances();
-        if let Err(e) = self.capabilities.clear_session() {
-            tracing::warn!(error = %e, "failed to clear capability session on shutdown");
-        }
-
-        // 2. Release persistent resources FIRST — BEFORE the best-effort
-        // capsule drain. The audit SurrealKV `LOCK` and principal-store file
-        // handles MUST be freed on the graceful path regardless of how long
-        // the drain takes: each capsule's
-        // unload is bounded (~1s of `Arc::get_mut` retries) but a large fleet
-        // draining sequentially could exceed the OS-thread watchdog's force-exit
-        // grace, and a force-exit with the audit `LOCK` still held is the exact
-        // wedge this whole change closes. Nothing in the drain below reads
-        // KV/audit (WASM unload = cancel/abort/drop; MCP unload = subprocess
-        // disconnect), and `clear_session()` above was the last KV writer, so
-        // closing the stores ahead of the drain is safe and makes the lock
-        // release independent of drain time.
-        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        self.audit_sink.shutdown();
-        // Publish before closing the engine. Daemon-host retirement follows
-        // task teardown; CLI recovery uses that same finalizer after process exit.
-        #[cfg(not(target_family = "wasm"))]
-        if let Some(store) = self.principal_store.as_ref()
-            && let Err(error) = store.publish_runtime_projection(&self.astrid_home)
-        {
-            tracing::error!(
-                error = %format!("{error:#}"),
-                "failed to publish running projection during shutdown"
-            );
-        }
-        if let Err(e) = self.kv.close().await {
-            tracing::warn!(error = %e, "Failed to flush KV store during shutdown");
-        }
-        // Closes through the shared `Arc<AuditLog>` (no `&mut` needed). Without
-        // this the audit lock outlived a terminating daemon — why a wedge forced
-        // a `SIGKILL`, which then raced the next boot on the still-held lock.
-        if let Err(e) = self.audit_log.close().await {
-            tracing::warn!(error = %e, "Failed to close audit log during shutdown");
-        }
-
-        // 3. Drain the registry so the dispatcher cannot hand out new Arc clones,
-        // then unload each capsule CONCURRENTLY. MCP engine unload is critical —
-        // it calls `mcp_client.disconnect()` to gracefully terminate child
-        // processes; without explicit unload they orphan. `drain()` returns one
-        // Arc per DISTINCT runtime (views are cleared first), so no two unload
-        // tasks contend on the same runtime's `Arc::get_mut`. Concurrency bounds
-        // the whole drain to ~one retry budget instead of N×, keeping the
-        // graceful path well under the watchdog grace so even a large fleet's
-        // subprocesses are actually disconnected rather than force-exited
-        // mid-drain (which would re-introduce the orphan class).
-        //
-        // The `EventDispatcher` temporarily clones `Arc<dyn Capsule>` into
-        // spawned interceptor tasks. After draining, no new clones can be
-        // created, but in-flight tasks may still hold one; each unload task
-        // `request_cancel`s to unblock them, then retries `Arc::get_mut` with
-        // brief yields.
-        let capsules = {
-            let mut reg = self.capsules.write().await;
-            reg.drain()
-        };
-        let mut drain_set = tokio::task::JoinSet::new();
-        for mut arc in capsules {
-            drain_set.spawn(async move {
-                let id = arc.id().clone();
-                let mut unloaded = false;
-
-                arc.request_cancel();
-                for retry in 0..20_u32 {
-                    if let Some(capsule) = Arc::get_mut(&mut arc) {
-                        if let Err(e) = capsule.unload().await {
-                            tracing::warn!(
-                                capsule_id = %id,
-                                error = %e,
-                                "Failed to unload capsule during shutdown"
-                            );
-                        }
-                        unloaded = true;
-                        break;
-                    }
-                    if retry < 19 {
-                        astrid_runtime::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-                }
-
-                if !unloaded {
-                    tracing::warn!(
-                        capsule_id = %id,
-                        strong_count = Arc::strong_count(&arc),
-                        "Dropping capsule without explicit unload after retries exhausted; \
-                         MCP child processes may be orphaned"
-                    );
-                }
-            });
-        }
-        // Await every unload task. A task that panicked or was cancelled would
-        // otherwise be swallowed silently, leaving its capsule un-unloaded (and
-        // its MCP subprocess possibly orphaned) with no diagnostic — so log the
-        // join failure. Shutdown still proceeds: a stuck unload must not block
-        // the graceful path (the OS-thread watchdog is the hard backstop).
-        while let Some(res) = drain_set.join_next().await {
-            if let Err(err) = res {
-                if err.is_panic() {
-                    tracing::error!("A capsule unload task panicked during shutdown");
-                } else {
-                    tracing::error!(error = %err, "A capsule unload task failed to join during shutdown");
-                }
-            }
-        }
-
-        // 4. Remove the socket and token files so stale-socket detection works
-        // on next boot and the auth token doesn't persist on disk after shutdown.
-        // This runs AFTER the capsule drain, which is the correct order: MCP
-        // child processes communicate via stdio pipes (not this Unix socket), so
-        // they are already terminated by step 3. The socket is only used for
-        // CLI-to-kernel IPC. Unix-only: the `socket` module (and the on-disk
-        // socket/PID/readiness files it manages) exist only on that profile.
-        #[cfg(unix)]
-        {
-            let socket_path = crate::socket::kernel_socket_path();
-            let _ = astrid_core::local_transport::remove_endpoint(&socket_path);
-            let _ = std::fs::remove_file(&self.token_path);
-            crate::socket::remove_readiness_file();
-            crate::socket::remove_pid_file();
-        }
-
-        tracing::info!("Kernel shutdown complete");
-    }
-
     /// Wait for a set of capsules to signal readiness, in parallel.
     ///
     /// Collects `Arc<dyn Capsule>` handles under a short-lived read lock,
@@ -3951,6 +3697,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         groups,
         astrid_home: home,
         admin_write_lock: Mutex::new(()),
+        runtime_work: runtime_work::RuntimeWork::default(),
         env_install_fence: Arc::new(tokio::sync::RwLock::new(())),
         env_refresh_pending: DashMap::new(),
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -4834,8 +4581,15 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHand
             RestartTracker,
         > = std::collections::HashMap::new();
 
+        let mut shutdown = kernel.shutdown_tx.subscribe();
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = shutdown.wait_for(|closing| *closing) => break,
+                _ = interval.tick() => {},
+            }
+            let Some(_work) = kernel.runtime_work.admit() else {
+                break;
+            };
             metrics::counter!(METRIC_BACKGROUND_TICKS_TOTAL, "loop" => "capsule_health")
                 .increment(1);
 

@@ -201,6 +201,15 @@ fn validate_timeouts(config: &Config) -> ConfigResult<()> {
         });
     }
 
+    // Keep the native watchdog within the established maximum operator
+    // finalization wait, including on hosts that cannot finish a large pack.
+    if !(1..=crate::client::MAX_DAEMON_SHUTDOWN_TIMEOUT_SECS).contains(&t.daemon_shutdown_secs) {
+        return Err(ConfigError::ValidationError {
+            field: "timeouts.daemon_shutdown_secs".to_owned(),
+            message: "daemon_shutdown_secs must be between 1 and 600 seconds".to_owned(),
+        });
+    }
+
     if t.daemon_ready_secs == 0 {
         return Err(ConfigError::ValidationError {
             field: "timeouts.daemon_ready_secs".to_owned(),
@@ -653,6 +662,20 @@ mod tests {
         let mut config = Config::default();
         config.timeouts.daemon_ready_secs = 0;
         assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn daemon_shutdown_budget_is_bounded() {
+        for seconds in [0, 601, u64::MAX] {
+            let mut config = Config::default();
+            config.timeouts.daemon_shutdown_secs = seconds;
+            assert!(validate(&config).is_err());
+        }
+        for seconds in [1, 60, 600] {
+            let mut config = Config::default();
+            config.timeouts.daemon_shutdown_secs = seconds;
+            validate(&config).unwrap();
+        }
     }
 
     #[test]

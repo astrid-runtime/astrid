@@ -259,6 +259,16 @@ pub fn enforce_restrictions(
         "retry.mcp_max_attempts",
     );
 
+    // A project must not force premature runtime retirement or extend the
+    // host's termination bound. Only the operator owns this watchdog budget.
+    block_workspace_override(
+        merged,
+        baseline,
+        workspace_layer,
+        &["timeouts", "daemon_shutdown_secs"],
+        "timeouts.daemon_shutdown_secs",
+    );
+
     // timeouts.approval_secs: can only decrease.
     clamp_max_int(
         merged,

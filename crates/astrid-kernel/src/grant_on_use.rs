@@ -93,6 +93,7 @@ pub(crate) fn spawn_grant_on_use_handler(kernel: Arc<Kernel>) -> astrid_runtime:
 
     astrid_runtime::spawn(async move {
         let mut pending = HashMap::<String, PendingGrant>::new();
+        let mut shutdown = kernel.shutdown_tx.subscribe();
         loop {
             let until_expiry = pending
                 .values()
@@ -105,6 +106,7 @@ pub(crate) fn spawn_grant_on_use_handler(kernel: Arc<Kernel>) -> astrid_runtime:
                 .unwrap_or(GRANT_RESPONSE_TIMEOUT);
 
             tokio::select! {
+                _ = shutdown.wait_for(|closing| *closing) => break,
                 event = observer.recv() => {
                     let Some(event) = event else {
                         break;
@@ -134,6 +136,9 @@ fn process_event(
     pending: &mut HashMap<String, PendingGrant>,
     event: &AstridEvent,
 ) {
+    let Some(_work) = kernel.runtime_work.admit() else {
+        return;
+    };
     let AstridEvent::Ipc { message, .. } = event else {
         return;
     };
@@ -354,6 +359,10 @@ fn handle_grant_response(
 }
 
 fn expire_pending(kernel: &Kernel, pending: &mut HashMap<String, PendingGrant>) {
+    let Some(_work) = kernel.runtime_work.admit() else {
+        pending.clear();
+        return;
+    };
     let now = astrid_runtime::time::Instant::now();
     pending.retain(|request_id, entry| {
         let keep = entry.deadline > now;
@@ -378,6 +387,9 @@ fn expire_pending(kernel: &Kernel, pending: &mut HashMap<String, PendingGrant>) 
 }
 
 async fn complete_grant(kernel: &Arc<Kernel>, request_id: &str, entry: PendingGrant) {
+    let Some(_work) = kernel.runtime_work.admit() else {
+        return;
+    };
     let applied = grant_capsule(kernel, &entry.principal, &entry.capsule_id).await;
     let granted = applied.is_some();
     // The decision is durable before the result is published, as for other

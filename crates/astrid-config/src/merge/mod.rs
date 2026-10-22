@@ -17,3 +17,6 @@ pub use types::{ConfigLayer, FieldSources};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod shutdown_budget_tests;

@@ -3,9 +3,8 @@
 //! The daemon's async `run()` used to handle SIGTERM/SIGINT/SIGHUP with a
 //! `tokio::select!`, which can only fire when a tokio worker is free to poll
 //! the reactor. Under enough concurrent guest compute every worker is pinned,
-//! so a `SIGTERM` sat unhandled and only `SIGKILL` could stop the daemon —
-//! which then left the audit `LOCK` held until process death and raced the next
-//! boot. (Fix 5 stops exempt run-loops from pinning workers, but a starvation-
+//! so a `SIGTERM` sat unhandled and only `SIGKILL` could stop the daemon,
+//! skipping durable finalization. (Fix 5 stops exempt run-loops from pinning workers, but a starvation-
 //! proof kill path is the defense-in-depth guarantee: the daemon must ALWAYS be
 //! killable, whether the CPU load was a bug or legitimate heavy work.)
 //!
@@ -13,18 +12,10 @@
 //! OS — independent of the tokio runtime. On the first signal it (a) requests a
 //! graceful shutdown via the kernel's `shutdown_tx` watch channel (the async
 //! `run()` selects on it and runs the normal `kernel.shutdown().await`), and
-//! (b) arms a hard deadline on a separate thread: after [`SHUTDOWN_GRACE`], if
+//! (b) arms a hard deadline on a separate thread: after the configured shutdown budget, if
 //! the process is still alive (graceful shutdown wedged), it force-exits so the
 //! OS releases every lock. A SECOND signal before the deadline force-exits
 //! immediately (an impatient operator).
-
-/// Grace period between the first shutdown signal and a forced exit.
-///
-/// Long enough for a healthy graceful shutdown (capsule drain + KV/audit close)
-/// to complete and let the process exit on its own, but bounded so a starved
-/// daemon can never hang indefinitely holding the audit lock.
-#[cfg(unix)]
-pub(crate) const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Force-exit code used when graceful shutdown exceeds the grace deadline.
 #[cfg(unix)]
@@ -67,7 +58,10 @@ pub(crate) const fn signal_decision(is_first: bool) -> SignalDecision {
 /// to the default signal disposition (terminate on SIGTERM) — still killable,
 /// just not graceful — which is logged. Killable-but-abrupt beats wedged.
 #[cfg(unix)]
-pub(crate) fn spawn_signal_watchdog(shutdown_tx: tokio::sync::watch::Sender<bool>) {
+pub(crate) fn spawn_signal_watchdog(
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    grace: std::time::Duration,
+) {
     use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
     use signal_hook::iterator::Signals;
 
@@ -100,7 +94,7 @@ pub(crate) fn spawn_signal_watchdog(shutdown_tx: tokio::sync::watch::Sender<bool
                         // moved past its wait — the deadline below still guards
                         // the exit either way.
                         let _ = shutdown_tx.send(true);
-                        arm_force_exit_deadline();
+                        arm_force_exit_deadline(grace);
                     },
                     SignalDecision::ForceExitNow => {
                         tracing::warn!(
@@ -129,16 +123,16 @@ pub(crate) fn spawn_signal_watchdog(shutdown_tx: tokio::sync::watch::Sender<bool
 /// If graceful shutdown finishes first, `run()` returns and `main` exits the
 /// process normally (exit 0) — this sleeping thread is torn down with it before
 /// it fires. If graceful shutdown wedges (workers starved), this fires after
-/// [`SHUTDOWN_GRACE`] and force-exits so the OS releases every lock (including
+/// the configured shutdown budget and force-exits so the OS releases every lock (including
 /// the audit `LOCK`).
 #[cfg(unix)]
-fn arm_force_exit_deadline() {
+fn arm_force_exit_deadline(grace: std::time::Duration) {
     let spawn_result = std::thread::Builder::new()
         .name("astrid-shutdown-deadline".into())
-        .spawn(|| {
-            std::thread::sleep(SHUTDOWN_GRACE);
+        .spawn(move || {
+            std::thread::sleep(grace);
             tracing::error!(
-                grace_secs = SHUTDOWN_GRACE.as_secs(),
+                grace_secs = grace.as_secs(),
                 "graceful shutdown timed out under load; forcing exit"
             );
             std::process::exit(EXIT_GRACE_TIMEOUT);
@@ -159,6 +153,28 @@ fn arm_force_exit_deadline() {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{SignalDecision, signal_decision};
+
+    #[test]
+    fn hard_deadline_exits_a_process_that_cannot_finish_shutdown() {
+        const CHILD: &str = "ASTRID_TEST_SHUTDOWN_DEADLINE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            super::arm_force_exit_deadline(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            panic!("hard deadline failed to terminate child");
+        }
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("locate watchdog test executable"),
+        )
+        .args([
+            "--exact",
+            "signal::tests::hard_deadline_exits_a_process_that_cannot_finish_shutdown",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .status()
+        .expect("run watchdog child process");
+        assert_eq!(status.code(), Some(super::EXIT_GRACE_TIMEOUT));
+    }
 
     #[test]
     fn first_signal_starts_graceful_and_arms_deadline() {
