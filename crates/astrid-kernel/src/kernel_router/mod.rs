@@ -50,6 +50,8 @@ use visibility::CapsuleVisibility;
 #[cfg(test)]
 mod capability_catalog_tests;
 #[cfg(test)]
+mod command_observation_tests;
+#[cfg(test)]
 mod connection_tracker_tests;
 #[cfg(test)]
 mod test_util;
@@ -353,6 +355,9 @@ async fn handle_request(
                             .unwrap_or_else(|| "No description".to_string()),
                         provider_capsule: manifest.package.name.clone(),
                         kind: cmd.kind,
+                        caller_max_timeout_secs: Some(
+                            authorization.profile.quotas.max_timeout_secs,
+                        ),
                     });
                 }
             }

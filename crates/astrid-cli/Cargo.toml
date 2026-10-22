@@ -86,6 +86,8 @@ uuid = { workspace = true }
 which = { workspace = true }
 
 [dev-dependencies]
+astrid-uplink = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }
 insta = { workspace = true }
 
 [lints]

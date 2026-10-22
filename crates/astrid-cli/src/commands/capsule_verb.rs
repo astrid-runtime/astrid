@@ -20,7 +20,7 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use uuid::Uuid;
 
 use astrid_core::kernel_api::{CommandInfo, CommandKind};
@@ -29,9 +29,8 @@ use crate::commands::daemon;
 use crate::socket_client::SocketClient;
 use crate::theme::Theme;
 
-/// Wall-clock budget for a capsule to respond on the result topic.
-const RESULT_TIMEOUT_SECS: u64 = 70;
-const RESULT_TIMEOUT: Duration = Duration::from_secs(RESULT_TIMEOUT_SECS);
+/// Delivery allowance beyond the caller policy snapshot; not a settlement guarantee.
+const RESULT_DELIVERY_ALLOWANCE: Duration = Duration::from_secs(10);
 const CAPSULES_LOADED_TOPIC: &str = "astrid.v1.capsules_loaded";
 
 /// Outcome of resolving a verb against the daemon's command registry.
@@ -46,6 +45,8 @@ pub(crate) enum VerbMatch {
         provider: String,
         /// Resolved description (for diagnostics; unused on the happy path).
         description: String,
+        /// Authenticated caller timeout from the kernel registry response.
+        caller_max_timeout_secs: Option<u64>,
     },
     /// No capsule provides this CLI verb.
     None,
@@ -70,6 +71,7 @@ pub(crate) fn match_verb(verb: &str, commands: &[CommandInfo]) -> VerbMatch {
         [only] => VerbMatch::One {
             provider: only.provider_capsule.clone(),
             description: only.description.clone(),
+            caller_max_timeout_secs: only.caller_max_timeout_secs,
         },
         many => VerbMatch::Ambiguous {
             providers: many.iter().map(|c| c.provider_capsule.clone()).collect(),
@@ -98,7 +100,11 @@ pub(crate) async fn run_external(tokens: Vec<String>) -> Result<ExitCode> {
     };
 
     match match_verb(&verb, &commands) {
-        VerbMatch::One { provider, .. } => execute(&provider, &verb, &args).await,
+        VerbMatch::One {
+            provider,
+            caller_max_timeout_secs,
+            ..
+        } => execute(&provider, &verb, &args, caller_max_timeout_secs).await,
         VerbMatch::None => {
             eprintln!(
                 "{}",
@@ -141,10 +147,10 @@ pub(crate) async fn run_explicit(
         },
     };
 
-    let exists = commands
+    let command = commands
         .iter()
-        .any(|c| c.kind == CommandKind::Cli && c.name == verb && c.provider_capsule == provider);
-    if !exists {
+        .find(|c| c.kind == CommandKind::Cli && c.name == verb && c.provider_capsule == provider);
+    let Some(command) = command else {
         eprintln!(
             "{}",
             Theme::error(&format!(
@@ -153,9 +159,9 @@ pub(crate) async fn run_explicit(
         );
         print_available(&commands);
         return Ok(ExitCode::from(1));
-    }
+    };
 
-    execute(&provider, &verb, &args).await
+    execute(&provider, &verb, &args, command.caller_max_timeout_secs).await
 }
 
 /// Ensure the daemon is up, connect, and fetch the CLI command registry.
@@ -202,7 +208,14 @@ async fn resolve_commands() -> Result<Vec<CommandInfo>> {
 }
 
 /// Publish the run request and await + render the result.
-async fn execute(provider: &str, verb: &str, args: &[String]) -> Result<ExitCode> {
+async fn execute(
+    provider: &str,
+    verb: &str,
+    args: &[String],
+    caller_max_timeout_secs: Option<u64>,
+) -> Result<ExitCode> {
+    // Reject malformed metadata before publishing an operation.
+    let result_timeout = command_result_timeout(caller_max_timeout_secs)?;
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
     let source_id = session.0;
     // Bind the connection to the active principal so the capsule verb runs
@@ -230,6 +243,9 @@ async fn execute(provider: &str, verb: &str, args: &[String]) -> Result<ExitCode
     let run_topic = astrid_types::Topic::cli_command_run(provider);
     let result_topic = astrid_types::Topic::cli_command_result(&req_id);
 
+    let deadline = tokio::time::Instant::now()
+        .checked_add(result_timeout)
+        .context("Cannot represent command observation deadline")?;
     let msg = astrid_types::ipc::IpcMessage::new(
         run_topic,
         astrid_types::ipc::IpcPayload::RawJson(body),
@@ -249,7 +265,7 @@ async fn execute(provider: &str, verb: &str, args: &[String]) -> Result<ExitCode
         result_topic.as_str(),
         provider,
         caller.as_str(),
-        RESULT_TIMEOUT,
+        deadline,
     )
     .await
     {
@@ -258,21 +274,32 @@ async fn execute(provider: &str, verb: &str, args: &[String]) -> Result<ExitCode
             eprintln!(
                 "{}",
                 Theme::error(&format!(
-                    "Capsule '{provider}' unloaded before command completed; command cancelled."
+                    "Capsule '{provider}' unloaded before its result arrived (request {req_id}). The command outcome is unknown; inspect its state before retrying."
                 ))
             );
             Ok(ExitCode::from(1))
         },
-        Err(_) => {
+        Err(error) => {
             eprintln!(
                 "{}",
                 Theme::error(&format!(
-                    "Capsule '{provider}' did not respond within {RESULT_TIMEOUT_SECS}s."
+                    "Capsule '{provider}' result was not received (request {req_id}): {error:#}. The command may still be running or may have completed; this client did not request cancellation or retry it. Inspect its state before retrying."
                 ))
             );
             Ok(ExitCode::from(1))
         },
     }
+}
+
+fn command_result_timeout(caller_max_timeout_secs: Option<u64>) -> Result<Duration> {
+    let seconds = caller_max_timeout_secs.unwrap_or(astrid_core::DEFAULT_MAX_TIMEOUT_SECS);
+    anyhow::ensure!(
+        (1..=astrid_core::TIMEOUT_SECS_UPPER_BOUND).contains(&seconds),
+        "Daemon returned an invalid caller invocation timeout"
+    );
+    Duration::from_secs(seconds)
+        .checked_add(RESULT_DELIVERY_ALLOWANCE)
+        .context("Cannot represent command result wait budget")
 }
 
 enum CommandWait {
@@ -285,11 +312,8 @@ async fn wait_for_command_result(
     result_topic: &str,
     provider: &str,
     principal: &str,
-    timeout: Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<CommandWait> {
-    let deadline = tokio::time::Instant::now()
-        .checked_add(timeout)
-        .unwrap_or_else(tokio::time::Instant::now);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -430,211 +454,5 @@ fn print_available(commands: &[CommandInfo]) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn cmd(name: &str, provider: &str, kind: CommandKind) -> CommandInfo {
-        CommandInfo {
-            name: name.to_string(),
-            description: format!("{name} desc"),
-            provider_capsule: provider.to_string(),
-            kind,
-        }
-    }
-
-    #[test]
-    fn match_verb_none_when_no_cli_provider() {
-        let cmds = vec![
-            cmd("deploy", "ops", CommandKind::Slash),
-            cmd("status", "ops", CommandKind::Cli),
-        ];
-        // `deploy` exists only as a slash command → no CLI match.
-        assert_eq!(match_verb("deploy", &cmds), VerbMatch::None);
-        // Entirely unknown verb.
-        assert_eq!(match_verb("nope", &cmds), VerbMatch::None);
-    }
-
-    #[test]
-    fn match_verb_one_when_single_cli_provider() {
-        let cmds = vec![
-            cmd("status", "ops", CommandKind::Cli),
-            cmd("other", "misc", CommandKind::Cli),
-        ];
-        assert_eq!(
-            match_verb("status", &cmds),
-            VerbMatch::One {
-                provider: "ops".to_string(),
-                description: "status desc".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn match_verb_ambiguous_when_multiple_cli_providers() {
-        let cmds = vec![
-            cmd("deploy", "ops", CommandKind::Cli),
-            cmd("deploy", "infra", CommandKind::Cli),
-            // A slash command of the same name must not count.
-            cmd("deploy", "ui", CommandKind::Slash),
-        ];
-        assert_eq!(
-            match_verb("deploy", &cmds),
-            VerbMatch::Ambiguous {
-                providers: vec!["ops".to_string(), "infra".to_string()],
-            }
-        );
-    }
-
-    #[test]
-    fn render_result_handles_valid_and_out_of_range_exit_codes() {
-        // `ExitCode` exposes no inner-value accessor, so these assert the
-        // valid and out-of-range paths execute without panicking (rendering
-        // output to stdout/stderr) and return a process exit code. Out-of-
-        // range codes (negative or > 255) map to failure (1), never to 0 —
-        // a capsule sending garbage must not look like success.
-        let frame = serde_json::json!({
-            "payload": { "req_id": "x", "exit_code": 5, "output": "" }
-        });
-        let _ = render_result("p", &frame);
-
-        let over = serde_json::json!({
-            "payload": { "req_id": "x", "exit_code": 99999, "output": "hi" }
-        });
-        let _ = render_result("p", &over);
-
-        let negative = serde_json::json!({
-            "payload": { "req_id": "x", "exit_code": -1, "output": "" }
-        });
-        let _ = render_result("p", &negative);
-    }
-
-    #[test]
-    fn render_result_handles_malformed_payloads() {
-        // Missing exit_code and missing payload both take the error-exit
-        // path; ensure neither panics.
-        let no_code = serde_json::json!({ "payload": { "output": "hi" } });
-        let _ = render_result("p", &no_code);
-
-        let no_payload = serde_json::json!({ "topic": "x" });
-        let _ = render_result("p", &no_payload);
-    }
-
-    #[test]
-    fn capsules_loaded_missing_provider_detects_unload() {
-        let raw = serde_json::json!({
-            "topic": "astrid.v1.capsules_loaded",
-            "payload": {
-                "status": "ready",
-                "capsules": [
-                    { "name": "astrid-capsule-session", "meta": null }
-                ]
-            }
-        });
-        assert!(capsules_loaded_missing_provider(
-            &raw,
-            "astrid-capsule-adversarial",
-            "alice"
-        ));
-        assert!(!capsules_loaded_missing_provider(
-            &raw,
-            "astrid-capsule-session",
-            "alice"
-        ));
-    }
-
-    #[test]
-    fn capsules_loaded_missing_provider_accepts_wrapped_raw_json() {
-        let raw = serde_json::json!({
-            "topic": "astrid.v1.capsules_loaded",
-            "payload": {
-                "type": "raw_json",
-                "value": {
-                    "status": "ready",
-                    "capsules": []
-                }
-            }
-        });
-        assert!(capsules_loaded_missing_provider(&raw, "provider", "alice"));
-    }
-
-    #[test]
-    fn capsules_loaded_missing_provider_ignores_unparseable_payload() {
-        let raw = serde_json::json!({
-            "topic": "astrid.v1.capsules_loaded",
-            "payload": { "status": "ready" }
-        });
-        assert!(!capsules_loaded_missing_provider(&raw, "provider", "alice"));
-    }
-
-    #[test]
-    fn capsules_loaded_missing_provider_filters_by_principal() {
-        let raw = serde_json::json!({
-            "topic": "astrid.v1.capsules_loaded",
-            "payload": {
-                "status": "ready",
-                "capsules": [
-                    {
-                        "principal": "bob",
-                        "name": "astrid-capsule-adversarial",
-                        "meta": null
-                    }
-                ]
-            }
-        });
-
-        assert!(
-            capsules_loaded_missing_provider(&raw, "astrid-capsule-adversarial", "alice"),
-            "alice's command should cancel when only bob still has the provider loaded"
-        );
-        assert!(
-            !capsules_loaded_missing_provider(&raw, "astrid-capsule-adversarial", "bob"),
-            "bob's command should not cancel while bob's provider remains loaded"
-        );
-    }
-
-    #[test]
-    fn capsules_loaded_missing_provider_ignores_other_frame_principal() {
-        let raw = serde_json::json!({
-            "topic": "astrid.v1.capsules_loaded",
-            "principal": "bob",
-            "payload": {
-                "status": "ready",
-                "capsules": []
-            }
-        });
-
-        assert!(
-            !capsules_loaded_missing_provider(&raw, "astrid-capsule-adversarial", "alice"),
-            "alice must not cancel on another principal's capsules_loaded frame"
-        );
-    }
-
-    #[test]
-    fn capsules_loaded_missing_provider_detects_current_principal_entry() {
-        let raw = serde_json::json!({
-            "topic": "astrid.v1.capsules_loaded",
-            "principal": "alice",
-            "payload": {
-                "status": "ready",
-                "capsules": [
-                    {
-                        "principal": "alice",
-                        "name": "astrid-capsule-adversarial",
-                        "meta": null
-                    },
-                    {
-                        "principal": "bob",
-                        "name": "astrid-capsule-session",
-                        "meta": null
-                    }
-                ]
-            }
-        });
-
-        assert!(!capsules_loaded_missing_provider(
-            &raw,
-            "astrid-capsule-adversarial",
-            "alice"
-        ));
-    }
-}
+#[path = "capsule_verb/tests.rs"]
+mod tests;
