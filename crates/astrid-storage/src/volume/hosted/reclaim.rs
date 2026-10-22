@@ -215,7 +215,7 @@ pub(super) fn reclaim_locked(path: &Path, state: &mut ContainerState) -> io::Res
         flush_state: super::FlushState::Required,
         publication_pending: false,
         #[cfg(windows)]
-        restore_pending: false,
+        restore: super::RestoreState::NotRequired,
         regions: BTreeMap::new(),
     };
     rebuilt.file.write_all(&VOLUME_MAGIC)?;
@@ -278,7 +278,7 @@ pub(super) fn reclaim_locked(path: &Path, state: &mut ContainerState) -> io::Res
 
 pub(super) fn finish_publication(path: &Path, state: &mut ContainerState) -> io::Result<()> {
     #[cfg(windows)]
-    if state.restore_pending {
+    if state.restore == super::RestoreState::Required {
         if super::open::require_current(&state.file, path).is_err() {
             super::open::require_current(&state.file, &previous_path(path))?;
             restore_name(path, state)?;
@@ -287,12 +287,10 @@ pub(super) fn finish_publication(path: &Path, state: &mut ContainerState) -> io:
         if temp_path(path).exists() {
             std::fs::remove_file(temp_path(path))?;
         }
-        state.restore_pending = false;
+        state.restore = super::RestoreState::NotRequired;
     }
     if state.publication_pending {
-        #[cfg(windows)]
-        flush_publication(&state.file)?;
-        sync_parent(path)?;
+        sync_publication(path, &state.file)?;
         #[cfg(windows)]
         if previous_path(path).exists() {
             std::fs::remove_file(previous_path(path))?;
@@ -326,28 +324,34 @@ thread_local! {
     pub(super) static FAIL_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn sync_parent(path: &Path) -> io::Result<()> {
+fn sync_publication(path: &Path, file: &File) -> io::Result<()> {
     #[cfg(test)]
     if FAIL_DIRECTORY_SYNC.with(|fail| fail.replace(false)) {
         return Err(io::Error::other("injected directory flush failure"));
     }
-    #[cfg(unix)]
-    {
-        File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()?;
-    }
     #[cfg(windows)]
     {
-        // Both replacement and artifact promotion use MoveFileExW with
-        // MOVEFILE_WRITE_THROUGH: its documented contract completes the move
-        // on disk before returning. There is no deferred parent flush here.
         let _ = path;
+        flush_publication(file)
     }
-    #[cfg(not(any(unix, windows)))]
-    return Err(io::Error::new(
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        sync_parent(path)
+    }
+}
+
+#[cfg(not(windows))]
+fn sync_parent(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()
+    }
+    #[cfg(not(unix))]
+    Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "volume publication durability is unsupported",
-    ));
-    Ok(())
+    ))
 }
 
 struct RegionReader<'a> {
@@ -403,10 +407,14 @@ fn publish(
         // A failed write-through move may have changed the namespace before
         // reporting its flush error. Only a verified old active inode permits
         // the unchanged-state path; otherwise restoration remains mandatory.
-        state.restore_pending = super::open::require_current(&state.file, destination).is_err();
+        state.restore = if super::open::require_current(&state.file, destination).is_ok() {
+            super::RestoreState::NotRequired
+        } else {
+            super::RestoreState::Required
+        };
         return Err(error);
     }
-    state.restore_pending = true;
+    state.restore = super::RestoreState::Required;
     #[cfg(test)]
     if let Some(hook) = AFTER_DETACH.with(|hook| hook.borrow_mut().take()) {
         hook();
@@ -420,7 +428,7 @@ fn publish(
         }
         return Err(error);
     }
-    state.restore_pending = false;
+    state.restore = super::RestoreState::NotRequired;
     Ok(())
 }
 
