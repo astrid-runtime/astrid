@@ -9,7 +9,7 @@ fn snapshot_count(bytes: &[u8]) -> usize {
         .count()
 }
 
-fn append_legacy_record(
+pub(super) fn append_legacy_record(
     path: &std::path::Path,
     sequence: u64,
     operation: Operation,
