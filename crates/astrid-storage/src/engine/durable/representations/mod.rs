@@ -668,6 +668,9 @@ impl RepresentationStore {
                 self.reverse.entry(object).or_default().push(representation);
             }
         }
+        // These maps came from canonical recovery or checked model mutations.
+        // Reclaim cannot fail on a valid trie. Propagate an invariant failure
+        // rather than hiding corruption, even though authority is now durable.
         self.reclaim_map_history()?;
         Ok(())
     }

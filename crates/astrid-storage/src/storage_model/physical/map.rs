@@ -527,7 +527,11 @@ impl CanonicalPhysicalMap {
         Ok(rebuilt.entry_count)
     }
 
-    /// Recover one active map while retaining historical arena nodes.
+    /// Recover one active map, retaining every node supplied by the caller.
+    ///
+    /// A caller that needs only the active view should supply its reachable
+    /// closure. Historical-model callers may supply a larger arena to keep
+    /// older roots available; this function does not prune that arena.
     ///
     /// # Errors
     ///
