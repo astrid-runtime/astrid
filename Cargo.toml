@@ -204,8 +204,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # changes in minor versions. Cargo.lock is committed, but the patch range also
 # prevents fresh resolution from silently adopting a future incompatible minor.
 # It still admits compatible bug and security fixes.
-rmcp = { version = "~3.2.0", features = ["server", "client", "transport-io", "elicitation", "macros", "request-state", "schemars"] }
-rustyline = { version = "18", features = ["derive"] }
+rmcp = { version = "~3.5.1", features = ["server", "client", "transport-io", "elicitation", "macros", "request-state", "schemars"] }
+rustyline = { version = "19", features = ["derive"] }
 semver = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -214,13 +214,13 @@ sha2 = "0.11"
 # Security-sensitive native verifier for keyless Sigstore bundles. Keep this
 # exact-pinned: it sits on the self-update trust boundary, and its TUF support
 # refreshes the public-good trust root without invoking an external verifier.
-sigstore-verify = { version = "=0.11.0", default-features = false, features = ["rustls", "tuf"] }
+sigstore-verify = { version = "=0.15.0", default-features = false, features = ["rustls", "tuf"] }
 # Asymmetric JWT/JWKS validation for the MCP HTTP OAuth resource server.
 # Application code rejects `alg=none` and HMAC; this crate only verifies
 # asymmetric signatures from a configured JWKS document.
-jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+jsonwebtoken = { version = "11.1", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 subtle = "2"
-surrealkv = "0.21"
+surrealkv = "1.0"
 syn = { version = "~3.0.4", features = ["full", "visit"] }
 syntect = { version = "5", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-fancy"] }
 tar = "0.4"
@@ -260,18 +260,18 @@ url = "2"
 # that pins every router path against the spec. Workspace has no
 # other OpenAPI generator. `axum_extras` plugs into axum's extractor
 # system so `#[utoipa::path]` annotations on handlers carry through.
-utoipa = { version = "5", features = ["axum_extras"] }
-uuid = { version = "~1.25.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
+utoipa = { version = "6", features = ["axum_extras"] }
+uuid = { version = "~1.28.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
 walkdir = "2.5"
-wasm-encoder = "0.257.1"
-wat = "=1.257.1"
-wasmparser = "0.257.1"
+wasm-encoder = "0.262.0"
+wat = "=1.262.0"
+wasmparser = "0.262.0"
 windows-sys = "0.61"
-wit-component = "0.257.1"
-wit-parser = "0.257.1"
-wasmtime = { version = "48.0.6", features = ["component-model", "cranelift", "call-hook"] }
+wit-component = "0.262.0"
+wit-parser = "0.262.0"
+wasmtime = { version = "49.0.3", features = ["component-model", "cranelift", "call-hook"] }
 wasmtime-wasi = "48.0.6"
-unicode-normalization = "=0.1.25"
+unicode-normalization = "=0.1.26"
 unicode-width = "0.2"
 which = "8"
 zeroize = { version = "1.8", features = ["derive"] }
