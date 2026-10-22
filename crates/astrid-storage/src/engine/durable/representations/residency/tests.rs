@@ -66,8 +66,8 @@ fn published_updates_bound_resident_history_and_recover_every_entry() {
         prior_nodes = resident;
         prior_persisted = store.persisted_map_nodes.len();
         for map in [&store.representations, &store.placement_entries] {
-            // Every internal node has at least two children. At most 2n-1
-            // nodes are active; the runtime amortizes collection at twice that.
+            // Keep the legacy binary-tree upper bound as a broad guard.
+            // The dense-map test below checks the tighter reachable closure.
             let maximum = map.entry_count().saturating_mul(2).saturating_sub(1) * 2;
             assert!(u64::try_from(map.nodes().len()).unwrap() <= maximum);
         }
@@ -85,4 +85,68 @@ fn published_updates_bound_resident_history_and_recover_every_entry() {
     }
     reopened.checkpoint_volume(&volume, limits).unwrap();
     assert_eq!(reopened.active, active);
+}
+
+#[test]
+fn dense_history_is_bounded_by_measured_reachable_nodes() {
+    let directory = tempfile::tempdir().unwrap();
+    let volume: Arc<dyn AstridVolume> =
+        HostedFileVolume::open(directory.path().join("dense.volume")).unwrap();
+    let limits = super::super::RecoveryLimits::process_addressable();
+    let mut store =
+        RepresentationStore::activate_volume(&volume, limits, ObjectId::new([1; 32]), []).unwrap();
+    let mut objects = Vec::new();
+    for sequence in 0_u64..256 {
+        let bytes = sequence.to_le_bytes();
+        let object = ObjectId::new(*blake3::hash(&bytes).as_bytes());
+        let direct = store
+            .describe_direct(
+                object,
+                &bytes,
+                ArenaLocation {
+                    offset: sequence * 100,
+                    payload_len: 8,
+                    checksum: [3; 32],
+                },
+            )
+            .unwrap();
+        let update = store.append_direct_update(&[direct]).unwrap().unwrap();
+        store.publish_direct_update(update).unwrap();
+        let mut active_nodes = 0;
+        for map in [
+            &store.profiles,
+            &store.representations,
+            &store.placement_entries,
+        ] {
+            let mut active = map.clone();
+            active.reclaim_unreachable_nodes().unwrap();
+            let reachable = active.nodes().len();
+            active_nodes += reachable;
+            assert!(
+                map.nodes().len() <= reachable * 2,
+                "dense map retains more than a closure-sized history allowance"
+            );
+        }
+        if store.persisted_map_nodes.len() > active_nodes * 2 {
+            assert!(
+                store.checkpoint_required(),
+                "physical ID history must not wait for a binary-tree worst-case bound"
+            );
+        }
+        objects.push(object);
+    }
+    assert!(store.checkpoint_required());
+    let active = store.active;
+    let persisted = store.persisted_map_nodes.len();
+    store.checkpoint_volume(&volume, limits).unwrap();
+    assert!(store.persisted_map_nodes.len() < persisted);
+    assert_eq!(store.active, active);
+    drop(store);
+    let reopened = RepresentationStore::open_volume(&volume, limits)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reopened.active, active);
+    for object in objects {
+        assert!(reopened.contains_direct(object));
+    }
 }
