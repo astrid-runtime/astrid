@@ -32,6 +32,9 @@ mod format;
 mod index_validation;
 mod recovery;
 mod residency;
+mod reverse_index;
+
+use reverse_index::{RepresentationIds, ReverseIndex};
 
 use activation::{append_new_reachable_map_nodes, build_initial_state, generation_name};
 use recovery::{
@@ -111,7 +114,7 @@ pub(super) struct RepresentationStore {
     // Memoized durable descendant closures; discarded when the store is reopened.
     complete_map_subtrees: BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     direct_profile: RepresentationProfileId,
-    reverse: BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
+    reverse: ReverseIndex,
 }
 
 pub(super) struct PendingRepresentationUpdate {
@@ -120,7 +123,7 @@ pub(super) struct PendingRepresentationUpdate {
     catalogue: RepresentationCatalogueRoot,
     placements: PlacementSet,
     reverse_additions: Vec<(ObjectId, RepresentationRecordId)>,
-    replacement_reverse: Option<BTreeMap<ObjectId, Vec<RepresentationRecordId>>>,
+    replacement_reverse: Option<ReverseIndex>,
 }
 
 struct DirectMapEntry {
@@ -518,7 +521,12 @@ impl RepresentationStore {
         );
         let replacement_reverse = entries
             .into_iter()
-            .map(|entry| (entry.object, vec![entry.representation_id]))
+            .map(|entry| {
+                (
+                    entry.object,
+                    RepresentationIds::single(entry.representation_id),
+                )
+            })
             .collect();
 
         let mut metadata = Vec::new();
@@ -671,7 +679,7 @@ impl RepresentationStore {
             self.reverse = replacement;
         } else {
             for (object, representation) in update.reverse_additions {
-                self.reverse.entry(object).or_default().push(representation);
+                reverse_index::insert(&mut self.reverse, object, representation);
             }
         }
         // These maps came from canonical recovery or checked model mutations.

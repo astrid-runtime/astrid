@@ -7,12 +7,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::SeekFrom;
 
 use super::super::DurableIo;
+use super::reverse_index::{self, ReverseIndex};
 
 use crate::storage_model::{
-    CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapKey, PhysicalMapNode, PlacementEntry,
-    PlacementSet, Recipe, RepresentationCatalogueRoot, RepresentationProfile,
-    RepresentationProfileId, RepresentationRecord, RepresentationRecordId, RepresentationState,
-    RepresentationStateId,
+    CanonicalPhysicalMap, Coverage, PhysicalMapKey, PhysicalMapNode, PlacementEntry, PlacementSet,
+    Recipe, RepresentationCatalogueRoot, RepresentationProfile, RepresentationProfileId,
+    RepresentationRecord, RepresentationState, RepresentationStateId,
 };
 
 use super::super::{FRAME_HEADER_LEN, scan_frames};
@@ -432,7 +432,7 @@ pub(super) fn validate_representations(
     profiles: &CanonicalPhysicalMap,
     representations: &CanonicalPhysicalMap,
     placements: &CanonicalPhysicalMap,
-) -> Result<(BTreeMap<ObjectId, Vec<RepresentationRecordId>>, u64), DurableError> {
+) -> Result<(ReverseIndex, u64), DurableError> {
     let mut placement_by_blob = BTreeMap::new();
     let mut extent_count = 0_u64;
     for (key, bytes) in active_entries(placements)? {
@@ -458,7 +458,7 @@ pub(super) fn validate_representations(
             .ok_or(DurableError::EncodingOverflow)?;
         placement_by_blob.insert(entry.blob(), entry);
     }
-    let mut reverse = BTreeMap::<ObjectId, Vec<RepresentationRecordId>>::new();
+    let mut reverse = ReverseIndex::new();
     for (key, bytes) in active_entries(representations)? {
         let record = RepresentationRecord::decode(bytes)?;
         let id = record.identify(&Blake3PhysicalIdentity)?;
@@ -494,7 +494,7 @@ pub(super) fn validate_representations(
                 "direct representation placement does not match its record",
             ));
         }
-        reverse.entry(object).or_default().push(id);
+        reverse_index::insert(&mut reverse, object, id);
     }
     Ok((reverse, extent_count))
 }
