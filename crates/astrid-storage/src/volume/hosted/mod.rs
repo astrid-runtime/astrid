@@ -64,6 +64,13 @@ enum FlushState {
     Confirmed,
 }
 
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreState {
+    NotRequired,
+    Required,
+}
+
 #[derive(Debug)]
 struct ContainerState {
     file: File,
@@ -80,7 +87,7 @@ struct ContainerState {
     // Publication is acknowledged only after its platform durability barrier.
     publication_pending: bool,
     #[cfg(windows)]
-    restore_pending: bool,
+    restore: RestoreState,
     regions: BTreeMap<VolumeRegion, RegionState>,
 }
 

@@ -198,7 +198,7 @@ fn windows_failed_restore_blocks_flush_until_old_name_is_durable_again() {
     volume.sync().unwrap();
     reclaim::FAIL_PROMOTIONS.with(|fail| *fail.borrow_mut() = [false, true, true, true].into());
     assert!(volume.reclaim().is_err());
-    assert!(volume.state.lock().restore_pending);
+    assert_eq!(volume.state.lock().restore, RestoreState::Required);
     // reclaim has returned and dropped the rebuilt descriptor. The still
     // locked previous inode must fence even this unlocked staging artifact.
     let contender = super::open_tests::try_foreign_open(&path);
@@ -206,9 +206,9 @@ fn windows_failed_restore_blocks_flush_until_old_name_is_durable_again() {
     assert!(!path.exists());
     volume.write_region_at(&region, 0, b"after!").unwrap();
     assert!(volume.sync().is_err());
-    assert!(volume.state.lock().restore_pending);
+    assert_eq!(volume.state.lock().restore, RestoreState::Required);
     volume.sync().unwrap();
-    assert!(!volume.state.lock().restore_pending);
+    assert_eq!(volume.state.lock().restore, RestoreState::NotRequired);
     assert!(path.exists());
     drop(volume);
     let reopened = HostedFileVolume::open(&path).unwrap();
@@ -235,10 +235,10 @@ fn windows_effective_move_error_adopts_current_inode_and_retries_flush() {
         });
         assert!(volume.reclaim().is_err());
         if failed_move == 0 {
-            assert!(volume.state.lock().restore_pending);
+            assert_eq!(volume.state.lock().restore, RestoreState::Required);
         } else {
             assert!(volume.state.lock().publication_pending);
-            assert!(!volume.state.lock().restore_pending);
+            assert_eq!(volume.state.lock().restore, RestoreState::NotRequired);
             super::open::require_current(&volume.state.lock().file, &path).unwrap();
         }
         let contender = super::open_tests::try_foreign_open(&path);
@@ -247,11 +247,11 @@ fn windows_effective_move_error_adopts_current_inode_and_retries_flush() {
         assert!(volume.sync().is_err());
         {
             let state = volume.state.lock();
-            assert!(state.restore_pending || state.publication_pending);
+            assert!(state.restore == RestoreState::Required || state.publication_pending);
         }
         volume.write_region_at(&region, 0, b"after!").unwrap();
         volume.sync().unwrap();
-        assert!(!volume.state.lock().restore_pending);
+        assert_eq!(volume.state.lock().restore, RestoreState::NotRequired);
         assert!(!volume.state.lock().publication_pending);
         assert!(!reclaim::temp_path(&path).exists());
         assert!(!reclaim::previous_path(&path).exists());
