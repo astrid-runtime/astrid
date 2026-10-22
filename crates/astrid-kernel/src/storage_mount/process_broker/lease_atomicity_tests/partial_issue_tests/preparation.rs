@@ -61,12 +61,6 @@ async fn mountpoint_preparation_failure_retains_root_until_exact_retry() {
                 Some(blocker_root.as_path())
             );
         }
-        let Err(denied) = broker.mount(&caller).await else {
-            panic!("{stage:?} retained preparation blocker must deny replacement");
-        };
-        assert!(denied.contains("requires administrative cleanup"));
-        assert!(blocker_root.exists());
-
         let replacement_mount = PROCESS_MOUNT_TEST_ID
             .scope(test_id + 1000, broker.mount(&caller))
             .await

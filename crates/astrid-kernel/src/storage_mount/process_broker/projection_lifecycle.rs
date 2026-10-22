@@ -423,6 +423,10 @@ pub(crate) async fn revoke_projection_leases(
         );
         return false;
     }
+    // Explicit lease revocation holds this same guard for resource and map
+    // cleanup. Keep projection invalidation in that order too, after listener
+    // drain, so the two paths cannot remove one lease concurrently.
+    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
     // Resource removal and unmap are two phases. A resource fault therefore
     // leaves the complete exact set mapped as the bounded-retry authority.
     for state in &states {
