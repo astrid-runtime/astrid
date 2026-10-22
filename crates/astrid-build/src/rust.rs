@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tracing::{info, warn};
 
+mod component_pins;
 mod config;
+use component_pins::{bind_manifest_to_packaged_wasm, verify_archive_pins};
 use config::EffectiveCargoRustflags;
 use config::{cargo_config_effective_rustflags_for_target, cargo_config_target_and_rustflags};
 #[cfg(test)]
@@ -90,6 +92,10 @@ pub(crate) fn build(dir: &Path, output: Option<&str>) -> Result<()> {
         &asset_refs,
         wit_staging.as_deref(),
     )?;
+    if let Err(error) = verify_archive_pins(&out_file, &toml_content) {
+        let _ = fs::remove_file(&out_file);
+        return Err(error);
+    }
     crate::artifact::sign_archive_with_runtime_key(&out_file)?;
 
     info!("Successfully built Rust capsule: {}", out_file.display());
@@ -683,7 +689,7 @@ fn build_manifest_content(
         create_default_manifest(crate_name, package_version, wasm_name)
     };
 
-    bind_manifest_to_packaged_wasm(&mut toml_doc, &packaged_name)?;
+    bind_manifest_to_packaged_wasm(&mut toml_doc, dir, &packaged_name)?;
 
     if let Some(desc) = &capsule_description
         && let Some(pkg) = toml_doc.get_mut("package")
@@ -699,70 +705,6 @@ fn build_manifest_content(
     }
 
     Ok(toml_doc.to_string())
-}
-
-/// Bind the manifest's single WASM component to the one file the archiver
-/// writes. A hand-authored manifest can retain an old package-name filename
-/// after a `[lib] name = "..."` change; leaving that pointer untouched would
-/// produce an archive whose executable cannot be resolved at install time.
-///
-/// This builder emits exactly one cdylib, so multiple component tables are an
-/// unsafe ambiguity rather than an invitation to discard author-declared
-/// components. All other component fields (id, type, hash, links, and
-/// capabilities) remain untouched. If an author supplied both `file` and the
-/// legacy `entrypoint` alias, fail closed instead of choosing one silently.
-fn bind_manifest_to_packaged_wasm(
-    toml_doc: &mut toml_edit::DocumentMut,
-    packaged_name: &str,
-) -> Result<()> {
-    validate_wasm_output_name(packaged_name.strip_suffix(".wasm").unwrap_or(packaged_name))?;
-
-    let Some(component_item) = toml_doc.get_mut("component") else {
-        let mut component = toml_edit::Table::new();
-        let component_id = packaged_name.strip_suffix(".wasm").unwrap_or(packaged_name);
-        component.insert("id", toml_edit::value(component_id));
-        component.insert("file", toml_edit::value(packaged_name));
-        component.insert("type", toml_edit::value("executable"));
-        let mut components = toml_edit::ArrayOfTables::new();
-        components.push(component);
-        toml_doc.insert("component", toml_edit::Item::ArrayOfTables(components));
-        return Ok(());
-    };
-
-    let Some(components) = component_item.as_array_of_tables_mut() else {
-        bail!("Capsule.toml component must be an array of tables")
-    };
-    if components.len() != 1 {
-        bail!(
-            "Capsule.toml declares {} components, but this build packages exactly one cdylib",
-            components.len()
-        );
-    }
-    let component = components
-        .get_mut(0)
-        .context("Capsule.toml component array unexpectedly empty")?;
-    let has_file = component.get("file").is_some();
-    let has_entrypoint = component.get("entrypoint").is_some();
-    if has_file && has_entrypoint {
-        bail!(
-            "Capsule.toml component declares both `file` and `entrypoint`; refusing an ambiguous executable path"
-        );
-    }
-
-    let key = if has_file {
-        "file"
-    } else if has_entrypoint {
-        "entrypoint"
-    } else {
-        "file"
-    };
-    if let Some(item) = component.get(key)
-        && item.as_str().is_none()
-    {
-        bail!("Capsule.toml component `{key}` must be a string")
-    }
-    component.insert(key, toml_edit::value(packaged_name));
-    Ok(())
 }
 
 /// Resolve the output directory, creating it if necessary.
