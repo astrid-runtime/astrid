@@ -533,6 +533,12 @@ async fn independent_reader_accepts_a_rust_produced_volume() {
         .set("alice:capsule:shell", "cwd", b"/workspace".to_vec())
         .await
         .unwrap();
+    let large = chunker_golden_source(512 * 1024);
+    store
+        .kv()
+        .set("alice:capsule:shell", "large", large.clone())
+        .await
+        .unwrap();
     let owner = StateOwner::Principal(alice_uid);
     let name = ContentName::new("workspace/fastcdc-golden.bin").unwrap();
     store
@@ -545,6 +551,7 @@ async fn independent_reader_accepts_a_rust_produced_volume() {
     let output = std::process::Command::new("python3")
         .arg(&script)
         .arg(home.storage_volume_path())
+        .arg("--payloads")
         .output()
         .unwrap();
     assert!(
@@ -553,12 +560,7 @@ async fn independent_reader_accepts_a_rust_produced_volume() {
         String::from_utf8_lossy(&output.stderr)
     );
     let decoded: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(decoded["roots"][alice.as_str()]["generation"], 1);
-    assert_eq!(decoded["roots"][alice.as_str()]["kv"]["entries"], 1);
-    assert_eq!(
-        decoded["roots"][alice.as_str()]["kv"]["logical_bytes"],
-        b"/workspace".len()
-    );
+    assert_independent_large_kv(&decoded, &alice, &large);
     assert!(
         decoded["roots"][alice.as_str()]["commit"]
             .as_str()
@@ -634,5 +636,21 @@ assert volume_region_name(" Astrid ".encode()) == " Astrid ""#,
         output.status.success(),
         "independent validator failed: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_independent_large_kv(decoded: &serde_json::Value, alice: &str, large: &[u8]) {
+    assert_eq!(decoded["roots"][alice]["generation"], 2);
+    assert_eq!(decoded["roots"][alice]["kv"]["entries"], 2);
+    assert_eq!(
+        decoded["roots"][alice]["kv"]["logical_bytes"],
+        b"/workspace".len().strict_add(large.len())
+    );
+    assert!(
+        decoded["roots"][alice]["kv"]["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["key"] == "large" && entry["value_hex"] == hex::encode(large))
     );
 }
