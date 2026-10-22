@@ -1,6 +1,7 @@
 //! Capsule trait and core types.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -258,7 +259,7 @@ pub trait Capsule: Send + Sync {
 /// everything declared in the `Capsule.toml`.
 pub(crate) struct CompositeCapsule {
     id: CapsuleId,
-    manifest: CapsuleManifest,
+    manifest: Arc<CapsuleManifest>,
     state: CapsuleState,
     engines: Vec<Box<dyn crate::engine::ExecutionEngine>>,
     capsule_dir: Option<PathBuf>,
@@ -267,7 +268,8 @@ pub(crate) struct CompositeCapsule {
 
 impl CompositeCapsule {
     /// Create a new, empty Composite Capsule from a manifest.
-    pub(crate) fn new(manifest: CapsuleManifest) -> CapsuleResult<Self> {
+    pub(crate) fn new(manifest: impl Into<Arc<CapsuleManifest>>) -> CapsuleResult<Self> {
+        let manifest = manifest.into();
         let id = CapsuleId::new(manifest.package.name.clone())?;
         Ok(Self {
             id,
