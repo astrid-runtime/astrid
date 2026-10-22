@@ -35,16 +35,16 @@ def _is_bot(commit: Mapping[str, object]) -> bool:
     return isinstance(author, dict) and str(author.get("login", "")).endswith("[bot]")
 
 
-def check_commits(payload: object) -> list[str]:
+def check_commits(payload: object, *, require_all_contributions: bool = False) -> list[str]:
     errors: list[str] = []
 
     for commit in _flatten_commits(payload):
         sha = str(commit.get("sha", "unknown"))[:12]
         parents = commit.get("parents")
-        if isinstance(parents, list) and len(parents) > 1:
+        if not require_all_contributions and isinstance(parents, list) and len(parents) > 1:
             # Merge commits are transport history, not authored patch commits.
             continue
-        if _is_bot(commit):
+        if not require_all_contributions and _is_bot(commit):
             continue
 
         commit_metadata = commit.get("commit")
@@ -95,13 +95,15 @@ def main() -> int:
                 for sha in sorted(scope.imported):
                     print(f"Already admitted on protected main: {sha}")
             payload = [item for item in commits if item.get("sha") not in scope.imported]
-        errors = check_commits(payload)
+        errors = check_commits(payload, require_all_contributions=(
+            args.event_json is not None and scope.main_sha is not None
+        ))
     except (OSError, json.JSONDecodeError, ValueError) as error:
         print(f"::error::Unable to validate DCO commits: {error}")
         return 1
 
     if errors:
-        print("::error::Every non-bot, non-merge commit must carry a matching DCO sign-off:")
+        print("::error::Every checked contribution must carry a matching DCO sign-off:")
         for error in errors:
             print(f"::error::  {error}")
         return 1

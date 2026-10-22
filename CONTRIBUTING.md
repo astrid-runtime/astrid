@@ -82,9 +82,11 @@ Every non-bot, non-merge commit must include a `Signed-off-by` trailer whose ema
 the commit author. For same-repository integrations into `os/universal`, the trusted
 base checker may exclude commits already reachable from an independently authenticated,
 protected `main` commit. This imports previously admitted history; it does not certify
-or rewrite that history. Every new non-bot, non-merge commit remains subject to the
-matching-author requirement. Fork PRs and PRs targeting other branches keep the full
-commit check. Failure to authenticate main protection or prove ancestry fails the gate.
+or rewrite that history. Every new commit in that OS integration range, including
+bot-attributed and merge commits, must carry a matching-author sign-off. This
+prevents a merge resolution or attributed bot identity from exempting new content.
+Fork PRs and PRs targeting other branches keep the existing full commit check.
+Failure to authenticate main protection or prove ancestry fails the gate.
 
 Add the sign-off with Git's option:
 

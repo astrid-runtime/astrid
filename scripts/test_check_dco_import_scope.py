@@ -180,11 +180,14 @@ class ProtectedMainImportTests(unittest.TestCase):
         result = self.resolve()
         self.assertEqual(result.imported, frozenset([self.main]))
         remaining = [c for c in self.payload if c["sha"] not in result.imported]
-        errors = check_commits(remaining)
-        self.assertEqual(len(errors), 1)
+        errors = check_commits(remaining, require_all_contributions=True)
+        self.assertEqual(len(errors), 2)
         self.assertIn(side[:12], errors[0])
         remaining[0] = self.metadata(side, signed=True)
-        self.assertEqual(check_commits(remaining), [])
+        self.assertIn(merge[:12], check_commits(remaining, require_all_contributions=True)[0])
+        remaining[1] = self.metadata(merge, signed=True)
+        remaining[1]["parents"] = [{}, {}]
+        self.assertEqual(check_commits(remaining, require_all_contributions=True), [])
 
     def test_failed_ancestry_command_is_not_a_negative_proof(self):
         original = scope._git
