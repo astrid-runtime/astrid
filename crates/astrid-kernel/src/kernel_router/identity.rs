@@ -74,9 +74,20 @@ pub(crate) struct AuthorizedRequest {
 }
 
 impl AuthorizedRequest {
-    #[cfg(test)]
     pub(crate) fn principal_uid(&self) -> Option<PrincipalUid> {
         self.identity.as_ref().map(|identity| identity.uid)
+    }
+
+    /// Return the trusted identity only when the request captured one.
+    ///
+    /// Private package authority deliberately has no alias-only fallback.
+    pub(crate) fn authenticated_identity(&self) -> Result<&AuthorizedPrincipal, PermissionError> {
+        self.identity
+            .as_ref()
+            .ok_or_else(|| PermissionError::MissingCapability {
+                principal: self.principal.clone(),
+                required: REQUIRED_PRINCIPAL_IDENTITY.to_owned(),
+            })
     }
 
     pub(crate) fn capability_check(&self) -> CapabilityCheck<'_> {
@@ -221,6 +232,46 @@ pub(crate) async fn pause_authorize_identity_for_test(kernel: &Arc<crate::Kernel
     identity_gate::pause(kernel).await;
     #[cfg(not(test))]
     let _ = kernel;
+}
+
+#[cfg(test)]
+mod private_identity_tests {
+    use super::*;
+
+    #[test]
+    fn alias_without_authenticated_identity_cannot_read_private_packages() {
+        let authorization = AuthorizedRequest {
+            principal: PrincipalId::new("alice").expect("principal"),
+            identity: None,
+            profile: Arc::new(PrincipalProfile::default()),
+            groups: Arc::new(GroupConfig::default()),
+            device_scope: None,
+        };
+        let error = authorization
+            .authenticated_identity()
+            .expect_err("identity-less requests must fail closed");
+        assert!(error.to_string().contains("principal:identity"));
+    }
+
+    #[tokio::test]
+    async fn stale_alias_binding_cannot_confirm_private_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = astrid_core::dirs::AstridHome::from_path(directory.path());
+        let kernel = crate::test_kernel_with_home(home).await;
+        let old = PrincipalId::new("old").expect("principal");
+        let new = PrincipalId::new("new").expect("principal");
+        let uid = PrincipalUid::from_bytes([0x81; 32]);
+        kernel
+            .principal_directory
+            .register(old.clone(), uid)
+            .expect("admit principal");
+        let identity = AuthorizedPrincipal::bind(&kernel, &old).expect("bind current alias");
+        kernel
+            .principal_directory
+            .rename(uid, &old, new)
+            .expect("rename admitted principal");
+        assert!(identity.confirm_live(&kernel).is_err());
+    }
 }
 
 #[cfg(test)]

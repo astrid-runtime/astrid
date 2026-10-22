@@ -45,7 +45,6 @@ use connection_tracker::register_connection_tracker;
 use connection_tracker::{ConnectionSignal, connection_signal};
 use device_scope::resolve_device_scope;
 use inventory::{durable_package_details, visible_inventory_manifests};
-use visibility::CapsuleVisibility;
 
 #[cfg(test)]
 mod capability_catalog_tests;
@@ -184,7 +183,15 @@ async fn handle_request(
     let requested_target = request_target_principal(&req, &caller);
     let required_cap = required_capability(&req, scope);
     let authorization =
-        match authorize_request(kernel, &caller, device_key_id.as_deref(), required_cap) {
+        match inventory_request_identity(kernel, &caller, &req).and_then(|identity| {
+            authorize_request_with_identity(
+                kernel,
+                &caller,
+                device_key_id.as_deref(),
+                required_cap,
+                identity,
+            )
+        }) {
             Ok(authorization) => authorization,
             Err(e) => {
                 warn!(
@@ -331,8 +338,7 @@ async fn handle_request(
             KernelResponse::Error("Approval logic not yet implemented in kernel router".to_string())
         },
         KernelRequest::ListCapsules => {
-            let visibility = CapsuleVisibility::new(&authorization);
-            let list: Vec<_> = visible_inventory_manifests(kernel, &visibility)
+            let list: Vec<_> = visible_inventory_manifests(kernel, &authorization)
                 .await
                 .into_iter()
                 .map(|manifest| manifest.package.name)
@@ -340,9 +346,8 @@ async fn handle_request(
             KernelResponse::Success(serde_json::json!(list))
         },
         KernelRequest::GetCommands => {
-            let visibility = CapsuleVisibility::new(&authorization);
             let mut commands = Vec::new();
-            let manifests = visible_inventory_manifests(kernel, &visibility).await;
+            let manifests = visible_inventory_manifests(kernel, &authorization).await;
             for manifest in &manifests {
                 for cmd in &manifest.commands {
                     commands.push(astrid_events::kernel_api::CommandInfo {
@@ -483,16 +488,11 @@ async fn handle_request(
             KernelResponse::Status(status)
         },
         KernelRequest::GetCapsuleMetadata => {
-            let visibility = CapsuleVisibility::new(&authorization);
-            let manifests = visible_inventory_manifests(kernel, &visibility).await;
-            let registry = kernel.capsules.read().await;
-            let owner_uid = kernel.principal_directory.uid_for(&caller).ok();
+            let manifests = visible_inventory_manifests(kernel, &authorization).await;
+            let owner_uid = authorization.principal_uid();
             let mut entries = Vec::new();
             for manifest in manifests {
-                let source_id =
-                    astrid_capsule::capsule::CapsuleId::new(manifest.package.name.clone())
-                        .ok()
-                        .and_then(|id| registry.source_id_for(&caller, &id));
+                let source_id = None;
                 let env = manifest
                     .env
                     .iter()
@@ -511,7 +511,7 @@ async fn handle_request(
                     })
                     .collect();
                 let (wit_hashes, wasm_hash, update_source) =
-                    durable_package_details(kernel, owner_uid, &manifest.package.name);
+                    durable_package_details(kernel, &authorization, &manifest.package.name);
                 entries.push(astrid_events::kernel_api::CapsuleMetadataEntry {
                     name: manifest.package.name.clone(),
                     capabilities: serde_json::to_value(&manifest.capabilities)
@@ -561,8 +561,7 @@ async fn handle_request(
             KernelResponse::CapsuleMetadata(entries)
         },
         KernelRequest::GetAgentReadiness => {
-            let visibility = CapsuleVisibility::new(&authorization);
-            let manifests = visible_inventory_manifests(kernel, &visibility).await;
+            let manifests = visible_inventory_manifests(kernel, &authorization).await;
             let readiness = astrid_capsule::readiness::agent_loop_readiness(&manifests);
             KernelResponse::AgentReadiness(readiness)
         },
@@ -591,6 +590,22 @@ fn schedule_reload_capsules(kernel: Arc<crate::Kernel>) -> bool {
         kernel.load_all_capsules().await;
     });
     true
+}
+
+/// Bind the immutable UID before policy evaluation on every package discovery
+/// surface. These requests have no alias-only or path-derived fallback.
+fn inventory_request_identity(
+    kernel: &crate::Kernel,
+    caller: &PrincipalId,
+    req: &KernelRequest,
+) -> Result<Option<AuthorizedPrincipal>, astrid_capabilities::PermissionError> {
+    match req {
+        KernelRequest::ListCapsules
+        | KernelRequest::GetCommands
+        | KernelRequest::GetCapsuleMetadata
+        | KernelRequest::GetAgentReadiness => AuthorizedPrincipal::bind(kernel, caller).map(Some),
+        _ => Ok(None),
+    }
 }
 
 fn try_start_full_reload(in_flight: &AtomicBool) -> bool {
