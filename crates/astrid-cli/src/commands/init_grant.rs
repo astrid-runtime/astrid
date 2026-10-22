@@ -177,7 +177,7 @@ where
 /// content: it lives under `run/principals`, which the daemon clears on boot,
 /// and never creates the legacy `home/<principal>/.config` tree.
 pub(super) struct ProvisioningLock {
-    _file: File,
+    file: File,
 }
 
 impl ProvisioningLock {
@@ -206,7 +206,18 @@ impl ProvisioningLock {
         FileExt::try_lock_exclusive(&file).with_context(|| {
             format!("another distro provision is already running for target principal '{target}'")
         })?;
-        Ok(Self { _file: file })
+        Ok(Self { file })
+    }
+}
+
+impl Drop for ProvisioningLock {
+    fn drop(&mut self) {
+        // A concurrent fork may temporarily retain this open description until
+        // exec closes it. Guard ownership ends here, even if that description
+        // has another descriptor; do not let it extend the provisioning lease.
+        if let Err(error) = FileExt::unlock(&self.file) {
+            tracing::warn!(%error, "failed to release provisioning lock explicitly");
+        }
     }
 }
 
@@ -662,6 +673,26 @@ mod tests {
         assert!(err.to_string().contains("already running"), "got: {err:#}");
         drop(first);
         ProvisioningLock::acquire(&home, &target).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_provisioning_guard_releases_inherited_open_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(dir.path());
+        let target = PrincipalId::new("alice").unwrap();
+        let guard = ProvisioningLock::acquire(&home, &target).unwrap();
+        // dup shares the open description, as fork does before exec. Keep it
+        // alive across guard drop so close alone cannot release flock.
+        let inherited = guard.file.try_clone().unwrap();
+        assert!(ProvisioningLock::acquire(&home, &target).is_err());
+        drop(guard);
+        let replacement = ProvisioningLock::acquire(&home, &target).unwrap();
+        // Closing the stale descriptor must not unlock the new description.
+        drop(inherited);
+        assert!(ProvisioningLock::acquire(&home, &target).is_err());
+        drop(replacement);
+        assert!(ProvisioningLock::acquire(&home, &target).is_ok());
     }
 
     #[tokio::test]
