@@ -70,9 +70,32 @@ pub(super) fn recover_container(file: &mut File) -> io::Result<Recovery> {
     recover_from_headers(file)
 }
 
+/// Exact encoded namespace size, without allocating the snapshot. This is
+/// format accounting, shared by the encoder and physical maintenance.
+pub(super) fn snapshot_bytes(regions: &BTreeMap<VolumeRegion, RegionState>) -> io::Result<u64> {
+    regions.iter().try_fold(12_u64, |total, (region, state)| {
+        let name = u64::try_from(region.as_str().len())
+            .map_err(|_| invalid_transition("snapshot region name length overflow"))?;
+        let extents = u64::try_from(state.extents.len())
+            .map_err(|_| invalid_transition("snapshot extent count overflow"))?;
+        total
+            .checked_add(14)
+            .and_then(|value| value.checked_add(name))
+            .and_then(|value| {
+                extents
+                    .checked_mul(24)
+                    .and_then(|bytes| value.checked_add(bytes))
+            })
+            .ok_or_else(|| invalid_transition("commit snapshot size overflow"))
+    })
+}
+
 pub(super) fn encode_region_snapshot(
     regions: &BTreeMap<VolumeRegion, RegionState>,
 ) -> io::Result<Vec<u8>> {
+    if snapshot_bytes(regions)? > MAX_COMMIT_SNAPSHOT_BYTES {
+        return Err(invalid_transition("commit snapshot exceeds format bound"));
+    }
     let region_count = u32::try_from(regions.len())
         .map_err(|_| invalid_transition("too many regions in commit snapshot"))?;
     let mut output = Vec::new();
