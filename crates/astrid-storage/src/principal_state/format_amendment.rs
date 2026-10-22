@@ -478,6 +478,15 @@ pub(super) fn prepare_volume_format_specification(engine: &RuntimeEngine) -> Sto
         },
         _ => DestinationFormat::Current,
     };
+    // Every supported direct profile already declared the catalog grammar.
+    // Verify its bootstrap before admitting any successor format evidence.
+    let catalog = super::bootstrap::content_catalog_format_specification()?;
+    prepare_catalog_specification(
+        engine,
+        DestinationFormat::Current,
+        &catalog,
+        engine.identify(&catalog),
+    )?;
     prepare_format_specification(engine, destination, &current, current_id)
 }
 
@@ -516,7 +525,7 @@ fn ensure_specification(
     {
         Some(actual) if actual == *expected => Ok(()),
         Some(_) => Err(StorageError::Connection(format!(
-            "{description} does not match store.meta"
+            "{description} does not match the registered specification"
         ))),
         None if missing_is_error => Err(StorageError::Connection(format!(
             "completed principal store is missing its {description}"
