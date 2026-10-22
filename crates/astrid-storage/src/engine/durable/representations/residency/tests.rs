@@ -37,6 +37,9 @@ fn published_updates_bound_resident_history_and_recover_every_entry() {
     let mut store =
         RepresentationStore::activate_volume(&volume, limits, ObjectId::new([1; 32]), []).unwrap();
     let mut objects = Vec::new();
+    let mut reclaimed = false;
+    let mut prior_nodes = 0;
+    let mut prior_persisted = store.persisted_map_nodes.len();
     for sequence in 0_u64..4096 {
         let bytes = sequence.to_le_bytes();
         let object = ObjectId::new(*blake3::hash(&bytes).as_bytes());
@@ -53,6 +56,15 @@ fn published_updates_bound_resident_history_and_recover_every_entry() {
             .unwrap();
         let update = store.append_direct_update(&[direct]).unwrap().unwrap();
         store.publish_direct_update(update).unwrap();
+        let resident = store.representations.nodes().len() + store.placement_entries.nodes().len();
+        if resident < prior_nodes {
+            assert!(store.complete_map_subtrees.is_empty());
+            reclaimed = true;
+        }
+        // New path copies must still be persisted after proof-cache eviction.
+        assert!(store.persisted_map_nodes.len() > prior_persisted);
+        prior_nodes = resident;
+        prior_persisted = store.persisted_map_nodes.len();
         for map in [&store.representations, &store.placement_entries] {
             // Every internal node has at least two children. At most 2n-1
             // nodes are active; the runtime amortizes collection at twice that.
@@ -61,6 +73,7 @@ fn published_updates_bound_resident_history_and_recover_every_entry() {
         }
         objects.push(object);
     }
+    assert!(reclaimed, "exercise proof eviction and subsequent writes");
     let active = store.active;
     drop(store);
     let mut reopened = RepresentationStore::open_volume(&volume, limits)
