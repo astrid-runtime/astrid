@@ -40,6 +40,20 @@ class CheckDcoTests(unittest.TestCase):
     def test_bot_commits_are_ignored(self):
         self.assertEqual(check_commits([commit(message="chore: update", login="dependabot[bot]")]), [])
 
+    def test_os_import_policy_requires_signoff_on_new_merge(self):
+        errors = check_commits(
+            [commit(message="Merge main with changed resolution", parents=2)],
+            require_all_contributions=True,
+        )
+        self.assertIn("missing Signed-off-by trailer", errors[0])
+
+    def test_os_import_policy_requires_signoff_on_new_bot_commit(self):
+        errors = check_commits(
+            [commit(message="chore: update", login="dependabot[bot]")],
+            require_all_contributions=True,
+        )
+        self.assertIn("missing Signed-off-by trailer", errors[0])
+
     def test_paginated_payload_can_be_nested(self):
         self.assertEqual(check_commits([[commit()]]), [])
 
