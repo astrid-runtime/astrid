@@ -53,10 +53,11 @@ const POOL_MIN: usize = 8;
 /// per-principal memory ledger.
 const POOL_MAX: usize = 64;
 
-/// Instances kept warm (eagerly built, never evicted) so a burst does not pay
-/// instantiate latency for the first few invocations. The pool grows lazily
-/// above this toward the max and an idle timer reclaims back down to it.
-const WARM_MIN_IDLE: usize = 4;
+/// One eagerly validated Store makes the interceptor immediately callable.
+/// Additional concurrent invocations instantiate lazily up to the pool max;
+/// idle reclamation returns to this lifecycle minimum instead of retaining
+/// speculative copies for every principal. This is not a concurrency limit.
+const WARM_MIN_IDLE: usize = 1;
 
 /// Maximum redirect hops the host follows by default, and the caller ceiling a
 /// per-request `max-redirects` clamps DOWN to. The single source of truth for

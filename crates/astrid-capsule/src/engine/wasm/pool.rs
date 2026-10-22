@@ -803,11 +803,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn checkout_grows_lazily_then_bounds_at_max() {
         let cancel = CancellationToken::new();
-        let pool = empty_pool(4, 2, &cancel).await;
+        let limits = super::super::limits::CapsuleRuntimeLimits::resolve(None, None, Some(4));
+        let min_idle = limits.instance_pool_min_idle();
+        let pool = empty_pool(limits.instance_pool_size, min_idle, &cancel).await;
+        assert_eq!(
+            pool.available.lock().unwrap().len(),
+            1,
+            "an idle principal must not retain speculative Store copies"
+        );
 
-        // First two pop the warm set; the next two force a lazy build.
+        // The first lease is warm; the other three grow without reducing max.
         let c1 = pool.checkout().await.expect("warm 1");
-        let c2 = pool.checkout().await.expect("warm 2");
+        let c2 = pool.checkout().await.expect("lazy grow 2");
         let c3 = pool.checkout().await.expect("lazy grow 3");
         let c4 = pool.checkout().await.expect("lazy grow 4");
 
@@ -826,10 +833,22 @@ mod tests {
             .expect("checkout after return");
 
         drop((c1, c2, c3, c5));
+        let evicted = {
+            let mut available = pool.available.lock().unwrap();
+            assert_eq!(available.len(), 4);
+            drain_excess(&mut available, min_idle)
+        };
+        assert_eq!(evicted.len(), 3);
+        drop(evicted);
+        assert_eq!(pool.available.lock().unwrap().len(), 1);
+        assert!(
+            pool.checkout().await.is_some(),
+            "retained Store remains callable"
+        );
         cancel.cancel();
     }
 
-    /// Regression for #1477: the eager four-instance warm floor is created at
+    /// Regression for #1477: an explicit four-instance warm fixture is created at
     /// epoch zero, then the shared engine advances before a fifth concurrent
     /// lease forces lazy instantiation. The old exempt `u64::MAX` delta wrapped
     /// to an elapsed absolute deadline and trapped during component init.
