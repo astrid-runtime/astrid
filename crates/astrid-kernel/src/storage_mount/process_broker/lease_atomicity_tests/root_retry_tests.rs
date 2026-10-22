@@ -81,15 +81,9 @@ fn spawn_panicking_workers(
     WorkerJobs,
     Vec<Arc<crate::storage_mount::BlockingWorkerTestGate>>,
 ) {
-    let create = |path: &'static str| {
-        astrid_core::storage_filesystem::StorageFilesystemOperationV1::Create {
-            path: path.to_owned(),
-            kind: astrid_core::storage_filesystem::StorageFilesystemEntryKindV1::File,
-        }
-    };
     let mut workers = WorkerJobs::new();
     let mut gates = Vec::new();
-    for (index, mount_id) in projection.component_mount_ids.iter().enumerate() {
+    for mount_id in &projection.component_mount_ids {
         let state = Arc::clone(
             kernel
                 .storage_mounts
@@ -100,11 +94,11 @@ fn spawn_panicking_workers(
         state.set_drain_timeouts_for_test(std::time::Duration::from_millis(80));
         let gate = state.arm_blocking_worker_gate_for_test();
         let kernel = Arc::clone(kernel);
-        let operation = create(match index {
-            0 => "panic-branch.bin",
-            1 => "panic-owner.bin",
-            _ => "panic-shared.bin",
-        });
+        // Stat reaches the worker gate without taking the global namespace
+        // mutation lock, so each component can enter before one is released.
+        let operation = astrid_core::storage_filesystem::StorageFilesystemOperationV1::Stat {
+            path: String::new(),
+        };
         workers.spawn(async move {
             crate::storage_mount::execute_operation_for_test(kernel, state, operation).await
         });
