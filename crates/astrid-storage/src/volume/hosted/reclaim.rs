@@ -247,7 +247,8 @@ pub(super) fn reclaim_locked(path: &Path, state: &mut ContainerState) -> io::Res
     run_test_swap_hook(path);
     // Atomic replacement leaves the old state usable on failure. Both inode
     // handles stay locked through publication; open verifies inode identity after locking
-    // before performing recovery or cleanup. Install state before any fallible operation.
+    // before performing recovery or cleanup. After publication succeeds,
+    // install state before any further fallible operation.
     publish(&temporary, path)?;
     rebuilt.flush_state = super::FlushState::Required;
     rebuilt.publication_pending = true;
