@@ -41,6 +41,28 @@ async fn concurrent_worker_panics_block_cleanup_until_settled_retries() {
         let _ = worker.expect("worker task joined");
     }
 
+    // The held worker's later JoinFailed escalates the earlier TimedOut
+    // observation. That new failure must consume one exact retry before any
+    // replacement is admitted; otherwise a caller could skip its drain fence.
+    let Err(denied) = PROCESS_MOUNT_TEST_ID
+        .scope(650, broker.mount(&caller))
+        .await
+    else {
+        panic!("escalated failure must block its first retry");
+    };
+    assert!(denied.contains("administrative cleanup"), "{denied}");
+    assert!(
+        stale_root.exists(),
+        "failed exact retry must retain the root"
+    );
+    assert!(
+        stale_projection
+            .component_mount_ids
+            .iter()
+            .all(|mount_id| kernel.storage_mounts.contains_key(mount_id)),
+        "failed exact retry must retain every lease"
+    );
+
     let mounts = retry_concurrently(&broker, &caller).await;
     assert_settled_replacement(&kernel, &broker, &stale_projection, &stale_root, &mounts);
     for mount in mounts {
