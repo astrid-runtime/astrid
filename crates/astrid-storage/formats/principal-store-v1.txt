@@ -423,7 +423,8 @@ KvLeaf used as a B+-tree leaf page:
               no value bytes; value_length > 1024
               required Owns reference label:
                   "value/" || u16 entry_index big-endian
-              target is a version-4 Data KvLeaf of value_length bytes
+              target is a version-4 opaque or version-5 chunked Data KvLeaf
+              representing value_length bytes, as defined in section 7.1.2
 
   Only spilled entries have value references. No other references are allowed.
   The three subtree totals equal the decoded entries. Quota bytes are the sum
@@ -501,7 +502,8 @@ NamespaceMap transition:
               u64 value_length, > 1024
               required Owns reference label:
                   "value/" || u32 mutation_index big-endian
-              target is a version-4 Data KvLeaf of value_length bytes
+              target is a version-4 opaque or version-5 chunked Data KvLeaf
+              representing value_length bytes, as defined in section 7.1.2
 
   logical_bytes = visible value-byte total after applying this transition
   references additionally contain at most:
@@ -613,6 +615,48 @@ Commit:
   identity-bearing but non-owning, so default reconstruction does not require
   historical commits.
 
+
+7.1.2 Chunked KV spilled values, record-local format version 5
+
+The production format-4 KV transition and checkpoint grammar additionally
+accepts the following spilled-value record. Principal, checkpoint, page and
+transition envelope versions remain 4. This amendment changes no visible KV
+bytes, logical quota, historical reachability, or root publication semantics.
+
+KvLeaf used as a chunked spilled value:
+
+  kind=5, version=5, class=Data, logical_bytes=0
+  canonical_bytes = LE64 exact logical value length
+  references = exactly Owns label ASCII "content" -> canonical File
+
+This representation is used only for values strictly larger than 262144 bytes,
+the maximum chunk size of the frozen ASTRID_V1 FastCDC content profile. Values
+through 1024 bytes remain inline; larger values through 262144 bytes retain the
+opaque format-4 representation. Existing opaque format-4 values remain valid
+at any length greater than 1024. New writers choose the chunked representation
+above that threshold deterministically.
+
+The owned File and its complete chunk/tree closure use the frozen content-DAG
+format-1 grammar and ASTRID_V1 profile. The File logical length must equal both
+the wrapper length and its enclosing value-slot length. Readers verify the
+profile and declared length before reconstructing, and verify the complete
+canonical content shape and FastCDC boundaries before returning bytes. Other
+wrapper fields, labels, reference kinds, trailing bytes and missing records
+are rejected. No proof cache or trust in an unverified File is implied.
+
+The wrapper and newly needed File/tree/chunk records are admitted in the same
+exact-root transaction as the KV mutation. Existing immutable chunks may be
+reused; root conflict or quota failure cannot publish a partial closure. The
+value-slot length continues to charge the full visible value and key metadata
+under the existing quota rules. Chunk sharing does not reduce logical charges.
+Historical roots, custody evidence and explicit pins retain the same ownership
+closures. This encoding does not authorize historical garbage collection.
+
+The specification identity is amended using the existing crash-safe in-band
+specification and store.meta transition. Older binaries reject the successor
+specification rather than interpreting format-5 values as opaque format-4
+bytes. The Rust PrincipalKvStore format-1 whole-state oracle is unchanged;
+the independent Python reader is extended to verify chunked format-5 values.
 
 7.2 Content DAG, object format version 1
 -----------------------------------------
