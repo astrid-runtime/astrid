@@ -8,10 +8,15 @@ use tracing::{debug, trace, warn};
 
 use astrid_core::PrincipalId;
 
+mod dispatch;
+
+#[cfg(test)]
+use crate::route::MAX_SUBSCRIPTION_BUDGET_BYTES;
+
 use crate::event::AstridEvent;
 use crate::route::{
-    MAX_SUBSCRIPTION_BUDGET_BYTES, PrincipalKey, RouteAdmissionGate, RouteEntry, RouteKey,
-    RoutedEventReceiver, SubscriptionRepAllocator, TopicMatcher,
+    PrincipalKey, RouteAdmissionGate, RouteEntry, RouteKey, RoutedEventReceiver,
+    SubscriptionRepAllocator, TopicMatcher,
 };
 use crate::subscriber::{EventSubscriber, SubscriberRegistry};
 
@@ -380,72 +385,6 @@ impl EventBus {
         self.dispatch_to_routes(&event);
 
         count.saturating_add(unreserved_count)
-    }
-
-    /// Iterate the routes table, fan out matching events into each
-    /// route's per-principal queue. The read-lock is released as soon
-    /// as the matching set is cloned out so a slow per-route push can
-    /// never block a sibling publish or a `subscribe_topic_routed`
-    /// write-lock acquisition.
-    fn dispatch_to_routes(&self, event: &Arc<AstridEvent>) {
-        // Snapshot matching route Arcs under the read lock, then
-        // release the lock before doing any per-route enqueue work.
-        // Without this, a publisher loop would hold the read lock
-        // across every route's lock-and-push, blocking
-        // `subscribe_topic_routed` callers (which need the write lock).
-        let matched: Vec<(RouteKey, Arc<parking_lot::Mutex<RouteEntry>>)> = {
-            let routes = self.routes.read();
-            if routes.is_empty() {
-                return;
-            }
-            routes
-                .iter()
-                .filter_map(|(k, e)| {
-                    let entry = e.lock();
-                    if entry.matcher.matches(event) {
-                        // Hold a shared label snapshot before drop so we
-                        // can release the per-entry lock between the
-                        // matcher check and the actual push (push needs
-                        // its own write lock).
-                        drop(entry);
-                        Some((k.clone(), Arc::clone(e)))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        };
-        if matched.is_empty() {
-            return;
-        }
-
-        let principal: PrincipalKey = match &**event {
-            AstridEvent::Ipc { message, .. } => message.principal.clone(),
-            _ => None,
-        };
-
-        for (_key, entry_arc) in matched {
-            let mut entry = entry_arc.lock();
-            // Self-scope gate: a route scoped to a single principal drops a
-            // foreign-principal event here, skipping BOTH the push and the
-            // wakeup. Without the notify-skip the receiver would be woken to
-            // drain nothing and immediately re-park. Unscoped routes
-            // (`scope == None`) accept every publisher, so this is a pure
-            // no-op for them and the push path is byte-identical to before.
-            if !entry.accepts_event(&principal, event) {
-                continue;
-            }
-            entry.push_with_eviction(
-                Arc::clone(event),
-                principal.clone(),
-                MAX_SUBSCRIPTION_BUDGET_BYTES,
-            );
-            // Capture the notify Arc before drop so we can wake the
-            // receiver without holding the entry lock across the wake.
-            let notify = Arc::clone(&entry.notify);
-            drop(entry);
-            notify.notify_one();
-        }
     }
 
     /// Subscribe to events.
