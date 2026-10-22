@@ -10,6 +10,35 @@ use super::DurableError;
 use super::RepresentationStore;
 use super::format::Blake3PhysicalIdentity;
 
+/// Reachable-node counts measured after recovery, rebuild, or collection.
+/// These disposable baselines schedule work; they confer no authority.
+#[derive(Debug)]
+pub(super) struct MapResidency {
+    profiles: usize,
+    representations: usize,
+    placements: usize,
+}
+
+impl MapResidency {
+    pub(super) fn new(
+        profiles: &CanonicalPhysicalMap,
+        representations: &CanonicalPhysicalMap,
+        placements: &CanonicalPhysicalMap,
+    ) -> Self {
+        Self {
+            profiles: profiles.nodes().len(),
+            representations: representations.nodes().len(),
+            placements: placements.nodes().len(),
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.profiles
+            .saturating_add(self.representations)
+            .saturating_add(self.placements)
+    }
+}
+
 impl RepresentationStore {
     #[cfg(test)]
     pub(in crate::engine::durable) fn persisted_physical_node_count(&self) -> usize {
@@ -17,43 +46,30 @@ impl RepresentationStore {
     }
 
     pub(in crate::engine::durable) fn checkpoint_required(&self) -> bool {
-        // At most 2n-1 nodes are reachable in either canonical construction.
-        // Rewrite only when at least half this conservative bound is history;
-        // work is amortized over path-copy mutations, not scheduled per agent.
-        let active_bound = [
-            &self.profiles,
-            &self.representations,
-            &self.placement_entries,
-        ]
-        .into_iter()
-        .map(|map| map.entry_count().saturating_mul(2).saturating_sub(1))
-        .fold(0_u64, u64::saturating_add);
-        u64::try_from(self.persisted_map_nodes.len()).unwrap_or(u64::MAX)
-            > active_bound.saturating_mul(2)
+        self.persisted_map_nodes.len() > self.residency.total().saturating_mul(2)
     }
 
     pub(super) fn reclaim_map_history(&mut self) -> Result<(), DurableError> {
         let mut reclaimed = false;
-        for map in [
-            &mut self.profiles,
-            &mut self.representations,
-            &mut self.placement_entries,
+        for (map, baseline) in [
+            (&mut self.profiles, &mut self.residency.profiles),
+            (
+                &mut self.representations,
+                &mut self.residency.representations,
+            ),
+            (&mut self.placement_entries, &mut self.residency.placements),
         ] {
-            // Both canonical constructions have at least two children per
-            // internal node, hence at most 2n-1 active nodes for n entries.
-            // Collect at twice that bound: at least half the resident nodes
-            // are then obsolete, amortizing traversal over path-copy writes.
-            // This derives work from live cardinality, not an operator quota.
-            let active_bound = map.entry_count().saturating_mul(2).saturating_sub(1);
-            if u64::try_from(map.nodes().len()).unwrap_or(u64::MAX) > active_bound.saturating_mul(2)
-            {
+            // Use the last measured reachable closure, not the 2n-1 binary
+            // worst case: dense radix pages can hold many entries per node.
+            // Crossing twice this baseline amortizes a traversal over new
+            // path copies or genuine growth; both establish a fresh baseline.
+            if map.nodes().len() > baseline.saturating_mul(2) {
                 map.reclaim_unreachable_nodes()?;
+                *baseline = map.nodes().len();
                 reclaimed = true;
             }
         }
         if reclaimed {
-            // These are disposable traversal proofs. Keeping old proofs after
-            // collecting their nodes would retain the same history as IDs.
             self.complete_map_subtrees.clear();
         }
         Ok(())

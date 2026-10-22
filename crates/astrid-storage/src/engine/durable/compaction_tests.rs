@@ -663,10 +663,17 @@ fn interrupted_representation_rebase_finishes_metadata_reclamation() {
         let (_, update) = transaction("alice", Some(current), &value.to_le_bytes());
         current = engine.commit(update).unwrap().root();
     }
-    let metadata = directory
-        .path()
-        .join("representations/generations/0000000000000001/metadata.arena");
-    let before = std::fs::metadata(metadata).unwrap().len();
+    // Ordinary physical maintenance can already advance the generation.
+    let generations = directory.path().join("representations/generations");
+    let prior_paths = std::fs::read_dir(&generations)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(prior_paths.len(), 1);
+    let prior_generation = prior_paths[0].file_name().unwrap().to_os_string();
+    let before = std::fs::metadata(prior_paths[0].join("metadata.arena"))
+        .unwrap()
+        .len();
     let policy = evidence(b"retain-current-roots");
     let authorization = plan(&engine, retention(&engine, &policy, []), policy);
     drop(engine);
@@ -692,7 +699,7 @@ fn interrupted_representation_rebase_finishes_metadata_reclamation() {
     assert_eq!(paths.len(), 1);
     assert_ne!(
         paths[0].file_name().unwrap(),
-        "0000000000000001",
+        prior_generation,
         "recovery retired compaction intent without checkpointing"
     );
     assert!(

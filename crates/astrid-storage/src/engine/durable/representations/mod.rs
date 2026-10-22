@@ -107,6 +107,7 @@ pub(super) struct RepresentationStore {
     representations: CanonicalPhysicalMap,
     placement_entries: CanonicalPhysicalMap,
     persisted_map_nodes: BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    residency: residency::MapResidency,
     // Memoized durable descendant closures; discarded when the store is reopened.
     complete_map_subtrees: BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     direct_profile: RepresentationProfileId,
@@ -510,6 +511,11 @@ impl RepresentationStore {
             PhysicalMapDomain::Placement,
             placement_entries,
         )?;
+        self.residency = residency::MapResidency::new(
+            &self.profiles,
+            &self.representations,
+            &self.placement_entries,
+        );
         let replacement_reverse = entries
             .into_iter()
             .map(|entry| (entry.object, vec![entry.representation_id]))
@@ -833,6 +839,11 @@ impl RepresentationStore {
             state,
             catalogue,
             placements,
+            residency: residency::MapResidency::new(
+                &profiles,
+                &representations,
+                &placement_entries,
+            ),
             profiles,
             representations,
             placement_entries,
