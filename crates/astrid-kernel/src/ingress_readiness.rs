@@ -21,17 +21,41 @@ impl Kernel {
             move |key| {
                 let kernel = Arc::clone(&active);
                 Box::pin(async move {
-                    if *kernel.shutdown_tx.borrow() {
-                        return false;
-                    }
-                    let Some((principal, _, _)) = Self::split_scoped_topic_probe_key(&key) else {
-                        return false;
-                    };
-                    kernel.ensure_principal_loaded(&principal).await;
-                    kernel.ingress_topic_ready(&key).await
+                    // The socket owns only this wait. A disconnect or turn
+                    // cancellation must not drop a partially loaded capsule.
+                    kernel
+                        .run_owned_readiness(move |kernel| async move {
+                            if *kernel.shutdown_tx.borrow() {
+                                return false;
+                            }
+                            let Some((principal, _, _)) = Self::split_scoped_topic_probe_key(&key)
+                            else {
+                                return false;
+                            };
+                            kernel.ensure_principal_loaded(&principal).await;
+                            kernel.ingress_topic_ready(&key).await
+                        })
+                        .await
                 })
             },
         )
+    }
+
+    /// Own lifecycle admission independently of any socket/HTTP waiter.
+    /// Dropping the join handle leaves the transaction owned by its task.
+    pub(super) async fn run_owned_readiness<F, Fut>(self: Arc<Self>, work: F) -> bool
+    where
+        F: FnOnce(Arc<Self>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = bool> + Send + 'static,
+    {
+        tokio::spawn(async move {
+            let Some(_permit) = self.runtime_work.admit() else {
+                return false;
+            };
+            work(Arc::clone(&self)).await
+        })
+        .await
+        .unwrap_or(false)
     }
 
     async fn ingress_topic_ready(&self, key: &str) -> bool {
@@ -74,3 +98,6 @@ impl Kernel {
         !*self.shutdown_tx.borrow()
     }
 }
+
+#[cfg(test)]
+pub(super) mod tests;

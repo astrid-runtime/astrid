@@ -124,6 +124,7 @@ async fn management_human_reply_and_cancellation_do_not_wait_for_capsules() {
     ensure(Some(&probe), &identity, &cancel).await.unwrap();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn cancellation_drops_pending_readiness_without_publishing_the_prompt() {
     use crate::native::{

@@ -1915,10 +1915,7 @@ impl Kernel {
             .await?;
 
         if let Err(error) = activate_and_wait_ready(&id, capsule.as_mut()).await {
-            capsule.request_cancel();
-            if let Err(cleanup) = capsule.unload().await {
-                tracing::warn!(capsule_id = %id, error = %cleanup, "Failed to unload rejected runtime candidate");
-            }
+            capsule_removal::unload_rejected_runtime(capsule, &id).await;
             return Err(error);
         }
 
@@ -2124,6 +2121,8 @@ impl Kernel {
         #[cfg(test)]
         capsule_adversarial_tests::record_workspace_source(&capsule_name, &ctx.workspace_source);
         capsule.load(&ctx).await?;
+        #[cfg(test)]
+        ingress_readiness::tests::pause_after_load(&capsule_name).await;
         Ok(capsule)
     }
 
@@ -2753,18 +2752,25 @@ impl Kernel {
             move |topic: String| {
                 let kernel = Arc::clone(&warm_kernel);
                 Box::pin(async move {
-                    if let Some(principal) = Self::scoped_probe_principal(&topic) {
-                        kernel.ensure_principal_uplinks_loaded(&principal).await;
-                        kernel.publish_capsules_loaded_for(&principal).await;
-                        if Self::topic_has_subscriber(Arc::clone(&kernel.capsules), topic.clone())
-                            .await
-                        {
-                            return true;
-                        }
-                        kernel.ensure_principal_loaded(&principal).await;
-                        kernel.publish_capsules_loaded_for(&principal).await;
-                    }
-                    Self::topic_has_subscriber(Arc::clone(&kernel.capsules), topic).await
+                    kernel
+                        .run_owned_readiness(move |kernel| async move {
+                            if let Some(principal) = Self::scoped_probe_principal(&topic) {
+                                kernel.ensure_principal_uplinks_loaded(&principal).await;
+                                kernel.publish_capsules_loaded_for(&principal).await;
+                                if Self::topic_has_subscriber(
+                                    Arc::clone(&kernel.capsules),
+                                    topic.clone(),
+                                )
+                                .await
+                                {
+                                    return true;
+                                }
+                                kernel.ensure_principal_loaded(&principal).await;
+                                kernel.publish_capsules_loaded_for(&principal).await;
+                            }
+                            Self::topic_has_subscriber(Arc::clone(&kernel.capsules), topic).await
+                        })
+                        .await
                 })
             },
             move |topic: String| {
