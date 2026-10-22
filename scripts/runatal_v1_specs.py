@@ -3,7 +3,7 @@
 FORMAT_SPECIFICATION = (
     1,
     1,
-    bytes.fromhex("04282fcf272c9024e0f5388d1665f82f3a823ddfea2225ebfa5cd6f36946a2db"),
+    bytes.fromhex("f9b69b9160bd48612d39f7bef3c43e6559b83436a54d23f928a145710fa20b74"),
 )
 CONTENT_CATALOG_SPECIFICATION = (
     1,

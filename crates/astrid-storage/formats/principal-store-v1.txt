@@ -652,11 +652,16 @@ under the existing quota rules. Chunk sharing does not reduce logical charges.
 Historical roots, custody evidence and explicit pins retain the same ownership
 closures. This encoding does not authorize historical garbage collection.
 
-The specification identity is amended using the existing crash-safe in-band
-specification and store.meta transition. Older binaries reject the successor
-specification rather than interpreting format-5 values as opaque format-4
-bytes. The Rust PrincipalKvStore format-1 whole-state oracle is unchanged;
-the independent Python reader is extended to verify chunked format-5 values.
+Directory stores amend the specification identity using the existing crash-safe
+in-band specification and store.meta transition; older binaries reject that
+successor metadata at open. Hosted volumes retain an explicitly compatible
+predecessor direct-canonical profile and durably admit the successor in-band
+specification before enabling new writes. An older volume reader can open that
+retained profile but must reject format-5 values when decoding them; it cannot
+interpret them as opaque format-4 bytes. This amendment does not introduce a
+volume-wide minimum-reader gate. The Rust PrincipalKvStore format-1 whole-state
+oracle is unchanged; the independent Python reader verifies chunked format-5
+values.
 
 7.2 Content DAG, object format version 1
 -----------------------------------------

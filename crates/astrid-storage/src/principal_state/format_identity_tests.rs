@@ -90,7 +90,7 @@ fn format_specification_has_a_tagged_metadata_identity() {
     assert!(record.references().is_empty());
     assert_eq!(
         object_id_hex(id),
-        "04282fcf272c9024e0f5388d1665f82f3a823ddfea2225ebfa5cd6f36946a2db"
+        "f9b69b9160bd48612d39f7bef3c43e6559b83436a54d23f928a145710fa20b74"
     );
     assert_eq!(
         object_id_hex(catalog_id),
@@ -101,7 +101,7 @@ fn format_specification_has_a_tagged_metadata_identity() {
         "format=astrid-principal-store-v1\n\
          identity=blake3-object-identity-v1\n\
          identity-wire=tagged-identity-v1\n\
-         format-spec-object=1:1:32:04282fcf272c9024e0f5388d1665f82f3a823ddfea2225ebfa5cd6f36946a2db\n\
+         format-spec-object=1:1:32:f9b69b9160bd48612d39f7bef3c43e6559b83436a54d23f928a145710fa20b74\n\
          content-catalog-spec-object=1:1:32:8f3999b066b666396259c4a92f9de7c5b8e67df9d38a69fb4fb824968b56ecdb\n\
          representations=authoritative-direct-v1\n\
          principal-codec=state-owner-v2\n\
