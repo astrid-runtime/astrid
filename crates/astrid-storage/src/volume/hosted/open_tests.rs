@@ -14,7 +14,7 @@ fn foreign_process_cannot_open_owned_volume() {
     assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
 }
 
-fn try_foreign_open(path: &std::path::Path) -> Output {
+pub(super) fn try_foreign_open(path: &std::path::Path) -> Output {
     Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -121,10 +121,10 @@ fn first_create_contender_opens_existing_inode_without_modifying_it() {
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("astrid.volume");
     let volume = HostedFileVolume::open(&path).unwrap();
-    let before = std::fs::read(&path).unwrap();
+    let before = super::test_support::read_container(&volume);
     let contender = super::open::open_regular(&path, true).unwrap();
     super::open::require_current(&contender, &path).unwrap();
     assert!(fs2::FileExt::try_lock_exclusive(&contender).is_err());
-    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(super::test_support::read_container(&volume), before);
     drop(volume);
 }
