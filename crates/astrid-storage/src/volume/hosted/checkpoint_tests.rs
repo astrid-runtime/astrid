@@ -400,3 +400,120 @@ fn sparse_tail_rejects_corrupt_write_header_checksum_and_payload() {
         assert!(error.to_string().contains("checksum"), "{error}");
     }
 }
+
+#[test]
+fn fallback_recovery_does_not_clone_all_extents_at_every_commit() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    std::fs::write(&path, VOLUME_MAGIC).unwrap();
+    append_legacy_record(&path, 1, Operation::Create, b"objects", 0, &[]);
+    append_legacy_record(
+        &path,
+        2,
+        Operation::Commit,
+        COMMIT_REGION.as_bytes(),
+        0,
+        &[],
+    );
+    for index in 0..256_u64 {
+        append_legacy_record(
+            &path,
+            3 + 2 * index,
+            Operation::Write,
+            b"objects",
+            index,
+            b"x",
+        );
+        append_legacy_record(
+            &path,
+            4 + 2 * index,
+            Operation::Commit,
+            COMMIT_REGION.as_bytes(),
+            0,
+            &[],
+        );
+    }
+    REGION_STATE_CLONES.with(|count| count.set(0));
+    let mut file = File::open(&path).unwrap();
+    let recovered = recover::recover_container(&mut file).unwrap();
+    assert_eq!(
+        recovered.regions[&VolumeRegion::new("objects").unwrap()].length,
+        256
+    );
+    REGION_STATE_CLONES.with(|count| assert_eq!(count.get(), 0));
+}
+
+#[test]
+fn fallback_recovery_discards_complete_but_uncommitted_namespace_changes() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    std::fs::write(&path, VOLUME_MAGIC).unwrap();
+    append_legacy_record(&path, 1, Operation::Create, b"objects", 0, &[]);
+    append_legacy_record(&path, 2, Operation::Write, b"objects", 0, b"protected");
+    append_legacy_record(
+        &path,
+        3,
+        Operation::Commit,
+        COMMIT_REGION.as_bytes(),
+        0,
+        &[],
+    );
+    append_legacy_record(&path, 4, Operation::Truncate, b"objects", 0, &[]);
+    append_legacy_record(&path, 5, Operation::Create, b"uncommitted", 0, &[]);
+    let mut file = File::open(&path).unwrap();
+    let recovered = recover::recover_container(&mut file).unwrap();
+    let region = &recovered.regions[&VolumeRegion::new("objects").unwrap()];
+    assert_eq!(region.length, 9);
+    assert!(
+        !recovered
+            .regions
+            .contains_key(&VolumeRegion::new("uncommitted").unwrap())
+    );
+    let extent = region.extents.values().next().unwrap();
+    let mut payload = [0; 9];
+    let mut reader = &file;
+    reader
+        .seek(SeekFrom::Start(extent.physical_offset))
+        .unwrap();
+    reader.read_exact(&mut payload).unwrap();
+    assert_eq!(&payload, b"protected");
+}
+
+#[test]
+fn fallback_recovery_preserves_snapshot_rename_before_uncommitted_truncate() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let region = VolumeRegion::new("objects").unwrap();
+    let renamed = VolumeRegion::new("renamed").unwrap();
+    let volume = HostedFileVolume::open(&path).unwrap();
+    volume.create_region(&region, true).unwrap();
+    volume.write_region_at(&region, 0, b"protected").unwrap();
+    volume.rename_region(&region, &renamed).unwrap();
+    volume.sync().unwrap();
+    let (durable, sequence) = {
+        let state = volume.state.lock();
+        assert_ne!(state.last_snapshot_end, 0);
+        (state.durable_len, state.sequence)
+    };
+    drop(volume);
+    OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(durable)
+        .unwrap();
+    append_legacy_record(
+        &path,
+        sequence.strict_add(1),
+        Operation::Truncate,
+        b"renamed",
+        0,
+        &[],
+    );
+    let mut file = File::open(&path).unwrap();
+    let recovered = recover::recover_container(&mut file).unwrap();
+    assert_eq!(recovered.sequence, sequence);
+    assert_eq!(recovered.regions.len(), 1);
+    assert_eq!(recovered.regions[&renamed].length, 9);
+    assert!(!recovered.regions.contains_key(&region));
+}

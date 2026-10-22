@@ -200,7 +200,6 @@ fn recover_from_headers(file: &File) -> io::Result<Recovery> {
     let mut offset = VOLUME_MAGIC.len() as u64;
     let mut sequence = 0_u64;
     let mut regions = BTreeMap::new();
-    let mut committed_regions = BTreeMap::new();
     let mut committed_sequence = 0_u64;
     let mut committed_offset = offset;
     let mut last_commit_offset = 0_u64;
@@ -262,7 +261,6 @@ fn recover_from_headers(file: &File) -> io::Result<Recovery> {
             .checked_add(header.total_len)
             .ok_or_else(|| io::Error::other("volume scan offset overflow"))?;
         if header.operation == Operation::Commit {
-            committed_regions = regions.clone();
             committed_sequence = sequence;
             committed_offset = offset;
             if payload.as_ref().is_some_and(|bytes| !bytes.is_empty()) {
@@ -274,7 +272,14 @@ fn recover_from_headers(file: &File) -> io::Result<Recovery> {
         }
     }
     Ok(Recovery {
-        regions: committed_regions,
+        // A torn/uncommitted tail is uncommon. Replay its validated committed
+        // prefix once rather than cloning the entire extent namespace at each
+        // commit. Both paths retain all framing and transition checks.
+        regions: if offset == committed_offset {
+            regions
+        } else {
+            replay_committed_namespace(file, committed_offset)?
+        },
         sequence: committed_sequence,
         valid_len: committed_offset,
         durable_len: committed_offset,
@@ -282,6 +287,32 @@ fn recover_from_headers(file: &File) -> io::Result<Recovery> {
         last_snapshot_end,
         footer_present: false,
     })
+}
+
+fn replay_committed_namespace(
+    file: &File,
+    committed_end: u64,
+) -> io::Result<BTreeMap<VolumeRegion, RegionState>> {
+    let mut regions = BTreeMap::new();
+    let mut offset = VOLUME_MAGIC.len() as u64;
+    let mut sequence = 0_u64;
+    while offset < committed_end {
+        let header = read_header(file, offset, committed_end)?
+            .ok_or_else(|| invalid_transition("truncated committed volume prefix"))?;
+        if header.sequence != sequence.saturating_add(1) {
+            return Err(invalid_transition("non-contiguous committed volume prefix"));
+        }
+        let payload = read_record_payload(file, &header)?;
+        apply_record(&mut regions, &header, payload.as_deref())?;
+        sequence = header.sequence;
+        offset = offset
+            .checked_add(header.total_len)
+            .ok_or_else(|| invalid_transition("committed volume prefix offset overflow"))?;
+    }
+    if offset != committed_end {
+        return Err(invalid_transition("committed volume prefix overrun"));
+    }
+    Ok(regions)
 }
 
 fn apply_record(
