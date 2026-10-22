@@ -8,10 +8,6 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ## [Unreleased]
 
-### Fixed
-
-- Demand-load the authenticated native caller before capsule request publication, and join lifecycle work and capsule producers before final storage flush. Keep signal-forced termination over durable home packing with an operator-configured shutdown budget. Closes #2196.
-
 ## [2026.10.1] - 2026-10-15
 
 ### Fixed
