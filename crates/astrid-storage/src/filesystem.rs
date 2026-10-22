@@ -6,11 +6,9 @@
 //! implicit. Mutations publish through the same owner-root compare-and-swap as
 //! content and KV state.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::io::Read;
-use std::sync::{Arc, OnceLock};
-
-use parking_lot::Mutex;
+use std::sync::Arc;
 
 use crate::content::{ContentName, PrincipalContentError, PrincipalContentStore};
 use crate::engine::PrincipalProjectionEngine;
@@ -167,19 +165,13 @@ pub enum FilesystemError {
 pub struct AstridFilesystem<P: Ord, E> {
     content: Arc<PrincipalContentStore<P, E>>,
     owner: P,
-    confirmed_directories: OnceLock<Arc<Mutex<HashSet<String>>>>,
 }
 
 impl<P: Clone + Ord, E> Clone for AstridFilesystem<P, E> {
     fn clone(&self) -> Self {
-        let confirmed_directories = OnceLock::new();
-        if let Some(cache) = self.confirmed_directories.get() {
-            let _ = confirmed_directories.set(Arc::clone(cache));
-        }
         Self {
             content: Arc::clone(&self.content),
             owner: self.owner.clone(),
-            confirmed_directories,
         }
     }
 }
@@ -188,11 +180,7 @@ impl<P: Ord, E> AstridFilesystem<P, E> {
     /// Bind a filesystem view to one already-authorized owner.
     #[must_use]
     pub const fn new(content: Arc<PrincipalContentStore<P, E>>, owner: P) -> Self {
-        Self {
-            content,
-            owner,
-            confirmed_directories: OnceLock::new(),
-        }
+        Self { content, owner }
     }
 
     /// Bind the kernel-fixed Fleet shared subtree (`shared/`).
@@ -518,7 +506,6 @@ where
             return Err(FilesystemError::IsDirectory(path.clone()));
         }
         self.content.put(&self.owner, &path.file_name()?, bytes)?;
-        self.remember_directory(&path.parent());
         Ok(())
     }
 
@@ -542,7 +529,6 @@ where
         }
         self.content
             .put_streaming(&self.owner, &path.file_name()?, source)?;
-        self.remember_directory(&path.parent());
         Ok(())
     }
 
@@ -561,7 +547,6 @@ where
         }
         self.content
             .put(&self.owner, &path.directory_marker()?, &[])?;
-        self.remember_directory(path);
         Ok(())
     }
 
@@ -596,7 +581,6 @@ where
                 }
             },
         }
-        self.invalidate_directory_cache();
         Ok(())
     }
 
@@ -693,7 +677,6 @@ where
         {
             return Err(FilesystemError::AlreadyExists(to.clone()));
         }
-        self.invalidate_directory_cache();
         Ok(())
     }
 
@@ -714,17 +697,11 @@ where
         if parent.as_str().is_empty() {
             return Ok(());
         }
-        if self.cached_directory(&parent) {
-            return Ok(());
-        }
         match self.stat(&parent)? {
             FilesystemEntry {
                 kind: FilesystemEntryKind::Directory,
                 ..
-            } => {
-                self.remember_directory(&parent);
-                Ok(())
-            },
+            } => Ok(()),
             _ => Err(FilesystemError::NotDirectory(parent)),
         }
     }
@@ -737,11 +714,11 @@ where
         }
     }
 
+    // Other views and direct content writers can replace this namespace.
+    // An unversioned positive cache can therefore resurrect deleted parents;
+    // resolve against authoritative content instead of retaining path facts.
     fn directory_exists(&self, path: &FilesystemPath) -> Result<bool, FilesystemError> {
         if path.as_str().is_empty() {
-            return Ok(true);
-        }
-        if self.cached_directory(path) {
             return Ok(true);
         }
         if self
@@ -749,37 +726,13 @@ where
             .describe(&self.owner, &path.directory_marker()?)?
             .is_some()
         {
-            self.remember_directory(path);
             return Ok(true);
         }
         let prefix = path.directory_prefix();
         if self.content.prefix_exists(&self.owner, &prefix)? {
-            self.remember_directory(path);
             return Ok(true);
         }
         Ok(false)
-    }
-
-    fn cached_directory(&self, path: &FilesystemPath) -> bool {
-        self.confirmed_directories
-            .get()
-            .is_some_and(|cache| cache.lock().contains(path.as_str()))
-    }
-
-    fn remember_directory(&self, path: &FilesystemPath) {
-        if path.as_str().is_empty() {
-            return;
-        }
-        self.confirmed_directories
-            .get_or_init(|| Arc::new(Mutex::new(HashSet::new())))
-            .lock()
-            .insert(path.as_str().to_owned());
-    }
-
-    fn invalidate_directory_cache(&self) {
-        if let Some(cache) = self.confirmed_directories.get() {
-            cache.lock().clear();
-        }
     }
 }
 
