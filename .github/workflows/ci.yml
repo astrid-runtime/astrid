@@ -386,6 +386,10 @@ jobs:
         shell: pwsh
         run: cargo test --locked --target ${{ matrix.target }} -p astrid-core platform_fs -- --nocapture
 
+      - name: Run hosted volume recovery and publication tests natively
+        shell: pwsh
+        run: cargo test --locked --target ${{ matrix.target }} -p astrid-storage volume::hosted -- --nocapture
+
       - name: Parse the Windows install scripts
         shell: pwsh
         run: |
