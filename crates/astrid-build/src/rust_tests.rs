@@ -1273,5 +1273,177 @@ fn existing_manifest_with_multiple_components_fails_closed() {
 
     let error = build_manifest_content(source.path(), &wasm_path, "capsule", "1.0.0", "capsule")
         .unwrap_err();
-    assert!(error.to_string().contains("exactly one cdylib"));
+    assert!(error.to_string().contains("component id"));
+}
+
+#[test]
+fn packs_one_cdylib_with_pinned_prebuilt_worker_and_assets() {
+    let source = tempfile::tempdir().unwrap();
+    fs::create_dir(source.path().join("assets")).unwrap();
+    let wasm_path = source.path().join("renamed_controller.wasm");
+    fs::write(&wasm_path, b"\0asm\x01\0\0\0").unwrap();
+    let worker = b"prebuilt compute worker";
+    let kernel = b"immutable kernel asset";
+    fs::write(source.path().join("assets/worker.wasm"), worker).unwrap();
+    fs::write(source.path().join("assets/kernel.img"), kernel).unwrap();
+    let worker_hash = blake3::hash(worker).to_hex();
+    let kernel_hash = blake3::hash(kernel).to_hex();
+    fs::write(
+        source.path().join("Capsule.toml"),
+        format!(
+            "[package]\nname = \"realm\"\nversion = \"1.0.0\"\n\n[[component]]\nid = \"controller\"\nfile = \"old_controller.wasm\"\ntype = \"executable\"\n\n[[component]]\nid = \"worker\"\nfile = \"assets/worker.wasm\"\ntype = \"compute-worker\"\nhash = \"blake3:{worker_hash}\"\n\n[[component.asset]]\nid = \"kernel\"\nfile = \"assets/kernel.img\"\nhash = \"blake3:{kernel_hash}\"\n"
+        ),
+    )
+    .unwrap();
+    let manifest = build_manifest_content(
+        source.path(),
+        &wasm_path,
+        "realm",
+        "1.0.0",
+        "renamed_controller",
+    )
+    .unwrap();
+    assert!(manifest.contains("file = \"renamed_controller.wasm\""));
+    assert!(manifest.contains("file = \"assets/worker.wasm\""));
+    assert!(manifest.contains("file = \"assets/kernel.img\""));
+    let archive_path = source.path().join("realm.capsule");
+    let assets = discover_opaque_assets(source.path()).unwrap();
+    let asset_refs = assets.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+    pack_capsule_archive(
+        &archive_path,
+        &manifest,
+        Some(&wasm_path),
+        source.path(),
+        &asset_refs,
+        None,
+    )
+    .unwrap();
+    verify_archive_pins(&archive_path, &manifest).unwrap();
+    let decoder = flate2::read::GzDecoder::new(File::open(&archive_path).unwrap());
+    let mut archive = tar::Archive::new(decoder);
+    let mut observed = std::collections::BTreeMap::new();
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let name = entry.path().unwrap().to_string_lossy().into_owned();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes).unwrap();
+        observed.insert(name, bytes);
+    }
+    assert_eq!(observed["assets/worker.wasm"], worker);
+    assert_eq!(observed["assets/kernel.img"], kernel);
+    assert_eq!(observed["Capsule.toml"], manifest.as_bytes());
+    assert_eq!(observed["renamed_controller.wasm"], b"\0asm\x01\0\0\0");
+
+    // A source file changed after the first check cannot become a signed
+    // package under its old manifest pin.
+    fs::write(source.path().join("assets/worker.wasm"), b"changed").unwrap();
+    let changed_path = source.path().join("changed.capsule");
+    pack_capsule_archive(
+        &changed_path,
+        &manifest,
+        Some(&wasm_path),
+        source.path(),
+        &asset_refs,
+        None,
+    )
+    .unwrap();
+    assert!(
+        verify_archive_pins(&changed_path, &manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("hash mismatch")
+    );
+}
+
+#[test]
+fn rejects_unpinned_or_ambiguous_prebuilt_components() {
+    let source = tempfile::tempdir().unwrap();
+    fs::create_dir(source.path().join("assets")).unwrap();
+    let wasm_path = source.path().join("controller.wasm");
+    fs::write(&wasm_path, b"\0asm\x01\0\0\0").unwrap();
+    fs::write(source.path().join("assets/worker.wasm"), b"worker").unwrap();
+    let pin = blake3::hash(b"worker").to_hex();
+    let base = "[package]\nname = \"realm\"\nversion = \"1.0.0\"\n\n[[component]]\nid = \"controller\"\nfile = \"controller.wasm\"\ntype = \"executable\"\n\n[[component]]\nid = \"worker\"\nfile = \"assets/worker.wasm\"\ntype = \"compute-worker\"\n";
+    let cases = [
+        (String::new(), "require a blake3 hash"),
+        (
+            format!("hash = \"blake3:{}\"\n", blake3::hash(b"tampered").to_hex()),
+            "hash mismatch",
+        ),
+        (
+            format!("hash = \"blake3:{pin}\"\nentrypoint = \"assets/worker.wasm\"\n"),
+            "both `file` and `entrypoint`",
+        ),
+        (
+            format!(
+                "hash = \"blake3:{pin}\"\n[[component.asset]]\nid = \"duplicate\"\nfile = \"assets/worker.wasm\"\nhash = \"blake3:{pin}\"\n"
+            ),
+            "repeats packaged",
+        ),
+        (
+            format!(
+                "hash = \"blake3:{pin}\"\n[[component]]\nid = \"other\"\nfile = \"assets/worker.wasm\"\ntype = \"executable\"\n"
+            ),
+            "exactly one cdylib",
+        ),
+    ];
+    for (suffix, expected) in cases {
+        fs::write(
+            source.path().join("Capsule.toml"),
+            format!("{base}{suffix}"),
+        )
+        .unwrap();
+        let error =
+            build_manifest_content(source.path(), &wasm_path, "realm", "1.0.0", "controller")
+                .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error:#}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_prebuilt_asset_symlink_and_path_escape() {
+    use std::os::unix::fs::symlink;
+    let source = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    fs::create_dir(source.path().join("assets")).unwrap();
+    fs::write(outside.path().join("worker.wasm"), b"worker").unwrap();
+    symlink(
+        outside.path().join("worker.wasm"),
+        source.path().join("assets/worker.wasm"),
+    )
+    .unwrap();
+    let wasm_path = source.path().join("controller.wasm");
+    fs::write(&wasm_path, b"\0asm\x01\0\0\0").unwrap();
+    let pin = blake3::hash(b"worker").to_hex();
+    let manifest = |path: &str| {
+        format!(
+            "[package]\nname = \"realm\"\nversion = \"1.0.0\"\n[[component]]\nid = \"controller\"\nfile = \"controller.wasm\"\n[[component]]\nid = \"worker\"\nfile = \"{path}\"\ntype = \"compute-worker\"\nhash = \"blake3:{pin}\"\n"
+        )
+    };
+    fs::write(
+        source.path().join("Capsule.toml"),
+        manifest("assets/worker.wasm"),
+    )
+    .unwrap();
+    assert!(
+        build_manifest_content(source.path(), &wasm_path, "realm", "1.0.0", "controller")
+            .unwrap_err()
+            .to_string()
+            .contains("symlink")
+    );
+    fs::write(
+        source.path().join("Capsule.toml"),
+        manifest("assets/../outside.wasm"),
+    )
+    .unwrap();
+    assert!(
+        build_manifest_content(source.path(), &wasm_path, "realm", "1.0.0", "controller")
+            .unwrap_err()
+            .to_string()
+            .contains("canonical relative path")
+    );
 }
