@@ -1,5 +1,8 @@
 //! Durable capsule publication binding and canonical projection repair.
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod copied;
+
 use std::path::Path;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::sync::{Arc, Mutex, Weak};
@@ -115,6 +118,18 @@ impl Kernel {
         snapshot: &astrid_storage::CapsulePackageSnapshot,
     ) -> anyhow::Result<()> {
         self.validate_published_cache_path(dir, principal, manifest, snapshot)?;
+        self.verify_materialization_bytes(dir, principal, manifest, snapshot)
+    }
+
+    /// Authenticate a private staging tree without giving its path authority.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn verify_materialization_bytes(
+        &self,
+        dir: &Path,
+        principal: &astrid_core::principal::PrincipalId,
+        manifest: &astrid_capsule_types::manifest::CapsuleManifest,
+        snapshot: &astrid_storage::CapsulePackageSnapshot,
+    ) -> anyhow::Result<()> {
         let uid = self
             .principal_directory
             .uid_for(principal)
@@ -152,16 +167,13 @@ impl Kernel {
         }
         let mut expected_files = verified
             .archive_entries()
-            .map(|(path, bytes)| (path.to_owned(), bytes.to_vec()))
+            .map(|(path, bytes)| (path.to_owned(), bytes))
             .collect::<std::collections::BTreeMap<_, _>>();
-        expected_files.insert(
-            "Capsule.toml".to_owned(),
-            verified.manifest_bytes().to_vec(),
-        );
-        expected_files.insert("meta.json".to_owned(), verified.metadata_bytes().to_vec());
+        expected_files.insert("Capsule.toml".to_owned(), verified.manifest_bytes());
+        expected_files.insert("meta.json".to_owned(), verified.metadata_bytes());
         expected_files.insert(
             "authority.json".to_owned(),
-            verified.snapshot().package().authority.clone(),
+            verified.snapshot().package().authority.as_slice(),
         );
         let actual = Self::inventory_projection_files(dir)?;
         if actual.files
@@ -195,7 +207,7 @@ impl Kernel {
                 Self::read_projection_file_nofollow(&dir.join(relative)).map_err(|error| {
                     anyhow::anyhow!("read materialized capsule member {relative}: {error}")
                 })?;
-            if materialized != *expected {
+            if materialized.as_slice() != *expected {
                 anyhow::bail!(
                     "materialized capsule member {relative} differs from durable archive"
                 );
@@ -312,6 +324,14 @@ impl Kernel {
             std::fs::remove_dir_all(target).map_err(|error| {
                 anyhow::anyhow!("remove stale capsule materialization: {error}")
             })?;
+        }
+        #[cfg(target_os = "macos")]
+        match self.copy_published_projection(target, principal, discovery_manifest, snapshot) {
+            Ok(Some(manifest)) => return Ok(manifest),
+            Ok(None) => {},
+            Err(error) => {
+                tracing::debug!(%error, "Rebuilding capsule projection from canonical package");
+            },
         }
         astrid_capsule_install::materialize_capsule_package(snapshot.package(), target)
             .map_err(|error| anyhow::anyhow!("materialize durable capsule package: {error:#}"))?;

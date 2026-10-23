@@ -96,7 +96,7 @@ fn take_workspace_source() -> Option<WorkspaceSource> {
         .take()
 }
 
-async fn seed_isolated_principal(
+pub(crate) async fn seed_isolated_principal(
     kernel: &crate::Kernel,
     home: &AstridHome,
     name: &str,
@@ -116,7 +116,7 @@ async fn seed_isolated_principal(
     principal
 }
 
-fn scratch_home() -> (tempfile::TempDir, AstridHome) {
+pub(crate) fn scratch_home() -> (tempfile::TempDir, AstridHome) {
     let dir = tempfile::tempdir().expect("capsule adversarial tempdir");
     let home = AstridHome::from_path(dir.path());
     (dir, home)
@@ -130,7 +130,7 @@ fn write_manifest(root: &Path, name: &str) {
     .expect("write capsule manifest");
 }
 
-fn write_component_source(root: &Path, name: &str, wit: Option<&[u8]>) -> Vec<u8> {
+pub(crate) fn write_component_source(root: &Path, name: &str, wit: Option<&[u8]>) -> Vec<u8> {
     std::fs::create_dir_all(root).expect("create component source");
     std::fs::write(
         root.join("Capsule.toml"),
@@ -146,7 +146,7 @@ fn write_component_source(root: &Path, name: &str, wit: Option<&[u8]>) -> Vec<u8
     wasm
 }
 
-fn publish_component_source(
+pub(crate) fn publish_component_source(
     kernel: &crate::Kernel,
     principal: &PrincipalId,
     root: &Path,
@@ -215,7 +215,7 @@ fn publish_component_source_at(
     Ok(package)
 }
 
-fn durable_target(
+pub(crate) fn durable_target(
     kernel: &crate::Kernel,
     principal: &PrincipalId,
     package: &astrid_storage::CapsulePackage,
