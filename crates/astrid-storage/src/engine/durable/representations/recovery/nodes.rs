@@ -18,7 +18,6 @@ pub(in super::super) struct RecoveredNodes {
     locations: PagedLocations,
     limits: RecoveryLimits,
     budget: LocationIndexMemoryBudget,
-    journal_started: bool,
     // PhysicalMapNodes lends immutable access; only disposable authenticated
     // page evidence changes here. Index mutations invalidate its run epoch.
     page_memo: RefCell<AuthenticatedPageMemo>,
@@ -39,27 +38,14 @@ impl RecoveredNodes {
             locations: PagedLocations::new(budget.durable_entries()),
             limits,
             budget,
-            journal_started: false,
             page_memo: RefCell::default(),
         })
     }
 
-    pub(super) fn begin_journal(&mut self) -> Result<(), DurableError> {
-        // Reachability evidence belongs to one journal replay. A later replay
-        // must re-read media rather than reuse evidence from an earlier call.
-        *self.page_memo.get_mut() = AuthenticatedPageMemo::default();
-        if self.journal_started {
-            self.locations.clear_proofs()?;
-        }
-        self.journal_started = true;
-        Ok(())
-    }
-
-    pub(in super::super) fn prepare_active_maps(&mut self) -> Result<(), DurableError> {
-        // Journal proof writes fragment the locator again after admission.
-        // Canonical recovery needs every location, but none of those weaker
-        // proofs. Rebuild once before its walks to avoid repeated negative
-        // probes across obsolete runs; cold proofs are rebuilt from the maps.
+    pub(in super::super) fn reset_proofs(&mut self) -> Result<(), DurableError> {
+        // Phase boundaries discard journal reachability evidence and collapse
+        // fragmented runs without dropping any historical location. Canonical
+        // cold proofs are rebuilt independently from the recovered active maps.
         self.locations.clear_proofs()?;
         *self.page_memo.get_mut() = AuthenticatedPageMemo::default();
         Ok(())

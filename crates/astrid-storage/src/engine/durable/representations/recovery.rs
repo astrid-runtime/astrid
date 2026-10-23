@@ -133,7 +133,9 @@ pub(super) fn recover_journal<F: DurableIo>(
     metadata: &mut MetadataIndex,
     limits: RecoveryLimits,
 ) -> Result<(RepresentationStateId, RepresentationState), DurableError> {
-    metadata.nodes.begin_journal()?;
+    // Admission leaves geometric runs; every replay starts with a consolidated
+    // locator and fresh reachability evidence, including the first replay.
+    metadata.nodes.reset_proofs()?;
     let mut entries = Vec::new();
     scan_frames(
         file,

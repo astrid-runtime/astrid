@@ -908,7 +908,9 @@ impl RepresentationStore {
             index.value(MetadataKind::Placement, state.placements().as_bytes())?,
         )?;
         let mut nodes = index.into_nodes();
-        nodes.prepare_active_maps()?;
+        // Journal proof writes fragment the locator again after admission.
+        // Canonical map walks need the locations, but none of those proofs.
+        nodes.reset_proofs()?;
         let profiles = residency::recover_active_map(
             PhysicalMapDomain::Profile,
             catalogue.profiles_root(),
