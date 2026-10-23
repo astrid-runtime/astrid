@@ -347,7 +347,7 @@ impl WorkspaceBranchService {
             return Ok(astrid_storage::StateOwner::Principal(uid));
         };
         let snapshot = ownership
-            .load()
+            .load_shared()
             .await
             .map_err(|error| format!("resolve principal fleet ownership: {error}"))?;
         Ok(snapshot
@@ -524,7 +524,7 @@ impl WorkspaceBranchService {
         }
         if let Some(ownership) = self.ownership.as_ref() {
             let snapshot = ownership
-                .load()
+                .load_shared()
                 .await
                 .map_err(|error| format!("load ownership graph for branch cleanup: {error}"))?;
             for assignment in snapshot.principal_owners() {

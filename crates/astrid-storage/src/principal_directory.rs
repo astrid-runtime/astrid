@@ -20,13 +20,37 @@ pub struct PrincipalDirectory {
     inner: Arc<RwLock<PrincipalDirectoryState>>,
 }
 
+/// Identity of one directory state. Retained tokens prevent pointer reuse
+/// from making a replaced directory appear unchanged to a validated memo.
+#[derive(Clone, Debug)]
+pub(crate) struct PrincipalDirectoryRevision(Arc<()>);
+
+impl Default for PrincipalDirectoryRevision {
+    fn default() -> Self {
+        Self(Arc::new(()))
+    }
+}
+
+impl PartialEq for PrincipalDirectoryRevision {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for PrincipalDirectoryRevision {}
+
 #[derive(Clone, Debug, Default)]
 struct PrincipalDirectoryState {
+    revision: PrincipalDirectoryRevision,
     aliases: HashMap<PrincipalId, PrincipalUid>,
     principals: HashMap<PrincipalUid, PrincipalId>,
 }
 
 impl PrincipalDirectory {
+    pub(crate) fn revision(&self) -> PrincipalDirectoryRevision {
+        self.inner.read().revision.clone()
+    }
+
     /// Register one validated alias-to-UID binding.
     ///
     /// Repeating the same binding is idempotent. Reusing either side for a
@@ -56,6 +80,10 @@ impl PrincipalDirectory {
                 "principal uid {uid} is already bound to alias {existing}"
             )));
         }
+        if state.aliases.get(&alias) == Some(&uid) && state.principals.get(&uid) == Some(&alias) {
+            return Ok(());
+        }
+        state.revision = PrincipalDirectoryRevision::default();
         state.aliases.insert(alias.clone(), uid);
         state.principals.insert(uid, alias);
         Ok(())
@@ -64,6 +92,7 @@ impl PrincipalDirectory {
     pub(crate) fn unregister(&self, alias: &PrincipalId, uid: PrincipalUid) {
         let mut state = self.inner.write();
         if state.aliases.get(alias) == Some(&uid) && state.principals.get(&uid) == Some(alias) {
+            state.revision = PrincipalDirectoryRevision::default();
             state.aliases.remove(alias);
             state.principals.remove(&uid);
         }
@@ -164,6 +193,7 @@ impl PrincipalDirectory {
                 "principal rename target {new_alias} is already bound to uid {existing}"
             )));
         }
+        state.revision = PrincipalDirectoryRevision::default();
         state.aliases.remove(old_alias);
         state.aliases.insert(new_alias.clone(), uid);
         state.principals.insert(uid, new_alias);
