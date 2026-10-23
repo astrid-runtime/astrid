@@ -55,6 +55,16 @@ impl RecoveredNodes {
         Ok(())
     }
 
+    pub(in super::super) fn prepare_active_maps(&mut self) -> Result<(), DurableError> {
+        // Journal proof writes fragment the locator again after admission.
+        // Canonical recovery needs every location, but none of those weaker
+        // proofs. Rebuild once before its walks to avoid repeated negative
+        // probes across obsolete runs; cold proofs are rebuilt from the maps.
+        self.locations.clear_proofs()?;
+        *self.page_memo.get_mut() = AuthenticatedPageMemo::default();
+        Ok(())
+    }
+
     pub(super) fn admit(
         &mut self,
         offset: u64,

@@ -907,7 +907,8 @@ impl RepresentationStore {
         let placements = PlacementSet::decode(
             index.value(MetadataKind::Placement, state.placements().as_bytes())?,
         )?;
-        let nodes = index.into_nodes();
+        let mut nodes = index.into_nodes();
+        nodes.prepare_active_maps()?;
         let profiles = residency::recover_active_map(
             PhysicalMapDomain::Profile,
             catalogue.profiles_root(),
