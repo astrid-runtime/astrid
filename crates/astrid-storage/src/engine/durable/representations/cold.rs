@@ -11,8 +11,11 @@ use std::sync::Arc;
 
 use super::super::format::{frame_checksum, read_frame_at};
 use super::super::locations::{
-    ClosureProof, LocationIndexMemoryBudget, LocationLookup, PagedLocations, RebuildLocations,
+    AuthenticatedPageMemo, ClosureProof, LocationIndexMemoryBudget, LocationLookup, PagedLocations,
+    RebuildLocations,
 };
+use std::cell::RefCell;
+use std::rc::Rc;
 use super::super::{
     ArenaLocation, DurableError, File, RecoveryLimits, append_frame, io_error, scan_frames,
 };
@@ -219,6 +222,67 @@ impl super::activation::CompleteNodes for ColdNodes {
     fn remember(&mut self, id: PhysicalMapNodeId) -> Result<(), DurableError> {
         let mut arena = self.0.lock();
         let result = arena.locations.mark_proven(ObjectId::new(*id.as_bytes()));
+        if result.is_err() {
+            arena.failed = true;
+        }
+        result
+    }
+}
+
+/// Shared operation-scoped page memo for one closure walk.
+///
+/// Guards are acquired only around locator lookups/updates. Callers must not
+/// hold a `NodeArena` mutex across `map.view_node`, which re-enters the same
+/// arena through `ColdNodes`.
+pub(super) struct ColdMemoPresence<'a> {
+    cold: &'a ColdNodes,
+    memo: Rc<RefCell<AuthenticatedPageMemo>>,
+}
+
+pub(super) struct ColdMemoComplete<'a> {
+    cold: &'a ColdNodes,
+    memo: Rc<RefCell<AuthenticatedPageMemo>>,
+}
+
+pub(super) fn memoized_closure_handles(
+    cold: &ColdNodes,
+) -> (ColdMemoPresence<'_>, ColdMemoComplete<'_>) {
+    let memo = Rc::new(RefCell::new(AuthenticatedPageMemo::default()));
+    (
+        ColdMemoPresence {
+            cold,
+            memo: Rc::clone(&memo),
+        },
+        ColdMemoComplete { cold, memo },
+    )
+}
+
+impl super::activation::NodePresence for ColdMemoPresence<'_> {
+    fn has_node(&self, id: &PhysicalMapNodeId) -> Result<bool, DurableError> {
+        let mut memo = self.memo.borrow_mut();
+        let arena = self.cold.0.lock();
+        Ok(arena
+            .locations
+            .location_memo(ObjectId::new(*id.as_bytes()), &mut memo)?
+            .is_some())
+    }
+}
+
+impl super::activation::CompleteNodes for ColdMemoComplete<'_> {
+    fn complete(&self, id: &PhysicalMapNodeId) -> Result<bool, DurableError> {
+        let mut memo = self.memo.borrow_mut();
+        let arena = self.cold.0.lock();
+        arena
+            .locations
+            .closure_proven_memo(ObjectId::new(*id.as_bytes()), &mut memo)
+    }
+
+    fn remember(&mut self, id: PhysicalMapNodeId) -> Result<(), DurableError> {
+        let mut memo = self.memo.borrow_mut();
+        let mut arena = self.cold.0.lock();
+        let result = arena
+            .locations
+            .mark_proven_memo(ObjectId::new(*id.as_bytes()), &mut memo);
         if result.is_err() {
             arena.failed = true;
         }

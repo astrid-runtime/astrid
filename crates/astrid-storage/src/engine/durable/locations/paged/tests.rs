@@ -213,3 +213,67 @@ fn recovered_proofs_and_direct_spill_keep_the_same_locations_and_proof_membershi
         assert!(paged.failed());
     }
 }
+
+
+#[test]
+fn authenticated_page_memo_reuses_pages_and_clears_on_run_flush() {
+    use super::super::run::test_take_page_auth_count;
+    use super::AuthenticatedPageMemo;
+    use std::num::NonZeroUsize;
+
+    fn id(index: u64) -> ObjectId {
+        let mut bytes = [0; 32];
+        bytes[..8].copy_from_slice(&index.to_be_bytes());
+        ObjectId::new(bytes)
+    }
+    fn loc(index: u64) -> ArenaLocation {
+        ArenaLocation {
+            offset: index.strict_mul(10),
+            payload_len: 8,
+            checksum: [9; 32],
+        }
+    }
+
+    let limit = NonZeroUsize::new(4).unwrap();
+    let mut paged = PagedLocations::new(limit);
+    for index in 0..64 {
+        paged.insert(id(index), loc(index)).unwrap();
+    }
+    assert!(paged.test_spilled_run_count() > 0, "spilled runs required for page memo");
+
+    let _ = test_take_page_auth_count();
+    let mut memo = AuthenticatedPageMemo::default();
+    for index in 0..64 {
+        assert!(paged.location_memo(id(index), &mut memo).unwrap().is_some());
+    }
+    let (hits, misses) = memo.test_hit_miss();
+    let auth = test_take_page_auth_count();
+    assert!(hits > 0, "cross-lookup ancestor reuse expected");
+    assert_eq!(auth, misses);
+
+    let _ = test_take_page_auth_count();
+    for index in 0..64 {
+        let mut uncached = AuthenticatedPageMemo::default();
+        assert!(paged.location_memo(id(index), &mut uncached).unwrap().is_some());
+    }
+    let uncached_auth = test_take_page_auth_count();
+    assert!(
+        uncached_auth > auth.strict_mul(2),
+        "uncached control must re-auth ancestors: memoized={auth} uncached={uncached_auth}"
+    );
+
+    for index in 64..128 {
+        paged.insert(id(index), loc(index)).unwrap();
+    }
+    let _ = test_take_page_auth_count();
+    for index in 0..16 {
+        assert!(paged.location_memo(id(index), &mut memo).unwrap().is_some());
+    }
+    let (hits_after, misses_after) = memo.test_hit_miss();
+    let auth_after = test_take_page_auth_count();
+    // Epoch rebind installs fresh per-run memos; their miss count equals new auths.
+    assert_eq!(auth_after, misses_after);
+    assert!(auth_after > 0, "replaced runs must re-authenticate");
+    assert!(hits_after > 0 || auth_after > 0);
+    let _ = misses;
+}

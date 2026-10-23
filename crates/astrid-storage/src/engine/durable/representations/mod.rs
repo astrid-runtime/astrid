@@ -47,6 +47,7 @@ mod cold;
 mod contiguous;
 mod node_view;
 use cold::{ColdNodes, ColdPhysicalMap};
+use cold::memoized_closure_handles;
 mod direct;
 mod volume;
 use authority::{create_file as create_cap_file, open_file as open_cap_file, quarantine_entry};
@@ -492,20 +493,26 @@ impl RepresentationStore {
             .map(|entry| (entry.object, entry.representation_id))
             .collect();
         let mut appended_map_nodes = BTreeSet::new();
-        append_new_reachable_map_nodes(
-            &mut metadata,
-            &self.representations,
-            &self.persisted_map_nodes,
-            &mut appended_map_nodes,
-            &mut self.persisted_map_nodes.clone(),
-        )?;
-        append_new_reachable_map_nodes(
-            &mut metadata,
-            &self.placement_entries,
-            &self.persisted_map_nodes,
-            &mut appended_map_nodes,
-            &mut self.persisted_map_nodes.clone(),
-        )?;
+        {
+            let (presence, mut complete) = memoized_closure_handles(&self.persisted_map_nodes);
+            append_new_reachable_map_nodes(
+                &mut metadata,
+                &self.representations,
+                &presence,
+                &mut appended_map_nodes,
+                &mut complete,
+            )?;
+        }
+        {
+            let (presence, mut complete) = memoized_closure_handles(&self.persisted_map_nodes);
+            append_new_reachable_map_nodes(
+                &mut metadata,
+                &self.placement_entries,
+                &presence,
+                &mut appended_map_nodes,
+                &mut complete,
+            )?;
+        }
         let (catalogue, placements, state) = self.next_authority()?;
         let state_id = state.identify(&Blake3PhysicalIdentity);
         metadata.push(MetadataFrame::catalogue(&Blake3PhysicalIdentity, catalogue));
@@ -597,13 +604,16 @@ impl RepresentationStore {
         let mut metadata = Vec::new();
         let mut appended_map_nodes = BTreeSet::new();
         for map in [&self.representations, &self.placement_entries] {
+            {
+            let (presence, mut complete) = memoized_closure_handles(&self.persisted_map_nodes);
             append_new_reachable_map_nodes(
                 &mut metadata,
                 map,
-                &self.persisted_map_nodes,
+                &presence,
                 &mut appended_map_nodes,
-                &mut self.persisted_map_nodes.clone(),
+                &mut complete,
             )?;
+        }
         }
         let (catalogue, placements, state) = self.next_authority()?;
         let state_id = state.identify(&Blake3PhysicalIdentity);
