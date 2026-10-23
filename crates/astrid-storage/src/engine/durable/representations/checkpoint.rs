@@ -26,16 +26,22 @@ impl RepresentationStore {
         self.flush()?;
         let generation = increment(self.journal_generation)?;
         let mut batch = super::batch::MetadataBatch::new(limits)?;
+        // Reuse authenticated locator ancestors for this read-only walk.
+        // The provider retains no node bodies and drops all page proofs before
+        // replacement-generation recovery independently validates its authority.
+        let nodes = self.persisted_map_nodes.memoized_nodes();
         for map in [
             &self.profiles,
             &self.representations,
             &self.placement_entries,
         ] {
-            super::node_view::visit_nodes(map, |node| {
+            let view = map.with_node_provider(&nodes);
+            super::node_view::visit_nodes(&view, |node| {
                 let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, &node)?;
                 batch.push(&frame)
             })?;
         }
+        drop(nodes);
         for frame in [
             MetadataFrame::catalogue(&Blake3PhysicalIdentity, self.catalogue),
             MetadataFrame::placement(&Blake3PhysicalIdentity, self.placements),
