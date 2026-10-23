@@ -277,8 +277,8 @@ where
     }
 
     /// Set the disposable historical-locator staging budget without changing
-    /// durable authority. The shared target covers logical, physical, and private
-    /// path-copy staging. A failed physical spill fences admission; recovery
+    /// durable authority. The shared target covers logical, physical, private
+    /// path-copy staging and reverse heads. A failed physical spill fences admission; recovery
     /// rebuilds all locators using the previous policy.
     ///
     /// # Errors
@@ -289,7 +289,7 @@ where
     ) -> Result<(), DurableError> {
         let mut inner = self.lock_usable()?;
         inner.index.set_limit(budget.durable_entries())?;
-        if let Some(representations) = &inner.representations
+        if let Some(representations) = &mut inner.representations
             && let Err(error) = representations.set_location_index_memory(budget)
         {
             self.mark_requires_recovery(&mut inner);
