@@ -26,6 +26,23 @@ fn transferred_owner_packs_after_runtime_drop_and_reopens_exact_state() {
             std::fs::write(home.root().join("config.toml"), b"before handoff").unwrap();
             store.publish_runtime_projection(&home).unwrap();
             let owner = store.handoff_for_retirement(&home).unwrap();
+            assert!(
+                store
+                    .content
+                    .take_catalog_validation(&StateOwner::System)
+                    .is_none(),
+                "old owner retained the transferred proof"
+            );
+            // Consume the moved proof to exercise the native seam and ensure
+            // final packing also remains correct with full-validation fallback.
+            assert!(
+                owner
+                    .store
+                    .content
+                    .take_catalog_validation(&StateOwner::System)
+                    .is_some(),
+                "retirement owner lost the validated System catalogue"
+            );
             assert!(kv.get("system:retirement", "key").await.is_err());
             assert!(content.read(&StateOwner::System, &name).is_err());
             kv.close().await.unwrap();
