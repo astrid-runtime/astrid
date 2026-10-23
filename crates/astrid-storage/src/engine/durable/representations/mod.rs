@@ -924,6 +924,10 @@ impl RepresentationStore {
             placements.entries_root(),
             &mut index.nodes,
         )?;
+        // Active node ownership has moved into the three maps. Historical
+        // decoded bodies and scalar replay bytes no longer serve validation;
+        // release them before domain checks and the cold locator rebuild.
+        drop(index);
         if profiles.entry_count() != catalogue.profile_count()
             || representations.entry_count() != catalogue.representation_count()
             || placement_entries.entry_count() != placements.blob_count()

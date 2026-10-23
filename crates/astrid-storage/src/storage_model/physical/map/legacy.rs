@@ -1,7 +1,6 @@
 //! Frozen binary Patricia-map construction retained for format-one recovery.
 
 use super::nodes::{self, PhysicalMapMutNodes};
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use super::{
@@ -25,16 +24,16 @@ pub(super) fn insert<I: PhysicalIdentity, N: PhysicalMapMutNodes>(
     .insert_at(root, key, value)
 }
 
-pub(super) fn build<I: PhysicalIdentity>(
+pub(super) fn build<I: PhysicalIdentity, V: AsRef<[u8]>, N: PhysicalMapMutNodes>(
     identity: &I,
     domain: PhysicalMapDomain,
-    entries: &[(PhysicalMapKey, Vec<u8>)],
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
-) -> Result<PhysicalMapNodeId, PhysicalModelError> {
+    entries: &[(PhysicalMapKey, V)],
+    nodes: &mut N,
+) -> Result<PhysicalMapNodeId, N::Error> {
     if entries.len() == 1 {
-        let node = PhysicalMapNode::leaf(domain, entries[0].0, entries[0].1.clone());
+        let node = PhysicalMapNode::leaf(domain, entries[0].0, entries[0].1.as_ref().to_vec());
         let id = node.identify(identity)?;
-        nodes.insert(id, node);
+        nodes.put(id, node)?;
         return Ok(id);
     }
     let first = entries
@@ -49,11 +48,11 @@ pub(super) fn build<I: PhysicalIdentity>(
         .search_key();
     let prefix_bits = common_prefix_bits(&first, &last)?;
     if prefix_bits >= SEARCH_KEY_BITS {
-        return Err(PhysicalModelError::InvalidMap("duplicate branch key"));
+        return Err(PhysicalModelError::InvalidMap("duplicate branch key").into());
     }
     let split = entries.partition_point(|(key, _)| !bit(&key.search_key(), prefix_bits));
     if split == 0 || split == entries.len() {
-        return Err(PhysicalModelError::InvalidMap("canonical branch is unary"));
+        return Err(PhysicalModelError::InvalidMap("canonical branch is unary").into());
     }
     let zero = build(identity, domain, &entries[..split], nodes)?;
     let one = build(identity, domain, &entries[split..], nodes)?;
@@ -66,7 +65,7 @@ pub(super) fn build<I: PhysicalIdentity>(
         u64::try_from(entries.len()).map_err(|_| PhysicalModelError::LengthOverflow)?,
     )?;
     let id = node.identify(identity)?;
-    nodes.insert(id, node);
+    nodes.put(id, node)?;
     Ok(id)
 }
 

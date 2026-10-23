@@ -4,7 +4,6 @@ mod batch;
 pub(super) use batch::insert_entries;
 
 use super::nodes::{self, PhysicalMapMutNodes};
-use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -13,12 +12,12 @@ use super::{
     PhysicalMapNodeId, PhysicalModelError, RADIX_PAGE_CAPACITY, nibble_prefix_byte_len,
 };
 
-pub(super) fn build<I: PhysicalIdentity>(
+pub(super) fn build<I: PhysicalIdentity, V: AsRef<[u8]>, N: PhysicalMapMutNodes>(
     identity: &I,
     domain: PhysicalMapDomain,
-    entries: &[(PhysicalMapKey, Vec<u8>)],
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
-) -> Result<PhysicalMapNodeId, PhysicalModelError> {
+    entries: &[(PhysicalMapKey, V)],
+    nodes: &mut N,
+) -> Result<PhysicalMapNodeId, N::Error> {
     build_range(identity, domain, entries, 0, nodes)
 }
 
@@ -38,10 +37,10 @@ pub(super) fn insert<I: PhysicalIdentity, N: PhysicalMapMutNodes>(
     .insert_at(root, key, value)
 }
 
-fn build_range<I: PhysicalIdentity, N: PhysicalMapMutNodes>(
+fn build_range<I: PhysicalIdentity, V: AsRef<[u8]>, N: PhysicalMapMutNodes>(
     identity: &I,
     domain: PhysicalMapDomain,
-    entries: &[(PhysicalMapKey, Vec<u8>)],
+    entries: &[(PhysicalMapKey, V)],
     depth: u8,
     nodes: &mut N,
 ) -> Result<PhysicalMapNodeId, N::Error> {
@@ -52,7 +51,13 @@ fn build_range<I: PhysicalIdentity, N: PhysicalMapMutNodes>(
         return insert_node(
             identity,
             nodes,
-            PhysicalMapNode::page(domain, entries.to_vec())?,
+            PhysicalMapNode::page(
+                domain,
+                entries
+                    .iter()
+                    .map(|(key, value)| (*key, value.as_ref().to_vec()))
+                    .collect(),
+            )?,
         );
     }
 
