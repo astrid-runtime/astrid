@@ -47,7 +47,12 @@ fn direct_publication_rebase_and_recovery_keep_all_reverse_entries() {
     let update = store.append_direct_update(&objects).unwrap().unwrap();
     store.publish_direct_update(update).unwrap();
     assert_bounded(&store, objects.len());
+    let before_rebase = store.active;
     store.rebase_all_direct(&objects).unwrap();
+    assert_eq!(
+        store.active, before_rebase,
+        "matching direct authority must remain a no-op"
+    );
     assert_bounded(&store, objects.len());
     let active = store.active;
     let expected = store.reverse.snapshot().unwrap();
@@ -66,6 +71,8 @@ fn direct_publication_rebase_and_recovery_keep_all_reverse_entries() {
     assert_bounded(&recovered, objects.len());
     assert_eq!(recovered.active, active);
     assert_eq!(recovered.reverse.snapshot().unwrap(), expected);
+    assert_mount_proof_consumed(&mut recovered);
+
     for object in &objects {
         assert!(recovered.contains_direct(object.object).unwrap());
     }
@@ -90,4 +97,31 @@ fn direct_publication_rebase_and_recovery_keep_all_reverse_entries() {
     .unwrap();
     assert_eq!(repaired.active, before);
     assert_eq!(repaired.reverse.snapshot().unwrap(), expected);
+}
+
+fn assert_mount_proof_consumed(recovered: &mut RepresentationStore) {
+    let direct = recovered.direct_arena_locations().unwrap();
+    let index = direct.iter().copied().collect();
+    let protected = direct
+        .iter()
+        .map(|(_, location)| {
+            location
+                .offset
+                .strict_add(super::super::FRAME_HEADER_LEN)
+                .strict_add(location.payload_len)
+        })
+        .max()
+        .unwrap();
+    assert_eq!(
+        recovered.generation_zero_protected_len().unwrap(),
+        protected
+    );
+    assert!(recovered.recovered_direct.is_some());
+    recovered.validate_generation_zero_index(&index).unwrap();
+    assert!(
+        recovered.recovered_direct.is_none(),
+        "mount proof must be released before exposing the engine"
+    );
+    assert!(recovered.generation_zero_protected_len().is_err());
+    assert!(recovered.validate_generation_zero_index(&index).is_err());
 }
