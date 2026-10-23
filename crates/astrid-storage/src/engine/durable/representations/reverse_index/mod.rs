@@ -3,7 +3,9 @@
 //! Every admitted representation stays in its original order. Only paged heads
 //! and bounded merge workspace stay resident; canonical maps remain authority.
 
-use super::super::locations::{LocationIndexMemoryBudget, LocationLookup, PagedLocations};
+use super::super::locations::{
+    AuthenticatedPageMemo, LocationIndexMemoryBudget, LocationLookup, PagedLocations,
+};
 use super::super::{ArenaLocation, DurableError, File, append_frame, io_error};
 use crate::storage_model::{ObjectId, RepresentationRecordId};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,8 +45,23 @@ impl ReverseIndex {
         object: ObjectId,
         id: RepresentationRecordId,
     ) -> Result<bool, DurableError> {
+        self.insert_first_memo(object, id, &mut AuthenticatedPageMemo::default())
+    }
+
+    /// Reuse immutable locator pages during one exclusive catalogue rebuild.
+    /// Link bodies are always read and authenticated, even with a warm memo.
+    pub(super) fn insert_first_memo(
+        &mut self,
+        object: ObjectId,
+        id: RepresentationRecordId,
+        memo: &mut AuthenticatedPageMemo,
+    ) -> Result<bool, DurableError> {
         let result = (|| {
-            let previous = self.head(object)?;
+            let previous = self
+                .heads
+                .location_memo(object, memo)?
+                .map(|location| self.link(object, location).map(|link| (location, link)))
+                .transpose()?;
             let first = previous.is_none();
             let link = Link {
                 id,
@@ -52,7 +69,7 @@ impl ReverseIndex {
                 previous: previous.map(|(location, _)| location),
             };
             let location = append_frame(&mut self.file, MAGIC, &link.encode(object))?;
-            self.heads.insert(object, location)?;
+            self.heads.insert_memo(object, location, memo)?;
             Ok(first)
         })();
         if result.is_err() {
