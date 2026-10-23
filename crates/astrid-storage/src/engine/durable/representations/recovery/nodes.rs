@@ -1,7 +1,7 @@
 //! Recovery owns frame locations, never a history-sized decoded payload arena.
 
 use super::super::super::format::frame_checksum;
-use super::super::super::locations::{LocationLookup, PagedLocations};
+use super::super::super::locations::{AuthenticatedPageMemo, PagedLocations};
 use super::super::format::{Blake3PhysicalIdentity, METADATA_MAGIC, MetadataFrame, map_node_id};
 use super::super::{
     ArenaLocation, ColdNodes, DurableError, DurableFile, LocationIndexMemoryBudget, RecoveryLimits,
@@ -11,6 +11,7 @@ use crate::storage_model::{
     CanonicalPhysicalMap, ObjectId, PhysicalMapNode, PhysicalMapNodeId, PhysicalMapNodes,
 };
 use std::borrow::Cow;
+use std::cell::RefCell;
 
 pub(in super::super) struct RecoveredNodes {
     file: DurableFile,
@@ -18,6 +19,9 @@ pub(in super::super) struct RecoveredNodes {
     limits: RecoveryLimits,
     budget: LocationIndexMemoryBudget,
     journal_started: bool,
+    // PhysicalMapNodes lends immutable access; only disposable authenticated
+    // page evidence changes here. Index mutations invalidate its run epoch.
+    page_memo: RefCell<AuthenticatedPageMemo>,
 }
 
 impl RecoveredNodes {
@@ -36,12 +40,14 @@ impl RecoveredNodes {
             limits,
             budget,
             journal_started: false,
+            page_memo: RefCell::default(),
         })
     }
 
     pub(super) fn begin_journal(&mut self) -> Result<(), DurableError> {
         // Reachability evidence belongs to one journal replay. A later replay
         // must re-read media rather than reuse evidence from an earlier call.
+        *self.page_memo.get_mut() = AuthenticatedPageMemo::default();
         if self.journal_started {
             self.locations.clear_proofs()?;
         }
@@ -73,13 +79,14 @@ impl RecoveredNodes {
         }
         let payload_len =
             u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
-        self.locations.insert(
+        self.locations.insert_memo(
             ObjectId::new(*id.as_bytes()),
             ArenaLocation {
                 offset,
                 payload_len,
                 checksum: frame_checksum(METADATA_MAGIC, payload_len, payload),
             },
+            self.page_memo.get_mut(),
         )
     }
 
@@ -109,13 +116,17 @@ impl RecoveredNodes {
 
 impl super::super::activation::CompleteNodes for RecoveredNodes {
     fn complete(&self, id: &PhysicalMapNodeId) -> Result<bool, DurableError> {
-        self.locations.closure_proven(ObjectId::new(*id.as_bytes()))
+        self.locations.closure_proven_memo(
+            ObjectId::new(*id.as_bytes()),
+            &mut self.page_memo.borrow_mut(),
+        )
     }
 
     fn remember(&mut self, id: PhysicalMapNodeId) -> Result<(), DurableError> {
         // These bits prove recovery reachability only. into_cold rebuilds every
         // bit from canonically validated active maps, never from this evidence.
-        self.locations.mark_proven(ObjectId::new(*id.as_bytes()))
+        self.locations
+            .mark_proven_memo(ObjectId::new(*id.as_bytes()), self.page_memo.get_mut())
     }
 }
 
@@ -125,7 +136,11 @@ impl PhysicalMapNodes for RecoveredNodes {
         &self,
         id: PhysicalMapNodeId,
     ) -> Result<Option<Cow<'_, PhysicalMapNode>>, DurableError> {
-        let Some(location) = self.locations.location(ObjectId::new(*id.as_bytes()))? else {
+        let Some(location) = self.locations.location_memo(
+            ObjectId::new(*id.as_bytes()),
+            &mut self.page_memo.borrow_mut(),
+        )?
+        else {
             return Ok(None);
         };
         super::super::cold::read_node(&self.file, self.limits, id, location)
