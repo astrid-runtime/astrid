@@ -38,6 +38,8 @@ mod node;
 mod overlay;
 #[cfg(all(test, feature = "legacy-surrealkv"))]
 mod performance_tests;
+#[cfg(all(test, not(target_family = "wasm")))]
+mod retirement_tests;
 mod validation;
 
 pub(crate) use self::header::validated_projection_quota;
@@ -79,6 +81,14 @@ pub struct TreeKvStore<P: Ord, I, R, E> {
     checkpointing: Arc<Mutex<BTreeSet<P>>>,
     hot_cache: Option<Arc<KvHotCache<P>>>,
     marker: PhantomData<fn() -> (P, I)>,
+}
+
+/// Retirement can only shrink a captured owner; ordinary mutations still
+/// resolve the current quota policy even when they replace existing data.
+#[derive(Clone, Copy)]
+enum MutationQuota {
+    CurrentPolicy,
+    NonIncreasing,
 }
 
 struct BlockingTreeStore<P: Ord, E> {
@@ -233,6 +243,18 @@ where
     fn mutate<T>(
         &self,
         owner: &P,
+        mutation: impl FnMut(
+            &mut TreeContext<'_, P, E>,
+            &TreeHeader<P>,
+        ) -> StorageResult<(T, Vec<(Vec<u8>, Option<Vec<u8>>)>, bool)>,
+    ) -> StorageResult<T> {
+        self.mutate_with_quota(owner, MutationQuota::CurrentPolicy, mutation)
+    }
+
+    fn mutate_with_quota<T>(
+        &self,
+        owner: &P,
+        quota: MutationQuota,
         mut mutation: impl FnMut(
             &mut TreeContext<'_, P, E>,
             &TreeHeader<P>,
@@ -259,13 +281,7 @@ where
                 .ok_or_else(|| {
                     StorageError::Internal("principal quota total overflow".to_owned())
                 })?;
-            if let Some(quota) = &self.quota
-                && let Some(limit) = quota.max_logical_bytes(owner)?
-                && used > limit
-                && used > previous_used
-            {
-                return Err(StorageError::quota_exceeded(used, limit));
-            }
+            self.validate_mutation_quota(owner, quota, used, previous_used)?;
             let tree = projection.tree;
             let validated_projection = projection.clone();
             let transaction = context.finish_projection(header, &projection)?;
@@ -298,6 +314,33 @@ where
                 Err(error) => return Err(map_engine(&error)),
             }
         }
+    }
+
+    fn validate_mutation_quota(
+        &self,
+        owner: &P,
+        quota: MutationQuota,
+        used: u64,
+        previous_used: u64,
+    ) -> StorageResult<()> {
+        match quota {
+            MutationQuota::NonIncreasing if used > previous_used => {
+                return Err(StorageError::Internal(
+                    "principal KV retirement would increase storage usage".to_owned(),
+                ));
+            },
+            MutationQuota::NonIncreasing => {},
+            MutationQuota::CurrentPolicy => {
+                if let Some(quota) = &self.quota
+                    && let Some(limit) = quota.max_logical_bytes(owner)?
+                    && used > limit
+                    && used > previous_used
+                {
+                    return Err(StorageError::quota_exceeded(used, limit));
+                }
+            },
+        }
+        Ok(())
     }
 
     fn clear_range(&self, owner: &P, start: &[u8], end: &[u8]) -> StorageResult<u64> {
@@ -467,22 +510,30 @@ where
     /// Returns a storage error if the owner's authoritative KV state cannot be
     /// read or the clearing mutation cannot be committed.
     pub fn clear_owner(&self, owner: &P) -> StorageResult<u64> {
-        let removed = self.blocking_store().mutate(owner, |context, header| {
-            let mut entries = BTreeMap::<Vec<u8>, Option<Vec<u8>>>::new();
-            context.visit_entries(header.tree, |composite, value| {
-                entries.insert(composite.to_vec(), Some(value.to_vec()));
-                Ok(())
-            })?;
-            for (key, value) in header.overlay.all() {
-                entries.insert(key, value);
-            }
-            let mutations = entries
-                .into_iter()
-                .filter_map(|(key, value)| value.map(|_| (key, None)))
-                .collect::<Vec<_>>();
-            let count = u64::try_from(mutations.len()).unwrap_or(u64::MAX);
-            Ok((count, mutations, count != 0))
-        })?;
+        // The immutable owner has already been captured by identity retirement.
+        // Its live alias/profile may be gone or reused. This privileged path
+        // validates and commits only a non-increasing projection, never grants
+        // growth authority, and preserves every non-KV component.
+        let removed = self.blocking_store().mutate_with_quota(
+            owner,
+            MutationQuota::NonIncreasing,
+            |context, header| {
+                let mut entries = BTreeMap::<Vec<u8>, Option<Vec<u8>>>::new();
+                context.visit_entries(header.tree, |composite, value| {
+                    entries.insert(composite.to_vec(), Some(value.to_vec()));
+                    Ok(())
+                })?;
+                for (key, value) in header.overlay.all() {
+                    entries.insert(key, value);
+                }
+                let mutations = entries
+                    .into_iter()
+                    .filter_map(|(key, value)| value.map(|_| (key, None)))
+                    .collect::<Vec<_>>();
+                let count = u64::try_from(mutations.len()).unwrap_or(u64::MAX);
+                Ok((count, mutations, count != 0))
+            },
+        )?;
         if let Some(cache) = &self.hot_cache {
             cache.remove_owner(owner);
         }
