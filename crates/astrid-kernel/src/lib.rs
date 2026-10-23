@@ -3498,19 +3498,17 @@ async fn open_test_runtime_kv(
         Arc::new(move |owner: &astrid_storage::StateOwner| match owner {
             astrid_storage::StateOwner::System => Ok(None),
             astrid_storage::StateOwner::Principal(uid) => {
-                quota_directory
-                    .alias_for(*uid)
-                    .map_or(Ok(None), |principal| {
-                        astrid_core::profile::PrincipalProfile::load_required(
-                            &quota_home,
-                            &principal,
-                        )
-                        .map(|profile| Some(profile.quotas.max_storage_bytes))
-                        .map_err(|error| {
-                            astrid_storage::StorageError::Internal(format!(
-                                "resolve storage quota for {principal}: {error}"
-                            ))
-                        })
+                let principal = quota_directory.alias_for(*uid).map_err(|error| {
+                    astrid_storage::StorageError::Internal(format!(
+                        "resolve storage quota for {uid}: {error}"
+                    ))
+                })?;
+                astrid_core::profile::PrincipalProfile::load_required(&quota_home, &principal)
+                    .map(|profile| Some(profile.quotas.max_storage_bytes))
+                    .map_err(|error| {
+                        astrid_storage::StorageError::Internal(format!(
+                            "resolve storage quota for {principal}: {error}"
+                        ))
                     })
             },
             astrid_storage::StateOwner::Fleet(_) => {
