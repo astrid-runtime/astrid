@@ -25,9 +25,14 @@ pub(in crate::engine::durable) struct PendingWalObject {
     record: Arc<ObjectRecord>,
     location: Option<ArenaLocation>,
     direct: Option<DirectArenaObject>,
+    closure_proven: bool,
 }
 
 impl PendingWalObject {
+    pub(in crate::engine::durable) const fn closure_proven(&self) -> bool {
+        self.closure_proven
+    }
+
     pub(in crate::engine::durable) fn staged(
         payload: Arc<[u8]>,
         record: Arc<ObjectRecord>,
@@ -39,6 +44,7 @@ impl PendingWalObject {
             record,
             location: Some(location),
             direct,
+            closure_proven: false,
         }
     }
 
@@ -51,6 +57,7 @@ impl PendingWalObject {
             record,
             location: None,
             direct: None,
+            closure_proven: false,
         }
     }
 
@@ -135,6 +142,28 @@ impl<P: Ord> Default for PendingWalOverlay<P> {
 }
 
 impl<P: Ord> PendingWalOverlay<P> {
+    pub(in crate::engine::durable) fn closure_proven(&self, id: &ObjectId) -> bool {
+        self.objects
+            .get(id)
+            .is_some_and(PendingWalObject::closure_proven)
+    }
+
+    pub(in crate::engine::durable) fn mark_proven(&mut self, id: ObjectId) -> bool {
+        if let Some(object) = self.objects.get_mut(&id) {
+            object.closure_proven = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::durable) fn clear_proofs(&mut self) {
+        for object in self.objects.values_mut() {
+            object.closure_proven = false;
+        }
+    }
+
     #[allow(dead_code)]
     pub(in crate::engine::durable) fn is_empty(&self) -> bool {
         self.objects.is_empty() && self.roots.is_empty()

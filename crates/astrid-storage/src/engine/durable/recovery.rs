@@ -468,8 +468,9 @@ where
             } else {
                 self.recover_media().and_then(|(mut recovered, wal)| {
                     stabilize_recovered_store(&mut recovered, self.faults.as_ref())?;
-                    let index = super::locations::PagedLocations::from_map(
+                    let index = super::locations::PagedLocations::from_map_with_proofs(
                         std::mem::take(&mut recovered.index),
+                        &recovered.validated,
                         self.index_memory.read().durable_entries(),
                     )?;
                     Ok((recovered, wal, index))
@@ -483,7 +484,6 @@ where
                     inner.pending_index_locations.clear();
                     inner.pending_direct_objects.clear();
                     inner.pending_wal = super::wal::PendingWalOverlay::default();
-                    inner.validated = recovered.validated;
                     inner.files = Some(recovered.files);
                     inner.representations = recovered.representations;
                     *self.wal.lock() = wal;

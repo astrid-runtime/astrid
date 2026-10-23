@@ -317,8 +317,9 @@ where
         recovered: super::RecoveredStore<P>,
         wal: Option<super::DurableWal<P, I, C>>,
     ) -> Result<Self, DurableError> {
-        let index = super::locations::PagedLocations::from_map(
+        let index = super::locations::PagedLocations::from_map_with_proofs(
             recovered.index,
+            &recovered.validated,
             options.policy.index_memory.durable_entries(),
         )?;
         Ok(Self {
@@ -349,7 +350,6 @@ where
                 pending_wal: super::wal::PendingWalOverlay::default(),
                 pending_index_locations: Vec::new(),
                 pending_direct_objects: BTreeMap::new(),
-                validated: recovered.validated,
                 files: Some(recovered.files),
                 representations: recovered.representations,
                 lock: Some(lock),

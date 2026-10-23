@@ -94,7 +94,10 @@ where
                 }
                 inner.pending_index_locations.push(location);
             }
-            inner.validated.extend(validated);
+            if let Err(error) = inner.mark_proven_all(validated) {
+                engine.mark_requires_recovery(&mut inner);
+                return Err(error);
+            }
             inner.roots_by_principal = restore.roots;
             if let Err(error) = engine.advance_index_frontier(&mut inner, arena_len) {
                 engine.mark_requires_recovery(&mut inner);
