@@ -32,7 +32,7 @@ impl RuntimePrincipalStore {
     /// # Errors
     /// Fails on a wrong home, active commits, or a durable flush failure.
     pub fn handoff_for_retirement(&self, home: &AstridHome) -> StorageResult<RuntimeRetirement> {
-        super::runtime_tree::validate_retirement_home(home, self)?;
+        super::runtime_tree_active::validate_retirement_home(home, self)?;
         let engine = Arc::new(self.engine.handoff_for_retirement().map_err(|error| {
             StorageError::Connection(format!("transfer runtime store: {error}"))
         })?);

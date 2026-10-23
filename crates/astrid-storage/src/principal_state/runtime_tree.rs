@@ -529,20 +529,6 @@ fn seed_layout_version(home: &AstridHome, store: &RuntimePrincipalStore) -> Stor
     result
 }
 
-/// Verify that finalization is bound to this admitted runtime home.
-pub(super) fn validate_retirement_home(
-    home: &AstridHome,
-    store: &RuntimePrincipalStore,
-) -> StorageResult<()> {
-    if active::read(home, store)?.is_none() {
-        return Err(tree_error(
-            home.root(),
-            "runtime retirement requires an admitted projection receipt",
-        ));
-    }
-    Ok(())
-}
-
 /// Publish current running projection changes, then retire their host files.
 pub(super) fn pack_and_retire_projection(
     home: &AstridHome,
