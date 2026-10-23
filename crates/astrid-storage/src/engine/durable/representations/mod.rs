@@ -46,8 +46,8 @@ mod batch;
 mod cold;
 mod contiguous;
 mod node_view;
-use cold::{ColdNodes, ColdPhysicalMap};
 use cold::memoized_closure_handles;
+use cold::{ColdNodes, ColdPhysicalMap};
 mod direct;
 mod volume;
 use authority::{create_file as create_cap_file, open_file as open_cap_file, quarantine_entry};
@@ -605,15 +605,15 @@ impl RepresentationStore {
         let mut appended_map_nodes = BTreeSet::new();
         for map in [&self.representations, &self.placement_entries] {
             {
-            let (presence, mut complete) = memoized_closure_handles(&self.persisted_map_nodes);
-            append_new_reachable_map_nodes(
-                &mut metadata,
-                map,
-                &presence,
-                &mut appended_map_nodes,
-                &mut complete,
-            )?;
-        }
+                let (presence, mut complete) = memoized_closure_handles(&self.persisted_map_nodes);
+                append_new_reachable_map_nodes(
+                    &mut metadata,
+                    map,
+                    &presence,
+                    &mut appended_map_nodes,
+                    &mut complete,
+                )?;
+            }
         }
         let (catalogue, placements, state) = self.next_authority()?;
         let state_id = state.identify(&Blake3PhysicalIdentity);

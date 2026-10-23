@@ -14,8 +14,6 @@ use super::super::locations::{
     AuthenticatedPageMemo, ClosureProof, LocationIndexMemoryBudget, LocationLookup, PagedLocations,
     RebuildLocations,
 };
-use std::cell::RefCell;
-use std::rc::Rc;
 use super::super::{
     ArenaLocation, DurableError, File, RecoveryLimits, append_frame, io_error, scan_frames,
 };
@@ -26,6 +24,8 @@ use crate::storage_model::{
     BackedPhysicalMap, CanonicalPhysicalMap, ObjectId, PhysicalMapMutNodes, PhysicalMapNode,
     PhysicalMapNodeId, PhysicalMapNodes,
 };
+use std::cell::RefCell;
+use std::rc::Rc;
 
 pub(super) type ColdPhysicalMap = BackedPhysicalMap<ColdNodes>;
 
