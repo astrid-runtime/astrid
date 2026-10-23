@@ -26,9 +26,12 @@ use super::{
 use crate::volume::AstridVolume;
 use std::sync::Arc;
 
+mod snapshot;
 #[cfg(test)]
 mod tests;
 mod validation;
+
+use snapshot::Snapshot;
 
 use validation::validate_state;
 
@@ -321,14 +324,13 @@ pub(super) fn replace_index<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
             super::FaultPoint::BeforeIndexCachePublication,
         ));
     }
-    let payload = encode_snapshot(state, scheme)?;
+    let snapshot = Snapshot::new(state, scheme)?;
     let temporary = format!("{INDEX_FILE}.tmp");
     remove_checkpoint_if_present(directory, &temporary)
         .map_err(|source| super::io_error("remove temporary durable object index", source))?;
     let mut file = create_private_file_capability(directory, Path::new(&temporary))
         .map_err(|error| index_error("create temporary durable object index", error))?;
-    append_frame(&mut file, INDEX_MAGIC, &payload)
-        .map_err(|error| index_error("append durable object-index snapshot", error))?;
+    snapshot.append(&mut file)?;
     file.sync_data()
         .map_err(|source| super::io_error("flush durable object-index snapshot", source))?;
     drop(file);
@@ -354,15 +356,14 @@ pub(super) fn replace_volume_index<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>
             super::FaultPoint::BeforeIndexCachePublication,
         ));
     }
-    let payload = encode_snapshot(state, scheme)?;
+    let snapshot = Snapshot::new(state, scheme)?;
     let mut file = File::volume(volume, INDEX_FILE, true)
         .map_err(|error| index_error("open durable volume object index", error))?;
     file.set_len(0)
         .map_err(|source| super::io_error("truncate durable volume object index", source))?;
     file.seek(SeekFrom::Start(0))
         .map_err(|source| super::io_error("seek durable volume object index", source))?;
-    append_frame(&mut file, INDEX_MAGIC, &payload)
-        .map_err(|error| index_error("append durable volume object-index snapshot", error))?;
+    snapshot.append(&mut file)?;
     file.sync_data()
         .map_err(|source| super::io_error("flush durable volume object-index snapshot", source))?;
     file.seek(SeekFrom::End(0))
@@ -435,10 +436,7 @@ fn append_snapshot<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
     state: &IndexState<M>,
     scheme: IdentityScheme,
 ) -> Result<(), DurableError> {
-    let payload = encode_snapshot(state, scheme)?;
-    append_frame(file, INDEX_MAGIC, &payload)
-        .map_err(|error| index_error("append durable object-index snapshot", error))
-        .map(|_| ())
+    Snapshot::new(state, scheme)?.append(file)
 }
 
 pub(super) fn index_cache_starts_with_snapshot(file: &File) -> bool {
@@ -487,6 +485,7 @@ fn objects_through_arena(
         .collect()
 }
 
+#[cfg(test)]
 fn encode_snapshot<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
     state: &IndexState<M>,
     scheme: IdentityScheme,
