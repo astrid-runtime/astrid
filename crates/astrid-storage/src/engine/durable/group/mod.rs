@@ -1,5 +1,7 @@
 //! Caller-coordinated durability batching for principal-root commits.
 
+use crate::engine::durable::locations::LocationLookup as _;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -423,15 +425,20 @@ where
             };
             match self.persist_group(&mut inner, &accepted) {
                 Ok(persisted) => {
-                    for location in persisted.locations {
-                        inner.index.insert(location.0, location.1);
-                        inner.pending_index_locations.push(location);
-                    }
+                    let install = (|| {
+                        for location in persisted.locations {
+                            inner.index.insert(location.0, location.1)?;
+                            inner.pending_index_locations.push(location);
+                        }
+                        Ok(())
+                    })();
                     debug_assert!(
                         live_files_mut(&mut inner.files)
                             .map_or(true, |files| files.arena_len >= previous_arena_len)
                     );
-                    let frontier = self.publish_commit_frontier(&mut inner, persisted.arena_len);
+                    let frontier = install.and_then(|()| {
+                        self.publish_commit_frontier(&mut inner, persisted.arena_len)
+                    });
                     if let Err(error) = frontier {
                         self.mark_requires_recovery(&mut inner);
                         complete_failed_group(&mut completions, accepted, error);
@@ -548,22 +555,19 @@ where
                         .zip(commit_locations.iter().copied()),
                 )
                 .map(|((id, payload), location)| (id, payload, location));
-            debug_assert!(
-                pending_locations
-                    .iter()
-                    .all(|(id, location)| index.get(id) == Some(location))
-            );
+            let mut shared = Vec::new();
+            for commit in accepted {
+                for id in &commit.prepared.validated {
+                    if let Some(location) = index.location(*id)? {
+                        shared.push((*id, location));
+                    }
+                }
+            }
             self.append_group_representations(
                 &files.arena,
                 representations,
                 PendingRepresentations::new(pending_locations, pending_direct, validated),
-                accepted.iter().flat_map(|commit| {
-                    commit
-                        .prepared
-                        .validated
-                        .iter()
-                        .filter_map(|id| index.get(id).map(|location| (*id, *location)))
-                }),
+                shared.into_iter(),
                 appended,
             )?
         } else {

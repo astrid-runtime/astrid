@@ -1,5 +1,6 @@
 //! Explicit flush and close lifecycle for the durable engine.
 
+use super::locations::LocationLookup as _;
 use super::wal::durable_error as wal_durable_error;
 use super::{
     ARENA_MAGIC, DurableEngine, DurableError, DurableInner, FRAME_HEADER_LEN,
@@ -179,7 +180,7 @@ where
                 if object.location().is_some() {
                     continue;
                 }
-                if let Some(location) = inner.index.get(id).copied() {
+                if let Some(location) = inner.index.location(*id)? {
                     let (_, payload) = read_indexed_object_with_payload(
                         &files.arena,
                         *id,
@@ -205,7 +206,10 @@ where
                     });
                 }
                 for (id, location) in new_ids.iter().copied().zip(appended) {
-                    inner.index.insert(id, location);
+                    if let Err(error) = inner.index.insert(id, location) {
+                        self.mark_requires_recovery(inner);
+                        return Err(error);
+                    }
                     inner.pending_index_locations.push((id, location));
                 }
             }
@@ -269,11 +273,16 @@ where
                 return Ok(());
             }
         }
-        let arena_tail = inner
-            .index
-            .values()
-            .copied()
-            .max_by_key(|location| location.offset);
+        let arena_tail = inner.index.locations().try_fold(None, |tail, entry| {
+            let (_, location) = entry?;
+            Ok::<_, DurableError>(Some(tail.map_or(location, |old: super::ArenaLocation| {
+                if old.offset > location.offset {
+                    old
+                } else {
+                    location
+                }
+            })))
+        })?;
         let arena_len = arena_tail
             .and_then(|location| {
                 location

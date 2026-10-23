@@ -1,5 +1,6 @@
 //! Incremental immutable-object staging for durable root transactions.
 
+use super::locations::LocationLookup as _;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
@@ -303,7 +304,7 @@ where
     ) -> Result<(ObjectId, InsertOutcome), DurableError> {
         let id = self.identify(record);
         let mut inner = self.lock_usable()?;
-        if let Some(location) = inner.index.get(&id).copied() {
+        if let Some(location) = inner.index.location(id)? {
             let existing = {
                 let files = live_files_mut(&mut inner.files)?;
                 read_indexed_object(&files.arena, id, location, &self.identity, self.limits)?
@@ -342,7 +343,10 @@ where
                         return Err(error);
                     },
                 };
-                inner.index.insert(id, location);
+                if let Err(error) = inner.index.insert(id, location) {
+                    self.mark_requires_recovery(&mut inner);
+                    return Err(error);
+                }
                 inner.pending_index_locations.push((id, location));
                 if let Some(direct) = direct {
                     inner.pending_direct_objects.insert(id, direct);
@@ -555,7 +559,7 @@ where
     ) -> Result<BTreeSet<ObjectId>, DurableError> {
         let mut already_present = BTreeSet::new();
         for (id, prepared) in unique {
-            let Some(location) = inner.index.get(id).copied() else {
+            let Some(location) = inner.index.location(*id)? else {
                 continue;
             };
             let existing = {
@@ -584,7 +588,10 @@ where
             ));
         }
         for (id, location) in ids.iter().copied().zip(locations.iter().copied()) {
-            inner.index.insert(id, location);
+            if let Err(error) = inner.index.insert(id, location) {
+                self.mark_requires_recovery(inner);
+                return Err(error);
+            }
             inner.pending_index_locations.push((id, location));
         }
         for (prepared, location) in direct.into_iter().zip(locations.iter().copied()) {

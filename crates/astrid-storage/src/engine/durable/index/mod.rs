@@ -9,7 +9,7 @@
 //! deliberately absent: recovery always derives them from the root journal
 //! and identity-checked arena objects.
 
-use std::borrow::Borrow;
+use super::locations::LocationLookup;
 use std::collections::BTreeMap;
 use std::io::{Seek, SeekFrom};
 use std::path::Path;
@@ -177,7 +177,7 @@ where
                 let previous_state = IndexState {
                     arena_len: frontier.previous_arena_len,
                     arena_tail: frontier.previous_arena_tail,
-                    objects: objects_through_arena(&inner.index, frontier.previous_arena_len),
+                    objects: objects_through_arena(&inner.index, frontier.previous_arena_len)?,
                 };
                 append_snapshot(&mut cache, &previous_state, self.identity.scheme())?;
                 if !frontier.locations.is_empty() {
@@ -211,7 +211,7 @@ where
         Ok(())
     }
 
-    pub(super) fn replace_index_cache<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
+    pub(super) fn replace_index_cache<M: LocationLookup>(
         &self,
         state: &IndexState<M>,
     ) -> Result<File, DurableError> {
@@ -313,7 +313,7 @@ fn decode_record(
 }
 
 /// Replace the disposable index with one complete, flushed checkpoint.
-pub(super) fn replace_index<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
+pub(super) fn replace_index<M: LocationLookup>(
     directory: &cap_std::fs::Dir,
     state: &IndexState<M>,
     scheme: IdentityScheme,
@@ -345,7 +345,7 @@ pub(super) fn replace_index<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
     Ok(reopened)
 }
 
-pub(super) fn replace_volume_index<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
+pub(super) fn replace_volume_index<M: LocationLookup>(
     volume: Arc<dyn AstridVolume>,
     state: &IndexState<M>,
     scheme: IdentityScheme,
@@ -431,7 +431,7 @@ pub(super) fn append_index_delta(
     Ok(())
 }
 
-fn append_snapshot<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
+fn append_snapshot<M: LocationLookup>(
     file: &mut File,
     state: &IndexState<M>,
     scheme: IdentityScheme,
@@ -470,23 +470,14 @@ fn index_cache_is_empty(file: &File) -> bool {
 }
 
 fn objects_through_arena(
-    objects: &BTreeMap<ObjectId, ArenaLocation>,
+    objects: &dyn LocationLookup,
     arena_len: u64,
-) -> BTreeMap<ObjectId, ArenaLocation> {
-    objects
-        .iter()
-        .filter_map(|(id, location)| {
-            let end = location
-                .offset
-                .checked_add(FRAME_HEADER_LEN)
-                .and_then(|value| value.checked_add(location.payload_len))?;
-            (end <= arena_len).then_some((*id, *location))
-        })
-        .collect()
+) -> Result<super::locations::ArenaPrefix<'_>, DurableError> {
+    super::locations::ArenaPrefix::new(objects, arena_len)
 }
 
 #[cfg(test)]
-fn encode_snapshot<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
+fn encode_snapshot<M: LocationLookup>(
     state: &IndexState<M>,
     scheme: IdentityScheme,
 ) -> Result<Vec<u8>, DurableError> {
@@ -495,12 +486,13 @@ fn encode_snapshot<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
     encode_scheme(&mut bytes, scheme);
     bytes.extend_from_slice(&state.arena_len.to_le_bytes());
     encode_optional_location(&mut bytes, state.arena_tail);
-    let objects = state.objects.borrow();
-    encode_len(&mut bytes, objects.len())?;
-    // A BTreeMap is already unique and ordered by the canonical ObjectId.
-    // Borrow its entries directly instead of allocating another full vector.
-    for (id, location) in objects {
-        encode_identity(&mut bytes, scheme, *id);
+    let objects = &state.objects;
+    encode_len(&mut bytes, objects.location_count())?;
+    // LocationLookup guarantees unique entries in canonical ObjectId order.
+    // Stream them directly instead of allocating another full vector.
+    for entry in objects.locations() {
+        let (id, location) = entry?;
+        encode_identity(&mut bytes, scheme, id);
         bytes.extend_from_slice(&location.offset.to_le_bytes());
         bytes.extend_from_slice(&location.payload_len.to_le_bytes());
         bytes.extend_from_slice(&location.checksum);

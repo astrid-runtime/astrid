@@ -1,5 +1,7 @@
 //! Proof-bound liveness capture and crash-recoverable arena compaction.
 
+use crate::engine::durable::locations::LocationLookup as _;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Seek, SeekFrom};
 use std::path::Path;
@@ -350,7 +352,7 @@ where
         let live = self.live_objects(inner, retention)?;
         let record = self.fact_snapshot_record(inner, retention)?;
         let snapshot = GcFactSnapshotId::new(self.identify(&record));
-        let condemned = Self::object_universe(inner)
+        let condemned = Self::object_universe(inner)?
             .into_iter()
             .filter(|id| !live.contains(id))
             .collect();
@@ -419,7 +421,7 @@ where
         bytes.extend_from_slice(retention.policy().object_id().as_bytes());
         encode_current_roots(&mut bytes, &inner.roots_by_principal, &self.principal_codec)?;
         encode_retained_roots(&mut bytes, retention.additional_roots())?;
-        let universe = Self::object_universe(inner);
+        let universe = Self::object_universe(inner)?;
         let object_count =
             u64::try_from(universe.len()).map_err(|_| DurableError::EncodingOverflow)?;
         bytes.extend_from_slice(&object_count.to_le_bytes());
@@ -450,8 +452,12 @@ where
         .map_err(DurableError::Model)
     }
 
-    fn object_universe(inner: &DurableInner<P>) -> BTreeSet<ObjectId> {
-        inner.index.keys().copied().collect::<BTreeSet<_>>()
+    fn object_universe(inner: &DurableInner<P>) -> Result<BTreeSet<ObjectId>, DurableError> {
+        inner
+            .index
+            .locations()
+            .map(|entry| entry.map(|(id, _)| id))
+            .collect()
     }
 
     fn read_compaction_object(
@@ -460,7 +466,7 @@ where
         id: ObjectId,
     ) -> Result<ObjectRecord, DurableError> {
         let super::DurableInner { files, index, .. } = inner;
-        if let Some(location) = index.get(&id).copied() {
+        if let Some(location) = index.location(id)? {
             let files = live_files_mut(files)?;
             return read_indexed_object(&files.arena, id, location, &self.identity, self.limits);
         }
@@ -604,7 +610,7 @@ where
         live: &BTreeSet<ObjectId>,
     ) -> Result<PreparedCompaction, DurableError> {
         cleanup_without_intent(self.hosted_directory()?)?;
-        let objects_before = u64::try_from(Self::object_universe(inner).len())
+        let objects_before = u64::try_from(Self::object_universe(inner)?.len())
             .map_err(|_| DurableError::EncodingOverflow)?;
         let (arena_bytes_before, root_bytes_before, root_digest_before) = {
             let files = live_files_mut(&mut inner.files)?;
@@ -713,7 +719,10 @@ where
         self.object_cache
             .retain_objects(|object| replacement.index.contains_key(&object));
         inner.roots_by_principal = replacement.roots;
-        inner.index = replacement.index;
+        inner.index = super::locations::PagedLocations::from_map(
+            replacement.index,
+            self.index_memory.read().entries(),
+        )?;
         inner.pending_index_locations.clear();
         inner.pending_direct_objects.clear();
         inner.validated = replacement.validated;

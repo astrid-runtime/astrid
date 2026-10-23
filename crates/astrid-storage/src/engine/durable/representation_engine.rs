@@ -1,5 +1,6 @@
 //! Durable-engine integration for authoritative physical representations.
 
+use super::locations::LocationLookup as _;
 use std::collections::BTreeSet;
 
 use crate::storage_model::{ObjectId, RepresentationStateId};
@@ -82,7 +83,7 @@ where
         let mut inner = self.lock_usable()?;
         let excluded: BTreeSet<_> = bootstrap_objects.iter().copied().collect();
         if !excluded.contains(&frozen_specification)
-            || !inner.index.contains_key(&frozen_specification)
+            || inner.index.location(frozen_specification)?.is_none()
         {
             return Err(DurableError::InvalidRepresentationState(
                 "frozen specification is not a persisted bootstrap object",
@@ -101,11 +102,13 @@ where
         let representations = {
             let DurableInner { files, index, .. } = &mut *inner;
             let files = live_files_mut(files)?;
-            let requested = index
-                .iter()
-                .filter(|(object, _)| !excluded.contains(object))
-                .map(|(object, location)| (*object, *location))
-                .collect::<Vec<_>>();
+            let mut requested = Vec::new();
+            for entry in index.locations() {
+                let (object, location) = entry?;
+                if !excluded.contains(&object) {
+                    requested.push((object, location));
+                }
+            }
             let mut objects = Vec::new();
             objects
                 .try_reserve_exact(requested.len())
@@ -170,20 +173,19 @@ where
             ));
         }
         if !excluded.contains(&active_specification)
-            || !inner.index.contains_key(&active_specification)
+            || inner.index.location(active_specification)?.is_none()
         {
             return Err(DurableError::InvalidRepresentationState(
                 "active direct profile specification is not a persisted bootstrap object",
             ));
         }
-        let missing = inner
-            .index
-            .iter()
-            .filter(|(object, _)| {
-                !excluded.contains(object) && !representations.contains_direct(**object)
-            })
-            .map(|(object, location)| (*object, *location))
-            .collect::<Vec<_>>();
+        let mut missing = Vec::new();
+        for entry in inner.index.locations() {
+            let (object, location) = entry?;
+            if !excluded.contains(&object) && !representations.contains_direct(object) {
+                missing.push((object, location));
+            }
+        }
         if missing.is_empty() {
             return Ok(representations.active());
         }

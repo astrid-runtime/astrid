@@ -60,7 +60,7 @@ impl RepresentationStore {
             (&mut self.placement_entries, &mut self.residency.placements),
         ] {
             // Use the last measured reachable closure, not the 2n-1 binary
-            // worst case: dense radix pages can hold many entries per node.
+            // worst case: radix branches can combine more than two children.
             // Crossing twice this baseline amortizes a traversal over new
             // path copies or genuine growth; both establish a fresh baseline.
             if map.nodes().len() > baseline.saturating_mul(2) {

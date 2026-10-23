@@ -1,5 +1,6 @@
 //! Single-sync transaction-WAL publication for a durable commit group.
 
+use super::super::locations::LocationLookup as _;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -112,7 +113,7 @@ where
         prepared: &[BTreeMap<ObjectId, Arc<[u8]>>],
     ) -> Result<(), DurableError> {
         for (id, record) in staged {
-            let location = inner.index.get(id).copied().ok_or(DurableError::Corrupt {
+            let location = inner.index.location(*id)?.ok_or(DurableError::Corrupt {
                 file: ARENA_FILE,
                 offset: 0,
                 detail: "WAL staged object is missing its arena location",

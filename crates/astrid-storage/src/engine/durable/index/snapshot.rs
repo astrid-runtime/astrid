@@ -1,14 +1,13 @@
 //! Constant-workspace encoding of the existing sorted index snapshot.
 
-use std::borrow::Borrow;
-use std::collections::BTreeMap;
+use super::super::locations::LocationLookup;
 use std::io::{BufWriter, SeekFrom, Write};
 
 use super::super::format::{frame_checksum_hasher, frame_header};
 use super::super::{DurableIo, io_error};
 use super::{
-    ArenaLocation, DurableError, INDEX_MAGIC, IdentityScheme, IndexState, LOCATION_BYTES, ObjectId,
-    SNAPSHOT_RECORD, encode_identity, encode_len, encode_optional_location, encode_scheme,
+    DurableError, INDEX_MAGIC, IdentityScheme, IndexState, LOCATION_BYTES, SNAPSHOT_RECORD,
+    encode_identity, encode_len, encode_optional_location, encode_scheme,
 };
 
 // An I/O coalescing target, not a retention or admission limit. Neither the
@@ -17,25 +16,25 @@ const WRITE_BUFFER_BYTES: usize = 64 * 1024;
 
 pub(super) struct Snapshot<'a> {
     prefix: Vec<u8>,
-    objects: &'a BTreeMap<ObjectId, ArenaLocation>,
+    objects: &'a dyn LocationLookup,
     scheme: IdentityScheme,
     payload_len: u64,
 }
 
 impl<'a> Snapshot<'a> {
-    pub(super) fn new<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
+    pub(super) fn new<M: LocationLookup>(
         state: &'a IndexState<M>,
         scheme: IdentityScheme,
     ) -> Result<Self, DurableError> {
-        let objects = state.objects.borrow();
+        let objects = &state.objects;
         let mut prefix = Vec::new();
         prefix.push(SNAPSHOT_RECORD);
         encode_scheme(&mut prefix, scheme);
         prefix.extend_from_slice(&state.arena_len.to_le_bytes());
         encode_optional_location(&mut prefix, state.arena_tail);
-        encode_len(&mut prefix, objects.len())?;
+        encode_len(&mut prefix, objects.location_count())?;
         let payload_len = objects
-            .len()
+            .location_count()
             .checked_mul(LOCATION_BYTES)
             .and_then(|bytes| bytes.checked_add(prefix.len()))
             .and_then(|bytes| u64::try_from(bytes).ok())
@@ -80,9 +79,10 @@ impl<'a> Snapshot<'a> {
     ) -> Result<(), DurableError> {
         visit(&self.prefix)?;
         let mut entry = Vec::with_capacity(LOCATION_BYTES);
-        for (id, location) in self.objects {
+        for record in self.objects.locations() {
+            let (id, location) = record?;
             entry.clear();
-            encode_identity(&mut entry, self.scheme, *id);
+            encode_identity(&mut entry, self.scheme, id);
             entry.extend_from_slice(&location.offset.to_le_bytes());
             entry.extend_from_slice(&location.payload_len.to_le_bytes());
             entry.extend_from_slice(&location.checksum);

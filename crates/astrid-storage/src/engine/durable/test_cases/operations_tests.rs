@@ -451,7 +451,7 @@ fn staged_batch_appender_failure_installs_no_authority() {
     let inner = engine.inner.lock();
     assert!(inner.poisoned);
     assert!(inner.roots_by_principal.is_empty());
-    assert!(ids.iter().all(|id| !inner.index.contains_key(id)));
+    assert!(ids.iter().all(|id| inner.index.location(*id).unwrap().is_none()));
     assert!(ids.iter().all(|id| !inner.validated.contains(id)));
     assert_eq!(
         engine.lifecycle.load(Ordering::Acquire),

@@ -4,10 +4,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::storage_model::{ModelError, ObjectId, RootGeneration, RootState};
 
+use super::locations::LocationLookup;
+
 use super::{
-    ArenaLocation, DurableError, DurableIo, File, IdentityScheme, PersistentObjectIdentity,
-    PrincipalCodec, ROOT_FILE, ROOT_MAGIC, RecoveryLimits, corrupt, materialize_closure,
-    preload_indexed_closures, recovery_closure_error, scan_frames, validate_commit_closure,
+    DurableError, DurableIo, File, IdentityScheme, PersistentObjectIdentity, PrincipalCodec,
+    ROOT_FILE, ROOT_MAGIC, RecoveryLimits, corrupt, materialize_closure, preload_indexed_closures,
+    recovery_closure_error, scan_frames, validate_commit_closure,
 };
 
 const SNAPSHOT_SENTINEL: u64 = u64::MAX;
@@ -37,7 +39,7 @@ where
 pub(super) fn recover_roots<P, I, C, R>(
     roots: &mut R,
     arena: &mut File,
-    index: &BTreeMap<ObjectId, ArenaLocation>,
+    index: &dyn LocationLookup,
     codec: &C,
     identity: &I,
     limits: RecoveryLimits,
@@ -55,7 +57,7 @@ where
 fn validate_recovered_roots<P, I>(
     recovered: BTreeMap<P, (RootState, u64)>,
     arena: &mut File,
-    index: &BTreeMap<ObjectId, ArenaLocation>,
+    index: &dyn LocationLookup,
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<(BTreeMap<P, RootState>, BTreeSet<ObjectId>), DurableError>

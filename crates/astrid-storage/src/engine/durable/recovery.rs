@@ -407,7 +407,13 @@ where
     /// recovery error while leaving the engine poisoned and retryable.
     pub fn recover_if_required(&self) -> Result<bool, DurableError> {
         match self.lifecycle.load(std::sync::atomic::Ordering::Acquire) {
-            LIFECYCLE_USABLE => return Ok(false),
+            LIFECYCLE_USABLE => {
+                let mut inner = self.inner.lock();
+                if !inner.index.failed() {
+                    return Ok(false);
+                }
+                self.mark_requires_recovery(&mut inner);
+            },
             LIFECYCLE_CLOSED => return Err(DurableError::Closed),
             _ => {},
         }
@@ -417,6 +423,9 @@ where
     }
 
     fn recover_locked(&self, inner: &mut DurableInner<P>) -> Result<bool, DurableError> {
+        if inner.index.failed() {
+            self.mark_requires_recovery(inner);
+        }
         if !inner.poisoned {
             return if inner.files.is_some() {
                 Ok(false)
@@ -448,14 +457,18 @@ where
             } else {
                 self.recover_media().and_then(|(mut recovered, wal)| {
                     stabilize_recovered_store(&mut recovered, self.faults.as_ref())?;
-                    Ok((recovered, wal))
+                    let index = super::locations::PagedLocations::from_map(
+                        std::mem::take(&mut recovered.index),
+                        self.index_memory.read().entries(),
+                    )?;
+                    Ok((recovered, wal, index))
                 })
             };
             match recovered {
-                Ok((recovered, wal)) => {
+                Ok((recovered, wal, index)) => {
                     inner.roots_by_principal = recovered.roots_by_principal;
                     self.published_roots.replace(&inner.roots_by_principal);
-                    inner.index = recovered.index;
+                    inner.index = index;
                     inner.pending_index_locations.clear();
                     inner.pending_direct_objects.clear();
                     inner.pending_wal = super::wal::PendingWalOverlay::default();
@@ -526,6 +539,9 @@ where
         recovery: &mut RecoveryScope,
     ) -> Result<MutexGuard<'_, DurableInner<P>>, DurableError> {
         let mut inner = self.inner.lock();
+        if inner.index.failed() {
+            self.mark_requires_recovery(&mut inner);
+        }
         if inner.poisoned {
             recovery.enter()?;
             self.recover_locked(&mut inner)?;

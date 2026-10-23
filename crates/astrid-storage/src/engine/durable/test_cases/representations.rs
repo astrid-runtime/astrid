@@ -738,7 +738,7 @@ fn unverified_staged_witness_cannot_hide_arena_tampering() {
     )
     .unwrap();
     let (staged_id, _) = engine.stage_object(&staged).unwrap();
-    let location = engine.inner.lock().index[&staged_id];
+    let location = engine.inner.lock().index.location(staged_id).unwrap().unwrap();
     let byte_offset = location
         .offset
         .checked_add(FRAME_HEADER_LEN)
@@ -785,7 +785,7 @@ fn published_direct_tail_corruption_is_not_truncated() {
     )
     .unwrap();
     let (staged_id, _) = engine.stage_object(&staged).unwrap();
-    let location = engine.inner.lock().index[&staged_id];
+    let location = engine.inner.lock().index.location(staged_id).unwrap().unwrap();
     engine.close().unwrap();
     drop(engine);
 
@@ -853,7 +853,7 @@ fn reopen_defers_unreachable_interior_frame_scrub_until_read() {
     let (corrupt_id, location) = {
         let inner = engine.inner.lock();
         ids.into_iter()
-            .map(|id| (id, inner.index[&id]))
+            .map(|id| (id, inner.index.location(id).unwrap().unwrap()))
             .min_by_key(|(_, location)| location.offset)
             .unwrap()
     };

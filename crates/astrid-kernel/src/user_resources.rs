@@ -51,7 +51,15 @@ pub(crate) fn configure_object_cache(
     workspace: &std::path::Path,
     layout: &astrid_core::dirs::WorkspaceLayout,
 ) -> std::io::Result<()> {
-    if let Some(bytes) = load_policy(home, workspace, layout)?.decoded_object_cache_bytes {
+    let policy = load_policy(home, workspace, layout)?;
+    if let Some(bytes) = policy.location_index_memory_bytes {
+        let budget = astrid_storage::LocationIndexMemoryBudget::new(bytes.get())
+            .map_err(std::io::Error::other)?;
+        store
+            .set_location_index_memory(budget)
+            .map_err(std::io::Error::other)?;
+    }
+    if let Some(bytes) = policy.decoded_object_cache_bytes {
         store.set_object_cache_capacity(astrid_storage::engine::ObjectCacheCapacity::Bounded(
             bytes.get(),
         ));

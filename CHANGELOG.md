@@ -8,6 +8,10 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ## [Unreleased]
 
+### Fixed
+
+- Move the complete logical object locator into authenticated disposable disk runs with an operator-controlled staging-memory target. Preserve every historical location, rebuild scratch corruption from durable authority, and stream checkpoint prefixes without copying the full index. Closes #2216.
+
 ## [2026.10.1] - 2026-10-15
 
 ### Fixed

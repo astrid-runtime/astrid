@@ -509,6 +509,21 @@ impl RuntimePrincipalStore {
         self.engine.reclaim_object_cache();
     }
 
+    /// Set the shared disposable historical-index staging budget.
+    ///
+    /// # Errors
+    /// Returns an error if the live engine or its required spill cannot be used.
+    pub fn set_location_index_memory(
+        &self,
+        budget: crate::engine::LocationIndexMemoryBudget,
+    ) -> super::principal_state::StorageResult<()> {
+        self.engine
+            .set_location_index_memory(budget)
+            .map_err(|error| {
+                StorageError::Connection(format!("configure historical index memory: {error}"))
+            })
+    }
+
     /// Apply a total decoded-object cache target and immediately reclaim.
     /// Durable objects, history and explicit per-principal budgets are unchanged.
     pub fn set_object_cache_capacity(&self, capacity: crate::engine::ObjectCacheCapacity) {

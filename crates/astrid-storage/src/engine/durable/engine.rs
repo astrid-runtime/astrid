@@ -1,3 +1,4 @@
+use super::locations::LocationLookup as _;
 use super::{
     ARENA_FILE, ARENA_MAGIC, Arc, BTreeMap, BTreeSet, ClosureObjects, DurableEngine, DurableError,
     DurableInner, FaultPoint, InsertOutcome, LIFECYCLE_CLOSED, LIFECYCLE_REQUIRES_RECOVERY,
@@ -89,11 +90,7 @@ where
                     .pending_wal
                     .get_object(&id)
                     .map(|object| Arc::new(object.record().clone()));
-                (
-                    pending,
-                    inner.index.get(&id).copied(),
-                    inner.arena_generation,
-                )
+                (pending, inner.index.location(id)?, inner.arena_generation)
             };
             if let Some(record) = pending {
                 if let Some(record) = self.retain_loaded_object_if_current_with(
@@ -190,10 +187,12 @@ where
         loop {
             let (locations, generation) = {
                 let inner = self.lock_usable_with(&mut recovery)?;
-                let locations = missing
-                    .keys()
-                    .filter_map(|id| inner.index.get(id).copied().map(|location| (*id, location)))
-                    .collect::<Vec<_>>();
+                let mut locations = Vec::new();
+                for id in missing.keys() {
+                    if let Some(location) = inner.index.location(*id)? {
+                        locations.push((*id, location));
+                    }
+                }
                 (locations, inner.arena_generation)
             };
             let reader_guard = self.arena_reader.read();
@@ -248,7 +247,7 @@ where
         recovery: &mut RecoveryScope,
     ) -> Result<Option<Arc<ObjectRecord>>, DurableError> {
         let inner = self.lock_usable_with(recovery)?;
-        if inner.arena_generation != generation || !inner.index.contains_key(&id) {
+        if inner.arena_generation != generation || inner.index.location(id)?.is_none() {
             return Ok(None);
         }
         Ok(Some(self.object_cache.insert(principal, id, record)))
@@ -275,6 +274,21 @@ where
             LIFECYCLE_REQUIRES_RECOVERY,
             std::sync::atomic::Ordering::Release,
         );
+    }
+
+    /// Set the disposable historical-locator staging budget without changing
+    /// durable authority. A failed spill leaves the previous policy in force.
+    ///
+    /// # Errors
+    /// Returns a storage or scratch-I/O error while retaining all locations.
+    pub fn set_location_index_memory(
+        &self,
+        budget: super::LocationIndexMemoryBudget,
+    ) -> Result<(), DurableError> {
+        let mut inner = self.lock_usable()?;
+        inner.index.set_limit(budget.entries())?;
+        *self.index_memory.write() = budget;
+        Ok(())
     }
 
     /// Return privileged cache diagnostics.
@@ -375,7 +389,7 @@ where
         }
         let id = self.identify(record);
         let mut inner = self.lock_usable()?;
-        if let Some(location) = inner.index.get(&id).copied() {
+        if let Some(location) = inner.index.location(id)? {
             return self.persist_existing_standalone(&mut inner, id, location, record);
         }
         self.persist_new_standalone(&mut inner, id, record)
@@ -478,7 +492,10 @@ where
                 return Err(error);
             },
         };
-        inner.index.insert(id, location);
+        if let Err(error) = inner.index.insert(id, location) {
+            self.mark_requires_recovery(inner);
+            return Err(error);
+        }
         inner.pending_index_locations.push((id, location));
         inner.validated.insert(id);
         debug_assert_eq!(
@@ -709,7 +726,7 @@ where
                 }
                 continue;
             }
-            if let Some(location) = inner.index.get(&id).copied() {
+            if let Some(location) = inner.index.location(id)? {
                 let files = live_files_mut(&mut inner.files)?;
                 let existing =
                     read_indexed_object(&files.arena, id, location, &self.identity, self.limits)?;

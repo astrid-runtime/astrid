@@ -1,5 +1,7 @@
 //! Astrid-volume arena replacement under the compaction mutation fence.
 
+use crate::engine::durable::locations::LocationLookup as _;
+
 use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
 
@@ -59,7 +61,7 @@ where
         let mut arena = File::volume(Arc::clone(volume), ARENA_COMPACTING, true)?;
         let mut new_index = BTreeMap::new();
         for id in live {
-            if !inner.index.contains_key(id) {
+            if inner.index.location(*id)?.is_none() {
                 continue;
             }
             let record = self.read_compaction_object(inner, *id)?;
@@ -248,7 +250,10 @@ where
         self.object_cache
             .retain_objects(|object| replacement.index.contains_key(&object));
         inner.roots_by_principal = replacement.roots;
-        inner.index = replacement.index;
+        inner.index = super::super::locations::PagedLocations::from_map(
+            replacement.index,
+            self.index_memory.read().entries(),
+        )?;
         inner.pending_index_locations.clear();
         inner.pending_direct_objects.clear();
         inner.validated = replacement.validated;
