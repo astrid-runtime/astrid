@@ -248,9 +248,21 @@ impl OwnershipStore {
         alias: Option<PrincipalId>,
         authority: Option<(PrincipalUid, &[u8; 32])>,
     ) -> Result<PrincipalDeletionGuard, OwnershipError> {
+        self.guard_principal_deletion_checked(principal_uid, alias, |graph| {
+            Self::authorize_deletion(graph, principal_uid, authority)
+        })
+        .await
+    }
+
+    pub(super) async fn guard_principal_deletion_checked(
+        &self,
+        principal_uid: PrincipalUid,
+        alias: Option<PrincipalId>,
+        authorize: impl Fn(&OwnershipSnapshot) -> Result<Option<FleetUid>, OwnershipError>,
+    ) -> Result<PrincipalDeletionGuard, OwnershipError> {
         let guard = Arc::clone(&self.mutation_lock).lock_owned().await;
         self.mutate_unlocked(|graph| {
-            let fleet = Self::authorize_deletion(graph, principal_uid, authority)?;
+            let fleet = authorize(graph)?;
             if let Some(requested) = &alias
                 && let Ok(live_alias) = self.principals.alias_for(principal_uid)
                 && &live_alias != requested

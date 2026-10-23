@@ -53,8 +53,8 @@ async fn spawn_inherits_fleet_without_human_delegation_and_rejects_stale_or_owne
         .await
         .unwrap();
     let captured = store.capture_derived_ownership(creator).await.unwrap();
-    store
-        .assign_derived_principal(child, &captured)
+    let initialization = store
+        .assign_derived_principal_for_initialization(child, &captured)
         .await
         .unwrap();
     let graph = store.load().await.unwrap();
@@ -82,8 +82,8 @@ async fn spawn_inherits_fleet_without_human_delegation_and_rejects_stale_or_owne
     );
     assert_eq!(before, store.load().await.unwrap());
     let fresh = store.capture_derived_ownership(creator).await.unwrap();
-    store
-        .assign_derived_principal(stale_child, &fresh)
+    let transferred = store
+        .assign_derived_principal_for_initialization(stale_child, &fresh)
         .await
         .unwrap();
     assert_eq!(
@@ -96,4 +96,36 @@ async fn spawn_inherits_fleet_without_human_delegation_and_rejects_stale_or_owne
             .fleet_uid,
         fleets[1].uid
     );
+    let before = store.load().await.unwrap();
+    assert!(
+        initialization
+            .reserve_rollback(PrincipalId::new("stale").unwrap())
+            .await
+            .is_err()
+    );
+    assert_eq!(before, store.load().await.unwrap());
+    assert!(store.guard_principal_deletion(child).await.is_err());
+    store
+        .transfer_principal(stale_child, fleets[1].uid, fleets[0].uid, user.uid)
+        .await
+        .unwrap();
+    let before = store.load().await.unwrap();
+    assert!(
+        transferred
+            .reserve_rollback(PrincipalId::new("stale").unwrap())
+            .await
+            .is_err()
+    );
+    assert_eq!(before, store.load().await.unwrap());
+    let guard = initialization
+        .reserve_rollback(PrincipalId::new("child").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(guard.principal_uid(), child);
+    drop(guard);
+    let pending = store.load().await.unwrap();
+    assert!(pending.principal_owner(child).is_none());
+    assert!(pending.accountable_user(child).is_none());
+    assert!(pending.principal_deletions.contains_key(&child));
+    assert!(store.assign_derived_principal(child, &fresh).await.is_err());
 }
