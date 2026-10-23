@@ -651,11 +651,7 @@ pub(super) fn append_frame<F: DurableIo>(
     let offset = file
         .seek(SeekFrom::End(0))
         .map_err(|source| io_error("seek durable append", source))?;
-    let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
-    header[..8].copy_from_slice(&magic);
-    header[8..10].copy_from_slice(&FRAME_VERSION.to_le_bytes());
-    header[12..20].copy_from_slice(&payload_len.to_le_bytes());
-    header[CHECKSUM_START..].copy_from_slice(&checksum);
+    let header = frame_header(magic, payload_len, checksum);
     file.write_all(&header)
         .map_err(|source| io_error("append durable frame header", source))?;
     file.write_all(payload)
@@ -699,11 +695,7 @@ pub(super) fn append_frames<T: AsRef<[u8]>, F: DurableIo>(
         let offset = base
             .checked_add(relative)
             .ok_or(DurableError::EncodingOverflow)?;
-        let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
-        header[..8].copy_from_slice(&magic);
-        header[8..10].copy_from_slice(&FRAME_VERSION.to_le_bytes());
-        header[12..20].copy_from_slice(&payload_len.to_le_bytes());
-        header[CHECKSUM_START..].copy_from_slice(&checksum);
+        let header = frame_header(magic, payload_len, checksum);
         encoded.extend_from_slice(&header);
         encoded.extend_from_slice(payload);
         locations.push(ArenaLocation {
@@ -718,12 +710,30 @@ pub(super) fn append_frames<T: AsRef<[u8]>, F: DurableIo>(
 }
 
 pub(super) fn frame_checksum(magic: [u8; 8], payload_len: u64, payload: &[u8]) -> [u8; 32] {
+    let mut hasher = frame_checksum_hasher(magic, payload_len);
+    hasher.update(payload);
+    *hasher.finalize().as_bytes()
+}
+
+pub(super) fn frame_checksum_hasher(magic: [u8; 8], payload_len: u64) -> blake3::Hasher {
     let mut hasher = blake3::Hasher::new_derive_key("astrid durable physical frame checksum v1");
     hasher.update(&magic);
     hasher.update(&FRAME_VERSION.to_le_bytes());
     hasher.update(&payload_len.to_le_bytes());
-    hasher.update(payload);
-    *hasher.finalize().as_bytes()
+    hasher
+}
+
+pub(super) fn frame_header(
+    magic: [u8; 8],
+    payload_len: u64,
+    checksum: [u8; 32],
+) -> [u8; FRAME_HEADER_LEN_USIZE] {
+    let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
+    header[..8].copy_from_slice(&magic);
+    header[8..10].copy_from_slice(&FRAME_VERSION.to_le_bytes());
+    header[12..20].copy_from_slice(&payload_len.to_le_bytes());
+    header[CHECKSUM_START..].copy_from_slice(&checksum);
+    header
 }
 
 pub(super) fn corrupt(file: &'static str, offset: u64, detail: &'static str) -> DurableError {
