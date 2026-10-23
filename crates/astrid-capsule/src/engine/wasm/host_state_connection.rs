@@ -3,6 +3,11 @@
 
 use super::*;
 
+// These registries belong to a capsule pool, not the whole process. DashMap's
+// CPU-sized default eagerly allocates empty shards for every loaded capsule.
+// Two is its minimum supported shard count; entries still grow on demand and
+// pooled Stores retain the same shared, independently locked registries.
+
 impl HostState {
     /// Build a fresh, empty per-connection identity registry.
     ///
@@ -12,7 +17,7 @@ impl HostState {
     /// registry into every instance (issue #45/#852).
     #[must_use]
     pub fn new_connection_principals() -> Arc<dashmap::DashMap<u32, ConnectionIdentity>> {
-        Arc::new(dashmap::DashMap::new())
+        Arc::new(dashmap::DashMap::with_shard_amount(2))
     }
 
     /// Build a fresh, empty per-connection client-lifecycle registry.
@@ -26,7 +31,7 @@ impl HostState {
     #[must_use]
     pub fn new_client_connections()
     -> Arc<dashmap::DashMap<u32, astrid_core::principal::PrincipalId>> {
-        Arc::new(dashmap::DashMap::new())
+        Arc::new(dashmap::DashMap::with_shard_amount(2))
     }
 
     /// Build a fresh, empty shared-listener registry.
@@ -40,7 +45,7 @@ impl HostState {
     #[must_use]
     pub fn new_shared_listeners() -> Arc<dashmap::DashMap<(String, u16), super::SharedTcpListener>>
     {
-        Arc::new(dashmap::DashMap::new())
+        Arc::new(dashmap::DashMap::with_shard_amount(2))
     }
 
     /// Bind `principal` and the authenticating device `key_id` to the
@@ -94,5 +99,60 @@ impl HostState {
     /// registry does not leak entries for closed connections.
     pub(crate) fn unbind_connection_principal(&self, rep: u32) {
         self.connection_principals.remove(&rep);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_connection_registries_have_bounded_shard_overhead() {
+        assert_eq!(HostState::new_connection_principals().shards().len(), 2);
+        assert_eq!(HostState::new_client_connections().shards().len(), 2);
+        assert_eq!(HostState::new_shared_listeners().shards().len(), 2);
+    }
+
+    #[test]
+    fn concurrent_connection_bindings_preserve_identity_and_owner() {
+        let registry = HostState::new_connection_principals();
+        std::thread::scope(|scope| {
+            for rep in 0..16 {
+                let registry = &registry;
+                scope.spawn(move || {
+                    let principal = astrid_core::PrincipalId::new(format!("client-{rep}"))
+                        .expect("valid principal");
+                    let device_key_id = Some(format!("device-{rep}"));
+                    let request_owner = astrid_events::ipc::RequestOwnerId::generate();
+                    registry.insert(
+                        rep,
+                        ConnectionIdentity {
+                            principal: principal.clone(),
+                            device_key_id: device_key_id.clone(),
+                            request_owner,
+                        },
+                    );
+                    let identity = registry.get(&rep).expect("bound identity");
+                    assert_eq!(identity.principal, principal);
+                    assert_eq!(identity.device_key_id, device_key_id);
+                    assert_eq!(identity.request_owner, request_owner);
+                    drop(identity);
+                    assert!(registry.remove(&rep).is_some());
+                });
+            }
+        });
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn fresh_client_registries_keep_stream_identifiers_private() {
+        let first = HostState::new_client_connections();
+        let second = HostState::new_client_connections();
+        let alice = astrid_core::PrincipalId::new("alice").expect("valid principal");
+        first.insert(42, alice.clone());
+        assert_eq!(first.get(&42).as_deref(), Some(&alice));
+        assert!(second.get(&42).is_none());
+        first.remove(&42);
+        assert!(first.is_empty());
     }
 }

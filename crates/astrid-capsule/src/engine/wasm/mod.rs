@@ -3924,10 +3924,10 @@ async fn build_lifecycle_host_state(
         process_count_by_principal: std::collections::HashMap::new(),
         // Lifecycle hooks never accept socket connections; a throwaway
         // registry satisfies the field (issue #45/#852).
-        connection_principals: Arc::new(dashmap::DashMap::new()),
+        connection_principals: HostState::new_connection_principals(),
         // Lifecycle hooks never accept inbound uplink connections; a throwaway
         // lifecycle registry satisfies the field.
-        client_connections: Arc::new(dashmap::DashMap::new()),
+        client_connections: HostState::new_client_connections(),
         // Lifecycle hooks never bind a listener; a throwaway registry satisfies
         // the field.
         shared_listeners: HostState::new_shared_listeners(),
