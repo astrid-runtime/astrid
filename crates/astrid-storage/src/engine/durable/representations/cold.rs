@@ -46,7 +46,21 @@ struct StagedNodes {
     locations: PagedLocations,
 }
 
+/// Page proofs live only for the bounded traversal that owns this provider.
+/// Decoded node bodies are never retained and remain authenticated on each read.
+pub(super) struct ColdMemoNodes<'a> {
+    cold: &'a ColdNodes,
+    memo: RefCell<AuthenticatedPageMemo>,
+}
+
 impl ColdNodes {
+    pub(super) fn memoized_nodes(&self) -> ColdMemoNodes<'_> {
+        ColdMemoNodes {
+            cold: self,
+            memo: RefCell::new(AuthenticatedPageMemo::default()),
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn from_metadata(
         file: &File,
@@ -288,13 +302,21 @@ impl super::activation::CompleteNodes for ColdMemoComplete<'_> {
 
 impl NodeArena {
     fn node(&self, id: PhysicalMapNodeId) -> Result<Option<PhysicalMapNode>, DurableError> {
+        self.node_memo(id, &mut AuthenticatedPageMemo::default())
+    }
+
+    fn node_memo(
+        &self,
+        id: PhysicalMapNodeId,
+        memo: &mut AuthenticatedPageMemo,
+    ) -> Result<Option<PhysicalMapNode>, DurableError> {
         let key = ObjectId::new(*id.as_bytes());
         if let Some(staged) = &self.staged
             && let Some(location) = staged.locations.location(key)?
         {
             return read_node(&staged.file, self.limits, id, location).map(Some);
         }
-        let Some(location) = self.locations.location(key)? else {
+        let Some(location) = self.locations.location_memo(key, memo)? else {
             return Ok(None);
         };
         read_node(&self.file, self.limits, id, location).map(Some)
@@ -312,6 +334,28 @@ impl PhysicalMapNodes for ColdNodes {
     ) -> Result<Option<Cow<'_, PhysicalMapNode>>, DurableError> {
         let mut arena = self.0.lock();
         let result = arena.node(id).map(|node| node.map(Cow::Owned));
+        if result.is_err() {
+            arena.failed = true;
+        }
+        result
+    }
+}
+
+impl PhysicalMapNodes for ColdMemoNodes<'_> {
+    type Error = DurableError;
+
+    fn note_read_failure(&self) {
+        self.cold.note_read_failure();
+    }
+
+    fn node(
+        &self,
+        id: PhysicalMapNodeId,
+    ) -> Result<Option<Cow<'_, PhysicalMapNode>>, DurableError> {
+        let mut arena = self.cold.0.lock();
+        let result = arena
+            .node_memo(id, &mut self.memo.borrow_mut())
+            .map(|node| node.map(Cow::Owned));
         if result.is_err() {
             arena.failed = true;
         }

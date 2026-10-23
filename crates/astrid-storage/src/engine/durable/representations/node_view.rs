@@ -1,9 +1,9 @@
 //! Complete, fallible traversal shared by resident recovery and cold runtime views.
 
-use super::cold::ColdPhysicalMap;
 use super::{DurableError, format::Blake3PhysicalIdentity};
 use crate::storage_model::{
-    CanonicalPhysicalMap, PhysicalMapKey, PhysicalMapNode, PhysicalMapNodeId,
+    BackedPhysicalMap, CanonicalPhysicalMap, PhysicalMapKey, PhysicalMapNode, PhysicalMapNodeId,
+    PhysicalMapNodes,
 };
 
 pub(super) trait MapView {
@@ -25,7 +25,7 @@ impl MapView for CanonicalPhysicalMap {
             .map_err(Into::into)
     }
 }
-impl MapView for ColdPhysicalMap {
+impl<N: PhysicalMapNodes<Error = DurableError>> MapView for BackedPhysicalMap<N> {
     fn view_root(&self) -> Option<PhysicalMapNodeId> {
         self.root()
     }
