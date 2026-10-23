@@ -33,6 +33,8 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# Inspect eager shard storage in allocation-overhead regression tests only.
+dashmap = { workspace = true, features = ["raw-api"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 # Thread-local debugging recorder for asserting metric emission in unit
 # tests without installing a global recorder (`with_local_recorder`).

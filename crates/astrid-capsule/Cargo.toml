@@ -103,6 +103,8 @@ wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
 
 [dev-dependencies]
+# Inspect eager shard storage in allocation-overhead regression tests only.
+dashmap = { workspace = true, features = ["raw-api"] }
 astrid-crypto = { workspace = true }
 astrid-mcp = { workspace = true, features = ["test-support"] }
 astrid-uplink = { workspace = true, features = ["test-support"] }

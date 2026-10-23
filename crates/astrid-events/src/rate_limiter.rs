@@ -38,7 +38,11 @@ impl IpcRateLimiter {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            state: dashmap::DashMap::new(),
+            // A limiter is shared within one capsule pool. Avoid a CPU-sized
+            // empty shard array for each loaded capsule; two is DashMap's
+            // minimum. Bucket keys and entry-level atomic accounting stay
+            // unchanged, and the table grows with actual traffic.
+            state: dashmap::DashMap::with_shard_amount(2),
             last_prune: std::sync::Mutex::new(web_time::Instant::now()),
         }
     }
@@ -114,6 +118,45 @@ mod tests {
 
     const ONE_MIB: usize = 1024 * 1024;
     const TEN_MIB: usize = 10 * 1024 * 1024;
+
+    #[test]
+    fn idle_limiter_has_bounded_shard_overhead() {
+        let limiter = IpcRateLimiter::new();
+        assert_eq!(limiter.state.shards().len(), 2);
+        assert!(limiter.state.is_empty());
+    }
+
+    #[test]
+    fn concurrent_publishers_cannot_overdraw_shared_bucket() {
+        let limiter = IpcRateLimiter::new();
+        let capsule = Uuid::new_v4();
+        let principal = pid("concurrent");
+        // Keep the accounting window fixed while threads contend, without
+        // relying on the scheduler finishing within one wall-clock second.
+        limiter.state.insert(
+            (capsule, principal.clone()),
+            (
+                web_time::Instant::now() + std::time::Duration::from_mins(1),
+                0,
+            ),
+        );
+        let admitted = std::sync::atomic::AtomicUsize::new(0);
+        let start = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    start.wait();
+                    for _ in 0..100 {
+                        if limiter.check_quota(capsule, &principal, 1, 100).is_ok() {
+                            admitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(admitted.into_inner(), 100);
+        assert_eq!(limiter.state.get(&(capsule, principal)).unwrap().1, 100);
+    }
 
     #[test]
     fn payload_above_hard_cap_rejected_regardless_of_profile() {
