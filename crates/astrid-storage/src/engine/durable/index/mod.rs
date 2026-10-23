@@ -9,6 +9,7 @@
 //! deliberately absent: recovery always derives them from the root journal
 //! and identity-checked arena objects.
 
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::io::{Seek, SeekFrom};
 use std::path::Path;
@@ -25,6 +26,15 @@ use super::{
 use crate::volume::AstridVolume;
 use std::sync::Arc;
 
+mod snapshot;
+#[cfg(test)]
+mod tests;
+mod validation;
+
+use snapshot::Snapshot;
+
+use validation::validate_state;
+
 const SNAPSHOT_RECORD: u8 = 1;
 const DELTA_RECORD: u8 = 2;
 const CURRENT_DIGEST_BYTES: u32 = 32;
@@ -32,10 +42,10 @@ const TAGGED_IDENTITY_BYTES: usize = 40;
 const LOCATION_BYTES: usize = TAGGED_IDENTITY_BYTES + 8 + 8 + 32;
 
 /// Recovered disposable object-location state.
-pub(super) struct IndexState {
+pub(super) struct IndexState<M = BTreeMap<ObjectId, ArenaLocation>> {
     pub(super) arena_len: u64,
     pub(super) arena_tail: Option<ArenaLocation>,
-    pub(super) objects: BTreeMap<ObjectId, ArenaLocation>,
+    pub(super) objects: M,
 }
 
 /// One successfully persisted object-arena change cached after publication.
@@ -192,7 +202,7 @@ where
                 let current_state = IndexState {
                     arena_len: frontier.arena_len,
                     arena_tail: frontier.arena_tail,
-                    objects: inner.index.clone(),
+                    objects: &inner.index,
                 };
                 drop(files.index_cache.take());
                 files.index_cache = Some(self.replace_index_cache(&current_state)?);
@@ -201,7 +211,10 @@ where
         Ok(())
     }
 
-    pub(super) fn replace_index_cache(&self, state: &IndexState) -> Result<File, DurableError> {
+    pub(super) fn replace_index_cache<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
+        &self,
+        state: &IndexState<M>,
+    ) -> Result<File, DurableError> {
         let volume = self.volume.read();
         match (self.directory_capability.as_deref(), volume.as_ref()) {
             (Some(directory), None) => replace_index(
@@ -242,26 +255,7 @@ pub(super) fn recover_index(
         INDEX_MAGIC,
         RecoveryLimits::process_addressable(),
         |offset, payload| {
-            let mut reader = WireReader::new(payload);
-            let record = reader.u8().map_err(|detail| corrupt(offset, detail))?;
-            let decoded = match record {
-                SNAPSHOT_RECORD if state.is_none() => decode_snapshot(&mut reader, scheme, offset)?,
-                DELTA_RECORD => {
-                    let current = state
-                        .take()
-                        .ok_or_else(|| corrupt(offset, "index delta precedes snapshot"))?;
-                    apply_delta(current, &mut reader, scheme, offset)?
-                },
-                SNAPSHOT_RECORD => {
-                    return Err(corrupt(offset, "index contains more than one snapshot"));
-                },
-                _ => return Err(corrupt(offset, "unknown index record kind")),
-            };
-            if reader.remaining() != 0 {
-                return Err(corrupt(offset, "trailing index-record bytes"));
-            }
-            validate_state(&decoded, offset)?;
-            state = Some(decoded);
+            state = Some(decode_record(state.take(), payload, scheme, offset)?);
             Ok(())
         },
     );
@@ -291,10 +285,37 @@ pub(super) fn recover_index(
     Some(state)
 }
 
+fn decode_record(
+    state: Option<IndexState>,
+    payload: &[u8],
+    scheme: IdentityScheme,
+    offset: u64,
+) -> Result<IndexState, DurableError> {
+    let mut reader = WireReader::new(payload);
+    let record = reader.u8().map_err(|detail| corrupt(offset, detail))?;
+    let decoded = match (record, state) {
+        (SNAPSHOT_RECORD, None) => {
+            let snapshot = decode_snapshot(&mut reader, scheme, offset)?;
+            validate_state(&snapshot, offset)?;
+            snapshot
+        },
+        (DELTA_RECORD, Some(current)) => apply_delta(current, &mut reader, scheme, offset)?,
+        (DELTA_RECORD, None) => return Err(corrupt(offset, "index delta precedes snapshot")),
+        (SNAPSHOT_RECORD, Some(_)) => {
+            return Err(corrupt(offset, "index contains more than one snapshot"));
+        },
+        _ => return Err(corrupt(offset, "unknown index record kind")),
+    };
+    if reader.remaining() != 0 {
+        return Err(corrupt(offset, "trailing index-record bytes"));
+    }
+    Ok(decoded)
+}
+
 /// Replace the disposable index with one complete, flushed checkpoint.
-pub(super) fn replace_index(
+pub(super) fn replace_index<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
     directory: &cap_std::fs::Dir,
-    state: &IndexState,
+    state: &IndexState<M>,
     scheme: IdentityScheme,
     faults: &dyn FaultInjector,
 ) -> Result<File, DurableError> {
@@ -303,14 +324,13 @@ pub(super) fn replace_index(
             super::FaultPoint::BeforeIndexCachePublication,
         ));
     }
-    let payload = encode_snapshot(state, scheme)?;
+    let snapshot = Snapshot::new(state, scheme)?;
     let temporary = format!("{INDEX_FILE}.tmp");
     remove_checkpoint_if_present(directory, &temporary)
         .map_err(|source| super::io_error("remove temporary durable object index", source))?;
     let mut file = create_private_file_capability(directory, Path::new(&temporary))
         .map_err(|error| index_error("create temporary durable object index", error))?;
-    append_frame(&mut file, INDEX_MAGIC, &payload)
-        .map_err(|error| index_error("append durable object-index snapshot", error))?;
+    snapshot.append(&mut file)?;
     file.sync_data()
         .map_err(|source| super::io_error("flush durable object-index snapshot", source))?;
     drop(file);
@@ -325,9 +345,9 @@ pub(super) fn replace_index(
     Ok(reopened)
 }
 
-pub(super) fn replace_volume_index(
+pub(super) fn replace_volume_index<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
     volume: Arc<dyn AstridVolume>,
-    state: &IndexState,
+    state: &IndexState<M>,
     scheme: IdentityScheme,
     faults: &dyn FaultInjector,
 ) -> Result<File, DurableError> {
@@ -336,15 +356,14 @@ pub(super) fn replace_volume_index(
             super::FaultPoint::BeforeIndexCachePublication,
         ));
     }
-    let payload = encode_snapshot(state, scheme)?;
+    let snapshot = Snapshot::new(state, scheme)?;
     let mut file = File::volume(volume, INDEX_FILE, true)
         .map_err(|error| index_error("open durable volume object index", error))?;
     file.set_len(0)
         .map_err(|source| super::io_error("truncate durable volume object index", source))?;
     file.seek(SeekFrom::Start(0))
         .map_err(|source| super::io_error("seek durable volume object index", source))?;
-    append_frame(&mut file, INDEX_MAGIC, &payload)
-        .map_err(|error| index_error("append durable volume object-index snapshot", error))?;
+    snapshot.append(&mut file)?;
     file.sync_data()
         .map_err(|source| super::io_error("flush durable volume object-index snapshot", source))?;
     file.seek(SeekFrom::End(0))
@@ -412,15 +431,12 @@ pub(super) fn append_index_delta(
     Ok(())
 }
 
-fn append_snapshot(
+fn append_snapshot<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
     file: &mut File,
-    state: &IndexState,
+    state: &IndexState<M>,
     scheme: IdentityScheme,
 ) -> Result<(), DurableError> {
-    let payload = encode_snapshot(state, scheme)?;
-    append_frame(file, INDEX_MAGIC, &payload)
-        .map_err(|error| index_error("append durable object-index snapshot", error))
-        .map(|_| ())
+    Snapshot::new(state, scheme)?.append(file)
 }
 
 pub(super) fn index_cache_starts_with_snapshot(file: &File) -> bool {
@@ -469,17 +485,26 @@ fn objects_through_arena(
         .collect()
 }
 
-fn encode_snapshot(state: &IndexState, scheme: IdentityScheme) -> Result<Vec<u8>, DurableError> {
+#[cfg(test)]
+fn encode_snapshot<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
+    state: &IndexState<M>,
+    scheme: IdentityScheme,
+) -> Result<Vec<u8>, DurableError> {
     let mut bytes = Vec::new();
     bytes.push(SNAPSHOT_RECORD);
     encode_scheme(&mut bytes, scheme);
     bytes.extend_from_slice(&state.arena_len.to_le_bytes());
     encode_optional_location(&mut bytes, state.arena_tail);
-    encode_locations(
-        &mut bytes,
-        scheme,
-        state.objects.iter().map(|(id, location)| (*id, *location)),
-    )?;
+    let objects = state.objects.borrow();
+    encode_len(&mut bytes, objects.len())?;
+    // A BTreeMap is already unique and ordered by the canonical ObjectId.
+    // Borrow its entries directly instead of allocating another full vector.
+    for (id, location) in objects {
+        encode_identity(&mut bytes, scheme, *id);
+        bytes.extend_from_slice(&location.offset.to_le_bytes());
+        bytes.extend_from_slice(&location.payload_len.to_le_bytes());
+        bytes.extend_from_slice(&location.checksum);
+    }
     Ok(bytes)
 }
 
@@ -554,6 +579,11 @@ fn apply_delta(
     }
     let arena_tail = decode_location(reader, offset)?;
     let additions = decode_locations(reader, scheme, offset)?;
+    // The prior prefix was validated and arena length cannot decrease. Old
+    // locations therefore remain bounded; only additions and the new tail
+    // need bounds checks. Authoritative arena verification still follows.
+    validation::validate_locations(additions.values(), arena_len, offset)?;
+    validation::validate_tail(Some(arena_tail), arena_len, offset)?;
     for (id, location) in additions {
         match state.objects.get(&id) {
             Some(existing) if same_location(*existing, location) => {},
@@ -647,42 +677,6 @@ fn decode_locations(
         previous = Some(id);
     }
     Ok(locations)
-}
-
-fn validate_state(state: &IndexState, offset: u64) -> Result<(), DurableError> {
-    for location in state.objects.values() {
-        let end = location
-            .offset
-            .checked_add(FRAME_HEADER_LEN)
-            .and_then(|value| value.checked_add(location.payload_len))
-            .ok_or(DurableError::EncodingOverflow)?;
-        if end > state.arena_len {
-            return Err(corrupt(
-                offset,
-                "indexed object extends beyond covered arena",
-            ));
-        }
-    }
-    match state.arena_tail {
-        Some(location) => {
-            let end = location
-                .offset
-                .checked_add(FRAME_HEADER_LEN)
-                .and_then(|value| value.checked_add(location.payload_len))
-                .ok_or(DurableError::EncodingOverflow)?;
-            if end != state.arena_len {
-                return Err(corrupt(
-                    offset,
-                    "indexed arena tail does not end at covered length",
-                ));
-            }
-        },
-        None if state.arena_len != 0 => {
-            return Err(corrupt(offset, "non-empty arena has no indexed tail"));
-        },
-        None => {},
-    }
-    Ok(())
 }
 
 fn encode_len(bytes: &mut Vec<u8>, len: usize) -> Result<(), DurableError> {

@@ -3,8 +3,8 @@
 use std::io::{IoSlice, Write};
 
 use super::{
-    ArenaLocation, CHECKSUM_START, DurableError, DurableIo, FRAME_HEADER_LEN,
-    FRAME_HEADER_LEN_USIZE, FRAME_VERSION, SeekFrom, frame_checksum, io, io_error,
+    ArenaLocation, DurableError, DurableIo, FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE, SeekFrom,
+    frame_checksum, frame_header, io, io_error,
 };
 
 // Deliberately below every supported platform's practical iovec ceiling. A
@@ -28,11 +28,7 @@ impl PreparedFrame {
         let payload_len =
             u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
         let checksum = frame_checksum(magic, payload_len, &payload);
-        let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
-        header[..8].copy_from_slice(&magic);
-        header[8..10].copy_from_slice(&FRAME_VERSION.to_le_bytes());
-        header[12..20].copy_from_slice(&payload_len.to_le_bytes());
-        header[CHECKSUM_START..].copy_from_slice(&checksum);
+        let header = frame_header(magic, payload_len, checksum);
         Ok(Self {
             header,
             payload,
