@@ -407,8 +407,9 @@ pub(super) fn validate_profiles(
     map: &CanonicalPhysicalMap,
 ) -> Result<RepresentationProfileId, DurableError> {
     let mut direct = None;
-    for (key, value) in active_entries(map)? {
-        let profile = RepresentationProfile::decode(value)?;
+    for entry in active_entries(map) {
+        let (key, value) = entry?;
+        let profile = RepresentationProfile::decode(&value)?;
         let id = profile.identify(&Blake3PhysicalIdentity)?;
         if PhysicalMapKey::from(id) != key {
             return Err(DurableError::InvalidRepresentationState(
@@ -435,15 +436,19 @@ pub(super) fn validate_representations(
 ) -> Result<(ReverseIndex, u64), DurableError> {
     let mut placement_by_blob = BTreeMap::new();
     let mut extent_count = 0_u64;
-    for (key, bytes) in active_entries(placements)? {
-        let entry = PlacementEntry::decode(bytes)?;
+    for entry in active_entries(placements) {
+        let (key, bytes) = entry?;
+        let entry = PlacementEntry::decode(&bytes)?;
         if PhysicalMapKey::from(entry.blob()) != key {
             return Err(DurableError::InvalidRepresentationState(
                 "placement leaf key does not match its value",
             ));
         }
         if profiles
-            .get(PhysicalMapKey::from(entry.profile()))
+            .try_get(
+                &Blake3PhysicalIdentity,
+                PhysicalMapKey::from(entry.profile()),
+            )?
             .is_none()
         {
             return Err(DurableError::InvalidRepresentationState(
@@ -459,18 +464,24 @@ pub(super) fn validate_representations(
         placement_by_blob.insert(entry.blob(), entry);
     }
     let mut reverse = ReverseIndex::new();
-    for (key, bytes) in active_entries(representations)? {
-        let record = RepresentationRecord::decode(bytes)?;
+    for entry in active_entries(representations) {
+        let (key, bytes) = entry?;
+        let record = RepresentationRecord::decode(&bytes)?;
         let id = record.identify(&Blake3PhysicalIdentity)?;
         if PhysicalMapKey::from(id) != key {
             return Err(DurableError::InvalidRepresentationState(
                 "representation leaf key does not match its value",
             ));
         }
-        let profile_bytes = profiles.get(PhysicalMapKey::from(record.profile())).ok_or(
-            DurableError::InvalidRepresentationState("representation profile is missing"),
-        )?;
-        let profile = RepresentationProfile::decode(profile_bytes)?;
+        let profile_bytes = profiles
+            .try_get(
+                &Blake3PhysicalIdentity,
+                PhysicalMapKey::from(record.profile()),
+            )?
+            .ok_or(DurableError::InvalidRepresentationState(
+                "representation profile is missing",
+            ))?;
+        let profile = RepresentationProfile::decode(&profile_bytes)?;
         record.validate_against_profile(&Blake3PhysicalIdentity, &profile)?;
         let (object, blob, canonical_length) = match (record.coverage(), record.recipe()) {
             (
@@ -499,46 +510,10 @@ pub(super) fn validate_representations(
     Ok((reverse, extent_count))
 }
 
-pub(super) fn active_entries(
-    map: &CanonicalPhysicalMap,
-) -> Result<Vec<(PhysicalMapKey, &[u8])>, DurableError> {
-    let Some(root) = map.root() else {
-        return Ok(Vec::new());
-    };
-    let mut entries = Vec::new();
-    let mut stack = vec![root];
-    let mut visited = BTreeSet::new();
-    while let Some(id) = stack.pop() {
-        if !visited.insert(id) {
-            return Err(DurableError::InvalidRepresentationState(
-                "physical map traversal revisited a node",
-            ));
-        }
-        match map
-            .nodes()
-            .get(&id)
-            .ok_or(DurableError::InvalidRepresentationState(
-                "physical map traversal found a missing node",
-            ))? {
-            PhysicalMapNode::Leaf { key, value, .. } => entries.push((*key, value.as_slice())),
-            PhysicalMapNode::Branch { zero, one, .. } => {
-                stack.push(*one);
-                stack.push(*zero);
-            },
-            PhysicalMapNode::Page {
-                entries: page_entries,
-                ..
-            } => entries.extend(
-                page_entries
-                    .iter()
-                    .map(|(key, value)| (*key, value.as_slice())),
-            ),
-            PhysicalMapNode::Radix { children, .. } => {
-                stack.extend(children.iter().rev().copied());
-            },
-        }
-    }
-    Ok(entries)
+pub(super) fn active_entries<M: super::node_view::MapView>(
+    map: &M,
+) -> super::node_view::Entries<'_, M> {
+    super::node_view::Entries::new(map)
 }
 
 pub(super) fn read_current_file<F: DurableIo>(

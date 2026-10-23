@@ -34,11 +34,16 @@ fn published_updates_bound_resident_history_and_recover_every_entry() {
     let volume: Arc<dyn AstridVolume> =
         HostedFileVolume::open(directory.path().join("test.volume")).unwrap();
     let limits = super::super::RecoveryLimits::process_addressable();
-    let mut store =
-        RepresentationStore::activate_volume(&volume, limits, ObjectId::new([1; 32]), []).unwrap();
+    let mut store = RepresentationStore::activate_volume(
+        &volume,
+        limits,
+        ObjectId::new([1; 32]),
+        [],
+        super::super::LocationIndexMemoryBudget::default(),
+    )
+    .unwrap();
     let mut objects = Vec::new();
     let mut reclaimed = false;
-    let mut prior_nodes = 0;
     let mut prior_persisted = store.persisted_map_nodes.len();
     for sequence in 0_u64..4096 {
         let bytes = sequence.to_le_bytes();
@@ -56,32 +61,29 @@ fn published_updates_bound_resident_history_and_recover_every_entry() {
             .unwrap();
         let update = store.append_direct_update(&[direct]).unwrap().unwrap();
         store.publish_direct_update(update).unwrap();
-        let resident = store.representations.nodes().len() + store.placement_entries.nodes().len();
-        if resident < prior_nodes {
-            assert!(store.complete_map_subtrees.is_empty());
+        if store.complete_map_subtrees.is_empty() {
             reclaimed = true;
         }
-        // New path copies must still be persisted after proof-cache eviction.
+        // Node values are fetched from existing metadata frames; the complete
+        // physical-ID index retains only its finite shared staging workspace.
+        assert!(store.persisted_map_nodes.staging_capacity_bytes() <= 1_048_576);
         assert!(store.persisted_map_nodes.len() > prior_persisted);
-        prior_nodes = resident;
         prior_persisted = store.persisted_map_nodes.len();
-        for map in [&store.representations, &store.placement_entries] {
-            // Keep the legacy binary-tree upper bound as a broad guard.
-            // The dense-map test below checks the tighter reachable closure.
-            let maximum = map.entry_count().saturating_mul(2).saturating_sub(1) * 2;
-            assert!(u64::try_from(map.nodes().len()).unwrap() <= maximum);
-        }
         objects.push(object);
     }
     assert!(reclaimed, "exercise proof eviction and subsequent writes");
     let active = store.active;
     drop(store);
-    let mut reopened = RepresentationStore::open_volume(&volume, limits)
-        .unwrap()
-        .unwrap();
+    let mut reopened = RepresentationStore::open_volume(
+        &volume,
+        limits,
+        super::super::LocationIndexMemoryBudget::default(),
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(reopened.active, active);
     for object in objects {
-        assert!(reopened.contains_direct(object));
+        assert!(reopened.contains_direct(object).unwrap());
     }
     reopened.checkpoint_volume(&volume, limits).unwrap();
     assert_eq!(reopened.active, active);
@@ -93,8 +95,14 @@ fn dense_history_is_bounded_by_measured_reachable_nodes() {
     let volume: Arc<dyn AstridVolume> =
         HostedFileVolume::open(directory.path().join("dense.volume")).unwrap();
     let limits = super::super::RecoveryLimits::process_addressable();
-    let mut store =
-        RepresentationStore::activate_volume(&volume, limits, ObjectId::new([1; 32]), []).unwrap();
+    let mut store = RepresentationStore::activate_volume(
+        &volume,
+        limits,
+        ObjectId::new([1; 32]),
+        [],
+        super::super::LocationIndexMemoryBudget::default(),
+    )
+    .unwrap();
     let mut objects = Vec::new();
     for sequence in 0_u64..256 {
         let bytes = sequence.to_le_bytes();
@@ -118,14 +126,8 @@ fn dense_history_is_bounded_by_measured_reachable_nodes() {
             &store.representations,
             &store.placement_entries,
         ] {
-            let mut active = map.clone();
-            active.reclaim_unreachable_nodes().unwrap();
-            let reachable = active.nodes().len();
-            active_nodes += reachable;
-            assert!(
-                map.nodes().len() <= reachable * 2,
-                "dense map retains more than a closure-sized history allowance"
-            );
+            active_nodes += super::super::node_view::node_count(map).unwrap();
+            assert!(store.persisted_map_nodes.staging_capacity_bytes() <= 1_048_576);
         }
         if store.persisted_map_nodes.len() > active_nodes * 2 {
             assert!(
@@ -142,11 +144,15 @@ fn dense_history_is_bounded_by_measured_reachable_nodes() {
     assert!(store.persisted_map_nodes.len() < persisted);
     assert_eq!(store.active, active);
     drop(store);
-    let reopened = RepresentationStore::open_volume(&volume, limits)
-        .unwrap()
-        .unwrap();
+    let reopened = RepresentationStore::open_volume(
+        &volume,
+        limits,
+        super::super::LocationIndexMemoryBudget::default(),
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(reopened.active, active);
     for object in objects {
-        assert!(reopened.contains_direct(object));
+        assert!(reopened.contains_direct(object).unwrap());
     }
 }

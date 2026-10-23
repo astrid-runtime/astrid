@@ -97,11 +97,6 @@ impl PagedLocations {
                 *remaining = remaining.strict_sub(1);
             }
         }
-        if self.resident.capacity() < self.limit.get() {
-            self.resident
-                .try_reserve_exact(self.limit.get().saturating_sub(self.resident.len()))
-                .map_err(|_| DurableError::EncodingOverflow)?;
-        }
         let previous = self.location(id)?;
         if previous == Some(location) {
             return Ok(());
@@ -124,7 +119,20 @@ impl PagedLocations {
         } else {
             match position {
                 Ok(at) => self.resident[at].1 = location,
-                Err(at) => self.resident.insert(at, (id, location)),
+                Err(at) => {
+                    if self.resident.len() == self.resident.capacity() {
+                        let target = self
+                            .resident
+                            .capacity()
+                            .max(1)
+                            .saturating_mul(2)
+                            .min(self.limit.get());
+                        self.resident
+                            .try_reserve_exact(target.saturating_sub(self.resident.len()))
+                            .map_err(|_| DurableError::EncodingOverflow)?;
+                    }
+                    self.resident.insert(at, (id, location));
+                },
             }
         }
         self.count = count;
@@ -256,13 +264,16 @@ impl PagedLocations {
             let (id, location) = self.resident[0];
             self.flush_with(id, location, self.count)?;
         }
-        // Replace the staging allocation only after any required spill succeeds.
-        let mut resident = Vec::new();
-        resident
-            .try_reserve_exact(limit.get())
-            .map_err(|_| DurableError::EncodingOverflow)?;
-        resident.append(&mut self.resident);
-        self.resident = resident;
+        // Shrink an over-budget allocation after any required spill succeeds.
+        // Raising a target does not eagerly reserve its entire allowance.
+        if self.resident.capacity() > limit.get() {
+            let mut resident = Vec::new();
+            resident
+                .try_reserve_exact(self.resident.len())
+                .map_err(|_| DurableError::EncodingOverflow)?;
+            resident.append(&mut self.resident);
+            self.resident = resident;
+        }
         self.limit = limit;
         Ok(())
     }

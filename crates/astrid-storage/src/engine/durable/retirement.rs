@@ -39,8 +39,10 @@ where
         self.flush_for_retirement(&mut inner)?;
         let mut reader = self.arena_reader.write();
         self.lifecycle.store(LIFECYCLE_CLOSED, Ordering::Release);
-        let transferred =
-            std::mem::replace(&mut *inner, empty_inner(self.index_memory.read().entries()));
+        let transferred = std::mem::replace(
+            &mut *inner,
+            empty_inner(self.index_memory.read().durable_entries()),
+        );
         let published_roots = PublishedRoots::new(&transferred.roots_by_principal);
         self.published_roots.replace(&inner.roots_by_principal);
         self.object_cache.clear();

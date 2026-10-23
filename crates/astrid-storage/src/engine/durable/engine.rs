@@ -277,7 +277,9 @@ where
     }
 
     /// Set the disposable historical-locator staging budget without changing
-    /// durable authority. A failed spill leaves the previous policy in force.
+    /// durable authority. The shared target covers logical, physical, and private
+    /// path-copy staging. A failed physical spill fences admission; recovery
+    /// rebuilds all locators using the previous policy.
     ///
     /// # Errors
     /// Returns a storage or scratch-I/O error while retaining all locations.
@@ -286,7 +288,13 @@ where
         budget: super::LocationIndexMemoryBudget,
     ) -> Result<(), DurableError> {
         let mut inner = self.lock_usable()?;
-        inner.index.set_limit(budget.entries())?;
+        inner.index.set_limit(budget.durable_entries())?;
+        if let Some(representations) = &inner.representations
+            && let Err(error) = representations.set_location_index_memory(budget)
+        {
+            self.mark_requires_recovery(&mut inner);
+            return Err(error);
+        }
         *self.index_memory.write() = budget;
         Ok(())
     }
@@ -413,7 +421,7 @@ where
         }
         let payload = encode_object_frame(self.identity.scheme(), id, &existing)?;
         let appended = if let Some(representations) = &inner.representations
-            && !representations.contains_direct(id)
+            && !representations.contains_direct(id)?
         {
             vec![representations.describe_direct(
                 id,

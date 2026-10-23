@@ -22,8 +22,8 @@ fn direct_representation_activation_reopens_and_tracks_later_commits() {
         let inner = engine.inner.lock();
         let representations = inner.representations.as_ref().unwrap();
         assert_eq!(representations.active(), initial_state);
-        assert!(representations.contains_direct(first_commit));
-        assert!(!representations.contains_direct(specification_id));
+        assert!(representations.contains_direct(first_commit).unwrap());
+        assert!(!representations.contains_direct(specification_id).unwrap());
     }
 
     let (second_commit, second) = transaction("alice", Some(first_root), b"after activation");
@@ -31,7 +31,7 @@ fn direct_representation_activation_reopens_and_tracks_later_commits() {
     let advanced_state = {
         let inner = engine.inner.lock();
         let representations = inner.representations.as_ref().unwrap();
-        assert!(representations.contains_direct(second_commit));
+        assert!(representations.contains_direct(second_commit).unwrap());
         assert_ne!(representations.active(), initial_state);
         representations.active()
     };
@@ -47,9 +47,9 @@ fn direct_representation_activation_reopens_and_tracks_later_commits() {
     );
     let inner = reopened.inner.lock();
     let representations = inner.representations.as_ref().unwrap();
-    assert!(representations.contains_direct(first_commit));
-    assert!(representations.contains_direct(second_commit));
-    assert!(!representations.contains_direct(specification_id));
+    assert!(representations.contains_direct(first_commit).unwrap());
+    assert!(representations.contains_direct(second_commit).unwrap());
+    assert!(!representations.contains_direct(specification_id).unwrap());
 }
 
 #[test]
@@ -127,8 +127,8 @@ fn compatible_format_amendment_reopens_an_existing_direct_profile() {
         representations.frozen_specification().unwrap(),
         old_specification_id
     );
-    assert!(representations.contains_direct(first_commit));
-    assert!(representations.contains_direct(second_commit));
+    assert!(representations.contains_direct(first_commit).unwrap());
+    assert!(representations.contains_direct(second_commit).unwrap());
 }
 
 #[test]
@@ -296,7 +296,7 @@ fn valid_representation_cas_without_its_metadata_repairs_from_the_arena() {
         let inner = repaired.inner.lock();
         let representations = inner.representations.as_ref().unwrap();
         assert_eq!(representations.active(), initial_state);
-        assert!(!representations.contains_direct(second_commit));
+        assert!(!representations.contains_direct(second_commit).unwrap());
     }
 
     let repaired_state = repaired
@@ -324,7 +324,7 @@ fn valid_representation_cas_without_its_metadata_repairs_from_the_arena() {
             .representations
             .as_ref()
             .unwrap()
-            .contains_direct(second_commit)
+            .contains_direct(second_commit).unwrap()
     );
 }
 
@@ -368,7 +368,7 @@ fn representation_state_is_durable_before_root_publication() {
                 .representations
                 .as_ref()
                 .unwrap()
-                .contains_direct(unpublished_commit)
+                .contains_direct(unpublished_commit).unwrap()
         );
     }
     interrupted.close().unwrap();
@@ -382,7 +382,7 @@ fn representation_state_is_durable_before_root_publication() {
             .representations
             .as_ref()
             .unwrap()
-            .contains_direct(unpublished_commit)
+            .contains_direct(unpublished_commit).unwrap()
     );
 }
 
@@ -441,7 +441,7 @@ fn activation_repair_covers_an_arena_flush_without_a_state_cas() {
             .representations
             .as_ref()
             .unwrap()
-            .contains_direct(unpublished_commit)
+            .contains_direct(unpublished_commit).unwrap()
     );
     interrupted.close().unwrap();
     drop(interrupted);
@@ -455,7 +455,7 @@ fn activation_repair_covers_an_arena_flush_without_a_state_cas() {
             .representations
             .as_ref()
             .unwrap()
-            .contains_direct(unpublished_commit)
+            .contains_direct(unpublished_commit).unwrap()
     );
 }
 
@@ -513,7 +513,7 @@ fn retry_represents_a_recovered_orphan_without_reappending_it() {
             .representations
             .as_ref()
             .unwrap()
-            .contains_direct(commit)
+            .contains_direct(commit).unwrap()
     );
 }
 
@@ -588,7 +588,7 @@ fn activated_flush_publishes_direct_paths_for_staged_prefix() {
             .representations
             .as_ref()
             .unwrap()
-            .contains_direct(staged_id)
+            .contains_direct(staged_id).unwrap()
     );
     engine.close().unwrap();
     drop(engine);
@@ -601,7 +601,7 @@ fn activated_flush_publishes_direct_paths_for_staged_prefix() {
             .representations
             .as_ref()
             .unwrap()
-            .contains_direct(staged_id)
+            .contains_direct(staged_id).unwrap()
     );
 }
 
@@ -651,7 +651,7 @@ fn verified_staged_closure_consumes_direct_description_witnesses() {
     assert!(
         object_ids
             .into_iter()
-            .all(|object| representations.contains_direct(object))
+            .all(|object| representations.contains_direct(object).unwrap())
     );
 }
 
@@ -927,8 +927,8 @@ fn standalone_ack_covers_an_earlier_staged_prefix() {
     let reopened = open(directory.path());
     let inner = reopened.inner.lock();
     let representations = inner.representations.as_ref().unwrap();
-    assert!(representations.contains_direct(earlier_id));
-    assert!(representations.contains_direct(later_id));
+    assert!(representations.contains_direct(earlier_id).unwrap());
+    assert!(representations.contains_direct(later_id).unwrap());
 }
 
 #[test]

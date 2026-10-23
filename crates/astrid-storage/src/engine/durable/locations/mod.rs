@@ -57,9 +57,12 @@ mod paged;
 
 pub(super) use paged::PagedLocations;
 
-/// Resident workspace target for the complete historical object locator.
+/// Shared resident staging target for complete durable locators.
 ///
-/// The sorted staging vector reserves at most this many entry bytes. Tree roots,
+/// The engine divides this target between the historical object locator,
+/// physical-node locator, and private path-copy locator. All are shared across
+/// principals. Their sorted staging vectors together reserve at most this many
+/// entry bytes. Tree roots,
 /// iterators and one page per merge level are additional bounded workspace; OS
 /// file cache is outside this target. Durable history is never truncated.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,6 +91,14 @@ impl LocationIndexMemoryBudget {
     #[must_use]
     pub const fn bytes(self) -> std::num::NonZeroU64 {
         self.0
+    }
+
+    pub(super) fn durable_entries(self) -> std::num::NonZeroUsize {
+        // Three simultaneously live tables: logical, physical, private mutation.
+        // A one-entry table spills directly without allocating a resident slot,
+        // so targets below three entries still respect the shared ceiling.
+        std::num::NonZeroUsize::new((self.entries().get() / 3).max(1))
+            .expect("a direct-spill locator has a nonzero threshold")
     }
 
     pub(super) fn entries(self) -> std::num::NonZeroUsize {

@@ -211,6 +211,7 @@ where
             &principal_codec,
             &identity,
             limits,
+            policy.index_memory,
             policy.transaction_wal.is_enabled(),
             faults.as_ref(),
         )?;
@@ -284,6 +285,7 @@ where
             &principal_codec,
             &identity,
             limits,
+            options.policy.index_memory,
             options.policy.transaction_wal.is_enabled(),
             options.faults.as_ref(),
         )?;
@@ -317,7 +319,7 @@ where
     ) -> Result<Self, DurableError> {
         let index = super::locations::PagedLocations::from_map(
             recovered.index,
-            options.policy.index_memory.entries(),
+            options.policy.index_memory.durable_entries(),
         )?;
         Ok(Self {
             directory,

@@ -13,9 +13,12 @@ use super::identity::{
     decode_map_node_id, decode_physical_digest, encode_map_node_id, encode_physical_digest,
 };
 
+mod backed;
+pub(crate) use backed::BackedPhysicalMap;
+pub(crate) use nodes::{PhysicalMapMutNodes, PhysicalMapNodes};
 mod legacy;
+mod nodes;
 mod radix;
-mod residency;
 
 const LEGACY_MAP_NODE_VERSION: u16 = 1;
 const RADIX_MAP_NODE_VERSION: u16 = 2;
@@ -63,6 +66,9 @@ impl PhysicalMapDomain {
 pub struct PhysicalMapKey([u8; 32]);
 
 impl PhysicalMapKey {
+    /// Width of the frozen tagged search encoding used by binary paths.
+    pub(crate) const SEARCH_BITS: u32 = SEARCH_KEY_BITS;
+
     /// Construct a key from the current physical digest bytes.
     #[must_use]
     pub const fn new(bytes: [u8; 32]) -> Self {
@@ -571,33 +577,16 @@ impl CanonicalPhysicalMap {
         key: PhysicalMapKey,
         value: Vec<u8>,
     ) -> Result<bool, PhysicalModelError> {
-        let (replacement, inserted) = if let Some(root) = self.root {
-            match self.construction {
-                MapConstruction::LegacyBinary => {
-                    legacy::insert(identity, self.domain, &mut self.nodes, root, key, value)?
-                },
-                MapConstruction::DenseRadix => {
-                    radix::insert(identity, self.domain, &mut self.nodes, root, key, value)?
-                },
-            }
-        } else {
-            let node = match self.construction {
-                MapConstruction::LegacyBinary => PhysicalMapNode::leaf(self.domain, key, value),
-                MapConstruction::DenseRadix => {
-                    PhysicalMapNode::page(self.domain, vec![(key, value)])?
-                },
-            };
-            let id = node.identify(identity)?;
-            self.nodes.insert(id, node);
-            (id, true)
-        };
-        if inserted {
-            self.root = Some(replacement);
-            self.entry_count = self
-                .entry_count
-                .checked_add(1)
-                .ok_or(PhysicalModelError::LengthOverflow)?;
-        }
+        let mut view = backed::BackedPhysicalMap::new(
+            self.domain,
+            self.construction,
+            self.root,
+            self.entry_count,
+            &mut self.nodes,
+        );
+        let inserted = view.insert(identity, key, value)?;
+        self.root = view.root();
+        self.entry_count = view.entry_count();
         Ok(inserted)
     }
 
@@ -727,6 +716,19 @@ impl CanonicalPhysicalMap {
     #[must_use]
     pub const fn nodes(&self) -> &BTreeMap<PhysicalMapNodeId, PhysicalMapNode> {
         &self.nodes
+    }
+
+    /// Read a physical entry without translating missing reachable nodes or
+    /// authentication failures into absence.
+    ///
+    /// # Errors
+    /// Rejects invalid identities, domains, paths, or missing reachable nodes.
+    pub fn try_get<I: PhysicalIdentity>(
+        &self,
+        identity: &I,
+        key: PhysicalMapKey,
+    ) -> Result<Option<Vec<u8>>, PhysicalModelError> {
+        self.with_node_provider(&self.nodes).try_get(identity, key)
     }
 
     /// Look up one leaf through the authenticated trie.
