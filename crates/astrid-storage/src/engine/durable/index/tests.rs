@@ -136,3 +136,37 @@ fn tail_only_delta_validates_its_prefix_without_rescanning_prior_locations() {
     );
     assert!(decode_record(Some(state), &bytes, scheme(), 1).is_err());
 }
+
+#[test]
+fn borrowed_snapshot_preserves_canonical_wire_and_complete_locations() {
+    let mut objects = BTreeMap::new();
+    for sequence in (1..=4096).rev() {
+        objects.insert(identity(sequence), location(sequence));
+    }
+    let tail = location(4096);
+    let state = IndexState {
+        arena_len: 4096 * (FRAME_HEADER_LEN + 1),
+        arena_tail: Some(tail),
+        objects: &objects,
+    };
+    let actual = encode_snapshot(&state, scheme()).unwrap();
+    let mut expected = vec![SNAPSHOT_RECORD];
+    encode_scheme(&mut expected, scheme());
+    expected.extend_from_slice(&state.arena_len.to_le_bytes());
+    encode_optional_location(&mut expected, state.arena_tail);
+    // The existing unordered encoder is the canonical reference for old
+    // snapshot/delta bytes. Include IDs whose byte order differs from number
+    // order, rather than assuming insertion order is the wire ordering.
+    encode_locations(
+        &mut expected,
+        scheme(),
+        objects.iter().rev().map(|(id, location)| (*id, *location)),
+    )
+    .unwrap();
+    assert_eq!(actual, expected);
+    let recovered = decode_record(None, &actual, scheme(), 0).unwrap();
+    assert_eq!(recovered.objects, objects);
+    assert_eq!(recovered.arena_tail, Some(tail));
+    assert_eq!(recovered.arena_len, state.arena_len);
+    validate_state(&recovered, 0).unwrap();
+}

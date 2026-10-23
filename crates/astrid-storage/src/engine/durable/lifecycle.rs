@@ -262,7 +262,7 @@ where
         let state = IndexState {
             arena_len,
             arena_tail,
-            objects: inner.index.clone(),
+            objects: &inner.index,
         };
         let files = live_files_mut(&mut inner.files)?;
         drop(files.index_cache.take());
