@@ -7,7 +7,27 @@ use std::path::Path;
 
 const PROVENANCE: &[u8] = b"com.apple.provenance\0";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AttributeNames {
+    Empty,
+    Provenance,
+    Other,
+}
+
+impl AttributeNames {
+    fn accepts_value(self, size: Option<usize>) -> bool {
+        matches!(
+            (self, size),
+            (Self::Empty, None) | (Self::Provenance, Some(_))
+        )
+    }
+}
+
 pub(super) fn permitted_names(file: &File) -> io::Result<bool> {
+    Ok(attribute_names(file)? != AttributeNames::Other)
+}
+
+fn attribute_names(file: &File) -> io::Result<AttributeNames> {
     // Fixed-name storage prevents untrusted side data from sizing an allocation.
     let mut names = [0_u8; PROVENANCE.len()];
     // SAFETY: the descriptor and fixed output buffer remain live for this call.
@@ -17,22 +37,29 @@ pub(super) fn permitted_names(file: &File) -> io::Result<bool> {
     if count < 0 {
         let error = io::Error::last_os_error();
         return if error.raw_os_error() == Some(nix::libc::ERANGE) {
-            Ok(false)
+            Ok(AttributeNames::Other)
         } else {
             Err(error)
         };
     }
-    Ok(
-        count == 0
-            || (usize::try_from(count).ok() == Some(PROVENANCE.len()) && names == PROVENANCE),
-    )
+    Ok(if count == 0 {
+        AttributeNames::Empty
+    } else if usize::try_from(count).ok() == Some(PROVENANCE.len()) && names == PROVENANCE {
+        AttributeNames::Provenance
+    } else {
+        AttributeNames::Other
+    })
 }
 
 pub(super) fn matches_local(file: &File, parent: &Path) -> io::Result<bool> {
-    if !permitted_names(file)? {
+    let names = attribute_names(file)?;
+    if names == AttributeNames::Other {
         return Ok(false);
     }
     let size = value_size(file)?;
+    if !names.accepts_value(size) {
+        return Ok(false);
+    }
     if size.is_none() {
         return Ok(true);
     }
@@ -49,7 +76,7 @@ pub(super) fn matches_local(file: &File, parent: &Path) -> io::Result<bool> {
         .open(&path)?;
     // The descriptor now owns the empty baseline; no extra projection survives.
     std::fs::remove_file(path)?;
-    if !permitted_names(&baseline)? {
+    if attribute_names(&baseline)? != AttributeNames::Provenance {
         return Ok(false);
     }
     let expected_size = value_size(&baseline)?;
@@ -111,4 +138,19 @@ fn read_value(file: &File, length: usize) -> io::Result<Vec<u8>> {
         ));
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AttributeNames;
+
+    #[test]
+    fn listed_and_fetched_attributes_must_agree_before_acceptance() {
+        assert!(AttributeNames::Empty.accepts_value(None));
+        assert!(AttributeNames::Provenance.accepts_value(Some(11)));
+        assert!(!AttributeNames::Provenance.accepts_value(None));
+        assert!(!AttributeNames::Empty.accepts_value(Some(11)));
+        assert!(!AttributeNames::Other.accepts_value(None));
+        assert!(!AttributeNames::Other.accepts_value(Some(11)));
+    }
 }
