@@ -22,7 +22,7 @@ mod derived;
 mod provision;
 mod resources;
 mod shared_snapshot;
-pub use derived::DerivedPrincipalOwnership;
+pub use derived::{DerivedPrincipalInitialization, DerivedPrincipalOwnership};
 mod upgrade;
 pub use upgrade::{UnownedPrincipalDeferral, UnownedPrincipalReconciliation};
 mod user_bindings;
