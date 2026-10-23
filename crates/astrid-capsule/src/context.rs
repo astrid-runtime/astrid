@@ -323,10 +323,8 @@ impl WorkspaceBranchService {
         // Ownership can change while the synchronous branch begin is in
         // progress. Re-read before publishing the binding and discard the
         // just-created branch if the owner moved.
-        if self.owner_for(uid).await? != owner {
-            let _ = self.branches.rollback(&owner, descriptor.id());
-            return Err("principal workspace ownership changed during branch bind".to_owned());
-        }
+        self.confirm_new_binding(uid, owner, descriptor.id())
+            .await?;
         let binding = WorkspaceBranchBinding {
             uid,
             owner,
@@ -350,6 +348,9 @@ impl WorkspaceBranchService {
             .load_shared()
             .await
             .map_err(|error| format!("resolve principal fleet ownership: {error}"))?;
+        if snapshot.principal_is_retiring(uid) {
+            return Err("principal workspace identity is being retired".to_owned());
+        }
         Ok(snapshot
             .principal_owner(uid)
             .map_or(astrid_storage::StateOwner::Principal(uid), |assignment| {
@@ -907,3 +908,9 @@ impl CapsuleContext {
 
 #[cfg(test)]
 mod workspace_cleanup_tests;
+
+#[cfg(not(target_family = "wasm"))]
+mod workspace_retirement;
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod workspace_retirement_tests;

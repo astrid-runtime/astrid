@@ -645,6 +645,12 @@ where
         self.entries.store(Arc::new(next));
     }
 
+    fn remove(&self, principal: &P) {
+        let mut next = (**self.entries.load()).clone();
+        next.remove(principal);
+        self.entries.store(Arc::new(next));
+    }
+
     fn replace(&self, roots: &BTreeMap<P, RootState>) {
         self.entries.store(Arc::new(Self::entries(roots)));
     }
@@ -710,6 +716,7 @@ mod engine;
 mod object_access;
 mod opening;
 mod retirement;
+mod root_removal;
 
 impl<P: Ord, I, C> Drop for DurableEngine<P, I, C> {
     fn drop(&mut self) {

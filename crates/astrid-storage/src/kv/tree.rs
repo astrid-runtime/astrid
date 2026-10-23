@@ -514,6 +514,15 @@ where
         Ok(removed)
     }
 
+    /// Forget optional projections after a privileged owner-root retirement.
+    /// This does not commit an empty replacement or recreate the removed root.
+    pub(crate) fn forget_retired_owner(&self, owner: &P) {
+        if let Some(cache) = &self.hot_cache {
+            cache.remove_owner(owner);
+        }
+        self.blocking_store().forget_owner_projection_state(owner);
+    }
+
     #[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]
     pub(crate) fn import_entries_for_migration(
         &self,

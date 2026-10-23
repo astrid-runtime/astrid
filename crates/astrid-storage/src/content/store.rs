@@ -963,3 +963,9 @@ pub use workspace::{
     WorkspaceBranchError, WorkspaceBranchStore, WorkspaceFilesystem, WorkspaceUid,
 };
 pub(crate) use workspace::{is_workspace_branch_label, workspace_branch_quota_from_loader};
+
+pub(crate) use workspace::directory::{
+    DIRECTORY_LABEL as WORKSPACE_DIRECTORY_LABEL, DirectoryProof as WorkspaceDirectoryProof,
+    PROOF_CACHE_KEY as WORKSPACE_DIRECTORY_PROOF_KEY,
+    validate_from_loader as validate_workspace_directory,
+};

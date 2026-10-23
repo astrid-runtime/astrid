@@ -101,7 +101,6 @@ fn checksummed_invalid_proof_states_and_padding_are_rejected() {
     }
 }
 
-
 #[test]
 fn page_memo_reuses_authenticated_ancestors_within_one_operation() {
     let run = build(5_000);
@@ -119,14 +118,21 @@ fn page_memo_reuses_authenticated_ancestors_within_one_operation() {
     let auth = super::test_take_page_auth_count();
     let hits = memo.test_hits();
     let misses = memo.test_misses();
-    assert!(hits > 0, "shared ancestors must hit the memo: misses={misses}");
+    assert!(
+        hits > 0,
+        "shared ancestors must hit the memo: misses={misses}"
+    );
     assert_eq!(auth, misses, "each miss authenticates exactly once");
     // Uncached control: fresh memo every lookup forces re-auth of the path.
     let _ = super::test_take_page_auth_count();
     for index in 0_u64..5_000 {
         let id = pair(index.strict_mul(2)).0;
         let mut uncached = PageMemo::default();
-        assert!(run.lookup_row_memoized(id, &mut uncached).unwrap().is_some());
+        assert!(
+            run.lookup_row_memoized(id, &mut uncached)
+                .unwrap()
+                .is_some()
+        );
     }
     let uncached_auth = super::test_take_page_auth_count();
     assert!(
@@ -139,7 +145,11 @@ fn page_memo_reuses_authenticated_ancestors_within_one_operation() {
 fn page_memo_rebinds_after_run_replacement_and_still_fails_closed_on_corruption() {
     let run = build(2_000);
     let mut memo = PageMemo::default();
-    assert!(run.lookup_row_memoized(pair(0).0, &mut memo).unwrap().is_some());
+    assert!(
+        run.lookup_row_memoized(pair(0).0, &mut memo)
+            .unwrap()
+            .is_some()
+    );
     let replaced = build(2_000);
     // Binding keys the exact incarnation so a replaced run re-authenticates.
     assert!(
@@ -152,7 +162,12 @@ fn page_memo_rebinds_after_run_replacement_and_still_fails_closed_on_corruption(
 
     let corrupt = build(64);
     let mut memo = PageMemo::default();
-    assert!(corrupt.lookup_row_memoized(pair(0).0, &mut memo).unwrap().is_some());
+    assert!(
+        corrupt
+            .lookup_row_memoized(pair(0).0, &mut memo)
+            .unwrap()
+            .is_some()
+    );
     corrupt.test_file().set_len(0).unwrap();
     // Run files are immutable for the life of an operation memo. A new operation
     // must authenticate again and fail closed on the damaged accelerator.
@@ -163,12 +178,15 @@ fn page_memo_rebinds_after_run_replacement_and_still_fails_closed_on_corruption(
     ));
 }
 
-
 #[test]
 fn page_memo_rejects_wrong_upper_even_when_offset_digest_warm() {
     let run = build(256);
     let mut memo = PageMemo::default();
-    assert!(run.lookup_row_memoized(pair(0).0, &mut memo).unwrap().is_some());
+    assert!(
+        run.lookup_row_memoized(pair(0).0, &mut memo)
+            .unwrap()
+            .is_some()
+    );
     assert!(memo.test_hits() > 0 || memo.test_misses() > 0);
 
     // Same offset/digest/level as the authenticated root, forged upper bound.

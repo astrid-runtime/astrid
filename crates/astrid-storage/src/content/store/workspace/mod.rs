@@ -18,6 +18,7 @@ use crate::storage_model::{
 use super::{root_from_record, validate_catalog};
 
 mod codec;
+pub(crate) mod directory;
 mod filesystem;
 mod helpers;
 mod lifecycle;
@@ -43,7 +44,6 @@ const BRANCH_WORKING_LABEL: &[u8] = b"working";
 const BRANCH_MAGIC: &[u8] = b"astrid-workspace-branch-v1\0";
 const BRANCH_RECEIPT_MAGIC: &[u8] = b"astrid-workspace-promoted-v1\0";
 const BRANCH_FORMAT: ObjectFormatVersion = ObjectFormatVersion::V1;
-const MAX_WORKSPACE_BRANCHES: usize = 128;
 const UID_BYTES: usize = 16;
 
 // Private imports so child modules can keep using `super::Name`.
@@ -64,7 +64,7 @@ use codec::{
 use helpers::{
     BranchState, hydrate_root, is_workspace_receipt_label, map_read_error,
     parse_workspace_receipt_uid, parse_workspace_uid, qualify_name, selected_catalog,
-    selected_name, validate_target_prefix, workspace_receipt_label, workspace_ref_label,
+    selected_name, validate_target_prefix,
 };
 
 pub(crate) fn is_workspace_branch_label(label: &[u8]) -> bool {
@@ -124,3 +124,6 @@ pub(crate) fn workspace_branch_quota_from_loader(
     }
     Ok(working.summary.quota_bytes)
 }
+
+#[cfg(test)]
+use helpers::{workspace_receipt_label, workspace_ref_label};

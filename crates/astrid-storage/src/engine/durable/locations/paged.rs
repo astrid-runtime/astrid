@@ -49,12 +49,15 @@ impl AuthenticatedPageMemo {
 
     #[cfg(test)]
     pub(in crate::engine::durable) fn test_hit_miss(&self) -> (usize, usize) {
-        self.runs.iter().flatten().fold((0, 0), |(hits, misses), memo| {
-            (
-                hits.strict_add(memo.test_hits()),
-                misses.strict_add(memo.test_misses()),
-            )
-        })
+        self.runs
+            .iter()
+            .flatten()
+            .fold((0, 0), |(hits, misses), memo| {
+                (
+                    hits.strict_add(memo.test_hits()),
+                    misses.strict_add(memo.test_misses()),
+                )
+            })
     }
 }
 

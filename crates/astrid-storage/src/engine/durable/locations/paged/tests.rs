@@ -214,7 +214,6 @@ fn recovered_proofs_and_direct_spill_keep_the_same_locations_and_proof_membershi
     }
 }
 
-
 #[test]
 fn authenticated_page_memo_reuses_pages_and_clears_on_run_flush() {
     use super::super::run::test_take_page_auth_count;
@@ -239,7 +238,10 @@ fn authenticated_page_memo_reuses_pages_and_clears_on_run_flush() {
     for index in 0..64 {
         paged.insert(id(index), loc(index)).unwrap();
     }
-    assert!(paged.test_spilled_run_count() > 0, "spilled runs required for page memo");
+    assert!(
+        paged.test_spilled_run_count() > 0,
+        "spilled runs required for page memo"
+    );
 
     let _ = test_take_page_auth_count();
     let mut memo = AuthenticatedPageMemo::default();
@@ -254,7 +256,12 @@ fn authenticated_page_memo_reuses_pages_and_clears_on_run_flush() {
     let _ = test_take_page_auth_count();
     for index in 0..64 {
         let mut uncached = AuthenticatedPageMemo::default();
-        assert!(paged.location_memo(id(index), &mut uncached).unwrap().is_some());
+        assert!(
+            paged
+                .location_memo(id(index), &mut uncached)
+                .unwrap()
+                .is_some()
+        );
     }
     let uncached_auth = test_take_page_auth_count();
     assert!(

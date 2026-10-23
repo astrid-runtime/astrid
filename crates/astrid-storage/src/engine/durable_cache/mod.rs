@@ -490,6 +490,25 @@ where
         }
     }
 
+    /// Release only this owner's associations; shared physical objects and
+    /// unrelated owners' projections keep their existing accounting.
+    pub(super) fn discard_principal(&self, principal: &P) {
+        let _accounting = self.accounting.lock();
+        let mut state = self.state.lock();
+        let objects = state
+            .principals
+            .get(principal)
+            .map(|partition| partition.entries.keys().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for object in objects {
+            state.detach_principal(principal, object);
+        }
+        let resident = state.resident_bytes();
+        drop(state);
+        self.controller.reconcile(resident);
+        self.principal_budget.reconcile(principal, 0);
+    }
+
     pub(super) fn clear(&self) {
         let _accounting = self.accounting.lock();
         let mut state = self.state.lock();

@@ -60,7 +60,7 @@ fn workspace_streaming_preserves_base_and_failed_source_does_not_publish() {
 #[test]
 fn workspace_streaming_refuses_quota_without_replacing_the_file() {
     use std::io::Read;
-    let content = content_with_quota(64);
+    let content = content_with_quota(450);
     let branches = WorkspaceBranchStore::new(Arc::clone(&content));
     let owner = owner();
     let id = WorkspaceUid::from_bytes([84; 16]);
@@ -235,7 +235,7 @@ fn unrelated_home_bytes_are_not_duplicated_into_prefix_branch_quota() {
     let content = {
         let engine = Arc::new(InMemoryEngine::new(Blake3ObjectIdentityV1));
         let quota: Arc<dyn crate::kv::KvQuotaResolver<StateOwner>> =
-            Arc::new(|_owner: &StateOwner| Ok(Some(80)));
+            Arc::new(|_owner: &StateOwner| Ok(Some(475)));
         Arc::new(PrincipalContentStore::from_engine_with_quota(engine, quota))
     };
     let branches = WorkspaceBranchStore::new(Arc::clone(&content));
@@ -397,17 +397,10 @@ fn promoted_receipt_does_not_pin_old_base_after_gc() {
         )
         .unwrap();
     let promoted = branches.promote(&owner, id).unwrap();
-    let receipt_id = content
-        .header(&owner)
-        .unwrap()
-        .preserved_state
-        .iter()
-        .find(|reference| {
-            reference.label().as_bytes() == format!("workspace-promoted/{id}").as_bytes()
-        })
-        .map(ObjectReference::target)
-        .expect("promotion receipt");
-    assert_eq!(content.header(&owner).unwrap().other_quota_bytes, before);
+    let header = content.header(&owner).unwrap();
+    let directory = branches.directory_root(&owner, &header).unwrap().unwrap();
+    let receipt_id = super::directory::receipt_object(&branches, &owner, directory, id);
+    assert!(header.other_quota_bytes > before); // Durable receipt/index metadata is charged.
     assert!(engine.object(branch.base_content_root().unwrap()).is_some());
     engine.collect_garbage().unwrap();
     assert!(engine.object(branch.base_content_root().unwrap()).is_none());
@@ -638,9 +631,37 @@ fn content_with_quota(
     Arc::new(PrincipalContentStore::from_engine_with_quota(engine, quota))
 }
 
+type QuotaTestContent =
+    PrincipalContentStore<StateOwner, InMemoryEngine<StateOwner, Blake3ObjectIdentityV1>>;
+
+fn content_with_adjustable_quota() -> (Arc<QuotaTestContent>, Arc<std::sync::atomic::AtomicU64>) {
+    let limit = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    let current = Arc::clone(&limit);
+    let quota: Arc<dyn crate::kv::KvQuotaResolver<StateOwner>> = Arc::new(move |_: &StateOwner| {
+        Ok(Some(current.load(std::sync::atomic::Ordering::Relaxed)))
+    });
+    let engine = Arc::new(InMemoryEngine::new(Blake3ObjectIdentityV1));
+    (
+        Arc::new(PrincipalContentStore::from_engine_with_quota(engine, quota)),
+        limit,
+    )
+}
+
+fn freeze_quota_at_usage(
+    content: &QuotaTestContent,
+    owner: &StateOwner,
+    limit: &std::sync::atomic::AtomicU64,
+) {
+    let header = content.header(owner).unwrap();
+    let used = header
+        .other_quota_bytes
+        .strict_add(header.catalog.map_or(0, |root| root.summary.quota_bytes));
+    limit.store(used, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[test]
 fn branch_views_are_charged_to_owner_quota_and_drop_releases_charge() {
-    let content = content_with_quota(14);
+    let (content, limit) = content_with_adjustable_quota();
     let branches = WorkspaceBranchStore::new(Arc::clone(&content));
     let owner = owner();
     let first = ContentName::new("a").unwrap();
@@ -649,6 +670,7 @@ fn branch_views_are_charged_to_owner_quota_and_drop_releases_charge() {
     let branch = branches
         .begin_with_uid(&owner, WorkspaceUid::from_bytes([6; 16]))
         .unwrap();
+    freeze_quota_at_usage(&content, &owner, &limit);
     assert!(matches!(
         content.put(&owner, &second, b"5678"),
         Err(PrincipalContentError::QuotaExceeded { .. })
@@ -663,7 +685,7 @@ fn branch_views_are_charged_to_owner_quota_and_drop_releases_charge() {
 
 #[test]
 fn multiple_live_branches_cannot_evade_owner_quota() {
-    let content = content_with_quota(20);
+    let (content, limit) = content_with_adjustable_quota();
     let branches = WorkspaceBranchStore::new(Arc::clone(&content));
     let owner = owner();
     let first = WorkspaceUid::from_bytes([14; 16]);
@@ -673,6 +695,7 @@ fn multiple_live_branches_cannot_evade_owner_quota() {
     branches
         .write(&owner, first, &ContentName::new("one").unwrap(), &[1; 8])
         .unwrap();
+    freeze_quota_at_usage(&content, &owner, &limit);
     assert!(matches!(
         branches.write(&owner, second, &ContentName::new("two").unwrap(), &[2; 8]),
         Err(WorkspaceBranchError::QuotaExceeded { .. })

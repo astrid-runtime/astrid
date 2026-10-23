@@ -12,6 +12,10 @@ from runatal_v1_fastcdc import ASTRID_V1, cut, is_canonical_boundary
 from runatal_v1_fastcdc import validate_profile, verify_golden_vectors
 from runatal_v1_frames import frames, frames_bytes
 from runatal_v1_kv import validate_principal_kv
+from runatal_v1_workspace import (
+    validate_principal_workspace,
+    validate_workspace_branch_schema,
+)
 from runatal_v1_physical import decode_store as decode_physical_store, identity_bytes
 from runatal_v1_sha384 import verify_cross_hash_attestations
 from runatal_v1_sketch import verify_bottom_k_sketches
@@ -25,6 +29,7 @@ ARENA_MAGIC = b"ASTOBJ1\0"
 ROOT_MAGIC = b"ASTROOT\0"
 ROOT_SNAPSHOT_SENTINEL = (1 << 64) - 1
 ROOT_SNAPSHOT_RECORD = 1
+ROOT_REMOVAL_RECORD = 2
 KIND_NAMES = (
     "Chunk",
     "ChunkTree",
@@ -637,6 +642,7 @@ def validate_known_schema(record):
         14: validate_derivation_evidence,
         15: validate_gc_plan,
         16: validate_gc_commit,
+        17: validate_workspace_branch_schema,
     }
     validator = validators.get(record["kind"])
     if validator is not None:
@@ -695,7 +701,13 @@ def decode_root(payload):
     cursor = Cursor(payload)
     prefix = cursor.integer(8)
     if prefix == ROOT_SNAPSHOT_SENTINEL:
-        if cursor.integer(1) != ROOT_SNAPSHOT_RECORD:
+        record = cursor.integer(1)
+        if record == ROOT_REMOVAL_RECORD:
+            principal = cursor.take(cursor.integer(8))
+            expected = root_state(cursor)
+            cursor.done()
+            return ("remove", principal, expected)
+        if record != ROOT_SNAPSHOT_RECORD:
             raise FormatError("unknown root-journal extension record")
         entries = []
         previous = None
@@ -890,6 +902,13 @@ def recover(store, include_payloads):
                 if name in roots:
                     raise FormatError(f"duplicate snapshot principal {name}")
                 roots[name] = current
+        elif record[0] == "remove":
+            _, principal, expected = record
+            name = principal_text(principal)
+            actual = roots.get(name)
+            if actual != expected:
+                raise FormatError(f"root CAS mismatch for {name} at byte {offset}")
+            del roots[name]
         else:
             _, principal, expected, replacement = record
             name = principal_text(principal)
@@ -910,6 +929,7 @@ def recover(store, include_payloads):
         kv_projections[name] = validate_principal_kv(
             objects, root[1], include_payloads
         )
+        validate_principal_workspace(objects, root[1])
         for key in closure:
             record = objects[key]
             if record["kind"] == 2 and key not in validated_files:

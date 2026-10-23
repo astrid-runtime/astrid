@@ -3,7 +3,7 @@
 FORMAT_SPECIFICATION = (
     1,
     1,
-    bytes.fromhex("f9b69b9160bd48612d39f7bef3c43e6559b83436a54d23f928a145710fa20b74"),
+    bytes.fromhex("8d6518e110478bf76b78d8fc13b3f92eef44d78bcfebcd59b9b1b720615a8a6a"),
 )
 CONTENT_CATALOG_SPECIFICATION = (
     1,
@@ -13,6 +13,7 @@ CONTENT_CATALOG_SPECIFICATION = (
 LEGACY_FORMAT_SPECIFICATIONS = {
     (1, 1, bytes.fromhex(digest))
     for digest in (
+        "f9b69b9160bd48612d39f7bef3c43e6559b83436a54d23f928a145710fa20b74",
         "ac3e1ab1e82be24dae7cdef949698dd54d2407bc7f39fb30709dc36677eea61d",
         "f9b17fa5e6b4ac4562c7e4ab2da1f0c756da07945d808794ad75544a132b0d91",
         "62cded9a5b01fe75d7781b66303f5ffe8ced55a43025a0389eefaea5a0c58fe2",

@@ -179,6 +179,23 @@ where
                 .ok_or_else(|| {
                     StorageError::Internal("principal quota total overflow".to_owned())
                 })?;
+        } else if reference.label().as_bytes() == crate::content::WORKSPACE_DIRECTORY_LABEL {
+            if state.references().iter().any(|reference| {
+                is_workspace_branch_label(reference.label().as_bytes())
+                    || reference
+                        .label()
+                        .as_bytes()
+                        .starts_with(b"workspace-promoted/")
+            }) {
+                return Err(StorageError::Serialization(
+                    "mixed flat and indexed workspace state".to_owned(),
+                ));
+            }
+            quota_bytes = quota_bytes
+                .checked_add(workspace_directory_quota(engine, owner, reference)?)
+                .ok_or_else(|| {
+                    StorageError::Internal("principal quota total overflow".to_owned())
+                })?;
         } else if is_workspace_branch_label(reference.label().as_bytes()) {
             quota_bytes = quota_bytes
                 .checked_add(
@@ -471,4 +488,53 @@ fn owned_target(id: ObjectId, record: &ObjectRecord, label: &[u8]) -> StorageRes
         return Err(invalid(id, "required KV tree reference is not owning"));
     }
     Ok(reference.target())
+}
+
+fn workspace_directory_quota<P, E>(
+    engine: &E,
+    owner: &P,
+    reference: &ObjectReference,
+) -> StorageResult<u64>
+where
+    P: Clone + Ord,
+    E: KvProjectionEngine<P>,
+{
+    use crate::content::{
+        WORKSPACE_DIRECTORY_PROOF_KEY, WorkspaceDirectoryProof, validate_workspace_directory,
+    };
+    if reference.kind() != ReferenceKind::Owns {
+        return Err(StorageError::Serialization(
+            "workspace directory is not owning".to_owned(),
+        ));
+    }
+    if let Some(entry) =
+        engine.load_kv_projection_cache(owner, reference.target(), WORKSPACE_DIRECTORY_PROOF_KEY)
+        && let Some(proof) = entry.downcast::<WorkspaceDirectoryProof>()
+        && let Some(quota) = proof.quota_for(reference.target())
+    {
+        return Ok(quota);
+    }
+    let proof = validate_workspace_directory(reference, &mut |object| {
+        engine
+            .load_kv_object_for(owner, object)
+            .map_err(|error| {
+                PrincipalContentError::Projection(PrincipalProjectionError::Engine(
+                    error.to_string(),
+                ))
+            })?
+            .ok_or(PrincipalContentError::Projection(
+                PrincipalProjectionError::Model(ModelError::MissingObject(object)),
+            ))
+    })
+    .map_err(|error| StorageError::Serialization(error.to_string()))?;
+    let quota = proof.quota_for(reference.target()).ok_or_else(|| {
+        StorageError::Serialization("workspace directory proof identity mismatch".to_owned())
+    })?;
+    let _ = engine.retain_kv_projection_cache(
+        owner,
+        reference.target(),
+        WORKSPACE_DIRECTORY_PROOF_KEY,
+        crate::engine::ProjectionCacheEntry::new(proof),
+    );
+    Ok(quota)
 }

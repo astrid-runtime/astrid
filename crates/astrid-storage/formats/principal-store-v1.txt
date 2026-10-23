@@ -1895,4 +1895,120 @@ change availability or speed only; they never fabricate identity, liveness,
 authorization, or accounting.
 
 
+13. IMMUTABLE PRINCIPAL RETIREMENT AND WORKSPACE DIRECTORY
+----------------------------------------------------------
+
+13.1 Exact root removal
+
+The ASTROOT extension sentinel also admits extension record 2:
+
+  u64            extension_sentinel = 18446744073709551615
+  u8             removal_record = 2
+  u64            principal_byte_length
+  u8[]           principal[principal_byte_length]
+  RootState      expected
+
+There is no replacement and no trailing byte. Principal decoding and canonical
+re-encoding follow the same rules as transition records. Replay MUST require
+that the current principal root equals expected exactly, then remove that map
+entry. A stale, absent, or already removed root is a compare-and-swap failure.
+No live-map tombstone or empty replacement root is introduced. Compaction's
+first-frame snapshot contains present principals only. A subsequent ordinary
+create with expected_tag=0 uses generation zero as for an initially absent
+principal. Authorization to retire an immutable UID remains a runtime boundary.
+
+Removal is a root-journal operation. The replace-only transaction-WAL grammar
+is unchanged: pending WAL replacements MUST be folded and checkpointed before
+a removal frame can be appended. The deletion frame and backing media MUST
+be durable before absence is published or acknowledged. Uncertain persistence
+requires recovery. Shared owning closures, explicit pins, read handles, and
+other retention roots remain protected by ordinary compaction proofs.
+
+13.2 Workspace records
+
+WorkspaceBranch (kind 17), object_format_version=1, class=Metadata,
+logical_bytes=0, has the following canonical byte forms. Live records start
+with ASCII "astrid-workspace-branch-v1" followed by NUL; terminal promotion
+receipts instead start with "astrid-workspace-promoted-v1" followed by NUL.
+The remaining fields are:
+
+  u8[16]         workspace_uid
+  [u8            binding_tag = 1
+   u8[32]        principal_uid]          present only in UID-bound records
+  u32            target_prefix_byte_length
+  u8[]           target_prefix[target_prefix_byte_length]
+  u8             base_present           0 or 1
+  u8[32]         base_catalog            all zero if base_present=0
+  u8             working_present        0 or 1
+  u8[32]         working_catalog         all zero if working_present=0
+
+Legacy unbound records omit binding_tag and principal_uid. The exact total
+length derived from the legacy prefix-length slot selects the legacy form;
+otherwise the 33-byte binding field is present. The historical extended
+unbound form (binding_tag=0 with all-zero principal_uid) remains readable.
+A non-empty target prefix is canonical UTF-8 without empty, dot, or dot-dot
+path components. UID-bound directory rows require a non-empty prefix.
+Live records have exactly the Owns "base" and "working" references selected
+by the two present flags, in label order. Terminal receipts have no references:
+their old catalog identities are historical comparison data, not liveness pins.
+
+13.3 Indexed workspace state
+
+A PrincipalState optionally owns one "workspace-directory" component. It MUST
+NOT also have any flat "workspace/" or "workspace-promoted/" component. An
+empty directory has no component. Directory nodes use the canonical binary
+radix grammar, byte ordering, partition rules, and finite/disjoint closure
+validation of CONTENT CATALOG FORMAT 2, with these exact substitutions:
+
+  object_format_version = 3
+  leaf owning reference label = "workspace-record"
+  leaf target = WorkspaceBranch version 1
+
+The leaf's encoded logical_bytes is a quota charge, not file payload length.
+Each leaf summary is:
+
+  logical_bytes = encoded logical_bytes
+  quota_bytes   = encoded logical_bytes + UTF-8 key length + 198
+  entries       = 1
+
+The fixed 198-byte reserve conservatively charges one leaf and one binary
+branch per row, including their owning reference metadata; a binary tree has
+fewer branches than leaves. All totals use checked arithmetic. A node using
+version 2 cannot be decoded as workspace state or vice versa.
+
+The exact key forms (slashes are literal) are:
+
+  b/<workspace_uid>                         live primary record
+  r/<workspace_uid>                         terminal receipt primary record
+  a/<principal_uid>/<workspace_uid>         complete UID binding inventory
+  u/<principal_uid>/<target_prefix>         current UID/prefix selector
+
+Workspace UIDs are 32 lowercase hexadecimal characters; principal UIDs are
+64 lowercase hexadecimal characters. Keys MUST agree with the embedded record
+identity, binding UID, prefix and lifecycle. One workspace UID has exactly one
+primary row. Every UID-bound primary row has exactly one matching a/ row with
+the identical target; no extra a/ rows are permitted. Each UID/prefix group has
+exactly one u/ row whose target belongs to that group. At most one member may
+be live, and if present it MUST be selected. Otherwise any terminal member may
+be selected. Unbound legacy primary rows have neither a/ nor u/ rows.
+
+Primary row logical_bytes equals the record's canonical payload length plus
+sum(33 + reference-label length), plus the fully validated working catalog's
+quota_bytes for a live branch, or zero working-catalog charge for a terminal
+receipt. The a/ and u/ rows have logical_bytes zero: primary-record metadata
+and working bytes are charged once. Live base/working roots and their catalog
+summaries MUST validate completely; terminal receipt catalog IDs need not
+remain present. A decoder MUST validate the complete row bijection before
+minting any immutable-root-bound summary proof. Disposable proofs do not grant
+liveness, and a cache miss or eviction MUST use complete validation.
+
+Legacy flat components remain readable. Migration preserves every branch and
+receipt object identity, fully validates their old state, builds this unique
+canonical directory, and replaces the flat references in one ordinary owner
+root compare-and-swap. It never transfers branch ownership implicitly. True
+UID retirement may remove that UID's bindings and receipts from current and
+former fleet roots, and then remove its private principal root; ordinary
+capsule unload or daemon restart MUST preserve valid live workspace state.
+
+
 END OF ASTRID PRINCIPAL STORE FORMAT 1

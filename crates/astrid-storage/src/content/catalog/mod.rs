@@ -1,7 +1,7 @@
 //! Canonical path-copy catalog for principal-owned named content.
 
 mod legacy;
-mod tree;
+pub(crate) mod tree;
 
 pub(crate) const CONTENT_COMPONENT_LABEL: &[u8] = b"content";
 
