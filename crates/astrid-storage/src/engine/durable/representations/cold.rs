@@ -14,9 +14,7 @@ use super::super::locations::{
     AuthenticatedPageMemo, ClosureProof, LocationIndexMemoryBudget, LocationLookup, PagedLocations,
     RebuildLocations,
 };
-use super::super::{
-    ArenaLocation, DurableError, File, RecoveryLimits, append_frame, io_error, scan_frames,
-};
+use super::super::{ArenaLocation, DurableError, File, RecoveryLimits, append_frame, io_error};
 use super::format::{
     Blake3PhysicalIdentity, METADATA_FILE, METADATA_MAGIC, MetadataFrame, MetadataKind,
 };
@@ -60,8 +58,24 @@ impl ColdNodes {
 
     /// Reuse only complete active closures accepted by canonical map recovery.
     /// The final unique proof count also requires every such node on media.
+    #[cfg(test)]
     pub(super) fn from_validated_maps(
         file: &File,
+        limits: RecoveryLimits,
+        budget: LocationIndexMemoryBudget,
+        maps: &[&CanonicalPhysicalMap],
+    ) -> Result<Self, DurableError> {
+        let mut reader = file
+            .try_clone()
+            .map_err(|e| io_error("clone recovery metadata scanner", e))?;
+        super::recovery::recover_metadata(&mut reader, limits, budget)?
+            .into_nodes()
+            .into_cold(maps)
+    }
+
+    pub(super) fn from_recovered_locations(
+        file: File,
+        source: PagedLocations,
         limits: RecoveryLimits,
         budget: LocationIndexMemoryBudget,
         maps: &[&CanonicalPhysicalMap],
@@ -70,40 +84,22 @@ impl ColdNodes {
             sum.checked_add(map.nodes().len())
                 .ok_or(DurableError::EncodingOverflow)
         })?;
-        let mut reader = file
-            .try_clone()
-            .map_err(|error| io_error("clone physical node arena", error))?;
         let mut rebuild = RebuildLocations::new(budget.durable_entries());
-        scan_frames(
-            &mut reader,
-            METADATA_FILE,
-            METADATA_MAGIC,
-            limits,
-            |offset, payload| {
-                let frame = MetadataFrame::decode(payload)?;
-                if frame.kind == MetadataKind::MapNode {
-                    frame.verify(&Blake3PhysicalIdentity)?;
-                    let payload_len =
-                        u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
-                    let id = PhysicalMapNodeId::new(frame.identity);
-                    let proof = if maps.iter().any(|map| map.nodes().contains_key(&id)) {
-                        ClosureProof::Complete
-                    } else {
-                        ClosureProof::Unknown
-                    };
-                    rebuild.push(
-                        ObjectId::new(frame.identity),
-                        ArenaLocation {
-                            offset,
-                            payload_len,
-                            checksum: frame_checksum(METADATA_MAGIC, payload_len, payload),
-                        },
-                        proof,
-                    )?;
-                }
-                Ok(())
-            },
-        )?;
+        // Publish canonical closure proofs only after full active-map validation.
+        // Historical journal reachability memos never confer this stronger proof.
+        for entry in source.locations() {
+            let (id, location) = entry?;
+            let proof = if maps.iter().any(|map| {
+                map.nodes()
+                    .contains_key(&PhysicalMapNodeId::new(*id.as_bytes()))
+            }) {
+                ClosureProof::Complete
+            } else {
+                ClosureProof::Unknown
+            };
+            rebuild.push(id, location, proof)?;
+        }
+        drop(source);
         let (locations, complete) = rebuild.finish()?;
         if complete != expected_complete {
             return Err(DurableError::InvalidRepresentationState(
@@ -111,7 +107,7 @@ impl ColdNodes {
             ));
         }
         Ok(Self(Arc::new(Mutex::new(NodeArena {
-            file: reader,
+            file,
             locations,
             limits,
             failed: false,
@@ -296,37 +292,12 @@ impl NodeArena {
         if let Some(staged) = &self.staged
             && let Some(location) = staged.locations.location(key)?
         {
-            return Self::read_node(&staged.file, self.limits, id, location).map(Some);
+            return read_node(&staged.file, self.limits, id, location).map(Some);
         }
         let Some(location) = self.locations.location(key)? else {
             return Ok(None);
         };
-        Self::read_node(&self.file, self.limits, id, location).map(Some)
-    }
-
-    fn read_node(
-        file: &File,
-        limits: RecoveryLimits,
-        id: PhysicalMapNodeId,
-        location: ArenaLocation,
-    ) -> Result<PhysicalMapNode, DurableError> {
-        let payload = read_frame_at(file, METADATA_FILE, METADATA_MAGIC, location.offset, limits)?;
-        if u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?
-            != location.payload_len
-            || frame_checksum(METADATA_MAGIC, location.payload_len, &payload) != location.checksum
-        {
-            return Err(DurableError::InvalidRepresentationState(
-                "physical node locator no longer matches frame",
-            ));
-        }
-        let frame = MetadataFrame::decode(&payload)?;
-        if frame.kind != MetadataKind::MapNode || frame.identity != *id.as_bytes() {
-            return Err(DurableError::InvalidRepresentationState(
-                "physical node locator names a different identity",
-            ));
-        }
-        frame.verify(&Blake3PhysicalIdentity)?;
-        Ok(PhysicalMapNode::decode(&frame.value)?)
+        read_node(&self.file, self.limits, id, location).map(Some)
     }
 }
 
@@ -400,3 +371,28 @@ mod tests;
 
 #[cfg(test)]
 mod engine_tests;
+
+pub(super) fn read_node(
+    file: &File,
+    limits: RecoveryLimits,
+    id: PhysicalMapNodeId,
+    location: ArenaLocation,
+) -> Result<PhysicalMapNode, DurableError> {
+    let payload = read_frame_at(file, METADATA_FILE, METADATA_MAGIC, location.offset, limits)?;
+    if u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?
+        != location.payload_len
+        || frame_checksum(METADATA_MAGIC, location.payload_len, &payload) != location.checksum
+    {
+        return Err(DurableError::InvalidRepresentationState(
+            "physical node locator no longer matches frame",
+        ));
+    }
+    let frame = MetadataFrame::decode(&payload)?;
+    if frame.kind != MetadataKind::MapNode || frame.identity != *id.as_bytes() {
+        return Err(DurableError::InvalidRepresentationState(
+            "physical node locator names a different identity",
+        ));
+    }
+    frame.verify(&Blake3PhysicalIdentity)?;
+    Ok(PhysicalMapNode::decode(&frame.value)?)
+}
