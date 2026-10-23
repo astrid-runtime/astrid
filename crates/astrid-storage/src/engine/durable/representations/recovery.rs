@@ -496,6 +496,7 @@ pub(super) fn validate_representations(
         placement_by_blob.insert(entry.blob(), entry);
     }
     let mut reverse = ReverseIndex::new(index_memory)?;
+    let mut reverse_pages = super::super::locations::AuthenticatedPageMemo::default();
     let mut recovered_direct = super::recovered_direct::Builder::new()?;
     for entry in active_entries(representations) {
         let (key, bytes) = entry?;
@@ -538,7 +539,7 @@ pub(super) fn validate_representations(
                 "direct representation placement does not match its record",
             ));
         }
-        if reverse.insert_first(object, id)? {
+        if reverse.insert_first_memo(object, id, &mut reverse_pages)? {
             recovered_direct.push(object, placement)?;
         }
     }
