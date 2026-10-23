@@ -3,10 +3,10 @@
 use crate::storage_model::{ModelError, ObjectId, ObjectKind, ObjectRecord, PrincipalUsage, World};
 
 use super::format::{read_indexed_object, visit_indexed_objects};
+use super::locations::LocationLookup;
 use super::wal::PendingWalOverlay;
 use super::{
-    ArenaLocation, BTreeMap, BTreeSet, DurableError, File, PersistentObjectIdentity, ROOT_FILE,
-    RecoveryLimits,
+    BTreeMap, BTreeSet, DurableError, File, PersistentObjectIdentity, ROOT_FILE, RecoveryLimits,
 };
 
 // This is an I/O coalescing target, not an authenticity or allocation limit.
@@ -15,7 +15,7 @@ const RECOVERY_CLOSURE_READ_TARGET_BYTES: u64 = 8 * 1024 * 1024;
 
 pub(super) struct ClosureObjects<'a, I, P: Ord> {
     pub(super) arena: &'a mut File,
-    pub(super) index: &'a BTreeMap<ObjectId, ArenaLocation>,
+    pub(super) index: &'a dyn LocationLookup,
     pub(super) incoming: &'a BTreeMap<ObjectId, ObjectRecord>,
     pub(super) pending: Option<&'a PendingWalOverlay<P>>,
     pub(super) identity: &'a I,
@@ -30,7 +30,7 @@ impl<I: PersistentObjectIdentity, P: Ord> ClosureObjects<'_, I, P> {
         if let Some(record) = self.pending.and_then(|pending| pending.get_object(&id)) {
             return Ok(record.record().clone());
         }
-        if let Some(location) = self.index.get(&id).copied() {
+        if let Some(location) = self.index.location(id)? {
             return read_indexed_object(self.arena, id, location, self.identity, self.limits);
         }
         Err(ModelError::MissingObject(id).into())
@@ -75,7 +75,7 @@ pub(super) fn materialize_closure<I: PersistentObjectIdentity, P: Ord>(
 /// load.
 pub(super) fn preload_indexed_closures<I: PersistentObjectIdentity>(
     arena: &File,
-    index: &BTreeMap<ObjectId, ArenaLocation>,
+    index: &dyn LocationLookup,
     roots: impl IntoIterator<Item = ObjectId>,
     identity: &I,
     limits: RecoveryLimits,
@@ -88,10 +88,7 @@ pub(super) fn preload_indexed_closures<I: PersistentObjectIdentity>(
             if loaded.contains_key(&id) {
                 continue;
             }
-            let location = index
-                .get(&id)
-                .copied()
-                .ok_or(ModelError::MissingObject(id))?;
+            let location = index.location(id)?.ok_or(ModelError::MissingObject(id))?;
             requested.push((id, location));
         }
         if requested.is_empty() {

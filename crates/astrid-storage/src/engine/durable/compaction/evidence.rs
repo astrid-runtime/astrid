@@ -9,8 +9,7 @@ use crate::storage_model::{
 };
 
 use super::{
-    ArenaLocation, DurableError, PersistentObjectIdentity, PrincipalCodec, VerifiedCompactionPlan,
-    encoded_roots,
+    DurableError, PersistentObjectIdentity, PrincipalCodec, VerifiedCompactionPlan, encoded_roots,
 };
 
 const PLACEMENT_PREFIX: &[u8] = b"astrid-gc-placement-set-v1\0";
@@ -113,7 +112,7 @@ pub(super) struct PlacementView<'a, P: Ord> {
     pub(super) arena_bytes: u64,
     pub(super) root_journal_bytes: u64,
     pub(super) root_journal_digest: [u8; 32],
-    pub(super) index: &'a BTreeMap<ObjectId, ArenaLocation>,
+    pub(super) index: &'a dyn crate::engine::durable::locations::LocationLookup,
     pub(super) roots: &'a BTreeMap<P, RootState>,
 }
 
@@ -257,10 +256,11 @@ where
     bytes.extend_from_slice(&placement.arena_bytes.to_le_bytes());
     bytes.extend_from_slice(&placement.root_journal_bytes.to_le_bytes());
     bytes.extend_from_slice(&placement.root_journal_digest);
-    let object_count =
-        u64::try_from(placement.index.len()).map_err(|_| DurableError::EncodingOverflow)?;
+    let object_count = u64::try_from(placement.index.location_count())
+        .map_err(|_| DurableError::EncodingOverflow)?;
     bytes.extend_from_slice(&object_count.to_le_bytes());
-    for (id, location) in placement.index {
+    for entry in placement.index.locations() {
+        let (id, location) = entry?;
         bytes.extend_from_slice(id.as_bytes());
         bytes.extend_from_slice(&location.offset.to_le_bytes());
         bytes.extend_from_slice(&location.payload_len.to_le_bytes());

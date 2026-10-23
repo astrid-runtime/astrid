@@ -1,3 +1,5 @@
+use crate::engine::durable::{ArenaLocation, ObjectId};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
@@ -141,4 +143,26 @@ fn streamed_snapshot_reports_mid_payload_io_failure() {
             .is_err()
     );
     assert_eq!(file.written, WRITE_BUFFER_BYTES + 123);
+}
+
+#[test]
+fn snapshot_locator_read_failure_cannot_be_encoded_as_an_empty_index() {
+    let state = IndexState {
+        arena_len: 100,
+        arena_tail: None,
+        objects: crate::engine::durable::locations::tests::FailedLookup,
+    };
+    let mut file = ObservedFile::new();
+    let error = Snapshot::new(&state, IdentityScheme::new(1, 1).unwrap())
+        .unwrap()
+        .append(&mut file)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        DurableError::Corrupt {
+            file: "injected locator",
+            ..
+        }
+    ));
+    assert_eq!(file.written, 0);
 }

@@ -170,7 +170,7 @@ async fn configured_cache_budget_reclaims_and_preserves_authoritative_reads() {
     assert!(store.object_cache_stats().resident_bytes > 1);
     std::fs::write(
         home.root().join("config.toml"),
-        "[resources]\ndecoded_object_cache_bytes = 1",
+        "[resources]\ndecoded_object_cache_bytes = 1\nlocation_index_memory_bytes = 640",
     )
     .unwrap();
     configure_object_cache(&store, &home, workspace.path(), &WorkspaceLayout::default()).unwrap();
@@ -183,4 +183,27 @@ async fn configured_cache_budget_reclaims_and_preserves_authoritative_reads() {
         Some(content)
     );
     assert_eq!(store.object_cache_stats().resident_bytes, 0);
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn index_budget_too_small_for_an_entry_fails_operator_configuration() {
+    let root = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(root.path());
+    let workspace = tempfile::tempdir().unwrap();
+    let store = astrid_storage::open_runtime_principal_store(
+        &home,
+        Arc::new(|_: &astrid_storage::StateOwner| Ok(None)),
+    )
+    .await
+    .unwrap();
+    std::fs::write(
+        home.root().join("config.toml"),
+        "[resources]\nlocation_index_memory_bytes = 1",
+    )
+    .unwrap();
+    let error =
+        configure_object_cache(&store, &home, workspace.path(), &WorkspaceLayout::default())
+            .unwrap_err();
+    assert!(error.to_string().contains("hold an entry"));
 }

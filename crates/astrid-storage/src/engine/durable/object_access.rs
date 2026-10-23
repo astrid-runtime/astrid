@@ -1,5 +1,6 @@
 //! Uncached logical-object access across physical representations.
 
+use super::locations::LocationLookup as _;
 use crate::storage_model::{ObjectId, ObjectRecord};
 
 use super::{
@@ -20,11 +21,12 @@ where
     /// Returns a recovery error when authoritative reopen cannot complete.
     pub fn object_count(&self) -> Result<usize, DurableError> {
         let inner = self.lock_usable()?;
-        let overlay_only = inner
-            .pending_wal
-            .objects()
-            .filter(|(id, _)| !inner.index.contains_key(id))
-            .count();
+        let mut overlay_only = 0_usize;
+        for (id, _) in inner.pending_wal.objects() {
+            if inner.index.location(*id)?.is_none() {
+                overlay_only = overlay_only.strict_add(1);
+            }
+        }
         inner
             .index
             .len()
@@ -45,7 +47,7 @@ where
                 if let Some(object) = inner.pending_wal.get_object(&id) {
                     return Ok(Some(object.record().clone()));
                 }
-                (inner.index.get(&id).copied(), inner.arena_generation)
+                (inner.index.location(id)?, inner.arena_generation)
             };
             let Some(location) = location else {
                 return Ok(None);

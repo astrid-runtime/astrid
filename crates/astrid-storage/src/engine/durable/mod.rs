@@ -152,6 +152,7 @@ pub struct DurableEnginePolicy<P> {
     recovery: RecoveryRetryPolicy,
     object_cache: ObjectCacheConfig<P>,
     transaction_wal: TransactionWalPolicy,
+    index_memory: LocationIndexMemoryBudget,
 }
 
 impl<P> DurableEnginePolicy<P> {
@@ -167,7 +168,19 @@ impl<P> DurableEnginePolicy<P> {
             recovery,
             object_cache,
             transaction_wal: TransactionWalPolicy::disabled(),
+            // A shared engine gets a finite staging table, independent of its
+            // complete historical object count. Embedders may tune the target.
+            index_memory: LocationIndexMemoryBudget::DEFAULT,
         }
+    }
+
+    /// Bound the resident staging table for the complete disk-backed object
+    /// locator. Historical entries remain available in authenticated anonymous
+    /// runs; this target never limits durable history or object admission.
+    #[must_use]
+    pub const fn with_location_index_memory(mut self, budget: LocationIndexMemoryBudget) -> Self {
+        self.index_memory = budget;
+        self
     }
 
     /// Select whether new root transactions publish through the single-sync
@@ -553,7 +566,7 @@ struct ArenaLocation {
 #[derive(Debug)]
 struct DurableInner<P: Ord> {
     roots_by_principal: BTreeMap<P, RootState>,
-    index: BTreeMap<ObjectId, ArenaLocation>,
+    index: locations::PagedLocations,
     pending_wal: wal::PendingWalOverlay<P>,
     pending_index_locations: Vec<(ObjectId, ArenaLocation)>,
     pending_direct_objects: BTreeMap<ObjectId, representations::DirectArenaObject>,
@@ -674,6 +687,7 @@ pub struct DurableEngine<P: Ord, I, C> {
     lifecycle: AtomicU8,
     arena_reader: RwLock<Option<ArenaReader>>,
     object_cache: ObjectCache<P>,
+    index_memory: RwLock<LocationIndexMemoryBudget>,
     recovery_policy: RecoveryRetryPolicy,
     preparation_authority: Arc<()>,
     inner: Mutex<DurableInner<P>>,
@@ -808,6 +822,7 @@ mod format;
 mod group;
 mod index;
 mod lifecycle;
+mod locations;
 mod native_io;
 mod recovery;
 mod representation_engine;
@@ -860,3 +875,5 @@ mod group_tests;
 mod index_tests;
 #[cfg(test)]
 mod tests;
+
+pub use locations::LocationIndexMemoryBudget;

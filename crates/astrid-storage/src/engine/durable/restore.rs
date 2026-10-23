@@ -1,5 +1,6 @@
 //! Destination-only root restoration and principal-codec migration.
 
+use super::locations::LocationLookup as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::path::Path;
@@ -87,7 +88,10 @@ where
     match persisted {
         Ok((locations, arena_len)) => {
             for location in locations {
-                inner.index.insert(location.0, location.1);
+                if let Err(error) = inner.index.insert(location.0, location.1) {
+                    engine.mark_requires_recovery(&mut inner);
+                    return Err(error);
+                }
                 inner.pending_index_locations.push(location);
             }
             inner.validated.extend(validated);
@@ -222,7 +226,7 @@ where
 {
     let mut objects = Vec::new();
     for (id, record) in records {
-        if let Some(location) = inner.index.get(id).copied() {
+        if let Some(location) = inner.index.location(*id)? {
             let files = live_files_mut(&mut inner.files)?;
             let existing =
                 read_indexed_object(&files.arena, *id, location, &engine.identity, engine.limits)?;

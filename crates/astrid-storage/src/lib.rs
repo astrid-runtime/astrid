@@ -114,9 +114,9 @@ pub use secret::{FallbackSecretStore, KeychainSecretStore};
 
 #[cfg(not(target_family = "wasm"))]
 pub use engine::{
-    DurableEnginePolicy, GroupCommitPolicy, ObjectCacheCapacity, ObjectCacheConfig,
-    ObjectCacheController, ObjectCacheMemoryBudget, ObjectCacheStats, PrincipalObjectCacheBudget,
-    RecoveryRetryPolicy, TransactionWalPolicy,
+    DurableEnginePolicy, GroupCommitPolicy, LocationIndexMemoryBudget, ObjectCacheCapacity,
+    ObjectCacheConfig, ObjectCacheController, ObjectCacheMemoryBudget, ObjectCacheStats,
+    PrincipalObjectCacheBudget, RecoveryRetryPolicy, TransactionWalPolicy,
 };
 #[cfg(feature = "legacy-surrealkv")]
 pub use kv::SurrealKvStore;

@@ -39,7 +39,8 @@ where
         self.flush_for_retirement(&mut inner)?;
         let mut reader = self.arena_reader.write();
         self.lifecycle.store(LIFECYCLE_CLOSED, Ordering::Release);
-        let transferred = std::mem::replace(&mut *inner, empty_inner());
+        let transferred =
+            std::mem::replace(&mut *inner, empty_inner(self.index_memory.read().entries()));
         let published_roots = PublishedRoots::new(&transferred.roots_by_principal);
         self.published_roots.replace(&inner.roots_by_principal);
         self.object_cache.clear();
@@ -58,6 +59,7 @@ where
             lifecycle: AtomicU8::new(LIFECYCLE_USABLE),
             arena_reader: RwLock::new(reader.take()),
             object_cache: self.object_cache.empty_peer(),
+            index_memory: RwLock::new(*self.index_memory.read()),
             recovery_policy: self.recovery_policy,
             preparation_authority: Arc::new(()),
             inner: Mutex::new(transferred),
@@ -73,10 +75,10 @@ fn busy() -> DurableError {
     )
 }
 
-fn empty_inner<P: Ord>() -> DurableInner<P> {
+fn empty_inner<P: Ord>(limit: std::num::NonZeroUsize) -> DurableInner<P> {
     DurableInner {
         roots_by_principal: BTreeMap::new(),
-        index: BTreeMap::new(),
+        index: super::locations::PagedLocations::new(limit),
         pending_wal: PendingWalOverlay::default(),
         pending_index_locations: Vec::new(),
         pending_direct_objects: BTreeMap::new(),

@@ -40,11 +40,11 @@ pub use durable::{
     CompactionEvidenceBundle, CompactionFacts, CompactionProofVerifier, CompactionReport,
     CompactionRetainedRoot, CompactionRetention, CompactionRootKind,
     DeterministicCompactionProofVerifier, DurableEngine, DurableEnginePolicy, DurableError,
-    FaultInjector, FaultPoint, GroupCommitPolicy, IdentityScheme, NoFaults, ObjectCacheCapacity,
-    ObjectCacheConfig, ObjectCacheController, ObjectCacheMemoryBudget, ObjectCacheStats,
-    PersistentObjectIdentity, PrincipalCodec, PrincipalObjectCacheBudget, RecoveryLimits,
-    RecoveryRetryPolicy, TransactionWalPolicy, VerifiedCompactionPlan,
-    deterministic_compaction_proof,
+    FaultInjector, FaultPoint, GroupCommitPolicy, IdentityScheme, LocationIndexMemoryBudget,
+    NoFaults, ObjectCacheCapacity, ObjectCacheConfig, ObjectCacheController,
+    ObjectCacheMemoryBudget, ObjectCacheStats, PersistentObjectIdentity, PrincipalCodec,
+    PrincipalObjectCacheBudget, RecoveryLimits, RecoveryRetryPolicy, TransactionWalPolicy,
+    VerifiedCompactionPlan, deterministic_compaction_proof,
 };
 pub use kv::{
     KvProjectionEngine, KvProjectionError, KvState, KvStateSnapshot, ReadyKvRoot,

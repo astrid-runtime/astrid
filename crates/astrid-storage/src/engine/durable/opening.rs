@@ -214,7 +214,7 @@ where
             policy.transaction_wal.is_enabled(),
             faults.as_ref(),
         )?;
-        Ok(Self::from_recovered(
+        Self::from_recovered(
             None,
             None,
             Some(volume),
@@ -225,7 +225,7 @@ where
             EngineOpenOptions { policy, faults },
             recovered,
             wal,
-        ))
+        )
     }
 
     /// Open or create a durable store with an explicit fault injector.
@@ -288,7 +288,7 @@ where
             options.faults.as_ref(),
         )?;
 
-        Ok(Self::from_recovered(
+        Self::from_recovered(
             Some(path),
             Some(directory_capability),
             None,
@@ -299,7 +299,7 @@ where
             options,
             recovered,
             wal,
-        ))
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -314,8 +314,12 @@ where
         options: EngineOpenOptions<P>,
         recovered: super::RecoveredStore<P>,
         wal: Option<super::DurableWal<P, I, C>>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, DurableError> {
+        let index = super::locations::PagedLocations::from_map(
+            recovered.index,
+            options.policy.index_memory.entries(),
+        )?;
+        Ok(Self {
             directory,
             directory_capability,
             volume: RwLock::new(volume),
@@ -329,6 +333,7 @@ where
                 generation: 0,
             })),
             object_cache: ObjectCache::new(options.policy.object_cache),
+            index_memory: RwLock::new(options.policy.index_memory),
             recovery_policy: options.policy.recovery,
             preparation_authority: Arc::new(()),
             group_policy: options.policy.group_commit,
@@ -338,7 +343,7 @@ where
             published_roots: super::PublishedRoots::new(&recovered.roots_by_principal),
             inner: Mutex::new(DurableInner {
                 roots_by_principal: recovered.roots_by_principal,
-                index: recovered.index,
+                index,
                 pending_wal: super::wal::PendingWalOverlay::default(),
                 pending_index_locations: Vec::new(),
                 pending_direct_objects: BTreeMap::new(),
@@ -349,6 +354,6 @@ where
                 poisoned: false,
                 arena_generation: 0,
             }),
-        }
+        })
     }
 }

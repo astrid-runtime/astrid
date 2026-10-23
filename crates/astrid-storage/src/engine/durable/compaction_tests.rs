@@ -1,4 +1,5 @@
 //! Crash and authority tests for proof-audited durable compaction.
+use super::locations::LocationLookup as _;
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -250,7 +251,7 @@ fn compaction_invalidates_evidence_for_reclaimed_staged_objects() {
     engine.compact(&authorization).unwrap();
 
     let inner = engine.inner.lock();
-    assert!(!inner.index.contains_key(&staged_id));
+    assert!(inner.index.location(staged_id).unwrap().is_none());
     assert!(!inner.validated.contains(&staged_id));
 }
 
