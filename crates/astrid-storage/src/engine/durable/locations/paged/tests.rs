@@ -284,3 +284,28 @@ fn authenticated_page_memo_reuses_pages_and_clears_on_run_flush() {
     assert!(hits_after > 0 || auth_after > 0);
     let _ = misses;
 }
+
+#[test]
+fn proof_reset_preserves_all_locations_and_invalidates_authenticated_page_memos() {
+    let mut locations = PagedLocations::new(NonZeroUsize::new(4).unwrap());
+    let expected = (0..128).map(entry).collect::<BTreeMap<_, _>>();
+    for (id, location) in &expected {
+        locations.insert(*id, *location).unwrap();
+        locations.mark_proven(*id).unwrap();
+    }
+    let id = entry(42).0;
+    let mut memo = AuthenticatedPageMemo::default();
+    assert!(locations.closure_proven_memo(id, &mut memo).unwrap());
+    locations.clear_proofs().unwrap();
+    assert!(!locations.closure_proven_memo(id, &mut memo).unwrap());
+    assert_eq!(
+        locations
+            .locations()
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .unwrap(),
+        expected
+    );
+    assert!(
+        locations.resident_capacity_bytes() <= 4 * std::mem::size_of::<(ObjectId, LocatorValue)>()
+    );
+}

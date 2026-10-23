@@ -45,8 +45,8 @@ impl RepresentationStore {
             &generation_region(&generation, JOURNAL_PATH),
             false,
         )?;
-        let index = recover_metadata(&mut metadata, limits, index_memory)?;
-        let (active, state) = recover_journal(&mut journal, current, &index, limits)?;
+        let mut index = recover_metadata(&mut metadata, limits, index_memory)?;
+        let (active, state) = recover_journal(&mut journal, current, &mut index, limits)?;
         let recovered = Self::from_recovered(
             metadata,
             journal,

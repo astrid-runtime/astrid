@@ -180,13 +180,23 @@ impl PagedLocations {
         )
     }
 
-    #[cfg(test)]
     pub(in crate::engine::durable) fn clear_proofs(&mut self) -> Result<(), DurableError> {
-        let entries = self.locations().collect::<Result<Vec<_>, _>>()?;
-        for (id, location) in entries {
-            let previous = self.row_before_insert(id)?;
-            self.insert_row(id, LocatorValue::unknown(location), previous)?;
+        if self.failed() {
+            return Err(DurableError::InvalidRepresentationState(
+                "cannot reset failed locator proofs",
+            ));
         }
+        let mut rebuild = RebuildLocations::new(self.limit);
+        for entry in self.locations() {
+            let (id, location) = entry?;
+            rebuild.push(id, location, ClosureProof::Unknown)?;
+        }
+        let (replacement, _) = rebuild.finish()?;
+        self.runs_epoch.fetch_add(1, Ordering::AcqRel);
+        replacement
+            .runs_epoch
+            .store(self.runs_epoch.load(Ordering::Acquire), Ordering::Release);
+        *self = replacement;
         Ok(())
     }
 
