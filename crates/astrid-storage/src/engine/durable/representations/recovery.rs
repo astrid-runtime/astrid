@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::SeekFrom;
 
 use super::super::DurableIo;
-use super::reverse_index::{self, ReverseIndex};
+use super::reverse_index::ReverseIndex;
 
 use crate::storage_model::{
     CanonicalPhysicalMap, Coverage, PhysicalMapKey, PhysicalMapNode, PlacementEntry, PlacementSet,
@@ -433,6 +433,7 @@ pub(super) fn validate_representations(
     profiles: &CanonicalPhysicalMap,
     representations: &CanonicalPhysicalMap,
     placements: &CanonicalPhysicalMap,
+    index_memory: super::LocationIndexMemoryBudget,
 ) -> Result<(ReverseIndex, u64), DurableError> {
     let mut placement_by_blob = BTreeMap::new();
     let mut extent_count = 0_u64;
@@ -463,7 +464,7 @@ pub(super) fn validate_representations(
             .ok_or(DurableError::EncodingOverflow)?;
         placement_by_blob.insert(entry.blob(), entry);
     }
-    let mut reverse = ReverseIndex::new();
+    let mut reverse = ReverseIndex::new(index_memory)?;
     for entry in active_entries(representations) {
         let (key, bytes) = entry?;
         let record = RepresentationRecord::decode(&bytes)?;
@@ -505,7 +506,7 @@ pub(super) fn validate_representations(
                 "direct representation placement does not match its record",
             ));
         }
-        reverse_index::insert(&mut reverse, object, id);
+        reverse.insert(object, id)?;
     }
     Ok((reverse, extent_count))
 }
