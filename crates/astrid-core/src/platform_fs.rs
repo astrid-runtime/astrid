@@ -5,6 +5,9 @@
 //! replace authenticated executables without exposing platform handles to the
 //! rest of the workspace.
 
+mod clone_file;
+pub use clone_file::try_clone_file;
+
 use std::collections::HashSet;
 use std::io;
 use std::path::{Component, Path, PathBuf};
