@@ -505,7 +505,7 @@ where
             return Err(error);
         }
         inner.pending_index_locations.push((id, location));
-        inner.validated.insert(id);
+        self.remember_proofs(inner, [id])?;
         debug_assert_eq!(
             previous_arena_len,
             live_files_mut(&mut inner.files)?.arena_len
@@ -778,12 +778,8 @@ where
         commit: ObjectId,
     ) -> Result<BTreeSet<ObjectId>, DurableError> {
         let pending_wal = &inner.pending_wal;
-        let DurableInner {
-            files,
-            index,
-            validated,
-            ..
-        } = inner;
+        let DurableInner { files, index, .. } = inner;
+        let validated = super::proofs::ProvenObjects::new(index, pending_wal);
         let files = live_files_mut(files)?;
         validate_incremental_closure(
             &mut ClosureObjects {
@@ -794,7 +790,7 @@ where
                 identity: &self.identity,
                 limits: self.limits,
             },
-            validated,
+            &validated,
             commit,
         )
     }

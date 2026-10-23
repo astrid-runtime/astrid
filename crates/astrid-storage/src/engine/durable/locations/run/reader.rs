@@ -1,14 +1,14 @@
 //! Authenticated lookups and ordered traversal of anonymous runs.
 
 use super::{
-    ArenaLocation, BRANCH_CAPACITY, CHILD_BYTES, DurableError, ENTRY_BYTES, HEADER_BYTES,
-    LEAF_CAPACITY, Node, ObjectId, PAGE_BYTES, Page, Run, corrupt,
+    ArenaLocation, BRANCH_CAPACITY, CHILD_BYTES, ClosureProof, DurableError, ENTRY_BYTES,
+    HEADER_BYTES, LEAF_CAPACITY, LocatorValue, Node, ObjectId, PAGE_BYTES, Page, Run, corrupt,
 };
 
 pub(in crate::engine::durable::locations) struct Entries<'a> {
     run: &'a Run,
     pending: Vec<Node>,
-    leaf: std::vec::IntoIter<(ObjectId, ArenaLocation)>,
+    leaf: std::vec::IntoIter<(ObjectId, LocatorValue)>,
     failed: bool,
 }
 
@@ -24,7 +24,7 @@ impl<'a> Entries<'a> {
 }
 
 impl Iterator for Entries<'_> {
-    type Item = Result<(ObjectId, ArenaLocation), DurableError>;
+    type Item = Result<(ObjectId, LocatorValue), DurableError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.failed {
@@ -100,20 +100,7 @@ pub(super) fn decode(node: Node, bytes: &[u8; PAGE_BYTES]) -> Result<Page, Durab
                 .map_err(|_| corrupt(node.offset, "invalid location offset"))?,
         );
         if node.level == 0 {
-            leaves.push((
-                key,
-                ArenaLocation {
-                    offset,
-                    payload_len: u64::from_le_bytes(
-                        record[40..48]
-                            .try_into()
-                            .map_err(|_| corrupt(node.offset, "invalid location length"))?,
-                    ),
-                    checksum: record[48..80]
-                        .try_into()
-                        .map_err(|_| corrupt(node.offset, "invalid location checksum"))?,
-                },
-            ));
+            leaves.push((key, leaf_value(node, offset, record)?));
         } else {
             if offset >= node.offset {
                 return Err(corrupt(
@@ -139,4 +126,29 @@ pub(super) fn decode(node: Node, bytes: &[u8; PAGE_BYTES]) -> Result<Page, Durab
     } else {
         Ok(Page::Branch(children))
     }
+}
+
+fn leaf_value(node: Node, offset: u64, record: &[u8]) -> Result<LocatorValue, DurableError> {
+    let proof = match record[80] {
+        0 => ClosureProof::Unknown,
+        1 => ClosureProof::Complete,
+        _ => return Err(corrupt(node.offset, "invalid closure proof state")),
+    };
+    if record[81..].iter().any(|byte| *byte != 0) {
+        return Err(corrupt(node.offset, "noncanonical locator proof padding"));
+    }
+    Ok(LocatorValue {
+        proof,
+        location: ArenaLocation {
+            offset,
+            payload_len: u64::from_le_bytes(
+                record[40..48]
+                    .try_into()
+                    .map_err(|_| corrupt(node.offset, "invalid location length"))?,
+            ),
+            checksum: record[48..80]
+                .try_into()
+                .map_err(|_| corrupt(node.offset, "invalid location checksum"))?,
+        },
+    })
 }

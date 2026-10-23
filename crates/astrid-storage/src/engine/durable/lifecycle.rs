@@ -91,7 +91,6 @@ where
         // index after close. On a failed flush the arena/WAL remain authority
         // for a new engine; the closed instance can never serve these views.
         inner.index.clear();
-        inner.validated.clear();
         inner.roots_by_principal.clear();
         inner.pending_direct_objects.clear();
         inner.pending_index_locations = Vec::new();
@@ -211,6 +210,11 @@ where
                         return Err(error);
                     }
                     inner.pending_index_locations.push((id, location));
+                }
+            }
+            for (id, object) in pending.objects() {
+                if object.closure_proven() {
+                    inner.index.mark_proven(*id)?;
                 }
             }
             let journals = pending

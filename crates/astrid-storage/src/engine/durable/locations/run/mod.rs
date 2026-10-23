@@ -7,7 +7,9 @@
 use std::fs::File;
 use std::io::Write;
 
-use super::super::{ArenaLocation, DurableError, ObjectId};
+use super::super::ArenaLocation;
+use super::super::{DurableError, ObjectId};
+use super::{ClosureProof, LocatorValue};
 use crate::engine::durable::media::DurableIo;
 
 mod builder;
@@ -20,7 +22,7 @@ pub(super) use reader::Entries;
 // an admission ceiling. Fixed pages bound each read/build workspace.
 const PAGE_BYTES: usize = 4096;
 const HEADER_BYTES: usize = 8;
-const ENTRY_BYTES: usize = 80;
+const ENTRY_BYTES: usize = 88;
 const CHILD_BYTES: usize = 72;
 const LEAF_CAPACITY: usize = (PAGE_BYTES - HEADER_BYTES) / ENTRY_BYTES;
 const BRANCH_CAPACITY: usize = (PAGE_BYTES - HEADER_BYTES) / CHILD_BYTES;
@@ -43,12 +45,17 @@ pub(super) struct Run {
 }
 
 enum Page {
-    Leaf(Vec<(ObjectId, ArenaLocation)>),
+    Leaf(Vec<(ObjectId, LocatorValue)>),
     Branch(Vec<Node>),
 }
 
 impl Run {
+    #[cfg(test)]
     pub(super) fn lookup(&self, id: ObjectId) -> Result<Option<ArenaLocation>, DurableError> {
+        self.lookup_row(id).map(|row| row.map(|row| row.location))
+    }
+
+    pub(super) fn lookup_row(&self, id: ObjectId) -> Result<Option<LocatorValue>, DurableError> {
         let mut node = self.root;
         loop {
             match self.page(node)? {
@@ -74,7 +81,15 @@ impl Run {
         &self.file
     }
 
-    pub(super) fn entries(&self) -> Entries<'_> {
+    #[cfg(test)]
+    pub(super) fn entries(
+        &self,
+    ) -> impl Iterator<Item = Result<(ObjectId, ArenaLocation), DurableError>> + '_ {
+        self.rows()
+            .map(|entry| entry.map(|(id, row)| (id, row.location)))
+    }
+
+    pub(super) fn rows(&self) -> Entries<'_> {
         Entries::new(self)
     }
 

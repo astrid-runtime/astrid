@@ -1,7 +1,7 @@
 //! Move verified durable ownership without reopening or reviving old handles.
 
 use super::wal::PendingWalOverlay;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -84,7 +84,6 @@ fn empty_inner<P: Ord>(limit: std::num::NonZeroUsize) -> DurableInner<P> {
         pending_wal: PendingWalOverlay::default(),
         pending_index_locations: Vec::new(),
         pending_direct_objects: BTreeMap::new(),
-        validated: BTreeSet::new(),
         files: None,
         representations: None,
         lock: None,

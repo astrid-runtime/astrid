@@ -68,7 +68,6 @@ impl RepresentationStore {
                 &self.placement_entries,
                 self.persisted_map_nodes.len(),
             )?;
-            self.complete_map_subtrees.clear();
         }
         Ok(())
     }

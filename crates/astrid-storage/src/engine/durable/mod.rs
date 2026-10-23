@@ -563,6 +563,8 @@ struct ArenaLocation {
     checksum: [u8; 32],
 }
 
+mod proofs;
+
 #[derive(Debug)]
 struct DurableInner<P: Ord> {
     roots_by_principal: BTreeMap<P, RootState>,
@@ -570,7 +572,6 @@ struct DurableInner<P: Ord> {
     pending_wal: wal::PendingWalOverlay<P>,
     pending_index_locations: Vec<(ObjectId, ArenaLocation)>,
     pending_direct_objects: BTreeMap<ObjectId, representations::DirectArenaObject>,
-    validated: BTreeSet<ObjectId>,
     files: Option<DurableFiles>,
     representations: Option<representations::RepresentationStore>,
     lock: Option<StoreLock>,

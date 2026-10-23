@@ -2,7 +2,7 @@
 
 use crate::engine::durable::locations::LocationLookup as _;
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -169,14 +169,14 @@ struct AcceptedCommit<P: Ord> {
 struct PendingRepresentations<'a> {
     locations: &'a [(ObjectId, super::ArenaLocation)],
     direct: &'a BTreeMap<ObjectId, super::representations::DirectArenaObject>,
-    validated: &'a BTreeSet<ObjectId>,
+    validated: &'a dyn super::proofs::ClosureProofLookup,
 }
 
 impl<'a> PendingRepresentations<'a> {
     const fn new(
         locations: &'a [(ObjectId, super::ArenaLocation)],
         direct: &'a BTreeMap<ObjectId, super::representations::DirectArenaObject>,
-        validated: &'a BTreeSet<ObjectId>,
+        validated: &'a dyn super::proofs::ClosureProofLookup,
     ) -> Self {
         Self {
             locations,
@@ -430,6 +430,9 @@ where
                             inner.index.insert(location.0, location.1)?;
                             inner.pending_index_locations.push(location);
                         }
+                        for commit in &accepted {
+                            inner.mark_proven_all(commit.prepared.validated.iter().copied())?;
+                        }
                         Ok(())
                     })();
                     debug_assert!(
@@ -444,9 +447,6 @@ where
                         complete_failed_group(&mut completions, accepted, error);
                     } else {
                         for accepted in accepted {
-                            inner
-                                .validated
-                                .extend(accepted.prepared.validated.iter().copied());
                             inner.roots_by_principal.insert(
                                 accepted.prepared.principal.clone(),
                                 accepted.prepared.root,
@@ -513,9 +513,10 @@ where
             pending_index_locations: pending_locations,
             pending_direct_objects: pending_direct,
             index,
-            validated,
+            pending_wal,
             ..
         } = inner;
+        let validated = super::proofs::ProvenObjects::new(index, pending_wal);
         let files = live_files_mut(files)?;
         let append_started = Instant::now();
         let mut ids = Vec::new();
@@ -566,7 +567,7 @@ where
             self.append_group_representations(
                 &files.arena,
                 representations,
-                PendingRepresentations::new(pending_locations, pending_direct, validated),
+                PendingRepresentations::new(pending_locations, pending_direct, &validated),
                 shared.into_iter(),
                 appended,
             )?
@@ -657,7 +658,7 @@ where
             // Admission-created direct descriptions are reusable only after
             // the logical owning closure earned the same process-local token.
             // Otherwise reread and identify the arena frame before promotion.
-            if (pending.validated.contains(&id) || required.contains_key(&id))
+            if (pending.validated.proven(&id)? || required.contains_key(&id))
                 && let Some(cached) = pending.direct.get(&id)
                 && cached.location == location
             {

@@ -81,3 +81,22 @@ fn anonymous_run_truncation_is_an_error_and_duplicate_input_is_rejected() {
     assert!(builder.push(id, location).is_err());
     assert!(Builder::new().unwrap().finish().unwrap().is_none());
 }
+
+#[test]
+fn checksummed_invalid_proof_states_and_padding_are_rejected() {
+    use std::io::Read as _;
+    for (offset, byte) in [(80, 2), (81, 1)] {
+        let mut run = build(1);
+        let mut bytes = [0; PAGE_BYTES];
+        run.file.rewind().unwrap();
+        run.file.read_exact(&mut bytes).unwrap();
+        bytes[HEADER_BYTES + offset] = byte;
+        run.file.rewind().unwrap();
+        run.file.write_all(&bytes).unwrap();
+        run.root.digest = digest(0, &bytes);
+        assert!(matches!(
+            run.lookup_row(pair(0).0),
+            Err(DurableError::Corrupt { .. })
+        ));
+    }
+}

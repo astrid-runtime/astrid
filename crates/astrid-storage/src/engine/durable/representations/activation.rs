@@ -150,7 +150,7 @@ pub(super) fn append_new_reachable_map_nodes(
     map: &(impl MapView + ?Sized),
     durable: &impl NodePresence,
     appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
-    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    complete: &mut impl CompleteNodes,
 ) -> Result<usize, DurableError> {
     let Some(root) = map.view_root() else {
         return Ok(0);
@@ -164,15 +164,13 @@ pub(super) fn append_new_reachable_map_nodes(
             // Cache only closures checked against the append-only persisted set.
             let children_complete = match &node {
                 PhysicalMapNode::Branch { zero, one, .. } => {
-                    complete.contains(zero) && complete.contains(one)
+                    complete.complete(zero)? && complete.complete(one)?
                 },
-                PhysicalMapNode::Radix { children, .. } => {
-                    children.iter().all(|child| complete.contains(child))
-                },
+                PhysicalMapNode::Radix { children, .. } => children_complete(complete, children)?,
                 PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => true,
             };
             if durable.has_node(&id)? && children_complete {
-                complete.insert(id);
+                complete.remember(id)?;
             }
             if !durable.has_node(&id)? && !appended.contains(&id) {
                 metadata.push(MetadataFrame::map_node(&Blake3PhysicalIdentity, &node)?);
@@ -180,7 +178,7 @@ pub(super) fn append_new_reachable_map_nodes(
             }
             continue;
         }
-        if complete.contains(&id) || !visited.insert(id) {
+        if complete.complete(&id)? || !visited.insert(id) {
             continue;
         }
         let node = map.view_node(id)?;
@@ -197,6 +195,39 @@ pub(super) fn append_new_reachable_map_nodes(
         }
     }
     Ok(visited.len())
+}
+
+/// Positive membership means every immutable descendant is canonical too.
+pub(super) trait CompleteNodes {
+    fn complete(&self, id: &crate::storage_model::PhysicalMapNodeId) -> Result<bool, DurableError>;
+    fn remember(&mut self, id: crate::storage_model::PhysicalMapNodeId)
+    -> Result<(), DurableError>;
+}
+
+fn children_complete(
+    complete: &impl CompleteNodes,
+    children: &[crate::storage_model::PhysicalMapNodeId],
+) -> Result<bool, DurableError> {
+    for child in children {
+        if !complete.complete(child)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+impl CompleteNodes for BTreeSet<crate::storage_model::PhysicalMapNodeId> {
+    fn complete(&self, id: &crate::storage_model::PhysicalMapNodeId) -> Result<bool, DurableError> {
+        Ok(self.contains(id))
+    }
+    fn remember(
+        &mut self,
+        id: crate::storage_model::PhysicalMapNodeId,
+    ) -> Result<(), DurableError> {
+        self.insert(id);
+        Ok(())
+    }
 }
 
 pub(super) trait MapNodeRef {

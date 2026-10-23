@@ -77,9 +77,7 @@ fn locator_allocates_for_actual_entries_instead_of_eagerly_reserving_the_budget(
         checksum: [2; 32],
     };
     index.insert(id, location).unwrap();
-    assert!(
-        index.resident_capacity_bytes() <= 2 * std::mem::size_of::<(ObjectId, ArenaLocation)>()
-    );
+    assert!(index.resident_capacity_bytes() <= 2 * std::mem::size_of::<(ObjectId, LocatorValue)>());
     let before = index.resident_capacity_bytes();
     index
         .set_limit(std::num::NonZeroUsize::new(budget.entries().get() * 2).unwrap())
