@@ -73,11 +73,14 @@ impl RepresentationStore {
     }
 }
 
-pub(super) fn recover_active_map(
+pub(super) fn recover_active_map<N: crate::storage_model::PhysicalMapNodes>(
     domain: PhysicalMapDomain,
     root: Option<PhysicalMapNodeId>,
-    arena: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
-) -> Result<CanonicalPhysicalMap, DurableError> {
+    arena: &N,
+) -> Result<CanonicalPhysicalMap, DurableError>
+where
+    N::Error: Into<DurableError>,
+{
     let mut nodes = BTreeMap::new();
     let mut pending = root.into_iter().collect::<Vec<_>>();
     while let Some(id) = pending.pop() {
@@ -85,10 +88,12 @@ pub(super) fn recover_active_map(
             continue;
         }
         let node = arena
-            .remove(&id)
+            .node(id)
+            .map_err(Into::into)?
             .ok_or(DurableError::InvalidRepresentationState(
                 "active physical map closure is incomplete",
-            ))?;
+            ))?
+            .into_owned();
         match &node {
             PhysicalMapNode::Branch { zero, one, .. } => pending.extend([*zero, *one]),
             PhysicalMapNode::Radix { children, .. } => pending.extend(children.iter().copied()),

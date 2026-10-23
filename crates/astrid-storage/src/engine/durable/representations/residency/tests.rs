@@ -19,12 +19,11 @@ fn active_closure_recovery_still_rejects_invalid_identity_and_domain() {
         (PhysicalMapDomain::Profile, id),
         (PhysicalMapDomain::Placement, valid_id),
     ] {
-        let mut arena = BTreeMap::from([(stored_id, node.clone())]);
-        assert!(super::recover_active_map(domain, Some(stored_id), &mut arena).is_err());
+        let arena = BTreeMap::from([(stored_id, node.clone())]);
+        assert!(super::recover_active_map(domain, Some(stored_id), &arena).is_err());
     }
     assert!(
-        super::recover_active_map(PhysicalMapDomain::Profile, Some(id), &mut BTreeMap::new(),)
-            .is_err()
+        super::recover_active_map(PhysicalMapDomain::Profile, Some(id), &BTreeMap::new(),).is_err()
     );
 }
 
