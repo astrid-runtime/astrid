@@ -28,7 +28,15 @@ pub fn try_clone_file(source: &File, destination: &Path) -> io::Result<bool> {
             "clone source is not a regular file",
         ));
     }
-    platform_clone(source, destination)
+    #[cfg(target_os = "macos")]
+    {
+        platform_clone(source, destination)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = destination;
+        Ok(false)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -62,11 +70,6 @@ fn platform_clone(source: &File, destination: &Path) -> io::Result<bool> {
         Some(nix::libc::ENOTSUP | nix::libc::EXDEV) => Ok(false),
         _ => Err(error),
     }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn platform_clone(_source: &File, _destination: &Path) -> io::Result<bool> {
-    Ok(false)
 }
 
 #[cfg(test)]
