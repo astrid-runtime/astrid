@@ -83,27 +83,7 @@ where
             Projection::empty()
         },
         Some(reference) if reference.kind() == ReferenceKind::Owns => {
-            let cached = validation
-                .projections
-                .lock()
-                .get(&owner)
-                .filter(|projection| projection.head == Some(reference.target()))
-                .cloned();
-            if let Some(cached) = cached {
-                cached
-            } else {
-                let decoded = decode_kv_component::<P, E>(
-                    engine,
-                    &owner,
-                    reference.target(),
-                    &validation.trees,
-                )?;
-                validation
-                    .projections
-                    .lock()
-                    .insert(owner.clone(), decoded.clone());
-                decoded
-            }
+            validated_projection(engine, &owner, reference.target(), validation)?
         },
         Some(_) => {
             return Err(invalid(state_id, "principal KV component is not owning"));
@@ -147,20 +127,11 @@ where
     P: Clone + Ord,
     E: KvProjectionEngine<P>,
 {
-    let cached = validation
-        .projections
-        .lock()
-        .get(owner)
-        .filter(|projection| projection.head == Some(head))
-        .cloned();
-    if let Some(cached) = cached {
+    if let Some(cached) = super::projection_cache::load(engine, owner, head) {
         return Ok(cached);
     }
     let decoded = decode_kv_component(engine, owner, head, &validation.trees)?;
-    validation
-        .projections
-        .lock()
-        .insert(owner.clone(), decoded.clone());
+    super::projection_cache::retain(engine, owner, &decoded);
     Ok(decoded)
 }
 

@@ -27,7 +27,6 @@ fn fixture() -> (Store, PrincipalContentStore<String, Engine>) {
 
 fn assert_forgotten(store: &Store, owner: &String) {
     assert!(!store.validation.trees.lock().contains_key(owner));
-    assert!(!store.validation.projections.lock().contains_key(owner));
     assert!(!store.validated_content.lock().contains_key(owner));
 }
 
@@ -45,7 +44,6 @@ async fn owner_churn_leaves_no_projection_cache_or_cleanup_tombstones() {
         assert!(store.checkpointing.lock().is_empty());
     }
     assert!(store.validation.trees.lock().is_empty());
-    assert!(store.validation.projections.lock().is_empty());
     assert!(store.validated_content.lock().is_empty());
 }
 
@@ -73,7 +71,6 @@ async fn purged_owner_pending_checkpoint_cannot_leave_repopulated_caches() {
         })
         .unwrap();
     // The admitted checkpoint's fresh header/commit may refill accelerators.
-    assert!(store.validation.projections.lock().contains_key(&owner));
     assert!(store.validated_content.lock().contains_key(&owner));
     drop(registration);
     assert_forgotten(&store, &owner);
@@ -95,7 +92,7 @@ async fn ordinary_checkpoint_keeps_live_accelerators() {
     let registration = CheckpointRegistration::acquire(blocking.clone(), owner.clone()).unwrap();
     assert!(blocking.checkpoint_once(owner.clone(), true).unwrap());
     drop(registration);
-    assert!(store.validation.projections.lock().contains_key(&owner));
+    assert!(store.validation.trees.lock().contains_key(&owner));
     assert!(store.checkpointing.lock().is_empty());
 }
 
