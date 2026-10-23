@@ -273,7 +273,7 @@ where
             .map_err(|source| io_error("read recovered arena metadata", source))?
             .len(),
         arena_tail,
-        objects: index.clone(),
+        objects: &index,
     };
     *index_cache = Some(replace_volume_index(
         Arc::clone(volume),

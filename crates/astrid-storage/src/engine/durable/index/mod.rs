@@ -9,6 +9,7 @@
 //! deliberately absent: recovery always derives them from the root journal
 //! and identity-checked arena objects.
 
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::io::{Seek, SeekFrom};
 use std::path::Path;
@@ -38,10 +39,10 @@ const TAGGED_IDENTITY_BYTES: usize = 40;
 const LOCATION_BYTES: usize = TAGGED_IDENTITY_BYTES + 8 + 8 + 32;
 
 /// Recovered disposable object-location state.
-pub(super) struct IndexState {
+pub(super) struct IndexState<M = BTreeMap<ObjectId, ArenaLocation>> {
     pub(super) arena_len: u64,
     pub(super) arena_tail: Option<ArenaLocation>,
-    pub(super) objects: BTreeMap<ObjectId, ArenaLocation>,
+    pub(super) objects: M,
 }
 
 /// One successfully persisted object-arena change cached after publication.
@@ -198,7 +199,7 @@ where
                 let current_state = IndexState {
                     arena_len: frontier.arena_len,
                     arena_tail: frontier.arena_tail,
-                    objects: inner.index.clone(),
+                    objects: &inner.index,
                 };
                 drop(files.index_cache.take());
                 files.index_cache = Some(self.replace_index_cache(&current_state)?);
@@ -207,7 +208,10 @@ where
         Ok(())
     }
 
-    pub(super) fn replace_index_cache(&self, state: &IndexState) -> Result<File, DurableError> {
+    pub(super) fn replace_index_cache<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
+        &self,
+        state: &IndexState<M>,
+    ) -> Result<File, DurableError> {
         let volume = self.volume.read();
         match (self.directory_capability.as_deref(), volume.as_ref()) {
             (Some(directory), None) => replace_index(
@@ -306,9 +310,9 @@ fn decode_record(
 }
 
 /// Replace the disposable index with one complete, flushed checkpoint.
-pub(super) fn replace_index(
+pub(super) fn replace_index<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
     directory: &cap_std::fs::Dir,
-    state: &IndexState,
+    state: &IndexState<M>,
     scheme: IdentityScheme,
     faults: &dyn FaultInjector,
 ) -> Result<File, DurableError> {
@@ -339,9 +343,9 @@ pub(super) fn replace_index(
     Ok(reopened)
 }
 
-pub(super) fn replace_volume_index(
+pub(super) fn replace_volume_index<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
     volume: Arc<dyn AstridVolume>,
-    state: &IndexState,
+    state: &IndexState<M>,
     scheme: IdentityScheme,
     faults: &dyn FaultInjector,
 ) -> Result<File, DurableError> {
@@ -426,9 +430,9 @@ pub(super) fn append_index_delta(
     Ok(())
 }
 
-fn append_snapshot(
+fn append_snapshot<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
     file: &mut File,
-    state: &IndexState,
+    state: &IndexState<M>,
     scheme: IdentityScheme,
 ) -> Result<(), DurableError> {
     let payload = encode_snapshot(state, scheme)?;
@@ -483,17 +487,25 @@ fn objects_through_arena(
         .collect()
 }
 
-fn encode_snapshot(state: &IndexState, scheme: IdentityScheme) -> Result<Vec<u8>, DurableError> {
+fn encode_snapshot<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
+    state: &IndexState<M>,
+    scheme: IdentityScheme,
+) -> Result<Vec<u8>, DurableError> {
     let mut bytes = Vec::new();
     bytes.push(SNAPSHOT_RECORD);
     encode_scheme(&mut bytes, scheme);
     bytes.extend_from_slice(&state.arena_len.to_le_bytes());
     encode_optional_location(&mut bytes, state.arena_tail);
-    encode_locations(
-        &mut bytes,
-        scheme,
-        state.objects.iter().map(|(id, location)| (*id, *location)),
-    )?;
+    let objects = state.objects.borrow();
+    encode_len(&mut bytes, objects.len())?;
+    // A BTreeMap is already unique and ordered by the canonical ObjectId.
+    // Borrow its entries directly instead of allocating another full vector.
+    for (id, location) in objects {
+        encode_identity(&mut bytes, scheme, *id);
+        bytes.extend_from_slice(&location.offset.to_le_bytes());
+        bytes.extend_from_slice(&location.payload_len.to_le_bytes());
+        bytes.extend_from_slice(&location.checksum);
+    }
     Ok(bytes)
 }
 
