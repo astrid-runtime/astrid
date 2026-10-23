@@ -169,15 +169,26 @@ impl PagedLocations {
         id: ObjectId,
         location: ArenaLocation,
     ) -> Result<(), DurableError> {
-        let prior = self.row_before_insert(id)?;
-        self.insert_row(
+        self.insert_memo(id, location, &mut AuthenticatedPageMemo::default())
+    }
+
+    pub(in crate::engine::durable) fn insert_memo(
+        &mut self,
+        id: ObjectId,
+        location: ArenaLocation,
+        memo: &mut AuthenticatedPageMemo,
+    ) -> Result<(), DurableError> {
+        let prior = self.row_before_insert_memo(id, memo)?;
+        let result = self.insert_row(
             id,
             LocatorValue {
                 location,
                 proof: prior.map_or(ClosureProof::Unknown, |prior| prior.proof),
             },
             prior,
-        )
+        );
+        memo.sync(self);
+        result
     }
 
     pub(in crate::engine::durable) fn clear_proofs(&mut self) -> Result<(), DurableError> {

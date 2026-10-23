@@ -309,3 +309,33 @@ fn proof_reset_preserves_all_locations_and_invalidates_authenticated_page_memos(
         locations.resident_capacity_bytes() <= 4 * std::mem::size_of::<(ObjectId, LocatorValue)>()
     );
 }
+
+#[test]
+fn memoized_location_admission_reuses_authenticated_pages_and_rejects_damaged_runs() {
+    use super::super::run::test_take_page_auth_count;
+    let mut locations = PagedLocations::new(NonZeroUsize::new(4).unwrap());
+    for n in 0..128 {
+        let (id, location) = entry(n);
+        locations.insert(id, location).unwrap();
+    }
+    let (id, location) = entry(42);
+    let mut memo = AuthenticatedPageMemo::default();
+    let _ = test_take_page_auth_count();
+    for _ in 0..64 {
+        locations.insert_memo(id, location, &mut memo).unwrap();
+    }
+    let memoized = test_take_page_auth_count();
+    assert!(memoized > 0);
+    assert!(memo.test_hit_miss().0 > 0);
+    for _ in 0..64 {
+        locations.insert(id, location).unwrap();
+    }
+    let control = test_take_page_auth_count();
+    assert!(
+        control > memoized.strict_mul(2),
+        "memoized={memoized}, control={control}"
+    );
+    locations.damage_run_after_inserts(0);
+    assert!(locations.insert_memo(id, location, &mut memo).is_err());
+    assert!(locations.failed());
+}
