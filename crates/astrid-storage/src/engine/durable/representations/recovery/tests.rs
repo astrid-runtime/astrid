@@ -21,13 +21,13 @@ fn recovery_memo_never_remembers_an_incomplete_closure() {
     assert!(map.nodes().len() > 1);
     let partial = BTreeMap::from([(root, map.nodes()[&root].clone())]);
     let mut complete = BTreeSet::new();
-    assert!(!map_closure_complete(Some(root), &partial, &mut complete).unwrap());
+    assert!(!test_map_closure_complete(Some(root), &partial, &mut complete).unwrap());
     assert!(complete.is_empty());
-    assert!(!map_closure_complete(Some(root), &partial, &mut complete).unwrap());
-    assert!(map_closure_complete(Some(root), map.nodes(), &mut complete).unwrap());
+    assert!(!test_map_closure_complete(Some(root), &partial, &mut complete).unwrap());
+    assert!(test_map_closure_complete(Some(root), map.nodes(), &mut complete).unwrap());
     assert_eq!(complete.len(), map.nodes().len());
     let verified = complete.clone();
-    assert!(map_closure_complete(Some(root), map.nodes(), &mut complete).unwrap());
+    assert!(test_map_closure_complete(Some(root), map.nodes(), &mut complete).unwrap());
     assert_eq!(complete, verified);
     let absent = PhysicalMapKey::new([255; 32]);
     let other = CanonicalPhysicalMap::build_dense(
@@ -36,7 +36,7 @@ fn recovery_memo_never_remembers_an_incomplete_closure() {
         vec![(absent, vec![0])],
     )
     .unwrap();
-    assert!(!map_closure_complete(other.root(), map.nodes(), &mut complete).unwrap());
+    assert!(!test_map_closure_complete(other.root(), map.nodes(), &mut complete).unwrap());
     assert_eq!(complete, verified);
 }
 
@@ -291,7 +291,8 @@ fn journal_recovery_does_not_repair_authenticated_locator_read_failures() {
     ] {
         append_test_metadata(&mut file, &frame);
     }
-    let metadata = recover_metadata(
+    append_unreferenced_catalogues(&mut file);
+    let mut metadata = recover_metadata(
         &mut file,
         RecoveryLimits::process_addressable(),
         super::super::LocationIndexMemoryBudget::default(),
@@ -322,17 +323,68 @@ fn journal_recovery_does_not_repair_authenticated_locator_read_failures() {
     }
     let limits = RecoveryLimits::process_addressable();
     assert_eq!(
-        recover_journal(&mut journal, current, &metadata, limits).unwrap(),
+        recover_journal(&mut journal, current, &mut metadata, limits).unwrap(),
         (second_id, second)
+    );
+    assert_eq!(
+        metadata.values.len(),
+        5,
+        "keep both states and their authority roots"
     );
     let original_len = journal.seek(SeekFrom::End(0)).unwrap();
     // Admission succeeded, but the immutable locator's backing media now fails.
     // This is corruption, not a missing final publication eligible for repair.
     file.durable_set_len(0).unwrap();
-    assert!(recover_journal(&mut journal, current, &metadata, limits).is_err());
+    assert!(recover_journal(&mut journal, current, &mut metadata, limits).is_err());
     assert_eq!(journal.seek(SeekFrom::End(0)).unwrap(), original_len);
 }
 
 fn append_test_metadata(file: &mut DurableFile, frame: &MetadataFrame) {
     super::super::super::append_frame(file, METADATA_MAGIC, &frame.encode().unwrap()).unwrap();
+}
+
+fn append_unreferenced_catalogues(file: &mut DurableFile) {
+    for generation in 10..74 {
+        let unused = RepresentationCatalogueRoot::new(generation, None, 0, None, 0).unwrap();
+        append_test_metadata(
+            file,
+            &MetadataFrame::catalogue(&Blake3PhysicalIdentity, unused),
+        );
+    }
+}
+
+fn test_map_closure_complete(
+    root: Option<crate::storage_model::PhysicalMapNodeId>,
+    nodes: &BTreeMap<crate::storage_model::PhysicalMapNodeId, PhysicalMapNode>,
+    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+) -> Result<bool, DurableError> {
+    struct Provider<'a> {
+        nodes: &'a BTreeMap<crate::storage_model::PhysicalMapNodeId, PhysicalMapNode>,
+        complete: &'a mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    }
+    impl PhysicalMapNodes for Provider<'_> {
+        type Error = DurableError;
+        fn node(
+            &self,
+            id: crate::storage_model::PhysicalMapNodeId,
+        ) -> Result<Option<std::borrow::Cow<'_, PhysicalMapNode>>, DurableError> {
+            Ok(self.nodes.get(&id).map(std::borrow::Cow::Borrowed))
+        }
+    }
+    impl super::super::activation::CompleteNodes for Provider<'_> {
+        fn complete(
+            &self,
+            id: &crate::storage_model::PhysicalMapNodeId,
+        ) -> Result<bool, DurableError> {
+            Ok(self.complete.contains(id))
+        }
+        fn remember(
+            &mut self,
+            id: crate::storage_model::PhysicalMapNodeId,
+        ) -> Result<(), DurableError> {
+            self.complete.insert(id);
+            Ok(())
+        }
+    }
+    map_closure_complete(root, &mut Provider { nodes, complete })
 }

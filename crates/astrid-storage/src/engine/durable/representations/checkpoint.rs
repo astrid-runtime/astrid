@@ -67,8 +67,8 @@ impl RepresentationStore {
             max_tail_frames: u32::MAX,
             max_tail_bytes: u64::MAX,
         };
-        let index = recover_metadata(&mut metadata, limits, self.persisted_map_nodes.budget())?;
-        let (active, state) = recover_journal(&mut journal, current, &index, limits)?;
+        let mut index = recover_metadata(&mut metadata, limits, self.persisted_map_nodes.budget())?;
+        let (active, state) = recover_journal(&mut journal, current, &mut index, limits)?;
         let recovered = Self::from_recovered(
             metadata,
             journal,

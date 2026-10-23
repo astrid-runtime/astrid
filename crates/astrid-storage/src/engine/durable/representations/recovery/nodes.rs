@@ -17,6 +17,7 @@ pub(in super::super) struct RecoveredNodes {
     locations: PagedLocations,
     limits: RecoveryLimits,
     budget: LocationIndexMemoryBudget,
+    journal_started: bool,
 }
 
 impl RecoveredNodes {
@@ -34,7 +35,18 @@ impl RecoveredNodes {
             locations: PagedLocations::new(budget.durable_entries()),
             limits,
             budget,
+            journal_started: false,
         })
+    }
+
+    pub(super) fn begin_journal(&mut self) -> Result<(), DurableError> {
+        // Reachability evidence belongs to one journal replay. A later replay
+        // must re-read media rather than reuse evidence from an earlier call.
+        if self.journal_started {
+            self.locations.clear_proofs()?;
+        }
+        self.journal_started = true;
+        Ok(())
     }
 
     pub(super) fn admit(
@@ -95,6 +107,18 @@ impl RecoveredNodes {
     }
 }
 
+impl super::super::activation::CompleteNodes for RecoveredNodes {
+    fn complete(&self, id: &PhysicalMapNodeId) -> Result<bool, DurableError> {
+        self.locations.closure_proven(ObjectId::new(*id.as_bytes()))
+    }
+
+    fn remember(&mut self, id: PhysicalMapNodeId) -> Result<(), DurableError> {
+        // These bits prove recovery reachability only. into_cold rebuilds every
+        // bit from canonically validated active maps, never from this evidence.
+        self.locations.mark_proven(ObjectId::new(*id.as_bytes()))
+    }
+}
+
 impl PhysicalMapNodes for RecoveredNodes {
     type Error = DurableError;
     fn node(
@@ -108,3 +132,6 @@ impl PhysicalMapNodes for RecoveredNodes {
             .map(|node| Some(Cow::Owned(node)))
     }
 }
+
+#[cfg(test)]
+mod tests;
