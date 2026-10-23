@@ -33,6 +33,10 @@ use retirement::{
     validate_legacy_retirement_candidate,
 };
 
+pub(super) fn retire_packed_projection_tree(path: &Path) -> io::Result<()> {
+    retirement::retire_packed_projection_tree(path)
+}
+
 const LAYOUT_MIGRATION_INTENT: &str = "layout-v1-to-v2.intent";
 const LAYOUT_MIGRATION_RECEIPT: &str = "layout-v1-to-v2.complete";
 const LAYOUT_MIGRATION_RETIREMENT: &str = "layout-v1-to-v2.retiring";

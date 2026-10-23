@@ -87,11 +87,19 @@ pub(super) fn validate_legacy_tree(path: &Path, root_device: u64) -> io::Result<
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetirementDurability {
+    EveryDirectory,
+    ContainingDirectory,
+}
+
 fn delete_tree(
     path: &Path,
     root_device: u64,
     preserve_root_finder_metadata: bool,
     before_runtime_run_removal: &mut impl FnMut(&Path) -> io::Result<()>,
+    durability: RetirementDurability,
+    sync: &mut impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -134,7 +142,14 @@ fn delete_tree(
             continue;
         }
         if child_metadata.is_dir() {
-            delete_tree(&child, root_device, false, before_runtime_run_removal)?;
+            delete_tree(
+                &child,
+                root_device,
+                false,
+                before_runtime_run_removal,
+                durability,
+                sync,
+            )?;
         } else if child_metadata.is_file() {
             crate::platform_fs::verify_no_redirects(&child)?;
             std::fs::remove_file(&child)?;
@@ -149,9 +164,14 @@ fn delete_tree(
         }
     }
 
-    // Flush the directory's child removals before removing the directory
-    // entry itself. The caller also flushes the containing `var/` directory.
-    sync_directory(path)?;
+    // Legacy migration and the Finder-preserving run directory retain their
+    // child-removal barriers. A packed projection instead synchronizes its
+    // surviving parent: removed descendants have no remaining namespace to
+    // publish, and the durable RETIRING receipt owns crash recovery until that
+    // final barrier succeeds.
+    if durability == RetirementDurability::EveryDirectory {
+        sync(path)?;
+    }
     if preserve_root_finder_metadata {
         before_runtime_run_removal(path)?;
         remove_runtime_run_directory(path)
@@ -265,6 +285,42 @@ fn retire_tree_root_with_hook(
     preserve_root_finder_metadata: bool,
     before_runtime_run_removal: &mut impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
+    retire_tree_root_with_durability(
+        path,
+        preserve_root_finder_metadata,
+        before_runtime_run_removal,
+        RetirementDurability::EveryDirectory,
+        &mut sync_directory,
+    )
+}
+
+/// Only for a runtime projection whose bytes and RETIRING inventory have
+/// already been durably published. The containing directory barrier must
+/// succeed before the caller clears that inventory or acknowledges retirement.
+pub(super) fn retire_packed_projection_tree(path: &Path) -> io::Result<()> {
+    retire_packed_projection_tree_with_sync(path, &mut sync_directory)
+}
+
+fn retire_packed_projection_tree_with_sync(
+    path: &Path,
+    sync: &mut impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    retire_tree_root_with_durability(
+        path,
+        false,
+        &mut |_| Ok(()),
+        RetirementDurability::ContainingDirectory,
+        sync,
+    )
+}
+
+fn retire_tree_root_with_durability(
+    path: &Path,
+    preserve_root_finder_metadata: bool,
+    before_runtime_run_removal: &mut impl FnMut(&Path) -> io::Result<()>,
+    durability: RetirementDurability,
+    sync: &mut impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -295,11 +351,13 @@ fn retire_tree_root_with_hook(
         root_device,
         preserve_root_finder_metadata,
         before_runtime_run_removal,
+        durability,
+        sync,
     )?;
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("legacy state source has no parent"))?;
-    sync_directory(parent)
+    sync(parent)
 }
 
 fn ensure_legacy_tree_boundary(
@@ -492,3 +550,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "dirs_layout_retirement/packed_tests.rs"]
+mod packed_tests;
