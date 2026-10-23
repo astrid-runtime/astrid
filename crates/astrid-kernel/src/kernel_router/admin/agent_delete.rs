@@ -302,9 +302,11 @@ pub(super) async fn finish_identity_removal(
         .await
         .map_err(|e| err_internal(format!("post-identity capability purge failed: {e}")))?;
     if let (Some(store), Some(uid)) = (&kernel.principal_store, principal_uid) {
-        store.purge_principal_kv(uid).map_err(|e| {
-            err_internal(format!("post-identity principal state purge failed: {e}"))
-        })?;
+        reclaim_native_principal_state(kernel, store, uid)
+            .await
+            .map_err(|e| {
+                err_internal(format!("post-identity principal state purge failed: {e}"))
+            })?;
     }
     if let Some(guard) = ownership_guard {
         guard.finish().await.map_err(|e| {
@@ -350,7 +352,7 @@ async fn retire_and_reclaim(
     // corrupt/missing installations. Legacy/test compositions without the
     // native store retain the prior best-effort namespace fallback.
     if let (Some(store), Some(uid)) = (&kernel.principal_store, principal_uid) {
-        if let Err(error) = store.purge_principal_kv(uid) {
+        if let Err(error) = reclaim_native_principal_state(kernel, store, uid).await {
             authority_errors.push(format!("principal state: {error}"));
         }
     } else {
@@ -499,4 +501,19 @@ pub(super) fn reclaim_legacy_secret_root(
             .map_err(|error| format!("{}: {error}", entry_path.display()))?;
     }
     std::fs::remove_dir(path).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+async fn reclaim_native_principal_state(
+    kernel: &Arc<crate::Kernel>,
+    store: &astrid_storage::RuntimePrincipalStore,
+    uid: astrid_core::PrincipalUid,
+) -> Result<(), String> {
+    if let Some(service) = &kernel.workspace_branches {
+        service.retire_principal(uid).await
+    } else {
+        store
+            .purge_principal_state(uid)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
 }

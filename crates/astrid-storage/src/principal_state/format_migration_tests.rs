@@ -11,11 +11,11 @@ use super::format_amendment::{
     PRE_GC_OUTBOX_FORMAT_SPEC_ID, PRE_KV_TRANSITION_FORMAT_SPEC_ID,
     PRE_MECHANICAL_AUDIT_FORMAT_SPEC_ID, PRE_PHYSICAL_CATALOGUE_FORMAT_SPEC_ID,
     PRE_RESERVED_REPRESENTATION_TAG_FORMAT_SPEC_ID, PRE_RUNATAL_NAMING_FORMAT_SPEC_ID,
-    PRE_SHA384_ATTESTATION_FORMAT_SPEC_ID, PRE_WORKSPACE_BRANCH_FORMAT_SPEC_ID,
-    STORE_METADATA_FILE, format_spec_record, legacy_store_metadata, pre_fleet_owner_store_metadata,
-    pre_representation_store_metadata, prepare_catalog_specification, prepare_destination,
-    prepare_format_specification, previous_store_metadata, representation_bootstrap_objects,
-    store_metadata,
+    PRE_SHA384_ATTESTATION_FORMAT_SPEC_ID, PRE_UID_RETIREMENT_FORMAT_SPEC_ID,
+    PRE_WORKSPACE_BRANCH_FORMAT_SPEC_ID, STORE_METADATA_FILE, format_spec_record,
+    legacy_store_metadata, pre_fleet_owner_store_metadata, pre_representation_store_metadata,
+    prepare_catalog_specification, prepare_destination, prepare_format_specification,
+    previous_store_metadata, representation_bootstrap_objects, store_metadata,
 };
 use super::{
     Blake3ObjectIdentityV1, RuntimeEngine, StateOwnerCodecV1, StateOwnerCodecV2, StateOwnerV1,
@@ -120,6 +120,7 @@ fn completed_prior_v1_stores_are_selected_for_runatal_amendment() {
     assert_prior_format_is_selected(PRE_WORKSPACE_BRANCH_FORMAT_SPEC_ID, false);
     assert_prior_current_projection_is_selected(PRE_RESERVED_REPRESENTATION_TAG_FORMAT_SPEC_ID);
     assert_prior_current_projection_is_selected(PRE_CHUNKED_KV_FORMAT_SPEC_ID);
+    assert_prior_current_projection_is_selected(PRE_UID_RETIREMENT_FORMAT_SPEC_ID);
 }
 
 fn assert_pre_fleet_owner_format_is_selected() {
@@ -446,11 +447,146 @@ async fn pre_chunked_kv_catalogue_upgrade_preserves_root_and_accepts_large_value
     reopened.engine.close().unwrap();
 }
 
+#[tokio::test]
+async fn pre_uid_retirement_catalogue_upgrade_preserves_root() {
+    use crate::KvStore;
+    use std::sync::Arc;
+
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    super::runtime_tests::seed_legacy_layout(&home);
+    let path = home.principal_store_path();
+    let prior = pre_uid_retirement_specification();
+    let prior_id = Blake3ObjectIdentityV1.identify(&prior);
+    assert_eq!(prior_id, PRE_UID_RETIREMENT_FORMAT_SPEC_ID);
+    let catalog = bootstrap::content_catalog_format_specification().unwrap();
+    let catalog_id = Blake3ObjectIdentityV1.identify(&catalog);
+    let engine = Arc::new(
+        RuntimeEngine::open(
+            &path,
+            Blake3ObjectIdentityV1,
+            StateOwnerCodecV2,
+            RecoveryLimits::process_addressable(),
+        )
+        .unwrap(),
+    );
+    engine.persist_standalone_object(&prior).unwrap();
+    engine.persist_standalone_object(&catalog).unwrap();
+    let kv = super::RuntimeStore::from_engine(
+        engine.clone(),
+        super::StateOwnerResolver::new(super::PrincipalDirectory::default()),
+    );
+    kv.set(
+        "system:identity",
+        "retained",
+        b"before-uid-amendment".to_vec(),
+    )
+    .await
+    .unwrap();
+    drop(kv);
+    let before = engine.root(&super::StateOwner::System).unwrap();
+    engine
+        .ensure_direct_representation_catalogue(prior_id, &[prior_id, catalog_id])
+        .unwrap();
+    engine.close().unwrap();
+    drop(engine);
+    std::fs::write(
+        path.join(STORE_METADATA_FILE),
+        store_metadata(prior_id, catalog_id),
+    )
+    .unwrap();
+    std::fs::write(
+        path.join(super::migrations::MIGRATION_MARKER_FILE),
+        super::migrations::KV_TRANSITION_CHECKPOINT_MARKER,
+    )
+    .unwrap();
+    let store =
+        super::open_runtime_principal_store(&home, Arc::new(|_: &super::StateOwner| Ok(None)))
+            .await
+            .unwrap();
+    assert_eq!(
+        store.engine.root(&super::StateOwner::System).unwrap(),
+        before
+    );
+    assert_eq!(
+        store.kv().get("system:identity", "retained").await.unwrap(),
+        Some(b"before-uid-amendment".to_vec())
+    );
+    store.engine.close().unwrap();
+}
+
+#[test]
+fn pre_uid_retirement_missing_catalog_rejects_before_successor_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    super::runtime_tests::seed_legacy_layout(&home);
+    let engine = RuntimeEngine::open(
+        home.principal_store_path(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    let prior = pre_uid_retirement_specification();
+    let prior_id = Blake3ObjectIdentityV1.identify(&prior);
+    engine.persist_standalone_object(&prior).unwrap();
+    let catalog = bootstrap::content_catalog_format_specification().unwrap();
+    let catalog_id = Blake3ObjectIdentityV1.identify(&catalog);
+    let missing = prepare_catalog_specification(
+        &engine,
+        DestinationFormat::PriorV1 {
+            format_spec: prior_id,
+            catalog_spec_was_declared: true,
+        },
+        &catalog,
+        catalog_id,
+    )
+    .unwrap_err();
+    assert!(
+        missing
+            .to_string()
+            .contains("missing its content catalog specification"),
+        "{missing}"
+    );
+    let current = format_spec_record().unwrap();
+    assert!(
+        engine
+            .object(Blake3ObjectIdentityV1.identify(&current))
+            .unwrap()
+            .is_none(),
+        "rejected upgrade must not insert successor format evidence"
+    );
+    engine.close().unwrap();
+}
+
+pub(super) fn pre_uid_retirement_specification() -> crate::storage_model::ObjectRecord {
+    use crate::storage_model::{ObjectClass, ObjectFormatVersion, ObjectKind, ObjectRecord};
+    // Reconstruct the published predecessor from the amended grammar without
+    // duplicating Section 13. The HEAD specification ended immediately after
+    // the representation-index guarantees.
+    let text = std::str::from_utf8(super::format_amendment::STORE_FORMAT_SPEC).unwrap();
+    let (before, _) = text
+        .split_once("13. IMMUTABLE PRINCIPAL RETIREMENT AND WORKSPACE DIRECTORY")
+        .unwrap();
+    let prior_text = format!("{before}END OF ASTRID PRINCIPAL STORE FORMAT 1\n");
+    ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        prior_text.as_bytes().to_vec(),
+        vec![],
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap()
+}
+
 pub(super) fn pre_chunked_specification() -> crate::storage_model::ObjectRecord {
     use crate::storage_model::{ObjectClass, ObjectFormatVersion, ObjectKind, ObjectRecord};
     // Reconstruct the published predecessor from the amended grammar and
     // bind it to its real identity without duplicating the full specification.
-    let text = std::str::from_utf8(super::format_amendment::STORE_FORMAT_SPEC).unwrap();
+    // Strip Section 13 first so the 7.1.2 rewind targets the pre-retirement text.
+    let pre_uid = pre_uid_retirement_specification();
+    let text = std::str::from_utf8(pre_uid.canonical_bytes()).unwrap();
     let (before, amendment) = text.split_once("7.1.2 Chunked KV spilled values").unwrap();
     let (_, after) = amendment
         .split_once("7.2 Content DAG, object format version 1")

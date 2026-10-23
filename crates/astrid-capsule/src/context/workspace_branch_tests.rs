@@ -326,3 +326,44 @@ async fn ownership_move_invalidates_existing_branch_before_finish() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn retirement_during_post_begin_revalidation_discards_unpublished_branch() {
+    let fixture = fixture().await;
+    let uid = fixture.directory.uid_for(&fixture.alice).unwrap();
+    let owner = StateOwner::Principal(uid);
+    let ownership = Arc::new(
+        astrid_storage::OwnershipStore::new(fixture.store.kv(), fixture.directory.clone()).unwrap(),
+    );
+    let service = WorkspaceBranchService::new_with_ownership(
+        fixture.store.clone(),
+        fixture.directory.clone(),
+        Some(Arc::clone(&ownership)),
+    );
+    let branch = service
+        .branches
+        .begin_for_uid_at(
+            &owner,
+            uid,
+            astrid_core::WorkspaceUid::random(),
+            astrid_storage::ContentName::new(WorkspaceBranchService::ATTACHMENT_PREFIX).unwrap(),
+        )
+        .unwrap();
+    // Exercise the exact production boundary between begin and publishing a
+    // binding. No storage reclaim follows: rollback must handle the error.
+    let guard = ownership.guard_principal_deletion(uid).await.unwrap();
+    let error = service
+        .confirm_new_binding(uid, owner, branch.id())
+        .await
+        .unwrap_err();
+    assert!(error.contains("being retired"));
+    assert!(
+        service
+            .branches
+            .list_bindings_by_uid(&owner, uid)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(service.bindings.lock().unwrap().is_empty());
+    drop(guard);
+}

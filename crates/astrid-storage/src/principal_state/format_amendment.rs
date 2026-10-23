@@ -87,7 +87,12 @@ pub(super) const PRE_CHUNKED_KV_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
     172, 62, 26, 177, 232, 43, 226, 77, 174, 124, 222, 249, 73, 105, 141, 213, 77, 36, 7, 188, 127,
     57, 251, 48, 112, 157, 195, 102, 119, 238, 166, 29,
 ]);
-const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 15] = [
+/// Specification before indexed workspaces and exact root removal.
+pub(super) const PRE_UID_RETIREMENT_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
+    249, 182, 155, 145, 96, 189, 72, 97, 45, 57, 247, 190, 243, 196, 62, 101, 89, 184, 52, 54, 165,
+    77, 35, 249, 40, 161, 69, 113, 15, 162, 11, 116,
+]);
+const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 16] = [
     PRE_DERIVATION_FORMAT_SPEC_ID,
     PRE_COMPACTION_FORMAT_SPEC_ID,
     PRE_GC_OUTBOX_FORMAT_SPEC_ID,
@@ -103,6 +108,7 @@ const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 15] = [
     PRE_WORKSPACE_BRANCH_FORMAT_SPEC_ID,
     PRE_RESERVED_REPRESENTATION_TAG_FORMAT_SPEC_ID,
     PRE_CHUNKED_KV_FORMAT_SPEC_ID,
+    PRE_UID_RETIREMENT_FORMAT_SPEC_ID,
 ];
 
 /// Known predecessors whose direct-canonical recipe is unchanged.
@@ -117,6 +123,7 @@ pub(super) const DIRECT_CATALOGUE_PREDECESSORS: &[ObjectId] = &[
     PRE_WORKSPACE_BRANCH_FORMAT_SPEC_ID,
     PRE_RESERVED_REPRESENTATION_TAG_FORMAT_SPEC_ID,
     PRE_CHUNKED_KV_FORMAT_SPEC_ID,
+    PRE_UID_RETIREMENT_FORMAT_SPEC_ID,
 ];
 
 #[cfg(test)]

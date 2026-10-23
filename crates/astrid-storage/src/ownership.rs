@@ -121,6 +121,12 @@ impl OwnershipSnapshot {
         self.principal_ownership.get(&uid)
     }
 
+    /// Whether durable identity deletion currently reserves this exact UID.
+    #[must_use]
+    pub fn principal_is_retiring(&self, uid: PrincipalUid) -> bool {
+        self.principal_deletions.contains_key(&uid)
+    }
+
     /// Iterate over users in stable UID order.
     pub fn users(&self) -> impl Iterator<Item = &UserIdentity> {
         self.users.values()

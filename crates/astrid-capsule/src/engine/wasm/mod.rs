@@ -3070,8 +3070,9 @@ impl ExecutionEngine for WasmEngine {
         // Canonical Astrid branch state is kernel-owned and shared across all
         // capsule engines.  Do not roll back the service on one engine's
         // unload: another capsule (or a SystemResident invocation) may still
-        // hold the same authenticated branch.  The service rolls back any
-        // uncommitted bindings when the kernel-wide `Arc` is finally dropped.
+        // hold the same authenticated branch. Durable live bindings survive
+        // the final service drop and are rebound after restart. Only explicit
+        // workspace rollback or immutable UID retirement reclaims them.
         #[cfg(not(target_family = "wasm"))]
         {
             self.workspace_branches = None;

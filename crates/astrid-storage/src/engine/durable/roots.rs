@@ -14,6 +14,7 @@ use super::{
 
 const SNAPSHOT_SENTINEL: u64 = u64::MAX;
 const SNAPSHOT_RECORD: u8 = 1;
+const REMOVE_RECORD: u8 = 2;
 const CURRENT_DIGEST_BYTES: u32 = 32;
 
 pub(super) fn recover_root_history<P, C, R>(
@@ -138,6 +139,32 @@ where
             }
             apply_transition(recovered, codec, offset, &record)
         },
+        DecodedRootJournalRecord::Remove {
+            principal,
+            expected,
+        } => {
+            if encode_root_removal(scheme, &principal, expected)? != payload {
+                return Err(corrupt(
+                    ROOT_FILE,
+                    offset,
+                    "root removal frame is not canonical",
+                ));
+            }
+            let principal = decode_principal(codec, &principal, offset)?;
+            let actual = recovered.get(&principal).map(|(root, _)| *root);
+            if actual != Some(expected) {
+                return Err(DurableError::RecoveryModel {
+                    file: ROOT_FILE,
+                    offset,
+                    source: ModelError::RootConflict {
+                        expected: Some(expected),
+                        actual,
+                    },
+                });
+            }
+            recovered.remove(&principal);
+            Ok(())
+        },
         DecodedRootJournalRecord::Snapshot(entries) => {
             if offset != 0 || !recovered.is_empty() {
                 return Err(corrupt(
@@ -248,6 +275,22 @@ pub(super) fn encode_root_record(
     Ok(bytes)
 }
 
+pub(super) fn encode_root_removal(
+    scheme: IdentityScheme,
+    principal: &[u8],
+    expected: RootState,
+) -> Result<Vec<u8>, DurableError> {
+    let principal_len =
+        u64::try_from(principal.len()).map_err(|_| DurableError::EncodingOverflow)?;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&SNAPSHOT_SENTINEL.to_le_bytes());
+    bytes.push(REMOVE_RECORD);
+    bytes.extend_from_slice(&principal_len.to_le_bytes());
+    bytes.extend_from_slice(principal);
+    encode_root_state(&mut bytes, scheme, expected);
+    Ok(bytes)
+}
+
 pub(super) fn encode_root_snapshot(
     scheme: IdentityScheme,
     roots: &[(Vec<u8>, RootState)],
@@ -292,6 +335,10 @@ fn encode_identity(bytes: &mut Vec<u8>, scheme: IdentityScheme, id: ObjectId) {
 enum DecodedRootJournalRecord {
     Transition(DecodedRootRecord),
     Snapshot(Vec<(Vec<u8>, RootState)>),
+    Remove {
+        principal: Vec<u8>,
+        expected: RootState,
+    },
 }
 
 struct DecodedRootRecord {
@@ -307,8 +354,21 @@ fn decode_root_journal_record(
     let mut reader = RootReader::new(bytes);
     let prefix = reader.u64()?;
     if prefix == SNAPSHOT_SENTINEL {
-        if reader.u8()? != SNAPSHOT_RECORD {
-            return Err("unknown root-journal extension record");
+        match reader.u8()? {
+            REMOVE_RECORD => {
+                let principal_len = reader.usize_len()?;
+                let principal = reader.take(principal_len)?.to_vec();
+                let expected = reader.root_state(scheme)?;
+                if reader.remaining() != 0 {
+                    return Err("trailing root removal bytes");
+                }
+                return Ok(DecodedRootJournalRecord::Remove {
+                    principal,
+                    expected,
+                });
+            },
+            SNAPSHOT_RECORD => {},
+            _ => return Err("unknown root-journal extension record"),
         }
         let count = reader.usize_len()?;
         let mut entries = Vec::new();
@@ -436,3 +496,6 @@ impl<'a> RootReader<'a> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;
