@@ -22,27 +22,7 @@ async fn spawn_inherits_fleet_without_human_delegation_and_rejects_stale_or_owne
             .unwrap();
     }
     let store = OwnershipStore::new(Arc::new(MemoryKvStore::new()), directory).unwrap();
-    let user = UserIdentity::from_genesis(UserGenesis::from_parts(
-        uuid::Uuid::from_u128(1),
-        chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
-        [4; 32],
-    ))
-    .unwrap();
-    store.create_user(user.clone()).await.unwrap();
-    let fleets: Vec<_> = [2, 3]
-        .into_iter()
-        .map(|id| {
-            FleetIdentity::from_genesis(FleetGenesis::from_parts(
-                uuid::Uuid::from_u128(id),
-                chrono::DateTime::from_timestamp(1_700_000_001, 0).unwrap(),
-                user.uid,
-            ))
-            .unwrap()
-        })
-        .collect();
-    for fleet in &fleets {
-        store.create_fleet(fleet.clone()).await.unwrap();
-    }
+    let (user, fleets) = create_user_and_fleets(&store).await;
     assert!(store.capture_derived_ownership(creator).await.is_err());
     store
         .assign_principal(PrincipalOwnership {
@@ -128,4 +108,29 @@ async fn spawn_inherits_fleet_without_human_delegation_and_rejects_stale_or_owne
     assert!(pending.accountable_user(child).is_none());
     assert!(pending.principal_deletions.contains_key(&child));
     assert!(store.assign_derived_principal(child, &fresh).await.is_err());
+}
+
+async fn create_user_and_fleets(store: &OwnershipStore) -> (UserIdentity, Vec<FleetIdentity>) {
+    let user = UserIdentity::from_genesis(UserGenesis::from_parts(
+        uuid::Uuid::from_u128(1),
+        chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        [4; 32],
+    ))
+    .unwrap();
+    store.create_user(user.clone()).await.unwrap();
+    let fleets: Vec<_> = [2, 3]
+        .into_iter()
+        .map(|id| {
+            FleetIdentity::from_genesis(FleetGenesis::from_parts(
+                uuid::Uuid::from_u128(id),
+                chrono::DateTime::from_timestamp(1_700_000_001, 0).unwrap(),
+                user.uid,
+            ))
+            .unwrap()
+        })
+        .collect();
+    for fleet in &fleets {
+        store.create_fleet(fleet.clone()).await.unwrap();
+    }
+    (user, fleets)
 }
