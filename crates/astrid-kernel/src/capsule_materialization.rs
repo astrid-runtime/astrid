@@ -325,6 +325,7 @@ impl Kernel {
                 anyhow::anyhow!("remove stale capsule materialization: {error}")
             })?;
         }
+        #[cfg(target_os = "macos")]
         match self.copy_published_projection(target, principal, discovery_manifest, snapshot) {
             Ok(Some(manifest)) => return Ok(manifest),
             Ok(None) => {},

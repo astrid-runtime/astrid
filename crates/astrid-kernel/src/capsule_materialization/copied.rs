@@ -4,6 +4,7 @@
 //! artifact cache survives this operation; every published owner keeps its own
 //! inode and exact durable sidecars.
 
+#[cfg(target_os = "macos")]
 use crate::Kernel;
 #[cfg(target_os = "macos")]
 use astrid_capsule_types::manifest::CapsuleManifest;
@@ -101,19 +102,6 @@ fn copy_members(
         &verified.snapshot().package().authority,
     )?;
     Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-impl Kernel {
-    pub(super) fn copy_published_projection(
-        &self,
-        _target: &std::path::Path,
-        _principal: &astrid_core::PrincipalId,
-        _manifest: &astrid_capsule_types::manifest::CapsuleManifest,
-        _snapshot: &astrid_storage::CapsulePackageSnapshot,
-    ) -> anyhow::Result<Option<astrid_capsule_types::manifest::CapsuleManifest>> {
-        Ok(None)
-    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
