@@ -434,7 +434,7 @@ pub(super) fn validate_representations(
     representations: &CanonicalPhysicalMap,
     placements: &CanonicalPhysicalMap,
     index_memory: super::LocationIndexMemoryBudget,
-) -> Result<(ReverseIndex, u64), DurableError> {
+) -> Result<(ReverseIndex, u64, super::recovered_direct::RecoveredDirect), DurableError> {
     let mut placement_by_blob = BTreeMap::new();
     let mut extent_count = 0_u64;
     for entry in active_entries(placements) {
@@ -465,6 +465,7 @@ pub(super) fn validate_representations(
         placement_by_blob.insert(entry.blob(), entry);
     }
     let mut reverse = ReverseIndex::new(index_memory)?;
+    let mut recovered_direct = super::recovered_direct::Builder::new()?;
     for entry in active_entries(representations) {
         let (key, bytes) = entry?;
         let record = RepresentationRecord::decode(&bytes)?;
@@ -506,9 +507,11 @@ pub(super) fn validate_representations(
                 "direct representation placement does not match its record",
             ));
         }
-        reverse.insert(object, id)?;
+        if reverse.insert_first(object, id)? {
+            recovered_direct.push(object, placement)?;
+        }
     }
-    Ok((reverse, extent_count))
+    Ok((reverse, extent_count, recovered_direct.finish()?))
 }
 
 pub(super) fn active_entries<M: super::node_view::MapView>(

@@ -34,15 +34,26 @@ impl ReverseIndex {
         object: ObjectId,
         id: RepresentationRecordId,
     ) -> Result<(), DurableError> {
+        self.insert_first(object, id).map(|_| ())
+    }
+
+    /// Return whether this is the earliest admitted representation for object.
+    pub(super) fn insert_first(
+        &mut self,
+        object: ObjectId,
+        id: RepresentationRecordId,
+    ) -> Result<bool, DurableError> {
         let result = (|| {
             let previous = self.head(object)?;
+            let first = previous.is_none();
             let link = Link {
                 id,
                 first: previous.as_ref().map_or(id, |(_, link)| link.first),
                 previous: previous.map(|(location, _)| location),
             };
             let location = append_frame(&mut self.file, MAGIC, &link.encode(object))?;
-            self.heads.insert(object, location)
+            self.heads.insert(object, location)?;
+            Ok(first)
         })();
         if result.is_err() {
             self.failed.store(true, Ordering::Release);
