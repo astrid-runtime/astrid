@@ -372,6 +372,27 @@ impl PagedLocations {
         self.failed.load(Ordering::Acquire)
     }
 
+    fn rows(&self) -> RowEntries<'_> {
+        let mut sources: Vec<RowEntries<'_>> = vec![Box::new(
+            self.resident
+                .iter()
+                .map(|(id, location)| Ok((*id, *location))),
+        )];
+        sources.extend(
+            self.runs
+                .iter()
+                .flatten()
+                .map(|run| Box::new(run.rows()) as Box<dyn Iterator<Item = Result<_, _>>>),
+        );
+        let entries: Box<dyn Iterator<Item = Result<_, _>>> = match MergedEntries::new(sources) {
+            Ok(entries) => Box::new(entries),
+            Err(error) => Box::new(std::iter::once(Err(error))),
+        };
+        Box::new(
+            entries.map(|entry| entry.inspect_err(|_| self.failed.store(true, Ordering::Release))),
+        )
+    }
+
     fn lookup(&self, id: ObjectId) -> Result<Option<LocatorValue>, DurableError> {
         if let Ok(at) = self.resident.binary_search_by_key(&id, |entry| entry.0) {
             return Ok(Some(self.resident[at].1));
@@ -397,26 +418,10 @@ impl LocationLookup for PagedLocations {
     fn locations(
         &self,
     ) -> Box<dyn Iterator<Item = Result<(ObjectId, ArenaLocation), DurableError>> + '_> {
-        let mut sources: Vec<RowEntries<'_>> = vec![Box::new(
-            self.resident
-                .iter()
-                .map(|(id, location)| Ok((*id, *location))),
-        )];
-        sources.extend(
-            self.runs
-                .iter()
-                .flatten()
-                .map(|run| Box::new(run.rows()) as Box<dyn Iterator<Item = Result<_, _>>>),
-        );
-        let entries: Box<dyn Iterator<Item = Result<_, _>>> = match MergedEntries::new(sources) {
-            Ok(entries) => Box::new(entries),
-            Err(error) => Box::new(std::iter::once(Err(error))),
-        };
-        Box::new(entries.map(|entry| {
-            entry
-                .map(|(id, row)| (id, row.location))
-                .inspect_err(|_| self.failed.store(true, Ordering::Release))
-        }))
+        Box::new(
+            self.rows()
+                .map(|entry| entry.map(|(id, row)| (id, row.location))),
+        )
     }
 }
 
@@ -482,6 +487,9 @@ impl Iterator for MergedEntries<'_> {
         Some(Ok(selected))
     }
 }
+
+mod rebuild;
+pub(in crate::engine::durable) use rebuild::RebuildLocations;
 
 #[cfg(test)]
 mod tests;

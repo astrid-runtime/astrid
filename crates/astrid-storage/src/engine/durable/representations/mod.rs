@@ -899,7 +899,6 @@ impl RepresentationStore {
         let placements = PlacementSet::decode(
             index.value(MetadataKind::Placement, state.placements().as_bytes())?,
         )?;
-        let persisted_map_nodes = ColdNodes::from_metadata(&metadata, limits, index_memory)?;
         let profiles = residency::recover_active_map(
             PhysicalMapDomain::Profile,
             catalogue.profiles_root(),
@@ -935,6 +934,18 @@ impl RepresentationStore {
                 "placement extent count disagrees with map entries",
             ));
         }
+        let persisted_map_nodes = ColdNodes::from_validated_maps(
+            &metadata,
+            limits,
+            index_memory,
+            &[&profiles, &representations, &placement_entries],
+        )?;
+        let residency = residency::MapResidency::new(
+            &profiles,
+            &representations,
+            &placement_entries,
+            persisted_map_nodes.len(),
+        )?;
         let profiles = profiles.with_node_provider(persisted_map_nodes.clone());
         let representations = representations.with_node_provider(persisted_map_nodes.clone());
         let placement_entries = placement_entries.with_node_provider(persisted_map_nodes.clone());
@@ -946,12 +957,7 @@ impl RepresentationStore {
             state,
             catalogue,
             placements,
-            residency: residency::MapResidency::new(
-                &profiles,
-                &representations,
-                &placement_entries,
-                persisted_map_nodes.len(),
-            )?,
+            residency,
             profiles,
             representations,
             placement_entries,
