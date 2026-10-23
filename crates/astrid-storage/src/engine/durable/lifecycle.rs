@@ -98,6 +98,20 @@ where
         self.published_roots.replace(&inner.roots_by_principal);
     }
 
+    pub(super) fn flush_for_retirement(
+        &self,
+        inner: &mut DurableInner<P>,
+    ) -> Result<(), DurableError> {
+        if let Err(error) = self
+            .flush_authority(inner)
+            .and_then(|()| self.checkpoint_index(inner, VolumeIndexPersist::RetainDeltas))
+        {
+            self.mark_requires_recovery(inner);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn flush_authority(&self, inner: &mut DurableInner<P>) -> Result<(), DurableError> {
         if self.transaction_wal.is_enabled() {
             return self.checkpoint_transaction_wal(inner);
