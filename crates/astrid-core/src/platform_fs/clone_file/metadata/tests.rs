@@ -2,6 +2,7 @@
 use super::*;
 use crate::platform_fs::try_clone_file;
 use std::ffi::CString;
+use std::os::fd::AsRawFd as _;
 
 fn attributed(file: &File) {
     let name = CString::new("user.astrid-clone-test").unwrap();
@@ -96,4 +97,43 @@ fn captured_clone_flags_are_cleared_before_discard() {
     assert_eq!(cleared, 0);
     assert!(!result.unwrap());
     assert!(!target.exists());
+}
+
+#[test]
+fn native_local_provenance_does_not_disable_cloning_or_leave_baseline_files() {
+    use std::os::unix::ffi::OsStrExt as _;
+    // Application-path files may receive kernel provenance that /tmp lacks.
+    let root = tempfile::Builder::new()
+        .prefix(".astrid-clone-provenance-test-")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap();
+    let source_path = root.path().join("source");
+    std::fs::write(&source_path, b"authenticated data fork").unwrap();
+    let source = File::open(source_path).unwrap();
+    let pilot = root.path().join("pilot");
+    let name = CString::new(pilot.as_os_str().as_bytes()).unwrap();
+    // SAFETY: open fixture descriptor and a live NUL-terminated private path.
+    let code = unsafe {
+        nix::libc::fclonefileat(
+            source.as_raw_fd(),
+            nix::libc::AT_FDCWD,
+            name.as_ptr(),
+            0x0002,
+        )
+    };
+    if code != 0 {
+        let error = io::Error::last_os_error();
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(nix::libc::ENOTSUP | nix::libc::EXDEV)
+        ));
+        return;
+    }
+    let target = root.path().join("target");
+    assert!(
+        try_clone_file(&source, &target).unwrap(),
+        "native local provenance must not force a copy"
+    );
+    assert_eq!(std::fs::read(target).unwrap(), b"authenticated data fork");
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 3);
 }
