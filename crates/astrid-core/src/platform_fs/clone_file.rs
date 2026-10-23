@@ -4,11 +4,16 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
+#[cfg(target_os = "macos")]
+mod metadata;
+
 /// Clone regular-file contents into a new, independent inode when supported.
 ///
 /// The source descriptor pins the opened file rather than following its path
 /// again. Callers must own the destination parent and authenticate the cloned
 /// bytes before publication: cloning confers neither identity nor authority.
+/// On macOS, sources with file flags or extended attributes use the ordinary
+/// copy fallback; accepted clones receive private owner-readable/writable mode.
 /// Returns `false` without creating a destination on unsupported filesystems
 /// or platforms. The caller can then write its already authenticated bytes.
 ///
@@ -32,7 +37,11 @@ fn platform_clone(source: &File, destination: &Path) -> io::Result<bool> {
     use std::ffi::CString;
     use std::os::fd::AsRawFd as _;
     use std::os::unix::ffi::OsStrExt as _;
-    let destination = CString::new(destination.as_os_str().as_bytes())
+    const CLONE_NOOWNERCOPY: u32 = 0x0002; // macOS sys/clonefile.h ABI.
+    if !metadata::eligible(source)? {
+        return Ok(false);
+    }
+    let destination_cstring = CString::new(destination.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "clone path contains NUL"))?;
     // SAFETY: the source descriptor remains borrowed and open for the call;
     // destination is NUL-terminated and alive. The syscall retains neither.
@@ -41,12 +50,12 @@ fn platform_clone(source: &File, destination: &Path) -> io::Result<bool> {
         nix::libc::fclonefileat(
             source.as_raw_fd(),
             nix::libc::AT_FDCWD,
-            destination.as_ptr(),
-            0,
+            destination_cstring.as_ptr(),
+            CLONE_NOOWNERCOPY,
         )
     };
     if result == 0 {
-        return Ok(true);
+        return metadata::prepare(destination);
     }
     let error = io::Error::last_os_error();
     match error.raw_os_error() {
