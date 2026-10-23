@@ -370,7 +370,7 @@ where
     let mut direct = Vec::new();
     if let Some(representations) = representations.as_deref_mut() {
         for (id, record) in &incoming {
-            if representations.contains_direct(*id) {
+            if representations.contains_direct(*id)? {
                 continue;
             }
             let Some(location) = index.get(id).copied() else {

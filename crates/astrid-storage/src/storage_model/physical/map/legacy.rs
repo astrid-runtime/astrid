@@ -1,5 +1,6 @@
 //! Frozen binary Patricia-map construction retained for format-one recovery.
 
+use super::nodes::{self, PhysicalMapMutNodes};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
@@ -8,14 +9,14 @@ use super::{
     PhysicalModelError, SEARCH_KEY_BITS,
 };
 
-pub(super) fn insert<I: PhysicalIdentity>(
+pub(super) fn insert<I: PhysicalIdentity, N: PhysicalMapMutNodes>(
     identity: &I,
     domain: PhysicalMapDomain,
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    nodes: &mut N,
     root: PhysicalMapNodeId,
     key: PhysicalMapKey,
     value: Vec<u8>,
-) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError> {
+) -> Result<(PhysicalMapNodeId, bool), N::Error> {
     Insertion {
         identity,
         domain,
@@ -82,28 +83,22 @@ struct Branch {
     subtree_entries: u64,
 }
 
-struct Insertion<'a, I> {
+struct Insertion<'a, I, N> {
     identity: &'a I,
     domain: PhysicalMapDomain,
-    nodes: &'a mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    nodes: &'a mut N,
 }
 
-impl<I: PhysicalIdentity> Insertion<'_, I> {
+impl<I: PhysicalIdentity, N: PhysicalMapMutNodes> Insertion<'_, I, N> {
     fn insert_at(
         &mut self,
         node_id: PhysicalMapNodeId,
         key: PhysicalMapKey,
         value: Vec<u8>,
-    ) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError> {
-        let node = self
-            .nodes
-            .get(&node_id)
-            .cloned()
-            .ok_or(PhysicalModelError::InvalidMap("missing insertion node"))?;
+    ) -> Result<(PhysicalMapNodeId, bool), N::Error> {
+        let node = nodes::read(self.identity, self.nodes, self.domain, node_id)?;
         if node.domain() != self.domain {
-            return Err(PhysicalModelError::InvalidMap(
-                "insertion crossed a map domain",
-            ));
+            return Err(PhysicalModelError::InvalidMap("insertion crossed a map domain").into());
         }
         match node {
             PhysicalMapNode::Leaf {
@@ -138,9 +133,9 @@ impl<I: PhysicalIdentity> Insertion<'_, I> {
                 key,
                 value,
             ),
-            PhysicalMapNode::Page { .. } | PhysicalMapNode::Radix { .. } => Err(
-                PhysicalModelError::InvalidMap("legacy map contains a radix node"),
-            ),
+            PhysicalMapNode::Page { .. } | PhysicalMapNode::Radix { .. } => {
+                Err(PhysicalModelError::InvalidMap("legacy map contains a radix node").into())
+            },
         }
     }
 
@@ -150,14 +145,14 @@ impl<I: PhysicalIdentity> Insertion<'_, I> {
         existing: &Leaf,
         key: PhysicalMapKey,
         value: Vec<u8>,
-    ) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError> {
+    ) -> Result<(PhysicalMapNodeId, bool), N::Error> {
         if existing.key == key {
             if existing.value == value {
                 return Ok((node_id, false));
             }
-            return Err(PhysicalModelError::InvalidMap(
-                "leaf key has unequal canonical bytes",
-            ));
+            return Err(
+                PhysicalModelError::InvalidMap("leaf key has unequal canonical bytes").into(),
+            );
         }
         let existing_search = existing.key.search_key();
         let new_search = key.search_key();
@@ -182,7 +177,7 @@ impl<I: PhysicalIdentity> Insertion<'_, I> {
         branch: Branch,
         key: PhysicalMapKey,
         value: Vec<u8>,
-    ) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError> {
+    ) -> Result<(PhysicalMapNodeId, bool), N::Error> {
         let search = key.search_key();
         let common = common_prefix_with_prefix(&search, branch.prefix_bits, &branch.prefix)?;
         if common < branch.prefix_bits {
@@ -217,12 +212,12 @@ impl<I: PhysicalIdentity> Insertion<'_, I> {
         value: Vec<u8>,
         search: &[u8],
         common: u32,
-    ) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError> {
+    ) -> Result<(PhysicalMapNodeId, bool), N::Error> {
         let new_leaf_id = self.insert_leaf(key, value)?;
         if bit(&branch.prefix, common) == bit(search, common) {
-            return Err(PhysicalModelError::InvalidMap(
-                "branch prefix split did not diverge",
-            ));
+            return Err(
+                PhysicalModelError::InvalidMap("branch prefix split did not diverge").into(),
+            );
         }
         let (zero, one) = ordered_children(node_id, new_leaf_id, search, common);
         let parent = PhysicalMapNode::branch(
@@ -240,17 +235,12 @@ impl<I: PhysicalIdentity> Insertion<'_, I> {
         &mut self,
         key: PhysicalMapKey,
         value: Vec<u8>,
-    ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
+    ) -> Result<PhysicalMapNodeId, N::Error> {
         self.insert_node(PhysicalMapNode::leaf(self.domain, key, value))
     }
 
-    fn insert_node(
-        &mut self,
-        node: PhysicalMapNode,
-    ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
-        let id = node.identify(self.identity)?;
-        self.nodes.entry(id).or_insert(node);
-        Ok(id)
+    fn insert_node(&mut self, node: PhysicalMapNode) -> Result<PhysicalMapNodeId, N::Error> {
+        nodes::store(self.identity, self.nodes, node)
     }
 }
 

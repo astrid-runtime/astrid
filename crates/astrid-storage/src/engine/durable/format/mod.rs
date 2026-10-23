@@ -137,7 +137,7 @@ pub(super) fn verify_indexed_tail<F: DurableIo>(
     Ok(())
 }
 
-fn read_frame_at<F: DurableIo>(
+pub(super) fn read_frame_at<F: DurableIo>(
     file: &F,
     file_name: &'static str,
     magic: [u8; 8],

@@ -8,7 +8,22 @@ use crate::storage_model::{
 use std::collections::BTreeSet;
 
 use super::format::{Blake3PhysicalIdentity, MetadataFrame};
+use super::node_view::MapView;
 use super::{DirectArenaObject, DurableError, LOCAL_STORAGE_NODE};
+
+pub(super) trait NodePresence {
+    fn has_node(&self, id: &crate::storage_model::PhysicalMapNodeId) -> Result<bool, DurableError>;
+}
+impl NodePresence for BTreeSet<crate::storage_model::PhysicalMapNodeId> {
+    fn has_node(&self, id: &crate::storage_model::PhysicalMapNodeId) -> Result<bool, DurableError> {
+        Ok(self.contains(id))
+    }
+}
+impl NodePresence for super::cold::ColdNodes {
+    fn has_node(&self, id: &crate::storage_model::PhysicalMapNodeId) -> Result<bool, DurableError> {
+        self.contains(id)
+    }
+}
 
 pub(super) struct InitialState {
     pub(super) metadata: Vec<MetadataFrame>,
@@ -132,27 +147,22 @@ pub(super) fn append_map_nodes(
 
 pub(super) fn append_new_reachable_map_nodes(
     metadata: &mut Vec<MetadataFrame>,
-    map: &CanonicalPhysicalMap,
-    durable: &BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    map: &(impl MapView + ?Sized),
+    durable: &impl NodePresence,
     appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
 ) -> Result<usize, DurableError> {
-    let Some(root) = map.root() else {
+    let Some(root) = map.view_root() else {
         return Ok(0);
     };
     let mut pending = vec![(root, false)];
     let mut visited = BTreeSet::new();
     while let Some((id, expanded)) = pending.pop() {
         if expanded {
-            let node = map
-                .nodes()
-                .get(&id)
-                .ok_or(DurableError::InvalidRepresentationState(
-                    "active physical map is missing a reachable node",
-                ))?;
+            let node = map.view_node(id)?;
             // A persisted parent alone does not establish durable descendants.
             // Cache only closures checked against the append-only persisted set.
-            let children_complete = match node {
+            let children_complete = match &node {
                 PhysicalMapNode::Branch { zero, one, .. } => {
                     complete.contains(zero) && complete.contains(one)
                 },
@@ -161,11 +171,11 @@ pub(super) fn append_new_reachable_map_nodes(
                 },
                 PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => true,
             };
-            if durable.contains(&id) && children_complete {
+            if durable.has_node(&id)? && children_complete {
                 complete.insert(id);
             }
-            if !durable.contains(&id) && !appended.contains(&id) {
-                metadata.push(MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?);
+            if !durable.has_node(&id)? && !appended.contains(&id) {
+                metadata.push(MetadataFrame::map_node(&Blake3PhysicalIdentity, &node)?);
                 appended.insert(id);
             }
             continue;
@@ -173,14 +183,9 @@ pub(super) fn append_new_reachable_map_nodes(
         if complete.contains(&id) || !visited.insert(id) {
             continue;
         }
-        let node = map
-            .nodes()
-            .get(&id)
-            .ok_or(DurableError::InvalidRepresentationState(
-                "active physical map is missing a reachable node",
-            ))?;
+        let node = map.view_node(id)?;
         pending.push((id, true));
-        match node {
+        match &node {
             PhysicalMapNode::Branch { zero, one, .. } => {
                 pending.push((*one, false));
                 pending.push((*zero, false));
@@ -244,7 +249,7 @@ mod tests {
     #[test]
     fn verified_durable_subtrees_skip_unchanged_nodes() {
         let mut map = dense_map();
-        let durable = map.nodes().keys().copied().collect();
+        let durable: BTreeSet<_> = map.nodes().keys().copied().collect();
         let mut complete = BTreeSet::new();
         let mut metadata = Vec::new();
         let mut appended = BTreeSet::new();
@@ -354,7 +359,7 @@ mod tests {
             let Some(parent_position) = positions.get(parent.as_bytes()) else {
                 continue;
             };
-            let children = match node {
+            let children = match &node {
                 PhysicalMapNode::Branch { zero, one, .. } => vec![*zero, *one],
                 PhysicalMapNode::Radix { children, .. } => children.clone(),
                 PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => Vec::new(),

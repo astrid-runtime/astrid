@@ -26,6 +26,7 @@ pub use identity::{
     PhysicalIdentity, PhysicalMapNodeId, PlacementSetId, RepresentationCatalogueRootId,
     RepresentationProfileId, RepresentationRecordId, RepresentationStateId,
 };
+pub(crate) use map::{BackedPhysicalMap, PhysicalMapMutNodes, PhysicalMapNodes};
 pub use map::{CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode};
 pub use placement::{PlacementEntry, PlacementSet, Replica, ReplicaLocator};
 pub use profile::{

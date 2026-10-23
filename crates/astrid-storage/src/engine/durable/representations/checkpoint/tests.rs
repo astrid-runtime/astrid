@@ -24,8 +24,14 @@ fn volume_checkpoints_bound_metadata_and_preserve_authority_across_restart() {
     let path = directory.path().join("test.volume");
     let mut volume: Arc<dyn AstridVolume> = HostedFileVolume::open(&path).unwrap();
     let limits = RecoveryLimits::process_addressable();
-    let mut store =
-        RepresentationStore::activate_volume(&volume, limits, ObjectId::new([1; 32]), []).unwrap();
+    let mut store = RepresentationStore::activate_volume(
+        &volume,
+        limits,
+        ObjectId::new([1; 32]),
+        [],
+        super::super::LocationIndexMemoryBudget::default(),
+    )
+    .unwrap();
     for cycle in 0..4 {
         for offset in 1..=100 {
             advance(&mut store, cycle * 100 + offset);
@@ -50,9 +56,13 @@ fn volume_checkpoints_bound_metadata_and_preserve_authority_across_restart() {
         // mandatory byte-range locks, so copying a live volume is not portable.
         drop(volume);
         volume = HostedFileVolume::open(&path).unwrap();
-        let recovered = RepresentationStore::open_volume(&volume, limits)
-            .unwrap()
-            .unwrap();
+        let recovered = RepresentationStore::open_volume(
+            &volume,
+            limits,
+            super::super::LocationIndexMemoryBudget::default(),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(recovered.active, active);
         assert_eq!(recovered.reverse, reverse);
         store = recovered;
@@ -64,8 +74,14 @@ fn native_checkpoints_preserve_updates_after_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let root = open_store_root(directory.path()).unwrap();
     let limits = RecoveryLimits::process_addressable();
-    let mut store =
-        RepresentationStore::activate(&root, limits, ObjectId::new([1; 32]), []).unwrap();
+    let mut store = RepresentationStore::activate(
+        &root,
+        limits,
+        ObjectId::new([1; 32]),
+        [],
+        super::super::LocationIndexMemoryBudget::default(),
+    )
+    .unwrap();
     for cycle in 0..3 {
         for offset in 1..=50 {
             advance(&mut store, cycle * 50 + offset);
@@ -74,9 +90,15 @@ fn native_checkpoints_preserve_updates_after_reopen() {
         store.checkpoint_native(&root, limits).unwrap();
         assert!(store.metadata.metadata().unwrap().len() < 4096);
         drop(store);
-        store = RepresentationStore::open(&root, limits).unwrap().unwrap();
+        store = RepresentationStore::open(
+            &root,
+            limits,
+            super::super::LocationIndexMemoryBudget::default(),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(store.active, active);
-        assert!(store.contains_direct(ObjectId::new([7; 32])));
+        assert!(store.contains_direct(ObjectId::new([7; 32])).unwrap());
         assert_eq!(
             std::fs::read_dir(directory.path().join("representations/generations"))
                 .unwrap()
@@ -92,8 +114,14 @@ fn unpublished_volume_checkpoint_cannot_change_authority_and_is_retryable() {
     let volume: Arc<dyn AstridVolume> =
         HostedFileVolume::open(directory.path().join("test.volume")).unwrap();
     let limits = RecoveryLimits::process_addressable();
-    let mut store =
-        RepresentationStore::activate_volume(&volume, limits, ObjectId::new([1; 32]), []).unwrap();
+    let mut store = RepresentationStore::activate_volume(
+        &volume,
+        limits,
+        ObjectId::new([1; 32]),
+        [],
+        super::super::LocationIndexMemoryBudget::default(),
+    )
+    .unwrap();
     advance(&mut store, 1);
     let active = store.active;
     let metadata = DurableFile::volume(
@@ -111,9 +139,13 @@ fn unpublished_volume_checkpoint_cannot_change_authority_and_is_retryable() {
     let (replacement, _) = store.checkpoint_into(metadata, journal, limits).unwrap();
     drop(replacement);
     drop(store);
-    let mut recovered = RepresentationStore::open_volume(&volume, limits)
-        .unwrap()
-        .unwrap();
+    let mut recovered = RepresentationStore::open_volume(
+        &volume,
+        limits,
+        super::super::LocationIndexMemoryBudget::default(),
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(recovered.journal_generation, 1);
     assert_eq!(recovered.active, active);
     recovered.checkpoint_volume(&volume, limits).unwrap();
@@ -128,8 +160,14 @@ fn published_checkpoint_recovers_before_cleanup_and_does_not_fall_back_on_corrup
     let volume: Arc<dyn AstridVolume> =
         HostedFileVolume::open(directory.path().join("test.volume")).unwrap();
     let limits = RecoveryLimits::process_addressable();
-    let mut store =
-        RepresentationStore::activate_volume(&volume, limits, ObjectId::new([1; 32]), []).unwrap();
+    let mut store = RepresentationStore::activate_volume(
+        &volume,
+        limits,
+        ObjectId::new([1; 32]),
+        [],
+        super::super::LocationIndexMemoryBudget::default(),
+    )
+    .unwrap();
     advance(&mut store, 1);
     let active = store.active;
     let metadata = DurableFile::volume(
@@ -165,9 +203,13 @@ fn published_checkpoint_recovers_before_cleanup_and_does_not_fall_back_on_corrup
             .len(),
         4
     );
-    let mut recovered = RepresentationStore::open_volume(&volume, limits)
-        .unwrap()
-        .unwrap();
+    let mut recovered = RepresentationStore::open_volume(
+        &volume,
+        limits,
+        super::super::LocationIndexMemoryBudget::default(),
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(recovered.journal_generation, 2);
     assert_eq!(recovered.active, active);
     recovered.checkpoint_volume(&volume, limits).unwrap();
@@ -189,7 +231,14 @@ fn published_checkpoint_recovers_before_cleanup_and_does_not_fall_back_on_corrup
         )
         .unwrap();
     volume.sync().unwrap();
-    assert!(RepresentationStore::open_volume(&volume, limits).is_err());
+    assert!(
+        RepresentationStore::open_volume(
+            &volume,
+            limits,
+            super::super::LocationIndexMemoryBudget::default()
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -198,8 +247,14 @@ fn recovered_maps_retain_only_their_active_closures() {
     let volume: Arc<dyn AstridVolume> =
         HostedFileVolume::open(directory.path().join("residency.volume")).unwrap();
     let limits = RecoveryLimits::process_addressable();
-    let mut store =
-        RepresentationStore::activate_volume(&volume, limits, ObjectId::new([1; 32]), []).unwrap();
+    let mut store = RepresentationStore::activate_volume(
+        &volume,
+        limits,
+        ObjectId::new([1; 32]),
+        [],
+        super::super::LocationIndexMemoryBudget::default(),
+    )
+    .unwrap();
     for offset in 1..=40 {
         advance(&mut store, offset);
     }
@@ -209,9 +264,13 @@ fn recovered_maps_retain_only_their_active_closures() {
     assert!(historical_nodes > 3);
     drop(store);
 
-    let mut recovered = RepresentationStore::open_volume(&volume, limits)
-        .unwrap()
-        .unwrap();
+    let mut recovered = RepresentationStore::open_volume(
+        &volume,
+        limits,
+        super::super::LocationIndexMemoryBudget::default(),
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(recovered.active, active);
     assert_eq!(recovered.reverse, reverse);
     for map in [
@@ -220,17 +279,28 @@ fn recovered_maps_retain_only_their_active_closures() {
         &recovered.placement_entries,
     ] {
         assert_eq!(map.entry_count(), 1);
-        assert_eq!(map.nodes().len(), 1, "retain only this root's active page");
+        assert_eq!(
+            super::super::node_view::node_count(map).unwrap(),
+            1,
+            "retain only this root's active page"
+        );
     }
     assert_eq!(recovered.persisted_map_nodes.len(), historical_nodes);
 
     advance(&mut recovered, 41);
     let active = recovered.active;
     drop(recovered);
-    let reopened = RepresentationStore::open_volume(&volume, limits)
-        .unwrap()
-        .unwrap();
+    let reopened = RepresentationStore::open_volume(
+        &volume,
+        limits,
+        super::super::LocationIndexMemoryBudget::default(),
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(reopened.active, active);
     assert_eq!(reopened.reverse, reverse);
-    assert_eq!(reopened.placement_entries.nodes().len(), 1);
+    assert_eq!(
+        super::super::node_view::node_count(&reopened.placement_entries).unwrap(),
+        1
+    );
 }

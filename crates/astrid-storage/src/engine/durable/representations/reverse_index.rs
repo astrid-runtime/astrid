@@ -106,9 +106,14 @@ mod persistence_tests {
         let path = directory.path().join("inline.volume");
         let volume: Arc<dyn AstridVolume> = HostedFileVolume::open(&path).unwrap();
         let limits = RecoveryLimits::process_addressable();
-        let mut store =
-            RepresentationStore::activate_volume(&volume, limits, ObjectId::new([1; 32]), [])
-                .unwrap();
+        let mut store = RepresentationStore::activate_volume(
+            &volume,
+            limits,
+            ObjectId::new([1; 32]),
+            [],
+            super::super::LocationIndexMemoryBudget::default(),
+        )
+        .unwrap();
         let objects = (0..128_u64)
             .map(|index| {
                 let mut bytes = [0; 32];
@@ -138,14 +143,18 @@ mod persistence_tests {
         std::fs::copy(&path, directory.path().join("reopened.volume")).unwrap();
         let reopened: Arc<dyn AstridVolume> =
             HostedFileVolume::open(directory.path().join("reopened.volume")).unwrap();
-        let recovered = RepresentationStore::open_volume(&reopened, limits)
-            .unwrap()
-            .unwrap();
+        let recovered = RepresentationStore::open_volume(
+            &reopened,
+            limits,
+            super::super::LocationIndexMemoryBudget::default(),
+        )
+        .unwrap()
+        .unwrap();
         assert_inline(&recovered, objects.len());
         assert_eq!(recovered.active, active);
         assert_eq!(recovered.reverse, expected);
         for object in &objects {
-            assert!(recovered.contains_direct(object.object));
+            assert!(recovered.contains_direct(object.object).unwrap());
         }
     }
 }

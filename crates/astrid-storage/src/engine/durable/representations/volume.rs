@@ -27,6 +27,7 @@ impl RepresentationStore {
     pub(in crate::engine::durable) fn open_volume(
         volume: &Arc<dyn AstridVolume>,
         limits: RecoveryLimits,
+        index_memory: super::LocationIndexMemoryBudget,
     ) -> Result<Option<Self>, DurableError> {
         if !region_exists(volume, CURRENT_REGION)? {
             return Ok(None);
@@ -49,10 +50,14 @@ impl RepresentationStore {
         let recovered = Self::from_recovered(
             metadata,
             journal,
-            current.journal_generation,
-            active,
-            state,
+            super::RecoveredPhysicalAuthority {
+                journal_generation: current.journal_generation,
+                active,
+                state,
+            },
             index,
+            limits,
+            index_memory,
         )?;
         Ok(Some(recovered))
     }
@@ -62,8 +67,9 @@ impl RepresentationStore {
         limits: RecoveryLimits,
         frozen_specification: ObjectId,
         objects: impl IntoIterator<Item = Result<super::DirectArenaObject, DurableError>>,
+        index_memory: super::LocationIndexMemoryBudget,
     ) -> Result<Self, DurableError> {
-        if let Some(existing) = Self::open_volume(volume, limits)? {
+        if let Some(existing) = Self::open_volume(volume, limits, index_memory)? {
             return Ok(existing);
         }
         remove_region_if_present(volume, CURRENT_TEMP_REGION)?;
@@ -148,9 +154,11 @@ impl RepresentationStore {
             .map_err(|source| io_error("flush volume representation namespace", source))?;
         drop(metadata);
         drop(journal);
-        Self::open_volume(volume, limits)?.ok_or(DurableError::InvalidRepresentationState(
-            "published volume representation state did not reopen",
-        ))
+        Self::open_volume(volume, limits, index_memory)?.ok_or(
+            DurableError::InvalidRepresentationState(
+                "published volume representation state did not reopen",
+            ),
+        )
     }
 }
 
