@@ -64,3 +64,6 @@ fn validate_astrid_home(raw_path: &str, home_dir: &Path) -> Option<PathBuf> {
 
     Some(canonical)
 }
+
+#[cfg(test)]
+mod tests;

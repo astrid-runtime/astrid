@@ -14,10 +14,14 @@ This crate has zero dependencies on other internal astrid crates. It depends onl
 From highest to lowest priority:
 
 1. **Workspace** (`{workspace}/.astrid/config.toml`) - untrusted input, restricted
-2. **User** (`~/.astrid/config.toml`)
+2. **User** (`~/.astrid/config.toml`, then `~/.astrid/etc/config.toml`; use `$ASTRID_HOME` when selected)
 3. **System** (`/etc/astrid/config.toml`)
 4. **Environment variables** (`ASTRID_*`) - fallback only, applied to fields no config file set
 5. **Embedded defaults** (`defaults.toml` compiled into the binary)
+
+Both user files merge at the same layer. The canonical `etc/config.toml` wins
+overlapping settings; root-only fields remain. A malformed present file fails
+loading rather than falling back to another file.
 
 ## Workspace restriction enforcement
 

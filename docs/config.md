@@ -4,9 +4,14 @@ Astrid uses a layered configuration system powered by TOML. Configuration is loa
 
 1. **Defaults** (Embedded in binary — safe production values)
 2. **System Config** (`/etc/astrid/config.toml`)
-3. **User Config** (`~/.astrid/config.toml` or `$ASTRID_HOME/config.toml`)
+3. **User Config** (under `~/.astrid` or `$ASTRID_HOME`: `config.toml`, then `etc/config.toml`)
 4. **Workspace Config** (`.astrid/config.toml` in the project root — can only **tighten** security, never loosen)
 5. **Environment Variables** (`ASTRID_*` — fill in unset fields only, do not override)
+
+Both user files remain supported. The canonical editor writes `etc/config.toml`;
+its settings override matching fields in the root `config.toml`, while unrelated
+legacy fields remain. A malformed file prevents loading; it is never skipped
+in favor of the other path.
 
 ## Connectors
 
