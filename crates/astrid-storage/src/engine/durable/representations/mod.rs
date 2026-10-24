@@ -50,6 +50,7 @@ use cold::memoized_closure_handles;
 use cold::{ColdNodes, ColdPhysicalMap};
 mod direct;
 mod direct_records;
+mod update;
 mod volume;
 use authority::{create_file as create_cap_file, open_file as open_cap_file, quarantine_entry};
 pub(super) use contiguous::open_store_root;
@@ -452,45 +453,12 @@ impl RepresentationStore {
         if entries.is_empty() {
             return Ok(None);
         }
-        self.representations.insert_entries(
-            &Blake3PhysicalIdentity,
-            entries
-                .iter()
-                .map(|entry| entry.representation.clone())
-                .collect(),
-        )?;
-        self.placement_entries.insert_entries(
-            &Blake3PhysicalIdentity,
-            entries
-                .iter()
-                .map(|entry| entry.placement.clone())
-                .collect(),
-        )?;
+        let mut appended_map_nodes = BTreeSet::new();
+        self.stage_direct_maps(&entries, &mut metadata, &mut appended_map_nodes)?;
         let reverse_additions = entries
             .into_iter()
             .map(|entry| (entry.object, entry.representation_id))
             .collect();
-        let mut appended_map_nodes = BTreeSet::new();
-        {
-            let (presence, mut complete) = memoized_closure_handles(&self.persisted_map_nodes);
-            append_new_reachable_map_nodes(
-                &mut metadata,
-                &self.representations,
-                &presence,
-                &mut appended_map_nodes,
-                &mut complete,
-            )?;
-        }
-        {
-            let (presence, mut complete) = memoized_closure_handles(&self.persisted_map_nodes);
-            append_new_reachable_map_nodes(
-                &mut metadata,
-                &self.placement_entries,
-                &presence,
-                &mut appended_map_nodes,
-                &mut complete,
-            )?;
-        }
         let (catalogue, placements, state) = self.next_authority()?;
         let state_id = state.identify(&Blake3PhysicalIdentity);
         metadata.push(MetadataFrame::catalogue(&Blake3PhysicalIdentity, catalogue));

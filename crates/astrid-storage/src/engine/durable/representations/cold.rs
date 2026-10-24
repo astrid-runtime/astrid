@@ -49,7 +49,7 @@ struct StagedNodes {
 /// Decoded node bodies are never retained and remain authenticated on each read.
 pub(super) struct ColdMemoNodes<'a> {
     cold: &'a ColdNodes,
-    memo: RefCell<AuthenticatedPageMemo>,
+    memo: Rc<RefCell<AuthenticatedPageMemo>>,
 }
 
 impl ColdNodes {
@@ -87,7 +87,7 @@ impl ColdNodes {
     pub(super) fn memoized_nodes(&self) -> ColdMemoNodes<'_> {
         ColdMemoNodes {
             cold: self,
-            memo: RefCell::new(AuthenticatedPageMemo::default()),
+            memo: Rc::new(RefCell::new(AuthenticatedPageMemo::default())),
         }
     }
 
@@ -283,14 +283,22 @@ pub(super) struct ColdMemoComplete<'a> {
 pub(super) fn memoized_closure_handles(
     cold: &ColdNodes,
 ) -> (ColdMemoPresence<'_>, ColdMemoComplete<'_>) {
-    let memo = Rc::new(RefCell::new(AuthenticatedPageMemo::default()));
-    (
-        ColdMemoPresence {
-            cold,
-            memo: Rc::clone(&memo),
-        },
-        ColdMemoComplete { cold, memo },
-    )
+    cold.memoized_nodes().closure_handles()
+}
+
+impl<'a> ColdMemoNodes<'a> {
+    pub(super) fn closure_handles(&self) -> (ColdMemoPresence<'a>, ColdMemoComplete<'a>) {
+        (
+            ColdMemoPresence {
+                cold: self.cold,
+                memo: Rc::clone(&self.memo),
+            },
+            ColdMemoComplete {
+                cold: self.cold,
+                memo: Rc::clone(&self.memo),
+            },
+        )
+    }
 }
 
 impl super::activation::NodePresence for ColdMemoPresence<'_> {
@@ -389,9 +397,14 @@ impl PhysicalMapNodes for ColdMemoNodes<'_> {
     }
 }
 
-impl PhysicalMapMutNodes for ColdNodes {
-    fn put(&mut self, id: PhysicalMapNodeId, node: PhysicalMapNode) -> Result<(), DurableError> {
-        let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, &node)?;
+impl ColdNodes {
+    fn put_memo(
+        &self,
+        id: PhysicalMapNodeId,
+        node: &PhysicalMapNode,
+        memo: &mut AuthenticatedPageMemo,
+    ) -> Result<(), DurableError> {
+        let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?;
         if frame.identity != *id.as_bytes() {
             return Err(DurableError::InvalidRepresentationState(
                 "physical node write identity mismatch",
@@ -400,8 +413,12 @@ impl PhysicalMapMutNodes for ColdNodes {
         let payload = frame.encode()?;
         let mut arena = self.0.lock();
         super::super::ensure_payload_limit(METADATA_FILE, 0, payload.len(), arena.limits)?;
-        if let Some(existing) = arena.node(id)? {
-            if existing != node {
+        let existing = arena.node_memo(id, memo);
+        if existing.is_err() {
+            arena.failed = true;
+        }
+        if let Some(existing) = existing? {
+            if existing != *node {
                 return Err(DurableError::InvalidRepresentationState(
                     "physical node identity collision",
                 ));
@@ -433,6 +450,18 @@ impl PhysicalMapMutNodes for ColdNodes {
             arena.failed = true;
         }
         result
+    }
+}
+
+impl PhysicalMapMutNodes for ColdNodes {
+    fn put(&mut self, id: PhysicalMapNodeId, node: PhysicalMapNode) -> Result<(), DurableError> {
+        self.put_memo(id, &node, &mut AuthenticatedPageMemo::default())
+    }
+}
+
+impl PhysicalMapMutNodes for ColdMemoNodes<'_> {
+    fn put(&mut self, id: PhysicalMapNodeId, node: PhysicalMapNode) -> Result<(), DurableError> {
+        self.cold.put_memo(id, &node, &mut self.memo.borrow_mut())
     }
 }
 
