@@ -3,7 +3,7 @@ use super::{
     ArenaLocation, DurableError, Link, LocationIndexMemoryBudget, MAGIC, ObjectId,
     RepresentationRecordId, ReverseIndex,
 };
-use crate::engine::durable::locations::{ClosureProof, RebuildLocations};
+use crate::engine::durable::locations::{PagedLocations, SortedLocationBuilder};
 use std::num::NonZeroUsize;
 mod run;
 use run::{Row, Run, Writer};
@@ -121,18 +121,16 @@ impl Rebuild {
                 .map_err(|source| super::io_error("clone reverse rebuild output", source))?,
             self.budget.buffered_output_bytes(),
         )?;
-        let mut heads = RebuildLocations::checked(self.budget.durable_entries(), |_, _, _| {
-            Err(DurableError::InvalidRepresentationState(
-                "duplicate grouped reverse head",
-            ))
-        });
+        // Grouped objects are already unique and sorted. The page builder
+        // checks that order directly without spilling and merging them again.
+        let mut heads = SortedLocationBuilder::new()?;
         let mut group: Option<(ObjectId, RepresentationRecordId, ArenaLocation)> = None;
         if let Some(run) = merged {
             let mut reader = run.reader();
             while let Some(row) = reader.next()? {
                 if group.is_some_and(|(object, _, _)| object != row.object) {
                     let (object, _, location) = group.take().expect("group present");
-                    heads.push(object, location, ClosureProof::Unknown)?;
+                    heads.push(object, location)?;
                 }
                 let (earliest, previous) = if let Some((_, earliest, location)) = group {
                     // Readback must authenticate the emitted media, including
@@ -159,10 +157,10 @@ impl Rebuild {
             }
         }
         if let Some((object, _, location)) = group {
-            heads.push(object, location, ClosureProof::Unknown)?;
+            heads.push(object, location)?;
         }
         links.finish()?;
-        index.heads = heads.finish()?.0;
+        index.heads = PagedLocations::from_sorted_builder(self.budget.durable_entries(), heads)?;
         Ok(index)
     }
 

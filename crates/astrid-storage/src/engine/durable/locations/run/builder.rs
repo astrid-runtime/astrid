@@ -7,7 +7,7 @@ use super::{
 
 use std::io::BufWriter;
 
-pub(in crate::engine::durable::locations) struct Builder {
+pub(in crate::engine::durable) struct Builder {
     file: BufWriter<File>,
     pub(super) leaf: Vec<(ObjectId, LocatorValue)>,
     pub(super) levels: Vec<Vec<Node>>,
@@ -16,11 +16,10 @@ pub(in crate::engine::durable::locations) struct Builder {
     previous: Option<ObjectId>,
 }
 
-#[cfg(test)]
 use super::ArenaLocation;
 
 impl Builder {
-    pub(in crate::engine::durable::locations) fn new() -> Result<Self, DurableError> {
+    pub(in crate::engine::durable) fn new() -> Result<Self, DurableError> {
         Ok(Self {
             file: BufWriter::with_capacity(
                 PAGE_BYTES.strict_mul(2),
@@ -36,8 +35,7 @@ impl Builder {
         })
     }
 
-    #[cfg(test)]
-    pub(in crate::engine::durable::locations) fn push(
+    pub(in crate::engine::durable) fn push(
         &mut self,
         id: ObjectId,
         location: ArenaLocation,

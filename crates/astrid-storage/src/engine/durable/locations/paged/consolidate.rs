@@ -57,6 +57,14 @@ impl PagedLocations {
                 .ok_or(DurableError::EncodingOverflow)?;
             builder.push_row(id, row)?;
         }
+        Ok((Self::from_sorted_builder(limit, builder)?, complete))
+    }
+
+    /// Publish one complete sorted output only after its buffered pages flush.
+    pub(in crate::engine::durable) fn from_sorted_builder(
+        limit: NonZeroUsize,
+        builder: Builder,
+    ) -> Result<Self, DurableError> {
         let mut locations = PagedLocations::new(limit);
         if let Some(run) = builder.finish()? {
             locations.count = run.count;
@@ -69,7 +77,7 @@ impl PagedLocations {
             locations.runs.resize_with(level.strict_add(1), || None);
             locations.runs[level] = Some(run);
         }
-        Ok((locations, complete))
+        Ok(locations)
     }
 }
 
