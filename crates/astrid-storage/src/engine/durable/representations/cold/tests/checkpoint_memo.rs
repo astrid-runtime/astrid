@@ -110,3 +110,46 @@ fn checkpoint_memo_rebinds_after_authenticated_run_damage() {
         "damaged locator cannot become absence or cached success"
     );
 }
+
+#[test]
+fn checkpoint_preparation_consolidates_historical_locators_and_keeps_fresh_body_checks() {
+    use super::super::super::activation::CompleteNodes;
+    let (file, map, nodes) = fixture();
+    let provider = nodes.memoized_nodes();
+    let root = map.root().unwrap();
+    provider.node(root).unwrap();
+    let mut historical = Vec::new();
+    for ordinal in 0_u16..63 {
+        let node = PhysicalMapNode::leaf(
+            PhysicalMapDomain::Representation,
+            PhysicalMapKey::new(*blake3::hash(&ordinal.to_be_bytes()).as_bytes()),
+            vec![9; 16],
+        );
+        let id = node.identify(&Blake3PhysicalIdentity).unwrap();
+        let payload = MetadataFrame::map_node(&Blake3PhysicalIdentity, &node)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let location =
+            append_frame(&mut file.try_clone().unwrap(), METADATA_MAGIC, &payload).unwrap();
+        nodes.promote(id, location).unwrap();
+        historical.push((id, node));
+    }
+    assert!(nodes.0.lock().locations.test_spilled_run_count() > 1);
+    let count = nodes.len();
+    nodes.prepare_checkpoint_walk().unwrap();
+    assert_eq!(nodes.0.lock().locations.test_spilled_run_count(), 1);
+    assert_eq!(nodes.len(), count);
+    for (id, node) in map.nodes() {
+        assert!(nodes.complete(id).unwrap());
+        assert_eq!(provider.node(*id).unwrap().unwrap().as_ref(), node);
+    }
+    for (id, node) in historical {
+        assert!(!nodes.complete(&id).unwrap());
+        assert_eq!(provider.node(id).unwrap().unwrap().as_ref(), &node);
+    }
+    file.set_len(0).unwrap();
+    assert!(provider.node(root).is_err());
+    assert!(nodes.failed());
+    assert!(nodes.prepare_checkpoint_walk().is_err());
+}

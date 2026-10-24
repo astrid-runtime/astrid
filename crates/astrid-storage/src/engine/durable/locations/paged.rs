@@ -460,6 +460,20 @@ impl PagedLocations {
     }
 
     #[cfg(test)]
+    pub(in crate::engine::durable) fn truncate_oldest_test_run(&self) {
+        self.runs
+            .iter()
+            .rev()
+            .flatten()
+            .next()
+            .expect("test requires a run")
+            .test_file()
+            .set_len(0)
+            .unwrap();
+        self.runs_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
     pub(in crate::engine::durable) fn truncate_test_run(&self) {
         self.truncate_test_run_without_epoch();
         // Anonymous run bytes are immutable in production. Test fault injection
@@ -724,6 +738,7 @@ impl Iterator for MergedEntries<'_> {
     }
 }
 
+mod consolidate;
 mod rebuild;
 pub(in crate::engine::durable) use rebuild::RebuildLocations;
 
