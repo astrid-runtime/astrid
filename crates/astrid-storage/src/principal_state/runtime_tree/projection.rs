@@ -1,6 +1,9 @@
 //! Restore regular files and explicit filesystem directory markers distinctly.
 
-use super::{Path, PathBuf, StorageResult, normalize_relative_path, tree_error};
+use super::{
+    Path, PathBuf, RUNTIME_KEY_PROJECTION, RuntimeTreeEntry, STAGING_JOURNAL_PROJECTION,
+    StorageResult, normalize_relative_path, tree_error,
+};
 
 pub(super) fn confined_projection_path(root: &Path, relative: &str) -> StorageResult<PathBuf> {
     let normalized = normalize_relative_path(relative);
@@ -62,6 +65,29 @@ pub(super) fn surviving_directory(root: &Path, name: &str) -> bool {
     confined_projection_path(root, relative)
         .and_then(|path| std::fs::symlink_metadata(path).map_err(|error| tree_error(root, error)))
         .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+}
+
+pub(super) fn is_bootstrap_surviving_projection(scanned: &[RuntimeTreeEntry]) -> bool {
+    !scanned.is_empty()
+        && scanned.iter().all(|entry| {
+            matches!(
+                entry.name().as_str(),
+                "etc/layout-version" | RUNTIME_KEY_PROJECTION | STAGING_JOURNAL_PROJECTION
+            )
+        })
+}
+
+/// Pack-open materializes the staging journal before retirement can run.
+///
+/// That one enumerated regular file is not a surviving projection and must not
+/// be admitted without an ACTIVE receipt. Directories, symlinks, siblings,
+/// alternate spellings, and the broader bootstrap set keep fail-closed;
+/// redirects still fail in preflight.
+pub(super) fn is_exactly_pack_open_staging_journal(scanned: &[RuntimeTreeEntry]) -> bool {
+    matches!(
+        scanned,
+        [entry] if entry.name().as_str() == STAGING_JOURNAL_PROJECTION
+    )
 }
 
 #[cfg(test)]

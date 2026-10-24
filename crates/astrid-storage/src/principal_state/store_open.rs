@@ -79,7 +79,7 @@ pub async fn open_runtime_principal_store_for_pack(
             PrincipalDirectory::default(),
             Arc::new(engine),
             receipt,
-            false,
+            ProjectionOpenMode::Pack,
             false,
         )
         .await?;
@@ -93,7 +93,7 @@ pub async fn open_runtime_principal_store_for_pack(
         PrincipalDirectory::default(),
         Arc::new(engine),
         receipt,
-        false,
+        ProjectionOpenMode::Pack,
         false,
     )
     .await?;
@@ -188,7 +188,7 @@ async fn open_runtime_principal_store_with_options(
             principals,
             Arc::new(engine),
             receipt,
-            true,
+            ProjectionOpenMode::Restore,
             false,
         )
         .await;
@@ -207,7 +207,7 @@ async fn open_runtime_principal_store_with_options(
             principals,
             Arc::new(engine),
             receipt,
-            true,
+            ProjectionOpenMode::Restore,
             true,
         )
         .await;
@@ -223,7 +223,7 @@ async fn open_runtime_principal_store_with_options(
             principals,
             Arc::new(engine),
             receipt,
-            true,
+            ProjectionOpenMode::Restore,
             true,
         )
         .await;
@@ -310,8 +310,49 @@ async fn open_migrated_directory_store(
         principals,
         Arc::new(engine),
         receipt,
+        ProjectionOpenMode::Restore,
         true,
-        true,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum ProjectionOpenMode {
+    Restore,
+    RestoreRetiring,
+    Pack,
+}
+
+/// Recover an interrupted retirement using only existing volume authority.
+///
+/// The caller must hold the boot singleton and must not consume surviving host
+/// configuration or identity before this returns. A missing, ACTIVE, relocated,
+/// corrupt or incomplete retirement receipt fails before projection writes.
+///
+/// # Errors
+/// Returns an error for unsafe host entries, missing media, failed recovery or
+/// a surviving host file absent from the authenticated same-root inventory.
+pub async fn open_runtime_principal_store_from_retiring_projection(
+    home: &AstridHome,
+    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
+    principals: PrincipalDirectory,
+) -> PrincipalStorageResult<RuntimePrincipalStore> {
+    home.validate_volume_recovery_candidate()
+        .map_err(|error| StorageError::Connection(error.to_string()))?;
+    let (engine, receipt) = volume_migration::open_existing(home, DurableEnginePolicy::default())?
+        .ok_or_else(|| {
+            StorageError::Connection(
+                "retirement recovery requires existing volume media".to_owned(),
+            )
+        })?;
+    assemble_volume_store(
+        home,
+        quota,
+        principals,
+        Arc::new(engine),
+        receipt,
+        ProjectionOpenMode::RestoreRetiring,
+        false,
     )
     .await
 }
@@ -322,7 +363,7 @@ async fn assemble_volume_store(
     principals: PrincipalDirectory,
     engine: Arc<RuntimeEngine>,
     directory_cutover_receipt: String,
-    restore_projection: bool,
+    projection: ProjectionOpenMode,
     allow_receiptless_bootstrap: bool,
 ) -> crate::principal_state::StorageResult<RuntimePrincipalStore> {
     assemble_runtime_store(
@@ -331,7 +372,7 @@ async fn assemble_volume_store(
         principals,
         engine,
         directory_cutover_receipt,
-        restore_projection,
+        projection,
         allow_receiptless_bootstrap,
     )
     .await
@@ -379,7 +420,7 @@ async fn assemble_runtime_store(
     principals: PrincipalDirectory,
     engine: Arc<RuntimeEngine>,
     directory_cutover_receipt: String,
-    restore_projection: bool,
+    projection: ProjectionOpenMode,
     allow_receiptless_bootstrap: bool,
 ) -> crate::principal_state::StorageResult<RuntimePrincipalStore> {
     let format_spec = bootstrap::format_specification()?;
@@ -456,12 +497,18 @@ async fn assemble_runtime_store(
         staging: Arc::clone(&staging),
         principals,
     };
-    if restore_projection {
-        crate::principal_state::runtime_tree::reconcile_running_projection(
-            home,
-            &store,
-            allow_receiptless_bootstrap,
-        )?;
+    match projection {
+        ProjectionOpenMode::RestoreRetiring => {
+            super::runtime_tree::retirement_recovery::restore(home, &store)?;
+        },
+        ProjectionOpenMode::Restore => {
+            crate::principal_state::runtime_tree::reconcile_running_projection(
+                home,
+                &store,
+                allow_receiptless_bootstrap,
+            )?;
+        },
+        ProjectionOpenMode::Pack => {},
     }
     let staging_area = NativeContentStagingArea::open(home.content_staging_path())?;
     staging.set(Arc::new(staging_area)).map_err(|_| {

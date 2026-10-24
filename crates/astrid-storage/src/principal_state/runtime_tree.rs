@@ -21,7 +21,13 @@ mod key_recovery;
 #[cfg(test)]
 mod key_recovery_tests;
 mod projection;
-use projection::{confined_projection_path, write_projection_file};
+pub(super) mod retirement_recovery;
+#[cfg(test)]
+mod retirement_recovery_tests;
+use projection::{
+    confined_projection_path, is_bootstrap_surviving_projection,
+    is_exactly_pack_open_staging_journal, write_projection_file,
+};
 
 const VOLUME_PATH_PREFIX: &str = "volume";
 const SOCKET_PATH: &str = "run/system.sock";
@@ -30,7 +36,6 @@ const MIGRATING_VOLUME: &str = "astrid.migrating";
 const LEGACY_VAR_VOLUME: &str = "var/astrid.volume";
 const DIRECTORY_STORE_PREFIX: &str = "var/principal-store";
 const QUARANTINE_PREFIX: &str = "quarantine/principal-store";
-const TRANSIENT_PREFIX: &str = "run";
 const RUNTIME_KEY_PROJECTION: &str = "keys/runtime.key";
 const STAGING_JOURNAL_PROJECTION: &str = "var/content-staging/intents.v1.log";
 const TRANSACTION_STAGING_PATHS: &[&str] = &[
@@ -231,8 +236,7 @@ pub(super) fn is_excluded(relative: &str) -> bool {
         || relative == ACTIVE_PROJECTION_NAME
         || relative == LEGACY_VAR_VOLUME
         || is_path_or_descendant(relative, VOLUME_PATH_PREFIX)
-        || (relative.starts_with(&format!("{TRANSIENT_PREFIX}/"))
-            && !is_path_or_descendant(relative, &format!("{TRANSIENT_PREFIX}/capsules")))
+        || astrid_core::dirs::is_transient_runtime_projection_path(relative)
         || is_path_or_descendant(relative, DIRECTORY_STORE_PREFIX)
         || HOST_EXECUTABLES.contains(&relative)
         || relative == SOCKET_PATH
@@ -254,6 +258,14 @@ pub(super) fn restore_projection(
     }
     ingest_runtime_key(home, store)?;
     seed_layout_version(home, store)?;
+    restore_published_projection(home, store, content)
+}
+
+fn restore_published_projection(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+    content: &super::NativePrincipalContentStore,
+) -> StorageResult<()> {
     let mut entries = content
         .list(&StateOwner::System)
         .map_err(|error| tree_error(home.root(), format!("list volume projection: {error}")))?;
@@ -842,6 +854,12 @@ pub(super) fn reconcile_running_projection(
         },
         Some(receipt) => match receipt.phase() {
             ReceiptPhase::Active => {
+                if !allow_receiptless_bootstrap && layout_version.is_none() && surviving {
+                    return Err(tree_error(
+                        home.root(),
+                        "sentinel-free ACTIVE projection cannot admit surviving host bytes",
+                    ));
+                }
                 let scanned = scan(home.root())?;
                 if surviving && !is_bootstrap_surviving_projection(&scanned) {
                     publish_active_projection(home, store)?;
@@ -882,29 +900,6 @@ fn validate_retiring_host_subset(
         }
     }
     Ok(())
-}
-
-fn is_bootstrap_surviving_projection(scanned: &[RuntimeTreeEntry]) -> bool {
-    !scanned.is_empty()
-        && scanned.iter().all(|entry| {
-            matches!(
-                entry.name().as_str(),
-                "etc/layout-version" | RUNTIME_KEY_PROJECTION | STAGING_JOURNAL_PROJECTION
-            )
-        })
-}
-
-/// Pack-open materializes the staging journal before retirement can run.
-///
-/// That one enumerated regular file is not a surviving projection and must not
-/// be admitted without an ACTIVE receipt. Directories, symlinks, siblings,
-/// alternate spellings, and the broader bootstrap set keep fail-closed;
-/// redirects still fail in preflight.
-fn is_exactly_pack_open_staging_journal(scanned: &[RuntimeTreeEntry]) -> bool {
-    matches!(
-        scanned,
-        [entry] if entry.name().as_str() == STAGING_JOURNAL_PROJECTION
-    )
 }
 
 /// Validate redirects and unadmitted specials before any destructive restore.

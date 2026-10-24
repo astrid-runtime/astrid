@@ -54,6 +54,8 @@ pub use dirs_layout::{
 #[path = "dirs_projection_retirement.rs"]
 mod projection_retirement;
 pub use projection_retirement::{retire_packed_projection_root, retire_projection_root};
+mod retirement_recovery;
+pub use retirement_recovery::is_transient_runtime_projection_path;
 #[path = "dirs_run_dir.rs"]
 mod run_dir;
 mod stopped_key;

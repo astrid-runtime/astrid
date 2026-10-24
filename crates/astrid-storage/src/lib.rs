@@ -127,6 +127,7 @@ pub use principal_state::{
     ReadyStagedContent, RuntimePrincipalStore, RuntimeTreeEntry, StagedContentId,
     StagedContentWriter, StateOwner, StateOwnerCodecV1, StateOwnerCodecV2, StateOwnerResolver,
     StateOwnerV1, open_runtime_kv, open_runtime_kv_with_directory, open_runtime_principal_store,
+    open_runtime_principal_store_from_retiring_projection,
     open_runtime_principal_store_with_directory, open_runtime_principal_store_with_object_cache,
     open_runtime_principal_store_with_policy,
 };
