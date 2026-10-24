@@ -229,3 +229,205 @@ fn batch_provider_failure_and_count_overflow_preserve_old_authority() {
         None
     );
 }
+
+#[test]
+fn sorted_query_batches_match_point_reads_and_authenticate_each_shared_path_once() {
+    for dense in [false, true] {
+        let entries = (0..2048).map(distributed).collect();
+        let oracle = if dense {
+            CanonicalPhysicalMap::build_dense(
+                &Blake3PhysicalIdentity,
+                PhysicalMapDomain::Representation,
+                entries,
+            )
+        } else {
+            CanonicalPhysicalMap::build(
+                &Blake3PhysicalIdentity,
+                PhysicalMapDomain::Representation,
+                entries,
+            )
+        }
+        .unwrap();
+        let backed = oracle.with_node_provider(CountedNodes {
+            inner: provider(&oracle),
+            original: oracle.nodes.keys().copied().collect(),
+            reads: RefCell::default(),
+            writes: 0,
+        });
+        let mut keys: Vec<_> = (0..4096).map(|n| distributed(n).0).collect();
+        keys.sort_unstable();
+        for key in &keys {
+            backed.try_get(&Blake3PhysicalIdentity, *key).unwrap();
+        }
+        let point_reads: usize = backed.nodes.reads.borrow().values().sum();
+        backed.nodes.reads.borrow_mut().clear();
+        let mut found = BTreeMap::new();
+        backed
+            .try_visit_sorted(&Blake3PhysicalIdentity, &keys, |key, value| {
+                assert!(found.insert(key, value.map(<[u8]>::to_vec)).is_none());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(found.len(), keys.len());
+        for key in &keys {
+            assert_eq!(found[key], oracle.get(*key).map(<[u8]>::to_vec));
+        }
+        let reads = backed.nodes.reads.borrow();
+        assert!(reads.values().all(|n| *n == 1));
+        assert!(reads.values().sum::<usize>() < point_reads);
+    }
+}
+
+#[test]
+fn sorted_query_batches_reject_bad_queries_and_fresh_provider_failures() {
+    for dense in [false, true] {
+        let oracle = maps(dense);
+        let mut backed = oracle.with_node_provider(provider(&oracle));
+        for keys in [vec![key(1), key(1)], vec![key(2), key(1)]] {
+            assert!(
+                backed
+                    .try_visit_sorted(&Blake3PhysicalIdentity, &keys, |_, _| panic!(
+                        "invalid query visited"
+                    ))
+                    .is_err()
+            );
+        }
+        let keys = [key(0), key(1), key(999)];
+        backed
+            .try_visit_sorted(&Blake3PhysicalIdentity, &keys, |_, _| Ok(()))
+            .unwrap();
+        backed.nodes.fail_read = true;
+        assert_eq!(
+            backed.try_visit_sorted(&Blake3PhysicalIdentity, &keys, |_, _| Ok(())),
+            Err(ProviderError::Io)
+        );
+        backed.nodes.fail_read = false;
+        assert_eq!(
+            backed.try_visit_sorted(&Blake3PhysicalIdentity, &keys, |_, _| Err(
+                ProviderError::Io
+            )),
+            Err(ProviderError::Io)
+        );
+        backed.nodes.nodes.remove(&oracle.root().unwrap());
+        assert!(
+            backed
+                .try_visit_sorted(&Blake3PhysicalIdentity, &keys, |_, _| Ok(()))
+                .is_err()
+        );
+    }
+}
+
+struct FencedNodes {
+    inner: OwnedNodes,
+    failed: core::cell::Cell<bool>,
+    reads: core::cell::Cell<usize>,
+}
+
+impl PhysicalMapNodes for FencedNodes {
+    type Error = ProviderError;
+
+    fn note_read_failure(&self) {
+        self.failed.set(true);
+    }
+
+    fn node(&self, id: PhysicalMapNodeId) -> Result<Option<Cow<'_, PhysicalMapNode>>, Self::Error> {
+        let reads = self.reads.get().strict_add(1);
+        self.reads.set(reads);
+        // Bound the negative control too: missing cycle protection must fail
+        // this test with Io, rather than hang the test process.
+        if reads > 8 {
+            return Err(ProviderError::Io);
+        }
+        self.inner.node(id)
+    }
+}
+
+#[test]
+fn sorted_query_fences_media_errors_but_not_query_or_visitor_errors() {
+    let oracle = maps(true);
+    let backed = oracle.with_node_provider(FencedNodes {
+        inner: provider(&oracle),
+        failed: core::cell::Cell::new(false),
+        reads: core::cell::Cell::new(0),
+    });
+    assert!(
+        backed
+            .try_visit_sorted(&Blake3PhysicalIdentity, &[key(1), key(0)], |_, _| Ok(()))
+            .is_err()
+    );
+    assert!(!backed.nodes.failed.get());
+    assert_eq!(
+        backed.try_visit_sorted(&Blake3PhysicalIdentity, &[key(0)], |_, _| Err(
+            ProviderError::Io
+        )),
+        Err(ProviderError::Io)
+    );
+    assert!(!backed.nodes.failed.get());
+    backed
+        .try_visit_sorted(&Blake3PhysicalIdentity, &[key(0)], |_, _| Ok(()))
+        .unwrap();
+    let mut backed = backed;
+    backed.nodes.inner.fail_read = true;
+    assert_eq!(
+        backed.try_visit_sorted(&Blake3PhysicalIdentity, &[key(0)], |_, _| Ok(())),
+        Err(ProviderError::Io)
+    );
+    assert!(backed.nodes.failed.get());
+}
+
+#[test]
+fn sorted_query_rejects_self_referential_legacy_and_radix_nodes() {
+    // A deliberately colliding identity permits constructing a cycle that a
+    // cryptographic identity normally prevents. Exercise traversal itself.
+    struct CollidingIdentity;
+    impl PhysicalIdentity for CollidingIdentity {
+        fn identify(&self, _: &'static str, _: &[u8]) -> [u8; 32] {
+            [1; 32]
+        }
+    }
+    let root = PhysicalMapNodeId::new([1; 32]);
+    let sibling = PhysicalMapNodeId::new([2; 32]);
+    for dense in [false, true] {
+        let domain = PhysicalMapDomain::Representation;
+        let node = if dense {
+            PhysicalMapNode::radix(domain, 0, Vec::new(), 3, vec![root, sibling], 1024).unwrap()
+        } else {
+            PhysicalMapNode::branch(domain, 0, Vec::new(), root, sibling, 2).unwrap()
+        };
+        let nodes = FencedNodes {
+            inner: OwnedNodes {
+                nodes: [(root, node)].into_iter().collect(),
+                fail_read: false,
+                writes_until_failure: None,
+            },
+            failed: core::cell::Cell::new(false),
+            reads: core::cell::Cell::new(0),
+        };
+        let map = BackedPhysicalMap::new(
+            domain,
+            if dense {
+                MapConstruction::DenseRadix
+            } else {
+                MapConstruction::LegacyBinary
+            },
+            Some(root),
+            1024,
+            nodes,
+        );
+        let error = map.try_visit_sorted(&CollidingIdentity, &[key(0)], |_, _| {
+            panic!("cycle returned membership")
+        });
+        assert_eq!(
+            error,
+            Err(ProviderError::Model(PhysicalModelError::InvalidMap(
+                if dense {
+                    "non-increasing radix branch depth"
+                } else {
+                    "non-increasing map branch depth"
+                }
+            )))
+        );
+        assert_eq!(map.nodes.reads.get(), 2);
+        assert!(map.nodes.failed.get());
+    }
+}

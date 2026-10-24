@@ -13,6 +13,8 @@ use super::{
     radix_common_prefix,
 };
 
+mod batch;
+
 #[derive(Debug)]
 pub(crate) struct BackedPhysicalMap<N> {
     domain: PhysicalMapDomain,
