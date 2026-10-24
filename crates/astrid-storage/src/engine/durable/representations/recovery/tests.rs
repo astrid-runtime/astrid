@@ -392,3 +392,60 @@ fn test_map_closure_complete(
     }
     map_closure_complete(root, &mut Provider { nodes, complete })
 }
+
+#[test]
+fn recovery_validates_unreferenced_placements_before_rebuilding_reverse_catalogue() {
+    use crate::storage_model::{ObjectId, Replica, ReplicaLocator};
+    let (profile, profile_id) =
+        super::super::activation::direct_profile(ObjectId::new([1; 32])).unwrap();
+    let profiles = CanonicalPhysicalMap::build_dense(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Profile,
+        vec![(PhysicalMapKey::from(profile_id), profile.encode().unwrap())],
+    )
+    .unwrap();
+    let representations = CanonicalPhysicalMap::build_dense(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Representation,
+        vec![],
+    )
+    .unwrap();
+    let blob = crate::storage_model::BlobId::new([2; 32]);
+    let replica = Replica::new(
+        super::super::LOCAL_STORAGE_NODE,
+        ReplicaLocator::ArenaFrame {
+            arena_generation: 0,
+            offset: 0,
+            payload_length: 8,
+            frame_checksum: [3; 32],
+        },
+    )
+    .unwrap();
+    let placement = PlacementEntry::new(blob, profile_id, 8, vec![replica]).unwrap();
+    let encoded = placement.encode().unwrap();
+    for (key, bytes, succeeds) in [
+        (PhysicalMapKey::from(blob), encoded.clone(), true),
+        (PhysicalMapKey::new([9; 32]), encoded, false),
+        (PhysicalMapKey::from(blob), vec![0], false),
+    ] {
+        let placements = CanonicalPhysicalMap::build_dense(
+            &Blake3PhysicalIdentity,
+            PhysicalMapDomain::Placement,
+            vec![(key, bytes)],
+        )
+        .unwrap();
+        let result = validate_representations(
+            &profiles,
+            &representations,
+            &placements,
+            super::super::LocationIndexMemoryBudget::default(),
+        );
+        if succeeds {
+            let (reverse, extents, _) = result.unwrap();
+            assert_eq!(extents, 1);
+            assert_eq!(reverse.len(), 0);
+        } else {
+            assert!(result.is_err(), "unused placement must still be validated");
+        }
+    }
+}

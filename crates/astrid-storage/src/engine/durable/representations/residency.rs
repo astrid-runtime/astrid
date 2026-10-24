@@ -62,10 +62,13 @@ impl RepresentationStore {
             .saturating_sub(self.residency.measured_history)
             > self.residency.total()
         {
+            // Scope page authentication to this immutable count, as in checkpoint
+            // traversal. Node bodies are still fetched and verified on each read.
+            let nodes = self.persisted_map_nodes.memoized_nodes();
             self.residency = MapResidency::new(
-                &self.profiles,
-                &self.representations,
-                &self.placement_entries,
+                &self.profiles.with_node_provider(&nodes),
+                &self.representations.with_node_provider(&nodes),
+                &self.placement_entries.with_node_provider(&nodes),
                 self.persisted_map_nodes.len(),
             )?;
         }

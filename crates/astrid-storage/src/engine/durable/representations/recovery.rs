@@ -482,7 +482,6 @@ pub(super) fn validate_representations(
     placements: &CanonicalPhysicalMap,
     index_memory: super::LocationIndexMemoryBudget,
 ) -> Result<(ReverseIndex, u64, super::recovered_direct::RecoveredDirect), DurableError> {
-    let mut placement_by_blob = BTreeMap::new();
     let mut extent_count = 0_u64;
     for entry in active_entries(placements) {
         let (key, bytes) = entry?;
@@ -509,7 +508,6 @@ pub(super) fn validate_representations(
                     .map_err(|_| DurableError::EncodingOverflow)?,
             )
             .ok_or(DurableError::EncodingOverflow)?;
-        placement_by_blob.insert(entry.blob(), entry);
     }
     let mut reverse = ReverseIndex::new(index_memory)?;
     let mut reverse_pages = super::super::locations::AuthenticatedPageMemo::default();
@@ -543,12 +541,14 @@ pub(super) fn validate_representations(
             ) => (*object, *blob, *canonical_record_bytes),
             _ => continue,
         };
-        let placement =
-            placement_by_blob
-                .get(&blob)
-                .ok_or(DurableError::InvalidRepresentationState(
-                    "direct representation placement is missing",
-                ))?;
+        // The immutable canonical placement map already owns these values.
+        // Authenticate the lookup rather than retaining a second decoded catalogue.
+        let placement_bytes = placements
+            .try_get(&Blake3PhysicalIdentity, PhysicalMapKey::from(blob))?
+            .ok_or(DurableError::InvalidRepresentationState(
+                "direct representation placement is missing",
+            ))?;
+        let placement = PlacementEntry::decode(&placement_bytes)?;
         if placement.profile() != record.profile() || placement.encoded_length() != canonical_length
         {
             return Err(DurableError::InvalidRepresentationState(
@@ -556,7 +556,7 @@ pub(super) fn validate_representations(
             ));
         }
         if reverse.insert_first_memo(object, id, &mut reverse_pages)? {
-            recovered_direct.push(object, placement)?;
+            recovered_direct.push(object, &placement)?;
         }
     }
     Ok((reverse, extent_count, recovered_direct.finish()?))
