@@ -3,7 +3,7 @@
 //! Implements the `Config::load()` algorithm:
 //! 1. Parse `defaults.toml` → base
 //! 2. Merge `/etc/astrid/config.toml` (system)
-//! 3. Merge `$ASTRID_HOME/config.toml` or `~/.astrid/config.toml` (user)
+//! 3. Merge legacy root `config.toml`, then canonical `etc/config.toml` (user)
 //! 4. Merge the selected workspace config + restriction enforcement
 //! 5. Apply env var fallbacks for unset fields
 //! 6. Deserialize merged tree → `Config`
@@ -25,6 +25,9 @@ use crate::merge::{ConfigLayer, FieldSources, deep_merge_tracking, enforce_restr
 use crate::show::ResolvedConfig;
 use crate::types::Config;
 use crate::validate;
+
+mod user;
+use user::{discover_user_config, load_home_configs};
 
 /// Embedded default configuration.
 const DEFAULTS_TOML: &str = include_str!("defaults.toml");
@@ -101,14 +104,13 @@ pub fn load_with_layout(
 
     // 3. User config.
     let user_config = if let Some(h) = astrid_home_override {
-        // When overridden, treat the path as the .astrid directory itself.
-        let path = h.join("config.toml");
-        try_load_file(&path)?.map(|overlay| (overlay, path))
+        // An explicit home is a runtime root, not the user's parent directory.
+        load_home_configs(h)?
     } else {
         discover_user_config(&home_dir, env_vars.get("ASTRID_HOME").map(String::as_str))?
     };
 
-    if let Some((overlay, path)) = user_config {
+    for (overlay, path) in user_config {
         reject_legacy_model_section(&overlay, &path.display().to_string())?;
         deep_merge_tracking(
             &mut merged,
@@ -290,56 +292,6 @@ fn try_load_file(path: &Path) -> ConfigResult<Option<toml::Value>> {
     })?;
 
     Ok(Some(value))
-}
-
-fn discover_user_config(
-    home_dir: &Path,
-    astrid_home: Option<&str>,
-) -> ConfigResult<Option<(toml::Value, PathBuf)>> {
-    if let Some(astrid_home) = astrid_home {
-        let validated = validate_astrid_home(astrid_home, home_dir);
-        if let Some(canonical) = validated {
-            let path = canonical.join("config.toml");
-            if let Some(overlay) = try_load_file(&path)? {
-                return Ok(Some((overlay, path)));
-            }
-        } else {
-            tracing::warn!(
-                path = astrid_home,
-                "ASTRID_HOME is not a valid directory owned by current user; ignoring"
-            );
-        }
-    }
-
-    let user_path = home_dir.join(".astrid").join("config.toml");
-    try_load_file(&user_path).map(|overlay| overlay.map(|overlay| (overlay, user_path)))
-}
-
-/// Validate that an `ASTRID_HOME` path is a real directory owned by the
-/// same user who owns `home_dir`. Returns the canonicalized path on success.
-fn validate_astrid_home(raw_path: &str, home_dir: &Path) -> Option<PathBuf> {
-    let canonical = PathBuf::from(raw_path).canonicalize().ok()?;
-
-    if !canonical.is_dir() {
-        return None;
-    }
-
-    // On Unix, verify the directory is owned by the same user who owns
-    // the home directory (which we already trust).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let dir_uid = canonical.metadata().ok()?.uid();
-        let home_uid = home_dir.metadata().ok()?.uid();
-        if dir_uid != home_uid {
-            return None;
-        }
-    }
-
-    #[cfg(not(unix))]
-    let _ = home_dir;
-
-    Some(canonical)
 }
 
 /// Reject host-owned model configuration before any credential can be merged.
@@ -565,6 +517,7 @@ mod tests {
         let (_overlay, path) =
             discover_user_config(home.path(), Some(astrid_home.path().to_str().unwrap()))
                 .unwrap()
+                .pop()
                 .expect("ASTRID_HOME config should be discovered");
 
         assert_eq!(
@@ -696,3 +649,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod home_tests;
