@@ -119,6 +119,14 @@ impl LocationIndexMemoryBudget {
         self.0
     }
 
+    /// Bound private sequential output by a staging quarter and the existing
+    /// two-page locator writer workspace. Tiny budgets write frames directly.
+    pub(in crate::engine::durable) fn buffered_output_bytes(self) -> usize {
+        let bytes =
+            usize::try_from(self.0.get()).expect("validated budget fits addressable memory");
+        (bytes / 4).min(run::buffered_output_bytes())
+    }
+
     pub(super) fn durable_entries(self) -> std::num::NonZeroUsize {
         // Four live tables: logical, physical, private mutation, reverse heads.
         // A one-entry table spills directly without allocating a resident slot,

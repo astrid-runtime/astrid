@@ -21,6 +21,10 @@ pub(super) use reader::Entries;
 // Private page layout for anonymous accelerators, not a persistent protocol or
 // an admission ceiling. Fixed pages bound each read/build workspace.
 const PAGE_BYTES: usize = 4096;
+
+pub(super) const fn buffered_output_bytes() -> usize {
+    PAGE_BYTES.strict_mul(2)
+}
 const HEADER_BYTES: usize = 8;
 const ENTRY_BYTES: usize = 88;
 const CHILD_BYTES: usize = 72;

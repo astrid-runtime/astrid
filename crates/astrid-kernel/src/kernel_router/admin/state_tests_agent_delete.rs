@@ -67,6 +67,93 @@ async fn create(kernel: &Arc<Kernel>, principal: &PrincipalId) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn agent_delete_reclaims_interrupted_provisioning_without_a_profile() {
+    for phase in ["key-only", "unlinked-identity", "linked-identity"] {
+        let (_dir, kernel) = fixture().await;
+        let principal = PrincipalId::new(format!("interrupted-{phase}")).unwrap();
+        let operator_uid = kernel
+            .principal_directory
+            .uid_for(&PrincipalId::default())
+            .unwrap();
+        let key_path = kernel
+            .astrid_home
+            .keys_dir()
+            .join(format!("{principal}.key"));
+        std::fs::create_dir_all(key_path.parent().unwrap()).unwrap();
+        let key = astrid_crypto::load_or_generate_keypair(&key_path).unwrap();
+        let old_uid = if phase == "key-only" {
+            None
+        } else {
+            let user = kernel
+                .identity_store
+                .create_principal(principal.clone(), *key.public_key_bytes())
+                .await
+                .unwrap();
+            if phase == "linked-identity" {
+                kernel
+                    .identity_store
+                    .link("cli", principal.as_str(), user.id, "system")
+                    .await
+                    .unwrap();
+            }
+            Some(
+                kernel
+                    .identity_store
+                    .get_principal_identity(user.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .uid,
+            )
+        };
+        assert!(!PrincipalProfile::path_for(&kernel.astrid_home, &principal).exists());
+        let response = super::test_support::dispatch_as_operator(
+            &kernel,
+            &PrincipalId::default(),
+            AdminRequestKind::AgentDelete {
+                principal: principal.clone(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(response, AdminResponseBody::Success(_)),
+            "{phase}: {response:?}"
+        );
+        assert!(!key_path.exists());
+        assert!(
+            kernel
+                .identity_store
+                .resolve("cli", principal.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !kernel
+                .identity_store
+                .list_users()
+                .await
+                .unwrap()
+                .iter()
+                .any(|user| user.principal == principal)
+        );
+        if let Some(uid) = old_uid {
+            assert!(kernel.principal_directory.alias_for(uid).is_err());
+        }
+        create(&kernel, &principal).await;
+        let replacement = kernel.principal_directory.uid_for(&principal).unwrap();
+        assert!(old_uid.is_none_or(|uid| uid != replacement));
+        assert_eq!(
+            kernel
+                .principal_directory
+                .uid_for(&PrincipalId::default())
+                .unwrap(),
+            operator_uid
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn agent_delete_reclaims_home_key_and_secrets_and_reports_them() {
     let (_dir, kernel) = fixture().await;
     assert!(

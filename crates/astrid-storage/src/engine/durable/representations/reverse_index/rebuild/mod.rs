@@ -1,12 +1,14 @@
 //! Bounded recovery sort followed by grouped immutable reverse-link emission.
 use super::{
     ArenaLocation, DurableError, Link, LocationIndexMemoryBudget, MAGIC, ObjectId,
-    RepresentationRecordId, ReverseIndex, append_frame,
+    RepresentationRecordId, ReverseIndex,
 };
 use crate::engine::durable::locations::{ClosureProof, RebuildLocations};
 use std::num::NonZeroUsize;
 mod run;
 use run::{Row, Run, Writer};
+mod links;
+use links::BufferedLinks;
 
 pub(in super::super) struct Rebuild {
     rows: Vec<Row>,
@@ -112,6 +114,13 @@ impl Rebuild {
         // vector before constructing the final paged head table.
         drop(self.rows);
         let mut index = ReverseIndex::new(self.budget)?;
+        let mut links = BufferedLinks::new(
+            index
+                .file
+                .try_clone()
+                .map_err(|source| super::io_error("clone reverse rebuild output", source))?,
+            self.budget.buffered_output_bytes(),
+        )?;
         let mut heads = RebuildLocations::checked(self.budget.durable_entries(), |_, _, _| {
             Err(DurableError::InvalidRepresentationState(
                 "duplicate grouped reverse head",
@@ -126,6 +135,9 @@ impl Rebuild {
                     heads.push(object, location, ClosureProof::Unknown)?;
                 }
                 let (earliest, previous) = if let Some((_, earliest, location)) = group {
+                    // Readback must authenticate the emitted media, including
+                    // links still pending in the private output buffer.
+                    links.flush()?;
                     let prior = index.link(row.object, location)?;
                     if prior.first != earliest {
                         return Err(DurableError::InvalidRepresentationState(
@@ -142,13 +154,14 @@ impl Rebuild {
                     first: earliest,
                     previous,
                 };
-                let location = append_frame(&mut index.file, MAGIC, &link.encode(row.object))?;
+                let location = links.append(&link.encode(row.object))?;
                 group = Some((row.object, earliest, location));
             }
         }
         if let Some((object, _, location)) = group {
             heads.push(object, location, ClosureProof::Unknown)?;
         }
+        links.finish()?;
         index.heads = heads.finish()?.0;
         Ok(index)
     }
