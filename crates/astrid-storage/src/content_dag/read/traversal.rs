@@ -15,6 +15,11 @@ use super::{
     VerifiedEdge,
 };
 
+mod output;
+use output::RangeOutput;
+#[cfg(test)]
+pub(crate) use output::measurement;
+
 #[derive(Clone, Copy)]
 pub(super) enum BoundaryMode<'a> {
     Skip,
@@ -85,6 +90,45 @@ pub(super) fn read_decoded_range<S: ContentSource>(
     length: u64,
     boundary_mode: BoundaryMode<'_>,
 ) -> Result<(Vec<u8>, ContentVerificationDelta), ContentReadError<S::Error>> {
+    let mut bytes = Vec::new();
+    let delta = traverse_decoded_range(
+        source,
+        file,
+        decoded,
+        offset,
+        length,
+        boundary_mode,
+        &mut RangeOutput::Buffer(&mut bytes),
+    )?;
+    Ok((bytes, delta))
+}
+
+pub(super) fn validate_decoded_content<S: ContentSource>(
+    source: &S,
+    file: ObjectId,
+    decoded: (ChunkingProfile, u64, u64, Option<ObjectId>),
+) -> Result<(), ContentReadError<S::Error>> {
+    traverse_decoded_range(
+        source,
+        file,
+        decoded,
+        0,
+        decoded.1,
+        BoundaryMode::Validate,
+        &mut RangeOutput::Count(0),
+    )
+    .map(|_| ())
+}
+
+fn traverse_decoded_range<S: ContentSource>(
+    source: &S,
+    file: ObjectId,
+    decoded: (ChunkingProfile, u64, u64, Option<ObjectId>),
+    offset: u64,
+    length: u64,
+    boundary_mode: BoundaryMode<'_>,
+    output: &mut RangeOutput<'_>,
+) -> Result<ContentVerificationDelta, ContentReadError<S::Error>> {
     let (profile, logical_bytes, chunk_count, content) = decoded;
     let end = offset
         .checked_add(length)
@@ -102,12 +146,9 @@ pub(super) fn read_decoded_range<S: ContentSource>(
         .into());
     }
     let capacity = usize::try_from(length).map_err(|_| ContentError::LengthOverflow)?;
-    let mut output = Vec::new();
-    output
-        .try_reserve_exact(capacity)
-        .map_err(|_| ContentError::LengthOverflow)?;
+    output.prepare(capacity)?;
     if length == 0 {
-        return Ok((output, ContentVerificationDelta::default()));
+        return Ok(ContentVerificationDelta::default());
     }
     let content = content.ok_or(ContentError::InvalidObject {
         object: file,
@@ -128,7 +169,7 @@ pub(super) fn read_decoded_range<S: ContentSource>(
     let record = load(source, content)?;
     let mut traversal = RangeTraversal {
         range: RequestedRange { start: offset, end },
-        output: &mut output,
+        output,
         boundaries: &mut boundaries,
     };
     append_loaded_range(
@@ -152,12 +193,9 @@ pub(super) fn read_decoded_range<S: ContentSource>(
         }
         .into());
     }
-    Ok((
-        output,
-        boundaries
-            .map(BoundaryWindow::into_delta)
-            .unwrap_or_default(),
-    ))
+    Ok(boundaries
+        .map(BoundaryWindow::into_delta)
+        .unwrap_or_default())
 }
 
 #[derive(Clone, Copy)]
@@ -190,9 +228,9 @@ struct TraversalNode {
     path: Vec<TreeStep>,
 }
 
-struct RangeTraversal<'output, 'verification> {
+struct RangeTraversal<'output, 'verification, 'buffer> {
     range: RequestedRange,
-    output: &'output mut Vec<u8>,
+    output: &'output mut RangeOutput<'buffer>,
     boundaries: &'output mut Option<BoundaryWindow<'verification>>,
 }
 
@@ -420,7 +458,7 @@ fn validate_boundary(
 fn append_loaded_range<S: ContentSource>(
     source: &S,
     node: TraversalNode,
-    traversal: &mut RangeTraversal<'_, '_>,
+    traversal: &mut RangeTraversal<'_, '_, '_>,
 ) -> Result<(), ContentReadError<S::Error>> {
     match node.record.kind() {
         ObjectKind::Chunk => append_chunk_range(node, traversal),
@@ -435,7 +473,7 @@ fn append_loaded_range<S: ContentSource>(
 
 fn append_chunk_range<E>(
     node: TraversalNode,
-    traversal: &mut RangeTraversal<'_, '_>,
+    traversal: &mut RangeTraversal<'_, '_, '_>,
 ) -> Result<(), ContentReadError<E>> {
     let TraversalNode {
         object,
@@ -480,14 +518,14 @@ fn append_chunk_range<E>(
             object,
             detail: "chunk range exceeds payload",
         })?;
-    traversal.output.extend_from_slice(bytes);
+    traversal.output.append(bytes)?;
     Ok(())
 }
 
 fn append_tree_range<S: ContentSource>(
     source: &S,
     node: TraversalNode,
-    traversal: &mut RangeTraversal<'_, '_>,
+    traversal: &mut RangeTraversal<'_, '_, '_>,
 ) -> Result<(), ContentReadError<S::Error>> {
     let TraversalNode {
         object,

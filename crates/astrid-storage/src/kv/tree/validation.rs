@@ -117,7 +117,7 @@ where
         match &handle.node {
             Node::Leaf(leaf) => {
                 for entry in &leaf.entries {
-                    self.value_bytes(&entry.value)?;
+                    self.validate_value(&entry.value)?;
                 }
                 Ok(ValidatedNode {
                     minimum_key: leaf

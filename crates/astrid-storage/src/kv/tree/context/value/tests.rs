@@ -58,19 +58,22 @@ fn chunked_value_rejects_malformed_wrapper_and_descriptor() {
     let variants = malformed_wrappers(&record, length);
     for (bad, declared) in variants {
         let id = context.insert(bad).unwrap();
-        assert!(
-            context
-                .value_bytes(&ValueSlot::Spilled {
-                    object: id,
-                    length: declared
-                })
-                .is_err()
-        );
+        let value = ValueSlot::Spilled {
+            object: id,
+            length: declared,
+        };
+        let read = context.value_bytes(&value).unwrap_err().to_string();
+        let (validation, output) =
+            crate::content_dag::output_measurement::measure(|| context.validate_value(&value));
+        assert_eq!(validation.unwrap_err().to_string(), read);
+        assert_eq!(output.reserved, 0);
+        assert_eq!(output.written, 0, "wrapper errors precede traversal");
     }
     context.records.remove(&record.references()[0].target());
-    assert!(
-        context.value_bytes(&value).is_err(),
-        "missing file must fail closed"
+    assert_eq!(
+        context.validate_value(&value).unwrap_err().to_string(),
+        context.value_bytes(&value).unwrap_err().to_string(),
+        "missing file must fail closed with the same error"
     );
 }
 
@@ -193,10 +196,22 @@ fn chunked_value_verifies_content_boundaries() {
             .unwrap(),
         )
         .unwrap();
-    assert!(
-        context
-            .value_bytes(&ValueSlot::Spilled { object, length })
-            .is_err()
+    let value = ValueSlot::Spilled { object, length };
+    let error = context.value_bytes(&value).unwrap_err().to_string();
+    assert_eq!(
+        context.validate_value(&value).unwrap_err().to_string(),
+        error
+    );
+    let root = context
+        .make_leaf_page(&[crate::kv::tree::node::LeafEntry {
+            key: b"alice:capsule:ownership\0graph".to_vec(),
+            value,
+        }])
+        .unwrap()
+        .object;
+    assert_eq!(
+        context.validate_tree(Some(root)).unwrap_err().to_string(),
+        error
     );
 }
 
@@ -314,6 +329,155 @@ fn spilled_value_encoding_thresholds_are_pinned() {
             },
         };
         assert_eq!(actual, version, "encoding for {length} visible bytes");
+        context.validate_value(&value).unwrap();
         assert_eq!(context.value_bytes(&value).unwrap(), bytes);
+        let root = context
+            .build_sorted(vec![(b"alice:capsule:ownership\0graph".to_vec(), bytes)])
+            .unwrap();
+        assert_eq!(context.validate_tree(root).unwrap().entries, 1);
     }
+}
+
+#[test]
+fn tree_validation_does_not_reserve_discarded_value_output() {
+    let engine = InMemoryEngine::new(TestIdentity);
+    let principal = "alice".to_owned();
+    let mut context = TreeContext::new(&engine, &principal);
+    let bytes = bytes();
+    let key = b"alice:capsule:ownership\0graph".to_vec();
+    let root = context
+        .build_sorted(vec![(key.clone(), bytes.clone())])
+        .unwrap();
+    let (result, output) =
+        crate::content_dag::output_measurement::measure(|| context.validate_tree(root));
+    assert_eq!(result.unwrap().entries, 1);
+    assert_eq!(output.written, bytes.len());
+    assert_eq!(
+        output.reserved, 0,
+        "validation must not reconstruct and discard a whole value"
+    );
+    let (read, output) =
+        crate::content_dag::output_measurement::measure(|| context.get(root, &key));
+    assert_eq!(read.unwrap(), Some(bytes.clone()));
+    assert_eq!(output.reserved, bytes.len());
+    assert_eq!(output.written, bytes.len());
+}
+
+#[test]
+fn opaque_validation_preserves_the_materializing_decoder_predicate() {
+    let engine = InMemoryEngine::new(TestIdentity);
+    let principal = "alice".to_owned();
+    let mut context = TreeContext::new(&engine, &principal);
+    let record = value_record(vec![42; 2048]).unwrap();
+    let valid = context.insert(record.clone()).unwrap();
+    context
+        .validate_value(&ValueSlot::Spilled {
+            object: valid,
+            length: 2048,
+        })
+        .unwrap();
+    for (kind, version, class, logical, refs, length) in [
+        (ObjectKind::File, 4, ObjectClass::Data, 0, vec![], 2048),
+        (ObjectKind::KvLeaf, 3, ObjectClass::Data, 0, vec![], 2048),
+        (
+            ObjectKind::KvLeaf,
+            4,
+            ObjectClass::Metadata,
+            0,
+            vec![],
+            2048,
+        ),
+        (ObjectKind::KvLeaf, 4, ObjectClass::Data, 1, vec![], 2048),
+        (
+            ObjectKind::KvLeaf,
+            4,
+            ObjectClass::Data,
+            0,
+            vec![ObjectReference::owns(
+                ReferenceLabel::new(b"unexpected".to_vec()),
+                valid,
+            )],
+            2048,
+        ),
+        (ObjectKind::KvLeaf, 4, ObjectClass::Data, 0, vec![], 2049),
+        (ObjectKind::KvLeaf, 4, ObjectClass::Data, 0, vec![], 1024),
+    ] {
+        let object = context
+            .insert(
+                ObjectRecord::new(
+                    kind,
+                    ObjectFormatVersion::new(version).unwrap(),
+                    if length == 1024 {
+                        vec![42; 1024]
+                    } else {
+                        record.canonical_bytes().to_vec()
+                    },
+                    refs,
+                    logical,
+                    class,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let value = ValueSlot::Spilled { object, length };
+        assert_eq!(
+            context.validate_value(&value).unwrap_err().to_string(),
+            context.value_bytes(&value).unwrap_err().to_string()
+        );
+    }
+}
+
+#[test]
+fn chunked_validation_rejects_descriptor_profile_before_reading_content() {
+    let engine = InMemoryEngine::new(TestIdentity);
+    let principal = "alice".to_owned();
+    let mut context = TreeContext::new(&engine, &principal);
+    let ValueSlot::Spilled { object, length } = context.make_value(bytes()).unwrap() else {
+        panic!("large value must spill");
+    };
+    let wrapper = context.record(object).unwrap();
+    let file = context.record(wrapper.references()[0].target()).unwrap();
+    let profile = ChunkingProfile::fastcdc_v2020(16 * 1024, 64 * 1024, 256 * 1024, 1).unwrap();
+    let (_, _, chunks) = crate::content_dag::decode_file_header(
+        wrapper.references()[0].target(),
+        file.canonical_bytes(),
+    )
+    .unwrap();
+    let wrong_file = context
+        .insert(
+            ObjectRecord::new(
+                file.kind(),
+                file.format_version(),
+                crate::content_dag::encode_file_header(profile, length, chunks),
+                file.references().to_vec(),
+                file.logical_bytes(),
+                file.class(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let object = context
+        .insert(
+            ObjectRecord::new(
+                wrapper.kind(),
+                wrapper.format_version(),
+                wrapper.canonical_bytes().to_vec(),
+                vec![ObjectReference::owns(
+                    ReferenceLabel::new(CONTENT_LABEL.to_vec()),
+                    wrong_file,
+                )],
+                wrapper.logical_bytes(),
+                wrapper.class(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let value = ValueSlot::Spilled { object, length };
+    let (result, output) =
+        crate::content_dag::output_measurement::measure(|| context.validate_value(&value));
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("descriptor disagrees with wrapper"));
+    assert_eq!(error, context.value_bytes(&value).unwrap_err().to_string());
+    assert_eq!(output.written, 0);
+    assert_eq!(output.reserved, 0);
 }

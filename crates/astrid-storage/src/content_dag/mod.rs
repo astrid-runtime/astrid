@@ -32,6 +32,9 @@ mod stream_tests;
 mod tests;
 
 pub use build::{BuiltContent, build_content};
+#[cfg(test)]
+pub(crate) use read::traversal::measurement as output_measurement;
+pub(crate) use read::validate_opened_content;
 pub use read::{
     ContentReadError, ContentSource, ContentVerificationDelta, ContentVerificationState,
     describe_content, open_content, read_content, read_content_range, read_opened_content,
