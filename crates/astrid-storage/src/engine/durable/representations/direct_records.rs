@@ -7,6 +7,8 @@ use super::{
 };
 use crate::storage_model::BackedPhysicalMap;
 
+mod batch;
+
 pub(in crate::engine::durable) struct DirectRecords<'a> {
     store: &'a RepresentationStore,
     reverse_pages: AuthenticatedPageMemo,
@@ -26,6 +28,26 @@ impl RepresentationStore {
 }
 
 impl DirectRecords<'_> {
+    fn validate(
+        &self,
+        object: ObjectId,
+        bytes: Option<&[u8]>,
+    ) -> Result<RepresentationRecord, DurableError> {
+        let bytes = bytes.ok_or(DurableError::InvalidRepresentationState(
+            "reverse index references a missing representation",
+        ))?;
+        let record = RepresentationRecord::decode(bytes)?;
+        if record.profile() != self.store.direct_profile
+            || !matches!(record.coverage(), Coverage::Exact { object: covered, .. } if *covered == object)
+            || !matches!(record.recipe(), Recipe::DirectCanonical { .. })
+        {
+            return Err(DurableError::InvalidRepresentationState(
+                "direct profile has incompatible coverage or recipe",
+            ));
+        }
+        Ok(record)
+    }
+
     pub(in crate::engine::durable) fn record(
         &mut self,
         object: ObjectId,
@@ -46,20 +68,8 @@ impl DirectRecords<'_> {
         // never substitutes for freshly authenticated link and record bodies.
         let bytes = self
             .representations
-            .try_get(&Blake3PhysicalIdentity, PhysicalMapKey::from(id))?
-            .ok_or(DurableError::InvalidRepresentationState(
-                "reverse index references a missing representation",
-            ))?;
-        let record = RepresentationRecord::decode(&bytes)?;
-        if record.profile() != self.store.direct_profile
-            || !matches!(record.coverage(), Coverage::Exact { object: covered, .. } if *covered == object)
-            || !matches!(record.recipe(), Recipe::DirectCanonical { .. })
-        {
-            return Err(DurableError::InvalidRepresentationState(
-                "direct profile has incompatible coverage or recipe",
-            ));
-        }
-        Ok(Some(record))
+            .try_get(&Blake3PhysicalIdentity, PhysicalMapKey::from(id))?;
+        self.validate(object, bytes.as_deref()).map(Some)
     }
 }
 
