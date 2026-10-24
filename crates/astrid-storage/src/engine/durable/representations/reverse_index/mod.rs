@@ -10,6 +10,9 @@ use super::super::{ArenaLocation, DurableError, File, append_frame, io_error};
 use crate::storage_model::{ObjectId, RepresentationRecordId};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod rebuild;
+pub(super) use rebuild::Rebuild as ReverseRebuild;
+
 mod chain;
 use chain::{Link, MAGIC};
 
@@ -48,7 +51,7 @@ impl ReverseIndex {
         self.insert_first_memo(object, id, &mut AuthenticatedPageMemo::default())
     }
 
-    /// Reuse immutable locator pages during one exclusive catalogue rebuild.
+    /// Reuse authenticated locator pages across one exclusive head mutation.
     /// Link bodies are always read and authenticated, even with a warm memo.
     pub(super) fn insert_first_memo(
         &mut self,
