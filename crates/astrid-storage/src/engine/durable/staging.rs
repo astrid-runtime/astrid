@@ -1,6 +1,6 @@
 //! Incremental immutable-object staging for durable root transactions.
 
-use super::locations::LocationLookup as _;
+use super::locations::{AuthenticatedPageMemo, LocationLookup as _};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
@@ -576,9 +576,12 @@ where
         inner: &mut DurableInner<P>,
         unique: &BTreeMap<ObjectId, PreparedStagingObject>,
     ) -> Result<BTreeSet<ObjectId>, DurableError> {
+        // This memo belongs to this locked pass only. Preparation releases
+        // the lock, so append admission must authenticate a fresh pass.
+        let mut memo = AuthenticatedPageMemo::default();
         let mut already_present = BTreeSet::new();
         for (id, prepared) in unique {
-            let Some(location) = inner.index.location(*id)? else {
+            let Some(location) = inner.index.location_memo(*id, &mut memo)? else {
                 continue;
             };
             let existing = {
@@ -606,8 +609,9 @@ where
                 "prepared staging batch lengths disagree",
             ));
         }
+        let mut memo = AuthenticatedPageMemo::default();
         for (id, location) in ids.iter().copied().zip(locations.iter().copied()) {
-            if let Err(error) = inner.index.insert(id, location) {
+            if let Err(error) = inner.index.insert_memo(id, location, &mut memo) {
                 self.mark_requires_recovery(inner);
                 return Err(error);
             }
@@ -721,3 +725,6 @@ mod closure_evidence_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tests;
