@@ -234,3 +234,35 @@ fn earliest_identity_is_authenticated_by_the_head_locator() {
     assert!(index.first(object(3)).is_err());
     assert!(index.failed());
 }
+
+#[test]
+fn immutable_head_scan_reuses_pages_but_reauthenticates_every_link() {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut index = ReverseIndex::new(budget(128)).unwrap();
+    for n in 0..512 {
+        index.insert(object(n), representation(n)).unwrap();
+    }
+    let mut memo = AuthenticatedPageMemo::default();
+    crate::engine::durable::locations::test_take_page_auth_count();
+    for n in 0..512 {
+        assert_eq!(
+            index.first_memo(object(n), &mut memo).unwrap(),
+            Some(representation(n))
+        );
+    }
+    let shared_auth = crate::engine::durable::locations::test_take_page_auth_count();
+    for n in 0..512 {
+        assert_eq!(index.first(object(n)).unwrap(), Some(representation(n)));
+    }
+    let fresh_auth = crate::engine::durable::locations::test_take_page_auth_count();
+    assert!(
+        shared_auth < fresh_auth,
+        "shared pages: {shared_auth} versus {fresh_auth}"
+    );
+    let location = index.heads.location(object(0)).unwrap().unwrap();
+    let mut file = index.file.try_clone().unwrap();
+    file.seek(SeekFrom::Start(location.offset)).unwrap();
+    file.write_all(&[0xff; 8]).unwrap();
+    assert!(index.first_memo(object(0), &mut memo).is_err());
+    assert!(index.first_memo(object(9999), &mut memo).is_err());
+}

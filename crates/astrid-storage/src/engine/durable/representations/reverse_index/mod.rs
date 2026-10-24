@@ -88,11 +88,27 @@ impl ReverseIndex {
             .transpose()
     }
 
+    #[cfg(test)]
     pub(super) fn first(
         &self,
         object: ObjectId,
     ) -> Result<Option<RepresentationRecordId>, DurableError> {
-        Ok(self.head(object)?.map(|(_, link)| link.first))
+        self.first_memo(object, &mut AuthenticatedPageMemo::default())
+    }
+
+    /// Reuse page evidence during one immutable scan; authenticate every link.
+    pub(super) fn first_memo(
+        &self,
+        object: ObjectId,
+        memo: &mut AuthenticatedPageMemo,
+    ) -> Result<Option<RepresentationRecordId>, DurableError> {
+        if self.failed() {
+            return Err(chain::corrupt("failed reverse catalogue"));
+        }
+        self.heads
+            .location_memo(object, memo)?
+            .map(|location| self.link(object, location).map(|link| link.first))
+            .transpose()
     }
 
     pub(super) fn contains(&self, object: ObjectId) -> Result<bool, DurableError> {
