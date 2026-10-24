@@ -205,3 +205,30 @@ fn page_memo_rejects_wrong_upper_even_when_offset_digest_warm() {
         Err(DurableError::Corrupt { .. })
     ));
 }
+
+#[test]
+fn decoded_location_pages_reserve_only_their_validated_rows() {
+    for count in [1, 17, LEAF_CAPACITY as u64, (LEAF_CAPACITY * 17) as u64] {
+        let run = build(count);
+        let mut pending = vec![run.root];
+        while let Some(node) = pending.pop() {
+            match run.page(node).unwrap() {
+                Page::Leaf(rows) => {
+                    assert_eq!(
+                        rows.capacity(),
+                        rows.len(),
+                        "leaf growth retains spare rows"
+                    );
+                },
+                Page::Branch(children) => {
+                    assert_eq!(
+                        children.capacity(),
+                        children.len(),
+                        "branch growth retains spare rows"
+                    );
+                    pending.extend(children);
+                },
+            }
+        }
+    }
+}

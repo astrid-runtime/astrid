@@ -11,6 +11,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use super::run::{Builder, PageMemo, Run};
 use super::{ArenaLocation, ClosureProof, DurableError, LocationLookup, LocatorValue, ObjectId};
 
+type CheckDuplicate<'a> =
+    dyn FnMut(ObjectId, ArenaLocation, ArenaLocation) -> Result<(), DurableError> + 'a;
+
 type RowEntries<'a> = Box<dyn Iterator<Item = Result<(ObjectId, LocatorValue), DurableError>> + 'a>;
 
 /// Operation-scoped authenticated page reuse across geometric runs.
@@ -260,6 +263,16 @@ impl PagedLocations {
         location: LocatorValue,
         previous: Option<LocatorValue>,
     ) -> Result<(), DurableError> {
+        self.insert_row_checked(id, location, previous, &mut |_, _, _| Ok(()))
+    }
+
+    fn insert_row_checked(
+        &mut self,
+        id: ObjectId,
+        location: LocatorValue,
+        previous: Option<LocatorValue>,
+        check: &mut CheckDuplicate<'_>,
+    ) -> Result<(), DurableError> {
         // The exclusive borrow keeps the authenticated prior row valid through
         // the mutation; proof preservation and count admission share that read.
         if previous == Some(location) {
@@ -279,10 +292,13 @@ impl PagedLocations {
             .checked_add(usize::from(position.is_err()))
             .ok_or(DurableError::EncodingOverflow)?;
         if resident_count >= self.limit.get() {
-            self.flush_with(id, location, count)?;
+            self.flush_with_checked(id, location, count, check)?;
         } else {
             match position {
-                Ok(at) => self.resident[at].1 = location,
+                Ok(at) => {
+                    check(id, location.location, self.resident[at].1.location)?;
+                    self.resident[at].1 = location;
+                },
                 Err(at) => {
                     if self.resident.len() == self.resident.capacity() {
                         let target = self
@@ -309,6 +325,16 @@ impl PagedLocations {
         location: LocatorValue,
         count: usize,
     ) -> Result<(), DurableError> {
+        self.flush_with_checked(id, location, count, &mut |_, _, _| Ok(()))
+    }
+
+    fn flush_with_checked(
+        &mut self,
+        id: ObjectId,
+        location: LocatorValue,
+        count: usize,
+        check: &mut CheckDuplicate<'_>,
+    ) -> Result<(), DurableError> {
         // Include the prospective mutation in the new run without publishing it
         // in memory. An I/O failure must leave the entire logical index intact.
         let sources: Vec<Box<dyn Iterator<Item = Result<_, DurableError>>>> = vec![
@@ -320,7 +346,7 @@ impl PagedLocations {
             ),
         ];
         let mut builder = Builder::new()?;
-        for entry in MergedEntries::new(sources)? {
+        for entry in MergedEntries::checked(sources, Some(check))? {
             let (id, location) = entry?;
             builder.push_row(id, location)?;
         }
@@ -331,7 +357,7 @@ impl PagedLocations {
             ))?;
         let mut level = 0_usize;
         while let Some(Some(older)) = self.runs.get(level) {
-            carry = merge(&carry, older)?;
+            carry = merge(&carry, older, check)?;
             level = level.checked_add(1).ok_or(DurableError::EncodingOverflow)?;
         }
         let physical_entries = self
@@ -347,7 +373,7 @@ impl PagedLocations {
             // level indefinitely. A geometric full merge bounds this metadata
             // duplication without removing any distinct historical object.
             for older in self.runs.iter().skip(level).flatten() {
-                carry = merge(&carry, older)?;
+                carry = merge(&carry, older, check)?;
             }
             level = 0;
             let mut capacity = self.limit.get();
@@ -459,6 +485,10 @@ impl PagedLocations {
     }
 
     fn rows(&self) -> RowEntries<'_> {
+        self.rows_checked(None)
+    }
+
+    fn rows_checked<'a>(&'a self, check: Option<&'a mut CheckDuplicate<'a>>) -> RowEntries<'a> {
         let mut sources: Vec<RowEntries<'_>> = vec![Box::new(
             self.resident
                 .iter()
@@ -470,10 +500,11 @@ impl PagedLocations {
                 .flatten()
                 .map(|run| Box::new(run.rows()) as Box<dyn Iterator<Item = Result<_, _>>>),
         );
-        let entries: Box<dyn Iterator<Item = Result<_, _>>> = match MergedEntries::new(sources) {
-            Ok(entries) => Box::new(entries),
-            Err(error) => Box::new(std::iter::once(Err(error))),
-        };
+        let entries: Box<dyn Iterator<Item = Result<_, _>>> =
+            match MergedEntries::checked(sources, check) {
+                Ok(entries) => Box::new(entries),
+                Err(error) => Box::new(std::iter::once(Err(error))),
+            };
         Box::new(
             entries.map(|entry| entry.inspect_err(|_| self.failed.store(true, Ordering::Release))),
         )
@@ -588,10 +619,10 @@ impl LocationLookup for PagedLocations {
     }
 }
 
-fn merge(newer: &Run, older: &Run) -> Result<Run, DurableError> {
+fn merge(newer: &Run, older: &Run, check: &mut CheckDuplicate<'_>) -> Result<Run, DurableError> {
     let sources: Vec<RowEntries<'_>> = vec![Box::new(newer.rows()), Box::new(older.rows())];
     let mut builder = Builder::new()?;
-    for entry in MergedEntries::new(sources)? {
+    for entry in MergedEntries::checked(sources, Some(check))? {
         let (id, location) = entry?;
         builder.push_row(id, location)?;
     }
@@ -605,11 +636,15 @@ fn merge(newer: &Run, older: &Run) -> Result<Run, DurableError> {
 struct MergedEntries<'a> {
     sources: Vec<RowEntries<'a>>,
     heads: Vec<Option<(ObjectId, LocatorValue)>>,
+    check: Option<&'a mut CheckDuplicate<'a>>,
     failed: bool,
 }
 
 impl<'a> MergedEntries<'a> {
-    fn new(mut sources: Vec<RowEntries<'a>>) -> Result<Self, DurableError> {
+    fn checked(
+        mut sources: Vec<RowEntries<'a>>,
+        check: Option<&'a mut CheckDuplicate<'a>>,
+    ) -> Result<Self, DurableError> {
         let heads = sources
             .iter_mut()
             .map(|source| source.next().transpose())
@@ -617,6 +652,7 @@ impl<'a> MergedEntries<'a> {
         Ok(Self {
             sources,
             heads,
+            check,
             failed: false,
         })
     }
@@ -636,8 +672,19 @@ impl Iterator for MergedEntries<'_> {
             }
         }
         let selected = selected?;
+        let mut first = true;
         for (head, source) in self.heads.iter_mut().zip(&mut self.sources) {
-            if head.is_some_and(|head| head.0 == selected.0) {
+            if let Some((id, row)) = *head
+                && id == selected.0
+            {
+                if !first
+                    && let Some(check) = self.check.as_mut()
+                    && let Err(error) = check(id, selected.1.location, row.location)
+                {
+                    self.failed = true;
+                    return Some(Err(error));
+                }
+                first = false;
                 match source.next().transpose() {
                     Ok(next) => *head = next,
                     Err(error) => {

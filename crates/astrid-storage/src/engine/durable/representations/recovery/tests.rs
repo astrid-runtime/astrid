@@ -109,7 +109,7 @@ fn metadata_node_rejection_preserves_verified_index() {
     let mut file = DurableFile::native(tempfile::tempfile().unwrap());
     let payload = frame.encode().unwrap();
     let offset = super::super::super::append_frame(&mut file, METADATA_MAGIC, &payload).unwrap();
-    let mut index = MetadataIndex::new(
+    let mut index = MetadataAdmission::new(
         &file,
         RecoveryLimits::process_addressable(),
         super::super::LocationIndexMemoryBudget::default(),
@@ -130,6 +130,7 @@ fn metadata_node_rejection_preserves_verified_index() {
             .insert(offset.offset, &noncanonical.encode().unwrap())
             .is_err()
     );
+    let index = index.finish().unwrap();
     assert_eq!(index.nodes.len(), map.nodes().len());
     for (id, node) in map.nodes() {
         assert_eq!(index.nodes.node(*id).unwrap().unwrap().as_ref(), node);
@@ -227,7 +228,7 @@ fn duplicate_admission_authenticates_the_previous_body_before_locator_replacemen
         .unwrap();
     let mut file = DurableFile::native(tempfile::tempfile().unwrap());
     let first = super::super::super::append_frame(&mut file, METADATA_MAGIC, &payload).unwrap();
-    let mut index = MetadataIndex::new(
+    let mut index = MetadataAdmission::new(
         &file,
         RecoveryLimits::process_addressable(),
         super::super::LocationIndexMemoryBudget::default(),
@@ -244,7 +245,10 @@ fn duplicate_admission_authenticates_the_previous_body_before_locator_replacemen
         index.insert(second.offset, &payload).is_err(),
         "a new duplicate must not hide corrupted prior media"
     );
-    assert_eq!(index.nodes.len(), 1);
+    assert!(
+        index.finish().is_err(),
+        "failed admission cannot publish an index"
+    );
 }
 
 #[test]
