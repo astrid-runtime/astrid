@@ -152,13 +152,22 @@ impl ResolvedConfig {
 
         paths.push("/etc/astrid/config.toml".to_owned());
 
-        if let Some(home) = astrid_home {
-            paths.push(format!("{home}/config.toml"));
+        let runtime_root = if let Some(home) = astrid_home {
+            home.to_owned()
         } else if let Some(home) = home_dir {
-            paths.push(format!("{home}/.astrid/config.toml"));
+            format!("{home}/.astrid")
         } else {
-            paths.push("~/.astrid/config.toml".to_owned());
-        }
+            "~/.astrid".to_owned()
+        };
+        // List both user overlays in the same order as discovery. The canonical
+        // editor path wins conflicts; supported root-only fields are retained.
+        paths.push(format!("{runtime_root}/config.toml"));
+        paths.push(
+            astrid_core::dirs::AstridHome::from_path(runtime_root)
+                .config_path()
+                .display()
+                .to_string(),
+        );
 
         if let Some(ws) = workspace_root {
             paths.push(
@@ -244,10 +253,11 @@ mod tests {
     #[test]
     fn test_config_paths() {
         let paths = ResolvedConfig::config_paths(Some("/home/user"), Some("/home/user/project"));
-        assert_eq!(paths.len(), 3);
+        assert_eq!(paths.len(), 4);
         assert!(paths[0].contains("/etc/astrid"));
         assert!(paths[1].contains("/home/user/.astrid"));
-        assert!(paths[2].contains("/home/user/project/.astrid"));
+        assert!(paths[2].contains("/home/user/.astrid/etc/config.toml"));
+        assert!(paths[3].contains("/home/user/project/.astrid"));
     }
 
     #[test]
@@ -258,6 +268,7 @@ mod tests {
             Some("/home/user/project"),
         );
         assert_eq!(paths[1], "/tmp/astrid-home/config.toml");
+        assert_eq!(paths[2], "/tmp/astrid-home/etc/config.toml");
         assert!(!paths[1].contains("/home/user/.astrid"));
     }
 
@@ -271,7 +282,7 @@ mod tests {
             &layout,
         );
         assert_eq!(
-            paths[2],
+            paths[3],
             "/home/user/project/.alternate-runtime/config.toml"
         );
     }
