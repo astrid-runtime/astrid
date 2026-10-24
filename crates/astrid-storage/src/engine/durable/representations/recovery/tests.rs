@@ -449,3 +449,88 @@ fn recovery_validates_unreferenced_placements_before_rebuilding_reverse_catalogu
         }
     }
 }
+
+#[test]
+fn recovery_rejects_unused_placement_profile_and_missing_direct_blob() {
+    use crate::storage_model::{ObjectId, Replica, ReplicaLocator};
+    let (profile, profile_id) =
+        super::super::activation::direct_profile(ObjectId::new([1; 32])).unwrap();
+    let profiles = CanonicalPhysicalMap::build_dense(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Profile,
+        vec![(PhysicalMapKey::from(profile_id), profile.encode().unwrap())],
+    )
+    .unwrap();
+    let empty_profiles = CanonicalPhysicalMap::build_dense(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Profile,
+        vec![],
+    )
+    .unwrap();
+    let empty_representations = CanonicalPhysicalMap::build_dense(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Representation,
+        vec![],
+    )
+    .unwrap();
+    let blob = crate::storage_model::BlobId::new([2; 32]);
+    let replica = Replica::new(
+        super::super::LOCAL_STORAGE_NODE,
+        ReplicaLocator::ArenaFrame {
+            arena_generation: 0,
+            offset: 0,
+            payload_length: 8,
+            frame_checksum: [3; 32],
+        },
+    )
+    .unwrap();
+    let placement = PlacementEntry::new(blob, profile_id, 8, vec![replica]).unwrap();
+    let placements = CanonicalPhysicalMap::build_dense(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Placement,
+        vec![(PhysicalMapKey::from(blob), placement.encode().unwrap())],
+    )
+    .unwrap();
+    assert!(
+        validate_representations(
+            &empty_profiles,
+            &empty_representations,
+            &placements,
+            super::super::LocationIndexMemoryBudget::default()
+        )
+        .is_err()
+    );
+    let record = RepresentationRecord::new(
+        profile_id,
+        Coverage::exact(ObjectId::new([4; 32]), 8).unwrap(),
+        Recipe::DirectCanonical { blob },
+        8,
+        8,
+        None,
+    )
+    .unwrap();
+    let representations = CanonicalPhysicalMap::build_dense(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Representation,
+        vec![(
+            PhysicalMapKey::from(record.identify(&Blake3PhysicalIdentity).unwrap()),
+            record.encode().unwrap(),
+        )],
+    )
+    .unwrap();
+    let empty_placements = CanonicalPhysicalMap::build_dense(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Placement,
+        vec![],
+    )
+    .unwrap();
+    assert!(
+        validate_representations(
+            &profiles,
+            &representations,
+            &empty_placements,
+            super::super::LocationIndexMemoryBudget::default()
+        )
+        .is_err()
+    );
+}

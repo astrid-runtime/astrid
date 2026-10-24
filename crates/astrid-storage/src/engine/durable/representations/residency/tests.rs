@@ -163,71 +163,77 @@ fn dense_history_is_bounded_by_measured_reachable_nodes() {
 #[test]
 fn residency_remeasurement_reuses_page_authentication_but_not_node_bodies() {
     use super::super::super::locations::test_take_page_auth_count;
-    let directory = tempfile::tempdir().unwrap();
-    let volume: Arc<dyn AstridVolume> =
-        HostedFileVolume::open(directory.path().join("memo.volume")).unwrap();
-    let budget = super::super::LocationIndexMemoryBudget::new(
-        std::num::NonZeroU64::new(super::super::LocationIndexMemoryBudget::MIN_BYTES).unwrap(),
-    )
-    .unwrap();
-    let mut store = RepresentationStore::activate_volume(
-        &volume,
-        super::super::RecoveryLimits::process_addressable(),
-        ObjectId::new([1; 32]),
-        [],
-        budget,
-    )
-    .unwrap();
-    let direct = (0_u64..256)
-        .map(|sequence| {
-            let bytes = sequence.to_le_bytes();
-            store
-                .describe_direct(
-                    ObjectId::new(*blake3::hash(&bytes).as_bytes()),
-                    &bytes,
-                    ArenaLocation {
-                        offset: sequence * 100,
-                        payload_len: 8,
-                        checksum: [3; 32],
-                    },
-                )
-                .unwrap()
-        })
-        .collect::<Vec<_>>();
-    let update = store.append_direct_update(&direct).unwrap().unwrap();
-    store.publish_direct_update(update).unwrap();
-    test_take_page_auth_count();
-    let expected = super::MapResidency::new(
-        &store.profiles,
-        &store.representations,
-        &store.placement_entries,
-        store.persisted_map_nodes.len(),
-    )
-    .unwrap();
-    let uncached = test_take_page_auth_count();
-    // Force only the disposable scheduling hints, leaving authority untouched.
-    store.residency = super::MapResidency {
-        profiles: 0,
-        representations: 0,
-        placements: 0,
-        measured_history: 0,
-    };
-    store.reclaim_map_history().unwrap();
-    let cached = test_take_page_auth_count();
-    assert_eq!(store.residency.profiles, expected.profiles);
-    assert_eq!(store.residency.representations, expected.representations);
-    assert_eq!(store.residency.placements, expected.placements);
-    assert_eq!(store.residency.measured_history, expected.measured_history);
-    assert!(cached > 0, "must authenticate actual spilled pages");
-    assert!(
-        cached < uncached,
-        "reuse ancestors during the count: {cached} vs {uncached}"
-    );
+    for damage_locator in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let volume: Arc<dyn AstridVolume> =
+            HostedFileVolume::open(directory.path().join("memo.volume")).unwrap();
+        let budget = super::super::LocationIndexMemoryBudget::new(
+            std::num::NonZeroU64::new(super::super::LocationIndexMemoryBudget::MIN_BYTES).unwrap(),
+        )
+        .unwrap();
+        let mut store = RepresentationStore::activate_volume(
+            &volume,
+            super::super::RecoveryLimits::process_addressable(),
+            ObjectId::new([1; 32]),
+            [],
+            budget,
+        )
+        .unwrap();
+        let direct = (0_u64..256)
+            .map(|sequence| {
+                let bytes = sequence.to_le_bytes();
+                store
+                    .describe_direct(
+                        ObjectId::new(*blake3::hash(&bytes).as_bytes()),
+                        &bytes,
+                        ArenaLocation {
+                            offset: sequence * 100,
+                            payload_len: 8,
+                            checksum: [3; 32],
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let update = store.append_direct_update(&direct).unwrap().unwrap();
+        store.publish_direct_update(update).unwrap();
+        test_take_page_auth_count();
+        let expected = super::MapResidency::new(
+            &store.profiles,
+            &store.representations,
+            &store.placement_entries,
+            store.persisted_map_nodes.len(),
+        )
+        .unwrap();
+        let uncached = test_take_page_auth_count();
+        // Force only the disposable scheduling hints, leaving authority untouched.
+        store.residency = super::MapResidency {
+            profiles: 0,
+            representations: 0,
+            placements: 0,
+            measured_history: 0,
+        };
+        store.reclaim_map_history().unwrap();
+        let cached = test_take_page_auth_count();
+        assert_eq!(store.residency.profiles, expected.profiles);
+        assert_eq!(store.residency.representations, expected.representations);
+        assert_eq!(store.residency.placements, expected.placements);
+        assert_eq!(store.residency.measured_history, expected.measured_history);
+        assert!(cached > 0, "must authenticate actual spilled pages");
+        assert!(
+            cached < uncached,
+            "reuse ancestors during the count: {cached} vs {uncached}"
+        );
 
-    store.metadata.set_len(0).unwrap();
-    store.residency.measured_history = 0;
-    store.residency.profiles = 0;
-    store.residency.representations = 0;
-    store.residency.placements = 0;
-    assert!(store.reclaim_map_history().is_err());
+        if damage_locator {
+            store.persisted_map_nodes.truncate_test_run();
+        } else {
+            store.metadata.set_len(0).unwrap();
+        }
+        store.residency.measured_history = 0;
+        store.residency.profiles = 0;
+        store.residency.representations = 0;
+        store.residency.placements = 0;
+        assert!(store.reclaim_map_history().is_err());
+    }
 }
