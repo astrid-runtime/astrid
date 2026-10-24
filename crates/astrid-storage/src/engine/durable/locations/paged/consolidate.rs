@@ -1,5 +1,8 @@
 //! Transactional streaming consolidation for long immutable locator walks.
-use super::{Builder, CheckDuplicate, DurableError, Ordering, PagedLocations};
+use super::{
+    Builder, CheckDuplicate, DurableError, LocatorValue, NonZeroUsize, ObjectId, Ordering,
+    PagedLocations,
+};
 use crate::engine::durable::locations::ClosureProof;
 
 impl PagedLocations {
@@ -38,16 +41,23 @@ impl PagedLocations {
         &'a self,
         check: Option<&'a mut CheckDuplicate<'a>>,
     ) -> Result<(Self, usize), DurableError> {
+        Self::from_sorted_rows(self.limit, self.rows_checked(check))
+    }
+
+    pub(super) fn from_sorted_rows(
+        limit: NonZeroUsize,
+        rows: impl IntoIterator<Item = Result<(ObjectId, LocatorValue), DurableError>>,
+    ) -> Result<(Self, usize), DurableError> {
         let mut builder = Builder::new()?;
         let mut complete = 0_usize;
-        for entry in self.rows_checked(check) {
+        for entry in rows {
             let (id, row) = entry?;
             complete = complete
                 .checked_add(usize::from(row.proof == ClosureProof::Complete))
                 .ok_or(DurableError::EncodingOverflow)?;
             builder.push_row(id, row)?;
         }
-        let mut locations = PagedLocations::new(self.limit);
+        let mut locations = PagedLocations::new(limit);
         if let Some(run) = builder.finish()? {
             locations.count = run.count;
             let mut capacity = locations.limit.get();
