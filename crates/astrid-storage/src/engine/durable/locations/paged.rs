@@ -432,7 +432,23 @@ impl PagedLocations {
     }
 
     #[cfg(test)]
-    pub(in crate::engine::durable) fn truncate_test_run(&self) {
+    pub(in crate::engine::durable) fn corrupt_test_run_page_without_epoch(&self, offset: u64) {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = self
+            .runs
+            .iter()
+            .flatten()
+            .next()
+            .expect("test requires a run")
+            .test_file()
+            .try_clone()
+            .unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&[0xff; 8]).unwrap();
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::durable) fn truncate_test_run_without_epoch(&self) {
         self.runs
             .iter()
             .flatten()
@@ -441,6 +457,11 @@ impl PagedLocations {
             .test_file()
             .set_len(0)
             .unwrap();
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::durable) fn truncate_test_run(&self) {
+        self.truncate_test_run_without_epoch();
         // Anonymous run bytes are immutable in production. Test fault injection
         // bumps the epoch so operation memos cannot serve pre-damage pages.
         self.runs_epoch.fetch_add(1, Ordering::AcqRel);

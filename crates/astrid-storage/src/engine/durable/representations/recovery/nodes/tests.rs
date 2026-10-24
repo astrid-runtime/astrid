@@ -461,3 +461,5 @@ fn journal_proof_staging_stays_within_the_existing_borrowed_partition() {
         }
     }
 }
+
+mod certificate;
