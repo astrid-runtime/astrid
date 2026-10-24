@@ -20,12 +20,23 @@ fn map(value: u8) -> CanonicalPhysicalMap {
     .unwrap()
 }
 
-fn reader(file: &DurableFile) -> RecoveredNodes {
+fn reader(file: &DurableFile) -> NodeAdmission {
     let budget = LocationIndexMemoryBudget::new(NonZeroU64::new(352).unwrap()).unwrap();
-    RecoveredNodes::new(file, RecoveryLimits::process_addressable(), budget).unwrap()
+    NodeAdmission::new(file, RecoveryLimits::process_addressable(), budget).unwrap()
 }
 
-fn append(file: &mut DurableFile, nodes: &mut RecoveredNodes, node: &PhysicalMapNode) {
+fn fragment(nodes: &mut RecoveredNodes) {
+    use crate::engine::durable::locations::LocationLookup;
+    let mut locations = PagedLocations::new(nodes.budget.durable_entries());
+    for row in nodes.locations.locations() {
+        let (id, location) = row.unwrap();
+        locations.insert(id, location).unwrap();
+    }
+    nodes.locations = locations;
+    *nodes.page_memo.get_mut() = AuthenticatedPageMemo::default();
+}
+
+fn append(file: &mut DurableFile, nodes: &mut NodeAdmission, node: &PhysicalMapNode) {
     let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, node).unwrap();
     let payload = frame.encode().unwrap();
     let location = crate::engine::durable::append_frame(file, METADATA_MAGIC, &payload).unwrap();
@@ -49,6 +60,10 @@ fn journal_admission_consolidates_runs_preserving_historical_nodes() {
             node.clone(),
         );
     }
+    let mut nodes = nodes.finish().unwrap();
+    // Exercise the journal boundary with a deliberately fragmented, validated
+    // locator as well as the consolidated result returned by admission.
+    fragment(&mut nodes);
     assert!(nodes.locations.test_spilled_run_count() > 1);
     nodes.reset_proofs().unwrap();
     assert_eq!(nodes.locations.test_spilled_run_count(), 1);
@@ -76,6 +91,7 @@ fn journal_admission_rejects_damaged_runs_even_with_a_warm_memo() {
     for node in map.nodes().values() {
         append(&mut file, &mut nodes, node);
     }
+    let mut nodes = nodes.finish().unwrap();
     assert!(nodes.node(map.root().unwrap()).unwrap().is_some());
     nodes.locations.truncate_test_run();
     assert!(nodes.reset_proofs().is_err());
@@ -100,6 +116,10 @@ fn active_map_handoff_consolidates_runs_without_losing_nodes_or_trusting_journal
             node.clone(),
         );
     }
+    let mut nodes = nodes.finish().unwrap();
+    // Exercise the journal boundary with a deliberately fragmented, validated
+    // locator as well as the consolidated result returned by admission.
+    fragment(&mut nodes);
     assert!(nodes.locations.test_spilled_run_count() > 1);
     nodes.reset_proofs().unwrap();
     assert!(super::super::map_closure_complete(maps[0].root(), &mut nodes).unwrap());
@@ -155,6 +175,7 @@ fn active_map_handoff_rejects_damaged_runs_even_with_a_warm_memo() {
     for node in map.nodes().values() {
         append(&mut file, &mut nodes, node);
     }
+    let mut nodes = nodes.finish().unwrap();
     assert!(nodes.node(map.root().unwrap()).unwrap().is_some());
     nodes.locations.truncate_test_run();
     assert!(nodes.reset_proofs().is_err());
@@ -169,10 +190,13 @@ fn paged_reachability_never_memoizes_missing_descendants_or_promotes_historical_
     let root = historical.root().unwrap();
     let mut file = DurableFile::native(tempfile::tempfile().unwrap());
     let mut nodes = reader(&file);
-    nodes.reset_proofs().unwrap();
     append(&mut file, &mut nodes, &historical.nodes()[&root]);
-    assert!(!super::super::map_closure_complete(Some(root), &mut nodes).unwrap());
-    assert!(!nodes.complete(&root).unwrap());
+    let mut partial = nodes.finish().unwrap();
+    partial.reset_proofs().unwrap();
+    assert!(!super::super::map_closure_complete(Some(root), &mut partial).unwrap());
+    assert!(!partial.complete(&root).unwrap());
+    let mut nodes = reader(&file);
+    append(&mut file, &mut nodes, &historical.nodes()[&root]);
     for (id, node) in historical.nodes() {
         if *id != root {
             append(&mut file, &mut nodes, node);
@@ -181,6 +205,7 @@ fn paged_reachability_never_memoizes_missing_descendants_or_promotes_historical_
     for node in active.nodes().values() {
         append(&mut file, &mut nodes, node);
     }
+    let mut nodes = nodes.finish().unwrap();
     assert!(super::super::map_closure_complete(Some(root), &mut nodes).unwrap());
     for id in historical.nodes().keys() {
         assert!(nodes.complete(id).unwrap());
@@ -205,6 +230,7 @@ fn failed_media_reads_do_not_publish_reachability_proofs() {
     for node in map.nodes().values() {
         append(&mut file, &mut nodes, node);
     }
+    let mut nodes = nodes.finish().unwrap();
     nodes.reset_proofs().unwrap();
     file.durable_set_len(0).unwrap();
     assert!(super::super::map_closure_complete(map.root(), &mut nodes).is_err());
@@ -221,6 +247,7 @@ fn reachability_proof_write_failure_is_an_error_and_fences_replay() {
     for node in map.nodes().values() {
         append(&mut file, &mut nodes, node);
     }
+    let mut nodes = nodes.finish().unwrap();
     nodes.reset_proofs().unwrap();
     nodes.locations.damage_run_after_inserts(0);
     assert!(super::super::map_closure_complete(map.root(), &mut nodes).is_err());
@@ -236,6 +263,7 @@ fn recovery_reuses_locator_page_evidence_but_always_authenticates_node_media() {
     for node in map.nodes().values() {
         append(&mut file, &mut nodes, node);
     }
+    let mut nodes = nodes.finish().unwrap();
     nodes.reset_proofs().unwrap();
     let id = map.root().unwrap();
     assert!(nodes.node(id).unwrap().is_some());
@@ -255,4 +283,43 @@ fn recovery_reuses_locator_page_evidence_but_always_authenticates_node_media() {
     );
     nodes.reset_proofs().unwrap();
     assert_eq!(nodes.page_memo.borrow().test_hit_miss(), (0, 0));
+}
+
+#[test]
+fn sorted_admission_never_hides_corrupted_superseded_node_media() {
+    use std::io::{Seek, SeekFrom, Write};
+    for resident_budget in [352, 65536] {
+        let map = map(10);
+        let root = map.root().unwrap();
+        let mut file = DurableFile::native(tempfile::tempfile().unwrap());
+        let budget =
+            LocationIndexMemoryBudget::new(NonZeroU64::new(resident_budget).unwrap()).unwrap();
+        let mut admission =
+            NodeAdmission::new(&file, RecoveryLimits::process_addressable(), budget).unwrap();
+        let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, &map.nodes()[&root]).unwrap();
+        let payload = frame.encode().unwrap();
+        let first =
+            crate::engine::durable::append_frame(&mut file, METADATA_MAGIC, &payload).unwrap();
+        admission.admit(first.offset, &payload, &frame).unwrap();
+        for (id, node) in map.nodes() {
+            if *id != root {
+                append(&mut file, &mut admission, node);
+            }
+        }
+        let second =
+            crate::engine::durable::append_frame(&mut file, METADATA_MAGIC, &payload).unwrap();
+        file.seek(SeekFrom::Start(
+            first.offset + crate::engine::durable::FRAME_HEADER_LEN,
+        ))
+        .unwrap();
+        file.write_all(&[payload[0] ^ 0x80]).unwrap();
+        if admission.admit(second.offset, &payload, &frame).is_err() {
+            assert!(admission.finish().is_err());
+        } else {
+            assert!(
+                admission.finish().is_err(),
+                "final merge must authenticate a superseded spilled location"
+            );
+        }
+    }
 }

@@ -82,8 +82,10 @@ pub(super) fn decode(node: Node, bytes: &[u8; PAGE_BYTES]) -> Result<Page, Durab
     }
     let records = bytes[HEADER_BYTES..end].chunks_exact(width);
     let mut previous = None;
-    let mut leaves = Vec::new();
-    let mut children = Vec::new();
+    // The authenticated page header already bounds the exact row count. Reserve
+    // only its active variant once, avoiding repeated growth on random lookups.
+    let mut leaves = Vec::with_capacity(if node.level == 0 { count } else { 0 });
+    let mut children = Vec::with_capacity(if node.level == 0 { 0 } else { count });
     for record in records {
         let key = ObjectId::new(
             record[..32]
