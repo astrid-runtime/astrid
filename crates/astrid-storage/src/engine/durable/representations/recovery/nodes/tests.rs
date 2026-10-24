@@ -144,9 +144,10 @@ fn active_map_handoff_consolidates_runs_without_losing_nodes_or_trusting_journal
         consolidated_misses > 0,
         "replacement pages must still be authenticated"
     );
-    assert!(
-        consolidated_hits + consolidated_misses < control_hits + control_misses,
-        "consolidation removes cross-run page probes, even when tiny runs fit one page"
+    assert_eq!(
+        consolidated_hits + consolidated_misses,
+        control_hits + control_misses,
+        "journal proofs leave the already consolidated base locator unchanged"
     );
     assert_eq!(recovered.root(), control.root());
     assert_eq!(recovered.nodes(), control.nodes());
@@ -249,9 +250,33 @@ fn reachability_proof_write_failure_is_an_error_and_fences_replay() {
     }
     let mut nodes = nodes.finish().unwrap();
     nodes.reset_proofs().unwrap();
-    nodes.locations.damage_run_after_inserts(0);
+    // Install one independently complete leaf so the damage hook has an
+    // existing proof run to truncate on the next insertion.
+    let leaf = map
+        .nodes()
+        .iter()
+        .find_map(|(id, node)| {
+            matches!(
+                node,
+                PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. }
+            )
+            .then_some(*id)
+        })
+        .unwrap();
+    assert!(super::super::map_closure_complete(Some(leaf), &mut nodes).unwrap());
+    nodes.proofs.get_mut().damage_run_after_inserts(0);
     assert!(super::super::map_closure_complete(map.root(), &mut nodes).is_err());
-    assert!(nodes.locations.failed());
+    assert!(
+        nodes
+            .proofs
+            .borrow()
+            .require_healthy(&nodes.locations)
+            .is_err()
+    );
+    assert!(
+        !nodes.locations.failed(),
+        "proof writes must not mutate base authority"
+    );
     assert!(nodes.reset_proofs().is_err());
 }
 
@@ -325,7 +350,7 @@ fn sorted_admission_never_hides_corrupted_superseded_node_media() {
 }
 
 #[test]
-fn positive_closure_memo_reuses_only_successful_queries_until_run_replacement() {
+fn journal_proofs_spill_without_replacing_base_runs_and_revoke_on_base_replacement() {
     let map = map(11);
     let mut file = DurableFile::native(tempfile::tempfile().unwrap());
     let mut admission = reader(&file);
@@ -334,43 +359,38 @@ fn positive_closure_memo_reuses_only_successful_queries_until_run_replacement() 
     }
     let mut nodes = admission.finish().unwrap();
     let id = map.root().unwrap();
+    let base_epoch = nodes.locations.runs_epoch();
+    assert!(!nodes.complete(&id).unwrap());
+    assert!(super::super::map_closure_complete(Some(id), &mut nodes).unwrap());
+    assert_eq!(
+        nodes.locations.runs_epoch(),
+        base_epoch,
+        "reachability proofs must not rewrite the large immutable base locator"
+    );
+    for id in map.nodes().keys() {
+        assert!(nodes.complete(id).unwrap());
+    }
     assert!(
-        nodes
-            .resident_capacity_bytes()
-            .strict_add(nodes.complete_memo.borrow().capacity_bytes())
+        nodes.resident_capacity_bytes() + nodes.proofs.borrow().resident_capacity_bytes()
             <= usize::try_from(nodes.budget.bytes().get()).unwrap() / 2
     );
-    assert!(!nodes.complete(&id).unwrap());
-    assert!(!nodes.complete_memo.borrow().contains(id));
-    assert!(super::super::map_closure_complete(Some(id), &mut nodes).unwrap());
-    // remember() alone never populates the hot-query memo with every new node.
-    assert!(!nodes.complete_memo.borrow().contains(id));
-    assert!(nodes.complete(&id).unwrap());
-    assert!(nodes.complete_memo.borrow().contains(id));
     *nodes.page_memo.get_mut() = AuthenticatedPageMemo::default();
     assert!(nodes.complete(&id).unwrap());
-    assert_eq!(
-        nodes.page_memo.borrow().test_hit_miss(),
-        (0, 0),
-        "a successful repeated closure query needs no random page walk"
+    assert_eq!(nodes.page_memo.borrow().test_hit_miss(), (0, 0));
+    nodes.locations.clear_proofs().unwrap();
+    assert!(
+        !nodes.complete(&id).unwrap(),
+        "healthy source replacement revokes old proofs too"
     );
+    assert!(super::super::map_closure_complete(Some(id), &mut nodes).unwrap());
     nodes.locations.truncate_test_run();
-    assert!(
-        nodes.complete(&id).is_err(),
-        "a changed run must be authenticated again"
-    );
+    assert!(nodes.complete(&id).is_err());
     assert!(nodes.locations.failed());
-    assert!(!nodes.complete_memo.borrow().contains(id));
-    // Even an independently warm slot must never bypass the failure fence.
-    nodes.complete_memo.get_mut().insert(id);
-    assert!(
-        nodes.complete(&id).is_err(),
-        "the failure fence must win over any memo"
-    );
+    assert!(nodes.reset_proofs().is_err());
 }
 
 #[test]
-fn positive_closure_memo_reset_and_failure_never_leave_sticky_true() {
+fn journal_proof_damage_fences_queries_reads_reset_and_handoff() {
     let map = map(12);
     let mut file = DurableFile::native(tempfile::tempfile().unwrap());
     let mut admission = reader(&file);
@@ -381,48 +401,63 @@ fn positive_closure_memo_reset_and_failure_never_leave_sticky_true() {
     let id = map.root().unwrap();
     assert!(super::super::map_closure_complete(Some(id), &mut nodes).unwrap());
     assert!(nodes.complete(&id).unwrap());
-    nodes.reset_proofs().unwrap();
-    assert!(!nodes.complete_memo.borrow().contains(id));
-    assert!(!nodes.complete(&id).unwrap());
-    let missing = PhysicalMapNodeId::new([0xf1; 32]);
-    assert!(!nodes.complete(&missing).unwrap());
-    assert!(!nodes.complete_memo.borrow().contains(missing));
-    assert!(super::super::map_closure_complete(Some(id), &mut nodes).unwrap());
-    assert!(nodes.complete(&id).unwrap());
-    nodes.locations.truncate_test_run();
-    assert!(nodes.reset_proofs().is_err());
-    assert!(!nodes.complete_memo.borrow().contains(id));
+    nodes.proofs.borrow().truncate_test_run();
+    assert!(map.nodes().keys().any(|id| nodes.complete(id).is_err()));
     assert!(nodes.complete(&id).is_err());
+    assert!(nodes.node(id).is_err());
+    assert!(nodes.reset_proofs().is_err());
+    assert!(nodes.into_cold(&[&map]).is_err());
 }
 
 #[test]
-fn positive_closure_memo_is_bounded_and_full_identity_checked() {
+fn journal_proof_reset_missing_and_full_identity_are_not_sticky_true() {
+    let map = map(13);
+    let mut file = DurableFile::native(tempfile::tempfile().unwrap());
+    let mut admission = reader(&file);
+    for node in map.nodes().values() {
+        append(&mut file, &mut admission, node);
+    }
+    let mut nodes = admission.finish().unwrap();
+    let id = map.root().unwrap();
+    assert!(super::super::map_closure_complete(Some(id), &mut nodes).unwrap());
+    let mut different = *id.as_bytes();
+    different[31] ^= 1;
+    assert!(!nodes.complete(&PhysicalMapNodeId::new(different)).unwrap());
+    nodes.reset_proofs().unwrap();
+    for id in map.nodes().keys() {
+        assert!(!nodes.complete(id).unwrap());
+    }
+    assert!(super::super::map_closure_complete(Some(id), &mut nodes).unwrap());
+    assert!(nodes.complete(&id).unwrap());
+    let cold = nodes.into_cold(&[&map]).unwrap();
+    for id in map.nodes().keys() {
+        assert!(cold.complete(id).unwrap());
+    }
+}
+
+#[test]
+fn journal_proof_staging_stays_within_the_existing_borrowed_partition() {
+    let maps = [map(14), map(15)];
     for bytes in [LocationIndexMemoryBudget::MIN_BYTES, 352, 65536, 1_048_576] {
         let budget = LocationIndexMemoryBudget::new(NonZeroU64::new(bytes).unwrap()).unwrap();
-        let mut memo = CompleteMemo::new(budget).unwrap();
-        let capacity = memo.capacity_bytes();
-        assert!(u64::try_from(capacity).unwrap() <= bytes / 4);
-        let first = PhysicalMapNodeId::new([1; 32]);
-        memo.insert(first);
-        if capacity == 0 {
-            assert!(!memo.contains(first));
-            continue;
+        let mut file = DurableFile::native(tempfile::tempfile().unwrap());
+        let mut admission =
+            NodeAdmission::new(&file, RecoveryLimits::process_addressable(), budget).unwrap();
+        for node in maps.iter().flat_map(|map| map.nodes().values()) {
+            append(&mut file, &mut admission, node);
         }
-        assert!(memo.contains(first));
-        let mut colliding = [1; 32];
-        colliding[31] = 2; // Same native-word slot, distinct complete identity.
-        let colliding = PhysicalMapNodeId::new(colliding);
-        assert!(!memo.contains(colliding));
-        memo.insert(colliding);
-        assert!(memo.contains(colliding));
-        assert!(!memo.contains(first));
-        for n in 0_u32..10_000 {
-            memo.insert(PhysicalMapNodeId::new(
-                *blake3::hash(&n.to_be_bytes()).as_bytes(),
-            ));
+        let mut nodes = admission.finish().unwrap();
+        let epoch = nodes.locations.runs_epoch();
+        for map in &maps {
+            assert!(super::super::map_closure_complete(map.root(), &mut nodes).unwrap());
+            assert!(
+                u64::try_from(nodes.proofs.borrow().resident_capacity_bytes()).unwrap()
+                    <= bytes / 4
+            );
+            assert_eq!(nodes.locations.runs_epoch(), epoch);
         }
-        assert_eq!(memo.capacity_bytes(), capacity);
-        memo.sync(1);
-        assert!(!memo.contains(colliding));
+        for id in maps.iter().flat_map(|map| map.nodes().keys()) {
+            assert!(nodes.complete(id).unwrap());
+        }
     }
 }

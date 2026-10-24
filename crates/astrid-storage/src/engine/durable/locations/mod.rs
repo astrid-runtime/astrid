@@ -84,7 +84,7 @@ pub(super) use paged::{AuthenticatedPageMemo, PagedLocations, RebuildLocations};
 ///
 /// The engine divides this target between the historical object locator,
 /// physical-node locator, private path-copy locator, and reverse heads. During
-/// recovery, a bounded positive reachability memo borrows the otherwise absent
+/// recovery, a paged journal-reachability locator borrows the otherwise absent
 /// private path-copy partition; it is released before cold mutation starts. All are shared across
 /// principals. Their sorted staging vectors together reserve at most this many
 /// entry bytes. Tree roots,
