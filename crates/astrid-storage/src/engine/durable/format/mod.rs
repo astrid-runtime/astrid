@@ -27,6 +27,8 @@ thread_local! {
 mod indexed;
 mod prepared;
 mod reader;
+#[cfg(test)]
+mod tests;
 
 #[cfg(test)]
 pub(super) use indexed::{last_batch_spans, reset_last_batch_spans};
@@ -840,25 +842,7 @@ pub(super) fn decode_object_frame(
     let canonical_len = reader.usize_len()?;
     let reference_count = reader.usize_len()?;
     let canonical_bytes = reader.take(canonical_len)?.to_vec();
-    if reference_count > reader.remaining() / MIN_REFERENCE_WIRE_BYTES {
-        return Err("reference count exceeds frame capacity");
-    }
-    let mut references = Vec::new();
-    references
-        .try_reserve(reference_count)
-        .map_err(|_| "reference allocation failed")?;
-    for _ in 0..reference_count {
-        let label_len = reader.usize_len()?;
-        let label = reader.take(label_len)?.to_vec();
-        let target = reader.identity(scheme)?;
-        let reference_kind =
-            ReferenceKind::from_code(reader.u8()?).ok_or("unknown reference-kind code")?;
-        references.push(ObjectReference::new(
-            ReferenceLabel::new(label),
-            target,
-            reference_kind,
-        ));
-    }
+    let references = decode_references(&mut reader, scheme, reference_count)?;
     if reader.remaining() != 0 {
         return Err("trailing object-frame bytes");
     }
@@ -872,4 +856,33 @@ pub(super) fn decode_object_frame(
     )
     .map_err(|_| "non-canonical object references")?;
     Ok((id, record))
+}
+
+fn decode_references(
+    reader: &mut SliceReader<'_>,
+    scheme: IdentityScheme,
+    count: usize,
+) -> Result<Vec<ObjectReference>, &'static str> {
+    if count > reader.remaining() / MIN_REFERENCE_WIRE_BYTES {
+        return Err("reference count exceeds frame capacity");
+    }
+    let mut references = Vec::new();
+    // The complete count is known: growth slack would live as long as the
+    // immutable decoded record, including while retained in the object cache.
+    references
+        .try_reserve_exact(count)
+        .map_err(|_| "reference allocation failed")?;
+    for _ in 0..count {
+        let label_len = reader.usize_len()?;
+        let label = reader.take(label_len)?.to_vec();
+        let target = reader.identity(scheme)?;
+        let reference_kind =
+            ReferenceKind::from_code(reader.u8()?).ok_or("unknown reference-kind code")?;
+        references.push(ObjectReference::new(
+            ReferenceLabel::new(label),
+            target,
+            reference_kind,
+        ));
+    }
+    Ok(references)
 }
