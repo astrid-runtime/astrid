@@ -182,10 +182,13 @@ where
             ));
         }
         let mut missing = Vec::new();
-        for entry in inner.index.locations() {
-            let (object, location) = entry?;
-            if !excluded.contains(&object) && !representations.contains_direct(object)? {
-                missing.push((object, location));
+        {
+            let mut records = representations.direct_records();
+            for entry in inner.index.locations() {
+                let (object, location) = entry?;
+                if !excluded.contains(&object) && records.record(object)?.is_none() {
+                    missing.push((object, location));
+                }
             }
         }
         if missing.is_empty() {

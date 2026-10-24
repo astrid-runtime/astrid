@@ -49,6 +49,7 @@ mod node_view;
 use cold::memoized_closure_handles;
 use cold::{ColdNodes, ColdPhysicalMap};
 mod direct;
+mod direct_records;
 mod volume;
 use authority::{create_file as create_cap_file, open_file as open_cap_file, quarantine_entry};
 pub(super) use contiguous::open_store_root;
@@ -421,29 +422,7 @@ impl RepresentationStore {
         &self,
         object: ObjectId,
     ) -> Result<Option<RepresentationRecord>, DurableError> {
-        let Some(id) = self.reverse.first(object)? else {
-            return Ok(None);
-        };
-        // Recovery admits only validated Exact+DirectCanonical records into
-        // this index, and the catalogue admits exactly one direct profile.
-        // The authenticated earliest ID therefore preserves admission order
-        // without scanning every later retained representation on each read.
-        let bytes = self
-            .representations
-            .try_get(&Blake3PhysicalIdentity, PhysicalMapKey::from(id))?
-            .ok_or(DurableError::InvalidRepresentationState(
-                "reverse index references a missing representation",
-            ))?;
-        let record = RepresentationRecord::decode(&bytes)?;
-        if record.profile() != self.direct_profile
-            || !matches!(record.coverage(), Coverage::Exact { object: covered, .. } if *covered == object)
-            || !matches!(record.recipe(), Recipe::DirectCanonical { .. })
-        {
-            return Err(DurableError::InvalidRepresentationState(
-                "direct profile has incompatible coverage or recipe",
-            ));
-        }
-        Ok(Some(record))
+        self.direct_records().record(object)
     }
 
     /// On any error the engine must poison this store and recover it before
