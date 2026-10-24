@@ -767,3 +767,5 @@ fn content_errors_preserve_typed_sources() {
     let content_source = core::error::Error::source(&read).unwrap();
     assert!(content_source.downcast_ref::<ContentError>().is_some());
 }
+
+mod validation;
