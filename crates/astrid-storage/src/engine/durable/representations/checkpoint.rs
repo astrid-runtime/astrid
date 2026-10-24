@@ -24,6 +24,7 @@ impl RepresentationStore {
         limits: RecoveryLimits,
     ) -> Result<(Self, CurrentPointer), DurableError> {
         self.flush()?;
+        self.persisted_map_nodes.prepare_checkpoint_walk()?;
         let generation = increment(self.journal_generation)?;
         let mut batch = super::batch::MetadataBatch::new(limits)?;
         // Reuse authenticated locator ancestors for this read-only walk.

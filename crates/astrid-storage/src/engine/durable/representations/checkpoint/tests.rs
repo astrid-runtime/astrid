@@ -304,3 +304,53 @@ fn recovered_maps_retain_only_their_active_closures() {
         1
     );
 }
+
+#[test]
+fn spilled_checkpoint_preserves_authority_and_rejects_older_run_damage_before_current() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("spilled.volume");
+    let volume: Arc<dyn AstridVolume> = HostedFileVolume::open(&path).unwrap();
+    let limits = RecoveryLimits::process_addressable();
+    let budget = super::super::LocationIndexMemoryBudget::new(
+        std::num::NonZeroU64::new(super::super::LocationIndexMemoryBudget::MIN_BYTES).unwrap(),
+    )
+    .unwrap();
+    let mut store =
+        RepresentationStore::activate_volume(&volume, limits, ObjectId::new([1; 32]), [], budget)
+            .unwrap();
+    for offset in 1..=17 {
+        advance(&mut store, offset);
+    }
+    store.flush().unwrap();
+    assert!(store.persisted_map_nodes.test_spilled_run_count() > 1);
+    let active = store.active;
+    let reverse = store.reverse.snapshot().unwrap();
+    store.checkpoint_volume(&volume, limits).unwrap();
+    assert_eq!(store.active, active);
+    assert_eq!(store.reverse.snapshot().unwrap(), reverse);
+    drop(store);
+    let mut store = RepresentationStore::open_volume(&volume, limits, budget)
+        .unwrap()
+        .unwrap();
+    assert_eq!(store.active, active);
+    assert_eq!(store.reverse.snapshot().unwrap(), reverse);
+    for offset in 18..=34 {
+        advance(&mut store, offset);
+    }
+    store.flush().unwrap();
+    assert!(store.persisted_map_nodes.test_spilled_run_count() > 1);
+    let generation = store.journal_generation;
+    let mut before =
+        DurableFile::volume(Arc::clone(&volume), "representations/CURRENT", false).unwrap();
+    let pointer = read_all(&mut before, "read test pointer").unwrap();
+    store.persisted_map_nodes.truncate_oldest_test_run();
+    assert!(store.checkpoint_volume(&volume, limits).is_err());
+    assert_eq!(store.journal_generation, generation);
+    let mut after =
+        DurableFile::volume(Arc::clone(&volume), "representations/CURRENT", false).unwrap();
+    assert_eq!(
+        read_all(&mut after, "read unchanged pointer").unwrap(),
+        pointer
+    );
+    assert!(store.persisted_map_nodes.failed());
+}
