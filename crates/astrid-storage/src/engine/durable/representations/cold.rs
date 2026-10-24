@@ -12,7 +12,6 @@ use std::sync::Arc;
 use super::super::format::{frame_checksum, read_frame_at};
 use super::super::locations::{
     AuthenticatedPageMemo, ClosureProof, LocationIndexMemoryBudget, LocationLookup, PagedLocations,
-    RebuildLocations,
 };
 use super::super::{ArenaLocation, DurableError, File, RecoveryLimits, append_frame, io_error};
 use super::format::{
@@ -129,23 +128,19 @@ impl ColdNodes {
             sum.checked_add(map.nodes().len())
                 .ok_or(DurableError::EncodingOverflow)
         })?;
-        let mut rebuild = RebuildLocations::new(budget.durable_entries());
         // Publish canonical closure proofs only after full active-map validation.
         // Historical journal reachability memos never confer this stronger proof.
-        for entry in source.locations() {
-            let (id, location) = entry?;
-            let proof = if maps.iter().any(|map| {
+        let (locations, complete) = source.rebuild_proofs(budget.durable_entries(), |id| {
+            if maps.iter().any(|map| {
                 map.nodes()
                     .contains_key(&PhysicalMapNodeId::new(*id.as_bytes()))
             }) {
                 ClosureProof::Complete
             } else {
                 ClosureProof::Unknown
-            };
-            rebuild.push(id, location, proof)?;
-        }
+            }
+        })?;
         drop(source);
-        let (locations, complete) = rebuild.finish()?;
         if complete != expected_complete {
             return Err(DurableError::InvalidRepresentationState(
                 "validated physical closure is missing from metadata",
