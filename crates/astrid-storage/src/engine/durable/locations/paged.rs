@@ -480,6 +480,11 @@ impl PagedLocations {
         Ok(())
     }
 
+    /// Identity of the current authenticated run set, changed on replacement.
+    pub(in crate::engine::durable) fn runs_epoch(&self) -> u64 {
+        self.runs_epoch.load(Ordering::Acquire)
+    }
+
     pub(in crate::engine::durable) fn failed(&self) -> bool {
         self.failed.load(Ordering::Acquire)
     }

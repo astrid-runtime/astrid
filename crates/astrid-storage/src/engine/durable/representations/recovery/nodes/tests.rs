@@ -323,3 +323,106 @@ fn sorted_admission_never_hides_corrupted_superseded_node_media() {
         }
     }
 }
+
+#[test]
+fn positive_closure_memo_reuses_only_successful_queries_until_run_replacement() {
+    let map = map(11);
+    let mut file = DurableFile::native(tempfile::tempfile().unwrap());
+    let mut admission = reader(&file);
+    for node in map.nodes().values() {
+        append(&mut file, &mut admission, node);
+    }
+    let mut nodes = admission.finish().unwrap();
+    let id = map.root().unwrap();
+    assert!(
+        nodes
+            .resident_capacity_bytes()
+            .strict_add(nodes.complete_memo.borrow().capacity_bytes())
+            <= usize::try_from(nodes.budget.bytes().get()).unwrap() / 2
+    );
+    assert!(!nodes.complete(&id).unwrap());
+    assert!(!nodes.complete_memo.borrow().contains(id));
+    assert!(super::super::map_closure_complete(Some(id), &mut nodes).unwrap());
+    // remember() alone never populates the hot-query memo with every new node.
+    assert!(!nodes.complete_memo.borrow().contains(id));
+    assert!(nodes.complete(&id).unwrap());
+    assert!(nodes.complete_memo.borrow().contains(id));
+    *nodes.page_memo.get_mut() = AuthenticatedPageMemo::default();
+    assert!(nodes.complete(&id).unwrap());
+    assert_eq!(
+        nodes.page_memo.borrow().test_hit_miss(),
+        (0, 0),
+        "a successful repeated closure query needs no random page walk"
+    );
+    nodes.locations.truncate_test_run();
+    assert!(
+        nodes.complete(&id).is_err(),
+        "a changed run must be authenticated again"
+    );
+    assert!(nodes.locations.failed());
+    assert!(!nodes.complete_memo.borrow().contains(id));
+    // Even an independently warm slot must never bypass the failure fence.
+    nodes.complete_memo.get_mut().insert(id);
+    assert!(
+        nodes.complete(&id).is_err(),
+        "the failure fence must win over any memo"
+    );
+}
+
+#[test]
+fn positive_closure_memo_reset_and_failure_never_leave_sticky_true() {
+    let map = map(12);
+    let mut file = DurableFile::native(tempfile::tempfile().unwrap());
+    let mut admission = reader(&file);
+    for node in map.nodes().values() {
+        append(&mut file, &mut admission, node);
+    }
+    let mut nodes = admission.finish().unwrap();
+    let id = map.root().unwrap();
+    assert!(super::super::map_closure_complete(Some(id), &mut nodes).unwrap());
+    assert!(nodes.complete(&id).unwrap());
+    nodes.reset_proofs().unwrap();
+    assert!(!nodes.complete_memo.borrow().contains(id));
+    assert!(!nodes.complete(&id).unwrap());
+    let missing = PhysicalMapNodeId::new([0xf1; 32]);
+    assert!(!nodes.complete(&missing).unwrap());
+    assert!(!nodes.complete_memo.borrow().contains(missing));
+    assert!(super::super::map_closure_complete(Some(id), &mut nodes).unwrap());
+    assert!(nodes.complete(&id).unwrap());
+    nodes.locations.truncate_test_run();
+    assert!(nodes.reset_proofs().is_err());
+    assert!(!nodes.complete_memo.borrow().contains(id));
+    assert!(nodes.complete(&id).is_err());
+}
+
+#[test]
+fn positive_closure_memo_is_bounded_and_full_identity_checked() {
+    for bytes in [LocationIndexMemoryBudget::MIN_BYTES, 352, 65536, 1_048_576] {
+        let budget = LocationIndexMemoryBudget::new(NonZeroU64::new(bytes).unwrap()).unwrap();
+        let mut memo = CompleteMemo::new(budget).unwrap();
+        let capacity = memo.capacity_bytes();
+        assert!(u64::try_from(capacity).unwrap() <= bytes / 4);
+        let first = PhysicalMapNodeId::new([1; 32]);
+        memo.insert(first);
+        if capacity == 0 {
+            assert!(!memo.contains(first));
+            continue;
+        }
+        assert!(memo.contains(first));
+        let mut colliding = [1; 32];
+        colliding[31] = 2; // Same native-word slot, distinct complete identity.
+        let colliding = PhysicalMapNodeId::new(colliding);
+        assert!(!memo.contains(colliding));
+        memo.insert(colliding);
+        assert!(memo.contains(colliding));
+        assert!(!memo.contains(first));
+        for n in 0_u32..10_000 {
+            memo.insert(PhysicalMapNodeId::new(
+                *blake3::hash(&n.to_be_bytes()).as_bytes(),
+            ));
+        }
+        assert_eq!(memo.capacity_bytes(), capacity);
+        memo.sync(1);
+        assert!(!memo.contains(colliding));
+    }
+}
