@@ -50,6 +50,10 @@ impl JournalProofs {
         Ok(())
     }
 
+    pub(super) fn fence(&mut self) {
+        self.failed = true;
+    }
+
     fn sync(&mut self, source: &PagedLocations) -> Result<(), DurableError> {
         self.require_healthy(source)?;
         // Base run replacement revokes every dependent proof. Replacement of

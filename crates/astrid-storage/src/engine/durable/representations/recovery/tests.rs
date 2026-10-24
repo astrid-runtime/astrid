@@ -620,3 +620,114 @@ fn reverse_recovery_keeps_multiple_direct_records_and_selects_the_original_first
         .validate(&BTreeMap::from([(object, locations[&expected[0]])]))
         .unwrap();
 }
+
+#[test]
+fn certified_journal_preserves_missing_interior_root_failure_and_tail_repair() {
+    use crate::storage_model::PhysicalMapNodeId;
+    use std::io::Seek;
+    for interior in [false, true] {
+        let map = CanonicalPhysicalMap::build_dense(
+            &Blake3PhysicalIdentity,
+            PhysicalMapDomain::Placement,
+            vec![(PhysicalMapKey::new([42; 32]), vec![17])],
+        )
+        .unwrap();
+        let catalogue = RepresentationCatalogueRoot::new(1, None, 0, None, 0).unwrap();
+        let good = PlacementSet::new(1, None, 0, 0).unwrap();
+        let missing = PlacementSet::new(2, Some(PhysicalMapNodeId::new([255; 32])), 1, 1).unwrap();
+        let first = RepresentationState::new(
+            1,
+            None,
+            catalogue.identify(&Blake3PhysicalIdentity),
+            good.identify(&Blake3PhysicalIdentity),
+        )
+        .unwrap();
+        let first_id = first.identify(&Blake3PhysicalIdentity);
+        let second = RepresentationState::new(
+            2,
+            Some(first_id),
+            catalogue.identify(&Blake3PhysicalIdentity),
+            missing.identify(&Blake3PhysicalIdentity),
+        )
+        .unwrap();
+        let second_id = second.identify(&Blake3PhysicalIdentity);
+        let mut file = DurableFile::native(tempfile::tempfile().unwrap());
+        for node in map.nodes().values() {
+            append_test_metadata(
+                &mut file,
+                &MetadataFrame::map_node(&Blake3PhysicalIdentity, node).unwrap(),
+            );
+        }
+        for frame in [
+            MetadataFrame::catalogue(&Blake3PhysicalIdentity, catalogue),
+            MetadataFrame::placement(&Blake3PhysicalIdentity, good),
+            MetadataFrame::placement(&Blake3PhysicalIdentity, missing),
+            MetadataFrame::state(&Blake3PhysicalIdentity, first),
+            MetadataFrame::state(&Blake3PhysicalIdentity, second),
+        ] {
+            append_test_metadata(&mut file, &frame);
+        }
+        let limits = RecoveryLimits::process_addressable();
+        let mut metadata = recover_metadata(
+            &mut file,
+            limits,
+            super::super::LocationIndexMemoryBudget::default(),
+        )
+        .unwrap();
+        let mut journal = DurableFile::native(tempfile::tempfile().unwrap());
+        let checkpoint = JournalEntry::Checkpoint {
+            journal_generation: FIRST_JOURNAL_GENERATION,
+            active: None,
+            state_generation: 0,
+            prior_journal_digest: None,
+        };
+        super::super::super::append_frame(&mut journal, JOURNAL_MAGIC, &checkpoint.encode())
+            .unwrap();
+        let checkpoint_bytes = read_all(&mut journal, "read test checkpoint").unwrap();
+        let current = CurrentPointer {
+            journal_generation: FIRST_JOURNAL_GENERATION,
+            checkpoint_digest: journal_digest(&checkpoint_bytes),
+            max_tail_frames: 3,
+            max_tail_bytes: 4096,
+        };
+        for (expected, replacement) in [(None, first_id), (Some(first_id), second_id)] {
+            append_test_state_cas(&mut journal, expected, replacement);
+        }
+        let tail_end = journal.seek(SeekFrom::End(0)).unwrap();
+        if interior {
+            append_test_state_cas(&mut journal, Some(second_id), second_id);
+        }
+        let original_len = journal.seek(SeekFrom::End(0)).unwrap();
+        let result = recover_journal(&mut journal, current, &mut metadata, limits);
+        assert!(metadata.nodes.has_matching_certificate());
+        if interior {
+            assert!(matches!(
+                result,
+                Err(DurableError::InvalidRepresentationState(
+                    "interior representation journal state has an incomplete metadata closure"
+                ))
+            ));
+            assert_eq!(journal.seek(SeekFrom::End(0)).unwrap(), original_len);
+        } else {
+            assert_eq!(result.unwrap(), (first_id, first));
+            assert!(journal.seek(SeekFrom::End(0)).unwrap() < tail_end);
+            assert_eq!(
+                recover_journal(&mut journal, current, &mut metadata, limits).unwrap(),
+                (first_id, first)
+            );
+        }
+    }
+}
+
+fn append_test_state_cas(
+    journal: &mut DurableFile,
+    expected: Option<RepresentationStateId>,
+    replacement: RepresentationStateId,
+) {
+    let entry = JournalEntry::StateCas {
+        journal_generation: FIRST_JOURNAL_GENERATION,
+        expected,
+        replacement,
+    };
+    super::super::super::append_frame(journal, JOURNAL_MAGIC, &entry.encode()).unwrap();
+}

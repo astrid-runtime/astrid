@@ -179,6 +179,7 @@ pub(super) fn recover_journal<F: DurableIo>(
     )?;
     validate_tail_budget(entries.len(), bytes.len(), checkpoint_end, current)?;
     metadata.retain_journal_authority(&entries)?;
+    metadata.nodes.certify_closures()?;
     let (mut active, mut generation) = recover_checkpoint(first, current, metadata)?;
     let mut previous_state = active
         .map(|id| {
