@@ -534,3 +534,89 @@ fn recovery_rejects_unused_placement_profile_and_missing_direct_blob() {
         .is_err()
     );
 }
+
+#[test]
+fn reverse_recovery_keeps_multiple_direct_records_and_selects_the_original_first_placement() {
+    use crate::storage_model::{BlobId, ObjectId, Replica, ReplicaLocator};
+    let object = ObjectId::new([4; 32]);
+    let (profile, profile_id) =
+        super::super::activation::direct_profile(ObjectId::new([1; 32])).unwrap();
+    let profiles = CanonicalPhysicalMap::build_dense(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Profile,
+        vec![(PhysicalMapKey::from(profile_id), profile.encode().unwrap())],
+    )
+    .unwrap();
+    let mut records = Vec::new();
+    let mut placement_entries = Vec::new();
+    let mut locations = BTreeMap::new();
+    for n in [9_u8, 2] {
+        let blob = BlobId::new([n; 32]);
+        let record = RepresentationRecord::new(
+            profile_id,
+            Coverage::exact(object, 8).unwrap(),
+            Recipe::DirectCanonical { blob },
+            8,
+            8,
+            None,
+        )
+        .unwrap();
+        let id = record.identify(&Blake3PhysicalIdentity).unwrap();
+        records.push((PhysicalMapKey::from(id), record.encode().unwrap()));
+        let location = super::super::ArenaLocation {
+            offset: u64::from(n),
+            payload_len: 8,
+            checksum: [n; 32],
+        };
+        let replica = Replica::new(
+            super::super::LOCAL_STORAGE_NODE,
+            ReplicaLocator::ArenaFrame {
+                arena_generation: 0,
+                offset: location.offset,
+                payload_length: location.payload_len,
+                frame_checksum: location.checksum,
+            },
+        )
+        .unwrap();
+        let placement = PlacementEntry::new(blob, profile_id, 8, vec![replica]).unwrap();
+        placement_entries.push((PhysicalMapKey::from(blob), placement.encode().unwrap()));
+        locations.insert(id, location);
+    }
+    let representations = CanonicalPhysicalMap::build_dense(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Representation,
+        records,
+    )
+    .unwrap();
+    let placements = CanonicalPhysicalMap::build_dense(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Placement,
+        placement_entries,
+    )
+    .unwrap();
+    let expected = active_entries(&representations)
+        .map(|entry| {
+            let (_, bytes) = entry.unwrap();
+            RepresentationRecord::decode(&bytes)
+                .unwrap()
+                .identify(&Blake3PhysicalIdentity)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let (reverse, extents, direct) = validate_representations(
+        &profiles,
+        &representations,
+        &placements,
+        super::super::LocationIndexMemoryBudget::default(),
+    )
+    .unwrap();
+    assert_eq!(extents, 2);
+    assert_eq!(
+        reverse.snapshot().unwrap(),
+        BTreeMap::from([(object, expected.clone())])
+    );
+    assert_eq!(reverse.first(object).unwrap(), Some(expected[0]));
+    direct
+        .validate(&BTreeMap::from([(object, locations[&expected[0]])]))
+        .unwrap();
+}
