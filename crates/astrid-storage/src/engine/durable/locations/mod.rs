@@ -153,3 +153,8 @@ pub(super) use prefix::ArenaPrefix;
 
 #[cfg(test)]
 mod engine_tests;
+
+#[cfg(test)]
+pub(in crate::engine::durable) fn test_take_page_auth_count() -> usize {
+    run::test_take_page_auth_count()
+}
