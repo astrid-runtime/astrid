@@ -1,12 +1,14 @@
-//! Bounded bottom-up construction: one unfinished page per tree level.
+//! Bounded construction: one unfinished page per level and one buffered writer.
 
 use super::{
     BRANCH_CAPACITY, CHILD_BYTES, DurableError, ENTRY_BYTES, File, HEADER_BYTES, LEAF_CAPACITY,
     LocatorValue, Node, ObjectId, PAGE_BYTES, Run, Write, corrupt, digest,
 };
 
+use std::io::BufWriter;
+
 pub(in crate::engine::durable::locations) struct Builder {
-    file: File,
+    file: BufWriter<File>,
     pub(super) leaf: Vec<(ObjectId, LocatorValue)>,
     pub(super) levels: Vec<Vec<Node>>,
     bytes: u64,
@@ -20,9 +22,12 @@ use super::ArenaLocation;
 impl Builder {
     pub(in crate::engine::durable::locations) fn new() -> Result<Self, DurableError> {
         Ok(Self {
-            file: tempfile::tempfile().map_err(|source| {
-                super::super::super::io_error("create anonymous location accelerator", source)
-            })?,
+            file: BufWriter::with_capacity(
+                PAGE_BYTES.strict_mul(2),
+                tempfile::tempfile().map_err(|source| {
+                    super::super::super::io_error("create anonymous location accelerator", source)
+                })?,
+            ),
             leaf: Vec::with_capacity(LEAF_CAPACITY),
             levels: Vec::new(),
             bytes: 0,
@@ -79,7 +84,14 @@ impl Builder {
                 .ok_or_else(|| corrupt(self.bytes, "location builder lost root"))?;
             if pending.next().is_none() {
                 return Ok(Some(Run {
-                    file: self.file,
+                    // Publishing the root requires every buffered page to reach
+                    // the anonymous file. Drop-time flushing cannot report errors.
+                    file: self.file.into_inner().map_err(|error| {
+                        super::super::super::io_error(
+                            "flush anonymous location accelerator",
+                            error.into_error(),
+                        )
+                    })?,
                     root: node,
                     count: self.count,
                     bytes: self.bytes,
@@ -180,5 +192,57 @@ impl Builder {
             upper,
             level,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adjacent_pages_are_batched_and_flushed_before_the_run_is_readable() {
+        let mut builder = Builder::new().unwrap();
+        for ordinal in 0..LEAF_CAPACITY * 2 {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&u64::try_from(ordinal).unwrap().to_be_bytes());
+            builder
+                .push(
+                    ObjectId::new(bytes),
+                    ArenaLocation {
+                        offset: u64::try_from(ordinal).unwrap(),
+                        payload_len: 48,
+                        checksum: [3; 32],
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            builder.file.get_ref().metadata().unwrap().len(),
+            0,
+            "two adjacent leaf pages should share buffered output"
+        );
+        let run = builder.finish().unwrap().unwrap();
+        assert_eq!(run.file.metadata().unwrap().len(), run.bytes);
+        assert_eq!(
+            run.entries().collect::<Result<Vec<_>, _>>().unwrap().len(),
+            LEAF_CAPACITY * 2
+        );
+    }
+
+    #[test]
+    fn buffered_page_output_failure_cannot_publish_a_run() {
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        let mut builder = Builder::new().unwrap();
+        // A read-only file accepts bytes into the writer buffer, then fails when
+        // finish must publish those bytes. This exercises the delayed-error path.
+        builder.file = std::io::BufWriter::new(std::fs::File::open(temporary.path()).unwrap());
+        let id = ObjectId::new([1; 32]);
+        let location = ArenaLocation {
+            offset: 0,
+            payload_len: 48,
+            checksum: [3; 32],
+        };
+        builder.push(id, location).unwrap();
+        assert!(matches!(builder.finish(), Err(DurableError::Io { .. })));
     }
 }
