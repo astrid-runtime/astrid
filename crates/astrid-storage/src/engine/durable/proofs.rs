@@ -4,10 +4,13 @@
 //! has been checked. Root publication does not create evidence. Missing bits
 //! require the ordinary traversal; scratch errors require recovery.
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 
 use super::{
-    DurableError, DurableInner, ObjectId, locations::PagedLocations, wal::PendingWalOverlay,
+    DurableError, DurableInner, ObjectId,
+    locations::{AuthenticatedPageMemo, PagedLocations},
+    wal::PendingWalOverlay,
 };
 
 pub(super) trait ClosureProofLookup {
@@ -23,11 +26,17 @@ impl ClosureProofLookup for BTreeSet<ObjectId> {
 pub(super) struct ProvenObjects<'a, P: Ord> {
     index: &'a PagedLocations,
     pending: &'a PendingWalOverlay<P>,
+    // Disposable pages live only as long as this immutable index borrow.
+    pages: RefCell<AuthenticatedPageMemo>,
 }
 
 impl<'a, P: Ord> ProvenObjects<'a, P> {
-    pub(super) const fn new(index: &'a PagedLocations, pending: &'a PendingWalOverlay<P>) -> Self {
-        Self { index, pending }
+    pub(super) fn new(index: &'a PagedLocations, pending: &'a PendingWalOverlay<P>) -> Self {
+        Self {
+            index,
+            pending,
+            pages: RefCell::default(),
+        }
     }
 }
 
@@ -36,7 +45,8 @@ impl<P: Ord> ClosureProofLookup for ProvenObjects<'_, P> {
         if self.pending.closure_proven(id) {
             return Ok(true);
         }
-        self.index.closure_proven(*id)
+        self.index
+            .closure_proven_memo(*id, &mut self.pages.borrow_mut())
     }
 }
 
@@ -45,19 +55,15 @@ impl<P: Ord> DurableInner<P> {
         ProvenObjects::new(&self.index, &self.pending_wal)
     }
 
-    pub(super) fn mark_proven(&mut self, id: ObjectId) -> Result<(), DurableError> {
-        if self.pending_wal.mark_proven(id) {
-            return Ok(());
-        }
-        self.index.mark_proven(id)
-    }
-
     pub(super) fn mark_proven_all(
         &mut self,
         ids: impl IntoIterator<Item = ObjectId>,
     ) -> Result<(), DurableError> {
+        let mut pages = AuthenticatedPageMemo::default();
         for id in ids {
-            self.mark_proven(id)?;
+            if !self.pending_wal.mark_proven(id) {
+                self.index.mark_proven_memo(id, &mut pages)?;
+            }
         }
         Ok(())
     }
