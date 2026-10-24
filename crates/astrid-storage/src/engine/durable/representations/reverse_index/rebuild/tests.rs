@@ -94,3 +94,31 @@ fn failed_reverse_rebuild_cannot_publish_partial_rows() {
             .is_err()
     );
 }
+
+#[test]
+fn sorted_head_publication_does_not_reread_intermediate_locator_runs() {
+    let mut rebuild = Rebuild::new(budget(LocationIndexMemoryBudget::MIN_BYTES * 128));
+    for n in 0..2048 {
+        rebuild.push(object(n % 1024), id(n)).unwrap();
+    }
+    test_take_page_auth_count();
+    let index = rebuild.finish(|_, _| Ok(())).unwrap();
+    let pages = test_take_page_auth_count();
+    eprintln!("grouped head publication locator pages reread={pages}");
+    assert_eq!(
+        pages, 0,
+        "sorted grouped heads need only one output builder"
+    );
+    assert_eq!(index.len(), 1024);
+    for n in 0..1024 {
+        assert_eq!(index.first(object(n)).unwrap(), Some(id(n)));
+        assert_eq!(
+            index
+                .ids_newest_first(object(n))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![id(n.strict_add(1024)), id(n)]
+        );
+    }
+}

@@ -15,7 +15,7 @@ use crate::engine::durable::media::DurableIo;
 mod builder;
 mod reader;
 
-pub(super) use builder::Builder;
+pub(in crate::engine::durable) use builder::Builder;
 pub(super) use reader::Entries;
 
 // Private page layout for anonymous accelerators, not a persistent protocol or

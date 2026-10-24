@@ -21,7 +21,6 @@ pub(in crate::engine::durable) struct LocatorValue {
 }
 
 impl LocatorValue {
-    #[cfg(test)]
     const fn unknown(location: ArenaLocation) -> Self {
         Self {
             location,
@@ -79,6 +78,7 @@ mod run;
 mod paged;
 
 pub(super) use paged::{AuthenticatedPageMemo, PagedLocations, RebuildLocations};
+pub(super) use run::Builder as SortedLocationBuilder;
 
 /// Shared resident staging target for complete durable locators.
 ///
