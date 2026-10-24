@@ -123,3 +123,54 @@ fn private_file_validation_rejects_fifo_without_waiting_for_a_writer() {
     assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
     worker.join().unwrap();
 }
+
+#[test]
+fn public_acl_inspection_accepts_private_sockets_and_rejects_socket_acls() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("callback.sock");
+    let _socket = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    super::super::validate_no_extended_acl(&path).unwrap();
+    for rule in ["everyone allow read", "everyone deny write"] {
+        add_acl(&path, rule);
+        assert_eq!(
+            super::super::validate_no_extended_acl(&path)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(
+            std::process::Command::new("/bin/chmod")
+                .arg("-N")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        super::super::validate_no_extended_acl(&path).unwrap();
+    }
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(&path, &alias).unwrap();
+    assert!(super::super::validate_no_extended_acl(&alias).is_err());
+    assert!(validate_socket(&alias).is_err());
+    assert!(validate_socket(&root.path().join("missing")).is_err());
+}
+
+#[test]
+fn socket_acl_query_distinguishes_missing_path_from_missing_acl_property() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("callback.sock");
+    let native_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert!(
+        matches!(inspect_socket_path(&native_path), Err(error) if error.kind() == io::ErrorKind::NotFound)
+    );
+    let socket = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let (stat, security) = inspect_socket_path(&native_path).unwrap();
+    assert_eq!(stat.st_mode & nix::libc::S_IFMT, nix::libc::S_IFSOCK);
+    security.validate_acl().unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert!(
+        matches!(inspect_socket_path(&native_path), Err(error) if error.kind() == io::ErrorKind::NotFound)
+    );
+    drop(socket);
+}

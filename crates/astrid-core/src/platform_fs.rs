@@ -314,7 +314,15 @@ pub fn validate_private_file(path: &Path) -> io::Result<()> {
 pub fn validate_no_extended_acl(path: &Path) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        macos_acl::validate(&open_file_no_follow_unix(path)?)
+        match open_file_no_follow_unix(path) {
+            Ok(file) => macos_acl::validate(&file),
+            // Darwin cannot open a socket vnode as a file. Inspect its ACL
+            // relative to the captured parent and verify the socket identity.
+            Err(error) if error.raw_os_error() == Some(nix::libc::EOPNOTSUPP) => {
+                macos_acl::validate_socket(path)
+            },
+            Err(error) => Err(error),
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
