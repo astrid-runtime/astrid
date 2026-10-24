@@ -2,6 +2,8 @@
 //!
 //! Nodes are immutable and reference-counted, so each published projection
 //! reuses the previous projection and copies only one balanced search path.
+//! Unchanged resolved payloads share immutable storage across those copied paths.
+//! Each projection still charges the full capacity of every reachable payload.
 
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -14,7 +16,7 @@ pub(super) struct OverlayMap {
 #[derive(Debug)]
 struct Node {
     key: Vec<u8>,
-    value: Option<Vec<u8>>,
+    value: Arc<Option<Vec<u8>>>,
     left: Option<Arc<Self>>,
     right: Option<Arc<Self>>,
     height: u32,
@@ -44,7 +46,7 @@ impl OverlayMap {
     }
 
     pub(super) fn insert(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) {
-        self.root = Some(insert(self.root.take(), key, value));
+        self.root = Some(insert(self.root.take(), key, Arc::new(value)));
     }
 
     pub(super) fn range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
@@ -65,11 +67,11 @@ fn collect_all(node: Option<&Node>, entries: &mut Vec<(Vec<u8>, Option<Vec<u8>>)
         return;
     };
     collect_all(node.left.as_deref(), entries);
-    entries.push((node.key.clone(), node.value.clone()));
+    entries.push((node.key.clone(), node.value.as_ref().clone()));
     collect_all(node.right.as_deref(), entries);
 }
 
-fn insert(root: Option<Arc<Node>>, key: Vec<u8>, value: Option<Vec<u8>>) -> Arc<Node> {
+fn insert(root: Option<Arc<Node>>, key: Vec<u8>, value: Arc<Option<Vec<u8>>>) -> Arc<Node> {
     let Some(node) = root else {
         return make_node(key, value, None, None);
     };
@@ -93,14 +95,16 @@ fn insert(root: Option<Arc<Node>>, key: Vec<u8>, value: Option<Vec<u8>>) -> Arc<
 
 fn make_node(
     key: Vec<u8>,
-    value: Option<Vec<u8>>,
+    value: Arc<Option<Vec<u8>>>,
     left: Option<Arc<Node>>,
     right: Option<Arc<Node>>,
 ) -> Arc<Node> {
     let retained_bytes = std::mem::size_of::<Node>()
         .saturating_add(std::mem::size_of::<[usize; 2]>())
         .saturating_add(key.capacity())
-        .saturating_add(value.as_ref().map_or(0, Vec::capacity))
+        .saturating_add(std::mem::size_of::<Option<Vec<u8>>>())
+        .saturating_add(std::mem::size_of::<[usize; 2]>())
+        .saturating_add(value.as_ref().as_ref().map_or(0, Vec::capacity))
         .saturating_add(left.as_ref().map_or(0, |node| node.retained_bytes))
         .saturating_add(right.as_ref().map_or(0, |node| node.retained_bytes));
     Arc::new(Node {
@@ -206,7 +210,7 @@ fn collect_range(
         collect_range(node.left.as_deref(), start, end, entries);
     }
     if node.key.as_slice() >= start && node.key.as_slice() < end {
-        entries.push((node.key.clone(), node.value.clone()));
+        entries.push((node.key.clone(), node.value.as_ref().clone()));
     }
     if node.key.as_slice() < end {
         collect_range(node.right.as_deref(), start, end, entries);
@@ -214,71 +218,4 @@ fn collect_range(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
-    use super::OverlayMap;
-
-    fn measured(node: Option<&super::Node>) -> usize {
-        node.map_or(0, |node| {
-            std::mem::size_of::<super::Node>()
-                .saturating_add(std::mem::size_of::<[usize; 2]>())
-                .saturating_add(node.key.capacity())
-                .saturating_add(node.value.as_ref().map_or(0, Vec::capacity))
-                .saturating_add(measured(node.left.as_deref()))
-                .saturating_add(measured(node.right.as_deref()))
-        })
-    }
-
-    #[test]
-    fn subtree_charge_includes_spare_capacity_and_survives_rotations_and_sharing() {
-        let mut overlay = OverlayMap::default();
-        for index in 0..128_u8 {
-            let mut key = Vec::with_capacity(128);
-            key.push(index);
-            let mut value = Vec::with_capacity(1024);
-            value.push(index);
-            overlay.insert(key, Some(value));
-            assert_eq!(overlay.retained_bytes(), measured(overlay.root.as_deref()));
-        }
-        let prior = overlay.clone();
-        let before = prior.retained_bytes();
-        for index in (0..128_u8).rev() {
-            overlay.insert(vec![index], None);
-            assert_eq!(overlay.retained_bytes(), measured(overlay.root.as_deref()));
-        }
-        assert_eq!(prior.retained_bytes(), before);
-        assert!(before > overlay.retained_bytes());
-        assert_eq!(OverlayMap::default().retained_bytes(), 0);
-    }
-
-    #[test]
-    fn persistent_overlay_matches_an_ordered_map_under_replacement() {
-        let mut overlay = OverlayMap::default();
-        let mut expected = BTreeMap::<Vec<u8>, Option<Vec<u8>>>::new();
-        let mut seed = 0x4f56_4552_4c41_5931_u64;
-        for step in 0..2_048_u64 {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            let key = format!("n\0{:04}", seed % 257).into_bytes();
-            let value = (seed & 3 != 0).then(|| seed.to_le_bytes().to_vec());
-            let prior = overlay.clone();
-            let expected_before = expected
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect::<Vec<_>>();
-            overlay.insert(key.clone(), value.clone());
-            expected.insert(key.clone(), value.clone());
-            assert_eq!(overlay.get(&key), Some(&value), "step {step}");
-            assert_eq!(prior.all(), expected_before, "step {step}");
-            assert_eq!(
-                overlay.all(),
-                expected
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect::<Vec<_>>()
-            );
-        }
-    }
-}
+mod tests;
