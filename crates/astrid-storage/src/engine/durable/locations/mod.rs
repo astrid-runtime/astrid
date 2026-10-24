@@ -83,10 +83,12 @@ pub(super) use paged::{AuthenticatedPageMemo, PagedLocations, RebuildLocations};
 /// Shared resident staging target for complete durable locators.
 ///
 /// The engine divides this target between the historical object locator,
-/// physical-node locator, private path-copy locator, and reverse heads. All are shared across
+/// physical-node locator, private path-copy locator, and reverse heads. During
+/// recovery, a bounded positive reachability memo borrows the otherwise absent
+/// private path-copy partition; it is released before cold mutation starts. All are shared across
 /// principals. Their sorted staging vectors together reserve at most this many
 /// entry bytes. Tree roots,
-/// iterators and one page per merge level are additional bounded workspace; OS
+/// iterators, buffered page output and one page per merge level are additional bounded workspace; OS
 /// file cache is outside this target. Durable history is never truncated.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LocationIndexMemoryBudget(std::num::NonZeroU64);
