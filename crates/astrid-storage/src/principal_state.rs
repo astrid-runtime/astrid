@@ -101,6 +101,7 @@ pub use staging::{
 pub use store_open::open_runtime_principal_store_for_pack;
 pub use store_open::{
     open_runtime_kv, open_runtime_kv_with_directory, open_runtime_principal_store,
+    open_runtime_principal_store_from_retiring_projection,
     open_runtime_principal_store_with_directory, open_runtime_principal_store_with_object_cache,
     open_runtime_principal_store_with_policy,
 };

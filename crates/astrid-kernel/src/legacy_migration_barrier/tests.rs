@@ -397,7 +397,7 @@ fn first_migration_retires_empty_unsupported_kv_and_token_directories() {
     assert!(!principal_home.tokens_dir().exists());
 }
 
-fn fresh_retirement_ledger(cow: SourceIdentity) -> MigrationLedger {
+pub(super) fn fresh_retirement_ledger(cow: SourceIdentity) -> MigrationLedger {
     let mut components = vec![
         MigrationComponent {
             name: "system:cow".to_owned(),
