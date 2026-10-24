@@ -266,3 +266,61 @@ fn immutable_head_scan_reuses_pages_but_reauthenticates_every_link() {
     assert!(index.first_memo(object(0), &mut memo).is_err());
     assert!(index.first_memo(object(9999), &mut memo).is_err());
 }
+
+#[test]
+fn equivalence_authenticates_each_head_page_only_in_the_stream() {
+    use crate::engine::durable::locations::test_take_page_auth_count;
+    let mut first = ReverseIndex::new(budget(128)).unwrap();
+    let mut second = ReverseIndex::new(budget(128)).unwrap();
+    for number in 0..256 {
+        for id in [number, number % 7, number % 7] {
+            first.insert(object(number), representation(id)).unwrap();
+        }
+    }
+    // Distinct scratch offsets must not affect semantic equivalence.
+    for number in (0..256).rev() {
+        for id in [number, number % 7, number % 7] {
+            second.insert(object(number), representation(id)).unwrap();
+        }
+    }
+    test_take_page_auth_count();
+    for index in [&first, &second] {
+        for row in index.heads.locations() {
+            row.unwrap();
+        }
+    }
+    let streamed = test_take_page_auth_count();
+    assert!(streamed > 0);
+    assert!(first.equivalent(&second).unwrap());
+    let compared = test_take_page_auth_count();
+    eprintln!("reverse equivalence pages: compared={compared}, streamed={streamed}");
+    assert_eq!(
+        compared, streamed,
+        "equivalence must consume authenticated streamed head locations"
+    );
+}
+
+#[test]
+fn equivalence_rejects_latched_reverse_failure_even_without_live_heads() {
+    let first = ReverseIndex::new(budget(1)).unwrap();
+    let second = ReverseIndex::new(budget(1)).unwrap();
+    first.failed.store(true, Ordering::Release);
+    assert!(first.equivalent(&second).is_err());
+    assert!(second.equivalent(&first).is_err());
+}
+
+#[test]
+fn equivalence_freshly_authenticates_older_links_below_matching_heads() {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut first = ReverseIndex::new(budget(1)).unwrap();
+    let mut second = ReverseIndex::new(budget(1)).unwrap();
+    for id in [1, 2, 3] {
+        first.insert(object(7), representation(id)).unwrap();
+        second.insert(object(7), representation(id)).unwrap();
+    }
+    assert!(first.equivalent(&second).unwrap());
+    second.file.seek(SeekFrom::Start(0)).unwrap();
+    second.file.write_all(&[0]).unwrap();
+    assert!(first.equivalent(&second).is_err());
+    assert!(second.failed());
+}
