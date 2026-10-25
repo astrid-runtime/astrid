@@ -147,3 +147,93 @@ fn first_post_recovery_path_copy_does_not_expand_unchanged_complete_subtrees() {
     assert_eq!(metadata.len(), visited);
     assert_eq!(appended.len(), visited);
 }
+
+#[test]
+fn canonical_proof_handoff_reads_one_source_pass_and_discards_historical_proofs() {
+    use crate::engine::durable::locations::test_take_page_auth_count;
+    let active = map(1);
+    let historical = map(2);
+    let file = File::native(tempfile::tempfile().unwrap());
+    let mut locations = std::collections::BTreeMap::new();
+    for node in active.nodes().values().chain(historical.nodes().values()) {
+        let payload = MetadataFrame::map_node(&Blake3PhysicalIdentity, node)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let location =
+            append_frame(&mut file.try_clone().unwrap(), METADATA_MAGIC, &payload).unwrap();
+        locations.insert(
+            ObjectId::new(*node.identify(&Blake3PhysicalIdentity).unwrap().as_bytes()),
+            location,
+        );
+    }
+    let all_proven = locations.keys().copied().collect();
+    let source = PagedLocations::from_map_with_proofs(
+        locations,
+        &all_proven,
+        std::num::NonZeroUsize::new(8).unwrap(),
+    )
+    .unwrap();
+    test_take_page_auth_count();
+    let count = source
+        .locations()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .len();
+    let one_pass = test_take_page_auth_count();
+    assert!(one_pass > 0);
+    let budget = LocationIndexMemoryBudget::new(std::num::NonZeroU64::new(352).unwrap()).unwrap();
+    let nodes = ColdNodes::from_recovered_locations(
+        file,
+        source,
+        RecoveryLimits::process_addressable(),
+        budget,
+        &[&active],
+    )
+    .unwrap();
+    assert_eq!(
+        test_take_page_auth_count(),
+        one_pass,
+        "canonical proof handoff must not re-sort ordered input"
+    );
+    assert_eq!(nodes.len(), count);
+    for id in active.nodes().keys() {
+        assert!(nodes.complete(id).unwrap());
+    }
+    for id in historical.nodes().keys() {
+        assert!(
+            !nodes.complete(id).unwrap(),
+            "historical source proofs cannot confer canonical membership"
+        );
+    }
+}
+
+#[test]
+fn canonical_proof_handoff_authenticates_source_again_before_publication() {
+    let map = (0_u64..127)
+        .map(|index| {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&index.to_be_bytes());
+            (
+                ObjectId::new(bytes),
+                ArenaLocation {
+                    offset: index,
+                    payload_len: 48,
+                    checksum: [5; 32],
+                },
+            )
+        })
+        .collect();
+    let source = PagedLocations::from_map(map, std::num::NonZeroUsize::new(8).unwrap()).unwrap();
+    source.truncate_test_run_without_epoch();
+    assert!(
+        ColdNodes::from_recovered_locations(
+            File::native(tempfile::tempfile().unwrap()),
+            source,
+            RecoveryLimits::process_addressable(),
+            LocationIndexMemoryBudget::default(),
+            &[],
+        )
+        .is_err()
+    );
+}

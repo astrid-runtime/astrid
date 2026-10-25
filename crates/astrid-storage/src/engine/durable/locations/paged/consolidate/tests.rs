@@ -94,3 +94,42 @@ fn consolidation_checks_established_unique_count_before_publication() {
     assert_eq!(locations.runs_epoch(), epoch);
     assert!(locations.test_spilled_run_count() > 1);
 }
+
+#[test]
+fn proof_reset_reads_only_one_sorted_source_pass() {
+    use crate::engine::durable::locations::test_take_page_auth_count;
+    let map = (0..4096)
+        .map(entry)
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let proven = map.keys().copied().collect();
+    let mut locations =
+        PagedLocations::from_map_with_proofs(map.clone(), &proven, NonZeroUsize::new(8).unwrap())
+            .unwrap();
+    test_take_page_auth_count();
+    let before = locations.rows().collect::<Result<Vec<_>, _>>().unwrap();
+    let one_pass = test_take_page_auth_count();
+    assert!(one_pass > 0);
+    assert!(
+        before
+            .iter()
+            .all(|(_, row)| row.proof == ClosureProof::Complete)
+    );
+    locations.clear_proofs().unwrap();
+    let rewritten = test_take_page_auth_count();
+    assert_eq!(
+        rewritten, one_pass,
+        "already sorted rows must not be sorted and merged again"
+    );
+    assert_eq!(
+        locations
+            .locations()
+            .collect::<Result<std::collections::BTreeMap<_, _>, _>>()
+            .unwrap(),
+        map
+    );
+    assert!(
+        locations
+            .rows()
+            .all(|row| row.unwrap().1.proof == ClosureProof::Unknown)
+    );
+}
