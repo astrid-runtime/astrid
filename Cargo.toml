@@ -269,8 +269,8 @@ wasmparser = "0.257.1"
 windows-sys = "0.61"
 wit-component = "0.257.1"
 wit-parser = "0.257.1"
-wasmtime = { version = "48.0.6", features = ["component-model", "cranelift", "call-hook"] }
-wasmtime-wasi = "48.0.6"
+wasmtime = { version = "48.0.7", features = ["component-model", "cranelift", "call-hook"] }
+wasmtime-wasi = "48.0.7"
 unicode-normalization = "=0.1.25"
 unicode-width = "0.2"
 which = "8"
