@@ -77,6 +77,7 @@ fn published_updates_bound_resident_history_and_recover_every_entry() {
     );
     let active = store.active;
     drop(store);
+    super::super::node_view::test_take_count_walks();
     let mut reopened = RepresentationStore::open_volume(
         &volume,
         limits,
@@ -84,6 +85,11 @@ fn published_updates_bound_resident_history_and_recover_every_entry() {
     )
     .unwrap()
     .unwrap();
+    assert_eq!(
+        super::super::node_view::test_take_count_walks(),
+        0,
+        "real volume recovery must reuse its validated active-closure counts"
+    );
     assert_eq!(reopened.active, active);
     for object in objects {
         assert!(reopened.contains_direct(object).unwrap());
@@ -235,5 +241,74 @@ fn residency_remeasurement_reuses_page_authentication_but_not_node_bodies() {
         store.residency.representations = 0;
         store.residency.placements = 0;
         assert!(store.reclaim_map_history().is_err());
+    }
+}
+
+#[test]
+fn recovered_residency_counts_only_active_nodes_without_another_map_walk() {
+    use super::super::node_view::test_take_count_walks;
+    use crate::storage_model::{CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapKey};
+    use std::collections::BTreeMap;
+
+    for dense in [false, true] {
+        let mut arena = BTreeMap::new();
+        let mut roots = [None; 3];
+        let mut expected = [0; 3];
+        for (index, domain) in [
+            PhysicalMapDomain::Profile,
+            PhysicalMapDomain::Representation,
+            PhysicalMapDomain::Placement,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let entries = (0_u64..64)
+                .map(|n| {
+                    (
+                        PhysicalMapKey::new(*blake3::hash(&n.to_le_bytes()).as_bytes()),
+                        n.to_le_bytes().to_vec(),
+                    )
+                })
+                .collect();
+            let mut map = if dense {
+                CanonicalPhysicalMap::build_dense(&super::Blake3PhysicalIdentity, domain, entries)
+            } else {
+                CanonicalPhysicalMap::build(&super::Blake3PhysicalIdentity, domain, entries)
+            }
+            .unwrap();
+            roots[index] = map.root();
+            expected[index] = map.nodes().len();
+            // Retain a later root in the same arena: its nodes must not inflate
+            // the original active root's residency baseline.
+            map.insert(
+                &super::Blake3PhysicalIdentity,
+                PhysicalMapKey::new([255; 32]),
+                vec![7; 4096],
+            )
+            .unwrap();
+            arena.extend(map.nodes().iter().map(|(id, node)| (*id, node.clone())));
+        }
+        test_take_count_walks();
+        let (residency, maps) = super::MapResidency::recover(roots, &arena, arena.len()).unwrap();
+        assert_eq!(
+            test_take_count_walks(),
+            0,
+            "canonical recovery already visited these nodes"
+        );
+        assert_eq!(
+            [
+                residency.profiles,
+                residency.representations,
+                residency.placements
+            ],
+            expected
+        );
+        assert_eq!(residency.measured_history, arena.len());
+        for (map, count) in maps.iter().zip(expected) {
+            assert_eq!(map.nodes().len(), count);
+            assert_eq!(super::super::node_view::node_count(map).unwrap(), count);
+        }
+        let (empty, _) = super::MapResidency::recover([None; 3], &arena, arena.len()).unwrap();
+        assert_eq!(empty.total(), 0);
     }
 }

@@ -175,8 +175,7 @@ impl RecoveredNodes {
             .is_some_and(|proof| proof.matches(&self.locations))
     }
 
-    #[cfg(test)]
-    pub(super) fn len(&self) -> usize {
+    pub(in super::super) fn len(&self) -> usize {
         self.locations.len()
     }
 

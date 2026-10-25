@@ -35,6 +35,34 @@ impl MapResidency {
         })
     }
 
+    /// Recover exactly the active closures before using their retained lengths.
+    /// Generic canonical maps may also contain unreachable historical nodes;
+    /// only this constructor owns the reachability walk establishing these counts.
+    pub(super) fn recover<N: crate::storage_model::PhysicalMapNodes>(
+        roots: [Option<PhysicalMapNodeId>; 3],
+        arena: &N,
+        measured_history: usize,
+    ) -> Result<(Self, [CanonicalPhysicalMap; 3]), DurableError>
+    where
+        N::Error: Into<DurableError>,
+    {
+        let [profile, representation, placement] = roots;
+        let profiles = recover_active_map(PhysicalMapDomain::Profile, profile, arena)?;
+        let representations =
+            recover_active_map(PhysicalMapDomain::Representation, representation, arena)?;
+        let placements = recover_active_map(PhysicalMapDomain::Placement, placement, arena)?;
+        // Each successful recovery collected exactly its root closure and ran
+        // the production canonical validator. Counting the retained nodes needs
+        // no additional decoding, cloning, hashing or ordered-entry traversal.
+        let residency = Self {
+            profiles: profiles.nodes().len(),
+            representations: representations.nodes().len(),
+            placements: placements.nodes().len(),
+            measured_history,
+        };
+        Ok((residency, [profiles, representations, placements]))
+    }
+
     fn total(&self) -> usize {
         self.profiles
             .saturating_add(self.representations)
