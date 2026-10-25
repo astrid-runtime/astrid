@@ -202,7 +202,7 @@ impl RepresentationStore {
         let mut metadata =
             DurableFile::native(open_cap_file(&generation, Path::new(METADATA_PATH))?);
         let mut journal = DurableFile::native(open_cap_file(&generation, Path::new(JOURNAL_PATH))?);
-        let index = recover_metadata(&mut metadata, limits)?;
+        let index = recover_metadata(&mut metadata, limits, index_memory)?;
         let (active, state) = recover_journal(&mut journal, current, &index, limits)?;
         let recovered = Self::from_recovered(
             metadata,
@@ -213,7 +213,6 @@ impl RepresentationStore {
                 state,
             },
             index,
-            limits,
             index_memory,
         )?;
         Ok(Some(recovered))
@@ -894,8 +893,7 @@ impl RepresentationStore {
         metadata: DurableFile,
         journal: DurableFile,
         authority: RecoveredPhysicalAuthority,
-        mut index: MetadataIndex,
-        limits: RecoveryLimits,
+        index: MetadataIndex,
         index_memory: LocationIndexMemoryBudget,
     ) -> Result<Self, DurableError> {
         let RecoveredPhysicalAuthority {
@@ -909,25 +907,22 @@ impl RepresentationStore {
         let placements = PlacementSet::decode(
             index.value(MetadataKind::Placement, state.placements().as_bytes())?,
         )?;
+        let nodes = index.into_nodes();
         let profiles = residency::recover_active_map(
             PhysicalMapDomain::Profile,
             catalogue.profiles_root(),
-            &mut index.nodes,
+            &nodes,
         )?;
         let representations = residency::recover_active_map(
             PhysicalMapDomain::Representation,
             catalogue.representations_root(),
-            &mut index.nodes,
+            &nodes,
         )?;
         let placement_entries = residency::recover_active_map(
             PhysicalMapDomain::Placement,
             placements.entries_root(),
-            &mut index.nodes,
+            &nodes,
         )?;
-        // Active node ownership has moved into the three maps. Historical
-        // decoded bodies and scalar replay bytes no longer serve validation;
-        // release them before domain checks and the cold locator rebuild.
-        drop(index);
         if profiles.entry_count() != catalogue.profile_count()
             || representations.entry_count() != catalogue.representation_count()
             || placement_entries.entry_count() != placements.blob_count()
@@ -948,12 +943,8 @@ impl RepresentationStore {
                 "placement extent count disagrees with map entries",
             ));
         }
-        let persisted_map_nodes = ColdNodes::from_validated_maps(
-            &metadata,
-            limits,
-            index_memory,
-            &[&profiles, &representations, &placement_entries],
-        )?;
+        let persisted_map_nodes =
+            nodes.into_cold(&[&profiles, &representations, &placement_entries])?;
         let residency = residency::MapResidency::new(
             &profiles,
             &representations,

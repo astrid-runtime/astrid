@@ -19,22 +19,36 @@ use super::super::{FRAME_HEADER_LEN, scan_frames};
 use super::format::{
     Blake3PhysicalIdentity, CURRENT_FILE, CURRENT_MAGIC, CurrentPointer, JOURNAL_FILE,
     JOURNAL_MAGIC, JournalEntry, METADATA_FILE, METADATA_MAGIC, MetadataFrame, MetadataKind,
-    journal_digest, map_node_id,
+    journal_digest,
 };
 use super::{
     DurableError, FIRST_JOURNAL_GENERATION, RecoveryLimits, increment, io_error, read_all,
 };
 
-#[derive(Default)]
+mod nodes;
+pub(super) use nodes::RecoveredNodes;
+
 pub(super) struct MetadataIndex {
     values: BTreeMap<(MetadataKind, [u8; 32]), Vec<u8>>,
-    pub(super) nodes: BTreeMap<crate::storage_model::PhysicalMapNodeId, PhysicalMapNode>,
+    pub(super) nodes: RecoveredNodes,
 }
 
 impl MetadataIndex {
-    fn insert(&mut self, frame: MetadataFrame) -> Result<(), DurableError> {
+    fn new(
+        file: &super::DurableFile,
+        limits: RecoveryLimits,
+        budget: super::LocationIndexMemoryBudget,
+    ) -> Result<Self, DurableError> {
+        Ok(Self {
+            values: BTreeMap::new(),
+            nodes: RecoveredNodes::new(file, limits, budget)?,
+        })
+    }
+
+    fn insert(&mut self, offset: u64, payload: &[u8]) -> Result<(), DurableError> {
+        let frame = MetadataFrame::decode(payload)?;
         if frame.kind == MetadataKind::MapNode {
-            return self.insert_map_node(&frame);
+            return self.nodes.admit(offset, payload, &frame);
         }
         frame.verify(&Blake3PhysicalIdentity)?;
         let key = (frame.kind, frame.identity);
@@ -50,27 +64,8 @@ impl MetadataIndex {
         Ok(())
     }
 
-    fn insert_map_node(&mut self, frame: &MetadataFrame) -> Result<(), DurableError> {
-        let node = PhysicalMapNode::decode(&frame.value)?;
-        let id = node.identify(&Blake3PhysicalIdentity)?;
-        if id != map_node_id(frame.identity) {
-            return Err(DurableError::InvalidRepresentationState(
-                "metadata identity does not match canonical value",
-            ));
-        }
-        if let Some(existing) = self.nodes.get(&id) {
-            if existing != &node {
-                return Err(DurableError::InvalidRepresentationState(
-                    "physical metadata identity collision",
-                ));
-            }
-        } else {
-            self.nodes.insert(id, node);
-        }
-        // Canonical decoding and identity checks establish the same collision
-        // invariant as encoded values. Keep one decoded owner: recovery never
-        // requests a MapNode through value(), only the authenticated node map.
-        Ok(())
+    pub(super) fn into_nodes(self) -> RecoveredNodes {
+        self.nodes
     }
 
     pub(super) fn value(
@@ -87,17 +82,18 @@ impl MetadataIndex {
     }
 }
 
-pub(super) fn recover_metadata<F: DurableIo>(
-    file: &mut F,
+pub(super) fn recover_metadata(
+    file: &mut super::DurableFile,
     limits: RecoveryLimits,
+    budget: super::LocationIndexMemoryBudget,
 ) -> Result<MetadataIndex, DurableError> {
-    let mut index = MetadataIndex::default();
+    let mut index = MetadataIndex::new(file, limits, budget)?;
     scan_frames(
         file,
         METADATA_FILE,
         METADATA_MAGIC,
         limits,
-        |_offset, payload| index.insert(MetadataFrame::decode(payload)?),
+        |offset, payload| index.insert(offset, payload),
     )?;
     Ok(index)
 }
@@ -275,20 +271,23 @@ fn state_metadata_closure_complete(
         catalogue.representations_root(),
         placements.entries_root(),
     ] {
-        if !map_closure_complete(root, &metadata.nodes, complete) {
+        if !map_closure_complete(root, &metadata.nodes, complete)? {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
-fn map_closure_complete(
+fn map_closure_complete<N: crate::storage_model::PhysicalMapNodes>(
     root: Option<crate::storage_model::PhysicalMapNodeId>,
-    nodes: &BTreeMap<crate::storage_model::PhysicalMapNodeId, PhysicalMapNode>,
+    nodes: &N,
     complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
-) -> bool {
+) -> Result<bool, DurableError>
+where
+    N::Error: Into<DurableError>,
+{
     let Some(root) = root else {
-        return true;
+        return Ok(true);
     };
     let mut pending = vec![root];
     let mut visited = BTreeSet::new();
@@ -296,10 +295,10 @@ fn map_closure_complete(
         if complete.contains(&id) || !visited.insert(id) {
             continue;
         }
-        let Some(node) = nodes.get(&id) else {
-            return false;
+        let Some(node) = nodes.node(id).map_err(Into::into)? else {
+            return Ok(false);
         };
-        match node {
+        match node.as_ref() {
             PhysicalMapNode::Branch { zero, one, .. } => pending.extend([*zero, *one]),
             PhysicalMapNode::Radix { children, .. } => {
                 pending.extend(children.iter().copied());
@@ -309,7 +308,7 @@ fn map_closure_complete(
     }
     // Never remember a partial traversal that encountered a missing descendant.
     complete.extend(visited);
-    true
+    Ok(true)
 }
 
 fn truncate_repairable_journal_tail<F: DurableIo>(
