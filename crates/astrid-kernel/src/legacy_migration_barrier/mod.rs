@@ -993,3 +993,6 @@ fn ensure_no_unretired_component_sources(
 mod log_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod recovery_admission_tests;
