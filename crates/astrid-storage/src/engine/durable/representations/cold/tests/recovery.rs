@@ -50,7 +50,31 @@ fn recovery_proves_only_complete_active_nodes_and_keeps_last_duplicate_frames() 
         assert!(!nodes.complete(id).unwrap());
     }
     let root = active.root().unwrap();
+    let mut metadata = Vec::new();
+    let mut appended = std::collections::BTreeSet::new();
+    assert_eq!(
+        super::super::super::activation::append_new_reachable_map_nodes(
+            &mut metadata,
+            &active,
+            &nodes,
+            &mut appended,
+            &mut nodes.clone(),
+        )
+        .unwrap(),
+        0,
+    );
     nodes.0.lock().locations.truncate_test_run();
+    assert!(
+        super::super::super::activation::append_new_reachable_map_nodes(
+            &mut metadata,
+            &active,
+            &nodes,
+            &mut appended,
+            &mut nodes.clone(),
+        )
+        .is_err(),
+        "a new traversal must authenticate the proof again",
+    );
     assert!(nodes.complete(&root).is_err());
     assert!(
         nodes.failed(),
