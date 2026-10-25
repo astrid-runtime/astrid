@@ -15,6 +15,9 @@ use crate::storage_model::{
 use std::borrow::Cow;
 use std::cell::RefCell;
 
+mod memo;
+use memo::CompleteMemo;
+
 pub(in super::super) struct RecoveredNodes {
     file: DurableFile,
     locations: PagedLocations,
@@ -23,6 +26,7 @@ pub(in super::super) struct RecoveredNodes {
     // PhysicalMapNodes lends immutable access; only disposable authenticated
     // page evidence changes here. Index mutations invalidate its run epoch.
     page_memo: RefCell<AuthenticatedPageMemo>,
+    complete_memo: RefCell<CompleteMemo>,
 }
 
 /// No lookup or journal authority can observe a partially admitted index.
@@ -105,6 +109,7 @@ impl NodeAdmission {
             limits: self.limits,
             budget: self.budget,
             page_memo: RefCell::default(),
+            complete_memo: RefCell::new(CompleteMemo::new(self.budget)?),
         })
     }
 }
@@ -114,6 +119,7 @@ impl RecoveredNodes {
         // Phase boundaries discard journal reachability evidence and collapse
         // fragmented runs without dropping any historical location. Canonical
         // cold proofs are rebuilt independently from the recovered active maps.
+        self.complete_memo.get_mut().clear();
         self.locations.clear_proofs()?;
         *self.page_memo.get_mut() = AuthenticatedPageMemo::default();
         Ok(())
@@ -123,6 +129,9 @@ impl RecoveredNodes {
         self,
         maps: &[&CanonicalPhysicalMap],
     ) -> Result<ColdNodes, DurableError> {
+        // The borrowed staging partition must be free before cold mutation
+        // state can use it. Journal memo entries never become canonical proofs.
+        drop(self.complete_memo);
         ColdNodes::from_recovered_locations(
             self.file,
             self.locations,
@@ -145,17 +154,47 @@ impl RecoveredNodes {
 
 impl super::super::activation::CompleteNodes for RecoveredNodes {
     fn complete(&self, id: &PhysicalMapNodeId) -> Result<bool, DurableError> {
-        self.locations.closure_proven_memo(
+        let mut memo = self.complete_memo.borrow_mut();
+        if self.locations.failed() {
+            memo.clear();
+            return Err(DurableError::InvalidRepresentationState(
+                "failed recovery locator",
+            ));
+        }
+        // A replacement run must be authenticated again, even for a previously
+        // complete ID. Reuse never outlives the existing page-evidence epoch.
+        memo.sync(self.locations.runs_epoch());
+        if memo.contains(*id) {
+            return Ok(true);
+        }
+        match self.locations.closure_proven_memo(
             ObjectId::new(*id.as_bytes()),
             &mut self.page_memo.borrow_mut(),
-        )
+        ) {
+            Ok(true) => {
+                memo.insert(*id);
+                Ok(true)
+            },
+            Ok(false) => Ok(false),
+            Err(error) => {
+                memo.clear();
+                Err(error)
+            },
+        }
     }
 
     fn remember(&mut self, id: PhysicalMapNodeId) -> Result<(), DurableError> {
         // These bits prove recovery reachability only. into_cold rebuilds every
         // bit from canonically validated active maps, never from this evidence.
-        self.locations
-            .mark_proven_memo(ObjectId::new(*id.as_bytes()), self.page_memo.get_mut())
+        let result = self
+            .locations
+            .mark_proven_memo(ObjectId::new(*id.as_bytes()), self.page_memo.get_mut());
+        let memo = self.complete_memo.get_mut();
+        memo.sync(self.locations.runs_epoch());
+        if result.is_err() {
+            memo.clear();
+        }
+        result
     }
 }
 
