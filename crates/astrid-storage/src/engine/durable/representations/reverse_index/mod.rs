@@ -121,26 +121,37 @@ impl ReverseIndex {
             .map(|entry| entry.map(|(object, _)| object))
     }
 
+    #[cfg(test)]
     pub(super) fn ids_newest_first(&self, object: ObjectId) -> Result<Ids<'_>, DurableError> {
-        let head = self.head(object)?;
-        Ok(Ids {
+        let head = self.head(object)?.map(|(_, link)| link);
+        Ok(self.ids_from_head(object, head))
+    }
+
+    fn ids_from_head(&self, object: ObjectId, head: Option<Link>) -> Ids<'_> {
+        Ids {
             index: self,
             object,
-            first: head.as_ref().map(|(_, link)| link.first),
-            pending: head.map(|(_, link)| link),
+            first: head.as_ref().map(|link| link.first),
+            pending: head,
             next: None,
-        })
+        }
     }
 
     pub(super) fn equivalent(&self, other: &Self) -> Result<bool, DurableError> {
-        let mut left = self.keys();
-        let mut right = other.keys();
+        if self.failed() || other.failed() {
+            return Err(chain::corrupt("failed reverse catalogue comparison"));
+        }
+        // The ordered streams already authenticate each head location. Consume
+        // those exact locations instead of repeating a cold lookup per object;
+        // every head body and older link still receives fresh authentication.
+        let mut left = self.heads.locations();
+        let mut right = other.heads.locations();
         loop {
             match (left.next().transpose()?, right.next().transpose()?) {
                 (None, None) => return Ok(true),
-                (Some(a), Some(b)) if a == b => {
-                    let mut a_ids = self.ids_newest_first(a)?;
-                    let mut b_ids = other.ids_newest_first(b)?;
+                (Some((a, a_location)), Some((b, b_location))) if a == b => {
+                    let mut a_ids = self.ids_from_head(a, Some(self.link(a, a_location)?));
+                    let mut b_ids = other.ids_from_head(b, Some(other.link(b, b_location)?));
                     loop {
                         match (a_ids.next().transpose()?, b_ids.next().transpose()?) {
                             (None, None) => break,
