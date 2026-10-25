@@ -54,6 +54,11 @@ pub(super) struct ColdMemoNodes<'a> {
 }
 
 impl ColdNodes {
+    #[cfg(test)]
+    pub(super) fn truncate_test_run(&self) {
+        self.0.lock().locations.truncate_test_run();
+    }
+
     pub(super) fn memoized_nodes(&self) -> ColdMemoNodes<'_> {
         ColdMemoNodes {
             cold: self,
