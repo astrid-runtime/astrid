@@ -349,15 +349,18 @@ where
     pub(super) fn remove_owner(&self, owner: &P) {
         let _accounting = self.accounting.lock();
         let mut writer = self.writer.lock();
-        let mut owners = (**self.owners.load()).clone();
-        let Some(removed) = owners.remove(owner) else {
+        let mut owners = self.owners.load_full();
+        if !owners.contains_key(owner) {
+            return;
+        }
+        let Some(removed) = Arc::make_mut(&mut owners).remove(owner) else {
             return;
         };
         writer.resident_bytes = writer
             .resident_bytes
             .saturating_sub(removed.snapshot.load().resident_bytes);
         writer.owner_order.retain(|candidate| candidate != owner);
-        self.owners.store(Arc::new(owners));
+        self.owners.store(owners);
         let resident_total = writer.resident_bytes;
         let resident_by_owner = self
             .owners
@@ -491,7 +494,7 @@ where
         bounds: CacheBounds,
     ) {
         let mut writer = self.writer.lock();
-        let mut owners = (**self.owners.load()).clone();
+        let mut owners = self.owners.load_full();
         let mut owners_changed = false;
         let mut evicted_owners = Vec::new();
         let owner_cache = if let Some(existing) = owners.get(owner) {
@@ -501,7 +504,7 @@ where
                 let Some(evicted_owner) = writer.owner_order.pop_front() else {
                     break;
                 };
-                if let Some(evicted) = owners.remove(&evicted_owner) {
+                if let Some(evicted) = Arc::make_mut(&mut owners).remove(&evicted_owner) {
                     evicted_owners.push(evicted_owner);
                     writer.resident_bytes = writer
                         .resident_bytes
@@ -509,7 +512,7 @@ where
                 }
             }
             let created = Arc::new(OwnerCache::new());
-            owners.insert(owner.clone(), Arc::clone(&created));
+            Arc::make_mut(&mut owners).insert(owner.clone(), Arc::clone(&created));
             writer.owner_order.push_back(owner.clone());
             owners_changed = true;
             created
@@ -556,7 +559,7 @@ where
                     retained_order.push_back(candidate);
                     continue;
                 }
-                if let Some(evicted) = owners.remove(&candidate) {
+                if let Some(evicted) = Arc::make_mut(&mut owners).remove(&candidate) {
                     evicted_owners.push(candidate);
                     owners_changed = true;
                     previous_global =
@@ -571,7 +574,7 @@ where
         writer.resident_bytes = previous_global.saturating_add(next.resident_bytes);
         owner_cache.snapshot.store(Arc::new(next));
         if owners_changed {
-            self.owners.store(Arc::new(owners));
+            self.owners.store(owners);
         }
         let resident_total = writer.resident_bytes;
         let resident_by_owner = self
@@ -623,6 +626,45 @@ mod tests {
             generation: RootGeneration::new(u64::from(generation)),
             commit: ObjectId::new([generation; 32]),
         }
+    }
+
+    #[test]
+    fn existing_owner_admission_does_not_copy_the_owner_index() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Eq, PartialEq, Ord, PartialOrd)]
+        struct Owner(u32);
+        static CLONES: AtomicUsize = AtomicUsize::new(0);
+        impl Clone for Owner {
+            fn clone(&self) -> Self {
+                CLONES.fetch_add(1, Ordering::Relaxed);
+                Self(self.0)
+            }
+        }
+        let cache = KvHotCache::with_limits(1_000_000, 10_000, 128, 8);
+        for owner in 0..128 {
+            cache.insert(&Owner(owner), Some(root(1)), b"key".to_vec(), Some(b"old"));
+        }
+        CLONES.store(0, Ordering::Relaxed);
+        cache.remove_owner(&Owner(128));
+        assert_eq!(CLONES.load(Ordering::Relaxed), 0);
+        cache.insert(&Owner(64), Some(root(2)), b"key".to_vec(), Some(b"new"));
+        // Admission and final reconciliation each provide the budget authority
+        // with a complete owner ledger. Updating a known owner needs no third
+        // copy of all owner identities for the unchanged lookup index.
+        assert!(CLONES.load(Ordering::Relaxed) <= 2 * 128);
+        assert!(matches!(
+            cache.get(&Owner(64), Some(root(2)), b"key"),
+            HotRead::Hit(Some(value)) if value == b"new"
+        ));
+        assert!(matches!(
+            cache.get(&Owner(64), Some(root(1)), b"key"),
+            HotRead::Miss
+        ));
+        assert!(matches!(
+            cache.get(&Owner(63), Some(root(1)), b"key"),
+            HotRead::Hit(Some(value)) if value == b"old"
+        ));
     }
 
     #[test]
