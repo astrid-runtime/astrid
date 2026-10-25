@@ -97,3 +97,32 @@ fn reachability_proof_write_failure_is_an_error_and_fences_replay() {
     assert!(nodes.locations.failed());
     assert!(nodes.begin_journal().is_err());
 }
+
+#[test]
+fn recovery_reuses_locator_page_evidence_but_always_authenticates_node_media() {
+    let map = map(5);
+    let mut file = DurableFile::native(tempfile::tempfile().unwrap());
+    let mut nodes = reader(&file);
+    for node in map.nodes().values() {
+        append(&mut file, &mut nodes, node);
+    }
+    nodes.begin_journal().unwrap();
+    let id = map.root().unwrap();
+    assert!(nodes.node(id).unwrap().is_some());
+    let first = nodes.page_memo.borrow().test_hit_miss();
+    assert!(first.1 > 0);
+    assert!(nodes.node(id).unwrap().is_some());
+    let second = nodes.page_memo.borrow().test_hit_miss();
+    assert!(second.0 > first.0);
+    assert_eq!(
+        second.1, first.1,
+        "unchanged immutable pages need no repeat authentication"
+    );
+    file.durable_set_len(0).unwrap();
+    assert!(
+        nodes.node(id).is_err(),
+        "page evidence must never cache the canonical body"
+    );
+    nodes.begin_journal().unwrap();
+    assert_eq!(nodes.page_memo.borrow().test_hit_miss(), (0, 0));
+}
