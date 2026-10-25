@@ -16,7 +16,10 @@ use crate::storage_model::{ObjectId, ObjectRecord};
 use parking_lot::Mutex;
 
 mod policy;
+mod principals;
 mod weights;
+
+use principals::CachedPrincipals;
 
 use weights::{association_weight, cache_weight, projection_cache_weight, projection_weight};
 
@@ -29,7 +32,7 @@ struct CachedObject<P: Ord> {
     record: Arc<ObjectRecord>,
     weight: u64,
     last_access: u64,
-    principals: BTreeSet<P>,
+    principals: CachedPrincipals<P>,
 }
 
 struct CachedProjection {
@@ -273,8 +276,7 @@ where
             }
 
             let tick = state.tick();
-            let mut principals = BTreeSet::new();
-            principals.insert(principal.clone());
+            let principals = CachedPrincipals::new(principal.clone());
             state.entries.insert(
                 object,
                 CachedObject {
@@ -938,7 +940,7 @@ where
             return;
         };
         self.lru.remove(&(entry.last_access, object));
-        for principal in entry.principals {
+        for principal in entry.principals.into_iter() {
             if let Some(partition) = self.principals.get_mut(&principal)
                 && let Some(principal_entry) = partition.entries.remove(&object)
             {
