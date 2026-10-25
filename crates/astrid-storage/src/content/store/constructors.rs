@@ -25,7 +25,6 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             engine,
             quota: Some(quota),
             validated_catalogs: Arc::new(Mutex::new(BTreeMap::new())),
-            decoded_headers: Arc::new(Mutex::new(BTreeMap::new())),
             validated_kv: Arc::new(KvValidationCache::default()),
             read_leases: Arc::new(ContentReadLeaseRegistry::default()),
             #[cfg(test)]
@@ -49,7 +48,6 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             engine,
             quota: Some(quota),
             validated_catalogs,
-            decoded_headers: Arc::new(Mutex::new(BTreeMap::new())),
             validated_kv,
             read_leases: Arc::new(ContentReadLeaseRegistry::default()),
             #[cfg(test)]
@@ -71,7 +69,6 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             engine,
             quota: None,
             validated_catalogs,
-            decoded_headers: Arc::new(Mutex::new(BTreeMap::new())),
             validated_kv: Arc::new(KvValidationCache::default()),
             read_leases: Arc::new(ContentReadLeaseRegistry::default()),
             #[cfg(test)]

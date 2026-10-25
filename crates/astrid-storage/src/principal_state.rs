@@ -748,9 +748,9 @@ impl RuntimePrincipalStore {
     /// be read or the clearing mutation cannot be committed.
     pub fn purge_principal_kv(&self, principal: PrincipalUid) -> StorageResult<bool> {
         let owner = StateOwner::Principal(principal);
-        self.runtime_kv
-            .clear_owner(&owner)
-            .map(|removed| removed != 0)
+        let removed = self.runtime_kv.clear_owner(&owner)?;
+        self.content.forget_owner_projection_state(&owner);
+        Ok(removed != 0)
     }
 
     /// Remove one capsule's guest KV namespace for an admitted principal.

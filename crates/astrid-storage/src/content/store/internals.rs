@@ -35,9 +35,15 @@ where
         header.previous_catalog_quota_bytes = header
             .catalog
             .map_or(0, |catalog| catalog.summary.quota_bytes);
-        self.decoded_headers
-            .lock()
-            .insert(principal.clone(), std::sync::Arc::new(header));
+        // A header is an accelerator, governed by the same budget as its
+        // authenticated commit. Do not retain an uncharged per-UID duplicate.
+        let _ = self.engine.load_shared_object_for(principal, root.commit);
+        let _ = self.engine.retain_projection_cache(
+            principal,
+            root.commit,
+            super::DECODED_HEADER_CACHE_KEY,
+            crate::engine::ProjectionCacheEntry::new(header),
+        );
     }
 
     pub(super) fn decode_header(

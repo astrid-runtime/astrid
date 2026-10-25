@@ -9,6 +9,13 @@ use super::super::{ContentName, ContentWriteOutcome, PrincipalContentError};
 use super::PrincipalContentStore;
 
 impl<P: Ord, E> PrincipalContentStore<P, E> {
+    /// Forget accelerators for a purged owner, preserving immutable read leases
+    /// and every non-KV durable component.
+    pub(crate) fn forget_owner_projection_state(&self, principal: &P) {
+        self.validated_catalogs.lock().remove(principal);
+        self.validated_kv.forget_owner(principal);
+    }
+
     /// Detach one immutable root-bound proof after exclusive engine handoff.
     /// The recipient must still decode its fresh header and match both the
     /// canonical catalog identity and summary before using this evidence.
@@ -28,7 +35,6 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             validated_catalogs: Arc::new(
                 parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             ),
-            decoded_headers: Arc::new(parking_lot::Mutex::new(std::collections::BTreeMap::new())),
             validated_kv: Arc::new(crate::kv::KvValidationCache::default()),
             read_leases: Arc::new(super::ContentReadLeaseRegistry::default()),
             #[cfg(test)]

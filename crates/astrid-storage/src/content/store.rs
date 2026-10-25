@@ -67,9 +67,6 @@ pub struct PrincipalContentStore<P: Ord, E> {
     engine: Arc<E>,
     quota: Option<Arc<dyn KvQuotaResolver<P>>>,
     validated_catalogs: Arc<Mutex<BTreeMap<P, CatalogValidation>>>,
-    /// Last decoded header for the current principal root. One entry per
-    /// principal, replaced on catalog commit, never a second cache budget.
-    decoded_headers: Arc<Mutex<BTreeMap<P, Arc<ContentHeader>>>>,
     validated_kv: Arc<KvValidationCache<P>>,
     read_leases: Arc<ContentReadLeaseRegistry<P>>,
     #[cfg(test)]
@@ -920,21 +917,12 @@ where
     fn header(&self, principal: &P) -> Result<Arc<ContentHeader>, PrincipalContentError> {
         let root = self.engine.current_root(principal)?;
         if let Some(root) = root
-            && let Some(header) = self.decoded_headers.lock().get(principal).cloned()
-            && header.root == Some(root)
-        {
-            return Ok(header);
-        }
-        if let Some(root) = root
             && let Some(header) = self
                 .engine
                 .load_projection_cache(principal, root.commit, DECODED_HEADER_CACHE_KEY)
                 .and_then(|entry| entry.downcast::<ContentHeader>())
             && header.root == Some(root)
         {
-            self.decoded_headers
-                .lock()
-                .insert(principal.clone(), Arc::clone(&header));
             return Ok(header);
         }
         let header = self.decode_header(principal, root)?;
@@ -942,9 +930,6 @@ where
             return Ok(Arc::new(header));
         };
         let header = Arc::new(header);
-        self.decoded_headers
-            .lock()
-            .insert(principal.clone(), Arc::clone(&header));
         let _ = self.engine.retain_projection_cache(
             principal,
             root.commit,

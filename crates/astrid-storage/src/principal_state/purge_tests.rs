@@ -233,6 +233,13 @@ async fn retired_uid_purge_survives_alias_removal_and_reuse_with_strict_live_quo
         .unwrap();
     assert!(store.purge_principal_kv(retired).unwrap());
     assert!(!store.purge_principal_kv(retired).unwrap());
+    assert!(
+        store
+            .content()
+            .take_catalog_validation(&StateOwner::Principal(retired))
+            .is_none(),
+        "retired UID retained its catalogue accelerator"
+    );
     assert_eq!(
         store.kv().get("alice:capsule:notes", "key").await.unwrap(),
         Some(b"replacement state".to_vec())
