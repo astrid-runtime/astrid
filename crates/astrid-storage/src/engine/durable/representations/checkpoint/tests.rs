@@ -38,10 +38,10 @@ fn volume_checkpoints_bound_metadata_and_preserve_authority_across_restart() {
         }
         let before = store.metadata.metadata().unwrap().len();
         let active = store.active;
-        let reverse = store.reverse.clone();
+        let reverse = store.reverse.snapshot().unwrap();
         store.checkpoint_volume(&volume, limits).unwrap();
         assert_eq!(store.active, active);
-        assert_eq!(store.reverse, reverse);
+        assert_eq!(store.reverse.snapshot().unwrap(), reverse);
         assert!(store.metadata.metadata().unwrap().len() < before / 10);
         assert!(store.metadata.metadata().unwrap().len() < 4096);
         assert_eq!(
@@ -64,7 +64,7 @@ fn volume_checkpoints_bound_metadata_and_preserve_authority_across_restart() {
         .unwrap()
         .unwrap();
         assert_eq!(recovered.active, active);
-        assert_eq!(recovered.reverse, reverse);
+        assert_eq!(recovered.reverse.snapshot().unwrap(), reverse);
         store = recovered;
     }
 }
@@ -259,7 +259,7 @@ fn recovered_maps_retain_only_their_active_closures() {
         advance(&mut store, offset);
     }
     let active = store.active;
-    let reverse = store.reverse.clone();
+    let reverse = store.reverse.snapshot().unwrap();
     let historical_nodes = store.persisted_map_nodes.len();
     assert!(historical_nodes > 3);
     drop(store);
@@ -272,7 +272,7 @@ fn recovered_maps_retain_only_their_active_closures() {
     .unwrap()
     .unwrap();
     assert_eq!(recovered.active, active);
-    assert_eq!(recovered.reverse, reverse);
+    assert_eq!(recovered.reverse.snapshot().unwrap(), reverse);
     for map in [
         &recovered.profiles,
         &recovered.representations,
@@ -298,7 +298,7 @@ fn recovered_maps_retain_only_their_active_closures() {
     .unwrap()
     .unwrap();
     assert_eq!(reopened.active, active);
-    assert_eq!(reopened.reverse, reverse);
+    assert_eq!(reopened.reverse.snapshot().unwrap(), reverse);
     assert_eq!(
         super::super::node_view::node_count(&reopened.placement_entries).unwrap(),
         1

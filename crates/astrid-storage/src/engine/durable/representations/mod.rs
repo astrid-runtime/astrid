@@ -34,7 +34,7 @@ mod recovery;
 mod residency;
 mod reverse_index;
 
-use reverse_index::{RepresentationIds, ReverseIndex};
+use reverse_index::ReverseIndex;
 
 use activation::{append_new_reachable_map_nodes, build_initial_state, generation_name};
 use recovery::{
@@ -144,14 +144,25 @@ struct DirectMapEntry {
 
 impl RepresentationStore {
     pub(in crate::engine::durable) fn set_location_index_memory(
-        &self,
+        &mut self,
         budget: LocationIndexMemoryBudget,
     ) -> Result<(), DurableError> {
-        self.persisted_map_nodes.set_memory(budget)
+        self.persisted_map_nodes.set_memory(budget)?;
+        self.reverse.set_memory(budget)
     }
 
     pub(in crate::engine::durable) fn accelerator_failed(&self) -> bool {
-        self.persisted_map_nodes.failed()
+        self.persisted_map_nodes.failed() || self.reverse.failed()
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::durable) fn damage_reverse_run_after_inserts(&mut self, count: usize) {
+        self.reverse.damage_run_after_inserts(count);
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::durable) fn truncate_reverse_test_run(&self) {
+        self.reverse.truncate_test_run();
     }
 
     pub(super) fn open(
@@ -317,20 +328,18 @@ impl RepresentationStore {
         // (the in-band specification and other bootstrap records) remain
         // recoverable through store.meta. Compaction must not silently pull
         // those independent roots into the representation catalogue.
-        let previously_authoritative = self.reverse.keys().copied().collect::<BTreeSet<_>>();
-        let direct = index
-            .iter()
-            .filter(|(id, _)| previously_authoritative.contains(id))
-            .map(|(id, location)| {
+        let mut direct = Vec::new();
+        for (id, location) in index {
+            if self.reverse.contains(*id)? {
                 let (_, payload) =
                     read_indexed_object_with_payload(arena, *id, *location, identity, limits)?;
-                self.describe_direct(
+                direct.push(self.describe_direct(
                     *id,
                     canonical_record_bytes(&payload, identity.scheme())?,
                     *location,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+                )?);
+            }
+        }
         self.rebase_all_direct(&direct)
     }
 
@@ -411,29 +420,29 @@ impl RepresentationStore {
         &self,
         object: ObjectId,
     ) -> Result<Option<RepresentationRecord>, DurableError> {
-        let Some(records) = self.reverse.get(&object) else {
+        let Some(id) = self.reverse.first(object)? else {
             return Ok(None);
         };
-        for id in records.iter() {
-            let bytes = self
-                .representations
-                .try_get(&Blake3PhysicalIdentity, PhysicalMapKey::from(*id))?
-                .ok_or(DurableError::InvalidRepresentationState(
-                    "reverse index references a missing representation",
-                ))?;
-            let record = RepresentationRecord::decode(&bytes)?;
-            if record.profile() == self.direct_profile {
-                if !matches!(record.coverage(), Coverage::Exact { object: covered, .. } if *covered == object)
-                    || !matches!(record.recipe(), Recipe::DirectCanonical { .. })
-                {
-                    return Err(DurableError::InvalidRepresentationState(
-                        "direct profile has incompatible coverage or recipe",
-                    ));
-                }
-                return Ok(Some(record));
-            }
+        // Recovery admits only validated Exact+DirectCanonical records into
+        // this index, and the catalogue admits exactly one direct profile.
+        // The authenticated earliest ID therefore preserves admission order
+        // without scanning every later retained representation on each read.
+        let bytes = self
+            .representations
+            .try_get(&Blake3PhysicalIdentity, PhysicalMapKey::from(id))?
+            .ok_or(DurableError::InvalidRepresentationState(
+                "reverse index references a missing representation",
+            ))?;
+        let record = RepresentationRecord::decode(&bytes)?;
+        if record.profile() != self.direct_profile
+            || !matches!(record.coverage(), Coverage::Exact { object: covered, .. } if *covered == object)
+            || !matches!(record.recipe(), Recipe::DirectCanonical { .. })
+        {
+            return Err(DurableError::InvalidRepresentationState(
+                "direct profile has incompatible coverage or recipe",
+            ));
         }
-        Ok(None)
+        Ok(Some(record))
     }
 
     /// On any error the engine must poison this store and recover it before
@@ -579,15 +588,10 @@ impl RepresentationStore {
             &self.placement_entries,
             self.persisted_map_nodes.len(),
         )?;
-        let replacement_reverse = entries
-            .into_iter()
-            .map(|entry| {
-                (
-                    entry.object,
-                    RepresentationIds::single(entry.representation_id),
-                )
-            })
-            .collect();
+        let mut replacement_reverse = ReverseIndex::new(self.persisted_map_nodes.budget())?;
+        for entry in entries {
+            replacement_reverse.insert(entry.object, entry.representation_id)?;
+        }
 
         let mut metadata = Vec::new();
         let mut appended_map_nodes = BTreeSet::new();
@@ -760,7 +764,7 @@ impl RepresentationStore {
             self.reverse = replacement;
         } else {
             for (object, representation) in update.reverse_additions {
-                reverse_index::insert(&mut self.reverse, object, representation);
+                self.reverse.insert(object, representation)?;
             }
         }
         // These maps came from canonical recovery or checked model mutations.
@@ -823,8 +827,9 @@ impl RepresentationStore {
     fn direct_arena_locations(&self) -> Result<Vec<(ObjectId, ArenaLocation)>, DurableError> {
         let mut direct = Vec::new();
         for object in self.reverse.keys() {
+            let object = object?;
             let record =
-                self.direct_record(*object)?
+                self.direct_record(object)?
                     .ok_or(DurableError::InvalidRepresentationState(
                         "reverse index has no direct representation",
                     ))?;
@@ -850,7 +855,7 @@ impl RepresentationStore {
                 } = replica.locator()
                 {
                     direct.push((
-                        *object,
+                        object,
                         ArenaLocation {
                             offset,
                             payload_len: payload_length,
@@ -912,8 +917,12 @@ impl RepresentationStore {
             ));
         }
         let direct_profile = validate_profiles(&profiles)?;
-        let (reverse, extent_count) =
-            validate_representations(&profiles, &representations, &placement_entries)?;
+        let (reverse, extent_count) = validate_representations(
+            &profiles,
+            &representations,
+            &placement_entries,
+            index_memory,
+        )?;
         if extent_count != placements.replica_extent_count() {
             return Err(DurableError::InvalidRepresentationState(
                 "placement extent count disagrees with map entries",

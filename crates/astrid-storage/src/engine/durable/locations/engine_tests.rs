@@ -308,3 +308,99 @@ fn wal_closure_proofs_fold_into_locators_and_recover_with_the_same_root() {
     assert_eq!(reopened.root(&"alice".to_owned()).unwrap(), Some(root));
     assert!(reopened.inner.lock().proofs().proven(&commit).unwrap());
 }
+
+fn activate_test_catalogue(engine: &DurableEngine<String, TestIdentity, Utf8Codec>) {
+    let specification = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"reverse locator recovery specification".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let (id, _) = engine.persist_standalone_object(&specification).unwrap();
+    engine
+        .ensure_direct_representation_catalogue(id, &[id])
+        .unwrap();
+}
+
+#[test]
+fn reverse_admission_failure_after_publication_immediately_fences_and_recovers() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    activate_test_catalogue(&engine);
+    let mut history = seed_spilled_history(&engine);
+    let record = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"canonical object before reverse admission failure".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let id = TestIdentity.identify(&record);
+    engine
+        .inner
+        .lock()
+        .representations
+        .as_mut()
+        .unwrap()
+        .damage_reverse_run_after_inserts(0);
+    assert!(engine.persist_standalone_object(&record).is_err());
+    assert_eq!(
+        engine.lifecycle.load(std::sync::atomic::Ordering::Acquire),
+        super::super::LIFECYCLE_REQUIRES_RECOVERY
+    );
+    history.push((id, record));
+    assert_poisoned_and_recover_history(&engine, &history);
+}
+
+#[test]
+fn retirement_keeps_reverse_custody_and_recovers_corrupt_scratch() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    activate_test_catalogue(&engine);
+    let history = seed_spilled_history(&engine);
+    let transferred = engine.handoff_for_retirement().unwrap();
+    for (id, _) in &history {
+        assert!(
+            transferred
+                .inner
+                .lock()
+                .representations
+                .as_ref()
+                .unwrap()
+                .contains_direct(*id)
+                .unwrap()
+        );
+    }
+    transferred
+        .inner
+        .lock()
+        .representations
+        .as_ref()
+        .unwrap()
+        .truncate_reverse_test_run();
+    assert!(
+        transferred
+            .inner
+            .lock()
+            .representations
+            .as_ref()
+            .unwrap()
+            .contains_direct(history[0].0)
+            .is_err()
+    );
+    assert!(transferred.recover_if_required().unwrap());
+    assert!(!transferred.recover_if_required().unwrap());
+    for (id, record) in &history {
+        assert_eq!(transferred.object(*id).unwrap(), Some(record.clone()));
+    }
+    transferred.close().unwrap();
+    let reopened = open(directory.path());
+    for (id, record) in history {
+        assert_eq!(reopened.object(id).unwrap(), Some(record));
+    }
+}

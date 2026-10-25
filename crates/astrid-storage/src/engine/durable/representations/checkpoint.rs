@@ -81,7 +81,7 @@ impl RepresentationStore {
             limits,
             self.persisted_map_nodes.budget(),
         )?;
-        if recovered.active != self.active || recovered.reverse != self.reverse {
+        if recovered.active != self.active || !recovered.reverse.equivalent(&self.reverse)? {
             return Err(DurableError::InvalidRepresentationState(
                 "checkpoint changed physical authority",
             ));
