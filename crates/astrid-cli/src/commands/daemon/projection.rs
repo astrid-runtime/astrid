@@ -43,8 +43,14 @@ fn inspect_while_fenced<T>(
     fence: std::sync::Arc<std::fs::File>,
     inspect: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    let fence = std::sync::Arc::try_unwrap(fence)
+        .map_err(|_| anyhow::anyhow!("projection inspection requires exclusive fence ownership"))?;
     let result = inspect();
-    drop(fence);
+    // Closing alone can leave the lock held by a concurrent fork until exec.
+    // Release the captured open-file description before interactive approval.
+    fence
+        .unlock()
+        .context("release projection inspection fence")?;
     result
 }
 

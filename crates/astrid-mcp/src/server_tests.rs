@@ -213,7 +213,9 @@ async fn reluctant_mcp_server_fixture() {
     let mut descendant = tokio::process::Command::new("/bin/sh");
     descendant
         .arg("-c")
-        .arg("echo $$ > \"$1\"; trap '' TERM; while :; do sleep 1; done")
+        .arg(
+            "trap '' TERM; echo $$ > \"$1.next\"; mv \"$1.next\" \"$1\"; while :; do sleep 1; done",
+        )
         .arg("astrid-mcp-descendant")
         .arg(pid_file);
     let _descendant = descendant.spawn().expect("spawn fixture descendant");
