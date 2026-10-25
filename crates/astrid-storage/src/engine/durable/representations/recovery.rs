@@ -509,8 +509,7 @@ pub(super) fn validate_representations(
             )
             .ok_or(DurableError::EncodingOverflow)?;
     }
-    let mut reverse = ReverseIndex::new(index_memory)?;
-    let mut reverse_pages = super::super::locations::AuthenticatedPageMemo::default();
+    let mut rebuild = super::reverse_index::ReverseRebuild::new(index_memory);
     let mut recovered_direct = super::recovered_direct::Builder::new()?;
     for entry in active_entries(representations) {
         let (key, bytes) = entry?;
@@ -531,35 +530,58 @@ pub(super) fn validate_representations(
             ))?;
         let profile = RepresentationProfile::decode(&profile_bytes)?;
         record.validate_against_profile(&Blake3PhysicalIdentity, &profile)?;
-        let (object, blob, canonical_length) = match (record.coverage(), record.recipe()) {
-            (
-                Coverage::Exact {
-                    object,
-                    canonical_record_bytes,
-                },
-                Recipe::DirectCanonical { blob },
-            ) => (*object, *blob, *canonical_record_bytes),
-            _ => continue,
-        };
-        // The immutable canonical placement map already owns these values.
-        // Authenticate the lookup rather than retaining a second decoded catalogue.
-        let placement_bytes = placements
-            .try_get(&Blake3PhysicalIdentity, PhysicalMapKey::from(blob))?
-            .ok_or(DurableError::InvalidRepresentationState(
-                "direct representation placement is missing",
-            ))?;
-        let placement = PlacementEntry::decode(&placement_bytes)?;
-        if placement.profile() != record.profile() || placement.encoded_length() != canonical_length
-        {
-            return Err(DurableError::InvalidRepresentationState(
-                "direct representation placement does not match its record",
-            ));
-        }
-        if reverse.insert_first_memo(object, id, &mut reverse_pages)? {
-            recovered_direct.push(object, &placement)?;
+        if let Some((object, _)) = direct_placement(&record, placements)? {
+            rebuild.push(object, id)?;
         }
     }
+    let reverse = rebuild.finish(|object, id| {
+        let bytes = representations
+            .try_get(&Blake3PhysicalIdentity, PhysicalMapKey::from(id))?
+            .ok_or(DurableError::InvalidRepresentationState(
+                "sorted reverse record is missing",
+            ))?;
+        let record = RepresentationRecord::decode(&bytes)?;
+        let (expected, placement) = direct_placement(&record, placements)?.ok_or(
+            DurableError::InvalidRepresentationState("sorted reverse record is not direct"),
+        )?;
+        if object != expected {
+            return Err(DurableError::InvalidRepresentationState(
+                "sorted reverse object changed",
+            ));
+        }
+        recovered_direct.push(object, &placement)
+    })?;
     Ok((reverse, extent_count, recovered_direct.finish()?))
+}
+
+fn direct_placement(
+    record: &RepresentationRecord,
+    placements: &CanonicalPhysicalMap,
+) -> Result<Option<(crate::storage_model::ObjectId, PlacementEntry)>, DurableError> {
+    let (object, blob, canonical_length) = match (record.coverage(), record.recipe()) {
+        (
+            Coverage::Exact {
+                object,
+                canonical_record_bytes,
+            },
+            Recipe::DirectCanonical { blob },
+        ) => (*object, *blob, *canonical_record_bytes),
+        _ => return Ok(None),
+    };
+    // The immutable canonical map owns these values. Authenticate each lookup
+    // rather than retaining a second decoded placement catalogue.
+    let bytes = placements
+        .try_get(&Blake3PhysicalIdentity, PhysicalMapKey::from(blob))?
+        .ok_or(DurableError::InvalidRepresentationState(
+            "direct representation placement is missing",
+        ))?;
+    let placement = PlacementEntry::decode(&bytes)?;
+    if placement.profile() != record.profile() || placement.encoded_length() != canonical_length {
+        return Err(DurableError::InvalidRepresentationState(
+            "direct representation placement does not match its record",
+        ));
+    }
+    Ok(Some((object, placement)))
 }
 
 pub(super) fn active_entries<M: super::node_view::MapView>(
