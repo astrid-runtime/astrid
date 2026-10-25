@@ -2,7 +2,8 @@
 
 use crate::engine::{
     CommitOutcome, KvProjectionEngine, KvProjectionError, PrincipalProjectionEngine,
-    PrincipalProjectionError, RootSnapshot, RootTransaction,
+    PrincipalProjectionError, ProjectionCacheEntry, ProjectionCacheKey, RootSnapshot,
+    RootTransaction,
 };
 use crate::storage_model::{ObjectId, ObjectRecord, RootState};
 
@@ -28,6 +29,39 @@ where
 
     fn load_kv_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, KvProjectionError> {
         self.0.load_object(id).map_err(map_error)
+    }
+
+    fn load_kv_object_for(
+        &self,
+        principal: &P,
+        id: ObjectId,
+    ) -> Result<Option<ObjectRecord>, KvProjectionError> {
+        self.0.load_object_for(principal, id).map_err(map_error)
+    }
+    fn load_kv_projection_cache(
+        &self,
+        principal: &P,
+        head: ObjectId,
+        key: ProjectionCacheKey,
+    ) -> Option<ProjectionCacheEntry> {
+        self.0.load_projection_cache(principal, head, key)
+    }
+    fn retain_kv_projection_cache(
+        &self,
+        principal: &P,
+        head: ObjectId,
+        key: ProjectionCacheKey,
+        value: ProjectionCacheEntry,
+    ) -> bool {
+        self.0.retain_projection_cache(principal, head, key, value)
+    }
+    fn discard_kv_projection_cache(
+        &self,
+        principal: &P,
+        head: ObjectId,
+        key: ProjectionCacheKey,
+    ) -> bool {
+        self.0.discard_projection_cache(principal, head, key)
     }
 
     fn snapshot_kv_root(&self, _principal: &P) -> Result<Option<RootSnapshot>, KvProjectionError> {

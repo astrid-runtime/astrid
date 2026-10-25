@@ -39,6 +39,7 @@ mod node;
 mod overlay;
 #[cfg(all(test, feature = "legacy-surrealkv"))]
 mod performance_tests;
+mod projection_cache;
 #[cfg(all(test, not(target_family = "wasm")))]
 mod retirement_tests;
 mod validation;
@@ -60,14 +61,12 @@ const CHECKPOINT_MIN_DELTA_BYTES: u64 = 4 * 1024 * 1024;
 #[derive(Debug)]
 pub(crate) struct KvValidationCache<P: Ord> {
     trees: Mutex<BTreeMap<P, TreeValidation>>,
-    projections: Mutex<BTreeMap<P, Projection>>,
 }
 
 impl<P: Ord> Default for KvValidationCache<P> {
     fn default() -> Self {
         Self {
             trees: Mutex::new(BTreeMap::new()),
-            projections: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -76,7 +75,6 @@ impl<P: Ord> KvValidationCache<P> {
     /// Drop reconstructible accelerators without changing the owner's state.
     pub(crate) fn forget_owner(&self, owner: &P) {
         self.trees.lock().remove(owner);
-        self.projections.lock().remove(owner);
     }
 }
 
@@ -292,7 +290,7 @@ where
                 })?;
             self.validate_mutation_quota(owner, quota, used, previous_used)?;
             let tree = projection.tree;
-            let validated_projection = projection.clone();
+            let previous_head = header.head;
             let transaction = context.finish_projection(header, &projection)?;
             match self.engine.commit_kv_root(transaction) {
                 Ok(_) => {
@@ -310,10 +308,12 @@ where
                             },
                         );
                     }
-                    self.validation
-                        .projections
-                        .lock()
-                        .insert(owner.clone(), validated_projection);
+                    projection_cache::replace(
+                        self.engine.as_ref(),
+                        owner,
+                        previous_head,
+                        &projection,
+                    );
                     if should_checkpoint(&projection) {
                         self.schedule_checkpoint(owner.clone());
                     }
@@ -417,6 +417,7 @@ where
         if !force && !should_checkpoint(&current_projection) {
             return Ok(false);
         }
+        let previous_head = current.head;
         let Some((transaction, rebased)) =
             context.rebase_checkpoint(base.head, current, tree, checkpoint_totals)?
         else {
@@ -424,8 +425,9 @@ where
         };
         match self.engine.commit_kv_root(transaction) {
             Ok(_) => {
+                projection_cache::replace(self.engine.as_ref(), &owner, previous_head, &rebased);
                 self.validation.trees.lock().insert(
-                    owner.clone(),
+                    owner,
                     TreeValidation {
                         root: tree,
                         entries: checkpoint_totals.entries,
@@ -433,7 +435,6 @@ where
                         quota_bytes: checkpoint_totals.quota_bytes,
                     },
                 );
-                self.validation.projections.lock().insert(owner, rebased);
                 Ok(true)
             },
             Err(KvProjectionError::Model(ModelError::RootConflict { .. })) => Ok(false),
