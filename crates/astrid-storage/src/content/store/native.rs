@@ -9,6 +9,16 @@ use super::super::{ContentName, ContentWriteOutcome, PrincipalContentError};
 use super::PrincipalContentStore;
 
 impl<P: Ord, E> PrincipalContentStore<P, E> {
+    /// Detach one immutable root-bound proof after exclusive engine handoff.
+    /// The recipient must still decode its fresh header and match both the
+    /// canonical catalog identity and summary before using this evidence.
+    pub(crate) fn take_catalog_validation(
+        &self,
+        principal: &P,
+    ) -> Option<crate::content::catalog::CatalogValidation> {
+        self.validated_catalogs.lock().remove(principal)
+    }
+
     /// Construct without a principal-specific quota.
     #[must_use]
     pub fn from_engine(engine: Arc<E>) -> Self {

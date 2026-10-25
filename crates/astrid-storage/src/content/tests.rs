@@ -27,6 +27,8 @@ use crate::StorageError;
 use crate::kv::{KvStore, TreeKvStore};
 use crate::principal_graph::PRINCIPAL_GRAPH_VERSION;
 
+mod retirement_validation;
+
 #[derive(Clone, Copy)]
 struct TestIdentity;
 

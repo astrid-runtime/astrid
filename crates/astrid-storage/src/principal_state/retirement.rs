@@ -36,10 +36,19 @@ impl RuntimePrincipalStore {
         let engine = Arc::new(self.engine.handoff_for_retirement().map_err(|error| {
             StorageError::Connection(format!("transfer runtime store: {error}"))
         })?);
-        // Retirement only writes system-owned projection content. It must not
-        // inherit callable old views or their mutable validation/read caches.
+        // The old engine is now permanently closed and its exact files and
+        // locks belong to this owner. Move only System's immutable catalog
+        // identity/summary proof; a fresh header must authenticate its current
+        // root and match both fields before reusing it. Missing proof or a
+        // different root requires full validation; a same-root summary mismatch
+        // remains an error. No old cache container or view crosses
+        // custody, and no principal-sized collection is copied.
         let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|_: &StateOwner| Ok(None));
-        let catalogs = Arc::new(Mutex::new(BTreeMap::new()));
+        let mut catalogs = BTreeMap::new();
+        if let Some(validation) = self.content.take_catalog_validation(&StateOwner::System) {
+            catalogs.insert(StateOwner::System, validation);
+        }
+        let catalogs = Arc::new(Mutex::new(catalogs));
         let kv_validation = Arc::new(crate::kv::KvValidationCache::default());
         let runtime_kv = Arc::new(RuntimeStore::from_engine_with_quota_and_content_validation(
             Arc::clone(&engine),
