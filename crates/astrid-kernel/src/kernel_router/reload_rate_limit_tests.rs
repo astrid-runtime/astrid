@@ -62,12 +62,26 @@ async fn spawn_kernel_router_honors_home_capsule_reload_cap() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let home = astrid_core::dirs::AstridHome::from_path(dir.path());
-    let kernel = crate::test_kernel_with_home(home).await;
+    let initial = astrid_storage::open_runtime_principal_store(
+        &home,
+        Arc::new(|_: &astrid_storage::StateOwner| Ok(None)),
+    )
+    .await
+    .unwrap();
+    drop(initial);
     std::fs::write(
-        kernel.astrid_home.root().join("config.toml"),
+        home.root().join("config.toml"),
         "[rate_limits]\ncapsule_reload_per_min = 7\n",
     )
     .expect("write home rate-limit config");
+    let kernel = crate::test_kernel_with_home(home).await;
+    // Router construction must retain the admitted boot generation even if
+    // the operator edits the next boot's policy before it is spawned.
+    std::fs::write(
+        kernel.astrid_home.root().join("config.toml"),
+        "[rate_limits]\ncapsule_reload_per_min = 99\n",
+    )
+    .unwrap();
 
     let caller = PrincipalId::new("operator").expect("principal");
     let profile = PrincipalProfile {

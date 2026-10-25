@@ -82,7 +82,7 @@ fn only_sentinel_staging_directory(home: &AstridHome) -> io::Result<bool> {
     Ok(true)
 }
 
-fn only_boot_singleton(home: &AstridHome) -> io::Result<bool> {
+pub(super) fn only_boot_singleton(home: &AstridHome) -> io::Result<bool> {
     let run = home.root().join("run");
     if !run.try_exists()? {
         return Ok(false);
@@ -91,6 +91,10 @@ fn only_boot_singleton(home: &AstridHome) -> io::Result<bool> {
     // only that persistent lockfile, not an arbitrary surviving run projection.
     crate::platform_fs::validate_private_directory(&run)?;
     let entries = fs::read_dir(&run)?.collect::<Result<Vec<_>, _>>()?;
+    if entries.is_empty() {
+        // A crash can occur after mkdir and before opening the singleton.
+        return Ok(true);
+    }
     if entries.len() != 1 || entries[0].file_name() != "system.lock" {
         return Ok(false);
     }

@@ -30,28 +30,22 @@ mod tests;
 pub(crate) fn load(
     ownership: Arc<OwnershipStore>,
     directory: PrincipalDirectory,
-    home: &astrid_core::dirs::AstridHome,
-    workspace: &std::path::Path,
-    layout: &astrid_core::dirs::WorkspaceLayout,
-) -> std::io::Result<Arc<UserCpuAccounting>> {
-    let policy = load_policy(home, workspace, layout)?;
-    Ok(Arc::new(UserCpuAccounting::new(
+    policy: &astrid_config::resources::ResourceConfig,
+) -> Arc<UserCpuAccounting> {
+    Arc::new(UserCpuAccounting::new(
         ownership,
         directory,
         policy.default_user_cpu_fuel_per_sec,
-        policy.user_cpu_fuel_per_sec,
-    )))
+        policy.user_cpu_fuel_per_sec.clone(),
+    ))
 }
 
 /// Apply operator cache policy after the durable config projection is admitted.
 #[cfg(not(target_family = "wasm"))]
 pub(crate) fn configure_object_cache(
     store: &astrid_storage::RuntimePrincipalStore,
-    home: &astrid_core::dirs::AstridHome,
-    workspace: &std::path::Path,
-    layout: &astrid_core::dirs::WorkspaceLayout,
+    policy: &astrid_config::resources::ResourceConfig,
 ) -> std::io::Result<()> {
-    let policy = load_policy(home, workspace, layout)?;
     if let Some(bytes) = policy.location_index_memory_bytes {
         let budget = astrid_storage::LocationIndexMemoryBudget::new(bytes.get())
             .map_err(std::io::Error::other)?;
@@ -65,22 +59,4 @@ pub(crate) fn configure_object_cache(
         ));
     }
     Ok(())
-}
-
-fn load_policy(
-    home: &astrid_core::dirs::AstridHome,
-    workspace: &std::path::Path,
-    layout: &astrid_core::dirs::WorkspaceLayout,
-) -> std::io::Result<astrid_config::resources::ResourceConfig> {
-    // The kernel may have been constructed with an explicit home independent
-    // of process-wide ASTRID_HOME. Resource authority follows that captured
-    // home, never a second ambient home lookup.
-    Ok(
-        astrid_config::Config::load_with_home_and_layout(Some(workspace), home.root(), layout)
-            .map_err(|error| {
-                std::io::Error::other(format!("load operator resource allocations: {error}"))
-            })?
-            .config
-            .resources,
-    )
 }

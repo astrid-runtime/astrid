@@ -11,24 +11,9 @@ use astrid_audit::{
     AuditArchiveWriter, AuditArchiver, AuditEntry, AuditError, AuditLog, AuditPruneReceipt,
     AuditResult,
 };
-use astrid_config::types::{AuditConfig, AuditRetentionConfig};
+use astrid_config::types::AuditRetentionConfig;
 use astrid_core::PrincipalId;
 use async_trait::async_trait;
-
-/// Read `[audit]` from the daemon's config, or the defaults when it cannot
-/// be loaded.
-pub(crate) fn load_audit_config(
-    workspace_root: &Path,
-    workspace_layout: &astrid_core::dirs::WorkspaceLayout,
-) -> AuditConfig {
-    astrid_config::Config::load_with_layout(Some(workspace_root), workspace_layout).map_or_else(
-        |error| {
-            tracing::warn!(error = %error, "config unavailable; using default audit settings");
-            AuditConfig::default()
-        },
-        |resolved| resolved.config.audit,
-    )
-}
 
 /// Apply `[audit.retention]` to the kernel's audit log.
 pub(crate) fn apply_retention_config(audit_log: &AuditLog, config: &AuditRetentionConfig) {

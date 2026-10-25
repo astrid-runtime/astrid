@@ -1,4 +1,4 @@
-//! Structural preflight only; a durable RETIRING receipt must admit recovery.
+//! Structural preflight only; storage must prove volume recovery authority.
 
 use std::io;
 
@@ -8,8 +8,8 @@ impl AstridHome {
     /// Validate a sentinel-free existing volume for singleton-owned recovery.
     ///
     /// This does not admit host bytes or authorize identity provisioning. The
-    /// caller must open existing media and verify its same-root RETIRING receipt
-    /// before restoring any projection or reading host configuration or keys.
+    /// caller must open existing media and prove bootstrap-only authority or
+    /// authenticated existing projection recovery before reading host policy.
     /// Ordinary fresh-root admission through [`Self::ensure`] remains strict.
     ///
     /// # Errors
@@ -23,6 +23,49 @@ impl AstridHome {
                 "volume recovery requires an absent layout sentinel",
             ));
         }
+        self.validate_existing_volume_projection()
+    }
+
+    /// Validate structure for retrying interrupted bootstrap before its ledger.
+    ///
+    /// This grants no authority: storage must separately prove both the empty
+    /// birth receipt and current bootstrap-only roots under the boot singleton.
+    ///
+    /// # Errors
+    /// Rejects legacy/unknown layouts, unsafe media and redirected/special entries.
+    pub fn validate_fresh_admission_candidate(&self) -> io::Result<()> {
+        self.validate_run_dir()?;
+        if !matches!(
+            self.layout_version()?.as_deref(),
+            None | Some(super::LAYOUT_VERSION)
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fresh admission retry requires a fresh or layout-two projection",
+            ));
+        }
+        self.validate_existing_volume_projection()
+    }
+
+    /// Read-only recognition of ordinary sentinel-free root structure.
+    ///
+    /// This permits no host import or identity provisioning. Storage must still
+    /// prove volume authority and recover stopped-key residue before use.
+    ///
+    /// # Errors
+    /// Rejects a present sentinel or any unadmitted fresh-root entry.
+    pub fn validate_unsentinelled_root(&self) -> io::Result<()> {
+        self.validate_run_dir()?;
+        if self.layout_version()?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ordinary stopped root requires an absent sentinel",
+            ));
+        }
+        self.validate_fresh_root_entries().map(|_| ())
+    }
+
+    fn validate_existing_volume_projection(&self) -> io::Result<()> {
         crate::platform_fs::validate_private_directory(self.root())?;
         crate::platform_fs::validate_private_file(&self.storage_volume_path())?;
         validate_projection_entry(self.root(), self.root())

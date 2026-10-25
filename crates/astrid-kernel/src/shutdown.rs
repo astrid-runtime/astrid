@@ -134,11 +134,13 @@ impl Kernel {
         // socket/PID/readiness files it manages) exist only on that profile.
         #[cfg(unix)]
         {
-            let socket_path = crate::socket::kernel_socket_path();
+            // Reuse the run directory captured with the admitted token. An
+            // ambient home/run override changed later cannot retarget cleanup.
+            let socket_path = self.token_path.with_file_name("system.sock");
             let _ = astrid_core::local_transport::remove_endpoint(&socket_path);
             let _ = std::fs::remove_file(&self.token_path);
-            crate::socket::remove_readiness_file();
-            crate::socket::remove_pid_file();
+            let _ = std::fs::remove_file(self.token_path.with_file_name("system.ready"));
+            let _ = std::fs::remove_file(self.token_path.with_file_name("system.pid"));
         }
 
         tracing::info!("Kernel shutdown complete");

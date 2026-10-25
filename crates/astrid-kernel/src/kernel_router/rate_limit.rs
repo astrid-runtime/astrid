@@ -56,18 +56,10 @@ impl ManagementRateLimiter {
         }
     }
 
-    /// Load operator rate-limit knobs from the kernel home. Invalid or
-    /// missing config falls back to the derived core-set default, not a
-    /// silent `5/min` cap.
+    /// Reuse the validated boot snapshot; malformed policy cannot silently
+    /// switch the serving router to defaults or a different home.
     pub(crate) fn from_kernel(kernel: &crate::Kernel) -> Self {
-        let limits = astrid_config::Config::load_with_home_and_layout(
-            Some(&kernel.workspace_root),
-            kernel.astrid_home.root(),
-            kernel.workspace_layout(),
-        )
-        .map(|resolved| resolved.config.rate_limits)
-        .unwrap_or_default();
-        Self::with_limits(limits)
+        Self::with_limits(kernel.management_rate_limits.clone())
     }
 
     #[cfg_attr(
@@ -402,12 +394,24 @@ mod tests {
     async fn from_kernel_honors_home_capsule_reload_cap() {
         let dir = tempfile::tempdir().expect("tempdir");
         let home = astrid_core::dirs::AstridHome::from_path(dir.path());
-        let kernel = crate::test_kernel_with_home(home).await;
+        let initial = astrid_storage::open_runtime_principal_store(
+            &home,
+            std::sync::Arc::new(|_: &astrid_storage::StateOwner| Ok(None)),
+        )
+        .await
+        .unwrap();
+        drop(initial);
         std::fs::write(
-            kernel.astrid_home.root().join("config.toml"),
+            home.root().join("config.toml"),
             "[rate_limits]\ncapsule_reload_per_min = 7\n",
         )
         .expect("write home rate-limit config");
+        let kernel = crate::test_kernel_with_home(home.clone()).await;
+        std::fs::write(
+            home.root().join("config.toml"),
+            "[rate_limits]\ncapsule_reload_per_min = 99\n",
+        )
+        .unwrap();
         let limiter = ManagementRateLimiter::from_kernel(&kernel);
         assert_eq!(
             limiter.limits().capsule_reload_per_min,

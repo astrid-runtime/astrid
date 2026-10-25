@@ -6,6 +6,49 @@ use crate::KvStore;
 use crate::principal_state::{RuntimeStore, StateOwnerResolver, bootstrap};
 use crate::storage_model::{ObjectClass, ObjectFormatVersion, ObjectKind, ObjectRecord};
 
+#[tokio::test]
+async fn fresh_retry_rejects_nonempty_birth_even_after_imported_live_kv_is_removed() {
+    let root = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(root.path());
+    home.ensure().unwrap();
+    let store = crate::open_runtime_principal_store(&home, Arc::new(|_: &StateOwner| Ok(None)))
+        .await
+        .unwrap();
+    let kv = store.system_control_kv("audit").unwrap();
+    kv.set("imported", b"original authority".to_vec())
+        .await
+        .unwrap();
+    let imported = snapshots(&store.engine).unwrap();
+    kv.delete("imported").await.unwrap();
+    assert_eq!(
+        store
+            .runtime_kv
+            .entry_count_for_owner(&StateOwner::System)
+            .unwrap(),
+        0
+    );
+    drop(kv);
+    drop(store);
+    // A nonempty cutover receipt remains binding even when current live roots
+    // later return to bootstrap shape. Retained history is never fresh birth.
+    let volume = HostedFileVolume::open(home.storage_volume_path()).unwrap();
+    write_cutover_receipt(volume.as_ref(), &imported).unwrap();
+    drop(volume);
+    let result = crate::open_runtime_principal_store_from_fresh_admission(
+        &home,
+        Arc::new(|_: &StateOwner| Ok(None)),
+        crate::PrincipalDirectory::default(),
+    )
+    .await;
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("imported volume")
+    );
+}
+
 fn seed_volume(home: &AstridHome, specification: &ObjectRecord) -> RuntimeEngine {
     seed_volume_with_catalog(home, specification, true)
 }

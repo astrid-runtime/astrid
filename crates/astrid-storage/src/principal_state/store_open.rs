@@ -320,6 +320,7 @@ async fn open_migrated_directory_store(
 enum ProjectionOpenMode {
     Restore,
     RestoreRetiring,
+    RestoreFreshAdmission,
     Pack,
 }
 
@@ -357,6 +358,37 @@ pub async fn open_runtime_principal_store_from_retiring_projection(
     .await
 }
 
+/// Recover a fresh admission interrupted before the component ledger commit.
+///
+/// The caller must hold the boot singleton and must not consume host authority.
+/// This accepts only an existing canonical volume whose birth receipt and
+/// current roots independently prove bootstrap-only state. No host bytes are
+/// imported. An unpublished bootstrap signing identity stays on the host for
+/// the ordinary private-key loader; existing volume identity is restored.
+///
+/// # Errors
+/// Returns an error for imported/populated media, malformed bootstrap state,
+/// unsafe host entries or failed durable recovery.
+pub async fn open_runtime_principal_store_from_fresh_admission(
+    home: &AstridHome,
+    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
+    principals: PrincipalDirectory,
+) -> PrincipalStorageResult<RuntimePrincipalStore> {
+    home.validate_fresh_admission_candidate()
+        .map_err(|error| StorageError::Connection(error.to_string()))?;
+    let (engine, receipt) = volume_migration::open_fresh_admission(home)?;
+    assemble_volume_store(
+        home,
+        quota,
+        principals,
+        Arc::new(engine),
+        receipt,
+        ProjectionOpenMode::RestoreFreshAdmission,
+        false,
+    )
+    .await
+}
+
 async fn assemble_volume_store(
     home: &AstridHome,
     quota: Arc<dyn KvQuotaResolver<StateOwner>>,
@@ -366,16 +398,83 @@ async fn assemble_volume_store(
     projection: ProjectionOpenMode,
     allow_receiptless_bootstrap: bool,
 ) -> crate::principal_state::StorageResult<RuntimePrincipalStore> {
-    assemble_runtime_store(
-        home,
-        quota,
-        principals,
-        engine,
-        directory_cutover_receipt,
-        projection,
-        allow_receiptless_bootstrap,
-    )
-    .await
+    let store =
+        assemble_runtime_store(quota, principals, engine, directory_cutover_receipt).await?;
+    match projection {
+        ProjectionOpenMode::RestoreFreshAdmission => {
+            super::runtime_tree::fresh_admission::restore(home, &store)?;
+        },
+        ProjectionOpenMode::RestoreRetiring => {
+            super::runtime_tree::retirement_recovery::restore(home, &store)?;
+        },
+        ProjectionOpenMode::Restore => super::runtime_tree::reconcile_running_projection(
+            home,
+            &store,
+            allow_receiptless_bootstrap,
+        )?,
+        ProjectionOpenMode::Pack => {},
+    }
+    initialize_staging(home, &store)?;
+    Ok(store)
+}
+
+fn initialize_staging(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+) -> PrincipalStorageResult<()> {
+    let staging_area = NativeContentStagingArea::open(home.content_staging_path())?;
+    store.staging.set(Arc::new(staging_area)).map_err(|_| {
+        StorageError::Internal("runtime store staging area initialized twice".to_owned())
+    })
+}
+
+/// Origin proved by singleton-owned recovery, before publishing host bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveredProjectionOrigin {
+    /// Empty birth and current bootstrap-only roots permit fresh initialization.
+    FreshAdmission,
+    /// Existing packed or RETIRING authority must restore its complete ledger.
+    Existing,
+}
+
+/// Recover a sentinel-free canonical volume without guessing its boot origin.
+///
+/// The caller must hold the boot singleton. Current bootstrap-only roots and
+/// the empty birth receipt authorize fresh retry. Otherwise ordinary packed
+/// homes retain normal reconciliation, and partial homes require RETIRING.
+///
+/// # Errors
+/// Rejects unsafe media/host entries and incomplete or corrupt authority.
+pub async fn open_runtime_principal_store_from_unsentinelled_projection(
+    home: &AstridHome,
+    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
+    principals: PrincipalDirectory,
+) -> PrincipalStorageResult<(RuntimePrincipalStore, RecoveredProjectionOrigin)> {
+    home.validate_volume_recovery_candidate()
+        .map_err(|error| StorageError::Connection(error.to_string()))?;
+    let (engine, receipt) = volume_migration::open_existing(home, DurableEnginePolicy::default())?
+        .ok_or_else(|| {
+            StorageError::Connection(
+                "projection recovery requires existing canonical volume".to_owned(),
+            )
+        })?;
+    let fresh_birth = volume_migration::is_fresh_birth_receipt(&receipt);
+    let store = assemble_runtime_store(quota, principals, Arc::new(engine), receipt).await?;
+    let origin = if fresh_birth
+        && super::runtime_tree::fresh_admission::restore_if_bootstrap(home, &store)?
+    {
+        RecoveredProjectionOrigin::FreshAdmission
+    } else {
+        if home.validate_unsentinelled_root().is_ok() {
+            super::runtime_tree::reconcile_running_projection(home, &store, false)?;
+        } else {
+            super::runtime_tree::retirement_recovery::restore(home, &store)?;
+        }
+        RecoveredProjectionOrigin::Existing
+    };
+    initialize_staging(home, &store)?;
+    quarantine_unrecognized_principal_store(home, &store)?;
+    Ok((store, origin))
 }
 
 fn quarantine_unrecognized_principal_store(
@@ -415,13 +514,10 @@ fn unrecognized_principal_store_present(home: &AstridHome) -> PrincipalStorageRe
 }
 
 async fn assemble_runtime_store(
-    home: &AstridHome,
     quota: Arc<dyn KvQuotaResolver<StateOwner>>,
     principals: PrincipalDirectory,
     engine: Arc<RuntimeEngine>,
     directory_cutover_receipt: String,
-    projection: ProjectionOpenMode,
-    allow_receiptless_bootstrap: bool,
 ) -> crate::principal_state::StorageResult<RuntimePrincipalStore> {
     let format_spec = bootstrap::format_specification()?;
     let format_spec_id = engine.identify(&format_spec);
@@ -497,23 +593,6 @@ async fn assemble_runtime_store(
         staging: Arc::clone(&staging),
         principals,
     };
-    match projection {
-        ProjectionOpenMode::RestoreRetiring => {
-            super::runtime_tree::retirement_recovery::restore(home, &store)?;
-        },
-        ProjectionOpenMode::Restore => {
-            crate::principal_state::runtime_tree::reconcile_running_projection(
-                home,
-                &store,
-                allow_receiptless_bootstrap,
-            )?;
-        },
-        ProjectionOpenMode::Pack => {},
-    }
-    let staging_area = NativeContentStagingArea::open(home.content_staging_path())?;
-    staging.set(Arc::new(staging_area)).map_err(|_| {
-        StorageError::Internal("runtime store staging area initialized twice".to_owned())
-    })?;
     Ok(store)
 }
 

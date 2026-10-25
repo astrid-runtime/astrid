@@ -47,6 +47,28 @@ pub(super) fn open_existing(
     Ok(Some((engine, receipt)))
 }
 
+/// The birth receipt proves no directory import occurred. Current roots must
+/// independently be checked before treating this volume as abandoned bootstrap.
+pub(super) fn open_fresh_admission(home: &AstridHome) -> StorageResult<(RuntimeEngine, String)> {
+    if !inspect_volume_entry(&home.storage_volume_path())? {
+        return Err(connection(
+            "fresh admission retry requires canonical volume".to_owned(),
+        ));
+    }
+    let (engine, receipt) = open_existing(home, DurableEnginePolicy::default())?
+        .ok_or_else(|| connection("fresh admission volume disappeared".to_owned()))?;
+    if !is_fresh_birth_receipt(&receipt) {
+        return Err(connection(
+            "fresh admission retry refuses imported volume".to_owned(),
+        ));
+    }
+    Ok((engine, receipt))
+}
+
+pub(super) fn is_fresh_birth_receipt(receipt: &str) -> bool {
+    receipt == cutover_receipt(&[])
+}
+
 /// Resolve the canonical volume and promote a released legacy path once.
 ///
 /// Promotion happens before recovery so the runtime-tree admission walk can
