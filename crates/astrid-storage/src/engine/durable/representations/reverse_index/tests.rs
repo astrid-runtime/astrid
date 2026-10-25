@@ -18,6 +18,86 @@ fn budget(rows: u64) -> LocationIndexMemoryBudget {
 }
 
 #[test]
+fn catalogue_rebuild_reuses_locator_pages_and_preserves_every_reverse_link() {
+    let mut shared = ReverseIndex::new(budget(128)).unwrap();
+    let mut fresh = ReverseIndex::new(budget(128)).unwrap();
+    for number in 0..256 {
+        shared
+            .insert(object(number), representation(number))
+            .unwrap();
+        fresh
+            .insert(object(number), representation(number))
+            .unwrap();
+    }
+    let mut memo = AuthenticatedPageMemo::default();
+    let mut fresh_auth = 0_usize;
+    for number in 0..64 {
+        assert!(
+            !shared
+                .insert_first_memo(object(number), representation(999), &mut memo)
+                .unwrap()
+        );
+        let mut control = AuthenticatedPageMemo::default();
+        assert!(
+            !fresh
+                .insert_first_memo(object(number), representation(999), &mut control)
+                .unwrap()
+        );
+        fresh_auth = fresh_auth.strict_add(control.test_hit_miss().1);
+    }
+    let (hits, shared_auth) = memo.test_hit_miss();
+    assert!(shared_auth > 0 && hits > 0);
+    assert!(
+        fresh_auth > shared_auth.strict_mul(2),
+        "fresh={fresh_auth}, shared={shared_auth}"
+    );
+    assert!(shared.equivalent(&fresh).unwrap());
+    for number in 0..64 {
+        assert_eq!(
+            shared.first(object(number)).unwrap(),
+            Some(representation(number))
+        );
+        assert_eq!(
+            shared
+                .ids_newest_first(object(number))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![representation(999), representation(number)]
+        );
+    }
+}
+
+#[test]
+fn warm_rebuild_memo_still_authenticates_link_bodies_and_rebinds_damaged_runs() {
+    for damage_link in [false, true] {
+        let mut index = ReverseIndex::new(budget(128)).unwrap();
+        for number in 0..256 {
+            index
+                .insert(object(number), representation(number))
+                .unwrap();
+        }
+        let mut memo = AuthenticatedPageMemo::default();
+        index
+            .insert_first_memo(object(0), representation(999), &mut memo)
+            .unwrap();
+        assert!(memo.test_hit_miss().0 > 0);
+        if damage_link {
+            index.file.set_len(0).unwrap();
+        } else {
+            index.damage_run_after_inserts(0);
+        }
+        let number = u64::from(!damage_link);
+        assert!(
+            index
+                .insert_first_memo(object(number), representation(1000), &mut memo)
+                .is_err()
+        );
+        assert!(index.failed());
+    }
+}
+
+#[test]
 fn ten_thousand_reverse_heads_preserve_all_ids_and_duplicates_with_bounded_residency() {
     let target = budget(128);
     let mut index = ReverseIndex::new(target).unwrap();
