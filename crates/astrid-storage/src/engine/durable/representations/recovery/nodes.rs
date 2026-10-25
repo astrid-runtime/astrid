@@ -17,6 +17,8 @@ use std::cell::RefCell;
 
 mod proofs;
 use proofs::JournalProofs;
+mod certificate;
+use certificate::ClosureCertificate;
 
 pub(in super::super) struct RecoveredNodes {
     file: DurableFile,
@@ -27,6 +29,7 @@ pub(in super::super) struct RecoveredNodes {
     // page evidence changes here. Index mutations invalidate its run epoch.
     page_memo: RefCell<AuthenticatedPageMemo>,
     proofs: RefCell<JournalProofs>,
+    certificate: Option<ClosureCertificate>,
 }
 
 /// No lookup or journal authority can observe a partially admitted index.
@@ -103,14 +106,15 @@ impl NodeAdmission {
 
     pub(super) fn finish(self) -> Result<RecoveredNodes, DurableError> {
         let (locations, _) = self.locations.finish()?;
-        let locations_epoch = locations.runs_epoch();
+        let proofs = JournalProofs::new(self.budget, locations.runs_epoch());
         Ok(RecoveredNodes {
             file: self.file,
             locations,
             limits: self.limits,
             budget: self.budget,
             page_memo: RefCell::default(),
-            proofs: RefCell::new(JournalProofs::new(self.budget, locations_epoch)),
+            proofs: RefCell::new(proofs),
+            certificate: None,
         })
     }
 }
@@ -121,9 +125,29 @@ impl RecoveredNodes {
         // fragmented runs without dropping any historical location. Canonical
         // cold proofs are rebuilt independently from the recovered active maps.
         self.proofs.get_mut().require_healthy(&self.locations)?;
-        self.locations.clear_proofs()?;
+        self.certificate = None;
+        // Discard journal evidence before rebuilding the admitted locator.
+        *self.proofs.get_mut() = JournalProofs::new(self.budget, self.locations.runs_epoch());
+        self.locations
+            .clear_proofs()
+            .inspect_err(|_| self.proofs.get_mut().fence())?;
         *self.proofs.get_mut() = JournalProofs::new(self.budget, self.locations.runs_epoch());
         *self.page_memo.get_mut() = AuthenticatedPageMemo::default();
+        Ok(())
+    }
+
+    pub(super) fn certify_closures(&mut self) -> Result<(), DurableError> {
+        self.proofs.get_mut().require_healthy(&self.locations)?;
+        self.certificate = None;
+        // Release any prior journal staging loan before reference witnesses use
+        // that partition. A certificate is published only after the join ends.
+        *self.proofs.get_mut() = JournalProofs::new(self.budget, self.locations.runs_epoch());
+        let result =
+            ClosureCertificate::build(&self.file, &self.locations, self.limits, self.budget);
+        if result.is_err() {
+            self.proofs.get_mut().fence();
+        }
+        self.certificate = result?;
         Ok(())
     }
 
@@ -145,6 +169,13 @@ impl RecoveredNodes {
     }
 
     #[cfg(test)]
+    pub(super) fn has_matching_certificate(&self) -> bool {
+        self.certificate
+            .as_ref()
+            .is_some_and(|proof| proof.matches(&self.locations))
+    }
+
+    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.locations.len()
     }
@@ -157,6 +188,20 @@ impl RecoveredNodes {
 
 impl super::super::activation::CompleteNodes for RecoveredNodes {
     fn complete(&self, id: &PhysicalMapNodeId) -> Result<bool, DurableError> {
+        self.proofs.borrow().require_healthy(&self.locations)?;
+        if self
+            .certificate
+            .as_ref()
+            .is_some_and(|proof| proof.matches(&self.locations))
+        {
+            return self
+                .locations
+                .location_memo(
+                    ObjectId::new(*id.as_bytes()),
+                    &mut self.page_memo.borrow_mut(),
+                )
+                .map(|location| location.is_some());
+        }
         self.proofs.borrow_mut().complete(
             ObjectId::new(*id.as_bytes()),
             &self.locations,
