@@ -242,7 +242,69 @@ fn retirement_transfers_spilled_locator_files_and_releases_old_owner() {
     assert_eq!(engine.inner.lock().index.resident_capacity_bytes(), 0);
     for (id, record) in history {
         assert!(matches!(engine.object(id), Err(DurableError::Closed)));
+        assert!(transferred.inner.lock().index.closure_proven(id).unwrap());
         assert_eq!(transferred.object(id).unwrap(), Some(record));
     }
     transferred.close().unwrap();
+}
+
+#[test]
+fn proof_install_failure_immediately_fences_standalone_and_staged_publication() {
+    for standalone in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = open(directory.path());
+        engine
+            .set_location_index_memory(
+                LocationIndexMemoryBudget::new(
+                    NonZeroU64::new(LocationIndexMemoryBudget::MIN_BYTES).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut history = seed_spilled_history(&engine);
+        let record = ObjectRecord::new(
+            ObjectKind::Evidence,
+            ObjectFormatVersion::V1,
+            b"proof failure after location admission".to_vec(),
+            Vec::new(),
+            0,
+            ObjectClass::Metadata,
+        )
+        .unwrap();
+        let id = TestIdentity.identify(&record);
+        engine.inner.lock().index.damage_run_after_inserts(1);
+        let result = if standalone {
+            engine.persist_standalone_object(&record)
+        } else {
+            engine.stage_object(&record)
+        };
+        assert!(result.is_err(), "proof write cannot acknowledge success");
+        assert_eq!(
+            engine.lifecycle.load(std::sync::atomic::Ordering::Acquire),
+            super::super::LIFECYCLE_REQUIRES_RECOVERY,
+            "cached reads must observe the fence before another lock"
+        );
+        history.push((id, record));
+        assert_poisoned_and_recover_history(&engine, &history);
+    }
+}
+
+#[test]
+fn wal_closure_proofs_fold_into_locators_and_recover_with_the_same_root() {
+    use super::super::proofs::ClosureProofLookup as _;
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open_with_wal(
+        directory.path(),
+        TransactionWalPolicy::enabled(NonZeroU64::new(u64::MAX).unwrap()),
+    );
+    let (commit, tx) = transaction("alice", None, b"pending proof ownership");
+    let root = engine.commit(tx).unwrap().root();
+    assert!(engine.inner.lock().proofs().proven(&commit).unwrap());
+    engine.flush().unwrap();
+    assert!(engine.inner.lock().pending_wal.is_empty());
+    assert!(engine.inner.lock().index.closure_proven(commit).unwrap());
+    engine.close().unwrap();
+    let reopened = open(directory.path());
+    assert_eq!(reopened.root(&"alice".to_owned()).unwrap(), Some(root));
+    assert!(reopened.inner.lock().proofs().proven(&commit).unwrap());
 }

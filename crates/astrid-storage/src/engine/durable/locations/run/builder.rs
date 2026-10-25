@@ -1,18 +1,21 @@
 //! Bounded bottom-up construction: one unfinished page per tree level.
 
 use super::{
-    ArenaLocation, BRANCH_CAPACITY, CHILD_BYTES, DurableError, ENTRY_BYTES, File, HEADER_BYTES,
-    LEAF_CAPACITY, Node, ObjectId, PAGE_BYTES, Run, Write, corrupt, digest,
+    BRANCH_CAPACITY, CHILD_BYTES, DurableError, ENTRY_BYTES, File, HEADER_BYTES, LEAF_CAPACITY,
+    LocatorValue, Node, ObjectId, PAGE_BYTES, Run, Write, corrupt, digest,
 };
 
 pub(in crate::engine::durable::locations) struct Builder {
     file: File,
-    pub(super) leaf: Vec<(ObjectId, ArenaLocation)>,
+    pub(super) leaf: Vec<(ObjectId, LocatorValue)>,
     pub(super) levels: Vec<Vec<Node>>,
     bytes: u64,
     count: usize,
     previous: Option<ObjectId>,
 }
+
+#[cfg(test)]
+use super::ArenaLocation;
 
 impl Builder {
     pub(in crate::engine::durable::locations) fn new() -> Result<Self, DurableError> {
@@ -28,10 +31,19 @@ impl Builder {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::engine::durable::locations) fn push(
         &mut self,
         id: ObjectId,
         location: ArenaLocation,
+    ) -> Result<(), DurableError> {
+        self.push_row(id, LocatorValue::unknown(location))
+    }
+
+    pub(in crate::engine::durable::locations) fn push_row(
+        &mut self,
+        id: ObjectId,
+        location: LocatorValue,
     ) -> Result<(), DurableError> {
         if self.previous.is_some_and(|previous| previous >= id) {
             return Err(corrupt(
@@ -91,11 +103,13 @@ impl Builder {
                 .map_err(|_| DurableError::EncodingOverflow)?
                 .to_le_bytes(),
         );
-        for ((id, location), target) in self
+        for ((id, row), target) in self
             .leaf
             .iter()
             .zip(bytes[HEADER_BYTES..].chunks_exact_mut(ENTRY_BYTES))
         {
+            let location = row.location;
+            target[80] = u8::from(row.proof == super::ClosureProof::Complete);
             target[..32].copy_from_slice(id.as_bytes());
             target[32..40].copy_from_slice(&location.offset.to_le_bytes());
             target[40..48].copy_from_slice(&location.payload_len.to_le_bytes());

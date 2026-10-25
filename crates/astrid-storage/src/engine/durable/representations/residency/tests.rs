@@ -43,7 +43,8 @@ fn published_updates_bound_resident_history_and_recover_every_entry() {
     )
     .unwrap();
     let mut objects = Vec::new();
-    let mut reclaimed = false;
+    let mut remeasured = false;
+    let initial_measurement = store.residency.measured_history;
     let mut prior_persisted = store.persisted_map_nodes.len();
     for sequence in 0_u64..4096 {
         let bytes = sequence.to_le_bytes();
@@ -61,8 +62,8 @@ fn published_updates_bound_resident_history_and_recover_every_entry() {
             .unwrap();
         let update = store.append_direct_update(&[direct]).unwrap().unwrap();
         store.publish_direct_update(update).unwrap();
-        if store.complete_map_subtrees.is_empty() {
-            reclaimed = true;
+        if store.residency.measured_history > initial_measurement {
+            remeasured = true;
         }
         // Node values are fetched from existing metadata frames; the complete
         // physical-ID index retains only its finite shared staging workspace.
@@ -71,7 +72,10 @@ fn published_updates_bound_resident_history_and_recover_every_entry() {
         prior_persisted = store.persisted_map_nodes.len();
         objects.push(object);
     }
-    assert!(reclaimed, "exercise proof eviction and subsequent writes");
+    assert!(
+        remeasured,
+        "exercise active-closure remeasurement and subsequent writes"
+    );
     let active = store.active;
     drop(store);
     let mut reopened = RepresentationStore::open_volume(

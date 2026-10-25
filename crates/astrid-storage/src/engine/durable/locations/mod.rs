@@ -7,6 +7,29 @@ use std::collections::BTreeMap;
 
 use super::{ArenaLocation, DurableError, ObjectId};
 
+/// Process-local evidence; never encoded in the durable index cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::engine::durable) enum ClosureProof {
+    Unknown,
+    Complete,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::engine::durable) struct LocatorValue {
+    location: ArenaLocation,
+    proof: ClosureProof,
+}
+
+impl LocatorValue {
+    #[cfg(test)]
+    const fn unknown(location: ArenaLocation) -> Self {
+        Self {
+            location,
+            proof: ClosureProof::Unknown,
+        }
+    }
+}
+
 pub(super) trait LocationLookup {
     fn location(&self, id: ObjectId) -> Result<Option<ArenaLocation>, DurableError>;
     fn location_count(&self) -> usize;
@@ -73,13 +96,14 @@ impl LocationIndexMemoryBudget {
     pub const DEFAULT: Self =
         Self(std::num::NonZeroU64::new(1_048_576).expect("one MiB is nonzero"));
 
-    /// Smallest budget capable of holding one complete locator entry.
+    /// Historical admission floor, retained for configuration compatibility.
+    /// Smaller-than-row partitions spill directly without reserving a row.
     pub const MIN_BYTES: u64 = std::mem::size_of::<(ObjectId, ArenaLocation)>() as u64;
 
-    /// Admit a finite, addressable target capable of holding an entry.
+    /// Admit a finite, addressable target at or above the historical floor.
     ///
     /// # Errors
-    /// Rejects targets smaller than one entry or above addressable memory.
+    /// Rejects targets below the historical floor or above addressable memory.
     pub fn new(bytes: std::num::NonZeroU64) -> Result<Self, &'static str> {
         if bytes.get() < Self::MIN_BYTES || bytes.get() > isize::MAX as u64 {
             return Err("location index budget must hold an entry and fit addressable memory");
@@ -102,16 +126,21 @@ impl LocationIndexMemoryBudget {
     }
 
     pub(super) fn entries(self) -> std::num::NonZeroUsize {
-        // Constructor bounds establish both conversion and nonzero division.
-        std::num::NonZeroUsize::new((self.0.get() / Self::MIN_BYTES) as usize)
+        // The historical floor predates proof bits. Tiny targets use direct
+        // spilling; they never reserve an over-budget resident row.
+        let bytes =
+            usize::try_from(self.0.get()).expect("validated budget fits addressable memory");
+        let rows = bytes
+            .checked_div(std::mem::size_of::<(ObjectId, LocatorValue)>())
+            .expect("complete locator rows have nonzero size");
+        std::num::NonZeroUsize::new(rows.max(1))
             .expect("validated locator budget holds an addressable entry")
     }
 }
 
 impl Default for LocationIndexMemoryBudget {
     fn default() -> Self {
-        // One shared 1 MiB vector stages roughly 13k entries before a geometric
-        // spill. This amortizes writes without reserving RAM per principal or
+        // Shared staging amortizes writes without reserving RAM per principal or
         // retaining an entire 10k-agent historical catalogue in memory.
         Self::DEFAULT
     }
@@ -122,6 +151,3 @@ pub(super) use prefix::ArenaPrefix;
 
 #[cfg(test)]
 mod engine_tests;
-
-type LocationEntry = Result<(ObjectId, ArenaLocation), DurableError>;
-type LocationEntries<'a> = Box<dyn Iterator<Item = LocationEntry> + 'a>;

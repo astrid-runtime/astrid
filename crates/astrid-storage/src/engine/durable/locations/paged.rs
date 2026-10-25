@@ -9,11 +9,13 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::run::{Builder, Run};
-use super::{ArenaLocation, DurableError, LocationEntries, LocationLookup, ObjectId};
+use super::{ArenaLocation, ClosureProof, DurableError, LocationLookup, LocatorValue, ObjectId};
+
+type RowEntries<'a> = Box<dyn Iterator<Item = Result<(ObjectId, LocatorValue), DurableError>> + 'a>;
 
 #[derive(Debug)]
 pub(in crate::engine::durable) struct PagedLocations {
-    resident: Vec<(ObjectId, ArenaLocation)>,
+    resident: Vec<(ObjectId, LocatorValue)>,
     runs: Vec<Option<Run>>,
     limit: NonZeroUsize,
     count: usize,
@@ -35,14 +37,39 @@ impl PagedLocations {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::engine::durable) fn from_map(
         map: BTreeMap<ObjectId, ArenaLocation>,
         limit: NonZeroUsize,
     ) -> Result<Self, DurableError> {
+        Self::from_map_with_proofs(map, &std::collections::BTreeSet::new(), limit)
+    }
+
+    pub(in crate::engine::durable) fn from_map_with_proofs(
+        map: BTreeMap<ObjectId, ArenaLocation>,
+        proven: &std::collections::BTreeSet<ObjectId>,
+        limit: NonZeroUsize,
+    ) -> Result<Self, DurableError> {
+        let row = |id, location| {
+            (
+                id,
+                LocatorValue {
+                    location,
+                    proof: if proven.contains(&id) {
+                        ClosureProof::Complete
+                    } else {
+                        ClosureProof::Unknown
+                    },
+                },
+            )
+        };
         if map.len() < limit.get() {
             return Ok(Self {
                 count: map.len(),
-                resident: map.into_iter().collect(),
+                resident: map
+                    .into_iter()
+                    .map(|(id, location)| row(id, location))
+                    .collect(),
                 runs: Vec::new(),
                 limit,
                 failed: AtomicBool::new(false),
@@ -53,7 +80,8 @@ impl PagedLocations {
         let count = map.len();
         let mut builder = Builder::new()?;
         for (id, location) in map {
-            builder.push(id, location)?;
+            let (id, value) = row(id, location);
+            builder.push_row(id, value)?;
         }
         let run = builder
             .finish()?
@@ -88,6 +116,57 @@ impl PagedLocations {
         id: ObjectId,
         location: ArenaLocation,
     ) -> Result<(), DurableError> {
+        let prior = self.row(id)?;
+        self.insert_row(
+            id,
+            LocatorValue {
+                location,
+                proof: prior.map_or(ClosureProof::Unknown, |prior| prior.proof),
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::durable) fn clear_proofs(&mut self) -> Result<(), DurableError> {
+        let entries = self.locations().collect::<Result<Vec<_>, _>>()?;
+        for (id, location) in entries {
+            self.insert_row(id, LocatorValue::unknown(location))?;
+        }
+        Ok(())
+    }
+
+    pub(in crate::engine::durable) fn closure_proven(
+        &self,
+        id: ObjectId,
+    ) -> Result<bool, DurableError> {
+        Ok(self
+            .row(id)?
+            .is_some_and(|row| row.proof == ClosureProof::Complete))
+    }
+
+    pub(in crate::engine::durable) fn mark_proven(
+        &mut self,
+        id: ObjectId,
+    ) -> Result<(), DurableError> {
+        let mut row = self
+            .row(id)?
+            .ok_or(DurableError::InvalidRepresentationState(
+                "closure proof has no object locator",
+            ))?;
+        row.proof = ClosureProof::Complete;
+        let result = self.insert_row(id, row);
+        if result.is_err() {
+            self.failed.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    fn row(&self, id: ObjectId) -> Result<Option<LocatorValue>, DurableError> {
+        self.lookup(id)
+            .inspect_err(|_| self.failed.store(true, Ordering::Release))
+    }
+
+    fn insert_row(&mut self, id: ObjectId, location: LocatorValue) -> Result<(), DurableError> {
         #[cfg(test)]
         if let Some(remaining) = self.damage_after_inserts.as_mut() {
             if *remaining == 0 {
@@ -97,7 +176,7 @@ impl PagedLocations {
                 *remaining = remaining.strict_sub(1);
             }
         }
-        let previous = self.location(id)?;
+        let previous = self.row(id)?;
         if previous == Some(location) {
             return Ok(());
         }
@@ -142,7 +221,7 @@ impl PagedLocations {
     fn flush_with(
         &mut self,
         id: ObjectId,
-        location: ArenaLocation,
+        location: LocatorValue,
         count: usize,
     ) -> Result<(), DurableError> {
         // Include the prospective mutation in the new run without publishing it
@@ -158,7 +237,7 @@ impl PagedLocations {
         let mut builder = Builder::new()?;
         for entry in MergedEntries::new(sources)? {
             let (id, location) = entry?;
-            builder.push(id, location)?;
+            builder.push_row(id, location)?;
         }
         let mut carry = builder
             .finish()?
@@ -253,7 +332,7 @@ impl PagedLocations {
     pub(in crate::engine::durable) fn resident_capacity_bytes(&self) -> usize {
         self.resident
             .capacity()
-            .strict_mul(std::mem::size_of::<(ObjectId, ArenaLocation)>())
+            .strict_mul(std::mem::size_of::<(ObjectId, LocatorValue)>())
     }
 
     pub(in crate::engine::durable) fn set_limit(
@@ -282,12 +361,12 @@ impl PagedLocations {
         self.failed.load(Ordering::Acquire)
     }
 
-    fn lookup(&self, id: ObjectId) -> Result<Option<ArenaLocation>, DurableError> {
+    fn lookup(&self, id: ObjectId) -> Result<Option<LocatorValue>, DurableError> {
         if let Ok(at) = self.resident.binary_search_by_key(&id, |entry| entry.0) {
             return Ok(Some(self.resident[at].1));
         }
         for run in self.runs.iter().flatten() {
-            if let Some(location) = run.lookup(id)? {
+            if let Some(location) = run.lookup_row(id)? {
                 return Ok(Some(location));
             }
         }
@@ -297,8 +376,7 @@ impl PagedLocations {
 
 impl LocationLookup for PagedLocations {
     fn location(&self, id: ObjectId) -> Result<Option<ArenaLocation>, DurableError> {
-        self.lookup(id)
-            .inspect_err(|_| self.failed.store(true, Ordering::Release))
+        self.row(id).map(|row| row.map(|row| row.location))
     }
 
     fn location_count(&self) -> usize {
@@ -308,7 +386,7 @@ impl LocationLookup for PagedLocations {
     fn locations(
         &self,
     ) -> Box<dyn Iterator<Item = Result<(ObjectId, ArenaLocation), DurableError>> + '_> {
-        let mut sources: Vec<LocationEntries<'_>> = vec![Box::new(
+        let mut sources: Vec<RowEntries<'_>> = vec![Box::new(
             self.resident
                 .iter()
                 .map(|(id, location)| Ok((*id, *location))),
@@ -317,25 +395,26 @@ impl LocationLookup for PagedLocations {
             self.runs
                 .iter()
                 .flatten()
-                .map(|run| Box::new(run.entries()) as Box<dyn Iterator<Item = Result<_, _>>>),
+                .map(|run| Box::new(run.rows()) as Box<dyn Iterator<Item = Result<_, _>>>),
         );
         let entries: Box<dyn Iterator<Item = Result<_, _>>> = match MergedEntries::new(sources) {
             Ok(entries) => Box::new(entries),
             Err(error) => Box::new(std::iter::once(Err(error))),
         };
-        Box::new(
-            entries.map(|entry| entry.inspect_err(|_| self.failed.store(true, Ordering::Release))),
-        )
+        Box::new(entries.map(|entry| {
+            entry
+                .map(|(id, row)| (id, row.location))
+                .inspect_err(|_| self.failed.store(true, Ordering::Release))
+        }))
     }
 }
 
 fn merge(newer: &Run, older: &Run) -> Result<Run, DurableError> {
-    let sources: Vec<LocationEntries<'_>> =
-        vec![Box::new(newer.entries()), Box::new(older.entries())];
+    let sources: Vec<RowEntries<'_>> = vec![Box::new(newer.rows()), Box::new(older.rows())];
     let mut builder = Builder::new()?;
     for entry in MergedEntries::new(sources)? {
         let (id, location) = entry?;
-        builder.push(id, location)?;
+        builder.push_row(id, location)?;
     }
     builder
         .finish()?
@@ -345,13 +424,13 @@ fn merge(newer: &Run, older: &Run) -> Result<Run, DurableError> {
 }
 
 struct MergedEntries<'a> {
-    sources: Vec<LocationEntries<'a>>,
-    heads: Vec<Option<(ObjectId, ArenaLocation)>>,
+    sources: Vec<RowEntries<'a>>,
+    heads: Vec<Option<(ObjectId, LocatorValue)>>,
     failed: bool,
 }
 
 impl<'a> MergedEntries<'a> {
-    fn new(mut sources: Vec<LocationEntries<'a>>) -> Result<Self, DurableError> {
+    fn new(mut sources: Vec<RowEntries<'a>>) -> Result<Self, DurableError> {
         let heads = sources
             .iter_mut()
             .map(|source| source.next().transpose())
@@ -365,7 +444,7 @@ impl<'a> MergedEntries<'a> {
 }
 
 impl Iterator for MergedEntries<'_> {
-    type Item = Result<(ObjectId, ArenaLocation), DurableError>;
+    type Item = Result<(ObjectId, LocatorValue), DurableError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.failed {
@@ -373,7 +452,7 @@ impl Iterator for MergedEntries<'_> {
         }
         let mut selected = None;
         for entry in self.heads.iter().flatten() {
-            if selected.is_none_or(|previous: (ObjectId, ArenaLocation)| previous.0 > entry.0) {
+            if selected.is_none_or(|previous: (ObjectId, LocatorValue)| previous.0 > entry.0) {
                 selected = Some(*entry);
             }
         }

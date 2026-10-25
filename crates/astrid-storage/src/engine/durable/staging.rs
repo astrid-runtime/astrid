@@ -50,23 +50,24 @@ struct StagingBatchAppend {
 }
 
 fn staged_closure_evidence(
-    validated: &BTreeSet<ObjectId>,
+    validated: &dyn super::proofs::ClosureProofLookup,
     records: &BTreeMap<ObjectId, PreparedStagingObject>,
-) -> BTreeSet<ObjectId> {
+) -> Result<BTreeSet<ObjectId>, DurableError> {
     // This is intentionally batch-local. Retaining reverse edges for every
     // unreachable staged object would turn an accelerator into O(history)
     // host memory. Parent-before-child batches use the ordinary commit walk.
     let mut unresolved = BTreeMap::<ObjectId, BTreeSet<ObjectId>>::new();
     let mut dependents = BTreeMap::<ObjectId, BTreeSet<ObjectId>>::new();
     for (id, prepared) in records {
-        if validated.contains(id) {
+        if validated.proven(id)? {
             continue;
         }
-        let dependencies = prepared
-            .record
-            .owning_references()
-            .filter(|child| !validated.contains(child))
-            .collect::<BTreeSet<_>>();
+        let mut dependencies = BTreeSet::new();
+        for child in prepared.record.owning_references() {
+            if !validated.proven(&child)? {
+                dependencies.insert(child);
+            }
+        }
         for child in dependencies
             .iter()
             .filter(|child| records.contains_key(child))
@@ -98,13 +99,19 @@ fn staged_closure_evidence(
             }
         }
     }
-    proven
+    Ok(proven)
 }
 
-fn record_owns_validated_closure(record: &ObjectRecord, validated: &BTreeSet<ObjectId>) -> bool {
-    record
-        .owning_references()
-        .all(|child| validated.contains(&child))
+fn record_owns_validated_closure(
+    record: &ObjectRecord,
+    validated: &dyn super::proofs::ClosureProofLookup,
+) -> Result<bool, DurableError> {
+    for child in record.owning_references() {
+        if !validated.proven(&child)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 impl PreparedStagingBatch {
@@ -281,6 +288,19 @@ where
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
+    fn remember_staged_proof(
+        &self,
+        inner: &mut DurableInner<P>,
+        id: ObjectId,
+        record: &ObjectRecord,
+    ) -> Result<(), DurableError> {
+        let evidence = record_owns_validated_closure(record, &inner.proofs());
+        if self.proof_result(inner, evidence)? {
+            self.remember_proofs(inner, [id])?;
+        }
+        Ok(())
+    }
+
     /// Stage one immutable object without publishing a principal root.
     ///
     /// Identity is recomputed and an existing object is read back before a
@@ -312,9 +332,7 @@ where
             if &existing != record {
                 return Err(ModelError::ObjectCollision(id).into());
             }
-            if record_owns_validated_closure(record, &inner.validated) {
-                inner.validated.insert(id);
-            }
+            self.remember_staged_proof(&mut inner, id, record)?;
             return Ok((id, InsertOutcome::AlreadyPresent));
         }
         let payload = encode_object_frame(self.identity.scheme(), id, record)?;
@@ -351,9 +369,7 @@ where
                 if let Some(direct) = direct {
                     inner.pending_direct_objects.insert(id, direct);
                 }
-                if record_owns_validated_closure(record, &inner.validated) {
-                    inner.validated.insert(id);
-                }
+                self.remember_staged_proof(&mut inner, id, record)?;
                 Ok((id, InsertOutcome::Inserted))
             },
             Err(error) => {
@@ -496,13 +512,14 @@ where
                 self.verify_existing_batch(&mut inner, &prepared_batch.prepared.unique)?;
             record_phase(observer, ProjectionPhase::AdmissionProbe, probe_started);
             if already_present.len() == prepared_batch.prepared.unique.len() {
-                let proven =
-                    staged_closure_evidence(&inner.validated, &prepared_batch.prepared.unique);
+                let evidence =
+                    staged_closure_evidence(&inner.proofs(), &prepared_batch.prepared.unique);
+                let proven = self.proof_result(&mut inner, evidence)?;
                 let outcomes = prepared_batch.prepared.finish(&already_present)?.outcomes;
                 // Every record was read back and byte-compared while `inner`
                 // was locked, so these tokens have the same meaning as tokens
                 // earned for newly installed frames below.
-                inner.validated.extend(proven);
+                self.remember_proofs(&mut inner, proven)?;
                 return Ok(outcomes);
             }
             if active_profile != prepared_batch.direct_profile
@@ -520,7 +537,9 @@ where
                 prepared_batch.direct_profile = active_profile;
                 continue;
             }
-            let proven = staged_closure_evidence(&inner.validated, &prepared_batch.prepared.unique);
+            let evidence =
+                staged_closure_evidence(&inner.proofs(), &prepared_batch.prepared.unique);
+            let proven = self.proof_result(&mut inner, evidence)?;
             let append = prepared_batch.prepared.finish(&already_present)?;
             let append_started = Instant::now();
             let append_result = {
@@ -540,7 +559,7 @@ where
                     // Install evidence only after every corresponding location
                     // and direct description is present. Any earlier failure
                     // leaves the validated frontier unchanged.
-                    inner.validated.extend(proven);
+                    self.remember_proofs(&mut inner, proven)?;
                     record_phase(observer, ProjectionPhase::PhysicalMapUpdate, map_started);
                     return Ok(append.outcomes);
                 },
@@ -662,7 +681,7 @@ mod closure_evidence_tests {
         records.insert(child, prepared(record(Vec::new())));
 
         assert_eq!(
-            staged_closure_evidence(&BTreeSet::new(), &records),
+            staged_closure_evidence(&BTreeSet::new(), &records).unwrap(),
             BTreeSet::from([child, parent])
         );
     }
@@ -695,6 +714,10 @@ mod closure_evidence_tests {
             )])),
         );
 
-        assert!(staged_closure_evidence(&BTreeSet::new(), &records).is_empty());
+        assert!(
+            staged_closure_evidence(&BTreeSet::new(), &records)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

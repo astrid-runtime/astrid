@@ -15,7 +15,7 @@ fn assert_metadata_released(engine: &DurableEngine<String, TestIdentity, Utf8Cod
         inner.index.is_empty(),
         "closed handles retain historical locators"
     );
-    assert!(inner.validated.is_empty());
+    assert_eq!(inner.index.resident_capacity_bytes(), 0);
     assert!(inner.roots_by_principal.is_empty());
     assert!(inner.pending_direct_objects.is_empty());
     assert_eq!(inner.pending_index_locations.capacity(), 0);
@@ -46,7 +46,7 @@ fn retained_closed_engine_releases_history_and_reopens_identical_authority() {
         history.push((id, record));
     }
     let count = engine.object_count().unwrap();
-    assert!(!engine.inner.lock().validated.is_empty());
+    assert!(!engine.inner.lock().index.is_empty());
     assert!(!engine.published_roots.entries.load().is_empty());
 
     engine.close().unwrap();

@@ -128,7 +128,7 @@ pub(super) fn validate_commit_closure(
 
 pub(super) fn validate_incremental_closure<I: PersistentObjectIdentity, P: Ord>(
     source: &mut ClosureObjects<'_, I, P>,
-    validated: &BTreeSet<ObjectId>,
+    validated: &dyn super::proofs::ClosureProofLookup,
     root: ObjectId,
 ) -> Result<BTreeSet<ObjectId>, DurableError> {
     let root_record = source.load(root)?;
@@ -144,7 +144,7 @@ pub(super) fn validate_incremental_closure<I: PersistentObjectIdentity, P: Ord>(
     let mut stack = vec![(root, false)];
 
     while let Some((id, expanded)) = stack.pop() {
-        if validated.contains(&id) {
+        if validated.proven(&id)? {
             reachable.insert(id);
             continue;
         }

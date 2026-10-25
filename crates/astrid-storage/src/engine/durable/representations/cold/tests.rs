@@ -174,3 +174,52 @@ fn oversized_node_is_rejected_before_staging_and_a_valid_retry_reopens() {
     assert_eq!(reopened.len(), 1);
     assert_eq!(reopened.node(id).unwrap().unwrap().as_ref(), &small);
 }
+
+#[test]
+fn staged_physical_nodes_cannot_create_canonical_closure_evidence() {
+    use super::super::activation::CompleteNodes as _;
+    let file = File::native(tempfile::tempfile().unwrap());
+    let mut nodes = ColdNodes::from_metadata(
+        &file,
+        RecoveryLimits::process_addressable(),
+        LocationIndexMemoryBudget::default(),
+    )
+    .unwrap();
+    let node = leaf();
+    let id = node.identify(&Blake3PhysicalIdentity).unwrap();
+    nodes.put(id, node).unwrap();
+    assert!(!nodes.complete(&id).unwrap());
+    assert!(nodes.remember(id).is_err());
+    assert!(nodes.failed());
+}
+
+#[test]
+fn canonical_closure_evidence_is_paged_authenticated_and_process_local() {
+    use super::super::activation::CompleteNodes as _;
+    let file = File::native(tempfile::tempfile().unwrap());
+    let budget = LocationIndexMemoryBudget::new(
+        std::num::NonZeroU64::new(LocationIndexMemoryBudget::MIN_BYTES).unwrap(),
+    )
+    .unwrap();
+    let limits = RecoveryLimits::process_addressable();
+    let mut nodes = ColdNodes::from_metadata(&file, limits, budget).unwrap();
+    let node = leaf();
+    let id = node.identify(&Blake3PhysicalIdentity).unwrap();
+    let payload = MetadataFrame::map_node(&Blake3PhysicalIdentity, &node)
+        .unwrap()
+        .encode()
+        .unwrap();
+    let location = append_frame(&mut file.try_clone().unwrap(), METADATA_MAGIC, &payload).unwrap();
+    nodes.promote(id, location).unwrap();
+    assert!(!nodes.complete(&id).unwrap());
+    nodes.remember(id).unwrap();
+    assert!(nodes.complete(&id).unwrap());
+    assert_eq!(nodes.staging_capacity_bytes(), 0);
+    nodes.0.lock().locations.truncate_test_run();
+    assert!(nodes.complete(&id).is_err());
+    assert!(nodes.failed());
+    // Rebuild from canonical frames; scratch flags never confer durable authority.
+    let recovered = ColdNodes::from_metadata(&file, limits, budget).unwrap();
+    assert!(!recovered.complete(&id).unwrap());
+    assert_eq!(recovered.node(id).unwrap().unwrap().as_ref(), &node);
+}

@@ -1,5 +1,6 @@
 //! Crash and authority tests for proof-audited durable compaction.
 use super::locations::LocationLookup as _;
+use super::proofs::ClosureProofLookup as _;
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -243,7 +244,7 @@ fn compaction_invalidates_evidence_for_reclaimed_staged_objects() {
     let engine = super::tests::open(directory.path());
     let staged = evidence(b"complete but unreachable staged object");
     let (staged_id, _) = engine.stage_object(&staged).unwrap();
-    assert!(engine.inner.lock().validated.contains(&staged_id));
+    assert!(engine.inner.lock().proofs().proven(&staged_id).unwrap());
     let policy = evidence(b"retain-current-roots");
     let authorization = plan(&engine, retention(&engine, &policy, []), policy);
 
@@ -252,7 +253,7 @@ fn compaction_invalidates_evidence_for_reclaimed_staged_objects() {
 
     let inner = engine.inner.lock();
     assert!(inner.index.location(staged_id).unwrap().is_none());
-    assert!(!inner.validated.contains(&staged_id));
+    assert!(!inner.proofs().proven(&staged_id).unwrap());
 }
 
 #[test]

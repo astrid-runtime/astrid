@@ -1,3 +1,4 @@
+use crate::engine::durable::proofs::ClosureProofLookup as _;
 #[test]
 fn indexed_object_read_does_not_move_the_append_cursor() {
     let directory = tempfile::tempdir().unwrap();
@@ -140,7 +141,7 @@ fn staged_closure_is_validated_and_flushed_by_root_commit() {
         transaction
             .records()
             .iter()
-            .all(|(id, _)| engine.inner.lock().validated.contains(id))
+            .all(|(id, _)| engine.inner.lock().proofs().proven(id).unwrap())
     );
 
     let outcome = engine
@@ -185,7 +186,7 @@ fn reopen_discards_unrooted_staging_evidence_and_revalidates_on_publish() {
         transaction
             .records()
             .iter()
-            .all(|(id, _)| engine.inner.lock().validated.contains(id))
+            .all(|(id, _)| engine.inner.lock().proofs().proven(id).unwrap())
     );
     engine.flush().unwrap();
     engine.close().unwrap();
@@ -196,7 +197,7 @@ fn reopen_discards_unrooted_staging_evidence_and_revalidates_on_publish() {
         transaction
             .records()
             .iter()
-            .all(|(id, _)| !reopened.inner.lock().validated.contains(id))
+            .all(|(id, _)| !reopened.inner.lock().proofs().proven(id).unwrap())
     );
     let outcome = reopened
         .commit(RootTransaction::new(
@@ -213,7 +214,7 @@ fn reopen_discards_unrooted_staging_evidence_and_revalidates_on_publish() {
         transaction
             .records()
             .iter()
-            .all(|(id, _)| reopened.inner.lock().validated.contains(id))
+            .all(|(id, _)| reopened.inner.lock().proofs().proven(id).unwrap())
     );
 }
 
@@ -225,7 +226,7 @@ fn parent_before_child_staging_falls_back_to_publication_validation() {
     for (_, record) in transaction.records().iter().rev() {
         engine.stage_object(record).unwrap();
     }
-    assert!(!engine.inner.lock().validated.contains(&commit));
+    assert!(!engine.inner.lock().proofs().proven(&commit).unwrap());
 
     let outcome = engine
         .commit(RootTransaction::new(
@@ -254,7 +255,7 @@ fn incomplete_staging_cannot_publish_a_dangling_root() {
         .clone();
     engine.stage_object(&commit_record).unwrap();
 
-    assert!(!engine.inner.lock().validated.contains(&commit));
+    assert!(!engine.inner.lock().proofs().proven(&commit).unwrap());
 
     assert!(matches!(
         engine.commit(RootTransaction::new(
@@ -310,7 +311,7 @@ fn equal_dedup_hits_reconstruct_batch_closure_evidence() {
         .map(|(_, record)| record.clone())
         .collect::<Vec<_>>();
     engine.stage_objects(records.clone()).unwrap();
-    engine.inner.lock().validated.clear();
+    engine.inner.lock().clear_proofs();
 
     let outcomes = engine.stage_objects(records).unwrap();
 
@@ -324,7 +325,7 @@ fn equal_dedup_hits_reconstruct_batch_closure_evidence() {
         transaction
             .records()
             .iter()
-            .all(|(id, _)| inner.validated.contains(id))
+            .all(|(id, _)| inner.proofs().proven(id).unwrap())
     );
 }
 
@@ -452,7 +453,7 @@ fn staged_batch_appender_failure_installs_no_authority() {
     assert!(inner.poisoned);
     assert!(inner.roots_by_principal.is_empty());
     assert!(ids.iter().all(|id| inner.index.location(*id).unwrap().is_none()));
-    assert!(ids.iter().all(|id| !inner.validated.contains(id)));
+    assert!(ids.iter().all(|id| !inner.proofs().proven(id).unwrap()));
     assert_eq!(
         engine.lifecycle.load(Ordering::Acquire),
         LIFECYCLE_REQUIRES_RECOVERY

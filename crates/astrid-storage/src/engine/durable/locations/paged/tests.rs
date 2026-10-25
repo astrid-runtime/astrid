@@ -137,3 +137,79 @@ fn repeated_location_replacements_do_not_accumulate_redundant_run_entries() {
         expected.into_iter().collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn proof_rows_survive_geometric_merges_without_another_history_sized_tree() {
+    let limit = NonZeroUsize::new(32).unwrap();
+    let mut paged = PagedLocations::new(limit);
+    for index in 0..10000_u64 {
+        let (id, location) = entry(index);
+        paged.insert(id, location).unwrap();
+        assert!(!paged.closure_proven(id).unwrap());
+        if index % 2 == 0 {
+            paged.mark_proven(id).unwrap();
+        }
+        assert!(
+            paged.resident_capacity_bytes()
+                <= limit
+                    .get()
+                    .strict_mul(std::mem::size_of::<(ObjectId, LocatorValue)>())
+        );
+        assert!(
+            paged
+                .runs
+                .iter()
+                .flatten()
+                .map(|run| run.count)
+                .sum::<usize>()
+                <= paged.count.saturating_mul(2)
+        );
+    }
+    for index in 0..10000 {
+        let (id, mut location) = entry(index);
+        assert_eq!(paged.closure_proven(id).unwrap(), index % 2 == 0);
+        location.offset = location.offset.strict_add(1);
+        paged.insert(id, location).unwrap();
+        assert_eq!(paged.closure_proven(id).unwrap(), index % 2 == 0);
+        assert_eq!(paged.location(id).unwrap(), Some(location));
+    }
+    assert!(!paged.closure_proven(entry(10000).0).unwrap());
+    assert!(paged.mark_proven(entry(10000).0).is_err());
+    assert_eq!(paged.len(), 10000);
+}
+
+#[test]
+fn recovered_proofs_and_direct_spill_keep_the_same_locations_and_proof_membership() {
+    let map = (0..256).map(entry).collect::<BTreeMap<_, _>>();
+    let proven = (0..256)
+        .filter(|index| index % 3 == 0)
+        .map(|index| entry(index).0)
+        .collect();
+    for limit in [1, 1024] {
+        let mut paged = PagedLocations::from_map_with_proofs(
+            map.clone(),
+            &proven,
+            NonZeroUsize::new(limit).unwrap(),
+        )
+        .unwrap();
+        paged.set_limit(NonZeroUsize::new(1).unwrap()).unwrap();
+        assert_eq!(paged.resident_capacity_bytes(), 0);
+        for index in 0..256 {
+            assert_eq!(
+                paged.closure_proven(entry(index).0).unwrap(),
+                index % 3 == 0
+            );
+        }
+        assert_eq!(
+            paged
+                .locations()
+                .collect::<Result<BTreeMap<_, _>, _>>()
+                .unwrap(),
+            map
+        );
+        paged.truncate_test_run();
+        assert!(paged.closure_proven(entry(0).0).is_err());
+        assert!(paged.mark_proven(entry(0).0).is_err());
+        assert!(paged.failed());
+    }
+}

@@ -720,13 +720,13 @@ where
         self.object_cache
             .retain_objects(|object| replacement.index.contains_key(&object));
         inner.roots_by_principal = replacement.roots;
-        inner.index = super::locations::PagedLocations::from_map(
+        inner.index = super::locations::PagedLocations::from_map_with_proofs(
             replacement.index,
+            &replacement.validated,
             self.index_memory.read().durable_entries(),
         )?;
         inner.pending_index_locations.clear();
         inner.pending_direct_objects.clear();
-        inner.validated = replacement.validated;
         inner.files = Some(DurableFiles {
             arena,
             roots,

@@ -177,6 +177,24 @@ impl ColdNodes {
     }
 }
 
+impl super::activation::CompleteNodes for ColdNodes {
+    fn complete(&self, id: &PhysicalMapNodeId) -> Result<bool, DurableError> {
+        self.0
+            .lock()
+            .locations
+            .closure_proven(ObjectId::new(*id.as_bytes()))
+    }
+
+    fn remember(&mut self, id: PhysicalMapNodeId) -> Result<(), DurableError> {
+        let mut arena = self.0.lock();
+        let result = arena.locations.mark_proven(ObjectId::new(*id.as_bytes()));
+        if result.is_err() {
+            arena.failed = true;
+        }
+        result
+    }
+}
+
 impl NodeArena {
     fn node(&self, id: PhysicalMapNodeId) -> Result<Option<PhysicalMapNode>, DurableError> {
         let key = ObjectId::new(*id.as_bytes());
