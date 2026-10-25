@@ -595,6 +595,26 @@ where
             .collect())
     }
 
+    /// Return roots in an ordered owner range without visiting unrelated owners.
+    ///
+    /// This privileged maintenance query has the same authority boundary as
+    /// [`Self::roots`]; projection callers must use their admitted owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a recovery error when authoritative reopen cannot complete.
+    pub fn roots_in_range(
+        &self,
+        range: impl std::ops::RangeBounds<P>,
+    ) -> Result<Vec<(P, RootState)>, DurableError> {
+        let inner = self.lock_usable()?;
+        Ok(inner
+            .roots_by_principal
+            .range(range)
+            .map(|(principal, root)| (principal.clone(), *root))
+            .collect())
+    }
+
     /// Capture one current root and its complete owning closure.
     ///
     /// # Errors

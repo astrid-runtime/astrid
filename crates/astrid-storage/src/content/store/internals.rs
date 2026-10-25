@@ -31,6 +31,18 @@ where
                     .map_or(CatalogSummary::default(), |catalog| catalog.summary),
             },
         );
+        if let Some(previous) = header.root
+            && previous.commit != root.commit
+        {
+            // A replaced owner head cannot serve a current-header lookup.
+            // Readers already holding its Arc retain their immutable view;
+            // keeping another cached copy only crowds out live projections.
+            let _ = self.engine.discard_projection_cache(
+                principal,
+                previous.commit,
+                super::DECODED_HEADER_CACHE_KEY,
+            );
+        }
         header.root = Some(root);
         header.previous_catalog_quota_bytes = header
             .catalog
@@ -87,30 +99,16 @@ where
                         .load_object_for(principal, reference.target())?
                         .ok_or_else(|| ContentError::MissingObject(reference.target()))?;
                     let root = root_from_record(reference.target(), &record)?;
-                    let cached = self
-                        .validated_catalogs
-                        .lock()
-                        .get(principal)
-                        .copied()
-                        .filter(|validation| validation.root == Some(root.object));
-                    let validation = if let Some(validation) = cached {
-                        validation
-                    } else {
-                        let validation = validate_catalog(Some(root), &mut |object| {
-                            self.load_required_for(principal, object)
-                        })?;
-                        self.validated_catalogs
-                            .lock()
-                            .insert(principal.clone(), validation);
-                        validation
-                    };
-                    if validation.summary != root.summary {
-                        return Err(invalid(
-                            root.object,
-                            "content catalog validation totals disagree",
-                        ));
-                    }
+                    self.validate_header_catalog(principal, root)?;
                     catalog = Some(root);
+                },
+                super::workspace::directory::DIRECTORY_LABEL => {
+                    other_quota_bytes = other_quota_bytes
+                        .checked_add(
+                            self.workspace_directory_quota(principal, state_id, &state, reference)?,
+                        )
+                        .ok_or(PrincipalContentError::AccountingOverflow)?;
+                    preserved_state.push(reference.clone());
                 },
                 KV_COMPONENT_LABEL => {
                     other_quota_bytes = other_quota_bytes
@@ -146,6 +144,56 @@ where
             preserved_state,
             preserved_commit,
         })
+    }
+
+    fn validate_header_catalog(
+        &self,
+        principal: &P,
+        root: CatalogRoot,
+    ) -> Result<(), PrincipalContentError> {
+        let cached = self
+            .validated_catalogs
+            .lock()
+            .get(principal)
+            .copied()
+            .filter(|validation| validation.root == Some(root.object));
+        let validation = if let Some(validation) = cached {
+            validation
+        } else {
+            let validation = validate_catalog(Some(root), &mut |object| {
+                self.load_required_for(principal, object)
+            })?;
+            self.validated_catalogs
+                .lock()
+                .insert(principal.clone(), validation);
+            validation
+        };
+        if validation.summary != root.summary {
+            return Err(invalid(
+                root.object,
+                "content catalog validation totals disagree",
+            ));
+        }
+        Ok(())
+    }
+
+    fn workspace_directory_quota(
+        &self,
+        principal: &P,
+        state_id: ObjectId,
+        state: &ObjectRecord,
+        reference: &ObjectReference,
+    ) -> Result<u64, PrincipalContentError> {
+        if state.references().iter().any(|reference| {
+            is_workspace_branch_label(reference.label().as_bytes())
+                || reference
+                    .label()
+                    .as_bytes()
+                    .starts_with(b"workspace-promoted/")
+        }) {
+            return Err(invalid(state_id, "mixed flat and indexed workspace state"));
+        }
+        super::workspace::directory::quota_for_store(self, principal, reference)
     }
 
     pub(super) fn kv_quota(

@@ -6,14 +6,13 @@ use crate::content::catalog::{delete, insert, list, root_from_record};
 use crate::content_dag::BuiltContent;
 
 use super::{
-    BranchState, CatalogRoot, CatalogValue, ContentHeader, ContentName, MAX_WORKSPACE_BRANCHES,
-    ModelError, ObjectId, ObjectRecord, ObjectReference, PrincipalContentError,
-    PrincipalProjectionEngine, PrincipalProjectionError, ReferenceKind, WorkspaceBranchDescriptor,
-    WorkspaceBranchError, WorkspaceBranchStore, WorkspaceUid, decode_branch_record,
-    decode_promotion_receipt, is_workspace_branch_label, is_workspace_receipt_label,
-    make_branch_record, make_branch_record_for_uid, parse_workspace_receipt_uid,
-    parse_workspace_uid, qualify_name, selected_catalog, selected_name, validate_catalog,
-    workspace_ref_label,
+    BranchState, CatalogRoot, CatalogValue, ContentHeader, ContentName, ModelError, ObjectId,
+    ObjectRecord, PrincipalContentError, PrincipalProjectionEngine, PrincipalProjectionError,
+    ReferenceKind, WorkspaceBranchDescriptor, WorkspaceBranchError, WorkspaceBranchStore,
+    WorkspaceUid, decode_branch_record, decode_promotion_receipt, is_workspace_branch_label,
+    is_workspace_receipt_label, make_branch_record, make_branch_record_for_uid,
+    parse_workspace_receipt_uid, parse_workspace_uid, qualify_name, selected_catalog,
+    selected_name, validate_catalog,
 };
 
 impl<P, E> WorkspaceBranchStore<P, E>
@@ -30,11 +29,10 @@ where
     ) -> Result<WorkspaceBranchDescriptor<P>, WorkspaceBranchError> {
         loop {
             let header = self.content.header(owner)?;
-            let branches = self.decode_branches(owner, &header)?;
             if self.completion_receipt(owner, &header, id)?.is_some() {
                 return Err(WorkspaceBranchError::AlreadyExists(id));
             }
-            if let Some(existing) = branches.iter().find(|branch| branch.id == id) {
+            if let Some(existing) = self.find_branch(owner, &header, id)? {
                 let requested = selected_catalog(
                     header.catalog,
                     target_prefix,
@@ -57,23 +55,18 @@ where
                 }
                 return Err(WorkspaceBranchError::AlreadyExists(id));
             }
-            if let Some(binding_uid) = binding_uid
-                && branches.iter().any(|branch| {
-                    branch.binding_uid == Some(binding_uid)
-                        && branch.target_prefix.as_ref() == target_prefix
-                })
+            if let Some(uid) = binding_uid
+                && let Some(prefix) = target_prefix
+                && self
+                    .binding_for_uid(owner, uid, prefix)?
+                    .is_some_and(|binding| {
+                        binding.lifecycle() == super::WorkspaceBindingLifecycle::Live
+                    })
             {
                 return Err(WorkspaceBranchError::BindingAlreadyExists {
-                    binding_uid,
-                    target_prefix: target_prefix.cloned().ok_or(
-                        WorkspaceBranchError::InvalidTargetPrefix {
-                            detail: "bound workspace prefix cannot be omitted",
-                        },
-                    )?,
+                    binding_uid: uid,
+                    target_prefix: prefix.clone(),
                 });
-            }
-            if branches.len() >= MAX_WORKSPACE_BRANCHES {
-                return Err(WorkspaceBranchError::BranchLimitExceeded);
             }
             let (base, mut base_records) = selected_catalog(
                 header.catalog,
@@ -91,16 +84,23 @@ where
             )?;
             let record_id = self.content.engine.identify_object(&record);
             let mut next = header.as_ref().clone();
-            next.preserved_state
-                .push(ObjectReference::owns(workspace_ref_label(id), record_id));
             let mut records = BTreeMap::new();
             records.append(&mut base_records);
             records.insert(record_id, record);
+            let directory_receipt =
+                self.edit_directory(owner, &mut next, &mut records, id, Some((record_id, false)))?;
+            let committed_header = next.clone();
             let transaction =
                 self.content
                     .encode_transaction(owner.clone(), next, None, records)?;
             match self.content.engine.commit_root(transaction) {
-                Ok(_) => {
+                Ok(outcome) => {
+                    self.finish_workspace_commit(
+                        owner,
+                        committed_header,
+                        outcome.root(),
+                        directory_receipt,
+                    );
                     let root = base.map(|root| root.object);
                     return Ok(WorkspaceBranchDescriptor::new(
                         owner.clone(),
@@ -123,9 +123,7 @@ where
         header: &ContentHeader,
         id: WorkspaceUid,
     ) -> Result<BranchState, WorkspaceBranchError> {
-        self.decode_branches(owner, header)?
-            .into_iter()
-            .find(|branch| branch.id == id)
+        self.find_branch(owner, header, id)?
             .ok_or(WorkspaceBranchError::NotFound(id))
     }
 
@@ -255,7 +253,7 @@ where
         Ok(())
     }
 
-    pub(super) fn completion_receipt(
+    pub(super) fn completion_receipt_legacy(
         &self,
         owner: &P,
         header: &ContentHeader,
@@ -286,7 +284,7 @@ where
         Ok(None)
     }
 
-    pub(super) fn decode_branches(
+    pub(super) fn decode_legacy_branches(
         &self,
         owner: &P,
         header: &ContentHeader,
@@ -441,15 +439,22 @@ where
             let record_id = self.content.engine.identify_object(&record);
             records.insert(record_id, record);
             let mut next = header.as_ref().clone();
-            next.preserved_state
-                .retain(|reference| parse_workspace_uid(reference.label().as_bytes()) != Some(id));
-            next.preserved_state
-                .push(ObjectReference::owns(workspace_ref_label(id), record_id));
+            let directory_receipt =
+                self.edit_directory(owner, &mut next, &mut records, id, Some((record_id, false)))?;
+            let committed_header = next.clone();
             let transaction =
                 self.content
                     .encode_transaction(owner.clone(), next, None, records)?;
             match self.content.engine.commit_root(transaction) {
-                Ok(_) => return Ok(()),
+                Ok(outcome) => {
+                    self.finish_workspace_commit(
+                        owner,
+                        committed_header,
+                        outcome.root(),
+                        directory_receipt,
+                    );
+                    return Ok(());
+                },
                 Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
                 Err(error) => return Err(error.into()),
             }

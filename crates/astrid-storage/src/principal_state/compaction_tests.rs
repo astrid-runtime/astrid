@@ -346,3 +346,67 @@ async fn deterministic_runtime_compaction_reclaims_and_delivers_receipt() {
     );
     reopened.engine.close().unwrap();
 }
+
+#[tokio::test]
+async fn retired_uid_read_lease_and_peer_content_survive_until_final_release() {
+    use crate::ContentName;
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let uid = PrincipalUid::from_bytes([0x31; 32]);
+    let peer = PrincipalUid::from_bytes([0x32; 32]);
+    let owner = StateOwner::Principal(uid);
+    let other = StateOwner::Principal(peer);
+    let held_name = ContentName::new("held").unwrap();
+    let shared_name = ContentName::new("shared").unwrap();
+    store
+        .content()
+        .put(&owner, &held_name, b"lease-only bytes")
+        .unwrap();
+    store
+        .content()
+        .put(&owner, &shared_name, b"peer-shared bytes")
+        .unwrap();
+    store
+        .content()
+        .put(&other, &shared_name, b"peer-shared bytes")
+        .unwrap();
+    let handle = store
+        .content()
+        .open_read(&owner, &held_name)
+        .unwrap()
+        .unwrap();
+    let held_file = handle.descriptor().file();
+    assert!(store.purge_principal_state(uid).unwrap());
+    let policy = evidence(b"retirement lease test policy");
+    store
+        .compact_with_deterministic_proof(ObjectId::new([0xD1; 32]), policy, Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(handle.read().unwrap(), b"lease-only bytes");
+    assert!(store.engine.root(&owner).unwrap().is_none());
+    assert_eq!(
+        store.content().read(&other, &shared_name).unwrap().unwrap(),
+        b"peer-shared bytes"
+    );
+    drop(handle);
+    let policy = evidence(b"retirement final release test policy");
+    store
+        .compact_with_deterministic_proof(ObjectId::new([0xD2; 32]), policy, Vec::new())
+        .await
+        .unwrap();
+    assert!(store.engine.object(held_file).unwrap().is_none());
+    store.engine.close().unwrap();
+    drop(store);
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    assert!(store.engine.root(&owner).unwrap().is_none());
+    assert!(store.engine.object(held_file).unwrap().is_none());
+    assert_eq!(
+        store.content().read(&other, &shared_name).unwrap().unwrap(),
+        b"peer-shared bytes"
+    );
+}

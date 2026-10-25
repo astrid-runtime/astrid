@@ -333,3 +333,56 @@ async fn failed_reclamation_keeps_alias_reserved_until_retry_succeeds() {
     .await;
     assert!(matches!(retried, AdminResponseBody::Success(_)));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_delete_retires_workspace_and_private_content_before_alias_reuse() {
+    use astrid_storage::{ContentName, FilesystemPath, StateOwner, WorkspaceBranchStore};
+    let (_dir, kernel) = fixture().await;
+    let principal = PrincipalId::new("workspace-retire").unwrap();
+    create(&kernel, &principal).await;
+    let uid = kernel.principal_directory.uid_for(&principal).unwrap();
+    let service = kernel.workspace_branches.as_ref().unwrap();
+    let binding = service.bind(&principal).await.unwrap();
+    let path = FilesystemPath::new("private-sentinel").unwrap();
+    service
+        .filesystem(binding)
+        .write(&path, b"private workspace")
+        .unwrap();
+    let store = kernel.principal_store.as_ref().unwrap();
+    let name = ContentName::new("private-content").unwrap();
+    store
+        .content()
+        .put(&StateOwner::Principal(uid), &name, b"private content")
+        .unwrap();
+    let response = super::test_support::dispatch_as_operator(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentDelete {
+            principal: principal.clone(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(response, AdminResponseBody::Success(_)),
+        "{response:?}"
+    );
+    assert!(
+        store
+            .content()
+            .read(&StateOwner::Principal(uid), &name)
+            .unwrap()
+            .is_none()
+    );
+    let branches = WorkspaceBranchStore::new(store.content());
+    assert!(
+        branches
+            .list_bindings_by_uid(&binding.owner, uid)
+            .unwrap()
+            .is_empty()
+    );
+    create(&kernel, &principal).await;
+    let replacement = service.bind(&principal).await.unwrap();
+    assert_ne!(replacement.uid, uid);
+    assert_ne!(replacement.branch, binding.branch);
+    assert!(service.filesystem(replacement).stat(&path).is_err());
+}

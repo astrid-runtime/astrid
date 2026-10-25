@@ -706,3 +706,8 @@ impl From<PrincipalProjectionError> for PrincipalContentError {
         Self::Projection(error)
     }
 }
+
+pub(crate) use store::{
+    WORKSPACE_DIRECTORY_LABEL, WORKSPACE_DIRECTORY_PROOF_KEY, WorkspaceDirectoryProof,
+    validate_workspace_directory,
+};
