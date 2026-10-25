@@ -803,22 +803,24 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn checkout_grows_lazily_then_bounds_at_max() {
         let cancel = CancellationToken::new();
-        let limits = super::super::limits::CapsuleRuntimeLimits::resolve(None, None, Some(4));
+        let limits = super::super::limits::CapsuleRuntimeLimits::resolve(None, None, Some(6));
         let min_idle = limits.instance_pool_min_idle();
         let pool = empty_pool(limits.instance_pool_size, min_idle, &cancel).await;
         assert_eq!(
             pool.available.lock().unwrap().len(),
-            1,
-            "an idle principal must not retain speculative Store copies"
+            4,
+            "the existing four-call warm burst must not require lazy instantiation"
         );
 
-        // The first lease is warm; the other three grow without reducing max.
+        // The existing four-call burst is warm; further calls grow lazily.
         let c1 = pool.checkout().await.expect("warm 1");
-        let c2 = pool.checkout().await.expect("lazy grow 2");
-        let c3 = pool.checkout().await.expect("lazy grow 3");
-        let c4 = pool.checkout().await.expect("lazy grow 4");
+        let c2 = pool.checkout().await.expect("warm 2");
+        let c3 = pool.checkout().await.expect("warm 3");
+        let c4 = pool.checkout().await.expect("warm 4");
+        let c5 = pool.checkout().await.expect("lazy grow 5");
+        let c6 = pool.checkout().await.expect("lazy grow 6");
 
-        // Five would exceed max=4: the permit wait must not resolve.
+        // Seven would exceed max=6: the permit wait must not resolve.
         let blocked = tokio::time::timeout(Duration::from_millis(100), pool.checkout()).await;
         assert!(
             blocked.is_err(),
@@ -826,21 +828,21 @@ mod tests {
         );
 
         // Returning one frees a permit and a warm instance; the wait resolves.
-        drop(c4);
-        let c5 = tokio::time::timeout(Duration::from_millis(1000), pool.checkout())
+        drop(c6);
+        let c7 = tokio::time::timeout(Duration::from_millis(1000), pool.checkout())
             .await
             .expect("a returned instance must unblock the waiter")
             .expect("checkout after return");
 
-        drop((c1, c2, c3, c5));
+        drop((c1, c2, c3, c4, c5, c7));
         let evicted = {
             let mut available = pool.available.lock().unwrap();
-            assert_eq!(available.len(), 4);
+            assert_eq!(available.len(), 6);
             drain_excess(&mut available, min_idle)
         };
-        assert_eq!(evicted.len(), 3);
+        assert_eq!(evicted.len(), 2);
         drop(evicted);
-        assert_eq!(pool.available.lock().unwrap().len(), 1);
+        assert_eq!(pool.available.lock().unwrap().len(), 4);
         assert!(
             pool.checkout().await.is_some(),
             "retained Store remains callable"
