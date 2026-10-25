@@ -5,14 +5,15 @@
 //! owning one canonical file DAG. Reuse, reachability and admission remain in
 //! the same root transaction; no side keys or separate publications are used.
 
-use super::super::node::{decode_value, value_record};
+use super::super::node::{decode_value, spilled_opaque_payload, value_record};
 use super::{
     INLINE_VALUE_MAX, KvProjectionEngine, ObjectClass, ObjectId, ObjectKind, ObjectRecord,
     ObjectReference, ReferenceKind, StorageError, StorageResult, TreeContext, ValueSlot,
     arithmetic_overflow, invalid, map_engine,
 };
 use crate::content_dag::{
-    ChunkingProfile, ContentSource, build_content, open_content, read_opened_content,
+    ChunkingProfile, ContentSource, OpenedContent, build_content, open_content,
+    read_opened_content, validate_opened_content,
 };
 use crate::storage_model::{ObjectFormatVersion, ObjectIdentity, ReferenceLabel};
 
@@ -76,12 +77,43 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         }
     }
 
+    pub(in crate::kv::tree) fn validate_value(&self, value: &ValueSlot) -> StorageResult<()> {
+        match value {
+            ValueSlot::Inline(_) => Ok(()),
+            ValueSlot::Spilled { object, length } => {
+                let record = self.record(*object)?;
+                if record.format_version() == CHUNKED_VALUE_VERSION {
+                    let opened = self.open_chunked_value(*object, *length, &record)?;
+                    validate_opened_content(self, opened).map_err(|error| {
+                        StorageError::Serialization(format!(
+                            "read chunked KV value {object:?}: {error}"
+                        ))
+                    })
+                } else {
+                    spilled_opaque_payload(*object, *length, &record).map(|_| ())
+                }
+            },
+        }
+    }
+
     fn read_chunked_value(
         &self,
         id: ObjectId,
         length: u64,
         record: &ObjectRecord,
     ) -> StorageResult<Vec<u8>> {
+        let opened = self.open_chunked_value(id, length, record)?;
+        read_opened_content(self, opened).map_err(|error| {
+            StorageError::Serialization(format!("read chunked KV value {id:?}: {error}"))
+        })
+    }
+
+    fn open_chunked_value(
+        &self,
+        id: ObjectId,
+        length: u64,
+        record: &ObjectRecord,
+    ) -> StorageResult<OpenedContent> {
         if record.kind() != ObjectKind::KvLeaf
             || record.class() != ObjectClass::Data
             || record.logical_bytes() != 0
@@ -104,9 +136,7 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         {
             return Err(invalid(id, "chunked KV descriptor disagrees with wrapper"));
         }
-        read_opened_content(self, opened).map_err(|error| {
-            StorageError::Serialization(format!("read chunked KV value {id:?}: {error}"))
-        })
+        Ok(opened)
     }
 }
 
