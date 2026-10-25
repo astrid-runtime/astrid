@@ -308,6 +308,11 @@ fn recovered_residency_counts_only_active_nodes_without_another_map_walk() {
             assert_eq!(map.nodes().len(), count);
             assert_eq!(super::super::node_view::node_count(map).unwrap(), count);
         }
+        assert_eq!(
+            test_take_count_walks(),
+            3,
+            "the counter must detect the three intentional comparison walks"
+        );
         let (empty, _) = super::MapResidency::recover([None; 3], &arena, arena.len()).unwrap();
         assert_eq!(empty.total(), 0);
     }
