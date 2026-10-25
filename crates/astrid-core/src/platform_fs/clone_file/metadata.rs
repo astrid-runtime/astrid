@@ -1,24 +1,18 @@
-//! Only data blocks from a disposable source may reach a private projection.
+//! Reject side data and compare OS provenance with a fresh private local file.
 #![allow(unsafe_code)]
 
 use std::fs::{File, OpenOptions, Permissions};
 use std::io;
-use std::os::fd::AsRawFd as _;
 use std::os::macos::fs::MetadataExt as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::Path;
+mod attributes;
 
 pub(super) fn eligible(source: &File) -> io::Result<bool> {
     if source.metadata()?.st_flags() != 0 {
         return Ok(false);
     }
-    // SAFETY: querying the required size writes no buffer and borrows an open
-    // descriptor. No source pathname is resolved again.
-    let count = unsafe { nix::libc::flistxattr(source.as_raw_fd(), std::ptr::null_mut(), 0, 0) };
-    if count < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(count == 0)
+    attributes::permitted_names(source)
 }
 
 pub(super) fn prepare(destination: &Path) -> io::Result<bool> {
@@ -35,7 +29,13 @@ pub(super) fn prepare(destination: &Path) -> io::Result<bool> {
             .open(destination)?;
         // Recheck the captured clone: source attributes can change after the
         // preflight. Its private inode is independent after the clone syscall.
-        eligible(&opened)
+        Ok(eligible(&opened)?
+            && attributes::matches_local(
+                &opened,
+                destination
+                    .parent()
+                    .ok_or_else(|| io::Error::other("clone destination has no parent"))?,
+            )?)
     })();
     if !matches!(result, Ok(true)) {
         discard(destination)?;

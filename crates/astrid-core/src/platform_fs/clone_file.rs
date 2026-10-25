@@ -12,8 +12,9 @@ mod metadata;
 /// The source descriptor pins the opened file rather than following its path
 /// again. Callers must own the destination parent and authenticate the cloned
 /// bytes before publication: cloning confers neither identity nor authority.
-/// On macOS, sources with file flags or extended attributes use the ordinary
-/// copy fallback; accepted clones receive private owner-readable/writable mode.
+/// On macOS, sources with flags or arbitrary attributes use ordinary copying.
+/// Captured OS provenance must match a fresh local-file baseline; accepted
+/// clones receive private owner-readable/writable mode.
 /// Returns `false` without creating a destination on unsupported filesystems
 /// or platforms. The caller can then write its already authenticated bytes.
 ///
