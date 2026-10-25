@@ -53,11 +53,10 @@ const POOL_MIN: usize = 8;
 /// per-principal memory ledger.
 const POOL_MAX: usize = 64;
 
-/// One eagerly validated Store makes the interceptor immediately callable.
-/// Additional concurrent invocations instantiate lazily up to the pool max;
-/// idle reclamation returns to this lifecycle minimum instead of retaining
-/// speculative copies for every principal. This is not a concurrency limit.
-const WARM_MIN_IDLE: usize = 1;
+/// Preserve four eagerly validated Stores for immediately available concurrent
+/// interceptor calls. Further concurrency grows lazily up to the pool maximum;
+/// idle reclamation retains this warm set so a later burst need not rebuild it.
+const WARM_MIN_IDLE: usize = 4;
 
 /// Maximum redirect hops the host follows by default, and the caller ceiling a
 /// per-request `max-redirects` clamps DOWN to. The single source of truth for
@@ -418,9 +417,11 @@ mod tests {
 
     #[test]
     fn min_idle_is_clamped_to_the_max() {
-        // Large pool keeps WARM_MIN_IDLE warm.
+        // Preserve the existing four immediately available interceptor Stores.
         let big = CapsuleRuntimeLimits::resolve(None, None, Some(32));
-        assert_eq!(big.instance_pool_min_idle(), WARM_MIN_IDLE);
+        assert_eq!(big.instance_pool_min_idle(), 4);
+        let two = CapsuleRuntimeLimits::resolve(None, None, Some(2));
+        assert_eq!(two.instance_pool_min_idle(), 2);
         // A size-1 (carve-out) pool warm-starts its single instance.
         let one = CapsuleRuntimeLimits::resolve(None, None, Some(1));
         assert_eq!(one.instance_pool_min_idle(), 1);
