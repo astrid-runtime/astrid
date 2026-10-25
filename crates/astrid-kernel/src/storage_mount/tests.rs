@@ -218,7 +218,12 @@ async fn oversized_set_length_and_random_write_preflight_before_full_read() {
     let store = kernel.principal_store.clone().unwrap();
     let filesystem = AstridFilesystem::new(
         store.content(),
-        StateOwner::Principal(astrid_core::PrincipalUid::from_bytes([0xA4; 32])),
+        StateOwner::Principal(
+            kernel
+                .principal_directory
+                .uid_for(&astrid_core::PrincipalId::default())
+                .unwrap(),
+        ),
     );
     let path = FilesystemPath::new("probe.bin").unwrap();
     filesystem.write(&path, b"seed").unwrap();
@@ -376,7 +381,10 @@ async fn principal_home_subtree_cannot_reach_capsule_catalog() {
     let temporary = tempfile::tempdir().unwrap();
     let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
     let kernel = crate::test_kernel_with_home(home).await;
-    let uid = astrid_core::PrincipalUid::from_bytes([0xD0; 32]);
+    let uid = kernel
+        .principal_directory
+        .uid_for(&astrid_core::PrincipalId::default())
+        .unwrap();
     let store = kernel.principal_store.clone().unwrap();
     let root = AstridFilesystem::new(store.content(), StateOwner::Principal(uid));
     root.create_dir(&FilesystemPath::new("home").unwrap())

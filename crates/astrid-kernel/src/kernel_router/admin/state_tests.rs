@@ -605,6 +605,15 @@ async fn agent_delete_retry_clears_reservation_after_identity_was_removed() {
     )
     .await;
     assert_success(&created);
+    kernel
+        .kv
+        .set(
+            "recoverable-delete:capsule:session",
+            "history",
+            b"private".to_vec(),
+        )
+        .await
+        .unwrap();
 
     let user = kernel
         .identity_store
@@ -643,6 +652,15 @@ async fn agent_delete_retry_clears_reservation_after_identity_was_removed() {
     )
     .await;
     assert_success(&retried);
+    assert!(
+        !kernel
+            .principal_store
+            .as_ref()
+            .unwrap()
+            .purge_principal_kv(identity.uid)
+            .unwrap(),
+        "retry after identity removal must commit the retired UID's nonempty KV purge"
+    );
     assert!(matches!(
         kernel
             .ownership_store

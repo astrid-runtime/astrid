@@ -187,3 +187,73 @@ async fn immutable_owner_purge_cannot_follow_a_reused_alias() {
         "purging the retired UID must not follow the reused alias"
     );
 }
+
+#[tokio::test]
+async fn retired_uid_purge_survives_alias_removal_and_reuse_with_strict_live_quota() {
+    use crate::principal_state::open_runtime_principal_store_with_directory;
+    use crate::{ContentName, PrincipalDirectory};
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let principals = PrincipalDirectory::default();
+    let quota_directory = principals.clone();
+    let quota: Arc<dyn KvQuotaResolver<StateOwner>> =
+        Arc::new(move |owner: &StateOwner| match owner {
+            StateOwner::Principal(uid) => quota_directory.alias_for(*uid).map(|_| Some(u64::MAX)),
+            StateOwner::System | StateOwner::Fleet(_) => Ok(None),
+        });
+    let store = open_runtime_principal_store_with_directory(&home, quota, principals.clone())
+        .await
+        .unwrap();
+    let retired = create_principal(&store, "alice");
+    create_principal(&store, "bob");
+    store
+        .kv()
+        .set("alice:capsule:notes", "key", b"old private state".to_vec())
+        .await
+        .unwrap();
+    store
+        .kv()
+        .set("bob:capsule:notes", "key", b"peer state".to_vec())
+        .await
+        .unwrap();
+    let name = ContentName::new("retained-content").unwrap();
+    store
+        .content()
+        .put(&StateOwner::Principal(retired), &name, b"keep non-KV state")
+        .unwrap();
+    let alias = PrincipalId::new("alice").unwrap();
+    principals.unregister(&alias, retired);
+    assert!(principals.alias_for(retired).is_err());
+    let replacement = PrincipalUid::from_bytes([0x99; 32]);
+    principals.register(alias, replacement).unwrap();
+    store
+        .kv()
+        .set("alice:capsule:notes", "key", b"replacement state".to_vec())
+        .await
+        .unwrap();
+    assert!(store.purge_principal_kv(retired).unwrap());
+    assert!(!store.purge_principal_kv(retired).unwrap());
+    assert_eq!(
+        store.kv().get("alice:capsule:notes", "key").await.unwrap(),
+        Some(b"replacement state".to_vec())
+    );
+    assert_eq!(
+        store.kv().get("bob:capsule:notes", "key").await.unwrap(),
+        Some(b"peer state".to_vec())
+    );
+    assert_eq!(
+        store
+            .content()
+            .read(&StateOwner::Principal(retired), &name)
+            .unwrap(),
+        Some(b"keep non-KV state".to_vec())
+    );
+    let dead_namespace = format!("principal-uid:{retired}:control:env:notes");
+    assert!(
+        store
+            .kv()
+            .set(&dead_namespace, "key", b"forbidden".to_vec())
+            .await
+            .is_err()
+    );
+}

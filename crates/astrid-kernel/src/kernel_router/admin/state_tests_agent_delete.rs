@@ -75,6 +75,7 @@ async fn agent_delete_reclaims_home_key_and_secrets_and_reports_them() {
     );
     let principal = PrincipalId::new("ghost").unwrap();
     create(&kernel, &principal).await;
+    let uid = kernel.principal_directory.uid_for(&principal).unwrap();
     let (home, key, secrets) = seed_footprint(&kernel, &principal);
     kernel
         .kv
@@ -109,6 +110,16 @@ async fn agent_delete_reclaims_home_key_and_secrets_and_reports_them() {
     );
     assert_eq!(value["unloaded_capsules"], serde_json::json!([]));
     assert_eq!(value["cleanup_errors"], serde_json::json!([]));
+    assert!(kernel.principal_directory.alias_for(uid).is_err());
+    assert!(
+        !kernel
+            .principal_store
+            .as_ref()
+            .unwrap()
+            .purge_principal_kv(uid)
+            .unwrap(),
+        "the real deletion path must have committed the retired UID's KV purge"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
