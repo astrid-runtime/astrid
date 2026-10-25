@@ -23,6 +23,14 @@ rescue StandardError => error
 end
 fail("workflow root must be a mapping") unless workflow.is_a?(Hash)
 
+audit_steps = workflow.fetch("jobs").fetch("audit").fetch("steps")
+unless audit_steps.any? { |step| step["run"] == "cargo audit --file Cargo.lock" }
+  fail("security audit must inspect Cargo.lock directly")
+end
+if audit_steps.any? { |step| step.fetch("uses", "").start_with?("rustsec/audit-check@") }
+  fail("security audit must not depend on check-publication permissions")
+end
+
 concurrency = workflow.fetch("concurrency") do
   fail("missing top-level concurrency block")
 end
