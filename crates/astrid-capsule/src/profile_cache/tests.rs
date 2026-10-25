@@ -615,6 +615,28 @@ fn shared_load_token_lives_until_last_loader_and_cannot_publish_after_alias_reus
 }
 
 #[test]
+fn finishing_loaders_release_tokens_before_struct_fields_are_dropped() {
+    let (_directory, cache) = fixture();
+    let principal = principal("finishing-loaders");
+    let mut first = cache.begin_load(&principal);
+    let mut second = cache.begin_load(&principal);
+
+    // Keep both structs alive after their destructor bodies finish. This
+    // forces the window before Rust drops their fields, without a scheduler.
+    first.finish();
+    assert_eq!(cache.state.read().unwrap().loads.len(), 1);
+    second.finish();
+    assert!(cache.state.read().unwrap().loads.is_empty());
+
+    let replacement = cache.begin_load(&principal);
+    drop(first);
+    drop(second);
+    assert!(replacement.is_current(&cache.state.read().unwrap()));
+    drop(replacement);
+    assert!(cache.state.read().unwrap().loads.is_empty());
+}
+
+#[test]
 fn unwinding_last_profile_loader_removes_its_identity() {
     let (_directory, cache) = fixture();
     let principal = principal("panicking-loader");
