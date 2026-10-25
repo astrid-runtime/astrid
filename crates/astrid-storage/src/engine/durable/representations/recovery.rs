@@ -33,7 +33,12 @@ pub(super) struct MetadataIndex {
     pub(super) nodes: RecoveredNodes,
 }
 
-impl MetadataIndex {
+struct MetadataAdmission {
+    values: BTreeMap<(MetadataKind, [u8; 32]), Vec<u8>>,
+    nodes: nodes::NodeAdmission,
+}
+
+impl MetadataAdmission {
     fn new(
         file: &super::DurableFile,
         limits: RecoveryLimits,
@@ -41,7 +46,7 @@ impl MetadataIndex {
     ) -> Result<Self, DurableError> {
         Ok(Self {
             values: BTreeMap::new(),
-            nodes: RecoveredNodes::new(file, limits, budget)?,
+            nodes: nodes::NodeAdmission::new(file, limits, budget)?,
         })
     }
 
@@ -64,6 +69,15 @@ impl MetadataIndex {
         Ok(())
     }
 
+    fn finish(self) -> Result<MetadataIndex, DurableError> {
+        Ok(MetadataIndex {
+            values: self.values,
+            nodes: self.nodes.finish()?,
+        })
+    }
+}
+
+impl MetadataIndex {
     pub(super) fn into_nodes(self) -> RecoveredNodes {
         self.nodes
     }
@@ -116,7 +130,7 @@ pub(super) fn recover_metadata(
     limits: RecoveryLimits,
     budget: super::LocationIndexMemoryBudget,
 ) -> Result<MetadataIndex, DurableError> {
-    let mut index = MetadataIndex::new(file, limits, budget)?;
+    let mut index = MetadataAdmission::new(file, limits, budget)?;
     scan_frames(
         file,
         METADATA_FILE,
@@ -124,7 +138,7 @@ pub(super) fn recover_metadata(
         limits,
         |offset, payload| index.insert(offset, payload),
     )?;
-    Ok(index)
+    index.finish()
 }
 
 pub(super) fn recover_journal<F: DurableIo>(

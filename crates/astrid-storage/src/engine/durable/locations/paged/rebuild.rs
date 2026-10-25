@@ -7,13 +7,24 @@ use crate::engine::durable::locations::ClosureProof;
 pub(in crate::engine::durable) struct RebuildLocations {
     locations: PagedLocations,
     failed: bool,
+    check: Box<super::CheckDuplicate<'static>>,
 }
 
 impl RebuildLocations {
     pub(in crate::engine::durable) fn new(limit: NonZeroUsize) -> Self {
+        Self::checked(limit, |_, _, _| Ok(()))
+    }
+
+    /// Validate every duplicate before any merge or resident replacement drops
+    /// its older location. The result is private until finish succeeds.
+    pub(in crate::engine::durable) fn checked(
+        limit: NonZeroUsize,
+        check: impl FnMut(ObjectId, ArenaLocation, ArenaLocation) -> Result<(), DurableError> + 'static,
+    ) -> Self {
         Self {
             locations: PagedLocations::new(limit),
             failed: false,
+            check: Box::new(check),
         }
     }
 
@@ -26,9 +37,12 @@ impl RebuildLocations {
         self.require_healthy()?;
         // During construction every replacement supplies its entire row. The
         // ordered merge selects the newest duplicate; no prior lookup is needed.
-        let result = self
-            .locations
-            .insert_row(id, LocatorValue { location, proof }, None);
+        let result = self.locations.insert_row_checked(
+            id,
+            LocatorValue { location, proof },
+            None,
+            &mut self.check,
+        );
         self.failed |= result.is_err();
         result
     }
@@ -51,7 +65,7 @@ impl RebuildLocations {
         }
         let mut builder = Builder::new()?;
         let mut complete = 0_usize;
-        for entry in self.locations.rows() {
+        for entry in self.locations.rows_checked(Some(&mut self.check)) {
             let (id, row) = entry?;
             complete = complete
                 .checked_add(usize::from(row.proof == ClosureProof::Complete))
