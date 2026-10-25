@@ -116,13 +116,14 @@ impl PagedLocations {
         id: ObjectId,
         location: ArenaLocation,
     ) -> Result<(), DurableError> {
-        let prior = self.row(id)?;
+        let prior = self.row_before_insert(id)?;
         self.insert_row(
             id,
             LocatorValue {
                 location,
                 proof: prior.map_or(ClosureProof::Unknown, |prior| prior.proof),
             },
+            prior,
         )
     }
 
@@ -130,7 +131,8 @@ impl PagedLocations {
     pub(in crate::engine::durable) fn clear_proofs(&mut self) -> Result<(), DurableError> {
         let entries = self.locations().collect::<Result<Vec<_>, _>>()?;
         for (id, location) in entries {
-            self.insert_row(id, LocatorValue::unknown(location))?;
+            let previous = self.row_before_insert(id)?;
+            self.insert_row(id, LocatorValue::unknown(location), previous)?;
         }
         Ok(())
     }
@@ -148,13 +150,12 @@ impl PagedLocations {
         &mut self,
         id: ObjectId,
     ) -> Result<(), DurableError> {
-        let mut row = self
-            .row(id)?
-            .ok_or(DurableError::InvalidRepresentationState(
-                "closure proof has no object locator",
-            ))?;
+        let previous = self.row_before_insert(id)?;
+        let mut row = previous.ok_or(DurableError::InvalidRepresentationState(
+            "closure proof has no object locator",
+        ))?;
         row.proof = ClosureProof::Complete;
-        let result = self.insert_row(id, row);
+        let result = self.insert_row(id, row, previous);
         if result.is_err() {
             self.failed.store(true, Ordering::Release);
         }
@@ -166,7 +167,7 @@ impl PagedLocations {
             .inspect_err(|_| self.failed.store(true, Ordering::Release))
     }
 
-    fn insert_row(&mut self, id: ObjectId, location: LocatorValue) -> Result<(), DurableError> {
+    fn row_before_insert(&mut self, id: ObjectId) -> Result<Option<LocatorValue>, DurableError> {
         #[cfg(test)]
         if let Some(remaining) = self.damage_after_inserts.as_mut() {
             if *remaining == 0 {
@@ -176,7 +177,17 @@ impl PagedLocations {
                 *remaining = remaining.strict_sub(1);
             }
         }
-        let previous = self.row(id)?;
+        self.row(id)
+    }
+
+    fn insert_row(
+        &mut self,
+        id: ObjectId,
+        location: LocatorValue,
+        previous: Option<LocatorValue>,
+    ) -> Result<(), DurableError> {
+        // The exclusive borrow keeps the authenticated prior row valid through
+        // the mutation; proof preservation and count admission share that read.
         if previous == Some(location) {
             return Ok(());
         }

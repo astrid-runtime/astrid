@@ -29,7 +29,7 @@ mod activation;
 mod authority;
 mod checkpoint;
 mod format;
-mod index_validation;
+mod recovered_direct;
 mod recovery;
 mod residency;
 mod reverse_index;
@@ -117,6 +117,7 @@ pub(super) struct RepresentationStore {
     residency: residency::MapResidency,
     direct_profile: RepresentationProfileId,
     reverse: ReverseIndex,
+    recovered_direct: Option<(RepresentationStateId, recovered_direct::RecoveredDirect)>,
 }
 
 #[derive(Clone, Copy)]
@@ -637,7 +638,7 @@ impl RepresentationStore {
     ) -> Result<bool, DurableError> {
         let expected = objects
             .iter()
-            .map(|object| (object.object, object.location))
+            .map(|object| (object.object, &object.location))
             .collect::<BTreeMap<_, _>>();
         if expected.len() != objects.len()
             || self.representations.entry_count()
@@ -647,11 +648,16 @@ impl RepresentationStore {
         {
             return Ok(false);
         }
-        Ok(self
-            .direct_arena_locations()?
-            .into_iter()
-            .collect::<BTreeMap<_, _>>()
-            == expected)
+        let mut count = 0_usize;
+        let mut matched = true;
+        for object in self.reverse.keys() {
+            let object = object?;
+            let placement = self.direct_placement(object)?;
+            let last = recovered_direct::arena_locations(&placement).last();
+            matched &= expected.get(&object).copied() == last.as_ref();
+            count = count.checked_add(1).ok_or(DurableError::EncodingOverflow)?;
+        }
+        Ok(matched && count == expected.len())
     }
 
     fn prepare_direct_entry(
@@ -757,6 +763,7 @@ impl RepresentationStore {
         append_frame(&mut self.journal, JOURNAL_MAGIC, &cas)?;
         self.flush_journal()?;
         self.active = update.state_id;
+        self.recovered_direct = None;
         self.state = update.state;
         self.catalogue = update.catalogue;
         self.placements = update.placements;
@@ -797,78 +804,78 @@ impl RepresentationStore {
     /// uncommitted tail. Recovery consults this value before it may truncate
     /// the logical arena.
     pub(super) fn generation_zero_protected_len(&self) -> Result<u64, DurableError> {
-        self.direct_arena_locations()?
-            .into_iter()
-            .try_fold(0_u64, |protected, (_, location)| {
-                let end = location
-                    .offset
-                    .checked_add(FRAME_HEADER_LEN)
-                    .and_then(|value| value.checked_add(location.payload_len))
-                    .ok_or(DurableError::EncodingOverflow)?;
-                Ok(protected.max(end))
-            })
+        let (active, direct) =
+            self.recovered_direct
+                .as_ref()
+                .ok_or(DurableError::InvalidRepresentationState(
+                    "mount replica proof has been consumed",
+                ))?;
+        if *active != self.active {
+            return Err(DurableError::InvalidRepresentationState(
+                "mount replica proof names a different physical state",
+            ));
+        }
+        Ok(direct.protected_len())
     }
 
-    /// Validate that generation-zero placements name the recovered arena
-    /// index exactly.
-    ///
-    /// This is mount-time topology validation, not an implicit full-store
-    /// scrub. Authoritative object reads verify the named frame checksum,
-    /// canonical encoding, and logical identity before returning bytes. A
-    /// scheduled refinery pass owns proactive full-corpus re-attestation.
+    /// Consume mount-time replica evidence before exposing the recovered engine.
+    /// Object reads still authenticate canonical frames and logical identities.
     pub(super) fn validate_generation_zero_index(
-        &self,
+        &mut self,
         index: &BTreeMap<ObjectId, ArenaLocation>,
     ) -> Result<(), DurableError> {
-        let direct = self.direct_arena_locations()?;
-        index_validation::validate(&direct, index)
+        let (active, direct) =
+            self.recovered_direct
+                .take()
+                .ok_or(DurableError::InvalidRepresentationState(
+                    "mount replica proof has been consumed",
+                ))?;
+        if active != self.active {
+            return Err(DurableError::InvalidRepresentationState(
+                "mount replica proof names a different physical state",
+            ));
+        }
+        direct.validate(index)
     }
 
+    fn direct_placement(&self, object: ObjectId) -> Result<PlacementEntry, DurableError> {
+        let record =
+            self.direct_record(object)?
+                .ok_or(DurableError::InvalidRepresentationState(
+                    "reverse index has no direct representation",
+                ))?;
+        let Recipe::DirectCanonical { blob } = record.recipe() else {
+            return Err(DurableError::InvalidRepresentationState(
+                "direct profile uses a non-direct recipe",
+            ));
+        };
+        let placement = self
+            .placement_entries
+            .try_get(&Blake3PhysicalIdentity, PhysicalMapKey::from(*blob))?
+            .ok_or(DurableError::InvalidRepresentationState(
+                "direct representation placement disappeared",
+            ))?;
+        let placement = PlacementEntry::decode(&placement)?;
+        if recovered_direct::arena_locations(&placement)
+            .next()
+            .is_none()
+        {
+            return Err(DurableError::InvalidRepresentationState(
+                "direct representation has no generation-zero arena placement",
+            ));
+        }
+        Ok(placement)
+    }
+
+    #[cfg(test)]
     fn direct_arena_locations(&self) -> Result<Vec<(ObjectId, ArenaLocation)>, DurableError> {
         let mut direct = Vec::new();
         for object in self.reverse.keys() {
             let object = object?;
-            let record =
-                self.direct_record(object)?
-                    .ok_or(DurableError::InvalidRepresentationState(
-                        "reverse index has no direct representation",
-                    ))?;
-            let Recipe::DirectCanonical { blob } = record.recipe() else {
-                return Err(DurableError::InvalidRepresentationState(
-                    "direct profile uses a non-direct recipe",
-                ));
-            };
-            let placement = self
-                .placement_entries
-                .try_get(&Blake3PhysicalIdentity, PhysicalMapKey::from(*blob))?
-                .ok_or(DurableError::InvalidRepresentationState(
-                    "direct representation placement disappeared",
-                ))?;
-            let placement = PlacementEntry::decode(&placement)?;
-            let before = direct.len();
-            for replica in placement.replicas() {
-                if let ReplicaLocator::ArenaFrame {
-                    arena_generation: 0,
-                    offset,
-                    payload_length,
-                    frame_checksum,
-                } = replica.locator()
-                {
-                    direct.push((
-                        object,
-                        ArenaLocation {
-                            offset,
-                            payload_len: payload_length,
-                            checksum: frame_checksum,
-                        },
-                    ));
-                }
-            }
-            if direct.len() == before {
-                return Err(DurableError::InvalidRepresentationState(
-                    "direct representation has no generation-zero arena placement",
-                ));
-            }
+            let placement = self.direct_placement(object)?;
+            direct.extend(
+                recovered_direct::arena_locations(&placement).map(|location| (object, location)),
+            );
         }
         Ok(direct)
     }
@@ -917,7 +924,7 @@ impl RepresentationStore {
             ));
         }
         let direct_profile = validate_profiles(&profiles)?;
-        let (reverse, extent_count) = validate_representations(
+        let (reverse, extent_count, recovered_direct) = validate_representations(
             &profiles,
             &representations,
             &placement_entries,
@@ -951,6 +958,7 @@ impl RepresentationStore {
             persisted_map_nodes,
             direct_profile,
             reverse,
+            recovered_direct: Some((active, recovered_direct)),
         })
     }
 }
