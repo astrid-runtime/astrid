@@ -162,8 +162,8 @@ pub(super) fn node_count<M: MapView>(map: &M) -> Result<usize, DurableError> {
     Ok(entries.visited)
 }
 
-/// Emit children before parents using only a bounded path stack. Runtime maps
-/// were fully validated before admission; every fetched node is authenticated.
+/// Emit each node once, parent before children, using only a bounded path stack.
+/// Runtime maps were fully validated before admission; every fetched node is authenticated.
 /// Checkpoint verification still validates the complete replacement generation
 /// before CURRENT is published.
 pub(super) fn visit_nodes<M: MapView>(
@@ -172,15 +172,11 @@ pub(super) fn visit_nodes<M: MapView>(
 ) -> Result<(), DurableError> {
     let mut pending = map
         .view_root()
-        .map(|id| (id, 0_u32, false))
+        .map(|id| (id, 0_u32))
         .into_iter()
         .collect::<Vec<_>>();
-    while let Some((id, minimum_depth, expanded)) = pending.pop() {
+    while let Some((id, minimum_depth)) = pending.pop() {
         let node = map.view_node(id)?;
-        if expanded {
-            visit(node)?;
-            continue;
-        }
         let (depth, width, children) = match &node {
             PhysicalMapNode::Branch {
                 prefix_bits,
@@ -207,12 +203,15 @@ pub(super) fn visit_nodes<M: MapView>(
                 "physical branch depth exceeded its path",
             ));
         }
-        pending.push((id, minimum_depth, true));
+        visit(node)?;
         pending.extend(
             children
                 .into_iter()
-                .map(|child| (child, depth.strict_add(width), false)),
+                .map(|child| (child, depth.strict_add(width))),
         );
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
