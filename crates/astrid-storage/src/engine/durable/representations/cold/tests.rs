@@ -223,3 +223,5 @@ fn canonical_closure_evidence_is_paged_authenticated_and_process_local() {
     assert!(!recovered.complete(&id).unwrap());
     assert_eq!(recovered.node(id).unwrap().unwrap().as_ref(), &node);
 }
+
+mod recovery;

@@ -1,6 +1,6 @@
 use super::*;
 
-fn entry(index: u64) -> (ObjectId, ArenaLocation) {
+pub(super) fn entry(index: u64) -> (ObjectId, ArenaLocation) {
     let mut bytes = [0; 32];
     bytes[..8].copy_from_slice(&index.to_be_bytes());
     (

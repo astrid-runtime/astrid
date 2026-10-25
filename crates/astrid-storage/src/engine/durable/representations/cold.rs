@@ -10,7 +10,9 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use super::super::format::{frame_checksum, read_frame_at};
-use super::super::locations::{LocationIndexMemoryBudget, LocationLookup, PagedLocations};
+use super::super::locations::{
+    ClosureProof, LocationIndexMemoryBudget, LocationLookup, PagedLocations, RebuildLocations,
+};
 use super::super::{
     ArenaLocation, DurableError, File, RecoveryLimits, append_frame, io_error, scan_frames,
 };
@@ -44,15 +46,31 @@ struct StagedNodes {
 }
 
 impl ColdNodes {
+    #[cfg(test)]
     pub(super) fn from_metadata(
         file: &File,
         limits: RecoveryLimits,
         budget: LocationIndexMemoryBudget,
     ) -> Result<Self, DurableError> {
+        Self::from_validated_maps(file, limits, budget, &[])
+    }
+
+    /// Reuse only complete active closures accepted by canonical map recovery.
+    /// The final unique proof count also requires every such node on media.
+    pub(super) fn from_validated_maps(
+        file: &File,
+        limits: RecoveryLimits,
+        budget: LocationIndexMemoryBudget,
+        maps: &[&CanonicalPhysicalMap],
+    ) -> Result<Self, DurableError> {
+        let expected_complete = maps.iter().try_fold(0_usize, |sum, map| {
+            sum.checked_add(map.nodes().len())
+                .ok_or(DurableError::EncodingOverflow)
+        })?;
         let mut reader = file
             .try_clone()
             .map_err(|error| io_error("clone physical node arena", error))?;
-        let mut locations = PagedLocations::new(budget.durable_entries());
+        let mut rebuild = RebuildLocations::new(budget.durable_entries());
         scan_frames(
             &mut reader,
             METADATA_FILE,
@@ -64,18 +82,31 @@ impl ColdNodes {
                     frame.verify(&Blake3PhysicalIdentity)?;
                     let payload_len =
                         u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
-                    locations.insert(
+                    let id = PhysicalMapNodeId::new(frame.identity);
+                    let proof = if maps.iter().any(|map| map.nodes().contains_key(&id)) {
+                        ClosureProof::Complete
+                    } else {
+                        ClosureProof::Unknown
+                    };
+                    rebuild.push(
                         ObjectId::new(frame.identity),
                         ArenaLocation {
                             offset,
                             payload_len,
                             checksum: frame_checksum(METADATA_MAGIC, payload_len, payload),
                         },
+                        proof,
                     )?;
                 }
                 Ok(())
             },
         )?;
+        let (locations, complete) = rebuild.finish()?;
+        if complete != expected_complete {
+            return Err(DurableError::InvalidRepresentationState(
+                "validated physical closure is missing from metadata",
+            ));
+        }
         Ok(Self(Arc::new(Mutex::new(NodeArena {
             file: reader,
             locations,

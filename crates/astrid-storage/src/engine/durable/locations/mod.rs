@@ -78,7 +78,7 @@ mod run;
 
 mod paged;
 
-pub(super) use paged::PagedLocations;
+pub(super) use paged::{PagedLocations, RebuildLocations};
 
 /// Shared resident staging target for complete durable locators.
 ///
