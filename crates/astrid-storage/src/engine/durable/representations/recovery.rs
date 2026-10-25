@@ -68,6 +68,35 @@ impl MetadataIndex {
         self.nodes
     }
 
+    fn retain_journal_authority(
+        &mut self,
+        entries: &[(u64, JournalEntry)],
+    ) -> Result<(), DurableError> {
+        // Admission already authenticated every frame and compared duplicate
+        // bodies. Only now may unrelated scalar copies be released. Keep the
+        // complete checkpoint/CAS chain, including previous authority roots
+        // needed by generation validation, not merely the final active state.
+        let mut required = BTreeSet::new();
+        for (_, entry) in entries {
+            let state = match entry {
+                JournalEntry::Checkpoint { active, .. } => *active,
+                JournalEntry::StateCas { replacement, .. } => Some(*replacement),
+            };
+            let Some(id) = state else { continue };
+            let key = (MetadataKind::State, *id.as_bytes());
+            required.insert(key);
+            if let Some(bytes) = self.values.get(&key) {
+                let state = RepresentationState::decode(bytes)?;
+                required.insert((MetadataKind::Catalogue, *state.catalogue().as_bytes()));
+                required.insert((MetadataKind::Placement, *state.placements().as_bytes()));
+            }
+        }
+        // Missing final metadata remains absent and follows ordinary journal
+        // repair rules; pruning must not turn that absence into another error.
+        self.values.retain(|key, _| required.contains(key));
+        Ok(())
+    }
+
     pub(super) fn value(
         &self,
         kind: MetadataKind,
@@ -101,9 +130,10 @@ pub(super) fn recover_metadata(
 pub(super) fn recover_journal<F: DurableIo>(
     file: &mut F,
     current: CurrentPointer,
-    metadata: &MetadataIndex,
+    metadata: &mut MetadataIndex,
     limits: RecoveryLimits,
 ) -> Result<(RepresentationStateId, RepresentationState), DurableError> {
+    metadata.nodes.begin_journal()?;
     let mut entries = Vec::new();
     scan_frames(
         file,
@@ -131,8 +161,9 @@ pub(super) fn recover_journal<F: DurableIo>(
     let first = entries.first().map(|(_, entry)| *entry).ok_or(
         DurableError::InvalidRepresentationState("representation journal is empty"),
     )?;
-    let (mut active, mut generation) = recover_checkpoint(first, current, metadata)?;
     validate_tail_budget(entries.len(), bytes.len(), checkpoint_end, current)?;
+    metadata.retain_journal_authority(&entries)?;
+    let (mut active, mut generation) = recover_checkpoint(first, current, metadata)?;
     let mut previous_state = active
         .map(|id| {
             RepresentationState::decode(metadata.value(MetadataKind::State, id.as_bytes())?)
@@ -141,7 +172,6 @@ pub(super) fn recover_journal<F: DurableIo>(
         .transpose()?;
     // Metadata is immutable for this replay. Only successfully checked closures
     // may be reused across historical states; CAS and generation checks still run.
-    let mut complete_maps = BTreeSet::new();
     let entry_count = entries.len();
     for (position, (offset, entry)) in entries.into_iter().enumerate().skip(1) {
         let JournalEntry::StateCas {
@@ -159,7 +189,7 @@ pub(super) fn recover_journal<F: DurableIo>(
                 "representation journal CAS conflict",
             ));
         }
-        if !state_metadata_closure_complete(replacement, metadata, &mut complete_maps)? {
+        if !state_metadata_closure_complete(replacement, metadata)? {
             if position.checked_add(1) != Some(entry_count) {
                 return Err(DurableError::InvalidRepresentationState(
                     "interior representation journal state has an incomplete metadata closure",
@@ -195,7 +225,7 @@ pub(super) fn recover_journal<F: DurableIo>(
 fn recover_checkpoint(
     first: JournalEntry,
     current: CurrentPointer,
-    metadata: &MetadataIndex,
+    metadata: &mut MetadataIndex,
 ) -> Result<(Option<RepresentationStateId>, u64), DurableError> {
     match first {
         JournalEntry::Checkpoint {
@@ -219,7 +249,7 @@ fn recover_checkpoint(
         } if journal_generation == current.journal_generation
             && journal_generation > FIRST_JOURNAL_GENERATION =>
         {
-            if !state_metadata_closure_complete(active, metadata, &mut BTreeSet::new())? {
+            if !state_metadata_closure_complete(active, metadata)? {
                 return Err(DurableError::InvalidRepresentationState(
                     "representation checkpoint has an incomplete metadata closure",
                 ));
@@ -242,8 +272,7 @@ fn recover_checkpoint(
 
 fn state_metadata_closure_complete(
     state_id: RepresentationStateId,
-    metadata: &MetadataIndex,
-    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    metadata: &mut MetadataIndex,
 ) -> Result<bool, DurableError> {
     let Some(state_bytes) = metadata
         .values
@@ -271,17 +300,18 @@ fn state_metadata_closure_complete(
         catalogue.representations_root(),
         placements.entries_root(),
     ] {
-        if !map_closure_complete(root, &metadata.nodes, complete)? {
+        if !map_closure_complete(root, &mut metadata.nodes)? {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
-fn map_closure_complete<N: crate::storage_model::PhysicalMapNodes>(
+fn map_closure_complete<
+    N: crate::storage_model::PhysicalMapNodes + super::activation::CompleteNodes,
+>(
     root: Option<crate::storage_model::PhysicalMapNodeId>,
-    nodes: &N,
-    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    nodes: &mut N,
 ) -> Result<bool, DurableError>
 where
     N::Error: Into<DurableError>,
@@ -292,7 +322,7 @@ where
     let mut pending = vec![root];
     let mut visited = BTreeSet::new();
     while let Some(id) = pending.pop() {
-        if complete.contains(&id) || !visited.insert(id) {
+        if nodes.complete(&id)? || !visited.insert(id) {
             continue;
         }
         let Some(node) = nodes.node(id).map_err(Into::into)? else {
@@ -307,7 +337,9 @@ where
         }
     }
     // Never remember a partial traversal that encountered a missing descendant.
-    complete.extend(visited);
+    for id in visited {
+        nodes.remember(id)?;
+    }
     Ok(true)
 }
 
