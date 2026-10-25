@@ -2,13 +2,17 @@
 //!
 //! Files use the same canonical streaming arena path as capsule content.
 
-use std::fs::File;
 use std::io::Cursor;
 
 use crate::content::{ChunkingProfile, ContentIngest, ContentName, PrepareDerivedBatchContent};
 use crate::error::{StorageError, StorageResult};
 
 use super::{RuntimePrincipalStore, StateOwner};
+
+#[cfg(test)]
+mod atomic_tests;
+mod source;
+use source::HomeSource;
 
 /// One sealed regular file ready for packed home publication.
 pub struct ContiguousFileIngest {
@@ -59,7 +63,7 @@ impl RuntimePrincipalStore {
     ) -> StorageResult<()> {
         let mut ingests = Vec::new();
         for file in files {
-            let source = open_home_source(&file)?;
+            let source = HomeSource::new(&file);
             ingests.push(ContentIngest::new(file.name, source));
         }
         if ingests.is_empty() {
@@ -90,7 +94,7 @@ impl RuntimePrincipalStore {
         for file in files {
             let (name, source): (_, Box<dyn std::io::Read + Send>) = match file {
                 PackedProjectionIngest::File(file) => {
-                    let source = open_home_source(&file)?;
+                    let source = HomeSource::new(&file);
                     (file.name, Box::new(source))
                 },
                 PackedProjectionIngest::Bytes { name, bytes } => {
@@ -120,27 +124,6 @@ impl RuntimePrincipalStore {
             .map(|_| ())
             .map_err(|error| StorageError::Internal(format!("replace packed home batch: {error}")))
     }
-}
-
-fn open_home_source(file: &ContiguousFileIngest) -> StorageResult<File> {
-    let source = File::open(&file.path).map_err(|error| {
-        StorageError::Connection(format!("open home source {}: {error}", file.path.display()))
-    })?;
-    let actual_bytes = source
-        .metadata()
-        .map_err(|error| {
-            StorageError::Connection(format!("stat home source {}: {error}", file.path.display()))
-        })?
-        .len();
-    if actual_bytes != file.logical_bytes {
-        return Err(StorageError::Connection(format!(
-            "home source {} changed length (expected {}, found {})",
-            file.path.display(),
-            file.logical_bytes,
-            actual_bytes
-        )));
-    }
-    Ok(source)
 }
 
 #[cfg(test)]

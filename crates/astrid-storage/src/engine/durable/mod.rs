@@ -694,6 +694,7 @@ impl<P: Ord, I, C> fmt::Debug for DurableEngine<P, I, C> {
 mod engine;
 mod object_access;
 mod opening;
+mod retirement;
 
 impl<P: Ord, I, C> Drop for DurableEngine<P, I, C> {
     fn drop(&mut self) {

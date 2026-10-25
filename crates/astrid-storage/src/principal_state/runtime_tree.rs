@@ -581,7 +581,7 @@ fn is_staging_generation(name: &str) -> bool {
 
 fn retire_projection(home: &AstridHome) -> StorageResult<()> {
     let root = home.root();
-    astrid_core::dirs::retire_projection_root(root)
+    astrid_core::dirs::retire_packed_projection_root(root)
         .map_err(|error| tree_error(root, format!("retire projection: {error}")))
 }
 
@@ -766,7 +766,8 @@ fn legacy_projection_pack(home: &AstridHome, store: &RuntimePrincipalStore) -> S
         .content()
         .flush()
         .map_err(|error| tree_error(home.root(), format!("flush volume projection: {error}")))?;
-    retire_projection(home)
+    astrid_core::dirs::retire_projection_root(home.root())
+        .map_err(|error| tree_error(home.root(), format!("retire legacy projection: {error}")))
 }
 fn tree_io_error(error: &std::io::Error) -> StorageError {
     StorageError::Connection(error.to_string())

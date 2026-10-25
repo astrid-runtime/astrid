@@ -102,6 +102,12 @@ impl<P> Default for CommitGroup<P> {
     }
 }
 
+impl<P> CommitGroup<P> {
+    pub(super) fn is_idle(&self) -> bool {
+        !self.leader_active && self.queue.is_empty()
+    }
+}
+
 /// RAII ownership of the one active group-leader role.
 ///
 /// Normal execution hands leadership to the next queued caller explicitly.
@@ -746,5 +752,21 @@ fn complete_failed_group<P: Ord>(
             accepted.receipt,
             Err(first.take().unwrap_or(DurableError::RequiresRecovery)),
         ));
+    }
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::super::tests::{open, transaction};
+    #[test]
+    fn active_commit_group_cannot_transfer_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = open(directory.path());
+        engine.commit_group.lock().leader_active = true;
+        assert!(engine.handoff_for_retirement().is_err());
+        engine.commit_group.lock().leader_active = false;
+        let (_, transaction) = transaction("agent", None, b"still writable");
+        engine.commit(transaction).unwrap();
+        engine.handoff_for_retirement().unwrap().close().unwrap();
     }
 }

@@ -92,6 +92,8 @@ use format_amendment::{
 };
 use native_io::atomic_write;
 pub use runtime_tree::RuntimeTreeEntry;
+mod retirement;
+pub use retirement::RuntimeRetirement;
 pub use staging::{
     NativeContentStagingArea, ReadyStagedContent, StagedContentId, StagedContentWriter,
 };

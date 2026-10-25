@@ -20,6 +20,16 @@ pub struct RuntimeLifecycleGuard {
 }
 
 impl RuntimeLifecycleGuard {
+    /// Pack through the transferred owner after every runtime task has stopped.
+    ///
+    /// The lifecycle fence remains held through packing and final engine close.
+    ///
+    /// # Errors
+    /// Returns a home mismatch, publication, retirement, or close failure.
+    pub fn finish_with_owner(self, mut owner: super::RuntimeRetirement) -> StorageResult<()> {
+        owner.finish(&self.home)
+    }
+
     /// Acquire exclusive lifecycle ownership without creating the runtime root.
     ///
     /// # Errors

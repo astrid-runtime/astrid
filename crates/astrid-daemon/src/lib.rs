@@ -38,19 +38,24 @@ pub fn run_to_completion() -> Result<()> {
     }
     let home = astrid_core::dirs::AstridHome::resolve()?;
     let lifecycle = astrid_storage::principal_state::RuntimeLifecycleGuard::acquire(&home)?;
-    {
+    let retirement = {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        runtime.block_on(run_with_args(args))?;
-        // Drop joins blocking work and cancels remaining async tasks before any
-        // projection file can be retired. No kernel handles cross this scope.
-    }
+        let retirement = runtime.block_on(run_with_args(args))?;
+        // Only the separate finalization owner crosses this scope. Old runtime
+        // storage handles are closed before task teardown joins blocking work.
+        retirement
+    };
     tracing::info!("Runtime tasks stopped; finalizing durable home");
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(lifecycle.finish())?;
+    if let Some(owner) = retirement {
+        lifecycle.finish_with_owner(owner)?;
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(lifecycle.finish())?;
+    }
     // Tracing can recreate a retired log projection; stderr cannot reopen it.
     eprintln!("Astrid durable home finalized");
     Ok(())
@@ -242,7 +247,10 @@ fn write_readiness_then_arm_ephemeral<T, E>(
 /// Returns an error if the kernel fails to boot, the native local uplink cannot
 /// claim its listener, or the readiness file cannot be written.
 pub async fn run() -> Result<()> {
-    run_with_args(Args::parse()).await
+    // Embedders retain the original service-loop contract. Dropping the owner
+    // closes its store; only run_to_completion retires the host projection.
+    drop(run_with_args(Args::parse()).await?);
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -250,7 +258,9 @@ pub async fn run() -> Result<()> {
     clippy::too_many_lines,
     reason = "boot sequence: sequential config resolution + kernel/capsule setup that does not benefit from splitting"
 )]
-async fn run_with_args(args: Args) -> Result<()> {
+async fn run_with_args(
+    args: Args,
+) -> Result<Option<astrid_storage::principal_state::RuntimeRetirement>> {
     let workspace_layout = match std::env::var("ASTRID_WORKSPACE_STATE_DIR") {
         Ok(value) => astrid_core::dirs::WorkspaceLayout::new(value)
             .context("invalid ASTRID_WORKSPACE_STATE_DIR")?,
@@ -499,13 +509,15 @@ async fn run_with_args(args: Args) -> Result<()> {
         notify.notify_waiters();
     }
 
-    kernel.shutdown(Some("signal".to_string())).await;
+    let retirement = kernel
+        .shutdown_for_finalization(Some("signal".to_string()))
+        .await?;
     if let Err(error) = native_uplink_task.await {
         tracing::warn!(%error, "native local uplink task did not exit cleanly");
     }
 
     tracing::info!("Kernel services and native uplink stopped");
-    Ok(())
+    Ok(retirement)
 }
 
 /// Report that native daemon startup is unavailable on this platform.
@@ -522,7 +534,9 @@ async fn run_with_args(args: Args) -> Result<()> {
     clippy::unused_async,
     reason = "the cross-platform daemon entry point remains async even when startup is unsupported"
 )]
-async fn run_with_args(_args: Args) -> Result<()> {
+async fn run_with_args(
+    _args: Args,
+) -> Result<Option<astrid_storage::principal_state::RuntimeRetirement>> {
     anyhow::bail!("native Astrid daemon startup is not yet supported on this platform")
 }
 

@@ -3,6 +3,18 @@
 use super::Kernel;
 use std::sync::Arc;
 
+enum ShutdownMode {
+    Close,
+    #[cfg(not(target_family = "wasm"))]
+    Transfer,
+}
+
+enum ShutdownOutcome {
+    Complete,
+    #[cfg(not(target_family = "wasm"))]
+    Retirement(astrid_storage::principal_state::RuntimeRetirement),
+}
+
 impl Kernel {
     /// Gracefully shut down the kernel.
     ///
@@ -10,6 +22,34 @@ impl Kernel {
     /// capsule producers. Publish the final projection and close durable stores
     /// after producers stop, then remove the Unix socket file.
     pub async fn shutdown(&self, reason: Option<String>) {
+        if let Err(error) = self.shutdown_inner(reason, ShutdownMode::Close).await {
+            tracing::error!(%error, "kernel shutdown did not finish durable ownership");
+        }
+    }
+
+    /// Stop runtime producers and close their handles, retaining a distinct
+    /// durable owner for packing after the host joins its task runtime.
+    ///
+    /// # Errors
+    /// Returns publication, handoff, or close failures without claiming that
+    /// the surviving projection was successfully retired.
+    #[cfg(not(target_family = "wasm"))]
+    pub async fn shutdown_for_finalization(
+        &self,
+        reason: Option<String>,
+    ) -> astrid_storage::StorageResult<Option<astrid_storage::principal_state::RuntimeRetirement>>
+    {
+        match self.shutdown_inner(reason, ShutdownMode::Transfer).await? {
+            ShutdownOutcome::Complete => Ok(None),
+            ShutdownOutcome::Retirement(owner) => Ok(Some(owner)),
+        }
+    }
+
+    async fn shutdown_inner(
+        &self,
+        reason: Option<String>,
+        mode: ShutdownMode,
+    ) -> astrid_storage::StorageResult<ShutdownOutcome> {
         tracing::info!(reason = ?reason, "Kernel shutting down");
         self.shutdown_tx.send_replace(true);
         self.runtime_work.close().await;
@@ -53,25 +93,34 @@ impl Kernel {
         // the final audit flush and projection publication.
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         self.audit_sink.shutdown();
-        // Publish before closing the engine. Daemon-host retirement follows
-        // task teardown; CLI recovery uses that same finalizer after process exit.
+        let mut outcome = Ok(ShutdownOutcome::Complete);
         #[cfg(not(target_family = "wasm"))]
-        if let Some(store) = self.principal_store.as_ref()
-            && let Err(error) = store.publish_runtime_projection(&self.astrid_home)
-        {
-            tracing::error!(
-                error = %format!("{error:#}"),
-                "failed to publish running projection during shutdown"
+        if let Some(store) = self.principal_store.as_ref() {
+            outcome = store
+                .publish_runtime_projection(&self.astrid_home)
+                .map(|()| ShutdownOutcome::Complete);
+            if outcome.is_ok() && matches!(mode, ShutdownMode::Transfer) {
+                outcome = store
+                    .handoff_for_retirement(&self.astrid_home)
+                    .map(ShutdownOutcome::Retirement);
+            }
+        }
+        #[cfg(target_family = "wasm")]
+        let _ = mode;
+        // A successful transfer has already closed the old engine. Closing
+        // this old KV view also releases its read cache; no new owner is closed.
+        if let Err(error) = self.kv.close().await {
+            tracing::warn!(%error, "Failed to close KV store during shutdown");
+            record_close_error(&mut outcome, error);
+        }
+        if let Err(error) = self.audit_log.close().await {
+            tracing::warn!(%error, "Failed to close audit log during shutdown");
+            record_close_error(
+                &mut outcome,
+                astrid_storage::StorageError::Internal(format!(
+                    "close shutdown audit log: {error}"
+                )),
             );
-        }
-        if let Err(e) = self.kv.close().await {
-            tracing::warn!(error = %e, "Failed to flush KV store during shutdown");
-        }
-        // Release durable ownership after the final producer flush. Forced
-        // process termination also releases OS locks; it cannot claim a
-        // successfully finalized projection.
-        if let Err(e) = self.audit_log.close().await {
-            tracing::warn!(error = %e, "Failed to close audit log during shutdown");
         }
 
         tracing::info!("Kernel durable stores closed");
@@ -93,6 +142,7 @@ impl Kernel {
         }
 
         tracing::info!("Kernel shutdown complete");
+        outcome
     }
     async fn drain_shutdown_capsules(&self) {
         let capsules = {
@@ -151,3 +201,20 @@ impl Kernel {
         }
     }
 }
+
+// A transferred owner is custody, not a success flag that an ancillary close
+// error may replace. Report the error only after that owner has packed/closed.
+fn record_close_error(
+    outcome: &mut astrid_storage::StorageResult<ShutdownOutcome>,
+    error: astrid_storage::StorageError,
+) {
+    match outcome {
+        Ok(ShutdownOutcome::Complete) => *outcome = Err(error),
+        #[cfg(not(target_family = "wasm"))]
+        Ok(ShutdownOutcome::Retirement(owner)) => owner.record_shutdown_error(error),
+        Err(_) => {},
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests;
