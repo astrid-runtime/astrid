@@ -37,6 +37,18 @@ impl CanonicalPhysicalMap {
 }
 
 impl<N: PhysicalMapNodes> BackedPhysicalMap<N> {
+    /// Rebind the same immutable map header to an operation-scoped provider.
+    /// Reads still validate node identity, domain and construction below.
+    pub(crate) fn with_node_provider<M: PhysicalMapNodes>(&self, nodes: M) -> BackedPhysicalMap<M> {
+        BackedPhysicalMap {
+            domain: self.domain,
+            construction: self.construction,
+            root: self.root,
+            entry_count: self.entry_count,
+            nodes,
+        }
+    }
+
     pub(super) fn new(
         domain: PhysicalMapDomain,
         construction: MapConstruction,

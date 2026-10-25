@@ -225,3 +225,5 @@ fn canonical_closure_evidence_is_paged_authenticated_and_process_local() {
 }
 
 mod recovery;
+
+mod checkpoint_memo;
