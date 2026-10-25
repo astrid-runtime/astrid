@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// A staged runtime can create its subscriptions and become internally ready
 /// while this gate is closed. Publishing the runtime opens the same atomic gate
 /// for every route without rebuilding subscriptions or draining a pre-publish
-/// backlog (closed routes reject events at enqueue time).
+/// backlog (closed routes reject events during matching and enqueue).
 #[derive(Clone, Debug)]
 pub struct RouteAdmissionGate {
     published: Arc<AtomicBool>,
