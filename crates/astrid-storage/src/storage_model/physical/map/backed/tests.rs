@@ -9,6 +9,8 @@ impl PhysicalIdentity for Blake3PhysicalIdentity {
 use alloc::borrow::Cow;
 use alloc::collections::BTreeMap;
 
+mod batch;
+
 #[derive(Debug, PartialEq)]
 enum ProviderError {
     Model(PhysicalModelError),

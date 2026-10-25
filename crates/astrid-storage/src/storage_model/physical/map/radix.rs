@@ -1,5 +1,8 @@
 //! Dense canonical nibble-radix construction.
 
+mod batch;
+pub(super) use batch::insert_entries;
+
 use super::nodes::{self, PhysicalMapMutNodes};
 use alloc::collections::BTreeMap;
 use alloc::vec;

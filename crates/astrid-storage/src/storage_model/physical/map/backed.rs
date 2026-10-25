@@ -168,7 +168,8 @@ impl<N: PhysicalMapNodes> BackedPhysicalMap<N> {
 }
 
 impl<N: PhysicalMapMutNodes> BackedPhysicalMap<N> {
-    /// Insert a batch by canonical path copying. On error the previous root and
+    /// Merge dense batches directly into final canonical paths; legacy maps
+    /// retain per-row path copying. On error the previous root and
     /// count remain authoritative. Providers may retain immutable orphan nodes
     /// written before failure; installing bytes never publishes root authority.
     pub(crate) fn insert_entries<I: PhysicalIdentity>(
@@ -176,6 +177,22 @@ impl<N: PhysicalMapMutNodes> BackedPhysicalMap<N> {
         identity: &I,
         additions: Vec<(PhysicalMapKey, Vec<u8>)>,
     ) -> Result<u64, N::Error> {
+        if self.construction == MapConstruction::DenseRadix {
+            let (root, added) = radix::insert_entries(
+                identity,
+                self.domain,
+                &mut self.nodes,
+                self.root,
+                additions,
+            )?;
+            let count = self
+                .entry_count
+                .checked_add(added)
+                .ok_or(PhysicalModelError::LengthOverflow)?;
+            self.root = root;
+            self.entry_count = count;
+            return Ok(added);
+        }
         let previous = (self.root, self.entry_count);
         let result = (|| {
             let mut count = 0_u64;
