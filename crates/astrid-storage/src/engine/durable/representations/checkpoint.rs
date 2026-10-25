@@ -6,10 +6,9 @@
 //! reclaim the previous generation only after CURRENT itself is durable.
 
 use super::{
-    BTreeSet, Blake3PhysicalIdentity, CurrentPointer, DurableError, DurableFile, JOURNAL_MAGIC,
-    JOURNAL_PATH, JournalEntry, METADATA_MAGIC, METADATA_PATH, MetadataFrame, RecoveryLimits,
-    RepresentationStore, append_frame, append_frames, append_new_reachable_map_nodes, format,
-    generation_name, increment, io_error, journal_digest, read_all, read_current_file,
+    Blake3PhysicalIdentity, CurrentPointer, DurableError, DurableFile, JOURNAL_MAGIC, JOURNAL_PATH,
+    JournalEntry, METADATA_PATH, MetadataFrame, RecoveryLimits, RepresentationStore, append_frame,
+    format, generation_name, increment, io_error, journal_digest, read_all, read_current_file,
     recover_journal, recover_metadata,
 };
 
@@ -26,31 +25,25 @@ impl RepresentationStore {
     ) -> Result<(Self, CurrentPointer), DurableError> {
         self.flush()?;
         let generation = increment(self.journal_generation)?;
-        let mut frames = Vec::new();
-        let mut appended = BTreeSet::new();
+        let mut batch = super::batch::MetadataBatch::new(limits)?;
         for map in [
             &self.profiles,
             &self.representations,
             &self.placement_entries,
         ] {
-            append_new_reachable_map_nodes(
-                &mut frames,
-                map,
-                &BTreeSet::new(),
-                &mut appended,
-                &mut BTreeSet::new(),
-            )?;
+            super::node_view::visit_nodes(map, |node| {
+                let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, &node)?;
+                batch.push(&frame)
+            })?;
         }
-        frames.extend([
+        for frame in [
             MetadataFrame::catalogue(&Blake3PhysicalIdentity, self.catalogue),
             MetadataFrame::placement(&Blake3PhysicalIdentity, self.placements),
             MetadataFrame::state(&Blake3PhysicalIdentity, self.state),
-        ]);
-        let payloads = frames
-            .iter()
-            .map(MetadataFrame::encode)
-            .collect::<Result<Vec<_>, _>>()?;
-        append_frames(&mut metadata, METADATA_MAGIC, &payloads)?;
+        ] {
+            batch.push(&frame)?;
+        }
+        batch.append_to(&mut metadata)?;
         metadata
             .sync_data()
             .map_err(|source| io_error("flush checkpoint metadata", source))?;
@@ -76,7 +69,18 @@ impl RepresentationStore {
         };
         let index = recover_metadata(&mut metadata, limits)?;
         let (active, state) = recover_journal(&mut journal, current, &index, limits)?;
-        let recovered = Self::from_recovered(metadata, journal, generation, active, state, index)?;
+        let recovered = Self::from_recovered(
+            metadata,
+            journal,
+            super::RecoveredPhysicalAuthority {
+                journal_generation: generation,
+                active,
+                state,
+            },
+            index,
+            limits,
+            self.persisted_map_nodes.budget(),
+        )?;
         if recovered.active != self.active || recovered.reverse != self.reverse {
             return Err(DurableError::InvalidRepresentationState(
                 "checkpoint changed physical authority",

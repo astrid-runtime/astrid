@@ -61,13 +61,14 @@ pub(super) fn recover_interrupted_compaction<P, I, C>(
     codec: &C,
     identity: &I,
     limits: RecoveryLimits,
+    index_memory: crate::engine::LocationIndexMemoryBudget,
 ) -> Result<(), DurableError>
 where
     P: Clone + Ord,
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
-    recovery::recover_interrupted_compaction(store_root, codec, identity, limits)
+    recovery::recover_interrupted_compaction(store_root, codec, identity, limits, index_memory)
 }
 
 /// Native relation snapshot and proposed condemned set for one GC proof.
@@ -721,7 +722,7 @@ where
         inner.roots_by_principal = replacement.roots;
         inner.index = super::locations::PagedLocations::from_map(
             replacement.index,
-            self.index_memory.read().entries(),
+            self.index_memory.read().durable_entries(),
         )?;
         inner.pending_index_locations.clear();
         inner.pending_direct_objects.clear();

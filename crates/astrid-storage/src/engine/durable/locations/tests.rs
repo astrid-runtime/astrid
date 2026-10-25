@@ -65,3 +65,29 @@ fn cold_lookup_failure_is_not_missing_object_in_owning_closure_or_recovery() {
         }
     ));
 }
+
+#[test]
+fn locator_allocates_for_actual_entries_instead_of_eagerly_reserving_the_budget() {
+    let budget = LocationIndexMemoryBudget::default();
+    let mut index = PagedLocations::new(budget.entries());
+    let id = ObjectId::new([1; 32]);
+    let location = ArenaLocation {
+        offset: 0,
+        payload_len: 1,
+        checksum: [2; 32],
+    };
+    index.insert(id, location).unwrap();
+    assert!(
+        index.resident_capacity_bytes() <= 2 * std::mem::size_of::<(ObjectId, ArenaLocation)>()
+    );
+    let before = index.resident_capacity_bytes();
+    index
+        .set_limit(std::num::NonZeroUsize::new(budget.entries().get() * 2).unwrap())
+        .unwrap();
+    assert_eq!(index.resident_capacity_bytes(), before);
+    assert_eq!(index.location(id).unwrap(), Some(location));
+    for byte in 2..64 {
+        index.insert(ObjectId::new([byte; 32]), location).unwrap();
+        assert!(index.resident_capacity_bytes() as u64 <= budget.bytes().get());
+    }
+}

@@ -135,6 +135,7 @@ where
                     self.limits,
                     frozen_specification,
                     objects.into_iter().map(Ok),
+                    *self.index_memory.read(),
                 )?
             } else {
                 RepresentationStore::activate(
@@ -142,6 +143,7 @@ where
                     self.limits,
                     frozen_specification,
                     objects.into_iter().map(Ok),
+                    *self.index_memory.read(),
                 )?
             }
         };
@@ -182,7 +184,7 @@ where
         let mut missing = Vec::new();
         for entry in inner.index.locations() {
             let (object, location) = entry?;
-            if !excluded.contains(&object) && !representations.contains_direct(object) {
+            if !excluded.contains(&object) && !representations.contains_direct(object)? {
                 missing.push((object, location));
             }
         }
@@ -274,7 +276,7 @@ where
                 .cloned(),
         );
         for (id, location) in pending_index_locations.iter().copied() {
-            if !seen.insert(id) || representations.contains_direct(id) {
+            if !seen.insert(id) || representations.contains_direct(id)? {
                 continue;
             }
             let (_, payload) = read_indexed_object_with_payload(

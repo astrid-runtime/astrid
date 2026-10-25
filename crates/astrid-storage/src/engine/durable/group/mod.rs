@@ -651,7 +651,7 @@ where
             .copied()
             .chain(required.iter().map(|(id, location)| (*id, *location)))
         {
-            if !seen.insert(id) || representations.contains_direct(id) {
+            if !seen.insert(id) || representations.contains_direct(id)? {
                 continue;
             }
             // Admission-created direct descriptions are reusable only after

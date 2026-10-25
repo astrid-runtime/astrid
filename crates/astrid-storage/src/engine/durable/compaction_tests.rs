@@ -285,9 +285,9 @@ fn compaction_rebases_direct_authority_before_retiring_old_placements() {
     {
         let inner = engine.inner.lock();
         let representations = inner.representations.as_ref().unwrap();
-        assert!(!representations.contains_direct(first.commit));
-        assert!(representations.contains_direct(current.commit));
-        assert!(!representations.contains_direct(specification_id));
+        assert!(!representations.contains_direct(first.commit).unwrap());
+        assert!(representations.contains_direct(current.commit).unwrap());
+        assert!(!representations.contains_direct(specification_id).unwrap());
     }
     engine.close().unwrap();
     drop(engine);

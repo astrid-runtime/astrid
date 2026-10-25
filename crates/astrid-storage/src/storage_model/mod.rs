@@ -635,6 +635,7 @@ pub use gc_evidence::{
     GcCommitEvidence, GcCommitId, GcEvidenceError, GcFactSnapshotId, GcPlanEvidence, GcPlanId,
     RetentionPolicyId, TensorLogicProofId,
 };
+pub(crate) use physical::{BackedPhysicalMap, PhysicalMapMutNodes, PhysicalMapNodes};
 pub use physical::{
     CanonicalPhysicalMap, Coverage, Dependency, PhysicalIdentity, PhysicalMapDomain,
     PhysicalMapKey, PhysicalMapNode, PhysicalMapNodeId, PhysicalModelError, PlacementEntry,

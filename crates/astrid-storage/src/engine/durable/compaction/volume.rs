@@ -252,7 +252,7 @@ where
         inner.roots_by_principal = replacement.roots;
         inner.index = super::super::locations::PagedLocations::from_map(
             replacement.index,
-            self.index_memory.read().entries(),
+            self.index_memory.read().durable_entries(),
         )?;
         inner.pending_index_locations.clear();
         inner.pending_direct_objects.clear();

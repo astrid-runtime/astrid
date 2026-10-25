@@ -16,9 +16,9 @@ use super::File as DurableFile;
 #[cfg(test)]
 use super::open_rw;
 use super::{
-    ArenaLocation, DurableError, DurableIo, FRAME_HEADER_LEN, PersistentObjectIdentity,
-    RecoveryLimits, append_frame, append_frames, canonical_record_bytes, io_error,
-    read_indexed_object_with_payload,
+    ArenaLocation, DurableError, DurableIo, FRAME_HEADER_LEN, LocationIndexMemoryBudget,
+    PersistentObjectIdentity, RecoveryLimits, append_frame, append_frames, canonical_record_bytes,
+    io_error, read_indexed_object_with_payload,
 };
 use format::{
     Blake3PhysicalIdentity, CurrentPointer, JOURNAL_MAGIC, JournalEntry, METADATA_MAGIC,
@@ -42,7 +42,11 @@ use recovery::{
     validate_representations,
 };
 
+mod batch;
+mod cold;
 mod contiguous;
+mod node_view;
+use cold::{ColdNodes, ColdPhysicalMap};
 mod direct;
 mod volume;
 use authority::{create_file as create_cap_file, open_file as open_cap_file, quarantine_entry};
@@ -106,15 +110,22 @@ pub(super) struct RepresentationStore {
     state: RepresentationState,
     catalogue: RepresentationCatalogueRoot,
     placements: PlacementSet,
-    profiles: CanonicalPhysicalMap,
-    representations: CanonicalPhysicalMap,
-    placement_entries: CanonicalPhysicalMap,
-    persisted_map_nodes: BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    profiles: ColdPhysicalMap,
+    representations: ColdPhysicalMap,
+    placement_entries: ColdPhysicalMap,
+    persisted_map_nodes: ColdNodes,
     residency: residency::MapResidency,
     // Memoized durable descendant closures; discarded when the store is reopened.
     complete_map_subtrees: BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     direct_profile: RepresentationProfileId,
     reverse: ReverseIndex,
+}
+
+#[derive(Clone, Copy)]
+struct RecoveredPhysicalAuthority {
+    journal_generation: u64,
+    active: RepresentationStateId,
+    state: RepresentationState,
 }
 
 pub(super) struct PendingRepresentationUpdate {
@@ -134,9 +145,21 @@ struct DirectMapEntry {
 }
 
 impl RepresentationStore {
+    pub(in crate::engine::durable) fn set_location_index_memory(
+        &self,
+        budget: LocationIndexMemoryBudget,
+    ) -> Result<(), DurableError> {
+        self.persisted_map_nodes.set_memory(budget)
+    }
+
+    pub(in crate::engine::durable) fn accelerator_failed(&self) -> bool {
+        self.persisted_map_nodes.failed()
+    }
+
     pub(super) fn open(
         store_root: &cap_std::fs::Dir,
         limits: RecoveryLimits,
+        index_memory: LocationIndexMemoryBudget,
     ) -> Result<Option<Self>, DurableError> {
         let root_directory = match contiguous::open_representation_root(store_root) {
             Ok(root) => root,
@@ -173,10 +196,14 @@ impl RepresentationStore {
         let recovered = Self::from_recovered(
             metadata,
             journal,
-            current.journal_generation,
-            active,
-            state,
+            RecoveredPhysicalAuthority {
+                journal_generation: current.journal_generation,
+                active,
+                state,
+            },
             index,
+            limits,
+            index_memory,
         )?;
         Ok(Some(recovered))
     }
@@ -186,8 +213,9 @@ impl RepresentationStore {
         limits: RecoveryLimits,
         frozen_specification: ObjectId,
         objects: impl IntoIterator<Item = Result<DirectArenaObject, DurableError>>,
+        index_memory: LocationIndexMemoryBudget,
     ) -> Result<Self, DurableError> {
-        if let Some(existing) = Self::open(store_root, limits)? {
+        if let Some(existing) = Self::open(store_root, limits, index_memory)? {
             return Ok(existing);
         }
         quarantine_entry(store_root, DIRECTORY, &format!("{DIRECTORY}.incomplete"))?;
@@ -267,9 +295,11 @@ impl RepresentationStore {
             .map_err(|source| io_error("flush representation root", source))?;
         drop(metadata);
         drop(journal);
-        Self::open(store_root, limits)?.ok_or(DurableError::InvalidRepresentationState(
-            "published representation state did not reopen",
-        ))
+        Self::open(store_root, limits, index_memory)?.ok_or(
+            DurableError::InvalidRepresentationState(
+                "published representation state did not reopen",
+            ),
+        )
     }
 
     pub(super) fn direct_profile_for(
@@ -308,8 +338,9 @@ impl RepresentationStore {
 
     pub(super) fn logical_liveness_roots(&self) -> Result<BTreeSet<ObjectId>, DurableError> {
         let mut roots = BTreeSet::new();
-        for (_, bytes) in recovery::active_entries(&self.profiles)? {
-            let profile = RepresentationProfile::decode(bytes)?;
+        for entry in recovery::active_entries(&self.profiles) {
+            let (_, bytes) = entry?;
+            let profile = RepresentationProfile::decode(&bytes)?;
             roots.extend(
                 profile
                     .immutable_dependencies()
@@ -320,8 +351,9 @@ impl RepresentationStore {
                     }),
             );
         }
-        for (_, bytes) in recovery::active_entries(&self.representations)? {
-            let record = RepresentationRecord::decode(bytes)?;
+        for entry in recovery::active_entries(&self.representations) {
+            let (_, bytes) = entry?;
+            let record = RepresentationRecord::decode(&bytes)?;
             roots.extend(
                 record
                     .dependencies()
@@ -360,79 +392,93 @@ impl RepresentationStore {
     pub(super) fn frozen_specification(&self) -> Result<ObjectId, DurableError> {
         let bytes = self
             .profiles
-            .get(PhysicalMapKey::from(self.direct_profile))
+            .try_get(
+                &Blake3PhysicalIdentity,
+                PhysicalMapKey::from(self.direct_profile),
+            )?
             .ok_or(DurableError::InvalidRepresentationState(
                 "direct representation profile disappeared",
             ))?;
-        Ok(RepresentationProfile::decode(bytes)?.frozen_specification())
+        Ok(RepresentationProfile::decode(&bytes)?.frozen_specification())
     }
 
-    pub(super) fn contains_direct(&self, object: ObjectId) -> bool {
-        self.reverse.get(&object).is_some_and(|records| {
-            records.iter().any(|record| {
-                self.representations
-                    .get(PhysicalMapKey::from(*record))
-                    .and_then(|bytes| RepresentationRecord::decode(bytes).ok())
-                    .is_some_and(|value| {
-                        value.profile() == self.direct_profile
-                            && matches!(value.coverage(), Coverage::Exact { object: covered, .. } if *covered == object)
-                            && matches!(value.recipe(), Recipe::DirectCanonical { .. })
-                    })
-            })
-        })
+    pub(super) fn contains_direct(&self, object: ObjectId) -> Result<bool, DurableError> {
+        Ok(self.direct_record(object)?.is_some_and(|record| {
+            matches!(record.coverage(), Coverage::Exact { object: covered, .. } if *covered == object)
+                && matches!(record.recipe(), Recipe::DirectCanonical { .. })
+        }))
     }
 
+    fn direct_record(
+        &self,
+        object: ObjectId,
+    ) -> Result<Option<RepresentationRecord>, DurableError> {
+        let Some(records) = self.reverse.get(&object) else {
+            return Ok(None);
+        };
+        for id in records.iter() {
+            let bytes = self
+                .representations
+                .try_get(&Blake3PhysicalIdentity, PhysicalMapKey::from(*id))?
+                .ok_or(DurableError::InvalidRepresentationState(
+                    "reverse index references a missing representation",
+                ))?;
+            let record = RepresentationRecord::decode(&bytes)?;
+            if record.profile() == self.direct_profile {
+                if !matches!(record.coverage(), Coverage::Exact { object: covered, .. } if *covered == object)
+                    || !matches!(record.recipe(), Recipe::DirectCanonical { .. })
+                {
+                    return Err(DurableError::InvalidRepresentationState(
+                        "direct profile has incompatible coverage or recipe",
+                    ));
+                }
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
+    /// On any error the engine must poison this store and recover it before
+    /// another operation: staged nodes and tentative map roots are not authority.
     pub(super) fn append_direct_update(
         &mut self,
         objects: &[DirectArenaObject],
     ) -> Result<Option<PendingRepresentationUpdate>, DurableError> {
         let mut metadata = Vec::new();
         let profile = RepresentationProfile::decode(
-            self.profiles
-                .get(PhysicalMapKey::from(self.direct_profile))
+            &self
+                .profiles
+                .try_get(
+                    &Blake3PhysicalIdentity,
+                    PhysicalMapKey::from(self.direct_profile),
+                )?
                 .ok_or(DurableError::InvalidRepresentationState(
                     "direct representation profile disappeared",
                 ))?,
         )?;
         let mut entries = Vec::new();
         for object in objects {
-            if !self.contains_direct(object.object) {
+            if !self.contains_direct(object.object)? {
                 entries.push(self.prepare_direct_entry(object, &profile)?);
             }
         }
         if entries.is_empty() {
             return Ok(None);
         }
-        let rebuild_representations =
-            bulk_rebuild_is_cheaper(self.representations.entry_count(), entries.len())?;
-        let rebuild_placements =
-            bulk_rebuild_is_cheaper(self.placement_entries.entry_count(), entries.len())?;
-        let representation_entries = entries
-            .iter()
-            .map(|entry| entry.representation.clone())
-            .collect::<Vec<_>>();
-        let placement_entries = entries
-            .iter()
-            .map(|entry| entry.placement.clone())
-            .collect::<Vec<_>>();
-        if rebuild_representations {
-            self.representations
-                .rebuild_with_entries(&Blake3PhysicalIdentity, representation_entries)?;
-        } else {
-            for (key, value) in representation_entries {
-                self.representations
-                    .insert(&Blake3PhysicalIdentity, key, value)?;
-            }
-        }
-        if rebuild_placements {
-            self.placement_entries
-                .rebuild_with_entries(&Blake3PhysicalIdentity, placement_entries)?;
-        } else {
-            for (key, value) in placement_entries {
-                self.placement_entries
-                    .insert(&Blake3PhysicalIdentity, key, value)?;
-            }
-        }
+        self.representations.insert_entries(
+            &Blake3PhysicalIdentity,
+            entries
+                .iter()
+                .map(|entry| entry.representation.clone())
+                .collect(),
+        )?;
+        self.placement_entries.insert_entries(
+            &Blake3PhysicalIdentity,
+            entries
+                .iter()
+                .map(|entry| entry.placement.clone())
+                .collect(),
+        )?;
         let reverse_additions = entries
             .into_iter()
             .map(|entry| (entry.object, entry.representation_id))
@@ -460,12 +506,14 @@ impl RepresentationStore {
             placements,
         ));
         metadata.push(MetadataFrame::state(&Blake3PhysicalIdentity, state));
-        let payloads = metadata
-            .iter()
-            .map(MetadataFrame::encode)
-            .collect::<Result<Vec<_>, _>>()?;
-        append_frames(&mut self.metadata, METADATA_MAGIC, &payloads)?;
-        self.persisted_map_nodes.extend(appended_map_nodes);
+        self.append_metadata_frames(&metadata)?;
+        for id in appended_map_nodes {
+            if !self.persisted_map_nodes.contains(&id)? {
+                return Err(DurableError::InvalidRepresentationState(
+                    "new physical node lacks a locator",
+                ));
+            }
+        }
         Ok(Some(PendingRepresentationUpdate {
             state,
             state_id,
@@ -478,6 +526,7 @@ impl RepresentationStore {
 
     /// Replace every active physical representation with the supplied direct
     /// arena placement after compaction has materialized all live objects.
+    /// An error requires engine poisoning before reuse, as for direct updates.
     pub(super) fn rebase_all_direct(
         &mut self,
         objects: &[DirectArenaObject],
@@ -486,8 +535,12 @@ impl RepresentationStore {
             return Ok(());
         }
         let profile = RepresentationProfile::decode(
-            self.profiles
-                .get(PhysicalMapKey::from(self.direct_profile))
+            &self
+                .profiles
+                .try_get(
+                    &Blake3PhysicalIdentity,
+                    PhysicalMapKey::from(self.direct_profile),
+                )?
                 .ok_or(DurableError::InvalidRepresentationState(
                     "direct representation profile disappeared",
                 ))?,
@@ -504,21 +557,30 @@ impl RepresentationStore {
             .iter()
             .map(|entry| entry.placement.clone())
             .collect();
-        self.representations = CanonicalPhysicalMap::build_dense(
+        let replacement_representations = CanonicalPhysicalMap::build_dense(
             &Blake3PhysicalIdentity,
             PhysicalMapDomain::Representation,
             representation_entries,
         )?;
-        self.placement_entries = CanonicalPhysicalMap::build_dense(
+        let replacement_placements = CanonicalPhysicalMap::build_dense(
             &Blake3PhysicalIdentity,
             PhysicalMapDomain::Placement,
             placement_entries,
         )?;
+        self.persisted_map_nodes
+            .install_materialized(&replacement_representations)?;
+        self.persisted_map_nodes
+            .install_materialized(&replacement_placements)?;
+        self.representations =
+            replacement_representations.with_node_provider(self.persisted_map_nodes.clone());
+        self.placement_entries =
+            replacement_placements.with_node_provider(self.persisted_map_nodes.clone());
         self.residency = residency::MapResidency::new(
             &self.profiles,
             &self.representations,
             &self.placement_entries,
-        );
+            self.persisted_map_nodes.len(),
+        )?;
         let replacement_reverse = entries
             .into_iter()
             .map(|entry| {
@@ -547,12 +609,14 @@ impl RepresentationStore {
             MetadataFrame::placement(&Blake3PhysicalIdentity, placements),
             MetadataFrame::state(&Blake3PhysicalIdentity, state),
         ]);
-        let payloads = metadata
-            .iter()
-            .map(MetadataFrame::encode)
-            .collect::<Result<Vec<_>, _>>()?;
-        append_frames(&mut self.metadata, METADATA_MAGIC, &payloads)?;
-        self.persisted_map_nodes.extend(appended_map_nodes);
+        self.append_metadata_frames(&metadata)?;
+        for id in appended_map_nodes {
+            if !self.persisted_map_nodes.contains(&id)? {
+                return Err(DurableError::InvalidRepresentationState(
+                    "new physical node lacks a locator",
+                ));
+            }
+        }
         let update = PendingRepresentationUpdate {
             state,
             state_id,
@@ -658,6 +722,25 @@ impl RepresentationStore {
         Ok((catalogue, placements, state))
     }
 
+    // Partial promotion or append errors require engine poisoning and reopen.
+    // Scratch is released on success, or with this store during recovery.
+    fn append_metadata_frames(&mut self, frames: &[MetadataFrame]) -> Result<(), DurableError> {
+        let mut batch = batch::MetadataBatch::new(self.persisted_map_nodes.limits())?;
+        for frame in frames {
+            batch.push(frame)?;
+        }
+        let base = batch.append_to(&mut self.metadata)?;
+        batch.promote_nodes(
+            &self.persisted_map_nodes,
+            base,
+            self.persisted_map_nodes.limits(),
+        )?;
+        // Both current maps' complete closures have been emitted. No scratch
+        // node is needed by the pending authority or any prior durable root.
+        self.persisted_map_nodes.finish_staging();
+        Ok(())
+    }
+
     pub(super) fn publish_direct_update(
         &mut self,
         update: PendingRepresentationUpdate,
@@ -741,18 +824,12 @@ impl RepresentationStore {
 
     fn direct_arena_locations(&self) -> Result<Vec<(ObjectId, ArenaLocation)>, DurableError> {
         let mut direct = Vec::new();
-        for (object, records) in &self.reverse {
-            let record = records
-                .iter()
-                .filter_map(|id| {
-                    self.representations
-                        .get(PhysicalMapKey::from(*id))
-                        .and_then(|bytes| RepresentationRecord::decode(bytes).ok())
-                })
-                .find(|record| record.profile() == self.direct_profile)
-                .ok_or(DurableError::InvalidRepresentationState(
-                    "reverse index has no direct representation",
-                ))?;
+        for object in self.reverse.keys() {
+            let record =
+                self.direct_record(*object)?
+                    .ok_or(DurableError::InvalidRepresentationState(
+                        "reverse index has no direct representation",
+                    ))?;
             let Recipe::DirectCanonical { blob } = record.recipe() else {
                 return Err(DurableError::InvalidRepresentationState(
                     "direct profile uses a non-direct recipe",
@@ -760,11 +837,11 @@ impl RepresentationStore {
             };
             let placement = self
                 .placement_entries
-                .get(PhysicalMapKey::from(*blob))
+                .try_get(&Blake3PhysicalIdentity, PhysicalMapKey::from(*blob))?
                 .ok_or(DurableError::InvalidRepresentationState(
                     "direct representation placement disappeared",
                 ))?;
-            let placement = PlacementEntry::decode(placement)?;
+            let placement = PlacementEntry::decode(&placement)?;
             let before = direct.len();
             for replica in placement.replicas() {
                 if let ReplicaLocator::ArenaFrame {
@@ -796,18 +873,23 @@ impl RepresentationStore {
     fn from_recovered(
         metadata: DurableFile,
         journal: DurableFile,
-        journal_generation: u64,
-        active: RepresentationStateId,
-        state: RepresentationState,
+        authority: RecoveredPhysicalAuthority,
         mut index: MetadataIndex,
+        limits: RecoveryLimits,
+        index_memory: LocationIndexMemoryBudget,
     ) -> Result<Self, DurableError> {
+        let RecoveredPhysicalAuthority {
+            journal_generation,
+            active,
+            state,
+        } = authority;
         let catalogue = RepresentationCatalogueRoot::decode(
             index.value(MetadataKind::Catalogue, state.catalogue().as_bytes())?,
         )?;
         let placements = PlacementSet::decode(
             index.value(MetadataKind::Placement, state.placements().as_bytes())?,
         )?;
-        let persisted_map_nodes = index.nodes.keys().copied().collect();
+        let persisted_map_nodes = ColdNodes::from_metadata(&metadata, limits, index_memory)?;
         let profiles = residency::recover_active_map(
             PhysicalMapDomain::Profile,
             catalogue.profiles_root(),
@@ -839,6 +921,9 @@ impl RepresentationStore {
                 "placement extent count disagrees with map entries",
             ));
         }
+        let profiles = profiles.with_node_provider(persisted_map_nodes.clone());
+        let representations = representations.with_node_provider(persisted_map_nodes.clone());
+        let placement_entries = placement_entries.with_node_provider(persisted_map_nodes.clone());
         Ok(Self {
             metadata,
             journal,
@@ -851,7 +936,8 @@ impl RepresentationStore {
                 &profiles,
                 &representations,
                 &placement_entries,
-            ),
+                persisted_map_nodes.len(),
+            )?,
             profiles,
             representations,
             placement_entries,
@@ -861,21 +947,6 @@ impl RepresentationStore {
             reverse,
         })
     }
-}
-
-fn bulk_rebuild_is_cheaper(existing: u64, additions: usize) -> Result<bool, DurableError> {
-    let additions = u64::try_from(additions).map_err(|_| DurableError::EncodingOverflow)?;
-    let total = existing
-        .checked_add(additions)
-        .ok_or(DurableError::EncodingOverflow)?;
-    let estimated_path_nodes = additions
-        .checked_mul(u64::from(total.max(2).ilog2()).saturating_add(2))
-        .ok_or(DurableError::EncodingOverflow)?;
-    let final_tree_nodes = total
-        .checked_mul(2)
-        .and_then(|nodes| nodes.checked_sub(1))
-        .ok_or(DurableError::EncodingOverflow)?;
-    Ok(estimated_path_nodes > final_tree_nodes)
 }
 
 fn read_all<F: DurableIo>(file: &mut F, operation: &'static str) -> Result<Vec<u8>, DurableError> {

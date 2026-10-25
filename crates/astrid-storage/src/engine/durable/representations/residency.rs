@@ -17,19 +17,22 @@ pub(super) struct MapResidency {
     profiles: usize,
     representations: usize,
     placements: usize,
+    measured_history: usize,
 }
 
 impl MapResidency {
     pub(super) fn new(
-        profiles: &CanonicalPhysicalMap,
-        representations: &CanonicalPhysicalMap,
-        placements: &CanonicalPhysicalMap,
-    ) -> Self {
-        Self {
-            profiles: profiles.nodes().len(),
-            representations: representations.nodes().len(),
-            placements: placements.nodes().len(),
-        }
+        profiles: &impl super::node_view::MapView,
+        representations: &impl super::node_view::MapView,
+        placements: &impl super::node_view::MapView,
+        measured_history: usize,
+    ) -> Result<Self, DurableError> {
+        Ok(Self {
+            profiles: super::node_view::node_count(profiles)?,
+            representations: super::node_view::node_count(representations)?,
+            placements: super::node_view::node_count(placements)?,
+            measured_history,
+        })
     }
 
     fn total(&self) -> usize {
@@ -50,26 +53,21 @@ impl RepresentationStore {
     }
 
     pub(super) fn reclaim_map_history(&mut self) -> Result<(), DurableError> {
-        let mut reclaimed = false;
-        for (map, baseline) in [
-            (&mut self.profiles, &mut self.residency.profiles),
-            (
-                &mut self.representations,
-                &mut self.residency.representations,
-            ),
-            (&mut self.placement_entries, &mut self.residency.placements),
-        ] {
-            // Use the last measured reachable closure, not the 2n-1 binary
-            // worst case: radix branches can combine more than two children.
-            // Crossing twice this baseline amortizes a traversal over new
-            // path copies or genuine growth; both establish a fresh baseline.
-            if map.nodes().len() > baseline.saturating_mul(2) {
-                map.reclaim_unreachable_nodes()?;
-                *baseline = map.nodes().len();
-                reclaimed = true;
-            }
-        }
-        if reclaimed {
+        // Cold views own no decoded historical nodes. Re-measure the active
+        // closure only after geometric catalogue growth, preserving checkpoint
+        // scheduling without keeping another resident membership set.
+        if self
+            .persisted_map_nodes
+            .len()
+            .saturating_sub(self.residency.measured_history)
+            > self.residency.total()
+        {
+            self.residency = MapResidency::new(
+                &self.profiles,
+                &self.representations,
+                &self.placement_entries,
+                self.persisted_map_nodes.len(),
+            )?;
             self.complete_map_subtrees.clear();
         }
         Ok(())

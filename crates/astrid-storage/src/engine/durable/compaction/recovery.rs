@@ -104,6 +104,7 @@ pub(super) fn recover_interrupted_compaction<P, I, C>(
     codec: &C,
     identity: &I,
     limits: RecoveryLimits,
+    index_memory: crate::engine::LocationIndexMemoryBudget,
 ) -> Result<(), DurableError>
 where
     P: Clone + Ord,
@@ -148,7 +149,7 @@ where
             "recovered compaction placement differs from its durable intent",
         ));
     }
-    rebase_representation_authority(store_root, identity, limits)?;
+    rebase_representation_authority(store_root, identity, limits, index_memory)?;
     remove_capability_file_if_exists(store_root, INDEX_FILE)?;
     let ready = outbox::mark_ready(store_root, intent_model.commit, identity, limits)?;
     if ready != bundle {
@@ -163,8 +164,10 @@ fn rebase_representation_authority<I: PersistentObjectIdentity>(
     store_root: &cap_std::fs::Dir,
     identity: &I,
     limits: RecoveryLimits,
+    index_memory: crate::engine::LocationIndexMemoryBudget,
 ) -> Result<(), DurableError> {
-    let Some(mut representations) = RepresentationStore::open(store_root, limits)? else {
+    let Some(mut representations) = RepresentationStore::open(store_root, limits, index_memory)?
+    else {
         return Ok(());
     };
     let mut arena = open_rw_capability(store_root, Path::new(ARENA_FILE), false)?;

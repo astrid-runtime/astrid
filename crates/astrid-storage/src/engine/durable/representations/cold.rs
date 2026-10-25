@@ -1,0 +1,289 @@
+//! Physical-node values stay in their existing canonical metadata frames.
+//!
+//! Three active map views share one complete paged locator. Path copying writes
+//! new immutable nodes into anonymous staging under the existing mutation lock.
+//! Only final reachable nodes enter metadata; authority still requires its flush
+//! and the existing journal CAS. Batch intermediates never become durable junk.
+
+use parking_lot::Mutex;
+use std::borrow::Cow;
+use std::sync::Arc;
+
+use super::super::format::{frame_checksum, read_frame_at};
+use super::super::locations::{LocationIndexMemoryBudget, LocationLookup, PagedLocations};
+use super::super::{
+    ArenaLocation, DurableError, File, RecoveryLimits, append_frame, io_error, scan_frames,
+};
+use super::format::{
+    Blake3PhysicalIdentity, METADATA_FILE, METADATA_MAGIC, MetadataFrame, MetadataKind,
+};
+use crate::storage_model::{
+    BackedPhysicalMap, CanonicalPhysicalMap, ObjectId, PhysicalMapMutNodes, PhysicalMapNode,
+    PhysicalMapNodeId, PhysicalMapNodes,
+};
+
+pub(super) type ColdPhysicalMap = BackedPhysicalMap<ColdNodes>;
+
+#[derive(Clone, Debug)]
+pub(super) struct ColdNodes(Arc<Mutex<NodeArena>>);
+
+#[derive(Debug)]
+struct NodeArena {
+    file: File,
+    locations: PagedLocations,
+    limits: RecoveryLimits,
+    failed: bool,
+    staged: Option<StagedNodes>,
+    budget: LocationIndexMemoryBudget,
+}
+
+#[derive(Debug)]
+struct StagedNodes {
+    file: File,
+    locations: PagedLocations,
+}
+
+impl ColdNodes {
+    pub(super) fn from_metadata(
+        file: &File,
+        limits: RecoveryLimits,
+        budget: LocationIndexMemoryBudget,
+    ) -> Result<Self, DurableError> {
+        let mut reader = file
+            .try_clone()
+            .map_err(|error| io_error("clone physical node arena", error))?;
+        let mut locations = PagedLocations::new(budget.durable_entries());
+        scan_frames(
+            &mut reader,
+            METADATA_FILE,
+            METADATA_MAGIC,
+            limits,
+            |offset, payload| {
+                let frame = MetadataFrame::decode(payload)?;
+                if frame.kind == MetadataKind::MapNode {
+                    frame.verify(&Blake3PhysicalIdentity)?;
+                    let payload_len =
+                        u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
+                    locations.insert(
+                        ObjectId::new(frame.identity),
+                        ArenaLocation {
+                            offset,
+                            payload_len,
+                            checksum: frame_checksum(METADATA_MAGIC, payload_len, payload),
+                        },
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
+        Ok(Self(Arc::new(Mutex::new(NodeArena {
+            file: reader,
+            locations,
+            limits,
+            failed: false,
+            staged: None,
+            budget,
+        }))))
+    }
+
+    pub(super) fn install_materialized(
+        &mut self,
+        map: &CanonicalPhysicalMap,
+    ) -> Result<(), DurableError> {
+        for (id, node) in map.nodes() {
+            self.put(*id, node.clone())?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn failed(&self) -> bool {
+        let arena = self.0.lock();
+        arena.failed
+            || arena.locations.failed()
+            || arena
+                .staged
+                .as_ref()
+                .is_some_and(|staged| staged.locations.failed())
+    }
+
+    pub(super) fn contains(&self, id: &PhysicalMapNodeId) -> Result<bool, DurableError> {
+        Ok(self
+            .0
+            .lock()
+            .locations
+            .location(ObjectId::new(*id.as_bytes()))?
+            .is_some())
+    }
+
+    /// Install a locator only after its final reachable frame was appended.
+    pub(super) fn promote(
+        &self,
+        id: PhysicalMapNodeId,
+        location: ArenaLocation,
+    ) -> Result<(), DurableError> {
+        let mut arena = self.0.lock();
+        let result = arena
+            .locations
+            .insert(ObjectId::new(*id.as_bytes()), location);
+        if result.is_err() {
+            arena.failed = true;
+        }
+        result
+    }
+
+    /// Every current map root now resolves through canonical metadata. Dropping
+    /// the anonymous arena releases intermediate path copies and their locators.
+    pub(super) fn finish_staging(&self) {
+        self.0.lock().staged = None;
+    }
+
+    #[cfg(test)]
+    pub(super) fn staging_capacity_bytes(&self) -> usize {
+        let arena = self.0.lock();
+        arena.locations.resident_capacity_bytes().saturating_add(
+            arena
+                .staged
+                .as_ref()
+                .map_or(0, |staged| staged.locations.resident_capacity_bytes()),
+        )
+    }
+
+    pub(super) fn budget(&self) -> LocationIndexMemoryBudget {
+        self.0.lock().budget
+    }
+
+    pub(super) fn set_memory(&self, budget: LocationIndexMemoryBudget) -> Result<(), DurableError> {
+        let mut arena = self.0.lock();
+        let result = (|| {
+            arena.locations.set_limit(budget.durable_entries())?;
+            if let Some(staged) = &mut arena.staged {
+                staged.locations.set_limit(budget.durable_entries())?;
+            }
+            arena.budget = budget;
+            Ok(())
+        })();
+        if result.is_err() {
+            arena.failed = true;
+        }
+        result
+    }
+
+    pub(super) fn limits(&self) -> RecoveryLimits {
+        self.0.lock().limits
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.0.lock().locations.len()
+    }
+}
+
+impl NodeArena {
+    fn node(&self, id: PhysicalMapNodeId) -> Result<Option<PhysicalMapNode>, DurableError> {
+        let key = ObjectId::new(*id.as_bytes());
+        if let Some(staged) = &self.staged
+            && let Some(location) = staged.locations.location(key)?
+        {
+            return Self::read_node(&staged.file, self.limits, id, location).map(Some);
+        }
+        let Some(location) = self.locations.location(key)? else {
+            return Ok(None);
+        };
+        Self::read_node(&self.file, self.limits, id, location).map(Some)
+    }
+
+    fn read_node(
+        file: &File,
+        limits: RecoveryLimits,
+        id: PhysicalMapNodeId,
+        location: ArenaLocation,
+    ) -> Result<PhysicalMapNode, DurableError> {
+        let payload = read_frame_at(file, METADATA_FILE, METADATA_MAGIC, location.offset, limits)?;
+        if u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?
+            != location.payload_len
+            || frame_checksum(METADATA_MAGIC, location.payload_len, &payload) != location.checksum
+        {
+            return Err(DurableError::InvalidRepresentationState(
+                "physical node locator no longer matches frame",
+            ));
+        }
+        let frame = MetadataFrame::decode(&payload)?;
+        if frame.kind != MetadataKind::MapNode || frame.identity != *id.as_bytes() {
+            return Err(DurableError::InvalidRepresentationState(
+                "physical node locator names a different identity",
+            ));
+        }
+        frame.verify(&Blake3PhysicalIdentity)?;
+        Ok(PhysicalMapNode::decode(&frame.value)?)
+    }
+}
+
+impl PhysicalMapNodes for ColdNodes {
+    type Error = DurableError;
+    fn note_read_failure(&self) {
+        self.0.lock().failed = true;
+    }
+    fn node(
+        &self,
+        id: PhysicalMapNodeId,
+    ) -> Result<Option<Cow<'_, PhysicalMapNode>>, DurableError> {
+        let mut arena = self.0.lock();
+        let result = arena.node(id).map(|node| node.map(Cow::Owned));
+        if result.is_err() {
+            arena.failed = true;
+        }
+        result
+    }
+}
+
+impl PhysicalMapMutNodes for ColdNodes {
+    fn put(&mut self, id: PhysicalMapNodeId, node: PhysicalMapNode) -> Result<(), DurableError> {
+        let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, &node)?;
+        if frame.identity != *id.as_bytes() {
+            return Err(DurableError::InvalidRepresentationState(
+                "physical node write identity mismatch",
+            ));
+        }
+        let payload = frame.encode()?;
+        let mut arena = self.0.lock();
+        super::super::ensure_payload_limit(METADATA_FILE, 0, payload.len(), arena.limits)?;
+        if let Some(existing) = arena.node(id)? {
+            if existing != node {
+                return Err(DurableError::InvalidRepresentationState(
+                    "physical node identity collision",
+                ));
+            }
+            return Ok(());
+        }
+        let result = (|| {
+            if arena.staged.is_none() {
+                arena.staged =
+                    Some(StagedNodes {
+                        file: File::native(tempfile::tempfile().map_err(|error| {
+                            io_error("create physical node staging arena", error)
+                        })?),
+                        locations: PagedLocations::new(arena.budget.durable_entries()),
+                    });
+            }
+            let staged = arena
+                .staged
+                .as_mut()
+                .ok_or(DurableError::InvalidRepresentationState(
+                    "physical node staging arena disappeared",
+                ))?;
+            let location = append_frame(&mut staged.file, METADATA_MAGIC, &payload)?;
+            staged
+                .locations
+                .insert(ObjectId::new(*id.as_bytes()), location)
+        })();
+        if result.is_err() {
+            arena.failed = true;
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod engine_tests;

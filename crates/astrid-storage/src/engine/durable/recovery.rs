@@ -37,6 +37,7 @@ pub(super) fn recover_store<P, I, C>(
     principal_codec: &SharedPrincipalCodec<C>,
     identity: &SharedIdentity<I>,
     limits: RecoveryLimits,
+    index_memory: super::LocationIndexMemoryBudget,
     create_wal: bool,
     faults: &dyn FaultInjector,
 ) -> Result<RecoveredWal<P, I, C>, DurableError>
@@ -45,9 +46,9 @@ where
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
-    recover_interrupted_compaction(store_root, principal_codec, identity, limits)?;
+    recover_interrupted_compaction(store_root, principal_codec, identity, limits, index_memory)?;
     let mut representations =
-        super::representations::RepresentationStore::open(store_root, limits)?;
+        super::representations::RepresentationStore::open(store_root, limits, index_memory)?;
     let protected_arena_len = representations.as_ref().map_or(
         Ok(0),
         super::representations::RepresentationStore::generation_zero_protected_len,
@@ -147,6 +148,7 @@ pub(super) fn recover_volume<P, I, C>(
     principal_codec: &SharedPrincipalCodec<C>,
     identity: &SharedIdentity<I>,
     limits: RecoveryLimits,
+    index_memory: super::LocationIndexMemoryBudget,
     create_wal: bool,
     faults: &dyn FaultInjector,
 ) -> Result<RecoveredWal<P, I, C>, DurableError>
@@ -163,7 +165,7 @@ where
         .sync()
         .map_err(|source| io_error("flush Astrid volume namespace", source))?;
     let mut representations =
-        super::representations::RepresentationStore::open_volume(volume, limits)?;
+        super::representations::RepresentationStore::open_volume(volume, limits, index_memory)?;
     let protected_arena_len = representations.as_ref().map_or(
         Ok(0),
         super::representations::RepresentationStore::generation_zero_protected_len,
@@ -409,7 +411,11 @@ where
         match self.lifecycle.load(std::sync::atomic::Ordering::Acquire) {
             LIFECYCLE_USABLE => {
                 let mut inner = self.inner.lock();
-                if !inner.index.failed() {
+                if !(inner.index.failed()
+                    || inner.representations.as_ref().is_some_and(
+                        super::representations::RepresentationStore::accelerator_failed,
+                    ))
+                {
                     return Ok(false);
                 }
                 self.mark_requires_recovery(&mut inner);
@@ -423,7 +429,12 @@ where
     }
 
     fn recover_locked(&self, inner: &mut DurableInner<P>) -> Result<bool, DurableError> {
-        if inner.index.failed() {
+        if inner.index.failed()
+            || inner
+                .representations
+                .as_ref()
+                .is_some_and(super::representations::RepresentationStore::accelerator_failed)
+        {
             self.mark_requires_recovery(inner);
         }
         if !inner.poisoned {
@@ -459,7 +470,7 @@ where
                     stabilize_recovered_store(&mut recovered, self.faults.as_ref())?;
                     let index = super::locations::PagedLocations::from_map(
                         std::mem::take(&mut recovered.index),
-                        self.index_memory.read().entries(),
+                        self.index_memory.read().durable_entries(),
                     )?;
                     Ok((recovered, wal, index))
                 })
@@ -513,6 +524,7 @@ where
                 &self.principal_codec,
                 &self.identity,
                 self.limits,
+                *self.index_memory.read(),
                 self.transaction_wal.is_enabled(),
                 self.faults.as_ref(),
             ),
@@ -521,6 +533,7 @@ where
                 &self.principal_codec,
                 &self.identity,
                 self.limits,
+                *self.index_memory.read(),
                 self.transaction_wal.is_enabled(),
                 self.faults.as_ref(),
             ),
@@ -539,7 +552,12 @@ where
         recovery: &mut RecoveryScope,
     ) -> Result<MutexGuard<'_, DurableInner<P>>, DurableError> {
         let mut inner = self.inner.lock();
-        if inner.index.failed() {
+        if inner.index.failed()
+            || inner
+                .representations
+                .as_ref()
+                .is_some_and(super::representations::RepresentationStore::accelerator_failed)
+        {
             self.mark_requires_recovery(&mut inner);
         }
         if inner.poisoned {

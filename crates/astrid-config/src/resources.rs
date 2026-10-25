@@ -16,9 +16,10 @@ pub struct ResourceConfig {
     /// Omitted retains the storage engine default (one `GiB`); zero is invalid.
     /// This limits reconstructible cache residency, not durable history.
     pub decoded_object_cache_bytes: Option<DecodedObjectCacheBytes>,
-    /// Staging-vector bytes for the shared complete historical object locator.
-    /// Omission uses one `MiB`. Durable history spills to authenticated temporary
-    /// files; this target does not cap history, page workspace, or OS file cache.
+    /// Shared staging-vector bytes for complete logical and physical locators,
+    /// including private path-copy staging. Omission uses one `MiB` in total.
+    /// History spills to authenticated temporary files; this target excludes
+    /// merge pages, traversal workspace, and OS file cache.
     pub location_index_memory_bytes: Option<StorageMemoryBytes>,
     /// Default fuel/second rate for users without an explicit override.
     /// Omitted means no new aggregate limit; existing principal limits remain.

@@ -1,5 +1,6 @@
 //! Dense canonical nibble-radix construction.
 
+use super::nodes::{self, PhysicalMapMutNodes};
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -18,14 +19,14 @@ pub(super) fn build<I: PhysicalIdentity>(
     build_range(identity, domain, entries, 0, nodes)
 }
 
-pub(super) fn insert<I: PhysicalIdentity>(
+pub(super) fn insert<I: PhysicalIdentity, N: PhysicalMapMutNodes>(
     identity: &I,
     domain: PhysicalMapDomain,
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    nodes: &mut N,
     root: PhysicalMapNodeId,
     key: PhysicalMapKey,
     value: Vec<u8>,
-) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError> {
+) -> Result<(PhysicalMapNodeId, bool), N::Error> {
     DenseInsertion {
         identity,
         domain,
@@ -34,15 +35,15 @@ pub(super) fn insert<I: PhysicalIdentity>(
     .insert_at(root, key, value)
 }
 
-fn build_range<I: PhysicalIdentity>(
+fn build_range<I: PhysicalIdentity, N: PhysicalMapMutNodes>(
     identity: &I,
     domain: PhysicalMapDomain,
     entries: &[(PhysicalMapKey, Vec<u8>)],
     depth: u8,
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
-) -> Result<PhysicalMapNodeId, PhysicalModelError> {
+    nodes: &mut N,
+) -> Result<PhysicalMapNodeId, N::Error> {
     if entries.is_empty() {
-        return Err(PhysicalModelError::InvalidMap("empty radix range"));
+        return Err(PhysicalModelError::InvalidMap("empty radix range").into());
     }
     if entries.len() <= RADIX_PAGE_CAPACITY {
         return insert_node(
@@ -64,7 +65,7 @@ fn build_range<I: PhysicalIdentity>(
         depth,
     );
     if prefix_nibbles >= DIGEST_NIBBLES {
-        return Err(PhysicalModelError::InvalidMap("duplicate radix key"));
+        return Err(PhysicalModelError::InvalidMap("duplicate radix key").into());
     }
 
     let mut child_bitmap = 0_u16;
@@ -103,30 +104,24 @@ fn build_range<I: PhysicalIdentity>(
     insert_node(identity, nodes, node)
 }
 
-struct DenseInsertion<'a, I> {
+struct DenseInsertion<'a, I, N> {
     identity: &'a I,
     domain: PhysicalMapDomain,
-    nodes: &'a mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    nodes: &'a mut N,
 }
 
-impl<I: PhysicalIdentity> DenseInsertion<'_, I> {
+impl<I: PhysicalIdentity, N: PhysicalMapMutNodes> DenseInsertion<'_, I, N> {
     fn insert_at(
         &mut self,
         node_id: PhysicalMapNodeId,
         key: PhysicalMapKey,
         value: Vec<u8>,
-    ) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError> {
-        let node = self
-            .nodes
-            .get(&node_id)
-            .cloned()
-            .ok_or(PhysicalModelError::InvalidMap(
-                "missing radix insertion node",
-            ))?;
+    ) -> Result<(PhysicalMapNodeId, bool), N::Error> {
+        let node = nodes::read(self.identity, self.nodes, self.domain, node_id)?;
         if node.domain() != self.domain {
-            return Err(PhysicalModelError::InvalidMap(
-                "radix insertion crossed a map domain",
-            ));
+            return Err(
+                PhysicalModelError::InvalidMap("radix insertion crossed a map domain").into(),
+            );
         }
         match node {
             PhysicalMapNode::Page { mut entries, .. } => {
@@ -135,7 +130,8 @@ impl<I: PhysicalIdentity> DenseInsertion<'_, I> {
                     Ok(_) => {
                         return Err(PhysicalModelError::InvalidMap(
                             "page key has unequal canonical bytes",
-                        ));
+                        )
+                        .into());
                     },
                     Err(index) => entries.insert(index, (key, value)),
                 }
@@ -165,9 +161,9 @@ impl<I: PhysicalIdentity> DenseInsertion<'_, I> {
                     subtree_entries,
                 },
             ),
-            PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Branch { .. } => Err(
-                PhysicalModelError::InvalidMap("radix map contains a legacy node"),
-            ),
+            PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Branch { .. } => {
+                Err(PhysicalModelError::InvalidMap("radix map contains a legacy node").into())
+            },
         }
     }
 
@@ -177,16 +173,14 @@ impl<I: PhysicalIdentity> DenseInsertion<'_, I> {
         key: PhysicalMapKey,
         value: Vec<u8>,
         mut branch: Branch,
-    ) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError> {
+    ) -> Result<(PhysicalMapNodeId, bool), N::Error> {
         let common = common_with_prefix(key, branch.prefix_nibbles, &branch.prefix);
         if common < branch.prefix_nibbles {
             let page = self.insert_node(PhysicalMapNode::page(self.domain, vec![(key, value)])?)?;
             let existing_selector = nibble_from_bytes(&branch.prefix, common);
             let inserted_selector = nibble(key, common);
             if existing_selector == inserted_selector {
-                return Err(PhysicalModelError::InvalidMap(
-                    "radix split did not diverge",
-                ));
+                return Err(PhysicalModelError::InvalidMap("radix split did not diverge").into());
             }
             let bitmap = (1_u16 << existing_selector) | (1_u16 << inserted_selector);
             let children = if existing_selector < inserted_selector {
@@ -244,10 +238,7 @@ impl<I: PhysicalIdentity> DenseInsertion<'_, I> {
         Ok((replacement, true))
     }
 
-    fn insert_node(
-        &mut self,
-        node: PhysicalMapNode,
-    ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
+    fn insert_node(&mut self, node: PhysicalMapNode) -> Result<PhysicalMapNodeId, N::Error> {
         insert_node(self.identity, self.nodes, node)
     }
 }
@@ -260,14 +251,12 @@ struct Branch {
     subtree_entries: u64,
 }
 
-fn insert_node<I: PhysicalIdentity>(
+fn insert_node<I: PhysicalIdentity, N: PhysicalMapMutNodes>(
     identity: &I,
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    nodes: &mut N,
     node: PhysicalMapNode,
-) -> Result<PhysicalMapNodeId, PhysicalModelError> {
-    let id = node.identify(identity)?;
-    nodes.entry(id).or_insert(node);
-    Ok(id)
+) -> Result<PhysicalMapNodeId, N::Error> {
+    nodes::store(identity, nodes, node)
 }
 
 pub(super) fn nibble(key: PhysicalMapKey, index: u8) -> u8 {
