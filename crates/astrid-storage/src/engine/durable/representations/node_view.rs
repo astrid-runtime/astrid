@@ -154,7 +154,19 @@ impl<M: MapView> Iterator for Entries<'_, M> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static COUNT_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn test_take_count_walks() -> usize {
+    COUNT_WALKS.with(|walks| walks.replace(0))
+}
+
 pub(super) fn node_count<M: MapView>(map: &M) -> Result<usize, DurableError> {
+    #[cfg(test)]
+    COUNT_WALKS.with(|walks| walks.set(walks.get().strict_add(1)));
     let mut entries = Entries::new(map);
     for entry in entries.by_ref() {
         entry?;

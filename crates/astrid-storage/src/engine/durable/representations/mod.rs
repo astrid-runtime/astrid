@@ -858,21 +858,16 @@ impl RepresentationStore {
         // Canonical map walks retain admitted locations but must discard all
         // journal reachability evidence before independent validation.
         nodes.reset_proofs()?;
-        let profiles = residency::recover_active_map(
-            PhysicalMapDomain::Profile,
-            catalogue.profiles_root(),
-            &nodes,
-        )?;
-        let representations = residency::recover_active_map(
-            PhysicalMapDomain::Representation,
-            catalogue.representations_root(),
-            &nodes,
-        )?;
-        let placement_entries = residency::recover_active_map(
-            PhysicalMapDomain::Placement,
-            placements.entries_root(),
-            &nodes,
-        )?;
+        let (residency, [profiles, representations, placement_entries]) =
+            residency::MapResidency::recover(
+                [
+                    catalogue.profiles_root(),
+                    catalogue.representations_root(),
+                    placements.entries_root(),
+                ],
+                &nodes,
+                nodes.len(),
+            )?;
         if profiles.entry_count() != catalogue.profile_count()
             || representations.entry_count() != catalogue.representation_count()
             || placement_entries.entry_count() != placements.blob_count()
@@ -895,12 +890,6 @@ impl RepresentationStore {
         }
         let persisted_map_nodes =
             nodes.into_cold(&[&profiles, &representations, &placement_entries])?;
-        let residency = residency::MapResidency::new(
-            &profiles,
-            &representations,
-            &placement_entries,
-            persisted_map_nodes.len(),
-        )?;
         let profiles = profiles.with_node_provider(persisted_map_nodes.clone());
         let representations = representations.with_node_provider(persisted_map_nodes.clone());
         let placement_entries = placement_entries.with_node_provider(persisted_map_nodes.clone());
