@@ -37,7 +37,8 @@ fn boot_singleton_is_allowed_but_other_run_state_is_not() {
     let (_root, home) = fixture();
     let run = home.root().join("run");
     crate::platform_fs::ensure_private_directory(&run).unwrap();
-    assert!(!recognize(&home).unwrap());
+    assert!(recognize(&home).unwrap());
+    assert!(home.validate_runtime_identity_provisioning().is_err());
     crate::platform_fs::atomic_write_private_file(&run.join("system.lock"), b"").unwrap();
     assert!(recognize(&home).unwrap());
     crate::platform_fs::atomic_write_private_file(&run.join("system.ready"), b"ready").unwrap();
@@ -120,4 +121,74 @@ fn legacy_key_directory_with_extended_acl_is_rejected() {
     assert!(recognize(&home).is_err());
     assert!(home.ensure().is_err());
     assert_eq!(fs::read(home.runtime_key_path()).unwrap(), [9; 32]);
+}
+
+#[test]
+fn fresh_boot_accepts_only_private_singleton_runtime_residue() {
+    for lock in [false, true] {
+        for key in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let home = AstridHome::from_path(root.path());
+            home.ensure().unwrap();
+            let run = home.root().join("run");
+            crate::platform_fs::ensure_private_directory(&run).unwrap();
+            if lock {
+                crate::platform_fs::atomic_write_private_file(&run.join("system.lock"), b"")
+                    .unwrap();
+            }
+            if key {
+                crate::platform_fs::atomic_write_private_file(&home.runtime_key_path(), &[9; 32])
+                    .unwrap();
+            }
+            home.ensure().unwrap();
+            home.validate_runtime_identity_provisioning().unwrap();
+            crate::platform_fs::atomic_write_private_file(&run.join("system.ready"), b"foreign")
+                .unwrap();
+            assert!(home.ensure().is_err());
+            assert!(home.validate_runtime_identity_provisioning().is_err());
+            assert_eq!(fs::read(run.join("system.ready")).unwrap(), b"foreign");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn fresh_boot_rejects_redirected_singleton_runtime_residue() {
+    for redirect_directory in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(root.path());
+        home.ensure().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let run = home.root().join("run");
+        if redirect_directory {
+            std::os::unix::fs::symlink(target.path(), &run).unwrap();
+        } else {
+            crate::platform_fs::ensure_private_directory(&run).unwrap();
+            let file = target.path().join("foreign");
+            crate::platform_fs::atomic_write_private_file(&file, b"").unwrap();
+            std::os::unix::fs::symlink(file, run.join("system.lock")).unwrap();
+        }
+        assert!(home.ensure().is_err());
+        assert!(home.validate_runtime_identity_provisioning().is_err());
+    }
+}
+
+#[test]
+fn bootstrap_runtime_residue_cannot_reprovision_stopped_volume_identity() {
+    for lock in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(root.path());
+        home.ensure().unwrap();
+        crate::platform_fs::atomic_write_private_file(&home.storage_volume_path(), b"media")
+            .unwrap();
+        let run = home.root().join("run");
+        crate::platform_fs::ensure_private_directory(&run).unwrap();
+        if lock {
+            crate::platform_fs::atomic_write_private_file(&run.join("system.lock"), b"").unwrap();
+        }
+        home.ensure().unwrap();
+        assert!(home.validate_runtime_identity_provisioning().is_err());
+        assert_eq!(fs::read(home.storage_volume_path()).unwrap(), b"media");
+        assert!(!home.runtime_key_path().exists());
+    }
 }

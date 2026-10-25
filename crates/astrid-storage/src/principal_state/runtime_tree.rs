@@ -17,6 +17,9 @@ use super::{
 };
 
 use super::runtime_tree_active as active;
+pub(super) mod fresh_admission;
+#[cfg(test)]
+mod fresh_admission_tests;
 mod key_recovery;
 #[cfg(test)]
 mod key_recovery_tests;

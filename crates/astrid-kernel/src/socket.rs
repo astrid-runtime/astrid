@@ -4,19 +4,6 @@ use astrid_core::local_transport::{self, LocalListener};
 use astrid_core::session_token::SessionToken;
 use tracing::warn;
 
-/// Path to the local Unix Domain Socket for the kernel.
-#[must_use]
-pub(crate) fn kernel_socket_path() -> PathBuf {
-    use astrid_core::dirs::AstridHome;
-    match AstridHome::resolve() {
-        Ok(home) => home.socket_path(),
-        Err(e) => {
-            warn!(error = %e, "Failed to resolve ASTRID_HOME; falling back to /tmp/.astrid/run/system.sock");
-            PathBuf::from("/tmp/.astrid/run/system.sock")
-        },
-    }
-}
-
 /// Create the daemon run directory (the parent of the socket and lockfile)
 /// with `0o700` perms.
 ///
@@ -99,7 +86,7 @@ pub(crate) fn bind_listener(
     // Also clean stale readiness file as defense-in-depth for daemon
     // crashes that bypassed graceful shutdown. Do this only after endpoint
     // preparation succeeds so a rejected live endpoint keeps its sentinel.
-    remove_readiness_file();
+    let _ = std::fs::remove_file(home.ready_path());
 
     Ok(listener)
 }
@@ -157,17 +144,10 @@ pub(crate) fn acquire_singleton_lock(
 /// cannot be written. Unlike socket/CLI paths, there is no `/tmp` fallback
 /// because writing a secret token under a world-listable directory would
 /// undermine the authentication it provides.
-pub(crate) fn generate_session_token() -> Result<(SessionToken, PathBuf), std::io::Error> {
-    use astrid_core::dirs::AstridHome;
-
+pub(crate) fn generate_session_token(
+    home: &astrid_core::dirs::AstridHome,
+) -> Result<(SessionToken, PathBuf), std::io::Error> {
     let token = SessionToken::generate();
-
-    let home = AstridHome::resolve().map_err(|e| {
-        std::io::Error::other(format!(
-            "Cannot generate session token: failed to resolve ASTRID_HOME: {e}"
-        ))
-    })?;
-
     let path = home.token_path();
     token.write_to_file(&path)?;
     Ok((token, path))
@@ -220,7 +200,20 @@ pub fn write_readiness_file_for_workspace(
     workspace_root: &std::path::Path,
     workspace_layout: &astrid_core::dirs::WorkspaceLayout,
 ) -> Result<(), std::io::Error> {
-    let path = readiness_path();
+    let home = astrid_core::dirs::AstridHome::resolve()?;
+    write_readiness_file_for_home(&home, workspace_root, workspace_layout)
+}
+
+/// Publish readiness for the home captured by native boot admission.
+///
+/// # Errors
+/// Returns an error if workspace selection or sentinel publication fails.
+pub fn write_readiness_file_for_home(
+    home: &astrid_core::dirs::AstridHome,
+    workspace_root: &std::path::Path,
+    workspace_layout: &astrid_core::dirs::WorkspaceLayout,
+) -> Result<(), std::io::Error> {
+    let path = home.ready_path();
     let fingerprint = astrid_core::dirs::checked_workspace_selection_fingerprint(
         workspace_root,
         workspace_layout,
@@ -308,9 +301,17 @@ pub fn pid_path() -> PathBuf {
 /// file only degrades `stop`/`restart` to socket-only cleanup), so it logs
 /// rather than aborting boot.
 pub fn write_pid_file() -> Result<(), std::io::Error> {
-    use std::io::Write as _;
+    write_pid_file_at(&pid_path())
+}
 
-    let path = pid_path();
+pub(crate) fn write_pid_file_for_home(
+    home: &astrid_core::dirs::AstridHome,
+) -> Result<(), std::io::Error> {
+    write_pid_file_at(&home.pid_path())
+}
+
+fn write_pid_file_at(path: &std::path::Path) -> Result<(), std::io::Error> {
+    use std::io::Write as _;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -354,7 +355,7 @@ pub fn write_pid_file() -> Result<(), std::io::Error> {
         return Err(e);
     }
 
-    if let Err(e) = std::fs::rename(&tmp, &path) {
+    if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }

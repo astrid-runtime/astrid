@@ -48,7 +48,7 @@ pub(in crate::principal_state) fn restore(
     establish_active_receipt(home, store)
 }
 
-fn volume_file(
+pub(super) fn volume_file(
     home: &AstridHome,
     store: &RuntimePrincipalStore,
     name: &str,

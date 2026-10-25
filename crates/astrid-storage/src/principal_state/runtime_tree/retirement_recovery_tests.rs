@@ -261,3 +261,45 @@ async fn excluded_runtime_sockets_do_not_block_authenticated_retirement_recovery
     );
     drop(reopened);
 }
+
+#[tokio::test]
+async fn unsentinelled_opener_preserves_existing_origin_for_packed_and_retiring_media() {
+    use crate::{
+        RecoveredProjectionOrigin, open_runtime_principal_store_from_unsentinelled_projection,
+    };
+    for retiring in [false, true] {
+        for lock in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let home = AstridHome::from_path(root.path());
+            let store = fixture(&home).await;
+            if retiring {
+                transition_retiring_projection(&home, &store).unwrap();
+                std::fs::remove_dir_all(home.etc_dir()).unwrap();
+            } else {
+                store.pack_and_retire_runtime_projection(&home).unwrap();
+            }
+            drop(store);
+            if lock {
+                astrid_core::platform_fs::atomic_write_private_file(
+                    &home.root().join("run/system.lock"),
+                    b"",
+                )
+                .unwrap();
+            }
+            let (store, origin) = open_runtime_principal_store_from_unsentinelled_projection(
+                &home,
+                quota(),
+                PrincipalDirectory::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(origin, RecoveredProjectionOrigin::Existing);
+            assert_eq!(std::fs::read(home.config_path()).unwrap(), [7; 32]);
+            assert_eq!(std::fs::read(home.runtime_key_path()).unwrap(), [7; 32]);
+            assert_eq!(
+                active::read(&home, &store).unwrap().unwrap().phase(),
+                ReceiptPhase::Active
+            );
+        }
+    }
+}

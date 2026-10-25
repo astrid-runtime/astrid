@@ -15,16 +15,17 @@ async fn recovered_v2_layout_requires_its_complete_volume_owned_migration_ledger
         let root = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(root.path());
         let quota = interrupted_home(&home, case).await;
-        let admission = crate::home_admission::validate(&home).unwrap();
+        let admission = crate::home_admission::validate_boot(&home).unwrap();
         assert!(matches!(
             admission,
-            crate::home_admission::HomeAdmission::Retiring
+            crate::home_admission::HomeAdmission::Unsentinelled
         ));
         let result = admission
             .open_store(&home, quota, PrincipalDirectory::default())
             .await;
         if case == "complete" {
-            let reopened = result.unwrap();
+            let (reopened, origin) = result.unwrap();
+            assert!(matches!(origin, Some(LayoutOrigin::ExistingV2)));
             reject_incomplete_layout_v2(&home).unwrap();
             assert_eq!(
                 std::fs::read(home.keys_dir().join("runtime.key")).unwrap(),

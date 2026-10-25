@@ -472,6 +472,11 @@ where
     E: KvProjectionEngine<P> + 'static,
     R: KvPrincipalResolver<P>,
 {
+    /// Count the current validated projection, including committed overlay deltas.
+    pub(crate) fn entry_count_for_owner(&self, owner: &P) -> StorageResult<u64> {
+        Ok(self.blocking_store().header(owner.clone())?.entries)
+    }
+
     /// Atomically remove every visible KV entry owned by `owner`.
     ///
     /// This privileged lifecycle operation works from the authoritative tree

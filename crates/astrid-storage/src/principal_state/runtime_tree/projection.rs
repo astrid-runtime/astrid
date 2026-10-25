@@ -67,14 +67,18 @@ pub(super) fn surviving_directory(root: &Path, name: &str) -> bool {
         .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
 }
 
+pub(super) fn is_bootstrap_projection_name(name: &str) -> bool {
+    matches!(
+        name,
+        "etc/layout-version" | RUNTIME_KEY_PROJECTION | STAGING_JOURNAL_PROJECTION
+    )
+}
+
 pub(super) fn is_bootstrap_surviving_projection(scanned: &[RuntimeTreeEntry]) -> bool {
     !scanned.is_empty()
-        && scanned.iter().all(|entry| {
-            matches!(
-                entry.name().as_str(),
-                "etc/layout-version" | RUNTIME_KEY_PROJECTION | STAGING_JOURNAL_PROJECTION
-            )
-        })
+        && scanned
+            .iter()
+            .all(|entry| is_bootstrap_projection_name(entry.name().as_str()))
 }
 
 /// Pack-open materializes the staging journal before retirement can run.

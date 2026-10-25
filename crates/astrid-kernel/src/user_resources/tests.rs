@@ -173,7 +173,8 @@ async fn configured_cache_budget_reclaims_and_preserves_authoritative_reads() {
         "[resources]\ndecoded_object_cache_bytes = 1\nlocation_index_memory_bytes = 640",
     )
     .unwrap();
-    configure_object_cache(&store, &home, workspace.path(), &WorkspaceLayout::default()).unwrap();
+    let policy = load_policy(&home, workspace.path(), &WorkspaceLayout::default()).unwrap();
+    configure_object_cache(&store, &policy).unwrap();
     assert_eq!(store.object_cache_stats().resident_bytes, 0);
     assert_eq!(
         store
@@ -202,8 +203,17 @@ async fn index_budget_too_small_for_an_entry_fails_operator_configuration() {
         "[resources]\nlocation_index_memory_bytes = 1",
     )
     .unwrap();
-    let error =
-        configure_object_cache(&store, &home, workspace.path(), &WorkspaceLayout::default())
-            .unwrap_err();
+    let policy = load_policy(&home, workspace.path(), &WorkspaceLayout::default()).unwrap();
+    let error = configure_object_cache(&store, &policy).unwrap_err();
     assert!(error.to_string().contains("hold an entry"));
+}
+
+fn load_policy(
+    home: &AstridHome,
+    workspace: &std::path::Path,
+    layout: &WorkspaceLayout,
+) -> std::io::Result<astrid_config::resources::ResourceConfig> {
+    Ok(crate::boot_policy::load(home, workspace, layout)?
+        .config
+        .resources)
 }

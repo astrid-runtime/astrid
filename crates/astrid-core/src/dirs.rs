@@ -507,6 +507,13 @@ impl AstridHome {
         }
         let mut entries = self.root().read_dir()?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(std::fs::DirEntry::file_name);
+        // The singleton is acquired before opening storage. Its exact private
+        // runtime residue carries no durable authority and must survive retry.
+        if let Some(index) = entries.iter().position(|entry| entry.file_name() == "run")
+            && stopped_key::only_boot_singleton(self)?
+        {
+            entries.remove(index);
+        }
         if entries.len() == 1 && entries[0].file_name() == std::ffi::OsStr::new("keys") {
             self.validate_runtime_key_bootstrap(&entries[0].path())?;
             return Ok(UnsentinelledRootState::RuntimeKeyBootstrap);

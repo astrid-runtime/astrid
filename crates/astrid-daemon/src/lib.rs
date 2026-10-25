@@ -15,6 +15,9 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 
+#[cfg(unix)]
+mod admission_logging;
+
 /// Explicitly bound native secret responder; not enabled by default.
 pub mod native_input;
 
@@ -167,20 +170,6 @@ fn init_logging(log_config: &astrid_telemetry::LogConfig) {
     }
 }
 
-#[cfg(unix)]
-fn defer_file_logging_until_kernel_admission(
-    astrid_home: &astrid_core::dirs::AstridHome,
-    log_config: &astrid_telemetry::LogConfig,
-) -> Result<bool> {
-    Ok(
-        matches!(log_config.target, astrid_telemetry::LogTarget::File(_))
-            && astrid_home
-                .layout_version()
-                .context("failed to inspect Astrid home layout before logging")?
-                .is_none(),
-    )
-}
-
 /// Resolve the capsule host-call concurrency ceilings from CLI flags, the
 /// loaded config (which already folded in `ASTRID_CAPSULE_*` env), and the
 /// host-derived defaults. Precedence: CLI flag > config file > env > host.
@@ -276,74 +265,65 @@ async fn run_with_args(
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
     });
 
-    // Load the unified config once: it drives both logging and the capsule
-    // runtime concurrency ceilings below.
-    let unified_cfg = astrid_config::Config::load_with_home_and_layout(
-        Some(&workspace_root),
-        astrid_home.root(),
-        &workspace_layout,
-    )
-    .ok()
-    .map(|r| r.config);
-
-    let daemon_log_target = std::env::var_os(DAEMON_LOG_TARGET_ENV);
-    let log_config = daemon_log_config(
-        args.verbose,
-        unified_cfg.as_ref(),
-        &astrid_home,
-        daemon_log_target.as_deref(),
-    )?;
-    let defer_logging = defer_file_logging_until_kernel_admission(&astrid_home, &log_config)?;
-    if !defer_logging {
-        init_logging(&log_config);
-    }
-
     let session_id = astrid_core::SessionId::from_uuid(
         uuid::Uuid::parse_str(&args.session)
             .map_err(|e| anyhow::anyhow!("Invalid UUID format: {e}"))?,
     );
 
-    // Resolve the capsule host-call concurrency ceilings (CLI > config+env >
-    // host-derived default); the kernel forwards them to every `WasmEngine`.
-    // Done before `args.workspace` is consumed below.
-    let runtime_limits = resolve_capsule_limits(&args, unified_cfg.as_ref());
-
-    // Operator ceilings for the astrid:http host (global; absent `[http]`
-    // config = the host's historical constants). Forwarded to every capsule.
-    let http_limits = resolve_http_limits(unified_cfg.as_ref());
-    let kernel = astrid_kernel::Kernel::new_with_workspace_layout(
-        session_id.clone(),
-        workspace_root,
-        runtime_limits,
-        std::collections::HashMap::new(),
-        http_limits,
-        workspace_layout,
+    // Admit the captured root and restore its packed configuration before
+    // resolving immutable process policy. This stage owns the one store open.
+    let admitted = admission_logging::trace_admission(
+        args.verbose,
+        astrid_kernel::native_boot::AdmittedNativeBoot::admit(
+            astrid_home.clone(),
+            workspace_root,
+            workspace_layout,
+        ),
     )
     .await
-    .map_err(|e| anyhow::anyhow!("Failed to boot Kernel: {e}"))?;
+    .map_err(|error| anyhow::anyhow!("Failed to admit Kernel boot: {error}"))?;
+    let admitted_config = admitted.config();
+    let daemon_log_target = std::env::var_os(DAEMON_LOG_TARGET_ENV);
+    let log_config = daemon_log_config(
+        args.verbose,
+        Some(&admitted_config.config),
+        &astrid_home,
+        daemon_log_target.as_deref(),
+    )?;
+    init_logging(&log_config);
 
-    // Local egress is security policy at durable-root authority, so read it
-    // only after admission and bind it once before any capsule can load.
-    let admitted_config = astrid_config::Config::load_with_home_and_layout(
-        Some(&kernel.workspace_root),
-        astrid_home.root(),
-        kernel.workspace_layout(),
-    )
-    .map_err(|error| anyhow::anyhow!("Failed to load admitted-home boot policy: {error:#}"))?;
+    // CLI overrides are resolved against this exact restored snapshot; the
+    // kernel stores the final limits immutably before any capsule can load.
+    let runtime_limits = resolve_capsule_limits(&args, Some(&admitted_config.config));
+    let http_limits = resolve_http_limits(Some(&admitted_config.config));
+    tracing::debug!(
+        blocking_concurrency = runtime_limits.blocking_concurrency,
+        io_concurrency = runtime_limits.io_concurrency,
+        instance_pool_size = runtime_limits.instance_pool_size,
+        http_timeout_secs = http_limits.default_total_timeout.as_secs(),
+        "Resolved admitted boot limits"
+    );
+    let kernel = admitted
+        .start(
+            session_id.clone(),
+            runtime_limits,
+            std::collections::HashMap::new(),
+            http_limits,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("Failed to boot Kernel: {error}"))?;
+
     let private_inputs = native_input::configure(&kernel, &admitted_config.config)?;
     kernel
-        .bind_boot_local_egress(admitted_config.config.security.capsule_local_egress)
+        .bind_boot_local_egress(admitted_config.config.security.capsule_local_egress.clone())
         .map_err(|error| anyhow::anyhow!("Failed to bind boot policy: {error}"))?;
 
-    if defer_logging {
-        init_logging(&log_config);
-    }
     kernel
         .set_system_capsules(
-            unified_cfg
-                .as_ref()
-                .into_iter()
-                .flat_map(|config| config.uplinks.iter())
+            admitted_config
+                .config
+                .uplinks
+                .iter()
                 .map(|uplink| uplink.plugin.clone()),
         )
         .await;
@@ -416,7 +396,8 @@ async fn run_with_args(
     write_readiness_then_arm_ephemeral(
         args.ephemeral,
         || {
-            astrid_kernel::socket::write_readiness_file_for_workspace(
+            astrid_kernel::socket::write_readiness_file_for_home(
+                &astrid_home,
                 &kernel.workspace_root,
                 kernel.workspace_layout(),
             )
@@ -624,10 +605,7 @@ fn spawn_gateway(
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{
-        DAEMON_LOG_TARGET_ENV, daemon_log_config, defer_file_logging_until_kernel_admission,
-        write_readiness_then_arm_ephemeral,
-    };
+    use super::{DAEMON_LOG_TARGET_ENV, daemon_log_config, write_readiness_then_arm_ephemeral};
     use std::sync::Mutex;
 
     #[test]
@@ -685,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_home_defers_file_logging_until_kernel_admission() {
+    fn log_selection_does_not_materialize_unadmitted_home() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock after Unix epoch")
@@ -701,14 +679,11 @@ mod tests {
             daemon_log_config(false, None, &home, Some(std::ffi::OsStr::new("stderr")))
                 .expect("stderr config");
 
-        assert!(
-            defer_file_logging_until_kernel_admission(&home, &file_config)
-                .expect("fresh layout inspection")
+        assert_eq!(
+            file_config.target,
+            astrid_telemetry::LogTarget::File(home.log_dir())
         );
-        assert!(
-            !defer_file_logging_until_kernel_admission(&home, &stderr_config)
-                .expect("fresh layout inspection")
-        );
+        assert_eq!(stderr_config.target, astrid_telemetry::LogTarget::Stderr);
         assert!(
             !root.exists(),
             "logging selection must not create content before kernel admission"

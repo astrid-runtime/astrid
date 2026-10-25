@@ -373,6 +373,12 @@ fn non_volume_stopped_sidecars_fail_closed() {
         .unwrap();
         let sidecar = home.root().join(relative);
         std::fs::create_dir_all(&sidecar).unwrap();
+        if relative == "run" {
+            // A private empty runtime directory or singleton is bootstrap
+            // residue. Other runtime state remains an unadmitted sidecar.
+            crate::platform_fs::ensure_private_directory(&sidecar).unwrap();
+            std::fs::write(sidecar.join("foreign"), b"unadmitted").unwrap();
+        }
 
         let error = home.ensure().unwrap_err();
 

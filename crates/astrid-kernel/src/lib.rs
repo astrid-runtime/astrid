@@ -29,6 +29,8 @@ mod audit_retention;
 mod audit_retirement_tests;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod audit_sink;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod boot_policy;
 /// Passive event-bus storm diagnostics (publish-rate monitor).
 mod bus_monitor;
 #[cfg(test)]
@@ -76,6 +78,9 @@ pub mod kernel_router;
 mod kernel_shutdown_tests;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod legacy_migration_barrier;
+/// Native resource admission and immutable configuration before kernel wiring.
+#[cfg(unix)]
+pub mod native_boot;
 mod native_input;
 mod runtime_work;
 mod shutdown;
@@ -358,6 +363,8 @@ pub struct Kernel {
     /// `Copy` value — no resolution logic lives here. See
     /// [`CapsuleRuntimeLimits`](astrid_capsule_types::CapsuleRuntimeLimits).
     runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits,
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    management_rate_limits: astrid_config::types::RateLimitsConfig,
     /// Operator-approved per-capsule local-egress boot allowlist
     /// (`[security.capsule_local_egress]`), keyed by capsule id. Resolved
     /// once after durable-root admission; the kernel only stores it and hands
@@ -537,6 +544,8 @@ pub struct KernelResources {
     /// host-home migration lifecycle.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) layout_origin: Option<legacy_migration_barrier::LayoutOrigin>,
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    boot_config: Option<Arc<astrid_config::ResolvedConfig>>,
 }
 
 impl KernelResources {
@@ -564,6 +573,8 @@ impl KernelResources {
             singleton_lock,
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             layout_origin: None,
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            boot_config: None,
         }
     }
 
@@ -774,147 +785,15 @@ impl Kernel {
         http_limits: astrid_capsule_types::HttpLimits,
         workspace_layout: WorkspaceLayout,
     ) -> Result<Arc<Self>, std::io::Error> {
-        use astrid_core::dirs::AstridHome;
-
-        // Resolve the Astrid home directory. Required for persistent KV store
-        // and audit log. Fails boot if neither $ASTRID_HOME nor $HOME is set.
-        let home = AstridHome::resolve().map_err(|e| {
+        let home = astrid_core::dirs::AstridHome::resolve().map_err(|error| {
             std::io::Error::other(format!(
-                "Failed to resolve Astrid home (set $ASTRID_HOME or $HOME): {e}"
+                "Failed to resolve Astrid home (set $ASTRID_HOME or $HOME): {error}"
             ))
         })?;
-        let layout_origin = legacy_migration_barrier::capture_layout_origin(&home)?;
-        // A layout-two sentinel is only authoritative together with the
-        // component migration ledger.  Check this before `AstridHome::ensure`
-        // can retire any released source on behalf of an incomplete cutover.
-        legacy_migration_barrier::reject_incomplete_layout_v2(&home)?;
-        let home_admission = home_admission::validate(&home)?;
-
-        // Acquire the singleton advisory lock as the FIRST fallible boot step —
-        // BEFORE opening any shared state store. A boot-race loser then fails
-        // here with the actionable "already running (singleton lock held)"
-        // error and never opens (or even touches) the shared principal or audit
-        // stores, rather than dying on a raw `LOCK is already locked` from
-        // the store layer after having opened one. The listener bind below does
-        // NOT re-acquire the lock — it is already held for the process lifetime.
-        let singleton_lock = socket::acquire_boot_singleton_lock(&home)?;
-        if home.layout_version()?.as_deref() == Some(astrid_core::dirs::LEGACY_LAYOUT_VERSION) {
-            let migration_target =
-                astrid_core::dirs::LayoutMigrationTarget::for_current_executable(
-                    astrid_storage::RUNTIME_STORE_FORMAT_ID,
-                )?;
-            home.begin_layout_v2_migration(&migration_target)?;
-        }
-
-        // Resolve quota policy before opening state so the durable adapter and
-        // capsule engine share exactly one invalidatable profile cache.
-        let profile_cache = Arc::new(PrincipalProfileCache::with_home(home.clone()));
-        let principal_directory = astrid_storage::PrincipalDirectory::default();
-        let quota_cache = Arc::clone(&profile_cache);
-        let quota_principals = principal_directory.clone();
-        let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
-            Arc::new(move |owner: &astrid_storage::StateOwner| {
-                match owner {
-                    astrid_storage::StateOwner::System => Ok(None),
-                    astrid_storage::StateOwner::Principal(owner) => {
-                        quota_principals.alias_for(*owner).and_then(|principal| {
-                            quota_cache
-                                .resolve(&principal)
-                                .map(|profile| Some(profile.quotas.max_storage_bytes))
-                                .map_err(|error| {
-                                    astrid_storage::StorageError::Internal(format!(
-                                        "resolve storage quota for {principal}: {error}"
-                                    ))
-                                })
-                        })
-                    },
-                    // A fleet is a real writable owner. Until the allocation-policy
-                    // capsule admits a tighter fleet budget, retain the same hard
-                    // storage ceiling used by an unconfigured principal. Accounting
-                    // and enforcement remain in the kernel; policy does not run in
-                    // the storage transaction.
-                    astrid_storage::StateOwner::Fleet(_) => {
-                        Ok(Some(astrid_core::profile::DEFAULT_MAX_STORAGE_BYTES))
-                    },
-                }
-            });
-
-        // Open the authoritative state store. First cutover imports and
-        // verifies legacy SurrealKV under the singleton lock before serving.
-        let principal_store = home_admission
-            .open_store(&home, quota, principal_directory.clone())
+        native_boot::AdmittedNativeBoot::admit(home, workspace_root, workspace_layout)
+            .await?
+            .start(session_id, runtime_limits, local_egress, http_limits)
             .await
-            .map_err(|e| std::io::Error::other(format!("Failed to open principal store: {e}")))?;
-        home.clear_runtime_principal_scratch().map_err(|error| {
-            std::io::Error::other(format!(
-                "Failed to clear stale principal runtime scratch: {error}"
-            ))
-        })?;
-        let kv = principal_store.kv();
-        // TODO: clear ephemeral keys (e: prefix) on boot when the key
-        // lifecycle tier convention is established.
-
-        // Load the runtime signing key ONCE and share it (issue #929): the
-        // audit log signs chain entries with it, and the admin token-mint path
-        // signs capability tokens with the same key. Never load it from disk
-        // twice — a second load would still yield the same persisted bytes, but
-        // routing one `Arc` makes the single-source-of-truth explicit and lets
-        // `kernel.runtime_key` mint tokens the approval interceptor's validator
-        // trusts as issuer.
-        let runtime_key = Arc::new(load_or_generate_runtime_key(&home.keys_dir())?);
-        let audit_store = principal_store
-            .system_control_kv("audit")
-            .map_err(|e| std::io::Error::other(format!("Failed to open audit projection: {e}")))?
-            .backend();
-        let audit_log = open_audit_log(
-            &home,
-            audit_store,
-            &principal_store,
-            Arc::clone(&runtime_key),
-        )
-        .await?;
-
-        // Bind the secure Unix socket (the singleton lock is already held). The
-        // socket is bound here, but not yet listened on. The token is generated
-        // before any capsule can accept connections, preventing a race where a
-        // client connects before the token file exists.
-        let listener = socket::bind_listener(&home)?;
-        // Record our PID immediately after acquiring the singleton lock, so the
-        // PID on disk always belongs to the process that holds the state-db
-        // lock. The CLI reads this to signal a wedged daemon that is no longer
-        // reachable over the socket but still holding the lock (which would
-        // otherwise wedge the next `astrid start`). Best-effort: a write
-        // failure only degrades `stop`/`restart` to socket-only cleanup.
-        if let Err(e) = socket::write_pid_file() {
-            tracing::warn!(error = %e, "Failed to write daemon PID file; stop/restart will fall back to socket-only cleanup");
-        }
-        let (session_token, token_path) = socket::generate_session_token()?;
-
-        let resources = KernelResources::new(
-            home,
-            kv,
-            audit_log,
-            runtime_key,
-            Arc::new(session_token),
-            token_path,
-            Some(Arc::new(tokio::sync::Mutex::new(listener))),
-            Some(singleton_lock),
-        )
-        .with_layout_origin(layout_origin);
-
-        Self::with_resources_and_workspace_layout_with_profile_cache_and_directory(
-            session_id,
-            workspace_root,
-            runtime_limits,
-            local_egress,
-            http_limits,
-            resources,
-            workspace_layout,
-            Some(profile_cache),
-            principal_directory,
-            Some(principal_store),
-        )
-        .await
     }
 
     /// Construct a Kernel from already-acquired host resources.
@@ -1098,6 +977,8 @@ impl Kernel {
             singleton_lock,
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             layout_origin,
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            boot_config,
         } = resources;
         #[cfg(not(unix))]
         let _ = token_path;
@@ -1112,6 +993,16 @@ impl Kernel {
             std::io::Error::new(error.kind(), format!("unsafe workspace selection: {error}"))
         })?;
         let workspace_root = workspace_selection.project_root().to_path_buf();
+
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let boot_config = match boot_config {
+            Some(config) => config,
+            None => Arc::new(boot_policy::load(
+                &home,
+                &workspace_root,
+                &workspace_layout,
+            )?),
+        };
 
         let event_bus = Arc::new(EventBus::new());
         let capsules = Arc::new(RwLock::new(CapsuleRegistry::new()));
@@ -1276,12 +1167,7 @@ impl Kernel {
             // on the audit log it injects (`AuditLog::enable_entry_v2`).
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             {
-                let entry_format = astrid_config::Config::load_with_layout(
-                    Some(&workspace_root),
-                    &workspace_layout,
-                )
-                .map(|resolved| resolved.config.audit.entry_format)
-                .map_err(|error| error.to_string());
+                let entry_format = Ok(boot_config.config.audit.entry_format);
                 audit_keys::apply_entry_format(
                     &audit_log,
                     &home.keys_dir(),
@@ -1318,7 +1204,7 @@ impl Kernel {
             })?;
 
             // Apply pre-configured identity links from config.
-            apply_identity_config(&identity_store, &workspace_root, &workspace_layout).await;
+            apply_identity_config(&identity_store, &boot_config.config.identity.links).await;
 
             // Import ordinary user files from the released principal-home
             // tree before the layout receipt allows the daemon to serve the
@@ -1371,12 +1257,11 @@ impl Kernel {
         }
 
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let audit_config =
-            crate::audit_retention::load_audit_config(&workspace_root, &workspace_layout);
+        let audit_config = &boot_config.config.audit;
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         crate::audit_retention::apply_retention_config(&audit_log, &audit_config.retention);
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let host_audit_policy = crate::audit_sink::HostAuditPolicy::from(&audit_config);
+        let host_audit_policy = crate::audit_sink::HostAuditPolicy::from(audit_config);
         // The host-audit lane keeps its marker (which lane run is open, and
         // which chains it wrote to) beside the audit projection, so a run
         // that stops without draining leaves a signed gap entry at the next
@@ -1400,18 +1285,11 @@ impl Kernel {
         let user_cpu = user_resources::load(
             Arc::clone(&ownership_store),
             principal_directory.clone(),
-            &home,
-            &workspace_root,
-            &workspace_layout,
-        )?;
+            &boot_config.config.resources,
+        );
         #[cfg(not(target_family = "wasm"))]
         if let Some(store) = principal_store.as_ref() {
-            user_resources::configure_object_cache(
-                store,
-                &home,
-                &workspace_root,
-                &workspace_layout,
-            )?;
+            user_resources::configure_object_cache(store, &boot_config.config.resources)?;
         }
         let kernel = Arc::new(Self {
             session_id: session_id.clone(),
@@ -1463,6 +1341,8 @@ impl Kernel {
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             compiled_wasm: astrid_capsule::engine::wasm::CompiledWasmCache::default(),
             runtime_limits,
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            management_rate_limits: boot_config.config.rate_limits.clone(),
             local_egress: std::sync::RwLock::new(None),
             #[cfg(not(target_family = "wasm"))]
             native_secret_inputs: OnceLock::new(),
@@ -3677,6 +3557,10 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         compiled_wasm: astrid_capsule::engine::wasm::CompiledWasmCache::default(),
         runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits::default(),
+        management_rate_limits: boot_policy::load(&home, home.root(), &WorkspaceLayout::default())
+            .expect("test kernel: admitted boot config")
+            .config
+            .rate_limits,
         local_egress: std::sync::RwLock::new(None),
         #[cfg(not(target_family = "wasm"))]
         native_secret_inputs: OnceLock::new(),
@@ -5338,19 +5222,9 @@ fn mint_default_principal_keypair(
 /// but does not abort boot.
 async fn apply_identity_config(
     store: &Arc<dyn astrid_storage::IdentityStore>,
-    workspace_root: &std::path::Path,
-    workspace_layout: &WorkspaceLayout,
+    links: &[astrid_config::types::IdentityLinkConfig],
 ) {
-    let config =
-        match astrid_config::Config::load_with_layout(Some(workspace_root), workspace_layout) {
-            Ok(resolved) => resolved.config,
-            Err(e) => {
-                tracing::debug!(error = %e, "No config loaded for identity links");
-                return;
-            },
-        };
-
-    for link_cfg in &config.identity.links {
+    for link_cfg in links {
         let result = apply_single_identity_link(store, link_cfg).await;
         if let Err(e) = result {
             tracing::warn!(
