@@ -1,6 +1,7 @@
 //! Factory and routing logic for instantiating Composite Capsules.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::capsule::{Capsule, CompositeCapsule};
 use crate::engine::wasm::limits::{CapsuleRuntimeLimits, HttpLimits};
@@ -117,13 +118,14 @@ impl CapsuleLoader {
         manifest: CapsuleManifest,
         capsule_dir: PathBuf,
     ) -> CapsuleResult<Box<dyn Capsule>> {
-        let mut composite = CompositeCapsule::new(manifest.clone())?;
+        let manifest = Arc::new(manifest);
+        let mut composite = CompositeCapsule::new(Arc::clone(&manifest))?;
 
         // 1. WASM Component Engine
         if !manifest.components.is_empty() {
             composite.add_engine(Box::new(
-                crate::engine::WasmEngine::new(
-                    manifest.clone(),
+                crate::engine::WasmEngine::new_shared(
+                    Arc::clone(&manifest),
                     capsule_dir.clone(),
                     self.fuel_ledger.clone(),
                     self.fuel_rate.clone(),
@@ -143,8 +145,8 @@ impl CapsuleLoader {
             // a host process breakout.
             if server.server_type.as_deref() == Some("stdio") {
                 composite.add_engine(Box::new(
-                    crate::engine::McpHostEngine::new(
-                        manifest.clone(),
+                    crate::engine::McpHostEngine::new_shared(
+                        Arc::clone(&manifest),
                         server.clone(),
                         capsule_dir.clone(),
                         self.mcp_client.clone(),
@@ -156,10 +158,7 @@ impl CapsuleLoader {
         // 3. Static Context Engine
         // Always added. Handles injecting context files and static commands
         // directly into the OS memory without booting any VMs or processes.
-        composite.add_engine(Box::new(crate::engine::StaticEngine::new(
-            manifest.clone(),
-            capsule_dir.clone(),
-        )));
+        composite.add_engine(Box::new(crate::engine::StaticEngine));
 
         composite.set_source_dir(capsule_dir);
 

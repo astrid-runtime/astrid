@@ -2,6 +2,7 @@
 //! declared manifest capabilities.
 
 use async_trait::async_trait;
+use std::sync::Arc;
 
 use super::{CapsuleSecurityGate, IdentityOperation, identity_capability_satisfies};
 use crate::manifest::CapsuleManifest;
@@ -21,7 +22,7 @@ pub(crate) struct ManifestSecurityGate {
     /// at runtime as-is. `fs_read` / `fs_write` are **not** used at runtime —
     /// their scheme-aware split lives in `resolved_static_*` and
     /// `home_suffixes_*`.
-    manifest: CapsuleManifest,
+    manifest: Arc<CapsuleManifest>,
     /// Non-`home://` fs_read patterns, fully resolved at construction time.
     /// Includes `cwd://`-resolved paths, wildcard `"*"`, and literal paths.
     resolved_static_read: Vec<String>,
@@ -52,10 +53,11 @@ pub(crate) struct ManifestSecurityGate {
 
 impl ManifestSecurityGate {
     pub(crate) fn new(
-        manifest: CapsuleManifest,
+        manifest: impl Into<Arc<CapsuleManifest>>,
         workspace_root: std::path::PathBuf,
         home_root: Option<std::path::PathBuf>,
     ) -> Self {
+        let manifest = manifest.into();
         // Canonicalize roots once up front. Both `partition_schemes` (for prefix
         // strings) and `workspace_root_path` (for wildcard confinement) use
         // the same canonical values, avoiding redundant syscalls.

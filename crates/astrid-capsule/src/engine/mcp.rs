@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -37,7 +38,7 @@ pub(super) fn runtime_server_id(
 /// calls use the bare inner `McpClient` with `AuthorizationProof::System`
 /// semantics - they are kernel infrastructure, not user-facing tool calls.
 pub struct McpHostEngine {
-    manifest: CapsuleManifest,
+    manifest: Arc<CapsuleManifest>,
     server_def: McpServerDef,
     capsule_dir: PathBuf,
     mcp_client: SecureMcpClient,
@@ -54,6 +55,15 @@ impl McpHostEngine {
     /// Create a new MCP host engine.
     pub fn new(
         manifest: CapsuleManifest,
+        server_def: McpServerDef,
+        capsule_dir: PathBuf,
+        mcp_client: SecureMcpClient,
+    ) -> Self {
+        Self::new_shared(Arc::new(manifest), server_def, capsule_dir, mcp_client)
+    }
+
+    pub(crate) fn new_shared(
+        manifest: Arc<CapsuleManifest>,
         server_def: McpServerDef,
         capsule_dir: PathBuf,
         mcp_client: SecureMcpClient,
