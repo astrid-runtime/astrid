@@ -1,7 +1,5 @@
 //! Private bulk construction; no lookup can observe provisional duplicate counts.
-use super::{
-    ArenaLocation, Builder, DurableError, LocatorValue, NonZeroUsize, ObjectId, PagedLocations,
-};
+use super::{ArenaLocation, DurableError, LocatorValue, NonZeroUsize, ObjectId, PagedLocations};
 use crate::engine::durable::locations::ClosureProof;
 
 pub(in crate::engine::durable) struct RebuildLocations {
@@ -63,28 +61,7 @@ impl RebuildLocations {
                 .count();
             return Ok((self.locations, complete));
         }
-        let mut builder = Builder::new()?;
-        let mut complete = 0_usize;
-        for entry in self.locations.rows_checked(Some(&mut self.check)) {
-            let (id, row) = entry?;
-            complete = complete
-                .checked_add(usize::from(row.proof == ClosureProof::Complete))
-                .ok_or(DurableError::EncodingOverflow)?;
-            builder.push_row(id, row)?;
-        }
-        let mut locations = PagedLocations::new(self.locations.limit);
-        if let Some(run) = builder.finish()? {
-            locations.count = run.count;
-            let mut capacity = locations.limit.get();
-            let mut level = 0_usize;
-            while capacity < run.count {
-                capacity = capacity.saturating_mul(2);
-                level = level.checked_add(1).ok_or(DurableError::EncodingOverflow)?;
-            }
-            locations.runs.resize_with(level.strict_add(1), || None);
-            locations.runs[level] = Some(run);
-        }
-        Ok((locations, complete))
+        self.locations.merged_runs(Some(&mut self.check))
     }
 
     fn require_healthy(&self) -> Result<(), DurableError> {

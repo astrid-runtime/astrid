@@ -55,8 +55,34 @@ pub(super) struct ColdMemoNodes<'a> {
 
 impl ColdNodes {
     #[cfg(test)]
+    pub(super) fn truncate_oldest_test_run(&self) {
+        self.0.lock().locations.truncate_oldest_test_run();
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_spilled_run_count(&self) -> usize {
+        self.0.lock().locations.test_spilled_run_count()
+    }
+
+    #[cfg(test)]
     pub(super) fn truncate_test_run(&self) {
         self.0.lock().locations.truncate_test_run();
+    }
+
+    /// Consolidate only process-local lookup machinery; durable authority stays
+    /// untouched and checkpoint recovery independently verifies its replacement.
+    pub(super) fn prepare_checkpoint_walk(&self) -> Result<(), DurableError> {
+        let mut arena = self.0.lock();
+        if arena.failed {
+            return Err(DurableError::InvalidRepresentationState(
+                "cannot checkpoint failed physical node arena",
+            ));
+        }
+        let result = arena.locations.consolidate();
+        if result.is_err() {
+            arena.failed = true;
+        }
+        result
     }
 
     pub(super) fn memoized_nodes(&self) -> ColdMemoNodes<'_> {
