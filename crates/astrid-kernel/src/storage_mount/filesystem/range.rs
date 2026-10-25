@@ -106,7 +106,12 @@ mod tests {
         let store = kernel.principal_store.clone().unwrap();
         let fs = AstridFilesystem::new(
             store.content(),
-            StateOwner::Principal(astrid_core::PrincipalUid::from_bytes([0xB9; 32])),
+            StateOwner::Principal(
+                kernel
+                    .principal_directory
+                    .uid_for(&astrid_core::PrincipalId::default())
+                    .unwrap(),
+            ),
         );
         let path = FilesystemPath::new("gap.bin").unwrap();
         fs.write(&path, b"seed").unwrap();
@@ -152,7 +157,12 @@ mod tests {
         let store = kernel.principal_store.clone().unwrap();
         let fs = AstridFilesystem::new(
             store.content(),
-            StateOwner::Principal(astrid_core::PrincipalUid::from_bytes([0xB8; 32])),
+            StateOwner::Principal(
+                kernel
+                    .principal_directory
+                    .uid_for(&astrid_core::PrincipalId::default())
+                    .unwrap(),
+            ),
         );
         let path = FilesystemPath::new("large.bin").unwrap();
         fs.write(&path, b"seed").unwrap();
