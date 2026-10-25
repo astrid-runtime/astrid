@@ -153,3 +153,53 @@ fn checkpoint_preparation_consolidates_historical_locators_and_keeps_fresh_body_
     assert!(nodes.failed());
     assert!(nodes.prepare_checkpoint_walk().is_err());
 }
+
+#[test]
+fn memoized_put_validates_existing_bodies_again_and_fences_corruption() {
+    let (file, map, nodes) = fixture();
+    let mut provider = nodes.memoized_nodes();
+    let root = map.root().unwrap();
+    let node = map.nodes()[&root].clone();
+    provider.put(root, node.clone()).unwrap();
+    file.set_len(0).unwrap();
+    assert!(provider.put(root, node).is_err());
+    assert!(
+        nodes.failed(),
+        "a cached locator must not hide changed node bytes"
+    );
+    assert_eq!(nodes.staging_capacity_bytes(), 0);
+}
+
+#[test]
+fn memoized_put_rebinds_after_promotions_and_never_turns_corruption_into_absence() {
+    let (file, map, nodes) = fixture();
+    let mut provider = nodes.memoized_nodes();
+    let root = map.root().unwrap();
+    provider.put(root, map.nodes()[&root].clone()).unwrap();
+    for ordinal in 0_u16..63 {
+        let node = PhysicalMapNode::leaf(
+            PhysicalMapDomain::Representation,
+            PhysicalMapKey::new(*blake3::hash(&ordinal.to_be_bytes()).as_bytes()),
+            vec![9; 16],
+        );
+        let id = node.identify(&Blake3PhysicalIdentity).unwrap();
+        let payload = MetadataFrame::map_node(&Blake3PhysicalIdentity, &node)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let location =
+            append_frame(&mut file.try_clone().unwrap(), METADATA_MAGIC, &payload).unwrap();
+        nodes.promote(id, location).unwrap();
+    }
+    provider.put(root, map.nodes()[&root].clone()).unwrap();
+    nodes.truncate_test_run();
+    let prospective = PhysicalMapNode::leaf(
+        PhysicalMapDomain::Representation,
+        PhysicalMapKey::new([0xff; 32]),
+        vec![5; 32],
+    );
+    let id = prospective.identify(&Blake3PhysicalIdentity).unwrap();
+    assert!(provider.put(id, prospective).is_err());
+    assert!(nodes.failed());
+    assert_eq!(nodes.staging_capacity_bytes(), 0);
+}
