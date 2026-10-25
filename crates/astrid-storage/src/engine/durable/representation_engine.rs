@@ -181,16 +181,11 @@ where
                 "active direct profile specification is not a persisted bootstrap object",
             ));
         }
-        let mut missing = Vec::new();
-        {
-            let mut records = representations.direct_records();
-            for entry in inner.index.locations() {
-                let (object, location) = entry?;
-                if !excluded.contains(&object) && records.record(object)?.is_none() {
-                    missing.push((object, location));
-                }
-            }
-        }
+        let missing = representations.missing_direct_records(
+            &inner.index,
+            excluded,
+            *self.index_memory.read(),
+        )?;
         if missing.is_empty() {
             return Ok(representations.active());
         }
