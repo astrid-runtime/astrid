@@ -690,7 +690,7 @@ where
         let index_state = IndexState {
             arena_len: replacement.arena_len,
             arena_tail: replacement.arena_tail,
-            objects: replacement.index.clone(),
+            objects: &replacement.index,
         };
         let index_cache = replace_index(
             self.hosted_directory()?,
