@@ -28,6 +28,23 @@ pub(crate) fn record_cleanup(name: &str) {
     }
 }
 
+async fn wait_until_loaded(barrier: &LoadBarrier, waiter: &mut tokio::task::JoinHandle<bool>) {
+    let loaded = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            () = barrier.loaded.notified() => {},
+            outcome = &mut *waiter => {
+                panic!("readiness finished before the capsule load barrier: {outcome:?}");
+            }
+        }
+    })
+    .await;
+    assert!(
+        loaded.is_ok(),
+        "capsule load barrier timed out; readiness waiter finished: {}",
+        waiter.is_finished()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disconnected_native_waiter_cannot_cancel_a_loaded_runtime_before_cleanup() {
     let root = tempfile::tempdir().unwrap();
@@ -86,14 +103,12 @@ file = "main.wasm"
     let barrier = BARRIER.get().unwrap();
     assert_eq!(kernel.sorted_principal_capsules(&principal).len(), 1);
     let probe = kernel.capsule_ingress_readiness();
-    let waiter = tokio::spawn(async move {
+    let mut waiter = tokio::spawn(async move {
         probe
             .ensure_subscribed("\0astrid.scoped-topic\0default\0cli.v1.command.run.fixture")
             .await
     });
-    tokio::time::timeout(Duration::from_secs(10), barrier.loaded.notified())
-        .await
-        .unwrap();
+    wait_until_loaded(barrier, &mut waiter).await;
     waiter.abort();
     assert!(waiter.await.unwrap_err().is_cancelled());
     let mut close = Box::pin(kernel.runtime_work.close());
