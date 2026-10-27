@@ -353,7 +353,9 @@ where
     /// This narrow path exists for store-level bootstrap evidence referenced
     /// by `store.meta`, such as the in-band format specification. The object
     /// must not own another object; graph publication remains a root
-    /// transaction. Successful insertion flushes the arena before returning.
+    /// transaction. Successful insertion flushes the arena and, on a hosted
+    /// volume, crosses the container durability fence before returning. Equal
+    /// already-present retries that write no bytes skip that fence.
     ///
     /// # Errors
     ///
@@ -424,6 +426,7 @@ where
                     return Err(error);
                 },
             }
+            self.finish_standalone_publication(inner)?;
         }
         Ok((id, InsertOutcome::AlreadyPresent))
     }
@@ -481,7 +484,19 @@ where
             self.mark_requires_recovery(inner);
             return Err(error);
         }
+        self.finish_standalone_publication(inner)?;
         Ok((id, InsertOutcome::Inserted))
+    }
+
+    fn finish_standalone_publication(
+        &self,
+        inner: &mut DurableInner<P>,
+    ) -> Result<(), DurableError> {
+        if let Err(error) = self.sync_volume() {
+            self.mark_requires_recovery(inner);
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(super) fn flush_standalone(
