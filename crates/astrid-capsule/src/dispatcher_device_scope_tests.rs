@@ -240,7 +240,7 @@ async fn cancelled_admission_does_not_prompt_for_an_unpublished_invocation() {
         Arc::new(crate::dispatcher::admission::Admitter {
             registry,
             event_bus: Arc::downgrade(&bus),
-            queues: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            queues: Arc::default(),
             chain_locks: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             access_resolver: Some(fixture.resolver),
             waits: crate::dispatcher::wait_graph::WaitGraph::default(),

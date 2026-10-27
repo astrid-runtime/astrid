@@ -199,6 +199,19 @@ async fn reject_admin_request_without_caller(
     error: CallerResolutionError,
 ) {
     let caller = PrincipalId::anonymous();
+    let Some(_work) = kernel.runtime_work.admit() else {
+        publish_response(
+            kernel,
+            response_topic,
+            caller.as_str(),
+            device_key_id.as_deref(),
+            AdminKernelResponse::for_request(
+                req.request_id,
+                AdminResponseBody::Error("runtime is shutting down".into()),
+            ),
+        );
+        return;
+    };
     let method = admin_request_method(&req.kind);
     let required_cap =
         required_capability_for_admin_request(&req.kind, resolve_admin_scope(&req.kind, &caller));
@@ -836,6 +849,19 @@ async fn handle_admin_request(
 ) {
     let response_topic = admin_response_topic(&topic);
     let request_id = req.request_id.clone();
+    let Some(_work) = kernel.runtime_work.admit() else {
+        publish_response(
+            kernel,
+            response_topic,
+            caller.as_str(),
+            device_key_id.as_deref(),
+            AdminKernelResponse::for_request(
+                request_id,
+                AdminResponseBody::Error("runtime is shutting down".to_owned()),
+            ),
+        );
+        return;
+    };
     if matches!(
         req.kind,
         AdminRequestKind::InviteRedeem { .. } | AdminRequestKind::PairDeviceRedeem { .. }

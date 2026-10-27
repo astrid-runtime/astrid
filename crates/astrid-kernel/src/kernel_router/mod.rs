@@ -186,6 +186,16 @@ async fn handle_request(
     req: KernelRequest,
 ) {
     let response_topic = response_topic_for(&topic);
+    let Some(_work) = kernel.runtime_work.admit() else {
+        publish_response(
+            kernel,
+            response_topic,
+            caller.as_str(),
+            device_key_id.as_deref(),
+            KernelResponse::Error("runtime is shutting down".to_owned()),
+        );
+        return;
+    };
 
     // Capability enforcement preamble (issue #670). Resolve the caller's
     // profile, compute the required capability for this request, and

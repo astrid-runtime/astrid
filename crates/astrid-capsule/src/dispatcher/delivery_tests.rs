@@ -56,10 +56,10 @@ async fn verify_retired_reservation(wait_for_capacity: bool) {
             })
             .unwrap();
     }
-    let queues = Arc::new(parking_lot::Mutex::new(HashMap::from([(
-        (runtime, Some("default".to_owned())),
-        sender,
-    )])));
+    let queues: CapsuleQueues = Arc::default();
+    queues
+        .lock()
+        .insert((runtime, Some("default".to_owned())), sender);
     let bus = Arc::new(EventBus::new());
     let admitter: Arc<dyn astrid_events::EventDeliveryAdmitter> = Arc::new(admission::Admitter {
         registry: Arc::new(RwLock::new(registry)),
@@ -214,7 +214,7 @@ async fn shared_fallback_queues_detect_cross_principal_wait_cycles() {
             registry.source_id_for(&principal, &id).unwrap(),
         ));
     }
-    let queues = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let queues: CapsuleQueues = Arc::default();
     let mut receivers = Vec::new();
     for (runtime_id, _) in &identities {
         let (sender, receiver) = mpsc::channel(1);
@@ -587,4 +587,45 @@ async fn burst_preserves_every_payload_and_terminal_event() {
         actual.last() == expected.last(),
     );
     assert_eq!(actual, expected, "stream payloads must remain ordered");
+}
+
+#[tokio::test]
+async fn global_stop_fences_fifo_and_priority_chain_publication() {
+    for chain in [false, true] {
+        let mut registry = CapsuleRegistry::new();
+        for (name, priority) in [("first", 10), ("second", if chain { 20 } else { 10 })] {
+            let (capsule, _) =
+                MockCapsule::with_priority(name, "llm.v1.stream.test-provider", priority, None);
+            register_system_test_capsule(&mut registry, Box::new(capsule));
+        }
+        let bus = Arc::new(EventBus::new());
+        let queues: CapsuleQueues = Arc::default();
+        let control = queues::DispatcherControl::new(queues.clone());
+        let admitter: Arc<dyn astrid_events::EventDeliveryAdmitter> =
+            Arc::new(admission::Admitter {
+                registry: Arc::new(RwLock::new(registry)),
+                event_bus: Arc::downgrade(&bus),
+                queues,
+                chain_locks: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+                access_resolver: None,
+                waits: wait_graph::WaitGraph::default(),
+            });
+        assert!(bus.register_delivery_admitter(&admitter));
+        let mut observed = bus.subscribe();
+        let reservation = bus
+            .reserve_publication(event("default", 0, uuid::Uuid::nil()))
+            .await
+            .unwrap();
+        control.stop();
+        assert_eq!(
+            reservation.publish(),
+            Err(astrid_events::DeliveryAdmissionError::Closed)
+        );
+        assert!(observed.try_recv().is_none());
+        assert!(matches!(
+            bus.reserve_publication(event("default", 1, uuid::Uuid::nil()))
+                .await,
+            Err(astrid_events::DeliveryAdmissionError::Closed)
+        ));
+    }
 }
