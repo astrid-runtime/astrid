@@ -17,14 +17,21 @@ use astrid_storage::{ContentName, ScopedKvStore, StateOwner};
 
 use crate::Kernel;
 
+#[cfg(not(target_family = "wasm"))]
+mod workspace;
+
 struct ReadyCapsule {
     id: CapsuleId,
     manifest: CapsuleManifest,
+    #[cfg(not(target_family = "wasm"))]
+    workspace_probe: Option<workspace::WorkspaceProbe>,
 }
 
 impl ReadyCapsule {
     fn new(name: &str) -> Self {
         Self {
+            #[cfg(not(target_family = "wasm"))]
+            workspace_probe: None,
             id: CapsuleId::new(name).unwrap(),
             manifest: CapsuleManifest {
                 package: PackageDef {
@@ -58,6 +65,17 @@ impl Capsule for ReadyCapsule {
 
     async fn unload(&mut self) -> CapsuleResult<()> {
         Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    async fn wait_ready(
+        &self,
+        _timeout: std::time::Duration,
+    ) -> astrid_capsule::capsule::ReadyStatus {
+        match &self.workspace_probe {
+            Some(probe) => probe.check().await,
+            None => astrid_capsule::capsule::ReadyStatus::Ready,
+        }
     }
 }
 

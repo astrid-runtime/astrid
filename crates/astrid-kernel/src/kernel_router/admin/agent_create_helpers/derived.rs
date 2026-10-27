@@ -12,7 +12,7 @@ use super::super::handlers::{
     require_principal_exists, success_json,
 };
 use super::create::{materialize_cloned_capsule_installs, provision_new_principal};
-use super::rollback::rollback_after_failure;
+use super::rollback::{rollback_after_failure, rollback_failed_initialization};
 
 pub(crate) struct DerivedPrincipalTarget {
     pub(crate) principal: PrincipalId,
@@ -139,17 +139,6 @@ async fn finish_derived_principal(
     profile: PrincipalProfile,
     ownership: &astrid_storage::ownership::DerivedPrincipalOwnership,
 ) -> AdminResponseBody {
-    if let Err(error) = kernel
-        .ensure_principal_capsules_ready(&principal, &load_capsules)
-        .await
-    {
-        return rollback_after_failure(
-            kernel,
-            &principal,
-            err_internal(format!("derived capsule readiness failed: {error}")),
-        )
-        .await;
-    }
     let uid = match kernel.principal_directory.uid_for(&principal) {
         Ok(uid) => uid,
         Err(error) => {
@@ -157,15 +146,34 @@ async fn finish_derived_principal(
                 .await;
         },
     };
-    if let Err(error) = kernel
+    let initialization = match kernel
         .ownership_store
-        .assign_derived_principal(uid, ownership)
+        .assign_derived_principal_for_initialization(uid, ownership)
         .await
     {
-        return rollback_after_failure(
+        Ok(initialization) => initialization,
+        Err(error) => {
+            return rollback_after_failure(
+                kernel,
+                &principal,
+                err_internal(format!("spawn ownership assignment failed: {error}")),
+            )
+            .await;
+        },
+    };
+    // Capsule initialization binds durable workspace state to the current
+    // accountable owner. Publish the captured ownership before loading so
+    // first load and restart resolve the same fleet. Readiness failure still
+    // uses the full owned-principal retirement rollback below.
+    if let Err(error) = kernel
+        .ensure_principal_capsules_ready(&principal, &load_capsules)
+        .await
+    {
+        return rollback_failed_initialization(
             kernel,
             &principal,
-            err_internal(format!("spawn ownership assignment failed: {error}")),
+            &initialization,
+            err_internal(format!("derived capsule readiness failed: {error}")),
         )
         .await;
     }
