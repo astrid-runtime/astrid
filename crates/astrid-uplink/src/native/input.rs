@@ -1,9 +1,9 @@
 //! Bounded connection input admission and independently scheduled control.
 
 use super::{
-    AuthenticatedIdentity, EventBus, IpcMessage, IpcPayload, LocalWriteHalf, Topic, egress,
-    private_elicit, process_inbound, readiness, routing, validate_ingress, write_ingress_refusal,
-    write_message,
+    AuthenticatedIdentity, EventBus, IpcMessage, IpcPayload, LocalWriteHalf, Topic,
+    ValidatedIngress, egress, private_elicit, process_validated_inbound, readiness, routing,
+    validate_ingress, write_ingress_refusal, write_message,
 };
 
 type InputSlots<'a, 'b> = (
@@ -42,14 +42,14 @@ impl<'a> PendingInput<'a> {
             chat_session,
             starts_turn,
             future: Box::pin(async move {
-                validate_ingress(&message)?;
-                readiness::ensure(probe, identity, &message).await?;
-                process_inbound(
+                let validated = ValidatedIngress::new(message)?;
+                readiness::ensure(probe, identity, validated.message()).await?;
+                process_validated_inbound(
                     bus,
                     identity,
                     identity.principal.as_str(),
                     receiver,
-                    message,
+                    validated,
                 )
                 .await
             }),

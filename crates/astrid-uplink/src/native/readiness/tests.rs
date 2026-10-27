@@ -140,7 +140,7 @@ async fn management_human_reply_and_cancellation_do_not_wait_for_capsules() {
 #[cfg(unix)]
 #[tokio::test]
 async fn cancellation_drops_pending_readiness_without_publishing_the_prompt() {
-    use crate::native::{
+    use super::super::{
         FramedReader, LocalStream, input::handle_connection_input, local_transport,
     };
     let bus = Arc::new(EventBus::new());
@@ -205,4 +205,135 @@ async fn cancellation_drops_pending_readiness_without_publishing_the_prompt() {
     assert!(pending.is_none());
     assert!(deliveries.try_recv().is_none());
     assert_eq!(receiver.turn_owner(), None);
+}
+
+#[tokio::test]
+async fn pending_input_validates_ingress_payload_once_before_readiness() {
+    use super::super::{reset_validate_ingress_serializations, validate_ingress_serializations};
+
+    reset_validate_ingress_serializations();
+    let bus = Arc::new(EventBus::new());
+    let registry = egress::Registry::install(&bus);
+    let identity = identity();
+    let receiver = registry.subscribe(
+        "alice".into(),
+        identity.device_key_id.clone(),
+        identity.request_owner,
+    );
+    let mut deliveries = bus.subscribe_topic("cli.v1.command.run.fixture");
+    let probe = CapsuleTopicProbe::new_with_ensure(
+        |_| Box::pin(async { false }),
+        |_| Box::pin(async { true }),
+    );
+    let message = IpcMessage::new(
+        Topic::from_raw("cli.v1.command.run.fixture"),
+        IpcPayload::RawJson(serde_json::json!({"req_id":"once"})),
+        Uuid::nil(),
+    );
+    let pending = PendingInput::with_readiness(&bus, &identity, &receiver, message, Some(&probe));
+    pending.future.await.unwrap();
+    assert_eq!(
+        validate_ingress_serializations(),
+        1,
+        "PendingInput must serialize/validate the payload exactly once before readiness+publish"
+    );
+    assert!(deliveries.try_recv().is_some());
+}
+
+#[tokio::test]
+async fn oversize_ingress_is_refused_before_readiness_or_publication() {
+    use super::super::{
+        MAX_PAYLOAD_BYTES, reset_validate_ingress_serializations, validate_ingress_serializations,
+    };
+
+    reset_validate_ingress_serializations();
+    let bus = Arc::new(EventBus::new());
+    let registry = egress::Registry::install(&bus);
+    let identity = identity();
+    let receiver = registry.subscribe(
+        "alice".into(),
+        identity.device_key_id.clone(),
+        identity.request_owner,
+    );
+    let mut deliveries = bus.subscribe_topic("cli.v1.command.run.fixture");
+    let probe = CapsuleTopicProbe::new(|_| panic!("readiness must not run for oversize ingress"));
+    let oversized = "x".repeat(MAX_PAYLOAD_BYTES + 1);
+    let message = IpcMessage::new(
+        Topic::from_raw("cli.v1.command.run.fixture"),
+        IpcPayload::RawJson(serde_json::json!({ "blob": oversized })),
+        Uuid::nil(),
+    );
+    let pending = PendingInput::with_readiness(&bus, &identity, &receiver, message, Some(&probe));
+    let err = pending.future.await.expect_err("oversize must fail");
+    assert_eq!(err, "payload exceeds IPC limit");
+    assert_eq!(
+        validate_ingress_serializations(),
+        1,
+        "oversize still performs one serialization after topic allowance"
+    );
+    assert!(deliveries.try_recv().is_none());
+}
+
+#[tokio::test]
+async fn malformed_topic_is_refused_before_readiness_without_serialization() {
+    use super::super::{reset_validate_ingress_serializations, validate_ingress_serializations};
+
+    reset_validate_ingress_serializations();
+    let bus = Arc::new(EventBus::new());
+    let registry = egress::Registry::install(&bus);
+    let identity = identity();
+    let receiver = registry.subscribe(
+        "alice".into(),
+        identity.device_key_id.clone(),
+        identity.request_owner,
+    );
+    let probe = CapsuleTopicProbe::new(|_| panic!("readiness must not run for malformed topic"));
+    let message = IpcMessage::new(
+        Topic::from_raw(""),
+        IpcPayload::RawJson(serde_json::json!({})),
+        Uuid::nil(),
+    );
+    let pending = PendingInput::with_readiness(&bus, &identity, &receiver, message, Some(&probe));
+    let err = pending.future.await.expect_err("empty topic must fail");
+    assert_eq!(err, "invalid topic shape");
+    assert_eq!(
+        validate_ingress_serializations(),
+        0,
+        "invalid topic must not reach payload serialization"
+    );
+}
+
+#[tokio::test]
+async fn raw_process_inbound_wrapper_still_refuses_oversize() {
+    use super::super::{
+        MAX_PAYLOAD_BYTES, process_inbound, reset_validate_ingress_serializations,
+        validate_ingress_serializations,
+    };
+
+    reset_validate_ingress_serializations();
+    let bus = Arc::new(EventBus::new());
+    let registry = egress::Registry::install(&bus);
+    let identity = identity();
+    let receiver = registry.subscribe(
+        "alice".into(),
+        identity.device_key_id.clone(),
+        identity.request_owner,
+    );
+    let oversized = "x".repeat(MAX_PAYLOAD_BYTES + 1);
+    let message = IpcMessage::new(
+        Topic::from_raw("cli.v1.command.run.fixture"),
+        IpcPayload::RawJson(serde_json::json!({ "blob": oversized })),
+        Uuid::nil(),
+    );
+    let err = process_inbound(
+        &bus,
+        &identity,
+        identity.principal.as_str(),
+        &receiver,
+        message,
+    )
+    .await
+    .expect_err("raw checked wrapper must still validate");
+    assert_eq!(err, "payload exceeds IPC limit");
+    assert_eq!(validate_ingress_serializations(), 1);
 }
