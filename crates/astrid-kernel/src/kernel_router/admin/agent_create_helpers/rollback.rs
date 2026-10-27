@@ -11,7 +11,7 @@ pub(super) async fn rollback_after_failure(
     principal: &PrincipalId,
     original: AdminResponseBody,
 ) -> AdminResponseBody {
-    rollback_with_initialization(kernel, principal, None, original).await
+    rollback_with_initialization(kernel, principal, None, Vec::new(), original).await
 }
 
 pub(super) async fn rollback_failed_initialization(
@@ -20,16 +20,36 @@ pub(super) async fn rollback_failed_initialization(
     initialization: &astrid_storage::ownership::PrincipalInitialization,
     original: AdminResponseBody,
 ) -> AdminResponseBody {
-    rollback_with_initialization(kernel, principal, Some(initialization), original).await
+    rollback_failed_initialization_with_views(
+        kernel,
+        principal,
+        initialization,
+        Vec::new(),
+        original,
+    )
+    .await
+}
+
+/// Keep queued capsule loaders outside a failed initialization until its exact
+/// assignment is reserved and both retirement fences have closed admission.
+pub(super) async fn rollback_failed_initialization_with_views(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    initialization: &astrid_storage::ownership::PrincipalInitialization,
+    views: Vec<crate::CapsuleViewGuard>,
+    original: AdminResponseBody,
+) -> AdminResponseBody {
+    rollback_with_initialization(kernel, principal, Some(initialization), views, original).await
 }
 
 async fn rollback_with_initialization(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
     initialization: Option<&astrid_storage::ownership::PrincipalInitialization>,
+    views: Vec<crate::CapsuleViewGuard>,
     original: AdminResponseBody,
 ) -> AdminResponseBody {
-    match rollback_derived_principal(kernel, principal, initialization).await {
+    match rollback_derived_principal(kernel, principal, initialization, views).await {
         Ok(()) => original,
         Err(error) => err_internal(format!(
             "derived principal provisioning failed and rollback could not complete: {error}"
@@ -41,9 +61,10 @@ async fn rollback_derived_principal(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
     initialization: Option<&astrid_storage::ownership::PrincipalInitialization>,
+    views: Vec<crate::CapsuleViewGuard>,
 ) -> Result<(), String> {
     let pending = prepare_rollback(kernel, principal, initialization).await?;
-    reclaim_derived_principal(kernel, principal, pending).await
+    reclaim_derived_principal(kernel, principal, pending, views).await
 }
 
 async fn prepare_rollback(
@@ -75,15 +96,9 @@ async fn reclaim_derived_principal(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
     pending: super::super::agent_delete::PendingIdentityRemoval,
+    views: Vec<crate::CapsuleViewGuard>,
 ) -> Result<(), String> {
-    kernel
-        .capabilities
-        .begin_principal_retirement(principal.clone())
-        .await;
-    kernel
-        .allowance_store
-        .begin_principal_retirement(principal)
-        .map_err(|error| format!("allowance retirement fence failed: {error}"))?;
+    fence_failed_initialization(kernel, principal, views).await?;
     kernel
         .identity_store
         .unlink(AGENT_IDENTITY_PLATFORM, principal.as_str())
@@ -166,6 +181,31 @@ async fn reclaim_derived_principal(
     super::super::agent_delete::finish_identity_removal(kernel, principal, pending)
         .await
         .map_err(|response| format!("identity removal completion returned {response:?}"))
+}
+
+pub(super) async fn fence_failed_initialization(
+    kernel: &crate::Kernel,
+    principal: &PrincipalId,
+    views: Vec<crate::CapsuleViewGuard>,
+) -> Result<(), String> {
+    {
+        // Match ordinary deletion: a constructor already past the retiring
+        // check must finish before the retirement/unload snapshot can begin.
+        let _load_guard = kernel.capsule_load_lock.lock().await;
+        kernel
+            .capabilities
+            .begin_principal_retirement(principal.clone())
+            .await;
+        kernel
+            .allowance_store
+            .begin_principal_retirement(principal)
+            .map_err(|error| format!("allowance retirement fence failed: {error}"))?;
+    }
+    // Unload takes these same view locks. A parked loader can now proceed only
+    // to the retirement check, never to a partially initialized runtime.
+    // Exact-assignment reservation must succeed before this function is called.
+    drop(views);
+    Ok(())
 }
 
 fn ensure_legacy_secret_rollback_allowed(

@@ -14,6 +14,7 @@
 
 mod create;
 mod derived;
+mod initialization;
 mod registration;
 mod rollback;
 

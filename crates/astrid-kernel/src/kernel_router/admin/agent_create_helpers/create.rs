@@ -57,11 +57,35 @@ pub(crate) async fn provision_new_principal(
         },
     };
 
+    let views = if clone_from.is_some() {
+        match super::initialization::lock_initializing_capsules(
+            kernel,
+            &principal,
+            &profile.capsules,
+        )
+        .await
+        {
+            Ok(views) => views,
+            Err(error) => {
+                return super::rollback::rollback_failed_initialization(
+                    kernel,
+                    &principal,
+                    &initialization,
+                    err_internal(error),
+                )
+                .await;
+            },
+        }
+    } else {
+        Vec::new()
+    };
+
     if let Err(e) = profile.save_to_path(&profile_path) {
-        return super::rollback::rollback_failed_initialization(
+        return super::rollback::rollback_failed_initialization_with_views(
             kernel,
             &principal,
             &initialization,
+            views,
             err_internal(format!("profile save failed: {e}")),
         )
         .await;
@@ -79,14 +103,18 @@ pub(crate) async fn provision_new_principal(
         && let Err(e) =
             materialize_cloned_capsule_installs(kernel, source, &principal, &profile.capsules)
     {
-        return super::rollback::rollback_failed_initialization(
+        return super::rollback::rollback_failed_initialization_with_views(
             kernel,
             &principal,
             &initialization,
+            views,
             err_internal(format!("capsule install clone failed: {e}")),
         )
         .await;
     }
+
+    #[cfg(all(test, not(target_family = "wasm")))]
+    super::super::state_tests_agent_derive::initialization::pause_after_install(&principal).await;
 
     // State inheritance is OPT-IN. By default the new principal inherits
     // NOTHING — least privilege, and no silent leak of `default`'s env
@@ -105,6 +133,7 @@ pub(crate) async fn provision_new_principal(
         super::super::inheritance::inherit_from_principal(kernel, source, &principal).await;
     }
 
+    drop(views);
     warm_created_principal(kernel, principal.clone());
 
     info!(%principal, user_id = %user_id, "Layer 6 agent.create");

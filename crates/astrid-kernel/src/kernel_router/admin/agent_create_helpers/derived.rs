@@ -50,42 +50,11 @@ pub(crate) async fn provision_derived_principal(
         ownership,
     } = target;
 
-    let RegisteredPrincipal { mut profile, .. } = match register_new_principal(
-        kernel,
-        principal.clone(),
-        profile_path.clone(),
-        vec![astrid_core::groups::BUILTIN_RESTRICTED.to_string()],
-        Vec::new(),
-        None,
-        false,
-    )
-    .await
-    {
-        Ok(registered) => registered,
-        Err(response) => return response,
-    };
-    let uid = match kernel.principal_directory.uid_for(&principal) {
-        Ok(uid) => uid,
-        Err(error) => {
-            return rollback_after_failure(kernel, &principal, err_internal(error.to_string()))
-                .await;
-        },
-    };
-    let initialization = match kernel
-        .ownership_store
-        .assign_derived_principal_for_initialization(uid, &ownership)
-        .await
-    {
-        Ok(initialization) => initialization,
-        Err(error) => {
-            return rollback_after_failure(
-                kernel,
-                &principal,
-                err_internal(format!("spawn ownership assignment failed: {error}")),
-            )
-            .await;
-        },
-    };
+    let (mut profile, initialization) =
+        match register_derived_principal(kernel, &principal, &profile_path, &ownership).await {
+            Ok(registered) => registered,
+            Err(response) => return response,
+        };
     // Profiles are visible to concurrent reload and boot warm. Assign before
     // the first publication, not merely before this task's readiness check.
     profile.capsules = allow_capsules;
@@ -100,11 +69,27 @@ pub(crate) async fn provision_derived_principal(
         .await;
     }
 
+    let views =
+        match super::initialization::lock_initializing_capsules(kernel, &principal, &load_capsules)
+            .await
+        {
+            Ok(views) => views,
+            Err(error) => {
+                return rollback_failed_initialization(
+                    kernel,
+                    &principal,
+                    &initialization,
+                    err_internal(error),
+                )
+                .await;
+            },
+        };
     if let Err(e) = profile.save_to_path(&profile_path) {
-        return rollback_failed_initialization(
+        return super::rollback::rollback_failed_initialization_with_views(
             kernel,
             &principal,
             &initialization,
+            views,
             err_profile(&principal, &e),
         )
         .await;
@@ -122,8 +107,16 @@ pub(crate) async fn provision_derived_principal(
     )
     .await
     {
-        return rollback_failed_initialization(kernel, &principal, &initialization, response).await;
+        return super::rollback::rollback_failed_initialization_with_views(
+            kernel,
+            &principal,
+            &initialization,
+            views,
+            response,
+        )
+        .await;
     }
+    drop(views);
     finish_derived_principal(
         kernel,
         principal,
@@ -133,6 +126,54 @@ pub(crate) async fn provision_derived_principal(
         &initialization,
     )
     .await
+}
+
+async fn register_derived_principal(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    profile_path: &Path,
+    ownership: &astrid_storage::ownership::DerivedPrincipalOwnership,
+) -> Result<
+    (
+        PrincipalProfile,
+        astrid_storage::ownership::PrincipalInitialization,
+    ),
+    AdminResponseBody,
+> {
+    let RegisteredPrincipal { profile, .. } = register_new_principal(
+        kernel,
+        principal.clone(),
+        profile_path.to_path_buf(),
+        vec![astrid_core::groups::BUILTIN_RESTRICTED.to_string()],
+        Vec::new(),
+        None,
+        false,
+    )
+    .await?;
+    let uid = match kernel.principal_directory.uid_for(principal) {
+        Ok(uid) => uid,
+        Err(error) => {
+            return Err(
+                rollback_after_failure(kernel, principal, err_internal(error.to_string())).await,
+            );
+        },
+    };
+    let initialization = match kernel
+        .ownership_store
+        .assign_derived_principal_for_initialization(uid, ownership)
+        .await
+    {
+        Ok(initialization) => initialization,
+        Err(error) => {
+            return Err(rollback_after_failure(
+                kernel,
+                principal,
+                err_internal(format!("spawn ownership assignment failed: {error}")),
+            )
+            .await);
+        },
+    };
+    Ok((profile, initialization))
 }
 
 async fn validate_derived_request(
@@ -172,6 +213,8 @@ async fn initialize_derived_capsule_state(
 ) -> Result<(), AdminResponseBody> {
     materialize_cloned_capsule_installs(kernel, source, principal, load_capsules)
         .map_err(|e| err_internal(format!("derived capsule materialization failed: {e}")))?;
+    #[cfg(all(test, not(target_family = "wasm")))]
+    super::super::state_tests_agent_derive::initialization::pause_after_install(principal).await;
     super::super::inheritance::inherit_selected_capsule_state(
         kernel,
         source,

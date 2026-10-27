@@ -1855,6 +1855,11 @@ impl Kernel {
         {
             anyhow::bail!("cannot load capsule '{id}' for retiring principal '{principal}'");
         }
+        #[cfg(all(test, not(target_family = "wasm")))]
+        kernel_router::admin::state_tests_agent_derive::initialization::pause_admitted_loader(
+            principal,
+        )
+        .await;
         let wasm_hash = capsule_instance_hash(&manifest, &runtime_dir);
         // `capabilities.uplink` alone remains a principal-scoped daemon/host
         // grant unless the operator explicitly promotes it. A manifest that

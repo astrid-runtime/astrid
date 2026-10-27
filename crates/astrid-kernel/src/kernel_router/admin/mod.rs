@@ -54,7 +54,7 @@ mod state_tests_agent_clone;
 #[cfg(test)]
 mod state_tests_agent_delete;
 #[cfg(test)]
-mod state_tests_agent_derive;
+pub(crate) mod state_tests_agent_derive;
 #[cfg(test)]
 mod state_tests_agent_modify;
 #[cfg(test)]
