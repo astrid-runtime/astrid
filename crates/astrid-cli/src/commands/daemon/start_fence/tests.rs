@@ -1,5 +1,6 @@
 use super::*;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::Arc;
 
 #[test]
 fn lock_leaf_alias_is_refused_without_mutating_target() {
@@ -193,5 +194,88 @@ fn foreign_socket_child() {
     assert!(
         open(Path::new(&path)).is_err(),
         "foreign socket must not be admitted as a directory"
+    );
+}
+
+#[test]
+fn dropping_guard_releases_duplicated_open_description() {
+    let root = tempfile::tempdir().expect("owned root");
+    let path = root.path().join("astrid-start-fences/fixture.lock");
+    let guard = open(&path).expect("fence");
+    let inherited = guard.file.try_clone().expect("fixture dup");
+    let competitor = File::options().read(true).write(true).open(&path).unwrap();
+    assert!(matches!(
+        competitor.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    drop(guard);
+    competitor
+        .try_lock()
+        .expect("explicit unlock must release while a dup remains");
+    drop(inherited);
+    let third = File::options().read(true).write(true).open(&path).unwrap();
+    assert!(
+        matches!(third.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+        "closing a stale dup must not unlock the successor"
+    );
+}
+
+#[test]
+fn cloned_guard_keeps_lock_until_final_drop() {
+    let root = tempfile::tempdir().expect("owned root");
+    let path = root.path().join("astrid-start-fences/fixture.lock");
+    let guard = open(&path).expect("fence");
+    let clone = Arc::clone(&guard);
+    let competitor = File::options().read(true).write(true).open(&path).unwrap();
+    assert!(matches!(
+        competitor.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    drop(guard);
+    assert!(
+        matches!(
+            competitor.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ),
+        "a remaining guard clone must keep the lease"
+    );
+    drop(clone);
+    competitor
+        .try_lock()
+        .expect("final guard drop must release the lease");
+}
+
+#[test]
+fn successor_can_lock_after_release_while_owned_child_is_alive() {
+    struct Reap(std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let root = tempfile::tempdir().expect("owned root");
+    let path = root.path().join("astrid-start-fences/fixture.lock");
+    let guard = open(&path).expect("fence");
+    let child = std::process::Command::new("sleep")
+        .arg("30")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn owned child");
+    let mut child = Reap(child);
+    assert!(
+        child.0.try_wait().expect("poll child").is_none(),
+        "child must be alive after spawn returns"
+    );
+    drop(guard);
+    let competitor = File::options().read(true).write(true).open(&path).unwrap();
+    competitor
+        .try_lock()
+        .expect("successor must acquire after guard release while the child is alive");
+    assert!(
+        child.0.try_wait().expect("poll child").is_none(),
+        "child must remain alive through successor lock"
     );
 }

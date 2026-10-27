@@ -418,14 +418,13 @@ fn start_clears_sentinels(action: StartAction) -> bool {
 
 /// Serialize stale healing and boot decisions so two starts cannot both decide
 /// that the same pathname is dead and race their children onto the singleton.
-pub(crate) async fn acquire_daemon_start_fence() -> Result<Arc<std::fs::File>> {
+pub(crate) async fn acquire_daemon_start_fence() -> Result<Arc<start_fence::DaemonStartFence>> {
     let home = astrid_core::dirs::AstridHome::resolve().context("failed to resolve Astrid home")?;
     let path = daemon_start_fence_path(&home)?;
-    let file = tokio::task::spawn_blocking(move || start_fence::open(&path))
+    tokio::task::spawn_blocking(move || start_fence::open(&path))
         .await
         .context("daemon start fence task failed")?
-        .map_err(|error| anyhow::anyhow!("failed to acquire daemon start fence: {error}"))?;
-    Ok(Arc::new(file))
+        .map_err(|error| anyhow::anyhow!("failed to acquire daemon start fence: {error}"))
 }
 
 /// Admit a disposable runtime override before lifecycle code can resolve or
