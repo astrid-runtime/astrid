@@ -21,7 +21,11 @@ mod deletion;
 mod derived;
 mod provision;
 mod resources;
-pub use derived::{DerivedPrincipalInitialization, DerivedPrincipalOwnership};
+pub use derived::DerivedPrincipalOwnership;
+mod initialization;
+pub use initialization::PrincipalInitialization;
+/// Compatibility name for rollback authority returned by derived provisioning.
+pub type DerivedPrincipalInitialization = PrincipalInitialization;
 mod upgrade;
 pub use upgrade::{UnownedPrincipalDeferral, UnownedPrincipalReconciliation};
 mod user_bindings;

@@ -10,9 +10,8 @@ use super::super::handlers::{
     AGENT_IDENTITY_PLATFORM, err_bad_input, err_internal, err_profile, principal_profile_path,
     require_principal_exists, success_json,
 };
-use super::rollback::{
-    remove_principal_key, rollback_created_identity, rollback_created_identity_unless_assigned,
-};
+use super::registration::{RegisteredPrincipal, register_new_principal};
+use super::rollback::rollback_created_identity_unless_assigned;
 
 /// Build, register, and provision a genuinely-new principal.
 ///
@@ -30,79 +29,71 @@ pub(crate) async fn provision_new_principal(
     inherit_from: Option<PrincipalId>,
     clone_from: Option<PrincipalId>,
     allow_admin_clone: bool,
-    warm_after_create: bool,
-    ownership: Option<&super::super::handlers::creation_authority::CreationAuthority>,
+    ownership: &super::super::handlers::creation_authority::CreationAuthority,
 ) -> AdminResponseBody {
-    if let Err(error) = kernel
-        .ownership_store
-        .ensure_alias_available(&principal)
-        .await
-    {
-        return err_bad_input(format!(
-            "principal alias `{principal}` is unavailable: {error}"
-        ));
-    }
-
-    // Build the profile: a `clone_from` replica (validated + admin-guarded) or
-    // a fresh profile from the supplied groups/grants. Runs under the lock so
-    // the clone source is pinned across the read.
-    let mut profile = match build_create_profile(
+    let RegisteredPrincipal { profile, user_id } = match register_new_principal(
         kernel,
-        &principal,
+        principal.clone(),
+        profile_path.clone(),
         groups,
         grants,
-        clone_from.as_ref(),
+        clone_from.clone(),
         allow_admin_clone,
-    ) {
-        Ok(p) => p,
-        Err(resp) => return resp,
+    )
+    .await
+    {
+        Ok(registered) => registered,
+        Err(response) => return response,
     };
-
-    // Mint a per-principal ed25519 keypair so this principal can authenticate
-    // its local socket connections (issue #45/#852): the private key lands in
-    // system custody under `keys/` (NOT the principal home — the agent sandbox
-    // denies it, but the operator/OS-user CLI can read it to sign), and the
-    // public key + the `Keypair` auth method are registered on the profile so
-    // the handshake can verify a signature against it.
-    let initial_public_key = match mint_principal_keypair(kernel, &principal, &mut profile) {
-        Ok(public_key) => public_key,
-        Err(resp) => return resp,
-    };
-
-    if let Err(e) = profile.validate() {
-        remove_principal_key(kernel, &principal);
-        return err_bad_input(format!("profile rejected: {e}"));
-    }
-
-    let user = match kernel
-        .identity_store
-        .create_principal(principal.clone(), initial_public_key)
+    let initialization = match ownership
+        .assign_for_initialization(kernel, &principal)
         .await
     {
-        Ok(u) => u,
-        Err(e) => {
-            remove_principal_key(kernel, &principal);
-            return err_internal(format!("identity store create_user failed: {e}"));
+        Ok(initialization) => initialization,
+        Err(response) => {
+            rollback_created_identity_unless_assigned(kernel, &principal, user_id, &profile_path)
+                .await;
+            return response;
         },
     };
-    if let Err(e) = kernel
-        .identity_store
-        .link(
-            AGENT_IDENTITY_PLATFORM,
-            principal.as_str(),
-            user.id,
-            "system",
+
+    let views = if clone_from.is_some() {
+        match super::initialization::lock_initializing_capsules(
+            kernel,
+            &principal,
+            &profile.capsules,
         )
         .await
-    {
-        rollback_created_identity(kernel, &principal, user.id, &profile_path, false).await;
-        return err_internal(format!("identity store link failed: {e}"));
-    }
+        {
+            Ok(views) => views,
+            Err(error) => {
+                return super::rollback::rollback_failed_initialization(
+                    kernel,
+                    &principal,
+                    &initialization,
+                    err_internal(error),
+                )
+                .await;
+            },
+        }
+    } else {
+        Vec::new()
+    };
 
     if let Err(e) = profile.save_to_path(&profile_path) {
-        rollback_created_identity(kernel, &principal, user.id, &profile_path, false).await;
-        return err_internal(format!("profile save failed: {e}"));
+        return super::rollback::rollback_failed_initialization_with_views(
+            kernel,
+            &principal,
+            &initialization,
+            views,
+            err_internal(format!("profile save failed: {e}")),
+        )
+        .await;
     }
+
+    #[cfg(all(test, not(target_family = "wasm")))]
+    super::super::state_tests_agent_derive::workspace::pause_after_profile_publication(&principal)
+        .await;
 
     // Principal KV/content roots are UID-bound and provision lazily by the
     // authoritative runtime store. Do not recreate the released native
@@ -112,9 +103,18 @@ pub(crate) async fn provision_new_principal(
         && let Err(e) =
             materialize_cloned_capsule_installs(kernel, source, &principal, &profile.capsules)
     {
-        rollback_created_identity(kernel, &principal, user.id, &profile_path, true).await;
-        return err_internal(format!("capsule install clone failed (rolled back): {e}"));
+        return super::rollback::rollback_failed_initialization_with_views(
+            kernel,
+            &principal,
+            &initialization,
+            views,
+            err_internal(format!("capsule install clone failed: {e}")),
+        )
+        .await;
     }
+
+    #[cfg(all(test, not(target_family = "wasm")))]
+    super::super::state_tests_agent_derive::initialization::pause_after_install(&principal).await;
 
     // State inheritance is OPT-IN. By default the new principal inherits
     // NOTHING — least privilege, and no silent leak of `default`'s env
@@ -133,20 +133,13 @@ pub(crate) async fn provision_new_principal(
         super::super::inheritance::inherit_from_principal(kernel, source, &principal).await;
     }
 
-    if let Some(authority) = ownership
-        && let Err(response) = authority.assign(kernel, &principal).await
-    {
-        rollback_created_identity_unless_assigned(kernel, &principal, user.id, &profile_path).await;
-        return response;
-    }
-    if warm_after_create {
-        warm_created_principal(kernel, principal.clone());
-    }
+    drop(views);
+    warm_created_principal(kernel, principal.clone());
 
-    info!(%principal, user_id = %user.id, "Layer 6 agent.create");
+    info!(%principal, user_id = %user_id, "Layer 6 agent.create");
     success_json(serde_json::json!({
         "principal": principal.as_str(),
-        "astrid_user_id": user.id,
+        "astrid_user_id": user_id,
     }))
 }
 
@@ -221,7 +214,7 @@ pub(super) fn materialize_cloned_capsule_installs(
 /// from disk and the source must be pinned across the read. Returns the
 /// [`AdminResponseBody`] error to propagate on rejection (bad source, or an
 /// admin-conferring source without `allow_admin_clone`).
-fn build_create_profile(
+pub(super) fn build_create_profile(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
     groups: Vec<String>,
@@ -317,7 +310,7 @@ fn build_create_profile(
 /// as `ed25519:<hex>` and `AuthMethod::Keypair` is recorded, so the kernel-side
 /// handshake can verify a signature against it (issue #45/#852). Returns the
 /// error response to propagate on a filesystem failure.
-fn mint_principal_keypair(
+pub(super) fn mint_principal_keypair(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
     profile: &mut PrincipalProfile,

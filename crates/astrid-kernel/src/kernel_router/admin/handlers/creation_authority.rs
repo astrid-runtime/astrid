@@ -78,6 +78,28 @@ impl CreationAuthority {
             })
     }
 
+    pub(in crate::kernel_router::admin) async fn assign_for_initialization(
+        &self,
+        kernel: &Kernel,
+        principal: &PrincipalId,
+    ) -> Result<astrid_storage::ownership::PrincipalInitialization, AdminResponseBody> {
+        let created = kernel
+            .principal_directory
+            .uid_for(principal)
+            .map_err(|error| err_internal(error.to_string()))?;
+        kernel
+            .ownership_store
+            .assign_created_principal_for_device_initialization(
+                created,
+                self.creator,
+                &self.public_key,
+            )
+            .await
+            .map_err(|error| {
+                err_bad_input(format!("principal ownership assignment failed: {error}"))
+            })
+    }
+
     /// Keyless backfill may repair credentials, never mint into a foreign fleet.
     async fn authorize_existing_target(
         &self,
@@ -215,8 +237,7 @@ async fn create_with_authority(
         inherit_from,
         clone_from,
         allow_admin_clone,
-        true,
-        Some(authority),
+        authority,
     )
     .await
 }

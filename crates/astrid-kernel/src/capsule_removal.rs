@@ -203,3 +203,20 @@ async fn purge_capsule_state(
         .map(|_| ())
         .map_err(|error| anyhow::anyhow!("purge capsule state for '{id}': {error}"))
 }
+
+/// Join a candidate's workers before releasing the enclosing load admission.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(super) async fn unload_rejected_runtime(
+    mut capsule: Box<dyn astrid_capsule::capsule::Capsule>,
+    id: &CapsuleId,
+) {
+    capsule.request_cancel();
+    let cleanup = capsule.unload().await;
+    #[cfg(test)]
+    if cleanup.is_ok() {
+        crate::ingress_readiness::tests::record_cleanup(id.as_str());
+    }
+    if let Err(cleanup) = cleanup {
+        tracing::warn!(capsule_id = %id, error = %cleanup, "Failed to unload rejected runtime candidate");
+    }
+}

@@ -16,7 +16,8 @@
 //! (b) arms a hard deadline on a separate thread: after [`SHUTDOWN_GRACE`], if
 //! the process is still alive (graceful shutdown wedged), it force-exits so the
 //! OS releases every lock. A SECOND signal before the deadline force-exits
-//! immediately (an impatient operator).
+//! immediately (an impatient operator). In-process shutdown requests arm the
+//! same deadline before joining runtime producers; a later signal never resets it.
 
 /// Grace period between the first shutdown signal and a forced exit.
 ///
@@ -67,7 +68,10 @@ pub(crate) const fn signal_decision(is_first: bool) -> SignalDecision {
 /// to the default signal disposition (terminate on SIGTERM) — still killable,
 /// just not graceful — which is logged. Killable-but-abrupt beats wedged.
 #[cfg(unix)]
-pub(crate) fn spawn_signal_watchdog(shutdown_tx: tokio::sync::watch::Sender<bool>) {
+pub(crate) fn spawn_signal_watchdog(
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    deadline: std::sync::Arc<ShutdownDeadline>,
+) {
     use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
     use signal_hook::iterator::Signals;
 
@@ -100,7 +104,7 @@ pub(crate) fn spawn_signal_watchdog(shutdown_tx: tokio::sync::watch::Sender<bool
                         // moved past its wait — the deadline below still guards
                         // the exit either way.
                         let _ = shutdown_tx.send(true);
-                        arm_force_exit_deadline();
+                        deadline.arm();
                     },
                     SignalDecision::ForceExitNow => {
                         tracing::warn!(
@@ -123,66 +127,66 @@ pub(crate) fn spawn_signal_watchdog(shutdown_tx: tokio::sync::watch::Sender<bool
     }
 }
 
-/// Arm the hard force-exit deadline on its OWN thread, so the watchdog's signal
-/// loop can keep running and still catch a second signal while this sleeps.
-///
-/// If graceful shutdown finishes first, `run()` returns and `main` exits the
-/// process normally (exit 0) — this sleeping thread is torn down with it before
-/// it fires. If graceful shutdown wedges (workers starved), this fires after
-/// [`SHUTDOWN_GRACE`] and force-exits so the OS releases every lock (including
-/// the audit `LOCK`).
-#[cfg(unix)]
-fn arm_force_exit_deadline() {
-    let spawn_result = std::thread::Builder::new()
-        .name("astrid-shutdown-deadline".into())
-        .spawn(|| {
-            std::thread::sleep(SHUTDOWN_GRACE);
-            tracing::error!(
-                grace_secs = SHUTDOWN_GRACE.as_secs(),
-                "graceful shutdown timed out under load; forcing exit"
-            );
-            std::process::exit(EXIT_GRACE_TIMEOUT);
-        });
+/// One process deadline shared by API shutdown and the OS signal watchdog.
+/// Once armed, another shutdown source cannot extend the original grace.
+#[derive(Debug)]
+pub(crate) struct ShutdownDeadline {
+    armed: std::sync::atomic::AtomicBool,
+    grace: std::time::Duration,
+}
 
-    if let Err(e) = spawn_result {
-        // Could not arm the deadline thread. Do not force-exit here: graceful
-        // shutdown is already in flight and usually completes. Log so a wedged
-        // shutdown without its backstop is diagnosable.
-        tracing::error!(
-            error = %e,
-            "failed to arm the force-exit deadline thread; graceful shutdown has no \
-             hard backstop this run"
-        );
+impl Default for ShutdownDeadline {
+    fn default() -> Self {
+        Self {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            grace: SHUTDOWN_GRACE,
+        }
+    }
+}
+
+impl ShutdownDeadline {
+    /// Wait for any in-process request and arm before entering shutdown joins.
+    pub(crate) async fn wait_for_shutdown(
+        &self,
+        receiver: &mut tokio::sync::watch::Receiver<bool>,
+    ) {
+        let _ = receiver.wait_for(|requested| *requested).await;
+        self.arm();
+    }
+
+    /// The signal thread calls this directly even if Tokio workers are starved.
+    pub(crate) fn arm(&self) {
+        self.try_arm();
+    }
+
+    fn try_arm(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.armed.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let grace = self.grace;
+        let spawn = std::thread::Builder::new()
+            .name("astrid-shutdown-deadline".into())
+            .spawn(move || {
+                std::thread::sleep(grace);
+                tracing::error!(
+                    grace_secs = grace.as_secs(),
+                    "graceful shutdown timed out under load; forcing exit"
+                );
+                std::process::exit(EXIT_GRACE_TIMEOUT);
+            });
+        if let Err(error) = spawn {
+            // Permit a later shutdown source to retry a failed thread spawn.
+            self.armed.store(false, Ordering::Release);
+            tracing::error!(
+                %error,
+                "failed to arm the force-exit deadline thread; graceful shutdown has no hard backstop"
+            );
+            return false;
+        }
+        true
     }
 }
 
 #[cfg(all(test, unix))]
-mod tests {
-    use super::{SignalDecision, signal_decision};
-
-    #[test]
-    fn first_signal_starts_graceful_and_arms_deadline() {
-        assert_eq!(signal_decision(true), SignalDecision::GracefulThenArm);
-    }
-
-    #[test]
-    fn subsequent_signal_forces_immediate_exit() {
-        assert_eq!(signal_decision(false), SignalDecision::ForceExitNow);
-    }
-
-    #[test]
-    fn two_signals_are_graceful_then_force_exit() {
-        // Mirrors the watchdog loop's `first` state machine: the first signal
-        // requests graceful shutdown + arms the deadline; the next forces exit.
-        let mut first = true;
-
-        let d1 = signal_decision(first);
-        assert_eq!(d1, SignalDecision::GracefulThenArm);
-        if matches!(d1, SignalDecision::GracefulThenArm) {
-            first = false;
-        }
-
-        let d2 = signal_decision(first);
-        assert_eq!(d2, SignalDecision::ForceExitNow);
-    }
-}
+mod tests;

@@ -10,12 +10,21 @@ const CHAT_DELTA_TOPIC: &str = "agent.v1.stream.delta";
 const MAX_STREAM_SESSIONS: usize = 64;
 const MAX_STREAM_BYTES: usize = super::MAX_PAYLOAD_BYTES;
 
-const ALLOWED_INGRESS_EXACT: &[&str] = &["user.v1.prompt", "cli.v1.command.execute"];
-const ALLOWED_INGRESS_PREFIXES: &[&str] = &[
+const ALLOWED_INGRESS_EXACT: &[&str] = &[
+    "user.v1.prompt",
+    "cli.v1.command.execute",
+    // These request topics are broker-owned despite sharing the kernel request
+    // prefix. Consent replies below that prefix remain on the control path.
+    "astrid.v1.request.mcp.tools.list",
+    "astrid.v1.request.mcp.tool.call",
+];
+const CONTROL_INGRESS_PREFIXES: &[&str] = &[
     "astrid.v1.request.",
     "astrid.v1.admin.",
     "astrid.v1.elicit.response.",
     "astrid.v1.approval.response.",
+];
+const CAPSULE_INGRESS_PREFIXES: &[&str] = &[
     "registry.v1.selection.",
     "session.v1.request.",
     "cli.v1.command.run.",
@@ -52,8 +61,16 @@ pub(super) fn ingress_allowed(topic: &str) -> bool {
     {
         return false;
     }
+    capsule_request_topic(topic)
+        || CONTROL_INGRESS_PREFIXES
+            .iter()
+            .any(|prefix| topic.starts_with(prefix))
+}
+
+/// Request families owned by capsules, shared by ACL and readiness policy.
+pub(super) fn capsule_request_topic(topic: &str) -> bool {
     ALLOWED_INGRESS_EXACT.contains(&topic)
-        || ALLOWED_INGRESS_PREFIXES
+        || CAPSULE_INGRESS_PREFIXES
             .iter()
             .any(|prefix| topic.starts_with(prefix))
 }
