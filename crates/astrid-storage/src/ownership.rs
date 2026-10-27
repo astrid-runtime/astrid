@@ -21,7 +21,7 @@ mod deletion;
 mod derived;
 mod provision;
 mod resources;
-pub use derived::DerivedPrincipalOwnership;
+pub use derived::{DerivedPrincipalInitialization, DerivedPrincipalOwnership};
 mod upgrade;
 pub use upgrade::{UnownedPrincipalDeferral, UnownedPrincipalReconciliation};
 mod user_bindings;
