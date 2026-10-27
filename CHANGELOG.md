@@ -8,12 +8,6 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ## [Unreleased]
 
-### Fixed
-
-- Keep newly cloned capsules from starting before state inheritance finishes.
-  Failed initialization closes capsule admission before releasing queued loaders;
-  rollback preserves principals whose ownership has changed. Closes #2252.
-
 ## [2026.10.1] - 2026-10-15
 
 ### Fixed
