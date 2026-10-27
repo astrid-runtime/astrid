@@ -19,6 +19,20 @@ fn identity() -> AuthenticatedIdentity {
 
 #[tokio::test]
 async fn cold_capsule_request_waits_before_publication_and_uses_authenticated_principal() {
+    assert_cold_request_gated("cli.v1.command.run.fixture").await;
+}
+
+#[tokio::test]
+async fn cold_mcp_broker_requests_wait_before_publication() {
+    for topic in [
+        "astrid.v1.request.mcp.tools.list",
+        "astrid.v1.request.mcp.tool.call",
+    ] {
+        assert_cold_request_gated(topic).await;
+    }
+}
+
+async fn assert_cold_request_gated(topic: &'static str) {
     let bus = Arc::new(EventBus::new());
     let registry = egress::Registry::install(&bus);
     let identity = identity();
@@ -27,7 +41,6 @@ async fn cold_capsule_request_waits_before_publication_and_uses_authenticated_pr
         identity.device_key_id.clone(),
         identity.request_owner,
     );
-    let topic = "cli.v1.command.run.fixture";
     let mut deliveries = bus.subscribe_topic(topic);
     let ready = Arc::new(tokio::sync::Semaphore::new(0));
     let release = Arc::clone(&ready);
@@ -36,10 +49,7 @@ async fn cold_capsule_request_waits_before_publication_and_uses_authenticated_pr
         move |key| {
             let ready = Arc::clone(&ready);
             Box::pin(async move {
-                assert_eq!(
-                    key,
-                    "\0astrid.scoped-topic\0alice\0cli.v1.command.run.fixture"
-                );
+                assert_eq!(key, format!("\0astrid.scoped-topic\0alice\0{topic}"));
                 let permit = ready.acquire().await.unwrap();
                 permit.forget();
                 true
@@ -104,6 +114,9 @@ async fn management_human_reply_and_cancellation_do_not_wait_for_capsules() {
         "astrid.v1.admin.agent.list.req",
         "astrid.v1.elicit.response.req",
         "astrid.v1.approval.response.req",
+        "astrid.v1.request.mcp.approval.respond",
+        "astrid.v1.request.mcp.grant.respond",
+        "astrid.v1.request.mcp.ingress.respond",
     ] {
         let message = IpcMessage::new(
             Topic::from_raw(topic),

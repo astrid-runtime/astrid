@@ -452,6 +452,7 @@ async fn run_with_args(args: Args) -> Result<()> {
 
     // Wait for a termination signal or API shutdown request.
     let mut shutdown_rx = kernel.shutdown_tx.subscribe();
+    let shutdown_deadline = std::sync::Arc::new(signal::ShutdownDeadline::default());
 
     #[cfg(unix)]
     {
@@ -469,8 +470,11 @@ async fn run_with_args(args: Args) -> Result<()> {
         // watchdog AND by an in-process API shutdown request. No tokio signal
         // registration here — that avoids double-handling the same signals the
         // watchdog owns.
-        signal::spawn_signal_watchdog(kernel.shutdown_tx.clone());
-        let _ = shutdown_rx.wait_for(|v| *v).await;
+        signal::spawn_signal_watchdog(
+            kernel.shutdown_tx.clone(),
+            std::sync::Arc::clone(&shutdown_deadline),
+        );
+        shutdown_deadline.wait_for_shutdown(&mut shutdown_rx).await;
         tracing::info!("Shutdown requested, shutting down");
     }
     #[cfg(not(unix))]
