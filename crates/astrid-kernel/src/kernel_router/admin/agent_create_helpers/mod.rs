@@ -14,6 +14,7 @@
 
 mod create;
 mod derived;
+mod registration;
 mod rollback;
 
 #[cfg(test)]

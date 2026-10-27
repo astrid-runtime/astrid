@@ -134,3 +134,82 @@ async fn create_user_and_fleets(store: &OwnershipStore) -> (UserIdentity, Vec<Fl
     }
     (user, fleets)
 }
+
+#[tokio::test]
+async fn device_initialization_requires_current_delegation_and_cannot_capture_owned_peers() {
+    let directory = PrincipalDirectory::default();
+    let creator = PrincipalUid::from_bytes([11; 32]);
+    let child = PrincipalUid::from_bytes([12; 32]);
+    for (alias, uid) in [("creator", creator), ("child", child)] {
+        directory
+            .register(PrincipalId::new(alias).unwrap(), uid)
+            .unwrap();
+    }
+    let store = OwnershipStore::new(Arc::new(MemoryKvStore::new()), directory).unwrap();
+    let (user, fleets) = create_user_and_fleets(&store).await;
+    store
+        .assign_principal(PrincipalOwnership {
+            principal_uid: creator,
+            fleet_uid: fleets[0].uid,
+            assigned_by: user.uid,
+        })
+        .await
+        .unwrap();
+    let key = [14; 32];
+    let before = store.load().await.unwrap();
+    assert!(
+        store
+            .assign_created_principal_for_device_initialization(child, creator, &key)
+            .await
+            .is_err()
+    );
+    assert_eq!(before, store.load().await.unwrap());
+    store
+        .initialize_local_user_device(creator, key, user.uid, fleets[0].uid)
+        .await
+        .unwrap();
+    let initialization = store
+        .assign_created_principal_for_device_initialization(child, creator, &key)
+        .await
+        .unwrap();
+    assert_eq!(initialization.principal_uid(), child);
+    let before = store.load().await.unwrap();
+    assert!(
+        store
+            .assign_created_principal_for_device_initialization(child, creator, &key)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .assign_created_principal_for_device_initialization(creator, creator, &key)
+            .await
+            .is_err()
+    );
+    assert!(
+        initialization
+            .reserve_rollback(PrincipalId::new("creator").unwrap())
+            .await
+            .is_err()
+    );
+    assert_eq!(before, store.load().await.unwrap());
+    // Credential backfill remains idempotent and conveys no rollback receipt.
+    store
+        .assign_created_principal_for_device(child, creator, &key)
+        .await
+        .unwrap();
+    store
+        .revoke_user_device(creator, key, user.uid)
+        .await
+        .unwrap();
+    let guard = initialization
+        .reserve_rollback(PrincipalId::new("child").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(guard.principal_uid(), child);
+    drop(guard);
+    let graph = store.load().await.unwrap();
+    assert!(graph.principal_owner(child).is_none());
+    assert!(graph.accountable_user(child).is_none());
+    assert!(graph.principal_deletions.contains_key(&child));
+}

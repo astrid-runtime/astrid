@@ -18,7 +18,7 @@ use astrid_storage::{ContentName, ScopedKvStore, StateOwner};
 use crate::Kernel;
 
 #[cfg(not(target_family = "wasm"))]
-mod workspace;
+pub(super) mod workspace;
 
 struct ReadyCapsule {
     id: CapsuleId,

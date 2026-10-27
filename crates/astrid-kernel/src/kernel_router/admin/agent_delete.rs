@@ -156,7 +156,7 @@ pub(super) async fn prepare_identity_removal(
 pub(super) async fn prepare_initialization_rollback(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
-    initialization: &astrid_storage::ownership::DerivedPrincipalInitialization,
+    initialization: &astrid_storage::ownership::PrincipalInitialization,
 ) -> Result<PendingIdentityRemoval, AdminResponseBody> {
     let user = kernel
         .identity_store

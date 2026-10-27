@@ -11,7 +11,8 @@ use super::super::handlers::{
     AGENT_IDENTITY_PLATFORM, err_bad_input, err_internal, err_profile, principal_profile_path,
     require_principal_exists, success_json,
 };
-use super::create::{materialize_cloned_capsule_installs, provision_new_principal};
+use super::create::materialize_cloned_capsule_installs;
+use super::registration::{RegisteredPrincipal, register_new_principal};
 use super::rollback::{rollback_after_failure, rollback_failed_initialization};
 
 pub(crate) struct DerivedPrincipalTarget {
@@ -30,115 +31,39 @@ pub(crate) async fn provision_derived_principal(
     inherit_capsule_state: Vec<String>,
     network_egress: Vec<String>,
 ) -> AdminResponseBody {
+    if let Err(response) = validate_derived_request(
+        kernel,
+        &target,
+        &source,
+        &load_capsules,
+        &allow_capsules,
+        &inherit_capsule_state,
+        &network_egress,
+    )
+    .await
+    {
+        return response;
+    }
     let DerivedPrincipalTarget {
         principal,
         profile_path,
         ownership,
     } = target;
-    if source == principal {
-        return err_bad_input("derived principal cannot use itself as its source".to_string());
-    }
-    if let Err(response) = ensure_derived_target_clean(kernel, &principal, &profile_path).await {
-        return response;
-    }
-    let source_path = principal_profile_path(kernel, &source);
-    if let Err(e) = require_principal_exists(&source, &source_path) {
-        return err_bad_input(format!("derive source rejected: {e}"));
-    }
-    if let Err(response) = validate_derived_capsules(
-        kernel,
-        &source,
-        &load_capsules,
-        &allow_capsules,
-        &inherit_capsule_state,
-    ) {
-        return response;
-    }
-    if let Err(response) = validate_derived_network(&network_egress) {
-        return response;
-    }
 
-    let response = provision_new_principal(
+    let RegisteredPrincipal { mut profile, .. } = match register_new_principal(
         kernel,
         principal.clone(),
         profile_path.clone(),
         vec![astrid_core::groups::BUILTIN_RESTRICTED.to_string()],
         Vec::new(),
         None,
-        None,
         false,
-        false,
-        None,
     )
-    .await;
-    if !matches!(response, AdminResponseBody::Success(_)) {
-        return response;
-    }
-
-    let mut profile = match PrincipalProfile::load_from_path(&profile_path) {
-        Ok(profile) => profile,
-        Err(e) => {
-            return rollback_after_failure(kernel, &principal, err_profile(&principal, &e)).await;
-        },
+    .await
+    {
+        Ok(registered) => registered,
+        Err(response) => return response,
     };
-    profile.capsules = allow_capsules;
-    profile.network.egress = network_egress;
-    if let Err(e) = profile.validate() {
-        return rollback_after_failure(
-            kernel,
-            &principal,
-            err_bad_input(format!("derived profile rejected: {e}")),
-        )
-        .await;
-    }
-
-    if let Err(e) = materialize_cloned_capsule_installs(kernel, &source, &principal, &load_capsules)
-    {
-        return rollback_after_failure(
-            kernel,
-            &principal,
-            err_internal(format!("derived capsule materialization failed: {e}")),
-        )
-        .await;
-    }
-    if let Err(e) = profile.save_to_path(&profile_path) {
-        return rollback_after_failure(kernel, &principal, err_profile(&principal, &e)).await;
-    }
-    kernel.profile_cache.invalidate(&principal);
-    if let Err(e) = super::super::inheritance::inherit_selected_capsule_state(
-        kernel,
-        &source,
-        &principal,
-        &inherit_capsule_state,
-    )
-    .await
-    {
-        return rollback_after_failure(
-            kernel,
-            &principal,
-            err_internal(format!("derived state inheritance failed: {e}")),
-        )
-        .await;
-    }
-    finish_derived_principal(
-        kernel,
-        principal,
-        source,
-        load_capsules,
-        profile,
-        &ownership,
-    )
-    .await
-}
-
-async fn finish_derived_principal(
-    kernel: &Arc<crate::Kernel>,
-    principal: PrincipalId,
-    source: PrincipalId,
-    load_capsules: Vec<String>,
-    profile: PrincipalProfile,
-    ownership: &astrid_storage::ownership::DerivedPrincipalOwnership,
-) -> AdminResponseBody {
     let uid = match kernel.principal_directory.uid_for(&principal) {
         Ok(uid) => uid,
         Err(error) => {
@@ -148,7 +73,7 @@ async fn finish_derived_principal(
     };
     let initialization = match kernel
         .ownership_store
-        .assign_derived_principal_for_initialization(uid, ownership)
+        .assign_derived_principal_for_initialization(uid, &ownership)
         .await
     {
         Ok(initialization) => initialization,
@@ -161,10 +86,110 @@ async fn finish_derived_principal(
             .await;
         },
     };
-    // Capsule initialization binds durable workspace state to the current
-    // accountable owner. Publish the captured ownership before loading so
-    // first load and restart resolve the same fleet. Readiness failure still
-    // uses the full owned-principal retirement rollback below.
+    // Profiles are visible to concurrent reload and boot warm. Assign before
+    // the first publication, not merely before this task's readiness check.
+    profile.capsules = allow_capsules;
+    profile.network.egress = network_egress;
+    if let Err(e) = profile.validate() {
+        return rollback_failed_initialization(
+            kernel,
+            &principal,
+            &initialization,
+            err_bad_input(format!("derived profile rejected: {e}")),
+        )
+        .await;
+    }
+
+    if let Err(e) = profile.save_to_path(&profile_path) {
+        return rollback_failed_initialization(
+            kernel,
+            &principal,
+            &initialization,
+            err_profile(&principal, &e),
+        )
+        .await;
+    }
+    kernel.profile_cache.invalidate(&principal);
+    #[cfg(all(test, not(target_family = "wasm")))]
+    super::super::state_tests_agent_derive::workspace::pause_after_profile_publication(&principal)
+        .await;
+    if let Err(response) = initialize_derived_capsule_state(
+        kernel,
+        &source,
+        &principal,
+        &load_capsules,
+        &inherit_capsule_state,
+    )
+    .await
+    {
+        return rollback_failed_initialization(kernel, &principal, &initialization, response).await;
+    }
+    finish_derived_principal(
+        kernel,
+        principal,
+        source,
+        load_capsules,
+        profile,
+        &initialization,
+    )
+    .await
+}
+
+async fn validate_derived_request(
+    kernel: &Arc<crate::Kernel>,
+    target: &DerivedPrincipalTarget,
+    source: &PrincipalId,
+    load_capsules: &[String],
+    allow_capsules: &[String],
+    inherit_capsule_state: &[String],
+    network_egress: &[String],
+) -> Result<(), AdminResponseBody> {
+    if source == &target.principal {
+        return Err(err_bad_input(
+            "derived principal cannot use itself as its source".to_string(),
+        ));
+    }
+    ensure_derived_target_clean(kernel, &target.principal, &target.profile_path).await?;
+    let source_path = principal_profile_path(kernel, source);
+    require_principal_exists(source, &source_path)
+        .map_err(|e| err_bad_input(format!("derive source rejected: {e}")))?;
+    validate_derived_capsules(
+        kernel,
+        source,
+        load_capsules,
+        allow_capsules,
+        inherit_capsule_state,
+    )?;
+    validate_derived_network(network_egress)
+}
+
+async fn initialize_derived_capsule_state(
+    kernel: &Arc<crate::Kernel>,
+    source: &PrincipalId,
+    principal: &PrincipalId,
+    load_capsules: &[String],
+    inherit_capsule_state: &[String],
+) -> Result<(), AdminResponseBody> {
+    materialize_cloned_capsule_installs(kernel, source, principal, load_capsules)
+        .map_err(|e| err_internal(format!("derived capsule materialization failed: {e}")))?;
+    super::super::inheritance::inherit_selected_capsule_state(
+        kernel,
+        source,
+        principal,
+        inherit_capsule_state,
+    )
+    .await
+    .map_err(|e| err_internal(format!("derived state inheritance failed: {e}")))
+}
+
+async fn finish_derived_principal(
+    kernel: &Arc<crate::Kernel>,
+    principal: PrincipalId,
+    source: PrincipalId,
+    load_capsules: Vec<String>,
+    profile: PrincipalProfile,
+    initialization: &astrid_storage::ownership::PrincipalInitialization,
+) -> AdminResponseBody {
     if let Err(error) = kernel
         .ensure_principal_capsules_ready(&principal, &load_capsules)
         .await
@@ -172,7 +197,7 @@ async fn finish_derived_principal(
         return rollback_failed_initialization(
             kernel,
             &principal,
-            &initialization,
+            initialization,
             err_internal(format!("derived capsule readiness failed: {error}")),
         )
         .await;

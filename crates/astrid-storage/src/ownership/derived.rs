@@ -1,8 +1,8 @@
 //! Fleet inheritance for capability-authorized agent spawning.
 
-use astrid_core::{PrincipalId, PrincipalOwnership, PrincipalUid, UserUid};
+use astrid_core::{PrincipalOwnership, PrincipalUid, UserUid};
 
-use super::{OwnershipError, OwnershipStore, PrincipalDeletionGuard};
+use super::{OwnershipError, OwnershipStore, PrincipalInitialization};
 
 #[cfg(test)]
 mod tests;
@@ -15,52 +15,6 @@ mod tests;
 pub struct DerivedPrincipalOwnership {
     creator: PrincipalOwnership,
     accountable_user: UserUid,
-}
-
-/// Ephemeral rollback authority for one successfully assigned fresh child.
-///
-/// This receipt does not delegate user or device authority. Dropping it after
-/// initialization leaves the assignment intact. It cannot be constructed or
-/// cloned by a caller, or redirected to a peer. Reservation checks that the
-/// child still has the captured ownership and accountability assignment.
-#[derive(Debug)]
-pub struct DerivedPrincipalInitialization {
-    store: OwnershipStore,
-    child: PrincipalOwnership,
-    accountable_user: UserUid,
-}
-
-impl DerivedPrincipalInitialization {
-    /// Immutable child identity whose failed initialization may be retired.
-    #[must_use]
-    pub const fn principal_uid(&self) -> PrincipalUid {
-        self.child.principal_uid
-    }
-
-    /// Reserve rollback of this exact assignment before reclaiming identity.
-    ///
-    /// # Errors
-    /// Rejects changed ownership/accountability, alias conflicts, an unknown
-    /// child, and invalid storage. Reservation and removal commit atomically.
-    pub async fn reserve_rollback(
-        &self,
-        alias: PrincipalId,
-    ) -> Result<PrincipalDeletionGuard, OwnershipError> {
-        self.store
-            .guard_principal_deletion_checked(self.child.principal_uid, Some(alias), |graph| {
-                if graph.principal_owner(self.child.principal_uid) != Some(&self.child)
-                    || graph.accountable_user(self.child.principal_uid)
-                        != Some(self.accountable_user)
-                {
-                    return Err(OwnershipError::IdentityConflict(
-                        "derived initialization rollback",
-                        self.child.principal_uid.to_string(),
-                    ));
-                }
-                Ok(Some(self.child.fleet_uid))
-            })
-            .await
-    }
 }
 
 impl OwnershipStore {
@@ -121,7 +75,7 @@ impl OwnershipStore {
         &self,
         child: PrincipalUid,
         ownership: &DerivedPrincipalOwnership,
-    ) -> Result<DerivedPrincipalInitialization, OwnershipError> {
+    ) -> Result<PrincipalInitialization, OwnershipError> {
         self.mutate(|graph| {
             let creator = ownership.creator.principal_uid;
             for uid in [creator, child] {
@@ -160,14 +114,14 @@ impl OwnershipStore {
             Ok(())
         })
         .await?;
-        Ok(DerivedPrincipalInitialization {
-            store: self.clone(),
-            child: PrincipalOwnership {
+        Ok(PrincipalInitialization::new(
+            self.clone(),
+            PrincipalOwnership {
                 principal_uid: child,
                 fleet_uid: ownership.creator.fleet_uid,
                 assigned_by: ownership.creator.assigned_by,
             },
-            accountable_user: ownership.accountable_user,
-        })
+            ownership.accountable_user,
+        ))
     }
 }

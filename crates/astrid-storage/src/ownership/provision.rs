@@ -2,7 +2,7 @@
 
 use astrid_core::{PrincipalOwnership, PrincipalUid, UserUid};
 
-use super::{OwnershipError, OwnershipSnapshot, OwnershipStore};
+use super::{OwnershipError, OwnershipSnapshot, OwnershipStore, PrincipalInitialization};
 
 impl OwnershipStore {
     /// Assign a new principal to its creator's current fleet atomically.
@@ -48,6 +48,46 @@ impl OwnershipStore {
             self.assign_creation_in_graph(graph, created, creator, actor)
         })
         .await
+    }
+
+    /// Assign a previously unowned principal and retain initialization rollback.
+    ///
+    /// Device delegation, fleet management and assignment are checked in one
+    /// mutation. Unlike idempotent credential backfill, this rejects every
+    /// existing assignment: initialization cannot authorize retiring a peer.
+    ///
+    /// # Errors
+    /// Rejects existing ownership and all device-based assignment failures.
+    pub async fn assign_created_principal_for_device_initialization(
+        &self,
+        created: PrincipalUid,
+        creator: PrincipalUid,
+        public_key: &[u8; 32],
+    ) -> Result<PrincipalInitialization, OwnershipError> {
+        let (assignment, actor) = self
+            .mutate(|graph| {
+                if let Some(owner) = graph.principal_owner(created) {
+                    return Err(OwnershipError::PrincipalAlreadyOwned {
+                        principal: created,
+                        fleet: owner.fleet_uid,
+                    });
+                }
+                let actor = graph
+                    .user_for_device(creator, public_key)
+                    .ok_or(OwnershipError::UserDeviceNotBound(creator))?;
+                self.assign_creation_in_graph(graph, created, creator, actor)?;
+                let assignment = graph
+                    .principal_owner(created)
+                    .ok_or(OwnershipError::PrincipalNotOwned(created))?
+                    .clone();
+                Ok((assignment, actor))
+            })
+            .await?;
+        Ok(PrincipalInitialization::new(
+            self.clone(),
+            assignment,
+            actor,
+        ))
     }
 
     pub(super) fn assign_creation_in_graph(

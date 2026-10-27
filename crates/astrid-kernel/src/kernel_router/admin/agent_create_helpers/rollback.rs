@@ -17,7 +17,7 @@ pub(super) async fn rollback_after_failure(
 pub(super) async fn rollback_failed_initialization(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
-    initialization: &astrid_storage::ownership::DerivedPrincipalInitialization,
+    initialization: &astrid_storage::ownership::PrincipalInitialization,
     original: AdminResponseBody,
 ) -> AdminResponseBody {
     rollback_with_initialization(kernel, principal, Some(initialization), original).await
@@ -26,7 +26,7 @@ pub(super) async fn rollback_failed_initialization(
 async fn rollback_with_initialization(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
-    initialization: Option<&astrid_storage::ownership::DerivedPrincipalInitialization>,
+    initialization: Option<&astrid_storage::ownership::PrincipalInitialization>,
     original: AdminResponseBody,
 ) -> AdminResponseBody {
     match rollback_derived_principal(kernel, principal, initialization).await {
@@ -40,7 +40,7 @@ async fn rollback_with_initialization(
 async fn rollback_derived_principal(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
-    initialization: Option<&astrid_storage::ownership::DerivedPrincipalInitialization>,
+    initialization: Option<&astrid_storage::ownership::PrincipalInitialization>,
 ) -> Result<(), String> {
     let pending = prepare_rollback(kernel, principal, initialization).await?;
     reclaim_derived_principal(kernel, principal, pending).await
@@ -49,7 +49,7 @@ async fn rollback_derived_principal(
 async fn prepare_rollback(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
-    initialization: Option<&astrid_storage::ownership::DerivedPrincipalInitialization>,
+    initialization: Option<&astrid_storage::ownership::PrincipalInitialization>,
 ) -> Result<super::super::agent_delete::PendingIdentityRemoval, String> {
     crate::legacy_migration_barrier::ensure_principal_delete_allowed(
         &kernel.astrid_home,
