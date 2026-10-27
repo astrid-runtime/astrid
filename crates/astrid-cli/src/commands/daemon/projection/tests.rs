@@ -1,26 +1,15 @@
 use super::inspect_while_fenced;
-use std::fs::OpenOptions;
-use std::sync::Arc;
+use std::fs::File;
 
 #[test]
 fn inspection_excludes_stop_and_releases_fence_before_approval() {
     for fail_inspection in [false, true] {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("start-fence");
-        let owner = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .unwrap();
-        owner.lock().unwrap();
-        let stop = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let path = directory.path().join("astrid-start-fences/fixture.lock");
+        let owner = super::super::start_fence::open(&path).unwrap();
+        let stop = File::options().read(true).write(true).open(&path).unwrap();
 
-        let result = inspect_while_fenced(Arc::new(owner), || {
+        let result = inspect_while_fenced(owner, || {
             assert!(
                 stop.try_lock().is_err(),
                 "stop could retire the inspected projection"

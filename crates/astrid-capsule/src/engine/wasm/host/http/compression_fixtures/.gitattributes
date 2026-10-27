@@ -1,0 +1,4 @@
+payload.txt text eol=lf
+SOURCE.txt text eol=lf
+*.zst binary
+*.br binary

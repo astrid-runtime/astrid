@@ -40,7 +40,7 @@ pub(crate) async fn with_persistent_daemon_projection<T>(
 }
 
 fn inspect_while_fenced<T>(
-    fence: std::sync::Arc<std::fs::File>,
+    fence: std::sync::Arc<super::start_fence::DaemonStartFence>,
     inspect: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     let result = inspect();

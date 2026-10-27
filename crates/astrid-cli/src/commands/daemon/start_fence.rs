@@ -1,11 +1,37 @@
 //! Open the singleton fence without following appended temporary-path aliases.
 use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
 
+/// Exclusive start-fence lease. The last `Arc` drop unlocks explicitly so a
+/// duplicated open description cannot extend the lease past guard ownership.
+pub(crate) struct DaemonStartFence {
+    file: File,
+}
+
+impl DaemonStartFence {
+    fn hold(file: File) -> Arc<Self> {
+        Arc::new(Self { file })
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        self.file.metadata()
+    }
+}
+
+impl Drop for DaemonStartFence {
+    fn drop(&mut self) {
+        if let Err(error) = self.file.unlock() {
+            tracing::warn!(%error, "failed to release daemon start fence explicitly");
+        }
+    }
+}
+
 #[cfg(unix)]
-pub(super) fn open(path: &Path) -> Result<File> {
+pub(super) fn open(path: &Path) -> Result<Arc<DaemonStartFence>> {
     use nix::fcntl::{OFlag, open, openat};
     use nix::sys::stat::Mode;
     use std::os::unix::fs::MetadataExt;
@@ -61,7 +87,7 @@ pub(super) fn open(path: &Path) -> Result<File> {
         "start fence must be a private regular single-link file owned by this user"
     );
     file.lock().context("lock daemon start fence")?;
-    Ok(file)
+    Ok(DaemonStartFence::hold(file))
 }
 
 /// Keep the legacy lock for its owner so old and new CLIs still serialize.
@@ -105,7 +131,7 @@ fn create_directory(root: &std::os::fd::OwnedFd, name: &std::ffi::OsStr) -> Resu
 mod tests;
 
 #[cfg(not(unix))]
-pub(super) fn open(path: &Path) -> Result<File> {
+pub(super) fn open(path: &Path) -> Result<Arc<DaemonStartFence>> {
     let parent = path.parent().context("start fence has no directory")?;
     match std::fs::create_dir(parent) {
         Ok(()) => {},
@@ -130,5 +156,5 @@ pub(super) fn open(path: &Path) -> Result<File> {
         .truncate(false)
         .open(path)?;
     file.lock()?;
-    Ok(file)
+    Ok(DaemonStartFence::hold(file))
 }

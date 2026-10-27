@@ -1,0 +1,20 @@
+HTTP host compression fixtures for reqwest auto-decompress regressions.
+
+Generated 2026-10-27 on macOS with host CLI codecs (not crate dev-dependencies):
+  zstd   v1.5.7  (/opt/homebrew/bin/zstd)  — same libzstd as zstd-sys 2.1.2+zstd.1.5.7
+  brotli 1.2.0   (/opt/homebrew/bin/brotli)
+
+payload.txt is exactly 64 copies of the ASCII line
+  astrid-http-compression-fixture-v1\n
+(2240 bytes, LF only, no NUL). SHA-256:
+  59bb6eb8de976cf545e73930a405d99d591cca9f38016c96fbf89aae767d8f86
+
+payload.zst:
+  zstd -19 -c payload.txt > payload.zst
+  58 bytes  SHA-256 f8938d065bccaf896fd6af4179b8f43ce7ec54edbf26696a9c97c50ff1ab464e
+
+payload.br:
+  brotli -q 11 -c payload.txt > payload.br
+  44 bytes  SHA-256 ef5d087c2eae12b04fa732a08151ef99fb5bd4ce93dcbeb7d99a83746caba67e
+
+Do not regenerate unless the plaintext or host codec version changes; tests pin these bytes.
