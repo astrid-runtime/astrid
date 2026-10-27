@@ -269,7 +269,37 @@ wasmparser = "0.257.1"
 windows-sys = "0.61"
 wit-component = "0.257.1"
 wit-parser = "0.257.1"
-wasmtime = { version = "48.0.7", features = ["component-model", "cranelift", "call-hook"] }
+# Wasmtime 48.0.7 defaults include `cache` -> wasmtime-internal-cache -> zstd ^0.13.
+# Astrid never calls Config::cache(); compiled-code reuse is CompiledWasmCache.
+# Keep every other 48.0.7 default plus the existing extra `call-hook`.
+wasmtime = { version = "48.0.7", default-features = false, features = [
+    "anyhow",
+    "async",
+    "backtrace",
+    "gc",
+    "gc-copying",
+    "gc-drc",
+    "gc-null",
+    "wat",
+    "profiling",
+    "parallel-compilation",
+    "cranelift",
+    "pooling-allocator",
+    "demangle",
+    "addr2line",
+    "coredump",
+    "debug-builtins",
+    "runtime",
+    "component-model",
+    "component-model-async",
+    "threads",
+    "stack-switching",
+    "std",
+    "debug",
+    "compile-time-builtins",
+    "wit-parser",
+    "call-hook",
+] }
 wasmtime-wasi = "48.0.7"
 unicode-normalization = "=0.1.25"
 unicode-width = "0.2"

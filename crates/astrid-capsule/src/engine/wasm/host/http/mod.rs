@@ -401,3 +401,7 @@ mod audit_tests;
 #[cfg(test)]
 #[path = "credentials_tests.rs"]
 mod credentials_tests;
+
+#[cfg(test)]
+#[path = "compression_tests.rs"]
+mod compression_tests;
