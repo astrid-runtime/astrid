@@ -139,6 +139,55 @@ fn reclaim_crash_after_rename_before_directory_flush_child() {
     std::process::exit(19);
 }
 
+#[test]
+#[ignore = "subprocess working-directory entry point"]
+fn relative_volume_path_after_working_directory_change_child() {
+    let root = PathBuf::from(std::env::var_os("ASTRID_STORAGE_TEST_RELATIVE_PATH").unwrap());
+    std::env::set_current_dir(&root).unwrap();
+    let volume = HostedFileVolume::open("storage/astrid.volume").unwrap();
+    let region = VolumeRegion::new("objects").unwrap();
+    volume.create_region(&region, true).unwrap();
+    volume.write_region_at(&region, 0, b"before").unwrap();
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::env::set_current_dir(&elsewhere).unwrap();
+    volume.sync().unwrap();
+    volume.reclaim().unwrap();
+    volume.write_region_at(&region, 0, b"after!").unwrap();
+    volume.sync().unwrap();
+    let bare = HostedFileVolume::open("bare.volume").unwrap();
+    bare.create_region(&region, true).unwrap();
+    bare.write_region_at(&region, 0, b"bare").unwrap();
+    bare.sync().unwrap();
+}
+
+#[test]
+fn relative_volume_keeps_original_path_after_working_directory_changes() {
+    let temporary = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "volume::hosted::maintenance_tests::relative_volume_path_after_working_directory_change_child",
+            "--ignored",
+        ])
+        .env("ASTRID_STORAGE_TEST_RELATIVE_PATH", temporary.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let volume = HostedFileVolume::open(temporary.path().join("storage/astrid.volume")).unwrap();
+    let mut bytes = [0; 6];
+    volume
+        .read_region_at(&VolumeRegion::new("objects").unwrap(), 0, &mut bytes)
+        .unwrap();
+    assert_eq!(&bytes, b"after!");
+    assert!(!temporary.path().join("elsewhere/storage").exists());
+    let bare = HostedFileVolume::open(temporary.path().join("elsewhere/bare.volume")).unwrap();
+    let mut bytes = [0; 4];
+    bare.read_region_at(&VolumeRegion::new("objects").unwrap(), 0, &mut bytes)
+        .unwrap();
+    assert_eq!(&bytes, b"bare");
+}
+
 #[cfg(unix)]
 #[test]
 fn reopen_after_interrupted_publication_requires_directory_flush_before_ack() {

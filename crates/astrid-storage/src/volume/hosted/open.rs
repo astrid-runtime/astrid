@@ -65,7 +65,9 @@ impl HostedFileVolume {
     /// exists, recovery reads the footer, the named snapshot commit, and a
     /// bounded tail of later records ending at that footer sequence.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Arc<Self>> {
-        let path = path.as_ref().to_path_buf();
+        // Capture relative-path ownership once; later sync and reclaim must
+        // still target this volume if the process changes its directory.
+        let path = std::path::absolute(path.as_ref())?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
