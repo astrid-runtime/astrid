@@ -522,9 +522,14 @@ where
         if self.lifecycle.load(std::sync::atomic::Ordering::Acquire) != LIFECYCLE_USABLE {
             return None;
         }
-        Some(crate::engine::ReadyKvRoot::new(
-            self.published_roots.get(principal),
-        ))
+        let root = self.published_roots.get(principal);
+        // Close publishes its lifecycle fence before discarding the root map.
+        // A reader that observes the cleared map must fall back to the locked
+        // path, which reports Closed, rather than treating it as an absent root.
+        if self.lifecycle.load(std::sync::atomic::Ordering::Acquire) != LIFECYCLE_USABLE {
+            return None;
+        }
+        Some(crate::engine::ReadyKvRoot::new(root))
     }
 
     /// Return a consistent copy of every current principal root.
