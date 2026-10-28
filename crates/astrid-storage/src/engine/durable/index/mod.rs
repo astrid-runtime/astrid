@@ -273,7 +273,9 @@ pub(super) fn recover_index(
         .collect::<Vec<_>>();
     ordered.sort_by_key(|(_, location)| location.offset);
     for (id, location) in ordered {
-        if verify_indexed_location(arena, id, location, scheme, limits).is_err() {
+        if verify_indexed_location(arena, id, location, scheme, limits, authoritative_arena_len)
+            .is_err()
+        {
             return None;
         }
     }
@@ -281,6 +283,11 @@ pub(super) fn recover_index(
         Some(location) if verify_indexed_tail(arena, location, limits).is_err() => return None,
         None if state.arena_len != 0 => return None,
         _ => {},
+    }
+    // Prefix checks share the length captured before recovery. Do not accept
+    // that view if the underlying media changed length during validation.
+    if arena.metadata().ok()?.len() != authoritative_arena_len {
+        return None;
     }
     Some(state)
 }

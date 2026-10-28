@@ -16,6 +16,8 @@ use std::path::Path;
 const IDENTITY_PREFIX_BYTES: usize = 8;
 const CURRENT_DIGEST_BYTES: u32 = 32;
 const CURRENT_DIGEST_BYTES_USIZE: usize = 32;
+const TAGGED_IDENTITY_BYTES: usize = IDENTITY_PREFIX_BYTES + CURRENT_DIGEST_BYTES_USIZE;
+const INDEXED_PREFIX_BYTES: usize = FRAME_HEADER_LEN_USIZE + TAGGED_IDENTITY_BYTES;
 const MIN_REFERENCE_WIRE_BYTES: usize =
     std::mem::size_of::<u64>() + IDENTITY_PREFIX_BYTES + CURRENT_DIGEST_BYTES_USIZE + 1;
 
@@ -27,6 +29,8 @@ thread_local! {
 mod indexed;
 mod prepared;
 mod reader;
+#[cfg(test)]
+mod verify_indexed_location_tests;
 
 #[cfg(test)]
 pub(super) use indexed::{last_batch_spans, reset_last_batch_spans};
@@ -38,35 +42,48 @@ pub(super) use prepared::{PreparedFrame, append_prepared_frames};
 use reader::SliceReader;
 
 pub(super) fn verify_indexed_location<F: DurableIo>(
-    arena: &mut F,
+    arena: &F,
     expected_id: ObjectId,
     location: ArenaLocation,
     scheme: IdentityScheme,
     limits: RecoveryLimits,
+    authoritative_arena_len: u64,
 ) -> Result<(), DurableError> {
-    let file_len = arena
-        .durable_metadata()
-        .map_err(|source| io_error("read indexed arena metadata", source))?
-        .len();
     let frame_end = location
         .offset
         .checked_add(FRAME_HEADER_LEN)
         .and_then(|value| value.checked_add(location.payload_len))
         .ok_or(DurableError::EncodingOverflow)?;
-    if frame_end > file_len {
+    if frame_end > authoritative_arena_len {
         return Err(corrupt(
             ARENA_FILE,
             location.offset,
             "indexed frame extends beyond the arena",
         ));
     }
-    arena
-        .seek(SeekFrom::Start(location.offset))
-        .map_err(|source| io_error("seek indexed arena header", source))?;
-    let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
-    arena
-        .read_exact(&mut header)
-        .map_err(|source| io_error("read indexed arena header", source))?;
+    let identity_len =
+        u64::try_from(TAGGED_IDENTITY_BYTES).map_err(|_| DurableError::EncodingOverflow)?;
+    if location.payload_len < identity_len {
+        return Err(corrupt(
+            ARENA_FILE,
+            location.offset,
+            "indexed object identity prefix is truncated",
+        ));
+    }
+    let mut prefix = [0_u8; INDEXED_PREFIX_BYTES];
+    read_exact_at(arena, &mut prefix, location.offset)
+        .map_err(|source| io_error("read indexed arena prefix", source))?;
+    authenticate_indexed_prefix(&prefix, expected_id, location, scheme, limits)
+}
+
+fn authenticate_indexed_prefix(
+    prefix: &[u8; INDEXED_PREFIX_BYTES],
+    expected_id: ObjectId,
+    location: ArenaLocation,
+    scheme: IdentityScheme,
+    limits: RecoveryLimits,
+) -> Result<(), DurableError> {
+    let header = &prefix[..FRAME_HEADER_LEN_USIZE];
     if header[..8] != ARENA_MAGIC
         || u16::from_le_bytes([header[8], header[9]]) != FRAME_VERSION
         || header[10..12] != [0, 0]
@@ -100,11 +117,8 @@ pub(super) fn verify_indexed_location<F: DurableIo>(
             "indexed frame header does not match the cache",
         ));
     }
-    let mut identity_bytes = [0_u8; IDENTITY_PREFIX_BYTES + CURRENT_DIGEST_BYTES_USIZE];
-    arena
-        .read_exact(&mut identity_bytes)
-        .map_err(|source| io_error("read indexed object identity", source))?;
-    let mut reader = SliceReader::new(&identity_bytes);
+    let identity_bytes = &prefix[FRAME_HEADER_LEN_USIZE..];
+    let mut reader = SliceReader::new(identity_bytes);
     let actual = reader
         .identity(scheme)
         .map_err(|detail| corrupt(ARENA_FILE, location.offset, detail))?;
@@ -805,12 +819,11 @@ pub(super) fn object_frame_declares_identity(
     scheme: IdentityScheme,
     id: ObjectId,
 ) -> bool {
-    const IDENTITY_BYTES: usize = IDENTITY_PREFIX_BYTES + CURRENT_DIGEST_BYTES_USIZE;
-    frame_payload.len() >= IDENTITY_BYTES
+    frame_payload.len() >= TAGGED_IDENTITY_BYTES
         && frame_payload[..2] == scheme.algorithm().to_le_bytes()
         && frame_payload[2..4] == scheme.construction().to_le_bytes()
         && frame_payload[4..8] == CURRENT_DIGEST_BYTES.to_le_bytes()
-        && frame_payload[8..IDENTITY_BYTES] == *id.as_bytes()
+        && frame_payload[8..TAGGED_IDENTITY_BYTES] == *id.as_bytes()
 }
 
 pub(super) fn canonical_record_bytes(
