@@ -13,6 +13,8 @@ use super::{
     truncate_extents,
 };
 
+mod snapshot;
+
 const RECOVERY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_METADATA_PAYLOAD_BYTES: u64 = 2 * 1024 * 1024;
 // This is a format bound, not an operator knob: a commit snapshot and the
@@ -353,7 +355,7 @@ fn apply_record(
                 return Err(invalid_transition("invalid volume commit boundary"));
             }
             if let Some(payload) = payload.filter(|payload| !payload.is_empty()) {
-                *regions = decode_region_snapshot(payload, header_start(header)?)?;
+                snapshot::replace_from_snapshot(regions, payload, header_start(header)?)?;
             }
         },
         Operation::Write => {
