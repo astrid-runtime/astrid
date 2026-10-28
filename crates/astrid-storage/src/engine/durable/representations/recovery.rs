@@ -9,10 +9,10 @@ use std::io::SeekFrom;
 use super::super::DurableIo;
 
 use crate::storage_model::{
-    CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapKey, PhysicalMapNode, PlacementEntry,
-    PlacementSet, Recipe, RepresentationCatalogueRoot, RepresentationProfile,
-    RepresentationProfileId, RepresentationRecord, RepresentationRecordId, RepresentationState,
-    RepresentationStateId,
+    BlobId, CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapKey, PhysicalMapNode,
+    PlacementEntry, PlacementSet, Recipe, ReplicaLocator, RepresentationCatalogueRoot,
+    RepresentationProfile, RepresentationProfileId, RepresentationRecord, RepresentationRecordId,
+    RepresentationState, RepresentationStateId,
 };
 
 use super::super::{FRAME_HEADER_LEN, scan_frames};
@@ -22,7 +22,8 @@ use super::format::{
     journal_digest, map_node_id,
 };
 use super::{
-    DurableError, FIRST_JOURNAL_GENERATION, RecoveryLimits, increment, io_error, read_all,
+    ArenaLocation, DurableError, FIRST_JOURNAL_GENERATION, GenerationZeroLocations, RecoveryLimits,
+    increment, io_error, read_all,
 };
 
 #[derive(Default)]
@@ -424,11 +425,18 @@ pub(super) fn validate_profiles(
     ))
 }
 
+pub(super) struct ValidatedRepresentations {
+    pub(super) reverse: BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
+    pub(super) extent_count: u64,
+    pub(super) locations: GenerationZeroLocations,
+}
+
 pub(super) fn validate_representations(
     profiles: &CanonicalPhysicalMap,
     representations: &CanonicalPhysicalMap,
     placements: &CanonicalPhysicalMap,
-) -> Result<(BTreeMap<ObjectId, Vec<RepresentationRecordId>>, u64), DurableError> {
+    direct_profile: RepresentationProfileId,
+) -> Result<ValidatedRepresentations, DurableError> {
     let mut placement_by_blob = BTreeMap::new();
     let mut extent_count = 0_u64;
     for (key, bytes) in active_entries(placements)? {
@@ -455,6 +463,9 @@ pub(super) fn validate_representations(
         placement_by_blob.insert(entry.blob(), entry);
     }
     let mut reverse = BTreeMap::<ObjectId, Vec<RepresentationRecordId>>::new();
+    // First matching direct_profile blob per object in reverse-vector order.
+    // Record payloads are not retained; placement_by_blob is already decoded.
+    let mut selected = BTreeMap::<ObjectId, BlobId>::new();
     for (key, bytes) in active_entries(representations)? {
         let record = RepresentationRecord::decode(bytes)?;
         let id = record.identify(&Blake3PhysicalIdentity)?;
@@ -491,8 +502,68 @@ pub(super) fn validate_representations(
             ));
         }
         reverse.entry(object).or_default().push(id);
+        if record.profile() == direct_profile {
+            selected.entry(object).or_insert(blob);
+        }
     }
-    Ok((reverse, extent_count))
+    let locations =
+        generation_zero_locations_from_selected(&reverse, &selected, &placement_by_blob)?;
+    Ok(ValidatedRepresentations {
+        reverse,
+        extent_count,
+        locations: GenerationZeroLocations::new(locations),
+    })
+}
+
+pub(super) fn generation_zero_arena_locations(
+    placement: &PlacementEntry,
+) -> impl Iterator<Item = ArenaLocation> + '_ {
+    placement
+        .replicas()
+        .iter()
+        .filter_map(|replica| match replica.locator() {
+            ReplicaLocator::ArenaFrame {
+                arena_generation: 0,
+                offset,
+                payload_length,
+                frame_checksum,
+            } => Some(ArenaLocation {
+                offset,
+                payload_len: payload_length,
+                checksum: frame_checksum,
+            }),
+            _ => None,
+        })
+}
+
+fn generation_zero_locations_from_selected(
+    reverse: &BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
+    selected: &BTreeMap<ObjectId, BlobId>,
+    placements: &BTreeMap<BlobId, PlacementEntry>,
+) -> Result<Vec<(ObjectId, ArenaLocation)>, DurableError> {
+    let mut direct = Vec::new();
+    for object in reverse.keys() {
+        let blob = selected
+            .get(object)
+            .ok_or(DurableError::InvalidRepresentationState(
+                "reverse index has no direct representation",
+            ))?;
+        let placement = placements
+            .get(blob)
+            .ok_or(DurableError::InvalidRepresentationState(
+                "direct representation placement disappeared",
+            ))?;
+        let before = direct.len();
+        for location in generation_zero_arena_locations(placement) {
+            direct.push((*object, location));
+        }
+        if direct.len() == before {
+            return Err(DurableError::InvalidRepresentationState(
+                "direct representation has no generation-zero arena placement",
+            ));
+        }
+    }
+    Ok(direct)
 }
 
 pub(super) fn active_entries(
