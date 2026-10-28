@@ -150,24 +150,12 @@ impl Kernel {
         if authority_bytes != verified.snapshot().package().authority {
             anyhow::bail!("durable capsule authority bytes do not match materialization");
         }
-        let mut expected_files = verified
-            .archive_entries()
-            .map(|(path, bytes)| (path.to_owned(), bytes.to_vec()))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        expected_files.insert(
-            "Capsule.toml".to_owned(),
-            verified.manifest_bytes().to_vec(),
-        );
-        expected_files.insert("meta.json".to_owned(), verified.metadata_bytes().to_vec());
-        expected_files.insert(
-            "authority.json".to_owned(),
-            verified.snapshot().package().authority.clone(),
-        );
+        let expected_files = expected_materialization_files(&verified);
         let actual = Self::inventory_projection_files(dir)?;
         if actual.files
             != expected_files
                 .keys()
-                .cloned()
+                .map(|relative| (*relative).to_owned())
                 .collect::<std::collections::BTreeSet<_>>()
         {
             anyhow::bail!("materialized capsule file inventory differs from durable package");
@@ -395,6 +383,21 @@ impl Kernel {
         }
         self.verify_published_materialization(dir, principal, manifest, snapshot)
     }
+}
+
+/// Borrow the immutable verified bytes for this comparison only. The host
+/// inventory and every projected file are still read afresh at each check.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn expected_materialization_files(
+    verified: &astrid_capsule_install::VerifiedDurableCapsulePackage,
+) -> std::collections::BTreeMap<&str, &[u8]> {
+    let mut files = verified
+        .archive_entries()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    files.insert("Capsule.toml", verified.manifest_bytes());
+    files.insert("meta.json", verified.metadata_bytes());
+    files.insert("authority.json", &verified.snapshot().package().authority);
+    files
 }
 
 #[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
