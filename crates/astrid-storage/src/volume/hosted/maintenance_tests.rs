@@ -121,6 +121,57 @@ fn directory_flush_failure_keeps_publication_pending_until_successful_retry() {
     assert_eq!(&bytes, b"retained");
 }
 
+#[cfg(unix)]
+#[test]
+#[ignore = "subprocess crash entry point"]
+fn reclaim_crash_after_rename_before_directory_flush_child() {
+    let path = PathBuf::from(std::env::var_os("ASTRID_STORAGE_TEST_PUBLICATION_CRASH").unwrap());
+    let volume = HostedFileVolume::open(&path).unwrap();
+    let region = VolumeRegion::new("objects").unwrap();
+    volume.create_region(&region, true).unwrap();
+    volume.write_region_at(&region, 0, b"acknowledged").unwrap();
+    volume.sync().unwrap();
+    reclaim::FAIL_DIRECTORY_SYNC.with(|fail| fail.set(true));
+    assert!(volume.reclaim().is_err());
+    assert!(volume.state.lock().publication_pending);
+    // Bypass Drop: the new inode has a valid footer but its directory flush
+    // failed. Reopen must not infer durable publication from that footer.
+    std::process::exit(19);
+}
+
+#[cfg(unix)]
+#[test]
+fn reopen_after_interrupted_publication_requires_directory_flush_before_ack() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "volume::hosted::maintenance_tests::reclaim_crash_after_rename_before_directory_flush_child",
+            "--ignored",
+        ])
+        .env("ASTRID_STORAGE_TEST_PUBLICATION_CRASH", &path)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(19), "{output:?}");
+    let reopened = HostedFileVolume::open(&path).unwrap();
+    reclaim::FAIL_DIRECTORY_SYNC.with(|fail| fail.set(true));
+    let error = reopened.sync().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected directory flush failure")
+    );
+    assert!(reopened.state.lock().publication_pending);
+    reopened.sync().unwrap();
+    assert!(!reopened.state.lock().publication_pending);
+    let mut bytes = [0; 12];
+    reopened
+        .read_region_at(&VolumeRegion::new("objects").unwrap(), 0, &mut bytes)
+        .unwrap();
+    assert_eq!(&bytes, b"acknowledged");
+}
+
 #[test]
 #[ignore = "subprocess crash entry point"]
 fn reclaim_crash_before_publication_child() {

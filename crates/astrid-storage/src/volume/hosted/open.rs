@@ -105,7 +105,10 @@ impl HostedFileVolume {
             boundary_pending: false,
             footer_pending,
             flush_state: super::FlushState::Required,
-            publication_pending: false,
+            // A process may have exited after replacing this inode but before
+            // flushing the directory. A valid footer cannot prove that the
+            // directory entry is durable; the first sync must confirm it.
+            publication_pending: cfg!(unix),
             #[cfg(windows)]
             restore: super::RestoreState::NotRequired,
             regions: recovery.regions,
