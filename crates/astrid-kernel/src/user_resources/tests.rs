@@ -143,3 +143,44 @@ async fn lifecycle_resolution_shares_the_supplied_runtime_ledger_even_for_admin_
             .is_err()
     );
 }
+
+#[cfg(not(target_family = "wasm"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn configured_cache_budget_reclaims_and_preserves_authoritative_reads() {
+    let root = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(root.path());
+    let workspace = tempfile::tempdir().unwrap();
+    let store = astrid_storage::open_runtime_principal_store(
+        &home,
+        Arc::new(|_: &astrid_storage::StateOwner| Ok(None)),
+    )
+    .await
+    .unwrap();
+    let owner = astrid_storage::StateOwner::System;
+    let name = astrid_storage::ContentName::new("cache-budget-fixture.bin").unwrap();
+    let content = vec![0x5a; 128 * 1024];
+    store.content().put(&owner, &name, &content).unwrap();
+    assert_eq!(
+        store
+            .content()
+            .read_range(&owner, &name, 0, content.len() as u64)
+            .unwrap(),
+        Some(content.clone())
+    );
+    assert!(store.object_cache_stats().resident_bytes > 1);
+    std::fs::write(
+        home.root().join("config.toml"),
+        "[resources]\ndecoded_object_cache_bytes = 1",
+    )
+    .unwrap();
+    configure_object_cache(&store, &home, workspace.path(), &WorkspaceLayout::default()).unwrap();
+    assert_eq!(store.object_cache_stats().resident_bytes, 0);
+    assert_eq!(
+        store
+            .content()
+            .read_range(&owner, &name, 0, content.len() as u64)
+            .unwrap(),
+        Some(content)
+    );
+    assert_eq!(store.object_cache_stats().resident_bytes, 0);
+}

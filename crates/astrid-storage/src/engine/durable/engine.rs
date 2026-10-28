@@ -300,6 +300,13 @@ where
         self.object_cache.reclaim();
     }
 
+    /// Adjust total reconstructible cache residency and reclaim immediately.
+    /// External governed leases and explicit per-principal budgets still apply.
+    /// Discarded entries are reconstructed and verified from durable storage.
+    pub fn set_object_cache_capacity(&self, capacity: crate::engine::ObjectCacheCapacity) {
+        self.object_cache.set_capacity(capacity);
+    }
+
     /// Load one projection-owned process-local accelerator from governed
     /// cache memory.
     ///

@@ -507,6 +507,12 @@ impl RuntimePrincipalStore {
         self.engine.reclaim_object_cache();
     }
 
+    /// Apply a total decoded-object cache target and immediately reclaim.
+    /// Durable objects, history and explicit per-principal budgets are unchanged.
+    pub fn set_object_cache_capacity(&self, capacity: crate::engine::ObjectCacheCapacity) {
+        self.engine.set_object_cache_capacity(capacity);
+    }
+
     /// Return backend-reported free capacity and active arena bytes.
     ///
     /// This read-only media capability is suitable for audit or migration
