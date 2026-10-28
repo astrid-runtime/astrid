@@ -55,11 +55,22 @@ fn canonical_node_identity_borrows_validated_bytes_for_every_construction_and_do
                     context,
                     calls: Cell::new(0),
                 };
+                super::super::codec::reset_encoder_finishes();
                 let (decoded, id) =
                     PhysicalMapNode::decode_and_identify(&bytes, &identity).unwrap();
+                assert_eq!(
+                    super::super::codec::encoder_finishes(),
+                    0,
+                    "decode allocated a roundtrip encoding"
+                );
                 assert_eq!(&decoded, node);
                 assert_eq!(&id, expected_id);
                 assert_eq!(id, node.identify(&Identity).unwrap());
+                assert_eq!(
+                    super::super::codec::encoder_finishes(),
+                    1,
+                    "identify must still encode its owned node"
+                );
                 assert_eq!(identity.calls.get(), 1);
             }
         }
