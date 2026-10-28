@@ -113,9 +113,6 @@ impl HostedFileVolume {
         if footer_pending {
             // A header-only recovery is immediately upgraded so the next boot
             // can use the footer even when no caller performs an explicit sync.
-            if recover::snapshot_bytes(&state.regions)? > recover::MAX_COMMIT_SNAPSHOT_BYTES {
-                reclaim::reclaim_locked(&path, &mut state)?;
-            }
             HostedFileVolume::make_durable(&mut state)?;
         }
         reclaim::cleanup_artifacts(&path)?;

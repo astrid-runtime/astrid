@@ -465,11 +465,6 @@ impl AstridVolume for HostedFileVolume {
         let _open_guard = self.open_lock.lock();
         let mut state = self.state.lock();
         reclaim::finish_publication(&self.path, &mut state)?;
-        if recover::snapshot_bytes(&state.regions)? > recover::MAX_COMMIT_SNAPSHOT_BYTES {
-            // Coalesce physical mappings without deleting any logical bytes.
-            // The existing format bound remains the allocation/recovery guard.
-            reclaim::reclaim_locked(&self.path, &mut state)?;
-        }
         Self::make_durable(&mut state)
     }
 }
