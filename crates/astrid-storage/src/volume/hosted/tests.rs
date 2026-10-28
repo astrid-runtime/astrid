@@ -1,4 +1,4 @@
-use super::reclaim::set_test_unlock_hook;
+use super::reclaim::set_test_swap_hook;
 use super::*;
 use crate::volume::VolumeFile;
 
@@ -131,8 +131,8 @@ fn hosted_volume_reclaim_shrinks_and_recovers_swap_artifacts() {
         );
     }
 
-    let previous = PathBuf::from(format!("{}.previous", path.display()));
-    let temporary_path = PathBuf::from(format!("{}.compacting", path.display()));
+    let previous = reclaim::previous_path(&path);
+    let temporary_path = reclaim::temp_path(&path);
     std::fs::copy(&path, &previous).unwrap();
     std::fs::remove_file(&path).unwrap();
     let volume = HostedFileVolume::open(&path).unwrap();
@@ -149,7 +149,7 @@ fn hosted_volume_reclaim_shrinks_and_recovers_swap_artifacts() {
 }
 
 #[test]
-fn reclaim_blocks_concurrent_open_during_unlock_swap_and_preserves_active_path() {
+fn reclaim_blocks_concurrent_open_during_atomic_swap_and_preserves_active_path() {
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -165,7 +165,7 @@ fn reclaim_blocks_concurrent_open_during_unlock_swap_and_preserves_active_path()
 
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
-    set_test_unlock_hook(
+    set_test_swap_hook(
         path.clone(),
         Box::new(move || {
             entered_tx.send(()).unwrap();
@@ -177,9 +177,9 @@ fn reclaim_blocks_concurrent_open_during_unlock_swap_and_preserves_active_path()
     let reclaim_thread = std::thread::spawn(move || reclaiming.reclaim());
     entered_rx
         .recv_timeout(Duration::from_secs(5))
-        .expect("reclaim reached the unlock/swap boundary");
+        .expect("reclaim reached the atomic publication boundary");
 
-    // Opening during the unlock/swap window must not acquire the retired
+    // Opening during the atomic publication window must not acquire the retired
     // inode or clean up the in-flight compacting artifact. A correct opener
     // may fail fast or wait for the swap; either way, it must not report a
     // successful open before the reclaiming writer is released.

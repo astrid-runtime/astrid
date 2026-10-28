@@ -6,7 +6,7 @@
 //! Flow:
 //! 1. **Daemon** — these verbs require the daemon; auto-start it if the
 //!    socket is missing (reusing [`daemon::ensure_daemon`]).
-//! 2. **Resolve** — connect a [`SocketClient`], ask the kernel for the
+//! 2. **Resolve** — connect a management client, ask the kernel for the
 //!    command registry (`GetCommands`), and filter to `kind == cli`.
 //! 3. **Match** — resolve `(verb, providers)` to exactly one provider, or
 //!    report an actionable error (zero/ambiguous).
@@ -167,39 +167,21 @@ async fn resolve_commands() -> Result<Vec<CommandInfo>> {
     // These verbs require the daemon — auto-start it if needed.
     daemon::ensure_daemon("capsule").await?;
 
-    let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let source_id = session.0;
-    // Bind the connection to the active principal (and stamp it on the
-    // request) so the daemon scopes this management request to the invoking
-    // identity. A nil source with no principal falls back to the `default`
-    // (admin) principal — letting a non-admin enumerate capsule verbs under
-    // admin context, an RBAC bypass.
-    let caller = crate::principal::current();
-    let mut client = crate::socket_client::connect_for_workspace(session, caller.clone(), None)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to daemon: {e}"))?;
+    // Use the management client: it correlates responses and consumes Working
+    // keepalives until a terminal response. Cold principal discovery can outlive
+    // the first ping; treating that ping as the registry reply rejects first use.
+    let mut client = crate::socket_client::connect_kernel_for_workspace(None).await?;
+    fetch_commands(&mut client).await
+}
 
-    let req = astrid_core::kernel_api::KernelRequest::GetCommands;
-    let val = serde_json::to_value(req)?;
-    let msg = astrid_types::ipc::IpcMessage::new(
-        astrid_types::Topic::kernel_request("get_commands"),
-        astrid_types::ipc::IpcPayload::RawJson(val),
-        source_id,
-    )
-    .with_principal(caller.to_string());
-    client.send_message(msg).await?;
-    let raw = client
-        .read_until_topic(
-            astrid_types::Topic::kernel_response("get_commands").as_str(),
-            Duration::from_secs(10),
-        )
-        .await?;
-    match SocketClient::extract_kernel_response(&raw) {
-        Some(astrid_core::kernel_api::KernelResponse::Commands(cmds)) => Ok(cmds),
-        // Surface the daemon's own error (e.g. a capability/permission denial)
-        // instead of folding it into a generic "unexpected response".
-        Some(astrid_core::kernel_api::KernelResponse::Error(err)) => {
-            anyhow::bail!("Daemon error: {err}")
+async fn fetch_commands(client: &mut astrid_uplink::KernelClient) -> Result<Vec<CommandInfo>> {
+    match client
+        .request(astrid_core::kernel_api::KernelRequest::GetCommands)
+        .await?
+    {
+        astrid_core::kernel_api::KernelResponse::Commands(commands) => Ok(commands),
+        astrid_core::kernel_api::KernelResponse::Error(error) => {
+            anyhow::bail!("Daemon error: {error}")
         },
         _ => anyhow::bail!("Daemon returned an unexpected response to GetCommands"),
     }
@@ -979,3 +961,7 @@ mod tests {
         assert!(!is_affirmative("no"));
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "capsule_verb/registry_tests.rs"]
+mod registry_tests;

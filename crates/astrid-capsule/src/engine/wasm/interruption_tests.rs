@@ -141,6 +141,7 @@ async fn admission_wait_spends_the_real_guest_invocation_deadline() {
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
         occupied.settle(0, std::time::Instant::now());
     },);
+    let invoke_elapsed = started.elapsed();
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     ticker.join().unwrap();
     assert!(
@@ -148,9 +149,9 @@ async fn admission_wait_spends_the_real_guest_invocation_deadline() {
         "{result:?}"
     );
     assert!(
-        started.elapsed() < std::time::Duration::from_millis(1400),
+        invoke_elapsed < std::time::Duration::from_millis(1400),
         "queued admission must not grant another full guest deadline: {:?}",
-        started.elapsed()
+        invoke_elapsed
     );
 }
 
