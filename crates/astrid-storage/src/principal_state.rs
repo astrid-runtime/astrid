@@ -52,7 +52,7 @@ mod format_identity_tests;
 #[cfg(test)]
 mod format_migration_tests;
 mod lifecycle;
-pub use lifecycle::RuntimeLifecycleGuard;
+pub use lifecycle::{RuntimeFinalization, RuntimeLifecycleGuard};
 #[cfg(test)]
 mod hosted_volume_tests;
 mod migrations;
@@ -452,6 +452,7 @@ pub type NativePrincipalContentStore = PrincipalContentStore<
 /// Native principal-store projections opened over one durable engine.
 #[derive(Clone)]
 pub struct RuntimePrincipalStore {
+    volume_binding: std::sync::Weak<crate::volume::HostedFileVolume>,
     engine: Arc<RuntimeEngine>,
     directory_cutover_receipt: Arc<str>,
     runtime_kv: Arc<RuntimeStore>,

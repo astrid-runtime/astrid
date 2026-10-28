@@ -570,6 +570,7 @@ pub(super) fn pack_and_retire_projection(
         }
     }
     transition_retiring_projection(home, store)?;
+    store.require_volume_binding(home)?;
     retire_projection(home)?;
     active::clear(store, home).map(|_| ())
 }
@@ -766,6 +767,7 @@ fn legacy_projection_pack(home: &AstridHome, store: &RuntimePrincipalStore) -> S
         .content()
         .flush()
         .map_err(|error| tree_error(home.root(), format!("flush volume projection: {error}")))?;
+    store.require_volume_binding(home)?;
     retire_projection(home)
 }
 fn tree_io_error(error: &std::io::Error) -> StorageError {

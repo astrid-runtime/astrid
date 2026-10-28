@@ -110,6 +110,12 @@ async fn shutdown_joins_admitted_writers_before_closing_storage() {
         .unwrap();
     drop(writer);
     shutdown.await;
+    // Retaining the closed kernel/store must not retain a strong hosted-volume
+    // handle: explicit close releases file ownership immediately.
+    assert!(
+        astrid_storage::volume::HostedFileVolume::open(kernel.astrid_home.storage_volume_path())
+            .is_ok()
+    );
     assert!(
         kernel
             .kv
@@ -135,3 +141,106 @@ async fn closed_lifecycle_rejects_health_restart_before_registry_or_storage_acce
 }
 
 mod idle_dispatcher;
+
+#[tokio::test]
+async fn retained_shutdown_joins_admitted_writers_and_closes_only_at_finalization() {
+    let root = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(root.path());
+    let lifecycle = astrid_storage::principal_state::RuntimeLifecycleGuard::acquire(&home).unwrap();
+    let kernel = test_kernel_with_home(home.clone()).await;
+    let writer = kernel.runtime_work.admit().unwrap();
+    let mut shutdown = Box::pin(kernel.shutdown_for_finalization(Some("writer barrier".into())));
+    assert!(
+        std::future::Future::poll(
+            shutdown.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending()
+    );
+    assert!(kernel.runtime_work.admit().is_none());
+    kernel
+        .kv
+        .set("shutdown-regression", "admitted", b"committed".to_vec())
+        .await
+        .unwrap();
+    drop(writer);
+    let token = shutdown.await.unwrap();
+    // All engine projections, including audit, must leave the authority open
+    // for the host's final pack rather than trigger a second recovery.
+    assert_eq!(
+        kernel
+            .kv
+            .get("shutdown-regression", "admitted")
+            .await
+            .unwrap(),
+        Some(b"committed".to_vec())
+    );
+    lifecycle.finish_retained(token).unwrap();
+    assert!(
+        kernel
+            .kv
+            .set("shutdown-regression", "late", b"rejected".to_vec())
+            .await
+            .is_err()
+    );
+    let reopened = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .kv()
+            .get("shutdown-regression", "admitted")
+            .await
+            .unwrap(),
+        Some(b"committed".to_vec())
+    );
+    reopened.kv().close().await.unwrap();
+}
+
+#[test]
+fn retained_shutdown_packs_host_write_joined_by_original_runtime_drop() {
+    let root = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(root.path());
+    let lifecycle = astrid_storage::principal_state::RuntimeLifecycleGuard::acquire(&home).unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (kernel, token) = runtime.block_on(async {
+        let kernel = test_kernel_with_home(home.clone()).await;
+        let log = home.root().join("log/daemon.log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, b"before shutdown").unwrap();
+        let (release, pending) = std::sync::mpsc::channel();
+        // Deliberately not awaited: the host runtime's destructor must join
+        // this writer before finalization can retire its path.
+        tokio::task::spawn_blocking(move || {
+            pending.recv().unwrap();
+            std::fs::write(log, b"joined during runtime drop").unwrap();
+        });
+        let token = kernel
+            .shutdown_for_finalization(Some("runtime join".into()))
+            .await
+            .unwrap();
+        release.send(()).unwrap();
+        (kernel, token)
+    });
+    drop(runtime);
+    lifecycle.finish_retained(token).unwrap();
+    assert!(!home.root().join("log/daemon.log").exists());
+    let recovery = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    recovery.block_on(async {
+        assert!(kernel.kv.get("system:test", "late").await.is_err());
+        let reopened = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(home.root().join("log/daemon.log")).unwrap(),
+            b"joined during runtime drop"
+        );
+        reopened.kv().close().await.unwrap();
+    });
+}
