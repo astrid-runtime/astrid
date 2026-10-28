@@ -38,8 +38,8 @@ impl MetadataIndex {
             // Decode and authenticate once, then keep that sole owned value.
             // Retaining its encoded payload as well duplicates every historical
             // node until journal validation and active-closure recovery finish.
-            let node = PhysicalMapNode::decode(&frame.value)?;
-            let id = node.identify(&Blake3PhysicalIdentity)?;
+            let (node, id) =
+                PhysicalMapNode::decode_and_identify(&frame.value, &Blake3PhysicalIdentity)?;
             if id != map_node_id(frame.identity) {
                 return Err(DurableError::InvalidRepresentationState(
                     "metadata identity does not match canonical value",

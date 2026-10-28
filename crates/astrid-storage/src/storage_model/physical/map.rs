@@ -17,6 +17,9 @@ mod legacy;
 mod radix;
 mod residency;
 
+#[cfg(test)]
+mod identity_tests;
+
 const LEGACY_MAP_NODE_VERSION: u16 = 1;
 const RADIX_MAP_NODE_VERSION: u16 = 2;
 const RADIX_PAGE_CAPACITY: usize = 1;
@@ -374,13 +377,29 @@ impl PhysicalMapNode {
         &self,
         identity: &I,
     ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
-        let context = match self {
+        Ok(PhysicalMapNodeId::new(
+            identity.identify(self.identity_context(), &self.encode()?),
+        ))
+    }
+
+    /// Authenticate the original bytes after decode proves their canonical form.
+    /// Recovery already owns these bytes, so encoding again for hashing would
+    /// duplicate the canonical roundtrip performed by `decode`.
+    #[cfg(any(test, not(target_family = "wasm")))]
+    pub(crate) fn decode_and_identify<I: PhysicalIdentity>(
+        bytes: &[u8],
+        identity: &I,
+    ) -> Result<(Self, PhysicalMapNodeId), PhysicalModelError> {
+        let node = Self::decode(bytes)?;
+        let id = PhysicalMapNodeId::new(identity.identify(node.identity_context(), bytes));
+        Ok((node, id))
+    }
+
+    const fn identity_context(&self) -> &'static str {
+        match self {
             Self::Leaf { .. } | Self::Branch { .. } => "astrid-physical-map-node-v1\0",
             Self::Page { .. } | Self::Radix { .. } => "astrid-physical-radix-map-node-v1\0",
-        };
-        Ok(PhysicalMapNodeId::new(
-            identity.identify(context, &self.encode()?),
-        ))
+        }
     }
 }
 
