@@ -67,14 +67,24 @@ impl RepresentationStore {
         if reclaimed || collection.is_err() {
             // Also evict on error: an earlier map may already have reclaimed
             // nodes before a later map failed. Propagate that failure below.
-            // Evict proof memos together. Durable frames and historical roots
-            // remain unchanged; reintroduced IDs are safely appended again.
-            self.complete_map_subtrees.clear();
-            self.persisted_map_nodes.retain(|id| {
-                self.profiles.nodes().contains_key(id)
-                    || self.representations.nodes().contains_key(id)
-                    || self.placement_entries.nodes().contains_key(id)
-            });
+            let profiles = self.profiles.nodes();
+            let representations = self.representations.nodes();
+            let placements = self.placement_entries.nodes();
+            let resident = |id: &PhysicalMapNodeId| {
+                profiles.contains_key(id)
+                    || representations.contains_key(id)
+                    || placements.contains_key(id)
+            };
+            if collection.is_err() {
+                self.complete_map_subtrees.clear();
+            } else {
+                // Immutable resident nodes keep their complete durable closure:
+                // successful collection retains every reachable descendant.
+                self.complete_map_subtrees.retain(resident);
+            }
+            // Durable frames and historical roots remain unchanged;
+            // reintroduced IDs are safely appended again.
+            self.persisted_map_nodes.retain(resident);
         }
         collection
     }

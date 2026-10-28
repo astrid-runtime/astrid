@@ -57,12 +57,12 @@ fn published_updates_bound_resident_history_and_recover_every_entry() {
         store.publish_direct_update(update).unwrap();
         let resident = store.representations.nodes().len() + store.placement_entries.nodes().len();
         if resident < prior_nodes {
-            assert!(store.complete_map_subtrees.is_empty());
             reclaimed = true;
         }
         // Append memos must not retain IDs whose runtime nodes were evicted.
         let all_resident = resident + store.profiles.nodes().len();
         assert!(store.persisted_map_nodes.len() <= all_resident);
+        assert!(store.complete_map_subtrees.len() <= all_resident);
         prior_nodes = resident;
         for (map, baseline) in [
             (&store.profiles, store.residency.profiles),
@@ -336,4 +336,95 @@ fn later_map_reclaim_failure_clears_complete_proofs_after_earlier_shrink() {
         "earlier map must shrink before the later map fails"
     );
     assert!(store.complete_map_subtrees.is_empty());
+}
+
+#[test]
+fn collection_retains_complete_live_closures_and_skips_their_next_append_walk() {
+    use super::super::append_new_reachable_map_nodes;
+    use std::collections::BTreeSet;
+
+    let directory = tempfile::tempdir().unwrap();
+    let volume: Arc<dyn AstridVolume> =
+        HostedFileVolume::open(directory.path().join("complete-proofs.volume")).unwrap();
+    let limits = super::super::RecoveryLimits::process_addressable();
+    let mut store =
+        RepresentationStore::activate_volume(&volume, limits, ObjectId::new([1; 32]), []).unwrap();
+    for sequence in 0_u64..128 {
+        let bytes = sequence.to_le_bytes();
+        let direct = store
+            .describe_direct(
+                ObjectId::new(*blake3::hash(&bytes).as_bytes()),
+                &bytes,
+                ArenaLocation {
+                    offset: sequence * 100,
+                    payload_len: 8,
+                    checksum: [3; 32],
+                },
+            )
+            .unwrap();
+        let update = store.append_direct_update(&[direct]).unwrap().unwrap();
+        let root = store.representations.root().unwrap();
+        let before_nodes = store.representations.nodes().len();
+        let mut metadata = Vec::new();
+        let mut appended = BTreeSet::new();
+        // Appending the real update has persisted its nodes. Let the actual
+        // append traversal establish their complete durable-closure proofs.
+        append_new_reachable_map_nodes(
+            &mut metadata,
+            &store.representations,
+            &store.persisted_map_nodes,
+            &mut appended,
+            &mut store.complete_map_subtrees,
+        )
+        .unwrap();
+        assert!(store.complete_map_subtrees.contains(&root));
+        let prior_proofs = store.complete_map_subtrees.clone();
+        store.publish_direct_update(update).unwrap();
+        if store.representations.nodes().len() < before_nodes {
+            let evicted = prior_proofs
+                .iter()
+                .find(|id| {
+                    !store.profiles.nodes().contains_key(id)
+                        && !store.representations.nodes().contains_key(id)
+                        && !store.placement_entries.nodes().contains_key(id)
+                })
+                .expect("collection must evict a previously proven historical node");
+            assert!(!store.persisted_map_nodes.contains(evicted));
+            assert!(!store.complete_map_subtrees.contains(evicted));
+            assert!(store.complete_map_subtrees.contains(&root));
+            let resident = store.profiles.nodes().len()
+                + store.representations.nodes().len()
+                + store.placement_entries.nodes().len();
+            assert!(store.complete_map_subtrees.len() <= resident);
+            let warm = append_new_reachable_map_nodes(
+                &mut metadata,
+                &store.representations,
+                &store.persisted_map_nodes,
+                &mut appended,
+                &mut store.complete_map_subtrees,
+            )
+            .unwrap();
+            let cold = append_new_reachable_map_nodes(
+                &mut metadata,
+                &store.representations,
+                &store.persisted_map_nodes,
+                &mut appended,
+                &mut BTreeSet::new(),
+            )
+            .unwrap();
+            assert_eq!(warm, 0, "collection must preserve the live closure proof");
+            assert_eq!(cold, store.representations.nodes().len());
+            assert!(
+                cold > 1,
+                "exercise a closure containing durable descendants"
+            );
+            assert!(
+                metadata.is_empty(),
+                "proof reuse must not change durable frames"
+            );
+            assert!(appended.is_empty());
+            return;
+        }
+    }
+    panic!("published updates must exercise representation-map collection");
 }
