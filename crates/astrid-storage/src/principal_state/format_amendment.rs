@@ -82,7 +82,12 @@ pub(super) const PRE_RESERVED_REPRESENTATION_TAG_FORMAT_SPEC_ID: ObjectId = Obje
     88, 114, 107, 60, 36, 60, 48, 235, 192, 148, 31, 101, 100, 39, 82, 0, 148, 166, 187, 16, 231,
     178, 25, 11, 231, 50, 181, 166, 19, 0, 20, 77,
 ]);
-const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 14] = [
+/// Specification identity before chunked KV spilled values were registered.
+pub(super) const PRE_CHUNKED_KV_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
+    172, 62, 26, 177, 232, 43, 226, 77, 174, 124, 222, 249, 73, 105, 141, 213, 77, 36, 7, 188, 127,
+    57, 251, 48, 112, 157, 195, 102, 119, 238, 166, 29,
+]);
+const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 15] = [
     PRE_DERIVATION_FORMAT_SPEC_ID,
     PRE_COMPACTION_FORMAT_SPEC_ID,
     PRE_GC_OUTBOX_FORMAT_SPEC_ID,
@@ -97,6 +102,7 @@ const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 14] = [
     PRE_FLEET_OWNER_FORMAT_SPEC_ID,
     PRE_WORKSPACE_BRANCH_FORMAT_SPEC_ID,
     PRE_RESERVED_REPRESENTATION_TAG_FORMAT_SPEC_ID,
+    PRE_CHUNKED_KV_FORMAT_SPEC_ID,
 ];
 
 /// Known predecessors whose direct-canonical recipe is unchanged.
@@ -110,6 +116,7 @@ pub(super) const DIRECT_CATALOGUE_PREDECESSORS: &[ObjectId] = &[
     PRE_FLEET_OWNER_FORMAT_SPEC_ID,
     PRE_WORKSPACE_BRANCH_FORMAT_SPEC_ID,
     PRE_RESERVED_REPRESENTATION_TAG_FORMAT_SPEC_ID,
+    PRE_CHUNKED_KV_FORMAT_SPEC_ID,
 ];
 
 #[cfg(test)]
@@ -442,6 +449,47 @@ pub(super) fn prepare_format_specification(
     }
 }
 
+/// Hosted volumes carry their format identity in the authoritative direct
+/// profile rather than a directory's store.meta. Only that recovered identity
+/// can authorize an amendment; finding an unrelated old Evidence object is
+/// insufficient. A missing current bootstrap under a current profile remains
+/// corruption, not permission to recreate it. Compatible catalogue admission
+/// intentionally retains the original direct profile identity; only record-local
+/// value decoding, not a new volume-wide open gate, fences older readers.
+pub(super) fn prepare_volume_format_specification(engine: &RuntimeEngine) -> StorageResult<()> {
+    let current = format_spec_record()?;
+    let current_id = engine.identify(&current);
+    let active = engine
+        .direct_representation_specification()
+        .map_err(|error| {
+            StorageError::Connection(format!("read volume format profile: {error}"))
+        })?;
+    let destination = match active {
+        Some(prior) if DIRECT_CATALOGUE_PREDECESSORS.contains(&prior) => {
+            DestinationFormat::PriorV1 {
+                format_spec: prior,
+                catalog_spec_was_declared: true,
+            }
+        },
+        Some(id) if id != current_id => {
+            return Err(StorageError::Connection(
+                "volume direct profile selects an unsupported format".to_owned(),
+            ));
+        },
+        _ => DestinationFormat::Current,
+    };
+    // Every supported direct profile already declared the catalog grammar.
+    // Verify its bootstrap before admitting any successor format evidence.
+    let catalog = super::bootstrap::content_catalog_format_specification()?;
+    prepare_catalog_specification(
+        engine,
+        DestinationFormat::Current,
+        &catalog,
+        engine.identify(&catalog),
+    )?;
+    prepare_format_specification(engine, destination, &current, current_id)
+}
+
 pub(super) fn prepare_catalog_specification(
     engine: &RuntimeEngine,
     destination_format: DestinationFormat,
@@ -477,7 +525,7 @@ fn ensure_specification(
     {
         Some(actual) if actual == *expected => Ok(()),
         Some(_) => Err(StorageError::Connection(format!(
-            "{description} does not match store.meta"
+            "{description} does not match the registered specification"
         ))),
         None if missing_is_error => Err(StorageError::Connection(format!(
             "completed principal store is missing its {description}"

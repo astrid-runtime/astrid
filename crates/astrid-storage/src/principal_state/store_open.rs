@@ -389,21 +389,25 @@ async fn assemble_runtime_store(
     let bootstrap_objects = representation_bootstrap_objects(format_spec_id, catalog_spec_id);
     let catalogue_engine = Arc::clone(&engine);
     tokio::task::spawn_blocking(move || {
-        catalogue_engine.ensure_direct_representation_catalogue_compatible_with(
-            format_spec_id,
-            DIRECT_CATALOGUE_PREDECESSORS,
-            &bootstrap_objects,
-        )
+        super::format_amendment::prepare_volume_format_specification(&catalogue_engine)?;
+        catalogue_engine
+            .ensure_direct_representation_catalogue_compatible_with(
+                format_spec_id,
+                DIRECT_CATALOGUE_PREDECESSORS,
+                &bootstrap_objects,
+            )
+            .map_err(|error| {
+                StorageError::Connection(format!(
+                    "activate volume representation catalogue: {error}"
+                ))
+            })
     })
     .await
     .map_err(|error| {
         StorageError::Connection(format!(
             "volume representation-catalogue worker failed: {error}"
         ))
-    })?
-    .map_err(|error| {
-        StorageError::Connection(format!("activate volume representation catalogue: {error}"))
-    })?;
+    })??;
     let validated_catalogs = Arc::new(Mutex::new(BTreeMap::<StateOwner, CatalogValidation>::new()));
     let validated_kv = Arc::new(crate::kv::KvValidationCache::default());
 

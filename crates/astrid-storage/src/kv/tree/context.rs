@@ -15,12 +15,13 @@ use super::delta::{
 use super::header::TreeHeader;
 use super::node::{
     ChildPointer, INLINE_VALUE_MAX, LeafEntry, NODE_MAX_ENTRIES, NODE_MAX_RETAINED_BYTES, Node,
-    NodeHandle, NodeTotals, ValueSlot, branch_record, decode_node, decode_value, leaf_record,
-    value_record,
+    NodeHandle, NodeTotals, ValueSlot, branch_record, decode_node, leaf_record,
 };
 use super::{FORMAT_VERSION, KV_LABEL, PARENT_LABEL, STATE_LABEL};
 use crate::error::{StorageError, StorageResult};
 use crate::kv::tree_error::{invalid, map_engine};
+
+mod value;
 
 pub(super) struct TreeContext<'a, P, E> {
     engine: &'a E,
@@ -494,15 +495,6 @@ where
         ])
     }
 
-    fn make_value(&mut self, bytes: Vec<u8>) -> StorageResult<ValueSlot> {
-        if bytes.len() <= INLINE_VALUE_MAX {
-            return Ok(ValueSlot::Inline(bytes));
-        }
-        let length = u64::try_from(bytes.len()).map_err(|_| arithmetic_overflow())?;
-        let object = self.insert(value_record(bytes)?)?;
-        Ok(ValueSlot::Spilled { object, length })
-    }
-
     fn make_leaf_page(&mut self, entries: &[LeafEntry]) -> StorageResult<NodeHandle> {
         let record = leaf_record(entries)?;
         self.insert_node(&record)
@@ -511,16 +503,6 @@ where
     fn make_branch_page(&mut self, children: &[ChildPointer]) -> StorageResult<NodeHandle> {
         let record = branch_record(children)?;
         self.insert_node(&record)
-    }
-
-    pub(super) fn value_bytes(&self, value: &ValueSlot) -> StorageResult<Vec<u8>> {
-        match value {
-            ValueSlot::Inline(bytes) => Ok(bytes.clone()),
-            ValueSlot::Spilled { object, length } => {
-                let record = self.record(*object)?;
-                decode_value(*object, *length, &record)
-            },
-        }
     }
 
     fn validate_pointer(&mut self, pointer: &ChildPointer) -> StorageResult<()> {
