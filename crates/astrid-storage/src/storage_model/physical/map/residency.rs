@@ -28,7 +28,11 @@ impl CanonicalPhysicalMap {
                 PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => {},
             }
         }
-        self.nodes.retain(|id, _| retained.contains(id));
+        // Successful closure validation proves every retained ID is in nodes.
+        // Both iterators ascend, so each match consumes the next reachable ID.
+        let mut retained = retained.into_iter().peekable();
+        self.nodes
+            .retain(|id, _| retained.next_if(|reachable| reachable == id).is_some());
         Ok(())
     }
 

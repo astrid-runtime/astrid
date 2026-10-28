@@ -4,7 +4,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::super::{
-    CanonicalPhysicalMap, PhysicalIdentity, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNodeId,
+    CanonicalPhysicalMap, PhysicalIdentity, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode,
+    PhysicalMapNodeId,
 };
 
 struct Identity;
@@ -70,4 +71,45 @@ fn incomplete_closure_does_not_partially_reclaim_the_arena() {
     let before = map.clone();
     assert!(map.reclaim_unreachable_nodes().is_err());
     assert_eq!(map, before);
+}
+
+#[test]
+fn reclaim_removes_stale_ids_before_between_and_after_live_ids() {
+    for dense in [false, true] {
+        for count in [0_u32, 1, 256] {
+            let entries = (0..count)
+                .map(|sequence| {
+                    let value = sequence.to_le_bytes().to_vec();
+                    (PhysicalMapKey::new(*blake3::hash(&value).as_bytes()), value)
+                })
+                .collect();
+            let mut map = if dense {
+                CanonicalPhysicalMap::build_dense(&Identity, PhysicalMapDomain::Placement, entries)
+            } else {
+                CanonicalPhysicalMap::build(&Identity, PhysicalMapDomain::Placement, entries)
+            }
+            .unwrap();
+            let expected = map.clone();
+            // Unreachable IDs exercise both endpoints and gaps between live IDs.
+            // Their contents confer no reachability; only the current root does.
+            for byte in 0..=u8::MAX {
+                assert!(
+                    map.nodes
+                        .insert(
+                            PhysicalMapNodeId::new([byte; 32]),
+                            PhysicalMapNode::Leaf {
+                                domain: map.domain,
+                                key: PhysicalMapKey::new([byte; 32]),
+                                value: vec![byte],
+                            },
+                        )
+                        .is_none()
+                );
+            }
+            map.reclaim_unreachable_nodes().unwrap();
+            assert_eq!(map, expected);
+            map.reclaim_unreachable_nodes().unwrap();
+            assert_eq!(map, expected);
+        }
+    }
 }
