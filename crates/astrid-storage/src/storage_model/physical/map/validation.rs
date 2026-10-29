@@ -4,6 +4,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 
+use super::super::codec::Encoder;
 use super::{
     PhysicalIdentity, PhysicalMapDomain, PhysicalMapNode, PhysicalMapNodeId, PhysicalModelError,
     build_root,
@@ -28,9 +29,11 @@ pub(super) fn validate_root<I: PhysicalIdentity>(
     let mut stack = vec![root];
     let mut visited = BTreeSet::new();
     // Only fixed-width keys and borrowed value slices scale with entry count.
-    // The builder owns at most its current node's value copy and encoding;
-    // the consuming emitter hashes then drops it instead of retaining an arena.
+    // The builder owns at most its current node's value copy; one encoding
+    // buffer is reused for this walk and rebuild, then dropped with the call.
+    // The consuming emitter never retains a rebuilt node arena.
     let mut entries = Vec::new();
+    let mut scratch = Vec::new();
     while let Some(node_id) = stack.pop() {
         if !visited.insert(node_id) {
             return Err(PhysicalModelError::InvalidMap(
@@ -43,7 +46,7 @@ pub(super) fn validate_root<I: PhysicalIdentity>(
         if node.domain() != domain {
             return Err(PhysicalModelError::InvalidMap("map domain mismatch"));
         }
-        if node.identify(identity)? != node_id {
+        if identify_encoded(identity, node, &mut scratch)? != node_id {
             return Err(PhysicalModelError::InvalidMap("map-node identity mismatch"));
         }
         match node {
@@ -69,7 +72,7 @@ pub(super) fn validate_root<I: PhysicalIdentity>(
     }
     let (rebuilt_root, entry_count) =
         build_root(domain, &mut entries, construction, &mut |node| {
-            node.identify(identity)
+            identify_encoded(identity, &node, &mut scratch)
         })?;
     if rebuilt_root != Some(root) {
         return Err(PhysicalModelError::InvalidMap(
@@ -77,4 +80,15 @@ pub(super) fn validate_root<I: PhysicalIdentity>(
         ));
     }
     Ok(entry_count)
+}
+
+fn identify_encoded<I: PhysicalIdentity>(
+    identity: &I,
+    node: &PhysicalMapNode,
+    scratch: &mut Vec<u8>,
+) -> Result<PhysicalMapNodeId, PhysicalModelError> {
+    node.encode_into(&mut Encoder::reusing(scratch))?;
+    Ok(PhysicalMapNodeId::new(
+        identity.identify(node.identity_context(), scratch.as_slice()),
+    ))
 }

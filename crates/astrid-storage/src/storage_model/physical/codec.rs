@@ -17,6 +17,12 @@ impl EncodingSink for Vec<u8> {
     }
 }
 
+impl EncodingSink for &mut Vec<u8> {
+    fn write(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+}
+
 pub(super) struct Comparison<'a> {
     remaining: Option<&'a [u8]>,
 }
@@ -58,6 +64,12 @@ impl Encoder {
         #[cfg(test)]
         ENCODER_FINISHES.with(|count| count.set(count.get().strict_add(1)));
         self.bytes
+    }
+
+    /// Start one encoding in caller-owned storage without retaining old bytes.
+    pub(super) fn reusing(bytes: &mut Vec<u8>) -> Encoder<&mut Vec<u8>> {
+        bytes.clear();
+        Encoder { bytes }
     }
 
     pub(super) const fn comparing(bytes: &[u8]) -> Encoder<Comparison<'_>> {

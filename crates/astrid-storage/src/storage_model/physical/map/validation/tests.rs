@@ -414,3 +414,89 @@ fn materialized_validate_root<I: PhysicalIdentity>(
     }
     Ok(rebuilt.entry_count)
 }
+
+#[derive(Default)]
+struct RecordingIdentity {
+    preimages: core::cell::RefCell<Vec<(&'static str, Vec<u8>)>>,
+}
+
+impl PhysicalIdentity for RecordingIdentity {
+    fn identify(&self, context: &'static str, material: &[u8]) -> [u8; 32] {
+        // Copy here: validation deliberately reuses the input slice's storage.
+        self.preimages
+            .borrow_mut()
+            .push((context, material.to_vec()));
+        Identity.identify(context, material)
+    }
+}
+
+#[test]
+fn reused_validation_preserves_every_injected_identity_preimage() {
+    use super::super::super::codec::{encoder_finishes, reset_encoder_finishes};
+
+    for domain in DOMAINS {
+        for construction in CONSTRUCTIONS {
+            for common_prefix in [false, true] {
+                for count in [0, 1, 2, 17, 65] {
+                    let map = CanonicalPhysicalMap::build_with_construction(
+                        &Identity,
+                        domain,
+                        entries(count, common_prefix),
+                        construction,
+                    )
+                    .unwrap();
+                    let direct = RecordingIdentity::default();
+                    reset_encoder_finishes();
+                    let expected =
+                        materialized_validate_root(&direct, domain, map.root, &map.nodes);
+                    let owned_finishes = encoder_finishes();
+                    let expected_preimages = direct.preimages.into_inner();
+                    let reused = RecordingIdentity::default();
+                    reset_encoder_finishes();
+                    let actual =
+                        CanonicalPhysicalMap::validate_root(&reused, domain, map.root, &map.nodes);
+                    let reused_finishes = encoder_finishes();
+                    assert_eq!(actual, expected);
+                    assert_eq!(reused.preimages.into_inner(), expected_preimages);
+                    // Legacy key-search encodings still finish normally. The
+                    // removed finishes correspond exactly to identified nodes.
+                    assert_eq!(
+                        owned_finishes,
+                        reused_finishes.strict_add(expected_preimages.len())
+                    );
+                    if construction == MapConstruction::DenseRadix {
+                        assert_eq!(reused_finishes, 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn reused_node_identity_clears_longer_preimages_before_the_next_node() {
+    for domain in DOMAINS {
+        for construction in CONSTRUCTIONS {
+            let direct = RecordingIdentity::default();
+            let reused = RecordingIdentity::default();
+            let mut scratch = Vec::new();
+            for length in [8_193, 0, 1, 65_537, 3] {
+                let key = PhysicalMapKey::new([7; 32]);
+                let value = vec![9; length];
+                let node = match construction {
+                    MapConstruction::LegacyBinary => PhysicalMapNode::leaf(domain, key, value),
+                    MapConstruction::DenseRadix => PhysicalMapNode::Page {
+                        domain,
+                        entries: vec![(key, value)],
+                    },
+                };
+                assert_eq!(
+                    super::identify_encoded(&reused, &node, &mut scratch).unwrap(),
+                    node.identify(&direct).unwrap()
+                );
+                assert_eq!(scratch, node.encode().unwrap());
+            }
+            assert_eq!(reused.preimages.into_inner(), direct.preimages.into_inner());
+        }
+    }
+}

@@ -60,3 +60,27 @@ fn comparison_handles_empty_fields_without_clearing_an_earlier_mismatch() {
         Err(PhysicalModelError::NonCanonicalEncoding)
     );
 }
+
+#[test]
+fn reused_encoding_matches_owned_fields_and_clears_shorter_output() {
+    let mut owned = Encoder::new();
+    fields(&mut owned);
+    let expected = owned.finish();
+    let mut scratch = vec![0xff; 1_024];
+    let original_pointer = scratch.as_ptr();
+    let original_capacity = scratch.capacity();
+    {
+        let mut encoder = Encoder::reusing(&mut scratch);
+        fields(&mut encoder);
+    }
+    assert_eq!(scratch, expected);
+    assert_eq!(scratch.as_ptr(), original_pointer);
+    assert_eq!(scratch.capacity(), original_capacity);
+    Encoder::reusing(&mut scratch).bytes(&[]).unwrap();
+    assert_eq!(scratch, 0_u64.to_le_bytes());
+    // An empty next encoding must also discard the entire previous preimage.
+    Encoder::reusing(&mut scratch);
+    assert!(scratch.is_empty());
+    assert_eq!(scratch.as_ptr(), original_pointer);
+    assert_eq!(scratch.capacity(), original_capacity);
+}
