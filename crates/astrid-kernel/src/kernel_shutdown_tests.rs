@@ -19,9 +19,21 @@ async fn graceful_shutdown_publishes_final_running_projection() {
     );
     drop(kernel);
 
-    let reopened = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
-        .await
-        .unwrap();
+    // Inspect durable content without recovery first ingesting the host file.
+    let reopened = astrid_storage::principal_state::open_runtime_principal_store_for_pack(
+        &home,
+        unlimited_quota(),
+    )
+    .await
+    .unwrap();
+    let name = astrid_storage::ContentName::new("log/daemon.log").unwrap();
+    assert_eq!(
+        reopened
+            .content()
+            .read(&astrid_storage::StateOwner::System, &name)
+            .unwrap(),
+        Some(b"generation-1\ngeneration-2\n".to_vec())
+    );
     assert_eq!(
         std::fs::read(&log_path).unwrap(),
         b"generation-1\ngeneration-2\n"
@@ -243,4 +255,153 @@ fn retained_shutdown_packs_host_write_joined_by_original_runtime_drop() {
         );
         reopened.kv().close().await.unwrap();
     });
+}
+
+#[test]
+fn retained_shutdown_defers_host_publication_until_runtime_writers_join() {
+    let root = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(root.path());
+    let lifecycle = astrid_storage::principal_state::RuntimeLifecycleGuard::acquire(&home).unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (kernel, token) = runtime.block_on(async {
+        let kernel = test_kernel_with_home(home.clone()).await;
+        let path = home.root().join("etc/retained-final-publication.conf");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"before runtime teardown").unwrap();
+        let name = astrid_storage::ContentName::new("etc/retained-final-publication.conf").unwrap();
+        let store = kernel.principal_store.as_ref().unwrap();
+        assert_eq!(
+            store
+                .content()
+                .read(&astrid_storage::StateOwner::System, &name)
+                .unwrap(),
+            None
+        );
+        let (release, pending) = std::sync::mpsc::channel();
+        tokio::task::spawn_blocking(move || {
+            pending.recv().unwrap();
+            std::fs::write(path, b"joined during runtime teardown").unwrap();
+        });
+        let token = kernel
+            .shutdown_for_finalization(Some("single publication".into()))
+            .await
+            .unwrap();
+        // The retained path must not ingest an intermediate host generation.
+        let published = store
+            .content()
+            .read(&astrid_storage::StateOwner::System, &name)
+            .unwrap();
+        release.send(()).unwrap();
+        assert_eq!(published, None);
+        (kernel, token)
+    });
+    drop(runtime);
+    lifecycle.finish_retained(token).unwrap();
+    assert!(
+        !home
+            .root()
+            .join("etc/retained-final-publication.conf")
+            .exists()
+    );
+    let recovery = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    recovery.block_on(async {
+        assert!(kernel.kv.get("system:test", "late").await.is_err());
+        let reopened = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(home.root().join("etc/retained-final-publication.conf")).unwrap(),
+            b"joined during runtime teardown"
+        );
+        reopened.kv().close().await.unwrap();
+    });
+}
+
+#[tokio::test]
+async fn abandoned_retained_shutdown_recovers_unpublished_host_writes() {
+    let root = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(root.path());
+    let lifecycle = astrid_storage::principal_state::RuntimeLifecycleGuard::acquire(&home).unwrap();
+    let kernel = test_kernel_with_home(home.clone()).await;
+    let path = home.root().join("etc/abandoned-finalization.conf");
+    let name = astrid_storage::ContentName::new("etc/abandoned-finalization.conf").unwrap();
+    std::fs::write(&path, b"recover without intermediate publication").unwrap();
+    let token = kernel
+        .shutdown_for_finalization(Some("abandoned finalizer".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        kernel
+            .principal_store
+            .as_ref()
+            .unwrap()
+            .content()
+            .read(&astrid_storage::StateOwner::System, &name)
+            .unwrap(),
+        None
+    );
+    drop(token);
+    assert!(kernel.kv.get("system:test", "late").await.is_err());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"recover without intermediate publication"
+    );
+    drop(kernel);
+    drop(lifecycle);
+    let reopened = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .content()
+            .read(&astrid_storage::StateOwner::System, &name)
+            .unwrap(),
+        Some(b"recover without intermediate publication".to_vec())
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"recover without intermediate publication"
+    );
+    reopened.kv().close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retained_finalization_rejects_redirect_without_retiring_host_writes() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(root.path());
+    let lifecycle = astrid_storage::principal_state::RuntimeLifecycleGuard::acquire(&home).unwrap();
+    let kernel = test_kernel_with_home(home.clone()).await;
+    let path = home.root().join("etc/unsafe-finalization.conf");
+    std::fs::write(&path, b"preserve on failed finalization").unwrap();
+    let redirect = home.root().join("redirect");
+    std::os::unix::fs::symlink(outside.path(), &redirect).unwrap();
+    let token = kernel
+        .shutdown_for_finalization(Some("unsafe finalizer".into()))
+        .await
+        .unwrap();
+    assert!(lifecycle.finish_retained(token).is_err());
+    assert!(redirect.symlink_metadata().is_ok());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"preserve on failed finalization"
+    );
+    assert!(kernel.kv.get("system:test", "late").await.is_err());
+    drop(kernel);
+    std::fs::remove_file(&redirect).unwrap();
+    let reopened = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"preserve on failed finalization"
+    );
+    reopened.kv().close().await.unwrap();
 }

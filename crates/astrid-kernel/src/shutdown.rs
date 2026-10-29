@@ -31,7 +31,8 @@ impl Kernel {
     /// Ordinary callers should use [`Self::shutdown`] to close storage here.
     ///
     /// # Errors
-    /// Returns a storage error when projection publication or shutdown fails.
+    /// Returns a storage error when producer shutdown or audit close fails.
+    /// Projection validation and publication are deferred to the finalizer.
     #[cfg(not(target_family = "wasm"))]
     pub async fn shutdown_for_finalization(
         &self,
@@ -139,7 +140,11 @@ impl Kernel {
         #[cfg(not(target_family = "wasm"))]
         let mut publication = Ok(());
         #[cfg(not(target_family = "wasm"))]
-        if let Some(store) = self.principal_store.as_ref()
+        // The retained finalizer publishes after the host runtime joins its
+        // writers. Publishing here would ingest an intermediate generation
+        // and repeat the full tree publication at finalization.
+        if !retain_store
+            && let Some(store) = self.principal_store.as_ref()
             && let Err(error) = store.publish_runtime_projection(&self.astrid_home)
         {
             tracing::error!(error = %error, "failed to publish running projection during shutdown");

@@ -617,9 +617,10 @@ impl RuntimePrincipalStore {
 
     /// Publish the live running projection while retaining host files.
     ///
-    /// Graceful kernel shutdown calls this before its durable projections are
-    /// closed. The daemon host finalizes after its task runtime is dropped;
-    /// CLI recovery uses the same finalizer for an already-dead daemon.
+    /// Kernel shutdown without a retained finalization token calls this before
+    /// closing storage. A retained daemon instead publishes through the finalizer
+    /// after its task runtime is dropped; CLI recovery uses that same finalizer
+    /// for an already-dead daemon.
     ///
     /// # Errors
     ///
