@@ -206,7 +206,7 @@ fn borrowed_validation_matches_materialized_rejections() {
             });
             compare_changed(&map, |node| match node {
                 PhysicalMapNode::Branch { prefix, .. } | PhysicalMapNode::Radix { prefix, .. } => {
-                    prefix[0] ^= 0x80
+                    prefix[0] ^= 0x80;
                 },
                 _ => unreachable!(),
             });
