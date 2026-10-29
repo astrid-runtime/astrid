@@ -16,6 +16,7 @@ use super::identity::{
 mod legacy;
 mod radix;
 mod residency;
+mod validation;
 
 #[cfg(test)]
 mod identity_tests;
@@ -463,25 +464,19 @@ impl CanonicalPhysicalMap {
         mut entries: Vec<(PhysicalMapKey, Vec<u8>)>,
         construction: MapConstruction,
     ) -> Result<Self, PhysicalModelError> {
-        entries.sort_by_key(|(key, _)| *key);
-        if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-            return Err(PhysicalModelError::InvalidMap("duplicate leaf key"));
-        }
-        let entry_count =
-            u64::try_from(entries.len()).map_err(|_| PhysicalModelError::LengthOverflow)?;
         let mut nodes = BTreeMap::new();
-        let root = if entries.is_empty() {
-            None
-        } else {
-            Some(match construction {
+        let (root, entry_count) = build_root(domain, &mut entries, construction, &mut |node| {
+            let id = node.identify(identity)?;
+            match construction {
                 MapConstruction::LegacyBinary => {
-                    legacy::build(identity, domain, &entries, &mut nodes)?
+                    nodes.insert(id, node);
                 },
                 MapConstruction::DenseRadix => {
-                    radix::build(identity, domain, &entries, &mut nodes)?
+                    nodes.entry(id).or_insert(node);
                 },
-            })
-        };
+            }
+            Ok(id)
+        })?;
         Ok(Self {
             domain,
             construction,
@@ -503,55 +498,7 @@ impl CanonicalPhysicalMap {
         root: Option<PhysicalMapNodeId>,
         nodes: &BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
     ) -> Result<u64, PhysicalModelError> {
-        let Some(root) = root else {
-            return Ok(0);
-        };
-        let construction = nodes
-            .get(&root)
-            .ok_or(PhysicalModelError::InvalidMap("missing map root"))?
-            .construction();
-        let mut stack = vec![root];
-        let mut visited = BTreeSet::new();
-        let mut entries = Vec::new();
-        while let Some(node_id) = stack.pop() {
-            if !visited.insert(node_id) {
-                return Err(PhysicalModelError::InvalidMap(
-                    "node is cyclic or shared by two parents",
-                ));
-            }
-            let node = nodes
-                .get(&node_id)
-                .ok_or(PhysicalModelError::InvalidMap("missing map node"))?;
-            if node.domain() != domain {
-                return Err(PhysicalModelError::InvalidMap("map domain mismatch"));
-            }
-            if node.identify(identity)? != node_id {
-                return Err(PhysicalModelError::InvalidMap("map-node identity mismatch"));
-            }
-            match node {
-                PhysicalMapNode::Leaf { key, value, .. } => {
-                    entries.push((*key, value.clone()));
-                },
-                PhysicalMapNode::Branch { zero, one, .. } => {
-                    stack.push(*one);
-                    stack.push(*zero);
-                },
-                PhysicalMapNode::Page {
-                    entries: page_entries,
-                    ..
-                } => entries.extend(page_entries.iter().cloned()),
-                PhysicalMapNode::Radix { children, .. } => {
-                    stack.extend(children.iter().rev().copied());
-                },
-            }
-        }
-        let rebuilt = Self::build_with_construction(identity, domain, entries, construction)?;
-        if rebuilt.root != Some(root) {
-            return Err(PhysicalModelError::InvalidMap(
-                "node graph is not the unique canonical trie",
-            ));
-        }
-        Ok(rebuilt.entry_count)
+        validation::validate_root(identity, domain, root, nodes)
     }
 
     /// Recover one active map, retaining every node supplied by the caller.
@@ -946,4 +893,29 @@ fn radix_common_prefix(key: PhysicalMapKey, prefix_nibbles: u8, prefix: &[u8]) -
         common = common.saturating_add(1);
     }
     common
+}
+
+/// Build the same canonical root with either owned values or borrowed views.
+/// The emitter controls node ownership, never the construction or encoding.
+fn build_root<V: AsRef<[u8]>>(
+    domain: PhysicalMapDomain,
+    entries: &mut [(PhysicalMapKey, V)],
+    construction: MapConstruction,
+    emit: &mut impl FnMut(PhysicalMapNode) -> Result<PhysicalMapNodeId, PhysicalModelError>,
+) -> Result<(Option<PhysicalMapNodeId>, u64), PhysicalModelError> {
+    entries.sort_by_key(|(key, _)| *key);
+    if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(PhysicalModelError::InvalidMap("duplicate leaf key"));
+    }
+    let entry_count =
+        u64::try_from(entries.len()).map_err(|_| PhysicalModelError::LengthOverflow)?;
+    let root = if entries.is_empty() {
+        None
+    } else {
+        Some(match construction {
+            MapConstruction::LegacyBinary => legacy::build(domain, entries, emit)?,
+            MapConstruction::DenseRadix => radix::build(domain, entries, emit)?,
+        })
+    };
+    Ok((root, entry_count))
 }

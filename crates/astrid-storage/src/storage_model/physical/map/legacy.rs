@@ -24,17 +24,17 @@ pub(super) fn insert<I: PhysicalIdentity>(
     .insert_at(root, key, value)
 }
 
-pub(super) fn build<I: PhysicalIdentity>(
-    identity: &I,
+pub(super) fn build<V: AsRef<[u8]>>(
     domain: PhysicalMapDomain,
-    entries: &[(PhysicalMapKey, Vec<u8>)],
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    entries: &[(PhysicalMapKey, V)],
+    emit: &mut impl FnMut(PhysicalMapNode) -> Result<PhysicalMapNodeId, PhysicalModelError>,
 ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
     if entries.len() == 1 {
-        let node = PhysicalMapNode::leaf(domain, entries[0].0, entries[0].1.clone());
-        let id = node.identify(identity)?;
-        nodes.insert(id, node);
-        return Ok(id);
+        return emit(PhysicalMapNode::leaf(
+            domain,
+            entries[0].0,
+            entries[0].1.as_ref().to_vec(),
+        ));
     }
     let first = entries
         .first()
@@ -54,8 +54,8 @@ pub(super) fn build<I: PhysicalIdentity>(
     if split == 0 || split == entries.len() {
         return Err(PhysicalModelError::InvalidMap("canonical branch is unary"));
     }
-    let zero = build(identity, domain, &entries[..split], nodes)?;
-    let one = build(identity, domain, &entries[split..], nodes)?;
+    let zero = build(domain, &entries[..split], emit)?;
+    let one = build(domain, &entries[split..], emit)?;
     let node = PhysicalMapNode::branch(
         domain,
         prefix_bits,
@@ -64,9 +64,7 @@ pub(super) fn build<I: PhysicalIdentity>(
         one,
         u64::try_from(entries.len()).map_err(|_| PhysicalModelError::LengthOverflow)?,
     )?;
-    let id = node.identify(identity)?;
-    nodes.insert(id, node);
-    Ok(id)
+    emit(node)
 }
 
 struct Leaf {

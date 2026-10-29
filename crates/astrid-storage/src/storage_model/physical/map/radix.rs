@@ -9,13 +9,12 @@ use super::{
     PhysicalMapNodeId, PhysicalModelError, RADIX_PAGE_CAPACITY, nibble_prefix_byte_len,
 };
 
-pub(super) fn build<I: PhysicalIdentity>(
-    identity: &I,
+pub(super) fn build<V: AsRef<[u8]>>(
     domain: PhysicalMapDomain,
-    entries: &[(PhysicalMapKey, Vec<u8>)],
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    entries: &[(PhysicalMapKey, V)],
+    emit: &mut impl FnMut(PhysicalMapNode) -> Result<PhysicalMapNodeId, PhysicalModelError>,
 ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
-    build_range(identity, domain, entries, 0, nodes)
+    build_range(domain, entries, 0, emit)
 }
 
 pub(super) fn insert<I: PhysicalIdentity>(
@@ -34,22 +33,23 @@ pub(super) fn insert<I: PhysicalIdentity>(
     .insert_at(root, key, value)
 }
 
-fn build_range<I: PhysicalIdentity>(
-    identity: &I,
+fn build_range<V: AsRef<[u8]>>(
     domain: PhysicalMapDomain,
-    entries: &[(PhysicalMapKey, Vec<u8>)],
+    entries: &[(PhysicalMapKey, V)],
     depth: u8,
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    emit: &mut impl FnMut(PhysicalMapNode) -> Result<PhysicalMapNodeId, PhysicalModelError>,
 ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
     if entries.is_empty() {
         return Err(PhysicalModelError::InvalidMap("empty radix range"));
     }
     if entries.len() <= RADIX_PAGE_CAPACITY {
-        return insert_node(
-            identity,
-            nodes,
-            PhysicalMapNode::page(domain, entries.to_vec())?,
-        );
+        return emit(PhysicalMapNode::page(
+            domain,
+            entries
+                .iter()
+                .map(|(key, value)| (*key, value.as_ref().to_vec()))
+                .collect(),
+        )?);
     }
 
     let prefix_nibbles = common_prefix_nibbles(
@@ -82,13 +82,12 @@ fn build_range<I: PhysicalIdentity>(
         }
         child_bitmap |= 1_u16 << selector;
         children.push(build_range(
-            identity,
             domain,
             &entries[start..end],
             prefix_nibbles
                 .checked_add(1)
                 .ok_or(PhysicalModelError::LengthOverflow)?,
-            nodes,
+            emit,
         )?);
         start = end;
     }
@@ -100,7 +99,7 @@ fn build_range<I: PhysicalIdentity>(
         children,
         u64::try_from(entries.len()).map_err(|_| PhysicalModelError::LengthOverflow)?,
     )?;
-    insert_node(identity, nodes, node)
+    emit(node)
 }
 
 struct DenseInsertion<'a, I> {
@@ -142,7 +141,9 @@ impl<I: PhysicalIdentity> DenseInsertion<'_, I> {
                 let replacement = if entries.len() <= RADIX_PAGE_CAPACITY {
                     self.insert_node(PhysicalMapNode::page(self.domain, entries)?)?
                 } else {
-                    build_range(self.identity, self.domain, &entries, 0, self.nodes)?
+                    build(self.domain, &entries, &mut |node| {
+                        insert_node(self.identity, self.nodes, node)
+                    })?
                 };
                 Ok((replacement, true))
             },
