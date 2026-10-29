@@ -9,6 +9,16 @@
 #[path = "platform_fs/macos_acl.rs"]
 mod macos_acl;
 
+#[path = "platform_fs/private_projection.rs"]
+mod private_projection;
+pub use private_projection::PrivateFileProjection;
+
+#[cfg(unix)]
+#[path = "platform_fs/mount_boundary.rs"]
+mod mount_boundary;
+#[cfg(unix)]
+pub(crate) use mount_boundary::MountBoundary;
+
 use std::collections::HashSet;
 use std::io;
 use std::path::{Component, Path, PathBuf};

@@ -21,8 +21,11 @@ mod key_recovery;
 #[cfg(test)]
 mod key_recovery_tests;
 mod projection;
+mod restoration;
 mod retirement;
-use projection::{confined_projection_path, write_projection_file};
+use projection::confined_projection_path;
+#[cfg(test)]
+use projection::write_projection_file;
 
 const VOLUME_PATH_PREFIX: &str = "volume";
 const SOCKET_PATH: &str = "run/system.sock";
@@ -247,74 +250,7 @@ pub(super) fn restore_projection(
     store: &RuntimePrincipalStore,
     content: &super::NativePrincipalContentStore,
 ) -> StorageResult<()> {
-    let layout_version = home
-        .layout_version()
-        .map_err(|error| tree_io_error(&error))?;
-    if layout_version.as_deref() == Some(astrid_core::dirs::LEGACY_LAYOUT_VERSION) {
-        return Ok(());
-    }
-    ingest_runtime_key(home, store)?;
-    seed_layout_version(home, store)?;
-    let mut entries = content
-        .list(&StateOwner::System)
-        .map_err(|error| tree_error(home.root(), format!("list volume projection: {error}")))?;
-    // Make subsequent interrupted restores structurally recognizable before
-    // materializing other volume-owned directories or configuration files.
-    entries.sort_by_key(|entry| entry.name().as_str() != "etc/layout-version");
-    for entry in &entries {
-        let name = entry.name().as_str();
-        if is_excluded(name) || is_retired_legacy_projection(home, name) {
-            continue;
-        }
-        confined_projection_path(home.root(), name.strip_suffix('/').unwrap_or(name))?;
-    }
-    let mut written = Vec::new();
-    let result = (|| -> StorageResult<()> {
-        for entry in entries {
-            let name = entry.name().as_str();
-            if is_excluded(name) || is_retired_legacy_projection(home, name) {
-                continue;
-            }
-            if let Some(directory) = name.strip_suffix('/') {
-                projection::restore_directory(home.root(), directory, entry.logical_bytes())?;
-                continue;
-            }
-            let Some(bytes) = content
-                .read(&StateOwner::System, entry.name())
-                .map_err(|error| {
-                    tree_error(home.root(), format!("read projection {name}: {error}"))
-                })?
-            else {
-                continue;
-            };
-            let path = confined_projection_path(home.root(), name)?;
-            let previous = super::native_io::snapshot_private_file(&path)?;
-            written.push((path, previous));
-            write_projection_file(home.root(), name, &bytes)?;
-            if is_staging_generation(name) {
-                let path = confined_projection_path(home.root(), name)?;
-                super::rebind_staging_generation(&path)?;
-            }
-        }
-        Ok(())
-    })();
-    if let Err(error) = result {
-        let rollback_errors = super::native_io::rollback_private_files(written);
-        if !rollback_errors.is_empty() {
-            let retirement = match transition_retiring_projection(home, store) {
-                Ok(()) => "durable RETIRING receipt recorded".to_owned(),
-                Err(retirement) => format!("failed to force RETIRING receipt: {retirement}"),
-            };
-            return Err(tree_error(
-                home.root(),
-                format!(
-                    "restore failed: {error}; rollback failures: {rollback_errors:?}; {retirement}"
-                ),
-            ));
-        }
-        return Err(error);
-    }
-    Ok(())
+    restoration::restore_projection(home, store, content)
 }
 
 fn is_retired_legacy_projection(home: &AstridHome, name: &str) -> bool {

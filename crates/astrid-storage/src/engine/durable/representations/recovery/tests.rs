@@ -43,6 +43,148 @@ fn recovery_memo_never_remembers_an_incomplete_closure() {
     assert_eq!(complete, verified);
 }
 
+fn dense_representation_map() -> CanonicalPhysicalMap {
+    CanonicalPhysicalMap::build_dense(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Representation,
+        (0_u32..32)
+            .map(|ordinal| {
+                (
+                    PhysicalMapKey::new(*blake3::hash(&ordinal.to_le_bytes()).as_bytes()),
+                    ordinal.to_le_bytes().to_vec(),
+                )
+            })
+            .collect(),
+    )
+    .unwrap()
+}
+
+fn index_with_state(
+    map: &CanonicalPhysicalMap,
+    catalogue: RepresentationCatalogueRoot,
+    placements: PlacementSet,
+    state: RepresentationState,
+) -> (MetadataIndex, RepresentationStateId) {
+    let identity = Blake3PhysicalIdentity;
+    let mut index = MetadataIndex::default();
+    for node in map.nodes().values() {
+        index
+            .insert(MetadataFrame::map_node(&identity, node).unwrap())
+            .unwrap();
+    }
+    index
+        .insert(MetadataFrame::catalogue(&identity, catalogue))
+        .unwrap();
+    index
+        .insert(MetadataFrame::placement(&identity, placements))
+        .unwrap();
+    let state_id = state.identify(&identity);
+    index
+        .insert(MetadataFrame::state(&identity, state))
+        .unwrap();
+    (index, state_id)
+}
+
+fn shared_roots(map: &CanonicalPhysicalMap) -> (RepresentationCatalogueRoot, PlacementSet) {
+    let leaves = 32;
+    (
+        RepresentationCatalogueRoot::new(1, map.root(), leaves, map.root(), leaves).unwrap(),
+        PlacementSet::new(1, map.root(), leaves, leaves).unwrap(),
+    )
+}
+
+fn later_journal_checkpoint(
+    active: RepresentationStateId,
+    state_generation: u64,
+) -> (JournalEntry, CurrentPointer) {
+    (
+        JournalEntry::Checkpoint {
+            journal_generation: FIRST_JOURNAL_GENERATION + 1,
+            active: Some(active),
+            state_generation,
+            prior_journal_digest: Some([7; 32]),
+        },
+        CurrentPointer {
+            journal_generation: FIRST_JOURNAL_GENERATION + 1,
+            checkpoint_digest: [1; 32],
+            max_tail_frames: 8,
+            max_tail_bytes: 64,
+        },
+    )
+}
+
+#[test]
+fn checkpoint_closure_is_reused_by_the_first_shared_cas() {
+    let map = dense_representation_map();
+    let (catalogue, placements) = shared_roots(&map);
+    let identity = Blake3PhysicalIdentity;
+    let checkpoint_state = RepresentationState::new(
+        1,
+        None,
+        catalogue.identify(&identity),
+        placements.identify(&identity),
+    )
+    .unwrap();
+    let (mut metadata, checkpoint_id) =
+        index_with_state(&map, catalogue, placements, checkpoint_state);
+    let cas_state = RepresentationState::new(
+        2,
+        Some(checkpoint_id),
+        catalogue.identify(&identity),
+        placements.identify(&identity),
+    )
+    .unwrap();
+    let cas_id = cas_state.identify(&identity);
+    metadata
+        .insert(MetadataFrame::state(&identity, cas_state))
+        .unwrap();
+    let (checkpoint, current) = later_journal_checkpoint(checkpoint_id, 1);
+    let mut complete = BTreeSet::new();
+    recover_checkpoint(checkpoint, current, &metadata, &mut complete).unwrap();
+    assert_eq!(complete.len(), map.nodes().len());
+    let stolen = map.root().unwrap();
+    metadata.nodes.remove(&stolen);
+    assert!(
+        state_metadata_closure_complete(cas_id, &metadata, &mut complete).unwrap(),
+        "first CAS must reuse checkpoint proofs without walking stolen nodes",
+    );
+    assert!(
+        !state_metadata_closure_complete(cas_id, &metadata, &mut BTreeSet::new()).unwrap(),
+        "a discarded checkpoint set must still observe the missing node",
+    );
+}
+
+#[test]
+fn incomplete_checkpoint_cannot_populate_closure_proofs() {
+    let map = dense_representation_map();
+    let root = map.root().unwrap();
+    let (catalogue, placements) = shared_roots(&map);
+    let identity = Blake3PhysicalIdentity;
+    let state = RepresentationState::new(
+        1,
+        None,
+        catalogue.identify(&identity),
+        placements.identify(&identity),
+    )
+    .unwrap();
+    let (mut metadata, state_id) = index_with_state(&map, catalogue, placements, state);
+    let only_root = BTreeMap::from([(root, map.nodes()[&root].clone())]);
+    metadata.nodes = only_root;
+    let (checkpoint, current) = later_journal_checkpoint(state_id, 1);
+    let mut complete = BTreeSet::new();
+    let error = recover_checkpoint(checkpoint, current, &metadata, &mut complete).unwrap_err();
+    assert!(matches!(
+        error,
+        DurableError::InvalidRepresentationState(
+            "representation checkpoint has an incomplete metadata closure",
+        )
+    ));
+    assert!(
+        complete.is_empty(),
+        "failed checkpoint must not retain partial map proofs"
+    );
+}
+
 #[test]
 fn metadata_recovery_keeps_one_owned_copy_of_each_map_node() {
     let node = PhysicalMapNode::leaf(

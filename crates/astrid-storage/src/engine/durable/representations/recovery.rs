@@ -132,7 +132,12 @@ pub(super) fn recover_journal<F: DurableIo>(
     let first = entries.first().map(|(_, entry)| *entry).ok_or(
         DurableError::InvalidRepresentationState("representation journal is empty"),
     )?;
-    let (mut active, mut generation) = recover_checkpoint(first, current, metadata)?;
+    // Metadata is immutable for this replay. Only successfully checked closures
+    // may be reused across historical states, including the checkpoint active
+    // state; CAS and generation checks still run.
+    let mut complete_maps = BTreeSet::new();
+    let (mut active, mut generation) =
+        recover_checkpoint(first, current, metadata, &mut complete_maps)?;
     validate_tail_budget(entries.len(), bytes.len(), checkpoint_end, current)?;
     let mut previous_state = active
         .map(|id| {
@@ -140,9 +145,6 @@ pub(super) fn recover_journal<F: DurableIo>(
                 .map_err(DurableError::from)
         })
         .transpose()?;
-    // Metadata is immutable for this replay. Only successfully checked closures
-    // may be reused across historical states; CAS and generation checks still run.
-    let mut complete_maps = BTreeSet::new();
     let entry_count = entries.len();
     for (position, (offset, entry)) in entries.into_iter().enumerate().skip(1) {
         let JournalEntry::StateCas {
@@ -197,6 +199,7 @@ fn recover_checkpoint(
     first: JournalEntry,
     current: CurrentPointer,
     metadata: &MetadataIndex,
+    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
 ) -> Result<(Option<RepresentationStateId>, u64), DurableError> {
     match first {
         JournalEntry::Checkpoint {
@@ -220,7 +223,7 @@ fn recover_checkpoint(
         } if journal_generation == current.journal_generation
             && journal_generation > FIRST_JOURNAL_GENERATION =>
         {
-            if !state_metadata_closure_complete(active, metadata, &mut BTreeSet::new())? {
+            if !state_metadata_closure_complete(active, metadata, complete)? {
                 return Err(DurableError::InvalidRepresentationState(
                     "representation checkpoint has an incomplete metadata closure",
                 ));

@@ -4,33 +4,33 @@ use nix::sys::stat::fstat;
 use std::fs::File;
 use std::io;
 
-pub(super) struct MountBoundary {
+pub(crate) struct MountBoundary {
     device: nix::libc::dev_t,
     #[cfg(target_os = "linux")]
     mount: MountId,
 }
 
 impl MountBoundary {
-    pub(super) fn new(root: &File) -> io::Result<Self> {
+    pub(crate) fn new(root: &File) -> io::Result<Self> {
         Ok(Self {
-            device: fstat(root).map_err(super::nix_error)?.st_dev,
+            device: fstat(root).map_err(super::nix_io_error)?.st_dev,
             #[cfg(target_os = "linux")]
             mount: MountId::read(root)?,
         })
     }
 
-    pub(super) fn validate(&self, child: &File) -> io::Result<()> {
-        self.validate_device(fstat(child).map_err(super::nix_error)?.st_dev)?;
+    pub(crate) fn validate(&self, child: &File) -> io::Result<()> {
+        self.validate_device(fstat(child).map_err(super::nix_io_error)?.st_dev)?;
         #[cfg(target_os = "linux")]
         if MountId::read(child)? != self.mount {
-            return Err(super::invalid("projection crosses a mount boundary"));
+            return Err(invalid("projection crosses a mount boundary"));
         }
         Ok(())
     }
 
-    pub(super) fn validate_device(&self, device: nix::libc::dev_t) -> io::Result<()> {
+    pub(crate) fn validate_device(&self, device: nix::libc::dev_t) -> io::Result<()> {
         if device != self.device {
-            return Err(super::invalid("projection crosses a device boundary"));
+            return Err(invalid("projection crosses a device boundary"));
         }
         Ok(())
     }
@@ -62,18 +62,22 @@ impl MountId {
                     || value.is_empty()
                     || !value.bytes().all(|byte| byte.is_ascii_digit())
                 {
-                    return Err(super::invalid("malformed fdinfo mount identity"));
+                    return Err(invalid("malformed fdinfo mount identity"));
                 }
                 let number = value
                     .parse::<u64>()
                     .ok()
                     .and_then(std::num::NonZeroU64::new)
-                    .ok_or_else(|| super::invalid("invalid fdinfo mount identity"))?;
+                    .ok_or_else(|| invalid("invalid fdinfo mount identity"))?;
                 mount = Some(Self(number));
             }
         }
-        mount.ok_or_else(|| super::invalid("fdinfo lacks mount identity"))
+        mount.ok_or_else(|| invalid("fdinfo lacks mount identity"))
     }
+}
+
+fn invalid(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 #[cfg(test)]

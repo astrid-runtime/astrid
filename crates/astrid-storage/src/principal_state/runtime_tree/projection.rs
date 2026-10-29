@@ -32,6 +32,7 @@ pub(super) fn confined_projection_path(root: &Path, relative: &str) -> StorageRe
     Ok(path)
 }
 
+#[cfg(test)]
 pub(super) fn write_projection_file(
     root: &Path,
     relative: &str,
@@ -47,12 +48,25 @@ pub(super) fn write_projection_file(
     Ok(())
 }
 
-pub(super) fn restore_directory(root: &Path, name: &str, logical_bytes: u64) -> StorageResult<()> {
+pub(super) fn restore_directory(
+    writer: &astrid_core::platform_fs::PrivateFileProjection,
+    root: &Path,
+    name: &str,
+    logical_bytes: u64,
+) -> StorageResult<()> {
     if logical_bytes != 0 {
         return Err(tree_error(root, "directory marker contains file bytes"));
     }
     let path = confined_projection_path(root, name)?;
-    super::super::native_io::ensure_private_directory(&path)
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|error| tree_error(root, error))?;
+    writer.ensure_directory(relative).map_err(|error| {
+        tree_error(
+            root,
+            format!("restore projection directory {name}: {error}"),
+        )
+    })
 }
 
 pub(super) fn surviving_directory(root: &Path, name: &str) -> bool {

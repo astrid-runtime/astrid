@@ -10,9 +10,7 @@ use nix::fcntl::{AtFlags, OFlag, openat};
 use nix::sys::stat::{FileStat, Mode, SFlag, fstat, fstatat};
 use nix::unistd::{UnlinkatFlags, unlinkat};
 
-#[path = "mount.rs"]
-mod mount;
-use mount::MountBoundary;
+use crate::platform_fs::MountBoundary;
 
 const CANONICAL_VOLUME: &str = "astrid.volume";
 
