@@ -780,6 +780,9 @@ impl RepresentationStore {
             placements.entries_root(),
             &mut index.nodes,
         )?;
+        // Active closures now own their nodes. Release unused historical bodies
+        // and replay metadata before allocating the validated reverse index.
+        drop(index);
         if profiles.entry_count() != catalogue.profile_count()
             || representations.entry_count() != catalogue.representation_count()
             || placement_entries.entry_count() != placements.blob_count()
