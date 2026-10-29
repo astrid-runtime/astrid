@@ -14,7 +14,7 @@ mod private_projection;
 pub use private_projection::PrivateFileProjection;
 
 #[cfg(unix)]
-#[path = "platform_fs/mount_boundary.rs"]
+#[path = "platform_fs/mount_boundary/mod.rs"]
 mod mount_boundary;
 #[cfg(unix)]
 pub(crate) use mount_boundary::MountBoundary;

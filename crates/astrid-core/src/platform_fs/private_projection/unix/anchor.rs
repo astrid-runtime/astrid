@@ -6,11 +6,12 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use nix::fcntl::openat;
-use nix::sys::stat::{Mode, SFlag, fchmod, fstat, mkdirat};
+use nix::sys::stat::{Mode, SFlag, fchmod, mkdirat};
 use nix::unistd::{fsync, getuid};
 
 use super::{
-    Identity, MountBoundary, directory_flags, entry_stat, invalid, nix_io_error, verify_identity,
+    DescriptorObservation, Identity, MountBoundary, directory_flags, entry_stat, fstat, invalid,
+    nix_io_error, verify_identity, verify_observed_identity,
 };
 
 pub(super) struct Root {
@@ -58,8 +59,9 @@ impl Root {
     }
 
     pub(super) fn validate(&self, boundary: &MountBoundary) -> io::Result<()> {
-        validate_private_directory(&self.file)?;
-        verify_identity(&self.parent, &self.name, &self.file, self.identity)?;
+        let held = DescriptorObservation::read(&self.file)?;
+        validate_private_directory(&held)?;
+        verify_observed_identity(&self.parent, &self.name, &held, self.identity)?;
         let current = File::from(
             openat(
                 &self.parent,
@@ -69,10 +71,11 @@ impl Root {
             )
             .map_err(nix_io_error)?,
         );
-        if Identity::of(&current)? != self.identity {
+        let current = DescriptorObservation::read(&current)?;
+        if Identity::read(current.stat()) != self.identity {
             return Err(invalid("projection root binding changed"));
         }
-        boundary.validate(&current)
+        boundary.validate_observation(&current)
     }
 
     pub(super) fn validate_absolute(&self, boundary: &MountBoundary) -> io::Result<()> {
@@ -161,8 +164,9 @@ impl<'a> DirectoryChain<'a> {
         self.root.validate(boundary)?;
         let mut parent = &self.root.file;
         for binding in &self.bindings {
-            validate_private_directory(&binding.file)?;
-            verify_identity(parent, &binding.name, &binding.file, binding.identity)?;
+            let held = DescriptorObservation::read(&binding.file)?;
+            validate_private_directory(&held)?;
+            verify_observed_identity(parent, &binding.name, &held, binding.identity)?;
             let current = File::from(
                 openat(
                     parent,
@@ -172,10 +176,11 @@ impl<'a> DirectoryChain<'a> {
                 )
                 .map_err(nix_io_error)?,
             );
-            if Identity::of(&current)? != binding.identity {
+            let current = DescriptorObservation::read(&current)?;
+            if Identity::read(current.stat()) != binding.identity {
                 return Err(invalid("projection directory binding changed"));
             }
-            boundary.validate(&current)?;
+            boundary.validate_observation(&current)?;
             parent = &binding.file;
         }
         Ok(())
@@ -205,8 +210,8 @@ pub(super) fn make_private_directory(file: &File) -> io::Result<bool> {
     Ok(changed)
 }
 
-fn validate_private_directory(file: &File) -> io::Result<()> {
-    let stat = fstat(file).map_err(nix_io_error)?;
+fn validate_private_directory(observed: &DescriptorObservation<'_>) -> io::Result<()> {
+    let stat = observed.stat();
     if stat.st_mode & SFlag::S_IFMT.bits() != SFlag::S_IFDIR.bits()
         || stat.st_uid != getuid().as_raw()
         || stat.st_mode & 0o777 != 0o700
@@ -217,6 +222,6 @@ fn validate_private_directory(file: &File) -> io::Result<()> {
         ));
     }
     #[cfg(target_os = "macos")]
-    crate::platform_fs::macos_acl::validate(file)?;
+    crate::platform_fs::macos_acl::validate(observed.file())?;
     Ok(())
 }

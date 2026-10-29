@@ -6,10 +6,11 @@ use std::io::{self, Read as _};
 use std::path::Path;
 
 use nix::fcntl::{AtFlags, OFlag, openat};
-use nix::sys::stat::{FileStat, SFlag, fstat, fstatat};
+use nix::sys::stat::{FileStat, SFlag, fstatat};
 use nix::unistd::fsync;
 
 use super::RelativePath;
+use crate::platform_fs::mount_boundary::{DescriptorObservation, fstat};
 use crate::platform_fs::{MountBoundary, nix_io_error};
 
 mod anchor;
@@ -125,6 +126,21 @@ fn entry_stat(parent: &File, name: &OsStr) -> io::Result<Option<FileStat>> {
 fn verify_identity(parent: &File, name: &OsStr, file: &File, expected: Identity) -> io::Result<()> {
     let current = entry_stat(parent, name)?.map(|stat| Identity::read(&stat));
     if Identity::of(file)? != expected || current != Some(expected) {
+        return Err(invalid("projection entry identity changed"));
+    }
+    Ok(())
+}
+
+fn verify_observed_identity(
+    parent: &File,
+    name: &OsStr,
+    observed: &DescriptorObservation<'_>,
+    expected: Identity,
+) -> io::Result<()> {
+    // The held descriptor's inode/device/type cannot change. Its earlier
+    // policy observation can supply identity while this name is read afresh.
+    let current = entry_stat(parent, name)?.map(|stat| Identity::read(&stat));
+    if Identity::read(observed.stat()) != expected || current != Some(expected) {
         return Err(invalid("projection entry identity changed"));
     }
     Ok(())

@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-#[cfg(target_os = "linux")]
 use std::ffi::OsString;
 use std::fs;
 use std::io;
@@ -10,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use super::hooks::{self, Event};
+use super::{DescriptorObservation, DirectoryChain, Projection};
 use crate::platform_fs::PrivateFileProjection;
 
 fn assert_no_temporary_files(root: &Path) {
@@ -341,4 +341,103 @@ fn parent_fence_error_can_be_rolled_back_through_same_root() {
     projection.sync().unwrap();
     assert_eq!(fs::read(root.path().join("state")).unwrap(), b"previous");
     assert_no_temporary_files(root.path());
+}
+
+#[test]
+fn root_validation_uses_two_ordinary_fstat_syscalls() {
+    let root = tempfile::tempdir().unwrap();
+    let projection = Projection::open(root.path()).unwrap();
+    DescriptorObservation::reset_syscall_count();
+    projection.root.validate(&projection.boundary).unwrap();
+    assert_eq!(DescriptorObservation::syscall_count(), 2);
+}
+
+#[test]
+fn directory_validation_uses_two_ordinary_fstats_per_node() {
+    let root = tempfile::tempdir().unwrap();
+    let projection = Projection::open(root.path()).unwrap();
+    let chain = DirectoryChain::walk(
+        &projection.root,
+        &projection.boundary,
+        &[OsString::from("one"), OsString::from("two")],
+        true,
+    )
+    .unwrap()
+    .unwrap();
+    DescriptorObservation::reset_syscall_count();
+    chain.validate(&projection.boundary).unwrap();
+    // Two observations each for the root and the two directory bindings.
+    assert_eq!(DescriptorObservation::syscall_count(), 6);
+}
+
+#[test]
+fn root_policy_is_read_again_at_each_validation_checkpoint() {
+    let root = tempfile::tempdir().unwrap();
+    let projection = Projection::open(root.path()).unwrap();
+    projection.root.validate(&projection.boundary).unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let error = projection.root.validate(&projection.boundary).unwrap_err();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    projection.root.validate(&projection.boundary).unwrap();
+}
+
+#[test]
+fn directory_permission_change_before_rename_is_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let projection = PrivateFileProjection::open(root.path()).unwrap();
+    projection
+        .write(Path::new("nested/state"), b"previous")
+        .unwrap();
+    let nested = root.path().join("nested");
+    let changed = nested.clone();
+    let hook = hooks::install(move |event| {
+        if event == Event::BeforeRename {
+            fs::set_permissions(&changed, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        Ok(())
+    });
+    let error = projection
+        .write(Path::new("nested/state"), b"replacement")
+        .unwrap_err();
+    drop(hook);
+    fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(fs::read(nested.join("state")).unwrap(), b"previous");
+    assert_no_temporary_files(&nested);
+    projection.sync().unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn directory_acl_change_before_rename_is_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let projection = PrivateFileProjection::open(root.path()).unwrap();
+    projection
+        .write(Path::new("nested/state"), b"previous")
+        .unwrap();
+    let nested = root.path().join("nested");
+    let changed = nested.clone();
+    let hook = hooks::install(move |event| {
+        if event == Event::BeforeRename {
+            assert!(
+                std::process::Command::new("/bin/chmod")
+                    .args(["+a", "everyone allow read"])
+                    .arg(&changed)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        Ok(())
+    });
+    let error = projection
+        .write(Path::new("nested/state"), b"replacement")
+        .unwrap_err();
+    drop(hook);
+    crate::platform_fs::macos_acl::restrict(&fs::File::open(&nested).unwrap()).unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(fs::read(nested.join("state")).unwrap(), b"previous");
+    assert_no_temporary_files(&nested);
+    projection.sync().unwrap();
 }

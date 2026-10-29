@@ -1,8 +1,10 @@
 //! Reject device transitions and, on Linux, same-device bind mounts.
 
-use nix::sys::stat::fstat;
 use std::fs::File;
 use std::io;
+
+mod descriptor_observation;
+pub(crate) use descriptor_observation::{DescriptorObservation, counted_fstat as fstat};
 
 pub(crate) struct MountBoundary {
     device: nix::libc::dev_t,
@@ -20,9 +22,13 @@ impl MountBoundary {
     }
 
     pub(crate) fn validate(&self, child: &File) -> io::Result<()> {
-        self.validate_device(fstat(child).map_err(super::nix_io_error)?.st_dev)?;
+        self.validate_observation(&DescriptorObservation::read(child)?)
+    }
+
+    pub(crate) fn validate_observation(&self, child: &DescriptorObservation<'_>) -> io::Result<()> {
+        self.validate_device(child.stat().st_dev)?;
         #[cfg(target_os = "linux")]
-        if MountId::read(child)? != self.mount {
+        if MountId::read(child.file())? != self.mount {
             return Err(invalid("projection crosses a mount boundary"));
         }
         Ok(())
