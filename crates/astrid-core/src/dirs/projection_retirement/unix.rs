@@ -63,11 +63,25 @@ struct InventoryEntry {
     children: Vec<Self>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetirementSync {
+    Directory,
+    Device,
+}
+
 pub(super) fn retire(path: &Path) -> io::Result<()> {
     retire_after_preflight(path, || {})
 }
 
 fn retire_after_preflight(path: &Path, after_preflight: impl FnOnce()) -> io::Result<()> {
+    retire_with_sync(path, after_preflight, |_, _| Ok(()))
+}
+
+fn retire_with_sync(
+    path: &Path,
+    after_preflight: impl FnOnce(),
+    mut after_sync: impl FnMut(&File, RetirementSync) -> io::Result<()>,
+) -> io::Result<()> {
     let root = crate::platform_fs::open_existing_directory_no_follow(path)?;
     let boundary = MountBoundary::new(&root)?;
     let entries = inventory(&root, &boundary, true)?;
@@ -75,9 +89,26 @@ fn retire_after_preflight(path: &Path, after_preflight: impl FnOnce()) -> io::Re
     // Recheck the complete captured tree before committing any deletion. This
     // also detects canonical-volume replacement at the preflight boundary.
     validate_inventory(&root, &entries, &boundary)?;
-    retire_entries(&root, &entries, &boundary, true)?;
-    validate_survivor(&root, &entries, &boundary)?;
-    root.sync_all()
+    let retirement = retire_entries(&root, &entries, &boundary, true, &mut after_sync)
+        .and_then(|()| validate_survivor(&root, &entries, &boundary));
+    // Directory fsyncs precede directory removal. File::sync_all adds Apple's
+    // device-wide F_FULLFSYNC once for preceding writes, including
+    // after partial cleanup. Storage keeps its durable RETIRING receipt and
+    // volume authority until this terminal barrier and retirement both succeed.
+    synchronize(&root, RetirementSync::Device, &mut after_sync)?;
+    retirement
+}
+
+fn synchronize(
+    directory: &File,
+    kind: RetirementSync,
+    after_sync: &mut impl FnMut(&File, RetirementSync) -> io::Result<()>,
+) -> io::Result<()> {
+    match kind {
+        RetirementSync::Directory => nix::unistd::fsync(directory).map_err(nix_error)?,
+        RetirementSync::Device => directory.sync_all()?,
+    }
+    after_sync(directory, kind)
 }
 
 fn inventory(
@@ -132,6 +163,7 @@ fn retire_entries(
     entries: &[InventoryEntry],
     boundary: &MountBoundary,
     root: bool,
+    after_sync: &mut impl FnMut(&File, RetirementSync) -> io::Result<()>,
 ) -> io::Result<()> {
     for entry in entries {
         let child = open_checked(parent, &entry.name, entry.identity, boundary)?;
@@ -140,10 +172,11 @@ fn retire_entries(
         }
         let flags = match &child {
             Child::Directory(directory) => {
-                retire_entries(directory, &entry.children, boundary, false)?;
-                // Preserve the legacy durability order: sync the directory's
-                // removals before unlinking the directory from its parent.
-                directory.sync_all()?;
+                retire_entries(directory, &entry.children, boundary, false, after_sync)?;
+                // Persist this directory's removals before unlinking it. On
+                // Apple platforms fsync fences metadata without issuing a
+                // device-wide F_FULLFSYNC for every removed directory.
+                synchronize(directory, RetirementSync::Directory, after_sync)?;
                 UnlinkatFlags::RemoveDir
             },
             Child::File { .. } => UnlinkatFlags::NoRemoveDir,
@@ -153,9 +186,9 @@ fn retire_entries(
         check_identity(parent, &entry.name, &child, entry.identity, boundary)?;
         unlinkat(parent, entry.name.as_os_str(), flags).map_err(nix_error)?;
         if root && entry.identity.kind == EntryKind::Directory {
-            // Legacy top-level tree retirement also fenced the containing
-            // root after each directory removal, including before a later error.
-            parent.sync_all()?;
+            // Preserve the containing-root fence after each top-level
+            // directory removal, including before a later error.
+            synchronize(parent, RetirementSync::Directory, after_sync)?;
         }
     }
     Ok(())
@@ -284,3 +317,7 @@ fn invalid(message: &'static str) -> io::Error {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "sync_tests.rs"]
+mod sync_tests;
