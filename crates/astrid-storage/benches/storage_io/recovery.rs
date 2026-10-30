@@ -95,10 +95,7 @@ pub(super) struct FrozenSource {
 
 impl FrozenSource {
     pub(super) fn open(path: &Path) -> BenchResult<Self> {
-        if !std::fs::symlink_metadata(path)?.is_file() {
-            return Err("recovery source must be a regular, stopped volume snapshot".into());
-        }
-        let mut file = File::open(path)?;
+        let mut file = open_source_file(path)?;
         fs2::FileExt::try_lock_shared(&file)
             .map_err(|error| format!("recovery source is locked by a writer: {error}"))?;
         let bytes = file.metadata()?.len();
@@ -134,6 +131,37 @@ impl FrozenSource {
         }
         Ok(())
     }
+}
+
+pub(super) fn open_source_file(path: &Path) -> BenchResult<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // Refuse the final symlink atomically; a raced FIFO must not block open.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err("recovery source must be a regular, stopped volume snapshot".into());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err("recovery source must not be a reparse point".into());
+        }
+    }
+    Ok(file)
 }
 
 fn hash_file(file: &mut File) -> BenchResult<String> {

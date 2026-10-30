@@ -914,8 +914,8 @@ byte-identical. The last working copy is retained under `--root`; earlier
 copies are removed outside the timers. Provision room for both a full copy and
 any recovery writes, plus the host's required free-space reserve.
 
-Separate metrics measure container open, durable-engine open and explicit
-engine close. They use the runtime's StateOwner-v2 codec, process-addressable
+Separate metrics measure container open, durable-engine open and engine close
+including teardown of the engine and volume handles. They use the runtime's StateOwner-v2 codec, process-addressable
 recovery limits and default engine policy. Root enumeration/comparison is
 outside those timers. This is **engine recovery**, not daemon readiness,
 projection restoration, a fresh 10k-agent derivation or known-byte application

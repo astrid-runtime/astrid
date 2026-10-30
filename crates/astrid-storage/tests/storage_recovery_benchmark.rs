@@ -147,7 +147,7 @@ async fn isolated_recovery_profile() {
     let writer = output.clone();
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter("astrid_storage::recovery=debug")
-        .with_span_events(FmtSpan::CLOSE)
+        .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
         .json()
         .with_writer(move || writer.clone())
         .finish();
@@ -183,11 +183,17 @@ async fn isolated_recovery_profile() {
         "recover_volume_index",
         "recover_roots",
     ] {
+        let entry = records
+            .iter()
+            .position(|r| r["span"]["name"] == phase && r["fields"]["message"] == "new")
+            .unwrap_or_else(|| panic!("missing sampling entry marker {phase}: {records:?}"));
+        let close = records
+            .iter()
+            .position(|r| r["span"]["name"] == phase && r["fields"]["time.busy"].is_string())
+            .unwrap_or_else(|| panic!("missing measured phase {phase}: {records:?}"));
         assert!(
-            records
-                .iter()
-                .any(|r| r["span"]["name"] == phase && r["fields"]["time.busy"].is_string()),
-            "missing measured phase {phase}: {records:?}"
+            entry < close,
+            "phase {phase} closed before its entry marker"
         );
     }
     assert!(
@@ -202,6 +208,34 @@ async fn isolated_recovery_profile() {
             .any(|r| r["span"]["name"] == "recover_journal"
                 && r["span"]["journal_frames"].as_u64().is_some_and(|n| n > 0))
     );
+}
+
+#[test]
+fn source_descriptor_requires_a_regular_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(recovery::open_source_file(tmp.path()).is_err());
+    let path = tmp.path().join("source");
+    std::fs::write(&path, b"frozen source").unwrap();
+    assert!(recovery::open_source_file(&path).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn source_descriptor_refuses_final_symlinks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let alias = tmp.path().join("alias");
+    std::fs::write(&source, b"frozen source").unwrap();
+    std::os::unix::fs::symlink(&source, &alias).unwrap();
+    let error = recovery::open_source_file(&alias).unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .raw_os_error(),
+        Some(libc::ELOOP)
+    );
+    assert_eq!(std::fs::read(&source).unwrap(), b"frozen source");
 }
 
 #[test]
