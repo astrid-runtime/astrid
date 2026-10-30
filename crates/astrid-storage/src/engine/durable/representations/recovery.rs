@@ -33,13 +33,18 @@ pub(super) struct MetadataIndex {
 }
 
 impl MetadataIndex {
-    fn insert(&mut self, frame: MetadataFrame) -> Result<(), DurableError> {
+    fn insert<V: AsRef<[u8]> + Into<Vec<u8>>>(
+        &mut self,
+        frame: MetadataFrame<V>,
+    ) -> Result<(), DurableError> {
         if frame.kind == MetadataKind::MapNode {
             // Decode and authenticate once, then keep that sole owned value.
             // Retaining its encoded payload as well duplicates every historical
             // node until journal validation and active-closure recovery finish.
-            let (node, id) =
-                PhysicalMapNode::decode_and_identify(&frame.value, &Blake3PhysicalIdentity)?;
+            let (node, id) = PhysicalMapNode::decode_and_identify(
+                frame.value.as_ref(),
+                &Blake3PhysicalIdentity,
+            )?;
             if id != map_node_id(frame.identity) {
                 return Err(DurableError::InvalidRepresentationState(
                     "metadata identity does not match canonical value",
@@ -59,14 +64,14 @@ impl MetadataIndex {
         frame.verify(&Blake3PhysicalIdentity)?;
         let key = (frame.kind, frame.identity);
         if let Some(existing) = self.values.get(&key) {
-            if existing != &frame.value {
+            if existing.as_slice() != frame.value.as_ref() {
                 return Err(DurableError::InvalidRepresentationState(
                     "physical metadata identity collision",
                 ));
             }
             return Ok(());
         }
-        self.values.insert(key, frame.value);
+        self.values.insert(key, frame.value.into());
         Ok(())
     }
 

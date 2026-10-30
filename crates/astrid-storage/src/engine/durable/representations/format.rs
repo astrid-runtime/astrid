@@ -8,6 +8,9 @@ use crate::storage_model::{
 
 use super::super::DurableError;
 
+#[cfg(test)]
+mod tests;
+
 pub(super) const METADATA_MAGIC: [u8; 8] = *b"ASTRPM1\0";
 pub(super) const JOURNAL_MAGIC: [u8; 8] = *b"ASTREP1\0";
 pub(super) const CURRENT_MAGIC: [u8; 8] = *b"ASTCUR1\0";
@@ -58,10 +61,10 @@ impl MetadataKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct MetadataFrame {
+pub(super) struct MetadataFrame<V = Vec<u8>> {
     pub(super) kind: MetadataKind,
     pub(super) identity: [u8; 32],
-    pub(super) value: Vec<u8>,
+    pub(super) value: V,
 }
 
 impl MetadataFrame {
@@ -115,15 +118,17 @@ impl MetadataFrame {
             value,
         }
     }
+}
 
+impl<V: AsRef<[u8]>> MetadataFrame<V> {
     pub(super) fn encode(&self) -> Result<Vec<u8>, DurableError> {
         let value_len =
-            u64::try_from(self.value.len()).map_err(|_| DurableError::EncodingOverflow)?;
+            u64::try_from(self.value.as_ref().len()).map_err(|_| DurableError::EncodingOverflow)?;
         let mut bytes = Vec::new();
         let capacity = 1_usize
             .checked_add(TAGGED_IDENTITY_BYTES)
             .and_then(|total| total.checked_add(8))
-            .and_then(|total| total.checked_add(self.value.len()))
+            .and_then(|total| total.checked_add(self.value.as_ref().len()))
             .ok_or(DurableError::EncodingOverflow)?;
         bytes
             .try_reserve_exact(capacity)
@@ -131,43 +136,28 @@ impl MetadataFrame {
         bytes.push(self.kind.code());
         encode_physical_identity(&mut bytes, &self.identity);
         bytes.extend_from_slice(&value_len.to_le_bytes());
-        bytes.extend_from_slice(&self.value);
+        bytes.extend_from_slice(self.value.as_ref());
         Ok(bytes)
-    }
-
-    pub(super) fn decode(bytes: &[u8]) -> Result<Self, DurableError> {
-        let mut reader = Reader::new(bytes);
-        let kind = MetadataKind::decode(reader.u8()?)?;
-        let identity = reader.physical_identity()?;
-        let value = reader.length_prefixed()?.to_vec();
-        reader.finish()?;
-        let frame = Self::new(kind, identity, value);
-        if frame.encode()?.as_slice() != bytes {
-            return Err(DurableError::InvalidRepresentationState(
-                "metadata frame is not canonical",
-            ));
-        }
-        Ok(frame)
     }
 
     pub(super) fn verify<I: PhysicalIdentity>(&self, identity: &I) -> Result<(), DurableError> {
         let computed = match self.kind {
-            MetadataKind::Profile => *RepresentationProfile::decode(&self.value)?
+            MetadataKind::Profile => *RepresentationProfile::decode(self.value.as_ref())?
                 .identify(identity)?
                 .as_bytes(),
-            MetadataKind::Representation => *RepresentationRecord::decode(&self.value)?
+            MetadataKind::Representation => *RepresentationRecord::decode(self.value.as_ref())?
                 .identify(identity)?
                 .as_bytes(),
-            MetadataKind::MapNode => *PhysicalMapNode::decode(&self.value)?
+            MetadataKind::MapNode => *PhysicalMapNode::decode(self.value.as_ref())?
                 .identify(identity)?
                 .as_bytes(),
-            MetadataKind::Catalogue => *RepresentationCatalogueRoot::decode(&self.value)?
+            MetadataKind::Catalogue => *RepresentationCatalogueRoot::decode(self.value.as_ref())?
                 .identify(identity)
                 .as_bytes(),
-            MetadataKind::Placement => *PlacementSet::decode(&self.value)?
+            MetadataKind::Placement => *PlacementSet::decode(self.value.as_ref())?
                 .identify(identity)
                 .as_bytes(),
-            MetadataKind::State => *RepresentationState::decode(&self.value)?
+            MetadataKind::State => *RepresentationState::decode(self.value.as_ref())?
                 .identify(identity)
                 .as_bytes(),
         };
@@ -177,6 +167,25 @@ impl MetadataFrame {
             ));
         }
         Ok(())
+    }
+}
+
+impl<'a> MetadataFrame<&'a [u8]> {
+    pub(super) fn decode(bytes: &'a [u8]) -> Result<Self, DurableError> {
+        let mut reader = Reader::new(bytes);
+        let kind = MetadataKind::decode(reader.u8()?)?;
+        let identity = reader.physical_identity()?;
+        let value = reader.length_prefixed()?;
+        reader.finish()?;
+        // Each field has one fixed-width encoding: the reader rejects unknown
+        // tags, noncanonical identity envelopes, lengths and trailing bytes.
+        // Re-encoding this outer frame would only copy the original payload;
+        // canonical value decoding and authentication still happen on insert.
+        Ok(Self {
+            kind,
+            identity,
+            value,
+        })
     }
 }
 

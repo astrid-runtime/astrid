@@ -21,7 +21,7 @@ pub(super) fn run(config: &Config, root: &Path, provenance: RunProvenance) -> Be
     if config.profile_recovery {
         tracing_subscriber::fmt()
             .with_env_filter("astrid_storage::recovery=debug")
-            .with_span_events(FmtSpan::CLOSE)
+            .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
             .json()
             .with_writer(std::io::stderr)
             .try_init()?;

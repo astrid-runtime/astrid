@@ -935,7 +935,10 @@ cargo bench -p astrid-storage --bench storage_io -- \
 ```
 
 `--profile-recovery` enables only `astrid_storage::recovery` DEBUG spans and
-emits JSON span-close events to stderr. These cover container recovery,
+emits JSON span-open and span-close events to stderr. Open markers allow an
+external profiler to target an explicitly owned benchmark process during a
+particular phase; close events carry the rounded diagnostic durations. These
+cover container recovery,
 metadata decoding, journal replay, each active-map domain, profile and
 representation validation, object-index recovery and root validation. Metadata
 spans include decoded unique map-node and authority-record counts; journal
