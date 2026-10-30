@@ -32,6 +32,12 @@ impl RepresentationStore {
         Ok(Self::open_volume_recovered(volume, limits)?.map(|(store, _locations)| store))
     }
 
+    #[tracing::instrument(
+        target = "astrid_storage::recovery",
+        level = "debug",
+        name = "recover_representations",
+        skip_all
+    )]
     pub(in crate::engine::durable) fn open_volume_recovered(
         volume: &Arc<dyn AstridVolume>,
         limits: RecoveryLimits,

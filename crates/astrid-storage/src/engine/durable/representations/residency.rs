@@ -90,6 +90,7 @@ impl RepresentationStore {
     }
 }
 
+#[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all, fields(domain = ?domain, input_nodes = arena.len(), active_nodes = tracing::field::Empty))]
 pub(super) fn recover_active_map(
     domain: PhysicalMapDomain,
     root: Option<PhysicalMapNodeId>,
@@ -112,6 +113,9 @@ pub(super) fn recover_active_map(
             PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => {},
         }
         nodes.insert(id, node);
+    }
+    if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {
+        tracing::Span::current().record("active_nodes", nodes.len());
     }
     // Durable metadata retains historical roots. An active view needs only its
     // own closure, and domain-bound identities prevent sharing between maps.

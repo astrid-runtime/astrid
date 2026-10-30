@@ -890,3 +890,78 @@ Guest-visible timing and result fields expose only ordinary filesystem
 lifecycle and resource failures. Object reuse, was-present status, insertion
 counts, physical representation choice, and dedup-derived accounting remain
 operator diagnostics.
+
+
+## Frozen-volume recovery and phase profiling
+
+The same `storage_io` executable can recover a **stopped, disposable snapshot**
+without running the daemon, restoring projections or loading capsules:
+
+```bash
+cargo bench -p astrid-storage --bench storage_io -- \
+  --recovery-volume /absolute/path/to/stopped-snapshot/astrid.volume \
+  --samples 5 --root /absolute/path/to/empty/recovery-results \
+  --output /absolute/path/to/recovery.json
+```
+
+This mode runs only recovery. It takes a read-only shared lock on the source,
+refuses a writer-held source, and copies its original bytes before **each**
+sample. Source hashing, copy, fsync and copy-hash verification are outside the
+measurement. The report binds the source volume length/SHA-256, executable,
+revision, recovered owner/root count and canonical root-set digest. Every
+sample must produce identical roots, and the original source must remain
+byte-identical. The last working copy is retained under `--root`; earlier
+copies are removed outside the timers. Provision room for both a full copy and
+any recovery writes, plus the host's required free-space reserve.
+
+Separate metrics measure container open, durable-engine open and explicit
+engine close. They use the runtime's StateOwner-v2 codec, process-addressable
+recovery limits and default engine policy. Root enumeration/comparison is
+outside those timers. This is **engine recovery**, not daemon readiness,
+projection restoration, a fresh 10k-agent derivation or known-byte application
+readback. The source is copied and hashed immediately beforehand, so page-cache
+state is uncontrolled and generally warm; do not label it an uncached disk test.
+The process also reuses its allocator across samples. Use separate process runs
+for whole-process peak-memory comparisons.
+
+For phase attribution, run a separate diagnostic:
+
+```bash
+cargo bench -p astrid-storage --bench storage_io -- \
+  --recovery-volume /absolute/path/to/stopped-snapshot/astrid.volume \
+  --samples 1 --profile-recovery \
+  --output /absolute/path/to/recovery-profile.json \
+  2> /absolute/path/to/recovery-phases.jsonl
+```
+
+`--profile-recovery` enables only `astrid_storage::recovery` DEBUG spans and
+emits JSON span-close events to stderr. These cover container recovery,
+metadata decoding, journal replay, each active-map domain, profile and
+representation validation, object-index recovery and root validation. Metadata
+spans include decoded unique map-node and authority-record counts; journal
+spans include frame count, byte count and completed-node proof count. The
+report marks this run `instrumented`; it is **not speed evidence**. Ordinary
+benchmark runs install no tracing subscriber. Existing daemon logging can
+capture the same spans when its configured directives enable that target and
+span events; no new daemon profiling setting is introduced.
+
+Compare identical snapshots and workload parameters on the same machine. Build
+and provision outside measurement, perform untimed warm-ups, then alternate
+baseline/candidate/candidate/baseline in repeated blocks. Retain all raw results
+and failures. The raw timing arrays preserve execution order; summaries use a
+sorted copy. Do not present p95/p99 from a handful of restart observations or
+infer per-operation latency from whole-batch durations. Keep allocation logging,
+stack sampling and other profiling out of accepted timing runs. These manual
+measurements are evidence, not a CI timing threshold or release certification.
+
+The existing boot-benchmark script can summarize that profile without starting
+or stopping any process:
+
+```bash
+python3 scripts/bench_daemon_boot.py \
+  --recovery-profile-log /absolute/path/to/recovery-phases.jsonl
+```
+
+It preserves each phase's parent path, map domain and counters. Span durations
+are inclusive and rounded by the logging formatter; do not sum parent and
+child spans or mistake that summary for the raw benchmark timing samples.

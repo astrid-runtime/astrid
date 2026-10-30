@@ -64,6 +64,7 @@ impl HostedFileVolume {
     /// record is treated as an uncommitted tail and truncated. Once a footer
     /// exists, recovery reads the footer, the named snapshot commit, and a
     /// bounded tail of later records ending at that footer sequence.
+    #[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all)]
     pub fn open(path: impl AsRef<Path>) -> io::Result<Arc<Self>> {
         // Capture relative-path ownership once; later sync and reclaim must
         // still target this volume if the process changes its directory.

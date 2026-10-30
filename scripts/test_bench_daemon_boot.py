@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import json
 import unittest
 
-from bench_daemon_boot import assert_boot_inventory
+from bench_daemon_boot import assert_boot_inventory, recovery_phase_summary
 
 
 class BootInventoryTests(unittest.TestCase):
@@ -48,6 +48,37 @@ class BootInventoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'timestamped'):
             assert_boot_inventory(json.dumps({'fields': {'message': self.ready, 'capsules': 1}}),
                                   self.started, 1)
+
+
+class RecoveryProfileTests(unittest.TestCase):
+    def test_preserves_nested_paths_domains_and_counts_without_summing(self):
+        def close(name, busy, parents=(), **fields):
+            return json.dumps({
+                'target': 'astrid_storage::recovery',
+                'fields': {'message': 'close', 'time.busy': busy, 'time.idle': '10ns'},
+                'span': {'name': name, **fields},
+                'spans': [{'name': parent} for parent in parents],
+            })
+        summary = recovery_phase_summary('\n'.join([
+            'Compiling benchmark',
+            close('recover_active_map', '25.5ms', ('open_volume_engine',), domain='Profile', active_nodes=3),
+            close('open_volume_engine', '1.25s'),
+        ]))
+        self.assertFalse(summary['timing_accepted'])
+        self.assertEqual(len(summary['phases']), 2)
+        phase = summary['phases'][0]
+        self.assertEqual(phase['path'], ['open_volume_engine', 'recover_active_map'])
+        self.assertEqual(phase['fields'], {'domain': 'Profile', 'active_nodes': 3})
+        self.assertAlmostEqual(phase['reported_busy_seconds'], 0.0255)
+
+    def test_missing_or_unknown_units_fail_instead_of_reporting_zero(self):
+        with self.assertRaisesRegex(ValueError, 'no recovery'):
+            recovery_phase_summary('no spans')
+        with self.assertRaisesRegex(ValueError, 'unsupported span duration'):
+            recovery_phase_summary(json.dumps({
+                'target': 'astrid_storage::recovery', 'span': {'name': 'recover_metadata'},
+                'fields': {'message': 'close', 'time.busy': 'unknown', 'time.idle': '1ns'},
+            }))
 
 
 if __name__ == '__main__':

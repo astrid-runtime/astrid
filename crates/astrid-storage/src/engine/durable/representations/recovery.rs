@@ -84,6 +84,8 @@ impl MetadataIndex {
     }
 }
 
+#[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all,
+    fields(map_nodes = tracing::field::Empty, authority_records = tracing::field::Empty))]
 pub(super) fn recover_metadata<F: DurableIo>(
     file: &mut F,
     limits: RecoveryLimits,
@@ -96,9 +98,16 @@ pub(super) fn recover_metadata<F: DurableIo>(
         limits,
         |_offset, payload| index.insert(MetadataFrame::decode(payload)?),
     )?;
+    if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {
+        tracing::Span::current().record("map_nodes", index.nodes.len());
+        tracing::Span::current().record("authority_records", index.values.len());
+    }
     Ok(index)
 }
 
+#[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all,
+    fields(journal_frames = tracing::field::Empty, journal_bytes = tracing::field::Empty,
+        complete_map_nodes = tracing::field::Empty))]
 pub(super) fn recover_journal<F: DurableIo>(
     file: &mut F,
     current: CurrentPointer,
@@ -146,6 +155,10 @@ pub(super) fn recover_journal<F: DurableIo>(
         })
         .transpose()?;
     let entry_count = entries.len();
+    if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {
+        tracing::Span::current().record("journal_frames", entry_count);
+        tracing::Span::current().record("journal_bytes", bytes.len());
+    }
     for (position, (offset, entry)) in entries.into_iter().enumerate().skip(1) {
         let JournalEntry::StateCas {
             journal_generation,
@@ -192,6 +205,9 @@ pub(super) fn recover_journal<F: DurableIo>(
     ))?;
     let state =
         RepresentationState::decode(metadata.value(MetadataKind::State, active.as_bytes())?)?;
+    if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {
+        tracing::Span::current().record("complete_map_nodes", complete_maps.len());
+    }
     Ok((active, state))
 }
 
@@ -403,6 +419,7 @@ fn validate_root_generation(reused: bool, previous: u64, current: u64) -> Result
     }
 }
 
+#[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all)]
 pub(super) fn validate_profiles(
     map: &CanonicalPhysicalMap,
 ) -> Result<RepresentationProfileId, DurableError> {
@@ -434,6 +451,7 @@ pub(super) struct ValidatedRepresentations {
     pub(super) locations: GenerationZeroLocations,
 }
 
+#[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all)]
 pub(super) fn validate_representations(
     profiles: &CanonicalPhysicalMap,
     representations: &CanonicalPhysicalMap,

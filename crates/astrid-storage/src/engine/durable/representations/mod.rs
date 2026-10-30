@@ -751,6 +751,12 @@ impl RepresentationStore {
         Ok(direct)
     }
 
+    #[tracing::instrument(
+        target = "astrid_storage::recovery",
+        level = "debug",
+        name = "reconstruct_active_representations",
+        skip_all
+    )]
     fn from_recovered(
         metadata: DurableFile,
         journal: DurableFile,

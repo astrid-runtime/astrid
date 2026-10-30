@@ -26,6 +26,12 @@ impl GenerationZeroLocations {
 
     /// Preserve metadata correspondence checks; object reads still verify payload
     /// checksums, canonical encodings and logical identity before returning bytes.
+    #[tracing::instrument(
+        target = "astrid_storage::recovery",
+        level = "debug",
+        name = "validate_representation_index",
+        skip_all
+    )]
     pub(in crate::engine::durable) fn validate_index(
         self,
         index: &BTreeMap<ObjectId, ArenaLocation>,

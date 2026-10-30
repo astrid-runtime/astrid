@@ -255,6 +255,7 @@ where
     ))
 }
 
+#[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all)]
 fn recover_volume_index<I>(
     volume: &Arc<dyn AstridVolume>,
     arena: &mut super::File,
@@ -339,6 +340,12 @@ fn open_optional_volume_wal(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    target = "astrid_storage::recovery",
+    level = "debug",
+    name = "replay_transaction_wal",
+    skip_all
+)]
 fn replay_transaction_wal<P, I, C>(
     wal_file: super::File,
     arena: &mut super::File,
