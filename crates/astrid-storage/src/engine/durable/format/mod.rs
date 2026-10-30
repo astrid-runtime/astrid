@@ -1,5 +1,7 @@
 //! Native arena and root-journal framing, parsing, and recovery.
 
+use std::io::{Read as _, Seek as _};
+
 #[cfg(test)]
 use super::File;
 use super::{
@@ -29,6 +31,8 @@ thread_local! {
 mod indexed;
 mod prepared;
 mod reader;
+#[cfg(test)]
+mod scan_tests;
 #[cfg(test)]
 mod verify_indexed_location_tests;
 
@@ -319,6 +323,9 @@ pub(in crate::engine::durable) fn recovery_arena_scans() -> usize {
     RECOVERY_ARENA_SCANS.with(std::cell::Cell::get)
 }
 
+/// Successful scans leave the cursor at the current append boundary. After
+/// an error the cursor is unspecified: callers must abandon or reposition the
+/// handle before reuse. A rejected callback is never treated as tail damage.
 pub(super) fn scan_frames<F: DurableIo>(
     file: &mut F,
     file_name: &'static str,
@@ -344,6 +351,11 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
         protected_len,
         file_len,
     };
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| io_error("seek durable frame", source))?;
+    // The scan owns the cursor. Buffer sequential reads rather than seeking
+    // and issuing separate media reads for every header and small payload.
+    let mut reader = std::io::BufReader::new(file);
     let mut offset = 0_u64;
     while offset < file_len {
         let remaining = file_len
@@ -357,17 +369,16 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
                     "published frame header is truncated",
                 ));
             }
-            truncate_tail(file, offset)?;
+            truncate_tail(*reader.get_mut(), offset)?;
             break;
         }
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|source| io_error("seek durable frame", source))?;
         let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
-        file.read_exact(&mut header)
+        reader
+            .read_exact(&mut header)
             .map_err(|source| io_error("read durable frame header", source))?;
         if header[..8] != magic {
             truncate_unpublished_tail_or_fail(
-                file,
+                *reader.get_mut(),
                 policy,
                 offset,
                 false,
@@ -391,7 +402,7 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
                 .checked_add(payload_len)
                 .and_then(|frame_len| offset.checked_add(frame_len));
             truncate_unpublished_tail_or_fail(
-                file,
+                *reader.get_mut(),
                 policy,
                 offset,
                 claimed_end.is_some_and(|end| end <= file_len),
@@ -413,13 +424,13 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
                     "published frame payload is truncated",
                 ));
             }
-            truncate_tail(file, offset)?;
+            truncate_tail(*reader.get_mut(), offset)?;
             break;
         }
-        let payload = read_frame_payload(file, payload_len)?;
+        let payload = read_frame_payload(&mut reader, payload_len)?;
         if frame_checksum(magic, payload_len, &payload) != decoded.checksum {
             truncate_unpublished_tail_or_fail(
-                file,
+                *reader.get_mut(),
                 policy,
                 offset,
                 false,
@@ -430,7 +441,10 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
         accept(offset, &payload)?;
         offset = frame_end;
     }
-    file.seek(SeekFrom::End(0))
+    // Tail repair above is terminal: discard any read-ahead before exposing
+    // the cursor again, including when repair shortened the underlying file.
+    reader
+        .seek(SeekFrom::End(0))
         .map_err(|source| io_error("seek durable file tail", source))?;
     Ok(())
 }
@@ -496,7 +510,7 @@ fn decode_frame_header(
     })
 }
 
-fn read_frame_payload<F: DurableIo>(
+fn read_frame_payload<F: std::io::Read>(
     file: &mut F,
     payload_len: u64,
 ) -> Result<Vec<u8>, DurableError> {
