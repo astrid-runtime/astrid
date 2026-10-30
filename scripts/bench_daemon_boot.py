@@ -60,14 +60,55 @@ def assert_boot_inventory(text, started_at, expected):
     return loaded
 
 
+def recovery_phase_summary(text):
+    """Keep inclusive phase timings and counters; never sum nested spans."""
+    phases = []
+    scales = {'ns': 1e-9, 'µs': 1e-6, 'ms': 1e-3, 's': 1.0}
+    for line in text.splitlines():
+        if not line.lstrip().startswith('{'):
+            continue  # Cargo/compiler output can share stderr with the spans.
+        record = json.loads(line)
+        if record.get('target') != 'astrid_storage::recovery':
+            continue
+        fields = record.get('fields', {})
+        if fields.get('message') != 'close':
+            continue
+        span = record['span']
+        phase = {
+            'path': [parent['name'] for parent in record.get('spans', [])] + [span['name']],
+            'fields': {key: value for key, value in span.items() if key != 'name'},
+        }
+        for kind in ('busy', 'idle'):
+            value = fields[f'time.{kind}']
+            match = re.fullmatch(r'(\d+(?:\.\d+)?)(ns|µs|ms|s)', value)
+            if match is None:
+                raise ValueError(f'unsupported span duration {value!r}')
+            phase[f'reported_{kind}_seconds'] = float(match[1]) * scales[match[2]]
+        phases.append(phase)
+    if not phases:
+        raise ValueError('no recovery span-close timings found')
+    return {
+        'scope': 'instrumented recovery diagnosis; inclusive rounded span durations',
+        'timing_accepted': False,
+        'phases': phases,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--aos-home', type=Path, required=True)
-    parser.add_argument('--workspace', type=Path, required=True)
-    parser.add_argument('--cli', type=Path, required=True)
-    parser.add_argument('--capsules', type=int, required=True)
+    parser.add_argument('--recovery-profile-log', type=Path,
+                        help='summarize offline recovery JSON spans without starting a daemon')
+    parser.add_argument('--aos-home', type=Path)
+    parser.add_argument('--workspace', type=Path)
+    parser.add_argument('--cli', type=Path)
+    parser.add_argument('--capsules', type=int)
     parser.add_argument('--max-seconds', type=float)
     args = parser.parse_args()
+    if args.recovery_profile_log is not None:
+        print(json.dumps(recovery_phase_summary(args.recovery_profile_log.read_text()), indent=2))
+        return
+    if any(value is None for value in (args.aos_home, args.workspace, args.cli, args.capsules)):
+        parser.error('boot requires --aos-home, --workspace, --cli and --capsules')
     home, workspace, cli = (p.resolve() for p in (args.aos_home, args.workspace, args.cli))
     runtime = home / 'runtime'
     assert args.capsules > 0 and workspace.is_dir() and cli.is_file()

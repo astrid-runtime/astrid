@@ -16,8 +16,9 @@ use super::format::{
 };
 use super::recovery::{read_current_file, recover_journal, recover_metadata};
 use super::{
-    DIRECTORY, DurableError, FIRST_JOURNAL_GENERATION, GENERATIONS_DIRECTORY, JOURNAL_PATH,
-    METADATA_PATH, RepresentationStore, append_frame, append_frames, io_error,
+    DIRECTORY, DurableError, FIRST_JOURNAL_GENERATION, GENERATIONS_DIRECTORY,
+    GenerationZeroLocations, JOURNAL_PATH, METADATA_PATH, RepresentationStore, append_frame,
+    append_frames, io_error,
 };
 
 const CURRENT_REGION: &str = "representations/CURRENT";
@@ -28,6 +29,19 @@ impl RepresentationStore {
         volume: &Arc<dyn AstridVolume>,
         limits: RecoveryLimits,
     ) -> Result<Option<Self>, DurableError> {
+        Ok(Self::open_volume_recovered(volume, limits)?.map(|(store, _locations)| store))
+    }
+
+    #[tracing::instrument(
+        target = "astrid_storage::recovery",
+        level = "debug",
+        name = "recover_representations",
+        skip_all
+    )]
+    pub(in crate::engine::durable) fn open_volume_recovered(
+        volume: &Arc<dyn AstridVolume>,
+        limits: RecoveryLimits,
+    ) -> Result<Option<(Self, GenerationZeroLocations)>, DurableError> {
         if !region_exists(volume, CURRENT_REGION)? {
             return Ok(None);
         }
@@ -46,15 +60,14 @@ impl RepresentationStore {
         )?;
         let index = recover_metadata(&mut metadata, limits)?;
         let (active, state) = recover_journal(&mut journal, current, &index, limits)?;
-        let recovered = Self::from_recovered(
+        Ok(Some(Self::from_recovered(
             metadata,
             journal,
             current.journal_generation,
             active,
             state,
-            &index,
-        )?;
-        Ok(Some(recovered))
+            index,
+        )?))
     }
 
     pub(in crate::engine::durable) fn activate_volume(

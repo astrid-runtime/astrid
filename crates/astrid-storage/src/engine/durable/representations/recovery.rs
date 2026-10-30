@@ -9,10 +9,10 @@ use std::io::SeekFrom;
 use super::super::DurableIo;
 
 use crate::storage_model::{
-    CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapKey, PhysicalMapNode, PlacementEntry,
-    PlacementSet, Recipe, RepresentationCatalogueRoot, RepresentationProfile,
-    RepresentationProfileId, RepresentationRecord, RepresentationRecordId, RepresentationState,
-    RepresentationStateId,
+    BlobId, CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapKey, PhysicalMapNode,
+    PlacementEntry, PlacementSet, Recipe, ReplicaLocator, RepresentationCatalogueRoot,
+    RepresentationProfile, RepresentationProfileId, RepresentationRecord, RepresentationRecordId,
+    RepresentationState, RepresentationStateId,
 };
 
 use super::super::{FRAME_HEADER_LEN, scan_frames};
@@ -22,7 +22,8 @@ use super::format::{
     journal_digest, map_node_id,
 };
 use super::{
-    DurableError, FIRST_JOURNAL_GENERATION, RecoveryLimits, increment, io_error, read_all,
+    ArenaLocation, DurableError, FIRST_JOURNAL_GENERATION, GenerationZeroLocations, RecoveryLimits,
+    increment, io_error, read_all,
 };
 
 #[derive(Default)]
@@ -32,24 +33,45 @@ pub(super) struct MetadataIndex {
 }
 
 impl MetadataIndex {
-    fn insert(&mut self, frame: MetadataFrame) -> Result<(), DurableError> {
+    fn insert<V: AsRef<[u8]> + Into<Vec<u8>>>(
+        &mut self,
+        frame: MetadataFrame<V>,
+    ) -> Result<(), DurableError> {
+        if frame.kind == MetadataKind::MapNode {
+            // Decode and authenticate once, then keep that sole owned value.
+            // Retaining its encoded payload as well duplicates every historical
+            // node until journal validation and active-closure recovery finish.
+            let (node, id) = PhysicalMapNode::decode_and_identify(
+                frame.value.as_ref(),
+                &Blake3PhysicalIdentity,
+            )?;
+            if id != map_node_id(frame.identity) {
+                return Err(DurableError::InvalidRepresentationState(
+                    "metadata identity does not match canonical value",
+                ));
+            }
+            if let Some(existing) = self.nodes.get(&id) {
+                if existing != &node {
+                    return Err(DurableError::InvalidRepresentationState(
+                        "physical metadata identity collision",
+                    ));
+                }
+            } else {
+                self.nodes.insert(id, node);
+            }
+            return Ok(());
+        }
         frame.verify(&Blake3PhysicalIdentity)?;
         let key = (frame.kind, frame.identity);
         if let Some(existing) = self.values.get(&key) {
-            if existing != &frame.value {
+            if existing.as_slice() != frame.value.as_ref() {
                 return Err(DurableError::InvalidRepresentationState(
                     "physical metadata identity collision",
                 ));
             }
             return Ok(());
         }
-        if frame.kind == MetadataKind::MapNode {
-            self.nodes.insert(
-                map_node_id(frame.identity),
-                PhysicalMapNode::decode(&frame.value)?,
-            );
-        }
-        self.values.insert(key, frame.value);
+        self.values.insert(key, frame.value.into());
         Ok(())
     }
 
@@ -67,6 +89,8 @@ impl MetadataIndex {
     }
 }
 
+#[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all,
+    fields(map_nodes = tracing::field::Empty, authority_records = tracing::field::Empty))]
 pub(super) fn recover_metadata<F: DurableIo>(
     file: &mut F,
     limits: RecoveryLimits,
@@ -79,9 +103,16 @@ pub(super) fn recover_metadata<F: DurableIo>(
         limits,
         |_offset, payload| index.insert(MetadataFrame::decode(payload)?),
     )?;
+    if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {
+        tracing::Span::current().record("map_nodes", index.nodes.len());
+        tracing::Span::current().record("authority_records", index.values.len());
+    }
     Ok(index)
 }
 
+#[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all,
+    fields(journal_frames = tracing::field::Empty, journal_bytes = tracing::field::Empty,
+        complete_map_nodes = tracing::field::Empty))]
 pub(super) fn recover_journal<F: DurableIo>(
     file: &mut F,
     current: CurrentPointer,
@@ -115,7 +146,12 @@ pub(super) fn recover_journal<F: DurableIo>(
     let first = entries.first().map(|(_, entry)| *entry).ok_or(
         DurableError::InvalidRepresentationState("representation journal is empty"),
     )?;
-    let (mut active, mut generation) = recover_checkpoint(first, current, metadata)?;
+    // Metadata is immutable for this replay. Only successfully checked closures
+    // may be reused across historical states, including the checkpoint active
+    // state; CAS and generation checks still run.
+    let mut complete_maps = BTreeSet::new();
+    let (mut active, mut generation) =
+        recover_checkpoint(first, current, metadata, &mut complete_maps)?;
     validate_tail_budget(entries.len(), bytes.len(), checkpoint_end, current)?;
     let mut previous_state = active
         .map(|id| {
@@ -123,10 +159,11 @@ pub(super) fn recover_journal<F: DurableIo>(
                 .map_err(DurableError::from)
         })
         .transpose()?;
-    // Metadata is immutable for this replay. Only successfully checked closures
-    // may be reused across historical states; CAS and generation checks still run.
-    let mut complete_maps = BTreeSet::new();
     let entry_count = entries.len();
+    if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {
+        tracing::Span::current().record("journal_frames", entry_count);
+        tracing::Span::current().record("journal_bytes", bytes.len());
+    }
     for (position, (offset, entry)) in entries.into_iter().enumerate().skip(1) {
         let JournalEntry::StateCas {
             journal_generation,
@@ -173,6 +210,9 @@ pub(super) fn recover_journal<F: DurableIo>(
     ))?;
     let state =
         RepresentationState::decode(metadata.value(MetadataKind::State, active.as_bytes())?)?;
+    if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {
+        tracing::Span::current().record("complete_map_nodes", complete_maps.len());
+    }
     Ok((active, state))
 }
 
@@ -180,6 +220,7 @@ fn recover_checkpoint(
     first: JournalEntry,
     current: CurrentPointer,
     metadata: &MetadataIndex,
+    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
 ) -> Result<(Option<RepresentationStateId>, u64), DurableError> {
     match first {
         JournalEntry::Checkpoint {
@@ -203,7 +244,7 @@ fn recover_checkpoint(
         } if journal_generation == current.journal_generation
             && journal_generation > FIRST_JOURNAL_GENERATION =>
         {
-            if !state_metadata_closure_complete(active, metadata, &mut BTreeSet::new())? {
+            if !state_metadata_closure_complete(active, metadata, complete)? {
                 return Err(DurableError::InvalidRepresentationState(
                     "representation checkpoint has an incomplete metadata closure",
                 ));
@@ -383,6 +424,7 @@ fn validate_root_generation(reused: bool, previous: u64, current: u64) -> Result
     }
 }
 
+#[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all)]
 pub(super) fn validate_profiles(
     map: &CanonicalPhysicalMap,
 ) -> Result<RepresentationProfileId, DurableError> {
@@ -408,11 +450,19 @@ pub(super) fn validate_profiles(
     ))
 }
 
+pub(super) struct ValidatedRepresentations {
+    pub(super) reverse: BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
+    pub(super) extent_count: u64,
+    pub(super) locations: GenerationZeroLocations,
+}
+
+#[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all)]
 pub(super) fn validate_representations(
     profiles: &CanonicalPhysicalMap,
     representations: &CanonicalPhysicalMap,
     placements: &CanonicalPhysicalMap,
-) -> Result<(BTreeMap<ObjectId, Vec<RepresentationRecordId>>, u64), DurableError> {
+    direct_profile: RepresentationProfileId,
+) -> Result<ValidatedRepresentations, DurableError> {
     let mut placement_by_blob = BTreeMap::new();
     let mut extent_count = 0_u64;
     for (key, bytes) in active_entries(placements)? {
@@ -439,6 +489,9 @@ pub(super) fn validate_representations(
         placement_by_blob.insert(entry.blob(), entry);
     }
     let mut reverse = BTreeMap::<ObjectId, Vec<RepresentationRecordId>>::new();
+    // First matching direct_profile blob per object in reverse-vector order.
+    // Record payloads are not retained; placement_by_blob is already decoded.
+    let mut selected = BTreeMap::<ObjectId, BlobId>::new();
     for (key, bytes) in active_entries(representations)? {
         let record = RepresentationRecord::decode(bytes)?;
         let id = record.identify(&Blake3PhysicalIdentity)?;
@@ -475,8 +528,68 @@ pub(super) fn validate_representations(
             ));
         }
         reverse.entry(object).or_default().push(id);
+        if record.profile() == direct_profile {
+            selected.entry(object).or_insert(blob);
+        }
     }
-    Ok((reverse, extent_count))
+    let locations =
+        generation_zero_locations_from_selected(&reverse, &selected, &placement_by_blob)?;
+    Ok(ValidatedRepresentations {
+        reverse,
+        extent_count,
+        locations: GenerationZeroLocations::new(locations),
+    })
+}
+
+pub(super) fn generation_zero_arena_locations(
+    placement: &PlacementEntry,
+) -> impl Iterator<Item = ArenaLocation> + '_ {
+    placement
+        .replicas()
+        .iter()
+        .filter_map(|replica| match replica.locator() {
+            ReplicaLocator::ArenaFrame {
+                arena_generation: 0,
+                offset,
+                payload_length,
+                frame_checksum,
+            } => Some(ArenaLocation {
+                offset,
+                payload_len: payload_length,
+                checksum: frame_checksum,
+            }),
+            _ => None,
+        })
+}
+
+fn generation_zero_locations_from_selected(
+    reverse: &BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
+    selected: &BTreeMap<ObjectId, BlobId>,
+    placements: &BTreeMap<BlobId, PlacementEntry>,
+) -> Result<Vec<(ObjectId, ArenaLocation)>, DurableError> {
+    let mut direct = Vec::new();
+    for object in reverse.keys() {
+        let blob = selected
+            .get(object)
+            .ok_or(DurableError::InvalidRepresentationState(
+                "reverse index has no direct representation",
+            ))?;
+        let placement = placements
+            .get(blob)
+            .ok_or(DurableError::InvalidRepresentationState(
+                "direct representation placement disappeared",
+            ))?;
+        let before = direct.len();
+        for location in generation_zero_arena_locations(placement) {
+            direct.push((*object, location));
+        }
+        if direct.len() == before {
+            return Err(DurableError::InvalidRepresentationState(
+                "direct representation has no generation-zero arena placement",
+            ));
+        }
+    }
+    Ok(direct)
 }
 
 pub(super) fn active_entries(

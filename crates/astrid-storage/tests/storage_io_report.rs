@@ -32,6 +32,8 @@ fn config() -> Config {
         object_cache_bytes: None,
         root: Some(PathBuf::from("unused")),
         output: None,
+        recovery_volume: None,
+        profile_recovery: false,
     }
 }
 
@@ -59,6 +61,10 @@ fn even_sample_medians_use_the_two_central_observations() {
 
     let encoded = serde_json::to_value(report).expect("report serializes");
     assert_eq!(encoded["metrics"][0]["median_milliseconds"], 15.0);
+    assert_eq!(
+        encoded["metrics"][0]["samples_nanoseconds"],
+        serde_json::json!([20_000_000, 10_000_000])
+    );
     assert_eq!(
         encoded["write_amplifications"][0]["median_authoritative_bytes_appended"],
         15

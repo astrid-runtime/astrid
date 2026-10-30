@@ -30,6 +30,8 @@ pub(super) struct Config {
     pub(super) object_cache_bytes: Option<u64>,
     pub(super) root: Option<PathBuf>,
     pub(super) output: Option<PathBuf>,
+    pub(super) recovery_volume: Option<PathBuf>,
+    pub(super) profile_recovery: bool,
 }
 
 impl Config {
@@ -47,6 +49,8 @@ impl Config {
             object_cache_bytes: None,
             root: None,
             output: None,
+            recovery_volume: None,
+            profile_recovery: false,
         };
         let mut arguments = env::args().skip(1);
         while let Some(argument) = arguments.next() {
@@ -83,12 +87,24 @@ impl Config {
                 },
                 "--root" => config.root = Some(parse_path(&mut arguments, "--root")?),
                 "--output" => config.output = Some(parse_path(&mut arguments, "--output")?),
+                "--recovery-volume" => {
+                    config.recovery_volume = Some(parse_path(&mut arguments, "--recovery-volume")?);
+                },
+                "--profile-recovery" => config.profile_recovery = true,
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
                 },
                 unknown => return Err(format!("unknown argument {unknown:?}; use --help").into()),
             }
+        }
+        if config.recovery_volume.is_some() && config.object_cache_bytes.is_some() {
+            return Err(
+                "recovery-only mode uses the default policy; omit --object-cache-bytes".into(),
+            );
+        }
+        if config.profile_recovery && config.recovery_volume.is_none() {
+            return Err("--profile-recovery requires --recovery-volume".into());
         }
         if config.bytes == 0 {
             return Err("--bytes must be greater than zero".into());
@@ -160,6 +176,9 @@ fn print_help() {
            --bulk-files N        files in the bulk corpus (default {DEFAULT_BULK_FILES})\n\
            --object-cache-bytes N decoded-object/projection cache budget (default disabled)\n\
            --root PATH           retain benchmark data under PATH\n\
+           --recovery-volume PATH\n\
+                                 only recover copies of a stopped StateOwner-v2 volume\n\
+           --profile-recovery    emit recovery spans on stderr; diagnostic, not speed evidence\n\
            --output PATH         write the JSON report to PATH\n"
     );
 }

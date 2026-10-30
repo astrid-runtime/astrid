@@ -52,7 +52,7 @@ mod format_identity_tests;
 #[cfg(test)]
 mod format_migration_tests;
 mod lifecycle;
-pub use lifecycle::RuntimeLifecycleGuard;
+pub use lifecycle::{RuntimeFinalization, RuntimeLifecycleGuard};
 #[cfg(test)]
 mod hosted_volume_tests;
 mod migrations;
@@ -452,6 +452,7 @@ pub type NativePrincipalContentStore = PrincipalContentStore<
 /// Native principal-store projections opened over one durable engine.
 #[derive(Clone)]
 pub struct RuntimePrincipalStore {
+    volume_binding: std::sync::Weak<crate::volume::HostedFileVolume>,
     engine: Arc<RuntimeEngine>,
     directory_cutover_receipt: Arc<str>,
     runtime_kv: Arc<RuntimeStore>,
@@ -616,9 +617,10 @@ impl RuntimePrincipalStore {
 
     /// Publish the live running projection while retaining host files.
     ///
-    /// Graceful kernel shutdown calls this before its durable projections are
-    /// closed. The daemon host finalizes after its task runtime is dropped;
-    /// CLI recovery uses the same finalizer for an already-dead daemon.
+    /// Kernel shutdown without a retained finalization token calls this before
+    /// closing storage. A retained daemon instead publishes through the finalizer
+    /// after its task runtime is dropped; CLI recovery uses that same finalizer
+    /// for an already-dead daemon.
     ///
     /// # Errors
     ///

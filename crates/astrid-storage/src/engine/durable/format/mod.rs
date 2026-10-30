@@ -1,5 +1,7 @@
 //! Native arena and root-journal framing, parsing, and recovery.
 
+use std::io::{Read as _, Seek as _};
+
 #[cfg(test)]
 use super::File;
 use super::{
@@ -16,6 +18,8 @@ use std::path::Path;
 const IDENTITY_PREFIX_BYTES: usize = 8;
 const CURRENT_DIGEST_BYTES: u32 = 32;
 const CURRENT_DIGEST_BYTES_USIZE: usize = 32;
+const TAGGED_IDENTITY_BYTES: usize = IDENTITY_PREFIX_BYTES + CURRENT_DIGEST_BYTES_USIZE;
+const INDEXED_PREFIX_BYTES: usize = FRAME_HEADER_LEN_USIZE + TAGGED_IDENTITY_BYTES;
 const MIN_REFERENCE_WIRE_BYTES: usize =
     std::mem::size_of::<u64>() + IDENTITY_PREFIX_BYTES + CURRENT_DIGEST_BYTES_USIZE + 1;
 
@@ -27,6 +31,10 @@ thread_local! {
 mod indexed;
 mod prepared;
 mod reader;
+#[cfg(test)]
+mod scan_tests;
+#[cfg(test)]
+mod verify_indexed_location_tests;
 
 #[cfg(test)]
 pub(super) use indexed::{last_batch_spans, reset_last_batch_spans};
@@ -38,35 +46,48 @@ pub(super) use prepared::{PreparedFrame, append_prepared_frames};
 use reader::SliceReader;
 
 pub(super) fn verify_indexed_location<F: DurableIo>(
-    arena: &mut F,
+    arena: &F,
     expected_id: ObjectId,
     location: ArenaLocation,
     scheme: IdentityScheme,
     limits: RecoveryLimits,
+    authoritative_arena_len: u64,
 ) -> Result<(), DurableError> {
-    let file_len = arena
-        .durable_metadata()
-        .map_err(|source| io_error("read indexed arena metadata", source))?
-        .len();
     let frame_end = location
         .offset
         .checked_add(FRAME_HEADER_LEN)
         .and_then(|value| value.checked_add(location.payload_len))
         .ok_or(DurableError::EncodingOverflow)?;
-    if frame_end > file_len {
+    if frame_end > authoritative_arena_len {
         return Err(corrupt(
             ARENA_FILE,
             location.offset,
             "indexed frame extends beyond the arena",
         ));
     }
-    arena
-        .seek(SeekFrom::Start(location.offset))
-        .map_err(|source| io_error("seek indexed arena header", source))?;
-    let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
-    arena
-        .read_exact(&mut header)
-        .map_err(|source| io_error("read indexed arena header", source))?;
+    let identity_len =
+        u64::try_from(TAGGED_IDENTITY_BYTES).map_err(|_| DurableError::EncodingOverflow)?;
+    if location.payload_len < identity_len {
+        return Err(corrupt(
+            ARENA_FILE,
+            location.offset,
+            "indexed object identity prefix is truncated",
+        ));
+    }
+    let mut prefix = [0_u8; INDEXED_PREFIX_BYTES];
+    read_exact_at(arena, &mut prefix, location.offset)
+        .map_err(|source| io_error("read indexed arena prefix", source))?;
+    authenticate_indexed_prefix(&prefix, expected_id, location, scheme, limits)
+}
+
+fn authenticate_indexed_prefix(
+    prefix: &[u8; INDEXED_PREFIX_BYTES],
+    expected_id: ObjectId,
+    location: ArenaLocation,
+    scheme: IdentityScheme,
+    limits: RecoveryLimits,
+) -> Result<(), DurableError> {
+    let header = &prefix[..FRAME_HEADER_LEN_USIZE];
     if header[..8] != ARENA_MAGIC
         || u16::from_le_bytes([header[8], header[9]]) != FRAME_VERSION
         || header[10..12] != [0, 0]
@@ -100,11 +121,8 @@ pub(super) fn verify_indexed_location<F: DurableIo>(
             "indexed frame header does not match the cache",
         ));
     }
-    let mut identity_bytes = [0_u8; IDENTITY_PREFIX_BYTES + CURRENT_DIGEST_BYTES_USIZE];
-    arena
-        .read_exact(&mut identity_bytes)
-        .map_err(|source| io_error("read indexed object identity", source))?;
-    let mut reader = SliceReader::new(&identity_bytes);
+    let identity_bytes = &prefix[FRAME_HEADER_LEN_USIZE..];
+    let mut reader = SliceReader::new(identity_bytes);
     let actual = reader
         .identity(scheme)
         .map_err(|detail| corrupt(ARENA_FILE, location.offset, detail))?;
@@ -305,6 +323,9 @@ pub(in crate::engine::durable) fn recovery_arena_scans() -> usize {
     RECOVERY_ARENA_SCANS.with(std::cell::Cell::get)
 }
 
+/// Successful scans leave the cursor at the current append boundary. After
+/// an error the cursor is unspecified: callers must abandon or reposition the
+/// handle before reuse. A rejected callback is never treated as tail damage.
 pub(super) fn scan_frames<F: DurableIo>(
     file: &mut F,
     file_name: &'static str,
@@ -330,6 +351,11 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
         protected_len,
         file_len,
     };
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| io_error("seek durable frame", source))?;
+    // The scan owns the cursor. Buffer sequential reads rather than seeking
+    // and issuing separate media reads for every header and small payload.
+    let mut reader = std::io::BufReader::new(file);
     let mut offset = 0_u64;
     while offset < file_len {
         let remaining = file_len
@@ -343,17 +369,16 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
                     "published frame header is truncated",
                 ));
             }
-            truncate_tail(file, offset)?;
+            truncate_tail(*reader.get_mut(), offset)?;
             break;
         }
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|source| io_error("seek durable frame", source))?;
         let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
-        file.read_exact(&mut header)
+        reader
+            .read_exact(&mut header)
             .map_err(|source| io_error("read durable frame header", source))?;
         if header[..8] != magic {
             truncate_unpublished_tail_or_fail(
-                file,
+                *reader.get_mut(),
                 policy,
                 offset,
                 false,
@@ -377,7 +402,7 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
                 .checked_add(payload_len)
                 .and_then(|frame_len| offset.checked_add(frame_len));
             truncate_unpublished_tail_or_fail(
-                file,
+                *reader.get_mut(),
                 policy,
                 offset,
                 claimed_end.is_some_and(|end| end <= file_len),
@@ -399,13 +424,13 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
                     "published frame payload is truncated",
                 ));
             }
-            truncate_tail(file, offset)?;
+            truncate_tail(*reader.get_mut(), offset)?;
             break;
         }
-        let payload = read_frame_payload(file, payload_len)?;
+        let payload = read_frame_payload(&mut reader, payload_len)?;
         if frame_checksum(magic, payload_len, &payload) != decoded.checksum {
             truncate_unpublished_tail_or_fail(
-                file,
+                *reader.get_mut(),
                 policy,
                 offset,
                 false,
@@ -416,7 +441,10 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
         accept(offset, &payload)?;
         offset = frame_end;
     }
-    file.seek(SeekFrom::End(0))
+    // Tail repair above is terminal: discard any read-ahead before exposing
+    // the cursor again, including when repair shortened the underlying file.
+    reader
+        .seek(SeekFrom::End(0))
         .map_err(|source| io_error("seek durable file tail", source))?;
     Ok(())
 }
@@ -482,7 +510,7 @@ fn decode_frame_header(
     })
 }
 
-fn read_frame_payload<F: DurableIo>(
+fn read_frame_payload<F: std::io::Read>(
     file: &mut F,
     payload_len: u64,
 ) -> Result<Vec<u8>, DurableError> {
@@ -805,12 +833,11 @@ pub(super) fn object_frame_declares_identity(
     scheme: IdentityScheme,
     id: ObjectId,
 ) -> bool {
-    const IDENTITY_BYTES: usize = IDENTITY_PREFIX_BYTES + CURRENT_DIGEST_BYTES_USIZE;
-    frame_payload.len() >= IDENTITY_BYTES
+    frame_payload.len() >= TAGGED_IDENTITY_BYTES
         && frame_payload[..2] == scheme.algorithm().to_le_bytes()
         && frame_payload[2..4] == scheme.construction().to_le_bytes()
         && frame_payload[4..8] == CURRENT_DIGEST_BYTES.to_le_bytes()
-        && frame_payload[8..IDENTITY_BYTES] == *id.as_bytes()
+        && frame_payload[8..TAGGED_IDENTITY_BYTES] == *id.as_bytes()
 }
 
 pub(super) fn canonical_record_bytes(

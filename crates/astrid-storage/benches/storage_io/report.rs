@@ -22,6 +22,7 @@ pub(super) struct Report {
     write_amplifications: Vec<WriteAmplification>,
     representation_metadata: Vec<RepresentationMetadata>,
     resource_peaks: Vec<ResourcePeak>,
+    recovery_fixture: Option<RecoveryFixture>,
 }
 
 impl Report {
@@ -39,7 +40,12 @@ impl Report {
             write_amplifications: Vec::new(),
             representation_metadata: Vec::new(),
             resource_peaks: Vec::new(),
+            recovery_fixture: None,
         }
+    }
+
+    pub(super) fn record_recovery_fixture(&mut self, fixture: RecoveryFixture) {
+        self.recovery_fixture = Some(fixture);
     }
 
     pub(super) fn encode_evidence(&self) -> serde_json::Result<Vec<u8>> {
@@ -312,6 +318,15 @@ impl Report {
 }
 
 #[derive(Debug, Serialize)]
+pub(super) struct RecoveryFixture {
+    pub(super) volume_bytes: u64,
+    pub(super) volume_sha256: String,
+    pub(super) root_count: usize,
+    pub(super) roots_sha256: String,
+    pub(super) instrumented: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct ResourcePeak {
     name: &'static str,
     samples_bytes: Vec<u64>,
@@ -404,6 +419,7 @@ impl Metric {
         operations: Option<usize>,
         mut samples: Vec<Duration>,
     ) -> Self {
+        let samples_nanoseconds = samples.iter().map(Duration::as_nanos).collect();
         samples.sort_unstable();
         let minimum = samples.first().copied().unwrap_or(Duration::ZERO);
         let median = median_duration(&samples);
@@ -413,7 +429,7 @@ impl Metric {
             name,
             bytes_per_sample: bytes,
             operations_per_sample: operations,
-            samples_nanoseconds: samples.iter().map(Duration::as_nanos).collect(),
+            samples_nanoseconds,
             minimum_milliseconds: duration_milliseconds(minimum),
             median_milliseconds: duration_milliseconds(median),
             maximum_milliseconds: duration_milliseconds(maximum),

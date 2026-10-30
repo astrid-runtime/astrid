@@ -14,6 +14,8 @@ use std::path::Path;
 mod config;
 #[path = "storage_io/provenance.rs"]
 mod provenance;
+#[path = "storage_io/recovery.rs"]
+mod recovery;
 #[path = "storage_io/report.rs"]
 mod report;
 #[path = "storage_io/workloads.rs"]
@@ -56,11 +58,16 @@ async fn main() -> BenchResult<()> {
             .map_or_else(|| "disabled".to_owned(), |bytes| format!("{bytes} bytes"))
     );
 
-    let source = root.join("source.bin");
-    workloads::prepare_source(&source, config.bytes, config.block_bytes)?;
-    let source_digest = workloads::hash_native(&source, config.block_bytes)?;
-    let mut report = Report::new(config.clone(), provenance);
-    workloads::run(&config, &root, &source, source_digest, &mut report).await?;
+    let report = if config.recovery_volume.is_some() {
+        recovery::run(&config, &root, provenance)?
+    } else {
+        let source = root.join("source.bin");
+        workloads::prepare_source(&source, config.bytes, config.block_bytes)?;
+        let source_digest = workloads::hash_native(&source, config.block_bytes)?;
+        let mut report = Report::new(config.clone(), provenance);
+        workloads::run(&config, &root, &source, source_digest, &mut report).await?;
+        report
+    };
 
     report.print_table();
     let encoded = report.encode_evidence()?;

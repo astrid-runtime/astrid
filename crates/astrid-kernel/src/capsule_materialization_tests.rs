@@ -22,6 +22,7 @@ fn publish_env_capsule(kernel: &Arc<Kernel>, name: &str) {
         ),
     )
     .unwrap();
+    std::fs::write(dir.join("fixture.bin"), b"verified archive member").unwrap();
     let home = kernel.astrid_home.clone();
     let storage = kernel
         .principal_store
@@ -42,6 +43,42 @@ fn publish_env_capsule(kernel: &Arc<Kernel>, name: &str) {
     .join()
     .unwrap()
     .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn materialization_comparison_borrows_verified_package_bytes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let kernel = crate::test_kernel_with_home(AstridHome::from_path(dir.path())).await;
+    let capsule = "borrowed-materialization";
+    publish_env_capsule(&kernel, capsule);
+    let principal = PrincipalId::default();
+    let uid = kernel.principal_directory.uid_for(&principal).unwrap();
+    let package = astrid_capsule_install::read_verified_durable_package_for_owner(
+        kernel.principal_store.as_ref().expect("principal store"),
+        &astrid_storage::StateOwner::Principal(uid),
+        capsule,
+    )
+    .unwrap()
+    .expect("verified package");
+    let files = super::expected_materialization_files(&package);
+    let archive_member = package
+        .archive_entries()
+        .find(|(name, _)| *name == "fixture.bin")
+        .expect("fixture archive member");
+    for (name, bytes) in [
+        archive_member,
+        ("Capsule.toml", package.manifest_bytes()),
+        ("meta.json", package.metadata_bytes()),
+        (
+            "authority.json",
+            package.snapshot().package().authority.as_slice(),
+        ),
+    ] {
+        let expected = files.get(name).expect("expected member");
+        assert!(!bytes.is_empty());
+        assert_eq!(*expected, bytes);
+        assert_eq!(expected.as_ptr(), bytes.as_ptr(), "copied {name}");
+    }
 }
 
 fn published_target(

@@ -196,6 +196,12 @@ where
     /// # Errors
     ///
     /// Returns the same errors as [`Self::open_volume`].
+    #[tracing::instrument(
+        target = "astrid_storage::recovery",
+        level = "debug",
+        name = "open_volume_engine",
+        skip_all
+    )]
     pub(in crate::engine::durable) fn open_volume_with_faults(
         volume: Arc<dyn AstridVolume>,
         identity: I,

@@ -82,101 +82,76 @@ impl RuntimeLifecycleGuard {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{ContentName, open_runtime_principal_store};
+/// Exclusive shutdown responsibility for an already-open runtime store.
+///
+/// This token deliberately cannot be cloned. Dropping it closes the engine,
+/// including when runtime teardown or final publication fails.
+#[must_use = "finish the durable home after stopping the task runtime"]
+pub struct RuntimeFinalization {
+    store: super::RuntimePrincipalStore,
+}
 
-    #[tokio::test]
-    async fn finalizer_fences_replacement_and_is_idempotent() {
-        let parent = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(parent.path().join("runtime"));
-        let lifecycle = RuntimeLifecycleGuard::acquire(&home).unwrap();
-        assert!(
-            !home.root().exists(),
-            "fencing must not preempt fresh-home admission"
-        );
-        let original_path = home.lifecycle_lock_path().unwrap();
-        assert_eq!(
-            original_path.parent().unwrap().parent().unwrap(),
-            std::fs::canonicalize(parent.path()).unwrap(),
-            "control storage must be a stable sibling, not process temp storage"
-        );
-        let other_temp = tempfile::tempdir().unwrap();
-        let probe = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "principal_state::lifecycle::tests::different_temp_process_cannot_acquire_fence",
-                "--nocapture",
-            ])
-            .env("ASTRID_TEST_LIFECYCLE_ROOT", home.root())
-            .env("TMPDIR", other_temp.path())
-            .env("TMP", other_temp.path())
-            .env("TEMP", other_temp.path())
-            .output()
-            .unwrap();
-        assert!(
-            probe.status.success(),
-            "{}",
-            String::from_utf8_lossy(&probe.stderr)
-        );
-        let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|_: &StateOwner| Ok(None));
-        let store = open_runtime_principal_store(&home, quota.clone())
-            .await
-            .unwrap();
-        let name = ContentName::new("bin/test.wasm").unwrap();
-        store
-            .content()
-            .put(&StateOwner::System, &name, b"capsule")
-            .unwrap();
-        store.publish_runtime_projection(&home).unwrap();
-        drop(store);
-        assert_eq!(original_path, home.lifecycle_lock_path().unwrap());
-        assert!(RuntimeLifecycleGuard::acquire(&home).is_err());
-        lifecycle.finish().await.unwrap();
-        let entries = std::fs::read_dir(home.root())
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].file_name(), "astrid.volume");
-        RuntimeLifecycleGuard::acquire(&home)
-            .unwrap()
-            .finish()
-            .await
-            .unwrap();
-        let store = open_runtime_principal_store(&home, quota).await.unwrap();
-        assert_eq!(
-            store.content().read(&StateOwner::System, &name).unwrap(),
-            Some(b"capsule".to_vec())
-        );
+impl super::RuntimePrincipalStore {
+    pub(super) fn require_volume_binding(&self, home: &AstridHome) -> StorageResult<()> {
+        let volume = self.volume_binding.upgrade().ok_or_else(|| {
+            StorageError::Connection("retained runtime volume is already closed".into())
+        })?;
+        volume
+            .require_current_binding(&home.storage_volume_path())
+            .map_err(|error| {
+                StorageError::Connection(format!("validate retained runtime volume: {error}"))
+            })
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn failed_finalization_preserves_recovery_evidence() {
-        let parent = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(parent.path().join("runtime"));
-        let lifecycle = RuntimeLifecycleGuard::acquire(&home).unwrap();
-        let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|_: &StateOwner| Ok(None));
-        let store = open_runtime_principal_store(&home, quota).await.unwrap();
-        std::fs::write(home.root().join("config.toml"), b"keep").unwrap();
-        drop(store);
-        std::os::unix::fs::symlink(parent.path(), home.root().join("redirect")).unwrap();
-        assert!(lifecycle.finish().await.is_err());
-        assert_eq!(
-            std::fs::read(home.root().join("config.toml")).unwrap(),
-            b"keep"
-        );
-        assert!(home.root().join("redirect").symlink_metadata().is_ok());
-        assert!(RuntimeLifecycleGuard::acquire(&home).is_ok());
-    }
-
-    #[test]
-    fn different_temp_process_cannot_acquire_fence() {
-        let Some(root) = std::env::var_os("ASTRID_TEST_LIFECYCLE_ROOT") else {
-            return;
-        };
-        assert!(RuntimeLifecycleGuard::acquire(&AstridHome::from_path(root)).is_err());
+    /// Transfer shutdown responsibility to the host without reopening storage.
+    ///
+    /// Call only after admitting no new work and draining capsule producers.
+    /// The host must drop its task runtime before finalizing this token.
+    pub fn retain_for_finalization(&self) -> RuntimeFinalization {
+        RuntimeFinalization {
+            store: self.clone(),
+        }
     }
 }
+
+impl Drop for RuntimeFinalization {
+    fn drop(&mut self) {
+        // Close invalidates every surviving projection, even on error. Never
+        // trace here: finalization may already have retired the log directory.
+        let _ = self.store.engine.close();
+    }
+}
+
+impl RuntimeLifecycleGuard {
+    /// Finalize the retained store after its task runtime has stopped.
+    ///
+    /// # Errors
+    /// Rejects a different home, replaced volume, or unsafe host projection.
+    /// Failures before retirement preserve host files. Later errors retain
+    /// the durable volume and any surviving projection for recovery.
+    pub fn finish_retained(self, finalization: RuntimeFinalization) -> StorageResult<()> {
+        let packed = finalization
+            .store
+            .require_volume_binding(&self.home)
+            .and_then(|()| {
+                finalization
+                    .store
+                    .pack_and_retire_runtime_projection(&self.home)
+            });
+        let closed = finalization.store.engine.close().map_err(|error| {
+            StorageError::Connection(format!("close finalized runtime volume: {error}"))
+        });
+        drop(finalization);
+        match (packed, closed) {
+            (Err(pack), Err(close)) => Err(StorageError::Connection(format!(
+                "{pack}; additionally failed to close retained storage: {close}"
+            ))),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod tests;

@@ -34,6 +34,7 @@ where
     Ok(recovered)
 }
 
+#[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all)]
 pub(super) fn recover_roots<P, I, C, R>(
     roots: &mut R,
     arena: &mut File,

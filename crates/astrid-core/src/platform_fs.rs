@@ -9,6 +9,16 @@
 #[path = "platform_fs/macos_acl.rs"]
 mod macos_acl;
 
+#[path = "platform_fs/private_projection.rs"]
+mod private_projection;
+pub use private_projection::PrivateFileProjection;
+
+#[cfg(unix)]
+#[path = "platform_fs/mount_boundary/mod.rs"]
+mod mount_boundary;
+#[cfg(unix)]
+pub(crate) use mount_boundary::MountBoundary;
+
 use std::collections::HashSet;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -666,12 +676,43 @@ fn open_directory_no_follow_unix(path: &Path) -> io::Result<std::fs::File> {
     Ok(directory)
 }
 
+/// Open exactly the requested directory, never a nearest existing ancestor.
+#[cfg(unix)]
+pub(crate) fn open_existing_directory_no_follow(path: &Path) -> io::Result<std::fs::File> {
+    let (directory, missing) = unix_directory_walk(path)?;
+    if !missing.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "projection root is missing",
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    static DIRECTORY_WALK_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(unix, test))]
+pub(crate) fn reset_directory_walk_count() {
+    DIRECTORY_WALK_COUNT.set(0);
+}
+
+#[cfg(all(unix, test))]
+pub(crate) fn directory_walk_count() -> usize {
+    DIRECTORY_WALK_COUNT.get()
+}
+
 #[cfg(unix)]
 fn unix_directory_walk(path: &Path) -> io::Result<(std::fs::File, Vec<std::ffi::OsString>)> {
     use nix::errno::Errno;
     use nix::fcntl::{OFlag, openat};
     use nix::sys::stat::Mode;
     use std::path::Component;
+
+    #[cfg(test)]
+    DIRECTORY_WALK_COUNT.with(|count| count.set(count.get().strict_add(1)));
 
     let components = path.components().collect::<Vec<_>>();
     if components

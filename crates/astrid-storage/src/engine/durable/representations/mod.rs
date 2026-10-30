@@ -30,12 +30,14 @@ mod authority;
 mod checkpoint;
 mod format;
 mod index_validation;
+pub(super) use index_validation::GenerationZeroLocations;
 mod recovery;
+mod residency;
 
 use activation::{append_new_reachable_map_nodes, build_initial_state, generation_name};
 use recovery::{
-    MetadataIndex, read_current_file, recover_journal, recover_metadata, validate_profiles,
-    validate_representations,
+    MetadataIndex, ValidatedRepresentations, generation_zero_arena_locations, read_current_file,
+    recover_journal, recover_metadata, validate_profiles, validate_representations,
 };
 
 mod contiguous;
@@ -102,6 +104,7 @@ pub(super) struct RepresentationStore {
     state: RepresentationState,
     catalogue: RepresentationCatalogueRoot,
     placements: PlacementSet,
+    residency: residency::MapResidency,
     profiles: CanonicalPhysicalMap,
     representations: CanonicalPhysicalMap,
     placement_entries: CanonicalPhysicalMap,
@@ -128,11 +131,23 @@ struct DirectMapEntry {
     placement: (PhysicalMapKey, Vec<u8>),
 }
 
+#[cfg(test)]
+std::thread_local! {
+    pub(super) static DIRECT_ARENA_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl RepresentationStore {
     pub(super) fn open(
         store_root: &cap_std::fs::Dir,
         limits: RecoveryLimits,
     ) -> Result<Option<Self>, DurableError> {
+        Ok(Self::open_recovered(store_root, limits)?.map(|(store, _locations)| store))
+    }
+
+    pub(super) fn open_recovered(
+        store_root: &cap_std::fs::Dir,
+        limits: RecoveryLimits,
+    ) -> Result<Option<(Self, GenerationZeroLocations)>, DurableError> {
         let root_directory = match contiguous::open_representation_root(store_root) {
             Ok(root) => root,
             Err(DurableError::Io { source, .. })
@@ -165,15 +180,14 @@ impl RepresentationStore {
         let mut journal = DurableFile::native(open_cap_file(&generation, Path::new(JOURNAL_PATH))?);
         let index = recover_metadata(&mut metadata, limits)?;
         let (active, state) = recover_journal(&mut journal, current, &index, limits)?;
-        let recovered = Self::from_recovered(
+        Ok(Some(Self::from_recovered(
             metadata,
             journal,
             current.journal_generation,
             active,
             state,
-            &index,
-        )?;
-        Ok(Some(recovered))
+            index,
+        )?))
     }
 
     pub(super) fn activate(
@@ -509,6 +523,11 @@ impl RepresentationStore {
             PhysicalMapDomain::Placement,
             placement_entries,
         )?;
+        self.residency = residency::MapResidency::new(
+            &self.profiles,
+            &self.representations,
+            &self.placement_entries,
+        );
         let replacement_reverse = entries
             .into_iter()
             .map(|entry| (entry.object, vec![entry.representation_id]))
@@ -667,6 +686,10 @@ impl RepresentationStore {
                 self.reverse.entry(object).or_default().push(representation);
             }
         }
+        // These maps came from canonical recovery or checked model mutations.
+        // Reclaim cannot fail on a valid trie. Propagate an invariant failure
+        // rather than hiding corruption, even though authority is now durable.
+        self.reclaim_map_history()?;
         Ok(())
     }
 
@@ -687,40 +710,9 @@ impl RepresentationStore {
             .map_err(|source| io_error("flush representation state journal", source))
     }
 
-    /// Return the arena prefix proven durable by published physical state.
-    ///
-    /// A malformed frame below this boundary is corruption, not a repairable
-    /// uncommitted tail. Recovery consults this value before it may truncate
-    /// the logical arena.
-    pub(super) fn generation_zero_protected_len(&self) -> Result<u64, DurableError> {
-        self.direct_arena_locations()?
-            .into_iter()
-            .try_fold(0_u64, |protected, (_, location)| {
-                let end = location
-                    .offset
-                    .checked_add(FRAME_HEADER_LEN)
-                    .and_then(|value| value.checked_add(location.payload_len))
-                    .ok_or(DurableError::EncodingOverflow)?;
-                Ok(protected.max(end))
-            })
-    }
-
-    /// Validate that generation-zero placements name the recovered arena
-    /// index exactly.
-    ///
-    /// This is mount-time topology validation, not an implicit full-store
-    /// scrub. Authoritative object reads verify the named frame checksum,
-    /// canonical encoding, and logical identity before returning bytes. A
-    /// scheduled refinery pass owns proactive full-corpus re-attestation.
-    pub(super) fn validate_generation_zero_index(
-        &self,
-        index: &BTreeMap<ObjectId, ArenaLocation>,
-    ) -> Result<(), DurableError> {
-        let direct = self.direct_arena_locations()?;
-        index_validation::validate(&direct, index)
-    }
-
     fn direct_arena_locations(&self) -> Result<Vec<(ObjectId, ArenaLocation)>, DurableError> {
+        #[cfg(test)]
+        DIRECT_ARENA_WALKS.with(|count| count.set(count.get().strict_add(1)));
         let mut direct = Vec::new();
         for (object, records) in &self.reverse {
             let record = records
@@ -747,23 +739,8 @@ impl RepresentationStore {
                 ))?;
             let placement = PlacementEntry::decode(placement)?;
             let before = direct.len();
-            for replica in placement.replicas() {
-                if let ReplicaLocator::ArenaFrame {
-                    arena_generation: 0,
-                    offset,
-                    payload_length,
-                    frame_checksum,
-                } = replica.locator()
-                {
-                    direct.push((
-                        *object,
-                        ArenaLocation {
-                            offset,
-                            payload_len: payload_length,
-                            checksum: frame_checksum,
-                        },
-                    ));
-                }
+            for location in generation_zero_arena_locations(&placement) {
+                direct.push((*object, location));
             }
             if direct.len() == before {
                 return Err(DurableError::InvalidRepresentationState(
@@ -774,38 +751,44 @@ impl RepresentationStore {
         Ok(direct)
     }
 
+    #[tracing::instrument(
+        target = "astrid_storage::recovery",
+        level = "debug",
+        name = "reconstruct_active_representations",
+        skip_all
+    )]
     fn from_recovered(
         metadata: DurableFile,
         journal: DurableFile,
         journal_generation: u64,
         active: RepresentationStateId,
         state: RepresentationState,
-        index: &MetadataIndex,
-    ) -> Result<Self, DurableError> {
+        mut index: MetadataIndex,
+    ) -> Result<(Self, GenerationZeroLocations), DurableError> {
         let catalogue = RepresentationCatalogueRoot::decode(
             index.value(MetadataKind::Catalogue, state.catalogue().as_bytes())?,
         )?;
         let placements = PlacementSet::decode(
             index.value(MetadataKind::Placement, state.placements().as_bytes())?,
         )?;
-        let profiles = CanonicalPhysicalMap::recover(
-            &Blake3PhysicalIdentity,
+        let profiles = residency::recover_active_map(
             PhysicalMapDomain::Profile,
             catalogue.profiles_root(),
-            index.nodes.clone(),
+            &mut index.nodes,
         )?;
-        let representations = CanonicalPhysicalMap::recover(
-            &Blake3PhysicalIdentity,
+        let representations = residency::recover_active_map(
             PhysicalMapDomain::Representation,
             catalogue.representations_root(),
-            index.nodes.clone(),
+            &mut index.nodes,
         )?;
-        let placement_entries = CanonicalPhysicalMap::recover(
-            &Blake3PhysicalIdentity,
+        let placement_entries = residency::recover_active_map(
             PhysicalMapDomain::Placement,
             placements.entries_root(),
-            index.nodes.clone(),
+            &mut index.nodes,
         )?;
+        // Active closures now own their nodes. Release unused historical bodies
+        // and replay metadata before allocating the validated reverse index.
+        drop(index);
         if profiles.entry_count() != catalogue.profile_count()
             || representations.entry_count() != catalogue.representation_count()
             || placement_entries.entry_count() != placements.blob_count()
@@ -814,30 +797,52 @@ impl RepresentationStore {
                 "physical map count disagrees with its authority root",
             ));
         }
+        // This is an append memo, not the durable historical catalogue. Journal
+        // recovery has checked historical frame identities and CAS closure
+        // completeness. Active maps receive full canonical validation above.
+        // An evicted node can be appended again with its canonical ID.
+        let persisted_map_nodes = [&profiles, &representations, &placement_entries]
+            .into_iter()
+            .flat_map(|map| map.nodes().keys().copied())
+            .collect();
+        let residency =
+            residency::MapResidency::new(&profiles, &representations, &placement_entries);
         let direct_profile = validate_profiles(&profiles)?;
-        let (reverse, extent_count) =
-            validate_representations(&profiles, &representations, &placement_entries)?;
+        let ValidatedRepresentations {
+            reverse,
+            extent_count,
+            locations,
+        } = validate_representations(
+            &profiles,
+            &representations,
+            &placement_entries,
+            direct_profile,
+        )?;
         if extent_count != placements.replica_extent_count() {
             return Err(DurableError::InvalidRepresentationState(
                 "placement extent count disagrees with map entries",
             ));
         }
-        Ok(Self {
-            metadata,
-            journal,
-            journal_generation,
-            active,
-            state,
-            catalogue,
-            placements,
-            profiles,
-            representations,
-            placement_entries,
-            persisted_map_nodes: index.nodes.keys().copied().collect(),
-            complete_map_subtrees: BTreeSet::new(),
-            direct_profile,
-            reverse,
-        })
+        Ok((
+            Self {
+                metadata,
+                journal,
+                journal_generation,
+                active,
+                state,
+                catalogue,
+                placements,
+                residency,
+                profiles,
+                representations,
+                placement_entries,
+                persisted_map_nodes,
+                complete_map_subtrees: BTreeSet::new(),
+                direct_profile,
+                reverse,
+            },
+            locations,
+        ))
     }
 }
 

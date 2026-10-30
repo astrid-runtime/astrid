@@ -18,6 +18,12 @@ use clap::Parser;
 /// Explicitly bound native secret responder; not enabled by default.
 pub mod native_input;
 
+#[derive(Clone, Copy)]
+enum StoreShutdown {
+    Close,
+    RetainForFinalization,
+}
+
 /// Run the daemon and finalize its durable home after all runtime tasks stop.
 ///
 /// Both binary entry points use this path for API, signal, and idle shutdown.
@@ -38,19 +44,20 @@ pub fn run_to_completion() -> Result<()> {
     }
     let home = astrid_core::dirs::AstridHome::resolve()?;
     let lifecycle = astrid_storage::principal_state::RuntimeLifecycleGuard::acquire(&home)?;
-    {
+    let finalization = {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        runtime.block_on(run_with_args(args))?;
-        // Drop joins blocking work and cancels remaining async tasks before any
-        // projection file can be retired. No kernel handles cross this scope.
-    }
+        let finalization =
+            runtime.block_on(run_with_args(args, StoreShutdown::RetainForFinalization))?;
+        // Runtime drop joins blocking work and cancels remaining async tasks.
+        // Only the storage finalization token may cross this boundary.
+        drop(runtime);
+        finalization
+            .ok_or_else(|| anyhow::anyhow!("daemon did not retain finalization ownership"))?
+    };
     tracing::info!("Runtime tasks stopped; finalizing durable home");
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(lifecycle.finish())?;
+    lifecycle.finish_retained(finalization)?;
     // Tracing can recreate a retired log projection; stderr cannot reopen it.
     eprintln!("Astrid durable home finalized");
     Ok(())
@@ -242,7 +249,9 @@ fn write_readiness_then_arm_ephemeral<T, E>(
 /// Returns an error if the kernel fails to boot, the native local uplink cannot
 /// claim its listener, or the readiness file cannot be written.
 pub async fn run() -> Result<()> {
-    run_with_args(Args::parse()).await
+    run_with_args(Args::parse(), StoreShutdown::Close)
+        .await
+        .map(|_| ())
 }
 
 #[cfg(unix)]
@@ -250,7 +259,10 @@ pub async fn run() -> Result<()> {
     clippy::too_many_lines,
     reason = "boot sequence: sequential config resolution + kernel/capsule setup that does not benefit from splitting"
 )]
-async fn run_with_args(args: Args) -> Result<()> {
+async fn run_with_args(
+    args: Args,
+    shutdown: StoreShutdown,
+) -> Result<Option<astrid_storage::principal_state::RuntimeFinalization>> {
     let workspace_layout = match std::env::var("ASTRID_WORKSPACE_STATE_DIR") {
         Ok(value) => astrid_core::dirs::WorkspaceLayout::new(value)
             .context("invalid ASTRID_WORKSPACE_STATE_DIR")?,
@@ -500,13 +512,22 @@ async fn run_with_args(args: Args) -> Result<()> {
         notify.notify_waiters();
     }
 
-    kernel.shutdown(Some("signal".to_string())).await;
+    let finalization = if matches!(shutdown, StoreShutdown::RetainForFinalization) {
+        Some(
+            kernel
+                .shutdown_for_finalization(Some("signal".to_string()))
+                .await,
+        )
+    } else {
+        kernel.shutdown(Some("signal".to_string())).await;
+        None
+    };
     if let Err(error) = native_uplink_task.await {
         tracing::warn!(%error, "native local uplink task did not exit cleanly");
     }
 
     tracing::info!("Kernel services and native uplink stopped");
-    Ok(())
+    finalization.transpose().map_err(Into::into)
 }
 
 /// Report that native daemon startup is unavailable on this platform.
@@ -523,7 +544,10 @@ async fn run_with_args(args: Args) -> Result<()> {
     clippy::unused_async,
     reason = "the cross-platform daemon entry point remains async even when startup is unsupported"
 )]
-async fn run_with_args(_args: Args) -> Result<()> {
+async fn run_with_args(
+    _args: Args,
+    _shutdown: StoreShutdown,
+) -> Result<Option<astrid_storage::principal_state::RuntimeFinalization>> {
     anyhow::bail!("native Astrid daemon startup is not yet supported on this platform")
 }
 

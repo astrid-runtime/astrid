@@ -1,17 +1,19 @@
 //! Authoritative startup and in-process recovery for the durable engine.
 
+use super::representations::{GenerationZeroLocations, RepresentationStore};
 use super::wal::{durable_error as wal_durable_error, recover_wal};
 use super::{
-    ARENA_FILE, ArenaReader, DurableEngine, DurableError, DurableFiles, DurableInner, DurableWal,
-    FaultInjector, FaultPoint, INDEX_FILE, IndexState, LIFECYCLE_CLOSED, LIFECYCLE_USABLE,
-    MutexGuard, PersistentObjectIdentity, PrincipalCodec, ROOT_FILE, RecoveredStore,
-    RecoveryLimits, Seek, SeekFrom, SharedIdentity, SharedPrincipalCodec, WAL_FILE, io, io_error,
-    open_rw_capability, recover_arena, recover_index, recover_interrupted_compaction,
-    recover_root_history, recover_roots, replace_index, replace_volume_index,
-    sync_store_directory_capability,
+    ARENA_FILE, ArenaLocation, ArenaReader, DurableEngine, DurableError, DurableFiles,
+    DurableInner, DurableWal, FaultInjector, FaultPoint, File, INDEX_FILE, IndexState,
+    LIFECYCLE_CLOSED, LIFECYCLE_USABLE, MutexGuard, PersistentObjectIdentity, PrincipalCodec,
+    ROOT_FILE, RecoveredStore, RecoveryLimits, Seek, SeekFrom, SharedIdentity,
+    SharedPrincipalCodec, WAL_FILE, io, io_error, open_rw_capability, recover_arena, recover_index,
+    recover_interrupted_compaction, recover_root_history, recover_roots, replace_index,
+    replace_volume_index, sync_store_directory_capability,
 };
+use crate::storage_model::ObjectId;
 use crate::volume::AstridVolume;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 type RecoveredWal<P, I, C> = (RecoveredStore<P>, Option<DurableWal<P, I, C>>);
 use std::path::Path;
@@ -32,6 +34,51 @@ impl RecoveryScope {
     }
 }
 
+fn recover_native_object_index<I: PersistentObjectIdentity>(
+    store_root: &cap_std::fs::Dir,
+    arena: &mut File,
+    index_cache: &mut Option<File>,
+    identity: &I,
+    limits: RecoveryLimits,
+    protected_arena_len: u64,
+    faults: &dyn FaultInjector,
+) -> Result<(BTreeMap<ObjectId, ArenaLocation>, Option<ArenaLocation>), DurableError> {
+    let scheme = identity.scheme();
+    let arena_len = arena
+        .metadata()
+        .map_err(|source| io_error("read object-arena metadata", source))?
+        .len();
+    if let Some(state) = index_cache
+        .as_mut()
+        .and_then(|file| recover_index(file, arena, scheme, limits, arena_len))
+    {
+        return Ok((state.objects, state.arena_tail));
+    }
+    let (index, arena_tail) = recover_arena(arena, identity, limits, protected_arena_len)?;
+    let state = IndexState {
+        arena_len: arena
+            .metadata()
+            .map_err(|source| io_error("read recovered arena metadata", source))?
+            .len(),
+        arena_tail,
+        objects: index,
+    };
+    drop(index_cache.take());
+    *index_cache = Some(replace_index(store_root, &state, scheme, faults)?);
+    Ok((state.objects, state.arena_tail))
+}
+
+fn take_generation_zero_handoff(
+    recovered: Option<(RepresentationStore, GenerationZeroLocations)>,
+) -> Result<(Option<RepresentationStore>, GenerationZeroLocations, u64), DurableError> {
+    let (store, locations) = match recovered {
+        Some((store, locations)) => (Some(store), locations),
+        None => (None, GenerationZeroLocations::default()),
+    };
+    let protected_arena_len = locations.protected_len()?;
+    Ok((store, locations, protected_arena_len))
+}
+
 pub(super) fn recover_store<P, I, C>(
     store_root: &cap_std::fs::Dir,
     principal_codec: &SharedPrincipalCodec<C>,
@@ -46,12 +93,8 @@ where
     C: PrincipalCodec<P>,
 {
     recover_interrupted_compaction(store_root, principal_codec, identity, limits)?;
-    let mut representations =
-        super::representations::RepresentationStore::open(store_root, limits)?;
-    let protected_arena_len = representations.as_ref().map_or(
-        Ok(0),
-        super::representations::RepresentationStore::generation_zero_protected_len,
-    )?;
+    let (mut representations, locations, protected_arena_len) =
+        take_generation_zero_handoff(RepresentationStore::open_recovered(store_root, limits)?)?;
     let mut arena = open_rw_capability(store_root, Path::new(ARENA_FILE), true)?;
     let mut roots = open_rw_capability(store_root, Path::new(ROOT_FILE), true)?;
     let mut index_cache = open_rw_capability(store_root, Path::new(INDEX_FILE), true).ok();
@@ -60,33 +103,16 @@ where
     if wal_file.is_some() {
         sync_store_directory_capability(store_root)?;
     }
-    let scheme = identity.scheme();
-    let arena_len = arena
-        .metadata()
-        .map_err(|source| io_error("read object-arena metadata", source))?
-        .len();
-    let cached = index_cache
-        .as_mut()
-        .and_then(|file| recover_index(file, &mut arena, scheme, limits, arena_len));
-    let (index, arena_tail) = if let Some(state) = cached {
-        (state.objects, state.arena_tail)
-    } else {
-        let (index, arena_tail) = recover_arena(&mut arena, identity, limits, protected_arena_len)?;
-        let state = IndexState {
-            arena_len: arena
-                .metadata()
-                .map_err(|source| io_error("read recovered arena metadata", source))?
-                .len(),
-            arena_tail,
-            objects: index,
-        };
-        drop(index_cache.take());
-        index_cache = Some(replace_index(store_root, &state, scheme, faults)?);
-        (state.objects, state.arena_tail)
-    };
-    if let Some(representations) = &mut representations {
-        representations.validate_generation_zero_index(&index)?;
-    }
+    let (index, arena_tail) = recover_native_object_index(
+        store_root,
+        &mut arena,
+        &mut index_cache,
+        identity,
+        limits,
+        protected_arena_len,
+        faults,
+    )?;
+    locations.validate_index(&index)?;
     let mut index = index;
     let wal_writer = if let Some(wal_file) = wal_file {
         Some(replay_transaction_wal(
@@ -162,12 +188,8 @@ where
     volume
         .sync()
         .map_err(|source| io_error("flush Astrid volume namespace", source))?;
-    let mut representations =
-        super::representations::RepresentationStore::open_volume(volume, limits)?;
-    let protected_arena_len = representations.as_ref().map_or(
-        Ok(0),
-        super::representations::RepresentationStore::generation_zero_protected_len,
-    )?;
+    let (mut representations, locations, protected_arena_len) =
+        take_generation_zero_handoff(RepresentationStore::open_volume_recovered(volume, limits)?)?;
     let (index, arena_tail) = recover_volume_index(
         volume,
         &mut arena,
@@ -177,9 +199,7 @@ where
         protected_arena_len,
         faults,
     )?;
-    if let Some(store) = &mut representations {
-        store.validate_generation_zero_index(&index)?;
-    }
+    locations.validate_index(&index)?;
     let mut index = index;
     let wal_writer = if let Some(wal_file) = wal_file {
         Some(replay_transaction_wal(
@@ -235,6 +255,7 @@ where
     ))
 }
 
+#[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all)]
 fn recover_volume_index<I>(
     volume: &Arc<dyn AstridVolume>,
     arena: &mut super::File,
@@ -319,6 +340,12 @@ fn open_optional_volume_wal(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    target = "astrid_storage::recovery",
+    level = "debug",
+    name = "replay_transaction_wal",
+    skip_all
+)]
 fn replay_transaction_wal<P, I, C>(
     wal_file: super::File,
     arena: &mut super::File,
@@ -534,3 +561,6 @@ where
         Ok(inner)
     }
 }
+
+#[cfg(test)]
+mod tests;

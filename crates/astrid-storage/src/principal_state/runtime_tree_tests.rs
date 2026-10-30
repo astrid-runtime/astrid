@@ -1235,16 +1235,20 @@ fn rebind_staging_generation_rejects_symlink_without_touching_target() {
 }
 
 #[test]
-fn rollback_private_files_attempts_every_destination() {
+fn rollback_projection_files_attempts_every_destination() {
     let directory = tempfile::tempdir().unwrap();
     let removed = directory.path().join("removed");
     std::fs::write(&removed, b"remove").unwrap();
-    let failed = directory.path().join("missing-parent/file");
+    std::fs::write(directory.path().join("blocked-parent"), b"not a directory").unwrap();
+    let writer = astrid_core::platform_fs::PrivateFileProjection::open(directory.path()).unwrap();
 
-    let errors = super::super::native_io::rollback_private_files(vec![
-        (removed.clone(), None),
-        (failed, None),
-    ]);
+    let errors = super::restoration::rollback_projection_files(
+        &writer,
+        vec![
+            (std::path::PathBuf::from("removed"), None),
+            (std::path::PathBuf::from("blocked-parent/file"), None),
+        ],
+    );
     assert_eq!(errors.len(), 1, "one destination should fail");
     assert!(!removed.exists(), "later rollback destination was skipped");
 }
