@@ -1895,4 +1895,42 @@ change availability or speed only; they never fabricate identity, liveness,
 authorization, or accounting.
 
 
+13. IMMUTABLE PRINCIPAL RETIREMENT
+--------------------------------
+
+13.1 Exact root removal
+
+The ASTROOT extension sentinel also admits extension record 2:
+
+  u64            extension_sentinel = 18446744073709551615
+  u8             removal_record = 2
+  u64            principal_byte_length
+  u8[]           principal[principal_byte_length]
+  RootState      expected
+
+There is no replacement and no trailing byte. Principal decoding and canonical
+re-encoding follow the same rules as transition records. Replay MUST require
+that the current principal root equals expected exactly, then remove that map
+entry. A stale, absent, or already removed root is a compare-and-swap failure.
+No live-map tombstone or empty replacement root is introduced. Compaction's
+first-frame snapshot contains present principals only. A subsequent ordinary
+create with expected_tag=0 uses generation zero as for an initially absent
+principal. Authorization to retire an immutable UID remains a runtime boundary.
+
+Removal is a root-journal operation. The replace-only transaction-WAL grammar
+is unchanged: pending WAL replacements MUST be folded and checkpointed before
+a removal frame can be appended. The deletion frame and backing media MUST
+be durable before absence is published or acknowledged. Uncertain persistence
+requires recovery. Shared owning closures, explicit pins, read handles, and
+other retention roots remain protected by ordinary compaction proofs.
+
+13.2 UID-bound workspace retirement
+
+True identity retirement removes bindings and promotion receipts for the
+captured immutable UID from its private root and every current or former fleet
+root. It does not remove a surviving fleet catalog, peer binding, System state,
+or explicit read lease. Ordinary capsule unload and daemon restart preserve
+valid live workspace state. Runtime deletion reservations and writer fencing
+remain mandatory; a mutable alias is never sufficient cleanup authority.
+
 END OF ASTRID PRINCIPAL STORE FORMAT 1

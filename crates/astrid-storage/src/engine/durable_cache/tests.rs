@@ -467,3 +467,38 @@ fn projection_values_share_the_object_cache_budget_and_principal_partition() {
     assert_eq!(stats.resident_projection_entries, 0);
     assert_eq!(stats.resident_projection_bytes, 0);
 }
+
+#[test]
+fn retiring_owner_releases_its_governed_lease_and_preserves_shared_peer() {
+    use crate::StateOwner;
+    use crate::resident_cache::GovernedObjectCache;
+    use crate::resources::ResidentMemoryAuthority;
+    use astrid_core::PrincipalUid;
+
+    let authority = ResidentMemoryAuthority::new(1024 * 1024);
+    let owner = StateOwner::Principal(PrincipalUid::from_bytes([9; 32]));
+    let peer = StateOwner::Principal(PrincipalUid::from_bytes([8; 32]));
+    authority
+        .register_principal(owner, None, 1024 * 1024)
+        .unwrap();
+    authority
+        .register_principal(peer, None, 1024 * 1024)
+        .unwrap();
+    let budget = GovernedObjectCache::new(authority.clone());
+    let cache = ObjectCache::new(budget.config());
+    let id = object(71);
+    cache.insert(&owner, id, record(71));
+    assert!(cache.get(&peer, id).is_some());
+    assert_eq!(authority.snapshot().logical_leases.len(), 2);
+    cache.discard_principal(&owner);
+    assert_eq!(cache.principal_charge(&owner), 0);
+    assert!(cache.get(&peer, id).is_some());
+    assert_eq!(cache.stats().resident_objects, 1);
+    assert_eq!(
+        authority.snapshot().logical_leases.len(),
+        1,
+        "retired owner retains an empty memory lease"
+    );
+    cache.discard_principal(&peer);
+    assert!(authority.snapshot().logical_leases.is_empty());
+}

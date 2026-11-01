@@ -84,7 +84,10 @@ where
         result.and(unlock)
     }
 
-    fn flush_authority(&self, inner: &mut DurableInner<P>) -> Result<(), DurableError> {
+    pub(in crate::engine::durable) fn flush_authority(
+        &self,
+        inner: &mut DurableInner<P>,
+    ) -> Result<(), DurableError> {
         if self.transaction_wal.is_enabled() {
             return self.checkpoint_transaction_wal(inner);
         }

@@ -450,7 +450,8 @@ pub(super) fn pre_chunked_specification() -> crate::storage_model::ObjectRecord 
     use crate::storage_model::{ObjectClass, ObjectFormatVersion, ObjectKind, ObjectRecord};
     // Reconstruct the published predecessor from the amended grammar and
     // bind it to its real identity without duplicating the full specification.
-    let text = std::str::from_utf8(super::format_amendment::STORE_FORMAT_SPEC).unwrap();
+    let predecessor = pre_uid_retirement_specification();
+    let text = std::str::from_utf8(predecessor.canonical_bytes()).unwrap();
     let (before, amendment) = text.split_once("7.1.2 Chunked KV spilled values").unwrap();
     let (_, after) = amendment
         .split_once("7.2 Content DAG, object format version 1")
@@ -468,4 +469,29 @@ pub(super) fn pre_chunked_specification() -> crate::storage_model::ObjectRecord 
         ObjectClass::Metadata,
     )
     .unwrap()
+}
+
+/// Reconstruct the byte-exact published chunked-KV predecessor. The new
+/// root-removal grammar must never alter an older specification's identity.
+pub(super) fn pre_uid_retirement_specification() -> crate::storage_model::ObjectRecord {
+    use crate::storage_model::{ObjectClass, ObjectFormatVersion, ObjectKind, ObjectRecord};
+    let text = std::str::from_utf8(super::format_amendment::STORE_FORMAT_SPEC).unwrap();
+    let (before, _) = text
+        .split_once("13. IMMUTABLE PRINCIPAL RETIREMENT")
+        .unwrap();
+    let prior = format!("{before}END OF ASTRID PRINCIPAL STORE FORMAT 1\n");
+    let record = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        prior.into_bytes(),
+        vec![],
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    assert_eq!(
+        Blake3ObjectIdentityV1.identify(&record),
+        super::format_amendment::PRE_UID_RETIREMENT_FORMAT_SPEC_ID,
+    );
+    record
 }

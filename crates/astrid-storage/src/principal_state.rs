@@ -60,6 +60,7 @@ mod native_io;
 #[cfg(test)]
 mod native_kv_scale_probe_tests;
 mod owner_migration;
+mod principal_retirement;
 #[cfg(test)]
 mod projection_name_tests;
 #[cfg(all(test, feature = "legacy-surrealkv"))]
@@ -715,11 +716,9 @@ impl RuntimePrincipalStore {
 
     /// Remove every KV namespace owned by one immutable principal UID.
     ///
-    /// This is the authoritative identity-deletion primitive: it reclaims
-    /// every capsule KV namespace without guessing capsule IDs from the live
-    /// registry or installation directory. Other typed state components remain
-    /// bound to the retired immutable UID and cannot be inherited by a later
-    /// identity that reuses the alias.
+    /// Full identity retirement uses [`Self::purge_principal_state`] after
+    /// reserving the captured UID and draining its writers. This narrower
+    /// operation preserves all non-KV components and workspace bindings.
     ///
     /// # Errors
     ///

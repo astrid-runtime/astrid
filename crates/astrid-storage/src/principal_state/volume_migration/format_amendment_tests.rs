@@ -343,3 +343,53 @@ async fn missing_catalog_bootstrap_rejects_before_successor_admission() {
     );
     engine.close().unwrap();
 }
+
+#[tokio::test]
+async fn chunked_predecessor_amends_exactly_before_root_retirement() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let prior = crate::principal_state::format_migration_tests::pre_uid_retirement_specification();
+    let engine = Arc::new(seed_volume(&home, &prior));
+    let kv = RuntimeStore::from_engine(
+        engine.clone(),
+        StateOwnerResolver::new(crate::principal_state::PrincipalDirectory::default()),
+    );
+    let retained = vec![0x64; 512 * 1024];
+    kv.set("system:identity", "retained", retained.clone())
+        .await
+        .unwrap();
+    drop(kv);
+    let before = engine.root(&StateOwner::System).unwrap();
+    engine.close().unwrap();
+    drop(engine);
+    assert_eq!(independently_read_value(&home, "retained"), retained);
+    let volume = HostedFileVolume::open(home.storage_volume_path()).unwrap();
+    let engine = RuntimeEngine::open_volume(
+        volume,
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+        DurableEnginePolicy::default(),
+    )
+    .unwrap();
+    crate::principal_state::format_amendment::prepare_volume_format_specification(&engine).unwrap();
+    assert_eq!(engine.root(&StateOwner::System).unwrap(), before);
+    engine.close().unwrap();
+    drop(engine);
+
+    let store = crate::principal_state::open_runtime_principal_store(
+        &home,
+        Arc::new(|_: &StateOwner| Ok(None)),
+    )
+    .await
+    .unwrap();
+    // Projection admission may update System metadata; exact amendment-root
+    // preservation is checked before those separate runtime writes below.
+    assert_eq!(
+        store.kv().get("system:identity", "retained").await.unwrap(),
+        Some(retained.clone())
+    );
+    store.engine.close().unwrap();
+    drop(store);
+    assert_eq!(independently_read_value(&home, "retained"), retained);
+}

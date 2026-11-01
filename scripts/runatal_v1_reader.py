@@ -30,6 +30,7 @@ ARENA_MAGIC = b"ASTOBJ1\0"
 ROOT_MAGIC = b"ASTROOT\0"
 ROOT_SNAPSHOT_SENTINEL = (1 << 64) - 1
 ROOT_SNAPSHOT_RECORD = 1
+ROOT_REMOVAL_RECORD = 2
 KIND_NAMES = (
     "Chunk",
     "ChunkTree",
@@ -700,7 +701,13 @@ def decode_root(payload):
     cursor = Cursor(payload)
     prefix = cursor.integer(8)
     if prefix == ROOT_SNAPSHOT_SENTINEL:
-        if cursor.integer(1) != ROOT_SNAPSHOT_RECORD:
+        record = cursor.integer(1)
+        if record == ROOT_REMOVAL_RECORD:
+            principal = cursor.take(cursor.integer(8))
+            expected = root_state(cursor)
+            cursor.done()
+            return ("remove", principal, expected)
+        if record != ROOT_SNAPSHOT_RECORD:
             raise FormatError("unknown root-journal extension record")
         entries = []
         previous = None
@@ -909,6 +916,12 @@ def recover(store, include_payloads):
                 if name in roots:
                     raise FormatError(f"duplicate snapshot principal {name}")
                 roots[name] = current
+        elif record[0] == "remove":
+            _, principal, expected = record
+            name = principal_text(principal)
+            if roots.get(name) != expected:
+                raise FormatError(f"root CAS mismatch for {name} at byte {offset}")
+            del roots[name]
         else:
             _, principal, expected, replacement = record
             name = principal_text(principal)

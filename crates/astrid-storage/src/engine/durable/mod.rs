@@ -631,6 +631,12 @@ where
         self.entries.store(Arc::new(next));
     }
 
+    fn remove(&self, principal: &P) {
+        let mut next = (**self.entries.load()).clone();
+        next.remove(principal);
+        self.entries.store(Arc::new(next));
+    }
+
     fn replace(&self, roots: &BTreeMap<P, RootState>) {
         self.entries.store(Arc::new(Self::entries(roots)));
     }
@@ -812,6 +818,7 @@ mod recovery;
 mod representation_engine;
 mod representations;
 mod restore;
+mod root_removal;
 mod roots;
 mod validation;
 mod wal;
