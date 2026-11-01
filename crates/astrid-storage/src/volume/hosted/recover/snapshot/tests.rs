@@ -19,6 +19,7 @@ fn namespace() -> BTreeMap<VolumeRegion, RegionState> {
                             physical_offset: 100,
                         },
                     )]),
+                    ..RegionState::default()
                 },
             )
         })
@@ -41,7 +42,7 @@ fn apply(
         payload_offset: limit.strict_add(header_bytes),
         payload_len: payload.len() as u64,
     };
-    apply_record(regions, &header, Some(payload))
+    apply_record(&tempfile::tempfile()?, regions, &header, Some(payload))
 }
 
 #[test]
