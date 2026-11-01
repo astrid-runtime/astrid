@@ -2,6 +2,12 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static OWNED_LOAD_COUNT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 use super::{GRAPH_KEY, OwnershipError, OwnershipSnapshot, OwnershipStore};
 use crate::principal_directory::PrincipalDirectoryRevision;
 

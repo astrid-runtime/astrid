@@ -26,7 +26,7 @@ impl OwnershipStore {
         &self,
         creator: PrincipalUid,
     ) -> Result<DerivedPrincipalOwnership, OwnershipError> {
-        let graph = self.load().await?;
+        let graph = self.load_shared().await?;
         if graph.principal_deletions.contains_key(&creator) {
             return Err(OwnershipError::PrincipalDeletionInProgress(creator));
         }

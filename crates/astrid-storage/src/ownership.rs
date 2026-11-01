@@ -340,6 +340,8 @@ impl OwnershipStore {
     ///
     /// Fails closed on storage errors, malformed bytes, or broken invariants.
     pub async fn load(&self) -> Result<OwnershipSnapshot, OwnershipError> {
+        #[cfg(test)]
+        shared_snapshot::OWNED_LOAD_COUNT.with(|count| count.set(count.get() + 1));
         Ok(self.load_shared().await?.as_ref().clone())
     }
 

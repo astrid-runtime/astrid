@@ -276,3 +276,78 @@ async fn directory_change_after_cache_selection_cannot_return_old_authority() {
         "directory drift returned authority validated before retirement"
     );
 }
+
+#[tokio::test]
+async fn derived_capture_and_alias_check_borrow_shared_snapshot_without_owned_load() {
+    let (store, _, directory, alias, uid) = assigned().await;
+    let first = store.load_shared().await.unwrap();
+    OWNED_LOAD_COUNT.with(|count| count.set(0));
+    store.capture_derived_ownership(uid).await.unwrap();
+    store.ensure_alias_available(&alias).await.unwrap();
+    assert_eq!(
+        OWNED_LOAD_COUNT.with(std::cell::Cell::get),
+        0,
+        "read-only derive helpers cloned the full graph through load()"
+    );
+    assert!(Arc::ptr_eq(&first, &store.load_shared().await.unwrap()));
+    directory.unregister(&alias, uid);
+    assert!(
+        store.capture_derived_ownership(uid).await.is_err(),
+        "cached graph authorized spawn after directory removal"
+    );
+    assert!(
+        store.ensure_alias_available(&alias).await.is_err(),
+        "cached graph survived directory removal for alias checks"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_derived_reads_share_one_fetch_and_skip_owned_load() {
+    let (_, seeded, directory, alias, uid) = assigned().await;
+    let bytes = seeded
+        .get(super::super::OWNERSHIP_NAMESPACE, GRAPH_KEY)
+        .await
+        .unwrap()
+        .unwrap();
+    let raw = Arc::new(ConcurrentReads::default());
+    raw.inner
+        .set(super::super::OWNERSHIP_NAMESPACE, GRAPH_KEY, bytes)
+        .await
+        .unwrap();
+    let store = OwnershipStore::new(raw.clone(), directory).unwrap();
+    OWNED_LOAD_COUNT.with(|count| count.set(0));
+    let mut tasks = Vec::new();
+    for index in 0..64 {
+        let cloned = store.clone();
+        let alias = alias.clone();
+        tasks.push(tokio::spawn(async move {
+            match index % 3 {
+                0 => {
+                    cloned.load_shared().await.unwrap();
+                },
+                1 => {
+                    cloned.capture_derived_ownership(uid).await.unwrap();
+                },
+                _ => cloned.ensure_alias_available(&alias).await.unwrap(),
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    assert_eq!(
+        raw.peak.load(Ordering::SeqCst),
+        1,
+        "derived readers retained separate raw graph buffers"
+    );
+    assert_eq!(
+        raw.reads.load(Ordering::SeqCst),
+        64,
+        "derived readers skipped current authority reads"
+    );
+    assert_eq!(
+        OWNED_LOAD_COUNT.with(std::cell::Cell::get),
+        0,
+        "concurrent derived readers cloned the full graph through load()"
+    );
+}
