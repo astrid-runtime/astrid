@@ -123,13 +123,17 @@ pub(super) struct TcpListenerSlot {
 /// Lease on a `shared_listeners` registry entry for one guest slot.
 pub(super) struct TcpListenerShare {
     key: (String, u16),
-    registry: Arc<dashmap::DashMap<(String, u16), SharedTcpListener>>,
+    registry: Arc<std::sync::OnceLock<dashmap::DashMap<(String, u16), SharedTcpListener>>>,
     quota: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl TcpListenerShare {
     fn release(self) {
-        match self.registry.entry(self.key) {
+        let Some(registry) = self.registry.get() else {
+            debug_assert!(false, "shared listener missing on slot drop");
+            return;
+        };
+        match registry.entry(self.key) {
             dashmap::mapref::entry::Entry::Occupied(occupied) => {
                 let previous = occupied.get().holders.fetch_update(
                     Ordering::AcqRel,
@@ -588,7 +592,11 @@ impl net::Host for HostState {
                 Io(ErrorCode),
                 Quota,
             }
-            let outcome = match self.shared_listeners.entry((host.clone(), port)) {
+            let outcome = match self
+                .shared_listeners
+                .get_or_init(dashmap::DashMap::new)
+                .entry((host.clone(), port))
+            {
                 dashmap::mapref::entry::Entry::Occupied(existing) => {
                     let previous = existing.get().holders.fetch_add(1, Ordering::AcqRel);
                     debug_assert!(

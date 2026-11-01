@@ -40,7 +40,12 @@ async fn connect_and_disconnect_stamp_the_same_verified_principal() {
     let claude = PrincipalId::new("claude-code").expect("valid principal");
     let rep = 42u32;
 
+    assert!(state.client_connections.get().is_none());
     register_and_emit_connect(&state, rep, claude.clone());
+    assert!(
+        state.client_connections.get().is_some(),
+        "first inbound connect initializes one shared lifecycle map"
+    );
     let (connect_topic, connect_principal) = next_client_event(&mut rx);
     assert_eq!(connect_topic, "client.v1.connect");
     assert_eq!(connect_principal.as_deref(), Some("claude-code"));
@@ -135,5 +140,16 @@ async fn disconnect_is_idempotent_after_entry_removed() {
     assert!(
         rx.try_recv().is_none(),
         "a second disconnect for an already-removed rep must not emit"
+    );
+}
+
+#[tokio::test]
+async fn idle_disconnect_does_not_initialize_client_registry() {
+    let state = minimal_host_state(tokio::runtime::Handle::current());
+    assert!(state.client_connections.get().is_none());
+    emit_client_disconnect(&state, 999u32);
+    assert!(
+        state.client_connections.get().is_none(),
+        "disconnect of an unregistered stream must not allocate the lifecycle map"
     );
 }

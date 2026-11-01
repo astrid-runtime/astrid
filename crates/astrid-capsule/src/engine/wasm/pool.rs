@@ -520,8 +520,10 @@ fn clear_on_return(state: &mut HostState, reset_resources: bool) {
         // `unbind_connection_principal`), so clear the per-connection
         // principal registry to the same empty-table baseline rather than
         // leaking entries for connections whose stream is now gone
-        // (issue #45/#852).
-        state.connection_principals.clear();
+        // (issue #45/#852). An unused registry must stay uninitialized.
+        if let Some(principals) = state.connection_principals.get() {
+            principals.clear();
+        }
     }
 }
 
@@ -698,6 +700,31 @@ mod tests {
         assert_eq!(state.process_count_total, 1);
         drop(next);
         cancel.cancel();
+    }
+
+    #[test]
+    fn clear_on_return_leaves_unused_connection_registry_uninitialized() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let mut state = minimal_host_state(runtime.handle().clone());
+        assert!(state.connection_principals.get().is_none());
+        clear_on_return(&mut state, true);
+        assert!(state.connection_principals.get().is_none());
+        state.bind_connection_principal(
+            1,
+            astrid_core::PrincipalId::new("alice").expect("valid principal"),
+            None,
+        );
+        clear_on_return(&mut state, true);
+        assert!(
+            state
+                .connection_principals
+                .get()
+                .is_some_and(dashmap::DashMap::is_empty),
+            "reset must empty an initialized registry without leaking the bound identity"
+        );
+        assert_eq!(state.connection_principal(1), None);
     }
 
     /// The in-flight transport origin is per-frame state: a pool return must

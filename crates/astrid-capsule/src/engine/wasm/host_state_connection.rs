@@ -6,13 +6,19 @@ use super::*;
 impl HostState {
     /// Build a fresh, empty per-connection identity registry.
     ///
+    /// The `OnceLock` stays unset until the first bind so unused runtimes do
+    /// not pay `DashMap`'s CPU-sized empty shard array. `OnceLock` rather than
+    /// `LazyLock`: `Deref` would allocate on idle `get`/`remove`/`clear`.
+    /// First insert uses `DashMap::new` (default shard count).
+    ///
     /// Callers that construct a `HostState` outside the pooled-capsule path
     /// (lifecycle hooks, the hook handler, tests) use this so they do not have
-    /// to name the `dashmap` type. The pooled path instead clones one shared
+    /// to name the map type. The pooled path instead clones one shared
     /// registry into every instance (issue #45/#852).
     #[must_use]
-    pub fn new_connection_principals() -> Arc<dashmap::DashMap<u32, ConnectionIdentity>> {
-        Arc::new(dashmap::DashMap::new())
+    pub fn new_connection_principals()
+    -> Arc<std::sync::OnceLock<dashmap::DashMap<u32, ConnectionIdentity>>> {
+        Arc::new(std::sync::OnceLock::new())
     }
 
     /// Build a fresh, empty per-connection client-lifecycle registry.
@@ -22,11 +28,11 @@ impl HostState {
     /// (no device id) for the connect/disconnect counter, whereas
     /// `connection_principals` carries the device-aware [`ConnectionIdentity`].
     /// Out-of-pool constructors (lifecycle hooks, the hook handler, tests) use
-    /// this so they do not have to name the `dashmap` type.
+    /// this so they do not have to name the map type.
     #[must_use]
     pub fn new_client_connections()
-    -> Arc<dashmap::DashMap<u32, astrid_core::principal::PrincipalId>> {
-        Arc::new(dashmap::DashMap::new())
+    -> Arc<std::sync::OnceLock<dashmap::DashMap<u32, astrid_core::principal::PrincipalId>>> {
+        Arc::new(std::sync::OnceLock::new())
     }
 
     /// Build a fresh, empty shared-listener registry.
@@ -36,11 +42,11 @@ impl HostState {
     /// `share_tcp_listeners`; N=1 never consults this map. Interceptor /
     /// non-worker pool instances each get a fresh map so a concrete-port bind
     /// stays private. Out-of-pool constructors use this so they do not have
-    /// to name the `dashmap` type.
+    /// to name the map type.
     #[must_use]
-    pub fn new_shared_listeners() -> Arc<dashmap::DashMap<(String, u16), super::SharedTcpListener>>
-    {
-        Arc::new(dashmap::DashMap::new())
+    pub fn new_shared_listeners()
+    -> Arc<std::sync::OnceLock<dashmap::DashMap<(String, u16), super::SharedTcpListener>>> {
+        Arc::new(std::sync::OnceLock::new())
     }
 
     /// Bind `principal` and the authenticating device `key_id` to the
@@ -58,14 +64,16 @@ impl HostState {
         principal: astrid_core::principal::PrincipalId,
         device_key_id: Option<String>,
     ) {
-        self.connection_principals.insert(
-            rep,
-            ConnectionIdentity {
-                principal,
-                device_key_id,
-                request_owner: astrid_events::ipc::RequestOwnerId::generate(),
-            },
-        );
+        self.connection_principals
+            .get_or_init(dashmap::DashMap::new)
+            .insert(
+                rep,
+                ConnectionIdentity {
+                    principal,
+                    device_key_id,
+                    request_owner: astrid_events::ipc::RequestOwnerId::generate(),
+                },
+            );
     }
 
     /// Return the verified principal bound to the connection identified by
@@ -85,14 +93,20 @@ impl HostState {
         rep: u32,
     ) -> Option<astrid_core::principal::PrincipalId> {
         self.connection_principals
-            .get(&rep)
-            .map(|e| e.principal.clone())
+            .get()
+            .and_then(|map| map.get(&rep).map(|entry| entry.principal.clone()))
     }
 
     /// Remove any verified-identity binding for the connection identified by
     /// stream resource `rep`. Called when the stream resource drops so the
     /// registry does not leak entries for closed connections.
     pub(crate) fn unbind_connection_principal(&self, rep: u32) {
-        self.connection_principals.remove(&rep);
+        if let Some(map) = self.connection_principals.get() {
+            map.remove(&rep);
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "host_state_connection/tests.rs"]
+mod tests;

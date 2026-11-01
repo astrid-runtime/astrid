@@ -103,6 +103,8 @@ wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
 
 [dev-dependencies]
+# Inspect default shard counts in allocation regressions; production uses no raw API.
+dashmap = { workspace = true, features = ["raw-api"] }
 astrid-crypto = { workspace = true }
 astrid-mcp = { workspace = true, features = ["test-support"] }
 astrid-uplink = { workspace = true, features = ["test-support"] }
@@ -117,3 +119,7 @@ unsafe_code = "deny"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
+
+[[bench]]
+name = "registry_overhead"
+harness = false

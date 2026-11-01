@@ -99,8 +99,8 @@ impl HostTcpStream for HostState {
             let bound = match &result {
                 Ok(NetReadStatus::Data(_)) => self
                     .connection_principals
-                    .get(&self_.rep())
-                    .map(|entry| entry.clone()),
+                    .get()
+                    .and_then(|map| map.get(&self_.rep()).map(|entry| entry.clone())),
                 _ => None,
             };
             match bound {
