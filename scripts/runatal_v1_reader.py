@@ -12,13 +12,17 @@ from runatal_v1_fastcdc import ASTRID_V1, cut, is_canonical_boundary
 from runatal_v1_fastcdc import validate_profile, verify_golden_vectors
 from runatal_v1_frames import frames, frames_bytes
 from runatal_v1_kv import validate_principal_kv
-from runatal_v1_physical import decode_store as decode_physical_store, identity_bytes
+from runatal_v1_physical import (
+    FormatError as PhysicalFormatError,
+    decode_store as decode_physical_store,
+    identity_bytes,
+)
 from runatal_v1_sha384 import verify_cross_hash_attestations
 from runatal_v1_sketch import verify_bottom_k_sketches
 from runatal_v1_specs import (
     FORMAT_SPECIFICATION, CONTENT_CATALOG_SPECIFICATION, LEGACY_FORMAT_SPECIFICATIONS,
 )
-from runatal_v1_volume import VolumeFormatError, recover_volume
+from runatal_v1_volume import RegionPath, VolumeFormatError, recover_volume
 
 OBJECT_CONTEXT = "astrid principal store object identity v1"
 ARENA_MAGIC = b"ASTOBJ1\0"
@@ -831,7 +835,21 @@ def recover(store, include_payloads):
     }
     if catalog_specification is not None:
         bootstrap_objects.add(identity_bytes(catalog_specification))
-    if not volume:
+    if volume:
+        # Use the same physical-state validation as directory stores and select
+        # the authoritative profile, not whichever Evidence happens to exist.
+        try:
+            physical = decode_physical_store(RegionPath(regions), bootstrap_objects)
+        except (VolumeFormatError, PhysicalFormatError) as error:
+            raise FormatError(str(error)) from error
+        supported = {
+            identity_text(identifier): identifier
+            for identifier in LEGACY_FORMAT_SPECIFICATIONS | {FORMAT_SPECIFICATION}
+        }
+        specification = supported.get(physical["frozen_specification"])
+        if specification is None:
+            raise FormatError("volume direct profile selects an unsupported format")
+    else:
         decode_physical_store(store, bootstrap_objects)
     objects = {}
     offsets = {}

@@ -276,6 +276,9 @@ def validate_active_state(store, active, metadata, bootstrap_objects):
     )
     return {
         "state": identity_text(active),
+        "frozen_specification": identity_text(
+            profiles[direct_profiles[0]]["specification"]
+        ),
         "catalogue_generation": catalogue["generation"],
         "representation_count": catalogue["representation_count"],
         "placement_count": placement_set["blob_count"],

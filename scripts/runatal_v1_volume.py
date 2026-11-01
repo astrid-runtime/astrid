@@ -18,6 +18,26 @@ class VolumeFormatError(Exception):
     pass
 
 
+class RegionPath:
+    """Read-only path view over recovered regions for the existing store reader."""
+
+    def __init__(self, regions, parts=()):
+        self.regions = regions
+        self.parts = parts
+
+    def __truediv__(self, part):
+        return RegionPath(self.regions, self.parts + (str(part),))
+
+    def __str__(self):
+        return "/".join(self.parts)
+
+    def read_bytes(self):
+        try:
+            return self.regions[str(self)]
+        except KeyError as error:
+            raise VolumeFormatError(f"missing recovered volume region: {self}") from error
+
+
 class Cursor:
     def __init__(self, data):
         self.data = data

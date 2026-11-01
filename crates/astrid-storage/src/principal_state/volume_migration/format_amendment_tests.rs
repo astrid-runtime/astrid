@@ -37,6 +37,68 @@ fn seed_volume_with_catalog(
     engine
 }
 
+fn independently_read_value(home: &AstridHome, key: &str) -> Vec<u8> {
+    let script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/runatal_v1_reader.py");
+    let output = std::process::Command::new("python3")
+        .arg(script)
+        .arg(home.storage_volume_path())
+        .arg("--payloads")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "independent reader failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let decoded: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let values = decoded["roots"]["system"]["kv"]["values"]
+        .as_array()
+        .unwrap();
+    let entry = values
+        .iter()
+        .find(|entry| entry["namespace"] == "system:identity" && entry["key"] == key)
+        .unwrap();
+    hex::decode(entry["value_hex"].as_str().unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn independent_reader_accepts_prior_volume_before_and_after_chunked_amendment() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let prior = crate::principal_state::format_migration_tests::pre_chunked_specification();
+    let engine = Arc::new(seed_volume(&home, &prior));
+    let kv = RuntimeStore::from_engine(
+        engine.clone(),
+        StateOwnerResolver::new(crate::principal_state::PrincipalDirectory::default()),
+    );
+    let retained = vec![0x31; 4096];
+    kv.set("system:identity", "retained", retained.clone())
+        .await
+        .unwrap();
+    drop(kv);
+    engine.close().unwrap();
+    drop(engine);
+    assert_eq!(independently_read_value(&home, "retained"), retained);
+
+    let store = crate::principal_state::open_runtime_principal_store(
+        &home,
+        Arc::new(|_: &StateOwner| Ok(None)),
+    )
+    .await
+    .unwrap();
+    let large = vec![0x5a; 512 * 1024];
+    store
+        .kv()
+        .set("system:identity", "chunked", large.clone())
+        .await
+        .unwrap();
+    store.engine.close().unwrap();
+    drop(store);
+    assert_eq!(independently_read_value(&home, "chunked"), large);
+    assert_eq!(independently_read_value(&home, "retained"), retained);
+}
+
 #[tokio::test]
 async fn existing_volume_amends_prior_profile_preserving_history_and_exact_values() {
     let directory = tempfile::tempdir().unwrap();

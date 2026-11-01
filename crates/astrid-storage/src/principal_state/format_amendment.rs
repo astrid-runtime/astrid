@@ -531,7 +531,7 @@ fn ensure_specification(
             "completed principal store is missing its {description}"
         ))),
         None => engine
-            .persist_standalone_object(expected)
+            .persist_bootstrap_object(expected)
             .map(|_| ())
             .map_err(|error| StorageError::Connection(format!("persist {description}: {error}"))),
     }
