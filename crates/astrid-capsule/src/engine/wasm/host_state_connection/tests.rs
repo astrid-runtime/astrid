@@ -88,25 +88,33 @@ fn interceptor_style_clones_share_identity_run_loop_maps_stay_private() {
 #[test]
 fn concurrent_connection_bindings_preserve_identity_and_owner() {
     let registry = HostState::new_connection_principals();
+    let first_bind = std::sync::Barrier::new(16);
+    let all_bound = std::sync::Barrier::new(16);
+    let all_checked = std::sync::Barrier::new(16);
+    assert!(registry.get().is_none());
     std::thread::scope(|scope| {
         for rep in 0..16 {
             let registry = Arc::clone(&registry);
+            let (first_bind, all_bound, all_checked) = (&first_bind, &all_bound, &all_checked);
             scope.spawn(move || {
                 let (_runtime, mut state) = current_thread_state();
                 state.connection_principals = registry;
                 let principal = astrid_core::PrincipalId::new(format!("client-{rep}"))
                     .expect("valid principal");
                 let device_key_id = Some(format!("device-{rep}"));
+                first_bind.wait();
                 state.bind_connection_principal(rep, principal.clone(), device_key_id.clone());
+                all_bound.wait();
                 let identity = state
                     .connection_principals
                     .get()
-                    .expect("concurrent first insert initializes one map")
-                    .get(&rep)
-                    .expect("bound identity");
+                    .and_then(|map| map.get(&rep).map(|entry| entry.value().clone()));
+                let bound_count = state.connection_principals.get().map(dashmap::DashMap::len);
+                all_checked.wait();
+                let identity = identity.expect("concurrent first bind preserves identity");
                 assert_eq!(identity.principal, principal);
                 assert_eq!(identity.device_key_id, device_key_id);
-                drop(identity);
+                assert_eq!(bound_count, Some(16));
                 state.unbind_connection_principal(rep);
                 assert_eq!(state.connection_principal(rep), None);
             });
