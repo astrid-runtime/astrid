@@ -70,6 +70,10 @@ where
     /// Return one immutable object through the principal-accounted decoded
     /// cache without cloning its allocation.
     ///
+    /// Retention requires an authoritative root for the principal. Reads made
+    /// before its first root or through a lease after retirement remain valid,
+    /// but cannot create a cache account for an absent owner.
+    ///
     /// Cache policy never changes read correctness. A bypass or miss performs
     /// the ordinary positional frame read and full validation before the
     /// resulting record can be retained.
@@ -86,7 +90,10 @@ where
         let mut recovery = RecoveryScope::default();
         loop {
             self.ensure_cached_read_usable_with(&mut recovery)?;
-            if let Some(record) = self.object_cache.get(principal, id) {
+            if let Some(record) = self
+                .object_cache
+                .get_if_current(principal, id, || self.cache_owner_is_live(principal))
+            {
                 return Ok(Some(record));
             }
             let (pending, location, generation) = {
@@ -183,7 +190,10 @@ where
         let mut results = vec![None; ids.len()];
         let mut missing = BTreeMap::<ObjectId, Vec<usize>>::new();
         for (index, id) in ids.iter().copied().enumerate() {
-            if let Some(record) = self.object_cache.get(principal, id) {
+            if let Some(record) = self
+                .object_cache
+                .get_if_current(principal, id, || self.cache_owner_is_live(principal))
+            {
                 results[index] = Some(record);
             } else {
                 missing.entry(id).or_default().push(index);
@@ -217,7 +227,11 @@ where
                 continue;
             }
             for (id, record) in loaded {
-                let cached = self.object_cache.insert(principal, id, record);
+                let cached = self
+                    .object_cache
+                    .insert_if_current(principal, id, record, || {
+                        self.cache_owner_is_live(principal)
+                    });
                 if let Some(indices) = missing.get(&id) {
                     for index in indices {
                         results[*index] = Some(Arc::clone(&cached));
@@ -257,7 +271,19 @@ where
         if inner.arena_generation != generation || !inner.index.contains_key(&id) {
             return Ok(None);
         }
-        Ok(Some(self.object_cache.insert(principal, id, record)))
+        Ok(Some(self.object_cache.insert_if_current(
+            principal,
+            id,
+            record,
+            || self.cache_owner_is_live(principal),
+        )))
+    }
+
+    // Evaluated only under ObjectCache's accounting gate. Removal publishes
+    // root absence before discarding associations under that same gate.
+    fn cache_owner_is_live(&self, principal: &P) -> bool {
+        self.lifecycle.load(std::sync::atomic::Ordering::Acquire) == LIFECYCLE_USABLE
+            && self.published_roots.entries.load().contains_key(principal)
     }
 
     fn ensure_cached_read_usable(&self) -> Result<(), DurableError> {
@@ -338,7 +364,9 @@ where
             return false;
         }
         self.object_cache
-            .retain_projection(principal, object, key, value)
+            .retain_projection_if_current(principal, object, key, value, || {
+                self.cache_owner_is_live(principal)
+            })
     }
 
     /// Discard one projection-owned accelerator and release its cache charge.

@@ -72,9 +72,12 @@ where
         drop(inner.representations.take());
         drop(inner.files.take());
         drop(self.arena_reader.write().take());
-        self.object_cache.clear();
+        // Publish the closed admission fence before clearing. A cached read
+        // already holding the accounting gate is cleared afterward; a later
+        // one cannot recreate a reservation after explicit close.
         self.lifecycle
             .store(LIFECYCLE_CLOSED, std::sync::atomic::Ordering::Release);
+        self.object_cache.clear();
         let unlock = match inner.lock.take() {
             Some(StoreLock::Native(lock)) => fs2::FileExt::unlock(&lock)
                 .map_err(|source| io_error("unlock principal store while closing", source)),

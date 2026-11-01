@@ -77,3 +77,6 @@ mod system_retention_tests;
 
 #[cfg(test)]
 mod capacity_tests;
+
+#[cfg(test)]
+mod cache_retirement_tests;

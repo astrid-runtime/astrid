@@ -502,3 +502,23 @@ fn retiring_owner_releases_its_governed_lease_and_preserves_shared_peer() {
     cache.discard_principal(&peer);
     assert!(authority.snapshot().logical_leases.is_empty());
 }
+
+// Standalone cache-policy tests have no durable root lifecycle. Production
+// admissions always supply the engine's liveness proof under the cache gate.
+impl<P: Clone + Ord> ObjectCache<P> {
+    fn get(&self, principal: &P, object: ObjectId) -> Option<Arc<ObjectRecord>> {
+        self.get_if_current(principal, object, || true)
+    }
+    fn insert(&self, principal: &P, object: ObjectId, record: ObjectRecord) -> Arc<ObjectRecord> {
+        self.insert_if_current(principal, object, record, || true)
+    }
+    fn retain_projection(
+        &self,
+        principal: &P,
+        object: ObjectId,
+        key: ProjectionCacheKey,
+        value: ProjectionCacheEntry,
+    ) -> bool {
+        self.retain_projection_if_current(principal, object, key, value, || true)
+    }
+}

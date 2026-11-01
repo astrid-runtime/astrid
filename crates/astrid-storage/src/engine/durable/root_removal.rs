@@ -80,4 +80,7 @@ where
 mod tests;
 
 #[cfg(test)]
+mod cache_retirement_tests;
+
+#[cfg(test)]
 mod publication_scale_tests;
