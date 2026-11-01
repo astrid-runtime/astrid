@@ -6,9 +6,36 @@
 //! wins the gate is therefore subsequently discarded; one that follows the
 //! discard cannot recreate the retired partition. Ordinary cache hits need no
 //! durable-engine lock, and no retired-owner tombstone is retained.
-use super::*;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use crate::engine::{ProjectionCacheEntry, ProjectionCacheKey};
+use crate::storage_model::{ObjectId, ObjectRecord};
+
+use super::{
+    CacheAdmission, CachedObject, ObjectCache, ObjectCacheCapacity, PrincipalEntry,
+    association_weight, cache_weight, projection_cache_weight,
+};
 
 impl<P: Clone + Ord> ObjectCache<P> {
+    // Capacity callbacks run before the cache-state lock is acquired. Keep
+    // that ordering identical for records, associations and projections.
+    fn reserve_capacity(
+        &self,
+        principal: &P,
+        global_required: u64,
+        principal_required: u64,
+    ) -> CacheAdmission {
+        let global = self.controller.ensure_capacity(global_required);
+        let principal = if global == ObjectCacheCapacity::Disabled {
+            ObjectCacheCapacity::Disabled
+        } else {
+            self.principal_budget
+                .ensure_capacity(principal, principal_required)
+        };
+        CacheAdmission { global, principal }
+    }
+
     pub(in crate::engine) fn get_if_current(
         &self,
         principal: &P,
@@ -40,16 +67,12 @@ impl<P: Clone + Ord> ObjectCache<P> {
                 )
             }
         };
-        let global_capacity = self.controller.ensure_capacity(global_required);
-        let principal_capacity = if global_capacity == ObjectCacheCapacity::Disabled {
-            ObjectCacheCapacity::Disabled
-        } else {
-            self.principal_budget
-                .ensure_capacity(principal, principal_required)
-        };
+        let capacity = self.reserve_capacity(principal, global_required, principal_required);
         let mut state = self.state.lock();
-        let global_capacity = global_capacity.min(self.controller.capacity());
-        let principal_capacity = principal_capacity.min(self.principal_budget.capacity(principal));
+        let global_capacity = capacity.global.min(self.controller.capacity());
+        let principal_capacity = capacity
+            .principal
+            .min(self.principal_budget.capacity(principal));
         state.trim_global(global_capacity);
         state.trim_principal(principal, principal_capacity);
         let result = 'cache: {
@@ -129,16 +152,12 @@ impl<P: Clone + Ord> ObjectCache<P> {
                 )
             }
         };
-        let global_capacity = self.controller.ensure_capacity(global_required);
-        let principal_capacity = if global_capacity == ObjectCacheCapacity::Disabled {
-            ObjectCacheCapacity::Disabled
-        } else {
-            self.principal_budget
-                .ensure_capacity(principal, principal_required)
-        };
+        let capacity = self.reserve_capacity(principal, global_required, principal_required);
         let mut state = self.state.lock();
-        let global_capacity = global_capacity.min(self.controller.capacity());
-        let principal_capacity = principal_capacity.min(self.principal_budget.capacity(principal));
+        let global_capacity = capacity.global.min(self.controller.capacity());
+        let principal_capacity = capacity
+            .principal
+            .min(self.principal_budget.capacity(principal));
         state.trim_global(global_capacity);
         state.trim_principal(principal, principal_capacity);
         let result = 'cache: {
@@ -244,16 +263,12 @@ impl<P: Clone + Ord> ObjectCache<P> {
                     .saturating_add(weight),
             )
         };
-        let global_capacity = self.controller.ensure_capacity(global_required);
-        let principal_capacity = if global_capacity == ObjectCacheCapacity::Disabled {
-            ObjectCacheCapacity::Disabled
-        } else {
-            self.principal_budget
-                .ensure_capacity(principal, principal_required)
-        };
+        let capacity = self.reserve_capacity(principal, global_required, principal_required);
         let mut state = self.state.lock();
-        let global_capacity = global_capacity.min(self.controller.capacity());
-        let principal_capacity = principal_capacity.min(self.principal_budget.capacity(principal));
+        let global_capacity = capacity.global.min(self.controller.capacity());
+        let principal_capacity = capacity
+            .principal
+            .min(self.principal_budget.capacity(principal));
         state.trim_global(global_capacity);
         state.trim_principal(principal, principal_capacity);
         let retained = state.insert_projection(

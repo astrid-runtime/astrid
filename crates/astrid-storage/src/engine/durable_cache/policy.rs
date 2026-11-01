@@ -300,7 +300,9 @@ pub struct ObjectCacheStats {
     pub hits: u64,
     /// Governed reads that required arena access.
     pub misses: u64,
-    /// Reads that bypassed retention because either budget was disabled.
+    /// Read lookups that bypassed retention because policy declined it,
+    /// including absent owners and unavailable cache budgets. An ensuing
+    /// insertion attempt does not count the same read a second time.
     pub bypasses: u64,
     /// Physical records admitted.
     pub insertions: u64,

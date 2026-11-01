@@ -54,6 +54,9 @@ where
     /// the ordinary positional frame read and full validation before the
     /// resulting record can be retained.
     ///
+    /// Cache retention requires a current authoritative root for the principal.
+    /// Reads for an absent owner remain valid without creating a cache account.
+    ///
     /// # Errors
     ///
     /// Returns a recovery error when authoritative reopen cannot complete, or
@@ -152,6 +155,9 @@ where
     /// arena frames are read as one span and each frame retains its complete
     /// checksum, identity, and canonical decode validation.
     ///
+    /// Cache retention requires a current authoritative root for the principal.
+    /// Reads for an absent owner remain valid without creating a cache account.
+    ///
     /// # Errors
     ///
     /// Returns a recovery error when authoritative reopen cannot complete, or
@@ -175,6 +181,9 @@ where
     /// Cache misses are resolved from one index snapshot. Physically adjacent
     /// arena frames are read as one span and each frame retains its complete
     /// checksum, identity, and canonical decode validation.
+    ///
+    /// Cache retention requires a current authoritative root for the principal.
+    /// Reads for an absent owner remain valid without creating a cache account.
     ///
     /// # Errors
     ///
@@ -353,6 +362,7 @@ where
     ///
     /// Returns `false` when policy declines retention. Projection correctness
     /// must not depend on this value remaining resident.
+    /// An absent authoritative principal root also declines retention.
     pub fn retain_projection_cache(
         &self,
         principal: &P,

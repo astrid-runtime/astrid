@@ -4,6 +4,42 @@ use super::super::tests::{open_with_cache, transaction};
 use super::super::{ObjectCacheCapacity, ObjectCacheController};
 
 #[test]
+fn rootless_reads_remain_valid_and_begin_retention_only_after_genesis() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open_with_cache(
+        directory.path(),
+        ObjectCacheController::new(ObjectCacheCapacity::Unbounded),
+    );
+    let (_, peer_transaction) = transaction("peer", None, b"immutable shared object");
+    let peer = engine.commit(peer_transaction).unwrap().root();
+    let owner = "not-yet-rooted".to_owned();
+    let expected = engine.object(peer.commit).unwrap().unwrap();
+    assert_eq!(
+        engine.object_for(&owner, peer.commit).unwrap(),
+        Some(expected.clone())
+    );
+    assert_eq!(
+        engine.objects_for(&owner, &[peer.commit]).unwrap(),
+        vec![Some(expected)]
+    );
+    assert_eq!(engine.object_cache_principal_charge(&owner), 0);
+    assert_eq!(engine.object_cache_stats().bypasses, 2);
+    let (_, genesis) = transaction(&owner, None, b"live owner");
+    engine.commit(genesis).unwrap();
+    let first = engine
+        .shared_object_for(&owner, peer.commit)
+        .unwrap()
+        .unwrap();
+    let second = engine
+        .shared_object_for(&owner, peer.commit)
+        .unwrap()
+        .unwrap();
+    assert!(std::sync::Arc::ptr_eq(&first, &second));
+    assert!(engine.object_cache_principal_charge(&owner) > 0);
+    engine.close().unwrap();
+}
+
+#[test]
 fn decoded_read_completed_after_root_removal_remains_uncached() {
     let directory = tempfile::tempdir().unwrap();
     let engine = open_with_cache(
