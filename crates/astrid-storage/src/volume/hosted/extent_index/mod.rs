@@ -18,3 +18,6 @@ pub(super) const INDEX_PAGE_RECORD_BYTES: u64 = (super::RECORD_FIXED_BYTES as u6
 
 #[cfg(test)]
 mod integration_tests;
+
+#[cfg(test)]
+mod test_support;

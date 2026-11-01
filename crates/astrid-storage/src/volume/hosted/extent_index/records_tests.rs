@@ -1,6 +1,7 @@
 use std::io::{Seek, SeekFrom, Write};
 
 use super::super::codec::IndexedExtent;
+use super::super::test_support::container_bytes;
 use super::*;
 use crate::volume::AstridVolume;
 
@@ -178,7 +179,7 @@ fn recovery_discards_complete_and_torn_unpublished_page_records() {
         } else {
             "complete.volume"
         });
-        std::fs::copy(&volume.path, &copy).unwrap();
+        std::fs::write(&copy, container_bytes(&state.file)).unwrap();
         if torn {
             std::fs::OpenOptions::new()
                 .write(true)
