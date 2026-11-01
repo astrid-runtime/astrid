@@ -50,9 +50,10 @@ where
     /// Return one immutable object through the principal-accounted decoded
     /// cache.
     ///
-    /// Cache policy never changes read correctness. A bypass or miss performs
-    /// the ordinary positional frame read and full validation before the
-    /// resulting record can be retained.
+    /// Cache policy never changes read correctness. A retention bypass may
+    /// reuse an already validated shared record without acquiring ownership.
+    /// When no validated record is cached, reads use the ordinary pending-WAL
+    /// or positional arena path with full validation before retention.
     ///
     /// Cache retention requires a current authoritative root for the principal.
     /// Reads for an absent owner remain valid without creating a cache account.
@@ -77,9 +78,10 @@ where
     /// before its first root or through a lease after retirement remain valid,
     /// but cannot create a cache account for an absent owner.
     ///
-    /// Cache policy never changes read correctness. A bypass or miss performs
-    /// the ordinary positional frame read and full validation before the
-    /// resulting record can be retained.
+    /// Cache policy never changes read correctness. A retention bypass may
+    /// reuse an already validated shared record without acquiring ownership.
+    /// When no validated record is cached, reads use the ordinary pending-WAL
+    /// or positional arena path with full validation before retention.
     ///
     /// # Errors
     ///

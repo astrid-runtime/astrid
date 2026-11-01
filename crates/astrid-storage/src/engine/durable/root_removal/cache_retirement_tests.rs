@@ -24,6 +24,20 @@ fn rootless_reads_remain_valid_and_begin_retention_only_after_genesis() {
     );
     assert_eq!(engine.object_cache_principal_charge(&owner), 0);
     assert_eq!(engine.object_cache_stats().bypasses, 2);
+    let peer_record = engine
+        .shared_object_for(&"peer".to_owned(), peer.commit)
+        .unwrap()
+        .unwrap();
+    let before = engine.object_cache_stats();
+    let rootless_record = engine
+        .shared_object_for(&owner, peer.commit)
+        .unwrap()
+        .unwrap();
+    assert!(std::sync::Arc::ptr_eq(&peer_record, &rootless_record));
+    let after = engine.object_cache_stats();
+    assert_eq!(after.bypasses, before.bypasses + 1);
+    assert_eq!(after.misses, before.misses);
+    assert_eq!(engine.object_cache_principal_charge(&owner), 0);
     let (_, genesis) = transaction(&owner, None, b"live owner");
     engine.commit(genesis).unwrap();
     let first = engine
