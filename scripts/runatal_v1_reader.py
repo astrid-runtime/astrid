@@ -21,6 +21,7 @@ from runatal_v1_sha384 import verify_cross_hash_attestations
 from runatal_v1_sketch import verify_bottom_k_sketches
 from runatal_v1_specs import (
     FORMAT_SPECIFICATION, CONTENT_CATALOG_SPECIFICATION, LEGACY_FORMAT_SPECIFICATIONS,
+    DIRECT_CATALOGUE_FORMAT_SPECIFICATIONS,
 )
 from runatal_v1_volume import RegionPath, VolumeFormatError, recover_volume
 
@@ -844,7 +845,7 @@ def recover(store, include_payloads):
             raise FormatError(str(error)) from error
         supported = {
             identity_text(identifier): identifier
-            for identifier in LEGACY_FORMAT_SPECIFICATIONS | {FORMAT_SPECIFICATION}
+            for identifier in DIRECT_CATALOGUE_FORMAT_SPECIFICATIONS
         }
         specification = supported.get(physical["frozen_specification"])
         if specification is None:

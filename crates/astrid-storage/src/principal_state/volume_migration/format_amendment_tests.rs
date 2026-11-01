@@ -62,6 +62,38 @@ fn independently_read_value(home: &AstridHome, key: &str) -> Vec<u8> {
     hex::decode(entry["value_hex"].as_str().unwrap()).unwrap()
 }
 
+#[test]
+fn independent_reader_direct_profile_grants_match_runtime() {
+    use crate::storage_model::ObjectIdentity as _;
+    use std::collections::BTreeSet;
+
+    let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts");
+    let output = std::process::Command::new("python3")
+        .current_dir(scripts)
+        .args([
+            "-c",
+            "from runatal_v1_specs import DIRECT_CATALOGUE_FORMAT_SPECIFICATIONS; \
+             print('\\n'.join(sorted(item[2].hex() for item in \
+             DIRECT_CATALOGUE_FORMAT_SPECIFICATIONS)))",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let actual: BTreeSet<_> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let current = Blake3ObjectIdentityV1.identify(&bootstrap::format_specification().unwrap());
+    let expected: BTreeSet<_> =
+        crate::principal_state::format_amendment::DIRECT_CATALOGUE_PREDECESSORS
+            .iter()
+            .chain(std::iter::once(&current))
+            .map(|id| hex::encode(id.as_bytes()))
+            .collect();
+    assert_eq!(actual, expected);
+}
+
 #[tokio::test]
 async fn independent_reader_accepts_prior_volume_before_and_after_chunked_amendment() {
     let directory = tempfile::tempdir().unwrap();

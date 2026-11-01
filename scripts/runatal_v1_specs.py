@@ -31,3 +31,16 @@ LEGACY_FORMAT_SPECIFICATIONS = {
         "58726b3c243c30ebc0941f656427520094a6bb10e7b2190be732b5a61300144d",
     )
 }
+
+# Only post-dense amendments preserve the direct-canonical recipe. Historical
+# bootstrap exclusion above is broader and must not grant profile authority.
+DIRECT_CATALOGUE_FORMAT_SPECIFICATIONS = {FORMAT_SPECIFICATION} | {
+    (1, 1, bytes.fromhex(digest))
+    for digest in (
+        "900d1eface3294bc9e47369c0fcb64dca56ff334dfbc1288f349090e10c09e6f",
+        "9d701dc87360e634b25b7b7f5d5e79315f9f27bcf4d50e09c2181e439b0c7d75",
+        "f9b17fa5e6b4ac4562c7e4ab2da1f0c756da07945d808794ad75544a132b0d91",
+        "58726b3c243c30ebc0941f656427520094a6bb10e7b2190be732b5a61300144d",
+        "ac3e1ab1e82be24dae7cdef949698dd54d2407bc7f39fb30709dc36677eea61d",
+    )
+}
