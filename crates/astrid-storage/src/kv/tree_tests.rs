@@ -66,7 +66,7 @@ impl PersistentObjectIdentity for TestIdentity {
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Copy, Debug)]
-struct Utf8Codec;
+pub(super) struct Utf8Codec;
 
 #[cfg(not(target_family = "wasm"))]
 impl PrincipalCodec<String> for Utf8Codec {

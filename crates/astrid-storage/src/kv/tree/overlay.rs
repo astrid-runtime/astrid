@@ -13,21 +13,28 @@ pub(super) struct OverlayMap {
 
 #[derive(Debug)]
 struct Node {
-    key: Vec<u8>,
-    value: Option<Vec<u8>>,
+    entry: Arc<Entry>,
     left: Option<Arc<Self>>,
     right: Option<Arc<Self>>,
     height: u32,
+}
+
+// Search-path copies and rotations share immutable payloads as well as links.
+// A replacement gets a new entry, leaving earlier projections unchanged.
+#[derive(Debug)]
+struct Entry {
+    key: Vec<u8>,
+    value: Option<Vec<u8>>,
 }
 
 impl OverlayMap {
     pub(super) fn get(&self, key: &[u8]) -> Option<&Option<Vec<u8>>> {
         let mut cursor = self.root.as_deref();
         while let Some(node) = cursor {
-            match key.cmp(node.key.as_slice()) {
+            match key.cmp(node.entry.key.as_slice()) {
                 Ordering::Less => cursor = node.left.as_deref(),
                 Ordering::Greater => cursor = node.right.as_deref(),
-                Ordering::Equal => return Some(&node.value),
+                Ordering::Equal => return Some(&node.entry.value),
             }
         }
         None
@@ -55,41 +62,37 @@ fn collect_all(node: Option<&Node>, entries: &mut Vec<(Vec<u8>, Option<Vec<u8>>)
         return;
     };
     collect_all(node.left.as_deref(), entries);
-    entries.push((node.key.clone(), node.value.clone()));
+    entries.push((node.entry.key.clone(), node.entry.value.clone()));
     collect_all(node.right.as_deref(), entries);
 }
 
 fn insert(root: Option<Arc<Node>>, key: Vec<u8>, value: Option<Vec<u8>>) -> Arc<Node> {
     let Some(node) = root else {
-        return make_node(key, value, None, None);
+        return make_node(Arc::new(Entry { key, value }), None, None);
     };
-    let rebuilt = match key.as_slice().cmp(node.key.as_slice()) {
+    let rebuilt = match key.as_slice().cmp(node.entry.key.as_slice()) {
         Ordering::Less => make_node(
-            node.key.clone(),
-            node.value.clone(),
+            Arc::clone(&node.entry),
             Some(insert(node.left.clone(), key, value)),
             node.right.clone(),
         ),
         Ordering::Greater => make_node(
-            node.key.clone(),
-            node.value.clone(),
+            Arc::clone(&node.entry),
             node.left.clone(),
             Some(insert(node.right.clone(), key, value)),
         ),
-        Ordering::Equal => make_node(key, value, node.left.clone(), node.right.clone()),
+        Ordering::Equal => make_node(
+            Arc::new(Entry { key, value }),
+            node.left.clone(),
+            node.right.clone(),
+        ),
     };
     rebalance(rebuilt)
 }
 
-fn make_node(
-    key: Vec<u8>,
-    value: Option<Vec<u8>>,
-    left: Option<Arc<Node>>,
-    right: Option<Arc<Node>>,
-) -> Arc<Node> {
+fn make_node(entry: Arc<Entry>, left: Option<Arc<Node>>, right: Option<Arc<Node>>) -> Arc<Node> {
     Arc::new(Node {
-        key,
-        value,
+        entry,
         height: height(left.as_ref())
             .max(height(right.as_ref()))
             .saturating_add(1),
@@ -107,8 +110,7 @@ fn rebalance(node: Arc<Node>) -> Arc<Node> {
         };
         let node = if height(left.left.as_ref()) < height(left.right.as_ref()) {
             make_node(
-                node.key.clone(),
-                node.value.clone(),
+                Arc::clone(&node.entry),
                 Some(rotate_left(left)),
                 node.right.clone(),
             )
@@ -123,8 +125,7 @@ fn rebalance(node: Arc<Node>) -> Arc<Node> {
         };
         let node = if height(right.right.as_ref()) < height(right.left.as_ref()) {
             make_node(
-                node.key.clone(),
-                node.value.clone(),
+                Arc::clone(&node.entry),
                 node.left.clone(),
                 Some(rotate_right(right)),
             )
@@ -141,17 +142,11 @@ fn rotate_left(node: &Arc<Node>) -> Arc<Node> {
         return Arc::clone(node);
     };
     let left = make_node(
-        node.key.clone(),
-        node.value.clone(),
+        Arc::clone(&node.entry),
         node.left.clone(),
         right.left.clone(),
     );
-    make_node(
-        right.key.clone(),
-        right.value.clone(),
-        Some(left),
-        right.right.clone(),
-    )
+    make_node(Arc::clone(&right.entry), Some(left), right.right.clone())
 }
 
 fn rotate_right(node: &Arc<Node>) -> Arc<Node> {
@@ -159,17 +154,11 @@ fn rotate_right(node: &Arc<Node>) -> Arc<Node> {
         return Arc::clone(node);
     };
     let right = make_node(
-        node.key.clone(),
-        node.value.clone(),
+        Arc::clone(&node.entry),
         left.right.clone(),
         node.right.clone(),
     );
-    make_node(
-        left.key.clone(),
-        left.value.clone(),
-        left.left.clone(),
-        Some(right),
-    )
+    make_node(Arc::clone(&left.entry), left.left.clone(), Some(right))
 }
 
 fn height(node: Option<&Arc<Node>>) -> u32 {
@@ -185,13 +174,13 @@ fn collect_range(
     let Some(node) = node else {
         return;
     };
-    if node.key.as_slice() >= start {
+    if node.entry.key.as_slice() >= start {
         collect_range(node.left.as_deref(), start, end, entries);
     }
-    if node.key.as_slice() >= start && node.key.as_slice() < end {
-        entries.push((node.key.clone(), node.value.clone()));
+    if node.entry.key.as_slice() >= start && node.entry.key.as_slice() < end {
+        entries.push((node.entry.key.clone(), node.entry.value.clone()));
     }
-    if node.key.as_slice() < end {
+    if node.entry.key.as_slice() < end {
         collect_range(node.right.as_deref(), start, end, entries);
     }
 }
@@ -201,6 +190,27 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::OverlayMap;
+
+    #[test]
+    fn path_copy_and_rotations_share_unchanged_value_allocations() {
+        for keys in [b"abc", b"acb", b"cba", b"cab"] {
+            let mut overlay = OverlayMap::default();
+            for key in &keys[..2] {
+                overlay.insert(vec![*key], Some(vec![*key; 512 * 1024]));
+            }
+            // Keep the original buffers alive; allocator reuse cannot make a
+            // copied replacement appear to share the original allocation.
+            let prior = overlay.clone();
+            overlay.insert(vec![keys[2]], Some(vec![keys[2]; 512 * 1024]));
+            for key in &keys[..2] {
+                let old = prior.get(&[*key]).unwrap().as_ref().unwrap();
+                let current = overlay.get(&[*key]).unwrap().as_ref().unwrap();
+                assert_eq!(old, current);
+                assert_eq!(old.as_ptr(), current.as_ptr(), "unchanged key {key}");
+            }
+            assert!(prior.get(&[keys[2]]).is_none());
+        }
+    }
 
     #[test]
     fn persistent_overlay_matches_an_ordered_map_under_replacement() {
