@@ -28,6 +28,8 @@ thread_local! {
     static RECOVERY_ARENA_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+mod frame_checksum_context_tests;
 mod indexed;
 mod prepared;
 mod reader;
@@ -155,7 +157,7 @@ pub(super) fn verify_indexed_tail<F: DurableIo>(
     Ok(())
 }
 
-fn read_frame_at<F: DurableIo>(
+pub(super) fn read_frame_at<F: DurableIo>(
     file: &F,
     file_name: &'static str,
     magic: [u8; 8],
@@ -274,7 +276,7 @@ pub(super) fn recover_arena<I: PersistentObjectIdentity, F: DurableIo>(
         ARENA_MAGIC,
         limits,
         protected_len,
-        |offset, payload| {
+        |offset, payload, _source| {
             let (id, record) = decode_object_frame(payload, scheme)
                 .map_err(|detail| corrupt(ARENA_FILE, offset, detail))?;
             let computed = identity.identify(&record);
@@ -331,9 +333,67 @@ pub(super) fn scan_frames<F: DurableIo>(
     file_name: &'static str,
     magic: [u8; 8],
     limits: RecoveryLimits,
-    accept: impl FnMut(u64, &[u8]) -> Result<(), DurableError>,
+    mut accept: impl FnMut(u64, &[u8]) -> Result<(), DurableError>,
 ) -> Result<(), DurableError> {
-    scan_frames_with_protected_prefix(file, file_name, magic, limits, 0, accept)
+    scan_frames_with_source(
+        file,
+        file_name,
+        magic,
+        limits,
+        |offset, payload, _source| accept(offset, payload),
+    )
+}
+
+/// The callback can reload earlier validated frames without disturbing
+/// sequential read-ahead, including providers whose positional reads seek.
+pub(super) fn scan_frames_with_source<F: DurableIo>(
+    file: &mut F,
+    file_name: &'static str,
+    magic: [u8; 8],
+    limits: RecoveryLimits,
+    mut accept: impl FnMut(
+        u64,
+        &[u8],
+        &mut dyn FnMut(u64) -> Result<Vec<u8>, DurableError>,
+    ) -> Result<(), DurableError>,
+) -> Result<(), DurableError> {
+    scan_frames_with_protected_prefix(
+        file,
+        file_name,
+        magic,
+        limits,
+        0,
+        |offset, payload, source| {
+            accept(offset, payload, &mut |position| {
+                read_frame_preserving_cursor(source, file_name, magic, position, limits)
+            })
+        },
+    )
+}
+
+fn read_frame_preserving_cursor<F: DurableIo>(
+    source: &mut F,
+    file_name: &'static str,
+    magic: [u8; 8],
+    offset: u64,
+    limits: RecoveryLimits,
+) -> Result<Vec<u8>, DurableError> {
+    let position = if source.durable_read_at_preserves_cursor() {
+        None
+    } else {
+        Some(
+            source
+                .stream_position()
+                .map_err(|error| io_error("save durable scan read-ahead position", error))?,
+        )
+    };
+    let payload = read_frame_at(source, file_name, magic, offset, limits)?;
+    if let Some(position) = position {
+        source
+            .seek(SeekFrom::Start(position))
+            .map_err(|error| io_error("restore durable scan read-ahead position", error))?;
+    }
+    Ok(payload)
 }
 
 fn scan_frames_with_protected_prefix<F: DurableIo>(
@@ -342,7 +402,7 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
     magic: [u8; 8],
     limits: RecoveryLimits,
     protected_len: u64,
-    mut accept: impl FnMut(u64, &[u8]) -> Result<(), DurableError>,
+    mut accept: impl FnMut(u64, &[u8], &mut F) -> Result<(), DurableError>,
 ) -> Result<(), DurableError> {
     let file_len = validated_file_len(file, file_name, protected_len)?;
     let policy = FrameScanPolicy {
@@ -357,6 +417,8 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
     // and issuing separate media reads for every header and small payload.
     let mut reader = std::io::BufReader::new(file);
     let mut offset = 0_u64;
+    // Reused for the whole scan; largest accepted frame is retained until return.
+    let mut payload = Vec::new();
     while offset < file_len {
         let remaining = file_len
             .checked_sub(offset)
@@ -427,7 +489,7 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
             truncate_tail(*reader.get_mut(), offset)?;
             break;
         }
-        let payload = read_frame_payload(&mut reader, payload_len)?;
+        read_frame_payload(&mut reader, payload_len, &mut payload)?;
         if frame_checksum(magic, payload_len, &payload) != decoded.checksum {
             truncate_unpublished_tail_or_fail(
                 *reader.get_mut(),
@@ -438,7 +500,7 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
             )?;
             break;
         }
-        accept(offset, &payload)?;
+        accept(offset, &payload, *reader.get_mut())?;
         offset = frame_end;
     }
     // Tail repair above is terminal: discard any read-ahead before exposing
@@ -513,16 +575,17 @@ fn decode_frame_header(
 fn read_frame_payload<F: std::io::Read>(
     file: &mut F,
     payload_len: u64,
-) -> Result<Vec<u8>, DurableError> {
+    payload: &mut Vec<u8>,
+) -> Result<(), DurableError> {
     let payload_usize = usize::try_from(payload_len).map_err(|_| DurableError::EncodingOverflow)?;
-    let mut payload = Vec::new();
+    payload.clear();
     payload
         .try_reserve_exact(payload_usize)
         .map_err(|_| DurableError::EncodingOverflow)?;
     payload.resize(payload_usize, 0);
-    file.read_exact(&mut payload)
+    file.read_exact(payload)
         .map_err(|source| io_error("read durable frame payload", source))?;
-    Ok(payload)
+    Ok(())
 }
 
 fn truncate_unpublished_tail_or_fail<F: DurableIo>(
@@ -639,10 +702,7 @@ fn physical_frame_is_valid<F: DurableIo>(
     let expected: [u8; 32] = header[CHECKSUM_START..]
         .try_into()
         .map_err(|_| DurableError::EncodingOverflow)?;
-    let mut hasher = blake3::Hasher::new_derive_key("astrid durable physical frame checksum v1");
-    hasher.update(&magic);
-    hasher.update(&FRAME_VERSION.to_le_bytes());
-    hasher.update(&payload_len.to_le_bytes());
+    let mut hasher = frame_checksum_hasher(magic, payload_len);
     let mut unread = payload_len;
     let mut buffer = Vec::new();
     buffer
@@ -737,6 +797,27 @@ pub(super) fn append_frames<T: AsRef<[u8]>, F: DurableIo>(
     Ok(locations)
 }
 
+// Exact on-disk domain. This phrase has no terminal NUL; changing it would
+// invalidate every stored physical frame checksum.
+const FRAME_CHECKSUM_DOMAIN: &str = "astrid durable physical frame checksum v1";
+
+fn new_frame_checksum_context() -> blake3::Hasher {
+    #[cfg(test)]
+    FRAME_CHECKSUM_CONTEXT_INITIALIZATIONS.with(|count| count.set(count.get().strict_add(1)));
+    blake3::Hasher::new_derive_key(FRAME_CHECKSUM_DOMAIN)
+}
+
+// Clone the initialized derive-key hasher, retaining BLAKE3's material-mode
+// flags. Feeding a derived key to new_keyed would change the checksum domain.
+static FRAME_CHECKSUM_CONTEXT: std::sync::LazyLock<blake3::Hasher> =
+    std::sync::LazyLock::new(new_frame_checksum_context);
+
+#[cfg(test)]
+std::thread_local! {
+    static FRAME_CHECKSUM_CONTEXT_INITIALIZATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 pub(super) fn frame_checksum(magic: [u8; 8], payload_len: u64, payload: &[u8]) -> [u8; 32] {
     let mut hasher = frame_checksum_hasher(magic, payload_len);
     hasher.update(payload);
@@ -744,7 +825,7 @@ pub(super) fn frame_checksum(magic: [u8; 8], payload_len: u64, payload: &[u8]) -
 }
 
 pub(super) fn frame_checksum_hasher(magic: [u8; 8], payload_len: u64) -> blake3::Hasher {
-    let mut hasher = blake3::Hasher::new_derive_key("astrid durable physical frame checksum v1");
+    let mut hasher = (*FRAME_CHECKSUM_CONTEXT).clone();
     hasher.update(&magic);
     hasher.update(&FRAME_VERSION.to_le_bytes());
     hasher.update(&payload_len.to_le_bytes());

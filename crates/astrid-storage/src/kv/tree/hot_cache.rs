@@ -10,6 +10,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use imbl::{HashMap as PersistentHashMap, Vector};
 use parking_lot::Mutex;
 
 use crate::storage_model::RootState;
@@ -217,10 +218,26 @@ pub(super) enum HotRead {
     Miss,
 }
 
-#[derive(Clone)]
+#[cfg_attr(not(test), derive(Clone))]
 enum CachedValue {
     Present(Arc<[u8]>),
     Missing,
+}
+
+#[cfg(test)]
+thread_local! {
+    static COPIED_CACHE_VALUES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+impl Clone for CachedValue {
+    fn clone(&self) -> Self {
+        COPIED_CACHE_VALUES.with(|copies| copies.set(copies.get().strict_add(1)));
+        match self {
+            Self::Present(value) => Self::Present(Arc::clone(value)),
+            Self::Missing => Self::Missing,
+        }
+    }
 }
 
 impl CachedValue {
@@ -241,8 +258,8 @@ impl CachedValue {
 
 struct OwnerSnapshot {
     root: Option<RootState>,
-    entries: BTreeMap<Vec<u8>, CachedValue>,
-    insertion_order: VecDeque<Vec<u8>>,
+    entries: PersistentHashMap<Vec<u8>, CachedValue>,
+    insertion_order: Vector<Vec<u8>>,
     resident_bytes: usize,
 }
 
@@ -250,15 +267,15 @@ impl OwnerSnapshot {
     fn empty(root: Option<RootState>) -> Self {
         Self {
             root,
-            entries: BTreeMap::new(),
-            insertion_order: VecDeque::new(),
+            entries: PersistentHashMap::new(),
+            insertion_order: Vector::new(),
             resident_bytes: 0,
         }
     }
 
     fn entry_bytes(key: &[u8], value: &CachedValue) -> usize {
         ENTRY_ACCOUNTING_BYTES
-            // The ordered map and FIFO each own one key allocation.
+            // The entry map and FIFO each own one key allocation.
             .saturating_add(key.len().saturating_mul(2))
             .saturating_add(value.bytes())
     }
@@ -397,10 +414,16 @@ where
         if snapshot.root != root {
             return HotRead::Miss;
         }
-        snapshot
-            .entries
-            .get(key)
-            .map_or(HotRead::Miss, |value| HotRead::Hit(value.to_vec()))
+        let value = if snapshot.entries.len() == 1 {
+            snapshot
+                .entries
+                .iter()
+                .next()
+                .and_then(|(entry_key, value)| (entry_key.as_slice() == key).then_some(value))
+        } else {
+            snapshot.entries.get(key)
+        };
+        value.map_or(HotRead::Miss, |value| HotRead::Hit(value.to_vec()))
     }
 
     pub(super) fn insert(
@@ -689,6 +712,152 @@ mod tests {
             cache.get(&"alice", Some(root(1)), b"key"),
             HotRead::Miss
         ));
+    }
+
+    #[test]
+    fn same_root_admission_shares_entries_with_retained_readers() {
+        const ENTRIES: usize = 512;
+        let cache = KvHotCache::with_limits(1_000_000, 1_000_000, 1, ENTRIES + 1);
+        for index in 0..ENTRIES {
+            cache.insert(
+                &"alice",
+                Some(root(1)),
+                format!("key-{index:04}").into_bytes(),
+                Some(b"value"),
+            );
+        }
+        // Hold a real reader snapshot: an optimization that only works when
+        // the old entry set is exclusively owned does not repair cold scans.
+        let previous = cache
+            .owners
+            .load()
+            .get(&"alice")
+            .unwrap()
+            .snapshot
+            .load_full();
+        COPIED_CACHE_VALUES.with(|copies| copies.set(0));
+        cache.insert(&"alice", Some(root(1)), b"new".to_vec(), Some(b"new-value"));
+        let copied = COPIED_CACHE_VALUES.with(std::cell::Cell::get);
+
+        assert_eq!(previous.entries.len(), ENTRIES);
+        assert!(!previous.entries.contains_key(b"new".as_slice()));
+        for index in 0..ENTRIES {
+            assert!(matches!(
+                cache.get(&"alice", Some(root(1)), format!("key-{index:04}").as_bytes()),
+                HotRead::Hit(Some(value)) if value == b"value"
+            ));
+        }
+        assert!(matches!(
+            cache.get(&"alice", Some(root(1)), b"new"),
+            HotRead::Hit(Some(value)) if value == b"new-value"
+        ));
+        assert!(
+            copied < ENTRIES,
+            "admitting one key copied {copied} values from the {ENTRIES}-entry reader snapshot"
+        );
+        COPIED_CACHE_VALUES.with(|copies| copies.set(0));
+        cache.insert(
+            &"alice",
+            Some(root(1)),
+            b"key-0000".to_vec(),
+            Some(b"replacement"),
+        );
+        assert!(COPIED_CACHE_VALUES.with(std::cell::Cell::get) < ENTRIES);
+        assert_eq!(
+            previous
+                .entries
+                .get(b"key-0000".as_slice())
+                .unwrap()
+                .to_vec(),
+            Some(b"value".to_vec())
+        );
+        assert!(
+            matches!(cache.get(&"alice", Some(root(1)), b"key-0000"), HotRead::Hit(Some(value)) if value == b"replacement")
+        );
+    }
+
+    #[test]
+    fn replacing_an_entry_preserves_retained_snapshot_and_fifo_order() {
+        let cache = KvHotCache::with_limits(1_000_000, 1_000_000, 1, 3);
+        for key in [b"a", b"b", b"c"] {
+            cache.insert(&"alice", Some(root(1)), key.to_vec(), Some(b"old"));
+        }
+        let previous = cache
+            .owners
+            .load()
+            .get(&"alice")
+            .unwrap()
+            .snapshot
+            .load_full();
+        cache.insert(&"alice", Some(root(1)), b"b".to_vec(), Some(b"new"));
+        assert_eq!(
+            previous.entries.get(b"b".as_slice()).unwrap().to_vec(),
+            Some(b"old".to_vec())
+        );
+        for key in [b"d", b"e"] {
+            cache.insert(&"alice", Some(root(1)), key.to_vec(), Some(b"later"));
+        }
+        for key in [b"a", b"c"] {
+            assert!(matches!(
+                cache.get(&"alice", Some(root(1)), key),
+                HotRead::Miss
+            ));
+        }
+        assert!(
+            matches!(cache.get(&"alice", Some(root(1)), b"b"), HotRead::Hit(Some(value)) if value == b"new")
+        );
+        for key in [b"d", b"e"] {
+            assert!(
+                matches!(cache.get(&"alice", Some(root(1)), key), HotRead::Hit(Some(value)) if value == b"later")
+            );
+        }
+    }
+
+    #[test]
+    fn retained_reader_survives_root_publication_and_owner_retirement() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+
+        let cache = KvHotCache::with_limits(1_000_000, 1_000_000, 1, 3);
+        cache.insert(&"alice", Some(root(1)), b"key".to_vec(), Some(b"old"));
+        let (ready_tx, ready_rx) = channel();
+        let (phase_tx, phase_rx) = channel();
+        let (observed_tx, observed_rx) = channel();
+        std::thread::scope(|scope| {
+            let reader_cache = &cache;
+            let reader = scope.spawn(move || {
+                let previous = reader_cache
+                    .owners
+                    .load()
+                    .get(&"alice")
+                    .unwrap()
+                    .snapshot
+                    .load_full();
+                ready_tx.send(()).unwrap();
+                phase_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let old_value = previous.entries.get(b"key".as_slice()).unwrap().to_vec();
+                let current = reader_cache.get(&"alice", Some(root(2)), b"key");
+                observed_tx.send((old_value, current)).unwrap();
+                phase_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                (
+                    previous.entries.get(b"key".as_slice()).unwrap().to_vec(),
+                    reader_cache.get(&"alice", Some(root(1)), b"key"),
+                    reader_cache.get(&"alice", Some(root(2)), b"key"),
+                )
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            cache.insert(&"alice", Some(root(2)), b"key".to_vec(), Some(b"new"));
+            phase_tx.send(()).unwrap();
+            let published = observed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            cache.remove_owner(&"alice");
+            phase_tx.send(()).unwrap();
+            let retired = reader.join().unwrap();
+            assert_eq!(published.0, Some(b"old".to_vec()));
+            assert!(matches!(published.1, HotRead::Hit(Some(value)) if value == b"new"));
+            assert_eq!(retired.0, Some(b"old".to_vec()));
+            assert!(matches!(retired.1, HotRead::Miss));
+            assert!(matches!(retired.2, HotRead::Miss));
+        });
     }
 
     #[test]

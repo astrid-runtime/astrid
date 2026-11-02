@@ -28,6 +28,7 @@ chrono = { workspace = true, features = ["clock"] }
 fastcdc = { workspace = true }
 fastcdc-v4 = { workspace = true }
 hex = { workspace = true }
+imbl = { workspace = true }
 lz4_flex = { workspace = true }
 keyring = { workspace = true, optional = true }
 parking_lot = { workspace = true }

@@ -1,8 +1,9 @@
 //! Frozen binary Patricia-map construction retained for format-one recovery.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
+use super::occupancy::{Occupancy, occupy_node};
 use super::{
     PhysicalIdentity, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode, PhysicalMapNodeId,
     PhysicalModelError, SEARCH_KEY_BITS,
@@ -12,6 +13,7 @@ pub(super) fn insert<I: PhysicalIdentity>(
     identity: &I,
     domain: PhysicalMapDomain,
     nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    pending: Option<&mut BTreeSet<PhysicalMapNodeId>>,
     root: PhysicalMapNodeId,
     key: PhysicalMapKey,
     value: Vec<u8>,
@@ -20,6 +22,7 @@ pub(super) fn insert<I: PhysicalIdentity>(
         identity,
         domain,
         nodes,
+        pending,
     }
     .insert_at(root, key, value)
 }
@@ -84,6 +87,7 @@ struct Insertion<'a, I> {
     identity: &'a I,
     domain: PhysicalMapDomain,
     nodes: &'a mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    pending: Option<&'a mut BTreeSet<PhysicalMapNodeId>>,
 }
 
 impl<I: PhysicalIdentity> Insertion<'_, I> {
@@ -246,9 +250,14 @@ impl<I: PhysicalIdentity> Insertion<'_, I> {
         &mut self,
         node: PhysicalMapNode,
     ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
-        let id = node.identify(self.identity)?;
-        self.nodes.entry(id).or_insert(node);
-        Ok(id)
+        occupy_node(
+            self.identity,
+            Occupancy {
+                nodes: self.nodes,
+                pending: self.pending.as_deref_mut(),
+            },
+            node,
+        )
     }
 }
 

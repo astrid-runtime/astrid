@@ -108,6 +108,9 @@ fn evidence_envelope_binds_the_complete_payload() {
     let revision = provenance.revision().to_owned();
     let mut report = Report::new(config(), provenance);
     report.record_bytes("bytes", 1, vec![Duration::from_nanos(1)]);
+    report
+        .record_resource_peak("astrid_recovery_rss_bytes_before_container", vec![4096])
+        .expect("resource peak samples");
     let payload_json = serde_json::to_string(&report).expect("report payload serializes");
     let expected = hex::encode(Sha256::digest(payload_json.as_bytes()));
 
@@ -129,4 +132,32 @@ fn evidence_envelope_binds_the_complete_payload() {
         envelope["payload"]
     );
     assert_eq!(envelope["payload"]["provenance"]["git_revision"], revision);
+}
+
+#[test]
+fn report_serializes_sorted_resource_peak_samples() {
+    let mut report = Report::new(config(), provenance());
+    report
+        .record_resource_peak(
+            "astrid_recovery_rss_bytes_after_engine_open",
+            vec![30, 10, 20],
+        )
+        .expect("resource peak samples");
+
+    let encoded = serde_json::to_value(report).expect("report serializes");
+    let peak = &encoded["resource_peaks"][0];
+    assert_eq!(peak["name"], "astrid_recovery_rss_bytes_after_engine_open");
+    assert_eq!(peak["samples_bytes"], serde_json::json!([10, 20, 30]));
+    assert_eq!(peak["minimum_bytes"], 10);
+    assert_eq!(peak["median_bytes"], 20);
+    assert_eq!(peak["maximum_bytes"], 30);
+}
+
+#[test]
+fn resource_peak_rejects_empty_samples() {
+    let mut report = Report::new(config(), provenance());
+    let error = report
+        .record_resource_peak("astrid_recovery_rss_bytes_before_container", Vec::new())
+        .expect_err("empty samples");
+    assert!(error.contains("no samples"), "{error}");
 }

@@ -18,16 +18,27 @@ fn recovery_memo_never_remembers_an_incomplete_closure() {
     .unwrap();
     let root = map.root().unwrap();
     assert!(map.nodes().len() > 1);
-    let partial = BTreeMap::from([(root, map.nodes()[&root].clone())]);
-    let mut complete = BTreeSet::new();
-    assert!(!map_closure_complete(Some(root), &partial, &mut complete));
-    assert!(complete.is_empty());
-    assert!(!map_closure_complete(Some(root), &partial, &mut complete));
-    assert!(map_closure_complete(Some(root), map.nodes(), &mut complete));
+    let mut partial = MetadataIndex::default();
+    partial
+        .insert(MetadataFrame::map_node(&Blake3PhysicalIdentity, &map.nodes()[&root]).unwrap())
+        .unwrap();
+    let mut incomplete = partial.nodes.closure_checker();
+    assert!(!incomplete.complete(Some(root)));
+    assert_eq!(incomplete.len(), 0);
+    assert!(!incomplete.complete(Some(root)));
+    assert_eq!(incomplete.len(), 0);
+    let mut metadata = MetadataIndex::default();
+    for node in map.nodes().values() {
+        metadata
+            .insert(MetadataFrame::map_node(&Blake3PhysicalIdentity, node).unwrap())
+            .unwrap();
+    }
+    let mut complete = metadata.nodes.closure_checker();
+    assert!(complete.complete(Some(root)));
     assert_eq!(complete.len(), map.nodes().len());
-    let verified = complete.clone();
-    assert!(map_closure_complete(Some(root), map.nodes(), &mut complete));
-    assert_eq!(complete, verified);
+    let verified = complete.len();
+    assert!(complete.complete(Some(root)));
+    assert_eq!(complete.len(), verified);
     let absent = PhysicalMapKey::new([255; 32]);
     let other = CanonicalPhysicalMap::build_dense(
         &Blake3PhysicalIdentity,
@@ -35,12 +46,8 @@ fn recovery_memo_never_remembers_an_incomplete_closure() {
         vec![(absent, vec![0])],
     )
     .unwrap();
-    assert!(!map_closure_complete(
-        other.root(),
-        map.nodes(),
-        &mut complete
-    ));
-    assert_eq!(complete, verified);
+    assert!(!complete.complete(other.root()));
+    assert_eq!(complete.len(), verified);
 }
 
 fn dense_representation_map() -> CanonicalPhysicalMap {
@@ -139,18 +146,23 @@ fn checkpoint_closure_is_reused_by_the_first_shared_cas() {
         .insert(MetadataFrame::state(&identity, cas_state))
         .unwrap();
     let (checkpoint, current) = later_journal_checkpoint(checkpoint_id, 1);
-    let mut complete = BTreeSet::new();
+    let mut complete = metadata.nodes.closure_checker();
     recover_checkpoint(checkpoint, current, &metadata, &mut complete).unwrap();
     assert_eq!(complete.len(), map.nodes().len());
-    let stolen = map.root().unwrap();
-    metadata.nodes.remove(&stolen);
-    assert!(
-        state_metadata_closure_complete(cas_id, &metadata, &mut complete).unwrap(),
-        "first CAS must reuse checkpoint proofs without walking stolen nodes",
+    let visited = complete.visits();
+    assert!(state_metadata_closure_complete(cas_id, &metadata, &mut complete).unwrap());
+    assert_eq!(
+        complete.visits(),
+        visited,
+        "the first CAS must reuse checkpoint closure proofs"
     );
+    // The immutable borrow prevents a proof surviving metadata mutation.
+    drop(complete);
+    metadata.nodes.take(&map.root().unwrap()).unwrap();
+    let mut changed = metadata.nodes.closure_checker();
     assert!(
-        !state_metadata_closure_complete(cas_id, &metadata, &mut BTreeSet::new()).unwrap(),
-        "a discarded checkpoint set must still observe the missing node",
+        !state_metadata_closure_complete(cas_id, &metadata, &mut changed).unwrap(),
+        "a new snapshot must observe the missing node",
     );
 }
 
@@ -168,10 +180,11 @@ fn incomplete_checkpoint_cannot_populate_closure_proofs() {
     )
     .unwrap();
     let (mut metadata, state_id) = index_with_state(&map, catalogue, placements, state);
-    let only_root = BTreeMap::from([(root, map.nodes()[&root].clone())]);
-    metadata.nodes = only_root;
+    for id in map.nodes().keys().filter(|id| **id != root) {
+        metadata.nodes.take(id).unwrap();
+    }
     let (checkpoint, current) = later_journal_checkpoint(state_id, 1);
-    let mut complete = BTreeSet::new();
+    let mut complete = metadata.nodes.closure_checker();
     let error = recover_checkpoint(checkpoint, current, &metadata, &mut complete).unwrap_err();
     assert!(matches!(
         error,
@@ -180,13 +193,13 @@ fn incomplete_checkpoint_cannot_populate_closure_proofs() {
         )
     ));
     assert!(
-        complete.is_empty(),
+        complete.len() == 0,
         "failed checkpoint must not retain partial map proofs"
     );
 }
 
 #[test]
-fn metadata_recovery_keeps_one_owned_copy_of_each_map_node() {
+fn metadata_recovery_keeps_only_links_and_loads_active_bodies() {
     let node = PhysicalMapNode::leaf(
         PhysicalMapDomain::Representation,
         PhysicalMapKey::new([7; 32]),
@@ -197,12 +210,23 @@ fn metadata_recovery_keeps_one_owned_copy_of_each_map_node() {
     for _ in 0..2 {
         super::super::append_frame(&mut file, METADATA_MAGIC, &frame.encode().unwrap()).unwrap();
     }
-    let index = recover_metadata(&mut file, RecoveryLimits::process_addressable()).unwrap();
+    let limits = RecoveryLimits::process_addressable();
+    let mut index = recover_metadata(&mut file, limits).unwrap();
     assert_eq!(index.nodes.len(), 1);
-    assert_eq!(index.nodes[&map_node_id(frame.identity)], node);
+    assert_eq!(index.nodes.edge_count(), 0);
+    let map = index
+        .recover_active_map(
+            PhysicalMapDomain::Representation,
+            Some(map_node_id(frame.identity)),
+            &file,
+            limits,
+        )
+        .unwrap();
+    assert_eq!(map.nodes()[&map_node_id(frame.identity)], node);
+    assert!(index.nodes.len() == 0);
     assert!(
         index.values.is_empty(),
-        "decoded nodes must not retain a second encoded payload"
+        "historical node bodies must not be retained as encoded payloads"
     );
 }
 
@@ -217,7 +241,7 @@ fn metadata_recovery_rejects_map_bytes_with_another_nodes_identity() {
     frame.identity[0] ^= 1;
     let mut index = MetadataIndex::default();
     assert!(index.insert(frame).is_err());
-    assert!(index.nodes.is_empty());
+    assert!(index.nodes.len() == 0);
     assert!(index.values.is_empty());
 }
 
@@ -424,4 +448,265 @@ fn validate_generation_zero_index_rejects_corrupt_and_missing_locations() {
             "direct representation names a missing logical object"
         ))
     ));
+}
+
+#[test]
+fn metadata_recovery_loads_root_before_child_history_without_retaining_old_values() {
+    let map = dense_representation_map();
+    let root = map.root().unwrap();
+    let mut file = tempfile::tempfile().unwrap();
+    let mut order = vec![root];
+    order.extend(map.nodes().keys().copied().filter(|id| *id != root));
+    for id in order {
+        let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, &map.nodes()[&id]).unwrap();
+        super::super::append_frame(&mut file, METADATA_MAGIC, &frame.encode().unwrap()).unwrap();
+    }
+    // These unreachable historical bodies remain on disk and are authenticated,
+    // but have no reason to occupy decoded buffers during journal recovery.
+    for marker in 0_u8..64 {
+        let node = PhysicalMapNode::leaf(
+            PhysicalMapDomain::Representation,
+            PhysicalMapKey::new([marker; 32]),
+            vec![marker; 65536],
+        );
+        let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, &node).unwrap();
+        super::super::append_frame(&mut file, METADATA_MAGIC, &frame.encode().unwrap()).unwrap();
+    }
+    let before = file.metadata().unwrap().len();
+    let limits = RecoveryLimits::process_addressable();
+    let mut index = recover_metadata(&mut file, limits).unwrap();
+    assert_eq!(index.nodes.len(), map.nodes().len().strict_add(64));
+    assert!(index.nodes.edge_count() < index.nodes.len());
+    let mut complete = index.nodes.closure_checker();
+    assert!(complete.complete(Some(root)));
+    drop(complete);
+    let recovered = index
+        .recover_active_map(PhysicalMapDomain::Representation, Some(root), &file, limits)
+        .unwrap();
+    assert_eq!(recovered.nodes(), map.nodes());
+    assert_eq!(index.nodes.len(), 64);
+    assert!(
+        index.values.is_empty(),
+        "historical values remain on disk only"
+    );
+    assert_eq!(
+        file.metadata().unwrap().len(),
+        before,
+        "recovery must not delete historical metadata"
+    );
+}
+
+#[test]
+fn metadata_duplicate_identity_requires_exact_body_equality() {
+    let node = PhysicalMapNode::leaf(
+        PhysicalMapDomain::Representation,
+        PhysicalMapKey::new([7; 32]),
+        vec![42; 4096],
+    );
+    let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, &node).unwrap();
+    let mut index = MetadataIndex::default();
+    index.insert(frame.clone()).unwrap();
+    let mut different = frame.clone();
+    different.value = PhysicalMapNode::leaf(
+        PhysicalMapDomain::Representation,
+        PhysicalMapKey::new([7; 32]),
+        vec![43; 4096],
+    )
+    .encode()
+    .unwrap();
+    // Deliberately supply an earlier body with the same identity envelope:
+    // checking the envelope alone would wrongly accept this duplicate.
+    let result = index.insert_at(52, frame, |_| different.encode());
+    assert!(matches!(
+        result,
+        Err(DurableError::InvalidRepresentationState(
+            "physical metadata identity collision"
+        ))
+    ));
+    assert_eq!(index.nodes.len(), 1);
+}
+
+#[test]
+fn active_map_body_rereads_validate_the_frame_again() {
+    use std::io::{Seek, Write};
+
+    let node = PhysicalMapNode::leaf(
+        PhysicalMapDomain::Representation,
+        PhysicalMapKey::new([7; 32]),
+        vec![42; 4096],
+    );
+    let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, &node).unwrap();
+    let mut file = tempfile::tempfile().unwrap();
+    let location =
+        super::super::append_frame(&mut file, METADATA_MAGIC, &frame.encode().unwrap()).unwrap();
+    let limits = RecoveryLimits::process_addressable();
+    let mut index = recover_metadata(&mut file, limits).unwrap();
+    file.seek(SeekFrom::Start(
+        location.offset.strict_add(FRAME_HEADER_LEN),
+    ))
+    .unwrap();
+    file.write_all(&[0xff]).unwrap();
+    assert!(
+        index
+            .recover_active_map(
+                PhysicalMapDomain::Representation,
+                Some(map_node_id(frame.identity)),
+                &file,
+                limits,
+            )
+            .is_err(),
+        "active bodies must pass full frame validation when loaded"
+    );
+}
+
+#[test]
+fn indexed_active_recovery_validates_domain_and_consumes_each_node_once() {
+    let node = PhysicalMapNode::Page {
+        domain: PhysicalMapDomain::Profile,
+        entries: vec![(PhysicalMapKey::new([8; 32]), vec![9])],
+    };
+    let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, &node).unwrap();
+    let root = map_node_id(frame.identity);
+    let mut file = tempfile::tempfile().unwrap();
+    super::super::append_frame(&mut file, METADATA_MAGIC, &frame.encode().unwrap()).unwrap();
+    let limits = RecoveryLimits::process_addressable();
+    let mut index = recover_metadata(&mut file, limits).unwrap();
+    assert!(
+        index
+            .recover_active_map(PhysicalMapDomain::Placement, Some(root), &file, limits)
+            .is_err(),
+        "authenticated node bytes must not authorize a different map domain"
+    );
+    let mut index = recover_metadata(&mut file, limits).unwrap();
+    let recovered = index
+        .recover_active_map(PhysicalMapDomain::Profile, Some(root), &file, limits)
+        .unwrap();
+    assert_eq!(recovered.nodes(), &BTreeMap::from([(root, node)]));
+    assert_eq!(index.nodes.len(), 0);
+    assert!(matches!(
+        index.recover_active_map(PhysicalMapDomain::Profile, Some(root), &file, limits),
+        Err(DurableError::InvalidRepresentationState(
+            "active physical map closure is incomplete"
+        ))
+    ));
+}
+
+#[test]
+fn indexed_active_recovery_rejects_incomplete_and_forged_subtree_counts() {
+    let leaf = PhysicalMapNode::leaf(
+        PhysicalMapDomain::Representation,
+        PhysicalMapKey::new([8; 32]),
+        vec![9],
+    );
+    let other = PhysicalMapNode::leaf(
+        PhysicalMapDomain::Representation,
+        PhysicalMapKey::new([128; 32]),
+        vec![10],
+    );
+    // Frames and identities are valid, but two leaves cannot justify a count of three.
+    let branch = PhysicalMapNode::branch(
+        PhysicalMapDomain::Representation,
+        0,
+        vec![],
+        leaf.identify(&Blake3PhysicalIdentity).unwrap(),
+        other.identify(&Blake3PhysicalIdentity).unwrap(),
+        3,
+    )
+    .unwrap();
+    let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, &branch).unwrap();
+    let root = map_node_id(frame.identity);
+    let mut file = tempfile::tempfile().unwrap();
+    super::super::append_frame(&mut file, METADATA_MAGIC, &frame.encode().unwrap()).unwrap();
+    let limits = RecoveryLimits::process_addressable();
+    let mut index = recover_metadata(&mut file, limits).unwrap();
+    assert!(matches!(
+        index.recover_active_map(PhysicalMapDomain::Representation, Some(root), &file, limits),
+        Err(DurableError::InvalidRepresentationState(
+            "active physical map closure is incomplete"
+        ))
+    ));
+    for node in [&leaf, &other] {
+        let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, node).unwrap();
+        super::super::append_frame(&mut file, METADATA_MAGIC, &frame.encode().unwrap()).unwrap();
+    }
+    let mut index = recover_metadata(&mut file, limits).unwrap();
+    assert!(
+        index
+            .recover_active_map(PhysicalMapDomain::Representation, Some(root), &file, limits)
+            .is_err(),
+        "indexed traversal must retain canonical shape validation"
+    );
+}
+
+#[test]
+fn active_entry_visitor_preserves_order_and_borrows_values_across_constructions() {
+    let entries = (0_u32..128)
+        .map(|ordinal| {
+            (
+                PhysicalMapKey::new(*blake3::hash(&ordinal.to_le_bytes()).as_bytes()),
+                ordinal.to_le_bytes().to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut expected = entries.clone();
+    expected.sort_by_key(|(key, _)| *key);
+    for dense in [false, true] {
+        let build = if dense {
+            CanonicalPhysicalMap::build_dense
+        } else {
+            CanonicalPhysicalMap::build
+        };
+        let mut map = build(
+            &Blake3PhysicalIdentity,
+            PhysicalMapDomain::Representation,
+            entries[..64].to_vec(),
+        )
+        .unwrap();
+        for (key, value) in &entries[64..] {
+            map.insert(&Blake3PhysicalIdentity, *key, value.clone())
+                .unwrap();
+        }
+        let fresh = build(
+            &Blake3PhysicalIdentity,
+            PhysicalMapDomain::Representation,
+            entries.clone(),
+        )
+        .unwrap();
+        assert_eq!(map.root(), fresh.root());
+        assert!(map.nodes().len() > fresh.nodes().len());
+        let mut actual = Vec::new();
+        for_each_active_entry(&map, |key, bytes| {
+            assert!(std::ptr::eq(bytes, map.get(key).unwrap()));
+            actual.push((key, bytes.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(actual, expected, "dense={dense}");
+    }
+}
+
+#[test]
+fn active_entry_visitor_propagates_rejection_and_skips_empty_maps() {
+    let map = dense_representation_map();
+    let mut visited = 0;
+    let error = for_each_active_entry(&map, |_, _| {
+        visited += 1;
+        Err(DurableError::InvalidRepresentationState(
+            "visitor rejected entry",
+        ))
+    });
+    assert_eq!(visited, 1);
+    assert!(matches!(
+        error,
+        Err(DurableError::InvalidRepresentationState(
+            "visitor rejected entry"
+        ))
+    ));
+    let empty = CanonicalPhysicalMap::build_dense(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Representation,
+        Vec::new(),
+    )
+    .unwrap();
+    for_each_active_entry(&empty, |_, _| panic!("empty map has no entries")).unwrap();
 }

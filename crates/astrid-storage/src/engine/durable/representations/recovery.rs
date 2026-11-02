@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, HashSet};
 use std::io::SeekFrom;
 
 use super::super::DurableIo;
@@ -26,68 +26,10 @@ use super::{
     increment, io_error, read_all,
 };
 
-#[derive(Default)]
-pub(super) struct MetadataIndex {
-    values: BTreeMap<(MetadataKind, [u8; 32]), Vec<u8>>,
-    pub(super) nodes: BTreeMap<crate::storage_model::PhysicalMapNodeId, PhysicalMapNode>,
-}
-
-impl MetadataIndex {
-    fn insert<V: AsRef<[u8]> + Into<Vec<u8>>>(
-        &mut self,
-        frame: MetadataFrame<V>,
-    ) -> Result<(), DurableError> {
-        if frame.kind == MetadataKind::MapNode {
-            // Decode and authenticate once, then keep that sole owned value.
-            // Retaining its encoded payload as well duplicates every historical
-            // node until journal validation and active-closure recovery finish.
-            let (node, id) = PhysicalMapNode::decode_and_identify(
-                frame.value.as_ref(),
-                &Blake3PhysicalIdentity,
-            )?;
-            if id != map_node_id(frame.identity) {
-                return Err(DurableError::InvalidRepresentationState(
-                    "metadata identity does not match canonical value",
-                ));
-            }
-            if let Some(existing) = self.nodes.get(&id) {
-                if existing != &node {
-                    return Err(DurableError::InvalidRepresentationState(
-                        "physical metadata identity collision",
-                    ));
-                }
-            } else {
-                self.nodes.insert(id, node);
-            }
-            return Ok(());
-        }
-        frame.verify(&Blake3PhysicalIdentity)?;
-        let key = (frame.kind, frame.identity);
-        if let Some(existing) = self.values.get(&key) {
-            if existing.as_slice() != frame.value.as_ref() {
-                return Err(DurableError::InvalidRepresentationState(
-                    "physical metadata identity collision",
-                ));
-            }
-            return Ok(());
-        }
-        self.values.insert(key, frame.value.into());
-        Ok(())
-    }
-
-    pub(super) fn value(
-        &self,
-        kind: MetadataKind,
-        identity: &[u8; 32],
-    ) -> Result<&[u8], DurableError> {
-        self.values
-            .get(&(kind, *identity))
-            .map(Vec::as_slice)
-            .ok_or(DurableError::InvalidRepresentationState(
-                "physical metadata closure is incomplete",
-            ))
-    }
-}
+mod index;
+use super::super::format::{read_frame_at, scan_frames_with_source};
+use index::HistoricalMapClosure;
+pub(super) use index::MetadataIndex;
 
 #[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all,
     fields(map_nodes = tracing::field::Empty, authority_records = tracing::field::Empty))]
@@ -96,12 +38,14 @@ pub(super) fn recover_metadata<F: DurableIo>(
     limits: RecoveryLimits,
 ) -> Result<MetadataIndex, DurableError> {
     let mut index = MetadataIndex::default();
-    scan_frames(
+    scan_frames_with_source(
         file,
         METADATA_FILE,
         METADATA_MAGIC,
         limits,
-        |_offset, payload| index.insert(MetadataFrame::decode(payload)?),
+        |offset, payload, load_previous| {
+            index.insert_at(offset, MetadataFrame::decode(payload)?, load_previous)
+        },
     )?;
     if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {
         tracing::Span::current().record("map_nodes", index.nodes.len());
@@ -149,7 +93,7 @@ pub(super) fn recover_journal<F: DurableIo>(
     // Metadata is immutable for this replay. Only successfully checked closures
     // may be reused across historical states, including the checkpoint active
     // state; CAS and generation checks still run.
-    let mut complete_maps = BTreeSet::new();
+    let mut complete_maps = metadata.nodes.closure_checker();
     let (mut active, mut generation) =
         recover_checkpoint(first, current, metadata, &mut complete_maps)?;
     validate_tail_budget(entries.len(), bytes.len(), checkpoint_end, current)?;
@@ -220,7 +164,7 @@ fn recover_checkpoint(
     first: JournalEntry,
     current: CurrentPointer,
     metadata: &MetadataIndex,
-    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    complete: &mut HistoricalMapClosure<'_>,
 ) -> Result<(Option<RepresentationStateId>, u64), DurableError> {
     match first {
         JournalEntry::Checkpoint {
@@ -268,7 +212,7 @@ fn recover_checkpoint(
 fn state_metadata_closure_complete(
     state_id: RepresentationStateId,
     metadata: &MetadataIndex,
-    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    complete: &mut HistoricalMapClosure<'_>,
 ) -> Result<bool, DurableError> {
     let Some(state_bytes) = metadata
         .values
@@ -296,41 +240,11 @@ fn state_metadata_closure_complete(
         catalogue.representations_root(),
         placements.entries_root(),
     ] {
-        if !map_closure_complete(root, &metadata.nodes, complete) {
+        if !complete.complete(root) {
             return Ok(false);
         }
     }
     Ok(true)
-}
-
-fn map_closure_complete(
-    root: Option<crate::storage_model::PhysicalMapNodeId>,
-    nodes: &BTreeMap<crate::storage_model::PhysicalMapNodeId, PhysicalMapNode>,
-    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
-) -> bool {
-    let Some(root) = root else {
-        return true;
-    };
-    let mut pending = vec![root];
-    let mut visited = BTreeSet::new();
-    while let Some(id) = pending.pop() {
-        if complete.contains(&id) || !visited.insert(id) {
-            continue;
-        }
-        let Some(node) = nodes.get(&id) else {
-            return false;
-        };
-        match node {
-            PhysicalMapNode::Branch { zero, one, .. } => pending.extend([*zero, *one]),
-            PhysicalMapNode::Radix { children, .. } => {
-                pending.extend(children.iter().copied());
-            },
-            PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => {},
-        }
-    }
-    // Never remember a partial traversal that encountered a missing descendant.
-    complete.extend(visited);
-    true
 }
 
 fn truncate_repairable_journal_tail<F: DurableIo>(
@@ -429,7 +343,7 @@ pub(super) fn validate_profiles(
     map: &CanonicalPhysicalMap,
 ) -> Result<RepresentationProfileId, DurableError> {
     let mut direct = None;
-    for (key, value) in active_entries(map)? {
+    for_each_active_entry(map, |key, value| {
         let profile = RepresentationProfile::decode(value)?;
         let id = profile.identify(&Blake3PhysicalIdentity)?;
         if PhysicalMapKey::from(id) != key {
@@ -444,7 +358,8 @@ pub(super) fn validate_profiles(
                 "catalogue has more than one direct profile",
             ));
         }
-    }
+        Ok(())
+    })?;
     direct.ok_or(DurableError::InvalidRepresentationState(
         "catalogue has no direct profile",
     ))
@@ -465,7 +380,7 @@ pub(super) fn validate_representations(
 ) -> Result<ValidatedRepresentations, DurableError> {
     let mut placement_by_blob = BTreeMap::new();
     let mut extent_count = 0_u64;
-    for (key, bytes) in active_entries(placements)? {
+    for_each_active_entry(placements, |key, bytes| {
         let entry = PlacementEntry::decode(bytes)?;
         if PhysicalMapKey::from(entry.blob()) != key {
             return Err(DurableError::InvalidRepresentationState(
@@ -487,12 +402,13 @@ pub(super) fn validate_representations(
             )
             .ok_or(DurableError::EncodingOverflow)?;
         placement_by_blob.insert(entry.blob(), entry);
-    }
+        Ok(())
+    })?;
     let mut reverse = BTreeMap::<ObjectId, Vec<RepresentationRecordId>>::new();
     // First matching direct_profile blob per object in reverse-vector order.
     // Record payloads are not retained; placement_by_blob is already decoded.
     let mut selected = BTreeMap::<ObjectId, BlobId>::new();
-    for (key, bytes) in active_entries(representations)? {
+    for_each_active_entry(representations, |key, bytes| {
         let record = RepresentationRecord::decode(bytes)?;
         let id = record.identify(&Blake3PhysicalIdentity)?;
         if PhysicalMapKey::from(id) != key {
@@ -513,7 +429,7 @@ pub(super) fn validate_representations(
                 },
                 Recipe::DirectCanonical { blob },
             ) => (*object, *blob, *canonical_record_bytes),
-            _ => continue,
+            _ => return Ok(()),
         };
         let placement =
             placement_by_blob
@@ -531,7 +447,8 @@ pub(super) fn validate_representations(
         if record.profile() == direct_profile {
             selected.entry(object).or_insert(blob);
         }
-    }
+        Ok(())
+    })?;
     let locations =
         generation_zero_locations_from_selected(&reverse, &selected, &placement_by_blob)?;
     Ok(ValidatedRepresentations {
@@ -592,15 +509,16 @@ fn generation_zero_locations_from_selected(
     Ok(direct)
 }
 
-pub(super) fn active_entries(
+pub(super) fn for_each_active_entry(
     map: &CanonicalPhysicalMap,
-) -> Result<Vec<(PhysicalMapKey, &[u8])>, DurableError> {
+    mut visit: impl FnMut(PhysicalMapKey, &[u8]) -> Result<(), DurableError>,
+) -> Result<(), DurableError> {
     let Some(root) = map.root() else {
-        return Ok(Vec::new());
+        return Ok(());
     };
-    let mut entries = Vec::new();
     let mut stack = vec![root];
-    let mut visited = BTreeSet::new();
+    // Only membership matters here; the DFS stack determines canonical entry order.
+    let mut visited = HashSet::new();
     while let Some(id) = stack.pop() {
         if !visited.insert(id) {
             return Err(DurableError::InvalidRepresentationState(
@@ -613,7 +531,7 @@ pub(super) fn active_entries(
             .ok_or(DurableError::InvalidRepresentationState(
                 "physical map traversal found a missing node",
             ))? {
-            PhysicalMapNode::Leaf { key, value, .. } => entries.push((*key, value.as_slice())),
+            PhysicalMapNode::Leaf { key, value, .. } => visit(*key, value.as_slice())?,
             PhysicalMapNode::Branch { zero, one, .. } => {
                 stack.push(*one);
                 stack.push(*zero);
@@ -621,17 +539,17 @@ pub(super) fn active_entries(
             PhysicalMapNode::Page {
                 entries: page_entries,
                 ..
-            } => entries.extend(
-                page_entries
-                    .iter()
-                    .map(|(key, value)| (*key, value.as_slice())),
-            ),
+            } => {
+                for (key, value) in page_entries {
+                    visit(*key, value.as_slice())?;
+                }
+            },
             PhysicalMapNode::Radix { children, .. } => {
                 stack.extend(children.iter().rev().copied());
             },
         }
     }
-    Ok(entries)
+    Ok(())
 }
 
 pub(super) fn read_current_file<F: DurableIo>(

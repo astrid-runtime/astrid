@@ -53,8 +53,14 @@ mod catalog_load_tests;
 mod compiled;
 mod construction;
 mod content_source;
+mod epoch;
 use compiled::CompiledWasmArtifact;
 pub use compiled::{COMPILED_ENGINE_ABI, CompiledWasmCache};
+pub(crate) use epoch::{
+    DEFAULT_RUN_LOOP_WINDOW_TICKS, EpochAction, configure_run_store, run_epoch_action,
+};
+#[cfg(test)]
+use epoch::{MAX_NO_YIELD_WINDOWS, epoch_decision, exempt_epoch_action};
 #[cfg(test)]
 mod fuel_scheduling_tests;
 pub mod host;
@@ -690,32 +696,6 @@ async fn run_workspace_cow_op(
 /// See #639 for the resource telemetry tracking issue.
 const WASM_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 
-/// Default length (epoch ticks) of a bound run-loop's epoch deadline window
-/// when the owner profile does not pin a tighter timeout.
-///
-/// One tick is [`EPOCH_TICK_INTERVAL`] (100 ms), so the default ~5 s window is
-/// `5000 / 100 = 50` ticks. Each window the bound run-loop's
-/// `epoch_deadline_callback` fires: a recv/accept/sleep loop (which set
-/// `recv_yielded` since the last window) is re-extended and cooperatively
-/// yields the tokio worker; a no-recv spinner accrues `no_yield_windows` and
-/// is interrupt-trapped once it reaches [`MAX_NO_YIELD_WINDOWS`]. The window
-/// is derived per-capsule from the owner quota `max_timeout_secs` (clamped to
-/// this default) in [`resolve_run_loop_budget`]; this const is the fail-safe.
-const DEFAULT_RUN_LOOP_WINDOW_TICKS: u64 = 50;
-
-/// Number of consecutive windows a bound run-loop may burn CPU **without**
-/// cooperating through recv/accept or a completed nonzero sleep (setting
-/// `recv_yielded`) before its epoch callback returns
-/// [`UpdateDeadline::Interrupt`](wasmtime::UpdateDeadline) and traps the guest.
-///
-/// A legitimate run loop waits through recv/accept or sleep, so it resets the
-/// counter every window and is never trapped. A pure `loop {}` (or any
-/// no-recv burner) never resets it and is interrupt-trapped after this many
-/// windows. With the default window (~5 s) this is a ~15 s grace before a
-/// runaway is killed — generous enough to never catch a healthy capsule, tight
-/// enough to bound a genuine spinner.
-const MAX_NO_YIELD_WINDOWS: u32 = 3;
-
 /// Per-single-invocation fuel budget for a pooled interceptor call (10e9).
 ///
 /// This is the per-invocation CPU **measurement** seed, NOT the run-loop CPU
@@ -864,7 +844,8 @@ pub(crate) struct RunLoopBudget {
     /// [`CAP_RESOURCES_UNBOUNDED`](astrid_core::CAP_RESOURCES_UNBOUNDED), the
     /// operator-granted [`CAP_NET_BIND`](astrid_core::CAP_NET_BIND) /
     /// [`CAP_UPLINK`](astrid_core::CAP_UPLINK) capability (admin holds all via
-    /// `*`). Exempt Stores are never epoch-interrupt-trapped.
+    /// `*`). Live exempt Stores have no CPU-starvation trap; cancellation
+    /// still interrupts them so unload can join their workers.
     exempt: bool,
     /// Whether this capsule is a bound (non-exempt) run-loop — the only class
     /// that gets the epoch interrupt callback + memory cap. When `false`,
@@ -874,7 +855,7 @@ pub(crate) struct RunLoopBudget {
     /// Epoch deadline window, in [`EPOCH_TICK_INTERVAL`] ticks, for a bound
     /// run-loop. `None` for exempt/non-run-loop. The run-loop Store's epoch
     /// callback fires every `window_ticks` and re-arms the deadline to the
-    /// same value (see [`epoch_decision`]).
+    /// same value (see [`epoch::epoch_decision`]).
     window_ticks: Option<u64>,
     /// Linear-memory ceiling for the run-loop Store (owner quota for a bound
     /// run-loop, [`WASM_MAX_MEMORY_BYTES`] otherwise).
@@ -1080,122 +1061,6 @@ pub(crate) fn resolve_run_loop_budget(
         bound_run_loop,
         window_ticks,
         mem_bytes,
-    }
-}
-
-/// The action a bound run-loop's epoch callback takes when a deadline window
-/// elapses, plus the new state to write back. Pure so it is unit-testable
-/// without wasmtime; the production callback ([the run-loop Store setup])
-/// applies it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EpochAction {
-    /// Cooperatively yield the tokio worker and re-arm the deadline by
-    /// `window_ticks`. Maps to
-    /// [`UpdateDeadline::Yield`](wasmtime::UpdateDeadline::Yield).
-    Yield(u64),
-    /// Trap the guest. Maps to
-    /// [`UpdateDeadline::Interrupt`](wasmtime::UpdateDeadline::Interrupt).
-    Interrupt,
-}
-
-/// Pure epoch-deadline decision for a bound run-loop.
-///
-/// Called once per elapsed window with the run-loop's current
-/// `(recv_yielded, no_yield_windows)`:
-///
-/// * If the guest waited through recv/accept or completed a nonzero sleep
-///   since the last window (`recv_yielded`): clear the flag, reset the no-yield
-///   counter to 0, and **`Yield`** (cooperatively yield the worker + re-arm).
-///   Such a loop is never trapped.
-/// * Otherwise it burned the whole window without a cooperative wait: increment
-///   `no_yield_windows`. Once it reaches `max` (`MAX_NO_YIELD_WINDOWS`),
-///   **`Interrupt`** (trap the runaway); below `max`, still **`Yield`** — so
-///   even a pure `loop {}` cooperatively yields the worker every window and can
-///   NEVER starve the daemon while it lives out its grace windows.
-///
-/// Returns `(action, new_recv_yielded, new_no_yield_windows)`.
-pub(crate) fn epoch_decision(
-    recv_yielded: bool,
-    no_yield_windows: u32,
-    window_ticks: u64,
-    max: u32,
-) -> (EpochAction, bool, u32) {
-    if recv_yielded {
-        // Cooperative wait: reset and keep running.
-        (EpochAction::Yield(window_ticks), false, 0)
-    } else {
-        let next = no_yield_windows.saturating_add(1);
-        if next >= max {
-            // Persistent no-recv spinner: trap it.
-            (EpochAction::Interrupt, false, next)
-        } else {
-            // Still within the grace window — yield the worker (never starve)
-            // and accrue toward the interrupt.
-            (EpochAction::Yield(window_ticks), false, next)
-        }
-    }
-}
-
-/// Pure epoch-deadline decision for an EXEMPT run-loop.
-///
-/// An exempt run-loop's owner holds an [`EXEMPT_CAPABILITIES`](astrid_core)
-/// capability (`CAP_RESOURCES_UNBOUNDED` / `CAP_NET_BIND` / `CAP_UPLINK`; admin
-/// via `*`), so it is **unbounded CPU** and must NEVER be trapped
-/// (`Interrupt`) or fuel-out. But "unbounded" must not mean "never yields":
-/// before this it was pinned at `epoch_deadline = u64::MAX` with no callback,
-/// so the guest fiber never reached a yield point and enough concurrent exempt
-/// compute pinned every tokio worker — starving the reactor (and the SIGTERM
-/// handler) into a `SIGKILL`-only wedge.
-///
-/// This makes an exempt run-loop **always `Yield`** every window and re-arm —
-/// the exact cooperativeness guarantee a bound run-loop already has, minus the
-/// trap. It can still burn a core, but it can no longer starve the daemon: the
-/// worker is released to the reactor every window. An OS cgroup remains the
-/// backstop for raw CPU burn. Pure so it is unit-testable without wasmtime,
-/// mirroring [`epoch_decision`].
-pub(crate) const fn exempt_epoch_action(window_ticks: u64) -> EpochAction {
-    EpochAction::Yield(window_ticks)
-}
-
-/// Apply a run-loop Store's CPU bound: a wasmtime EPOCH deadline plus interrupt
-/// callback driven by the shared epoch ticker. Factored out of `load` so every
-/// worker Store (one for the single-worker default, N for `bind_workers > 1`)
-/// is configured identically.
-///
-/// BOUND run-loop (`window_ticks = Some`): the callback runs the pure
-/// [`epoch_decision`] each window — a recv/accept/sleep loop `Yield`s (never trapped),
-/// a no-recv spinner accrues toward `Interrupt` after `MAX_NO_YIELD_WINDOWS` but
-/// still `Yield`s during the grace windows, so it can never starve the daemon.
-///
-/// EXEMPT run-loop (`window_ticks = None`): unbounded CPU — [`exempt_epoch_action`]
-/// always `Yield`s, never `Interrupt`s — but still cooperatively yields the tokio
-/// worker every window. `UpdateDeadline::Yield` is async-legal because the run
-/// loop drives the guest via `call_async`.
-fn configure_run_store(store: &mut Store<HostState>, run_budget: &RunLoopBudget) {
-    let window = run_budget.window_ticks;
-    store.set_epoch_deadline(window.unwrap_or(DEFAULT_RUN_LOOP_WINDOW_TICKS));
-    store.epoch_deadline_callback(move |mut context| {
-        Ok(match run_epoch_action(context.data_mut(), window) {
-            EpochAction::Yield(ticks) => wasmtime::UpdateDeadline::Yield(ticks),
-            EpochAction::Interrupt => wasmtime::UpdateDeadline::Interrupt,
-        })
-    });
-}
-
-/// One watchdog policy for both personal and user-accounted run loops.
-fn run_epoch_action(state: &mut HostState, window: Option<u64>) -> EpochAction {
-    if let Some(window) = window {
-        let (action, recv_yielded, no_yield_windows) = epoch_decision(
-            state.recv_yielded,
-            state.no_yield_windows,
-            window,
-            MAX_NO_YIELD_WINDOWS,
-        );
-        state.recv_yielded = recv_yielded;
-        state.no_yield_windows = no_yield_windows;
-        action
-    } else {
-        exempt_epoch_action(DEFAULT_RUN_LOOP_WINDOW_TICKS)
     }
 }
 
@@ -5086,133 +4951,6 @@ mod tests {
         }
     }
 
-    // ── epoch_decision (the FIX 2 callback logic, directly) ──────────────
-
-    #[test]
-    fn epoch_recv_loop_never_traps_and_resets() {
-        // recv_yielded=true → Yield, flag cleared, counter reset to 0 — no
-        // matter how high the counter had climbed.
-        let (action, recv, windows) = epoch_decision(true, 99, 50, MAX_NO_YIELD_WINDOWS);
-        assert_eq!(action, EpochAction::Yield(50));
-        assert!(!recv, "flag must be cleared after reading");
-        assert_eq!(windows, 0, "a recv resets the no-yield counter");
-    }
-
-    #[test]
-    fn epoch_no_recv_yields_during_grace_then_interrupts() {
-        // A no-recv spinner: Yields (cooperatively, never starving) while the
-        // counter is below max, then Interrupts exactly when it reaches max.
-        let max = 3u32;
-        // window 0 -> 1: yield
-        let (a0, _, w0) = epoch_decision(false, 0, 50, max);
-        assert_eq!(a0, EpochAction::Yield(50));
-        assert_eq!(w0, 1);
-        // window 1 -> 2: yield
-        let (a1, _, w1) = epoch_decision(false, w0, 50, max);
-        assert_eq!(a1, EpochAction::Yield(50));
-        assert_eq!(w1, 2);
-        // window 2 -> 3 == max: interrupt
-        let (a2, _, w2) = epoch_decision(false, w1, 50, max);
-        assert_eq!(a2, EpochAction::Interrupt);
-        assert_eq!(w2, 3);
-    }
-
-    #[test]
-    fn epoch_recv_every_window_never_interrupts_driven() {
-        // The task's named guarantee, modelled as a DRIVEN feedback loop (not a
-        // single shot): a legit recv/accept loop sets `recv_yielded` every
-        // window, so feeding `epoch_decision`'s output back into its next call —
-        // exactly as the production callback does via HostState — yields forever
-        // and NEVER interrupts, even far past MAX_NO_YIELD_WINDOWS windows.
-        let max = MAX_NO_YIELD_WINDOWS;
-        let mut no_yield = 0u32;
-        for window in 0..(max as u64 * 100 + 7) {
-            // A recv occurred since the last window (the host fn set the flag).
-            let recv_yielded = true;
-            let (action, new_recv, new_windows) = epoch_decision(recv_yielded, no_yield, 50, max);
-            assert_eq!(
-                action,
-                EpochAction::Yield(50),
-                "a recv-yielding loop must Yield on window {window}, never Interrupt"
-            );
-            assert!(!new_recv, "the flag is always cleared after reading");
-            assert_eq!(new_windows, 0, "every recv resets the no-yield counter");
-            no_yield = new_windows;
-        }
-    }
-
-    #[test]
-    fn epoch_single_late_recv_restores_full_grace_driven() {
-        // Adversarial boundary: a spinner accrues to max-1 (one window short of
-        // the trap), then a SINGLE recv arrives. That recv must reset the
-        // counter to 0 so the spinner gets the FULL grace again before any
-        // trap — there must be no "primed" early interrupt carried across the
-        // reset. Drive `epoch_decision`'s output back into itself.
-        let max = MAX_NO_YIELD_WINDOWS;
-        assert!(max >= 2, "test assumes a multi-window grace");
-        let mut no_yield = 0u32;
-        // Spin up to max-1 (still yielding, not yet trapped).
-        for _ in 0..(max - 1) {
-            let (action, _, w) = epoch_decision(false, no_yield, 50, max);
-            assert_eq!(action, EpochAction::Yield(50));
-            no_yield = w;
-        }
-        assert_eq!(no_yield, max - 1, "primed one window short of the trap");
-        // A single recv resets the counter.
-        let (action, _, w) = epoch_decision(true, no_yield, 50, max);
-        assert_eq!(action, EpochAction::Yield(50));
-        assert_eq!(w, 0, "one recv at the brink restores the full grace");
-        no_yield = w;
-        // Now the spinner must get the FULL grace again: max-1 yields, then trap
-        // exactly on the max-th — not one window early.
-        for window in 0..(max - 1) {
-            let (action, _, w) = epoch_decision(false, no_yield, 50, max);
-            assert_eq!(
-                action,
-                EpochAction::Yield(50),
-                "post-reset grace window {window} must Yield, not trap early"
-            );
-            no_yield = w;
-        }
-        let (action, _, _) = epoch_decision(false, no_yield, 50, max);
-        assert_eq!(
-            action,
-            EpochAction::Interrupt,
-            "trap lands on the full max-th post-reset window, not earlier"
-        );
-    }
-
-    #[test]
-    fn epoch_interrupt_is_immediate_when_max_is_one() {
-        // With max=1 the very first no-recv window traps.
-        let (action, _, windows) = epoch_decision(false, 0, 10, 1);
-        assert_eq!(action, EpochAction::Interrupt);
-        assert_eq!(windows, 1);
-    }
-
-    #[test]
-    fn epoch_counter_does_not_overflow() {
-        // saturating_add guards a pathological counter near u32::MAX.
-        let (action, _, windows) = epoch_decision(false, u32::MAX, 10, MAX_NO_YIELD_WINDOWS);
-        assert_eq!(action, EpochAction::Interrupt);
-        assert_eq!(windows, u32::MAX);
-    }
-
-    #[test]
-    fn exempt_epoch_action_always_yields_never_interrupts() {
-        // The exempt run-loop policy is unbounded: it must ALWAYS cooperatively
-        // yield the worker (re-arming by `window_ticks`) and NEVER trap, for any
-        // window value — the guarantee that keeps an exempt capsule from
-        // starving the daemon without ever bounding its CPU.
-        for ticks in [1_u64, 10, 50, DEFAULT_RUN_LOOP_WINDOW_TICKS, u64::MAX] {
-            assert_eq!(
-                exempt_epoch_action(ticks),
-                EpochAction::Yield(ticks),
-                "exempt policy must yield (never interrupt) for window {ticks}"
-            );
-        }
-    }
-
     #[test]
     fn check_principal_enabled_allows_enabled_profile() {
         let profile = astrid_core::profile::PrincipalProfile::default();
@@ -6035,15 +5773,18 @@ mod epoch_integration_tests {
     use std::time::Duration;
     use wasmtime::{Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, Trap};
 
-    /// Install the PRODUCTION EXEMPT-run-loop epoch policy on `store` (Fix 5).
+    /// Install the live exempt CPU policy on `store` (Fix 5).
     ///
-    /// Byte-for-byte mirror of the load path's exempt-run-loop branch: a finite
-    /// `window_ticks` deadline plus a callback that returns the shared
-    /// [`exempt_epoch_action`] — always `Yield`, NEVER `Interrupt`. `yields`
-    /// counts callback firings so a test can assert the guest cooperatively
-    /// yielded (rather than the pre-fix `u64::MAX` pin with no callback, which
-    /// never yielded and starved the reactor). The DECISION is the same function
-    /// production calls; the test does not reimplement it.
+    /// Mirrors the live (not cancelled) exempt branch inside `run_epoch_action`:
+    /// a finite `window_ticks` deadline plus a callback that returns
+    /// [`exempt_epoch_action`] — always `Yield` while the instance is live.
+    /// Production run Stores go through `run_epoch_action`, which Interrupts
+    /// only on instance `cancel_token` teardown, not on a per-principal overlay.
+    /// `yields` counts callback firings so a test can assert the guest
+    /// cooperatively yielded (rather than the pre-fix `u64::MAX` pin with no
+    /// callback, which never yielded and starved the reactor). The live CPU
+    /// decision is the same function production calls; the test does not
+    /// reimplement it.
     fn apply_exempt_epoch_bound(store: &mut Store<()>, window_ticks: u64, yields: Arc<AtomicU64>) {
         store.set_fuel(u64::MAX).expect("fuel enabled");
         store.set_epoch_deadline(window_ticks);

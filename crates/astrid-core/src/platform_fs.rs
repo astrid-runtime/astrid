@@ -26,6 +26,8 @@ use std::path::{Component, Path, PathBuf};
 #[cfg(windows)]
 #[path = "platform_fs/windows.rs"]
 mod windows;
+#[cfg(windows)]
+pub(crate) use windows::projection as windows_projection;
 
 #[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

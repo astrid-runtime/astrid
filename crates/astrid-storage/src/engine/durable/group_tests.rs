@@ -755,6 +755,92 @@ fn wal_policy() -> DurableEnginePolicy<String> {
 }
 
 #[test]
+fn shared_single_reads_committed_wal_objects_before_canonical_fold() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = DurableEngine::open_with_policy(
+        directory.path(),
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        wal_policy(),
+    )
+    .unwrap();
+    let principal = "alice".to_owned();
+    let (commit, transaction) = transaction(&principal, None, b"wal-shared-single");
+    engine.commit(transaction).unwrap();
+    let record = engine.object(commit).unwrap().unwrap();
+    let generation = {
+        let inner = engine.lock_usable().unwrap();
+        assert!(!inner.index.contains_key(&commit));
+        assert!(inner.pending_wal.get_object(&commit).is_some());
+        inner.arena_generation
+    };
+    // Exercise the retry predicate first: old code fails here rather than
+    // hanging the suite in the public single-object read below.
+    assert_eq!(
+        engine
+            .retain_loaded_object_if_current(&principal, commit, generation, record.clone(),)
+            .unwrap()
+            .as_deref(),
+        Some(&record),
+        "a committed WAL object is current before canonical folding",
+    );
+    // The policy disables the decoded cache, so the predicate check cannot
+    // prime this read or hide a second miss on the pending-WAL branch.
+    assert_eq!(engine.object_cache_stats().resident_record_bytes, 0);
+    assert_eq!(
+        engine
+            .shared_object_for(&principal, commit)
+            .unwrap()
+            .as_deref(),
+        Some(&record)
+    );
+    assert!(
+        engine
+            .shared_object_for(&principal, ObjectId::new([0xff; 32]))
+            .unwrap()
+            .is_none()
+    );
+    engine.flush().unwrap();
+    assert_eq!(
+        engine
+            .shared_object_for(&principal, commit)
+            .unwrap()
+            .as_deref(),
+        Some(&record)
+    );
+}
+
+#[test]
+fn shared_batch_reads_committed_wal_objects_before_canonical_fold() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = DurableEngine::open_with_policy(
+        directory.path(),
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        wal_policy(),
+    )
+    .unwrap();
+    let (commit, transaction) = transaction("alice", None, b"wal-shared-batch");
+    engine.commit(transaction).unwrap();
+    let principal = "alice".to_owned();
+    // Do not prime the single-object cache or flush the WAL into the arena.
+    let batch = engine
+        .shared_objects_for(&principal, &[commit, commit])
+        .unwrap();
+    assert!(
+        batch[0].is_some(),
+        "committed WAL objects are visible to batch readers"
+    );
+    assert_eq!(batch[0].as_deref(), engine.object(commit).unwrap().as_ref());
+    assert!(Arc::ptr_eq(
+        batch[0].as_ref().unwrap(),
+        batch[1].as_ref().unwrap()
+    ));
+}
+
+#[test]
 fn transaction_wal_serves_committed_state_before_canonical_fold() {
     let directory = tempfile::tempdir().unwrap();
     let engine = DurableEngine::open_with_policy(
