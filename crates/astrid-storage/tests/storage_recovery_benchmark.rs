@@ -177,7 +177,7 @@ async fn isolated_recovery_profile() {
         "validate_representation_index",
         "recover_metadata",
         "recover_journal",
-        "recover_active_map",
+        "recover_indexed_active_map",
         "validate_profiles",
         "validate_representations",
         "recover_volume_index",
@@ -201,6 +201,27 @@ async fn isolated_recovery_profile() {
             .iter()
             .any(|r| r["span"]["name"] == "recover_metadata"
                 && r["span"]["map_nodes"].as_u64().is_some_and(|n| n > 0))
+    );
+    let active_maps = records
+        .iter()
+        .filter(|r| {
+            r["span"]["name"] == "recover_indexed_active_map"
+                && r["fields"]["time.busy"].is_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(active_maps.len(), 3, "one recovery per map domain");
+    for record in &active_maps {
+        let indexed = record["span"]["indexed_nodes"].as_u64().unwrap();
+        let active = record["span"]["active_nodes"].as_u64().unwrap();
+        assert!(indexed >= active);
+        assert!(record["span"].get("input_nodes").is_none());
+    }
+    assert!(
+        active_maps.iter().any(|r| {
+            r["span"]["indexed_nodes"].as_u64().unwrap()
+                > r["span"]["active_nodes"].as_u64().unwrap()
+        }),
+        "index inventory must not be reported as the selected active closure"
     );
     assert!(
         records

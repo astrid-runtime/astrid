@@ -86,7 +86,9 @@ impl MetadataIndex {
             ))
     }
 
-    #[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all, fields(domain = ?domain, input_nodes = self.nodes.len(), active_nodes = tracing::field::Empty))]
+    // This phase includes indexed frame loading and full canonical validation.
+    // Its inventory count includes historical nodes, not only the active closure.
+    #[tracing::instrument(name = "recover_indexed_active_map", target = "astrid_storage::recovery", level = "debug", skip_all, fields(domain = ?domain, indexed_nodes = self.nodes.len(), active_nodes = tracing::field::Empty))]
     pub(in crate::engine::durable::representations) fn recover_active_map<F: DurableIo>(
         &mut self,
         domain: PhysicalMapDomain,
