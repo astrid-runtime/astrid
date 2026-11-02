@@ -318,7 +318,7 @@ impl RepresentationStore {
 
     pub(super) fn logical_liveness_roots(&self) -> Result<BTreeSet<ObjectId>, DurableError> {
         let mut roots = BTreeSet::new();
-        for (_, bytes) in recovery::active_entries(&self.profiles)? {
+        recovery::for_each_active_entry(&self.profiles, |_, bytes| {
             let profile = RepresentationProfile::decode(bytes)?;
             roots.extend(
                 profile
@@ -329,8 +329,9 @@ impl RepresentationStore {
                         ProfileDependency::PhysicalBlob(_) => None,
                     }),
             );
-        }
-        for (_, bytes) in recovery::active_entries(&self.representations)? {
+            Ok(())
+        })?;
+        recovery::for_each_active_entry(&self.representations, |_, bytes| {
             let record = RepresentationRecord::decode(bytes)?;
             roots.extend(
                 record
@@ -346,7 +347,8 @@ impl RepresentationStore {
                         | Dependency::Profile(_) => None,
                     }),
             );
-        }
+            Ok(())
+        })?;
         Ok(roots)
     }
 

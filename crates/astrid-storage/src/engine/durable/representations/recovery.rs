@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, HashSet};
 use std::io::SeekFrom;
 
 use super::super::DurableIo;
@@ -343,7 +343,7 @@ pub(super) fn validate_profiles(
     map: &CanonicalPhysicalMap,
 ) -> Result<RepresentationProfileId, DurableError> {
     let mut direct = None;
-    for (key, value) in active_entries(map)? {
+    for_each_active_entry(map, |key, value| {
         let profile = RepresentationProfile::decode(value)?;
         let id = profile.identify(&Blake3PhysicalIdentity)?;
         if PhysicalMapKey::from(id) != key {
@@ -358,7 +358,8 @@ pub(super) fn validate_profiles(
                 "catalogue has more than one direct profile",
             ));
         }
-    }
+        Ok(())
+    })?;
     direct.ok_or(DurableError::InvalidRepresentationState(
         "catalogue has no direct profile",
     ))
@@ -379,7 +380,7 @@ pub(super) fn validate_representations(
 ) -> Result<ValidatedRepresentations, DurableError> {
     let mut placement_by_blob = BTreeMap::new();
     let mut extent_count = 0_u64;
-    for (key, bytes) in active_entries(placements)? {
+    for_each_active_entry(placements, |key, bytes| {
         let entry = PlacementEntry::decode(bytes)?;
         if PhysicalMapKey::from(entry.blob()) != key {
             return Err(DurableError::InvalidRepresentationState(
@@ -401,12 +402,13 @@ pub(super) fn validate_representations(
             )
             .ok_or(DurableError::EncodingOverflow)?;
         placement_by_blob.insert(entry.blob(), entry);
-    }
+        Ok(())
+    })?;
     let mut reverse = BTreeMap::<ObjectId, Vec<RepresentationRecordId>>::new();
     // First matching direct_profile blob per object in reverse-vector order.
     // Record payloads are not retained; placement_by_blob is already decoded.
     let mut selected = BTreeMap::<ObjectId, BlobId>::new();
-    for (key, bytes) in active_entries(representations)? {
+    for_each_active_entry(representations, |key, bytes| {
         let record = RepresentationRecord::decode(bytes)?;
         let id = record.identify(&Blake3PhysicalIdentity)?;
         if PhysicalMapKey::from(id) != key {
@@ -427,7 +429,7 @@ pub(super) fn validate_representations(
                 },
                 Recipe::DirectCanonical { blob },
             ) => (*object, *blob, *canonical_record_bytes),
-            _ => continue,
+            _ => return Ok(()),
         };
         let placement =
             placement_by_blob
@@ -445,7 +447,8 @@ pub(super) fn validate_representations(
         if record.profile() == direct_profile {
             selected.entry(object).or_insert(blob);
         }
-    }
+        Ok(())
+    })?;
     let locations =
         generation_zero_locations_from_selected(&reverse, &selected, &placement_by_blob)?;
     Ok(ValidatedRepresentations {
@@ -506,15 +509,16 @@ fn generation_zero_locations_from_selected(
     Ok(direct)
 }
 
-pub(super) fn active_entries(
+pub(super) fn for_each_active_entry(
     map: &CanonicalPhysicalMap,
-) -> Result<Vec<(PhysicalMapKey, &[u8])>, DurableError> {
+    mut visit: impl FnMut(PhysicalMapKey, &[u8]) -> Result<(), DurableError>,
+) -> Result<(), DurableError> {
     let Some(root) = map.root() else {
-        return Ok(Vec::new());
+        return Ok(());
     };
-    let mut entries = Vec::new();
     let mut stack = vec![root];
-    let mut visited = BTreeSet::new();
+    // Only membership matters here; the DFS stack determines canonical entry order.
+    let mut visited = HashSet::new();
     while let Some(id) = stack.pop() {
         if !visited.insert(id) {
             return Err(DurableError::InvalidRepresentationState(
@@ -527,7 +531,7 @@ pub(super) fn active_entries(
             .ok_or(DurableError::InvalidRepresentationState(
                 "physical map traversal found a missing node",
             ))? {
-            PhysicalMapNode::Leaf { key, value, .. } => entries.push((*key, value.as_slice())),
+            PhysicalMapNode::Leaf { key, value, .. } => visit(*key, value.as_slice())?,
             PhysicalMapNode::Branch { zero, one, .. } => {
                 stack.push(*one);
                 stack.push(*zero);
@@ -535,17 +539,17 @@ pub(super) fn active_entries(
             PhysicalMapNode::Page {
                 entries: page_entries,
                 ..
-            } => entries.extend(
-                page_entries
-                    .iter()
-                    .map(|(key, value)| (*key, value.as_slice())),
-            ),
+            } => {
+                for (key, value) in page_entries {
+                    visit(*key, value.as_slice())?;
+                }
+            },
             PhysicalMapNode::Radix { children, .. } => {
                 stack.extend(children.iter().rev().copied());
             },
         }
     }
-    Ok(entries)
+    Ok(())
 }
 
 pub(super) fn read_current_file<F: DurableIo>(

@@ -637,3 +637,76 @@ fn indexed_active_recovery_rejects_incomplete_and_forged_subtree_counts() {
         "indexed traversal must retain canonical shape validation"
     );
 }
+
+#[test]
+fn active_entry_visitor_preserves_order_and_borrows_values_across_constructions() {
+    let entries = (0_u32..128)
+        .map(|ordinal| {
+            (
+                PhysicalMapKey::new(*blake3::hash(&ordinal.to_le_bytes()).as_bytes()),
+                ordinal.to_le_bytes().to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut expected = entries.clone();
+    expected.sort_by_key(|(key, _)| *key);
+    for dense in [false, true] {
+        let build = if dense {
+            CanonicalPhysicalMap::build_dense
+        } else {
+            CanonicalPhysicalMap::build
+        };
+        let mut map = build(
+            &Blake3PhysicalIdentity,
+            PhysicalMapDomain::Representation,
+            entries[..64].to_vec(),
+        )
+        .unwrap();
+        for (key, value) in &entries[64..] {
+            map.insert(&Blake3PhysicalIdentity, *key, value.clone())
+                .unwrap();
+        }
+        let fresh = build(
+            &Blake3PhysicalIdentity,
+            PhysicalMapDomain::Representation,
+            entries.clone(),
+        )
+        .unwrap();
+        assert_eq!(map.root(), fresh.root());
+        assert!(map.nodes().len() > fresh.nodes().len());
+        let mut actual = Vec::new();
+        for_each_active_entry(&map, |key, bytes| {
+            assert!(std::ptr::eq(bytes, map.get(key).unwrap()));
+            actual.push((key, bytes.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(actual, expected, "dense={dense}");
+    }
+}
+
+#[test]
+fn active_entry_visitor_propagates_rejection_and_skips_empty_maps() {
+    let map = dense_representation_map();
+    let mut visited = 0;
+    let error = for_each_active_entry(&map, |_, _| {
+        visited += 1;
+        Err(DurableError::InvalidRepresentationState(
+            "visitor rejected entry",
+        ))
+    });
+    assert_eq!(visited, 1);
+    assert!(matches!(
+        error,
+        Err(DurableError::InvalidRepresentationState(
+            "visitor rejected entry"
+        ))
+    ));
+    let empty = CanonicalPhysicalMap::build_dense(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Representation,
+        Vec::new(),
+    )
+    .unwrap();
+    for_each_active_entry(&empty, |_, _| panic!("empty map has no entries")).unwrap();
+}
