@@ -42,3 +42,39 @@ fn recovery_memo_never_remembers_an_incomplete_closure() {
     ));
     assert_eq!(complete, verified);
 }
+
+#[test]
+fn metadata_recovery_keeps_one_owned_copy_of_each_map_node() {
+    let node = PhysicalMapNode::leaf(
+        PhysicalMapDomain::Representation,
+        PhysicalMapKey::new([7; 32]),
+        vec![42; 4096],
+    );
+    let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, &node).unwrap();
+    let mut file = tempfile::tempfile().unwrap();
+    for _ in 0..2 {
+        super::super::append_frame(&mut file, METADATA_MAGIC, &frame.encode().unwrap()).unwrap();
+    }
+    let index = recover_metadata(&mut file, RecoveryLimits::process_addressable()).unwrap();
+    assert_eq!(index.nodes.len(), 1);
+    assert_eq!(index.nodes[&map_node_id(frame.identity)], node);
+    assert!(
+        index.values.is_empty(),
+        "decoded nodes must not retain a second encoded payload"
+    );
+}
+
+#[test]
+fn metadata_recovery_rejects_map_bytes_with_another_nodes_identity() {
+    let node = PhysicalMapNode::leaf(
+        PhysicalMapDomain::Representation,
+        PhysicalMapKey::new([7; 32]),
+        vec![42; 4096],
+    );
+    let mut frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, &node).unwrap();
+    frame.identity[0] ^= 1;
+    let mut index = MetadataIndex::default();
+    assert!(index.insert(frame).is_err());
+    assert!(index.nodes.is_empty());
+    assert!(index.values.is_empty());
+}
