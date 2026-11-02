@@ -18,6 +18,8 @@ mod provenance;
 mod recovery;
 #[path = "storage_io/report.rs"]
 mod report;
+#[path = "storage_io/resource.rs"]
+mod resource;
 #[path = "storage_io/workloads.rs"]
 mod workloads;
 

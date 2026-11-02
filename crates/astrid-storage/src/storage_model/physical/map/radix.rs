@@ -1,9 +1,10 @@
 //! Dense canonical nibble-radix construction.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 
+use super::occupancy::{Occupancy, occupy_node};
 use super::{
     DIGEST_NIBBLES, PhysicalIdentity, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode,
     PhysicalMapNodeId, PhysicalModelError, RADIX_PAGE_CAPACITY, nibble_prefix_byte_len,
@@ -21,6 +22,7 @@ pub(super) fn insert<I: PhysicalIdentity>(
     identity: &I,
     domain: PhysicalMapDomain,
     nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    pending: Option<&mut BTreeSet<PhysicalMapNodeId>>,
     root: PhysicalMapNodeId,
     key: PhysicalMapKey,
     value: Vec<u8>,
@@ -29,6 +31,7 @@ pub(super) fn insert<I: PhysicalIdentity>(
         identity,
         domain,
         nodes,
+        pending,
     }
     .insert_at(root, key, value)
 }
@@ -106,6 +109,7 @@ struct DenseInsertion<'a, I> {
     identity: &'a I,
     domain: PhysicalMapDomain,
     nodes: &'a mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    pending: Option<&'a mut BTreeSet<PhysicalMapNodeId>>,
 }
 
 impl<I: PhysicalIdentity> DenseInsertion<'_, I> {
@@ -141,9 +145,7 @@ impl<I: PhysicalIdentity> DenseInsertion<'_, I> {
                 let replacement = if entries.len() <= RADIX_PAGE_CAPACITY {
                     self.insert_node(PhysicalMapNode::page(self.domain, entries)?)?
                 } else {
-                    build(self.domain, &entries, &mut |node| {
-                        insert_node(self.identity, self.nodes, node)
-                    })?
+                    build(self.domain, &entries, &mut |node| self.insert_node(node))?
                 };
                 Ok((replacement, true))
             },
@@ -249,7 +251,14 @@ impl<I: PhysicalIdentity> DenseInsertion<'_, I> {
         &mut self,
         node: PhysicalMapNode,
     ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
-        insert_node(self.identity, self.nodes, node)
+        occupy_node(
+            self.identity,
+            Occupancy {
+                nodes: self.nodes,
+                pending: self.pending.as_deref_mut(),
+            },
+            node,
+        )
     }
 }
 
@@ -259,16 +268,6 @@ struct Branch {
     child_bitmap: u16,
     children: Vec<PhysicalMapNodeId>,
     subtree_entries: u64,
-}
-
-fn insert_node<I: PhysicalIdentity>(
-    identity: &I,
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
-    node: PhysicalMapNode,
-) -> Result<PhysicalMapNodeId, PhysicalModelError> {
-    let id = node.identify(identity)?;
-    nodes.entry(id).or_insert(node);
-    Ok(id)
 }
 
 pub(super) fn nibble(key: PhysicalMapKey, index: u8) -> u8 {

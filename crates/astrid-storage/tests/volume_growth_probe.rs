@@ -127,3 +127,84 @@ fn tiny_overwrite_commits_do_not_rewrite_the_extent_map() {
         drop(writer);
     }
 }
+
+#[test]
+#[ignore = "controlled public-API extent-capacity replay; run explicitly"]
+fn one_region_recovers_beyond_the_legacy_snapshot_capacity() {
+    assert_fragmented_capacity_recovers(1);
+}
+
+#[test]
+#[ignore = "controlled public-API extent-capacity replay; run explicitly"]
+fn interleaved_regions_recover_beyond_the_legacy_snapshot_capacity() {
+    assert_fragmented_capacity_recovers(7);
+}
+
+fn assert_fragmented_capacity_recovers(region_count: usize) {
+    // ASTMAP1 uses 24 bytes per extent and has a 16 MiB payload ceiling.
+    // Cross that real format boundary through ordinary public writes, rather
+    // than constructing an impossible namespace or lowering a test-only cap.
+    const LEGACY_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
+    const LEGACY_EXTENT_BYTES: u64 = 24;
+    let extent_count = LEGACY_SNAPSHOT_BYTES / LEGACY_EXTENT_BYTES + 1;
+    let region_count_u64 = u64::try_from(region_count).unwrap();
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let writer = HostedFileVolume::open(&path).unwrap();
+    let regions: Vec<_> = (0..region_count)
+        .map(|index| VolumeRegion::new(format!("region-{index}")).unwrap())
+        .collect();
+    for region in &regions {
+        writer.create_region(region, true).unwrap();
+    }
+    #[cfg(unix)]
+    let original_inode = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&path).unwrap().ino()
+    };
+    for index in 0..extent_count {
+        let region = &regions[usize::try_from(index.strict_rem(region_count_u64)).unwrap()];
+        let value = u8::try_from(index % 251).unwrap();
+        writer
+            .write_region_at(region, index.strict_div(region_count_u64), &[value])
+            .unwrap();
+        if index == extent_count / 2 {
+            writer.sync().unwrap();
+        }
+    }
+    // The writes after the earlier acknowledged checkpoint exceed the tail
+    // budget. Old code must now describe the enlarged map and fails here.
+    writer.sync().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), original_inode);
+    }
+    let acknowledged_bytes = std::fs::metadata(&path).unwrap().len();
+    writer.sync().unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), acknowledged_bytes);
+
+    // Recover acknowledged persisted bytes before Drop gets another chance
+    // to flush, and verify every mapped byte across all region boundaries.
+    let copy = temporary.path().join("acknowledged.volume");
+    std::fs::copy(&path, &copy).unwrap();
+    let recovered = HostedFileVolume::open(&copy).unwrap();
+    for (index, region) in regions.iter().enumerate() {
+        let region_index = u64::try_from(index).unwrap();
+        let expected_len = extent_count
+            .strict_sub(1)
+            .strict_sub(region_index)
+            .strict_div(region_count_u64)
+            .strict_add(1);
+        assert_eq!(recovered.region_len(region).unwrap(), expected_len);
+        let mut bytes = vec![0; usize::try_from(expected_len).unwrap()];
+        recovered.read_region_at(region, 0, &mut bytes).unwrap();
+        assert!(bytes.iter().enumerate().all(|(offset, actual)| {
+            let global = u64::try_from(offset)
+                .unwrap()
+                .strict_mul(region_count_u64)
+                .strict_add(region_index);
+            *actual == u8::try_from(global % 251).unwrap()
+        }));
+    }
+}

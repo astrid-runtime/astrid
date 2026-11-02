@@ -1,5 +1,6 @@
 //! Serialized open and reclaim coordination for hosted volume containers.
 
+use super::IndexCheckpoint;
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
@@ -63,7 +64,9 @@ impl HostedFileVolume {
     /// framing, invalid region name, or host I/O failure. An incomplete final
     /// record is treated as an uncommitted tail and truncated. Once a footer
     /// exists, recovery reads the footer, the named snapshot commit, and a
-    /// bounded tail of later records ending at that footer sequence.
+    /// bounded tail of later records ending at that footer sequence. Paged
+    /// checkpoints additionally verify every referenced immutable metadata
+    /// page with bounded working memory before exposing the namespace.
     #[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all)]
     pub fn open(path: impl AsRef<Path>) -> io::Result<Arc<Self>> {
         // Capture relative-path ownership once; later sync and reclaim must
@@ -99,6 +102,8 @@ impl HostedFileVolume {
         }
         let footer_pending = !recovery.footer_present;
         let mut state = ContainerState {
+            checkpoint_format: recovery.checkpoint_format,
+            index_checkpoint: IndexCheckpoint::NotPrepared,
             file,
             sequence: recovery.sequence,
             valid_len: recovery.valid_len,

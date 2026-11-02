@@ -16,9 +16,11 @@ use parking_lot::Mutex;
 
 use super::{AstridVolume, MAX_REGION_NAME_BYTES, VolumeMetadataMutation, VolumeRegion};
 
+mod extent_index;
 mod open;
 mod reclaim;
 mod recover;
+mod region_io;
 mod stream;
 
 const VOLUME_MAGIC: [u8; 8] = *b"ASTVOL1\0";
@@ -34,6 +36,12 @@ struct Extent {
     physical_offset: u64,
 }
 
+struct AppendedRecord {
+    payload_offset: u64,
+    payload_len: u64,
+    checksum: [u8; 32],
+}
+
 #[cfg(test)]
 thread_local! {
     static REGION_STATE_CLONES: Cell<usize> = const { Cell::new(0) };
@@ -44,7 +52,12 @@ thread_local! {
 #[derive(Debug, Default)]
 struct RegionState {
     length: u64,
+    // Legacy namespaces retain their map here until conversion. Paged
+    // namespaces retain only writes since their last bounded checkpoint.
     extents: BTreeMap<u64, Extent>,
+    root: Option<extent_index::reference::PageRef>,
+    // A truncate permanently clips the old base, even after logical regrowth.
+    base_limit: u64,
 }
 
 impl Clone for RegionState {
@@ -54,6 +67,8 @@ impl Clone for RegionState {
         Self {
             length: self.length,
             extents: self.extents.clone(),
+            root: self.root,
+            base_limit: self.base_limit,
         }
     }
 }
@@ -71,8 +86,23 @@ enum RestoreState {
     Required,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum CheckpointFormat {
+    #[default]
+    Legacy,
+    Paged,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IndexCheckpoint {
+    NotPrepared,
+    Prepared,
+}
+
 #[derive(Debug)]
 struct ContainerState {
+    checkpoint_format: CheckpointFormat,
+    index_checkpoint: IndexCheckpoint,
     file: File,
     sequence: u64,
     valid_len: u64,
@@ -126,6 +156,17 @@ impl HostedFileVolume {
         offset: u64,
         payload: &[u8],
     ) -> io::Result<(u64, u64)> {
+        let record = Self::append_record(state, operation, region, offset, payload)?;
+        Ok((record.payload_offset, record.payload_len))
+    }
+
+    fn append_record(
+        state: &mut ContainerState,
+        operation: Operation,
+        region: &VolumeRegion,
+        offset: u64,
+        payload: &[u8],
+    ) -> io::Result<AppendedRecord> {
         let next_sequence = state
             .sequence
             .checked_add(1)
@@ -177,7 +218,11 @@ impl HostedFileVolume {
             .checked_add(total_len)
             .ok_or_else(|| io::Error::other("volume length overflow"))?;
         state.sequence = next_sequence;
-        Ok((physical_payload, payload_len))
+        Ok(AppendedRecord {
+            payload_offset: physical_payload,
+            payload_len,
+            checksum,
+        })
     }
 
     fn make_durable(state: &mut ContainerState) -> io::Result<()> {
@@ -191,7 +236,8 @@ impl HostedFileVolume {
         if state.flush_state == FlushState::Confirmed {
             return Ok(());
         }
-        if state.last_commit_offset == 0
+        if state.checkpoint_format == CheckpointFormat::Legacy
+            && state.last_commit_offset == 0
             && state.valid_len == VOLUME_MAGIC.len() as u64
             && state.regions.is_empty()
         {
@@ -209,6 +255,7 @@ impl HostedFileVolume {
             if !payload.is_empty() {
                 state.last_commit_offset = commit_start;
                 state.last_snapshot_end = state.valid_len;
+                state.index_checkpoint = IndexCheckpoint::NotPrepared;
             }
             state.durable_len = state.valid_len;
             state.boundary_pending = true;
@@ -230,11 +277,13 @@ impl HostedFileVolume {
 
     fn needs_commit(state: &ContainerState) -> bool {
         !state.boundary_pending
-            && (state.valid_len != state.durable_len || state.last_snapshot_end == 0)
+            && (state.valid_len != state.durable_len
+                || state.last_snapshot_end == 0
+                || state.index_checkpoint == IndexCheckpoint::Prepared)
     }
 
-    fn commit_payload(state: &ContainerState) -> io::Result<Vec<u8>> {
-        if state.last_snapshot_end != 0 {
+    fn commit_payload(state: &mut ContainerState) -> io::Result<Vec<u8>> {
+        if state.last_snapshot_end != 0 && state.index_checkpoint == IndexCheckpoint::NotPrepared {
             let tail = state
                 .valid_len
                 .checked_sub(state.last_snapshot_end)
@@ -252,7 +301,13 @@ impl HostedFileVolume {
                 return Ok(Vec::new());
             }
         }
-        recover::encode_region_snapshot(&state.regions)
+        if state.checkpoint_format == CheckpointFormat::Legacy
+            && recover::snapshot_bytes(&state.regions)? <= recover::MAX_COMMIT_SNAPSHOT_BYTES
+        {
+            recover::encode_region_snapshot(&state.regions)
+        } else {
+            extent_index::publication::prepare_checkpoint(state)
+        }
     }
 }
 impl Drop for HostedFileVolume {
@@ -302,46 +357,11 @@ impl AstridVolume for HostedFileVolume {
         offset: u64,
         buffer: &mut [u8],
     ) -> io::Result<usize> {
-        let mut state = self.state.lock();
+        let state = self.state.lock();
         let Some(region_state) = state.regions.get(region) else {
             return Err(io::Error::new(io::ErrorKind::NotFound, region.as_str()));
         };
-        if offset >= region_state.length || buffer.is_empty() {
-            return Ok(0);
-        }
-        let available = region_state.length.saturating_sub(offset);
-        let wanted = usize::try_from(available.min(buffer.len() as u64))
-            .map_err(|_| io::Error::other("volume read length overflow"))?;
-        let read_end = offset
-            .checked_add(wanted as u64)
-            .ok_or_else(|| io::Error::other("volume read range overflow"))?;
-        // Copy only extents that overlap the requested range. Cloning the whole
-        // region map on every read made catalog lookups quadratic in extents.
-        let overlaps = overlapping_extents(region_state, offset, read_end);
-        buffer[..wanted].fill(0);
-        for (start, extent) in overlaps {
-            let copy_start = start.max(offset);
-            let copy_end = extent.logical_end.min(read_end);
-            if copy_start >= copy_end {
-                continue;
-            }
-            let physical = extent
-                .physical_offset
-                .checked_add(copy_start.saturating_sub(start))
-                .ok_or_else(|| io::Error::other("volume extent offset overflow"))?;
-            let destination = usize::try_from(copy_start.saturating_sub(offset))
-                .map_err(|_| io::Error::other("volume destination offset overflow"))?;
-            let length = usize::try_from(copy_end.saturating_sub(copy_start))
-                .map_err(|_| io::Error::other("volume extent length overflow"))?;
-            state.file.seek(SeekFrom::Start(physical))?;
-            let destination_end = destination
-                .checked_add(length)
-                .ok_or_else(|| io::Error::other("volume destination range overflow"))?;
-            state
-                .file
-                .read_exact(&mut buffer[destination..destination_end])?;
-        }
-        Ok(wanted)
+        region_io::read(&state.file, region_state, offset, buffer)
     }
 
     fn write_region_from(
@@ -365,6 +385,7 @@ impl AstridVolume for HostedFileVolume {
             .get_mut(region)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, region.as_str()))?;
         truncate_extents(&mut region_state.extents, length);
+        region_state.base_limit = region_state.base_limit.min(length);
         region_state.length = length;
         Ok(())
     }
@@ -492,6 +513,7 @@ enum Operation {
     Replace = 6,
     MetadataTransaction = 7,
     Commit = 8,
+    IndexPage = 9,
 }
 
 impl Operation {
@@ -505,6 +527,7 @@ impl Operation {
             6 => Ok(Self::Replace),
             7 => Ok(Self::MetadataTransaction),
             8 => Ok(Self::Commit),
+            9 => Ok(Self::IndexPage),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unknown Astrid volume operation",

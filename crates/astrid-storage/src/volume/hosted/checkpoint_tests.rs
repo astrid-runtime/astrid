@@ -515,3 +515,152 @@ fn fallback_recovery_preserves_snapshot_rename_before_uncommitted_truncate() {
     assert_eq!(recovered.regions[&renamed].length, 9);
     assert!(!recovered.regions.contains_key(&region));
 }
+
+fn footerless_snapshot_history_with_uncommitted_tail()
+-> (tempfile::TempDir, std::path::PathBuf, u64, u64) {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let (volume, region) = open_objects(&path);
+    volume.create_region(&region, true).unwrap();
+    volume.write_region_at(&region, 0, b"protected").unwrap();
+    volume.sync().unwrap();
+    let (durable, mut sequence, snapshot) = {
+        let state = volume.state.lock();
+        (
+            state.durable_len,
+            state.sequence,
+            recover::encode_region_snapshot(&state.regions).unwrap(),
+        )
+    };
+    drop(volume);
+    OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(durable)
+        .unwrap();
+    let first_snapshot_offset = durable;
+    for _ in 0..64 {
+        sequence = sequence.strict_add(1);
+        append_legacy_record(
+            &path,
+            sequence,
+            Operation::Commit,
+            COMMIT_REGION.as_bytes(),
+            0,
+            &snapshot,
+        );
+    }
+    append_legacy_record(
+        &path,
+        sequence.strict_add(1),
+        Operation::Truncate,
+        b"objects",
+        0,
+        &[],
+    );
+    (temporary, path, sequence, first_snapshot_offset)
+}
+
+#[test]
+fn fallback_recovery_reuses_validated_snapshot_instead_of_replaying_history_twice() {
+    let (_temporary, path, sequence, _) = footerless_snapshot_history_with_uncommitted_tail();
+    let mut file = File::open(&path).unwrap();
+    recover::reset_read_header_count();
+    let recovered = recover::recover_container(&mut file).unwrap();
+    assert_eq!(recovered.sequence, sequence);
+    let region = &recovered.regions[&VolumeRegion::new("objects").unwrap()];
+    assert_eq!(region.length, 9);
+    let extent = region.extents.values().next().unwrap();
+    let mut bytes = [0; 9];
+    let mut reader = &file;
+    reader
+        .seek(SeekFrom::Start(extent.physical_offset))
+        .unwrap();
+    reader.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"protected");
+    // Keep the full first scan, one uncommitted record, and the selected snapshot.
+    // Historical snapshots must not cause a second full-prefix header walk.
+    assert!(recover::read_header_count() <= usize::try_from(sequence).unwrap() + 2);
+}
+
+#[test]
+fn fallback_snapshot_reuse_still_rejects_corrupted_historical_commit() {
+    let (_temporary, path, _, first_snapshot_offset) =
+        footerless_snapshot_history_with_uncommitted_tail();
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[usize::try_from(first_snapshot_offset).unwrap() + 43] ^= 1;
+    std::fs::write(&path, bytes).unwrap();
+    let mut file = File::open(&path).unwrap();
+    assert!(recover::recover_container(&mut file).is_err());
+}
+
+#[test]
+fn fallback_snapshot_tail_preserves_header_only_write_acceptance() {
+    for payload_length in [
+        9,
+        usize::try_from(recover::MAX_COMMIT_SNAPSHOT_BYTES).unwrap() + 1,
+    ] {
+        for corrupt_write_checksum in [false, true] {
+            let (_temporary, path, sequence, _) =
+                footerless_snapshot_history_with_uncommitted_tail();
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let committed = recover::recover_container(&mut file).unwrap().durable_len;
+            file.set_len(committed).unwrap();
+            let payload = vec![0x5A; payload_length];
+            append_legacy_record(
+                &path,
+                sequence.strict_add(1),
+                Operation::Write,
+                b"objects",
+                0,
+                &payload,
+            );
+            append_legacy_record(
+                &path,
+                sequence.strict_add(2),
+                Operation::Commit,
+                COMMIT_REGION.as_bytes(),
+                0,
+                &[],
+            );
+            if corrupt_write_checksum {
+                // Legacy header recovery is explicitly not a write-data scrub.
+                file.seek(SeekFrom::Start(committed + 43)).unwrap();
+                let mut byte = [0];
+                file.read_exact(&mut byte).unwrap();
+                byte[0] ^= 1;
+                file.seek(SeekFrom::Start(committed + 43)).unwrap();
+                file.write_all(&byte).unwrap();
+            }
+            append_legacy_record(
+                &path,
+                sequence.strict_add(3),
+                Operation::Truncate,
+                b"objects",
+                0,
+                &[],
+            );
+            recover::reset_read_header_count();
+            let recovered = recover::recover_container(&mut file).unwrap();
+            assert_eq!(recovered.sequence, sequence.strict_add(2));
+            let region = &recovered.regions[&VolumeRegion::new("objects").unwrap()];
+            assert_eq!(region.length, payload_length as u64);
+            let extent = region.extents.values().next().unwrap();
+            let mut actual = vec![0; payload_length];
+            file.seek(SeekFrom::Start(extent.physical_offset)).unwrap();
+            file.read_exact(&mut actual).unwrap();
+            assert_eq!(actual, payload);
+            let bounded_headers = usize::try_from(recovered.sequence).unwrap() + 4;
+            if payload_length as u64 <= recover::MAX_COMMIT_SNAPSHOT_BYTES {
+                assert!(recover::read_header_count() <= bounded_headers);
+            } else {
+                assert!(recover::read_header_count() > bounded_headers);
+            }
+        }
+    }
+}

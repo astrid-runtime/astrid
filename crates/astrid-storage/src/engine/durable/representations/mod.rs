@@ -6,8 +6,8 @@ use std::path::Path;
 
 use crate::storage_model::{
     CanonicalPhysicalMap, Coverage, Dependency, ObjectId, PhysicalMapDomain, PhysicalMapKey,
-    PlacementEntry, PlacementSet, ProfileDependency, Recipe, Replica, ReplicaLocator,
-    RepresentationCatalogueRoot, RepresentationProfile, RepresentationProfileId,
+    PhysicalMapNodeId, PlacementEntry, PlacementSet, ProfileDependency, Recipe, Replica,
+    ReplicaLocator, RepresentationCatalogueRoot, RepresentationProfile, RepresentationProfileId,
     RepresentationRecord, RepresentationRecordId, RepresentationState, RepresentationStateId,
     StorageNodeId,
 };
@@ -26,15 +26,20 @@ use format::{
 };
 
 mod activation;
+#[cfg(test)]
+mod append_fault;
+use activation::append_new_reachable_map_nodes;
 mod authority;
 mod checkpoint;
 mod format;
 mod index_validation;
 pub(super) use index_validation::GenerationZeroLocations;
+#[cfg(test)]
+mod pending_tests;
 mod recovery;
 mod residency;
 
-use activation::{append_new_reachable_map_nodes, build_initial_state, generation_name};
+use activation::{build_initial_state, generation_name};
 use recovery::{
     MetadataIndex, ValidatedRepresentations, generation_zero_arena_locations, read_current_file,
     recover_journal, recover_metadata, validate_profiles, validate_representations,
@@ -108,9 +113,7 @@ pub(super) struct RepresentationStore {
     profiles: CanonicalPhysicalMap,
     representations: CanonicalPhysicalMap,
     placement_entries: CanonicalPhysicalMap,
-    persisted_map_nodes: BTreeSet<crate::storage_model::PhysicalMapNodeId>,
-    // Memoized durable descendant closures; discarded when the store is reopened.
-    complete_map_subtrees: BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    pending_unpersisted_map_nodes: BTreeSet<PhysicalMapNodeId>,
     direct_profile: RepresentationProfileId,
     reverse: BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
 }
@@ -134,6 +137,7 @@ struct DirectMapEntry {
 #[cfg(test)]
 std::thread_local! {
     pub(super) static DIRECT_ARENA_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FAIL_NEXT_METADATA_APPEND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl RepresentationStore {
@@ -187,6 +191,7 @@ impl RepresentationStore {
             active,
             state,
             index,
+            limits,
         )?))
     }
 
@@ -317,7 +322,7 @@ impl RepresentationStore {
 
     pub(super) fn logical_liveness_roots(&self) -> Result<BTreeSet<ObjectId>, DurableError> {
         let mut roots = BTreeSet::new();
-        for (_, bytes) in recovery::active_entries(&self.profiles)? {
+        recovery::for_each_active_entry(&self.profiles, |_, bytes| {
             let profile = RepresentationProfile::decode(bytes)?;
             roots.extend(
                 profile
@@ -328,8 +333,9 @@ impl RepresentationStore {
                         ProfileDependency::PhysicalBlob(_) => None,
                     }),
             );
-        }
-        for (_, bytes) in recovery::active_entries(&self.representations)? {
+            Ok(())
+        })?;
+        recovery::for_each_active_entry(&self.representations, |_, bytes| {
             let record = RepresentationRecord::decode(bytes)?;
             roots.extend(
                 record
@@ -345,7 +351,8 @@ impl RepresentationStore {
                         | Dependency::Profile(_) => None,
                     }),
             );
-        }
+            Ok(())
+        })?;
         Ok(roots)
     }
 
@@ -377,18 +384,12 @@ impl RepresentationStore {
     }
 
     pub(super) fn contains_direct(&self, object: ObjectId) -> bool {
-        self.reverse.get(&object).is_some_and(|records| {
-            records.iter().any(|record| {
-                self.representations
-                    .get(PhysicalMapKey::from(*record))
-                    .and_then(|bytes| RepresentationRecord::decode(bytes).ok())
-                    .is_some_and(|value| {
-                        value.profile() == self.direct_profile
-                            && matches!(value.coverage(), Coverage::Exact { object: covered, .. } if *covered == object)
-                            && matches!(value.recipe(), Recipe::DirectCanonical { .. })
-                    })
-            })
-        })
+        // Recovery validates every record and requires each reverse-index key
+        // to have a matching direct-profile record and generation-zero placement.
+        // Publication adds only checked direct entries or replaces the whole
+        // index with a checked direct rebase. Pending entries are absent until
+        // publication; membership reuses that proof without decoding it again.
+        self.reverse.contains_key(&object)
     }
 
     pub(super) fn append_direct_update(
@@ -412,10 +413,6 @@ impl RepresentationStore {
         if entries.is_empty() {
             return Ok(None);
         }
-        let rebuild_representations =
-            bulk_rebuild_is_cheaper(self.representations.entry_count(), entries.len())?;
-        let rebuild_placements =
-            bulk_rebuild_is_cheaper(self.placement_entries.entry_count(), entries.len())?;
         let representation_entries = entries
             .iter()
             .map(|entry| entry.representation.clone())
@@ -424,43 +421,22 @@ impl RepresentationStore {
             .iter()
             .map(|entry| entry.placement.clone())
             .collect::<Vec<_>>();
-        if rebuild_representations {
-            self.representations
-                .rebuild_with_entries(&Blake3PhysicalIdentity, representation_entries)?;
-        } else {
-            for (key, value) in representation_entries {
-                self.representations
-                    .insert(&Blake3PhysicalIdentity, key, value)?;
-            }
-        }
-        if rebuild_placements {
-            self.placement_entries
-                .rebuild_with_entries(&Blake3PhysicalIdentity, placement_entries)?;
-        } else {
-            for (key, value) in placement_entries {
-                self.placement_entries
-                    .insert(&Blake3PhysicalIdentity, key, value)?;
-            }
-        }
+        occupy_map_entries(
+            &mut self.representations,
+            &mut self.pending_unpersisted_map_nodes,
+            representation_entries,
+        )?;
+        occupy_map_entries(
+            &mut self.placement_entries,
+            &mut self.pending_unpersisted_map_nodes,
+            placement_entries,
+        )?;
         let reverse_additions = entries
             .into_iter()
             .map(|entry| (entry.object, entry.representation_id))
             .collect();
         let mut appended_map_nodes = BTreeSet::new();
-        append_new_reachable_map_nodes(
-            &mut metadata,
-            &self.representations,
-            &self.persisted_map_nodes,
-            &mut appended_map_nodes,
-            &mut self.complete_map_subtrees,
-        )?;
-        append_new_reachable_map_nodes(
-            &mut metadata,
-            &self.placement_entries,
-            &self.persisted_map_nodes,
-            &mut appended_map_nodes,
-            &mut self.complete_map_subtrees,
-        )?;
+        self.append_pending_map_nodes(&mut metadata, &mut appended_map_nodes)?;
         let (catalogue, placements, state) = self.next_authority()?;
         let state_id = state.identify(&Blake3PhysicalIdentity);
         metadata.push(MetadataFrame::catalogue(&Blake3PhysicalIdentity, catalogue));
@@ -473,8 +449,7 @@ impl RepresentationStore {
             .iter()
             .map(MetadataFrame::encode)
             .collect::<Result<Vec<_>, _>>()?;
-        append_frames(&mut self.metadata, METADATA_MAGIC, &payloads)?;
-        self.persisted_map_nodes.extend(appended_map_nodes);
+        self.persist_appended_map_nodes(&payloads, appended_map_nodes)?;
         Ok(Some(PendingRepresentationUpdate {
             state,
             state_id,
@@ -513,21 +488,28 @@ impl RepresentationStore {
             .iter()
             .map(|entry| entry.placement.clone())
             .collect();
-        self.representations = CanonicalPhysicalMap::build_dense(
+        let representations = CanonicalPhysicalMap::build_dense(
             &Blake3PhysicalIdentity,
             PhysicalMapDomain::Representation,
             representation_entries,
         )?;
-        self.placement_entries = CanonicalPhysicalMap::build_dense(
+        let placement_entries = CanonicalPhysicalMap::build_dense(
             &Blake3PhysicalIdentity,
             PhysicalMapDomain::Placement,
             placement_entries,
         )?;
+        self.representations
+            .report_unoccupied_from(&representations, &mut self.pending_unpersisted_map_nodes);
+        self.placement_entries
+            .report_unoccupied_from(&placement_entries, &mut self.pending_unpersisted_map_nodes);
+        self.representations = representations;
+        self.placement_entries = placement_entries;
         self.residency = residency::MapResidency::new(
             &self.profiles,
             &self.representations,
             &self.placement_entries,
         );
+        self.retain_live_pending_nodes();
         let replacement_reverse = entries
             .into_iter()
             .map(|entry| (entry.object, vec![entry.representation_id]))
@@ -535,15 +517,7 @@ impl RepresentationStore {
 
         let mut metadata = Vec::new();
         let mut appended_map_nodes = BTreeSet::new();
-        for map in [&self.representations, &self.placement_entries] {
-            append_new_reachable_map_nodes(
-                &mut metadata,
-                map,
-                &self.persisted_map_nodes,
-                &mut appended_map_nodes,
-                &mut self.complete_map_subtrees,
-            )?;
-        }
+        self.append_pending_map_nodes(&mut metadata, &mut appended_map_nodes)?;
         let (catalogue, placements, state) = self.next_authority()?;
         let state_id = state.identify(&Blake3PhysicalIdentity);
         metadata.extend([
@@ -555,8 +529,7 @@ impl RepresentationStore {
             .iter()
             .map(MetadataFrame::encode)
             .collect::<Result<Vec<_>, _>>()?;
-        append_frames(&mut self.metadata, METADATA_MAGIC, &payloads)?;
-        self.persisted_map_nodes.extend(appended_map_nodes);
+        self.persist_appended_map_nodes(&payloads, appended_map_nodes)?;
         let update = PendingRepresentationUpdate {
             state,
             state_id,
@@ -764,6 +737,7 @@ impl RepresentationStore {
         active: RepresentationStateId,
         state: RepresentationState,
         mut index: MetadataIndex,
+        limits: RecoveryLimits,
     ) -> Result<(Self, GenerationZeroLocations), DurableError> {
         let catalogue = RepresentationCatalogueRoot::decode(
             index.value(MetadataKind::Catalogue, state.catalogue().as_bytes())?,
@@ -771,22 +745,25 @@ impl RepresentationStore {
         let placements = PlacementSet::decode(
             index.value(MetadataKind::Placement, state.placements().as_bytes())?,
         )?;
-        let profiles = residency::recover_active_map(
+        let profiles = index.recover_active_map(
             PhysicalMapDomain::Profile,
             catalogue.profiles_root(),
-            &mut index.nodes,
+            &metadata,
+            limits,
         )?;
-        let representations = residency::recover_active_map(
+        let representations = index.recover_active_map(
             PhysicalMapDomain::Representation,
             catalogue.representations_root(),
-            &mut index.nodes,
+            &metadata,
+            limits,
         )?;
-        let placement_entries = residency::recover_active_map(
+        let placement_entries = index.recover_active_map(
             PhysicalMapDomain::Placement,
             placements.entries_root(),
-            &mut index.nodes,
+            &metadata,
+            limits,
         )?;
-        // Active closures now own their nodes. Release unused historical bodies
+        // Active closures now own their nodes. Release unused historical links
         // and replay metadata before allocating the validated reverse index.
         drop(index);
         if profiles.entry_count() != catalogue.profile_count()
@@ -797,14 +774,8 @@ impl RepresentationStore {
                 "physical map count disagrees with its authority root",
             ));
         }
-        // This is an append memo, not the durable historical catalogue. Journal
-        // recovery has checked historical frame identities and CAS closure
-        // completeness. Active maps receive full canonical validation above.
-        // An evicted node can be appended again with its canonical ID.
-        let persisted_map_nodes = [&profiles, &representations, &placement_entries]
-            .into_iter()
-            .flat_map(|map| map.nodes().keys().copied())
-            .collect();
+        // Recovered occupancy is already durable. Track only vacant occupancy
+        // created after this open; never snapshot the live key set.
         let residency =
             residency::MapResidency::new(&profiles, &representations, &placement_entries);
         let direct_profile = validate_profiles(&profiles)?;
@@ -836,13 +807,76 @@ impl RepresentationStore {
                 profiles,
                 representations,
                 placement_entries,
-                persisted_map_nodes,
-                complete_map_subtrees: BTreeSet::new(),
+                pending_unpersisted_map_nodes: BTreeSet::new(),
                 direct_profile,
                 reverse,
             },
             locations,
         ))
+    }
+}
+
+fn persist_metadata_frames(
+    metadata: &mut DurableFile,
+    payloads: &[Vec<u8>],
+) -> Result<(), DurableError> {
+    #[cfg(test)]
+    if FAIL_NEXT_METADATA_APPEND.with(|fail| fail.replace(false)) {
+        return Err(io_error(
+            "append durable frame batch",
+            std::io::Error::other("injected metadata append failure"),
+        ));
+    }
+    #[cfg(test)]
+    if let Some(result) = append_fault::append_if_armed(metadata, payloads) {
+        return result;
+    }
+    append_frames(metadata, METADATA_MAGIC, payloads).map(|_| ())
+}
+
+fn occupy_map_entries(
+    map: &mut CanonicalPhysicalMap,
+    pending: &mut BTreeSet<PhysicalMapNodeId>,
+    entries: Vec<(PhysicalMapKey, Vec<u8>)>,
+) -> Result<(), DurableError> {
+    if bulk_rebuild_is_cheaper(map.entry_count(), entries.len())? {
+        map.rebuild_with_occupancy(&Blake3PhysicalIdentity, entries, pending)?;
+        return Ok(());
+    }
+    for (key, value) in entries {
+        map.insert_with_occupancy(&Blake3PhysicalIdentity, key, value, pending)?;
+    }
+    Ok(())
+}
+
+impl RepresentationStore {
+    fn persist_appended_map_nodes(
+        &mut self,
+        payloads: &[Vec<u8>],
+        appended: BTreeSet<PhysicalMapNodeId>,
+    ) -> Result<(), DurableError> {
+        persist_metadata_frames(&mut self.metadata, payloads)?;
+        for id in appended {
+            self.pending_unpersisted_map_nodes.remove(&id);
+        }
+        Ok(())
+    }
+
+    fn retain_live_pending_nodes(&mut self) {
+        let profiles = self.profiles.nodes();
+        let representations = self.representations.nodes();
+        let placements = self.placement_entries.nodes();
+        let resident = |id: &PhysicalMapNodeId| {
+            profiles.contains_key(id)
+                || representations.contains_key(id)
+                || placements.contains_key(id)
+        };
+        self.pending_unpersisted_map_nodes.retain(resident);
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_metadata_append() {
+        FAIL_NEXT_METADATA_APPEND.with(|fail| fail.set(true));
     }
 }
 

@@ -52,7 +52,7 @@ fn failed_atomic_publish_preserves_the_original_writable_state() {
 }
 
 #[test]
-fn sync_fail_closes_a_namespace_exceeding_the_snapshot_format_bound() {
+fn sync_pages_a_namespace_exceeding_the_legacy_snapshot_bound() {
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("astrid.volume");
     let volume = HostedFileVolume::open(&path).unwrap();
@@ -82,19 +82,30 @@ fn sync_fail_closes_a_namespace_exceeding_the_snapshot_format_bound() {
         target.length = count;
         assert!(recover::encode_region_snapshot(&state.regions).is_err());
     }
-    let error = volume.sync().unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    assert!(
-        error
-            .to_string()
-            .contains("commit snapshot exceeds format bound")
-    );
-    assert_eq!(
-        volume.state.lock().regions[&region].extents.len(),
-        usize::try_from(count).unwrap()
-    );
+    let before = same_file::Handle::from_path(&path).unwrap();
+    volume.sync().unwrap();
+    assert_eq!(before, same_file::Handle::from_path(&path).unwrap());
+    {
+        let state = volume.state.lock();
+        assert_eq!(state.checkpoint_format, CheckpointFormat::Paged);
+        assert!(state.regions[&region].extents.is_empty());
+        assert_eq!(
+            state.regions[&region].root.unwrap().extent_count().get(),
+            count
+        );
+    }
     assert!(!volume.state.lock().publication_pending);
     assert!(!reclaim::temp_path(&path).exists());
+    drop(volume);
+    let reopened = HostedFileVolume::open(&path).unwrap();
+    for offset in [0, count / 2, count - 1] {
+        let mut byte = [0];
+        assert_eq!(
+            reopened.read_region_at(&region, offset, &mut byte).unwrap(),
+            1
+        );
+        assert_eq!(byte, *b"x");
+    }
 }
 
 #[test]

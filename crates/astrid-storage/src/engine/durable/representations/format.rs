@@ -311,18 +311,47 @@ pub(in crate::engine::durable) struct Blake3PhysicalIdentity;
 
 impl PhysicalIdentity for Blake3PhysicalIdentity {
     fn identify(&self, context: &'static str, material: &[u8]) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new_derive_key(context);
+        let mut hasher = initialized_physical_hasher(context);
         hasher.update(material);
         *hasher.finalize().as_bytes()
     }
 
     fn identify_parts(&self, context: &'static str, parts: &[&[u8]]) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new_derive_key(context);
+        let mut hasher = initialized_physical_hasher(context);
         for part in parts {
             hasher.update(part);
         }
         *hasher.finalize().as_bytes()
     }
+}
+
+// These are format contexts, including their terminal NUL, not cache policy.
+const LEGACY_MAP_CONTEXT: &str = "astrid-physical-map-node-v1\0";
+const RADIX_MAP_CONTEXT: &str = "astrid-physical-radix-map-node-v1\0";
+
+fn initialized_physical_hasher(context: &'static str) -> blake3::Hasher {
+    // Clone the initialized derive-key hasher, retaining BLAKE3's material-mode
+    // flags. Feeding a derived key to new_keyed would change physical identity.
+    static LEGACY: std::sync::LazyLock<blake3::Hasher> =
+        std::sync::LazyLock::new(|| new_physical_hasher(LEGACY_MAP_CONTEXT));
+    static RADIX: std::sync::LazyLock<blake3::Hasher> =
+        std::sync::LazyLock::new(|| new_physical_hasher(RADIX_MAP_CONTEXT));
+    match context {
+        LEGACY_MAP_CONTEXT => (*LEGACY).clone(),
+        RADIX_MAP_CONTEXT => (*RADIX).clone(),
+        _ => new_physical_hasher(context),
+    }
+}
+
+fn new_physical_hasher(context: &'static str) -> blake3::Hasher {
+    #[cfg(test)]
+    PHYSICAL_HASHER_INITIALIZATIONS.with(|count| count.set(count.get().strict_add(1)));
+    blake3::Hasher::new_derive_key(context)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static PHYSICAL_HASHER_INITIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub(super) fn journal_digest(bytes: &[u8]) -> [u8; 32] {

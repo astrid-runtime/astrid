@@ -2,8 +2,9 @@
 
 use crate::storage_model::{
     CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode,
-    PlacementEntry, PlacementSet, Recipe, ReconstructionBounds, Replica, ReplicaLocator,
-    RepresentationCatalogueRoot, RepresentationProfile, RepresentationRecord, RepresentationState,
+    PhysicalMapNodeId, PlacementEntry, PlacementSet, Recipe, ReconstructionBounds, Replica,
+    ReplicaLocator, RepresentationCatalogueRoot, RepresentationProfile, RepresentationRecord,
+    RepresentationState,
 };
 use std::collections::BTreeSet;
 
@@ -130,12 +131,83 @@ pub(super) fn append_map_nodes(
     Ok(())
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static PENDING_NODE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl super::RepresentationStore {
+    /// Append only new occupancy in this store's current metadata generation.
+    ///
+    /// Recovery validates every initial closure; checked mutations report each
+    /// vacant ID before it can become reachable. IDs leave pending only after a
+    /// whole metadata batch succeeds. Thus an immutable nonpending node already
+    /// has an appended descendant closure. Publication still flushes metadata
+    /// before journal authority; this inference does not replace that ordering.
+    /// Keep this owner-bound: arbitrary maps and durable-ID sets do not prove it.
+    pub(super) fn append_pending_map_nodes(
+        &self,
+        metadata: &mut Vec<MetadataFrame>,
+        appended: &mut BTreeSet<PhysicalMapNodeId>,
+    ) -> Result<(), DurableError> {
+        // Profiles are immutable after recovery; only these two maps mutate.
+        for map in [&self.representations, &self.placement_entries] {
+            let Some(root) = map
+                .root()
+                .filter(|id| self.pending_unpersisted_map_nodes.contains(id))
+            else {
+                continue;
+            };
+            let mut stack = vec![(root, false)];
+            let mut visited = BTreeSet::new();
+            while let Some((id, expanded)) = stack.pop() {
+                if !self.pending_unpersisted_map_nodes.contains(&id)
+                    || appended.contains(&id)
+                    || (!expanded && !visited.insert(id))
+                {
+                    continue;
+                }
+                #[cfg(test)]
+                PENDING_NODE_READS.with(|reads| reads.set(reads.get().strict_add(1)));
+                let node = map
+                    .nodes()
+                    .get(&id)
+                    .ok_or(DurableError::InvalidRepresentationState(
+                        "active physical map is missing a reachable node",
+                    ))?;
+                if expanded {
+                    metadata.push(MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?);
+                    appended.insert(id);
+                    continue;
+                }
+                stack.push((id, true));
+                match node {
+                    PhysicalMapNode::Branch { zero, one, .. } => {
+                        stack.push((*one, false));
+                        stack.push((*zero, false));
+                    },
+                    PhysicalMapNode::Radix { children, .. } => {
+                        stack.extend(children.iter().rev().map(|child| (*child, false)));
+                    },
+                    PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => {},
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_pending_node_reads() -> usize {
+        PENDING_NODE_READS.with(|reads| reads.replace(0))
+    }
+}
+
 pub(super) fn append_new_reachable_map_nodes(
     metadata: &mut Vec<MetadataFrame>,
     map: &CanonicalPhysicalMap,
-    durable: &BTreeSet<crate::storage_model::PhysicalMapNodeId>,
-    appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
-    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    durable: &BTreeSet<PhysicalMapNodeId>,
+    appended: &mut BTreeSet<PhysicalMapNodeId>,
+    complete: &mut BTreeSet<PhysicalMapNodeId>,
 ) -> Result<usize, DurableError> {
     let Some(root) = map.root() else {
         return Ok(0);

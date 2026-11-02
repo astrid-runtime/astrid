@@ -7,6 +7,10 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
+
+#[cfg(not(target_family = "wasm"))]
+mod durable;
 
 use crate::storage_model::{
     ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectIdentity, ObjectKind,
@@ -358,6 +362,39 @@ pub trait KvProjectionEngine<P>: Send + Sync {
         self.load_kv_object(id)
     }
 
+    /// Load one immutable object without copying a governed cache allocation.
+    ///
+    /// The default preserves engines that only expose owned records.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same read errors as [`Self::load_kv_object_for`].
+    fn load_shared_kv_object_for(
+        &self,
+        principal: &P,
+        id: ObjectId,
+    ) -> Result<Option<Arc<ObjectRecord>>, KvProjectionError> {
+        self.load_kv_object_for(principal, id)
+            .map(|record| record.map(Arc::new))
+    }
+
+    /// Load shared immutable objects in request order with principal attribution.
+    ///
+    /// Durable engines coalesce reads while preserving full frame validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a read error if any requested object cannot be read.
+    fn load_shared_kv_objects_for(
+        &self,
+        principal: &P,
+        ids: &[ObjectId],
+    ) -> Result<Vec<Option<Arc<ObjectRecord>>>, KvProjectionError> {
+        ids.iter()
+            .map(|id| self.load_shared_kv_object_for(principal, *id))
+            .collect()
+    }
+
     /// Capture one principal's root and owning closure.
     ///
     /// # Errors
@@ -432,57 +469,6 @@ where
 
     fn flush_kv(&self) -> Result<(), KvProjectionError> {
         Ok(())
-    }
-}
-
-#[cfg(not(target_family = "wasm"))]
-impl<P, I, C> KvProjectionEngine<P> for DurableEngine<P, I, C>
-where
-    P: Clone + Ord + Send + Sync,
-    I: PersistentObjectIdentity + Send + Sync,
-    C: PrincipalCodec<P> + Send + Sync,
-{
-    fn identify_kv_object(&self, record: &ObjectRecord) -> ObjectId {
-        self.identify(record)
-    }
-
-    fn current_kv_root(&self, principal: &P) -> Result<Option<RootState>, KvProjectionError> {
-        self.root(principal).map_err(map_durable_error)
-    }
-
-    fn current_kv_root_if_ready(&self, principal: &P) -> Option<ReadyKvRoot> {
-        self.root_if_ready(principal)
-    }
-
-    fn load_kv_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, KvProjectionError> {
-        self.object(id).map_err(map_durable_error)
-    }
-
-    fn load_kv_object_for(
-        &self,
-        principal: &P,
-        id: ObjectId,
-    ) -> Result<Option<ObjectRecord>, KvProjectionError> {
-        self.object_for(principal, id).map_err(map_durable_error)
-    }
-
-    fn snapshot_kv_root(&self, principal: &P) -> Result<Option<RootSnapshot>, KvProjectionError> {
-        self.snapshot(principal).map_err(map_durable_error)
-    }
-
-    fn commit_kv_root(
-        &self,
-        transaction: RootTransaction<P>,
-    ) -> Result<CommitOutcome, KvProjectionError> {
-        self.commit(transaction).map_err(map_durable_error)
-    }
-
-    fn flush_kv(&self) -> Result<(), KvProjectionError> {
-        self.flush().map_err(map_durable_error)
-    }
-
-    fn close_kv(&self) -> Result<(), KvProjectionError> {
-        self.close().map_err(map_durable_error)
     }
 }
 

@@ -1,5 +1,6 @@
 //! Path-copy operations over canonical KV pages.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 
@@ -28,6 +29,8 @@ pub(super) struct TreeContext<'a, P, E> {
     principal: &'a P,
     records: BTreeMap<ObjectId, ObjectRecord>,
     nodes: BTreeMap<ObjectId, NodeHandle>,
+    #[cfg(test)]
+    content_loads: std::cell::Cell<usize>,
     marker: PhantomData<fn() -> P>,
 }
 
@@ -42,6 +45,8 @@ where
             principal,
             records: BTreeMap::new(),
             nodes: BTreeMap::new(),
+            #[cfg(test)]
+            content_loads: std::cell::Cell::new(0),
             marker: PhantomData,
         }
     }
@@ -114,7 +119,7 @@ where
         for (key, bytes) in entries {
             let entry = LeafEntry {
                 key,
-                value: self.make_value(bytes)?,
+                value: self.make_value(Cow::Owned(bytes))?,
             };
             current.push(entry);
             if current.len() > 1 && !page_fits(leaf_record(&current), current.len(), 1)? {
@@ -303,10 +308,10 @@ where
         let mut mutations = Vec::with_capacity(replacements.len());
         for (key, replacement) in replacements {
             let previous = match current.get(&key) {
-                Some(value) => value.clone(),
-                None => self.get(header.tree, &key)?,
+                Some(value) => value.as_deref().map(Cow::Borrowed),
+                None => self.get(header.tree, &key)?.map(Cow::Owned),
             };
-            if previous == replacement {
+            if previous.as_deref() == replacement.as_deref() {
                 return Err(StorageError::Serialization(
                     "KV mutation batch contains a no-op".to_owned(),
                 ));
@@ -318,15 +323,10 @@ where
                 replacement.as_deref(),
             )?;
             let value = replacement
-                .map(|value| self.make_value(value))
+                .as_deref()
+                .map(|value| self.make_value(Cow::Borrowed(value)))
                 .transpose()?;
-            current.insert(
-                key.clone(),
-                value
-                    .as_ref()
-                    .map(|value| self.value_bytes(value))
-                    .transpose()?,
-            );
+            current.insert(key.clone(), replacement);
             mutations.push(Mutation { key, value });
         }
         let record = delta_record(
