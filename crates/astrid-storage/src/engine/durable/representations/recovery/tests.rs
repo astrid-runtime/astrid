@@ -558,3 +558,82 @@ fn active_map_body_rereads_validate_the_frame_again() {
         "active bodies must pass full frame validation when loaded"
     );
 }
+
+#[test]
+fn indexed_active_recovery_validates_domain_and_consumes_each_node_once() {
+    let node = PhysicalMapNode::Page {
+        domain: PhysicalMapDomain::Profile,
+        entries: vec![(PhysicalMapKey::new([8; 32]), vec![9])],
+    };
+    let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, &node).unwrap();
+    let root = map_node_id(frame.identity);
+    let mut file = tempfile::tempfile().unwrap();
+    super::super::append_frame(&mut file, METADATA_MAGIC, &frame.encode().unwrap()).unwrap();
+    let limits = RecoveryLimits::process_addressable();
+    let mut index = recover_metadata(&mut file, limits).unwrap();
+    assert!(
+        index
+            .recover_active_map(PhysicalMapDomain::Placement, Some(root), &file, limits)
+            .is_err(),
+        "authenticated node bytes must not authorize a different map domain"
+    );
+    let mut index = recover_metadata(&mut file, limits).unwrap();
+    let recovered = index
+        .recover_active_map(PhysicalMapDomain::Profile, Some(root), &file, limits)
+        .unwrap();
+    assert_eq!(recovered.nodes(), &BTreeMap::from([(root, node)]));
+    assert_eq!(index.nodes.len(), 0);
+    assert!(matches!(
+        index.recover_active_map(PhysicalMapDomain::Profile, Some(root), &file, limits),
+        Err(DurableError::InvalidRepresentationState(
+            "active physical map closure is incomplete"
+        ))
+    ));
+}
+
+#[test]
+fn indexed_active_recovery_rejects_incomplete_and_forged_subtree_counts() {
+    let leaf = PhysicalMapNode::leaf(
+        PhysicalMapDomain::Representation,
+        PhysicalMapKey::new([8; 32]),
+        vec![9],
+    );
+    let other = PhysicalMapNode::leaf(
+        PhysicalMapDomain::Representation,
+        PhysicalMapKey::new([128; 32]),
+        vec![10],
+    );
+    // Frames and identities are valid, but two leaves cannot justify a count of three.
+    let branch = PhysicalMapNode::branch(
+        PhysicalMapDomain::Representation,
+        0,
+        vec![],
+        leaf.identify(&Blake3PhysicalIdentity).unwrap(),
+        other.identify(&Blake3PhysicalIdentity).unwrap(),
+        3,
+    )
+    .unwrap();
+    let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, &branch).unwrap();
+    let root = map_node_id(frame.identity);
+    let mut file = tempfile::tempfile().unwrap();
+    super::super::append_frame(&mut file, METADATA_MAGIC, &frame.encode().unwrap()).unwrap();
+    let limits = RecoveryLimits::process_addressable();
+    let mut index = recover_metadata(&mut file, limits).unwrap();
+    assert!(matches!(
+        index.recover_active_map(PhysicalMapDomain::Representation, Some(root), &file, limits),
+        Err(DurableError::InvalidRepresentationState(
+            "active physical map closure is incomplete"
+        ))
+    ));
+    for node in [&leaf, &other] {
+        let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, node).unwrap();
+        super::super::append_frame(&mut file, METADATA_MAGIC, &frame.encode().unwrap()).unwrap();
+    }
+    let mut index = recover_metadata(&mut file, limits).unwrap();
+    assert!(
+        index
+            .recover_active_map(PhysicalMapDomain::Representation, Some(root), &file, limits)
+            .is_err(),
+        "indexed traversal must retain canonical shape validation"
+    );
+}

@@ -86,6 +86,7 @@ impl MetadataIndex {
             ))
     }
 
+    #[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all, fields(domain = ?domain, input_nodes = self.nodes.len(), active_nodes = tracing::field::Empty))]
     pub(in crate::engine::durable::representations) fn recover_active_map<F: DurableIo>(
         &mut self,
         domain: PhysicalMapDomain,
@@ -140,7 +141,18 @@ impl MetadataIndex {
             pending.extend(children.iter().copied());
             nodes.insert(id, node);
         }
-        super::super::residency::recover_active_map(domain, root, &mut nodes)
+        if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {
+            tracing::Span::current().record("active_nodes", nodes.len());
+        }
+        // The indexed traversal already extracted exactly this active closure.
+        // Transfer its ownership directly; canonical recovery still validates
+        // identities, domains and shape, including cycles and shared children.
+        Ok(CanonicalPhysicalMap::recover(
+            &Blake3PhysicalIdentity,
+            domain,
+            root,
+            nodes,
+        )?)
     }
 
     #[cfg(test)]
