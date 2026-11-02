@@ -473,16 +473,19 @@ fn bounded_policy_tracks_both_directions_of_operator_resize() {
     let alice = "alice".to_owned();
     let weight = cache_weight(&record(1)) + association_weight::<String>();
     let capacity = NonZeroU64::new(weight).unwrap();
-    let cache = ObjectCache::new(ObjectCacheConfig::bounded(capacity));
+    let config = ObjectCacheConfig::bounded(capacity);
+    let controller = config.controller.clone();
+    let cache = ObjectCache::new(config);
     cache.insert(&alice, object(1), record(1));
     assert_eq!(cache.stats().resident_objects, 1);
-    cache.set_capacity(ObjectCacheCapacity::Bounded(
+    controller.set_capacity(ObjectCacheCapacity::Bounded(
         NonZeroU64::new(weight * 3).unwrap(),
     ));
     cache.insert(&alice, object(2), record(2));
     cache.insert(&alice, object(3), record(3));
     assert_eq!(cache.stats().resident_objects, 3);
-    cache.set_capacity(ObjectCacheCapacity::Bounded(capacity));
+    controller.set_capacity(ObjectCacheCapacity::Bounded(capacity));
+    cache.reclaim();
     assert!(cache.stats().resident_bytes <= weight);
     assert_eq!(cache.stats().resident_objects, 1);
     assert_lru_indexes(&cache);

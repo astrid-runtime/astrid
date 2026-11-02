@@ -1400,22 +1400,18 @@ impl Kernel {
         let host_audit_marker: Option<astrid_storage::ScopedKvStore> = None;
 
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let user_cpu = user_resources::load(
-            Arc::clone(&ownership_store),
-            principal_directory.clone(),
-            &home,
-            &workspace_root,
-            &workspace_layout,
-        )?;
+        let resource_policy =
+            user_resources::load_policy(&home, &workspace_root, &workspace_layout)?;
         #[cfg(not(target_family = "wasm"))]
         if let Some(store) = principal_store.as_ref() {
-            user_resources::configure_object_cache(
-                store,
-                &home,
-                &workspace_root,
-                &workspace_layout,
-            )?;
+            user_resources::configure_object_cache(store, &resource_policy);
         }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let user_cpu = user_resources::accounting(
+            Arc::clone(&ownership_store),
+            principal_directory.clone(),
+            resource_policy,
+        );
         let kernel = Arc::new(Self {
             session_id: session_id.clone(),
             event_bus,

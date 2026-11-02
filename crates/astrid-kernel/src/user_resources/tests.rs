@@ -173,7 +173,15 @@ async fn configured_cache_budget_reclaims_and_preserves_authoritative_reads() {
         "[resources]\ndecoded_object_cache_bytes = 1",
     )
     .unwrap();
-    configure_object_cache(&store, &home, workspace.path(), &WorkspaceLayout::default()).unwrap();
+    let policy = load_policy(&home, workspace.path(), &WorkspaceLayout::default()).unwrap();
+    // A second disk load would reject this edit or apply a different snapshot.
+    // Cache policy must use the same admission as CPU accounting.
+    std::fs::write(
+        home.root().join("config.toml"),
+        "[resources]\ndecoded_object_cache_bytes = 0",
+    )
+    .unwrap();
+    configure_object_cache(&store, &policy);
     assert_eq!(store.object_cache_stats().resident_bytes, 0);
     assert_eq!(
         store

@@ -27,39 +27,33 @@ pub(crate) async fn execution_throttle(
 #[cfg(test)]
 mod tests;
 
-pub(crate) fn load(
+pub(crate) fn accounting(
     ownership: Arc<OwnershipStore>,
     directory: PrincipalDirectory,
-    home: &astrid_core::dirs::AstridHome,
-    workspace: &std::path::Path,
-    layout: &astrid_core::dirs::WorkspaceLayout,
-) -> std::io::Result<Arc<UserCpuAccounting>> {
-    let policy = load_policy(home, workspace, layout)?;
-    Ok(Arc::new(UserCpuAccounting::new(
+    policy: astrid_config::resources::ResourceConfig,
+) -> Arc<UserCpuAccounting> {
+    Arc::new(UserCpuAccounting::new(
         ownership,
         directory,
         policy.default_user_cpu_fuel_per_sec,
         policy.user_cpu_fuel_per_sec,
-    )))
+    ))
 }
 
-/// Apply operator cache policy after the durable config projection is admitted.
+/// Apply the same admitted operator policy used for CPU accounting.
 #[cfg(not(target_family = "wasm"))]
 pub(crate) fn configure_object_cache(
     store: &astrid_storage::RuntimePrincipalStore,
-    home: &astrid_core::dirs::AstridHome,
-    workspace: &std::path::Path,
-    layout: &astrid_core::dirs::WorkspaceLayout,
-) -> std::io::Result<()> {
-    if let Some(bytes) = load_policy(home, workspace, layout)?.decoded_object_cache_bytes {
+    policy: &astrid_config::resources::ResourceConfig,
+) {
+    if let Some(bytes) = policy.decoded_object_cache_bytes {
         store.set_object_cache_capacity(astrid_storage::engine::ObjectCacheCapacity::Bounded(
             bytes.get(),
         ));
     }
-    Ok(())
 }
 
-fn load_policy(
+pub(crate) fn load_policy(
     home: &astrid_core::dirs::AstridHome,
     workspace: &std::path::Path,
     layout: &astrid_core::dirs::WorkspaceLayout,
