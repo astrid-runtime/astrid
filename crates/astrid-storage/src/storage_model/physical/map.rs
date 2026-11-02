@@ -15,6 +15,7 @@ use super::identity::{
 
 mod decode;
 mod legacy;
+mod occupancy;
 mod radix;
 mod residency;
 mod validation;
@@ -23,6 +24,8 @@ mod validation;
 mod decode_tests;
 #[cfg(test)]
 mod identity_tests;
+#[cfg(test)]
+mod occupancy_tests;
 
 #[cfg(test)]
 std::thread_local! {
@@ -465,26 +468,64 @@ impl CanonicalPhysicalMap {
     ///
     /// Historical nodes remain available for older catalogue generations. An
     /// identical key/value is idempotent; reusing a key with unequal bytes is
-    /// rejected as a physical identity collision.
+    /// rejected as a physical identity collision. A node identity that collides
+    /// on unequal bytes is also rejected.
     ///
     /// # Errors
     ///
     /// Rejects a collision, missing internal node, invalid stored domain, or
-    /// count overflow without changing the active root.
+    /// count overflow without changing the active root. Path-copy nodes already
+    /// occupied in the arena stay occupied if a later step fails.
     pub fn insert<I: PhysicalIdentity>(
         &mut self,
         identity: &I,
         key: PhysicalMapKey,
         value: Vec<u8>,
     ) -> Result<bool, PhysicalModelError> {
+        self.insert_observed(identity, key, value, None)
+    }
+
+    /// Insert one entry and report vacant node occupancy into `pending`.
+    ///
+    /// Failed inserts may leave historical occupancy; those IDs stay in
+    /// `pending` so later reuse cannot be treated as already durable.
+    pub(crate) fn insert_with_occupancy<I: PhysicalIdentity>(
+        &mut self,
+        identity: &I,
+        key: PhysicalMapKey,
+        value: Vec<u8>,
+        pending: &mut BTreeSet<PhysicalMapNodeId>,
+    ) -> Result<bool, PhysicalModelError> {
+        self.insert_observed(identity, key, value, Some(pending))
+    }
+
+    fn insert_observed<I: PhysicalIdentity>(
+        &mut self,
+        identity: &I,
+        key: PhysicalMapKey,
+        value: Vec<u8>,
+        pending: Option<&mut BTreeSet<PhysicalMapNodeId>>,
+    ) -> Result<bool, PhysicalModelError> {
         let (replacement, inserted) = if let Some(root) = self.root {
             match self.construction {
-                MapConstruction::LegacyBinary => {
-                    legacy::insert(identity, self.domain, &mut self.nodes, root, key, value)?
-                },
-                MapConstruction::DenseRadix => {
-                    radix::insert(identity, self.domain, &mut self.nodes, root, key, value)?
-                },
+                MapConstruction::LegacyBinary => legacy::insert(
+                    identity,
+                    self.domain,
+                    &mut self.nodes,
+                    pending,
+                    root,
+                    key,
+                    value,
+                )?,
+                MapConstruction::DenseRadix => radix::insert(
+                    identity,
+                    self.domain,
+                    &mut self.nodes,
+                    pending,
+                    root,
+                    key,
+                    value,
+                )?,
             }
         } else {
             let node = match self.construction {
@@ -493,8 +534,14 @@ impl CanonicalPhysicalMap {
                     PhysicalMapNode::page(self.domain, vec![(key, value)])?
                 },
             };
-            let id = node.identify(identity)?;
-            self.nodes.insert(id, node);
+            let id = occupancy::occupy_node(
+                identity,
+                occupancy::Occupancy {
+                    nodes: &mut self.nodes,
+                    pending,
+                },
+                node,
+            )?;
             (id, true)
         };
         if inserted {
@@ -525,58 +572,26 @@ impl CanonicalPhysicalMap {
         identity: &I,
         additions: Vec<(PhysicalMapKey, Vec<u8>)>,
     ) -> Result<u64, PhysicalModelError> {
-        let mut entries = BTreeMap::<PhysicalMapKey, Vec<u8>>::new();
-        if let Some(root) = self.root {
-            let mut stack = vec![root];
-            let mut visited = BTreeSet::new();
-            while let Some(node_id) = stack.pop() {
-                if !visited.insert(node_id) {
-                    return Err(PhysicalModelError::InvalidMap(
-                        "active map traversal revisited a node",
-                    ));
-                }
-                match self
-                    .nodes
-                    .get(&node_id)
-                    .ok_or(PhysicalModelError::InvalidMap("missing active map node"))?
-                {
-                    PhysicalMapNode::Leaf { key, value, .. } => {
-                        if entries.insert(*key, value.clone()).is_some() {
-                            return Err(PhysicalModelError::InvalidMap(
-                                "active map has duplicate leaf keys",
-                            ));
-                        }
-                    },
-                    PhysicalMapNode::Branch { zero, one, .. } => {
-                        stack.push(*one);
-                        stack.push(*zero);
-                    },
-                    PhysicalMapNode::Page {
-                        entries: page_entries,
-                        ..
-                    } => {
-                        for (key, value) in page_entries {
-                            if entries.insert(*key, value.clone()).is_some() {
-                                return Err(PhysicalModelError::InvalidMap(
-                                    "active map has duplicate page keys",
-                                ));
-                            }
-                        }
-                    },
-                    PhysicalMapNode::Radix { children, .. } => {
-                        stack.extend(children.iter().rev().copied());
-                    },
-                }
-            }
-        }
-        if u64::try_from(entries.len()).map_err(|_| PhysicalModelError::LengthOverflow)?
-            != self.entry_count
-        {
-            return Err(PhysicalModelError::InvalidMap(
-                "active map count does not match its leaves",
-            ));
-        }
+        self.rebuild_observed(identity, additions, None)
+    }
 
+    /// Rebuild the active trie and report vacant rebuilt occupancy into `pending`.
+    pub(crate) fn rebuild_with_occupancy<I: PhysicalIdentity>(
+        &mut self,
+        identity: &I,
+        additions: Vec<(PhysicalMapKey, Vec<u8>)>,
+        pending: &mut BTreeSet<PhysicalMapNodeId>,
+    ) -> Result<u64, PhysicalModelError> {
+        self.rebuild_observed(identity, additions, Some(pending))
+    }
+
+    fn rebuild_observed<I: PhysicalIdentity>(
+        &mut self,
+        identity: &I,
+        additions: Vec<(PhysicalMapKey, Vec<u8>)>,
+        pending: Option<&mut BTreeSet<PhysicalMapNodeId>>,
+    ) -> Result<u64, PhysicalModelError> {
+        let mut entries = self.active_entries()?;
         let mut inserted = 0_u64;
         for (key, value) in additions {
             match entries.get(&key) {
@@ -611,10 +626,66 @@ impl CanonicalPhysicalMap {
                 ));
             }
         }
+        if let Some(pending) = pending {
+            occupancy::report_new_occupancy(&self.nodes, &rebuilt.nodes, pending);
+        }
         self.nodes.extend(rebuilt.nodes);
         self.root = rebuilt.root;
         self.entry_count = rebuilt.entry_count;
         Ok(inserted)
+    }
+
+    fn active_entries(&self) -> Result<BTreeMap<PhysicalMapKey, Vec<u8>>, PhysicalModelError> {
+        let mut entries = BTreeMap::<PhysicalMapKey, Vec<u8>>::new();
+        let mut stack: Vec<_> = self.root.into_iter().collect();
+        let mut visited = BTreeSet::new();
+        while let Some(node_id) = stack.pop() {
+            if !visited.insert(node_id) {
+                return Err(PhysicalModelError::InvalidMap(
+                    "active map traversal revisited a node",
+                ));
+            }
+            match self
+                .nodes
+                .get(&node_id)
+                .ok_or(PhysicalModelError::InvalidMap("missing active map node"))?
+            {
+                PhysicalMapNode::Leaf { key, value, .. } => {
+                    if entries.insert(*key, value.clone()).is_some() {
+                        return Err(PhysicalModelError::InvalidMap(
+                            "active map has duplicate leaf keys",
+                        ));
+                    }
+                },
+                PhysicalMapNode::Branch { zero, one, .. } => {
+                    stack.push(*one);
+                    stack.push(*zero);
+                },
+                PhysicalMapNode::Page {
+                    entries: page_entries,
+                    ..
+                } => {
+                    for (key, value) in page_entries {
+                        if entries.insert(*key, value.clone()).is_some() {
+                            return Err(PhysicalModelError::InvalidMap(
+                                "active map has duplicate page keys",
+                            ));
+                        }
+                    }
+                },
+                PhysicalMapNode::Radix { children, .. } => {
+                    stack.extend(children.iter().rev().copied());
+                },
+            }
+        }
+        if u64::try_from(entries.len()).map_err(|_| PhysicalModelError::LengthOverflow)?
+            != self.entry_count
+        {
+            return Err(PhysicalModelError::InvalidMap(
+                "active map count does not match its leaves",
+            ));
+        }
+        Ok(entries)
     }
 
     /// Return the authenticated root, or `None` for an empty map.
@@ -638,6 +709,20 @@ impl CanonicalPhysicalMap {
     #[cfg(test)]
     pub(crate) fn take_lookup_count() -> usize {
         MAP_LOOKUPS.with(|count| count.replace(0))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_occupancy_reports() -> usize {
+        occupancy::take_occupancy_reports()
+    }
+
+    /// Report keys present in `replacement` that are vacant in this map.
+    pub(crate) fn report_unoccupied_from(
+        &self,
+        replacement: &Self,
+        pending: &mut BTreeSet<PhysicalMapNodeId>,
+    ) {
+        occupancy::report_new_occupancy(&self.nodes, replacement.nodes(), pending);
     }
 
     /// Look up one leaf through the authenticated trie.

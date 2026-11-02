@@ -2,8 +2,9 @@
 
 use crate::storage_model::{
     CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode,
-    PlacementEntry, PlacementSet, Recipe, ReconstructionBounds, Replica, ReplicaLocator,
-    RepresentationCatalogueRoot, RepresentationProfile, RepresentationRecord, RepresentationState,
+    PhysicalMapNodeId, PlacementEntry, PlacementSet, Recipe, ReconstructionBounds, Replica,
+    ReplicaLocator, RepresentationCatalogueRoot, RepresentationProfile, RepresentationRecord,
+    RepresentationState,
 };
 use std::collections::BTreeSet;
 
@@ -133,9 +134,35 @@ pub(super) fn append_map_nodes(
 pub(super) fn append_new_reachable_map_nodes(
     metadata: &mut Vec<MetadataFrame>,
     map: &CanonicalPhysicalMap,
-    durable: &BTreeSet<crate::storage_model::PhysicalMapNodeId>,
-    appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
-    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    durable: &BTreeSet<PhysicalMapNodeId>,
+    appended: &mut BTreeSet<PhysicalMapNodeId>,
+    complete: &mut BTreeSet<PhysicalMapNodeId>,
+) -> Result<usize, DurableError> {
+    append_reachable_map_nodes(metadata, map, |id| durable.contains(id), appended, complete)
+}
+
+pub(super) fn append_unpersisted_reachable_map_nodes(
+    metadata: &mut Vec<MetadataFrame>,
+    map: &CanonicalPhysicalMap,
+    unpersisted: &BTreeSet<PhysicalMapNodeId>,
+    appended: &mut BTreeSet<PhysicalMapNodeId>,
+    complete: &mut BTreeSet<PhysicalMapNodeId>,
+) -> Result<usize, DurableError> {
+    append_reachable_map_nodes(
+        metadata,
+        map,
+        |id| !unpersisted.contains(id),
+        appended,
+        complete,
+    )
+}
+
+fn append_reachable_map_nodes(
+    metadata: &mut Vec<MetadataFrame>,
+    map: &CanonicalPhysicalMap,
+    is_persisted: impl Fn(&PhysicalMapNodeId) -> bool,
+    appended: &mut BTreeSet<PhysicalMapNodeId>,
+    complete: &mut BTreeSet<PhysicalMapNodeId>,
 ) -> Result<usize, DurableError> {
     let Some(root) = map.root() else {
         return Ok(0);
@@ -151,7 +178,7 @@ pub(super) fn append_new_reachable_map_nodes(
                     "active physical map is missing a reachable node",
                 ))?;
             // A persisted parent alone does not establish durable descendants.
-            // Cache only closures checked against the append-only persisted set.
+            // Cache only closures whose resident nodes are known to be durable.
             let children_complete = match node {
                 PhysicalMapNode::Branch { zero, one, .. } => {
                     complete.contains(zero) && complete.contains(one)
@@ -161,10 +188,10 @@ pub(super) fn append_new_reachable_map_nodes(
                 },
                 PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => true,
             };
-            if durable.contains(&id) && children_complete {
+            if is_persisted(&id) && children_complete {
                 complete.insert(id);
             }
-            if !durable.contains(&id) && !appended.contains(&id) {
+            if !is_persisted(&id) && !appended.contains(&id) {
                 metadata.push(MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?);
                 appended.insert(id);
             }

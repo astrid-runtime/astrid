@@ -29,16 +29,9 @@ impl MapResidency {
 
 impl RepresentationStore {
     pub(super) fn reclaim_map_history(&mut self) -> Result<(), DurableError> {
-        // rebase_all_direct replaces maps with build_dense, discarding old nodes
-        // without crossing a collection threshold. Its disposable ID memos need
-        // eviction after the newly built root has become durable.
-        let resident = self
-            .profiles
-            .nodes()
-            .len()
-            .saturating_add(self.representations.nodes().len())
-            .saturating_add(self.placement_entries.nodes().len());
-        let mut reclaimed = self.persisted_map_nodes.len() > resident;
+        // rebase_all_direct retains memos against the replacement occupancy.
+        // Collection still drops unreachable path-copy debris after 2x growth.
+        let mut reclaimed = false;
         let collection = (|| -> Result<(), DurableError> {
             for (map, baseline) in [
                 (&mut self.profiles, &mut self.residency.profiles),
@@ -79,7 +72,7 @@ impl RepresentationStore {
             }
             // Durable frames and historical roots remain unchanged;
             // reintroduced IDs are safely appended again.
-            self.persisted_map_nodes.retain(resident);
+            self.pending_unpersisted_map_nodes.retain(resident);
         }
         collection
     }

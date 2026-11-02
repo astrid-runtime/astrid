@@ -35,7 +35,7 @@ fn published_updates_bound_resident_history_and_recover_every_entry() {
         }
         // Append memos must not retain IDs whose runtime nodes were evicted.
         let all_resident = resident + store.profiles.nodes().len();
-        assert!(store.persisted_map_nodes.len() <= all_resident);
+        assert!(store.pending_unpersisted_map_nodes.is_empty());
         assert!(store.complete_map_subtrees.len() <= all_resident);
         prior_nodes = resident;
         for (map, baseline) in [
@@ -96,11 +96,11 @@ fn recovery_retains_only_active_physical_id_memos_without_changing_durable_histo
     let resident = reopened.profiles.nodes().len()
         + reopened.representations.nodes().len()
         + reopened.placement_entries.nodes().len();
-    assert_eq!(
-        reopened.persisted_map_nodes.len(),
-        resident,
-        "historical durable IDs must not remain in the live append memo"
+    assert!(
+        reopened.pending_unpersisted_map_nodes.is_empty(),
+        "recovered occupancy is durable; pending must not snapshot live keys"
     );
+    assert!(resident > 1);
     for sequence in 0_u64..128 {
         assert!(reopened.contains_direct(ObjectId::new(
             *blake3::hash(&sequence.to_le_bytes()).as_bytes()
@@ -138,7 +138,7 @@ fn append_reintroduces_evicted_nodes_and_reopen_authenticates_duplicate_frames()
     let id = store.representations.root().unwrap();
     let placement = store.placement_entries.root();
     store.rebase_all_direct(&[]).unwrap();
-    assert!(!store.persisted_map_nodes.contains(&id));
+    assert!(!store.pending_unpersisted_map_nodes.contains(&id));
     assert!(!store.representations.nodes().contains_key(&id));
     assert!(!store.contains_direct(object));
     let pending = store.append_direct_update(&[direct]).unwrap().unwrap();
@@ -282,7 +282,7 @@ fn later_map_reclaim_failure_clears_complete_proofs_after_earlier_shrink() {
 
 #[test]
 fn collection_retains_complete_live_closures_and_skips_their_next_append_walk() {
-    use super::super::append_new_reachable_map_nodes;
+    use super::super::append_unpersisted_reachable_map_nodes;
     use std::collections::BTreeSet;
 
     let directory = tempfile::tempdir().unwrap();
@@ -311,10 +311,10 @@ fn collection_retains_complete_live_closures_and_skips_their_next_append_walk() 
         let mut appended = BTreeSet::new();
         // Appending the real update has persisted its nodes. Let the actual
         // append traversal establish their complete durable-closure proofs.
-        append_new_reachable_map_nodes(
+        append_unpersisted_reachable_map_nodes(
             &mut metadata,
             &store.representations,
-            &store.persisted_map_nodes,
+            &store.pending_unpersisted_map_nodes,
             &mut appended,
             &mut store.complete_map_subtrees,
         )
@@ -331,25 +331,25 @@ fn collection_retains_complete_live_closures_and_skips_their_next_append_walk() 
                         && !store.placement_entries.nodes().contains_key(id)
                 })
                 .expect("collection must evict a previously proven historical node");
-            assert!(!store.persisted_map_nodes.contains(evicted));
+            assert!(!store.pending_unpersisted_map_nodes.contains(evicted));
             assert!(!store.complete_map_subtrees.contains(evicted));
             assert!(store.complete_map_subtrees.contains(&root));
             let resident = store.profiles.nodes().len()
                 + store.representations.nodes().len()
                 + store.placement_entries.nodes().len();
             assert!(store.complete_map_subtrees.len() <= resident);
-            let warm = append_new_reachable_map_nodes(
+            let warm = append_unpersisted_reachable_map_nodes(
                 &mut metadata,
                 &store.representations,
-                &store.persisted_map_nodes,
+                &store.pending_unpersisted_map_nodes,
                 &mut appended,
                 &mut store.complete_map_subtrees,
             )
             .unwrap();
-            let cold = append_new_reachable_map_nodes(
+            let cold = append_unpersisted_reachable_map_nodes(
                 &mut metadata,
                 &store.representations,
-                &store.persisted_map_nodes,
+                &store.pending_unpersisted_map_nodes,
                 &mut appended,
                 &mut BTreeSet::new(),
             )
