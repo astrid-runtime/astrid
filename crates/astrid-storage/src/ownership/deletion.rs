@@ -228,7 +228,7 @@ impl OwnershipStore {
     /// Returns an ownership error if the graph cannot be loaded or `alias` is
     /// still reserved by an incomplete deletion.
     pub async fn ensure_alias_available(&self, alias: &PrincipalId) -> Result<(), OwnershipError> {
-        let graph = self.load().await?;
+        let graph = self.load_shared().await?;
         if let Some((principal, _)) = graph
             .principal_deletions
             .iter()

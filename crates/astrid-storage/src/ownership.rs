@@ -21,6 +21,7 @@ mod deletion;
 mod derived;
 mod provision;
 mod resources;
+mod shared_snapshot;
 pub use derived::DerivedPrincipalOwnership;
 mod initialization;
 pub use initialization::PrincipalInitialization;
@@ -275,6 +276,7 @@ pub struct OwnershipStore {
     storage: ScopedKvStore,
     principals: PrincipalDirectory,
     mutation_lock: Arc<AsyncMutex<()>>,
+    snapshots: Arc<shared_snapshot::SharedSnapshots>,
 }
 
 /// Exclusive barrier held while an unowned principal is removed from the
@@ -328,6 +330,7 @@ impl OwnershipStore {
             storage: ScopedKvStore::new(storage, OWNERSHIP_NAMESPACE)?,
             principals,
             mutation_lock: Arc::new(AsyncMutex::new(())),
+            snapshots: Arc::default(),
         })
     }
 
@@ -337,8 +340,9 @@ impl OwnershipStore {
     ///
     /// Fails closed on storage errors, malformed bytes, or broken invariants.
     pub async fn load(&self) -> Result<OwnershipSnapshot, OwnershipError> {
-        let raw = self.storage.get(GRAPH_KEY).await?;
-        self.decode(raw.as_deref())
+        #[cfg(test)]
+        shared_snapshot::OWNED_LOAD_COUNT.with(|count| count.set(count.get().strict_add(1)));
+        Ok(self.load_shared().await?.as_ref().clone())
     }
 
     /// Register one durable human identity, idempotently.

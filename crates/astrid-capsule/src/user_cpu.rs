@@ -81,7 +81,7 @@ impl UserCpuAccounting {
             .map_err(|error| error.to_string())?;
         let graph = self
             .ownership
-            .load()
+            .load_shared()
             .await
             .map_err(|error| error.to_string())?;
         let user = graph.accountable_user(uid).ok_or_else(|| format!(
