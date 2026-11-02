@@ -7,17 +7,20 @@ use alloc::vec::Vec;
 use crate::storage_model::BlobId;
 
 use super::PhysicalModelError;
-use super::codec::{Decoder, Encoder, EncodingSink};
+use super::codec::{Encoder, EncodingSink};
 use super::identity::{
     PhysicalIdentity, PhysicalMapNodeId, RepresentationProfileId, RepresentationRecordId,
-    decode_map_node_id, decode_physical_digest, encode_map_node_id, encode_physical_digest,
+    encode_physical_digest,
 };
 
+mod decode;
 mod legacy;
 mod radix;
 mod residency;
 mod validation;
 
+#[cfg(test)]
+mod decode_tests;
 #[cfg(test)]
 mod identity_tests;
 
@@ -276,61 +279,7 @@ impl PhysicalMapNode {
         &self,
         encoder: &mut Encoder<W>,
     ) -> Result<(), PhysicalModelError> {
-        encoder.u16(match self {
-            Self::Leaf { .. } | Self::Branch { .. } => LEGACY_MAP_NODE_VERSION,
-            Self::Page { .. } | Self::Radix { .. } => RADIX_MAP_NODE_VERSION,
-        });
-        encoder.u8(self.domain().code());
-        match self {
-            Self::Leaf { key, value, .. } => {
-                encoder.u8(0);
-                encode_physical_digest(encoder, key.as_bytes());
-                encoder.bytes(value)?;
-            },
-            Self::Branch {
-                prefix_bits,
-                prefix,
-                zero,
-                one,
-                subtree_entries,
-                ..
-            } => {
-                encoder.u8(1);
-                encoder.u32(*prefix_bits);
-                encoder.raw(prefix);
-                encode_map_node_id(encoder, *zero);
-                encode_map_node_id(encoder, *one);
-                encoder.u64(*subtree_entries);
-            },
-            Self::Page { entries, .. } => {
-                encoder.u8(0);
-                encoder
-                    .u8(u8::try_from(entries.len())
-                        .map_err(|_| PhysicalModelError::LengthOverflow)?);
-                for (key, value) in entries {
-                    encode_physical_digest(encoder, key.as_bytes());
-                    encoder.bytes(value)?;
-                }
-            },
-            Self::Radix {
-                prefix_nibbles,
-                prefix,
-                child_bitmap,
-                children,
-                subtree_entries,
-                ..
-            } => {
-                encoder.u8(1);
-                encoder.u8(*prefix_nibbles);
-                encoder.raw(prefix);
-                encoder.u16(*child_bitmap);
-                for child in children {
-                    encode_map_node_id(encoder, *child);
-                }
-                encoder.u64(*subtree_entries);
-            },
-        }
-        Ok(())
+        decode::MapNodeView::from_owned(self).encode_into(encoder)
     }
 
     /// Decode one canonical format-one node.
@@ -339,42 +288,7 @@ impl PhysicalMapNode {
     ///
     /// Rejects invalid fields, trailing bytes, and second encodings.
     pub fn decode(bytes: &[u8]) -> Result<Self, PhysicalModelError> {
-        let mut decoder = Decoder::new(bytes);
-        let version = decoder.u16()?;
-        let domain = PhysicalMapDomain::from_code(decoder.u8()?)?;
-        let node = match version {
-            LEGACY_MAP_NODE_VERSION => match decoder.u8()? {
-                0 => Self::leaf(
-                    domain,
-                    PhysicalMapKey::new(decode_physical_digest(&mut decoder)?),
-                    decoder.bytes()?.to_vec(),
-                ),
-                1 => {
-                    let prefix_bits = decoder.u32()?;
-                    let prefix_bytes = legacy::prefix_byte_len(prefix_bits)?;
-                    Self::branch(
-                        domain,
-                        prefix_bits,
-                        decoder.take(prefix_bytes)?.to_vec(),
-                        decode_map_node_id(&mut decoder)?,
-                        decode_map_node_id(&mut decoder)?,
-                        decoder.u64()?,
-                    )?
-                },
-                tag => return Err(PhysicalModelError::UnknownTag("physical-map-node", tag)),
-            },
-            RADIX_MAP_NODE_VERSION => decode_radix_node(&mut decoder, domain)?,
-            _ => {
-                return Err(PhysicalModelError::InvalidMap(
-                    "unsupported map-node version",
-                ));
-            },
-        };
-        decoder.finish()?;
-        let mut comparison = Encoder::comparing(bytes);
-        node.encode_into(&mut comparison)?;
-        comparison.finish_comparison()?;
-        Ok(node)
+        decode::with_decoded(bytes, decode::into_owned)?
     }
 
     /// Derive the domain-separated node identity.
@@ -402,6 +316,19 @@ impl PhysicalMapNode {
         let node = Self::decode(bytes)?;
         let id = PhysicalMapNodeId::new(identity.identify(node.identity_context(), bytes));
         Ok((node, id))
+    }
+
+    /// Authenticate historical metadata without allocating its value or prefix.
+    #[cfg(any(test, not(target_family = "wasm")))]
+    pub(crate) fn decode_child_ids_and_identify<I: PhysicalIdentity>(
+        bytes: &[u8],
+        identity: &I,
+    ) -> Result<(alloc::boxed::Box<[PhysicalMapNodeId]>, PhysicalMapNodeId), PhysicalModelError>
+    {
+        decode::with_decoded(bytes, |node| {
+            let id = PhysicalMapNodeId::new(identity.identify(node.identity_context(), bytes));
+            (node.child_ids(), id)
+        })
     }
 
     const fn identity_context(&self) -> &'static str {
@@ -765,62 +692,7 @@ impl CanonicalPhysicalMap {
     }
 }
 
-fn decode_radix_node(
-    decoder: &mut Decoder<'_>,
-    domain: PhysicalMapDomain,
-) -> Result<PhysicalMapNode, PhysicalModelError> {
-    match decoder.u8()? {
-        0 => {
-            let count = usize::from(decoder.u8()?);
-            if count == 0 || count > RADIX_PAGE_CAPACITY {
-                return Err(PhysicalModelError::InvalidMap(
-                    "radix page count is outside its bound",
-                ));
-            }
-            let mut entries = Vec::new();
-            entries
-                .try_reserve_exact(count)
-                .map_err(|_| PhysicalModelError::LengthOverflow)?;
-            for _ in 0..count {
-                entries.push((
-                    PhysicalMapKey::new(decode_physical_digest(decoder)?),
-                    decoder.bytes()?.to_vec(),
-                ));
-            }
-            PhysicalMapNode::page(domain, entries)
-        },
-        1 => {
-            let prefix_nibbles = decoder.u8()?;
-            let prefix = decoder
-                .take(nibble_prefix_byte_len(prefix_nibbles))?
-                .to_vec();
-            let child_bitmap = decoder.u16()?;
-            let child_count = usize::try_from(child_bitmap.count_ones())
-                .map_err(|_| PhysicalModelError::LengthOverflow)?;
-            let mut children = Vec::new();
-            children
-                .try_reserve_exact(child_count)
-                .map_err(|_| PhysicalModelError::LengthOverflow)?;
-            for _ in 0..child_count {
-                children.push(decode_map_node_id(decoder)?);
-            }
-            PhysicalMapNode::radix(
-                domain,
-                prefix_nibbles,
-                prefix,
-                child_bitmap,
-                children,
-                decoder.u64()?,
-            )
-        },
-        tag => Err(PhysicalModelError::UnknownTag(
-            "physical-radix-map-node",
-            tag,
-        )),
-    }
-}
-
-fn validate_page(entries: &[(PhysicalMapKey, Vec<u8>)]) -> Result<(), PhysicalModelError> {
+fn validate_page<V>(entries: &[(PhysicalMapKey, V)]) -> Result<(), PhysicalModelError> {
     if entries.is_empty() || entries.len() > RADIX_PAGE_CAPACITY {
         return Err(PhysicalModelError::InvalidMap(
             "radix page count is outside its bound",
@@ -866,7 +738,12 @@ pub(super) fn validate_radix(
             "radix branch is non-canonical or incomplete",
         ));
     }
-    if children.iter().copied().collect::<BTreeSet<_>>().len() != children.len() {
+    // The validated u16 bitmap bounds this comparison to sixteen children.
+    if children
+        .iter()
+        .enumerate()
+        .any(|(index, child)| children[..index].contains(child))
+    {
         return Err(PhysicalModelError::InvalidMap(
             "radix branch aliases its children",
         ));

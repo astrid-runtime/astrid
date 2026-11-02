@@ -18,6 +18,7 @@ pub(super) struct RecoveredMapNode {
 }
 
 impl RecoveredMapNode {
+    #[cfg(test)]
     pub(super) fn new(offset: u64, node: PhysicalMapNode) -> Self {
         let children: Box<[_]> = match node {
             PhysicalMapNode::Branch { zero, one, .. } => Box::new([zero, one]),
@@ -45,7 +46,7 @@ impl MetadataIndex {
         load_previous: impl FnOnce(u64) -> Result<Vec<u8>, DurableError>,
     ) -> Result<(), DurableError> {
         if frame.kind == MetadataKind::MapNode {
-            let (node, id) = PhysicalMapNode::decode_and_identify(
+            let (children, id) = PhysicalMapNode::decode_child_ids_and_identify(
                 frame.value.as_ref(),
                 &Blake3PhysicalIdentity,
             )?;
@@ -68,7 +69,13 @@ impl MetadataIndex {
                     ));
                 }
             } else {
-                self.nodes.insert(id, RecoveredMapNode::new(offset, node));
+                self.nodes.insert(
+                    id,
+                    RecoveredMapNode {
+                        offset: MetadataFrameOffset(offset),
+                        children,
+                    },
+                );
             }
             return Ok(());
         }
