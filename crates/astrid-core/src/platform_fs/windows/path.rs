@@ -11,6 +11,16 @@ use super::prelude::*;
 
 pub(super) struct OwnedHandle(pub(super) HANDLE);
 
+impl OwnedHandle {
+    pub(super) fn into_file(self) -> File {
+        let handle = self.0;
+        std::mem::forget(self);
+        // SAFETY: this uniquely owned Win32 handle is transferred into `File`
+        // exactly once; `File` closes it on drop.
+        unsafe { File::from_raw_handle(handle.cast()) }
+    }
+}
+
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
         if !self.0.is_null() {
@@ -72,7 +82,7 @@ impl Drop for DeleteCreatedDirectoryOnDrop {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct FileIdentity {
+pub(crate) struct FileIdentity {
     pub(super) volume: u32,
     pub(super) index_high: u32,
     pub(super) index_low: u32,
@@ -502,7 +512,7 @@ fn open_directory_identity_relative(
     open_directory_identity_relative_with_access(parent, name, lock_against_rename, 0)
 }
 
-fn open_directory_identity_relative_with_access(
+pub(super) fn open_directory_identity_relative_with_access(
     parent: HANDLE,
     name: &OsStr,
     lock_against_rename: bool,

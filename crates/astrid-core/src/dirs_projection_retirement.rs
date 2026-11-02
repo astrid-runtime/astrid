@@ -1,11 +1,11 @@
 //! The single fail-closed boundary for retiring an Astrid runtime projection.
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 use std::fs::File;
 use std::io;
 use std::path::Path;
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 const CANONICAL_VOLUME: &str = "astrid.volume";
 
 /// Validate the complete projection before deleting any entry.
@@ -25,7 +25,11 @@ pub fn retire_projection_root(root: &Path) -> io::Result<()> {
     {
         unix::retire(root)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows::retire(root)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         retire_portable(root)
     }
@@ -35,7 +39,12 @@ pub fn retire_projection_root(root: &Path) -> io::Result<()> {
 #[path = "dirs/projection_retirement/unix.rs"]
 mod unix;
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+#[path = "dirs/projection_retirement/windows.rs"]
+mod windows;
+
+/// Path-based fallback for hosts that are neither Unix nor Windows.
+#[cfg(not(any(unix, windows)))]
 fn retire_portable(root: &Path) -> io::Result<()> {
     preflight_projection_entry(root)?;
     let mut entries = std::fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
@@ -56,7 +65,7 @@ fn retire_portable(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn preflight_projection_entry(path: &Path) -> io::Result<()> {
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {

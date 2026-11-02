@@ -255,6 +255,14 @@ async fn provision_invited_principal(
     normalised_key: &str,
     profile: &PrincipalProfile,
 ) -> Result<uuid::Uuid, String> {
+    // Both admission and retirement hold admin_write_lock. Preserve an
+    // interrupted deletion's alias before creating any replacement identity.
+    kernel
+        .ownership_store
+        .ensure_alias_available(principal)
+        .await
+        .map_err(|error| format!("principal alias `{principal}` is unavailable: {error}"))?;
+
     let initial_public_key = astrid_crypto::PublicKey::from_hex(normalised_key)
         .map(<[u8; 32]>::from)
         .map_err(|error| format!("validated invite key decode failed: {error}"))?;
@@ -514,6 +522,8 @@ fn err_unauthorized(msg: String) -> AdminResponseBody {
 
 #[cfg(test)]
 mod tests {
+    mod alias_retirement;
+
     use super::*;
     use astrid_core::dirs::AstridHome;
     use tempfile::TempDir;

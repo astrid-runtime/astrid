@@ -14,6 +14,8 @@ mod path;
 mod prelude;
 #[path = "windows/private_file.rs"]
 mod private_file;
+#[path = "windows/projection.rs"]
+pub(crate) mod projection;
 #[path = "windows/rename.rs"]
 mod rename;
 

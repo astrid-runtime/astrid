@@ -13,11 +13,41 @@ use super::{
 #[cfg(test)]
 mod tests;
 
+#[derive(Clone, Copy)]
+enum WalkAuthentication {
+    Reencode,
+    #[cfg(any(test, not(target_family = "wasm")))]
+    Owned,
+}
+
 pub(super) fn validate_root<I: PhysicalIdentity>(
     identity: &I,
     domain: PhysicalMapDomain,
     root: Option<PhysicalMapNodeId>,
     nodes: &BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+) -> Result<u64, PhysicalModelError> {
+    validate_root_inner(identity, domain, root, nodes, WalkAuthentication::Reencode)
+}
+
+#[cfg(any(test, not(target_family = "wasm")))]
+pub(super) fn validate_owned_root<I: PhysicalIdentity>(
+    recovery: &super::authenticated::AuthenticatedMapRecovery<'_, I>,
+) -> Result<u64, PhysicalModelError> {
+    validate_root_inner(
+        recovery.identity(),
+        recovery.domain(),
+        recovery.root(),
+        recovery.nodes(),
+        WalkAuthentication::Owned,
+    )
+}
+
+fn validate_root_inner<I: PhysicalIdentity>(
+    identity: &I,
+    domain: PhysicalMapDomain,
+    root: Option<PhysicalMapNodeId>,
+    nodes: &BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    authentication: WalkAuthentication,
 ) -> Result<u64, PhysicalModelError> {
     let Some(root) = root else {
         return Ok(0);
@@ -46,8 +76,16 @@ pub(super) fn validate_root<I: PhysicalIdentity>(
         if node.domain() != domain {
             return Err(PhysicalModelError::InvalidMap("map domain mismatch"));
         }
-        if identify_encoded(identity, node, &mut scratch)? != node_id {
-            return Err(PhysicalModelError::InvalidMap("map-node identity mismatch"));
+        match authentication {
+            WalkAuthentication::Reencode => {
+                if identify_encoded(identity, node, &mut scratch)? != node_id {
+                    return Err(PhysicalModelError::InvalidMap("map-node identity mismatch"));
+                }
+            },
+            #[cfg(any(test, not(target_family = "wasm")))]
+            WalkAuthentication::Owned => {
+                // AuthenticatedMapRecovery already bound these nodes to their IDs.
+            },
         }
         match node {
             PhysicalMapNode::Leaf { key, value, .. } => {

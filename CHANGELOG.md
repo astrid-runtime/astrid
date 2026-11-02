@@ -8,15 +8,6 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ## [Unreleased]
 
-### Fixed
-
-- Let hosted volumes grow beyond the legacy extent-snapshot capacity using
-  immutable paged metadata checkpoints, without copying application payloads
-  during sync or retaining the complete checkpoint map in memory. Existing
-  volumes convert when their extent map exceeds the legacy snapshot bound.
-  Once converted, they require a reader supporting the paged format; older
-  readers reject the committed format rather than silently losing data.
-
 ## [2026.10.1] - 2026-10-15
 
 ### Fixed

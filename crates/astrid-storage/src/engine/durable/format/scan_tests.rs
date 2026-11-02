@@ -12,6 +12,7 @@ struct ObservedStream {
     seeks: usize,
     short_reads: bool,
     fail_after_reads: Option<usize>,
+    move_cursor_on_read_at: bool,
 }
 
 impl Read for ObservedStream {
@@ -43,6 +44,10 @@ impl Seek for ObservedStream {
     }
 }
 impl DurableIo for ObservedStream {
+    fn durable_read_at_preserves_cursor(&self) -> bool {
+        !self.move_cursor_on_read_at && self.file.durable_read_at_preserves_cursor()
+    }
+
     fn durable_metadata(&self) -> io::Result<StoreMetadata> {
         self.file.durable_metadata()
     }
@@ -53,7 +58,15 @@ impl DurableIo for ObservedStream {
         self.file.durable_sync_data()
     }
     fn durable_read_at(&self, bytes: &mut [u8], offset: u64) -> io::Result<usize> {
-        self.file.durable_read_at(bytes, offset)
+        if self.move_cursor_on_read_at {
+            // A cloned native handle shares its cursor, matching Windows
+            // seek_read even when this regression runs on Unix.
+            let mut reader = self.file.try_clone()?;
+            reader.seek(SeekFrom::Start(offset))?;
+            reader.read(bytes)
+        } else {
+            self.file.durable_read_at(bytes, offset)
+        }
     }
 }
 
@@ -77,6 +90,7 @@ fn stream(hosted: bool) -> (tempfile::TempDir, ObservedStream) {
             seeks: 0,
             short_reads: false,
             fail_after_reads: None,
+            move_cursor_on_read_at: false,
         },
     )
 }
@@ -234,7 +248,7 @@ fn buffered_tail_repair_never_truncates_a_published_prefix_or_interior_frame() {
                 ARENA_MAGIC,
                 RecoveryLimits::process_addressable(),
                 if published { original_len } else { prefix_len },
-                |_, _| {
+                |_, _, _source| {
                     accepted += 1;
                     Ok(())
                 },
@@ -250,5 +264,116 @@ fn buffered_tail_repair_never_truncates_a_published_prefix_or_interior_frame() {
                 append_frame(&mut stream, ARENA_MAGIC, b"replacement tail").unwrap();
             }
         }
+    }
+}
+
+#[test]
+fn positional_callback_reads_preserve_sequential_scan_read_ahead() {
+    for hosted in [false, true] {
+        let (_dir, mut source) = stream(hosted);
+        let first = append_frame(&mut source, ARENA_MAGIC, b"first frame").unwrap();
+        append_frame(&mut source, ARENA_MAGIC, b"second frame").unwrap();
+        let length = source.file.metadata().unwrap().len();
+        let limits = RecoveryLimits::process_addressable();
+        let mut seen = Vec::new();
+        scan_frames_with_source(
+            &mut source,
+            "test frames",
+            ARENA_MAGIC,
+            limits,
+            |offset, bytes, load_previous| {
+                if offset != first.offset {
+                    assert_eq!(load_previous(first.offset)?, b"first frame");
+                }
+                seen.push(bytes.to_vec());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![b"first frame".to_vec(), b"second frame".to_vec()]
+        );
+        assert_eq!(source.file.stream_position().unwrap(), length);
+        assert_eq!(source.file.metadata().unwrap().len(), length);
+    }
+}
+
+#[test]
+fn callback_rereads_preserve_read_ahead_across_refills_with_a_shared_cursor() {
+    let (_dir, mut source) = stream(false);
+    source.move_cursor_on_read_at = true;
+    let mut expected = Vec::new();
+    for marker in 0_u8..32 {
+        let bytes = vec![marker; 1024];
+        append_frame(&mut source, ARENA_MAGIC, &bytes).unwrap();
+        expected.push(bytes);
+    }
+    let length = source.file.metadata().unwrap().len();
+    let limits = RecoveryLimits::process_addressable();
+    let mut seen = Vec::new();
+    scan_frames_with_source(
+        &mut source,
+        "shared-cursor frames",
+        ARENA_MAGIC,
+        limits,
+        |_, bytes, load_previous| {
+            assert_eq!(load_previous(0)?, expected[0]);
+            seen.push(bytes.to_vec());
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        seen, expected,
+        "rereads must not replace later frames with earlier ones"
+    );
+    assert_eq!(source.file.metadata().unwrap().len(), length);
+    assert_eq!(source.file.stream_position().unwrap(), length);
+}
+
+#[test]
+fn sequential_scan_reuses_payload_buffer_for_same_and_smaller_frames() {
+    for hosted in [false, true] {
+        let (_dir, mut stream) = stream(hosted);
+        let payloads = [
+            vec![0x11_u8; 32_769],
+            vec![0x22_u8; 32_769],
+            vec![0x33_u8; 8],
+            Vec::new(),
+            vec![0x44_u8; 40_000],
+            vec![0x55_u8; 40_000],
+        ];
+        let mut expected = Vec::new();
+        for payload in &payloads {
+            let location = append_frame(&mut stream, ARENA_MAGIC, payload).unwrap();
+            expected.push((location.offset, payload.clone()));
+        }
+        let mut seen = Vec::new();
+        let mut pointers = Vec::new();
+        scan_frames(
+            &mut stream,
+            "test frames",
+            ARENA_MAGIC,
+            RecoveryLimits::process_addressable(),
+            |offset, payload| {
+                pointers.push(payload.as_ptr() as usize);
+                seen.push((offset, payload.to_vec()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, expected);
+        assert_eq!(pointers.len(), payloads.len());
+        assert!(
+            pointers[..4]
+                .windows(2)
+                .all(|pair| pair[0] == pair[1] && pair[0] != 0),
+            "same and smaller frames must keep the scan payload allocation: {pointers:?}"
+        );
+        assert!(
+            pointers[4] == pointers[5] && pointers[4] != 0,
+            "same-size frames after growth must reuse the grown allocation: {pointers:?}"
+        );
     }
 }

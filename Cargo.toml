@@ -130,6 +130,7 @@ hex = "0.4"
 # sha2 0.11 (digest 0.11) and is already in the lock through other crates.
 hmac = "0.13"
 ignore = "0.4"
+imbl = { version = "=7.0.2", default-features = false }
 indicatif = "0.18"
 insta = { version = "1.40", features = ["yaml", "json"] }
 jsonrpsee = { version = "0.24", features = ["server", "client", "macros"] }

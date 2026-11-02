@@ -3,32 +3,6 @@ use crate::volume::{AstridVolume, HostedFileVolume};
 use std::sync::Arc;
 
 #[test]
-fn active_closure_recovery_still_rejects_invalid_identity_and_domain() {
-    use crate::storage_model::{
-        PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode, PhysicalMapNodeId,
-    };
-    use std::collections::BTreeMap;
-
-    let id = PhysicalMapNodeId::new([7; 32]);
-    let node = PhysicalMapNode::Page {
-        domain: PhysicalMapDomain::Profile,
-        entries: vec![(PhysicalMapKey::new([8; 32]), vec![9])],
-    };
-    let valid_id = node.identify(&super::Blake3PhysicalIdentity).unwrap();
-    for (domain, stored_id) in [
-        (PhysicalMapDomain::Profile, id),
-        (PhysicalMapDomain::Placement, valid_id),
-    ] {
-        let mut arena = BTreeMap::from([(stored_id, node.clone())]);
-        assert!(super::recover_active_map(domain, Some(stored_id), &mut arena).is_err());
-    }
-    assert!(
-        super::recover_active_map(PhysicalMapDomain::Profile, Some(id), &mut BTreeMap::new(),)
-            .is_err()
-    );
-}
-
-#[test]
 fn published_updates_bound_resident_history_and_recover_every_entry() {
     let directory = tempfile::tempdir().unwrap();
     let volume: Arc<dyn AstridVolume> =
@@ -60,9 +34,7 @@ fn published_updates_bound_resident_history_and_recover_every_entry() {
             reclaimed = true;
         }
         // Append memos must not retain IDs whose runtime nodes were evicted.
-        let all_resident = resident + store.profiles.nodes().len();
-        assert!(store.persisted_map_nodes.len() <= all_resident);
-        assert!(store.complete_map_subtrees.len() <= all_resident);
+        assert!(store.pending_unpersisted_map_nodes.is_empty());
         prior_nodes = resident;
         for (map, baseline) in [
             (&store.profiles, store.residency.profiles),
@@ -73,7 +45,7 @@ fn published_updates_bound_resident_history_and_recover_every_entry() {
         }
         objects.push(object);
     }
-    assert!(reclaimed, "exercise proof eviction and subsequent writes");
+    assert!(reclaimed, "exercise node eviction and subsequent writes");
     let active = store.active;
     drop(store);
     let mut reopened = RepresentationStore::open_volume(&volume, limits)
@@ -122,11 +94,11 @@ fn recovery_retains_only_active_physical_id_memos_without_changing_durable_histo
     let resident = reopened.profiles.nodes().len()
         + reopened.representations.nodes().len()
         + reopened.placement_entries.nodes().len();
-    assert_eq!(
-        reopened.persisted_map_nodes.len(),
-        resident,
-        "historical durable IDs must not remain in the live append memo"
+    assert!(
+        reopened.pending_unpersisted_map_nodes.is_empty(),
+        "recovered occupancy is durable; pending must not snapshot live keys"
     );
+    assert!(resident > 1);
     for sequence in 0_u64..128 {
         assert!(reopened.contains_direct(ObjectId::new(
             *blake3::hash(&sequence.to_le_bytes()).as_bytes()
@@ -164,7 +136,7 @@ fn append_reintroduces_evicted_nodes_and_reopen_authenticates_duplicate_frames()
     let id = store.representations.root().unwrap();
     let placement = store.placement_entries.root();
     store.rebase_all_direct(&[]).unwrap();
-    assert!(!store.persisted_map_nodes.contains(&id));
+    assert!(!store.pending_unpersisted_map_nodes.contains(&id));
     assert!(!store.representations.nodes().contains_key(&id));
     assert!(!store.contains_direct(object));
     let pending = store.append_direct_update(&[direct]).unwrap().unwrap();
@@ -256,39 +228,7 @@ fn unpublished_append_is_not_authority_and_equal_retry_survives_reopen() {
 }
 
 #[test]
-fn shared_arena_second_map_does_not_accept_a_stolen_node() {
-    use crate::storage_model::{PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode};
-    use std::collections::BTreeMap;
-
-    let node = PhysicalMapNode::Page {
-        domain: PhysicalMapDomain::Profile,
-        entries: vec![(PhysicalMapKey::new([8; 32]), vec![9])],
-    };
-    let id = node.identify(&super::Blake3PhysicalIdentity).unwrap();
-    let mut arena = BTreeMap::from([(id, node)]);
-    let recovered =
-        super::recover_active_map(PhysicalMapDomain::Profile, Some(id), &mut arena).unwrap();
-    assert_eq!(recovered.root(), Some(id));
-    assert!(
-        arena.is_empty(),
-        "first recover must consume the shared node"
-    );
-    let error = super::recover_active_map(PhysicalMapDomain::Representation, Some(id), &mut arena)
-        .unwrap_err();
-    match error {
-        super::DurableError::InvalidRepresentationState(detail) => {
-            assert_eq!(detail, "active physical map closure is incomplete");
-        },
-        other => panic!("expected incomplete closure, got {other:?}"),
-    }
-    assert!(
-        arena.is_empty(),
-        "leftover arena must not become the second map"
-    );
-}
-
-#[test]
-fn later_map_reclaim_failure_clears_complete_proofs_after_earlier_shrink() {
+fn later_map_reclaim_failure_retains_only_resident_pending_ids_after_earlier_shrink() {
     use crate::storage_model::PhysicalMapNodeId;
 
     let directory = tempfile::tempdir().unwrap();
@@ -318,9 +258,8 @@ fn later_map_reclaim_failure_clears_complete_proofs_after_earlier_shrink() {
         before_representations > 1,
         "insert must retain historical representation nodes"
     );
-    store
-        .complete_map_subtrees
-        .insert(PhysicalMapNodeId::new([0x11; 32]));
+    let absent = PhysicalMapNodeId::new([0x11; 32]);
+    store.pending_unpersisted_map_nodes.insert(absent);
     store.residency.representations = 0;
     store.residency.placements = 0;
     assert!(
@@ -335,17 +274,16 @@ fn later_map_reclaim_failure_clears_complete_proofs_after_earlier_shrink() {
         store.representations.nodes().len() < before_representations,
         "earlier map must shrink before the later map fails"
     );
-    assert!(store.complete_map_subtrees.is_empty());
+    assert!(!store.pending_unpersisted_map_nodes.contains(&absent));
 }
 
 #[test]
-fn collection_retains_complete_live_closures_and_skips_their_next_append_walk() {
-    use super::super::append_new_reachable_map_nodes;
+fn collection_keeps_appended_closures_out_of_the_next_incremental_walk() {
     use std::collections::BTreeSet;
 
     let directory = tempfile::tempdir().unwrap();
     let volume: Arc<dyn AstridVolume> =
-        HostedFileVolume::open(directory.path().join("complete-proofs.volume")).unwrap();
+        HostedFileVolume::open(directory.path().join("pending-collection.volume")).unwrap();
     let limits = super::super::RecoveryLimits::process_addressable();
     let mut store =
         RepresentationStore::activate_volume(&volume, limits, ObjectId::new([1; 32]), []).unwrap();
@@ -363,68 +301,81 @@ fn collection_retains_complete_live_closures_and_skips_their_next_append_walk() 
             )
             .unwrap();
         let update = store.append_direct_update(&[direct]).unwrap().unwrap();
-        let root = store.representations.root().unwrap();
         let before_nodes = store.representations.nodes().len();
-        let mut metadata = Vec::new();
-        let mut appended = BTreeSet::new();
-        // Appending the real update has persisted its nodes. Let the actual
-        // append traversal establish their complete durable-closure proofs.
-        append_new_reachable_map_nodes(
-            &mut metadata,
-            &store.representations,
-            &store.persisted_map_nodes,
-            &mut appended,
-            &mut store.complete_map_subtrees,
-        )
-        .unwrap();
-        assert!(store.complete_map_subtrees.contains(&root));
-        let prior_proofs = store.complete_map_subtrees.clone();
         store.publish_direct_update(update).unwrap();
         if store.representations.nodes().len() < before_nodes {
-            let evicted = prior_proofs
-                .iter()
-                .find(|id| {
-                    !store.profiles.nodes().contains_key(id)
-                        && !store.representations.nodes().contains_key(id)
-                        && !store.placement_entries.nodes().contains_key(id)
-                })
-                .expect("collection must evict a previously proven historical node");
-            assert!(!store.persisted_map_nodes.contains(evicted));
-            assert!(!store.complete_map_subtrees.contains(evicted));
-            assert!(store.complete_map_subtrees.contains(&root));
-            let resident = store.profiles.nodes().len()
-                + store.representations.nodes().len()
-                + store.placement_entries.nodes().len();
-            assert!(store.complete_map_subtrees.len() <= resident);
-            let warm = append_new_reachable_map_nodes(
-                &mut metadata,
-                &store.representations,
-                &store.persisted_map_nodes,
-                &mut appended,
-                &mut store.complete_map_subtrees,
-            )
-            .unwrap();
-            let cold = append_new_reachable_map_nodes(
-                &mut metadata,
-                &store.representations,
-                &store.persisted_map_nodes,
-                &mut appended,
-                &mut BTreeSet::new(),
-            )
-            .unwrap();
-            assert_eq!(warm, 0, "collection must preserve the live closure proof");
-            assert_eq!(cold, store.representations.nodes().len());
-            assert!(
-                cold > 1,
-                "exercise a closure containing durable descendants"
-            );
-            assert!(
-                metadata.is_empty(),
-                "proof reuse must not change durable frames"
-            );
+            let mut metadata = Vec::new();
+            let mut appended = BTreeSet::new();
+            RepresentationStore::take_pending_node_reads();
+            store
+                .append_pending_map_nodes(&mut metadata, &mut appended)
+                .unwrap();
+            assert_eq!(RepresentationStore::take_pending_node_reads(), 0);
+            assert!(metadata.is_empty());
             assert!(appended.is_empty());
+            assert!(store.pending_unpersisted_map_nodes.is_empty());
             return;
         }
     }
     panic!("published updates must exercise representation-map collection");
+}
+
+#[test]
+fn direct_membership_reuses_validated_coverage_across_publication_and_reopen() {
+    use crate::storage_model::CanonicalPhysicalMap;
+
+    let directory = tempfile::tempdir().unwrap();
+    let volume: Arc<dyn AstridVolume> =
+        HostedFileVolume::open(directory.path().join("coverage.volume")).unwrap();
+    let limits = super::super::RecoveryLimits::process_addressable();
+    let mut store =
+        RepresentationStore::activate_volume(&volume, limits, ObjectId::new([1; 32]), []).unwrap();
+    let objects = [2, 3, 4].map(|byte| ObjectId::new([byte; 32]));
+    let direct = objects.map(|object| {
+        store
+            .describe_direct(
+                object,
+                object.as_bytes(),
+                ArenaLocation {
+                    offset: u64::from(object.as_bytes()[0]) * 100,
+                    payload_len: 32,
+                    checksum: [3; 32],
+                },
+            )
+            .unwrap()
+    });
+    let check = |store: &RepresentationStore, expected: [bool; 3]| {
+        CanonicalPhysicalMap::take_lookup_count();
+        assert_eq!(
+            objects.map(|object| store.contains_direct(object)),
+            expected
+        );
+        assert_eq!(
+            CanonicalPhysicalMap::take_lookup_count(),
+            0,
+            "validated coverage must not traverse and decode the physical map again"
+        );
+    };
+    check(&store, [false; 3]);
+    let update = store.append_direct_update(&direct[..2]).unwrap().unwrap();
+    check(&store, [false; 3]);
+    store.publish_direct_update(update).unwrap();
+    check(&store, [true, true, false]);
+    drop(store);
+    let mut store = RepresentationStore::open_volume(&volume, limits)
+        .unwrap()
+        .unwrap();
+    check(&store, [true, true, false]);
+    let update = store.append_direct_update(&direct[2..]).unwrap().unwrap();
+    check(&store, [true, true, false]);
+    store.publish_direct_update(update).unwrap();
+    check(&store, [true; 3]);
+    store.rebase_all_direct(&direct[1..]).unwrap();
+    check(&store, [false, true, true]);
+    store.checkpoint_volume(&volume, limits).unwrap();
+    drop(store);
+    let store = RepresentationStore::open_volume(&volume, limits)
+        .unwrap()
+        .unwrap();
+    check(&store, [false, true, true]);
 }

@@ -67,6 +67,7 @@ impl RepresentationStore {
             active,
             state,
             index,
+            limits,
         )?))
     }
 

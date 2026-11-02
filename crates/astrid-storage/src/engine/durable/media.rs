@@ -40,6 +40,12 @@ pub(in crate::engine::durable) trait DurableIo:
     fn durable_set_len(&self, length: u64) -> io::Result<()>;
     fn durable_sync_data(&self) -> io::Result<()>;
     fn durable_read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize>;
+
+    /// Whether positional reads leave the sequential cursor unchanged.
+    /// Unknown providers conservatively require cursor preservation.
+    fn durable_read_at_preserves_cursor(&self) -> bool {
+        false
+    }
 }
 
 impl File {
@@ -149,6 +155,13 @@ impl std::io::Seek for File {
 }
 
 impl DurableIo for File {
+    fn durable_read_at_preserves_cursor(&self) -> bool {
+        match self {
+            Self::Native(_) => cfg!(unix),
+            Self::Volume(_) => true,
+        }
+    }
+
     fn durable_metadata(&self) -> io::Result<StoreMetadata> {
         self.metadata()
     }
@@ -167,6 +180,10 @@ impl DurableIo for File {
 }
 
 impl DurableIo for NativeFile {
+    fn durable_read_at_preserves_cursor(&self) -> bool {
+        cfg!(unix)
+    }
+
     fn durable_metadata(&self) -> io::Result<StoreMetadata> {
         self.metadata().map(StoreMetadata::Native)
     }
