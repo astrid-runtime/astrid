@@ -28,6 +28,8 @@ thread_local! {
     static RECOVERY_ARENA_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+mod frame_checksum_context_tests;
 mod indexed;
 mod prepared;
 mod reader;
@@ -700,10 +702,7 @@ fn physical_frame_is_valid<F: DurableIo>(
     let expected: [u8; 32] = header[CHECKSUM_START..]
         .try_into()
         .map_err(|_| DurableError::EncodingOverflow)?;
-    let mut hasher = blake3::Hasher::new_derive_key("astrid durable physical frame checksum v1");
-    hasher.update(&magic);
-    hasher.update(&FRAME_VERSION.to_le_bytes());
-    hasher.update(&payload_len.to_le_bytes());
+    let mut hasher = frame_checksum_hasher(magic, payload_len);
     let mut unread = payload_len;
     let mut buffer = Vec::new();
     buffer
@@ -798,6 +797,27 @@ pub(super) fn append_frames<T: AsRef<[u8]>, F: DurableIo>(
     Ok(locations)
 }
 
+// Exact on-disk domain. This phrase has no terminal NUL; changing it would
+// invalidate every stored physical frame checksum.
+const FRAME_CHECKSUM_DOMAIN: &str = "astrid durable physical frame checksum v1";
+
+fn new_frame_checksum_context() -> blake3::Hasher {
+    #[cfg(test)]
+    FRAME_CHECKSUM_CONTEXT_INITIALIZATIONS.with(|count| count.set(count.get().strict_add(1)));
+    blake3::Hasher::new_derive_key(FRAME_CHECKSUM_DOMAIN)
+}
+
+// Clone the initialized derive-key hasher, retaining BLAKE3's material-mode
+// flags. Feeding a derived key to new_keyed would change the checksum domain.
+static FRAME_CHECKSUM_CONTEXT: std::sync::LazyLock<blake3::Hasher> =
+    std::sync::LazyLock::new(new_frame_checksum_context);
+
+#[cfg(test)]
+std::thread_local! {
+    static FRAME_CHECKSUM_CONTEXT_INITIALIZATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 pub(super) fn frame_checksum(magic: [u8; 8], payload_len: u64, payload: &[u8]) -> [u8; 32] {
     let mut hasher = frame_checksum_hasher(magic, payload_len);
     hasher.update(payload);
@@ -805,7 +825,7 @@ pub(super) fn frame_checksum(magic: [u8; 8], payload_len: u64, payload: &[u8]) -
 }
 
 pub(super) fn frame_checksum_hasher(magic: [u8; 8], payload_len: u64) -> blake3::Hasher {
-    let mut hasher = blake3::Hasher::new_derive_key("astrid durable physical frame checksum v1");
+    let mut hasher = (*FRAME_CHECKSUM_CONTEXT).clone();
     hasher.update(&magic);
     hasher.update(&FRAME_VERSION.to_le_bytes());
     hasher.update(&payload_len.to_le_bytes());
