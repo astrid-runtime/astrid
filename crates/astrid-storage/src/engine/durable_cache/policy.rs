@@ -171,6 +171,7 @@ impl ObjectCacheController {
 
     /// Replace the capacity. Existing entries are evicted lazily on the next
     /// cache operation so policy changes do not block the control plane.
+    /// Engine/store setters additionally request immediate reclaim.
     pub fn set_capacity(&self, capacity: ObjectCacheCapacity) {
         self.capacity.store(capacity.encoded(), Ordering::Relaxed);
     }
@@ -286,9 +287,11 @@ impl<P> ObjectCacheConfig<P> {
     #[must_use]
     pub fn bounded(bytes: NonZeroU64) -> Self {
         let capacity = ObjectCacheCapacity::Bounded(bytes);
+        let controller = ObjectCacheController::new(capacity);
+        let principal_controller = controller.clone();
         Self::new(
-            ObjectCacheController::new(capacity),
-            Arc::new(move |_: &P| capacity),
+            controller,
+            Arc::new(move |_: &P| principal_controller.capacity()),
         )
     }
 }

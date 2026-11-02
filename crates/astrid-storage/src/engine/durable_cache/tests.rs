@@ -467,3 +467,23 @@ fn projection_values_share_the_object_cache_budget_and_principal_partition() {
     assert_eq!(stats.resident_projection_entries, 0);
     assert_eq!(stats.resident_projection_bytes, 0);
 }
+
+#[test]
+fn bounded_policy_tracks_both_directions_of_operator_resize() {
+    let alice = "alice".to_owned();
+    let weight = cache_weight(&record(1)) + association_weight::<String>();
+    let capacity = NonZeroU64::new(weight).unwrap();
+    let cache = ObjectCache::new(ObjectCacheConfig::bounded(capacity));
+    cache.insert(&alice, object(1), record(1));
+    assert_eq!(cache.stats().resident_objects, 1);
+    cache.set_capacity(ObjectCacheCapacity::Bounded(
+        NonZeroU64::new(weight * 3).unwrap(),
+    ));
+    cache.insert(&alice, object(2), record(2));
+    cache.insert(&alice, object(3), record(3));
+    assert_eq!(cache.stats().resident_objects, 3);
+    cache.set_capacity(ObjectCacheCapacity::Bounded(capacity));
+    assert!(cache.stats().resident_bytes <= weight);
+    assert_eq!(cache.stats().resident_objects, 1);
+    assert_lru_indexes(&cache);
+}

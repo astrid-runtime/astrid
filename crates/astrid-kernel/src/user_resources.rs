@@ -43,6 +43,22 @@ pub(crate) fn load(
     )))
 }
 
+/// Apply operator cache policy after the durable config projection is admitted.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn configure_object_cache(
+    store: &astrid_storage::RuntimePrincipalStore,
+    home: &astrid_core::dirs::AstridHome,
+    workspace: &std::path::Path,
+    layout: &astrid_core::dirs::WorkspaceLayout,
+) -> std::io::Result<()> {
+    if let Some(bytes) = load_policy(home, workspace, layout)?.decoded_object_cache_bytes {
+        store.set_object_cache_capacity(astrid_storage::engine::ObjectCacheCapacity::Bounded(
+            bytes.get(),
+        ));
+    }
+    Ok(())
+}
+
 fn load_policy(
     home: &astrid_core::dirs::AstridHome,
     workspace: &std::path::Path,
