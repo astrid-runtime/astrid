@@ -3,6 +3,8 @@
 use super::*;
 
 const CHUNK: usize = 65_536;
+// This historical wire domain must stay independent of the production constant.
+const HISTORICAL_CHECKSUM_DOMAIN: &str = "astrid durable physical frame checksum v1";
 
 struct Case {
     magic: [u8; 8],
@@ -53,7 +55,7 @@ fn cases() -> Vec<Case> {
 }
 
 fn independent_fresh_checksum(magic: [u8; 8], payload_len: u64, payload: &[u8]) -> [u8; 32] {
-    let mut hasher = new_frame_checksum_context();
+    let mut hasher = blake3::Hasher::new_derive_key(HISTORICAL_CHECKSUM_DOMAIN);
     hasher.update(&magic);
     hasher.update(&FRAME_VERSION.to_le_bytes());
     hasher.update(&payload_len.to_le_bytes());
@@ -67,7 +69,7 @@ fn derive_key_checksum(magic: [u8; 8], payload_len: u64, payload: &[u8]) -> [u8;
     material.extend_from_slice(&FRAME_VERSION.to_le_bytes());
     material.extend_from_slice(&payload_len.to_le_bytes());
     material.extend_from_slice(payload);
-    blake3::derive_key(FRAME_CHECKSUM_DOMAIN, &material)
+    blake3::derive_key(HISTORICAL_CHECKSUM_DOMAIN, &material)
 }
 
 fn expected_checksum(magic: [u8; 8], payload_len: u64, payload: &[u8]) -> [u8; 32] {
