@@ -20,6 +20,11 @@ mod radix;
 mod residency;
 mod validation;
 
+#[cfg(any(test, not(target_family = "wasm")))]
+mod authenticated;
+
+#[cfg(test)]
+mod authenticated_tests;
 #[cfg(test)]
 mod decode_tests;
 #[cfg(test)]
@@ -27,9 +32,13 @@ mod identity_tests;
 #[cfg(test)]
 mod occupancy_tests;
 
+#[cfg(any(test, not(target_family = "wasm")))]
+pub(crate) use authenticated::AuthenticatedMapRecovery;
+
 #[cfg(test)]
 std::thread_local! {
     static MAP_LOOKUPS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static MAP_ENCODES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 const LEGACY_MAP_NODE_VERSION: u16 = 1;
@@ -287,7 +296,14 @@ impl PhysicalMapNode {
         &self,
         encoder: &mut Encoder<W>,
     ) -> Result<(), PhysicalModelError> {
+        #[cfg(test)]
+        MAP_ENCODES.with(|count| count.set(count.get().strict_add(1)));
         decode::MapNodeView::from_owned(self).encode_into(encoder)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_encode_count() -> usize {
+        MAP_ENCODES.with(|count| count.replace(0))
     }
 
     /// Decode one canonical format-one node.

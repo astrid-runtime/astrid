@@ -4,8 +4,9 @@ use super::{
     BTreeMap, Blake3PhysicalIdentity, DurableError, DurableIo, METADATA_FILE, METADATA_MAGIC,
     MetadataFrame, MetadataKind, RecoveryLimits, map_node_id, read_frame_at,
 };
+use crate::storage_model::physical::AuthenticatedMapRecovery;
 use crate::storage_model::{
-    CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapNode, PhysicalMapNodeId,
+    CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapNode, PhysicalMapNodeId, PhysicalModelError,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -96,10 +97,10 @@ impl MetadataIndex {
         source: &F,
         limits: RecoveryLimits,
     ) -> Result<CanonicalPhysicalMap, DurableError> {
-        let mut nodes = BTreeMap::new();
+        let mut recovery = AuthenticatedMapRecovery::new(&Blake3PhysicalIdentity, domain, root);
         let mut pending: Vec<_> = root.into_iter().collect();
         while let Some(id) = pending.pop() {
-            if nodes.contains_key(&id) {
+            if recovery.contains(id) {
                 continue;
             }
             let entry = self
@@ -116,45 +117,51 @@ impl MetadataIndex {
                 limits,
             )?;
             let frame = MetadataFrame::decode(&payload)?;
-            let (node, computed) =
-                PhysicalMapNode::decode_and_identify(frame.value, &Blake3PhysicalIdentity)?;
-            if frame.kind != MetadataKind::MapNode
-                || map_node_id(frame.identity) != id
-                || computed != id
-            {
+            if frame.kind != MetadataKind::MapNode || map_node_id(frame.identity) != id {
                 return Err(DurableError::InvalidRepresentationState(
                     "metadata identity does not match canonical value",
                 ));
             }
-            let branch_children;
-            let children = match &node {
-                PhysicalMapNode::Branch { zero, one, .. } => {
-                    branch_children = [*zero, *one];
-                    branch_children.as_slice()
+            // Copy links into the format's child-id stack so this loop does not
+            // keep a borrow of the owned arena across `pending.extend`.
+            let mut child_buf = [PhysicalMapNodeId::new([0; 32]); u16::BITS as usize];
+            let node = match recovery.authenticate(id, frame.value) {
+                Ok(node) => node,
+                Err(PhysicalModelError::InvalidMap("map-node identity mismatch")) => {
+                    return Err(DurableError::InvalidRepresentationState(
+                        "metadata identity does not match canonical value",
+                    ));
                 },
-                PhysicalMapNode::Radix { children, .. } => children.as_slice(),
-                PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => &[],
+                Err(error) => return Err(error.into()),
             };
+            let child_count = match node {
+                PhysicalMapNode::Branch { zero, one, .. } => {
+                    child_buf[0] = *zero;
+                    child_buf[1] = *one;
+                    2
+                },
+                PhysicalMapNode::Radix { children, .. } => {
+                    let count = children.len();
+                    child_buf[..count].copy_from_slice(children);
+                    count
+                },
+                PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => 0,
+            };
+            let children = &child_buf[..child_count];
             if !self.nodes.matches_children(&entry, children) {
                 return Err(DurableError::InvalidRepresentationState(
                     "active physical map links changed during recovery",
                 ));
             }
             pending.extend(children.iter().copied());
-            nodes.insert(id, node);
         }
         if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {
-            tracing::Span::current().record("active_nodes", nodes.len());
+            tracing::Span::current().record("active_nodes", recovery.len());
         }
-        // The indexed traversal already extracted exactly this active closure.
-        // Transfer its ownership directly; canonical recovery still validates
-        // identities, domains and shape, including cycles and shared children.
-        Ok(CanonicalPhysicalMap::recover(
-            &Blake3PhysicalIdentity,
-            domain,
-            root,
-            nodes,
-        )?)
+        // Fresh frames were authenticated into the owned arena. Finish still
+        // rebuilds the canonical root and rejects domain, cycle, sharing, and
+        // missing bodies without hashing those owned nodes again.
+        Ok(recovery.finish()?)
     }
 
     #[cfg(test)]

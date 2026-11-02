@@ -26,6 +26,8 @@ pub use identity::{
     PhysicalIdentity, PhysicalMapNodeId, PlacementSetId, RepresentationCatalogueRootId,
     RepresentationProfileId, RepresentationRecordId, RepresentationStateId,
 };
+#[cfg(any(test, not(target_family = "wasm")))]
+pub(crate) use map::AuthenticatedMapRecovery;
 pub use map::{CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode};
 pub use placement::{PlacementEntry, PlacementSet, Replica, ReplicaLocator};
 pub use profile::{
