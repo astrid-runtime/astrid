@@ -342,16 +342,56 @@ pub(super) fn scan_frames<F: DurableIo>(
     )
 }
 
-/// The shared source supports validated positional reads of earlier frames
-/// without disturbing sequential read-ahead or collecting duplicate payloads.
+/// The callback can reload earlier validated frames without disturbing
+/// sequential read-ahead, including providers whose positional reads seek.
 pub(super) fn scan_frames_with_source<F: DurableIo>(
     file: &mut F,
     file_name: &'static str,
     magic: [u8; 8],
     limits: RecoveryLimits,
-    accept: impl FnMut(u64, &[u8], &F) -> Result<(), DurableError>,
+    mut accept: impl FnMut(
+        u64,
+        &[u8],
+        &mut dyn FnMut(u64) -> Result<Vec<u8>, DurableError>,
+    ) -> Result<(), DurableError>,
 ) -> Result<(), DurableError> {
-    scan_frames_with_protected_prefix(file, file_name, magic, limits, 0, accept)
+    scan_frames_with_protected_prefix(
+        file,
+        file_name,
+        magic,
+        limits,
+        0,
+        |offset, payload, source| {
+            accept(offset, payload, &mut |position| {
+                read_frame_preserving_cursor(source, file_name, magic, position, limits)
+            })
+        },
+    )
+}
+
+fn read_frame_preserving_cursor<F: DurableIo>(
+    source: &mut F,
+    file_name: &'static str,
+    magic: [u8; 8],
+    offset: u64,
+    limits: RecoveryLimits,
+) -> Result<Vec<u8>, DurableError> {
+    let position = if source.durable_read_at_preserves_cursor() {
+        None
+    } else {
+        Some(
+            source
+                .stream_position()
+                .map_err(|error| io_error("save durable scan read-ahead position", error))?,
+        )
+    };
+    let payload = read_frame_at(source, file_name, magic, offset, limits)?;
+    if let Some(position) = position {
+        source
+            .seek(SeekFrom::Start(position))
+            .map_err(|error| io_error("restore durable scan read-ahead position", error))?;
+    }
+    Ok(payload)
 }
 
 fn scan_frames_with_protected_prefix<F: DurableIo>(
@@ -360,7 +400,7 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
     magic: [u8; 8],
     limits: RecoveryLimits,
     protected_len: u64,
-    mut accept: impl FnMut(u64, &[u8], &F) -> Result<(), DurableError>,
+    mut accept: impl FnMut(u64, &[u8], &mut F) -> Result<(), DurableError>,
 ) -> Result<(), DurableError> {
     let file_len = validated_file_len(file, file_name, protected_len)?;
     let policy = FrameScanPolicy {
@@ -456,7 +496,7 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
             )?;
             break;
         }
-        accept(offset, &payload, reader.get_ref())?;
+        accept(offset, &payload, *reader.get_mut())?;
         offset = frame_end;
     }
     // Tail repair above is terminal: discard any read-ahead before exposing

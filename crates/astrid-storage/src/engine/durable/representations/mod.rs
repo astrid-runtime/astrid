@@ -791,7 +791,7 @@ impl RepresentationStore {
             &metadata,
             limits,
         )?;
-        // Active closures now own their nodes. Release unused historical bodies
+        // Active closures now own their nodes. Release unused historical links
         // and replay metadata before allocating the validated reverse index.
         drop(index);
         if profiles.entry_count() != catalogue.profile_count()

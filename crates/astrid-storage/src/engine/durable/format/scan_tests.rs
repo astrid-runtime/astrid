@@ -12,6 +12,7 @@ struct ObservedStream {
     seeks: usize,
     short_reads: bool,
     fail_after_reads: Option<usize>,
+    move_cursor_on_read_at: bool,
 }
 
 impl Read for ObservedStream {
@@ -43,6 +44,10 @@ impl Seek for ObservedStream {
     }
 }
 impl DurableIo for ObservedStream {
+    fn durable_read_at_preserves_cursor(&self) -> bool {
+        !self.move_cursor_on_read_at && self.file.durable_read_at_preserves_cursor()
+    }
+
     fn durable_metadata(&self) -> io::Result<StoreMetadata> {
         self.file.durable_metadata()
     }
@@ -53,7 +58,15 @@ impl DurableIo for ObservedStream {
         self.file.durable_sync_data()
     }
     fn durable_read_at(&self, bytes: &mut [u8], offset: u64) -> io::Result<usize> {
-        self.file.durable_read_at(bytes, offset)
+        if self.move_cursor_on_read_at {
+            // A cloned native handle shares its cursor, matching Windows
+            // seek_read even when this regression runs on Unix.
+            let mut reader = self.file.try_clone()?;
+            reader.seek(SeekFrom::Start(offset))?;
+            reader.read(bytes)
+        } else {
+            self.file.durable_read_at(bytes, offset)
+        }
     }
 }
 
@@ -77,6 +90,7 @@ fn stream(hosted: bool) -> (tempfile::TempDir, ObservedStream) {
             seeks: 0,
             short_reads: false,
             fail_after_reads: None,
+            move_cursor_on_read_at: false,
         },
     )
 }
@@ -267,12 +281,9 @@ fn positional_callback_reads_preserve_sequential_scan_read_ahead() {
             "test frames",
             ARENA_MAGIC,
             limits,
-            |offset, bytes, file| {
+            |offset, bytes, load_previous| {
                 if offset != first.offset {
-                    assert_eq!(
-                        read_frame_at(file, "test frames", ARENA_MAGIC, first.offset, limits)?,
-                        b"first frame"
-                    );
+                    assert_eq!(load_previous(first.offset)?, b"first frame");
                 }
                 seen.push(bytes.to_vec());
                 Ok(())
@@ -286,4 +297,37 @@ fn positional_callback_reads_preserve_sequential_scan_read_ahead() {
         assert_eq!(source.file.stream_position().unwrap(), length);
         assert_eq!(source.file.metadata().unwrap().len(), length);
     }
+}
+
+#[test]
+fn callback_rereads_preserve_read_ahead_across_refills_with_a_shared_cursor() {
+    let (_dir, mut source) = stream(false);
+    source.move_cursor_on_read_at = true;
+    let mut expected = Vec::new();
+    for marker in 0_u8..32 {
+        let bytes = vec![marker; 1024];
+        append_frame(&mut source, ARENA_MAGIC, &bytes).unwrap();
+        expected.push(bytes);
+    }
+    let length = source.file.metadata().unwrap().len();
+    let limits = RecoveryLimits::process_addressable();
+    let mut seen = Vec::new();
+    scan_frames_with_source(
+        &mut source,
+        "shared-cursor frames",
+        ARENA_MAGIC,
+        limits,
+        |_, bytes, load_previous| {
+            assert_eq!(load_previous(0)?, expected[0]);
+            seen.push(bytes.to_vec());
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        seen, expected,
+        "rereads must not replace later frames with earlier ones"
+    );
+    assert_eq!(source.file.metadata().unwrap().len(), length);
+    assert_eq!(source.file.stream_position().unwrap(), length);
 }
