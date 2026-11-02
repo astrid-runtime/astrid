@@ -66,7 +66,6 @@ enum IndexCacheKind {
 
 struct IndexFrontier<'a> {
     previous_arena_len: u64,
-    previous_arena_tail: Option<ArenaLocation>,
     arena_len: u64,
     arena_tail: Option<ArenaLocation>,
     locations: &'a [(ObjectId, ArenaLocation)],
@@ -124,7 +123,6 @@ where
         };
         let frontier = IndexFrontier {
             previous_arena_len,
-            previous_arena_tail,
             arena_len,
             arena_tail,
             locations: &locations,
@@ -174,25 +172,12 @@ where
                     return Err(DurableError::Closed);
                 };
                 self.fail_if(super::FaultPoint::BeforeIndexCachePublication)?;
-                let previous_state = IndexState {
-                    arena_len: frontier.previous_arena_len,
-                    arena_tail: frontier.previous_arena_tail,
-                    objects: objects_through_arena(&inner.index, frontier.previous_arena_len),
+                let current_state = IndexState {
+                    arena_len: frontier.arena_len,
+                    arena_tail: frontier.arena_tail,
+                    objects: &inner.index,
                 };
-                append_snapshot(&mut cache, &previous_state, self.identity.scheme())?;
-                if !frontier.locations.is_empty() {
-                    let delta = IndexDelta {
-                        previous_arena_len: frontier.previous_arena_len,
-                        arena_len: frontier.arena_len,
-                        arena_tail: frontier.arena_tail.ok_or(DurableError::Corrupt {
-                            file: ARENA_FILE,
-                            offset: frontier.previous_arena_len,
-                            detail: "object arena advanced without indexed locations",
-                        })?,
-                        objects: frontier.locations,
-                    };
-                    append_index_delta(&mut cache, &delta, self.identity.scheme())?;
-                }
+                Snapshot::new(&current_state, self.identity.scheme())?.append(&mut cache)?;
                 cache.sync_data().map_err(|source| {
                     super::io_error("flush rebuilt durable object index", source)
                 })?;
@@ -431,14 +416,6 @@ pub(super) fn append_index_delta(
     Ok(())
 }
 
-fn append_snapshot<M: Borrow<BTreeMap<ObjectId, ArenaLocation>>>(
-    file: &mut File,
-    state: &IndexState<M>,
-    scheme: IdentityScheme,
-) -> Result<(), DurableError> {
-    Snapshot::new(state, scheme)?.append(file)
-}
-
 pub(super) fn index_cache_starts_with_snapshot(file: &File) -> bool {
     let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
         return false;
@@ -467,22 +444,6 @@ pub(super) fn index_cache_starts_with_snapshot(file: &File) -> bool {
 
 fn index_cache_is_empty(file: &File) -> bool {
     file.metadata().is_ok_and(|metadata| metadata.len() == 0)
-}
-
-fn objects_through_arena(
-    objects: &BTreeMap<ObjectId, ArenaLocation>,
-    arena_len: u64,
-) -> BTreeMap<ObjectId, ArenaLocation> {
-    objects
-        .iter()
-        .filter_map(|(id, location)| {
-            let end = location
-                .offset
-                .checked_add(FRAME_HEADER_LEN)
-                .and_then(|value| value.checked_add(location.payload_len))?;
-            (end <= arena_len).then_some((*id, *location))
-        })
-        .collect()
 }
 
 #[cfg(test)]

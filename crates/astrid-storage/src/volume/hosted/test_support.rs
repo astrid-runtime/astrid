@@ -2,6 +2,12 @@
 
 use super::*;
 
+impl HostedFileVolume {
+    pub(crate) fn copy_container_for_test(&self, path: &std::path::Path) {
+        copy_container(self, path);
+    }
+}
+
 pub(super) fn read_container(volume: &HostedFileVolume) -> Vec<u8> {
     let mut state = volume.state.lock();
     let position = state.file.stream_position().unwrap();
