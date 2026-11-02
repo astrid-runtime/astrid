@@ -8,7 +8,7 @@ use super::super::scan_frames;
 use super::format::{METADATA_FILE, METADATA_MAGIC, MetadataFrame, MetadataKind};
 use super::{
     ArenaLocation, DirectArenaObject, ObjectId, RecoveryLimits, RepresentationStore,
-    append_new_reachable_map_nodes, append_unpersisted_reachable_map_nodes,
+    append_new_reachable_map_nodes,
 };
 
 fn open_volume(name: &str) -> (tempfile::TempDir, Arc<dyn AstridVolume>) {
@@ -225,14 +225,9 @@ fn checkpoint_emits_every_reachable_node_when_pending_is_empty() {
     assert!(appended.len() > 1);
     let mut incremental = Vec::new();
     let mut skipped = BTreeSet::new();
-    append_unpersisted_reachable_map_nodes(
-        &mut incremental,
-        &store.representations,
-        &store.pending_unpersisted_map_nodes,
-        &mut skipped,
-        &mut BTreeSet::new(),
-    )
-    .unwrap();
+    store
+        .append_pending_map_nodes(&mut incremental, &mut skipped)
+        .unwrap();
     assert!(incremental.is_empty());
     assert!(skipped.is_empty());
 }
@@ -251,4 +246,125 @@ fn append_occupancy_reports_follow_the_copied_path() {
     assert!(reports > 0);
     assert!(reports < before);
     assert!(store.pending_unpersisted_map_nodes.is_empty());
+}
+
+#[test]
+fn first_update_after_reopen_reads_only_new_occupancy() {
+    let (_directory, volume) = open_volume("pending-cold-path.volume");
+    let mut store = activate(&volume);
+    let direct: Vec<_> = (0_u64..1024)
+        .map(|sequence| describe(&store, sequence, sequence.strict_mul(100)))
+        .collect();
+    let update = store.append_direct_update(&direct).unwrap().unwrap();
+    store.publish_direct_update(update).unwrap();
+    drop(store);
+    let mut store =
+        RepresentationStore::open_volume(&volume, RecoveryLimits::process_addressable())
+            .unwrap()
+            .unwrap();
+    let resident = store.representations.nodes().len() + store.placement_entries.nodes().len();
+    assert!(
+        resident > 16,
+        "exercise a recovered closure with many nodes"
+    );
+    let mut frames = Vec::new();
+    let mut appended = BTreeSet::new();
+    RepresentationStore::take_pending_node_reads();
+    store
+        .append_pending_map_nodes(&mut frames, &mut appended)
+        .unwrap();
+    assert_eq!(RepresentationStore::take_pending_node_reads(), 0);
+    assert!(frames.is_empty());
+    assert!(appended.is_empty());
+
+    let next = describe(&store, 1024, 102_400);
+    CanonicalPhysicalMap::take_occupancy_reports();
+    let update = store.append_direct_update(&[next]).unwrap().unwrap();
+    let occupancy = CanonicalPhysicalMap::take_occupancy_reports();
+    let reads = RepresentationStore::take_pending_node_reads();
+    assert!(occupancy > 0);
+    assert!(reads > 0);
+    assert!(reads <= occupancy.strict_mul(2));
+    assert!(
+        reads < resident,
+        "the first update must not walk recovered bodies"
+    );
+    assert!(store.pending_unpersisted_map_nodes.is_empty());
+    store.publish_direct_update(update).unwrap();
+    let active = store.active;
+    drop(store);
+    let reopened = RepresentationStore::open_volume(&volume, RecoveryLimits::process_addressable())
+        .unwrap()
+        .unwrap();
+    assert_eq!(reopened.active, active);
+    assert!(reopened.contains_direct(ObjectId::new(
+        *blake3::hash(&1024_u64.to_le_bytes()).as_bytes()
+    )));
+}
+
+#[test]
+fn partial_metadata_batch_write_preserves_acknowledged_authority_after_recovery() {
+    use std::num::NonZeroUsize;
+
+    let header = usize::try_from(super::FRAME_HEADER_LEN).unwrap();
+    for prefix in [1, header.strict_add(1)] {
+        let (_directory, volume) = open_volume("pending-torn-batch.volume");
+        let mut store = activate(&volume);
+        publish_one(&mut store, 0, 100);
+        let acknowledged = store.active;
+        let metadata_len = store.metadata.metadata().unwrap().len();
+        let journal_len = store.journal.metadata().unwrap().len();
+        let next = describe(&store, 1, 200);
+        let object = ObjectId::new(*blake3::hash(&1_u64.to_le_bytes()).as_bytes());
+        assert!(store.pending_unpersisted_map_nodes.is_empty());
+        CanonicalPhysicalMap::take_occupancy_reports();
+        super::append_fault::fail_after(NonZeroUsize::new(prefix).unwrap());
+        let Err(error) = store.append_direct_update(&[next]) else {
+            panic!("the real batch writer must fail after its partial write");
+        };
+        assert!(matches!(
+            error,
+            super::DurableError::Io {
+                operation: "append durable frame batch",
+                ..
+            }
+        ));
+        assert_eq!(
+            store.metadata.metadata().unwrap().len(),
+            metadata_len.strict_add(u64::try_from(prefix).unwrap())
+        );
+        assert_eq!(store.journal.metadata().unwrap().len(), journal_len);
+        assert_eq!(store.active, acknowledged);
+        let occupied = CanonicalPhysicalMap::take_occupancy_reports();
+        assert!(occupied > 0);
+        assert_eq!(store.pending_unpersisted_map_nodes.len(), occupied);
+        assert!(!store.contains_direct(object));
+        drop(store);
+
+        // Recovery's existing incomplete-tail policy owns truncation. Never
+        // retry on the failed live handle or discard an arbitrary open error.
+        let mut store =
+            RepresentationStore::open_volume(&volume, RecoveryLimits::process_addressable())
+                .unwrap()
+                .unwrap();
+        assert_eq!(store.active, acknowledged);
+        assert_eq!(store.metadata.metadata().unwrap().len(), metadata_len);
+        assert!(store.pending_unpersisted_map_nodes.is_empty());
+        assert!(store.contains_direct(ObjectId::new(
+            *blake3::hash(&0_u64.to_le_bytes()).as_bytes()
+        )));
+        assert!(!store.contains_direct(object));
+        let next = describe(&store, 1, 200);
+        let update = store.append_direct_update(&[next]).unwrap().unwrap();
+        store.publish_direct_update(update).unwrap();
+        let published = store.active;
+        drop(store);
+        let reopened =
+            RepresentationStore::open_volume(&volume, RecoveryLimits::process_addressable())
+                .unwrap()
+                .unwrap();
+        assert_ne!(published, acknowledged);
+        assert_eq!(reopened.active, published);
+        assert!(reopened.contains_direct(object));
+    }
 }

@@ -29,7 +29,7 @@ impl MapResidency {
 
 impl RepresentationStore {
     pub(super) fn reclaim_map_history(&mut self) -> Result<(), DurableError> {
-        // rebase_all_direct retains memos against the replacement occupancy.
+        // rebase_all_direct retains pending IDs against replacement occupancy.
         // Collection still drops unreachable path-copy debris after 2x growth.
         let mut reclaimed = false;
         let collection = (|| -> Result<(), DurableError> {
@@ -63,13 +63,6 @@ impl RepresentationStore {
                     || representations.contains_key(id)
                     || placements.contains_key(id)
             };
-            if collection.is_err() {
-                self.complete_map_subtrees.clear();
-            } else {
-                // Immutable resident nodes keep their complete durable closure:
-                // successful collection retains every reachable descendant.
-                self.complete_map_subtrees.retain(resident);
-            }
             // Durable frames and historical roots remain unchanged;
             // reintroduced IDs are safely appended again.
             self.pending_unpersisted_map_nodes.retain(resident);

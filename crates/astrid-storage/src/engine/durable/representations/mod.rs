@@ -26,7 +26,9 @@ use format::{
 };
 
 mod activation;
-use activation::{append_new_reachable_map_nodes, append_unpersisted_reachable_map_nodes};
+#[cfg(test)]
+mod append_fault;
+use activation::append_new_reachable_map_nodes;
 mod authority;
 mod checkpoint;
 mod format;
@@ -112,8 +114,6 @@ pub(super) struct RepresentationStore {
     representations: CanonicalPhysicalMap,
     placement_entries: CanonicalPhysicalMap,
     pending_unpersisted_map_nodes: BTreeSet<PhysicalMapNodeId>,
-    // Memoized durable descendant closures; discarded when the store is reopened.
-    complete_map_subtrees: BTreeSet<PhysicalMapNodeId>,
     direct_profile: RepresentationProfileId,
     reverse: BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
 }
@@ -436,20 +436,7 @@ impl RepresentationStore {
             .map(|entry| (entry.object, entry.representation_id))
             .collect();
         let mut appended_map_nodes = BTreeSet::new();
-        append_unpersisted_reachable_map_nodes(
-            &mut metadata,
-            &self.representations,
-            &self.pending_unpersisted_map_nodes,
-            &mut appended_map_nodes,
-            &mut self.complete_map_subtrees,
-        )?;
-        append_unpersisted_reachable_map_nodes(
-            &mut metadata,
-            &self.placement_entries,
-            &self.pending_unpersisted_map_nodes,
-            &mut appended_map_nodes,
-            &mut self.complete_map_subtrees,
-        )?;
+        self.append_pending_map_nodes(&mut metadata, &mut appended_map_nodes)?;
         let (catalogue, placements, state) = self.next_authority()?;
         let state_id = state.identify(&Blake3PhysicalIdentity);
         metadata.push(MetadataFrame::catalogue(&Blake3PhysicalIdentity, catalogue));
@@ -522,7 +509,7 @@ impl RepresentationStore {
             &self.representations,
             &self.placement_entries,
         );
-        self.retain_live_map_memos();
+        self.retain_live_pending_nodes();
         let replacement_reverse = entries
             .into_iter()
             .map(|entry| (entry.object, vec![entry.representation_id]))
@@ -530,15 +517,7 @@ impl RepresentationStore {
 
         let mut metadata = Vec::new();
         let mut appended_map_nodes = BTreeSet::new();
-        for map in [&self.representations, &self.placement_entries] {
-            append_unpersisted_reachable_map_nodes(
-                &mut metadata,
-                map,
-                &self.pending_unpersisted_map_nodes,
-                &mut appended_map_nodes,
-                &mut self.complete_map_subtrees,
-            )?;
-        }
+        self.append_pending_map_nodes(&mut metadata, &mut appended_map_nodes)?;
         let (catalogue, placements, state) = self.next_authority()?;
         let state_id = state.identify(&Blake3PhysicalIdentity);
         metadata.extend([
@@ -829,7 +808,6 @@ impl RepresentationStore {
                 representations,
                 placement_entries,
                 pending_unpersisted_map_nodes: BTreeSet::new(),
-                complete_map_subtrees: BTreeSet::new(),
                 direct_profile,
                 reverse,
             },
@@ -848,6 +826,10 @@ fn persist_metadata_frames(
             "append durable frame batch",
             std::io::Error::other("injected metadata append failure"),
         ));
+    }
+    #[cfg(test)]
+    if let Some(result) = append_fault::append_if_armed(metadata, payloads) {
+        return result;
     }
     append_frames(metadata, METADATA_MAGIC, payloads).map(|_| ())
 }
@@ -880,7 +862,7 @@ impl RepresentationStore {
         Ok(())
     }
 
-    fn retain_live_map_memos(&mut self) {
+    fn retain_live_pending_nodes(&mut self) {
         let profiles = self.profiles.nodes();
         let representations = self.representations.nodes();
         let placements = self.placement_entries.nodes();
@@ -890,7 +872,6 @@ impl RepresentationStore {
                 || placements.contains_key(id)
         };
         self.pending_unpersisted_map_nodes.retain(resident);
-        self.complete_map_subtrees.retain(resident);
     }
 
     #[cfg(test)]
