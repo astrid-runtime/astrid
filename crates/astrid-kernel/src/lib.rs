@@ -80,6 +80,9 @@ mod shutdown;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod user_resources;
 pub use native_input::native_input_device_is_live;
+/// Bind the kernel identity store, skipping a second user-prefix walk when
+/// native assemble already populated the shared principal directory.
+mod identity_bootstrap;
 /// Deterministic CLI-root user/fleet bootstrap and unowned-principal upgrade.
 mod ownership_bootstrap;
 /// Persistent pair-device token store (issue #756).
@@ -1182,22 +1185,16 @@ impl Kernel {
         ));
 
         let allowance_store = Arc::new(astrid_approval::AllowanceStore::new());
-        // Create system-wide identity store backed by the shared KV.
-        let identity_kv = astrid_storage::ScopedKvStore::new(Arc::clone(&kv), "system:identity")
-            .map_err(|e| std::io::Error::other(format!("Failed to create identity KV: {e}")))?;
-        let identity_store: Arc<dyn astrid_storage::IdentityStore> =
-            Arc::new(astrid_storage::KvIdentityStore::with_principal_directory(
-                identity_kv,
-                principal_directory.clone(),
-            ));
-        identity_store
-            .load_principal_directory()
-            .await
-            .map_err(|error| {
-                std::io::Error::other(format!(
-                    "Failed to load durable principal identities: {error}"
-                ))
-            })?;
+        // Native assemble already loaded this shared directory. Portable and
+        // wasm callers inject KV without a runtime principal store and still
+        // load plus validate once here.
+        let identity_store = identity_bootstrap::bind_identity_store(
+            &kv,
+            principal_directory.clone(),
+            #[cfg(not(target_family = "wasm"))]
+            principal_store.as_ref(),
+        )
+        .await?;
         let ownership_store = Arc::new(
             astrid_storage::OwnershipStore::new(Arc::clone(&kv), principal_directory.clone())
                 .map_err(|error| {
