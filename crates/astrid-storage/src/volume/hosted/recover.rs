@@ -185,6 +185,20 @@ fn recover_footer_at(
     {
         return Ok(None);
     }
+    let Some(mut recovery) = recover_checkpoint(file, last_commit_offset, durable_len, sequence)?
+    else {
+        return Ok(None);
+    };
+    recovery.footer_present = footer_present;
+    Ok(Some(recovery))
+}
+
+fn recover_checkpoint(
+    file: &File,
+    last_commit_offset: u64,
+    durable_len: u64,
+    sequence: u64,
+) -> io::Result<Option<Recovery>> {
     let Some((header, payload)) = read_checkpoint(file, last_commit_offset, durable_len)? else {
         return Ok(None);
     };
@@ -220,7 +234,7 @@ fn recover_footer_at(
         durable_len,
         last_commit_offset,
         last_snapshot_end: snapshot_end,
-        footer_present,
+        footer_present: false,
     }))
 }
 
@@ -300,28 +314,44 @@ fn recover_from_headers(file: &File) -> io::Result<Recovery> {
             }
         }
     }
-    Ok(Recovery {
-        // A torn/uncommitted tail is uncommon. Replay its validated committed
-        // prefix once rather than cloning the entire extent namespace at each
-        // commit. Both paths retain all framing and transition checks.
-        regions: if offset == committed_offset {
-            regions
-        } else {
-            replay_committed_namespace(file, committed_offset)?
-        },
+    let mut recovery = Recovery {
+        regions,
         sequence: committed_sequence,
         valid_len: committed_offset,
         durable_len: committed_offset,
         last_commit_offset,
         last_snapshot_end,
         footer_present: false,
-    })
+    };
+    if offset != committed_offset {
+        // The first scan validated all historical transitions. Discard only its
+        // uncommitted namespace and restore the authenticated committed state.
+        recovery.regions.clear();
+        recovery.regions = replay_committed_namespace(file, &recovery)?;
+    }
+    Ok(recovery)
 }
 
 fn replay_committed_namespace(
     file: &File,
-    committed_end: u64,
+    recovery: &Recovery,
 ) -> io::Result<BTreeMap<VolumeRegion, RegionState>> {
+    let committed_end = recovery.durable_len;
+    if recovery.last_commit_offset != 0
+        && committed_end
+            .checked_sub(recovery.last_snapshot_end)
+            .is_some_and(|tail| tail <= MAX_COMMIT_SNAPSHOT_BYTES)
+        && let Some(checkpoint) = recover_checkpoint(
+            file,
+            recovery.last_commit_offset,
+            committed_end,
+            recovery.sequence,
+        )?
+    {
+        return Ok(checkpoint.regions);
+    }
+    // Legacy volumes can have no snapshot or a longer committed suffix.
+    // Preserve full replay for those accepted encodings without raising bounds.
     let mut regions = BTreeMap::new();
     let mut offset = VOLUME_MAGIC.len() as u64;
     let mut sequence = 0_u64;
