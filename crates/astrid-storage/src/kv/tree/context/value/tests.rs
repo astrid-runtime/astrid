@@ -97,6 +97,16 @@ fn cached_content_source_reuses_principal_accounted_allocations() {
                 .unwrap(),
         )
         .unwrap();
+    // Both charged readers must have authoritative roots. Reading shared
+    // content for an absent owner may reuse bytes without retaining an account.
+    engine
+        .commit(
+            TreeContext::new(&engine, &bob)
+                .finish(TreeHeader::empty(bob.clone()), None)
+                .unwrap(),
+        )
+        .unwrap();
+    assert!(engine.root(&bob).unwrap().is_some());
     engine.flush().unwrap();
     let cached = engine.shared_objects_for(&alice, &ids).unwrap();
     let source = TreeContext::new(&engine, &alice);
