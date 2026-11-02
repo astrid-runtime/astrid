@@ -28,8 +28,8 @@ use super::{
 
 mod index;
 use super::super::format::{read_frame_at, scan_frames_with_source};
+use index::HistoricalMapClosure;
 pub(super) use index::MetadataIndex;
-use index::RecoveredMapNode;
 
 #[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all,
     fields(map_nodes = tracing::field::Empty, authority_records = tracing::field::Empty))]
@@ -93,7 +93,7 @@ pub(super) fn recover_journal<F: DurableIo>(
     // Metadata is immutable for this replay. Only successfully checked closures
     // may be reused across historical states, including the checkpoint active
     // state; CAS and generation checks still run.
-    let mut complete_maps = BTreeSet::new();
+    let mut complete_maps = metadata.nodes.closure_checker();
     let (mut active, mut generation) =
         recover_checkpoint(first, current, metadata, &mut complete_maps)?;
     validate_tail_budget(entries.len(), bytes.len(), checkpoint_end, current)?;
@@ -164,7 +164,7 @@ fn recover_checkpoint(
     first: JournalEntry,
     current: CurrentPointer,
     metadata: &MetadataIndex,
-    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    complete: &mut HistoricalMapClosure<'_>,
 ) -> Result<(Option<RepresentationStateId>, u64), DurableError> {
     match first {
         JournalEntry::Checkpoint {
@@ -212,7 +212,7 @@ fn recover_checkpoint(
 fn state_metadata_closure_complete(
     state_id: RepresentationStateId,
     metadata: &MetadataIndex,
-    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    complete: &mut HistoricalMapClosure<'_>,
 ) -> Result<bool, DurableError> {
     let Some(state_bytes) = metadata
         .values
@@ -240,35 +240,11 @@ fn state_metadata_closure_complete(
         catalogue.representations_root(),
         placements.entries_root(),
     ] {
-        if !map_closure_complete(root, &metadata.nodes, complete) {
+        if !complete.complete(root) {
             return Ok(false);
         }
     }
     Ok(true)
-}
-
-fn map_closure_complete(
-    root: Option<crate::storage_model::PhysicalMapNodeId>,
-    nodes: &BTreeMap<crate::storage_model::PhysicalMapNodeId, RecoveredMapNode>,
-    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
-) -> bool {
-    let Some(root) = root else {
-        return true;
-    };
-    let mut pending = vec![root];
-    let mut visited = BTreeSet::new();
-    while let Some(id) = pending.pop() {
-        if complete.contains(&id) || !visited.insert(id) {
-            continue;
-        }
-        let Some(node) = nodes.get(&id) else {
-            return false;
-        };
-        pending.extend(node.children.iter().copied());
-    }
-    // Never remember a partial traversal that encountered a missing descendant.
-    complete.extend(visited);
-    true
 }
 
 fn truncate_repairable_journal_tail<F: DurableIo>(

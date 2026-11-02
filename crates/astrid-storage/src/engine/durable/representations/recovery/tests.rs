@@ -18,21 +18,27 @@ fn recovery_memo_never_remembers_an_incomplete_closure() {
     .unwrap();
     let root = map.root().unwrap();
     assert!(map.nodes().len() > 1);
-    let summaries: BTreeMap<_, _> = map
-        .nodes()
-        .iter()
-        .map(|(id, node)| (*id, RecoveredMapNode::new(0, node.clone())))
-        .collect();
-    let partial = BTreeMap::from([(root, summaries[&root].clone())]);
-    let mut complete = BTreeSet::new();
-    assert!(!map_closure_complete(Some(root), &partial, &mut complete));
-    assert!(complete.is_empty());
-    assert!(!map_closure_complete(Some(root), &partial, &mut complete));
-    assert!(map_closure_complete(Some(root), &summaries, &mut complete));
+    let mut partial = MetadataIndex::default();
+    partial
+        .insert(MetadataFrame::map_node(&Blake3PhysicalIdentity, &map.nodes()[&root]).unwrap())
+        .unwrap();
+    let mut incomplete = partial.nodes.closure_checker();
+    assert!(!incomplete.complete(Some(root)));
+    assert_eq!(incomplete.len(), 0);
+    assert!(!incomplete.complete(Some(root)));
+    assert_eq!(incomplete.len(), 0);
+    let mut metadata = MetadataIndex::default();
+    for node in map.nodes().values() {
+        metadata
+            .insert(MetadataFrame::map_node(&Blake3PhysicalIdentity, node).unwrap())
+            .unwrap();
+    }
+    let mut complete = metadata.nodes.closure_checker();
+    assert!(complete.complete(Some(root)));
     assert_eq!(complete.len(), map.nodes().len());
-    let verified = complete.clone();
-    assert!(map_closure_complete(Some(root), &summaries, &mut complete));
-    assert_eq!(complete, verified);
+    let verified = complete.len();
+    assert!(complete.complete(Some(root)));
+    assert_eq!(complete.len(), verified);
     let absent = PhysicalMapKey::new([255; 32]);
     let other = CanonicalPhysicalMap::build_dense(
         &Blake3PhysicalIdentity,
@@ -40,12 +46,8 @@ fn recovery_memo_never_remembers_an_incomplete_closure() {
         vec![(absent, vec![0])],
     )
     .unwrap();
-    assert!(!map_closure_complete(
-        other.root(),
-        &summaries,
-        &mut complete
-    ));
-    assert_eq!(complete, verified);
+    assert!(!complete.complete(other.root()));
+    assert_eq!(complete.len(), verified);
 }
 
 fn dense_representation_map() -> CanonicalPhysicalMap {
@@ -144,18 +146,23 @@ fn checkpoint_closure_is_reused_by_the_first_shared_cas() {
         .insert(MetadataFrame::state(&identity, cas_state))
         .unwrap();
     let (checkpoint, current) = later_journal_checkpoint(checkpoint_id, 1);
-    let mut complete = BTreeSet::new();
+    let mut complete = metadata.nodes.closure_checker();
     recover_checkpoint(checkpoint, current, &metadata, &mut complete).unwrap();
     assert_eq!(complete.len(), map.nodes().len());
-    let stolen = map.root().unwrap();
-    metadata.nodes.remove(&stolen);
-    assert!(
-        state_metadata_closure_complete(cas_id, &metadata, &mut complete).unwrap(),
-        "first CAS must reuse checkpoint proofs without walking stolen nodes",
+    let visited = complete.visits();
+    assert!(state_metadata_closure_complete(cas_id, &metadata, &mut complete).unwrap());
+    assert_eq!(
+        complete.visits(),
+        visited,
+        "the first CAS must reuse checkpoint closure proofs"
     );
+    // The immutable borrow prevents a proof surviving metadata mutation.
+    drop(complete);
+    metadata.nodes.take(&map.root().unwrap()).unwrap();
+    let mut changed = metadata.nodes.closure_checker();
     assert!(
-        !state_metadata_closure_complete(cas_id, &metadata, &mut BTreeSet::new()).unwrap(),
-        "a discarded checkpoint set must still observe the missing node",
+        !state_metadata_closure_complete(cas_id, &metadata, &mut changed).unwrap(),
+        "a new snapshot must observe the missing node",
     );
 }
 
@@ -173,10 +180,11 @@ fn incomplete_checkpoint_cannot_populate_closure_proofs() {
     )
     .unwrap();
     let (mut metadata, state_id) = index_with_state(&map, catalogue, placements, state);
-    let only_root = BTreeMap::from([(root, metadata.nodes[&root].clone())]);
-    metadata.nodes = only_root;
+    for id in map.nodes().keys().filter(|id| **id != root) {
+        metadata.nodes.take(id).unwrap();
+    }
     let (checkpoint, current) = later_journal_checkpoint(state_id, 1);
-    let mut complete = BTreeSet::new();
+    let mut complete = metadata.nodes.closure_checker();
     let error = recover_checkpoint(checkpoint, current, &metadata, &mut complete).unwrap_err();
     assert!(matches!(
         error,
@@ -185,7 +193,7 @@ fn incomplete_checkpoint_cannot_populate_closure_proofs() {
         )
     ));
     assert!(
-        complete.is_empty(),
+        complete.len() == 0,
         "failed checkpoint must not retain partial map proofs"
     );
 }
@@ -205,11 +213,7 @@ fn metadata_recovery_keeps_only_links_and_loads_active_bodies() {
     let limits = RecoveryLimits::process_addressable();
     let mut index = recover_metadata(&mut file, limits).unwrap();
     assert_eq!(index.nodes.len(), 1);
-    assert!(
-        index.nodes[&map_node_id(frame.identity)]
-            .children
-            .is_empty()
-    );
+    assert_eq!(index.nodes.edge_count(), 0);
     let map = index
         .recover_active_map(
             PhysicalMapDomain::Representation,
@@ -219,7 +223,7 @@ fn metadata_recovery_keeps_only_links_and_loads_active_bodies() {
         )
         .unwrap();
     assert_eq!(map.nodes()[&map_node_id(frame.identity)], node);
-    assert!(index.nodes.is_empty());
+    assert!(index.nodes.len() == 0);
     assert!(
         index.values.is_empty(),
         "historical node bodies must not be retained as encoded payloads"
@@ -237,7 +241,7 @@ fn metadata_recovery_rejects_map_bytes_with_another_nodes_identity() {
     frame.identity[0] ^= 1;
     let mut index = MetadataIndex::default();
     assert!(index.insert(frame).is_err());
-    assert!(index.nodes.is_empty());
+    assert!(index.nodes.len() == 0);
     assert!(index.values.is_empty());
 }
 
@@ -472,20 +476,19 @@ fn metadata_recovery_loads_root_before_child_history_without_retaining_old_value
     let limits = RecoveryLimits::process_addressable();
     let mut index = recover_metadata(&mut file, limits).unwrap();
     assert_eq!(index.nodes.len(), map.nodes().len().strict_add(64));
-    let links: usize = index.nodes.values().map(|entry| entry.children.len()).sum();
-    assert!(links < index.nodes.len());
-    let mut complete = BTreeSet::new();
-    assert!(map_closure_complete(
-        Some(root),
-        &index.nodes,
-        &mut complete
-    ));
+    assert!(index.nodes.edge_count() < index.nodes.len());
+    let mut complete = index.nodes.closure_checker();
+    assert!(complete.complete(Some(root)));
+    drop(complete);
     let recovered = index
         .recover_active_map(PhysicalMapDomain::Representation, Some(root), &file, limits)
         .unwrap();
     assert_eq!(recovered.nodes(), map.nodes());
     assert_eq!(index.nodes.len(), 64);
-    assert!(index.nodes.values().all(|entry| entry.children.is_empty()));
+    assert!(
+        index.values.is_empty(),
+        "historical values remain on disk only"
+    );
     assert_eq!(
         file.metadata().unwrap().len(),
         before,

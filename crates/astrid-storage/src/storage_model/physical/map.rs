@@ -318,16 +318,16 @@ impl PhysicalMapNode {
         Ok((node, id))
     }
 
-    /// Authenticate historical metadata without allocating its value or prefix.
+    /// Authenticate historical metadata and consume its links without allocation.
     #[cfg(any(test, not(target_family = "wasm")))]
-    pub(crate) fn decode_child_ids_and_identify<I: PhysicalIdentity>(
+    pub(crate) fn with_child_ids_and_identify<I: PhysicalIdentity, T>(
         bytes: &[u8],
         identity: &I,
-    ) -> Result<(alloc::boxed::Box<[PhysicalMapNodeId]>, PhysicalMapNodeId), PhysicalModelError>
-    {
+        consume: impl FnOnce(PhysicalMapNodeId, &[PhysicalMapNodeId]) -> T,
+    ) -> Result<T, PhysicalModelError> {
         decode::with_decoded(bytes, |node| {
             let id = PhysicalMapNodeId::new(identity.identify(node.identity_context(), bytes));
-            (node.child_ids(), id)
+            node.with_child_ids(|children| consume(id, children))
         })
     }
 

@@ -67,11 +67,15 @@ fn borrowed_map_decode_keeps_values_and_prefixes_in_the_original_payload() {
                 })
                 .unwrap();
                 let calls = identity.0.get();
-                let (children, computed) =
-                    PhysicalMapNode::decode_child_ids_and_identify(&bytes, &identity).unwrap();
+                let (children, computed) = PhysicalMapNode::with_child_ids_and_identify(
+                    &bytes,
+                    &identity,
+                    |id, children| (children.to_vec(), id),
+                )
+                .unwrap();
                 assert_eq!(identity.0.get(), calls.strict_add(1));
                 assert_eq!(&computed, expected);
-                assert_eq!(&*children, expected_children);
+                assert_eq!(children, expected_children);
                 assert_eq!(PhysicalMapNode::decode(&bytes).unwrap(), *owned);
                 for end in 0..bytes.len() {
                     let truncated = &bytes[..end];
@@ -88,7 +92,7 @@ fn assert_rejected(bytes: &[u8]) {
     let owned = PhysicalMapNode::decode(bytes).unwrap_err();
     let borrowed = decode::with_decoded(bytes, |_| ()).unwrap_err();
     assert_eq!(format!("{owned:?}"), format!("{borrowed:?}"));
-    assert!(PhysicalMapNode::decode_child_ids_and_identify(bytes, &identity).is_err());
+    assert!(PhysicalMapNode::with_child_ids_and_identify(bytes, &identity, |_, _| ()).is_err());
     assert_eq!(
         identity.0.get(),
         0,
@@ -137,8 +141,12 @@ fn borrowed_decode_preserves_version_domain_tags_and_canonical_prefix_rejections
             .unwrap();
             let bytes = node.encode().unwrap();
             assert!(
-                PhysicalMapNode::decode_child_ids_and_identify(&bytes, &Identity(Cell::new(0)))
-                    .is_ok()
+                PhysicalMapNode::with_child_ids_and_identify(
+                    &bytes,
+                    &Identity(Cell::new(0)),
+                    |_, _| ()
+                )
+                .is_ok()
             );
         }
     }

@@ -95,11 +95,11 @@ impl<V: AsRef<[u8]>> MapNodeView<'_, V> {
     }
 
     #[cfg(any(test, not(target_family = "wasm")))]
-    pub(super) fn child_ids(&self) -> alloc::boxed::Box<[PhysicalMapNodeId]> {
+    pub(super) fn with_child_ids<T>(&self, consume: impl FnOnce(&[PhysicalMapNodeId]) -> T) -> T {
         match self {
-            Self::Branch { zero, one, .. } => alloc::boxed::Box::new([*zero, *one]),
-            Self::Radix { children, .. } => (*children).into(),
-            Self::Leaf { .. } | Self::Page { .. } => alloc::boxed::Box::default(),
+            Self::Branch { zero, one, .. } => consume(&[*zero, *one]),
+            Self::Radix { children, .. } => consume(children),
+            Self::Leaf { .. } | Self::Page { .. } => consume(&[]),
         }
     }
 
