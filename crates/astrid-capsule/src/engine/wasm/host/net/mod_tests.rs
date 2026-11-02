@@ -10,6 +10,14 @@ use crate::engine::wasm::bindings::astrid::net::host::{Host as _, HostTcpListene
 use crate::engine::wasm::host_state::HostState;
 use crate::engine::wasm::test_fixtures::minimal_host_state;
 
+fn shared_listener_count(state: &HostState) -> usize {
+    state
+        .shared_listeners
+        .get()
+        .map(dashmap::DashMap::len)
+        .unwrap_or(0)
+}
+
 #[test]
 fn max_active_streams_pinned() {
     assert_eq!(MAX_ACTIVE_STREAMS, 8);
@@ -79,7 +87,7 @@ async fn worker_stores_dedupe_onto_one_bound_socket() {
     let b = worker_b.bind_tcp("127.0.0.1".into(), port).unwrap();
 
     assert_eq!(
-        worker_a.shared_listeners.len(),
+        shared_listener_count(&worker_a),
         1,
         "both workers must observe ONE registry entry for the address"
     );
@@ -92,7 +100,7 @@ async fn worker_stores_dedupe_onto_one_bound_socket() {
     HostTcpListener::drop(&mut worker_a, a).unwrap();
     HostTcpListener::drop(&mut worker_b, b).unwrap();
     assert_eq!(
-        worker_a.shared_listeners.len(),
+        shared_listener_count(&worker_a),
         0,
         "last slot drop must evict the registry so the OS socket closes"
     );
@@ -118,20 +126,21 @@ async fn localhost_and_loopback_literal_share_one_registry_entry() {
     let b = worker_b.bind_tcp("127.0.0.1".into(), port).unwrap();
 
     assert_eq!(
-        worker_a.shared_listeners.len(),
+        shared_listener_count(&worker_a),
         1,
         "`localhost` and `127.0.0.1` are the same address and must share one entry"
     );
     assert!(
         worker_a
             .shared_listeners
-            .contains_key(&("127.0.0.1".to_string(), port)),
+            .get()
+            .is_some_and(|map| map.contains_key(&("127.0.0.1".to_string(), port))),
         "the registry must be keyed on the normalized literal, never on `localhost`"
     );
 
     HostTcpListener::drop(&mut worker_a, a).unwrap();
     HostTcpListener::drop(&mut worker_b, b).unwrap();
-    assert_eq!(worker_a.shared_listeners.len(), 0);
+    assert_eq!(shared_listener_count(&worker_a), 0);
     assert_eq!(worker_a.tcp_listener_count.load(Ordering::Acquire), 0);
 }
 
@@ -139,13 +148,14 @@ async fn localhost_and_loopback_literal_share_one_registry_entry() {
 async fn last_slot_drop_closes_os_socket_so_rebind_succeeds() {
     let port = free_port();
     let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    assert!(state.shared_listeners.get().is_none());
     let first = state.bind_tcp("127.0.0.1".into(), port).unwrap();
-    HostTcpListener::drop(&mut state, first).unwrap();
-    assert_eq!(
-        state.shared_listeners.len(),
-        0,
+    assert!(
+        state.shared_listeners.get().is_none(),
         "N=1 never enters the shared registry"
     );
+    HostTcpListener::drop(&mut state, first).unwrap();
+    assert!(state.shared_listeners.get().is_none());
     assert_eq!(state.tcp_listener_count.load(Ordering::Acquire), 0);
     let rebound = state
         .bind_tcp("127.0.0.1".into(), port)
@@ -170,7 +180,7 @@ async fn binder_first_drop_keeps_quota_until_last_live_slot() {
         1,
         "quota tracks the live socket, not the binder slot"
     );
-    assert_eq!(binder.shared_listeners.len(), 1);
+    assert_eq!(shared_listener_count(&binder), 1);
 
     let mut outsider = minimal_host_state(handle);
     assert!(
@@ -183,7 +193,7 @@ async fn binder_first_drop_keeps_quota_until_last_live_slot() {
 
     HostTcpListener::drop(&mut sibling, sibling_slot).unwrap();
     assert_eq!(binder.tcp_listener_count.load(Ordering::Acquire), 0);
-    assert_eq!(binder.shared_listeners.len(), 0);
+    assert_eq!(shared_listener_count(&binder), 0);
     let rebound = outsider
         .bind_tcp("127.0.0.1".into(), port)
         .expect("port is free after last live slot drops");
@@ -199,10 +209,9 @@ async fn n1_double_bind_on_same_host_state_is_address_in_use() {
         "minimal_host_state models N=1 / interceptor HostState"
     );
     let first = state.bind_tcp("127.0.0.1".into(), port).unwrap();
-    assert_eq!(
-        state.shared_listeners.len(),
-        0,
-        "N=1 must not insert into shared_listeners"
+    assert!(
+        state.shared_listeners.get().is_none(),
+        "N=1 must not initialize shared_listeners"
     );
     assert!(
         matches!(
@@ -210,6 +219,10 @@ async fn n1_double_bind_on_same_host_state_is_address_in_use() {
             Err(ErrorCode::AddressInUse)
         ),
         "N=1 must attempt a real OS bind; a second bind on the same HostState must not clone the socket"
+    );
+    assert!(
+        state.shared_listeners.get().is_none(),
+        "a failed N=1 second bind must not initialize the shared registry"
     );
     HostTcpListener::drop(&mut state, first).unwrap();
 }

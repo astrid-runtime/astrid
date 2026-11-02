@@ -433,8 +433,8 @@ pub struct HostState {
     /// `Arc` so a capsule's pool of `Store`s shares one limiter — otherwise
     /// each pooled `Store` would get its own budget and the per-capsule
     /// throughput cap would be `pool_size`× too loose (issue #816). The
-    /// limiter is internally concurrent (`DashMap`), so shared `&self` access
-    /// is contention-free.
+    /// limiter is internally concurrent; its bucket map is created on first
+    /// bucket lookup after the payload hard cap rather than at construction.
     pub ipc_limiter: Arc<astrid_events::ipc::IpcRateLimiter>,
     /// Plugin configuration from the manifest.
     ///
@@ -685,16 +685,21 @@ pub struct HostState {
     /// principal challenge-response (issue #45/#852) and torn down when the
     /// stream resource drops.
     ///
-    /// `Arc<DashMap>` so the binding is SHARED across a capsule's pooled
-    /// interceptor `HostState` instances exactly like [`process_tracker`](Self::process_tracker):
-    /// the same socket-owning capsule may serve a connection from a
-    /// different pooled instance than the one that accepted it. Run-loop
-    /// workers do not share this map: each worker owns a ResourceTable, so
-    /// Wasmtime `u32` reps collide across workers. Each entry
-    /// carries the verified principal AND the `key_id` of the device that
-    /// authenticated it ([`ConnectionIdentity`]) so the cap-gate can apply the
-    /// device's scope as an attenuation floor on the principal's authority.
-    pub connection_principals: Arc<dashmap::DashMap<u32, ConnectionIdentity>>,
+    /// `Arc<OnceLock<DashMap>>` so unused runtimes skip shard allocation, while
+    /// interceptor pools still SHARE one registry after first bind (exactly
+    /// like [`process_tracker`](Self::process_tracker)): the same socket-owning
+    /// capsule may serve a connection from a different pooled instance than
+    /// the one that accepted it. Run-loop workers do not share this map: each
+    /// worker owns a ResourceTable, so Wasmtime `u32` reps collide across
+    /// workers. Each entry carries the verified principal AND the `key_id` of
+    /// the device that authenticated it ([`ConnectionIdentity`]) so the
+    /// cap-gate can apply the device's scope as an attenuation floor on the
+    /// principal's authority.
+    ///
+    /// This field type is an intentional in-crate host-state representation
+    /// change, not a WIT or guest ABI change. Reads, unbind, pool reset, and
+    /// Drop use `OnceLock::get` and treat a missing map as empty.
+    pub connection_principals: Arc<std::sync::OnceLock<dashmap::DashMap<u32, ConnectionIdentity>>>,
     /// The verified principal of the source connection whose inbound frame is
     /// currently in flight — the ENFORCEMENT side of
     /// [`connection_principals`](Self::connection_principals) (issue #45/#852).
@@ -770,9 +775,11 @@ pub struct HostState {
     ///
     /// Distinct from [`connection_principals`](Self::connection_principals),
     /// which stores only authenticated principals (absence ⇒ `publish-as`
-    /// anonymous fallback). `Arc<DashMap>` so the binding survives drop landing
-    /// on a different pooled instance than the one that accepted.
-    pub client_connections: Arc<dashmap::DashMap<u32, astrid_core::principal::PrincipalId>>,
+    /// anonymous fallback). `Arc<OnceLock<DashMap>>` so unused runtimes skip
+    /// shard allocation, while interceptor pools still share one registry
+    /// after first accept so drop can land on a different pooled instance.
+    pub client_connections:
+        Arc<std::sync::OnceLock<dashmap::DashMap<u32, astrid_core::principal::PrincipalId>>>,
     /// Bound loopback TCP listeners shared across a run-loop capsule's worker
     /// Stores, keyed by `(host, port)`. When `bind_workers > 1`, each of the N
     /// worker Stores runs `run()` and calls `bind_tcp` for the same address;
@@ -782,7 +789,11 @@ pub struct HostState {
     /// the OS socket closes. Cloned into worker Stores only when
     /// `bind_workers > 1`; interceptor / non-worker pool instances each get
     /// a fresh map so a concrete-port bind is not accidentally shared.
-    pub shared_listeners: Arc<dashmap::DashMap<(String, u16), SharedTcpListener>>,
+    /// `Arc<OnceLock<DashMap>>` so N=1 and interceptor HostStates that never
+    /// share a listener allocate no shard array; worker first-bind initializes
+    /// one default map. Listener drop/release never initializes.
+    pub shared_listeners:
+        Arc<std::sync::OnceLock<dashmap::DashMap<(String, u16), SharedTcpListener>>>,
     /// Whether `bind_tcp` may clone a concrete-port socket from
     /// [`shared_listeners`](Self::shared_listeners). True only for
     /// `bind_workers > 1` worker Stores. N=1 (and interceptor/lifecycle

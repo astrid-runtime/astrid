@@ -639,15 +639,15 @@ fn connection_principal_registry_round_trip() {
     state.bind_connection_principal(rep, alice.clone(), Some("dev-alice".to_string()));
     let alice_owner = state
         .connection_principals
-        .get(&rep)
-        .map(|identity| identity.request_owner)
+        .get()
+        .and_then(|map| map.get(&rep).map(|identity| identity.request_owner))
         .expect("connection owner");
     assert_eq!(state.connection_principal(rep), Some(alice.clone()));
     assert_eq!(
         state
             .connection_principals
-            .get(&rep)
-            .and_then(|e| e.device_key_id.clone())
+            .get()
+            .and_then(|map| map.get(&rep).and_then(|entry| entry.device_key_id.clone()))
             .as_deref(),
         Some("dev-alice"),
         "the device key_id must be stored alongside the principal"
@@ -662,8 +662,8 @@ fn connection_principal_registry_round_trip() {
     state.bind_connection_principal(rep, bob.clone(), None);
     let bob_owner = state
         .connection_principals
-        .get(&rep)
-        .map(|identity| identity.request_owner)
+        .get()
+        .and_then(|map| map.get(&rep).map(|identity| identity.request_owner))
         .expect("connection owner");
     assert_ne!(
         alice_owner, bob_owner,
@@ -673,8 +673,8 @@ fn connection_principal_registry_round_trip() {
     assert_eq!(
         state
             .connection_principals
-            .get(&rep)
-            .and_then(|e| e.device_key_id.clone()),
+            .get()
+            .and_then(|map| map.get(&rep).and_then(|entry| entry.device_key_id.clone())),
         None,
         "rebinding without a device must clear the prior device id"
     );

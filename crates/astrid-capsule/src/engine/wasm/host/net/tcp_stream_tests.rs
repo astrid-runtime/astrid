@@ -94,8 +94,8 @@ async fn framed_read_records_then_clears_verified_ingress_principal() {
     state.bind_connection_principal(rep, claude.clone(), Some("dev-abc123".to_string()));
     let request_owner = state
         .connection_principals
-        .get(&rep)
-        .map(|identity| identity.request_owner)
+        .get()
+        .and_then(|map| map.get(&rep).map(|identity| identity.request_owner))
         .expect("request owner");
 
     // Peer sends one length-prefixed frame (4-byte BE length + payload).

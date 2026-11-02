@@ -47,7 +47,10 @@ const EVENT_SOURCE: &str = "net_client_lifecycle";
 /// removes it at stream drop, guaranteeing the connect/disconnect pair balances
 /// on the identical host-verified principal.
 pub(super) fn register_and_emit_connect(state: &HostState, rep: u32, principal: PrincipalId) {
-    state.client_connections.insert(rep, principal.clone());
+    state
+        .client_connections
+        .get_or_init(dashmap::DashMap::new)
+        .insert(rep, principal.clone());
     publish_lifecycle(
         state,
         Topic::client_connect(),
@@ -64,7 +67,11 @@ pub(super) fn register_and_emit_connect(state: &HostState, rep: u32, principal: 
 /// connection — outbound TCP streams (`connect-tcp`) and non-net resources —
 /// so a capsule-dialed socket dropping never moves the client counter.
 pub(super) fn emit_client_disconnect(state: &HostState, rep: u32) {
-    let Some((_, principal)) = state.client_connections.remove(&rep) else {
+    let Some((_, principal)) = state
+        .client_connections
+        .get()
+        .and_then(|map| map.remove(&rep))
+    else {
         return;
     };
     publish_lifecycle(

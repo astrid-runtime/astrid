@@ -15,10 +15,10 @@ impl request_context::Host for HostState {
             .get::<NetStream>(&Resource::new_borrow(connection.rep()))
             .map_err(|_| ErrorCode::InvalidHandle)?;
 
-        Ok(self
-            .connection_principals
-            .get(&connection.rep())
-            .map(|identity| identity.request_owner.to_string()))
+        Ok(self.connection_principals.get().and_then(|map| {
+            map.get(&connection.rep())
+                .map(|identity| identity.request_owner.to_string())
+        }))
     }
 
     fn connection_principal(
@@ -29,10 +29,10 @@ impl request_context::Host for HostState {
             .get::<NetStream>(&Resource::new_borrow(connection.rep()))
             .map_err(|_| ErrorCode::InvalidHandle)?;
 
-        Ok(self
-            .connection_principals
-            .get(&connection.rep())
-            .map(|identity| identity.principal.to_string()))
+        Ok(self.connection_principals.get().and_then(|map| {
+            map.get(&connection.rep())
+                .map(|identity| identity.principal.to_string())
+        }))
     }
 }
 
@@ -69,10 +69,18 @@ mod tests {
             .expect("push stream")
             .rep();
 
+        assert!(
+            state.connection_principals.get().is_none(),
+            "fixture HostState must not allocate the identity map"
+        );
         assert_eq!(
             request_context::Host::connection_principal(&mut state, Resource::new_borrow(rep))
                 .expect("unbound stream lookup"),
             None
+        );
+        assert!(
+            state.connection_principals.get().is_none(),
+            "an unbound request-context lookup must not initialize the registry"
         );
         assert_eq!(
             request_context::Host::connection_owner(&mut state, Resource::new_borrow(rep))
@@ -84,8 +92,11 @@ mod tests {
         state.bind_connection_principal(rep, principal, Some("device-alice".to_owned()));
         let expected_owner = state
             .connection_principals
-            .get(&rep)
-            .map(|identity| identity.request_owner.to_string())
+            .get()
+            .and_then(|map| {
+                map.get(&rep)
+                    .map(|identity| identity.request_owner.to_string())
+            })
             .expect("bound connection owner");
 
         assert_eq!(

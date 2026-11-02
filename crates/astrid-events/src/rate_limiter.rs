@@ -29,7 +29,9 @@ pub const MAX_IPC_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
 /// it resets.
 #[derive(Debug)]
 pub struct IpcRateLimiter {
-    state: dashmap::DashMap<RateLimiterKey, (web_time::Instant, usize)>,
+    /// Created on the first bucket lookup after the payload hard cap. Idle
+    /// limiters allocate no `DashMap` shards. First use retains default sharding.
+    state: std::sync::OnceLock<dashmap::DashMap<RateLimiterKey, (web_time::Instant, usize)>>,
     last_prune: std::sync::Mutex<web_time::Instant>,
 }
 
@@ -38,7 +40,7 @@ impl IpcRateLimiter {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            state: dashmap::DashMap::new(),
+            state: std::sync::OnceLock::new(),
             last_prune: std::sync::Mutex::new(web_time::Instant::now()),
         }
     }
@@ -68,19 +70,19 @@ impl IpcRateLimiter {
 
         let now = web_time::Instant::now();
 
+        let state = self.state.get_or_init(dashmap::DashMap::new);
         // Lazy prune stale entries to prevent memory leaks when shared globally.
-        if self.state.len() > 1000 {
+        if state.len() > 1000 {
             if let Ok(mut last) = self.last_prune.try_lock() {
                 if now.saturating_duration_since(*last).as_secs() > 60 {
                     *last = now;
-                    self.state
-                        .retain(|_, v| now.saturating_duration_since(v.0).as_secs() < 1);
+                    state.retain(|_, v| now.saturating_duration_since(v.0).as_secs() < 1);
                 }
             }
         }
 
         let key: RateLimiterKey = (capsule_uuid, principal.clone());
-        let mut entry = self.state.entry(key).or_insert((now, 0));
+        let mut entry = state.entry(key).or_insert((now, 0));
 
         // Reset window if more than 1 second has passed
         if now.saturating_duration_since(entry.0).as_secs() >= 1 {
@@ -114,6 +116,121 @@ mod tests {
 
     const ONE_MIB: usize = 1024 * 1024;
     const TEN_MIB: usize = 10 * 1024 * 1024;
+
+    #[test]
+    fn unused_limiter_does_not_allocate_buckets() {
+        let limiter = IpcRateLimiter::new();
+        assert!(limiter.state.get().is_none());
+    }
+
+    #[test]
+    fn oversized_payload_does_not_initialize_buckets() {
+        let limiter = IpcRateLimiter::new();
+        let err = limiter
+            .check_quota(
+                Uuid::new_v4(),
+                &pid("alice"),
+                MAX_IPC_PAYLOAD_BYTES + 1,
+                usize::MAX,
+            )
+            .expect_err("payload > 5 MiB must reject");
+        assert!(err.contains("Payload too large"));
+        assert!(
+            limiter.state.get().is_none(),
+            "hard-cap rejection must not allocate the bucket map"
+        );
+    }
+
+    #[test]
+    fn first_admitted_publish_initializes_one_default_map() {
+        let limiter = IpcRateLimiter::new();
+        limiter
+            .check_quota(Uuid::new_v4(), &pid("alice"), 1, ONE_MIB)
+            .expect("first byte fits");
+        let state = limiter
+            .state
+            .get()
+            .expect("first admitted publish initializes");
+        assert_eq!(
+            state.shards().len(),
+            dashmap::DashMap::<RateLimiterKey, (web_time::Instant, usize)>::new()
+                .shards()
+                .len(),
+            "first insert must use DashMap::new, not a reduced shard count"
+        );
+    }
+
+    #[test]
+    fn concurrent_first_checks_preserve_independent_buckets() {
+        let limiter = IpcRateLimiter::new();
+        let capsule = Uuid::new_v4();
+        let start = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            for index in 0..16 {
+                let limiter = &limiter;
+                let start = &start;
+                scope.spawn(move || {
+                    let principal = pid(&format!("first-publisher-{index}"));
+                    start.wait();
+                    limiter
+                        .check_quota(capsule, &principal, 1, ONE_MIB)
+                        .expect("independent first byte fits");
+                    assert_eq!(
+                        limiter
+                            .state
+                            .get()
+                            .unwrap()
+                            .get(&(capsule, principal))
+                            .unwrap()
+                            .1,
+                        1
+                    );
+                });
+            }
+        });
+        assert_eq!(limiter.state.get().unwrap().len(), 16);
+    }
+
+    #[test]
+    fn concurrent_publishers_cannot_overdraw_shared_bucket() {
+        let limiter = IpcRateLimiter::new();
+        let capsule = Uuid::new_v4();
+        let principal = pid("concurrent");
+        // Keep the accounting window fixed while threads contend, without
+        // relying on the scheduler finishing within one wall-clock second.
+        limiter.state.get_or_init(dashmap::DashMap::new).insert(
+            (capsule, principal.clone()),
+            (
+                web_time::Instant::now() + std::time::Duration::from_mins(1),
+                0,
+            ),
+        );
+        let admitted = std::sync::atomic::AtomicUsize::new(0);
+        let start = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    start.wait();
+                    for _ in 0..100 {
+                        if limiter.check_quota(capsule, &principal, 1, 100).is_ok() {
+                            admitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(admitted.into_inner(), 100);
+        assert_eq!(
+            limiter
+                .state
+                .get()
+                .expect("overdraw test initialized the map")
+                .get(&(capsule, principal))
+                .unwrap()
+                .1,
+            100
+        );
+    }
 
     #[test]
     fn payload_above_hard_cap_rejected_regardless_of_profile() {
