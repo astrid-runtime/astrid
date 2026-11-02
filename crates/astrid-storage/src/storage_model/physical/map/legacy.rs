@@ -1,5 +1,6 @@
 //! Frozen binary Patricia-map construction retained for format-one recovery.
 
+use super::validation::CanonicalNodeSink;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
@@ -24,16 +25,16 @@ pub(super) fn insert<I: PhysicalIdentity>(
     .insert_at(root, key, value)
 }
 
-pub(super) fn build<I: PhysicalIdentity>(
+pub(super) fn build<I: PhysicalIdentity, V: AsRef<[u8]>, N: CanonicalNodeSink>(
     identity: &I,
     domain: PhysicalMapDomain,
-    entries: &[(PhysicalMapKey, Vec<u8>)],
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    entries: &[(PhysicalMapKey, V)],
+    nodes: &mut N,
 ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
     if entries.len() == 1 {
-        let node = PhysicalMapNode::leaf(domain, entries[0].0, entries[0].1.clone());
+        let node = PhysicalMapNode::leaf(domain, entries[0].0, entries[0].1.as_ref().to_vec());
         let id = node.identify(identity)?;
-        nodes.insert(id, node);
+        nodes.put(id, node)?;
         return Ok(id);
     }
     let first = entries
@@ -65,7 +66,7 @@ pub(super) fn build<I: PhysicalIdentity>(
         u64::try_from(entries.len()).map_err(|_| PhysicalModelError::LengthOverflow)?,
     )?;
     let id = node.identify(identity)?;
-    nodes.insert(id, node);
+    nodes.put(id, node)?;
     Ok(id)
 }
 
