@@ -1,5 +1,6 @@
 //! Dense canonical nibble-radix construction.
 
+use super::validation::CanonicalNodeSink;
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -9,11 +10,11 @@ use super::{
     PhysicalMapNodeId, PhysicalModelError, RADIX_PAGE_CAPACITY, nibble_prefix_byte_len,
 };
 
-pub(super) fn build<I: PhysicalIdentity>(
+pub(super) fn build<I: PhysicalIdentity, V: AsRef<[u8]>, N: CanonicalNodeSink>(
     identity: &I,
     domain: PhysicalMapDomain,
-    entries: &[(PhysicalMapKey, Vec<u8>)],
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    entries: &[(PhysicalMapKey, V)],
+    nodes: &mut N,
 ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
     build_range(identity, domain, entries, 0, nodes)
 }
@@ -34,12 +35,12 @@ pub(super) fn insert<I: PhysicalIdentity>(
     .insert_at(root, key, value)
 }
 
-fn build_range<I: PhysicalIdentity>(
+fn build_range<I: PhysicalIdentity, V: AsRef<[u8]>, N: CanonicalNodeSink>(
     identity: &I,
     domain: PhysicalMapDomain,
-    entries: &[(PhysicalMapKey, Vec<u8>)],
+    entries: &[(PhysicalMapKey, V)],
     depth: u8,
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    nodes: &mut N,
 ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
     if entries.is_empty() {
         return Err(PhysicalModelError::InvalidMap("empty radix range"));
@@ -48,7 +49,13 @@ fn build_range<I: PhysicalIdentity>(
         return insert_node(
             identity,
             nodes,
-            PhysicalMapNode::page(domain, entries.to_vec())?,
+            PhysicalMapNode::page(
+                domain,
+                entries
+                    .iter()
+                    .map(|(key, value)| (*key, value.as_ref().to_vec()))
+                    .collect(),
+            )?,
         );
     }
 
@@ -260,13 +267,13 @@ struct Branch {
     subtree_entries: u64,
 }
 
-fn insert_node<I: PhysicalIdentity>(
+fn insert_node<I: PhysicalIdentity, N: CanonicalNodeSink>(
     identity: &I,
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    nodes: &mut N,
     node: PhysicalMapNode,
 ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
     let id = node.identify(identity)?;
-    nodes.entry(id).or_insert(node);
+    nodes.put(id, node)?;
     Ok(id)
 }
 
