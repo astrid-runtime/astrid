@@ -15,7 +15,11 @@ use crate::engine::{ProjectionCacheEntry, ProjectionCacheKey};
 use crate::storage_model::{ObjectId, ObjectRecord};
 use parking_lot::Mutex;
 
+mod admission;
 mod policy;
+mod weights;
+
+use weights::{association_weight, cache_weight, projection_cache_weight, projection_weight};
 
 pub use policy::{
     ObjectCacheCapacity, ObjectCacheConfig, ObjectCacheController, ObjectCacheMemoryBudget,
@@ -118,189 +122,6 @@ where
         }
     }
 
-    pub(super) fn get(&self, principal: &P, object: ObjectId) -> Option<Arc<ObjectRecord>> {
-        let _accounting = self.accounting.lock();
-        let (global_required, principal_required) = {
-            let state = self.state.lock();
-            let weight = state.entries.get(&object).map_or(0, |entry| entry.weight);
-            if weight == 0 || state.is_attached(principal, object) {
-                (state.resident_bytes(), state.principal_charge(principal))
-            } else {
-                (
-                    state
-                        .resident_bytes()
-                        .saturating_add(association_weight::<P>()),
-                    state.principal_charge(principal).saturating_add(weight),
-                )
-            }
-        };
-        let global_capacity = self.controller.ensure_capacity(global_required);
-        let principal_capacity = if global_capacity == ObjectCacheCapacity::Disabled {
-            ObjectCacheCapacity::Disabled
-        } else {
-            self.principal_budget
-                .ensure_capacity(principal, principal_required)
-        };
-        let mut state = self.state.lock();
-        let global_capacity = global_capacity.min(self.controller.capacity());
-        let principal_capacity = principal_capacity.min(self.principal_budget.capacity(principal));
-        state.trim_global(global_capacity);
-        state.trim_principal(principal, principal_capacity);
-        let result = 'cache: {
-            if global_capacity == ObjectCacheCapacity::Disabled
-                || principal_capacity == ObjectCacheCapacity::Disabled
-            {
-                state.bypasses = state.bypasses.saturating_add(1);
-                break 'cache None;
-            }
-
-            let Some(weight) = state.entries.get(&object).map(|entry| entry.weight) else {
-                state.misses = state.misses.saturating_add(1);
-                break 'cache None;
-            };
-            if !principal_capacity.accepts(weight) {
-                state.bypasses = state.bypasses.saturating_add(1);
-                break 'cache None;
-            }
-            if !state.is_attached(principal, object) {
-                let association_weight = association_weight::<P>();
-                state.evict_global_until_fits(association_weight, global_capacity, Some(object));
-                if !state.can_fit_global(association_weight, global_capacity)
-                    || !state.attach_principal(principal, object, weight, principal_capacity)
-                {
-                    state.bypasses = state.bypasses.saturating_add(1);
-                    break 'cache None;
-                }
-            }
-            let Some(record) = state.touch(principal, object) else {
-                break 'cache None;
-            };
-            state.hits = state.hits.saturating_add(1);
-            Some(record)
-        };
-        let resident = state.resident_bytes();
-        let charged = state.principal_charge(principal);
-        drop(state);
-        // Reconciliation may acknowledge an authority pressure target and
-        // shrink a slab. The accounting guard keeps this byte count ordered
-        // with every admission and explicit release without invoking an
-        // external policy while the cache-state lock is held.
-        self.controller.reconcile(resident);
-        self.principal_budget.reconcile(principal, charged);
-        result
-    }
-
-    pub(super) fn insert(
-        &self,
-        principal: &P,
-        object: ObjectId,
-        record: ObjectRecord,
-    ) -> Arc<ObjectRecord> {
-        let _accounting = self.accounting.lock();
-        let record = Arc::new(record);
-        let weight = cache_weight(&record);
-        let association_weight = association_weight::<P>();
-        let initial_weight = weight.saturating_add(association_weight);
-        let (global_required, principal_required) = {
-            let state = self.state.lock();
-            if state.entries.contains_key(&object) {
-                if state.is_attached(principal, object) {
-                    (state.resident_bytes(), state.principal_charge(principal))
-                } else {
-                    (
-                        state.resident_bytes().saturating_add(association_weight),
-                        state.principal_charge(principal).saturating_add(weight),
-                    )
-                }
-            } else {
-                (
-                    state.resident_bytes().saturating_add(initial_weight),
-                    state.principal_charge(principal).saturating_add(weight),
-                )
-            }
-        };
-        let global_capacity = self.controller.ensure_capacity(global_required);
-        let principal_capacity = if global_capacity == ObjectCacheCapacity::Disabled {
-            ObjectCacheCapacity::Disabled
-        } else {
-            self.principal_budget
-                .ensure_capacity(principal, principal_required)
-        };
-        let mut state = self.state.lock();
-        let global_capacity = global_capacity.min(self.controller.capacity());
-        let principal_capacity = principal_capacity.min(self.principal_budget.capacity(principal));
-        state.trim_global(global_capacity);
-        state.trim_principal(principal, principal_capacity);
-        let result = 'cache: {
-            if !global_capacity.accepts(initial_weight) || !principal_capacity.accepts(weight) {
-                break 'cache Arc::clone(&record);
-            }
-
-            if state.entries.contains_key(&object) {
-                if !state.is_attached(principal, object) {
-                    state.evict_global_until_fits(
-                        association_weight,
-                        global_capacity,
-                        Some(object),
-                    );
-                    if !state.can_fit_global(association_weight, global_capacity)
-                        || !state.attach_principal(principal, object, weight, principal_capacity)
-                    {
-                        break 'cache Arc::clone(&record);
-                    }
-                }
-                break 'cache state
-                    .touch(principal, object)
-                    .unwrap_or_else(|| Arc::clone(&record));
-            }
-
-            state.evict_principal_until_fits(principal, weight, principal_capacity);
-            state.evict_global_until_fits(initial_weight, global_capacity, None);
-            if !state.can_fit_principal(principal, weight, principal_capacity)
-                || !state.can_fit_global(initial_weight, global_capacity)
-            {
-                break 'cache Arc::clone(&record);
-            }
-
-            let tick = state.tick();
-            let mut principals = BTreeSet::new();
-            principals.insert(principal.clone());
-            state.entries.insert(
-                object,
-                CachedObject {
-                    record: Arc::clone(&record),
-                    weight,
-                    last_access: tick,
-                    principals,
-                },
-            );
-            state.lru.insert((tick, object));
-            let partition = state.principals.entry(principal.clone()).or_default();
-            partition.entries.insert(
-                object,
-                PrincipalEntry {
-                    last_access: tick,
-                    projections: BTreeMap::new(),
-                },
-            );
-            partition.lru.insert((tick, object));
-            partition.charged_bytes = partition.charged_bytes.saturating_add(weight);
-            state.resident_record_bytes = state.resident_record_bytes.saturating_add(weight);
-            state.resident_association_bytes = state
-                .resident_association_bytes
-                .saturating_add(association_weight);
-            state.resident_associations = state.resident_associations.saturating_add(1);
-            state.insertions = state.insertions.saturating_add(1);
-            Arc::clone(&record)
-        };
-        let resident = state.resident_bytes();
-        let charged = state.principal_charge(principal);
-        drop(state);
-        self.controller.reconcile(resident);
-        self.principal_budget.reconcile(principal, charged);
-        result
-    }
-
     pub(super) fn stats(&self) -> ObjectCacheStats {
         let state = self.state.lock();
         ObjectCacheStats {
@@ -372,66 +193,6 @@ where
         Some(ProjectionCacheEntry::from_parts(value, weight))
     }
 
-    pub(super) fn retain_projection(
-        &self,
-        principal: &P,
-        object: ObjectId,
-        key: ProjectionCacheKey,
-        value: ProjectionCacheEntry,
-    ) -> bool {
-        let _accounting = self.accounting.lock();
-        let (value, payload_weight) = value.into_parts();
-        let weight = projection_cache_weight(payload_weight);
-        let (global_required, principal_required) = {
-            let state = self.state.lock();
-            let replaced = state
-                .principals
-                .get(principal)
-                .and_then(|partition| partition.entries.get(&object))
-                .and_then(|entry| entry.projections.get(&key))
-                .map_or(0, |entry| entry.weight);
-            (
-                state
-                    .resident_bytes()
-                    .saturating_sub(replaced)
-                    .saturating_add(weight),
-                state
-                    .principal_charge(principal)
-                    .saturating_sub(replaced)
-                    .saturating_add(weight),
-            )
-        };
-        let global_capacity = self.controller.ensure_capacity(global_required);
-        let principal_capacity = if global_capacity == ObjectCacheCapacity::Disabled {
-            ObjectCacheCapacity::Disabled
-        } else {
-            self.principal_budget
-                .ensure_capacity(principal, principal_required)
-        };
-        let mut state = self.state.lock();
-        let global_capacity = global_capacity.min(self.controller.capacity());
-        let principal_capacity = principal_capacity.min(self.principal_budget.capacity(principal));
-        state.trim_global(global_capacity);
-        state.trim_principal(principal, principal_capacity);
-        let retained = state.insert_projection(
-            principal,
-            object,
-            key,
-            value,
-            weight,
-            CacheAdmission {
-                global: global_capacity,
-                principal: principal_capacity,
-            },
-        );
-        let resident = state.resident_bytes();
-        let charged = state.principal_charge(principal);
-        drop(state);
-        self.controller.reconcile(resident);
-        self.principal_budget.reconcile(principal, charged);
-        retained
-    }
-
     pub(super) fn discard_projection(
         &self,
         principal: &P,
@@ -481,6 +242,25 @@ where
         for (principal, charged) in charges {
             self.principal_budget.reconcile(&principal, charged);
         }
+    }
+
+    /// Release only this owner's associations; shared physical objects and
+    /// unrelated owners' projections keep their existing accounting.
+    pub(super) fn discard_principal(&self, principal: &P) {
+        let _accounting = self.accounting.lock();
+        let mut state = self.state.lock();
+        let objects = state
+            .principals
+            .get(principal)
+            .map(|partition| partition.entries.keys().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for object in objects {
+            state.detach_principal(principal, object);
+        }
+        let resident = state.resident_bytes();
+        drop(state);
+        self.controller.reconcile(resident);
+        self.principal_budget.release_unused(principal, 0);
     }
 
     pub(super) fn clear(&self) {
@@ -945,41 +725,6 @@ where
             .saturating_add(self.resident_association_bytes)
             .saturating_add(self.resident_projection_bytes)
     }
-}
-
-fn cache_weight(record: &ObjectRecord) -> u64 {
-    let resident_metadata = std::mem::size_of::<ObjectRecord>()
-        .saturating_add(std::mem::size_of::<Arc<ObjectRecord>>())
-        .saturating_add(std::mem::size_of::<ObjectId>())
-        .saturating_add(std::mem::size_of::<u64>());
-    record
-        .retained_bytes()
-        .unwrap_or(u64::MAX)
-        .saturating_add(u64::try_from(resident_metadata).unwrap_or(u64::MAX))
-}
-
-fn association_weight<P>() -> u64 {
-    u64::try_from(
-        std::mem::size_of::<P>()
-            .saturating_add(std::mem::size_of::<ObjectId>())
-            .saturating_add(std::mem::size_of::<u64>())
-            .saturating_add(std::mem::size_of::<ObjectId>())
-            .saturating_add(std::mem::size_of::<u64>()),
-    )
-    .unwrap_or(u64::MAX)
-}
-
-fn projection_weight(entry: &PrincipalEntry) -> u64 {
-    entry.projections.values().fold(0_u64, |total, projection| {
-        total.saturating_add(projection.weight)
-    })
-}
-
-fn projection_cache_weight(payload: u64) -> u64 {
-    let metadata = std::mem::size_of::<ProjectionCacheKey>()
-        .saturating_add(std::mem::size_of::<CachedProjection>())
-        .saturating_add(std::mem::size_of::<usize>().saturating_mul(3));
-    payload.saturating_add(u64::try_from(metadata).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]

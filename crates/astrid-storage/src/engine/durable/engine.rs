@@ -50,9 +50,13 @@ where
     /// Return one immutable object through the principal-accounted decoded
     /// cache.
     ///
-    /// Cache policy never changes read correctness. A bypass or miss performs
-    /// the ordinary positional frame read and full validation before the
-    /// resulting record can be retained.
+    /// Cache policy never changes read correctness. A retention bypass may
+    /// reuse an already validated shared record without acquiring ownership.
+    /// When no validated record is cached, reads use the ordinary pending-WAL
+    /// or positional arena path with full validation before retention.
+    ///
+    /// Cache retention requires a current authoritative root for the principal.
+    /// Reads for an absent owner remain valid without creating a cache account.
     ///
     /// # Errors
     ///
@@ -70,9 +74,14 @@ where
     /// Return one immutable object through the principal-accounted decoded
     /// cache without cloning its allocation.
     ///
-    /// Cache policy never changes read correctness. A bypass or miss performs
-    /// the ordinary positional frame read and full validation before the
-    /// resulting record can be retained.
+    /// Retention requires an authoritative root for the principal. Reads made
+    /// before its first root or through a lease after retirement remain valid,
+    /// but cannot create a cache account for an absent owner.
+    ///
+    /// Cache policy never changes read correctness. A retention bypass may
+    /// reuse an already validated shared record without acquiring ownership.
+    /// When no validated record is cached, reads use the ordinary pending-WAL
+    /// or positional arena path with full validation before retention.
     ///
     /// # Errors
     ///
@@ -86,7 +95,10 @@ where
         let mut recovery = RecoveryScope::default();
         loop {
             self.ensure_cached_read_usable_with(&mut recovery)?;
-            if let Some(record) = self.object_cache.get(principal, id) {
+            if let Some(record) = self
+                .object_cache
+                .get_if_current(principal, id, || self.cache_owner_is_live(principal))
+            {
                 return Ok(Some(record));
             }
             let (pending, location, generation) = {
@@ -145,6 +157,9 @@ where
     /// arena frames are read as one span and each frame retains its complete
     /// checksum, identity, and canonical decode validation.
     ///
+    /// Cache retention requires a current authoritative root for the principal.
+    /// Reads for an absent owner remain valid without creating a cache account.
+    ///
     /// # Errors
     ///
     /// Returns a recovery error when authoritative reopen cannot complete, or
@@ -169,6 +184,9 @@ where
     /// arena frames are read as one span and each frame retains its complete
     /// checksum, identity, and canonical decode validation.
     ///
+    /// Cache retention requires a current authoritative root for the principal.
+    /// Reads for an absent owner remain valid without creating a cache account.
+    ///
     /// # Errors
     ///
     /// Returns a recovery error when authoritative reopen cannot complete, or
@@ -183,7 +201,10 @@ where
         let mut results = vec![None; ids.len()];
         let mut missing = BTreeMap::<ObjectId, Vec<usize>>::new();
         for (index, id) in ids.iter().copied().enumerate() {
-            if let Some(record) = self.object_cache.get(principal, id) {
+            if let Some(record) = self
+                .object_cache
+                .get_if_current(principal, id, || self.cache_owner_is_live(principal))
+            {
                 results[index] = Some(record);
             } else {
                 missing.entry(id).or_default().push(index);
@@ -228,7 +249,11 @@ where
                 continue;
             }
             for (id, record) in loaded {
-                let cached = self.object_cache.insert(principal, id, record);
+                let cached = self
+                    .object_cache
+                    .insert_if_current(principal, id, record, || {
+                        self.cache_owner_is_live(principal)
+                    });
                 if let Some(indices) = missing.get(&id) {
                     for index in indices {
                         results[*index] = Some(Arc::clone(&cached));
@@ -273,7 +298,19 @@ where
         {
             return Ok(None);
         }
-        Ok(Some(self.object_cache.insert(principal, id, record)))
+        Ok(Some(self.object_cache.insert_if_current(
+            principal,
+            id,
+            record,
+            || self.cache_owner_is_live(principal),
+        )))
+    }
+
+    // Evaluated only under ObjectCache's accounting gate. Removal publishes
+    // root absence before discarding associations under that same gate.
+    fn cache_owner_is_live(&self, principal: &P) -> bool {
+        self.lifecycle.load(std::sync::atomic::Ordering::Acquire) == LIFECYCLE_USABLE
+            && self.published_roots.entries.load().contains_key(principal)
     }
 
     fn ensure_cached_read_usable(&self) -> Result<(), DurableError> {
@@ -343,6 +380,7 @@ where
     ///
     /// Returns `false` when policy declines retention. Projection correctness
     /// must not depend on this value remaining resident.
+    /// An absent authoritative principal root also declines retention.
     pub fn retain_projection_cache(
         &self,
         principal: &P,
@@ -354,7 +392,9 @@ where
             return false;
         }
         self.object_cache
-            .retain_projection(principal, object, key, value)
+            .retain_projection_if_current(principal, object, key, value, || {
+                self.cache_owner_is_live(principal)
+            })
     }
 
     /// Discard one projection-owned accelerator and release its cache charge.
@@ -612,6 +652,26 @@ where
         Ok(inner
             .roots_by_principal
             .iter()
+            .map(|(principal, root)| (principal.clone(), *root))
+            .collect())
+    }
+
+    /// Return roots in an ordered owner range without visiting unrelated owners.
+    ///
+    /// This privileged maintenance query has the same authority boundary as
+    /// [`Self::roots`]; projection callers must use their admitted owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a recovery error when authoritative reopen cannot complete.
+    pub fn roots_in_range(
+        &self,
+        range: impl std::ops::RangeBounds<P>,
+    ) -> Result<Vec<(P, RootState)>, DurableError> {
+        let inner = self.lock_usable()?;
+        Ok(inner
+            .roots_by_principal
+            .range(range)
             .map(|(principal, root)| (principal.clone(), *root))
             .collect())
     }

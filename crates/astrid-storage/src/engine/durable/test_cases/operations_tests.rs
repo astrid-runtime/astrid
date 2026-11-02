@@ -1129,6 +1129,11 @@ fn governed_object_cache_verifies_once_and_charges_each_principal() {
     let directory = tempfile::tempdir().unwrap();
     let total = ObjectCacheCapacity::Bounded(std::num::NonZeroU64::new(2 * 1024 * 1024).unwrap());
     let engine = open_with_cache(directory.path(), ObjectCacheController::new(total));
+    // Cache ownership follows live authoritative roots, not a bare caller ID.
+    let (_, genesis) = transaction("alice", None, b"live cache owner");
+    engine.commit(genesis).unwrap();
+    let (_, genesis) = transaction("bob", None, b"live cache owner");
+    engine.commit(genesis).unwrap();
     let record = ObjectRecord::new(
         ObjectKind::Evidence,
         ObjectFormatVersion::V1,
@@ -1187,6 +1192,9 @@ fn explicit_close_releases_cached_records_and_positional_reader() {
     let directory = tempfile::tempdir().unwrap();
     let total = ObjectCacheCapacity::Bounded(std::num::NonZeroU64::new(1024 * 1024).unwrap());
     let engine = open_with_cache(directory.path(), ObjectCacheController::new(total));
+    // Cache ownership follows live authoritative roots, not a bare caller ID.
+    let (_, genesis) = transaction("alice", None, b"live cache owner");
+    engine.commit(genesis).unwrap();
     let record = ObjectRecord::new(
         ObjectKind::Evidence,
         ObjectFormatVersion::V1,
@@ -1245,6 +1253,9 @@ fn poisoned_engine_recovers_before_serving_cached_reads() {
     let directory = tempfile::tempdir().unwrap();
     let total = ObjectCacheCapacity::Bounded(std::num::NonZeroU64::new(1024 * 1024).unwrap());
     let engine = open_with_cache(directory.path(), ObjectCacheController::new(total));
+    // Cache ownership follows live authoritative roots, not a bare caller ID.
+    let (_, genesis) = transaction("alice", None, b"live cache owner");
+    engine.commit(genesis).unwrap();
     let record = ObjectRecord::new(
         ObjectKind::Evidence,
         ObjectFormatVersion::V1,

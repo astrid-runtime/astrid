@@ -346,6 +346,46 @@ fn compaction_discards_cached_objects_that_leave_the_authoritative_index() {
 }
 
 #[test]
+fn retired_root_compaction_preserves_peer_and_explicit_lease_closures() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = super::tests::open(directory.path());
+    let owner = "alice".to_owned();
+    let (_, private) = transaction(&owner, None, b"retired private bytes");
+    let private = engine.commit(private).unwrap().root();
+    let (_, leased) = transaction(&owner, Some(private), b"retained lease bytes");
+    let leased = engine.commit(leased).unwrap().root();
+    let peer = "bob".to_owned();
+    let (_, shared) = transaction(&peer, None, b"retained lease bytes");
+    let peer_root = engine.commit(shared).unwrap().root();
+    engine.remove_root(&owner, leased).unwrap();
+    let policy = evidence(b"retain-live-and-leased-roots");
+    let authorization = plan(
+        &engine,
+        retention(
+            &engine,
+            &policy,
+            [CompactionRetainedRoot::new(
+                CompactionRootKind::ReadHandle,
+                leased.commit,
+            )],
+        ),
+        policy,
+    );
+    assert!(authorization.facts().condemned().contains(&private.commit));
+    engine.compact(&authorization).unwrap();
+    assert!(engine.object(private.commit).unwrap().is_none());
+    assert!(engine.object(leased.commit).unwrap().is_some());
+    assert!(engine.object(peer_root.commit).unwrap().is_some());
+    engine.close().unwrap();
+    let reopened = super::tests::open(directory.path());
+    assert!(reopened.root(&owner).unwrap().is_none());
+    assert_eq!(reopened.root(&peer).unwrap(), Some(peer_root));
+    assert!(reopened.object(private.commit).unwrap().is_none());
+    assert!(reopened.object(leased.commit).unwrap().is_some());
+    reopened.close().unwrap();
+}
+
+#[test]
 fn explicit_additional_roots_pin_their_complete_closure() {
     let directory = tempfile::tempdir().unwrap();
     let engine = super::tests::open(directory.path());

@@ -11,6 +11,11 @@ from runatal_v1_blake3 import derive_key
 from runatal_v1_fastcdc import ASTRID_V1, cut, is_canonical_boundary
 from runatal_v1_fastcdc import validate_profile, verify_golden_vectors
 from runatal_v1_frames import frames, frames_bytes
+from runatal_v1_codec import Cursor, FormatError, identity, identity_text
+from runatal_v1_root_journal import (
+    ROOT_SNAPSHOT_SENTINEL, ROOT_SNAPSHOT_RECORD, ROOT_REMOVAL_RECORD,
+    decode_root, principal_text, root_state,
+)
 from runatal_v1_kv import validate_principal_kv
 from runatal_v1_physical import (
     FormatError as PhysicalFormatError,
@@ -28,8 +33,6 @@ from runatal_v1_volume import RegionPath, VolumeFormatError, recover_volume
 OBJECT_CONTEXT = "astrid principal store object identity v1"
 ARENA_MAGIC = b"ASTOBJ1\0"
 ROOT_MAGIC = b"ASTROOT\0"
-ROOT_SNAPSHOT_SENTINEL = (1 << 64) - 1
-ROOT_SNAPSHOT_RECORD = 1
 KIND_NAMES = (
     "Chunk",
     "ChunkTree",
@@ -54,42 +57,6 @@ REFERENCE_NAMES = ("Owns", "Evidence", "Lineage", "Derived")
 CHUNK_TREE_FANOUT = 128
 CONTENT_LABEL = b"content"
 U64_MAX = (1 << 64) - 1
-class FormatError(Exception):
-    pass
-
-
-class Cursor:
-    def __init__(self, data):
-        self.data = data
-        self.offset = 0
-
-    def take(self, length):
-        end = self.offset + length
-        if end > len(self.data):
-            raise FormatError("truncated payload")
-        value = self.data[self.offset : end]
-        self.offset = end
-        return value
-
-    def integer(self, length):
-        return int.from_bytes(self.take(length), "little")
-
-    def done(self):
-        if self.offset != len(self.data):
-            raise FormatError("trailing payload bytes")
-
-
-def identity(cursor):
-    algorithm = cursor.integer(2)
-    construction = cursor.integer(2)
-    length = cursor.integer(4)
-    if not algorithm or not construction or not length:
-        raise FormatError("zero identity tag field")
-    return (algorithm, construction, cursor.take(length))
-
-
-def identity_text(value):
-    return f"{value[0]}:{value[1]}:{len(value[2])}:{value[2].hex()}"
 
 
 def object_material(record):
@@ -692,50 +659,6 @@ def decode_object(payload):
     return object_id, record
 
 
-def root_state(cursor):
-    return (cursor.integer(8), identity(cursor))
-
-
-def decode_root(payload):
-    cursor = Cursor(payload)
-    prefix = cursor.integer(8)
-    if prefix == ROOT_SNAPSHOT_SENTINEL:
-        if cursor.integer(1) != ROOT_SNAPSHOT_RECORD:
-            raise FormatError("unknown root-journal extension record")
-        entries = []
-        previous = None
-        for _ in range(cursor.integer(8)):
-            principal = cursor.take(cursor.integer(8))
-            if previous is not None and principal <= previous:
-                raise FormatError("non-canonical root snapshot order")
-            previous = principal
-            entries.append((principal, root_state(cursor)))
-        cursor.done()
-        return ("snapshot", entries)
-
-    principal = cursor.take(prefix)
-    expected_tag = cursor.integer(1)
-    if expected_tag == 0:
-        expected = None
-    elif expected_tag == 1:
-        expected = root_state(cursor)
-    else:
-        raise FormatError("invalid expected-root tag")
-    replacement = root_state(cursor)
-    cursor.done()
-    return ("transition", principal, expected, replacement)
-
-
-def principal_text(principal):
-    if principal == b"\0":
-        return "system"
-    if len(principal) == 33 and principal[:1] == b"\1":
-        return principal[1:].hex()
-    if len(principal) == 33 and principal[:1] == b"\2":
-        return f"fleet:{principal[1:].hex()}"
-    raise FormatError("invalid state-owner-v2 encoding")
-
-
 def parse_metadata(path):
     entries = {}
     for line in path.read_text(encoding="ascii").splitlines():
@@ -909,6 +832,12 @@ def recover(store, include_payloads):
                 if name in roots:
                     raise FormatError(f"duplicate snapshot principal {name}")
                 roots[name] = current
+        elif record[0] == "remove":
+            _, principal, expected = record
+            name = principal_text(principal)
+            if roots.get(name) != expected:
+                raise FormatError(f"root CAS mismatch for {name} at byte {offset}")
+            del roots[name]
         else:
             _, principal, expected, replacement = record
             name = principal_text(principal)

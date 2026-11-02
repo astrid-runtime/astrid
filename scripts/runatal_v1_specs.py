@@ -3,7 +3,7 @@
 FORMAT_SPECIFICATION = (
     1,
     1,
-    bytes.fromhex("f9b69b9160bd48612d39f7bef3c43e6559b83436a54d23f928a145710fa20b74"),
+    bytes.fromhex("0b57567bc6650ff4ccd2ca9504c30d43b25937a109ec1e79e245fd9e57e0df42"),
 )
 CONTENT_CATALOG_SPECIFICATION = (
     1,
@@ -13,6 +13,7 @@ CONTENT_CATALOG_SPECIFICATION = (
 LEGACY_FORMAT_SPECIFICATIONS = {
     (1, 1, bytes.fromhex(digest))
     for digest in (
+        "f9b69b9160bd48612d39f7bef3c43e6559b83436a54d23f928a145710fa20b74",
         "ac3e1ab1e82be24dae7cdef949698dd54d2407bc7f39fb30709dc36677eea61d",
         "f9b17fa5e6b4ac4562c7e4ab2da1f0c756da07945d808794ad75544a132b0d91",
         "62cded9a5b01fe75d7781b66303f5ffe8ced55a43025a0389eefaea5a0c58fe2",
@@ -37,6 +38,7 @@ LEGACY_FORMAT_SPECIFICATIONS = {
 DIRECT_CATALOGUE_FORMAT_SPECIFICATIONS = {FORMAT_SPECIFICATION} | {
     (1, 1, bytes.fromhex(digest))
     for digest in (
+        "f9b69b9160bd48612d39f7bef3c43e6559b83436a54d23f928a145710fa20b74",
         "900d1eface3294bc9e47369c0fcb64dca56ff334dfbc1288f349090e10c09e6f",
         "9d701dc87360e634b25b7b7f5d5e79315f9f27bcf4d50e09c2181e439b0c7d75",
         "f9b17fa5e6b4ac4562c7e4ab2da1f0c756da07945d808794ad75544a132b0d91",

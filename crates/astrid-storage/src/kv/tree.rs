@@ -34,6 +34,7 @@ mod hot_cache;
 #[cfg(test)]
 mod hot_cache_integration_tests;
 mod legacy_avl;
+mod maintenance;
 mod node;
 mod overlay;
 #[cfg(all(test, feature = "legacy-surrealkv"))]
@@ -62,6 +63,13 @@ pub(crate) struct KvValidationCache<P: Ord> {
     projections: Mutex<BTreeMap<P, Projection>>,
 }
 
+impl<P: Ord> KvValidationCache<P> {
+    pub(crate) fn forget_owner(&self, owner: &P) {
+        self.trees.lock().remove(owner);
+        self.projections.lock().remove(owner);
+    }
+}
+
 impl<P: Ord> Default for KvValidationCache<P> {
     fn default() -> Self {
         Self {
@@ -78,7 +86,7 @@ pub struct TreeKvStore<P: Ord, I, R, E> {
     quota: Option<Arc<dyn KvQuotaResolver<P>>>,
     validation: Arc<KvValidationCache<P>>,
     validated_content: Arc<Mutex<BTreeMap<P, crate::content::CatalogValidation>>>,
-    checkpointing: Arc<Mutex<BTreeSet<P>>>,
+    checkpointing: maintenance::Checkpointing<P>,
     hot_cache: Option<Arc<KvHotCache<P>>>,
     marker: PhantomData<fn() -> (P, I)>,
 }
@@ -96,7 +104,7 @@ struct BlockingTreeStore<P: Ord, E> {
     quota: Option<Arc<dyn KvQuotaResolver<P>>>,
     validation: Arc<KvValidationCache<P>>,
     validated_content: Arc<Mutex<BTreeMap<P, crate::content::CatalogValidation>>>,
-    checkpointing: Arc<Mutex<BTreeSet<P>>>,
+    checkpointing: maintenance::Checkpointing<P>,
     hot_cache: Option<Arc<KvHotCache<P>>>,
 }
 
@@ -123,7 +131,7 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
             quota: None,
             validation: Arc::new(KvValidationCache::default()),
             validated_content: Arc::new(Mutex::new(BTreeMap::new())),
-            checkpointing: Arc::new(Mutex::new(BTreeSet::new())),
+            checkpointing: Arc::new(Mutex::new(BTreeMap::new())),
             hot_cache: None,
             marker: PhantomData,
         }
@@ -142,7 +150,7 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
             quota: Some(quota),
             validation: Arc::new(KvValidationCache::default()),
             validated_content: Arc::new(Mutex::new(BTreeMap::new())),
-            checkpointing: Arc::new(Mutex::new(BTreeSet::new())),
+            checkpointing: Arc::new(Mutex::new(BTreeMap::new())),
             hot_cache: None,
             marker: PhantomData,
         }
@@ -161,7 +169,7 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
             quota: Some(quota),
             validation,
             validated_content,
-            checkpointing: Arc::new(Mutex::new(BTreeSet::new())),
+            checkpointing: Arc::new(Mutex::new(BTreeMap::new())),
             hot_cache: None,
             marker: PhantomData,
         }
@@ -366,43 +374,6 @@ where
         })
     }
 
-    fn schedule_checkpoint(&self, owner: P) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        self.schedule_checkpoint_on(owner, runtime);
-    }
-
-    fn schedule_checkpoint_on(&self, owner: P, runtime: tokio::runtime::Handle) {
-        if !self.checkpointing.lock().insert(owner.clone()) {
-            return;
-        }
-        let store = self.clone();
-        let spawn_runtime = runtime.clone();
-        let _task = spawn_runtime.spawn_blocking(move || {
-            let outcome = store.checkpoint_once(owner.clone(), false);
-            store.checkpointing.lock().remove(&owner);
-            let retry = if matches!(outcome.as_ref(), Ok(false)) {
-                match store.header(owner.clone()) {
-                    Ok(header) => should_checkpoint(&projection_from_header(&header)),
-                    Err(error) => {
-                        tracing::warn!(%error, "principal KV checkpoint retry check failed");
-                        false
-                    },
-                }
-            } else {
-                false
-            };
-            if let Err(error) = outcome {
-                tracing::warn!(%error, "principal KV checkpoint failed");
-            }
-            if retry {
-                std::thread::yield_now();
-                store.schedule_checkpoint_on(owner, runtime);
-            }
-        });
-    }
-
     fn checkpoint_once(&self, owner: P, force: bool) -> StorageResult<bool> {
         self.checkpoint_once_after(owner, force, || Ok(()))
     }
@@ -537,7 +508,17 @@ where
         if let Some(cache) = &self.hot_cache {
             cache.remove_owner(owner);
         }
+        self.blocking_store().forget_owner_projection_state(owner);
         Ok(removed)
+    }
+
+    /// Forget optional projections after a privileged owner-root retirement.
+    /// This does not commit an empty replacement or recreate the removed root.
+    pub(crate) fn forget_retired_owner(&self, owner: &P) {
+        if let Some(cache) = &self.hot_cache {
+            cache.remove_owner(owner);
+        }
+        self.blocking_store().forget_owner_projection_state(owner);
     }
 
     #[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]

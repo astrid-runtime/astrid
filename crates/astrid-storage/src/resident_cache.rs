@@ -128,8 +128,12 @@ impl PrincipalObjectCacheBudget<StateOwner> for GovernedObjectCache {
     }
 
     fn release_unused(&self, principal: &StateOwner, charged_bytes: u64) {
-        if let Some(pool) = self.logical_pool(principal) {
-            let _ = pool.trim_to_usage(charged_bytes);
+        let mut logical = self.inner.logical.lock();
+        if let Some(pool) = logical.get(principal)
+            && pool.trim_to_usage(charged_bytes).is_ok()
+            && charged_bytes == 0
+        {
+            logical.remove(principal);
         }
     }
 
