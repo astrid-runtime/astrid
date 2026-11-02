@@ -490,3 +490,62 @@ fn bounded_policy_tracks_both_directions_of_operator_resize() {
     assert_eq!(cache.stats().resident_objects, 1);
     assert_lru_indexes(&cache);
 }
+
+#[test]
+fn bounded_global_charge_covers_shared_records_and_each_principals_projections() {
+    let owners = ["alice".to_owned(), "bob".to_owned()];
+    let projection = TestProjection(vec![7; 4096]);
+    let weight = cache_weight(&record(1))
+        + 2 * association_weight::<String>()
+        + 2 * projection_cache_weight(projection.retained_bytes());
+    let initial = NonZeroU64::new(weight).unwrap();
+    let config = ObjectCacheConfig::bounded(initial);
+    let cache = ObjectCache::new(config);
+    let assert_bound = |limit| {
+        let state = cache.state.lock();
+        let total = state.resident_bytes();
+        assert!(total <= limit);
+        for owner in &owners {
+            assert!(state.principal_charge(owner) <= total);
+        }
+    };
+    let populate = |byte| {
+        let id = object(byte);
+        for owner in &owners {
+            cache.insert(owner, id, record(byte));
+            assert!(cache.retain_projection(
+                owner,
+                id,
+                ProjectionCacheKey::new(1),
+                ProjectionCacheEntry::new(TestProjection(vec![7; 4096])),
+            ));
+        }
+    };
+
+    populate(1);
+    assert_bound(weight);
+    cache.set_capacity(ObjectCacheCapacity::Bounded(
+        NonZeroU64::new(weight * 3).unwrap(),
+    ));
+    populate(2);
+    populate(3);
+    assert_eq!(cache.stats().resident_objects, 3);
+    assert_eq!(cache.stats().resident_associations, 6);
+    assert_eq!(cache.stats().resident_projection_entries, 6);
+    assert_bound(weight * 3);
+
+    cache.set_capacity(ObjectCacheCapacity::Bounded(initial));
+    assert_bound(weight);
+    assert_lru_indexes(&cache);
+    cache.set_capacity(ObjectCacheCapacity::Disabled);
+    assert_bound(0);
+    assert_eq!(cache.stats().resident_objects, 0);
+    assert_eq!(cache.stats().resident_projection_entries, 0);
+    assert!(cache.get(&owners[0], object(3)).is_none());
+
+    cache.set_capacity(ObjectCacheCapacity::Bounded(initial));
+    populate(4);
+    assert_bound(weight);
+    assert_eq!(cache.stats().resident_objects, 1);
+    assert_lru_indexes(&cache);
+}

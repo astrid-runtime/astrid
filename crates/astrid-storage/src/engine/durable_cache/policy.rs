@@ -287,11 +287,14 @@ impl<P> ObjectCacheConfig<P> {
     #[must_use]
     pub fn bounded(bytes: NonZeroU64) -> Self {
         let capacity = ObjectCacheCapacity::Bounded(bytes);
-        let controller = ObjectCacheController::new(capacity);
-        let principal_controller = controller.clone();
+        // Every principal's charge is a subset of the global charge: shared
+        // records and its projections are also charged globally, alongside
+        // every association. The global controller therefore bounds each
+        // principal too, including after resize. Resolving that same target
+        // again per principal would add a redundant hot-path policy lookup.
         Self::new(
-            controller,
-            Arc::new(move |_: &P| principal_controller.capacity()),
+            ObjectCacheController::new(capacity),
+            Arc::new(|_: &P| ObjectCacheCapacity::Unbounded),
         )
     }
 }
