@@ -187,6 +187,7 @@ impl RepresentationStore {
             active,
             state,
             index,
+            limits,
         )?))
     }
 
@@ -764,6 +765,7 @@ impl RepresentationStore {
         active: RepresentationStateId,
         state: RepresentationState,
         mut index: MetadataIndex,
+        limits: RecoveryLimits,
     ) -> Result<(Self, GenerationZeroLocations), DurableError> {
         let catalogue = RepresentationCatalogueRoot::decode(
             index.value(MetadataKind::Catalogue, state.catalogue().as_bytes())?,
@@ -771,20 +773,23 @@ impl RepresentationStore {
         let placements = PlacementSet::decode(
             index.value(MetadataKind::Placement, state.placements().as_bytes())?,
         )?;
-        let profiles = residency::recover_active_map(
+        let profiles = index.recover_active_map(
             PhysicalMapDomain::Profile,
             catalogue.profiles_root(),
-            &mut index.nodes,
+            &metadata,
+            limits,
         )?;
-        let representations = residency::recover_active_map(
+        let representations = index.recover_active_map(
             PhysicalMapDomain::Representation,
             catalogue.representations_root(),
-            &mut index.nodes,
+            &metadata,
+            limits,
         )?;
-        let placement_entries = residency::recover_active_map(
+        let placement_entries = index.recover_active_map(
             PhysicalMapDomain::Placement,
             placements.entries_root(),
-            &mut index.nodes,
+            &metadata,
+            limits,
         )?;
         // Active closures now own their nodes. Release unused historical bodies
         // and replay metadata before allocating the validated reverse index.

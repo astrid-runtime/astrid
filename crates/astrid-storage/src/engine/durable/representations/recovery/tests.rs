@@ -18,15 +18,20 @@ fn recovery_memo_never_remembers_an_incomplete_closure() {
     .unwrap();
     let root = map.root().unwrap();
     assert!(map.nodes().len() > 1);
-    let partial = BTreeMap::from([(root, map.nodes()[&root].clone())]);
+    let summaries: BTreeMap<_, _> = map
+        .nodes()
+        .iter()
+        .map(|(id, node)| (*id, RecoveredMapNode::new(0, node.clone())))
+        .collect();
+    let partial = BTreeMap::from([(root, summaries[&root].clone())]);
     let mut complete = BTreeSet::new();
     assert!(!map_closure_complete(Some(root), &partial, &mut complete));
     assert!(complete.is_empty());
     assert!(!map_closure_complete(Some(root), &partial, &mut complete));
-    assert!(map_closure_complete(Some(root), map.nodes(), &mut complete));
+    assert!(map_closure_complete(Some(root), &summaries, &mut complete));
     assert_eq!(complete.len(), map.nodes().len());
     let verified = complete.clone();
-    assert!(map_closure_complete(Some(root), map.nodes(), &mut complete));
+    assert!(map_closure_complete(Some(root), &summaries, &mut complete));
     assert_eq!(complete, verified);
     let absent = PhysicalMapKey::new([255; 32]);
     let other = CanonicalPhysicalMap::build_dense(
@@ -37,7 +42,7 @@ fn recovery_memo_never_remembers_an_incomplete_closure() {
     .unwrap();
     assert!(!map_closure_complete(
         other.root(),
-        map.nodes(),
+        &summaries,
         &mut complete
     ));
     assert_eq!(complete, verified);
@@ -168,7 +173,7 @@ fn incomplete_checkpoint_cannot_populate_closure_proofs() {
     )
     .unwrap();
     let (mut metadata, state_id) = index_with_state(&map, catalogue, placements, state);
-    let only_root = BTreeMap::from([(root, map.nodes()[&root].clone())]);
+    let only_root = BTreeMap::from([(root, metadata.nodes[&root].clone())]);
     metadata.nodes = only_root;
     let (checkpoint, current) = later_journal_checkpoint(state_id, 1);
     let mut complete = BTreeSet::new();
@@ -186,7 +191,7 @@ fn incomplete_checkpoint_cannot_populate_closure_proofs() {
 }
 
 #[test]
-fn metadata_recovery_keeps_one_owned_copy_of_each_map_node() {
+fn metadata_recovery_keeps_only_links_and_loads_active_bodies() {
     let node = PhysicalMapNode::leaf(
         PhysicalMapDomain::Representation,
         PhysicalMapKey::new([7; 32]),
@@ -197,12 +202,27 @@ fn metadata_recovery_keeps_one_owned_copy_of_each_map_node() {
     for _ in 0..2 {
         super::super::append_frame(&mut file, METADATA_MAGIC, &frame.encode().unwrap()).unwrap();
     }
-    let index = recover_metadata(&mut file, RecoveryLimits::process_addressable()).unwrap();
+    let limits = RecoveryLimits::process_addressable();
+    let mut index = recover_metadata(&mut file, limits).unwrap();
     assert_eq!(index.nodes.len(), 1);
-    assert_eq!(index.nodes[&map_node_id(frame.identity)], node);
+    assert!(
+        index.nodes[&map_node_id(frame.identity)]
+            .children
+            .is_empty()
+    );
+    let map = index
+        .recover_active_map(
+            PhysicalMapDomain::Representation,
+            Some(map_node_id(frame.identity)),
+            &file,
+            limits,
+        )
+        .unwrap();
+    assert_eq!(map.nodes()[&map_node_id(frame.identity)], node);
+    assert!(index.nodes.is_empty());
     assert!(
         index.values.is_empty(),
-        "decoded nodes must not retain a second encoded payload"
+        "historical node bodies must not be retained as encoded payloads"
     );
 }
 
@@ -424,4 +444,114 @@ fn validate_generation_zero_index_rejects_corrupt_and_missing_locations() {
             "direct representation names a missing logical object"
         ))
     ));
+}
+
+#[test]
+fn metadata_recovery_loads_root_before_child_history_without_retaining_old_values() {
+    let map = dense_representation_map();
+    let root = map.root().unwrap();
+    let mut file = tempfile::tempfile().unwrap();
+    let mut order = vec![root];
+    order.extend(map.nodes().keys().copied().filter(|id| *id != root));
+    for id in order {
+        let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, &map.nodes()[&id]).unwrap();
+        super::super::append_frame(&mut file, METADATA_MAGIC, &frame.encode().unwrap()).unwrap();
+    }
+    // These unreachable historical bodies remain on disk and are authenticated,
+    // but have no reason to occupy decoded buffers during journal recovery.
+    for marker in 0_u8..64 {
+        let node = PhysicalMapNode::leaf(
+            PhysicalMapDomain::Representation,
+            PhysicalMapKey::new([marker; 32]),
+            vec![marker; 65536],
+        );
+        let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, &node).unwrap();
+        super::super::append_frame(&mut file, METADATA_MAGIC, &frame.encode().unwrap()).unwrap();
+    }
+    let before = file.metadata().unwrap().len();
+    let limits = RecoveryLimits::process_addressable();
+    let mut index = recover_metadata(&mut file, limits).unwrap();
+    assert_eq!(index.nodes.len(), map.nodes().len().strict_add(64));
+    let links: usize = index.nodes.values().map(|entry| entry.children.len()).sum();
+    assert!(links < index.nodes.len());
+    let mut complete = BTreeSet::new();
+    assert!(map_closure_complete(
+        Some(root),
+        &index.nodes,
+        &mut complete
+    ));
+    let recovered = index
+        .recover_active_map(PhysicalMapDomain::Representation, Some(root), &file, limits)
+        .unwrap();
+    assert_eq!(recovered.nodes(), map.nodes());
+    assert_eq!(index.nodes.len(), 64);
+    assert!(index.nodes.values().all(|entry| entry.children.is_empty()));
+    assert_eq!(
+        file.metadata().unwrap().len(),
+        before,
+        "recovery must not delete historical metadata"
+    );
+}
+
+#[test]
+fn metadata_duplicate_identity_requires_exact_body_equality() {
+    let node = PhysicalMapNode::leaf(
+        PhysicalMapDomain::Representation,
+        PhysicalMapKey::new([7; 32]),
+        vec![42; 4096],
+    );
+    let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, &node).unwrap();
+    let mut index = MetadataIndex::default();
+    index.insert(frame.clone()).unwrap();
+    let mut different = frame.clone();
+    different.value = PhysicalMapNode::leaf(
+        PhysicalMapDomain::Representation,
+        PhysicalMapKey::new([7; 32]),
+        vec![43; 4096],
+    )
+    .encode()
+    .unwrap();
+    // Deliberately supply an earlier body with the same identity envelope:
+    // checking the envelope alone would wrongly accept this duplicate.
+    let result = index.insert_at(52, frame, |_| different.encode());
+    assert!(matches!(
+        result,
+        Err(DurableError::InvalidRepresentationState(
+            "physical metadata identity collision"
+        ))
+    ));
+    assert_eq!(index.nodes.len(), 1);
+}
+
+#[test]
+fn active_map_body_rereads_validate_the_frame_again() {
+    use std::io::{Seek, Write};
+
+    let node = PhysicalMapNode::leaf(
+        PhysicalMapDomain::Representation,
+        PhysicalMapKey::new([7; 32]),
+        vec![42; 4096],
+    );
+    let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, &node).unwrap();
+    let mut file = tempfile::tempfile().unwrap();
+    let location =
+        super::super::append_frame(&mut file, METADATA_MAGIC, &frame.encode().unwrap()).unwrap();
+    let limits = RecoveryLimits::process_addressable();
+    let mut index = recover_metadata(&mut file, limits).unwrap();
+    file.seek(SeekFrom::Start(
+        location.offset.strict_add(FRAME_HEADER_LEN),
+    ))
+    .unwrap();
+    file.write_all(&[0xff]).unwrap();
+    assert!(
+        index
+            .recover_active_map(
+                PhysicalMapDomain::Representation,
+                Some(map_node_id(frame.identity)),
+                &file,
+                limits,
+            )
+            .is_err(),
+        "active bodies must pass full frame validation when loaded"
+    );
 }

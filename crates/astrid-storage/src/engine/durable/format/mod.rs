@@ -155,7 +155,7 @@ pub(super) fn verify_indexed_tail<F: DurableIo>(
     Ok(())
 }
 
-fn read_frame_at<F: DurableIo>(
+pub(super) fn read_frame_at<F: DurableIo>(
     file: &F,
     file_name: &'static str,
     magic: [u8; 8],
@@ -274,7 +274,7 @@ pub(super) fn recover_arena<I: PersistentObjectIdentity, F: DurableIo>(
         ARENA_MAGIC,
         limits,
         protected_len,
-        |offset, payload| {
+        |offset, payload, _source| {
             let (id, record) = decode_object_frame(payload, scheme)
                 .map_err(|detail| corrupt(ARENA_FILE, offset, detail))?;
             let computed = identity.identify(&record);
@@ -331,7 +331,25 @@ pub(super) fn scan_frames<F: DurableIo>(
     file_name: &'static str,
     magic: [u8; 8],
     limits: RecoveryLimits,
-    accept: impl FnMut(u64, &[u8]) -> Result<(), DurableError>,
+    mut accept: impl FnMut(u64, &[u8]) -> Result<(), DurableError>,
+) -> Result<(), DurableError> {
+    scan_frames_with_source(
+        file,
+        file_name,
+        magic,
+        limits,
+        |offset, payload, _source| accept(offset, payload),
+    )
+}
+
+/// The shared source supports validated positional reads of earlier frames
+/// without disturbing sequential read-ahead or collecting duplicate payloads.
+pub(super) fn scan_frames_with_source<F: DurableIo>(
+    file: &mut F,
+    file_name: &'static str,
+    magic: [u8; 8],
+    limits: RecoveryLimits,
+    accept: impl FnMut(u64, &[u8], &F) -> Result<(), DurableError>,
 ) -> Result<(), DurableError> {
     scan_frames_with_protected_prefix(file, file_name, magic, limits, 0, accept)
 }
@@ -342,7 +360,7 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
     magic: [u8; 8],
     limits: RecoveryLimits,
     protected_len: u64,
-    mut accept: impl FnMut(u64, &[u8]) -> Result<(), DurableError>,
+    mut accept: impl FnMut(u64, &[u8], &F) -> Result<(), DurableError>,
 ) -> Result<(), DurableError> {
     let file_len = validated_file_len(file, file_name, protected_len)?;
     let policy = FrameScanPolicy {
@@ -438,7 +456,7 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
             )?;
             break;
         }
-        accept(offset, &payload)?;
+        accept(offset, &payload, reader.get_ref())?;
         offset = frame_end;
     }
     // Tail repair above is terminal: discard any read-ahead before exposing

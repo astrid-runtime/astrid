@@ -234,7 +234,7 @@ fn buffered_tail_repair_never_truncates_a_published_prefix_or_interior_frame() {
                 ARENA_MAGIC,
                 RecoveryLimits::process_addressable(),
                 if published { original_len } else { prefix_len },
-                |_, _| {
+                |_, _, _source| {
                     accepted += 1;
                     Ok(())
                 },
@@ -250,5 +250,40 @@ fn buffered_tail_repair_never_truncates_a_published_prefix_or_interior_frame() {
                 append_frame(&mut stream, ARENA_MAGIC, b"replacement tail").unwrap();
             }
         }
+    }
+}
+
+#[test]
+fn positional_callback_reads_preserve_sequential_scan_read_ahead() {
+    for hosted in [false, true] {
+        let (_dir, mut source) = stream(hosted);
+        let first = append_frame(&mut source, ARENA_MAGIC, b"first frame").unwrap();
+        append_frame(&mut source, ARENA_MAGIC, b"second frame").unwrap();
+        let length = source.file.metadata().unwrap().len();
+        let limits = RecoveryLimits::process_addressable();
+        let mut seen = Vec::new();
+        scan_frames_with_source(
+            &mut source,
+            "test frames",
+            ARENA_MAGIC,
+            limits,
+            |offset, bytes, file| {
+                if offset != first.offset {
+                    assert_eq!(
+                        read_frame_at(file, "test frames", ARENA_MAGIC, first.offset, limits)?,
+                        b"first frame"
+                    );
+                }
+                seen.push(bytes.to_vec());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![b"first frame".to_vec(), b"second frame".to_vec()]
+        );
+        assert_eq!(source.file.stream_position().unwrap(), length);
+        assert_eq!(source.file.metadata().unwrap().len(), length);
     }
 }

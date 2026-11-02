@@ -26,68 +26,10 @@ use super::{
     increment, io_error, read_all,
 };
 
-#[derive(Default)]
-pub(super) struct MetadataIndex {
-    values: BTreeMap<(MetadataKind, [u8; 32]), Vec<u8>>,
-    pub(super) nodes: BTreeMap<crate::storage_model::PhysicalMapNodeId, PhysicalMapNode>,
-}
-
-impl MetadataIndex {
-    fn insert<V: AsRef<[u8]> + Into<Vec<u8>>>(
-        &mut self,
-        frame: MetadataFrame<V>,
-    ) -> Result<(), DurableError> {
-        if frame.kind == MetadataKind::MapNode {
-            // Decode and authenticate once, then keep that sole owned value.
-            // Retaining its encoded payload as well duplicates every historical
-            // node until journal validation and active-closure recovery finish.
-            let (node, id) = PhysicalMapNode::decode_and_identify(
-                frame.value.as_ref(),
-                &Blake3PhysicalIdentity,
-            )?;
-            if id != map_node_id(frame.identity) {
-                return Err(DurableError::InvalidRepresentationState(
-                    "metadata identity does not match canonical value",
-                ));
-            }
-            if let Some(existing) = self.nodes.get(&id) {
-                if existing != &node {
-                    return Err(DurableError::InvalidRepresentationState(
-                        "physical metadata identity collision",
-                    ));
-                }
-            } else {
-                self.nodes.insert(id, node);
-            }
-            return Ok(());
-        }
-        frame.verify(&Blake3PhysicalIdentity)?;
-        let key = (frame.kind, frame.identity);
-        if let Some(existing) = self.values.get(&key) {
-            if existing.as_slice() != frame.value.as_ref() {
-                return Err(DurableError::InvalidRepresentationState(
-                    "physical metadata identity collision",
-                ));
-            }
-            return Ok(());
-        }
-        self.values.insert(key, frame.value.into());
-        Ok(())
-    }
-
-    pub(super) fn value(
-        &self,
-        kind: MetadataKind,
-        identity: &[u8; 32],
-    ) -> Result<&[u8], DurableError> {
-        self.values
-            .get(&(kind, *identity))
-            .map(Vec::as_slice)
-            .ok_or(DurableError::InvalidRepresentationState(
-                "physical metadata closure is incomplete",
-            ))
-    }
-}
+mod index;
+use super::super::format::{read_frame_at, scan_frames_with_source};
+pub(super) use index::MetadataIndex;
+use index::RecoveredMapNode;
 
 #[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all,
     fields(map_nodes = tracing::field::Empty, authority_records = tracing::field::Empty))]
@@ -96,12 +38,16 @@ pub(super) fn recover_metadata<F: DurableIo>(
     limits: RecoveryLimits,
 ) -> Result<MetadataIndex, DurableError> {
     let mut index = MetadataIndex::default();
-    scan_frames(
+    scan_frames_with_source(
         file,
         METADATA_FILE,
         METADATA_MAGIC,
         limits,
-        |_offset, payload| index.insert(MetadataFrame::decode(payload)?),
+        |offset, payload, source| {
+            index.insert_at(offset, MetadataFrame::decode(payload)?, |location| {
+                read_frame_at(source, METADATA_FILE, METADATA_MAGIC, location, limits)
+            })
+        },
     )?;
     if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {
         tracing::Span::current().record("map_nodes", index.nodes.len());
@@ -305,7 +251,7 @@ fn state_metadata_closure_complete(
 
 fn map_closure_complete(
     root: Option<crate::storage_model::PhysicalMapNodeId>,
-    nodes: &BTreeMap<crate::storage_model::PhysicalMapNodeId, PhysicalMapNode>,
+    nodes: &BTreeMap<crate::storage_model::PhysicalMapNodeId, RecoveredMapNode>,
     complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
 ) -> bool {
     let Some(root) = root else {
@@ -320,13 +266,7 @@ fn map_closure_complete(
         let Some(node) = nodes.get(&id) else {
             return false;
         };
-        match node {
-            PhysicalMapNode::Branch { zero, one, .. } => pending.extend([*zero, *one]),
-            PhysicalMapNode::Radix { children, .. } => {
-                pending.extend(children.iter().copied());
-            },
-            PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => {},
-        }
+        pending.extend(node.children.iter().copied());
     }
     // Never remember a partial traversal that encountered a missing descendant.
     complete.extend(visited);

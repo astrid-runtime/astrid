@@ -77,7 +77,7 @@ impl RepresentationStore {
         let index = recover_metadata(&mut metadata, limits)?;
         let (active, state) = recover_journal(&mut journal, current, &index, limits)?;
         let (recovered, locations) =
-            Self::from_recovered(metadata, journal, generation, active, state, index)?;
+            Self::from_recovered(metadata, journal, generation, active, state, index, limits)?;
         if recovered.active != self.active || recovered.reverse != self.reverse {
             return Err(DurableError::InvalidRepresentationState(
                 "checkpoint changed physical authority",
