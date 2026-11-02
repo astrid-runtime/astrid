@@ -11,6 +11,7 @@ thread_local! {
     // Account only allocations inside the invoking validation call. Input
     // ownership outlives that call; the harness and other threads are excluded.
     static ACCOUNTING: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
+    static INVALID_ACCOUNTING: Cell<bool> = const { Cell::new(false) };
 }
 
 struct Allocator;
@@ -18,7 +19,18 @@ struct Allocator;
 fn account(size: usize, allocated: bool) {
     let _ = ACCOUNTING.try_with(|state| {
         if let Some((live, peak)) = state.get() {
-            let live = if allocated { live + size } else { live - size };
+            let next = if allocated {
+                live.checked_add(size)
+            } else {
+                live.checked_sub(size)
+            };
+            let Some(live) = next else {
+                // Allocators cannot unwind. Mark an invalid measurement and
+                // reject it outside the allocator after validation returns.
+                state.set(None);
+                INVALID_ACCOUNTING.set(true);
+                return;
+            };
             state.set(Some((live, peak.max(live))));
         }
     });
@@ -66,8 +78,7 @@ impl Drop for ResetAccounting {
     }
 }
 
-#[test]
-fn canonical_validation_borrows_the_complete_input_payload_set() {
+fn validate_without_retaining_input_payloads(dense: bool) {
     let count = 128_usize;
     let value_bytes = 64 * 1024_usize;
     let entries = (0..count)
@@ -78,8 +89,13 @@ fn canonical_validation_borrows_the_complete_input_payload_set() {
             )
         })
         .collect();
-    let map =
-        CanonicalPhysicalMap::build(&Identity, PhysicalMapDomain::Placement, entries).unwrap();
+    let map = if dense {
+        CanonicalPhysicalMap::build_dense(&Identity, PhysicalMapDomain::Placement, entries)
+    } else {
+        CanonicalPhysicalMap::build(&Identity, PhysicalMapDomain::Placement, entries)
+    }
+    .unwrap();
+    INVALID_ACCOUNTING.set(false);
     ACCOUNTING.set(Some((0, 0)));
     let reset = ResetAccounting;
     let result = CanonicalPhysicalMap::validate_root(
@@ -88,8 +104,14 @@ fn canonical_validation_borrows_the_complete_input_payload_set() {
         map.root(),
         map.nodes(),
     );
-    let (_, peak) = ACCOUNTING.get().unwrap();
+    let accounting = ACCOUNTING.get();
+    let invalid = INVALID_ACCOUNTING.get();
     drop(reset);
+    assert!(
+        !invalid,
+        "temporary allocation accounting overflowed or underflowed"
+    );
+    let (_, peak) = accounting.unwrap();
     assert_eq!(result.unwrap(), u64::try_from(count).unwrap());
     // Room for transient node encoding, traversal sets and allocator rounding;
     // a second full input payload set alone exceeds this bound eightfold.
@@ -97,4 +119,14 @@ fn canonical_validation_borrows_the_complete_input_payload_set() {
         peak < count * value_bytes / 8,
         "validation retained {peak} temporary bytes"
     );
+}
+
+#[test]
+fn legacy_canonical_validation_borrows_the_complete_input_payload_set() {
+    validate_without_retaining_input_payloads(false);
+}
+
+#[test]
+fn dense_canonical_validation_borrows_the_complete_input_payload_set() {
+    validate_without_retaining_input_payloads(true);
 }

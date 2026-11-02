@@ -224,3 +224,36 @@ fn canonical_builders_reject_unequal_nodes_with_the_same_identity() {
         );
     }
 }
+
+#[test]
+fn incremental_builders_reject_collisions_without_changing_the_active_map() {
+    struct Collision;
+    impl PhysicalIdentity for Collision {
+        fn identify(&self, _: &'static str, _: &[u8]) -> [u8; 32] {
+            [0x55; 32]
+        }
+    }
+    for construction in [MapConstruction::LegacyBinary, MapConstruction::DenseRadix] {
+        let mut map = super::super::CanonicalPhysicalMap::build_with_construction(
+            &Collision,
+            PhysicalMapDomain::Placement,
+            vec![(PhysicalMapKey::new([0; 32]), vec![1])],
+            construction,
+        )
+        .unwrap();
+        let original = map.clone();
+        let result = map.insert(&Collision, PhysicalMapKey::new([1; 32]), vec![2]);
+        assert!(
+            matches!(
+                result,
+                Err(PhysicalModelError::InvalidMap(
+                    "physical map-node identity collision"
+                ))
+            ),
+            "{construction:?} incremental insertion must reject colliding nodes"
+        );
+        assert_eq!(map.root(), original.root());
+        assert_eq!(map.entry_count(), original.entry_count());
+        assert_eq!(map.nodes(), original.nodes());
+    }
+}

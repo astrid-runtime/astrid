@@ -250,7 +250,7 @@ impl<I: PhysicalIdentity> Insertion<'_, I> {
         node: PhysicalMapNode,
     ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
         let id = node.identify(self.identity)?;
-        self.nodes.entry(id).or_insert(node);
+        self.nodes.put(id, node)?;
         Ok(id)
     }
 }
