@@ -23,6 +23,8 @@ mod provenance;
 mod recovery;
 #[path = "../benches/storage_io/report.rs"]
 mod report;
+#[path = "../benches/storage_io/resource.rs"]
+mod resource;
 
 async fn fixture(path: &Path) -> PathBuf {
     let home = AstridHome::from_path(path.to_path_buf());
@@ -271,4 +273,136 @@ fn invalid_snapshot_is_rejected_without_modifying_source() {
     assert!(HostedFileVolume::open(copy).is_err());
     source.verify().unwrap();
     assert_eq!(std::fs::read(path).unwrap(), original);
+}
+
+#[tokio::test]
+async fn recovery_report_records_rss_and_object_cache_charge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source_path = fixture(&tmp.path().join("source")).await;
+    let root = tmp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let config = config::Config {
+        bytes: 1,
+        block_bytes: 1,
+        range_bytes: 1,
+        samples: 1,
+        small_files: 1,
+        small_file_bytes: 1,
+        concurrent_principals: 1,
+        bulk_workers: 1,
+        bulk_files: 1,
+        object_cache_bytes: None,
+        root: Some(root.clone()),
+        output: None,
+        recovery_volume: Some(source_path),
+        profile_recovery: false,
+    };
+    let report = recovery::run(
+        &config,
+        &root,
+        provenance::RunProvenance::from_evidence(
+            "fixture-revision".to_owned(),
+            Vec::new(),
+            vec!["storage_recovery_benchmark".to_owned()],
+            0,
+            "00".to_owned(),
+        ),
+    )
+    .unwrap();
+    let encoded = serde_json::to_value(report).expect("report serializes");
+    assert_byte_occupancy_peaks(&encoded);
+    assert_eq!(
+        resource_peak_names(&encoded),
+        expected_recovery_resource_peak_names()
+    );
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    assert_nonzero_rss_peaks(&encoded);
+    assert_eq!(
+        encoded["metrics"][0]["name"],
+        "astrid_recovery_container_open"
+    );
+    assert_eq!(encoded["metrics"][1]["name"], "astrid_recovery_engine_open");
+    assert_eq!(
+        encoded["metrics"][2]["name"],
+        "astrid_recovery_engine_close"
+    );
+    assert_eq!(encoded["recovery_fixture"]["instrumented"], false);
+}
+
+const CACHE_OCCUPANCY_PEAKS: [&str; 4] = [
+    "astrid_recovery_object_cache_resident_bytes",
+    "astrid_recovery_object_cache_resident_record_bytes",
+    "astrid_recovery_object_cache_resident_association_bytes",
+    "astrid_recovery_object_cache_resident_projection_bytes",
+];
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const RSS_PEAKS: [&str; 4] = [
+    "astrid_recovery_rss_bytes_before_container",
+    "astrid_recovery_rss_bytes_after_container",
+    "astrid_recovery_rss_bytes_after_engine_open",
+    "astrid_recovery_rss_bytes_after_engine_close",
+];
+
+fn expected_recovery_resource_peak_names() -> Vec<&'static str> {
+    let mut names = Vec::new();
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    names.extend(RSS_PEAKS);
+    names.extend(CACHE_OCCUPANCY_PEAKS);
+    names
+}
+
+fn resource_peak_names(encoded: &serde_json::Value) -> Vec<&str> {
+    encoded["resource_peaks"]
+        .as_array()
+        .expect("resource peaks")
+        .iter()
+        .map(|peak| peak["name"].as_str().expect("peak name"))
+        .collect()
+}
+
+fn assert_byte_occupancy_peaks(encoded: &serde_json::Value) {
+    for peak in encoded["resource_peaks"]
+        .as_array()
+        .expect("resource peaks")
+    {
+        let name = peak["name"].as_str().expect("peak name");
+        assert!(
+            !name.contains("objects") && !name.contains("count"),
+            "resource peak {name} is not a byte occupancy"
+        );
+        let object = peak.as_object().expect("peak object");
+        for key in [
+            "samples_bytes",
+            "minimum_bytes",
+            "median_bytes",
+            "maximum_bytes",
+        ] {
+            assert!(object.contains_key(key), "{name} missing {key}");
+        }
+        for key in object.keys() {
+            assert!(
+                !key.contains("count") && !key.contains("objects"),
+                "resource peak field {key} is not a byte occupancy"
+            );
+        }
+        let samples = peak["samples_bytes"].as_array().expect("samples");
+        assert_eq!(samples.len(), 1, "{name}");
+        samples[0].as_u64().expect("byte sample");
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn assert_nonzero_rss_peaks(encoded: &serde_json::Value) {
+    for peak in encoded["resource_peaks"]
+        .as_array()
+        .expect("resource peaks")
+    {
+        let name = peak["name"].as_str().expect("peak name");
+        if !name.starts_with("astrid_recovery_rss_bytes_") {
+            continue;
+        }
+        let samples = peak["samples_bytes"].as_array().expect("samples");
+        assert!(samples[0].as_u64().expect("rss sample") > 0, "{name}");
+    }
 }
