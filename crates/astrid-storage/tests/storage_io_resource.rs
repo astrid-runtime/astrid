@@ -3,8 +3,12 @@
 #[path = "../benches/storage_io/resource.rs"]
 mod resource;
 
+#[cfg(not(target_os = "linux"))]
 #[path = "../benches/storage_io/resource/linux.rs"]
 mod linux;
+
+#[cfg(target_os = "linux")]
+use resource::linux;
 
 use std::io::ErrorKind;
 

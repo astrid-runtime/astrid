@@ -2,7 +2,7 @@
 
 use std::io::{self, ErrorKind};
 
-pub(super) fn parse_linux_vm_rss_bytes(status: &str) -> io::Result<u64> {
+pub(crate) fn parse_linux_vm_rss_bytes(status: &str) -> io::Result<u64> {
     for line in status.lines() {
         let Some((key, value)) = line.split_once(':') else {
             continue;

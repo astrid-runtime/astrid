@@ -5,7 +5,7 @@
 //! platforms return `Ok(None)` so callers omit RSS peaks instead of
 //! recording a fake zero.
 
-use std::io::{self, ErrorKind};
+use std::io;
 
 /// Current resident-set size in bytes for this process.
 ///
@@ -23,7 +23,7 @@ pub(super) fn process_resident_bytes() -> io::Result<Option<u64>> {
 #[allow(unsafe_code)]
 fn macos_resident_bytes() -> io::Result<u64> {
     let pid = libc::pid_t::try_from(std::process::id())
-        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "process id exceeds pid_t"))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "process id exceeds pid_t"))?;
     let mut info = std::mem::MaybeUninit::<libc::rusage_info_v2>::zeroed();
     // SAFETY: `info` is a writable `rusage_info_v2` for this process only.
     // Darwin `proc_pid_rusage(pid, RUSAGE_INFO_V2, buffer)` writes that
@@ -47,4 +47,4 @@ fn linux_resident_bytes() -> io::Result<u64> {
 
 #[cfg(target_os = "linux")]
 #[path = "resource/linux.rs"]
-mod linux;
+pub(super) mod linux;
