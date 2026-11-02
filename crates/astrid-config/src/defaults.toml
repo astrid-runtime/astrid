@@ -20,6 +20,11 @@
 # one-second burst; scheduling overshoot is repaid before further execution.
 # Changes apply on daemon restart.
 [resources]
+# Total decoded storage working set shared by all agents, not per-agent.
+# Omitted: one GiB, keeping audit-tree reads off repeated checksum paths.
+# Smaller budgets trade memory for verified disk reads; larger budgets can
+# consume the selected amount of RAM. Durable history is never discarded.
+# decoded_object_cache_bytes = 1073741824
 # default_user_cpu_fuel_per_sec = 2000000000
 # [resources.user_cpu_fuel_per_sec]
 # "<64-character canonical user UID>" = 4000000000

@@ -495,6 +495,11 @@ where
         self.principal_budget.release_unused_all(&BTreeMap::new());
     }
 
+    pub(super) fn set_capacity(&self, capacity: ObjectCacheCapacity) {
+        self.controller.set_capacity(capacity);
+        self.reclaim();
+    }
+
     /// Honor the latest external pressure targets and return released slabs.
     pub(super) fn reclaim(&self) {
         let _accounting = self.accounting.lock();

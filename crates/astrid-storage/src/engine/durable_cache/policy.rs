@@ -171,6 +171,7 @@ impl ObjectCacheController {
 
     /// Replace the capacity. Existing entries are evicted lazily on the next
     /// cache operation so policy changes do not block the control plane.
+    /// Engine/store setters additionally request immediate reclaim.
     pub fn set_capacity(&self, capacity: ObjectCacheCapacity) {
         self.capacity.store(capacity.encoded(), Ordering::Relaxed);
     }
@@ -286,9 +287,14 @@ impl<P> ObjectCacheConfig<P> {
     #[must_use]
     pub fn bounded(bytes: NonZeroU64) -> Self {
         let capacity = ObjectCacheCapacity::Bounded(bytes);
+        // Every principal's charge is a subset of the global charge: shared
+        // records and its projections are also charged globally, alongside
+        // every association. The global controller therefore bounds each
+        // principal too, including after resize. Resolving that same target
+        // again per principal would add a redundant hot-path policy lookup.
         Self::new(
             ObjectCacheController::new(capacity),
-            Arc::new(move |_: &P| capacity),
+            Arc::new(|_: &P| ObjectCacheCapacity::Unbounded),
         )
     }
 }
