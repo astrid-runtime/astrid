@@ -24,6 +24,11 @@ mod decode_tests;
 #[cfg(test)]
 mod identity_tests;
 
+#[cfg(test)]
+std::thread_local! {
+    static MAP_LOOKUPS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
 const LEGACY_MAP_NODE_VERSION: u16 = 1;
 const RADIX_MAP_NODE_VERSION: u16 = 2;
 const RADIX_PAGE_CAPACITY: usize = 1;
@@ -630,9 +635,16 @@ impl CanonicalPhysicalMap {
         &self.nodes
     }
 
+    #[cfg(test)]
+    pub(crate) fn take_lookup_count() -> usize {
+        MAP_LOOKUPS.with(|count| count.replace(0))
+    }
+
     /// Look up one leaf through the authenticated trie.
     #[must_use]
     pub fn get(&self, key: PhysicalMapKey) -> Option<&[u8]> {
+        #[cfg(test)]
+        MAP_LOOKUPS.with(|count| count.set(count.get().strict_add(1)));
         let mut current = self.root?;
         let search = key.search_key();
         loop {

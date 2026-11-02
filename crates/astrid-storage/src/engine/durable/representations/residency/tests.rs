@@ -370,3 +370,63 @@ fn collection_retains_complete_live_closures_and_skips_their_next_append_walk() 
     }
     panic!("published updates must exercise representation-map collection");
 }
+
+#[test]
+fn direct_membership_reuses_validated_coverage_across_publication_and_reopen() {
+    use crate::storage_model::CanonicalPhysicalMap;
+
+    let directory = tempfile::tempdir().unwrap();
+    let volume: Arc<dyn AstridVolume> =
+        HostedFileVolume::open(directory.path().join("coverage.volume")).unwrap();
+    let limits = super::super::RecoveryLimits::process_addressable();
+    let mut store =
+        RepresentationStore::activate_volume(&volume, limits, ObjectId::new([1; 32]), []).unwrap();
+    let objects = [2, 3, 4].map(|byte| ObjectId::new([byte; 32]));
+    let direct = objects.map(|object| {
+        store
+            .describe_direct(
+                object,
+                object.as_bytes(),
+                ArenaLocation {
+                    offset: u64::from(object.as_bytes()[0]) * 100,
+                    payload_len: 32,
+                    checksum: [3; 32],
+                },
+            )
+            .unwrap()
+    });
+    let check = |store: &RepresentationStore, expected: [bool; 3]| {
+        CanonicalPhysicalMap::take_lookup_count();
+        assert_eq!(
+            objects.map(|object| store.contains_direct(object)),
+            expected
+        );
+        assert_eq!(
+            CanonicalPhysicalMap::take_lookup_count(),
+            0,
+            "validated coverage must not traverse and decode the physical map again"
+        );
+    };
+    check(&store, [false; 3]);
+    let update = store.append_direct_update(&direct[..2]).unwrap().unwrap();
+    check(&store, [false; 3]);
+    store.publish_direct_update(update).unwrap();
+    check(&store, [true, true, false]);
+    drop(store);
+    let mut store = RepresentationStore::open_volume(&volume, limits)
+        .unwrap()
+        .unwrap();
+    check(&store, [true, true, false]);
+    let update = store.append_direct_update(&direct[2..]).unwrap().unwrap();
+    check(&store, [true, true, false]);
+    store.publish_direct_update(update).unwrap();
+    check(&store, [true; 3]);
+    store.rebase_all_direct(&direct[1..]).unwrap();
+    check(&store, [false, true, true]);
+    store.checkpoint_volume(&volume, limits).unwrap();
+    drop(store);
+    let store = RepresentationStore::open_volume(&volume, limits)
+        .unwrap()
+        .unwrap();
+    check(&store, [false, true, true]);
+}

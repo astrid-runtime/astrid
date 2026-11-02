@@ -380,18 +380,12 @@ impl RepresentationStore {
     }
 
     pub(super) fn contains_direct(&self, object: ObjectId) -> bool {
-        self.reverse.get(&object).is_some_and(|records| {
-            records.iter().any(|record| {
-                self.representations
-                    .get(PhysicalMapKey::from(*record))
-                    .and_then(|bytes| RepresentationRecord::decode(bytes).ok())
-                    .is_some_and(|value| {
-                        value.profile() == self.direct_profile
-                            && matches!(value.coverage(), Coverage::Exact { object: covered, .. } if *covered == object)
-                            && matches!(value.recipe(), Recipe::DirectCanonical { .. })
-                    })
-            })
-        })
+        // Recovery validates every record and requires each reverse-index key
+        // to have a matching direct-profile record and generation-zero placement.
+        // Publication adds only checked direct entries or replaces the whole
+        // index with a checked direct rebase. Pending entries are absent until
+        // publication; membership reuses that proof without decoding it again.
+        self.reverse.contains_key(&object)
     }
 
     pub(super) fn append_direct_update(
