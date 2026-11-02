@@ -331,3 +331,49 @@ fn callback_rereads_preserve_read_ahead_across_refills_with_a_shared_cursor() {
     assert_eq!(source.file.metadata().unwrap().len(), length);
     assert_eq!(source.file.stream_position().unwrap(), length);
 }
+
+#[test]
+fn sequential_scan_reuses_payload_buffer_for_same_and_smaller_frames() {
+    for hosted in [false, true] {
+        let (_dir, mut stream) = stream(hosted);
+        let payloads = [
+            vec![0x11_u8; 32_769],
+            vec![0x22_u8; 32_769],
+            vec![0x33_u8; 8],
+            Vec::new(),
+            vec![0x44_u8; 40_000],
+            vec![0x55_u8; 40_000],
+        ];
+        let mut expected = Vec::new();
+        for payload in &payloads {
+            let location = append_frame(&mut stream, ARENA_MAGIC, payload).unwrap();
+            expected.push((location.offset, payload.clone()));
+        }
+        let mut seen = Vec::new();
+        let mut pointers = Vec::new();
+        scan_frames(
+            &mut stream,
+            "test frames",
+            ARENA_MAGIC,
+            RecoveryLimits::process_addressable(),
+            |offset, payload| {
+                pointers.push(payload.as_ptr() as usize);
+                seen.push((offset, payload.to_vec()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, expected);
+        assert_eq!(pointers.len(), payloads.len());
+        assert!(
+            pointers[..4]
+                .windows(2)
+                .all(|pair| pair[0] == pair[1] && pair[0] != 0),
+            "same and smaller frames must keep the scan payload allocation: {pointers:?}"
+        );
+        assert!(
+            pointers[4] == pointers[5] && pointers[4] != 0,
+            "same-size frames after growth must reuse the grown allocation: {pointers:?}"
+        );
+    }
+}

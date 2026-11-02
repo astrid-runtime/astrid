@@ -415,6 +415,8 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
     // and issuing separate media reads for every header and small payload.
     let mut reader = std::io::BufReader::new(file);
     let mut offset = 0_u64;
+    // Reused for the whole scan; largest accepted frame is retained until return.
+    let mut payload = Vec::new();
     while offset < file_len {
         let remaining = file_len
             .checked_sub(offset)
@@ -485,7 +487,7 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
             truncate_tail(*reader.get_mut(), offset)?;
             break;
         }
-        let payload = read_frame_payload(&mut reader, payload_len)?;
+        read_frame_payload(&mut reader, payload_len, &mut payload)?;
         if frame_checksum(magic, payload_len, &payload) != decoded.checksum {
             truncate_unpublished_tail_or_fail(
                 *reader.get_mut(),
@@ -571,16 +573,17 @@ fn decode_frame_header(
 fn read_frame_payload<F: std::io::Read>(
     file: &mut F,
     payload_len: u64,
-) -> Result<Vec<u8>, DurableError> {
+    payload: &mut Vec<u8>,
+) -> Result<(), DurableError> {
     let payload_usize = usize::try_from(payload_len).map_err(|_| DurableError::EncodingOverflow)?;
-    let mut payload = Vec::new();
+    payload.clear();
     payload
         .try_reserve_exact(payload_usize)
         .map_err(|_| DurableError::EncodingOverflow)?;
     payload.resize(payload_usize, 0);
-    file.read_exact(&mut payload)
+    file.read_exact(payload)
         .map_err(|source| io_error("read durable frame payload", source))?;
-    Ok(payload)
+    Ok(())
 }
 
 fn truncate_unpublished_tail_or_fail<F: DurableIo>(
