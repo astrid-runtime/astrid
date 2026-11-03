@@ -151,11 +151,16 @@ def terminal_receipt(receipt):
 
 
 def emit_terminal_receipt(receipt):
-    summary = terminal_receipt(receipt)
-    print(TERMINAL_RECEIPT_MARKER, flush=True)
-    print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
-    print(f"{TERMINAL_RECEIPT_MARKER}_END", flush=True)
-    return summary
+    # The saved receipt is authoritative. A broken log pipe or serialization
+    # failure in this auxiliary copy must not replace the original exception.
+    try:
+        summary = terminal_receipt(receipt)
+        print(TERMINAL_RECEIPT_MARKER, flush=True)
+        print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
+        print(f"{TERMINAL_RECEIPT_MARKER}_END", flush=True)
+        return summary
+    except Exception:
+        return None
 
 
 def settle_after_builds(receipt, save, deadline):

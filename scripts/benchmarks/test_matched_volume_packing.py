@@ -278,5 +278,14 @@ class RefusalTests(unittest.TestCase):
         self.assertEqual(summary["runs"], receipt["runs"])
         self.assertEqual(MODULE.json.dumps(receipt, sort_keys=True), original)
 
+    def test_terminal_fallback_cannot_mask_the_primary_failure(self):
+        for failure in (BrokenPipeError("closed stdout"), TypeError("bad JSON")):
+            with self.subTest(failure=failure), patch("builtins.print", side_effect=failure):
+                with self.assertRaisesRegex(RuntimeError, "original quiet HOLD"):
+                    try:
+                        raise RuntimeError("original quiet HOLD")
+                    finally:
+                        MODULE.emit_terminal_receipt({"complete": False})
+
 if __name__ == "__main__":
     unittest.main()
