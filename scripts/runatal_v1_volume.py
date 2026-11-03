@@ -13,6 +13,9 @@ VOLUME_RECORD_BYTES = 75
 VOLUME_CONTEXT = "astrid volume record v1"
 VOLUME_TRANSACTION_REGION = "system/volume-metadata-transaction"
 VOLUME_COMMIT_REGION = "system/volume-commit"
+# Framing/allocation guard for one commit catalogue, matching hosted recover.
+MAX_COMMIT_SNAPSHOT_BYTES = 16 * 1024 * 1024
+LEGACY_SNAPSHOT_MAGIC = b"ASTMAP1\0"
 INDEX_PAGE_REGION = b"system/volume-extent-index"
 INDEX_PAGE_BYTES = 4096
 INDEX_RECORD_BYTES = VOLUME_RECORD_BYTES + len(INDEX_PAGE_REGION) + INDEX_PAGE_BYTES
@@ -260,7 +263,7 @@ def indexed_extents(data, reference, parent_offset, parent_sequence):
 
 
 def validate_paged_checkpoint(data, payload, offset, sequence, regions):
-    if len(payload) > 16 * 1024 * 1024:
+    if len(payload) > MAX_COMMIT_SNAPSHOT_BYTES:
         raise VolumeFormatError("paged catalogue exceeds format bound")
     cursor = Cursor(payload)
     if cursor.take(8) != b"ASTMAP2\0":
@@ -293,6 +296,44 @@ def validate_paged_checkpoint(data, payload, offset, sequence, regions):
     cursor.done()
     if names != set(regions):
         raise VolumeFormatError("paged catalogue omits recovered regions")
+
+
+def validate_legacy_snapshot(data, payload, commit_offset, regions):
+    if len(payload) > MAX_COMMIT_SNAPSHOT_BYTES or len(payload) < 12:
+        raise VolumeFormatError("invalid commit snapshot length")
+    cursor = Cursor(payload)
+    if cursor.take(8) != LEGACY_SNAPSHOT_MAGIC:
+        raise VolumeFormatError("invalid commit snapshot magic")
+    names = set()
+    for _ in range(cursor.integer(4)):
+        name = volume_region_name(cursor.take(cursor.integer(2)))
+        length = cursor.integer(8)
+        if name in names:
+            raise VolumeFormatError("duplicate commit snapshot region")
+        names.add(name)
+        if name not in regions or len(regions[name]) != length:
+            raise VolumeFormatError("legacy snapshot contradicts recovered namespace")
+        logical = memoryview(regions[name])
+        previous_end = 0
+        for _ in range(cursor.integer(4)):
+            start = cursor.integer(8)
+            logical_end = cursor.integer(8)
+            physical = cursor.integer(8)
+            if start >= logical_end or start < previous_end or logical_end > length:
+                raise VolumeFormatError("invalid commit snapshot extent")
+            extent_len = logical_end - start
+            if physical > commit_offset or extent_len > commit_offset - physical:
+                raise VolumeFormatError("invalid commit snapshot extent")
+            if any(logical[previous_end:start]):
+                raise VolumeFormatError("legacy snapshot hole contradicts recovered bytes")
+            if logical[start:logical_end] != memoryview(data)[physical:physical + extent_len]:
+                raise VolumeFormatError("legacy snapshot payload contradicts recovered bytes")
+            previous_end = logical_end
+        if any(logical[previous_end:]):
+            raise VolumeFormatError("legacy snapshot sparse tail contradicts recovered bytes")
+    cursor.done()
+    if names != set(regions):
+        raise VolumeFormatError("legacy snapshot omits recovered regions")
 
 
 def recover_volume(path):
@@ -379,13 +420,18 @@ def recover_volume(path):
                 raise VolumeFormatError("invalid extent-index record envelope")
             index_page(payload, offset, current, header[43:75])
         else:
-            # Format-1 commits may carry the hosted region-map snapshot. The
-            # independent reader replays the preceding records and does not
-            # need to interpret that optional acceleration payload.
+            # Empty commits keep the replayed namespace. Nonempty payloads are
+            # ASTMAP2 or ASTMAP1 catalogues checked against replay; the reader
+            # still returns replayed bytes rather than substituting the snapshot.
             if name != VOLUME_COMMIT_REGION or logical_offset != 0:
                 raise VolumeFormatError("invalid volume commit boundary")
-            if payload.startswith(b"ASTMAP2\0"):
-                validate_paged_checkpoint(data, payload, offset, current, regions)
+            if len(payload) > MAX_COMMIT_SNAPSHOT_BYTES:
+                raise VolumeFormatError("commit snapshot exceeds format bound")
+            if payload:
+                if payload.startswith(b"ASTMAP2\0"):
+                    validate_paged_checkpoint(data, payload, offset, current, regions)
+                else:
+                    validate_legacy_snapshot(data, payload, offset, regions)
             committed_regions = {
                 name: bytes(value) for name, value in regions.items()
             }
