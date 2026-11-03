@@ -545,6 +545,17 @@ where
 
     pub(super) fn insert(&mut self, record: ObjectRecord) -> StorageResult<ObjectId> {
         let object = self.engine.identify_kv_object(&record);
+        self.stage_identified_record(object, record)
+    }
+
+    // Transaction-local staging only. Callers supply either an ID just computed
+    // by this engine or an unchanged record from its immediate content build.
+    // Root admission still independently verifies every declared identity.
+    fn stage_identified_record(
+        &mut self,
+        object: ObjectId,
+        record: ObjectRecord,
+    ) -> StorageResult<ObjectId> {
         match self.records.get(&object) {
             Some(existing) if existing == &record => {},
             Some(_) => return Err(map_engine(&ModelError::ObjectCollision(object).into())),

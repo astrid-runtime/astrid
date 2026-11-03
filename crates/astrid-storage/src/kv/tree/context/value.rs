@@ -44,8 +44,11 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
             StorageError::Serialization(format!("build chunked KV value: {error}"))
         })?;
         let file = built.descriptor().file();
-        for (_, record) in built.into_records() {
-            self.insert(record)?;
+        // The builder used this same context's engine identity and returns
+        // unchanged owned records. Reuse those IDs only for local staging;
+        // authoritative root admission still verifies the entire transaction.
+        for (object, record) in built.into_records() {
+            self.stage_identified_record(object, record)?;
         }
         let wrapper = ObjectRecord::new(
             ObjectKind::KvLeaf,

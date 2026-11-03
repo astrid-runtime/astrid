@@ -317,3 +317,111 @@ fn spilled_value_encoding_thresholds_are_pinned() {
         assert_eq!(context.value_bytes(&value).unwrap(), bytes);
     }
 }
+
+#[derive(Default)]
+struct CountingContentIdentity {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl ObjectIdentity for CountingContentIdentity {
+    fn identify(&self, record: &ObjectRecord) -> ObjectId {
+        if matches!(
+            record.kind(),
+            ObjectKind::Chunk | ObjectKind::ChunkTree | ObjectKind::File
+        ) {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        TestIdentity.identify(record)
+    }
+}
+
+#[test]
+fn chunked_value_reuses_builder_identity_calls_before_admission() {
+    use std::sync::atomic::Ordering;
+
+    let engine = InMemoryEngine::new(CountingContentIdentity::default());
+    let principal = "alice".to_owned();
+    let mut context = TreeContext::new(&engine, &principal);
+    let bytes = bytes();
+    let built = build_content(&context, PROFILE, &bytes).unwrap();
+    let builder_calls = engine.identity().calls.swap(0, Ordering::Relaxed);
+    assert!(builder_calls > 0);
+    let file = built.descriptor().file();
+    let value = context.make_value(bytes).unwrap();
+    assert_eq!(
+        engine.identity().calls.load(Ordering::Relaxed),
+        builder_calls
+    );
+    let ValueSlot::Spilled { object, .. } = value else {
+        panic!("large value must spill");
+    };
+    assert_eq!(context.records[&object].references()[0].target(), file);
+    for (id, record) in built.into_records() {
+        assert_eq!(context.records.get(&id), Some(&record));
+    }
+    assert_eq!(engine.object_count(), 0);
+    assert!(engine.root(&principal).is_none());
+}
+
+#[test]
+fn chunked_value_reuses_equal_staged_bodies_without_growth() {
+    let engine = InMemoryEngine::new(TestIdentity);
+    let principal = "alice".to_owned();
+    let mut context = TreeContext::new(&engine, &principal);
+    let bytes = bytes();
+    let first = context.make_value(bytes.clone()).unwrap();
+    let count = context.records.len();
+    let second = context.make_value(bytes.clone()).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(context.records.len(), count);
+    assert_eq!(context.value_bytes(&second).unwrap(), bytes);
+    assert_eq!(engine.object_count(), 0);
+}
+
+struct StagingCollisionIdentity {
+    poison: ObjectRecord,
+    target: ObjectId,
+}
+
+impl ObjectIdentity for StagingCollisionIdentity {
+    fn identify(&self, record: &ObjectRecord) -> ObjectId {
+        if record == &self.poison {
+            self.target
+        } else {
+            TestIdentity.identify(record)
+        }
+    }
+}
+
+#[test]
+fn chunked_value_rejects_unequal_staged_body_without_overwriting() {
+    use crate::storage_model::ModelError;
+
+    let bytes = bytes();
+    let built = build_content(&TestIdentity, PROFILE, &bytes).unwrap();
+    let target = built
+        .records()
+        .iter()
+        .find(|(_, record)| record.kind() == ObjectKind::Chunk)
+        .unwrap()
+        .0;
+    let poison = value_record(b"stage collision".to_vec()).unwrap();
+    let engine = InMemoryEngine::new(StagingCollisionIdentity {
+        poison: poison.clone(),
+        target,
+    });
+    let principal = "alice".to_owned();
+    let mut context = TreeContext::new(&engine, &principal);
+    assert_eq!(context.insert(poison.clone()).unwrap(), target);
+    let Err(error) = context.make_value(bytes) else {
+        panic!("unequal bodies at one identity must fail local staging");
+    };
+    assert_eq!(
+        error.to_string(),
+        map_engine(&ModelError::ObjectCollision(target).into()).to_string()
+    );
+    assert_eq!(context.records.get(&target), Some(&poison));
+    assert_eq!(engine.object_count(), 0);
+    assert!(engine.root(&principal).is_none());
+}
