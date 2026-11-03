@@ -10,11 +10,15 @@ impl HostedFileVolume {
 
 pub(super) fn read_container(volume: &HostedFileVolume) -> Vec<u8> {
     let mut state = volume.state.lock();
-    let position = state.file.stream_position().unwrap();
-    state.file.seek(SeekFrom::Start(0)).unwrap();
+    read_locked_file(&mut state.file)
+}
+
+pub(super) fn read_locked_file(file: &mut File) -> Vec<u8> {
+    let position = file.stream_position().unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
     let mut bytes = Vec::new();
-    state.file.read_to_end(&mut bytes).unwrap();
-    state.file.seek(SeekFrom::Start(position)).unwrap();
+    file.read_to_end(&mut bytes).unwrap();
+    file.seek(SeekFrom::Start(position)).unwrap();
     bytes
 }
 

@@ -178,16 +178,17 @@ fn recovery_discards_complete_and_torn_unpublished_page_records() {
         } else {
             "complete.volume"
         });
-        std::fs::copy(&volume.path, &copy).unwrap();
+        let valid_len = state.valid_len;
+        drop(state);
+        super::super::super::test_support::copy_container(&volume, &copy);
         if torn {
             std::fs::OpenOptions::new()
                 .write(true)
                 .open(&copy)
                 .unwrap()
-                .set_len(state.valid_len - 1)
+                .set_len(valid_len - 1)
                 .unwrap();
         }
-        drop(state);
         let reopened = HostedFileVolume::open(&copy).unwrap();
         let region = VolumeRegion::new("data/page-test").unwrap();
         let mut bytes = [0; 32];

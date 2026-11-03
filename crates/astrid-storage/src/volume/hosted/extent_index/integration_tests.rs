@@ -1,5 +1,6 @@
 use std::io;
 
+use super::super::test_support::{copy_container, read_container, read_locked_file};
 use super::super::{CheckpointFormat, FlushState, HostedFileVolume, VolumeRegion};
 use super::publication::prepare_checkpoint;
 use crate::volume::AstridVolume;
@@ -78,13 +79,13 @@ fn failed_flush_reuses_the_same_prepared_pages_commit_and_footer() {
     .unwrap_err();
     assert_eq!(error.to_string(), "injected flush failure");
     let boundary = (state.valid_len, state.sequence, state.last_commit_offset);
-    let bytes = std::fs::read(&path).unwrap();
+    let bytes = read_locked_file(&mut state.file);
     HostedFileVolume::make_durable(&mut state).unwrap();
     assert_eq!(
         (state.valid_len, state.sequence, state.last_commit_offset),
         boundary
     );
-    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(read_locked_file(&mut state.file), bytes);
     assert_eq!(state.flush_state, FlushState::Confirmed);
     drop(state);
     drop(volume);
@@ -164,7 +165,7 @@ fn catalogue_encoding_failure_restores_original_namespace_and_suffix() {
     let mut state = volume.state.lock();
     let original_sequence = state.sequence;
     let original_length = state.valid_len;
-    let original_bytes = std::fs::read(&path).unwrap();
+    let original_bytes = read_locked_file(&mut state.file);
     // One page can be appended; the catalogue then cannot acquire a sequence.
     state.sequence = u64::MAX.strict_sub(1);
     assert!(prepare_checkpoint(&mut state).is_err());
@@ -175,7 +176,7 @@ fn catalogue_encoding_failure_restores_original_namespace_and_suffix() {
     assert!(state.regions[&region].root.is_none());
     assert_eq!(state.regions[&region].extents.len(), 1);
     assert_eq!(
-        std::fs::read(&path).unwrap(),
+        read_locked_file(&mut state.file),
         original_bytes[..usize::try_from(original_length).unwrap()]
     );
     state.sequence = original_sequence;
@@ -198,7 +199,7 @@ fn catalogue_failure_before_any_append_preserves_confirmed_footer() {
     let region = VolumeRegion::new("data/empty").unwrap();
     volume.create_region(&region, true).unwrap();
     volume.sync().unwrap();
-    let before = std::fs::read(&path).unwrap();
+    let before = read_container(&volume);
     let mut state = volume.state.lock();
     let boundary = (state.valid_len, state.sequence);
     assert!(!state.footer_pending);
@@ -231,7 +232,7 @@ fn catalogue_failure_before_any_append_preserves_confirmed_footer() {
     assert_eq!((state.valid_len, state.sequence), boundary);
     assert!(!state.footer_pending);
     assert_eq!(state.flush_state, FlushState::Confirmed);
-    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(read_locked_file(&mut state.file), before);
     drop(state);
     drop(volume);
     assert!(read(&HostedFileVolume::open(&path).unwrap(), &region).is_empty());
@@ -262,7 +263,10 @@ fn independent_python_reader_verifies_actual_multilevel_paged_volume() {
             .get(),
         1
     );
-    let before = std::fs::read(&path).unwrap();
+    let before = read_container(&volume);
+    let snapshot = directory.path().join("snapshot.volume");
+    copy_container(&volume, &snapshot);
+    assert_eq!(std::fs::read(&snapshot).unwrap(), before);
     let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts");
     let output = std::process::Command::new("python3")
         .arg("-c")
@@ -273,7 +277,7 @@ fn independent_python_reader_verifies_actual_multilevel_paged_volume() {
              assert recover_volume(Path(sys.argv[2])) == {'data/test': bytes(expected)}",
         )
         .arg(scripts)
-        .arg(&path)
+        .arg(&snapshot)
         .output()
         .unwrap();
     assert!(
@@ -281,5 +285,6 @@ fn independent_python_reader_verifies_actual_multilevel_paged_volume() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(std::fs::read(&snapshot).unwrap(), before);
+    assert_eq!(read_container(&volume), before);
 }
