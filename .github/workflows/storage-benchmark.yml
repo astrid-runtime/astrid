@@ -160,33 +160,44 @@ jobs:
           path: astrid-benchmark.noindex/host-indexing-setup.json
           if-no-files-found: warn
           retention-days: 30
-      - name: Diagnose host indexing after benchmark failure
-        if: failure() && runner.environment == 'github-hosted'
+      - name: Attribute CPU intervals after evolving-KV failure
+        if: failure() && runner.environment == 'github-hosted' && inputs.matched_mode == 'evolving-kv'
         continue-on-error: true
-        shell: bash
+        env:
+          BASELINE: ${{ inputs.packing_baseline }}
         run: |
-          root="$GITHUB_WORKSPACE/astrid-benchmark.noindex"
-          [[ -d "$root" && ! -L "$root" ]] || exit 0
-          # Standalone diagnostic; not part of the benchmark's content-bound manifest.
-          set -o noclobber
-          {
-            set +e
-            echo 'Read-only post-failure context; not a performance sample'
-            /usr/bin/mdutil -s /
-            echo "mdutil_exit=$?"
-            /bin/ps -axo pid=,ppid=,pcpu=,comm=
-            echo "ps_exit=$?"
-            echo 'sudo -n /usr/bin/fs_usage -t 10 -w -f filesys mdworker_shared mds_stores mds'
-            sudo -n /usr/bin/fs_usage -t 10 -w -f filesys mdworker_shared mds_stores mds
-            echo "fs_usage_exit=$?"
-          } > "$root/host-indexing-diagnostics.log" 2>&1
-      - name: Preserve standalone host-indexing diagnostic
-        if: failure() && runner.environment == 'github-hosted'
-        continue-on-error: true
+          python3 - <<'PYDIAG'
+          import hashlib, json, os, pathlib, shutil, subprocess
+          root = pathlib.Path(os.environ["GITHUB_WORKSPACE"]) / "astrid-benchmark.noindex"
+          source = root / "protocol/scripts/benchmarks/hosted_cpu_attribution.py"
+          expected = "88fc921ce9862903fd4caf7d7479432d841eccb8377d0694a1e9f23a0f5a28b3"
+          assert hashlib.sha256(source.read_bytes()).hexdigest() == expected
+          stage = root / "diagnostic"
+          stage.mkdir(mode=0o700, exist_ok=False)
+          staged = stage / source.name
+          shutil.copy2(source, staged)
+          assert hashlib.sha256(staged.read_bytes()).hexdigest() == expected
+          argv = ["python3", str(staged)]
+          receipt = root / "packing-evidence/receipt.json"
+          if receipt.is_file():
+              build = json.loads(receipt.read_text()).get("builds", {}).get("main")
+              if build is not None:
+                  assert build["head"] == os.environ["BASELINE"]
+                  assert pathlib.Path(build["binary"]) == root / "packing-evidence/main-storage-io"
+                  argv += ["--baseline-binary", build["binary"], "--baseline-sha256", build["binary_sha256"]]
+          subprocess.run(argv, check=True)
+          PYDIAG
+      - name: Preserve standalone CPU attribution diagnostic
+        if: always() && runner.environment == 'github-hosted' && inputs.matched_mode == 'evolving-kv'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: matched-packing-host-indexing-${{ github.sha }}
-          path: astrid-benchmark.noindex/host-indexing-diagnostics.log
+          name: matched-packing-cpu-attribution-${{ github.sha }}
+          path: |
+            astrid-benchmark.noindex/diagnostic/hosted_cpu_attribution.py
+            astrid-benchmark.noindex/cpu-attribution/receipt.json
+            astrid-benchmark.noindex/cpu-attribution/baseline.stdout
+            astrid-benchmark.noindex/cpu-attribution/baseline.stderr
+            astrid-benchmark.noindex/cpu-attribution/baseline.report.json
           if-no-files-found: warn
           retention-days: 30
 

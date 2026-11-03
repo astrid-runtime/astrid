@@ -1,5 +1,9 @@
 """Owned-only indexing isolation; no services, daemons, builds or benchmarks."""
 import importlib.util
+import json
+import shutil
+import subprocess
+import textwrap
 import os
 from pathlib import Path
 import re
@@ -42,17 +46,58 @@ class NamespaceTests(unittest.TestCase):
                 self.assertIn("run: python3 astrid-benchmark.noindex/protocol/scripts/benchmarks/hosted_macos_setup.py", body)
                 primary = body.index("- name: Preserve evidence including failed samples")
                 receipt = body.index("- name: Preserve standalone hosted setup receipt")
-                diagnostic = body.index("- name: Diagnose host indexing after benchmark failure")
+                diagnostic = body.index("- name: Attribute CPU intervals after evolving-KV failure" if job == "matched-packing" else "- name: Diagnose host indexing after benchmark failure")
                 self.assertLess(primary, receipt)
                 self.assertLess(receipt, diagnostic)
                 self.assertIn("if: always()", body[receipt:diagnostic])
                 self.assertIn("path: astrid-benchmark.noindex/host-indexing-setup.json", body[receipt:diagnostic])
                 mdutil_lines = re.findall(r"^.*\bmdutil\b.*$", body, flags=re.MULTILINE)
-                self.assertEqual([line.strip() for line in mdutil_lines], ["/usr/bin/mdutil -s /"])
+                self.assertEqual([line.strip() for line in mdutil_lines], [] if job == "matched-packing" else ["/usr/bin/mdutil -s /"])
                 for forbidden in ("killall", "launchctl", ".metadata_never_index"):
                     self.assertNotIn(forbidden, body)
         generic = workflow.split("  matched-packing:", 1)[0]
         self.assertNotIn("astrid-benchmark.noindex", generic)
+
+    def test_failure_cpu_diagnostic_executes_actual_workflow_wiring_without_a_child(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/storage-benchmark.yml").read_text()
+        block = workflow.split("- name: Attribute CPU intervals after evolving-KV failure", 1)[1]
+        block = block.split("- name: Preserve standalone CPU attribution diagnostic", 1)[0]
+        self.assertIn("if: failure() && runner.environment == 'github-hosted' && inputs.matched_mode == 'evolving-kv'", block)
+        self.assertIn("continue-on-error: true", block)
+        source = textwrap.dedent(block.split("python3 - <<'PYDIAG'\n", 1)[1].split("\n          PYDIAG", 1)[0])
+        program = compile(source, "<workflow CPU diagnostic>", "exec")
+        for case in ("no-receipt", "valid-build", "wrong-head", "wrong-binary"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as raw:
+                workspace = Path(raw).resolve()
+                root = workspace / "astrid-benchmark.noindex"
+                root.mkdir(mode=0o700)
+                staged = root / "protocol/scripts/benchmarks"
+                staged.mkdir(parents=True)
+                shutil.copy2(Path(__file__).with_name("hosted_cpu_attribution.py"), staged)
+                build = {"head": "0" * 40, "binary": str(root / "packing-evidence/main-storage-io"),
+                         "binary_sha256": "a" * 64}
+                if case != "no-receipt":
+                    (root / "packing-evidence").mkdir()
+                    if case == "wrong-head":
+                        build["head"] = "1" * 40
+                    elif case == "wrong-binary":
+                        build["binary"] = str(root / "packing-evidence/candidate-storage-io")
+                    (root / "packing-evidence/receipt.json").write_text(json.dumps({"builds": {"main": build}}))
+                with patch.dict(os.environ, {"GITHUB_WORKSPACE": str(workspace), "BASELINE": "0" * 40}), \
+                        patch.object(subprocess, "run") as child:
+                    if case in ("wrong-head", "wrong-binary"):
+                        with self.assertRaises(AssertionError):
+                            exec(program, {})
+                        child.assert_not_called()
+                    else:
+                        exec(program, {})
+                        expected = ["python3", str(root / "diagnostic/hosted_cpu_attribution.py")]
+                        if case == "valid-build":
+                            expected += ["--baseline-binary", build["binary"], "--baseline-sha256", build["binary_sha256"]]
+                        child.assert_called_once_with(expected, check=True)
+                self.assertEqual((root / "diagnostic").stat().st_mode & 0o777, 0o700)
+                self.assertEqual((root / "diagnostic/hosted_cpu_attribution.py").read_bytes(),
+                                 Path(__file__).with_name("hosted_cpu_attribution.py").read_bytes())
 
     def test_namespace_is_existing_owned_ancestor_not_a_git_marker(self):
         with tempfile.TemporaryDirectory() as raw:
