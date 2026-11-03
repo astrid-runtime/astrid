@@ -33,7 +33,10 @@ def _populate(output, publication, log_paths):
     if receipt.is_symlink() or not receipt.is_file():
         raise RuntimeError("publication requires a regular receipt")
     raw = receipt.read_bytes()
-    json.loads(raw)  # The measured receipt is copied exactly, not summarized.
+    measured = json.loads(raw)  # The measured receipt is copied exactly, not summarized.
+    # Evolving-KV acquisition promises complete raw reports/logs across rejected
+    # attempts. Refuse publication instead of silently substituting bounded tails.
+    full_logs = measured.get("mode") == "evolving-kv"
     (publication / "receipt.json").write_bytes(raw)
     paths = [output / name for name in ("main-cargo.jsonl", "candidate-cargo.jsonl",
                                        "client-rustc.log", "capsule-build.log")]
@@ -53,15 +56,20 @@ def _populate(output, publication, log_paths):
         relative = path.relative_to(output)
         length = path.stat().st_size
         count = min(length, LOG_LIMIT, remaining)
+        if full_logs and count != length:
+            raise RuntimeError(f"evolving-KV raw evidence exceeds publication bounds: {relative}")
         target = publication / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         with path.open("rb") as stream:
             stream.seek(length - count)
             tail = stream.read(count)
         target.write_bytes(tail)
+        source_digest, published_digest = digest(path), digest(target)
+        if full_logs and (len(tail) != length or source_digest != published_digest):
+            raise RuntimeError(f"evolving-KV raw evidence changed during publication: {relative}")
         manifest["logs"].append({"path": str(relative), "source_bytes": length,
-                                 "source_sha256": digest(path), "published_bytes": len(tail),
-                                 "published_sha256": digest(target), "tail_only": count < length})
+                                 "source_sha256": source_digest, "published_bytes": len(tail),
+                                 "published_sha256": published_digest, "tail_only": count < length})
         remaining -= count
     (publication / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest

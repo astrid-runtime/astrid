@@ -118,3 +118,56 @@ class EvidenceTests(unittest.TestCase):
                 self.assertFalse(json.loads((root / "receipt.json").read_text())["complete"])
                 self.assertFalse((root / "public").exists())
                 self.assertEqual(list(root.glob(".publication-*")), [])
+
+    def test_evolving_logs_are_byte_complete_with_matching_manifest_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "receipt.json").write_text('{"complete": true, "mode": "evolving-kv"}')
+            logs = [root / "sample-00.stdout", root / "sample-01.report.json"]
+            for path, raw in zip(logs, [b"raw stdout", b'{"raw":"report"}'], strict=True):
+                path.write_bytes(raw)
+            manifest = MODULE.publish(root, logs)
+            for path, entry in zip(logs, manifest["logs"], strict=True):
+                self.assertEqual((root / "public" / path.name).read_bytes(), path.read_bytes())
+                self.assertFalse(entry["tail_only"])
+                self.assertEqual(entry["source_bytes"], entry["published_bytes"])
+                self.assertEqual(entry["source_sha256"], entry["published_sha256"])
+
+    def test_evolving_per_file_and_aggregate_overflow_fail_without_public_success(self):
+        for failure in ("file", "aggregate"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                receipt = {"complete": True, "mode": "evolving-kv"}
+                emit = MagicMock()
+                def save():
+                    (root / "receipt.json").write_text(json.dumps(receipt))
+                logs = [root / "sample-00.stdout", root / "sample-01.stdout"]
+                original = [b"abcdef" if failure == "file" else b"abcd", b"efgh"]
+                for path, data in zip(logs, original, strict=True):
+                    path.write_bytes(data)
+                with patch.object(MODULE, "LOG_LIMIT", 5), patch.object(MODULE, "TOTAL_LOG_LIMIT", 7):
+                    with self.assertRaisesRegex(RuntimeError, "raw evidence exceeds publication bounds"):
+                        MODULE.finalize(root, receipt, save, emit, log_paths=logs)
+                self.assertFalse(receipt["complete"])
+                self.assertIn("raw evidence exceeds publication bounds", receipt["publication_error"])
+                self.assertFalse((root / "public").exists())
+                self.assertEqual(list(root.glob(".publication-*")), [])
+                self.assertEqual([path.read_bytes() for path in logs], original)
+                self.assertFalse(json.loads((root / "receipt.json").read_text())["complete"])
+                emit.assert_called_once_with(receipt)
+
+    def test_evolving_log_changed_during_copy_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "receipt.json").write_text('{"complete": true, "mode": "evolving-kv"}')
+            log = root / "sample-00.stdout"
+            log.write_bytes(b"before")
+            original_digest = MODULE.digest
+            def digest(path):
+                if path == log:
+                    log.write_bytes(b"changed")
+                return original_digest(path)
+            with patch.object(MODULE, "digest", side_effect=digest):
+                with self.assertRaisesRegex(RuntimeError, "raw evidence changed during publication"):
+                    MODULE.publish(root, [log])
+            self.assertFalse((root / "public").exists())

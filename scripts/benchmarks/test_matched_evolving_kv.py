@@ -378,7 +378,8 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(actual, expected)
         self.assertEqual(len(actual), 36)
 
-    def run_protocol(self, root, fail=False, quiet=None, settle=None, sample_hook=None, expected_error=None, other_workload=False):
+    def run_protocol(self, root, fail=False, quiet=None, settle=None, sample_hook=None, expected_error=None, other_workload=False,
+                     hook_overrides=None, overlay_check=None, disk=None):
         protocol, output = root / "protocol", root / "output"
         protocol.mkdir()
         output.mkdir()
@@ -390,7 +391,7 @@ class ScheduleTests(unittest.TestCase):
             manifest[relative] = hashlib.sha256(source.read_bytes()).hexdigest()
         args = SimpleNamespace(baseline=root / "baseline", candidate=root / "candidate",
                                baseline_head=HEAD, candidate_head="c" * 40)
-        receipt = {"samples": [], "performance_accepted": False}
+        receipt = {"samples": [], "performance_accepted": False, "protocol_checkout_head": HEAD}
         save = Mock()
         def frozen_build(path, head, _protocol, _manifest, _output, arm, _deadline, _hooks, **_options):
             return {"head": head, "binary": str(output / arm), "binary_sha256": DIGEST,
@@ -408,13 +409,14 @@ class ScheduleTests(unittest.TestCase):
                                    SAMPLE_FIELDS=[], run_sample=sample) if other_workload else None
         sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else DIGEST
         hooks = {"sha": sha, "quiet_snapshot": quiet or (lambda: {"quiet": True}),
-                 "settle_after_builds": Mock(),
+                 "settle_after_builds": Mock(), "clean_checkout": Mock(),
                  "settle_before_sample": settle or (lambda *args: {"quiet": True}),
                  "abba_schedule": shared_schedule()}
+        hooks.update(hook_overrides or {})
         with patch.object(MODE, "build", side_effect=frozen_build), \
-                patch.object(MODE, "verify_overlay", return_value=[]), \
+                patch.object(MODE, "verify_overlay", overlay_check or Mock(return_value=[])), \
                 patch.object(MODE, "run_sample", side_effect=sample), \
-                patch.object(MODE.shutil, "disk_usage", return_value=SimpleNamespace(free=10 * 1024**3)):
+                patch.object(MODE.shutil, "disk_usage", disk or Mock(return_value=SimpleNamespace(free=10 * 1024**3))):
             if fail or expected_error:
                 with self.assertRaisesRegex(RuntimeError, expected_error or "retained synthetic failure"):
                     MODE.run(args, protocol, output, receipt, save, MODE.time.monotonic() + 10000, hooks, workload=workload)
@@ -447,6 +449,11 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(receipt["schedule"], expected)
         self.assertEqual(len(receipt["samples"]), 18)
         self.assertTrue(all(s["complete"] for s in receipt["samples"]))
+        self.assertEqual(receipt["accepted_attempt"], 0)
+        self.assertEqual(receipt["accepted_sample_indices"], list(range(18)))
+        self.assertTrue(all(s["accepted_for_comparison"] for s in receipt["samples"]))
+        self.assertIn("disposable runner only", receipt["rejected_fixture_retention"])
+        self.assertIn("not proof noise is external", receipt["acquisition_scope"])
         self.assertFalse(receipt["performance_accepted"])
         self.assertEqual(receipt["workload_definition"]["growth_logical_denominators"], [540672, 8404992])
         self.assertIn("unused_legacy_config_fields", receipt["workload_definition"])
@@ -467,7 +474,7 @@ class ScheduleTests(unittest.TestCase):
             with self.subTest(slot=rejected_slot), tempfile.TemporaryDirectory(dir=Path(__file__).parent) as raw:
                 def execute(index, sample):
                     if index == rejected_slot:
-                        sample.update(complete=False, failure="noise only")
+                        sample.update(complete=False, failure="noise only", elapsed_s=1)
                         raise MODE.PostSampleNoise("noise only")
                     sample.update(complete=True, elapsed_s=1 if sample["attempt"] == 0 else 9)
                 receipt, _ = self.run_protocol(Path(raw).resolve(), sample_hook=execute)
@@ -483,6 +490,10 @@ class ScheduleTests(unittest.TestCase):
                 self.assertTrue(all(s["accepted_for_comparison"] for s in accepted))
                 rejected = receipt["samples"][:rejected_slot + 1]
                 self.assertTrue(all(not s["accepted_for_comparison"] for s in rejected))
+                self.assertTrue(all(s["elapsed_s"] == 1 for s in rejected))
+                self.assertTrue(all(s["elapsed_s"] == 9 for s in accepted))
+                self.assertLess(max(s["elapsed_s"] for s in rejected),
+                                min(s["elapsed_s"] for s in accepted))
                 self.assertTrue(all(Path(s["fixture"]).is_dir() for s in rejected))
                 self.assertTrue(all(not Path(s["fixture"]).exists() for s in accepted))
                 self.assertEqual(len({s["fixture"] for s in receipt["samples"]}), len(receipt["samples"]))
@@ -523,8 +534,82 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(len(receipt["samples"]), 1)
         self.assertNotIn("accepted_attempt", receipt)
 
+    def test_late_full_protocol_drift_preserves_every_fixture_and_refuses_acceptance(self):
+        verify = Mock(side_effect=RuntimeError("late non-overlay protocol drift"))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            receipt, _ = self.run_protocol(root, hook_overrides={"clean_checkout": verify},
+                                           expected_error="late non-overlay protocol drift")
+            verify.assert_called_once_with(root / "protocol", HEAD)
+            self.assertEqual(len(receipt["samples"]), 18)
+            self.assertTrue(all(Path(s["fixture"]).is_dir() for s in receipt["samples"]))
+            self.assertTrue(all(not s["accepted_for_comparison"] for s in receipt["samples"]))
+            self.assertNotIn("accepted_attempt", receipt)
+            self.assertNotIn("accepted_sample_indices", receipt)
+
+    def test_final_overlay_or_binary_drift_preserves_fixtures_and_refuses_acceptance(self):
+        for failure in ("overlay", "binary"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw).resolve()
+                sha = lambda path: ("wrong" if path.name == "main" and failure == "binary" else
+                                    hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else DIGEST)
+                receipt, _ = self.run_protocol(
+                    root, hook_overrides={"sha": sha},
+                    overlay_check=Mock(return_value=["drift"] if failure == "overlay" else []),
+                    expected_error="producer source drift after schedule" if failure == "overlay" else "frozen binary drift after schedule")
+                self.assertEqual(len(receipt["samples"]), 18)
+                self.assertTrue(all(Path(s["fixture"]).is_dir() for s in receipt["samples"]))
+                self.assertTrue(all(not s["accepted_for_comparison"] for s in receipt["samples"]))
+                self.assertNotIn("accepted_attempt", receipt)
+
+    def test_disk_and_budget_refusal_after_noise_do_not_start_another_sample(self):
+        for failure in ("disk", "budget"):
+            clock = Mock(return_value=0)
+            def execute(index, sample):
+                if failure == "budget":
+                    clock.return_value = 20000
+                raise MODE.PostSampleNoise("noise only")
+            disk = Mock(side_effect=[SimpleNamespace(free=10 * 1024**3), SimpleNamespace(free=0)])
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as raw, \
+                    patch.object(MODE.time, "monotonic", clock):
+                receipt, _ = self.run_protocol(
+                    Path(raw).resolve(), sample_hook=execute, disk=disk,
+                    expected_error="sample disk reserve" if failure == "disk" else "run budget cannot contain full sample")
+            self.assertEqual(len(receipt["schedule_attempts"]), 2)
+            self.assertEqual(len(receipt["samples"]), 1)
+            self.assertNotIn("accepted_attempt", receipt)
+
+    def test_stringly_noise_runtime_error_is_terminal(self):
+        def execute(index, sample):
+            raise RuntimeError("background load after sample: HOLD")
+        with tempfile.TemporaryDirectory() as raw:
+            receipt, _ = self.run_protocol(Path(raw).resolve(), sample_hook=execute,
+                                           expected_error="background load after sample: HOLD")
+        self.assertEqual(len(receipt["schedule_attempts"]), 1)
+        self.assertEqual(len(receipt["samples"]), 1)
+        self.assertNotIn("accepted_attempt", receipt)
+
+    def test_third_whole_attempt_can_succeed_without_pooling_prior_samples(self):
+        def execute(index, sample):
+            if sample["attempt"] < 2:
+                raise MODE.PostSampleNoise("noise only")
+            sample["complete"] = True
+        with tempfile.TemporaryDirectory() as raw:
+            receipt, _ = self.run_protocol(Path(raw).resolve(), sample_hook=execute)
+        self.assertEqual(receipt["accepted_attempt"], 2)
+        self.assertEqual(receipt["accepted_sample_indices"], list(range(2, 20)))
+        self.assertEqual([s["accepted_for_comparison"] for s in receipt["samples"]], [False] * 2 + [True] * 18)
+        self.assertFalse(receipt["performance_accepted"])
+
+    def test_fixture_creation_failure_registers_no_phantom_sample_index(self):
+        with tempfile.TemporaryDirectory() as raw, \
+                patch.object(MODE.tempfile, "mkdtemp", side_effect=RuntimeError("fixture creation failed")):
+            receipt, _ = self.run_protocol(Path(raw).resolve(), expected_error="fixture creation failed")
+        self.assertEqual(receipt["samples"], [])
+        self.assertEqual(receipt["schedule_attempts"][0]["sample_indices"], [])
+
     def test_noisy_postcheck_never_masks_product_or_identity_failure(self):
-        for case in ["valid", "exit", "timeout", "missing", "malformed", "overlay", "binary"]:
+        for case in ["valid", "exit", "timeout", "missing", "malformed", "overlay", "binary", "cpu"]:
             with self.subTest(case=case), tempfile.TemporaryDirectory(dir=Path(__file__).parent) as raw:
                 root = Path(raw).resolve()
                 volume = root / "fixture"
@@ -551,7 +636,8 @@ class ScheduleTests(unittest.TestCase):
                         patch.object(MODE.subprocess, "run", side_effect=execute):
                     with self.assertRaises(Exception) as error:
                         MODE.run_sample(build, root, volume, root, 0, sample, {},
-                                        {"sha": sha, "quiet_snapshot": lambda: {"quiet": False}})
+                                        {"sha": sha, "quiet_snapshot": Mock(side_effect=RuntimeError("CPU measurement failed"))
+                                         if case == "cpu" else lambda: {"quiet": False}})
                 self.assertEqual(isinstance(error.exception, MODE.PostSampleNoise), case == "valid")
                 self.assertFalse(sample["complete"])
                 self.assertTrue(sample["fixture_preserved"])

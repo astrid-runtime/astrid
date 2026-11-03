@@ -364,10 +364,11 @@ def run_schedule(args, output, receipt, save, deadline, hooks, workload,
         if attempt is not None:
             sample.update(attempt=attempt["index"], schedule_slot=slot,
                           retain_until_schedule_verified=True, accepted_for_comparison=False)
-            attempt["sample_indices"].append(index)
         if workload:
             sample.update(zip(workload.SAMPLE_FIELDS, configuration, strict=True))
         receipt["samples"].append(sample)
+        if attempt is not None:
+            attempt["sample_indices"].append(index)
         save()
         path = args.baseline.resolve() if arm == "main" else args.candidate.resolve()
         try:
@@ -434,6 +435,9 @@ def run(args, protocol, output, receipt, save, deadline, hooks, workload=None):
         require(hooks["sha"](Path(builds[arm]["binary"])) == builds[arm]["binary_sha256"],
                 "frozen binary drift after schedule")
     if accepted is not None:
+        # Validate the entire protocol checkout before destroying any fixtures or
+        # marking a comparison accepted, including files outside the Rust overlay.
+        hooks["clean_checkout"](protocol, receipt["protocol_checkout_head"])
         # Raw rejected reports/logs remain published. Rejected fixtures remain on
         # the disposable runner only; producer source and receipts reproduce them.
         for index in accepted["sample_indices"]:
