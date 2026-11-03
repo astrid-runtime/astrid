@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use astrid_core::dirs::AstridHome;
 use astrid_storage::KvStore;
+use tokio::runtime::Builder;
 
 use super::{authoritative_store_bytes, open_store};
 use crate::BenchResult;
@@ -20,38 +21,63 @@ const EDITS: usize = 4;
 const NAMESPACE: &str = "system:storage-benchmark";
 const KEY: &str = "evolving-value";
 
-pub(crate) async fn run(config: &Config, root: &Path, report: &mut Report) -> BenchResult<()> {
+pub(crate) fn run(config: &Config, root: &Path, report: &mut Report) -> BenchResult<()> {
     for (bytes, offset) in [(512 * 1024, 250_000), (8 * 1024 * 1024, 3_000_000)] {
         let versions = corpus(bytes, offset);
         let mut samples = Samples::default();
         for sample in 0..config.samples {
             let home = AstridHome::from_path(root.join(format!("evolving-kv-{bytes}-{sample}")));
             home.ensure()?;
-            run_sample(config, &home, &versions, &mut samples).await?;
+            // Each phase owns its runtime. Dropping it joins blocking checkpoint
+            // workers, so no writer or CPU work escapes into the next phase.
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| run_sample(config, &home, &versions, &mut samples))
+                    .join()
+                    .map_err(|_| "evolving-value sample thread panicked")?
+            })?;
         }
         samples.record(bytes, report)?;
     }
     Ok(())
 }
 
-async fn run_sample(
+fn run_sample(
     config: &Config,
     home: &AstridHome,
     versions: &[Vec<u8>],
     samples: &mut Samples,
 ) -> BenchResult<()> {
+    let runtime = Builder::new_current_thread().enable_all().build()?;
+    let started = Instant::now();
+    let before = runtime.block_on(write_phase(config, home, versions, samples))?;
+    drop(runtime);
+    samples.closed_sequence.push(started.elapsed());
+    // Per-call length deltas are invalid: asynchronous checkpoints may append
+    // between calls. Only charge the complete, closed and drained sequence.
+    samples.closed_growth.push(growth(home, before)?);
+    let runtime = Builder::new_current_thread().enable_all().build()?;
+    let result = runtime.block_on(reopen_phase(config, home, versions, samples));
+    drop(runtime);
+    result
+}
+
+async fn write_phase(
+    config: &Config,
+    home: &AstridHome,
+    versions: &[Vec<u8>],
+    samples: &mut Samples,
+) -> BenchResult<u64> {
     let store = open_store(home, config.object_cache_bytes).await?;
     let kv = store.kv();
-    let initial = versions[0].clone();
     let before = authoritative_store_bytes(home)?;
+    let initial = versions[0].clone();
     let started = Instant::now();
     kv.set(NAMESPACE, KEY, initial).await?;
     samples.initial_set.push(started.elapsed());
-    samples.initial_growth.push(growth(home, before)?);
     verify(kv.as_ref(), &versions[0]).await?;
     for pair in versions.windows(2) {
         let replacement = pair[1].clone();
-        let before = authoritative_store_bytes(home)?;
         let started = Instant::now();
         let applied = kv
             .compare_and_swap(NAMESPACE, KEY, Some(&pair[0]), replacement)
@@ -60,7 +86,6 @@ async fn run_sample(
         if !applied {
             return Err("uncontended evolving-value CAS was not applied".into());
         }
-        samples.edit_growth.push(growth(home, before)?);
         verify(kv.as_ref(), &pair[1]).await?;
     }
     let final_value = versions.last().ok_or("empty evolving-value corpus")?;
@@ -73,6 +98,16 @@ async fn run_sample(
     samples.close.push(started.elapsed());
     drop(kv);
     drop(store);
+    Ok(before)
+}
+
+async fn reopen_phase(
+    config: &Config,
+    home: &AstridHome,
+    versions: &[Vec<u8>],
+    samples: &mut Samples,
+) -> BenchResult<()> {
+    let final_value = versions.last().ok_or("empty evolving-value corpus")?;
     let started = Instant::now();
     let reopened = open_store(home, config.object_cache_bytes).await?;
     samples.reopen.push(started.elapsed());
@@ -130,9 +165,9 @@ fn growth(home: &AstridHome, before: u64) -> BenchResult<u64> {
 #[derive(Default)]
 struct Samples {
     initial_set: Vec<Duration>,
-    initial_growth: Vec<u64>,
     cas: Vec<Duration>,
-    edit_growth: Vec<u64>,
+    closed_sequence: Vec<Duration>,
+    closed_growth: Vec<u64>,
     read: Vec<Duration>,
     close: Vec<Duration>,
     reopen: Vec<Duration>,
@@ -145,37 +180,38 @@ impl Samples {
             524_288 => [
                 "kv_512k_initial",
                 "kv_512k_insert_cas",
-                "kv_512k_read",
+                "kv_512k_read_warm",
                 "kv_512k_close",
                 "kv_512k_reopen",
                 "kv_512k_reopen_read",
+                "kv_512k_closed_sequence",
             ],
             8_388_608 => [
                 "kv_8m_initial",
                 "kv_8m_insert_cas",
-                "kv_8m_read",
+                "kv_8m_read_warm",
                 "kv_8m_close",
                 "kv_8m_reopen",
                 "kv_8m_reopen_read",
+                "kv_8m_closed_sequence",
             ],
             _ => return Err("unrecognized evolving-value corpus size".into()),
         };
         let initial_bytes = u64::try_from(bytes)?;
         let final_bytes = u64::try_from(bytes.strict_add(EDITS.strict_mul(INSERT_BYTES)))?;
         report.record_bytes(names[0], initial_bytes, self.initial_set);
-        report.record_write_amplification(names[0], initial_bytes, self.initial_growth)?;
-        // Each observation is one exact full-value CAS. The amplification
-        // denominator is inserted logical bytes, not the full submitted value.
+        // Each observation is one exact full-value CAS, with real background
+        // checkpoints enabled. It does not include all deferred checkpoint work.
         report.record_operations(names[1], 1, self.cas);
-        report.record_write_amplification(
-            names[1],
-            u64::try_from(INSERT_BYTES)?,
-            self.edit_growth,
-        )?;
         report.record_bytes(names[2], final_bytes, self.read);
         report.record_operations(names[3], 1, self.close);
         report.record_operations(names[4], 1, self.reopen);
         report.record_bytes(names[5], final_bytes, self.read_after_reopen);
+        // End-to-end sequence includes open, client cloning, exact verification,
+        // close and runtime/checkpoint drain. Its denominator is the initial
+        // value plus four logical insertions, not five full submitted payloads.
+        report.record_operations(names[6], 1, self.closed_sequence);
+        report.record_write_amplification(names[6], final_bytes, self.closed_growth)?;
         Ok(())
     }
 }

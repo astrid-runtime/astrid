@@ -58,7 +58,7 @@ async fn main() -> BenchResult<()> {
 
     let mut report = Report::new(config.clone(), provenance);
     if config.selection == config::Selection::EvolvingKv {
-        workloads::evolving_kv::run(&config, &root, &mut report).await?;
+        workloads::evolving_kv::run(&config, &root, &mut report)?;
     } else {
         let source = root.join("source.bin");
         workloads::prepare_source(&source, config.bytes, config.block_bytes)?;

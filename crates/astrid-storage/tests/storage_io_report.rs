@@ -10,6 +10,8 @@ mod config;
 mod provenance;
 #[path = "../benches/storage_io/report.rs"]
 mod report;
+#[path = "../benches/storage_io/workloads.rs"]
+mod workloads;
 
 use config::Config;
 use provenance::RunProvenance;
@@ -143,4 +145,35 @@ fn evolving_kv_selection_is_explicit_and_unknown_modes_fail_closed() {
         Config::from_arguments(["--only", "all-but-unknown"].into_iter().map(str::to_owned))
             .is_err()
     );
+}
+
+#[test]
+fn evolving_kv_growth_covers_closed_sequences_and_reads_are_explicit() {
+    let root = tempfile::tempdir().expect("owned benchmark root");
+    let mut config = config();
+    config.samples = 1;
+    config.selection = config::Selection::EvolvingKv;
+    let mut report = Report::new(config.clone(), provenance());
+    workloads::evolving_kv::run(&config, root.path(), &mut report)
+        .expect("public KV writes and reopened exact readback");
+    let encoded = serde_json::to_value(report).expect("report serializes");
+    let metrics = encoded["metrics"].as_array().expect("metric array");
+    assert_eq!(metrics.len(), 14);
+    let growth = encoded["write_amplifications"]
+        .as_array()
+        .expect("growth array");
+    assert_eq!(growth.len(), 2);
+    for (prefix, final_bytes) in [("kv_512k", 540_672), ("kv_8m", 8_404_992)] {
+        assert!(
+            metrics
+                .iter()
+                .any(|row| row["name"] == format!("{prefix}_read_warm"))
+        );
+        let row = growth
+            .iter()
+            .find(|row| row["name"] == format!("{prefix}_closed_sequence"))
+            .expect("only closed-sequence growth is attributed");
+        assert_eq!(row["logical_bytes_per_sample"], final_bytes);
+    }
+    assert!(!root.path().join("source.bin").exists());
 }
