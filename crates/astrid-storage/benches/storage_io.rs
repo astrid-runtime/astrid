@@ -56,11 +56,15 @@ async fn main() -> BenchResult<()> {
             .map_or_else(|| "disabled".to_owned(), |bytes| format!("{bytes} bytes"))
     );
 
-    let source = root.join("source.bin");
-    workloads::prepare_source(&source, config.bytes, config.block_bytes)?;
-    let source_digest = workloads::hash_native(&source, config.block_bytes)?;
     let mut report = Report::new(config.clone(), provenance);
-    workloads::run(&config, &root, &source, source_digest, &mut report).await?;
+    if config.selection == config::Selection::EvolvingKv {
+        workloads::evolving_kv::run(&config, &root, &mut report).await?;
+    } else {
+        let source = root.join("source.bin");
+        workloads::prepare_source(&source, config.bytes, config.block_bytes)?;
+        let source_digest = workloads::hash_native(&source, config.block_bytes)?;
+        workloads::run(&config, &root, &source, source_digest, &mut report).await?;
+    }
 
     report.print_table();
     let encoded = report.encode_evidence()?;

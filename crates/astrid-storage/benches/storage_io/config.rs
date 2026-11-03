@@ -16,8 +16,18 @@ const DEFAULT_SMALL_FILE_BYTES: usize = 4096;
 const DEFAULT_CONCURRENT_PRINCIPALS: usize = 4;
 const DEFAULT_BULK_FILES: usize = 100;
 
+/// Existing workloads remain the default; the new probe is explicitly selected.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum Selection {
+    #[default]
+    Existing,
+    EvolvingKv,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct Config {
+    pub(super) selection: Selection,
     pub(super) bytes: u64,
     pub(super) block_bytes: usize,
     pub(super) range_bytes: usize,
@@ -34,7 +44,12 @@ pub(super) struct Config {
 
 impl Config {
     pub(super) fn from_args() -> BenchResult<Self> {
+        Self::from_arguments(env::args().skip(1))
+    }
+
+    pub(super) fn from_arguments(arguments: impl Iterator<Item = String>) -> BenchResult<Self> {
         let mut config = Self {
+            selection: Selection::Existing,
             bytes: DEFAULT_BYTES,
             block_bytes: DEFAULT_BLOCK_BYTES,
             range_bytes: DEFAULT_RANGE_BYTES,
@@ -48,11 +63,18 @@ impl Config {
             root: None,
             output: None,
         };
-        let mut arguments = env::args().skip(1);
+        let mut arguments = arguments;
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 // Cargo supplies this marker to custom benchmark executables.
                 "--bench" => {},
+                "--only" => {
+                    let value = arguments.next().ok_or("--only requires a workload")?;
+                    config.selection = match value.as_str() {
+                        "evolving-kv" => Selection::EvolvingKv,
+                        _ => return Err(format!("unsupported --only workload {value:?}").into()),
+                    };
+                },
                 "--bytes" => config.bytes = parse_u64(&mut arguments, "--bytes")?,
                 "--block-bytes" => {
                     config.block_bytes = parse_usize(&mut arguments, "--block-bytes")?;
@@ -90,27 +112,32 @@ impl Config {
                 unknown => return Err(format!("unknown argument {unknown:?}; use --help").into()),
             }
         }
-        if config.bytes == 0 {
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> BenchResult<()> {
+        if self.bytes == 0 {
             return Err("--bytes must be greater than zero".into());
         }
-        if config.object_cache_bytes == Some(0) {
+        if self.object_cache_bytes == Some(0) {
             return Err("--object-cache-bytes must be greater than zero".into());
         }
         for (name, value) in [
-            ("--block-bytes", config.block_bytes),
-            ("--range-bytes", config.range_bytes),
-            ("--samples", config.samples),
-            ("--small-files", config.small_files),
-            ("--small-file-bytes", config.small_file_bytes),
-            ("--concurrent-principals", config.concurrent_principals),
-            ("--bulk-workers", config.bulk_workers),
-            ("--bulk-files", config.bulk_files),
+            ("--block-bytes", self.block_bytes),
+            ("--range-bytes", self.range_bytes),
+            ("--samples", self.samples),
+            ("--small-files", self.small_files),
+            ("--small-file-bytes", self.small_file_bytes),
+            ("--concurrent-principals", self.concurrent_principals),
+            ("--bulk-workers", self.bulk_workers),
+            ("--bulk-files", self.bulk_files),
         ] {
             if NonZeroUsize::new(value).is_none() {
                 return Err(format!("{name} must be greater than zero").into());
             }
         }
-        Ok(config)
+        Ok(())
     }
 }
 
@@ -148,6 +175,7 @@ fn print_help() {
         "Usage: cargo bench -p astrid-storage --bench storage_io -- [options]\n\
          \n\
          Options:\n\
+           --only evolving-kv    only evolving 512 KiB/8 MiB KV probe; skip source/bulk I/O\n\
            --bytes N             large-file corpus bytes (default {DEFAULT_BYTES})\n\
            --block-bytes N       native copy buffer bytes (default {DEFAULT_BLOCK_BYTES})\n\
            --range-bytes N       published range-read bytes (default {DEFAULT_RANGE_BYTES})\n\

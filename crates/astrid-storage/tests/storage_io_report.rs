@@ -20,6 +20,7 @@ type BenchResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 fn config() -> Config {
     Config {
+        selection: config::Selection::Existing,
         bytes: 1,
         block_bytes: 1,
         range_bytes: 1,
@@ -123,4 +124,23 @@ fn evidence_envelope_binds_the_complete_payload() {
         envelope["payload"]
     );
     assert_eq!(envelope["payload"]["provenance"]["git_revision"], revision);
+}
+
+#[test]
+fn evolving_kv_selection_is_explicit_and_unknown_modes_fail_closed() {
+    let existing = Config::from_arguments(std::iter::empty()).expect("defaults parse");
+    assert_eq!(existing.selection, config::Selection::Existing);
+    let selected = Config::from_arguments(
+        ["--only", "evolving-kv", "--samples", "2"]
+            .into_iter()
+            .map(str::to_owned),
+    )
+    .expect("probe selection parses");
+    assert_eq!(selected.selection, config::Selection::EvolvingKv);
+    assert_eq!(selected.samples, 2);
+    assert!(Config::from_arguments(["--only"].into_iter().map(str::to_owned)).is_err());
+    assert!(
+        Config::from_arguments(["--only", "all-but-unknown"].into_iter().map(str::to_owned))
+            .is_err()
+    );
 }

@@ -25,6 +25,9 @@ use crate::BenchResult;
 #[path = "workloads/bulk.rs"]
 mod bulk;
 
+#[path = "workloads/evolving_kv.rs"]
+pub(super) mod evolving_kv;
+
 use bulk::benchmark_bulk_ingest;
 
 pub(super) async fn run(
