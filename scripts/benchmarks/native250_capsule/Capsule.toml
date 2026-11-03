@@ -1,0 +1,19 @@
+[package]
+name = "codewall-e2e-driver"
+version = "0.0.0"
+description = "Isolated known-content KV lifecycle diagnostic"
+astrid-version = ">=2026.9.0, <2027.0.0"
+[[component]]
+id = "codewall-e2e-driver"
+file = "codewall_e2e_driver.wasm"
+type = "executable"
+[capabilities]
+[publish]
+"cli.v1.command.result.*" = { wit = "opaque" }
+[subscribe]
+"cli.v1.command.run.codewall-e2e-driver" = { wit = "opaque" }
+"codewall.v1.policy.activation.response" = { wit = "opaque" }
+[[command]]
+name = "codewall-fixture"
+kind = "cli"
+description = "Known-content diagnostic"
