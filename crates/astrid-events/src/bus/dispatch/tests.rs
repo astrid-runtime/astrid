@@ -318,3 +318,79 @@ async fn peer_principal_or_system_is_not_a_candidate_for_foreign_publish() {
     assert_eq!(alice.try_drain(MAX_SUBSCRIPTION_BUDGET_BYTES).len(), 1);
     assert!(bob.try_drain(MAX_SUBSCRIPTION_BUDGET_BYTES).is_empty());
 }
+
+#[test]
+fn route_count_tracks_membership_without_scanning_principals() {
+    let bus = EventBus::new();
+    assert_eq!(bus.routed_subscription_count(), 0);
+    let mut held = Vec::new();
+    for ordinal in 0..128 {
+        held.push(bus.subscribe_topic_routed_scoped(
+            Uuid::new_v4(),
+            "scale.*",
+            "fixture",
+            "test",
+            Some(Some(format!("p-{ordinal}"))),
+        ));
+    }
+    held.push(bus.subscribe_topic_routed(Uuid::new_v4(), "scale.*", "all", "test"));
+    held.push(bus.subscribe_topic_routed_principal_or_system(
+        Uuid::new_v4(),
+        "scale.*",
+        "runtime",
+        "test",
+        "alice",
+    ));
+    assert_eq!(bus.routed_subscription_count(), 130);
+    assert_eq!(bus.routes.read().iter_all().count(), 130);
+    held.truncate(10);
+    assert_eq!(bus.routed_subscription_count(), 10);
+    assert_eq!(bus.routes.read().iter_all().count(), 10);
+}
+
+#[test]
+fn publish_selection_microbench_n1_and_10k_foreign() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    fn measure(label: &str, foreign: usize, iters: u32) {
+        let bus = EventBus::new();
+        let mut held = Vec::with_capacity(foreign.saturating_add(2));
+        for ordinal in 0..foreign {
+            held.push(bus.subscribe_topic_routed_scoped(
+                Uuid::new_v4(),
+                "scale.*",
+                "fixture",
+                "test",
+                Some(Some(format!("foreign-{ordinal}"))),
+            ));
+        }
+        let mut own = bus.subscribe_topic_routed_scoped(
+            Uuid::new_v4(),
+            "scale.*",
+            "own",
+            "test",
+            Some(Some("alice".into())),
+        );
+        let event = (*event()).clone();
+        // Warmup
+        for _ in 0..32 {
+            bus.publish(black_box(event.clone()));
+            let _ = black_box(own.try_drain(MAX_SUBSCRIPTION_BUDGET_BYTES));
+        }
+        let start = Instant::now();
+        for _ in 0..iters {
+            bus.publish(black_box(event.clone()));
+            let _ = black_box(own.try_drain(MAX_SUBSCRIPTION_BUDGET_BYTES));
+        }
+        let elapsed = start.elapsed();
+        let per = elapsed / iters;
+        println!(
+            "publish_selection_microbench[{label}]: foreign={foreign} iters={iters} total={elapsed:?} per_publish={per:?}"
+        );
+        drop(held);
+    }
+
+    measure("n1", 0, 2_000);
+    measure("n10000_foreign", 10_000, 200);
+}

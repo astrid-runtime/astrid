@@ -16,24 +16,24 @@ impl EventBus {
     }
 
     fn matching_routes(&self, event: &AstridEvent, principal: &PrincipalKey) -> Vec<RouteHandle> {
-        // Candidate membership comes from the scope-partitioned table. Foreign
-        // scopes are not visited or locked. `accepts_event` remains the authz
-        // fence for gate / receipt / request-owner restrictions, and topic
-        // match stays exact. Release the table lock before enqueue so a slow
-        // receiver cannot prevent a concurrent subscription or sibling
-        // publisher from making progress.
-        let candidates = self.routes.read().candidates_for(principal);
-        candidates
-            .into_iter()
-            .filter_map(|entry| {
-                #[cfg(test)]
-                self.selection_visits
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let route = entry.lock();
-                (route.accepts_event(principal, event) && route.matcher.matches(event))
-                    .then(|| Arc::clone(&entry))
-            })
-            .collect()
+        // Hold the table read guard while borrowing candidate buckets.
+        // Foreign scopes are not visited. Clone a handle only after
+        // accepts_event + topic match succeed, preserving the #2203 rule that
+        // temporary ownership scales with admitted recipients. Release the
+        // table lock before enqueue so a slow receiver cannot stall subscribe.
+        let table = self.routes.read();
+        let mut matched = Vec::new();
+        for entry in table.candidates(principal) {
+            #[cfg(test)]
+            self.selection_visits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let route = entry.lock();
+            if route.accepts_event(principal, event) && route.matcher.matches(event) {
+                matched.push(Arc::clone(entry));
+            }
+        }
+        drop(table);
+        matched
     }
 
     fn enqueue_routes(

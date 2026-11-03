@@ -58,15 +58,15 @@ pub(crate) mod receiver;
 mod state;
 mod table;
 
-pub(crate) use entry::RouteEntry;
 pub use entry::{
     DRR_QUANTUM_MIN_BYTES, MAX_SUBSCRIPTION_BUDGET_BYTES, METRIC_ROUTE_BYTE_EVICTIONS_TOTAL,
     METRIC_ROUTE_QUANTUM_STARVED_TOTAL, PrincipalKey, RouteKey,
 };
+pub(crate) use entry::{RouteAdmission, RouteEntry};
 pub use gate::{RouteAdmissionGate, RouteCommitGuard};
 pub use matcher::{TopicMatcher, ipc_size_of, principal_class_label, topic_pattern_matches};
 pub use receiver::{
     METRIC_ROUTE_ACTIVE_PRINCIPALS, METRIC_ROUTE_BUDGET_BYTES_IN_USE, RoutedEventReceiver,
 };
 pub(crate) use state::SubscriptionRepAllocator;
-pub(crate) use table::{RouteHandle, RouteSelectionScope, RouteTable};
+pub(crate) use table::{RouteHandle, RouteTable};

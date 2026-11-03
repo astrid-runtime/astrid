@@ -83,10 +83,17 @@ pub struct RouteKey {
 /// principal; `Some(s)` = user/agent principal string.
 pub type PrincipalKey = Option<String>;
 
-#[derive(Debug)]
-enum RouteAdmission {
+/// Immutable admission scope for a routed subscription.
+///
+/// This is the authoritative typed scope used both for authz
+/// ([`RouteEntry::accepts`]) and for partition membership in the route table.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum RouteAdmission {
+    /// Unscoped firehose.
     All,
+    /// Exact publisher principal, including `Exact(None)` for system-only.
     Exact(PrincipalKey),
+    /// Persistent principal runtime that also admits kernel/system publishes.
     PrincipalOrSystem(String),
 }
 
@@ -225,16 +232,8 @@ impl RouteEntry {
     /// Scope partition used by the authoritative route table for candidate
     /// selection. Index membership is not authorization; [`accepts_event`]
     /// remains the fence.
-    pub(crate) fn selection_scope(&self) -> crate::route::RouteSelectionScope {
-        match &self.scope {
-            RouteAdmission::All => crate::route::RouteSelectionScope::All,
-            RouteAdmission::Exact(expected) => {
-                crate::route::RouteSelectionScope::Exact(expected.clone())
-            },
-            RouteAdmission::PrincipalOrSystem(expected) => {
-                crate::route::RouteSelectionScope::PrincipalOrSystem(expected.clone())
-            },
-        }
+    pub(crate) fn selection_scope(&self) -> RouteAdmission {
+        self.scope.clone()
     }
 
     /// Whether an event published by `publisher` is admitted into this

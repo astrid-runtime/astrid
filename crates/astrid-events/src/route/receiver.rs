@@ -9,7 +9,7 @@ use tokio::sync::Notify;
 
 use crate::event::AstridEvent;
 use crate::route::entry::{RouteEntry, RouteKey};
-use crate::route::{RouteSelectionScope, RouteTable};
+use crate::route::{RouteAdmission, RouteTable};
 
 /// Gauge: number of active principal sub-queues currently held by a
 /// route. Labelled by `capsule`.
@@ -24,7 +24,7 @@ pub struct RoutedEventReceiver {
     pub(crate) route_key: RouteKey,
     pub(crate) route_entry: Arc<Mutex<RouteEntry>>,
     pub(crate) notify: Arc<Notify>,
-    pub(crate) selection_scope: RouteSelectionScope,
+    pub(crate) selection_scope: RouteAdmission,
     pub(crate) routes: Arc<RwLock<RouteTable>>,
     pub(crate) lagged_count: u64,
     pub(crate) subscriber: &'static str,
