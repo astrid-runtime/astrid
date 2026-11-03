@@ -53,10 +53,13 @@ jobs:
 
       - name: Capture storage evidence
         shell: bash
+        env:
+          BENCH_BYTES: ${{ inputs.bytes }}
+          BENCH_SAMPLES: ${{ inputs.samples }}
         run: |
           cargo bench -p astrid-storage --bench storage_io -- \
-            --bytes '${{ inputs.bytes }}' \
-            --samples '${{ inputs.samples }}' \
+            --bytes "$BENCH_BYTES" \
+            --samples "$BENCH_SAMPLES" \
             --small-files 32 \
             --concurrent-principals 4 \
             --bulk-workers 4 \
@@ -112,6 +115,8 @@ jobs:
           persist-credentials: false
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
       - name: Collect matched unlogged evidence
         env:
           BASELINE: ${{ inputs.packing_baseline }}

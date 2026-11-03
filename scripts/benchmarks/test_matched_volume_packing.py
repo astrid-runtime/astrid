@@ -3,8 +3,9 @@
 import importlib.util
 from pathlib import Path
 import tempfile
+import subprocess
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 SPEC = importlib.util.spec_from_file_location(
@@ -54,6 +55,85 @@ class RefusalTests(unittest.TestCase):
                     MODULE.main()
                 build.assert_not_called()
                 self.assertFalse(output.exists())
+
+    def test_corrupted_copy_refuses_before_cargo(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / MODULE.INJECTION).parent.mkdir(parents=True)
+
+            def corrupt_copy(_source, target):
+                target.write_bytes(b"wrong probe")
+
+            with patch.object(MODULE, "clean_checkout"), \
+                    patch.object(MODULE.shutil, "copyfile", side_effect=corrupt_copy), \
+                    patch.object(MODULE.subprocess, "Popen") as cargo:
+                with self.assertRaisesRegex(RuntimeError, "changed during copy"):
+                    MODULE.build(root, HEAD, root / "unused", root, "main", float("inf"))
+                cargo.assert_not_called()
+
+    def test_timeout_and_postsample_hold_preserve_fixture_and_output(self):
+        for timed_out in [False, True]:
+            with self.subTest(timed_out=timed_out), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                fixture = root / "fixture"
+                fixture.mkdir()
+                sample = {"count": 32768, "regions": 7, "phase": "timed"}
+                response = subprocess.CompletedProcess([], 0, b"complete=true\n", b"")
+                timeout = subprocess.TimeoutExpired("fake", 180, output=b"partial", stderr=b"late")
+                with patch.object(MODULE.subprocess, "run", return_value=response,
+                                  side_effect=timeout if timed_out else None), \
+                        patch.object(MODULE, "quiet_snapshot", return_value={"quiet": timed_out}):
+                    with self.assertRaises(RuntimeError):
+                        MODULE.run_sample("fake", fixture, root, 0, sample)
+                self.assertTrue(sample["child_reaped"])
+                self.assertTrue(sample["fixture_preserved"])
+                self.assertTrue(fixture.exists())
+                self.assertEqual(sample["timed_out"], timed_out)
+                self.assertIn("quiet_after", sample)
+                self.assertEqual(sample["stdout_sha256"], MODULE.sha(root / "sample-00.stdout"))
+                self.assertEqual((root / "sample-00.stdout").read_bytes(),
+                                 b"partial" if timed_out else b"complete=true\n")
+
+    def test_success_reaps_fixture_only_after_quiet_validity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = root / "fixture"
+            fixture.mkdir()
+            sample = {"count": 32768, "regions": 7, "phase": "timed"}
+            response = subprocess.CompletedProcess([], 0, b"complete=true\n", b"")
+            with patch.object(MODULE.subprocess, "run", return_value=response), \
+                    patch.object(MODULE, "quiet_snapshot", return_value={"quiet": True}):
+                MODULE.run_sample("fake", fixture, root, 0, sample)
+            self.assertTrue(sample["fixture_reaped"])
+            self.assertFalse(sample["fixture_preserved"])
+            self.assertFalse(fixture.exists())
+
+    def test_build_deadline_refuses_before_cargo(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / MODULE.INJECTION).parent.mkdir(parents=True)
+            probe = Path(__file__).with_name("volume_packing_probe.rs")
+            with patch.object(MODULE, "clean_checkout"), \
+                    patch.object(MODULE.subprocess, "Popen") as cargo:
+                with self.assertRaisesRegex(RuntimeError, "budget exhausted"):
+                    MODULE.build(root, HEAD, probe, root, "main", 0)
+                cargo.assert_not_called()
+
+    def test_build_timeout_reaps_only_its_new_process_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / MODULE.INJECTION).parent.mkdir(parents=True)
+            probe = Path(__file__).with_name("volume_packing_probe.rs")
+            process = MagicMock(pid=123456)
+            process.wait.side_effect = [subprocess.TimeoutExpired("fake-cargo", 900), 0]
+            with patch.object(MODULE, "clean_checkout"), \
+                    patch.object(MODULE.subprocess, "Popen", return_value=process) as cargo, \
+                    patch.object(MODULE.os, "killpg") as kill:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    MODULE.build(root, HEAD, probe, root, "main", float("inf"))
+                self.assertTrue(cargo.call_args.kwargs["start_new_session"])
+                kill.assert_called_once_with(123456, MODULE.signal.SIGKILL)
+                self.assertEqual(process.wait.call_count, 2)
 
 
 if __name__ == "__main__":
