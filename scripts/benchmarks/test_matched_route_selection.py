@@ -22,7 +22,7 @@ def sha(path):
 
 def report(build, foreign=0, arm="main"):
     return (f"route_selection_bench label={arm} foreign={foreign} iters=2000 warmups=2 "
-            f"total_ns=200001 per_publish_ns=100 exe={build['binary']}\n").encode()
+            f"scope=validated_publish_drain_iteration_v2 total_ns=200001 per_iteration_ns=100 exe={build['binary']}\n").encode()
 
 
 class RouteTests(unittest.TestCase):
@@ -36,7 +36,8 @@ class RouteTests(unittest.TestCase):
                             raw.replace(b"warmups=2", b"warmups=0"), raw.replace(b"main-route", b"other"),
                             raw.replace(b"label=main", b"label=candidate"),
                             raw.replace(b"total_ns=200001", b"total_ns=0"),
-                            raw.replace(b"per_publish_ns=100", b"per_publish_ns=99"),
+                            raw.replace(b"per_iteration_ns=100", b"per_iteration_ns=99"),
+                            raw.replace(b"scope=validated_publish_drain_iteration_v2 ", b""),
                             raw.replace(f"foreign={foreign}".encode(), b"foreign=2")):
                 with self.subTest(raw=invalid), self.assertRaises(RuntimeError):
                     MODE.validate_report(invalid, build, sample)
@@ -176,6 +177,31 @@ class RouteTests(unittest.TestCase):
             self.assertTrue((public / "sample-00.stderr").is_file())
             self.assertEqual((public / "sample-00.stdout").read_text(), "route assertion partial report")
             self.assertFalse(any((public / name).exists() for name in ("home", "volume", "cargo-target")))
+
+    def test_timed_iteration_has_no_caller_clone_and_keeps_natural_delivery_lifecycle(self):
+        source = (Path(__file__).resolve().parents[2] / MODE.SOURCE).read_text()
+        measure = source.split("fn measure(", 1)[1].split("fn main()", 1)[0]
+        timed = measure.split("let start = Instant::now();", 1)[1].split("let total = start.elapsed();", 1)[0]
+        self.assertNotIn(".clone()", timed)
+        self.assertIn("assert_own_delivery", timed)
+        self.assertIn("black_box(drained)", timed)
+        before = measure.split("let start = Instant::now();", 1)[0]
+        self.assertIn(".map(|_| event.clone())", before)
+        self.assertIn(".into_iter()", before)
+        self.assertIn("per_iteration_ns", source)
+        self.assertIn("scope=validated_publish_drain_iteration_v2", source)
+        self.assertIn("assertions", MODE.DEFINITION["metric_scope"])
+        self.assertIn("drops", MODE.DEFINITION["metric_scope"])
+
+    def test_only_matched_jobs_pin_native_macos15_environment(self):
+        workflow = (Path(PACK.__file__).resolve().parents[2] / ".github/workflows/storage-benchmark.yml").read_text()
+        for job in ("matched-packing", "matched-native250"):
+            body = workflow.split(f"  {job}:", 1)[1].split("\n  matched-", 1)[0]
+            self.assertIn("runs-on: macos-15\n", body)
+            self.assertNotIn("runs-on: macos-latest", body)
+        generic = workflow.split("  matched-packing:", 1)[0]
+        self.assertIn("os: macos-latest", generic)
+        self.assertIn("native macOS arm64 required", Path(PACK.__file__).read_text())
 
     def test_existing_entrypoint_and_workflow_select_route_without_new_architecture(self):
         runner = Path(PACK.__file__)

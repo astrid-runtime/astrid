@@ -7,7 +7,7 @@ import time
 
 SOURCE = "crates/astrid-events/examples/route_selection_bench.rs"
 # Reviewed source is frozen independently from either producer implementation.
-HARNESS_SHA = "0c2fce192fea66240ffab61bd8c982d28e0efd7fad893f0a1ee6fdb4b3cfb9ee"
+HARNESS_SHA = "233b52de9b68f1e7cb914ee8bffd5adb3d16f194e9e3cd92d07273a5bc37d9d4"
 TARGET = {"name": "route_selection_bench", "source": SOURCE, "kind": "example",
           "cargo": ["build", "--release", "--example", "route_selection_bench", "-p", "astrid-events", "--locked", "-j", "1"],
           "frozen": "route-selection"}
@@ -17,14 +17,14 @@ TIMED_ABBA_CYCLES = 8
 DEFINITION = {
     "mode": "route-selection",
     "method": "per foreign count (0, 10000): 2 total warmup invocations (1 per arm), then 8 ABBA cycles = 32 total timed invocations (16 per arm)",
-    "metric_scope": "unlogged public EventBus publish plus own-route try_drain; not daemon startup or end-to-end IPC",
+    "metric_scope": "unlogged validated iteration: owned-event publish, own-route try_drain, event identity-field assertions, loop overhead and natural per-iteration drops; caller cloning and iterator preparation excluded; no overhead subtraction; not daemon startup or end-to-end IPC",
     "workload_definition": {"foreign_subscriptions": [0, 10000], "own_subscriptions": 1,
                             "iterations_per_invocation": 2000, "in_process_warmup_publishes_per_invocation": 2,
                             "warmup_invocations_per_arm_per_case": 1,
                             "timed_invocations_per_arm_per_case": 16,
                             "n1_means": "foreign0 plus one own scoped subscriber",
                             "delivery": "exact own event id/topic/principal checked on each publish; foreign queues held",
-                            "harness_source_head": "17221202c5101c973167503ce84219bbd488a23b",
+                            "harness_source": "this exact protocol checkout head/tree in outer receipt; frozen SHA below",
                             "harness_source_sha256": HARNESS_SHA,
                             "provenance": "external frozen-artifact receipt; stdout exe path must equal selected binary",
                             "nonclaims": "microbenchmark only; no automatic speed verdict"},
@@ -48,7 +48,8 @@ def source_manifest(protocol, hooks):
 def validate_report(raw, build, sample):
     text = raw.decode("utf-8", errors="strict")
     pattern = (r"route_selection_bench label=(main|candidate) foreign=(0|10000) "
-               r"iters=2000 warmups=2 total_ns=([0-9]+) per_publish_ns=([0-9]+) exe=(.+)\n?")
+               r"iters=2000 warmups=2 scope=validated_publish_drain_iteration_v2 "
+               r"total_ns=([0-9]+) per_iteration_ns=([0-9]+) exe=(.+)\n?")
     match = re.fullmatch(pattern, text)
     require(match is not None, "missing/malformed route-selection report")
     arm, foreign, total, per, executable = match.groups()
@@ -58,7 +59,7 @@ def validate_report(raw, build, sample):
     require(0 < total < 2**64 * 1_000_000_000 and per == total // 2000,
             "route duration arithmetic mismatch")
     return {"foreign": int(foreign), "iterations": 2000, "warmups": 2,
-            "total_ns": total, "per_publish_ns": per,
+            "total_ns": total, "per_iteration_ns": per, "scope": "validated_publish_drain_iteration_v2",
             "producer_head": build["head"], "binary_sha256": build["binary_sha256"]}
 
 

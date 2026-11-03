@@ -89,7 +89,7 @@ jobs:
   matched-packing:
     if: inputs.packing_baseline != '' || inputs.packing_candidate != '' || inputs.matched_mode != 'packing'
     name: Same-host macOS arm64 matched workload evidence
-    runs-on: macos-latest
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - name: Harden runner
@@ -154,7 +154,7 @@ jobs:
   matched-native250:
     if: inputs.native250_baseline != '' || inputs.native250_candidate != ''
     name: Same-host macOS arm64 native250 evidence
-    runs-on: macos-latest
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - name: Harden runner

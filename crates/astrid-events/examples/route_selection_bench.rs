@@ -1,7 +1,9 @@
 //! Matched public EventBus route-selection microbench.
 //!
-//! Measures `EventBus::publish` + own-route `try_drain` with N foreign exact
-//! scoped subscriptions sharing the same wildcard topic. No allocation
+//! Measures a validated iteration: owned-event publish, own-route drain,
+//! identity-field assertions, loop overhead and natural per-iteration drops.
+//! Caller event cloning is prepared before timing. N foreign exact scoped
+//! subscriptions share the same wildcard topic. No allocation
 //! logging. Intended for standalone release binaries compared across source
 //! revisions (ABBA), not as an ordinary unit-test workload.
 //!
@@ -130,9 +132,14 @@ fn measure(foreign: usize, iters: u32, warmups: u32) -> (Duration, Duration) {
         assert_own_delivery(&event, &drained);
         let _ = black_box(drained);
     }
+    // Prebuild caller-owned events so allocation/string cloning is not charged
+    // to routing. Construct the iterator before timing; its backing allocation
+    // is released after timing, while drained batches keep their natural drops.
+    let prepared: Vec<_> = (0..iters).map(|_| event.clone()).collect();
+    let mut events = prepared.into_iter();
     let start = Instant::now();
-    for _ in 0..iters {
-        bus.publish(black_box(event.clone()));
+    for owned_event in events.by_ref() {
+        bus.publish(black_box(owned_event));
         let drained = own.try_drain(MAX_SUBSCRIPTION_BUDGET_BYTES);
         assert_own_delivery(&event, &drained);
         let _ = black_box(drained);
@@ -160,7 +167,7 @@ fn main() -> ExitCode {
     // Product-source head is recorded in the external frozen-artifact receipt,
     // not inferred from whatever checkout happens to invoke this binary.
     println!(
-        "route_selection_bench label={label} foreign={foreign} iters={iters} warmups={warmups} total_ns={} per_publish_ns={} exe={exe}",
+        "route_selection_bench label={label} foreign={foreign} iters={iters} warmups={warmups} scope=validated_publish_drain_iteration_v2 total_ns={} per_iteration_ns={} exe={exe}",
         total.as_nanos(),
         per.as_nanos()
     );
