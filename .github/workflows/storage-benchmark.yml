@@ -188,12 +188,14 @@ jobs:
           subprocess.run(argv, check=True)
           PYDIAG
       - name: Preserve standalone CPU attribution diagnostic
+        continue-on-error: true
         if: always() && runner.environment == 'github-hosted' && inputs.matched_mode == 'evolving-kv'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: matched-packing-cpu-attribution-${{ github.sha }}
           path: |
             astrid-benchmark.noindex/diagnostic/hosted_cpu_attribution.py
+            astrid-benchmark.noindex/packing-evidence/receipt.json
             astrid-benchmark.noindex/cpu-attribution/receipt.json
             astrid-benchmark.noindex/cpu-attribution/baseline.stdout
             astrid-benchmark.noindex/cpu-attribution/baseline.stderr

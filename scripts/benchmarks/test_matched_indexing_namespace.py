@@ -99,6 +99,17 @@ class NamespaceTests(unittest.TestCase):
                 self.assertEqual((root / "diagnostic/hosted_cpu_attribution.py").read_bytes(),
                                  Path(__file__).with_name("hosted_cpu_attribution.py").read_bytes())
 
+    def test_cpu_artifact_independently_preserves_baseline_build_binding(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/storage-benchmark.yml").read_text()
+        block = workflow.split("- name: Preserve standalone CPU attribution diagnostic", 1)[1].split("  matched-native250:", 1)[0]
+        self.assertIn("if: always() && runner.environment == 'github-hosted' && inputs.matched_mode == 'evolving-kv'", block)
+        self.assertIn("continue-on-error: true", block)
+        paths = block.split("path: |", 1)[1].split("if-no-files-found:", 1)[0].split()
+        self.assertIn("astrid-benchmark.noindex/packing-evidence/receipt.json", paths)
+        self.assertIn("astrid-benchmark.noindex/diagnostic/hosted_cpu_attribution.py", paths)
+        self.assertIn("astrid-benchmark.noindex/cpu-attribution/receipt.json", paths)
+        self.assertFalse(any("fixture" in path for path in paths))
+
     def test_namespace_is_existing_owned_ancestor_not_a_git_marker(self):
         with tempfile.TemporaryDirectory() as raw:
             workspace = Path(raw).resolve()
