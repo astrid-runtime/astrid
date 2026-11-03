@@ -33,13 +33,21 @@ def _artifact(name: str, path: Path, *, opt_level: str = "3", test: bool = False
 
 
 class Native250SyntheticTests(unittest.TestCase):
+    def setUp(self):
+        prepare = patch.object(MODULE.packing.source_build, "prepare", return_value={})
+        verify = patch.object(MODULE.packing.source_build, "verify_artifact")
+        prepare.start()
+        verify.start()
+        self.addCleanup(prepare.stop)
+        self.addCleanup(verify.stop)
+
     def test_first_build_can_check_disk_before_target_exists(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             checkout = root / "checkout"
             checkout.mkdir()
             (checkout / "Cargo.lock").write_text("fixture")
-            target = root / "cargo-target" / "main"
+            target = root / "cargo-target"
             process = MagicMock()
             process.wait.return_value = 0
             with patch.object(MODULE.packing, "clean_checkout"), \

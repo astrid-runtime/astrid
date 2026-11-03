@@ -109,10 +109,13 @@ def build(path, head, protocol, manifest, output, arm, deadline, hooks):
     log = output / f"{arm}-build.jsonl"
     budget = min(900, deadline - time.monotonic())
     require(budget > 0, "run budget exhausted before build")
-    with log.open("w") as stream:
+    build_deadline = time.monotonic() + budget
+    preparation = hooks["source_build"].prepare(
+        path, output / "cargo-target", log, env, build_deadline)
+    with log.open("a") as stream:
         process = subprocess.Popen(command, cwd=path, env=env, stdout=stream,
                                    stderr=subprocess.STDOUT, start_new_session=True)
-        code = wait_build(process, budget)
+        code = wait_build(process, max(0, build_deadline - time.monotonic()))
     require(code == 0, f"{arm} evolving-KV build failed: {code}")
     require(verify_overlay(path, head, manifest, hooks) == dirty,
             "producer overlay status changed during build")
@@ -124,12 +127,14 @@ def build(path, head, protocol, manifest, output, arm, deadline, hooks):
             continue
         if event.get("reason") != "compiler-artifact":
             continue
+        hooks["source_build"].verify_artifact(event, path, preparation)
         for filename in event["filenames"]:
             file = Path(filename)
             if file.is_file():
                 artifacts.append({"path": filename, "sha256": hooks["sha"](file),
                                   "package_id": event["package_id"],
-                                  "features": event["features"], "profile": event["profile"]})
+                                  "features": event["features"], "profile": event["profile"],
+                                  "fresh": event.get("fresh")})
         if event["target"]["name"] == "storage_io" and event.get("executable"):
             require(Path(event["target"]["src_path"]).resolve() == path / BENCH_ROOT / "storage_io.rs",
                     "Cargo benchmark source is not the selected producer overlay")
@@ -145,7 +150,7 @@ def build(path, head, protocol, manifest, output, arm, deadline, hooks):
             "binary_bytes": binary.stat().st_size, "artifacts": artifacts,
             "source_overlay": manifest, "overlay_porcelain": dirty,
             "cargo_command": command, "cargo_target": env["CARGO_TARGET_DIR"],
-            "build_log_sha256": hooks["sha"](log)}
+            "source_build": preparation, "build_log_sha256": hooks["sha"](log)}
 
 
 def unique_object(pairs):

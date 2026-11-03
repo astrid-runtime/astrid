@@ -224,7 +224,10 @@ class BuildTests(unittest.TestCase):
                     kwargs["stdout"].write(json.dumps(event) + "\n")
                     return Mock(wait=Mock(return_value=0))
                 sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
-                hooks = {"sha": sha, "command": Mock(side_effect=["tree", "rustc-1.95"])}
+                preparation = {"workspace_packages": []}
+                source_build = SimpleNamespace(prepare=Mock(return_value=preparation), verify_artifact=Mock())
+                hooks = {"sha": sha, "command": Mock(side_effect=["tree", "rustc-1.95"]),
+                         "source_build": source_build}
                 with patch.object(MODE, "prepare_overlay", return_value=[]), \
                         patch.object(MODE, "verify_overlay", return_value=[]), \
                         patch.object(MODE.subprocess, "Popen", side_effect=start) as launch, \
@@ -234,6 +237,10 @@ class BuildTests(unittest.TestCase):
                             MODE.build(producer, HEAD, root, {}, output, "main", MODE.time.monotonic() + 10000, hooks)
                         continue
                     receipt = MODE.build(producer, HEAD, root, {}, output, "main", MODE.time.monotonic() + 10000, hooks)
+                self.assertIs(receipt["source_build"], preparation)
+                self.assertEqual(source_build.prepare.call_args.args[:3],
+                                 (producer, output / "cargo-target", output / "main-build.jsonl"))
+                source_build.verify_artifact.assert_called_once_with(event, producer, preparation)
                 command = launch.call_args.args[0]
                 self.assertEqual(command[:4], ["cargo", "bench", "--no-run", "--locked"])
                 self.assertEqual(command[command.index("--bench") + 1], "storage_io")

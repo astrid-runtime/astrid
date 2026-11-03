@@ -49,6 +49,15 @@ def _artifact(
 
 
 class Native250BuildSyntheticTests(unittest.TestCase):
+    def setUp(self):
+        self.source_preparation = {"workspace_packages": []}
+        prepare = patch.object(MODULE.packing.source_build, "prepare", return_value=self.source_preparation)
+        verify = patch.object(MODULE.packing.source_build, "verify_artifact")
+        self.prepare_source = prepare.start()
+        self.verify_source = verify.start()
+        self.addCleanup(prepare.stop)
+        self.addCleanup(verify.stop)
+
     def test_baseline_seed_client_is_frozen_before_candidate_replaces_shared_libraries(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory).resolve()
@@ -116,6 +125,12 @@ class Native250BuildSyntheticTests(unittest.TestCase):
                 result = MODULE.build_install_set(
                     checkout, HEAD, target, root / "main-cargo.jsonl", float("inf")
                 )
+            preparation_args = self.prepare_source.call_args.args
+            self.assertEqual(preparation_args[:3], (checkout, target, root / "main-cargo.jsonl"))
+            self.assertEqual(preparation_args[3]["CARGO_TARGET_DIR"], str(target))
+            self.assertGreater(preparation_args[4], MODULE.time.monotonic())
+            self.assertIs(result["source_build"], self.source_preparation)
+            self.assertEqual(self.verify_source.call_count, 3)
             command = popen.call_args.args[0]
             self.assertEqual(result["packages"], ["astrid"])
             self.assertIn("-p", command)

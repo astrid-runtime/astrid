@@ -192,7 +192,8 @@ class RefusalTests(unittest.TestCase):
             process.wait.side_effect = [subprocess.TimeoutExpired("fake-cargo", 900), 0]
             with patch.object(MODULE, "clean_checkout"), \
                     patch.object(MODULE.subprocess, "Popen", return_value=process) as cargo, \
-                    patch.object(MODULE.os, "killpg") as kill:
+                    patch.object(MODULE.os, "killpg") as kill, \
+                    patch.object(MODULE.source_build, "prepare", return_value={}):
                 with self.assertRaises(subprocess.TimeoutExpired):
                     MODULE.build(root, HEAD, probe, root, "main", float("inf"))
                 self.assertTrue(cargo.call_args.kwargs["start_new_session"])

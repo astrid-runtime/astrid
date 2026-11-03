@@ -36,6 +36,12 @@ evolving_kv = importlib.util.module_from_spec(EVOLVING_SPEC)
 EVOLVING_SPEC.loader.exec_module(evolving_kv)
 
 
+SOURCE_BUILD_SPEC = importlib.util.spec_from_file_location(
+    "benchmark_source_build", Path(__file__).with_name("source_build.py"))
+source_build = importlib.util.module_from_spec(SOURCE_BUILD_SPEC)
+SOURCE_BUILD_SPEC.loader.exec_module(source_build)
+
+
 def finalize_evidence(output, receipt, save, primary_error=None):
     logs = [output / "main-build.jsonl", output / "candidate-build.jsonl"]
     logs.extend(output.glob("sample-*.stdout"))
@@ -226,14 +232,18 @@ def build(path, head, probe, output, arm, deadline):
     log = output / f"{arm}-build.jsonl"
     budget = min(900, deadline - time.monotonic())
     require(budget > 0, "run budget exhausted before build")
-    with log.open("w") as stream:
+    build_deadline = time.monotonic() + budget
+    env = os.environ.copy()
+    env["CARGO_TARGET_DIR"] = str(output / "cargo-target")
+    preparation = source_build.prepare(path, output / "cargo-target", log, env, build_deadline)
+    with log.open("a") as stream:
         process = subprocess.Popen([
             "cargo", "build", "--release", "--locked", "-j", "1", "-p",
             "astrid-storage", "--features", "legacy-surrealkv", "--example",
             "volume_packing_probe", "--message-format=json",
-        ], cwd=path, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+        ], cwd=path, env=env, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
         try:
-            code = process.wait(timeout=budget)
+            code = process.wait(timeout=max(0, build_deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             # Only the disposable build's new process group; no shared services.
             try:
@@ -253,12 +263,14 @@ def build(path, head, probe, output, arm, deadline):
             continue
         if event.get("reason") != "compiler-artifact":
             continue
+        source_build.verify_artifact(event, path, preparation)
         for filename in event["filenames"]:
             file = Path(filename)
             if file.is_file():
                 artifacts.append({"path": filename, "sha256": sha(file),
                                   "package_id": event["package_id"],
-                                  "features": event["features"], "profile": event["profile"]})
+                                  "features": event["features"], "profile": event["profile"],
+                                  "fresh": event.get("fresh")})
         if event["target"]["name"] == "volume_packing_probe":
             executable = event.get("executable")
     require(executable is not None, "Cargo emitted no probe executable")
@@ -270,7 +282,8 @@ def build(path, head, probe, output, arm, deadline):
             "lock_sha256": sha(path / "Cargo.lock"), "binary": str(binary),
             "binary_sha256": sha(binary), "artifacts": artifacts,
             "injected_source": INJECTION, "injected_sha256": sha(source),
-            "tracked_source_clean": True, "build_log_sha256": sha(log)}
+            "tracked_source_clean": True, "source_build": preparation,
+            "build_log_sha256": sha(log)}
 
 
 def metrics(stdout):
@@ -348,6 +361,7 @@ def main():
     receipt = {"complete": False, "performance_accepted": False, "samples": [],
                "mode": args.mode, "probe_sha256": PROBE_SHA if args.mode == "packing" else None,
                "runner_sha256": sha(Path(__file__)),
+               "source_build_helper_sha256": sha(Path(source_build.__file__)),
                "platform": platform.platform(), "machine": platform.machine(),
                "workflow_sha": os.environ.get("GITHUB_SHA"),
                "workflow_run_id": os.environ.get("GITHUB_RUN_ID"),
@@ -377,7 +391,7 @@ def main():
         save()
         if args.mode == "evolving-kv":
             hooks = {name: globals()[name] for name in (
-                "sha", "command", "clean_checkout", "quiet_snapshot", "settle_after_builds", "abba_schedule")}
+                "sha", "command", "clean_checkout", "quiet_snapshot", "settle_after_builds", "abba_schedule", "source_build")}
             receipt["evolving_helper_sha256"] = sha(Path(evolving_kv.__file__))
             evolving_kv.run(args, protocol, output, receipt, save, deadline, hooks)
             clean_checkout(protocol, protocol_head)

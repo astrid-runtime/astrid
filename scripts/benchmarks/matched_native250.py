@@ -712,6 +712,7 @@ def main() -> None:
         "client_source_sha256": sha(CLIENT_SOURCE),
         "capsule_source_lib_sha256": sha(CAPSULE_SOURCE / "src" / "lib.rs"),
         "packing_helper_sha256": sha(PACKING_PATH),
+        "source_build_helper_sha256": sha(Path(packing.source_build.__file__)),
         "platform": platform.platform(), "machine": platform.machine(),
         "cpu": packing.command(["sysctl", "-n", "machdep.cpu.brand_string"]),
         "ram_bytes": packing.command(["sysctl", "-n", "hw.memsize"]),

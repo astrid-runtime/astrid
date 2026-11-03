@@ -173,7 +173,9 @@ def cargo_build(
     cmd = ["cargo", "build", "--release", "--locked", "--message-format=json"]
     for package in packages:
         cmd.extend(["-p", package])
-    with log.open("w") as stream:
+    build_deadline = time.monotonic() + budget
+    preparation = packing.source_build.prepare(checkout, target_dir, log, env, build_deadline)
+    with log.open("a") as stream:
         process = subprocess.Popen(
             cmd,
             cwd=checkout,
@@ -182,7 +184,7 @@ def cargo_build(
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        code = _wait_owned_group(process, budget)
+        code = _wait_owned_group(process, max(0, build_deadline - time.monotonic()))
         require(code == 0, f"cargo failed in {checkout}: {code}")
     packing.clean_checkout(checkout, head)
     artifacts = []
@@ -194,6 +196,7 @@ def cargo_build(
             continue
         if event.get("reason") != "compiler-artifact":
             continue
+        packing.source_build.verify_artifact(event, checkout, preparation)
         name = event["target"]["name"]
         executable = event.get("executable")
         if executable:
@@ -206,6 +209,7 @@ def cargo_build(
                 "sha256": sha(filenames[0]) if filenames and filenames[0].is_file() else None,
                 "filename_sha256s": _filename_bindings(filenames),
                 "package_id": event.get("package_id"),
+                "fresh": event.get("fresh"),
                 "target": name,
                 "profile": event.get("profile"),
             }
@@ -230,6 +234,7 @@ def cargo_build(
             name: {"path": str(path), "sha256": sha(path)} for name, path in binaries.items()
         },
         "artifacts": artifacts,
+        "source_build": preparation,
         "artifact_inventory_binding": ARTIFACT_INVENTORY_BINDING,
         "build_log_sha256": sha(log),
         "packages": list(packages),
