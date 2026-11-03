@@ -4,7 +4,7 @@
 //! is by [`RouteAdmission`]; [`RouteEntry::accepts_event`] remains the authz
 //! fence after a candidate is chosen.
 
-use std::collections::hash_map::{self, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -90,25 +90,28 @@ impl RouteTable {
         &'a self,
         publisher: &'a PrincipalKey,
     ) -> impl Iterator<Item = &'a RouteHandle> + 'a {
+        // Standard lazy combinators: take(0) never advances foreign PoS
+        // buckets for a concrete publisher; take(len) walks every PoS
+        // bucket for system publishes. No temporary Vec.
         let exact = self
             .exact
             .get(publisher)
-            .map(|bucket| bucket.values())
             .into_iter()
-            .flatten();
-        let principal_or_system = match publisher {
-            Some(principal) => PosIter::One(
-                self.principal_or_system
-                    .get(principal)
-                    .map(|bucket| bucket.values())
-                    .into_iter()
-                    .flatten(),
-            ),
-            None => PosIter::All {
-                outer: self.principal_or_system.values(),
-                inner: None,
-            },
-        };
+            .flat_map(HashMap::values);
+        let principal_or_system = self
+            .principal_or_system
+            .values()
+            .take(if publisher.is_none() {
+                self.principal_or_system.len()
+            } else {
+                0
+            })
+            .chain(
+                publisher
+                    .as_ref()
+                    .and_then(|principal| self.principal_or_system.get(principal)),
+            )
+            .flat_map(HashMap::values);
         exact
             .chain(principal_or_system)
             .chain(self.unscoped.values())
@@ -122,35 +125,5 @@ impl RouteTable {
             .flat_map(HashMap::values)
             .chain(self.principal_or_system.values().flat_map(HashMap::values))
             .chain(self.unscoped.values())
-    }
-}
-
-/// Principal-or-system candidate iterator without allocating a temporary Vec.
-enum PosIter<'a> {
-    One(std::iter::Flatten<std::option::IntoIter<hash_map::Values<'a, RouteKey, RouteHandle>>>),
-    All {
-        outer: hash_map::Values<'a, String, HashMap<RouteKey, RouteHandle>>,
-        inner: Option<hash_map::Values<'a, RouteKey, RouteHandle>>,
-    },
-}
-
-impl<'a> Iterator for PosIter<'a> {
-    type Item = &'a RouteHandle;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::One(iter) => iter.next(),
-            Self::All { outer, inner } => loop {
-                if let Some(item) = inner.as_mut().and_then(Iterator::next) {
-                    return Some(item);
-                }
-                if let Some(bucket) = outer.next() {
-                    *inner = Some(bucket.values());
-                } else {
-                    *inner = None;
-                    return None;
-                }
-            },
-        }
     }
 }

@@ -349,6 +349,7 @@ fn route_count_tracks_membership_without_scanning_principals() {
 }
 
 #[test]
+#[ignore = "timing harness; use examples/route_selection_bench.rs for matched release ABBA"]
 fn publish_selection_microbench_n1_and_10k_foreign() {
     use std::hint::black_box;
     use std::time::Instant;
