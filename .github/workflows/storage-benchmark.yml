@@ -142,12 +142,41 @@ jobs:
             --candidate "$GITHUB_WORKSPACE/astrid-benchmark.noindex/candidate" \
             --baseline-head "$BASELINE" --candidate-head "$CANDIDATE" \
             --output "$GITHUB_WORKSPACE/astrid-benchmark.noindex/packing-evidence"
+      - name: Diagnose host indexing after benchmark failure
+        if: failure() && runner.environment == 'github-hosted'
+        continue-on-error: true
+        shell: bash
+        run: |
+          root="$GITHUB_WORKSPACE/astrid-benchmark.noindex"
+          [[ -d "$root" && ! -L "$root" ]] || exit 0
+          # Standalone diagnostic; not part of the benchmark's content-bound manifest.
+          set -o noclobber
+          {
+            set +e
+            echo 'Read-only post-failure context; not a performance sample'
+            /usr/bin/mdutil -s /
+            echo "mdutil_exit=$?"
+            /bin/ps -axo pid=,ppid=,pcpu=,comm=
+            echo "ps_exit=$?"
+            echo 'sudo -n /usr/bin/fs_usage -t 10 -w -f filesys mdworker_shared mds_stores mds'
+            sudo -n /usr/bin/fs_usage -t 10 -w -f filesys mdworker_shared mds_stores mds
+            echo "fs_usage_exit=$?"
+          } > "$root/host-indexing-diagnostics.log" 2>&1
       - name: Preserve evidence including failed samples
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: matched-packing-${{ github.sha }}
           path: astrid-benchmark.noindex/packing-evidence/public
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Preserve standalone host-indexing diagnostic
+        if: failure() && runner.environment == 'github-hosted'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: matched-packing-host-indexing-${{ github.sha }}
+          path: astrid-benchmark.noindex/host-indexing-diagnostics.log
           if-no-files-found: warn
           retention-days: 30
 
@@ -206,11 +235,40 @@ jobs:
             --candidate "$GITHUB_WORKSPACE/astrid-benchmark.noindex/candidate" \
             --baseline-head "$BASELINE" --candidate-head "$CANDIDATE" \
             --output "$GITHUB_WORKSPACE/astrid-benchmark.noindex/native250-evidence"
+      - name: Diagnose host indexing after benchmark failure
+        if: failure() && runner.environment == 'github-hosted'
+        continue-on-error: true
+        shell: bash
+        run: |
+          root="$GITHUB_WORKSPACE/astrid-benchmark.noindex"
+          [[ -d "$root" && ! -L "$root" ]] || exit 0
+          # Standalone diagnostic; not part of the benchmark's content-bound manifest.
+          set -o noclobber
+          {
+            set +e
+            echo 'Read-only post-failure context; not a performance sample'
+            /usr/bin/mdutil -s /
+            echo "mdutil_exit=$?"
+            /bin/ps -axo pid=,ppid=,pcpu=,comm=
+            echo "ps_exit=$?"
+            echo 'sudo -n /usr/bin/fs_usage -t 10 -w -f filesys mdworker_shared mds_stores mds'
+            sudo -n /usr/bin/fs_usage -t 10 -w -f filesys mdworker_shared mds_stores mds
+            echo "fs_usage_exit=$?"
+          } > "$root/host-indexing-diagnostics.log" 2>&1
       - name: Preserve evidence including failed samples
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: matched-native250-${{ github.sha }}
           path: astrid-benchmark.noindex/native250-evidence/public
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Preserve standalone host-indexing diagnostic
+        if: failure() && runner.environment == 'github-hosted'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: matched-native250-host-indexing-${{ github.sha }}
+          path: astrid-benchmark.noindex/host-indexing-diagnostics.log
           if-no-files-found: warn
           retention-days: 30
