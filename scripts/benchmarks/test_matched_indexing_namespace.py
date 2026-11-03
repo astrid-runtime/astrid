@@ -2,6 +2,7 @@
 import importlib.util
 import os
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -46,7 +47,9 @@ class NamespaceTests(unittest.TestCase):
                 self.assertLess(receipt, diagnostic)
                 self.assertIn("if: always()", body[receipt:diagnostic])
                 self.assertIn("path: astrid-benchmark.noindex/host-indexing-setup.json", body[receipt:diagnostic])
-                for forbidden in ("killall", "launchctl", ".metadata_never_index", "mdutil -i"):
+                mdutil_lines = re.findall(r"^.*\bmdutil\b.*$", body, flags=re.MULTILINE)
+                self.assertEqual([line.strip() for line in mdutil_lines], ["/usr/bin/mdutil -s /"])
+                for forbidden in ("killall", "launchctl", ".metadata_never_index"):
                     self.assertNotIn(forbidden, body)
         generic = workflow.split("  matched-packing:", 1)[0]
         self.assertNotIn("astrid-benchmark.noindex", generic)
