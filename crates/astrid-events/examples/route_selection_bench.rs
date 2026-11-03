@@ -1,4 +1,4 @@
-//! Matched public EventBus route-selection microbench.
+//! Matched public `EventBus` route-selection microbench.
 //!
 //! Measures `EventBus::publish` + own-route `try_drain` with N foreign exact
 //! scoped subscriptions sharing the same wildcard topic. No allocation
@@ -11,8 +11,11 @@
 //! from the astrid-events sources it was linked against.
 //!
 //! Usage:
-//!   cargo run -p astrid-events --release --example route_selection_bench -- \
+//!   cargo run -p astrid-events --release --example `route_selection_bench` -- \
 //!     --label corrected --foreign 10000 --iters 2000 --warmups 2
+
+#[path = "route_selection_bench_args.rs"]
+mod route_selection_bench_args;
 
 use std::env;
 use std::hint::black_box;
@@ -23,6 +26,7 @@ use astrid_events::{
     AstridEvent, EventBus, EventMetadata, IpcMessage, IpcPayload, MAX_SUBSCRIPTION_BUDGET_BYTES,
 };
 use astrid_types::Topic;
+use route_selection_bench_args::BenchConfig;
 use uuid::Uuid;
 
 fn event_on(topic: &str, principal: Option<&str>) -> AstridEvent {
@@ -36,44 +40,6 @@ fn event_on(topic: &str, principal: Option<&str>) -> AstridEvent {
         metadata: EventMetadata::new("route_selection_bench"),
         message,
     }
-}
-
-fn parse_u32(flag: &str, default: u32) -> u32 {
-    let mut args = env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == flag {
-            return args
-                .next()
-                .expect("missing value")
-                .parse()
-                .expect("invalid u32");
-        }
-    }
-    default
-}
-
-fn parse_usize(flag: &str, default: usize) -> usize {
-    let mut args = env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == flag {
-            return args
-                .next()
-                .expect("missing value")
-                .parse()
-                .expect("invalid usize");
-        }
-    }
-    default
-}
-
-fn parse_label() -> String {
-    let mut args = env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--label" {
-            return args.next().unwrap_or_else(|| "unlabeled".into());
-        }
-    }
-    "unlabeled".into()
 }
 
 fn assert_own_delivery(expected: &AstridEvent, drained: &[std::sync::Arc<AstridEvent>]) {
@@ -138,29 +104,33 @@ fn measure(foreign: usize, iters: u32, warmups: u32) -> (Duration, Duration) {
         let _ = black_box(drained);
     }
     let total = start.elapsed();
-    let per = total / iters;
+    // Parser rejects --iters 0; checked_div keeps clippy arithmetic lint honest.
+    let per = total
+        .checked_div(iters)
+        .expect("iters validated >= 1 by BenchConfig::parse");
     drop(held);
     (total, per)
 }
 
 fn main() -> ExitCode {
-    let label = parse_label();
-    let foreign = parse_usize("--foreign", 0);
-    let iters = parse_u32("--iters", 2_000);
-    let warmups = parse_u32("--warmups", 2);
-    if iters == 0 {
-        eprintln!("route_selection_bench: --iters must be >= 1 (got 0)");
-        return ExitCode::from(2);
-    }
-    let exe = env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "unknown".into());
+    let cfg = match BenchConfig::parse(env::args().skip(1)) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("route_selection_bench: {err}");
+            return ExitCode::from(2);
+        },
+    };
+    let exe = env::current_exe().map_or_else(|_| "unknown".into(), |p| p.display().to_string());
 
-    let (total, per) = measure(foreign, iters, warmups);
+    let (total, per) = measure(cfg.foreign, cfg.iters, cfg.warmups);
     // Product-source head is recorded in the external frozen-artifact receipt,
     // not inferred from whatever checkout happens to invoke this binary.
     println!(
-        "route_selection_bench label={label} foreign={foreign} iters={iters} warmups={warmups} total_ns={} per_publish_ns={} exe={exe}",
+        "route_selection_bench label={} foreign={} iters={} warmups={} total_ns={} per_publish_ns={} exe={exe}",
+        cfg.label,
+        cfg.foreign,
+        cfg.iters,
+        cfg.warmups,
         total.as_nanos(),
         per.as_nanos()
     );

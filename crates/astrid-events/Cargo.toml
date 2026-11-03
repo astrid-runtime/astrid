@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Event bus for Astrid secure agent runtime"
+autoexamples = false
 
 [dependencies]
 astrid-runtime = { workspace = true }
@@ -40,3 +41,9 @@ metrics-util = "0.20"
 
 [lints]
 workspace = true
+
+# Sibling support modules under examples/ are pulled in via #[path] and must
+# not become separate binaries.
+[[example]]
+name = "route_selection_bench"
+path = "examples/route_selection_bench.rs"

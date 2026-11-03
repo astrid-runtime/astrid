@@ -348,6 +348,83 @@ fn route_count_tracks_membership_without_scanning_principals() {
     assert_eq!(bus.routes.read().iter_all().count(), 10);
 }
 
+#[tokio::test]
+async fn exact_none_system_only_route_receives_system_publish() {
+    let bus = EventBus::new();
+    let mut system_only = bus.subscribe_topic_routed_scoped(
+        Uuid::new_v4(),
+        "scale.*",
+        "system-only",
+        "test",
+        Some(None),
+    );
+    let mut alice = bus.subscribe_topic_routed_scoped(
+        Uuid::new_v4(),
+        "scale.*",
+        "alice",
+        "test",
+        Some(Some("alice".into())),
+    );
+    let _ = bus.take_selection_visits();
+    bus.publish((*event_on("scale.request", None)).clone());
+    assert_eq!(
+        bus.take_selection_visits(),
+        1,
+        "Exact(None) must be the only candidate for a system publish when no PoS/unscoped routes exist"
+    );
+    assert_eq!(
+        system_only.try_drain(MAX_SUBSCRIPTION_BUDGET_BYTES).len(),
+        1
+    );
+    assert!(alice.try_drain(MAX_SUBSCRIPTION_BUDGET_BYTES).is_empty());
+
+    let _ = bus.take_selection_visits();
+    bus.publish((*event()).clone());
+    assert_eq!(bus.take_selection_visits(), 1);
+    assert!(
+        system_only
+            .try_drain(MAX_SUBSCRIPTION_BUDGET_BYTES)
+            .is_empty()
+    );
+    assert_eq!(alice.try_drain(MAX_SUBSCRIPTION_BUDGET_BYTES).len(), 1);
+}
+
+#[test]
+fn empty_principal_buckets_leave_the_outer_maps() {
+    let bus = EventBus::new();
+    let exact = bus.subscribe_topic_routed_scoped(
+        Uuid::new_v4(),
+        "scale.*",
+        "exact",
+        "test",
+        Some(Some("alice".into())),
+    );
+    let pos = bus.subscribe_topic_routed_principal_or_system(
+        Uuid::new_v4(),
+        "scale.*",
+        "runtime",
+        "test",
+        "bob",
+    );
+    {
+        let table = bus.routes.read();
+        assert!(table.contains_exact_principal(&Some("alice".into())));
+        assert!(table.contains_principal_or_system("bob"));
+    }
+    drop(exact);
+    drop(pos);
+    let table = bus.routes.read();
+    assert!(
+        !table.contains_exact_principal(&Some("alice".into())),
+        "empty exact principal bucket must leave the outer map"
+    );
+    assert!(
+        !table.contains_principal_or_system("bob"),
+        "empty principal-or-system bucket must leave the outer map"
+    );
+    assert_eq!(table.len(), 0);
+}
+
 #[test]
 #[ignore = "timing harness; use examples/route_selection_bench.rs for matched release ABBA"]
 fn publish_selection_microbench_n1_and_10k_foreign() {

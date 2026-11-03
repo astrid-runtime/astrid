@@ -87,7 +87,7 @@ pub type PrincipalKey = Option<String>;
 ///
 /// This is the authoritative typed scope used both for authz
 /// ([`RouteEntry::accepts`]) and for partition membership in the route table.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RouteAdmission {
     /// Unscoped firehose.
     All,
@@ -126,19 +126,18 @@ pub(crate) struct RouteEntry {
     /// Stable capsule label for telemetry. Bounded by deployed capsule
     /// count.
     pub(crate) capsule_id_label: String,
-    /// Authz self-scope. `Some(p)` ⇒ only events whose publisher
-    /// [`PrincipalKey`] equals `p` are admitted; foreign-principal events
-    /// are dropped at enqueue ([`accepts`](Self::accepts) → `false`) so
-    /// they never consume this route's 1 `MiB` byte budget, never enter
-    /// the [`fanout`](Self::fanout) map, and can never head-evict the
-    /// owner's own entries. `None` ⇒ unscoped (all principals) — the
-    /// default and the only behaviour pre-existing subscriptions get.
+    /// Authz / partition admission scope ([`RouteAdmission`]).
+    /// `Exact(p)` admits only that publisher; `Exact(None)` is system-only;
+    /// `PrincipalOrSystem(p)` admits that principal plus kernel/system;
+    /// `All` is the unscoped firehose. Foreign-principal events fail
+    /// [`accepts`](Self::accepts) at enqueue so they never consume this
+    /// route's 1 `MiB` byte budget, never enter [`fanout`](Self::fanout),
+    /// and can never head-evict the owner's own entries.
     ///
-    /// This is orthogonal to the per-principal DRR fan-out buckets, which
-    /// remain fairness-only (#813): scoping decides *admission*, DRR
-    /// decides *order* among whatever was admitted. A scoped route admits
-    /// at most one principal, so its DRR rotation holds exactly one
-    /// bucket — strictly less work than an unscoped firehose route.
+    /// Orthogonal to per-principal DRR fan-out buckets (#813): admission
+    /// scope decides *who enters*; DRR decides *order* among admitted
+    /// traffic. An exact-scoped route admits at most one publisher, so its
+    /// DRR rotation holds at most one bucket.
     ///
     /// COMPLETENESS is CROSS-PRINCIPAL ONLY. The guarantee above ("can never
     /// head-evict the owner's own entries") is about FOREIGN principals — a
@@ -169,12 +168,10 @@ pub(crate) struct RouteEntry {
 impl RouteEntry {
     /// Construct a new entry for the given matcher.
     ///
-    /// `scope` self-scopes the route to a single publisher principal (see
-    /// [`scope`](Self::scope)); pass `None` for the unscoped, all-principals
-    /// behaviour that every pre-existing subscription relies on. The
-    /// argument is mandatory so every constructor must state its intent —
-    /// a forgotten scope is a compile error, the secure-by-default failure
-    /// mode.
+    /// `scope` maps the public subscribe Option onto [`RouteAdmission`]:
+    /// `None` → `All` (unscoped firehose); `Some(principal)` →
+    /// `Exact(principal)` including `Some(None)` for system-only. The
+    /// argument is mandatory so every constructor states its intent.
     pub(crate) fn new(
         matcher: TopicMatcher,
         capsule_id_label: String,
@@ -237,11 +234,13 @@ impl RouteEntry {
     }
 
     /// Whether an event published by `publisher` is admitted into this
-    /// route. Unscoped routes (`scope == None`) admit every publisher;
-    /// scoped routes admit only their own principal. This is the single
-    /// named home of the authz rule — both the [`dispatch_to_routes`]
-    /// notify-skip and the [`push_with_eviction`](Self::push_with_eviction)
-    /// defence-in-depth guard consult it.
+    /// route under [`RouteAdmission`]. `All` admits every publisher;
+    /// `Exact` admits only that principal (including system-only
+    /// `Exact(None)`); `PrincipalOrSystem` admits that principal plus
+    /// kernel/system. This is the single named home of the authz rule —
+    /// both the [`dispatch_to_routes`] notify-skip and the
+    /// [`push_with_eviction`](Self::push_with_eviction) defence-in-depth
+    /// guard consult it.
     ///
     /// [`dispatch_to_routes`]: crate::bus::EventBus
     pub(crate) fn accepts(&self, publisher: &PrincipalKey) -> bool {

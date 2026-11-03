@@ -117,6 +117,20 @@ impl RouteTable {
             .chain(self.unscoped.values())
     }
 
+    /// Whether an exact-scope outer principal bucket currently exists.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn contains_exact_principal(&self, principal: &PrincipalKey) -> bool {
+        self.exact.contains_key(principal)
+    }
+
+    /// Whether a principal-or-system outer principal bucket currently exists.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn contains_principal_or_system(&self, principal: &str) -> bool {
+        self.principal_or_system.contains_key(principal)
+    }
+
     /// Flat scan of every stored route. Test/red instrumentation only.
     #[cfg(test)]
     pub(crate) fn iter_all(&self) -> impl Iterator<Item = &RouteHandle> {
