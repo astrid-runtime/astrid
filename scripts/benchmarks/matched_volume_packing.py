@@ -104,19 +104,21 @@ def quiet_snapshot():
 TERMINAL_RECEIPT_MARKER = "ASTRID_MATCHED_BENCHMARK_TERMINAL_RECEIPT_V1"
 
 
-def compact_receipt(value):
+def compact_receipt(value, path=()):
     """Omit bulky context while preserving all measured state and identities."""
     if isinstance(value, list):
-        return [compact_receipt(item) for item in value]
+        return [compact_receipt(item, path + (index,)) for index, item in enumerate(value)]
     if not isinstance(value, dict):
         return value
-    result = {key: compact_receipt(item) for key, item in value.items()
-              if key not in ("rows", "artifacts")}
+    compiler_inventory = len(path) == 2 and path[0] == "builds"
+    omitted = {"rows", "artifacts"} if compiler_inventory else {"rows"}
+    result = {key: compact_receipt(item, path + (key,)) for key, item in value.items()
+              if key not in omitted}
     if "rows" in value:
         rows = value["rows"]
         result["row_count"] = len(rows) if isinstance(rows, list) else None
         result["rows_omitted_from_terminal"] = True
-    if "artifacts" in value:
+    if compiler_inventory and "artifacts" in value:
         artifacts = value["artifacts"]
         # Exact full inventories remain in the saved receipt; bind rather than
         # dump thousands of compiler artifacts into the workflow log.
@@ -139,12 +141,14 @@ def terminal_receipt(receipt):
         result[f"{singular}_count"] = len(items) if isinstance(items, list) else None
         result.setdefault(key, None)
     observations = []
-    for index, window in enumerate((receipt.get("postbuild_settling") or {}).get("windows") or []):
+    settling = receipt.get("postbuild_settling")
+    windows = settling.get("windows") if isinstance(settling, dict) else None
+    for index, window in enumerate(windows if isinstance(windows, list) else []):
         observations.append({"kind": "postbuild_settling", "index": index,
-                             **compact_receipt(window)})
+                             "observation": compact_receipt(window)})
     for key in ("quiet_gate_before_sample", "quiet_gate_before_life"):
         if key in receipt:
-            observations.append({"kind": key, **compact_receipt(receipt[key])})
+            observations.append({"kind": key, "observation": compact_receipt(receipt[key])})
     result["quiet_observations"] = observations
     result["note"] = "Compact stdout fallback; saved full receipt remains authoritative"
     return result

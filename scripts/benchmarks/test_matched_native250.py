@@ -88,6 +88,35 @@ class Native250SyntheticTests(unittest.TestCase):
             self.assertEqual(frozen.read_bytes(), b"baseline executable")
             self.assertEqual(MODULE.sha(frozen), result["binaries"]["astrid"]["sha256"])
 
+    def test_client_link_uses_the_producer_toolchain_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            library = root / "libfixture.rlib"
+            library.write_bytes(b"producer")
+            build = {"checkout": str(checkout), "rustc": "pinned compiler", "artifacts": []}
+            libraries = {"fixture": {"path": str(library), "sha256": MODULE.sha(library)}}
+
+            def compile_client(args, **kwargs):
+                self.assertEqual(kwargs.get("cwd"), checkout)
+                Path(args[args.index("-o") + 1]).write_bytes(b"client")
+                return MagicMock(returncode=0)
+
+            with patch.object(MODULE, "select_release_rlibs", return_value=libraries), \
+                    patch.object(MODULE.packing, "command", return_value="pinned compiler") as version, \
+                    patch.object(MODULE.subprocess, "run", side_effect=compile_client) as link:
+                result = MODULE.build_shared_client(build, root / "owned", root, float("inf"))
+                version.assert_called_once_with(["rustc", "-Vv"], checkout)
+                self.assertEqual(result["rustc"], build["rustc"])
+                self.assertEqual(link.call_count, 1)
+            with patch.object(MODULE, "select_release_rlibs", return_value=libraries), \
+                    patch.object(MODULE.packing, "command", return_value="different compiler"), \
+                    patch.object(MODULE.subprocess, "run") as link:
+                with self.assertRaisesRegex(RuntimeError, "compiler differs"):
+                    MODULE.build_shared_client(build, root / "owned", root, float("inf"))
+                link.assert_not_called()
+
     def test_schedule_is_two_warmups_plus_sixteen_timed_abba(self):
         arms = MODULE.schedule_arms()
         self.assertEqual(arms[:2], ["main", "candidate"])
@@ -692,7 +721,7 @@ class Native250SyntheticTests(unittest.TestCase):
         # generic row/artifact omission only.
         self.assertEqual(
             summary["builds"]["main"]["client"]["sha256"], "9" * 64)
-        self.assertTrue(summary["quiet_observations"][0]["rows_omitted_from_terminal"])
+        self.assertTrue(summary["quiet_observations"][0]["observation"]["rows_omitted_from_terminal"])
 
 
 if __name__ == "__main__":

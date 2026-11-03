@@ -304,8 +304,9 @@ def cargo_build(checkout: Path, head: str, packages: list[str], target_dir: Path
         binaries[name] = destination
     return {
         "head": head,
+        "checkout": str(checkout),
         "tree": packing.command(["git", "rev-parse", "HEAD^{tree}"], checkout),
-        "rustc": packing.command(["rustc", "-Vv"]),
+        "rustc": packing.command(["rustc", "-Vv"], checkout),
         "lock_sha256": sha(checkout / "Cargo.lock"),
         "target_dir": str(target_dir),
         "binaries": {name: {"path": str(path), "sha256": sha(path)}
@@ -355,6 +356,9 @@ def build_shared_client(candidate_build: dict, ownership_root: Path, output: Pat
     require(CLIENT_SOURCE.is_file(), "native_lifecycle_client.rs missing")
     source_sha = sha(CLIENT_SOURCE)
     libraries = select_release_rlibs(candidate_build["artifacts"])
+    checkout = Path(candidate_build["checkout"])
+    compiler = packing.command(["rustc", "-Vv"], checkout)
+    require(compiler == candidate_build["rustc"], "client compiler differs from producer")
     deps = Path(next(iter(libraries.values()))["path"]).parent
     binary = output / "native250-lifecycle-client"
     log = output / "client-rustc.log"
@@ -368,7 +372,7 @@ def build_shared_client(candidate_build: dict, ownership_root: Path, output: Pat
     budget = min(300, deadline - time.monotonic())
     require(budget > 0, "run budget exhausted before client link")
     with log.open("w") as stream:
-        result = subprocess.run(cmd, env=env, stdout=stream, stderr=subprocess.STDOUT,
+        result = subprocess.run(cmd, cwd=checkout, env=env, stdout=stream, stderr=subprocess.STDOUT,
                                 timeout=budget)
     require(result.returncode == 0, f"client rustc failed; see {log}")
     require(sha(CLIENT_SOURCE) == source_sha, "client source changed during link")
@@ -381,6 +385,7 @@ def build_shared_client(candidate_build: dict, ownership_root: Path, output: Pat
         "libraries": libraries,
         "log_sha256": sha(log),
         "shared_both_arms": True,
+        "rustc": compiler,
         "linked_against": "candidate producer libraries via compiler-artifact provenance",
     }
 
@@ -800,8 +805,9 @@ def run_one(ordinal, label, binary, cli, client, capsule, seed, ownership_root, 
     def first_ops(cycle, home, run, directory, daemon):
         rec["operations"].append(run_client(client, home, run, directory / "first-empty.log",
                                             ["empty", "0", "1"], daemon))
-        run_client(client, home, run, directory / "remaining-empty.log",
-                   ["empty", "1", str(COHORT)], daemon)
+        rec["operations"].append(run_client(
+            client, home, run, directory / "remaining-empty.log",
+            ["empty", "1", str(COHORT)], daemon))
         write = run_client(client, home, run, directory / "timed-probe-pattern.log",
                            ["probe-pattern", "0", str(COHORT)], daemon)
         write["role"] = "timed-known-write"

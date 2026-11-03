@@ -673,6 +673,7 @@ jobs:
             scripts/validate-macos-fskit.sh \
             scripts/test_v0104_macos_upgrade.sh
           python3 -m unittest scripts/test_macos_release_packaging.py
+          python3 -m unittest discover -s scripts/benchmarks -p 'test_matched_*.py'
           scripts/test_manage_macos_fskit.sh
 
       - name: Verify native media isolation on macOS

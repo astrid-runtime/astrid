@@ -244,13 +244,22 @@ class RefusalTests(unittest.TestCase):
         self.assertEqual(summary["samples"], [])
         self.assertEqual(summary["builds"]["main"]["artifact_count"], 1)
         self.assertNotIn("rows", summary["quiet_observations"][0])
-        self.assertEqual(summary["quiet_observations"][0]["row_count"], 50)
+        self.assertEqual(summary["quiet_observations"][0]["observation"]["row_count"], 50)
         self.assertEqual(summary["quiet_observations"][1]["kind"], "quiet_gate_before_sample")
-        self.assertEqual(summary["quiet_observations"][1]["index"], 0)
-        self.assertFalse(summary["quiet_observations"][1]["quiet"])
+        self.assertEqual(summary["quiet_observations"][1]["observation"]["index"], 0)
+        self.assertFalse(summary["quiet_observations"][1]["observation"]["quiet"])
         encoded = MODULE.json.dumps(summary)
         self.assertNotIn("40.9 observer", encoded)
         self.assertLess(len(encoded), 8000)
+
+    def test_terminal_fallback_preserves_malformed_quiet_evidence(self):
+        receipt = {"failure": "original failure", "postbuild_settling": {"windows": [None]},
+                   "quiet_gate_before_sample": "incomplete"}
+        summary = MODULE.terminal_receipt(receipt)
+        self.assertEqual(summary["failure"], "original failure")
+        self.assertIsNone(summary["postbuild_settling"]["windows"][0])
+        self.assertEqual(summary["quiet_gate_before_sample"], "incomplete")
+        self.assertIsNone(summary["sample_count"])
 
     def test_terminal_receipt_missing_samples_not_reinterpreted_as_zero(self):
         summary = MODULE.terminal_receipt({"complete": False})
@@ -265,7 +274,8 @@ class RefusalTests(unittest.TestCase):
         # Artifact finalization can fail after collection. The fallback must
         # retain evidence needed to interpret timings, not just their values.
         receipt = {
-            "client": {"path": "owned-client", "sha256": "a" * 64},
+            "client": {"path": "owned-client", "sha256": "a" * 64,
+                       "artifacts": [{"identity_sha256": "b" * 64}]},
             "runs": [{"ordinal": 0, "first_upgrade": {
                 "ready_process_metrics": {"rss_bytes": 1234},
                 "terminal_process_metrics": {"max_rss_bytes": 5678},
@@ -277,6 +287,14 @@ class RefusalTests(unittest.TestCase):
         self.assertEqual(summary["client"], receipt["client"])
         self.assertEqual(summary["runs"], receipt["runs"])
         self.assertEqual(MODULE.json.dumps(receipt, sort_keys=True), original)
+
+    def test_compiler_inventory_hash_binds_the_complete_ordered_inventory(self):
+        artifacts = [{"z": 1, "a": "duplicate"}, {"a": "duplicate", "z": 2}]
+        receipt = {"builds": {"main": {"artifacts": artifacts}}}
+        summary = MODULE.terminal_receipt(receipt)["builds"]["main"]
+        canonical = MODULE.json.dumps(artifacts, sort_keys=True, separators=(",", ":")).encode()
+        self.assertEqual(summary["artifact_inventory_sha256"], MODULE.hashlib.sha256(canonical).hexdigest())
+        self.assertEqual(summary["artifact_count"], 2)
 
     def test_terminal_fallback_cannot_mask_the_primary_failure(self):
         for failure in (BrokenPipeError("closed stdout"), TypeError("bad JSON")):
