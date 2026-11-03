@@ -347,6 +347,31 @@ def public_source_paths(output):
     return [output / "protocol-source" / relative for relative in SOURCES]
 
 
+def bound_public_evidence(output, receipt):
+    """Bind produced files even if they disappear before the final glob scan.
+
+    A completed acquisition requires every sample triple, build and archived
+    source. A failed partial run requires only outputs whose receipt hash was
+    recorded; files not yet produced must not replace its primary failure.
+    """
+    complete = receipt.get("complete", False) or "accepted_attempt" in receipt
+    required = {}
+    for arm in ("main", "candidate"):
+        expected = receipt.get("builds", {}).get(arm, {}).get("build_log_sha256")
+        if complete or expected is not None:
+            required[output / f"{arm}-build.jsonl"] = expected
+    for relative in SOURCES:
+        path = output / "protocol-source" / relative
+        if complete or path.exists():
+            required[path] = receipt.get("source_overlay", {}).get(relative)
+    for index, sample in enumerate(receipt.get("samples", [])):
+        for suffix, field in (("stdout", "stdout_sha256"), ("stderr", "stderr_sha256"),
+                              ("report.json", "report_sha256")):
+            if complete or field in sample:
+                required[output / f"sample-{index:02d}.{suffix}"] = sample.get(field)
+    return required
+
+
 def run_schedule(args, output, receipt, save, deadline, hooks, workload,
                  builds, manifest, schedule, attempt):
     for slot, item in enumerate(schedule):

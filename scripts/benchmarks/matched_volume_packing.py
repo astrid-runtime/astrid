@@ -53,13 +53,15 @@ def finalize_evidence(output, receipt, save, primary_error=None):
     logs = [output / "main-build.jsonl", output / "candidate-build.jsonl"]
     logs.extend(output.glob("sample-*.stdout"))
     logs.extend(output.glob("sample-*.stderr"))
+    required = {}
     if receipt.get("mode") == "evolving-kv":
+        required["required_logs"] = evolving_kv.bound_public_evidence(output, receipt)
         logs.extend(evolving_kv.public_source_paths(output))
         logs.extend(output.glob("sample-*.report.json"))
     if receipt.get("mode") == "route-selection":
         logs.append(output / "protocol-source" / route_selection.SOURCE)
     evidence.finalize(output, receipt, save, emit_terminal_receipt,
-                      primary_error=primary_error, log_paths=logs)
+                      primary_error=primary_error, log_paths=logs, **required)
 
 
 PROBE_SHA = "bff5f6b391f7ae2ed1b2c43d94def378733de4c89c9287c5c767b7a173ea7faf"

@@ -15,6 +15,10 @@ from unittest.mock import patch
 SPEC = importlib.util.spec_from_file_location("evolving_mode", Path(__file__).with_name("evolving_kv.py"))
 MODE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODE)
+PROTOCOL_SPEC = importlib.util.spec_from_file_location(
+    "evolving_publication_protocol", Path(__file__).with_name("matched_volume_packing.py"))
+PROTOCOL = importlib.util.module_from_spec(PROTOCOL_SPEC)
+PROTOCOL_SPEC.loader.exec_module(PROTOCOL)
 HEAD = "a" * 40
 DIGEST = "b" * 64
 
@@ -344,6 +348,108 @@ def shared_schedule():
 
 
 class PublicationTests(unittest.TestCase):
+    def complete_evidence(self, root):
+        receipt = {"mode": "evolving-kv", "complete": True, "accepted_attempt": 0,
+                   "accepted_sample_indices": list(range(18)), "samples": [],
+                   "builds": {}, "source_overlay": {}}
+        def write(relative, raw):
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
+            return hashlib.sha256(raw).hexdigest()
+        for arm in ("main", "candidate"):
+            receipt["builds"][arm] = {"build_log_sha256": write(f"{arm}-build.jsonl", b"build log")}
+        for relative in MODE.SOURCES:
+            receipt["source_overlay"][relative] = write(f"protocol-source/{relative}", b"frozen source")
+        for index in range(18):
+            sample = {}
+            for suffix, field in (("stdout", "stdout_sha256"), ("stderr", "stderr_sha256"),
+                                  ("report.json", "report_sha256")):
+                sample[field] = write(f"sample-{index:02d}.{suffix}", b"bound raw bytes")
+            receipt["samples"].append(sample)
+        return receipt
+
+    def test_actual_finalizer_rejects_deleted_bound_report_stdout_source_and_build(self):
+        for missing in ("sample-17.report.json", "sample-17.stdout", "main-build.jsonl",
+                        f"protocol-source/{MODE.SOURCES[-1]}"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw).resolve()
+                receipt = self.complete_evidence(root)
+                (root / missing).unlink()
+                def save():
+                    (root / "receipt.json").write_text(json.dumps(receipt))
+                emit = Mock()
+                with patch.object(PROTOCOL, "emit_terminal_receipt", emit):
+                    with self.assertRaisesRegex(RuntimeError, "missing bound evidence"):
+                        PROTOCOL.finalize_evidence(root, receipt, save)
+                self.assertFalse(receipt["complete"])
+                self.assertIn(missing, receipt["publication_error"])
+                self.assertFalse((root / "public").exists())
+                self.assertEqual(list(root.glob(".publication-*")), [])
+                self.assertFalse(json.loads((root / "receipt.json").read_text())["complete"])
+                emit.assert_called_once_with(receipt)
+
+    def test_actual_finalizer_success_has_every_bound_file_byte_complete(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            receipt = self.complete_evidence(root)
+            required = MODE.bound_public_evidence(root, receipt)
+            def save():
+                (root / "receipt.json").write_text(json.dumps(receipt))
+            with patch.object(PROTOCOL, "emit_terminal_receipt"):
+                PROTOCOL.finalize_evidence(root, receipt, save)
+            manifest = json.loads((root / "public/manifest.json").read_text())
+            self.assertEqual({entry["path"] for entry in manifest["logs"]},
+                             {str(path.relative_to(root)) for path in required})
+            for path in required:
+                self.assertEqual((root / "public" / path.relative_to(root)).read_bytes(), path.read_bytes())
+            self.assertTrue(receipt["complete"])
+
+    def test_actual_partial_finalizer_does_not_require_unproduced_files(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            receipt = {"mode": "evolving-kv", "complete": False, "failure": "original child failure",
+                       "samples": [{"stdout_sha256": hashlib.sha256(b"partial stdout").hexdigest()}]}
+            (root / "sample-00.stdout").write_bytes(b"partial stdout")
+            def save():
+                (root / "receipt.json").write_text(json.dumps(receipt))
+            emit = Mock()
+            with patch.object(PROTOCOL, "emit_terminal_receipt", emit):
+                PROTOCOL.finalize_evidence(root, receipt, save, primary_error=RuntimeError("original child failure"))
+            self.assertEqual(receipt["failure"], "original child failure")
+            self.assertNotIn("publication_error", receipt)
+            self.assertEqual((root / "public/sample-00.stdout").read_bytes(), b"partial stdout")
+            self.assertFalse((root / "public/sample-00.report.json").exists())
+            emit.assert_called_once_with(receipt)
+
+    def test_actual_partial_finalizer_retains_primary_failure_if_bound_output_disappears(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            receipt = {"mode": "evolving-kv", "complete": False, "failure": "original child failure",
+                       "samples": [{"stdout_sha256": hashlib.sha256(b"partial stdout").hexdigest()}]}
+            def save():
+                (root / "receipt.json").write_text(json.dumps(receipt))
+            emit = Mock()
+            with patch.object(PROTOCOL, "emit_terminal_receipt", emit):
+                PROTOCOL.finalize_evidence(root, receipt, save, primary_error=RuntimeError("original child failure"))
+            self.assertEqual(receipt["failure"], "original child failure")
+            self.assertIn("missing bound evidence", receipt["publication_error"])
+            self.assertFalse((root / "public").exists())
+            emit.assert_called_once_with(receipt)
+
+    def test_actual_finalizer_rejects_changed_bound_bytes_not_just_missing_files(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            receipt = self.complete_evidence(root)
+            (root / "sample-17.report.json").write_bytes(b"different but internally stable bytes")
+            def save():
+                (root / "receipt.json").write_text(json.dumps(receipt))
+            with patch.object(PROTOCOL, "emit_terminal_receipt"):
+                with self.assertRaisesRegex(RuntimeError, "bound evidence identity mismatch"):
+                    PROTOCOL.finalize_evidence(root, receipt, save)
+            self.assertFalse(receipt["complete"])
+            self.assertFalse((root / "public").exists())
+
     def test_evolving_publication_extends_allowlist_without_homes_or_targets(self):
         source = Path(__file__).with_name("matched_volume_packing.py").read_text()
         node = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == "finalize_evidence")

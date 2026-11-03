@@ -15,7 +15,7 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def publish(output: Path, log_paths=None) -> dict:
+def publish(output: Path, log_paths=None, required_logs=None) -> dict:
     output = output.resolve()
     publication = output / "public"
     if publication.exists() or publication.is_symlink():
@@ -23,12 +23,12 @@ def publish(output: Path, log_paths=None) -> dict:
     # A failed copy must never expose an earlier successful receipt to upload.
     with tempfile.TemporaryDirectory(prefix=".publication-", dir=output) as temporary:
         staging = Path(temporary)
-        manifest = _populate(output, staging, log_paths)
+        manifest = _populate(output, staging, log_paths, required_logs)
         staging.rename(publication)
     return manifest
 
 
-def _populate(output, publication, log_paths):
+def _populate(output, publication, log_paths, required_logs):
     receipt = output / "receipt.json"
     if receipt.is_symlink() or not receipt.is_file():
         raise RuntimeError("publication requires a regular receipt")
@@ -45,11 +45,15 @@ def _populate(output, publication, log_paths):
     paths.extend(output.glob("ownership-root/life-*/*.log"))
     if log_paths is not None:
         paths = list(log_paths)
+    required_logs = required_logs or {}
+    paths.extend(required_logs)
     manifest = {"receipt_sha256": digest(receipt), "logs": [],
                 "log_limit_bytes": LOG_LIMIT, "total_log_limit_bytes": TOTAL_LOG_LIMIT}
     remaining = TOTAL_LOG_LIMIT
     for path in sorted(set(paths)):
         if not path.exists():
+            if path in required_logs:
+                raise RuntimeError(f"publication missing bound evidence: {path.relative_to(output)}")
             continue
         if path.is_symlink() or not path.is_file() or path.resolve() != path:
             raise RuntimeError(f"publication refuses aliased log: {path}")
@@ -65,6 +69,8 @@ def _populate(output, publication, log_paths):
             tail = stream.read(count)
         target.write_bytes(tail)
         source_digest, published_digest = digest(path), digest(target)
+        if path in required_logs and (not required_logs[path] or source_digest != required_logs[path]):
+            raise RuntimeError(f"publication bound evidence identity mismatch: {relative}")
         if full_logs and (len(tail) != length or source_digest != published_digest):
             raise RuntimeError(f"evolving-KV raw evidence changed during publication: {relative}")
         manifest["logs"].append({"path": str(relative), "source_bytes": length,
@@ -75,7 +81,7 @@ def _populate(output, publication, log_paths):
     return manifest
 
 
-def finalize(output, receipt, save, emit, primary_error=None, log_paths=None):
+def finalize(output, receipt, save, emit, primary_error=None, log_paths=None, required_logs=None):
     """Attempt every evidence exit path without hiding an earlier run failure."""
     failures = []
     try:
@@ -85,7 +91,9 @@ def finalize(output, receipt, save, emit, primary_error=None, log_paths=None):
         receipt["final_save_error"] = repr(error)
         failures.append(error)
     try:
-        if log_paths is None:
+        if required_logs is not None:
+            publish(output, log_paths, required_logs)
+        elif log_paths is None:
             publish(output)
         else:
             publish(output, log_paths)
