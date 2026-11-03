@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 SPEC = importlib.util.spec_from_file_location("native250_evidence", Path(__file__).parent / "native250" / "evidence.py")
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -55,3 +55,40 @@ class EvidenceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "aliased log"):
                 MODULE.publish(root)
             self.assertFalse((root / "public/capsule-build.log").exists())
+
+    def test_final_save_failure_still_publishes_durable_receipt_and_emits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            durable = '{"complete": false, "stage": "previous"}'
+            (root / "receipt.json").write_text(durable)
+            receipt = {"complete": True}
+            emit = MagicMock()
+            error = OSError("disk full")
+            with self.assertRaisesRegex(OSError, "disk full"):
+                MODULE.finalize(root, receipt, MagicMock(side_effect=error), emit)
+            self.assertEqual((root / "public/receipt.json").read_text(), durable)
+            self.assertFalse(receipt["complete"])
+            self.assertIn("disk full", receipt["final_save_error"])
+            emit.assert_called_once_with(receipt)
+
+    def test_finalization_preserves_primary_failure_across_all_evidence_failures(self):
+        receipt = {"complete": False}
+        primary = TimeoutError("original timeout")
+        save = MagicMock(side_effect=OSError("save failed"))
+        emit = MagicMock()
+        with patch.object(MODULE, "publish", side_effect=OSError("publish failed")) as publish:
+            MODULE.finalize(Path("unused"), receipt, save, emit, primary_error=primary)
+        self.assertEqual(save.call_count, 2)
+        publish.assert_called_once()
+        emit.assert_called_once_with(receipt)
+        self.assertIn("publish failed", receipt["publication_error"])
+        self.assertIn("save failed", receipt["publication_error_save_error"])
+
+    def test_successful_finalization_saves_publishes_then_emits(self):
+        receipt = {"complete": True}
+        operations = []
+        with patch.object(MODULE, "publish", side_effect=lambda _: operations.append("publish")):
+            MODULE.finalize(Path("unused"), receipt,
+                            lambda: operations.append("save"),
+                            lambda value: operations.append(("emit", value.copy())))
+        self.assertEqual(operations, ["save", "publish", ("emit", receipt)])

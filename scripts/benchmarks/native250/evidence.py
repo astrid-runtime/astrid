@@ -26,6 +26,7 @@ def publish(output: Path) -> dict:
     (publication / "receipt.json").write_bytes(raw)
     paths = [output / name for name in ("main-cargo.jsonl", "candidate-cargo.jsonl",
                                        "client-rustc.log", "capsule-build.log")]
+    paths.append(output / "baseline-seed-client" / "client-rustc.log")
     paths.extend(output.glob("ownership-root/seed/*.log"))
     paths.extend(output.glob("ownership-root/life-*/*.log"))
     manifest = {"receipt_sha256": digest(receipt), "logs": [],
@@ -51,3 +52,31 @@ def publish(output: Path) -> dict:
         remaining -= count
     (publication / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
+
+
+def finalize(output, receipt, save, emit, primary_error=None):
+    """Attempt every evidence exit path without hiding an earlier run failure."""
+    failures = []
+    try:
+        save()
+    except BaseException as error:
+        receipt["complete"] = False
+        receipt["final_save_error"] = repr(error)
+        failures.append(error)
+    try:
+        publish(output)
+    except BaseException as error:
+        receipt["complete"] = False
+        receipt["publication_error"] = repr(error)
+        failures.append(error)
+        try:
+            save()
+        except BaseException as retry_error:
+            receipt["publication_error_save_error"] = repr(retry_error)
+            failures.append(retry_error)
+    try:
+        emit(receipt)
+    except BaseException as error:
+        failures.append(error)
+    if primary_error is None and failures:
+        raise failures[0]

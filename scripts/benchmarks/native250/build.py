@@ -265,6 +265,28 @@ def build_install_set(
     return result
 
 
+def build_producers_with_seed_client(producers, ownership_root, output, deadline, receipt, save):
+    """Link the seed author before a shared target can replace baseline rlibs."""
+    require([arm for arm, _, _ in producers] == ["main", "candidate"], "producer arm order")
+    builds = {}
+    receipt["builds"] = builds
+    seed_client = None
+    for arm, path, head in producers:
+        builds[arm] = build_install_set(path.resolve(), head, output / "cargo-target",
+                                        output / f"{arm}-cargo.jsonl", deadline)
+        save()
+        if arm == "main":
+            client_output = output / "baseline-seed-client"
+            client_output.mkdir(mode=0o700)
+            seed_client = build_shared_client(builds[arm], ownership_root, client_output, deadline)
+            seed_client.update(shared_both_arms=False, role="baseline-seed-only",
+                               producer_head=head,
+                               linked_against="baseline producer libraries via compiler-artifact provenance")
+            receipt["seed_client"] = seed_client
+            save()
+    return builds, seed_client
+
+
 def select_release_rlibs(artifacts: list[dict]) -> dict[str, dict]:
     selected: dict[str, dict] = {}
     for item in artifacts:

@@ -49,6 +49,34 @@ def _artifact(
 
 
 class Native250BuildSyntheticTests(unittest.TestCase):
+    def test_baseline_seed_client_is_frozen_before_candidate_replaces_shared_libraries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory).resolve()
+            baseline, candidate = {"producer": "main"}, {"producer": "candidate"}
+            events = []
+            receipt = {}
+            def build(path, head, target, log, deadline):
+                events.append(head)
+                if head == "b" * 40:
+                    self.assertIn("seed_client", receipt)
+                    self.assertEqual(events, [HEAD, "link-baseline", "b" * 40])
+                    return candidate
+                return baseline
+            def link(producer, ownership, destination, deadline):
+                self.assertIs(producer, baseline)
+                self.assertTrue(destination.is_dir())
+                events.append("link-baseline")
+                return {"path": str(destination / "client")}
+            with patch.object(MODULE, "build_install_set", side_effect=build), \
+                    patch.object(MODULE, "build_shared_client", side_effect=link):
+                builds, client = MODULE.build_producers_with_seed_client(
+                    [("main", output, HEAD), ("candidate", output, "b" * 40)],
+                    output / "owned", output, float("inf"), receipt, lambda: None)
+            self.assertIs(builds["candidate"], candidate)
+            self.assertEqual(client["producer_head"], HEAD)
+            self.assertFalse(client["shared_both_arms"])
+            self.assertEqual(client["role"], "baseline-seed-only")
+
     def test_build_install_set_emits_public_astrid_package_only(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

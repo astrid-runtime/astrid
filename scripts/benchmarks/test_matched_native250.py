@@ -104,6 +104,20 @@ class Native250SyntheticTests(unittest.TestCase):
         process.terminate.assert_not_called()
         self.assertIsNone(daemon.process)
 
+    def test_authenticated_connections_and_correlation_are_required(self):
+        # These source contracts protect checks on the actual connected socket,
+        # in addition to the compiled fake-peer negatives retained by the run.
+        client = (MODULE.HERE / "native_lifecycle_client.rs").read_text()
+        admin = (MODULE.HERE / "native250_admin.rs").read_text()
+        self.assertRegex(client, r"SocketClient::connect\(SessionId::new\(\), id.clone\(\)\)[\s\S]*?is_authenticated")
+        self.assertIn("client.is_authenticated()", client)
+        self.assertIn("socket.is_authenticated()", admin)
+        self.assertIn("raw.get(\"topic\").and_then(Value::as_str) == Some(response.as_str())", admin)
+        self.assertIn("== Some(id.as_str())", admin)
+        self.assertIn("reply.request_id.as_deref() == Some(id.as_str())", admin)
+        self.assertIn("did not authenticate", client)
+        self.assertIn("did not authenticate", admin)
+
     def test_seed_start_failure_preserves_partial_boot_and_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

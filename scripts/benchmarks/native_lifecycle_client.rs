@@ -199,7 +199,7 @@ async fn run() -> anyhow::Result<()> {
                 into_result(
                     root_client
                         .as_mut()
-                        .unwrap()
+                        .context("derived fleet client missing after authenticated connect")?
                         .request_agent_derive(AgentDeriveRequest {
                             name: id.to_string(),
                             source: PrincipalId::default(),

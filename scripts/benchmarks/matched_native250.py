@@ -537,6 +537,10 @@ def generate_seed(ownership_root: Path, daemon: Path, cli: Path, client: Path,
                 "historical_cfa7_sha256": "cfa7fe7e403b65d94c2a96b113edc02ffc5f8a1d1c771e25a8a083465fee4be9",
                 "identity_minted_once_per_job": True,
                 "seed_daemon_head_role": "baseline",
+                "offline_direct_storage_client_role": "baseline-seed-only",
+                "offline_direct_storage_mutations": ["prepare-fleets", "rehome-roots"],
+                "offline_direct_storage_readback": ["offline-census"],
+                "offline_client": receipt["seed_client"],
                 "capsule_install_cli_role": "baseline-built-public-path",
                 "released_2026_10_1_cli_used": False,
                 "gap": "seed content reflects baseline head + baseline CLI, not historical released-2026.10.1 capture",
@@ -721,16 +725,10 @@ def main() -> None:
                 receipt["instrumentation_removed"].append(key)
                 del os.environ[key]
         save()
-        shared_target = output / "cargo-target"
-        builds = {}
-        receipt["builds"] = builds
-        for arm, path, head in [
+        builds, seed_client = build.build_producers_with_seed_client([
             ("main", args.baseline, args.baseline_head),
             ("candidate", args.candidate, args.candidate_head),
-        ]:
-            builds[arm] = build.build_install_set(path.resolve(), head,
-                                      shared_target, output / f"{arm}-cargo.jsonl", deadline)
-            save()
+        ], ownership_root, output, deadline, receipt, save)
         packing.settle_after_builds(receipt, save, deadline)
         baseline_cli = Path(builds["main"]["binaries"]["astrid"]["path"])
         baseline_daemon = Path(builds["main"]["binaries"]["astrid-daemon"]["path"])
@@ -748,10 +746,11 @@ def main() -> None:
         save()
         packing.clean_checkout(protocol, protocol_head)
         client = build_shared_client(builds["candidate"], ownership_root, output, deadline)
+        client.update(role="shared-online-both-arms", producer_head=args.candidate_head)
         receipt["client"] = client
         save()
         seed = generate_seed(ownership_root, baseline_daemon, baseline_cli,
-                             Path(client["path"]), Path(capsule["path"]), output, receipt, save)
+                             Path(seed_client["path"]), Path(capsule["path"]), output, receipt, save)
         arms = schedule_arms()
         receipt["schedule"] = arms
         save()
@@ -773,17 +772,8 @@ def main() -> None:
         receipt["failure"] = str(error)
         raise
     finally:
-        save()
-        primary = sys.exception()
-        try:
-            evidence.publish(output)
-        except Exception as publication_error:
-            receipt["publication_error"] = repr(publication_error)
-            save()
-            if primary is None:
-                raise
-        finally:
-            packing.emit_terminal_receipt(receipt)
+        evidence.finalize(output, receipt, save, packing.emit_terminal_receipt,
+                          primary_error=sys.exception())
 
 
 if __name__ == "__main__":
