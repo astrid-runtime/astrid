@@ -11,6 +11,12 @@ use super::{
 use crate::engine::{ProjectionObserver, ProjectionPhase};
 use crate::storage_model::ObjectIdentity;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StandaloneRole {
+    Represented,
+    Bootstrap,
+}
+
 impl<P, I, C> DurableEngine<P, I, C>
 where
     P: Clone + Ord,
@@ -372,15 +378,44 @@ where
         &self,
         record: &ObjectRecord,
     ) -> Result<(ObjectId, InsertOutcome), DurableError> {
+        self.persist_standalone(record, StandaloneRole::Represented)
+    }
+
+    /// Persist terminal format evidence through the independent bootstrap path.
+    ///
+    /// The format-amendment caller must first authorize the predecessor. This
+    /// retains the ordinary collision, flush and volume-fence guarantees while
+    /// keeping bootstrap evidence outside the relocatable direct catalogue.
+    pub(crate) fn persist_bootstrap_object(
+        &self,
+        record: &ObjectRecord,
+    ) -> Result<(ObjectId, InsertOutcome), DurableError> {
+        if record.kind() != crate::storage_model::ObjectKind::Evidence
+            || record.class() != crate::storage_model::ObjectClass::Metadata
+            || record.logical_bytes() != 0
+            || !record.references().is_empty()
+        {
+            return Err(DurableError::InvalidRepresentationState(
+                "bootstrap specification must be terminal metadata evidence",
+            ));
+        }
+        self.persist_standalone(record, StandaloneRole::Bootstrap)
+    }
+
+    fn persist_standalone(
+        &self,
+        record: &ObjectRecord,
+        role: StandaloneRole,
+    ) -> Result<(ObjectId, InsertOutcome), DurableError> {
         if record.owning_references().next().is_some() {
             return Err(DurableError::BootstrapObjectOwnsState);
         }
         let id = self.identify(record);
         let mut inner = self.lock_usable()?;
         if let Some(location) = inner.index.get(&id).copied() {
-            return self.persist_existing_standalone(&mut inner, id, location, record);
+            return self.persist_existing_standalone(&mut inner, id, location, record, role);
         }
-        self.persist_new_standalone(&mut inner, id, record)
+        self.persist_new_standalone(&mut inner, id, record, role)
     }
 
     fn persist_existing_standalone(
@@ -389,6 +424,7 @@ where
         id: ObjectId,
         location: super::ArenaLocation,
         record: &ObjectRecord,
+        role: StandaloneRole,
     ) -> Result<(ObjectId, InsertOutcome), DurableError> {
         let (existing, needs_flush) = {
             let files = live_files_mut(&mut inner.files)?;
@@ -400,7 +436,8 @@ where
             return Err(ModelError::ObjectCollision(id).into());
         }
         let payload = encode_object_frame(self.identity.scheme(), id, &existing)?;
-        let appended = if let Some(representations) = &inner.representations
+        let appended = if role == StandaloneRole::Represented
+            && let Some(representations) = &inner.representations
             && !representations.contains_direct(id)
         {
             vec![representations.describe_direct(
@@ -443,6 +480,7 @@ where
         inner: &mut DurableInner<P>,
         id: ObjectId,
         record: &ObjectRecord,
+        role: StandaloneRole,
     ) -> Result<(ObjectId, InsertOutcome), DurableError> {
         let payload = encode_object_frame(self.identity.scheme(), id, record)?;
         ensure_payload_limit(ARENA_FILE, 0, payload.len(), self.limits)?;
@@ -457,7 +495,9 @@ where
                 return Err(error);
             },
         };
-        let appended = if let Some(representations) = &inner.representations {
+        let appended = if role == StandaloneRole::Represented
+            && let Some(representations) = &inner.representations
+        {
             vec![representations.describe_direct(
                 id,
                 canonical_record_bytes(&payload, self.identity.scheme())?,

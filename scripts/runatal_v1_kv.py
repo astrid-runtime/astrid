@@ -94,6 +94,9 @@ def retained_bytes(record):
 
 
 def decode_value(objects, object_id, length, version):
+    record = objects.get(identity_text(object_id))
+    if version == 4 and record is not None and record["kind"] == 5 and record["version"] == 5:
+        return decode_chunked_value(objects, record, length)
     record = object_at(objects, object_id, 5, version)
     if (
         record["class"] != 0
@@ -104,6 +107,42 @@ def decode_value(objects, object_id, length, version):
     ):
         raise KvFormatError("invalid spilled KV value")
     return record["canonical"]
+
+
+def decode_chunked_value(objects, record, length):
+    # The main reader owns the independent content grammar. Import at call
+    # time because it also imports this KV projection decoder.
+    from runatal_v1_reader import FormatError, decode_file, validate_file
+    from runatal_v1_fastcdc import ASTRID_V1
+
+    if (record["class"] != 0 or record["logical_bytes"]
+            or length <= ASTRID_V1[5]
+            or record["canonical"] != length.to_bytes(8, "little")
+            or len(record["references"]) != 1):
+        raise KvFormatError("invalid chunked KV wrapper")
+    target = exact_reference(record, b"content", 0)
+    file = objects.get(identity_text(target))
+    if file is None:
+        raise KvFormatError("missing chunked KV File")
+    try:
+        profile, logical, _, content = decode_file(file)
+        if profile != ASTRID_V1 or logical != length:
+            raise KvFormatError("chunked KV descriptor mismatch")
+        validate_file(objects, file)
+    except FormatError as error:
+        raise KvFormatError(str(error)) from error
+    # Validation above proves the finite canonical tree and chunk ordering.
+    chunks, pending = [], [content]
+    while pending:
+        node = objects[identity_text(pending.pop())]
+        if node["kind"] == 0:
+            chunks.append(node["canonical"])
+        else:
+            pending.extend(reference["target"] for reference in reversed(node["references"]))
+    value = b"".join(chunks)
+    if len(value) != length:
+        raise KvFormatError("chunked KV reconstructed length mismatch")
+    return value
 
 
 def page_totals(cursor):

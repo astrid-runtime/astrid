@@ -21,7 +21,7 @@ use crate::principal_graph::{LEGACY_PRINCIPAL_GRAPH_VERSION, PRINCIPAL_GRAPH_VER
 use crate::{StorageError, StorageResult};
 
 #[derive(Clone, Copy, Debug)]
-struct TestIdentity;
+pub(super) struct TestIdentity;
 
 impl ObjectIdentity for TestIdentity {
     fn identify(&self, record: &ObjectRecord) -> ObjectId {
@@ -948,3 +948,6 @@ async fn durable_transition_latency_and_bytes_are_cardinality_stable() {
         reopened.close().unwrap();
     }
 }
+
+#[path = "tree/chunked_value_tests.rs"]
+mod chunked_value_tests;

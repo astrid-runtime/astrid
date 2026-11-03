@@ -2,6 +2,11 @@
 """Regression tests for independent physical-store validation."""
 
 import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import runatal_v1_reader as reader
+from runatal_v1_specs import LEGACY_FORMAT_SPECIFICATIONS
 
 from runatal_v1_physical import (
     FormatError,
@@ -19,6 +24,25 @@ def tagged(byte):
 
 
 class PhysicalValidationTests(unittest.TestCase):
+    def test_volume_rejects_pre_catalogue_profile_before_evidence_lookup(self):
+        unsupported = (1, 1, bytes.fromhex(
+            "82e46f53ba9bb2f52d6b942088d5965eaa17c2720e61ce842ed9d5e3c0d1219d"
+        ))
+        self.assertIn(unsupported, LEGACY_FORMAT_SPECIFICATIONS)
+        # Isolate profile admission from physical checksum/coverage validation.
+        # Missing Evidence must not determine whether a profile is supported.
+        physical = {"frozen_specification": reader.identity_text(unsupported)}
+        with (
+            patch.object(Path, "is_file", return_value=True),
+            patch.object(reader, "recover_volume", return_value={
+                "objects.arena": b"", "roots.journal": b"",
+            }),
+            patch.object(reader, "decode_physical_store", return_value=physical),
+            self.assertRaisesRegex(reader.FormatError,
+                                   "volume direct profile selects an unsupported format"),
+        ):
+            reader.recover(Path("isolated-volume"), False)
+
     def test_map_rejects_noncanonical_prefix_bytes(self):
         zero_key = tagged(0x00)
         one_key = tagged(0x80)

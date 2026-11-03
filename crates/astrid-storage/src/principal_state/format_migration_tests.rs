@@ -5,9 +5,10 @@ use crate::storage_model::{ObjectId, ObjectIdentity};
 
 use super::bootstrap;
 use super::format_amendment::{
-    DestinationFormat, PRE_BOTTOM_K_SKETCH_FORMAT_SPEC_ID, PRE_COMPACTION_FORMAT_SPEC_ID,
-    PRE_DENSE_RADIX_FORMAT_SPEC_ID, PRE_FASTCDC_FREEZE_FORMAT_SPEC_ID,
-    PRE_FLEET_OWNER_FORMAT_SPEC_ID, PRE_GC_OUTBOX_FORMAT_SPEC_ID, PRE_KV_TRANSITION_FORMAT_SPEC_ID,
+    DestinationFormat, PRE_BOTTOM_K_SKETCH_FORMAT_SPEC_ID, PRE_CHUNKED_KV_FORMAT_SPEC_ID,
+    PRE_COMPACTION_FORMAT_SPEC_ID, PRE_DENSE_RADIX_FORMAT_SPEC_ID,
+    PRE_FASTCDC_FREEZE_FORMAT_SPEC_ID, PRE_FLEET_OWNER_FORMAT_SPEC_ID,
+    PRE_GC_OUTBOX_FORMAT_SPEC_ID, PRE_KV_TRANSITION_FORMAT_SPEC_ID,
     PRE_MECHANICAL_AUDIT_FORMAT_SPEC_ID, PRE_PHYSICAL_CATALOGUE_FORMAT_SPEC_ID,
     PRE_RESERVED_REPRESENTATION_TAG_FORMAT_SPEC_ID, PRE_RUNATAL_NAMING_FORMAT_SPEC_ID,
     PRE_SHA384_ATTESTATION_FORMAT_SPEC_ID, PRE_WORKSPACE_BRANCH_FORMAT_SPEC_ID,
@@ -118,6 +119,7 @@ fn completed_prior_v1_stores_are_selected_for_runatal_amendment() {
     // path rather than silently treating an unknown kind as Derived.
     assert_prior_format_is_selected(PRE_WORKSPACE_BRANCH_FORMAT_SPEC_ID, false);
     assert_prior_current_projection_is_selected(PRE_RESERVED_REPRESENTATION_TAG_FORMAT_SPEC_ID);
+    assert_prior_current_projection_is_selected(PRE_CHUNKED_KV_FORMAT_SPEC_ID);
 }
 
 fn assert_pre_fleet_owner_format_is_selected() {
@@ -354,4 +356,116 @@ fn current_format_identity_without_catalog_metadata_fails_closed() {
         error.to_string().contains("selects an unsupported format"),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn pre_chunked_kv_catalogue_upgrade_preserves_root_and_accepts_large_values() {
+    use crate::KvStore;
+    use std::sync::Arc;
+
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    super::runtime_tests::seed_legacy_layout(&home);
+    let path = home.principal_store_path();
+    let prior = pre_chunked_specification();
+    let prior_id = Blake3ObjectIdentityV1.identify(&prior);
+    assert_eq!(prior_id, PRE_CHUNKED_KV_FORMAT_SPEC_ID);
+    let catalog = bootstrap::content_catalog_format_specification().unwrap();
+    let catalog_id = Blake3ObjectIdentityV1.identify(&catalog);
+    let engine = Arc::new(
+        RuntimeEngine::open(
+            &path,
+            Blake3ObjectIdentityV1,
+            StateOwnerCodecV2,
+            RecoveryLimits::process_addressable(),
+        )
+        .unwrap(),
+    );
+    engine.persist_standalone_object(&prior).unwrap();
+    engine.persist_standalone_object(&catalog).unwrap();
+    let kv = super::RuntimeStore::from_engine(
+        engine.clone(),
+        super::StateOwnerResolver::new(super::PrincipalDirectory::default()),
+    );
+    kv.set("system:identity", "retained", b"before-amendment".to_vec())
+        .await
+        .unwrap();
+    drop(kv);
+    let before = engine.root(&super::StateOwner::System).unwrap();
+    engine
+        .ensure_direct_representation_catalogue(prior_id, &[prior_id, catalog_id])
+        .unwrap();
+    engine.close().unwrap();
+    drop(engine);
+    std::fs::write(
+        path.join(STORE_METADATA_FILE),
+        store_metadata(prior_id, catalog_id),
+    )
+    .unwrap();
+    std::fs::write(
+        path.join(super::migrations::MIGRATION_MARKER_FILE),
+        super::migrations::KV_TRANSITION_CHECKPOINT_MARKER,
+    )
+    .unwrap();
+    let store =
+        super::open_runtime_principal_store(&home, Arc::new(|_: &super::StateOwner| Ok(None)))
+            .await
+            .unwrap();
+    assert_eq!(
+        store.engine.root(&super::StateOwner::System).unwrap(),
+        before
+    );
+    assert_eq!(
+        store.kv().get("system:identity", "retained").await.unwrap(),
+        Some(b"before-amendment".to_vec())
+    );
+    let large = vec![0x55; 512 * 1024];
+    store
+        .kv()
+        .set("system:identity", "large", large.clone())
+        .await
+        .unwrap();
+    store.engine.close().unwrap();
+    drop(store);
+    let reopened =
+        super::open_runtime_principal_store(&home, Arc::new(|_: &super::StateOwner| Ok(None)))
+            .await
+            .unwrap();
+    assert_eq!(
+        reopened.kv().get("system:identity", "large").await.unwrap(),
+        Some(large)
+    );
+    assert_eq!(
+        reopened
+            .kv()
+            .get("system:identity", "retained")
+            .await
+            .unwrap(),
+        Some(b"before-amendment".to_vec())
+    );
+    reopened.engine.close().unwrap();
+}
+
+pub(super) fn pre_chunked_specification() -> crate::storage_model::ObjectRecord {
+    use crate::storage_model::{ObjectClass, ObjectFormatVersion, ObjectKind, ObjectRecord};
+    // Reconstruct the published predecessor from the amended grammar and
+    // bind it to its real identity without duplicating the full specification.
+    let text = std::str::from_utf8(super::format_amendment::STORE_FORMAT_SPEC).unwrap();
+    let (before, amendment) = text.split_once("7.1.2 Chunked KV spilled values").unwrap();
+    let (_, after) = amendment
+        .split_once("7.2 Content DAG, object format version 1")
+        .unwrap();
+    let prior_text = format!("{before}7.2 Content DAG, object format version 1{after}").replace(
+        "target is a version-4 opaque or version-5 chunked Data KvLeaf\n              representing value_length bytes, as defined in section 7.1.2",
+        "target is a version-4 Data KvLeaf of value_length bytes",
+    );
+    ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        prior_text.as_bytes().to_vec(),
+        vec![],
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap()
 }
