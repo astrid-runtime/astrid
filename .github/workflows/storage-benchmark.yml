@@ -11,6 +11,12 @@ on:
         description: Samples per repeatable workload
         required: true
         default: '3'
+      packing_baseline:
+        description: Optional exact baseline commit for same-host volume packing comparison
+        default: ''
+      packing_candidate:
+        description: Optional exact candidate commit for same-host volume packing comparison
+        default: ''
 
 permissions:
   contents: read
@@ -20,6 +26,7 @@ env:
 
 jobs:
   benchmark:
+    if: inputs.packing_baseline == '' && inputs.packing_candidate == ''
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -63,4 +70,63 @@ jobs:
           name: storage-benchmark-${{ github.sha }}-${{ matrix.name }}
           path: storage-benchmark-${{ matrix.name }}.json
           if-no-files-found: error
+          retention-days: 30
+
+  matched-packing:
+    if: inputs.packing_baseline != '' || inputs.packing_candidate != ''
+    name: Same-host macOS arm64 packing evidence
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - name: Check out benchmark protocol
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: protocol
+          persist-credentials: false
+      - name: Validate exact revisions
+        env:
+          BASELINE: ${{ inputs.packing_baseline }}
+          CANDIDATE: ${{ inputs.packing_candidate }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          for key in ('BASELINE', 'CANDIDATE'):
+              if re.fullmatch(r'[0-9a-f]{40}', os.environ[key]) is None:
+                  raise SystemExit(f'{key} must be a full commit SHA')
+          PY
+      - name: Check out baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.packing_baseline }}
+          path: baseline
+          persist-credentials: false
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.packing_candidate }}
+          path: candidate
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Collect matched unlogged evidence
+        env:
+          BASELINE: ${{ inputs.packing_baseline }}
+          CANDIDATE: ${{ inputs.packing_candidate }}
+        run: |
+          python3 protocol/scripts/benchmarks/matched_volume_packing.py \
+            --baseline "$GITHUB_WORKSPACE/baseline" \
+            --candidate "$GITHUB_WORKSPACE/candidate" \
+            --baseline-head "$BASELINE" --candidate-head "$CANDIDATE" \
+            --output "$GITHUB_WORKSPACE/packing-evidence"
+      - name: Preserve evidence including failed samples
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: matched-packing-${{ github.sha }}
+          path: packing-evidence
+          if-no-files-found: warn
           retention-days: 30
