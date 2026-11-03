@@ -17,9 +17,17 @@ pub(in crate::engine::durable::representations::recovery) struct RecoveredMapNod
     children: Range<usize>,
 }
 
+#[derive(Clone, Copy, Default)]
+enum NodeBody {
+    #[default]
+    Unresolved,
+    Available(MetadataFrameOffset),
+    Consumed,
+}
+
 #[derive(Default)]
 struct NodeDescriptor {
-    offset: Option<MetadataFrameOffset>,
+    body: NodeBody,
     children: Range<usize>,
 }
 
@@ -43,9 +51,13 @@ impl HistoricalMapGraph {
         &self,
         id: &PhysicalMapNodeId,
     ) -> Option<MetadataFrameOffset> {
-        self.indices
-            .get(id)
-            .and_then(|index| self.nodes[index.0].offset)
+        self.indices.get(id).and_then(|index| {
+            if let NodeBody::Available(offset) = self.nodes[index.0].body {
+                Some(offset)
+            } else {
+                None
+            }
+        })
     }
 
     /// Resolve a unique authenticated body after the caller checks duplicates
@@ -56,7 +68,11 @@ impl HistoricalMapGraph {
         offset: MetadataFrameOffset,
         children: &[PhysicalMapNodeId],
     ) -> Result<(), DurableError> {
-        if self.offset(&id).is_some() {
+        if self
+            .indices
+            .get(&id)
+            .is_some_and(|index| !matches!(self.nodes[index.0].body, NodeBody::Unresolved))
+        {
             return Err(DurableError::InvalidRepresentationState(
                 "historical map node is already resolved",
             ));
@@ -84,7 +100,7 @@ impl HistoricalMapGraph {
         }
         let end = self.edges.len();
         self.nodes[index.0] = NodeDescriptor {
-            offset: Some(offset),
+            body: NodeBody::Available(offset),
             children: start..end,
         };
         self.resolved = self.resolved.strict_add(1);
@@ -107,7 +123,10 @@ impl HistoricalMapGraph {
     ) -> Option<RecoveredMapNode> {
         let index = self.indices.get(id)?;
         let descriptor = &mut self.nodes[index.0];
-        let offset = descriptor.offset.take()?;
+        let NodeBody::Available(offset) = descriptor.body else {
+            return None;
+        };
+        descriptor.body = NodeBody::Consumed;
         self.resolved = self.resolved.strict_sub(1);
         Some(RecoveredMapNode {
             offset,
@@ -199,7 +218,7 @@ impl HistoricalMapClosure<'_> {
             self.status[index.0] = ClosureStatus::Visiting;
             self.touched.push(index);
             let node = &self.graph.nodes[index.0];
-            if node.offset.is_none() {
+            if !matches!(node.body, NodeBody::Available(_)) {
                 self.finish(false);
                 return false;
             }

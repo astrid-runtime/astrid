@@ -742,7 +742,13 @@ pub(super) fn validate_radix(
             "radix branch is non-canonical or incomplete",
         ));
     }
-    if children.iter().copied().collect::<BTreeSet<_>>().len() != children.len() {
+    // The selector bitmap bounds this slice to sixteen children. Compare the
+    // preceding IDs directly so validating borrowed nodes never allocates.
+    if children
+        .iter()
+        .enumerate()
+        .any(|(index, child)| children[..index].contains(child))
+    {
         return Err(PhysicalModelError::InvalidMap(
             "radix branch aliases its children",
         ));

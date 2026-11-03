@@ -164,3 +164,30 @@ fn a_cycle_does_not_hide_an_unresolved_descendant() {
     assert!(closure.complete(Some(id(1))));
     assert_eq!(closure.len(), 2);
 }
+
+#[test]
+fn consumed_bodies_cannot_be_resolved_again_or_orphan_their_edges() {
+    let mut graph = HistoricalMapGraph::default();
+    insert(&mut graph, 1, &[2]);
+    insert(&mut graph, 2, &[]);
+    for value in [1, 2] {
+        let node = graph.take(&id(value)).unwrap();
+        let counts = (graph.len(), graph.nodes.len(), graph.edge_count());
+        assert!(
+            graph
+                .insert(id(value), MetadataFrameOffset(99), &[id(3)])
+                .is_err()
+        );
+        assert_eq!((graph.len(), graph.nodes.len(), graph.edge_count()), counts);
+        assert!(graph.offset(&id(value)).is_none());
+        assert!(graph.take(&id(value)).is_none());
+        let children: &[PhysicalMapNodeId] = if value == 1 { &[id(2)] } else { &[] };
+        assert!(graph.matches_children(&node, children));
+    }
+    assert_eq!(graph.len(), 0);
+    // A failed take of a forward reference must not consume its future body.
+    insert(&mut graph, 4, &[5]);
+    assert!(graph.take(&id(5)).is_none());
+    insert(&mut graph, 5, &[]);
+    assert!(graph.closure_checker().complete(Some(id(4))));
+}
