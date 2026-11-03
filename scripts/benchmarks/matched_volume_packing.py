@@ -72,6 +72,28 @@ def require(condition, detail):
         raise RuntimeError(detail)
 
 
+def owned_indexing_namespace(protocol, baseline, candidate, output):
+    """Validate the fresh .noindex ancestor created before CI checkout.
+
+    Apple documents .noindex path components as excluding Spotlight discovery:
+    https://developer.apple.com/documentation/xcode/locating-a-missing-debug-symbol-file
+    This cannot make unrelated host activity quiet; admission gates still apply.
+    """
+    workspace = os.environ.get("GITHUB_WORKSPACE", "")
+    require(workspace and Path(workspace).is_absolute(), "absolute GITHUB_WORKSPACE required")
+    root = Path(workspace).resolve() / "astrid-benchmark.noindex"
+    require(root.is_dir() and not root.is_symlink() and root.resolve() == root,
+            "fresh owned .noindex benchmark namespace required before checkout")
+    paths = {"protocol": protocol, "baseline": baseline, "candidate": candidate, "output": output}
+    for role, path in paths.items():
+        absolute = path.absolute()
+        require(absolute == absolute.resolve() and absolute != root and absolute.is_relative_to(root),
+                f"{role} must stay within the nonaliased owned .noindex namespace")
+    return {"root": str(root), "paths": {key: str(value.absolute()) for key, value in paths.items()},
+            "mechanism": "Spotlight .noindex ancestor created before checkout/build/fixtures",
+            "proves_quiet": False}
+
+
 def clean_checkout(path, head, injected=False):
     require(re.fullmatch(r"[0-9a-f]{40}", head), "expected a full commit SHA")
     require(command(["git", "rev-parse", "HEAD"], path) == head, "head mismatch")
@@ -369,12 +391,14 @@ def main():
     protocol = Path(command(["git", "rev-parse", "--show-toplevel"], Path(__file__).parent))
     protocol_head = os.environ.get("GITHUB_SHA", "")
     clean_checkout(protocol, protocol_head)
+    namespace = owned_indexing_namespace(protocol, args.baseline, args.candidate, args.output)
     output = args.output.resolve()
     output.mkdir(exist_ok=False)
     probe = Path(__file__).with_name("volume_packing_probe.rs")
     if args.mode == "packing":
         require(sha(probe) == PROBE_SHA, "frozen probe changed")
     receipt = {"complete": False, "performance_accepted": False, "samples": [],
+               "indexing_namespace": namespace,
                "mode": args.mode, "probe_sha256": PROBE_SHA if args.mode == "packing" else None,
                "runner_sha256": sha(Path(__file__)),
                "source_build_helper_sha256": sha(Path(source_build.__file__)),

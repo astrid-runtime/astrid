@@ -96,10 +96,12 @@ jobs:
         uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
+      - name: Create owned unindexed benchmark namespace
+        run: mkdir -m 700 "$GITHUB_WORKSPACE/astrid-benchmark.noindex"
       - name: Check out benchmark protocol
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: protocol
+          path: astrid-benchmark.noindex/protocol
           persist-credentials: false
       - name: Validate exact revisions
         env:
@@ -116,13 +118,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.packing_baseline }}
-          path: baseline
+          path: astrid-benchmark.noindex/baseline
           persist-credentials: false
       - name: Check out candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.packing_candidate }}
-          path: candidate
+          path: astrid-benchmark.noindex/candidate
           persist-credentials: false
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -134,18 +136,18 @@ jobs:
           BASELINE: ${{ inputs.packing_baseline }}
           CANDIDATE: ${{ inputs.packing_candidate }}
         run: |
-          python3 protocol/scripts/benchmarks/matched_volume_packing.py \
+          python3 astrid-benchmark.noindex/protocol/scripts/benchmarks/matched_volume_packing.py \
             --mode "$MATCHED_MODE" \
-            --baseline "$GITHUB_WORKSPACE/baseline" \
-            --candidate "$GITHUB_WORKSPACE/candidate" \
+            --baseline "$GITHUB_WORKSPACE/astrid-benchmark.noindex/baseline" \
+            --candidate "$GITHUB_WORKSPACE/astrid-benchmark.noindex/candidate" \
             --baseline-head "$BASELINE" --candidate-head "$CANDIDATE" \
-            --output "$GITHUB_WORKSPACE/packing-evidence"
+            --output "$GITHUB_WORKSPACE/astrid-benchmark.noindex/packing-evidence"
       - name: Preserve evidence including failed samples
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: matched-packing-${{ github.sha }}
-          path: packing-evidence/public
+          path: astrid-benchmark.noindex/packing-evidence/public
           if-no-files-found: warn
           retention-days: 30
 
@@ -159,10 +161,12 @@ jobs:
         uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
+      - name: Create owned unindexed benchmark namespace
+        run: mkdir -m 700 "$GITHUB_WORKSPACE/astrid-benchmark.noindex"
       - name: Check out benchmark protocol
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: protocol
+          path: astrid-benchmark.noindex/protocol
           persist-credentials: false
       - name: Validate exact revisions
         env:
@@ -179,13 +183,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.native250_baseline }}
-          path: baseline
+          path: astrid-benchmark.noindex/baseline
           persist-credentials: false
       - name: Check out candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.native250_candidate }}
-          path: candidate
+          path: astrid-benchmark.noindex/candidate
           persist-credentials: false
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -197,16 +201,16 @@ jobs:
           BASELINE: ${{ inputs.native250_baseline }}
           CANDIDATE: ${{ inputs.native250_candidate }}
         run: |
-          python3 protocol/scripts/benchmarks/matched_native250.py \
-            --baseline "$GITHUB_WORKSPACE/baseline" \
-            --candidate "$GITHUB_WORKSPACE/candidate" \
+          python3 astrid-benchmark.noindex/protocol/scripts/benchmarks/matched_native250.py \
+            --baseline "$GITHUB_WORKSPACE/astrid-benchmark.noindex/baseline" \
+            --candidate "$GITHUB_WORKSPACE/astrid-benchmark.noindex/candidate" \
             --baseline-head "$BASELINE" --candidate-head "$CANDIDATE" \
-            --output "$GITHUB_WORKSPACE/native250-evidence"
+            --output "$GITHUB_WORKSPACE/astrid-benchmark.noindex/native250-evidence"
       - name: Preserve evidence including failed samples
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: matched-native250-${{ github.sha }}
-          path: native250-evidence/public
+          path: astrid-benchmark.noindex/native250-evidence/public
           if-no-files-found: warn
           retention-days: 30

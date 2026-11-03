@@ -702,12 +702,15 @@ def main() -> None:
     protocol = Path(packing.command(["git", "rev-parse", "--show-toplevel"], HERE))
     protocol_head = os.environ.get("GITHUB_SHA", "")
     packing.clean_checkout(protocol, protocol_head)
+    namespace = packing.owned_indexing_namespace(protocol, args.baseline, args.candidate, args.output)
     output = args.output.resolve()
     output.mkdir(exist_ok=False)
     ownership_root = output / "ownership-root"
     ownership_root.mkdir(mode=0o700)
     receipt = {
         "complete": False, "performance_accepted": False, "runs": [],
+        "indexing_namespace": namespace,
+        "short_run_directory_policy": "/private/tmp owned directories end .noindex; socket length ceiling unchanged",
         "runner_sha256": sha(Path(__file__)),
         "client_source_sha256": sha(CLIENT_SOURCE),
         "capsule_source_lib_sha256": sha(CAPSULE_SOURCE / "src" / "lib.rs"),

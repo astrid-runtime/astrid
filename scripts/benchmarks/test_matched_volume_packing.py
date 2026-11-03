@@ -359,7 +359,7 @@ class RefusalTests(unittest.TestCase):
             self.assertEqual(files, ["manifest.json", "receipt.json", "sample-00.stdout"])
             self.assertTrue((fixture / "volume").exists())
             workflow = Path(__file__).resolve().parents[2] / ".github/workflows/storage-benchmark.yml"
-            self.assertIn("path: packing-evidence/public", workflow.read_text())
+            self.assertIn("path: astrid-benchmark.noindex/packing-evidence/public", workflow.read_text())
 
     def test_packing_final_save_failure_still_publishes_and_emits(self):
         with tempfile.TemporaryDirectory() as directory:

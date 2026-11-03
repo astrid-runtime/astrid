@@ -114,8 +114,11 @@ def child_env(home: Path, run: Path) -> dict[str, str]:
 
 
 def private_run_dir(name: str) -> Path:
-    # Keep short paths for sockets; also hosts the CI-only capsule cargo target.
-    path = Path("/private/tmp") / f"ast-n250-{os.getpid()}-{time.time_ns()}-{name}"
+    # Keep short paths for sockets; exclude these owned run/capsule targets
+    # from Spotlight too, without changing host-wide indexing services.
+    path = Path("/private/tmp") / f"ast-n250-{os.getpid()}-{time.time_ns()}-{name}.noindex"
+    # Darwin sockaddr_un.sun_path is 104 bytes including its terminator.
+    require(len(os.fsencode(path / "system.sock")) < 104, "owned socket path exceeds Darwin bound")
     require(not path.exists(), f"run dir exists {path}")
     path.mkdir(mode=0o700)
     return path
