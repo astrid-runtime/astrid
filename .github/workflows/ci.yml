@@ -390,6 +390,10 @@ jobs:
         shell: pwsh
         run: cargo test --locked --target ${{ matrix.target }} -p astrid-storage volume::hosted -- --nocapture
 
+      - name: Run disposable index cache recovery tests natively
+        shell: pwsh
+        run: cargo test --locked --target ${{ matrix.target }} -p astrid-storage engine::durable::index_tests::cache_rebuild -- --nocapture
+
       - name: Parse the Windows install scripts
         shell: pwsh
         run: |

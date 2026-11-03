@@ -301,3 +301,5 @@ fn standalone_insert_indexes_the_complete_staged_suffix_before_reopen() {
     assert_eq!(reopened.object(bootstrap_id).unwrap(), Some(bootstrap));
     assert_eq!(reopened.object_count().unwrap(), 3);
 }
+
+mod cache_rebuild;
