@@ -100,6 +100,27 @@ def quiet_snapshot():
             "interval_seconds": elapsed, "quiet": cpu <= 10.0}
 
 
+def settle_after_builds(receipt, save, deadline):
+    # Builds and artifact hashing are outside the measurement. Allow their
+    # background work to drain before admission, retaining every observation.
+    # This does not retry, discard, or extend any timed probe sample.
+    receipt["postbuild_settling"] = {"maximum_windows": 30,
+                                   "required_consecutive_quiet": 2, "windows": []}
+    state = receipt["postbuild_settling"]
+    consecutive = 0
+    for _ in range(state["maximum_windows"]):
+        require(deadline - time.monotonic() >= 181,
+                "run budget cannot contain settling and a full sample: HOLD")
+        window = quiet_snapshot()
+        state["windows"].append(window)
+        consecutive = consecutive + 1 if window["quiet"] else 0
+        state["consecutive_quiet"] = consecutive
+        save()
+        if consecutive == state["required_consecutive_quiet"]:
+            return
+    raise RuntimeError("postbuild background load did not settle: HOLD")
+
+
 def build(path, head, probe, output, arm, deadline):
     clean_checkout(path, head)
     source = path / INJECTION
@@ -254,6 +275,7 @@ def main():
             save()
         require(all(b["injected_sha256"] == PROBE_SHA for b in builds.values()),
                 "producer probe injections differ")
+        settle_after_builds(receipt, save, deadline)
         schedule = []
         for count, regions in [(32768, 7), (600000, 1)]:
             schedule.extend((arm, count, regions, "warmup") for arm in builds)

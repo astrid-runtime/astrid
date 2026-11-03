@@ -79,6 +79,34 @@ class RefusalTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "did not advance"):
                 MODULE.quiet_snapshot()
 
+    def test_postbuild_settling_requires_two_consecutive_quiet_windows(self):
+        receipt = {}
+        with patch.object(MODULE, "quiet_snapshot", side_effect=[
+                {"quiet": False}, {"quiet": True}, {"quiet": False},
+                {"quiet": True}, {"quiet": True}]), \
+                patch.object(MODULE, "run_sample") as sample:
+            save = MagicMock()
+            MODULE.settle_after_builds(receipt, save, float("inf"))
+        self.assertEqual(len(receipt["postbuild_settling"]["windows"]), 5)
+        self.assertEqual(receipt["postbuild_settling"]["consecutive_quiet"], 2)
+        self.assertEqual(save.call_count, 5)
+        sample.assert_not_called()
+
+    def test_persistent_load_holds_after_bounded_settling(self):
+        receipt = {}
+        with patch.object(MODULE, "quiet_snapshot", return_value={"quiet": False}), \
+                patch.object(MODULE, "run_sample") as sample:
+            with self.assertRaisesRegex(RuntimeError, "did not settle"):
+                MODULE.settle_after_builds(receipt, MagicMock(), float("inf"))
+        self.assertEqual(len(receipt["postbuild_settling"]["windows"]), 30)
+        sample.assert_not_called()
+
+    def test_settling_does_not_spend_reserved_sample_budget(self):
+        with patch.object(MODULE, "quiet_snapshot") as snapshot:
+            with self.assertRaisesRegex(RuntimeError, "run budget"):
+                MODULE.settle_after_builds({}, MagicMock(), 0)
+        snapshot.assert_not_called()
+
     def test_local_host_refuses_before_output_or_build(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "must-not-exist"
