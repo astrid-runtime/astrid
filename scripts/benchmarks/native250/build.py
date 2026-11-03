@@ -167,7 +167,10 @@ def cargo_build(
     env = sanitized_env()
     env["CARGO_TARGET_DIR"] = str(target_dir)
     _host_cargo_caches(env)
-    cmd = ["cargo", "build", "--release", "--locked", "-j", "1", "--message-format=json"]
+    # Use Cargo's host/configured parallelism for the disposable build. A forced
+    # single compiler exhausted the build budget before any runtime measurement.
+    # Release settings and the post-build quiet gate remain identical per arm.
+    cmd = ["cargo", "build", "--release", "--locked", "--message-format=json"]
     for package in packages:
         cmd.extend(["-p", package])
     with log.open("w") as stream:

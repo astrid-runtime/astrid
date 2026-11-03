@@ -121,6 +121,9 @@ class Native250BuildSyntheticTests(unittest.TestCase):
             self.assertIn("-p", command)
             self.assertEqual(command[command.index("-p") + 1], "astrid")
             self.assertNotIn("astrid-cli", command)
+            self.assertNotIn("-j", command)
+            self.assertIn("--release", command)
+            self.assertIn("--locked", command)
             self.assertNotIn("astrid-daemon", command[command.index("-p") :])
             self.assertEqual(
                 set(result["binaries"]),
