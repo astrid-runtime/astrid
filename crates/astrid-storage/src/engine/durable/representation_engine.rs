@@ -70,7 +70,8 @@ where
     ///
     /// Applies the same recovery checks as
     /// [`Self::ensure_direct_representation_catalogue`] and rejects an active
-    /// profile not explicitly named by either specification argument.
+    /// profile not explicitly named by either specification argument, or a
+    /// bootstrap object that has entered the relocatable catalogue.
     pub fn ensure_direct_representation_catalogue_compatible_with(
         &self,
         frozen_specification: ObjectId,
@@ -172,6 +173,17 @@ where
         {
             return Err(DurableError::InvalidRepresentationState(
                 "active direct profile specification is not a persisted bootstrap object",
+            ));
+        }
+        // A predecessor may not know a successor's bootstrap identity and can
+        // describe it during coverage repair. Exclusion must be checked against
+        // recovered authoritative state, not just the current writer's role.
+        if excluded
+            .iter()
+            .any(|object| representations.has_representation_for(*object))
+        {
+            return Err(DurableError::InvalidRepresentationState(
+                "bootstrap object has a relocatable representation",
             ));
         }
         let missing = inner

@@ -364,6 +364,12 @@ impl RepresentationStore {
         Ok(RepresentationProfile::decode(bytes)?.frozen_specification())
     }
 
+    pub(super) fn has_representation_for(&self, object: ObjectId) -> bool {
+        self.reverse
+            .get(&object)
+            .is_some_and(|records| !records.is_empty())
+    }
+
     pub(super) fn contains_direct(&self, object: ObjectId) -> bool {
         self.reverse.get(&object).is_some_and(|records| {
             records.iter().any(|record| {
