@@ -1,14 +1,9 @@
 //! Keep active map residency independent of durable historical nodes.
 
-use std::collections::BTreeMap;
-
-use crate::storage_model::{
-    CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapNode, PhysicalMapNodeId,
-};
+use crate::storage_model::{CanonicalPhysicalMap, PhysicalMapNodeId};
 
 use super::DurableError;
 use super::RepresentationStore;
-use super::format::Blake3PhysicalIdentity;
 
 /// Last measured reachable closures; scheduling evidence confers no authority.
 #[derive(Debug)]
@@ -88,41 +83,6 @@ impl RepresentationStore {
         }
         collection
     }
-}
-
-pub(super) fn recover_active_map(
-    domain: PhysicalMapDomain,
-    root: Option<PhysicalMapNodeId>,
-    arena: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
-) -> Result<CanonicalPhysicalMap, DurableError> {
-    let mut nodes = BTreeMap::new();
-    let mut pending = root.into_iter().collect::<Vec<_>>();
-    while let Some(id) = pending.pop() {
-        if nodes.contains_key(&id) {
-            continue;
-        }
-        let node = arena
-            .remove(&id)
-            .ok_or(DurableError::InvalidRepresentationState(
-                "active physical map closure is incomplete",
-            ))?;
-        match &node {
-            PhysicalMapNode::Branch { zero, one, .. } => pending.extend([*zero, *one]),
-            PhysicalMapNode::Radix { children, .. } => pending.extend(children.iter().copied()),
-            PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => {},
-        }
-        nodes.insert(id, node);
-    }
-    // Durable metadata retains historical roots. An active view needs only its
-    // own closure, and domain-bound identities prevent sharing between maps.
-    // Keep canonical validation: reachability alone proves neither identity nor
-    // shape, and the visited set must not turn cycles into accepted maps.
-    Ok(CanonicalPhysicalMap::recover(
-        &Blake3PhysicalIdentity,
-        domain,
-        root,
-        nodes,
-    )?)
 }
 
 #[cfg(test)]

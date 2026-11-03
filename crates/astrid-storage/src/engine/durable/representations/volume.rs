@@ -53,6 +53,7 @@ impl RepresentationStore {
             active,
             state,
             index,
+            limits,
         )?;
         Ok(Some(recovered))
     }

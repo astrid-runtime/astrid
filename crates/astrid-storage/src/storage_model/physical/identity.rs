@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use crate::storage_model::{BlobId, ObjectId};
 
 use super::PhysicalModelError;
-use super::codec::{Decoder, Encoder};
+use super::codec::{Decoder, Encoder, EncodingSink};
 
 const BLAKE3_ALGORITHM: u16 = 1;
 const LOGICAL_CONSTRUCTION: u16 = 1;
@@ -168,7 +168,7 @@ pub(super) fn encode_record_id(encoder: &mut Encoder, id: RepresentationRecordId
     );
 }
 
-pub(super) fn encode_map_node_id(encoder: &mut Encoder, id: PhysicalMapNodeId) {
+pub(super) fn encode_map_node_id<W: EncodingSink>(encoder: &mut Encoder<W>, id: PhysicalMapNodeId) {
     encode_physical_digest(encoder, id.as_bytes());
 }
 
@@ -220,14 +220,19 @@ pub(super) fn tagged_profile_bytes(id: RepresentationProfileId) -> Vec<u8> {
     encoder.finish()
 }
 
-fn encode_tagged(encoder: &mut Encoder, algorithm: u16, construction: u16, digest: &[u8; 32]) {
+fn encode_tagged<W: EncodingSink>(
+    encoder: &mut Encoder<W>,
+    algorithm: u16,
+    construction: u16,
+    digest: &[u8; 32],
+) {
     encoder.u16(algorithm);
     encoder.u16(construction);
     encoder.u32(CURRENT_DIGEST_BYTES);
     encoder.raw(digest);
 }
 
-pub(super) fn encode_physical_digest(encoder: &mut Encoder, digest: &[u8; 32]) {
+pub(super) fn encode_physical_digest<W: EncodingSink>(encoder: &mut Encoder<W>, digest: &[u8; 32]) {
     encode_tagged(encoder, BLAKE3_ALGORITHM, PHYSICAL_CONSTRUCTION, digest);
 }
 

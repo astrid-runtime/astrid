@@ -4,8 +4,49 @@ use alloc::vec::Vec;
 
 use super::PhysicalModelError;
 
-pub(super) struct Encoder {
-    bytes: Vec<u8>,
+#[cfg(test)]
+mod tests;
+
+pub(super) trait EncodingSink {
+    fn write(&mut self, bytes: &[u8]);
+}
+
+impl EncodingSink for Vec<u8> {
+    fn write(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+}
+
+pub(super) struct Comparison<'a> {
+    remaining: Option<&'a [u8]>,
+}
+
+impl EncodingSink for Comparison<'_> {
+    fn write(&mut self, bytes: &[u8]) {
+        self.remaining = self.remaining.and_then(|remaining| {
+            let (prefix, tail) = remaining.split_at_checked(bytes.len())?;
+            (prefix == bytes).then_some(tail)
+        });
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static ENCODER_FINISHES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_encoder_finishes() {
+    ENCODER_FINISHES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn encoder_finishes() -> usize {
+    ENCODER_FINISHES.with(core::cell::Cell::get)
+}
+
+pub(super) struct Encoder<W = Vec<u8>> {
+    bytes: W,
 }
 
 impl Encoder {
@@ -14,27 +55,49 @@ impl Encoder {
     }
 
     pub(super) fn finish(self) -> Vec<u8> {
+        #[cfg(test)]
+        ENCODER_FINISHES.with(|count| count.set(count.get().strict_add(1)));
         self.bytes
     }
 
+    pub(super) const fn comparing(bytes: &[u8]) -> Encoder<Comparison<'_>> {
+        Encoder {
+            bytes: Comparison {
+                remaining: Some(bytes),
+            },
+        }
+    }
+}
+
+impl Encoder<Comparison<'_>> {
+    pub(super) fn finish_comparison(self) -> Result<(), PhysicalModelError> {
+        if self.bytes.remaining == Some(&[]) {
+            Ok(())
+        } else {
+            Err(PhysicalModelError::NonCanonicalEncoding)
+        }
+    }
+}
+
+impl<W: EncodingSink> Encoder<W> {
     pub(super) fn u8(&mut self, value: u8) {
-        self.bytes.push(value);
+        self.bytes.write(&[value]);
     }
 
     pub(super) fn u16(&mut self, value: u16) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
+        self.bytes.write(&value.to_le_bytes());
     }
 
     pub(super) fn u32(&mut self, value: u32) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
+        self.bytes.write(&value.to_le_bytes());
     }
 
     pub(super) fn u64(&mut self, value: u64) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
+        self.bytes.write(&value.to_le_bytes());
     }
 
     pub(super) fn raw(&mut self, value: &[u8]) {
-        self.bytes.extend_from_slice(value);
+        self.bytes.write(value);
     }
 
     pub(super) fn bytes(&mut self, value: &[u8]) -> Result<(), PhysicalModelError> {
