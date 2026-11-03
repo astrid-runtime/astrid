@@ -115,6 +115,23 @@ def _validate_owned_target(
     return workspace_root, checkout_root, target_root
 
 
+def communicate_owned(process: subprocess.Popen, budget: float):
+    """Drain or kill/reap the caller's newly created owned process group.
+
+    Caller must start a new session and retain all timeout diagnostics.
+    Never pass a preexisting process or a shared process group.
+    """
+    try:
+        return process.communicate(timeout=budget)
+    except subprocess.TimeoutExpired as error:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        error.output, error.stderr = process.communicate()
+        raise
+
+
 def _run_owned(
     command: list[str],
     *,
@@ -136,13 +153,9 @@ def _run_owned(
         start_new_session=True,
     )
     try:
-        stdout, stderr = process.communicate(timeout=budget)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        stdout, stderr = process.communicate()
+        stdout, stderr = communicate_owned(process, budget)
+    except subprocess.TimeoutExpired as error:
+        stdout, stderr = error.output or "", error.stderr or ""
         with log.open("a", encoding="utf-8") as stream:
             if stdout:
                 stream.write(stdout)

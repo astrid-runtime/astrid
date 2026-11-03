@@ -75,7 +75,7 @@ def verify_overlay(path, head, manifest, hooks):
 
 def prepare_overlay(path, head, protocol, manifest, hooks):
     hooks["clean_checkout"](path, head)
-    for relative in SOURCES:
+    for relative in manifest:
         target = path / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         require(not target.is_symlink() and target.parent.resolve() == target.parent,
@@ -97,15 +97,18 @@ def wait_build(process, budget):
         raise
 
 
-def build(path, head, protocol, manifest, output, arm, deadline, hooks):
+def build(path, head, protocol, manifest, output, arm, deadline, hooks, target=None):
     dirty = prepare_overlay(path, head, protocol, manifest, hooks)
     require(shutil.disk_usage(path).free >= 2 * 1024**3, "build disk reserve")
     env = os.environ.copy()
     # Existing disposable-CI exception: one target shared across both producers,
     # outside their source trees and never included in published evidence.
     env["CARGO_TARGET_DIR"] = str(output / "cargo-target")
-    command = ["cargo", "bench", "--no-run", "--locked", "-j", "1", "-p",
-               "astrid-storage", "--bench", "storage_io", "--message-format=json-render-diagnostics"]
+    target = target or {"name": "storage_io", "source": f"{BENCH_ROOT}/storage_io.rs",
+                        "kind": "bench", "cargo": ["bench", "--no-run", "--locked", "-j", "1",
+                                                   "-p", "astrid-storage", "--bench", "storage_io"],
+                        "frozen": "storage-io"}
+    command = ["cargo", *target["cargo"], "--message-format=json-render-diagnostics"]
     log = output / f"{arm}-build.jsonl"
     budget = min(900, deadline - time.monotonic())
     require(budget > 0, "run budget exhausted before build")
@@ -116,7 +119,7 @@ def build(path, head, protocol, manifest, output, arm, deadline, hooks):
         process = subprocess.Popen(command, cwd=path, env=env, stdout=stream,
                                    stderr=subprocess.STDOUT, start_new_session=True)
         code = wait_build(process, max(0, build_deadline - time.monotonic()))
-    require(code == 0, f"{arm} evolving-KV build failed: {code}")
+    require(code == 0, f"{arm} {target['name']} build failed: {code}")
     require(verify_overlay(path, head, manifest, hooks) == dirty,
             "producer overlay status changed during build")
     artifacts, executables = [], []
@@ -135,13 +138,13 @@ def build(path, head, protocol, manifest, output, arm, deadline, hooks):
                                   "package_id": event["package_id"],
                                   "features": event["features"], "profile": event["profile"],
                                   "fresh": event.get("fresh")})
-        if event["target"]["name"] == "storage_io" and event.get("executable"):
-            require(Path(event["target"]["src_path"]).resolve() == path / BENCH_ROOT / "storage_io.rs",
+        if event["target"]["name"] == target["name"] and event.get("executable"):
+            require(Path(event["target"]["src_path"]).resolve() == path / target["source"],
                     "Cargo benchmark source is not the selected producer overlay")
-            require("bench" in event["target"]["kind"], "Cargo executable is not a benchmark target")
+            require(target["kind"] in event["target"]["kind"], "Cargo executable target kind mismatch")
             executables.append(event["executable"])
-    require(len(executables) == 1, "Cargo emitted ambiguous/missing storage_io executable")
-    binary = output / f"{arm}-storage-io"
+    require(len(executables) == 1, "Cargo emitted ambiguous/missing selected executable")
+    binary = output / f"{arm}-{target['frozen']}"
     shutil.copy2(executables[0], binary)
     return {"head": head, "tree": hooks["command"](["git", "rev-parse", "HEAD^{tree}"], path),
             "rustc": hooks["command"](["rustc", "-Vv"], path),
@@ -333,13 +336,15 @@ def public_source_paths(output):
     return [output / "protocol-source" / relative for relative in SOURCES]
 
 
-def run(args, protocol, output, receipt, save, deadline, hooks):
-    manifest = source_manifest(protocol, hooks)
+def run(args, protocol, output, receipt, save, deadline, hooks, workload=None):
+    manifest = (workload.source_manifest if workload else source_manifest)(protocol, hooks)
     receipt.update(mode="evolving-kv", source_overlay=manifest,
                    workload_definition=WORKLOAD_DEFINITION,
                    method="2 warmups plus 16 timed ABBA invocations; storage_io --only evolving-kv --samples 1",
                    metric_scope="hosted KV wall time and volume length growth; not allocated memory or reclaimable disk")
-    for relative in SOURCES:
+    if workload:
+        receipt.update(workload.DEFINITION)
+    for relative in manifest:
         target = output / "protocol-source" / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(protocol / relative, target)
@@ -349,15 +354,18 @@ def run(args, protocol, output, receipt, save, deadline, hooks):
                             ("candidate", args.candidate.resolve(), args.candidate_head)]:
         receipt["build_attempt"] = {"arm": arm, "head": head, "complete": False}
         save()
-        builds[arm] = build(path, head, protocol, manifest, output, arm, deadline, hooks)
+        options = {"target": workload.TARGET} if workload else {}
+        builds[arm] = build(path, head, protocol, manifest, output, arm, deadline, hooks, **options)
         receipt["build_attempt"]["complete"] = True
         save()
     require(builds["main"]["rustc"] == builds["candidate"]["rustc"], "producer toolchain mismatch")
     hooks["settle_after_builds"](receipt, save, deadline)
-    schedule = hooks["abba_schedule"]([()], builds)
+    options = {"timed_cycles": workload.TIMED_ABBA_CYCLES} if workload else {}
+    schedule = hooks["abba_schedule"](workload.CONFIGURATIONS if workload else [()], builds, **options)
     receipt["schedule"] = schedule
     save()
-    for index, (arm, phase) in enumerate(schedule):
+    for index, item in enumerate(schedule):
+        arm, *configuration, phase = item
         require(deadline - time.monotonic() >= 180, "run budget cannot contain full sample: HOLD")
         before = hooks["settle_before_sample"](receipt, save, deadline, {"index": index})
         receipt["quiet_gate_before_sample"] = {"index": index, **before}
@@ -367,14 +375,18 @@ def run(args, protocol, output, receipt, save, deadline, hooks):
         fixture = Path(tempfile.mkdtemp(prefix="evolving-kv-", dir=output))
         sample = {"arm": arm, "phase": phase, "quiet_before": before,
                   "fixture": str(fixture), "complete": False}
+        if workload:
+            sample.update(zip(workload.SAMPLE_FIELDS, configuration, strict=True))
         receipt["samples"].append(sample)
         save()
         path = args.baseline.resolve() if arm == "main" else args.candidate.resolve()
         try:
-            run_sample(builds[arm], path, fixture, output, index, sample, manifest, hooks)
+            runner = workload.run_sample if workload else run_sample
+            runner(builds[arm], path, fixture, output, index, sample, manifest, hooks)
         finally:
             save()
-    require(source_manifest(protocol, hooks) == manifest, "protocol source drift")
+    require((workload.source_manifest if workload else source_manifest)(protocol, hooks) == manifest,
+            "protocol source drift")
     for arm, path in [("main", args.baseline.resolve()), ("candidate", args.candidate.resolve())]:
         require(verify_overlay(path, builds[arm]["head"], manifest, hooks) == builds[arm]["overlay_porcelain"],
                 "producer source drift after schedule")

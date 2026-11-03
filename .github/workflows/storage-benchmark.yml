@@ -14,13 +14,13 @@ on:
       matched_mode:
         description: Existing matched runner workload (requires both packing commit inputs)
         type: choice
-        options: [packing, evolving-kv]
+        options: [packing, evolving-kv, route-selection]
         default: packing
       packing_baseline:
-        description: Optional exact baseline commit for selected same-host matched storage workload
+        description: Optional exact baseline commit for selected same-host matched workload
         default: ''
       packing_candidate:
-        description: Optional exact candidate commit for selected same-host matched storage workload
+        description: Optional exact candidate commit for selected same-host matched workload
         default: ''
       native250_baseline:
         description: Optional exact baseline commit for portable matched native250 evidence
@@ -37,7 +37,7 @@ env:
 
 jobs:
   benchmark:
-    if: inputs.packing_baseline == '' && inputs.packing_candidate == '' && inputs.native250_baseline == '' && inputs.native250_candidate == '' && inputs.matched_mode != 'evolving-kv'
+    if: inputs.packing_baseline == '' && inputs.packing_candidate == '' && inputs.native250_baseline == '' && inputs.native250_candidate == '' && inputs.matched_mode == 'packing'
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -87,8 +87,8 @@ jobs:
           retention-days: 30
 
   matched-packing:
-    if: inputs.packing_baseline != '' || inputs.packing_candidate != '' || inputs.matched_mode == 'evolving-kv'
-    name: Same-host macOS arm64 matched storage evidence
+    if: inputs.packing_baseline != '' || inputs.packing_candidate != '' || inputs.matched_mode != 'packing'
+    name: Same-host macOS arm64 matched workload evidence
     runs-on: macos-latest
     timeout-minutes: 60
     steps:

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Same-host, unlogged ABBA evidence from two exact storage revisions.
+"""Same-host, unlogged ABBA evidence from two exact producer revisions.
 
 Runs only in a disposable GitHub-hosted macOS workspace. The frozen public-API
 probe is injected identically as an untracked example in both clean checkouts;
 the report records that injection explicitly. Evolving-KV mode instead overlays
-all modules of the existing storage_io benchmark identically. No automatic speed verdict.
+all modules of the existing storage_io benchmark identically. Route-selection
+mode overlays the frozen public EventBus example. No automatic speed verdict.
 """
 
 import argparse
@@ -36,6 +37,12 @@ evolving_kv = importlib.util.module_from_spec(EVOLVING_SPEC)
 EVOLVING_SPEC.loader.exec_module(evolving_kv)
 
 
+ROUTE_SPEC = importlib.util.spec_from_file_location(
+    "matched_route_selection", Path(__file__).with_name("route_selection.py"))
+route_selection = importlib.util.module_from_spec(ROUTE_SPEC)
+ROUTE_SPEC.loader.exec_module(route_selection)
+
+
 SOURCE_BUILD_SPEC = importlib.util.spec_from_file_location(
     "benchmark_source_build", Path(__file__).with_name("source_build.py"))
 source_build = importlib.util.module_from_spec(SOURCE_BUILD_SPEC)
@@ -49,6 +56,8 @@ def finalize_evidence(output, receipt, save, primary_error=None):
     if receipt.get("mode") == "evolving-kv":
         logs.extend(evolving_kv.public_source_paths(output))
         logs.extend(output.glob("sample-*.report.json"))
+    if receipt.get("mode") == "route-selection":
+        logs.append(output / "protocol-source" / route_selection.SOURCE)
     evidence.finalize(output, receipt, save, emit_terminal_receipt,
                       primary_error=primary_error, log_paths=logs)
 
@@ -363,19 +372,19 @@ def run_sample(binary, fixture, output, index, sample):
         sample["fixture_preserved"] = fixture.exists()
 
 
-def abba_schedule(configurations, arms):
-    """Retain two warmups and sixteen timed samples per matched configuration."""
+def abba_schedule(configurations, arms, timed_cycles=4):
+    """Default: two warmups and sixteen total timed samples per configuration."""
     schedule = []
     for configuration in configurations:
         schedule.extend((arm, *configuration, "warmup") for arm in arms)
         schedule.extend((arm, *configuration, "timed")
-                        for arm in ["main", "candidate", "candidate", "main"] * 4)
+                        for arm in ["main", "candidate", "candidate", "main"] * timed_cycles)
     return schedule
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("packing", "evolving-kv"), default="packing")
+    parser.add_argument("--mode", choices=("packing", "evolving-kv", "route-selection"), default="packing")
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--candidate", type=Path, required=True)
     parser.add_argument("--baseline-head", required=True)
@@ -424,16 +433,20 @@ def main():
     try:
         for key in list(os.environ):
             if (key.startswith(("Malloc", "DYLD_", "ASAN_", "LSAN_", "HEAPTRACK")) or
-                    (args.mode == "evolving-kv" and
+                    (args.mode in ("evolving-kv", "route-selection") and
                      (key.startswith("RUST_LOG") or key in ("ASTRID_ALLOC_LOG", "MALLOC_LOG")))):
                 receipt["instrumentation_removed"].append(key)
                 del os.environ[key]
         save()
-        if args.mode == "evolving-kv":
+        if args.mode in ("evolving-kv", "route-selection"):
             hooks = {name: globals()[name] for name in (
                 "sha", "command", "clean_checkout", "quiet_snapshot", "settle_after_builds", "settle_before_sample", "abba_schedule", "source_build")}
             receipt["evolving_helper_sha256"] = sha(Path(evolving_kv.__file__))
-            evolving_kv.run(args, protocol, output, receipt, save, deadline, hooks)
+            workload = route_selection if args.mode == "route-selection" else None
+            hooks["overlay"] = evolving_kv
+            if workload:
+                receipt["route_helper_sha256"] = sha(Path(route_selection.__file__))
+            evolving_kv.run(args, protocol, output, receipt, save, deadline, hooks, workload)
             clean_checkout(protocol, protocol_head)
             receipt["complete"] = True
             return

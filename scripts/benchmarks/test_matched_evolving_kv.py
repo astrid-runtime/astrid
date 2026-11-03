@@ -330,7 +330,7 @@ class SampleTests(unittest.TestCase):
         mode = next(n for n in ast.walk(main) if isinstance(n, ast.Call) and n.args and
                     isinstance(n.args[0], ast.Constant) and n.args[0].value == "--mode")
         self.assertEqual(next(k.value.value for k in mode.keywords if k.arg == "default"), "packing")
-        self.assertIn('if args.mode == "evolving-kv":', source)
+        self.assertIn('if args.mode in ("evolving-kv", "route-selection"):', source)
         self.assertIn('abba_schedule([(32768, 7), (600000, 1)], builds)', source)
         self.assertIn('("main", 699051, 1, "negative-control")', source)
 
