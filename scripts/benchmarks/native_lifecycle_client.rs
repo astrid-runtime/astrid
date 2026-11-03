@@ -1,5 +1,6 @@
 //! Isolated native250 lifecycle diagnostic; never a production command.
 //! Ownership root is compile-time bound via NATIVE250_OWNERSHIP_ROOT.
+mod native250_admin;
 use anyhow::{Context, ensure};
 use astrid_core::dirs::AstridHome;
 use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody, AgentDeriveRequest};
@@ -10,10 +11,8 @@ use astrid_types::{
     Topic,
     ipc::{IpcMessage, IpcPayload},
 };
-use astrid_uplink::{
-    admin_client::{AdminClient, into_result},
-    socket_client::SocketClient,
-};
+use astrid_uplink::{admin_client::into_result, socket_client::SocketClient};
+use native250_admin::AuthenticatedAdmin as AdminClient;
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -221,6 +220,10 @@ async fn run() -> anyhow::Result<()> {
             },
             "probe-pattern" | "probe" | "probe-wrong-marker" | "empty" => {
                 let mut client = SocketClient::connect(SessionId::new(), id.clone()).await?;
+                ensure!(
+                    client.is_authenticated(),
+                    "principal {id} did not authenticate"
+                );
                 let req = Uuid::new_v4().simple().to_string();
                 let writes = if mode == "probe-pattern" {
                     1 + index % 2

@@ -26,6 +26,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -42,65 +43,32 @@ STAGE_TIMEOUT_SECS = 600
 WARMUPS = 2
 TIMED = 16
 OVERWRITE_ROLES = ("overwrite-1", "overwrite-2", "overwrite-3")
-WANTED_LIBS = {
-    "anyhow", "astrid_core", "astrid_storage", "astrid_uplink", "astrid_types",
-    "uuid", "chrono", "tokio", "serde_json", "astrid_capsule", "astrid_crypto",
-}
 PROTECTED_PIDS = {1361, 54628, 64147, 87781}
-LOCAL_DISK_FLOOR = 40 * 1024 ** 3
-STRIP_ENV_PREFIXES = ("Malloc", "DYLD_", "ASAN_", "LSAN_", "HEAPTRACK", "RUST_LOG")
-STRIP_ENV_EXACT = {
-    "ASTRID_ALLOC_LOG", "MALLOC_LOG", "ASTRID_PRINCIPAL", "ASTRID_PRINCIPAL_ID",
-    "ASTRID_CLIENT_CONFIG", "ASTRID_WORKSPACE_STATE_DIR",
-}
 IS_DARWIN = platform.system() == "Darwin"
 
 
-def load_packing():
-    spec = importlib.util.spec_from_file_location("matched_volume_packing", PACKING_PATH)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-packing = load_packing()
-
-
-def sha(path: Path) -> str:
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
-
-
-def require(condition, detail):
-    if not condition:
-        raise RuntimeError(detail)
+BUILD_SPEC = importlib.util.spec_from_file_location("native250_build", HERE / "native250" / "build.py")
+build = importlib.util.module_from_spec(BUILD_SPEC)
+BUILD_SPEC.loader.exec_module(build)
+EVIDENCE_SPEC = importlib.util.spec_from_file_location("native250_evidence", HERE / "native250" / "evidence.py")
+evidence = importlib.util.module_from_spec(EVIDENCE_SPEC)
+EVIDENCE_SPEC.loader.exec_module(evidence)
+packing = build.packing
+STRIP_ENV_PREFIXES, STRIP_ENV_EXACT = build.STRIP_ENV_PREFIXES, build.STRIP_ENV_EXACT
+WANTED_LIBS = build.WANTED_LIBS
+sha, require = build.sha, build.require
+sanitized_env, child_env = build.sanitized_env, build.child_env
+disk_policy, private_run_dir = build.disk_policy, build.private_run_dir
+cargo_build, select_release_rlibs = build.cargo_build, build.select_release_rlibs
+build_shared_client, tree_file_hashes = build.build_shared_client, build.tree_file_hashes
+build_capsule = build.build_capsule
+stage_capsule_source = build.stage_capsule_source
 
 
 def atomic_write(path: Path, payload: dict) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, indent=2) + "\n")
     temporary.replace(path)
-
-
-def sanitized_env() -> dict[str, str]:
-    env = {
-        key: value for key, value in os.environ.items()
-        if not key.startswith(STRIP_ENV_PREFIXES) and key not in STRIP_ENV_EXACT
-    }
-    for key in list(STRIP_ENV_EXACT):
-        env.pop(key, None)
-    leaked = sorted(k for k in env if k.startswith(STRIP_ENV_PREFIXES) or k in STRIP_ENV_EXACT)
-    require(not leaked, f"allocator/principal env leaked: {leaked}")
-    require("ASTRID_PRINCIPAL" not in env and "ASTRID_PRINCIPAL_ID" not in env,
-            "inherited principal must be cleared")
-    return env
-
-
-def child_env(home: Path, run: Path) -> dict[str, str]:
-    env = sanitized_env()
-    env.update({"ASTRID_HOME": str(home), "ASTRID_RUN_DIR": str(run),
-                "ASTRID_DAEMON_LOG_TARGET": "stderr"})
-    return env
 
 
 if IS_DARWIN:
@@ -234,216 +202,6 @@ def volume_stat(path: Path) -> dict:
             "dev": info.st_dev, "allocated_bytes": info.st_blocks * 512}
 
 
-def disk_policy(output: Path, local: bool = False) -> None:
-    free = shutil.disk_usage(output).free
-    if local:
-        require(free >= LOCAL_DISK_FLOOR, "local 40 GiB campaign floor")
-    else:
-        require(free >= 2 * 1024 ** 3, "disposable CI disk reserve")
-
-
-def cargo_build(checkout: Path, head: str, packages: list[str], target_dir: Path,
-                log: Path, deadline: float) -> dict:
-    packing.clean_checkout(checkout, head)
-    target_dir.mkdir(parents=True, exist_ok=True)
-    disk_policy(target_dir)
-    budget = min(1200, deadline - time.monotonic())
-    require(budget > 0, "run budget exhausted before cargo")
-    env = sanitized_env()
-    env["CARGO_TARGET_DIR"] = str(target_dir)
-    for key in ("CARGO_HOME", "RUSTUP_HOME"):
-        env.pop(key, None)
-    cmd = ["cargo", "build", "--release", "--locked", "-j", "1",
-           "--message-format=json"]
-    for package in packages:
-        cmd.extend(["-p", package])
-    with log.open("w") as stream:
-        process = subprocess.Popen(cmd, cwd=checkout, env=env, stdout=stream,
-                                   stderr=subprocess.STDOUT, start_new_session=True)
-        try:
-            code = process.wait(timeout=budget)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
-            raise
-        require(code == 0, f"cargo failed in {checkout}: {code}")
-    packing.clean_checkout(checkout, head)
-    artifacts = []
-    binaries = {}
-    for line in log.read_text().splitlines():
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        if event.get("reason") != "compiler-artifact":
-            continue
-        name = event["target"]["name"]
-        executable = event.get("executable")
-        if executable:
-            binaries[name] = Path(executable)
-        filenames = [Path(filename) for filename in event.get("filenames", [])]
-        artifacts.append({
-            "path": str(filenames[0]) if filenames else None,
-            "filenames": [str(path) for path in filenames],
-            "sha256": sha(filenames[0]) if filenames and filenames[0].is_file() else None,
-            "package_id": event.get("package_id"),
-            "target": name,
-            "profile": event.get("profile"),
-        })
-    # Both arms reuse dependency compilation. Freeze executables before the
-    # next Cargo invocation can replace target/release/astrid[-daemon|-build].
-    frozen = log.with_suffix(".binaries")
-    frozen.mkdir()
-    for name, executable in binaries.items():
-        destination = frozen / name
-        shutil.copy2(executable, destination)
-        require(sha(destination) == sha(executable), "executable changed while freezing")
-        binaries[name] = destination
-    return {
-        "head": head,
-        "checkout": str(checkout),
-        "tree": packing.command(["git", "rev-parse", "HEAD^{tree}"], checkout),
-        "rustc": packing.command(["rustc", "-Vv"], checkout),
-        "lock_sha256": sha(checkout / "Cargo.lock"),
-        "target_dir": str(target_dir),
-        "binaries": {name: {"path": str(path), "sha256": sha(path)}
-                     for name, path in binaries.items()},
-        "artifacts": artifacts,
-        "build_log_sha256": sha(log),
-        "packages": packages,
-    }
-
-
-def select_release_rlibs(artifacts: list[dict]) -> dict[str, dict]:
-    selected: dict[str, dict] = {}
-    for item in artifacts:
-        name = item.get("target")
-        profile = item.get("profile") or {}
-        if name not in WANTED_LIBS:
-            continue
-        if profile.get("opt_level") != "3" or profile.get("test"):
-            continue
-        rlibs = [Path(path) for path in item.get("filenames") or [] if str(path).endswith(".rlib")]
-        require(rlibs, f"compiler-artifact for {name} missing rlib")
-        require(len(rlibs) == 1, f"ambiguous rlib filenames for {name}: {rlibs}")
-        path = rlibs[0]
-        require(path.is_file(), f"missing rlib file for {name}: {path}")
-        digest = sha(path)
-        record = {
-            "path": str(path),
-            "sha256": digest,
-            "package_id": item.get("package_id"),
-            "profile": profile,
-        }
-        if name in selected:
-            require(selected[name]["path"] == record["path"]
-                    and selected[name]["sha256"] == record["sha256"],
-                    f"conflicting compiler-artifact provenance for {name}")
-            continue
-        selected[name] = record
-    missing = WANTED_LIBS - set(selected)
-    require(not missing, f"missing release rlib provenance: {sorted(missing)}")
-    parents = {Path(info["path"]).parent for info in selected.values()}
-    require(len(parents) == 1, f"rlibs must share one deps directory, found {parents}")
-    return selected
-
-
-def build_shared_client(candidate_build: dict, ownership_root: Path, output: Path,
-                        deadline: float) -> dict:
-    require(CLIENT_SOURCE.is_file(), "native_lifecycle_client.rs missing")
-    source_sha = sha(CLIENT_SOURCE)
-    libraries = select_release_rlibs(candidate_build["artifacts"])
-    checkout = Path(candidate_build["checkout"])
-    compiler = packing.command(["rustc", "-Vv"], checkout)
-    require(compiler == candidate_build["rustc"], "client compiler differs from producer")
-    deps = Path(next(iter(libraries.values()))["path"]).parent
-    binary = output / "native250-lifecycle-client"
-    log = output / "client-rustc.log"
-    require(not binary.exists(), "client binary already exists")
-    cmd = ["rustc", "--edition=2024", "-O", "--crate-name", "native250_lifecycle_client",
-           str(CLIENT_SOURCE), "-L", f"dependency={deps}", "-o", str(binary)]
-    for name, info in sorted(libraries.items()):
-        cmd.extend(["--extern", f"{name}={info['path']}"])
-    env = sanitized_env()
-    env["NATIVE250_OWNERSHIP_ROOT"] = str(ownership_root)
-    budget = min(300, deadline - time.monotonic())
-    require(budget > 0, "run budget exhausted before client link")
-    with log.open("w") as stream:
-        result = subprocess.run(cmd, cwd=checkout, env=env, stdout=stream, stderr=subprocess.STDOUT,
-                                timeout=budget)
-    require(result.returncode == 0, f"client rustc failed; see {log}")
-    require(sha(CLIENT_SOURCE) == source_sha, "client source changed during link")
-    for info in libraries.values():
-        require(sha(Path(info["path"])) == info["sha256"], "rlib changed during link")
-    return {
-        "path": str(binary), "sha256": sha(binary), "source": str(CLIENT_SOURCE),
-        "source_sha256": source_sha,
-        "ownership_root": str(ownership_root),
-        "libraries": libraries,
-        "log_sha256": sha(log),
-        "shared_both_arms": True,
-        "rustc": compiler,
-        "linked_against": "candidate producer libraries via compiler-artifact provenance",
-    }
-
-
-def tree_file_hashes(root: Path) -> dict[str, str]:
-    hashes = {}
-    for path in sorted(root.rglob("*")):
-        if path.is_symlink():
-            raise RuntimeError(f"refusing symlink in capsule source: {path}")
-        if path.is_file():
-            hashes[str(path.relative_to(root))] = sha(path)
-    return hashes
-
-
-def stage_capsule_source(ownership_root: Path) -> tuple[Path, dict[str, str]]:
-    require(CAPSULE_SOURCE.is_dir(), "native250_capsule missing")
-    for forbidden in ("dist", "target", "builder-home"):
-        require(not (CAPSULE_SOURCE / forbidden).exists(),
-                f"capsule source must not include {forbidden}")
-    staged = ownership_root / "capsule-src"
-    require(not staged.exists(), "capsule staging already exists")
-    shutil.copytree(CAPSULE_SOURCE, staged, symlinks=False)
-    hashes = tree_file_hashes(staged)
-    require("src/lib.rs" in hashes, "capsule lib.rs missing after stage")
-    require(hashes["src/lib.rs"] == sha(CAPSULE_SOURCE / "src" / "lib.rs"),
-            "staged capsule lib hash mismatch")
-    return staged, hashes
-
-
-def build_capsule(cli: Path, ownership_root: Path, output: Path, deadline: float) -> dict:
-    staged, source_hashes = stage_capsule_source(ownership_root)
-    out = output / "capsule-dist"
-    out.mkdir(mode=0o700)
-    home = ownership_root / "capsule-builder-home"
-    home.mkdir(mode=0o700)
-    run = private_run_dir("capsule-build")
-    env = child_env(home, run)
-    budget = min(900, deadline - time.monotonic())
-    require(budget > 0, "run budget exhausted before capsule build")
-    log = output / "capsule-build.log"
-    with log.open("w") as stream:
-        result = subprocess.run(
-            [str(cli), "capsule", "build", str(staged), "--output", str(out)],
-            env=env, stdout=stream, stderr=subprocess.STDOUT, timeout=budget)
-    require(result.returncode == 0, f"capsule build failed; see {log}")
-    require(tree_file_hashes(staged) == source_hashes, "capsule source mutated during build")
-    require(tree_file_hashes(CAPSULE_SOURCE)["src/lib.rs"] == source_hashes["src/lib.rs"],
-            "original capsule source changed during build")
-    capsules = list(out.glob("*.capsule"))
-    require(len(capsules) == 1, f"expected one capsule, found {capsules}")
-    return {
-        "path": str(capsules[0]), "sha256": sha(capsules[0]),
-        "source_lib_sha256": source_hashes["src/lib.rs"],
-        "source_tree_sha256s": source_hashes,
-        "staged_source": str(staged),
-        "cli_sha256": sha(cli), "log_sha256": sha(log),
-        "builder_home": str(home),
-    }
 
 
 class OwnedDaemon:
@@ -492,30 +250,40 @@ class OwnedDaemon:
     def stop(self, boot: dict, require_volume_only: bool = True) -> None:
         if self.process is None:
             return
+        try:
+            metrics = wait_owned(self.process, 0, self.identity)
+        except subprocess.TimeoutExpired:
+            pass
+        else:
+            boot["terminal_process_metrics"] = metrics
+            boot["exit"] = self.process.returncode
+            boot["unexpected_exit_before_shutdown"] = True
+            self._close()
+            raise RuntimeError("persistent daemon exited before explicit shutdown")
         self.assert_owned()
         boot["before_shutdown_process_metrics"] = sample_owned(self.process, self.identity)
         started = time.monotonic()
-        if self.process.poll() is None:
-            self.assert_owned()
-            self.process.terminate()
+        self.assert_owned()
+        boot["explicit_shutdown_requested"] = True
+        self.process.terminate()
+        try:
+            boot["terminal_process_metrics"] = wait_owned(
+                self.process, PRODUCT_SHUTDOWN_SECS, self.identity)
+        except subprocess.TimeoutExpired:
+            boot["shutdown_deadline_exceeded"] = True
             try:
                 boot["terminal_process_metrics"] = wait_owned(
-                    self.process, PRODUCT_SHUTDOWN_SECS, self.identity)
+                    self.process, CLEANUP_SECS, self.identity)
             except subprocess.TimeoutExpired:
-                boot["shutdown_deadline_exceeded"] = True
-                try:
-                    boot["terminal_process_metrics"] = wait_owned(
-                        self.process, CLEANUP_SECS, self.identity)
-                except subprocess.TimeoutExpired:
-                    self.assert_owned()
-                    self.process.kill()
-                    boot["terminal_process_metrics"] = wait_owned(
-                        self.process, CLEANUP_SECS, self.identity)
-                    boot["cleanup_kill"] = True
-                boot["shutdown_seconds"] = time.monotonic() - started
-                boot["exit"] = self.process.returncode
-                self._close()
-                raise RuntimeError("product 8s shutdown exceeded; cleanup cannot PASS")
+                self.assert_owned()
+                self.process.kill()
+                boot["terminal_process_metrics"] = wait_owned(
+                    self.process, CLEANUP_SECS, self.identity)
+                boot["cleanup_kill"] = True
+            boot["shutdown_seconds"] = time.monotonic() - started
+            boot["exit"] = self.process.returncode
+            self._close()
+            raise RuntimeError("product 8s shutdown exceeded; cleanup cannot PASS")
         boot["shutdown_seconds"] = time.monotonic() - started
         boot["exit"] = self.process.returncode
         self._close()
@@ -550,57 +318,83 @@ class OwnedDaemon:
         self.identity = None
 
 
+def execute_stage(command: list[str], env: dict, log_path: Path, item: dict) -> None:
+    started = time.monotonic()
+    text = ""
+    try:
+        output = subprocess.run(command, env=env, capture_output=True, text=True,
+                                timeout=STAGE_TIMEOUT_SECS)
+        item["exit"] = output.returncode
+        text = output.stdout + output.stderr
+    except subprocess.TimeoutExpired as error:
+        item["timed_out"] = True
+        parts = (error.stdout or "", error.stderr or "")
+        text = "".join(p.decode(errors="replace") if isinstance(p, bytes) else p for p in parts)
+        item["error"] = repr(error)
+        raise
+    except BaseException as error:
+        item["error"] = repr(error)
+        raise
+    finally:
+        item["seconds"] = time.monotonic() - started
+        item["timing_scope"] = "client subprocess wall time; excludes log writing and daemon sampling"
+        primary = sys.exception()
+        try:
+            log_path.write_text(text)
+            item.update(log=str(log_path), log_sha256=sha(log_path))
+        except BaseException as log_error:
+            item["log_error"] = repr(log_error)
+            if primary is None:
+                raise
+    require(item["exit"] == 0, f"stage failed {command}: {text[-4000:]}")
+    item["complete"] = True
+
+
 def run_client(client: Path, home: Path, run: Path, log_path: Path, args: list[str],
-               daemon: OwnedDaemon) -> dict:
-    daemon.assert_owned()
-    before = sample_owned(daemon.process, daemon.identity)
-    began = time.monotonic()
-    output = subprocess.run([str(client), *args], env=child_env(home, run),
-                            capture_output=True, text=True, timeout=STAGE_TIMEOUT_SECS)
-    text = output.stdout + output.stderr
-    log_path.write_text(text)
-    after = sample_owned(daemon.process, daemon.identity)
-    item = {
-        "args": args, "seconds": time.monotonic() - began, "exit": output.returncode,
-        "log": str(log_path), "log_sha256": sha(log_path),
-        "daemon_before": before, "daemon_after": after,
-        "daemon_stage_cpu_ns": {
-            "user": after["user_cpu_ns"] - before["user_cpu_ns"],
-            "system": after["system_cpu_ns"] - before["system_cpu_ns"],
-            "source": "owned proc_pid_rusage delta; not ps %CPU",
-        },
-    }
-    require(output.returncode == 0, f"client failed {args}: {text[-4000:]}")
-    return item
+               daemon: OwnedDaemon, *, ledger: list | None = None) -> dict:
+    item = {"args": args, "exit": None, "complete": False}
+    if ledger is not None:
+        ledger.append(item)
+    primary = None
+    try:
+        daemon.assert_owned()
+        before = sample_owned(daemon.process, daemon.identity)
+        item["daemon_before"] = before
+        execute_stage([str(client), *args], child_env(home, run), log_path, item)
+        return item
+    except BaseException as error:
+        primary = error
+        item["complete"] = False
+        item["error"] = repr(error)
+        raise
+    finally:
+        try:
+            after = sample_owned(daemon.process, daemon.identity)
+            item["daemon_after"] = after
+            if "daemon_before" in item:
+                item["daemon_stage_cpu_ns"] = {
+                    "user": after["user_cpu_ns"] - before["user_cpu_ns"],
+                    "system": after["system_cpu_ns"] - before["system_cpu_ns"],
+                    "source": "owned proc_pid_rusage delta; not ps %CPU",
+                }
+        except BaseException as sampling_error:
+            item["complete"] = False
+            item["after_sampling_error"] = repr(sampling_error)
+            if primary is None:
+                raise
 
 
 def install_capsule(cli: Path, capsule: Path, home: Path, workspace: Path, run: Path,
-                    principal: str, log_path: Path) -> dict:
-    env = child_env(home, run)
-    began = time.monotonic()
-    command = [
-        str(cli), "--daemon-workspace", str(workspace), "--principal", principal,
-        "capsule", "install", str(capsule), "--yes", "--approve-untrusted",
-    ]
-    output = subprocess.run(command, env=env, capture_output=True, text=True,
-                            timeout=STAGE_TIMEOUT_SECS)
-    log_path.write_text(output.stdout + output.stderr)
-    item = {
-        "command": command, "principal": principal, "seconds": time.monotonic() - began,
-        "exit": output.returncode, "log": str(log_path), "log_sha256": sha(log_path),
-        "cli_sha256": sha(cli), "capsule_sha256": sha(capsule),
-        "daemon_workspace": str(workspace),
-    }
-    require(output.returncode == 0, f"capsule install failed: {log_path.read_text()[-2000:]}")
+                    principal: str, log_path: Path, *, ledger: list | None = None) -> dict:
+    command = [str(cli), "--daemon-workspace", str(workspace), "--principal", principal,
+               "capsule", "install", str(capsule), "--yes", "--approve-untrusted"]
+    item = {"command": command, "principal": principal, "exit": None, "complete": False,
+            "cli_sha256": sha(cli), "capsule_sha256": sha(capsule),
+            "daemon_workspace": str(workspace)}
+    if ledger is not None:
+        ledger.append(item)
+    execute_stage(command, child_env(home, run), log_path, item)
     return item
-
-
-def private_run_dir(name: str) -> Path:
-    # Public daemon sockets live under ASTRID_RUN_DIR; keep paths short.
-    path = Path("/private/tmp") / f"ast-n250-{os.getpid()}-{time.time_ns()}-{name}"
-    require(not path.exists(), f"run dir exists {path}")
-    path.mkdir(mode=0o700)
-    return path
 
 
 def make_owned_dir(root: Path, name: str) -> Path:
@@ -660,18 +454,18 @@ def generate_seed(ownership_root: Path, daemon: Path, cli: Path, client: Path,
 
     try:
         owned, run, boot = boot_seed("install-daemon")
-        operations.append(install_capsule(
-            cli, capsule, home, workspace, run, "default", seed_dir / "install.log"))
+        install_capsule(
+            cli, capsule, home, workspace, run, "default", seed_dir / "install.log", ledger=operations)
         owned.stop(boot, require_volume_only=False)
         owned = None
 
         owned, run, boot = boot_seed("roots-daemon")
-        operations.append(run_client(client, home, run, seed_dir / "create-roots.log",
-                                     ["create-roots", "0", str(COHORT)], owned))
+        run_client(client, home, run, seed_dir / "create-roots.log",
+                                     ["create-roots", "0", str(COHORT)], owned, ledger=operations)
         for index in (0, 100, 200):
-            operations.append(install_capsule(
+            install_capsule(
                 cli, capsule, home, workspace, run, f"scale-agent-{index:05}",
-                seed_dir / f"install-root-{index:05}.log"))
+                seed_dir / f"install-root-{index:05}.log", ledger=operations)
         owned.stop(boot, require_volume_only=False)
         owned = None
 
@@ -681,14 +475,14 @@ def generate_seed(ownership_root: Path, daemon: Path, cli: Path, client: Path,
                        seed_dir / "rehome-roots.log", operations, "rehome-roots")
 
         owned, run, boot = boot_seed("derive-daemon")
-        operations.append(run_client(client, home, run, seed_dir / "derive.log",
-                                     ["derive", "0", str(COHORT)], owned))
-        operations.append(run_client(client, home, run, seed_dir / "census.log",
-                                     ["census"], owned))
-        operations.append(run_client(client, home, run, seed_dir / "empty.log",
-                                     ["empty", "0", str(COHORT)], owned))
-        operations.append(run_client(client, home, run, seed_dir / "wrong-marker.log",
-                                     ["probe-wrong-marker", "0", "1"], owned))
+        run_client(client, home, run, seed_dir / "derive.log",
+                                     ["derive", "0", str(COHORT)], owned, ledger=operations)
+        run_client(client, home, run, seed_dir / "census.log",
+                                     ["census"], owned, ledger=operations)
+        run_client(client, home, run, seed_dir / "empty.log",
+                                     ["empty", "0", str(COHORT)], owned, ledger=operations)
+        run_client(client, home, run, seed_dir / "wrong-marker.log",
+                                     ["probe-wrong-marker", "0", "1"], owned, ledger=operations)
         owned.stop(boot, require_volume_only=False)
         owned = None
 
@@ -803,38 +597,32 @@ def run_one(ordinal, label, binary, cli, client, capsule, seed, ownership_root, 
     save()
 
     def first_ops(cycle, home, run, directory, daemon):
-        rec["operations"].append(run_client(client, home, run, directory / "first-empty.log",
-                                            ["empty", "0", "1"], daemon))
-        rec["operations"].append(run_client(
+        run_client(client, home, run, directory / "first-empty.log",
+                                            ["empty", "0", "1"], daemon, ledger=rec["operations"])
+        run_client(
             client, home, run, directory / "remaining-empty.log",
-            ["empty", "1", str(COHORT)], daemon))
+            ["empty", "1", str(COHORT)], daemon, ledger=rec["operations"])
         write = run_client(client, home, run, directory / "timed-probe-pattern.log",
-                           ["probe-pattern", "0", str(COHORT)], daemon)
+                           ["probe-pattern", "0", str(COHORT)], daemon, ledger=rec["operations"])
         write["role"] = "timed-known-write"
-        rec["operations"].append(write)
         neg = run_client(client, home, run, directory / "wrong-marker.log",
-                         ["probe-wrong-marker", "0", "1"], daemon)
+                         ["probe-wrong-marker", "0", "1"], daemon, ledger=rec["operations"])
         neg["role"] = "negative-control"
-        rec["operations"].append(neg)
         read = run_client(client, home, run, directory / "timed-probe.log",
-                          ["probe", "0", str(COHORT)], daemon)
+                          ["probe", "0", str(COHORT)], daemon, ledger=rec["operations"])
         read["role"] = "timed-known-read"
-        rec["operations"].append(read)
         for index, role in enumerate(OVERWRITE_ROLES, start=1):
             item = run_client(client, home, run, directory / f"timed-overwrite-{index}.log",
-                              ["probe-pattern", "0", str(COHORT)], daemon)
+                              ["probe-pattern", "0", str(COHORT)], daemon, ledger=rec["operations"])
             item["role"] = role
-            rec["operations"].append(item)
 
     def recovered_ops(cycle, home, run, directory, daemon):
         first = run_client(client, home, run, directory / "recovered-first-probe.log",
-                           ["probe", "0", "1"], daemon)
+                           ["probe", "0", "1"], daemon, ledger=rec["operations"])
         first["role"] = "first-authenticated-recovered"
-        rec["operations"].append(first)
         rest = run_client(client, home, run, directory / "remaining-recovered-probe.log",
-                          ["probe", "1", str(COHORT)], daemon)
+                          ["probe", "1", str(COHORT)], daemon, ledger=rec["operations"])
         rest["role"] = "remaining-recovered-readback"
-        rec["operations"].append(rest)
 
     try:
         disk_policy(output)
@@ -924,11 +712,11 @@ def main() -> None:
         shared_target = output / "cargo-target"
         builds = {}
         receipt["builds"] = builds
-        for arm, path, head, packages in [
-            ("main", args.baseline, args.baseline_head, ["astrid-daemon", "astrid-cli", "astrid-build"]),
-            ("candidate", args.candidate, args.candidate_head, ["astrid-daemon", "astrid-cli", "astrid-build"]),
+        for arm, path, head in [
+            ("main", args.baseline, args.baseline_head),
+            ("candidate", args.candidate, args.candidate_head),
         ]:
-            builds[arm] = cargo_build(path.resolve(), head, packages,
+            builds[arm] = build.build_install_set(path.resolve(), head,
                                       shared_target, output / f"{arm}-cargo.jsonl", deadline)
             save()
         packing.settle_after_builds(receipt, save, deadline)
@@ -974,7 +762,16 @@ def main() -> None:
         raise
     finally:
         save()
-        packing.emit_terminal_receipt(receipt)
+        primary = sys.exception()
+        try:
+            evidence.publish(output)
+        except Exception as publication_error:
+            receipt["publication_error"] = repr(publication_error)
+            save()
+            if primary is None:
+                raise
+        finally:
+            packing.emit_terminal_receipt(receipt)
 
 
 if __name__ == "__main__":

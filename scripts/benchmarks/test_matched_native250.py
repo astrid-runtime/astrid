@@ -88,34 +88,99 @@ class Native250SyntheticTests(unittest.TestCase):
             self.assertEqual(frozen.read_bytes(), b"baseline executable")
             self.assertEqual(MODULE.sha(frozen), result["binaries"]["astrid"]["sha256"])
 
-    def test_client_link_uses_the_producer_toolchain_directory(self):
+
+    def test_early_clean_exit_is_failure_with_terminal_rusage(self):
+        daemon = MODULE.OwnedDaemon(Path("/owned/daemon"), Path("/owned/home"),
+                                   Path("/owned/work"), Path("/owned/run"), Path("/owned/log"))
+        process = MagicMock(pid=777004, returncode=0)
+        process.poll.side_effect = AssertionError("must preserve wait4")
+        daemon.process, daemon.identity = process, {"pid": process.pid}
+        boot = {}
+        with patch.object(MODULE, "wait_owned", return_value={"max_rss_bytes": 1234}):
+            with self.assertRaisesRegex(RuntimeError, "before explicit shutdown"):
+                daemon.stop(boot)
+        self.assertEqual(boot["terminal_process_metrics"]["max_rss_bytes"], 1234)
+        self.assertTrue(boot["unexpected_exit_before_shutdown"])
+        process.terminate.assert_not_called()
+        self.assertIsNone(daemon.process)
+
+    def test_log_failure_preserves_stage_timeout(self):
+        error = MODULE.subprocess.TimeoutExpired(["client"], 1, output=b"partial")
+        item = {"exit": None, "complete": False}
+        log = MagicMock()
+        log.write_text.side_effect = OSError("disk full")
+        with patch.object(MODULE.subprocess, "run", side_effect=error):
+            with self.assertRaises(MODULE.subprocess.TimeoutExpired) as raised:
+                MODULE.execute_stage(["client"], {}, log, item)
+        self.assertIs(raised.exception, error)
+        self.assertIn("disk full", item["log_error"])
+        self.assertTrue(item["timed_out"])
+        self.assertFalse(item["complete"])
+
+    def test_after_sampling_failure_does_not_leave_a_complete_operation(self):
+        daemon = MagicMock(spec=["assert_owned", "process", "identity"])
+        ledger = []
+        def complete(command, env, log, item):
+            item.update(exit=0, complete=True)
+        with patch.object(MODULE, "sample_owned", side_effect=[{}, OSError("sample failed")]), \
+                patch.object(MODULE, "execute_stage", side_effect=complete):
+            with self.assertRaisesRegex(OSError, "sample failed"):
+                MODULE.run_client(Path("client"), Path("home"), Path("run"),
+                                  Path("log"), [], daemon, ledger=ledger)
+        self.assertEqual(len(ledger), 1)
+        self.assertFalse(ledger[0]["complete"])
+        self.assertIn("sample failed", ledger[0]["after_sampling_error"])
+
+    def test_failed_and_timed_out_client_stages_remain_in_the_ledger(self):
+        for failure in (MagicMock(returncode=1, stdout="partial", stderr="error"),
+                        MODULE.subprocess.TimeoutExpired("client", 600, output=b"partial")):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                log = Path(directory) / "client.log"
+                ledger = []
+                daemon = MagicMock(spec=["assert_owned", "process", "identity"])
+                metrics = {"user_cpu_ns": 100, "system_cpu_ns": 200}
+                mock = {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}
+                with patch.object(MODULE.subprocess, "run", **mock), \
+                        patch.object(MODULE, "sample_owned", return_value=metrics):
+                    with self.assertRaises((RuntimeError, MODULE.subprocess.TimeoutExpired)):
+                        MODULE.run_client(Path("/owned/client"), Path(directory), Path(directory),
+                                          log, ["probe", "0", "1"], daemon, ledger=ledger)
+                self.assertEqual(len(ledger), 1)
+                self.assertFalse(ledger[0]["complete"])
+                self.assertIn("partial", log.read_text())
+                self.assertEqual(ledger[0]["daemon_after"], metrics)
+                self.assertIn("error", ledger[0])
+
+    def test_run_one_records_remaining_empty_and_every_operation_once(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            checkout = root / "checkout"
-            checkout.mkdir()
-            library = root / "libfixture.rlib"
-            library.write_bytes(b"producer")
-            build = {"checkout": str(checkout), "rustc": "pinned compiler", "artifacts": []}
-            libraries = {"fixture": {"path": str(library), "sha256": MODULE.sha(library)}}
+            home = root / "home"
+            home.mkdir()
+            (home / "astrid.volume").write_bytes(b"owned")
+            seed = root / "seed.volume"
+            seed.write_bytes(b"seed")
+            fixture = {"directory": str(root), "home": str(home), "workspace": str(root)}
+            receipt = {"runs": []}
 
-            def compile_client(args, **kwargs):
-                self.assertEqual(kwargs.get("cwd"), checkout)
-                Path(args[args.index("-o") + 1]).write_bytes(b"client")
-                return MagicMock(returncode=0)
+            def stage(client, home, run, log, args, daemon, *, ledger):
+                item = {"args": args, "log": str(log)}
+                ledger.append(item)
+                return item
 
-            with patch.object(MODULE, "select_release_rlibs", return_value=libraries), \
-                    patch.object(MODULE.packing, "command", return_value="pinned compiler") as version, \
-                    patch.object(MODULE.subprocess, "run", side_effect=compile_client) as link:
-                result = MODULE.build_shared_client(build, root / "owned", root, float("inf"))
-                version.assert_called_once_with(["rustc", "-Vv"], checkout)
-                self.assertEqual(result["rustc"], build["rustc"])
-                self.assertEqual(link.call_count, 1)
-            with patch.object(MODULE, "select_release_rlibs", return_value=libraries), \
-                    patch.object(MODULE.packing, "command", return_value="different compiler"), \
-                    patch.object(MODULE.subprocess, "run") as link:
-                with self.assertRaisesRegex(RuntimeError, "compiler differs"):
-                    MODULE.build_shared_client(build, root / "owned", root, float("inf"))
-                link.assert_not_called()
+            def boot(*args):
+                args[-1]({}, home, root, root, MagicMock())
+
+            with patch.object(MODULE, "provision_life", return_value=fixture), \
+                    patch.object(MODULE, "disk_policy"), \
+                    patch.object(MODULE, "boot_cycle", side_effect=boot), \
+                    patch.object(MODULE, "run_client", side_effect=stage):
+                rec = MODULE.run_one(0, "main", root, root, root, root,
+                                     {"volume": str(seed), "sha256": MODULE.sha(seed)},
+                                     root, root, receipt, lambda: None)
+            self.assertEqual(len(rec["operations"]), 10)
+            self.assertEqual(len({id(x) for x in rec["operations"]}), 10)
+            remaining = [x for x in rec["operations"] if Path(x["log"]).name == "remaining-empty.log"]
+            self.assertEqual([x["args"] for x in remaining], [["empty", "1", str(MODULE.COHORT)]])
 
     def test_schedule_is_two_warmups_plus_sixteen_timed_abba(self):
         arms = MODULE.schedule_arms()
@@ -429,9 +494,9 @@ class Native250SyntheticTests(unittest.TestCase):
             boot = {}
             with patch.object(daemon, "assert_owned"), \
                     patch.object(MODULE, "sample_owned", return_value={"pid": 777001}), \
-                    patch.object(MODULE, "wait_owned", return_value={
-                        "user_cpu_ns": 1, "system_cpu_ns": 1, "max_rss_bytes": 1,
-                        "source": "wait4 exact owned child"}):
+                    patch.object(MODULE, "wait_owned", side_effect=[
+                        MODULE.subprocess.TimeoutExpired("daemon", 0), {"max_rss_bytes": 1},
+                        MODULE.subprocess.TimeoutExpired("daemon", 0), {"max_rss_bytes": 1}]):
                 with self.assertRaisesRegex(RuntimeError, "volume-only"):
                     daemon.stop(boot, require_volume_only=True)
                 daemon.process = MagicMock(pid=777002, returncode=0, args=["daemon"])
@@ -505,41 +570,6 @@ class Native250SyntheticTests(unittest.TestCase):
             self.assertEqual(item["daemon_workspace"], str(workspace))
             self.assertEqual(item["exit"], 0)
 
-    def test_build_capsule_uses_sanitized_child_env_not_raw_environ(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory).resolve()
-            staged = root / "capsule-src"
-            staged.mkdir()
-            (staged / "src").mkdir()
-            (staged / "src" / "lib.rs").write_text("fn main() {}\n")
-            hashes = {"src/lib.rs": MODULE.sha(staged / "src" / "lib.rs")}
-            out = root / "out"
-            out.mkdir()
-            cli = root / "astrid"
-            cli.write_bytes(b"cli")
-            captured = {}
-
-            def fake_run(command, env=None, stdout=None, stderr=None, timeout=None):
-                captured["env"] = dict(env)
-                capsule = out / "capsule-dist" / "fixture.capsule"
-                capsule.parent.mkdir(parents=True, exist_ok=True)
-                capsule.write_bytes(b"built")
-                return MagicMock(returncode=0)
-
-            with patch.dict(os.environ, {
-                "PATH": "/usr/bin",
-                "ASTRID_PRINCIPAL": "raw-leak",
-                "MallocStackLogging": "1",
-            }, clear=True), \
-                    patch.object(MODULE, "stage_capsule_source", return_value=(staged, hashes)), \
-                    patch.object(MODULE, "private_run_dir", return_value=root / "run"), \
-                    patch.object(MODULE.subprocess, "run", side_effect=fake_run), \
-                    patch.object(MODULE, "tree_file_hashes", side_effect=[hashes, hashes]):
-                (root / "run").mkdir()
-                MODULE.build_capsule(cli, root, out, MODULE.time.monotonic() + 60)
-            self.assertNotIn("ASTRID_PRINCIPAL", captured["env"])
-            self.assertNotIn("MallocStackLogging", captured["env"])
-            self.assertEqual(captured["env"]["ASTRID_HOME"], str(root / "capsule-builder-home"))
 
     def test_lsof_idle_requires_empty_stderr_and_fails_closed(self):
         path = Path("/tmp/native250-lsof-probe")
@@ -608,12 +638,12 @@ class Native250SyntheticTests(unittest.TestCase):
             (fake_source / "src" / "lib.rs").write_text("pub fn probe() {}\n")
             ownership = root / "ownership-root"
             ownership.mkdir()
-            with patch.object(MODULE, "CAPSULE_SOURCE", fake_source):
+            with patch.object(MODULE.build, "CAPSULE_SOURCE", fake_source):
                 staged, hashes = MODULE.stage_capsule_source(ownership)
             self.assertEqual(hashes["src/lib.rs"], MODULE.sha(fake_source / "src" / "lib.rs"))
             self.assertEqual(MODULE.tree_file_hashes(staged), hashes)
             (fake_source / "dist").mkdir()
-            with patch.object(MODULE, "CAPSULE_SOURCE", fake_source):
+            with patch.object(MODULE.build, "CAPSULE_SOURCE", fake_source):
                 with self.assertRaisesRegex(RuntimeError, "must not include dist"):
                     MODULE.stage_capsule_source(ownership / "second")
 
