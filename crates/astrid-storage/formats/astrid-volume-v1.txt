@@ -54,10 +54,14 @@ Operation codes are:
   7  commit a metadata transaction; region is exactly
       system/volume-metadata-transaction and logical_offset is zero
    8  durable commit boundary; region is exactly system/volume-commit
-      and logical_offset is zero. Payload is empty, or an ASTMAP1
-      snapshot of the live extent map. Snapshot payload and the
+      and logical_offset is zero. Payload is empty, an ASTMAP1 snapshot of the live extent map,
+      or an ASTMAP2 catalogue of immutable extent-tree roots. Commit
+      payload and the
       unrecovered tail after the named snapshot are each at most 16 MiB.
       That ceiling is a format bound, not an operator knob.
+   9  immutable extent-index page; region is exactly
+      system/volume-extent-index, logical_offset is zero, and payload is
+      exactly 4096 bytes in the ASTXPG1 grammar below.
 
 A mutation record is recoverable data but is not a durability boundary by
 itself. Version one admits records only after the most recent operation-8
@@ -74,7 +78,7 @@ destination bytes. Count is 1 through 1024. All mutations validate and become
 visible as one record or none become visible.
 
 Recovery prefers a trailing ASTFTR1 footer when present. The footer names the
-most recent ASTMAP1 commit, the durable length, and the sequence of the last
+most recent nonempty ASTMAP1 or ASTMAP2 commit, the durable length, and the sequence of the last
 operation-8 record (empty or snapshot). Footer open reads that checkpoint, then
 replays a contiguous tail of at most 16 MiB that must end at a commit whose
 sequence matches the footer. A damaged footer falls back to a header scan. A
@@ -93,8 +97,62 @@ Commit snapshots are bounded to 16 MiB; other non-write payloads are bounded to
 sync() appends operation 8 when mutations are pending and returns only after
 that boundary is durable. A pending tail shorter than 16 MiB, including the
 empty commit record itself, uses an empty payload and leaves the named snapshot
-unchanged. A tail that would exceed 16 MiB writes a new ASTMAP1 snapshot.
+unchanged. A tail that would exceed 16 MiB writes a new checkpoint. A namespace
+whose ASTMAP1 encoding would exceed 16 MiB converts to ASTMAP2. Subsequent
+paged checkpoints retain that representation, including after empty reclaim.
+Unchanged immutable pages may be reused; checkpoint preparation does not move
+application payloads. Page records and the catalogue precede the existing
+commit/footer durability barrier.
 Graceful close performs the same boundary. A crash before the boundary can
 discard the uncommitted tail. HostedFileVolume holds an exclusive lock for the
 open lifetime. The engine close boundary releases that lock even when other
 references to the closed engine remain.
+
+Immutable extent checkpoints
+----------------------------
+
+ASTMAP1 remains the supported legacy namespace representation. ASTMAP2 is an
+extension of the hosted container grammar; readers that do not implement
+operation 9 and ASTMAP2 cannot open a converted container. Conversion is not a
+change to principal-store object identity or application payload encoding.
+
+An ASTMAP2 payload begins with eight bytes "ASTMAP2" plus NUL, then u32 region
+count. Each region is u16 UTF-8 name length, name bytes, u64 logical length,
+and u8 root flag. Names must be canonical, strictly ordered and unique. Flag 0
+has no following reference; flag 1 is followed by one 80-byte page reference.
+Other flags and trailing bytes are invalid. The complete catalogue remains
+bounded to 16 MiB; its size depends on region count, not extent count.
+
+A page reference is exactly:
+
+  offset  size  field
+       0     8  ASTREG1 page-record offset
+       8     8  nonzero page-record sequence
+      16    32  ASTREG1 record checksum
+      48     8  first logical byte in subtree
+      56     8  exclusive logical end of subtree
+      64     8  nonzero number of subtree extents
+      72     1  page level (0 leaf; 1 through 63 branch)
+      73     7  zero reserved bytes
+
+The complete referenced record and its sequence must precede its parent (or
+catalogue commit). A child level is exactly one below its parent's. Child
+ranges are ordered, nonoverlapping and enclosed by the parent; child counts
+sum to the parent count. A reference count cannot exceed its logical range
+length and must be at least 2 raised to its level. A region root's logical
+end cannot exceed the region length. Recovery validates every reachable page,
+its record identity, checksum, framing and exact subtree summary before
+publishing the recovered namespace; validating only the catalogue is invalid.
+
+Each ASTXPG1 page payload is exactly 4096 bytes. Bytes 0..8 are "ASTXPG1" plus
+NUL; byte 8 is level; bytes 9..12 are zero; bytes 12..14 are u16 entry count;
+bytes 14..16 are zero. Entries start at byte 16, and unused bytes are zero.
+Leaf entries are u64 logical start, u64 exclusive logical end and u64 physical
+payload offset, for a capacity of 170 entries. Leaf ranges are nonempty,
+ordered, nonoverlapping, and their physical ranges end before the leaf record.
+Branch entries are 80-byte references, for a capacity of 51 entries. Leaves
+must be nonempty; branches have at least two children of the same level.
+
+Logical truncation clips the readable immutable base before pending extents
+are overlaid, so regrowth cannot expose truncated bytes. Physical reclaim
+remains explicit and preserves live logical bytes and the paged format.

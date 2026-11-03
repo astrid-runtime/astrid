@@ -1,8 +1,9 @@
 //! Crash-safe physical reclamation for the hosted volume adapter.
 
+use super::IndexCheckpoint;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
@@ -142,50 +143,6 @@ fn create_file(path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
-fn read_region(
-    file: &mut File,
-    region: &RegionState,
-    offset: u64,
-    buffer: &mut [u8],
-) -> io::Result<()> {
-    buffer.fill(0);
-    let end = offset
-        .checked_add(
-            u64::try_from(buffer.len())
-                .map_err(|_| io::Error::other("volume reclaim buffer length overflow"))?,
-        )
-        .ok_or_else(|| io::Error::other("volume reclaim range overflow"))?;
-    let first = region
-        .extents
-        .range(..=offset)
-        .next_back()
-        .map_or(offset, |(start, _)| *start);
-    for (start, extent) in region.extents.range(first..end) {
-        if extent.logical_end <= offset {
-            continue;
-        }
-        let copy_start = (*start).max(offset);
-        let copy_end = extent.logical_end.min(end);
-        if copy_start >= copy_end {
-            continue;
-        }
-        let physical = extent
-            .physical_offset
-            .checked_add(copy_start.saturating_sub(*start))
-            .ok_or_else(|| io::Error::other("volume reclaim extent overflow"))?;
-        let destination = usize::try_from(copy_start.saturating_sub(offset))
-            .map_err(|_| io::Error::other("volume reclaim destination overflow"))?;
-        let length = usize::try_from(copy_end.saturating_sub(copy_start))
-            .map_err(|_| io::Error::other("volume reclaim extent length overflow"))?;
-        let destination_end = destination
-            .checked_add(length)
-            .ok_or_else(|| io::Error::other("volume reclaim destination range overflow"))?;
-        file.seek(SeekFrom::Start(physical))?;
-        file.read_exact(&mut buffer[destination..destination_end])?;
-    }
-    Ok(())
-}
-
 pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
     let _open_guard = volume.open_lock.lock();
     let mut state = volume.state.lock();
@@ -204,6 +161,8 @@ pub(super) fn reclaim_locked(path: &Path, state: &mut ContainerState) -> io::Res
     }
     let temporary_file = create_file(&temporary)?;
     let mut rebuilt = ContainerState {
+        checkpoint_format: state.checkpoint_format,
+        index_checkpoint: IndexCheckpoint::NotPrepared,
         file: temporary_file,
         sequence: 0,
         valid_len: 0,
@@ -368,7 +327,7 @@ impl Read for RegionReader<'_> {
         if length == 0 {
             return Ok(0);
         }
-        read_region(self.file, self.region, self.offset, &mut buffer[..length])?;
+        super::region_io::read(self.file, self.region, self.offset, &mut buffer[..length])?;
         self.offset = self.offset.strict_add(length as u64);
         Ok(length)
     }
