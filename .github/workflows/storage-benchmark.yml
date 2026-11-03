@@ -103,6 +103,8 @@ jobs:
         with:
           path: astrid-benchmark.noindex/protocol
           persist-credentials: false
+      - name: Prepare disposable hosted macOS indexing
+        run: python3 astrid-benchmark.noindex/protocol/scripts/benchmarks/hosted_macos_setup.py
       - name: Validate exact revisions
         env:
           BASELINE: ${{ inputs.packing_baseline }}
@@ -148,6 +150,14 @@ jobs:
         with:
           name: matched-packing-${{ github.sha }}
           path: astrid-benchmark.noindex/packing-evidence/public
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Preserve standalone hosted setup receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: matched-packing-host-indexing-setup-${{ github.sha }}
+          path: astrid-benchmark.noindex/host-indexing-setup.json
           if-no-files-found: warn
           retention-days: 30
       - name: Diagnose host indexing after benchmark failure
@@ -197,6 +207,8 @@ jobs:
         with:
           path: astrid-benchmark.noindex/protocol
           persist-credentials: false
+      - name: Prepare disposable hosted macOS indexing
+        run: python3 astrid-benchmark.noindex/protocol/scripts/benchmarks/hosted_macos_setup.py
       - name: Validate exact revisions
         env:
           BASELINE: ${{ inputs.native250_baseline }}
@@ -241,6 +253,14 @@ jobs:
         with:
           name: matched-native250-${{ github.sha }}
           path: astrid-benchmark.noindex/native250-evidence/public
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Preserve standalone hosted setup receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: matched-native250-host-indexing-setup-${{ github.sha }}
+          path: astrid-benchmark.noindex/host-indexing-setup.json
           if-no-files-found: warn
           retention-days: 30
       - name: Diagnose host indexing after benchmark failure

@@ -34,7 +34,19 @@ class NamespaceTests(unittest.TestCase):
                 self.assertIn('"$GITHUB_WORKSPACE/astrid-benchmark.noindex/', body)
                 evidence = "packing-evidence" if job == "matched-packing" else "native250-evidence"
                 self.assertIn(f"path: astrid-benchmark.noindex/{evidence}/public", body)
-                for forbidden in ("mdutil", "killall", "launchctl", ".metadata_never_index"):
+                setup = "- name: Prepare disposable hosted macOS indexing"
+                self.assertEqual(body.count(setup), 1)
+                self.assertLess(body.index("- name: Check out benchmark protocol"), body.index(setup))
+                self.assertLess(body.index(setup), body.index("- name: Install Rust"))
+                self.assertIn("run: python3 astrid-benchmark.noindex/protocol/scripts/benchmarks/hosted_macos_setup.py", body)
+                primary = body.index("- name: Preserve evidence including failed samples")
+                receipt = body.index("- name: Preserve standalone hosted setup receipt")
+                diagnostic = body.index("- name: Diagnose host indexing after benchmark failure")
+                self.assertLess(primary, receipt)
+                self.assertLess(receipt, diagnostic)
+                self.assertIn("if: always()", body[receipt:diagnostic])
+                self.assertIn("path: astrid-benchmark.noindex/host-indexing-setup.json", body[receipt:diagnostic])
+                for forbidden in ("killall", "launchctl", ".metadata_never_index", "mdutil -i"):
                     self.assertNotIn(forbidden, body)
         generic = workflow.split("  matched-packing:", 1)[0]
         self.assertNotIn("astrid-benchmark.noindex", generic)
