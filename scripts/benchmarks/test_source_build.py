@@ -37,10 +37,12 @@ def _ci_env(workspace: Path, **extra: str) -> dict[str, str]:
 def _metadata(checkout: Path, packages: list[tuple[str, str, str]]) -> dict:
     members = []
     rows = []
+    lock_rows = []
     for name, package_id, rel in packages:
         manifest = checkout / rel / "Cargo.toml"
         manifest.parent.mkdir(parents=True, exist_ok=True)
         manifest.write_text("[package]\nname=%r\nversion=\"0.0.0\"\n" % name, encoding="utf-8")
+        lock_rows.append(f'[[package]]\nname = "{name}"\nversion = "0.0.0"\n')
         members.append(package_id)
         rows.append(
             {
@@ -50,6 +52,7 @@ def _metadata(checkout: Path, packages: list[tuple[str, str, str]]) -> dict:
                 "version": "0.0.0",
             }
         )
+    (checkout / "Cargo.lock").write_text("\n".join(lock_rows), encoding="utf-8")
     # One registry package that must not be cleaned.
     rows.append(
         {
@@ -67,6 +70,41 @@ def _metadata(checkout: Path, packages: list[tuple[str, str, str]]) -> dict:
 
 
 class SourceBuildSyntheticTests(unittest.TestCase):
+    def test_child_environment_cache_homes_are_refused_before_cargo(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            checkout = root / "checkout"
+            checkout.mkdir()
+            hosted = _ci_env(root)
+            cases = [
+                ({"HOME": str(root / "different-home")}, root / "different-home" / ".cargo" / "cargo-target"),
+                ({"HOME": str(root / "different-home")}, root / "different-home" / ".rustup" / "cargo-target"),
+                ({"CARGO_HOME": "../relative-cache"}, root / "relative-cache" / "cargo-target"),
+                ({"RUSTUP_HOME": "../relative-rustup"}, root / "relative-rustup" / "cargo-target"),
+            ]
+            with patch.dict(os.environ, hosted, clear=True), \
+                    patch.object(MODULE.subprocess, "Popen") as cargo:
+                for changes, target in cases:
+                    with self.subTest(changes=changes):
+                        with self.assertRaisesRegex(RuntimeError, "outside host cache/rustup"):
+                            MODULE.prepare(checkout, target, root / "build.log",
+                                           dict(hosted, **changes), time.monotonic() + 30)
+                cargo.assert_not_called()
+
+    def test_clean_rejects_same_name_registry_or_other_version_before_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory).resolve()
+            packages = [{"name": "fixture"}]
+            valid = '[[package]]\nname="fixture"\nversion="0.0.0"\n'
+            for bad in (valid + '[[package]]\nname="fixture"\nversion="1.0.0"\nsource="registry+test"\n',
+                        valid + '[[package]]\nname="fixture"\nversion="1.0.0"\n',
+                        valid + 'source="registry+test"\n'):
+                (checkout / "Cargo.lock").write_text(bad)
+                with self.assertRaisesRegex(RuntimeError, "not unique and local"):
+                    MODULE._validate_clean_names(packages, checkout)
+            (checkout / "Cargo.lock").write_text(valid)
+            self.assertEqual(len(MODULE._validate_clean_names(packages, checkout)), 64)
+
     def test_prepare_refuses_non_hosted_runner_before_cargo(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

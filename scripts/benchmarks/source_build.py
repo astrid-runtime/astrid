@@ -16,6 +16,7 @@ from pathlib import Path
 import signal
 import subprocess
 import time
+import tomllib
 from typing import Any
 from urllib.parse import unquote, urlparse
 
@@ -40,21 +41,25 @@ def _refuse_symlink_ancestors(path: Path) -> Path:
         cursor = cursor / part
         if cursor.is_symlink():
             raise RuntimeError(f"refusing symlink ancestor: {cursor}")
-    # Ancestor symlink refusal is the authority; resolve only for containment checks.
+    # This is a static check within an exclusively owned CI workspace, not
+    # protection from a malicious process replacing paths during Cargo execution.
     return absolute.resolve()
 
 
-def _host_cache_roots(env: dict[str, str]) -> list[Path]:
-    home = Path.home().resolve()
-    cargo_home = Path(env["CARGO_HOME"]).expanduser() if "CARGO_HOME" in env else home / ".cargo"
-    rustup_home = Path(env["RUSTUP_HOME"]).expanduser() if "RUSTUP_HOME" in env else home / ".rustup"
-    roots = [
-        cargo_home.resolve(),
-        rustup_home.resolve(),
-        (home / ".cache").resolve(),
-        (home / "Library" / "Caches").resolve(),
-    ]
-    return roots
+def _host_cache_roots(env: dict[str, str], checkout: Path) -> list[Path]:
+    # Cargo resolves HOME from its own environment, and relative cache-home
+    # overrides from its cwd. Never expand '~' using the observer's HOME.
+    child_home = Path(env.get("HOME", ""))
+    require(child_home.is_absolute(), "child HOME must be an explicit absolute path")
+    homes = {Path.home().resolve(), child_home.resolve()}
+    roots = [home / suffix for home in homes
+             for suffix in (".cargo", ".rustup", ".cache", "Library/Caches")]
+    for name in ("CARGO_HOME", "RUSTUP_HOME"):
+        if name in env:
+            require(bool(env[name]), f"{name} must not be empty")
+            value = Path(env[name])
+            roots.append(value if value.is_absolute() else checkout / value)
+    return [root.resolve() for root in roots]
 
 
 def _validate_owned_target(
@@ -94,7 +99,7 @@ def _validate_owned_target(
         and not _is_relative_to(checkout_root, target_root),
         "owned target must stay outside the producer checkout",
     )
-    for cache_root in _host_cache_roots(env):
+    for cache_root in _host_cache_roots(env, checkout_root):
         require(
             not _is_relative_to(target_root, cache_root)
             and not _is_relative_to(cache_root, target_root),
@@ -241,6 +246,20 @@ def _workspace_packages(metadata: dict[str, Any], checkout: Path) -> list[dict[s
     return selected
 
 
+def _validate_clean_names(packages: list[dict[str, str]], checkout: Path) -> str:
+    # Cargo 1.95 clean ignores package URL/version qualifiers. Prove each name
+    # is unique across the locked dependency graph before using that interface.
+    lock = checkout / "Cargo.lock"
+    raw = lock.read_bytes()
+    graph = tomllib.loads(raw.decode())
+    locked = graph.get("package", [])
+    for package in packages:
+        matches = [row for row in locked if row.get("name") == package["name"]]
+        require(len(matches) == 1 and "source" not in matches[0],
+                f"workspace clean name is not unique and local in Cargo.lock: {package['name']}")
+    return hashlib.sha256(raw).hexdigest()
+
+
 def _path_from_package_id(package_id: str) -> Path | None:
     if not isinstance(package_id, str) or not package_id.startswith("path+file://"):
         return None
@@ -316,6 +335,7 @@ def prepare(
         ) from error
     packages = _workspace_packages(metadata, checkout_root)
     metadata_sha256 = hashlib.sha256(metadata_text.encode()).hexdigest()
+    lock_sha256 = _validate_clean_names(packages, checkout_root)
 
     clean_command = [
         "cargo",
@@ -347,6 +367,8 @@ def prepare(
         "metadata_command": metadata_command,
         "metadata_exit": metadata_exit,
         "metadata_sha256": metadata_sha256,
+        "lock_sha256": lock_sha256,
+        "clean_selection": "Cargo1.95 name-scoped clean; names proven unique and local across locked graph",
         "clean_command": clean_command,
         "clean_exit": clean_exit,
         "provenance": (
