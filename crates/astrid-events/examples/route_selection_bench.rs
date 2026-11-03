@@ -5,13 +5,18 @@
 //! logging. Intended for standalone release binaries compared across source
 //! revisions (ABBA), not as an ordinary unit-test workload.
 //!
+//! Product-source identity for a frozen binary comes from the external build
+//! receipt written when that artifact was produced. This process does not
+//! print a git HEAD: the checkout that *invokes* a frozen binary may differ
+//! from the astrid-events sources it was linked against.
+//!
 //! Usage:
 //!   cargo run -p astrid-events --release --example route_selection_bench -- \
 //!     --label corrected --foreign 10000 --iters 2000 --warmups 2
 
 use std::env;
 use std::hint::black_box;
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use astrid_events::{
@@ -71,19 +76,32 @@ fn parse_label() -> String {
     "unlabeled".into()
 }
 
-fn git_head() -> String {
-    Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|out| {
-            if out.status.success() {
-                Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| "unknown".into())
+fn assert_own_delivery(expected: &AstridEvent, drained: &[std::sync::Arc<AstridEvent>]) {
+    assert_eq!(
+        drained.len(),
+        1,
+        "own route must receive exactly one event per publish"
+    );
+    let AstridEvent::Ipc {
+        metadata: expected_meta,
+        message: expected_msg,
+    } = expected
+    else {
+        panic!("bench event must be Ipc");
+    };
+    let AstridEvent::Ipc {
+        metadata: got_meta,
+        message: got_msg,
+    } = drained[0].as_ref()
+    else {
+        panic!("drained event must be Ipc");
+    };
+    assert_eq!(got_meta.event_id, expected_meta.event_id);
+    assert_eq!(got_msg.topic.as_str(), expected_msg.topic.as_str());
+    assert_eq!(
+        got_msg.principal.as_deref(),
+        expected_msg.principal.as_deref()
+    );
 }
 
 fn measure(foreign: usize, iters: u32, warmups: u32) -> (Duration, Duration) {
@@ -108,15 +126,19 @@ fn measure(foreign: usize, iters: u32, warmups: u32) -> (Duration, Duration) {
     let event = event_on("scale.request", Some("alice"));
     for _ in 0..warmups {
         bus.publish(black_box(event.clone()));
-        let _ = black_box(own.try_drain(MAX_SUBSCRIPTION_BUDGET_BYTES));
+        let drained = own.try_drain(MAX_SUBSCRIPTION_BUDGET_BYTES);
+        assert_own_delivery(&event, &drained);
+        let _ = black_box(drained);
     }
     let start = Instant::now();
     for _ in 0..iters {
         bus.publish(black_box(event.clone()));
-        let _ = black_box(own.try_drain(MAX_SUBSCRIPTION_BUDGET_BYTES));
+        let drained = own.try_drain(MAX_SUBSCRIPTION_BUDGET_BYTES);
+        assert_own_delivery(&event, &drained);
+        let _ = black_box(drained);
     }
     let total = start.elapsed();
-    let per = total / iters.max(1);
+    let per = total / iters;
     drop(held);
     (total, per)
 }
@@ -126,14 +148,19 @@ fn main() -> ExitCode {
     let foreign = parse_usize("--foreign", 0);
     let iters = parse_u32("--iters", 2_000);
     let warmups = parse_u32("--warmups", 2);
-    let head = git_head();
+    if iters == 0 {
+        eprintln!("route_selection_bench: --iters must be >= 1 (got 0)");
+        return ExitCode::from(2);
+    }
     let exe = env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "unknown".into());
 
     let (total, per) = measure(foreign, iters, warmups);
+    // Product-source head is recorded in the external frozen-artifact receipt,
+    // not inferred from whatever checkout happens to invoke this binary.
     println!(
-        "route_selection_bench label={label} head={head} foreign={foreign} iters={iters} warmups={warmups} total_ns={} per_publish_ns={} exe={exe}",
+        "route_selection_bench label={label} foreign={foreign} iters={iters} warmups={warmups} total_ns={} per_publish_ns={} exe={exe}",
         total.as_nanos(),
         per.as_nanos()
     );
