@@ -38,10 +38,46 @@ class RefusalTests(unittest.TestCase):
             command.assert_not_called()
 
     def test_busy_background_holds_without_signalling(self):
-        with patch.object(MODULE, "command", return_value="9.5 runner\n1.0 service"):
-            self.assertFalse(MODULE.quiet_snapshot()["quiet"])
-        with patch.object(MODULE, "command", return_value="0.5 runner\n1.0 service"):
-            self.assertTrue(MODULE.quiet_snapshot()["quiet"])
+        # Two cores, 200 ticks: 15 busy ticks are 15% of one core, not 7.5%.
+        with patch.object(MODULE, "command", side_effect=["2", "0.0 observer"]), \
+                patch.object(MODULE, "cpu_ticks", side_effect=[
+                    [100, 100, 100, 100], [110, 105, 285, 100]]), \
+                patch.object(MODULE.time, "sleep"), \
+                patch.object(MODULE.os, "killpg") as signal:
+            result = MODULE.quiet_snapshot()
+        self.assertFalse(result["quiet"])
+        self.assertEqual(result["background_cpu_percent"], 15.0)
+        signal.assert_not_called()
+
+    def test_idle_observer_is_not_busy_because_of_prior_hashing(self):
+        # Causal reproduction of run41598553008: stale observer ps=40.9%.
+        with patch.object(MODULE, "command", side_effect=["2", "40.9 observer"]), \
+                patch.object(MODULE, "cpu_ticks", side_effect=[
+                    [100, 100, 100, 100], [100, 100, 300, 100]]), \
+                patch.object(MODULE.time, "sleep"):
+            result = MODULE.quiet_snapshot()
+        self.assertTrue(result["quiet"])
+        self.assertEqual(result["background_cpu_percent"], 0)
+        self.assertEqual(result["rows"], ["40.9 observer"])
+
+    def test_quiet_threshold_and_counter_wrap(self):
+        for busy, accepted in [(10, True), (11, False)]:
+            with self.subTest(busy=busy), patch.object(
+                    MODULE, "command", side_effect=["2", ""]), \
+                    patch.object(MODULE, "cpu_ticks", side_effect=[
+                        [(1 << 32) - 5, 0, 0, 0],
+                        [busy - 5, 0, 200 - busy, 0]]), \
+                    patch.object(MODULE.time, "sleep"):
+                result = MODULE.quiet_snapshot()
+            self.assertEqual(result["quiet"], accepted)
+            self.assertEqual(result["background_cpu_percent"], busy)
+
+    def test_unavailable_cpu_measurement_fails_closed(self):
+        with patch.object(MODULE, "command", return_value="2"), \
+                patch.object(MODULE, "cpu_ticks", return_value=[1, 1, 1, 1]), \
+                patch.object(MODULE.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "did not advance"):
+                MODULE.quiet_snapshot()
 
     def test_local_host_refuses_before_output_or_build(self):
         with tempfile.TemporaryDirectory() as directory:

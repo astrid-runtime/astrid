@@ -7,6 +7,7 @@ the report records that injection explicitly. No automatic speed verdict.
 """
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -47,12 +48,56 @@ def clean_checkout(path, head, injected=False):
     require(others == (INJECTION if injected else ""), "unexpected untracked source")
 
 
+def cpu_ticks():
+    # Darwin mach/host_info.h: HOST_CPU_LOAD_INFO=3, four natural_t counters
+    # in USER, SYSTEM, IDLE, NICE order. Release this call's host-port right.
+    lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    port_type = ctypes.c_uint32
+    lib.mach_host_self.restype = port_type
+    lib.mach_host_self.argtypes = []
+    lib.host_statistics.restype = ctypes.c_int
+    lib.host_statistics.argtypes = [port_type, ctypes.c_int,
+                                   ctypes.POINTER(ctypes.c_int),
+                                   ctypes.POINTER(ctypes.c_uint32)]
+    lib.mach_port_deallocate.restype = ctypes.c_int
+    lib.mach_port_deallocate.argtypes = [port_type, port_type]
+    host = lib.mach_host_self()
+    require(host != 0, "no Mach host port for CPU measurement")
+    ticks = (ctypes.c_uint32 * 4)()
+    count = ctypes.c_uint32(4)
+    try:
+        code = lib.host_statistics(host, 3, ctypes.cast(
+            ticks, ctypes.POINTER(ctypes.c_int)), ctypes.byref(count))
+        require(code == 0 and count.value == 4, "CPU counter query failed")
+        return list(ticks)
+    finally:
+        task = port_type.in_dll(lib, "mach_task_self_").value
+        require(lib.mach_port_deallocate(task, host) == 0,
+                "CPU measurement host-port release failed")
+
+
 def quiet_snapshot():
-    # macOS ps reports percent of one core, as in the local campaign guard.
-    # Retain all rows for adjudication; never terminate background processes.
+    # Measure actual host-wide CPU, including this observer and kernel work.
+    # ps %CPU decays across time: hashing build artifacts made this otherwise
+    # idle observer look busy after it had stopped doing that work.
+    cores = int(command(["sysctl", "-n", "hw.logicalcpu"]))
+    require(cores > 0, "invalid logical CPU count")
+    started = time.monotonic()
+    before = cpu_ticks()
+    time.sleep(1)
+    after = cpu_ticks()
+    elapsed = time.monotonic() - started
+    delta = [(end - start) % (1 << 32) for start, end in zip(before, after)]
+    total = sum(delta)
+    require(total > 0, "CPU counters did not advance")
+    cpu = 100.0 * cores * (total - delta[2]) / total
     rows = command(["ps", "-axo", "pcpu=,comm="]).splitlines()
-    cpu = sum(float(row.split(maxsplit=1)[0]) for row in rows if row.strip())
-    return {"background_cpu_percent": cpu, "rows": rows, "quiet": cpu <= 10.0}
+    return {"background_cpu_percent": cpu, "rows": rows,
+            "rows_are_decaying_context_only": True,
+            "method": "Darwin host CPU tick delta; percent of one logical core",
+            "cpu_ticks_before": before, "cpu_ticks_after": after,
+            "cpu_tick_deltas": delta, "logical_cpus": cores,
+            "interval_seconds": elapsed, "quiet": cpu <= 10.0}
 
 
 def build(path, head, probe, output, arm, deadline):
