@@ -3,7 +3,8 @@
 
 Runs only in a disposable GitHub-hosted macOS workspace. The frozen public-API
 probe is injected identically as an untracked example in both clean checkouts;
-the report records that injection explicitly. No automatic speed verdict.
+the report records that injection explicitly. Evolving-KV mode instead overlays
+all modules of the existing storage_io benchmark identically. No automatic speed verdict.
 """
 
 import argparse
@@ -29,10 +30,19 @@ evidence = importlib.util.module_from_spec(EVIDENCE_SPEC)
 EVIDENCE_SPEC.loader.exec_module(evidence)
 
 
+EVOLVING_SPEC = importlib.util.spec_from_file_location(
+    "matched_evolving_kv", Path(__file__).with_name("evolving_kv.py"))
+evolving_kv = importlib.util.module_from_spec(EVOLVING_SPEC)
+EVOLVING_SPEC.loader.exec_module(evolving_kv)
+
+
 def finalize_evidence(output, receipt, save, primary_error=None):
     logs = [output / "main-build.jsonl", output / "candidate-build.jsonl"]
     logs.extend(output.glob("sample-*.stdout"))
     logs.extend(output.glob("sample-*.stderr"))
+    if receipt.get("mode") == "evolving-kv":
+        logs.extend(evolving_kv.public_source_paths(output))
+        logs.extend(output.glob("sample-*.report.json"))
     evidence.finalize(output, receipt, save, emit_terminal_receipt,
                       primary_error=primary_error, log_paths=logs)
 
@@ -302,8 +312,19 @@ def run_sample(binary, fixture, output, index, sample):
         sample["fixture_preserved"] = fixture.exists()
 
 
+def abba_schedule(configurations, arms):
+    """Retain two warmups and sixteen timed samples per matched configuration."""
+    schedule = []
+    for configuration in configurations:
+        schedule.extend((arm, *configuration, "warmup") for arm in arms)
+        schedule.extend((arm, *configuration, "timed")
+                        for arm in ["main", "candidate", "candidate", "main"] * 4)
+    return schedule
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=("packing", "evolving-kv"), default="packing")
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--candidate", type=Path, required=True)
     parser.add_argument("--baseline-head", required=True)
@@ -322,9 +343,11 @@ def main():
     output = args.output.resolve()
     output.mkdir(exist_ok=False)
     probe = Path(__file__).with_name("volume_packing_probe.rs")
-    require(sha(probe) == PROBE_SHA, "frozen probe changed")
+    if args.mode == "packing":
+        require(sha(probe) == PROBE_SHA, "frozen probe changed")
     receipt = {"complete": False, "performance_accepted": False, "samples": [],
-               "probe_sha256": PROBE_SHA, "runner_sha256": sha(Path(__file__)),
+               "mode": args.mode, "probe_sha256": PROBE_SHA if args.mode == "packing" else None,
+               "runner_sha256": sha(Path(__file__)),
                "platform": platform.platform(), "machine": platform.machine(),
                "workflow_sha": os.environ.get("GITHUB_SHA"),
                "workflow_run_id": os.environ.get("GITHUB_RUN_ID"),
@@ -346,10 +369,20 @@ def main():
 
     try:
         for key in list(os.environ):
-            if key.startswith(("Malloc", "DYLD_", "ASAN_", "LSAN_", "HEAPTRACK")):
+            if (key.startswith(("Malloc", "DYLD_", "ASAN_", "LSAN_", "HEAPTRACK")) or
+                    (args.mode == "evolving-kv" and
+                     (key.startswith("RUST_LOG") or key in ("ASTRID_ALLOC_LOG", "MALLOC_LOG")))):
                 receipt["instrumentation_removed"].append(key)
                 del os.environ[key]
         save()
+        if args.mode == "evolving-kv":
+            hooks = {name: globals()[name] for name in (
+                "sha", "command", "clean_checkout", "quiet_snapshot", "settle_after_builds", "abba_schedule")}
+            receipt["evolving_helper_sha256"] = sha(Path(evolving_kv.__file__))
+            evolving_kv.run(args, protocol, output, receipt, save, deadline, hooks)
+            clean_checkout(protocol, protocol_head)
+            receipt["complete"] = True
+            return
         builds = {}
         receipt["builds"] = builds
         for arm, path, head in [("main", args.baseline, args.baseline_head),
@@ -359,11 +392,7 @@ def main():
         require(all(b["injected_sha256"] == PROBE_SHA for b in builds.values()),
                 "producer probe injections differ")
         settle_after_builds(receipt, save, deadline)
-        schedule = []
-        for count, regions in [(32768, 7), (600000, 1)]:
-            schedule.extend((arm, count, regions, "warmup") for arm in builds)
-            schedule.extend((arm, count, regions, "timed")
-                            for arm in ["main", "candidate", "candidate", "main"] * 4)
+        schedule = abba_schedule([(32768, 7), (600000, 1)], builds)
         schedule.extend([("main", 699051, 1, "negative-control"),
                          ("candidate", 699051, 1, "capacity"),
                          ("candidate", 699051, 7, "capacity")])

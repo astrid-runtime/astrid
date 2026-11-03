@@ -11,11 +11,16 @@ on:
         description: Samples per repeatable workload
         required: true
         default: '3'
+      matched_mode:
+        description: Existing matched runner workload (requires both packing commit inputs)
+        type: choice
+        options: [packing, evolving-kv]
+        default: packing
       packing_baseline:
-        description: Optional exact baseline commit for same-host volume packing comparison
+        description: Optional exact baseline commit for selected same-host matched storage workload
         default: ''
       packing_candidate:
-        description: Optional exact candidate commit for same-host volume packing comparison
+        description: Optional exact candidate commit for selected same-host matched storage workload
         default: ''
       native250_baseline:
         description: Optional exact baseline commit for portable matched native250 evidence
@@ -32,7 +37,7 @@ env:
 
 jobs:
   benchmark:
-    if: inputs.packing_baseline == '' && inputs.packing_candidate == '' && inputs.native250_baseline == '' && inputs.native250_candidate == ''
+    if: inputs.packing_baseline == '' && inputs.packing_candidate == '' && inputs.native250_baseline == '' && inputs.native250_candidate == '' && inputs.matched_mode != 'evolving-kv'
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -82,8 +87,8 @@ jobs:
           retention-days: 30
 
   matched-packing:
-    if: inputs.packing_baseline != '' || inputs.packing_candidate != ''
-    name: Same-host macOS arm64 packing evidence
+    if: inputs.packing_baseline != '' || inputs.packing_candidate != '' || inputs.matched_mode == 'evolving-kv'
+    name: Same-host macOS arm64 matched storage evidence
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
@@ -125,10 +130,12 @@ jobs:
           toolchain: '1.95.0'
       - name: Collect matched unlogged evidence
         env:
+          MATCHED_MODE: ${{ inputs.matched_mode || 'packing' }}
           BASELINE: ${{ inputs.packing_baseline }}
           CANDIDATE: ${{ inputs.packing_candidate }}
         run: |
           python3 protocol/scripts/benchmarks/matched_volume_packing.py \
+            --mode "$MATCHED_MODE" \
             --baseline "$GITHUB_WORKSPACE/baseline" \
             --candidate "$GITHUB_WORKSPACE/candidate" \
             --baseline-head "$BASELINE" --candidate-head "$CANDIDATE" \
