@@ -520,6 +520,136 @@ async fn hosted_volume_rejects_interior_container_corruption_on_header_fallback(
 }
 
 #[tokio::test]
+async fn independent_reader_accepts_a_rust_produced_post_compaction_volume() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let alice_uid = create_test_principal(&store, "alice").await;
+    let alice = alice_uid.to_string();
+    seed_pre_compaction_kv_history(&store).await;
+    let expected = compact_then_write_tail_kv(&store).await;
+    drop(store);
+
+    let volume_path = home.storage_volume_path();
+    assert_post_compaction_reader_payload(&volume_path, &alice, &expected);
+    assert_physical_journal_generation_after_compaction(&volume_path);
+}
+
+async fn seed_pre_compaction_kv_history(store: &RuntimePrincipalStore) {
+    for value in 0_u64..16 {
+        store
+            .kv()
+            .set(
+                "alice:capsule:shell",
+                "state",
+                format!("pre-compact-{value}").into_bytes(),
+            )
+            .await
+            .unwrap();
+    }
+}
+
+async fn compact_then_write_tail_kv(store: &RuntimePrincipalStore) -> Vec<u8> {
+    let policy = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"post-compaction-independent-reader".to_vec(),
+        Vec::new(),
+        0,
+        crate::storage_model::ObjectClass::Metadata,
+    )
+    .unwrap();
+    store
+        .compact_with_deterministic_proof(
+            crate::storage_model::ObjectId::new([0xD5; 32]),
+            policy,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    // One post-compaction write exercises the repaired checkpoint seed against
+    // an actual journal tail CAS / root generation transition.
+    let expected = b"post-compact-tail".to_vec();
+    store
+        .kv()
+        .set("alice:capsule:shell", "state", expected.clone())
+        .await
+        .unwrap();
+    expected
+}
+
+fn assert_post_compaction_reader_payload(volume_path: &Path, alice: &str, expected: &[u8]) {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/runatal_v1_reader.py");
+    let output = std::process::Command::new("python3")
+        .arg(&script)
+        .arg(volume_path)
+        .arg("--payloads")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "independent reader failed on post-compaction volume: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let decoded: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(decoded["roots"][alice]["generation"].as_u64().unwrap() >= 2);
+    assert!(
+        decoded["roots"][alice]["kv"]["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry["key"] == "state" && entry["value_hex"] == hex::encode(expected)
+            }),
+        "post-compaction KV payload missing: {}",
+        decoded["roots"][alice]["kv"]
+    );
+}
+
+fn assert_physical_journal_generation_after_compaction(volume_path: &Path) {
+    let scripts = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts");
+    let summary = std::process::Command::new("python3")
+        .current_dir(&scripts)
+        .arg("-c")
+        .arg(
+            r#"
+import json, sys
+from pathlib import Path
+from runatal_v1_volume import recover_volume, RegionPath
+from runatal_v1_physical_store import decode_store
+from runatal_v1_specs import (
+    FORMAT_SPECIFICATION,
+    CONTENT_CATALOG_SPECIFICATION,
+    LEGACY_FORMAT_SPECIFICATIONS,
+)
+from runatal_v1_physical import identity_bytes
+volume = Path(sys.argv[1])
+regions = recover_volume(volume)
+bootstrap = {identity_bytes(identifier) for identifier in LEGACY_FORMAT_SPECIFICATIONS | {FORMAT_SPECIFICATION}}
+bootstrap.add(identity_bytes(CONTENT_CATALOG_SPECIFICATION))
+summary = decode_store(RegionPath(regions), bootstrap)
+assert summary["journal_generation"] > 1, summary
+print(json.dumps({"journal_generation": summary["journal_generation"]}))
+"#,
+        )
+        .arg(volume_path)
+        .output()
+        .unwrap();
+    assert!(
+        summary.status.success(),
+        "physical summary failed: {}",
+        String::from_utf8_lossy(&summary.stderr)
+    );
+    let physical: serde_json::Value = serde_json::from_slice(&summary.stdout).unwrap();
+    assert!(
+        physical["journal_generation"].as_u64().unwrap() > 1,
+        "expected compacted journal generation > 1, got {physical}"
+    );
+}
+
+#[tokio::test]
 async fn independent_reader_accepts_a_rust_produced_volume() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());

@@ -145,9 +145,9 @@ def replay_state_journal(
     state_generation = cursor.integer(8)
     prior_digest = optional_identity(cursor, PHYSICAL_SCHEME)
     cursor.done()
-    if generation != 1 or active is not None or state_generation or prior_digest is not None:
-        raise FormatError("unsupported initial representation checkpoint")
-    previous_state = None
+    previous_state = recover_checkpoint(
+        active, generation, state_generation, prior_digest, metadata
+    )
     for payload in payloads[1:]:
         cursor = Cursor(payload)
         if cursor.integer(1) != 0 or cursor.integer(8) != generation:
@@ -167,6 +167,21 @@ def replay_state_journal(
     if active is None:
         raise FormatError("representation journal has no active state")
     return active
+
+
+def recover_checkpoint(active, generation, state_generation, prior_digest, metadata):
+    """Seed replay from CURRENT's authenticated checkpoint, not reclaimed history."""
+    if generation == 1 and active is None and state_generation == 0 and prior_digest is None:
+        return None
+    if generation <= 1 or active is None or prior_digest is None:
+        raise FormatError("representation journal begins with an invalid checkpoint")
+    # Compaction retains the exact active state and its complete reachable maps;
+    # it intentionally reclaims prior journal generations. The prior digest is
+    # mandatory linkage, but cannot be rederived from already reclaimed bytes.
+    state, _, _, _, _ = validate_state_metadata(active, metadata)
+    if state["generation"] != state_generation:
+        raise FormatError("representation checkpoint state generation mismatch")
+    return state
 
 
 def validate_root_generations(previous, current, metadata):
@@ -198,7 +213,7 @@ def validate_root_generations(previous, current, metadata):
         raise FormatError("physical root generation does not match identity change")
 
 
-def validate_active_state(store, active, metadata, bootstrap_objects):
+def validate_state_metadata(active, metadata):
     state_bytes = metadata_value(metadata, 5, active)
     state = decode_representation_state(state_bytes)
     if physical_identity(STATE_CONTEXT, state_bytes) != active:
@@ -262,6 +277,11 @@ def validate_active_state(store, active, metadata, bootstrap_objects):
     )
     if replica_total != placement_set["replica_extent_count"]:
         raise FormatError("placement replica extent count mismatch")
+    return state, catalogue, profiles, records, placements
+
+
+def validate_active_state(store, active, metadata, bootstrap_objects):
+    _, catalogue, profiles, records, placements = validate_state_metadata(active, metadata)
     direct_profiles = [key for key, value in profiles.items() if value["kind"] == 0]
     if len(direct_profiles) != 1:
         raise FormatError("catalogue does not contain exactly one direct profile")
@@ -281,7 +301,7 @@ def validate_active_state(store, active, metadata, bootstrap_objects):
         ),
         "catalogue_generation": catalogue["generation"],
         "representation_count": catalogue["representation_count"],
-        "placement_count": placement_set["blob_count"],
+        "placement_count": len(placements),
     }
 
 

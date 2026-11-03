@@ -364,10 +364,14 @@ impl RepresentationStore {
         Ok(RepresentationProfile::decode(bytes)?.frozen_specification())
     }
 
-    pub(super) fn has_representation_for(&self, object: ObjectId) -> bool {
-        self.reverse
-            .get(&object)
-            .is_some_and(|records| !records.is_empty())
+    /// Bootstrap startup guard over the excluded set. Reverse catches
+    /// `DirectCanonical`; an O(1) all-direct proof or one streamed map visit
+    /// catches alternate recipes without allocating `active_entries`.
+    pub(super) fn ensure_no_relocatable_coverage_for(
+        &self,
+        excluded: &BTreeSet<ObjectId>,
+    ) -> Result<(), DurableError> {
+        recovery::ensure_no_excluded_object_coverage(&self.representations, &self.reverse, excluded)
     }
 
     pub(super) fn contains_direct(&self, object: ObjectId) -> bool {

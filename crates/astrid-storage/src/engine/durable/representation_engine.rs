@@ -178,14 +178,9 @@ where
         // A predecessor may not know a successor's bootstrap identity and can
         // describe it during coverage repair. Exclusion must be checked against
         // recovered authoritative state, not just the current writer's role.
-        if excluded
-            .iter()
-            .any(|object| representations.has_representation_for(*object))
-        {
-            return Err(DurableError::InvalidRepresentationState(
-                "bootstrap object has a relocatable representation",
-            ));
-        }
+        // Reverse is DirectCanonical-only; this also rejects PackedSlice,
+        // Compressed, and Delta coverage without a redundant all-recipe index.
+        representations.ensure_no_relocatable_coverage_for(excluded)?;
         let missing = inner
             .index
             .iter()
