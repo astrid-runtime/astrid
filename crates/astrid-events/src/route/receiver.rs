@@ -2,7 +2,6 @@
 //! Owns the lifetime of its `RouteEntry`: on drop, the entry is removed
 //! from the bus's `routes` map.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
@@ -10,6 +9,7 @@ use tokio::sync::Notify;
 
 use crate::event::AstridEvent;
 use crate::route::entry::{RouteEntry, RouteKey};
+use crate::route::{RouteSelectionScope, RouteTable};
 
 /// Gauge: number of active principal sub-queues currently held by a
 /// route. Labelled by `capsule`.
@@ -24,7 +24,8 @@ pub struct RoutedEventReceiver {
     pub(crate) route_key: RouteKey,
     pub(crate) route_entry: Arc<Mutex<RouteEntry>>,
     pub(crate) notify: Arc<Notify>,
-    pub(crate) routes: Arc<RwLock<HashMap<RouteKey, Arc<Mutex<RouteEntry>>>>>,
+    pub(crate) selection_scope: RouteSelectionScope,
+    pub(crate) routes: Arc<RwLock<RouteTable>>,
     pub(crate) lagged_count: u64,
     pub(crate) subscriber: &'static str,
 }
@@ -127,6 +128,6 @@ impl RoutedEventReceiver {
 impl Drop for RoutedEventReceiver {
     fn drop(&mut self) {
         let mut routes = self.routes.write();
-        routes.remove(&self.route_key);
+        routes.remove(&self.route_key, &self.selection_scope);
     }
 }

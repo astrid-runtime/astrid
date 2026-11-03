@@ -222,6 +222,21 @@ impl RouteEntry {
         self
     }
 
+    /// Scope partition used by the authoritative route table for candidate
+    /// selection. Index membership is not authorization; [`accepts_event`]
+    /// remains the fence.
+    pub(crate) fn selection_scope(&self) -> crate::route::RouteSelectionScope {
+        match &self.scope {
+            RouteAdmission::All => crate::route::RouteSelectionScope::All,
+            RouteAdmission::Exact(expected) => {
+                crate::route::RouteSelectionScope::Exact(expected.clone())
+            },
+            RouteAdmission::PrincipalOrSystem(expected) => {
+                crate::route::RouteSelectionScope::PrincipalOrSystem(expected.clone())
+            },
+        }
+    }
+
     /// Whether an event published by `publisher` is admitted into this
     /// route. Unscoped routes (`scope == None`) admit every publisher;
     /// scoped routes admit only their own principal. This is the single

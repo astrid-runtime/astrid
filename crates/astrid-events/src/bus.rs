@@ -1,7 +1,8 @@
 //! Event bus for broadcasting events to subscribers.
 
-use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
 use tracing::{debug, trace, warn};
@@ -15,7 +16,7 @@ use crate::route::MAX_SUBSCRIPTION_BUDGET_BYTES;
 
 use crate::event::AstridEvent;
 use crate::route::{
-    PrincipalKey, RouteAdmissionGate, RouteEntry, RouteKey, RoutedEventReceiver,
+    PrincipalKey, RouteAdmissionGate, RouteEntry, RouteKey, RouteTable, RoutedEventReceiver,
     SubscriptionRepAllocator, TopicMatcher,
 };
 use crate::subscriber::{EventSubscriber, SubscriberRegistry};
@@ -102,10 +103,13 @@ pub struct EventBus {
     /// `parking_lot::RwLock` keeps `publish` synchronous so the
     /// reentrant `SubscriberRegistry::notify` path does not need to be
     /// rewritten as async.
-    routes: Arc<parking_lot::RwLock<HashMap<RouteKey, Arc<parking_lot::Mutex<RouteEntry>>>>>,
+    routes: Arc<parking_lot::RwLock<RouteTable>>,
     /// Allocator for new `RouteKey.subscription_rep` ids; monotonic and
     /// shared across all `EventBus` clones.
     next_subscription_rep: Arc<SubscriptionRepAllocator>,
+    /// Test-only count of route locks performed during candidate selection.
+    #[cfg(test)]
+    selection_visits: Arc<AtomicUsize>,
 }
 
 impl EventBus {
@@ -129,8 +133,10 @@ impl EventBus {
             capacity,
             ipc_seq: Arc::new(AtomicU64::new(1)),
             publish_order: Arc::new(parking_lot::ReentrantMutex::new(())),
-            routes: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            routes: Arc::new(parking_lot::RwLock::new(RouteTable::default())),
             next_subscription_rep: Arc::new(SubscriptionRepAllocator::default()),
+            #[cfg(test)]
+            selection_visits: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -535,14 +541,20 @@ impl EventBus {
             .with_request_owner(request_owner)
             .with_receipt_publisher(capsule_uuid),
         ));
-        let notify = Arc::clone(&entry.lock().notify);
-        self.routes
-            .write()
-            .insert(route_key.clone(), Arc::clone(&entry));
+        let (notify, selection_scope) = {
+            let locked = entry.lock();
+            (Arc::clone(&locked.notify), locked.selection_scope())
+        };
+        self.routes.write().insert(
+            route_key.clone(),
+            Arc::clone(&entry),
+            selection_scope.clone(),
+        );
         RoutedEventReceiver {
             route_key,
             route_entry: entry,
             notify,
+            selection_scope,
             routes: Arc::clone(&self.routes),
             lagged_count: 0,
             subscriber,
@@ -580,15 +592,20 @@ impl EventBus {
                 .with_gate(gate)
                 .with_receipt_publisher(capsule_uuid),
         ));
-        let notify = Arc::clone(&entry.lock().notify);
-        {
-            let mut routes = self.routes.write();
-            routes.insert(route_key.clone(), Arc::clone(&entry));
-        }
+        let (notify, selection_scope) = {
+            let locked = entry.lock();
+            (Arc::clone(&locked.notify), locked.selection_scope())
+        };
+        self.routes.write().insert(
+            route_key.clone(),
+            Arc::clone(&entry),
+            selection_scope.clone(),
+        );
         RoutedEventReceiver {
             route_key,
             route_entry: entry,
             notify,
+            selection_scope,
             routes: Arc::clone(&self.routes),
             lagged_count: 0,
             subscriber,
@@ -669,14 +686,20 @@ impl EventBus {
                 .with_gate(gate)
                 .with_receipt_publisher(capsule_uuid),
         ));
-        let notify = Arc::clone(&entry.lock().notify);
-        self.routes
-            .write()
-            .insert(route_key.clone(), Arc::clone(&entry));
+        let (notify, selection_scope) = {
+            let locked = entry.lock();
+            (Arc::clone(&locked.notify), locked.selection_scope())
+        };
+        self.routes.write().insert(
+            route_key.clone(),
+            Arc::clone(&entry),
+            selection_scope.clone(),
+        );
         RoutedEventReceiver {
             route_key,
             route_entry: entry,
             notify,
+            selection_scope,
             routes: Arc::clone(&self.routes),
             lagged_count: 0,
             subscriber,
@@ -716,6 +739,12 @@ impl EventBus {
     pub fn capacity(&self) -> usize {
         self.capacity
     }
+
+    /// Take and reset the number of route locks performed by candidate selection.
+    #[cfg(test)]
+    pub(crate) fn take_selection_visits(&self) -> usize {
+        self.selection_visits.swap(0, Ordering::Relaxed)
+    }
 }
 
 impl Default for EventBus {
@@ -741,6 +770,8 @@ impl Clone for EventBus {
             publish_order: Arc::clone(&self.publish_order),
             routes: Arc::clone(&self.routes),
             next_subscription_rep: Arc::clone(&self.next_subscription_rep),
+            #[cfg(test)]
+            selection_visits: Arc::clone(&self.selection_visits),
         }
     }
 }

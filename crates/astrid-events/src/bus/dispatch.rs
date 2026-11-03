@@ -4,9 +4,7 @@ use std::sync::Arc;
 
 use super::EventBus;
 use crate::event::AstridEvent;
-use crate::route::{MAX_SUBSCRIPTION_BUDGET_BYTES, PrincipalKey, RouteEntry};
-
-type Route = Arc<parking_lot::Mutex<RouteEntry>>;
+use crate::route::{MAX_SUBSCRIPTION_BUDGET_BYTES, PrincipalKey, RouteHandle};
 
 impl EventBus {
     pub(super) fn dispatch_to_routes(&self, event: &Arc<AstridEvent>) {
@@ -17,23 +15,32 @@ impl EventBus {
         Self::enqueue_routes(matched, event, &message.principal);
     }
 
-    fn matching_routes(&self, event: &AstridEvent, principal: &PrincipalKey) -> Vec<Route> {
-        // Snapshot only admitted routes under the read lock. Foreign scopes
-        // need neither topic parsing nor temporary Arc/key ownership. Release
-        // the table lock before enqueue so a slow receiver cannot prevent a
-        // concurrent subscription or a sibling publisher from making progress.
-        self.routes
-            .read()
-            .values()
+    fn matching_routes(&self, event: &AstridEvent, principal: &PrincipalKey) -> Vec<RouteHandle> {
+        // Candidate membership comes from the scope-partitioned table. Foreign
+        // scopes are not visited or locked. `accepts_event` remains the authz
+        // fence for gate / receipt / request-owner restrictions, and topic
+        // match stays exact. Release the table lock before enqueue so a slow
+        // receiver cannot prevent a concurrent subscription or sibling
+        // publisher from making progress.
+        let candidates = self.routes.read().candidates_for(principal);
+        candidates
+            .into_iter()
             .filter_map(|entry| {
+                #[cfg(test)]
+                self.selection_visits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let route = entry.lock();
                 (route.accepts_event(principal, event) && route.matcher.matches(event))
-                    .then(|| Arc::clone(entry))
+                    .then(|| Arc::clone(&entry))
             })
             .collect()
     }
 
-    fn enqueue_routes(matched: Vec<Route>, event: &Arc<AstridEvent>, principal: &PrincipalKey) {
+    fn enqueue_routes(
+        matched: Vec<RouteHandle>,
+        event: &Arc<AstridEvent>,
+        principal: &PrincipalKey,
+    ) {
         for entry_arc in matched {
             let mut entry = entry_arc.lock();
             // A runtime may retire after the matching snapshot. Keep the

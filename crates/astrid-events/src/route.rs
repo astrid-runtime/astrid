@@ -24,7 +24,8 @@
 //!
 //! ```text
 //! EventBus
-//!  └── routes: RwLock<HashMap<RouteKey, Mutex<RouteEntry>>>
+//!  └── routes: RwLock<RouteTable>
+//!       │      partitioned by admission scope (exact / principal-or-system / all)
 //!       │      RouteKey = (capsule_uuid, topic_pattern, subscription_rep)
 //!       │      RouteEntry { matcher, fanout, total_bytes, notify }
 //!       │                                ↑
@@ -55,6 +56,7 @@ mod gate;
 pub(crate) mod matcher;
 pub(crate) mod receiver;
 mod state;
+mod table;
 
 pub(crate) use entry::RouteEntry;
 pub use entry::{
@@ -67,3 +69,4 @@ pub use receiver::{
     METRIC_ROUTE_ACTIVE_PRINCIPALS, METRIC_ROUTE_BUDGET_BYTES_IN_USE, RoutedEventReceiver,
 };
 pub(crate) use state::SubscriptionRepAllocator;
+pub(crate) use table::{RouteHandle, RouteSelectionScope, RouteTable};
