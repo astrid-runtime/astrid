@@ -30,7 +30,8 @@ def fixture():
     argv = ["/binary", "--only", "evolving-kv", "--samples", "1", "--root", "/root", "--output", "/report"]
     build = {"head": HEAD, "binary": "/binary", "binary_sha256": DIGEST,
              "binary_bytes": 12, "overlay_porcelain": []}
-    payload = {"provenance": {"repository": "astrid-runtime/astrid", "git_revision": HEAD,
+    payload = {"package_version": "2026.10.1", "os": "macos", "architecture": "aarch64", "logical_cpus": 3,
+               "provenance": {"repository": "astrid-runtime/astrid", "git_revision": HEAD,
                              "git_tree": {"state": "clean"}, "executable_argv": argv,
                              "executable": {"sha256": DIGEST, "bytes": 12}},
                "config": {"selection": "evolving_kv", "samples": 1, "object_cache_bytes": None,
@@ -44,15 +45,54 @@ def fixture():
                                        "operations_per_sample": None if byte_count else 1,
                                        "samples_nanoseconds": [100] * (4 if suffix == "insert_cas" else 1),
                                        "minimum_milliseconds": 0.0001, "median_milliseconds": 0.0001,
-                                       "maximum_milliseconds": 0.0001})
+                                       "maximum_milliseconds": 0.0001,
+                                       "median_mib_per_second": byte_count / 1048576 / 1e-7 if byte_count else None,
+                                       "median_operations_per_second": None if byte_count else 1e7})
         for suffix, count, denominator in [("closed_sequence", 1, size + 16384)]:
             payload["write_amplifications"].append({"name": f"{prefix}_{suffix}",
                                                   "authoritative_bytes_appended": [100] * count,
-                                                  "logical_bytes_per_sample": denominator})
+                                                  "logical_bytes_per_sample": denominator,
+                                                  "minimum_authoritative_bytes_appended": 100,
+                                                  "median_authoritative_bytes_appended": 100,
+                                                  "maximum_authoritative_bytes_appended": 100,
+                                                  "median_physical_to_logical_ratio": 100 / denominator})
     return payload, build, argv
 
 
 class ReportTests(unittest.TestCase):
+    def test_even_duration_midpoint_rounding_and_zero_rate_match_rust(self):
+        for values, median in [([1, 2, 5, 8], 3), ([0, 0, 0, 0], 0)]:
+            payload, build, argv = fixture()
+            row = payload["metrics"][1]
+            row.update(samples_nanoseconds=values, minimum_milliseconds=values[0] / 1e9 * 1000,
+                       median_milliseconds=median / 1e9 * 1000, maximum_milliseconds=values[-1] / 1e9 * 1000,
+                       median_operations_per_second=1 / (median / 1e9) if median else None)
+            with self.subTest(values=values):
+                MODE.validate_report(json.dumps(envelope(payload)), build, argv, [])
+
+    def test_rehashed_summary_and_schema_tampering_fails(self):
+        for category in ["minimum", "median", "maximum", "throughput", "operation-rate",
+                         "growth-minimum", "growth-median", "growth-maximum", "growth-ratio",
+                         "extra-payload", "missing-payload", "extra-metric", "missing-metric-summary",
+                         "extra-growth", "missing-growth-summary", "boolean-growth-summary"]:
+            payload, build, argv = fixture()
+            if category in ("minimum", "median", "maximum"):
+                payload["metrics"][0][f"{category}_milliseconds"] += 1
+            if category == "throughput": payload["metrics"][0]["median_mib_per_second"] *= 2
+            if category == "operation-rate": payload["metrics"][1]["median_operations_per_second"] *= 2
+            if category in ("growth-minimum", "growth-median", "growth-maximum"):
+                payload["write_amplifications"][0][f"{category[7:]}_authoritative_bytes_appended"] += 1
+            if category == "growth-ratio": payload["write_amplifications"][0]["median_physical_to_logical_ratio"] *= 2
+            if category == "extra-payload": payload["unreviewed"] = []
+            if category == "missing-payload": del payload["architecture"]
+            if category == "extra-metric": payload["metrics"][0]["unreviewed"] = 1
+            if category == "missing-metric-summary": del payload["metrics"][0]["maximum_milliseconds"]
+            if category == "extra-growth": payload["write_amplifications"][0]["unreviewed"] = 1
+            if category == "missing-growth-summary": del payload["write_amplifications"][0]["maximum_authoritative_bytes_appended"]
+            if category == "boolean-growth-summary": payload["write_amplifications"][0]["minimum_authoritative_bytes_appended"] = True
+            with self.subTest(category=category), self.assertRaises(RuntimeError):
+                MODE.validate_report(json.dumps(envelope(payload)), build, argv, [])
+
     def test_valid_report_and_full_payload_are_retained(self):
         payload, build, argv = fixture()
         report = envelope(payload)

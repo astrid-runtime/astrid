@@ -172,6 +172,36 @@ def integers(values, count):
             all(type(v) is int and v >= 0 for v in values))
 
 
+def same_float(actual, expected):
+    if expected is None:
+        return actual is None
+    # Rust Duration conversion and Python division can round differently.
+    # Permit four binary64 ULPs, never a percentage-based benchmark tolerance.
+    return (type(actual) in (int, float) and math.isfinite(actual) and actual >= 0 and
+            abs(actual - expected) <= 4 * max(math.ulp(actual), math.ulp(expected)))
+
+
+def validate_duration_summary(row):
+    require(set(row) == {"name", "bytes_per_sample", "operations_per_sample", "samples_nanoseconds",
+                         "minimum_milliseconds", "median_milliseconds", "maximum_milliseconds",
+                         "median_mib_per_second", "median_operations_per_second"}, "metric schema changed")
+    values = row["samples_nanoseconds"]
+    require(values == sorted(values) and values[-1] < 2**64 * 1_000_000_000,
+            "duration samples are not canonical Rust Durations")
+    middle = len(values) // 2
+    median = values[middle] if len(values) % 2 else values[middle - 1] + (values[middle] - values[middle - 1]) // 2
+    seconds = lambda ns: float(ns // 1_000_000_000) + float(ns % 1_000_000_000) / 1_000_000_000
+    for key, ns in [("minimum_milliseconds", values[0]), ("median_milliseconds", median),
+                    ("maximum_milliseconds", values[-1])]:
+        require(same_float(row[key], seconds(ns) * 1000), "duration summary disagrees with raw samples")
+    elapsed = seconds(median)
+    byte_count, operations = row["bytes_per_sample"], row["operations_per_sample"]
+    throughput = byte_count / 1048576 / elapsed if byte_count is not None and elapsed > 0 else None
+    rate = operations / elapsed if operations is not None and elapsed > 0 else None
+    require(same_float(row["median_mib_per_second"], throughput) and
+            same_float(row["median_operations_per_second"], rate), "throughput summary disagrees with raw samples")
+
+
 def validate_report(raw, build_receipt, argv, dirty):
     envelope = decode(raw)
     require(isinstance(envelope, dict), "storage_io envelope must be an object")
@@ -183,6 +213,9 @@ def validate_report(raw, build_receipt, argv, dirty):
     require(envelope.get("payload_digest") == digest, "storage_io payload digest mismatch")
     payload = decode(text)
     require(isinstance(payload, dict), "storage_io payload must be an object")
+    require(set(payload) == {"provenance", "package_version", "os", "architecture", "logical_cpus", "config",
+                             "metrics", "write_amplifications", "substrate_comparisons", "throughput_scaling",
+                             "representation_metadata", "resource_peaks"}, "payload schema changed")
     require(payload == envelope.get("payload"), "storage_io payload representations differ")
     provenance = payload["provenance"]
     require(provenance["git_revision"] == build_receipt["head"], "report producer mismatch")
@@ -224,17 +257,26 @@ def validate_metrics(payload):
         require((row["bytes_per_sample"] is None or type(row["bytes_per_sample"]) is int) and
                 (row["operations_per_sample"] is None or type(row["operations_per_sample"]) is int),
                 "noninteger operation/byte denominator")
-        for key in ("minimum_milliseconds", "median_milliseconds", "maximum_milliseconds"):
-            require(type(row[key]) in (int, float) and math.isfinite(row[key]) and row[key] >= 0,
-                    "invalid duration summary")
+        validate_duration_summary(row)
     require(isinstance(amplifications, list) and len(amplifications) == 2,
             "missing/extra amplification rows")
     require({a["name"] for a in amplifications} == set(expected_amps), "wrong amplification names")
     for row in amplifications:
+        require(set(row) == {"name", "authoritative_bytes_appended", "logical_bytes_per_sample",
+                             "minimum_authoritative_bytes_appended", "median_authoritative_bytes_appended",
+                             "maximum_authoritative_bytes_appended", "median_physical_to_logical_ratio"},
+                "growth schema changed")
         count, byte_count = expected_amps[row["name"]]
         require(integers(row["authoritative_bytes_appended"], count) and
                 type(row["logical_bytes_per_sample"]) is int and
                 row["logical_bytes_per_sample"] == byte_count, "wrong growth cardinality/denominator")
+        observed = row["authoritative_bytes_appended"][0]
+        require(observed < 2**64, "growth sample exceeds Rust u64")
+        for key in ("minimum_authoritative_bytes_appended", "median_authoritative_bytes_appended",
+                    "maximum_authoritative_bytes_appended"):
+            require(type(row[key]) is int and row[key] == observed, "growth summary disagrees with raw samples")
+        require(same_float(row["median_physical_to_logical_ratio"], observed / byte_count),
+                "growth ratio disagrees with raw sample")
     for field in ("substrate_comparisons", "throughput_scaling", "representation_metadata", "resource_peaks"):
         require(payload[field] == [], "unexpected unrelated workload metrics")
 
