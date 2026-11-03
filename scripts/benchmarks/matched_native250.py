@@ -417,19 +417,26 @@ def record_offline(client: Path, home: Path, args: list[str], log_path: Path,
                    operations: list[dict], phase: str) -> dict:
     lsof_idle(home / "astrid.volume")
     run = private_run_dir(f"offline-{phase}")
-    began = time.monotonic()
-    output = subprocess.run([str(client), *args], env=child_env(home, run),
-                            capture_output=True, text=True, timeout=STAGE_TIMEOUT_SECS)
-    log_path.write_text(output.stdout + output.stderr)
-    item = {
-        "phase": phase, "args": args, "seconds": time.monotonic() - began,
-        "exit": output.returncode, "log": str(log_path), "log_sha256": sha(log_path),
-    }
+    item = {"phase": phase, "args": args, "exit": None, "complete": False}
     operations.append(item)
-    lsof_idle(home / "astrid.volume")
-    shutil.rmtree(run)
-    require(output.returncode == 0, output.stderr[-2000:] or output.stdout[-2000:])
-    return item
+    try:
+        execute_stage([str(client), *args], child_env(home, run), log_path, item)
+        return item
+    except BaseException as error:
+        item["complete"] = False
+        item["error"] = repr(error)
+        raise
+    finally:
+        primary = sys.exception()
+        try:
+            lsof_idle(home / "astrid.volume")
+            shutil.rmtree(run)
+            item["run_dir_removed"] = True
+        except BaseException as cleanup_error:
+            item["complete"] = False
+            item["cleanup_error"] = repr(cleanup_error)
+            if primary is None:
+                raise
 
 
 def generate_seed(ownership_root: Path, daemon: Path, cli: Path, client: Path,
@@ -440,6 +447,9 @@ def generate_seed(ownership_root: Path, daemon: Path, cli: Path, client: Path,
     boots: list[dict] = []
     operations: list[dict] = []
     owned = None
+    receipt["seed"] = {"directory": str(seed_dir), "boots": boots,
+                       "operations": operations, "complete": False}
+    save()
 
     def boot_seed(log_name: str) -> tuple[OwnedDaemon, Path, dict]:
         nonlocal owned
@@ -514,6 +524,7 @@ def generate_seed(ownership_root: Path, daemon: Path, cli: Path, client: Path,
         digest = sha(volume)
         info = {
             "directory": str(seed_dir),
+            "complete": True,
             "volume": str(volume),
             "sha256": digest,
             "bytes": volume.stat().st_size,
@@ -540,7 +551,8 @@ def generate_seed(ownership_root: Path, daemon: Path, cli: Path, client: Path,
         return info
     except BaseException as error:
         if owned is not None:
-            owned.force_kill_owned({"seed_cleanup": True}, original_error=error)
+            cleanup = receipt["seed"].setdefault("failure_cleanup", {})
+            owned.force_kill_owned(cleanup, original_error=error)
         raise
 
 

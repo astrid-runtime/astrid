@@ -104,6 +104,43 @@ class Native250SyntheticTests(unittest.TestCase):
         process.terminate.assert_not_called()
         self.assertIsNone(daemon.process)
 
+    def test_seed_start_failure_preserves_partial_boot_and_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt = {}
+            daemon = MagicMock()
+            daemon.start.side_effect = RuntimeError("seed start failed")
+            with patch.object(MODULE, "OwnedDaemon", return_value=daemon), \
+                    patch.object(MODULE, "private_run_dir", return_value=root / "run"):
+                with self.assertRaisesRegex(RuntimeError, "seed start failed"):
+                    MODULE.generate_seed(root, root / "daemon", root / "cli", root / "client",
+                                         root / "capsule", root, receipt, lambda: None)
+            self.assertFalse(receipt["seed"]["complete"])
+            self.assertEqual(len(receipt["seed"]["boots"]), 1)
+            daemon.force_kill_owned.assert_called_once()
+            self.assertIs(daemon.force_kill_owned.call_args.args[0],
+                          receipt["seed"]["failure_cleanup"])
+
+    def test_offline_timeout_preserves_operation_and_cleans_owned_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "run"
+            run.mkdir()
+            operations = []
+            timeout = MODULE.subprocess.TimeoutExpired(["client"], 1, output=b"partial")
+            with patch.object(MODULE, "lsof_idle"), \
+                    patch.object(MODULE, "private_run_dir", return_value=run), \
+                    patch.object(MODULE.subprocess, "run", side_effect=timeout):
+                with self.assertRaises(MODULE.subprocess.TimeoutExpired):
+                    MODULE.record_offline(root / "client", root / "home", ["offline-census"],
+                                          root / "offline.log", operations, "offline-census")
+            self.assertEqual(len(operations), 1)
+            self.assertFalse(operations[0]["complete"])
+            self.assertTrue(operations[0]["timed_out"])
+            self.assertTrue(operations[0]["run_dir_removed"])
+            self.assertEqual((root / "offline.log").read_text(), "partial")
+            self.assertFalse(run.exists())
+
     def test_log_failure_preserves_stage_timeout(self):
         error = MODULE.subprocess.TimeoutExpired(["client"], 1, output=b"partial")
         item = {"exit": None, "complete": False}
