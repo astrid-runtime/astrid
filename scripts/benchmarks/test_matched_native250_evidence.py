@@ -92,3 +92,29 @@ class EvidenceTests(unittest.TestCase):
                             lambda: operations.append("save"),
                             lambda value: operations.append(("emit", value.copy())))
         self.assertEqual(operations, ["save", "publish", ("emit", receipt)])
+
+    def test_failed_publication_never_exposes_stale_success_receipt(self):
+        for failure in ("alias", "disk-full"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                receipt = {"complete": True}
+                def save():
+                    (root / "receipt.json").write_text(json.dumps(receipt))
+                log = root / "capsule-build.log"
+                if failure == "alias":
+                    target = root / "excluded"
+                    target.write_bytes(b"private")
+                    log.symlink_to(target)
+                else:
+                    log.write_bytes(b"diagnostic")
+                original = Path.write_bytes
+                def write(path, data):
+                    if failure == "disk-full" and path.name == "capsule-build.log":
+                        raise OSError("disk full while copying log")
+                    return original(path, data)
+                with patch.object(Path, "write_bytes", write):
+                    with self.assertRaises((OSError, RuntimeError)):
+                        MODULE.finalize(root, receipt, save, lambda value: None)
+                self.assertFalse(json.loads((root / "receipt.json").read_text())["complete"])
+                self.assertFalse((root / "public").exists())
+                self.assertEqual(list(root.glob(".publication-*")), [])

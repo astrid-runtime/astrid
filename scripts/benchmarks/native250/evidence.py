@@ -2,6 +2,7 @@
 from pathlib import Path
 import hashlib
 import json
+import tempfile
 
 # Artifact-service bounds, not runtime policy. Full log identity is recorded
 # even when only its tail fits; measured receipt values are never truncated.
@@ -14,10 +15,20 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def publish(output: Path) -> dict:
+def publish(output: Path, log_paths=None) -> dict:
     output = output.resolve()
     publication = output / "public"
-    publication.mkdir(mode=0o700, exist_ok=False)
+    if publication.exists() or publication.is_symlink():
+        raise RuntimeError("refusing to replace published evidence")
+    # A failed copy must never expose an earlier successful receipt to upload.
+    with tempfile.TemporaryDirectory(prefix=".publication-", dir=output) as temporary:
+        staging = Path(temporary)
+        manifest = _populate(output, staging, log_paths)
+        staging.rename(publication)
+    return manifest
+
+
+def _populate(output, publication, log_paths):
     receipt = output / "receipt.json"
     if receipt.is_symlink() or not receipt.is_file():
         raise RuntimeError("publication requires a regular receipt")
@@ -29,6 +40,8 @@ def publish(output: Path) -> dict:
     paths.append(output / "baseline-seed-client" / "client-rustc.log")
     paths.extend(output.glob("ownership-root/seed/*.log"))
     paths.extend(output.glob("ownership-root/life-*/*.log"))
+    if log_paths is not None:
+        paths = list(log_paths)
     manifest = {"receipt_sha256": digest(receipt), "logs": [],
                 "log_limit_bytes": LOG_LIMIT, "total_log_limit_bytes": TOTAL_LOG_LIMIT}
     remaining = TOTAL_LOG_LIMIT
@@ -54,7 +67,7 @@ def publish(output: Path) -> dict:
     return manifest
 
 
-def finalize(output, receipt, save, emit, primary_error=None):
+def finalize(output, receipt, save, emit, primary_error=None, log_paths=None):
     """Attempt every evidence exit path without hiding an earlier run failure."""
     failures = []
     try:
@@ -64,7 +77,10 @@ def finalize(output, receipt, save, emit, primary_error=None):
         receipt["final_save_error"] = repr(error)
         failures.append(error)
     try:
-        publish(output)
+        if log_paths is None:
+            publish(output)
+        else:
+            publish(output, log_paths)
     except BaseException as error:
         receipt["complete"] = False
         receipt["publication_error"] = repr(error)

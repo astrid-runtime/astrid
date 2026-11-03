@@ -117,6 +117,7 @@ class Native250SyntheticTests(unittest.TestCase):
         self.assertIn("reply.request_id.as_deref() == Some(id.as_str())", admin)
         self.assertIn("did not authenticate", client)
         self.assertIn("did not authenticate", admin)
+        self.assertIn('reply["payload"]["req_id"].as_str() == Some(req.as_str())', client)
 
     def test_seed_start_failure_preserves_partial_boot_and_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -370,49 +371,89 @@ class Native250SyntheticTests(unittest.TestCase):
                 daemon.assert_owned()
             sample.assert_not_called()
 
-    def test_force_kill_requires_identity_before_signal_and_preserves_error(self):
-        daemon = MODULE.OwnedDaemon(
-            Path("/tmp/astrid-daemon"), Path("/tmp/home"), Path("/tmp/ws"),
-            Path("/tmp/run"), Path("/tmp/log"))
-        daemon.process = MagicMock(pid=424242)
-        daemon.process.poll.return_value = None
-        daemon.identity = {
-            "pid": 424242,
-            "ppid": os.getpid(),
-            "lstart": "Thu Jan  1 00:00:00 1970",
-            "command": f"{daemon.binary} --workspace {daemon.workspace}",
-            "binary": str(daemon.binary),
-            "workspace": str(daemon.workspace),
-        }
-        record = {}
-        process = daemon.process
-        with patch.object(daemon, "assert_owned") as owned:
-            daemon.force_kill_owned(record)
-            owned.assert_called()
-            process.kill.assert_called_once()
-            self.assertTrue(record["failure_cleanup_child_reaped"])
-            self.assertIsNone(daemon.process)
+    def test_identity_capture_failure_kills_and_reaps_only_spawned_child(self):
+        # A toy sleeper, never an Astrid daemon or existing process.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            daemon = MODULE.OwnedDaemon(root / "daemon", root / "home", root / "work",
+                                       root / "run", root / "log")
+            child = MODULE.subprocess.Popen([MODULE.sys.executable, "-c",
+                                             "import time; time.sleep(30)"])
+            boot = {}
+            try:
+                with patch.object(MODULE.subprocess, "Popen", return_value=child), \
+                        patch.object(MODULE, "capture_process_identity", side_effect=OSError("identity unavailable")):
+                    with self.assertRaisesRegex(OSError, "identity unavailable"):
+                        daemon.start(boot)
+                self.assertIsNone(daemon.identity)
+                daemon.force_kill_owned(boot)
+                self.assertTrue(boot["failure_cleanup_child_reaped"])
+                self.assertEqual(child.returncode, -MODULE.signal.SIGKILL)
+                self.assertIsNone(daemon.process)
+            finally:
+                if child.returncode is None:
+                    child.kill()
+                    child.wait(timeout=5)
 
-        process = MagicMock(pid=424243)
-        process.poll.return_value = None
+    def test_cleanup_refuses_nonchild_without_losing_handle_or_primary_failure(self):
+        daemon = MODULE.OwnedDaemon(Path("/owned/daemon"), Path("/owned/home"),
+                                   Path("/owned/work"), Path("/owned/run"), Path("/owned/log"))
+        process = MagicMock(pid=424243, returncode=None)
         daemon.process = process
-        daemon.identity = {
-            "pid": 424243,
-            "ppid": os.getpid(),
-            "lstart": "Thu Jan  1 00:00:00 1970",
-            "command": f"{daemon.binary} --workspace {daemon.workspace}",
-            "binary": str(daemon.binary),
-            "workspace": str(daemon.workspace),
-        }
         original = RuntimeError("seed boom")
         record = {}
-        with patch.object(daemon, "assert_owned", side_effect=RuntimeError("identity drifted")):
+        with patch.object(MODULE.os, "wait4", side_effect=ChildProcessError("not our child")), \
+                patch.object(MODULE.os, "kill") as signal:
             with self.assertRaises(RuntimeError) as ctx:
                 daemon.force_kill_owned(record, original_error=original)
-            self.assertIs(ctx.exception, original)
-            self.assertIsInstance(ctx.exception.__cause__, RuntimeError)
-            self.assertIn("identity drifted", record["failure_cleanup_error"])
-            process.kill.assert_not_called()
+        self.assertIs(ctx.exception, original)
+        self.assertIsInstance(ctx.exception.__cause__, ChildProcessError)
+        self.assertIs(daemon.process, process)
+        signal.assert_not_called()
+
+    def test_shutdown_signals_without_popen_poll_stealing_wait4(self):
+        daemon = MODULE.OwnedDaemon(Path("/owned/daemon"), Path("/owned/home"),
+                                   Path("/owned/work"), Path("/owned/run"), Path("/owned/log"))
+        process = MagicMock(pid=424245, returncode=None)
+        process.poll.side_effect = AssertionError("Popen signals may reap before wait4")
+        daemon.process, daemon.identity = process, {"pid": process.pid}
+        calls = 0
+        def wait(*args):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise MODULE.subprocess.TimeoutExpired("owned", 0)
+            process.returncode = 0
+            return {"max_rss_bytes": 4321}
+        boot = {}
+        with patch.object(daemon, "assert_owned"), patch.object(MODULE, "sample_owned"), \
+                patch.object(MODULE, "wait_owned", side_effect=wait), \
+                patch.object(MODULE.os, "kill") as signal:
+            daemon.stop(boot, require_volume_only=False)
+        signal.assert_called_once_with(process.pid, MODULE.signal.SIGTERM)
+        process.terminate.assert_not_called()
+        self.assertEqual(boot["terminal_process_metrics"]["max_rss_bytes"], 4321)
+
+    def test_pre_ready_exit_records_wait4_rusage_without_poll(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            daemon = MODULE.OwnedDaemon(root / "daemon", root / "home", root / "work",
+                                       root / "run", root / "log")
+            process = MagicMock(pid=424244, returncode=None)
+            process.poll.side_effect = AssertionError("poll steals terminal rusage")
+            def terminal(*args):
+                process.returncode = 0
+                return {"max_rss_bytes": 1234}
+            boot = {}
+            with patch.object(MODULE.subprocess, "Popen", return_value=process), \
+                    patch.object(MODULE, "capture_process_identity", return_value={"pid": process.pid}), \
+                    patch.object(MODULE, "wait_owned", side_effect=terminal):
+                with self.assertRaisesRegex(RuntimeError, "before ready"):
+                    daemon.start(boot)
+            self.assertEqual(boot["terminal_process_metrics"]["max_rss_bytes"], 1234)
+            self.assertEqual(boot["exit"], 0)
+            self.assertTrue(boot["unexpected_exit_before_ready"])
+            self.assertIsNone(daemon.process)
 
     def test_quiet_hold_before_boot_cycle_preserves_no_false_complete(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -543,7 +584,7 @@ class Native250SyntheticTests(unittest.TestCase):
             daemon.process.poll.return_value = 0
             daemon.identity = {"pid": 777001}
             boot = {}
-            with patch.object(daemon, "assert_owned"), \
+            with patch.object(daemon, "assert_owned"), patch.object(MODULE.os, "kill"), \
                     patch.object(MODULE, "sample_owned", return_value={"pid": 777001}), \
                     patch.object(MODULE, "wait_owned", side_effect=[
                         MODULE.subprocess.TimeoutExpired("daemon", 0), {"max_rss_bytes": 1},

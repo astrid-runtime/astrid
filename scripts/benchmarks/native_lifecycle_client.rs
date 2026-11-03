@@ -257,6 +257,10 @@ async fn run() -> anyhow::Result<()> {
                         Duration::from_secs(60),
                     )
                     .await?;
+                ensure!(
+                    reply["payload"]["req_id"].as_str() == Some(req.as_str()),
+                    "principal response correlation mismatch: {reply}"
+                );
                 if mode == "probe-wrong-marker" {
                     ensure!(
                         reply["payload"]["exit_code"] == 1

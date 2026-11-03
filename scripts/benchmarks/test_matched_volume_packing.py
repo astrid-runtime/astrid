@@ -305,5 +305,36 @@ class RefusalTests(unittest.TestCase):
                     finally:
                         MODULE.emit_terminal_receipt({"complete": False})
 
+    def test_packing_publication_excludes_preserved_volumes_and_binaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            receipt = {"complete": False, "performance_accepted": False}
+            (root / "receipt.json").write_text(MODULE.json.dumps(receipt))
+            fixture = root / "packing-failed"
+            fixture.mkdir()
+            (fixture / "volume").write_bytes(b"preserved synthetic volume")
+            (root / "main-probe").write_bytes(b"binary")
+            (root / "sample-00.stdout").write_text("complete=false")
+            with patch.object(MODULE, "emit_terminal_receipt"):
+                MODULE.finalize_evidence(root, receipt, lambda: None)
+            files = sorted(str(p.relative_to(root / "public"))
+                           for p in (root / "public").rglob("*") if p.is_file())
+            self.assertEqual(files, ["manifest.json", "receipt.json", "sample-00.stdout"])
+            self.assertTrue((fixture / "volume").exists())
+            workflow = Path(__file__).resolve().parents[2] / ".github/workflows/storage-benchmark.yml"
+            self.assertIn("path: packing-evidence/public", workflow.read_text())
+
+    def test_packing_final_save_failure_still_publishes_and_emits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "receipt.json").write_text('{"complete": false}')
+            receipt = {"complete": True}
+            with patch.object(MODULE, "emit_terminal_receipt") as emit:
+                with self.assertRaisesRegex(OSError, "save failed"):
+                    MODULE.finalize_evidence(root, receipt, MagicMock(side_effect=OSError("save failed")))
+            self.assertFalse(receipt["complete"])
+            self.assertTrue((root / "public/receipt.json").exists())
+            emit.assert_called_once_with(receipt)
+
 if __name__ == "__main__":
     unittest.main()

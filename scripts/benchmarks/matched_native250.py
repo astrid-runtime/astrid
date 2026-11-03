@@ -236,8 +236,16 @@ class OwnedDaemon:
         self.identity = capture_process_identity(self.process, self.binary, self.workspace)
         boot["process_identity"] = dict(self.identity)
         while not (self.run / "system.ready").exists():
-            require(self.process.poll() is None,
-                    f"daemon exited {self.process.returncode} before ready")
+            try:
+                metrics = wait_owned(self.process, 0, self.identity)
+            except subprocess.TimeoutExpired:
+                pass
+            else:
+                boot["terminal_process_metrics"] = metrics
+                boot["exit"] = self.process.returncode
+                boot["unexpected_exit_before_ready"] = True
+                self._close()
+                raise RuntimeError("persistent daemon exited before ready")
             elapsed = time.monotonic() - boot["spawn_monotonic"]
             if elapsed >= READY_SECS:
                 boot["ready_containment_exceeded"] = True
@@ -265,7 +273,7 @@ class OwnedDaemon:
         started = time.monotonic()
         self.assert_owned()
         boot["explicit_shutdown_requested"] = True
-        self.process.terminate()
+        os.kill(self.process.pid, signal.SIGTERM)
         try:
             boot["terminal_process_metrics"] = wait_owned(
                 self.process, PRODUCT_SHUTDOWN_SECS, self.identity)
@@ -276,7 +284,7 @@ class OwnedDaemon:
                     self.process, CLEANUP_SECS, self.identity)
             except subprocess.TimeoutExpired:
                 self.assert_owned()
-                self.process.kill()
+                os.kill(self.process.pid, signal.SIGKILL)
                 boot["terminal_process_metrics"] = wait_owned(
                     self.process, CLEANUP_SECS, self.identity)
                 boot["cleanup_kill"] = True
@@ -297,18 +305,24 @@ class OwnedDaemon:
             return
         try:
             require(self.process.pid not in PROTECTED_PIDS, "protected")
-            if self.process.poll() is None:
-                self.assert_owned()
-                self.process.kill()
-            self.process.wait(timeout=5)
+            if self.process.returncode is None:
+                try:
+                    record["terminal_process_metrics"] = wait_owned(self.process, 0, self.identity)
+                except subprocess.TimeoutExpired:
+                    # wait4 proved this is our unreaped child. Its PID cannot be
+                    # reused before we reap it, even if identity capture failed.
+                    os.kill(self.process.pid, signal.SIGKILL)
+                    record["terminal_process_metrics"] = wait_owned(self.process, 5, self.identity)
             record["failure_cleanup_child_reaped"] = True
+            record["exit"] = self.process.returncode
         except BaseException as cleanup_error:
             record["failure_cleanup_error"] = repr(cleanup_error)
             if original_error is not None:
                 raise original_error from cleanup_error
             raise
         finally:
-            self._close()
+            if self.process.returncode is not None:
+                self._close()
 
     def _close(self) -> None:
         if self.log is not None:

@@ -9,6 +9,7 @@ the report records that injection explicitly. No automatic speed verdict.
 import argparse
 import ctypes
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -17,8 +18,23 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
+
+
+EVIDENCE_SPEC = importlib.util.spec_from_file_location(
+    "benchmark_evidence", Path(__file__).parent / "native250" / "evidence.py")
+evidence = importlib.util.module_from_spec(EVIDENCE_SPEC)
+EVIDENCE_SPEC.loader.exec_module(evidence)
+
+
+def finalize_evidence(output, receipt, save, primary_error=None):
+    logs = [output / "main-build.jsonl", output / "candidate-build.jsonl"]
+    logs.extend(output.glob("sample-*.stdout"))
+    logs.extend(output.glob("sample-*.stderr"))
+    evidence.finalize(output, receipt, save, emit_terminal_receipt,
+                      primary_error=primary_error, log_paths=logs)
 
 
 PROBE_SHA = "bff5f6b391f7ae2ed1b2c43d94def378733de4c89c9287c5c767b7a173ea7faf"
@@ -381,8 +397,7 @@ def main():
         receipt["failure"] = str(error)
         raise
     finally:
-        save()
-        emit_terminal_receipt(receipt)
+        finalize_evidence(output, receipt, save, primary_error=sys.exception())
 
 
 if __name__ == "__main__":
