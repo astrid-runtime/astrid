@@ -200,5 +200,83 @@ class RefusalTests(unittest.TestCase):
                 self.assertEqual(process.wait.call_count, 2)
 
 
+    def test_terminal_receipt_is_compact_and_truthful_on_hold(self):
+        receipt = {
+            "complete": False,
+            "performance_accepted": False,
+            "failure": "background load before sample: HOLD",
+            "workflow_sha": HEAD,
+            "protocol_checkout_head": HEAD,
+            "protocol_tree": "c" * 40,
+            "builds": {
+                "main": {
+                    "head": HEAD,
+                    "tree": "d" * 40,
+                    "lock_sha256": "e" * 64,
+                    "binary": "/tmp/main-probe",
+                    "binary_sha256": "f" * 64,
+                    "artifacts": [{"sha256": "1" * 64, "path": "/huge"}],
+                    "rustc": "rustc 1.95.0",
+                }
+            },
+            "postbuild_settling": {
+                "windows": [{
+                    "quiet": True,
+                    "background_cpu_percent": 1.0,
+                    "rows": ["40.9 observer"] * 50,
+                }]
+            },
+            "quiet_gate_before_sample": {
+                "index": 0,
+                "quiet": False,
+                "background_cpu_percent": 18.5,
+                "rows": ["busy"] * 20,
+            },
+            "samples": [],
+            "schedule": [("main", 32768, 7, "warmup")],
+        }
+        summary = MODULE.terminal_receipt(receipt)
+        self.assertEqual(summary["schema"], MODULE.TERMINAL_RECEIPT_MARKER)
+        self.assertFalse(summary["complete"])
+        self.assertEqual(summary["failure"], "background load before sample: HOLD")
+        self.assertTrue(summary["samples_present"])
+        self.assertEqual(summary["sample_count"], 0)
+        self.assertEqual(summary["samples"], [])
+        self.assertEqual(summary["builds"]["main"]["artifact_count"], 1)
+        self.assertNotIn("rows", summary["quiet_observations"][0])
+        self.assertEqual(summary["quiet_observations"][0]["row_count"], 50)
+        self.assertEqual(summary["quiet_observations"][1]["kind"], "quiet_gate_before_sample")
+        self.assertEqual(summary["quiet_observations"][1]["index"], 0)
+        self.assertFalse(summary["quiet_observations"][1]["quiet"])
+        encoded = MODULE.json.dumps(summary)
+        self.assertNotIn("40.9 observer", encoded)
+        self.assertLess(len(encoded), 8000)
+
+    def test_terminal_receipt_missing_samples_not_reinterpreted_as_zero(self):
+        summary = MODULE.terminal_receipt({"complete": False})
+        self.assertFalse(summary["samples_present"])
+        self.assertIsNone(summary["sample_count"])
+        self.assertIsNone(summary["samples"])
+        missing = MODULE.terminal_receipt("absent")
+        self.assertIsNone(missing["sample_count"])
+        self.assertIn("not reinterpreted", missing["failure"])
+
+    def test_terminal_fallback_preserves_client_identity_and_memory_evidence(self):
+        # Artifact finalization can fail after collection. The fallback must
+        # retain evidence needed to interpret timings, not just their values.
+        receipt = {
+            "client": {"path": "owned-client", "sha256": "a" * 64},
+            "runs": [{"ordinal": 0, "first_upgrade": {
+                "ready_process_metrics": {"rss_bytes": 1234},
+                "terminal_process_metrics": {"max_rss_bytes": 5678},
+                "shutdown_deadline_exceeded": True,
+            }, "operations": [{"daemon_before": {"rss_bytes": 9012}}]}],
+        }
+        original = MODULE.json.dumps(receipt, sort_keys=True)
+        summary = MODULE.terminal_receipt(receipt)
+        self.assertEqual(summary["client"], receipt["client"])
+        self.assertEqual(summary["runs"], receipt["runs"])
+        self.assertEqual(MODULE.json.dumps(receipt, sort_keys=True), original)
+
 if __name__ == "__main__":
     unittest.main()

@@ -100,6 +100,64 @@ def quiet_snapshot():
             "interval_seconds": elapsed, "quiet": cpu <= 10.0}
 
 
+
+TERMINAL_RECEIPT_MARKER = "ASTRID_MATCHED_BENCHMARK_TERMINAL_RECEIPT_V1"
+
+
+def compact_receipt(value):
+    """Omit bulky context while preserving all measured state and identities."""
+    if isinstance(value, list):
+        return [compact_receipt(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = {key: compact_receipt(item) for key, item in value.items()
+              if key not in ("rows", "artifacts")}
+    if "rows" in value:
+        rows = value["rows"]
+        result["row_count"] = len(rows) if isinstance(rows, list) else None
+        result["rows_omitted_from_terminal"] = True
+    if "artifacts" in value:
+        artifacts = value["artifacts"]
+        # Exact full inventories remain in the saved receipt; bind rather than
+        # dump thousands of compiler artifacts into the workflow log.
+        encoded = json.dumps(artifacts, sort_keys=True, separators=(",", ":")).encode()
+        result["artifact_count"] = len(artifacts) if isinstance(artifacts, list) else None
+        result["artifact_inventory_sha256"] = hashlib.sha256(encoded).hexdigest()
+    return result
+
+
+def terminal_receipt(receipt):
+    """Truthful stdout fallback when the artifact service cannot finalize."""
+    if not isinstance(receipt, dict):
+        receipt = {"complete": False, "performance_accepted": False,
+                   "failure": "receipt missing or non-object; not reinterpreted as zero samples"}
+    result = compact_receipt(receipt)
+    result["schema"] = TERMINAL_RECEIPT_MARKER
+    for key, singular in (("samples", "sample"), ("runs", "run")):
+        result[f"{key}_present"] = key in receipt
+        items = receipt.get(key)
+        result[f"{singular}_count"] = len(items) if isinstance(items, list) else None
+        result.setdefault(key, None)
+    observations = []
+    for index, window in enumerate((receipt.get("postbuild_settling") or {}).get("windows") or []):
+        observations.append({"kind": "postbuild_settling", "index": index,
+                             **compact_receipt(window)})
+    for key in ("quiet_gate_before_sample", "quiet_gate_before_life"):
+        if key in receipt:
+            observations.append({"kind": key, **compact_receipt(receipt[key])})
+    result["quiet_observations"] = observations
+    result["note"] = "Compact stdout fallback; saved full receipt remains authoritative"
+    return result
+
+
+def emit_terminal_receipt(receipt):
+    summary = terminal_receipt(receipt)
+    print(TERMINAL_RECEIPT_MARKER, flush=True)
+    print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
+    print(f"{TERMINAL_RECEIPT_MARKER}_END", flush=True)
+    return summary
+
+
 def settle_after_builds(receipt, save, deadline):
     # Builds and artifact hashing are outside the measurement. Allow their
     # background work to drain before admission, retaining every observation.
@@ -315,6 +373,7 @@ def main():
         raise
     finally:
         save()
+        emit_terminal_receipt(receipt)
 
 
 if __name__ == "__main__":
