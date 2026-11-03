@@ -321,6 +321,9 @@ def validate_direct_arena(
         objects[identity_bytes(object_id)] = (offset, payload, cursor.offset)
     covered = set()
     for record in records.values():
+        object_id = record["coverage"][1]
+        if identity_bytes(object_id) in bootstrap_objects:
+            raise FormatError("bootstrap object has a physical representation")
         if identity_bytes(record["profile"]) not in profiles:
             raise FormatError("representation profile is missing")
         profile = profiles[identity_bytes(record["profile"])]
@@ -330,7 +333,6 @@ def validate_direct_arena(
             raise FormatError("representation exceeds profile output bound")
         if record["profile"] != direct_profile or record["recipe"][0] != 0:
             continue
-        object_id = record["coverage"][1]
         try:
             offset, payload, canonical_offset = objects[identity_bytes(object_id)]
         except KeyError as error:

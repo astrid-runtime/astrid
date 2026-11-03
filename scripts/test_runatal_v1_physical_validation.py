@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Regression tests for independent physical-store validation."""
 
+import struct
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -9,21 +11,123 @@ import runatal_v1_reader as reader
 from runatal_v1_specs import LEGACY_FORMAT_SPECIFICATIONS
 
 from runatal_v1_physical import (
-    FormatError,
+    ARENA_MAGIC, BLOB_CONTEXT, PROFILE_CONTEXT, RECORD_CONTEXT, FormatError,
+    decode_placement_entry, decode_profile, decode_representation, derived_dependencies,
+    encode_placement_entry, encode_profile, encode_representation, frame_checksum,
+    physical_identity,
     canonical_prefix,
     identity_bytes,
     prefix_bits,
     search_key,
     validate_map,
 )
-from runatal_v1_physical_store import validate_direct_coverage, validate_direct_lengths
+from runatal_v1_physical_store import (
+    validate_direct_arena, validate_direct_coverage, validate_direct_lengths,
+)
 
 
 def tagged(byte):
     return (1, 2, bytes([byte]) * 32)
 
 
+def canonical_profile(kind):
+    specification = (1, 1, bytes([0x41]) * 32)
+    pinned = specification if kind == 3 else None
+    encoded = encode_profile({
+        "version": 1, "kind": kind, "decoder": pinned, "contract": pinned,
+        "runtime": pinned, "parameters": b"", "dependencies": [(0, specification)],
+        "bounds_version": 1, "bounds": (8, 8, 4096, 4096, 4096, 4096, 4096),
+        "specification": specification,
+    })
+    return physical_identity(PROFILE_CONTEXT, encoded), decode_profile(encoded)
+
+
+def canonical_record(profile, coverage, recipe, evidence=None):
+    encoded = encode_representation({
+        "version": 1, "profile": profile, "coverage": coverage, "recipe": recipe,
+        "dependencies": derived_dependencies(profile, recipe, evidence),
+        "canonical_output_bytes": coverage[2], "maximum_reconstruction_bytes": 4096,
+        "evidence": evidence,
+    })
+    return physical_identity(RECORD_CONTEXT, encoded), decode_representation(encoded)
+
+
+def alternate_coverage_fixture(store, recipe_tag, covers_bootstrap):
+    """Real frames and canonical records; direct coverage remains complete."""
+    bootstrap = (1, 1, bytes([0x51]) * 32)
+    ordinary = (1, 1, bytes([0x52]) * 32)
+    evidence = (1, 1, bytes([0x53]) * 32)
+    direct_profile, direct = canonical_profile(0)
+    other_profile, other = canonical_profile(1 if recipe_tag == 1 else 3)
+    arena = bytearray()
+    for object_id, canonical in [(bootstrap, b"bootstrap canonical"),
+                                 (ordinary, b"ordinary canonical")]:
+        payload = identity_bytes(object_id) + canonical
+        checksum = frame_checksum(ARENA_MAGIC, payload)
+        offset = len(arena)
+        arena += (ARENA_MAGIC + struct.pack("<HHQ", 1, 0, len(payload))
+                  + checksum + payload)
+    (store / "objects.arena").write_bytes(arena)
+    blob = physical_identity(BLOB_CONTEXT, identity_bytes(direct_profile)
+                             + struct.pack("<Q", len(canonical)) + canonical)
+    direct_id, direct_record = canonical_record(
+        direct_profile, (0, ordinary, len(canonical)), (0, blob)
+    )
+    placement = decode_placement_entry(encode_placement_entry({
+        "blob": blob, "profile": direct_profile, "encoded_length": len(canonical),
+        "replicas": [(0, (0, 0, offset, len(payload), checksum))],
+    }))
+    covered = bootstrap if covers_bootstrap else ordinary
+    length = len(b"bootstrap canonical") if covers_bootstrap else len(canonical)
+    recipe = {
+        1: (1, tagged(0x61), 0, length),
+        3: (3, tagged(0x61), None),
+        4: (4, tagged(0x61), ordinary),
+        5: (5, ordinary, 0, evidence),
+    }[recipe_tag]
+    alternate_id, alternate = canonical_record(
+        other_profile, (0, covered, length), recipe, evidence
+    )
+    return (direct_profile,
+            {identity_bytes(direct_profile): direct, identity_bytes(other_profile): other},
+            {direct_id: direct_record, alternate_id: alternate},
+            {identity_bytes(blob): placement}, {identity_bytes(bootstrap)})
+
+
 class PhysicalValidationTests(unittest.TestCase):
+    def test_every_alternate_recipe_rejects_bootstrap_exact_coverage(self):
+        for recipe_tag in (1, 3, 4, 5):
+            with self.subTest(recipe=recipe_tag), tempfile.TemporaryDirectory(
+                prefix="astrid-bootstrap-coverage-"
+            ) as directory:
+                store = Path(directory)
+                arguments = alternate_coverage_fixture(store, recipe_tag, True)
+                with self.assertRaisesRegex(FormatError, "bootstrap object"):
+                    validate_direct_arena(store, *arguments)
+
+    def test_every_alternate_recipe_preserves_valid_nonbootstrap_coverage(self):
+        for recipe_tag in (1, 3, 4, 5):
+            with self.subTest(recipe=recipe_tag), tempfile.TemporaryDirectory(
+                prefix="astrid-ordinary-coverage-"
+            ) as directory:
+                store = Path(directory)
+                arguments = alternate_coverage_fixture(store, recipe_tag, False)
+                validate_direct_arena(store, *arguments)
+
+    def test_alternate_recipes_do_not_replace_required_direct_coverage(self):
+        for recipe_tag in (1, 3, 4, 5):
+            with self.subTest(recipe=recipe_tag), tempfile.TemporaryDirectory(
+                prefix="astrid-missing-direct-coverage-"
+            ) as directory:
+                store = Path(directory)
+                direct, profiles, records, placements, bootstrap = alternate_coverage_fixture(
+                    store, recipe_tag, False
+                )
+                records = {key: record for key, record in records.items()
+                           if record["recipe"][0] != 0}
+                with self.assertRaisesRegex(FormatError, "does not cover every"):
+                    validate_direct_arena(store, direct, profiles, records, placements, bootstrap)
+
     def test_volume_rejects_pre_catalogue_profile_before_evidence_lookup(self):
         unsupported = (1, 1, bytes.fromhex(
             "82e46f53ba9bb2f52d6b942088d5965eaa17c2720e61ce842ed9d5e3c0d1219d"
