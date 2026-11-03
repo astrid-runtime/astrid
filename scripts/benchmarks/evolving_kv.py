@@ -359,7 +359,7 @@ def run(args, protocol, output, receipt, save, deadline, hooks):
     save()
     for index, (arm, phase) in enumerate(schedule):
         require(deadline - time.monotonic() >= 180, "run budget cannot contain full sample: HOLD")
-        before = hooks["quiet_snapshot"]()
+        before = hooks["settle_before_sample"](receipt, save, deadline, {"index": index})
         receipt["quiet_gate_before_sample"] = {"index": index, **before}
         save()
         require(before["quiet"], "background load before sample: HOLD")

@@ -107,6 +107,42 @@ class RefusalTests(unittest.TestCase):
                 MODULE.settle_after_builds({}, MagicMock(), 0)
         snapshot.assert_not_called()
 
+    def test_presample_burst_wait_keeps_every_window_without_executing_a_sample(self):
+        receipt = {"samples": []}
+        windows = [{"quiet": value, "rows": ["context"]}
+                   for value in (False, True, False, True, True)]
+        with patch.object(MODULE, "quiet_snapshot", side_effect=windows), \
+                patch.object(MODULE, "run_sample") as sample:
+            save = MagicMock()
+            result = MODULE.settle_before_sample(receipt, save, float("inf"), {"index": 7})
+        state = receipt["presample_settling"][0]
+        self.assertEqual(state["identity"], {"index": 7})
+        self.assertEqual(state["windows"], windows)
+        self.assertIs(result, windows[-1])
+        self.assertEqual(save.call_count, 5)
+        self.assertEqual(receipt["samples"], [])
+        sample.assert_not_called()
+        summary = MODULE.terminal_receipt(receipt)
+        retained = summary["presample_settling"][0]["windows"]
+        self.assertEqual([w["quiet"] for w in retained], [False, True, False, True, True])
+        self.assertTrue(all(w["rows_omitted_from_terminal"] for w in retained))
+
+    def test_presample_persistent_load_is_bounded_without_discarding_history(self):
+        receipt = {"samples": [{"complete": True, "arm": "main"}]}
+        with patch.object(MODULE, "quiet_snapshot", return_value={"quiet": False}):
+            with self.assertRaisesRegex(RuntimeError, "presample background load did not settle"):
+                MODULE.settle_before_sample(receipt, MagicMock(), float("inf"), {"ordinal": 1})
+        self.assertEqual(len(receipt["presample_settling"][0]["windows"]), 30)
+        self.assertEqual(receipt["samples"], [{"complete": True, "arm": "main"}])
+
+    def test_presample_does_not_admit_after_observation_spends_remaining_budget(self):
+        receipt = {}
+        with patch.object(MODULE.time, "monotonic", side_effect=[0, 0, 200]), \
+                patch.object(MODULE, "quiet_snapshot", return_value={"quiet": True}):
+            with self.assertRaisesRegex(RuntimeError, "full sample after settling"):
+                MODULE.settle_before_sample(receipt, MagicMock(), 300, {"index": 0})
+        self.assertEqual(len(receipt["presample_settling"][0]["windows"]), 2)
+
     def test_local_host_refuses_before_output_or_build(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "must-not-exist"

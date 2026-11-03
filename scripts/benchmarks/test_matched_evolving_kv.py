@@ -378,7 +378,7 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(actual, expected)
         self.assertEqual(len(actual), 36)
 
-    def run_protocol(self, root, fail=False):
+    def run_protocol(self, root, fail=False, quiet=None, settle=None):
         protocol, output = root / "protocol", root / "output"
         protocol.mkdir()
         output.mkdir()
@@ -402,8 +402,10 @@ class ScheduleTests(unittest.TestCase):
                 raise RuntimeError("retained synthetic failure")
             item["complete"] = True
         sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else DIGEST
-        hooks = {"sha": sha, "quiet_snapshot": lambda: {"quiet": True},
-                 "settle_after_builds": Mock(), "abba_schedule": shared_schedule()}
+        hooks = {"sha": sha, "quiet_snapshot": quiet or (lambda: {"quiet": True}),
+                 "settle_after_builds": Mock(),
+                 "settle_before_sample": settle or (lambda *args: {"quiet": True}),
+                 "abba_schedule": shared_schedule()}
         with patch.object(MODE, "build", side_effect=frozen_build), \
                 patch.object(MODE, "verify_overlay", return_value=[]), \
                 patch.object(MODE, "run_sample", side_effect=sample), \
@@ -414,6 +416,23 @@ class ScheduleTests(unittest.TestCase):
             else:
                 MODE.run(args, protocol, output, receipt, save, MODE.time.monotonic() + 10000, hooks)
         return receipt, save
+
+    def test_transient_admission_burst_waits_without_retrying_or_skipping_abba_samples(self):
+        spec = importlib.util.spec_from_file_location(
+            "evolving_admission_protocol", Path(__file__).with_name("matched_volume_packing.py"))
+        packing = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(packing)
+        windows = [{"quiet": value} for value in [False, True, True] + [True] * 34]
+        quiet = Mock(side_effect=windows)
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as raw, \
+                patch.object(packing, "quiet_snapshot", quiet):
+            receipt, _ = self.run_protocol(Path(raw).resolve(), quiet=quiet,
+                                           settle=packing.settle_before_sample)
+        self.assertEqual(len(receipt["samples"]), 18)
+        self.assertEqual(len(receipt["presample_settling"]), 18)
+        self.assertEqual(receipt["presample_settling"][0]["windows"], windows[:3])
+        self.assertEqual(quiet.call_count, 37)
+        self.assertEqual([(s["arm"], s["phase"]) for s in receipt["samples"]], receipt["schedule"])
 
     def test_two_warmups_and_sixteen_timed_abba_without_speed_verdict(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as raw:

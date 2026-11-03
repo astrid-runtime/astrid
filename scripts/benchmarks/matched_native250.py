@@ -772,7 +772,7 @@ def main() -> None:
         binaries = {"main": baseline_daemon, "candidate": candidate_daemon}
         for ordinal, label in enumerate(arms):
             require(deadline - time.monotonic() >= 180, "run budget cannot contain another life: HOLD")
-            before = packing.quiet_snapshot()
+            before = packing.settle_before_sample(receipt, save, deadline, {"ordinal": ordinal})
             receipt["quiet_gate_before_life"] = {"ordinal": ordinal, **before}
             save()
             require(before["quiet"], "background load before life: HOLD")

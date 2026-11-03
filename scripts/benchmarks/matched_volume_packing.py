@@ -205,7 +205,21 @@ def settle_after_builds(receipt, save, deadline):
     # This does not retry, discard, or extend any timed probe sample.
     receipt["postbuild_settling"] = {"maximum_windows": 30,
                                    "required_consecutive_quiet": 2, "windows": []}
-    state = receipt["postbuild_settling"]
+    settle_quiet(receipt["postbuild_settling"], save, deadline, "postbuild")
+
+
+def settle_before_sample(receipt, save, deadline, identity):
+    # Admission can race a fresh background burst after build settling. Wait
+    # before starting a sample using the same bounded quiet protocol. Never
+    # retry an executed sample or filter a result by its duration or outcome.
+    state = {"identity": identity, "maximum_windows": 30,
+             "required_consecutive_quiet": 2, "windows": []}
+    receipt.setdefault("presample_settling", []).append(state)
+    settle_quiet(state, save, deadline, "presample")
+    return state["windows"][-1]
+
+
+def settle_quiet(state, save, deadline, phase):
     consecutive = 0
     for _ in range(state["maximum_windows"]):
         require(deadline - time.monotonic() >= 181,
@@ -216,8 +230,10 @@ def settle_after_builds(receipt, save, deadline):
         state["consecutive_quiet"] = consecutive
         save()
         if consecutive == state["required_consecutive_quiet"]:
+            require(deadline - time.monotonic() >= 180,
+                    "run budget cannot contain a full sample after settling: HOLD")
             return
-    raise RuntimeError("postbuild background load did not settle: HOLD")
+    raise RuntimeError(f"{phase} background load did not settle: HOLD")
 
 
 def build(path, head, probe, output, arm, deadline):
@@ -391,7 +407,7 @@ def main():
         save()
         if args.mode == "evolving-kv":
             hooks = {name: globals()[name] for name in (
-                "sha", "command", "clean_checkout", "quiet_snapshot", "settle_after_builds", "abba_schedule", "source_build")}
+                "sha", "command", "clean_checkout", "quiet_snapshot", "settle_after_builds", "settle_before_sample", "abba_schedule", "source_build")}
             receipt["evolving_helper_sha256"] = sha(Path(evolving_kv.__file__))
             evolving_kv.run(args, protocol, output, receipt, save, deadline, hooks)
             clean_checkout(protocol, protocol_head)
@@ -415,7 +431,7 @@ def main():
         for index, (arm, count, regions, phase) in enumerate(schedule):
             require(deadline - time.monotonic() >= 180,
                     "run budget cannot contain another full sample: HOLD")
-            before = quiet_snapshot()
+            before = settle_before_sample(receipt, save, deadline, {"index": index})
             receipt["quiet_gate_before_sample"] = {"index": index, **before}
             save()
             require(before["quiet"], "background load before sample: HOLD")
