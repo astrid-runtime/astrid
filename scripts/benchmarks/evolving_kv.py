@@ -36,6 +36,15 @@ WORKLOAD_DEFINITION = {
 }
 
 
+# Protocol acquisition bound, not a product retry or operator setting. A noisy
+# attempt contributes no comparison rows; never choose attempts by their timing.
+MAX_QUIET_SCHEDULE_ATTEMPTS = 3
+
+
+class PostSampleNoise(RuntimeError):
+    """Only functionally valid, identity-checked execution can raise this."""
+
+
 def require(condition, detail):
     if not condition:
         raise RuntimeError(detail)
@@ -320,10 +329,12 @@ def run_sample(build_receipt, path, fixture, output, index, sample, manifest, ho
         require(verify_overlay(path, build_receipt["head"], manifest, hooks) == dirty,
                 "source drift during sample")
         require(hooks["sha"](Path(argv[0])) == build_receipt["binary_sha256"], "binary drift during sample")
-        require(sample["quiet_after"]["quiet"], "background load after sample: HOLD")
+        if not sample["quiet_after"]["quiet"]:
+            raise PostSampleNoise("background load after sample: HOLD")
         sample["complete"] = True
-        shutil.rmtree(fixture)
-        sample["fixture_reaped"] = True
+        if not sample.get("retain_until_schedule_verified", False):
+            shutil.rmtree(fixture)
+            sample["fixture_reaped"] = True
     except BaseException as error:
         sample["complete"] = False
         sample["failure"] = str(error)
@@ -334,6 +345,36 @@ def run_sample(build_receipt, path, fixture, output, index, sample, manifest, ho
 
 def public_source_paths(output):
     return [output / "protocol-source" / relative for relative in SOURCES]
+
+
+def run_schedule(args, output, receipt, save, deadline, hooks, workload,
+                 builds, manifest, schedule, attempt):
+    for slot, item in enumerate(schedule):
+        index = len(receipt["samples"])
+        arm, *configuration, phase = item
+        require(deadline - time.monotonic() >= 180, "run budget cannot contain full sample: HOLD")
+        before = hooks["settle_before_sample"](receipt, save, deadline, {"index": index})
+        receipt["quiet_gate_before_sample"] = {"index": index, **before}
+        save()
+        require(before["quiet"], "background load before sample: HOLD")
+        require(shutil.disk_usage(output).free >= 1024**3, "sample disk reserve")
+        fixture = Path(tempfile.mkdtemp(prefix="evolving-kv-", dir=output))
+        sample = {"arm": arm, "phase": phase, "quiet_before": before,
+                  "fixture": str(fixture), "complete": False}
+        if attempt is not None:
+            sample.update(attempt=attempt["index"], schedule_slot=slot,
+                          retain_until_schedule_verified=True, accepted_for_comparison=False)
+            attempt["sample_indices"].append(index)
+        if workload:
+            sample.update(zip(workload.SAMPLE_FIELDS, configuration, strict=True))
+        receipt["samples"].append(sample)
+        save()
+        path = args.baseline.resolve() if arm == "main" else args.candidate.resolve()
+        try:
+            runner = workload.run_sample if workload else run_sample
+            runner(builds[arm], path, fixture, output, index, sample, manifest, hooks)
+        finally:
+            save()
 
 
 def run(args, protocol, output, receipt, save, deadline, hooks, workload=None):
@@ -364,27 +405,27 @@ def run(args, protocol, output, receipt, save, deadline, hooks, workload=None):
     schedule = hooks["abba_schedule"](workload.CONFIGURATIONS if workload else [()], builds, **options)
     receipt["schedule"] = schedule
     save()
-    for index, item in enumerate(schedule):
-        arm, *configuration, phase = item
-        require(deadline - time.monotonic() >= 180, "run budget cannot contain full sample: HOLD")
-        before = hooks["settle_before_sample"](receipt, save, deadline, {"index": index})
-        receipt["quiet_gate_before_sample"] = {"index": index, **before}
-        save()
-        require(before["quiet"], "background load before sample: HOLD")
-        require(shutil.disk_usage(output).free >= 1024**3, "sample disk reserve")
-        fixture = Path(tempfile.mkdtemp(prefix="evolving-kv-", dir=output))
-        sample = {"arm": arm, "phase": phase, "quiet_before": before,
-                  "fixture": str(fixture), "complete": False}
-        if workload:
-            sample.update(zip(workload.SAMPLE_FIELDS, configuration, strict=True))
-        receipt["samples"].append(sample)
-        save()
-        path = args.baseline.resolve() if arm == "main" else args.candidate.resolve()
+    attempts = receipt.setdefault("schedule_attempts", []) if workload is None else None
+    accepted = None
+    for attempt_index in range(MAX_QUIET_SCHEDULE_ATTEMPTS if workload is None else 1):
+        attempt = None
+        if attempts is not None:
+            attempt = {"index": attempt_index, "sample_indices": [], "complete": False,
+                       "started_monotonic_s": time.monotonic()}
+            attempts.append(attempt)
         try:
-            runner = workload.run_sample if workload else run_sample
-            runner(builds[arm], path, fixture, output, index, sample, manifest, hooks)
-        finally:
+            run_schedule(args, output, receipt, save, deadline, hooks, workload,
+                         builds, manifest, schedule, attempt)
+        except PostSampleNoise as error:
+            if attempt is None:
+                raise
+            attempt.update(rejection=str(error), ended_monotonic_s=time.monotonic())
             save()
+            if attempt_index + 1 == MAX_QUIET_SCHEDULE_ATTEMPTS:
+                raise
+            continue
+        accepted = attempt
+        break
     require((workload.source_manifest if workload else source_manifest)(protocol, hooks) == manifest,
             "protocol source drift")
     for arm, path in [("main", args.baseline.resolve()), ("candidate", args.candidate.resolve())]:
@@ -392,3 +433,19 @@ def run(args, protocol, output, receipt, save, deadline, hooks, workload=None):
                 "producer source drift after schedule")
         require(hooks["sha"](Path(builds[arm]["binary"])) == builds[arm]["binary_sha256"],
                 "frozen binary drift after schedule")
+    if accepted is not None:
+        # Raw rejected reports/logs remain published. Rejected fixtures remain on
+        # the disposable runner only; producer source and receipts reproduce them.
+        for index in accepted["sample_indices"]:
+            sample = receipt["samples"][index]
+            fixture = Path(sample["fixture"])
+            shutil.rmtree(fixture)
+            sample.update(fixture_reaped=True, fixture_preserved=False)
+        for index in accepted["sample_indices"]:
+            receipt["samples"][index]["accepted_for_comparison"] = True
+        accepted.update(complete=True, ended_monotonic_s=time.monotonic())
+        receipt.update(accepted_attempt=accepted["index"],
+                       accepted_sample_indices=accepted["sample_indices"],
+                       acquisition_scope="first whole quiet schedule; conditional host-noise filter, not proof noise is external",
+                       rejected_fixture_retention="disposable runner only; raw reports/logs and exact source retained in public evidence")
+        save()

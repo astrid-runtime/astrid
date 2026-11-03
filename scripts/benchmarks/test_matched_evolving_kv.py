@@ -378,7 +378,7 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(actual, expected)
         self.assertEqual(len(actual), 36)
 
-    def run_protocol(self, root, fail=False, quiet=None, settle=None):
+    def run_protocol(self, root, fail=False, quiet=None, settle=None, sample_hook=None, expected_error=None, other_workload=False):
         protocol, output = root / "protocol", root / "output"
         protocol.mkdir()
         output.mkdir()
@@ -392,15 +392,20 @@ class ScheduleTests(unittest.TestCase):
                                baseline_head=HEAD, candidate_head="c" * 40)
         receipt = {"samples": [], "performance_accepted": False}
         save = Mock()
-        def frozen_build(path, head, _protocol, _manifest, _output, arm, _deadline, _hooks):
+        def frozen_build(path, head, _protocol, _manifest, _output, arm, _deadline, _hooks, **_options):
             return {"head": head, "binary": str(output / arm), "binary_sha256": DIGEST,
                     "overlay_porcelain": [], "rustc": "identical-pinned-toolchain"}
         def sample(_build, _path, _fixture, _output, _index, item, _manifest, _hooks):
             item["synthetic_test_only"] = True
+            if sample_hook:
+                return sample_hook(_index, item)
             if fail:
                 item["failure"] = "retained synthetic failure"
                 raise RuntimeError("retained synthetic failure")
             item["complete"] = True
+        workload = SimpleNamespace(source_manifest=MODE.source_manifest, DEFINITION={"mode": "route-selection"},
+                                   TARGET="route_selection", TIMED_ABBA_CYCLES=4, CONFIGURATIONS=[()],
+                                   SAMPLE_FIELDS=[], run_sample=sample) if other_workload else None
         sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else DIGEST
         hooks = {"sha": sha, "quiet_snapshot": quiet or (lambda: {"quiet": True}),
                  "settle_after_builds": Mock(),
@@ -410,11 +415,11 @@ class ScheduleTests(unittest.TestCase):
                 patch.object(MODE, "verify_overlay", return_value=[]), \
                 patch.object(MODE, "run_sample", side_effect=sample), \
                 patch.object(MODE.shutil, "disk_usage", return_value=SimpleNamespace(free=10 * 1024**3)):
-            if fail:
-                with self.assertRaisesRegex(RuntimeError, "retained synthetic failure"):
-                    MODE.run(args, protocol, output, receipt, save, MODE.time.monotonic() + 10000, hooks)
+            if fail or expected_error:
+                with self.assertRaisesRegex(RuntimeError, expected_error or "retained synthetic failure"):
+                    MODE.run(args, protocol, output, receipt, save, MODE.time.monotonic() + 10000, hooks, workload=workload)
             else:
-                MODE.run(args, protocol, output, receipt, save, MODE.time.monotonic() + 10000, hooks)
+                MODE.run(args, protocol, output, receipt, save, MODE.time.monotonic() + 10000, hooks, workload=workload)
         return receipt, save
 
     def test_transient_admission_burst_waits_without_retrying_or_skipping_abba_samples(self):
@@ -455,6 +460,101 @@ class ScheduleTests(unittest.TestCase):
         self.assertFalse(receipt["samples"][0]["complete"])
         self.assertFalse(receipt["performance_accepted"])
         self.assertGreater(save.call_count, 1)
+
+
+    def test_noise_rejects_whole_attempt_with_unique_indices_and_preserved_prior_fixtures(self):
+        for rejected_slot in [0, 9]:
+            with self.subTest(slot=rejected_slot), tempfile.TemporaryDirectory(dir=Path(__file__).parent) as raw:
+                def execute(index, sample):
+                    if index == rejected_slot:
+                        sample.update(complete=False, failure="noise only")
+                        raise MODE.PostSampleNoise("noise only")
+                    sample.update(complete=True, elapsed_s=1 if sample["attempt"] == 0 else 9)
+                receipt, _ = self.run_protocol(Path(raw).resolve(), sample_hook=execute)
+                attempts = receipt["schedule_attempts"]
+                self.assertEqual(len(attempts), 2)
+                self.assertFalse(attempts[0]["complete"])
+                self.assertTrue(attempts[1]["complete"])
+                self.assertEqual(receipt["accepted_attempt"], 1)
+                indices = receipt["accepted_sample_indices"]
+                self.assertEqual(indices, list(range(rejected_slot + 1, rejected_slot + 19)))
+                accepted = [receipt["samples"][i] for i in indices]
+                self.assertEqual([(s["arm"], s["phase"]) for s in accepted], receipt["schedule"])
+                self.assertTrue(all(s["accepted_for_comparison"] for s in accepted))
+                rejected = receipt["samples"][:rejected_slot + 1]
+                self.assertTrue(all(not s["accepted_for_comparison"] for s in rejected))
+                self.assertTrue(all(Path(s["fixture"]).is_dir() for s in rejected))
+                self.assertTrue(all(not Path(s["fixture"]).exists() for s in accepted))
+                self.assertEqual(len({s["fixture"] for s in receipt["samples"]}), len(receipt["samples"]))
+                self.assertEqual(len(receipt["builds"]), 2)
+                self.assertFalse(receipt["performance_accepted"])
+
+    def test_non_evolving_workload_never_retries_post_noise(self):
+        def execute(index, sample):
+            raise MODE.PostSampleNoise("noise only")
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as raw:
+            receipt, _ = self.run_protocol(Path(raw).resolve(), sample_hook=execute,
+                                           expected_error="noise only", other_workload=True)
+        self.assertEqual(len(receipt["samples"]), 1)
+        self.assertNotIn("schedule_attempts", receipt)
+        self.assertNotIn("accepted_attempt", receipt)
+        self.assertEqual(receipt["mode"], "route-selection")
+
+    def test_noise_attempt_bound_never_resets_or_accepts_partial_schedule(self):
+        def execute(index, sample):
+            raise MODE.PostSampleNoise("noise only")
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as raw:
+            receipt, _ = self.run_protocol(Path(raw).resolve(), sample_hook=execute,
+                                           expected_error="noise only")
+        self.assertEqual(len(receipt["schedule_attempts"]), 3)
+        self.assertEqual(len(receipt["samples"]), 3)
+        self.assertNotIn("accepted_attempt", receipt)
+        self.assertTrue(all(not s["accepted_for_comparison"] for s in receipt["samples"]))
+        self.assertFalse(any(a["complete"] for a in receipt["schedule_attempts"]))
+
+    def test_admission_failure_after_noise_is_terminal_without_third_attempt(self):
+        def execute(index, sample):
+            raise MODE.PostSampleNoise("noise only")
+        settle = Mock(side_effect=[{"quiet": True}, {"quiet": False}])
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as raw:
+            receipt, _ = self.run_protocol(Path(raw).resolve(), sample_hook=execute,
+                                           settle=settle, expected_error="background load before sample")
+        self.assertEqual(len(receipt["schedule_attempts"]), 2)
+        self.assertEqual(len(receipt["samples"]), 1)
+        self.assertNotIn("accepted_attempt", receipt)
+
+    def test_noisy_postcheck_never_masks_product_or_identity_failure(self):
+        for case in ["valid", "exit", "timeout", "missing", "malformed", "overlay", "binary"]:
+            with self.subTest(case=case), tempfile.TemporaryDirectory(dir=Path(__file__).parent) as raw:
+                root = Path(raw).resolve()
+                volume = root / "fixture"
+                volume.mkdir()
+                payload, build, _ = fixture()
+                sample = {"retain_until_schedule_verified": True}
+                def execute(argv, **kwargs):
+                    if case == "timeout":
+                        raise subprocess.TimeoutExpired(argv, 180)
+                    payload["provenance"]["executable_argv"] = argv
+                    payload["config"]["root"] = str(volume)
+                    payload["config"]["output"] = argv[argv.index("--output") + 1]
+                    if case != "missing":
+                        Path(payload["config"]["output"]).write_text(
+                            "invalid" if case == "malformed" else json.dumps(envelope(payload)))
+                    return subprocess.CompletedProcess(argv, int(case == "exit"), b"", b"")
+                sha = Mock(side_effect=[DIGEST, DIGEST, "wrong"] if case == "binary" else None,
+                           return_value=DIGEST)
+                # stdout/stderr/report hashes precede the final binary check.
+                if case == "binary":
+                    sha.side_effect = [DIGEST] * 4 + ["wrong"]
+                overlay = Mock(side_effect=[[], ["drift"]] if case == "overlay" else None, return_value=[])
+                with patch.object(MODE, "verify_overlay", overlay), \
+                        patch.object(MODE.subprocess, "run", side_effect=execute):
+                    with self.assertRaises(Exception) as error:
+                        MODE.run_sample(build, root, volume, root, 0, sample, {},
+                                        {"sha": sha, "quiet_snapshot": lambda: {"quiet": False}})
+                self.assertEqual(isinstance(error.exception, MODE.PostSampleNoise), case == "valid")
+                self.assertFalse(sample["complete"])
+                self.assertTrue(sample["fixture_preserved"])
 
 
 if __name__ == "__main__":
