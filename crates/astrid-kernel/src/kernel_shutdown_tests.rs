@@ -417,6 +417,7 @@ async fn shutdown_retires_only_boot_captured_runtime_files() {
             astrid_storage::principal_state::RuntimeLifecycleGuard::acquire(&home).unwrap();
         let kernel = test_kernel_with_home(home).await;
         let socket = kernel.token_path.with_file_name("system.sock");
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         for name in ["system.token", "system.ready", "system.pid"] {
             std::fs::write(kernel.token_path.with_file_name(name), b"owned runtime").unwrap();
