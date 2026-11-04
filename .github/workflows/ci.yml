@@ -48,6 +48,7 @@ on:
       - 'scripts/test_channel_workflow_contract.sh'
       - 'scripts/test_ci_workflow_contract.sh'
       - 'scripts/test_gnu_build_packages.py'
+      - 'scripts/test_cargo_test_executable.py'
       - 'scripts/nightly_version.py'
       - 'scripts/test_nightly_version.py'
       - 'release/nightly.toml'
@@ -291,33 +292,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test_binary=$(cargo test --locked -p astrid-core --lib --no-run --message-format=json | python3 -c '
-          import json, sys
-          paths = []
-          for line in sys.stdin:
-              message = json.loads(line)
-              if message.get("reason") == "compiler-message":
-                  diagnostic = message["message"]
-                  sys.stderr.write(diagnostic.get("rendered") or diagnostic["message"] + "\n")
-              if message.get("executable") and message.get("target", {}).get("name") == "astrid_core" and message.get("profile", {}).get("test"):
-                  paths.append(message["executable"])
-          assert len(paths) == 1, paths
-          print(paths[0])')
+          python3 scripts/test_cargo_test_executable.py
+          test_binary=$(cargo test --locked -p astrid-core --lib --no-run --message-format=json | python3 scripts/ci/cargo_test_executable.py astrid_core)
           sudo unshare --mount --propagation private -- "$test_binary" \
             bind_mount_ --ignored --nocapture --test-threads=1
 
-          storage_binary=$(cargo test --locked -p astrid-storage --lib --no-run --message-format=json | python3 -c '
-          import json, sys
-          paths = []
-          for line in sys.stdin:
-              message = json.loads(line)
-              if message.get("reason") == "compiler-message":
-                  diagnostic = message["message"]
-                  sys.stderr.write(diagnostic.get("rendered") or diagnostic["message"] + "\n")
-              if message.get("executable") and message.get("target", {}).get("name") == "astrid_storage" and message.get("profile", {}).get("test"):
-                  paths.append(message["executable"])
-          assert len(paths) == 1, paths
-          print(paths[0])')
+          storage_binary=$(cargo test --locked -p astrid-storage --lib --no-run --message-format=json | python3 scripts/ci/cargo_test_executable.py astrid_storage)
           sudo unshare --mount --propagation private -- "$storage_binary" \
             bind_mount_matching_skip --ignored --nocapture --test-threads=1
 
@@ -722,11 +702,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test_binary=$(cargo test --locked -p astrid --bin astrid --no-run --message-format=json | python3 -c '
-          import json, sys
-          paths = [m["executable"] for line in sys.stdin if (m := json.loads(line)).get("executable") and m.get("target", {}).get("name") == "astrid" and m.get("profile", {}).get("test")]
-          assert len(paths) == 1, paths
-          print(paths[0])')
+          test_binary=$(cargo test --locked -p astrid --bin astrid --no-run --message-format=json | python3 scripts/ci/cargo_test_executable.py astrid)
           # The child runs as UID 65534 and must be able to execute the test
           # binary without traversing private checkout or Cargo cache paths.
           fence_test_dir=$(mktemp -d /tmp/astrid-fence-tests.XXXXXXXX)
