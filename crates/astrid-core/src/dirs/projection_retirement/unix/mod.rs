@@ -12,6 +12,8 @@ use nix::unistd::{UnlinkatFlags, unlinkat};
 
 use super::CANONICAL_VOLUME;
 
+#[cfg(test)]
+mod barrier_tests;
 #[cfg(target_os = "linux")]
 mod mount;
 #[cfg(all(test, target_os = "linux"))]
@@ -69,11 +71,31 @@ pub(super) fn retire_with_hook(
     retire_with_hooks(root, before_delete, |_| Ok(()))
 }
 
+struct RetirementHooks<U, S> {
+    before_unlink: U,
+    sync_directory: S,
+}
+
 fn retire_with_hooks(
     root: &Path,
     before_delete: impl FnOnce() -> io::Result<()>,
-    mut before_unlink: impl FnMut(&Path) -> io::Result<()>,
+    before_unlink: impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
+    retire_with_io_hooks(root, before_delete, before_unlink, |directory, _| {
+        directory.sync_all()
+    })
+}
+
+fn retire_with_io_hooks(
+    root: &Path,
+    before_delete: impl FnOnce() -> io::Result<()>,
+    before_unlink: impl FnMut(&Path) -> io::Result<()>,
+    sync_directory: impl FnMut(&File, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut hooks = RetirementHooks {
+        before_unlink,
+        sync_directory,
+    };
     let directory = crate::platform_fs::open_existing_directory_no_follow(root)?;
     let boundary = RootBoundary {
         identity: fstat(&directory).map_err(os_error)?,
@@ -86,7 +108,7 @@ fn retire_with_hooks(
         &boundary,
         Traversal::Preflight,
         true,
-        &mut before_unlink,
+        &mut hooks,
     )?;
     before_delete()?;
     // Reconfirm the ambient binding once before mutation. Descendants are
@@ -106,7 +128,7 @@ fn retire_with_hooks(
         &boundary,
         Traversal::Delete,
         true,
-        &mut before_unlink,
+        &mut hooks,
     )
 }
 
@@ -116,7 +138,10 @@ fn walk(
     root: &RootBoundary,
     traversal: Traversal,
     is_root: bool,
-    before_unlink: &mut impl FnMut(&Path) -> io::Result<()>,
+    hooks: &mut RetirementHooks<
+        impl FnMut(&Path) -> io::Result<()>,
+        impl FnMut(&File, &Path) -> io::Result<()>,
+    >,
 ) -> io::Result<()> {
     for name in entries(directory)? {
         let child_path = path.join(&name);
@@ -133,17 +158,10 @@ fn walk(
             continue;
         }
         if let Some(child_directory) = child.directory() {
-            walk(
-                child_directory,
-                &child_path,
-                root,
-                traversal,
-                false,
-                before_unlink,
-            )?;
+            walk(child_directory, &child_path, root, traversal, false, hooks)?;
         }
         if traversal == Traversal::Delete {
-            before_unlink(&child_path)?;
+            (hooks.before_unlink)(&child_path)?;
             // Do not unlink a different object that replaced the opened entry
             // while its contents were being walked. unlinkat never follows a
             // last-component redirect, even if replacement wins after this check.
@@ -169,14 +187,16 @@ fn walk(
                 // The former per-subtree retirement also flushed its parent
                 // after every top-level directory removal, before proceeding
                 // to later siblings. Keep that barrier as well as the final one.
-                directory.sync_all()?;
+                (hooks.sync_directory)(directory, path)?;
             }
         }
     }
-    if traversal == Traversal::Delete {
-        // Preserve every existing directory barrier: flush child removals
-        // before the caller removes this directory, and flush the root last.
-        directory.sync_all()?;
+    if traversal == Traversal::Delete && is_root {
+        // The root barrier makes removed ancestor names durably absent. A
+        // descendant that is itself removed needs no independent barrier:
+        // interrupted retirement retains the durable volume as its authority.
+        // The caller may clear its RETIRING receipt only after this succeeds.
+        (hooks.sync_directory)(directory, path)?;
     }
     Ok(())
 }

@@ -16,7 +16,10 @@ const CANONICAL_VOLUME: &str = "astrid.volume";
 ///
 /// Every caller must use this function so a regular file is never removed
 /// before a later root special or nested redirect can stop retirement. The
-/// canonical media file is the only survivor.
+/// canonical media file is the only survivor. Successful return durably commits
+/// that root namespace. Partial deletion progress after an error is not a
+/// durable checkpoint; the caller must retain its recovery authority until
+/// retirement succeeds.
 ///
 /// # Errors
 ///
