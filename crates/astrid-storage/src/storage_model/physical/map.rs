@@ -10,7 +10,8 @@ use super::PhysicalModelError;
 use super::codec::{Decoder, Encoder};
 use super::identity::{
     PhysicalIdentity, PhysicalMapNodeId, RepresentationProfileId, RepresentationRecordId,
-    decode_map_node_id, decode_physical_digest, encode_map_node_id, encode_physical_digest,
+    TAGGED_CURRENT_DIGEST_BYTES, decode_map_node_id, decode_physical_digest, encode_map_node_id,
+    encode_physical_digest, encode_physical_digest_bytes,
 };
 
 mod legacy;
@@ -18,11 +19,14 @@ mod radix;
 mod residency;
 mod validation;
 
+#[cfg(test)]
+mod lookup_allocation_tests;
+
 const LEGACY_MAP_NODE_VERSION: u16 = 1;
 const RADIX_MAP_NODE_VERSION: u16 = 2;
 const RADIX_PAGE_CAPACITY: usize = 1;
 const DIGEST_NIBBLES: u8 = 64;
-const TAGGED_PHYSICAL_IDENTITY_BYTES: usize = 40;
+const TAGGED_PHYSICAL_IDENTITY_BYTES: usize = TAGGED_CURRENT_DIGEST_BYTES;
 const SEARCH_KEY_BYTES: usize = 4 + TAGGED_PHYSICAL_IDENTITY_BYTES;
 const SEARCH_KEY_BITS: u32 = 352;
 
@@ -77,13 +81,13 @@ impl PhysicalMapKey {
     }
 
     fn search_key(self) -> [u8; SEARCH_KEY_BYTES] {
-        let mut tagged = Encoder::new();
-        encode_physical_digest(&mut tagged, &self.0);
-        let tagged = tagged.finish();
-        debug_assert_eq!(tagged.len(), TAGGED_PHYSICAL_IDENTITY_BYTES);
+        // Legacy binary tries index the length-prefixed tagged digest. Build that
+        // fixed-width key on the stack from the shared physical helper so trie
+        // probes never heap-allocate a temporary Encoder buffer.
+        let tagged = encode_physical_digest_bytes(&self.0);
         let mut search = [0_u8; SEARCH_KEY_BYTES];
         search[..4].copy_from_slice(
-            &u32::try_from(tagged.len())
+            &u32::try_from(TAGGED_PHYSICAL_IDENTITY_BYTES)
                 .unwrap_or(u32::MAX)
                 .to_be_bytes(),
         );
@@ -686,7 +690,9 @@ impl CanonicalPhysicalMap {
     #[must_use]
     pub fn get(&self, key: PhysicalMapKey) -> Option<&[u8]> {
         let mut current = self.root?;
-        let search = key.search_key();
+        // Dense radix never needs a search key. Legacy Branch arms build one
+        // stack key lazily and reuse it for the whole descent.
+        let mut search = None;
         loop {
             match self.nodes.get(&current)? {
                 PhysicalMapNode::Leaf {
@@ -699,10 +705,11 @@ impl CanonicalPhysicalMap {
                     one,
                     ..
                 } => {
-                    if !legacy::matches_prefix(&search, *prefix_bits, prefix) {
+                    let search = search.get_or_insert_with(|| key.search_key());
+                    if !legacy::matches_prefix(search, *prefix_bits, prefix) {
                         return None;
                     }
-                    current = if legacy::bit(&search, *prefix_bits) {
+                    current = if legacy::bit(search, *prefix_bits) {
                         *one
                     } else {
                         *zero

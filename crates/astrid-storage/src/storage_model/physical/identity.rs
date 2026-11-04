@@ -220,11 +220,37 @@ pub(super) fn tagged_profile_bytes(id: RepresentationProfileId) -> Vec<u8> {
     encoder.finish()
 }
 
+/// Fixed-width tagged physical digest bytes for the current 32-byte grammar.
+///
+/// Exposed to physical siblings so search keys and layout oracles share one
+/// width with [`encode_physical_digest_bytes`]. The generic tagged helper that
+/// feeds wire encoders stays private to this module.
+pub(super) const TAGGED_CURRENT_DIGEST_BYTES: usize = 40;
+
+fn encode_tagged_current_digest(
+    algorithm: u16,
+    construction: u16,
+    digest: &[u8; 32],
+) -> [u8; TAGGED_CURRENT_DIGEST_BYTES] {
+    let mut tagged = [0_u8; TAGGED_CURRENT_DIGEST_BYTES];
+    tagged[0..2].copy_from_slice(&algorithm.to_le_bytes());
+    tagged[2..4].copy_from_slice(&construction.to_le_bytes());
+    tagged[4..8].copy_from_slice(&CURRENT_DIGEST_BYTES.to_le_bytes());
+    tagged[8..40].copy_from_slice(digest);
+    tagged
+}
+
 fn encode_tagged(encoder: &mut Encoder, algorithm: u16, construction: u16, digest: &[u8; 32]) {
-    encoder.u16(algorithm);
-    encoder.u16(construction);
-    encoder.u32(CURRENT_DIGEST_BYTES);
-    encoder.raw(digest);
+    encoder.raw(&encode_tagged_current_digest(
+        algorithm,
+        construction,
+        digest,
+    ));
+}
+
+/// Stack form of the physical tagged digest body used by legacy search keys.
+pub(super) fn encode_physical_digest_bytes(digest: &[u8; 32]) -> [u8; TAGGED_CURRENT_DIGEST_BYTES] {
+    encode_tagged_current_digest(BLAKE3_ALGORITHM, PHYSICAL_CONSTRUCTION, digest)
 }
 
 pub(super) fn encode_physical_digest(encoder: &mut Encoder, digest: &[u8; 32]) {

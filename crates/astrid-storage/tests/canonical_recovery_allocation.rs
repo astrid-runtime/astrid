@@ -130,3 +130,97 @@ fn legacy_canonical_validation_borrows_the_complete_input_payload_set() {
 fn dense_canonical_validation_borrows_the_complete_input_payload_set() {
     validate_without_retaining_input_payloads(true);
 }
+
+fn peak_during<R>(body: impl FnOnce() -> R) -> (R, usize) {
+    INVALID_ACCOUNTING.set(false);
+    ACCOUNTING.set(Some((0, 0)));
+    let reset = ResetAccounting;
+    let result = body();
+    let accounting = ACCOUNTING.get();
+    let invalid = INVALID_ACCOUNTING.get();
+    drop(reset);
+    assert!(
+        !invalid,
+        "temporary allocation accounting overflowed or underflowed"
+    );
+    let (_, peak) = accounting.expect("accounting active");
+    (result, peak)
+}
+
+fn build_lookup_fixture(dense: bool, count: usize) -> (CanonicalPhysicalMap, Vec<PhysicalMapKey>) {
+    let keys = (0..count)
+        .map(|index| PhysicalMapKey::new(*blake3::hash(&index.to_le_bytes()).as_bytes()))
+        .collect::<Vec<_>>();
+    let entries = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            (
+                *key,
+                u64::try_from(index)
+                    .expect("fixture index fits u64")
+                    .to_le_bytes()
+                    .to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let map = if dense {
+        CanonicalPhysicalMap::build_dense(&Identity, PhysicalMapDomain::Placement, entries)
+    } else {
+        CanonicalPhysicalMap::build(&Identity, PhysicalMapDomain::Placement, entries)
+    }
+    .expect("fixture map");
+    (map, keys)
+}
+
+fn assert_get_hit_miss_zero_alloc(dense: bool) {
+    let (map, keys) = build_lookup_fixture(dense, 64);
+    let miss = PhysicalMapKey::new(*blake3::hash(b"missing-lookup-key").as_bytes());
+    assert!(!keys.contains(&miss));
+
+    let (hit, hit_peak) = peak_during(|| map.get(keys[0]));
+    assert_eq!(hit, Some(0_u64.to_le_bytes().as_slice()));
+    assert_eq!(
+        hit_peak,
+        0,
+        "hit lookup allocated {hit_peak} bytes on {}",
+        if dense { "dense" } else { "legacy" }
+    );
+
+    let middle_index = keys.len() / 2;
+    let (middle, middle_peak) = peak_during(|| map.get(keys[middle_index]));
+    assert_eq!(
+        middle,
+        Some(
+            u64::try_from(middle_index)
+                .expect("fixture index fits u64")
+                .to_le_bytes()
+                .as_slice(),
+        )
+    );
+    assert_eq!(
+        middle_peak,
+        0,
+        "interior hit lookup allocated {middle_peak} bytes on {}",
+        if dense { "dense" } else { "legacy" }
+    );
+
+    let (missed, miss_peak) = peak_during(|| map.get(miss));
+    assert_eq!(missed, None);
+    assert_eq!(
+        miss_peak,
+        0,
+        "miss lookup allocated {miss_peak} bytes on {}",
+        if dense { "dense" } else { "legacy" }
+    );
+}
+
+#[test]
+fn legacy_physical_map_get_hit_and_miss_are_zero_alloc() {
+    assert_get_hit_miss_zero_alloc(false);
+}
+
+#[test]
+fn dense_physical_map_get_hit_and_miss_are_zero_alloc() {
+    assert_get_hit_miss_zero_alloc(true);
+}

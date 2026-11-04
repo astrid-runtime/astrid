@@ -368,7 +368,25 @@ fn canonical_prefix(key: &[u8], bits: u32) -> Result<Vec<u8>, PhysicalModelError
 }
 
 pub(super) fn matches_prefix(key: &[u8], bits: u32, expected: &[u8]) -> bool {
-    canonical_prefix(key, bits).is_ok_and(|prefix| prefix == expected)
+    let Ok(whole_bytes) = usize::try_from(bits / 8) else {
+        return false;
+    };
+    let Some(whole) = key.get(..whole_bytes) else {
+        return false;
+    };
+    let remainder = bits % 8;
+    if remainder == 0 {
+        return whole == expected;
+    }
+    let Some((last, complete)) = expected.split_last() else {
+        return false;
+    };
+    // Compare the canonical zero-padded final byte directly. Masking expected
+    // as well would incorrectly accept nonzero unused bits in a stored prefix.
+    whole == complete
+        && key
+            .get(whole_bytes)
+            .is_some_and(|byte| byte & (u8::MAX << 8_u32.strict_sub(remainder)) == *last)
 }
 
 pub(super) fn bit(key: &[u8], offset: u32) -> bool {
