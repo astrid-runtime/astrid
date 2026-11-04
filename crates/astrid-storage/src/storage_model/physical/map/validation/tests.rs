@@ -257,3 +257,225 @@ fn incremental_builders_reject_collisions_without_changing_the_active_map() {
         assert_eq!(map.nodes(), original.nodes());
     }
 }
+
+struct CountingIdentity(core::cell::Cell<usize>);
+
+impl PhysicalIdentity for CountingIdentity {
+    fn identify(&self, context: &'static str, material: &[u8]) -> [u8; 32] {
+        self.0.set(self.0.get().strict_add(1));
+        Identity.identify(context, material)
+    }
+}
+
+#[test]
+fn public_recovery_identifies_each_canonical_node_once() {
+    for construction in [MapConstruction::LegacyBinary, MapConstruction::DenseRadix] {
+        for count in [1_u32, 2, 17, 257] {
+            let entries = (0..count)
+                .map(|n| {
+                    (
+                        PhysicalMapKey::new(*blake3::hash(&n.to_be_bytes()).as_bytes()),
+                        vec![3; 129],
+                    )
+                })
+                .collect();
+            let map = super::super::CanonicalPhysicalMap::build_with_construction(
+                &Identity,
+                PhysicalMapDomain::Placement,
+                entries,
+                construction,
+            )
+            .unwrap();
+            let identity = CountingIdentity(core::cell::Cell::new(0));
+            let recovered = super::super::CanonicalPhysicalMap::recover(
+                &identity,
+                PhysicalMapDomain::Placement,
+                map.root(),
+                map.nodes().clone(),
+            )
+            .unwrap();
+            assert_eq!(recovered.entry_count(), u64::from(count));
+            assert_eq!(recovered.root(), map.root());
+            assert_eq!(identity.0.get(), map.nodes().len(), "{construction:?}");
+        }
+    }
+}
+
+#[test]
+fn canonical_builder_validation_requires_every_constructed_node() {
+    let entries = vec![(PhysicalMapKey::new([1; 32]), vec![1])];
+    for construction in [MapConstruction::LegacyBinary, MapConstruction::DenseRadix] {
+        let nodes = BTreeMap::new();
+        let mut sink = ValidationNodes(&nodes);
+        let result = match construction {
+            MapConstruction::LegacyBinary => {
+                legacy::build(&Identity, PhysicalMapDomain::Placement, &entries, &mut sink)
+            },
+            MapConstruction::DenseRadix => {
+                radix::build(&Identity, PhysicalMapDomain::Placement, &entries, &mut sink)
+            },
+        };
+        assert_eq!(
+            result,
+            Err(PhysicalModelError::InvalidMap("missing canonical map node"))
+        );
+    }
+}
+
+#[test]
+fn public_recovery_rejects_forged_leaf_bodies_under_original_identities() {
+    for construction in [MapConstruction::LegacyBinary, MapConstruction::DenseRadix] {
+        let entries = (0_u32..257)
+            .map(|n| {
+                (
+                    PhysicalMapKey::new(*blake3::hash(&n.to_be_bytes()).as_bytes()),
+                    vec![3; 129],
+                )
+            })
+            .collect();
+        let map = super::super::CanonicalPhysicalMap::build_with_construction(
+            &Identity,
+            PhysicalMapDomain::Placement,
+            entries,
+            construction,
+        )
+        .unwrap();
+        let root = map.root().unwrap();
+        let mut nodes = map.nodes().clone();
+        let body = nodes
+            .values_mut()
+            .find(|node| {
+                matches!(
+                    node,
+                    PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. }
+                )
+            })
+            .unwrap();
+        match body {
+            PhysicalMapNode::Leaf { value, .. } => value[0] ^= 1,
+            PhysicalMapNode::Page { entries, .. } => entries[0].1[0] ^= 1,
+            _ => unreachable!(),
+        }
+        assert!(reference(PhysicalMapDomain::Placement, root, &nodes).is_err());
+        assert!(
+            super::super::CanonicalPhysicalMap::recover(
+                &Identity,
+                PhysicalMapDomain::Placement,
+                Some(root),
+                nodes,
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn validation_sink_rejects_unequal_bodies_even_when_identity_collides() {
+    struct Collision;
+    impl PhysicalIdentity for Collision {
+        fn identify(&self, _: &'static str, _: &[u8]) -> [u8; 32] {
+            [0x55; 32]
+        }
+    }
+    for construction in [MapConstruction::LegacyBinary, MapConstruction::DenseRadix] {
+        let entries = vec![(PhysicalMapKey::new([1; 32]), vec![1])];
+        let map = super::super::CanonicalPhysicalMap::build_with_construction(
+            &Collision,
+            PhysicalMapDomain::Placement,
+            entries.clone(),
+            construction,
+        )
+        .unwrap();
+        let mut nodes = map.nodes().clone();
+        match nodes.values_mut().next().unwrap() {
+            PhysicalMapNode::Leaf { value, .. } => value[0] = 2,
+            PhysicalMapNode::Page { entries, .. } => entries[0].1[0] = 2,
+            _ => unreachable!(),
+        }
+        let mut sink = ValidationNodes(&nodes);
+        let result = match construction {
+            MapConstruction::LegacyBinary => legacy::build(
+                &Collision,
+                PhysicalMapDomain::Placement,
+                &entries,
+                &mut sink,
+            ),
+            MapConstruction::DenseRadix => radix::build(
+                &Collision,
+                PhysicalMapDomain::Placement,
+                &entries,
+                &mut sink,
+            ),
+        };
+        assert_eq!(
+            result,
+            Err(PhysicalModelError::InvalidMap(
+                "physical map-node identity collision"
+            ))
+        );
+    }
+}
+
+#[test]
+fn public_recovery_rejects_noncanonical_body_even_when_root_digest_collides() {
+    struct ForgedRootIdentity {
+        forged: Vec<u8>,
+        root: PhysicalMapNodeId,
+    }
+    impl PhysicalIdentity for ForgedRootIdentity {
+        fn identify(&self, context: &'static str, material: &[u8]) -> [u8; 32] {
+            if material == self.forged {
+                *self.root.as_bytes()
+            } else {
+                Identity.identify(context, material)
+            }
+        }
+    }
+    for construction in [MapConstruction::LegacyBinary, MapConstruction::DenseRadix] {
+        let entries = (0_u32..257)
+            .map(|n| {
+                (
+                    PhysicalMapKey::new(*blake3::hash(&n.to_be_bytes()).as_bytes()),
+                    vec![3],
+                )
+            })
+            .collect();
+        let map = super::super::CanonicalPhysicalMap::build_with_construction(
+            &Identity,
+            PhysicalMapDomain::Placement,
+            entries,
+            construction,
+        )
+        .unwrap();
+        let root = map.root().unwrap();
+        let mut nodes = map.nodes().clone();
+        let forged = nodes.get_mut(&root).unwrap();
+        match forged {
+            PhysicalMapNode::Branch {
+                subtree_entries, ..
+            }
+            | PhysicalMapNode::Radix {
+                subtree_entries, ..
+            } => {
+                *subtree_entries = subtree_entries.strict_add(1);
+            },
+            _ => panic!("exercise a multi-node canonical tree"),
+        }
+        let identity = ForgedRootIdentity {
+            forged: forged.encode().unwrap(),
+            root,
+        };
+        assert_eq!(forged.identify(&identity).unwrap(), root);
+        assert!(matches!(
+            super::super::CanonicalPhysicalMap::recover(
+                &identity,
+                PhysicalMapDomain::Placement,
+                Some(root),
+                nodes,
+            ),
+            Err(PhysicalModelError::InvalidMap(
+                "physical map-node identity collision"
+            ))
+        ));
+    }
+}
