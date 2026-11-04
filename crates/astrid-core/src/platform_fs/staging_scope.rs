@@ -208,21 +208,44 @@ mod tests {
         let scoped = scope.temporary_basename();
         let legacy = ".astrid-private-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-        assert!(is_private_atomic_staging_name(OsStr::new(legacy)));
+        // Recognition follows the Unix writer contract on every target.
+        let recognized = cfg!(unix);
+        assert_eq!(
+            is_private_atomic_staging_name(OsStr::new(legacy)),
+            recognized
+        );
         let uppercase = ".astrid-private-ABCDEF0123456789ABCDEF0123456789";
-        assert!(is_private_atomic_staging_name(OsStr::new(uppercase)));
+        assert_eq!(
+            is_private_atomic_staging_name(OsStr::new(uppercase)),
+            recognized
+        );
         assert!(!is_scoped_private_staging_name(OsStr::new(uppercase)));
         assert!(!scope.matches_temporary_basename(OsStr::new(uppercase)));
         assert!(!is_private_atomic_staging_name(OsStr::new(&scoped)));
-        assert!(is_scoped_private_staging_name(OsStr::new(&scoped)));
+        assert_eq!(
+            is_scoped_private_staging_name(OsStr::new(&scoped)),
+            recognized
+        );
         assert!(!is_scoped_private_staging_name(OsStr::new(legacy)));
-        assert!(is_structural_private_staging_name(OsStr::new(&scoped)));
-        assert!(is_structural_private_staging_name(OsStr::new(legacy)));
+        assert_eq!(
+            is_structural_private_staging_name(OsStr::new(&scoped)),
+            recognized
+        );
+        assert_eq!(
+            is_structural_private_staging_name(OsStr::new(legacy)),
+            recognized
+        );
 
-        assert!(scope.matches_temporary_basename(OsStr::new(&scoped)));
+        assert_eq!(
+            scope.matches_temporary_basename(OsStr::new(&scoped)),
+            recognized
+        );
         assert!(!other.matches_temporary_basename(OsStr::new(&scoped)));
         assert!(!scope.matches_temporary_basename(OsStr::new(legacy)));
-        assert_eq!(staging_name_scope(OsStr::new(&scoped)), Some(scope));
+        assert_eq!(
+            staging_name_scope(OsStr::new(&scoped)),
+            recognized.then_some(scope)
+        );
         assert_eq!(staging_name_scope(OsStr::new(legacy)), None);
     }
 }

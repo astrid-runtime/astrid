@@ -164,9 +164,8 @@ impl Inspection {
         expected: &[u8],
     ) -> io::Result<bool> {
         let path = self.path(relative);
-        let parent = match path.parent() {
-            Some(parent) => parent,
-            None => return Ok(false),
+        let Some(parent) = path.parent() else {
+            return Ok(false);
         };
         match (|| {
             self.validate_private_ancestors(parent)?;

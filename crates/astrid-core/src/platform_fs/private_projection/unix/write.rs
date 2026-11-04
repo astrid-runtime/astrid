@@ -183,9 +183,8 @@ impl Existing {
         #[cfg(target_os = "linux")]
         {
             let flags = OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
-            let descriptor = File::from(
-                openat(parent, name.as_os_str(), flags, Mode::empty()).map_err(nix_io_error)?,
-            );
+            let descriptor =
+                File::from(openat(parent, name, flags, Mode::empty()).map_err(nix_io_error)?);
             verify_identity(parent, name, &descriptor, identity)?;
             boundary.validate(&descriptor)?;
             Ok(Self::Present {
@@ -213,8 +212,7 @@ impl Existing {
                     // mount installed after the original descriptor opened.
                     let flags = OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
                     let current = File::from(
-                        openat(parent, name.as_os_str(), flags, Mode::empty())
-                            .map_err(nix_io_error)?,
+                        openat(parent, name, flags, Mode::empty()).map_err(nix_io_error)?,
                     );
                     verify_identity(parent, name, &current, *identity)?;
                     boundary.validate(&current)?;
