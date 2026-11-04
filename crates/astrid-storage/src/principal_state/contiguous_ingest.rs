@@ -283,6 +283,19 @@ mod tests {
         );
     }
 
+    fn assert_bootstrap_journal_bounds(records: &[(String, u64)]) {
+        for suffix in ["objects.index", "metadata.arena"] {
+            assert!(
+                records
+                    .iter()
+                    .filter(|(name, _)| name.ends_with(suffix))
+                    .count()
+                    <= 16,
+                "bootstrap journaled too many {suffix} records"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn volume_flush_does_not_journal_a_full_index_snapshot_per_file() {
         let directory = tempfile::tempdir().unwrap();
@@ -291,6 +304,12 @@ mod tests {
         let store = open_runtime_principal_store(&home, unlimited_quota())
             .await
             .unwrap();
+        // Keep bootstrap publication separate from this 512-file workload.
+        // Both phases retain the same fixed write ceiling; a new recovery
+        // intent must not disguise per-file index snapshots during ingestion.
+        let bootstrap_records =
+            crate::volume::write_record_payloads(&home.storage_volume_path()).unwrap();
+        assert_bootstrap_journal_bounds(&bootstrap_records);
         let owner = StateOwner::Principal(PrincipalUid::from_bytes([0x51; 32]));
         let unique_dir = directory.path().join("unique");
         std::fs::create_dir(&unique_dir).unwrap();
@@ -320,7 +339,12 @@ mod tests {
         let mut metadata_writes = 0_u32;
         let mut loose_payload = 0_u64;
         let mut buckets = std::collections::BTreeMap::<String, (u32, u64)>::new();
-        for (name, len) in crate::volume::write_record_payloads(&volume_path).unwrap() {
+        let records = crate::volume::write_record_payloads(&volume_path).unwrap();
+        assert!(
+            records.starts_with(&bootstrap_records),
+            "ingest unexpectedly rewrote bootstrap history"
+        );
+        for (name, len) in records.into_iter().skip(bootstrap_records.len()) {
             let bucket = if name == "objects.index" {
                 index_payload += len;
                 index_writes += 1;

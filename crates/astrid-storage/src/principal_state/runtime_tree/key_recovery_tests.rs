@@ -29,11 +29,19 @@ async fn interrupted_key_recovery_resumes_with_atomic_sentinel_staging() {
     interrupted_recovery(RestoreCut::SentinelStaging).await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn legacy_retiring_sentinel_staging_remains_recoverable() {
+    interrupted_recovery(RestoreCut::LegacySentinelStaging).await;
+}
+
 enum RestoreCut {
     BeforeProjection,
     SentinelDirectory,
     #[cfg(unix)]
     SentinelStaging,
+    #[cfg(unix)]
+    LegacySentinelStaging,
     FirstProjectedFile,
 }
 
@@ -96,7 +104,11 @@ async fn interrupted_recovery(cut: RestoreCut) {
     // Stop at the production boundary after durable evidence preservation,
     // then materialize only one real volume-owned file. Drop the store without
     // graceful retirement, as an interrupted restore would leave it.
-    assert!(super::key_recovery::recover(&home, &store).unwrap());
+    assert!(
+        super::stopped_recovery::recover(&home, &store)
+            .unwrap()
+            .is_some()
+    );
     match cut {
         RestoreCut::BeforeProjection => {},
         RestoreCut::SentinelDirectory => {
@@ -105,14 +117,9 @@ async fn interrupted_recovery(cut: RestoreCut) {
             astrid_core::platform_fs::ensure_private_directory(&home.root().join("etc")).unwrap();
         },
         #[cfg(unix)]
-        RestoreCut::SentinelStaging => {
-            let staged = home
-                .root()
-                .join("etc/.astrid-private-00000000000040008000000000000001");
-            // These deliberately incomplete bytes must never become the
-            // layout version or any admitted System-owned content.
-            astrid_core::platform_fs::atomic_write_private_file(&staged, b"incomplete").unwrap();
-        },
+        RestoreCut::SentinelStaging => plant_sentinel_staging(&home, &store, false),
+        #[cfg(unix)]
+        RestoreCut::LegacySentinelStaging => plant_sentinel_staging(&home, &store, true),
         RestoreCut::FirstProjectedFile => {
             let sentinel = ContentName::new("etc/layout-version").unwrap();
             let bytes = store
@@ -250,4 +257,28 @@ async fn stopped_volume_recovers_replacement_key_without_changing_identity() {
         Some(vec![9; 32])
     );
     store.pack_and_retire_runtime_projection(&home).unwrap();
+}
+
+#[cfg(unix)]
+fn plant_sentinel_staging(
+    home: &AstridHome,
+    store: &crate::principal_state::RuntimePrincipalStore,
+    legacy: bool,
+) {
+    let name = if legacy {
+        // Model an interrupted older release with its schema-1 inventory.
+        let entries = super::active_projection_entries(home, store).unwrap();
+        let receipt =
+            super::receipt_ingest(home, super::ReceiptPhase::Retiring, &entries, None).unwrap();
+        store
+            .replace_contiguous_files_removing_exact(StateOwner::System, [receipt], &[], None)
+            .unwrap();
+        store.content().flush().unwrap();
+        ".astrid-private-00000000000040008000000000000001".to_owned()
+    } else {
+        let receipt = super::active::read(home, store).unwrap().unwrap();
+        receipt.staging_scope().unwrap().temporary_basename()
+    };
+    let staged = home.root().join("etc").join(name);
+    astrid_core::platform_fs::atomic_write_private_file(&staged, b"incomplete").unwrap();
 }

@@ -244,3 +244,25 @@ fn unix_redirect_validation_accepts_regular_leaf_files_but_not_symlinks() {
     verify_no_redirects(&file).unwrap();
     assert!(verify_no_redirects(&redirect).is_err());
 }
+
+#[test]
+fn private_directory_validation_requires_existing_exact_path() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("private");
+    ensure_private_directory(&root).unwrap();
+    validate_private_directory(&root).unwrap();
+    for relative in ["missing", "missing/child"] {
+        let path = root.join(relative);
+        assert!(
+            validate_private_directory(&path).is_err(),
+            "validation accepted a missing directory: {}",
+            path.display()
+        );
+        assert!(!path.exists(), "validation created {}", path.display());
+    }
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    let file = root.join("regular-file");
+    atomic_write_private_file(&file, b"unchanged").unwrap();
+    assert!(validate_private_directory(&file).is_err());
+    assert_eq!(std::fs::read(&file).unwrap(), b"unchanged");
+}

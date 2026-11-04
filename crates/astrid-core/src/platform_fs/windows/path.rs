@@ -773,11 +773,16 @@ pub(in crate::platform_fs) fn default_astrid_home_root() -> io::Result<PathBuf> 
     Ok(local_data.join("Astrid").join("Runtime"))
 }
 
+/// Validate the exact existing boundary without creating missing descendants.
+pub(in crate::platform_fs) fn validate_private_directory(path: &Path) -> io::Result<()> {
+    validate_local_absolute_path(path)?;
+    TrustedPathGuard::capture(path)?.verify_contract(BoundaryContract::ExactPrivateDirectory)
+}
+
 pub(in crate::platform_fs) fn ensure_private_directory(path: &Path) -> io::Result<()> {
     validate_local_absolute_path(path)?;
     if path.exists() {
-        let guard = TrustedPathGuard::capture(path)?;
-        return guard.verify_contract(BoundaryContract::ExactPrivateDirectory);
+        return validate_private_directory(path);
     }
 
     let existing_parent = nearest_existing_ancestor(path)?;

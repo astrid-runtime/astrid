@@ -10,6 +10,7 @@ use crate::content::{ContentName, PrepareDerivedBatchContent};
 use crate::engine::PrincipalProjectionError;
 use crate::error::{StorageError, StorageResult};
 use astrid_core::dirs::AstridHome;
+use astrid_core::platform_fs::StagingScope;
 
 use super::{
     ContiguousFileIngest, PackedProjectionIngest, RuntimePrincipalStore, StateOwner,
@@ -17,11 +18,17 @@ use super::{
 };
 
 use super::runtime_tree_active as active;
-mod key_recovery;
 #[cfg(test)]
 mod key_recovery_tests;
 mod projection;
-use projection::{confined_projection_path, write_projection_file};
+mod restoration;
+mod stopped_recovery;
+#[cfg(test)]
+mod stopped_staging_matrix_tests;
+use projection::confined_projection_path;
+#[cfg(test)]
+use projection::write_projection_file;
+use restoration::restore_projection;
 
 const VOLUME_PATH_PREFIX: &str = "volume";
 const SOCKET_PATH: &str = "run/system.sock";
@@ -76,6 +83,13 @@ impl RuntimeTreeEntry {
 
 /// Scan the native runtime tree without reading file payloads.
 pub(super) fn scan(runtime_root: &Path) -> StorageResult<Vec<RuntimeTreeEntry>> {
+    scan_with_receipt(runtime_root, None)
+}
+
+fn scan_with_receipt(
+    runtime_root: &Path,
+    receipt: Option<&active::ActiveProjectionReceipt>,
+) -> StorageResult<Vec<RuntimeTreeEntry>> {
     let metadata = std::fs::symlink_metadata(runtime_root)
         .map_err(|error| tree_error(runtime_root, format!("inspect source root: {error}")))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -86,7 +100,7 @@ pub(super) fn scan(runtime_root: &Path) -> StorageResult<Vec<RuntimeTreeEntry>> 
     }
 
     let mut files = Vec::new();
-    collect_files(runtime_root, runtime_root, &mut files)?;
+    collect_files(runtime_root, runtime_root, &mut files, receipt)?;
     files.sort_by(|left, right| left.0.cmp(&right.0));
     files
         .into_iter()
@@ -117,6 +131,7 @@ fn collect_files(
     root: &Path,
     directory: &Path,
     files: &mut Vec<(String, PathBuf, std::fs::Metadata)>,
+    receipt: Option<&active::ActiveProjectionReceipt>,
 ) -> StorageResult<()> {
     let mut entries = std::fs::read_dir(directory)
         .map_err(|error| tree_error(directory, format!("read directory: {error}")))?
@@ -147,7 +162,22 @@ fn collect_files(
                 continue;
             }
             if metadata.is_dir() {
-                collect_files(root, &path, files)?;
+                // Only scoped RETIRING recovery reserves temporary-shaped
+                // directories. Ordinary admission retains its existing rules.
+                if let Some(receipt) = receipt
+                    && astrid_core::platform_fs::is_structural_private_staging_name(
+                        &entry.file_name(),
+                    )
+                    && !receipt.contains_inventory_name(&format!("{relative_text}/"))
+                {
+                    return Err(tree_error(
+                        &path,
+                        format!(
+                            "retiring projection contains unreceipted host file {relative_text}"
+                        ),
+                    ));
+                }
+                collect_files(root, &path, files, receipt)?;
             } else if metadata.is_file() {
                 files.push((relative_text, path, metadata));
             }
@@ -240,82 +270,6 @@ pub(super) fn is_excluded(relative: &str) -> bool {
         || TRANSACTION_STAGING_PATHS.contains(&relative)
 }
 
-/// Replace durable host files with volume-backed running projections.
-pub(super) fn restore_projection(
-    home: &AstridHome,
-    store: &RuntimePrincipalStore,
-    content: &super::NativePrincipalContentStore,
-) -> StorageResult<()> {
-    let layout_version = home
-        .layout_version()
-        .map_err(|error| tree_io_error(&error))?;
-    if layout_version.as_deref() == Some(astrid_core::dirs::LEGACY_LAYOUT_VERSION) {
-        return Ok(());
-    }
-    ingest_runtime_key(home, store)?;
-    seed_layout_version(home, store)?;
-    let mut entries = content
-        .list(&StateOwner::System)
-        .map_err(|error| tree_error(home.root(), format!("list volume projection: {error}")))?;
-    // Make subsequent interrupted restores structurally recognizable before
-    // materializing other volume-owned directories or configuration files.
-    entries.sort_by_key(|entry| entry.name().as_str() != "etc/layout-version");
-    for entry in &entries {
-        let name = entry.name().as_str();
-        if is_excluded(name) || is_retired_legacy_projection(home, name) {
-            continue;
-        }
-        confined_projection_path(home.root(), name.strip_suffix('/').unwrap_or(name))?;
-    }
-    let mut written = Vec::new();
-    let result = (|| -> StorageResult<()> {
-        for entry in entries {
-            let name = entry.name().as_str();
-            if is_excluded(name) || is_retired_legacy_projection(home, name) {
-                continue;
-            }
-            if let Some(directory) = name.strip_suffix('/') {
-                projection::restore_directory(home.root(), directory, entry.logical_bytes())?;
-                continue;
-            }
-            let Some(bytes) = content
-                .read(&StateOwner::System, entry.name())
-                .map_err(|error| {
-                    tree_error(home.root(), format!("read projection {name}: {error}"))
-                })?
-            else {
-                continue;
-            };
-            let path = confined_projection_path(home.root(), name)?;
-            let previous = super::native_io::snapshot_private_file(&path)?;
-            written.push((path, previous));
-            write_projection_file(home.root(), name, &bytes)?;
-            if is_staging_generation(name) {
-                let path = confined_projection_path(home.root(), name)?;
-                super::rebind_staging_generation(&path)?;
-            }
-        }
-        Ok(())
-    })();
-    if let Err(error) = result {
-        let rollback_errors = super::native_io::rollback_private_files(written);
-        if !rollback_errors.is_empty() {
-            let retirement = match transition_retiring_projection(home, store) {
-                Ok(()) => "durable RETIRING receipt recorded".to_owned(),
-                Err(retirement) => format!("failed to force RETIRING receipt: {retirement}"),
-            };
-            return Err(tree_error(
-                home.root(),
-                format!(
-                    "restore failed: {error}; rollback failures: {rollback_errors:?}; {retirement}"
-                ),
-            ));
-        }
-        return Err(error);
-    }
-    Ok(())
-}
-
 fn is_retired_legacy_projection(home: &AstridHome, name: &str) -> bool {
     [home.state_db_path(), home.cow_dir()]
         .into_iter()
@@ -340,7 +294,7 @@ pub(super) fn quarantine_principal_store(
     let source = home.principal_store_path();
     validate_legacy_retirement_candidate(&source)?;
     let mut files = Vec::new();
-    collect_files(&source, &source, &mut files)?;
+    collect_files(&source, &source, &mut files, None)?;
     files.sort_by(|left, right| left.0.cmp(&right.0));
 
     let generation = next_quarantine_generation(store)?;
@@ -610,8 +564,9 @@ fn receipt_ingest(
     home: &AstridHome,
     phase: ReceiptPhase,
     entries: &[ActiveProjectionEntry],
+    staging_scope: Option<StagingScope>,
 ) -> StorageResult<PackedProjectionIngest> {
-    let bytes = active::encode(home, phase, entries)?;
+    let bytes = active::encode(home, phase, entries, staging_scope)?;
     Ok(PackedProjectionIngest::bytes(
         active::active_projection_name()?,
         bytes,
@@ -623,7 +578,7 @@ fn rotate_active_receipt(
     store: &RuntimePrincipalStore,
     entries: &[ActiveProjectionEntry],
 ) -> StorageResult<()> {
-    let receipt = receipt_ingest(home, ReceiptPhase::Active, entries)?;
+    let receipt = receipt_ingest(home, ReceiptPhase::Active, entries, None)?;
     store.replace_contiguous_files_removing_exact(StateOwner::System, [receipt], &[], None)?;
     store
         .content()
@@ -687,7 +642,7 @@ impl PrepareDerivedBatchContent for ActiveReceiptDeriver {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let bytes = active::encode(&self.home, ReceiptPhase::Active, &entries)
+        let bytes = active::encode(&self.home, ReceiptPhase::Active, &entries, None)
             .map_err(|error| PrincipalProjectionError::Engine(error.to_string()))?;
         let name = active::active_projection_name()
             .map_err(|error| PrincipalProjectionError::Engine(error.to_string()))?;
@@ -753,7 +708,7 @@ fn transition_retiring_projection(
         return Ok(());
     }
     let entries = active_projection_entries(home, store)?;
-    let receipt = receipt_ingest(home, ReceiptPhase::Retiring, &entries)?;
+    let receipt = receipt_ingest(home, ReceiptPhase::Retiring, &entries, None)?;
     store.replace_contiguous_files_removing_exact(StateOwner::System, [receipt], &[], None)?;
     store
         .content()
@@ -797,8 +752,9 @@ pub(super) fn reconcile_running_projection(
         return Ok(());
     }
 
-    if !allow_receiptless_bootstrap && key_recovery::recover(home, store)? {
-        restore_projection(home, store, &store.content)?;
+    if !allow_receiptless_bootstrap && let Some(prepared) = stopped_recovery::recover(home, store)?
+    {
+        restoration::restore_after_recovery(prepared)?;
         establish_active_receipt(home, store)?;
         return Ok(());
     }
@@ -851,9 +807,16 @@ pub(super) fn reconcile_running_projection(
                 }
             },
             ReceiptPhase::Retiring => {
-                let scanned = scan(home.root())?;
-                validate_retiring_host_subset(home, &receipt, &scanned)?;
-                restore_projection(home, store, &store.content)?;
+                let scoped_receipt = receipt.staging_scope().map(|_| &receipt);
+                let scanned = scan_with_receipt(home.root(), scoped_receipt)?;
+                if let Some(prepared) =
+                    restoration::discharge_scoped_staging(home, store, &receipt, &scanned)?
+                {
+                    restoration::restore_after_recovery(prepared)?;
+                } else {
+                    validate_retiring_host_subset(home, &receipt, &scanned)?;
+                    restore_projection(home, store, &store.content)?;
+                }
             },
         },
     }

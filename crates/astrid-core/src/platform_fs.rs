@@ -9,6 +9,25 @@
 #[path = "platform_fs/macos_acl.rs"]
 mod macos_acl;
 
+#[cfg(unix)]
+mod mount_boundary;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use mount_boundary::fixtures as mount_fixtures;
+#[cfg(all(feature = "test-support", target_os = "linux"))]
+pub use mount_boundary::fixtures as mount_test_fixtures;
+mod private_projection;
+mod staging_scope;
+
+#[cfg(unix)]
+use mount_boundary::MountBoundary;
+#[cfg(target_os = "linux")]
+pub(crate) use mount_boundary::MountId;
+pub use private_projection::{PrivateFileProjection, PrivateProjectionInspection};
+pub use staging_scope::{
+    StagingScope, StagingScopeError, is_private_atomic_staging_name,
+    is_scoped_private_staging_name, is_structural_private_staging_name, staging_name_scope,
+};
+
 use std::collections::HashSet;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -193,7 +212,7 @@ pub fn validate_private_directory(path: &Path) -> io::Result<()> {
 
     #[cfg(windows)]
     {
-        windows::ensure_private_directory(path)
+        windows::validate_private_directory(path)
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -397,20 +416,6 @@ pub fn atomic_write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
-/// Recognize the Unix private atomic writer's temporary basename.
-///
-/// This is only a naming check, not authority to read or discard the file.
-/// Recovery must separately validate private ownership and durable intent.
-#[must_use]
-pub fn is_private_atomic_staging_name(name: &std::ffi::OsStr) -> bool {
-    cfg!(unix)
-        && name.to_str().is_some_and(|name| {
-            name.strip_prefix(".astrid-private-").is_some_and(|suffix| {
-                suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
-            })
-        })
-}
-
 /// Reject redirecting path components at a security-sensitive boundary.
 ///
 /// Windows checks the reparse attribute on every existing component, covering
@@ -517,7 +522,7 @@ fn ensure_private_directory_unix(path: &Path) -> io::Result<()> {
 fn validate_private_directory_unix(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
-    let directory = open_directory_no_follow_unix(path)?;
+    let directory = open_existing_directory_no_follow(path)?;
     let metadata = directory.metadata()?;
     if metadata.uid() != nix::unistd::getuid().as_raw() {
         return Err(io::Error::new(
@@ -679,12 +684,30 @@ fn open_directory_no_follow_unix(path: &Path) -> io::Result<std::fs::File> {
     Ok(directory)
 }
 
+#[cfg(all(unix, test))]
+thread_local! {
+    static DIRECTORY_WALK_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(unix, test))]
+pub(crate) fn reset_directory_walk_count() {
+    DIRECTORY_WALK_COUNT.set(0);
+}
+
+#[cfg(all(unix, test))]
+pub(crate) fn directory_walk_count() -> usize {
+    DIRECTORY_WALK_COUNT.get()
+}
+
 #[cfg(unix)]
 fn unix_directory_walk(path: &Path) -> io::Result<(std::fs::File, Vec<std::ffi::OsString>)> {
     use nix::errno::Errno;
     use nix::fcntl::{OFlag, openat};
     use nix::sys::stat::Mode;
     use std::path::Component;
+
+    #[cfg(test)]
+    DIRECTORY_WALK_COUNT.with(|count| count.set(count.get().strict_add(1)));
 
     let components = path.components().collect::<Vec<_>>();
     if components

@@ -593,7 +593,9 @@ async fn arbitrary_host_projection_without_active_receipt_fails_closed() {
     drop(packer);
 
     let rogue = home.root().join("etc/user.conf");
-    std::fs::create_dir_all(rogue.parent().unwrap()).unwrap();
+    // Exercise receipt authority independently of the earlier privacy check.
+    // An unsafe directory is already covered by the stopped-home tests.
+    astrid_core::platform_fs::ensure_private_directory(rogue.parent().unwrap()).unwrap();
     std::fs::write(&rogue, b"not a surviving projection").unwrap();
     let Err(error) = open_runtime_principal_store(&home, unlimited_quota()).await else {
         panic!("arbitrary preboot host file must not acquire catalog authority");
@@ -1234,21 +1236,6 @@ fn rebind_staging_generation_rejects_symlink_without_touching_target() {
     assert_eq!(std::fs::read(&external).unwrap(), crafted);
 }
 
-#[test]
-fn rollback_private_files_attempts_every_destination() {
-    let directory = tempfile::tempdir().unwrap();
-    let removed = directory.path().join("removed");
-    std::fs::write(&removed, b"remove").unwrap();
-    let failed = directory.path().join("missing-parent/file");
-
-    let errors = super::super::native_io::rollback_private_files(vec![
-        (removed.clone(), None),
-        (failed, None),
-    ]);
-    assert_eq!(errors.len(), 1, "one destination should fail");
-    assert!(!removed.exists(), "later rollback destination was skipped");
-}
-
 #[tokio::test]
 async fn retiring_stop_retains_unreceipted_host_file() {
     let home_dir = tempfile::tempdir().unwrap();
@@ -1263,7 +1250,7 @@ async fn retiring_stop_retains_unreceipted_host_file() {
         .publish_runtime_projection(&home)
         .expect("publish receipted projection");
     let entries = active_projection_entries(&home, &running).unwrap();
-    let retiring = receipt_ingest(&home, ReceiptPhase::Retiring, &entries).unwrap();
+    let retiring = receipt_ingest(&home, ReceiptPhase::Retiring, &entries, None).unwrap();
     running
         .replace_contiguous_files_removing_exact(StateOwner::System, [retiring], &[], None)
         .unwrap();

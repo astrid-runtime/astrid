@@ -14,15 +14,13 @@ use super::CANONICAL_VOLUME;
 
 #[cfg(test)]
 mod barrier_tests;
-#[cfg(target_os = "linux")]
-mod mount;
 #[cfg(all(test, target_os = "linux"))]
 mod mount_tests;
 
 struct RootBoundary {
     identity: FileStat,
     #[cfg(target_os = "linux")]
-    mount: mount::MountId,
+    mount: crate::platform_fs::MountId,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -100,7 +98,7 @@ fn retire_with_io_hooks(
     let boundary = RootBoundary {
         identity: fstat(&directory).map_err(os_error)?,
         #[cfg(target_os = "linux")]
-        mount: mount::MountId::of(&directory)?,
+        mount: crate::platform_fs::MountId::of(&directory)?,
     };
     walk(
         &directory,

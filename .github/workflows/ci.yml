@@ -297,7 +297,15 @@ jobs:
           assert len(paths) == 1, paths
           print(paths[0])')
           sudo unshare --mount --propagation private -- "$test_binary" \
-            dirs::projection_retirement::unix::mount_tests:: --ignored --nocapture --test-threads=1
+            bind_mount_ --ignored --nocapture --test-threads=1
+
+          storage_binary=$(cargo test --locked -p astrid-storage --lib --no-run --message-format=json | python3 -c '
+          import json, sys
+          paths = [m["executable"] for line in sys.stdin if (m := json.loads(line)).get("executable") and m.get("target", {}).get("name") == "astrid_storage" and m.get("profile", {}).get("test")]
+          assert len(paths) == 1, paths
+          print(paths[0])')
+          sudo unshare --mount --propagation private -- "$storage_binary" \
+            bind_mount_matching_skip --ignored --nocapture --test-threads=1
 
   check:
     name: Check

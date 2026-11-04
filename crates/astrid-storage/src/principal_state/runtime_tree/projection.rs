@@ -32,6 +32,7 @@ pub(super) fn confined_projection_path(root: &Path, relative: &str) -> StorageRe
     Ok(path)
 }
 
+#[cfg(test)]
 pub(super) fn write_projection_file(
     root: &Path,
     relative: &str,
@@ -45,14 +46,6 @@ pub(super) fn write_projection_file(
     astrid_core::platform_fs::atomic_write_private_file(&path, bytes)
         .map_err(|error| tree_error(&path, format!("project volume-backed file: {error}")))?;
     Ok(())
-}
-
-pub(super) fn restore_directory(root: &Path, name: &str, logical_bytes: u64) -> StorageResult<()> {
-    if logical_bytes != 0 {
-        return Err(tree_error(root, "directory marker contains file bytes"));
-    }
-    let path = confined_projection_path(root, name)?;
-    super::super::native_io::ensure_private_directory(&path)
 }
 
 pub(super) fn surviving_directory(root: &Path, name: &str) -> bool {

@@ -374,10 +374,26 @@ fn non_volume_stopped_sidecars_fail_closed() {
         let sidecar = home.root().join(relative);
         std::fs::create_dir_all(&sidecar).unwrap();
 
+        let sidecar_mode = std::fs::metadata(&sidecar).unwrap().permissions().mode();
         let error = home.ensure().unwrap_err();
 
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{relative}");
+        // A sentinel parent is recognizable only when already private. Its
+        // unsafe access now fails the explicit privacy gate, before admission.
+        let expected = if relative == "etc" {
+            io::ErrorKind::PermissionDenied
+        } else {
+            io::ErrorKind::InvalidData
+        };
+        assert_eq!(error.kind(), expected, "{relative}");
         assert!(sidecar.exists(), "{relative} was mutated");
+        assert_eq!(
+            std::fs::metadata(&sidecar).unwrap().permissions().mode(),
+            sidecar_mode
+        );
+        assert_eq!(
+            std::fs::read(home.storage_volume_path()).unwrap(),
+            b"stopped-volume"
+        );
     }
 }
 
