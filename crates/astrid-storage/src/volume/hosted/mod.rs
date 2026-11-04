@@ -107,6 +107,18 @@ impl fmt::Debug for HostedFileVolume {
     }
 }
 impl HostedFileVolume {
+    /// Check the expected path against the currently owned container handle.
+    /// Reclaim can replace this handle, so callers must not cache its inode.
+    pub(crate) fn require_current_binding(&self, path: &std::path::Path) -> io::Result<()> {
+        if self.path != std::path::absolute(path)? {
+            return Err(io::Error::other(
+                "Astrid volume belongs to a different home",
+            ));
+        }
+        astrid_core::platform_fs::verify_no_redirects(path)?;
+        open::require_current(&self.state.lock().file, path)
+    }
+
     fn append(
         state: &mut ContainerState,
         operation: Operation,
