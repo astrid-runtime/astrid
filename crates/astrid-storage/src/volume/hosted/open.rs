@@ -111,6 +111,11 @@ impl HostedFileVolume {
             last_snapshot_end: recovery.last_snapshot_end,
             boundary_pending: false,
             footer_pending,
+            physical_tail: if recovery.footer_present {
+                super::PhysicalTail::MayExceed
+            } else {
+                super::PhysicalTail::Exact
+            },
             flush_state: super::FlushState::Required,
             // A process may have exited after replacing this inode but before
             // flushing the directory. A valid footer cannot prove that the

@@ -47,6 +47,10 @@ thread_local! {
     static REGION_STATE_CLONES: Cell<usize> = const { Cell::new(0) };
     static EXTENT_VISITS: Cell<usize> = const { Cell::new(0) };
     static MUTATION_EXTENT_VISITS: Cell<usize> = const { Cell::new(0) };
+    static PREPARE_TRUNCATE_COUNT: Cell<usize> = const { Cell::new(0) };
+    static FAIL_PREPARE_TRUNCATE: Cell<bool> = const { Cell::new(false) };
+    static FAIL_ROLLBACK_TRUNCATE: Cell<bool> = const { Cell::new(false) };
+    static REMAINING_APPEND_WRITES: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 #[derive(Debug, Default)]
@@ -77,6 +81,14 @@ impl Clone for RegionState {
 enum FlushState {
     Required,
     Confirmed,
+}
+
+/// Process-local proof that the owned handle's physical end matches `valid_len`.
+/// Independent of footer_pending / flush_state / durability acknowledgements.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PhysicalTail {
+    Exact,
+    MayExceed,
 }
 
 #[cfg(windows)]
@@ -111,6 +123,9 @@ struct ContainerState {
     last_snapshot_end: u64,
     boundary_pending: bool,
     footer_pending: bool,
+    // Process-local proof that physical length may exceed valid_len (footer or
+    // uncertain mutation). Never derived from per-append metadata queries.
+    physical_tail: PhysicalTail,
     // Process-local proof only: set after a successful full flush, cleared
     // before any file mutation. A recovered footer is not this proof.
     flush_state: FlushState,
@@ -148,6 +163,67 @@ impl HostedFileVolume {
         Ok((record.payload_offset, record.payload_len))
     }
 
+    /// Clear flush proof, ensure the previous physical tail is discarded when
+    /// needed, seek to valid_len, then mark MayExceed before any record write.
+    fn prepare_append(state: &mut ContainerState) -> io::Result<()> {
+        state.flush_state = FlushState::Required;
+        state.footer_pending = true;
+        if state.physical_tail == PhysicalTail::MayExceed {
+            #[cfg(test)]
+            {
+                PREPARE_TRUNCATE_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+                if FAIL_PREPARE_TRUNCATE.with(Cell::get) {
+                    FAIL_PREPARE_TRUNCATE.with(|flag| flag.set(false));
+                    return Err(io::Error::other("injected prepare truncate failure"));
+                }
+            }
+            state.file.set_len(state.valid_len)?;
+            state.physical_tail = PhysicalTail::Exact;
+        }
+        state.file.seek(SeekFrom::Start(state.valid_len))?;
+        // Any caller after this may write; keep the physical end uncertain until
+        // the record fully publishes and advances valid_len.
+        state.physical_tail = PhysicalTail::MayExceed;
+        Ok(())
+    }
+
+    fn write_append_bytes(file: &mut File, bytes: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            let fail = REMAINING_APPEND_WRITES.with(|cell| {
+                let Some(remaining) = cell.get() else {
+                    return false;
+                };
+                if remaining == 0 {
+                    true
+                } else {
+                    cell.set(Some(remaining.saturating_sub(1)));
+                    false
+                }
+            });
+            if fail {
+                // Leave a real physical tail beyond valid_len for retry coverage.
+                let prefix = bytes.len().min(8);
+                if prefix != 0 {
+                    file.write_all(&bytes[..prefix])?;
+                }
+                return Err(io::Error::other("injected append write failure"));
+            }
+        }
+        file.write_all(bytes)
+    }
+
+    fn set_len_for_rollback(state: &mut ContainerState, len: u64) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            if FAIL_ROLLBACK_TRUNCATE.with(Cell::get) {
+                FAIL_ROLLBACK_TRUNCATE.with(|flag| flag.set(false));
+                return Err(io::Error::other("injected rollback truncate failure"));
+            }
+        }
+        state.file.set_len(len)
+    }
+
     fn append_record(
         state: &mut ContainerState,
         operation: Operation,
@@ -179,33 +255,33 @@ impl HostedFileVolume {
         hasher.update(payload);
         let checksum = *hasher.finalize().as_bytes();
 
-        // A footer occupies the old valid-end until the next append. Truncate
-        // it before writing the next ASTREG1 record; valid_len excludes it.
-        state.flush_state = FlushState::Required;
-        state.footer_pending = true;
-        state.file.set_len(state.valid_len)?;
-        state.file.seek(SeekFrom::Start(state.valid_len))?;
-        state.file.write_all(&RECORD_MAGIC)?;
-        state.file.write_all(&total_len.to_le_bytes())?;
-        state.file.write_all(&next_sequence.to_le_bytes())?;
-        state.file.write_all(&[operation as u8])?;
-        state.file.write_all(&name_len.to_le_bytes())?;
-        state.file.write_all(&offset.to_le_bytes())?;
-        state.file.write_all(&payload_len.to_le_bytes())?;
-        state.file.write_all(&checksum)?;
-        state.file.write_all(name)?;
+        // A footer may occupy the old valid-end until the next append. Discard
+        // it only when the process-local proof says the physical end may exceed
+        // valid_len; valid_len itself excludes the footer.
+        Self::prepare_append(state)?;
+        Self::write_append_bytes(&mut state.file, &RECORD_MAGIC)?;
+        Self::write_append_bytes(&mut state.file, &total_len.to_le_bytes())?;
+        Self::write_append_bytes(&mut state.file, &next_sequence.to_le_bytes())?;
+        Self::write_append_bytes(&mut state.file, &[operation as u8])?;
+        Self::write_append_bytes(&mut state.file, &name_len.to_le_bytes())?;
+        Self::write_append_bytes(&mut state.file, &offset.to_le_bytes())?;
+        Self::write_append_bytes(&mut state.file, &payload_len.to_le_bytes())?;
+        Self::write_append_bytes(&mut state.file, &checksum)?;
+        Self::write_append_bytes(&mut state.file, name)?;
         let physical_payload = state
             .valid_len
             .checked_add(u64::try_from(RECORD_FIXED_BYTES).unwrap_or(u64::MAX))
             .and_then(|value| value.checked_add(u64::from(name_len)))
             .ok_or_else(|| io::Error::other("volume physical offset overflow"))?;
-        state.file.write_all(payload)?;
+        Self::write_append_bytes(&mut state.file, payload)?;
         state.boundary_pending = false;
         state.valid_len = state
             .valid_len
             .checked_add(total_len)
             .ok_or_else(|| io::Error::other("volume length overflow"))?;
         state.sequence = next_sequence;
+        // Plain append has no rollback: only a fully published record returns Exact.
+        state.physical_tail = PhysicalTail::Exact;
         Ok(AppendedRecord {
             payload_offset: physical_payload,
             payload_len,
@@ -249,6 +325,9 @@ impl HostedFileVolume {
             state.boundary_pending = true;
         }
         if state.footer_pending || state.boundary_pending {
+            // Footer IO extends physical length beyond valid_len on success or
+            // may leave an uncertain tail on failure; retain MayExceed either way.
+            state.physical_tail = PhysicalTail::MayExceed;
             recover::write_footer(
                 &mut state.file,
                 state.last_commit_offset,
@@ -763,6 +842,34 @@ pub(crate) use stream::write_record_payloads;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+fn reset_prepare_truncate_count() {
+    PREPARE_TRUNCATE_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn prepare_truncate_count() -> usize {
+    PREPARE_TRUNCATE_COUNT.with(Cell::get)
+}
+
+#[cfg(test)]
+fn set_fail_prepare_truncate(value: bool) {
+    FAIL_PREPARE_TRUNCATE.with(|flag| flag.set(value));
+}
+
+#[cfg(test)]
+fn set_fail_rollback_truncate(value: bool) {
+    FAIL_ROLLBACK_TRUNCATE.with(|flag| flag.set(value));
+}
+
+#[cfg(test)]
+fn set_remaining_append_writes(value: Option<usize>) {
+    REMAINING_APPEND_WRITES.with(|cell| cell.set(value));
+}
+
+#[cfg(test)]
+mod append_tail_tests;
 
 #[cfg(test)]
 mod sync_tests;

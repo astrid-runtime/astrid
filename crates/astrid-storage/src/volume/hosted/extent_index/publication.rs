@@ -3,7 +3,8 @@
 use std::{collections::BTreeMap, io};
 
 use super::super::{
-    CheckpointFormat, ContainerState, FlushState, IndexCheckpoint, RegionState, VolumeRegion,
+    CheckpointFormat, ContainerState, FlushState, IndexCheckpoint, PhysicalTail, RegionState,
+    VolumeRegion,
 };
 use super::checkpoint::{self, RegionRoot};
 use super::codec::IndexedExtent;
@@ -68,11 +69,16 @@ pub(in crate::volume::hosted) fn prepare_checkpoint(
             if state.footer_pending {
                 // No commit has been written, so only unpublished bytes are
                 // removed. Later appends/footer writes retry a failed truncate.
-                state.file.set_len(start).map_err(|rollback| {
-                    io::Error::other(format!(
-                        "extent-index preparation failed: {error}; suffix rollback failed: {rollback}"
-                    ))
-                })?;
+                state.physical_tail = PhysicalTail::MayExceed;
+                match super::super::HostedFileVolume::set_len_for_rollback(state, start) {
+                    Ok(()) => state.physical_tail = PhysicalTail::Exact,
+                    Err(rollback) => {
+                        state.physical_tail = PhysicalTail::MayExceed;
+                        return Err(io::Error::other(format!(
+                            "extent-index preparation failed: {error}; suffix rollback failed: {rollback}"
+                        )));
+                    },
+                }
             }
             Err(error)
         },

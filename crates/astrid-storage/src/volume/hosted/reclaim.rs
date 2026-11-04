@@ -171,15 +171,20 @@ pub(super) fn reclaim_locked(path: &Path, state: &mut ContainerState) -> io::Res
         last_snapshot_end: 0,
         boundary_pending: false,
         footer_pending: true,
+        physical_tail: super::PhysicalTail::Exact,
         flush_state: super::FlushState::Required,
         publication_pending: false,
         #[cfg(windows)]
         restore: super::RestoreState::NotRequired,
         regions: BTreeMap::new(),
     };
+    // Magic is a file mutation: mark uncertain before the write, Exact only after
+    // valid_len catches up to the published header.
+    rebuilt.physical_tail = super::PhysicalTail::MayExceed;
     rebuilt.file.write_all(&VOLUME_MAGIC)?;
     rebuilt.valid_len = u64::try_from(VOLUME_MAGIC.len())
         .map_err(|_| io::Error::other("volume header length overflow"))?;
+    rebuilt.physical_tail = super::PhysicalTail::Exact;
     for (region, source) in &state.regions {
         HostedFileVolume::append(&mut rebuilt, Operation::Create, region, 0, &[])?;
         rebuilt

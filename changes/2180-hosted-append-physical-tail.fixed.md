@@ -1,0 +1,1 @@
+Skip redundant hosted-volume append preparation truncations once the process-local physical tail is proven exact, while retaining truncate-before-write after footers, partial plain failures, stream rollback uncertainty, and reclaim handle replacement.
