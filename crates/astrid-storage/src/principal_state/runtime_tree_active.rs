@@ -5,6 +5,7 @@
 //! projection and authorizes reconciliation. RETIRING is a durable inventory
 //! publication and never infers deletions from a partially retired host.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -226,6 +227,7 @@ pub(super) fn removals(
     if receipt.phase != ReceiptPhase::Active {
         return Ok(Vec::new());
     }
+    let surviving = surviving.iter().collect::<BTreeSet<_>>();
     receipt
         .entries
         .iter()
@@ -306,4 +308,47 @@ fn receipt_error(
 
 fn tree_error(path: &Path, detail: impl std::fmt::Display) -> StorageError {
     StorageError::Connection(format!("runtime tree {}: {detail}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn receipt(phase: ReceiptPhase, names: &[&str]) -> ActiveProjectionReceipt {
+        ActiveProjectionReceipt {
+            schema: RECEIPT_SCHEMA,
+            phase,
+            root: String::new(),
+            entries: names
+                .iter()
+                .map(|name| ActiveReceiptEntry {
+                    name: (*name).to_owned(),
+                    file: String::new(),
+                    logical_bytes: 0,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn removals_preserve_receipt_order_with_duplicate_survivors() {
+        let receipt = receipt(ReceiptPhase::Active, &["removed-b", "kept", "removed-a"]);
+        let surviving = ["unreceipted", "kept", "kept"].map(|name| ContentName::new(name).unwrap());
+        let removed = removals(&receipt, &surviving).unwrap();
+        assert_eq!(
+            removed.iter().map(ContentName::as_str).collect::<Vec<_>>(),
+            ["removed-b", "removed-a"]
+        );
+    }
+
+    #[test]
+    fn removals_reject_invalid_active_names_and_do_not_reconcile_retiring() {
+        let surviving = [ContentName::new("kept").unwrap()];
+        for invalid in ["", "nul\0name"] {
+            let active = receipt(ReceiptPhase::Active, &["kept", invalid]);
+            assert!(removals(&active, &surviving).is_err());
+            let retiring = receipt(ReceiptPhase::Retiring, &["kept", invalid]);
+            assert!(removals(&retiring, &surviving).unwrap().is_empty());
+        }
+    }
 }
