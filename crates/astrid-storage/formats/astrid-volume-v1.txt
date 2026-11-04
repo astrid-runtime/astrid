@@ -144,6 +144,19 @@ end cannot exceed the region length. Recovery validates every reachable page,
 its record identity, checksum, framing and exact subtree summary before
 publishing the recovered namespace; validating only the catalogue is invalid.
 
+Within one checkpoint, every selected physical page-record interval is
+exclusively owned: no two references, within or across regions, may select
+the same or overlapping record bytes. Distinct records with identical page
+contents are valid, and successive checkpoints may reuse earlier pages.
+
+Canonical writers emit operation-9 pages as top-level ASTREG1 records. Bounded
+footer recovery validates the complete locally framed page envelope at each
+referenced offset under the selected checkpoint's authority; it does not scan
+historical operations to prove top-level record-start membership. The offline
+full-history reader additionally checks that membership against its sequential
+record inventory. This distinction preserves bounded checkpoint recovery and
+does not replace any reachable-page or bounded-tail integrity check.
+
 Each ASTXPG1 page payload is exactly 4096 bytes. Bytes 0..8 are "ASTXPG1" plus
 NUL; byte 8 is level; bytes 9..12 are zero; bytes 12..14 are u16 entry count;
 bytes 14..16 are zero. Entries start at byte 16, and unused bytes are zero.
