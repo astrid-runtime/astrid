@@ -84,7 +84,7 @@ enum FlushState {
 }
 
 /// Process-local proof that the owned handle's physical end matches `valid_len`.
-/// Independent of footer_pending / flush_state / durability acknowledgements.
+/// Independent of `footer_pending`, `flush_state` and durability acknowledgements.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PhysicalTail {
     Exact,
@@ -164,7 +164,7 @@ impl HostedFileVolume {
     }
 
     /// Clear flush proof, ensure the previous physical tail is discarded when
-    /// needed, seek to valid_len, then mark MayExceed before any record write.
+    /// needed, seek to `valid_len`, then mark `MayExceed` before any record write.
     fn prepare_append(state: &mut ContainerState) -> io::Result<()> {
         state.flush_state = FlushState::Required;
         state.footer_pending = true;

@@ -3,7 +3,7 @@
 //! Checksum lives in the record header. This hashes while copying, then
 //! patches the checksum slot. The on-disk grammar is unchanged.
 
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom};
 #[cfg(test)]
 use std::path::Path;
 
