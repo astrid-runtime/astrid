@@ -163,7 +163,7 @@ fn partial_plain_write_failure_stays_uncertain_and_smaller_retry_reopens() {
     );
     let torn = super::test_support::read_container(&volume);
     assert!(
-        torn[valid_torn as usize..]
+        torn[usize::try_from(valid_torn).unwrap()..]
             .windows(8)
             .any(|window| window == b"long-pay"),
         "owned-handle suffix must retain the torn payload prefix before retry"
