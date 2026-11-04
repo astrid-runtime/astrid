@@ -490,7 +490,10 @@ pub(super) fn validate_representations(
                 "direct representation placement does not match its record",
             ));
         }
-        reverse.entry(object).or_default().push(id);
+        reverse
+            .entry(object)
+            .or_insert_with(|| Vec::with_capacity(1))
+            .push(id);
     }
     Ok((reverse, extent_count))
 }

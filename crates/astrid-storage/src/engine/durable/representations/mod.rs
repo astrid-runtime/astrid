@@ -671,7 +671,10 @@ impl RepresentationStore {
             self.reverse = replacement;
         } else {
             for (object, representation) in update.reverse_additions {
-                self.reverse.entry(object).or_default().push(representation);
+                self.reverse
+                    .entry(object)
+                    .or_insert_with(|| Vec::with_capacity(1))
+                    .push(representation);
             }
         }
         // These maps came from canonical recovery or checked model mutations.

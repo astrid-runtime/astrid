@@ -1,4 +1,9 @@
 use super::super::{ArenaLocation, ObjectId, open_store_root};
+use super::super::{
+    CanonicalPhysicalMap, Coverage, DirectArenaObject, LOCAL_STORAGE_NODE, PhysicalMapDomain,
+    PhysicalMapKey, PlacementEntry, Recipe, Replica, ReplicaLocator, RepresentationRecord,
+    RepresentationRecordId, activation, validate_representations,
+};
 use super::*;
 use crate::volume::{AstridVolume, HostedFileVolume};
 use std::sync::Arc;
@@ -247,4 +252,169 @@ fn recovered_maps_retain_only_their_active_closures() {
     assert_eq!(reopened.active, active);
     assert_eq!(reopened.reverse, reverse);
     assert_eq!(reopened.placement_entries.nodes().len(), 1);
+}
+fn capacity_fixture_objects(store: &RepresentationStore) -> Vec<DirectArenaObject> {
+    (1_u8..=3)
+        .map(|value| {
+            store
+                .describe_direct(
+                    ObjectId::new([value; 32]),
+                    &[value; 8],
+                    ArenaLocation {
+                        offset: u64::from(value).strict_mul(128),
+                        payload_len: 8,
+                        checksum: [value; 32],
+                    },
+                )
+                .unwrap()
+        })
+        .collect()
+}
+
+fn assert_singleton_reverse_capacity(store: &RepresentationStore) {
+    assert_eq!(size_of::<RepresentationRecordId>(), 32);
+    assert_eq!(store.reverse.len(), 3);
+    for value in 1_u8..=3 {
+        let ids = &store.reverse[&ObjectId::new([value; 32])];
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids.capacity(), 1, "singleton reverse index has spare slots");
+        assert!(store.contains_direct(ObjectId::new([value; 32])));
+    }
+}
+
+#[test]
+fn reverse_capacity_live_volume_publication_does_not_reserve_unused_alternates() {
+    let directory = tempfile::tempdir().unwrap();
+    let volume: Arc<dyn AstridVolume> =
+        HostedFileVolume::open(directory.path().join("capacity.volume")).unwrap();
+    let limits = RecoveryLimits::process_addressable();
+    let mut store =
+        RepresentationStore::activate_volume(&volume, limits, ObjectId::new([9; 32]), []).unwrap();
+    let objects = capacity_fixture_objects(&store);
+    let update = store.append_direct_update(&objects).unwrap().unwrap();
+    let expected = update.state_id;
+    store.publish_direct_update(update).unwrap();
+    assert_eq!(store.active, expected);
+    // Check before checkpoint/reopen so the live insertion path is covered.
+    assert_singleton_reverse_capacity(&store);
+    let reverse = store.reverse.clone();
+    store.checkpoint_volume(&volume, limits).unwrap();
+    assert_eq!(store.active, expected);
+    assert_eq!(store.reverse, reverse);
+    assert_singleton_reverse_capacity(&store);
+}
+
+#[test]
+fn reverse_capacity_volume_reopen_preserves_tight_singleton_lists() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("capacity.volume");
+    let volume: Arc<dyn AstridVolume> = HostedFileVolume::open(&path).unwrap();
+    let limits = RecoveryLimits::process_addressable();
+    let mut store =
+        RepresentationStore::activate_volume(&volume, limits, ObjectId::new([9; 32]), []).unwrap();
+    let objects = capacity_fixture_objects(&store);
+    // Rebase already constructs tight lists; recovery must not inflate them.
+    store.rebase_all_direct(&objects).unwrap();
+    assert_singleton_reverse_capacity(&store);
+    let active = store.active;
+    let reverse = store.reverse.clone();
+    drop(store);
+    drop(volume);
+    let volume: Arc<dyn AstridVolume> = HostedFileVolume::open(&path).unwrap();
+    let store = RepresentationStore::open_volume(&volume, limits)
+        .unwrap()
+        .unwrap();
+    assert_eq!(store.active, active);
+    assert_eq!(store.reverse, reverse);
+    assert_singleton_reverse_capacity(&store);
+}
+
+#[test]
+fn reverse_capacity_native_publication_checkpoint_and_reopen_preserve_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = open_store_root(directory.path()).unwrap();
+    let limits = RecoveryLimits::process_addressable();
+    let mut store =
+        RepresentationStore::activate(&root, limits, ObjectId::new([9; 32]), []).unwrap();
+    let objects = capacity_fixture_objects(&store);
+    let update = store.append_direct_update(&objects).unwrap().unwrap();
+    store.publish_direct_update(update).unwrap();
+    assert_singleton_reverse_capacity(&store);
+    let active = store.active;
+    let reverse = store.reverse.clone();
+    store.checkpoint_native(&root, limits).unwrap();
+    assert_singleton_reverse_capacity(&store);
+    drop(store);
+    let store = RepresentationStore::open(&root, limits).unwrap().unwrap();
+    assert_eq!(store.active, active);
+    assert_eq!(store.reverse, reverse);
+    assert_singleton_reverse_capacity(&store);
+}
+
+#[test]
+fn reverse_capacity_validation_preserves_alternate_records_and_all_replicas() {
+    let (profile, profile_id) = activation::direct_profile(ObjectId::new([9; 32])).unwrap();
+    let object = ObjectId::new([1; 32]);
+    let blob = crate::storage_model::BlobId::identify(&Blake3PhysicalIdentity, profile_id, &[1; 8])
+        .unwrap();
+    let mut ids = Vec::new();
+    let mut entries = Vec::new();
+    for maximum in [8, 9] {
+        let record = RepresentationRecord::new(
+            profile_id,
+            Coverage::exact(object, 8).unwrap(),
+            Recipe::DirectCanonical { blob },
+            8,
+            maximum,
+            None,
+        )
+        .unwrap();
+        record
+            .validate_against_profile(&Blake3PhysicalIdentity, &profile)
+            .unwrap();
+        let id = record.identify(&Blake3PhysicalIdentity).unwrap();
+        ids.push(id);
+        entries.push((PhysicalMapKey::from(id), record.encode().unwrap()));
+    }
+    let replicas = [128, 256]
+        .into_iter()
+        .map(|offset| {
+            Replica::new(
+                LOCAL_STORAGE_NODE,
+                ReplicaLocator::ArenaFrame {
+                    arena_generation: 0,
+                    offset,
+                    payload_length: 8,
+                    frame_checksum: [1; 32],
+                },
+            )
+            .unwrap()
+        })
+        .collect();
+    let placement = PlacementEntry::new(blob, profile_id, 8, replicas).unwrap();
+    let profiles = CanonicalPhysicalMap::build_dense(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Profile,
+        vec![(PhysicalMapKey::from(profile_id), profile.encode().unwrap())],
+    )
+    .unwrap();
+    let representations = CanonicalPhysicalMap::build_dense(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Representation,
+        entries,
+    )
+    .unwrap();
+    let placements = CanonicalPhysicalMap::build_dense(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Placement,
+        vec![(PhysicalMapKey::from(blob), placement.encode().unwrap())],
+    )
+    .unwrap();
+    let (reverse, extent_count) =
+        validate_representations(&profiles, &representations, &placements).unwrap();
+    ids.sort_unstable();
+    assert_eq!(reverse.len(), 1);
+    assert_eq!(reverse[&object], ids);
+    assert_eq!(extent_count, 2);
+    assert_eq!(placement.replicas().len(), 2);
 }
