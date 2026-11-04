@@ -1,8 +1,14 @@
 //! The single fail-closed boundary for retiring an Astrid runtime projection.
 
+#[cfg(not(unix))]
 use std::fs::File;
 use std::io;
 use std::path::Path;
+
+#[cfg(all(test, unix))]
+mod tests;
+#[cfg(unix)]
+mod unix;
 
 const CANONICAL_VOLUME: &str = "astrid.volume";
 
@@ -19,6 +25,18 @@ const CANONICAL_VOLUME: &str = "astrid.volume";
 /// leaves the tree untouched; a mid-retire error leaves the durable volume as
 /// the recovery authority.
 pub fn retire_projection_root(root: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        unix::retire(root)
+    }
+    #[cfg(not(unix))]
+    {
+        retire_by_path(root)
+    }
+}
+
+#[cfg(not(unix))]
+fn retire_by_path(root: &Path) -> io::Result<()> {
     preflight_projection_entry(root)?;
     let mut entries = std::fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
@@ -38,6 +56,7 @@ pub fn retire_projection_root(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
 fn preflight_projection_entry(path: &Path) -> io::Result<()> {
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {

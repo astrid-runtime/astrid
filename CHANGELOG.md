@@ -8,6 +8,10 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ## [Unreleased]
 
+### Fixed
+
+- Retire packed Unix runtime projections through retained directory handles, avoiding repeated absolute ancestor walks while preserving full-tree validation, mount boundaries and every directory durability barrier. Closes #2212.
+
 ## [2026.10.1] - 2026-10-15
 
 ### Fixed

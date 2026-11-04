@@ -287,6 +287,18 @@ jobs:
           linux_native_fuse_mount_supports_all_required_operations --
           --ignored --nocapture
 
+      - name: Reject runtime projection bind mounts in a private namespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_binary=$(cargo test --locked -p astrid-core --lib --no-run --message-format=json | python3 -c '
+          import json, sys
+          paths = [m["executable"] for line in sys.stdin if (m := json.loads(line)).get("executable") and m.get("target", {}).get("name") == "astrid_core" and m.get("profile", {}).get("test")]
+          assert len(paths) == 1, paths
+          print(paths[0])')
+          sudo unshare --mount --propagation private -- "$test_binary" \
+            dirs::projection_retirement::unix::mount_tests:: --ignored --nocapture --test-threads=1
+
   check:
     name: Check
     runs-on: ubuntu-latest

@@ -660,6 +660,19 @@ fn atomic_write_private_file_unix(path: &Path, bytes: &[u8]) -> io::Result<()> {
     validate_private_file(path)
 }
 
+/// Open the requested directory itself, rejecting missing tails and redirects.
+#[cfg(unix)]
+pub(crate) fn open_existing_directory_no_follow(path: &Path) -> io::Result<std::fs::File> {
+    let (directory, missing) = unix_directory_walk(path)?;
+    if !missing.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("directory does not exist: {}", path.display()),
+        ));
+    }
+    Ok(directory)
+}
+
 #[cfg(unix)]
 fn open_directory_no_follow_unix(path: &Path) -> io::Result<std::fs::File> {
     let (directory, _) = unix_directory_walk(path)?;
