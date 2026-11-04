@@ -1,9 +1,8 @@
-//! Canonical validation and proven reads must avoid redundant allocations.
+//! Canonical validation, rebuild and proven reads avoid redundant allocations.
 #![cfg(not(target_family = "wasm"))]
 
 use astrid_storage::storage_model::{
-    CanonicalPhysicalMap, ObjectId, ObjectRecord, PhysicalIdentity, PhysicalMapDomain,
-    PhysicalMapKey,
+    CanonicalPhysicalMap, ObjectId, ObjectRecord, PhysicalIdentity, PhysicalMapDomain, PhysicalMapKey,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -11,8 +10,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 thread_local! {
-    // Account only allocations inside the invoking validation call. Input
-    // ownership outlives that call; the harness and other threads are excluded.
+    // Account only allocations inside the invoking validation/rebuild call.
+    // Input ownership outlives that call; the harness and other threads are
+    // excluded. Additions measured under rebuild must be allocated inside the
+    // window so their later drop cannot underflow a zero live counter.
     static ACCOUNTING: Cell<Option<(usize, usize, usize)>> = const { Cell::new(None) };
     static INVALID_ACCOUNTING: Cell<bool> = const { Cell::new(false) };
 }
@@ -86,32 +87,25 @@ impl Drop for ResetAccounting {
     }
 }
 
-fn validate_without_retaining_input_payloads(dense: bool) {
-    let count = 128_usize;
-    let value_bytes = 64 * 1024_usize;
-    let entries = (0..count)
+const LARGE_COUNT: usize = 128;
+const LARGE_VALUE_BYTES: usize = 64 * 1024;
+
+fn large_entries() -> Vec<(PhysicalMapKey, Vec<u8>)> {
+    (0..LARGE_COUNT)
         .map(|index| {
             (
                 PhysicalMapKey::new(*blake3::hash(&index.to_le_bytes()).as_bytes()),
-                vec![0x5a; value_bytes],
+                vec![0x5a; LARGE_VALUE_BYTES],
             )
         })
-        .collect();
-    let map = if dense {
-        CanonicalPhysicalMap::build_dense(&Identity, PhysicalMapDomain::Placement, entries)
-    } else {
-        CanonicalPhysicalMap::build(&Identity, PhysicalMapDomain::Placement, entries)
-    }
-    .unwrap();
+        .collect()
+}
+
+fn measure_peak<R>(body: impl FnOnce() -> R) -> (R, usize) {
     INVALID_ACCOUNTING.set(false);
     ACCOUNTING.set(Some((0, 0, 0)));
     let reset = ResetAccounting;
-    let result = CanonicalPhysicalMap::validate_root(
-        &Identity,
-        PhysicalMapDomain::Placement,
-        map.root(),
-        map.nodes(),
-    );
+    let result = body();
     let accounting = ACCOUNTING.get();
     let invalid = INVALID_ACCOUNTING.get();
     drop(reset);
@@ -119,13 +113,66 @@ fn validate_without_retaining_input_payloads(dense: bool) {
         !invalid,
         "temporary allocation accounting overflowed or underflowed"
     );
-    let (_, peak, _) = accounting.unwrap();
-    assert_eq!(result.unwrap(), u64::try_from(count).unwrap());
+    let (_, peak, _) = accounting.expect("accounting active");
+    (result, peak)
+}
+
+fn validate_without_retaining_input_payloads(dense: bool) {
+    let entries = large_entries();
+    let map = if dense {
+        CanonicalPhysicalMap::build_dense(&Identity, PhysicalMapDomain::Placement, entries)
+    } else {
+        CanonicalPhysicalMap::build(&Identity, PhysicalMapDomain::Placement, entries)
+    }
+    .unwrap();
+    let (result, peak) = measure_peak(|| {
+        CanonicalPhysicalMap::validate_root(
+            &Identity,
+            PhysicalMapDomain::Placement,
+            map.root(),
+            map.nodes(),
+        )
+    });
+    assert_eq!(result.unwrap(), u64::try_from(LARGE_COUNT).unwrap());
     // Room for transient node encoding, traversal sets and allocator rounding;
     // a second full input payload set alone exceeds this bound eightfold.
     assert!(
-        peak < count * value_bytes / 8,
+        peak < LARGE_COUNT * LARGE_VALUE_BYTES / 8,
         "validation retained {peak} temporary bytes"
+    );
+}
+
+fn rebuild_without_cloning_existing_payloads(dense: bool) {
+    // Existing map + its large payloads are allocated before accounting so the
+    // measured window only sees rebuild scratch and the single new addition.
+    let mut map = if dense {
+        CanonicalPhysicalMap::build_dense(&Identity, PhysicalMapDomain::Placement, large_entries())
+    } else {
+        CanonicalPhysicalMap::build(&Identity, PhysicalMapDomain::Placement, large_entries())
+    }
+    .unwrap();
+    let before_root = map.root();
+    let before_count = map.entry_count();
+    let before_nodes = map.nodes().len();
+
+    let (inserted, peak) = measure_peak(|| {
+        // Allocate the addition inside the window. Creating it beforehand and
+        // dropping/moving it here would underflow the live counter.
+        let addition_key =
+            PhysicalMapKey::new(*blake3::hash(&LARGE_COUNT.to_le_bytes()).as_bytes());
+        let additions = vec![(addition_key, vec![0xa5; LARGE_VALUE_BYTES])];
+        map.rebuild_with_entries(&Identity, additions)
+    });
+    assert_eq!(inserted.unwrap(), 1);
+    assert_ne!(map.root(), before_root);
+    assert_eq!(map.entry_count(), before_count.strict_add(1));
+    assert!(map.nodes().len() > before_nodes);
+    // Leaf encode scratch + a small new-path node set stay well under one
+    // eighth of the pre-existing payload mass. The old rebuild cloned every
+    // existing 64 KiB leaf into an owned entries map and clearly exceeds it.
+    assert!(
+        peak < LARGE_COUNT * LARGE_VALUE_BYTES / 8,
+        "rebuild retained {peak} temporary bytes"
     );
 }
 
@@ -137,6 +184,16 @@ fn legacy_canonical_validation_borrows_the_complete_input_payload_set() {
 #[test]
 fn dense_canonical_validation_borrows_the_complete_input_payload_set() {
     validate_without_retaining_input_payloads(true);
+}
+
+#[test]
+fn legacy_canonical_rebuild_borrows_existing_payloads() {
+    rebuild_without_cloning_existing_payloads(false);
+}
+
+#[test]
+fn dense_canonical_rebuild_borrows_existing_payloads() {
+    rebuild_without_cloning_existing_payloads(true);
 }
 
 struct ResidentContent(BTreeMap<ObjectId, Arc<ObjectRecord>>);
