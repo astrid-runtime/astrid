@@ -4,19 +4,6 @@ use astrid_core::local_transport::{self, LocalListener};
 use astrid_core::session_token::SessionToken;
 use tracing::warn;
 
-/// Path to the local Unix Domain Socket for the kernel.
-#[must_use]
-pub(crate) fn kernel_socket_path() -> PathBuf {
-    use astrid_core::dirs::AstridHome;
-    match AstridHome::resolve() {
-        Ok(home) => home.socket_path(),
-        Err(e) => {
-            warn!(error = %e, "Failed to resolve ASTRID_HOME; falling back to /tmp/.astrid/run/system.sock");
-            PathBuf::from("/tmp/.astrid/run/system.sock")
-        },
-    }
-}
-
 /// Create the daemon run directory (the parent of the socket and lockfile)
 /// with `0o700` perms.
 ///

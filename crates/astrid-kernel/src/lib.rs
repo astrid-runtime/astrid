@@ -518,8 +518,11 @@ pub struct KernelResources {
     /// Session token for socket authentication, generated at boot and written
     /// to `~/.astrid/run/system.token`. The CLI presents it as its first message.
     pub session_token: Arc<astrid_core::session_token::SessionToken>,
-    /// Path the session token was written to, retained so shutdown reuses the
-    /// exact same path (avoids a fallback mismatch if the environment changes).
+    /// Absolute session-token path captured when the runtime was admitted.
+    /// Its parent is the runtime directory owned by this kernel: the socket,
+    /// readiness sentinel and PID file must be canonical siblings there.
+    /// Shutdown retires these captured paths without re-resolving environment
+    /// overrides. Hosts must keep boot-time path resolution consistent.
     pub token_path: PathBuf,
     /// The natively bound Unix listener for the CLI uplink, or `None` for hosts
     /// (and test kernels) that do not service a real socket.

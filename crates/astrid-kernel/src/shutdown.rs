@@ -109,14 +109,17 @@ impl Kernel {
         // socket/PID/readiness files it manages) exist only on that profile.
         #[cfg(unix)]
         {
+            use astrid_core::dirs::AstridHome;
+
             // The token captures the admitted runtime directory at boot. Never
             // resolve process-wide environment paths again during teardown: an
             // embedded kernel or changed override may refer to another runtime.
-            let socket_path = self.token_path.with_file_name("system.sock");
+            let socket_path = self.token_path.with_file_name(AstridHome::SOCKET_FILE_NAME);
             let _ = astrid_core::local_transport::remove_endpoint(&socket_path);
             let _ = std::fs::remove_file(&self.token_path);
-            let _ = std::fs::remove_file(self.token_path.with_file_name("system.ready"));
-            let _ = std::fs::remove_file(self.token_path.with_file_name("system.pid"));
+            let _ =
+                std::fs::remove_file(self.token_path.with_file_name(AstridHome::READY_FILE_NAME));
+            let _ = std::fs::remove_file(self.token_path.with_file_name(AstridHome::PID_FILE_NAME));
         }
 
         tracing::info!("Kernel shutdown complete");

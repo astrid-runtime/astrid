@@ -432,6 +432,9 @@ async fn shutdown_retires_only_boot_captured_runtime_files() {
             kernel.shutdown(None).await;
         }
 
+        // The primary falsifier is removal of the captured files: ambient
+        // ASTRID_HOME differs from this fixture. The independent root also
+        // guards against collateral cleanup without mutating process-wide env.
         for name in ["system.sock", "system.token", "system.ready", "system.pid"] {
             assert!(
                 !kernel.token_path.with_file_name(name).exists(),
