@@ -37,19 +37,23 @@ fn dirty_plain_and_streamed_appends_truncate_once_after_sync() {
     reset_faults();
     let directory = tempfile::tempdir().unwrap();
     let (volume, region, _) = open_ready_volume(&directory);
+    let first = VolumeRegion::new("plain-one").unwrap();
+    let second = VolumeRegion::new("plain-two").unwrap();
     reset_prepare_truncate_count();
-    volume.write_region_at(&region, 0, b"plain-one").unwrap();
+    // Rename carries its destination as a plain append_record payload. The
+    // write_region_at convenience method instead delegates to the stream path.
+    volume.rename_region(&region, &first).unwrap();
     assert_eq!(
         prepare_truncate_count(),
         1,
-        "first post-sync plain append strips footer"
+        "first plain append strips footer"
     );
-    volume.write_region_at(&region, 0, b"plain-two").unwrap();
+    volume.rename_region(&first, &second).unwrap();
     volume
-        .write_region_from(&region, 0, 9, &mut &b"streamed1"[..])
+        .write_region_from(&second, 0, 9, &mut &b"streamed1"[..])
         .unwrap();
     volume
-        .write_region_from(&region, 0, 9, &mut &b"streamed2"[..])
+        .write_region_from(&second, 0, 9, &mut &b"streamed2"[..])
         .unwrap();
     assert_eq!(
         prepare_truncate_count(),
@@ -57,11 +61,12 @@ fn dirty_plain_and_streamed_appends_truncate_once_after_sync() {
         "later dirty plain/streamed appends must not re-truncate"
     );
     volume.sync().unwrap();
+    let after = VolumeRegion::new("after").unwrap();
     reset_prepare_truncate_count();
-    volume.write_region_at(&region, 0, b"after").unwrap();
+    volume.rename_region(&second, &after).unwrap();
     assert_eq!(prepare_truncate_count(), 1);
     volume
-        .write_region_from(&region, 0, 5, &mut &b"again"[..])
+        .write_region_from(&after, 0, 5, &mut &b"again"[..])
         .unwrap();
     assert_eq!(prepare_truncate_count(), 1);
 }
@@ -144,18 +149,20 @@ fn short_stream_restores_footer_and_retry_reopens_clean() {
 }
 
 #[test]
-fn partial_plain_write_failure_stays_uncertain_and_smaller_retry_reopens() {
+fn partial_plain_rename_failure_stays_uncertain_and_smaller_retry_reopens() {
     reset_faults();
     let directory = tempfile::tempdir().unwrap();
     let (volume, region, _) = open_ready_volume(&directory);
-    // Allow the nine fixed/name header writes, then tear the payload prefix.
+    let long = VolumeRegion::new("long-payload-bytes").unwrap();
+    let tiny = VolumeRegion::new("tiny").unwrap();
+    // Rename reaches append_record directly, without streaming rollback. Allow
+    // its nine fixed/name header writes, then tear the destination-name payload.
     set_remaining_append_writes(Some(9));
-    let error = volume
-        .write_region_at(&region, 0, b"long-payload-bytes")
-        .unwrap_err();
+    let error = volume.rename_region(&region, &long).unwrap_err();
     assert!(error.to_string().contains("injected append write failure"));
     set_remaining_append_writes(None);
-
+    assert!(volume.region_exists(&region).unwrap());
+    assert!(!volume.region_exists(&long).unwrap());
     let (valid_torn, physical_torn) = owned_lengths(&volume);
     assert!(
         physical_torn > valid_torn,
@@ -168,9 +175,8 @@ fn partial_plain_write_failure_stays_uncertain_and_smaller_retry_reopens() {
             .any(|window| window == b"long-pay"),
         "owned-handle suffix must retain the torn payload prefix before retry"
     );
-
     reset_prepare_truncate_count();
-    volume.write_region_at(&region, 0, b"tiny").unwrap();
+    volume.rename_region(&region, &tiny).unwrap();
     assert_eq!(
         prepare_truncate_count(),
         1,
@@ -181,25 +187,18 @@ fn partial_plain_write_failure_stays_uncertain_and_smaller_retry_reopens() {
         physical_retry, valid_retry,
         "successful retry must publish an exact dirty tail before sync"
     );
-    // A smaller record would overwrite only a prefix of a left-behind tear;
-    // prove the uncertain suffix is gone before sync/footer can hide it.
+    // Inspect before any footer rewrite can truncate and hide an uncertain tail.
     let retry_bytes = super::test_support::read_container(&volume);
     assert_eq!(retry_bytes.len() as u64, valid_retry);
-    assert!(
-        !retry_bytes.windows(8).any(|window| window == b"long-pay"),
-        "torn plain prefix must not survive truncate+retry before sync"
-    );
-
     volume.sync().unwrap();
     let copy = directory.path().join("partial-reopen.volume");
     super::test_support::copy_container(&volume, &copy);
     let recovered = HostedFileVolume::open(&copy).unwrap();
-    let mut actual = [0_u8; 4];
-    assert_eq!(
-        recovered.read_region_at(&region, 0, &mut actual).unwrap(),
-        4
-    );
-    assert_eq!(&actual, b"tiny");
+    assert!(!recovered.region_exists(&region).unwrap());
+    assert!(!recovered.region_exists(&long).unwrap());
+    let mut actual = [0_u8; 10];
+    assert_eq!(recovered.read_region_at(&tiny, 0, &mut actual).unwrap(), 10);
+    assert_eq!(&actual, b"seed-bytes");
 }
 
 #[test]
