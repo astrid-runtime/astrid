@@ -241,3 +241,36 @@ fn borrowed_decode_rejects_aliases_impossible_counts_and_unused_prefix_bits() {
         assert_rejected(&node.encode().unwrap());
     }
 }
+
+#[test]
+fn canonical_node_wire_vectors_cover_owned_and_borrowed_encoders() {
+    let domain = PhysicalMapDomain::Representation;
+    let key = PhysicalMapKey::new([0x11; 32]);
+    let zero = PhysicalMapNodeId::new([0x22; 32]);
+    let one = PhysicalMapNodeId::new([0x33; 32]);
+    let nodes = [
+        PhysicalMapNode::leaf(domain, key, b"abc".to_vec()),
+        PhysicalMapNode::branch(domain, 1, vec![0x80], zero, one, 2).unwrap(),
+        PhysicalMapNode::page(domain, vec![(key, b"abc".to_vec())]).unwrap(),
+        PhysicalMapNode::radix(domain, 1, vec![0x80], 3, vec![zero, one], 2).unwrap(),
+    ];
+    // Frozen format-one and format-two bytes, independent of either encoder.
+    let vectors = [
+        "01000100010002002000000011111111111111111111111111111111111111111111111111111111111111110300000000000000616263",
+        "01000101010000008001000200200000002222222222222222222222222222222222222222222222222222222222222222010002002000000033333333333333333333333333333333333333333333333333333333333333330200000000000000",
+        "0200010001010002002000000011111111111111111111111111111111111111111111111111111111111111110300000000000000616263",
+        "020001010180030001000200200000002222222222222222222222222222222222222222222222222222222222222222010002002000000033333333333333333333333333333333333333333333333333333333333333330200000000000000",
+    ];
+    for (node, vector) in nodes.into_iter().zip(vectors) {
+        let expected = hex::decode(vector).unwrap();
+        assert_eq!(node.encode().unwrap(), expected);
+        let actual = decode::with_decoded(&expected, |view| {
+            let mut encoder = Encoder::new();
+            view.encode_into(&mut encoder).unwrap();
+            encoder.finish()
+        })
+        .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(PhysicalMapNode::decode(&expected).unwrap(), node);
+    }
+}

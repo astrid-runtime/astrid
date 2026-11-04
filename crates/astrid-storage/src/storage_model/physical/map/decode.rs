@@ -1,17 +1,15 @@
 //! One canonical grammar, with values borrowed until an owned node is required.
 
-use super::super::codec::Decoder;
-use super::super::identity::{
-    decode_map_node_id, decode_physical_digest, encode_map_node_id, encode_physical_digest,
-};
+use super::super::codec::{Decoder, Encoder, EncodingSink};
+use super::super::identity::{decode_map_node_id, decode_physical_digest};
 use super::{
-    Encoder, EncodingSink, LEGACY_MAP_NODE_VERSION, PhysicalMapDomain, PhysicalMapKey,
-    PhysicalMapNode, PhysicalMapNodeId, PhysicalModelError, RADIX_MAP_NODE_VERSION,
-    RADIX_PAGE_CAPACITY, Vec, legacy, nibble_prefix_byte_len, validate_page, validate_radix,
+    LEGACY_MAP_NODE_VERSION, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode, PhysicalMapNodeId,
+    PhysicalModelError, RADIX_MAP_NODE_VERSION, RADIX_PAGE_CAPACITY, Vec, legacy,
+    nibble_prefix_byte_len, validate_page, validate_radix,
 };
 
 #[derive(Clone, Copy)]
-pub(super) enum MapNodeView<'a, V: AsRef<[u8]>> {
+pub(super) enum MapNodeView<'a> {
     Leaf {
         domain: PhysicalMapDomain,
         key: PhysicalMapKey,
@@ -27,7 +25,7 @@ pub(super) enum MapNodeView<'a, V: AsRef<[u8]>> {
     },
     Page {
         domain: PhysicalMapDomain,
-        entries: &'a [(PhysicalMapKey, V)],
+        entries: &'a [(PhysicalMapKey, &'a [u8])],
     },
     Radix {
         domain: PhysicalMapDomain,
@@ -39,53 +37,7 @@ pub(super) enum MapNodeView<'a, V: AsRef<[u8]>> {
     },
 }
 
-impl<'a> MapNodeView<'a, Vec<u8>> {
-    pub(super) fn from_owned(node: &'a PhysicalMapNode) -> Self {
-        match node {
-            PhysicalMapNode::Leaf { domain, key, value } => Self::Leaf {
-                domain: *domain,
-                key: *key,
-                value,
-            },
-            PhysicalMapNode::Branch {
-                domain,
-                prefix_bits,
-                prefix,
-                zero,
-                one,
-                subtree_entries,
-            } => Self::Branch {
-                domain: *domain,
-                prefix_bits: *prefix_bits,
-                prefix,
-                zero: *zero,
-                one: *one,
-                subtree_entries: *subtree_entries,
-            },
-            PhysicalMapNode::Page { domain, entries } => Self::Page {
-                domain: *domain,
-                entries,
-            },
-            PhysicalMapNode::Radix {
-                domain,
-                prefix_nibbles,
-                prefix,
-                child_bitmap,
-                children,
-                subtree_entries,
-            } => Self::Radix {
-                domain: *domain,
-                prefix_nibbles: *prefix_nibbles,
-                prefix,
-                child_bitmap: *child_bitmap,
-                children,
-                subtree_entries: *subtree_entries,
-            },
-        }
-    }
-}
-
-impl<V: AsRef<[u8]>> MapNodeView<'_, V> {
+impl MapNodeView<'_> {
     #[cfg(any(test, not(target_family = "wasm")))]
     pub(super) const fn identity_context(&self) -> &'static str {
         match self {
@@ -107,67 +59,51 @@ impl<V: AsRef<[u8]>> MapNodeView<'_, V> {
         &self,
         encoder: &mut Encoder<W>,
     ) -> Result<(), PhysicalModelError> {
-        let (domain, version, tag) = match self {
-            Self::Leaf { domain, .. } => (*domain, LEGACY_MAP_NODE_VERSION, 0),
-            Self::Branch { domain, .. } => (*domain, LEGACY_MAP_NODE_VERSION, 1),
-            Self::Page { domain, .. } => (*domain, RADIX_MAP_NODE_VERSION, 0),
-            Self::Radix { domain, .. } => (*domain, RADIX_MAP_NODE_VERSION, 1),
-        };
-        encoder.u16(version);
-        encoder.u8(domain.code());
-        encoder.u8(tag);
         match self {
-            Self::Leaf { key, value, .. } => {
-                encode_physical_digest(encoder, key.as_bytes());
-                encoder.bytes(value)?;
-            },
+            Self::Leaf { domain, key, value } => super::encode::leaf(*domain, key, value, encoder)?,
             Self::Branch {
+                domain,
                 prefix_bits,
                 prefix,
                 zero,
                 one,
                 subtree_entries,
-                ..
             } => {
-                encoder.u32(*prefix_bits);
-                encoder.raw(prefix);
-                encode_map_node_id(encoder, *zero);
-                encode_map_node_id(encoder, *one);
-                encoder.u64(*subtree_entries);
+                super::encode::branch(
+                    *domain,
+                    *prefix_bits,
+                    prefix,
+                    zero,
+                    one,
+                    *subtree_entries,
+                    encoder,
+                );
             },
-            Self::Page { entries, .. } => {
-                encoder
-                    .u8(u8::try_from(entries.len())
-                        .map_err(|_| PhysicalModelError::LengthOverflow)?);
-                for (key, value) in *entries {
-                    encode_physical_digest(encoder, key.as_bytes());
-                    encoder.bytes(value.as_ref())?;
-                }
-            },
+            Self::Page { domain, entries } => super::encode::page(*domain, entries, encoder)?,
             Self::Radix {
+                domain,
                 prefix_nibbles,
                 prefix,
                 child_bitmap,
                 children,
                 subtree_entries,
-                ..
             } => {
-                encoder.u8(*prefix_nibbles);
-                encoder.raw(prefix);
-                encoder.u16(*child_bitmap);
-                for child in *children {
-                    encode_map_node_id(encoder, *child);
-                }
-                encoder.u64(*subtree_entries);
+                super::encode::radix(
+                    *domain,
+                    *prefix_nibbles,
+                    prefix,
+                    *child_bitmap,
+                    children,
+                    *subtree_entries,
+                    encoder,
+                );
             },
         }
         Ok(())
     }
 }
 
-pub(super) fn into_owned(
-    node: MapNodeView<'_, &[u8]>,
-) -> Result<PhysicalMapNode, PhysicalModelError> {
+pub(super) fn into_owned(node: MapNodeView<'_>) -> Result<PhysicalMapNode, PhysicalModelError> {
     Ok(match node {
         MapNodeView::Leaf { domain, key, value } => PhysicalMapNode::Leaf {
             domain,
@@ -229,7 +165,7 @@ pub(super) fn into_owned(
 
 pub(super) fn with_decoded<T>(
     bytes: &[u8],
-    consume: impl FnOnce(MapNodeView<'_, &[u8]>) -> T,
+    consume: impl FnOnce(MapNodeView<'_>) -> T,
 ) -> Result<T, PhysicalModelError> {
     let mut decoder = Decoder::new(bytes);
     let version = decoder.u16()?;
@@ -280,7 +216,7 @@ fn decode_radix<T>(
     mut decoder: Decoder<'_>,
     bytes: &[u8],
     domain: PhysicalMapDomain,
-    consume: impl FnOnce(MapNodeView<'_, &[u8]>) -> T,
+    consume: impl FnOnce(MapNodeView<'_>) -> T,
 ) -> Result<T, PhysicalModelError> {
     match decoder.u8()? {
         0 => {
@@ -350,8 +286,8 @@ fn decode_radix<T>(
 fn finish<T>(
     decoder: Decoder<'_>,
     bytes: &[u8],
-    node: MapNodeView<'_, &[u8]>,
-    consume: impl FnOnce(MapNodeView<'_, &[u8]>) -> T,
+    node: MapNodeView<'_>,
+    consume: impl FnOnce(MapNodeView<'_>) -> T,
 ) -> Result<T, PhysicalModelError> {
     decoder.finish()?;
     let mut comparison = Encoder::comparing(bytes);

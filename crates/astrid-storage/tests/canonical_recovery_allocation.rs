@@ -2,7 +2,8 @@
 #![cfg(not(target_family = "wasm"))]
 
 use astrid_storage::storage_model::{
-    CanonicalPhysicalMap, ObjectId, ObjectRecord, PhysicalIdentity, PhysicalMapDomain, PhysicalMapKey,
+    CanonicalPhysicalMap, ObjectId, ObjectRecord, PhysicalIdentity, PhysicalMapDomain,
+    PhysicalMapKey,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

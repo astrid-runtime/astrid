@@ -7,13 +7,14 @@ use alloc::vec::Vec;
 use crate::storage_model::BlobId;
 
 use super::PhysicalModelError;
-use super::codec::{Encoder, EncodingSink};
+use super::codec::Encoder;
 use super::identity::{
     PhysicalIdentity, PhysicalMapNodeId, RepresentationProfileId, RepresentationRecordId,
     encode_physical_digest,
 };
 
 mod decode;
+mod encode;
 mod legacy;
 mod radix;
 mod rebuild;
@@ -272,15 +273,47 @@ impl PhysicalMapNode {
     /// Returns a length overflow when a leaf value cannot fit `u64`.
     pub fn encode(&self) -> Result<Vec<u8>, PhysicalModelError> {
         let mut encoder = Encoder::new();
-        self.encode_into(&mut encoder)?;
+        match self {
+            Self::Leaf { domain, key, value } => encode::leaf(*domain, key, value, &mut encoder)?,
+            Self::Branch {
+                domain,
+                prefix_bits,
+                prefix,
+                zero,
+                one,
+                subtree_entries,
+            } => {
+                encode::branch(
+                    *domain,
+                    *prefix_bits,
+                    prefix,
+                    zero,
+                    one,
+                    *subtree_entries,
+                    &mut encoder,
+                );
+            },
+            Self::Page { domain, entries } => encode::page(*domain, entries, &mut encoder)?,
+            Self::Radix {
+                domain,
+                prefix_nibbles,
+                prefix,
+                child_bitmap,
+                children,
+                subtree_entries,
+            } => {
+                encode::radix(
+                    *domain,
+                    *prefix_nibbles,
+                    prefix,
+                    *child_bitmap,
+                    children,
+                    *subtree_entries,
+                    &mut encoder,
+                );
+            },
+        }
         Ok(encoder.finish())
-    }
-
-    fn encode_into<W: EncodingSink>(
-        &self,
-        encoder: &mut Encoder<W>,
-    ) -> Result<(), PhysicalModelError> {
-        decode::MapNodeView::from_owned(self).encode_into(encoder)
     }
 
     /// Decode one canonical format-one node.
