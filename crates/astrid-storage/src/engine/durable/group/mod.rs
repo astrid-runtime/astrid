@@ -102,6 +102,12 @@ impl<P> Default for CommitGroup<P> {
     }
 }
 
+impl<P> CommitGroup<P> {
+    pub(super) fn is_idle(&self) -> bool {
+        !self.leader_active && self.queue.is_empty()
+    }
+}
+
 /// RAII ownership of the one active group-leader role.
 ///
 /// Normal execution hands leadership to the next queued caller explicitly.
@@ -748,3 +754,6 @@ fn complete_failed_group<P: Ord>(
         ));
     }
 }
+
+#[cfg(test)]
+mod retirement_tests;

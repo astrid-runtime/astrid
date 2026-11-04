@@ -418,13 +418,14 @@ async fn assemble_runtime_store(
     let content = Arc::new(
         NativePrincipalContentStore::from_engine_with_quota_and_validation(
             Arc::clone(&engine),
-            quota,
+            Arc::clone(&quota),
             validated_catalogs,
             validated_kv,
         ),
     );
     let staging = Arc::new(OnceLock::new());
     let store = RuntimePrincipalStore {
+        quota,
         volume_binding: Arc::downgrade(&volume),
         engine,
         directory_cutover_receipt: Arc::from(directory_cutover_receipt),

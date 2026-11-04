@@ -155,7 +155,105 @@ async fn closed_lifecycle_rejects_health_restart_before_registry_or_storage_acce
 mod idle_dispatcher;
 
 #[tokio::test]
-async fn retained_shutdown_joins_admitted_writers_and_closes_only_at_finalization() {
+async fn finalization_revokes_old_handles_before_host_pack() {
+    let root = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(root.path());
+    let lifecycle = astrid_storage::principal_state::RuntimeLifecycleGuard::acquire(&home).unwrap();
+    let kernel = test_kernel_with_home(home.clone()).await;
+    let content = kernel.principal_store.as_ref().unwrap().content();
+    let name = astrid_storage::ContentName::new("capsules/handoff-test.wasm").unwrap();
+    content
+        .put(
+            &astrid_storage::StateOwner::System,
+            &name,
+            b"durable capsule",
+        )
+        .unwrap();
+    kernel
+        .kv
+        .set("shutdown-regression", "durable", b"committed".to_vec())
+        .await
+        .unwrap();
+    let opened = content
+        .open_read(&astrid_storage::StateOwner::System, &name)
+        .unwrap()
+        .unwrap();
+    assert_eq!(opened.read().unwrap(), b"durable capsule");
+    assert_eq!(
+        kernel
+            .kv
+            .get("shutdown-regression", "durable")
+            .await
+            .unwrap(),
+        Some(b"committed".to_vec())
+    );
+    let token = kernel.shutdown_for_finalization(None).await.unwrap();
+    assert!(
+        kernel
+            .kv
+            .get("shutdown-regression", "durable")
+            .await
+            .is_err(),
+        "old KV reads must be revoked before the final pack"
+    );
+    assert!(
+        kernel
+            .kv
+            .set("shutdown-regression", "late", b"forbidden".to_vec())
+            .await
+            .is_err()
+    );
+    assert!(
+        content
+            .read(&astrid_storage::StateOwner::System, &name)
+            .is_err()
+    );
+    assert!(opened.read().is_err());
+    assert!(
+        content
+            .put(&astrid_storage::StateOwner::System, &name, b"forbidden")
+            .is_err()
+    );
+    // Closing a revoked projection must not release the new owner's volume.
+    kernel.kv.close().await.unwrap();
+    assert!(astrid_storage::volume::HostedFileVolume::open(home.storage_volume_path()).is_err());
+    std::fs::write(home.root().join("config.toml"), b"final host state").unwrap();
+    lifecycle.finish_retained(token).unwrap();
+    let reopened = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .kv()
+            .get("shutdown-regression", "durable")
+            .await
+            .unwrap(),
+        Some(b"committed".to_vec())
+    );
+    assert_eq!(
+        reopened
+            .kv()
+            .get("shutdown-regression", "late")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        reopened
+            .content()
+            .read(&astrid_storage::StateOwner::System, &name)
+            .unwrap(),
+        Some(b"durable capsule".to_vec())
+    );
+    assert_eq!(
+        std::fs::read(home.root().join("config.toml")).unwrap(),
+        b"final host state"
+    );
+    reopened.kv().close().await.unwrap();
+}
+
+#[tokio::test]
+async fn retained_shutdown_joins_admitted_writers_and_revokes_former_handles() {
     let root = tempfile::tempdir().unwrap();
     let home = astrid_core::dirs::AstridHome::from_path(root.path());
     let lifecycle = astrid_storage::principal_state::RuntimeLifecycleGuard::acquire(&home).unwrap();
@@ -177,16 +275,17 @@ async fn retained_shutdown_joins_admitted_writers_and_closes_only_at_finalizatio
         .unwrap();
     drop(writer);
     let token = shutdown.await.unwrap();
-    // All engine projections, including audit, must leave the authority open
-    // for the host's final pack rather than trigger a second recovery.
-    assert_eq!(
+    // Admission is drained, and every old projection is now closed. Only
+    // the distinct finalization owner retains the verified files and lock.
+    assert!(
         kernel
             .kv
             .get("shutdown-regression", "admitted")
             .await
-            .unwrap(),
-        Some(b"committed".to_vec())
+            .is_err()
     );
+    kernel.kv.close().await.unwrap();
+    assert!(astrid_storage::volume::HostedFileVolume::open(home.storage_volume_path()).is_err());
     lifecycle.finish_retained(token).unwrap();
     assert!(
         kernel
@@ -289,13 +388,13 @@ fn retained_shutdown_defers_host_publication_until_runtime_writers_join() {
             .shutdown_for_finalization(Some("single publication".into()))
             .await
             .unwrap();
-        // The retained path must not ingest an intermediate host generation.
+        // Old projections are revoked immediately; they cannot inspect or
+        // mutate the distinct finalizer's generation.
         let published = store
             .content()
-            .read(&astrid_storage::StateOwner::System, &name)
-            .unwrap();
+            .read(&astrid_storage::StateOwner::System, &name);
         release.send(()).unwrap();
-        assert_eq!(published, None);
+        assert!(published.is_err());
         (kernel, token)
     });
     drop(runtime);
@@ -336,15 +435,14 @@ async fn abandoned_retained_shutdown_recovers_unpublished_host_writes() {
         .shutdown_for_finalization(Some("abandoned finalizer".into()))
         .await
         .unwrap();
-    assert_eq!(
+    assert!(
         kernel
             .principal_store
             .as_ref()
             .unwrap()
             .content()
             .read(&astrid_storage::StateOwner::System, &name)
-            .unwrap(),
-        None
+            .is_err()
     );
     drop(token);
     assert!(kernel.kv.get("system:test", "late").await.is_err());

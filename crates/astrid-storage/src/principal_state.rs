@@ -452,6 +452,7 @@ pub type NativePrincipalContentStore = PrincipalContentStore<
 /// Native principal-store projections opened over one durable engine.
 #[derive(Clone)]
 pub struct RuntimePrincipalStore {
+    quota: Arc<dyn crate::KvQuotaResolver<StateOwner>>,
     volume_binding: std::sync::Weak<crate::volume::HostedFileVolume>,
     engine: Arc<RuntimeEngine>,
     directory_cutover_receipt: Arc<str>,

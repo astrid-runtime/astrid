@@ -1,5 +1,7 @@
 //! One finalization path, shared by graceful daemon exit and CLI recovery.
 
+mod handoff;
+
 use std::fs::File;
 use std::io;
 use std::sync::Arc;
@@ -82,13 +84,14 @@ impl RuntimeLifecycleGuard {
     }
 }
 
-/// Exclusive shutdown responsibility for an already-open runtime store.
+/// Exclusive finalization custody after former runtime handles are closed.
 ///
 /// This token deliberately cannot be cloned. Dropping it closes the engine,
 /// including when runtime teardown or final publication fails.
 #[must_use = "finish the durable home after stopping the task runtime"]
 pub struct RuntimeFinalization {
     store: super::RuntimePrincipalStore,
+    shutdown_error: Option<StorageError>,
 }
 
 impl super::RuntimePrincipalStore {
@@ -102,15 +105,15 @@ impl super::RuntimePrincipalStore {
                 StorageError::Connection(format!("validate retained runtime volume: {error}"))
             })
     }
+}
 
-    /// Transfer shutdown responsibility to the host without reopening storage.
+impl RuntimeFinalization {
+    /// Retain an ancillary shutdown failure until packing and close complete.
     ///
-    /// Call only after admitting no new work and draining capsule producers.
-    /// The host must drop its task runtime before finalizing this token.
-    pub fn retain_for_finalization(&self) -> RuntimeFinalization {
-        RuntimeFinalization {
-            store: self.clone(),
-        }
+    /// Custody must survive an old projection's close error. Finalization still
+    /// packs late host writes, then reports the earlier failure to its caller.
+    pub fn record_shutdown_error(&mut self, error: StorageError) {
+        self.shutdown_error.get_or_insert(error);
     }
 }
 
@@ -129,7 +132,7 @@ impl RuntimeLifecycleGuard {
     /// Rejects a different home, replaced volume, or unsafe host projection.
     /// Failures before retirement preserve host files. Later errors retain
     /// the durable volume and any surviving projection for recovery.
-    pub fn finish_retained(self, finalization: RuntimeFinalization) -> StorageResult<()> {
+    pub fn finish_retained(self, mut finalization: RuntimeFinalization) -> StorageResult<()> {
         let packed = finalization
             .store
             .require_volume_binding(&self.home)
@@ -141,13 +144,23 @@ impl RuntimeLifecycleGuard {
         let closed = finalization.store.engine.close().map_err(|error| {
             StorageError::Connection(format!("close finalized runtime volume: {error}"))
         });
+        let shutdown_error = finalization.shutdown_error.take();
         drop(finalization);
-        match (packed, closed) {
+        let finalized = match (packed, closed) {
             (Err(pack), Err(close)) => Err(StorageError::Connection(format!(
                 "{pack}; additionally failed to close retained storage: {close}"
             ))),
             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
             (Ok(()), Ok(())) => Ok(()),
+        };
+        match (finalized, shutdown_error) {
+            (Err(error), Some(earlier)) => Err(StorageError::Connection(format!(
+                "{error}; earlier shutdown failed: {earlier}"
+            ))),
+            (Ok(()), Some(error)) => Err(StorageError::Internal(format!(
+                "durable home packed and closed; earlier shutdown failed: {error}"
+            ))),
+            (result, None) => result,
         }
     }
 }

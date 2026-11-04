@@ -812,6 +812,7 @@ mod recovery;
 mod representation_engine;
 mod representations;
 mod restore;
+mod retirement;
 mod roots;
 mod validation;
 mod wal;

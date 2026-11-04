@@ -118,6 +118,13 @@ where
         }
     }
 
+    pub(super) fn empty_peer(&self) -> Self {
+        Self::new(ObjectCacheConfig::new(
+            self.controller.clone(),
+            Arc::clone(&self.principal_budget),
+        ))
+    }
+
     pub(super) fn get(&self, principal: &P, object: ObjectId) -> Option<Arc<ObjectRecord>> {
         let _accounting = self.accounting.lock();
         let (global_required, principal_required) = {

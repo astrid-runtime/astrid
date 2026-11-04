@@ -113,11 +113,29 @@ async fn retained_fixture() -> (
 #[tokio::test]
 async fn retained_finalizer_packs_late_host_writes_without_reopening_locked_engine() {
     let (_parent, home, lifecycle, store) = retained_fixture().await;
-    let token = store.retain_for_finalization();
+    std::fs::write(
+        home.root().join("config.toml"),
+        b"intermediate host generation",
+    )
+    .unwrap();
+    let token = store.handoff_for_finalization(&home).unwrap();
+    // Moving verified custody must not publish the host generation that still
+    // has pending runtime writers. Only the later final pack may ingest it.
+    assert_eq!(
+        token
+            .store
+            .content()
+            .read(
+                &StateOwner::System,
+                &ContentName::new("config.toml").unwrap()
+            )
+            .unwrap(),
+        Some(b"before shutdown".to_vec())
+    );
     std::fs::write(home.root().join("config.toml"), b"after task teardown").unwrap();
     // A second open cannot recover this volume while the retained engine owns
     // it. Successful finalization must use the original engine despite the
-    // store clone remaining alive across the call.
+    // former store remaining alive across the call.
     assert!(crate::volume::HostedFileVolume::open(home.storage_volume_path()).is_err());
     lifecycle.finish_retained(token).unwrap();
     assert!(store.kv().get("system:test", "late").await.is_err());
@@ -134,7 +152,7 @@ async fn retained_finalizer_packs_late_host_writes_without_reopening_locked_engi
 #[tokio::test]
 async fn abandoned_token_closes_surviving_store_and_releases_volume() {
     let (_parent, home, _lifecycle, store) = retained_fixture().await;
-    drop(store.retain_for_finalization());
+    drop(store.handoff_for_finalization(&home).unwrap());
     assert!(
         store
             .kv()
@@ -157,7 +175,7 @@ async fn retained_finalizer_rejects_wrong_home_before_packing_and_closes_origina
     std::fs::write(other_home.root().join("config.toml"), b"other home").unwrap();
     assert!(
         other_lifecycle
-            .finish_retained(store.retain_for_finalization())
+            .finish_retained(store.handoff_for_finalization(&home).unwrap())
             .is_err()
     );
     assert!(store.kv().get("system:test", "late").await.is_err());
@@ -176,16 +194,13 @@ async fn retained_finalizer_rejects_wrong_home_before_packing_and_closes_origina
 #[tokio::test]
 async fn retained_finalizer_rejects_replaced_volume_and_preserves_host() {
     let (_parent, home, lifecycle, store) = retained_fixture().await;
+    let token = store.handoff_for_finalization(&home).unwrap();
     let volume_path = home.storage_volume_path();
     let original = home.root().join("original.volume");
     std::fs::rename(&volume_path, &original).unwrap();
     std::fs::copy(&original, &volume_path).unwrap();
     let replacement = std::fs::read(&volume_path).unwrap();
-    assert!(
-        lifecycle
-            .finish_retained(store.retain_for_finalization())
-            .is_err()
-    );
+    assert!(lifecycle.finish_retained(token).is_err());
     assert_eq!(std::fs::read(&volume_path).unwrap(), replacement);
     assert_eq!(
         std::fs::read(home.root().join("config.toml")).unwrap(),
@@ -198,15 +213,12 @@ async fn retained_finalizer_rejects_replaced_volume_and_preserves_host() {
 #[tokio::test]
 async fn retained_finalizer_rejects_volume_symlink_and_closes_original() {
     let (_parent, home, lifecycle, store) = retained_fixture().await;
+    let token = store.handoff_for_finalization(&home).unwrap();
     let volume_path = home.storage_volume_path();
     let original = home.root().join("original.volume");
     std::fs::rename(&volume_path, &original).unwrap();
     std::os::unix::fs::symlink(&original, &volume_path).unwrap();
-    assert!(
-        lifecycle
-            .finish_retained(store.retain_for_finalization())
-            .is_err()
-    );
+    assert!(lifecycle.finish_retained(token).is_err());
     assert!(volume_path.symlink_metadata().unwrap().is_symlink());
     assert_eq!(
         std::fs::read(home.root().join("config.toml")).unwrap(),
@@ -222,7 +234,7 @@ async fn retained_finalizer_closes_storage_when_host_pack_fails() {
     std::os::unix::fs::symlink(parent.path(), home.root().join("redirect")).unwrap();
     assert!(
         lifecycle
-            .finish_retained(store.retain_for_finalization())
+            .finish_retained(store.handoff_for_finalization(&home).unwrap())
             .is_err()
     );
     assert!(store.kv().get("system:test", "late").await.is_err());
@@ -248,7 +260,7 @@ async fn retained_finalizer_uses_current_handle_after_legitimate_reclaim() {
     assert_ne!(before, after, "reclaim must exercise an inode replacement");
     drop(volume);
     lifecycle
-        .finish_retained(store.retain_for_finalization())
+        .finish_retained(store.handoff_for_finalization(&home).unwrap())
         .unwrap();
     let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|_: &StateOwner| Ok(None));
     let reopened = open_runtime_principal_store(&home, quota).await.unwrap();
@@ -257,4 +269,35 @@ async fn retained_finalizer_uses_current_handle_after_legitimate_reclaim() {
         b"before shutdown"
     );
     reopened.kv().close().await.unwrap();
+}
+
+#[tokio::test]
+async fn transferred_finalizer_preserves_live_quota_policy() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let parent = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(parent.path().join("runtime"));
+    let lifecycle = RuntimeLifecycleGuard::acquire(&home).unwrap();
+    let limit = Arc::new(AtomicU64::new(u64::MAX));
+    let policy = Arc::clone(&limit);
+    let quota: Arc<dyn KvQuotaResolver<StateOwner>> =
+        Arc::new(move |_: &StateOwner| Ok(Some(policy.load(Ordering::Acquire))));
+    let store = open_runtime_principal_store(&home, quota).await.unwrap();
+    store.publish_runtime_projection(&home).unwrap();
+    let token = store.handoff_for_finalization(&home).unwrap();
+    limit.store(0, Ordering::Release);
+    let error = token
+        .store
+        .content()
+        .put(
+            &StateOwner::System,
+            &ContentName::new("capsules/quota-test.wasm").unwrap(),
+            b"must respect the same quota",
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::PrincipalContentError::QuotaExceeded { .. }
+    ));
+    limit.store(u64::MAX, Ordering::Release);
+    lifecycle.finish_retained(token).unwrap();
 }

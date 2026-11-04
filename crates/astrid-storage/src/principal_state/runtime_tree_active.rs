@@ -92,6 +92,20 @@ pub(super) fn active_projection_name() -> StorageResult<ContentName> {
         .map_err(|error| StorageError::Internal(format!("validate active receipt: {error}")))
 }
 
+/// Verify that finalization is bound to this admitted runtime home.
+pub(super) fn validate_retirement_home(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+) -> StorageResult<()> {
+    if read(home, store)?.is_none() {
+        return Err(tree_error(
+            home.root(),
+            "runtime retirement requires an admitted projection receipt",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn read(
     home: &AstridHome,
     store: &RuntimePrincipalStore,
