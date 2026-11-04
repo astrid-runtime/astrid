@@ -3,6 +3,7 @@
 //! Checksum lives in the record header. This hashes while copying, then
 //! patches the checksum slot. The on-disk grammar is unchanged.
 
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 #[cfg(test)]
 use std::path::Path;
@@ -61,6 +62,26 @@ pub(super) fn append_from(
     payload_len: u64,
     payload: &mut dyn Read,
 ) -> io::Result<(u64, u64)> {
+    append_from_with(
+        state,
+        operation,
+        region,
+        offset,
+        payload_len,
+        payload,
+        super::recover::write_footer,
+    )
+}
+
+pub(super) fn append_from_with(
+    state: &mut ContainerState,
+    operation: Operation,
+    region: &VolumeRegion,
+    offset: u64,
+    payload_len: u64,
+    payload: &mut dyn Read,
+    footer_restore: impl FnOnce(&mut File, u64, u64, u64) -> io::Result<()>,
+) -> io::Result<(u64, u64)> {
     if payload_len == 0 {
         return super::HostedFileVolume::append(state, operation, region, offset, &[]);
     }
@@ -77,7 +98,10 @@ pub(super) fn append_from(
             if state.last_commit_offset != 0 && start == state.durable_len {
                 // Restore marks MayExceed before any footer IO.
                 state.physical_tail = super::PhysicalTail::MayExceed;
-                let _ = super::recover::write_footer(
+                // Preflight failures never reach prepare_append, so obligate the
+                // next sync before a restore that may strip the durable footer.
+                state.footer_pending = true;
+                let _ = footer_restore(
                     &mut state.file,
                     state.last_commit_offset,
                     state.durable_len,

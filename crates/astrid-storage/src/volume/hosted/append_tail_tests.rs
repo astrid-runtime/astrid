@@ -202,6 +202,76 @@ fn partial_plain_rename_failure_stays_uncertain_and_smaller_retry_reopens() {
 }
 
 #[test]
+fn preflight_overflow_failed_footer_restore_resyncs_checksummed_footer() {
+    reset_faults();
+    let directory = tempfile::tempdir().unwrap();
+    let (volume, region, _) = open_ready_volume(&directory);
+    {
+        let mut state = volume.state.lock();
+        assert!(
+            !state.footer_pending,
+            "synced fixture must start with a confirmed durable footer"
+        );
+        assert_ne!(state.last_commit_offset, 0);
+        assert_eq!(state.valid_len, state.durable_len);
+        let durable_before = state.durable_len;
+        let error = super::stream::append_from_with(
+            &mut state,
+            Operation::Write,
+            &region,
+            0,
+            u64::MAX,
+            &mut &[][..],
+            |file, _last_commit_offset, durable_len, _sequence| {
+                // Same first effect as recover::write_footer: strip to durable_len,
+                // then fail before footer bytes are rewritten.
+                file.set_len(durable_len)?;
+                Err(io::Error::other("injected footer restore write failure"))
+            },
+        )
+        .expect_err("u64::MAX payload must fail preflight length overflow before prepare");
+        assert!(
+            error.to_string().contains("volume record length overflow"),
+            "unexpected preflight error: {error}"
+        );
+        assert!(
+            state.footer_pending,
+            "failed footer restore must mark footer_pending even when prepare never ran"
+        );
+        assert_eq!(state.physical_tail, PhysicalTail::MayExceed);
+        assert_eq!(
+            state.file.metadata().unwrap().len(),
+            durable_before,
+            "failed restore leaves the durable body without footer bytes"
+        );
+    }
+
+    volume.sync().unwrap();
+    let (valid_after, physical_after) = owned_lengths(&volume);
+    assert_eq!(
+        physical_after,
+        valid_after + super::recover::FOOTER_BYTES as u64,
+        "sync must rewrite a physical footer before Drop"
+    );
+
+    let copy = directory.path().join("preflight-footer-reopen.volume");
+    super::test_support::copy_container(&volume, &copy);
+    let mut snapshot = std::fs::File::open(&copy).unwrap();
+    let recovery = super::recover::recover_container(&mut snapshot).unwrap();
+    assert!(
+        recovery.footer_present,
+        "reopen must accept the checksummed footer path, not only a full-scan fallback"
+    );
+    let recovered = HostedFileVolume::open(&copy).unwrap();
+    let mut actual = [0_u8; 10];
+    assert_eq!(
+        recovered.read_region_at(&region, 0, &mut actual).unwrap(),
+        10
+    );
+    assert_eq!(&actual, b"seed-bytes");
+}
+
+#[test]
 fn rollback_truncate_failure_from_dirty_state_leaves_tail_for_retry() {
     reset_faults();
     let directory = tempfile::tempdir().unwrap();
