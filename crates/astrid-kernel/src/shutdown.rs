@@ -31,7 +31,9 @@ impl Kernel {
     /// Ordinary callers should use [`Self::shutdown`] to close storage here.
     ///
     /// # Errors
-    /// Returns a storage error when producer shutdown or audit close fails.
+    /// Returns a storage error when no native principal store is available or
+    /// its audit projection cannot close. Producer-drain failures retain their
+    /// existing log and audit-health reporting.
     /// Projection validation and publication are deferred to the finalizer.
     #[cfg(not(target_family = "wasm"))]
     pub async fn shutdown_for_finalization(
@@ -92,7 +94,8 @@ impl Kernel {
         self.drain_shutdown_capsules().await;
 
         // No admitted load/admin work or capsule producer may write after
-        // the final audit flush and projection publication.
+        // closing its audit projection. Retained mode publishes the final host
+        // projection only after the host task runtime has stopped.
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         self.audit_sink.shutdown();
         let finalization = self.finish_shutdown_storage(mode).await;
@@ -106,11 +109,14 @@ impl Kernel {
         // socket/PID/readiness files it manages) exist only on that profile.
         #[cfg(unix)]
         {
-            let socket_path = crate::socket::kernel_socket_path();
+            // The token captures the admitted runtime directory at boot. Never
+            // resolve process-wide environment paths again during teardown: an
+            // embedded kernel or changed override may refer to another runtime.
+            let socket_path = self.token_path.with_file_name("system.sock");
             let _ = astrid_core::local_transport::remove_endpoint(&socket_path);
             let _ = std::fs::remove_file(&self.token_path);
-            crate::socket::remove_readiness_file();
-            crate::socket::remove_pid_file();
+            let _ = std::fs::remove_file(self.token_path.with_file_name("system.ready"));
+            let _ = std::fs::remove_file(self.token_path.with_file_name("system.pid"));
         }
 
         tracing::info!("Kernel shutdown complete");

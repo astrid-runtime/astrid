@@ -405,3 +405,44 @@ async fn retained_finalization_rejects_redirect_without_retiring_host_writes() {
     );
     reopened.kv().close().await.unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shutdown_retires_only_boot_captured_runtime_files() {
+    for retained in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let home = astrid_core::dirs::AstridHome::from_path(root.path());
+        let lifecycle =
+            astrid_storage::principal_state::RuntimeLifecycleGuard::acquire(&home).unwrap();
+        let kernel = test_kernel_with_home(home).await;
+        let socket = kernel.token_path.with_file_name("system.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        for name in ["system.token", "system.ready", "system.pid"] {
+            std::fs::write(kernel.token_path.with_file_name(name), b"owned runtime").unwrap();
+        }
+        for name in ["system.sock", "system.token", "system.ready", "system.pid"] {
+            std::fs::write(foreign.path().join(name), b"other runtime").unwrap();
+        }
+
+        if retained {
+            let token = kernel.shutdown_for_finalization(None).await.unwrap();
+            lifecycle.finish_retained(token).unwrap();
+        } else {
+            kernel.shutdown(None).await;
+        }
+
+        for name in ["system.sock", "system.token", "system.ready", "system.pid"] {
+            assert!(
+                !kernel.token_path.with_file_name(name).exists(),
+                "shutdown must retire its captured {name}"
+            );
+            assert_eq!(
+                std::fs::read(foreign.path().join(name)).unwrap(),
+                b"other runtime",
+                "shutdown must preserve another runtime's {name}"
+            );
+        }
+        drop(listener);
+    }
+}
