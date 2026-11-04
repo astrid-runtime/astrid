@@ -13,7 +13,7 @@ mod macos_acl;
 mod mount_boundary;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use mount_boundary::fixtures as mount_fixtures;
-#[cfg(all(feature = "test-support", target_os = "linux"))]
+#[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
 pub use mount_boundary::fixtures as mount_test_fixtures;
 mod private_projection;
 mod staging_scope;

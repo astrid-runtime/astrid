@@ -293,7 +293,14 @@ jobs:
           set -euo pipefail
           test_binary=$(cargo test --locked -p astrid-core --lib --no-run --message-format=json | python3 -c '
           import json, sys
-          paths = [m["executable"] for line in sys.stdin if (m := json.loads(line)).get("executable") and m.get("target", {}).get("name") == "astrid_core" and m.get("profile", {}).get("test")]
+          paths = []
+          for line in sys.stdin:
+              message = json.loads(line)
+              if message.get("reason") == "compiler-message":
+                  diagnostic = message["message"]
+                  sys.stderr.write(diagnostic.get("rendered") or diagnostic["message"] + "\n")
+              if message.get("executable") and message.get("target", {}).get("name") == "astrid_core" and message.get("profile", {}).get("test"):
+                  paths.append(message["executable"])
           assert len(paths) == 1, paths
           print(paths[0])')
           sudo unshare --mount --propagation private -- "$test_binary" \
@@ -301,7 +308,14 @@ jobs:
 
           storage_binary=$(cargo test --locked -p astrid-storage --lib --no-run --message-format=json | python3 -c '
           import json, sys
-          paths = [m["executable"] for line in sys.stdin if (m := json.loads(line)).get("executable") and m.get("target", {}).get("name") == "astrid_storage" and m.get("profile", {}).get("test")]
+          paths = []
+          for line in sys.stdin:
+              message = json.loads(line)
+              if message.get("reason") == "compiler-message":
+                  diagnostic = message["message"]
+                  sys.stderr.write(diagnostic.get("rendered") or diagnostic["message"] + "\n")
+              if message.get("executable") and message.get("target", {}).get("name") == "astrid_storage" and message.get("profile", {}).get("test"):
+                  paths.append(message["executable"])
           assert len(paths) == 1, paths
           print(paths[0])')
           sudo unshare --mount --propagation private -- "$storage_binary" \

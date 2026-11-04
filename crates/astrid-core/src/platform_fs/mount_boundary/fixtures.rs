@@ -49,8 +49,10 @@ impl Drop for BindMount {
 /// Reject execution in the host mount namespace.
 pub fn require_private_namespace() {
     assert_ne!(
-        std::fs::read_link("/proc/self/ns/mnt").unwrap(),
-        std::fs::read_link("/proc/1/ns/mnt").unwrap(),
+        std::fs::read_link("/proc/self/ns/mnt")
+            .expect("read the owned test process mount namespace"),
+        std::fs::read_link("/proc/1/ns/mnt")
+            .expect("read the host init mount namespace for the fixture safety guard"),
         "run this test binary through unshare --mount --propagation private"
     );
 }
