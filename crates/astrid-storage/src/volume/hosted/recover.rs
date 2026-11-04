@@ -24,7 +24,9 @@ const RECOVERY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_METADATA_PAYLOAD_BYTES: u64 = 2 * 1024 * 1024;
 // This bounds one commit record/catalogue and its ordinary replay tail. It is
 // a framing/allocation guard, not a ceiling on live extents: immutable index
-// pages are verified separately with bounded working memory.
+// pages are verified separately. A checkpoint-local ownership set retains
+// selected record offsets, bounded by disjoint committed physical page bytes;
+// it is dropped before the recovered namespace is returned.
 pub(super) const MAX_COMMIT_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
 const SNAPSHOT_MAGIC: [u8; 8] = *b"ASTMAP1\0";
 const FOOTER_MAGIC: [u8; 8] = *b"ASTFTR1\0";

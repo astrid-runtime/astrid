@@ -231,10 +231,14 @@ def index_page(payload, offset, sequence, checksum):
     return index_reference(raw_reference), extents, children
 
 
-def indexed_extents(data, reference, parent_offset, parent_sequence):
-    # Strict level descent bounds recursion to 64; no all-page cache or map.
+def indexed_extents(data, reference, parent_offset, parent_sequence, page_offsets, owned):
+    # Sequential framing proves these physical records are disjoint. Ownership
+    # is checkpoint-local, so later checkpoints may reuse their own old pages.
     reference.require_before(parent_offset, parent_sequence)
     offset = reference.offset
+    if offset not in page_offsets or offset in owned:
+        raise VolumeFormatError("shared or overlapping extent-index page")
+    owned.add(offset)
     header = data[offset:offset + VOLUME_RECORD_BYTES]
     if len(header) != VOLUME_RECORD_BYTES or header[:8] != VOLUME_RECORD_MAGIC:
         raise VolumeFormatError("invalid extent-index record header")
@@ -259,16 +263,16 @@ def indexed_extents(data, reference, parent_offset, parent_sequence):
         raise VolumeFormatError("extent-index reference contradicts page")
     yield from extents
     for child in children:
-        yield from indexed_extents(data, child, offset, sequence)
+        yield from indexed_extents(data, child, offset, sequence, page_offsets, owned)
 
 
-def validate_paged_checkpoint(data, payload, offset, sequence, regions):
+def validate_paged_checkpoint(data, payload, offset, sequence, regions, page_offsets):
     if len(payload) > MAX_COMMIT_SNAPSHOT_BYTES:
         raise VolumeFormatError("paged catalogue exceeds format bound")
     cursor = Cursor(payload)
     if cursor.take(8) != b"ASTMAP2\0":
         raise VolumeFormatError("invalid paged checkpoint magic")
-    names, previous = set(), None
+    names, previous, owned = set(), None, set()
     for _ in range(cursor.integer(4)):
         raw_name = cursor.take(cursor.integer(2))
         name = volume_region_name(raw_name)
@@ -285,7 +289,7 @@ def validate_paged_checkpoint(data, payload, offset, sequence, regions):
             root = index_reference(cursor.take(80))
             if root.end > length:
                 raise VolumeFormatError("extent-index root exceeds region")
-            for start, extent_end, physical in indexed_extents(data, root, offset, sequence):
+            for start, extent_end, physical in indexed_extents(data, root, offset, sequence, page_offsets, owned):
                 if start < end or any(logical[end:start]):
                     raise VolumeFormatError("extent-index hole contradicts recovered bytes")
                 if logical[start:extent_end] != memoryview(data)[physical:physical + extent_end - start]:
@@ -342,6 +346,7 @@ def recover_volume(path):
         raise VolumeFormatError("invalid Astrid volume header")
     committed_regions = {}
     regions = {}
+    page_offsets = set()
     sequence = 0
     offset = len(VOLUME_MAGIC)
     while offset < len(data):
@@ -419,6 +424,7 @@ def recover_volume(path):
             if name_raw != INDEX_PAGE_REGION or logical_offset != 0:
                 raise VolumeFormatError("invalid extent-index record envelope")
             index_page(payload, offset, current, header[43:75])
+            page_offsets.add(offset)
         else:
             # Empty commits keep the replayed namespace. Nonempty payloads are
             # ASTMAP2 or ASTMAP1 catalogues checked against replay; the reader
@@ -429,7 +435,7 @@ def recover_volume(path):
                 raise VolumeFormatError("commit snapshot exceeds format bound")
             if payload:
                 if payload.startswith(b"ASTMAP2\0"):
-                    validate_paged_checkpoint(data, payload, offset, current, regions)
+                    validate_paged_checkpoint(data, payload, offset, current, regions, page_offsets)
                 else:
                     validate_legacy_snapshot(data, payload, offset, regions)
             committed_regions = {

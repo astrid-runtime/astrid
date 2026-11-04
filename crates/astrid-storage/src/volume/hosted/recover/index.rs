@@ -1,7 +1,9 @@
 //! Extent-page record validation shares ASTREG1 framing and checksums.
 
+use std::{cell::RefCell, collections::BTreeSet};
+
 use super::super::extent_index::{
-    INDEX_PAGE_REGION,
+    INDEX_PAGE_RECORD_BYTES, INDEX_PAGE_REGION,
     codec::{PAGE_BYTES, Page},
     reference::{PageRef, RecordOffset, RecordSequence},
 };
@@ -31,10 +33,13 @@ pub(super) fn decode_checkpoint(
     let offset = RecordOffset::new(offset)?;
     let sequence = RecordSequence::new(sequence)?;
     let catalogue = checkpoint::decode(payload, offset, sequence)?;
-    let reader = RecordReader {
-        file,
-        published_before: offset,
-        commit_sequence: sequence,
+    let reader = CheckpointPages {
+        reader: RecordReader {
+            file,
+            published_before: offset,
+            commit_sequence: sequence,
+        },
+        offsets: RefCell::new(BTreeSet::new()),
     };
     let mut regions = BTreeMap::new();
     for (name, region) in catalogue {
@@ -52,6 +57,47 @@ pub(super) fn decode_checkpoint(
         );
     }
     Ok(regions)
+}
+
+// Regions own disjoint physical page records. Reuse within a region across
+// successive checkpoints remains valid: ownership lasts for this checkpoint only.
+// Fixed record intervals bound this transient set by committed physical bytes;
+// neither page bodies nor a second runtime index survive namespace publication.
+struct CheckpointPages<'a> {
+    reader: RecordReader<'a>,
+    offsets: RefCell<BTreeSet<RecordOffset>>,
+}
+
+impl CheckpointPages<'_> {
+    fn claim(&self, start: RecordOffset) -> io::Result<()> {
+        let end = start
+            .get()
+            .checked_add(INDEX_PAGE_RECORD_BYTES)
+            .ok_or_else(|| invalid_transition("extent-index record interval overflow"))?;
+        let mut offsets = self.offsets.borrow_mut();
+        let overlaps_previous = offsets.range(..=start).next_back().is_some_and(|previous| {
+            // All admitted offsets have already passed the checked addition.
+            previous.get().strict_add(INDEX_PAGE_RECORD_BYTES) > start.get()
+        });
+        let overlaps_next = offsets
+            .range(start..)
+            .next()
+            .is_some_and(|next| next.get() < end);
+        if overlaps_previous || overlaps_next {
+            return Err(invalid_transition(
+                "shared or overlapping extent-index page",
+            ));
+        }
+        offsets.insert(start);
+        Ok(())
+    }
+}
+
+impl traversal::PageReader for CheckpointPages<'_> {
+    fn read_page(&self, reference: PageRef) -> io::Result<Page> {
+        self.claim(reference.offset())?;
+        traversal::PageReader::read_page(&self.reader, reference)
+    }
 }
 
 pub(in crate::volume::hosted) fn read_index_page(
@@ -103,3 +149,6 @@ fn require_envelope(header: &RecordHeader) -> io::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

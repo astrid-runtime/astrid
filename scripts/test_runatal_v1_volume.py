@@ -90,6 +90,35 @@ def fixture(page_mutation=None, reference_mutation=None):
     return data, {name: value}
 
 
+def shared_pages_fixture(lower_child, shared):
+    data, sequence, expected, physical = public_write((("data/a", b"a\0z"), ("data/b", b"a\0z")))
+
+    def page(entries, level, start, end, count):
+        nonlocal sequence
+        payload = (b"ASTXPG1\0" + struct.pack("<B3xH2x", level, len(entries)) + b"".join(entries)).ljust(4096, b"\0")
+        sequence, offset, _, checksum = append_record(data, sequence, 9, "system/volume-extent-index", 0, payload)
+        return struct.pack("<QQ32sQQQB7x", offset, sequence, checksum, start, end, count, level)
+
+    def first_leaf():
+        end = 1 if lower_child else 3
+        return page([struct.pack("<QQQ", 0, end, physical["data/a"])], 0, 0, end, 1)
+
+    first = first_leaf()
+    roots = []
+    for index in range(2):
+        leaf = first if index == 0 or shared else first_leaf()
+        if lower_child:
+            last = page([struct.pack("<QQQ", 2, 3, physical["data/a"] + 2)], 0, 2, 3, 1)
+            leaf = page([leaf, last], 1, 0, 3, 2)
+        roots.append(leaf)
+    catalogue = bytearray(b"ASTMAP2\0" + struct.pack("<I", 2))
+    for name, root in zip(expected, roots):
+        raw = name.encode()
+        catalogue.extend(struct.pack("<H", len(raw)) + raw + struct.pack("<QB", 3, 1) + root)
+    append_record(data, sequence, 8, COMMIT, 0, catalogue)
+    return data, expected
+
+
 def replace_bytes(data, offset, value):
     return data[:offset] + value + data[offset + len(value):]
 
@@ -110,6 +139,18 @@ class IndependentReaderPagedRegression(IndependentVolumeRecovery):
     def test_valid_paged_checkpoint_recovers_public_region(self):
         data, expected = fixture()
         self.assertEqual(self.recover(data), expected)
+
+    def test_shared_pages_across_regions_are_rejected(self):
+        for lower_child in (False, True):
+            with self.subTest(lower_child=lower_child):
+                data, _ = shared_pages_fixture(lower_child, True)
+                with self.assertRaisesRegex(VolumeFormatError, "shared or overlapping"):
+                    self.recover(data)
+
+    def test_distinct_pages_with_identical_content_are_accepted(self):
+        for lower_child in (False, True):
+            data, expected = shared_pages_fixture(lower_child, False)
+            self.assertEqual(self.recover(data), expected)
 
     def test_checksum_valid_malformed_page_is_rejected(self):
         for offset, replacement in [(0, b"!"), (9, b"!"), (14, b"!"), (4095, b"!"), (12, bytes(2))]:
