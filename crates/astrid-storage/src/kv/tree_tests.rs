@@ -134,6 +134,21 @@ impl KvProjectionEngine<String> for MeasuringEngine {
         Ok(record)
     }
 
+    fn load_shared_kv_object_for(
+        &self,
+        principal: &String,
+        id: ObjectId,
+    ) -> Result<Option<Arc<ObjectRecord>>, KvProjectionError> {
+        let record = self.inner.load_shared_kv_object_for(principal, id)?;
+        if let Some(record) = &record
+            && record.kind() == ObjectKind::Chunk
+        {
+            self.loaded_chunk_bytes
+                .fetch_add(record.canonical_bytes().len() as u64, Ordering::Relaxed);
+        }
+        Ok(record)
+    }
+
     fn snapshot_kv_root(
         &self,
         principal: &String,

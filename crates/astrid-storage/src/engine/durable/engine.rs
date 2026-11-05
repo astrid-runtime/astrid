@@ -94,7 +94,7 @@ where
                 let pending = inner
                     .pending_wal
                     .get_object(&id)
-                    .map(|object| Arc::new(object.record().clone()));
+                    .map(|object| object.record().clone());
                 (
                     pending,
                     inner.index.get(&id).copied(),
@@ -106,7 +106,7 @@ where
                     principal,
                     id,
                     generation,
-                    record.as_ref().clone(),
+                    record,
                     &mut recovery,
                 )? {
                     return Ok(Some(record));
@@ -194,13 +194,21 @@ where
         }
 
         loop {
-            let (locations, generation) = {
+            let (pending, locations, generation) = {
                 let inner = self.lock_usable_with(&mut recovery)?;
+                let mut pending = Vec::new();
                 let locations = missing
                     .keys()
-                    .filter_map(|id| inner.index.get(id).copied().map(|location| (*id, location)))
+                    .filter_map(|id| {
+                        if let Some(object) = inner.pending_wal.get_object(id) {
+                            pending.push((*id, object.record().clone()));
+                            None
+                        } else {
+                            inner.index.get(id).copied().map(|location| (*id, location))
+                        }
+                    })
                     .collect::<Vec<_>>();
-                (locations, inner.arena_generation)
+                (pending, locations, inner.arena_generation)
             };
             let reader_guard = self.arena_reader.read();
             let Some(reader) = reader_guard.as_ref() else {
@@ -209,8 +217,9 @@ where
             if reader.generation != generation {
                 continue;
             }
-            let loaded =
+            let mut loaded =
                 read_indexed_objects(&reader.file, &locations, &self.identity, self.limits)?;
+            loaded.extend(pending);
             drop(reader_guard);
             let inner = self.lock_usable_with(&mut recovery)?;
             if inner.arena_generation != generation {
@@ -254,7 +263,9 @@ where
         recovery: &mut RecoveryScope,
     ) -> Result<Option<Arc<ObjectRecord>>, DurableError> {
         let inner = self.lock_usable_with(recovery)?;
-        if inner.arena_generation != generation || !inner.index.contains_key(&id) {
+        if inner.arena_generation != generation
+            || (!inner.index.contains_key(&id) && inner.pending_wal.get_object(&id).is_none())
+        {
             return Ok(None);
         }
         Ok(Some(self.object_cache.insert(principal, id, record)))

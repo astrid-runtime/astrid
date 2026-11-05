@@ -438,6 +438,14 @@ where
         Ok(self.object(id))
     }
 
+    fn load_shared_kv_object_for(
+        &self,
+        _principal: &P,
+        id: ObjectId,
+    ) -> Result<Option<Arc<ObjectRecord>>, KvProjectionError> {
+        Ok(self.world.read().shared_object(id))
+    }
+
     fn snapshot_kv_root(&self, principal: &P) -> Result<Option<RootSnapshot>, KvProjectionError> {
         self.snapshot(principal).map_err(Into::into)
     }
