@@ -15,6 +15,23 @@ fn bytes() -> Vec<u8> {
 }
 
 #[test]
+fn borrowed_and_owned_values_have_identical_canonical_records() {
+    let engine = InMemoryEngine::new(TestIdentity);
+    let principal = "alice".to_owned();
+    let large = bytes();
+    for bytes in [&b"inline"[..], &large[..2000], large.as_slice()] {
+        let mut borrowed = TreeContext::new(&engine, &principal);
+        let borrowed_value = borrowed.make_value(bytes).unwrap();
+        let mut owned = TreeContext::new(&engine, &principal);
+        let owned_value = owned.make_value(bytes.to_vec()).unwrap();
+        assert_eq!(borrowed_value, owned_value);
+        assert_eq!(borrowed.records, owned.records);
+        assert_eq!(borrowed.value_bytes(&borrowed_value).unwrap(), bytes);
+    }
+    assert_eq!(engine.object_count(), 0);
+}
+
+#[test]
 fn chunked_value_round_trip_stays_transaction_local() {
     let engine = InMemoryEngine::new(TestIdentity);
     let principal = "alice".to_owned();

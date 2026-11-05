@@ -5,6 +5,8 @@
 //! owning one canonical file DAG. Reuse, reachability and admission remain in
 //! the same root transaction; no side keys or separate publications are used.
 
+use std::borrow::Cow;
+
 use super::super::node::{decode_value, value_record};
 use super::{
     INLINE_VALUE_MAX, KvProjectionEngine, ObjectClass, ObjectId, ObjectKind, ObjectRecord,
@@ -26,15 +28,19 @@ const CONTENT_LABEL: &[u8] = b"content";
 const PROFILE: ChunkingProfile = ChunkingProfile::ASTRID_V1;
 
 impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
-    pub(super) fn make_value(&mut self, bytes: Vec<u8>) -> StorageResult<ValueSlot> {
+    pub(super) fn make_value<'b>(
+        &mut self,
+        bytes: impl Into<Cow<'b, [u8]>>,
+    ) -> StorageResult<ValueSlot> {
+        let bytes = bytes.into();
         if bytes.len() <= INLINE_VALUE_MAX {
-            return Ok(ValueSlot::Inline(bytes));
+            return Ok(ValueSlot::Inline(bytes.into_owned()));
         }
         let length = u64::try_from(bytes.len()).map_err(|_| arithmetic_overflow())?;
         let object = if length > u64::from(PROFILE.maximum_bytes()) {
             self.make_chunked_value(&bytes, length)?
         } else {
-            self.insert(value_record(bytes)?)?
+            self.insert(value_record(bytes.into_owned())?)?
         };
         Ok(ValueSlot::Spilled { object, length })
     }

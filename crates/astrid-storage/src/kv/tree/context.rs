@@ -424,10 +424,10 @@ where
             )?;
             let value = replacement
                 .as_ref()
-                .map(|value| self.make_value(value.clone()))
+                .map(|value| self.make_value(value.as_slice()))
                 .transpose()?;
-            // The canonical builder consumes a copy; retain the caller's bytes
-            // for the overlay instead of decoding the just-staged value again.
+            // Chunk construction borrows these bytes; retain them for the
+            // overlay instead of reconstructing the just-staged value.
             // Root admission still verifies the complete transaction.
             current.insert(key.clone(), replacement);
             mutations.push(Mutation { key, value });
