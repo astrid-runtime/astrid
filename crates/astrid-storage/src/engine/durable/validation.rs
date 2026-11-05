@@ -119,16 +119,6 @@ pub(super) fn preload_indexed_closures<I: PersistentObjectIdentity>(
     Ok(loaded)
 }
 
-pub(super) fn validate_commit_closure(
-    records: &[(ObjectId, ObjectRecord)],
-    commit: ObjectId,
-) -> Result<(), ModelError> {
-    let mut world = World::<()>::new();
-    world.import_closure(records, commit)?;
-    world.compare_and_swap_root((), None, commit)?;
-    Ok(())
-}
-
 pub(super) fn validate_incremental_closure<I: PersistentObjectIdentity, P: Ord>(
     source: &mut ClosureObjects<'_, I, P>,
     validated: &BTreeSet<ObjectId>,

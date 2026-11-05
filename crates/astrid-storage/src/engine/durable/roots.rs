@@ -2,12 +2,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::storage_model::{ModelError, ObjectId, RootGeneration, RootState};
+use crate::storage_model::{ModelError, ObjectId, RootGeneration, RootState, World};
 
 use super::{
     ArenaLocation, DurableError, DurableIo, File, IdentityScheme, PersistentObjectIdentity,
-    PrincipalCodec, ROOT_FILE, ROOT_MAGIC, RecoveryLimits, corrupt, materialize_closure,
-    preload_indexed_closures, recovery_closure_error, scan_frames, validate_commit_closure,
+    PrincipalCodec, ROOT_FILE, ROOT_MAGIC, RecoveryLimits, corrupt, preload_indexed_closures,
+    recovery_closure_error, scan_frames,
 };
 
 const SNAPSHOT_SENTINEL: u64 = u64::MAX;
@@ -75,29 +75,27 @@ where
         let root_offset = recovered.values().next().map_or(0, |(_, offset)| *offset);
         recovery_closure_error(error, root_offset)
     })?;
-    let empty_index = BTreeMap::new();
-    for (root, offset) in recovered.values().copied() {
-        let records = materialize_closure(
-            &mut super::ClosureObjects::<_, P> {
-                arena,
-                index: &empty_index,
-                incoming: &preload,
-                pending: None,
-                identity,
-                limits,
-            },
-            root.commit,
-        )
-        .map_err(|error| recovery_closure_error(error, offset))?;
-        validate_commit_closure(&records, root.commit).map_err(|source| {
-            DurableError::RecoveryModel {
-                file: ROOT_FILE,
-                offset,
-                source,
-            }
+    // The preload already authenticated the union of reachable records. Move
+    // those records into the authoritative model instead of materializing and
+    // then importing a deep-owned copy of every principal's payload closure.
+    let mut world = World::new();
+    for (id, record) in preload {
+        world.insert_object(id, record).map_err(|source| {
+            let offset = recovered.values().next().map_or(0, |(_, offset)| *offset);
+            recovery_closure_error(source.into(), offset)
         })?;
-        validated.extend(records.into_iter().map(|(id, _)| id));
     }
+    for (principal, (root, offset)) in &recovered {
+        let model_error = |source: ModelError| recovery_closure_error(source.into(), *offset);
+        // Graph failures must still precede the root-kind check, just as they
+        // did when materialization ran before the model's import and root CAS.
+        let closure = world.closure(root.commit).map_err(model_error)?;
+        world
+            .compare_and_swap_root(principal, None, root.commit)
+            .map_err(model_error)?;
+        validated.extend(closure);
+    }
+    drop(world);
     Ok((
         recovered
             .into_iter()
@@ -434,3 +432,6 @@ impl<'a> RootReader<'a> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;
