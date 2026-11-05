@@ -951,3 +951,7 @@ mod chunked_value_tests;
 #[path = "tree/admission_test_support.rs"]
 mod admission_test_support;
 use admission_test_support::{AdmissionCensus, drain_checkpoint_tasks, settled_admission_census};
+
+#[cfg(not(target_family = "wasm"))]
+#[path = "tree/stale_publication_tests.rs"]
+mod stale_publication_tests;

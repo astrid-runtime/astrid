@@ -10,7 +10,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::engine::{KvProjectionEngine, KvProjectionError};
-use crate::storage_model::ModelError;
+use crate::storage_model::{ModelError, RootState};
 use parking_lot::Mutex;
 
 use self::context::{Replacement, TreeContext};
@@ -69,6 +69,41 @@ impl<P: Ord> Default for KvValidationCache<P> {
             trees: Mutex::new(BTreeMap::new()),
             projections: Mutex::new(BTreeMap::new()),
         }
+    }
+}
+
+impl<P: Clone + Ord> KvValidationCache<P> {
+    fn publish_if_current<E: KvProjectionEngine<P>>(
+        &self,
+        engine: &E,
+        owner: P,
+        expected: RootState,
+        projection: Projection,
+        checkpoint: Option<TreeValidation>,
+    ) {
+        if let Some(checkpoint) = checkpoint
+            && (checkpoint.root() != projection.tree
+                || projection.boundary != Some(checkpoint.certificate()))
+        {
+            return;
+        }
+        // Order every cache publisher and check currency inside that guard.
+        // Never hold it across graph validation or an authoritative commit.
+        let mut projections = self.projections.lock();
+        let Ok(Some(current)) = engine.current_kv_root(&owner) else {
+            // An optional cache query must not false-fail an already successful
+            // commit or historical snapshot read.
+            return;
+        };
+        if current != expected {
+            return;
+        }
+        // Nested cache order is projections -> trees. The engine root method
+        // has returned and released its own lock before either map is changed.
+        if let Some(checkpoint) = checkpoint {
+            self.trees.lock().insert(owner.clone(), checkpoint);
+        }
+        projections.insert(owner, projection);
     }
 }
 
@@ -287,29 +322,31 @@ where
             let validated_projection = projection.clone();
             let transaction = context.finish_projection(header, &projection)?;
             match self.engine.commit_kv_root(transaction) {
-                Ok(_) => {
+                Ok(outcome) => {
                     // A delta projection keeps the checkpoint tree unchanged;
                     // its totals include the overlay and therefore must never
                     // be cached as validation for that checkpoint tree.
-                    if projection.depth == 0
+                    let checkpoint = if projection.depth == 0
                         && let Some(certificate) = projection
                             .boundary
                             .filter(|certificate| certificate.matches_tree(tree))
                     {
-                        self.validation.trees.lock().insert(
-                            owner.clone(),
-                            TreeValidation::from_certificate(
-                                certificate,
-                                projection.totals.entries,
-                                logical_bytes,
-                                projection_used,
-                            ),
-                        );
-                    }
-                    self.validation
-                        .projections
-                        .lock()
-                        .insert(owner.clone(), validated_projection);
+                        Some(TreeValidation::from_certificate(
+                            certificate,
+                            projection.totals.entries,
+                            logical_bytes,
+                            projection_used,
+                        ))
+                    } else {
+                        None
+                    };
+                    self.validation.publish_if_current(
+                        self.engine.as_ref(),
+                        owner.clone(),
+                        outcome.root(),
+                        validated_projection,
+                        checkpoint,
+                    );
                     if should_checkpoint(&projection) {
                         self.schedule_checkpoint(owner.clone());
                     }
@@ -449,12 +486,14 @@ where
             return Ok(false);
         };
         match self.engine.commit_kv_root(transaction) {
-            Ok(_) => {
-                self.validation
-                    .trees
-                    .lock()
-                    .insert(owner.clone(), validation);
-                self.validation.projections.lock().insert(owner, rebased);
+            Ok(outcome) => {
+                self.validation.publish_if_current(
+                    self.engine.as_ref(),
+                    owner,
+                    outcome.root(),
+                    rebased,
+                    Some(validation),
+                );
                 Ok(true)
             },
             Err(KvProjectionError::Model(ModelError::RootConflict { .. })) => Ok(false),
@@ -615,6 +654,29 @@ where
         self.blocking_store()
             .header(owner)
             .map(|header| header.delta_depth)
+    }
+
+    #[cfg(test)]
+    pub(super) fn cached_checkpoint_for_test(
+        &self,
+        owner: &P,
+    ) -> (
+        Option<crate::storage_model::ObjectId>,
+        Option<crate::storage_model::ObjectId>,
+    ) {
+        let head = self
+            .validation
+            .projections
+            .lock()
+            .get(owner)
+            .and_then(|entry| entry.head);
+        let tree = self
+            .validation
+            .trees
+            .lock()
+            .get(owner)
+            .and_then(|entry| entry.root());
+        (head, tree)
     }
 
     #[cfg(test)]

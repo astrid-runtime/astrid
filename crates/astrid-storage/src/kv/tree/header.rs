@@ -76,14 +76,8 @@ where
     let state_id = owned_target(root.commit, &commit, STATE_LABEL)?;
     let state = load_typed(engine, &owner, state_id, ObjectKind::PrincipalState)?;
     require_structural(state_id, &state)?;
-    let projection = match state.reference(&ReferenceLabel::new(KV_LABEL)) {
-        None => {
-            validation
-                .trees
-                .lock()
-                .insert(owner.clone(), TreeValidation::EMPTY);
-            Projection::empty()
-        },
+    let (projection, checkpoint) = match state.reference(&ReferenceLabel::new(KV_LABEL)) {
+        None => (Projection::empty(), Some(TreeValidation::EMPTY)),
         Some(reference) if reference.kind() == ReferenceKind::Owns => {
             let cached = validation
                 .projections
@@ -92,19 +86,15 @@ where
                 .filter(|projection| projection.head == Some(reference.target()))
                 .cloned();
             if let Some(cached) = cached {
-                cached
+                (cached, None)
             } else {
-                let decoded = decode_kv_component::<P, E>(
+                let (decoded, checkpoint) = decode_kv_component::<P, E>(
                     engine,
                     &owner,
                     reference.target(),
                     &validation.trees,
                 )?;
-                validation
-                    .projections
-                    .lock()
-                    .insert(owner.clone(), decoded.clone());
-                decoded
+                (decoded, Some(checkpoint))
             }
         },
         Some(_) => {
@@ -122,6 +112,15 @@ where
         })
         .cloned()
         .collect();
+    if let Some(checkpoint) = checkpoint {
+        validation.publish_if_current(
+            engine,
+            owner.clone(),
+            root,
+            projection.clone(),
+            Some(checkpoint),
+        );
+    }
     Ok(TreeHeader {
         owner,
         root: Some(root),
@@ -142,10 +141,13 @@ where
     })
 }
 
+// A captured root authorizes publication only when the caller retrieved `head`
+// from that exact root's owning KV component. Historical callers pass None.
 pub(crate) fn validated_projection<P, E>(
     engine: &E,
     owner: &P,
     head: ObjectId,
+    captured_root: Option<RootState>,
     validation: &KvValidationCache<P>,
 ) -> StorageResult<Projection>
 where
@@ -161,11 +163,16 @@ where
     if let Some(cached) = cached {
         return Ok(cached);
     }
-    let decoded = decode_kv_component(engine, owner, head, &validation.trees)?;
-    validation
-        .projections
-        .lock()
-        .insert(owner.clone(), decoded.clone());
+    let (decoded, checkpoint) = decode_kv_component(engine, owner, head, &validation.trees)?;
+    if let Some(root) = captured_root {
+        validation.publish_if_current(
+            engine,
+            owner.clone(),
+            root,
+            decoded.clone(),
+            Some(checkpoint),
+        );
+    }
     Ok(decoded)
 }
 
@@ -173,13 +180,14 @@ pub(crate) fn validated_projection_quota<P, E>(
     engine: &E,
     owner: &P,
     head: ObjectId,
+    captured_root: Option<RootState>,
     validation: &KvValidationCache<P>,
 ) -> StorageResult<u64>
 where
     P: Clone + Ord,
     E: KvProjectionEngine<P>,
 {
-    validated_projection(engine, owner, head, validation)
+    validated_projection(engine, owner, head, captured_root, validation)
         .map(|projection| projection.totals.quota_bytes)
 }
 
@@ -306,7 +314,7 @@ fn decode_kv_component<P, E>(
     owner: &P,
     head_id: ObjectId,
     validated_trees: &Mutex<BTreeMap<P, TreeValidation>>,
-) -> StorageResult<Projection>
+) -> StorageResult<(Projection, TreeValidation)>
 where
     P: Clone + Ord,
     E: KvProjectionEngine<P>,
@@ -346,9 +354,7 @@ where
         validation
     } else {
         let mut context = TreeContext::<P, E>::new(engine, owner);
-        let validation = context.validate_tree(tree)?;
-        validated_trees.lock().insert(owner.clone(), validation);
-        validation
+        context.validate_tree(tree)?
     };
     if validation.entries != checkpoint_totals.entries
         || validation.logical_bytes != checkpoint_totals.logical_bytes
@@ -384,15 +390,18 @@ where
         prior_depth = depth;
         prior_delta_bytes = delta_bytes;
     }
-    Ok(Projection {
-        head: Some(head_id),
-        tree,
-        overlay,
-        depth: prior_depth,
-        delta_bytes: prior_delta_bytes,
-        totals,
-        boundary: Some(validation.certificate()),
-    })
+    Ok((
+        Projection {
+            head: Some(head_id),
+            tree,
+            overlay,
+            depth: prior_depth,
+            delta_bytes: prior_delta_bytes,
+            totals,
+            boundary: Some(validation.certificate()),
+        },
+        validation,
+    ))
 }
 
 fn apply_validated_mutations<P, E>(
