@@ -145,3 +145,112 @@ fn placement_validation_retains_only_the_join_fields_after_each_decode() {
         "placement validation retained {peak} temporary bytes for {replica_backing} replica bytes"
     );
 }
+
+#[test]
+#[cfg(not(target_family = "wasm"))]
+fn generation_zero_checks_do_not_retain_the_complete_locator_corpus() {
+    use super::super::{RepresentationStore, open_store_root};
+
+    const OBJECTS: u8 = 64;
+    const REPLICAS: u64 = 256;
+    let directory = tempfile::tempdir().unwrap();
+    let root = open_store_root(directory.path()).unwrap();
+    let mut store = RepresentationStore::activate(
+        &root,
+        RecoveryLimits::process_addressable(),
+        ObjectId::new([9; 32]),
+        [],
+    )
+    .unwrap();
+    let mut index = BTreeMap::new();
+    for ordinal in 0..OBJECTS {
+        let (object, location) =
+            insert_generation_zero_test_placement(&mut store, ordinal, REPLICAS);
+        index.insert(object, location);
+    }
+    // Fixture ownership stays outside the accounting window. Both production
+    // consumers must decode every selected placement without collecting all
+    // object/locator pairs before using them.
+    let (protected, protection_peak) =
+        crate::allocation_test_support::peak_during(|| store.generation_zero_protected_len());
+    let (topology, topology_peak) = crate::allocation_test_support::peak_during(|| {
+        store.validate_generation_zero_index(&index)
+    });
+    assert_eq!(
+        protected.unwrap(),
+        u64::from(OBJECTS) * REPLICAS - 1 + FRAME_HEADER_LEN + 8
+    );
+    topology.unwrap();
+    let corpus_bytes = usize::from(OBJECTS)
+        * usize::try_from(REPLICAS).unwrap()
+        * std::mem::size_of::<(ObjectId, super::super::ArenaLocation)>();
+    assert!(
+        protection_peak < corpus_bytes / 4 && topology_peak < corpus_bytes / 4,
+        "generation-zero validation retained protection={protection_peak}, topology={topology_peak} bytes for {corpus_bytes} locator bytes"
+    );
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn insert_generation_zero_test_placement(
+    store: &mut super::super::RepresentationStore,
+    ordinal: u8,
+    replica_count: u64,
+) -> (ObjectId, super::super::ArenaLocation) {
+    use super::super::LOCAL_STORAGE_NODE;
+    use crate::storage_model::{Replica, ReplicaLocator};
+    let object = ObjectId::new([ordinal; 32]);
+    let offset = u64::from(ordinal) * replica_count;
+    let location = super::super::ArenaLocation {
+        offset,
+        payload_len: 8,
+        checksum: [ordinal; 32],
+    };
+    let described = store
+        .describe_direct(object, &[ordinal; 8], location)
+        .unwrap();
+    let record = RepresentationRecord::new(
+        store.direct_profile,
+        Coverage::exact(object, 8).unwrap(),
+        Recipe::DirectCanonical {
+            blob: described.blob,
+        },
+        8,
+        8,
+        None,
+    )
+    .unwrap();
+    let id = record.identify(&Blake3PhysicalIdentity).unwrap();
+    store
+        .representations
+        .insert(
+            &Blake3PhysicalIdentity,
+            PhysicalMapKey::from(id),
+            record.encode().unwrap(),
+        )
+        .unwrap();
+    let replicas = (offset..offset + replica_count)
+        .map(|offset| {
+            Replica::new(
+                LOCAL_STORAGE_NODE,
+                ReplicaLocator::ArenaFrame {
+                    arena_generation: 0,
+                    offset,
+                    payload_length: 8,
+                    frame_checksum: [ordinal; 32],
+                },
+            )
+            .unwrap()
+        })
+        .collect();
+    let placement = PlacementEntry::new(described.blob, store.direct_profile, 8, replicas).unwrap();
+    store
+        .placement_entries
+        .insert(
+            &Blake3PhysicalIdentity,
+            PhysicalMapKey::from(described.blob),
+            placement.encode().unwrap(),
+        )
+        .unwrap();
+    store.reverse.insert(object, vec![id]);
+    (object, location)
+}

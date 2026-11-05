@@ -2,27 +2,21 @@
 
 use super::{ArenaLocation, BTreeMap, DurableError, ObjectId};
 
-pub(super) fn validate(
-    direct: &[(ObjectId, ArenaLocation)],
+pub(super) fn validate_object(
+    object: &ObjectId,
+    mut candidates: impl Iterator<Item = ArenaLocation>,
     index: &BTreeMap<ObjectId, ArenaLocation>,
 ) -> Result<(), DurableError> {
-    // direct_arena_locations walks the ordered reverse map and emits every
-    // object's replicas contiguously, rejecting objects without a replica.
-    // Visit each group once rather than rescanning the whole corpus per object.
-    for replicas in direct.chunk_by(|left, right| left.0 == right.0) {
-        let object = replicas[0].0;
-        let location =
-            index
-                .get(&object)
-                .copied()
-                .ok_or(DurableError::InvalidRepresentationState(
-                    "direct representation names a missing logical object",
-                ))?;
-        if !replicas.iter().any(|(_, candidate)| *candidate == location) {
-            return Err(DurableError::InvalidRepresentationState(
-                "generation-zero placement disagrees with the arena index",
-            ));
-        }
+    let location = index
+        .get(object)
+        .copied()
+        .ok_or(DurableError::InvalidRepresentationState(
+            "direct representation names a missing logical object",
+        ))?;
+    if !candidates.any(|candidate| candidate == location) {
+        return Err(DurableError::InvalidRepresentationState(
+            "generation-zero placement disagrees with the arena index",
+        ));
     }
     Ok(())
 }
@@ -30,6 +24,20 @@ pub(super) fn validate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn validate(
+        direct: &[(ObjectId, ArenaLocation)],
+        index: &BTreeMap<ObjectId, ArenaLocation>,
+    ) -> Result<(), DurableError> {
+        for replicas in direct.chunk_by(|left, right| left.0 == right.0) {
+            validate_object(
+                &replicas[0].0,
+                replicas.iter().map(|(_, location)| *location),
+                index,
+            )?;
+        }
+        Ok(())
+    }
 
     fn location(offset: u64) -> ArenaLocation {
         ArenaLocation {

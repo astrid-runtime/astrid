@@ -29,6 +29,7 @@ mod activation;
 mod authority;
 mod checkpoint;
 mod format;
+mod generation_zero;
 mod index_validation;
 mod recovery;
 mod residency;
@@ -573,11 +574,14 @@ impl RepresentationStore {
         {
             return Ok(false);
         }
-        Ok(self
-            .direct_arena_locations()?
-            .into_iter()
-            .collect::<BTreeMap<_, _>>()
-            == expected)
+        let mut actual = BTreeMap::new();
+        self.visit_direct_placements(|object, placement| {
+            for location in generation_zero::locations(placement) {
+                actual.insert(*object, location);
+            }
+            Ok(())
+        })?;
+        Ok(actual == expected)
     }
 
     fn prepare_direct_entry(
@@ -699,93 +703,6 @@ impl RepresentationStore {
         self.journal
             .sync_data()
             .map_err(|source| io_error("flush representation state journal", source))
-    }
-
-    /// Return the arena prefix proven durable by published physical state.
-    ///
-    /// A malformed frame below this boundary is corruption, not a repairable
-    /// uncommitted tail. Recovery consults this value before it may truncate
-    /// the logical arena.
-    pub(super) fn generation_zero_protected_len(&self) -> Result<u64, DurableError> {
-        self.direct_arena_locations()?
-            .into_iter()
-            .try_fold(0_u64, |protected, (_, location)| {
-                let end = location
-                    .offset
-                    .checked_add(FRAME_HEADER_LEN)
-                    .and_then(|value| value.checked_add(location.payload_len))
-                    .ok_or(DurableError::EncodingOverflow)?;
-                Ok(protected.max(end))
-            })
-    }
-
-    /// Validate that generation-zero placements name the recovered arena
-    /// index exactly.
-    ///
-    /// This is mount-time topology validation, not an implicit full-store
-    /// scrub. Authoritative object reads verify the named frame checksum,
-    /// canonical encoding, and logical identity before returning bytes. A
-    /// scheduled refinery pass owns proactive full-corpus re-attestation.
-    pub(super) fn validate_generation_zero_index(
-        &self,
-        index: &BTreeMap<ObjectId, ArenaLocation>,
-    ) -> Result<(), DurableError> {
-        let direct = self.direct_arena_locations()?;
-        index_validation::validate(&direct, index)
-    }
-
-    fn direct_arena_locations(&self) -> Result<Vec<(ObjectId, ArenaLocation)>, DurableError> {
-        let mut direct = Vec::new();
-        for (object, records) in &self.reverse {
-            let record = records
-                .iter()
-                .filter_map(|id| {
-                    self.representations
-                        .get(PhysicalMapKey::from(*id))
-                        .and_then(|bytes| RepresentationRecord::decode(bytes).ok())
-                })
-                .find(|record| record.profile() == self.direct_profile)
-                .ok_or(DurableError::InvalidRepresentationState(
-                    "reverse index has no direct representation",
-                ))?;
-            let Recipe::DirectCanonical { blob } = record.recipe() else {
-                return Err(DurableError::InvalidRepresentationState(
-                    "direct profile uses a non-direct recipe",
-                ));
-            };
-            let placement = self
-                .placement_entries
-                .get(PhysicalMapKey::from(*blob))
-                .ok_or(DurableError::InvalidRepresentationState(
-                    "direct representation placement disappeared",
-                ))?;
-            let placement = PlacementEntry::decode(placement)?;
-            let before = direct.len();
-            for replica in placement.replicas() {
-                if let ReplicaLocator::ArenaFrame {
-                    arena_generation: 0,
-                    offset,
-                    payload_length,
-                    frame_checksum,
-                } = replica.locator()
-                {
-                    direct.push((
-                        *object,
-                        ArenaLocation {
-                            offset,
-                            payload_len: payload_length,
-                            checksum: frame_checksum,
-                        },
-                    ));
-                }
-            }
-            if direct.len() == before {
-                return Err(DurableError::InvalidRepresentationState(
-                    "direct representation has no generation-zero arena placement",
-                ));
-            }
-        }
-        Ok(direct)
     }
 
     fn from_recovered(
