@@ -36,6 +36,7 @@ pub(super) struct TreeHeader<P> {
     pub(super) other_quota_bytes: u64,
     pub(super) preserved_state: Vec<ObjectReference>,
     pub(super) preserved_commit: Vec<ObjectReference>,
+    pub(super) boundary: Option<super::validation::ValidatedCheckpoint>,
 }
 
 impl<P> TreeHeader<P> {
@@ -54,6 +55,7 @@ impl<P> TreeHeader<P> {
             other_quota_bytes: 0,
             preserved_state: Vec::new(),
             preserved_commit: Vec::new(),
+            boundary: Some(super::validation::ValidatedCheckpoint::empty()),
         }
     }
 }
@@ -134,6 +136,9 @@ where
         other_quota_bytes,
         preserved_state,
         preserved_commit,
+        boundary: projection
+            .boundary
+            .filter(|certificate| certificate.matches_tree(projection.tree)),
     })
 }
 
@@ -336,7 +341,7 @@ where
         .lock()
         .get(owner)
         .copied()
-        .filter(|validation| validation.root == tree);
+        .filter(|validation| validation.root() == tree);
     let validation = if let Some(validation) = cached {
         validation
     } else {
@@ -386,6 +391,7 @@ where
         depth: prior_depth,
         delta_bytes: prior_delta_bytes,
         totals,
+        boundary: Some(validation.certificate()),
     })
 }
 

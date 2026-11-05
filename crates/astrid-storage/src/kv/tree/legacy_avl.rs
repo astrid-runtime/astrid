@@ -350,6 +350,7 @@ where
             other_quota_bytes: 0,
             preserved_state,
             preserved_commit,
+            boundary: Some(super::validation::ValidatedCheckpoint::empty()),
         },
         entries,
     }))

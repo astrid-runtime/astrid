@@ -27,7 +27,7 @@ impl AdmissionCensus {
         let roots = if before.commits == 0 && transitions != 0 {
             root_frame_bytes(b"alice", false)
                 .unwrap()
-                .checked_add((transitions - 1).checked_mul(later).unwrap())
+                .checked_add(transitions.strict_sub(1).checked_mul(later).unwrap())
                 .unwrap()
         } else {
             transitions.checked_mul(later).unwrap()

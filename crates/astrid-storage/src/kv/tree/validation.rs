@@ -1,19 +1,96 @@
 //! Full structural and accounting validation for persistent KV B+-trees.
 
+#[cfg(test)]
+#[path = "validation/proof_tests.rs"]
+mod proof_tests;
+
 use std::collections::BTreeMap;
 
 use crate::engine::KvProjectionEngine;
 use crate::storage_model::ObjectId;
 
 use super::context::TreeContext;
-use super::node::{ChildPointer, Node, NodeHandle, NodeTotals};
-use crate::error::StorageResult;
+use super::node::{ChildPointer, Node, NodeHandle, NodeTotals, ValueSlot};
+use crate::error::{StorageError, StorageResult};
 use crate::kv::tree_error::invalid;
 use crate::kv::{validate_key, validate_namespace};
 
+/// Opaque constant-size certificate that an exact immutable KV checkpoint tree
+/// may use certified point-reads.
+///
+/// Constructed only inside this module after full `validate_tree`, for the empty
+/// tree, or by inductive checkpoint derivation from a header that already
+/// carried a matching certificate. Owner binding is the carrying
+/// [`super::header::TreeHeader`] / principal partition: `projected_get` only
+/// skips content-boundary revalidation when the live context principal owns
+/// that header and `header.tree` matches this certificate. An empty
+/// (`None`-root) certificate never authorizes an opened content DAG.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ValidatedCheckpoint {
+    root: Option<ObjectId>,
+}
+
+impl ValidatedCheckpoint {
+    const EMPTY: Self = Self { root: None };
+
+    const fn certified(root: ObjectId) -> Self {
+        Self { root: Some(root) }
+    }
+
+    /// Empty checkpoint tree certificate. Never authorizes content tokens.
+    #[must_use]
+    pub(super) const fn empty() -> Self {
+        Self::EMPTY
+    }
+
+    /// Exact checkpoint tree root covered by this certificate, if any.
+    #[must_use]
+    pub(crate) const fn root(self) -> Option<ObjectId> {
+        self.root
+    }
+
+    /// Return whether this certificate names exactly `tree`.
+    #[must_use]
+    pub(super) fn matches_tree(self, tree: Option<ObjectId>) -> bool {
+        self.root == tree
+    }
+
+    /// Mint a per-read membership token for a content file retrieved under this
+    /// certificate. Empty certificates cannot mint; callers must only invoke
+    /// this after a bound leaf traversal found the file in this tree.
+    const fn membership_for_retrieved_file(
+        self,
+        file: ObjectId,
+    ) -> Option<CertifiedValueMembership> {
+        if self.root.is_none() {
+            return None;
+        }
+        Some(CertifiedValueMembership { file })
+    }
+}
+
+/// Constant-size per-read proof that one content file was retrieved under a
+/// sealed [`ValidatedCheckpoint`] tree traversal.
+///
+/// Constructed only in this module. The content-DAG bridge accepts this type
+/// and checks the opened descriptor's file identity; arbitrary opened DAGs
+/// cannot be authorized by presenting a tree certificate alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CertifiedValueMembership {
+    file: ObjectId,
+}
+
+impl CertifiedValueMembership {
+    /// Content-DAG file identity bound by the certified retrieval.
+    #[must_use]
+    pub(crate) const fn file(self) -> ObjectId {
+        self.file
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::kv) struct TreeValidation {
-    pub(in crate::kv) root: Option<ObjectId>,
+    certificate: ValidatedCheckpoint,
     pub(in crate::kv) entries: u64,
     pub(in crate::kv) logical_bytes: u64,
     pub(in crate::kv) quota_bytes: u64,
@@ -21,11 +98,39 @@ pub(in crate::kv) struct TreeValidation {
 
 impl TreeValidation {
     pub(in crate::kv) const EMPTY: Self = Self {
-        root: None,
+        certificate: ValidatedCheckpoint::EMPTY,
         entries: 0,
         logical_bytes: 0,
         quota_bytes: 0,
     };
+
+    /// Checkpoint tree root named by the sealed certificate.
+    #[must_use]
+    pub(in crate::kv) const fn root(self) -> Option<ObjectId> {
+        self.certificate.root()
+    }
+
+    /// Borrow the sealed certificate carried by this validation result.
+    #[must_use]
+    pub(super) const fn certificate(self) -> ValidatedCheckpoint {
+        self.certificate
+    }
+
+    /// Construct accounting around an already-sealed certificate.
+    #[must_use]
+    pub(super) const fn from_certificate(
+        certificate: ValidatedCheckpoint,
+        entries: u64,
+        logical_bytes: u64,
+        quota_bytes: u64,
+    ) -> Self {
+        Self {
+            certificate,
+            entries,
+            logical_bytes,
+            quota_bytes,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -101,12 +206,110 @@ where
         let validated = computed
             .remove(&root)
             .ok_or_else(|| invalid(root, "persistent KV root validation is missing"))?;
-        Ok(TreeValidation {
-            root: Some(root),
-            entries: validated.totals.entries,
-            logical_bytes: validated.totals.logical_bytes,
-            quota_bytes: validated.totals.quota_bytes,
-        })
+        Ok(TreeValidation::from_certificate(
+            ValidatedCheckpoint::certified(root),
+            validated.totals.entries,
+            validated.totals.logical_bytes,
+            validated.totals.quota_bytes,
+        ))
+    }
+
+    /// Pack a new checkpoint tree from a header that already carries a sealed
+    /// certificate for its current tree, and mint the successor certificate.
+    pub(super) fn build_validated_checkpoint(
+        &mut self,
+        header: &super::header::TreeHeader<P>,
+    ) -> StorageResult<(Option<ObjectId>, TreeValidation)> {
+        if self.principal() != &header.owner {
+            return Err(StorageError::Serialization(
+                "KV checkpoint owner disagrees with the live principal".to_owned(),
+            ));
+        }
+        if !header
+            .boundary
+            .is_some_and(|certificate| certificate.matches_tree(header.tree))
+        {
+            return Err(StorageError::Serialization(
+                "KV checkpoint requires a sealed certificate for the current tree".to_owned(),
+            ));
+        }
+        let entries = self.checkpoint_entries(header)?;
+        let tree = self.build_sorted_slots(entries)?;
+        let certificate = tree.map_or(ValidatedCheckpoint::empty(), ValidatedCheckpoint::certified);
+        Ok((
+            tree,
+            TreeValidation::from_certificate(
+                certificate,
+                header.entries,
+                header.logical_bytes,
+                header.quota_bytes,
+            ),
+        ))
+    }
+
+    /// Point-read a value under a sealed checkpoint certificate.
+    ///
+    /// Requires the carrying header's owner to match this context principal and
+    /// the certificate to name `header.tree`. Chunked values mint a private
+    /// per-read [`CertifiedValueMembership`] after the shared leaf lookup.
+    /// Mismatched or empty certificates fall back to fully validating reads.
+    pub(super) fn read_certified_tree_value(
+        &mut self,
+        header: &super::header::TreeHeader<P>,
+        key: &[u8],
+        certificate: ValidatedCheckpoint,
+    ) -> StorageResult<Option<Vec<u8>>> {
+        if self.principal() != &header.owner
+            || !certificate.matches_tree(header.tree)
+            || certificate.root().is_none()
+        {
+            return self.get(header.tree, key);
+        }
+        self.get_slot(header.tree, key)?
+            .map(|value| self.certified_slot_bytes(&value, certificate))
+            .transpose()
+    }
+
+    fn certified_slot_bytes(
+        &self,
+        value: &ValueSlot,
+        certificate: ValidatedCheckpoint,
+    ) -> StorageResult<Vec<u8>> {
+        use super::node::decode_value;
+        use crate::content_dag::{
+            read_verified_content, verified_content_from_certified_membership,
+        };
+        match value {
+            ValueSlot::Inline(bytes) => Ok(bytes.clone()),
+            ValueSlot::Spilled { object, length } => {
+                let record = self.record(*object)?;
+                if record.format_version() == super::context::value::chunked_value_version() {
+                    let opened = self.open_chunked_value(*object, *length, &record)?;
+                    let membership = certificate
+                        .membership_for_retrieved_file(opened.descriptor().file())
+                        .ok_or_else(|| {
+                            invalid(
+                                *object,
+                                "chunked KV value lacks a matching tree certificate",
+                            )
+                        })?;
+                    let verified = verified_content_from_certified_membership(opened, membership)
+                        .ok_or_else(|| {
+                        invalid(
+                            *object,
+                            "chunked KV value membership disagrees with opened content",
+                        )
+                    })?;
+                    read_verified_content(self, verified).map_err(|error| {
+                        StorageError::Serialization(format!(
+                            "read chunked KV value {object:?}: {error}"
+                        ))
+                    })
+                } else {
+                    decode_value(*object, *length, &record)
+                }
+            },
+        }
     }
 
     fn validate_page(

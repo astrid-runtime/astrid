@@ -215,6 +215,44 @@ fn chunked_value_verifies_content_boundaries() {
             .value_bytes(&ValueSlot::Spilled { object, length })
             .is_err()
     );
+    let tree = context
+        .build_sorted_slots(vec![crate::kv::tree::node::LeafEntry {
+            key: b"alice:capsule:ownership\0invalid".to_vec(),
+            value: ValueSlot::Spilled { object, length },
+        }])
+        .unwrap();
+    assert!(
+        context.validate_tree(tree).is_err(),
+        "a structurally valid tree must not certify noncanonical content boundaries"
+    );
+}
+
+#[test]
+fn certified_checkpoint_read_still_rejects_a_missing_chunk() {
+    use crate::kv::tree::header::TreeHeader;
+    let engine = InMemoryEngine::new(TestIdentity);
+    let principal = "alice".to_owned();
+    let mut context = TreeContext::new(&engine, &principal);
+    let tree = context
+        .build_sorted(vec![(b"alice:capsule:ownership\0large".to_vec(), bytes())])
+        .unwrap();
+    let validation = context.validate_tree(tree).unwrap();
+    let mut header = TreeHeader::empty(principal.clone());
+    header.tree = tree;
+    header.boundary = Some(validation.certificate());
+    let chunk = context
+        .records
+        .iter()
+        .find(|(_, record)| record.kind() == ObjectKind::Chunk)
+        .map(|(id, _)| *id)
+        .unwrap();
+    context.records.remove(&chunk);
+    assert!(
+        context
+            .projected_get(&header, b"alice:capsule:ownership\0large")
+            .is_err(),
+        "canonicality evidence must not hide a missing immutable object"
+    );
 }
 
 fn noncanonical_file(

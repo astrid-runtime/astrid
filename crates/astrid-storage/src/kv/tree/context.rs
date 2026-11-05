@@ -21,7 +21,7 @@ use super::{FORMAT_VERSION, KV_LABEL, PARENT_LABEL, STATE_LABEL};
 use crate::error::{StorageError, StorageResult};
 use crate::kv::tree_error::{invalid, map_engine};
 
-mod value;
+pub(super) mod value;
 
 pub(super) struct TreeContext<'a, P, E> {
     engine: &'a E,
@@ -57,19 +57,29 @@ where
 
     pub(super) fn get(
         &mut self,
-        mut root: Option<ObjectId>,
+        root: Option<ObjectId>,
         key: &[u8],
     ) -> StorageResult<Option<Vec<u8>>> {
+        self.get_slot(root, key)?
+            .map(|value| self.value_bytes(&value))
+            .transpose()
+    }
+
+    /// Authoritative leaf lookup used by ordinary and certified point-reads.
+    pub(super) fn get_slot(
+        &mut self,
+        mut root: Option<ObjectId>,
+        key: &[u8],
+    ) -> StorageResult<Option<ValueSlot>> {
         while let Some(object) = root {
             let handle = self.node(object)?;
             match handle.node {
-                Node::Leaf(leaf) => {
-                    return leaf
+                Node::Leaf(mut leaf) => {
+                    return Ok(leaf
                         .entries
                         .binary_search_by(|entry| entry.key.as_slice().cmp(key))
                         .ok()
-                        .map(|index| self.value_bytes(&leaf.entries[index].value))
-                        .transpose();
+                        .map(|index| leaf.entries.swap_remove(index).value));
                 },
                 Node::Branch(branch) => {
                     let index = child_index(&branch.children, key);
@@ -89,8 +99,19 @@ where
     ) -> StorageResult<Option<Vec<u8>>> {
         match header.overlay.get(key) {
             Some(value) => Ok(value.clone()),
-            None => self.get(header.tree, key),
+            None => match header
+                .boundary
+                .filter(|certificate| certificate.matches_tree(header.tree))
+            {
+                Some(certificate) => self.read_certified_tree_value(header, key, certificate),
+                None => self.get(header.tree, key),
+            },
         }
+    }
+
+    /// Live principal bound to this context.
+    pub(super) const fn principal(&self) -> &P {
+        self.principal
     }
 
     pub(super) fn build_sorted(
@@ -409,7 +430,7 @@ where
         for (key, replacement) in replacements {
             let previous = match current.get(&key) {
                 Some(value) => value.clone(),
-                None => self.get(header.tree, &key)?,
+                None => self.projected_get(header, &key)?,
             };
             if previous == replacement {
                 return Err(StorageError::Serialization(
@@ -454,6 +475,9 @@ where
                 .ok_or_else(arithmetic_overflow)?,
             delta_bytes,
             totals,
+            boundary: header
+                .boundary
+                .filter(|certificate| certificate.matches_tree(header.tree)),
         })
     }
 
@@ -474,6 +498,7 @@ where
         header: TreeHeader<P>,
         tree: Option<ObjectId>,
         checkpoint_totals: NodeTotals,
+        certificate: super::validation::ValidatedCheckpoint,
     ) -> StorageResult<Option<(RootTransaction<P>, Projection)>> {
         let mut tail = Vec::new();
         let mut cursor = header.head;
@@ -525,6 +550,7 @@ where
             depth,
             delta_bytes,
             totals,
+            boundary: Some(certificate).filter(|certificate| certificate.matches_tree(tree)),
         };
         let transaction = self.finish_projection(header, &projection)?;
         Ok(Some((transaction, projection)))
@@ -721,7 +747,7 @@ fn update_totals(
     Ok(())
 }
 
-fn child_index(children: &[ChildPointer], key: &[u8]) -> usize {
+pub(super) fn child_index(children: &[ChildPointer], key: &[u8]) -> usize {
     children
         .partition_point(|child| child.lower_bound.as_slice() <= key)
         .saturating_sub(1)

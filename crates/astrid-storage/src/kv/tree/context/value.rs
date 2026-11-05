@@ -14,7 +14,7 @@ use super::{
     arithmetic_overflow, invalid, map_engine,
 };
 use crate::content_dag::{
-    ChunkingProfile, ContentSource, build_content, open_content, read_opened_content,
+    ChunkingProfile, ContentSource, OpenedContent, build_content, open_content, read_opened_content,
 };
 use crate::storage_model::{ObjectFormatVersion, ObjectIdentity, ReferenceLabel};
 
@@ -24,6 +24,11 @@ const CHUNKED_VALUE_VERSION: ObjectFormatVersion = match ObjectFormatVersion::ne
     Some(version) => version,
     None => unreachable!(),
 };
+
+#[must_use]
+pub(in crate::kv::tree) const fn chunked_value_version() -> ObjectFormatVersion {
+    CHUNKED_VALUE_VERSION
+}
 const CONTENT_LABEL: &[u8] = b"content";
 const PROFILE: ChunkingProfile = ChunkingProfile::ASTRID_V1;
 
@@ -91,6 +96,18 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         length: u64,
         record: &ObjectRecord,
     ) -> StorageResult<Vec<u8>> {
+        let opened = self.open_chunked_value(id, length, record)?;
+        read_opened_content(self, opened).map_err(|error| {
+            StorageError::Serialization(format!("read chunked KV value {id:?}: {error}"))
+        })
+    }
+
+    pub(in crate::kv::tree) fn open_chunked_value(
+        &self,
+        id: ObjectId,
+        length: u64,
+        record: &ObjectRecord,
+    ) -> StorageResult<OpenedContent> {
         if record.kind() != ObjectKind::KvLeaf
             || record.class() != ObjectClass::Data
             || record.logical_bytes() != 0
@@ -113,9 +130,7 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         {
             return Err(invalid(id, "chunked KV descriptor disagrees with wrapper"));
         }
-        read_opened_content(self, opened).map_err(|error| {
-            StorageError::Serialization(format!("read chunked KV value {id:?}: {error}"))
-        })
+        Ok(opened)
     }
 }
 

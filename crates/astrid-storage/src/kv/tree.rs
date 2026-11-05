@@ -45,6 +45,7 @@ mod validation;
 pub(crate) use self::header::validated_projection_quota;
 pub use self::hot_cache::{KvReadCacheBudget, KvReadCacheCapacity, KvReadCacheConfig};
 pub(crate) use self::legacy_avl::migrate_principal as migrate_legacy_avl;
+pub(crate) use self::validation::CertifiedValueMembership;
 pub(super) use self::validation::TreeValidation;
 
 pub(super) const FORMAT_VERSION: crate::storage_model::ObjectFormatVersion =
@@ -290,15 +291,19 @@ where
                     // A delta projection keeps the checkpoint tree unchanged;
                     // its totals include the overlay and therefore must never
                     // be cached as validation for that checkpoint tree.
-                    if projection.depth == 0 {
+                    if projection.depth == 0
+                        && let Some(certificate) = projection
+                            .boundary
+                            .filter(|certificate| certificate.matches_tree(tree))
+                    {
                         self.validation.trees.lock().insert(
                             owner.clone(),
-                            TreeValidation {
-                                root: tree,
-                                entries: projection.totals.entries,
+                            TreeValidation::from_certificate(
+                                certificate,
+                                projection.totals.entries,
                                 logical_bytes,
-                                quota_bytes: projection_used,
-                            },
+                                projection_used,
+                            ),
                         );
                     }
                     self.validation
@@ -422,8 +427,7 @@ where
             return Ok(false);
         }
         let mut context = TreeContext::new(self.engine.as_ref(), &base.owner);
-        let entries = context.checkpoint_entries(&base)?;
-        let tree = context.build_sorted_slots(entries)?;
+        let (tree, validation) = context.build_validated_checkpoint(&base)?;
         let checkpoint_totals = base_projection.totals;
         interleave()?;
         let current = self.header(owner.clone())?;
@@ -431,22 +435,22 @@ where
         if !force && !should_checkpoint(&current_projection) {
             return Ok(false);
         }
-        let Some((transaction, rebased)) =
-            context.rebase_checkpoint(base.head, current, tree, checkpoint_totals)?
+        let Some((transaction, rebased)) = context.rebase_checkpoint(
+            base.head,
+            current,
+            tree,
+            checkpoint_totals,
+            validation.certificate(),
+        )?
         else {
             return Ok(false);
         };
         match self.engine.commit_kv_root(transaction) {
             Ok(_) => {
-                self.validation.trees.lock().insert(
-                    owner.clone(),
-                    TreeValidation {
-                        root: tree,
-                        entries: checkpoint_totals.entries,
-                        logical_bytes: checkpoint_totals.logical_bytes,
-                        quota_bytes: checkpoint_totals.quota_bytes,
-                    },
-                );
+                self.validation
+                    .trees
+                    .lock()
+                    .insert(owner.clone(), validation);
                 self.validation.projections.lock().insert(owner, rebased);
                 Ok(true)
             },
@@ -468,6 +472,9 @@ fn projection_from_header<P>(header: &TreeHeader<P>) -> Projection {
             logical_bytes: header.logical_bytes,
             quota_bytes: header.quota_bytes,
         },
+        boundary: header
+            .boundary
+            .filter(|certificate| certificate.matches_tree(header.tree)),
     }
 }
 

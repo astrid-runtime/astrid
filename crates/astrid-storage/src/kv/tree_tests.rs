@@ -933,6 +933,9 @@ async fn durable_transition_latency_and_bytes_are_cardinality_stable() {
     }
 }
 
+#[path = "tree/boundary_closure_tests.rs"]
+mod boundary_closure_tests;
+
 #[path = "tree/chunked_value_tests.rs"]
 mod chunked_value_tests;
 
