@@ -199,7 +199,7 @@ fn insert_generation_zero_test_placement(
     use super::super::LOCAL_STORAGE_NODE;
     use crate::storage_model::{Replica, ReplicaLocator};
     let object = ObjectId::new([ordinal; 32]);
-    let offset = u64::from(ordinal) * replica_count;
+    let offset = u64::from(ordinal).strict_mul(replica_count);
     let location = super::super::ArenaLocation {
         offset,
         payload_len: 8,
@@ -228,7 +228,7 @@ fn insert_generation_zero_test_placement(
             record.encode().unwrap(),
         )
         .unwrap();
-    let replicas = (offset..offset + replica_count)
+    let replicas = (offset..offset.strict_add(replica_count))
         .map(|offset| {
             Replica::new(
                 LOCAL_STORAGE_NODE,
