@@ -257,8 +257,9 @@ where
             .collect()
     }
 
-    // The header has already validated this immutable projection. Preserve
-    // its admitted value identities while packing replacement checkpoint pages.
+    // Repack the exact head's previously admitted, content-addressed value
+    // slots. Header validation and root admission establish the immutable
+    // closure; metadata checkpointing does not need a second content audit.
     pub(super) fn checkpoint_entries(
         &mut self,
         header: &TreeHeader<P>,

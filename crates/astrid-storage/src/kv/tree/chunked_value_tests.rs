@@ -197,5 +197,11 @@ async fn checkpoint_reuses_unchanged_chunked_values() {
         Some(b"latest".to_vec())
     );
     assert_eq!(store.get(namespace, "deleted").await.unwrap(), None);
+    assert!(store.delete(namespace, "large").await.unwrap());
+    assert!(store.delete(namespace, "updated").await.unwrap());
+    assert!(store.checkpoint_for_test("alice".to_owned()).unwrap());
+    assert_eq!(store.get(namespace, "large").await.unwrap(), None);
+    assert_eq!(store.get(namespace, "updated").await.unwrap(), None);
+    assert!(store.list_keys(namespace).await.unwrap().is_empty());
     store.close().await.unwrap();
 }
