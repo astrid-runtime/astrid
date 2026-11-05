@@ -34,6 +34,9 @@
 
 extern crate alloc;
 
+#[cfg(all(test, not(target_family = "wasm")))]
+mod allocation_test_support;
+
 /// Durable owner-scoped installed capsule package registry.
 pub mod capsule_registry;
 pub mod content;

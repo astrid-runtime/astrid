@@ -78,3 +78,70 @@ fn metadata_recovery_rejects_map_bytes_with_another_nodes_identity() {
     assert!(index.nodes.is_empty());
     assert!(index.values.is_empty());
 }
+
+#[test]
+#[cfg(not(target_family = "wasm"))]
+fn placement_validation_retains_only_the_join_fields_after_each_decode() {
+    use super::super::{LOCAL_STORAGE_NODE, activation};
+    use crate::storage_model::{BlobId, Replica, ReplicaLocator};
+
+    const PLACEMENTS: u8 = 64;
+    const REPLICAS: u64 = 256;
+    let (profile, profile_id) = activation::direct_profile(ObjectId::new([9; 32])).unwrap();
+    let profiles = CanonicalPhysicalMap::build_dense(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Profile,
+        vec![(PhysicalMapKey::from(profile_id), profile.encode().unwrap())],
+    )
+    .unwrap();
+    let entries = (0..PLACEMENTS)
+        .map(|ordinal| {
+            let blob =
+                BlobId::identify(&Blake3PhysicalIdentity, profile_id, &[ordinal; 8]).unwrap();
+            let replicas = (0..REPLICAS)
+                .map(|offset| {
+                    Replica::new(
+                        LOCAL_STORAGE_NODE,
+                        ReplicaLocator::ArenaFrame {
+                            arena_generation: 0,
+                            offset,
+                            payload_length: 8,
+                            frame_checksum: [ordinal; 32],
+                        },
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let placement = PlacementEntry::new(blob, profile_id, 8, replicas).unwrap();
+            (PhysicalMapKey::from(blob), placement.encode().unwrap())
+        })
+        .collect();
+    let placements = CanonicalPhysicalMap::build_dense(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Placement,
+        entries,
+    )
+    .unwrap();
+    let representations = CanonicalPhysicalMap::build_dense(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Representation,
+        Vec::new(),
+    )
+    .unwrap();
+    // Keep all authenticated inputs alive outside accounting. Invoke the real
+    // validator: every replica must be decoded and counted, but its backing
+    // array has no consumer after the placement-to-record join is recorded.
+    let (result, peak) = crate::allocation_test_support::peak_during(|| {
+        validate_representations(&profiles, &representations, &placements)
+    });
+    let (reverse, extent_count) = result.unwrap();
+    assert!(reverse.is_empty());
+    assert_eq!(extent_count, u64::from(PLACEMENTS) * REPLICAS);
+    let replica_backing = usize::from(PLACEMENTS)
+        * usize::try_from(REPLICAS).unwrap()
+        * std::mem::size_of::<Replica>();
+    assert!(
+        peak < replica_backing / 4,
+        "placement validation retained {peak} temporary bytes for {replica_backing} replica bytes"
+    );
+}

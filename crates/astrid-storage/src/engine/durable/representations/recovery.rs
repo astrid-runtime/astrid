@@ -452,7 +452,7 @@ pub(super) fn validate_representations(
                     .map_err(|_| DurableError::EncodingOverflow)?,
             )
             .ok_or(DurableError::EncodingOverflow)?;
-        placement_by_blob.insert(entry.blob(), entry);
+        placement_by_blob.insert(entry.blob(), (entry.profile(), entry.encoded_length()));
     }
     let mut reverse = BTreeMap::<ObjectId, Vec<RepresentationRecordId>>::new();
     for (key, bytes) in active_entries(representations)? {
@@ -478,14 +478,13 @@ pub(super) fn validate_representations(
             ) => (*object, *blob, *canonical_record_bytes),
             _ => continue,
         };
-        let placement =
+        let &(placement_profile, encoded_length) =
             placement_by_blob
                 .get(&blob)
                 .ok_or(DurableError::InvalidRepresentationState(
                     "direct representation placement is missing",
                 ))?;
-        if placement.profile() != record.profile() || placement.encoded_length() != canonical_length
-        {
+        if placement_profile != record.profile() || encoded_length != canonical_length {
             return Err(DurableError::InvalidRepresentationState(
                 "direct representation placement does not match its record",
             ));

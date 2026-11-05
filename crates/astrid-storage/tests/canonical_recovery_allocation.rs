@@ -4,63 +4,10 @@
 use astrid_storage::storage_model::{
     CanonicalPhysicalMap, PhysicalIdentity, PhysicalMapDomain, PhysicalMapKey,
 };
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 
-thread_local! {
-    // Account only allocations inside the invoking validation call. Input
-    // ownership outlives that call; the harness and other threads are excluded.
-    static ACCOUNTING: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
-    static INVALID_ACCOUNTING: Cell<bool> = const { Cell::new(false) };
-}
-
-struct Allocator;
-
-fn account(size: usize, allocated: bool) {
-    let _ = ACCOUNTING.try_with(|state| {
-        if let Some((live, peak)) = state.get() {
-            let next = if allocated {
-                live.checked_add(size)
-            } else {
-                live.checked_sub(size)
-            };
-            let Some(live) = next else {
-                // Allocators cannot unwind. Mark an invalid measurement and
-                // reject it outside the allocator after validation returns.
-                state.set(None);
-                INVALID_ACCOUNTING.set(true);
-                return;
-            };
-            state.set(Some((live, peak.max(live))));
-        }
-    });
-}
-
-// SAFETY: every allocation and deallocation forwards the unchanged layout to
-// System. Accounting uses allocation-free thread-local cells only.
-#[allow(
-    unsafe_code,
-    reason = "Test-only peak allocation accounting forwards System unchanged."
-)]
-unsafe impl GlobalAlloc for Allocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: forward the allocator contract and original layout.
-        let pointer = unsafe { System.alloc(layout) };
-        if !pointer.is_null() {
-            account(layout.size(), true);
-        }
-        pointer
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        account(layout.size(), false);
-        // SAFETY: all allocations originate from System with this layout.
-        unsafe { System.dealloc(pointer, layout) };
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: Allocator = Allocator;
+#[path = "../src/allocation_test_support.rs"]
+mod allocation_test_support;
+use allocation_test_support::peak_during;
 
 struct Identity;
 impl PhysicalIdentity for Identity {
@@ -68,13 +15,6 @@ impl PhysicalIdentity for Identity {
         let mut hash = blake3::Hasher::new_derive_key(context);
         hash.update(material);
         *hash.finalize().as_bytes()
-    }
-}
-
-struct ResetAccounting;
-impl Drop for ResetAccounting {
-    fn drop(&mut self) {
-        ACCOUNTING.set(None);
     }
 }
 
@@ -95,23 +35,14 @@ fn validate_without_retaining_input_payloads(dense: bool) {
         CanonicalPhysicalMap::build(&Identity, PhysicalMapDomain::Placement, entries)
     }
     .unwrap();
-    INVALID_ACCOUNTING.set(false);
-    ACCOUNTING.set(Some((0, 0)));
-    let reset = ResetAccounting;
-    let result = CanonicalPhysicalMap::validate_root(
-        &Identity,
-        PhysicalMapDomain::Placement,
-        map.root(),
-        map.nodes(),
-    );
-    let accounting = ACCOUNTING.get();
-    let invalid = INVALID_ACCOUNTING.get();
-    drop(reset);
-    assert!(
-        !invalid,
-        "temporary allocation accounting overflowed or underflowed"
-    );
-    let (_, peak) = accounting.unwrap();
+    let (result, peak) = peak_during(|| {
+        CanonicalPhysicalMap::validate_root(
+            &Identity,
+            PhysicalMapDomain::Placement,
+            map.root(),
+            map.nodes(),
+        )
+    });
     assert_eq!(result.unwrap(), u64::try_from(count).unwrap());
     // Room for transient node encoding, traversal sets and allocator rounding;
     // a second full input payload set alone exceeds this bound eightfold.
@@ -129,22 +60,6 @@ fn legacy_canonical_validation_borrows_the_complete_input_payload_set() {
 #[test]
 fn dense_canonical_validation_borrows_the_complete_input_payload_set() {
     validate_without_retaining_input_payloads(true);
-}
-
-fn peak_during<R>(body: impl FnOnce() -> R) -> (R, usize) {
-    INVALID_ACCOUNTING.set(false);
-    ACCOUNTING.set(Some((0, 0)));
-    let reset = ResetAccounting;
-    let result = body();
-    let accounting = ACCOUNTING.get();
-    let invalid = INVALID_ACCOUNTING.get();
-    drop(reset);
-    assert!(
-        !invalid,
-        "temporary allocation accounting overflowed or underflowed"
-    );
-    let (_, peak) = accounting.expect("accounting active");
-    (result, peak)
 }
 
 fn build_lookup_fixture(dense: bool, count: usize) -> (CanonicalPhysicalMap, Vec<PhysicalMapKey>) {
