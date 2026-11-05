@@ -280,6 +280,13 @@ where
         authorization: &VerifiedCompactionPlan,
     ) -> Result<CompactionReport, DurableError> {
         let mut inner = self.lock_usable()?;
+        // The replacement must be the only remaining source of logical
+        // objects. Fold and checkpoint committed WAL state under the same
+        // mutation fence before rechecking the proof, so a later fold cannot
+        // reintroduce objects omitted from the replacement arena.
+        if !inner.pending_wal.is_empty() {
+            self.checkpoint_transaction_wal(&mut inner)?;
+        }
         let (facts, live) = self.capture_facts_locked(&mut inner, &authorization.retention)?;
         if facts != authorization.facts {
             return Err(DurableError::CompactionSnapshotChanged);
@@ -451,7 +458,12 @@ where
     }
 
     fn object_universe(inner: &DurableInner<P>) -> BTreeSet<ObjectId> {
-        inner.index.keys().copied().collect::<BTreeSet<_>>()
+        inner
+            .index
+            .keys()
+            .copied()
+            .chain(inner.pending_wal.objects().map(|(id, _)| *id))
+            .collect()
     }
 
     fn read_compaction_object(
@@ -459,6 +471,9 @@ where
         inner: &mut DurableInner<P>,
         id: ObjectId,
     ) -> Result<ObjectRecord, DurableError> {
+        if let Some(object) = inner.pending_wal.get_object(&id) {
+            return Ok(object.record().clone());
+        }
         let super::DurableInner { files, index, .. } = inner;
         if let Some(location) = index.get(&id).copied() {
             let files = live_files_mut(files)?;
