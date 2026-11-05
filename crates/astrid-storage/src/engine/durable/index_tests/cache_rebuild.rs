@@ -293,3 +293,33 @@ fn live_empty_cache_root_publication_fault_preserves_acknowledged_state() {
         recovered.close().unwrap();
     }
 }
+
+#[test]
+fn volume_handoff_reports_checkpoint_failure_without_transferring_authority() {
+    let fixture = Fixture::new(true);
+    let faults = Arc::new(TripPublication::default());
+    let engine = fixture.open(Arc::clone(&faults));
+    let (root, mut known) = seed(&engine);
+    let next = record(32);
+    let outcomes = engine.stage_objects(vec![next.clone()]).unwrap();
+    known.push((outcomes[0].0, next));
+    faults.0.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        engine.handoff_for_retirement(),
+        Err(DurableError::FaultInjected(
+            FaultPoint::BeforeIndexCachePublication
+        ))
+    ));
+    assert!(engine.inner.lock().poisoned);
+    // Freeze the failed publication before recovery or a second handoff can
+    // rebuild the disposable index. The flushed authority must remain exact.
+    let persisted = fixture.capture_persisted();
+    exact_readback(&engine, root, &known);
+    let transferred = engine.handoff_for_retirement().unwrap();
+    engine.close().unwrap();
+    exact_readback(&transferred, root, &known);
+    transferred.close().unwrap();
+    let recovered = persisted.open(faults);
+    exact_readback(&recovered, root, &known);
+    recovered.close().unwrap();
+}
