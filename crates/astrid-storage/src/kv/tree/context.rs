@@ -24,8 +24,8 @@ use crate::kv::tree_error::{invalid, map_engine};
 pub(super) mod value;
 
 // A comparison and its mutation share one immutable header per CAS attempt.
-// Carry an already-read value through accounting; bulk key-only operations
-// keep deferred reads so they never retain every previous payload at once.
+// Carry only its length and equality result through accounting, releasing
+// each old payload immediately; key-only operations keep deferred reads.
 pub(super) struct Replacement {
     key: Vec<u8>,
     previous: PreviousValue,
@@ -34,7 +34,10 @@ pub(super) struct Replacement {
 
 enum PreviousValue {
     Unread,
-    Loaded(Option<Vec<u8>>),
+    Loaded {
+        previous_len: Option<usize>,
+        unchanged: bool,
+    },
 }
 
 impl Replacement {
@@ -51,9 +54,15 @@ impl Replacement {
         previous: Option<Vec<u8>>,
         value: Option<Vec<u8>>,
     ) -> Self {
+        let previous_len = previous.as_ref().map(Vec::len);
+        let unchanged = previous == value;
+        drop(previous);
         Self {
             key,
-            previous: PreviousValue::Loaded(previous),
+            previous: PreviousValue::Loaded {
+                previous_len,
+                unchanged,
+            },
             value,
         }
     }
@@ -473,24 +482,26 @@ where
             value: replacement,
         } in replacements
         {
-            let loaded_previous;
-            let previous = if let Some(value) = current.get(&key) {
-                value.as_deref()
+            let (previous_len, unchanged) = if let Some(value) = current.get(&key) {
+                (value.as_ref().map(Vec::len), value == &replacement)
             } else {
-                match &previous {
-                    PreviousValue::Loaded(value) => value.as_deref(),
+                match previous {
+                    PreviousValue::Loaded {
+                        previous_len,
+                        unchanged,
+                    } => (previous_len, unchanged),
                     PreviousValue::Unread => {
-                        loaded_previous = self.projected_get(header, &key)?;
-                        loaded_previous.as_deref()
+                        let value = self.projected_get(header, &key)?;
+                        (value.as_ref().map(Vec::len), value == replacement)
                     },
                 }
             };
-            if previous == replacement.as_deref() {
+            if unchanged {
                 return Err(StorageError::Serialization(
                     "KV mutation batch contains a no-op".to_owned(),
                 ));
             }
-            update_totals(&mut totals, &key, previous, replacement.as_deref())?;
+            update_totals(&mut totals, &key, previous_len, replacement.as_deref())?;
             let value = replacement
                 .as_ref()
                 .map(|value| self.make_value(value.as_slice()))
@@ -761,11 +772,11 @@ where
 fn update_totals(
     totals: &mut NodeTotals,
     key: &[u8],
-    previous: Option<&[u8]>,
+    previous: Option<usize>,
     replacement: Option<&[u8]>,
 ) -> StorageResult<()> {
     let key_bytes = u64::try_from(key.len()).map_err(|_| arithmetic_overflow())?;
-    let previous_bytes = previous.map_or(0, |value| value.len() as u64);
+    let previous_bytes = previous.map_or(0, |length| length as u64);
     let replacement_bytes = replacement.map_or(0, |value| value.len() as u64);
     totals.entries = match (previous, replacement) {
         (None, Some(_)) => totals.entries.checked_add(1),
