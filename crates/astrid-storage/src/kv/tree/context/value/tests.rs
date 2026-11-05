@@ -508,3 +508,122 @@ fn mutation_overlay_retains_original_value_allocation() {
     assert_eq!(value.as_ptr(), original_pointer);
     assert_eq!(engine.object_count(), 0, "staging must remain unpublished");
 }
+
+#[cfg(not(target_family = "wasm"))]
+#[tokio::test]
+async fn durable_content_reads_reuse_the_governed_record_allocation() {
+    use crate::content_dag::ContentSource;
+    use crate::engine::{DurableEngine, ObjectCacheConfig, PrincipalCodec, RecoveryLimits};
+    use crate::kv::{KvStore, TreeKvStore};
+    use std::sync::Arc;
+
+    #[derive(Clone, Copy)]
+    struct Resolver;
+    impl crate::kv::KvPrincipalResolver<String> for Resolver {
+        fn resolve(&self, namespace: &str) -> StorageResult<String> {
+            namespace
+                .split_once(":capsule:")
+                .map(|(owner, _)| owner.to_owned())
+                .ok_or_else(|| StorageError::InvalidKey("test namespace has no owner".to_owned()))
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct Codec;
+    impl PrincipalCodec<String> for Codec {
+        fn encode(&self, owner: &String) -> Vec<u8> {
+            owner.as_bytes().to_vec()
+        }
+        fn decode(&self, bytes: &[u8]) -> Option<String> {
+            String::from_utf8(bytes.to_vec()).ok()
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Arc::new(
+        DurableEngine::open_with_object_cache(
+            directory.path(),
+            TestIdentity,
+            Codec,
+            RecoveryLimits::process_addressable(),
+            ObjectCacheConfig::bounded(std::num::NonZeroU64::new(8 * 1024 * 1024).unwrap()),
+        )
+        .unwrap(),
+    );
+    let store =
+        TreeKvStore::<String, TestIdentity, Resolver, _>::from_engine(engine.clone(), Resolver);
+    let owner = "alice".to_owned();
+    let value = bytes();
+    store
+        .set("alice:capsule:test", "large", value.clone())
+        .await
+        .unwrap();
+    let snapshot = engine.snapshot(&owner).unwrap().unwrap();
+    let chunk = snapshot
+        .records()
+        .iter()
+        .find(|(_, record)| record.kind() == ObjectKind::Chunk)
+        .unwrap()
+        .0;
+    let resident = engine.shared_object_for(&owner, chunk).unwrap().unwrap();
+    let cached = engine.shared_object_for(&owner, chunk).unwrap().unwrap();
+    assert!(
+        Arc::ptr_eq(&resident, &cached),
+        "fixture did not retain its governed record"
+    );
+    let mut context = TreeContext::new(engine.as_ref(), &owner);
+    let loaded = context.load_shared_content_object(chunk).unwrap().unwrap();
+    assert!(
+        Arc::ptr_eq(&resident, &loaded),
+        "KV content loading deep-copied a governed cache hit"
+    );
+    let batch = context
+        .load_shared_content_objects(&[chunk, chunk])
+        .unwrap();
+    for loaded in batch {
+        assert!(
+            Arc::ptr_eq(&resident, &loaded.unwrap()),
+            "KV batch loading deep-copied a governed cache hit"
+        );
+    }
+    let staged = assert_staged_and_missing_reads(&mut context, chunk, &resident);
+    assert!(
+        engine.object(staged).unwrap().is_none(),
+        "content reads published staged bytes"
+    );
+    assert_eq!(
+        store.get("alice:capsule:test", "large").await.unwrap(),
+        Some(value)
+    );
+    store.close().await.unwrap();
+    assert!(
+        context.load_shared_content_object(chunk).is_err(),
+        "a cached object must not bypass engine closure"
+    );
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn assert_staged_and_missing_reads(
+    context: &mut TreeContext<'_, String, impl KvProjectionEngine<String>>,
+    chunk: ObjectId,
+    resident: &std::sync::Arc<ObjectRecord>,
+) -> ObjectId {
+    use crate::content_dag::ContentSource;
+    use std::sync::Arc;
+    let missing = ObjectId::new([0x19; 32]);
+    assert!(context.load_shared_content_object(missing).is_err());
+    assert!(
+        context
+            .load_shared_content_objects(&[chunk, missing])
+            .is_err()
+    );
+    let record = value_record(b"unpublished staged payload".to_vec()).unwrap();
+    let staged = context.insert(record.clone()).unwrap();
+    let mixed = context
+        .load_shared_content_objects(&[chunk, staged, chunk])
+        .unwrap();
+    assert!(Arc::ptr_eq(resident, mixed[0].as_ref().unwrap()));
+    assert_eq!(mixed[1].as_deref(), Some(&record));
+    assert!(Arc::ptr_eq(resident, mixed[2].as_ref().unwrap()));
+    staged
+}

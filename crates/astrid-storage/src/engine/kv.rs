@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::storage_model::{
     ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectIdentity, ObjectKind,
@@ -358,6 +359,24 @@ pub trait KvProjectionEngine<P>: Send + Sync {
         self.load_kv_object(id)
     }
 
+    /// Load one immutable KV object without copying a resident shared record.
+    ///
+    /// The default preserves owned-only engines. Governed caching engines
+    /// must apply the same principal attribution and read checks as their
+    /// owned path; sharing cannot bypass recovery, closure or frame validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same read errors as [`Self::load_kv_object_for`].
+    fn load_shared_kv_object_for(
+        &self,
+        principal: &P,
+        id: ObjectId,
+    ) -> Result<Option<Arc<ObjectRecord>>, KvProjectionError> {
+        self.load_kv_object_for(principal, id)
+            .map(|record| record.map(Arc::new))
+    }
+
     /// Capture one principal's root and owning closure.
     ///
     /// # Errors
@@ -464,6 +483,15 @@ where
         id: ObjectId,
     ) -> Result<Option<ObjectRecord>, KvProjectionError> {
         self.object_for(principal, id).map_err(map_durable_error)
+    }
+
+    fn load_shared_kv_object_for(
+        &self,
+        principal: &P,
+        id: ObjectId,
+    ) -> Result<Option<Arc<ObjectRecord>>, KvProjectionError> {
+        self.shared_object_for(principal, id)
+            .map_err(map_durable_error)
     }
 
     fn snapshot_kv_root(&self, principal: &P) -> Result<Option<RootSnapshot>, KvProjectionError> {

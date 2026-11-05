@@ -6,6 +6,7 @@
 //! the same root transaction; no side keys or separate publications are used.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use super::super::node::{decode_value, value_record};
 use super::{
@@ -16,7 +17,7 @@ use super::{
 use crate::content_dag::{
     ChunkingProfile, ContentSource, OpenedContent, build_content, open_content, read_opened_content,
 };
-use crate::storage_model::{ObjectFormatVersion, ObjectIdentity, ReferenceLabel};
+use crate::storage_model::{ModelError, ObjectFormatVersion, ObjectIdentity, ReferenceLabel};
 
 // These are immutable encoding rules, not operator memory limits. They pin
 // identities and the canonical representation chosen for the same KV bytes.
@@ -145,6 +146,28 @@ impl<P: Ord, E: KvProjectionEngine<P>> ContentSource for TreeContext<'_, P, E> {
 
     fn load_content_object(&self, id: ObjectId) -> StorageResult<Option<ObjectRecord>> {
         self.record(id).map(Some)
+    }
+
+    fn load_shared_content_object(&self, id: ObjectId) -> StorageResult<Option<Arc<ObjectRecord>>> {
+        if let Some(record) = self.records.get(&id) {
+            return Ok(Some(Arc::new(record.clone())));
+        }
+        self.engine
+            .load_shared_kv_object_for(self.principal, id)
+            .map_err(|error| map_engine(&error))?
+            .map(Some)
+            .ok_or_else(|| map_engine(&ModelError::MissingObject(id).into()))
+    }
+
+    fn load_shared_content_objects(
+        &self,
+        ids: &[ObjectId],
+    ) -> StorageResult<Vec<Option<Arc<ObjectRecord>>>> {
+        // Follow the same source for each element: staged records stay local,
+        // and engine misses retain single-read recovery/WAL semantics.
+        ids.iter()
+            .map(|id| self.load_shared_content_object(*id))
+            .collect()
     }
 }
 
