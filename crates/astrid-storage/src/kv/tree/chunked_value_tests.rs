@@ -16,6 +16,7 @@ async fn local_edit_to_large_value_does_not_retain_another_full_blob() {
         .set("alice:capsule:ownership", "graph", original.clone())
         .await
         .unwrap();
+    let before = settled_admission_census(&engine).await;
     let old_root = engine.inner.root(&"alice".to_owned()).unwrap();
     let old_snapshot = engine.inner.snapshot(&"alice".to_owned()).unwrap().unwrap();
     let mut edited = original.clone();
@@ -43,9 +44,10 @@ async fn local_edit_to_large_value_does_not_retain_another_full_blob() {
             "history object {id:?} changed"
         );
     }
-    let appended = engine.last_authoritative_bytes();
+    let after = settled_admission_census(&engine).await;
+    let appended = after.logical_wire_growth(&before);
     eprintln!(
-        "existing_bytes={} inserted_bytes=4096 appended_bytes={appended}",
+        "existing_bytes={} inserted_bytes=4096 admitted_logical_wire_bytes={appended}",
         original.len()
     );
     assert!(
@@ -70,6 +72,7 @@ async fn failed_cas_and_quota_cannot_admit_chunked_content() {
         .set("alice:capsule:ownership", "graph", original.clone())
         .await
         .unwrap();
+    drain_checkpoint_tasks(&engine).await;
     let count = engine.object_count();
     let root = engine.root(&"alice".to_owned());
     assert!(

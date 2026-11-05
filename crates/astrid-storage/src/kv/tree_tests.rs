@@ -96,7 +96,6 @@ type Store = TreeKvStore<String, TestIdentity, Resolver, InMemoryEngine<String, 
 #[derive(Debug)]
 struct MeasuringEngine {
     inner: InMemoryEngine<String, TestIdentity>,
-    last_authoritative_bytes: AtomicU64,
     identified_chunk_bytes: AtomicU64,
 }
 
@@ -104,13 +103,8 @@ impl MeasuringEngine {
     fn new() -> Self {
         Self {
             inner: InMemoryEngine::new(TestIdentity),
-            last_authoritative_bytes: AtomicU64::new(0),
             identified_chunk_bytes: AtomicU64::new(0),
         }
-    }
-
-    fn last_authoritative_bytes(&self) -> u64 {
-        self.last_authoritative_bytes.load(Ordering::Acquire)
     }
 }
 
@@ -142,27 +136,7 @@ impl KvProjectionEngine<String> for MeasuringEngine {
         &self,
         transaction: RootTransaction<String>,
     ) -> Result<CommitOutcome, KvProjectionError> {
-        let object_bytes = transaction
-            .records()
-            .iter()
-            .filter(|(object, _)| self.inner.object(*object).is_none())
-            .try_fold(0_u64, |total, (_, record)| {
-                total.checked_add(object_frame_bytes(record))
-            })
-            .ok_or_else(|| KvProjectionError::Engine("measurement overflow".to_owned()))?;
-        let journal_bytes = root_frame_bytes(
-            transaction.principal().as_bytes(),
-            transaction.expected().is_some(),
-        )
-        .ok_or_else(|| KvProjectionError::Engine("measurement overflow".to_owned()))?;
-        let outcome = self.inner.commit(transaction)?;
-        self.last_authoritative_bytes.store(
-            object_bytes
-                .checked_add(journal_bytes)
-                .ok_or_else(|| KvProjectionError::Engine("measurement overflow".to_owned()))?,
-            Ordering::Release,
-        );
-        Ok(outcome)
+        self.inner.commit(transaction).map_err(Into::into)
     }
 
     fn flush_kv(&self) -> Result<(), KvProjectionError> {
@@ -815,7 +789,8 @@ async fn transition_point_mutation_authoritative_bytes() {
         store
             .seed_sorted_for_test("alice".to_owned(), entries)
             .unwrap();
-        let checkpoint_bytes = engine.last_authoritative_bytes();
+        let seeded = settled_admission_census(&engine).await;
+        let checkpoint_bytes = seeded.logical_wire_growth(&AdmissionCensus::default());
         store
             .get("alice:capsule:bench", &format!("{:08}", cardinality / 3))
             .await
@@ -843,7 +818,8 @@ async fn transition_point_mutation_authoritative_bytes() {
             .await
             .unwrap();
         let set_elapsed = set_started.elapsed();
-        let set_bytes = engine.last_authoritative_bytes();
+        let after_set = settled_admission_census(&engine).await;
+        let set_bytes = after_set.logical_wire_growth(&seeded);
         let delete_started = Instant::now();
         assert!(
             store
@@ -851,13 +827,15 @@ async fn transition_point_mutation_authoritative_bytes() {
                 .await
                 .unwrap()
         );
+        let delete_elapsed = delete_started.elapsed();
+        let after_delete = settled_admission_census(&engine).await;
         eprintln!(
-            "cardinality={cardinality} checkpoint_bytes={checkpoint_bytes} \
-             replacement_bytes={set_bytes} delete_bytes={} get_ns={get_ns} \
+            "cardinality={cardinality} checkpoint_wire_bytes={checkpoint_bytes} \
+             replacement_wire_bytes={set_bytes} delete_wire_bytes={} get_ns={get_ns} \
              set_us={} delete_us={}",
-            engine.last_authoritative_bytes(),
+            after_delete.logical_wire_growth(&after_set),
             set_elapsed.as_micros(),
-            delete_started.elapsed().as_micros(),
+            delete_elapsed.as_micros(),
         );
     }
 }
@@ -957,3 +935,7 @@ async fn durable_transition_latency_and_bytes_are_cardinality_stable() {
 
 #[path = "tree/chunked_value_tests.rs"]
 mod chunked_value_tests;
+
+#[path = "tree/admission_test_support.rs"]
+mod admission_test_support;
+use admission_test_support::{AdmissionCensus, drain_checkpoint_tasks, settled_admission_census};
