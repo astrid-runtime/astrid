@@ -422,22 +422,8 @@ where
             return Ok(false);
         }
         let mut context = TreeContext::new(self.engine.as_ref(), &base.owner);
-        let mut entries = BTreeMap::<Vec<u8>, Vec<u8>>::new();
-        context.visit_entries(base.tree, |key, value| {
-            entries.insert(key.to_vec(), value.to_vec());
-            Ok(())
-        })?;
-        for (key, value) in base.overlay.all() {
-            match value {
-                Some(value) => {
-                    entries.insert(key, value);
-                },
-                None => {
-                    entries.remove(&key);
-                },
-            }
-        }
-        let tree = context.build_sorted(entries.into_iter().collect())?;
+        let entries = context.checkpoint_entries(&base)?;
+        let tree = context.build_sorted_slots(entries)?;
         let checkpoint_totals = base_projection.totals;
         interleave()?;
         let current = self.header(owner.clone())?;

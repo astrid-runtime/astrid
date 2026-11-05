@@ -97,6 +97,7 @@ type Store = TreeKvStore<String, TestIdentity, Resolver, InMemoryEngine<String, 
 struct MeasuringEngine {
     inner: InMemoryEngine<String, TestIdentity>,
     last_authoritative_bytes: AtomicU64,
+    identified_chunk_bytes: AtomicU64,
 }
 
 impl MeasuringEngine {
@@ -104,6 +105,7 @@ impl MeasuringEngine {
         Self {
             inner: InMemoryEngine::new(TestIdentity),
             last_authoritative_bytes: AtomicU64::new(0),
+            identified_chunk_bytes: AtomicU64::new(0),
         }
     }
 
@@ -114,6 +116,10 @@ impl MeasuringEngine {
 
 impl KvProjectionEngine<String> for MeasuringEngine {
     fn identify_kv_object(&self, record: &ObjectRecord) -> ObjectId {
+        if record.kind() == ObjectKind::Chunk {
+            self.identified_chunk_bytes
+                .fetch_add(record.canonical_bytes().len() as u64, Ordering::Relaxed);
+        }
         self.inner.identify(record)
     }
 

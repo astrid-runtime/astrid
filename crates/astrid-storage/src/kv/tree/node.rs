@@ -29,7 +29,7 @@ pub(super) struct NodeTotals {
 }
 
 impl NodeTotals {
-    fn add(self, other: Self) -> StorageResult<Self> {
+    pub(super) fn add(self, other: Self) -> StorageResult<Self> {
         Ok(Self {
             entries: self
                 .entries
@@ -69,7 +69,7 @@ pub(super) struct LeafEntry {
 }
 
 impl LeafEntry {
-    fn totals(&self) -> StorageResult<NodeTotals> {
+    pub(super) fn totals(&self) -> StorageResult<NodeTotals> {
         let key = u64::try_from(self.key.len()).map_err(|_| arithmetic_overflow())?;
         let value = self.value.length()?;
         Ok(NodeTotals {

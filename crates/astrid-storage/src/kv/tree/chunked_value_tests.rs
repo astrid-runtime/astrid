@@ -153,3 +153,49 @@ async fn chunked_values_survive_durable_reopen_and_checkpoint() {
     );
     store.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn checkpoint_reuses_unchanged_chunked_values() {
+    let engine = Arc::new(MeasuringEngine::new());
+    let store =
+        TreeKvStore::<String, TestIdentity, Resolver, _>::from_engine(engine.clone(), Resolver);
+    let namespace = "alice:capsule:ownership";
+    let original = vec![0x42; 512 * 1024];
+    store
+        .set(namespace, "large", original.clone())
+        .await
+        .unwrap();
+    store
+        .set(namespace, "updated", b"old".to_vec())
+        .await
+        .unwrap();
+    store
+        .set(namespace, "deleted", b"old".to_vec())
+        .await
+        .unwrap();
+    assert!(store.checkpoint_for_test("alice".to_owned()).unwrap());
+    store
+        .set(namespace, "updated", b"new".to_vec())
+        .await
+        .unwrap();
+    store
+        .set(namespace, "updated", b"latest".to_vec())
+        .await
+        .unwrap();
+    assert!(store.delete(namespace, "deleted").await.unwrap());
+    engine.identified_chunk_bytes.store(0, Ordering::Relaxed);
+
+    assert!(store.checkpoint_for_test("alice".to_owned()).unwrap());
+    assert_eq!(
+        engine.identified_chunk_bytes.load(Ordering::Relaxed),
+        0,
+        "metadata checkpoint must reuse admitted immutable content instead of rebuilding chunks"
+    );
+    assert_eq!(store.get(namespace, "large").await.unwrap(), Some(original));
+    assert_eq!(
+        store.get(namespace, "updated").await.unwrap(),
+        Some(b"latest".to_vec())
+    );
+    assert_eq!(store.get(namespace, "deleted").await.unwrap(), None);
+    store.close().await.unwrap();
+}

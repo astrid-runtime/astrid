@@ -97,13 +97,31 @@ where
         &mut self,
         entries: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> StorageResult<Option<ObjectId>> {
+        if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return Err(StorageError::Serialization(
+                "KV migration entries are not strictly ordered".to_owned(),
+            ));
+        }
+        let entries = entries
+            .into_iter()
+            .map(|(key, bytes)| {
+                Ok(LeafEntry {
+                    key,
+                    value: self.make_value(bytes)?,
+                })
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
+        self.build_sorted_slots(entries)
+    }
+
+    pub(super) fn build_sorted_slots(
+        &mut self,
+        entries: Vec<LeafEntry>,
+    ) -> StorageResult<Option<ObjectId>> {
         if entries.is_empty() {
             return Ok(None);
         }
-        if entries
-            .windows(2)
-            .any(|pair| pair[0].0.as_slice() >= pair[1].0.as_slice())
-        {
+        if entries.windows(2).any(|pair| pair[0].key >= pair[1].key) {
             return Err(StorageError::Serialization(
                 "KV migration entries are not strictly ordered".to_owned(),
             ));
@@ -111,11 +129,7 @@ where
 
         let mut leaves = Vec::new();
         let mut current = Vec::new();
-        for (key, bytes) in entries {
-            let entry = LeafEntry {
-                key,
-                value: self.make_value(bytes)?,
-            };
+        for entry in entries {
             current.push(entry);
             if current.len() > 1 && !page_fits(leaf_record(&current), current.len(), 1)? {
                 let overflow = current.pop().ok_or_else(|| {
@@ -243,6 +257,96 @@ where
             .collect()
     }
 
+    // The header has already validated this immutable projection. Preserve
+    // its admitted value identities while packing replacement checkpoint pages.
+    pub(super) fn checkpoint_entries(
+        &mut self,
+        header: &TreeHeader<P>,
+    ) -> StorageResult<Vec<LeafEntry>> {
+        let mut entries = BTreeMap::new();
+        let mut stack = header.tree.into_iter().collect::<Vec<_>>();
+        while let Some(object) = stack.pop() {
+            match self.node(object)?.node {
+                Node::Leaf(leaf) => {
+                    for entry in leaf.entries {
+                        if entries.insert(entry.key, entry.value).is_some() {
+                            return Err(invalid(object, "KV checkpoint contains duplicate keys"));
+                        }
+                    }
+                },
+                Node::Branch(branch) => {
+                    for child in branch.children.iter().rev() {
+                        self.validate_pointer(child)?;
+                        stack.push(child.object);
+                    }
+                },
+            }
+        }
+
+        // Latest occurrence wins. Values are immutable slots from the exact
+        // authoritative delta chain, rather than reconstructed overlay bytes.
+        let mut updates = BTreeMap::new();
+        let mut cursor = header.head;
+        let mut visited = BTreeSet::new();
+        let mut depth = 0_u64;
+        let mut checkpoint_tree = None;
+        while let Some(object) = cursor {
+            if !visited.insert(object) {
+                return Err(invalid(object, "KV delta chain contains a cycle"));
+            }
+            match decode_head(object, &self.record(object)?)? {
+                Head::Checkpoint { tree, .. } => {
+                    checkpoint_tree = tree;
+                    break;
+                },
+                Head::Delta {
+                    previous,
+                    mutations,
+                    ..
+                } => {
+                    depth = depth.checked_add(1).ok_or_else(arithmetic_overflow)?;
+                    for mutation in mutations {
+                        updates.entry(mutation.key).or_insert(mutation.value);
+                    }
+                    cursor = previous;
+                },
+            }
+        }
+        if checkpoint_tree != header.tree || depth != header.delta_depth {
+            return Err(StorageError::Serialization(
+                "KV checkpoint source disagrees with validated projection".to_owned(),
+            ));
+        }
+        for (key, value) in updates {
+            match value {
+                Some(value) => {
+                    entries.insert(key, value);
+                },
+                None => {
+                    entries.remove(&key);
+                },
+            }
+        }
+        let resolved = entries
+            .into_iter()
+            .map(|(key, value)| LeafEntry { key, value })
+            .collect::<Vec<_>>();
+        let totals = resolved
+            .iter()
+            .try_fold(NodeTotals::default(), |totals, entry| {
+                totals.add(entry.totals()?)
+            })?;
+        if totals.entries != header.entries
+            || totals.logical_bytes != header.logical_bytes
+            || totals.quota_bytes != header.quota_bytes
+        {
+            return Err(StorageError::Serialization(
+                "KV checkpoint slot accounting disagrees with validated projection".to_owned(),
+            ));
+        }
+        Ok(resolved)
+    }
+
     pub(super) fn visit_entries(
         &mut self,
         root: Option<ObjectId>,
@@ -318,15 +422,13 @@ where
                 replacement.as_deref(),
             )?;
             let value = replacement
-                .map(|value| self.make_value(value))
+                .as_ref()
+                .map(|value| self.make_value(value.clone()))
                 .transpose()?;
-            current.insert(
-                key.clone(),
-                value
-                    .as_ref()
-                    .map(|value| self.value_bytes(value))
-                    .transpose()?,
-            );
+            // The canonical builder consumes a copy; retain the caller's bytes
+            // for the overlay instead of decoding the just-staged value again.
+            // Root admission still verifies the complete transaction.
+            current.insert(key.clone(), replacement);
             mutations.push(Mutation { key, value });
         }
         let record = delta_record(

@@ -425,3 +425,28 @@ fn chunked_value_rejects_unequal_staged_body_without_overwriting() {
     assert_eq!(engine.object_count(), 0);
     assert!(engine.root(&principal).is_none());
 }
+
+#[test]
+fn mutation_overlay_retains_original_value_allocation() {
+    let engine = InMemoryEngine::new(TestIdentity);
+    let principal = "alice".to_owned();
+    let mut context = TreeContext::new(&engine, &principal);
+    let header = super::super::super::header::TreeHeader::empty(principal.clone());
+    let mut input = bytes();
+    input.reserve_exact(4096);
+    let original_pointer = input.as_ptr();
+    let original_capacity = input.capacity();
+    let expected = input.clone();
+    let key = b"alice:component\0large".to_vec();
+    let projection = context
+        .apply_mutations(&header, vec![(key.clone(), Some(input))])
+        .unwrap();
+
+    let value = projection.overlay.get(&key).unwrap().as_ref().unwrap();
+    assert_eq!(value, &expected);
+    // A read/decode round trip allocates for the logical length and loses the
+    // caller's spare capacity. The overlay already owns the original bytes.
+    assert_eq!(value.capacity(), original_capacity);
+    assert_eq!(value.as_ptr(), original_pointer);
+    assert_eq!(engine.object_count(), 0, "staging must remain unpublished");
+}
