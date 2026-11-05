@@ -230,21 +230,22 @@ impl<P: Ord> World<P> {
         records: &[(ObjectId, ObjectRecord)],
         root: ObjectId,
     ) -> Result<u64, ModelError> {
-        let mut staged = self.objects.clone();
-        let mut inserted = 0_u64;
+        // Keep the resident world borrowed until every fallible admission
+        // check succeeds. Copying its full retained history here makes even
+        // metadata-only checkpoints block readers while cloning old payloads.
+        let mut staged = BTreeMap::new();
         for (id, record) in records {
-            match staged.get(id) {
+            match staged.get(id).copied().or_else(|| self.objects.get(id)) {
                 Some(existing) if existing == record => {},
                 Some(_) => return Err(ModelError::ObjectCollision(*id)),
                 None => {
-                    staged.insert(*id, record.clone());
-                    inserted = inserted
-                        .checked_add(1)
-                        .ok_or(ModelError::ArithmeticOverflow)?;
+                    staged.insert(*id, record);
                 },
             }
         }
-        let closure = closure_in(&staged, root)?;
+        let closure = closure_with(root, |id| {
+            staged.get(&id).copied().or_else(|| self.objects.get(&id))
+        })?;
         if let Some(extraneous) = records
             .iter()
             .map(|(id, _)| id)
@@ -252,7 +253,11 @@ impl<P: Ord> World<P> {
         {
             return Err(ModelError::ExtraneousImportObject(*extraneous));
         }
-        self.objects = staged;
+        let inserted = u64::try_from(staged.len()).map_err(|_| ModelError::ArithmeticOverflow)?;
+        // No fallible model operation remains. Publication stays under the
+        // caller's exclusive world ownership, with unchanged resident records.
+        self.objects
+            .extend(staged.into_iter().map(|(id, record)| (id, record.clone())));
         Ok(inserted)
     }
 
@@ -488,6 +493,13 @@ pub(super) fn closure_in(
     objects: &BTreeMap<ObjectId, ObjectRecord>,
     root: ObjectId,
 ) -> Result<BTreeSet<ObjectId>, ModelError> {
+    closure_with(root, |id| objects.get(&id))
+}
+
+fn closure_with<'a>(
+    root: ObjectId,
+    object: impl Fn(ObjectId) -> Option<&'a ObjectRecord>,
+) -> Result<BTreeSet<ObjectId>, ModelError> {
     let mut result = BTreeSet::new();
     let mut marks = BTreeMap::<ObjectId, u8>::new();
     let mut stack = vec![(root, false)];
@@ -503,7 +515,7 @@ pub(super) fn closure_in(
             Some(1) => return Err(ModelError::ObjectCycle(id)),
             Some(_) | None => {},
         }
-        let record = objects.get(&id).ok_or(ModelError::MissingObject(id))?;
+        let record = object(id).ok_or(ModelError::MissingObject(id))?;
         marks.insert(id, 1);
         stack.push((id, true));
         for child in record.owning_references().rev() {
