@@ -149,3 +149,60 @@ async fn metadata_checkpoint_still_avoids_rebuild_while_certified_reads_remain_c
     );
     store.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn checkpointed_mutations_read_previous_chunked_value_once() {
+    use crate::kv::{KvBatchCondition, KvBatchMutation, KvEntryKey, KvMutationBatch};
+
+    let namespace = "alice:capsule:ownership";
+    let original = vec![0x42; 512 * 1024];
+    let replacement = vec![0x43; original.len()];
+    let mut observed = Vec::new();
+    for operation in ["set", "cas", "delete", "batch"] {
+        let engine = Arc::new(MeasuringEngine::new());
+        let store =
+            TreeKvStore::<String, TestIdentity, Resolver, _>::from_engine(engine.clone(), Resolver);
+        store
+            .set(namespace, "large", original.clone())
+            .await
+            .unwrap();
+        store.checkpoint_for_test("alice".to_owned()).unwrap();
+        super::admission_test_support::drain_checkpoint_tasks(&engine).await;
+        engine.loaded_chunk_bytes.store(0, Ordering::Relaxed);
+        match operation {
+            "set" => store
+                .set(namespace, "large", replacement.clone())
+                .await
+                .unwrap(),
+            "cas" => assert!(
+                store
+                    .compare_and_swap(namespace, "large", Some(&original), replacement.clone(),)
+                    .await
+                    .unwrap()
+            ),
+            "delete" => assert!(store.delete(namespace, "large").await.unwrap()),
+            "batch" => {
+                let batch = KvMutationBatch::new(
+                    std::iter::empty::<KvBatchCondition>(),
+                    [KvBatchMutation::Set {
+                        key: KvEntryKey::new(namespace, "large").unwrap(),
+                        value: replacement.clone(),
+                    }],
+                )
+                .unwrap();
+                assert!(store.apply_batch(&batch).await.unwrap().applied);
+            },
+            _ => unreachable!(),
+        }
+        observed.push((operation, engine.loaded_chunk_bytes.load(Ordering::Relaxed)));
+        let expected = (operation != "delete").then(|| replacement.clone());
+        assert_eq!(store.get(namespace, "large").await.unwrap(), expected);
+        store.close().await.unwrap();
+    }
+    // Each comparison already reconstructed this exact header's old value.
+    // Quota accounting must consume it without another full payload walk.
+    assert_eq!(
+        observed,
+        ["set", "cas", "delete", "batch"].map(|operation| (operation, original.len() as u64))
+    );
+}

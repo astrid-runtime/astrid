@@ -494,7 +494,10 @@ fn mutation_overlay_retains_original_value_allocation() {
     let expected = input.clone();
     let key = b"alice:component\0large".to_vec();
     let projection = context
-        .apply_mutations(&header, vec![(key.clone(), Some(input))])
+        .apply_mutations(
+            &header,
+            vec![super::super::Replacement::new(key.clone(), Some(input))],
+        )
         .unwrap();
 
     let value = projection.overlay.get(&key).unwrap().as_ref().unwrap();

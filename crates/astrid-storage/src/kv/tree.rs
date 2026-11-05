@@ -13,7 +13,7 @@ use crate::engine::{KvProjectionEngine, KvProjectionError};
 use crate::storage_model::ModelError;
 use parking_lot::Mutex;
 
-use self::context::TreeContext;
+use self::context::{Replacement, TreeContext};
 use self::delta::Projection;
 use self::header::{TreeHeader, decode_header};
 use self::hot_cache::KvHotCache;
@@ -247,7 +247,7 @@ where
         mutation: impl FnMut(
             &mut TreeContext<'_, P, E>,
             &TreeHeader<P>,
-        ) -> StorageResult<(T, Vec<(Vec<u8>, Option<Vec<u8>>)>, bool)>,
+        ) -> StorageResult<(T, Vec<Replacement>, bool)>,
     ) -> StorageResult<T> {
         self.mutate_with_quota(owner, MutationQuota::CurrentPolicy, mutation)
     }
@@ -259,7 +259,7 @@ where
         mut mutation: impl FnMut(
             &mut TreeContext<'_, P, E>,
             &TreeHeader<P>,
-        ) -> StorageResult<(T, Vec<(Vec<u8>, Option<Vec<u8>>)>, bool)>,
+        ) -> StorageResult<(T, Vec<Replacement>, bool)>,
     ) -> StorageResult<T> {
         loop {
             let header = self.header(owner.clone())?;
@@ -366,7 +366,10 @@ where
             }
             let count = u64::try_from(keys.len())
                 .map_err(|_| StorageError::Internal("KV key count overflow".to_owned()))?;
-            let mutations = keys.into_iter().map(|key| (key, None)).collect();
+            let mutations = keys
+                .into_iter()
+                .map(|key| Replacement::new(key, None))
+                .collect();
             Ok((count, mutations, count != 0))
         })
     }
@@ -521,7 +524,9 @@ where
                 }
                 let mutations = entries
                     .into_iter()
-                    .filter_map(|(key, value)| value.map(|_| (key, None)))
+                    .filter_map(|(key, value)| {
+                        value.map(|value| Replacement::observed(key, Some(value), None))
+                    })
                     .collect::<Vec<_>>();
                 let count = u64::try_from(mutations.len()).unwrap_or(u64::MAX);
                 Ok((count, mutations, count != 0))
@@ -543,7 +548,7 @@ where
             let mutations = entries
                 .iter()
                 .map(|entry| {
-                    (
+                    Replacement::new(
                         composite_key(&entry.namespace, &entry.key),
                         Some(entry.value.clone()),
                     )
@@ -636,10 +641,19 @@ where
         let mutation_owner = owner.clone();
         blocking.checkpoint_once_after(owner, true, move || {
             interleaved.mutate(&mutation_owner, |context, header| {
-                if context.projected_get(header, &key)?.as_deref() == Some(value.as_slice()) {
+                let previous = context.projected_get(header, &key)?;
+                if previous.as_deref() == Some(value.as_slice()) {
                     return Ok(((), Vec::new(), false));
                 }
-                Ok(((), vec![(key.clone(), Some(value.clone()))], true))
+                Ok((
+                    (),
+                    vec![Replacement::observed(
+                        key.clone(),
+                        previous,
+                        Some(value.clone()),
+                    )],
+                    true,
+                ))
             })
         })
     }

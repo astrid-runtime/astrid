@@ -97,6 +97,7 @@ type Store = TreeKvStore<String, TestIdentity, Resolver, InMemoryEngine<String, 
 struct MeasuringEngine {
     inner: InMemoryEngine<String, TestIdentity>,
     identified_chunk_bytes: AtomicU64,
+    loaded_chunk_bytes: AtomicU64,
 }
 
 impl MeasuringEngine {
@@ -104,6 +105,7 @@ impl MeasuringEngine {
         Self {
             inner: InMemoryEngine::new(TestIdentity),
             identified_chunk_bytes: AtomicU64::new(0),
+            loaded_chunk_bytes: AtomicU64::new(0),
         }
     }
 }
@@ -122,7 +124,14 @@ impl KvProjectionEngine<String> for MeasuringEngine {
     }
 
     fn load_kv_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, KvProjectionError> {
-        Ok(self.inner.object(id))
+        let record = self.inner.object(id);
+        if let Some(record) = &record
+            && record.kind() == ObjectKind::Chunk
+        {
+            self.loaded_chunk_bytes
+                .fetch_add(record.canonical_bytes().len() as u64, Ordering::Relaxed);
+        }
+        Ok(record)
     }
 
     fn snapshot_kv_root(

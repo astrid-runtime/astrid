@@ -23,6 +23,42 @@ use crate::kv::tree_error::{invalid, map_engine};
 
 pub(super) mod value;
 
+// A comparison and its mutation share one immutable header per CAS attempt.
+// Carry an already-read value through accounting; bulk key-only operations
+// keep deferred reads so they never retain every previous payload at once.
+pub(super) struct Replacement {
+    key: Vec<u8>,
+    previous: PreviousValue,
+    value: Option<Vec<u8>>,
+}
+
+enum PreviousValue {
+    Unread,
+    Loaded(Option<Vec<u8>>),
+}
+
+impl Replacement {
+    pub(super) fn new(key: Vec<u8>, value: Option<Vec<u8>>) -> Self {
+        Self {
+            key,
+            previous: PreviousValue::Unread,
+            value,
+        }
+    }
+
+    pub(super) fn observed(
+        key: Vec<u8>,
+        previous: Option<Vec<u8>>,
+        value: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            key,
+            previous: PreviousValue::Loaded(previous),
+            value,
+        }
+    }
+}
+
 pub(super) struct TreeContext<'a, P, E> {
     engine: &'a E,
     principal: &'a P,
@@ -412,10 +448,14 @@ where
     pub(super) fn apply_mutations(
         &mut self,
         header: &TreeHeader<P>,
-        mut replacements: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        mut replacements: Vec<Replacement>,
     ) -> StorageResult<Projection> {
-        replacements.sort_by(|left, right| left.0.cmp(&right.0));
-        if replacements.is_empty() || replacements.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        replacements.sort_by(|left, right| left.key.cmp(&right.key));
+        if replacements.is_empty()
+            || replacements
+                .windows(2)
+                .any(|pair| pair[0].key == pair[1].key)
+        {
             return Err(StorageError::Serialization(
                 "KV mutation batch is empty or has duplicate keys".to_owned(),
             ));
@@ -427,22 +467,30 @@ where
         };
         let mut current = header.overlay.clone();
         let mut mutations = Vec::with_capacity(replacements.len());
-        for (key, replacement) in replacements {
-            let previous = match current.get(&key) {
-                Some(value) => value.clone(),
-                None => self.projected_get(header, &key)?,
+        for Replacement {
+            key,
+            previous,
+            value: replacement,
+        } in replacements
+        {
+            let loaded_previous;
+            let previous = if let Some(value) = current.get(&key) {
+                value.as_deref()
+            } else {
+                match &previous {
+                    PreviousValue::Loaded(value) => value.as_deref(),
+                    PreviousValue::Unread => {
+                        loaded_previous = self.projected_get(header, &key)?;
+                        loaded_previous.as_deref()
+                    },
+                }
             };
-            if previous == replacement {
+            if previous == replacement.as_deref() {
                 return Err(StorageError::Serialization(
                     "KV mutation batch contains a no-op".to_owned(),
                 ));
             }
-            update_totals(
-                &mut totals,
-                &key,
-                previous.as_deref(),
-                replacement.as_deref(),
-            )?;
+            update_totals(&mut totals, &key, previous, replacement.as_deref())?;
             let value = replacement
                 .as_ref()
                 .map(|value| self.make_value(value.as_slice()))

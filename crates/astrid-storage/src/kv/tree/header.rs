@@ -408,24 +408,22 @@ where
     E: KvProjectionEngine<P>,
 {
     for mutation in mutations {
-        let previous = match overlay.get(&mutation.key) {
-            Some(value) => value.clone(),
-            None => context.get(tree, &mutation.key)?,
+        let loaded_previous;
+        let previous = if let Some(value) = overlay.get(&mutation.key) {
+            value.as_deref()
+        } else {
+            loaded_previous = context.get(tree, &mutation.key)?;
+            loaded_previous.as_deref()
         };
         let replacement = mutation
             .value
             .as_ref()
             .map(|value| context.value_bytes(value))
             .transpose()?;
-        if previous == replacement {
+        if previous == replacement.as_deref() {
             return Err(invalid(object, "KV delta contains a no-op mutation"));
         }
-        update_totals(
-            totals,
-            &mutation.key,
-            previous.as_deref(),
-            replacement.as_deref(),
-        )?;
+        update_totals(totals, &mutation.key, previous, replacement.as_deref())?;
         overlay.insert(mutation.key.clone(), replacement);
     }
     Ok(())

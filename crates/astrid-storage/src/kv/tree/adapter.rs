@@ -8,7 +8,7 @@ use crate::engine::KvProjectionEngine;
 use async_trait::async_trait;
 
 use super::hot_cache::HotRead;
-use super::{BlockingTreeStore, TreeKvStore, map_engine};
+use super::{BlockingTreeStore, Replacement, TreeKvStore, map_engine};
 use crate::error::{StorageError, StorageResult};
 use crate::kv::principal::KvPrincipalResolver;
 use crate::kv::{
@@ -79,10 +79,19 @@ where
         let blocking = self.blocking_store();
         run_blocking(move || {
             blocking.mutate(&owner, |context, header| {
-                if context.projected_get(header, &composite)?.as_deref() == Some(value.as_slice()) {
+                let previous = context.projected_get(header, &composite)?;
+                if previous.as_deref() == Some(value.as_slice()) {
                     return Ok(((), Vec::new(), false));
                 }
-                Ok(((), vec![(composite.clone(), Some(value.clone()))], true))
+                Ok((
+                    (),
+                    vec![Replacement::observed(
+                        composite.clone(),
+                        previous,
+                        Some(value.clone()),
+                    )],
+                    true,
+                ))
             })
         })
         .await
@@ -96,11 +105,12 @@ where
         let blocking = self.blocking_store();
         run_blocking(move || {
             blocking.mutate(&owner, |context, header| {
-                let removed = context.projected_get(header, &composite)?.is_some();
+                let previous = context.projected_get(header, &composite)?;
+                let removed = previous.is_some();
                 Ok((
                     removed,
                     removed
-                        .then(|| (composite.clone(), None))
+                        .then(|| Replacement::observed(composite.clone(), previous, None))
                         .into_iter()
                         .collect(),
                     removed,
@@ -170,7 +180,15 @@ where
                 if current.as_deref() == Some(new.as_slice()) {
                     return Ok((true, Vec::new(), false));
                 }
-                Ok((true, vec![(composite.clone(), Some(new.clone()))], true))
+                Ok((
+                    true,
+                    vec![Replacement::observed(
+                        composite.clone(),
+                        current,
+                        Some(new.clone()),
+                    )],
+                    true,
+                ))
             })
         })
         .await
@@ -294,8 +312,9 @@ where
         for mutation in batch.mutations() {
             let key = mutation.key().composite();
             let replacement = mutation.replacement().map(<[u8]>::to_vec);
-            if context.projected_get(header, &key)? != replacement {
-                mutations.push((key, replacement));
+            let previous = context.projected_get(header, &key)?;
+            if previous != replacement {
+                mutations.push(Replacement::observed(key, previous, replacement));
             }
         }
         let changed = !mutations.is_empty();
