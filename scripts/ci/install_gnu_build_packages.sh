@@ -11,6 +11,7 @@ printf '%s\n' \
   'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20260901T000000Z/ bullseye main' \
   'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/20260901T000000Z/ bullseye-security main' \
   > "$sources"
-options=(-o "Dir::Etc::sourcelist=$sources" -o Dir::Etc::sourceparts=-)
+# Retry transient snapshot downloads; exhausted failures still stop the build.
+options=(-o "Dir::Etc::sourcelist=$sources" -o Dir::Etc::sourceparts=- -o Acquire::Retries=3)
 apt-get "${options[@]}" update
 apt-get "${options[@]}" install -y --no-install-recommends "$@"

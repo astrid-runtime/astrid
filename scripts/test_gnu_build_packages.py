@@ -12,7 +12,7 @@ SCRIPT = Path(__file__).parent / "ci/install_gnu_build_packages.sh"
 
 
 class PackageSetupTests(unittest.TestCase):
-    def run_setup(self, fail_update=False):
+    def run_setup(self, fail_update=False, fail_install=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             log = root / "calls.jsonl"
@@ -28,10 +28,13 @@ class PackageSetupTests(unittest.TestCase):
                 "'sources': pathlib.Path(source).read_text()}) + '\\n')\n"
                 "if 'update' in args and os.environ['APT_TEST_FAIL'] == '1': "
                 "sys.exit(100)\n"
+                "if 'install' in args and os.environ['APT_TEST_FAIL_INSTALL'] == '1': "
+                "sys.exit(100)\n"
             )
             apt.chmod(0o755)
             env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}",
-                       APT_TEST_LOG=str(log), APT_TEST_FAIL=str(int(fail_update)))
+                       APT_TEST_LOG=str(log), APT_TEST_FAIL=str(int(fail_update)),
+                       APT_TEST_FAIL_INSTALL=str(int(fail_install)))
             result = subprocess.run(
                 ["bash", str(SCRIPT), "cmake", "gcc-aarch64-linux-gnu"],
                 env=env, check=False,
@@ -65,6 +68,19 @@ class PackageSetupTests(unittest.TestCase):
         self.assertEqual(code, 100)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["args"][-1], "update")
+
+    def test_transport_retries_are_bounded_for_update_and_install(self):
+        code, calls = self.run_setup()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            self.assertEqual(call["args"].count("Acquire::Retries=3"), 1)
+
+    def test_failed_install_remains_a_failure(self):
+        code, calls = self.run_setup(fail_install=True)
+        self.assertEqual(code, 100)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("install", calls[1]["args"])
 
 
 if __name__ == "__main__":
