@@ -136,13 +136,7 @@ fn validate(directory: &PrivateDirectory) -> StorageResult<()> {
         .map_err(|error| connection(format!("validate captured retirement: {error}")))?;
     // The read-only platform probe uses paths for mount detection. Rebind the
     // path after that probe; it must still name the capability we will traverse.
-    let confirmation = PrivateDirectory::open(&directory.path)?;
-    if confirmation.identity != directory.identity {
-        return Err(connection(
-            "captured retirement path changed during validation".to_owned(),
-        ));
-    }
-    Ok(())
+    directory.confirm_path_binding()
 }
 
 fn remove_contents(
@@ -185,6 +179,18 @@ fn remove_contents(
         }
     }
     directory.sync()
+}
+
+pub(in crate::principal_state) fn validate_retirement_tree(
+    directory: &PrivateDirectory,
+) -> StorageResult<()> {
+    validate(directory)
+}
+
+pub(in crate::principal_state) fn remove_retirement_contents(
+    directory: &PrivateDirectory,
+) -> StorageResult<()> {
+    remove_contents(directory, directory.identity)
 }
 
 #[cfg(test)]

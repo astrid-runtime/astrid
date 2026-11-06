@@ -6,8 +6,8 @@ use std::path::Path;
 
 /// Validate the legacy source boundary without following a redirected root.
 ///
-/// The kernel performs a stronger recursive tree/device/mount validation before
-/// retirement.  Keeping this small no-follow check in the audit crate closes
+/// The storage source owner performs recursive tree/device/mount validation
+/// during retirement. Keeping this small no-follow check in the audit crate closes
 /// the earlier open-before-preflight window for callers that use the migration
 /// API directly.
 pub(crate) fn validate_legacy_source_path(path: &Path) -> AuditResult<bool> {
@@ -43,6 +43,11 @@ pub(crate) struct LegacyAuditReceipt {
     pub(crate) source_entries: u64,
     pub(crate) source_bytes: u64,
     pub(crate) source_digest: String,
+    /// Retirement phase on this same MOVE receipt. A raw intent object is
+    /// Authorized; later phases wrap that intent so they cannot parse as it.
+    #[cfg(not(target_family = "wasm"))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retirement: Option<LegacyRetirementRecord>,
     /// Number of verified source chains, retained as O(1) metadata.
     #[serde(default)]
     pub(crate) chain_count: u64,
@@ -53,6 +58,48 @@ pub(crate) struct LegacyAuditReceipt {
     /// chain fragments live in disposable paged scratch keys while migrating.
     #[serde(default, skip_serializing)]
     pub(crate) chains: Vec<LegacyAuditChainReceipt>,
+}
+
+/// Closed retirement phases stored in [`LegacyAuditReceipt::retirement`].
+///
+/// A raw intent object is Authorized. That is the earlier encoding used by
+/// this still-dirty receipt field; it is not an externally published format.
+/// Staged and Completed wrap the same intent under a distinct key so they
+/// cannot parse as a new authorization. Mixed phase keys are refused.
+#[cfg(not(target_family = "wasm"))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(untagged)]
+pub(crate) enum LegacyRetirementRecord {
+    Completed(CompletedRetirement),
+    Staged(StagedRetirement),
+    Authorized(astrid_storage::LegacyRetirementIntent),
+}
+
+/// Completed wrapper. Extra keys are refused so mixed phase objects cannot
+/// match this variant.
+#[cfg(not(target_family = "wasm"))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CompletedRetirement {
+    pub(crate) completed: astrid_storage::LegacyRetirementIntent,
+}
+
+/// Staged wrapper. Extra keys are refused so mixed phase objects cannot match
+/// this variant.
+#[cfg(not(target_family = "wasm"))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StagedRetirement {
+    pub(crate) staged: astrid_storage::LegacyRetirementIntent,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl LegacyRetirementRecord {
+    /// Import already copied the projection; later destination appends are
+    /// expected and must not be compared to the original receipt digest.
+    pub(crate) const fn import_already_verified(&self) -> bool {
+        matches!(self, Self::Staged(_) | Self::Completed(_))
+    }
 }
 
 pub(crate) struct ReceiptAccumulator {
@@ -124,6 +171,8 @@ impl ReceiptAccumulator {
             source_entries: self.source_entries,
             source_bytes: self.source_bytes,
             source_digest: blake3::Hash::from_bytes(self.digest).to_hex().to_string(),
+            #[cfg(not(target_family = "wasm"))]
+            retirement: None,
             chain_count,
             chain_digest,
             chains: Vec::new(),

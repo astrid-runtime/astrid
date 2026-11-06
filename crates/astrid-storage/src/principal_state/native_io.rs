@@ -11,7 +11,11 @@ use cap_std::fs::Dir;
 #[cfg(feature = "legacy-surrealkv")]
 mod retirement;
 #[cfg(feature = "legacy-surrealkv")]
-pub(super) use retirement::CapturedDirectory;
+pub(super) use retirement::{
+    CapturedDirectory, remove_retirement_contents, validate_retirement_tree,
+};
+#[cfg(feature = "legacy-surrealkv")]
+mod from_captured;
 
 use crate::error::{StorageError, StorageResult};
 

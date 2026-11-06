@@ -5,10 +5,11 @@ use astrid_core::platform_fs::{CapturedDirectory, create_private_directory};
 
 #[test]
 fn captured_source_capability_moves_and_retires_under_the_same_writer_fence() {
-    let temporary = tempfile::tempdir().unwrap();
-    astrid_core::platform_fs::ensure_private_directory(temporary.path()).unwrap();
-    let source = temporary.path().join("source");
-    let staging = temporary.path().join("staging");
+    let temporary = super::private_temp();
+    let workspace = temporary.path().join("workspace");
+    create_private_directory(&workspace).unwrap();
+    let source = workspace.join("source");
+    let staging = workspace.join("staging");
     let staged = staging.join("captured");
     create_private_directory(&source).unwrap();
     create_private_directory(&staging).unwrap();

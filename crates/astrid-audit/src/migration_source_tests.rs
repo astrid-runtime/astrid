@@ -51,7 +51,7 @@ fn source_files(path: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 
 #[tokio::test]
 async fn published_legacy_import_preserves_source_until_retirement() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = super::legacy_test_directory::temporary().unwrap();
     let path = directory.path().join("audit-db");
     published_legacy_source(&path);
     let before = source_files(&path);
@@ -76,7 +76,7 @@ async fn published_legacy_import_preserves_source_until_retirement() {
 
 #[tokio::test]
 async fn rejected_legacy_digest_preserves_published_source() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = super::legacy_test_directory::temporary().unwrap();
     let path = directory.path().join("audit-db");
     published_legacy_source(&path);
     let before = source_files(&path);
@@ -133,7 +133,7 @@ async fn seed_audit(path: &Path, key: Arc<KeyPair>, entries: usize) {
 #[cfg(unix)]
 #[tokio::test]
 async fn original_source_change_during_move_still_prevents_marker_publication() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = super::legacy_test_directory::temporary().unwrap();
     let path = directory.path().join("source");
     let replacement = directory.path().join("replacement");
     let key = Arc::new(KeyPair::generate());
@@ -211,7 +211,7 @@ impl AuditCapacityProvider for ChangingPayloadCapacity {
 
 #[tokio::test]
 async fn original_payload_change_under_shared_lock_prevents_marker_publication() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = super::legacy_test_directory::temporary().unwrap();
     let path = directory.path().join("source");
     let replacement = directory.path().join("replacement");
     let key = Arc::new(KeyPair::generate());
@@ -261,7 +261,7 @@ async fn nonempty_old_format_import_preserves_source_on_refusal_and_success() {
     let fixture: serde_json::Value =
         serde_json::from_slice(include_bytes!("../fixtures/surrealkv-0.21.3-audit.json")).unwrap();
     for available in [0, u64::MAX] {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = super::legacy_test_directory::temporary().unwrap();
         let path = directory.path().join("audit-db");
         materialize_source(&path, &fixture);
         let before = source_files(&path);
@@ -318,11 +318,11 @@ async fn nonempty_old_format_import_preserves_source_on_refusal_and_success() {
 
 #[tokio::test]
 async fn final_digest_keeps_original_writer_fenced_through_staged_retirement() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = super::legacy_test_directory::temporary().unwrap();
     let path = directory.path().join("audit-db");
     published_legacy_source(&path);
     let before = source_files(&path);
-    let retired = directory.path().join("retired");
+    let staging_root = directory.path().join("retired");
     let destination = AuditLog::open_with_kv_store(
         Arc::new(astrid_storage::MemoryKvStore::new()),
         KeyPair::generate(),
@@ -333,20 +333,28 @@ async fn final_digest_keeps_original_writer_fenced_through_staged_retirement() {
         .await
         .unwrap();
     destination
-        .with_verified_legacy_source(&path, "fenced-retirement", &report.source_digest, |kind| {
-            assert_eq!(kind, astrid_storage::LegacySourceKind::LockedDatabase);
-            assert_source_writer_excluded(&path);
-            astrid_core::platform_fs::rename_with_write_through(&path, &retired)
-                .map_err(|error| AuditError::StorageError(error.to_string()))?;
-            assert_source_writer_excluded(&retired);
-            assert_eq!(source_files(&retired), before);
-            astrid_core::dirs::retire_legacy_source_tree(&retired)
-                .map_err(|error| AuditError::StorageError(error.to_string()))
-        })
+        .with_verified_legacy_source(
+            &path,
+            "fenced-retirement",
+            &report.source_digest,
+            async |source| {
+                assert_eq!(
+                    source.kind(),
+                    astrid_storage::LegacySourceKind::LockedDatabase
+                );
+                assert_source_writer_excluded(&path);
+                assert_eq!(source_files(&path), before);
+                let intent = source.retirement_intent();
+                source
+                    .retire(&intent, &staging_root)
+                    .await
+                    .map_err(|error| AuditError::StorageError(error.to_string()))
+            },
+        )
         .await
         .unwrap();
     assert!(!path.exists());
-    assert!(!retired.exists());
+    assert!(std::fs::read_dir(&staging_root).unwrap().next().is_none());
 }
 
 fn assert_source_writer_excluded(source: &std::path::Path) {
@@ -365,7 +373,7 @@ fn assert_source_writer_excluded(source: &std::path::Path) {
 
 #[tokio::test]
 async fn empty_source_retirement_atomically_refuses_new_files() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = super::legacy_test_directory::temporary().unwrap();
     let path = directory.path().join("audit-db");
     std::fs::create_dir(&path).unwrap();
     let destination = AuditLog::open_with_kv_store(
@@ -378,11 +386,23 @@ async fn empty_source_retirement_atomically_refuses_new_files() {
         .await
         .unwrap();
     let error = destination
-        .with_verified_legacy_source(&path, "empty-retirement", &report.source_digest, |kind| {
-            assert_eq!(kind, astrid_storage::LegacySourceKind::EmptyDirectory);
-            std::fs::write(path.join("late-writer"), b"must survive").unwrap();
-            std::fs::remove_dir(&path).map_err(|error| AuditError::StorageError(error.to_string()))
-        })
+        .with_verified_legacy_source(
+            &path,
+            "empty-retirement",
+            &report.source_digest,
+            async |source| {
+                assert_eq!(
+                    source.kind(),
+                    astrid_storage::LegacySourceKind::EmptyDirectory
+                );
+                std::fs::write(path.join("late-writer"), b"must survive").unwrap();
+                let intent = source.retirement_intent();
+                source
+                    .retire(&intent, &directory.path().join("retired"))
+                    .await
+                    .map_err(|error| AuditError::StorageError(error.to_string()))
+            },
+        )
         .await
         .unwrap_err();
     assert!(!error.to_string().is_empty());
@@ -394,7 +414,7 @@ async fn empty_source_retirement_atomically_refuses_new_files() {
 
 #[tokio::test]
 async fn unchanged_empty_source_can_be_retired_without_creating_a_lock() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = super::legacy_test_directory::temporary().unwrap();
     let path = directory.path().join("audit-db");
     std::fs::create_dir(&path).unwrap();
     let destination = AuditLog::open_with_kv_store(
@@ -407,12 +427,27 @@ async fn unchanged_empty_source_can_be_retired_without_creating_a_lock() {
         .await
         .unwrap();
     destination
-        .with_verified_legacy_source(&path, "empty-retirement", &report.source_digest, |kind| {
-            assert_eq!(kind, astrid_storage::LegacySourceKind::EmptyDirectory);
-            assert!(std::fs::read_dir(&path).unwrap().next().is_none());
-            std::fs::remove_dir(&path).map_err(|error| AuditError::StorageError(error.to_string()))
-        })
+        .with_verified_legacy_source(
+            &path,
+            "empty-retirement",
+            &report.source_digest,
+            async |source| {
+                assert_eq!(
+                    source.kind(),
+                    astrid_storage::LegacySourceKind::EmptyDirectory
+                );
+                assert!(std::fs::read_dir(&path).unwrap().next().is_none());
+                let intent = source.retirement_intent();
+                source
+                    .retire(&intent, &directory.path().join("retired"))
+                    .await
+                    .map_err(|error| AuditError::StorageError(error.to_string()))
+            },
+        )
         .await
         .unwrap();
     assert!(!path.exists());
 }
+
+#[path = "migration_source_tests/retirement.rs"]
+mod retirement;

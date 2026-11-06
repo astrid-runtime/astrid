@@ -55,6 +55,9 @@ mod migration;
 mod prune_oldest_impl;
 #[path = "log/retention_guard.rs"]
 mod retention_guard;
+#[cfg(not(target_family = "wasm"))]
+#[path = "log/retire_legacy.rs"]
+mod retire_legacy;
 #[path = "log/v2.rs"]
 mod v2;
 #[path = "log/verify_chain.rs"]
@@ -347,7 +350,7 @@ impl AuditLog {
                 legacy_path,
                 destination_identity,
                 expected_digest,
-                |_| Ok(()),
+                async |_| Ok(()),
             )
             .await
         }
@@ -362,9 +365,10 @@ impl AuditLog {
 
     /// Verify a legacy MOVE digest and run retirement under the same source fence.
     ///
-    /// A locked database retains its original shared LOCK until the synchronous
-    /// operation returns. An empty source has no lock: the operation must use
-    /// atomic empty-directory removal, never recursive deletion. Historical
+    /// A locked database retains its original shared LOCK until the operation
+    /// and its independently owned retirement work return. An empty source has
+    /// no lock: the operation must use atomic empty-directory removal, never
+    /// recursive deletion. Historical
     /// signatures and chains are not recertified by this byte-preservation proof.
     ///
     /// # Errors
@@ -377,7 +381,7 @@ impl AuditLog {
         legacy_path: impl AsRef<Path>,
         destination_identity: &str,
         expected_digest: &str,
-        operation: impl FnOnce(astrid_storage::LegacySourceKind) -> AuditResult<T>,
+        operation: impl AsyncFnOnce(astrid_storage::LegacySource) -> AuditResult<T>,
     ) -> AuditResult<T> {
         let legacy_path = legacy_path.as_ref();
         if !validate_legacy_source_path(legacy_path)? {
@@ -385,7 +389,7 @@ impl AuditLog {
                 "legacy audit source disappeared before retirement".to_owned(),
             ));
         }
-        astrid_storage::with_legacy_kv_snapshot(legacy_path, async |store, kind| {
+        astrid_storage::with_legacy_kv_snapshot(legacy_path, async |store, owner| {
             let source = KvAuditStorage::from_frozen_store(store);
             let receipt = digest_legacy_source(&source, destination_identity).await?;
             if receipt.source_digest != expected_digest {
@@ -393,7 +397,7 @@ impl AuditLog {
                     "legacy audit source changed before retirement".to_owned(),
                 ));
             }
-            operation(kind)
+            operation(owner).await
         })
         .await
         .map_err(|error| AuditError::StorageError(error.to_string()))?
@@ -917,6 +921,9 @@ impl AuditLog {
 #[cfg(test)]
 #[path = "batch_tests.rs"]
 mod batch_tests;
+#[cfg(test)]
+#[path = "log/legacy_test_directory.rs"]
+mod legacy_test_directory;
 #[cfg(all(test, not(target_family = "wasm")))]
 #[path = "migration_source_tests.rs"]
 mod migration_source_tests;

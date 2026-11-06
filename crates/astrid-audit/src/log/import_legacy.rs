@@ -1,5 +1,7 @@
 //! Native bulk move of a legacy `SurrealKV` audit tree into [`AuditLog`].
 
+#[cfg(not(target_family = "wasm"))]
+use super::migration::LegacyRetirementRecord;
 use super::migration::{
     copy_legacy_projection, decode_receipt, digest_legacy_source, digest_storage, payload_matches,
     validate_destination, validate_legacy_source_path, with_frozen_legacy_source,
@@ -23,8 +25,29 @@ impl AuditLog {
                 .await;
         }
 
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(existing) = marker_before.as_deref() {
+            let prior = decode_receipt(existing)?;
+            validate_destination(&prior, destination_identity)?;
+            if prior
+                .retirement
+                .as_ref()
+                .is_some_and(LegacyRetirementRecord::import_already_verified)
+            {
+                // The occupant is not a source we will retire at this name.
+                return Ok(LegacyAuditImportReport {
+                    source_entries: prior.source_entries,
+                    imported_entries: 0,
+                    marker_installed: false,
+                    source_digest: prior.source_digest,
+                });
+            }
+        }
+
         let (receipt, imported_entries) = with_frozen_legacy_source(&legacy_path, async |source| {
             let receipt = digest_legacy_source(&source, destination_identity).await?;
+            #[cfg(not(target_family = "wasm"))]
+            let mut receipt = receipt;
             self.ensure_migration_capacity(&receipt)?;
             if let Some(existing) = marker_before.as_deref() {
                 let prior = decode_receipt(existing)?;
@@ -33,6 +56,13 @@ impl AuditLog {
                         "legacy audit migration receipt conflicts with source or destination"
                             .to_owned(),
                     ));
+                }
+                // A retry must preserve the captured retirement authority.
+                // Replacing it from a same-payload source would authorize a
+                // different directory after an interrupted retirement.
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    receipt.retirement = prior.retirement;
                 }
             }
 
@@ -71,7 +101,7 @@ impl AuditLog {
         })
     }
 
-    async fn prove_reopened_destination(
+    pub(super) async fn prove_reopened_destination(
         &self,
         destination_identity: &str,
         expected: &super::migration::LegacyAuditReceipt,
@@ -106,6 +136,21 @@ impl AuditLog {
         };
         let receipt = decode_receipt(&marker_bytes)?;
         validate_destination(&receipt, destination_identity)?;
+        #[cfg(not(target_family = "wasm"))]
+        if receipt
+            .retirement
+            .as_ref()
+            .is_some_and(LegacyRetirementRecord::import_already_verified)
+        {
+            // Import already verified this destination. A later native append
+            // must not be compared against the original receipt projection.
+            return Ok(LegacyAuditImportReport {
+                source_entries: receipt.source_entries,
+                imported_entries: 0,
+                marker_installed: false,
+                source_digest: receipt.source_digest,
+            });
+        }
         let destination = digest_storage(self.storage.as_ref(), destination_identity).await?;
         if !payload_matches(&receipt, &destination) {
             return Err(AuditError::StorageError(

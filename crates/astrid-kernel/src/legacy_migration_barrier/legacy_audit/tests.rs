@@ -53,12 +53,34 @@ async fn boot_imports_old_format_audit_and_retires_only_the_verified_source() {
     assert_eq!(audit.count().await.unwrap(), 1);
     assert!(!source.exists());
     assert!(
-        !home
-            .migrations_dir()
-            .join("audit-principal-home.retired")
-            .exists()
+        std::fs::read_dir(home.migrations_dir())
+            .unwrap()
+            .all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("legacy-retire-")
+            })
     );
+    // Legitimate native writes after MOVE must not invalidate the persisted
+    // source retirement intent on the next boot.
+    audit
+        .append(
+            astrid_core::SessionId::new(),
+            astrid_audit::AuditAction::McpToolCall {
+                server: "native-after-migration".to_owned(),
+                tool: "append".to_owned(),
+                args_hash: astrid_crypto::ContentHash::zero(),
+            },
+            astrid_audit::AuthorizationProof::NotRequired {
+                reason: "fixture".to_owned(),
+            },
+            astrid_audit::AuditOutcome::success(),
+        )
+        .await
+        .unwrap();
     // Restart-style retry sees absence and preserves the imported projection.
     migrate_legacy_audit(&home, &audit).await.unwrap();
-    assert_eq!(audit.count().await.unwrap(), 1);
+    assert_eq!(audit.count().await.unwrap(), 2);
 }

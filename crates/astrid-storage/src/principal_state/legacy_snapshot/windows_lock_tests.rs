@@ -7,6 +7,10 @@ use std::path::Path;
 
 mod captured_source;
 
+pub(super) fn private_temp() -> super::test_directory::TestDirectory {
+    super::test_directory::temporary().unwrap()
+}
+
 fn assert_writer_excluded(file: &File) {
     assert!(
         matches!(file.try_lock(), Err(TryLockError::WouldBlock)),

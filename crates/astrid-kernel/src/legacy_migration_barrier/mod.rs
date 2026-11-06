@@ -43,19 +43,19 @@ mod retirement;
 mod secret;
 mod source;
 #[cfg(unix)]
-use crate::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
+use crate::preflight_legacy_audit_sources;
 use env_import::import_env_and_secrets;
 #[cfg(test)]
 pub(crate) use hooks::inject_tmp_retirement_interruption_once;
 pub(crate) use hooks::interrupt_after_tmp_retirement_if_requested;
+#[cfg(not(unix))]
+use host_fs::preflight_legacy_audit_sources;
 use host_fs::{
     add_log_source, add_principal_scope_sources, add_source, collect_workspace_targets,
     ensure_legacy_secret_aliases, path_exists, read_bounded_file, require_layout_provenance,
     retire_empty_directory, snapshot_log_path, snapshot_owner_controlled_path, snapshot_path,
     storage_io, sync_parent, validate_source_path,
 };
-#[cfg(not(unix))]
-use host_fs::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
 use ledger::{
     DestinationProof, MigrationLedger, SourceCount, SourceDigest, SourceIdentity,
     collect_destination_proofs, decode_canonical, reject_unsupported_sources,

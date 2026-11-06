@@ -3,13 +3,22 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use super::native_io::{CapturedDirectory, PrivateDirectory};
-use crate::{KvStore, StorageError, StorageResult, SurrealKvStore};
+use super::native_io::CapturedDirectory;
+use crate::{KvStore, StorageError, StorageResult};
 
+mod intent;
+mod owner;
+mod retire;
 mod store;
 use store::SnapshotStore;
 #[cfg(windows)]
 mod source_lock;
+
+pub use intent::LegacyRetirementIntent;
+pub use owner::LegacySource;
+pub use retire::{
+    LegacyRetirementStage, resume_legacy_retirement, resume_staged_legacy_retirement,
+};
 
 /// Original-source protection retained during a snapshot operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,84 +128,33 @@ impl Drop for SnapshotReader {
 /// # Errors
 ///
 /// Returns an error if private copying, opening, closing, or cleanup fails.
-/// The original source is never opened by the legacy engine or removed here.
+/// The original source is never opened by the legacy engine. Retirement is a
+/// separate owner method under a persisted intent.
 pub async fn with_legacy_kv_snapshot<T>(
     source: &Path,
-    operation: impl AsyncFnOnce(Arc<dyn KvStore>, LegacySourceKind) -> T,
+    operation: impl AsyncFnOnce(Arc<dyn KvStore>, LegacySource) -> T,
 ) -> StorageResult<T> {
     let source = source.to_path_buf();
     // Copying, fsync, and upstream format conversion perform blocking I/O.
     // Keep them off the async worker while retaining the source lock in the
     // returned owner through the operation and proven reader shutdown.
-    let (mut reader, store, kind) = tokio::task::spawn_blocking(move || prepare_snapshot(&source))
-        .await
-        .map_err(snapshot_error)??;
-    let result = operation(store, kind).await;
+    let (mut reader, store, owner) =
+        tokio::task::spawn_blocking(move || owner::prepare_snapshot(&source))
+            .await
+            .map_err(snapshot_error)??;
+    let result = operation(store, owner).await;
     reader.close().await?;
     Ok(result)
 }
 
-fn prepare_snapshot(
-    source: &Path,
-) -> StorageResult<(SnapshotReader, Arc<SnapshotStore>, LegacySourceKind)> {
-    let source = PrivateDirectory::open(source)?;
-    let source_lock = lock_source(&source)?;
-    let workspace = SnapshotWorkspace::create()?;
-    let copy = (|| {
-        let path = workspace
-            .0
-            .as_ref()
-            .ok_or_else(|| snapshot_error("missing workspace"))?
-            .path()
-            .join("database");
-        let destination = PrivateDirectory::open(&path)?;
-        super::migrations::copy_legacy_tree(&source, &destination)?;
-        drop(destination);
-        Ok::<_, StorageError>(path)
-    })();
-    let path = match copy {
-        Ok(path) => path,
-        Err(error) => {
-            // No engine was opened: a failed copy has no worker lifetime to
-            // retain. Remove only this exclusively created private workspace.
-            workspace.remove()?;
-            return Err(error);
-        },
-    };
-    let kind = if source_lock.is_some() {
-        LegacySourceKind::LockedDatabase
-    } else {
-        LegacySourceKind::EmptyDirectory
-    };
-    let store = Arc::new(SnapshotStore::new(
-        SurrealKvStore::open(&path)?,
-        source_lock,
-    ));
-    let reader = SnapshotReader {
-        store: Some(Arc::clone(&store)),
-        workspace: Some(workspace),
-    };
-    Ok((reader, store, kind))
-}
-
-fn lock_source(source: &PrivateDirectory) -> StorageResult<Option<std::fs::File>> {
-    if source.entries()?.is_empty() {
-        return Ok(None);
-    }
-    // Open read-only and no-follow: an engine opener truncates LOCK before
-    // acquiring it. A shared lock also permits the copy's separate read handle
-    // on Windows, where exclusive byte-range locks prevent even reads.
-    let lock = source.open_file(Path::new("LOCK"))?;
-    lock.try_lock_shared().map_err(snapshot_error)?;
-    #[cfg(windows)]
-    let lock = source_lock::handoff(lock).map_err(snapshot_error)?;
-    Ok(Some(lock))
-}
-
-fn snapshot_error(error: impl std::fmt::Display) -> StorageError {
+pub(super) fn snapshot_error(error: impl std::fmt::Display) -> StorageError {
     StorageError::Connection(format!("legacy snapshot: {error}"))
 }
 
+#[cfg(test)]
+mod retire_tests;
+#[cfg(test)]
+mod test_directory;
 #[cfg(test)]
 mod tests;
 

@@ -59,7 +59,10 @@ mod hosted_volume_tests;
 mod legacy_snapshot;
 mod migrations;
 #[cfg(feature = "legacy-surrealkv")]
-pub use legacy_snapshot::{LegacySourceKind, with_legacy_kv_snapshot};
+pub use legacy_snapshot::{
+    LegacyRetirementIntent, LegacyRetirementStage, LegacySource, LegacySourceKind,
+    resume_legacy_retirement, resume_staged_legacy_retirement, with_legacy_kv_snapshot,
+};
 mod native_io;
 #[cfg(test)]
 mod native_kv_scale_probe_tests;

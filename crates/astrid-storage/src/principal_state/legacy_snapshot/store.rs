@@ -1,5 +1,7 @@
 //! A snapshot owns its engine; escaped handles cannot outlive its scope.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use tokio::sync::{RwLock, RwLockReadGuard};
 
@@ -10,13 +12,13 @@ struct OpenSnapshot {
     // Keep the source fence with its engine, including failed/unscheduled
     // cleanup and escaped readers. Successful close drains reads, then drops
     // both resources together; a closed escaped wrapper retains neither.
-    _source_lock: Option<std::fs::File>,
+    _source_lock: Option<Arc<std::fs::File>>,
 }
 
 pub(super) struct SnapshotStore(RwLock<Option<OpenSnapshot>>);
 
 impl SnapshotStore {
-    pub(super) fn new(store: SurrealKvStore, source_lock: Option<std::fs::File>) -> Self {
+    pub(super) fn new(store: SurrealKvStore, source_lock: Option<Arc<std::fs::File>>) -> Self {
         Self(RwLock::new(Some(OpenSnapshot {
             store,
             _source_lock: source_lock,
@@ -133,7 +135,7 @@ mod tests {
         source_lock.try_lock_shared().unwrap();
         let store = Arc::new(SnapshotStore::new(
             SurrealKvStore::open(path.join("database")).unwrap(),
-            Some(source_lock),
+            Some(Arc::new(source_lock)),
         ));
         let reader = SnapshotReader {
             store: Some(Arc::clone(&store)),

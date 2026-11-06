@@ -9,7 +9,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandleEx, OpenFileById,
 };
 
-pub(super) fn handoff(original: File) -> io::Result<File> {
+pub(in crate::principal_state) fn handoff(original: File) -> io::Result<File> {
     let expected = identity(&original)?;
     let successor = open_by_id(&original, expected)?;
     let actual = identity(&successor)?;
@@ -26,6 +26,11 @@ pub(super) fn handoff(original: File) -> io::Result<File> {
     successor.try_lock_shared().map_err(io::Error::from)?;
     drop(original);
     Ok(successor)
+}
+
+pub(in crate::principal_state) fn extended_identity(file: &File) -> io::Result<(u64, [u8; 16])> {
+    let info = identity(file)?;
+    Ok((info.VolumeSerialNumber, info.FileId.Identifier))
 }
 
 fn identity(file: &File) -> io::Result<FILE_ID_INFO> {

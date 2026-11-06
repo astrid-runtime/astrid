@@ -3980,76 +3980,6 @@ pub(crate) fn require_audit_integrity(
 }
 
 #[cfg(unix)]
-pub(crate) fn retire_legacy_audit_dir(
-    home: &astrid_core::dirs::AstridHome,
-    source: &Path,
-) -> std::io::Result<()> {
-    let retired = home.migrations_dir().join("audit-principal-home.retired");
-    let expected = home
-        .principal_home(&astrid_core::PrincipalId::default())
-        .audit_dir();
-    if source != expected {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "legacy audit retirement source is outside the default principal audit path",
-        ));
-    }
-    astrid_core::platform_fs::verify_no_redirects(source.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "legacy audit source has no parent",
-        )
-    })?)?;
-    astrid_core::platform_fs::ensure_private_directory(&home.migrations_dir())?;
-    astrid_core::platform_fs::verify_no_redirects(&home.migrations_dir())?;
-    match std::fs::symlink_metadata(source) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "legacy audit source is not a regular directory: {}",
-                    source.display()
-                ),
-            ));
-        },
-        Ok(_) => {
-            if std::fs::symlink_metadata(&retired).is_ok() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    format!(
-                        "legacy audit retirement is ambiguous: {}",
-                        retired.display()
-                    ),
-                ));
-            }
-            let root_device = audit_tree_device(&std::fs::symlink_metadata(source)?);
-            validate_audit_tree(source, root_device)?;
-            astrid_core::platform_fs::rename_with_write_through(source, &retired)?;
-            sync_audit_directory(source.parent().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "legacy audit source has no parent",
-                )
-            })?)?;
-            sync_audit_directory(&home.migrations_dir())?;
-            validate_audit_tree(&retired, root_device)?;
-            delete_audit_tree(&retired, root_device)?;
-            sync_audit_directory(&home.migrations_dir())?;
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if std::fs::symlink_metadata(&retired).is_ok() {
-                let root_device = audit_tree_device(&std::fs::symlink_metadata(&retired)?);
-                validate_audit_tree(&retired, root_device)?;
-                delete_audit_tree(&retired, root_device)?;
-                sync_audit_directory(&home.migrations_dir())?;
-            }
-        },
-        Err(error) => return Err(error),
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
 fn audit_tree_device(metadata: &std::fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -4108,28 +4038,6 @@ fn validate_audit_tree(path: &Path, root_device: u64) -> std::io::Result<()> {
         }
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn delete_audit_tree(path: &Path, root_device: u64) -> std::io::Result<()> {
-    validate_audit_tree(path, root_device)?;
-    for entry in std::fs::read_dir(path)? {
-        let child = entry?.path();
-        let metadata = std::fs::symlink_metadata(&child)?;
-        if metadata.is_dir() {
-            delete_audit_tree(&child, root_device)?;
-        } else {
-            astrid_core::platform_fs::verify_no_redirects(&child)?;
-            std::fs::remove_file(&child)?;
-        }
-    }
-    sync_audit_directory(path)?;
-    std::fs::remove_dir(path)
-}
-
-#[cfg(unix)]
-fn sync_audit_directory(path: &Path) -> std::io::Result<()> {
-    std::fs::File::open(path)?.sync_all()
 }
 
 #[cfg(target_os = "linux")]

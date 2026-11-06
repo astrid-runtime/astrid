@@ -1,4 +1,5 @@
 use super::*;
+use crate::SurrealKvStore;
 
 pub(super) fn workspace_name_present(path: &std::path::Path) -> bool {
     // A Windows directory marked for deletion can reject child metadata opens
@@ -11,7 +12,7 @@ pub(super) fn workspace_name_present(path: &std::path::Path) -> bool {
 }
 
 async fn reader() -> (SnapshotReader, Arc<SnapshotStore>, std::path::PathBuf) {
-    let workspace = tempfile::tempdir().unwrap();
+    let workspace = super::test_directory::temporary().unwrap();
     let path = workspace.path().to_path_buf();
     let store = SurrealKvStore::open(path.join("database")).unwrap();
     store.set("test", "key", b"value".to_vec()).await.unwrap();
@@ -36,7 +37,7 @@ async fn explicit_close_closes_escaped_handles_before_removing_workspace() {
 #[tokio::test]
 async fn cancellation_closes_reader_and_removes_only_owned_workspace() {
     let (reader, escaped, path) = reader().await;
-    let source = tempfile::tempdir().unwrap();
+    let source = super::test_directory::temporary().unwrap();
     let source_file = source.path().join("untouched");
     std::fs::write(&source_file, b"source").unwrap();
     let (entered, ready) = tokio::sync::oneshot::channel();
@@ -61,7 +62,7 @@ async fn cancellation_closes_reader_and_removes_only_owned_workspace() {
 
 #[test]
 fn unavailable_cleanup_runtime_retains_workspace_instead_of_unlinking() {
-    let workspace = tempfile::tempdir().unwrap();
+    let workspace = super::test_directory::temporary().unwrap();
     let path = workspace.path().to_path_buf();
     drop(SnapshotWorkspace(Some(
         super::super::native_io::CapturedDirectory::open(&workspace.keep()).unwrap(),
@@ -72,7 +73,7 @@ fn unavailable_cleanup_runtime_retains_workspace_instead_of_unlinking() {
 
 #[tokio::test]
 async fn operation_error_still_closes_escaped_snapshot_handle() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = super::test_directory::temporary().unwrap();
     let source = directory.path().join("source");
     let original = SurrealKvStore::open(&source).unwrap();
     original
@@ -101,7 +102,7 @@ async fn operation_error_still_closes_escaped_snapshot_handle() {
 
 #[tokio::test]
 async fn live_source_writer_is_refused_without_touching_lock() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = super::test_directory::temporary().unwrap();
     let original = SurrealKvStore::open(directory.path()).unwrap();
     original
         .set("test", "key", b"original".to_vec())
@@ -141,7 +142,7 @@ async fn live_source_writer_is_refused_without_touching_lock() {
 
 #[tokio::test]
 async fn source_writer_excluded_through_operation_without_rewriting_lock() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = super::test_directory::temporary().unwrap();
     let original = SurrealKvStore::open(directory.path()).unwrap();
     original
         .set("test", "key", b"original".to_vec())
@@ -181,7 +182,7 @@ async fn source_writer_excluded_through_operation_without_rewriting_lock() {
 
 #[tokio::test]
 async fn empty_source_stays_empty_and_nonempty_without_lock_is_refused() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = super::test_directory::temporary().unwrap();
     with_legacy_kv_snapshot(directory.path(), async |store, _| {
         assert!(store.list_keys("test").await.unwrap().is_empty());
     })
@@ -204,7 +205,7 @@ async fn empty_source_stays_empty_and_nonempty_without_lock_is_refused() {
 
 #[tokio::test]
 async fn directory_lock_is_refused_without_entering_operation() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = super::test_directory::temporary().unwrap();
     std::fs::create_dir(directory.path().join("LOCK")).unwrap();
     let result = with_legacy_kv_snapshot(directory.path(), async |_, _| {
         panic!("directory LOCK must be refused");
@@ -216,7 +217,7 @@ async fn directory_lock_is_refused_without_entering_operation() {
 #[cfg(unix)]
 #[tokio::test]
 async fn redirected_lock_is_refused_without_touching_target() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = super::test_directory::temporary().unwrap();
     let target = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(target.path(), b"untouched").unwrap();
     std::os::unix::fs::symlink(target.path(), directory.path().join("LOCK")).unwrap();
@@ -269,7 +270,7 @@ async fn cleanup_refuses_a_replaced_workspace_name() {
     drop(reader.store.take());
     drop(store);
     let workspace = reader.workspace.take().unwrap();
-    let saved = tempfile::tempdir().unwrap();
+    let saved = super::test_directory::temporary().unwrap();
     std::fs::rename(&path, saved.path().join("captured-workspace")).unwrap();
     astrid_core::platform_fs::create_private_directory(&path).unwrap();
     std::fs::write(path.join("replacement"), b"must survive").unwrap();
@@ -296,7 +297,7 @@ async fn cleanup_refuses_a_replaced_workspace_name() {
 fn workspace_redirect_refusal_preserves_every_file() {
     let workspace = SnapshotWorkspace::create().unwrap();
     let path = workspace.0.as_ref().unwrap().path().to_path_buf();
-    let outside = tempfile::tempdir().unwrap();
+    let outside = super::test_directory::temporary().unwrap();
     std::fs::write(outside.path().join("sentinel"), b"outside").unwrap();
     std::fs::write(path.join("ordinary"), b"retain on refusal").unwrap();
     std::os::unix::fs::symlink(outside.path(), path.join("redirect")).unwrap();

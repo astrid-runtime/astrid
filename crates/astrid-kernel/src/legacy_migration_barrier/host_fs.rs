@@ -398,74 +398,6 @@ pub(super) fn preflight_legacy_audit_sources(
     Ok(default_source_present)
 }
 
-/// Retire the imported default audit tree through a private staging rename.
-/// The rename makes interrupted deletion resumable, while every pre/post
-/// traversal revalidates no-follow, regular-entry, device, and mount bounds.
-#[cfg(not(unix))]
-pub(super) fn retire_legacy_audit_dir(home: &AstridHome, source: &Path) -> io::Result<()> {
-    let retired = home.migrations_dir().join("audit-principal-home.retired");
-    let expected = home.principal_home(&PrincipalId::default()).audit_dir();
-    if source != expected {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "legacy audit retirement source is outside the default principal audit path",
-        ));
-    }
-    astrid_core::platform_fs::verify_no_redirects(source.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "legacy audit source has no parent",
-        )
-    })?)?;
-    astrid_core::platform_fs::ensure_private_directory(&home.migrations_dir())?;
-    astrid_core::platform_fs::verify_no_redirects(&home.migrations_dir())?;
-    match fs::symlink_metadata(source) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "legacy audit source is not a regular directory: {}",
-                    source.display()
-                ),
-            ));
-        },
-        Ok(_) => {
-            if fs::symlink_metadata(&retired).is_ok() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "legacy audit retirement is ambiguous: {}",
-                        retired.display()
-                    ),
-                ));
-            }
-            let root_device = device_id(&fs::symlink_metadata(source)?);
-            validate_audit_tree(source, root_device)?;
-            astrid_core::platform_fs::rename_with_write_through(source, &retired)?;
-            sync_directory(source.parent().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "legacy audit source has no parent",
-                )
-            })?)?;
-            sync_directory(&home.migrations_dir())?;
-            validate_audit_tree(&retired, root_device)?;
-            delete_audit_tree(&retired, root_device)?;
-            sync_directory(&home.migrations_dir())?;
-        },
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if fs::symlink_metadata(&retired).is_ok() {
-                let root_device = device_id(&fs::symlink_metadata(&retired)?);
-                validate_audit_tree(&retired, root_device)?;
-                delete_audit_tree(&retired, root_device)?;
-                sync_directory(&home.migrations_dir())?;
-            }
-        },
-        Err(error) => return Err(error),
-    }
-    Ok(())
-}
-
 #[cfg(not(unix))]
 fn validate_audit_tree(path: &Path, root_device: u64) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
@@ -518,23 +450,6 @@ fn validate_audit_tree(path: &Path, root_device: u64) -> io::Result<()> {
         }
     }
     Ok(())
-}
-
-#[cfg(not(unix))]
-fn delete_audit_tree(path: &Path, root_device: u64) -> io::Result<()> {
-    validate_audit_tree(path, root_device)?;
-    for entry in fs::read_dir(path).map_err(io::Error::other)? {
-        let child = entry.map_err(io::Error::other)?.path();
-        let metadata = fs::symlink_metadata(&child).map_err(io::Error::other)?;
-        if metadata.is_dir() {
-            delete_audit_tree(&child, root_device)?;
-        } else {
-            astrid_core::platform_fs::verify_no_redirects(&child)?;
-            fs::remove_file(&child).map_err(io::Error::other)?;
-        }
-    }
-    sync_directory(path)?;
-    fs::remove_dir(path).map_err(io::Error::other)
 }
 
 pub(super) fn device_id(metadata: &fs::Metadata) -> u64 {
