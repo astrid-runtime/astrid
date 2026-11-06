@@ -120,7 +120,10 @@ mod tests {
         ));
         let mut reader = SnapshotReader {
             store: Some(Arc::clone(&store)),
-            workspace: Some(SnapshotWorkspace(Some(workspace.keep()))),
+            workspace: Some(SnapshotWorkspace(Some(
+                crate::principal_state::native_io::CapturedDirectory::open(&workspace.keep())
+                    .unwrap(),
+            ))),
         };
         let reading = store.read().await.unwrap();
         let mut closing = Box::pin(reader.close());

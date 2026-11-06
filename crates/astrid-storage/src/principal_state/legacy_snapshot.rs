@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use super::native_io::PrivateDirectory;
+use super::native_io::{CapturedDirectory, PrivateDirectory};
 use crate::{KvStore, StorageError, StorageResult, SurrealKvStore};
 
 mod store;
@@ -19,7 +19,7 @@ pub enum LegacySourceKind {
 }
 
 // Even an aborted cleanup future must retain files until closure is proven.
-struct SnapshotWorkspace(Option<std::path::PathBuf>);
+struct SnapshotWorkspace(Option<CapturedDirectory>);
 
 impl SnapshotWorkspace {
     fn create() -> StorageResult<Self> {
@@ -28,13 +28,15 @@ impl SnapshotWorkspace {
         // The platform primitive creates exclusively with private access at
         // namespace creation. An existing name is never adopted or removed.
         astrid_core::platform_fs::create_private_directory(&path).map_err(snapshot_error)?;
-        Ok(Self(Some(path)))
+        Ok(Self(Some(CapturedDirectory::open(&path)?)))
     }
 
     fn remove(mut self) -> StorageResult<()> {
-        if let Some(path) = self.0.as_ref() {
-            astrid_core::dirs::retire_legacy_source_tree(path).map_err(snapshot_error)?;
-            self.0 = None;
+        if let Some(directory) = self.0.take() {
+            let path = directory.path().to_path_buf();
+            directory.remove().inspect_err(|error| {
+                tracing::warn!(%error, path = %path.display(), "retain unremoved legacy snapshot");
+            })?;
         }
         Ok(())
     }
@@ -43,7 +45,7 @@ impl SnapshotWorkspace {
 impl Drop for SnapshotWorkspace {
     fn drop(&mut self) {
         if let Some(retained) = self.0.as_ref() {
-            tracing::warn!(path = %retained.display(), "retain unclosed legacy snapshot");
+            tracing::warn!(path = %retained.path().display(), "retain unclosed legacy snapshot");
         }
     }
 }
@@ -148,6 +150,7 @@ fn prepare_snapshot(
             .0
             .as_ref()
             .ok_or_else(|| snapshot_error("missing workspace"))?
+            .path()
             .join("database");
         astrid_core::platform_fs::ensure_private_directory(&path).map_err(snapshot_error)?;
         let destination = PrivateDirectory::open(&path)?;
@@ -190,3 +193,6 @@ fn snapshot_error(error: impl std::fmt::Display) -> StorageError {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, windows))]
+mod windows_lock_tests;

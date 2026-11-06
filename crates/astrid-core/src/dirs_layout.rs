@@ -561,6 +561,21 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
+/// Validate a legacy tree before capability-relative retirement.
+///
+/// Checks the same redirect, regular-entry, device and mount boundaries used
+/// by [`retire_legacy_source_tree`], without removing anything. Callers must
+/// retain and recheck their captured directory identity across this path probe;
+/// validation alone does not confer authority to delete a later replacement.
+///
+/// # Errors
+///
+/// Returns an error for an absent root or an inadmissible entry or boundary.
+pub fn validate_legacy_source_tree(path: &Path) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    retirement::validate_legacy_tree(path, retirement::legacy_tree_device(&metadata))
+}
+
 /// Validate and retire a legacy directory tree without following redirects.
 ///
 /// The complete tree is checked for symlinks, special entries, filesystem

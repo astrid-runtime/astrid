@@ -18,7 +18,9 @@ async fn reader() -> (SnapshotReader, Arc<SnapshotStore>, std::path::PathBuf) {
     let store = Arc::new(SnapshotStore::new(store));
     let reader = SnapshotReader {
         store: Some(Arc::clone(&store)),
-        workspace: Some(SnapshotWorkspace(Some(workspace.keep()))),
+        workspace: Some(SnapshotWorkspace(Some(
+            super::super::native_io::CapturedDirectory::open(&workspace.keep()).unwrap(),
+        ))),
     };
     (reader, store, path)
 }
@@ -61,7 +63,9 @@ async fn cancellation_closes_reader_and_removes_only_owned_workspace() {
 fn unavailable_cleanup_runtime_retains_workspace_instead_of_unlinking() {
     let workspace = tempfile::tempdir().unwrap();
     let path = workspace.path().to_path_buf();
-    drop(SnapshotWorkspace(Some(workspace.keep())));
+    drop(SnapshotWorkspace(Some(
+        super::super::native_io::CapturedDirectory::open(&workspace.keep()).unwrap(),
+    )));
     assert!(path.is_dir());
     std::fs::remove_dir(path).unwrap();
 }
@@ -256,4 +260,52 @@ async fn snapshot_refuses_mutation_and_all_reads_after_close() {
             .is_err()
     );
     assert!(escaped.close().await.is_err());
+}
+
+#[tokio::test]
+async fn cleanup_refuses_a_replaced_workspace_name() {
+    let (mut reader, store, path) = reader().await;
+    store.close_reader().await.unwrap();
+    drop(reader.store.take());
+    drop(store);
+    let workspace = reader.workspace.take().unwrap();
+    let saved = tempfile::tempdir().unwrap();
+    std::fs::rename(&path, saved.path().join("captured-workspace")).unwrap();
+    astrid_core::platform_fs::create_private_directory(&path).unwrap();
+    std::fs::write(path.join("replacement"), b"must survive").unwrap();
+    let result = workspace.remove();
+    let replacement_survived =
+        std::fs::read(path.join("replacement")).is_ok_and(|bytes| bytes == b"must survive");
+    // Both roots are synthetic and owned by this test; clean the replacement
+    // before asserting the counterfactual so failure does not strand it.
+    if path.try_exists().unwrap() {
+        std::fs::remove_dir_all(&path).unwrap();
+    }
+    assert!(
+        result.is_err(),
+        "cleanup accepted a replacement workspace identity"
+    );
+    assert!(
+        replacement_survived,
+        "cleanup deleted replacement workspace bytes"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_redirect_refusal_preserves_every_file() {
+    let workspace = SnapshotWorkspace::create().unwrap();
+    let path = workspace.0.as_ref().unwrap().path().to_path_buf();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("sentinel"), b"outside").unwrap();
+    std::fs::write(path.join("ordinary"), b"retain on refusal").unwrap();
+    std::os::unix::fs::symlink(outside.path(), path.join("redirect")).unwrap();
+    let result = workspace.remove();
+    let original = std::fs::read(path.join("ordinary")).unwrap();
+    let untouched = std::fs::read(outside.path().join("sentinel")).unwrap();
+    // These paths were created by this test and never adopted from a caller.
+    std::fs::remove_dir_all(&path).unwrap();
+    assert!(result.is_err());
+    assert_eq!(original, b"retain on refusal");
+    assert_eq!(untouched, b"outside");
 }

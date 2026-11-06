@@ -394,6 +394,10 @@ jobs:
         shell: pwsh
         run: cargo test --locked --target ${{ matrix.target }} -p astrid-storage --features legacy-surrealkv principal_state::legacy_snapshot -- --nocapture
 
+      - name: Run captured workspace retirement tests natively
+        shell: pwsh
+        run: cargo test --locked --target ${{ matrix.target }} -p astrid-storage --features legacy-surrealkv principal_state::native_io::retirement -- --nocapture
+
       - name: Run legacy audit source preservation tests natively
         shell: pwsh
         run: cargo test --locked --target ${{ matrix.target }} -p astrid-audit migration_source_tests -- --nocapture
