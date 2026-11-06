@@ -12,6 +12,7 @@ fn identity_with_attribute_share_delete(path: &Path) -> DirectoryIdentity {
     let wide = wide_path(path).unwrap();
     // FILE_READ_ATTRIBUTES excludes DELETE, so SHARE_DELETE is compatible with
     // a captured no-share-delete handle that itself holds DELETE.
+    // SAFETY: wide is NUL-terminated, and OPEN_REPARSE_POINT prevents traversal.
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
@@ -29,6 +30,7 @@ fn identity_with_attribute_share_delete(path: &Path) -> DirectoryIdentity {
         "{}",
         io::Error::last_os_error()
     );
+    // SAFETY: the valid owned handle transfers exactly once into File.
     let file = unsafe { File::from_raw_handle(handle.cast()) };
     query_directory_identity(&file).unwrap()
 }
@@ -151,4 +153,21 @@ fn captured_directory_error_paths_leave_uncaptured_trees() {
         std::fs::read(source.join("data")).unwrap(),
         b"uncaptured stays"
     );
+}
+
+#[test]
+fn captured_directory_remove_does_not_report_success_with_a_live_duplicate() {
+    let _serial = serial_test_guard();
+    let root = private_temp();
+    let directory = root.path().join("pending");
+    crate::platform_fs::create_private_directory(&directory).unwrap();
+    let captured = CapturedDirectory::open(&directory).unwrap();
+    let duplicate = captured.try_clone_directory_file().unwrap();
+    let result = captured.remove_empty();
+    assert!(
+        result.is_err(),
+        "reported removal while a duplicate remained alive"
+    );
+    drop(duplicate);
+    assert!(!directory.exists());
 }

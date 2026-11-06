@@ -2,8 +2,9 @@
 //!
 //! Public Astrid path types stay in [`crate::dirs`]. This module owns the
 //! operating-system mechanics needed to make those paths private and to
-//! replace authenticated executables without exposing platform handles to the
-//! rest of the workspace.
+//! replace authenticated executables. Captured Windows directory owners may
+//! duplicate their native object as a standard File for capability traversal;
+//! removal still requires a handle-relative proof that the name is absent.
 
 #[cfg(target_os = "macos")]
 #[path = "platform_fs/macos_acl.rs"]

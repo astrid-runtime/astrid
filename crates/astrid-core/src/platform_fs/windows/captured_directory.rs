@@ -9,6 +9,7 @@ use super::io::rename_guarded_handle;
 use super::path::{OwnedHandle, TrustedPathGuard, open_directory_identity_relative_with_access};
 use super::prelude::*;
 use crate::platform_fs::DirectoryIdentity;
+use std::os::windows::io::BorrowedHandle;
 
 /// Windows directory opened with delete access and without delete sharing.
 ///
@@ -20,6 +21,8 @@ use crate::platform_fs::DirectoryIdentity;
 pub struct CapturedDirectory {
     file: File,
     identity: DirectoryIdentity,
+    parent: File,
+    name: OsString,
 }
 
 impl CapturedDirectory {
@@ -64,9 +67,15 @@ impl CapturedDirectory {
         .map_err(|error| {
             with_context(error, format!("open captured directory {}", path.display()))
         })?;
+        let parent = duplicate_directory_handle(source_parent.authority_handle())?;
         let file = into_std_file(handle);
         let identity = query_directory_identity(&file)?;
-        Ok(Self { file, identity })
+        Ok(Self {
+            file,
+            identity,
+            parent,
+            name: name.to_os_string(),
+        })
     }
 
     /// Duplicate the captured native directory object.
@@ -90,8 +99,8 @@ impl CapturedDirectory {
 
     /// Move the captured directory into `destination` without replacement.
     ///
-    /// The destination parent is captured for the native call and post-check
-    /// only. The destination must be a direct child of that parent. The source
+    /// The destination parent is captured for the native call and retained
+    /// for the eventual handle-relative removal check. The destination must be a direct child of that parent. The source
     /// file remains open through return. This does not establish a durable MOVE
     /// receipt.
     ///
@@ -116,7 +125,20 @@ impl CapturedDirectory {
                 format!("capture destination parent of {}", destination.display()),
             )
         })?;
-        rename_guarded_handle(&self.file, &destination_parent, destination, false)
+        let parent = duplicate_directory_handle(destination_parent.authority_handle())?;
+        let name = destination
+            .file_name()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "captured destination has no name",
+                )
+            })?
+            .to_os_string();
+        rename_guarded_handle(&self.file, &destination_parent, destination, false)?;
+        self.parent = parent;
+        self.name = name;
+        Ok(())
     }
 
     /// Delete the captured directory if it is empty, consuming the handle.
@@ -124,16 +146,45 @@ impl CapturedDirectory {
     /// Uses classic `FileDispositionInformation` so a nonempty directory is
     /// refused and POSIX unlink-while-open is not applied. Callers must empty
     /// contents through a cloned directory file and drop that clone first. This
-    /// does not recurse. Because `self` is consumed, a nonempty error still
-    /// closes the captured handle.
+    /// does not recurse. Success also requires proving the child name absent
+    /// through the retained parent. An outstanding duplicate may delay actual
+    /// deletion: that returns an error, never completed retirement. Because
+    /// `self` is consumed, errors still close the captured handle.
     ///
     /// # Errors
     ///
     /// Returns an error if the directory is not empty or the delete disposition
     /// is refused.
     pub fn remove_empty(self) -> io::Result<()> {
-        delete_empty_directory(&self.file)
+        let Self {
+            file, parent, name, ..
+        } = self;
+        delete_empty_directory(&file)?;
+        drop(file);
+        // A duplicate may keep the same native file object delete-pending.
+        // Only a missing child is proof of namespace removal; an existing
+        // child, DELETE_PENDING, or any other error is not success.
+        match open_directory_identity_relative_with_access(
+            parent.as_raw_handle().cast(),
+            &name,
+            false,
+            0,
+        ) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(with_context(error, "captured directory removal not proven")),
+            Ok(_) => Err(io::Error::other(
+                "captured directory name still exists after removal",
+            )),
+        }
     }
+}
+
+fn duplicate_directory_handle(handle: HANDLE) -> io::Result<File> {
+    // SAFETY: the caller retains its TrustedPathGuard through this duplication.
+    // The borrowed view does not take ownership; try_clone_to_owned duplicates
+    // the same native file object and File owns that duplicate exactly once.
+    let borrowed = unsafe { BorrowedHandle::borrow_raw(handle.cast()) };
+    borrowed.try_clone_to_owned().map(File::from)
 }
 
 pub(super) fn query_directory_identity(file: &File) -> io::Result<DirectoryIdentity> {
