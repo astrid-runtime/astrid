@@ -8,7 +8,7 @@ use super::{
     ensure_payload_limit, io_error, live_files_mut, materialize_closure, read_indexed_object,
     read_indexed_objects, usage_from_closure, validate_incremental_closure,
 };
-use crate::engine::{ProjectionObserver, ProjectionPhase};
+use crate::engine::{IdentityProof, KvIdentitySession, ProjectionObserver, ProjectionPhase};
 use crate::storage_model::ObjectIdentity;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -45,6 +45,13 @@ where
     #[must_use]
     pub fn identify(&self, record: &ObjectRecord) -> ObjectId {
         self.identity.identify(record)
+    }
+
+    pub(crate) fn captured_identity_session(&self) -> KvIdentitySession<'_>
+    where
+        I: Send + Sync,
+    {
+        KvIdentitySession::bind(&self.identity, &self.preparation_authority)
     }
 
     /// Return one immutable object through the principal-accounted decoded
@@ -683,6 +690,27 @@ where
         usage_from_closure(&records, root.commit).map_err(Into::into)
     }
 
+    fn verify_declared_identities(
+        &self,
+        records: &[(ObjectId, ObjectRecord)],
+        proof: &IdentityProof,
+    ) -> Result<(), DurableError> {
+        if proof.matches(&self.preparation_authority) {
+            return Ok(());
+        }
+        for (declared, record) in records {
+            let computed = self.identify(record);
+            if computed != *declared {
+                return Err(ModelError::ObjectIdentityMismatch {
+                    declared: *declared,
+                    computed,
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn prepare(
         &self,
         inner: &mut DurableInner<P>,
@@ -695,17 +723,9 @@ where
             expected,
             commit: commit_id,
             records,
+            identity_proof,
         } = transaction;
-        for (declared, record) in &records {
-            let computed = self.identify(record);
-            if computed != *declared {
-                return Err(ModelError::ObjectIdentityMismatch {
-                    declared: *declared,
-                    computed,
-                }
-                .into());
-            }
-        }
+        self.verify_declared_identities(&records, &identity_proof)?;
         let actual = pending_roots
             .get(&principal)
             .copied()
@@ -725,16 +745,7 @@ where
             commit: commit_id,
         };
 
-        let mut unique = BTreeMap::new();
-        for (id, record) in records {
-            match unique.get(&id) {
-                Some(existing) if existing == &record => {},
-                Some(_) => return Err(ModelError::ObjectCollision(id).into()),
-                None => {
-                    unique.insert(id, record);
-                },
-            }
-        }
+        let unique = unique_transaction_records(records)?;
         let closure_started = std::time::Instant::now();
         let reachable = self.validate_pending_closure(inner, &unique, commit_id);
         if let Some(observer) = observer {
@@ -828,4 +839,20 @@ where
         }
         Ok(())
     }
+}
+
+fn unique_transaction_records(
+    records: Vec<(ObjectId, ObjectRecord)>,
+) -> Result<BTreeMap<ObjectId, ObjectRecord>, DurableError> {
+    let mut unique = BTreeMap::new();
+    for (id, record) in records {
+        match unique.get(&id) {
+            Some(existing) if existing == &record => {},
+            Some(_) => return Err(ModelError::ObjectCollision(id).into()),
+            None => {
+                unique.insert(id, record);
+            },
+        }
+    }
+    Ok(unique)
 }

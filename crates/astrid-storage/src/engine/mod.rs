@@ -30,6 +30,7 @@ pub mod crash_replay;
 mod durable;
 #[cfg(not(target_family = "wasm"))]
 mod durable_cache;
+mod identity;
 mod kv;
 mod muninn;
 mod projection;
@@ -46,6 +47,8 @@ pub use durable::{
     RecoveryRetryPolicy, TransactionWalPolicy, VerifiedCompactionPlan,
     deterministic_compaction_proof,
 };
+pub(crate) use identity::IdentityProof;
+pub use identity::KvIdentitySession;
 pub use kv::{
     KvProjectionEngine, KvProjectionError, KvState, KvStateSnapshot, ReadyKvRoot,
     commit_kv_with_engine, kv_snapshot_with_engine,
@@ -76,15 +79,19 @@ pub use refinery::{
 
 /// A root update and the immutable records required to reconstruct it.
 ///
-/// Record identifiers are untrusted declarations. The engine recomputes every
-/// identity before admitting any record. Records may be empty when the commit
+/// Record identifiers declared through [`Self::new`] are untrusted. The engine
+/// recomputes every identity before admitting those records. A crate-private
+/// seal may skip only that identity loop when the consuming engine is the same
+/// process-local instance that hashed the records. Collision, closure, quota,
+/// and root compare-and-swap still run. Records may be empty when the commit
 /// closure is already present.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct RootTransaction<P> {
     principal: P,
     expected: Option<RootState>,
     commit: ObjectId,
     records: Vec<(ObjectId, ObjectRecord)>,
+    identity_proof: IdentityProof,
 }
 
 impl<P> RootTransaction<P> {
@@ -101,6 +108,7 @@ impl<P> RootTransaction<P> {
             expected,
             commit,
             records,
+            identity_proof: IdentityProof::Untrusted,
         }
     }
 
@@ -128,6 +136,29 @@ impl<P> RootTransaction<P> {
         &self.records
     }
 }
+
+impl<P: Clone> Clone for RootTransaction<P> {
+    fn clone(&self) -> Self {
+        Self {
+            principal: self.principal.clone(),
+            expected: self.expected,
+            commit: self.commit,
+            records: self.records.clone(),
+            identity_proof: IdentityProof::Untrusted,
+        }
+    }
+}
+
+impl<P: PartialEq> PartialEq for RootTransaction<P> {
+    fn eq(&self, other: &Self) -> bool {
+        self.principal == other.principal
+            && self.expected == other.expected
+            && self.commit == other.commit
+            && self.records == other.records
+    }
+}
+
+impl<P: Eq> Eq for RootTransaction<P> {}
 
 /// Result of publishing one principal-root transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -299,6 +330,13 @@ impl<P: Ord, I: ObjectIdentity> InMemoryEngine<P, I> {
         self.identity.identify(record)
     }
 
+    pub(crate) fn captured_identity_session(&self) -> KvIdentitySession<'_>
+    where
+        I: Send + Sync,
+    {
+        KvIdentitySession::bind(&self.identity, &self.preparation_authority)
+    }
+
     /// Admit one immutable object.
     ///
     /// Re-admission is idempotent. The returned identifier is always computed
@@ -350,14 +388,16 @@ impl<P: Ord, I: ObjectIdentity> InMemoryEngine<P, I> {
     /// error without changing the visible root. Identity, graph, and known
     /// root-conflict failures also admit no transaction record.
     pub fn commit(&self, transaction: RootTransaction<P>) -> Result<CommitOutcome, ModelError> {
-        self.verify_identities(&transaction.records)?;
-
         let RootTransaction {
             principal,
             expected,
             commit,
             records,
+            identity_proof,
         } = transaction;
+        if !identity_proof.matches(&self.preparation_authority) {
+            self.verify_identities(&records)?;
+        }
         let mut world = self.world.write();
         let actual = world.root(&principal);
         if actual != expected {
@@ -432,6 +472,8 @@ impl<P: Ord, I: ObjectIdentity> InMemoryEngine<P, I> {
     }
 }
 
+#[cfg(test)]
+mod identity_session_tests;
 #[cfg(test)]
 mod muninn_tests;
 

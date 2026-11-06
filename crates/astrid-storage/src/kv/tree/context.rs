@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 
-use crate::engine::{KvProjectionEngine, RootTransaction};
+use crate::engine::{KvIdentitySession, KvProjectionEngine, RootTransaction};
 use crate::storage_model::{
     ModelError, ObjectClass, ObjectId, ObjectKind, ObjectRecord, ObjectReference, ReferenceKind,
 };
@@ -73,6 +73,7 @@ pub(super) struct TreeContext<'a, P, E> {
     principal: &'a P,
     records: BTreeMap<ObjectId, ObjectRecord>,
     nodes: BTreeMap<ObjectId, NodeHandle>,
+    identity_session: Option<KvIdentitySession<'a>>,
     marker: PhantomData<fn() -> P>,
 }
 
@@ -87,6 +88,7 @@ where
             principal,
             records: BTreeMap::new(),
             nodes: BTreeMap::new(),
+            identity_session: engine.kv_identity_session(),
             marker: PhantomData,
         }
     }
@@ -655,12 +657,11 @@ where
         .map_err(|error| model_error(&error))?;
         let commit = self.insert(commit)?;
         self.retain_reachable(commit);
-        Ok(RootTransaction::new(
-            header.owner,
-            header.root,
-            commit,
-            self.records.into_iter().collect(),
-        ))
+        let records = self.records.into_iter().collect();
+        Ok(match self.identity_session {
+            Some(session) => session.seal_transaction(header.owner, header.root, commit, records),
+            None => RootTransaction::new(header.owner, header.root, commit, records),
+        })
     }
 
     fn pack_branches(&mut self, children: &[ChildPointer]) -> StorageResult<Vec<NodeHandle>> {
@@ -732,13 +733,19 @@ where
     }
 
     pub(super) fn insert(&mut self, record: ObjectRecord) -> StorageResult<ObjectId> {
-        let object = self.engine.identify_kv_object(&record);
-        self.stage_identified_record(object, record)
+        self.stage_identified_record(self.identify_record(&record), record)
     }
 
-    // Transaction-local staging only. Callers supply either an ID just computed
-    // by this engine or an unchanged record from its immediate content build.
-    // Root admission still independently verifies every declared identity.
+    pub(super) fn identify_record(&self, record: &ObjectRecord) -> ObjectId {
+        match self.identity_session {
+            Some(session) => session.identify(record),
+            None => self.engine.identify_kv_object(record),
+        }
+    }
+
+    // Transaction-local staging only. Writers are insert after identify_record
+    // and make_chunked_value immediately after build_content(self). A captured
+    // session lets admission trust these identities; keep this set of callers closed.
     fn stage_identified_record(
         &mut self,
         object: ObjectId,

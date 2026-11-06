@@ -322,6 +322,11 @@ pub trait KvProjectionEngine<P>: Send + Sync {
     /// Compute the logical identity of one canonical object.
     fn identify_kv_object(&self, record: &ObjectRecord) -> ObjectId;
 
+    /// Bound hasher and admission authority, or `None` to rehash at commit.
+    fn kv_identity_session(&self) -> Option<crate::engine::KvIdentitySession<'_>> {
+        None
+    }
+
     /// Return the current root of one principal without materializing it.
     ///
     /// # Errors
@@ -424,6 +429,10 @@ where
         self.identify(record)
     }
 
+    fn kv_identity_session(&self) -> Option<crate::engine::KvIdentitySession<'_>> {
+        Some(self.captured_identity_session())
+    }
+
     fn current_kv_root(&self, principal: &P) -> Result<Option<RootState>, KvProjectionError> {
         Ok(self.root(principal))
     }
@@ -471,6 +480,10 @@ where
 {
     fn identify_kv_object(&self, record: &ObjectRecord) -> ObjectId {
         self.identify(record)
+    }
+
+    fn kv_identity_session(&self) -> Option<crate::engine::KvIdentitySession<'_>> {
+        Some(self.captured_identity_session())
     }
 
     fn current_kv_root(&self, principal: &P) -> Result<Option<RootState>, KvProjectionError> {

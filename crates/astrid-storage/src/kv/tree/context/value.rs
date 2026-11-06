@@ -57,8 +57,8 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         })?;
         let file = built.descriptor().file();
         // The builder used this same context's engine identity and returns
-        // unchanged owned records. Reuse those IDs only for local staging;
-        // authoritative root admission still verifies the entire transaction.
+        // unchanged owned records. A captured session binds these exact IDs to
+        // the consuming engine; untrusted and foreign commits rehash them.
         for (object, record) in built.into_records() {
             self.stage_identified_record(object, record)?;
         }
@@ -137,7 +137,7 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
 
 impl<P: Ord, E: KvProjectionEngine<P>> ObjectIdentity for TreeContext<'_, P, E> {
     fn identify(&self, record: &ObjectRecord) -> ObjectId {
-        self.engine.identify_kv_object(record)
+        self.identify_record(record)
     }
 }
 
