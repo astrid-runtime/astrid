@@ -128,24 +128,17 @@ pub async fn with_legacy_kv_snapshot<T>(
     // Copying, fsync, and upstream format conversion perform blocking I/O.
     // Keep them off the async worker while retaining the source lock in the
     // returned owner through the operation and proven reader shutdown.
-    let (mut reader, store, source_lock) =
-        tokio::task::spawn_blocking(move || prepare_snapshot(&source))
-            .await
-            .map_err(snapshot_error)??;
-    let kind = if source_lock.is_some() {
-        LegacySourceKind::LockedDatabase
-    } else {
-        LegacySourceKind::EmptyDirectory
-    };
+    let (mut reader, store, kind) = tokio::task::spawn_blocking(move || prepare_snapshot(&source))
+        .await
+        .map_err(snapshot_error)??;
     let result = operation(store, kind).await;
     reader.close().await?;
-    drop(source_lock);
     Ok(result)
 }
 
 fn prepare_snapshot(
     source: &Path,
-) -> StorageResult<(SnapshotReader, Arc<SnapshotStore>, Option<std::fs::File>)> {
+) -> StorageResult<(SnapshotReader, Arc<SnapshotStore>, LegacySourceKind)> {
     let source = PrivateDirectory::open(source)?;
     let source_lock = lock_source(&source)?;
     let workspace = SnapshotWorkspace::create()?;
@@ -170,12 +163,20 @@ fn prepare_snapshot(
             return Err(error);
         },
     };
-    let store = Arc::new(SnapshotStore::new(SurrealKvStore::open(&path)?));
+    let kind = if source_lock.is_some() {
+        LegacySourceKind::LockedDatabase
+    } else {
+        LegacySourceKind::EmptyDirectory
+    };
+    let store = Arc::new(SnapshotStore::new(
+        SurrealKvStore::open(&path)?,
+        source_lock,
+    ));
     let reader = SnapshotReader {
         store: Some(Arc::clone(&store)),
         workspace: Some(workspace),
     };
-    Ok((reader, store, source_lock))
+    Ok((reader, store, kind))
 }
 
 fn lock_source(source: &PrivateDirectory) -> StorageResult<Option<std::fs::File>> {

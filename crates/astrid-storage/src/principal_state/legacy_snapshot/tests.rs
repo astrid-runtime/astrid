@@ -15,7 +15,7 @@ async fn reader() -> (SnapshotReader, Arc<SnapshotStore>, std::path::PathBuf) {
     let path = workspace.path().to_path_buf();
     let store = SurrealKvStore::open(path.join("database")).unwrap();
     store.set("test", "key", b"value".to_vec()).await.unwrap();
-    let store = Arc::new(SnapshotStore::new(store));
+    let store = Arc::new(SnapshotStore::new(store, None));
     let reader = SnapshotReader {
         store: Some(Arc::clone(&store)),
         workspace: Some(SnapshotWorkspace(Some(
