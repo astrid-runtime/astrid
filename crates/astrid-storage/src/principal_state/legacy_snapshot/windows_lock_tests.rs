@@ -129,3 +129,74 @@ fn native_parent_rename_preserves_the_shared_source_fence() {
         assert_eq!(std::fs::read(staged.join("LOCK")).unwrap(), b"fixture");
     }
 }
+
+fn native_link_count(file: &File) -> u32 {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the owned file handle and writable output buffer remain live.
+    #[allow(unsafe_code)]
+    assert_ne!(
+        unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &raw mut info) },
+        0,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    info.nNumberOfLinks
+}
+
+#[test]
+fn native_private_link_handoff_allows_write_through_retirement() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let staged = root.path().join("staged");
+    let outside = root.path().join("outside");
+    astrid_core::platform_fs::create_private_directory(&source).unwrap();
+    astrid_core::platform_fs::create_private_directory(&outside).unwrap();
+    std::fs::write(source.join("LOCK"), b"fixture").unwrap();
+    std::fs::write(source.join("data"), b"original data").unwrap();
+    let directory = PrivateDirectory::open(&source).unwrap();
+    let original = directory.open_file(Path::new("LOCK")).unwrap();
+    original.try_lock_shared().unwrap();
+    let identity = private_file_identity(&original).unwrap();
+    assert_eq!(native_link_count(&original), 1);
+    assert_path_writer_excluded(&source.join("LOCK"));
+    let alias = outside.join("LOCK");
+    std::fs::hard_link(source.join("LOCK"), &alias).unwrap();
+    let alias_directory = PrivateDirectory::open(&outside).unwrap();
+    let guard = alias_directory.open_file(Path::new("LOCK")).unwrap();
+    assert_eq!(private_file_identity(&guard).unwrap(), identity);
+    assert_eq!(native_link_count(&guard), 2);
+    guard.try_lock_shared().unwrap();
+    assert_path_writer_excluded(&source.join("LOCK"));
+    drop(original);
+    // A retained source directory capability deliberately pins its name on
+    // Windows. Only the same-file outside fence crosses this transition.
+    drop(directory);
+    assert_path_writer_excluded(&source.join("LOCK"));
+    let moved = astrid_core::platform_fs::rename_with_write_through(&source, &staged);
+    eprintln!("private same-file outside fence, write-through retirement: {moved:?}");
+    moved.unwrap();
+    assert!(!source.try_exists().unwrap());
+    assert_path_writer_excluded(&staged.join("LOCK"));
+    assert_eq!(std::fs::read(staged.join("LOCK")).unwrap(), b"fixture");
+    assert_eq!(
+        std::fs::read(staged.join("data")).unwrap(),
+        b"original data"
+    );
+    assert_eq!(private_file_identity(&guard).unwrap(), identity);
+    assert_eq!(native_link_count(&guard), 2);
+    drop(guard);
+    std::fs::remove_file(&alias).unwrap();
+    let writer = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(staged.join("LOCK"))
+        .unwrap();
+    assert_eq!(private_file_identity(&writer).unwrap(), identity);
+    assert_eq!(native_link_count(&writer), 1);
+    writer.try_lock().unwrap();
+    writer.unlock().unwrap();
+}

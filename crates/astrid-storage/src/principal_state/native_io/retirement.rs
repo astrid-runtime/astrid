@@ -1,4 +1,4 @@
-//! Captured directory authority for legacy cleanup, independent of its name.
+//! Cleanup of captured private snapshot workspaces, independent of their name.
 
 use super::{PrivateDirectory, PrivateDirectoryIdentity, connection};
 use crate::StorageResult;
@@ -49,61 +49,47 @@ impl CapturedDirectory {
         Ok(child)
     }
 
+    /// Remove the copied database beneath its exclusively owned private outer
+    /// workspace. This is not authority to retire an operator's source tree.
     pub(in crate::principal_state) fn remove(self) -> StorageResult<()> {
-        // Validate the entire tree before the first unlink, preserving the
-        // existing special-file and mount refusal. Then use the captured fd
-        // for every traversal: the ambient path never becomes delete authority.
         let directory = self.directory()?;
+        // The outer workspace contains only our database child. Refuse foreign
+        // entries before any deletion rather than adopting more cleanup scope.
+        if directory.entries()?.iter().any(|name| name != "database") {
+            return Err(connection(
+                "captured snapshot workspace contains an unexpected entry".to_owned(),
+            ));
+        }
+        // Validate the whole copy before unlinking. The retained private outer
+        // capability owns traversal; an ambient path never becomes authority.
         validate(&directory)?;
         self.directory()?;
         remove_contents(&directory, self.identity)?;
         directory.sync()?;
         drop(directory);
-        self.stage_empty()?.remove_empty()
+        self.verify_empty()?;
+        self.unlink_empty()
     }
 
-    fn stage_empty(self) -> StorageResult<Self> {
+    fn verify_empty(&self) -> StorageResult<()> {
         let directory = self.directory()?;
         if !directory.entries()?.is_empty() {
             return Err(connection(
-                "captured retirement directory is not empty".to_owned(),
+                "captured snapshot workspace is not empty".to_owned(),
             ));
         }
-        drop(directory);
-        // Remove only a fresh private name, never the caller-visible name that
-        // another owner can reuse after the verified directory moves away.
-        let name = OsString::from(format!(".astrid-retired-{}", uuid::Uuid::new_v4()));
-        let installed =
-            self.parent
-                .rename_child_to(Path::new(&self.name), &self.parent, Path::new(&name))?;
-        if installed.identity != self.identity {
-            return Err(connection(format!(
-                "retain replaced retirement directory at {}",
-                self.parent.path.join(&name).display()
-            )));
-        }
-        drop(installed);
-        let path = self.parent.path.join(&name);
-        self.parent.sync().map_err(|error| {
-            connection(format!(
-                "retain staged retirement {}: {error}",
-                path.display()
-            ))
-        })?;
-        Ok(Self {
-            parent: self.parent,
-            name,
-            identity: self.identity,
-            path,
-        })
+        Ok(())
     }
 
-    fn remove_empty(self) -> StorageResult<()> {
-        let confirmation = self.directory()?;
-        drop(confirmation);
-        // There is no portable identity-conditioned rmdir. The remaining
-        // empty-entry unlink targets our exclusive, unguessable staging name
-        // inside the retained parent; it never targets the original name.
+    fn unlink_empty(self) -> StorageResult<()> {
+        // Windows requires releasing the child directory handle before rmdir.
+        // The atomic empty-only operation cannot move or delete a nonempty
+        // replacement that appears after verify_empty. Never rename a late
+        // replacement into a new private name merely to discover its identity.
+        // No portable identity-conditioned rmdir exists: an empty replacement
+        // in this final window is indistinguishable. The original workspace
+        // name is exclusive and private; this is transient-copy cleanup, not
+        // a durable absence claim for operator data.
         self.parent.remove_directory(Path::new(&self.name))?;
         self.parent.sync()
     }
