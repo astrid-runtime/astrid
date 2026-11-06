@@ -1,7 +1,7 @@
 //! A parent rename may be refused while a descendant LOCK remains open.
 //! Either outcome must preserve the shared writer fence and original bytes.
 
-use super::super::native_io::PrivateDirectory;
+use super::super::native_io::{PrivateDirectory, private_file_identity};
 use std::fs::{File, TryLockError};
 use std::path::Path;
 
@@ -10,6 +10,80 @@ fn assert_writer_excluded(file: &File) {
         matches!(file.try_lock(), Err(TryLockError::WouldBlock)),
         "exclusive writer entered during the shared source fence"
     );
+}
+
+fn assert_path_writer_excluded(path: &Path) {
+    // A checkpoint handle must close before rename: an unrelated open handle
+    // through the source link would itself pin that directory on Windows.
+    let writer = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    assert_writer_excluded(&writer);
+}
+
+#[test]
+fn native_outside_lock_link_preserves_the_shared_source_fence() {
+    for outside_link in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let staged = root.path().join("staged");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let lock = source.join("LOCK");
+        let alias = outside.join("LOCK");
+        std::fs::write(&lock, b"fixture").unwrap();
+        let original = File::open(&lock).unwrap();
+        original.try_lock_shared().unwrap();
+        assert_path_writer_excluded(&lock);
+        let guard = if outside_link {
+            std::fs::hard_link(&lock, &alias).unwrap();
+            let guard = File::open(&alias).unwrap();
+            assert_eq!(
+                private_file_identity(&original).unwrap(),
+                private_file_identity(&guard).unwrap()
+            );
+            // Acquire the same-inode fence before closing the original link.
+            guard.try_lock_shared().unwrap();
+            assert_path_writer_excluded(&lock);
+            drop(original);
+            guard
+        } else {
+            original
+        };
+        assert_path_writer_excluded(&lock);
+        let while_locked = std::fs::rename(&source, &staged);
+        eprintln!(
+            "parent rename with short-lived writer checkpoints (outside_link={outside_link}): {while_locked:?}"
+        );
+        let remaining = if let Err(error) = &while_locked {
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(source.is_dir());
+            assert!(!staged.try_exists().unwrap());
+            &source
+        } else {
+            &staged
+        };
+        assert_path_writer_excluded(&remaining.join("LOCK"));
+        assert_eq!(std::fs::read(remaining.join("LOCK")).unwrap(), b"fixture");
+        drop(guard);
+        let writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(remaining.join("LOCK"))
+            .unwrap();
+        writer.try_lock().unwrap();
+        writer.unlock().unwrap();
+        drop(writer);
+        // Both rename outcomes are recorded by this experiment. Production
+        // retirement still requires success without releasing its writer fence.
+        if while_locked.is_err() {
+            std::fs::rename(&source, &staged).unwrap();
+        }
+        assert_eq!(std::fs::read(staged.join("LOCK")).unwrap(), b"fixture");
+    }
 }
 
 #[test]
