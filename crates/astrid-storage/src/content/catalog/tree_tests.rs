@@ -503,3 +503,43 @@ fn catalog_scale_probe() {
         );
     }
 }
+
+#[test]
+fn validate_catalog_rejects_file_logical_length_disagreement() {
+    let identity = TestIdentity;
+    let (honest, mut objects) = content_value(9, 16);
+    let dishonest = CatalogValue {
+        file: honest.file,
+        logical_bytes: honest.logical_bytes.checked_add(1).expect("fixture length"),
+    };
+    assert_ne!(honest.logical_bytes, dishonest.logical_bytes);
+
+    let mutation = insert(
+        None,
+        &ContentName::new("etc/agent-length-mismatch.conf").unwrap(),
+        dishonest,
+        &mut |object| {
+            objects
+                .get(&object)
+                .cloned()
+                .ok_or_else(|| invalid(object, "test object is missing"))
+        },
+        &|record| identity.identify(record),
+    )
+    .unwrap();
+    objects.extend(mutation.records);
+
+    let error = validate_catalog(mutation.root, &mut |object| {
+        objects
+            .get(&object)
+            .cloned()
+            .ok_or_else(|| invalid(object, "test object is missing"))
+    })
+    .expect_err("disagreeing catalog logical_bytes must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("content catalog and file logical lengths disagree"),
+        "{error}"
+    );
+}
