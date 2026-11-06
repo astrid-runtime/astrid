@@ -22,6 +22,10 @@ async fn boot_imports_old_format_audit_and_retires_only_the_verified_source() {
     let root = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(root.path().join("home"));
     home.ensure().unwrap();
+    // The component barrier creates this before writing its capsule-authority
+    // receipt and invoking audit migration. Storage never creates an arbitrary
+    // missing ancestor chain as part of moving a verified source.
+    astrid_core::platform_fs::ensure_private_directory(&home.migrations_dir()).unwrap();
     let source = home
         .principal_home(&astrid_core::PrincipalId::default())
         .audit_dir();
