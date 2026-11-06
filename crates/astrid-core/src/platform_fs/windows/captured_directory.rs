@@ -10,6 +10,7 @@ use super::path::{OwnedHandle, TrustedPathGuard, open_directory_identity_relativ
 use super::prelude::*;
 use crate::platform_fs::DirectoryIdentity;
 use std::os::windows::io::BorrowedHandle;
+use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 
 /// Windows directory opened with delete access and without delete sharing.
 ///
@@ -170,13 +171,20 @@ impl CapturedDirectory {
             false,
             0,
         ) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) if child_name_absent(&error) => Ok(()),
             Err(error) => Err(with_context(error, "captured directory removal not proven")),
             Ok(_) => Err(io::Error::other(
                 "captured directory name still exists after removal",
             )),
         }
     }
+}
+
+pub(super) fn child_name_absent(error: &io::Error) -> bool {
+    // A retained parent and one relative child need an actual missing name.
+    // Rust also classifies invalid drives/network paths as NotFound; those
+    // failures cannot prove that the captured entry has been removed.
+    error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND.cast_signed())
 }
 
 fn duplicate_directory_handle(handle: HANDLE) -> io::Result<File> {

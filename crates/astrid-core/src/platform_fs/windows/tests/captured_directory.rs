@@ -1,6 +1,6 @@
 //! Public captured-directory owner API.
 
-use super::super::captured_directory::query_directory_identity;
+use super::super::captured_directory::{child_name_absent, query_directory_identity};
 use super::*;
 use crate::platform_fs::{CapturedDirectory, DirectoryIdentity};
 
@@ -170,4 +170,17 @@ fn captured_directory_remove_does_not_report_success_with_a_live_duplicate() {
     );
     drop(duplicate);
     assert!(!directory.exists());
+}
+
+#[test]
+fn removal_confirmation_rejects_non_name_not_found_errors() {
+    assert!(child_name_absent(&io::Error::from_raw_os_error(2)));
+    // Path/drive/network disappearance and a delete-pending object do not
+    // establish the absence of this one child in the retained parent.
+    for code in [3, 5, 15, 53, 67, 303] {
+        assert!(!child_name_absent(&io::Error::from_raw_os_error(code)));
+    }
+    assert!(!child_name_absent(&io::Error::from(
+        io::ErrorKind::NotFound
+    )));
 }
