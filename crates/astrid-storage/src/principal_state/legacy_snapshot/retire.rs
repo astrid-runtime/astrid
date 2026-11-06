@@ -1,8 +1,8 @@
 //! Identity-conditioned original-source retirement and crash resume.
 
-use super::super::native_io::{
-    PrivateDirectory, remove_retirement_contents, validate_retirement_tree,
-};
+#[cfg(not(windows))]
+use super::super::native_io::validate_retirement_tree;
+use super::super::native_io::{PrivateDirectory, remove_retirement_contents};
 use super::intent::{LegacyCapturedIdentity, LegacyRetirementIntent};
 use super::owner::{CapturedSource, LegacySource};
 use super::snapshot_error;
@@ -325,7 +325,9 @@ fn empty_staged_unix(
             path.display()
         )));
     }
-    empty_capability(installed)?;
+    validate_retirement_tree(&installed)?;
+    remove_retirement_contents(&installed)?;
+    drop(installed);
     let confirmation = parent.open_child(Path::new(name))?;
     if &unix_directory_identity(&confirmation) != identity || !confirmation.entries()?.is_empty() {
         return Err(snapshot_error(
@@ -446,13 +448,6 @@ fn acquire_stage_lock(
     #[cfg(windows)]
     let lock = super::source_lock::handoff(lock).map_err(snapshot_error)?;
     Ok(Some(lock))
-}
-
-fn empty_capability(directory: PrivateDirectory) -> StorageResult<()> {
-    validate_retirement_tree(&directory)?;
-    remove_retirement_contents(&directory)?;
-    drop(directory);
-    Ok(())
 }
 
 fn directory_present(path: &Path) -> StorageResult<bool> {
