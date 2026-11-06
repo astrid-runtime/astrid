@@ -11,6 +11,7 @@ struct InterruptedIntentStore {
     // 1 rejects Authorized publication; 2 publishes Authorized then loses ack.
     // 3 publishes Staged then loses ack (MOVE done, delete not started).
     // 4 rejects Completed publication (delete already finished).
+    // 5 rejects Staged publication (MOVE done, delete cannot have started).
     interruption: AtomicU8,
 }
 
@@ -64,7 +65,7 @@ impl KvStore for InterruptedIntentStore {
         let wanted = self.interruption.load(Ordering::SeqCst);
         let matches = match wanted {
             1 | 2 => phase == RetirementCasPhase::Authorized,
-            3 => phase == RetirementCasPhase::Staged,
+            3 | 5 => phase == RetirementCasPhase::Staged,
             4 => phase == RetirementCasPhase::Completed,
             _ => false,
         };
@@ -73,7 +74,7 @@ impl KvStore for InterruptedIntentStore {
         } else {
             0
         };
-        if interruption == 1 || interruption == 4 {
+        if matches!(interruption, 1 | 4 | 5) {
             return Err(StorageError::Internal(
                 "injected before retirement intent".to_owned(),
             ));
@@ -587,4 +588,67 @@ async fn public_import_of_absent_source_with_authorized_receipt_still_requires_p
             .to_string()
             .contains("does not match the stored migration receipt")
     );
+}
+
+#[tokio::test]
+async fn authorized_missing_original_and_stage_cannot_claim_completion() {
+    let directory = super::super::legacy_test_directory::temporary().unwrap();
+    let source = directory.path().join("source");
+    let retained = directory.path().join("retained-original");
+    let stage = directory.path().join("stage");
+    published_legacy_source(&source);
+    let before = source_files(&source);
+    let store = Arc::new(InterruptedIntentStore::default());
+    let key = Arc::new(KeyPair::generate());
+    let audit = destination(&store, &key);
+    audit
+        .import_legacy_audit(&source, "missing-stage")
+        .await
+        .unwrap();
+    store.interruption.store(2, Ordering::SeqCst);
+    audit
+        .retire_legacy_audit(&source, &stage, "missing-stage")
+        .await
+        .unwrap_err();
+    let authorized = marker_bytes(&audit).await;
+    assert_eq!(retirement_phase(&authorized), "authorized");
+    std::fs::rename(&source, &retained).unwrap();
+    audit
+        .retire_legacy_audit(&source, &stage, "missing-stage")
+        .await
+        .unwrap_err();
+    assert_eq!(marker_bytes(&audit).await, authorized);
+    assert!(!stage.exists());
+    assert_eq!(source_files(&retained), before);
+}
+
+#[tokio::test]
+async fn move_before_staged_publication_resumes_the_captured_intact_stage() {
+    let directory = super::super::legacy_test_directory::temporary().unwrap();
+    let source = directory.path().join("source");
+    let stage = directory.path().join("stage");
+    published_legacy_source(&source);
+    let store = Arc::new(InterruptedIntentStore::default());
+    let key = Arc::new(KeyPair::generate());
+    let audit = destination(&store, &key);
+    audit
+        .import_legacy_audit(&source, "move-before-staged")
+        .await
+        .unwrap();
+    store.interruption.store(5, Ordering::SeqCst);
+    let error = audit
+        .retire_legacy_audit(&source, &stage, "move-before-staged")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("injected"));
+    assert_eq!(store.interruption.load(Ordering::SeqCst), 0);
+    assert!(!source.exists());
+    assert_eq!(retirement_phase(&marker_bytes(&audit).await), "authorized");
+    assert_eq!(std::fs::read_dir(&stage).unwrap().count(), 1);
+    audit
+        .retire_legacy_audit(&source, &stage, "move-before-staged")
+        .await
+        .unwrap();
+    assert_eq!(retirement_phase(&marker_bytes(&audit).await), "completed");
+    assert!(std::fs::read_dir(&stage).unwrap().next().is_none());
 }

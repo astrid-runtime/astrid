@@ -117,10 +117,35 @@ pub(super) fn stage_blocking(
     })
 }
 
+/// Capture a moved database stage that is still complete, before durable Staged.
+///
+/// The generation directory must exist, match the captured root, and still hold
+/// the captured LOCK under a shared fence. Dropping the returned owner does not
+/// delete. Callers persist Staged, then `retire`.
+///
+/// # Errors
+/// Returns an error for an empty intent, absent or replaced stage, missing or
+/// replaced LOCK, or a lock that cannot be held. An absent stage is not success.
+pub async fn capture_authorized_legacy_retirement_stage(
+    staging_root: &Path,
+    intent: &LegacyRetirementIntent,
+) -> StorageResult<LegacyRetirementStage> {
+    let name = intent
+        .stage_name()
+        .ok_or_else(|| snapshot_error("empty source has no database retirement stage"))?;
+    let path = staging_root.join(name);
+    let intent = intent.clone();
+    tokio::task::spawn_blocking(move || capture_authorized_blocking(&path, &intent))
+        .await
+        .map_err(snapshot_error)?
+}
+
 /// Finish only the receipt's staged database, regardless of the original name.
 ///
 /// Callers must prove that the staged transition is durable before using this
 /// entry point. An original-name occupant never becomes deletion authority.
+/// An absent whole stage, or a partial stage whose LOCK is already gone, is
+/// success for this Staged-only resume.
 ///
 /// # Errors
 /// Returns an error for an empty intent, replaced stage/LOCK, or failed removal.
@@ -308,19 +333,47 @@ fn empty_staged_unix(
     parent.sync()
 }
 
+fn capture_authorized_blocking(
+    stage_path: &Path,
+    intent: &LegacyRetirementIntent,
+) -> StorageResult<LegacyRetirementStage> {
+    if !directory_present(stage_path)? {
+        return Err(snapshot_error(
+            "legacy retirement stage is absent; Authorized resume cannot publish Staged",
+        ));
+    }
+    let stage = capture_present_stage(stage_path, intent)?;
+    if stage.fence.is_none() {
+        return Err(snapshot_error(
+            "legacy retirement stage LOCK is missing; deletion cannot have begun before Staged",
+        ));
+    }
+    Ok(stage)
+}
+
 fn resume_stage(stage_path: &Path, intent: &LegacyRetirementIntent) -> StorageResult<()> {
+    capture_present_stage(stage_path, intent)?.finish_blocking()
+}
+
+fn capture_present_stage(
+    stage_path: &Path,
+    intent: &LegacyRetirementIntent,
+) -> StorageResult<LegacyRetirementStage> {
     #[cfg(windows)]
     {
-        resume_stage_windows(stage_path, intent)
+        capture_present_stage_windows(stage_path, intent)
     }
     #[cfg(not(windows))]
     {
-        resume_stage_unix(stage_path, intent)
+        capture_present_stage_unix(stage_path, intent)
     }
 }
 
 #[cfg(windows)]
-fn resume_stage_windows(stage_path: &Path, intent: &LegacyRetirementIntent) -> StorageResult<()> {
+fn capture_present_stage_windows(
+    stage_path: &Path,
+    intent: &LegacyRetirementIntent,
+) -> StorageResult<LegacyRetirementStage> {
     let directory =
         astrid_core::platform_fs::CapturedDirectory::open(stage_path).map_err(snapshot_error)?;
     let actual = LegacyCapturedIdentity::from_windows_directory(directory.identity());
@@ -334,31 +387,38 @@ fn resume_stage_windows(stage_path: &Path, intent: &LegacyRetirementIntent) -> S
         .map_err(snapshot_error)?;
     let capability = PrivateDirectory::from_std_directory_file(clone, stage_path.to_path_buf())?;
     let lock = acquire_stage_lock(&capability, intent)?;
-    empty_capability(capability)?;
-    let result = directory.remove_empty().map_err(snapshot_error);
-    drop(lock);
-    result
+    drop(capability);
+    Ok(LegacyRetirementStage {
+        captured: CapturedSource::Handle { directory },
+        fence: lock.map(Arc::new),
+        path: stage_path.to_path_buf(),
+    })
 }
 
 #[cfg(not(windows))]
-fn resume_stage_unix(stage_path: &Path, intent: &LegacyRetirementIntent) -> StorageResult<()> {
-    let staging_parent = staging_parent(stage_path)?;
-    let stage_name = stage_file_name(stage_path)?;
-    let installed = staging_parent.open_child(Path::new(&stage_name))?;
+fn capture_present_stage_unix(
+    stage_path: &Path,
+    intent: &LegacyRetirementIntent,
+) -> StorageResult<LegacyRetirementStage> {
+    let parent = staging_parent(stage_path)?;
+    let name = stage_file_name(stage_path)?;
+    let installed = parent.open_child(Path::new(&name))?;
     if &unix_directory_identity(&installed) != intent.captured_root() {
         return Err(snapshot_error(
             "legacy retirement stage identity does not match captured source",
         ));
     }
     let lock = acquire_stage_lock(&installed, intent)?;
-    let _lock = lock;
     drop(installed);
-    empty_staged_unix(
-        &staging_parent,
-        &stage_name,
-        intent.captured_root(),
-        stage_path,
-    )
+    Ok(LegacyRetirementStage {
+        captured: CapturedSource::ParentRelative {
+            parent,
+            name,
+            identity: intent.captured_root().clone(),
+            path: stage_path.to_path_buf(),
+        },
+        fence: lock.map(Arc::new),
+    })
 }
 
 fn acquire_stage_lock(

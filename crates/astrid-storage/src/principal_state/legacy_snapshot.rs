@@ -17,7 +17,8 @@ mod source_lock;
 pub use intent::LegacyRetirementIntent;
 pub use owner::LegacySource;
 pub use retire::{
-    LegacyRetirementStage, resume_legacy_retirement, resume_staged_legacy_retirement,
+    LegacyRetirementStage, capture_authorized_legacy_retirement_stage, resume_legacy_retirement,
+    resume_staged_legacy_retirement,
 };
 
 /// Original-source protection retained during a snapshot operation.

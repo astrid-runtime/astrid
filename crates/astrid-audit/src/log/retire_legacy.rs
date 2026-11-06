@@ -90,9 +90,15 @@ impl AuditLog {
             Some(LegacyRetirementRecord::Authorized(intent))
                 if intent.kind() == LegacySourceKind::LockedDatabase =>
             {
-                // The original name is gone, so MOVE may already have happened
-                // before Staged was durable. Publish Staged first so a later
-                // occupant of that name cannot be adopted as the stage.
+                // Deletion cannot start while only Authorized is durable.
+                // Capture the intact stage first: combined original/stage
+                // absence is not evidence that our MOVE ever happened.
+                let stage = astrid_storage::capture_authorized_legacy_retirement_stage(
+                    staging_root,
+                    &intent,
+                )
+                .await
+                .map_err(|error| storage_error(&error))?;
                 let staged_receipt = with_phase(
                     receipt,
                     LegacyRetirementRecord::Staged(StagedRetirement {
@@ -100,9 +106,10 @@ impl AuditLog {
                     }),
                 );
                 let staged_marker = self.persist_phase(&marker, &staged_receipt).await?;
-                astrid_storage::resume_staged_legacy_retirement(staging_root, &intent)
+                stage
+                    .retire()
                     .await
-                    .map_err(storage_error)?;
+                    .map_err(|error| storage_error(&error))?;
                 self.complete_phase(&staged_marker, staged_receipt, intent)
                     .await
             },
@@ -178,7 +185,7 @@ impl AuditLog {
                         source
                             .retire(&intent, staging_root)
                             .await
-                            .map_err(storage_error)?;
+                            .map_err(|error| storage_error(&error))?;
                         self.complete_phase(&authorized_marker, authorized, intent)
                             .await
                     },
@@ -209,7 +216,7 @@ impl AuditLog {
         let stage = source
             .stage_retirement(&intent, staging_root)
             .await
-            .map_err(storage_error)?;
+            .map_err(|error| storage_error(&error))?;
         let staged_receipt = with_phase(
             current_receipt,
             LegacyRetirementRecord::Staged(StagedRetirement {
@@ -217,7 +224,10 @@ impl AuditLog {
             }),
         );
         let staged_marker = self.persist_phase(current_marker, &staged_receipt).await?;
-        stage.retire().await.map_err(storage_error)?;
+        stage
+            .retire()
+            .await
+            .map_err(|error| storage_error(&error))?;
         self.complete_phase(&staged_marker, staged_receipt, intent)
             .await
     }
@@ -233,7 +243,7 @@ impl AuditLog {
         let current = self.persist_phase(marker, &receipt).await?;
         astrid_storage::resume_staged_legacy_retirement(staging_root, &intent)
             .await
-            .map_err(storage_error)?;
+            .map_err(|error| storage_error(&error))?;
         self.complete_phase(&current, receipt, intent).await
     }
 
@@ -282,6 +292,6 @@ fn with_phase(
     receipt
 }
 
-fn storage_error(error: astrid_storage::StorageError) -> AuditError {
+fn storage_error(error: &astrid_storage::StorageError) -> AuditError {
     AuditError::StorageError(error.to_string())
 }

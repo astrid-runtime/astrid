@@ -192,10 +192,10 @@ fn captured_directory_traversal_duplicate_cannot_rename_its_owner() {
     let directory = root.path().join("source");
     let moved = root.path().join("moved-through-duplicate");
     crate::platform_fs::create_private_directory(&directory).unwrap();
-    let captured = CapturedDirectory::open(&directory).unwrap();
-    let duplicate = captured.try_clone_directory_file().unwrap();
     let child = directory.join("child");
     crate::platform_fs::create_private_directory(&child).unwrap();
+    let captured = CapturedDirectory::open(&directory).unwrap();
+    let duplicate = captured.try_clone_directory_file().unwrap();
     let (opened, _) = super::super::path::open_directory_identity_relative_with_access(
         duplicate.as_raw_handle().cast(),
         OsStr::new("child"),

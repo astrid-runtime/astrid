@@ -61,7 +61,8 @@ mod migrations;
 #[cfg(feature = "legacy-surrealkv")]
 pub use legacy_snapshot::{
     LegacyRetirementIntent, LegacyRetirementStage, LegacySource, LegacySourceKind,
-    resume_legacy_retirement, resume_staged_legacy_retirement, with_legacy_kv_snapshot,
+    capture_authorized_legacy_retirement_stage, resume_legacy_retirement,
+    resume_staged_legacy_retirement, with_legacy_kv_snapshot,
 };
 mod native_io;
 #[cfg(test)]

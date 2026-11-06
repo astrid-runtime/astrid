@@ -246,3 +246,70 @@ async fn missing_staging_ancestor_is_refused_before_source_move() {
     let source = capture(&path).await;
     drop(source);
 }
+
+#[tokio::test]
+async fn authorized_stage_capture_refuses_an_absent_stage() {
+    let root = test_directory::temporary().unwrap();
+    let path = root.path().join("source");
+    let staging = root.path().join("staging");
+    seeded_source(&path).await;
+    let source = capture(&path).await;
+    let intent = source.retirement_intent();
+    drop(source);
+    assert!(
+        capture_authorized_legacy_retirement_stage(&staging, &intent)
+            .await
+            .is_err()
+    );
+    assert!(path.join("LOCK").exists());
+    assert!(!staging.exists());
+}
+
+#[tokio::test]
+async fn authorized_stage_capture_holds_the_writer_fence_on_a_moved_stage() {
+    let root = test_directory::temporary().unwrap();
+    let path = root.path().join("source");
+    let staging = root.path().join("staging");
+    seeded_source(&path).await;
+    let source = capture(&path).await;
+    let intent = source.retirement_intent();
+    let stage = stage_captured(source, &staging, &intent).await;
+    let owner = capture_authorized_legacy_retirement_stage(&staging, &intent)
+        .await
+        .unwrap();
+    let writer = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(stage.join("LOCK"))
+        .unwrap();
+    assert!(matches!(
+        writer.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    drop(writer);
+    owner.retire().await.unwrap();
+    assert!(!stage.exists());
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn authorized_stage_capture_refuses_a_missing_lock_while_staged_resume_cleans_up() {
+    let root = test_directory::temporary().unwrap();
+    let path = root.path().join("source");
+    let staging = root.path().join("staging");
+    seeded_source(&path).await;
+    let source = capture(&path).await;
+    let intent = source.retirement_intent();
+    let stage = stage_captured(source, &staging, &intent).await;
+    std::fs::remove_file(stage.join("LOCK")).unwrap();
+    assert!(
+        capture_authorized_legacy_retirement_stage(&staging, &intent)
+            .await
+            .is_err()
+    );
+    assert!(stage.is_dir());
+    resume_staged_legacy_retirement(&staging, &intent)
+        .await
+        .unwrap();
+    assert!(!stage.exists());
+}
