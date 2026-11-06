@@ -11,6 +11,9 @@ use super::{
     RootState, StorageNodeId,
 };
 
+#[cfg(test)]
+mod commit_tests;
+
 /// In-memory reference world for principal-store operations.
 ///
 /// `P` is the integration layer's principal identifier. The model requires
@@ -250,23 +253,69 @@ impl<P: Ord> World<P> {
         Ok(inserted)
     }
 
-    /// Admit an owned transaction without copying its newly published payloads.
-    pub(crate) fn import_closure_owned(
+    /// Validate and publish an owned root transaction under one exclusive borrow.
+    ///
+    /// The validated closure cannot change between admission and publication.
+    /// Every fallible check precedes both object and root mutation, so no second
+    /// closure walk is needed to publish the root.
+    pub(crate) fn commit_closure_owned(
         &mut self,
+        principal: P,
+        expected: Option<RootState>,
+        commit: ObjectId,
         records: Vec<(ObjectId, ObjectRecord)>,
-        root: ObjectId,
-    ) -> Result<u64, ModelError> {
-        let mut staged = self.classify_import(&records, root)?;
+    ) -> Result<(RootState, u64), ModelError> {
+        let actual = self.root(&principal);
+        if actual != expected {
+            return Err(ModelError::RootConflict { expected, actual });
+        }
+        let generation = match actual {
+            Some(root) => root
+                .generation
+                .checked_next()
+                .ok_or(ModelError::ArithmeticOverflow)?,
+            None => RootGeneration::INITIAL,
+        };
+        self.validate_transaction_root(&records, commit)?;
+        let mut staged = self.classify_import(&records, commit)?;
         let inserted = u64::try_from(staged.len()).map_err(|_| ModelError::ArithmeticOverflow)?;
-        // All fallible admission checks precede publication. Consume each new
-        // identity once; equal resident or in-batch declarations need no copy.
+        // Consume each new identity once; equal resident or in-batch
+        // declarations need no copy. All admission checks have succeeded.
         self.objects.extend(
             records
                 .into_iter()
                 .filter(|(id, _)| staged.remove(id).is_some())
                 .map(|(id, record)| (id, Arc::new(record))),
         );
-        Ok(inserted)
+        let root = RootState { generation, commit };
+        self.roots.insert(principal, root);
+        Ok((root, inserted))
+    }
+
+    fn validate_transaction_root(
+        &self,
+        records: &[(ObjectId, ObjectRecord)],
+        root: ObjectId,
+    ) -> Result<(), ModelError> {
+        let mut incoming_root = None;
+        for (id, record) in records.iter().filter(|(id, _)| *id == root) {
+            debug_assert_eq!(*id, root);
+            if incoming_root.is_some_and(|existing| existing != record) {
+                return Err(ModelError::ObjectCollision(root));
+            }
+            incoming_root = Some(record);
+        }
+
+        let record = incoming_root
+            .or_else(|| self.object(root))
+            .ok_or(ModelError::MissingObject(root))?;
+        if record.kind() != ObjectKind::Commit {
+            return Err(ModelError::RootNotCommit {
+                object: root,
+                actual: record.kind(),
+            });
+        }
+        Ok(())
     }
 
     fn classify_import(
@@ -546,6 +595,8 @@ fn closure_with<'a>(
     root: ObjectId,
     object: impl Fn(ObjectId) -> Option<&'a ObjectRecord>,
 ) -> Result<BTreeSet<ObjectId>, ModelError> {
+    #[cfg(test)]
+    commit_tests::record_closure_walk();
     let mut result = BTreeSet::new();
     let mut marks = BTreeMap::<ObjectId, u8>::new();
     let mut stack = vec![(root, false)];

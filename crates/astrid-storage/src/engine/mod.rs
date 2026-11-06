@@ -19,7 +19,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use crate::storage_model::{
-    GcReport, InsertOutcome, ModelError, ObjectId, ObjectIdentity, ObjectKind, ObjectRecord, PinId,
+    GcReport, InsertOutcome, ModelError, ObjectId, ObjectIdentity, ObjectRecord, PinId,
     PrincipalUsage, RootState, World,
 };
 use parking_lot::RwLock;
@@ -415,17 +415,8 @@ impl<P: Ord, I: ObjectIdentity> InMemoryEngine<P, I> {
             self.verify_identities(&records)?;
         }
         let mut world = self.world.write();
-        let actual = world.root(&principal);
-        if actual != expected {
-            return Err(ModelError::RootConflict { expected, actual });
-        }
-        if actual.is_some_and(|root| root.generation.checked_next().is_none()) {
-            return Err(ModelError::ArithmeticOverflow);
-        }
-        Self::validate_transaction_root(&world, &records, commit)?;
-
-        let objects_inserted = world.import_closure_owned(records, commit)?;
-        let root = world.compare_and_swap_root(principal, expected, commit)?;
+        let (root, objects_inserted) =
+            world.commit_closure_owned(principal, expected, commit, records)?;
         let retired_projection = if same_engine {
             kv_checkpoint_publication.and_then(|publication| publication.try_publish(root))
         } else {
@@ -464,32 +455,6 @@ impl<P: Ord, I: ObjectIdentity> InMemoryEngine<P, I> {
                     computed,
                 });
             }
-        }
-        Ok(())
-    }
-
-    fn validate_transaction_root(
-        world: &World<P>,
-        records: &[(ObjectId, ObjectRecord)],
-        root: ObjectId,
-    ) -> Result<(), ModelError> {
-        let mut incoming_root = None;
-        for (id, record) in records.iter().filter(|(id, _)| *id == root) {
-            debug_assert_eq!(*id, root);
-            if incoming_root.is_some_and(|existing| existing != record) {
-                return Err(ModelError::ObjectCollision(root));
-            }
-            incoming_root = Some(record);
-        }
-
-        let record = incoming_root
-            .or_else(|| world.object(root))
-            .ok_or(ModelError::MissingObject(root))?;
-        if record.kind() != ObjectKind::Commit {
-            return Err(ModelError::RootNotCommit {
-                object: root,
-                actual: record.kind(),
-            });
         }
         Ok(())
     }
