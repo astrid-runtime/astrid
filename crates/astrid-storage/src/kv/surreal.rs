@@ -55,7 +55,7 @@ impl std::fmt::Debug for SurrealKvStore {
 impl SurrealKvStore {
     /// Open a persistent KV store at the given directory path.
     ///
-    /// Creates the directory if it does not exist. SurrealKV upgrades existing
+    /// Creates the directory if it does not exist. `SurrealKV` upgrades existing
     /// 0.20/0.21 databases to its current format in place. Callers that must
     /// preserve their source must open a private copy; Astrid's principal-store
     /// migrator does this before opening the legacy database.
