@@ -98,6 +98,8 @@ struct MeasuringEngine {
     inner: InMemoryEngine<String, TestIdentity>,
     identified_chunk_bytes: AtomicU64,
     loaded_chunk_bytes: AtomicU64,
+    owned_header_reads: AtomicU64,
+    shared_header_reads: AtomicU64,
 }
 
 impl MeasuringEngine {
@@ -106,6 +108,8 @@ impl MeasuringEngine {
             inner: InMemoryEngine::new(TestIdentity),
             identified_chunk_bytes: AtomicU64::new(0),
             loaded_chunk_bytes: AtomicU64::new(0),
+            owned_header_reads: AtomicU64::new(0),
+            shared_header_reads: AtomicU64::new(0),
         }
     }
 }
@@ -125,6 +129,14 @@ impl KvProjectionEngine<String> for MeasuringEngine {
 
     fn load_kv_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, KvProjectionError> {
         let record = self.inner.object(id);
+        if record.as_ref().is_some_and(|record| {
+            matches!(
+                record.kind(),
+                ObjectKind::Commit | ObjectKind::PrincipalState
+            )
+        }) {
+            self.owned_header_reads.fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(record) = &record
             && record.kind() == ObjectKind::Chunk
         {
@@ -140,6 +152,14 @@ impl KvProjectionEngine<String> for MeasuringEngine {
         id: ObjectId,
     ) -> Result<Option<Arc<ObjectRecord>>, KvProjectionError> {
         let record = self.inner.load_shared_kv_object_for(principal, id)?;
+        if record.as_ref().is_some_and(|record| {
+            matches!(
+                record.kind(),
+                ObjectKind::Commit | ObjectKind::PrincipalState
+            )
+        }) {
+            self.shared_header_reads.fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(record) = &record
             && record.kind() == ObjectKind::Chunk
         {
@@ -970,3 +990,6 @@ use admission_test_support::{AdmissionCensus, drain_checkpoint_tasks, settled_ad
 #[cfg(not(target_family = "wasm"))]
 #[path = "tree/stale_publication_tests.rs"]
 mod stale_publication_tests;
+
+#[path = "tree/header_read_tests.rs"]
+mod header_read_tests;

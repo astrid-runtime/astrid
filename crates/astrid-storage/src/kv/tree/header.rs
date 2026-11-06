@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use crate::engine::{KvProjectionEngine, PrincipalProjectionError};
 use crate::storage_model::{
@@ -486,12 +487,12 @@ fn load_typed<P, E>(
     owner: &P,
     id: ObjectId,
     kind: ObjectKind,
-) -> StorageResult<ObjectRecord>
+) -> StorageResult<Arc<ObjectRecord>>
 where
     E: KvProjectionEngine<P>,
 {
     let record = engine
-        .load_kv_object_for(owner, id)
+        .load_shared_kv_object_for(owner, id)
         .map_err(|error| map_engine(&error))?
         .ok_or_else(|| map_engine(&ModelError::MissingObject(id).into()))?;
     if record.kind() != kind || record.format_version() != FORMAT_VERSION {
