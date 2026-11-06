@@ -8,8 +8,14 @@ use super::{
     ensure_payload_limit, io_error, live_files_mut, materialize_closure, read_indexed_object,
     read_indexed_objects, usage_from_closure, validate_incremental_closure,
 };
-use crate::engine::{ProjectionObserver, ProjectionPhase};
+use crate::engine::{IdentityProof, KvIdentitySession, ProjectionObserver, ProjectionPhase};
 use crate::storage_model::ObjectIdentity;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StandaloneRole {
+    Represented,
+    Bootstrap,
+}
 
 impl<P, I, C> DurableEngine<P, I, C>
 where
@@ -39,6 +45,13 @@ where
     #[must_use]
     pub fn identify(&self, record: &ObjectRecord) -> ObjectId {
         self.identity.identify(record)
+    }
+
+    pub(crate) fn captured_identity_session(&self) -> KvIdentitySession<'_>
+    where
+        I: Send + Sync,
+    {
+        KvIdentitySession::bind(&self.identity, &self.preparation_authority)
     }
 
     /// Return one immutable object through the principal-accounted decoded
@@ -88,7 +101,7 @@ where
                 let pending = inner
                     .pending_wal
                     .get_object(&id)
-                    .map(|object| Arc::new(object.record().clone()));
+                    .map(|object| object.record().clone());
                 (
                     pending,
                     inner.index.get(&id).copied(),
@@ -100,7 +113,7 @@ where
                     principal,
                     id,
                     generation,
-                    record.as_ref().clone(),
+                    record,
                     &mut recovery,
                 )? {
                     return Ok(Some(record));
@@ -188,13 +201,21 @@ where
         }
 
         loop {
-            let (locations, generation) = {
+            let (pending, locations, generation) = {
                 let inner = self.lock_usable_with(&mut recovery)?;
+                let mut pending = Vec::new();
                 let locations = missing
                     .keys()
-                    .filter_map(|id| inner.index.get(id).copied().map(|location| (*id, location)))
+                    .filter_map(|id| {
+                        if let Some(object) = inner.pending_wal.get_object(id) {
+                            pending.push((*id, object.record().clone()));
+                            None
+                        } else {
+                            inner.index.get(id).copied().map(|location| (*id, location))
+                        }
+                    })
                     .collect::<Vec<_>>();
-                (locations, inner.arena_generation)
+                (pending, locations, inner.arena_generation)
             };
             let reader_guard = self.arena_reader.read();
             let Some(reader) = reader_guard.as_ref() else {
@@ -203,8 +224,9 @@ where
             if reader.generation != generation {
                 continue;
             }
-            let loaded =
+            let mut loaded =
                 read_indexed_objects(&reader.file, &locations, &self.identity, self.limits)?;
+            loaded.extend(pending);
             drop(reader_guard);
             let inner = self.lock_usable_with(&mut recovery)?;
             if inner.arena_generation != generation {
@@ -248,7 +270,9 @@ where
         recovery: &mut RecoveryScope,
     ) -> Result<Option<Arc<ObjectRecord>>, DurableError> {
         let inner = self.lock_usable_with(recovery)?;
-        if inner.arena_generation != generation || !inner.index.contains_key(&id) {
+        if inner.arena_generation != generation
+            || (!inner.index.contains_key(&id) && inner.pending_wal.get_object(&id).is_none())
+        {
             return Ok(None);
         }
         Ok(Some(self.object_cache.insert(principal, id, record)))
@@ -372,15 +396,44 @@ where
         &self,
         record: &ObjectRecord,
     ) -> Result<(ObjectId, InsertOutcome), DurableError> {
+        self.persist_standalone(record, StandaloneRole::Represented)
+    }
+
+    /// Persist terminal format evidence through the independent bootstrap path.
+    ///
+    /// The format-amendment caller must first authorize the predecessor. This
+    /// retains the ordinary collision, flush and volume-fence guarantees while
+    /// keeping bootstrap evidence outside the relocatable direct catalogue.
+    pub(crate) fn persist_bootstrap_object(
+        &self,
+        record: &ObjectRecord,
+    ) -> Result<(ObjectId, InsertOutcome), DurableError> {
+        if record.kind() != crate::storage_model::ObjectKind::Evidence
+            || record.class() != crate::storage_model::ObjectClass::Metadata
+            || record.logical_bytes() != 0
+            || !record.references().is_empty()
+        {
+            return Err(DurableError::InvalidRepresentationState(
+                "bootstrap specification must be terminal metadata evidence",
+            ));
+        }
+        self.persist_standalone(record, StandaloneRole::Bootstrap)
+    }
+
+    fn persist_standalone(
+        &self,
+        record: &ObjectRecord,
+        role: StandaloneRole,
+    ) -> Result<(ObjectId, InsertOutcome), DurableError> {
         if record.owning_references().next().is_some() {
             return Err(DurableError::BootstrapObjectOwnsState);
         }
         let id = self.identify(record);
         let mut inner = self.lock_usable()?;
         if let Some(location) = inner.index.get(&id).copied() {
-            return self.persist_existing_standalone(&mut inner, id, location, record);
+            return self.persist_existing_standalone(&mut inner, id, location, record, role);
         }
-        self.persist_new_standalone(&mut inner, id, record)
+        self.persist_new_standalone(&mut inner, id, record, role)
     }
 
     fn persist_existing_standalone(
@@ -389,6 +442,7 @@ where
         id: ObjectId,
         location: super::ArenaLocation,
         record: &ObjectRecord,
+        role: StandaloneRole,
     ) -> Result<(ObjectId, InsertOutcome), DurableError> {
         let (existing, needs_flush) = {
             let files = live_files_mut(&mut inner.files)?;
@@ -400,7 +454,8 @@ where
             return Err(ModelError::ObjectCollision(id).into());
         }
         let payload = encode_object_frame(self.identity.scheme(), id, &existing)?;
-        let appended = if let Some(representations) = &inner.representations
+        let appended = if role == StandaloneRole::Represented
+            && let Some(representations) = &inner.representations
             && !representations.contains_direct(id)
         {
             vec![representations.describe_direct(
@@ -443,6 +498,7 @@ where
         inner: &mut DurableInner<P>,
         id: ObjectId,
         record: &ObjectRecord,
+        role: StandaloneRole,
     ) -> Result<(ObjectId, InsertOutcome), DurableError> {
         let payload = encode_object_frame(self.identity.scheme(), id, record)?;
         ensure_payload_limit(ARENA_FILE, 0, payload.len(), self.limits)?;
@@ -457,7 +513,9 @@ where
                 return Err(error);
             },
         };
-        let appended = if let Some(representations) = &inner.representations {
+        let appended = if role == StandaloneRole::Represented
+            && let Some(representations) = &inner.representations
+        {
             vec![representations.describe_direct(
                 id,
                 canonical_record_bytes(&payload, self.identity.scheme())?,
@@ -632,6 +690,27 @@ where
         usage_from_closure(&records, root.commit).map_err(Into::into)
     }
 
+    fn verify_declared_identities(
+        &self,
+        records: &[(ObjectId, ObjectRecord)],
+        proof: &IdentityProof,
+    ) -> Result<(), DurableError> {
+        if proof.matches(&self.preparation_authority) {
+            return Ok(());
+        }
+        for (declared, record) in records {
+            let computed = self.identify(record);
+            if computed != *declared {
+                return Err(ModelError::ObjectIdentityMismatch {
+                    declared: *declared,
+                    computed,
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn prepare(
         &self,
         inner: &mut DurableInner<P>,
@@ -644,17 +723,16 @@ where
             expected,
             commit: commit_id,
             records,
+            identity_proof,
+            kv_checkpoint_publication,
         } = transaction;
-        for (declared, record) in &records {
-            let computed = self.identify(record);
-            if computed != *declared {
-                return Err(ModelError::ObjectIdentityMismatch {
-                    declared: *declared,
-                    computed,
-                }
-                .into());
-            }
-        }
+        let same_engine = identity_proof.matches(&self.preparation_authority);
+        self.verify_declared_identities(&records, &identity_proof)?;
+        let kv_checkpoint_publication = if same_engine {
+            kv_checkpoint_publication
+        } else {
+            None
+        };
         let actual = pending_roots
             .get(&principal)
             .copied()
@@ -674,16 +752,7 @@ where
             commit: commit_id,
         };
 
-        let mut unique = BTreeMap::new();
-        for (id, record) in records {
-            match unique.get(&id) {
-                Some(existing) if existing == &record => {},
-                Some(_) => return Err(ModelError::ObjectCollision(id).into()),
-                None => {
-                    unique.insert(id, record);
-                },
-            }
-        }
+        let unique = unique_transaction_records(records)?;
         let closure_started = std::time::Instant::now();
         let reachable = self.validate_pending_closure(inner, &unique, commit_id);
         if let Some(observer) = observer {
@@ -740,6 +809,7 @@ where
             commit: commit_frame,
             journal,
             validated: reachable,
+            kv_checkpoint_publication,
         })
     }
 
@@ -777,4 +847,20 @@ where
         }
         Ok(())
     }
+}
+
+fn unique_transaction_records(
+    records: Vec<(ObjectId, ObjectRecord)>,
+) -> Result<BTreeMap<ObjectId, ObjectRecord>, DurableError> {
+    let mut unique = BTreeMap::new();
+    for (id, record) in records {
+        match unique.get(&id) {
+            Some(existing) if existing == &record => {},
+            Some(_) => return Err(ModelError::ObjectCollision(id).into()),
+            None => {
+                unique.insert(id, record);
+            },
+        }
+    }
+    Ok(unique)
 }

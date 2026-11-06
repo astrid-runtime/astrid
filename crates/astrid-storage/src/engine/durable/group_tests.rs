@@ -816,3 +816,84 @@ fn transaction_wal_lives_on_an_astrid_volume_region() {
         commit
     );
 }
+
+#[test]
+fn transaction_wal_shared_batch_reads_match_single_before_fold() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = DurableEngine::open_with_policy(
+        directory.path(),
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        wal_policy(),
+    )
+    .unwrap();
+    let (commit, transaction) = transaction("alice", None, b"wal-batch-read");
+    let expected = transaction.records().to_vec();
+    // An unrelated immutable arena object exercises mixed snapshot resolution.
+    let arena_record = ObjectRecord::new(
+        ObjectKind::Chunk,
+        ObjectFormatVersion::V1,
+        b"arena-resident".to_vec(),
+        Vec::new(),
+        14,
+        ObjectClass::Data,
+    )
+    .unwrap();
+    let (arena_id, _) = engine.persist_standalone_object(&arena_record).unwrap();
+    engine.commit(transaction).unwrap();
+    let generation = {
+        let inner = engine.inner.lock();
+        assert!(inner.pending_wal.get_object(&commit).is_some());
+        assert!(!inner.index.contains_key(&commit));
+        inner.arena_generation
+    };
+    let principal = "alice".to_owned();
+    let record = expected
+        .iter()
+        .find(|(id, _)| *id == commit)
+        .unwrap()
+        .1
+        .clone();
+    // Exercise the retry guard directly first: old code would otherwise spin
+    // forever in shared_object_for before reaching the batch parity assertion.
+    assert!(
+        engine
+            .retain_loaded_object_if_current(&principal, commit, generation, record)
+            .unwrap()
+            .is_some(),
+        "shared read publication rejects a committed WAL-only object"
+    );
+    let unknown = ObjectId::new([255; 32]);
+    let ids = [commit, expected[0].0, unknown, commit, arena_id];
+    let singles = ids
+        .iter()
+        .map(|id| engine.shared_object_for(&principal, *id).unwrap())
+        .collect::<Vec<_>>();
+    assert!(singles[0].is_some());
+    assert!(singles[2].is_none());
+    let batch = engine.shared_objects_for(&principal, &ids).unwrap();
+    assert_eq!(batch, singles, "batch lost committed pending-WAL objects");
+    assert!(Arc::ptr_eq(
+        batch[0].as_ref().unwrap(),
+        batch[3].as_ref().unwrap()
+    ));
+    engine.close().unwrap();
+    assert!(matches!(
+        engine.shared_objects_for(&principal, &ids),
+        Err(DurableError::Closed)
+    ));
+    let reopened = DurableEngine::open_with_policy(
+        directory.path(),
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        wal_policy(),
+    )
+    .unwrap();
+    assert_eq!(
+        reopened.shared_objects_for(&principal, &ids).unwrap(),
+        singles
+    );
+    reopened.close().unwrap();
+}

@@ -21,7 +21,7 @@ use crate::principal_graph::{LEGACY_PRINCIPAL_GRAPH_VERSION, PRINCIPAL_GRAPH_VER
 use crate::{StorageError, StorageResult};
 
 #[derive(Clone, Copy, Debug)]
-struct TestIdentity;
+pub(super) struct TestIdentity;
 
 impl ObjectIdentity for TestIdentity {
     fn identify(&self, record: &ObjectRecord) -> ObjectId {
@@ -96,24 +96,30 @@ type Store = TreeKvStore<String, TestIdentity, Resolver, InMemoryEngine<String, 
 #[derive(Debug)]
 struct MeasuringEngine {
     inner: InMemoryEngine<String, TestIdentity>,
-    last_authoritative_bytes: AtomicU64,
+    identified_chunk_bytes: AtomicU64,
+    loaded_chunk_bytes: AtomicU64,
+    owned_header_reads: AtomicU64,
+    shared_header_reads: AtomicU64,
 }
 
 impl MeasuringEngine {
     fn new() -> Self {
         Self {
             inner: InMemoryEngine::new(TestIdentity),
-            last_authoritative_bytes: AtomicU64::new(0),
+            identified_chunk_bytes: AtomicU64::new(0),
+            loaded_chunk_bytes: AtomicU64::new(0),
+            owned_header_reads: AtomicU64::new(0),
+            shared_header_reads: AtomicU64::new(0),
         }
-    }
-
-    fn last_authoritative_bytes(&self) -> u64 {
-        self.last_authoritative_bytes.load(Ordering::Acquire)
     }
 }
 
 impl KvProjectionEngine<String> for MeasuringEngine {
     fn identify_kv_object(&self, record: &ObjectRecord) -> ObjectId {
+        if record.kind() == ObjectKind::Chunk {
+            self.identified_chunk_bytes
+                .fetch_add(record.canonical_bytes().len() as u64, Ordering::Relaxed);
+        }
         self.inner.identify(record)
     }
 
@@ -122,7 +128,45 @@ impl KvProjectionEngine<String> for MeasuringEngine {
     }
 
     fn load_kv_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, KvProjectionError> {
-        Ok(self.inner.object(id))
+        let record = self.inner.object(id);
+        if record.as_ref().is_some_and(|record| {
+            matches!(
+                record.kind(),
+                ObjectKind::Commit | ObjectKind::PrincipalState
+            )
+        }) {
+            self.owned_header_reads.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(record) = &record
+            && record.kind() == ObjectKind::Chunk
+        {
+            self.loaded_chunk_bytes
+                .fetch_add(record.canonical_bytes().len() as u64, Ordering::Relaxed);
+        }
+        Ok(record)
+    }
+
+    fn load_shared_kv_object_for(
+        &self,
+        principal: &String,
+        id: ObjectId,
+    ) -> Result<Option<Arc<ObjectRecord>>, KvProjectionError> {
+        let record = self.inner.load_shared_kv_object_for(principal, id)?;
+        if record.as_ref().is_some_and(|record| {
+            matches!(
+                record.kind(),
+                ObjectKind::Commit | ObjectKind::PrincipalState
+            )
+        }) {
+            self.shared_header_reads.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(record) = &record
+            && record.kind() == ObjectKind::Chunk
+        {
+            self.loaded_chunk_bytes
+                .fetch_add(record.canonical_bytes().len() as u64, Ordering::Relaxed);
+        }
+        Ok(record)
     }
 
     fn snapshot_kv_root(
@@ -136,27 +180,7 @@ impl KvProjectionEngine<String> for MeasuringEngine {
         &self,
         transaction: RootTransaction<String>,
     ) -> Result<CommitOutcome, KvProjectionError> {
-        let object_bytes = transaction
-            .records()
-            .iter()
-            .filter(|(object, _)| self.inner.object(*object).is_none())
-            .try_fold(0_u64, |total, (_, record)| {
-                total.checked_add(object_frame_bytes(record))
-            })
-            .ok_or_else(|| KvProjectionError::Engine("measurement overflow".to_owned()))?;
-        let journal_bytes = root_frame_bytes(
-            transaction.principal().as_bytes(),
-            transaction.expected().is_some(),
-        )
-        .ok_or_else(|| KvProjectionError::Engine("measurement overflow".to_owned()))?;
-        let outcome = self.inner.commit(transaction)?;
-        self.last_authoritative_bytes.store(
-            object_bytes
-                .checked_add(journal_bytes)
-                .ok_or_else(|| KvProjectionError::Engine("measurement overflow".to_owned()))?,
-            Ordering::Release,
-        );
-        Ok(outcome)
+        self.inner.commit(transaction).map_err(Into::into)
     }
 
     fn flush_kv(&self) -> Result<(), KvProjectionError> {
@@ -809,7 +833,8 @@ async fn transition_point_mutation_authoritative_bytes() {
         store
             .seed_sorted_for_test("alice".to_owned(), entries)
             .unwrap();
-        let checkpoint_bytes = engine.last_authoritative_bytes();
+        let seeded = settled_admission_census(&engine).await;
+        let checkpoint_bytes = seeded.logical_wire_growth(&AdmissionCensus::default());
         store
             .get("alice:capsule:bench", &format!("{:08}", cardinality / 3))
             .await
@@ -837,7 +862,8 @@ async fn transition_point_mutation_authoritative_bytes() {
             .await
             .unwrap();
         let set_elapsed = set_started.elapsed();
-        let set_bytes = engine.last_authoritative_bytes();
+        let after_set = settled_admission_census(&engine).await;
+        let set_bytes = after_set.logical_wire_growth(&seeded);
         let delete_started = Instant::now();
         assert!(
             store
@@ -845,13 +871,15 @@ async fn transition_point_mutation_authoritative_bytes() {
                 .await
                 .unwrap()
         );
+        let delete_elapsed = delete_started.elapsed();
+        let after_delete = settled_admission_census(&engine).await;
         eprintln!(
-            "cardinality={cardinality} checkpoint_bytes={checkpoint_bytes} \
-             replacement_bytes={set_bytes} delete_bytes={} get_ns={get_ns} \
+            "cardinality={cardinality} checkpoint_wire_bytes={checkpoint_bytes} \
+             replacement_wire_bytes={set_bytes} delete_wire_bytes={} get_ns={get_ns} \
              set_us={} delete_us={}",
-            engine.last_authoritative_bytes(),
+            after_delete.logical_wire_growth(&after_set),
             set_elapsed.as_micros(),
-            delete_started.elapsed().as_micros(),
+            delete_elapsed.as_micros(),
         );
     }
 }
@@ -948,3 +976,20 @@ async fn durable_transition_latency_and_bytes_are_cardinality_stable() {
         reopened.close().unwrap();
     }
 }
+
+#[path = "tree/boundary_closure_tests.rs"]
+mod boundary_closure_tests;
+
+#[path = "tree/chunked_value_tests.rs"]
+mod chunked_value_tests;
+
+#[path = "tree/admission_test_support.rs"]
+mod admission_test_support;
+use admission_test_support::{AdmissionCensus, drain_checkpoint_tasks, settled_admission_census};
+
+#[cfg(not(target_family = "wasm"))]
+#[path = "tree/stale_publication_tests.rs"]
+mod stale_publication_tests;
+
+#[path = "tree/header_read_tests.rs"]
+mod header_read_tests;

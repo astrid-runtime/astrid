@@ -31,7 +31,10 @@ async fn retirement_rejects_growth_and_ordinary_writes_still_require_live_policy
         |_, _| {
             Ok((
                 (),
-                vec![(b"agent\0other".to_vec(), Some(b"growth".to_vec()))],
+                vec![Replacement::new(
+                    b"agent\0other".to_vec(),
+                    Some(b"growth".to_vec()),
+                )],
                 true,
             ))
         },

@@ -33,6 +33,7 @@ pub(super) struct Projection {
     pub(super) depth: u64,
     pub(super) delta_bytes: u64,
     pub(super) totals: NodeTotals,
+    pub(super) boundary: Option<super::validation::ValidatedCheckpoint>,
 }
 
 impl Projection {
@@ -44,6 +45,7 @@ impl Projection {
             depth: 0,
             delta_bytes: 0,
             totals: NodeTotals::default(),
+            boundary: Some(super::validation::ValidatedCheckpoint::empty()),
         }
     }
 }

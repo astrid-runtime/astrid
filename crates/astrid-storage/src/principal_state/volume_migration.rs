@@ -12,6 +12,9 @@ use super::{Blake3ObjectIdentityV1, RuntimeEngine, StateOwner, StateOwnerCodecV2
 const CUTOVER_RECEIPT_REGION: &str = "system/migrations/directory-store-to-volume-v1";
 const MAX_CUTOVER_RECEIPT_BYTES: u64 = 256;
 
+#[cfg(test)]
+mod format_amendment_tests;
+
 pub(super) fn existing_volume_available(home: &AstridHome) -> StorageResult<bool> {
     Ok(promote_legacy_volume(home)?.is_some())
 }

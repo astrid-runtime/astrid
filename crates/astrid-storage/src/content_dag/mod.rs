@@ -241,8 +241,10 @@ impl OpenedContent {
 
 /// Proof that one immutable file DAG has canonical content boundaries.
 ///
-/// A token is produced only by Astrid's canonical builders or by a completed
-/// validating read. Because object identities bind the complete immutable
+/// A token is produced by Astrid's canonical builders, by a completed
+/// validating read, or by [`verified_content_from_certified_membership`] after
+/// KV whole-tree induction has already required those sources for the exact
+/// checkpoint tree. Because object identities bind the complete immutable
 /// closure, the proof remains valid for that exact file identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VerifiedContent {
@@ -250,7 +252,10 @@ pub struct VerifiedContent {
 }
 
 impl VerifiedContent {
-    pub(crate) const fn new(opened: OpenedContent) -> Self {
+    // Private to this module tree: child builders/readers may mint tokens after a
+    // canonical build or completed validating read. The only sibling-module mint
+    // path is [`verified_content_from_certified_membership`].
+    const fn new(opened: OpenedContent) -> Self {
         Self { opened }
     }
 
@@ -265,6 +270,24 @@ impl VerifiedContent {
     pub const fn opened_content(self) -> OpenedContent {
         self.opened
     }
+}
+
+/// Construct [`VerifiedContent`] for a KV certified point-read.
+///
+/// Accepts only a [`crate::kv::CertifiedValueMembership`] minted inside the KV
+/// validation module after a certificate-bound leaf traversal retrieved this
+/// exact content file. Returns `None` unless `opened` names that same file.
+/// An empty checkpoint certificate cannot mint membership, so it cannot reach
+/// this bridge. Tiny `content_dag` → KV type coupling keeps constructors sealed
+/// in KV rather than reopening a free mint API here.
+pub(crate) fn verified_content_from_certified_membership(
+    opened: OpenedContent,
+    membership: crate::kv::CertifiedValueMembership,
+) -> Option<VerifiedContent> {
+    if opened.descriptor().file() != membership.file() {
+        return None;
+    }
+    Some(VerifiedContent::new(opened))
 }
 
 /// Failure to construct or decode a canonical content DAG.

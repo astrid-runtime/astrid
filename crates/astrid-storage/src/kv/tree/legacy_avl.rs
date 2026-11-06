@@ -350,6 +350,7 @@ where
             other_quota_bytes: 0,
             preserved_state,
             preserved_commit,
+            boundary: Some(super::validation::ValidatedCheckpoint::empty()),
         },
         entries,
     }))
@@ -375,7 +376,7 @@ where
                 .map_err(|error| map_engine(&error))?
                 .ok_or_else(|| map_engine(&ModelError::MissingObject(object).into()))?;
             if record.format_version() == FORMAT_VERSION {
-                validated_projection(engine, owner, object, &KvValidationCache::default())?;
+                validated_projection(engine, owner, object, None, &KvValidationCache::default())?;
                 true
             } else {
                 false

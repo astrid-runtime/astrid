@@ -1,5 +1,7 @@
 //! Crash and authority tests for proof-audited durable compaction.
 
+mod transaction_wal;
+
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

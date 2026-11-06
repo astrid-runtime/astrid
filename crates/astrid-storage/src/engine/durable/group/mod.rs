@@ -18,6 +18,8 @@ use super::{
 };
 use crate::engine::{ProjectionObserver, ProjectionPhase};
 
+#[cfg(test)]
+mod checkpoint_publication_tests;
 mod wal;
 
 const DEFAULT_INITIAL_DELAY: Duration = Duration::from_micros(250);
@@ -364,6 +366,7 @@ where
 
     fn process_commit_batch(&self, batch: Vec<QueuedCommit<P>>) {
         let mut completions = Vec::new();
+        let mut retired_projections = Vec::new();
         let mut inner = match self.lock_usable() {
             Ok(inner) => inner,
             Err(error) => {
@@ -430,16 +433,10 @@ where
                         self.mark_requires_recovery(&mut inner);
                         complete_failed_group(&mut completions, accepted, error);
                     } else {
-                        for accepted in accepted {
-                            inner
-                                .validated
-                                .extend(accepted.prepared.validated.iter().copied());
-                            inner.roots_by_principal.insert(
-                                accepted.prepared.principal.clone(),
-                                accepted.prepared.root,
+                        for mut accepted in accepted {
+                            retired_projections.extend(
+                                self.publish_durable_root(&mut inner, &mut accepted.prepared),
                             );
-                            self.published_roots
-                                .publish(&accepted.prepared.principal, accepted.prepared.root);
                             completions.push((
                                 accepted.receipt,
                                 Ok(CommitOutcome {
@@ -457,9 +454,34 @@ where
             }
         }
         drop(inner);
+        // Releasing superseded value buffers can be expensive; the writer
+        // must already be available to other principals.
+        drop(retired_projections);
         for (receipt, result) in completions {
             receipt.complete(result);
         }
+    }
+
+    /// Called only after the batch's authoritative durability frontier succeeds.
+    fn publish_durable_root(
+        &self,
+        inner: &mut DurableInner<P>,
+        prepared: &mut Prepared<P>,
+    ) -> Option<crate::kv::RetiredKvProjection> {
+        inner.validated.extend(prepared.validated.iter().copied());
+        inner
+            .roots_by_principal
+            .insert(prepared.principal.clone(), prepared.root);
+        // Publish validation before the lock-free root, without waiting on a
+        // cache lock under the engine writer. The caller releases any evicted
+        // value buffers only after dropping that writer.
+        let retired = prepared
+            .kv_checkpoint_publication
+            .take()
+            .and_then(|publication| publication.try_publish(prepared.root));
+        self.published_roots
+            .publish(&prepared.principal, prepared.root);
+        retired
     }
 
     fn publish_commit_frontier(

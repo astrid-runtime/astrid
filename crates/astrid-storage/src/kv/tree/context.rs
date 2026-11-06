@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 
-use crate::engine::{KvProjectionEngine, RootTransaction};
+use crate::engine::{KvIdentitySession, KvProjectionEngine, RootTransaction};
 use crate::storage_model::{
     ModelError, ObjectClass, ObjectId, ObjectKind, ObjectRecord, ObjectReference, ReferenceKind,
 };
@@ -15,18 +15,65 @@ use super::delta::{
 use super::header::TreeHeader;
 use super::node::{
     ChildPointer, INLINE_VALUE_MAX, LeafEntry, NODE_MAX_ENTRIES, NODE_MAX_RETAINED_BYTES, Node,
-    NodeHandle, NodeTotals, ValueSlot, branch_record, decode_node, decode_value, leaf_record,
-    value_record,
+    NodeHandle, NodeTotals, ValueSlot, branch_record, decode_node, leaf_record,
 };
 use super::{FORMAT_VERSION, KV_LABEL, PARENT_LABEL, STATE_LABEL};
 use crate::error::{StorageError, StorageResult};
 use crate::kv::tree_error::{invalid, map_engine};
+
+pub(super) mod value;
+
+// A comparison and its mutation share one immutable header per CAS attempt.
+// Carry only its length and equality result through accounting, releasing
+// each old payload immediately; key-only operations keep deferred reads.
+pub(super) struct Replacement {
+    key: Vec<u8>,
+    previous: PreviousValue,
+    value: Option<Vec<u8>>,
+}
+
+enum PreviousValue {
+    Unread,
+    Loaded {
+        previous_len: Option<usize>,
+        unchanged: bool,
+    },
+}
+
+impl Replacement {
+    pub(super) fn new(key: Vec<u8>, value: Option<Vec<u8>>) -> Self {
+        Self {
+            key,
+            previous: PreviousValue::Unread,
+            value,
+        }
+    }
+
+    pub(super) fn observed(
+        key: Vec<u8>,
+        previous: Option<Vec<u8>>,
+        value: Option<Vec<u8>>,
+    ) -> Self {
+        let previous_len = previous.as_ref().map(Vec::len);
+        let unchanged = previous == value;
+        drop(previous);
+        Self {
+            key,
+            previous: PreviousValue::Loaded {
+                previous_len,
+                unchanged,
+            },
+            value,
+        }
+    }
+}
 
 pub(super) struct TreeContext<'a, P, E> {
     engine: &'a E,
     principal: &'a P,
     records: BTreeMap<ObjectId, ObjectRecord>,
     nodes: BTreeMap<ObjectId, NodeHandle>,
+    identity_session: Option<KvIdentitySession<'a>>,
     marker: PhantomData<fn() -> P>,
 }
 
@@ -41,6 +88,7 @@ where
             principal,
             records: BTreeMap::new(),
             nodes: BTreeMap::new(),
+            identity_session: engine.kv_identity_session(),
             marker: PhantomData,
         }
     }
@@ -56,19 +104,29 @@ where
 
     pub(super) fn get(
         &mut self,
-        mut root: Option<ObjectId>,
+        root: Option<ObjectId>,
         key: &[u8],
     ) -> StorageResult<Option<Vec<u8>>> {
+        self.get_slot(root, key)?
+            .map(|value| self.value_bytes(&value))
+            .transpose()
+    }
+
+    /// Authoritative leaf lookup used by ordinary and certified point-reads.
+    pub(super) fn get_slot(
+        &mut self,
+        mut root: Option<ObjectId>,
+        key: &[u8],
+    ) -> StorageResult<Option<ValueSlot>> {
         while let Some(object) = root {
             let handle = self.node(object)?;
             match handle.node {
-                Node::Leaf(leaf) => {
-                    return leaf
+                Node::Leaf(mut leaf) => {
+                    return Ok(leaf
                         .entries
                         .binary_search_by(|entry| entry.key.as_slice().cmp(key))
                         .ok()
-                        .map(|index| self.value_bytes(&leaf.entries[index].value))
-                        .transpose();
+                        .map(|index| leaf.entries.swap_remove(index).value));
                 },
                 Node::Branch(branch) => {
                     let index = child_index(&branch.children, key);
@@ -88,21 +146,50 @@ where
     ) -> StorageResult<Option<Vec<u8>>> {
         match header.overlay.get(key) {
             Some(value) => Ok(value.clone()),
-            None => self.get(header.tree, key),
+            None => match header
+                .boundary
+                .filter(|certificate| certificate.matches_tree(header.tree))
+            {
+                Some(certificate) => self.read_certified_tree_value(header, key, certificate),
+                None => self.get(header.tree, key),
+            },
         }
+    }
+
+    /// Live principal bound to this context.
+    pub(super) const fn principal(&self) -> &P {
+        self.principal
     }
 
     pub(super) fn build_sorted(
         &mut self,
         entries: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> StorageResult<Option<ObjectId>> {
+        if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return Err(StorageError::Serialization(
+                "KV migration entries are not strictly ordered".to_owned(),
+            ));
+        }
+        let entries = entries
+            .into_iter()
+            .map(|(key, bytes)| {
+                Ok(LeafEntry {
+                    key,
+                    value: self.make_value(bytes)?,
+                })
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
+        self.build_sorted_slots(entries)
+    }
+
+    pub(super) fn build_sorted_slots(
+        &mut self,
+        entries: Vec<LeafEntry>,
+    ) -> StorageResult<Option<ObjectId>> {
         if entries.is_empty() {
             return Ok(None);
         }
-        if entries
-            .windows(2)
-            .any(|pair| pair[0].0.as_slice() >= pair[1].0.as_slice())
-        {
+        if entries.windows(2).any(|pair| pair[0].key >= pair[1].key) {
             return Err(StorageError::Serialization(
                 "KV migration entries are not strictly ordered".to_owned(),
             ));
@@ -110,11 +197,7 @@ where
 
         let mut leaves = Vec::new();
         let mut current = Vec::new();
-        for (key, bytes) in entries {
-            let entry = LeafEntry {
-                key,
-                value: self.make_value(bytes)?,
-            };
+        for entry in entries {
             current.push(entry);
             if current.len() > 1 && !page_fits(leaf_record(&current), current.len(), 1)? {
                 let overflow = current.pop().ok_or_else(|| {
@@ -242,6 +325,97 @@ where
             .collect()
     }
 
+    // Repack the exact head's previously admitted, content-addressed value
+    // slots. Header validation and root admission establish the immutable
+    // closure; metadata checkpointing does not need a second content audit.
+    pub(super) fn checkpoint_entries(
+        &mut self,
+        header: &TreeHeader<P>,
+    ) -> StorageResult<Vec<LeafEntry>> {
+        let mut entries = BTreeMap::new();
+        let mut stack = header.tree.into_iter().collect::<Vec<_>>();
+        while let Some(object) = stack.pop() {
+            match self.node(object)?.node {
+                Node::Leaf(leaf) => {
+                    for entry in leaf.entries {
+                        if entries.insert(entry.key, entry.value).is_some() {
+                            return Err(invalid(object, "KV checkpoint contains duplicate keys"));
+                        }
+                    }
+                },
+                Node::Branch(branch) => {
+                    for child in branch.children.iter().rev() {
+                        self.validate_pointer(child)?;
+                        stack.push(child.object);
+                    }
+                },
+            }
+        }
+
+        // Latest occurrence wins. Values are immutable slots from the exact
+        // authoritative delta chain, rather than reconstructed overlay bytes.
+        let mut updates = BTreeMap::new();
+        let mut cursor = header.head;
+        let mut visited = BTreeSet::new();
+        let mut depth = 0_u64;
+        let mut checkpoint_tree = None;
+        while let Some(object) = cursor {
+            if !visited.insert(object) {
+                return Err(invalid(object, "KV delta chain contains a cycle"));
+            }
+            match decode_head(object, &self.record(object)?)? {
+                Head::Checkpoint { tree, .. } => {
+                    checkpoint_tree = tree;
+                    break;
+                },
+                Head::Delta {
+                    previous,
+                    mutations,
+                    ..
+                } => {
+                    depth = depth.checked_add(1).ok_or_else(arithmetic_overflow)?;
+                    for mutation in mutations {
+                        updates.entry(mutation.key).or_insert(mutation.value);
+                    }
+                    cursor = previous;
+                },
+            }
+        }
+        if checkpoint_tree != header.tree || depth != header.delta_depth {
+            return Err(StorageError::Serialization(
+                "KV checkpoint source disagrees with validated projection".to_owned(),
+            ));
+        }
+        for (key, value) in updates {
+            match value {
+                Some(value) => {
+                    entries.insert(key, value);
+                },
+                None => {
+                    entries.remove(&key);
+                },
+            }
+        }
+        let resolved = entries
+            .into_iter()
+            .map(|(key, value)| LeafEntry { key, value })
+            .collect::<Vec<_>>();
+        let totals = resolved
+            .iter()
+            .try_fold(NodeTotals::default(), |totals, entry| {
+                totals.add(entry.totals()?)
+            })?;
+        if totals.entries != header.entries
+            || totals.logical_bytes != header.logical_bytes
+            || totals.quota_bytes != header.quota_bytes
+        {
+            return Err(StorageError::Serialization(
+                "KV checkpoint slot accounting disagrees with validated projection".to_owned(),
+            ));
+        }
+        Ok(resolved)
+    }
+
     pub(super) fn visit_entries(
         &mut self,
         root: Option<ObjectId>,
@@ -285,10 +459,14 @@ where
     pub(super) fn apply_mutations(
         &mut self,
         header: &TreeHeader<P>,
-        mut replacements: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        mut replacements: Vec<Replacement>,
     ) -> StorageResult<Projection> {
-        replacements.sort_by(|left, right| left.0.cmp(&right.0));
-        if replacements.is_empty() || replacements.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        replacements.sort_by(|left, right| left.key.cmp(&right.key));
+        if replacements.is_empty()
+            || replacements
+                .windows(2)
+                .any(|pair| pair[0].key == pair[1].key)
+        {
             return Err(StorageError::Serialization(
                 "KV mutation batch is empty or has duplicate keys".to_owned(),
             ));
@@ -300,32 +478,41 @@ where
         };
         let mut current = header.overlay.clone();
         let mut mutations = Vec::with_capacity(replacements.len());
-        for (key, replacement) in replacements {
-            let previous = match current.get(&key) {
-                Some(value) => value.clone(),
-                None => self.get(header.tree, &key)?,
+        for Replacement {
+            key,
+            previous,
+            value: replacement,
+        } in replacements
+        {
+            let (previous_len, unchanged) = if let Some(value) = current.get(&key) {
+                (value.as_ref().map(Vec::len), value == &replacement)
+            } else {
+                match previous {
+                    PreviousValue::Loaded {
+                        previous_len,
+                        unchanged,
+                    } => (previous_len, unchanged),
+                    PreviousValue::Unread => {
+                        let value = self.projected_get(header, &key)?;
+                        (value.as_ref().map(Vec::len), value == replacement)
+                    },
+                }
             };
-            if previous == replacement {
+            if unchanged {
                 return Err(StorageError::Serialization(
                     "KV mutation batch contains a no-op".to_owned(),
                 ));
             }
-            update_totals(
-                &mut totals,
-                &key,
-                previous.as_deref(),
-                replacement.as_deref(),
-            )?;
+            update_totals(&mut totals, &key, previous_len, replacement.as_deref())?;
             let value = replacement
-                .map(|value| self.make_value(value))
+                .as_ref()
+                .map(|value| self.make_value(value.as_slice()))
                 .transpose()?;
-            current.insert(
-                key.clone(),
-                value
-                    .as_ref()
-                    .map(|value| self.value_bytes(value))
-                    .transpose()?,
-            );
+            // Chunk construction borrows these bytes; retain them for the
+            // overlay instead of reconstructing the just-staged value.
+            // Admission retains all structural and publication checks; locally
+            // bound identities do not need a second computation.
+            current.insert(key.clone(), replacement);
             mutations.push(Mutation { key, value });
         }
         let record = delta_record(
@@ -350,6 +537,9 @@ where
                 .ok_or_else(arithmetic_overflow)?,
             delta_bytes,
             totals,
+            boundary: header
+                .boundary
+                .filter(|certificate| certificate.matches_tree(header.tree)),
         })
     }
 
@@ -370,6 +560,7 @@ where
         header: TreeHeader<P>,
         tree: Option<ObjectId>,
         checkpoint_totals: NodeTotals,
+        certificate: super::validation::ValidatedCheckpoint,
     ) -> StorageResult<Option<(RootTransaction<P>, Projection)>> {
         let mut tail = Vec::new();
         let mut cursor = header.head;
@@ -421,6 +612,7 @@ where
             depth,
             delta_bytes,
             totals,
+            boundary: Some(certificate).filter(|certificate| certificate.matches_tree(tree)),
         };
         let transaction = self.finish_projection(header, &projection)?;
         Ok(Some((transaction, projection)))
@@ -466,12 +658,11 @@ where
         .map_err(|error| model_error(&error))?;
         let commit = self.insert(commit)?;
         self.retain_reachable(commit);
-        Ok(RootTransaction::new(
-            header.owner,
-            header.root,
-            commit,
-            self.records.into_iter().collect(),
-        ))
+        let records = self.records.into_iter().collect();
+        Ok(match self.identity_session {
+            Some(session) => session.seal_transaction(header.owner, header.root, commit, records),
+            None => RootTransaction::new(header.owner, header.root, commit, records),
+        })
     }
 
     fn pack_branches(&mut self, children: &[ChildPointer]) -> StorageResult<Vec<NodeHandle>> {
@@ -494,15 +685,6 @@ where
         ])
     }
 
-    fn make_value(&mut self, bytes: Vec<u8>) -> StorageResult<ValueSlot> {
-        if bytes.len() <= INLINE_VALUE_MAX {
-            return Ok(ValueSlot::Inline(bytes));
-        }
-        let length = u64::try_from(bytes.len()).map_err(|_| arithmetic_overflow())?;
-        let object = self.insert(value_record(bytes)?)?;
-        Ok(ValueSlot::Spilled { object, length })
-    }
-
     fn make_leaf_page(&mut self, entries: &[LeafEntry]) -> StorageResult<NodeHandle> {
         let record = leaf_record(entries)?;
         self.insert_node(&record)
@@ -511,16 +693,6 @@ where
     fn make_branch_page(&mut self, children: &[ChildPointer]) -> StorageResult<NodeHandle> {
         let record = branch_record(children)?;
         self.insert_node(&record)
-    }
-
-    pub(super) fn value_bytes(&self, value: &ValueSlot) -> StorageResult<Vec<u8>> {
-        match value {
-            ValueSlot::Inline(bytes) => Ok(bytes.clone()),
-            ValueSlot::Spilled { object, length } => {
-                let record = self.record(*object)?;
-                decode_value(*object, *length, &record)
-            },
-        }
     }
 
     fn validate_pointer(&mut self, pointer: &ChildPointer) -> StorageResult<()> {
@@ -562,7 +734,24 @@ where
     }
 
     pub(super) fn insert(&mut self, record: ObjectRecord) -> StorageResult<ObjectId> {
-        let object = self.engine.identify_kv_object(&record);
+        self.stage_identified_record(self.identify_record(&record), record)
+    }
+
+    pub(super) fn identify_record(&self, record: &ObjectRecord) -> ObjectId {
+        match self.identity_session {
+            Some(session) => session.identify(record),
+            None => self.engine.identify_kv_object(record),
+        }
+    }
+
+    // Transaction-local staging only. Writers are insert after identify_record
+    // and make_chunked_value immediately after build_content(self). A captured
+    // session lets admission trust these identities; keep this set of callers closed.
+    fn stage_identified_record(
+        &mut self,
+        object: ObjectId,
+        record: ObjectRecord,
+    ) -> StorageResult<ObjectId> {
         match self.records.get(&object) {
             Some(existing) if existing == &record => {},
             Some(_) => return Err(map_engine(&ModelError::ObjectCollision(object).into())),
@@ -591,11 +780,11 @@ where
 fn update_totals(
     totals: &mut NodeTotals,
     key: &[u8],
-    previous: Option<&[u8]>,
+    previous: Option<usize>,
     replacement: Option<&[u8]>,
 ) -> StorageResult<()> {
     let key_bytes = u64::try_from(key.len()).map_err(|_| arithmetic_overflow())?;
-    let previous_bytes = previous.map_or(0, |value| value.len() as u64);
+    let previous_bytes = previous.map_or(0, |length| length as u64);
     let replacement_bytes = replacement.map_or(0, |value| value.len() as u64);
     totals.entries = match (previous, replacement) {
         (None, Some(_)) => totals.entries.checked_add(1),
@@ -625,7 +814,7 @@ fn update_totals(
     Ok(())
 }
 
-fn child_index(children: &[ChildPointer], key: &[u8]) -> usize {
+pub(super) fn child_index(children: &[ChildPointer], key: &[u8]) -> usize {
     children
         .partition_point(|child| child.lower_bound.as_slice() <= key)
         .saturating_sub(1)

@@ -1,6 +1,7 @@
 //! In-memory executable world for principal-store operations.
 
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -10,14 +11,23 @@ use super::{
     RootState, StorageNodeId,
 };
 
+mod owned_commit;
+
+#[cfg(test)]
+mod commit_tests;
+
 /// In-memory reference world for principal-store operations.
 ///
 /// `P` is the integration layer's principal identifier. The model requires
 /// stable ordering only; it does not prescribe Astrid's public principal wire
 /// representation.
+///
+/// Cloning a world copies its mutable indexes and shares immutable record
+/// allocations. Removing an object releases this world's ownership; outstanding
+/// shared readers retain their records until their last reference is dropped.
 #[derive(Clone, Debug)]
 pub struct World<P: Ord> {
-    objects: BTreeMap<ObjectId, ObjectRecord>,
+    objects: BTreeMap<ObjectId, Arc<ObjectRecord>>,
     representations: BTreeMap<BlobId, ObjectId>,
     roots: BTreeMap<P, RootState>,
     pins: BTreeMap<PinId, ObjectId>,
@@ -56,7 +66,12 @@ impl<P: Ord> World<P> {
     /// Borrow one immutable object by its logical identifier.
     #[must_use]
     pub fn object(&self, id: ObjectId) -> Option<&ObjectRecord> {
-        self.objects.get(&id)
+        self.objects.get(&id).map(AsRef::as_ref)
+    }
+
+    /// Share this world's immutable record without copying its payload.
+    pub(crate) fn shared_object(&self, id: ObjectId) -> Option<Arc<ObjectRecord>> {
+        self.objects.get(&id).map(Arc::clone)
     }
 
     /// Return the current root for `principal`.
@@ -80,10 +95,10 @@ impl<P: Ord> World<P> {
         record: ObjectRecord,
     ) -> Result<InsertOutcome, ModelError> {
         match self.objects.get(&id) {
-            Some(existing) if existing == &record => Ok(InsertOutcome::AlreadyPresent),
+            Some(existing) if existing.as_ref() == &record => Ok(InsertOutcome::AlreadyPresent),
             Some(_) => Err(ModelError::ObjectCollision(id)),
             None => {
-                self.objects.insert(id, record);
+                self.objects.insert(id, Arc::new(record));
                 Ok(InsertOutcome::Inserted)
             },
         }
@@ -125,7 +140,7 @@ impl<P: Ord> World<P> {
     /// Returns [`ModelError::MissingObject`] for an incomplete graph or
     /// [`ModelError::ObjectCycle`] for a cyclic graph.
     pub fn closure(&self, root: ObjectId) -> Result<BTreeSet<ObjectId>, ModelError> {
-        closure_in(&self.objects, root)
+        closure_with(root, |id| self.object(id))
     }
 
     /// Atomically install a principal's root using compare-and-swap semantics.
@@ -210,7 +225,7 @@ impl<P: Ord> World<P> {
         let mut records = Vec::with_capacity(ids.len());
         for id in ids {
             let record = self.objects.get(&id).ok_or(ModelError::MissingObject(id))?;
-            records.push((id, record.clone()));
+            records.push((id, record.as_ref().clone()));
         }
         Ok(records)
     }
@@ -230,21 +245,70 @@ impl<P: Ord> World<P> {
         records: &[(ObjectId, ObjectRecord)],
         root: ObjectId,
     ) -> Result<u64, ModelError> {
-        let mut staged = self.objects.clone();
-        let mut inserted = 0_u64;
-        for (id, record) in records {
-            match staged.get(id) {
+        let staged = self.classify_import(records, root)?;
+        let inserted = u64::try_from(staged.len()).map_err(|_| ModelError::ArithmeticOverflow)?;
+        self.objects.extend(
+            staged
+                .into_iter()
+                .map(|(id, index)| (id, Arc::new(records[index].1.clone()))),
+        );
+        Ok(inserted)
+    }
+
+    fn validate_transaction_root(
+        &self,
+        records: &[(ObjectId, ObjectRecord)],
+        root: ObjectId,
+    ) -> Result<(), ModelError> {
+        let mut incoming_root = None;
+        for (id, record) in records.iter().filter(|(id, _)| *id == root) {
+            debug_assert_eq!(*id, root);
+            if incoming_root.is_some_and(|existing| existing != record) {
+                return Err(ModelError::ObjectCollision(root));
+            }
+            incoming_root = Some(record);
+        }
+
+        let record = incoming_root
+            .or_else(|| self.object(root))
+            .ok_or(ModelError::MissingObject(root))?;
+        if record.kind() != ObjectKind::Commit {
+            return Err(ModelError::RootNotCommit {
+                object: root,
+                actual: record.kind(),
+            });
+        }
+        Ok(())
+    }
+
+    fn classify_import(
+        &self,
+        records: &[(ObjectId, ObjectRecord)],
+        root: ObjectId,
+    ) -> Result<BTreeMap<ObjectId, usize>, ModelError> {
+        // Keep the resident world borrowed until every fallible admission
+        // check succeeds. Copying its full retained history here makes even
+        // metadata-only checkpoints block readers while cloning old payloads.
+        let mut staged = BTreeMap::<ObjectId, usize>::new();
+        for (index, (id, record)) in records.iter().enumerate() {
+            let existing = staged
+                .get(id)
+                .map(|index| &records[*index].1)
+                .or_else(|| self.object(*id));
+            match existing {
                 Some(existing) if existing == record => {},
                 Some(_) => return Err(ModelError::ObjectCollision(*id)),
                 None => {
-                    staged.insert(*id, record.clone());
-                    inserted = inserted
-                        .checked_add(1)
-                        .ok_or(ModelError::ArithmeticOverflow)?;
+                    staged.insert(*id, index);
                 },
             }
         }
-        let closure = closure_in(&staged, root)?;
+        let closure = closure_with(root, |id| {
+            staged
+                .get(&id)
+                .map(|index| &records[*index].1)
+                .or_else(|| self.object(id))
+        })?;
         if let Some(extraneous) = records
             .iter()
             .map(|(id, _)| id)
@@ -252,8 +316,7 @@ impl<P: Ord> World<P> {
         {
             return Err(ModelError::ExtraneousImportObject(*extraneous));
         }
-        self.objects = staged;
-        Ok(inserted)
+        Ok(staged)
     }
 
     /// Retain a root independently of a principal's current root.
@@ -488,6 +551,15 @@ pub(super) fn closure_in(
     objects: &BTreeMap<ObjectId, ObjectRecord>,
     root: ObjectId,
 ) -> Result<BTreeSet<ObjectId>, ModelError> {
+    closure_with(root, |id| objects.get(&id))
+}
+
+fn closure_with<'a>(
+    root: ObjectId,
+    object: impl Fn(ObjectId) -> Option<&'a ObjectRecord>,
+) -> Result<BTreeSet<ObjectId>, ModelError> {
+    #[cfg(test)]
+    commit_tests::record_closure_walk();
     let mut result = BTreeSet::new();
     let mut marks = BTreeMap::<ObjectId, u8>::new();
     let mut stack = vec![(root, false)];
@@ -503,7 +575,7 @@ pub(super) fn closure_in(
             Some(1) => return Err(ModelError::ObjectCycle(id)),
             Some(_) | None => {},
         }
-        let record = objects.get(&id).ok_or(ModelError::MissingObject(id))?;
+        let record = object(id).ok_or(ModelError::MissingObject(id))?;
         marks.insert(id, 1);
         stack.push((id, true));
         for child in record.owning_references().rev() {

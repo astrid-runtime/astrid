@@ -495,17 +495,85 @@ pub(super) fn validate_representations(
     Ok((reverse, extent_count))
 }
 
-pub(super) fn active_entries(
-    map: &CanonicalPhysicalMap,
-) -> Result<Vec<(PhysicalMapKey, &[u8])>, DurableError> {
+/// Bootstrap startup guard: reject Exact coverage of excluded objects under any recipe.
+///
+/// `reverse` only indexes `DirectCanonical` Exact records (`validate_representations` pushes each
+/// such record once). Ordinary hot reads keep using `contains_direct` / `reverse`.
+///
+/// After reverse hits are rejected, if `reverse.len()` equals the authoritative
+/// representation `entry_count`, every active record must already be a distinct
+/// `DirectCanonical` Exact entry (`reverse.len() <= #direct <= entry_count`, so
+/// equality collapses all three). That O(1) proof skips the fallback map walk.
+/// Duplicate directs for one object miss the fast path safely. Otherwise stream
+/// one authoritative visit over active leaves—no `Vec` materialization and no
+/// second walker. Decode errors fail closed.
+pub(super) fn ensure_no_excluded_object_coverage(
+    representations: &CanonicalPhysicalMap,
+    reverse: &BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
+    excluded: &BTreeSet<ObjectId>,
+) -> Result<(), DurableError> {
+    ensure_no_excluded_object_coverage_scanned(representations, reverse, excluded).map(|_| ())
+}
+
+/// Same guard as [`ensure_no_excluded_object_coverage`], returning how many map
+/// leaves the fallback visitor decoded (`0` when excluded is empty or the
+/// all-direct fast proof skips the walk).
+pub(super) fn ensure_no_excluded_object_coverage_scanned(
+    representations: &CanonicalPhysicalMap,
+    reverse: &BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
+    excluded: &BTreeSet<ObjectId>,
+) -> Result<u64, DurableError> {
+    if excluded.is_empty() {
+        return Ok(0);
+    }
+    if excluded.iter().any(|object| {
+        reverse
+            .get(object)
+            .is_some_and(|records| !records.is_empty())
+    }) {
+        return Err(DurableError::InvalidRepresentationState(
+            "bootstrap object has a relocatable representation",
+        ));
+    }
+    let reverse_objects =
+        u64::try_from(reverse.len()).map_err(|_| DurableError::EncodingOverflow)?;
+    if reverse_objects == representations.entry_count() {
+        return Ok(0);
+    }
+    let mut visited = 0_u64;
+    visit_active_entries(representations, |_key, bytes| {
+        visited = visited
+            .checked_add(1)
+            .ok_or(DurableError::EncodingOverflow)?;
+        let record = RepresentationRecord::decode(bytes)?;
+        let Coverage::Exact { object, .. } = record.coverage();
+        if excluded.contains(object) {
+            return Err(DurableError::InvalidRepresentationState(
+                "bootstrap object has a relocatable representation",
+            ));
+        }
+        Ok(())
+    })?;
+    Ok(visited)
+}
+
+/// Stream every active leaf in `map` through `visit`, preserving cycle and
+/// missing-node validation. Prefer this over allocating [`active_entries`] when
+/// callers can decide per leaf without retaining the full collection.
+pub(super) fn visit_active_entries<'a, F>(
+    map: &'a CanonicalPhysicalMap,
+    mut visit: F,
+) -> Result<(), DurableError>
+where
+    F: FnMut(PhysicalMapKey, &'a [u8]) -> Result<(), DurableError>,
+{
     let Some(root) = map.root() else {
-        return Ok(Vec::new());
+        return Ok(());
     };
-    let mut entries = Vec::new();
     let mut stack = vec![root];
-    let mut visited = BTreeSet::new();
+    let mut seen = BTreeSet::new();
     while let Some(id) = stack.pop() {
-        if !visited.insert(id) {
+        if !seen.insert(id) {
             return Err(DurableError::InvalidRepresentationState(
                 "physical map traversal revisited a node",
             ));
@@ -516,7 +584,7 @@ pub(super) fn active_entries(
             .ok_or(DurableError::InvalidRepresentationState(
                 "physical map traversal found a missing node",
             ))? {
-            PhysicalMapNode::Leaf { key, value, .. } => entries.push((*key, value.as_slice())),
+            PhysicalMapNode::Leaf { key, value, .. } => visit(*key, value.as_slice())?,
             PhysicalMapNode::Branch { zero, one, .. } => {
                 stack.push(*one);
                 stack.push(*zero);
@@ -524,16 +592,27 @@ pub(super) fn active_entries(
             PhysicalMapNode::Page {
                 entries: page_entries,
                 ..
-            } => entries.extend(
-                page_entries
-                    .iter()
-                    .map(|(key, value)| (*key, value.as_slice())),
-            ),
+            } => {
+                for (key, value) in page_entries {
+                    visit(*key, value.as_slice())?;
+                }
+            },
             PhysicalMapNode::Radix { children, .. } => {
                 stack.extend(children.iter().rev().copied());
             },
         }
     }
+    Ok(())
+}
+
+pub(super) fn active_entries(
+    map: &CanonicalPhysicalMap,
+) -> Result<Vec<(PhysicalMapKey, &[u8])>, DurableError> {
+    let mut entries = Vec::new();
+    visit_active_entries(map, |key, value| {
+        entries.push((key, value));
+        Ok(())
+    })?;
     Ok(entries)
 }
 

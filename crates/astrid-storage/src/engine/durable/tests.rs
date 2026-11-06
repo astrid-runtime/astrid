@@ -4,3 +4,6 @@ include!("test_cases/foundation.rs");
 include!("test_cases/representations.rs");
 include!("test_cases/operations_tests.rs");
 include!("test_cases/standalone_volume.rs");
+
+#[path = "test_cases/bootstrap_exclusion.rs"]
+mod bootstrap_exclusion;

@@ -650,6 +650,77 @@ fn export_import_is_complete_and_idempotent() {
 }
 
 #[test]
+fn importing_a_closure_preserves_resident_payload_allocations() {
+    let mut world = World::<&str>::new();
+    insert_small_tree(&mut world);
+    let resident = world.object(id(1)).unwrap().canonical_bytes().as_ptr();
+    let records = vec![(id(4), metadata(4, vec![id(3)]))];
+    assert_eq!(world.import_closure(&records, id(4)).unwrap(), 1);
+    // Immutable resident bytes must not be copied under the publication lock.
+    // The old implementation held both full allocations while staging, so
+    // even a tiny import replaced this unrelated resident allocation.
+    assert_eq!(
+        world.object(id(1)).unwrap().canonical_bytes().as_ptr(),
+        resident
+    );
+    assert_eq!(world.import_closure(&records, id(4)).unwrap(), 0);
+    assert_eq!(
+        world.object(id(1)).unwrap().canonical_bytes().as_ptr(),
+        resident
+    );
+}
+
+#[test]
+fn borrowed_import_validation_rejects_invalid_batches_without_publication() {
+    let cases = [
+        (
+            vec![(id(4), data(4)), (id(4), data(5))],
+            ModelError::ObjectCollision(id(4)),
+        ),
+        (
+            vec![(id(4), metadata(4, vec![id(5)]))],
+            ModelError::MissingObject(id(5)),
+        ),
+        (
+            vec![(id(4), metadata(4, vec![id(4)]))],
+            ModelError::ObjectCycle(id(4)),
+        ),
+        (
+            vec![(id(4), metadata(4, vec![id(3)])), (id(5), data(5))],
+            ModelError::ExtraneousImportObject(id(5)),
+        ),
+        (
+            vec![(id(4), metadata(4, vec![id(3)])), (id(1), data(9))],
+            ModelError::ObjectCollision(id(1)),
+        ),
+    ];
+    for (records, error) in cases {
+        let mut world = World::<&str>::new();
+        insert_small_tree(&mut world);
+        let before = world.export_closure(id(3)).unwrap();
+        let resident = world.object(id(1)).unwrap().canonical_bytes().as_ptr();
+        assert_eq!(world.import_closure(&records, id(4)), Err(error));
+        assert_eq!(world.object_count(), 3);
+        assert_eq!(world.export_closure(id(3)).unwrap(), before);
+        assert_eq!(
+            world.object(id(1)).unwrap().canonical_bytes().as_ptr(),
+            resident
+        );
+    }
+}
+
+#[test]
+fn borrowed_import_counts_identical_duplicate_declarations_once() {
+    let mut world = World::<&str>::new();
+    insert_small_tree(&mut world);
+    let record = metadata(4, vec![id(3)]);
+    let records = vec![(id(4), record.clone()), (id(4), record), (id(1), data(1))];
+    assert_eq!(world.import_closure(&records, id(4)).unwrap(), 1);
+    assert_eq!(world.object_count(), 4);
+    assert_eq!(world.import_closure(&records, id(4)).unwrap(), 0);
+}
+
+#[test]
 fn failed_import_is_invisible() {
     let mut source = World::<&str>::new();
     insert_small_tree(&mut source);

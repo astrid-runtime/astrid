@@ -108,7 +108,7 @@ where
                 },
                 KV_COMPONENT_LABEL => {
                     other_quota_bytes = other_quota_bytes
-                        .checked_add(self.kv_quota(principal, reference.target())?)
+                        .checked_add(self.kv_quota(principal, reference.target(), root)?)
                         .ok_or(PrincipalContentError::AccountingOverflow)?;
                     preserved_state.push(reference.clone());
                 },
@@ -146,11 +146,13 @@ where
         &self,
         principal: &P,
         object: ObjectId,
+        root: RootState,
     ) -> Result<u64, PrincipalContentError> {
         validated_projection_quota(
             &PrincipalKvAdapter::new(self.engine.as_ref()),
             principal,
             object,
+            Some(root),
             self.validated_kv.as_ref(),
         )
         .map_err(|_| invalid(object, "invalid KV component accounting"))

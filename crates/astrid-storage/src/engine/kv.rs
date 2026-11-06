@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::storage_model::{
     ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectIdentity, ObjectKind,
@@ -321,6 +322,11 @@ pub trait KvProjectionEngine<P>: Send + Sync {
     /// Compute the logical identity of one canonical object.
     fn identify_kv_object(&self, record: &ObjectRecord) -> ObjectId;
 
+    /// Bound hasher and admission authority, or `None` to rehash at commit.
+    fn kv_identity_session(&self) -> Option<crate::engine::KvIdentitySession<'_>> {
+        None
+    }
+
     /// Return the current root of one principal without materializing it.
     ///
     /// # Errors
@@ -356,6 +362,24 @@ pub trait KvProjectionEngine<P>: Send + Sync {
         id: ObjectId,
     ) -> Result<Option<ObjectRecord>, KvProjectionError> {
         self.load_kv_object(id)
+    }
+
+    /// Load one immutable KV object without copying a resident shared record.
+    ///
+    /// The default preserves owned-only engines. Governed caching engines
+    /// must apply the same principal attribution and read checks as their
+    /// owned path; sharing cannot bypass recovery, closure or frame validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same read errors as [`Self::load_kv_object_for`].
+    fn load_shared_kv_object_for(
+        &self,
+        principal: &P,
+        id: ObjectId,
+    ) -> Result<Option<Arc<ObjectRecord>>, KvProjectionError> {
+        self.load_kv_object_for(principal, id)
+            .map(|record| record.map(Arc::new))
     }
 
     /// Capture one principal's root and owning closure.
@@ -405,6 +429,10 @@ where
         self.identify(record)
     }
 
+    fn kv_identity_session(&self) -> Option<crate::engine::KvIdentitySession<'_>> {
+        Some(self.captured_identity_session())
+    }
+
     fn current_kv_root(&self, principal: &P) -> Result<Option<RootState>, KvProjectionError> {
         Ok(self.root(principal))
     }
@@ -417,6 +445,14 @@ where
 
     fn load_kv_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, KvProjectionError> {
         Ok(self.object(id))
+    }
+
+    fn load_shared_kv_object_for(
+        &self,
+        _principal: &P,
+        id: ObjectId,
+    ) -> Result<Option<Arc<ObjectRecord>>, KvProjectionError> {
+        Ok(self.world.read().shared_object(id))
     }
 
     fn snapshot_kv_root(&self, principal: &P) -> Result<Option<RootSnapshot>, KvProjectionError> {
@@ -446,6 +482,10 @@ where
         self.identify(record)
     }
 
+    fn kv_identity_session(&self) -> Option<crate::engine::KvIdentitySession<'_>> {
+        Some(self.captured_identity_session())
+    }
+
     fn current_kv_root(&self, principal: &P) -> Result<Option<RootState>, KvProjectionError> {
         self.root(principal).map_err(map_durable_error)
     }
@@ -464,6 +504,15 @@ where
         id: ObjectId,
     ) -> Result<Option<ObjectRecord>, KvProjectionError> {
         self.object_for(principal, id).map_err(map_durable_error)
+    }
+
+    fn load_shared_kv_object_for(
+        &self,
+        principal: &P,
+        id: ObjectId,
+    ) -> Result<Option<Arc<ObjectRecord>>, KvProjectionError> {
+        self.shared_object_for(principal, id)
+            .map_err(map_durable_error)
     }
 
     fn snapshot_kv_root(&self, principal: &P) -> Result<Option<RootSnapshot>, KvProjectionError> {

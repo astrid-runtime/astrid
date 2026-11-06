@@ -10,10 +10,10 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::engine::{KvProjectionEngine, KvProjectionError};
-use crate::storage_model::ModelError;
+use crate::storage_model::{ModelError, RootState};
 use parking_lot::Mutex;
 
-use self::context::TreeContext;
+use self::context::{Replacement, TreeContext};
 use self::delta::Projection;
 use self::header::{TreeHeader, decode_header};
 use self::hot_cache::KvHotCache;
@@ -38,6 +38,7 @@ mod node;
 mod overlay;
 #[cfg(all(test, feature = "legacy-surrealkv"))]
 mod performance_tests;
+mod publication;
 #[cfg(all(test, not(target_family = "wasm")))]
 mod retirement_tests;
 mod validation;
@@ -45,6 +46,8 @@ mod validation;
 pub(crate) use self::header::validated_projection_quota;
 pub use self::hot_cache::{KvReadCacheBudget, KvReadCacheCapacity, KvReadCacheConfig};
 pub(crate) use self::legacy_avl::migrate_principal as migrate_legacy_avl;
+pub(crate) use self::publication::{KvCheckpointPublication, RetiredKvProjection};
+pub(crate) use self::validation::CertifiedValueMembership;
 pub(super) use self::validation::TreeValidation;
 
 pub(super) const FORMAT_VERSION: crate::storage_model::ObjectFormatVersion =
@@ -68,6 +71,41 @@ impl<P: Ord> Default for KvValidationCache<P> {
             trees: Mutex::new(BTreeMap::new()),
             projections: Mutex::new(BTreeMap::new()),
         }
+    }
+}
+
+impl<P: Clone + Ord> KvValidationCache<P> {
+    fn publish_if_current<E: KvProjectionEngine<P>>(
+        &self,
+        engine: &E,
+        owner: P,
+        expected: RootState,
+        projection: Projection,
+        checkpoint: Option<TreeValidation>,
+    ) {
+        if let Some(checkpoint) = checkpoint
+            && (checkpoint.root() != projection.tree
+                || projection.boundary != Some(checkpoint.certificate()))
+        {
+            return;
+        }
+        // Order every cache publisher and check currency inside that guard.
+        // Never hold it across graph validation or an authoritative commit.
+        let mut projections = self.projections.lock();
+        let Ok(Some(current)) = engine.current_kv_root(&owner) else {
+            // An optional cache query must not false-fail an already successful
+            // commit or historical snapshot read.
+            return;
+        };
+        if current != expected {
+            return;
+        }
+        // Nested cache order is projections -> trees. The engine root method
+        // has returned and released its own lock before either map is changed.
+        if let Some(checkpoint) = checkpoint {
+            self.trees.lock().insert(owner.clone(), checkpoint);
+        }
+        projections.insert(owner, projection);
     }
 }
 
@@ -214,6 +252,11 @@ where
     E: KvProjectionEngine<P> + 'static,
 {
     fn header(&self, owner: P) -> StorageResult<TreeHeader<P>> {
+        // Pin only this operation's existing immutable projection before root
+        // capture. A concurrent checkpoint may replace the shared cache while
+        // this reader loads its captured commit/state. Head matching below
+        // preserves that snapshot without retaining an extra owner history.
+        let captured_projection = self.validation.projections.lock().get(&owner).cloned();
         let Some(root) = self
             .engine
             .current_kv_root(&owner)
@@ -227,6 +270,7 @@ where
             root,
             self.validation.as_ref(),
             self.validated_content.as_ref(),
+            captured_projection,
         )
     }
 
@@ -246,7 +290,7 @@ where
         mutation: impl FnMut(
             &mut TreeContext<'_, P, E>,
             &TreeHeader<P>,
-        ) -> StorageResult<(T, Vec<(Vec<u8>, Option<Vec<u8>>)>, bool)>,
+        ) -> StorageResult<(T, Vec<Replacement>, bool)>,
     ) -> StorageResult<T> {
         self.mutate_with_quota(owner, MutationQuota::CurrentPolicy, mutation)
     }
@@ -258,7 +302,7 @@ where
         mut mutation: impl FnMut(
             &mut TreeContext<'_, P, E>,
             &TreeHeader<P>,
-        ) -> StorageResult<(T, Vec<(Vec<u8>, Option<Vec<u8>>)>, bool)>,
+        ) -> StorageResult<(T, Vec<Replacement>, bool)>,
     ) -> StorageResult<T> {
         loop {
             let header = self.header(owner.clone())?;
@@ -286,25 +330,31 @@ where
             let validated_projection = projection.clone();
             let transaction = context.finish_projection(header, &projection)?;
             match self.engine.commit_kv_root(transaction) {
-                Ok(_) => {
+                Ok(outcome) => {
                     // A delta projection keeps the checkpoint tree unchanged;
                     // its totals include the overlay and therefore must never
                     // be cached as validation for that checkpoint tree.
-                    if projection.depth == 0 {
-                        self.validation.trees.lock().insert(
-                            owner.clone(),
-                            TreeValidation {
-                                root: tree,
-                                entries: projection.totals.entries,
-                                logical_bytes,
-                                quota_bytes: projection_used,
-                            },
-                        );
-                    }
-                    self.validation
-                        .projections
-                        .lock()
-                        .insert(owner.clone(), validated_projection);
+                    let checkpoint = if projection.depth == 0
+                        && let Some(certificate) = projection
+                            .boundary
+                            .filter(|certificate| certificate.matches_tree(tree))
+                    {
+                        Some(TreeValidation::from_certificate(
+                            certificate,
+                            projection.totals.entries,
+                            logical_bytes,
+                            projection_used,
+                        ))
+                    } else {
+                        None
+                    };
+                    self.validation.publish_if_current(
+                        self.engine.as_ref(),
+                        owner.clone(),
+                        outcome.root(),
+                        validated_projection,
+                        checkpoint,
+                    );
                     if should_checkpoint(&projection) {
                         self.schedule_checkpoint(owner.clone());
                     }
@@ -361,7 +411,10 @@ where
             }
             let count = u64::try_from(keys.len())
                 .map_err(|_| StorageError::Internal("KV key count overflow".to_owned()))?;
-            let mutations = keys.into_iter().map(|key| (key, None)).collect();
+            let mutations = keys
+                .into_iter()
+                .map(|key| Replacement::new(key, None))
+                .collect();
             Ok((count, mutations, count != 0))
         })
     }
@@ -422,22 +475,7 @@ where
             return Ok(false);
         }
         let mut context = TreeContext::new(self.engine.as_ref(), &base.owner);
-        let mut entries = BTreeMap::<Vec<u8>, Vec<u8>>::new();
-        context.visit_entries(base.tree, |key, value| {
-            entries.insert(key.to_vec(), value.to_vec());
-            Ok(())
-        })?;
-        for (key, value) in base.overlay.all() {
-            match value {
-                Some(value) => {
-                    entries.insert(key, value);
-                },
-                None => {
-                    entries.remove(&key);
-                },
-            }
-        }
-        let tree = context.build_sorted(entries.into_iter().collect())?;
+        let (tree, validation) = context.build_validated_checkpoint(&base)?;
         let checkpoint_totals = base_projection.totals;
         interleave()?;
         let current = self.header(owner.clone())?;
@@ -445,23 +483,35 @@ where
         if !force && !should_checkpoint(&current_projection) {
             return Ok(false);
         }
-        let Some((transaction, rebased)) =
-            context.rebase_checkpoint(base.head, current, tree, checkpoint_totals)?
+        let Some((transaction, rebased)) = context.rebase_checkpoint(
+            base.head,
+            current,
+            tree,
+            checkpoint_totals,
+            validation.certificate(),
+        )?
         else {
             return Ok(false);
         };
+        let commit = transaction.commit();
+        let transaction = transaction.with_kv_checkpoint_publication(|| {
+            KvCheckpointPublication::new(
+                Arc::clone(&self.validation),
+                owner.clone(),
+                commit,
+                rebased.clone(),
+                validation,
+            )
+        });
         match self.engine.commit_kv_root(transaction) {
-            Ok(_) => {
-                self.validation.trees.lock().insert(
-                    owner.clone(),
-                    TreeValidation {
-                        root: tree,
-                        entries: checkpoint_totals.entries,
-                        logical_bytes: checkpoint_totals.logical_bytes,
-                        quota_bytes: checkpoint_totals.quota_bytes,
-                    },
+            Ok(outcome) => {
+                self.validation.publish_if_current(
+                    self.engine.as_ref(),
+                    owner,
+                    outcome.root(),
+                    rebased,
+                    Some(validation),
                 );
-                self.validation.projections.lock().insert(owner, rebased);
                 Ok(true)
             },
             Err(KvProjectionError::Model(ModelError::RootConflict { .. })) => Ok(false),
@@ -482,6 +532,9 @@ fn projection_from_header<P>(header: &TreeHeader<P>) -> Projection {
             logical_bytes: header.logical_bytes,
             quota_bytes: header.quota_bytes,
         },
+        boundary: header
+            .boundary
+            .filter(|certificate| certificate.matches_tree(header.tree)),
     }
 }
 
@@ -528,7 +581,9 @@ where
                 }
                 let mutations = entries
                     .into_iter()
-                    .filter_map(|(key, value)| value.map(|_| (key, None)))
+                    .filter_map(|(key, value)| {
+                        value.map(|value| Replacement::observed(key, Some(value), None))
+                    })
                     .collect::<Vec<_>>();
                 let count = u64::try_from(mutations.len()).unwrap_or(u64::MAX);
                 Ok((count, mutations, count != 0))
@@ -550,7 +605,7 @@ where
             let mutations = entries
                 .iter()
                 .map(|entry| {
-                    (
+                    Replacement::new(
                         composite_key(&entry.namespace, &entry.key),
                         Some(entry.value.clone()),
                     )
@@ -620,6 +675,29 @@ where
     }
 
     #[cfg(test)]
+    pub(crate) fn cached_checkpoint_for_test(
+        &self,
+        owner: &P,
+    ) -> (
+        Option<crate::storage_model::ObjectId>,
+        Option<crate::storage_model::ObjectId>,
+    ) {
+        let head = self
+            .validation
+            .projections
+            .lock()
+            .get(owner)
+            .and_then(|entry| entry.head);
+        let tree = self
+            .validation
+            .trees
+            .lock()
+            .get(owner)
+            .and_then(|entry| entry.root());
+        (head, tree)
+    }
+
+    #[cfg(test)]
     pub(crate) fn checkpoint_for_test(&self, owner: P) -> StorageResult<bool> {
         self.blocking_store().checkpoint_once(owner, true)
     }
@@ -643,10 +721,19 @@ where
         let mutation_owner = owner.clone();
         blocking.checkpoint_once_after(owner, true, move || {
             interleaved.mutate(&mutation_owner, |context, header| {
-                if context.projected_get(header, &key)?.as_deref() == Some(value.as_slice()) {
+                let previous = context.projected_get(header, &key)?;
+                if previous.as_deref() == Some(value.as_slice()) {
                     return Ok(((), Vec::new(), false));
                 }
-                Ok(((), vec![(key.clone(), Some(value.clone()))], true))
+                Ok((
+                    (),
+                    vec![Replacement::observed(
+                        key.clone(),
+                        previous,
+                        Some(value.clone()),
+                    )],
+                    true,
+                ))
             })
         })
     }

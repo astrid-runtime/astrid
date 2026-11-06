@@ -19,6 +19,19 @@ where
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
+    /// Return the specification named by the recovered authoritative profile.
+    /// Runtime composition uses this identity to select an explicit format
+    /// amendment before admitting new bootstrap objects.
+    pub(crate) fn direct_representation_specification(
+        &self,
+    ) -> Result<Option<ObjectId>, DurableError> {
+        self.lock_usable()?
+            .representations
+            .as_ref()
+            .map(RepresentationStore::frozen_specification)
+            .transpose()
+    }
+
     /// Ensure the authoritative direct-representation catalogue is active.
     ///
     /// Activation describes the already-verified generation-zero object arena
@@ -57,7 +70,8 @@ where
     ///
     /// Applies the same recovery checks as
     /// [`Self::ensure_direct_representation_catalogue`] and rejects an active
-    /// profile not explicitly named by either specification argument.
+    /// profile not explicitly named by either specification argument, or a
+    /// bootstrap object that has entered the relocatable catalogue.
     pub fn ensure_direct_representation_catalogue_compatible_with(
         &self,
         frozen_specification: ObjectId,
@@ -161,6 +175,12 @@ where
                 "active direct profile specification is not a persisted bootstrap object",
             ));
         }
+        // A predecessor may not know a successor's bootstrap identity and can
+        // describe it during coverage repair. Exclusion must be checked against
+        // recovered authoritative state, not just the current writer's role.
+        // Reverse is DirectCanonical-only; this also rejects PackedSlice,
+        // Compressed, and Delta coverage without a redundant all-recipe index.
+        representations.ensure_no_relocatable_coverage_for(excluded)?;
         let missing = inner
             .index
             .iter()

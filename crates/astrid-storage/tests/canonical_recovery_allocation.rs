@@ -1,16 +1,19 @@
-//! Canonical validation must not retain a second complete payload set.
+//! Canonical validation and proven reads must avoid redundant allocations.
 #![cfg(not(target_family = "wasm"))]
 
 use astrid_storage::storage_model::{
-    CanonicalPhysicalMap, PhysicalIdentity, PhysicalMapDomain, PhysicalMapKey,
+    CanonicalPhysicalMap, ObjectId, ObjectRecord, PhysicalIdentity, PhysicalMapDomain,
+    PhysicalMapKey,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 thread_local! {
     // Account only allocations inside the invoking validation call. Input
     // ownership outlives that call; the harness and other threads are excluded.
-    static ACCOUNTING: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
+    static ACCOUNTING: Cell<Option<(usize, usize, usize)>> = const { Cell::new(None) };
     static INVALID_ACCOUNTING: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -18,7 +21,7 @@ struct Allocator;
 
 fn account(size: usize, allocated: bool) {
     let _ = ACCOUNTING.try_with(|state| {
-        if let Some((live, peak)) = state.get() {
+        if let Some((live, peak, allocations)) = state.get() {
             let next = if allocated {
                 live.checked_add(size)
             } else {
@@ -31,7 +34,12 @@ fn account(size: usize, allocated: bool) {
                 INVALID_ACCOUNTING.set(true);
                 return;
             };
-            state.set(Some((live, peak.max(live))));
+            let Some(allocations) = allocations.checked_add(usize::from(allocated)) else {
+                state.set(None);
+                INVALID_ACCOUNTING.set(true);
+                return;
+            };
+            state.set(Some((live, peak.max(live), allocations)));
         }
     });
 }
@@ -96,7 +104,7 @@ fn validate_without_retaining_input_payloads(dense: bool) {
     }
     .unwrap();
     INVALID_ACCOUNTING.set(false);
-    ACCOUNTING.set(Some((0, 0)));
+    ACCOUNTING.set(Some((0, 0, 0)));
     let reset = ResetAccounting;
     let result = CanonicalPhysicalMap::validate_root(
         &Identity,
@@ -111,7 +119,7 @@ fn validate_without_retaining_input_payloads(dense: bool) {
         !invalid,
         "temporary allocation accounting overflowed or underflowed"
     );
-    let (_, peak) = accounting.unwrap();
+    let (_, peak, _) = accounting.unwrap();
     assert_eq!(result.unwrap(), u64::try_from(count).unwrap());
     // Room for transient node encoding, traversal sets and allocator rounding;
     // a second full input payload set alone exceeds this bound eightfold.
@@ -129,4 +137,82 @@ fn legacy_canonical_validation_borrows_the_complete_input_payload_set() {
 #[test]
 fn dense_canonical_validation_borrows_the_complete_input_payload_set() {
     validate_without_retaining_input_payloads(true);
+}
+
+struct ResidentContent(BTreeMap<ObjectId, Arc<ObjectRecord>>);
+
+impl astrid_storage::content_dag::ContentSource for ResidentContent {
+    type Error = std::convert::Infallible;
+
+    fn load_content_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, Self::Error> {
+        Ok(self.0.get(&id).map(|record| record.as_ref().clone()))
+    }
+
+    fn load_shared_content_object(
+        &self,
+        id: ObjectId,
+    ) -> Result<Option<Arc<ObjectRecord>>, Self::Error> {
+        Ok(self.0.get(&id).cloned())
+    }
+
+    fn load_shared_content_objects(
+        &self,
+        ids: &[ObjectId],
+    ) -> Result<Vec<Option<Arc<ObjectRecord>>>, Self::Error> {
+        Ok(ids.iter().map(|id| self.0.get(id).cloned()).collect())
+    }
+}
+
+#[test]
+fn verified_content_reads_allocate_per_tree_node_instead_of_per_chunk() {
+    use astrid_storage::content_dag::{
+        CHUNK_TREE_FANOUT, ChunkingProfile, build_content, read_verified_content,
+    };
+    use astrid_storage::principal_state::Blake3ObjectIdentityV1;
+    use astrid_storage::storage_model::ObjectKind;
+
+    let mut random = 0x12ab_56cd_90ef_3412_u64;
+    let bytes: Vec<_> = (0..16 * 1024 * 1024)
+        .map(|_| {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            random.to_le_bytes()[0]
+        })
+        .collect();
+    let built = build_content(&Blake3ObjectIdentityV1, ChunkingProfile::ASTRID_V1, &bytes).unwrap();
+    assert!(built.descriptor().chunk_count() > u64::try_from(CHUNK_TREE_FANOUT).unwrap());
+    let verified = built.verified_content();
+    let tree_nodes = built
+        .records()
+        .iter()
+        .filter(|(_, record)| record.kind() == ObjectKind::ChunkTree)
+        .count();
+    let source = ResidentContent(
+        built
+            .into_records()
+            .into_iter()
+            .map(|(id, record)| (id, Arc::new(record)))
+            .collect(),
+    );
+
+    INVALID_ACCOUNTING.set(false);
+    ACCOUNTING.set(Some((0, 0, 0)));
+    let reset = ResetAccounting;
+    let result = read_verified_content(&source, verified);
+    let accounting = ACCOUNTING.get();
+    let invalid = INVALID_ACCOUNTING.get();
+    drop(reset);
+    assert!(!invalid, "verified-read allocation accounting was invalid");
+    assert_eq!(result.unwrap(), bytes);
+    let (_, _, allocations) = accounting.unwrap();
+    // One output allocation plus decoding and batch vectors per tree node.
+    // Geometric selection growth is bounded by log2(fanout); spare slots cover
+    // fixed traversal bookkeeping, not a path allocation for every chunk.
+    let per_node = usize::try_from(CHUNK_TREE_FANOUT.ilog2()).unwrap() + 6;
+    let budget = 8 + per_node * tree_nodes;
+    assert!(
+        allocations <= budget,
+        "verified read allocated {allocations} times for {tree_nodes} tree nodes (budget {budget})"
+    );
 }
