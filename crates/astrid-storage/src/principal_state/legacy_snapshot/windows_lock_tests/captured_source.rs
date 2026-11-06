@@ -2,6 +2,18 @@
 
 use super::assert_path_writer_excluded;
 use astrid_core::platform_fs::{CapturedDirectory, create_private_directory};
+use std::path::Path;
+
+fn assert_captured_entries(captured: &CapturedDirectory, path: &Path) {
+    let directory = super::PrivateDirectory::from_std_directory_file(
+        captured.try_clone_directory_file().unwrap(),
+        path.to_path_buf(),
+    )
+    .unwrap();
+    let mut names = directory.entries().unwrap();
+    names.sort();
+    assert_eq!(names, ["LOCK", "payload"].map(std::ffi::OsString::from));
+}
 
 #[test]
 fn captured_source_capability_moves_and_retires_under_the_same_writer_fence() {
@@ -18,6 +30,7 @@ fn captured_source_capability_moves_and_retires_under_the_same_writer_fence() {
 
     let mut captured = CapturedDirectory::open(&source).unwrap();
     let identity = captured.identity();
+    assert_captured_entries(&captured, &source);
     // Do not reopen the directory by path: that is a different native file
     // object, incompatible with the retained DELETE/no-share-delete owner.
     let directory = cap_std::fs::Dir::from_std_file(captured.try_clone_directory_file().unwrap());
@@ -30,6 +43,7 @@ fn captured_source_capability_moves_and_retires_under_the_same_writer_fence() {
     captured.rename_to(&staged).unwrap();
     assert!(!source.exists());
     assert_eq!(captured.identity(), identity);
+    assert_captured_entries(&captured, &staged);
     assert_eq!(directory.read("payload").unwrap(), b"original source");
     assert_eq!(directory.read("LOCK").unwrap(), b"unchanged lock");
     assert_path_writer_excluded(&staged.join("LOCK"));

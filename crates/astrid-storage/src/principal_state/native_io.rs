@@ -267,7 +267,7 @@ impl PrivateDirectory {
 
     pub(super) fn entries(&self) -> StorageResult<Vec<OsString>> {
         self.directory
-            .read_dir(Path::new("."))
+            .entries()
             .map_err(|error| {
                 connection(format!(
                     "read private directory {}: {error}",
