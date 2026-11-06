@@ -1,8 +1,10 @@
 use std::cell::Cell;
+use std::sync::{Arc, Barrier};
 
 use super::World;
+use parking_lot::RwLock;
 
-use crate::engine::{InMemoryEngine, RootTransaction};
+use crate::engine::{InMemoryEngine, KvProjectionEngine, RootTransaction};
 use crate::principal_state::Blake3ObjectIdentityV1;
 use crate::storage_model::{
     ModelError, ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord,
@@ -11,12 +13,17 @@ use crate::storage_model::{
 
 thread_local! {
     static CLOSURE_WALKS: Cell<Option<usize>> = const { Cell::new(None) };
+    static CLOSURE_PAUSE: Cell<Option<(Arc<Barrier>, Arc<Barrier>)>> = const { Cell::new(None) };
 }
 
 pub(super) fn record_closure_walk() {
     CLOSURE_WALKS.with(|count| {
         count.set(count.get().map(|walks| walks.strict_add(1)));
     });
+    if let Some((entered, release)) = CLOSURE_PAUSE.take() {
+        entered.wait();
+        release.wait();
+    }
 }
 
 struct ResetWalks;
@@ -24,6 +31,7 @@ struct ResetWalks;
 impl Drop for ResetWalks {
     fn drop(&mut self) {
         CLOSURE_WALKS.set(None);
+        CLOSURE_PAUSE.set(None);
     }
 }
 
@@ -156,16 +164,20 @@ fn rejected_owned_commits_preserve_objects_and_roots() {
         ),
     ];
     for (records, error) in cases {
-        let mut world = World::new();
-        world.insert_object(unrelated, chunk.clone()).unwrap();
+        let world = RwLock::new(World::new());
+        world
+            .write()
+            .insert_object(unrelated, chunk.clone())
+            .unwrap();
         assert_eq!(
-            world.commit_closure_owned("alice", None, root, records),
+            World::commit_closure_owned(world.upgradable_read(), "alice", None, root, records)
+                .map(|(_guard, root, inserted)| (root, inserted)),
             Err(error)
         );
-        assert_eq!(world.root(&"alice"), None);
-        assert_eq!(world.object_count(), 1);
-        assert_eq!(world.object(unrelated), Some(&chunk));
-        assert_eq!(world.object(root), None);
+        assert_eq!(world.read().root(&"alice"), None);
+        assert_eq!(world.read().object_count(), 1);
+        assert_eq!(world.read().object(unrelated), Some(&chunk));
+        assert_eq!(world.read().object(root), None);
     }
 }
 
@@ -180,19 +192,28 @@ fn owned_commit_checks_conflict_and_overflow_before_root_validation() {
     // Set the otherwise unreachable terminal generation to exercise the
     // production overflow boundary without billions of root publications.
     world.roots.insert("alice", actual);
+    let world = RwLock::new(world);
     assert_eq!(
-        world.commit_closure_owned("alice", None, root, Vec::new()),
+        World::commit_closure_owned(world.upgradable_read(), "alice", None, root, Vec::new())
+            .map(|(_guard, root, inserted)| (root, inserted)),
         Err(ModelError::RootConflict {
             expected: None,
             actual: Some(actual)
         }),
     );
     assert_eq!(
-        world.commit_closure_owned("alice", Some(actual), root, Vec::new()),
+        World::commit_closure_owned(
+            world.upgradable_read(),
+            "alice",
+            Some(actual),
+            root,
+            Vec::new()
+        )
+        .map(|(_guard, root, inserted)| (root, inserted)),
         Err(ModelError::ArithmeticOverflow),
     );
-    assert_eq!(world.root(&"alice"), Some(actual));
-    assert_eq!(world.object_count(), 0);
+    assert_eq!(world.read().root(&"alice"), Some(actual));
+    assert_eq!(world.read().object_count(), 0);
 }
 
 #[test]
@@ -208,4 +229,68 @@ fn standalone_root_swap_still_validates_resident_closure() {
     assert_eq!(walks, 1);
     assert_eq!(world.root(&"alice"), None);
     assert_eq!(world.object_count(), 1);
+}
+
+#[test]
+fn engine_commit_keeps_current_root_readable_during_closure_validation() {
+    let engine = Arc::new(InMemoryEngine::new(Blake3ObjectIdentityV1));
+    let leaf = ObjectRecord::new(
+        ObjectKind::Chunk,
+        ObjectFormatVersion::V1,
+        b"value".to_vec(),
+        Vec::new(),
+        5,
+        ObjectClass::Data,
+    )
+    .unwrap();
+    let leaf_id = engine.identify(&leaf);
+    let commit = commit_for(b"first", leaf_id);
+    let commit_id = engine.identify(&commit);
+    let initial = engine
+        .commit(RootTransaction::new(
+            "alice",
+            None,
+            commit_id,
+            vec![(leaf_id, leaf), (commit_id, commit)],
+        ))
+        .unwrap()
+        .root();
+    let commit = commit_for(b"second", leaf_id);
+    let commit_id = engine.identify(&commit);
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let worker = {
+        let engine = Arc::clone(&engine);
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        std::thread::spawn(move || {
+            let _reset = ResetWalks;
+            CLOSURE_PAUSE.set(Some((entered, release)));
+            engine.commit(RootTransaction::new(
+                "alice",
+                Some(initial),
+                commit_id,
+                vec![(commit_id, commit)],
+            ))
+        })
+    };
+    entered.wait();
+    let captured = engine
+        .current_kv_root_if_ready(&"alice")
+        .map(crate::engine::ReadyKvRoot::get);
+    // Release and join before asserting: a RED result must not leave the
+    // validation thread blocked behind the test's own pause.
+    release.wait();
+    let published = worker.join().unwrap().unwrap().root();
+    assert_eq!(
+        captured,
+        Some(Some(initial)),
+        "closure validation blocked the root reader"
+    );
+    assert_eq!(published.commit, commit_id);
+    assert_eq!(
+        published.generation,
+        initial.generation.checked_next().unwrap()
+    );
+    assert_eq!(engine.root(&"alice"), Some(published));
 }

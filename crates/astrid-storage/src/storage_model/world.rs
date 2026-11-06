@@ -11,6 +11,8 @@ use super::{
     RootState, StorageNodeId,
 };
 
+mod owned_commit;
+
 #[cfg(test)]
 mod commit_tests;
 
@@ -251,45 +253,6 @@ impl<P: Ord> World<P> {
                 .map(|(id, index)| (id, Arc::new(records[index].1.clone()))),
         );
         Ok(inserted)
-    }
-
-    /// Validate and publish an owned root transaction under one exclusive borrow.
-    ///
-    /// The validated closure cannot change between admission and publication.
-    /// Every fallible check precedes both object and root mutation, so no second
-    /// closure walk is needed to publish the root.
-    pub(crate) fn commit_closure_owned(
-        &mut self,
-        principal: P,
-        expected: Option<RootState>,
-        commit: ObjectId,
-        records: Vec<(ObjectId, ObjectRecord)>,
-    ) -> Result<(RootState, u64), ModelError> {
-        let actual = self.root(&principal);
-        if actual != expected {
-            return Err(ModelError::RootConflict { expected, actual });
-        }
-        let generation = match actual {
-            Some(root) => root
-                .generation
-                .checked_next()
-                .ok_or(ModelError::ArithmeticOverflow)?,
-            None => RootGeneration::INITIAL,
-        };
-        self.validate_transaction_root(&records, commit)?;
-        let mut staged = self.classify_import(&records, commit)?;
-        let inserted = u64::try_from(staged.len()).map_err(|_| ModelError::ArithmeticOverflow)?;
-        // Consume each new identity once; equal resident or in-batch
-        // declarations need no copy. All admission checks have succeeded.
-        self.objects.extend(
-            records
-                .into_iter()
-                .filter(|(id, _)| staged.remove(id).is_some())
-                .map(|(id, record)| (id, Arc::new(record))),
-        );
-        let root = RootState { generation, commit };
-        self.roots.insert(principal, root);
-        Ok((root, inserted))
     }
 
     fn validate_transaction_root(

@@ -414,9 +414,9 @@ impl<P: Ord, I: ObjectIdentity> InMemoryEngine<P, I> {
         if !same_engine {
             self.verify_identities(&records)?;
         }
-        let mut world = self.world.write();
-        let (root, objects_inserted) =
-            world.commit_closure_owned(principal, expected, commit, records)?;
+        let world = self.world.upgradable_read();
+        let (world, root, objects_inserted) =
+            World::commit_closure_owned(world, principal, expected, commit, records)?;
         let retired_projection = if same_engine {
             kv_checkpoint_publication.and_then(|publication| publication.try_publish(root))
         } else {
