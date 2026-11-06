@@ -31,6 +31,7 @@ fn captured_source_capability_moves_and_retires_under_the_same_writer_fence() {
     let mut captured = CapturedDirectory::open(&source).unwrap();
     let identity = captured.identity();
     assert_captured_entries(&captured, &source);
+    captured.validate_legacy_source_tree(&source).unwrap();
     // Do not reopen the directory by path: that is a different native file
     // object, incompatible with the retained DELETE/no-share-delete owner.
     let directory = cap_std::fs::Dir::from_std_file(captured.try_clone_directory_file().unwrap());
@@ -44,6 +45,7 @@ fn captured_source_capability_moves_and_retires_under_the_same_writer_fence() {
     assert!(!source.exists());
     assert_eq!(captured.identity(), identity);
     assert_captured_entries(&captured, &staged);
+    captured.validate_legacy_source_tree(&staged).unwrap();
     assert_eq!(directory.read("payload").unwrap(), b"original source");
     assert_eq!(directory.read("LOCK").unwrap(), b"unchanged lock");
     assert_path_writer_excluded(&staged.join("LOCK"));
@@ -51,6 +53,8 @@ fn captured_source_capability_moves_and_retires_under_the_same_writer_fence() {
     // The former source name is no longer authority for the captured object.
     create_private_directory(&source).unwrap();
     std::fs::write(source.join("sentinel"), b"new source must survive").unwrap();
+    assert!(captured.validate_legacy_source_tree(&source).is_err());
+    captured.validate_legacy_source_tree(&staged).unwrap();
     directory.remove_file("payload").unwrap();
     directory.remove_file("LOCK").unwrap();
     drop(directory);

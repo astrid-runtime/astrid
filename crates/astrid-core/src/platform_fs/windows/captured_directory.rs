@@ -116,6 +116,20 @@ impl CapturedDirectory {
         Ok(unsafe { File::from_raw_handle(duplicate.cast()) })
     }
 
+    /// Validate a legacy tree while retaining this directory's deletion fence.
+    ///
+    /// Reuses the ordinary redirect, ACL, regular-entry and filesystem-boundary
+    /// checks. Path guards reuse this native object only after matching its full
+    /// identity; they never reopen its name with incompatible delete sharing.
+    ///
+    /// # Errors
+    /// Returns an error on replacement, unsafe access, redirects or invalid entries.
+    pub fn validate_legacy_source_tree(&self, path: &Path) -> io::Result<()> {
+        crate::dirs::validate_captured_legacy_source_tree(path, &|entry| {
+            super::path::verify_captured_no_redirects(entry, path, &self.file)
+        })
+    }
+
     /// Return the captured 128-bit directory identity.
     #[must_use]
     pub fn identity(&self) -> DirectoryIdentity {
@@ -219,7 +233,7 @@ fn duplicate_directory_handle(handle: HANDLE) -> io::Result<File> {
     borrowed.try_clone_to_owned().map(File::from)
 }
 
-pub(super) fn query_directory_identity(file: &File) -> io::Result<DirectoryIdentity> {
+pub(super) fn query_directory_identity(file: &impl AsRawHandle) -> io::Result<DirectoryIdentity> {
     let mut info = FILE_ID_INFO::default();
     // SAFETY: `file` owns a live handle and `info` is a valid output buffer.
     let succeeded = unsafe {

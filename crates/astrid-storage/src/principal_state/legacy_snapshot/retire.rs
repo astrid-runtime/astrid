@@ -243,7 +243,11 @@ fn empty_moved_tree(
         .try_clone_directory_file()
         .map_err(snapshot_error)?;
     let capability = PrivateDirectory::from_std_directory_file(clone, stage_path.to_path_buf())?;
-    empty_capability(capability)?;
+    directory
+        .validate_legacy_source_tree(stage_path)
+        .map_err(snapshot_error)?;
+    remove_retirement_contents(&capability)?;
+    drop(capability);
     directory.remove_empty().map_err(snapshot_error)
 }
 
