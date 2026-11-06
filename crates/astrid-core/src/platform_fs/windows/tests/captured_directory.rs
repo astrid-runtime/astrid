@@ -184,3 +184,23 @@ fn removal_confirmation_rejects_non_name_not_found_errors() {
         io::ErrorKind::NotFound
     )));
 }
+
+#[test]
+fn captured_directory_traversal_duplicate_cannot_rename_its_owner() {
+    let _serial = serial_test_guard();
+    let root = private_temp();
+    let directory = root.path().join("source");
+    let moved = root.path().join("moved-through-duplicate");
+    crate::platform_fs::create_private_directory(&directory).unwrap();
+    let captured = CapturedDirectory::open(&directory).unwrap();
+    let duplicate = captured.try_clone_directory_file().unwrap();
+    let parent = TrustedPathGuard::capture(root.path()).unwrap();
+    let error = rename_guarded_handle(&duplicate, &parent, &moved, false)
+        .expect_err("traversal duplicate must not carry the owner's rename authority");
+    assert_eq!(error.raw_os_error(), Some(5));
+    assert!(directory.exists());
+    assert!(!moved.exists());
+    drop(duplicate);
+    captured.remove_empty().unwrap();
+    assert!(!directory.exists());
+}

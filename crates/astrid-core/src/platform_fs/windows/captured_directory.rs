@@ -10,7 +10,7 @@ use super::path::{OwnedHandle, TrustedPathGuard, open_directory_identity_relativ
 use super::prelude::*;
 use crate::platform_fs::DirectoryIdentity;
 use std::os::windows::io::BorrowedHandle;
-use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+use windows_sys::Win32::Foundation::{DuplicateHandle, ERROR_FILE_NOT_FOUND};
 
 /// Windows directory opened with delete access and without delete sharing.
 ///
@@ -81,15 +81,39 @@ impl CapturedDirectory {
 
     /// Duplicate the captured native directory object.
     ///
-    /// The returned file is `DuplicateHandle` of the same object, retaining
-    /// `FILE_LIST_DIRECTORY`. It is not a second pathname open and has no
-    /// pathname authority if ancestors later move.
+    /// The returned file duplicates the same object with only
+    /// `FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE`. It cannot
+    /// rename or delete the captured directory. It is not a second pathname
+    /// open and remains bound to the object if ancestors later move.
     ///
     /// # Errors
     ///
     /// Returns an error if the handle cannot be duplicated.
     pub fn try_clone_directory_file(&self) -> io::Result<File> {
-        self.file.try_clone()
+        let mut duplicate = null_mut();
+        // SAFETY: the source File and current process handles remain live.
+        // The output is a new, non-inheritable handle with traversal rights;
+        // omitting DUPLICATE_SAME_ACCESS excludes the owner's DELETE authority.
+        if unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                self.file.as_raw_handle().cast(),
+                GetCurrentProcess(),
+                &raw mut duplicate,
+                FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                0,
+                0,
+            )
+        } == 0
+        {
+            return Err(with_context(
+                io::Error::last_os_error(),
+                "duplicate captured directory",
+            ));
+        }
+        // SAFETY: successful DuplicateHandle creates one owned handle. No
+        // other owner is constructed for it, and File closes it exactly once.
+        Ok(unsafe { File::from_raw_handle(duplicate.cast()) })
     }
 
     /// Return the captured 128-bit directory identity.
@@ -101,8 +125,8 @@ impl CapturedDirectory {
     /// Move the captured directory into `destination` without replacement.
     ///
     /// The destination parent is captured for the native call and retained
-    /// for the eventual handle-relative removal check. The destination must be a direct child of that parent. The source
-    /// file remains open through return. This does not establish a durable MOVE
+    /// for the eventual handle-relative removal check. The destination must be
+    /// a direct child of that parent. The source file remains open through return. This does not establish a durable MOVE
     /// receipt.
     ///
     /// # Errors
