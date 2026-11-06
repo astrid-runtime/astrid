@@ -134,4 +134,4 @@ pub use principal_state::{
 pub use resident_cache::GovernedObjectCache;
 
 #[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]
-pub use principal_state::with_legacy_kv_snapshot;
+pub use principal_state::{LegacySourceKind, with_legacy_kv_snapshot};

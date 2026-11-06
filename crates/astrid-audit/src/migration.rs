@@ -213,7 +213,7 @@ pub(crate) async fn with_frozen_legacy_source<T>(
     path: &Path,
     operation: impl AsyncFnOnce(KvAuditStorage) -> AuditResult<T>,
 ) -> AuditResult<T> {
-    astrid_storage::with_legacy_kv_snapshot(path, async |store| {
+    astrid_storage::with_legacy_kv_snapshot(path, async |store, _| {
         operation(KvAuditStorage::from_frozen_store(store)).await
     })
     .await

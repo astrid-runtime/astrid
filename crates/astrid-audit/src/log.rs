@@ -326,38 +326,77 @@ impl AuditLog {
             .await
     }
 
-    /// Re-hash canonical source payload bytes immediately before retirement.
+    /// Re-hash canonical source payload bytes without changing the source.
     ///
-    /// This is a MOVE proof, not signature or chain recertify. The kernel calls
-    /// it under the boot singleton so a source mutation between ingest and
-    /// native-tree retirement leaves the source in place and fails closed.
+    /// This proves the digest only during this call. A retiring caller must use
+    /// `with_verified_legacy_source` to retain writer exclusion through
+    /// retirement rather than introduce a check-then-act gap.
     ///
     /// # Errors
     ///
-    /// Returns an error when the source is redirected, cannot be opened, or no
-    /// longer has the digest returned by [`Self::import_legacy_audit`].
+    /// Returns an error when the source is redirected, unreadable, or changed.
     pub async fn verify_legacy_source_digest(
         &self,
         legacy_path: impl AsRef<Path>,
         destination_identity: &str,
         expected_digest: &str,
     ) -> AuditResult<()> {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            self.with_verified_legacy_source(
+                legacy_path,
+                destination_identity,
+                expected_digest,
+                |_| Ok(()),
+            )
+            .await
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = (legacy_path, destination_identity, expected_digest);
+            Err(AuditError::StorageError(
+                "legacy audit disk verification requires a native filesystem".to_owned(),
+            ))
+        }
+    }
+
+    /// Verify a legacy MOVE digest and run retirement under the same source fence.
+    ///
+    /// A locked database retains its original shared LOCK until the synchronous
+    /// operation returns. An empty source has no lock: the operation must use
+    /// atomic empty-directory removal, never recursive deletion. Historical
+    /// signatures and chains are not recertified by this byte-preservation proof.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on source redirection, digest mismatch, operation failure,
+    /// or inability to close the private reader and clean its workspace.
+    #[cfg(not(target_family = "wasm"))]
+    pub async fn with_verified_legacy_source<T>(
+        &self,
+        legacy_path: impl AsRef<Path>,
+        destination_identity: &str,
+        expected_digest: &str,
+        operation: impl FnOnce(astrid_storage::LegacySourceKind) -> AuditResult<T>,
+    ) -> AuditResult<T> {
         let legacy_path = legacy_path.as_ref();
         if !validate_legacy_source_path(legacy_path)? {
             return Err(AuditError::StorageError(
                 "legacy audit source disappeared before retirement".to_owned(),
             ));
         }
-        let receipt = migration::with_frozen_legacy_source(legacy_path, async |source| {
-            digest_legacy_source(&source, destination_identity).await
+        astrid_storage::with_legacy_kv_snapshot(legacy_path, async |store, kind| {
+            let source = KvAuditStorage::from_frozen_store(store);
+            let receipt = digest_legacy_source(&source, destination_identity).await?;
+            if receipt.source_digest != expected_digest {
+                return Err(AuditError::StorageError(
+                    "legacy audit source changed before retirement".to_owned(),
+                ));
+            }
+            operation(kind)
         })
-        .await?;
-        if receipt.source_digest != expected_digest {
-            return Err(AuditError::StorageError(
-                "legacy audit source changed before retirement".to_owned(),
-            ));
-        }
-        Ok(())
+        .await
+        .map_err(|error| AuditError::StorageError(error.to_string()))?
     }
 
     fn ensure_migration_capacity(&self, source: &LegacyAuditReceipt) -> AuditResult<()> {

@@ -8,7 +8,7 @@ async fn reader() -> (SnapshotReader, Arc<SnapshotStore>, std::path::PathBuf) {
     let store = Arc::new(SnapshotStore::new(store));
     let reader = SnapshotReader {
         store: Some(Arc::clone(&store)),
-        workspace: Some(SnapshotWorkspace(Some(workspace))),
+        workspace: Some(SnapshotWorkspace(Some(workspace.keep()))),
     };
     (reader, store, path)
 }
@@ -51,7 +51,7 @@ async fn cancellation_closes_reader_and_removes_only_owned_workspace() {
 fn unavailable_cleanup_runtime_retains_workspace_instead_of_unlinking() {
     let workspace = tempfile::tempdir().unwrap();
     let path = workspace.path().to_path_buf();
-    drop(SnapshotWorkspace(Some(workspace)));
+    drop(SnapshotWorkspace(Some(workspace.keep())));
     assert!(path.is_dir());
     std::fs::remove_dir(path).unwrap();
 }
@@ -66,7 +66,7 @@ async fn operation_error_still_closes_escaped_snapshot_handle() {
         .await
         .unwrap();
     original.close().await.unwrap();
-    let result = with_legacy_kv_snapshot(&source, async |store| {
+    let result = with_legacy_kv_snapshot(&source, async |store, _| {
         assert_eq!(
             store.get("test", "key").await.unwrap().unwrap(),
             b"original"
@@ -95,7 +95,7 @@ async fn live_source_writer_is_refused_without_touching_lock() {
         .unwrap();
     let lock = directory.path().join("LOCK");
     let before = std::fs::read(&lock).unwrap();
-    let result = with_legacy_kv_snapshot(directory.path(), async |_| {
+    let result = with_legacy_kv_snapshot(directory.path(), async |_, _| {
         panic!("must not invoke operation while source writer holds LOCK");
     })
     .await;
@@ -117,7 +117,7 @@ async fn source_writer_excluded_through_operation_without_rewriting_lock() {
     let lock = directory.path().join("LOCK");
     let before = std::fs::read(&lock).unwrap();
     let permissions = std::fs::metadata(&lock).unwrap().permissions();
-    with_legacy_kv_snapshot(directory.path(), async |store| {
+    with_legacy_kv_snapshot(directory.path(), async |store, _| {
         assert_eq!(
             store.get("test", "key").await.unwrap().unwrap(),
             b"original"
@@ -147,7 +147,7 @@ async fn source_writer_excluded_through_operation_without_rewriting_lock() {
 #[tokio::test]
 async fn empty_source_stays_empty_and_nonempty_without_lock_is_refused() {
     let directory = tempfile::tempdir().unwrap();
-    with_legacy_kv_snapshot(directory.path(), async |store| {
+    with_legacy_kv_snapshot(directory.path(), async |store, _| {
         assert!(store.list_keys("test").await.unwrap().is_empty());
     })
     .await
@@ -159,7 +159,7 @@ async fn empty_source_stays_empty_and_nonempty_without_lock_is_refused() {
             .is_none()
     );
     std::fs::write(directory.path().join("unrecognized"), b"source").unwrap();
-    let result = with_legacy_kv_snapshot(directory.path(), async |_| {
+    let result = with_legacy_kv_snapshot(directory.path(), async |_, _| {
         panic!("a nonempty source must have its original LOCK");
     })
     .await;
@@ -171,7 +171,7 @@ async fn empty_source_stays_empty_and_nonempty_without_lock_is_refused() {
 async fn directory_lock_is_refused_without_entering_operation() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::create_dir(directory.path().join("LOCK")).unwrap();
-    let result = with_legacy_kv_snapshot(directory.path(), async |_| {
+    let result = with_legacy_kv_snapshot(directory.path(), async |_, _| {
         panic!("directory LOCK must be refused");
     })
     .await;
@@ -185,7 +185,7 @@ async fn redirected_lock_is_refused_without_touching_target() {
     let target = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(target.path(), b"untouched").unwrap();
     std::os::unix::fs::symlink(target.path(), directory.path().join("LOCK")).unwrap();
-    let result = with_legacy_kv_snapshot(directory.path(), async |_| {
+    let result = with_legacy_kv_snapshot(directory.path(), async |_, _| {
         panic!("redirected LOCK must be refused");
     })
     .await;

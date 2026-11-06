@@ -785,6 +785,18 @@ pub(in crate::platform_fs) fn ensure_private_directory(path: &Path) -> io::Resul
     guard.create_private_descendants(path)
 }
 
+pub(in crate::platform_fs) fn create_private_directory(path: &Path) -> io::Result<()> {
+    validate_local_absolute_path(path)?;
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private directory has no parent",
+        )
+    })?;
+    let guard = TrustedPathGuard::capture(parent)?;
+    guard.create_private_descendants(path)
+}
+
 pub(in crate::platform_fs) fn restrict_private_file(path: &Path) -> io::Result<()> {
     validate_local_absolute_path(path)?;
     let parent = path

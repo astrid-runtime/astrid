@@ -14,7 +14,7 @@ crash-replay = []
 # Deprecated compatibility alias. KV is always backed by the native object
 # store; this remains only so existing downstream feature selections compile.
 kv = []
-legacy-surrealkv = ["dep:surrealkv", "dep:tempfile"]
+legacy-surrealkv = ["dep:surrealkv"]
 keychain = ["dep:keyring"]
 full = ["kv", "legacy-surrealkv"]
 
@@ -65,7 +65,6 @@ harness = false
 getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-tempfile = { workspace = true, optional = true }
 cap-std = "4.0.3"
 same-file = "1.0.6"
 caseless = { workspace = true }

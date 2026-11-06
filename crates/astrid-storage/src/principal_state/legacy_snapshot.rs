@@ -9,13 +9,32 @@ use crate::{KvStore, StorageError, StorageResult, SurrealKvStore};
 mod store;
 use store::SnapshotStore;
 
+/// Original-source protection retained during a snapshot operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LegacySourceKind {
+    /// No files existed at capture; retirement must use atomic empty removal.
+    EmptyDirectory,
+    /// A shared original LOCK excludes cooperative legacy writers.
+    LockedDatabase,
+}
+
 // Even an aborted cleanup future must retain files until closure is proven.
-struct SnapshotWorkspace(Option<tempfile::TempDir>);
+struct SnapshotWorkspace(Option<std::path::PathBuf>);
 
 impl SnapshotWorkspace {
+    fn create() -> StorageResult<Self> {
+        let path =
+            std::env::temp_dir().join(format!("astrid-legacy-snapshot-{}", uuid::Uuid::new_v4()));
+        // The platform primitive creates exclusively with private access at
+        // namespace creation. An existing name is never adopted or removed.
+        astrid_core::platform_fs::create_private_directory(&path).map_err(snapshot_error)?;
+        Ok(Self(Some(path)))
+    }
+
     fn remove(mut self) -> StorageResult<()> {
-        if let Some(workspace) = self.0.take() {
-            workspace.close().map_err(snapshot_error)?;
+        if let Some(path) = self.0.as_ref() {
+            astrid_core::dirs::retire_legacy_source_tree(path).map_err(snapshot_error)?;
+            self.0 = None;
         }
         Ok(())
     }
@@ -23,8 +42,7 @@ impl SnapshotWorkspace {
 
 impl Drop for SnapshotWorkspace {
     fn drop(&mut self) {
-        if let Some(workspace) = self.0.take() {
-            let retained = workspace.keep();
+        if let Some(retained) = self.0.as_ref() {
             tracing::warn!(path = %retained.display(), "retain unclosed legacy snapshot");
         }
     }
@@ -52,9 +70,12 @@ impl SnapshotReader {
                 return Err(error);
             }
             drop(store);
-            workspace.remove().inspect_err(|error| {
-                tracing::error!(%error, "remove closed legacy snapshot");
-            })
+            tokio::task::spawn_blocking(move || workspace.remove())
+                .await
+                .map_err(snapshot_error)?
+                .inspect_err(|error| {
+                    tracing::error!(%error, "remove closed legacy snapshot");
+                })
         })))
     }
 
@@ -95,28 +116,60 @@ impl Drop for SnapshotReader {
 /// The original source is never opened by the legacy engine or removed here.
 pub async fn with_legacy_kv_snapshot<T>(
     source: &Path,
-    operation: impl AsyncFnOnce(Arc<dyn KvStore>) -> T,
+    operation: impl AsyncFnOnce(Arc<dyn KvStore>, LegacySourceKind) -> T,
 ) -> StorageResult<T> {
-    let source = PrivateDirectory::open(source)?;
-    let _source_lock = lock_source(&source)?;
-    let workspace = tempfile::Builder::new()
-        .prefix("astrid-legacy-snapshot-")
-        .tempdir()
-        .map_err(snapshot_error)?;
-    astrid_core::platform_fs::ensure_private_directory(workspace.path()).map_err(snapshot_error)?;
-    let path = workspace.path().join("database");
-    astrid_core::platform_fs::ensure_private_directory(&path).map_err(snapshot_error)?;
-    let destination = PrivateDirectory::open(&path)?;
-    super::migrations::copy_legacy_tree(&source, &destination)?;
-    drop(destination);
-    let store = Arc::new(SnapshotStore::new(SurrealKvStore::open(&path)?));
-    let mut reader = SnapshotReader {
-        store: Some(Arc::clone(&store)),
-        workspace: Some(SnapshotWorkspace(Some(workspace))),
+    let source = source.to_path_buf();
+    // Copying, fsync, and upstream format conversion perform blocking I/O.
+    // Keep them off the async worker while retaining the source lock in the
+    // returned owner through the operation and proven reader shutdown.
+    let (mut reader, store, source_lock) =
+        tokio::task::spawn_blocking(move || prepare_snapshot(&source))
+            .await
+            .map_err(snapshot_error)??;
+    let kind = if source_lock.is_some() {
+        LegacySourceKind::LockedDatabase
+    } else {
+        LegacySourceKind::EmptyDirectory
     };
-    let result = operation(store).await;
+    let result = operation(store, kind).await;
     reader.close().await?;
+    drop(source_lock);
     Ok(result)
+}
+
+fn prepare_snapshot(
+    source: &Path,
+) -> StorageResult<(SnapshotReader, Arc<SnapshotStore>, Option<std::fs::File>)> {
+    let source = PrivateDirectory::open(source)?;
+    let source_lock = lock_source(&source)?;
+    let workspace = SnapshotWorkspace::create()?;
+    let copy = (|| {
+        let path = workspace
+            .0
+            .as_ref()
+            .ok_or_else(|| snapshot_error("missing workspace"))?
+            .join("database");
+        astrid_core::platform_fs::ensure_private_directory(&path).map_err(snapshot_error)?;
+        let destination = PrivateDirectory::open(&path)?;
+        super::migrations::copy_legacy_tree(&source, &destination)?;
+        drop(destination);
+        Ok::<_, StorageError>(path)
+    })();
+    let path = match copy {
+        Ok(path) => path,
+        Err(error) => {
+            // No engine was opened: a failed copy has no worker lifetime to
+            // retain. Remove only this exclusively created private workspace.
+            workspace.remove()?;
+            return Err(error);
+        },
+    };
+    let store = Arc::new(SnapshotStore::new(SurrealKvStore::open(&path)?));
+    let reader = SnapshotReader {
+        store: Some(Arc::clone(&store)),
+        workspace: Some(workspace),
+    };
+    Ok((reader, store, source_lock))
 }
 
 fn lock_source(source: &PrivateDirectory) -> StorageResult<Option<std::fs::File>> {

@@ -54,3 +54,17 @@ fn handle_relative_mutation_fails_closed_or_stays_bound_during_ancestor_move() {
         "ancestor move must preserve exactly one authority-bound copy: {outcomes:?}"
     );
 }
+
+#[test]
+fn exclusive_private_directory_is_exact_at_creation_and_refuses_reuse() {
+    let root = private_temp();
+    let path = root.path().join("exclusive-private");
+    crate::platform_fs::create_private_directory(&path).unwrap();
+    crate::platform_fs::validate_private_directory(&path).unwrap();
+    assert_eq!(
+        crate::platform_fs::create_private_directory(&path)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+}

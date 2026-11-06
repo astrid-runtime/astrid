@@ -137,6 +137,43 @@ pub fn ensure_private_directory(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Exclusively create one private directory beneath an existing trusted parent.
+///
+/// Unlike [`ensure_private_directory`], this never adopts an existing name.
+/// Windows installs the protected private DACL at namespace creation; callers
+/// must not first create an inheriting directory with a generic temp API.
+///
+/// # Errors
+///
+/// Returns an error if the name exists, its parent is missing or redirected,
+/// or the platform cannot create and validate the private directory.
+pub fn create_private_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use nix::sys::stat::{Mode, mkdirat};
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private directory has no parent",
+            )
+        })?;
+        let name = path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "private directory has no name")
+        })?;
+        let directory = open_directory_no_follow_unix(parent)?;
+        mkdirat(&directory, name, Mode::from_bits_truncate(0o700)).map_err(nix_io_error)?;
+        ensure_private_directory_unix(path)
+    }
+    #[cfg(windows)]
+    {
+        windows::create_private_directory(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        std::fs::create_dir(path)
+    }
+}
+
 /// Make `path` and every nested real directory owner-only.
 ///
 /// Layout-1 leftovers often have `0755` children (COW slots, unpacked homes).

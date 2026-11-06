@@ -1,8 +1,10 @@
-//! Layout-1 handling of non-default `.local/audit` leftovers.
+//! Layout-1 audit import, verified retirement, and non-default leftovers.
 //!
 //! 0.10.4 created empty audit directories for every principal. Only `default`
 //! has an importer. Empty non-default trees are retired; non-empty ones are
 //! quarantined with their bytes preserved.
+
+use super::{Arc, AuditLog, preflight_legacy_audit_sources, retire_legacy_audit_dir};
 
 use std::fs;
 use std::io;
@@ -88,3 +90,59 @@ fn unique_destination(root: &Path, name: &str) -> io::Result<PathBuf> {
         "exhausted unique names for quarantined legacy audit tree",
     ))
 }
+
+pub(super) async fn migrate_legacy_audit(
+    home: &AstridHome,
+    audit: &Arc<AuditLog>,
+) -> io::Result<()> {
+    let default_audit = home.principal_home(&PrincipalId::default()).audit_dir();
+    let source_present = preflight_legacy_audit_sources(home, &default_audit)?;
+    if !source_present {
+        return Ok(());
+    }
+    let import_report = audit
+        .import_legacy_audit(&default_audit, "astrid-system-audit-v1")
+        .await
+        .map_err(|error| io::Error::other(format!("legacy audit migration failed: {error}")))?;
+    match fs::symlink_metadata(&default_audit) {
+        Ok(_) => {
+            preflight_legacy_audit_sources(home, &default_audit)?;
+            audit
+                .with_verified_legacy_source(
+                    &default_audit,
+                    "astrid-system-audit-v1",
+                    &import_report.source_digest,
+                    |kind| {
+                        let result = match kind {
+                            astrid_storage::LegacySourceKind::EmptyDirectory => {
+                                // remove_dir atomically refuses a newly nonempty source.
+                                retire_empty_directory(&default_audit)
+                            },
+                            astrid_storage::LegacySourceKind::LockedDatabase => {
+                                retire_legacy_audit_dir(home, &default_audit)
+                            },
+                        };
+                        result.map_err(|error| {
+                            astrid_audit::AuditError::StorageError(error.to_string())
+                        })
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    io::Error::other(format!(
+                        "legacy audit source verification or retirement failed: {error}"
+                    ))
+                })?;
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound && source_present => {
+            return Err(io::Error::other(
+                "legacy audit source disappeared before digest-bound retirement",
+            ));
+        },
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;
