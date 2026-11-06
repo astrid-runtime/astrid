@@ -3,32 +3,6 @@ use crate::volume::{AstridVolume, HostedFileVolume};
 use std::sync::Arc;
 
 #[test]
-fn active_closure_recovery_still_rejects_invalid_identity_and_domain() {
-    use crate::storage_model::{
-        PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode, PhysicalMapNodeId,
-    };
-    use std::collections::BTreeMap;
-
-    let id = PhysicalMapNodeId::new([7; 32]);
-    let node = PhysicalMapNode::Page {
-        domain: PhysicalMapDomain::Profile,
-        entries: vec![(PhysicalMapKey::new([8; 32]), vec![9])],
-    };
-    let valid_id = node.identify(&super::Blake3PhysicalIdentity).unwrap();
-    for (domain, stored_id) in [
-        (PhysicalMapDomain::Profile, id),
-        (PhysicalMapDomain::Placement, valid_id),
-    ] {
-        let mut arena = BTreeMap::from([(stored_id, node.clone())]);
-        assert!(super::recover_active_map(domain, Some(stored_id), &mut arena).is_err());
-    }
-    assert!(
-        super::recover_active_map(PhysicalMapDomain::Profile, Some(id), &mut BTreeMap::new(),)
-            .is_err()
-    );
-}
-
-#[test]
 fn published_updates_bound_resident_history_and_recover_every_entry() {
     let directory = tempfile::tempdir().unwrap();
     let volume: Arc<dyn AstridVolume> =
@@ -253,38 +227,6 @@ fn unpublished_append_is_not_authority_and_equal_retry_survives_reopen() {
     assert_eq!(reopened.active, published);
     assert_ne!(published, active);
     assert!(reopened.contains_direct(object));
-}
-
-#[test]
-fn shared_arena_second_map_does_not_accept_a_stolen_node() {
-    use crate::storage_model::{PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode};
-    use std::collections::BTreeMap;
-
-    let node = PhysicalMapNode::Page {
-        domain: PhysicalMapDomain::Profile,
-        entries: vec![(PhysicalMapKey::new([8; 32]), vec![9])],
-    };
-    let id = node.identify(&super::Blake3PhysicalIdentity).unwrap();
-    let mut arena = BTreeMap::from([(id, node)]);
-    let recovered =
-        super::recover_active_map(PhysicalMapDomain::Profile, Some(id), &mut arena).unwrap();
-    assert_eq!(recovered.root(), Some(id));
-    assert!(
-        arena.is_empty(),
-        "first recover must consume the shared node"
-    );
-    let error = super::recover_active_map(PhysicalMapDomain::Representation, Some(id), &mut arena)
-        .unwrap_err();
-    match error {
-        super::DurableError::InvalidRepresentationState(detail) => {
-            assert_eq!(detail, "active physical map closure is incomplete");
-        },
-        other => panic!("expected incomplete closure, got {other:?}"),
-    }
-    assert!(
-        arena.is_empty(),
-        "leftover arena must not become the second map"
-    );
 }
 
 #[test]

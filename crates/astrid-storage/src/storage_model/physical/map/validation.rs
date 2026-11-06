@@ -11,7 +11,7 @@ use super::{
 };
 
 /// Canonical construction can retain nodes or only check and discard them.
-/// The validation sink borrows the authenticated graph; it owns no second arena.
+/// The validation sink borrows the input graph; it owns no second arena.
 pub(super) trait CanonicalNodeSink {
     fn put(
         &mut self,
@@ -67,9 +67,6 @@ pub(super) fn validate_root<I: PhysicalIdentity>(
         if node.domain() != domain {
             return Err(PhysicalModelError::InvalidMap("map domain mismatch"));
         }
-        if node.identify(identity)? != node_id {
-            return Err(PhysicalModelError::InvalidMap("map-node identity mismatch"));
-        }
         match node {
             PhysicalMapNode::Leaf { key, value, .. } => entries.push((*key, value.as_slice())),
             PhysicalMapNode::Branch { zero, one, .. } => {
@@ -100,10 +97,11 @@ pub(super) fn validate_root<I: PhysicalIdentity>(
     Ok(count)
 }
 
-/// Canonical builders need child identities, not retained child bodies. Probe
-/// the authenticated input for collision checks; discard each newly hashed
-/// body immediately. Both legacy and radix wire construction remain shared
-/// with ordinary map creation instead of introducing a second shape oracle.
+/// Each production-built node is hashed, then must exist under that identity
+/// with the exact same body in the untrusted input. Root equality therefore
+/// binds its complete canonical closure without hashing the input graph twice.
+/// Missing canonical nodes and unequal colliding bodies both fail closed. The
+/// builders remain shared with ordinary creation, not a second shape oracle.
 struct ValidationNodes<'a>(&'a BTreeMap<PhysicalMapNodeId, PhysicalMapNode>);
 
 impl CanonicalNodeSink for ValidationNodes<'_> {
@@ -112,12 +110,13 @@ impl CanonicalNodeSink for ValidationNodes<'_> {
         id: PhysicalMapNodeId,
         node: PhysicalMapNode,
     ) -> Result<(), PhysicalModelError> {
-        if self.0.get(&id).is_some_and(|existing| existing != &node) {
-            return Err(PhysicalModelError::InvalidMap(
+        match self.0.get(&id) {
+            Some(existing) if existing == &node => Ok(()),
+            Some(_) => Err(PhysicalModelError::InvalidMap(
                 "physical map-node identity collision",
-            ));
+            )),
+            None => Err(PhysicalModelError::InvalidMap("missing canonical map node")),
         }
-        Ok(())
     }
 }
 

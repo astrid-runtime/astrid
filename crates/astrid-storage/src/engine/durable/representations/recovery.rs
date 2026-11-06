@@ -15,6 +15,7 @@ use crate::storage_model::{
     RepresentationStateId,
 };
 
+use super::super::format::{read_frame_at, scan_frames_with_source};
 use super::super::{FRAME_HEADER_LEN, scan_frames};
 use super::format::{
     Blake3PhysicalIdentity, CURRENT_FILE, CURRENT_MAGIC, CurrentPointer, JOURNAL_FILE,
@@ -25,79 +26,36 @@ use super::{
     DurableError, FIRST_JOURNAL_GENERATION, RecoveryLimits, increment, io_error, read_all,
 };
 
-#[derive(Default)]
-pub(super) struct MetadataIndex {
-    values: BTreeMap<(MetadataKind, [u8; 32]), Vec<u8>>,
-    pub(super) nodes: BTreeMap<crate::storage_model::PhysicalMapNodeId, PhysicalMapNode>,
-}
+mod index;
+use index::HistoricalMapClosure;
+pub(super) use index::MetadataIndex;
 
-impl MetadataIndex {
-    fn insert(&mut self, frame: MetadataFrame) -> Result<(), DurableError> {
-        if frame.kind == MetadataKind::MapNode {
-            // Decode and authenticate once, then keep that sole owned value.
-            // Retaining its encoded payload as well duplicates every historical
-            // node until journal validation and active-closure recovery finish.
-            let node = PhysicalMapNode::decode(&frame.value)?;
-            let id = node.identify(&Blake3PhysicalIdentity)?;
-            if id != map_node_id(frame.identity) {
-                return Err(DurableError::InvalidRepresentationState(
-                    "metadata identity does not match canonical value",
-                ));
-            }
-            if let Some(existing) = self.nodes.get(&id) {
-                if existing != &node {
-                    return Err(DurableError::InvalidRepresentationState(
-                        "physical metadata identity collision",
-                    ));
-                }
-            } else {
-                self.nodes.insert(id, node);
-            }
-            return Ok(());
-        }
-        frame.verify(&Blake3PhysicalIdentity)?;
-        let key = (frame.kind, frame.identity);
-        if let Some(existing) = self.values.get(&key) {
-            if existing != &frame.value {
-                return Err(DurableError::InvalidRepresentationState(
-                    "physical metadata identity collision",
-                ));
-            }
-            return Ok(());
-        }
-        self.values.insert(key, frame.value);
-        Ok(())
-    }
-
-    pub(super) fn value(
-        &self,
-        kind: MetadataKind,
-        identity: &[u8; 32],
-    ) -> Result<&[u8], DurableError> {
-        self.values
-            .get(&(kind, *identity))
-            .map(Vec::as_slice)
-            .ok_or(DurableError::InvalidRepresentationState(
-                "physical metadata closure is incomplete",
-            ))
-    }
-}
-
+#[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all,
+    fields(map_nodes = tracing::field::Empty, authority_records = tracing::field::Empty))]
 pub(super) fn recover_metadata<F: DurableIo>(
     file: &mut F,
     limits: RecoveryLimits,
 ) -> Result<MetadataIndex, DurableError> {
     let mut index = MetadataIndex::default();
-    scan_frames(
+    scan_frames_with_source(
         file,
         METADATA_FILE,
         METADATA_MAGIC,
         limits,
-        |_offset, payload| index.insert(MetadataFrame::decode(payload)?),
+        |offset, payload, load_previous| {
+            index.insert_at(offset, MetadataFrame::decode(payload)?, load_previous)
+        },
     )?;
+    if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {
+        tracing::Span::current().record("map_nodes", index.nodes.len());
+        tracing::Span::current().record("authority_records", index.values.len());
+    }
     Ok(index)
 }
 
+#[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all,
+    fields(journal_frames = tracing::field::Empty, journal_bytes = tracing::field::Empty,
+        complete_map_nodes = tracing::field::Empty))]
 pub(super) fn recover_journal<F: DurableIo>(
     file: &mut F,
     current: CurrentPointer,
@@ -131,7 +89,12 @@ pub(super) fn recover_journal<F: DurableIo>(
     let first = entries.first().map(|(_, entry)| *entry).ok_or(
         DurableError::InvalidRepresentationState("representation journal is empty"),
     )?;
-    let (mut active, mut generation) = recover_checkpoint(first, current, metadata)?;
+    // Metadata is immutable for this replay. Only successfully checked closures
+    // may be reused across historical states, including the checkpoint active
+    // state; CAS and generation checks still run.
+    let mut complete_maps = metadata.nodes.closure_checker();
+    let (mut active, mut generation) =
+        recover_checkpoint(first, current, metadata, &mut complete_maps)?;
     validate_tail_budget(entries.len(), bytes.len(), checkpoint_end, current)?;
     let mut previous_state = active
         .map(|id| {
@@ -139,10 +102,11 @@ pub(super) fn recover_journal<F: DurableIo>(
                 .map_err(DurableError::from)
         })
         .transpose()?;
-    // Metadata is immutable for this replay. Only successfully checked closures
-    // may be reused across historical states; CAS and generation checks still run.
-    let mut complete_maps = BTreeSet::new();
     let entry_count = entries.len();
+    if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {
+        tracing::Span::current().record("journal_frames", entry_count);
+        tracing::Span::current().record("journal_bytes", bytes.len());
+    }
     for (position, (offset, entry)) in entries.into_iter().enumerate().skip(1) {
         let JournalEntry::StateCas {
             journal_generation,
@@ -189,6 +153,9 @@ pub(super) fn recover_journal<F: DurableIo>(
     ))?;
     let state =
         RepresentationState::decode(metadata.value(MetadataKind::State, active.as_bytes())?)?;
+    if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {
+        tracing::Span::current().record("complete_map_nodes", complete_maps.len());
+    }
     Ok((active, state))
 }
 
@@ -196,6 +163,7 @@ fn recover_checkpoint(
     first: JournalEntry,
     current: CurrentPointer,
     metadata: &MetadataIndex,
+    complete: &mut HistoricalMapClosure<'_>,
 ) -> Result<(Option<RepresentationStateId>, u64), DurableError> {
     match first {
         JournalEntry::Checkpoint {
@@ -219,7 +187,7 @@ fn recover_checkpoint(
         } if journal_generation == current.journal_generation
             && journal_generation > FIRST_JOURNAL_GENERATION =>
         {
-            if !state_metadata_closure_complete(active, metadata, &mut BTreeSet::new())? {
+            if !state_metadata_closure_complete(active, metadata, complete)? {
                 return Err(DurableError::InvalidRepresentationState(
                     "representation checkpoint has an incomplete metadata closure",
                 ));
@@ -243,7 +211,7 @@ fn recover_checkpoint(
 fn state_metadata_closure_complete(
     state_id: RepresentationStateId,
     metadata: &MetadataIndex,
-    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    complete: &mut HistoricalMapClosure<'_>,
 ) -> Result<bool, DurableError> {
     let Some(state_bytes) = metadata
         .values
@@ -271,41 +239,11 @@ fn state_metadata_closure_complete(
         catalogue.representations_root(),
         placements.entries_root(),
     ] {
-        if !map_closure_complete(root, &metadata.nodes, complete) {
+        if !complete.complete(root) {
             return Ok(false);
         }
     }
     Ok(true)
-}
-
-fn map_closure_complete(
-    root: Option<crate::storage_model::PhysicalMapNodeId>,
-    nodes: &BTreeMap<crate::storage_model::PhysicalMapNodeId, PhysicalMapNode>,
-    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
-) -> bool {
-    let Some(root) = root else {
-        return true;
-    };
-    let mut pending = vec![root];
-    let mut visited = BTreeSet::new();
-    while let Some(id) = pending.pop() {
-        if complete.contains(&id) || !visited.insert(id) {
-            continue;
-        }
-        let Some(node) = nodes.get(&id) else {
-            return false;
-        };
-        match node {
-            PhysicalMapNode::Branch { zero, one, .. } => pending.extend([*zero, *one]),
-            PhysicalMapNode::Radix { children, .. } => {
-                pending.extend(children.iter().copied());
-            },
-            PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => {},
-        }
-    }
-    // Never remember a partial traversal that encountered a missing descendant.
-    complete.extend(visited);
-    true
 }
 
 fn truncate_repairable_journal_tail<F: DurableIo>(
