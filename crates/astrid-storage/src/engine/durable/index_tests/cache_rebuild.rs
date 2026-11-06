@@ -162,6 +162,37 @@ fn assert_single_snapshot(engine: &TestEngine) {
 }
 
 #[test]
+fn volume_flush_reports_checkpoint_failure_and_recovers_staged_objects() {
+    let fixture = Fixture::new(true);
+    let faults = Arc::new(TripPublication::default());
+    let engine = fixture.open(Arc::clone(&faults));
+    let (root, mut known) = seed(&engine);
+    let next = record(32);
+    let outcomes = engine.stage_objects(vec![next.clone()]).unwrap();
+    known.push((outcomes[0].0, next));
+    faults.0.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        engine.flush(),
+        Err(DurableError::FaultInjected(
+            FaultPoint::BeforeIndexCachePublication
+        ))
+    ));
+    assert!(
+        engine.inner.lock().poisoned,
+        "failed flush must require recovery"
+    );
+    // Authority was flushed before checkpoint publication. Freeze that boundary
+    // before either live recovery or close can rebuild the disposable cache.
+    let persisted = fixture.capture_persisted();
+    exact_readback(&engine, root, &known);
+    engine.flush().unwrap();
+    engine.close().unwrap();
+    let recovered = persisted.open(faults);
+    exact_readback(&recovered, root, &known);
+    recovered.close().unwrap();
+}
+
+#[test]
 fn live_empty_cache_rebuilds_one_snapshot_and_preserves_history() {
     for volume_backed in [false, true] {
         let fixture = Fixture::new(volume_backed);

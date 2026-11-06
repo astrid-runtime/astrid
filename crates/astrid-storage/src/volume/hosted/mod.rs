@@ -16,9 +16,11 @@ use parking_lot::Mutex;
 
 use super::{AstridVolume, MAX_REGION_NAME_BYTES, VolumeMetadataMutation, VolumeRegion};
 
+mod extent_index;
 mod open;
 mod reclaim;
 mod recover;
+mod region_io;
 mod stream;
 
 const VOLUME_MAGIC: [u8; 8] = *b"ASTVOL1\0";
@@ -34,17 +36,32 @@ struct Extent {
     physical_offset: u64,
 }
 
+struct AppendedRecord {
+    payload_offset: u64,
+    payload_len: u64,
+    checksum: [u8; 32],
+}
+
 #[cfg(test)]
 thread_local! {
     static REGION_STATE_CLONES: Cell<usize> = const { Cell::new(0) };
     static EXTENT_VISITS: Cell<usize> = const { Cell::new(0) };
     static MUTATION_EXTENT_VISITS: Cell<usize> = const { Cell::new(0) };
+    static PREPARE_TRUNCATE_COUNT: Cell<usize> = const { Cell::new(0) };
+    static FAIL_PREPARE_TRUNCATE: Cell<bool> = const { Cell::new(false) };
+    static FAIL_ROLLBACK_TRUNCATE: Cell<bool> = const { Cell::new(false) };
+    static REMAINING_APPEND_WRITES: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 #[derive(Debug, Default)]
 struct RegionState {
     length: u64,
+    // Legacy namespaces retain their map here until conversion. Paged
+    // namespaces retain only writes since their last bounded checkpoint.
     extents: BTreeMap<u64, Extent>,
+    root: Option<extent_index::reference::PageRef>,
+    // A truncate permanently clips the old base, even after logical regrowth.
+    base_limit: u64,
 }
 
 impl Clone for RegionState {
@@ -54,6 +71,8 @@ impl Clone for RegionState {
         Self {
             length: self.length,
             extents: self.extents.clone(),
+            root: self.root,
+            base_limit: self.base_limit,
         }
     }
 }
@@ -64,6 +83,14 @@ enum FlushState {
     Confirmed,
 }
 
+/// Process-local proof that the owned handle's physical end matches `valid_len`.
+/// Independent of `footer_pending`, `flush_state` and durability acknowledgements.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PhysicalTail {
+    Exact,
+    MayExceed,
+}
+
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestoreState {
@@ -71,8 +98,23 @@ enum RestoreState {
     Required,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum CheckpointFormat {
+    #[default]
+    Legacy,
+    Paged,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IndexCheckpoint {
+    NotPrepared,
+    Prepared,
+}
+
 #[derive(Debug)]
 struct ContainerState {
+    checkpoint_format: CheckpointFormat,
+    index_checkpoint: IndexCheckpoint,
     file: File,
     sequence: u64,
     valid_len: u64,
@@ -81,6 +123,9 @@ struct ContainerState {
     last_snapshot_end: u64,
     boundary_pending: bool,
     footer_pending: bool,
+    // Process-local proof that physical length may exceed valid_len (footer or
+    // uncertain mutation). Never derived from per-append metadata queries.
+    physical_tail: PhysicalTail,
     // Process-local proof only: set after a successful full flush, cleared
     // before any file mutation. A recovered footer is not this proof.
     flush_state: FlushState,
@@ -114,6 +159,78 @@ impl HostedFileVolume {
         offset: u64,
         payload: &[u8],
     ) -> io::Result<(u64, u64)> {
+        let record = Self::append_record(state, operation, region, offset, payload)?;
+        Ok((record.payload_offset, record.payload_len))
+    }
+
+    /// Clear flush proof, ensure the previous physical tail is discarded when
+    /// needed, seek to `valid_len`, then mark `MayExceed` before any record write.
+    fn prepare_append(state: &mut ContainerState) -> io::Result<()> {
+        state.flush_state = FlushState::Required;
+        state.footer_pending = true;
+        if state.physical_tail == PhysicalTail::MayExceed {
+            #[cfg(test)]
+            {
+                PREPARE_TRUNCATE_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+                if FAIL_PREPARE_TRUNCATE.with(Cell::get) {
+                    FAIL_PREPARE_TRUNCATE.with(|flag| flag.set(false));
+                    return Err(io::Error::other("injected prepare truncate failure"));
+                }
+            }
+            state.file.set_len(state.valid_len)?;
+            state.physical_tail = PhysicalTail::Exact;
+        }
+        state.file.seek(SeekFrom::Start(state.valid_len))?;
+        // Any caller after this may write; keep the physical end uncertain until
+        // the record fully publishes and advances valid_len.
+        state.physical_tail = PhysicalTail::MayExceed;
+        Ok(())
+    }
+
+    fn write_append_bytes(file: &mut File, bytes: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            let fail = REMAINING_APPEND_WRITES.with(|cell| {
+                let Some(remaining) = cell.get() else {
+                    return false;
+                };
+                if remaining == 0 {
+                    true
+                } else {
+                    cell.set(Some(remaining.saturating_sub(1)));
+                    false
+                }
+            });
+            if fail {
+                // Leave a real physical tail beyond valid_len for retry coverage.
+                let prefix = bytes.len().min(8);
+                if prefix != 0 {
+                    file.write_all(&bytes[..prefix])?;
+                }
+                return Err(io::Error::other("injected append write failure"));
+            }
+        }
+        file.write_all(bytes)
+    }
+
+    fn set_len_for_rollback(state: &mut ContainerState, len: u64) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            if FAIL_ROLLBACK_TRUNCATE.with(Cell::get) {
+                FAIL_ROLLBACK_TRUNCATE.with(|flag| flag.set(false));
+                return Err(io::Error::other("injected rollback truncate failure"));
+            }
+        }
+        state.file.set_len(len)
+    }
+
+    fn append_record(
+        state: &mut ContainerState,
+        operation: Operation,
+        region: &VolumeRegion,
+        offset: u64,
+        payload: &[u8],
+    ) -> io::Result<AppendedRecord> {
         let next_sequence = state
             .sequence
             .checked_add(1)
@@ -138,34 +255,38 @@ impl HostedFileVolume {
         hasher.update(payload);
         let checksum = *hasher.finalize().as_bytes();
 
-        // A footer occupies the old valid-end until the next append. Truncate
-        // it before writing the next ASTREG1 record; valid_len excludes it.
-        state.flush_state = FlushState::Required;
-        state.footer_pending = true;
-        state.file.set_len(state.valid_len)?;
-        state.file.seek(SeekFrom::Start(state.valid_len))?;
-        state.file.write_all(&RECORD_MAGIC)?;
-        state.file.write_all(&total_len.to_le_bytes())?;
-        state.file.write_all(&next_sequence.to_le_bytes())?;
-        state.file.write_all(&[operation as u8])?;
-        state.file.write_all(&name_len.to_le_bytes())?;
-        state.file.write_all(&offset.to_le_bytes())?;
-        state.file.write_all(&payload_len.to_le_bytes())?;
-        state.file.write_all(&checksum)?;
-        state.file.write_all(name)?;
+        // A footer may occupy the old valid-end until the next append. Discard
+        // it only when the process-local proof says the physical end may exceed
+        // valid_len; valid_len itself excludes the footer.
+        Self::prepare_append(state)?;
+        Self::write_append_bytes(&mut state.file, &RECORD_MAGIC)?;
+        Self::write_append_bytes(&mut state.file, &total_len.to_le_bytes())?;
+        Self::write_append_bytes(&mut state.file, &next_sequence.to_le_bytes())?;
+        Self::write_append_bytes(&mut state.file, &[operation as u8])?;
+        Self::write_append_bytes(&mut state.file, &name_len.to_le_bytes())?;
+        Self::write_append_bytes(&mut state.file, &offset.to_le_bytes())?;
+        Self::write_append_bytes(&mut state.file, &payload_len.to_le_bytes())?;
+        Self::write_append_bytes(&mut state.file, &checksum)?;
+        Self::write_append_bytes(&mut state.file, name)?;
         let physical_payload = state
             .valid_len
             .checked_add(u64::try_from(RECORD_FIXED_BYTES).unwrap_or(u64::MAX))
             .and_then(|value| value.checked_add(u64::from(name_len)))
             .ok_or_else(|| io::Error::other("volume physical offset overflow"))?;
-        state.file.write_all(payload)?;
+        Self::write_append_bytes(&mut state.file, payload)?;
         state.boundary_pending = false;
         state.valid_len = state
             .valid_len
             .checked_add(total_len)
             .ok_or_else(|| io::Error::other("volume length overflow"))?;
         state.sequence = next_sequence;
-        Ok((physical_payload, payload_len))
+        // Plain append has no rollback: only a fully published record returns Exact.
+        state.physical_tail = PhysicalTail::Exact;
+        Ok(AppendedRecord {
+            payload_offset: physical_payload,
+            payload_len,
+            checksum,
+        })
     }
 
     fn make_durable(state: &mut ContainerState) -> io::Result<()> {
@@ -179,7 +300,8 @@ impl HostedFileVolume {
         if state.flush_state == FlushState::Confirmed {
             return Ok(());
         }
-        if state.last_commit_offset == 0
+        if state.checkpoint_format == CheckpointFormat::Legacy
+            && state.last_commit_offset == 0
             && state.valid_len == VOLUME_MAGIC.len() as u64
             && state.regions.is_empty()
         {
@@ -197,11 +319,15 @@ impl HostedFileVolume {
             if !payload.is_empty() {
                 state.last_commit_offset = commit_start;
                 state.last_snapshot_end = state.valid_len;
+                state.index_checkpoint = IndexCheckpoint::NotPrepared;
             }
             state.durable_len = state.valid_len;
             state.boundary_pending = true;
         }
         if state.footer_pending || state.boundary_pending {
+            // Footer IO extends physical length beyond valid_len on success or
+            // may leave an uncertain tail on failure; retain MayExceed either way.
+            state.physical_tail = PhysicalTail::MayExceed;
             recover::write_footer(
                 &mut state.file,
                 state.last_commit_offset,
@@ -218,11 +344,13 @@ impl HostedFileVolume {
 
     fn needs_commit(state: &ContainerState) -> bool {
         !state.boundary_pending
-            && (state.valid_len != state.durable_len || state.last_snapshot_end == 0)
+            && (state.valid_len != state.durable_len
+                || state.last_snapshot_end == 0
+                || state.index_checkpoint == IndexCheckpoint::Prepared)
     }
 
-    fn commit_payload(state: &ContainerState) -> io::Result<Vec<u8>> {
-        if state.last_snapshot_end != 0 {
+    fn commit_payload(state: &mut ContainerState) -> io::Result<Vec<u8>> {
+        if state.last_snapshot_end != 0 && state.index_checkpoint == IndexCheckpoint::NotPrepared {
             let tail = state
                 .valid_len
                 .checked_sub(state.last_snapshot_end)
@@ -240,7 +368,13 @@ impl HostedFileVolume {
                 return Ok(Vec::new());
             }
         }
-        recover::encode_region_snapshot(&state.regions)
+        if state.checkpoint_format == CheckpointFormat::Legacy
+            && recover::snapshot_bytes(&state.regions)? <= recover::MAX_COMMIT_SNAPSHOT_BYTES
+        {
+            recover::encode_region_snapshot(&state.regions)
+        } else {
+            extent_index::publication::prepare_checkpoint(state)
+        }
     }
 }
 impl Drop for HostedFileVolume {
@@ -290,46 +424,11 @@ impl AstridVolume for HostedFileVolume {
         offset: u64,
         buffer: &mut [u8],
     ) -> io::Result<usize> {
-        let mut state = self.state.lock();
+        let state = self.state.lock();
         let Some(region_state) = state.regions.get(region) else {
             return Err(io::Error::new(io::ErrorKind::NotFound, region.as_str()));
         };
-        if offset >= region_state.length || buffer.is_empty() {
-            return Ok(0);
-        }
-        let available = region_state.length.saturating_sub(offset);
-        let wanted = usize::try_from(available.min(buffer.len() as u64))
-            .map_err(|_| io::Error::other("volume read length overflow"))?;
-        let read_end = offset
-            .checked_add(wanted as u64)
-            .ok_or_else(|| io::Error::other("volume read range overflow"))?;
-        // Copy only extents that overlap the requested range. Cloning the whole
-        // region map on every read made catalog lookups quadratic in extents.
-        let overlaps = overlapping_extents(region_state, offset, read_end);
-        buffer[..wanted].fill(0);
-        for (start, extent) in overlaps {
-            let copy_start = start.max(offset);
-            let copy_end = extent.logical_end.min(read_end);
-            if copy_start >= copy_end {
-                continue;
-            }
-            let physical = extent
-                .physical_offset
-                .checked_add(copy_start.saturating_sub(start))
-                .ok_or_else(|| io::Error::other("volume extent offset overflow"))?;
-            let destination = usize::try_from(copy_start.saturating_sub(offset))
-                .map_err(|_| io::Error::other("volume destination offset overflow"))?;
-            let length = usize::try_from(copy_end.saturating_sub(copy_start))
-                .map_err(|_| io::Error::other("volume extent length overflow"))?;
-            state.file.seek(SeekFrom::Start(physical))?;
-            let destination_end = destination
-                .checked_add(length)
-                .ok_or_else(|| io::Error::other("volume destination range overflow"))?;
-            state
-                .file
-                .read_exact(&mut buffer[destination..destination_end])?;
-        }
-        Ok(wanted)
+        region_io::read(&state.file, region_state, offset, buffer)
     }
 
     fn write_region_from(
@@ -353,6 +452,7 @@ impl AstridVolume for HostedFileVolume {
             .get_mut(region)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, region.as_str()))?;
         truncate_extents(&mut region_state.extents, length);
+        region_state.base_limit = region_state.base_limit.min(length);
         region_state.length = length;
         Ok(())
     }
@@ -480,6 +580,7 @@ enum Operation {
     Replace = 6,
     MetadataTransaction = 7,
     Commit = 8,
+    IndexPage = 9,
 }
 
 impl Operation {
@@ -493,6 +594,7 @@ impl Operation {
             6 => Ok(Self::Replace),
             7 => Ok(Self::MetadataTransaction),
             8 => Ok(Self::Commit),
+            9 => Ok(Self::IndexPage),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unknown Astrid volume operation",
@@ -740,6 +842,34 @@ pub(crate) use stream::write_record_payloads;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+fn reset_prepare_truncate_count() {
+    PREPARE_TRUNCATE_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn prepare_truncate_count() -> usize {
+    PREPARE_TRUNCATE_COUNT.with(Cell::get)
+}
+
+#[cfg(test)]
+fn set_fail_prepare_truncate(value: bool) {
+    FAIL_PREPARE_TRUNCATE.with(|flag| flag.set(value));
+}
+
+#[cfg(test)]
+fn set_fail_rollback_truncate(value: bool) {
+    FAIL_ROLLBACK_TRUNCATE.with(|flag| flag.set(value));
+}
+
+#[cfg(test)]
+fn set_remaining_append_writes(value: Option<usize>) {
+    REMAINING_APPEND_WRITES.with(|cell| cell.set(value));
+}
+
+#[cfg(test)]
+mod append_tail_tests;
 
 #[cfg(test)]
 mod sync_tests;

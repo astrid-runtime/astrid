@@ -7,18 +7,26 @@ use std::fs::File;
 use std::io::{self, Seek, SeekFrom, Write};
 
 use super::{
-    COMMIT_REGION, Extent, MAX_REGION_NAME_BYTES, METADATA_TRANSACTION_REGION, Operation,
-    RECORD_FIXED_BYTES, RECORD_MAGIC, RegionState, VOLUME_MAGIC, VolumeRegion,
+    COMMIT_REGION, CheckpointFormat, Extent, MAX_REGION_NAME_BYTES, METADATA_TRANSACTION_REGION,
+    Operation, RECORD_FIXED_BYTES, RECORD_MAGIC, RegionState, VOLUME_MAGIC, VolumeRegion,
     apply_metadata_mutations, decode_metadata_mutations, invalid_transition, overlay_extent,
     truncate_extents,
 };
 
+mod index;
+mod snapshot;
+use snapshot::decode_region_snapshot;
+pub(super) use snapshot::{encode_region_snapshot, snapshot_bytes};
+
+pub(super) use index::read_index_page;
+
 const RECOVERY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_METADATA_PAYLOAD_BYTES: u64 = 2 * 1024 * 1024;
-// This is a format bound, not an operator knob: a commit snapshot and the
-// unrecovered tail after that snapshot must be bounded so footer open can
-// refuse unbounded allocations and replay. 65k arena extents are about
-// 1.6 MiB before region names and framing.
+// This bounds one commit record/catalogue and its ordinary replay tail. It is
+// a framing/allocation guard, not a ceiling on live extents: immutable index
+// pages are verified separately. A checkpoint-local ownership set retains
+// selected record offsets, bounded by disjoint committed physical page bytes;
+// it is dropped before the recovered namespace is returned.
 pub(super) const MAX_COMMIT_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
 const SNAPSHOT_MAGIC: [u8; 8] = *b"ASTMAP1\0";
 const FOOTER_MAGIC: [u8; 8] = *b"ASTFTR1\0";
@@ -45,6 +53,7 @@ pub(super) fn read_header_count() -> usize {
 
 #[derive(Debug)]
 pub(super) struct Recovery {
+    pub(super) checkpoint_format: CheckpointFormat,
     pub(super) regions: BTreeMap<VolumeRegion, RegionState>,
     pub(super) sequence: u64,
     pub(super) valid_len: u64,
@@ -72,59 +81,6 @@ pub(super) fn recover_container(file: &mut File) -> io::Result<Recovery> {
     }
     advise_random_access(file);
     recover_from_headers(file)
-}
-
-/// Exact encoded namespace size, without allocating the snapshot. This is
-/// format accounting, shared by the encoder and physical maintenance.
-pub(super) fn snapshot_bytes(regions: &BTreeMap<VolumeRegion, RegionState>) -> io::Result<u64> {
-    regions.iter().try_fold(12_u64, |total, (region, state)| {
-        let name = u64::try_from(region.as_str().len())
-            .map_err(|_| invalid_transition("snapshot region name length overflow"))?;
-        let extents = u64::try_from(state.extents.len())
-            .map_err(|_| invalid_transition("snapshot extent count overflow"))?;
-        total
-            .checked_add(14)
-            .and_then(|value| value.checked_add(name))
-            .and_then(|value| {
-                extents
-                    .checked_mul(24)
-                    .and_then(|bytes| value.checked_add(bytes))
-            })
-            .ok_or_else(|| invalid_transition("commit snapshot size overflow"))
-    })
-}
-
-pub(super) fn encode_region_snapshot(
-    regions: &BTreeMap<VolumeRegion, RegionState>,
-) -> io::Result<Vec<u8>> {
-    if snapshot_bytes(regions)? > MAX_COMMIT_SNAPSHOT_BYTES {
-        return Err(invalid_transition("commit snapshot exceeds format bound"));
-    }
-    let region_count = u32::try_from(regions.len())
-        .map_err(|_| invalid_transition("too many regions in commit snapshot"))?;
-    let mut output = Vec::new();
-    output.extend_from_slice(&SNAPSHOT_MAGIC);
-    output.extend_from_slice(&region_count.to_le_bytes());
-    for (region, state) in regions {
-        let name = region.as_str().as_bytes();
-        let name_len = u16::try_from(name.len())
-            .map_err(|_| invalid_transition("commit snapshot region name too long"))?;
-        let extent_count = u32::try_from(state.extents.len())
-            .map_err(|_| invalid_transition("too many extents in commit snapshot"))?;
-        output.extend_from_slice(&name_len.to_le_bytes());
-        output.extend_from_slice(name);
-        output.extend_from_slice(&state.length.to_le_bytes());
-        output.extend_from_slice(&extent_count.to_le_bytes());
-        for (start, extent) in &state.extents {
-            output.extend_from_slice(&start.to_le_bytes());
-            output.extend_from_slice(&extent.logical_end.to_le_bytes());
-            output.extend_from_slice(&extent.physical_offset.to_le_bytes());
-        }
-        if output.len() as u64 > MAX_COMMIT_SNAPSHOT_BYTES {
-            return Err(invalid_transition("commit snapshot exceeds format bound"));
-        }
-    }
-    Ok(output)
 }
 
 pub(super) fn write_footer(
@@ -186,7 +142,9 @@ fn recover_footer_at(
     let Some((header, payload)) = read_checkpoint(file, last_commit_offset, durable_len)? else {
         return Ok(None);
     };
-    let mut regions = decode_region_snapshot(&payload, last_commit_offset)?;
+    let checkpoint_format = index::checkpoint_format(&payload);
+    let mut regions =
+        index::decode_checkpoint(file, &payload, last_commit_offset, header.sequence)?;
     let snapshot_end = last_commit_offset
         .checked_add(header.total_len)
         .ok_or_else(|| io::Error::other("volume checkpoint end overflow"))?;
@@ -212,6 +170,7 @@ fn recover_footer_at(
         )?;
     }
     Ok(Some(Recovery {
+        checkpoint_format,
         regions,
         sequence,
         valid_len: durable_len,
@@ -231,6 +190,7 @@ fn recover_from_headers(file: &File) -> io::Result<Recovery> {
     let mut committed_offset = offset;
     let mut last_commit_offset = 0_u64;
     let mut last_snapshot_end = 0_u64;
+    let mut checkpoint_format = CheckpointFormat::Legacy;
     while offset < physical_len {
         if physical_len.saturating_sub(offset) >= FOOTER_MAGIC.len() as u64 {
             let mut marker = [0_u8; FOOTER_MAGIC.len()];
@@ -282,7 +242,7 @@ fn recover_from_headers(file: &File) -> io::Result<Recovery> {
             },
             Err(error) => return Err(error),
         };
-        apply_record(&mut regions, &header, payload.as_deref())?;
+        apply_record(file, &mut regions, &header, payload.as_deref())?;
         sequence = header.sequence;
         offset = offset
             .checked_add(header.total_len)
@@ -290,7 +250,8 @@ fn recover_from_headers(file: &File) -> io::Result<Recovery> {
         if header.operation == Operation::Commit {
             committed_sequence = sequence;
             committed_offset = offset;
-            if payload.as_ref().is_some_and(|bytes| !bytes.is_empty()) {
+            if let Some(payload) = payload.as_ref().filter(|bytes| !bytes.is_empty()) {
+                checkpoint_format = index::checkpoint_format(payload);
                 last_commit_offset = offset
                     .checked_sub(header.total_len)
                     .ok_or_else(|| io::Error::other("volume commit offset underflow"))?;
@@ -299,6 +260,7 @@ fn recover_from_headers(file: &File) -> io::Result<Recovery> {
         }
     }
     Ok(Recovery {
+        checkpoint_format,
         // A torn/uncommitted tail is uncommon. Replay its validated committed
         // prefix once rather than cloning the entire extent namespace at each
         // commit. Both paths retain all framing and transition checks.
@@ -330,7 +292,7 @@ fn replay_committed_namespace(
             return Err(invalid_transition("non-contiguous committed volume prefix"));
         }
         let payload = read_record_payload(file, &header)?;
-        apply_record(&mut regions, &header, payload.as_deref())?;
+        apply_record(file, &mut regions, &header, payload.as_deref())?;
         sequence = header.sequence;
         offset = offset
             .checked_add(header.total_len)
@@ -343,6 +305,7 @@ fn replay_committed_namespace(
 }
 
 fn apply_record(
+    file: &File,
     regions: &mut BTreeMap<VolumeRegion, RegionState>,
     header: &RecordHeader,
     payload: Option<&[u8]>,
@@ -353,7 +316,16 @@ fn apply_record(
                 return Err(invalid_transition("invalid volume commit boundary"));
             }
             if let Some(payload) = payload.filter(|payload| !payload.is_empty()) {
-                *regions = decode_region_snapshot(payload, header_start(header)?)?;
+                if index::checkpoint_format(payload) == CheckpointFormat::Paged {
+                    *regions = index::decode_checkpoint(
+                        file,
+                        payload,
+                        header_start(header)?,
+                        header.sequence,
+                    )?;
+                } else {
+                    *regions = snapshot::decode_region_snapshot(payload, header_start(header)?)?;
+                }
             }
         },
         Operation::Write => {
@@ -391,6 +363,7 @@ fn apply_record(
                 .get_mut(&header.name)
                 .ok_or_else(|| invalid_transition("truncate before create"))?;
             truncate_extents(&mut region_state.extents, header.logical_offset);
+            region_state.base_limit = region_state.base_limit.min(header.logical_offset);
             region_state.length = header.logical_offset;
         },
         Operation::Remove => {
@@ -425,6 +398,9 @@ fn apply_record(
                 .ok_or_else(|| invalid_transition("missing metadata transaction payload"))?;
             let mutations = decode_metadata_mutations(payload)?;
             apply_metadata_mutations(regions, &mutations)?;
+        },
+        Operation::IndexPage => {
+            index::validate_index_page(header, payload)?;
         },
     }
     Ok(())
@@ -656,7 +632,7 @@ fn replay_checkpoint_tail(
                 "volume checkpoint tail contains a later snapshot",
             ));
         }
-        apply_record(regions, &header, payload.as_deref())?;
+        apply_record(file, regions, &header, payload.as_deref())?;
         sequence = header.sequence;
         last_was_commit = header.operation == Operation::Commit;
         offset = record_end;
@@ -694,67 +670,6 @@ pub(super) fn legacy_reader_accepts_terminal_snapshot(
     }
     let payload = read_record_payload(file, &header)?.unwrap_or_default();
     Ok(!payload.is_empty())
-}
-
-fn decode_region_snapshot(
-    payload: &[u8],
-    physical_limit: u64,
-) -> io::Result<BTreeMap<VolumeRegion, RegionState>> {
-    if payload.len() as u64 > MAX_COMMIT_SNAPSHOT_BYTES || payload.len() < 12 {
-        return Err(invalid_transition("invalid commit snapshot length"));
-    }
-    if payload[..SNAPSHOT_MAGIC.len()] != SNAPSHOT_MAGIC {
-        return Err(invalid_transition("invalid commit snapshot magic"));
-    }
-    let mut cursor = SNAPSHOT_MAGIC.len();
-    let region_count = usize::try_from(read_u32(payload, &mut cursor)?)
-        .map_err(|_| invalid_transition("commit snapshot region count overflow"))?;
-    let mut regions = BTreeMap::new();
-    for _ in 0..region_count {
-        let name_length = usize::from(read_u16(payload, &mut cursor)?);
-        let name = take(payload, &mut cursor, name_length)?;
-        let name = std::str::from_utf8(name)
-            .map_err(|_| invalid_transition("commit snapshot region is not UTF-8"))?;
-        let region = VolumeRegion::new(name.to_owned())?;
-        let length = read_u64(payload, &mut cursor)?;
-        let extent_count = usize::try_from(read_u32(payload, &mut cursor)?)
-            .map_err(|_| invalid_transition("commit snapshot extent count overflow"))?;
-        let mut extents = BTreeMap::new();
-        let mut previous_end = 0_u64;
-        for _ in 0..extent_count {
-            let start = read_u64(payload, &mut cursor)?;
-            let logical_end = read_u64(payload, &mut cursor)?;
-            let physical_offset = read_u64(payload, &mut cursor)?;
-            let extent_len = logical_end.saturating_sub(start);
-            if start >= logical_end
-                || start < previous_end
-                || logical_end > length
-                || physical_offset
-                    .checked_add(extent_len)
-                    .is_none_or(|end| end > physical_limit)
-            {
-                return Err(invalid_transition("invalid commit snapshot extent"));
-            }
-            previous_end = logical_end;
-            extents.insert(
-                start,
-                Extent {
-                    logical_end,
-                    physical_offset,
-                },
-            );
-        }
-        if regions
-            .insert(region, RegionState { length, extents })
-            .is_some()
-        {
-            return Err(invalid_transition("duplicate commit snapshot region"));
-        }
-    }
-    if cursor != payload.len() {
-        return Err(invalid_transition("commit snapshot has trailing bytes"));
-    }
-    Ok(regions)
 }
 
 fn has_physically_valid_record_after(file: &File, start: u64, end: u64) -> io::Result<bool> {
@@ -908,7 +823,7 @@ fn read_array<const N: usize>(bytes: &[u8]) -> io::Result<[u8; N]> {
         .map_err(|_| invalid_transition("invalid volume record integer"))
 }
 
-fn read_exact_at(file: &File, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
+pub(super) fn read_exact_at(file: &File, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
     let mut done = 0_usize;
     while done < buffer.len() {
         let read_offset = offset

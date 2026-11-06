@@ -255,7 +255,7 @@ where
             .unwrap_or(0);
         if persist == VolumeIndexPersist::RetainDeltas
             && self.on_volume_media()
-            && retain_volume_index_deltas(self, inner, arena_len, arena_tail)
+            && retain_volume_index_deltas(self, inner, arena_len, arena_tail)?
         {
             return Ok(());
         }
@@ -307,32 +307,31 @@ fn retain_volume_index_deltas<P, I, C>(
     inner: &mut DurableInner<P>,
     arena_len: u64,
     arena_tail: Option<super::ArenaLocation>,
-) -> bool
+) -> Result<bool, DurableError>
 where
     P: Clone + Ord,
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
     {
-        let Ok(files) = live_files_mut(&mut inner.files) else {
-            return false;
-        };
+        let files = live_files_mut(&mut inner.files)?;
         if files
             .index_cache
             .as_ref()
             .is_none_or(|cache| !super::index::index_cache_starts_with_snapshot(cache))
         {
-            return false;
+            return Ok(false);
         }
     }
-    if !inner.pending_index_locations.is_empty() {
-        let _ = engine.advance_index_frontier(inner, arena_len);
-    } else if let Ok(files) = live_files_mut(&mut inner.files) {
+    if inner.pending_index_locations.is_empty() {
+        let files = live_files_mut(&mut inner.files)?;
         files.arena_len = arena_len;
         files.arena_tail = arena_tail;
+    } else {
+        engine.advance_index_frontier(inner, arena_len)?;
     }
     inner.pending_direct_objects.clear();
-    true
+    Ok(true)
 }
 
 fn index_cache_has_one_frame(file: &mut File) -> bool {

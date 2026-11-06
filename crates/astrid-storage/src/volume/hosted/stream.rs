@@ -3,7 +3,8 @@
 //! Checksum lives in the record header. This hashes while copying, then
 //! patches the checksum slot. The on-disk grammar is unchanged.
 
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
 #[cfg(test)]
 use std::path::Path;
 
@@ -61,6 +62,26 @@ pub(super) fn append_from(
     payload_len: u64,
     payload: &mut dyn Read,
 ) -> io::Result<(u64, u64)> {
+    append_from_with(
+        state,
+        operation,
+        region,
+        offset,
+        payload_len,
+        payload,
+        super::recover::write_footer,
+    )
+}
+
+pub(super) fn append_from_with(
+    state: &mut ContainerState,
+    operation: Operation,
+    region: &VolumeRegion,
+    offset: u64,
+    payload_len: u64,
+    payload: &mut dyn Read,
+    footer_restore: impl FnOnce(&mut File, u64, u64, u64) -> io::Result<()>,
+) -> io::Result<(u64, u64)> {
     if payload_len == 0 {
         return super::HostedFileVolume::append(state, operation, region, offset, &[]);
     }
@@ -69,10 +90,18 @@ pub(super) fn append_from(
         Ok(result) => Ok(result),
         Err(error) => {
             state.flush_state = super::FlushState::Required;
-            let _ = state.file.set_len(start);
+            match HostedFileVolume::set_len_for_rollback(state, start) {
+                Ok(()) => state.physical_tail = super::PhysicalTail::Exact,
+                Err(_) => state.physical_tail = super::PhysicalTail::MayExceed,
+            }
             let _ = state.file.seek(SeekFrom::Start(start));
             if state.last_commit_offset != 0 && start == state.durable_len {
-                let _ = super::recover::write_footer(
+                // Restore marks MayExceed before any footer IO.
+                state.physical_tail = super::PhysicalTail::MayExceed;
+                // Preflight failures never reach prepare_append, so obligate the
+                // next sync before a restore that may strip the durable footer.
+                state.footer_pending = true;
+                let _ = footer_restore(
                     &mut state.file,
                     state.last_commit_offset,
                     state.durable_len,
@@ -112,22 +141,19 @@ fn append_from_inner(
     hasher.update(&payload_len.to_le_bytes());
     hasher.update(name);
 
-    // The previous footer ends at `valid_len`; remove it before publishing a
-    // new record. A failed stream leaves footer_pending set so the next sync
+    // Discard a previous physical tail only when the process-local proof says
+    // one may exist. A failed stream leaves footer_pending set so the next sync
     // restores the prior durable footer.
-    state.flush_state = super::FlushState::Required;
-    state.footer_pending = true;
-    state.file.set_len(state.valid_len)?;
-    state.file.seek(SeekFrom::Start(state.valid_len))?;
-    state.file.write_all(&RECORD_MAGIC)?;
-    state.file.write_all(&total_len.to_le_bytes())?;
-    state.file.write_all(&next_sequence.to_le_bytes())?;
-    state.file.write_all(&[operation as u8])?;
-    state.file.write_all(&name_len.to_le_bytes())?;
-    state.file.write_all(&offset.to_le_bytes())?;
-    state.file.write_all(&payload_len.to_le_bytes())?;
-    state.file.write_all(&[0_u8; 32])?;
-    state.file.write_all(name)?;
+    HostedFileVolume::prepare_append(state)?;
+    HostedFileVolume::write_append_bytes(&mut state.file, &RECORD_MAGIC)?;
+    HostedFileVolume::write_append_bytes(&mut state.file, &total_len.to_le_bytes())?;
+    HostedFileVolume::write_append_bytes(&mut state.file, &next_sequence.to_le_bytes())?;
+    HostedFileVolume::write_append_bytes(&mut state.file, &[operation as u8])?;
+    HostedFileVolume::write_append_bytes(&mut state.file, &name_len.to_le_bytes())?;
+    HostedFileVolume::write_append_bytes(&mut state.file, &offset.to_le_bytes())?;
+    HostedFileVolume::write_append_bytes(&mut state.file, &payload_len.to_le_bytes())?;
+    HostedFileVolume::write_append_bytes(&mut state.file, &[0_u8; 32])?;
+    HostedFileVolume::write_append_bytes(&mut state.file, name)?;
     let physical_payload = state
         .valid_len
         .checked_add(u64::try_from(RECORD_FIXED_BYTES).unwrap_or(u64::MAX))
@@ -140,13 +166,14 @@ fn append_from_inner(
         .checked_add(RECORD_CHECKSUM_OFFSET)
         .ok_or_else(|| io::Error::other("volume checksum offset overflow"))?;
     state.file.seek(SeekFrom::Start(checksum_at))?;
-    state.file.write_all(&checksum)?;
+    HostedFileVolume::write_append_bytes(&mut state.file, &checksum)?;
     state.boundary_pending = false;
     state.valid_len = state
         .valid_len
         .checked_add(total_len)
         .ok_or_else(|| io::Error::other("volume length overflow"))?;
     state.sequence = next_sequence;
+    state.physical_tail = super::PhysicalTail::Exact;
     Ok((physical_payload, payload_len))
 }
 
@@ -163,7 +190,7 @@ fn copy_and_hash(
             .map_err(|_| io::Error::other("volume stream copy length overflow"))?;
         source.read_exact(&mut buffer[..want])?;
         hasher.update(&buffer[..want]);
-        destination.write_all(&buffer[..want])?;
+        HostedFileVolume::write_append_bytes(destination, &buffer[..want])?;
         remaining = remaining
             .checked_sub(want as u64)
             .ok_or_else(|| io::Error::other("volume stream copy length overflow"))?;
