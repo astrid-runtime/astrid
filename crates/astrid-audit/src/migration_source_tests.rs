@@ -335,21 +335,10 @@ async fn final_digest_keeps_original_writer_fenced_through_staged_retirement() {
     destination
         .with_verified_legacy_source(&path, "fenced-retirement", &report.source_digest, |kind| {
             assert_eq!(kind, astrid_storage::LegacySourceKind::LockedDatabase);
-            let competing = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path.join("LOCK"))
-                .unwrap();
-            assert!(
-                competing.try_lock().is_err(),
-                "writer entered after final digest"
-            );
+            assert_source_writer_excluded(&path);
             astrid_core::platform_fs::rename_with_write_through(&path, &retired)
                 .map_err(|error| AuditError::StorageError(error.to_string()))?;
-            assert!(
-                competing.try_lock().is_err(),
-                "writer entered during staging"
-            );
+            assert_source_writer_excluded(&retired);
             assert_eq!(source_files(&retired), before);
             astrid_core::dirs::retire_legacy_source_tree(&retired)
                 .map_err(|error| AuditError::StorageError(error.to_string()))
@@ -358,6 +347,20 @@ async fn final_digest_keeps_original_writer_fenced_through_staged_retirement() {
         .unwrap();
     assert!(!path.exists());
     assert!(!retired.exists());
+}
+
+fn assert_source_writer_excluded(source: &std::path::Path) {
+    let competing = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(source.join("LOCK"))
+        .unwrap();
+    assert!(
+        matches!(competing.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+        "writer entered the digest-bound source fence"
+    );
+    // This checkpoint must close before a Windows parent move. Keeping a
+    // separate path-open probe live would itself pin the source directory.
 }
 
 #[tokio::test]

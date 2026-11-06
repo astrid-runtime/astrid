@@ -8,6 +8,8 @@ use crate::{KvStore, StorageError, StorageResult, SurrealKvStore};
 
 mod store;
 use store::SnapshotStore;
+#[cfg(windows)]
+mod source_lock;
 
 /// Original-source protection retained during a snapshot operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,6 +187,8 @@ fn lock_source(source: &PrivateDirectory) -> StorageResult<Option<std::fs::File>
     // on Windows, where exclusive byte-range locks prevent even reads.
     let lock = source.open_file(Path::new("LOCK"))?;
     lock.try_lock_shared().map_err(snapshot_error)?;
+    #[cfg(windows)]
+    let lock = source_lock::handoff(lock).map_err(snapshot_error)?;
     Ok(Some(lock))
 }
 
