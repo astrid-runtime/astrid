@@ -8,8 +8,6 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ## [Unreleased]
 
-- Avoid hashing locally constructed KV chunk records twice by binding their construction to the consuming engine; untrusted transactions retain full identity verification.
-
 ## [2026.10.1] - 2026-10-15
 
 ### Fixed

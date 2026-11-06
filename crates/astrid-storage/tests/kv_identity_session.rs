@@ -1,13 +1,13 @@
 //! Public-client regression coverage for engine-bound KV identities.
 #![cfg(not(target_family = "wasm"))]
 use astrid_storage::engine::{
-    CommitOutcome, DurableEngine, IdentityScheme, InMemoryEngine, KvIdentitySession,
-    KvProjectionEngine, KvProjectionError, PersistentObjectIdentity, PrincipalCodec,
-    RecoveryLimits, RootSnapshot, RootTransaction,
+    CommitOutcome, DurableEngine, DurableEnginePolicy, IdentityScheme, InMemoryEngine,
+    KvIdentitySession, KvProjectionEngine, KvProjectionError, PersistentObjectIdentity,
+    PrincipalCodec, RecoveryLimits, RootSnapshot, RootTransaction, TransactionWalPolicy,
 };
 use astrid_storage::principal_state::Blake3ObjectIdentityV1;
 use astrid_storage::storage_model::{
-    ObjectId, ObjectIdentity, ObjectKind, ObjectRecord, RootState,
+    ModelError, ObjectId, ObjectIdentity, ObjectKind, ObjectRecord, RootState,
 };
 use astrid_storage::{KvStore, StorageResult, TreeKvStore};
 use std::sync::{
@@ -54,13 +54,18 @@ struct Client<E> {
     inner: E,
     mode: Mode,
     sessions: AtomicU64,
+    commits: AtomicU64,
 }
 impl<E: KvProjectionEngine<String>> KvProjectionEngine<String> for Client<E> {
     fn identify_kv_object(&self, r: &ObjectRecord) -> ObjectId {
         if matches!(self.mode, Mode::LyingTrusted | Mode::LyingFallback)
             && r.kind() == ObjectKind::Chunk
         {
-            ObjectId::new([0xff; 32])
+            // A reversible transformation preserves distinct chunk identities,
+            // reaching engine admission instead of failing local deduplication.
+            let mut forged = *self.inner.identify_kv_object(r).as_bytes();
+            forged[0] ^= 0x80;
+            ObjectId::new(forged)
         } else {
             self.inner.identify_kv_object(r)
         }
@@ -88,12 +93,28 @@ impl<E: KvProjectionEngine<String>> KvProjectionEngine<String> for Client<E> {
         &self,
         tx: RootTransaction<String>,
     ) -> Result<CommitOutcome, KvProjectionError> {
-        if matches!(self.mode, Mode::Clone) {
+        self.commits.fetch_add(1, Ordering::Relaxed);
+        let expected_mismatch = matches!(self.mode, Mode::LyingFallback).then(|| {
+            let (declared, record) = tx
+                .records()
+                .iter()
+                .find(|(_, record)| record.kind() == ObjectKind::Chunk)
+                .unwrap();
+            (*declared, Blake3ObjectIdentityV1.identify(record))
+        });
+        let outcome = if matches!(self.mode, Mode::Clone) {
             self.inner.commit_kv_root(tx.clone())
         } else {
             self.inner.commit_kv_root(tx)
+        };
+        if let Some((expected_declared, expected_computed)) = expected_mismatch {
+            assert!(matches!(&outcome, Err(KvProjectionError::Model(
+                ModelError::ObjectIdentityMismatch { declared, computed }
+            )) if *declared == expected_declared && *computed == expected_computed));
         }
+        outcome
     }
+
     fn flush_kv(&self) -> Result<(), KvProjectionError> {
         self.inner.flush_kv()
     }
@@ -124,11 +145,13 @@ async fn exercise<E: KvProjectionEngine<String> + 'static>(
     inner: E,
     identity: CountingIdentity,
     mode: Mode,
+    wal_enabled: bool,
 ) {
     let engine = Arc::new(Client {
         inner,
         mode,
         sessions: AtomicU64::new(0),
+        commits: AtomicU64::new(0),
     });
     let store =
         TreeKvStore::<String, CountingIdentity, _, _>::from_engine(Arc::clone(&engine), owner);
@@ -136,6 +159,11 @@ async fn exercise<E: KvProjectionEngine<String> + 'static>(
     let result = store
         .set("alice:capsule:test", "value", bytes.clone())
         .await;
+    assert_eq!(
+        engine.commits.load(Ordering::Relaxed),
+        1,
+        "the public write must reach admission"
+    );
     if matches!(mode, Mode::LyingFallback) {
         assert!(
             result.is_err(),
@@ -159,11 +187,14 @@ async fn exercise<E: KvProjectionEngine<String> + 'static>(
             assert!(start.elapsed() < Duration::from_secs(30));
             tokio::task::yield_now().await;
         }
-        let factor = if matches!(mode, Mode::Fallback | Mode::Clone) {
+        let admission_passes: u64 = if matches!(mode, Mode::Fallback | Mode::Clone) {
             2
         } else {
             1
         };
+        // WAL overlay installation decodes and verifies its encoded frames
+        // independently. This test does not waive that verification.
+        let factor = admission_passes.strict_add(u64::from(wal_enabled));
         assert_eq!(
             identity.0.load(Ordering::Relaxed),
             (bytes.len() as u64).strict_mul(factor),
@@ -195,52 +226,66 @@ async fn external_wrapper_cannot_forge_or_preserve_cloned_identity_proof() {
             InMemoryEngine::<String, _>::new(identity.clone()),
             identity,
             mode,
+            false,
         )
         .await;
     }
 }
 #[tokio::test]
 async fn durable_admission_obeys_the_same_external_identity_boundary() {
-    for mode in [
-        Mode::Trusted,
-        Mode::Fallback,
-        Mode::Clone,
-        Mode::LyingTrusted,
-        Mode::LyingFallback,
-        Mode::ChangingGetter,
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        let identity = CountingIdentity(Arc::new(AtomicU64::new(0)));
-        let inner = DurableEngine::open(
-            dir.path(),
-            identity.clone(),
-            Codec,
-            RecoveryLimits::process_addressable(),
-        )
-        .unwrap();
-        exercise(inner, identity.clone(), mode).await;
-        let reopened = Arc::new(
-            DurableEngine::open(
+    for wal_enabled in [false, true] {
+        for mode in [
+            Mode::Trusted,
+            Mode::Fallback,
+            Mode::Clone,
+            Mode::LyingTrusted,
+            Mode::LyingFallback,
+            Mode::ChangingGetter,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let identity = CountingIdentity(Arc::new(AtomicU64::new(0)));
+            let policy = || {
+                if wal_enabled {
+                    DurableEnginePolicy::default().with_transaction_wal(
+                        TransactionWalPolicy::enabled(std::num::NonZeroU64::MAX),
+                    )
+                } else {
+                    DurableEnginePolicy::default()
+                }
+            };
+            let inner = DurableEngine::open_with_policy(
                 dir.path(),
-                identity,
+                identity.clone(),
                 Codec,
                 RecoveryLimits::process_addressable(),
+                policy(),
             )
-            .unwrap(),
-        );
-        let store = TreeKvStore::<String, CountingIdentity, _, _>::from_engine(
-            Arc::clone(&reopened),
-            owner,
-        );
-        let value = store.get("alice:capsule:test", "value").await.unwrap();
-        assert_eq!(
-            value,
-            if matches!(mode, Mode::LyingFallback) {
-                None
-            } else {
-                Some(payload())
-            }
-        );
-        store.close().await.unwrap();
+            .unwrap();
+            exercise(inner, identity.clone(), mode, wal_enabled).await;
+            let reopened = Arc::new(
+                DurableEngine::open_with_policy(
+                    dir.path(),
+                    identity,
+                    Codec,
+                    RecoveryLimits::process_addressable(),
+                    policy(),
+                )
+                .unwrap(),
+            );
+            let store = TreeKvStore::<String, CountingIdentity, _, _>::from_engine(
+                Arc::clone(&reopened),
+                owner,
+            );
+            let value = store.get("alice:capsule:test", "value").await.unwrap();
+            assert_eq!(
+                value,
+                if matches!(mode, Mode::LyingFallback) {
+                    None
+                } else {
+                    Some(payload())
+                }
+            );
+            store.close().await.unwrap();
+        }
     }
 }

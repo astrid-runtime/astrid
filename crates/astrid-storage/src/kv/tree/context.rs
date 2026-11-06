@@ -510,7 +510,8 @@ where
                 .transpose()?;
             // Chunk construction borrows these bytes; retain them for the
             // overlay instead of reconstructing the just-staged value.
-            // Root admission still verifies the complete transaction.
+            // Admission retains all structural and publication checks; locally
+            // bound identities do not need a second computation.
             current.insert(key.clone(), replacement);
             mutations.push(Mutation { key, value });
         }
