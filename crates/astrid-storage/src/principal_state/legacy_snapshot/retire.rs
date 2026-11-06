@@ -467,6 +467,7 @@ fn directory_present(path: &Path) -> StorageResult<bool> {
     }
 }
 
+#[cfg(not(windows))]
 fn staging_parent(stage_path: &Path) -> StorageResult<PrivateDirectory> {
     let parent = stage_path.parent().ok_or_else(|| {
         snapshot_error(format!(
@@ -477,6 +478,7 @@ fn staging_parent(stage_path: &Path) -> StorageResult<PrivateDirectory> {
     PrivateDirectory::open(parent)
 }
 
+#[cfg(not(windows))]
 fn stage_file_name(stage_path: &Path) -> StorageResult<std::ffi::OsString> {
     stage_path
         .file_name()

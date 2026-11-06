@@ -10,10 +10,10 @@ use cap_std::fs::Dir;
 
 #[cfg(feature = "legacy-surrealkv")]
 mod retirement;
+#[cfg(all(feature = "legacy-surrealkv", not(windows)))]
+pub(super) use retirement::validate_retirement_tree;
 #[cfg(feature = "legacy-surrealkv")]
-pub(super) use retirement::{
-    CapturedDirectory, remove_retirement_contents, validate_retirement_tree,
-};
+pub(super) use retirement::{CapturedDirectory, remove_retirement_contents};
 #[cfg(feature = "legacy-surrealkv")]
 mod from_captured;
 

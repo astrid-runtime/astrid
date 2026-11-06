@@ -181,6 +181,7 @@ fn remove_contents(
     directory.sync()
 }
 
+#[cfg(not(windows))]
 pub(in crate::principal_state) fn validate_retirement_tree(
     directory: &PrivateDirectory,
 ) -> StorageResult<()> {
