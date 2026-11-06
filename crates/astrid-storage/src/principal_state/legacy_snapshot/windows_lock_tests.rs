@@ -138,12 +138,8 @@ fn native_link_count(file: &File) -> u32 {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: the owned file handle and writable output buffer remain live.
     #[allow(unsafe_code)]
-    assert_ne!(
-        unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &raw mut info) },
-        0,
-        "{}",
-        std::io::Error::last_os_error()
-    );
+    let success = unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &raw mut info) };
+    assert_ne!(success, 0, "{}", std::io::Error::last_os_error());
     info.nNumberOfLinks
 }
 

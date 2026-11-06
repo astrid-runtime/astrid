@@ -89,12 +89,14 @@ async fn rejected_legacy_digest_preserves_published_source() {
     assert_eq!(source_files(&path), before);
 }
 
+#[cfg(unix)]
 struct ReplacingSourceCapacity {
     source: PathBuf,
     replacement: PathBuf,
     retained: PathBuf,
 }
 
+#[cfg(unix)]
 impl AuditCapacityProvider for ReplacingSourceCapacity {
     fn available_bytes(&self) -> AuditResult<Option<u64>> {
         // Called after the importer captured its source, before copying payload.
@@ -128,6 +130,7 @@ async fn seed_audit(path: &Path, key: Arc<KeyPair>, entries: usize) {
     source.close().await.unwrap();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn original_source_change_during_move_still_prevents_marker_publication() {
     let directory = tempfile::tempdir().unwrap();
@@ -149,6 +152,85 @@ async fn original_source_change_during_move_still_prevents_marker_publication() 
     .unwrap();
     let error = destination
         .import_legacy_audit(&path, "changing-audit-source")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("changed before retirement"));
+    assert!(
+        destination
+            .storage
+            .migration_marker()
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(source_files(&path), replacement_files);
+}
+
+struct ChangingPayloadCapacity {
+    source: PathBuf,
+    replacement: BTreeMap<PathBuf, Vec<u8>>,
+}
+
+impl AuditCapacityProvider for ChangingPayloadCapacity {
+    fn available_bytes(&self) -> AuditResult<Option<u64>> {
+        // Windows refuses a parent rename while the original LOCK is open.
+        // A noncooperating writer can still replace closed data files without
+        // replacing LOCK. Keep that same inode fenced throughout the mutation.
+        let writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.source.join("LOCK"))
+            .unwrap();
+        assert!(matches!(
+            writer.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(writer);
+        for entry in std::fs::read_dir(&self.source).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name() == "LOCK" {
+                continue;
+            }
+            if entry.file_type().unwrap().is_dir() {
+                std::fs::remove_dir_all(entry.path()).unwrap();
+            } else {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        for (relative, bytes) in &self.replacement {
+            if relative == Path::new("LOCK") {
+                continue;
+            }
+            let target = self.source.join(relative);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, bytes).unwrap();
+        }
+        Ok(Some(u64::MAX))
+    }
+}
+
+#[tokio::test]
+async fn original_payload_change_under_shared_lock_prevents_marker_publication() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("source");
+    let replacement = directory.path().join("replacement");
+    let key = Arc::new(KeyPair::generate());
+    seed_audit(&path, Arc::clone(&key), 1).await;
+    seed_audit(&replacement, Arc::clone(&key), 2).await;
+    let original_lock = std::fs::read(path.join("LOCK")).unwrap();
+    let mut replacement_files = source_files(&replacement);
+    replacement_files.insert(PathBuf::from("LOCK"), original_lock);
+    let destination = AuditLog::open_with_kv_store_and_capacity(
+        Arc::new(astrid_storage::MemoryKvStore::new()),
+        key,
+        Some(Arc::new(ChangingPayloadCapacity {
+            source: path.clone(),
+            replacement: replacement_files.clone(),
+        })),
+    )
+    .unwrap();
+    let error = destination
+        .import_legacy_audit(&path, "changing-audit-payload")
         .await
         .unwrap_err();
     assert!(error.to_string().contains("changed before retirement"));

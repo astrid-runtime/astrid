@@ -1,6 +1,30 @@
 use super::CapturedDirectory;
 
 #[test]
+fn cleanup_refuses_a_replaced_database_child_without_deleting_either_tree() {
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace = temporary.path().join("workspace");
+    let database = workspace.join("database");
+    let saved = temporary.path().join("saved-database");
+    std::fs::create_dir_all(&database).unwrap();
+    std::fs::write(database.join("copied"), b"original copy").unwrap();
+    let captured = CapturedDirectory::open(&workspace).unwrap();
+    std::fs::rename(&database, &saved).unwrap();
+    std::fs::create_dir(&database).unwrap();
+    std::fs::write(database.join("sentinel"), b"replacement must survive").unwrap();
+    let result = captured.remove();
+    assert!(result.is_err(), "cleanup adopted a replacement database");
+    assert_eq!(
+        std::fs::read(database.join("sentinel")).unwrap(),
+        b"replacement must survive"
+    );
+    assert_eq!(
+        std::fs::read(saved.join("copied")).unwrap(),
+        b"original copy"
+    );
+}
+
+#[test]
 fn cleanup_refuses_an_empty_replacement() {
     let temporary = tempfile::tempdir().unwrap();
     let original = temporary.path().join("workspace");

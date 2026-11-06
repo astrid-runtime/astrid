@@ -12,6 +12,7 @@ pub(in crate::principal_state) struct CapturedDirectory {
     parent: PrivateDirectory,
     name: OsString,
     identity: PrivateDirectoryIdentity,
+    database: Option<PrivateDirectoryIdentity>,
     path: PathBuf,
 }
 
@@ -26,10 +27,16 @@ impl CapturedDirectory {
             .ok_or_else(|| connection("captured directory has no child name".to_owned()))?
             .to_os_string();
         let child = parent.open_child(Path::new(&name))?;
+        let database = child
+            .contains(Path::new("database"))?
+            .then(|| child.open_child(Path::new("database")))
+            .transpose()?
+            .map(|database| database.identity);
         Ok(Self {
             parent,
             name,
             identity: child.identity,
+            database,
             path: path.to_path_buf(),
         })
     }
@@ -64,11 +71,40 @@ impl CapturedDirectory {
         // capability owns traversal; an ambient path never becomes authority.
         validate(&directory)?;
         self.directory()?;
-        remove_contents(&directory, self.identity)?;
+        self.remove_database(&directory)?;
         directory.sync()?;
         drop(directory);
         self.verify_empty()?;
         self.unlink_empty()
+    }
+
+    fn remove_database(&self, outer: &PrivateDirectory) -> StorageResult<()> {
+        let name = Path::new("database");
+        let Some(expected) = self.database else {
+            if outer.contains(name)? {
+                return Err(connection(
+                    "uncaptured snapshot database appeared".to_owned(),
+                ));
+            }
+            return Ok(());
+        };
+        let database = outer.open_child(name)?;
+        if database.identity != expected || expected.volume != self.identity.volume {
+            return Err(connection(
+                "captured snapshot database was replaced".to_owned(),
+            ));
+        }
+        remove_contents(&database, self.identity)?;
+        database.sync()?;
+        drop(database);
+        // Release the child's Windows handle before empty-only removal, while
+        // refusing an already replaced child before deleting its name.
+        let confirmation = outer.open_child(name)?;
+        if confirmation.identity != expected || !confirmation.entries()?.is_empty() {
+            return Err(connection("captured snapshot database changed".to_owned()));
+        }
+        drop(confirmation);
+        outer.remove_directory(name)
     }
 
     fn verify_empty(&self) -> StorageResult<()> {
@@ -88,7 +124,7 @@ impl CapturedDirectory {
         // replacement into a new private name merely to discover its identity.
         // No portable identity-conditioned rmdir exists: an empty replacement
         // in this final window is indistinguishable. The original workspace
-        // name is exclusive and private; this is transient-copy cleanup, not
+        // name was created exclusively with private access; this is copy cleanup, not
         // a durable absence claim for operator data.
         self.parent.remove_directory(Path::new(&self.name))?;
         self.parent.sync()

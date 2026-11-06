@@ -28,6 +28,8 @@ impl SnapshotWorkspace {
         // The platform primitive creates exclusively with private access at
         // namespace creation. An existing name is never adopted or removed.
         astrid_core::platform_fs::create_private_directory(&path).map_err(snapshot_error)?;
+        astrid_core::platform_fs::create_private_directory(&path.join("database"))
+            .map_err(snapshot_error)?;
         Ok(Self(Some(CapturedDirectory::open(&path)?)))
     }
 
@@ -152,7 +154,6 @@ fn prepare_snapshot(
             .ok_or_else(|| snapshot_error("missing workspace"))?
             .path()
             .join("database");
-        astrid_core::platform_fs::ensure_private_directory(&path).map_err(snapshot_error)?;
         let destination = PrivateDirectory::open(&path)?;
         super::migrations::copy_legacy_tree(&source, &destination)?;
         drop(destination);
