@@ -134,7 +134,7 @@ mod tests {
         drop(closing);
         drop(reading);
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while path.exists() {
+            while super::super::tests::workspace_name_present(&path) {
                 tokio::task::yield_now().await;
             }
         })

@@ -1,5 +1,15 @@
 use super::*;
 
+pub(super) fn workspace_name_present(path: &std::path::Path) -> bool {
+    // A Windows directory marked for deletion can reject child metadata opens
+    // with ACCESS_DENIED before its name disappears. Observe the parent
+    // namespace instead; enumeration errors remain failures, never absence.
+    let name = path.file_name().unwrap();
+    std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .any(|entry| entry.unwrap().file_name() == name)
+}
+
 async fn reader() -> (SnapshotReader, Arc<SnapshotStore>, std::path::PathBuf) {
     let workspace = tempfile::tempdir().unwrap();
     let path = workspace.path().to_path_buf();
@@ -37,7 +47,7 @@ async fn cancellation_closes_reader_and_removes_only_owned_workspace() {
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while path.try_exists().unwrap() {
+        while workspace_name_present(&path) {
             tokio::task::yield_now().await;
         }
     })
@@ -94,14 +104,35 @@ async fn live_source_writer_is_refused_without_touching_lock() {
         .await
         .unwrap();
     let lock = directory.path().join("LOCK");
-    let before = std::fs::read(&lock).unwrap();
+    // Windows byte-range locks also deny ordinary reads. Inspect the live
+    // file identity and metadata without reading its locked bytes; verify the
+    // pinned backend's PID payload only after the writer releases the lock.
+    let before = std::fs::File::open(&lock).unwrap();
+    let identity = super::super::native_io::private_file_identity(&before).unwrap();
+    let metadata = before.metadata().unwrap();
+    let expected = format!("{}\n", std::process::id()).into_bytes();
+    assert_eq!(metadata.len(), expected.len() as u64);
     let result = with_legacy_kv_snapshot(directory.path(), async |_, _| {
         panic!("must not invoke operation while source writer holds LOCK");
     })
     .await;
     assert!(result.is_err());
-    assert_eq!(std::fs::read(&lock).unwrap(), before);
+    let after = std::fs::File::open(&lock).unwrap();
+    assert_eq!(
+        super::super::native_io::private_file_identity(&after).unwrap(),
+        identity
+    );
+    assert_eq!(after.metadata().unwrap().len(), metadata.len());
+    assert_eq!(
+        after.metadata().unwrap().modified().unwrap(),
+        metadata.modified().unwrap()
+    );
+    assert_eq!(
+        original.get("test", "key").await.unwrap().unwrap(),
+        b"original"
+    );
     original.close().await.unwrap();
+    assert_eq!(std::fs::read(&lock).unwrap(), expected);
 }
 
 #[tokio::test]
