@@ -76,6 +76,9 @@ impl SurrealKvStore {
 
     /// Open a persistent KV store with custom options.
     ///
+    /// Like [`Self::open`], opening an older database can convert it in place.
+    /// Callers preserving a legacy source must open a private copy.
+    ///
     /// # Errors
     ///
     /// Returns [`StorageError::Connection`] if the store cannot be opened.

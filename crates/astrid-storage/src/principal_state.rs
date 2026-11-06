@@ -55,7 +55,11 @@ mod lifecycle;
 pub use lifecycle::RuntimeLifecycleGuard;
 #[cfg(test)]
 mod hosted_volume_tests;
+#[cfg(feature = "legacy-surrealkv")]
+mod legacy_snapshot;
 mod migrations;
+#[cfg(feature = "legacy-surrealkv")]
+pub use legacy_snapshot::with_legacy_kv_snapshot;
 mod native_io;
 #[cfg(test)]
 mod native_kv_scale_probe_tests;

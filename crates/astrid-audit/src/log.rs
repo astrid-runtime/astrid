@@ -348,8 +348,10 @@ impl AuditLog {
                 "legacy audit source disappeared before retirement".to_owned(),
             ));
         }
-        let source = KvAuditStorage::open_legacy_source(legacy_path)?;
-        let receipt = digest_legacy_source(&source, destination_identity).await?;
+        let receipt = migration::with_frozen_legacy_source(legacy_path, async |source| {
+            digest_legacy_source(&source, destination_identity).await
+        })
+        .await?;
         if receipt.source_digest != expected_digest {
             return Err(AuditError::StorageError(
                 "legacy audit source changed before retirement".to_owned(),
@@ -876,6 +878,10 @@ impl AuditLog {
 #[cfg(test)]
 #[path = "batch_tests.rs"]
 mod batch_tests;
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "migration_source_tests.rs"]
+mod migration_source_tests;
+
 #[cfg(test)]
 #[path = "migration_capacity_tests.rs"]
 mod migration_capacity_tests;

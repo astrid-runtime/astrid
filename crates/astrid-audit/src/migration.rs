@@ -206,3 +206,26 @@ pub(crate) async fn copy_legacy_projection(
 ) -> AuditResult<u64> {
     crate::storage::blind_move::copy_projection(source, destination).await
 }
+
+/// Open only a private copy and close it even when the audit operation fails.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) async fn with_frozen_legacy_source<T>(
+    path: &Path,
+    operation: impl AsyncFnOnce(KvAuditStorage) -> AuditResult<T>,
+) -> AuditResult<T> {
+    astrid_storage::with_legacy_kv_snapshot(path, async |store| {
+        operation(KvAuditStorage::from_frozen_store(store)).await
+    })
+    .await
+    .map_err(|error| AuditError::StorageError(error.to_string()))?
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) async fn with_frozen_legacy_source<T>(
+    _path: &Path,
+    _operation: impl AsyncFnOnce(KvAuditStorage) -> AuditResult<T>,
+) -> AuditResult<T> {
+    Err(AuditError::StorageError(
+        "legacy audit disk import requires a native filesystem".to_owned(),
+    ))
+}

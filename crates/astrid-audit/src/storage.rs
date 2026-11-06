@@ -4,9 +4,12 @@ use crate::entry::AuditEntry;
 use crate::error::{AuditError, AuditResult};
 use astrid_capabilities::AuditEntryId;
 use astrid_core::SessionId;
-use astrid_storage::{KvStore, MemoryKvStore, SurrealKvStore};
+#[cfg(test)]
+use astrid_storage::SurrealKvStore;
+use astrid_storage::{KvStore, MemoryKvStore};
 use async_trait::async_trait;
 use std::collections::HashSet;
+#[cfg(test)]
 use std::path::Path;
 use std::sync::Arc;
 mod anchor_marks;
@@ -14,6 +17,7 @@ mod append;
 mod append_batch;
 pub(crate) mod blind_move;
 mod census;
+#[cfg(test)]
 mod frozen;
 mod global;
 mod heads_page;
@@ -322,12 +326,19 @@ pub(crate) struct KvAuditStorage {
 }
 
 impl KvAuditStorage {
+    #[cfg(test)]
     pub(crate) fn open_legacy_source(path: impl AsRef<Path>) -> AuditResult<Self> {
         let store =
             SurrealKvStore::open(path).map_err(|e| AuditError::StorageError(e.to_string()))?;
         Ok(Self {
             store: Arc::new(frozen::FrozenKvStore::new(Arc::new(store))),
         })
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn from_frozen_store(store: Arc<dyn KvStore>) -> Self {
+        // The scoped snapshot already freezes writes and invalidates handles.
+        Self { store }
     }
 
     #[cfg(test)]

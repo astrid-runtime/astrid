@@ -2,11 +2,9 @@
 
 use super::migration::{
     copy_legacy_projection, decode_receipt, digest_legacy_source, digest_storage, payload_matches,
-    validate_destination, validate_legacy_source_path,
+    validate_destination, validate_legacy_source_path, with_frozen_legacy_source,
 };
-use super::{
-    AuditError, AuditLog, AuditResult, AuditStorage, KvAuditStorage, LegacyAuditImportReport,
-};
+use super::{AuditError, AuditLog, AuditResult, LegacyAuditImportReport};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -25,37 +23,39 @@ impl AuditLog {
                 .await;
         }
 
-        let source = KvAuditStorage::open_legacy_source(&legacy_path)?;
-        let receipt = digest_legacy_source(&source, destination_identity).await?;
-        self.ensure_migration_capacity(&receipt)?;
-        if let Some(existing) = marker_before.as_deref() {
-            let prior = decode_receipt(existing)?;
-            if !payload_matches(&prior, &receipt) {
-                return Err(AuditError::StorageError(
-                    "legacy audit migration receipt conflicts with source or destination"
-                        .to_owned(),
-                ));
+        let (receipt, imported_entries) = with_frozen_legacy_source(&legacy_path, async |source| {
+            let receipt = digest_legacy_source(&source, destination_identity).await?;
+            self.ensure_migration_capacity(&receipt)?;
+            if let Some(existing) = marker_before.as_deref() {
+                let prior = decode_receipt(existing)?;
+                if !payload_matches(&prior, &receipt) {
+                    return Err(AuditError::StorageError(
+                        "legacy audit migration receipt conflicts with source or destination"
+                            .to_owned(),
+                    ));
+                }
             }
-        }
 
-        let Some(destination) = self.storage.as_kv_audit_storage() else {
-            return Err(AuditError::StorageError(
-                "native audit destination cannot accept raw payload MOVE".to_owned(),
-            ));
-        };
-        let imported_entries = copy_legacy_projection(&source, destination).await?;
-        // Payload digest only: prove the source tree did not change during the
-        // bulk write. This is not signature or chain recertify.
-        let source_after = digest_legacy_source(&source, destination_identity).await?;
-        if !payload_matches(&receipt, &source_after) {
-            return Err(AuditError::StorageError(
-                "legacy audit source changed during native volume move".to_owned(),
-            ));
-        }
-        self.storage.flush().await?;
-        self.prove_reopened_destination(destination_identity, &receipt)
-            .await?;
-        source.close().await?;
+            let Some(destination) = self.storage.as_kv_audit_storage() else {
+                return Err(AuditError::StorageError(
+                    "native audit destination cannot accept raw payload MOVE".to_owned(),
+                ));
+            };
+            let imported_entries = copy_legacy_projection(&source, destination).await?;
+            self.storage.flush().await?;
+            self.prove_reopened_destination(destination_identity, &receipt)
+                .await?;
+            Ok((receipt, imported_entries))
+        })
+        .await?;
+        // Re-open a fresh copy of the original source, not the converted copy,
+        // so source changes during MOVE still prevent marker publication.
+        self.verify_legacy_source_digest(
+            &legacy_path,
+            destination_identity,
+            &receipt.source_digest,
+        )
+        .await?;
         self.storage.clear_migration_temp().await?;
         validate_destination(&receipt, destination_identity)?;
         let marker = serde_json::to_vec(&receipt)
