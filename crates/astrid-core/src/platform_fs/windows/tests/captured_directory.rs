@@ -194,6 +194,17 @@ fn captured_directory_traversal_duplicate_cannot_rename_its_owner() {
     crate::platform_fs::create_private_directory(&directory).unwrap();
     let captured = CapturedDirectory::open(&directory).unwrap();
     let duplicate = captured.try_clone_directory_file().unwrap();
+    let child = directory.join("child");
+    crate::platform_fs::create_private_directory(&child).unwrap();
+    let (opened, _) = super::super::path::open_directory_identity_relative_with_access(
+        duplicate.as_raw_handle().cast(),
+        OsStr::new("child"),
+        false,
+        0,
+    )
+    .expect("traversal duplicate must resolve a child relative to the captured object");
+    drop(opened);
+    std::fs::remove_dir(child).unwrap();
     let parent = TrustedPathGuard::capture(root.path()).unwrap();
     let error = rename_guarded_handle(&duplicate, &parent, &moved, false)
         .expect_err("traversal duplicate must not carry the owner's rename authority");

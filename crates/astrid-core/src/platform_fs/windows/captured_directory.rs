@@ -82,7 +82,7 @@ impl CapturedDirectory {
     /// Duplicate the captured native directory object.
     ///
     /// The returned file duplicates the same object with only
-    /// `FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE`. It cannot
+    /// `FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE`. It cannot
     /// rename or delete the captured directory. It is not a second pathname
     /// open and remains bound to the object if ancestors later move.
     ///
@@ -100,7 +100,7 @@ impl CapturedDirectory {
                 self.file.as_raw_handle().cast(),
                 GetCurrentProcess(),
                 &raw mut duplicate,
-                FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
                 0,
                 0,
             )
