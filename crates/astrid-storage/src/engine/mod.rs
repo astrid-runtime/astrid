@@ -84,7 +84,8 @@ pub use refinery::{
 /// seal may skip only that identity loop when the consuming engine is the same
 /// process-local instance that hashed the records. Collision, closure, quota,
 /// and root compare-and-swap still run. Records may be empty when the commit
-/// closure is already present.
+/// closure is already present. Private checkpoint cache hints are likewise
+/// engine-bound and are discarded by cloning or untrusted reconstruction.
 #[derive(Debug)]
 pub struct RootTransaction<P> {
     principal: P,
@@ -92,6 +93,7 @@ pub struct RootTransaction<P> {
     commit: ObjectId,
     records: Vec<(ObjectId, ObjectRecord)>,
     identity_proof: IdentityProof,
+    kv_checkpoint_publication: Option<crate::kv::KvCheckpointPublication>,
 }
 
 impl<P> RootTransaction<P> {
@@ -109,7 +111,18 @@ impl<P> RootTransaction<P> {
             commit,
             records,
             identity_proof: IdentityProof::Untrusted,
+            kv_checkpoint_publication: None,
         }
+    }
+
+    pub(crate) fn with_kv_checkpoint_publication(
+        mut self,
+        publication: impl FnOnce() -> crate::kv::KvCheckpointPublication,
+    ) -> Self {
+        if matches!(self.identity_proof, IdentityProof::Engine(_)) {
+            self.kv_checkpoint_publication = Some(publication());
+        }
+        self
     }
 
     /// Borrow the target principal.
@@ -145,6 +158,7 @@ impl<P: Clone> Clone for RootTransaction<P> {
             commit: self.commit,
             records: self.records.clone(),
             identity_proof: IdentityProof::Untrusted,
+            kv_checkpoint_publication: None,
         }
     }
 }
@@ -394,8 +408,10 @@ impl<P: Ord, I: ObjectIdentity> InMemoryEngine<P, I> {
             commit,
             records,
             identity_proof,
+            kv_checkpoint_publication,
         } = transaction;
-        if !identity_proof.matches(&self.preparation_authority) {
+        let same_engine = identity_proof.matches(&self.preparation_authority);
+        if !same_engine {
             self.verify_identities(&records)?;
         }
         let mut world = self.world.write();
@@ -410,6 +426,13 @@ impl<P: Ord, I: ObjectIdentity> InMemoryEngine<P, I> {
 
         let objects_inserted = world.import_closure_owned(records, commit)?;
         let root = world.compare_and_swap_root(principal, expected, commit)?;
+        let retired_projection = if same_engine {
+            kv_checkpoint_publication.and_then(|publication| publication.try_publish(root))
+        } else {
+            None
+        };
+        drop(world);
+        drop(retired_projection);
         Ok(CommitOutcome {
             root,
             objects_inserted,

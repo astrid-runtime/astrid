@@ -38,6 +38,7 @@ mod node;
 mod overlay;
 #[cfg(all(test, feature = "legacy-surrealkv"))]
 mod performance_tests;
+mod publication;
 #[cfg(all(test, not(target_family = "wasm")))]
 mod retirement_tests;
 mod validation;
@@ -45,6 +46,7 @@ mod validation;
 pub(crate) use self::header::validated_projection_quota;
 pub use self::hot_cache::{KvReadCacheBudget, KvReadCacheCapacity, KvReadCacheConfig};
 pub(crate) use self::legacy_avl::migrate_principal as migrate_legacy_avl;
+pub(crate) use self::publication::{KvCheckpointPublication, RetiredKvProjection};
 pub(crate) use self::validation::CertifiedValueMembership;
 pub(super) use self::validation::TreeValidation;
 
@@ -250,6 +252,11 @@ where
     E: KvProjectionEngine<P> + 'static,
 {
     fn header(&self, owner: P) -> StorageResult<TreeHeader<P>> {
+        // Pin only this operation's existing immutable projection before root
+        // capture. A concurrent checkpoint may replace the shared cache while
+        // this reader loads its captured commit/state. Head matching below
+        // preserves that snapshot without retaining an extra owner history.
+        let captured_projection = self.validation.projections.lock().get(&owner).cloned();
         let Some(root) = self
             .engine
             .current_kv_root(&owner)
@@ -263,6 +270,7 @@ where
             root,
             self.validation.as_ref(),
             self.validated_content.as_ref(),
+            captured_projection,
         )
     }
 
@@ -485,6 +493,16 @@ where
         else {
             return Ok(false);
         };
+        let commit = transaction.commit();
+        let transaction = transaction.with_kv_checkpoint_publication(|| {
+            KvCheckpointPublication::new(
+                Arc::clone(&self.validation),
+                owner.clone(),
+                commit,
+                rebased.clone(),
+                validation,
+            )
+        });
         match self.engine.commit_kv_root(transaction) {
             Ok(outcome) => {
                 self.validation.publish_if_current(
@@ -657,7 +675,7 @@ where
     }
 
     #[cfg(test)]
-    pub(super) fn cached_checkpoint_for_test(
+    pub(crate) fn cached_checkpoint_for_test(
         &self,
         owner: &P,
     ) -> (

@@ -48,7 +48,8 @@ pub use scoped::ScopedKvStore;
 #[cfg(feature = "legacy-surrealkv")]
 pub use surreal::SurrealKvStore;
 pub(crate) use tree::{
-    CertifiedValueMembership, KvValidationCache, migrate_legacy_avl, validated_projection_quota,
+    CertifiedValueMembership, KvCheckpointPublication, KvValidationCache, RetiredKvProjection,
+    migrate_legacy_avl, validated_projection_quota,
 };
 pub use tree::{KvReadCacheBudget, KvReadCacheCapacity, KvReadCacheConfig, TreeKvStore};
 

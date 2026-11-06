@@ -724,8 +724,15 @@ where
             commit: commit_id,
             records,
             identity_proof,
+            kv_checkpoint_publication,
         } = transaction;
+        let same_engine = identity_proof.matches(&self.preparation_authority);
         self.verify_declared_identities(&records, &identity_proof)?;
+        let kv_checkpoint_publication = if same_engine {
+            kv_checkpoint_publication
+        } else {
+            None
+        };
         let actual = pending_roots
             .get(&principal)
             .copied()
@@ -802,6 +809,7 @@ where
             commit: commit_frame,
             journal,
             validated: reachable,
+            kv_checkpoint_publication,
         })
     }
 

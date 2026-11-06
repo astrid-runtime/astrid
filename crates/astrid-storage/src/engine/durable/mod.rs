@@ -730,6 +730,7 @@ struct Prepared<P: Ord> {
     commit: Option<(ObjectId, Arc<[u8]>)>,
     journal: Vec<u8>,
     validated: BTreeSet<ObjectId>,
+    kv_checkpoint_publication: Option<crate::kv::KvCheckpointPublication>,
 }
 
 fn ensure_usable<P: Ord>(inner: &DurableInner<P>) -> Result<(), DurableError> {

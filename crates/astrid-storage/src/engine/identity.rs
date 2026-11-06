@@ -58,6 +58,7 @@ impl<'a> KvIdentitySession<'a> {
             commit,
             records,
             identity_proof: IdentityProof::Engine(Arc::clone(self.authority)),
+            kv_checkpoint_publication: None,
         }
     }
 }

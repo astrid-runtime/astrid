@@ -145,6 +145,54 @@ impl Drop for SnapshotRead {
 }
 
 #[tokio::test]
+async fn captured_delta_read_keeps_only_its_own_projection_until_completion() {
+    let owner = "alice".to_owned();
+    let namespace = "alice:capsule:ownership";
+    let engine = Arc::new(GatedEngine::new());
+    let store = Arc::new(GatedStore::from_engine(Arc::clone(&engine), Resolver));
+    // Below automatic checkpoint admission: the test orders the sole checkpoint.
+    let mut seed = 0x12ab_56cd_90ef_3412;
+    let original: Vec<u8> = (0..512 * 1024)
+        .map(|_| next(&mut seed).to_le_bytes()[0])
+        .collect();
+    store
+        .set(namespace, "graph", original.clone())
+        .await
+        .unwrap();
+    let root = engine.measured.inner.root(&owner).unwrap();
+    let (entered, release) = engine.gate_once(root.commit);
+    let reader_store = Arc::clone(&store);
+    let reader = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(reader_store.get(namespace, "graph"))
+    });
+    let reader = SnapshotRead {
+        release: Some(release),
+        reader: Some(reader),
+    };
+    // Root capture precedes this blocked commit-object load. Publication may
+    // now replace the shared owner cache, but must not discard this read's pin.
+    entered.recv_timeout(Duration::from_secs(30)).unwrap();
+    assert!(store.checkpoint_for_test(owner.clone()).unwrap());
+    let checkpoint = store.cached_checkpoint_for_test(&owner);
+    engine
+        .measured
+        .loaded_chunk_bytes
+        .store(0, Ordering::Relaxed);
+    assert_eq!(reader.finish().unwrap(), Some(original));
+    assert_eq!(
+        engine.measured.loaded_chunk_bytes.load(Ordering::Relaxed),
+        0,
+        "a captured warm delta must not reconstruct its evicted overlay"
+    );
+    assert_eq!(store.cached_checkpoint_for_test(&owner), checkpoint);
+    store.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn delayed_snapshot_read_cannot_evict_newer_checkpoint_validation() {
     let owner = "alice".to_owned();
     let namespace = "alice:capsule:ownership";

@@ -66,6 +66,7 @@ pub(super) fn decode_header<P, E>(
     root: RootState,
     validation: &KvValidationCache<P>,
     validated_content: &Mutex<BTreeMap<P, CatalogValidation>>,
+    captured_projection: Option<Projection>,
 ) -> StorageResult<TreeHeader<P>>
 where
     P: Clone + Ord,
@@ -79,12 +80,16 @@ where
     let (projection, checkpoint) = match state.reference(&ReferenceLabel::new(KV_LABEL)) {
         None => (Projection::empty(), Some(TreeValidation::EMPTY)),
         Some(reference) if reference.kind() == ReferenceKind::Owns => {
-            let cached = validation
-                .projections
-                .lock()
-                .get(&owner)
+            let cached = captured_projection
                 .filter(|projection| projection.head == Some(reference.target()))
-                .cloned();
+                .or_else(|| {
+                    validation
+                        .projections
+                        .lock()
+                        .get(&owner)
+                        .filter(|projection| projection.head == Some(reference.target()))
+                        .cloned()
+                });
             if let Some(cached) = cached {
                 (cached, None)
             } else {
