@@ -68,3 +68,69 @@ fn exclusive_private_directory_is_exact_at_creation_and_refuses_reuse() {
         std::io::ErrorKind::AlreadyExists
     );
 }
+
+#[test]
+fn captured_directory_handle_moves_without_adopting_a_late_source_name() {
+    let _serial = serial_test_guard();
+    let root = private_temp();
+    let sources = root.path().join("sources");
+    let targets = root.path().join("targets");
+    crate::platform_fs::create_private_directory(&sources).unwrap();
+    crate::platform_fs::create_private_directory(&targets).unwrap();
+    let source = sources.join("source");
+    let staged = targets.join("staged");
+    crate::platform_fs::create_private_directory(&source).unwrap();
+    std::fs::write(source.join("data"), b"captured bytes").unwrap();
+    let source_parent = TrustedPathGuard::capture(&sources).unwrap();
+    let target_parent = TrustedPathGuard::capture(&targets).unwrap();
+    // One DELETE-capable handle also denies delete sharing. A second handle
+    // requesting DELETE would itself conflict with that namespace fence.
+    let (captured, expected) = open_directory_identity_relative_with_access(
+        source_parent.authority_handle(),
+        OsStr::new("source"),
+        true,
+        DELETE,
+    )
+    .unwrap();
+    let replacement = sources.join("replacement");
+    assert!(std::fs::rename(&source, &replacement).is_err());
+    assert!(source.is_dir());
+    assert!(!replacement.exists());
+    rename_guarded_handle(&captured, &target_parent, &staged, false).unwrap();
+    assert!(!source.exists());
+    assert_eq!(
+        std::fs::read(staged.join("data")).unwrap(),
+        b"captured bytes"
+    );
+    drop(captured);
+    let (confirmation, installed) = open_directory_identity_relative_with_access(
+        target_parent.authority_handle(),
+        OsStr::new("staged"),
+        false,
+        0,
+    )
+    .unwrap();
+    assert_eq!(installed, expected);
+    drop(confirmation);
+
+    crate::platform_fs::create_private_directory(&source).unwrap();
+    std::fs::write(source.join("sentinel"), b"new source must survive").unwrap();
+    let (captured, _) = open_directory_identity_relative_with_access(
+        source_parent.authority_handle(),
+        OsStr::new("source"),
+        true,
+        DELETE,
+    )
+    .unwrap();
+    // A destination collision must neither replace the existing tree nor
+    // remove the captured source. No pathname replacement fallback is allowed.
+    assert!(rename_guarded_handle(&captured, &target_parent, &staged, false).is_err());
+    assert_eq!(
+        std::fs::read(source.join("sentinel")).unwrap(),
+        b"new source must survive"
+    );
+    assert_eq!(
+        std::fs::read(staged.join("data")).unwrap(),
+        b"captured bytes"
+    );
+}

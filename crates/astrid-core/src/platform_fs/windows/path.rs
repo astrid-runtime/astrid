@@ -502,7 +502,7 @@ fn open_directory_identity_relative(
     open_directory_identity_relative_with_access(parent, name, lock_against_rename, 0)
 }
 
-fn open_directory_identity_relative_with_access(
+pub(super) fn open_directory_identity_relative_with_access(
     parent: HANDLE,
     name: &OsStr,
     lock_against_rename: bool,

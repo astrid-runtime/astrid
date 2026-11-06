@@ -5,6 +5,8 @@ use super::super::native_io::{PrivateDirectory, private_file_identity};
 use std::fs::{File, TryLockError};
 use std::path::Path;
 
+mod file_id;
+
 fn assert_writer_excluded(file: &File) {
     assert!(
         matches!(file.try_lock(), Err(TryLockError::WouldBlock)),
