@@ -6,7 +6,7 @@ pub(super) use std::io::{self, Read, Seek, Write};
 pub(super) use std::mem::size_of;
 pub(super) use std::os::windows::ffi::{OsStrExt, OsStringExt};
 pub(super) use std::os::windows::fs::MetadataExt;
-pub(super) use std::os::windows::io::{AsRawHandle, FromRawHandle};
+pub(super) use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 pub(super) use std::path::{Component, Path, PathBuf, Prefix};
 pub(super) use std::ptr::{null, null_mut};
 
@@ -14,11 +14,12 @@ pub(super) use directories::BaseDirs;
 pub(super) use serde::{Deserialize, Serialize};
 pub(super) use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 pub(super) use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_DELETE, FILE_DISPOSITION_INFORMATION_EX,
-    FILE_DISPOSITION_POSIX_SEMANTICS, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
-    FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
-    FILE_SYNCHRONOUS_IO_NONALERT, FileDispositionInformationEx, FileRenameInformation,
-    FileRenameInformationEx, NtCreateFile, NtSetInformationFile,
+    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_DELETE, FILE_DISPOSITION_INFORMATION,
+    FILE_DISPOSITION_INFORMATION_EX, FILE_DISPOSITION_POSIX_SEMANTICS, FILE_NON_DIRECTORY_FILE,
+    FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS,
+    FILE_RENAME_REPLACE_IF_EXISTS, FILE_SYNCHRONOUS_IO_NONALERT, FileDispositionInformation,
+    FileDispositionInformationEx, FileRenameInformation, FileRenameInformationEx, NtCreateFile,
+    NtSetInformationFile,
 };
 pub(super) use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, GENERIC_ALL, GENERIC_READ,
@@ -46,10 +47,11 @@ pub(super) use windows_sys::Win32::Security::{
 pub(super) use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA,
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES,
-    FILE_WRITE_DATA, FILE_WRITE_EA, GetFileInformationByHandle, GetVolumePathNameW, OPEN_EXISTING,
-    READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_LIST_DIRECTORY,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, FileIdInfo, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, GetVolumePathNameW, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE,
+    WRITE_DAC, WRITE_OWNER,
 };
 pub(super) use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 pub(super) use windows_sys::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;

@@ -17,6 +17,14 @@ use std::path::{Component, Path, PathBuf};
 #[path = "platform_fs/windows.rs"]
 mod windows;
 
+#[path = "platform_fs/directory_identity.rs"]
+mod directory_identity;
+
+pub use directory_identity::DirectoryIdentity;
+
+#[cfg(windows)]
+pub use windows::CapturedDirectory;
+
 #[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum AclPrincipal {

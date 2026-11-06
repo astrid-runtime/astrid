@@ -508,7 +508,7 @@ fn rename_guarded_file(
 /// Rename the retained source object, rather than re-resolving its old name.
 /// The caller owns the source handle; target authority remains parent-relative.
 pub(super) fn rename_guarded_handle(
-    source: &OwnedHandle,
+    source: &impl AsRawHandle,
     guard: &TrustedPathGuard,
     destination: &Path,
     replace: bool,
@@ -559,7 +559,7 @@ pub(super) fn rename_guarded_handle(
     // semantics so an existing target handle cannot force an unsafe fallback.
     let result = unsafe {
         NtSetInformationFile(
-            source.0,
+            source.as_raw_handle().cast(),
             &raw mut status,
             info.cast(),
             u32::try_from(buffer_bytes).expect("rename buffer length fits u32"),

@@ -23,6 +23,12 @@ impl Drop for OwnedHandle {
     }
 }
 
+impl AsRawHandle for OwnedHandle {
+    fn as_raw_handle(&self) -> RawHandle {
+        self.0
+    }
+}
+
 pub(super) fn mark_handle_for_deletion(handle: HANDLE) -> io::Result<()> {
     let disposition = FILE_DISPOSITION_INFORMATION_EX {
         Flags: FILE_DISPOSITION_DELETE | FILE_DISPOSITION_POSIX_SEMANTICS,
