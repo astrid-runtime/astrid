@@ -520,12 +520,17 @@ fn append_tree_range<S: ContentSource>(
             .ok_or(ContentError::LengthOverflow)?;
         if traversal.range.start < child_absolute_end && traversal.range.end > child_base {
             let child_index = u16::try_from(index).map_err(|_| ContentError::LengthOverflow)?;
-            let mut child_path = path.clone();
-            child_path.push(TreeStep {
-                tree: object,
-                child_index,
-                child_count: child_count_u16,
-            });
+            let child_path = if traversal.boundaries.is_some() {
+                let mut child_path = path.clone();
+                child_path.push(TreeStep {
+                    tree: object,
+                    child_index,
+                    child_count: child_count_u16,
+                });
+                child_path
+            } else {
+                Vec::new()
+            };
             selected.push((
                 child,
                 ExpectedShape {
