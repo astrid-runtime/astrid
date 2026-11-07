@@ -287,6 +287,9 @@ jobs:
           linux_native_fuse_mount_supports_all_required_operations --
           --ignored --nocapture
 
+      - name: Reject projection bind mounts in a private namespace
+        run: bash scripts/ci/test_projection_bind_mounts.sh
+
   check:
     name: Check
     runs-on: ubuntu-latest

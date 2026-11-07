@@ -3,6 +3,18 @@
 use super::Kernel;
 use std::sync::Arc;
 
+#[cfg(not(target_family = "wasm"))]
+type ShutdownFinalization = astrid_storage::principal_state::RuntimeFinalization;
+#[cfg(target_family = "wasm")]
+type ShutdownFinalization = ();
+
+#[derive(Clone, Copy)]
+enum StoreShutdown {
+    Close,
+    #[cfg(not(target_family = "wasm"))]
+    RetainForFinalization,
+}
+
 impl Kernel {
     /// Gracefully shut down the kernel.
     ///
@@ -10,6 +22,39 @@ impl Kernel {
     /// capsule producers. Publish the final projection and close durable stores
     /// after producers stop, then remove the Unix socket file.
     pub async fn shutdown(&self, reason: Option<String>) {
+        let _ = self.shutdown_ordered(reason, StoreShutdown::Close).await;
+    }
+
+    /// Stop producers while retaining the open store for daemon finalization.
+    ///
+    /// The host must stop its task runtime before consuming the returned token.
+    /// Ordinary callers should use [`Self::shutdown`] to close storage here.
+    ///
+    /// # Errors
+    /// Returns a storage error when native storage is unavailable or exclusive
+    /// handoff fails. Ancillary close errors stay with the returned token and
+    /// are reported after final packing. Producer-drain failures retain their
+    /// existing log and audit-health reporting.
+    /// Projection validation and publication are deferred to the finalizer.
+    #[cfg(not(target_family = "wasm"))]
+    pub async fn shutdown_for_finalization(
+        &self,
+        reason: Option<String>,
+    ) -> astrid_storage::StorageResult<astrid_storage::principal_state::RuntimeFinalization> {
+        self.shutdown_ordered(reason, StoreShutdown::RetainForFinalization)
+            .await?
+            .ok_or_else(|| {
+                astrid_storage::StorageError::Internal(
+                    "kernel has no native principal store".into(),
+                )
+            })
+    }
+
+    async fn shutdown_ordered(
+        &self,
+        reason: Option<String>,
+        mode: StoreShutdown,
+    ) -> astrid_storage::StorageResult<Option<ShutdownFinalization>> {
         tracing::info!(reason = ?reason, "Kernel shutting down");
         self.shutdown_tx.send_replace(true);
         self.runtime_work.close().await;
@@ -50,31 +95,11 @@ impl Kernel {
         self.drain_shutdown_capsules().await;
 
         // No admitted load/admin work or capsule producer may write after
-        // the final audit flush and projection publication.
+        // closing its audit projection. Retained mode publishes the final host
+        // projection only after the host task runtime has stopped.
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         self.audit_sink.shutdown();
-        // Publish before closing the engine. Daemon-host retirement follows
-        // task teardown; CLI recovery uses that same finalizer after process exit.
-        #[cfg(not(target_family = "wasm"))]
-        if let Some(store) = self.principal_store.as_ref()
-            && let Err(error) = store.publish_runtime_projection(&self.astrid_home)
-        {
-            tracing::error!(
-                error = %format!("{error:#}"),
-                "failed to publish running projection during shutdown"
-            );
-        }
-        if let Err(e) = self.kv.close().await {
-            tracing::warn!(error = %e, "Failed to flush KV store during shutdown");
-        }
-        // Release durable ownership after the final producer flush. Forced
-        // process termination also releases OS locks; it cannot claim a
-        // successfully finalized projection.
-        if let Err(e) = self.audit_log.close().await {
-            tracing::warn!(error = %e, "Failed to close audit log during shutdown");
-        }
-
-        tracing::info!("Kernel durable stores closed");
+        let finalization = self.finish_shutdown_storage(mode).await;
 
         // Remove the socket and token files so stale-socket detection works
         // on next boot and the auth token doesn't persist on disk after shutdown.
@@ -85,15 +110,64 @@ impl Kernel {
         // socket/PID/readiness files it manages) exist only on that profile.
         #[cfg(unix)]
         {
-            let socket_path = crate::socket::kernel_socket_path();
+            use astrid_core::dirs::AstridHome;
+
+            // The token captures the admitted runtime directory at boot. Never
+            // resolve process-wide environment paths again during teardown: an
+            // embedded kernel or changed override may refer to another runtime.
+            let socket_path = self.token_path.with_file_name(AstridHome::SOCKET_FILE_NAME);
             let _ = astrid_core::local_transport::remove_endpoint(&socket_path);
             let _ = std::fs::remove_file(&self.token_path);
-            crate::socket::remove_readiness_file();
-            crate::socket::remove_pid_file();
+            let _ =
+                std::fs::remove_file(self.token_path.with_file_name(AstridHome::READY_FILE_NAME));
+            let _ = std::fs::remove_file(self.token_path.with_file_name(AstridHome::PID_FILE_NAME));
         }
 
         tracing::info!("Kernel shutdown complete");
+        finalization
     }
+
+    async fn finish_shutdown_storage(
+        &self,
+        mode: StoreShutdown,
+    ) -> astrid_storage::StorageResult<Option<ShutdownFinalization>> {
+        let mut finalization = Ok(None);
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(store) = self.principal_store.as_ref() {
+            finalization = match mode {
+                StoreShutdown::Close => store
+                    .publish_runtime_projection(&self.astrid_home)
+                    .map(|()| None),
+                StoreShutdown::RetainForFinalization => {
+                    store.handoff_for_finalization(&self.astrid_home).map(Some)
+                },
+            };
+            if let Err(error) = &finalization {
+                tracing::error!(%error, "failed to finalize runtime storage during shutdown");
+            }
+        }
+        #[cfg(target_family = "wasm")]
+        let _ = mode;
+        // A successful handoff leaves the old engine permanently closed.
+        // Closing this projection releases its read cache without unlocking
+        // or closing the distinct finalization owner.
+        if let Err(error) = self.kv.close().await {
+            tracing::warn!(%error, "Failed to flush KV store during shutdown");
+            record_close_error(&mut finalization, error);
+        }
+        if let Err(error) = self.audit_log.close().await {
+            tracing::warn!(%error, "Failed to close audit log during shutdown");
+            record_close_error(
+                &mut finalization,
+                astrid_storage::StorageError::Internal(format!(
+                    "close audit log during shutdown: {error}"
+                )),
+            );
+        }
+        tracing::info!("Kernel durable stores quiesced");
+        finalization
+    }
+
     async fn drain_shutdown_capsules(&self) {
         let capsules = {
             let mut reg = self.capsules.write().await;
@@ -151,3 +225,24 @@ impl Kernel {
         }
     }
 }
+
+// A transferred owner is custody. An ancillary close error must not discard
+// it before late host writes can be packed after the runtime joins.
+fn record_close_error(
+    outcome: &mut astrid_storage::StorageResult<Option<ShutdownFinalization>>,
+    error: astrid_storage::StorageError,
+) {
+    match outcome {
+        #[cfg(not(target_family = "wasm"))]
+        Ok(Some(owner)) => owner.record_shutdown_error(error),
+        Ok(_) => *outcome = Err(error),
+        Err(previous) => {
+            *previous = astrid_storage::StorageError::Internal(format!(
+                "{previous}; additionally: {error}"
+            ));
+        },
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests;
