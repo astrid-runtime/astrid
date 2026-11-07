@@ -2,6 +2,8 @@
 
 #[path = "windows/acl.rs"]
 mod acl;
+#[path = "windows/captured_directory.rs"]
+mod captured_directory;
 #[path = "windows/error.rs"]
 mod error;
 #[path = "windows/executable.rs"]
@@ -17,10 +19,11 @@ mod private_file;
 #[path = "windows/rename.rs"]
 mod rename;
 
+pub use captured_directory::CapturedDirectory;
 pub(super) use executable::replace_executable_set;
 pub(super) use path::{
-    default_astrid_home_root, ensure_private_directory, restrict_private_file,
-    validate_private_file, verify_no_redirects,
+    create_private_directory, default_astrid_home_root, ensure_private_directory,
+    restrict_private_file, validate_private_file, verify_no_redirects,
 };
 pub(super) use private_file::{atomic_write_private_file, read_private_file_to_string};
 pub(super) use rename::rename_with_write_through;

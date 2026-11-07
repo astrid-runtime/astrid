@@ -32,7 +32,7 @@ mod hooks;
 mod host_fs;
 mod ledger;
 mod legacy_audit;
-use legacy_audit::handle_non_default_audit_source;
+use legacy_audit::{handle_non_default_audit_source, migrate_legacy_audit};
 mod legacy_permissions;
 use legacy_permissions::tighten_owner_controlled_path;
 mod legacy_tmp;
@@ -43,19 +43,19 @@ mod retirement;
 mod secret;
 mod source;
 #[cfg(unix)]
-use crate::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
+use crate::preflight_legacy_audit_sources;
 use env_import::import_env_and_secrets;
 #[cfg(test)]
 pub(crate) use hooks::inject_tmp_retirement_interruption_once;
 pub(crate) use hooks::interrupt_after_tmp_retirement_if_requested;
+#[cfg(not(unix))]
+use host_fs::preflight_legacy_audit_sources;
 use host_fs::{
     add_log_source, add_principal_scope_sources, add_source, collect_workspace_targets,
     ensure_legacy_secret_aliases, path_exists, read_bounded_file, require_layout_provenance,
     retire_empty_directory, snapshot_log_path, snapshot_owner_controlled_path, snapshot_path,
     storage_io, sync_parent, validate_source_path,
 };
-#[cfg(not(unix))]
-use host_fs::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
 use ledger::{
     DestinationProof, MigrationLedger, SourceCount, SourceDigest, SourceIdentity,
     collect_destination_proofs, decode_canonical, reject_unsupported_sources,
@@ -495,43 +495,6 @@ async fn import_legacy_control_state(
         .await
         .map_err(storage_io)?;
     import_gateway_revocations(home, store.kv()).await
-}
-
-async fn migrate_legacy_audit(home: &AstridHome, audit: &Arc<AuditLog>) -> io::Result<()> {
-    let default_audit = home.principal_home(&PrincipalId::default()).audit_dir();
-    let source_present = preflight_legacy_audit_sources(home, &default_audit)?;
-    if !source_present {
-        return Ok(());
-    }
-    let import_report = audit
-        .import_legacy_audit(&default_audit, "astrid-system-audit-v1")
-        .await
-        .map_err(|error| io::Error::other(format!("legacy audit migration failed: {error}")))?;
-    match fs::symlink_metadata(&default_audit) {
-        Ok(_) => {
-            preflight_legacy_audit_sources(home, &default_audit)?;
-            audit
-                .verify_legacy_source_digest(
-                    &default_audit,
-                    "astrid-system-audit-v1",
-                    &import_report.source_digest,
-                )
-                .await
-                .map_err(|error| {
-                    io::Error::other(format!(
-                        "legacy audit source changed before digest-bound retirement: {error}"
-                    ))
-                })?;
-            retire_legacy_audit_dir(home, &default_audit)?;
-        },
-        Err(error) if error.kind() == io::ErrorKind::NotFound && source_present => {
-            return Err(io::Error::other(
-                "legacy audit source disappeared before digest-bound retirement",
-            ));
-        },
-        Err(error) => return Err(error),
-    }
-    Ok(())
 }
 
 fn ensure_no_unretired_authority_receipts(

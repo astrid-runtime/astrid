@@ -8,6 +8,15 @@ use std::path::{Path, PathBuf};
 
 use cap_std::fs::Dir;
 
+#[cfg(feature = "legacy-surrealkv")]
+mod retirement;
+#[cfg(all(feature = "legacy-surrealkv", not(windows)))]
+pub(super) use retirement::validate_retirement_tree;
+#[cfg(feature = "legacy-surrealkv")]
+pub(super) use retirement::{CapturedDirectory, remove_retirement_contents};
+#[cfg(feature = "legacy-surrealkv")]
+mod from_captured;
+
 use crate::error::{StorageError, StorageResult};
 
 #[cfg(unix)]
@@ -258,7 +267,7 @@ impl PrivateDirectory {
 
     pub(super) fn entries(&self) -> StorageResult<Vec<OsString>> {
         self.directory
-            .read_dir(Path::new("."))
+            .entries()
             .map_err(|error| {
                 connection(format!(
                     "read private directory {}: {error}",
@@ -393,6 +402,10 @@ impl PrivateDirectory {
         destination: &Path,
     ) -> StorageResult<PrivateDirectory> {
         let source_directory = self.open_child(source)?;
+        let expected = source_directory.identity;
+        // Directory capabilities deliberately deny deletion on Windows. Save
+        // identity, then release this handle before the namespace transition.
+        drop(source_directory);
         if destination_directory.contains(destination)? {
             return Err(connection(format!(
                 "private rename destination {} already exists",
@@ -413,7 +426,7 @@ impl PrivateDirectory {
             ))
         })?;
         let installed = destination_directory.open_child(destination)?;
-        if installed.identity != source_directory.identity {
+        if installed.identity != expected {
             return Err(connection(format!(
                 "private destination {} does not name the verified directory",
                 destination_directory.path.join(destination).display()

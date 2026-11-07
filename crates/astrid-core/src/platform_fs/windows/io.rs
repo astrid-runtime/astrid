@@ -500,8 +500,20 @@ fn rename_guarded_file(
     replace: bool,
 ) -> io::Result<()> {
     let source_name = guarded_child_name(guard, source)?;
-    let destination_name = guarded_child_name(guard, destination)?;
+    guarded_child_name(guard, destination)?;
     let source = open_guarded_child(guard, source_name, DELETE | FILE_READ_ATTRIBUTES)?;
+    rename_guarded_handle(&source, guard, destination, replace)
+}
+
+/// Rename the retained source object, rather than re-resolving its old name.
+/// The caller owns the source handle; target authority remains parent-relative.
+pub(super) fn rename_guarded_handle(
+    source: &impl AsRawHandle,
+    guard: &TrustedPathGuard,
+    destination: &Path,
+    replace: bool,
+) -> io::Result<()> {
+    let destination_name = guarded_child_name(guard, destination)?;
     let destination_wide = destination_name.encode_wide().collect::<Vec<_>>();
     let name_bytes = destination_wide
         .len()
@@ -547,7 +559,7 @@ fn rename_guarded_file(
     // semantics so an existing target handle cannot force an unsafe fallback.
     let result = unsafe {
         NtSetInformationFile(
-            source.0,
+            source.as_raw_handle().cast(),
             &raw mut status,
             info.cast(),
             u32::try_from(buffer_bytes).expect("rename buffer length fits u32"),

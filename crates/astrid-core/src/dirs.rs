@@ -47,9 +47,11 @@ pub const LAYOUT_VERSION: &str = "2";
 pub const LEGACY_LAYOUT_VERSION: &str = "1";
 #[path = "dirs_layout.rs"]
 mod dirs_layout;
+#[cfg(windows)]
+pub(crate) use dirs_layout::validate_captured_legacy_source_tree;
 pub use dirs_layout::{
     LayoutMigrationTarget, preserve_legacy_source_tree, retire_legacy_source_tree,
-    retire_runtime_run_directory,
+    retire_runtime_run_directory, validate_legacy_source_tree,
 };
 #[path = "dirs_projection_retirement.rs"]
 mod projection_retirement;

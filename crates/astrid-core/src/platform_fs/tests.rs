@@ -244,3 +244,17 @@ fn unix_redirect_validation_accepts_regular_leaf_files_but_not_symlinks() {
     verify_no_redirects(&file).unwrap();
     assert!(verify_no_redirects(&redirect).is_err());
 }
+
+#[test]
+fn exclusive_private_directory_creation_refuses_existing_names() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("private");
+    create_private_directory(&path).unwrap();
+    validate_private_directory(&path).unwrap();
+    std::fs::write(path.join("preserved"), b"original").unwrap();
+    assert_eq!(
+        create_private_directory(&path).unwrap_err().kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(std::fs::read(path.join("preserved")).unwrap(), b"original");
+}

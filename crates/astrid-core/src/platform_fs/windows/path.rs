@@ -9,6 +9,11 @@ use super::acl::{
 use super::error::with_context;
 use super::prelude::*;
 
+#[path = "path/verification.rs"]
+mod verification;
+pub(super) use verification::verify_captured_no_redirects;
+pub(in crate::platform_fs) use verification::verify_no_redirects;
+
 pub(super) struct OwnedHandle(pub(super) HANDLE);
 
 impl Drop for OwnedHandle {
@@ -20,6 +25,12 @@ impl Drop for OwnedHandle {
                 CloseHandle(self.0);
             }
         }
+    }
+}
+
+impl AsRawHandle for OwnedHandle {
+    fn as_raw_handle(&self) -> RawHandle {
+        self.0
     }
 }
 
@@ -183,6 +194,10 @@ pub(super) enum BoundaryContract {
 
 impl TrustedPathGuard {
     pub(super) fn capture(path: &Path) -> io::Result<Self> {
+        Self::capture_with_directory(path, None)
+    }
+
+    fn capture_with_directory(path: &Path, captured: Option<(&Path, &File)>) -> io::Result<Self> {
         validate_local_absolute_path(path)?;
         let mut components: Vec<LockedPathComponent> = Vec::new();
         let mut current = PathBuf::new();
@@ -210,7 +225,11 @@ impl TrustedPathGuard {
                     ),
                 ));
             }
-            let (handle, identity) = if let Some(parent) = components.last() {
+            let (handle, identity) = if let Some((root, file)) = captured
+                && current == root
+            {
+                verification::capture_component(components.last(), &current, file)?
+            } else if let Some(parent) = components.last() {
                 open_directory_identity_relative(
                     parent.handle.0,
                     component.as_os_str(),
@@ -502,7 +521,7 @@ fn open_directory_identity_relative(
     open_directory_identity_relative_with_access(parent, name, lock_against_rename, 0)
 }
 
-fn open_directory_identity_relative_with_access(
+pub(super) fn open_directory_identity_relative_with_access(
     parent: HANDLE,
     name: &OsStr,
     lock_against_rename: bool,
@@ -785,6 +804,18 @@ pub(in crate::platform_fs) fn ensure_private_directory(path: &Path) -> io::Resul
     guard.create_private_descendants(path)
 }
 
+pub(in crate::platform_fs) fn create_private_directory(path: &Path) -> io::Result<()> {
+    validate_local_absolute_path(path)?;
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private directory has no parent",
+        )
+    })?;
+    let guard = TrustedPathGuard::capture(parent)?;
+    guard.create_private_descendants(path)
+}
+
 pub(in crate::platform_fs) fn restrict_private_file(path: &Path) -> io::Result<()> {
     validate_local_absolute_path(path)?;
     let parent = path
@@ -829,58 +860,6 @@ pub(super) fn nearest_existing_ancestor(path: &Path) -> io::Result<PathBuf> {
             ));
         }
     }
-}
-
-pub(in crate::platform_fs) fn verify_no_redirects(path: &Path) -> io::Result<()> {
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "security-sensitive Windows path must be absolute without traversal: {}",
-                path.display()
-            ),
-        ));
-    }
-
-    let mut current = PathBuf::new();
-    let mut rooted = false;
-    for component in path.components() {
-        current.push(component.as_os_str());
-        if matches!(component, Component::RootDir) {
-            rooted = true;
-        }
-        if !rooted {
-            continue;
-        }
-        let metadata = match std::fs::symlink_metadata(&current) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "security-sensitive Windows path contains a reparse point: {}",
-                    current.display()
-                ),
-            ));
-        }
-    }
-    let guard_path = match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => path.to_path_buf(),
-        Ok(_) => path
-            .parent()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?
-            .to_path_buf(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => nearest_existing_ancestor(path)?,
-        Err(error) => return Err(error),
-    };
-    TrustedPathGuard::capture(&guard_path)?.verify()
 }
 
 pub(super) fn validate_local_absolute_path(path: &Path) -> io::Result<()> {

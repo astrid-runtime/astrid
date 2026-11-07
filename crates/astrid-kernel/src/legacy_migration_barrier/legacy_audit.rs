@@ -1,8 +1,10 @@
-//! Layout-1 handling of non-default `.local/audit` leftovers.
+//! Layout-1 audit import, verified retirement, and non-default leftovers.
 //!
 //! 0.10.4 created empty audit directories for every principal. Only `default`
 //! has an importer. Empty non-default trees are retired; non-empty ones are
 //! quarantined with their bytes preserved.
+
+use super::{Arc, AuditLog, preflight_legacy_audit_sources};
 
 use std::fs;
 use std::io;
@@ -88,3 +90,37 @@ fn unique_destination(root: &Path, name: &str) -> io::Result<PathBuf> {
         "exhausted unique names for quarantined legacy audit tree",
     ))
 }
+
+pub(super) async fn migrate_legacy_audit(
+    home: &AstridHome,
+    audit: &Arc<AuditLog>,
+) -> io::Result<()> {
+    let default_audit = home.principal_home(&PrincipalId::default()).audit_dir();
+    if preflight_legacy_audit_sources(home, &default_audit)? {
+        audit
+            .import_legacy_audit(&default_audit, "astrid-system-audit-v1")
+            .await
+            .map_err(|error| io::Error::other(format!("legacy audit migration failed: {error}")))?;
+        // Revalidate other layout-1 sources before the audit owner authorizes
+        // retirement of this captured source generation.
+        if !preflight_legacy_audit_sources(home, &default_audit)? {
+            return Err(io::Error::other(
+                "legacy audit source disappeared before digest-bound retirement",
+            ));
+        }
+    }
+    // A missing original can still have an authorized, partially deleted
+    // stage. The audit MOVE receipt is the sole authority to resume it.
+    audit
+        .retire_legacy_audit(
+            &default_audit,
+            home.migrations_dir(),
+            "astrid-system-audit-v1",
+        )
+        .await
+        .map_err(|error| io::Error::other(format!("legacy audit retirement failed: {error}")))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;

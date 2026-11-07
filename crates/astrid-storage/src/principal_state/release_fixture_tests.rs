@@ -166,6 +166,16 @@ async fn published_v0104_home_imports_verifies_and_retires_legacy_store() {
     );
     assert!(home.storage_volume_path().is_file());
     assert!(home.principal_store_path().is_dir());
+    // SurrealKV 1.x converts the old on-disk format when opened. Import must
+    // open only the private snapshot, preserving the published-release source
+    // until Astrid's verified cutover explicitly authorizes retirement.
+    for (relative, expected) in &source_files {
+        assert_eq!(
+            std::fs::read(home.state_db_path().join(relative)).unwrap(),
+            expected.as_slice()
+        );
+    }
+    assert!(!home.state_db_path().join("_surrealkv_v0_backup").exists());
     home.complete_layout_v2(&migration_target).unwrap();
     assert!(!home.state_db_path().exists());
     assert!(!home.root().join("srv").exists());

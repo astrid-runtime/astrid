@@ -30,7 +30,7 @@ async fn append_test_entries(log: &AuditLog, session_id: &SessionId, count: u32)
 
 #[tokio::test]
 async fn empty_released_audit_database_has_canonical_zero_chain_receipt() {
-    let directory = tempfile::tempdir().expect("temporary legacy directory");
+    let directory = super::legacy_test_directory::temporary().expect("temporary legacy directory");
     let path = directory.path().join("audit-db");
     let key = Arc::new(KeyPair::generate());
     AuditLog::open_legacy_source(&path, Arc::clone(&key))
@@ -64,7 +64,7 @@ async fn empty_released_audit_database_has_canonical_zero_chain_receipt() {
 
 #[tokio::test]
 async fn legacy_import_ignores_unusable_oversized_session_index() {
-    let directory = tempfile::tempdir().expect("temporary legacy directory");
+    let directory = super::legacy_test_directory::temporary().expect("temporary legacy directory");
     let path = directory.path().join("audit-db");
     let key = Arc::new(KeyPair::generate());
     let session = SessionId::new();
@@ -130,7 +130,7 @@ async fn oversized_prior_receipt_is_rejected_before_serde_allocation() {
         .await
         .expect("install oversized prior marker");
 
-    let directory = tempfile::tempdir().expect("temporary source directory");
+    let directory = super::legacy_test_directory::temporary().expect("temporary source directory");
     let error = destination
         .import_legacy_audit(directory.path().join("missing"), "test-system-audit")
         .await
@@ -141,7 +141,7 @@ async fn oversized_prior_receipt_is_rejected_before_serde_allocation() {
 #[cfg(unix)]
 #[tokio::test]
 async fn legacy_import_rejects_redirected_source_before_destination_mutation() {
-    let directory = tempfile::tempdir().expect("temporary legacy directory");
+    let directory = super::legacy_test_directory::temporary().expect("temporary legacy directory");
     let real_source = directory.path().join("real-audit-db");
     std::fs::create_dir(&real_source).expect("real source directory");
     let redirected = directory.path().join("audit-db");
@@ -167,7 +167,7 @@ async fn legacy_import_rejects_redirected_source_before_destination_mutation() {
 
 #[tokio::test]
 async fn legacy_import_refuses_unobservable_capacity_before_destination_mutation() {
-    let directory = tempfile::tempdir().expect("temporary legacy directory");
+    let directory = super::legacy_test_directory::temporary().expect("temporary legacy directory");
     let path = directory.path().join("audit-db");
     let key = Arc::new(KeyPair::generate());
     let session = SessionId::new();
@@ -194,7 +194,7 @@ async fn legacy_import_refuses_unobservable_capacity_before_destination_mutation
 
 #[tokio::test]
 async fn legacy_import_refuses_insufficient_capacity_before_destination_mutation() {
-    let directory = tempfile::tempdir().expect("temporary legacy directory");
+    let directory = super::legacy_test_directory::temporary().expect("temporary legacy directory");
     let path = directory.path().join("audit-db");
     let key = Arc::new(KeyPair::generate());
     let session = SessionId::new();
@@ -340,7 +340,7 @@ impl KvStore for CountingKvStore {
 #[tokio::test]
 async fn legacy_move_batches_destination_publishes_by_page_not_entry() {
     const ENTRIES: u32 = 400;
-    let directory = tempfile::tempdir().expect("temporary legacy directory");
+    let directory = super::legacy_test_directory::temporary().expect("temporary legacy directory");
     let path = directory.path().join("audit-db");
     let key = Arc::new(KeyPair::generate());
     let session = SessionId::new();
@@ -399,7 +399,7 @@ async fn legacy_move_batches_destination_publishes_by_page_not_entry() {
 
 #[tokio::test]
 async fn legacy_move_does_not_recertify_historical_signatures() {
-    let directory = tempfile::tempdir().expect("temporary legacy directory");
+    let directory = super::legacy_test_directory::temporary().expect("temporary legacy directory");
     let path = directory.path().join("audit-db");
     let key = Arc::new(KeyPair::generate());
     let session = SessionId::new();
@@ -450,7 +450,7 @@ async fn legacy_move_does_not_recertify_historical_signatures() {
 
 #[tokio::test]
 async fn legacy_move_fails_closed_when_destination_cannot_reopen() {
-    let directory = tempfile::tempdir().expect("temporary legacy directory");
+    let directory = super::legacy_test_directory::temporary().expect("temporary legacy directory");
     let path = directory.path().join("audit-db");
     let key = Arc::new(KeyPair::generate());
     let session = SessionId::new();
@@ -470,7 +470,7 @@ async fn legacy_move_fails_closed_when_destination_cannot_reopen() {
 
 #[tokio::test]
 async fn legacy_move_refuses_nonempty_destination() {
-    let directory = tempfile::tempdir().expect("temporary legacy directory");
+    let directory = super::legacy_test_directory::temporary().expect("temporary legacy directory");
     let path = directory.path().join("audit-db");
     let key = std::sync::Arc::new(astrid_crypto::KeyPair::generate());
     let session = SessionId::new();
@@ -621,7 +621,7 @@ async fn local_blind_move_reopen_and_append() {
 
 #[tokio::test]
 async fn legacy_move_source_rejects_writes() {
-    let directory = tempfile::tempdir().expect("temporary legacy directory");
+    let directory = super::legacy_test_directory::temporary().expect("temporary legacy directory");
     let path = directory.path().join("audit-db");
     let key = std::sync::Arc::new(KeyPair::generate());
     let session = SessionId::new();

@@ -132,3 +132,10 @@ pub use principal_state::{
 };
 #[cfg(not(target_family = "wasm"))]
 pub use resident_cache::GovernedObjectCache;
+
+#[cfg(all(feature = "legacy-surrealkv", not(target_family = "wasm")))]
+pub use principal_state::{
+    LegacyRetirementIntent, LegacyRetirementStage, LegacySource, LegacySourceKind,
+    capture_authorized_legacy_retirement_stage, resume_legacy_retirement,
+    resume_staged_legacy_retirement, with_legacy_kv_snapshot,
+};

@@ -254,7 +254,7 @@ fn prepare_legacy_snapshot(source: &Path, destination: &Path) -> StorageResult<(
 }
 
 #[cfg(feature = "legacy-surrealkv")]
-fn copy_legacy_tree(
+pub(super) fn copy_legacy_tree(
     source: &super::native_io::PrivateDirectory,
     destination: &super::native_io::PrivateDirectory,
 ) -> StorageResult<()> {

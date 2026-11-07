@@ -1,26 +1,7 @@
-use super::{preflight_legacy_audit_sources, require_audit_integrity, retire_legacy_audit_dir};
+use super::{preflight_legacy_audit_sources, require_audit_integrity};
 use astrid_audit::ChainVerificationResult;
 use astrid_core::SessionId;
 use astrid_core::dirs::AstridHome;
-
-#[test]
-fn audit_retirement_validates_tree_and_removes_only_verified_source() {
-    let directory = tempfile::tempdir().expect("temporary home");
-    let home = AstridHome::from_path(directory.path().join(".astrid"));
-    home.ensure().expect("home layout");
-    let principal_home = home.principal_home(&astrid_core::PrincipalId::default());
-    principal_home.ensure().expect("legacy principal layout");
-    std::fs::write(principal_home.audit_dir().join("entry"), b"audit").expect("audit fixture");
-
-    retire_legacy_audit_dir(&home, &principal_home.audit_dir()).expect("retire audit source");
-    assert!(!principal_home.audit_dir().exists());
-    assert!(
-        !home
-            .migrations_dir()
-            .join("audit-principal-home.retired")
-            .exists()
-    );
-}
 
 #[cfg(unix)]
 #[test]
@@ -35,7 +16,8 @@ fn audit_retirement_rejects_redirects_before_removal() {
     std::os::unix::fs::symlink(&outside, principal_home.audit_dir().join("redirect"))
         .expect("redirect fixture");
 
-    assert!(retire_legacy_audit_dir(&home, &principal_home.audit_dir()).is_err());
+    assert!(preflight_legacy_audit_sources(&home, &principal_home.audit_dir()).is_err());
+    assert!(outside.exists());
     assert!(principal_home.audit_dir().exists());
 }
 

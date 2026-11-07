@@ -2,8 +2,10 @@
 //!
 //! Public Astrid path types stay in [`crate::dirs`]. This module owns the
 //! operating-system mechanics needed to make those paths private and to
-//! replace authenticated executables without exposing platform handles to the
-//! rest of the workspace.
+//! replace authenticated executables. Captured Windows directory owners may
+//! duplicate their native object as a standard File with traversal rights only.
+//! Mutation authority stays with the owner; removal still requires a
+//! handle-relative proof that the name is absent.
 
 #[cfg(target_os = "macos")]
 #[path = "platform_fs/macos_acl.rs"]
@@ -16,6 +18,14 @@ use std::path::{Component, Path, PathBuf};
 #[cfg(windows)]
 #[path = "platform_fs/windows.rs"]
 mod windows;
+
+#[path = "platform_fs/directory_identity.rs"]
+mod directory_identity;
+
+pub use directory_identity::DirectoryIdentity;
+
+#[cfg(windows)]
+pub use windows::CapturedDirectory;
 
 #[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -134,6 +144,43 @@ pub fn ensure_private_directory(path: &Path) -> io::Result<()> {
     #[cfg(not(any(unix, windows)))]
     {
         std::fs::create_dir_all(path)
+    }
+}
+
+/// Exclusively create one private directory beneath an existing trusted parent.
+///
+/// Unlike [`ensure_private_directory`], this never adopts an existing name.
+/// Windows installs the protected private DACL at namespace creation; callers
+/// must not first create an inheriting directory with a generic temp API.
+///
+/// # Errors
+///
+/// Returns an error if the name exists, its parent is missing or redirected,
+/// or the platform cannot create and validate the private directory.
+pub fn create_private_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use nix::sys::stat::{Mode, mkdirat};
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private directory has no parent",
+            )
+        })?;
+        let name = path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "private directory has no name")
+        })?;
+        let directory = open_directory_no_follow_unix(parent)?;
+        mkdirat(&directory, name, Mode::from_bits_truncate(0o700)).map_err(nix_io_error)?;
+        ensure_private_directory_unix(path)
+    }
+    #[cfg(windows)]
+    {
+        windows::create_private_directory(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        std::fs::create_dir(path)
     }
 }
 

@@ -38,6 +38,14 @@ pub(super) fn legacy_tree_device(_metadata: &std::fs::Metadata) -> u64 {
 }
 
 pub(super) fn validate_legacy_tree(path: &Path, root_device: u64) -> io::Result<()> {
+    validate_legacy_tree_using(path, root_device, &crate::platform_fs::verify_no_redirects)
+}
+
+pub(super) fn validate_legacy_tree_using(
+    path: &Path,
+    root_device: u64,
+    verify_path: &impl Fn(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
         return Err(io::Error::new(
@@ -51,7 +59,7 @@ pub(super) fn validate_legacy_tree(path: &Path, root_device: u64) -> io::Result<
             format!("legacy state source is not a directory: {}", path.display()),
         ));
     }
-    crate::platform_fs::verify_no_redirects(path)?;
+    verify_path(path)?;
     ensure_legacy_tree_boundary(path, root_device, &metadata)?;
 
     for entry in std::fs::read_dir(path)? {
@@ -69,11 +77,11 @@ pub(super) fn validate_legacy_tree(path: &Path, root_device: u64) -> io::Result<
         }
         ensure_legacy_tree_boundary(&child, root_device, &child_metadata)?;
         if child_metadata.is_dir() {
-            validate_legacy_tree(&child, root_device)?;
+            validate_legacy_tree_using(&child, root_device, verify_path)?;
         } else if child_metadata.is_file() {
             // Opening only after the no-follow validation ensures a replaced
             // symlink is rejected rather than read or removed through it.
-            crate::platform_fs::verify_no_redirects(&child)?;
+            verify_path(&child)?;
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
