@@ -9,6 +9,8 @@ use std::path::Path;
 mod tests;
 #[cfg(unix)]
 mod unix;
+#[cfg(unix)]
+pub use unix::PreparedProjectionRetirement;
 
 const CANONICAL_VOLUME: &str = "astrid.volume";
 

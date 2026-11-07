@@ -105,6 +105,18 @@ impl super::RuntimePrincipalStore {
                 StorageError::Connection(format!("validate retained runtime volume: {error}"))
             })
     }
+
+    #[cfg(unix)]
+    pub(super) fn retirement_volume_file(&self, home: &AstridHome) -> StorageResult<File> {
+        let volume = self.volume_binding.upgrade().ok_or_else(|| {
+            StorageError::Connection("retained runtime volume is already closed".into())
+        })?;
+        volume
+            .retirement_file(&home.storage_volume_path())
+            .map_err(|error| {
+                StorageError::Connection(format!("capture retained runtime volume: {error}"))
+            })
+    }
 }
 
 impl RuntimeFinalization {

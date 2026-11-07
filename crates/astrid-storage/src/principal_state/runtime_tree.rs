@@ -21,6 +21,7 @@ mod key_recovery;
 #[cfg(test)]
 mod key_recovery_tests;
 mod projection;
+mod retirement;
 use projection::{confined_projection_path, write_projection_file};
 
 const VOLUME_PATH_PREFIX: &str = "volume";
@@ -570,20 +571,13 @@ pub(super) fn pack_and_retire_projection(
         }
     }
     transition_retiring_projection(home, store)?;
-    store.require_volume_binding(home)?;
-    retire_projection(home)?;
+    retirement::retire_current_projection(home, store)?;
     active::clear(store, home).map(|_| ())
 }
 
 fn is_staging_generation(name: &str) -> bool {
     name.strip_prefix("var/content-staging/generations/")
         .is_some_and(|name| name.ends_with(".sealed"))
-}
-
-fn retire_projection(home: &AstridHome) -> StorageResult<()> {
-    let root = home.root();
-    astrid_core::dirs::retire_projection_root(root)
-        .map_err(|error| tree_error(root, format!("retire projection: {error}")))
 }
 
 fn active_projection_entries(
@@ -767,8 +761,7 @@ fn legacy_projection_pack(home: &AstridHome, store: &RuntimePrincipalStore) -> S
         .content()
         .flush()
         .map_err(|error| tree_error(home.root(), format!("flush volume projection: {error}")))?;
-    store.require_volume_binding(home)?;
-    retire_projection(home)
+    retirement::retire_legacy_projection(home, store)
 }
 fn tree_io_error(error: &std::io::Error) -> StorageError {
     StorageError::Connection(error.to_string())

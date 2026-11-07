@@ -288,13 +288,7 @@ jobs:
           --ignored --nocapture
 
       - name: Reject projection bind mounts in a private namespace
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 scripts/test_cargo_test_executable.py
-          test_binary=$(cargo test --locked -p astrid-core --lib --no-run --message-format=json | python3 scripts/ci/cargo_test_executable.py astrid_core)
-          sudo unshare --mount --propagation private -- "$test_binary" \
-            bind_mount_ --ignored --nocapture --test-threads=1
+        run: bash scripts/ci/test_projection_bind_mounts.sh
 
   check:
     name: Check

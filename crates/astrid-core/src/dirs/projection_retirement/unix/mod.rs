@@ -4,7 +4,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::os::unix::ffi::OsStrExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use nix::fcntl::{AtFlags, OFlag, openat};
 use nix::sys::stat::{FileStat, Mode, SFlag, fstat, fstatat};
@@ -23,10 +23,155 @@ struct RootBoundary {
     mount: crate::platform_fs::MountId,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Traversal {
-    Preflight,
-    Delete,
+struct PlannedEntry {
+    name: OsString,
+    identity: FileStat,
+    children: Vec<PlannedEntry>,
+}
+
+/// Captured namespace authority and complete, ephemeral preflight inventory.
+///
+/// Only the root descriptor is retained. Entries are reopened without following
+/// redirects and must retain their captured identity before they can be removed.
+/// Dropping this plan performs no deletion.
+pub struct PreparedProjectionRetirement {
+    directory: File,
+    path: PathBuf,
+    boundary: RootBoundary,
+    inventory: Vec<PlannedEntry>,
+    regular_files: Vec<PathBuf>,
+}
+
+impl PreparedProjectionRetirement {
+    /// Validate every entry and capture the names and identities eligible for retirement.
+    ///
+    /// # Errors
+    /// Returns an error for redirected, special, inaccessible, or cross-mount entries.
+    pub fn prepare(root: &Path) -> io::Result<Self> {
+        let directory = crate::platform_fs::open_existing_directory_no_follow(root)?;
+        let boundary = RootBoundary {
+            identity: fstat(&directory).map_err(os_error)?,
+            #[cfg(target_os = "linux")]
+            mount: crate::platform_fs::MountId::of(&directory)?,
+        };
+        let mut regular_files = Vec::new();
+        let inventory = capture(
+            &directory,
+            root,
+            Path::new(""),
+            &boundary,
+            &mut regular_files,
+        )?;
+        Ok(Self {
+            directory,
+            path: root.to_owned(),
+            boundary,
+            inventory,
+            regular_files,
+        })
+    }
+
+    /// Regular projection files relative to the captured root, excluding `astrid.volume`.
+    /// Callers must validate these against their durable receipt before retiring.
+    pub fn regular_files(&self) -> impl Iterator<Item = &Path> {
+        self.regular_files.iter().map(PathBuf::as_path)
+    }
+
+    /// Remove only captured entries, retaining the actual engine-held canonical volume.
+    ///
+    /// # Errors
+    /// Returns an error if the expected volume, root binding, inventory, or any
+    /// captured identity changes, or removal or the root durability barrier fails.
+    /// After any error the caller must retain its durable retirement receipt.
+    pub fn retire(self, expected_volume: &File) -> io::Result<()> {
+        let expected = fstat(expected_volume).map_err(os_error)?;
+        self.retire_with_hooks(
+            Some(&expected),
+            &mut RetirementHooks {
+                before_unlink: |_: &Path| Ok(()),
+                sync_directory: |directory: &File, _: &Path| directory.sync_all(),
+            },
+        )
+    }
+
+    fn require_root(&self) -> io::Result<()> {
+        let confirmation = crate::platform_fs::open_existing_directory_no_follow(&self.path)?;
+        require_identity(
+            &self.boundary.identity,
+            &fstat(&confirmation).map_err(os_error)?,
+            &self.path,
+        )?;
+        #[cfg(target_os = "linux")]
+        self.boundary
+            .mount
+            .require_same(&confirmation, &self.path)?;
+        Ok(())
+    }
+
+    fn require_volume(&self, expected: Option<&FileStat>) -> io::Result<()> {
+        let planned = self
+            .inventory
+            .iter()
+            .find(|entry| entry.name == OsStr::new(CANONICAL_VOLUME));
+        let path = self.path.join(CANONICAL_VOLUME);
+        if let Some(expected) = expected {
+            let planned = planned.ok_or_else(|| invalid(&path, "canonical volume is missing"))?;
+            require_identity(expected, &planned.identity, &path)?;
+        }
+        if let Some(planned) = planned {
+            let current = open_entry(
+                &self.directory,
+                OsStr::new(CANONICAL_VOLUME),
+                &path,
+                &self.boundary,
+            )?;
+            require_identity(&planned.identity, current.identity(), &path)?;
+        }
+        Ok(())
+    }
+
+    fn require_survivors(&self, expected: Option<&FileStat>) -> io::Result<()> {
+        self.require_root()?;
+        self.require_volume(expected)?;
+        let names = entries(&self.directory)?;
+        let planned_volume = self
+            .inventory
+            .iter()
+            .find(|entry| entry.name == OsStr::new(CANONICAL_VOLUME));
+        if names.len() != usize::from(planned_volume.is_some())
+            || names
+                .iter()
+                .any(|name| name != OsStr::new(CANONICAL_VOLUME))
+        {
+            return Err(invalid(&self.path, "projection contains unretired entries"));
+        }
+        Ok(())
+    }
+
+    fn retire_with_hooks(
+        self,
+        expected: Option<&FileStat>,
+        hooks: &mut RetirementHooks<
+            impl FnMut(&Path) -> io::Result<()>,
+            impl FnMut(&File, &Path) -> io::Result<()>,
+        >,
+    ) -> io::Result<()> {
+        self.require_root()?;
+        self.require_volume(expected)?;
+        delete_inventory(
+            &self.directory,
+            &self.path,
+            &self.boundary,
+            &self.inventory,
+            true,
+            hooks,
+        )?;
+        self.require_survivors(expected)?;
+        // Removed descendants need no independent barrier: the retained durable
+        // volume remains recovery authority until the root namespace is committed.
+        (hooks.sync_directory)(&self.directory, &self.path)?;
+        self.require_survivors(expected)
+    }
 }
 
 // Directories carry traversal authority. Linux regular leaves retain an
@@ -90,111 +235,116 @@ fn retire_with_io_hooks(
     before_unlink: impl FnMut(&Path) -> io::Result<()>,
     sync_directory: impl FnMut(&File, &Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    let mut hooks = RetirementHooks {
-        before_unlink,
-        sync_directory,
-    };
-    let directory = crate::platform_fs::open_existing_directory_no_follow(root)?;
-    let boundary = RootBoundary {
-        identity: fstat(&directory).map_err(os_error)?,
-        #[cfg(target_os = "linux")]
-        mount: crate::platform_fs::MountId::of(&directory)?,
-    };
-    walk(
-        &directory,
-        root,
-        &boundary,
-        Traversal::Preflight,
-        true,
-        &mut hooks,
-    )?;
+    let plan = PreparedProjectionRetirement::prepare(root)?;
     before_delete()?;
-    // Reconfirm the ambient binding once before mutation. Descendants are
-    // subsequently opened relative to this retained authority, never through
-    // a potentially replaced absolute ancestor chain.
-    let confirmation = crate::platform_fs::open_existing_directory_no_follow(root)?;
-    require_identity(
-        &boundary.identity,
-        &fstat(&confirmation).map_err(os_error)?,
-        root,
-    )?;
-    #[cfg(target_os = "linux")]
-    boundary.mount.require_same(&confirmation, root)?;
-    walk(
-        &directory,
-        root,
-        &boundary,
-        Traversal::Delete,
-        true,
-        &mut hooks,
+    plan.retire_with_hooks(
+        None,
+        &mut RetirementHooks {
+            before_unlink,
+            sync_directory,
+        },
     )
 }
 
-fn walk(
+fn capture(
+    directory: &File,
+    path: &Path,
+    relative: &Path,
+    root: &RootBoundary,
+    regular_files: &mut Vec<PathBuf>,
+) -> io::Result<Vec<PlannedEntry>> {
+    let mut inventory = Vec::new();
+    for name in entries(directory)? {
+        let child_path = path.join(&name);
+        let child_relative = relative.join(&name);
+        let child = open_entry(directory, &name, &child_path, root)?;
+        let canonical = relative.as_os_str().is_empty() && name == OsStr::new(CANONICAL_VOLUME);
+        if canonical && child.directory().is_some() {
+            return Err(invalid(
+                &child_path,
+                "canonical volume is not a regular file",
+            ));
+        }
+        let children = if let Some(handle) = child.directory() {
+            capture(handle, &child_path, &child_relative, root, regular_files)?
+        } else {
+            if !canonical {
+                regular_files.push(child_relative);
+            }
+            Vec::new()
+        };
+        inventory.push(PlannedEntry {
+            name,
+            identity: *child.identity(),
+            children,
+        });
+    }
+    Ok(inventory)
+}
+
+fn delete_inventory(
     directory: &File,
     path: &Path,
     root: &RootBoundary,
-    traversal: Traversal,
+    inventory: &[PlannedEntry],
     is_root: bool,
     hooks: &mut RetirementHooks<
         impl FnMut(&Path) -> io::Result<()>,
         impl FnMut(&File, &Path) -> io::Result<()>,
     >,
 ) -> io::Result<()> {
-    for name in entries(directory)? {
-        let child_path = path.join(&name);
-        let child = open_entry(directory, &name, &child_path, root)?;
-        // Validate the canonical survivor too, including special files and
-        // redirects. Only its deletion is excluded.
+    // A listing only confirms the captured plan; it never grants deletion
+    // authority to newly observed names. Missing captured names fail closed too.
+    let names = entries(directory)?;
+    if !names.iter().eq(inventory.iter().map(|entry| &entry.name)) {
+        return Err(invalid(
+            path,
+            "projection inventory changed after preflight",
+        ));
+    }
+    for planned in inventory {
+        let name = &planned.name;
+        let child_path = path.join(name);
+        let child = open_entry(directory, name, &child_path, root)?;
+        require_identity(&planned.identity, child.identity(), &child_path)?;
         if is_root && name == OsStr::new(CANONICAL_VOLUME) {
-            if child.directory().is_some() {
-                return Err(invalid(
-                    &child_path,
-                    "canonical volume is not a regular file",
-                ));
-            }
             continue;
         }
         if let Some(child_directory) = child.directory() {
-            walk(child_directory, &child_path, root, traversal, false, hooks)?;
+            delete_inventory(
+                child_directory,
+                &child_path,
+                root,
+                &planned.children,
+                false,
+                hooks,
+            )?;
         }
-        if traversal == Traversal::Delete {
-            (hooks.before_unlink)(&child_path)?;
-            // Do not unlink a different object that replaced the opened entry
-            // while its contents were being walked. unlinkat never follows a
-            // last-component redirect, even if replacement wins after this check.
-            let current = fstatat(directory, name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
-                .map_err(os_error)?;
-            require_identity(child.identity(), &current, &child_path)?;
-            check_boundary(&child_path, root, &current)?;
-            #[cfg(target_os = "linux")]
-            let _mount_confirmation = {
-                // A bind mount can preserve dev/ino/type while changing the
-                // mounted object behind this name during the subtree walk.
-                let confirmation = open_entry(directory, &name, &child_path, root)?;
-                require_identity(child.identity(), confirmation.identity(), &child_path)?;
-                confirmation
-            };
-            let flags = if child.directory().is_some() {
-                UnlinkatFlags::RemoveDir
-            } else {
-                UnlinkatFlags::NoRemoveDir
-            };
-            unlinkat(directory, name.as_os_str(), flags).map_err(os_error)?;
-            if is_root && child.directory().is_some() {
-                // The former per-subtree retirement also flushed its parent
-                // after every top-level directory removal, before proceeding
-                // to later siblings. Keep that barrier as well as the final one.
-                (hooks.sync_directory)(directory, path)?;
-            }
+        (hooks.before_unlink)(&child_path)?;
+        // Do not unlink a different object that replaced the opened entry
+        // while its contents were being walked. unlinkat never follows a
+        // last-component redirect, even if replacement wins after this check.
+        let current =
+            fstatat(directory, name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW).map_err(os_error)?;
+        require_identity(&planned.identity, &current, &child_path)?;
+        check_boundary(&child_path, root, &current)?;
+        #[cfg(target_os = "linux")]
+        let _mount_confirmation = {
+            // Bind mounts can preserve dev/ino/type while replacing a name.
+            let confirmation = open_entry(directory, name, &child_path, root)?;
+            require_identity(&planned.identity, confirmation.identity(), &child_path)?;
+            confirmation
+        };
+        let flags = if child.directory().is_some() {
+            UnlinkatFlags::RemoveDir
+        } else {
+            UnlinkatFlags::NoRemoveDir
+        };
+        unlinkat(directory, name.as_os_str(), flags).map_err(os_error)?;
+        if is_root && child.directory().is_some() {
+            // Preserve the existing root barrier after each top-level directory.
+            (hooks.sync_directory)(directory, path)?;
         }
-    }
-    if traversal == Traversal::Delete && is_root {
-        // The root barrier makes removed ancestor names durably absent. A
-        // descendant that is itself removed needs no independent barrier:
-        // interrupted retirement retains the durable volume as its authority.
-        // The caller may clear its RETIRING receipt only after this succeeds.
-        (hooks.sync_directory)(directory, path)?;
     }
     Ok(())
 }
