@@ -22,7 +22,7 @@ pub(super) fn existing_volume_available(home: &AstridHome) -> StorageResult<bool
 pub(super) fn open_existing(
     home: &AstridHome,
     policy: DurableEnginePolicy<StateOwner>,
-) -> StorageResult<Option<(RuntimeEngine, String)>> {
+) -> StorageResult<Option<(RuntimeEngine, String, Arc<HostedFileVolume>)>> {
     let Some(path) = promote_legacy_volume(home)? else {
         return Ok(None);
     };
@@ -44,7 +44,7 @@ pub(super) fn open_existing(
     // expected to advance after that boundary, so ordinary reopen validates
     // the durable marker without comparing it to the current mutable roots.
     let receipt = require_cutover_receipt(volume.as_ref(), None)?;
-    Ok(Some((engine, receipt)))
+    Ok(Some((engine, receipt, volume)))
 }
 
 /// Resolve the canonical volume and promote a released legacy path once.
@@ -101,7 +101,7 @@ fn legacy_volume_path(home: &AstridHome) -> StorageResult<std::path::PathBuf> {
 pub(super) fn initialize_volume(
     home: &AstridHome,
     policy: DurableEnginePolicy<StateOwner>,
-) -> StorageResult<(RuntimeEngine, String)> {
+) -> StorageResult<(RuntimeEngine, String, Arc<HostedFileVolume>)> {
     let destination = home.storage_volume_path();
     let temporary = destination.with_extension("migrating");
     if temporary.exists() {
@@ -157,7 +157,7 @@ pub(super) fn initialize_volume(
     )
     .map_err(|error| connection(format!("open verified fresh Astrid volume: {error}")))?;
     let receipt = require_cutover_receipt(volume.as_ref(), Some(&[]))?;
-    Ok((engine, receipt))
+    Ok((engine, receipt, volume))
 }
 
 fn inspect_volume_entry(path: &std::path::Path) -> StorageResult<bool> {
@@ -181,7 +181,7 @@ pub(super) fn migrate_directory_store(
     home: &AstridHome,
     source: Arc<RuntimeEngine>,
     policy: DurableEnginePolicy<StateOwner>,
-) -> StorageResult<(RuntimeEngine, String)> {
+) -> StorageResult<(RuntimeEngine, String, Arc<HostedFileVolume>)> {
     let snapshots = snapshots(&source)?;
     let destination = home.storage_volume_path();
     let temporary = destination.with_extension("migrating");
@@ -252,7 +252,7 @@ pub(super) fn migrate_directory_store(
         .close()
         .map_err(|error| connection(format!("close retired directory store: {error}")))?;
     drop(source);
-    Ok((engine, receipt))
+    Ok((engine, receipt, volume))
 }
 
 pub(super) fn retire_verified_directory_if_present(

@@ -703,6 +703,15 @@ impl AstridHome {
         crate::runtime_scratch::clear_principal_scratch(&self.run_dir().join("principals"))
     }
 
+    /// Canonical runtime socket filename; fixed by the host-local filesystem contract.
+    pub const SOCKET_FILE_NAME: &str = "system.sock";
+    /// Canonical authentication token filename in the admitted runtime directory.
+    pub const TOKEN_FILE_NAME: &str = "system.token";
+    /// Canonical readiness sentinel filename in the admitted runtime directory.
+    pub const READY_FILE_NAME: &str = "system.ready";
+    /// Canonical process identifier filename in the admitted runtime directory.
+    pub const PID_FILE_NAME: &str = "system.pid";
+
     /// Portable endpoint token for the kernel's host-local transport.
     ///
     /// Unix uses this as the domain-socket path (`run/system.sock`). Windows
@@ -710,13 +719,13 @@ impl AstridHome {
     /// deliberately ignores the filesystem-shaped value.
     #[must_use]
     pub fn socket_path(&self) -> PathBuf {
-        self.run_dir().join("system.sock")
+        self.run_dir().join(Self::SOCKET_FILE_NAME)
     }
 
     /// Path to the session authentication token (`run/system.token`).
     #[must_use]
     pub fn token_path(&self) -> PathBuf {
-        self.run_dir().join("system.token")
+        self.run_dir().join(Self::TOKEN_FILE_NAME)
     }
 
     /// Path to the daemon readiness sentinel (`run/system.ready`).
@@ -726,7 +735,7 @@ impl AstridHome {
     /// to avoid connecting before the daemon is fully initialized.
     #[must_use]
     pub fn ready_path(&self) -> PathBuf {
-        self.run_dir().join("system.ready")
+        self.run_dir().join(Self::READY_FILE_NAME)
     }
 
     /// Path to the daemon PID file (`run/system.pid`).
@@ -740,7 +749,7 @@ impl AstridHome {
     /// `astrid start`.
     #[must_use]
     pub fn pid_path(&self) -> PathBuf {
-        self.run_dir().join("system.pid")
+        self.run_dir().join(Self::PID_FILE_NAME)
     }
 
     /// Path to the deferred queue database (`run/deferred.db/`).
