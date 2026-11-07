@@ -5,11 +5,12 @@
 //! projection and authorizes reconciliation. RETIRING is a durable inventory
 //! publication and never infers deletions from a partially retired host.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::content::ContentName;
+use crate::content::{ContentEntry, ContentName};
 use crate::error::{StorageError, StorageResult};
 use crate::storage_model::ObjectId;
 use astrid_core::dirs::AstridHome;
@@ -18,9 +19,10 @@ use super::{RuntimePrincipalStore, StateOwner, runtime_tree::is_excluded};
 
 pub(super) const ACTIVE_PROJECTION_NAME: &str = "run/.active-projection-v1.json";
 const RECEIPT_SCHEMA: u32 = 1;
-// A projection inventory is catalog metadata, not a quota. This bounds a
-// corrupted or hostile receipt before allocating its JSON payload.
-const MAX_RECEIPT_BYTES: u64 = 4 * 1024 * 1024;
+// Preserve the historical allowance for receipt framing and root spelling.
+// Inventory allowance is derived separately from authenticated live catalog
+// names, so a large fleet does not outgrow a fixed 4 MiB inventory ceiling.
+const RECEIPT_FRAMING_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ActiveProjectionEntry {
@@ -55,7 +57,9 @@ impl ActiveProjectionReceipt {
     }
 
     pub(super) fn contains_inventory_name(&self, name: &str) -> bool {
-        self.entries.iter().any(|entry| entry.name == name)
+        self.entries
+            .binary_search_by(|entry| entry.name.as_str().cmp(name))
+            .is_ok()
     }
 
     #[cfg(test)]
@@ -112,6 +116,10 @@ pub(super) fn read(
 ///
 /// Only the caller's bootstrap-only volume-copy recovery may accept a root
 /// mismatch; all other relocation is rejected by the caller.
+///
+/// Requires System-content writers to remain quiescent or caller-serialized
+/// throughout this operation: descriptor lookup, optional catalog listing,
+/// receipt reading and inventory lookups resolve owner roots separately.
 pub(super) fn read_relocatable(
     home: &AstridHome,
     store: &RuntimePrincipalStore,
@@ -132,12 +140,28 @@ pub(super) fn read_relocatable(
     let Some(metadata) = metadata else {
         return Ok(None);
     };
-    if metadata.logical_bytes() > MAX_RECEIPT_BYTES {
-        return Err(tree_error(
-            &host_receipt,
-            format!("active projection receipt exceeds {MAX_RECEIPT_BYTES} bytes"),
-        ));
-    }
+    // Small receipts retain the historical authenticated allocation ceiling and
+    // point lookups. Listing unrelated catalog content would make sparse reads
+    // scale with the whole owner inventory even when its header is warm.
+    let catalog = if metadata.logical_bytes() > RECEIPT_FRAMING_BYTES {
+        Some(
+            store
+                .content()
+                .list(&StateOwner::System)
+                .map_err(receipt_error("authenticate receipt inventory allowance"))?,
+        )
+    } else {
+        None
+    };
+    let inventory = match catalog.as_deref() {
+        Some(catalog) => ReceiptInventory::Listed(catalog),
+        None => ReceiptInventory::Point(store),
+    };
+    enforce_receipt_bound(
+        &host_receipt,
+        metadata.logical_bytes(),
+        inventory.size_bound()?,
+    )?;
     let bytes = store
         .content()
         .read(&StateOwner::System, &name)
@@ -148,20 +172,99 @@ pub(super) fn read_relocatable(
                 "active projection receipt disappeared while being read",
             )
         })?;
-    let receipt = serde_json::from_slice::<ActiveProjectionReceipt>(&bytes).map_err(|error| {
-        tree_error(
-            &host_receipt,
-            format!("parse active projection receipt: {error}"),
-        )
-    })?;
+    decode_receipt(&host_receipt, &bytes, &inventory)
+}
+
+// Both sources authenticate the same metadata through ContentStore. Only the
+// large-receipt path needs all catalog names to authorize its allocation bound.
+enum ReceiptInventory<'a> {
+    Point(&'a RuntimePrincipalStore),
+    Listed(&'a [ContentEntry]),
+}
+
+impl ReceiptInventory<'_> {
+    fn size_bound(&self) -> StorageResult<u64> {
+        match self {
+            Self::Point(_) => Ok(RECEIPT_FRAMING_BYTES),
+            Self::Listed(catalog) => receipt_size_bound(catalog.iter().map(ContentEntry::name)),
+        }
+    }
+
+    fn lookup(&self, name: &ContentName) -> StorageResult<Option<(ObjectId, u64)>> {
+        match self {
+            Self::Point(store) => store
+                .content()
+                .describe(&StateOwner::System, name)
+                .map(|descriptor| descriptor.map(|actual| (actual.file(), actual.logical_bytes())))
+                .map_err(receipt_error("inspect active receipt inventory entry")),
+            Self::Listed(catalog) => Ok(catalog
+                .binary_search_by(|actual| actual.name().cmp(name))
+                .ok()
+                .map(|index| (catalog[index].file(), catalog[index].logical_bytes()))),
+        }
+    }
+}
+
+fn decode_receipt(
+    host_receipt: &Path,
+    bytes: &[u8],
+    inventory: &ReceiptInventory<'_>,
+) -> StorageResult<Option<ActiveProjectionReceipt>> {
+    enforce_receipt_bound(
+        host_receipt,
+        u64::try_from(bytes.len())
+            .map_err(|_| StorageError::Internal("receipt length overflow".to_owned()))?,
+        inventory.size_bound()?,
+    )?;
+    let mut receipt =
+        serde_json::from_slice::<ActiveProjectionReceipt>(bytes).map_err(|error| {
+            tree_error(
+                host_receipt,
+                format!("parse active projection receipt: {error}"),
+            )
+        })?;
     if receipt.schema != RECEIPT_SCHEMA {
         return Err(tree_error(
-            &host_receipt,
+            host_receipt,
             "active projection receipt has an unsupported schema",
         ));
     }
+    if let ReceiptInventory::Listed(catalog) = inventory {
+        // ContentStore::list already returns unique canonical names in byte order.
+        // Retain that authenticated inventory directly instead of cloning every
+        // name into a second index. Refuse a broken ordering contract before using
+        // binary search; neither receipt claims nor host metadata establish it.
+        if catalog
+            .windows(2)
+            .any(|entries| entries[0].name() >= entries[1].name())
+        {
+            return Err(tree_error(
+                host_receipt,
+                "authenticated receipt catalog is not in unique canonical order",
+            ));
+        }
+        if receipt.entries.len() > catalog.len() {
+            return Err(tree_error(
+                host_receipt,
+                "active receipt has more entries than the durable catalog",
+            ));
+        }
+    }
+    // Historical receipts need not be ordered. Normalize only this temporary
+    // decoded inventory, so repeated membership checks remain logarithmic.
+    receipt.entries.sort_by(|a, b| a.name.cmp(&b.name));
+    if receipt
+        .entries
+        .windows(2)
+        .any(|entries| entries[0].name == entries[1].name)
+    {
+        return Err(tree_error(
+            host_receipt,
+            "active receipt repeats a durable catalog name",
+        ));
+    }
     for entry in &receipt.entries {
-        validate_receipt_entry(store, entry)?;
+        validate_receipt_entry(inventory, entry)?;
     }
     Ok(Some(receipt))
 }
@@ -184,8 +287,16 @@ pub(super) fn encode(
             })
             .collect(),
     };
-    serde_json::to_vec(&receipt)
-        .map_err(|error| tree_error(home.root(), format!("encode active receipt: {error}")))
+    let bytes = serde_json::to_vec(&receipt)
+        .map_err(|error| tree_error(home.root(), format!("encode active receipt: {error}")))?;
+    let length = u64::try_from(bytes.len())
+        .map_err(|_| StorageError::Internal("receipt length overflow".to_owned()))?;
+    enforce_receipt_bound(
+        home.root(),
+        length,
+        receipt_size_bound(entries.iter().map(|entry| &entry.name))?,
+    )?;
+    Ok(bytes)
 }
 
 pub(super) fn clear(store: &RuntimePrincipalStore, home: &AstridHome) -> StorageResult<bool> {
@@ -212,6 +323,7 @@ pub(super) fn removals(
     if receipt.phase != ReceiptPhase::Active {
         return Ok(Vec::new());
     }
+    let surviving = surviving.iter().collect::<BTreeSet<_>>();
     receipt
         .entries
         .iter()
@@ -229,8 +341,37 @@ pub(super) fn removals(
         .map(|names| names.into_iter().flatten().collect())
 }
 
+// Each canonical JSON inventory entry contains its escaped catalog name,
+// a 64-character object identity, a u64 length and less than 128 fixed bytes.
+// JSON escapes occupy at most six bytes per source UTF-8 byte. The allowance
+// is proportional to authenticated catalog metadata, never receipt claims.
+fn receipt_size_bound<'a>(names: impl IntoIterator<Item = &'a ContentName>) -> StorageResult<u64> {
+    names
+        .into_iter()
+        .try_fold(RECEIPT_FRAMING_BYTES, |total, name| {
+            u64::try_from(name.as_str().len())
+                .ok()
+                .and_then(|bytes| bytes.checked_mul(6))
+                .and_then(|bytes| bytes.checked_add(128))
+                .and_then(|bytes| total.checked_add(bytes))
+                .ok_or_else(|| {
+                    StorageError::Internal("receipt inventory allowance overflow".to_owned())
+                })
+        })
+}
+
+fn enforce_receipt_bound(path: &Path, bytes: u64, maximum: u64) -> StorageResult<()> {
+    if bytes > maximum {
+        return Err(tree_error(
+            path,
+            format!("active projection receipt exceeds catalog-derived {maximum} bytes"),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_receipt_entry(
-    store: &RuntimePrincipalStore,
+    inventory: &ReceiptInventory<'_>,
     entry: &ActiveReceiptEntry,
 ) -> StorageResult<()> {
     let name = ContentName::new(&entry.name).map_err(|error| {
@@ -239,16 +380,12 @@ fn validate_receipt_entry(
             format!("validate receipt catalog name: {error}"),
         )
     })?;
-    let actual = store
-        .content()
-        .describe(&StateOwner::System, &name)
-        .map_err(receipt_error("validate active receipt entry"))?
-        .ok_or_else(|| {
-            tree_error(
-                Path::new(&entry.name),
-                "active receipt names absent durable projection",
-            )
-        })?;
+    let (actual_file, actual_length) = inventory.lookup(&name)?.ok_or_else(|| {
+        tree_error(
+            Path::new(&entry.name),
+            "active receipt names absent durable projection",
+        )
+    })?;
 
     let bytes = hex::decode(&entry.file).map_err(|error| {
         tree_error(
@@ -262,11 +399,8 @@ fn validate_receipt_entry(
             "receipt object identity is not 32 bytes",
         )
     })?;
-    let identity_matches = actual.file().as_bytes() == &expected;
-    if !identity_matches
-        || actual.logical_bytes() != entry.logical_bytes
-        || is_excluded(&entry.name)
-    {
+    let identity_matches = actual_file.as_bytes() == &expected;
+    if !identity_matches || actual_length != entry.logical_bytes || is_excluded(&entry.name) {
         return Err(tree_error(
             Path::new(&entry.name),
             "active receipt does not match durable projection",
@@ -293,3 +427,6 @@ fn receipt_error(
 fn tree_error(path: &Path, detail: impl std::fmt::Display) -> StorageError {
     StorageError::Connection(format!("runtime tree {}: {detail}", path.display()))
 }
+
+#[cfg(test)]
+mod tests;
