@@ -29,5 +29,21 @@ async fn close_errors_retain_transferred_owner_until_finalization() {
     std::fs::write(home.root().join("config.toml"), b"final write").unwrap();
     let error = guard.finish_retained(owner).unwrap_err();
     assert!(error.to_string().contains("injected KV close error"));
+    assert!(error.to_string().contains("injected audit close error"));
     assert!(!home.root().join("config.toml").exists());
+}
+
+#[test]
+fn close_error_preserves_the_prior_finalization_failure() {
+    let mut outcome = Err(StorageError::Internal("injected handoff failure".into()));
+    record_close_error(
+        &mut outcome,
+        StorageError::Internal("injected later close failure".into()),
+    );
+    let Err(error) = outcome else {
+        panic!("close error discarded the finalization failure");
+    };
+    let message = error.to_string();
+    assert!(message.contains("injected handoff failure"));
+    assert!(message.contains("injected later close failure"));
 }

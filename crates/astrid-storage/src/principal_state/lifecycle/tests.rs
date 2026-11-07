@@ -192,6 +192,30 @@ async fn retained_finalizer_rejects_wrong_home_before_packing_and_closes_origina
 
 #[cfg(unix)]
 #[tokio::test]
+async fn projection_retirement_rechecks_volume_before_removing_host_files() {
+    let (parent, home, _lifecycle, store) = retained_fixture().await;
+    let volume = home.storage_volume_path();
+    let original = parent.path().join("owned-original.volume");
+    std::fs::rename(&volume, &original).unwrap();
+    std::fs::copy(&original, &volume).unwrap();
+    let replacement = std::fs::read(&volume).unwrap();
+    let host = home.root().join("config.toml");
+    std::fs::write(&host, b"latest host generation").unwrap();
+
+    // Exercise packing directly, without the finalizer's entry check. The
+    // engine still writes its captured original; this pathname is foreign.
+    let error = store.pack_and_retire_runtime_projection(&home).unwrap_err();
+    assert!(
+        error.to_string().contains("volume inode changed"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&host).unwrap(), b"latest host generation");
+    store.kv().close().await.unwrap();
+    assert_eq!(std::fs::read(&volume).unwrap(), replacement);
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn retained_finalizer_rejects_replaced_volume_and_preserves_host() {
     let (_parent, home, lifecycle, store) = retained_fixture().await;
     let token = store.handoff_for_finalization(&home).unwrap();

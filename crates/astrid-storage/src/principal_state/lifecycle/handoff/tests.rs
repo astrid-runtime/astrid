@@ -97,6 +97,9 @@ async fn shutdown_error_does_not_drop_packing_owner_or_hide_failure() {
     owner.record_shutdown_error(StorageError::Internal(
         "injected shutdown close failure".into(),
     ));
+    owner.record_shutdown_error(StorageError::Internal(
+        "injected second close failure".into(),
+    ));
     store.kv().close().await.unwrap();
     assert!(RuntimeLifecycleGuard::acquire(&home).is_err());
     std::fs::write(home.root().join("config.toml"), b"pack despite close error").unwrap();
@@ -106,6 +109,7 @@ async fn shutdown_error_does_not_drop_packing_owner_or_hide_failure() {
             .to_string()
             .contains("injected shutdown close failure")
     );
+    assert!(error.to_string().contains("injected second close failure"));
     assert!(!home.root().join("config.toml").exists());
     let reopened = open_runtime_principal_store(&home, quota()).await.unwrap();
     assert_eq!(

@@ -113,7 +113,10 @@ impl RuntimeFinalization {
     /// Custody must survive an old projection's close error. Finalization still
     /// packs late host writes, then reports the earlier failure to its caller.
     pub fn record_shutdown_error(&mut self, error: StorageError) {
-        self.shutdown_error.get_or_insert(error);
+        self.shutdown_error = Some(match self.shutdown_error.take() {
+            Some(previous) => StorageError::Internal(format!("{previous}; additionally: {error}")),
+            None => error,
+        });
     }
 }
 

@@ -1,6 +1,105 @@
 //! Retirement transfers exclusive authority rather than reopening the store.
 use super::super::tests::{TestIdentity, Utf8Codec, limits, open, transaction};
+use super::super::{IdentityScheme, ObjectId, ObjectIdentity, ObjectRecord};
 use super::*;
+use std::sync::{atomic::AtomicBool, mpsc};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+struct GatedReadIdentity {
+    armed: Arc<AtomicBool>,
+    entered: mpsc::SyncSender<()>,
+    release: Arc<Mutex<mpsc::Receiver<()>>>,
+}
+
+impl ObjectIdentity for GatedReadIdentity {
+    fn identify(&self, record: &ObjectRecord) -> ObjectId {
+        if self.armed.swap(false, Ordering::AcqRel) {
+            self.entered.send(()).unwrap();
+            self.release
+                .lock()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        }
+        TestIdentity.identify(record)
+    }
+}
+
+impl PersistentObjectIdentity for GatedReadIdentity {
+    fn scheme(&self) -> IdentityScheme {
+        TestIdentity.scheme()
+    }
+}
+
+#[test]
+fn handoff_joins_in_flight_shared_read_without_reversing_lock_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let (entered, reading) = mpsc::sync_channel(1);
+    let (release, released) = mpsc::sync_channel(1);
+    let armed = Arc::new(AtomicBool::new(false));
+    let engine = Arc::new(
+        DurableEngine::open(
+            directory.path(),
+            GatedReadIdentity {
+                armed: Arc::clone(&armed),
+                entered,
+                release: Arc::new(Mutex::new(released)),
+            },
+            Utf8Codec,
+            limits(),
+        )
+        .unwrap(),
+    );
+    let principal = "agent".to_owned();
+    let (commit, transaction) = transaction(&principal, None, b"in-flight reader");
+    engine.commit(transaction).unwrap();
+    engine.flush().unwrap();
+    engine.object_cache.clear();
+    armed.store(true, Ordering::Release);
+    let reader_engine = Arc::clone(&engine);
+    let (read_done, read_result) = mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        read_done
+            .send(reader_engine.shared_object_for(&principal, commit))
+            .unwrap();
+    });
+    // Identity validation runs while the real shared reader holds its arena
+    // guard, after releasing inner. No artificial lock order is introduced.
+    reading.recv_timeout(Duration::from_secs(5)).unwrap();
+    let handoff_engine = Arc::clone(&engine);
+    let (handed, handoff_result) = mpsc::sync_channel(1);
+    let handoff = std::thread::spawn(move || {
+        handed
+            .send(handoff_engine.handoff_for_retirement())
+            .unwrap();
+    });
+    let started = Instant::now();
+    while !engine.inner.is_locked() && !handoff.is_finished() {
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::thread::yield_now();
+    }
+    assert!(
+        engine.inner.is_locked(),
+        "handoff must own inner before reader resumes"
+    );
+    assert!(matches!(
+        handoff_result.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    release.send(()).unwrap();
+    let transferred = handoff_result
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        read_result.recv_timeout(Duration::from_secs(5)).unwrap(),
+        Err(DurableError::Closed)
+    ));
+    reader.join().unwrap();
+    handoff.join().unwrap();
+    assert!(transferred.object(commit).unwrap().is_some());
+    transferred.close().unwrap();
+}
 
 #[test]
 fn handoff_preserves_history_and_closes_retained_engine() {

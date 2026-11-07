@@ -236,7 +236,11 @@ fn record_close_error(
         #[cfg(not(target_family = "wasm"))]
         Ok(Some(owner)) => owner.record_shutdown_error(error),
         Ok(_) => *outcome = Err(error),
-        Err(_) => {},
+        Err(previous) => {
+            *previous = astrid_storage::StorageError::Internal(format!(
+                "{previous}; additionally: {error}"
+            ));
+        },
     }
 }
 
