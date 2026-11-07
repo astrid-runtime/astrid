@@ -3310,6 +3310,14 @@ impl Kernel {
         self.ephemeral.store(val, Ordering::Relaxed);
     }
 
+    /// Enable ephemeral mode without shutting down on disconnect during daemon startup.
+    /// Call [`Self::arm_ephemeral_startup_fallback`] after publishing readiness.
+    pub fn begin_ephemeral_startup(&self) {
+        self.ephemeral_startup_pending
+            .store(true, Ordering::Release);
+        self.set_ephemeral(true);
+    }
+
     /// Arm startup handoff grace after readiness, allowing brief preflight
     /// connections before the host establishes its lasting lifecycle lease.
     pub fn arm_ephemeral_startup_fallback(self: &Arc<Self>) {
