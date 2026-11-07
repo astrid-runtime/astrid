@@ -11,6 +11,15 @@
 #[path = "platform_fs/macos_acl.rs"]
 mod macos_acl;
 
+#[cfg(any(target_os = "linux", test))]
+mod mount_boundary;
+#[cfg(target_os = "linux")]
+pub(crate) use mount_boundary::MountId;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use mount_boundary::fixtures as mount_fixtures;
+#[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
+pub use mount_boundary::fixtures as mount_test_fixtures;
+
 use std::collections::HashSet;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -705,6 +714,19 @@ fn atomic_write_private_file_unix(path: &Path, bytes: &[u8]) -> io::Result<()> {
         parent_handle.sync_all()?;
     }
     validate_private_file(path)
+}
+
+/// Open the requested directory itself, rejecting missing tails and redirects.
+#[cfg(unix)]
+pub(crate) fn open_existing_directory_no_follow(path: &Path) -> io::Result<std::fs::File> {
+    let (directory, missing) = unix_directory_walk(path)?;
+    if !missing.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("directory does not exist: {}", path.display()),
+        ));
+    }
+    Ok(directory)
 }
 
 #[cfg(unix)]

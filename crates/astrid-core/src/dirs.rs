@@ -53,7 +53,7 @@ pub use dirs_layout::{
     LayoutMigrationTarget, preserve_legacy_source_tree, retire_legacy_source_tree,
     retire_runtime_run_directory, validate_legacy_source_tree,
 };
-#[path = "dirs_projection_retirement.rs"]
+#[path = "dirs/projection_retirement/mod.rs"]
 mod projection_retirement;
 pub use projection_retirement::retire_projection_root;
 #[path = "dirs_run_dir.rs"]
