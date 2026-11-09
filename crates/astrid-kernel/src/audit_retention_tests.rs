@@ -130,3 +130,64 @@ async fn unwritable_archive_leaves_the_chain_intact() {
         6
     );
 }
+
+#[test]
+fn poisoned_workspace_preserves_operator_retention_via_fallback() {
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let state = workspace.path().join(".astrid");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        r#"
+[audit]
+host_fail_closed = ["file_write", "process_spawn"]
+[audit.retention]
+require_anchor = true
+archive_dir = "/srv/audit-archive"
+"#,
+    )
+    .unwrap();
+    // Out-of-range value: workspace is allowed to set the key, but validation
+    // rejects the merged tree. Pre-fix this cleared operator retention.
+    std::fs::write(state.join("config.toml"), "[audit]\nhost_queue_capacity = 1\n").unwrap();
+
+    let audit = super::load_audit_config(
+        workspace.path(),
+        home.path(),
+        &astrid_core::dirs::WorkspaceLayout::default(),
+    )
+    .expect("operator fallback must succeed");
+
+    assert!(audit.retention.require_anchor);
+    assert_eq!(
+        audit.retention.archive_dir.as_deref(),
+        Some("/srv/audit-archive")
+    );
+    assert_eq!(
+        audit.host_fail_closed,
+        vec!["file_write".to_owned(), "process_spawn".to_owned()]
+    );
+}
+
+#[test]
+fn unreadable_operator_and_workspace_audit_config_fails_closed() {
+    let workspace = tempfile::tempdir().unwrap();
+    let state = workspace.path().join(".astrid");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("config.toml"), "[[[not valid").unwrap();
+
+    let isolated = tempfile::tempdir().unwrap();
+    std::fs::write(isolated.path().join("config.toml"), "[[[also broken").unwrap();
+    let err = super::load_audit_config(
+        workspace.path(),
+        isolated.path(),
+        &astrid_core::dirs::WorkspaceLayout::default(),
+    )
+    .expect_err("must not default-clear retention");
+    let message = err.to_string();
+    assert!(
+        message.contains("refusing to clear operator retention"),
+        "{message}"
+    );
+}
