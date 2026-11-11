@@ -4,6 +4,9 @@
 mod acl;
 #[path = "windows/captured_directory.rs"]
 mod captured_directory;
+#[cfg(test)]
+#[path = "windows/directory_durability.rs"]
+mod directory_durability;
 #[path = "windows/error.rs"]
 mod error;
 #[path = "windows/executable.rs"]

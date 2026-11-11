@@ -990,3 +990,6 @@ fn interrupted_replacement_recovers_at_each_mutation_phase() {
         b"new-daemon"
     );
 }
+
+#[path = "tests/directory_durability.rs"]
+mod directory_durability;
