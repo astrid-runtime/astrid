@@ -32,7 +32,7 @@ mod reader;
 #[cfg(test)]
 mod scan_tests;
 
-pub(super) use framed_append::FramedAppendStream;
+pub(super) use framed_append::{FramedAppendStream, TRANSFER_BUFFER_BYTES};
 #[cfg(test)]
 pub(super) use indexed::{last_batch_spans, reset_last_batch_spans};
 pub(super) use indexed::{

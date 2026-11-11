@@ -10,7 +10,7 @@ use std::io::{BufWriter, SeekFrom, Write};
 use super::{DurableError, DurableIo, frame_checksum, frame_header, io_error};
 
 /// Transfer buffer for coalescing many small framed writes.
-const TRANSFER_BUFFER_BYTES: usize = 64 * 1024;
+pub(in crate::engine::durable) const TRANSFER_BUFFER_BYTES: usize = 64 * 1024;
 
 pub(in crate::engine::durable) struct FramedAppendStream<'a, F: DurableIo> {
     writer: BufWriter<&'a mut F>,

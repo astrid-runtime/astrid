@@ -325,8 +325,12 @@ impl PhysicalIdentity for Blake3PhysicalIdentity {
     }
 }
 
+/// Frozen BLAKE3 derive-key context for raw representation journal bytes.
+pub(super) const JOURNAL_BYTES_DIGEST_CONTEXT: &str = "astrid-representation-journal-bytes-v1\0";
+
+#[cfg(test)]
 pub(super) fn journal_digest(bytes: &[u8]) -> [u8; 32] {
-    Blake3PhysicalIdentity.identify("astrid-representation-journal-bytes-v1\0", bytes)
+    Blake3PhysicalIdentity.identify(JOURNAL_BYTES_DIGEST_CONTEXT, bytes)
 }
 
 pub(super) fn map_node_id(bytes: [u8; 32]) -> PhysicalMapNodeId {

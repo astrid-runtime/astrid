@@ -9,9 +9,8 @@ use super::activation::visit_new_reachable_map_nodes;
 use super::{
     BTreeSet, Blake3PhysicalIdentity, CurrentPointer, DurableError, DurableFile,
     FramedAppendStream, JOURNAL_MAGIC, JOURNAL_PATH, JournalEntry, METADATA_MAGIC, METADATA_PATH,
-    MetadataFrame, RecoveryLimits, RepresentationStore, append_frame, format, generation_name,
-    increment, io_error, journal_digest, read_all, read_current_file, recover_journal,
-    recover_metadata,
+    MetadataFrame, RecoveryLimits, RepresentationStore, append_frame, digest_journal_file, format,
+    generation_name, increment, io_error, read_current_file, recover_journal, recover_metadata,
 };
 
 #[cfg(test)]
@@ -64,10 +63,7 @@ impl RepresentationStore {
         metadata
             .sync_data()
             .map_err(|source| io_error("flush checkpoint metadata", source))?;
-        let prior = journal_digest(&read_all(
-            &mut self.journal,
-            "read prior representation journal",
-        )?);
+        let prior = digest_journal_file(&mut self.journal, "digest prior representation journal")?;
         let checkpoint = JournalEntry::Checkpoint {
             journal_generation: generation,
             active: Some(self.active),
@@ -80,7 +76,7 @@ impl RepresentationStore {
             .map_err(|source| io_error("flush checkpoint journal", source))?;
         let current = CurrentPointer {
             journal_generation: generation,
-            checkpoint_digest: journal_digest(&read_all(&mut journal, "read checkpoint journal")?),
+            checkpoint_digest: digest_journal_file(&mut journal, "digest checkpoint journal")?,
             max_tail_frames: u32::MAX,
             max_tail_bytes: u64::MAX,
         };

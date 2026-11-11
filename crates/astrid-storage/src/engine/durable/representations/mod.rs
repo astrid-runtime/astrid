@@ -1,7 +1,6 @@
 //! Authoritative physical representation catalogue and placement state.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::SeekFrom;
 use std::path::Path;
 
 use crate::storage_model::{
@@ -22,13 +21,15 @@ use super::{
 };
 use format::{
     Blake3PhysicalIdentity, CurrentPointer, JOURNAL_MAGIC, JournalEntry, METADATA_MAGIC,
-    MetadataFrame, MetadataKind, journal_digest,
+    MetadataFrame, MetadataKind,
 };
 
 mod activation;
 mod authority;
 mod checkpoint;
+mod digest;
 mod format;
+use digest::{digest_journal_file, digest_journal_prefix, journal_byte_len};
 mod index_validation;
 mod recovery;
 mod residency;
@@ -220,8 +221,8 @@ impl RepresentationStore {
         journal
             .sync_data()
             .map_err(|source| io_error("flush representation checkpoint", source))?;
-        let checkpoint_bytes = read_all(&mut journal, "read representation checkpoint")?;
-        let checkpoint_digest = journal_digest(&checkpoint_bytes);
+        let checkpoint_digest =
+            digest_journal_file(&mut journal, "digest representation checkpoint")?;
         let state_cas = JournalEntry::StateCas {
             journal_generation: FIRST_JOURNAL_GENERATION,
             expected: None,
@@ -939,17 +940,6 @@ fn bulk_rebuild_is_cheaper(existing: u64, additions: usize) -> Result<bool, Dura
         .and_then(|nodes| nodes.checked_sub(1))
         .ok_or(DurableError::EncodingOverflow)?;
     Ok(estimated_path_nodes > final_tree_nodes)
-}
-
-fn read_all<F: DurableIo>(file: &mut F, operation: &'static str) -> Result<Vec<u8>, DurableError> {
-    file.seek(SeekFrom::Start(0))
-        .map_err(|source| io_error(operation, source))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|source| io_error(operation, source))?;
-    file.seek(SeekFrom::End(0))
-        .map_err(|source| io_error(operation, source))?;
-    Ok(bytes)
 }
 
 fn increment(value: u64) -> Result<u64, DurableError> {

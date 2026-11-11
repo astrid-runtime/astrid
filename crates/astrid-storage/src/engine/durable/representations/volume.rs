@@ -12,7 +12,6 @@ use super::super::{File as DurableFile, RecoveryLimits};
 use super::activation::{build_initial_state, generation_name};
 use super::format::{
     CURRENT_MAGIC, CurrentPointer, JOURNAL_MAGIC, JournalEntry, METADATA_MAGIC, MetadataFrame,
-    journal_digest,
 };
 use super::recovery::{read_current_file, recover_journal, recover_metadata};
 use super::{
@@ -100,9 +99,8 @@ impl RepresentationStore {
         journal
             .sync_data()
             .map_err(|source| io_error("flush volume representation checkpoint", source))?;
-        let checkpoint_bytes =
-            super::read_all(&mut journal, "read volume representation checkpoint")?;
-        let checkpoint_digest = journal_digest(&checkpoint_bytes);
+        let checkpoint_digest =
+            super::digest_journal_file(&mut journal, "digest volume representation checkpoint")?;
         let state_cas = JournalEntry::StateCas {
             journal_generation: FIRST_JOURNAL_GENERATION,
             expected: None,
