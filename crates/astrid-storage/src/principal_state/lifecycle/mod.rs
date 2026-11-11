@@ -250,5 +250,8 @@ impl RuntimeLifecycleGuard {
     }
 }
 
+#[cfg(all(test, windows))]
+mod private_birth_tests;
+
 #[cfg(test)]
 mod tests;

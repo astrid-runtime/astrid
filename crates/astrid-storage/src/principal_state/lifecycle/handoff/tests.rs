@@ -1,4 +1,5 @@
 //! Finalization must survive task-runtime teardown with closed former views.
+use super::drain_gate::{BlockedCommitGate, ENTRY_OBSERVE_TIMEOUT};
 use super::*;
 use crate::principal_state::RuntimeLifecycleGuard;
 use crate::{ContentName, StorageError, open_runtime_principal_store};
@@ -158,28 +159,6 @@ async fn failed_pack_preserves_host_evidence_and_allows_fenced_retry() {
     );
 }
 
-struct ReleaseOnDrop(Option<std::sync::Arc<std::sync::Barrier>>);
-
-impl Drop for ReleaseOnDrop {
-    fn drop(&mut self) {
-        if let Some(release) = self.0.take() {
-            let _ = release.wait();
-        }
-    }
-}
-
-impl ReleaseOnDrop {
-    fn new(release: std::sync::Arc<std::sync::Barrier>) -> Self {
-        Self(Some(release))
-    }
-
-    fn release(mut self) {
-        if let Some(release) = self.0.take() {
-            let _ = release.wait();
-        }
-    }
-}
-
 fn assert_busy_handoff_message(message: &str) {
     assert!(
         message.contains("active writers"),
@@ -187,43 +166,33 @@ fn assert_busy_handoff_message(message: &str) {
     );
 }
 
-fn wait_for_drain_entry(
-    reached: std::sync::Arc<std::sync::Barrier>,
-) -> tokio::sync::oneshot::Receiver<()> {
-    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
-    std::thread::spawn(move || {
-        reached.wait();
-        let _ = entered_tx.send(());
-    });
-    entered_rx
-}
-
 async fn retain_while_blocked_commit(
     home: &AstridHome,
-    reached: std::sync::Arc<std::sync::Barrier>,
-    release: std::sync::Arc<std::sync::Barrier>,
     key: &'static str,
     value: &'static [u8],
-) -> (
-    crate::principal_state::RuntimePrincipalStore,
-    super::super::PendingRuntimeFinalization,
-) {
-    use std::sync::Arc;
-
+) -> Result<
+    (
+        crate::principal_state::RuntimePrincipalStore,
+        super::super::PendingRuntimeFinalization,
+        BlockedCommitGate,
+    ),
+    String,
+> {
     let store = open_runtime_principal_store(home, quota())
         .await
-        .expect("open store");
+        .map_err(|error| error.to_string())?;
     store
         .kv()
         .set("system:retirement", "seed", b"before".to_vec())
         .await
-        .expect("seed write");
-    store.publish_runtime_projection(home).expect("publish");
+        .map_err(|error| error.to_string())?;
     store
-        .engine
-        .gate_next_group_drain(Arc::clone(&reached), Arc::clone(&release));
+        .publish_runtime_projection(home)
+        .map_err(|error| error.to_string())?;
 
-    let entered_rx = wait_for_drain_entry(Arc::clone(&reached));
+    let (entered_rx, release_tx) = store.engine.gate_next_group_drain_channel();
+    let mut gate = BlockedCommitGate::from_channel_gate(entered_rx, release_tx);
+
     let writer = store.clone();
     let write = tokio::spawn(async move {
         writer
@@ -231,26 +200,25 @@ async fn retain_while_blocked_commit(
             .set("system:retirement", key, value.to_vec())
             .await
     });
-    entered_rx.await.expect("commit entered drain gate");
+    tokio::task::block_in_place(|| gate.wait_for_entry(ENTRY_OBSERVE_TIMEOUT))
+        .map_err(|error| error.to_string())?;
     write.abort();
     let join = write.await.expect_err("cancelled write must join as error");
-    assert!(
-        join.is_cancelled(),
-        "async waiter must be cancelled while blocking commit stays live"
-    );
+    if !join.is_cancelled() {
+        return Err("async waiter must be cancelled while blocking commit stays live".to_owned());
+    }
 
     let pending = store
         .retain_for_finalization(home)
-        .expect("retain pending custody");
-    assert!(
-        RuntimeLifecycleGuard::acquire(home).is_err(),
-        "pending custody must keep the continuous lifecycle lock"
-    );
+        .map_err(|error| error.to_string())?;
+    if RuntimeLifecycleGuard::acquire(home).is_ok() {
+        return Err("pending custody must keep the continuous lifecycle lock".to_owned());
+    }
     let Err(busy) = store.handoff_for_finalization(home) else {
-        panic!("expected busy handoff during blocked commit");
+        return Err("expected busy handoff during blocked commit".to_owned());
     };
     assert_busy_handoff_message(&busy.to_string());
-    (store, pending)
+    Ok((store, pending, gate))
 }
 
 fn assert_reopened_blocked_bytes(home: &AstridHome, old_kv: &dyn crate::KvStore) {
@@ -290,52 +258,85 @@ fn assert_reopened_blocked_bytes(home: &AstridHome, old_kv: &dyn crate::KvStore)
 }
 
 #[test]
+fn retain_while_blocked_commit_reports_open_failure_before_entry() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let parent = tempfile::tempdir().unwrap();
+    let home_path = parent.path().join("runtime");
+    std::fs::write(&home_path, b"not-a-directory").unwrap();
+    let home = AstridHome::from_path(home_path);
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+
+    let runtime_home = home.clone();
+    let worker = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let outcome = runtime.block_on(async move {
+            retain_while_blocked_commit(&runtime_home, "blocked", b"never-written").await
+        });
+        result_tx
+            .send(outcome.map(|_| ()))
+            .expect("report pre-entry open outcome");
+        drop(runtime);
+    });
+
+    let result = result_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("pre-entry open failure must be reported");
+    let error = result.expect_err("file-as-root must fail before drain entry");
+    assert!(!error.is_empty(), "{error}");
+    worker
+        .join()
+        .expect("worker must join without hanging on an unentered drain gate");
+}
+
+#[test]
 fn pending_custody_waits_for_blocked_commit_across_runtime_drop() {
-    use std::sync::Arc;
     use std::sync::mpsc;
     use std::time::Duration;
 
     let parent = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(parent.path().join("runtime"));
     let lifecycle = RuntimeLifecycleGuard::acquire(&home).unwrap();
-    let reached = Arc::new(std::sync::Barrier::new(2));
-    let release = Arc::new(std::sync::Barrier::new(2));
-    let release_guard = ReleaseOnDrop::new(Arc::clone(&release));
     let (drop_started_tx, drop_started_rx) = mpsc::sync_channel::<()>(1);
     let (drop_done_tx, drop_done_rx) = mpsc::sync_channel::<()>(1);
     let (custody_tx, custody_rx) = mpsc::sync_channel(1);
 
     let runtime_home = home.clone();
-    let reached_for_runtime = Arc::clone(&reached);
-    let release_for_runtime = Arc::clone(&release);
     let runtime_thread = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .expect("runtime");
-        let (old_kv, pending) = runtime.block_on(async move {
-            let (store, pending) = retain_while_blocked_commit(
-                &runtime_home,
-                reached_for_runtime,
-                release_for_runtime,
-                "blocked",
-                b"joined-by-runtime-drop",
-            )
-            .await;
-            (store.kv(), pending)
+        let outcome = runtime.block_on(async move {
+            retain_while_blocked_commit(&runtime_home, "blocked", b"joined-by-runtime-drop").await
         });
-        custody_tx
-            .send((old_kv, pending))
-            .expect("send pending custody");
-        drop_started_tx.send(()).expect("signal runtime drop start");
-        drop(runtime);
-        drop_done_tx.send(()).expect("signal runtime drop complete");
+        match outcome {
+            Ok((store, pending, gate)) => {
+                custody_tx
+                    .send(Ok((store.kv(), pending, gate)))
+                    .expect("send pending custody");
+                drop_started_tx.send(()).expect("signal runtime drop start");
+                drop(runtime);
+                drop_done_tx.send(()).expect("signal runtime drop complete");
+            },
+            Err(error) => {
+                let _ = custody_tx.send(Err(error));
+            },
+        }
     });
 
-    let (old_kv, pending_custody) = custody_rx
-        .recv_timeout(Duration::from_secs(20))
-        .expect("pending custody from runtime thread");
+    let custody = match custody_rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => panic!("blocked-commit worker failed before custody: {error}"),
+        Err(_) => panic!("timed out waiting for pending custody from runtime thread"),
+    };
+    let (old_kv, pending_custody, gate) = custody;
     drop_started_rx
         .recv_timeout(Duration::from_secs(20))
         .expect("runtime drop started while gate held");
@@ -343,7 +344,11 @@ fn pending_custody_waits_for_blocked_commit_across_runtime_drop() {
         drop_done_rx.try_recv().is_err(),
         "runtime drop must still be waiting on the blocked commit"
     );
-    release_guard.release();
+    assert!(
+        gate.entered(),
+        "runtime drop wait requires an entered drain gate"
+    );
+    gate.release();
     drop_done_rx
         .recv_timeout(Duration::from_secs(20))
         .expect("runtime drop completed after gate release");
@@ -384,22 +389,16 @@ fn pending_custody_drop_closes_original_engine_without_transfer() {
 
 #[test]
 fn pending_busy_handoff_failure_closes_engine_and_preserves_shutdown_error() {
-    use std::sync::Arc;
     use std::sync::mpsc;
     use std::time::Duration;
 
     let parent = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(parent.path().join("runtime"));
     let _lifecycle = RuntimeLifecycleGuard::acquire(&home).unwrap();
-    let reached = Arc::new(std::sync::Barrier::new(2));
-    let release = Arc::new(std::sync::Barrier::new(2));
-    let release_guard = ReleaseOnDrop::new(Arc::clone(&release));
     let (result_tx, result_rx) = mpsc::sync_channel(1);
     let (drop_done_tx, drop_done_rx) = mpsc::sync_channel::<()>(1);
 
     let runtime_home = home.clone();
-    let reached_for_runtime = Arc::clone(&reached);
-    let release_for_runtime = Arc::clone(&release);
     let runtime_thread = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -407,31 +406,40 @@ fn pending_busy_handoff_failure_closes_engine_and_preserves_shutdown_error() {
             .build()
             .expect("runtime");
         let outcome = runtime.block_on(async move {
-            let (store, mut pending) = retain_while_blocked_commit(
-                &runtime_home,
-                reached_for_runtime,
-                release_for_runtime,
-                "busy",
-                b"in-flight",
-            )
-            .await;
+            let (store, mut pending, gate) =
+                retain_while_blocked_commit(&runtime_home, "busy", b"in-flight").await?;
             pending.record_shutdown_error(StorageError::Internal(
                 "injected ancillary close failure".into(),
             ));
             let Err(error) = pending.handoff_for_finalization() else {
-                panic!("expected busy handoff failure");
+                return Err("expected busy handoff failure".to_owned());
             };
-            (store.kv(), error)
+            Ok((store.kv(), error, gate))
         });
-        result_tx.send(outcome).expect("send busy failure outcome");
-        drop(runtime);
-        drop_done_tx.send(()).expect("signal runtime drop complete");
+        match outcome {
+            Ok((old_kv, error, gate)) => {
+                result_tx
+                    .send(Ok((old_kv, error, gate)))
+                    .expect("send busy failure outcome");
+                drop(runtime);
+                drop_done_tx.send(()).expect("signal runtime drop complete");
+            },
+            Err(error) => {
+                let _ = result_tx.send(Err(error));
+            },
+        }
     });
 
-    let (old_kv, error) = result_rx
-        .recv_timeout(Duration::from_secs(20))
-        .expect("busy failure outcome");
-    release_guard.release();
+    let (old_kv, error, gate) = match result_rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => panic!("busy handoff worker failed before entry: {error}"),
+        Err(_) => panic!("timed out waiting for busy failure outcome"),
+    };
+    assert!(
+        gate.entered(),
+        "busy handoff path requires entered drain gate"
+    );
+    gate.release();
     drop_done_rx
         .recv_timeout(Duration::from_secs(20))
         .expect("runtime drop completed after gate release");
@@ -514,16 +522,15 @@ async fn pending_replaced_volume_handoff_failure_closes_original_engine() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn busy_engine_handoff_failure_restores_old_staging_begin() {
-    use std::sync::Arc;
-
     let parent = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(parent.path().join("runtime"));
     let _lifecycle = RuntimeLifecycleGuard::acquire(&home).unwrap();
-    let reached = Arc::new(std::sync::Barrier::new(2));
-    let release = Arc::new(std::sync::Barrier::new(2));
-    let release_guard = ReleaseOnDrop::new(Arc::clone(&release));
 
-    let store = open_runtime_principal_store(&home, quota()).await.unwrap();
+    // Open before arming so a fresh-root failure cannot leave a release sender
+    // outstanding against an unstarted drain worker.
+    let store = open_runtime_principal_store(&home, quota())
+        .await
+        .expect("open store");
     store
         .kv()
         .set("system:retirement", "seed", b"before".to_vec())
@@ -540,10 +547,9 @@ async fn busy_engine_handoff_failure_restores_old_staging_begin() {
         .unwrap();
     // Drop the open writer so staging reserve can succeed; only the engine is busy.
     drop(old_area);
-    store
-        .engine
-        .gate_next_group_drain(Arc::clone(&reached), Arc::clone(&release));
-    let entered_rx = wait_for_drain_entry(Arc::clone(&reached));
+
+    let (entered_rx, release_tx) = store.engine.gate_next_group_drain_channel();
+    let mut gate = BlockedCommitGate::from_channel_gate(entered_rx, release_tx);
     let writer = store.clone();
     let write = tokio::spawn(async move {
         writer
@@ -551,7 +557,8 @@ async fn busy_engine_handoff_failure_restores_old_staging_begin() {
             .set("system:retirement", "busy", b"in-flight".to_vec())
             .await
     });
-    entered_rx.await.expect("commit entered drain gate");
+    tokio::task::block_in_place(|| gate.wait_for_entry(ENTRY_OBSERVE_TIMEOUT))
+        .expect("commit entered drain gate");
     write.abort();
     let join = write.await.expect_err("cancelled write must join as error");
     assert!(join.is_cancelled());
@@ -571,7 +578,7 @@ async fn busy_engine_handoff_failure_restores_old_staging_begin() {
         )
         .expect("failed engine handoff must restore open staging");
 
-    release_guard.release();
+    gate.release();
     let _ = home;
 }
 

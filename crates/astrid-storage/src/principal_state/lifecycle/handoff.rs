@@ -101,4 +101,6 @@ impl RuntimePrincipalStore {
 }
 
 #[cfg(test)]
+mod drain_gate;
+#[cfg(test)]
 mod tests;

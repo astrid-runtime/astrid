@@ -102,6 +102,11 @@ pub(super) fn initialize_volume(
     home: &AstridHome,
     policy: DurableEnginePolicy<StateOwner>,
 ) -> StorageResult<(RuntimeEngine, String, Arc<HostedFileVolume>)> {
+    // Create the Windows runtime root privately before volume bootstrap.
+    // Existing broad or redirected roots must fail without ACL repair.
+    #[cfg(windows)]
+    super::native_io::ensure_private_directory(home.root())?;
+
     let destination = home.storage_volume_path();
     let temporary = destination.with_extension("migrating");
     if temporary.exists() {
