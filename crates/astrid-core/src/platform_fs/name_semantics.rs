@@ -184,13 +184,40 @@ mod windows_upcase_tests {
     }
 
     #[test]
-    fn latin_i_and_dotless_i_collide_under_nt_upcase() {
-        // U+0049 LATIN CAPITAL LETTER I and U+0131 LATIN SMALL LETTER DOTLESS I
-        // share an NT ordinal upcase mapping. Unicode default casefold does not.
-        assert_eq!(
-            windows_nt_utf16_upcase_key("I"),
-            windows_nt_utf16_upcase_key("\u{0131}")
-        );
+    fn nt_upcase_keys_match_native_filename_aliases() {
+        // Check the actual filesystem instead of assuming linguistic Unicode
+        // uppercase mappings. In particular, NT's dotless-i mapping differs
+        // from the mapping a Unicode text library would suggest.
+        for (first, second) in [
+            ("i", "I"),
+            ("I", "\u{0131}"),
+            ("\u{00df}", "SS"),
+            ("caf\u{e9}", "cafe\u{301}"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let sensitive = super::directory_is_case_sensitive(root.path()).unwrap();
+            let first_path = root.path().join(first);
+            std::fs::write(&first_path, b"retained first file").unwrap();
+            let aliases = match std::fs::File::create_new(root.path().join(second)) {
+                Ok(file) => {
+                    drop(file);
+                    false
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => true,
+                Err(error) => panic!("native alias probe {first:?}/{second:?}: {error}"),
+            };
+            let expected_alias = !sensitive
+                && windows_nt_utf16_upcase_key(first) == windows_nt_utf16_upcase_key(second);
+            assert_eq!(
+                aliases, expected_alias,
+                "native filename comparison disagrees with admission for {first:?}/{second:?}"
+            );
+            assert_eq!(
+                std::fs::read(first_path).unwrap(),
+                b"retained first file",
+                "create-new alias probe must not replace the original"
+            );
+        }
     }
 
     #[test]

@@ -265,9 +265,9 @@ fn windows_policy(
     use astrid_core::platform_fs::name_semantics::windows_nt_utf16_upcase_key;
 
     // Admission uses the process NT ordinal UTF-16 upcase table
-    // (`RtlUpcaseUnicodeChar`). Unicode default casefold both misses host
-    // merges (Latin I vs dotless ı) and invents non-host merges (ß vs SS), so
-    // it is not the Windows alias detector. On-disk NTFS `$UpCase` on older or
+    // (`RtlUpcaseUnicodeChar`). Full Unicode folding can expand one code unit
+    // into several (ß vs SS), unlike NT's code-unit mapping, so it is not the
+    // Windows alias detector. On-disk NTFS `$UpCase` on older or
     // custom volumes can still differ from this user-mode table.
     const WINDOWS_NT_UPCASE: &str = "windows-nt-utf16-upcase";
     if !platform_has_key_collision(sentinels, entries, windows_nt_utf16_upcase_key) {

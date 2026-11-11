@@ -285,38 +285,20 @@ mod tests {
     }
 
     #[test]
-    fn custom_ord_key_can_model_nt_upcase_without_policy_variant() {
-        // Stand-in for RtlUpcaseUnicodeChar keys: I and dotless ı share a key;
-        // sharp s does not expand to SS. No ProjectionNameComparison change.
-        fn nt_like_key(value: &str) -> Vec<u16> {
+    fn custom_utf16_key_controls_collisions_without_policy_variant() {
+        // Test the generic visitor's caller-selected key, not a simulated NT
+        // table. Native Windows tests verify the real OS mapping separately.
+        let ascii_key = |value: &str| {
             value
+                .to_ascii_uppercase()
                 .encode_utf16()
-                .map(|unit| match unit {
-                    0x0069 | 0x0131 => 0x0049, // i / ı -> I
-                    0x0073 => 0x0053,          // s -> S
-                    lower if (0x61..=0x7a).contains(&lower) => lower - 0x20,
-                    other => other,
-                })
-                .collect()
-        }
-
-        assert!(
-            has_key_collision(&["I.toml", "\u{0131}.toml"], nt_like_key),
-            "I and dotless ı must collide under NT-like keys"
-        );
-        assert!(
-            !has_key_collision(&["\u{00df}.toml", "SS.toml"], nt_like_key),
-            "sharp s must not expand to SS under NT-like keys"
-        );
-        assert!(
-            has_key_collision(&["File", "FILE"], nt_like_key),
-            "ASCII case pairs still collide"
-        );
-
-        // Unicode default casefold (windows_caseless_v1) misses I/ı.
-        assert!(!collision(
+                .collect::<Vec<_>>()
+        };
+        assert!(has_key_collision(&["File", "FILE"], ascii_key));
+        assert!(!has_key_collision(&["\u{00df}.toml", "SS.toml"], ascii_key));
+        assert!(collision(
             ProjectionNamePolicy::windows_caseless_v1(),
-            &["I.toml", "\u{0131}.toml"]
+            &["\u{00df}.toml", "SS.toml"]
         ));
     }
 
