@@ -230,16 +230,10 @@ mod tests {
             recognized
         );
 
-        assert_eq!(
-            scope.matches_temporary_basename(OsStr::new(&scoped)),
-            recognized
-        );
+        assert!(scope.matches_temporary_basename(OsStr::new(&scoped)));
         assert!(!other.matches_temporary_basename(OsStr::new(&scoped)));
         assert!(!scope.matches_temporary_basename(OsStr::new(legacy)));
-        assert_eq!(
-            staging_name_scope(OsStr::new(&scoped)),
-            recognized.then_some(scope)
-        );
+        assert_eq!(staging_name_scope(OsStr::new(&scoped)), Some(scope));
         assert_eq!(staging_name_scope(OsStr::new(legacy)), None);
     }
 }
