@@ -555,6 +555,10 @@ mod tests {
     }
 }
 
+#[cfg(all(test, windows))]
+#[path = "native_io/windows_tests.rs"]
+mod windows_tests;
+
 #[cfg(target_os = "linux")]
 fn rename_no_replace(
     source_directory: &Dir,
@@ -770,21 +774,36 @@ pub(super) fn create_private_file(path: &Path) -> StorageResult<File> {
         .parent()
         .ok_or_else(|| connection(format!("private file {} has no parent", path.display())))?;
     ensure_private_directory(parent)?;
-    let mut options = OpenOptions::new();
-    options.create_new(true).read(true).write(true);
-    #[cfg(unix)]
+
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(PRIVATE_FILE_MODE);
+        // Privacy at birth: avoid path-based restrict/validate reopens that
+        // request FILE_SHARE_READ while this writer holds write access.
+        let file = astrid_core::platform_fs::create_new_private_file(path).map_err(|error| {
+            connection(format!("create private file {}: {error}", path.display()))
+        })?;
+        private_file_identity(&file)?;
+        Ok(file)
     }
-    let file = options
-        .open(path)
-        .map_err(|error| connection(format!("create private file {}: {error}", path.display())))?;
-    astrid_core::platform_fs::restrict_private_file(path).map_err(|error| {
-        connection(format!("restrict private file {}: {error}", path.display()))
-    })?;
-    validate_private_regular_file(path)?;
-    Ok(file)
+
+    #[cfg(not(windows))]
+    {
+        let mut options = OpenOptions::new();
+        options.create_new(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(PRIVATE_FILE_MODE);
+        }
+        let file = options.open(path).map_err(|error| {
+            connection(format!("create private file {}: {error}", path.display()))
+        })?;
+        astrid_core::platform_fs::restrict_private_file(path).map_err(|error| {
+            connection(format!("restrict private file {}: {error}", path.display()))
+        })?;
+        validate_private_regular_file(path)?;
+        Ok(file)
+    }
 }
 
 pub(super) fn open_private_file(path: &Path) -> StorageResult<File> {

@@ -45,7 +45,7 @@ Invoke-NativeCargoTest -CargoArgs @(
 Invoke-NativeCargoTest -CargoArgs @(
     "test", "--locked", "--target", $Target,
     "-p", "astrid-storage", "--features", "legacy-surrealkv",
-    "principal_state::native_io::retirement",
+    "principal_state::native_io",
     "--", "--nocapture"
 )
 

@@ -668,6 +668,37 @@ fn create_guarded_private_file_with_share(
     Ok(unsafe { File::from_raw_handle(raw.cast()) })
 }
 
+/// Create a new private regular file with the `ExactPrivate` ACL at birth.
+///
+/// Captures the parent as [`TrustedPathGuard`] and creates the child through
+/// [`create_guarded_private_file`], which applies the private ACL at `FILE_CREATE`,
+/// rejects redirects/non-regular types on that handle, and validates `ExactPrivate`
+/// before transferring the live read/write `File` (`FILE_SHARE_READ`). This
+/// function then re-verifies the retained parent `ExactPrivate` contract. Callers
+/// keep the returned handle without a path-based restrict/validate reopen that
+/// would share-conflict with the writer.
+///
+/// # Errors
+///
+/// Returns an error if the parent is missing, redirected, or not `ExactPrivate`;
+/// if the path already exists; if creation, type, or ACL validation fails; or if
+/// the parent contract fails after create. Failed parent postchecks mark the
+/// created handle for deletion before returning.
+pub fn create_new_private_file(path: &Path) -> io::Result<File> {
+    super::path::validate_local_absolute_path(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "private file has no parent"))?;
+    let guard = TrustedPathGuard::capture(parent)?;
+    guard.verify_contract(BoundaryContract::ExactPrivateDirectory)?;
+    let file = create_guarded_private_file(&guard, path)?;
+    if let Err(error) = guard.verify_contract(BoundaryContract::ExactPrivateDirectory) {
+        let _ = mark_file_for_deletion(file.as_raw_handle().cast());
+        return Err(error);
+    }
+    Ok(file)
+}
+
 pub(super) fn restrict_guarded_private_file(
     guard: &TrustedPathGuard,
     path: &Path,

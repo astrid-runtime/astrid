@@ -29,6 +29,13 @@ mod rename;
 pub(crate) mod retirement_support;
 
 pub use captured_directory::CapturedDirectory;
+pub use io::create_new_private_file;
+
+/// Validate `ExactPrivate` ACL on an open file handle without reopening the path.
+pub fn validate_private_file_handle(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    acl::validate_private_acl_handle(file.as_raw_handle().cast(), false, "private file handle")
+}
 pub(super) use executable::replace_executable_set;
 pub(super) use path::{
     create_private_directory, default_astrid_home_root, ensure_private_directory,

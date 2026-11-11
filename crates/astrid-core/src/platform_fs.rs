@@ -51,7 +51,7 @@ mod directory_identity;
 pub use directory_identity::DirectoryIdentity;
 
 #[cfg(windows)]
-pub use windows::CapturedDirectory;
+pub use windows::{CapturedDirectory, create_new_private_file, validate_private_file_handle};
 
 #[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
