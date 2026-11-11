@@ -19,6 +19,8 @@ use crate::content::{
     visit_raw_projection_collisions_with_key, visit_raw_protected_authority_collisions_with_key,
 };
 use crate::error::StorageError;
+#[cfg(windows)]
+use astrid_core::platform_fs::name_semantics::windows_nt_utf16_upcase_key;
 
 /// Exclusion spellings re-seeded into projection admission.
 ///
@@ -168,7 +170,6 @@ pub(super) fn validate(home: &AstridHome, entries: &[ContentEntry]) -> StorageRe
     // folded collisions so a lone RUN/principals impostor cannot skip the check).
     cfg_select! {
         windows => {
-            use astrid_core::platform_fs::name_semantics::windows_nt_utf16_upcase_key;
             reject_excluded_run_aliases_on_caseless_host(
                 home,
                 entries,
@@ -262,8 +263,6 @@ fn windows_policy(
     sentinels: &[ContentName],
     entries: &[ContentEntry],
 ) -> StorageResult<Option<ProjectionNamePolicy>> {
-    use astrid_core::platform_fs::name_semantics::windows_nt_utf16_upcase_key;
-
     // Admission uses the process NT ordinal UTF-16 upcase table
     // (`RtlUpcaseUnicodeChar`). Full Unicode folding can expand one code unit
     // into several (ß vs SS), unlike NT's code-unit mapping, so it is not the
@@ -330,7 +329,7 @@ fn platform_has_key_collision<K: Ord>(
     use std::ops::ControlFlow;
 
     let mut found = false;
-    crate::content::visit_raw_projection_collisions_with_key(
+    visit_raw_projection_collisions_with_key(
         entries.iter().map(ContentEntry::name),
         &mut key_for,
         |_| {
@@ -407,11 +406,9 @@ fn reject_host_unrepresentable_collisions_with_key<K>(
 where
     K: Ord,
 {
-    use std::ops::ControlFlow;
-
     let mut cache = HashMap::<PathBuf, bool>::new();
     let mut failure = None::<StorageError>;
-    crate::content::visit_raw_projection_collisions_with_key(
+    visit_raw_projection_collisions_with_key(
         entries.iter().map(ContentEntry::name),
         &mut key_for,
         |collision| {

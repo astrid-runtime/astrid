@@ -398,11 +398,11 @@ fn publish(
 
 #[cfg(windows)]
 fn promote(source: &Path, destination: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH;
     #[cfg(test)]
     if FAIL_PROMOTIONS.with(|fail| fail.borrow_mut().pop_front().unwrap_or(false)) {
         return Err(io::Error::other("injected Windows promotion failure"));
     }
-    use windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH;
     rename_windows(source, destination, MOVEFILE_WRITE_THROUGH)?;
     #[cfg(test)]
     if FAIL_AFTER_PROMOTIONS.with(|fail| fail.borrow_mut().pop_front().unwrap_or(false)) {

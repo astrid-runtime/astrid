@@ -4,6 +4,8 @@
 mod acl;
 #[path = "windows/captured_directory.rs"]
 mod captured_directory;
+#[path = "windows/directory_capability.rs"]
+pub mod directory_capability;
 #[cfg(test)]
 #[path = "windows/directory_durability.rs"]
 mod directory_durability;

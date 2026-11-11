@@ -64,16 +64,36 @@ impl PrivateDirectory {
         file: File,
         path: PathBuf,
     ) -> StorageResult<Self> {
+        Self::from_std_directory_file_with_flush(file, path, None)
+    }
+
+    /// Construct a captured capability with an explicit paired flush authority.
+    ///
+    /// Ordinary readonly `from_std_directory_file` keeps `flush = None` so
+    /// `sync` fails closed without ambient reopen. Mutating callers such as
+    /// `empty_moved_tree` supply a flusher from
+    /// `CapturedDirectory::open_paired_flush` (relative parent+name, 128-bit match).
+    #[cfg(windows)]
+    pub(in crate::principal_state) fn from_std_directory_file_with_flush(
+        file: File,
+        path: PathBuf,
+        flush: Option<astrid_core::platform_fs::directory_capability::DirectoryFlushCapability>,
+    ) -> StorageResult<Self> {
         let identity = super::private_directory_file_identity(&file)?;
+        if let Some(capability) = flush.as_ref() {
+            let flush_identity = super::private_directory_file_identity(capability.file())?;
+            if flush_identity != identity {
+                return Err(super::connection(
+                    "captured flush handle does not name the same directory".to_owned(),
+                ));
+            }
+        }
         let directory = Dir::from_std_file(file);
-        #[cfg(unix)]
-        let sync_handle = super::private_directory_sync_handle(&directory, &path, identity)?;
         Ok(Self {
             directory,
-            #[cfg(unix)]
-            sync_handle,
             path,
             identity,
+            flush,
         })
     }
 }

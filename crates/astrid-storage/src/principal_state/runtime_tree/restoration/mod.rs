@@ -426,12 +426,12 @@ fn reuse_or_mint_staging_scope(
 
 pub(super) use staging::{discharge_scoped_staging, eligible_file_parents, parent_is_eligible};
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn begin_writer_count(root: &std::path::Path) {
     tests::begin_writer_count(root);
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn take_writer_opens(root: &std::path::Path) -> usize {
     tests::take_writer_opens(root)
 }

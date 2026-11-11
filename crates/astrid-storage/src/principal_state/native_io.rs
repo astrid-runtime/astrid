@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 
 use cap_std::fs::Dir;
 
+#[path = "native_io/durability.rs"]
+mod durability;
+pub(super) use durability::{rename_private_entry, sync_directory};
+
 #[cfg(feature = "legacy-surrealkv")]
 mod retirement;
 #[cfg(all(feature = "legacy-surrealkv", not(windows)))]
@@ -16,6 +20,8 @@ pub(super) use retirement::validate_retirement_tree;
 pub(super) use retirement::{CapturedDirectory, remove_retirement_contents};
 #[cfg(feature = "legacy-surrealkv")]
 mod from_captured;
+#[cfg(windows)]
+mod windows_staging;
 
 use crate::error::{StorageError, StorageResult};
 
@@ -55,6 +61,8 @@ pub(super) struct PrivateDirectory {
     sync_handle: File,
     path: PathBuf,
     identity: PrivateDirectoryIdentity,
+    #[cfg(windows)]
+    flush: Option<astrid_core::platform_fs::directory_capability::DirectoryFlushCapability>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,12 +98,16 @@ impl PrivateDirectory {
         }
         #[cfg(unix)]
         let sync_handle = private_directory_sync_handle(&directory, path, identity)?;
+        #[cfg(windows)]
+        let flush = Some(windows_staging::open_flush_for_ambient(path, &directory)?);
         Ok(Self {
             directory,
             #[cfg(unix)]
             sync_handle,
             path: path.to_path_buf(),
             identity,
+            #[cfg(windows)]
+            flush,
         })
     }
 
@@ -123,12 +135,17 @@ impl PrivateDirectory {
         }
         #[cfg(unix)]
         let sync_handle = private_directory_sync_handle(&first, &self.path.join(name), identity)?;
+        #[cfg(windows)]
+        let flush =
+            windows_staging::child_flush(self.flush.as_ref(), &self.directory, name, &first)?;
         Ok(Self {
             directory: first,
             #[cfg(unix)]
             sync_handle,
             path: self.path.join(name),
             identity,
+            #[cfg(windows)]
+            flush,
         })
     }
 
@@ -333,6 +350,15 @@ impl PrivateDirectory {
                 )));
             },
         }
+        #[cfg(windows)]
+        windows_staging::rename_no_replace_windows(
+            &self.directory,
+            source,
+            &self.directory,
+            destination,
+            windows_staging::ExpectedRenameIdentity::File(expected),
+        )?;
+        #[cfg(not(windows))]
         rename_no_replace(&self.directory, source, &self.directory, destination).map_err(
             |error| {
                 connection(format!(
@@ -372,6 +398,15 @@ impl PrivateDirectory {
                 destination_directory.path.join(destination).display()
             )));
         }
+        #[cfg(windows)]
+        windows_staging::rename_no_replace_windows(
+            &self.directory,
+            source,
+            &destination_directory.directory,
+            destination,
+            windows_staging::ExpectedRenameIdentity::File(expected),
+        )?;
+        #[cfg(not(windows))]
         rename_no_replace(
             &self.directory,
             source,
@@ -412,6 +447,15 @@ impl PrivateDirectory {
                 destination_directory.path.join(destination).display()
             )));
         }
+        #[cfg(windows)]
+        windows_staging::rename_no_replace_windows(
+            &self.directory,
+            source,
+            &destination_directory.directory,
+            destination,
+            windows_staging::ExpectedRenameIdentity::Directory(expected),
+        )?;
+        #[cfg(not(windows))]
         rename_no_replace(
             &self.directory,
             source,
@@ -435,7 +479,6 @@ impl PrivateDirectory {
         Ok(installed)
     }
 
-    #[cfg_attr(not(unix), allow(clippy::unnecessary_wraps, clippy::unused_self))]
     pub(super) fn sync(&self) -> StorageResult<()> {
         #[cfg(unix)]
         {
@@ -443,9 +486,16 @@ impl PrivateDirectory {
                 connection(format!("flush directory {}: {error}", self.path.display()))
             })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            Ok(())
+            windows_staging::sync_windows(&self.path, self.flush.as_ref())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(connection(format!(
+                "directory flush unsupported on this target: {}",
+                self.path.display()
+            )))
         }
     }
 }
@@ -626,16 +676,6 @@ fn rename_no_replace(
     } else {
         Err(std::io::Error::last_os_error())
     }
-}
-
-#[cfg(windows)]
-fn rename_no_replace(
-    source_directory: &Dir,
-    source: &Path,
-    destination_directory: &Dir,
-    destination: &Path,
-) -> std::io::Result<()> {
-    source_directory.rename(source, destination_directory, destination)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -914,37 +954,6 @@ pub(super) fn quarantine_directory(path: &Path, classification: &str) -> Storage
     rename_private_entry(path, &destination)?;
     sync_directory(parent)?;
     Ok(destination)
-}
-
-/// Rename an entry at the platform's durable namespace boundary.
-///
-/// Windows has no portable parent-directory flush equivalent, so the rename
-/// itself must request write-through. Unix callers retain their existing
-/// parent-directory synchronization after this atomic transition.
-pub(super) fn rename_private_entry(source: &Path, destination: &Path) -> StorageResult<()> {
-    astrid_core::platform_fs::rename_with_write_through(source, destination).map_err(|error| {
-        connection(format!(
-            "rename private entry {} as {}: {error}",
-            source.display(),
-            destination.display()
-        ))
-    })
-}
-
-#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
-pub(super) fn sync_directory(path: &Path) -> StorageResult<()> {
-    #[cfg(unix)]
-    {
-        File::open(path)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| connection(format!("flush directory {}: {error}", path.display())))
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
-    }
 }
 
 #[cfg(not(windows))]

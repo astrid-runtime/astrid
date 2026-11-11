@@ -239,10 +239,17 @@ fn empty_moved_tree(
     directory: astrid_core::platform_fs::CapturedDirectory,
     stage_path: &Path,
 ) -> StorageResult<()> {
+    // Mutation-only: obtain relative paired flush from retained parent+name
+    // before cloning the readonly traversal handle. No ambient path reopen.
+    let flush = directory.open_paired_flush().map_err(snapshot_error)?;
     let clone = directory
         .try_clone_directory_file()
         .map_err(snapshot_error)?;
-    let capability = PrivateDirectory::from_std_directory_file(clone, stage_path.to_path_buf())?;
+    let capability = PrivateDirectory::from_std_directory_file_with_flush(
+        clone,
+        stage_path.to_path_buf(),
+        Some(flush),
+    )?;
     directory
         .validate_legacy_source_tree(stage_path)
         .map_err(snapshot_error)?;

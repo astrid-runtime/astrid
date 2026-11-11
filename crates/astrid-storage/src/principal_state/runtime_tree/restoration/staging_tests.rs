@@ -3,9 +3,11 @@
 use std::fs;
 use std::sync::Arc;
 
+#[cfg(unix)]
+use crate::ContentName;
 use crate::principal_state::runtime_tree::{active, transition_retiring_projection};
 use crate::principal_state::{RuntimePrincipalStore, StateOwner};
-use crate::{ContentName, KvQuotaResolver, open_runtime_principal_store};
+use crate::{KvQuotaResolver, open_runtime_principal_store};
 use astrid_core::dirs::AstridHome;
 
 const EXISTING: &str = "restoration/existing.conf";
@@ -45,6 +47,7 @@ fn scoped_intent<'a>(
     prepared
 }
 
+#[cfg(unix)]
 fn assert_volume_authority(home: &AstridHome, store: &RuntimePrincipalStore) {
     assert_eq!(
         active::read(home, store).unwrap().unwrap().phase(),
@@ -61,6 +64,7 @@ fn assert_volume_authority(home: &AstridHome, store: &RuntimePrincipalStore) {
     }
 }
 
+#[cfg(unix)]
 async fn assert_reopens_authoritatively(home: &AstridHome) {
     let store = open_runtime_principal_store(home, unlimited())
         .await

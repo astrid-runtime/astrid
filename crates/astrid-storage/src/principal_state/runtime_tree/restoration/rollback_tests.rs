@@ -1,5 +1,6 @@
 //! Rollback preserves exact prior generations using anonymous scratch storage.
 
+#[cfg(unix)]
 use std::io::{self, Read};
 use std::path::Path;
 
@@ -73,11 +74,13 @@ fn multi_generation_rollback_restores_exact_bytes() {
 }
 
 /// Reader that fails after `ok_bytes` to exercise midstream cleanup.
+#[cfg(unix)]
 struct FailAfter {
     ok_bytes: usize,
     read: usize,
 }
 
+#[cfg(unix)]
 impl Read for FailAfter {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if self.read >= self.ok_bytes {

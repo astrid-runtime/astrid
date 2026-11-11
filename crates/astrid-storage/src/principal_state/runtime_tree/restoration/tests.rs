@@ -24,6 +24,7 @@ pub(super) fn intent_committed(root: &Path) {
     });
 }
 
+#[cfg(unix)]
 pub(super) fn begin_writer_count(root: &Path) {
     WRITERS.with_borrow_mut(|counter| *counter = Some((root.to_path_buf(), 0)));
 }
@@ -38,6 +39,7 @@ pub(super) fn writer_opened(root: &Path) {
     });
 }
 
+#[cfg(unix)]
 pub(super) fn take_writer_opens(root: &Path) -> usize {
     WRITERS.with_borrow_mut(|counter| match counter.take() {
         Some((expected, count)) if expected == root => count,

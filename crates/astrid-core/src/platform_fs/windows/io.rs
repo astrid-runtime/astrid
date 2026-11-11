@@ -537,6 +537,22 @@ pub(super) fn rename_guarded_handle(
     replace: bool,
 ) -> io::Result<()> {
     let destination_name = guarded_child_name(guard, destination)?;
+    rename_by_parent_handle(source, guard.authority_handle(), destination_name, replace)
+}
+
+/// Handle-relative NT rename against an already-opened destination parent.
+pub(super) fn rename_by_parent_handle(
+    source: &impl AsRawHandle,
+    destination_parent: HANDLE,
+    destination_name: &OsStr,
+    replace: bool,
+) -> io::Result<()> {
+    if destination_name.is_empty() || destination_name.encode_wide().any(|unit| unit == 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid handle-relative Windows rename destination name",
+        ));
+    }
     let destination_wide = destination_name.encode_wide().collect::<Vec<_>>();
     let name_bytes = destination_wide
         .len()
@@ -566,7 +582,7 @@ pub(super) fn rename_guarded_handle(
         } else {
             (*info).Anonymous.ReplaceIfExists = false;
         }
-        (*info).RootDirectory = guard.authority_handle();
+        (*info).RootDirectory = destination_parent;
         (*info).FileNameLength = name_bytes;
         std::ptr::copy_nonoverlapping(
             destination_wide.as_ptr(),
@@ -595,6 +611,81 @@ pub(super) fn rename_guarded_handle(
         return Err(io::Error::from_raw_os_error(code.cast_signed()));
     }
     Ok(())
+}
+
+/// Mutation-specific regular-file open for exclusive rename.
+pub(super) fn open_relative_file_for_exclusive_rename(
+    parent: HANDLE,
+    name: &OsStr,
+) -> io::Result<File> {
+    let mut name_wide = name.encode_wide().collect::<Vec<_>>();
+    if name_wide.is_empty() || name_wide.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid handle-relative Windows file name",
+        ));
+    }
+    let byte_length = name_wide
+        .len()
+        .checked_mul(size_of::<u16>())
+        .and_then(|length| u16::try_from(length).ok())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Windows file name is too long")
+        })?;
+    let unicode = UNICODE_STRING {
+        Length: byte_length,
+        MaximumLength: byte_length,
+        Buffer: name_wide.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: u32::try_from(size_of::<OBJECT_ATTRIBUTES>()).expect("OBJECT_ATTRIBUTES fits u32"),
+        RootDirectory: parent,
+        ObjectName: &raw const unicode,
+        Attributes: 0x40, // OBJ_CASE_INSENSITIVE
+        SecurityDescriptor: null(),
+        SecurityQualityOfService: null(),
+    };
+    let mut handle = null_mut();
+    let mut status = IO_STATUS_BLOCK::default();
+    // SAFETY: parent/name buffers live for the call; OPEN_REPARSE_POINT avoids follow.
+    let result = unsafe {
+        NtCreateFile(
+            &raw mut handle,
+            DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            &raw const attributes,
+            &raw mut status,
+            null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            null(),
+            0,
+        )
+    };
+    if result < 0 {
+        let code = unsafe { RtlNtStatusToDosError(result) };
+        return Err(io::Error::from_raw_os_error(code.cast_signed()));
+    }
+    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        return Err(io::Error::other(
+            "NtCreateFile returned an invalid relative rename source handle",
+        ));
+    }
+    let owned = OwnedHandle(handle);
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(owned.0, &raw mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "exclusive rename source is redirected or not a regular file",
+        ));
+    }
+    let raw = owned.0;
+    std::mem::forget(owned);
+    Ok(unsafe { File::from_raw_handle(raw.cast()) })
 }
 
 fn guarded_child_name<'a>(guard: &TrustedPathGuard, path: &'a Path) -> io::Result<&'a OsStr> {
