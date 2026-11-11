@@ -207,7 +207,8 @@ mod tests {
         let scoped = scope.temporary_basename();
         let legacy = ".astrid-private-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-        // Recognition follows the Unix writer contract on every target.
+        // Legacy temporary names remain Unix-specific. Receipt-scoped names
+        // are recognized across targets, including the native Windows writer.
         let recognized = cfg!(unix);
         assert_eq!(
             is_private_atomic_staging_name(OsStr::new(legacy)),
@@ -221,15 +222,9 @@ mod tests {
         assert!(!is_scoped_private_staging_name(OsStr::new(uppercase)));
         assert!(!scope.matches_temporary_basename(OsStr::new(uppercase)));
         assert!(!is_private_atomic_staging_name(OsStr::new(&scoped)));
-        assert_eq!(
-            is_scoped_private_staging_name(OsStr::new(&scoped)),
-            recognized
-        );
+        assert!(is_scoped_private_staging_name(OsStr::new(&scoped)));
         assert!(!is_scoped_private_staging_name(OsStr::new(legacy)));
-        assert_eq!(
-            is_structural_private_staging_name(OsStr::new(&scoped)),
-            recognized
-        );
+        assert!(is_structural_private_staging_name(OsStr::new(&scoped)));
         assert_eq!(
             is_structural_private_staging_name(OsStr::new(legacy)),
             recognized
