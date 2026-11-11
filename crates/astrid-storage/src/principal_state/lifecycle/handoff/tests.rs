@@ -334,7 +334,7 @@ fn pending_custody_waits_for_blocked_commit_across_runtime_drop() {
     let custody = match custody_rx.recv_timeout(Duration::from_secs(20)) {
         Ok(Ok(value)) => value,
         Ok(Err(error)) => panic!("blocked-commit worker failed before custody: {error}"),
-        Err(_) => panic!("timed out waiting for pending custody from runtime thread"),
+        Err(error) => panic!("cannot receive pending custody from runtime thread: {error}"),
     };
     let (old_kv, pending_custody, gate) = custody;
     drop_started_rx
@@ -433,7 +433,7 @@ fn pending_busy_handoff_failure_closes_engine_and_preserves_shutdown_error() {
     let (old_kv, error, gate) = match result_rx.recv_timeout(Duration::from_secs(20)) {
         Ok(Ok(value)) => value,
         Ok(Err(error)) => panic!("busy handoff worker failed before entry: {error}"),
-        Err(_) => panic!("timed out waiting for busy failure outcome"),
+        Err(error) => panic!("cannot receive busy failure outcome: {error}"),
     };
     assert!(
         gate.entered(),

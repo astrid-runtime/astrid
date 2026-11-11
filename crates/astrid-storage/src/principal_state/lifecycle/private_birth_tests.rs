@@ -10,8 +10,10 @@ use std::sync::Arc;
 
 use astrid_core::dirs::AstridHome;
 
-use crate::principal_state::{StateOwner, open_runtime_principal_store};
-use crate::{KvQuotaResolver, open_runtime_principal_store_for_pack};
+use crate::KvQuotaResolver;
+use crate::principal_state::{
+    StateOwner, open_runtime_principal_store, open_runtime_principal_store_for_pack,
+};
 
 fn quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
     Arc::new(|_: &StateOwner| Ok(None))
@@ -140,9 +142,9 @@ async fn preexisting_broad_runtime_root_rejects_without_creating_volume() {
     );
 
     let (destination, migrating) = volume_paths(&home);
-    let error = open_runtime_principal_store(&home, quota())
-        .await
-        .expect_err("broad root must fail closed before volume bootstrap");
+    let Err(error) = open_runtime_principal_store(&home, quota()).await else {
+        panic!("broad root must fail closed before volume bootstrap");
+    };
     let message = error.to_string();
     assert!(
         message.contains("private Windows path ACL is not restricted")
@@ -194,9 +196,9 @@ async fn redirected_symlink_runtime_root_rejects_without_creating_volume() {
     );
 
     let (destination, migrating) = volume_paths(&home);
-    let error = open_runtime_principal_store(&home, quota())
-        .await
-        .expect_err("symlink runtime root must fail closed");
+    let Err(error) = open_runtime_principal_store(&home, quota()).await else {
+        panic!("symlink runtime root must fail closed");
+    };
     let message = error.to_string();
     assert!(
         message.contains("redirected or not a directory")
@@ -226,9 +228,9 @@ async fn nondirectory_runtime_root_rejects_without_creating_volume() {
     assert!(home.root().is_file());
 
     let (destination, migrating) = volume_paths(&home);
-    let error = open_runtime_principal_store(&home, quota())
-        .await
-        .expect_err("file runtime root must fail closed");
+    let Err(error) = open_runtime_principal_store(&home, quota()).await else {
+        panic!("file runtime root must fail closed");
+    };
     assert!(matches!(error, crate::StorageError::Connection(_)));
     assert_eq!(std::fs::read(home.root()).unwrap(), b"not-a-directory");
     assert!(!destination.exists(), "{destination:?} must stay absent");
