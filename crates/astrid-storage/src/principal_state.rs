@@ -52,7 +52,7 @@ mod format_identity_tests;
 #[cfg(test)]
 mod format_migration_tests;
 mod lifecycle;
-pub use lifecycle::{RuntimeFinalization, RuntimeLifecycleGuard};
+pub use lifecycle::{PendingRuntimeFinalization, RuntimeFinalization, RuntimeLifecycleGuard};
 #[cfg(test)]
 mod hosted_volume_tests;
 #[cfg(feature = "legacy-surrealkv")]

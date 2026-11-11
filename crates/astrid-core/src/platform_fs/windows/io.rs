@@ -413,6 +413,29 @@ pub(super) fn remove_guarded_file(guard: &TrustedPathGuard, path: &Path) -> io::
     })
 }
 
+/// Validate a leaf contract and mark deletion on the same open handle.
+///
+/// Used when a prior read-only open would exclude `DELETE` sharing and make a
+/// second delete open fail with a sharing violation.
+pub(super) fn remove_guarded_file_with_contract(
+    guard: &TrustedPathGuard,
+    path: &Path,
+    file_contract: FileContract,
+) -> io::Result<()> {
+    let name = guarded_child_name(guard, path)?;
+    let handle = open_guarded_child(guard, name, DELETE | GENERIC_READ | READ_CONTROL)?;
+    validate_file_contract(handle.0, path, file_contract)?;
+    mark_handle_for_deletion(handle.0).map_err(|error| {
+        with_context(
+            error,
+            format!(
+                "could not mark handle-relative file for deletion: {}",
+                path.display()
+            ),
+        )
+    })
+}
+
 pub(super) fn guarded_file_exists(guard: &TrustedPathGuard, path: &Path) -> io::Result<bool> {
     let name = guarded_child_name(guard, path)?;
     match open_guarded_child(guard, name, FILE_READ_ATTRIBUTES) {
@@ -615,7 +638,10 @@ fn open_guarded_child_locked(
     open_guarded_child_with_options(guard, name, desired_access, FILE_SHARE_READ, FILE_OPEN)
 }
 
-fn create_guarded_private_file(guard: &TrustedPathGuard, path: &Path) -> io::Result<File> {
+pub(in crate::platform_fs::windows) fn create_guarded_private_file(
+    guard: &TrustedPathGuard,
+    path: &Path,
+) -> io::Result<File> {
     create_guarded_private_file_with_share(guard, path, FILE_SHARE_READ)
 }
 

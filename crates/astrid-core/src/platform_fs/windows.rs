@@ -16,6 +16,8 @@ mod path;
 mod prelude;
 #[path = "windows/private_file.rs"]
 mod private_file;
+#[path = "windows/projection_session/mod.rs"]
+mod projection_session;
 #[path = "windows/rename.rs"]
 mod rename;
 
@@ -23,9 +25,12 @@ pub use captured_directory::CapturedDirectory;
 pub(super) use executable::replace_executable_set;
 pub(super) use path::{
     create_private_directory, default_astrid_home_root, ensure_private_directory,
-    restrict_private_file, validate_private_file, verify_no_redirects,
+    restrict_private_file, validate_private_directory, validate_private_file, verify_no_redirects,
 };
 pub(super) use private_file::{atomic_write_private_file, read_private_file_to_string};
+pub(in crate::platform_fs) use projection_session::{
+    ProjectionInspection, ProjectionRoot, create_private_scratch_file,
+};
 pub(super) use rename::rename_with_write_through;
 
 #[cfg(test)]

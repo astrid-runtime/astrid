@@ -14,6 +14,11 @@ mod verification;
 pub(super) use verification::verify_captured_no_redirects;
 pub(in crate::platform_fs) use verification::verify_no_redirects;
 
+#[path = "path/descendant.rs"]
+mod descendant;
+#[cfg(test)]
+pub(in crate::platform_fs::windows) use descendant::TEST_MOVE_DESCENDANT_DURING_CAPTURE;
+
 pub(super) struct OwnedHandle(pub(super) HANDLE);
 
 impl Drop for OwnedHandle {
@@ -330,6 +335,13 @@ impl TrustedPathGuard {
             .0
     }
 
+    pub(super) fn authority_identity(&self) -> FileIdentity {
+        self.components
+            .last()
+            .expect("captured Windows path has an authority component")
+            .identity
+    }
+
     pub(super) fn create_private_descendants(&self, target: &Path) -> io::Result<()> {
         let relative = target.strip_prefix(&self.authority_boundary).map_err(|_| {
             io::Error::new(
@@ -501,16 +513,22 @@ fn test_probe_created_directory_acl(handle: HANDLE, disposition: u32) -> io::Res
 }
 
 fn create_private_directory_relative(parent: HANDLE, name: &OsStr) -> io::Result<OwnedHandle> {
+    create_private_directory_identity_relative(parent, name).map(|(handle, _)| handle)
+}
+
+fn create_private_directory_identity_relative(
+    parent: HANDLE,
+    name: &OsStr,
+) -> io::Result<(OwnedHandle, FileIdentity)> {
     let security = PrivateSecurityDescriptor::new(true)?;
-    let (handle, _) = open_directory_identity_relative_with_options(
+    open_directory_identity_relative_with_options(
         parent,
         name,
         true,
         WRITE_DAC | DELETE,
         FILE_CREATE,
         Some(&security),
-    )?;
-    Ok(handle)
+    )
 }
 
 fn open_directory_identity_relative(
@@ -790,6 +808,11 @@ pub(in crate::platform_fs) fn default_astrid_home_root() -> io::Result<PathBuf> 
     validate_local_absolute_path(&local_data)?;
     TrustedPathGuard::capture(&local_data)?.verify()?;
     Ok(local_data.join("Astrid").join("Runtime"))
+}
+
+/// Validate existing directory privacy without creation or permission repair.
+pub(in crate::platform_fs) fn validate_private_directory(path: &Path) -> io::Result<()> {
+    TrustedPathGuard::capture(path)?.verify_contract(BoundaryContract::ExactPrivateDirectory)
 }
 
 pub(in crate::platform_fs) fn ensure_private_directory(path: &Path) -> io::Result<()> {

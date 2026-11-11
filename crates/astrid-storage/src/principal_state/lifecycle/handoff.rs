@@ -1,6 +1,6 @@
 //! Transfer existing verified storage custody without reviving former handles.
 
-use super::RuntimeFinalization;
+use super::{PendingRuntimeFinalization, RuntimeFinalization};
 use crate::principal_state::{
     NativePrincipalContentStore, RuntimePrincipalStore, RuntimeStore, StateOwnerResolver,
 };
@@ -11,6 +11,27 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 impl RuntimePrincipalStore {
+    /// Retain open custody for deferred handoff after task-runtime teardown.
+    ///
+    /// Does not close the engine or revoke live handles. Callers must keep this
+    /// token across the original runtime drop, then
+    /// [`PendingRuntimeFinalization::handoff_for_finalization`].
+    ///
+    /// # Errors
+    /// Fails when the volume binding or retirement home is invalid.
+    pub fn retain_for_finalization(
+        &self,
+        home: &AstridHome,
+    ) -> StorageResult<PendingRuntimeFinalization> {
+        self.require_volume_binding(home)?;
+        crate::principal_state::runtime_tree_active::validate_retirement_home(home, self)?;
+        Ok(PendingRuntimeFinalization {
+            store: Some(self.clone()),
+            home: home.clone(),
+            shutdown_error: None,
+        })
+    }
+
     /// Close old runtime handles and move authority into a finalization owner.
     ///
     /// All producers must already be quiesced. Keep the returned owner across

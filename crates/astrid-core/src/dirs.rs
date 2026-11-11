@@ -61,6 +61,7 @@ pub use projection_retirement::retire_projection_root;
 #[path = "dirs_run_dir.rs"]
 mod run_dir;
 mod stopped_key;
+pub use stopped_key::StoppedProjectionRecovery;
 #[path = "dirs_workspace.rs"]
 mod workspace_dir;
 pub use workspace_dir::WorkspaceDir;
@@ -260,7 +261,7 @@ enum UnsentinelledRootState {
     Empty,
     RuntimeKeyBootstrap,
     StoppedVolume,
-    StoppedKeyRecovery,
+    StoppedRecovery,
 }
 
 impl AstridHome {
@@ -407,6 +408,10 @@ impl AstridHome {
                 self.wit_store_dir(),
             ]);
         }
+        // Stopped admission is read-only until storage records restoration intent.
+        if existing_layout.is_none() && stopped_key::admit_stopped_read_only(self)? {
+            return Ok(());
+        }
         crate::platform_fs::ensure_private_directory(self.root())?;
         for dir in &dirs {
             crate::platform_fs::ensure_private_directory(dir)?;
@@ -493,7 +498,7 @@ impl AstridHome {
 
         if matches!(
             self.validate_fresh_root_entries()?,
-            UnsentinelledRootState::StoppedVolume | UnsentinelledRootState::StoppedKeyRecovery
+            UnsentinelledRootState::StoppedVolume | UnsentinelledRootState::StoppedRecovery
         ) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -504,8 +509,8 @@ impl AstridHome {
     }
 
     fn validate_fresh_root_entries(&self) -> io::Result<UnsentinelledRootState> {
-        if self.requires_stopped_key_recovery()? {
-            return Ok(UnsentinelledRootState::StoppedKeyRecovery);
+        if self.stopped_projection_recovery()?.is_some() {
+            return Ok(UnsentinelledRootState::StoppedRecovery);
         }
         let mut entries = self.root().read_dir()?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(std::fs::DirEntry::file_name);
@@ -535,6 +540,7 @@ impl AstridHome {
                     ),
                 ));
             }
+            stopped_key::validate_recovery_root(self)?;
             crate::platform_fs::validate_private_file(&path)?;
             state = UnsentinelledRootState::StoppedVolume;
         }

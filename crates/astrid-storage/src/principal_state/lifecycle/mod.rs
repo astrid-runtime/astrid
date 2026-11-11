@@ -140,6 +140,75 @@ impl Drop for RuntimeFinalization {
     }
 }
 
+/// Open-store custody retained across task-runtime teardown before handoff.
+///
+/// Clone the live [`super::RuntimePrincipalStore`] without closing it. Dropping
+/// this token without [`Self::handoff_for_finalization`] closes the original
+/// engine. A successful handoff transfers into [`RuntimeFinalization`] and must
+/// not close the fresh owner.
+#[must_use = "hand off after the task runtime stops, or drop to close the engine"]
+pub struct PendingRuntimeFinalization {
+    store: Option<super::RuntimePrincipalStore>,
+    home: AstridHome,
+    shutdown_error: Option<StorageError>,
+}
+
+impl PendingRuntimeFinalization {
+    /// Retain an ancillary shutdown failure until handoff and packing complete.
+    pub fn record_shutdown_error(&mut self, error: StorageError) {
+        self.shutdown_error = Some(match self.shutdown_error.take() {
+            Some(previous) => StorageError::Internal(format!("{previous}; additionally: {error}")),
+            None => error,
+        });
+    }
+
+    /// Transfer authority after producers have joined, typically after runtime drop.
+    ///
+    /// The live store stays in this token until transfer succeeds. A failed
+    /// handoff therefore still drops custody and closes the original engine.
+    /// Ancillary shutdown errors are preserved on both success and failure.
+    ///
+    /// # Errors
+    /// Fails on a wrong home, active commits, or a durable flush failure.
+    pub fn handoff_for_finalization(mut self) -> StorageResult<RuntimeFinalization> {
+        let Some(store) = self.store.as_ref() else {
+            return Err(StorageError::Connection(
+                "pending runtime custody is already released".into(),
+            ));
+        };
+        match store.handoff_for_finalization(&self.home) {
+            Ok(mut finalization) => {
+                // Successful transfer already closed the old engine. Drop the
+                // retained clone without running abandonment close again.
+                let _ = self.store.take();
+                if let Some(error) = self.shutdown_error.take() {
+                    finalization.record_shutdown_error(error);
+                }
+                Ok(finalization)
+            },
+            Err(error) => {
+                // Keep store installed so Drop closes the original engine.
+                Err(match self.shutdown_error.take() {
+                    Some(earlier) => StorageError::Connection(format!(
+                        "{error}; earlier shutdown failed: {earlier}"
+                    )),
+                    None => error,
+                })
+            },
+        }
+    }
+}
+
+impl Drop for PendingRuntimeFinalization {
+    fn drop(&mut self) {
+        // Abandonment must close the still-authoritative engine. Successful
+        // handoff takes the store out first so the fresh owner stays open.
+        if let Some(store) = self.store.take() {
+            let _ = store.engine.close();
+        }
+    }
+}
+
 impl RuntimeLifecycleGuard {
     /// Finalize the retained store after its task runtime has stopped.
     ///

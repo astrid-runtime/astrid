@@ -1,8 +1,44 @@
-//! Descriptor-bound Linux mount identity, including same-device bind mounts.
+//! Reject device transitions and, on Linux, same-device bind mounts.
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
+use nix::sys::stat::fstat;
+#[cfg(unix)]
 use std::fs::File;
 use std::io;
+
+#[cfg(unix)]
+pub(crate) struct MountBoundary {
+    device: nix::libc::dev_t,
+    #[cfg(target_os = "linux")]
+    mount: MountId,
+}
+
+#[cfg(unix)]
+impl MountBoundary {
+    pub(crate) fn new(root: &File) -> io::Result<Self> {
+        Ok(Self {
+            device: fstat(root).map_err(super::nix_io_error)?.st_dev,
+            #[cfg(target_os = "linux")]
+            mount: MountId::of(root)?,
+        })
+    }
+
+    pub(crate) fn validate(&self, child: &File) -> io::Result<()> {
+        self.validate_device(fstat(child).map_err(super::nix_io_error)?.st_dev)?;
+        #[cfg(target_os = "linux")]
+        if MountId::of(child)? != self.mount {
+            return Err(invalid("projection crosses a mount boundary"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_device(&self, device: nix::libc::dev_t) -> io::Result<()> {
+        if device != self.device {
+            return Err(invalid("projection crosses a device boundary"));
+        }
+        Ok(())
+    }
+}
 
 #[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -8,17 +8,19 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::content::{ContentEntry, ContentName};
 use crate::error::{StorageError, StorageResult};
 use crate::storage_model::ObjectId;
 use astrid_core::dirs::AstridHome;
+use astrid_core::platform_fs::StagingScope;
 
 use super::{RuntimePrincipalStore, StateOwner, runtime_tree::is_excluded};
 
 pub(super) const ACTIVE_PROJECTION_NAME: &str = "run/.active-projection-v1.json";
-const RECEIPT_SCHEMA: u32 = 1;
+const RECEIPT_SCHEMA_V1: u32 = 1;
+const RECEIPT_SCHEMA_V2: u32 = 2;
 // Preserve the historical allowance for receipt framing and root spelling.
 // Inventory allowance is derived separately from authenticated live catalog
 // names, so a large fleet does not outgrow a fixed 4 MiB inventory ceiling.
@@ -45,6 +47,12 @@ pub(super) struct ActiveProjectionReceipt {
     phase: ReceiptPhase,
     root: String,
     entries: Vec<ActiveReceiptEntry>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_staging_scope",
+        skip_serializing_if = "Option::is_none"
+    )]
+    staging_scope: Option<StagingScope>,
 }
 
 impl ActiveProjectionReceipt {
@@ -60,6 +68,14 @@ impl ActiveProjectionReceipt {
         self.entries
             .binary_search_by(|entry| entry.name.as_str().cmp(name))
             .is_ok()
+    }
+
+    pub(super) const fn staging_scope(&self) -> Option<StagingScope> {
+        self.staging_scope
+    }
+
+    pub(super) fn inventory_names(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|entry| entry.name.as_str())
     }
 
     #[cfg(test)]
@@ -89,6 +105,19 @@ struct ActiveReceiptEntry {
     name: String,
     file: String,
     logical_bytes: u64,
+}
+
+fn deserialize_present_staging_scope<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<StagingScope>, D::Error> {
+    // Missing field uses serde `default` and never reaches this function.
+    // Explicit JSON null must fail closed rather than becoming no-epoch.
+    match Option::<StagingScope>::deserialize(deserializer)? {
+        Some(scope) => Ok(Some(scope)),
+        None => Err(serde::de::Error::custom(
+            "staging_scope must not be null when present",
+        )),
+    }
 }
 
 pub(super) fn active_projection_name() -> StorageResult<ContentName> {
@@ -237,12 +266,7 @@ fn decode_receipt(
                 format!("parse active projection receipt: {error}"),
             )
         })?;
-    if receipt.schema != RECEIPT_SCHEMA {
-        return Err(tree_error(
-            host_receipt,
-            "active projection receipt has an unsupported schema",
-        ));
-    }
+    validate_receipt_schema(&receipt, host_receipt)?;
     if let ReceiptInventory::Listed(catalog) = inventory {
         // ContentStore::list already returns unique canonical names in byte order.
         // Retain that authenticated inventory directly instead of cloning every
@@ -287,9 +311,20 @@ pub(super) fn encode(
     home: &AstridHome,
     phase: ReceiptPhase,
     entries: &[ActiveProjectionEntry],
+    staging_scope: Option<StagingScope>,
 ) -> StorageResult<Vec<u8>> {
+    let schema = match (phase, staging_scope) {
+        (ReceiptPhase::Retiring, Some(_)) => RECEIPT_SCHEMA_V2,
+        (_, None) => RECEIPT_SCHEMA_V1,
+        (ReceiptPhase::Active, Some(_)) => {
+            return Err(tree_error(
+                home.root(),
+                "active projection receipt cannot carry a staging scope",
+            ));
+        },
+    };
     let receipt = ActiveProjectionReceipt {
-        schema: RECEIPT_SCHEMA,
+        schema,
         phase,
         root: canonical_root(home)?,
         entries: entries
@@ -300,6 +335,7 @@ pub(super) fn encode(
                 logical_bytes: entry.logical_bytes,
             })
             .collect(),
+        staging_scope,
     };
     let bytes = serde_json::to_vec(&receipt)
         .map_err(|error| tree_error(home.root(), format!("encode active receipt: {error}")))?;
@@ -311,6 +347,42 @@ pub(super) fn encode(
         receipt_size_bound(entries.iter().map(|entry| &entry.name))?,
     )?;
     Ok(bytes)
+}
+
+fn validate_receipt_schema(
+    receipt: &ActiveProjectionReceipt,
+    host_receipt: &Path,
+) -> StorageResult<()> {
+    match receipt.schema {
+        RECEIPT_SCHEMA_V1 => {
+            if receipt.staging_scope.is_some() {
+                return Err(tree_error(
+                    host_receipt,
+                    "schema 1 active projection receipt cannot carry a staging scope",
+                ));
+            }
+            Ok(())
+        },
+        RECEIPT_SCHEMA_V2 => {
+            if receipt.phase != ReceiptPhase::Retiring {
+                return Err(tree_error(
+                    host_receipt,
+                    "schema 2 active projection receipt must be RETIRING",
+                ));
+            }
+            if receipt.staging_scope.is_none() {
+                return Err(tree_error(
+                    host_receipt,
+                    "schema 2 retiring receipt requires a staging scope",
+                ));
+            }
+            Ok(())
+        },
+        _ => Err(tree_error(
+            host_receipt,
+            "active projection receipt has an unsupported schema",
+        )),
+    }
 }
 
 pub(super) fn clear(store: &RuntimePrincipalStore, home: &AstridHome) -> StorageResult<bool> {

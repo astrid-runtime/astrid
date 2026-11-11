@@ -292,6 +292,10 @@ mod tests {
             .await
             .unwrap();
         let owner = StateOwner::Principal(PrincipalUid::from_bytes([0x51; 32]));
+        let volume_path = home.storage_volume_path();
+        // Opening durably initializes the home, including restoration intent.
+        // Measure ingest and its close fence separately from that fixed work.
+        let initialization = crate::volume::write_record_payloads(&volume_path).unwrap();
         let unique_dir = directory.path().join("unique");
         std::fs::create_dir(&unique_dir).unwrap();
         let file_count = 512_usize;
@@ -313,14 +317,19 @@ mod tests {
         store.put_contiguous_files(owner, files).unwrap();
         store.engine.close().unwrap();
         drop(store);
-        let volume_path = home.storage_volume_path();
         let volume_len = std::fs::metadata(&volume_path).unwrap().len();
+        let writes = crate::volume::write_record_payloads(&volume_path).unwrap();
+        assert!(
+            writes.starts_with(&initialization),
+            "ingest replaced the initialization journal; write accounting is invalid"
+        );
+        eprintln!("home initialization writes: {initialization:?}");
         let mut index_payload = 0_u64;
         let mut index_writes = 0_u32;
         let mut metadata_writes = 0_u32;
         let mut loose_payload = 0_u64;
         let mut buckets = std::collections::BTreeMap::<String, (u32, u64)>::new();
-        for (name, len) in crate::volume::write_record_payloads(&volume_path).unwrap() {
+        for (name, len) in writes.into_iter().skip(initialization.len()) {
             let bucket = if name == "objects.index" {
                 index_payload += len;
                 index_writes += 1;

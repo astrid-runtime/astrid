@@ -11,14 +11,28 @@
 #[path = "platform_fs/macos_acl.rs"]
 mod macos_acl;
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(unix, test))]
 mod mount_boundary;
+mod private_projection;
+#[cfg(not(target_family = "wasm"))]
+mod private_scratch;
+mod staging_scope;
+
+#[cfg(unix)]
+use mount_boundary::MountBoundary;
 #[cfg(target_os = "linux")]
 pub(crate) use mount_boundary::MountId;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use mount_boundary::fixtures as mount_fixtures;
 #[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
 pub use mount_boundary::fixtures as mount_test_fixtures;
+pub use private_projection::{PrivateFileProjection, PrivateProjectionInspection};
+#[cfg(not(target_family = "wasm"))]
+pub use private_scratch::create_private_scratch_file;
+pub use staging_scope::{
+    StagingScope, StagingScopeError, is_private_atomic_staging_name,
+    is_scoped_private_staging_name, is_structural_private_staging_name, staging_name_scope,
+};
 
 use std::collections::HashSet;
 use std::io;
@@ -249,7 +263,7 @@ pub fn validate_private_directory(path: &Path) -> io::Result<()> {
 
     #[cfg(windows)]
     {
-        windows::ensure_private_directory(path)
+        windows::validate_private_directory(path)
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -451,20 +465,6 @@ pub fn atomic_write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
             "private atomic-file backend is selected by Windows callers only",
         ))
     }
-}
-
-/// Recognize the Unix private atomic writer's temporary basename.
-///
-/// This is only a naming check, not authority to read or discard the file.
-/// Recovery must separately validate private ownership and durable intent.
-#[must_use]
-pub fn is_private_atomic_staging_name(name: &std::ffi::OsStr) -> bool {
-    cfg!(unix)
-        && name.to_str().is_some_and(|name| {
-            name.strip_prefix(".astrid-private-").is_some_and(|suffix| {
-                suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
-            })
-        })
 }
 
 /// Reject redirecting path components at a security-sensitive boundary.
@@ -735,12 +735,20 @@ fn open_directory_no_follow_unix(path: &Path) -> io::Result<std::fs::File> {
     Ok(directory)
 }
 
+#[cfg(all(unix, test))]
+pub(crate) use private_projection::walk_counter::{
+    directory_walk_count, reset_directory_walk_count,
+};
+
 #[cfg(unix)]
 fn unix_directory_walk(path: &Path) -> io::Result<(std::fs::File, Vec<std::ffi::OsString>)> {
     use nix::errno::Errno;
     use nix::fcntl::{OFlag, openat};
     use nix::sys::stat::Mode;
     use std::path::Component;
+
+    #[cfg(test)]
+    private_projection::walk_counter::record();
 
     let components = path.components().collect::<Vec<_>>();
     if components

@@ -27,6 +27,8 @@ use crate::session_token::SessionToken;
 mod authority_tests;
 #[path = "tests/captured_directory.rs"]
 mod captured_directory_tests;
+#[path = "tests/projection_session.rs"]
+mod projection_session_tests;
 
 static NATIVE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

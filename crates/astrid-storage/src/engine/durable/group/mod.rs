@@ -314,7 +314,7 @@ where
     }
 
     #[cfg(test)]
-    pub(super) fn gate_next_group_drain(
+    pub(crate) fn gate_next_group_drain(
         &self,
         reached: Arc<std::sync::Barrier>,
         release: Arc<std::sync::Barrier>,

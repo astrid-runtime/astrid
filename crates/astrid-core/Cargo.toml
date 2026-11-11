@@ -40,6 +40,7 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 fs2 = { workspace = true }
+tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["dir"] }
