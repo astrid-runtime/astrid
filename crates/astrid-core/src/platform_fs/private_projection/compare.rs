@@ -3,32 +3,70 @@
 use std::fs::File;
 use std::io::{self, Read};
 
-pub(in crate::platform_fs) fn matches_file(file: &mut File, expected: &[u8]) -> io::Result<bool> {
-    if u64::try_from(expected.len()).ok() != Some(file.metadata()?.len()) {
+pub(in crate::platform_fs) fn matches_file_from(
+    file: &mut File,
+    length: u64,
+    expected: &mut dyn Read,
+) -> io::Result<bool> {
+    if file.metadata()?.len() != length {
         return Ok(false);
     }
-    matches_reader(file, expected)
+    matches_readers(file, length, expected)
 }
 
-fn matches_reader(reader: &mut impl Read, expected: &[u8]) -> io::Result<bool> {
-    // A bounded transfer buffer, not a file-size or admission limit.
-    let mut buffer = [0; 8192];
-    for chunk in expected.chunks(buffer.len()) {
-        match reader.read_exact(&mut buffer[..chunk.len()]) {
+fn matches_readers(
+    host: &mut dyn Read,
+    mut remaining: u64,
+    expected: &mut dyn Read,
+) -> io::Result<bool> {
+    // Transfer buffers, not admission limits. Neither side retains a file body.
+    let mut actual = [0; 8192];
+    let mut wanted = [0; 8192];
+    while remaining > 0 {
+        let count = usize::try_from(remaining.min(8192)).map_err(io::Error::other)?;
+        // Expected-content failures must remain hard errors even when host
+        // privacy/namespace failures are classified as an ordinary non-match.
+        expected
+            .read_exact(&mut wanted[..count])
+            .map_err(io::Error::other)?;
+        match host.read_exact(&mut actual[..count]) {
             Ok(()) => {},
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
             Err(error) => return Err(error),
         }
-        if buffer[..chunk.len()] != *chunk {
+        if actual[..count] != wanted[..count] {
             return Ok(false);
         }
+        remaining = remaining.strict_sub(u64::try_from(count).map_err(io::Error::other)?);
     }
-    // Detect growth after the initial metadata check, including empty files.
-    match reader.read_exact(&mut buffer[..1]) {
-        Ok(()) => Ok(false),
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(true),
-        Err(error) => Err(error),
+    if has_extra(host)? {
+        return Ok(false);
     }
+    if has_extra(expected).map_err(io::Error::other)? {
+        return Err(io::Error::other(
+            "expected content exceeds its admitted length",
+        ));
+    }
+    Ok(true)
+}
+
+fn has_extra(reader: &mut dyn Read) -> io::Result<bool> {
+    loop {
+        match reader.read(&mut [0; 1]) {
+            Ok(count) => return Ok(count != 0),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(test)]
+fn matches_reader(reader: &mut impl Read, expected: &[u8]) -> io::Result<bool> {
+    matches_readers(
+        reader,
+        u64::try_from(expected.len()).map_err(io::Error::other)?,
+        &mut io::Cursor::new(expected),
+    )
 }
 
 #[cfg(test)]
@@ -79,5 +117,32 @@ mod tests {
             matches_reader(&mut Failed, b"").unwrap_err().kind(),
             io::ErrorKind::Other
         );
+    }
+
+    #[test]
+    fn expected_stream_length_and_read_failures_are_hard_errors() {
+        struct Failed(io::ErrorKind);
+        impl Read for Failed {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(self.0, "authenticated source failed"))
+            }
+        }
+        for kind in [io::ErrorKind::InvalidData, io::ErrorKind::PermissionDenied] {
+            for length in [0, 1] {
+                let error = matches_readers(&mut &b"x"[..length], length as u64, &mut Failed(kind))
+                    .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::Other);
+                assert!(error.to_string().contains("authenticated source failed"));
+            }
+        }
+        for expected in [b"".as_slice(), b"xx".as_slice()] {
+            assert_eq!(
+                matches_readers(&mut &b"x"[..], 1, &mut &expected[..])
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::Other
+            );
+        }
+        assert!(matches_readers(&mut &b"x"[..], 1, &mut ShortReads(b"x")).unwrap());
     }
 }

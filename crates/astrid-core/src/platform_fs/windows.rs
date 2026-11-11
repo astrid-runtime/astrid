@@ -13,6 +13,8 @@ mod error;
 mod executable;
 #[path = "windows/io.rs"]
 mod io;
+#[path = "windows/ntfs_directory_flush.rs"]
+pub(crate) mod ntfs_directory_flush;
 #[path = "windows/path.rs"]
 mod path;
 #[path = "windows/prelude.rs"]
@@ -23,6 +25,8 @@ mod private_file;
 mod projection_session;
 #[path = "windows/rename.rs"]
 mod rename;
+#[path = "windows/retirement_support.rs"]
+pub(crate) mod retirement_support;
 
 pub use captured_directory::CapturedDirectory;
 pub(super) use executable::replace_executable_set;

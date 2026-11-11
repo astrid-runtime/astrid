@@ -53,6 +53,7 @@ tokio = { workspace = true, features = ["net"] }
 windows-sys = { workspace = true, features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
+    "Wdk_System_SystemServices",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",

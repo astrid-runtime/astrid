@@ -28,6 +28,7 @@ pub(super) struct Config {
     pub(super) bulk_workers: usize,
     pub(super) bulk_files: usize,
     pub(super) object_cache_bytes: Option<u64>,
+    pub(super) partial_verification_clone: bool,
     pub(super) root: Option<PathBuf>,
     pub(super) output: Option<PathBuf>,
 }
@@ -45,6 +46,7 @@ impl Config {
             bulk_workers: std::thread::available_parallelism().map_or(1, NonZeroUsize::get),
             bulk_files: DEFAULT_BULK_FILES,
             object_cache_bytes: None,
+            partial_verification_clone: false,
             root: None,
             output: None,
         };
@@ -81,6 +83,9 @@ impl Config {
                     config.object_cache_bytes =
                         Some(parse_u64(&mut arguments, "--object-cache-bytes")?);
                 },
+                "--partial-verification-clone" => {
+                    config.partial_verification_clone = true;
+                },
                 "--root" => config.root = Some(parse_path(&mut arguments, "--root")?),
                 "--output" => config.output = Some(parse_path(&mut arguments, "--output")?),
                 "--help" | "-h" => {
@@ -95,6 +100,11 @@ impl Config {
         }
         if config.object_cache_bytes == Some(0) {
             return Err("--object-cache-bytes must be greater than zero".into());
+        }
+        if config.partial_verification_clone && config.object_cache_bytes.is_none() {
+            return Err(
+                "--partial-verification-clone requires nonzero --object-cache-bytes".into(),
+            );
         }
         for (name, value) in [
             ("--block-bytes", config.block_bytes),
@@ -159,6 +169,9 @@ fn print_help() {
            --bulk-workers N      bounded ingest workers (default host available CPUs)\n\
            --bulk-files N        files in the bulk corpus (default {DEFAULT_BULK_FILES})\n\
            --object-cache-bytes N decoded-object/projection cache budget (default disabled)\n\
+           --partial-verification-clone\n\
+                                 run only matched cold read() vs windowed\n\
+                                 read_range(--range-bytes) (requires --object-cache-bytes)\n\
            --root PATH           retain benchmark data under PATH\n\
            --output PATH         write the JSON report to PATH\n"
     );

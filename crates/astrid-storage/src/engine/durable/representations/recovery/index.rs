@@ -18,6 +18,8 @@ pub(super) use graph::{HistoricalMapClosure, HistoricalMapGraph};
 pub(in crate::engine::durable::representations) struct MetadataIndex {
     pub(super) values: BTreeMap<(MetadataKind, [u8; 32]), Vec<u8>>,
     pub(super) nodes: HistoricalMapGraph,
+    /// `MapNode` frames observed in this generation, including identical duplicates.
+    pub(in crate::engine::durable::representations) map_frame_count: u64,
 }
 
 impl MetadataIndex {
@@ -54,6 +56,11 @@ impl MetadataIndex {
                         self.nodes
                             .insert(id, MetadataFrameOffset(offset), children)?;
                     }
+                    // Count every durable MapNode frame, including identical re-appends.
+                    self.map_frame_count = self
+                        .map_frame_count
+                        .checked_add(1)
+                        .ok_or(DurableError::EncodingOverflow)?;
                     Ok(())
                 },
             )?;

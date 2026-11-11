@@ -182,10 +182,11 @@ impl Inspection {
         }
     }
 
-    pub(super) fn matches_private_file(
+    pub(super) fn matches_private_file_from(
         &self,
         relative: &RelativePath,
-        expected: &[u8],
+        length: u64,
+        expected: &mut dyn io::Read,
     ) -> io::Result<bool> {
         let path = self.path(relative);
         let Some(parent) = path.parent() else {
@@ -196,7 +197,7 @@ impl Inspection {
             crate::platform_fs::verify_no_redirects(&path)?;
             crate::platform_fs::validate_private_file(&path)?;
             let mut file = std::fs::File::open(&path)?;
-            super::compare::matches_file(&mut file, expected)
+            super::compare::matches_file_from(&mut file, length, expected)
         })() {
             Ok(matched) => Ok(matched),
             Err(error) if is_non_match(&error) => Ok(false),

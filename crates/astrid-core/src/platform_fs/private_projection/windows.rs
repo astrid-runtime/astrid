@@ -87,12 +87,14 @@ impl Inspection {
         self.inner.matches_private_directory(&relative.0)
     }
 
-    pub(super) fn matches_private_file(
+    pub(super) fn matches_private_file_from(
         &self,
         relative: &RelativePath,
-        expected: &[u8],
+        length: u64,
+        expected: &mut dyn Read,
     ) -> io::Result<bool> {
-        self.inner.matches_private_file(&relative.0, expected)
+        self.inner
+            .matches_private_file_from(&relative.0, length, expected)
     }
 
     pub(super) fn confirm_absolute_root(&self) -> io::Result<()> {

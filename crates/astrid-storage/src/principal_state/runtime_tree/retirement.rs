@@ -85,7 +85,7 @@ fn retire(
     inventory: &Inventory,
     before_prepare: impl FnOnce() -> StorageResult<()>,
 ) -> StorageResult<()> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         // Capture from the actual engine owner, before preflight can observe
         // a pathname replacement. This clone conveys identity, not a new open.
@@ -100,24 +100,18 @@ fn retire(
             .retire(&volume)
             .map_err(|error| tree_error(home.root(), format!("retire projection: {error}")))?;
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
-        store.require_volume_binding(home)?;
-        before_prepare()?;
-        for entry in super::scan(home.root())? {
-            let relative = entry
-                .source_path
-                .strip_prefix(home.root())
-                .map_err(|error| {
-                    tree_error(home.root(), format!("validate retirement path: {error}"))
-                })?;
-            inventory.require_file(home, relative)?;
-        }
-        astrid_core::dirs::retire_projection_root(home.root())
-            .map_err(|error| tree_error(home.root(), format!("retire projection: {error}")))?;
+        let _ = (home, store, inventory, before_prepare);
+        return Err(tree_error(
+            home.root(),
+            "projection retirement requires unix or windows",
+        ));
     }
     // Do not clear the durable receipt if the public binding changed during
     // deletion, including after the core survivor and root barrier checks.
+    // With a real NTFS directory-structure flush barrier, existing active::clear
+    // after this function (pack_and_retire_projection) remains the Unix-parity path.
     store.require_volume_binding(home)
 }
 

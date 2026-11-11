@@ -485,7 +485,7 @@ fn verify_final_uniqueness(
     Ok(())
 }
 
-fn comparison_key(policy: ProjectionNamePolicy, value: &str) -> Vec<u8> {
+pub(crate) fn comparison_key(policy: ProjectionNamePolicy, value: &str) -> Vec<u8> {
     match policy.comparison() {
         super::ProjectionNameComparison::ByteExactV1 => value.as_bytes().to_vec(),
         super::ProjectionNameComparison::UnicodeCanonicalV1 => {

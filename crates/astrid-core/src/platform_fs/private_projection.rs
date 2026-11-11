@@ -211,8 +211,28 @@ impl PrivateProjectionInspection {
     /// # Errors
     /// Returns an error for unexpected I/O outside ordinary non-match conditions.
     pub fn matches_private_file(&self, relative: &Path, expected: &[u8]) -> io::Result<bool> {
+        self.matches_private_file_from(
+            relative,
+            u64::try_from(expected.len()).map_err(io::Error::other)?,
+            &mut io::Cursor::new(expected),
+        )
+    }
+
+    /// Compare a private leaf with an exact-length authenticated content stream.
+    ///
+    /// Retains the same root, mount, identity and privacy checks as slice
+    /// comparison. Expected-content read failures are always hard errors.
+    ///
+    /// # Errors
+    /// Returns an error for content verification failures or unexpected host I/O.
+    pub fn matches_private_file_from(
+        &self,
+        relative: &Path,
+        length: u64,
+        expected: &mut dyn io::Read,
+    ) -> io::Result<bool> {
         self.platform
-            .matches_private_file(&RelativePath::parse(relative)?, expected)
+            .matches_private_file_from(&RelativePath::parse(relative)?, length, expected)
     }
 
     /// Revalidate the absolute root binding after an all-matching inspection pass.

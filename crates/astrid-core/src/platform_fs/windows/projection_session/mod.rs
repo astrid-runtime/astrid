@@ -9,6 +9,9 @@ mod scratch;
 use std::cell::RefCell;
 
 #[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
 use super::io::rename_guarded_handle;
 
 pub(in crate::platform_fs) use scratch::create_private_scratch_file;
@@ -20,6 +23,7 @@ use super::io::{
     FileContract, open_guarded_regular_file, remove_guarded_file_with_contract,
     validate_file_contract,
 };
+use super::ntfs_directory_flush::open_flush_bound_to_guard;
 use super::path::{
     BoundaryContract, FileIdentity, TrustedPathGuard, open_directory_identity,
     validate_local_absolute_path,
@@ -38,11 +42,13 @@ pub(in crate::platform_fs) struct ProjectionRoot {
 }
 
 impl ProjectionRoot {
-    /// Open a writer on an existing `ExactPrivate` projection root.
+    /// Open a writer on an `ExactPrivate` projection root.
     ///
     /// Existing roots must already satisfy the private-directory contract;
     /// Windows does not repair privacy here (unlike Unix `make_private_directory`).
-    /// Missing roots are created private via [`ensure_private_directory`].
+    /// Missing roots remain supported: [`ensure_private_directory`] creates them
+    /// with the same paired child+parent NTFS namespace fences used for nested
+    /// [`Self::ensure_directory`] births (not an unfenced create path).
     pub(in crate::platform_fs) fn open_writer(
         root: &Path,
         staging_scope: Option<StagingScope>,
@@ -209,7 +215,10 @@ impl ProjectionRoot {
 
     pub(in crate::platform_fs) fn sync(&self) -> io::Result<()> {
         let cleanup = self.cleanup_temporary();
-        let fence = self.confirm_absolute_binding();
+        let fence = (|| {
+            flush_captured_namespace(&self.guard)?;
+            self.confirm_absolute_binding()
+        })();
         match cleanup {
             Ok(()) => fence,
             Err(error) => Err(combine_cleanup_and_fence(error, fence)),
@@ -263,7 +272,10 @@ impl ProjectionRoot {
         let result = self.with_parent(dirs, false, |parent| {
             let path = parent.authority_boundary().join(name);
             match remove_guarded_file_with_contract(parent, &path, contract) {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    flush_captured_namespace(parent)?;
+                    Ok(())
+                },
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
                 Err(error) => Err(error),
             }
@@ -350,18 +362,33 @@ impl ProjectionInspection {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::platform_fs) fn matches_private_file(
         &self,
         relative: &[OsString],
         expected: &[u8],
     ) -> io::Result<bool> {
+        self.matches_private_file_from(
+            relative,
+            u64::try_from(expected.len()).map_err(io::Error::other)?,
+            &mut io::Cursor::new(expected),
+        )
+    }
+
+    pub(in crate::platform_fs) fn matches_private_file_from(
+        &self,
+        relative: &[OsString],
+        length: u64,
+        expected: &mut dyn Read,
+    ) -> io::Result<bool> {
         let (dirs, name) = split_relative(relative)?;
-        let run = |parent: &TrustedPathGuard| {
+        let mut run = |parent: &TrustedPathGuard| {
             let path = parent.authority_boundary().join(name);
             parent.verify_contract(BoundaryContract::ExactPrivateDirectory)?;
             let mut file = open_guarded_regular_file(parent, &path, FileContract::ExactPrivate)?;
-            let matched =
-                crate::platform_fs::private_projection::compare::matches_file(&mut file, expected)?;
+            let matched = crate::platform_fs::private_projection::compare::matches_file_from(
+                &mut file, length, expected,
+            )?;
             validate_file_contract(
                 file.as_raw_handle().cast(),
                 &path,
@@ -458,4 +485,53 @@ fn combine_cleanup_and_fence(cleanup: io::Error, fence: io::Result<()>) -> io::E
             format!("{cleanup}; absolute root fence failed: {fence_error}"),
         ),
     }
+}
+
+/// FileId-bound NTFS parent/root directory-structure flush for projection fences.
+pub(super) fn flush_captured_namespace(guard: &TrustedPathGuard) -> io::Result<()> {
+    #[cfg(test)]
+    test_maybe_fail_namespace_flush()?;
+    open_flush_bound_to_guard(guard)?.flush()
+}
+
+#[cfg(test)]
+thread_local! {
+    static NAMESPACE_FLUSH_FAILURES: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+/// Arm the next `count` projection namespace flush failures on this thread only.
+///
+/// Drop the returned guard (or let it fall out of scope) to clear the arm so
+/// parallel tests cannot steal faults.
+pub(in crate::platform_fs::windows) fn install_namespace_flush_failures(
+    count: usize,
+) -> NamespaceFlushFaultReset {
+    NAMESPACE_FLUSH_FAILURES.with(|slot| slot.set(count));
+    NamespaceFlushFaultReset
+}
+
+#[cfg(test)]
+#[must_use]
+pub(in crate::platform_fs::windows) struct NamespaceFlushFaultReset;
+
+#[cfg(test)]
+impl Drop for NamespaceFlushFaultReset {
+    fn drop(&mut self) {
+        NAMESPACE_FLUSH_FAILURES.with(|slot| slot.set(0));
+    }
+}
+
+#[cfg(test)]
+fn test_maybe_fail_namespace_flush() -> io::Result<()> {
+    NAMESPACE_FLUSH_FAILURES.with(|slot| {
+        let remaining = slot.get();
+        if remaining == 0 {
+            return Ok(());
+        }
+        slot.set(remaining.strict_sub(1));
+        Err(io::Error::other(
+            "injected projection namespace flush failure",
+        ))
+    })
 }

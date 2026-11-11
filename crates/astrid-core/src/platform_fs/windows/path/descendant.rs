@@ -4,13 +4,89 @@
 //! absolute re-capture is rejected so a mid-walk spelling swap cannot replace
 //! the retained object identity.
 
+use std::os::windows::io::BorrowedHandle;
+
 use super::super::acl::validate_private_acl_handle;
 use super::super::error::with_context;
+use super::super::ntfs_directory_flush::{
+    open_flush_bound_to_authority, open_flush_relative_bound_to_authority,
+};
 use super::super::prelude::*;
 use super::{
     BoundaryContract, CreatedPrivateDirectories, FileIdentity, LockedPathComponent, OwnedHandle,
     TrustedPathGuard, create_private_directory_identity_relative, open_directory_identity_relative,
 };
+
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+thread_local! {
+    static DESCENDANT_NAMESPACE_FLUSH_FAILURES: Cell<usize> = const { Cell::new(0) };
+    /// When set, the next parent-namespace flush fails after a successful child flush.
+    static DESCENDANT_PARENT_NAMESPACE_FLUSH_FAIL: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+/// Arm the next `count` create-time directory namespace flush failures on this thread.
+pub(in crate::platform_fs::windows) fn install_descendant_namespace_flush_failures(
+    count: usize,
+) -> DescendantNamespaceFlushFaultReset {
+    DESCENDANT_NAMESPACE_FLUSH_FAILURES.with(|slot| slot.set(count));
+    DescendantNamespaceFlushFaultReset
+}
+
+#[cfg(test)]
+/// Fail only the parent fence after a successful child flush (discriminating regression).
+pub(in crate::platform_fs::windows) fn install_descendant_parent_namespace_flush_failure()
+-> DescendantNamespaceFlushFaultReset {
+    DESCENDANT_PARENT_NAMESPACE_FLUSH_FAIL.with(|slot| slot.set(true));
+    DescendantNamespaceFlushFaultReset
+}
+
+#[cfg(test)]
+#[must_use]
+pub(in crate::platform_fs::windows) struct DescendantNamespaceFlushFaultReset;
+
+#[cfg(test)]
+impl Drop for DescendantNamespaceFlushFaultReset {
+    fn drop(&mut self) {
+        DESCENDANT_NAMESPACE_FLUSH_FAILURES.with(|slot| slot.set(0));
+        DESCENDANT_PARENT_NAMESPACE_FLUSH_FAIL.with(|slot| slot.set(false));
+    }
+}
+
+#[cfg(test)]
+fn test_maybe_fail_descendant_namespace_flush() -> io::Result<()> {
+    DESCENDANT_NAMESPACE_FLUSH_FAILURES.with(|slot| {
+        let remaining = slot.get();
+        if remaining == 0 {
+            return Ok(());
+        }
+        slot.set(remaining.strict_sub(1));
+        Err(io::Error::other(
+            "injected descendant namespace flush failure",
+        ))
+    })
+}
+
+#[cfg(test)]
+fn test_maybe_fail_descendant_parent_namespace_flush() -> io::Result<()> {
+    let should_fail = DESCENDANT_PARENT_NAMESPACE_FLUSH_FAIL.with(|slot| {
+        let armed = slot.get();
+        if armed {
+            slot.set(false);
+        }
+        armed
+    });
+    if should_fail {
+        Err(io::Error::other(
+            "injected descendant parent namespace flush failure",
+        ))
+    } else {
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 /// After the first relative component is retained, rename `from` to `parked`
@@ -86,6 +162,18 @@ impl TrustedPathGuard {
                     handle
                 };
                 validate_private_acl_handle(handle.0, true, &current.display().to_string())?;
+                if newly_created {
+                    // Unix create parity: fsync(new dir) + fsync(parent).
+                    // Parent path is `current` without the leaf just pushed — no clone.
+                    let parent_path = current.parent().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "created projection directory has no parent path",
+                        )
+                    })?;
+                    flush_created_child_directory(parent, name, handle.0)?;
+                    flush_parent_directory_at(parent_path, parent)?;
+                }
                 parent = handle.0;
                 components.push(LockedPathComponent {
                     path: current.clone(),
@@ -185,6 +273,36 @@ fn open_or_create_private_directory_relative(
         },
         Err(error) => Err(error),
     }
+}
+
+pub(super) fn flush_created_child_directory(
+    parent: HANDLE,
+    name: &OsStr,
+    child: HANDLE,
+) -> io::Result<()> {
+    #[cfg(test)]
+    test_maybe_fail_descendant_namespace_flush()?;
+    // Child birth/cleanup handle is the no-SHARE_DELETE authority proof; derived
+    // flusher opens with SHARE_DELETE to coexist (paired cap owns the duplicate).
+    // SAFETY: `child` remains owned by CreatedPrivateDirectories / component.
+    let authority = unsafe { BorrowedHandle::borrow_raw(child.cast()) };
+    open_flush_relative_bound_to_authority(parent, name, authority)?.flush()
+}
+
+pub(super) fn flush_parent_directory_at(path: &Path, handle: HANDLE) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        test_maybe_fail_descendant_parent_namespace_flush()?;
+        test_maybe_fail_descendant_namespace_flush()?;
+    }
+    // Retain the caller's live parent object (DuplicateHandle SAME_ACCESS + FileId
+    // bind). Sharing mode follows that caller's boundary contract: the selected
+    // authority leaf / birth cleanup handle omits FILE_SHARE_DELETE, but an
+    // existing intermediate opened with lock_leaf=false may allow FILE_SHARE_DELETE.
+    // Do not FileId-only reopen.
+    // SAFETY: `handle` remains owned by the active parent component / guard dup.
+    let authority = unsafe { BorrowedHandle::borrow_raw(handle.cast()) };
+    open_flush_bound_to_authority(path, authority)?.flush()
 }
 
 fn validate_relative_directory_components(relative: &[OsString]) -> io::Result<()> {

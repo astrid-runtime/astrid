@@ -25,6 +25,30 @@ fn assert_no_temporary_files(root: &Path) {
 }
 
 #[test]
+fn inspection_does_not_classify_expected_content_failures_as_host_non_matches() {
+    struct Failed(io::ErrorKind);
+    impl io::Read for Failed {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(self.0, "content verification failed"))
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let projection = PrivateFileProjection::open(root.path()).unwrap();
+    projection.write(Path::new("state"), b"x").unwrap();
+    projection.sync().unwrap();
+    let inspection =
+        crate::platform_fs::PrivateProjectionInspection::try_open(root.path()).unwrap();
+    for kind in [io::ErrorKind::InvalidData, io::ErrorKind::PermissionDenied] {
+        let error = inspection
+            .matches_private_file_from(Path::new("state"), 1, &mut Failed(kind))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("content verification failed"));
+    }
+    assert_eq!(fs::read(root.path().join("state")).unwrap(), b"x");
+}
+
+#[test]
 fn batch_has_two_ancestry_walks_and_one_terminal_hardware_fence() {
     let root = tempfile::tempdir().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();

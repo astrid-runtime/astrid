@@ -159,7 +159,7 @@ impl HostedFileVolume {
     }
 
     /// Capture the actual owned inode for one final projection retirement.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn retirement_file(&self, path: &std::path::Path) -> io::Result<std::fs::File> {
         self.with_current_binding(path, std::fs::File::try_clone)
     }

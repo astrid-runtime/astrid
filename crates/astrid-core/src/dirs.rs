@@ -55,7 +55,7 @@ pub use dirs_layout::{
 };
 #[path = "dirs/projection_retirement/mod.rs"]
 mod projection_retirement;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use projection_retirement::PreparedProjectionRetirement;
 pub use projection_retirement::retire_projection_root;
 #[path = "dirs_run_dir.rs"]

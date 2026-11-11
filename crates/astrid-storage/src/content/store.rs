@@ -37,8 +37,10 @@ use crate::principal_graph::{LEGACY_PRINCIPAL_GRAPH_VERSION, PRINCIPAL_GRAPH_VER
 const KV_COMPONENT_LABEL: &[u8] = b"kv";
 const PARENT_LABEL: &[u8] = b"parent";
 const STATE_LABEL: &[u8] = b"state";
-// Soft write-coalescing target, not a record, file, or deployment limit.
-pub(super) const STAGING_BATCH_TARGET_BYTES: usize = 4 * 1024 * 1024;
+// Native content transfer target, shared by batched writers and restoration.
+// Coalesces verified I/O while keeping transfer memory independent of file size.
+// This is a soft I/O batch size, not a retention, record, or deployment limit.
+pub(crate) const NATIVE_CONTENT_BATCH_BYTES: usize = 4 * 1024 * 1024;
 pub(super) const VERIFIED_CONTENT_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(1);
 pub(super) const PARTIAL_VERIFICATION_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(2);
 const DECODED_HEADER_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(3);

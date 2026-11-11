@@ -20,6 +20,7 @@ use crate::engine::{ProjectionObserver, ProjectionPhase};
 
 #[cfg(test)]
 mod checkpoint_publication_tests;
+mod representations_maintenance;
 mod wal;
 
 const DEFAULT_INITIAL_DELAY: Duration = Duration::from_micros(250);
@@ -459,12 +460,18 @@ where
                 },
             }
         }
+        let ran_successful_commit = completions.iter().any(|(_, result)| result.is_ok());
         drop(inner);
         // Releasing superseded value buffers can be expensive; the writer
         // must already be available to other principals.
         drop(retired_projections);
         for (receipt, result) in completions {
             receipt.complete(result);
+        }
+        // Complete the batch before maintenance. New batches still serialize on
+        // the same engine writer while a representation generation is replaced.
+        if ran_successful_commit {
+            self.maintain_representations_after_commit();
         }
     }
 

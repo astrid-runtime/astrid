@@ -5,14 +5,17 @@
 //! Publish CURRENT only after the replacement generation is durable and verified;
 //! reclaim the previous generation only after CURRENT itself is durable.
 
+use super::activation::visit_new_reachable_map_nodes;
 use super::{
-    BTreeSet, Blake3PhysicalIdentity, CurrentPointer, DurableError, DurableFile, JOURNAL_MAGIC,
-    JOURNAL_PATH, JournalEntry, METADATA_MAGIC, METADATA_PATH, MetadataFrame, RecoveryLimits,
-    RepresentationStore, append_frame, append_frames, append_new_reachable_map_nodes, format,
-    generation_name, increment, io_error, journal_digest, read_all, read_current_file,
-    recover_journal, recover_metadata,
+    BTreeSet, Blake3PhysicalIdentity, CurrentPointer, DurableError, DurableFile,
+    FramedAppendStream, JOURNAL_MAGIC, JOURNAL_PATH, JournalEntry, METADATA_MAGIC, METADATA_PATH,
+    MetadataFrame, RecoveryLimits, RepresentationStore, append_frame, format, generation_name,
+    increment, io_error, journal_digest, read_all, read_current_file, recover_journal,
+    recover_metadata,
 };
 
+#[cfg(test)]
+mod maintenance_tests;
 mod native;
 #[cfg(test)]
 mod tests;
@@ -26,31 +29,38 @@ impl RepresentationStore {
     ) -> Result<(Self, CurrentPointer), DurableError> {
         self.flush()?;
         let generation = increment(self.journal_generation)?;
-        let mut frames = Vec::new();
+        // Stream tip-reachable MapNode frames through one framed append stream:
+        // seek once, reuse the shared transfer buffer, flush before sync/readback.
         let mut appended = BTreeSet::new();
-        for map in [
-            &self.profiles,
-            &self.representations,
-            &self.placement_entries,
-        ] {
-            append_new_reachable_map_nodes(
-                &mut frames,
-                map,
-                &BTreeSet::new(),
-                &mut appended,
-                &mut BTreeSet::new(),
-            )?;
+        let mut complete = BTreeSet::new();
+        let durable = BTreeSet::new();
+        {
+            let mut stream = FramedAppendStream::begin(&mut metadata, METADATA_MAGIC)?;
+            for map in [
+                &self.profiles,
+                &self.representations,
+                &self.placement_entries,
+            ] {
+                visit_new_reachable_map_nodes(
+                    map,
+                    &durable,
+                    &mut appended,
+                    &mut complete,
+                    |node| {
+                        let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?;
+                        stream.append_payload(&frame.encode()?)
+                    },
+                )?;
+            }
+            for frame in [
+                MetadataFrame::catalogue(&Blake3PhysicalIdentity, self.catalogue),
+                MetadataFrame::placement(&Blake3PhysicalIdentity, self.placements),
+                MetadataFrame::state(&Blake3PhysicalIdentity, self.state),
+            ] {
+                stream.append_payload(&frame.encode()?)?;
+            }
+            stream.finish()?;
         }
-        frames.extend([
-            MetadataFrame::catalogue(&Blake3PhysicalIdentity, self.catalogue),
-            MetadataFrame::placement(&Blake3PhysicalIdentity, self.placements),
-            MetadataFrame::state(&Blake3PhysicalIdentity, self.state),
-        ]);
-        let payloads = frames
-            .iter()
-            .map(MetadataFrame::encode)
-            .collect::<Result<Vec<_>, _>>()?;
-        append_frames(&mut metadata, METADATA_MAGIC, &payloads)?;
         metadata
             .sync_data()
             .map_err(|source| io_error("flush checkpoint metadata", source))?;
@@ -134,7 +144,6 @@ impl RepresentationStore {
         })
     }
 
-    #[cfg(test)]
     pub(in crate::engine::durable) fn checkpoint_volume(
         &mut self,
         volume: &std::sync::Arc<dyn crate::volume::AstridVolume>,
@@ -151,6 +160,49 @@ impl RepresentationStore {
             .sync()
             .map_err(|source| io_error("flush checkpoint publication", source))?;
         self.reclaim_checkpoint_volume(volume)
+    }
+
+    /// Checkpoint once obsolete frames provably reach the resident map size.
+    ///
+    /// The resident count includes transient unreachable nodes and can defer
+    /// maintenance beyond one reachable tip's worth of obsolete frames. Conservative free-space gate uses current durable
+    /// metadata length as an upper bound for the tip rewrite. Unknown or
+    /// insufficient space skips without failing the caller.
+    pub(in crate::engine::durable) fn maybe_checkpoint_volume(
+        &mut self,
+        volume: &std::sync::Arc<dyn crate::volume::AstridVolume>,
+        limits: RecoveryLimits,
+    ) -> Result<bool, DurableError> {
+        if !self.should_checkpoint_representations_metadata() {
+            return Ok(false);
+        }
+        let durable_len = self
+            .metadata
+            .metadata()
+            .map_err(|source| io_error("measure representation metadata length", source))?
+            .len();
+        match volume.available_space() {
+            Ok(Some(space)) if space < durable_len => return Ok(false),
+            Ok(None) | Err(_) => return Ok(false),
+            Ok(Some(_)) => {},
+        }
+        self.checkpoint_volume(volume, limits)?;
+        debug_assert!(self.map_frame_count() <= self.resident_map_node_count());
+        Ok(true)
+    }
+
+    /// Apply the same resident-node scheduling bound to native capability media.
+    pub(in crate::engine::durable) fn maybe_checkpoint_native(
+        &mut self,
+        store_root: &cap_std::fs::Dir,
+        limits: RecoveryLimits,
+    ) -> Result<bool, DurableError> {
+        if !self.should_checkpoint_representations_metadata() {
+            return Ok(false);
+        }
+        self.checkpoint_native(store_root, limits)?;
+        debug_assert!(self.map_frame_count() <= self.resident_map_node_count());
+        Ok(true)
     }
 
     /// Only call after this generation and its matching arena are durable.

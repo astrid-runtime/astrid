@@ -24,8 +24,11 @@ use crate::BenchResult;
 
 #[path = "workloads/bulk.rs"]
 mod bulk;
+#[path = "workloads/partial_verification_clone.rs"]
+mod partial_verification_clone;
 
 use bulk::benchmark_bulk_ingest;
+use partial_verification_clone::benchmark_partial_verification_clone;
 
 pub(super) async fn run(
     config: &Config,
@@ -34,6 +37,10 @@ pub(super) async fn run(
     source_digest: [u8; 32],
     report: &mut Report,
 ) -> BenchResult<()> {
+    if config.partial_verification_clone {
+        return benchmark_partial_verification_clone(config, root, source, source_digest, report)
+            .await;
+    }
     benchmark_native_large_writes(config, root, source, report)?;
     benchmark_staging_large_writes(config, root, source, report)?;
     benchmark_content_compute(config, source, report)?;

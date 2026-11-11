@@ -511,3 +511,104 @@ async fn pending_replaced_volume_handoff_failure_closes_original_engine() {
         "failed pending handoff must invalidate old handles"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn busy_engine_handoff_failure_restores_old_staging_begin() {
+    use std::sync::Arc;
+
+    let parent = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(parent.path().join("runtime"));
+    let _lifecycle = RuntimeLifecycleGuard::acquire(&home).unwrap();
+    let reached = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let release_guard = ReleaseOnDrop::new(Arc::clone(&release));
+
+    let store = open_runtime_principal_store(&home, quota()).await.unwrap();
+    store
+        .kv()
+        .set("system:retirement", "seed", b"before".to_vec())
+        .await
+        .unwrap();
+    store.publish_runtime_projection(&home).unwrap();
+    let old_area = store.staging();
+    old_area
+        .begin(
+            StateOwner::System,
+            ContentName::new("var/tmp/pre-busy.bin").unwrap(),
+            crate::content::ChunkingProfile::ASTRID_V1,
+        )
+        .unwrap();
+    // Drop the open writer so staging reserve can succeed; only the engine is busy.
+    drop(old_area);
+    store
+        .engine
+        .gate_next_group_drain(Arc::clone(&reached), Arc::clone(&release));
+    let entered_rx = wait_for_drain_entry(Arc::clone(&reached));
+    let writer = store.clone();
+    let write = tokio::spawn(async move {
+        writer
+            .kv()
+            .set("system:retirement", "busy", b"in-flight".to_vec())
+            .await
+    });
+    entered_rx.await.expect("commit entered drain gate");
+    write.abort();
+    let join = write.await.expect_err("cancelled write must join as error");
+    assert!(join.is_cancelled());
+
+    let Err(error) = store.handoff_for_finalization(&home) else {
+        panic!("expected busy engine handoff failure");
+    };
+    assert_busy_handoff_message(&error.to_string());
+
+    // Staging reserve rolled back via token Drop; begin must work again.
+    store
+        .staging()
+        .begin(
+            StateOwner::System,
+            ContentName::new("var/tmp/after-busy-fail.bin").unwrap(),
+            crate::content::ChunkingProfile::ASTRID_V1,
+        )
+        .expect("failed engine handoff must restore open staging");
+
+    release_guard.release();
+    let _ = home;
+}
+
+#[tokio::test]
+async fn old_staging_facade_is_closed_after_successful_handoff() {
+    let parent = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(parent.path().join("runtime"));
+    let store = open_runtime_principal_store(&home, quota()).await.unwrap();
+    let old_area = store.staging();
+    old_area
+        .begin(
+            StateOwner::System,
+            ContentName::new("var/tmp/pre-handoff.bin").unwrap(),
+            crate::content::ChunkingProfile::ASTRID_V1,
+        )
+        .unwrap();
+    let finalization = store.handoff_for_finalization(&home).unwrap();
+    assert!(finalization.store.staging.get().is_none());
+    let err = old_area
+        .begin(
+            StateOwner::System,
+            ContentName::new("var/tmp/after-handoff.bin").unwrap(),
+            crate::content::ChunkingProfile::ASTRID_V1,
+        )
+        .expect_err("old staging facade must close after handoff");
+    assert!(
+        err.to_string()
+            .contains("runtime staging is closed after projection retirement"),
+        "{err}"
+    );
+    assert!(
+        old_area
+            .ready()
+            .expect_err("old ready must close after handoff")
+            .to_string()
+            .contains("runtime staging is closed after projection retirement")
+    );
+    drop(finalization);
+    drop(store);
+}

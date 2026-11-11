@@ -4,7 +4,8 @@
 //! that inspection never repairs privacy.
 
 use super::super::projection_session::{
-    ProjectionInspection, ProjectionRoot, set_temporary_cleanup_failures,
+    ProjectionInspection, ProjectionRoot, install_namespace_flush_failures,
+    set_temporary_cleanup_failures,
 };
 use super::*;
 use crate::platform_fs::StagingScope;
@@ -766,3 +767,141 @@ fn directory_validation_does_not_create_a_missing_leaf() {
         "validation created a directory before durable intent"
     );
 }
+
+#[test]
+fn publish_namespace_flush_failure_after_rename_surfaces_error() {
+    let _serial = serial_test_guard();
+    let root = private_temp();
+    let projection_root = root.path().join("root");
+    std::fs::create_dir(&projection_root).unwrap();
+    apply_private_acl(&projection_root, true).unwrap();
+    let projection = ProjectionRoot::open_writer(&projection_root, None).unwrap();
+
+    let target = projection_root.join("file.txt");
+    assert!(
+        !target.exists(),
+        "precondition: destination absent before publish"
+    );
+
+    let fault = install_namespace_flush_failures(1);
+    let error = projection
+        .write(&rel(&["file.txt"]), b"hello")
+        .expect_err("parent namespace flush after rename must be required");
+    assert!(
+        error
+            .to_string()
+            .contains("injected projection namespace flush failure"),
+        "{error}"
+    );
+    // Rename commits before the parent fence; bytes may be present, but the
+    // operation must not report success without the namespace flush.
+    assert!(
+        target.exists(),
+        "flush failure after rename should leave the renamed destination for recovery"
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"hello");
+    drop(fault);
+
+    // Cleared arm: subsequent publish/sync must succeed with real fences.
+    projection.write(&rel(&["other.txt"]), b"ok").unwrap();
+    projection.sync().unwrap();
+    assert_eq!(
+        std::fs::read(projection_root.join("other.txt")).unwrap(),
+        b"ok"
+    );
+    assert_no_private_file_journal_residue(&projection_root);
+}
+
+#[test]
+fn remove_namespace_flush_failure_surfaces_error() {
+    let _serial = serial_test_guard();
+    let root = private_temp();
+    let projection_root = root.path().join("root");
+    std::fs::create_dir(&projection_root).unwrap();
+    apply_private_acl(&projection_root, true).unwrap();
+    let projection = ProjectionRoot::open_writer(&projection_root, None).unwrap();
+    projection.write(&rel(&["gone.txt"]), b"x").unwrap();
+    let target = projection_root.join("gone.txt");
+    assert!(target.exists(), "precondition: leaf present before remove");
+
+    let fault = install_namespace_flush_failures(1);
+    let error = projection
+        .remove(&rel(&["gone.txt"]))
+        .expect_err("remove parent namespace flush must be required");
+    assert!(
+        error
+            .to_string()
+            .contains("injected projection namespace flush failure"),
+        "{error}"
+    );
+    assert!(
+        !target.exists(),
+        "unlink commits before parent flush; destination must be gone"
+    );
+    drop(fault);
+
+    projection.sync().unwrap();
+}
+
+#[test]
+fn terminal_sync_namespace_flush_failure_surfaces_error() {
+    let _serial = serial_test_guard();
+    let root = private_temp();
+    let projection_root = root.path().join("root");
+    std::fs::create_dir(&projection_root).unwrap();
+    apply_private_acl(&projection_root, true).unwrap();
+    let projection = ProjectionRoot::open_writer(&projection_root, None).unwrap();
+    projection.write(&rel(&["kept.txt"]), b"x").unwrap();
+    let target = projection_root.join("kept.txt");
+    assert_eq!(std::fs::read(&target).unwrap(), b"x");
+
+    let fault = install_namespace_flush_failures(1);
+    let error = projection
+        .sync()
+        .expect_err("terminal root flush must be required");
+    assert!(
+        error
+            .to_string()
+            .contains("injected projection namespace flush failure"),
+        "{error}"
+    );
+    // Prior publish already parent-fenced; leaf remains readable after failed terminal flush.
+    assert_eq!(std::fs::read(&target).unwrap(), b"x");
+    drop(fault);
+
+    projection.sync().unwrap();
+}
+
+#[test]
+fn rollback_style_rewrite_and_remove_still_fence() {
+    let _serial = serial_test_guard();
+    let root = private_temp();
+    let projection_root = root.path().join("root");
+    std::fs::create_dir(&projection_root).unwrap();
+    apply_private_acl(&projection_root, true).unwrap();
+    let projection = ProjectionRoot::open_writer(&projection_root, None).unwrap();
+    projection
+        .write(&rel(&["nested", "a.txt"]), b"one")
+        .unwrap();
+    assert_eq!(
+        std::fs::read(projection_root.join("nested").join("a.txt")).unwrap(),
+        b"one"
+    );
+    projection
+        .write(&rel(&["nested", "a.txt"]), b"two")
+        .unwrap();
+    assert_eq!(
+        std::fs::read(projection_root.join("nested").join("a.txt")).unwrap(),
+        b"two"
+    );
+    projection.remove(&rel(&["nested", "a.txt"])).unwrap();
+    assert!(
+        !projection_root.join("nested").join("a.txt").exists(),
+        "rollback-style remove must delete the leaf"
+    );
+    projection.sync().unwrap();
+    assert_no_staging_temps(&projection_root);
+    assert_no_private_file_journal_residue(&projection_root);
+}
+
+mod birth;

@@ -25,12 +25,14 @@ thread_local! {
     static RECOVERY_ARENA_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+mod framed_append;
 mod indexed;
 mod prepared;
 mod reader;
 #[cfg(test)]
 mod scan_tests;
 
+pub(super) use framed_append::FramedAppendStream;
 #[cfg(test)]
 pub(super) use indexed::{last_batch_spans, reset_last_batch_spans};
 pub(super) use indexed::{

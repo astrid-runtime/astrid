@@ -16,9 +16,9 @@ use super::File as DurableFile;
 #[cfg(test)]
 use super::open_rw;
 use super::{
-    ArenaLocation, DurableError, DurableIo, FRAME_HEADER_LEN, PersistentObjectIdentity,
-    RecoveryLimits, append_frame, append_frames, canonical_record_bytes, io_error,
-    read_indexed_object_with_payload,
+    ArenaLocation, DurableError, DurableIo, FRAME_HEADER_LEN, FramedAppendStream,
+    PersistentObjectIdentity, RecoveryLimits, append_frame, append_frames, canonical_record_bytes,
+    io_error, read_indexed_object_with_payload,
 };
 use format::{
     Blake3PhysicalIdentity, CurrentPointer, JOURNAL_MAGIC, JournalEntry, METADATA_MAGIC,
@@ -108,6 +108,8 @@ pub(super) struct RepresentationStore {
     representations: CanonicalPhysicalMap,
     placement_entries: CanonicalPhysicalMap,
     persisted_map_nodes: BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    /// Durable `MapNode` frames in the current generation, including duplicates.
+    map_frame_count: u64,
     // Memoized durable descendant closures; discarded when the store is reopened.
     complete_map_subtrees: BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     direct_profile: RepresentationProfileId,
@@ -472,8 +474,14 @@ impl RepresentationStore {
             .iter()
             .map(MetadataFrame::encode)
             .collect::<Result<Vec<_>, _>>()?;
+        let map_frames =
+            u64::try_from(appended_map_nodes.len()).map_err(|_| DurableError::EncodingOverflow)?;
         append_frames(&mut self.metadata, METADATA_MAGIC, &payloads)?;
         self.persisted_map_nodes.extend(appended_map_nodes);
+        self.map_frame_count = self
+            .map_frame_count
+            .checked_add(map_frames)
+            .ok_or(DurableError::EncodingOverflow)?;
         Ok(Some(PendingRepresentationUpdate {
             state,
             state_id,
@@ -554,8 +562,14 @@ impl RepresentationStore {
             .iter()
             .map(MetadataFrame::encode)
             .collect::<Result<Vec<_>, _>>()?;
+        let map_frames =
+            u64::try_from(appended_map_nodes.len()).map_err(|_| DurableError::EncodingOverflow)?;
         append_frames(&mut self.metadata, METADATA_MAGIC, &payloads)?;
         self.persisted_map_nodes.extend(appended_map_nodes);
+        self.map_frame_count = self
+            .map_frame_count
+            .checked_add(map_frames)
+            .ok_or(DurableError::EncodingOverflow)?;
         let update = PendingRepresentationUpdate {
             state,
             state_id,
@@ -829,6 +843,7 @@ impl RepresentationStore {
             &metadata,
             limits,
         )?;
+        let map_frame_count = index.map_frame_count;
         // Active closures now own their nodes. Release unused historical links
         // and replay metadata before allocating the validated reverse index.
         drop(index);
@@ -871,10 +886,43 @@ impl RepresentationStore {
             representations,
             placement_entries,
             persisted_map_nodes,
+            map_frame_count,
             complete_map_subtrees: BTreeSet::new(),
             direct_profile,
             reverse,
         })
+    }
+
+    /// Resident `MapNode` count, including transient unreachable nodes.
+    ///
+    /// Residency collection bounds this above the reachable tip. Scheduling
+    /// against this upper bound avoids traversing the maps on every commit.
+    ///
+    /// Shared content-addressed node IDs across maps make the true unique tip
+    /// count `<=` this value; fire/residue math stays conservative.
+    pub(in crate::engine::durable) fn resident_map_node_count(&self) -> u64 {
+        u64::try_from(
+            self.profiles
+                .nodes()
+                .len()
+                .saturating_add(self.representations.nodes().len())
+                .saturating_add(self.placement_entries.nodes().len()),
+        )
+        .unwrap_or(u64::MAX)
+    }
+
+    pub(in crate::engine::durable) fn map_frame_count(&self) -> u64 {
+        self.map_frame_count
+    }
+
+    /// Rewrite when obsolete frames provably reach the resident node count.
+    ///
+    /// Subtracting resident nodes gives a lower bound on obsolete frames, so
+    /// transient unreachable residency can defer a checkpoint, never cause an
+    /// early one. This is scheduling evidence only, not recovery authority.
+    pub(in crate::engine::durable) fn should_checkpoint_representations_metadata(&self) -> bool {
+        let tip = self.resident_map_node_count();
+        tip > 0 && self.map_frame_count.saturating_sub(tip) >= tip
     }
 }
 

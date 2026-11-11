@@ -18,6 +18,10 @@ pub(in crate::platform_fs) use verification::verify_no_redirects;
 mod descendant;
 #[cfg(test)]
 pub(in crate::platform_fs::windows) use descendant::TEST_MOVE_DESCENDANT_DURING_CAPTURE;
+#[cfg(test)]
+pub(in crate::platform_fs::windows) use descendant::install_descendant_namespace_flush_failures;
+#[cfg(test)]
+pub(in crate::platform_fs::windows) use descendant::install_descendant_parent_namespace_flush_failure;
 
 pub(super) struct OwnedHandle(pub(super) HANDLE);
 
@@ -30,6 +34,15 @@ impl Drop for OwnedHandle {
                 CloseHandle(self.0);
             }
         }
+    }
+}
+
+impl From<OwnedHandle> for File {
+    fn from(handle: OwnedHandle) -> Self {
+        let raw = handle.0;
+        std::mem::forget(handle);
+        // SAFETY: OwnedHandle transfers its live file handle exactly once.
+        unsafe { Self::from_raw_handle(raw.cast()) }
     }
 }
 
@@ -342,6 +355,11 @@ impl TrustedPathGuard {
             .identity
     }
 
+    /// Create missing private descendants with paired child+parent NTFS fences.
+    ///
+    /// Each newly created component is flushed, then its parent namespace is
+    /// flushed, matching [`TrustedPathGuard::capture_descendant_directory`]
+    /// birth fencing. Partial failure cleans up created components.
     pub(super) fn create_private_descendants(&self, target: &Path) -> io::Result<()> {
         let relative = target.strip_prefix(&self.authority_boundary).map_err(|_| {
             io::Error::new(
@@ -386,13 +404,20 @@ impl TrustedPathGuard {
                 current.push(name);
                 let handle = create_private_directory_relative(parent, name)?;
                 created.push(current.clone(), handle);
-                validate_private_acl_handle(
-                    created
-                        .last_handle()
-                        .expect("created directory handle was just retained"),
-                    true,
-                    &current.display().to_string(),
-                )?;
+                let child = created
+                    .last_handle()
+                    .expect("created directory handle was just retained");
+                validate_private_acl_handle(child, true, &current.display().to_string())?;
+                // Same Unix create parity as capture_descendant_directory:
+                // NTFS flush new child, then flush the parent that gained it.
+                let parent_path = current.parent().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "created private directory has no parent path",
+                    )
+                })?;
+                descendant::flush_created_child_directory(parent, name, child)?;
+                descendant::flush_parent_directory_at(parent_path, parent)?;
 
                 #[cfg(test)]
                 after_test_directory_component(index)?;

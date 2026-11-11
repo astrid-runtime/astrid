@@ -478,13 +478,23 @@ pub(super) fn pack_and_retire_projection(
     home: &AstridHome,
     store: &RuntimePrincipalStore,
 ) -> StorageResult<()> {
+    // Reserve first so new staging ops cannot start during RETIRING. Commit
+    // after the durable receipt and before host delete; Drop restores Open on
+    // failure so retry keeps live staging.
+    let staging_close = crate::principal_state::lifecycle::staging::reserve_for_retirement(store)
+        .map_err(|error| {
+        tree_error(
+            home.root(),
+            format!("close content staging before retirement: {error}"),
+        )
+    })?;
     if home
         .layout_version()
         .map_err(|error| tree_io_error(&error))?
         .as_deref()
         == Some(astrid_core::dirs::LEGACY_LAYOUT_VERSION)
     {
-        return legacy_projection_pack(home, store);
+        return legacy_projection_pack(home, store, staging_close);
     }
     if validate_surviving_projection(home.root(), home.root())? {
         let receipt = active::read(home, store)?;
@@ -514,6 +524,9 @@ pub(super) fn pack_and_retire_projection(
         }
     }
     transition_retiring_projection(home, store)?;
+    if let Some(token) = staging_close {
+        token.commit();
+    }
     retirement::retire_current_projection(home, store)?;
     active::clear(store, home).map(|_| ())
 }
@@ -699,12 +712,19 @@ fn transition_retiring_projection(
         .map_err(|error| tree_error(home.root(), format!("flush retiring receipt: {error}")))
 }
 
-fn legacy_projection_pack(home: &AstridHome, store: &RuntimePrincipalStore) -> StorageResult<()> {
+fn legacy_projection_pack(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+    staging_close: Option<crate::principal_state::staging::StagingCloseToken>,
+) -> StorageResult<()> {
     admit(store, home.root())?;
     store
         .content()
         .flush()
         .map_err(|error| tree_error(home.root(), format!("flush volume projection: {error}")))?;
+    if let Some(token) = staging_close {
+        token.commit();
+    }
     retirement::retire_legacy_projection(home, store)
 }
 fn tree_io_error(error: &std::io::Error) -> StorageError {

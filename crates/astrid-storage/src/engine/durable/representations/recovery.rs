@@ -31,7 +31,8 @@ use index::HistoricalMapClosure;
 pub(super) use index::MetadataIndex;
 
 #[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all,
-    fields(map_nodes = tracing::field::Empty, authority_records = tracing::field::Empty))]
+    fields(map_nodes = tracing::field::Empty, authority_records = tracing::field::Empty,
+        map_frame_count = tracing::field::Empty))]
 pub(super) fn recover_metadata<F: DurableIo>(
     file: &mut F,
     limits: RecoveryLimits,
@@ -49,6 +50,7 @@ pub(super) fn recover_metadata<F: DurableIo>(
     if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {
         tracing::Span::current().record("map_nodes", index.nodes.len());
         tracing::Span::current().record("authority_records", index.values.len());
+        tracing::Span::current().record("map_frame_count", index.map_frame_count);
     }
     Ok(index)
 }

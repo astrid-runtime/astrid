@@ -4,6 +4,11 @@
 //! KV. The catalog charges every visible name and byte logically even when
 //! chunks or complete files are physically deduplicated.
 
+#[cfg(windows)]
+pub(crate) use projection_names::{
+    visit_raw_projection_collisions_with_key, visit_raw_protected_authority_collisions_with_key,
+};
+
 mod catalog;
 mod change_detection;
 mod kv_projection;
@@ -37,6 +42,18 @@ pub use projection_names::{
     ProjectionNamePlan, ProjectionNamePolicy, ProjectionNameSyntax, ProjectionReservationOutcome,
     plan_projection_names,
 };
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use projection_names::{
+    RawProjectionCollision, find_raw_projection_collision, find_raw_protected_authority_collision,
+    raw_projection_spelling_is_canonical,
+};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use projection_names::{
+    projection_name_comparison_key, visit_raw_projection_collisions,
+    visit_raw_protected_authority_collisions,
+};
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use store::NATIVE_CONTENT_BATCH_BYTES;
 pub use store::{
     PrincipalContentReadHandle, PrincipalContentStore, WorkspaceBindingLifecycle,
     WorkspaceBranchBinding, WorkspaceBranchDescriptor, WorkspaceBranchError, WorkspaceBranchStore,

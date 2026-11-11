@@ -13,6 +13,7 @@ mod macos_acl;
 
 #[cfg(any(unix, test))]
 mod mount_boundary;
+pub mod name_semantics;
 mod private_projection;
 #[cfg(not(target_family = "wasm"))]
 mod private_scratch;
@@ -26,6 +27,8 @@ pub(crate) use mount_boundary::MountId;
 pub(crate) use mount_boundary::fixtures as mount_fixtures;
 #[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
 pub use mount_boundary::fixtures as mount_test_fixtures;
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+pub use name_semantics::directory_is_case_sensitive;
 pub use private_projection::{PrivateFileProjection, PrivateProjectionInspection};
 #[cfg(not(target_family = "wasm"))]
 pub use private_scratch::create_private_scratch_file;
@@ -40,7 +43,7 @@ use std::path::{Component, Path, PathBuf};
 
 #[cfg(windows)]
 #[path = "platform_fs/windows.rs"]
-mod windows;
+pub(crate) mod windows;
 
 #[path = "platform_fs/directory_identity.rs"]
 mod directory_identity;

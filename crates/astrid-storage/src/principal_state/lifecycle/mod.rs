@@ -1,6 +1,7 @@
 //! One finalization path, shared by graceful daemon exit and CLI recovery.
 
 mod handoff;
+pub(in crate::principal_state) mod staging;
 
 use std::fs::File;
 use std::io;
@@ -79,6 +80,7 @@ impl RuntimeLifecycleGuard {
         }
         let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|_: &StateOwner| Ok(None));
         let store = open_runtime_principal_store_for_pack(&self.home, quota).await?;
+        // Pack owns the single rollback-safe reserve → RETIRING → commit path.
         store.pack_and_retire_runtime_projection(&self.home)?;
         Ok(())
     }
@@ -106,7 +108,7 @@ impl super::RuntimePrincipalStore {
             })
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) fn retirement_volume_file(&self, home: &AstridHome) -> StorageResult<File> {
         let volume = self.volume_binding.upgrade().ok_or_else(|| {
             StorageError::Connection("retained runtime volume is already closed".into())
@@ -217,14 +219,13 @@ impl RuntimeLifecycleGuard {
     /// Failures before retirement preserve host files. Later errors retain
     /// the durable volume and any surviving projection for recovery.
     pub fn finish_retained(self, mut finalization: RuntimeFinalization) -> StorageResult<()> {
-        let packed = finalization
-            .store
-            .require_volume_binding(&self.home)
-            .and_then(|()| {
-                finalization
-                    .store
-                    .pack_and_retire_runtime_projection(&self.home)
-            });
+        // Keep shutdown-error aggregation: do not `?` past require_volume_binding.
+        let packed = match finalization.store.require_volume_binding(&self.home) {
+            Err(error) => Err(error),
+            Ok(()) => finalization
+                .store
+                .pack_and_retire_runtime_projection(&self.home),
+        };
         let closed = finalization.store.engine.close().map_err(|error| {
             StorageError::Connection(format!("close finalized runtime volume: {error}"))
         });

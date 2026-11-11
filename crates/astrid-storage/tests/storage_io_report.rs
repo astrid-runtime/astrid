@@ -30,6 +30,7 @@ fn config() -> Config {
         bulk_workers: 4,
         bulk_files: 100,
         object_cache_bytes: None,
+        partial_verification_clone: false,
         root: Some(PathBuf::from("unused")),
         output: None,
     }

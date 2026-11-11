@@ -44,12 +44,13 @@ impl Inspection {
         }
     }
 
-    pub(in crate::platform_fs::private_projection) fn matches_private_file(
+    pub(in crate::platform_fs::private_projection) fn matches_private_file_from(
         &self,
         relative: &RelativePath,
-        expected: &[u8],
+        length: u64,
+        expected: &mut dyn io::Read,
     ) -> io::Result<bool> {
-        match self.read_matching_private_file(relative, expected) {
+        match self.read_matching_private_file(relative, length, expected) {
             Ok(matches) => Ok(matches),
             Err(error) if is_non_match(&error) => Ok(false),
             Err(error) => Err(error),
@@ -65,7 +66,8 @@ impl Inspection {
     fn read_matching_private_file(
         &self,
         relative: &RelativePath,
-        bytes: &[u8],
+        length: u64,
+        bytes: &mut dyn io::Read,
     ) -> io::Result<bool> {
         let (name, parents) = relative.0.split_last().ok_or_else(invalid_path)?;
         let Some(chain) =
@@ -86,7 +88,7 @@ impl Inspection {
         verify_identity(parent, name, &file, Identity::read(&expected))?;
         self.boundary.validate(&file)?;
         super::write::require_private_file(&file)?;
-        let matches = super::super::compare::matches_file(&mut file, bytes)?;
+        let matches = super::super::compare::matches_file_from(&mut file, length, bytes)?;
         verify_identity(parent, name, &file, Identity::read(&expected))?;
         super::write::require_private_file(&file)?;
         chain.validate(&self.boundary)?;

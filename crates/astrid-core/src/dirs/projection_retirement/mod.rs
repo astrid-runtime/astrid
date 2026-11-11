@@ -1,7 +1,5 @@
 //! The single fail-closed boundary for retiring an Astrid runtime projection.
 
-#[cfg(not(unix))]
-use std::fs::File;
 use std::io;
 use std::path::Path;
 
@@ -11,6 +9,11 @@ mod tests;
 mod unix;
 #[cfg(unix)]
 pub use unix::PreparedProjectionRetirement;
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::PreparedProjectionRetirement;
 
 const CANONICAL_VOLUME: &str = "astrid.volume";
 
@@ -23,10 +26,14 @@ const CANONICAL_VOLUME: &str = "astrid.volume";
 /// durable checkpoint; the caller must retain its recovery authority until
 /// retirement succeeds.
 ///
+/// On Windows, durable commit requires NTFS `DirectoryFile` flush
+/// (`NtFlushBuffersFileEx(0)`) before and after handle-relative deletes.
+///
 /// # Errors
 ///
 /// Returns an I/O error when a projection entry is redirected, is neither a
-/// regular file nor a real directory, or cannot be removed. A preflight error
+/// regular file nor a real directory, cannot be removed, or (Windows) the
+/// filesystem cannot prove NTFS directory-structure flush. A preflight error
 /// leaves the tree untouched; a mid-retire error leaves the durable volume as
 /// the recovery authority.
 pub fn retire_projection_root(root: &Path) -> io::Result<()> {
@@ -34,57 +41,16 @@ pub fn retire_projection_root(root: &Path) -> io::Result<()> {
     {
         unix::retire(root)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        retire_by_path(root)
+        windows::retire(root)
     }
-}
-
-#[cfg(not(unix))]
-fn retire_by_path(root: &Path) -> io::Result<()> {
-    preflight_projection_entry(root)?;
-    let mut entries = std::fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        let path = entry.path();
-        if entry.file_name() == std::ffi::OsStr::new(CANONICAL_VOLUME) {
-            continue;
-        }
-        let metadata = std::fs::symlink_metadata(&path)?;
-        if metadata.is_dir() {
-            crate::dirs::retire_legacy_source_tree(&path)?;
-        } else {
-            std::fs::remove_file(&path)?;
-        }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = root;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "projection retirement requires unix or windows",
+        ))
     }
-    File::open(root)?.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn preflight_projection_entry(path: &Path) -> io::Result<()> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("runtime projection is redirected: {}", path.display()),
-        ));
-    }
-    if metadata.is_dir() {
-        for entry in std::fs::read_dir(path)? {
-            let child = entry?.path();
-            preflight_projection_entry(&child)?;
-        }
-        return Ok(());
-    }
-    if !metadata.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "runtime projection contains a special entry: {}",
-                path.display()
-            ),
-        ));
-    }
-    Ok(())
 }

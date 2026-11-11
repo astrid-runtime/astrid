@@ -1,58 +1,59 @@
-//! Native Windows NTFS directory-flush access check (test-only).
+//! Native Windows NTFS directory-flush access fixture (test-only).
 //!
-//! [MS-FSA] 2.1.5.7 + <80>: `DirectoryFile` flush persists structure on NTFS only;
-//! non-NTFS SUCCESS is a documented no-op and must fail closed before deletes.
+//! Demoted onto the production shared module
+//! `super::ntfs_directory_flush`: one FileId+NTFS flush-capable open and one
+//! shared flush protocol ([MS-FSA] 2.1.5.7 + <80>). This file keeps
+//! only the ordinary-user token fixture, authority-relative child delete under a
+//! retained `TrustedPathGuard`, and native diagnostic printing after checked
+//! shared-production success.
 //!
-//! Opens are bound to the captured root by comparing full 128-bit `FileIdInfo`
-//! identities (`query_directory_identity`) between the `TrustedPathGuard`
-//! authority handle and the flush `File`. Handles are opened without
-//! `FILE_FLAG_OVERLAPPED`, so `NtFlushBuffersFileEx(0)` is expected to complete
-//! synchronously (`STATUS_PENDING` is rejected). Both the syscall NTSTATUS and
-//! `IO_STATUS_BLOCK.Status` must be `0`.
+//! Raw syscall/IOSB NTSTATUS values are not synthesized here — the shared helper
+//! returns `io::Result` only. Diagnostics report `shared_production_flush=PASS`
+//! after a successful `NtfsDirectoryFlushGuard::flush`, plus the shared
+//! `DIRECTORY_FLUSH_ACCESS` constant and the bound identity.
 
-use std::os::windows::io::BorrowedHandle;
-
-use super::captured_directory::query_directory_identity;
 use super::error::with_context;
-use super::path::{OwnedHandle, TrustedPathGuard, wide_path};
+use super::io::remove_guarded_file;
+use super::ntfs_directory_flush::{
+    DIRECTORY_FLUSH_ACCESS, NtfsDirectoryFlushGuard, open_flush_bound_to_guard,
+};
+use super::path::{OwnedHandle, TrustedPathGuard};
 use super::prelude::*;
 use crate::platform_fs::DirectoryIdentity;
-use windows_sys::Wdk::Storage::FileSystem::NtFlushBuffersFileEx;
-use windows_sys::Win32::Foundation::{LUID, STATUS_PENDING};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_NO_TOKEN, LUID};
 use windows_sys::Win32::Security::{
     CheckTokenMembership, CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE,
-    ImpersonateLoggedOnUser, LUA_TOKEN, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
-    RevertToSelf, SE_MANAGE_VOLUME_NAME, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
-    TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_IMPERSONATE, TOKEN_QUERY, TokenElevation,
-    WinBuiltinAdministratorsSid,
-};
-use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, GetVolumeInformationByHandleW,
+    ImpersonateLoggedOnUser, LUA_TOKEN, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, RevertToSelf,
+    SE_MANAGE_VOLUME_NAME, SE_PRIVILEGE_ENABLED, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
+    TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_IMPERSONATE, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    TokenElevation, TokenPrivileges, WinBuiltinAdministratorsSid,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 
-/// Directory write/append bits plus query rights for flush + volume identity.
-const DIRECTORY_FLUSH_ACCESS: u32 =
-    FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
-
 /// Observation printed by the native test (not a product API surface).
+///
+/// Does not invent NTSTATUS codes. `shared_production_flush` is set only after
+/// the shared opener+flush path returned `Ok`.
 #[derive(Debug)]
 pub(super) struct DirectoryFlushObservation {
-    pub(super) filesystem: OsString,
     pub(super) desired_access: u32,
     pub(super) identity: DirectoryIdentity,
-    pub(super) syscall_ntstatus: i32,
-    pub(super) iosb_ntstatus: i32,
+    pub(super) shared_production_flush: bool,
 }
 
 /// File-bound flush handle retained across a child delete in the native test.
+///
+/// Retains the authority [`TrustedPathGuard`] for handle-relative child deletion
+/// and the shared [`NtfsDirectoryFlushGuard`] for post-delete flush so mutation
+/// stays bound to the captured root identity.
 pub(super) struct DirectoryFlushHandle {
-    file: File,
+    guard: TrustedPathGuard,
+    flush: NtfsDirectoryFlushGuard,
 }
 
 impl DirectoryFlushHandle {
-    /// Capture `path`, bind flush open to the guard's 128-bit identity, require
-    /// NTFS, and prove synchronous `NtFlushBuffersFileEx(0)` before deletes.
+    /// Capture `path`, open via shared FileId+NTFS flush opener, and prove a
+    /// successful shared-production flush before deletes.
     pub(super) fn open_verified(path: &Path) -> io::Result<(Self, DirectoryFlushObservation)> {
         let guard = TrustedPathGuard::capture(path).map_err(|error| {
             with_context(
@@ -60,205 +61,35 @@ impl DirectoryFlushHandle {
                 format!("capture directory flush root {}", path.display()),
             )
         })?;
-        let expected = authority_directory_identity(&guard)?;
-        let handle = open_directory_flush_handle(path, DIRECTORY_FLUSH_ACCESS)?;
-        let file = into_std_file(handle);
-        let actual = query_directory_identity(&file).map_err(|error| {
-            with_context(
-                error,
-                format!("query flush-handle FileIdInfo {}", path.display()),
-            )
-        })?;
-        if actual != expected {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "directory flush handle FileIdInfo diverged from TrustedPathGuard authority for {}",
-                    path.display()
-                ),
-            ));
-        }
-        // Authority pin held through identity compare; path open is now bound.
-        drop(guard);
-
-        let filesystem = volume_filesystem_name(&file)?;
-        if !filesystem_is_ntfs(&filesystem) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "directory-structure flush requires NTFS (MS-FSA <80>); volume reports {}",
-                    filesystem.to_string_lossy()
-                ),
-            ));
-        }
-        let (syscall_ntstatus, iosb_ntstatus) = flush_directory_file_statuses(&file)?;
-        Ok((
-            Self { file },
-            DirectoryFlushObservation {
-                filesystem,
-                desired_access: DIRECTORY_FLUSH_ACCESS,
-                identity: actual,
-                syscall_ntstatus,
-                iosb_ntstatus,
-            },
-        ))
+        let flush = open_flush_bound_to_guard(&guard)?;
+        // Pre-delete durability proof through the exact production helper.
+        flush.flush()?;
+        let observation = DirectoryFlushObservation {
+            desired_access: DIRECTORY_FLUSH_ACCESS,
+            identity: flush.identity(),
+            shared_production_flush: true,
+        };
+        Ok((Self { guard, flush }, observation))
     }
 
-    /// Persist directory structure after a child delete on this same handle.
+    /// Delete a direct child under the retained authority guard (handle-relative).
+    pub(super) fn remove_child_file(&self, path: &Path) -> io::Result<()> {
+        remove_guarded_file(&self.guard, path)
+    }
+
+    /// Persist directory structure after a child delete via the shared production flush.
     pub(super) fn flush_after_delete(&self) -> io::Result<()> {
-        flush_directory_file_statuses(&self.file).map(|_| ())
+        self.flush.flush()
     }
-}
-
-fn flush_directory_file_statuses(file: &File) -> io::Result<(i32, i32)> {
-    let mut iosb = IO_STATUS_BLOCK::default();
-    // SAFETY: non-overlapped directory File; Parameters unused (NULL/0);
-    // `iosb` remains live for the call.
-    let status = unsafe {
-        NtFlushBuffersFileEx(
-            file.as_raw_handle().cast(),
-            0,
-            null(),
-            0,
-            &raw mut iosb,
-        )
-    };
-    // SAFETY: union read of Status after the native call completed.
-    let iosb_status = unsafe { iosb.Anonymous.Status };
-    if status == STATUS_PENDING || iosb_status == STATUS_PENDING {
-        return Err(io::Error::other(
-            "NtFlushBuffersFileEx returned STATUS_PENDING on a non-overlapped directory handle",
-        ));
-    }
-    if status != 0 {
-        // SAFETY: conversion is defined for the NTSTATUS returned by the call.
-        let code = unsafe { RtlNtStatusToDosError(status) };
-        return Err(with_context(
-            io::Error::from_raw_os_error(code.cast_signed()),
-            format!(
-                "NtFlushBuffersFileEx(0) syscall NTSTATUS 0x{:08X}",
-                status.cast_unsigned()
-            ),
-        ));
-    }
-    if iosb_status != 0 {
-        // SAFETY: conversion is defined for the IOSB NTSTATUS.
-        let code = unsafe { RtlNtStatusToDosError(iosb_status) };
-        return Err(with_context(
-            io::Error::from_raw_os_error(code.cast_signed()),
-            format!(
-                "NtFlushBuffersFileEx(0) IO_STATUS_BLOCK.Status 0x{:08X}",
-                iosb_status.cast_unsigned()
-            ),
-        ));
-    }
-    Ok((status, iosb_status))
-}
-
-fn authority_directory_identity(guard: &TrustedPathGuard) -> io::Result<DirectoryIdentity> {
-    // SAFETY: authority handle remains owned by `guard` for the borrow.
-    let borrowed = unsafe { BorrowedHandle::borrow_raw(guard.authority_handle().cast()) };
-    let file = borrowed.try_clone_to_owned().map(File::from).map_err(|error| {
-        with_context(error, "duplicate TrustedPathGuard authority for FileIdInfo")
-    })?;
-    query_directory_identity(&file)
-        .map_err(|error| with_context(error, "query TrustedPathGuard authority FileIdInfo"))
-}
-
-fn open_directory_flush_handle(path: &Path, desired_access: u32) -> io::Result<OwnedHandle> {
-    let wide = wide_path(path)?;
-    let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-    // SAFETY: NUL-terminated path; no OVERLAPPED flag — synchronous I/O.
-    // OPEN_REPARSE_POINT opens the object itself; attributes reject redirects.
-    let handle = unsafe {
-        CreateFileW(
-            wide.as_ptr(),
-            desired_access,
-            share,
-            null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(with_context(
-            io::Error::last_os_error(),
-            format!("open directory flush handle {}", path.display()),
-        ));
-    }
-    let handle = OwnedHandle(handle);
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: handle and output buffer are live.
-    if unsafe { GetFileInformationByHandle(handle.0, &raw mut info) } == 0 {
-        return Err(with_context(
-            io::Error::last_os_error(),
-            format!("query directory flush handle {}", path.display()),
-        ));
-    }
-    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "directory flush target is redirected or not a directory: {}",
-                path.display()
-            ),
-        ));
-    }
-    Ok(handle)
-}
-
-fn volume_filesystem_name(file: &File) -> io::Result<OsString> {
-    let mut fs_name = vec![0u16; 64];
-    let mut serial = 0u32;
-    let mut max_component = 0u32;
-    let mut flags = 0u32;
-    // SAFETY: handle live; volume name omitted; outs live for the call.
-    let ok = unsafe {
-        GetVolumeInformationByHandleW(
-            file.as_raw_handle().cast(),
-            null_mut(),
-            0,
-            &raw mut serial,
-            &raw mut max_component,
-            &raw mut flags,
-            fs_name.as_mut_ptr(),
-            u32::try_from(fs_name.len()).expect("filesystem name buffer fits u32"),
-        )
-    };
-    if ok == 0 {
-        return Err(with_context(
-            io::Error::last_os_error(),
-            "GetVolumeInformationByHandleW for directory flush",
-        ));
-    }
-    let len = fs_name
-        .iter()
-        .position(|&unit| unit == 0)
-        .unwrap_or(fs_name.len());
-    Ok(OsString::from_wide(&fs_name[..len]))
-}
-
-fn filesystem_is_ntfs(name: &OsStr) -> bool {
-    name.to_string_lossy().eq_ignore_ascii_case("NTFS")
-}
-
-fn into_std_file(handle: OwnedHandle) -> File {
-    let raw = handle.0;
-    std::mem::forget(handle);
-    // SAFETY: ownership transfers from OwnedHandle exactly once.
-    unsafe { File::from_raw_handle(raw.cast()) }
 }
 
 /// Current-thread ordinary-user authority for the native flush fixture.
 ///
 /// If the process token is elevated (common on hosted GHA Windows runners),
-/// builds a restricted token with `LUA_TOKEN`, disables the Administrators SID,
-/// deletes `SeManageVolumePrivilege`, impersonates it, and proves the effective
-/// token is non-admin. Reverts on drop. Never skips; never changes the process
-/// primary token.
+/// builds a restricted token with `LUA_TOKEN` + `DISABLE_MAX_PRIVILEGE`,
+/// disables the Administrators SID, impersonates it, and proves the effective
+/// token is non-admin with `SeManageVolumePrivilege` absent or not enabled.
+/// Reverts on drop. Never skips; never changes the process primary token.
 pub(super) struct OrdinaryUserImpersonation {
     _restricted: Option<OwnedHandle>,
     active: bool,
@@ -320,7 +151,6 @@ impl Drop for OrdinaryUserImpersonation {
     }
 }
 
-
 fn create_restricted_ordinary_token() -> io::Result<OwnedHandle> {
     let mut process_token = null_mut();
     // SAFETY: out handle transferred into OwnedHandle on success.
@@ -361,33 +191,19 @@ fn create_restricted_ordinary_token() -> io::Result<OwnedHandle> {
         Attributes: 0,
     };
 
-    let mut manage_volume = LUID {
-        LowPart: 0,
-        HighPart: 0,
-    };
-    // SAFETY: SE_MANAGE_VOLUME_NAME is a static wide string; LUID out is live.
-    if unsafe { LookupPrivilegeValueW(null(), SE_MANAGE_VOLUME_NAME, &raw mut manage_volume) } == 0
-    {
-        return Err(with_context(
-            io::Error::last_os_error(),
-            "LookupPrivilegeValueW(SeManageVolumePrivilege)",
-        ));
-    }
-    let delete_privilege = LUID_AND_ATTRIBUTES {
-        Luid: manage_volume,
-        Attributes: 0,
-    };
-
     let mut restricted = null_mut();
-    // SAFETY: source token live; disable/delete arrays live for the call.
+    // SAFETY: source token live; disable-SID array live for the call.
+    // `DISABLE_MAX_PRIVILEGE` disables privileges (including SeManageVolume);
+    // DeletePrivilegeCount/PrivilegesToDelete are ignored with that flag and
+    // must not be supplied as if they performed a literal privilege deletion.
     if unsafe {
         CreateRestrictedToken(
             process_token.0,
             LUA_TOKEN | DISABLE_MAX_PRIVILEGE,
             1,
             &raw const disable_sid,
-            1,
-            &raw const delete_privilege,
+            0,
+            null(),
             0,
             null(),
             &raw mut restricted,
@@ -396,7 +212,7 @@ fn create_restricted_ordinary_token() -> io::Result<OwnedHandle> {
     {
         return Err(with_context(
             io::Error::last_os_error(),
-            "CreateRestrictedToken(LUA_TOKEN|DISABLE_MAX_PRIVILEGE, deny Administrators, delete SeManageVolume)",
+            "CreateRestrictedToken(LUA_TOKEN|DISABLE_MAX_PRIVILEGE, deny Administrators)",
         ));
     }
     Ok(OwnedHandle(restricted))
@@ -437,33 +253,47 @@ fn token_is_elevated(token: HANDLE) -> io::Result<bool> {
     Ok(elevation.TokenIsElevated != 0)
 }
 
-fn prove_effective_token_is_ordinary() -> io::Result<()> {
+/// Prefer the thread impersonation token; fall back to the process token only
+/// when `OpenThreadToken` fails with `ERROR_NO_TOKEN`. Any other thread-token
+/// error fails closed and preserves the original error (no process fallback).
+pub(super) fn select_effective_query_token<T>(
+    open_thread_token: impl FnOnce() -> io::Result<T>,
+    open_process_token: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    match open_thread_token() {
+        Ok(token) => Ok(token),
+        Err(error) if error.raw_os_error() == Some(ERROR_NO_TOKEN.cast_signed()) => {
+            open_process_token()
+        },
+        Err(error) => Err(error),
+    }
+}
+
+fn open_thread_query_token() -> io::Result<OwnedHandle> {
     let mut token = null_mut();
-    // Prefer the impersonation token when present; else the process token.
-    // SAFETY: GetCurrentThread handle is pseudo-handle; OpenAsSelf=false uses
+    // SAFETY: GetCurrentThread handle is a pseudo-handle; OpenAsSelf=false uses
     // the thread's impersonation token when active.
-    let opened = unsafe {
-        OpenThreadToken(
-            GetCurrentThread(),
-            TOKEN_QUERY,
-            0,
-            &raw mut token,
-        )
-    };
-    let token = if opened == 0 {
-        let mut process_token = null_mut();
-        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut process_token) }
-            == 0
-        {
-            return Err(with_context(
-                io::Error::last_os_error(),
-                "OpenProcessToken while proving ordinary-user authority",
-            ));
-        }
-        OwnedHandle(process_token)
-    } else {
-        OwnedHandle(token)
-    };
+    let opened = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 0, &raw mut token) };
+    if opened == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(OwnedHandle(token))
+}
+
+fn open_process_query_token() -> io::Result<OwnedHandle> {
+    let mut process_token = null_mut();
+    // SAFETY: out handle owned by caller on success.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut process_token) } == 0 {
+        return Err(with_context(
+            io::Error::last_os_error(),
+            "OpenProcessToken while proving ordinary-user authority",
+        ));
+    }
+    Ok(OwnedHandle(process_token))
+}
+
+fn prove_effective_token_is_ordinary() -> io::Result<()> {
+    let token = select_effective_query_token(open_thread_query_token, open_process_query_token)?;
 
     if token_is_elevated(token.0)? {
         return Err(io::Error::new(
@@ -510,5 +340,205 @@ fn prove_effective_token_is_ordinary() -> io::Result<()> {
             "effective token still contains enabled Administrators SID",
         ));
     }
+
+    prove_se_manage_volume_disabled_or_absent(token.0)
+}
+
+fn prove_se_manage_volume_disabled_or_absent(token: HANDLE) -> io::Result<()> {
+    let manage_volume = lookup_se_manage_volume_luid()?;
+    let (buffer, returned_len) = read_token_privileges_buffer(token)?;
+    assert_se_manage_volume_absent_or_disabled(&buffer, returned_len, manage_volume)
+}
+
+fn lookup_se_manage_volume_luid() -> io::Result<LUID> {
+    let mut manage_volume = LUID {
+        LowPart: 0,
+        HighPart: 0,
+    };
+    // SAFETY: SE_MANAGE_VOLUME_NAME is a static wide string; LUID out is live.
+    if unsafe { LookupPrivilegeValueW(null(), SE_MANAGE_VOLUME_NAME, &raw mut manage_volume) } == 0
+    {
+        return Err(with_context(
+            io::Error::last_os_error(),
+            "LookupPrivilegeValueW(SeManageVolumePrivilege) while proving ordinary-user authority",
+        ));
+    }
+    Ok(manage_volume)
+}
+
+fn read_token_privileges_buffer(token: HANDLE) -> io::Result<(Vec<usize>, usize)> {
+    let mut required = 0u32;
+    // SAFETY: null/zero size query is the documented TokenPrivileges sizing call.
+    let sized =
+        unsafe { GetTokenInformation(token, TokenPrivileges, null_mut(), 0, &raw mut required) };
+    if sized != 0 || required == 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
+        return Err(with_context(
+            io::Error::last_os_error(),
+            "GetTokenInformation(TokenPrivileges) size query while proving ordinary-user authority",
+        ));
+    }
+
+    let byte_length = usize::try_from(required).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TokenPrivileges length overflow while proving ordinary-user authority",
+        )
+    })?;
+    if byte_length < size_of::<u32>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TokenPrivileges buffer smaller than PrivilegeCount header",
+        ));
+    }
+
+    let word_length = byte_length.div_ceil(size_of::<usize>());
+    let mut buffer = vec![0_usize; word_length];
+    let mut returned = 0u32;
+    // SAFETY: `buffer` is usize-aligned and provides at least `required` bytes.
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TokenPrivileges,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            required,
+            &raw mut returned,
+        )
+    } == 0
+    {
+        return Err(with_context(
+            io::Error::last_os_error(),
+            "GetTokenInformation(TokenPrivileges) while proving ordinary-user authority",
+        ));
+    }
+    let returned_len = usize::try_from(returned).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TokenPrivileges returned length overflow",
+        )
+    })?;
+    if returned_len < size_of::<u32>() || returned_len > byte_length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "TokenPrivileges returned length {returned_len} outside allocated buffer {byte_length}"
+            ),
+        ));
+    }
+    Ok((buffer, returned_len))
+}
+
+fn assert_se_manage_volume_absent_or_disabled(
+    buffer: &[usize],
+    returned_len: usize,
+    manage_volume: LUID,
+) -> io::Result<()> {
+    let privilege_header = std::mem::offset_of!(TOKEN_PRIVILEGES, Privileges);
+    // SAFETY: GetTokenInformation wrote a TOKEN_PRIVILEGES header into the
+    // aligned buffer; PrivilegeCount is the leading u32.
+    let privilege_count = unsafe { buffer.as_ptr().cast::<u32>().read() };
+    let privilege_count_usize = usize::try_from(privilege_count).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TokenPrivileges PrivilegeCount overflow",
+        )
+    })?;
+    let entry_size = size_of::<LUID_AND_ATTRIBUTES>();
+    let privileges_bytes = privilege_count_usize
+        .checked_mul(entry_size)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TokenPrivileges privilege array byte-length overflow",
+            )
+        })?;
+    let needed = privilege_header
+        .checked_add(privileges_bytes)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TokenPrivileges total byte-length overflow",
+            )
+        })?;
+    if needed > returned_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "TokenPrivileges PrivilegeCount {privilege_count} exceeds returned buffer ({needed} > {returned_len})"
+            ),
+        ));
+    }
+
+    for index in 0..privilege_count_usize {
+        let offset = privilege_header.strict_add(index.strict_mul(entry_size));
+        // SAFETY: offset was bounds-checked against returned_len; entries are
+        // 4-byte aligned LUID_AND_ATTRIBUTES values inside the owned buffer.
+        let entry = unsafe {
+            buffer
+                .as_ptr()
+                .byte_add(offset)
+                .cast::<LUID_AND_ATTRIBUTES>()
+                .read()
+        };
+        if entry.Luid.LowPart == manage_volume.LowPart
+            && entry.Luid.HighPart == manage_volume.HighPart
+        {
+            if entry.Attributes & SE_PRIVILEGE_ENABLED != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "effective token still has SeManageVolumePrivilege enabled",
+                ));
+            }
+            // Present but disabled is acceptable under DISABLE_MAX_PRIVILEGE.
+            return Ok(());
+        }
+    }
+    // Absent from the effective privilege set is also acceptable.
     Ok(())
+}
+
+#[cfg(test)]
+mod select_effective_query_token_tests {
+    use super::{ERROR_ACCESS_DENIED, ERROR_NO_TOKEN, select_effective_query_token};
+    use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn open_thread_token_access_denied_does_not_fall_back_to_process_token() {
+        let process_called = AtomicBool::new(false);
+        let error = select_effective_query_token::<()>(
+            || {
+                Err(io::Error::from_raw_os_error(
+                    ERROR_ACCESS_DENIED.cast_signed(),
+                ))
+            },
+            || {
+                process_called.store(true, Ordering::SeqCst);
+                Err(io::Error::other("process token fallback must not run"))
+            },
+        )
+        .expect_err("OpenThreadToken ACCESS_DENIED must fail closed");
+        assert!(
+            !process_called.load(Ordering::SeqCst),
+            "OpenProcessToken fallback must not run on OpenThreadToken ACCESS_DENIED"
+        );
+        assert_eq!(
+            error.raw_os_error(),
+            Some(ERROR_ACCESS_DENIED.cast_signed())
+        );
+    }
+
+    #[test]
+    fn open_thread_token_no_token_uses_process_fallback() {
+        let process_called = AtomicBool::new(false);
+        let value = select_effective_query_token(
+            || Err(io::Error::from_raw_os_error(ERROR_NO_TOKEN.cast_signed())),
+            || {
+                process_called.store(true, Ordering::SeqCst);
+                Ok(0xA11Cu32)
+            },
+        )
+        .expect("ERROR_NO_TOKEN must use process fallback");
+        assert!(process_called.load(Ordering::SeqCst));
+        assert_eq!(value, 0xA11C);
+    }
 }

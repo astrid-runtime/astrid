@@ -130,12 +130,16 @@ pub(super) fn append_map_nodes(
     Ok(())
 }
 
-pub(super) fn append_new_reachable_map_nodes(
-    metadata: &mut Vec<MetadataFrame>,
+/// Visit tip-reachable map nodes that still need durable publication.
+///
+/// `emit` runs once per newly appended node identity. Callers push into a Vec or
+/// write through a framed append stream; the walk/validation stays authoritative.
+pub(super) fn visit_new_reachable_map_nodes(
     map: &CanonicalPhysicalMap,
     durable: &BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    mut emit: impl FnMut(&PhysicalMapNode) -> Result<(), DurableError>,
 ) -> Result<usize, DurableError> {
     let Some(root) = map.root() else {
         return Ok(0);
@@ -165,7 +169,7 @@ pub(super) fn append_new_reachable_map_nodes(
                 complete.insert(id);
             }
             if !durable.contains(&id) && !appended.contains(&id) {
-                metadata.push(MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?);
+                emit(node)?;
                 appended.insert(id);
             }
             continue;
@@ -192,6 +196,19 @@ pub(super) fn append_new_reachable_map_nodes(
         }
     }
     Ok(visited.len())
+}
+
+pub(super) fn append_new_reachable_map_nodes(
+    metadata: &mut Vec<MetadataFrame>,
+    map: &CanonicalPhysicalMap,
+    durable: &BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+) -> Result<usize, DurableError> {
+    visit_new_reachable_map_nodes(map, durable, appended, complete, |node| {
+        metadata.push(MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?);
+        Ok(())
+    })
 }
 
 pub(super) trait MapNodeRef {

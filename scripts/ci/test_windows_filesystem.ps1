@@ -25,6 +25,12 @@ Invoke-NativeCargoTest -CargoArgs @(
 
 Invoke-NativeCargoTest -CargoArgs @(
     "test", "--locked", "--target", $Target,
+    "-p", "astrid-core", "dirs::projection_retirement",
+    "--", "--nocapture"
+)
+
+Invoke-NativeCargoTest -CargoArgs @(
+    "test", "--locked", "--target", $Target,
     "-p", "astrid-storage", "volume::hosted",
     "--", "--nocapture"
 )
@@ -71,5 +77,12 @@ Invoke-NativeCargoTest -CargoArgs @(
     "test", "--locked", "--target", $Target,
     "-p", "astrid-storage", "--all-features",
     "principal_state::runtime_tree::lifecycle_tests",
+    "--", "--nocapture"
+)
+
+Invoke-NativeCargoTest -CargoArgs @(
+    "test", "--locked", "--target", $Target,
+    "-p", "astrid-storage", "--all-features",
+    "principal_state::lifecycle",
     "--", "--nocapture"
 )

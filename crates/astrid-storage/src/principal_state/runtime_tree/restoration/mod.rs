@@ -200,6 +200,7 @@ fn projection_entries(
         let name = entry.name().as_str();
         confined_projection_path(home.root(), name.strip_suffix('/').unwrap_or(name))?;
     }
+    names::validate(home, &entries)?;
     Ok(entries)
 }
 
@@ -238,20 +239,35 @@ fn restore_entries<'a>(
                 .map_err(|error| tree_error(&path, error))?;
             continue;
         }
-        let Some(bytes) = content
-            .read(&StateOwner::System, entry.name())
+        let Some(handle) = content
+            .open_read(&StateOwner::System, entry.name())
             .map_err(|error| tree_error(home.root(), format!("read projection {name}: {error}")))?
         else {
             continue;
         };
+        let mut reader = read::AuthenticatedContentReader::new(&handle);
+        let length = reader.logical_len();
+        if length != entry.logical_bytes() {
+            return Err(tree_error(
+                home.root(),
+                "projection changed during restoration admission",
+            ));
+        }
         let path = confined_projection_path(home.root(), name)?;
         // Matching payload bytes alone do not establish the private-file contract.
         // Skips must prove the root-bound mount/device boundary, not ambient paths.
         if !is_staging_generation(name)
-            && inspection_matches_file(inspection.as_ref(), Path::new(name), &bytes, &path)?
+            && inspection_matches_file(
+                inspection.as_ref(),
+                Path::new(name),
+                length,
+                &mut reader,
+                &path,
+            )?
         {
             continue;
         }
+        reader.rewind();
         let writer = prepare(home, store, prepared)?;
         let previous = spool
             .capture(writer, Path::new(name))
@@ -261,7 +277,7 @@ fn restore_entries<'a>(
             previous,
         });
         writer
-            .write(Path::new(name), &bytes)
+            .write_from(Path::new(name), &mut reader, length)
             .map_err(|error| tree_error(&path, error))?;
         #[cfg(test)]
         tests::after_write(home.root(), name);
@@ -297,14 +313,15 @@ fn inspection_matches_directory(
 fn inspection_matches_file(
     inspection: Option<&PrivateProjectionInspection>,
     relative: &Path,
-    expected: &[u8],
+    length: u64,
+    expected: &mut dyn std::io::Read,
     path: &Path,
 ) -> StorageResult<bool> {
     let Some(inspection) = inspection else {
         return Ok(false);
     };
     inspection
-        .matches_private_file(relative, expected)
+        .matches_private_file_from(relative, length, expected)
         .map_err(|error| tree_error(path, error))
 }
 
@@ -419,6 +436,10 @@ pub(super) fn take_writer_opens(root: &std::path::Path) -> usize {
     tests::take_writer_opens(root)
 }
 
+mod names;
+mod read;
+#[cfg(test)]
+mod read_tests;
 mod rollback;
 mod staging;
 

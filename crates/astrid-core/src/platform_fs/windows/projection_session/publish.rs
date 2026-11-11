@@ -142,6 +142,8 @@ fn finish_publish(
             destination,
             FileContract::ExactPrivate,
         )?;
+        // Parent directory-structure fence (Unix parent fsync parity).
+        super::flush_captured_namespace(parent)?;
         parent.verify_contract(BoundaryContract::ExactPrivateDirectory)?;
         Ok(())
     })();

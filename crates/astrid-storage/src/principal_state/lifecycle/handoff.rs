@@ -45,9 +45,19 @@ impl RuntimePrincipalStore {
     ) -> StorageResult<RuntimeFinalization> {
         self.require_volume_binding(home)?;
         crate::principal_state::runtime_tree_active::validate_retirement_home(home, self)?;
+        // Reserve old staging before engine transfer. Idle facade clones do not
+        // block; live writer/publish leases do. Token Drop restores Open if the
+        // engine handoff fails.
+        let staging_close = match self.staging.get() {
+            Some(area) => Some(area.reserve_for_close()?),
+            None => None,
+        };
         let engine = Arc::new(self.engine.handoff_for_retirement().map_err(|error| {
             StorageError::Connection(format!("transfer runtime store: {error}"))
         })?);
+        if let Some(token) = staging_close {
+            token.commit();
+        }
         // Keep the live quota policy while creating fresh projections: old
         // handles and their validation/read caches cannot cross the handoff.
         let quota = Arc::clone(&self.quota);
