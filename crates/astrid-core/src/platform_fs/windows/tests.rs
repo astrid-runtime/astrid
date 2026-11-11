@@ -993,3 +993,6 @@ fn interrupted_replacement_recovers_at_each_mutation_phase() {
 
 #[path = "tests/directory_durability.rs"]
 mod directory_durability;
+
+#[path = "tests/ancestor_rename_probe.rs"]
+mod ancestor_rename_probe;
