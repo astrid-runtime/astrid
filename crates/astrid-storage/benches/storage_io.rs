@@ -46,21 +46,27 @@ async fn main() -> BenchResult<()> {
     };
     prepare_root(&root)?;
     println!("benchmark root: {}", root.display());
-    println!(
-        "corpus: {} bytes; block: {} bytes; range: {} bytes; object cache: {}",
-        config.bytes,
-        config.block_bytes,
-        config.range_bytes,
-        config
-            .object_cache_bytes
-            .map_or_else(|| "disabled".to_owned(), |bytes| format!("{bytes} bytes"))
-    );
-
-    let source = root.join("source.bin");
-    workloads::prepare_source(&source, config.bytes, config.block_bytes)?;
-    let source_digest = workloads::hash_native(&source, config.block_bytes)?;
     let mut report = Report::new(config.clone(), provenance);
-    workloads::run(&config, &root, &source, source_digest, &mut report).await?;
+    if let Some(overwrites) = config.checkpoint_overwrites {
+        println!(
+            "checkpoint overwrites: {overwrites}; payload: 256 bytes; object cache: runtime defaults"
+        );
+        workloads::run(&config, &root, Path::new(""), [0; 32], &mut report).await?;
+    } else {
+        println!(
+            "corpus: {} bytes; block: {} bytes; range: {} bytes; object cache: {}",
+            config.bytes,
+            config.block_bytes,
+            config.range_bytes,
+            config
+                .object_cache_bytes
+                .map_or_else(|| "disabled".to_owned(), |bytes| format!("{bytes} bytes"))
+        );
+        let source = root.join("source.bin");
+        workloads::prepare_source(&source, config.bytes, config.block_bytes)?;
+        let source_digest = workloads::hash_native(&source, config.block_bytes)?;
+        workloads::run(&config, &root, &source, source_digest, &mut report).await?;
+    }
 
     report.print_table();
     let encoded = report.encode_evidence()?;

@@ -24,6 +24,8 @@ use crate::BenchResult;
 
 #[path = "workloads/bulk.rs"]
 mod bulk;
+#[path = "workloads/checkpoint_churn.rs"]
+mod checkpoint_churn;
 #[path = "workloads/partial_verification_clone.rs"]
 mod partial_verification_clone;
 
@@ -37,6 +39,9 @@ pub(super) async fn run(
     source_digest: [u8; 32],
     report: &mut Report,
 ) -> BenchResult<()> {
+    if config.checkpoint_overwrites.is_some() {
+        return checkpoint_churn::run(config, root, report).await;
+    }
     if config.partial_verification_clone {
         return benchmark_partial_verification_clone(config, root, source, source_digest, report)
             .await;
@@ -253,10 +258,6 @@ async fn benchmark_runtime(
         samples
             .unique_authoritative_bytes
             .push(publication.unique_authoritative_bytes);
-        samples.unique_representation_metadata.push((
-            publication.unique_objects_inserted,
-            publication.unique_representation_bytes,
-        ));
         samples
             .unique_end_to_end
             .push(publication.unique_end_to_end);
@@ -272,10 +273,6 @@ async fn benchmark_runtime(
         samples
             .duplicate_authoritative_bytes
             .push(publication.duplicate_authoritative_bytes);
-        samples.duplicate_representation_metadata.push((
-            publication.duplicate_objects_inserted,
-            publication.duplicate_representation_bytes,
-        ));
         samples
             .duplicate_end_to_end
             .push(publication.duplicate_end_to_end);
@@ -335,19 +332,14 @@ async fn benchmark_publication(
     let (unique_name, unique_staged, stage_write, stage_seal) =
         stage_source(store, source, owner, "large/unique.bin", config.block_bytes)?;
     let authoritative_before = authoritative_store_bytes(home)?;
-    let representation_before = 0_u64;
     let started = Instant::now();
     let unique_outcome = store.publish_staged(unique_staged).await?;
     black_box(unique_outcome);
     let unique_publish = started.elapsed();
     let authoritative_after_unique = authoritative_store_bytes(home)?;
-    let representation_after_unique = 0_u64;
     let unique_authoritative_bytes = authoritative_after_unique
         .checked_sub(authoritative_before)
         .ok_or("authoritative store shrank during unique publication")?;
-    let unique_representation_bytes = representation_after_unique
-        .checked_sub(representation_before)
-        .ok_or("representation authority shrank during unique publication")?;
     let unique_end_to_end = sum_durations(&[stage_write, stage_seal, unique_publish])?;
 
     let (_, duplicate_staged, duplicate_write, duplicate_seal) = stage_source(
@@ -358,32 +350,23 @@ async fn benchmark_publication(
         config.block_bytes,
     )?;
     let authoritative_before_duplicate = authoritative_store_bytes(home)?;
-    let representation_before_duplicate = 0_u64;
     let started = Instant::now();
     let duplicate_outcome = store.publish_staged(duplicate_staged).await?;
     black_box(duplicate_outcome);
     let duplicate_publish = started.elapsed();
     let authoritative_after_duplicate = authoritative_store_bytes(home)?;
-    let representation_after_duplicate = 0_u64;
     let duplicate_authoritative_bytes = authoritative_after_duplicate
         .checked_sub(authoritative_before_duplicate)
         .ok_or("authoritative store shrank during duplicate publication")?;
-    let duplicate_representation_bytes = representation_after_duplicate
-        .checked_sub(representation_before_duplicate)
-        .ok_or("representation authority shrank during duplicate publication")?;
     Ok(PublicationSample {
         unique_name,
         unique_publish,
         unique_authoritative_bytes,
-        unique_objects_inserted: unique_outcome.objects_inserted(),
-        unique_representation_bytes,
         unique_end_to_end,
         duplicate_stage_write: duplicate_write,
         duplicate_stage_seal: duplicate_seal,
         duplicate_publish,
         duplicate_authoritative_bytes,
-        duplicate_objects_inserted: duplicate_outcome.objects_inserted(),
-        duplicate_representation_bytes,
         duplicate_end_to_end: sum_durations(&[duplicate_write, duplicate_seal, duplicate_publish])?,
     })
 }
@@ -392,15 +375,11 @@ struct PublicationSample {
     unique_name: ContentName,
     unique_publish: Duration,
     unique_authoritative_bytes: u64,
-    unique_objects_inserted: u64,
-    unique_representation_bytes: u64,
     unique_end_to_end: Duration,
     duplicate_stage_write: Duration,
     duplicate_stage_seal: Duration,
     duplicate_publish: Duration,
     duplicate_authoritative_bytes: u64,
-    duplicate_objects_inserted: u64,
-    duplicate_representation_bytes: u64,
     duplicate_end_to_end: Duration,
 }
 
@@ -409,13 +388,11 @@ struct RuntimeSamples {
     fresh_open: Vec<Duration>,
     unique_publish: Vec<Duration>,
     unique_authoritative_bytes: Vec<u64>,
-    unique_representation_metadata: Vec<(u64, u64)>,
     unique_end_to_end: Vec<Duration>,
     duplicate_stage_write: Vec<Duration>,
     duplicate_stage_seal: Vec<Duration>,
     duplicate_publish: Vec<Duration>,
     duplicate_authoritative_bytes: Vec<u64>,
-    duplicate_representation_metadata: Vec<(u64, u64)>,
     duplicate_end_to_end: Vec<Duration>,
     read_first: Vec<Duration>,
     read_warm: Vec<Duration>,
@@ -432,10 +409,6 @@ impl RuntimeSamples {
             "astrid_publish_unique",
             config.bytes,
             self.unique_authoritative_bytes,
-        )?;
-        report.record_representation_metadata(
-            "astrid_publish_unique",
-            self.unique_representation_metadata,
         )?;
         report.record_bytes(
             "astrid_unique_end_to_end",
@@ -461,10 +434,6 @@ impl RuntimeSamples {
             "astrid_publish_duplicate",
             config.bytes,
             self.duplicate_authoritative_bytes,
-        )?;
-        report.record_representation_metadata(
-            "astrid_publish_duplicate",
-            self.duplicate_representation_metadata,
         )?;
         report.record_bytes(
             "astrid_duplicate_end_to_end",

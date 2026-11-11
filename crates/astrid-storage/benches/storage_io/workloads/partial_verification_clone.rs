@@ -133,8 +133,8 @@ pub(super) async fn benchmark_partial_verification_clone(
         config.bytes,
         windowed_wall,
     );
-    report.record_resource_peak(Arm::FullRead.insertion_metric(), read_insertions)?;
-    report.record_resource_peak(Arm::WindowedRanges.insertion_metric(), windowed_insertions)?;
+    report.record_counts(Arm::FullRead.insertion_metric(), read_insertions)?;
+    report.record_counts(Arm::WindowedRanges.insertion_metric(), windowed_insertions)?;
     report.record_resource_peak(Arm::FullRead.resident_metric(), read_resident)?;
     report.record_resource_peak(Arm::WindowedRanges.resident_metric(), windowed_resident)?;
     if let Some(window) = window_bytes {

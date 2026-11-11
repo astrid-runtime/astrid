@@ -15,6 +15,7 @@ const DEFAULT_SMALL_FILES: usize = 64;
 const DEFAULT_SMALL_FILE_BYTES: usize = 4096;
 const DEFAULT_CONCURRENT_PRINCIPALS: usize = 4;
 const DEFAULT_BULK_FILES: usize = 100;
+const MATCHED_CHECKPOINT_OVERWRITES: usize = 4096;
 
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct Config {
@@ -29,12 +30,17 @@ pub(super) struct Config {
     pub(super) bulk_files: usize,
     pub(super) object_cache_bytes: Option<u64>,
     pub(super) partial_verification_clone: bool,
+    pub(super) checkpoint_overwrites: Option<NonZeroUsize>,
     pub(super) root: Option<PathBuf>,
     pub(super) output: Option<PathBuf>,
 }
 
 impl Config {
     pub(super) fn from_args() -> BenchResult<Self> {
+        Self::from_args_iter(env::args().skip(1))
+    }
+
+    pub(super) fn from_args_iter(arguments: impl IntoIterator<Item = String>) -> BenchResult<Self> {
         let mut config = Self {
             bytes: DEFAULT_BYTES,
             block_bytes: DEFAULT_BLOCK_BYTES,
@@ -47,10 +53,11 @@ impl Config {
             bulk_files: DEFAULT_BULK_FILES,
             object_cache_bytes: None,
             partial_verification_clone: false,
+            checkpoint_overwrites: None,
             root: None,
             output: None,
         };
-        let mut arguments = env::args().skip(1);
+        let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 // Cargo supplies this marker to custom benchmark executables.
@@ -86,6 +93,12 @@ impl Config {
                 "--partial-verification-clone" => {
                     config.partial_verification_clone = true;
                 },
+                "--checkpoint-overwrites" => {
+                    config.checkpoint_overwrites = Some(parse_nonzero_usize(
+                        &mut arguments,
+                        "--checkpoint-overwrites",
+                    )?);
+                },
                 "--root" => config.root = Some(parse_path(&mut arguments, "--root")?),
                 "--output" => config.output = Some(parse_path(&mut arguments, "--output")?),
                 "--help" | "-h" => {
@@ -95,32 +108,48 @@ impl Config {
                 unknown => return Err(format!("unknown argument {unknown:?}; use --help").into()),
             }
         }
-        if config.bytes == 0 {
+        config.validate()
+    }
+
+    fn validate(self) -> BenchResult<Self> {
+        if self.bytes == 0 {
             return Err("--bytes must be greater than zero".into());
         }
-        if config.object_cache_bytes == Some(0) {
+        if self.object_cache_bytes == Some(0) {
             return Err("--object-cache-bytes must be greater than zero".into());
         }
-        if config.partial_verification_clone && config.object_cache_bytes.is_none() {
+        if self.partial_verification_clone && self.object_cache_bytes.is_none() {
             return Err(
                 "--partial-verification-clone requires nonzero --object-cache-bytes".into(),
             );
         }
+        if self.checkpoint_overwrites.is_some() && self.partial_verification_clone {
+            return Err(
+                "--checkpoint-overwrites cannot be combined with --partial-verification-clone"
+                    .into(),
+            );
+        }
+        if self.checkpoint_overwrites.is_some() && self.object_cache_bytes.is_some() {
+            return Err(
+                "--checkpoint-overwrites uses the runtime object-cache default; do not pass --object-cache-bytes"
+                    .into(),
+            );
+        }
         for (name, value) in [
-            ("--block-bytes", config.block_bytes),
-            ("--range-bytes", config.range_bytes),
-            ("--samples", config.samples),
-            ("--small-files", config.small_files),
-            ("--small-file-bytes", config.small_file_bytes),
-            ("--concurrent-principals", config.concurrent_principals),
-            ("--bulk-workers", config.bulk_workers),
-            ("--bulk-files", config.bulk_files),
+            ("--block-bytes", self.block_bytes),
+            ("--range-bytes", self.range_bytes),
+            ("--samples", self.samples),
+            ("--small-files", self.small_files),
+            ("--small-file-bytes", self.small_file_bytes),
+            ("--concurrent-principals", self.concurrent_principals),
+            ("--bulk-workers", self.bulk_workers),
+            ("--bulk-files", self.bulk_files),
         ] {
             if NonZeroUsize::new(value).is_none() {
                 return Err(format!("{name} must be greater than zero").into());
             }
         }
-        Ok(config)
+        Ok(self)
     }
 }
 
@@ -144,6 +173,14 @@ fn parse_usize(arguments: &mut impl Iterator<Item = String>, name: &str) -> Benc
                 .parse()
                 .map_err(|error| format!("invalid {name} value {value:?}: {error}").into())
         })
+}
+
+fn parse_nonzero_usize(
+    arguments: &mut impl Iterator<Item = String>,
+    name: &str,
+) -> BenchResult<NonZeroUsize> {
+    let value = parse_usize(arguments, name)?;
+    NonZeroUsize::new(value).ok_or_else(|| format!("{name} must be greater than zero").into())
 }
 
 fn parse_path(arguments: &mut impl Iterator<Item = String>, name: &str) -> BenchResult<PathBuf> {
@@ -172,6 +209,11 @@ fn print_help() {
            --partial-verification-clone\n\
                                  run only matched cold read() vs windowed\n\
                                  read_range(--range-bytes) (requires --object-cache-bytes)\n\
+           --checkpoint-overwrites N\n\
+                                 exclusive 256-byte content overwrite profile; omit\n\
+                                 for the existing full bench. Rejects 0. Matched arms\n\
+                                 use {MATCHED_CHECKPOINT_OVERWRITES}. Uses production\n\
+                                 open_runtime_principal_store cache/policy.\n\
            --root PATH           retain benchmark data under PATH\n\
            --output PATH         write the JSON report to PATH\n"
     );
