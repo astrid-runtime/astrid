@@ -38,7 +38,11 @@ impl RepresentationStore {
             .len()
             .saturating_add(self.representations.nodes().len())
             .saturating_add(self.placement_entries.nodes().len());
-        let mut reclaimed = self.persisted_map_nodes.len() > resident;
+        let mut reclaimed = self
+            .persisted_map_nodes
+            .len()
+            .saturating_add(self.complete_map_subtrees.len())
+            > resident;
         let collection = (|| -> Result<(), DurableError> {
             for (map, baseline) in [
                 (&mut self.profiles, &mut self.residency.profiles),
@@ -71,7 +75,10 @@ impl RepresentationStore {
                     || placements.contains_key(id)
             };
             if collection.is_err() {
-                self.complete_map_subtrees.clear();
+                // Retain knowledge of existing frames, but revoke their closure
+                // proofs when a later map fails after partial collection.
+                self.persisted_map_nodes
+                    .append(&mut self.complete_map_subtrees);
             } else {
                 // Immutable resident nodes keep their complete durable closure:
                 // successful collection retains every reachable descendant.
@@ -87,3 +94,6 @@ impl RepresentationStore {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod recovery_tests;

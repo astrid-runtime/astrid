@@ -35,7 +35,14 @@ fn published_updates_bound_resident_history_and_recover_every_entry() {
         }
         // Append memos must not retain IDs whose runtime nodes were evicted.
         let all_resident = resident + store.profiles.nodes().len();
-        assert!(store.persisted_map_nodes.len() <= all_resident);
+        assert!(
+            store
+                .persisted_map_nodes
+                .is_disjoint(&store.complete_map_subtrees)
+        );
+        assert!(
+            store.persisted_map_nodes.len() + store.complete_map_subtrees.len() <= all_resident
+        );
         assert!(store.complete_map_subtrees.len() <= all_resident);
         prior_nodes = resident;
         for (map, baseline) in [
@@ -97,7 +104,7 @@ fn recovery_retains_only_active_physical_id_memos_without_changing_durable_histo
         + reopened.representations.nodes().len()
         + reopened.placement_entries.nodes().len();
     assert_eq!(
-        reopened.persisted_map_nodes.len(),
+        reopened.persisted_map_nodes.len() + reopened.complete_map_subtrees.len(),
         resident,
         "historical durable IDs must not remain in the live append memo"
     );
@@ -269,6 +276,7 @@ fn later_map_reclaim_failure_clears_complete_proofs_after_earlier_shrink() {
         !store.placement_entries.nodes().is_empty(),
         "later map must have nodes so reclaim runs after the earlier shrink"
     );
+    let prior_proofs = store.complete_map_subtrees.clone();
     store
         .placement_entries
         .corrupt_root_for_reclaim_fault(PhysicalMapNodeId::new([0x71; 32]));
@@ -278,6 +286,17 @@ fn later_map_reclaim_failure_clears_complete_proofs_after_earlier_shrink() {
         "earlier map must shrink before the later map fails"
     );
     assert!(store.complete_map_subtrees.is_empty());
+    for id in prior_proofs {
+        if store.profiles.nodes().contains_key(&id)
+            || store.representations.nodes().contains_key(&id)
+            || store.placement_entries.nodes().contains_key(&id)
+        {
+            assert!(
+                store.persisted_map_nodes.contains(&id),
+                "invalidate closure proof without forgetting an existing frame"
+            );
+        }
+    }
 }
 
 #[test]
@@ -314,7 +333,7 @@ fn collection_retains_complete_live_closures_and_skips_their_next_append_walk() 
         append_new_reachable_map_nodes(
             &mut metadata,
             &store.representations,
-            &store.persisted_map_nodes,
+            &mut store.persisted_map_nodes,
             &mut appended,
             &mut store.complete_map_subtrees,
         )
@@ -341,15 +360,20 @@ fn collection_retains_complete_live_closures_and_skips_their_next_append_walk() 
             let warm = append_new_reachable_map_nodes(
                 &mut metadata,
                 &store.representations,
-                &store.persisted_map_nodes,
+                &mut store.persisted_map_nodes,
                 &mut appended,
                 &mut store.complete_map_subtrees,
             )
             .unwrap();
+            let mut cold_durable = store
+                .persisted_map_nodes
+                .union(&store.complete_map_subtrees)
+                .copied()
+                .collect();
             let cold = append_new_reachable_map_nodes(
                 &mut metadata,
                 &store.representations,
-                &store.persisted_map_nodes,
+                &mut cold_durable,
                 &mut appended,
                 &mut BTreeSet::new(),
             )

@@ -89,7 +89,7 @@ fn active_map_materialization_reads_only_its_framed_bytes() {
     };
     visit_new_reachable_map_nodes(
         &original,
-        &BTreeSet::new(),
+        &mut BTreeSet::new(),
         &mut BTreeSet::new(),
         &mut BTreeSet::new(),
         |node| {

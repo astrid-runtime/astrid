@@ -111,10 +111,12 @@ pub(super) struct RepresentationStore {
     profiles: CanonicalPhysicalMap,
     representations: CanonicalPhysicalMap,
     placement_entries: CanonicalPhysicalMap,
+    // Persisted frames without a memoized descendant closure. These IDs are
+    // disjoint from complete_map_subtrees; neither set retains evicted nodes.
     persisted_map_nodes: BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     /// Durable `MapNode` frames in the current generation, including duplicates.
     map_frame_count: u64,
-    // Memoized durable descendant closures; discarded when the store is reopened.
+    // Complete durable closures, authenticated on recovery or checked by append.
     complete_map_subtrees: BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     direct_profile: RepresentationProfileId,
     reverse: BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
@@ -455,14 +457,14 @@ impl RepresentationStore {
         append_new_reachable_map_nodes(
             &mut metadata,
             &self.representations,
-            &self.persisted_map_nodes,
+            &mut self.persisted_map_nodes,
             &mut appended_map_nodes,
             &mut self.complete_map_subtrees,
         )?;
         append_new_reachable_map_nodes(
             &mut metadata,
             &self.placement_entries,
-            &self.persisted_map_nodes,
+            &mut self.persisted_map_nodes,
             &mut appended_map_nodes,
             &mut self.complete_map_subtrees,
         )?;
@@ -550,7 +552,7 @@ impl RepresentationStore {
             append_new_reachable_map_nodes(
                 &mut metadata,
                 map,
-                &self.persisted_map_nodes,
+                &mut self.persisted_map_nodes,
                 &mut appended_map_nodes,
                 &mut self.complete_map_subtrees,
             )?;
@@ -831,8 +833,10 @@ impl RepresentationStore {
         // This is an append memo, not the durable historical catalogue. Journal
         // recovery has checked historical frame identities and CAS closure
         // completeness. Active maps receive full canonical validation above.
-        // An evicted node can be appended again with its canonical ID.
-        let persisted_map_nodes = [&profiles, &representations, &placement_entries]
+        // Seed closure proofs from those authenticated active nodes without a
+        // duplicate ID set or another first-write traversal. Evicted nodes can
+        // be appended again with their canonical IDs.
+        let complete_map_subtrees = [&profiles, &representations, &placement_entries]
             .into_iter()
             .flat_map(|map| map.nodes().keys().copied())
             .collect();
@@ -858,9 +862,9 @@ impl RepresentationStore {
             profiles,
             representations,
             placement_entries,
-            persisted_map_nodes,
+            persisted_map_nodes: BTreeSet::new(),
             map_frame_count,
-            complete_map_subtrees: BTreeSet::new(),
+            complete_map_subtrees,
             direct_profile,
             reverse,
         })

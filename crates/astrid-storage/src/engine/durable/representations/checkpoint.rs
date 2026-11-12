@@ -32,7 +32,7 @@ impl RepresentationStore {
         // seek once, reuse the shared transfer buffer, flush before sync/readback.
         let mut appended = BTreeSet::new();
         let mut complete = BTreeSet::new();
-        let durable = BTreeSet::new();
+        let mut durable = BTreeSet::new();
         {
             let mut stream = FramedAppendStream::begin(&mut metadata, METADATA_MAGIC)?;
             for map in [
@@ -42,7 +42,7 @@ impl RepresentationStore {
             ] {
                 visit_new_reachable_map_nodes(
                     map,
-                    &durable,
+                    &mut durable,
                     &mut appended,
                     &mut complete,
                     |node| {

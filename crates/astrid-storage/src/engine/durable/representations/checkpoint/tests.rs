@@ -224,7 +224,10 @@ fn recovered_maps_retain_only_their_active_closures() {
         assert_eq!(map.entry_count(), 1);
         assert_eq!(map.nodes().len(), 1, "retain only this root's active page");
     }
-    assert_eq!(recovered.persisted_map_nodes.len(), 3);
+    assert_eq!(
+        recovered.persisted_map_nodes.len() + recovered.complete_map_subtrees.len(),
+        3
+    );
     assert_eq!(
         recovered.metadata.metadata().unwrap().len(),
         historical_bytes
@@ -234,10 +237,16 @@ fn recovered_maps_retain_only_their_active_closures() {
     // frames remain valid, and re-appending identical canonical nodes is safe.
     advance(&mut recovered, 1);
     assert_ne!(recovered.placement_entries.root(), final_placement);
-    assert_eq!(recovered.persisted_map_nodes.len(), 3);
+    assert_eq!(
+        recovered.persisted_map_nodes.len() + recovered.complete_map_subtrees.len(),
+        3
+    );
     advance(&mut recovered, 40);
     assert_eq!(recovered.placement_entries.root(), final_placement);
-    assert_eq!(recovered.persisted_map_nodes.len(), 3);
+    assert_eq!(
+        recovered.persisted_map_nodes.len() + recovered.complete_map_subtrees.len(),
+        3
+    );
     advance(&mut recovered, 41);
     let active = recovered.active;
     drop(recovered);

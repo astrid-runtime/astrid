@@ -136,7 +136,7 @@ pub(super) fn append_map_nodes(
 /// write through a framed append stream; the walk/validation stays authoritative.
 pub(super) fn visit_new_reachable_map_nodes(
     map: &CanonicalPhysicalMap,
-    durable: &BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    durable: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     mut emit: impl FnMut(&PhysicalMapNode) -> Result<(), DurableError>,
@@ -155,7 +155,8 @@ pub(super) fn visit_new_reachable_map_nodes(
                     "active physical map is missing a reachable node",
                 ))?;
             // A persisted parent alone does not establish durable descendants.
-            // Cache only closures checked against the append-only persisted set.
+            // Move checked IDs into the complete-closure partition so the two
+            // disposable memos never retain duplicate IDs.
             let children_complete = match node {
                 PhysicalMapNode::Branch { zero, one, .. } => {
                     complete.contains(zero) && complete.contains(one)
@@ -165,10 +166,12 @@ pub(super) fn visit_new_reachable_map_nodes(
                 },
                 PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => true,
             };
-            if durable.contains(&id) && children_complete {
+            let persisted = durable.contains(&id);
+            if persisted && children_complete {
+                durable.remove(&id);
                 complete.insert(id);
             }
-            if !durable.contains(&id) && !appended.contains(&id) {
+            if !persisted && !appended.contains(&id) {
                 emit(node)?;
                 appended.insert(id);
             }
@@ -201,7 +204,7 @@ pub(super) fn visit_new_reachable_map_nodes(
 pub(super) fn append_new_reachable_map_nodes(
     metadata: &mut Vec<MetadataFrame>,
     map: &CanonicalPhysicalMap,
-    durable: &BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    durable: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
 ) -> Result<usize, DurableError> {
@@ -261,14 +264,15 @@ mod tests {
     #[test]
     fn verified_durable_subtrees_skip_unchanged_nodes() {
         let mut map = dense_map();
-        let durable = map.nodes().keys().copied().collect();
+        let mut durable: BTreeSet<_> = map.nodes().keys().copied().collect();
+        let mut reference_durable = durable.clone();
         let mut complete = BTreeSet::new();
         let mut metadata = Vec::new();
         let mut appended = BTreeSet::new();
         let cold = append_new_reachable_map_nodes(
             &mut metadata,
             &map,
-            &durable,
+            &mut durable,
             &mut appended,
             &mut complete,
         )
@@ -278,7 +282,7 @@ mod tests {
         let warm = append_new_reachable_map_nodes(
             &mut metadata,
             &map,
-            &durable,
+            &mut durable,
             &mut appended,
             &mut complete,
         )
@@ -294,7 +298,7 @@ mod tests {
         let changed = append_new_reachable_map_nodes(
             &mut metadata,
             &map,
-            &durable,
+            &mut durable,
             &mut appended,
             &mut complete,
         )
@@ -305,7 +309,7 @@ mod tests {
         append_new_reachable_map_nodes(
             &mut cold_metadata,
             &map,
-            &durable,
+            &mut reference_durable,
             &mut cold_appended,
             &mut BTreeSet::new(),
         )
@@ -334,7 +338,7 @@ mod tests {
         append_new_reachable_map_nodes(
             &mut metadata,
             &map,
-            &BTreeSet::from([root]),
+            &mut BTreeSet::from([root]),
             &mut appended,
             &mut complete,
         )
@@ -355,7 +359,7 @@ mod tests {
         append_new_reachable_map_nodes(
             &mut metadata,
             &map,
-            &BTreeSet::new(),
+            &mut BTreeSet::new(),
             &mut appended,
             &mut BTreeSet::new(),
         )
