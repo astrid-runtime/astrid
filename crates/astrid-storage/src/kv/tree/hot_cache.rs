@@ -239,6 +239,7 @@ impl CachedValue {
     }
 }
 
+#[derive(Clone)]
 struct OwnerSnapshot {
     root: Option<RootState>,
     entries: BTreeMap<Vec<u8>, CachedValue>,
@@ -518,14 +519,18 @@ where
             created
         };
 
-        let previous = owner_cache.snapshot.load_full();
+        // Admissions are serialized by `accounting`. Temporarily publish a
+        // miss-only snapshot so an unobserved map can be moved, rather than
+        // cloning every prior key for each sequential cold read. A reader
+        // already holding the old snapshot keeps it immutable; only that
+        // overlapping-reader case needs a copy. A reader arriving during the
+        // update takes the ordinary authoritative-engine miss path.
+        let previous = owner_cache
+            .snapshot
+            .swap(Arc::new(OwnerSnapshot::empty(root)));
+        let previous_bytes = previous.resident_bytes;
         let mut next = if previous.root == root {
-            OwnerSnapshot {
-                root,
-                entries: previous.entries.clone(),
-                insertion_order: previous.insertion_order.clone(),
-                resident_bytes: previous.resident_bytes,
-            }
+            Arc::unwrap_or_clone(previous)
         } else {
             OwnerSnapshot::empty(root)
         };
@@ -540,9 +545,7 @@ where
         next.entries.insert(key.clone(), value);
         next.insertion_order.push_back(key);
 
-        let mut previous_global = writer
-            .resident_bytes
-            .saturating_sub(previous.resident_bytes);
+        let mut previous_global = writer.resident_bytes.saturating_sub(previous_bytes);
         while (next.entries.len() > self.entries_per_owner.get()
             || next.resident_bytes > bounds.per_owner.get())
             && next.remove_oldest()
@@ -626,6 +629,69 @@ mod tests {
             generation: RootGeneration::new(u64::from(generation)),
             commit: ObjectId::new([generation; 32]),
         }
+    }
+
+    #[test]
+    fn sequential_admission_reuses_unobserved_entry_allocations() {
+        let cache = KvHotCache::with_limits(1_000_000, 1_000_000, 4, 256);
+        cache.insert(&"alice", Some(root(1)), b"first".to_vec(), Some(b"value"));
+        let key_addresses = || {
+            let owners = cache.owners.load();
+            let snapshot = owners.get("alice").unwrap().snapshot.load();
+            let entry = snapshot
+                .entries
+                .get_key_value(b"first".as_slice())
+                .unwrap()
+                .0
+                .as_ptr() as usize;
+            let fifo = snapshot.insertion_order.front().unwrap().as_ptr() as usize;
+            (entry, fifo)
+        };
+        let original = key_addresses();
+        for index in 0..128 {
+            cache.insert(
+                &"alice",
+                Some(root(1)),
+                index.to_string().into_bytes(),
+                None,
+            );
+            assert_eq!(
+                key_addresses(),
+                original,
+                "unobserved keys must not be cloned on every admission"
+            );
+        }
+        assert!(
+            matches!(cache.get(&"alice", Some(root(1)), b"first"), HotRead::Hit(Some(value)) if value == b"value")
+        );
+    }
+
+    #[test]
+    fn admission_preserves_a_concurrent_readers_snapshot() {
+        let cache = KvHotCache::with_limits(1_000_000, 1_000_000, 4, 256);
+        cache.insert(&"alice", Some(root(1)), b"first".to_vec(), Some(b"old"));
+        let owners = cache.owners.load();
+        let owner = owners.get("alice").unwrap();
+        // Keep a lock-free read guard, rather than an explicit Arc clone:
+        // publication must also preserve readers protected by ArcSwap.
+        let observed = owner.snapshot.load();
+        cache.insert(&"alice", Some(root(1)), b"second".to_vec(), None);
+        assert!(observed.entries.contains_key(b"first".as_slice()));
+        assert!(!observed.entries.contains_key(b"second".as_slice()));
+        assert!(matches!(
+            cache.get(&"alice", Some(root(1)), b"second"),
+            HotRead::Hit(None)
+        ));
+        cache.insert(&"alice", Some(root(2)), b"third".to_vec(), Some(b"new"));
+        assert_eq!(observed.root, Some(root(1)));
+        assert!(observed.entries.contains_key(b"first".as_slice()));
+        assert!(matches!(
+            cache.get(&"alice", Some(root(2)), b"first"),
+            HotRead::Miss
+        ));
+        assert!(
+            matches!(cache.get(&"alice", Some(root(2)), b"third"), HotRead::Hit(Some(value)) if value == b"new")
+        );
     }
 
     #[test]
