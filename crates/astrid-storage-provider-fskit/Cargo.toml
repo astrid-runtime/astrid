@@ -21,7 +21,7 @@ fs2 = { workspace = true }
 nix = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-libproc = "0.14.11"
+libproc = "0.15.0"
 nix = { workspace = true, features = ["mount"] }
 
 [dev-dependencies]
