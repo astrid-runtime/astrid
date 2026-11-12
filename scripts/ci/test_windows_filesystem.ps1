@@ -76,7 +76,13 @@ Invoke-NativeCargoTest -CargoArgs @(
 Invoke-NativeCargoTest -CargoArgs @(
     "test", "--locked", "--target", $Target,
     "-p", "astrid-storage", "--all-features",
-    "principal_state::runtime_tree::lifecycle_tests",
+    "principal_state::runtime_tree",
+    "--", "--nocapture"
+)
+
+Invoke-NativeCargoTest -CargoArgs @(
+    "test", "--locked", "--target", $Target,
+    "-p", "astrid-kernel", "runtime_tree_admit",
     "--", "--nocapture"
 )
 

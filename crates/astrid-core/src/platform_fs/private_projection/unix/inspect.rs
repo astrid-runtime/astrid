@@ -29,6 +29,26 @@ impl Inspection {
         Ok(Self { root, boundary })
     }
 
+    pub(in crate::platform_fs::private_projection) fn open_writer(
+        &self,
+    ) -> io::Result<super::Projection> {
+        self.confirm_absolute_root()?;
+        #[cfg(test)]
+        super::hooks::after(super::hooks::Event::BeforeBoundWriterClone)?;
+        let root = self.root.try_clone()?;
+        // Clone descriptors, never recapture a replacement at the same path.
+        // The original mount proof must still accept the captured authority.
+        root.validate_absolute(&self.boundary)?;
+        self.boundary.validate(&root.file)?;
+        let boundary = MountBoundary::new(&root.file)?;
+        Ok(super::Projection {
+            root,
+            boundary,
+            staging_scope: None,
+            pending_temporary: std::cell::RefCell::new(None),
+        })
+    }
+
     pub(in crate::platform_fs::private_projection) fn matches_private_directory(
         &self,
         relative: &RelativePath,

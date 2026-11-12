@@ -6,8 +6,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use crate::content::{ContentName, PrepareDerivedBatchContent};
-use crate::engine::PrincipalProjectionError;
+use crate::content::ContentName;
 use crate::error::{StorageError, StorageResult};
 use astrid_core::dirs::AstridHome;
 use astrid_core::platform_fs::StagingScope;
@@ -18,10 +17,13 @@ use super::{
 };
 
 use super::runtime_tree_active as active;
+mod active_receipt;
+pub(super) mod admission;
 #[cfg(test)]
 mod key_recovery_tests;
 #[cfg(test)]
 mod lifecycle_tests;
+use active_receipt::ActiveReceiptDeriver;
 mod projection;
 mod restoration;
 mod retirement;
@@ -93,6 +95,7 @@ fn scan_with_receipt(
     runtime_root: &Path,
     receipt: Option<&active::ActiveProjectionReceipt>,
 ) -> StorageResult<Vec<RuntimeTreeEntry>> {
+    tracing::trace!(target: "astrid_storage::runtime_tree_scan", "scan runtime source tree");
     let metadata = std::fs::symlink_metadata(runtime_root)
         .map_err(|error| tree_error(runtime_root, format!("inspect source root: {error}")))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -605,47 +608,6 @@ pub(super) fn establish_active_receipt(
     rotate_active_receipt(home, store, &entries)
 }
 
-struct ActiveReceiptDeriver {
-    home: AstridHome,
-    entries: Vec<(ContentName, u64)>,
-}
-
-impl PrepareDerivedBatchContent for ActiveReceiptDeriver {
-    fn prepare(
-        &mut self,
-        prepared: &std::collections::BTreeMap<ContentName, crate::content::ContentDescriptor>,
-    ) -> Result<(ContentName, Vec<u8>), crate::content::PrincipalContentError> {
-        let entries = self
-            .entries
-            .iter()
-            .map(|(name, logical_bytes)| {
-                let descriptor = prepared.get(name).ok_or_else(|| {
-                    PrincipalProjectionError::Engine(format!(
-                        "prepared runtime projection omitted {}",
-                        name.as_str()
-                    ))
-                })?;
-                if descriptor.logical_bytes() != *logical_bytes {
-                    return Err(PrincipalProjectionError::Engine(format!(
-                        "prepared runtime projection changed {}",
-                        name.as_str()
-                    )));
-                }
-                Ok(ActiveProjectionEntry {
-                    name: name.clone(),
-                    file: descriptor.file(),
-                    logical_bytes: *logical_bytes,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let bytes = active::encode(&self.home, ReceiptPhase::Active, &entries, None)
-            .map_err(|error| PrincipalProjectionError::Engine(error.to_string()))?;
-        let name = active::active_projection_name()
-            .map_err(|error| PrincipalProjectionError::Engine(error.to_string()))?;
-        Ok((name, bytes))
-    }
-}
-
 fn publish_active_projection(
     home: &AstridHome,
     store: &RuntimePrincipalStore,
@@ -671,6 +633,7 @@ fn publish_active_projection(
     let mut derived = ActiveReceiptDeriver {
         home: home.clone(),
         entries: receipt_entries,
+        retained: &[],
     };
     let ingests = scanned.into_iter().map(|entry| {
         PackedProjectionIngest::File(ContiguousFileIngest::new(

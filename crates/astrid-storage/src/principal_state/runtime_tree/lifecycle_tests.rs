@@ -23,7 +23,7 @@ const ROOT_BYTES: &[u8] = b"root-v1\n";
 const PRIVATE_LOCK: &str = ".astrid-private-write.lock";
 const PRIVATE_JOURNAL: &str = ".astrid-private-write.transaction.json";
 
-fn fixture() -> (tempfile::TempDir, AstridHome) {
+pub(super) fn fixture() -> (tempfile::TempDir, AstridHome) {
     #[cfg(windows)]
     let root = tempfile::Builder::new()
         .prefix("astrid-restoration-")

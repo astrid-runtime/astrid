@@ -166,6 +166,16 @@ impl Inspection {
         })
     }
 
+    pub(super) fn open_writer(&self) -> io::Result<Projection> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "inspection-bound writer unavailable for {}",
+                self.root.display()
+            ),
+        ))
+    }
+
     fn path(&self, relative: &RelativePath) -> PathBuf {
         self.root.join(relative.0.iter().collect::<PathBuf>())
     }

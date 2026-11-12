@@ -5,7 +5,10 @@
 use std::fs::File;
 use std::io::Cursor;
 
-use crate::content::{ChunkingProfile, ContentIngest, ContentName, PrepareDerivedBatchContent};
+use crate::content::{
+    ChunkingProfile, ContentBatchExpectation, ContentBatchWriteOutcome, ContentIngest, ContentName,
+    PrepareDerivedBatchContent,
+};
 use crate::error::{StorageError, StorageResult};
 
 use super::{RuntimePrincipalStore, StateOwner};
@@ -86,6 +89,18 @@ impl RuntimePrincipalStore {
         removals: &'a [ContentName],
         derived: Option<&'a mut dyn PrepareDerivedBatchContent>,
     ) -> StorageResult<()> {
+        self.replace_contiguous_files_with_expectation(owner, files, removals, derived, None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn replace_contiguous_files_with_expectation<'a>(
+        &self,
+        owner: StateOwner,
+        files: impl IntoIterator<Item = PackedProjectionIngest>,
+        removals: &'a [ContentName],
+        derived: Option<&'a mut dyn PrepareDerivedBatchContent>,
+        expectation: Option<&'a ContentBatchExpectation>,
+    ) -> StorageResult<Option<ContentBatchWriteOutcome>> {
         let mut ingests = Vec::new();
         for file in files {
             let (name, source): (_, Box<dyn std::io::Read + Send>) = match file {
@@ -105,19 +120,34 @@ impl RuntimePrincipalStore {
         }
         if ingests.is_empty() {
             return if removals.is_empty() {
-                Ok(())
+                Ok(None)
             } else {
                 self.content
-                    .delete_batch(&owner, removals)
-                    .map(|_| ())
+                    .delete_batch_if(
+                        &owner,
+                        removals,
+                        expectation.unwrap_or(&ContentBatchExpectation::Any),
+                    )
+                    .map(|_| None)
                     .map_err(|error| {
                         StorageError::Internal(format!("remove packed home names: {error}"))
                     })
             };
         }
-        self.content
-            .replace_streaming_batch_removing_exact(&owner, ingests, removals, derived)
-            .map(|_| ())
+        let outcome = match expectation {
+            Some(expectation) => self.content.replace_streaming_batch_with_expectation(
+                &owner,
+                ingests,
+                removals,
+                derived,
+                Some(expectation),
+            ),
+            None => self
+                .content
+                .replace_streaming_batch_removing_exact(&owner, ingests, removals, derived),
+        };
+        outcome
+            .map(Some)
             .map_err(|error| StorageError::Internal(format!("replace packed home batch: {error}")))
     }
 }

@@ -375,6 +375,19 @@ impl ProjectionInspection {
         })
     }
 
+    pub(in crate::platform_fs) fn open_writer(&self) -> io::Result<ProjectionRoot> {
+        self.confirm_absolute_root()?;
+        let guard = self.guard.try_clone()?;
+        guard.verify_contract(BoundaryContract::ExactPrivateDirectory)?;
+        Ok(ProjectionRoot {
+            guard,
+            absolute: self.absolute.clone(),
+            identity: self.identity,
+            staging_scope: None,
+            pending_temporary: RefCell::new(None),
+        })
+    }
+
     pub(in crate::platform_fs) fn matches_private_directory(
         &self,
         relative: &[OsString],

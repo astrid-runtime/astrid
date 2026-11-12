@@ -443,7 +443,7 @@ pub(super) fn take_writer_opens(root: &std::path::Path) -> usize {
     tests::take_writer_opens(root)
 }
 
-mod names;
+pub(super) mod names;
 mod read;
 #[cfg(test)]
 mod read_tests;

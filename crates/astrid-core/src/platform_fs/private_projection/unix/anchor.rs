@@ -69,6 +69,16 @@ impl Root {
         })
     }
 
+    pub(super) fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            parent: self.parent.try_clone()?,
+            name: self.name.clone(),
+            file: self.file.try_clone()?,
+            identity: self.identity,
+            absolute: self.absolute.clone(),
+        })
+    }
+
     pub(super) fn validate(&self, boundary: &MountBoundary) -> io::Result<()> {
         validate_binding(&self.parent, &self.name, self.identity, boundary)
     }

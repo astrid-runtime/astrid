@@ -2,6 +2,8 @@
 
 #[cfg(not(target_family = "wasm"))]
 mod admission;
+#[cfg(test)]
+mod expectation_tests;
 mod publish;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -340,6 +342,21 @@ where
         R: Read + Send,
         I: IntoIterator<Item = ContentIngest<R>>,
     {
+        self.replace_streaming_batch_with_expectation(principal, ingests, removals, derived, None)
+    }
+
+    pub(crate) fn replace_streaming_batch_with_expectation<'a, R, I>(
+        &self,
+        principal: &P,
+        ingests: I,
+        removals: &'a [ContentName],
+        derived: Option<&'a mut dyn PrepareDerivedBatchContent>,
+        expectation: Option<&'a ContentBatchExpectation>,
+    ) -> Result<ContentBatchWriteOutcome, PrincipalContentError>
+    where
+        R: Read + Send,
+        I: IntoIterator<Item = ContentIngest<R>>,
+    {
         let ordered = ordered_ingests(ingests)?;
         validate_replacement_disjoint(&ordered, removals)?;
         let ingests = ordered
@@ -357,7 +374,10 @@ where
             BulkIngestPolicy::default(),
             None,
             false,
-            removing_exact(removals, derived),
+            BatchPublicationContext {
+                expectation,
+                ..removing_exact(removals, derived)
+            },
         )
         .map(|execution| execution.outcome)
     }

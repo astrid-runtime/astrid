@@ -290,6 +290,24 @@ impl TrustedPathGuard {
         Ok(result)
     }
 
+    pub(super) fn try_clone(&self) -> io::Result<Self> {
+        let components = self
+            .components
+            .iter()
+            .map(|component| {
+                Ok(LockedPathComponent {
+                    path: component.path.clone(),
+                    identity: component.identity,
+                    handle: descendant::duplicate_handle_same_access(component.handle.0)?,
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(Self {
+            components,
+            authority_boundary: self.authority_boundary.clone(),
+        })
+    }
+
     pub(super) fn verify(&self) -> io::Result<()> {
         let mut parent_handle: Option<OwnedHandle> = None;
         for component in &self.components {

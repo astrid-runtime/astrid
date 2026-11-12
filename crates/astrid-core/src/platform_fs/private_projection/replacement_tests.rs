@@ -207,3 +207,74 @@ fn rollback_never_repairs_unproven_parent_privacy() {
     );
     assert_eq!(fs::read(root.path().join(name)).unwrap(), b"ours");
 }
+
+#[test]
+fn inspection_bound_writer_updates_the_captured_private_root() {
+    let (parent, _native_guard) = private_root();
+    let root = parent.path().join("root");
+    crate::platform_fs::create_private_directory(&root).unwrap();
+    let inspection = super::PrivateProjectionInspection::try_open(&root).unwrap();
+    let writer = inspection.open_writer().unwrap();
+    writer.write(Path::new("nested/control"), b"bound").unwrap();
+    writer.sync().unwrap();
+    assert!(
+        inspection
+            .matches_private_file(Path::new("nested/control"), b"bound")
+            .unwrap()
+    );
+    inspection.confirm_absolute_root().unwrap();
+}
+
+#[test]
+fn inspection_bound_writer_rejects_replaced_root_or_ancestor() {
+    for replace_ancestor in [false, true] {
+        let (parent, _native_guard) = private_root();
+        let ancestor = parent.path().join("ancestor");
+        crate::platform_fs::create_private_directory(&ancestor).unwrap();
+        let root = ancestor.join("root");
+        crate::platform_fs::create_private_directory(&root).unwrap();
+        crate::platform_fs::atomic_write_private_file(&root.join("sentinel"), b"original").unwrap();
+        let inspection = super::PrivateProjectionInspection::try_open(&root).unwrap();
+        let moved = if replace_ancestor { &ancestor } else { &root };
+        let parked = parent.path().join("parked");
+        if let Err(error) = fs::rename(moved, &parked) {
+            #[cfg(windows)]
+            {
+                assert!(
+                    error.kind() == std::io::ErrorKind::PermissionDenied
+                        || error.raw_os_error()
+                            == Some(
+                                windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION
+                                    .cast_signed()
+                            ),
+                    "{error}"
+                );
+                eprintln!("captured Windows handles refused root/ancestor rename: {error}");
+                inspection.confirm_absolute_root().unwrap();
+                assert_eq!(fs::read(root.join("sentinel")).unwrap(), b"original");
+                continue;
+            }
+            #[cfg(unix)]
+            panic!("owned root/ancestor rename failed unexpectedly: {error}");
+        }
+        assert!(inspection.open_writer().is_err());
+        assert!(
+            !moved.exists(),
+            "a bound writer must not recreate a missing root"
+        );
+        crate::platform_fs::create_private_directory(moved).unwrap();
+        if replace_ancestor {
+            crate::platform_fs::create_private_directory(&root).unwrap();
+        }
+        crate::platform_fs::atomic_write_private_file(&root.join("sentinel"), b"foreign").unwrap();
+        assert!(inspection.open_writer().is_err());
+        assert_eq!(fs::read(root.join("sentinel")).unwrap(), b"foreign");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        let original = if replace_ancestor {
+            parked.join("root/sentinel")
+        } else {
+            parked.join("sentinel")
+        };
+        assert_eq!(fs::read(original).unwrap(), b"original");
+    }
+}

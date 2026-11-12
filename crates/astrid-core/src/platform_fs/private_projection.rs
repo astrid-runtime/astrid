@@ -202,6 +202,20 @@ impl PrivateProjectionInspection {
         })
     }
 
+    /// Derive a writer from this inspection's captured root authority.
+    ///
+    /// Reuses the captured identities and mount binding without creating or
+    /// repairing the root. Later operations retain the normal rooted fences.
+    ///
+    /// # Errors
+    /// Rejects changed or non-private root bindings, and unsupported backends.
+    pub fn open_writer(&self) -> io::Result<PrivateFileProjection> {
+        Ok(PrivateFileProjection {
+            platform: self.platform.open_writer()?,
+            binding: std::sync::Arc::new(()),
+        })
+    }
+
     /// Return whether `relative` is an existing private directory under the root.
     ///
     /// # Errors

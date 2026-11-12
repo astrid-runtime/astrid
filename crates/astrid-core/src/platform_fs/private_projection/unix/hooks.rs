@@ -6,6 +6,7 @@ use std::io;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Event {
+    BeforeBoundWriterClone,
     FileSynced,
     BeforeRename,
     BeforeUnlink,

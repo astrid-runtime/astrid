@@ -103,6 +103,12 @@ impl Inspection {
         })
     }
 
+    pub(super) fn open_writer(&self) -> io::Result<Projection> {
+        Ok(Projection {
+            inner: self.inner.open_writer()?,
+        })
+    }
+
     pub(super) fn matches_private_directory(&self, relative: &RelativePath) -> io::Result<bool> {
         self.inner.matches_private_directory(&relative.0)
     }

@@ -1,8 +1,8 @@
 //! Boot-time admission of the host runtime tree into packed system content.
 //!
-//! Admission runs in the singleton-owned migrate-only window. The receipt is
-//! host migration metadata, not runtime content, so the packed catalog remains
-//! the authority once the barrier completes.
+//! Admission runs in the singleton-owned migrate-only window. Its migration
+//! receipt is published as system content with the ACTIVE inventory; the packed
+//! catalog remains the authority once the barrier completes.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -10,9 +10,7 @@ use std::io;
 use std::path::Path;
 
 use astrid_core::dirs::AstridHome;
-use astrid_storage::{
-    ContentName, ContiguousFileIngest, RuntimePrincipalStore, RuntimeTreeEntry, StateOwner,
-};
+use astrid_storage::{ContentName, RuntimePrincipalStore, RuntimeTreeEntry, StateOwner};
 use serde::{Deserialize, Serialize};
 
 const RECEIPT_NAME: &str = "runtime-tree-v1.json";
@@ -43,6 +41,7 @@ impl RuntimeTreeReceipt {
             schema: RECEIPT_SCHEMA,
             entries: entries
                 .iter()
+                .filter(|entry| entry.name().as_str() != RECEIPT_RELATIVE_PATH)
                 .map(|entry| RuntimeTreeReceiptEntry {
                     name: entry.name().as_str().to_owned(),
                     bytes: entry.logical_bytes(),
@@ -53,13 +52,18 @@ impl RuntimeTreeReceipt {
     }
 
     fn matches_entries(&self, entries: &[RuntimeTreeEntry]) -> bool {
+        let mut actual = entries
+            .iter()
+            .filter(|entry| entry.name().as_str() != RECEIPT_RELATIVE_PATH);
         self.schema == RECEIPT_SCHEMA
-            && self.entries.len() == entries.len()
-            && self.entries.iter().zip(entries).all(|(receipt, entry)| {
-                receipt.name == entry.name().as_str()
-                    && receipt.bytes == entry.logical_bytes()
-                    && receipt.modified_nanos == entry.modified_nanos()
+            && self.entries.iter().all(|receipt| {
+                actual.next().is_some_and(|entry| {
+                    receipt.name == entry.name().as_str()
+                        && receipt.bytes == entry.logical_bytes()
+                        && receipt.modified_nanos == entry.modified_nanos()
+                })
             })
+            && actual.next().is_none()
     }
 }
 
@@ -68,8 +72,8 @@ impl RuntimeTreeReceipt {
 /// The blocking walk and packed publication run off the async executor. A
 /// receipt is written only after a second metadata scan agrees with the first,
 /// so a source mutation during ingest cannot be mistaken for a completed
-/// admission. The receipt itself is runtime content, so it is published in a
-/// second batch after the receipt is written.
+/// admission. The receipt and ACTIVE inventory publish together using the
+/// already committed payload identities.
 pub(crate) async fn admit(home: &AstridHome, store: &RuntimePrincipalStore) -> io::Result<()> {
     let home = home.clone();
     let store = store.clone();
@@ -91,53 +95,20 @@ fn admit_blocking(home: &AstridHome, store: &RuntimePrincipalStore) -> io::Resul
         return Ok(());
     }
 
-    store
-        .admit_runtime_tree(home.root())
-        .map_err(storage_error)?;
+    let admission = store.admit_runtime_tree_snapshot(
+        home,
+        &entries,
+        ContentName::new(RECEIPT_RELATIVE_PATH).map_err(io::Error::other)?,
+    )?;
     #[cfg(test)]
     run_source_mutation_hook(home)?;
-    let after = scan(store, home.root())?;
-    if !RuntimeTreeReceipt::from_entries(&entries).matches_entries(&after) {
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "runtime tree changed while packed admission was in progress",
-        ));
-    }
-    let receipt = RuntimeTreeReceipt::from_entries(&after);
+    let receipt = RuntimeTreeReceipt::from_entries(&entries);
     let bytes = serde_json::to_vec(&receipt).map_err(io::Error::other)?;
-    astrid_core::platform_fs::ensure_private_directory(&home.migrations_dir())?;
-    astrid_core::platform_fs::atomic_write_private_file(&receipt_path, &bytes)?;
-    admit_receipt(store, &receipt_path)?;
-    store
-        .establish_runtime_projection_receipt(home)
-        .map_err(storage_error)
-}
-
-fn admit_receipt(store: &RuntimePrincipalStore, receipt_path: &Path) -> io::Result<()> {
-    let name = ContentName::new(RECEIPT_RELATIVE_PATH.to_owned()).map_err(io::Error::other)?;
-    let bytes = fs::metadata(receipt_path)?.len();
-    store
-        .put_contiguous_files(
-            StateOwner::System,
-            [ContiguousFileIngest::new(
-                name,
-                receipt_path.to_owned(),
-                bytes,
-            )],
-        )
-        .map_err(storage_error)
+    admission.finish(bytes)
 }
 
 fn scan(store: &RuntimePrincipalStore, root: &Path) -> io::Result<Vec<RuntimeTreeEntry>> {
-    store
-        .scan_runtime_tree(root)
-        .map(|entries| {
-            entries
-                .into_iter()
-                .filter(|entry| entry.name().as_str() != RECEIPT_RELATIVE_PATH)
-                .collect()
-        })
-        .map_err(storage_error)
+    store.scan_runtime_tree(root).map_err(storage_error)
 }
 
 fn catalog_contains_entries(
@@ -154,6 +125,7 @@ fn catalog_contains_entries(
         .collect::<BTreeMap<_, _>>();
     Ok(entries
         .iter()
+        .filter(|entry| entry.name().as_str() != RECEIPT_RELATIVE_PATH)
         .all(|entry| catalog_sizes.get(entry.name().as_str()) == Some(&entry.logical_bytes())))
 }
 
@@ -254,6 +226,54 @@ mod tests {
         })
     }
 
+    fn private_home_fixture() -> (tempfile::TempDir, AstridHome) {
+        #[cfg(windows)]
+        let parent = tempfile::Builder::new()
+            .prefix("astrid-boot-admission-")
+            .tempdir_in(std::env::var_os("LOCALAPPDATA").expect("local app data"))
+            .unwrap();
+        #[cfg(not(windows))]
+        let parent = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(parent.path().join("home"));
+        home.ensure().unwrap();
+        (parent, home)
+    }
+
+    struct ScanObserver(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl tracing::Subscriber for ScanObserver {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.is_event() && metadata.target() == "astrid_storage::runtime_tree_scan"
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn cold_admission_walks_source_only_for_snapshot_and_final_check() {
+        let (_directory, home) = private_home_fixture();
+        let store = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tracing::subscriber::with_default(ScanObserver(Arc::clone(&calls)), || {
+            admit_blocking(&home, &store).unwrap();
+        });
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "observe every real storage source-walk boundary, including kernel calls"
+        );
+    }
+
     #[tokio::test]
     async fn admits_runtime_tree_once_and_reopens_from_preclose_copy() {
         let home_dir = tempfile::tempdir().unwrap();
@@ -305,6 +325,56 @@ mod tests {
                 .is_err()
         );
         assert!(fs::read_to_string(home.migrations_dir().join(RECEIPT_NAME)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn same_size_host_edit_is_persisted_then_warm_admission_is_unchanged() {
+        let (_directory, home) = private_home_fixture();
+        let store = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
+        let path = home.root().join("config.toml");
+        fs::write(&path, b"old").unwrap();
+        admit(&home, &store).await.unwrap();
+        fs::write(&path, b"new").unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+            .unwrap();
+        admit(&home, &store).await.unwrap();
+        let name = ContentName::new("config.toml").unwrap();
+        assert_eq!(
+            store.content().read(&StateOwner::System, &name).unwrap(),
+            Some(b"new".to_vec())
+        );
+        let before = fs::metadata(home.storage_volume_path()).unwrap().len();
+        admit(&home, &store).await.unwrap();
+        assert_eq!(
+            fs::metadata(home.storage_volume_path()).unwrap().len(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_migration_receipt_is_a_hard_error_without_publication() {
+        let (_directory, home) = private_home_fixture();
+        let store = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
+        astrid_core::platform_fs::atomic_write_private_file(
+            &home.migrations_dir().join(RECEIPT_NAME),
+            b"{",
+        )
+        .unwrap();
+        let before = fs::metadata(home.storage_volume_path()).unwrap().len();
+        assert_eq!(
+            admit(&home, &store).await.unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            fs::metadata(home.storage_volume_path()).unwrap().len(),
+            before
+        );
     }
 
     #[tokio::test]

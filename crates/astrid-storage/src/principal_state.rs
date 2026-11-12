@@ -101,7 +101,7 @@ use format_amendment::{
     prepare_format_specification, store_metadata,
 };
 use native_io::atomic_write;
-pub use runtime_tree::RuntimeTreeEntry;
+pub use runtime_tree::{RuntimeTreeEntry, admission::RuntimeTreeAdmission};
 pub use staging::{
     NativeContentStagingArea, ReadyStagedContent, StagedContentId, StagedContentWriter,
 };

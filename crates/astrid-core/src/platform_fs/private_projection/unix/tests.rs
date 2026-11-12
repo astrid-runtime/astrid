@@ -559,3 +559,51 @@ fn write_from_retries_interrupted_data_and_eof_reads() {
     projection.sync().unwrap();
     assert_eq!(fs::read(directory.path().join("state")).unwrap(), payload);
 }
+
+#[test]
+fn inspection_bound_writer_does_not_repair_a_mid_factory_root_swap() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("root");
+    crate::platform_fs::create_private_directory(&root).unwrap();
+    let inspection = crate::platform_fs::PrivateProjectionInspection::try_open(&root).unwrap();
+    let captured = root.clone();
+    let parked = parent.path().join("parked");
+    let hook = hooks::install(move |event| {
+        if event == Event::BeforeBoundWriterClone {
+            fs::rename(&captured, &parked)?;
+            fs::create_dir(&captured)?;
+            fs::set_permissions(&captured, fs::Permissions::from_mode(0o755))?;
+            fs::write(captured.join("foreign"), b"foreign")?;
+        }
+        Ok(())
+    });
+    assert!(inspection.open_writer().is_err());
+    drop(hook);
+    assert_eq!(
+        fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+    assert_eq!(fs::read(root.join("foreign")).unwrap(), b"foreign");
+}
+
+#[test]
+fn inspection_bound_writer_does_not_repair_changed_privacy() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("root");
+    crate::platform_fs::create_private_directory(&root).unwrap();
+    let inspection = crate::platform_fs::PrivateProjectionInspection::try_open(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(inspection.open_writer().is_err());
+    assert_eq!(
+        fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    // Recovery-intent callers retain the explicit ordinary repair constructor.
+    let writer = PrivateFileProjection::open(&root).unwrap();
+    assert_eq!(
+        fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    writer.sync().unwrap();
+}

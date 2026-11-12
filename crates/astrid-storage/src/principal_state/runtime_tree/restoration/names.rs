@@ -7,6 +7,7 @@ use std::ops::ControlFlow;
 #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 use std::path::{Path, PathBuf};
 
+use super::super::RuntimeTreeEntry;
 use super::{AstridHome, ContentEntry, ContentName, StorageResult, tree_error};
 use crate::content::{
     ProjectionNamePolicy, RawProjectionCollision, find_raw_projection_collision,
@@ -21,6 +22,35 @@ use crate::content::{
 use crate::error::StorageError;
 #[cfg(windows)]
 use astrid_core::platform_fs::name_semantics::windows_nt_utf16_upcase_key;
+
+/// Borrow only the names needed by the shared namespace validator.
+#[derive(Clone, Copy)]
+enum Names<'a> {
+    Catalog(&'a [ContentEntry]),
+    Admission {
+        snapshot: &'a [RuntimeTreeEntry],
+        control: &'a ContentName,
+    },
+}
+
+impl<'a> Names<'a> {
+    fn iter(self) -> impl Iterator<Item = &'a ContentName> {
+        let (catalog, snapshot, control): (&[ContentEntry], &[RuntimeTreeEntry], _) = match self {
+            Self::Catalog(entries) => (entries, &[], None),
+            Self::Admission { snapshot, control } => (&[], snapshot, Some(control)),
+        };
+        catalog
+            .iter()
+            .map(ContentEntry::name)
+            .chain(
+                snapshot
+                    .iter()
+                    .map(RuntimeTreeEntry::name)
+                    .filter(move |name| Some(*name) != control),
+            )
+            .chain(control)
+    }
+}
 
 /// Exclusion spellings re-seeded into projection admission.
 ///
@@ -87,7 +117,7 @@ fn protected_sentinel_names(home: &AstridHome) -> Vec<ContentName> {
 #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 fn reject_excluded_run_aliases_on_caseless_host<K>(
     home: &AstridHome,
-    entries: &[ContentEntry],
+    entries: Names<'_>,
     mut key_for: impl FnMut(&str) -> K,
     label: &str,
 ) -> StorageResult<()>
@@ -97,8 +127,8 @@ where
     let run_key = key_for(super::super::TRANSIENT_PREFIX);
     let capsules_key = key_for("capsules");
     let mut cache = HashMap::<PathBuf, bool>::new();
-    for entry in entries {
-        let name = entry.name().as_str();
+    for entry in entries.iter() {
+        let name = entry.as_str();
         let mut parts = name.split('/');
         let Some(first) = parts.next() else { continue };
         if key_for(first) != run_key {
@@ -142,8 +172,20 @@ fn noncanonical_spelling_message(name: &str) -> String {
 }
 
 pub(super) fn validate(home: &AstridHome, entries: &[ContentEntry]) -> StorageResult<()> {
-    for entry in entries {
-        let name = entry.name().as_str();
+    validate_names(home, Names::Catalog(entries))
+}
+
+pub(in crate::principal_state::runtime_tree) fn validate_admission(
+    home: &AstridHome,
+    snapshot: &[RuntimeTreeEntry],
+    control: &ContentName,
+) -> StorageResult<()> {
+    validate_names(home, Names::Admission { snapshot, control })
+}
+
+fn validate_names(home: &AstridHome, entries: Names<'_>) -> StorageResult<()> {
+    for entry in entries.iter() {
+        let name = entry.as_str();
         if !raw_projection_spelling_is_canonical(name) {
             return Err(tree_error(home.root(), noncanonical_spelling_message(name)));
         }
@@ -153,16 +195,12 @@ pub(super) fn validate(home: &AstridHome, entries: &[ContentEntry]) -> StorageRe
 
     // Exact structural: peers first (full prefixes), then protected authority.
     let exact = ProjectionNamePolicy::posix_exact_v1();
-    if let Some(collision) =
-        find_raw_projection_collision(exact, entries.iter().map(ContentEntry::name))
-    {
+    if let Some(collision) = find_raw_projection_collision(exact, entries.iter()) {
         return Err(collision_error(home, exact, &collision));
     }
-    if let Some(collision) = find_raw_protected_authority_collision(
-        exact,
-        &sentinels,
-        entries.iter().map(ContentEntry::name),
-    ) {
+    if let Some(collision) =
+        find_raw_protected_authority_collision(exact, &sentinels, entries.iter())
+    {
         return Err(collision_error(home, exact, &collision));
     }
 
@@ -198,16 +236,12 @@ pub(super) fn validate(home: &AstridHome, entries: &[ContentEntry]) -> StorageRe
     let Some(policy) = selected else {
         return Ok(());
     };
-    if let Some(collision) =
-        find_raw_projection_collision(policy, entries.iter().map(ContentEntry::name))
-    {
+    if let Some(collision) = find_raw_projection_collision(policy, entries.iter()) {
         return Err(collision_error(home, policy, &collision));
     }
-    if let Some(collision) = find_raw_protected_authority_collision(
-        policy,
-        &sentinels,
-        entries.iter().map(ContentEntry::name),
-    ) {
+    if let Some(collision) =
+        find_raw_protected_authority_collision(policy, &sentinels, entries.iter())
+    {
         return Err(collision_error(home, policy, &collision));
     }
     Ok(())
@@ -241,7 +275,7 @@ fn collision_error_under(
 fn macos_policy(
     home: &AstridHome,
     sentinels: &[ContentName],
-    entries: &[ContentEntry],
+    entries: Names<'_>,
 ) -> StorageResult<Option<ProjectionNamePolicy>> {
     let folded = ProjectionNamePolicy::unicode_canonical_caseless_v1();
     if !platform_has_folded_collision(folded, sentinels, entries) {
@@ -261,7 +295,7 @@ fn macos_policy(
 fn windows_policy(
     home: &AstridHome,
     sentinels: &[ContentName],
-    entries: &[ContentEntry],
+    entries: Names<'_>,
 ) -> StorageResult<Option<ProjectionNamePolicy>> {
     // Admission uses the process NT ordinal UTF-16 upcase table
     // (`RtlUpcaseUnicodeChar`). Full Unicode folding can expand one code unit
@@ -287,7 +321,7 @@ fn windows_policy(
 fn linux_policy(
     home: &AstridHome,
     sentinels: &[ContentName],
-    entries: &[ContentEntry],
+    entries: Names<'_>,
 ) -> StorageResult<Option<ProjectionNamePolicy>> {
     let folded = ProjectionNamePolicy::unicode_canonical_caseless_v1();
     // Fast path: no peer or protected-authority aliases under the conservative
@@ -309,40 +343,31 @@ fn linux_policy(
 fn platform_has_folded_collision(
     folded: ProjectionNamePolicy,
     sentinels: &[ContentName],
-    entries: &[ContentEntry],
+    entries: Names<'_>,
 ) -> bool {
-    find_raw_projection_collision(folded, entries.iter().map(ContentEntry::name)).is_some()
-        || find_raw_protected_authority_collision(
-            folded,
-            sentinels,
-            entries.iter().map(ContentEntry::name),
-        )
-        .is_some()
+    find_raw_projection_collision(folded, entries.iter()).is_some()
+        || find_raw_protected_authority_collision(folded, sentinels, entries.iter()).is_some()
 }
 
 #[cfg(windows)]
 fn platform_has_key_collision<K: Ord>(
     sentinels: &[ContentName],
-    entries: &[ContentEntry],
+    entries: Names<'_>,
     mut key_for: impl FnMut(&str) -> K,
 ) -> bool {
     use std::ops::ControlFlow;
 
     let mut found = false;
-    visit_raw_projection_collisions_with_key(
-        entries.iter().map(ContentEntry::name),
-        &mut key_for,
-        |_| {
-            found = true;
-            ControlFlow::Break(())
-        },
-    );
+    visit_raw_projection_collisions_with_key(entries.iter(), &mut key_for, |_| {
+        found = true;
+        ControlFlow::Break(())
+    });
     if found {
         return true;
     }
     visit_raw_protected_authority_collisions_with_key(
         sentinels,
-        entries.iter().map(ContentEntry::name),
+        entries.iter(),
         &mut key_for,
         |_| {
             found = true;
@@ -363,7 +388,7 @@ fn platform_has_key_collision<K: Ord>(
 fn reject_host_unrepresentable_collisions(
     home: &AstridHome,
     sentinels: &[ContentName],
-    entries: &[ContentEntry],
+    entries: Names<'_>,
     folded: ProjectionNamePolicy,
     exact: ProjectionNamePolicy,
 ) -> StorageResult<()> {
@@ -371,22 +396,13 @@ fn reject_host_unrepresentable_collisions(
     let mut cache = HashMap::<PathBuf, bool>::new();
     let mut failure = None::<StorageError>;
     // Peers first — do not let seed presence shadow entry↔entry collisions.
-    visit_raw_projection_collisions(
-        folded,
-        entries.iter().map(ContentEntry::name),
-        |collision| {
-            consider_host_collision(home, &collision, &label, exact, &mut cache, &mut failure)
-        },
-    );
+    visit_raw_projection_collisions(folded, entries.iter(), |collision| {
+        consider_host_collision(home, &collision, &label, exact, &mut cache, &mut failure)
+    });
     if failure.is_none() {
-        visit_raw_protected_authority_collisions(
-            folded,
-            sentinels,
-            entries.iter().map(ContentEntry::name),
-            |collision| {
-                consider_host_collision(home, &collision, &label, exact, &mut cache, &mut failure)
-            },
-        );
+        visit_raw_protected_authority_collisions(folded, sentinels, entries.iter(), |collision| {
+            consider_host_collision(home, &collision, &label, exact, &mut cache, &mut failure)
+        });
     }
     match failure {
         Some(error) => Err(error),
@@ -398,7 +414,7 @@ fn reject_host_unrepresentable_collisions(
 fn reject_host_unrepresentable_collisions_with_key<K>(
     home: &AstridHome,
     sentinels: &[ContentName],
-    entries: &[ContentEntry],
+    entries: Names<'_>,
     mut key_for: impl FnMut(&str) -> K,
     folded_label: &str,
     exact: ProjectionNamePolicy,
@@ -408,24 +424,20 @@ where
 {
     let mut cache = HashMap::<PathBuf, bool>::new();
     let mut failure = None::<StorageError>;
-    visit_raw_projection_collisions_with_key(
-        entries.iter().map(ContentEntry::name),
-        &mut key_for,
-        |collision| {
-            consider_host_collision(
-                home,
-                &collision,
-                folded_label,
-                exact,
-                &mut cache,
-                &mut failure,
-            )
-        },
-    );
+    visit_raw_projection_collisions_with_key(entries.iter(), &mut key_for, |collision| {
+        consider_host_collision(
+            home,
+            &collision,
+            folded_label,
+            exact,
+            &mut cache,
+            &mut failure,
+        )
+    });
     if failure.is_none() {
         visit_raw_protected_authority_collisions_with_key(
             sentinels,
-            entries.iter().map(ContentEntry::name),
+            entries.iter(),
             &mut key_for,
             |collision| {
                 consider_host_collision(
