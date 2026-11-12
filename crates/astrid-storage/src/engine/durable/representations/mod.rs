@@ -31,6 +31,9 @@ mod digest;
 mod format;
 use digest::{digest_journal_file, digest_journal_prefix, journal_byte_len};
 mod index_validation;
+pub(super) use index_validation::GenerationZeroIndex;
+#[cfg(test)]
+pub(super) use index_validation::count_extractions_during;
 mod recovery;
 mod residency;
 
@@ -724,40 +727,9 @@ impl RepresentationStore {
             .map_err(|source| io_error("flush representation state journal", source))
     }
 
-    /// Return the arena prefix proven durable by published physical state.
-    ///
-    /// A malformed frame below this boundary is corruption, not a repairable
-    /// uncommitted tail. Recovery consults this value before it may truncate
-    /// the logical arena.
-    pub(super) fn generation_zero_protected_len(&self) -> Result<u64, DurableError> {
-        self.direct_arena_locations()?
-            .into_iter()
-            .try_fold(0_u64, |protected, (_, location)| {
-                let end = location
-                    .offset
-                    .checked_add(FRAME_HEADER_LEN)
-                    .and_then(|value| value.checked_add(location.payload_len))
-                    .ok_or(DurableError::EncodingOverflow)?;
-                Ok(protected.max(end))
-            })
-    }
-
-    /// Validate that generation-zero placements name the recovered arena
-    /// index exactly.
-    ///
-    /// This is mount-time topology validation, not an implicit full-store
-    /// scrub. Authoritative object reads verify the named frame checksum,
-    /// canonical encoding, and logical identity before returning bytes. A
-    /// scheduled refinery pass owns proactive full-corpus re-attestation.
-    pub(super) fn validate_generation_zero_index(
-        &self,
-        index: &BTreeMap<ObjectId, ArenaLocation>,
-    ) -> Result<(), DurableError> {
-        let direct = self.direct_arena_locations()?;
-        index_validation::validate(&direct, index)
-    }
-
     fn direct_arena_locations(&self) -> Result<Vec<(ObjectId, ArenaLocation)>, DurableError> {
+        #[cfg(test)]
+        index_validation::DIRECT_EXTRACTIONS.with(|count| count.set(count.get().strict_add(1)));
         let mut direct = Vec::new();
         for (object, records) in &self.reverse {
             let record = records

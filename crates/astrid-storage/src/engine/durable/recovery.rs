@@ -1,5 +1,8 @@
 //! Authoritative startup and in-process recovery for the durable engine.
 
+#[cfg(test)]
+mod tests;
+
 use super::wal::{durable_error as wal_durable_error, recover_wal};
 use super::{
     ARENA_FILE, ArenaReader, DurableEngine, DurableError, DurableFiles, DurableInner, DurableWal,
@@ -48,10 +51,9 @@ where
     recover_interrupted_compaction(store_root, principal_codec, identity, limits)?;
     let mut representations =
         super::representations::RepresentationStore::open(store_root, limits)?;
-    let protected_arena_len = representations.as_ref().map_or(
-        Ok(0),
-        super::representations::RepresentationStore::generation_zero_protected_len,
-    )?;
+    let generation_zero =
+        super::representations::GenerationZeroIndex::capture(representations.as_ref())?;
+    let protected_arena_len = generation_zero.protected_len();
     let mut arena = open_rw_capability(store_root, Path::new(ARENA_FILE), true)?;
     let mut roots = open_rw_capability(store_root, Path::new(ROOT_FILE), true)?;
     let mut index_cache = open_rw_capability(store_root, Path::new(INDEX_FILE), true).ok();
@@ -84,9 +86,7 @@ where
         index_cache = Some(replace_index(store_root, &state, scheme, faults)?);
         (state.objects, state.arena_tail)
     };
-    if let Some(representations) = &mut representations {
-        representations.validate_generation_zero_index(&index)?;
-    }
+    generation_zero.validate(&index)?;
     let mut index = index;
     let wal_writer = if let Some(wal_file) = wal_file {
         Some(replay_transaction_wal(
@@ -164,10 +164,9 @@ where
         .map_err(|source| io_error("flush Astrid volume namespace", source))?;
     let mut representations =
         super::representations::RepresentationStore::open_volume(volume, limits)?;
-    let protected_arena_len = representations.as_ref().map_or(
-        Ok(0),
-        super::representations::RepresentationStore::generation_zero_protected_len,
-    )?;
+    let generation_zero =
+        super::representations::GenerationZeroIndex::capture(representations.as_ref())?;
+    let protected_arena_len = generation_zero.protected_len();
     let (index, arena_tail) = recover_volume_index(
         volume,
         &mut arena,
@@ -177,9 +176,7 @@ where
         protected_arena_len,
         faults,
     )?;
-    if let Some(store) = &mut representations {
-        store.validate_generation_zero_index(&index)?;
-    }
+    generation_zero.validate(&index)?;
     let mut index = index;
     let wal_writer = if let Some(wal_file) = wal_file {
         Some(replay_transaction_wal(

@@ -1,6 +1,73 @@
 //! Mount-time correspondence between direct replicas and the recovered index.
 
-use super::{ArenaLocation, BTreeMap, DurableError, ObjectId};
+use super::{
+    ArenaLocation, BTreeMap, DurableError, FRAME_HEADER_LEN, ObjectId, RepresentationStore,
+};
+
+#[cfg(test)]
+std::thread_local! {
+    pub(super) static DIRECT_EXTRACTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(in crate::engine::durable) fn count_extractions_during<T>(
+    operation: impl FnOnce() -> T,
+) -> (T, usize) {
+    DIRECT_EXTRACTIONS.with(|count| count.set(0));
+    let value = operation();
+    (value, DIRECT_EXTRACTIONS.with(std::cell::Cell::get))
+}
+
+/// One recovery-local placement snapshot, consumed before WAL replay can
+/// advance representation authority. Arena repair and index validation must
+/// consult the same checked placements. A malformed frame below the protected
+/// prefix is corruption, never a repairable uncommitted arena tail.
+///
+/// Index correspondence is mount-time topology validation. Authoritative reads
+/// still verify frame checksums, canonical encoding, and logical identity;
+/// proactive full-corpus re-attestation belongs to the refinery.
+pub(in crate::engine::durable) struct GenerationZeroIndex {
+    direct: Vec<(ObjectId, ArenaLocation)>,
+    protected_len: u64,
+}
+
+impl GenerationZeroIndex {
+    pub(in crate::engine::durable) fn capture(
+        representations: Option<&RepresentationStore>,
+    ) -> Result<Self, DurableError> {
+        let direct = representations
+            .map(RepresentationStore::direct_arena_locations)
+            .transpose()?
+            .unwrap_or_default();
+        Self::from_locations(direct)
+    }
+
+    fn from_locations(direct: Vec<(ObjectId, ArenaLocation)>) -> Result<Self, DurableError> {
+        let protected_len = direct.iter().try_fold(0_u64, |protected, (_, location)| {
+            let end = location
+                .offset
+                .checked_add(FRAME_HEADER_LEN)
+                .and_then(|value| value.checked_add(location.payload_len))
+                .ok_or(DurableError::EncodingOverflow)?;
+            Ok::<_, DurableError>(protected.max(end))
+        })?;
+        Ok(Self {
+            direct,
+            protected_len,
+        })
+    }
+
+    pub(in crate::engine::durable) fn protected_len(&self) -> u64 {
+        self.protected_len
+    }
+
+    pub(in crate::engine::durable) fn validate(
+        self,
+        index: &BTreeMap<ObjectId, ArenaLocation>,
+    ) -> Result<(), DurableError> {
+        validate(&self.direct, index)
+    }
+}
 
 pub(super) fn validate(
     direct: &[(ObjectId, ArenaLocation)],
@@ -37,6 +104,27 @@ mod tests {
             payload_len: 8,
             checksum: [0; 32],
         }
+    }
+
+    #[test]
+    fn snapshot_checks_every_replica_end_before_recovery() {
+        let object = ObjectId::new([1; 32]);
+        let snapshot = GenerationZeroIndex::from_locations(vec![
+            (object, location(1)),
+            (object, location(100)),
+        ])
+        .unwrap();
+        assert_eq!(snapshot.protected_len(), 100 + FRAME_HEADER_LEN + 8);
+        snapshot
+            .validate(&BTreeMap::from([(object, location(1))]))
+            .unwrap();
+        assert!(matches!(
+            GenerationZeroIndex::from_locations(vec![(object, location(u64::MAX))]),
+            Err(DurableError::EncodingOverflow)
+        ));
+        let absent = GenerationZeroIndex::capture(None).unwrap();
+        assert_eq!(absent.protected_len(), 0);
+        absent.validate(&BTreeMap::new()).unwrap();
     }
 
     #[test]
