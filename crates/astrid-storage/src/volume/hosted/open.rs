@@ -68,6 +68,40 @@ impl HostedFileVolume {
     /// checkpoints additionally verify every referenced immutable metadata
     /// page with bounded working memory before exposing the namespace.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Arc<Self>> {
+        Self::open_with_retained(
+            path,
+            #[cfg(windows)]
+            None,
+        )
+    }
+
+    /// Open a volume file under an already-admitted Windows runtime root.
+    ///
+    /// `path` must be a direct child of the retained root (root-level media).
+    /// Recovery/reclaim algorithms match [`Self::open`].
+    #[cfg(windows)]
+    pub(crate) fn open_runtime(
+        retained_root: std::sync::Arc<
+            astrid_core::platform_fs::directory_capability::RetainedPrivateRoot,
+        >,
+        path: impl AsRef<Path>,
+    ) -> io::Result<Arc<Self>> {
+        let path = std::path::absolute(path.as_ref())?;
+        if path.parent() != Some(retained_root.path()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Astrid volume path is outside the admitted runtime root",
+            ));
+        }
+        Self::open_with_retained(path, Some(retained_root))
+    }
+
+    fn open_with_retained(
+        path: impl AsRef<Path>,
+        #[cfg(windows)] retained_root: Option<
+            std::sync::Arc<astrid_core::platform_fs::directory_capability::RetainedPrivateRoot>,
+        >,
+    ) -> io::Result<Arc<Self>> {
         // Capture relative-path ownership once; later sync and reclaim must
         // still target this volume if the process changes its directory.
         let path = std::path::absolute(path.as_ref())?;
@@ -136,6 +170,8 @@ impl HostedFileVolume {
             path,
             open_lock,
             state: Mutex::new(state),
+            #[cfg(windows)]
+            _retained_root: retained_root,
         }))
     }
 }

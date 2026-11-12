@@ -72,6 +72,8 @@ mod owner_migration;
 mod projection_name_tests;
 #[cfg(all(test, feature = "legacy-surrealkv"))]
 mod release_fixture_tests;
+#[cfg(windows)]
+mod runtime_root_admission;
 #[cfg(test)]
 mod runtime_tests;
 mod runtime_tree;

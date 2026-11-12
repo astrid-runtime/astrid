@@ -355,6 +355,16 @@ impl TrustedPathGuard {
             .identity
     }
 
+    /// Duplicate the final authority handle as a `std::fs::File`.
+    ///
+    /// Uses `DuplicateHandle(DUPLICATE_SAME_ACCESS)` so the File keeps the
+    /// same no-delete sharing that fences ancestor rename while this owner
+    /// lives. Does not reopen by path and does not re-query identity.
+    pub(super) fn duplicate_authority_file(&self) -> io::Result<File> {
+        let handle = descendant::duplicate_handle_same_access(self.authority_handle())?;
+        Ok(File::from(handle))
+    }
+
     /// Create missing private descendants with paired child+parent NTFS fences.
     ///
     /// Each newly created component is flushed, then its parent namespace is

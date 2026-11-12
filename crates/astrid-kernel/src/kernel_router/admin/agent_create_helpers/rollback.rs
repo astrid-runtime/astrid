@@ -52,7 +52,7 @@ async fn rollback_with_initialization(
     match rollback_derived_principal(kernel, principal, initialization, views).await {
         Ok(()) => original,
         Err(error) => err_internal(format!(
-            "derived principal provisioning failed and rollback could not complete: {error}"
+            "derived principal provisioning failed ({original:?}) and rollback could not complete: {error}"
         )),
     }
 }
@@ -64,7 +64,7 @@ async fn rollback_derived_principal(
     views: Vec<crate::CapsuleViewGuard>,
 ) -> Result<(), String> {
     let pending = prepare_rollback(kernel, principal, initialization).await?;
-    reclaim_derived_principal(kernel, principal, pending, views).await
+    reclaim_derived_principal(kernel, principal, pending, views, initialization).await
 }
 
 async fn prepare_rollback(
@@ -97,6 +97,7 @@ async fn reclaim_derived_principal(
     principal: &PrincipalId,
     pending: super::super::agent_delete::PendingIdentityRemoval,
     views: Vec<crate::CapsuleViewGuard>,
+    initialization: Option<&astrid_storage::ownership::PrincipalInitialization>,
 ) -> Result<(), String> {
     fence_failed_initialization(kernel, principal, views).await?;
     kernel
@@ -123,8 +124,16 @@ async fn reclaim_derived_principal(
                 })
         })
         .transpose()
-        .map_err(|error| format!("list durable capsule packages: {error}"))?
+        .map_err(|error| {
+            cleanup_errors.push(format!("list durable capsule packages: {error}"));
+            cleanup_errors.join("; ")
+        })?
         .unwrap_or_default();
+    if initialization.is_some()
+        && let Some(uid) = pending.principal_uid()
+    {
+        reclaim_initializing_installs(kernel, uid, &capsule_ids, &mut cleanup_errors);
+    }
     for capsule in capsule_ids {
         if let Err(error) = kernel
             .kv
@@ -134,11 +143,6 @@ async fn reclaim_derived_principal(
             cleanup_errors.push(format!("KV namespace for capsule '{capsule}': {error}"));
         }
     }
-    collect_remove_file(
-        &principal_profile_path(kernel, principal),
-        "profile",
-        &mut cleanup_errors,
-    );
     collect_remove_dir(
         kernel.astrid_home.principal_home(principal).root(),
         "principal home",
@@ -158,7 +162,10 @@ async fn reclaim_derived_principal(
             &kernel.astrid_home,
             uid,
         )
-        .map_err(|error| format!("legacy secret migration provenance: {error}"))?,
+        .map_err(|error| {
+            cleanup_errors.push(format!("legacy secret migration provenance: {error}"));
+            cleanup_errors.join("; ")
+        })?,
         None => false,
     };
     if let Err(error) = super::super::agent_delete::reclaim_legacy_secret_root(
@@ -178,9 +185,49 @@ async fn reclaim_derived_principal(
         // acquire fresh authority.
         return Err(cleanup_errors.join("; "));
     }
+    // Reclamation resolves quota through this profile. Keep it available for
+    // retry if any package, KV or native cleanup above failed.
+    collect_remove_file(
+        &principal_profile_path(kernel, principal),
+        "profile",
+        &mut cleanup_errors,
+    );
+    if !cleanup_errors.is_empty() {
+        return Err(cleanup_errors.join("; "));
+    }
     super::super::agent_delete::finish_identity_removal(kernel, principal, pending)
         .await
         .map_err(|response| format!("identity removal completion returned {response:?}"))
+}
+
+/// Reclaim only packages from a failed fresh initialization. The caller has
+/// reserved that exact assignment and closed runtime admission; ordinary
+/// principal deletion deliberately retains its historical content catalog.
+fn reclaim_initializing_installs(
+    kernel: &crate::Kernel,
+    uid: astrid_core::PrincipalUid,
+    capsules: &[String],
+    errors: &mut Vec<String>,
+) {
+    let Some(store) = kernel.principal_store.as_ref() else {
+        return;
+    };
+    let registry = store.capsules();
+    let owner = astrid_storage::StateOwner::Principal(uid);
+    for capsule in capsules {
+        let result = registry.get_snapshot(&owner, capsule).and_then(|snapshot| {
+            snapshot.map_or(Ok(false), |snapshot| {
+                registry.remove_checked(
+                    &owner,
+                    capsule,
+                    astrid_storage::CapsuleInstallExpectation::Generation(snapshot.generation()),
+                )
+            })
+        });
+        if let Err(error) = result {
+            errors.push(format!("durable capsule '{capsule}' reclamation: {error}"));
+        }
+    }
 }
 
 pub(super) async fn fence_failed_initialization(

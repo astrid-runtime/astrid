@@ -304,3 +304,6 @@ async fn agent_create_clone_rejects_combined_with_groups() {
     .await;
     assert_error_contains(&res, "mutually exclusive");
 }
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) mod inventory;

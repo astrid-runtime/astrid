@@ -3589,25 +3589,25 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
             .expect("test kernel: open audit log"),
     );
 
-    // Admin tests exercise the real UID-bound storage path. Seed the default
-    // principal through the authoritative identity store rather than merely
-    // writing a profile; handlers must be able to resolve its immutable UID.
-    // Production seeds the admitted profile immediately after the migration
-    // barrier and before root identity bootstrap; mirror that ordering here.
-    seed_default_principal_admin_profile(&home).expect("test kernel: seed default profile");
+    // Fresh admin fixtures seed default through the authoritative identity
+    // store. Reopening an existing fixture preserves identity and migration
+    // history instead of trying to mint another default generation.
     let (identity_store, ownership_store) =
         open_test_identity_stores(&kv, principal_directory.clone());
-    identity_store
-        .create_principal(PrincipalId::default(), [7; 32])
-        .await
-        .expect("test kernel: seed default principal identity");
-
-    // `AstridHome::ensure` has already written the v2 sentinel. Complete the
-    // fresh-home barrier receipt in the fixture so delete/reclaim tests model
-    // an admitted runtime rather than bypassing the production gate. The
-    // fixture writes the exact canonical empty-home ledger shape; production
-    // still obtains it only through `legacy_migration_barrier::run`.
-    seed_test_migration_ledger(&home);
+    if principal_directory.uid_for(&PrincipalId::default()).is_ok() {
+        astrid_core::PrincipalProfile::load_required(&home, &PrincipalId::default())
+            .expect("test kernel: existing default profile");
+    } else {
+        // Match production: admit the profile before creating the root identity.
+        seed_default_principal_admin_profile(&home).expect("test kernel: seed default profile");
+        identity_store
+            .create_principal(PrincipalId::default(), [7; 32])
+            .await
+            .expect("test kernel: seed default principal identity");
+        // Only a newly initialized fixture may write the canonical empty-home
+        // ledger. Existing-state construction must never replace this history.
+        seed_test_migration_ledger(&home);
+    }
 
     // MCP: use a no-op secure client wrapped around an empty manager.
     // Admin handlers do not touch MCP.

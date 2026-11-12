@@ -141,6 +141,11 @@ pub struct HostedFileVolume {
     path: PathBuf,
     open_lock: open::OpenReclaimLock,
     state: Mutex<ContainerState>,
+    /// Windows: keep admitted runtime-root authority after `state` so Drop
+    /// releases the volume file before the namespace fence.
+    #[cfg(windows)]
+    _retained_root:
+        Option<std::sync::Arc<astrid_core::platform_fs::directory_capability::RetainedPrivateRoot>>,
 }
 
 impl fmt::Debug for HostedFileVolume {

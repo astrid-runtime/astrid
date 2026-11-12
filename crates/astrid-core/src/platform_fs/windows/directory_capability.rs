@@ -12,7 +12,7 @@ use std::fs::File;
 use std::io;
 use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 #[cfg(any(test, feature = "test-support"))]
 use std::cell::Cell;
@@ -196,6 +196,103 @@ fn test_maybe_fail_directory_flush() -> io::Result<()> {
         slot.set(remaining.strict_sub(1));
         Err(io::Error::other("injected directory flush failure"))
     })
+}
+
+/// Opaque retained `ExactPrivate` Windows runtime-root authority.
+///
+/// Holds a duplicated final-boundary [`File`] with the production no-delete
+/// sharing mask, plus the admitted absolute root label. `std::fs::File` is
+/// already `Send + Sync`; this type does not add unsafe auto-trait impls.
+/// Dropping the last clone releases the namespace fence so ancestor rename can
+/// succeed again.
+pub struct RetainedPrivateRoot {
+    /// Final-boundary authority; retained solely so Drop keeps the rename fence.
+    _authority: File,
+    path: PathBuf,
+}
+
+impl std::fmt::Debug for RetainedPrivateRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetainedPrivateRoot")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RetainedPrivateRoot {
+    /// Create or capture `path` as `ExactPrivate` and retain its final authority.
+    ///
+    /// Missing roots are born through the root-birth create loop with
+    /// `TrustedForCreate` parent policy. Existing roots must already be
+    /// `ExactPrivate`; broad or redirected roots fail closed without repair.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when absolutization fails, the path is not a local
+    /// absolute volume path, capture finds a redirect/non-directory/broad ACL,
+    /// birth cannot create an `ExactPrivate` descendant under a trusted parent,
+    /// or host I/O fails. Non-`NotFound` capture failures propagate unchanged.
+    pub fn admit(path: &Path) -> io::Result<std::sync::Arc<Self>> {
+        use super::path::{BoundaryContract, TrustedPathGuard, nearest_existing_ancestor};
+        use std::path::Component;
+
+        let path = std::path::absolute(path)?;
+        super::path::validate_local_absolute_path(&path)?;
+        let guard = match TrustedPathGuard::capture(&path) {
+            Ok(guard) => {
+                guard.verify_contract(BoundaryContract::ExactPrivateDirectory)?;
+                guard
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let existing_parent = nearest_existing_ancestor(&path)?;
+                let parent = TrustedPathGuard::capture(&existing_parent)?;
+                let relative = path
+                    .strip_prefix(parent.authority_boundary())
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "runtime root {} is outside retained parent {}",
+                                path.display(),
+                                parent.authority_boundary().display()
+                            ),
+                        )
+                    })?
+                    .components()
+                    .map(|component| match component {
+                        Component::Normal(name) => Ok(name.to_os_string()),
+                        _ => Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "runtime root contains a non-normal component: {}",
+                                path.display()
+                            ),
+                        )),
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                if relative.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("runtime root already names its parent: {}", path.display()),
+                    ));
+                }
+                parent.capture_private_descendants_for_create(&relative)?
+            },
+            Err(error) => return Err(error),
+        };
+        let authority = guard.duplicate_authority_file()?;
+        let path = guard.authority_boundary().to_path_buf();
+        drop(guard);
+        Ok(std::sync::Arc::new(Self {
+            _authority: authority,
+            path,
+        }))
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 #[cfg(test)]

@@ -36,7 +36,7 @@ impl ProbeCase {
             Self::PairedAfterGuardDrop => "paired-after-guard-drop",
             Self::PairedAndShareDeleteChildAfterGuardDrop => {
                 "paired-share-delete-child-after-guard-drop"
-            }
+            },
         }
     }
 }
@@ -85,10 +85,10 @@ impl HeldAuthority {
                 let borrowed =
                     unsafe { BorrowedHandle::borrow_raw(guard.authority_handle().cast()) };
                 query_directory_identity(&borrowed).unwrap()
-            }
+            },
             Self::Paired(capability) | Self::PairedWithChild { capability, .. } => {
                 query_directory_identity(capability.file()).unwrap()
-            }
+            },
         }
     }
 
@@ -99,11 +99,11 @@ impl HeldAuthority {
                 // Validate the retained object, without verifying its old label.
                 validate_private_acl_handle(guard.authority_handle(), true, "probe held root")
                     .unwrap();
-            }
+            },
             Self::Paired(capability) | Self::PairedWithChild { capability, .. } => {
                 assert_eq!(capability.identity(), expected);
                 capability.flush().unwrap();
-            }
+            },
         }
         if let Self::PairedWithChild { child, .. } = self {
             child.seek(SeekFrom::End(0)).unwrap();

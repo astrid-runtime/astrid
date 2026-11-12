@@ -67,12 +67,21 @@ pub async fn open_runtime_principal_store_for_pack(
     home: &AstridHome,
     quota: Arc<dyn KvQuotaResolver<StateOwner>>,
 ) -> crate::principal_state::StorageResult<RuntimePrincipalStore> {
+    #[cfg(windows)]
+    let (home, retained_root) = super::runtime_root_admission::normalize_and_admit(home)?;
+    #[cfg(windows)]
+    let home = &home;
     let policy = DurableEnginePolicy::default();
     if volume_migration::existing_volume_available(home)? {
-        let (engine, receipt, volume) =
-            volume_migration::open_existing(home, policy)?.ok_or_else(|| {
-                StorageError::Connection("Astrid volume disappeared while opening".to_owned())
-            })?;
+        let (engine, receipt, volume) = volume_migration::open_existing(
+            home,
+            policy,
+            #[cfg(windows)]
+            &retained_root,
+        )?
+        .ok_or_else(|| {
+            StorageError::Connection("Astrid volume disappeared while opening".to_owned())
+        })?;
         let store = assemble_runtime_store(
             home,
             quota,
@@ -86,7 +95,12 @@ pub async fn open_runtime_principal_store_for_pack(
         quarantine_unrecognized_principal_store(home, &store)?;
         return Ok(store);
     }
-    let (engine, receipt, volume) = volume_migration::initialize_volume(home, policy)?;
+    let (engine, receipt, volume) = volume_migration::initialize_volume(
+        home,
+        policy,
+        #[cfg(windows)]
+        &retained_root,
+    )?;
     let store = assemble_runtime_store(
         home,
         quota,
@@ -177,11 +191,20 @@ async fn open_runtime_principal_store_with_options(
     principals: PrincipalDirectory,
     policy: DurableEnginePolicy<StateOwner>,
 ) -> crate::principal_state::StorageResult<RuntimePrincipalStore> {
+    #[cfg(windows)]
+    let (home, retained_root) = super::runtime_root_admission::normalize_and_admit(home)?;
+    #[cfg(windows)]
+    let home = &home;
     if volume_migration::existing_volume_available(home)? {
-        let (engine, receipt, volume) =
-            volume_migration::open_existing(home, policy)?.ok_or_else(|| {
-                StorageError::Connection("Astrid volume disappeared while opening".to_owned())
-            })?;
+        let (engine, receipt, volume) = volume_migration::open_existing(
+            home,
+            policy,
+            #[cfg(windows)]
+            &retained_root,
+        )?
+        .ok_or_else(|| {
+            StorageError::Connection("Astrid volume disappeared while opening".to_owned())
+        })?;
         let store = assemble_runtime_store(
             home,
             quota,
@@ -200,7 +223,12 @@ async fn open_runtime_principal_store_with_options(
         .layout_version()
         .map_err(|error| StorageError::Connection(error.to_string()))?;
     if layout_version.as_deref() != Some(astrid_core::dirs::LEGACY_LAYOUT_VERSION) {
-        let (engine, receipt, volume) = volume_migration::initialize_volume(home, policy)?;
+        let (engine, receipt, volume) = volume_migration::initialize_volume(
+            home,
+            policy,
+            #[cfg(windows)]
+            &retained_root,
+        )?;
         let store = assemble_runtime_store(
             home,
             quota,
@@ -216,7 +244,12 @@ async fn open_runtime_principal_store_with_options(
         return Ok(store);
     }
     if unrecognized_principal_store_present(home)? {
-        let (engine, receipt, volume) = volume_migration::initialize_volume(home, policy)?;
+        let (engine, receipt, volume) = volume_migration::initialize_volume(
+            home,
+            policy,
+            #[cfg(windows)]
+            &retained_root,
+        )?;
         let store = assemble_runtime_store(
             home,
             quota,
@@ -231,7 +264,15 @@ async fn open_runtime_principal_store_with_options(
         super::runtime_tree::quarantine_principal_store(home, &store)?;
         return Ok(store);
     }
-    open_migrated_directory_store(home, quota, principals, policy).await
+    open_migrated_directory_store(
+        home,
+        quota,
+        principals,
+        policy,
+        #[cfg(windows)]
+        &retained_root,
+    )
+    .await
 }
 
 async fn open_migrated_directory_store(
@@ -239,6 +280,7 @@ async fn open_migrated_directory_store(
     quota: Arc<dyn KvQuotaResolver<StateOwner>>,
     principals: PrincipalDirectory,
     policy: DurableEnginePolicy<StateOwner>,
+    #[cfg(windows)] retained_root: &super::runtime_root_admission::AdmittedRuntimeRoot,
 ) -> crate::principal_state::StorageResult<RuntimePrincipalStore> {
     let store_path = home.principal_store_path();
     let open_path = store_path.clone();
@@ -303,8 +345,13 @@ async fn open_migrated_directory_store(
             })??;
     }
 
-    let (engine, receipt, volume) =
-        volume_migration::migrate_directory_store(home, engine, policy)?;
+    let (engine, receipt, volume) = volume_migration::migrate_directory_store(
+        home,
+        engine,
+        policy,
+        #[cfg(windows)]
+        retained_root,
+    )?;
     assemble_runtime_store(
         home,
         quota,
