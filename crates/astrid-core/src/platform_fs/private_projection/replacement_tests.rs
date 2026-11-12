@@ -2,9 +2,29 @@
 use super::PrivateFileProjection;
 use std::{fs, path::Path};
 
+// Windows filesystem fault injectors share the existing native test lock.
+// Keep its guard alive for the complete test, not just fixture creation.
+fn private_root() -> (
+    tempfile::TempDir,
+    Option<std::sync::MutexGuard<'static, ()>>,
+) {
+    #[cfg(windows)]
+    {
+        let guard = crate::platform_fs::windows::private_test_guard();
+        (
+            crate::platform_fs::windows::private_test_directory(),
+            Some(guard),
+        )
+    }
+    #[cfg(unix)]
+    {
+        (tempfile::tempdir().unwrap(), None)
+    }
+}
+
 #[test]
 fn captured_absence_rejects_new_target_without_publication() {
-    let root = tempfile::tempdir().unwrap();
+    let (root, _native_guard) = private_root();
     let projection = PrivateFileProjection::open(root.path()).unwrap();
     let (replacement, previous) = projection
         .capture_replacement(Path::new("state"), &mut Vec::new())
@@ -22,7 +42,7 @@ fn captured_absence_rejects_new_target_without_publication() {
 
 #[test]
 fn captured_previous_rejects_replaced_target_without_publication() {
-    let root = tempfile::tempdir().unwrap();
+    let (root, _native_guard) = private_root();
     let projection = PrivateFileProjection::open(root.path()).unwrap();
     projection.write(Path::new("state"), b"previous").unwrap();
     let mut backup = Vec::new();
@@ -41,7 +61,7 @@ fn captured_previous_rejects_replaced_target_without_publication() {
 
 #[test]
 fn rollback_refuses_a_changed_published_target_and_another_session() {
-    let root = tempfile::tempdir().unwrap();
+    let (root, _native_guard) = private_root();
     let projection = PrivateFileProjection::open(root.path()).unwrap();
     let (replacement, _) = projection
         .capture_replacement(Path::new("state"), &mut Vec::new())
@@ -66,7 +86,7 @@ fn rollback_refuses_a_changed_published_target_and_another_session() {
 
 #[test]
 fn postrename_fence_error_retains_receipt_and_restores_backup() {
-    let root = tempfile::tempdir().unwrap();
+    let (root, _native_guard) = private_root();
     let projection = PrivateFileProjection::open(root.path()).unwrap();
     projection.write(Path::new("state"), b"previous").unwrap();
     let mut backup = Vec::new();
@@ -94,7 +114,7 @@ fn postrename_fence_error_retains_receipt_and_restores_backup() {
 #[cfg(unix)]
 #[test]
 fn capture_and_publish_reuse_one_relative_directory_acquisition() {
-    let root = tempfile::tempdir().unwrap();
+    let (root, _native_guard) = private_root();
     let projection = PrivateFileProjection::open(root.path()).unwrap();
     projection
         .write(Path::new("nested/state"), b"previous")
@@ -124,7 +144,7 @@ fn capture_and_publish_reuse_one_relative_directory_acquisition() {
 }
 
 fn reject_missing_parent(prior: Option<&[u8]>) {
-    let root = tempfile::tempdir().unwrap();
+    let (root, _native_guard) = private_root();
     let projection = PrivateFileProjection::open(root.path()).unwrap();
     let name = Path::new("nested/state");
     if let Some(bytes) = prior {
@@ -168,7 +188,7 @@ fn rollback_never_accepts_missing_parent_for_prior_absence() {
 #[test]
 fn rollback_never_repairs_unproven_parent_privacy() {
     use std::os::unix::fs::PermissionsExt as _;
-    let root = tempfile::tempdir().unwrap();
+    let (root, _native_guard) = private_root();
     let projection = PrivateFileProjection::open(root.path()).unwrap();
     let name = Path::new("nested/state");
     projection.write(name, b"previous").unwrap();

@@ -56,3 +56,8 @@ mod native_tests;
 
 #[cfg(test)]
 pub(in crate::platform_fs) use projection_session::install_namespace_flush_failures as install_projection_namespace_flush_failures;
+
+#[cfg(test)]
+pub(in crate::platform_fs) use native_tests::{
+    private_temp as private_test_directory, serial_test_guard as private_test_guard,
+};

@@ -32,13 +32,13 @@ mod projection_session_tests;
 
 static NATIVE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn serial_test_guard() -> std::sync::MutexGuard<'static, ()> {
+pub(in crate::platform_fs) fn serial_test_guard() -> std::sync::MutexGuard<'static, ()> {
     NATIVE_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn private_temp() -> tempfile::TempDir {
+pub(in crate::platform_fs) fn private_temp() -> tempfile::TempDir {
     let local = BaseDirs::new().unwrap().data_local_dir().to_path_buf();
     let root = tempfile::Builder::new()
         .prefix("astrid-platform-fs-")
