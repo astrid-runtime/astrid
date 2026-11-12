@@ -102,6 +102,7 @@ impl Kernel {
     ) -> astrid_storage::StorageResult<ShutdownCustody> {
         self.drain_shutdown_producers(reason).await;
         let custody = self.finish_shutdown_storage(mode).await;
+        #[cfg(unix)]
         self.remove_shutdown_endpoints();
         tracing::info!("Kernel shutdown complete");
         custody
@@ -154,6 +155,7 @@ impl Kernel {
         self.audit_sink.shutdown();
     }
 
+    #[cfg(unix)]
     fn remove_shutdown_endpoints(&self) {
         // Remove the socket and token files so stale-socket detection works
         // on next boot and the auth token doesn't persist on disk after shutdown.
@@ -162,20 +164,16 @@ impl Kernel {
         // they have already been drained. The socket is only used for
         // CLI-to-kernel IPC. Unix-only: the `socket` module (and the on-disk
         // socket/PID/readiness files it manages) exist only on that profile.
-        #[cfg(unix)]
-        {
-            use astrid_core::dirs::AstridHome;
+        use astrid_core::dirs::AstridHome;
 
-            // The token captures the admitted runtime directory at boot. Never
-            // resolve process-wide environment paths again during teardown: an
-            // embedded kernel or changed override may refer to another runtime.
-            let socket_path = self.token_path.with_file_name(AstridHome::SOCKET_FILE_NAME);
-            let _ = astrid_core::local_transport::remove_endpoint(&socket_path);
-            let _ = std::fs::remove_file(&self.token_path);
-            let _ =
-                std::fs::remove_file(self.token_path.with_file_name(AstridHome::READY_FILE_NAME));
-            let _ = std::fs::remove_file(self.token_path.with_file_name(AstridHome::PID_FILE_NAME));
-        }
+        // The token captures the admitted runtime directory at boot. Never
+        // resolve process-wide environment paths again during teardown: an
+        // embedded kernel or changed override may refer to another runtime.
+        let socket_path = self.token_path.with_file_name(AstridHome::SOCKET_FILE_NAME);
+        let _ = astrid_core::local_transport::remove_endpoint(&socket_path);
+        let _ = std::fs::remove_file(&self.token_path);
+        let _ = std::fs::remove_file(self.token_path.with_file_name(AstridHome::READY_FILE_NAME));
+        let _ = std::fs::remove_file(self.token_path.with_file_name(AstridHome::PID_FILE_NAME));
     }
 
     async fn finish_shutdown_storage(
