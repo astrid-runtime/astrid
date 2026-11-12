@@ -46,8 +46,8 @@ pub(super) fn recover_metadata<F: DurableIo>(
         METADATA_FILE,
         METADATA_MAGIC,
         limits,
-        |offset, payload, load_previous| {
-            index.insert_at(offset, MetadataFrame::decode(payload)?, load_previous)
+        |location, payload, load_previous| {
+            index.insert_at(location, MetadataFrame::decode(payload)?, load_previous)
         },
     )?;
     if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {

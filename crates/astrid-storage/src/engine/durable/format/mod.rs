@@ -27,6 +27,7 @@ thread_local! {
 
 mod framed_append;
 mod indexed;
+mod location;
 #[cfg(test)]
 mod positioned_tests;
 mod prepared;
@@ -41,6 +42,7 @@ pub(super) use indexed::{
     read_indexed_object, read_indexed_object_with_payload, read_indexed_objects,
     visit_indexed_objects,
 };
+pub(super) use location::{FrameLocation, scan_frames_with_source};
 pub(super) use prepared::{PreparedFrame, append_prepared_frames};
 use reader::SliceReader;
 
@@ -167,33 +169,8 @@ fn read_frame_with(
     let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
     read_exact(&mut header, offset)
         .map_err(|source| io_error("read indexed durable frame header", source))?;
-    if header[..8] != magic {
-        return Err(corrupt(file_name, offset, "frame magic mismatch"));
-    }
-    let version = u16::from_le_bytes([header[8], header[9]]);
-    if version != FRAME_VERSION {
-        return Err(corrupt(file_name, offset, "unsupported frame version"));
-    }
-    if header[10..12] != [0, 0] {
-        return Err(corrupt(
-            file_name,
-            offset,
-            "reserved header bytes are non-zero",
-        ));
-    }
-    let payload_len = u64::from_le_bytes(
-        header[12..20]
-            .try_into()
-            .map_err(|_| DurableError::EncodingOverflow)?,
-    );
-    if payload_len > limits.max_frame_bytes {
-        return Err(DurableError::FrameTooLarge {
-            file: file_name,
-            offset,
-            declared: payload_len,
-            limit: limits.max_frame_bytes,
-        });
-    }
+    let decoded = validate_positioned_header(file_name, magic, offset, &header, limits)?;
+    let payload_len = decoded.payload_len;
     let payload_usize = usize::try_from(payload_len).map_err(|_| DurableError::EncodingOverflow)?;
     let mut payload = Vec::new();
     payload
@@ -205,13 +182,58 @@ fn read_frame_with(
         .ok_or(DurableError::EncodingOverflow)?;
     read_exact(&mut payload, payload_offset)
         .map_err(|source| io_error("read indexed durable frame payload", source))?;
-    let checksum: [u8; 32] = header[CHECKSUM_START..]
-        .try_into()
-        .map_err(|_| DurableError::EncodingOverflow)?;
-    if frame_checksum(magic, payload_len, &payload) != checksum {
+    validate_positioned_payload(file_name, magic, offset, decoded, &payload)?;
+    Ok(payload)
+}
+
+fn validate_positioned_header(
+    file_name: &'static str,
+    magic: [u8; 8],
+    offset: u64,
+    header: &[u8; FRAME_HEADER_LEN_USIZE],
+    limits: RecoveryLimits,
+) -> Result<DecodedFrameHeader, DurableError> {
+    if header[..8] != magic {
+        return Err(corrupt(file_name, offset, "frame magic mismatch"));
+    }
+    let decoded = decode_frame_header(file_name, offset, header)?;
+    check_frame_payload_limit(file_name, offset, decoded.payload_len, limits)?;
+    Ok(decoded)
+}
+
+fn check_frame_payload_limit(
+    file: &'static str,
+    offset: u64,
+    declared: u64,
+    limits: RecoveryLimits,
+) -> Result<(), DurableError> {
+    if declared > limits.max_frame_bytes {
+        return Err(DurableError::FrameTooLarge {
+            file,
+            offset,
+            declared,
+            limit: limits.max_frame_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn validate_positioned_payload(
+    file_name: &'static str,
+    magic: [u8; 8],
+    offset: u64,
+    decoded: DecodedFrameHeader,
+    payload: &[u8],
+) -> Result<(), DurableError> {
+    if u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?
+        != decoded.payload_len
+    {
+        return Err(corrupt(file_name, offset, "frame payload length mismatch"));
+    }
+    if frame_checksum(magic, decoded.payload_len, payload) != decoded.checksum {
         return Err(corrupt(file_name, offset, "frame checksum mismatch"));
     }
-    Ok(payload)
+    Ok(())
 }
 
 fn read_exact_at<F: DurableIo>(file: &F, buffer: &mut [u8], offset: u64) -> io::Result<()> {
@@ -340,34 +362,7 @@ pub(super) fn scan_frames<F: DurableIo>(
         file_name,
         magic,
         limits,
-        |offset, payload, _source| accept(offset, payload),
-    )
-}
-
-/// The callback can reload earlier validated frames without disturbing
-/// sequential read-ahead, including providers whose positional reads seek.
-pub(super) fn scan_frames_with_source<F: DurableIo>(
-    file: &mut F,
-    file_name: &'static str,
-    magic: [u8; 8],
-    limits: RecoveryLimits,
-    mut accept: impl FnMut(
-        u64,
-        &[u8],
-        &mut dyn FnMut(u64) -> Result<Vec<u8>, DurableError>,
-    ) -> Result<(), DurableError>,
-) -> Result<(), DurableError> {
-    scan_frames_with_protected_prefix(
-        file,
-        file_name,
-        magic,
-        limits,
-        0,
-        |offset, payload, source| {
-            accept(offset, payload, &mut |position| {
-                read_frame_preserving_cursor(source, file_name, magic, position, limits)
-            })
-        },
+        |location, payload, _source| accept(location.offset(), payload),
     )
 }
 

@@ -11,17 +11,17 @@ use super::{
 };
 use crate::engine::durable::media::StoreMetadata;
 
-struct ObservedSource {
-    file: File,
-    reads: RefCell<Vec<(u64, usize)>>,
-    short_limit: usize,
-    unreadable: Option<Range<u64>>,
-    error_kind: io::ErrorKind,
-    interrupt_once: Cell<bool>,
+pub(super) struct ObservedSource {
+    pub(super) file: File,
+    pub(super) reads: RefCell<Vec<(u64, usize)>>,
+    pub(super) short_limit: usize,
+    pub(super) unreadable: Option<Range<u64>>,
+    pub(super) error_kind: io::ErrorKind,
+    pub(super) interrupt_once: Cell<bool>,
 }
 
 impl ObservedSource {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             file: File::native(tempfile::tempfile().unwrap()),
             reads: RefCell::new(Vec::new()),

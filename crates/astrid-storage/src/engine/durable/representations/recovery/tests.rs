@@ -311,7 +311,14 @@ fn metadata_duplicate_identity_requires_exact_body_equality() {
     .unwrap();
     // Deliberately supply an earlier body with the same identity envelope:
     // checking the envelope alone would wrongly accept this duplicate.
-    let result = index.insert_at(52, frame, |_| different.encode());
+    let result = index.insert_at(
+        crate::engine::durable::format::FrameLocation::for_test(
+            52,
+            u64::try_from(frame.encode().unwrap().len()).unwrap(),
+        ),
+        frame,
+        |_| different.encode(),
+    );
     assert!(matches!(
         result,
         Err(DurableError::InvalidRepresentationState(
