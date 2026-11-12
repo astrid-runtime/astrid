@@ -473,3 +473,40 @@ fn scratch_gap_marker(ancestor: &Path) -> PathBuf {
         .expect("ancestor has parent scratch")
         .join("cutover-gap-denied.marker")
 }
+
+#[test]
+fn fresh_admit_allows_ambient_private_directory_while_retained_fence_holds() {
+    use crate::principal_state::native_io::PrivateDirectory;
+    use astrid_core::platform_fs::directory_capability::RetainedPrivateRoot;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let ancestor = scratch.path().join("ancestor");
+    std::fs::create_dir(&ancestor).unwrap();
+    let root = ancestor.join("runtime");
+    let moved = scratch.path().join("ancestor-moved");
+    assert!(!root.exists(), "fixture starts with a missing runtime root");
+
+    let retained = RetainedPrivateRoot::admit(&root).expect("fresh missing root admit");
+    astrid_core::platform_fs::validate_private_directory(retained.path())
+        .expect("admitted root must be ExactPrivate");
+
+    // Old DELETE-retained admit fails here with OS 32 against cap-std ambient open.
+    let directory = PrivateDirectory::open(retained.path())
+        .expect("ambient PrivateDirectory::open must succeed under post-ensure retained reader");
+    directory
+        .sync()
+        .expect("directory sync must succeed under retained reader");
+    drop(directory);
+
+    let error = std::fs::rename(&ancestor, &moved)
+        .expect_err("retained admit fence must still block ancestor rename");
+    assert_access_denied(&error);
+    assert!(root.is_dir(), "denied rename must leave runtime root");
+    assert!(!moved.exists(), "denied rename must not create destination");
+
+    drop(retained);
+    std::fs::rename(&ancestor, &moved)
+        .expect("after retained-root drop, ancestor rename must succeed");
+    assert!(moved.join("runtime").is_dir());
+    assert!(!ancestor.exists());
+}

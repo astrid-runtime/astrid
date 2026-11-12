@@ -222,64 +222,33 @@ impl std::fmt::Debug for RetainedPrivateRoot {
 impl RetainedPrivateRoot {
     /// Create or capture `path` as `ExactPrivate` and retain its final authority.
     ///
-    /// Missing roots are born through the root-birth create loop with
-    /// `TrustedForCreate` parent policy. Existing roots must already be
-    /// `ExactPrivate`; broad or redirected roots fail closed without repair.
+    /// Missing roots use the existing `ensure_private_directory` birth path
+    /// (create, child+parent NTFS flush, drop DELETE cleanup handles), then a
+    /// normal locked capture. Existing roots must already be `ExactPrivate`;
+    /// broad or redirected roots fail closed without repair. Admission begins
+    /// once the post-ensure capture succeeds, before any store or volume I/O.
     ///
     /// # Errors
     ///
     /// Returns an error when absolutization fails, the path is not a local
-    /// absolute volume path, capture finds a redirect/non-directory/broad ACL,
-    /// birth cannot create an `ExactPrivate` descendant under a trusted parent,
-    /// or host I/O fails. Non-`NotFound` capture failures propagate unchanged.
+    /// absolute volume path, ensure/capture finds a redirect/non-directory/broad
+    /// ACL, birth cannot create an `ExactPrivate` directory under a trusted
+    /// parent, or host I/O fails. Non-`NotFound` capture failures propagate
+    /// unchanged.
     pub fn admit(path: &Path) -> io::Result<std::sync::Arc<Self>> {
-        use super::path::{BoundaryContract, TrustedPathGuard, nearest_existing_ancestor};
-        use std::path::Component;
+        use super::path::{BoundaryContract, TrustedPathGuard};
 
         let path = std::path::absolute(path)?;
         super::path::validate_local_absolute_path(&path)?;
         let guard = match TrustedPathGuard::capture(&path) {
-            Ok(guard) => {
-                guard.verify_contract(BoundaryContract::ExactPrivateDirectory)?;
-                guard
-            },
+            Ok(guard) => guard,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let existing_parent = nearest_existing_ancestor(&path)?;
-                let parent = TrustedPathGuard::capture(&existing_parent)?;
-                let relative = path
-                    .strip_prefix(parent.authority_boundary())
-                    .map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!(
-                                "runtime root {} is outside retained parent {}",
-                                path.display(),
-                                parent.authority_boundary().display()
-                            ),
-                        )
-                    })?
-                    .components()
-                    .map(|component| match component {
-                        Component::Normal(name) => Ok(name.to_os_string()),
-                        _ => Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!(
-                                "runtime root contains a non-normal component: {}",
-                                path.display()
-                            ),
-                        )),
-                    })
-                    .collect::<io::Result<Vec<_>>>()?;
-                if relative.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!("runtime root already names its parent: {}", path.display()),
-                    ));
-                }
-                parent.capture_private_descendants_for_create(&relative)?
+                super::path::ensure_private_directory(&path)?;
+                TrustedPathGuard::capture(&path)?
             },
             Err(error) => return Err(error),
         };
+        guard.verify_contract(BoundaryContract::ExactPrivateDirectory)?;
         let authority = guard.duplicate_authority_file()?;
         let path = guard.authority_boundary().to_path_buf();
         drop(guard);

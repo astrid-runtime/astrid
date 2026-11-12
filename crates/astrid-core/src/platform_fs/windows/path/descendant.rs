@@ -119,11 +119,7 @@ impl TrustedPathGuard {
 
         if create {
             self.verify_contract(BoundaryContract::TrustedForCreate)?;
-            self.capture_or_create_relative_from_retained_handles(
-                relative,
-                target,
-                BoundaryContract::ExactPrivateDirectory,
-            )
+            self.capture_or_create_relative_from_retained_handles(relative, target)
         } else {
             self.verify_contract(BoundaryContract::ExactPrivateDirectory)?;
             let descendant = self.capture_relative_from_retained_handles(relative, target)?;
@@ -133,35 +129,10 @@ impl TrustedPathGuard {
         }
     }
 
-    /// Capture privately born descendants beneath a `TrustedForCreate` boundary.
-    ///
-    /// Unlike projection descent, the existing ancestor need not itself have
-    /// the `ExactPrivate` ACL. Every returned descendant still must have it.
-    pub(in crate::platform_fs::windows) fn capture_private_descendants_for_create(
-        &self,
-        relative: &[OsString],
-    ) -> io::Result<Self> {
-        validate_relative_directory_components(relative)?;
-        self.verify_contract(BoundaryContract::TrustedForCreate)?;
-        let target =
-            relative
-                .iter()
-                .fold(self.authority_boundary().to_path_buf(), |mut path, part| {
-                    path.push(part);
-                    path
-                });
-        self.capture_or_create_relative_from_retained_handles(
-            relative,
-            target,
-            BoundaryContract::TrustedForCreate,
-        )
-    }
-
     fn capture_or_create_relative_from_retained_handles(
         &self,
         relative: &[OsString],
         target: PathBuf,
-        parent_contract: BoundaryContract,
     ) -> io::Result<Self> {
         let mut components = duplicate_locked_components(&self.components)?;
         let mut parent = components
@@ -217,7 +188,7 @@ impl TrustedPathGuard {
                 authority_boundary: target,
             };
             descendant.verify_contract(BoundaryContract::ExactPrivateDirectory)?;
-            self.verify_contract(parent_contract)?;
+            self.verify_contract(BoundaryContract::ExactPrivateDirectory)?;
             Ok(descendant)
         })();
 
