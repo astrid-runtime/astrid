@@ -27,7 +27,8 @@ thread_local! {
 
 mod framed_append;
 mod indexed;
-mod positioned;
+#[cfg(test)]
+mod positioned_tests;
 mod prepared;
 mod reader;
 #[cfg(test)]
@@ -40,7 +41,6 @@ pub(super) use indexed::{
     read_indexed_object, read_indexed_object_with_payload, read_indexed_objects,
     visit_indexed_objects,
 };
-pub(super) use positioned::PositionalFrameReader;
 pub(super) use prepared::{PreparedFrame, append_prepared_frames};
 use reader::SliceReader;
 

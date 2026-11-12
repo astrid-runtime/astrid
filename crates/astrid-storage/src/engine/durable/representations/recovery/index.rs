@@ -4,7 +4,7 @@ use super::{
     BTreeMap, Blake3PhysicalIdentity, DurableError, DurableIo, METADATA_FILE, METADATA_MAGIC,
     MetadataFrame, MetadataKind, RecoveryLimits, map_node_id,
 };
-use crate::engine::durable::format::PositionalFrameReader;
+use crate::engine::durable::format::read_frame_at;
 use crate::storage_model::{
     CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapNode, PhysicalMapNodeId,
 };
@@ -104,7 +104,6 @@ impl MetadataIndex {
     ) -> Result<CanonicalPhysicalMap, DurableError> {
         let mut nodes = BTreeMap::new();
         let mut pending: Vec<_> = root.into_iter().collect();
-        let mut reader = PositionalFrameReader::new(source);
         while let Some(id) = pending.pop() {
             if nodes.contains_key(&id) {
                 continue;
@@ -115,8 +114,13 @@ impl MetadataIndex {
                 .ok_or(DurableError::InvalidRepresentationState(
                     "active physical map closure is incomplete",
                 ))?;
-            let payload =
-                reader.read_frame_at(METADATA_FILE, METADATA_MAGIC, entry.offset.0, limits)?;
+            let payload = read_frame_at(
+                source,
+                METADATA_FILE,
+                METADATA_MAGIC,
+                entry.offset.0,
+                limits,
+            )?;
             let frame = MetadataFrame::decode(&payload)?;
             let (node, computed) =
                 PhysicalMapNode::decode_and_identify(frame.value, &Blake3PhysicalIdentity)?;

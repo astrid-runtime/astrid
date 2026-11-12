@@ -65,7 +65,7 @@ impl DurableIo for ObservedFile {
 }
 
 #[test]
-fn active_map_materialization_coalesces_positioned_reads() {
+fn active_map_materialization_reads_only_its_framed_bytes() {
     let entries: Vec<_> = (0_u32..8192)
         .map(|ordinal| {
             (
@@ -127,12 +127,12 @@ fn active_map_materialization_coalesces_positioned_reads() {
         file.positioned_bytes.get()
     );
     assert!(
-        reads < node_count,
-        "reconstruction must coalesce adjacent nodes rather than issue two reads per node: {reads} reads for {node_count} nodes"
+        reads <= node_count * 2,
+        "at most header and body reads per node"
     );
-    assert!(
-        u64::try_from(file.positioned_bytes.get()).unwrap()
-            <= file.durable_metadata().unwrap().len().strict_mul(2),
-        "descending reconstruction must not repeatedly refill adjacent windows"
+    assert_eq!(
+        u64::try_from(file.positioned_bytes.get()).unwrap(),
+        file.durable_metadata().unwrap().len(),
+        "reconstruction must not reread or prefetch unrelated metadata"
     );
 }
