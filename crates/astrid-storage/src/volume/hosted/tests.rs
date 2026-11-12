@@ -583,6 +583,51 @@ fn read_region_at_copies_overlapping_extents_only() {
 }
 
 #[test]
+fn live_record_probe_keeps_cursor_and_volume_lock() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let volume = HostedFileVolume::open(&path).unwrap();
+    let region = VolumeRegion::new("probe").unwrap();
+    volume.create_region(&region, true).unwrap();
+    volume.write_region_at(&region, 0, b"one").unwrap();
+    volume.sync().unwrap();
+    volume.state.lock().file.seek(SeekFrom::Start(3)).unwrap();
+    assert_eq!(
+        volume.write_record_payloads().unwrap(),
+        vec![("probe".to_owned(), 3)]
+    );
+    assert_eq!(volume.state.lock().file.stream_position().unwrap(), 3);
+    let mut image = Vec::new();
+    let copied = volume.write_preclose_volume_image(&mut image).unwrap();
+    assert_eq!(usize::try_from(copied).unwrap(), image.len());
+    assert_eq!(&image[..VOLUME_MAGIC.len()], VOLUME_MAGIC);
+    assert_eq!(volume.state.lock().file.stream_position().unwrap(), 3);
+    let mut no_space: &mut [u8] = &mut [];
+    let error = volume
+        .write_preclose_volume_image(&mut no_space)
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+    assert_eq!(volume.state.lock().file.stream_position().unwrap(), 3);
+    #[cfg(windows)]
+    assert_eq!(
+        crate::volume::write_record_payloads(&path)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION.cast_signed())
+    );
+    volume.write_region_at(&region, 3, b"next").unwrap();
+    let mut bytes = [0_u8; 7];
+    volume.read_region_at(&region, 0, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"onenext");
+    let records = volume.write_record_payloads().unwrap();
+    drop(volume);
+    assert_eq!(
+        crate::volume::write_record_payloads(&path).unwrap(),
+        records
+    );
+}
+
+#[test]
 fn stream_write_of_known_length_is_one_payload_record() {
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("astrid.volume");

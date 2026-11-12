@@ -202,6 +202,26 @@ fn copy_and_hash(
 #[cfg(test)]
 pub(crate) fn write_record_payloads(path: &Path) -> io::Result<Vec<(String, u64)>> {
     let mut file = std::fs::File::open(path)?;
+    scan_write_record_payloads(&mut file)
+}
+
+#[cfg(test)]
+impl HostedFileVolume {
+    /// Inspect actual records through the live lock-owning handle.
+    /// A separate Windows handle cannot read the locked byte range. Keep the
+    /// volume mutex and restore the shared cursor before allowing further I/O.
+    pub(crate) fn write_record_payloads(&self) -> io::Result<Vec<(String, u64)>> {
+        let mut state = self.state.lock();
+        let position = state.file.stream_position()?;
+        let result = scan_write_record_payloads(&mut state.file);
+        state.file.seek(SeekFrom::Start(position))?;
+        result
+    }
+}
+
+#[cfg(test)]
+fn scan_write_record_payloads(file: &mut File) -> io::Result<Vec<(String, u64)>> {
+    file.seek(SeekFrom::Start(0))?;
     let mut magic = [0_u8; 8];
     file.read_exact(&mut magic)?;
     if magic != VOLUME_MAGIC {

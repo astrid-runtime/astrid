@@ -474,6 +474,28 @@ pub struct RuntimePrincipalStore {
 }
 
 impl RuntimePrincipalStore {
+    /// Write the current live container bytes for a quiescent replay fixture.
+    ///
+    /// Uses the lock-owning handle without flushing, closing, or releasing
+    /// volume custody. Callers must stop logical mutations before capture.
+    /// The byte image alone does not model power-loss persistence states.
+    /// Available only to tests and the explicit `crash-replay` tooling.
+    ///
+    /// # Errors
+    /// Rejects an unavailable or rebound volume and propagates read/write errors.
+    #[cfg(any(test, feature = "crash-replay"))]
+    pub fn write_preclose_volume_image(
+        &self,
+        output: &mut dyn std::io::Write,
+    ) -> StorageResult<u64> {
+        let volume = self.volume_binding.upgrade().ok_or_else(|| {
+            StorageError::Connection("runtime volume is unavailable for replay capture".into())
+        })?;
+        volume.write_preclose_volume_image(output).map_err(|error| {
+            StorageError::Connection(format!("capture pre-close runtime volume: {error}"))
+        })
+    }
+
     /// Retire the verified directory-store cutover source after the caller's
     /// global migration barrier is durable.
     ///

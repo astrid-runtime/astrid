@@ -67,7 +67,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_admin_directory_survives_volume_only_stop_and_reopen() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_directory::temporary().unwrap();
         let home = AstridHome::from_path(root.path());
         let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|_: &StateOwner| Ok(None));
         let store = open_runtime_principal_store(&home, quota.clone())

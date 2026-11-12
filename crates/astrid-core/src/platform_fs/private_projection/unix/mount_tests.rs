@@ -133,9 +133,8 @@ fn bind_mount_inspection_bound_writer_keeps_original_mount_authority() {
     let inspection =
         crate::platform_fs::PrivateProjectionInspection::try_open(root.path()).unwrap();
     let mut mounted = BindMount::attach(root.path()).unwrap();
-    let error = match inspection.open_writer() {
-        Ok(_) => panic!("root bind mount must not rebase captured authority"),
-        Err(error) => error,
+    let Err(error) = inspection.open_writer() else {
+        panic!("root bind mount must not rebase captured authority");
     };
     assert!(error.to_string().contains("mount boundary"), "{error}");
     mounted.unmount().unwrap();

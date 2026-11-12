@@ -57,7 +57,7 @@ async fn atomic_sentinel_staging_without_recovery_intent_is_rejected() {
 }
 
 async fn reject_sentinel_without_intent(staging: bool) {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(root.path());
     home.ensure().unwrap();
     astrid_core::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();
@@ -89,7 +89,7 @@ async fn reject_sentinel_without_intent(staging: bool) {
 }
 
 async fn interrupted_recovery(cut: RestoreCut) {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(root.path());
     home.ensure().unwrap();
     astrid_core::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();
@@ -165,7 +165,7 @@ async fn interrupted_recovery(cut: RestoreCut) {
 
 #[tokio::test]
 async fn replacement_key_cannot_seed_missing_volume_identity() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(root.path());
     home.ensure().unwrap();
     let store = open_runtime_principal_store(&home, quota()).await.unwrap();
@@ -184,7 +184,7 @@ async fn replacement_key_cannot_seed_missing_volume_identity() {
 
 #[tokio::test]
 async fn active_projection_cannot_be_reclassified_as_stopped_key_recovery() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(root.path());
     home.ensure().unwrap();
     let store = open_runtime_principal_store(&home, quota()).await.unwrap();
@@ -204,7 +204,7 @@ async fn active_projection_cannot_be_reclassified_as_stopped_key_recovery() {
 
 #[tokio::test]
 async fn stopped_volume_recovers_replacement_key_without_changing_identity() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(root.path());
     home.ensure().unwrap();
     astrid_core::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();

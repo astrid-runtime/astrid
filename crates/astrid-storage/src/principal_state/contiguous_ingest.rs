@@ -193,7 +193,7 @@ mod tests {
 
     #[tokio::test]
     async fn packed_volume_reopens_home_payloads() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_directory::temporary().unwrap();
         let home = AstridHome::from_path(directory.path());
         home.ensure().unwrap();
         let store = open_runtime_principal_store(&home, unlimited_quota())
@@ -229,7 +229,7 @@ mod tests {
 
     #[tokio::test]
     async fn packed_home_deduplicates_repeated_chunks_without_loose_regions() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_directory::temporary().unwrap();
         let home = AstridHome::from_path(directory.path());
         home.ensure().unwrap();
         let store = open_runtime_principal_store(&home, unlimited_quota())
@@ -268,10 +268,16 @@ mod tests {
             after_second.saturating_sub(after_first) < u64::try_from(bytes.len()).unwrap(),
             "identical second file recopied payload: {after_first} -> {after_second}"
         );
-        let copy_directory = tempfile::tempdir().unwrap();
+        let copy_directory = crate::test_directory::temporary().unwrap();
         let copy_home = AstridHome::from_path(copy_directory.path());
         copy_home.ensure().unwrap();
-        std::fs::copy(&volume_path, copy_home.storage_volume_path()).unwrap();
+        let mut image = Vec::new();
+        store.write_preclose_volume_image(&mut image).unwrap();
+        astrid_core::platform_fs::atomic_write_private_file(
+            &copy_home.storage_volume_path(),
+            &image,
+        )
+        .unwrap();
 
         store.engine.close().unwrap();
         drop(store);
@@ -313,9 +319,32 @@ mod tests {
         );
     }
 
+    fn distinct_files(
+        directory: &std::path::Path,
+        count: usize,
+    ) -> (Vec<ContiguousFileIngest>, u64) {
+        std::fs::create_dir(directory).unwrap();
+        let mut files = Vec::with_capacity(count);
+        let mut logical_bytes = 0_u64;
+        for index in 0..count {
+            let mut bytes = vec![0xA5_u8; 256];
+            bytes[0] = u8::try_from(index % 256).unwrap();
+            bytes[1] = u8::try_from(index / 256).unwrap();
+            let path = directory.join(format!("{index:04}.bin"));
+            std::fs::write(&path, &bytes).unwrap();
+            logical_bytes = logical_bytes.strict_add(u64::try_from(bytes.len()).unwrap());
+            files.push(ContiguousFileIngest::new(
+                ContentName::new(format!("u/{index:04}.bin")).unwrap(),
+                path,
+                u64::try_from(bytes.len()).unwrap(),
+            ));
+        }
+        (files, logical_bytes)
+    }
+
     #[tokio::test]
     async fn volume_flush_does_not_journal_a_full_index_snapshot_per_file() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_directory::temporary().unwrap();
         let home = AstridHome::from_path(directory.path());
         home.ensure().unwrap();
         let store = open_runtime_principal_store(&home, unlimited_quota())
@@ -325,25 +354,13 @@ mod tests {
         let volume_path = home.storage_volume_path();
         // Opening durably initializes the home, including restoration intent.
         // Measure ingest and its close fence separately from that fixed work.
-        let initialization = crate::volume::write_record_payloads(&volume_path).unwrap();
-        let unique_dir = directory.path().join("unique");
-        std::fs::create_dir(&unique_dir).unwrap();
-        let file_count = 512_usize;
-        let mut files = Vec::with_capacity(file_count);
-        let mut logical_bytes = 0_u64;
-        for index in 0..file_count {
-            let mut bytes = vec![0xA5_u8; 256];
-            bytes[0] = u8::try_from(index % 256).unwrap();
-            bytes[1] = u8::try_from(index / 256).unwrap();
-            let path = unique_dir.join(format!("{index:04}.bin"));
-            std::fs::write(&path, &bytes).unwrap();
-            logical_bytes += u64::try_from(bytes.len()).unwrap();
-            files.push(ContiguousFileIngest::new(
-                ContentName::new(format!("u/{index:04}.bin")).unwrap(),
-                path,
-                u64::try_from(bytes.len()).unwrap(),
-            ));
-        }
+        let initialization = store
+            .volume_binding
+            .upgrade()
+            .unwrap()
+            .write_record_payloads()
+            .unwrap();
+        let (files, logical_bytes) = distinct_files(&directory.path().join("unique"), 512);
         store.put_contiguous_files(owner, files).unwrap();
         store.engine.close().unwrap();
         drop(store);

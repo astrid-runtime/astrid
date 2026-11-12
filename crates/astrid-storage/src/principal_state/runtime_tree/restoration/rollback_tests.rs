@@ -8,8 +8,8 @@ use astrid_core::platform_fs::PrivateFileProjection;
 
 use super::rollback::RollbackSpool;
 
-fn private_root() -> (tempfile::TempDir, PrivateFileProjection) {
-    let root = tempfile::tempdir().unwrap();
+fn private_root() -> (crate::test_directory::TestDirectory, PrivateFileProjection) {
+    let root = crate::test_directory::temporary().unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;

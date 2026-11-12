@@ -89,6 +89,13 @@ Invoke-NativeCargoTest -CargoArgs @(
 Invoke-NativeCargoTest -CargoArgs @(
     "test", "--locked", "--target", $Target,
     "-p", "astrid-storage", "--all-features",
+    "principal_state::contiguous_ingest::tests",
+    "--", "--nocapture"
+)
+
+Invoke-NativeCargoTest -CargoArgs @(
+    "test", "--locked", "--target", $Target,
+    "-p", "astrid-storage", "--all-features",
     "principal_state::lifecycle",
     "--", "--nocapture"
 )

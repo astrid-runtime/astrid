@@ -918,5 +918,4 @@ fn legacy_projection_pack_publish_only(
 }
 
 #[cfg(test)]
-#[path = "runtime_tree_tests.rs"]
 mod tests;

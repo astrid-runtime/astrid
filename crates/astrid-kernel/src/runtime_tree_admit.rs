@@ -276,9 +276,7 @@ mod tests {
 
     #[tokio::test]
     async fn admits_runtime_tree_once_and_reopens_from_preclose_copy() {
-        let home_dir = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(home_dir.path());
-        home.ensure().unwrap();
+        let (_home_dir, home) = private_home_fixture();
         let store = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
             .await
             .unwrap();
@@ -302,12 +300,12 @@ mod tests {
             "receipt-matching admission republished content"
         );
 
-        let copied_dir = tempfile::tempdir().unwrap();
-        let copied_home = AstridHome::from_path(copied_dir.path());
-        copied_home.ensure().unwrap();
-        fs::copy(
-            home.storage_volume_path(),
-            copied_home.storage_volume_path(),
+        let (_copied_dir, copied_home) = private_home_fixture();
+        let mut image = Vec::new();
+        store.write_preclose_volume_image(&mut image).unwrap();
+        astrid_core::platform_fs::atomic_write_private_file(
+            &copied_home.storage_volume_path(),
+            &image,
         )
         .unwrap();
         let reopened =
@@ -379,9 +377,7 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_home_admits_generated_control_files() {
-        let directory = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(directory.path());
-        home.ensure().unwrap();
+        let (_directory, home) = private_home_fixture();
         let store = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
             .await
             .unwrap();
@@ -409,9 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn source_mutation_during_admission_fails_closed_without_receipt() {
-        let directory = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(directory.path());
-        home.ensure().unwrap();
+        let (_directory, home) = private_home_fixture();
         let store = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
             .await
             .unwrap();

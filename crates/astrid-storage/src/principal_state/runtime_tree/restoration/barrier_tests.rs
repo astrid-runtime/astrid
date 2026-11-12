@@ -19,8 +19,12 @@ fn unlimited() -> Arc<dyn KvQuotaResolver<StateOwner>> {
     Arc::new(|_: &StateOwner| Ok(None))
 }
 
-async fn fixture() -> (tempfile::TempDir, AstridHome, RuntimePrincipalStore) {
-    let directory = tempfile::tempdir().unwrap();
+async fn fixture() -> (
+    crate::test_directory::TestDirectory,
+    AstridHome,
+    RuntimePrincipalStore,
+) {
+    let directory = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(directory.path());
     let store = open_runtime_principal_store(&home, unlimited())
         .await

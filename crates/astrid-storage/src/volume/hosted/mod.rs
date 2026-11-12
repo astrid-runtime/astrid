@@ -909,7 +909,7 @@ mod sync_tests;
 
 #[cfg(test)]
 mod checkpoint_tests;
-#[cfg(test)]
+#[cfg(any(test, feature = "crash-replay"))]
 mod test_support;
 
 #[cfg(test)]

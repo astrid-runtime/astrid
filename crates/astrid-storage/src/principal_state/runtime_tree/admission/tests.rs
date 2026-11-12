@@ -13,6 +13,15 @@ async fn fixture() -> (tempfile::TempDir, AstridHome, RuntimePrincipalStore) {
     (parent, home, store)
 }
 
+fn physical_writes(store: &RuntimePrincipalStore) -> Vec<(String, u64)> {
+    store
+        .volume_binding
+        .upgrade()
+        .expect("live test store retains its volume")
+        .write_record_payloads()
+        .unwrap()
+}
+
 #[tokio::test]
 async fn unchanged_payload_batch_adds_no_root_or_physical_history() {
     let (_parent, home, store) = fixture().await;
@@ -23,22 +32,16 @@ async fn unchanged_payload_batch_adds_no_root_or_physical_history() {
         .finish(b"receipt".to_vec())
         .unwrap();
     let before_root = store.engine.root(&StateOwner::System).unwrap();
-    let before_writes = crate::volume::write_record_payloads(&home.storage_volume_path()).unwrap();
+    let before_writes = physical_writes(&store);
     let entries = scan(home.root()).unwrap();
     let pending = store
         .admit_runtime_tree_snapshot(&home, &entries, control())
         .unwrap();
     assert_eq!(store.engine.root(&StateOwner::System).unwrap(), before_root);
-    assert_eq!(
-        crate::volume::write_record_payloads(&home.storage_volume_path()).unwrap(),
-        before_writes
-    );
+    assert_eq!(physical_writes(&store), before_writes);
     pending.finish(b"receipt".to_vec()).unwrap();
     assert_eq!(store.engine.root(&StateOwner::System).unwrap(), before_root);
-    assert_eq!(
-        crate::volume::write_record_payloads(&home.storage_volume_path()).unwrap(),
-        before_writes
-    );
+    assert_eq!(physical_writes(&store), before_writes);
 }
 
 #[tokio::test]
@@ -84,6 +87,8 @@ async fn completion_catalog_conflict_rolls_back_only_its_host_receipt() {
         let (_parent, home, store) = fixture().await;
         let control_path = home.root().join(control().as_str());
         if let Some(bytes) = prior {
+            astrid_core::platform_fs::ensure_private_directory(control_path.parent().unwrap())
+                .unwrap();
             astrid_core::platform_fs::atomic_write_private_file(&control_path, bytes).unwrap();
         }
         let snapshot = scan(home.root()).unwrap();
@@ -292,7 +297,7 @@ async fn invalid_control_names_do_not_mutate_host_or_volume() {
     let (_parent, home, store) = fixture().await;
     let snapshot = scan(home.root()).unwrap();
     let before = store.engine.root(&StateOwner::System).unwrap();
-    let writes = crate::volume::write_record_payloads(&home.storage_volume_path()).unwrap();
+    let writes = physical_writes(&store);
     for raw in [
         "../astrid.volume",
         "x/../astrid.volume",
@@ -315,10 +320,7 @@ async fn invalid_control_names_do_not_mutate_host_or_volume() {
             "accepted {raw}"
         );
         assert_eq!(store.engine.root(&StateOwner::System).unwrap(), before);
-        assert_eq!(
-            crate::volume::write_record_payloads(&home.storage_volume_path()).unwrap(),
-            writes
-        );
+        assert_eq!(physical_writes(&store), writes);
     }
 }
 
@@ -327,7 +329,7 @@ async fn control_namespace_aliases_use_the_real_host_rules() {
     let (_parent, home, store) = fixture().await;
     let snapshot = scan(home.root()).unwrap();
     let before = store.engine.root(&StateOwner::System).unwrap();
-    let writes = crate::volume::write_record_payloads(&home.storage_volume_path()).unwrap();
+    let writes = physical_writes(&store);
     // Admission uses the same actual-target name semantics as restoration.
     let case_sensitive =
         astrid_core::platform_fs::name_semantics::directory_is_case_sensitive(home.root()).unwrap();
@@ -337,15 +339,16 @@ async fn control_namespace_aliases_use_the_real_host_rules() {
         ContentName::new("ASTRID.VOLUME").unwrap(),
     );
     if case_sensitive {
+        // This is a valid distinct name, so payload/ACTIVE publication is
+        // allowed; only the completed host control receipt is still absent.
         drop(result.expect("distinct spelling on a case-sensitive root"));
+        assert!(active::read(&home, &store).unwrap().is_some());
+        assert!(!home.root().join("ASTRID.VOLUME").exists());
     } else {
         assert!(result.is_err());
+        assert_eq!(store.engine.root(&StateOwner::System).unwrap(), before);
+        assert_eq!(physical_writes(&store), writes);
     }
-    assert_eq!(store.engine.root(&StateOwner::System).unwrap(), before);
-    assert_eq!(
-        crate::volume::write_record_payloads(&home.storage_volume_path()).unwrap(),
-        writes
-    );
 }
 
 #[tokio::test]
@@ -361,7 +364,7 @@ async fn control_peer_alias_uses_the_real_host_rules_before_publication() {
         .unwrap();
     let snapshot = scan(home.root()).unwrap();
     let before = store.engine.root(&StateOwner::System).unwrap();
-    let writes = crate::volume::write_record_payloads(&home.storage_volume_path()).unwrap();
+    let writes = physical_writes(&store);
     let case_sensitive =
         astrid_core::platform_fs::name_semantics::directory_is_case_sensitive(home.root()).unwrap();
     let result =
@@ -376,10 +379,7 @@ async fn control_peer_alias_uses_the_real_host_rules_before_publication() {
     }
     assert_eq!(std::fs::read(&path).unwrap(), b"source data");
     assert_eq!(store.engine.root(&StateOwner::System).unwrap(), before);
-    assert_eq!(
-        crate::volume::write_record_payloads(&home.storage_volume_path()).unwrap(),
-        writes
-    );
+    assert_eq!(physical_writes(&store), writes);
 }
 
 #[cfg(unix)]

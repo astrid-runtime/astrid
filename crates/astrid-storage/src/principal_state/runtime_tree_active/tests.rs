@@ -158,7 +158,7 @@ fn long_inventory_name(index: usize) -> ContentName {
 
 #[tokio::test]
 async fn sparse_receipt_reads_do_not_list_growing_unrelated_catalogs() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(directory.path());
     let store = open_runtime_principal_store(&home, unlimited_quota())
         .await
@@ -221,7 +221,7 @@ async fn sparse_receipt_reads_do_not_list_growing_unrelated_catalogs() {
 
 #[tokio::test]
 async fn receipt_allocation_boundary_selects_authenticated_inventory_source() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(directory.path());
     let store = open_runtime_principal_store(&home, unlimited_quota())
         .await
@@ -274,7 +274,7 @@ async fn receipt_allocation_boundary_selects_authenticated_inventory_source() {
 async fn public_receipt_read_scales_past_four_mib_with_one_catalog_list() {
     const COUNT: usize = 10_000;
 
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(directory.path());
     let store = open_runtime_principal_store(&home, unlimited_quota())
         .await
@@ -458,7 +458,7 @@ fn publish_forged_system_catalog_leaf_length(
 
 #[tokio::test]
 async fn public_receipt_read_rejects_catalog_file_logical_length_disagreement() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(directory.path());
     let store = open_runtime_principal_store(&home, unlimited_quota())
         .await

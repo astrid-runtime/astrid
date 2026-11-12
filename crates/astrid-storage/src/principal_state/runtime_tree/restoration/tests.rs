@@ -113,7 +113,7 @@ async fn interrupted_restore(cut: &'static str) {
 }
 
 async fn interrupted_restore_with_residue(cut: &'static str, residue: Option<SentinelResidue>) {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(root.path());
     home.ensure().unwrap();
     let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|_: &StateOwner| Ok(None));
@@ -299,7 +299,7 @@ async fn keyless_sentinel_cleanup_requires_its_same_root_retiring_inventory() {
 async fn reject_sentinel_cleanup(invalid: InvalidSentinelIntent) {
     use runtime_tree::ReceiptPhase;
 
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(root.path());
     home.ensure().unwrap();
     let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|_: &StateOwner| Ok(None));
@@ -381,7 +381,7 @@ async fn matching_payload_replaces_hardlink_without_mutating_alias() {
 #[tokio::test]
 async fn unchanged_private_directory_marker_does_not_rotate_restoration_intent() {
     use crate::{AstridFilesystem, FilesystemPath};
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(root.path());
     home.ensure().unwrap();
     let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|_: &StateOwner| Ok(None));
@@ -455,7 +455,7 @@ async fn bind_mount_matching_skip_rejects_mounted_private_subtree() {
 
 #[tokio::test]
 async fn ordinary_restore_has_durable_retiring_intent_before_host_publication() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(directory.path());
     home.ensure().unwrap();
     let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|_: &StateOwner| Ok(None));
@@ -563,7 +563,7 @@ impl Drop for BackupRaceReset {
     }
 }
 async fn restore_refuses_target_changed_after_backup(existing: bool) {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(root.path());
     home.ensure().unwrap();
     let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|_: &StateOwner| Ok(None));
