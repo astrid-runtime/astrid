@@ -528,3 +528,75 @@ fn volume_sentinel_seed_avoids_global_temporary_files() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// Neutral old-compatible hook: no production behavior or new core API involved.
+thread_local! {
+    static BACKUP_RACE: RefCell<Option<(PathBuf, bool)>> = const { RefCell::new(None) };
+}
+pub(super) fn after_backup(root: &Path, name: &str) {
+    if name != "config.toml" {
+        return;
+    }
+    let race = BACKUP_RACE.with_borrow_mut(|slot| {
+        if slot.as_ref().is_some_and(|(expected, _)| expected == root) {
+            slot.take()
+        } else {
+            None
+        }
+    });
+    let Some((_, existing)) = race else { return };
+    let path = root.join(name);
+    if existing {
+        // Retain the old inode to exclude inode-reuse ambiguity.
+        std::fs::rename(&path, root.join("prior-config.saved"))
+            .expect("perform the exact armed replacement race");
+    } else {
+        assert!(!path.exists(), "armed absence must really be absent");
+    }
+    std::fs::write(path, b"concurrent host generation")
+        .expect("perform the exact armed create race");
+}
+struct BackupRaceReset;
+impl Drop for BackupRaceReset {
+    fn drop(&mut self) {
+        BACKUP_RACE.with_borrow_mut(|slot| *slot = None);
+    }
+}
+async fn restore_refuses_target_changed_after_backup(existing: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(root.path());
+    home.ensure().unwrap();
+    let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|_: &StateOwner| Ok(None));
+    let store = open_runtime_principal_store(&home, quota).await.unwrap();
+    runtime_tree::write_projection_file(home.root(), "config.toml", b"durable config").unwrap();
+    store.pack_and_retire_runtime_projection(&home).unwrap();
+    if existing {
+        // A mismatching host generation forces actual replacement, not skip.
+        runtime_tree::write_projection_file(home.root(), "config.toml", b"prior host config")
+            .unwrap();
+    }
+    BACKUP_RACE.with_borrow_mut(|slot| *slot = Some((home.root().to_path_buf(), existing)));
+    let _reset = BackupRaceReset;
+    let result = super::restore_projection(&home, &store, &store.content);
+    assert!(
+        BACKUP_RACE.with_borrow(Option::is_none),
+        "race hook was not reached"
+    );
+    assert!(
+        result.is_err(),
+        "restore must refuse the changed generation before publication"
+    );
+    assert_eq!(
+        std::fs::read(home.root().join("config.toml")).unwrap(),
+        b"concurrent host generation",
+        "a prepublication failure must not roll back an unrelated target"
+    );
+}
+#[tokio::test]
+async fn ordinary_restore_preserves_file_created_after_backup() {
+    restore_refuses_target_changed_after_backup(false).await;
+}
+#[tokio::test]
+async fn ordinary_restore_preserves_file_replaced_after_backup() {
+    restore_refuses_target_changed_after_backup(true).await;
+}

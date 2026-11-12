@@ -127,24 +127,56 @@ impl ProjectionRoot {
         reader: &mut dyn Read,
         exact_len: u64,
     ) -> io::Result<()> {
-        self.cleanup_temporary()?;
-        let (dirs, name) = split_relative(relative)?;
-        reject_reserved_name(name)?;
-        self.guard
-            .verify_contract(BoundaryContract::ExactPrivateDirectory)?;
-        let published = if dirs.is_empty() {
-            let path = self.guard.authority_boundary().join(name);
-            publish::publish_from_reader(&self.guard, &path, reader, exact_len, self.staging_scope)
+        Replacement::for_write(self, relative)?
+            .write_from(reader, exact_len)
+            .1
+    }
+
+    pub(in crate::platform_fs) fn capture_replacement<'a>(
+        &'a self,
+        relative: &[OsString],
+        sink: &mut dyn Write,
+    ) -> io::Result<(Replacement<'a>, Option<u64>)> {
+        let replacement = Replacement::for_write(self, relative)?;
+        let length = replacement.snapshot_to(sink)?;
+        Ok((replacement, length))
+    }
+
+    pub(in crate::platform_fs) fn rollback_publication(
+        &self,
+        relative: &[OsString],
+        installed: Publication,
+        prior: Option<(&mut dyn Read, u64)>,
+    ) -> io::Result<()> {
+        if installed.root != self.identity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "publication belongs to a different projection root",
+            ));
+        }
+        let replacement = Replacement::open(self, relative, ParentMode::Existing)?;
+        if replacement.previous != Some(installed.file) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "published projection file was replaced before rollback",
+            ));
+        }
+        if let Some((reader, length)) = prior {
+            replacement.write_from(reader, length).1
         } else {
-            let parent = self.guard.capture_descendant_directory(dirs, true)?;
-            let path = parent.authority_boundary().join(name);
-            publish::publish_from_reader(&parent, &path, reader, exact_len, self.staging_scope)
-        };
-        match published {
-            Ok(()) => self
-                .guard
-                .verify_contract(BoundaryContract::ExactPrivateDirectory),
-            Err(failure) => Err(self.retain_publish_failure(failure)),
+            publish::require_destination(
+                replacement.parent(),
+                &replacement.path,
+                Some(installed.file),
+            )?;
+            remove_guarded_file_with_contract(
+                replacement.parent(),
+                &replacement.path,
+                FileContract::Trusted,
+            )?;
+            flush_captured_namespace(replacement.parent())?;
+            self.guard
+                .verify_contract(BoundaryContract::ExactPrivateDirectory)
         }
     }
 
@@ -504,7 +536,7 @@ thread_local! {
 ///
 /// Drop the returned guard (or let it fall out of scope) to clear the arm so
 /// parallel tests cannot steal faults.
-pub(in crate::platform_fs::windows) fn install_namespace_flush_failures(
+pub(in crate::platform_fs) fn install_namespace_flush_failures(
     count: usize,
 ) -> NamespaceFlushFaultReset {
     NAMESPACE_FLUSH_FAILURES.with(|slot| slot.set(count));
@@ -513,7 +545,7 @@ pub(in crate::platform_fs::windows) fn install_namespace_flush_failures(
 
 #[cfg(test)]
 #[must_use]
-pub(in crate::platform_fs::windows) struct NamespaceFlushFaultReset;
+pub(in crate::platform_fs) struct NamespaceFlushFaultReset;
 
 #[cfg(test)]
 impl Drop for NamespaceFlushFaultReset {
@@ -534,4 +566,126 @@ fn test_maybe_fail_namespace_flush() -> io::Result<()> {
             "injected projection namespace flush failure",
         ))
     })
+}
+
+/// Private publication receipt binds the exact installed identity to its root.
+#[derive(Clone, Copy)]
+pub(in crate::platform_fs) struct Publication {
+    root: FileIdentity,
+    file: FileIdentity,
+}
+
+#[derive(Clone, Copy)]
+enum ParentMode {
+    Create,
+    Existing,
+}
+
+pub(in crate::platform_fs) struct Replacement<'a> {
+    owner: &'a ProjectionRoot,
+    parent: Option<TrustedPathGuard>,
+    path: PathBuf,
+    previous: Option<FileIdentity>,
+}
+impl<'a> Replacement<'a> {
+    fn for_write(owner: &'a ProjectionRoot, relative: &[OsString]) -> io::Result<Self> {
+        Self::open(owner, relative, ParentMode::Create)
+    }
+
+    fn open(
+        owner: &'a ProjectionRoot,
+        relative: &[OsString],
+        mode: ParentMode,
+    ) -> io::Result<Self> {
+        owner.cleanup_temporary()?;
+        let (dirs, name) = split_relative(relative)?;
+        reject_reserved_name(name)?;
+        owner
+            .guard
+            .verify_contract(BoundaryContract::ExactPrivateDirectory)?;
+        let parent = if dirs.is_empty() {
+            None
+        } else {
+            Some(
+                owner
+                    .guard
+                    .capture_descendant_directory(dirs, matches!(mode, ParentMode::Create))?,
+            )
+        };
+        let guard = parent.as_ref().unwrap_or(&owner.guard);
+        let path = guard.authority_boundary().join(name);
+        let previous = publish::destination_identity(guard, &path)?;
+        Ok(Self {
+            owner,
+            parent,
+            path,
+            previous,
+        })
+    }
+    fn parent(&self) -> &TrustedPathGuard {
+        self.parent.as_ref().unwrap_or(&self.owner.guard)
+    }
+    fn snapshot_to(&self, sink: &mut dyn Write) -> io::Result<Option<u64>> {
+        publish::require_destination(self.parent(), &self.path, self.previous)?;
+        let Some(identity) = self.previous else {
+            self.parent()
+                .verify_contract(BoundaryContract::ExactPrivateDirectory)?;
+            return Ok(None);
+        };
+        let mut file = open_guarded_regular_file(self.parent(), &self.path, FileContract::Trusted)?;
+        if super::path::file_identity(&file)? != identity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "projection changed before backup",
+            ));
+        }
+        let length = io::copy(&mut file, sink)?;
+        validate_file_contract(
+            file.as_raw_handle().cast(),
+            &self.path,
+            FileContract::Trusted,
+        )?;
+        drop(file);
+        publish::require_destination(self.parent(), &self.path, self.previous)?;
+        self.parent()
+            .verify_contract(BoundaryContract::ExactPrivateDirectory)?;
+        self.owner
+            .guard
+            .verify_contract(BoundaryContract::ExactPrivateDirectory)?;
+        Ok(Some(length))
+    }
+    pub(in crate::platform_fs) fn write_from(
+        self,
+        reader: &mut dyn Read,
+        length: u64,
+    ) -> (Option<Publication>, io::Result<()>) {
+        if let Err(error) = publish::require_destination(self.parent(), &self.path, self.previous) {
+            return (None, Err(error));
+        }
+        match publish::publish_from_reader(
+            self.parent(),
+            &self.path,
+            reader,
+            length,
+            self.owner.staging_scope,
+            self.previous,
+        ) {
+            Ok(file) => (
+                Some(Publication {
+                    root: self.owner.identity,
+                    file,
+                }),
+                self.owner
+                    .guard
+                    .verify_contract(BoundaryContract::ExactPrivateDirectory),
+            ),
+            Err(mut failure) => {
+                let installed = failure.published.take().map(|file| Publication {
+                    root: self.owner.identity,
+                    file,
+                });
+                (installed, Err(self.owner.retain_publish_failure(failure)))
+            },
+        }
+    }
 }

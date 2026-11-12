@@ -207,6 +207,7 @@ fn projection_entries(
 struct WrittenFile {
     name: ContentName,
     previous: rollback::PreviousGeneration,
+    publication: astrid_core::platform_fs::PrivateFilePublication,
 }
 
 fn restore_entries<'a>(
@@ -269,16 +270,22 @@ fn restore_entries<'a>(
         }
         reader.rewind();
         let writer = prepare(home, store, prepared)?;
-        let previous = spool
+        let (replacement, previous) = spool
             .capture(writer, Path::new(name))
             .map_err(|error| tree_error(&path, error))?;
-        written.push(WrittenFile {
-            name: entry.name().clone(),
-            previous,
-        });
-        writer
-            .write_from(Path::new(name), &mut reader, length)
-            .map_err(|error| tree_error(&path, error))?;
+        #[cfg(test)]
+        tests::after_backup(home.root(), name);
+        let (publication, result) = replacement.write_from(&mut reader, length).into_parts();
+        if let Some(publication) = publication {
+            // Rename may have succeeded before a later durability fence failed.
+            // Enroll that exact installed identity before propagating the error.
+            written.push(WrittenFile {
+                name: entry.name().clone(),
+                previous,
+                publication,
+            });
+        }
+        result.map_err(|error| tree_error(&path, error))?;
         #[cfg(test)]
         tests::after_write(home.root(), name);
         if is_staging_generation(name) {
@@ -368,7 +375,7 @@ fn rollback(
     if let Some(writer) = prepared.and_then(|state| state.projection.as_ref()) {
         for file in written.into_iter().rev() {
             let path = Path::new(file.name.as_str());
-            if let Err(error) = spool.restore(writer, path, file.previous) {
+            if let Err(error) = spool.restore(writer, file.publication, file.previous) {
                 errors.push(format!("{}: {error}", path.display()));
             }
         }

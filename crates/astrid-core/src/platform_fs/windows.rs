@@ -45,10 +45,14 @@ pub(super) use path::{
 };
 pub(super) use private_file::{atomic_write_private_file, read_private_file_to_string};
 pub(in crate::platform_fs) use projection_session::{
-    ProjectionInspection, ProjectionRoot, create_private_scratch_file,
+    ProjectionInspection, ProjectionRoot, Publication as ProjectionPublication,
+    Replacement as ProjectionReplacement, create_private_scratch_file,
 };
 pub(super) use rename::rename_with_write_through;
 
 #[cfg(test)]
 #[path = "windows/tests.rs"]
 mod native_tests;
+
+#[cfg(test)]
+pub(in crate::platform_fs) use projection_session::install_namespace_flush_failures as install_projection_namespace_flush_failures;

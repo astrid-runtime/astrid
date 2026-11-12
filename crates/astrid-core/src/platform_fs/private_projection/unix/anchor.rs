@@ -28,7 +28,7 @@ pub(super) struct Root {
     parent: File,
     name: OsString,
     pub(super) file: File,
-    identity: Identity,
+    pub(super) identity: Identity,
     absolute: PathBuf,
 }
 
@@ -114,6 +114,8 @@ impl<'a> DirectoryChain<'a> {
         names: &[OsString],
         policy: WalkPolicy,
     ) -> io::Result<Option<Self>> {
+        #[cfg(test)]
+        RELATIVE_WALKS.with(|count| count.set(count.get().strict_add(1)));
         root.validate(boundary)?;
         let mut chain = Self {
             root,
@@ -235,4 +237,11 @@ fn validate_private_directory(file: &File) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     crate::platform_fs::macos_acl::validate(file)?;
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! { static RELATIVE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+pub(super) fn take_relative_walks() -> usize {
+    RELATIVE_WALKS.with(|count| count.replace(0))
 }

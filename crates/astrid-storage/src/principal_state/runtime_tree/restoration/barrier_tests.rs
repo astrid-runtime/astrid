@@ -162,30 +162,33 @@ async fn rollback_attempts_every_destination_after_one_fails() {
     writer
         .write(std::path::Path::new("blocked"), b"prior")
         .unwrap();
-    let previous_blocked = spool
+    let (replace_blocked, previous_blocked) = spool
         .capture(writer, std::path::Path::new("blocked"))
         .unwrap();
-    writer
-        .write(std::path::Path::new("blocked"), b"new")
-        .unwrap();
+    let (publication_blocked, result) =
+        replace_blocked.write_from(&mut &b"new"[..], 3).into_parts();
+    result.unwrap();
     fs::remove_file(home.root().join("blocked")).unwrap();
     fs::create_dir(home.root().join("blocked")).unwrap();
 
-    let previous_removed = spool
+    let (replace_removed, previous_removed) = spool
         .capture(writer, std::path::Path::new("removed"))
         .unwrap();
-    writer
-        .write(std::path::Path::new("removed"), b"remove")
-        .unwrap();
+    let (publication_removed, result) = replace_removed
+        .write_from(&mut &b"remove"[..], 6)
+        .into_parts();
+    result.unwrap();
 
     let written = vec![
         super::WrittenFile {
             name: ContentName::new("removed").unwrap(),
             previous: previous_removed,
+            publication: publication_removed.unwrap(),
         },
         super::WrittenFile {
             name: ContentName::new("blocked").unwrap(),
             previous: previous_blocked,
+            publication: publication_blocked.unwrap(),
         },
     ];
     let errors = super::rollback(&home, Some(&prepared), &mut spool, written, &mut || Ok(()));

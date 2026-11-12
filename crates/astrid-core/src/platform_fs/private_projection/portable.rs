@@ -234,3 +234,45 @@ fn is_non_match(error: &io::Error) -> bool {
             | io::ErrorKind::InvalidInput
     )
 }
+
+// Stream replacement is unsupported here, matching the existing write_from policy.
+pub(super) struct FileIdentity;
+pub(super) struct Replacement<'a>(std::marker::PhantomData<&'a Projection>);
+impl Replacement<'_> {
+    pub(super) fn write_from(
+        self,
+        _: &mut dyn io::Read,
+        _: u64,
+    ) -> (Option<FileIdentity>, io::Result<()>) {
+        (
+            None,
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "native private-file stream backend is unavailable",
+            )),
+        )
+    }
+}
+impl Projection {
+    pub(super) fn capture_replacement<'a>(
+        &'a self,
+        _: &RelativePath,
+        _: &mut dyn io::Write,
+    ) -> io::Result<(Replacement<'a>, Option<u64>)> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native private-file stream backend is unavailable",
+        ))
+    }
+    pub(super) fn rollback_publication(
+        &self,
+        _: &RelativePath,
+        _: FileIdentity,
+        _: Option<(&mut dyn io::Read, u64)>,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native private-file stream backend is unavailable",
+        ))
+    }
+}

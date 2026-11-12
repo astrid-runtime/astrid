@@ -5,6 +5,9 @@ use std::io::{self, Read, Write};
 use super::RelativePath;
 use crate::platform_fs::StagingScope;
 use crate::platform_fs::windows::{ProjectionInspection as NativeInspection, ProjectionRoot};
+pub(super) use crate::platform_fs::windows::{
+    ProjectionPublication as FileIdentity, ProjectionReplacement as Replacement,
+};
 
 pub(super) struct Projection {
     inner: ProjectionRoot,
@@ -32,6 +35,23 @@ impl Projection {
         output: &mut dyn Write,
     ) -> io::Result<Option<u64>> {
         self.inner.snapshot_to(&relative.0, output)
+    }
+
+    pub(super) fn capture_replacement<'a>(
+        &'a self,
+        relative: &RelativePath,
+        sink: &mut dyn Write,
+    ) -> io::Result<(Replacement<'a>, Option<u64>)> {
+        self.inner.capture_replacement(&relative.0, sink)
+    }
+    pub(super) fn rollback_publication(
+        &self,
+        relative: &RelativePath,
+        identity: FileIdentity,
+        prior: Option<(&mut dyn Read, u64)>,
+    ) -> io::Result<()> {
+        self.inner
+            .rollback_publication(&relative.0, identity, prior)
     }
 
     pub(super) fn write(&self, relative: &RelativePath, bytes: &[u8]) -> io::Result<()> {

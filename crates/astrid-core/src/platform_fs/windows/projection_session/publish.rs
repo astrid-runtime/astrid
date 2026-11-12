@@ -13,7 +13,9 @@ use super::super::acl::validate_private_acl_handle;
 use super::super::io::{
     FileContract, create_guarded_private_file, rename_guarded_handle, validate_file_contract,
 };
-use super::super::path::{BoundaryContract, TrustedPathGuard, mark_handle_for_deletion};
+use super::super::path::{
+    BoundaryContract, FileIdentity, TrustedPathGuard, file_identity, mark_handle_for_deletion,
+};
 use super::super::prelude::*;
 use crate::platform_fs::StagingScope;
 
@@ -64,7 +66,8 @@ pub(super) fn publish_from_reader(
     reader: &mut dyn Read,
     exact_len: u64,
     staging_scope: Option<StagingScope>,
-) -> Result<(), PublishFailure> {
+    expected: Option<FileIdentity>,
+) -> Result<FileIdentity, PublishFailure> {
     parent
         .verify_contract(BoundaryContract::ExactPrivateDirectory)
         .map_err(PublishFailure::without_pending)?;
@@ -80,7 +83,15 @@ pub(super) fn publish_from_reader(
             },
             Err(error) => return Err(PublishFailure::without_pending(error)),
         };
-        return finish_publish(parent, destination, reader, exact_len, &temporary, file);
+        return finish_publish(
+            parent,
+            destination,
+            reader,
+            exact_len,
+            &temporary,
+            file,
+            expected,
+        );
     }
     Err(PublishFailure::without_pending(exhausted.unwrap_or_else(
         || {
@@ -95,6 +106,7 @@ pub(super) fn publish_from_reader(
 pub(super) struct PublishFailure {
     pub error: io::Error,
     pub pending: Option<PendingTemporary>,
+    pub published: Option<FileIdentity>,
 }
 
 impl PublishFailure {
@@ -102,6 +114,7 @@ impl PublishFailure {
         Self {
             error,
             pending: None,
+            published: None,
         }
     }
 }
@@ -113,7 +126,8 @@ fn finish_publish(
     exact_len: u64,
     temporary: &Path,
     mut file: File,
-) -> Result<(), PublishFailure> {
+    expected: Option<FileIdentity>,
+) -> Result<FileIdentity, PublishFailure> {
     let staged = (|| -> io::Result<()> {
         copy_exact(reader, &mut file, exact_len)?;
         file.flush()?;
@@ -124,16 +138,23 @@ fn finish_publish(
             &temporary.display().to_string(),
         )?;
         parent.verify_contract(BoundaryContract::ExactPrivateDirectory)?;
+        require_destination(parent, destination, expected)?;
         Ok(())
     })();
     if let Err(error) = staged {
         return Err(abandon_staged(file, error));
     }
 
+    let installed = match file_identity(&file) {
+        Ok(identity) => identity,
+        Err(error) => return Err(abandon_staged(file, error)),
+    };
     if let Err(error) = rename_guarded_handle(&file, parent, destination, true) {
         return Err(abandon_staged(file, error));
     }
 
+    // Capture publication before any fallible post-rename fence.
+    let publication = Some(installed);
     // Rename committed: this handle now names the destination. Never delete it
     // here; batch rollback restores prior generations on validation failure.
     let published = (|| {
@@ -148,7 +169,14 @@ fn finish_publish(
         Ok(())
     })();
     drop(file);
-    published.map_err(PublishFailure::without_pending)
+    match published {
+        Ok(()) => Ok(installed),
+        Err(error) => Err(PublishFailure {
+            error,
+            pending: None,
+            published: publication,
+        }),
+    }
 }
 
 fn abandon_staged(file: File, error: io::Error) -> PublishFailure {
@@ -165,6 +193,7 @@ fn abandon_staged(file: File, error: io::Error) -> PublishFailure {
                 format!("{error}; temporary cleanup failed: {cleanup}"),
             ),
             pending: Some(pending),
+            published: None,
         },
     }
 }
@@ -226,3 +255,28 @@ fn test_maybe_fail_temporary_cleanup() -> io::Result<()> {
 
 #[cfg(test)]
 static CLEANUP_FAULT_SERIAL: Mutex<()> = Mutex::new(());
+
+/// Reopen the guarded name; a captured absence is distinct from any new file.
+pub(super) fn destination_identity(
+    parent: &TrustedPathGuard,
+    path: &Path,
+) -> io::Result<Option<FileIdentity>> {
+    match super::super::io::open_guarded_regular_file(parent, path, FileContract::Trusted) {
+        Ok(file) => file_identity(&file).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+pub(super) fn require_destination(
+    parent: &TrustedPathGuard,
+    path: &Path,
+    expected: Option<FileIdentity>,
+) -> io::Result<()> {
+    if destination_identity(parent, path)? != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "projection destination changed before mutation",
+        ));
+    }
+    Ok(())
+}

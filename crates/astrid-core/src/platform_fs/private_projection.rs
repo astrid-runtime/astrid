@@ -7,6 +7,8 @@ use std::path::{Component, Path};
 use super::StagingScope;
 
 pub(super) mod compare;
+mod replacement;
+pub use replacement::{PrivateFilePublication, PrivateFileReplacement, PrivateFileWriteOutcome};
 #[cfg(all(unix, test))]
 pub(super) mod walk_counter;
 
@@ -29,6 +31,7 @@ mod platform;
 /// no directory cache grows with the number of files.
 pub struct PrivateFileProjection {
     platform: platform::Projection,
+    binding: std::sync::Arc<()>,
 }
 
 impl PrivateFileProjection {
@@ -43,6 +46,7 @@ impl PrivateFileProjection {
     pub fn open(root: &Path) -> io::Result<Self> {
         Ok(Self {
             platform: platform::Projection::open(root)?,
+            binding: std::sync::Arc::new(()),
         })
     }
 
@@ -57,6 +61,7 @@ impl PrivateFileProjection {
     pub fn open_with_staging(root: &Path, scope: StagingScope) -> io::Result<Self> {
         Ok(Self {
             platform: platform::Projection::open_with_staging(root, scope)?,
+            binding: std::sync::Arc::new(()),
         })
     }
 
@@ -276,3 +281,7 @@ impl RelativePath {
         Ok(Self(names))
     }
 }
+
+#[cfg(all(test, any(unix, windows)))]
+#[path = "private_projection/replacement_tests.rs"]
+mod replacement_tests;

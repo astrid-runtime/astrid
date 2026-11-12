@@ -23,20 +23,22 @@ fn private_root() -> (tempfile::TempDir, PrivateFileProjection) {
 fn rollback_distinguishes_absent_and_empty_without_scratch_bytes() {
     let (root, projection) = private_root();
     let mut spool = RollbackSpool::default();
-    let missing = spool.capture(&projection, Path::new("missing")).unwrap();
+    let (replace_missing, missing) = spool.capture(&projection, Path::new("missing")).unwrap();
     projection.write(Path::new("empty"), &[]).unwrap();
-    let empty = spool.capture(&projection, Path::new("empty")).unwrap();
+    let (replace_empty, empty) = spool.capture(&projection, Path::new("empty")).unwrap();
     assert!(
         !spool.has_scratch_file(),
         "absent and empty generations need no scratch file"
     );
-    projection.write(Path::new("missing"), b"new").unwrap();
-    projection.write(Path::new("empty"), b"new").unwrap();
+    let (published_missing, result) = replace_missing.write_from(&mut &b"new"[..], 3).into_parts();
+    result.unwrap();
+    let (published_empty, result) = replace_empty.write_from(&mut &b"new"[..], 3).into_parts();
+    result.unwrap();
     spool
-        .restore(&projection, Path::new("missing"), missing)
+        .restore(&projection, published_missing.unwrap(), missing)
         .unwrap();
     spool
-        .restore(&projection, Path::new("empty"), empty)
+        .restore(&projection, published_empty.unwrap(), empty)
         .unwrap();
     assert!(!root.path().join("missing").exists());
     assert_eq!(std::fs::read(root.path().join("empty")).unwrap(), b"");
@@ -51,21 +53,33 @@ fn multi_generation_rollback_restores_exact_bytes() {
     projection.write(Path::new("b"), b"B000").unwrap();
     projection.write(Path::new("c"), &[]).unwrap();
 
-    let prev_a = spool.capture(&projection, Path::new("a")).unwrap();
-    let prev_b = spool.capture(&projection, Path::new("b")).unwrap();
-    let prev_c = spool.capture(&projection, Path::new("c")).unwrap();
-    let prev_d = spool.capture(&projection, Path::new("d")).unwrap();
+    let (replace_a, prev_a) = spool.capture(&projection, Path::new("a")).unwrap();
+    let (replace_b, prev_b) = spool.capture(&projection, Path::new("b")).unwrap();
+    let (replace_c, prev_c) = spool.capture(&projection, Path::new("c")).unwrap();
+    let (replace_d, prev_d) = spool.capture(&projection, Path::new("d")).unwrap();
     assert!(spool.has_scratch_file());
 
-    projection.write(Path::new("a"), b"A1").unwrap();
-    projection.write(Path::new("b"), b"B1").unwrap();
-    projection.write(Path::new("c"), b"C1").unwrap();
-    projection.write(Path::new("d"), b"D1").unwrap();
+    let (published_a, result) = replace_a.write_from(&mut &b"A1"[..], 2).into_parts();
+    result.unwrap();
+    let (published_b, result) = replace_b.write_from(&mut &b"B1"[..], 2).into_parts();
+    result.unwrap();
+    let (published_c, result) = replace_c.write_from(&mut &b"C1"[..], 2).into_parts();
+    result.unwrap();
+    let (published_d, result) = replace_d.write_from(&mut &b"D1"[..], 2).into_parts();
+    result.unwrap();
 
-    spool.restore(&projection, Path::new("d"), prev_d).unwrap();
-    spool.restore(&projection, Path::new("c"), prev_c).unwrap();
-    spool.restore(&projection, Path::new("b"), prev_b).unwrap();
-    spool.restore(&projection, Path::new("a"), prev_a).unwrap();
+    spool
+        .restore(&projection, published_d.unwrap(), prev_d)
+        .unwrap();
+    spool
+        .restore(&projection, published_c.unwrap(), prev_c)
+        .unwrap();
+    spool
+        .restore(&projection, published_b.unwrap(), prev_b)
+        .unwrap();
+    spool
+        .restore(&projection, published_a.unwrap(), prev_a)
+        .unwrap();
 
     assert_eq!(std::fs::read(root.path().join("a")).unwrap(), b"A0");
     assert_eq!(std::fs::read(root.path().join("b")).unwrap(), b"B000");

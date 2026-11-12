@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
-use nix::fcntl::{AtFlags, OFlag, openat};
+use nix::fcntl::{AtFlags, OFlag};
 use nix::sys::stat::{FileStat, SFlag, fstat, fstatat};
 use nix::unistd::fsync;
 
@@ -28,6 +28,7 @@ mod write;
 use anchor::{DirectoryChain, Root, WalkPolicy};
 
 pub(super) use inspect::Inspection;
+pub(super) use write::{FileIdentity, Replacement};
 
 pub(super) struct Projection {
     root: Root,
@@ -82,28 +83,31 @@ impl Projection {
         let Some(chain) = self.directories(parents, WalkPolicy::Repair)? else {
             return Ok(None);
         };
-        let parent = chain.directory();
-        let Some(expected) = entry_stat(parent, name)? else {
-            chain.validate(&self.boundary)?;
-            return Ok(None);
-        };
-        require_regular(&expected)?;
-        let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK;
-        let mut file = File::from(
-            openat(
-                parent,
-                name.as_os_str(),
-                flags,
-                nix::sys::stat::Mode::empty(),
-            )
-            .map_err(nix_io_error)?,
-        );
-        verify_identity(parent, name, &file, Identity::read(&expected))?;
-        self.boundary.validate(&file)?;
-        let length = io::copy(&mut file, sink)?;
-        verify_identity(parent, name, &file, Identity::read(&expected))?;
-        chain.validate(&self.boundary)?;
-        Ok(Some(length))
+        write::snapshot_previous(self, &chain, name, sink)
+    }
+
+    pub(super) fn capture_replacement<'a>(
+        &'a self,
+        relative: &RelativePath,
+        sink: &mut dyn io::Write,
+    ) -> io::Result<(Replacement<'a>, Option<u64>)> {
+        Replacement::capture(self, relative, sink)
+    }
+
+    pub(super) fn rollback_publication(
+        &self,
+        relative: &RelativePath,
+        identity: FileIdentity,
+        prior: Option<(&mut dyn io::Read, u64)>,
+    ) -> io::Result<()> {
+        match prior {
+            Some((source, length)) => {
+                let replacement = Replacement::for_existing(self, relative)?;
+                replacement.require_identity(identity)?;
+                replacement.write_from(source, length).1
+            },
+            None => self.remove_expected(relative, Some(identity)),
+        }
     }
 
     pub(super) fn ensure_directory(&self, relative: &RelativePath) -> io::Result<()> {
@@ -209,4 +213,18 @@ fn with_fence_error(error: io::Error, fence: io::Result<()>) -> io::Error {
             format!("{error}; captured-root durability fence failed: {fence}"),
         ),
     }
+}
+
+#[cfg(test)]
+pub(super) fn take_relative_walks() -> usize {
+    anchor::take_relative_walks()
+}
+#[cfg(test)]
+pub(super) fn fail_replacement_fence() -> impl Drop {
+    hooks::install(|event| {
+        if event == hooks::Event::ParentSynced {
+            return Err(io::Error::other("injected postrename fence failure"));
+        }
+        Ok(())
+    })
 }

@@ -8,7 +8,7 @@ use nix::fcntl::{OFlag, openat, renameat};
 use nix::sys::stat::{Mode, fchmod, fstat};
 use nix::unistd::{UnlinkatFlags, fsync, getuid, unlinkat};
 
-use super::anchor::WalkPolicy;
+use super::anchor::{DirectoryChain, WalkPolicy};
 use super::{
     Identity, MountBoundary, Projection, RelativePath, entry_stat, invalid, invalid_path,
     nix_io_error, require_regular, verify_identity,
@@ -36,48 +36,9 @@ impl Projection {
         source: &mut dyn io::Read,
         length: u64,
     ) -> io::Result<()> {
-        self.cleanup_temporary()?;
-        let (name, parents) = relative.0.split_last().ok_or_else(invalid_path)?;
-        let chain = self
-            .directories(parents, WalkPolicy::Create)?
-            .ok_or_else(invalid_path)?;
-        let parent = chain.directory();
-        let previous = Existing::capture(parent, name, &self.boundary)?;
-        let mut temporary = Temporary::create(parent, self.staging_scope)?;
-        let result = (|| {
-            temporary.make_private(&self.boundary)?;
-            copy_exact(source, &mut temporary.file, length)?;
-            fsync(&temporary.file).map_err(nix_io_error)?;
-            #[cfg(test)]
-            super::hooks::after(super::hooks::Event::FileSynced)?;
-            #[cfg(test)]
-            super::hooks::after(super::hooks::Event::BeforeRename)?;
-            chain.validate(&self.boundary)?;
-            previous.validate(parent, name, &self.boundary)?;
-            verify_identity(parent, &temporary.name, &temporary.file, temporary.identity)?;
-            require_private_file(&temporary.file)?;
-            renameat(parent, temporary.name.as_os_str(), parent, name.as_os_str())
-                .map_err(nix_io_error)?;
-            verify_identity(parent, name, &temporary.file, temporary.identity)?;
-            require_private_file(&temporary.file)?;
-            fsync(parent).map_err(nix_io_error)?;
-            #[cfg(test)]
-            super::hooks::after(super::hooks::Event::ParentSynced)?;
-            chain.validate(&self.boundary)
-        })();
-        if let Err(error) = result {
-            if let Err(cleanup) = temporary.cleanup(&self.boundary) {
-                // One failed write owns at most one temporary. Later mutations
-                // must discharge it before creating another rollback obligation.
-                *self.pending_temporary.borrow_mut() = Some(temporary);
-                return Err(io::Error::new(
-                    error.kind(),
-                    format!("{error}; temporary cleanup failed: {cleanup}"),
-                ));
-            }
-            return Err(error);
-        }
-        Ok(())
+        Replacement::for_write(self, relative)?
+            .write_from(source, length)
+            .1
     }
 
     pub(super) fn cleanup_temporary(&self) -> io::Result<()> {
@@ -90,13 +51,40 @@ impl Projection {
     }
 
     pub(in super::super) fn remove(&self, relative: &RelativePath) -> io::Result<()> {
+        self.remove_expected(relative, None)
+    }
+
+    pub(super) fn remove_expected(
+        &self,
+        relative: &RelativePath,
+        expected: Option<FileIdentity>,
+    ) -> io::Result<()> {
         self.cleanup_temporary()?;
         let (name, parents) = relative.0.split_last().ok_or_else(invalid_path)?;
-        let Some(chain) = self.directories(parents, WalkPolicy::Repair)? else {
-            return Ok(());
+        let policy = if expected.is_some() {
+            WalkPolicy::Inspect
+        } else {
+            WalkPolicy::Repair
+        };
+        let Some(chain) = self.directories(parents, policy)? else {
+            return if expected.is_some() {
+                Err(invalid(
+                    "published projection parent disappeared before rollback",
+                ))
+            } else {
+                Ok(())
+            };
         };
         let parent = chain.directory();
         let existing = Existing::capture(parent, name, &self.boundary)?;
+        if let Some(identity) = expected {
+            if self.root.identity != identity.root {
+                return Err(invalid(
+                    "publication belongs to a different projection root",
+                ));
+            }
+            existing.require_identity(identity)?;
+        }
         #[cfg(test)]
         super::hooks::after(super::hooks::Event::BeforeUnlink)?;
         chain.validate(&self.boundary)?;
@@ -183,6 +171,182 @@ impl Projection {
     }
 }
 
+/// Installed identity is carried through failures after rename.
+#[derive(Clone, Copy)]
+pub(in crate::platform_fs::private_projection) struct FileIdentity {
+    root: Identity,
+    file: Identity,
+}
+
+pub(in crate::platform_fs::private_projection) struct Replacement<'a> {
+    projection: &'a Projection,
+    chain: DirectoryChain<'a>,
+    name: OsString,
+    previous: Existing,
+}
+impl<'a> Replacement<'a> {
+    pub(in crate::platform_fs::private_projection) fn for_write(
+        projection: &'a Projection,
+        relative: &RelativePath,
+    ) -> io::Result<Self> {
+        Self::open(projection, relative, WalkPolicy::Create)
+    }
+
+    pub(super) fn for_existing(
+        projection: &'a Projection,
+        relative: &RelativePath,
+    ) -> io::Result<Self> {
+        Self::open(projection, relative, WalkPolicy::Inspect)
+    }
+
+    fn open(
+        projection: &'a Projection,
+        relative: &RelativePath,
+        policy: WalkPolicy,
+    ) -> io::Result<Self> {
+        projection.cleanup_temporary()?;
+        let (name, parents) = relative.0.split_last().ok_or_else(invalid_path)?;
+        let chain = projection
+            .directories(parents, policy)?
+            .ok_or_else(invalid_path)?;
+        let previous = Existing::capture(chain.directory(), name, &projection.boundary)?;
+        Ok(Self {
+            projection,
+            chain,
+            name: name.clone(),
+            previous,
+        })
+    }
+    pub(in crate::platform_fs::private_projection) fn capture(
+        projection: &'a Projection,
+        relative: &RelativePath,
+        sink: &mut dyn io::Write,
+    ) -> io::Result<(Self, Option<u64>)> {
+        let replacement = Self::for_write(projection, relative)?;
+        let length = snapshot_captured(
+            projection,
+            &replacement.chain,
+            &replacement.name,
+            &replacement.previous,
+            sink,
+        )?;
+        Ok((replacement, length))
+    }
+    pub(in crate::platform_fs::private_projection) fn require_identity(
+        &self,
+        identity: FileIdentity,
+    ) -> io::Result<()> {
+        if self.projection.root.identity != identity.root {
+            return Err(invalid(
+                "publication belongs to a different projection root",
+            ));
+        }
+        self.previous.require_identity(identity)
+    }
+    pub(in crate::platform_fs::private_projection) fn write_from(
+        self,
+        source: &mut dyn io::Read,
+        length: u64,
+    ) -> (Option<FileIdentity>, io::Result<()>) {
+        let parent = self.chain.directory();
+        let name = &self.name;
+        if let Err(error) = self
+            .chain
+            .validate(&self.projection.boundary)
+            .and_then(|()| {
+                self.previous
+                    .validate(parent, name, &self.projection.boundary)
+            })
+        {
+            return (None, Err(error));
+        }
+        let mut temporary = match Temporary::create(parent, self.projection.staging_scope) {
+            Ok(temporary) => temporary,
+            Err(error) => return (None, Err(error)),
+        };
+        let mut published = None;
+        let result = (|| {
+            temporary.make_private(&self.projection.boundary)?;
+            copy_exact(source, &mut temporary.file, length)?;
+            fsync(&temporary.file).map_err(nix_io_error)?;
+            #[cfg(test)]
+            super::hooks::after(super::hooks::Event::FileSynced)?;
+            #[cfg(test)]
+            super::hooks::after(super::hooks::Event::BeforeRename)?;
+            self.chain.validate(&self.projection.boundary)?;
+            self.previous
+                .validate(parent, name, &self.projection.boundary)?;
+            verify_identity(parent, &temporary.name, &temporary.file, temporary.identity)?;
+            require_private_file(&temporary.file)?;
+            renameat(parent, temporary.name.as_os_str(), parent, name.as_os_str())
+                .map_err(nix_io_error)?;
+            published = Some(FileIdentity {
+                root: self.projection.root.identity,
+                file: temporary.identity,
+            });
+            verify_identity(parent, name, &temporary.file, temporary.identity)?;
+            require_private_file(&temporary.file)?;
+            fsync(parent).map_err(nix_io_error)?;
+            #[cfg(test)]
+            super::hooks::after(super::hooks::Event::ParentSynced)?;
+            self.chain.validate(&self.projection.boundary)
+        })();
+        if let Err(error) = result {
+            if let Err(cleanup) = temporary.cleanup(&self.projection.boundary) {
+                // One failed write owns at most one temporary. Later mutations
+                // must discharge it before creating another rollback obligation.
+                *self.projection.pending_temporary.borrow_mut() = Some(temporary);
+                return (
+                    published,
+                    Err(io::Error::new(
+                        error.kind(),
+                        format!("{error}; temporary cleanup failed: {cleanup}"),
+                    )),
+                );
+            }
+            return (published, Err(error));
+        }
+        (published, Ok(()))
+    }
+}
+
+pub(super) fn snapshot_previous(
+    projection: &Projection,
+    chain: &DirectoryChain<'_>,
+    name: &OsStr,
+    sink: &mut dyn io::Write,
+) -> io::Result<Option<u64>> {
+    let previous = Existing::capture(chain.directory(), name, &projection.boundary)?;
+    let length = snapshot_captured(projection, chain, name, &previous, sink)?;
+    Ok(length)
+}
+fn snapshot_captured(
+    projection: &Projection,
+    chain: &DirectoryChain<'_>,
+    name: &OsStr,
+    previous: &Existing,
+    sink: &mut dyn io::Write,
+) -> io::Result<Option<u64>> {
+    let parent = chain.directory();
+    previous.validate(parent, name, &projection.boundary)?;
+    if matches!(previous, Existing::Absent) {
+        chain.validate(&projection.boundary)?;
+        return Ok(None);
+    }
+    let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK;
+    let mut file = File::from(openat(parent, name, flags, Mode::empty()).map_err(nix_io_error)?);
+    let Existing::Present { identity, .. } = previous else {
+        unreachable!()
+    };
+    verify_identity(parent, name, &file, *identity)?;
+    projection.boundary.validate(&file)?;
+    let length = io::copy(&mut file, sink)?;
+    verify_identity(parent, name, &file, *identity)?;
+    previous.validate(parent, name, &projection.boundary)?;
+    chain.validate(&projection.boundary)?;
+    Ok(Some(length))
+}
+
 enum Existing {
     Absent,
     Present {
@@ -215,6 +379,15 @@ impl Existing {
         #[cfg(not(target_os = "linux"))]
         {
             Ok(Self::Present { identity })
+        }
+    }
+
+    fn require_identity(&self, expected: FileIdentity) -> io::Result<()> {
+        match self {
+            Self::Present { identity, .. } if *identity == expected.file => Ok(()),
+            _ => Err(invalid(
+                "published projection file was replaced before rollback",
+            )),
         }
     }
 
