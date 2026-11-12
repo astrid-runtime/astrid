@@ -392,7 +392,7 @@ async fn pack_open_staging_journal_without_receipt_retires_to_volume() {
     assert_stopped_volume_only(&home);
 
     let intent = home.root().join(STAGING_JOURNAL_PROJECTION);
-    std::fs::create_dir_all(intent.parent().unwrap()).unwrap();
+    astrid_core::platform_fs::ensure_private_directory_tree(intent.parent().unwrap()).unwrap();
     std::fs::write(&intent, b"pack-open journal").unwrap();
     let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
         .await
@@ -456,7 +456,7 @@ async fn pack_open_staging_journal_sibling_file_fails_closed() {
 
     let intent = home.root().join(STAGING_JOURNAL_PROJECTION);
     let sibling = home.root().join("var/content-staging/sibling.log");
-    std::fs::create_dir_all(intent.parent().unwrap()).unwrap();
+    astrid_core::platform_fs::ensure_private_directory_tree(intent.parent().unwrap()).unwrap();
     std::fs::write(&intent, b"pack-open journal").unwrap();
     std::fs::write(&sibling, b"do-not-admit").unwrap();
     let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
@@ -497,7 +497,7 @@ async fn pack_open_staging_journal_sibling_symlink_fails_closed() {
 
     let intent = home.root().join(STAGING_JOURNAL_PROJECTION);
     let sibling = home.root().join("var/content-staging/link");
-    std::fs::create_dir_all(intent.parent().unwrap()).unwrap();
+    astrid_core::platform_fs::ensure_private_directory_tree(intent.parent().unwrap()).unwrap();
     std::fs::write(&intent, b"pack-open journal").unwrap();
     std::os::unix::fs::symlink(&intent, &sibling).unwrap();
     let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
@@ -538,7 +538,7 @@ async fn pack_open_staging_journal_symlink_sentinel_fails_closed() {
 
     let intent = home.root().join(STAGING_JOURNAL_PROJECTION);
     let target = home.root().join("astrid.volume");
-    std::fs::create_dir_all(intent.parent().unwrap()).unwrap();
+    astrid_core::platform_fs::ensure_private_directory_tree(intent.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&target, &intent).unwrap();
     let Err(error) = open_runtime_principal_store_for_pack(&home, unlimited_quota()).await else {
         panic!("symlink staging journal must not open for pack");
@@ -568,7 +568,7 @@ async fn pack_open_staging_journal_directory_sentinel_fails_closed() {
     drop(packer);
 
     let intent = home.root().join(STAGING_JOURNAL_PROJECTION);
-    std::fs::create_dir_all(&intent).unwrap();
+    astrid_core::platform_fs::ensure_private_directory_tree(&intent).unwrap();
     let Err(error) = open_runtime_principal_store_for_pack(&home, unlimited_quota()).await else {
         panic!("directory staging journal must not open for pack");
     };
@@ -599,7 +599,7 @@ async fn pack_open_staging_journal_socket_sentinel_fails_closed() {
     drop(packer);
 
     let intent = home.root().join(STAGING_JOURNAL_PROJECTION);
-    std::fs::create_dir_all(intent.parent().unwrap()).unwrap();
+    astrid_core::platform_fs::ensure_private_directory_tree(intent.parent().unwrap()).unwrap();
     let _listener = std::os::unix::net::UnixListener::bind(&intent).unwrap();
     let Err(error) = open_runtime_principal_store_for_pack(&home, unlimited_quota()).await else {
         panic!("socket staging journal must not open for pack");
@@ -675,12 +675,9 @@ async fn first_open_allows_bootstrap_sentinels_before_volume_exists() {
     let home_dir = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(home_dir.path());
     home.ensure().unwrap();
-    let layout = home.layout_version_path();
-    let key = home.runtime_key_path();
-    std::fs::create_dir_all(layout.parent().unwrap()).unwrap();
-    std::fs::create_dir_all(key.parent().unwrap()).unwrap();
-    std::fs::write(&layout, b"2").unwrap();
-    std::fs::write(&key, b"first-runtime-key").unwrap();
+    super::super::write_projection_file(home.root(), "etc/layout-version", b"2").unwrap();
+    super::super::write_projection_file(home.root(), "keys/runtime.key", b"first-runtime-key")
+        .unwrap();
     assert!(!home.storage_volume_path().exists());
 
     let store = open_runtime_principal_store(&home, unlimited_quota())
@@ -761,4 +758,35 @@ async fn restore_rebinds_staging_journal_before_new_seal() {
             .collect::<Vec<_>>(),
         vec![&first_name, &second_name]
     );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn private_writer_lock_is_not_trusted_bootstrap_content() {
+    let directory = crate::test_directory::temporary().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    home.ensure().unwrap();
+    astrid_core::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();
+    astrid_core::platform_fs::atomic_write_private_file(&home.runtime_key_path(), &[7; 32])
+        .unwrap();
+    let lock = home.keys_dir().join(".astrid-private-write.lock");
+    assert!(
+        lock.is_file(),
+        "fixture must exercise the real standalone writer sidecar"
+    );
+    let error = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .err()
+        .expect("standalone writer metadata is not a bootstrap exemption");
+    assert!(
+        error
+            .to_string()
+            .contains("active projection receipt is missing"),
+        "{error}"
+    );
+    assert!(
+        lock.is_file(),
+        "rejection must not clean unadmitted residue"
+    );
+    assert_eq!(std::fs::read(home.runtime_key_path()).unwrap(), [7; 32]);
 }

@@ -129,6 +129,8 @@ async fn fresh_missing_runtime_root_opens_with_private_acl_and_survives_reopen()
         Some(b"capsule-v1".to_vec())
     );
     store.engine.close().expect("close fresh engine");
+    astrid_core::platform_fs::validate_private_file(&home.storage_volume_path())
+        .expect("fresh runtime volume must retain its private-at-birth ACL");
 
     let reopened = open_runtime_principal_store(&home, quota())
         .await
@@ -157,6 +159,8 @@ async fn for_pack_fresh_missing_root_admits_private_runtime_root() {
     // Bounded proof: private root + volume birth only. Content/reopen coverage
     // lives in the normal opener regression above.
     store.engine.close().unwrap();
+    astrid_core::platform_fs::validate_private_file(&home.storage_volume_path())
+        .expect("for-pack runtime volume must be private at birth");
 }
 
 #[tokio::test]

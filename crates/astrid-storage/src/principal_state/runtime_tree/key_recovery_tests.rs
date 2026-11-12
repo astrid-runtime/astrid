@@ -61,14 +61,12 @@ async fn reject_sentinel_without_intent(staging: bool) {
     let home = AstridHome::from_path(root.path());
     home.ensure().unwrap();
     astrid_core::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();
-    astrid_core::platform_fs::atomic_write_private_file(&home.runtime_key_path(), &[7; 32])
-        .unwrap();
+    super::write_projection_file(home.root(), "keys/runtime.key", &[7; 32]).unwrap();
     let store = open_runtime_principal_store(&home, quota()).await.unwrap();
     store.pack_and_retire_runtime_projection(&home).unwrap();
     drop(store);
     astrid_core::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();
-    astrid_core::platform_fs::atomic_write_private_file(&home.runtime_key_path(), &[9; 32])
-        .unwrap();
+    super::write_projection_file(home.root(), "keys/runtime.key", &[9; 32]).unwrap();
     astrid_core::platform_fs::ensure_private_directory(&home.root().join("etc")).unwrap();
     let staged = home
         .root()
@@ -93,13 +91,11 @@ async fn interrupted_recovery(cut: RestoreCut) {
     let home = AstridHome::from_path(root.path());
     home.ensure().unwrap();
     astrid_core::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();
-    astrid_core::platform_fs::atomic_write_private_file(&home.runtime_key_path(), &[7; 32])
-        .unwrap();
+    super::write_projection_file(home.root(), "keys/runtime.key", &[7; 32]).unwrap();
     let store = open_runtime_principal_store(&home, quota()).await.unwrap();
     store.pack_and_retire_runtime_projection(&home).unwrap();
     astrid_core::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();
-    astrid_core::platform_fs::atomic_write_private_file(&home.runtime_key_path(), &[9; 32])
-        .unwrap();
+    super::write_projection_file(home.root(), "keys/runtime.key", &[9; 32]).unwrap();
 
     // Stop at the production boundary after durable evidence preservation,
     // then materialize only one real volume-owned file. Drop the store without
@@ -172,8 +168,7 @@ async fn replacement_key_cannot_seed_missing_volume_identity() {
     store.pack_and_retire_runtime_projection(&home).unwrap();
     drop(store);
     astrid_core::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();
-    astrid_core::platform_fs::atomic_write_private_file(&home.runtime_key_path(), &[9; 32])
-        .unwrap();
+    super::write_projection_file(home.root(), "keys/runtime.key", &[9; 32]).unwrap();
     let error = open_runtime_principal_store(&home, quota())
         .await
         .err()
@@ -192,8 +187,7 @@ async fn active_projection_cannot_be_reclassified_as_stopped_key_recovery() {
     store.establish_runtime_projection_receipt(&home).unwrap();
     drop(store);
     astrid_core::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();
-    astrid_core::platform_fs::atomic_write_private_file(&home.runtime_key_path(), &[9; 32])
-        .unwrap();
+    super::write_projection_file(home.root(), "keys/runtime.key", &[9; 32]).unwrap();
     let error = open_runtime_principal_store(&home, quota())
         .await
         .err()
@@ -208,8 +202,7 @@ async fn stopped_volume_recovers_replacement_key_without_changing_identity() {
     let home = AstridHome::from_path(root.path());
     home.ensure().unwrap();
     astrid_core::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();
-    astrid_core::platform_fs::atomic_write_private_file(&home.runtime_key_path(), &[7; 32])
-        .unwrap();
+    super::write_projection_file(home.root(), "keys/runtime.key", &[7; 32]).unwrap();
     let store = open_runtime_principal_store(&home, quota()).await.unwrap();
     store.pack_and_retire_runtime_projection(&home).unwrap();
     drop(store);
@@ -222,8 +215,7 @@ async fn stopped_volume_recovers_replacement_key_without_changing_identity() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(home.keys_dir(), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    astrid_core::platform_fs::atomic_write_private_file(&home.runtime_key_path(), &[9; 32])
-        .unwrap();
+    super::write_projection_file(home.root(), "keys/runtime.key", &[9; 32]).unwrap();
 
     home.ensure().expect("recognize stopped-key recovery shape");
     assert!(home.validate_runtime_identity_provisioning().is_err());

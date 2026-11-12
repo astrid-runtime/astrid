@@ -39,11 +39,11 @@ pub(super) fn write_projection_file(
     bytes: &[u8],
 ) -> StorageResult<()> {
     let path = confined_projection_path(root, relative)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| tree_error(&path, "projection path has no parent".to_owned()))?;
-    super::super::native_io::ensure_private_directory(parent)?;
-    astrid_core::platform_fs::atomic_write_private_file(&path, bytes)
+    let projection = astrid_core::platform_fs::PrivateFileProjection::open(root)
+        .map_err(|error| tree_error(&path, format!("open test projection: {error}")))?;
+    projection
+        .write(Path::new(relative), bytes)
+        .and_then(|()| projection.sync())
         .map_err(|error| tree_error(&path, format!("project volume-backed file: {error}")))?;
     Ok(())
 }

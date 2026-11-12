@@ -31,7 +31,7 @@ mod rename;
 pub(crate) mod retirement_support;
 
 pub use captured_directory::CapturedDirectory;
-pub use io::create_new_private_file;
+pub use io::{create_new_private_file, create_new_private_file_shared};
 
 /// Validate `ExactPrivate` ACL on an open file handle without reopening the path.
 pub fn validate_private_file_handle(file: &std::fs::File) -> std::io::Result<()> {

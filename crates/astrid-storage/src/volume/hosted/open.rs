@@ -105,12 +105,22 @@ impl HostedFileVolume {
         // Capture relative-path ownership once; later sync and reclaim must
         // still target this volume if the process changes its directory.
         let path = std::path::absolute(path.as_ref())?;
-        if let Some(parent) = path.parent() {
+        #[cfg(windows)]
+        let runtime_private = retained_root.is_some();
+        #[cfg(not(windows))]
+        let create_parent = true;
+        #[cfg(windows)]
+        let create_parent = !runtime_private;
+        if create_parent && let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let open_lock = OpenReclaimLock::for_path(&path)?;
         let swap_guard = open_lock.lock();
-        let mut file = reclaim::recover_artifacts(&path)?;
+        let mut file = reclaim::recover_artifacts(
+            &path,
+            #[cfg(windows)]
+            runtime_private,
+        )?;
         // A descriptor opened before replacement may acquire the retired
         // inode lock after publication. It must never become a writer.
         require_current(&file, &path)?;
@@ -176,7 +186,15 @@ impl HostedFileVolume {
     }
 }
 
-pub(super) fn open_regular(path: &Path, create: bool) -> io::Result<std::fs::File> {
+pub(super) fn open_regular(
+    path: &Path,
+    create: bool,
+    #[cfg(windows)] runtime_private: bool,
+) -> io::Result<std::fs::File> {
+    #[cfg(windows)]
+    if runtime_private {
+        return open_private_regular(path, create);
+    }
     let mut options = OpenOptions::new();
     options.read(true).write(true).create_new(create);
     #[cfg(unix)]
@@ -196,7 +214,12 @@ pub(super) fn open_regular(path: &Path, create: bool) -> io::Result<std::fs::Fil
         // Open its inode without creation and let the common lock/identity
         // checks decide ownership. Never truncate or retry creation.
         Err(error) if create && error.kind() == io::ErrorKind::AlreadyExists => {
-            return open_regular(path, false);
+            return open_regular(
+                path,
+                false,
+                #[cfg(windows)]
+                false,
+            );
         },
         Err(error) => return Err(error),
     };
@@ -210,7 +233,12 @@ pub(super) fn open_regular(path: &Path, create: bool) -> io::Result<std::fs::Fil
 }
 
 pub(super) fn require_current(file: &std::fs::File, path: &Path) -> io::Result<()> {
-    let current = open_regular(path, false)?;
+    let current = open_regular(
+        path,
+        false,
+        #[cfg(windows)]
+        false,
+    )?;
     if same_file::Handle::from_file(file.try_clone()?)? != same_file::Handle::from_file(current)? {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
@@ -218,4 +246,20 @@ pub(super) fn require_current(file: &std::fs::File, path: &Path) -> io::Result<(
         ));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn open_private_regular(path: &Path, create: bool) -> io::Result<std::fs::File> {
+    if create {
+        match astrid_core::platform_fs::create_new_private_file_shared(path) {
+            Ok(file) => return Ok(file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
+            Err(error) => return Err(error),
+        }
+    }
+    // Validate the opened inode itself. Never repair an untrusted existing
+    // volume, or close/reopen a new inode to change its sharing contract.
+    let file = open_regular(path, false, false)?;
+    astrid_core::platform_fs::validate_private_file_handle(&file)?;
+    Ok(file)
 }

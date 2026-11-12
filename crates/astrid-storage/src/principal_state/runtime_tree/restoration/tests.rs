@@ -391,6 +391,9 @@ async fn unchanged_private_directory_marker_does_not_rotate_restoration_intent()
         .create_dir(&FilesystemPath::new("empty").unwrap())
         .unwrap();
     astrid_core::platform_fs::ensure_private_directory(&home.root().join("empty")).unwrap();
+    // Startup restores before opening staging. Close this already-open test
+    // store's staging handles to exercise that same ownership boundary.
+    crate::principal_state::lifecycle::staging::close_for_retirement(&store).unwrap();
     store.publish_runtime_projection(&home).unwrap();
     INTENTS.with_borrow_mut(|counter| *counter = Some((home.root().to_path_buf(), 0)));
     super::restore_projection(&home, &store, &store.content()).unwrap();

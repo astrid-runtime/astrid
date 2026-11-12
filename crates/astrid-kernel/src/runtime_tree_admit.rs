@@ -303,11 +303,13 @@ mod tests {
         let (_copied_dir, copied_home) = private_home_fixture();
         let mut image = Vec::new();
         store.write_preclose_volume_image(&mut image).unwrap();
-        astrid_core::platform_fs::atomic_write_private_file(
-            &copied_home.storage_volume_path(),
-            &image,
-        )
-        .unwrap();
+        let projection =
+            astrid_core::platform_fs::PrivateFileProjection::open(copied_home.root()).unwrap();
+        projection
+            .write(Path::new("astrid.volume"), &image)
+            .unwrap();
+        projection.sync().unwrap();
+        drop(projection);
         let reopened =
             astrid_storage::open_runtime_principal_store(&copied_home, unlimited_quota())
                 .await

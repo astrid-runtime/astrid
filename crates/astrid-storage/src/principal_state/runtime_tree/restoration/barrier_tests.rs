@@ -29,9 +29,9 @@ async fn fixture() -> (
     let store = open_runtime_principal_store(&home, unlimited())
         .await
         .unwrap();
-    fs::create_dir_all(home.root().join("restoration")).unwrap();
+    astrid_core::platform_fs::ensure_private_directory(&home.root().join("restoration")).unwrap();
     for name in [EXISTING, ABSENT, "zz-redirected.conf"] {
-        fs::write(home.root().join(name), AUTHORITATIVE).unwrap();
+        super::super::write_projection_file(home.root(), name, AUTHORITATIVE).unwrap();
     }
     store.publish_runtime_projection(&home).unwrap();
     transition_retiring_projection(&home, &store).unwrap();

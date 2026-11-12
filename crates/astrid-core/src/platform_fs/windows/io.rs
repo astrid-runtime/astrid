@@ -776,13 +776,31 @@ fn create_guarded_private_file_with_share(
 /// the parent contract fails after create. Failed parent postchecks mark the
 /// created handle for deletion before returning.
 pub fn create_new_private_file(path: &Path) -> io::Result<File> {
+    create_private_file_with_sharing(path, FILE_SHARE_READ)
+}
+
+/// Create private media whose owner supplies cross-process locking.
+///
+/// The ACL, captured parent and no-overwrite birth checks match
+/// [`create_new_private_file`]. Read/write/delete sharing permits identity
+/// probes and rename while the caller retains its exclusive file lock.
+/// This function does not acquire that lock; callers must do so before use.
+///
+/// # Errors
+/// Returns the same birth and parent-contract errors as
+/// [`create_new_private_file`]. Existing files are never repaired or replaced.
+pub fn create_new_private_file_shared(path: &Path) -> io::Result<File> {
+    create_private_file_with_sharing(path, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+}
+
+fn create_private_file_with_sharing(path: &Path, sharing: u32) -> io::Result<File> {
     super::path::validate_local_absolute_path(path)?;
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "private file has no parent"))?;
     let guard = TrustedPathGuard::capture(parent)?;
     guard.verify_contract(BoundaryContract::ExactPrivateDirectory)?;
-    let file = create_guarded_private_file(&guard, path)?;
+    let file = create_guarded_private_file_with_share(&guard, path, sharing)?;
     if let Err(error) = guard.verify_contract(BoundaryContract::ExactPrivateDirectory) {
         let _ = mark_file_for_deletion(file.as_raw_handle().cast());
         return Err(error);

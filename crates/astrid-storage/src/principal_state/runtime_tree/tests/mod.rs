@@ -299,12 +299,13 @@ async fn admits_runtime_tree_and_reopens_from_preclose_volume_copy() {
     copied_home.ensure().unwrap();
     let mut image = Vec::new();
     store.write_preclose_volume_image(&mut image).unwrap();
-    astrid_core::platform_fs::atomic_write_private_file(&copied_home.storage_volume_path(), &image)
-        .unwrap();
+    super::write_projection_file(copied_home.root(), "astrid.volume", &image).unwrap();
     let relocated_layout = copied_home.root().join("etc/layout-version");
     let relocated_key = copied_home.root().join("keys/runtime.key");
-    std::fs::create_dir_all(relocated_layout.parent().unwrap()).unwrap();
-    std::fs::create_dir_all(relocated_key.parent().unwrap()).unwrap();
+    astrid_core::platform_fs::ensure_private_directory_tree(relocated_layout.parent().unwrap())
+        .unwrap();
+    astrid_core::platform_fs::ensure_private_directory_tree(relocated_key.parent().unwrap())
+        .unwrap();
     std::fs::write(&relocated_layout, b"host-bootstrap-not-authority").unwrap();
     std::fs::write(&relocated_key, b"host-key-not-authority").unwrap();
     let volume = HostedFileVolume::open(copied_home.storage_volume_path()).unwrap();
@@ -380,8 +381,8 @@ async fn preserves_runtime_key_across_initialization_and_restart() {
     let home_dir = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(home_dir.path());
     let key_path = home.runtime_key_path();
-    std::fs::create_dir_all(key_path.parent().unwrap()).unwrap();
-    std::fs::write(&key_path, b"original-runtime-key").unwrap();
+    super::write_projection_file(home.root(), RUNTIME_KEY_PROJECTION, b"original-runtime-key")
+        .unwrap();
 
     let store = open_runtime_principal_store(&home, unlimited_quota())
         .await
@@ -686,8 +687,7 @@ async fn relocated_volume_rejects_host_files_beyond_trusted_bootstrap() {
     copy_home.ensure().unwrap();
     let mut image = Vec::new();
     running.write_preclose_volume_image(&mut image).unwrap();
-    astrid_core::platform_fs::atomic_write_private_file(&copy_home.storage_volume_path(), &image)
-        .unwrap();
+    super::write_projection_file(copy_home.root(), "astrid.volume", &image).unwrap();
     drop(running);
     let layout = copy_home.root().join("etc/layout-version");
     std::fs::create_dir_all(layout.parent().unwrap()).unwrap();
