@@ -1,5 +1,49 @@
 use super::*;
 
+#[test]
+fn map_node_metadata_encodes_the_identified_payload_once() {
+    use crate::storage_model::{CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapKey};
+
+    let identity = Blake3PhysicalIdentity;
+    let mut variants = [false; 4];
+    for domain in [
+        PhysicalMapDomain::Profile,
+        PhysicalMapDomain::Representation,
+        PhysicalMapDomain::Placement,
+    ] {
+        let entries: Vec<_> = (0_u8..16)
+            .map(|index| (PhysicalMapKey::new([index; 32]), vec![index; 4096]))
+            .collect();
+        for map in [
+            CanonicalPhysicalMap::build(&identity, domain, entries.clone()).unwrap(),
+            CanonicalPhysicalMap::build_dense(&identity, domain, entries).unwrap(),
+        ] {
+            for (expected_id, node) in map.nodes() {
+                let expected_bytes = node.encode().unwrap();
+                let (variant, context) = match node {
+                    PhysicalMapNode::Leaf { .. } => (0, "astrid-physical-map-node-v1\0"),
+                    PhysicalMapNode::Branch { .. } => (1, "astrid-physical-map-node-v1\0"),
+                    PhysicalMapNode::Page { .. } => (2, "astrid-physical-radix-map-node-v1\0"),
+                    PhysicalMapNode::Radix { .. } => (3, "astrid-physical-radix-map-node-v1\0"),
+                };
+                let (frame, encodings) = PhysicalMapNode::count_encodings_during(|| {
+                    MetadataFrame::map_node(&identity, node).unwrap()
+                });
+                assert_eq!(encodings, 1, "metadata must retain the identified bytes");
+                assert_eq!(frame.kind, MetadataKind::MapNode);
+                assert_eq!(frame.identity, *expected_id.as_bytes());
+                assert_eq!(frame.identity, blake3::derive_key(context, &expected_bytes));
+                assert_eq!(frame.value, expected_bytes);
+                frame.verify(&identity).unwrap();
+                let encoded = frame.encode().unwrap();
+                assert_eq!(MetadataFrame::decode(&encoded).unwrap().value, frame.value);
+                variants[variant] = true;
+            }
+        }
+    }
+    assert_eq!(variants, [true; 4]);
+}
+
 // Frozen pre-borrowing decoder: re-encoding is the canonicality oracle, not a
 // second production parser. Compare acceptance and bytes under malformed input.
 fn owned_reference(bytes: &[u8]) -> Result<MetadataFrame, DurableError> {

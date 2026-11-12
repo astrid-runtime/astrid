@@ -334,9 +334,26 @@ impl PhysicalMapNode {
         &self,
         identity: &I,
     ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
-        Ok(PhysicalMapNodeId::new(
-            identity.identify(self.identity_context(), &self.encode()?),
-        ))
+        self.encode_and_identify(identity).map(|(_, id)| id)
+    }
+
+    /// Retain the exact canonical bytes used to derive the node identity.
+    /// Metadata publication needs both; encoding them together avoids allocating
+    /// and serializing the same node again after identification.
+    pub(crate) fn encode_and_identify<I: PhysicalIdentity>(
+        &self,
+        identity: &I,
+    ) -> Result<(Vec<u8>, PhysicalMapNodeId), PhysicalModelError> {
+        let bytes = self.encode()?;
+        let id = PhysicalMapNodeId::new(identity.identify(self.identity_context(), &bytes));
+        Ok((bytes, id))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn count_encodings_during<T>(operation: impl FnOnce() -> T) -> (T, usize) {
+        super::codec::reset_encoder_finishes();
+        let value = operation();
+        (value, super::codec::encoder_finishes())
     }
 
     /// Authenticate the original bytes after decode proves their canonical form.

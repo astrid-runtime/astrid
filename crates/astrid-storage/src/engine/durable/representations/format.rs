@@ -85,12 +85,8 @@ impl MetadataFrame {
         identity: &I,
         value: &PhysicalMapNode,
     ) -> Result<Self, DurableError> {
-        let id = value.identify(identity)?;
-        Ok(Self::new(
-            MetadataKind::MapNode,
-            *id.as_bytes(),
-            value.encode()?,
-        ))
+        let (bytes, id) = value.encode_and_identify(identity)?;
+        Ok(Self::new(MetadataKind::MapNode, *id.as_bytes(), bytes))
     }
 
     pub(super) fn catalogue<I: PhysicalIdentity>(
