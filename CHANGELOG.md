@@ -8,6 +8,10 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ## [Unreleased]
 
+### Fixed
+
+- Coalesce immutable physical-map recovery reads through the existing frame validator, while preserving bounded memory, authenticated history, canonical validation and publication barriers. Closes #2212.
+
 ## [2026.10.1] - 2026-10-15
 
 ### Fixed

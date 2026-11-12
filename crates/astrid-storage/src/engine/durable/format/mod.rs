@@ -27,6 +27,7 @@ thread_local! {
 
 mod framed_append;
 mod indexed;
+mod positioned;
 mod prepared;
 mod reader;
 #[cfg(test)]
@@ -39,6 +40,7 @@ pub(super) use indexed::{
     read_indexed_object, read_indexed_object_with_payload, read_indexed_objects,
     visit_indexed_objects,
 };
+pub(super) use positioned::PositionalFrameReader;
 pub(super) use prepared::{PreparedFrame, append_prepared_frames};
 use reader::SliceReader;
 
@@ -149,8 +151,21 @@ pub(super) fn read_frame_at<F: DurableIo>(
     offset: u64,
     limits: RecoveryLimits,
 ) -> Result<Vec<u8>, DurableError> {
+    read_frame_with(file_name, magic, offset, limits, |buffer, position| {
+        read_exact_at(file, buffer, position)
+    })
+}
+
+// Keep one authoritative frame validator for direct and coalesced reads.
+fn read_frame_with(
+    file_name: &'static str,
+    magic: [u8; 8],
+    offset: u64,
+    limits: RecoveryLimits,
+    mut read_exact: impl FnMut(&mut [u8], u64) -> io::Result<()>,
+) -> Result<Vec<u8>, DurableError> {
     let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
-    read_exact_at(file, &mut header, offset)
+    read_exact(&mut header, offset)
         .map_err(|source| io_error("read indexed durable frame header", source))?;
     if header[..8] != magic {
         return Err(corrupt(file_name, offset, "frame magic mismatch"));
@@ -188,7 +203,7 @@ pub(super) fn read_frame_at<F: DurableIo>(
     let payload_offset = offset
         .checked_add(FRAME_HEADER_LEN)
         .ok_or(DurableError::EncodingOverflow)?;
-    read_exact_at(file, &mut payload, payload_offset)
+    read_exact(&mut payload, payload_offset)
         .map_err(|source| io_error("read indexed durable frame payload", source))?;
     let checksum: [u8; 32] = header[CHECKSUM_START..]
         .try_into()

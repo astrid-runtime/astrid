@@ -1,6 +1,8 @@
 //! Recovery and closed-world validation for physical representation authority.
 
 #[cfg(test)]
+mod io_tests;
+#[cfg(test)]
 mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,7 +17,7 @@ use crate::storage_model::{
     RepresentationStateId,
 };
 
-use super::super::format::{read_frame_at, scan_frames_with_source};
+use super::super::format::scan_frames_with_source;
 use super::super::{FRAME_HEADER_LEN, scan_frames};
 use super::format::{
     Blake3PhysicalIdentity, CURRENT_FILE, CURRENT_MAGIC, CurrentPointer, JOURNAL_FILE,
