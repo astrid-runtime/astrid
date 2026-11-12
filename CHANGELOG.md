@@ -70,9 +70,6 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ### Fixed
 
-- Remove duplicate directory metadata queries during runtime projection
-  restoration and retirement, preserving identity, privacy and mount checks at
-  every existing validation boundary.
 - Use the same runtime compatibility rules for capsule and distro manifests,
   so dev release candidates can load capsules with satisfied stable minimum
   versions while preserving explicit prerelease ordering and version bounds.
