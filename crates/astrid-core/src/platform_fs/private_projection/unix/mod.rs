@@ -6,8 +6,12 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
+#[cfg(test)]
+use hooks::query_file_stat as fstat;
 use nix::fcntl::{AtFlags, OFlag};
-use nix::sys::stat::{FileStat, SFlag, fstat, fstatat};
+#[cfg(not(test))]
+use nix::sys::stat::fstat;
+use nix::sys::stat::{FileStat, SFlag, fstatat};
 use nix::unistd::fsync;
 
 use super::RelativePath;

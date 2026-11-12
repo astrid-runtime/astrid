@@ -1,16 +1,17 @@
 //! Root binding and bounded relative directory ownership.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use nix::fcntl::openat;
-use nix::sys::stat::{Mode, SFlag, fchmod, fstat, mkdirat};
+use nix::sys::stat::{FileStat, Mode, SFlag, fchmod, mkdirat};
 use nix::unistd::{fsync, getuid};
 
 use super::{
-    Identity, MountBoundary, directory_flags, entry_stat, invalid, nix_io_error, verify_identity,
+    Identity, MountBoundary, directory_flags, entry_stat, fstat, invalid, nix_io_error,
+    verify_identity,
 };
 
 /// Typed directory-walk authority for one rooted projection session.
@@ -69,21 +70,7 @@ impl Root {
     }
 
     pub(super) fn validate(&self, boundary: &MountBoundary) -> io::Result<()> {
-        validate_private_directory(&self.file)?;
-        verify_identity(&self.parent, &self.name, &self.file, self.identity)?;
-        let current = File::from(
-            openat(
-                &self.parent,
-                self.name.as_os_str(),
-                directory_flags(),
-                Mode::empty(),
-            )
-            .map_err(nix_io_error)?,
-        );
-        if Identity::of(&current)? != self.identity {
-            return Err(invalid("projection root binding changed"));
-        }
-        boundary.validate(&current)
+        validate_binding(&self.parent, &self.name, self.identity, boundary)
     }
 
     pub(super) fn validate_absolute(&self, boundary: &MountBoundary) -> io::Result<()> {
@@ -151,7 +138,9 @@ impl<'a> DirectoryChain<'a> {
             verify_identity(parent, name, &file, identity)?;
             boundary.validate(&file)?;
             match policy {
-                WalkPolicy::Inspect => validate_private_directory(&file)?,
+                WalkPolicy::Inspect => {
+                    validate_private_directory(&file)?;
+                },
                 WalkPolicy::Repair | WalkPolicy::Create => {
                     if make_private_directory(&file)? || created {
                         fsync(&file).map_err(nix_io_error)?;
@@ -179,25 +168,28 @@ impl<'a> DirectoryChain<'a> {
         self.root.validate(boundary)?;
         let mut parent = &self.root.file;
         for binding in &self.bindings {
-            validate_private_directory(&binding.file)?;
-            verify_identity(parent, &binding.name, &binding.file, binding.identity)?;
-            let current = File::from(
-                openat(
-                    parent,
-                    binding.name.as_os_str(),
-                    directory_flags(),
-                    Mode::empty(),
-                )
-                .map_err(nix_io_error)?,
-            );
-            if Identity::of(&current)? != binding.identity {
-                return Err(invalid("projection directory binding changed"));
-            }
-            boundary.validate(&current)?;
+            validate_binding(parent, &binding.name, binding.identity, boundary)?;
             parent = &binding.file;
         }
         Ok(())
     }
+}
+
+fn validate_binding(
+    parent: &File,
+    name: &OsStr,
+    expected: Identity,
+    boundary: &MountBoundary,
+) -> io::Result<()> {
+    let current =
+        File::from(openat(parent, name, directory_flags(), Mode::empty()).map_err(nix_io_error)?);
+    // The retained descriptor pins the captured inode. Matching the fresh
+    // no-follow handle lets privacy, identity and mount checks use one object.
+    let stat = validate_private_directory(&current)?;
+    if Identity::read(&stat) != expected {
+        return Err(invalid("projection directory binding changed"));
+    }
+    boundary.validate(&current)
 }
 
 pub(super) fn make_private_directory(file: &File) -> io::Result<bool> {
@@ -223,7 +215,7 @@ pub(super) fn make_private_directory(file: &File) -> io::Result<bool> {
     Ok(changed)
 }
 
-fn validate_private_directory(file: &File) -> io::Result<()> {
+fn validate_private_directory(file: &File) -> io::Result<FileStat> {
     let stat = fstat(file).map_err(nix_io_error)?;
     if stat.st_mode & SFlag::S_IFMT.bits() != SFlag::S_IFDIR.bits()
         || stat.st_uid != getuid().as_raw()
@@ -236,7 +228,7 @@ fn validate_private_directory(file: &File) -> io::Result<()> {
     }
     #[cfg(target_os = "macos")]
     crate::platform_fs::macos_acl::validate(file)?;
-    Ok(())
+    Ok(stat)
 }
 
 #[cfg(test)]
@@ -244,4 +236,40 @@ thread_local! { static RELATIVE_WALKS: std::cell::Cell<usize> = const { std::cel
 #[cfg(test)]
 pub(super) fn take_relative_walks() -> usize {
     RELATIVE_WALKS.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn directory_validation_reads_each_current_identity_once() {
+        let home = tempfile::tempdir().expect("temporary directory");
+        let root_path = home.path().join("root");
+        std::fs::create_dir(&root_path).expect("create root");
+        std::fs::set_permissions(&root_path, std::fs::Permissions::from_mode(0o700))
+            .expect("private root");
+        let names = [OsString::from("first"), OsString::from("second")];
+        let mut path = root_path.clone();
+        for name in &names {
+            path.push(name);
+            std::fs::create_dir(&path).expect("create ancestor");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .expect("private ancestor");
+        }
+        let root = Root::open(&root_path).expect("capture root");
+        let boundary = MountBoundary::new(&root.file).expect("capture mount boundary");
+        let chain = DirectoryChain::walk(&root, &boundary, &names, WalkPolicy::Inspect)
+            .expect("capture chain")
+            .expect("existing chain");
+        super::super::hooks::take_file_stat_queries();
+        chain.validate(&boundary).expect("validate captured chain");
+        assert_eq!(
+            super::super::hooks::take_file_stat_queries(),
+            names.len() + 1
+        );
+        root.validate(&boundary).expect("validate captured root");
+        assert_eq!(super::super::hooks::take_file_stat_queries(), 1);
+    }
 }

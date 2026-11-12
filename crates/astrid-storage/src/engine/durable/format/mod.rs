@@ -156,7 +156,7 @@ pub(super) fn read_frame_at<F: DurableIo>(
     })
 }
 
-// Keep one authoritative frame validator for direct and coalesced reads.
+// All positioned reads share framing, size, and checksum validation.
 fn read_frame_with(
     file_name: &'static str,
     magic: [u8; 8],
