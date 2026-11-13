@@ -80,6 +80,7 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+astrid-core = { workspace = true, features = ["test-support"] }
 async-trait = { workspace = true }
 astrid-build = { workspace = true }
 astrid-storage = { workspace = true, features = ["crash-replay"] }

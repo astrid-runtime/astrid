@@ -74,6 +74,8 @@ pub mod kernel_router;
 mod kernel_shutdown_tests;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod legacy_migration_barrier;
+#[cfg(unix)]
+mod native_boot;
 mod native_input;
 mod runtime_work;
 mod shutdown;
@@ -781,35 +783,10 @@ impl Kernel {
                 "Failed to resolve Astrid home (set $ASTRID_HOME or $HOME): {e}"
             ))
         })?;
-        let layout_origin = legacy_migration_barrier::capture_layout_origin(&home)?;
-        // A layout-two sentinel is only authoritative together with the
-        // component migration ledger.  Check this before `AstridHome::ensure`
-        // can retire any released source on behalf of an incomplete cutover.
-        legacy_migration_barrier::reject_incomplete_layout_v2(&home)?;
-        home.ensure().map_err(|error| {
-            std::io::Error::other(format!("Failed to validate Astrid home layout: {error}"))
-        })?;
-
-        // Acquire the singleton advisory lock as the FIRST fallible boot step —
-        // BEFORE opening any shared state store. A boot-race loser then fails
-        // here with the actionable "already running (singleton lock held)"
-        // error and never opens (or even touches) the shared principal or audit
-        // stores, rather than dying on a raw `LOCK is already locked` from
-        // the store layer after having opened one. The listener bind below does
-        // NOT re-acquire the lock — it is already held for the process lifetime.
-        let singleton_lock = socket::acquire_boot_singleton_lock(&home)?;
-        home.clear_runtime_principal_scratch().map_err(|error| {
-            std::io::Error::other(format!(
-                "Failed to clear stale principal runtime scratch: {error}"
-            ))
-        })?;
-        if home.layout_version()?.as_deref() == Some(astrid_core::dirs::LEGACY_LAYOUT_VERSION) {
-            let migration_target =
-                astrid_core::dirs::LayoutMigrationTarget::for_current_executable(
-                    astrid_storage::RUNTIME_STORE_FORMAT_ID,
-                )?;
-            home.begin_layout_v2_migration(&migration_target)?;
-        }
+        // Home-bound custody acquires the singleton before opening stores.
+        // Interrupted projection subsets must authenticate their durable
+        // RETIRING authority before ordinary home admission or amendments.
+        let boot_admission = native_boot::NativeBootAdmission::acquire(&home)?;
 
         // Resolve quota policy before opening state so the durable adapter and
         // capsule engine share exactly one invalidatable profile cache.
@@ -846,13 +823,9 @@ impl Kernel {
 
         // Open the authoritative state store. First cutover imports and
         // verifies legacy SurrealKV under the singleton lock before serving.
-        let principal_store = astrid_storage::open_runtime_principal_store_with_directory(
-            &home,
-            quota,
-            principal_directory.clone(),
-        )
-        .await
-        .map_err(|e| std::io::Error::other(format!("Failed to open principal store: {e}")))?;
+        let (principal_store, singleton_lock, layout_origin) = boot_admission
+            .open(quota, principal_directory.clone())
+            .await?;
         let kv = principal_store.kv();
         // TODO: clear ephemeral keys (e: prefix) on boot when the key
         // lifecycle tier convention is established.

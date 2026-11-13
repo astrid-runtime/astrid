@@ -42,6 +42,7 @@ mod proof;
 mod retirement;
 mod secret;
 mod source;
+mod startup;
 #[cfg(unix)]
 use crate::preflight_legacy_audit_sources;
 use env_import::import_env_and_secrets;
@@ -66,6 +67,7 @@ use ledger::{MigrationComponent, canonical_json};
 use retirement::retire_owner_controlled_tree;
 #[cfg(test)]
 use retirement::retire_tree;
+pub(crate) use startup::{StartupLayout, classify_startup, validate_recovery};
 
 #[cfg(test)]
 pub(crate) use secret::record_absent_legacy_secret_for_test;
@@ -137,7 +139,16 @@ pub(crate) fn reject_incomplete_layout_v2(home: &AstridHome) -> io::Result<()> {
             ),
         )
     })?;
-    let ledger: MigrationLedger = decode_canonical(&bytes, &path)?;
+    let fresh_layout = validate_complete_ledger(home, &bytes)?;
+    require_layout_provenance(&home.migrations_dir(), fresh_layout)?;
+    Ok(())
+}
+
+/// Validate the canonical ledger independently of its temporary host presence.
+/// Returns the existing explicit fresh-layout disposition; this never creates it.
+pub(crate) fn validate_complete_ledger(home: &AstridHome, bytes: &[u8]) -> io::Result<bool> {
+    let path = ledger_path(home);
+    let ledger: MigrationLedger = decode_canonical(bytes, &path)?;
     if ledger.schema != LEDGER_SCHEMA || !ledger.complete || ledger.components.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -152,8 +163,7 @@ pub(crate) fn reject_incomplete_layout_v2(home: &AstridHome) -> io::Result<()> {
         .components
         .iter()
         .any(|component| component.name == "system:fresh-layout");
-    require_layout_provenance(&home.migrations_dir(), fresh_layout)?;
-    Ok(())
+    Ok(fresh_layout)
 }
 
 /// Run every released-home migration while the daemon singleton is held.

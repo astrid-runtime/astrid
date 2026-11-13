@@ -57,6 +57,8 @@ pub use dirs_layout::{
 mod projection_retirement;
 #[cfg(any(unix, windows))]
 pub use projection_retirement::PreparedProjectionRetirement;
+#[cfg(all(feature = "test-support", unix))]
+pub use projection_retirement::interrupt_retirement_before_unlink_once;
 pub use projection_retirement::retire_projection_root;
 #[path = "dirs_run_dir.rs"]
 mod run_dir;
@@ -514,6 +516,10 @@ impl AstridHome {
         }
         let mut entries = self.root().read_dir()?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(std::fs::DirEntry::file_name);
+        // The exact private singleton is ownership residue, never source data.
+        if stopped_key::only_boot_singleton(self)? {
+            entries.retain(|entry| entry.file_name() != "run");
+        }
         if entries.len() == 1 && entries[0].file_name() == std::ffi::OsStr::new("keys") {
             self.validate_runtime_key_bootstrap(&entries[0].path())?;
             return Ok(UnsentinelledRootState::RuntimeKeyBootstrap);

@@ -169,18 +169,21 @@ fn only_sentinel_staging_directory(home: &AstridHome) -> io::Result<bool> {
     Ok(true)
 }
 
-fn only_boot_singleton(home: &AstridHome) -> io::Result<bool> {
+pub(super) fn only_boot_singleton(home: &AstridHome) -> io::Result<bool> {
     let run = home.root().join("run");
     if !run.try_exists()? {
         return Ok(false);
     }
     // Boot acquires this private singleton before storage restore. Accept
     // only that persistent lockfile, not an arbitrary surviving run projection.
-    crate::platform_fs::validate_private_directory(&run)?;
+    crate::platform_fs::verify_no_redirects(&run)?;
     let entries = fs::read_dir(&run)?.collect::<Result<Vec<_>, _>>()?;
     if entries.len() != 1 || entries[0].file_name() != "system.lock" {
         return Ok(false);
     }
+    // Unknown shapes retain ordinary fresh-root rejection. Only the exact
+    // singleton shape reaches private-access validation and can be omitted.
+    crate::platform_fs::validate_private_directory(&run)?;
     crate::platform_fs::validate_private_file(&run.join("system.lock"))?;
     Ok(true)
 }
@@ -191,3 +194,6 @@ fn invalid(message: &str) -> io::Error {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod singleton_retry_tests;

@@ -16,6 +16,8 @@ use parking_lot::Mutex;
 
 use super::{AstridVolume, MAX_REGION_NAME_BYTES, VolumeMetadataMutation, VolumeRegion};
 
+#[cfg(test)]
+mod canonical_open_tests;
 mod extent_index;
 mod open;
 mod reclaim;

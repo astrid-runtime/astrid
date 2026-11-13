@@ -16,7 +16,9 @@ use crate::storage_model::ObjectId;
 use astrid_core::dirs::AstridHome;
 use astrid_core::platform_fs::StagingScope;
 
-use super::{RuntimePrincipalStore, StateOwner, runtime_tree::is_excluded};
+use super::{
+    NativePrincipalContentStore, RuntimePrincipalStore, StateOwner, runtime_tree::is_excluded,
+};
 
 pub(super) const ACTIVE_PROJECTION_NAME: &str = "run/.active-projection-v1.json";
 const RECEIPT_SCHEMA_V1: u32 = 1;
@@ -78,8 +80,7 @@ impl ActiveProjectionReceipt {
         self.entries.iter().map(|entry| entry.name.as_str())
     }
 
-    #[cfg(test)]
-    pub(super) fn inventory_identity(&self, name: &str) -> StorageResult<Option<ObjectId>> {
+    pub(super) fn inventory_object(&self, name: &str) -> StorageResult<Option<(ObjectId, u64)>> {
         let Some(entry) = self.entries.iter().find(|entry| entry.name == name) else {
             return Ok(None);
         };
@@ -95,7 +96,13 @@ impl ActiveProjectionReceipt {
                 "receipt object identity is not 32 bytes",
             )
         })?;
-        Ok(Some(ObjectId::new(expected)))
+        Ok(Some((ObjectId::new(expected), entry.logical_bytes)))
+    }
+
+    #[cfg(test)]
+    pub(super) fn inventory_identity(&self, name: &str) -> StorageResult<Option<ObjectId>> {
+        self.inventory_object(name)
+            .map(|entry| entry.map(|(file, _)| file))
     }
 }
 
@@ -143,8 +150,15 @@ pub(super) fn read(
     home: &AstridHome,
     store: &RuntimePrincipalStore,
 ) -> StorageResult<Option<ActiveProjectionReceipt>> {
+    read_from_content(home, &store.content())
+}
+
+pub(super) fn read_from_content(
+    home: &AstridHome,
+    content: &NativePrincipalContentStore,
+) -> StorageResult<Option<ActiveProjectionReceipt>> {
     tracing::trace!(target: "astrid_storage::projection_receipt_read", "read runtime projection receipt");
-    let receipt = read_relocatable(home, store)?;
+    let receipt = read_relocatable_from_content(home, content)?;
     if let Some(receipt) = &receipt
         && receipt.root != canonical_root(home)?
     {
@@ -168,6 +182,13 @@ pub(super) fn read_relocatable(
     home: &AstridHome,
     store: &RuntimePrincipalStore,
 ) -> StorageResult<Option<ActiveProjectionReceipt>> {
+    read_relocatable_from_content(home, &store.content())
+}
+
+fn read_relocatable_from_content(
+    home: &AstridHome,
+    content: &NativePrincipalContentStore,
+) -> StorageResult<Option<ActiveProjectionReceipt>> {
     let host_receipt = home.root().join(ACTIVE_PROJECTION_NAME);
     if std::fs::symlink_metadata(&host_receipt).is_ok() {
         return Err(tree_error(
@@ -177,8 +198,7 @@ pub(super) fn read_relocatable(
     }
 
     let name = active_projection_name()?;
-    let metadata = store
-        .content()
+    let metadata = content
         .describe(&StateOwner::System, &name)
         .map_err(receipt_error("inspect active projection receipt"))?;
     let Some(metadata) = metadata else {
@@ -189,8 +209,7 @@ pub(super) fn read_relocatable(
     // scale with the whole owner inventory even when its header is warm.
     let catalog = if metadata.logical_bytes() > RECEIPT_FRAMING_BYTES {
         Some(
-            store
-                .content()
+            content
                 .list(&StateOwner::System)
                 .map_err(receipt_error("authenticate receipt inventory allowance"))?,
         )
@@ -199,15 +218,14 @@ pub(super) fn read_relocatable(
     };
     let inventory = match catalog.as_deref() {
         Some(catalog) => ReceiptInventory::Listed(catalog),
-        None => ReceiptInventory::Point(store),
+        None => ReceiptInventory::Point(content),
     };
     enforce_receipt_bound(
         &host_receipt,
         metadata.logical_bytes(),
         inventory.size_bound()?,
     )?;
-    let bytes = store
-        .content()
+    let bytes = content
         .read(&StateOwner::System, &name)
         .map_err(receipt_error("read active projection receipt"))?
         .ok_or_else(|| {
@@ -222,7 +240,7 @@ pub(super) fn read_relocatable(
 // Both sources authenticate the same metadata through ContentStore. Only the
 // large-receipt path needs all catalog names to authorize its allocation bound.
 enum ReceiptInventory<'a> {
-    Point(&'a RuntimePrincipalStore),
+    Point(&'a NativePrincipalContentStore),
     Listed(&'a [ContentEntry]),
 }
 
@@ -236,8 +254,7 @@ impl ReceiptInventory<'_> {
 
     fn lookup(&self, name: &ContentName) -> StorageResult<Option<(ObjectId, u64)>> {
         match self {
-            Self::Point(store) => store
-                .content()
+            Self::Point(content) => content
                 .describe(&StateOwner::System, name)
                 .map(|descriptor| descriptor.map(|actual| (actual.file(), actual.logical_bytes())))
                 .map_err(receipt_error("inspect active receipt inventory entry")),

@@ -15,6 +15,11 @@ mod windows;
 #[cfg(windows)]
 pub use windows::PreparedProjectionRetirement;
 
+#[cfg(all(feature = "test-support", unix))]
+mod replay;
+#[cfg(all(feature = "test-support", unix))]
+pub use replay::interrupt_retirement_before_unlink_once;
+
 const CANONICAL_VOLUME: &str = "astrid.volume";
 
 /// Validate the complete projection before deleting any entry.

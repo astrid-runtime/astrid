@@ -115,6 +115,69 @@ pub async fn open_runtime_principal_store_for_pack(
     Ok(store)
 }
 
+/// Recover an interrupted projection after authenticating caller-owned policy.
+///
+/// The caller must hold the boot singleton. Only existing private canonical
+/// media can open; no legacy/swap promotion, format amendment, identity loading,
+/// host reconciliation, or staging creation precedes the read-only callback.
+/// A successful callback hands the same locked engine to ordinary assembly.
+///
+/// # Errors
+/// Rejects absent/unsafe media, incomplete or foreign RETIRING inventory, failed
+/// policy validation, or ordinary assembly/restoration errors.
+pub async fn open_runtime_principal_store_recovering_projection<F>(
+    home: &AstridHome,
+    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
+    principals: PrincipalDirectory,
+    validate: F,
+) -> crate::principal_state::StorageResult<RuntimePrincipalStore>
+where
+    F: FnOnce(&super::startup_recovery::RuntimeProjectionRecovery<'_>) -> std::io::Result<()>,
+{
+    #[cfg(windows)]
+    let (home, retained_root) = super::runtime_root_admission::normalize_and_admit(home)?;
+    #[cfg(windows)]
+    let home = &home;
+    let root = astrid_core::platform_fs::PrivateProjectionInspection::try_open(home.root())
+        .map_err(super::startup_recovery::guard_error)?;
+    let (engine, receipt, volume) = volume_migration::open_existing_canonical_only(
+        home,
+        DurableEnginePolicy::default(),
+        #[cfg(windows)]
+        &retained_root,
+    )?;
+    root.confirm_absolute_root()
+        .map_err(super::startup_recovery::guard_error)?;
+    super::format_amendment::verify_volume_format_for_recovery(&engine)?;
+    let engine = Arc::new(engine);
+    let content = NativePrincipalContentStore::from_engine_with_quota(
+        Arc::clone(&engine),
+        Arc::clone(&quota),
+    );
+    {
+        let recovery = super::startup_recovery::authenticate(home, &content)?;
+        validate(&recovery).map_err(super::startup_recovery::guard_error)?;
+    }
+    drop(content);
+    root.confirm_absolute_root()
+        .map_err(super::startup_recovery::guard_error)?;
+    volume
+        .finish_canonical_recovery()
+        .map_err(super::startup_recovery::guard_error)?;
+    let store = assemble_runtime_store(
+        home,
+        quota,
+        principals,
+        (engine, volume),
+        receipt,
+        true,
+        false,
+    )
+    .await?;
+    quarantine_unrecognized_principal_store(home, &store)?;
+    Ok(store)
+}
+
 /// Open every native projection with an externally shared principal
 /// directory.
 ///

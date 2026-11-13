@@ -288,6 +288,8 @@ fn restore_entries<'a>(
         result.map_err(|error| tree_error(&path, error))?;
         #[cfg(test)]
         tests::after_write(home.root(), name);
+        #[cfg(feature = "crash-replay")]
+        crate::engine::crash_replay::host_projection::after_write(home.root(), name);
         if is_staging_generation(name) {
             super::super::rebind_staging_generation(&path)?;
         }

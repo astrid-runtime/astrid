@@ -111,7 +111,7 @@ pub(super) fn recover_artifacts(
     Ok(file)
 }
 
-fn lock_active(file: &File) -> io::Result<()> {
+pub(super) fn lock_active(file: &File) -> io::Result<()> {
     file.try_lock_exclusive().map_err(|error| {
         if error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
             || error.kind() == io::ErrorKind::WouldBlock

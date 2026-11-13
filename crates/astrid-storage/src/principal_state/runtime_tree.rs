@@ -304,7 +304,7 @@ pub(super) fn is_excluded(relative: &str) -> bool {
         || TRANSACTION_STAGING_PATHS.contains(&relative)
 }
 
-fn is_retired_legacy_projection(home: &AstridHome, name: &str) -> bool {
+pub(super) fn is_retired_legacy_projection(home: &AstridHome, name: &str) -> bool {
     [home.state_db_path(), home.cow_dir()]
         .into_iter()
         .filter_map(|path| {

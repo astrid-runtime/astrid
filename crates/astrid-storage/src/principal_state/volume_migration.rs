@@ -55,6 +55,37 @@ pub(super) fn open_existing(
     Ok(Some((engine, receipt, volume)))
 }
 
+/// Recover only existing canonical media, leaving all logical amendments and
+/// projection mutation to the caller's authenticated recovery gate.
+pub(super) fn open_existing_canonical_only(
+    home: &AstridHome,
+    policy: DurableEnginePolicy<StateOwner>,
+    #[cfg(windows)] retained_root: &super::runtime_root_admission::AdmittedRuntimeRoot,
+) -> StorageResult<(RuntimeEngine, String, Arc<HostedFileVolume>)> {
+    let canonical = home.storage_volume_path();
+    if inspect_volume_entry(&legacy_volume_path(home)?)? {
+        return Err(connection(
+            "recovery requires unambiguous canonical Astrid volume".to_owned(),
+        ));
+    }
+    let volume = HostedFileVolume::open_existing_canonical(
+        &canonical,
+        #[cfg(windows)]
+        Arc::clone(retained_root),
+    )
+    .map_err(|error| connection(format!("open existing canonical Astrid volume: {error}")))?;
+    let engine = RuntimeEngine::open_volume(
+        volume.clone(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+        policy,
+    )
+    .map_err(|error| connection(format!("recover canonical Astrid volume: {error}")))?;
+    let receipt = require_cutover_receipt(volume.as_ref(), None)?;
+    Ok((engine, receipt, volume))
+}
+
 /// Resolve the canonical volume and promote a released legacy path once.
 ///
 /// Promotion happens before recovery so the runtime-tree admission walk can

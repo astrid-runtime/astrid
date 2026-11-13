@@ -321,6 +321,8 @@ fn delete_inventory(
             )?;
         }
         (hooks.before_unlink)(&child_path)?;
+        #[cfg(feature = "test-support")]
+        super::replay::before_unlink(&child_path)?;
         // Do not unlink a different object that replaced the opened entry
         // while its contents were being walked. unlinkat never follows a
         // last-component redirect, even if replacement wins after this check.

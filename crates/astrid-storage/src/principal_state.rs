@@ -78,6 +78,8 @@ mod runtime_root_admission;
 mod runtime_tests;
 mod runtime_tree;
 mod runtime_tree_active;
+mod startup_recovery;
+pub use startup_recovery::RuntimeProjectionRecovery;
 mod staging;
 mod store_open;
 #[cfg(test)]
@@ -108,6 +110,7 @@ pub use staging::{
 pub use store_open::open_runtime_principal_store_for_pack;
 pub use store_open::{
     open_runtime_kv, open_runtime_kv_with_directory, open_runtime_principal_store,
+    open_runtime_principal_store_recovering_projection,
     open_runtime_principal_store_with_directory, open_runtime_principal_store_with_object_cache,
     open_runtime_principal_store_with_policy,
 };
