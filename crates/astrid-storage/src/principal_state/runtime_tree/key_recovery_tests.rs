@@ -209,7 +209,10 @@ async fn stopped_volume_recovers_replacement_key_without_changing_identity() {
 
     // Published stopped-install code recreated this directory with the umask
     // and generated a new private key before the daemon admitted its volume.
+    #[cfg(not(windows))]
     std::fs::create_dir(home.keys_dir()).unwrap();
+    #[cfg(windows)]
+    astrid_core::platform_fs::create_private_directory(&home.keys_dir()).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -223,8 +226,7 @@ async fn stopped_volume_recovers_replacement_key_without_changing_identity() {
     // Its private lock directory is ephemeral, not a surviving projection.
     let boot_run = home.root().join("run");
     astrid_core::platform_fs::ensure_private_directory(&boot_run).unwrap();
-    astrid_core::platform_fs::atomic_write_private_file(&boot_run.join("system.lock"), b"")
-        .unwrap();
+    super::write_projection_file(home.root(), "run/system.lock", b"").unwrap();
     let store = open_runtime_principal_store(&home, quota()).await.unwrap();
     assert_eq!(std::fs::read(home.runtime_key_path()).unwrap(), [7; 32]);
     let name = ContentName::new(format!(

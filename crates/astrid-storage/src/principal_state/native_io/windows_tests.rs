@@ -254,3 +254,49 @@ fn free_directory_sync_surfaces_native_flush_failure() {
         "{error}"
     );
 }
+
+#[test]
+fn capability_file_creation_has_private_acl_before_first_write_and_never_replaces() {
+    let root = private_temp();
+    let directory = PrivateDirectory::open(root.path()).unwrap();
+    let name = Path::new("intents.v1.log");
+    let mut file = directory.create_file(name).unwrap();
+    astrid_core::platform_fs::validate_private_file_handle(&file).unwrap();
+    file.write_all(b"private at birth").unwrap();
+    file.sync_all().unwrap();
+    let identity = private_file_identity(&file).unwrap();
+    assert!(directory.create_file(name).is_err());
+    assert_eq!(private_file_identity(&file).unwrap(), identity);
+    drop(file);
+    astrid_core::platform_fs::validate_private_file(&root.path().join(name)).unwrap();
+    assert_eq!(
+        std::fs::read(root.path().join(name)).unwrap(),
+        b"private at birth"
+    );
+}
+
+#[test]
+fn capability_file_creation_rejects_nonleaf_without_mutation() {
+    let root = private_temp();
+    let directory = PrivateDirectory::open(root.path()).unwrap();
+    for name in ["../escape", "child/leaf", "leaf:stream", ".", "leaf/", ""] {
+        assert!(directory.create_file(Path::new(name)).is_err(), "{name:?}");
+    }
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn capability_directory_birth_keeps_nested_migration_files_private() {
+    let root = private_temp();
+    let directory = PrivateDirectory::open(root.path()).unwrap();
+    let child = directory.ensure_child(Path::new("snapshot")).unwrap();
+    astrid_core::platform_fs::validate_private_directory(&root.path().join("snapshot")).unwrap();
+    let file = child.create_file(Path::new("data.sst")).unwrap();
+    astrid_core::platform_fs::validate_private_file_handle(&file).unwrap();
+    drop(file);
+    child.sync().unwrap();
+    directory.sync().unwrap();
+    assert!(child.create_file(Path::new("data.sst")).is_err());
+    let existing = directory.ensure_child(Path::new("snapshot")).unwrap();
+    assert!(existing.open_file(Path::new("data.sst")).is_ok());
+}

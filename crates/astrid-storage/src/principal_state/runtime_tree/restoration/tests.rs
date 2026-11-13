@@ -220,8 +220,9 @@ fn create_sentinel_residue(
         let etc = home.root().join("etc");
         astrid_core::platform_fs::ensure_private_directory(&etc).unwrap();
         if matches!(residue, SentinelResidue::Staging) {
-            astrid_core::platform_fs::atomic_write_private_file(
-                &etc.join(scope.temporary_basename()),
+            runtime_tree::write_projection_file(
+                home.root(),
+                &format!("etc/{}", scope.temporary_basename()),
                 b"interrupted sentinel",
             )
             .unwrap();
@@ -337,8 +338,12 @@ async fn reject_sentinel_cleanup(invalid: InvalidSentinelIntent) {
     let etc = home.root().join("etc");
     astrid_core::platform_fs::ensure_private_directory(&etc).unwrap();
     let staging = etc.join(".astrid-private-00000000000040008000000000000001");
-    astrid_core::platform_fs::atomic_write_private_file(&staging, b"unadmitted partial sentinel")
-        .unwrap();
+    runtime_tree::write_projection_file(
+        home.root(),
+        "etc/.astrid-private-00000000000040008000000000000001",
+        b"unadmitted partial sentinel",
+    )
+    .unwrap();
     drop(store);
     home.ensure().unwrap();
     assert!(

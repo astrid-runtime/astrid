@@ -382,6 +382,20 @@ pub fn validate_private_file(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Observe privacy without acquiring content-read authority or excluding a live
+/// writer. Stopped-volume recognition is only a structural preflight; storage
+/// subsequently authenticates and locks the canonical volume before recovery.
+pub(crate) fn validate_private_file_metadata(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        windows::validate_private_file_metadata(path)
+    }
+    #[cfg(not(windows))]
+    {
+        validate_private_file(path)
+    }
+}
+
 /// Reject a native path carrying an extended access-control list.
 ///
 /// macOS ACL entries can grant access beyond owner-only POSIX mode bits, so

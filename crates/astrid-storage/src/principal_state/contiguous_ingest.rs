@@ -118,7 +118,10 @@ impl RuntimePrincipalStore {
                 ChunkingProfile::ASTRID_V1,
             ));
         }
-        if ingests.is_empty() {
+        // Even an empty host snapshot must publish its derived receipt in the
+        // same root as removals. Only batches without a derivation may use the
+        // deletion-only path.
+        if ingests.is_empty() && derived.is_none() {
             return if removals.is_empty() {
                 Ok(None)
             } else {
@@ -432,3 +435,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod derived_tests;

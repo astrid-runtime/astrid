@@ -396,6 +396,11 @@ where
         I: IntoIterator<Item = ContentIngest<R>>,
     {
         let ordered = ordered_ingests(ingests)?;
+        // A derivation supplies the publication entry for an empty source
+        // snapshot; ordinary streaming batches still require a source.
+        if ordered.is_empty() && publication.derived.is_none() {
+            return Err(PrincipalContentError::EmptyBatch);
+        }
         let phase_observer = observe.then(|| Arc::new(BulkPhaseObserver::default()));
         let (completed, pending) = self.partition_cached_ingests(principal, ordered, cache)?;
         if let Some((bound, limit)) = self.quota_staging_bound(principal)? {
@@ -714,9 +719,6 @@ where
         {
             return Err(PrincipalContentError::DuplicateBatchName(name));
         }
-    }
-    if ordered.is_empty() {
-        return Err(PrincipalContentError::EmptyBatch);
     }
     Ok(ordered)
 }

@@ -27,6 +27,7 @@ use active_receipt::ActiveReceiptDeriver;
 mod projection;
 mod restoration;
 mod retirement;
+use retirement::transition_retiring_projection;
 mod stopped_recovery;
 #[cfg(test)]
 mod stopped_staging_matrix_tests;
@@ -91,9 +92,23 @@ pub(super) fn scan(runtime_root: &Path) -> StorageResult<Vec<RuntimeTreeEntry>> 
     scan_with_receipt(runtime_root, None)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScanPolicy {
+    Admission,
+    Publication,
+}
+
 fn scan_with_receipt(
     runtime_root: &Path,
     receipt: Option<&active::ActiveProjectionReceipt>,
+) -> StorageResult<Vec<RuntimeTreeEntry>> {
+    scan_with_policy(runtime_root, receipt, ScanPolicy::Admission)
+}
+
+fn scan_with_policy(
+    runtime_root: &Path,
+    receipt: Option<&active::ActiveProjectionReceipt>,
+    policy: ScanPolicy,
 ) -> StorageResult<Vec<RuntimeTreeEntry>> {
     tracing::trace!(target: "astrid_storage::runtime_tree_scan", "scan runtime source tree");
     let metadata = std::fs::symlink_metadata(runtime_root)
@@ -106,7 +121,7 @@ fn scan_with_receipt(
     }
 
     let mut files = Vec::new();
-    collect_files(runtime_root, runtime_root, &mut files, receipt)?;
+    collect_files(runtime_root, runtime_root, &mut files, receipt, policy)?;
     files.sort_by(|left, right| left.0.cmp(&right.0));
     files
         .into_iter()
@@ -138,6 +153,7 @@ fn collect_files(
     directory: &Path,
     files: &mut Vec<(String, PathBuf, std::fs::Metadata)>,
     receipt: Option<&active::ActiveProjectionReceipt>,
+    policy: ScanPolicy,
 ) -> StorageResult<()> {
     let mut entries = std::fs::read_dir(directory)
         .map_err(|error| tree_error(directory, format!("read directory: {error}")))?
@@ -168,6 +184,13 @@ fn collect_files(
                 continue;
             }
             if metadata.is_dir() {
+                if policy == ScanPolicy::Publication && relative_text == STAGING_JOURNAL_PROJECTION
+                {
+                    return Err(tree_error(
+                        &path,
+                        "pack-open staging journal is not a regular file",
+                    ));
+                }
                 // Only scoped RETIRING recovery reserves temporary-shaped
                 // directories. Ordinary admission retains its existing rules.
                 if let Some(receipt) = receipt
@@ -183,11 +206,16 @@ fn collect_files(
                         ),
                     ));
                 }
-                collect_files(root, &path, files, receipt)?;
+                collect_files(root, &path, files, receipt, policy)?;
             } else if metadata.is_file() {
                 files.push((relative_text, path, metadata));
+            } else if policy == ScanPolicy::Publication {
+                return Err(tree_error(
+                    &path,
+                    "running projection contains an unadmitted special entry",
+                ));
             }
-        } else if metadata.is_dir() || metadata.is_file() {
+        } else if metadata.is_dir() || metadata.is_file() || policy == ScanPolicy::Publication {
             return Err(tree_error(
                 &path,
                 "source entry path is not valid UTF-8".to_owned(),
@@ -300,7 +328,7 @@ pub(super) fn quarantine_principal_store(
     let source = home.principal_store_path();
     validate_legacy_retirement_candidate(&source)?;
     let mut files = Vec::new();
-    collect_files(&source, &source, &mut files, None)?;
+    collect_files(&source, &source, &mut files, None, ScanPolicy::Admission)?;
     files.sort_by(|left, right| left.0.cmp(&right.0));
 
     let generation = next_quarantine_generation(store)?;
@@ -499,19 +527,20 @@ pub(super) fn pack_and_retire_projection(
     {
         return legacy_projection_pack(home, store, staging_close);
     }
-    if validate_surviving_projection(home.root(), home.root())? {
+    // This one walk retains the validation pass's special-entry rejection;
+    // ordinary admission scans intentionally have a different contract.
+    let scanned = scan_with_policy(home.root(), None, ScanPolicy::Publication)?;
+    if !scanned.is_empty() {
         let receipt = active::read(home, store)?;
         match receipt {
             Some(receipt) if receipt.phase() == ReceiptPhase::Active => {
-                publish_active_projection(home, store)?;
+                publish_scanned_projection(home, store, &receipt, scanned)?;
             },
             Some(receipt) => {
-                let scanned = scan(home.root())?;
                 validate_retiring_host_subset(home, &receipt, &scanned)?;
             },
             None => {
-                let scanned = scan(home.root())?;
-                if !scanned.is_empty() && !is_exactly_pack_open_staging_journal(&scanned) {
+                if !is_exactly_pack_open_staging_journal(&scanned) {
                     let names = scanned
                         .iter()
                         .map(|entry| entry.name().as_str())
@@ -619,12 +648,21 @@ fn publish_active_projection(
         )
     })?;
     let scanned = scan(home.root())?;
+    publish_scanned_projection(home, store, &receipt, scanned)
+}
+
+fn publish_scanned_projection(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+    receipt: &active::ActiveProjectionReceipt,
+    scanned: Vec<RuntimeTreeEntry>,
+) -> StorageResult<()> {
     let surviving = scanned
         .iter()
         .map(RuntimeTreeEntry::name)
         .cloned()
         .collect::<Vec<_>>();
-    let mut removals = active::removals(&receipt, &surviving)?;
+    let mut removals = active::removals(receipt, &surviving)?;
     removals.retain(|name| !projection::surviving_directory(home.root(), name.as_str()));
     let receipt_entries = scanned
         .iter()
@@ -653,26 +691,6 @@ fn publish_active_projection(
         .flush()
         .map_err(|error| tree_error(home.root(), format!("flush active projection: {error}")))?;
     Ok(())
-}
-
-fn transition_retiring_projection(
-    home: &AstridHome,
-    store: &RuntimePrincipalStore,
-) -> StorageResult<()> {
-    let receipt = active::read(home, store)?;
-    let Some(receipt) = receipt else {
-        return Ok(());
-    };
-    if receipt.phase() == ReceiptPhase::Retiring {
-        return Ok(());
-    }
-    let entries = active_projection_entries(home, store)?;
-    let receipt = receipt_ingest(home, ReceiptPhase::Retiring, &entries, None)?;
-    store.replace_contiguous_files_removing_exact(StateOwner::System, [receipt], &[], None)?;
-    store
-        .content()
-        .flush()
-        .map_err(|error| tree_error(home.root(), format!("flush retiring receipt: {error}")))
 }
 
 fn legacy_projection_pack(
@@ -842,6 +860,11 @@ fn is_exactly_pack_open_staging_journal(scanned: &[RuntimeTreeEntry]) -> bool {
 /// host endpoints and media paths remain outside authority and cannot make an
 /// otherwise volume-only home look like a surviving projection.
 fn validate_surviving_projection(root: &Path, directory: &Path) -> StorageResult<bool> {
+    if tracing::enabled!(target: "astrid_storage::runtime_tree_scan", tracing::Level::TRACE)
+        && root == directory
+    {
+        tracing::trace!(target: "astrid_storage::runtime_tree_scan", "validate running projection tree");
+    }
     let mut entries = std::fs::read_dir(directory)
         .map_err(|error| tree_error(directory, format!("read running projection: {error}")))?
         .collect::<Result<Vec<_>, _>>()

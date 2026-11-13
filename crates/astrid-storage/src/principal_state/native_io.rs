@@ -151,7 +151,17 @@ impl PrivateDirectory {
 
     pub(super) fn ensure_child(&self, name: &Path) -> StorageResult<Self> {
         if !self.contains(name)? {
-            self.directory.create_dir(name).map_err(|error| {
+            #[cfg(windows)]
+            let created = {
+                use std::os::windows::io::AsHandle as _;
+                astrid_core::platform_fs::directory_capability::create_private_directory_relative(
+                    self.directory.as_handle(),
+                    name.as_os_str(),
+                )
+            };
+            #[cfg(not(windows))]
+            let created = self.directory.create_dir(name);
+            created.map_err(|error| {
                 connection(format!(
                     "create private directory {}: {error}",
                     self.path.join(name).display()
@@ -250,23 +260,34 @@ impl PrivateDirectory {
     }
 
     pub(super) fn create_file(&self, name: &Path) -> StorageResult<File> {
-        let mut options = cap_std::fs::OpenOptions::new();
-        options.create_new(true).read(true).write(true);
-        #[cfg(unix)]
-        {
-            use cap_std::fs::OpenOptionsExt as _;
-            options.mode(PRIVATE_FILE_MODE);
-        }
-        let file = self
-            .directory
-            .open_with(name, &options)
-            .map(cap_std::fs::File::into_std)
-            .map_err(|error| {
-                connection(format!(
-                    "create private file {}: {error}",
-                    self.path.join(name).display()
-                ))
-            })?;
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::io::AsHandle as _;
+
+            astrid_core::platform_fs::directory_capability::create_private_file_relative(
+                self.directory.as_handle(),
+                name.as_os_str(),
+            )
+        };
+        #[cfg(not(windows))]
+        let file = {
+            let mut options = cap_std::fs::OpenOptions::new();
+            options.create_new(true).read(true).write(true);
+            #[cfg(unix)]
+            {
+                use cap_std::fs::OpenOptionsExt as _;
+                options.mode(PRIVATE_FILE_MODE);
+            }
+            self.directory
+                .open_with(name, &options)
+                .map(cap_std::fs::File::into_std)
+        };
+        let file = file.map_err(|error| {
+            connection(format!(
+                "create private file {}: {error}",
+                self.path.join(name).display()
+            ))
+        })?;
         private_file_identity(&file)?;
         Ok(file)
     }

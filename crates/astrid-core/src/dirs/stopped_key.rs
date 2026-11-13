@@ -71,7 +71,7 @@ fn recognize_projection(home: &AstridHome) -> io::Result<Option<StoppedProjectio
         }
     }
     validate_recovery_root(home)?;
-    crate::platform_fs::validate_private_file(&home.storage_volume_path())?;
+    crate::platform_fs::validate_private_file_metadata(&home.storage_volume_path())?;
     if has_key {
         return Ok(valid_key_residue(home)?.then_some(StoppedProjectionRecovery::RuntimeKey));
     }

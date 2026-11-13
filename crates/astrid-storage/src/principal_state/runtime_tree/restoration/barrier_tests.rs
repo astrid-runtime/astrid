@@ -33,6 +33,7 @@ async fn fixture() -> (
     for name in [EXISTING, ABSENT, "zz-redirected.conf"] {
         super::super::write_projection_file(home.root(), name, AUTHORITATIVE).unwrap();
     }
+    crate::principal_state::lifecycle::staging::close_for_retirement(&store).unwrap();
     store.publish_runtime_projection(&home).unwrap();
     transition_retiring_projection(&home, &store).unwrap();
     // Model stale and absent host files after a durable RETIRING receipt.

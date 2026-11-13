@@ -10,6 +10,53 @@ use super::{
 };
 use crate::StorageResult;
 
+/// Publish a complete inventory only while every captured file still matches.
+pub(super) fn transition_retiring_projection(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+) -> StorageResult<()> {
+    transition_retiring_with_hook(home, store, || Ok(()))
+}
+
+fn transition_retiring_with_hook(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+    before_publish: impl FnOnce() -> StorageResult<()>,
+) -> StorageResult<()> {
+    let name = active::active_projection_name()?;
+    let expected = store
+        .content()
+        .describe(&super::StateOwner::System, &name)
+        .map_err(|error| tree_error(home.root(), format!("inspect retiring receipt: {error}")))?
+        .map(crate::content::ContentDescriptor::file);
+    let Some(receipt) = active::read(home, store)? else {
+        return Ok(());
+    };
+    if receipt.phase() == super::ReceiptPhase::Retiring {
+        return Ok(());
+    }
+    let entries = super::active_projection_entries(home, store)?;
+    let expectation = crate::content::ContentBatchExpectation::exact(
+        entries
+            .iter()
+            .map(|entry| (entry.name.clone(), Some(entry.file)))
+            .chain([(name.clone(), expected)]),
+    );
+    let receipt = super::receipt_ingest(home, super::ReceiptPhase::Retiring, &entries, None)?;
+    before_publish()?;
+    store.replace_contiguous_files_with_expectation(
+        super::StateOwner::System,
+        [receipt],
+        &[],
+        None,
+        Some(&expectation),
+    )?;
+    store
+        .content()
+        .flush()
+        .map_err(|error| tree_error(home.root(), format!("flush retiring receipt: {error}")))
+}
+
 enum Inventory {
     Current(Option<active::ActiveProjectionReceipt>),
     Legacy(Vec<crate::content::ContentEntry>),
@@ -117,3 +164,6 @@ fn retire(
 
 #[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(test)]
+mod publication_tests;

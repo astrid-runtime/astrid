@@ -565,7 +565,10 @@ fn test_probe_created_directory_acl(handle: HANDLE, disposition: u32) -> io::Res
     Ok(())
 }
 
-fn create_private_directory_relative(parent: HANDLE, name: &OsStr) -> io::Result<OwnedHandle> {
+pub(super) fn create_private_directory_relative(
+    parent: HANDLE,
+    name: &OsStr,
+) -> io::Result<OwnedHandle> {
     create_private_directory_identity_relative(parent, name).map(|(handle, _)| handle)
 }
 

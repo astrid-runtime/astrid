@@ -65,7 +65,7 @@ pub(super) fn acquire_named_private_lock(
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             let name = guarded_child_name(guard, path)?;
             let handle = open_guarded_child_with_options(
-                guard,
+                guard.authority_handle(),
                 name,
                 GENERIC_READ | GENERIC_WRITE | READ_CONTROL,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -713,7 +713,7 @@ fn open_guarded_child(
     desired_access: u32,
 ) -> io::Result<OwnedHandle> {
     open_guarded_child_with_options(
-        guard,
+        guard.authority_handle(),
         name,
         desired_access,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -726,7 +726,13 @@ fn open_guarded_child_locked(
     name: &OsStr,
     desired_access: u32,
 ) -> io::Result<OwnedHandle> {
-    open_guarded_child_with_options(guard, name, desired_access, FILE_SHARE_READ, FILE_OPEN)
+    open_guarded_child_with_options(
+        guard.authority_handle(),
+        name,
+        desired_access,
+        FILE_SHARE_READ,
+        FILE_OPEN,
+    )
 }
 
 pub(in crate::platform_fs::windows) fn create_guarded_private_file(
@@ -742,14 +748,22 @@ fn create_guarded_private_file_with_share(
     share_access: u32,
 ) -> io::Result<File> {
     let name = guarded_child_name(guard, path)?;
+    create_private_relative_file(guard.authority_handle(), name, share_access)
+}
+
+pub(super) fn create_private_relative_file(
+    parent: HANDLE,
+    name: &OsStr,
+    share_access: u32,
+) -> io::Result<File> {
     let handle = open_guarded_child_with_options(
-        guard,
+        parent,
         name,
         GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC | DELETE,
         share_access,
         FILE_CREATE,
     )?;
-    if let Err(error) = validate_private_acl_handle(handle.0, false, &path.display().to_string()) {
+    if let Err(error) = validate_private_acl_handle(handle.0, false, &name.to_string_lossy()) {
         let _ = mark_file_for_deletion(handle.0);
         return Err(error);
     }
@@ -847,7 +861,7 @@ impl Drop for DeleteCreatedFileOnDrop {
 }
 
 fn open_guarded_child_with_options(
-    guard: &TrustedPathGuard,
+    parent: HANDLE,
     name: &OsStr,
     desired_access: u32,
     share_access: u32,
@@ -880,7 +894,7 @@ fn open_guarded_child_with_options(
     let attributes = OBJECT_ATTRIBUTES {
         Length: u32::try_from(size_of::<OBJECT_ATTRIBUTES>())
             .expect("OBJECT_ATTRIBUTES fits in u32"),
-        RootDirectory: guard.authority_handle(),
+        RootDirectory: parent,
         ObjectName: &raw const unicode,
         Attributes: 0x40, // OBJ_CASE_INSENSITIVE
         SecurityDescriptor: security_descriptor

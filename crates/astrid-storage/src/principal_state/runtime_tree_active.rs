@@ -143,6 +143,7 @@ pub(super) fn read(
     home: &AstridHome,
     store: &RuntimePrincipalStore,
 ) -> StorageResult<Option<ActiveProjectionReceipt>> {
+    tracing::trace!(target: "astrid_storage::projection_receipt_read", "read runtime projection receipt");
     let receipt = read_relocatable(home, store)?;
     if let Some(receipt) = &receipt
         && receipt.root != canonical_root(home)?

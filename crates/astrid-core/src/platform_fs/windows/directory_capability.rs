@@ -116,6 +116,61 @@ pub fn open_directory_flush_relative(
     })
 }
 
+/// Create one regular file relative to a retained private directory.
+///
+/// Supplies the protected `ExactPrivate` ACL at `FILE_CREATE`, never overwrites,
+/// rejects redirects and verifies both the live child and parent ACLs. Retains
+/// ordinary read/write/delete sharing: the caller owns staging serialization.
+/// No ambient path is opened and no existing entry's permissions are repaired.
+///
+/// # Errors
+/// Returns an error for an invalid leaf, nonprivate parent, existing entry, or
+/// failed birth/ACL checks. A failed parent postcheck deletes only the new handle.
+pub fn create_private_file_relative(parent: BorrowedHandle<'_>, name: &OsStr) -> io::Result<File> {
+    let name = validate_relative_component(name)?;
+    let parent = parent.as_raw_handle().cast();
+    super::acl::validate_private_acl_handle(parent, true, "private file parent")?;
+    let file = super::io::create_private_relative_file(
+        parent,
+        name,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )?;
+    if let Err(error) = super::acl::validate_private_acl_handle(parent, true, "private file parent")
+    {
+        let _ = super::path::mark_handle_for_deletion(file.as_raw_handle().cast());
+        return Err(error);
+    }
+    Ok(file)
+}
+
+/// Create one private directory relative to a retained private parent.
+///
+/// Uses the same protected birth descriptor as ambient private-directory
+/// creation. The caller retains responsibility for its directory durability fence.
+/// Existing entries are never repaired or replaced.
+///
+/// # Errors
+/// Rejects non-leaf names, nonprivate parents, existing entries, redirects and
+/// failed ACL checks. Failed postchecks delete only the newly created handle.
+pub fn create_private_directory_relative(
+    parent: BorrowedHandle<'_>,
+    name: &OsStr,
+) -> io::Result<()> {
+    let name = validate_relative_component(name)?;
+    let parent = parent.as_raw_handle().cast();
+    super::acl::validate_private_acl_handle(parent, true, "private directory parent")?;
+    let child = super::path::create_private_directory_relative(parent, name)?;
+    let checked = super::acl::validate_private_acl_handle(child.0, true, "private directory child")
+        .and_then(|()| {
+            super::acl::validate_private_acl_handle(parent, true, "private directory parent")
+        });
+    if let Err(error) = checked {
+        let _ = super::path::mark_handle_for_deletion(child.0);
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Exclusive rename of an already-opened source into `destination_parent/name`.
 ///
 /// `destination_name` must be a single normal path component. Uses
