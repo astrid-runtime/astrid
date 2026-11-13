@@ -337,7 +337,9 @@ mod tests {
         fs::write(&path, b"old").unwrap();
         admit(&home, &store).await.unwrap();
         fs::write(&path, b"new").unwrap();
-        fs::File::open(&path)
+        fs::File::options()
+            .write(true)
+            .open(&path)
             .unwrap()
             .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
             .unwrap();
@@ -361,11 +363,13 @@ mod tests {
         let store = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
             .await
             .unwrap();
-        astrid_core::platform_fs::atomic_write_private_file(
-            &home.migrations_dir().join(RECEIPT_NAME),
-            b"{",
-        )
-        .unwrap();
+        let projection =
+            astrid_core::platform_fs::PrivateFileProjection::open(home.root()).unwrap();
+        projection
+            .write(Path::new(RECEIPT_RELATIVE_PATH), b"{")
+            .unwrap();
+        projection.sync().unwrap();
+        drop(projection);
         let before = fs::metadata(home.storage_volume_path()).unwrap().len();
         assert_eq!(
             admit(&home, &store).await.unwrap_err().kind(),
