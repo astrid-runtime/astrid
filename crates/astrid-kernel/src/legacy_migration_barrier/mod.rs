@@ -42,6 +42,7 @@ mod proof;
 mod retirement;
 mod secret;
 mod source;
+#[cfg(any(unix, test))]
 mod startup;
 #[cfg(unix)]
 use crate::preflight_legacy_audit_sources;
@@ -67,6 +68,7 @@ use ledger::{MigrationComponent, canonical_json};
 use retirement::retire_owner_controlled_tree;
 #[cfg(test)]
 use retirement::retire_tree;
+#[cfg(any(unix, test))]
 pub(crate) use startup::{StartupLayout, classify_startup, validate_recovery};
 
 #[cfg(test)]
