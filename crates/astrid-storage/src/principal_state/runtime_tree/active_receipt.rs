@@ -15,29 +15,7 @@ impl PrepareDerivedBatchContent for ActiveReceiptDeriver<'_> {
         &mut self,
         prepared: &std::collections::BTreeMap<ContentName, crate::content::ContentDescriptor>,
     ) -> Result<(ContentName, Vec<u8>), crate::content::PrincipalContentError> {
-        let mut entries = self
-            .entries
-            .iter()
-            .map(|(name, logical_bytes)| {
-                let descriptor = prepared.get(name).ok_or_else(|| {
-                    PrincipalProjectionError::Engine(format!(
-                        "prepared runtime projection omitted {}",
-                        name.as_str()
-                    ))
-                })?;
-                if descriptor.logical_bytes() != *logical_bytes {
-                    return Err(PrincipalProjectionError::Engine(format!(
-                        "prepared runtime projection changed {}",
-                        name.as_str()
-                    )));
-                }
-                Ok(ActiveProjectionEntry {
-                    name: name.clone(),
-                    file: descriptor.file(),
-                    logical_bytes: *logical_bytes,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut entries = prepared_entries(&self.entries, prepared)?;
         entries.extend(
             self.retained
                 .iter()
@@ -58,4 +36,33 @@ impl PrepareDerivedBatchContent for ActiveReceiptDeriver<'_> {
             .map_err(|error| PrincipalProjectionError::Engine(error.to_string()))?;
         Ok((name, bytes))
     }
+}
+
+/// Bind source lengths to the actual prepared identities before deriving inventory.
+pub(super) fn prepared_entries(
+    entries: &[(ContentName, u64)],
+    prepared: &std::collections::BTreeMap<ContentName, crate::content::ContentDescriptor>,
+) -> Result<Vec<ActiveProjectionEntry>, PrincipalProjectionError> {
+    entries
+        .iter()
+        .map(|(name, logical_bytes)| {
+            let descriptor = prepared.get(name).ok_or_else(|| {
+                PrincipalProjectionError::Engine(format!(
+                    "prepared runtime projection omitted {}",
+                    name.as_str()
+                ))
+            })?;
+            if descriptor.logical_bytes() != *logical_bytes {
+                return Err(PrincipalProjectionError::Engine(format!(
+                    "prepared runtime projection changed {}",
+                    name.as_str()
+                )));
+            }
+            Ok(ActiveProjectionEntry {
+                name: name.clone(),
+                file: descriptor.file(),
+                logical_bytes: *logical_bytes,
+            })
+        })
+        .collect()
 }

@@ -10,6 +10,9 @@ use super::{
 };
 use crate::StorageResult;
 
+mod publication;
+pub(super) use publication::publish_retiring_projection;
+
 /// Publish a complete inventory only while every captured file still matches.
 pub(super) fn transition_retiring_projection(
     home: &AstridHome,
@@ -23,38 +26,9 @@ fn transition_retiring_with_hook(
     store: &RuntimePrincipalStore,
     before_publish: impl FnOnce() -> StorageResult<()>,
 ) -> StorageResult<()> {
-    let name = active::active_projection_name()?;
-    let expected = store
-        .content()
-        .describe(&super::StateOwner::System, &name)
-        .map_err(|error| tree_error(home.root(), format!("inspect retiring receipt: {error}")))?
-        .map(crate::content::ContentDescriptor::file);
-    let Some(receipt) = active::read(home, store)? else {
-        return Ok(());
-    };
-    if receipt.phase() == super::ReceiptPhase::Retiring {
-        return Ok(());
-    }
-    let entries = super::active_projection_entries(home, store)?;
-    let expectation = crate::content::ContentBatchExpectation::exact(
-        entries
-            .iter()
-            .map(|entry| (entry.name.clone(), Some(entry.file)))
-            .chain([(name.clone(), expected)]),
-    );
-    let receipt = super::receipt_ingest(home, super::ReceiptPhase::Retiring, &entries, None)?;
-    before_publish()?;
-    store.replace_contiguous_files_with_expectation(
-        super::StateOwner::System,
-        [receipt],
-        &[],
-        None,
-        Some(&expectation),
-    )?;
-    store
-        .content()
-        .flush()
-        .map_err(|error| tree_error(home.root(), format!("flush retiring receipt: {error}")))
+    // No host payloads are rewritten on restoration's inventory-only path.
+    // The shared empty-snapshot contract retains the complete durable catalog.
+    publication::publish_with_hook(home, store, Vec::new(), before_publish)
 }
 
 enum Inventory {
@@ -138,14 +112,20 @@ fn retire(
         // a pathname replacement. This clone conveys identity, not a new open.
         let volume = store.retirement_volume_file(home)?;
         before_prepare()?;
+        let started = std::time::Instant::now();
         let prepared = astrid_core::dirs::PreparedProjectionRetirement::prepare(home.root())
             .map_err(|error| tree_error(home.root(), format!("prepare retirement: {error}")))?;
+        tracing::debug!(elapsed = ?started.elapsed(), "captured projection retirement inventory");
+        let started = std::time::Instant::now();
         for relative in prepared.regular_files() {
             inventory.require_file(home, relative)?;
         }
+        tracing::debug!(elapsed = ?started.elapsed(), "validated projection retirement inventory");
+        let started = std::time::Instant::now();
         prepared
             .retire(&volume)
             .map_err(|error| tree_error(home.root(), format!("retire projection: {error}")))?;
+        tracing::debug!(elapsed = ?started.elapsed(), "deleted and synchronized runtime projection");
     }
     #[cfg(not(any(unix, windows)))]
     {

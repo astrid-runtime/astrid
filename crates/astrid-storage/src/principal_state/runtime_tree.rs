@@ -529,38 +529,18 @@ pub(super) fn pack_and_retire_projection(
     }
     // This one walk retains the validation pass's special-entry rejection;
     // ordinary admission scans intentionally have a different contract.
+    let started = std::time::Instant::now();
     let scanned = scan_with_policy(home.root(), None, ScanPolicy::Publication)?;
-    if !scanned.is_empty() {
-        let receipt = active::read(home, store)?;
-        match receipt {
-            Some(receipt) if receipt.phase() == ReceiptPhase::Active => {
-                publish_scanned_projection(home, store, &receipt, scanned)?;
-            },
-            Some(receipt) => {
-                validate_retiring_host_subset(home, &receipt, &scanned)?;
-            },
-            None => {
-                if !is_exactly_pack_open_staging_journal(&scanned) {
-                    let names = scanned
-                        .iter()
-                        .map(|entry| entry.name().as_str())
-                        .collect::<Vec<_>>();
-                    return Err(tree_error(
-                        home.root(),
-                        format!(
-                            "active projection receipt is missing for surviving host projection: {names:?}"
-                        ),
-                    ));
-                }
-            },
-        }
-    }
-    transition_retiring_projection(home, store)?;
+    tracing::debug!(elapsed = ?started.elapsed(), files = scanned.len(), "scanned final runtime projection");
+    retirement::publish_retiring_projection(home, store, scanned)?;
     if let Some(token) = staging_close {
         token.commit();
     }
     retirement::retire_current_projection(home, store)?;
-    active::clear(store, home).map(|_| ())
+    let started = std::time::Instant::now();
+    active::clear(store, home)?;
+    tracing::debug!(elapsed = ?started.elapsed(), "cleared retired projection receipt");
+    Ok(())
 }
 
 fn is_staging_generation(name: &str) -> bool {
@@ -657,6 +637,7 @@ fn publish_scanned_projection(
     receipt: &active::ActiveProjectionReceipt,
     scanned: Vec<RuntimeTreeEntry>,
 ) -> StorageResult<()> {
+    let started = std::time::Instant::now();
     let surviving = scanned
         .iter()
         .map(RuntimeTreeEntry::name)
@@ -690,6 +671,7 @@ fn publish_scanned_projection(
         .content()
         .flush()
         .map_err(|error| tree_error(home.root(), format!("flush active projection: {error}")))?;
+    tracing::debug!(target: "astrid_storage::runtime_tree_publication", elapsed = ?started.elapsed(), phase = "active", "published and flushed runtime projection");
     Ok(())
 }
 

@@ -12,6 +12,7 @@ use crate::{KvQuotaResolver, StateOwner, open_runtime_principal_store};
 struct Operations {
     scans: Arc<AtomicUsize>,
     receipts: Arc<AtomicUsize>,
+    publications: Arc<AtomicUsize>,
 }
 
 impl tracing::Subscriber for Operations {
@@ -30,6 +31,9 @@ impl tracing::Subscriber for Operations {
             },
             "astrid_storage::projection_receipt_read" => {
                 self.receipts.fetch_add(1, Ordering::Relaxed);
+            },
+            "astrid_storage::runtime_tree_publication" => {
+                self.publications.fetch_add(1, Ordering::Relaxed);
             },
             _ => {},
         }
@@ -58,14 +62,15 @@ fn name(value: &str) -> ContentName {
 }
 
 #[tokio::test]
-async fn pack_uses_one_validating_walk_and_three_receipt_reads() {
+async fn pack_uses_one_validating_walk_one_publication_and_two_receipt_reads() {
     let (_directory, home, store) = fixture().await;
     let operations = Operations::default();
     tracing::subscriber::with_default(operations.clone(), || {
         store.pack_and_retire_runtime_projection(&home).unwrap();
     });
     assert_eq!(operations.scans.load(Ordering::Relaxed), 1);
-    assert_eq!(operations.receipts.load(Ordering::Relaxed), 3);
+    assert_eq!(operations.receipts.load(Ordering::Relaxed), 2);
+    assert_eq!(operations.publications.load(Ordering::Relaxed), 1);
     assert_eq!(std::fs::read_dir(home.root()).unwrap().count(), 1);
     assert!(active::read(&home, &store).unwrap().is_none());
 }
