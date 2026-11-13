@@ -1,5 +1,6 @@
 //! Root binding and bounded relative directory ownership.
 
+use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
@@ -99,9 +100,17 @@ struct DirectoryBinding {
     identity: Identity,
 }
 
+/// At most one completed chain is retained, independent of the number of files.
+/// Bindings are hints until each live name is revalidated; inspection never uses it.
+#[derive(Default)]
+pub(super) struct LastDirectoryChain {
+    bindings: RefCell<Vec<DirectoryBinding>>,
+}
+
 pub(super) struct DirectoryChain<'a> {
     root: &'a Root,
     bindings: Vec<DirectoryBinding>,
+    return_to: Option<&'a LastDirectoryChain>,
 }
 
 impl<'a> DirectoryChain<'a> {
@@ -111,61 +120,132 @@ impl<'a> DirectoryChain<'a> {
         names: &[OsString],
         policy: WalkPolicy,
     ) -> io::Result<Option<Self>> {
+        Self::walk_with_previous(root, boundary, names, policy, None)
+    }
+
+    pub(super) fn walk_reusing(
+        root: &'a Root,
+        boundary: &MountBoundary,
+        names: &[OsString],
+        policy: WalkPolicy,
+        previous: &'a LastDirectoryChain,
+    ) -> io::Result<Option<Self>> {
+        Self::walk_with_previous(root, boundary, names, policy, Some(previous))
+    }
+
+    fn walk_with_previous(
+        root: &'a Root,
+        boundary: &MountBoundary,
+        names: &[OsString],
+        policy: WalkPolicy,
+        previous: Option<&'a LastDirectoryChain>,
+    ) -> io::Result<Option<Self>> {
         #[cfg(test)]
         RELATIVE_WALKS.with(|count| count.set(count.get().strict_add(1)));
         root.validate(boundary)?;
+        let mut bindings = previous
+            .map(|previous| std::mem::take(&mut *previous.bindings.borrow_mut()))
+            .unwrap_or_default();
+        let common = bindings
+            .iter()
+            .zip(names)
+            .take_while(|(binding, name)| &binding.name == *name)
+            .count();
+        bindings.truncate(common);
         let mut chain = Self {
             root,
-            bindings: Vec::with_capacity(names.len()),
+            bindings,
+            return_to: None,
         };
-        for name in names {
-            let parent = chain.directory();
-            let mut created = false;
-            let initial = match entry_stat(parent, name)? {
-                Some(stat) => stat,
-                None if matches!(policy, WalkPolicy::Inspect | WalkPolicy::Repair) => {
-                    chain.validate(boundary)?;
-                    return Ok(None);
-                },
-                None => {
-                    match mkdirat(parent, name.as_os_str(), Mode::from_bits_truncate(0o700)) {
-                        Ok(()) => created = true,
-                        Err(nix::errno::Errno::EEXIST) => {},
-                        Err(error) => return Err(nix_io_error(error)),
-                    }
-                    entry_stat(parent, name)?
-                        .ok_or_else(|| invalid("new projection directory disappeared"))?
-                },
+        // A full prefix needs only the complete validation below: nothing uses
+        // its descriptors before then. A partial prefix must be validated before
+        // using its directory as authority to acquire or create the suffix.
+        if !chain.bindings.is_empty() {
+            let complete = common == names.len();
+            let validated = if complete {
+                chain.validate(boundary)
+            } else {
+                chain.validate_bindings(boundary)
             };
-            if initial.st_mode & SFlag::S_IFMT.bits() != SFlag::S_IFDIR.bits() {
-                return Err(invalid("projection parent is not a real directory"));
-            }
-            let file = File::from(
-                openat(parent, name.as_os_str(), directory_flags(), Mode::empty())
-                    .map_err(nix_io_error)?,
-            );
-            let identity = Identity::read(&initial);
-            verify_identity(parent, name, &file, identity)?;
-            boundary.validate(&file)?;
-            match policy {
-                WalkPolicy::Inspect => {
-                    validate_private_directory(&file)?;
+            match validated {
+                Ok(()) if complete => {
+                    chain.return_to = previous;
+                    return Ok(Some(chain));
                 },
-                WalkPolicy::Repair | WalkPolicy::Create => {
-                    if make_private_directory(&file)? || created {
-                        fsync(&file).map_err(nix_io_error)?;
-                        fsync(parent).map_err(nix_io_error)?;
-                    }
+                Ok(()) => {},
+                Err(_) => {
+                    // A stale hint does not change Repair/Create/Inspect policy.
+                    // Recheck the root before an ordinary full acquisition.
+                    chain.bindings.clear();
+                    root.validate(boundary)?;
                 },
             }
-            chain.bindings.push(DirectoryBinding {
-                name: name.clone(),
-                file,
-                identity,
-            });
+        }
+        let common = chain.bindings.len();
+        chain.bindings.reserve(names.len().saturating_sub(common));
+        for name in &names[common..] {
+            if !chain.acquire_child(boundary, name, policy)? {
+                chain.validate(boundary)?;
+                return Ok(None);
+            }
         }
         chain.validate(boundary)?;
+        // Only a complete successful acquisition is returned to the hint slot.
+        chain.return_to = previous;
         Ok(Some(chain))
+    }
+
+    fn acquire_child(
+        &mut self,
+        boundary: &MountBoundary,
+        name: &OsStr,
+        policy: WalkPolicy,
+    ) -> io::Result<bool> {
+        #[cfg(test)]
+        NEW_BINDINGS.with(|count| count.set(count.get().strict_add(1)));
+        let parent = self.directory();
+        let mut created = false;
+        let initial = match entry_stat(parent, name)? {
+            Some(stat) => stat,
+            None if matches!(policy, WalkPolicy::Inspect | WalkPolicy::Repair) => {
+                return Ok(false);
+            },
+            None => {
+                match mkdirat(parent, name, Mode::from_bits_truncate(0o700)) {
+                    Ok(()) => created = true,
+                    Err(nix::errno::Errno::EEXIST) => {},
+                    Err(error) => return Err(nix_io_error(error)),
+                }
+                entry_stat(parent, name)?
+                    .ok_or_else(|| invalid("new projection directory disappeared"))?
+            },
+        };
+        if initial.st_mode & SFlag::S_IFMT.bits() != SFlag::S_IFDIR.bits() {
+            return Err(invalid("projection parent is not a real directory"));
+        }
+        let file = File::from(
+            openat(parent, name, directory_flags(), Mode::empty()).map_err(nix_io_error)?,
+        );
+        let identity = Identity::read(&initial);
+        verify_identity(parent, name, &file, identity)?;
+        boundary.validate(&file)?;
+        match policy {
+            WalkPolicy::Inspect => {
+                validate_private_directory(&file)?;
+            },
+            WalkPolicy::Repair | WalkPolicy::Create => {
+                if make_private_directory(&file)? || created {
+                    fsync(&file).map_err(nix_io_error)?;
+                    fsync(parent).map_err(nix_io_error)?;
+                }
+            },
+        }
+        self.bindings.push(DirectoryBinding {
+            name: name.to_os_string(),
+            file,
+            identity,
+        });
+        Ok(true)
     }
 
     pub(super) fn directory(&self) -> &File {
@@ -176,12 +256,28 @@ impl<'a> DirectoryChain<'a> {
 
     pub(super) fn validate(&self, boundary: &MountBoundary) -> io::Result<()> {
         self.root.validate(boundary)?;
+        self.validate_bindings(boundary)
+    }
+
+    fn validate_bindings(&self, boundary: &MountBoundary) -> io::Result<()> {
         let mut parent = &self.root.file;
         for binding in &self.bindings {
             validate_binding(parent, &binding.name, binding.identity, boundary)?;
             parent = &binding.file;
         }
         Ok(())
+    }
+}
+
+impl Drop for DirectoryChain<'_> {
+    fn drop(&mut self) {
+        // Caching is optional. Never panic or duplicate descriptors in Drop,
+        // including if a caller already holds another outstanding chain.
+        if let Some(previous) = self.return_to
+            && let Ok(mut bindings) = previous.bindings.try_borrow_mut()
+        {
+            *bindings = std::mem::take(&mut self.bindings);
+        }
     }
 }
 
@@ -242,10 +338,29 @@ fn validate_private_directory(file: &File) -> io::Result<FileStat> {
 }
 
 #[cfg(test)]
-thread_local! { static RELATIVE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+thread_local! {
+    static RELATIVE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static NEW_BINDINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 #[cfg(test)]
 pub(super) fn take_relative_walks() -> usize {
     RELATIVE_WALKS.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+pub(super) fn take_new_bindings() -> usize {
+    NEW_BINDINGS.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+impl LastDirectoryChain {
+    pub(super) fn retained_depth(&self) -> usize {
+        self.bindings.borrow().len()
+    }
+
+    pub(super) fn clear(&self) {
+        self.bindings.borrow_mut().clear();
+    }
 }
 
 #[cfg(test)]

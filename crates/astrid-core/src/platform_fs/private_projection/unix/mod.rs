@@ -23,13 +23,15 @@ mod failure_tests;
 #[cfg(test)]
 mod hooks;
 mod inspect;
+#[cfg(test)]
+mod last_chain_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod mount_tests;
 #[cfg(test)]
 mod tests;
 mod write;
 
-use anchor::{DirectoryChain, Root, WalkPolicy};
+use anchor::{DirectoryChain, LastDirectoryChain, Root, WalkPolicy};
 
 pub(super) use inspect::Inspection;
 pub(super) use write::{FileIdentity, Replacement};
@@ -39,6 +41,7 @@ pub(super) struct Projection {
     boundary: MountBoundary,
     staging_scope: Option<StagingScope>,
     pending_temporary: RefCell<Option<write::Temporary>>,
+    last_directories: LastDirectoryChain,
 }
 
 impl Projection {
@@ -61,6 +64,7 @@ impl Projection {
             boundary,
             staging_scope,
             pending_temporary: RefCell::new(None),
+            last_directories: LastDirectoryChain::default(),
         };
         let preparation = (|| {
             if anchor::make_private_directory(&projection.root.file)? {
@@ -146,7 +150,13 @@ impl Projection {
         names: &[std::ffi::OsString],
         policy: WalkPolicy,
     ) -> io::Result<Option<DirectoryChain<'_>>> {
-        DirectoryChain::walk(&self.root, &self.boundary, names, policy)
+        DirectoryChain::walk_reusing(
+            &self.root,
+            &self.boundary,
+            names,
+            policy,
+            &self.last_directories,
+        )
     }
 }
 

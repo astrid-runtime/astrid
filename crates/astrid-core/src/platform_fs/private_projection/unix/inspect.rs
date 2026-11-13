@@ -46,6 +46,7 @@ impl Inspection {
             boundary,
             staging_scope: None,
             pending_temporary: std::cell::RefCell::new(None),
+            last_directories: super::LastDirectoryChain::default(),
         })
     }
 
