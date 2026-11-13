@@ -6,8 +6,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::{
-    MapConstruction, PhysicalIdentity, PhysicalMapDomain, PhysicalMapNode, PhysicalMapNodeId,
-    PhysicalModelError, legacy, radix,
+    MapConstruction, PhysicalIdentity, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode,
+    PhysicalMapNodeId, PhysicalModelError, legacy, radix,
 };
 
 /// Canonical construction can retain nodes or only check and discard them.
@@ -39,14 +39,43 @@ impl CanonicalNodeSink for BTreeMap<PhysicalMapNodeId, PhysicalMapNode> {
     }
 }
 
+/// A complete canonical proof borrowing its immutable leaf values. Construction
+/// is private so callers cannot supply emitter bookkeeping as reachability proof.
+pub(crate) struct CanonicalRootProof<'a> {
+    visited: BTreeSet<PhysicalMapNodeId>,
+    entries: Vec<(PhysicalMapKey, &'a [u8])>,
+}
+
+impl<'a> CanonicalRootProof<'a> {
+    pub(crate) fn visited(&self) -> &BTreeSet<PhysicalMapNodeId> {
+        &self.visited
+    }
+    pub(crate) fn entries(&self) -> &[(PhysicalMapKey, &'a [u8])] {
+        &self.entries
+    }
+}
+
 pub(super) fn validate_root<I: PhysicalIdentity>(
     identity: &I,
     domain: PhysicalMapDomain,
     root: Option<PhysicalMapNodeId>,
     nodes: &BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
 ) -> Result<u64, PhysicalModelError> {
+    let proof = prove_root(identity, domain, root, nodes)?;
+    u64::try_from(proof.entries.len()).map_err(|_| PhysicalModelError::LengthOverflow)
+}
+
+pub(super) fn prove_root<'a, I: PhysicalIdentity>(
+    identity: &I,
+    domain: PhysicalMapDomain,
+    root: Option<PhysicalMapNodeId>,
+    nodes: &'a BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+) -> Result<CanonicalRootProof<'a>, PhysicalModelError> {
     let Some(root) = root else {
-        return Ok(0);
+        return Ok(CanonicalRootProof {
+            visited: BTreeSet::new(),
+            entries: Vec::new(),
+        });
     };
     let construction = nodes
         .get(&root)
@@ -83,7 +112,6 @@ pub(super) fn validate_root<I: PhysicalIdentity>(
     if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
         return Err(PhysicalModelError::InvalidMap("duplicate leaf key"));
     }
-    let count = u64::try_from(entries.len()).map_err(|_| PhysicalModelError::LengthOverflow)?;
     let mut proof = ValidationNodes(nodes);
     let canonical = match construction {
         MapConstruction::LegacyBinary => legacy::build(identity, domain, &entries, &mut proof)?,
@@ -94,7 +122,7 @@ pub(super) fn validate_root<I: PhysicalIdentity>(
             "node graph is not the unique canonical trie",
         ));
     }
-    Ok(count)
+    Ok(CanonicalRootProof { visited, entries })
 }
 
 /// Each production-built node is hashed, then must exist under that identity

@@ -135,7 +135,7 @@ fn sealed_journal_rejects_altered_prior_digest_with_matching_length() {
     journal.sync_data().unwrap();
     emit.retarget_expected_lengths(metadata_len, journal.metadata().unwrap().len());
     let err = store
-        .verify_sealed_generation_for_adoption(&mut metadata, &mut journal, emit, limits)
+        .verify_sealed_generation_for_adoption(&mut metadata, &mut journal, &emit, limits)
         .expect_err("altered prior digest must fail closed");
     let message = format!("{err:?}");
     assert!(
@@ -161,7 +161,7 @@ fn sealed_journal_rejects_extra_valid_state_cas_frame() {
     journal.sync_data().unwrap();
     emit.retarget_expected_lengths(metadata_len, journal.metadata().unwrap().len());
     let err = store
-        .verify_sealed_generation_for_adoption(&mut metadata, &mut journal, emit, limits)
+        .verify_sealed_generation_for_adoption(&mut metadata, &mut journal, &emit, limits)
         .expect_err("extra StateCas must fail closed");
     let message = format!("{err:?}");
     assert!(
@@ -189,7 +189,7 @@ fn sealed_metadata_rejects_duplicate_map_node_frame() {
     metadata.sync_data().unwrap();
     emit.retarget_expected_lengths(metadata.metadata().unwrap().len(), journal_len);
     let err = store
-        .verify_sealed_generation_for_adoption(&mut metadata, &mut journal, emit, limits)
+        .verify_sealed_generation_for_adoption(&mut metadata, &mut journal, &emit, limits)
         .expect_err("duplicate map node must fail closed");
     let message = format!("{err:?}");
     assert!(
@@ -233,7 +233,7 @@ fn sealed_metadata_rejects_envelope_identity_body_mismatch() {
     metadata.sync_data().unwrap();
     emit.retarget_expected_lengths(metadata.metadata().unwrap().len(), journal_len);
     let err = store
-        .verify_sealed_generation_for_adoption(&mut metadata, &mut journal, emit, limits)
+        .verify_sealed_generation_for_adoption(&mut metadata, &mut journal, &emit, limits)
         .expect_err("identity/body mismatch must fail closed");
     let message = format!("{err:?}");
     assert!(
@@ -255,7 +255,7 @@ fn unpublished_verified_adoption_candidate_does_not_publish_current() {
         .emit_sealed_generation(&mut metadata, &mut journal)
         .unwrap();
     store
-        .verify_sealed_generation_for_adoption(&mut metadata, &mut journal, emit, limits)
+        .verify_sealed_generation_for_adoption(&mut metadata, &mut journal, &emit, limits)
         .unwrap();
     drop(metadata);
     drop(journal);
@@ -394,7 +394,7 @@ fn sealed_media_rejects_partial_tails_without_repairing_the_file() {
             length
         };
         let error = store
-            .verify_sealed_generation_for_adoption(&mut metadata, &mut journal, emit, limits)
+            .verify_sealed_generation_for_adoption(&mut metadata, &mut journal, &emit, limits)
             .unwrap_err();
         assert!(format!("{error:?}").contains("length disagrees"));
         let file = if journal_tail { &journal } else { &metadata };
@@ -444,7 +444,7 @@ fn sealed_metadata_requires_all_authority_frames() {
         journal.metadata().unwrap().len(),
     );
     let error = store
-        .verify_sealed_generation_for_adoption(&mut metadata, &mut journal, emit, limits)
+        .verify_sealed_generation_for_adoption(&mut metadata, &mut journal, &emit, limits)
         .unwrap_err();
     assert!(format!("{error:?}").contains("contents disagree"));
 }
@@ -557,4 +557,188 @@ fn publication_sync_failure_installs_new_handles_and_preserves_old_media() {
         .unwrap();
     assert_eq!(reopened.journal_generation, generation + 1);
     assert_eq!(reopened.active, active);
+}
+
+#[test]
+fn coherent_extra_orphan_in_emitter_memo_cannot_authorize_sealed_media() {
+    use crate::storage_model::{CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapKey};
+    let (_directory, volume, mut store, limits) = primed_volume();
+    let orphan = CanonicalPhysicalMap::build_dense(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Profile,
+        vec![(PhysicalMapKey::new([253; 32]), vec![19])],
+    )
+    .unwrap();
+    let id = orphan.root().unwrap();
+    let mut nodes = store.profiles.nodes().clone();
+    nodes.extend(orphan.nodes().iter().map(|(id, node)| (*id, node.clone())));
+    store.profiles = CanonicalPhysicalMap::recover(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Profile,
+        store.profiles.root(),
+        nodes,
+    )
+    .unwrap();
+    let (mut metadata, mut journal) = next_generation_files(&store, &volume);
+    let mut emit = store
+        .emit_sealed_generation(&mut metadata, &mut journal)
+        .unwrap();
+    let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, &orphan.nodes()[&id]).unwrap();
+    append_frame(&mut metadata, METADATA_MAGIC, &frame.encode().unwrap()).unwrap();
+    metadata.sync_data().unwrap();
+    emit.include_emitter_node(id);
+    emit.retarget_expected_lengths(
+        metadata.metadata().unwrap().len(),
+        journal.metadata().unwrap().len(),
+    );
+    let error = store
+        .verify_sealed_generation_for_adoption(&mut metadata, &mut journal, &emit, limits)
+        .unwrap_err();
+    assert!(
+        format!("{error:?}").contains("unsealed map node"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn sealed_metadata_rejects_missing_live_node_with_coherent_frames() {
+    use super::super::super::scan_frames;
+    let (_directory, volume, mut store, limits) = primed_volume();
+    let (mut metadata, mut journal) = next_generation_files(&store, &volume);
+    let mut emit = store
+        .emit_sealed_generation(&mut metadata, &mut journal)
+        .unwrap();
+    let mut payloads = Vec::new();
+    scan_frames(
+        &mut metadata,
+        super::super::format::METADATA_FILE,
+        METADATA_MAGIC,
+        limits,
+        |_, payload| {
+            payloads.push(payload.to_vec());
+            Ok(())
+        },
+    )
+    .unwrap();
+    metadata.set_len(0).unwrap();
+    metadata.seek(SeekFrom::Start(0)).unwrap();
+    let mut removed = false;
+    for payload in payloads {
+        if !removed && MetadataFrame::decode(&payload).unwrap().kind == MetadataKind::MapNode {
+            removed = true;
+        } else {
+            append_frame(&mut metadata, METADATA_MAGIC, &payload).unwrap();
+        }
+    }
+    assert!(removed);
+    metadata.sync_data().unwrap();
+    emit.retarget_expected_lengths(
+        metadata.metadata().unwrap().len(),
+        journal.metadata().unwrap().len(),
+    );
+    let error = store
+        .verify_sealed_generation_for_adoption(&mut metadata, &mut journal, &emit, limits)
+        .unwrap_err();
+    assert!(
+        format!("{error:?}").contains("contents disagree"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn automatic_checkpoint_rejects_forged_authority_counts_before_emission() {
+    use crate::storage_model::{RepresentationCatalogueRoot, RepresentationState};
+    let (_directory, volume, mut store, limits) = primed_volume();
+    store.catalogue = RepresentationCatalogueRoot::new(
+        store.catalogue.generation(),
+        store.profiles.root(),
+        store.profiles.entry_count() + 1,
+        store.representations.root(),
+        store.representations.entry_count(),
+    )
+    .unwrap();
+    store.state = RepresentationState::new(
+        store.state.generation(),
+        Some(store.active),
+        store.catalogue.identify(&Blake3PhysicalIdentity),
+        store.state.placements(),
+    )
+    .unwrap();
+    store.active = store.state.identify(&Blake3PhysicalIdentity);
+    let (mut metadata, mut journal) = next_generation_files(&store, &volume);
+    let error = store
+        .prepare_sealed_adoption(&mut metadata, &mut journal, limits)
+        .unwrap_err();
+    assert!(
+        format!("{error:?}").contains("authority roots disagree"),
+        "{error:?}"
+    );
+    assert_eq!(metadata.metadata().unwrap().len(), 0);
+    assert_eq!(journal.metadata().unwrap().len(), 0);
+}
+
+#[test]
+fn sealed_media_fresh_scan_rejects_same_length_crc_corruption() {
+    use std::io::{Read, Write};
+    for corrupt_journal in [false, true] {
+        let (_directory, volume, mut store, limits) = primed_volume();
+        let (mut metadata, mut journal) = next_generation_files(&store, &volume);
+        let emit = store
+            .emit_sealed_generation(&mut metadata, &mut journal)
+            .unwrap();
+        let file = if corrupt_journal {
+            &mut journal
+        } else {
+            &mut metadata
+        };
+        let length = file.metadata().unwrap().len();
+        file.seek(SeekFrom::End(-1)).unwrap();
+        let mut byte = [0];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 1;
+        file.seek(SeekFrom::End(-1)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.sync_data().unwrap();
+        assert_eq!(file.metadata().unwrap().len(), length);
+        store
+            .verify_sealed_generation_for_adoption(&mut metadata, &mut journal, &emit, limits)
+            .unwrap_err();
+    }
+}
+
+#[test]
+fn sealed_node_body_is_compared_against_every_matching_live_arena() {
+    use crate::storage_model::{CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapNode};
+    let (_directory, volume, mut store, limits) = primed_volume();
+    let (id, node) = store
+        .placement_entries
+        .nodes()
+        .iter()
+        .find(|(_, node)| {
+            matches!(
+                node,
+                PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. }
+            )
+        })
+        .unwrap();
+    let id = *id;
+    let mut forged = node.clone();
+    match &mut forged {
+        PhysicalMapNode::Leaf { value, .. } => value[0] ^= 1,
+        PhysicalMapNode::Page { entries, .. } => entries[0].1[0] ^= 1,
+        _ => unreachable!(),
+    }
+    let mut nodes = store.profiles.nodes().clone();
+    assert!(nodes.insert(id, forged).is_none());
+    // A historical unreachable entry may occupy the same ID in another arena.
+    // The active canonical proof cannot alone establish cross-arena equality.
+    store.profiles = CanonicalPhysicalMap::recover(
+        &Blake3PhysicalIdentity,
+        PhysicalMapDomain::Profile,
+        store.profiles.root(),
+        nodes,
+    )
+    .unwrap();
+    let error = store.checkpoint_volume(&volume, limits).unwrap_err();
+    assert!(format!("{error:?}").contains("body disagrees"), "{error:?}");
 }

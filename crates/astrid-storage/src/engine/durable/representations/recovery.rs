@@ -17,7 +17,7 @@ use crate::storage_model::{
     RepresentationStateId,
 };
 
-use super::super::format::{FrameLocation, scan_frames_with_source};
+use super::super::format::scan_frames_with_source;
 use super::super::{FRAME_HEADER_LEN, scan_frames};
 use super::format::{
     Blake3PhysicalIdentity, CURRENT_FILE, CURRENT_MAGIC, CurrentPointer, JOURNAL_FILE,
@@ -35,24 +35,12 @@ pub(super) use index::MetadataIndex;
 #[cfg(test)]
 pub(super) use index::{recover_active_map_calls, reset_recover_active_map_calls};
 
-pub(super) fn recover_metadata<F: DurableIo>(
-    file: &mut F,
-    limits: RecoveryLimits,
-) -> Result<MetadataIndex, DurableError> {
-    recover_metadata_inspecting(file, limits, |_, _| Ok(()))
-}
-
-/// Recover metadata while optionally inspecting each already-decoded frame during
-/// the one authoritative scan. Ordinary open/compaction callers pass a no-op
-/// inspector via [`recover_metadata`]. Automatic checkpoint adoption uses the
-/// inspector to prove sealed media equals the live tip without a second map rebuild.
 #[tracing::instrument(name = "recover_metadata", target = "astrid_storage::recovery", level = "debug", skip_all,
     fields(map_nodes = tracing::field::Empty, authority_records = tracing::field::Empty,
         map_frame_count = tracing::field::Empty))]
-pub(super) fn recover_metadata_inspecting<F: DurableIo>(
+pub(super) fn recover_metadata<F: DurableIo>(
     file: &mut F,
     limits: RecoveryLimits,
-    mut inspect: impl FnMut(FrameLocation, &MetadataFrame<&[u8]>) -> Result<(), DurableError>,
 ) -> Result<MetadataIndex, DurableError> {
     let mut index = MetadataIndex::default();
     scan_frames_with_source(
@@ -62,7 +50,6 @@ pub(super) fn recover_metadata_inspecting<F: DurableIo>(
         limits,
         |location, payload, load_previous| {
             let frame = MetadataFrame::decode(payload)?;
-            inspect(location, &frame)?;
             index.insert_at(location, frame, load_previous)
         },
     )?;
@@ -361,8 +348,14 @@ fn validate_root_generation(reused: bool, previous: u64, current: u64) -> Result
 pub(super) fn validate_profiles(
     map: &CanonicalPhysicalMap,
 ) -> Result<RepresentationProfileId, DurableError> {
+    validate_profile_entries(active_entries(map)?)
+}
+
+pub(super) fn validate_profile_entries<'a>(
+    entries: impl IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
+) -> Result<RepresentationProfileId, DurableError> {
     let mut direct = None;
-    for (key, value) in active_entries(map)? {
+    for (key, value) in entries {
         let profile = RepresentationProfile::decode(value)?;
         let id = profile.identify(&Blake3PhysicalIdentity)?;
         if PhysicalMapKey::from(id) != key {
@@ -395,9 +388,26 @@ pub(super) fn validate_representations<const COLLECT_PLACEMENTS: bool>(
     placements: &CanonicalPhysicalMap,
     direct_profile: RepresentationProfileId,
 ) -> Result<ValidatedRepresentations, DurableError> {
+    validate_representation_entries::<COLLECT_PLACEMENTS, _>(
+        profiles,
+        || active_entries(representations),
+        active_entries(placements)?,
+        direct_profile,
+    )
+}
+
+pub(super) fn validate_representation_entries<'a, const COLLECT_PLACEMENTS: bool, R>(
+    profiles: &CanonicalPhysicalMap,
+    representations: impl FnOnce() -> Result<R, DurableError>,
+    placements: impl IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
+    direct_profile: RepresentationProfileId,
+) -> Result<ValidatedRepresentations, DurableError>
+where
+    R: IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
+{
     let mut placement_by_blob = BTreeMap::new();
     let mut extent_count = 0_u64;
-    for (key, bytes) in active_entries(placements)? {
+    for (key, bytes) in placements {
         let entry = PlacementEntry::decode(bytes)?;
         if PhysicalMapKey::from(entry.blob()) != key {
             return Err(DurableError::InvalidRepresentationState(
@@ -422,7 +432,7 @@ pub(super) fn validate_representations<const COLLECT_PLACEMENTS: bool>(
     }
     let mut reverse = BTreeMap::<ObjectId, Vec<RepresentationRecordId>>::new();
     let mut generation_zero = super::index_validation::GenerationZeroPlacements::default();
-    for (key, bytes) in active_entries(representations)? {
+    for (key, bytes) in representations()? {
         let record = RepresentationRecord::decode(bytes)?;
         let id = record.identify(&Blake3PhysicalIdentity)?;
         if PhysicalMapKey::from(id) != key {

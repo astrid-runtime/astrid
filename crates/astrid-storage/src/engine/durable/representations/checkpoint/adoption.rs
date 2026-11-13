@@ -6,16 +6,16 @@
 //! (`checkpoint_volume`, `maybe_checkpoint_native`) uses this path.
 
 use crate::storage_model::{
-    CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapNode, PhysicalMapNodeId, PlacementSet,
-    RepresentationCatalogueRoot, RepresentationState,
+    CanonicalPhysicalMap, CanonicalRootProof, ObjectId, PhysicalMapDomain, PhysicalMapNode,
+    PhysicalMapNodeId, PlacementSet, RepresentationCatalogueRoot, RepresentationProfileId,
+    RepresentationRecordId, RepresentationState, RepresentationStateId,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::super::scan_frames;
 use super::super::activation::visit_new_reachable_map_nodes;
 use super::super::recovery::{
-    MetadataIndex, read_current_file, recover_metadata, recover_metadata_inspecting,
-    validate_profiles, validate_representations,
+    read_current_file, recover_metadata, validate_profile_entries, validate_representation_entries,
 };
 use super::super::residency::MapResidency;
 use super::super::{
@@ -43,8 +43,46 @@ pub(super) struct VerifiedSealedAdoption {
     map_frame_count: u64,
 }
 
+/// Field-split borrows freeze the complete tip while the disjoint journal is
+/// digested. No proof crosses a mutation or survives this checkpoint operation.
+struct LiveTipRefs<'a> {
+    profiles: &'a CanonicalPhysicalMap,
+    representations: &'a CanonicalPhysicalMap,
+    placement_entries: &'a CanonicalPhysicalMap,
+    reverse: &'a BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
+    catalogue: RepresentationCatalogueRoot,
+    placements: PlacementSet,
+    state: RepresentationState,
+    active: RepresentationStateId,
+    direct_profile: RepresentationProfileId,
+}
+
+struct CanonicalTip<'a> {
+    roots: [CanonicalRootProof<'a>; 3],
+    reachable: BTreeSet<PhysicalMapNodeId>,
+}
+
+impl<'a> LiveTipRefs<'a> {
+    fn prove(&self) -> Result<CanonicalTip<'a>, DurableError> {
+        self.ensure_live_authority_binds_sealed_tip()?;
+        let roots = [
+            self.profiles
+                .prove_root(&Blake3PhysicalIdentity, PhysicalMapDomain::Profile)?,
+            self.representations
+                .prove_root(&Blake3PhysicalIdentity, PhysicalMapDomain::Representation)?,
+            self.placement_entries
+                .prove_root(&Blake3PhysicalIdentity, PhysicalMapDomain::Placement)?,
+        ];
+        let reachable = roots
+            .iter()
+            .flat_map(|proof| proof.visited().iter().copied())
+            .collect();
+        Ok(CanonicalTip { roots, reachable })
+    }
+}
+
 impl RepresentationStore {
-    /// Shared tip emit used by reconstructing and adopting consumers.
+    /// Shared codec/write path; cold consumers retain their independent walk.
     pub(super) fn emit_sealed_generation(
         &mut self,
         metadata: &mut DurableFile,
@@ -52,64 +90,50 @@ impl RepresentationStore {
     ) -> Result<SealedGenerationEmit, DurableError> {
         self.flush()?;
         let generation = increment(self.journal_generation)?;
-        let mut appended = BTreeSet::new();
-        let mut complete = BTreeSet::new();
-        let mut durable = BTreeSet::new();
-        {
-            let mut stream = FramedAppendStream::begin(metadata, METADATA_MAGIC)?;
-            for map in [
-                &self.profiles,
-                &self.representations,
-                &self.placement_entries,
-            ] {
-                visit_new_reachable_map_nodes(
-                    map,
-                    &mut durable,
-                    &mut appended,
-                    &mut complete,
-                    |node| {
-                        let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?;
-                        stream.append_payload(&frame.encode()?)
-                    },
-                )?;
-            }
-            for frame in [
-                MetadataFrame::catalogue(&Blake3PhysicalIdentity, self.catalogue),
-                MetadataFrame::placement(&Blake3PhysicalIdentity, self.placements),
-                MetadataFrame::state(&Blake3PhysicalIdentity, self.state),
-            ] {
-                stream.append_payload(&frame.encode()?)?;
-            }
-            stream.finish()?;
-        }
-        metadata
-            .sync_data()
-            .map_err(|source| io_error("flush checkpoint metadata", source))?;
-        let prior = digest_journal_file(&mut self.journal, "digest prior representation journal")?;
-        let checkpoint = JournalEntry::Checkpoint {
-            journal_generation: generation,
-            active: Some(self.active),
-            state_generation: self.state.generation(),
-            prior_journal_digest: Some(prior),
+        let tip = LiveTipRefs {
+            profiles: &self.profiles,
+            representations: &self.representations,
+            placement_entries: &self.placement_entries,
+            reverse: &self.reverse,
+            catalogue: self.catalogue,
+            placements: self.placements,
+            state: self.state,
+            active: self.active,
+            direct_profile: self.direct_profile,
         };
-        append_frame(journal, JOURNAL_MAGIC, &checkpoint.encode())?;
-        journal
-            .sync_data()
-            .map_err(|source| io_error("flush checkpoint journal", source))?;
-        let current = CurrentPointer {
-            journal_generation: generation,
-            checkpoint_digest: digest_journal_file(journal, "digest checkpoint journal")?,
-            max_tail_frames: u32::MAX,
-            max_tail_bytes: u64::MAX,
+        tip.emit(metadata, journal, &mut self.journal, generation, None)
+    }
+
+    pub(super) fn prepare_sealed_adoption(
+        &mut self,
+        metadata: &mut DurableFile,
+        journal: &mut DurableFile,
+        limits: RecoveryLimits,
+    ) -> Result<(CurrentPointer, VerifiedSealedAdoption), DurableError> {
+        self.flush()?;
+        let generation = increment(self.journal_generation)?;
+        let tip = LiveTipRefs {
+            profiles: &self.profiles,
+            representations: &self.representations,
+            placement_entries: &self.placement_entries,
+            reverse: &self.reverse,
+            catalogue: self.catalogue,
+            placements: self.placements,
+            state: self.state,
+            active: self.active,
+            direct_profile: self.direct_profile,
         };
-        Ok(SealedGenerationEmit {
+        let canonical = tip.prove()?;
+        let emit = tip.emit(
+            metadata,
+            journal,
+            &mut self.journal,
             generation,
-            current,
-            appended,
-            expected_metadata_len: durable_len(metadata, "measure sealed checkpoint metadata")?,
-            expected_journal_len: durable_len(journal, "measure sealed checkpoint journal")?,
-            prior_journal_digest: prior,
-        })
+            Some(&canonical),
+        )?;
+        let current = emit.current;
+        let proof = tip.verify(metadata, journal, &emit, limits, canonical)?;
+        Ok((current, proof))
     }
 
     /// Reconstructing consumer used by prepare/compaction and `checkpoint_into`.
@@ -143,32 +167,136 @@ impl RepresentationStore {
         Ok((recovered, current))
     }
 
+    #[cfg(test)]
     pub(super) fn verify_sealed_generation_for_adoption(
         &self,
         metadata: &mut DurableFile,
         journal: &mut DurableFile,
-        emit: SealedGenerationEmit,
+        emit: &SealedGenerationEmit,
         limits: RecoveryLimits,
+    ) -> Result<VerifiedSealedAdoption, DurableError> {
+        let tip = LiveTipRefs {
+            profiles: &self.profiles,
+            representations: &self.representations,
+            placement_entries: &self.placement_entries,
+            reverse: &self.reverse,
+            catalogue: self.catalogue,
+            placements: self.placements,
+            state: self.state,
+            active: self.active,
+            direct_profile: self.direct_profile,
+        };
+        let canonical = tip.prove()?;
+        tip.verify(metadata, journal, emit, limits, canonical)
+    }
+}
+
+impl LiveTipRefs<'_> {
+    fn emit(
+        &self,
+        metadata: &mut DurableFile,
+        journal: &mut DurableFile,
+        prior_journal: &mut DurableFile,
+        generation: u64,
+        tip: Option<&CanonicalTip<'_>>,
+    ) -> Result<SealedGenerationEmit, DurableError> {
+        let mut appended = BTreeSet::new();
+        let mut complete = BTreeSet::new();
+        let mut durable = BTreeSet::new();
+        {
+            let mut stream = FramedAppendStream::begin(metadata, METADATA_MAGIC)?;
+            for (slot, map) in [self.profiles, self.representations, self.placement_entries]
+                .into_iter()
+                .enumerate()
+            {
+                if let Some(tip) = tip {
+                    for id in tip.roots[slot].visited() {
+                        let node =
+                            map.nodes()
+                                .get(id)
+                                .ok_or(DurableError::InvalidRepresentationState(
+                                    "missing canonical map node",
+                                ))?;
+                        if !tip.roots[..slot]
+                            .iter()
+                            .any(|root| root.visited().contains(id))
+                        {
+                            let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?;
+                            stream.append_payload(&frame.encode()?)?;
+                        }
+                    }
+                    continue;
+                }
+                visit_new_reachable_map_nodes(
+                    map,
+                    &mut durable,
+                    &mut appended,
+                    &mut complete,
+                    |node| {
+                        let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?;
+                        stream.append_payload(&frame.encode()?)
+                    },
+                )?;
+            }
+            for frame in [
+                MetadataFrame::catalogue(&Blake3PhysicalIdentity, self.catalogue),
+                MetadataFrame::placement(&Blake3PhysicalIdentity, self.placements),
+                MetadataFrame::state(&Blake3PhysicalIdentity, self.state),
+            ] {
+                stream.append_payload(&frame.encode()?)?;
+            }
+            stream.finish()?;
+        }
+        metadata
+            .sync_data()
+            .map_err(|source| io_error("flush checkpoint metadata", source))?;
+        let prior = digest_journal_file(prior_journal, "digest prior representation journal")?;
+        let checkpoint = JournalEntry::Checkpoint {
+            journal_generation: generation,
+            active: Some(self.active),
+            state_generation: self.state.generation(),
+            prior_journal_digest: Some(prior),
+        };
+        append_frame(journal, JOURNAL_MAGIC, &checkpoint.encode())?;
+        journal
+            .sync_data()
+            .map_err(|source| io_error("flush checkpoint journal", source))?;
+        let current = CurrentPointer {
+            journal_generation: generation,
+            checkpoint_digest: digest_journal_file(journal, "digest checkpoint journal")?,
+            max_tail_frames: u32::MAX,
+            max_tail_bytes: u64::MAX,
+        };
+        Ok(SealedGenerationEmit {
+            generation,
+            current,
+            appended,
+            expected_metadata_len: durable_len(metadata, "measure sealed checkpoint metadata")?,
+            expected_journal_len: durable_len(journal, "measure sealed checkpoint journal")?,
+            prior_journal_digest: prior,
+        })
+    }
+
+    fn verify(
+        &self,
+        metadata: &mut DurableFile,
+        journal: &mut DurableFile,
+        emit: &SealedGenerationEmit,
+        limits: RecoveryLimits,
+        canonical: CanonicalTip<'_>,
     ) -> Result<VerifiedSealedAdoption, DurableError> {
         require_exact_len(metadata, emit.expected_metadata_len, "checkpoint metadata")?;
         require_exact_len(journal, emit.expected_journal_len, "checkpoint journal")?;
-        let index = self.scan_sealed_metadata_against_live(metadata, &emit, limits)?;
+        self.scan_sealed_metadata_against_live(metadata, &canonical, limits)?;
         require_exact_len(metadata, emit.expected_metadata_len, "checkpoint metadata")?;
-        self.ensure_live_authority_binds_sealed_tip(&index)?;
-        self.ensure_live_maps_still_canonical()?;
-        self.ensure_live_semantic_agreement()?;
-        self.verify_exact_fresh_checkpoint_journal(journal, &emit, limits)?;
+        self.ensure_live_semantic_agreement(&canonical)?;
+        self.verify_exact_fresh_checkpoint_journal(journal, emit, limits)?;
         require_exact_len(journal, emit.expected_journal_len, "checkpoint journal")?;
         let map_frame_count =
-            u64::try_from(emit.appended.len()).map_err(|_| DurableError::EncodingOverflow)?;
-        if index.map_frame_count != map_frame_count {
-            return Err(DurableError::InvalidRepresentationState(
-                "checkpoint metadata frame count disagrees with the sealed tip",
-            ));
-        }
+            u64::try_from(canonical.reachable.len()).map_err(|_| DurableError::EncodingOverflow)?;
         Ok(VerifiedSealedAdoption {
             generation: emit.generation,
-            verified_reachable: emit.appended,
+            verified_reachable: canonical.reachable,
             map_frame_count,
         })
     }
@@ -176,40 +304,56 @@ impl RepresentationStore {
     fn scan_sealed_metadata_against_live(
         &self,
         metadata: &mut DurableFile,
-        emit: &SealedGenerationEmit,
+        canonical: &CanonicalTip<'_>,
         limits: RecoveryLimits,
-    ) -> Result<MetadataIndex, DurableError> {
+    ) -> Result<(), DurableError> {
         let mut saw_catalogue = false;
         let mut saw_placement = false;
         let mut saw_state = false;
-        let index =
-            recover_metadata_inspecting(metadata, limits, |_location, frame| match frame.kind {
-                MetadataKind::Profile | MetadataKind::Representation => {
-                    Err(DurableError::InvalidRepresentationState(
-                        "fresh checkpoint metadata contains legacy authority frames",
-                    ))
-                },
-                MetadataKind::MapNode => inspect_map_node_frame(self, emit, frame),
-                MetadataKind::Catalogue => inspect_catalogue_frame(self, &mut saw_catalogue, frame),
-                MetadataKind::Placement => inspect_placement_frame(self, &mut saw_placement, frame),
-                MetadataKind::State => inspect_state_frame(self, &mut saw_state, frame),
-            })?;
-        if !saw_catalogue || !saw_placement || !saw_state {
+        let mut observed = BTreeSet::new();
+        scan_frames(
+            metadata,
+            format::METADATA_FILE,
+            METADATA_MAGIC,
+            limits,
+            |_offset, payload| {
+                let frame = MetadataFrame::decode(payload)?;
+                match frame.kind {
+                    MetadataKind::Profile | MetadataKind::Representation => {
+                        Err(DurableError::InvalidRepresentationState(
+                            "fresh checkpoint metadata contains legacy authority frames",
+                        ))
+                    },
+                    MetadataKind::MapNode => {
+                        inspect_map_node_frame(self, &canonical.reachable, &frame)?;
+                        if !observed.insert(PhysicalMapNodeId::new(frame.identity)) {
+                            return Err(DurableError::InvalidRepresentationState(
+                                "checkpoint metadata frame count disagrees with unique node set",
+                            ));
+                        }
+                        Ok(())
+                    },
+                    MetadataKind::Catalogue => {
+                        frame.verify(&Blake3PhysicalIdentity)?;
+                        inspect_catalogue_frame(self, &mut saw_catalogue, &frame)
+                    },
+                    MetadataKind::Placement => {
+                        frame.verify(&Blake3PhysicalIdentity)?;
+                        inspect_placement_frame(self, &mut saw_placement, &frame)
+                    },
+                    MetadataKind::State => {
+                        frame.verify(&Blake3PhysicalIdentity)?;
+                        inspect_state_frame(self, &mut saw_state, &frame)
+                    },
+                }
+            },
+        )?;
+        if !saw_catalogue || !saw_placement || !saw_state || observed != canonical.reachable {
             return Err(DurableError::InvalidRepresentationState(
                 "checkpoint metadata contents disagree with the sealed tip",
             ));
         }
-        // Unique indexed nodes + independent map_frame_count + tip closure prove
-        // exact-once set equality with emit.appended (subset checked per frame).
-        index.ensure_exact_tip_closure(
-            [
-                self.catalogue.profiles_root(),
-                self.catalogue.representations_root(),
-                self.placements.entries_root(),
-            ],
-            emit.appended.len(),
-        )?;
-        Ok(index)
+        Ok(())
     }
 
     fn verify_exact_fresh_checkpoint_journal(
@@ -260,27 +404,16 @@ impl RepresentationStore {
         Ok(())
     }
 
-    fn ensure_live_authority_binds_sealed_tip(
-        &self,
-        index: &MetadataIndex,
-    ) -> Result<(), DurableError> {
-        let catalogue = RepresentationCatalogueRoot::decode(
-            index.value(MetadataKind::Catalogue, self.state.catalogue().as_bytes())?,
-        )?;
-        let placements = PlacementSet::decode(
-            index.value(MetadataKind::Placement, self.state.placements().as_bytes())?,
-        )?;
-        let state =
-            RepresentationState::decode(index.value(MetadataKind::State, self.active.as_bytes())?)?;
-        if catalogue != self.catalogue
-            || placements != self.placements
-            || state != self.state
-            || catalogue.profiles_root() != self.profiles.root()
-            || catalogue.profile_count() != self.profiles.entry_count()
-            || catalogue.representations_root() != self.representations.root()
-            || catalogue.representation_count() != self.representations.entry_count()
-            || placements.entries_root() != self.placement_entries.root()
-            || placements.blob_count() != self.placement_entries.entry_count()
+    fn ensure_live_authority_binds_sealed_tip(&self) -> Result<(), DurableError> {
+        if self.catalogue.identify(&Blake3PhysicalIdentity) != self.state.catalogue()
+            || self.placements.identify(&Blake3PhysicalIdentity) != self.state.placements()
+            || self.state.identify(&Blake3PhysicalIdentity) != self.active
+            || self.catalogue.profiles_root() != self.profiles.root()
+            || self.catalogue.profile_count() != self.profiles.entry_count()
+            || self.catalogue.representations_root() != self.representations.root()
+            || self.catalogue.representation_count() != self.representations.entry_count()
+            || self.placements.entries_root() != self.placement_entries.root()
+            || self.placements.blob_count() != self.placement_entries.entry_count()
         {
             return Err(DurableError::InvalidRepresentationState(
                 "sealed authority roots disagree with the live tip",
@@ -289,41 +422,24 @@ impl RepresentationStore {
         Ok(())
     }
 
-    fn ensure_live_maps_still_canonical(&self) -> Result<(), DurableError> {
-        for (map, domain) in [
-            (&self.profiles, PhysicalMapDomain::Profile),
-            (&self.representations, PhysicalMapDomain::Representation),
-            (&self.placement_entries, PhysicalMapDomain::Placement),
-        ] {
-            let count = CanonicalPhysicalMap::validate_root(
-                &Blake3PhysicalIdentity,
-                domain,
-                map.root(),
-                map.nodes(),
-            )?;
-            if count != map.entry_count() {
-                return Err(DurableError::InvalidRepresentationState(
-                    "live physical map count disagrees with canonical validation",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn ensure_live_semantic_agreement(&self) -> Result<(), DurableError> {
-        let direct_profile = validate_profiles(&self.profiles)?;
+    fn ensure_live_semantic_agreement(
+        &self,
+        canonical: &CanonicalTip<'_>,
+    ) -> Result<(), DurableError> {
+        let direct_profile =
+            validate_profile_entries(canonical.roots[0].entries().iter().copied())?;
         if direct_profile != self.direct_profile {
             return Err(DurableError::InvalidRepresentationState(
                 "live direct profile disagrees with catalogue validation",
             ));
         }
-        let validated = validate_representations::<false>(
-            &self.profiles,
-            &self.representations,
-            &self.placement_entries,
+        let validated = validate_representation_entries::<false, _>(
+            self.profiles,
+            || Ok(canonical.roots[1].entries().iter().copied()),
+            canonical.roots[2].entries().iter().copied(),
             direct_profile,
         )?;
-        if validated.reverse != self.reverse
+        if validated.reverse != *self.reverse
             || validated.extent_count != self.placements.replica_extent_count()
         {
             return Err(DurableError::InvalidRepresentationState(
@@ -332,7 +448,9 @@ impl RepresentationStore {
         }
         Ok(())
     }
+}
 
+impl RepresentationStore {
     /// After CURRENT publication, install new handles/generation and tip memos.
     pub(super) fn adopt_sealed_generation(
         &mut self,
@@ -369,19 +487,26 @@ impl RepresentationStore {
 }
 
 fn inspect_map_node_frame(
-    store: &RepresentationStore,
-    emit: &SealedGenerationEmit,
+    store: &LiveTipRefs<'_>,
+    reachable: &BTreeSet<PhysicalMapNodeId>,
     frame: &MetadataFrame<&[u8]>,
 ) -> Result<(), DurableError> {
     let id = PhysicalMapNodeId::new(frame.identity);
-    if !emit.appended.contains(&id) {
+    if !reachable.contains(&id) {
         return Err(DurableError::InvalidRepresentationState(
             "checkpoint metadata contains an unsealed map node",
         ));
     }
-    // insert_at authenticates identity/codec; compare the decoded body to live.
-    // Exact-once follows from subset checks plus unique/frame counts and tip closure.
-    let decoded = PhysicalMapNode::decode(frame.value)?;
+    let identified = PhysicalMapNode::with_child_ids_and_identify(
+        frame.value,
+        &Blake3PhysicalIdentity,
+        |identified, _children| identified,
+    )?;
+    if identified != id {
+        return Err(DurableError::InvalidRepresentationState(
+            "metadata identity does not match canonical value",
+        ));
+    }
     let mut matched = false;
     for map in [
         &store.profiles,
@@ -390,11 +515,11 @@ fn inspect_map_node_frame(
     ] {
         if let Some(live) = map.nodes().get(&id) {
             matched = true;
-            if &decoded != live {
-                return Err(DurableError::InvalidRepresentationState(
+            live.matches_encoded(frame.value).map_err(|_| {
+                DurableError::InvalidRepresentationState(
                     "checkpoint metadata map node body disagrees with the live tip",
-                ));
-            }
+                )
+            })?;
         }
     }
     if !matched {
@@ -406,7 +531,7 @@ fn inspect_map_node_frame(
 }
 
 fn inspect_catalogue_frame(
-    store: &RepresentationStore,
+    store: &LiveTipRefs<'_>,
     saw_catalogue: &mut bool,
     frame: &MetadataFrame<&[u8]>,
 ) -> Result<(), DurableError> {
@@ -426,7 +551,7 @@ fn inspect_catalogue_frame(
 }
 
 fn inspect_placement_frame(
-    store: &RepresentationStore,
+    store: &LiveTipRefs<'_>,
     saw_placement: &mut bool,
     frame: &MetadataFrame<&[u8]>,
 ) -> Result<(), DurableError> {
@@ -446,7 +571,7 @@ fn inspect_placement_frame(
 }
 
 fn inspect_state_frame(
-    store: &RepresentationStore,
+    store: &LiveTipRefs<'_>,
     saw_state: &mut bool,
     frame: &MetadataFrame<&[u8]>,
 ) -> Result<(), DurableError> {
@@ -509,6 +634,10 @@ impl SealedGenerationEmit {
     pub(super) fn retarget_expected_lengths(&mut self, metadata_len: u64, journal_len: u64) {
         self.expected_metadata_len = metadata_len;
         self.expected_journal_len = journal_len;
+    }
+
+    pub(super) fn include_emitter_node(&mut self, id: PhysicalMapNodeId) {
+        self.appended.insert(id);
     }
 
     pub(super) fn prior_journal_digest(&self) -> [u8; 32] {

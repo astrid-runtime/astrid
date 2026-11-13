@@ -619,6 +619,7 @@ mod derivation;
 mod derivation_evidence;
 mod gc_evidence;
 mod physical;
+pub(crate) use physical::CanonicalRootProof;
 mod proof;
 
 pub use derivation::{

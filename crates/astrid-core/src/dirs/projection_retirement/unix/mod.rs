@@ -18,6 +18,9 @@ mod barrier_tests;
 mod leaf_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod mount_tests;
+mod parallel;
+#[cfg(test)]
+mod parallel_tests;
 
 struct RootBoundary {
     identity: FileStat,
@@ -87,8 +90,9 @@ impl PreparedProjectionRetirement {
     /// After any error the caller must retain its durable retirement receipt.
     pub fn retire(self, expected_volume: &File) -> io::Result<()> {
         let expected = fstat(expected_volume).map_err(os_error)?;
-        self.retire_with_hooks(
+        self.retire_impl(
             Some(&expected),
+            true,
             &mut RetirementHooks {
                 before_unlink: |_: &Path| Ok(()),
                 sync_directory: |directory: &File, _: &Path| directory.sync_all(),
@@ -158,6 +162,18 @@ impl PreparedProjectionRetirement {
             impl FnMut(&File, &Path) -> io::Result<()>,
         >,
     ) -> io::Result<()> {
+        self.retire_impl(expected, false, hooks)
+    }
+
+    fn retire_impl(
+        self,
+        expected: Option<&FileStat>,
+        parallel_children: bool,
+        hooks: &mut RetirementHooks<
+            impl FnMut(&Path) -> io::Result<()>,
+            impl FnMut(&File, &Path) -> io::Result<()>,
+        >,
+    ) -> io::Result<()> {
         self.require_root()?;
         self.require_volume(expected)?;
         delete_inventory(
@@ -166,6 +182,7 @@ impl PreparedProjectionRetirement {
             &self.boundary,
             &self.inventory,
             true,
+            parallel_children,
             hooks,
         )?;
         self.require_survivors(expected)?;
@@ -290,11 +307,28 @@ fn delete_inventory(
     root: &RootBoundary,
     inventory: &[PlannedEntry],
     is_root: bool,
+    parallel_children: bool,
     hooks: &mut RetirementHooks<
         impl FnMut(&Path) -> io::Result<()>,
         impl FnMut(&File, &Path) -> io::Result<()>,
     >,
 ) -> io::Result<()> {
+    require_inventory(directory, path, inventory)?;
+    for planned in inventory {
+        delete_entry(
+            directory,
+            path,
+            root,
+            planned,
+            is_root,
+            parallel_children,
+            hooks,
+        )?;
+    }
+    Ok(())
+}
+
+fn require_inventory(directory: &File, path: &Path, inventory: &[PlannedEntry]) -> io::Result<()> {
     // A listing only confirms the captured plan; it never grants deletion
     // authority to newly observed names. Missing captured names fail closed too.
     let names = entries(directory)?;
@@ -304,61 +338,79 @@ fn delete_inventory(
             "projection inventory changed after preflight",
         ));
     }
-    for planned in inventory {
-        let name = &planned.name;
-        let child_path = path.join(name);
-        let canonical = is_root && name == OsStr::new(CANONICAL_VOLUME);
-        // Non-Linux regular leaves need no content handle. Their only action is
-        // unlink, so defer observation to the fresh no-follow check below. Keep
-        // directories and the retained volume checked before using their handles;
-        // Linux also retains O_PATH custody and mount confirmation for leaves.
-        let child = if defer_leaf_check(&planned.identity, canonical) {
-            None
+    Ok(())
+}
+
+fn delete_entry(
+    directory: &File,
+    path: &Path,
+    root: &RootBoundary,
+    planned: &PlannedEntry,
+    is_root: bool,
+    parallel_children: bool,
+    hooks: &mut RetirementHooks<
+        impl FnMut(&Path) -> io::Result<()>,
+        impl FnMut(&File, &Path) -> io::Result<()>,
+    >,
+) -> io::Result<()> {
+    let name = &planned.name;
+    let child_path = path.join(name);
+    let canonical = is_root && name == OsStr::new(CANONICAL_VOLUME);
+    // Non-Linux regular leaves need no content handle. Their only action is
+    // unlink, so defer observation to the fresh no-follow check below. Keep
+    // directories and the retained volume checked before using their handles;
+    // Linux also retains O_PATH custody and mount confirmation for leaves.
+    let child = if defer_leaf_check(&planned.identity, canonical) {
+        None
+    } else {
+        let child = open_entry(directory, name, &child_path, root)?;
+        require_identity(&planned.identity, child.identity(), &child_path)?;
+        Some(child)
+    };
+    if canonical {
+        return Ok(());
+    }
+    let child_directory = child.as_ref().and_then(Entry::directory);
+    if let Some(child_directory) = child_directory {
+        if is_root && parallel_children {
+            parallel::delete_children(child_directory, &child_path, root, &planned.children)?;
         } else {
-            let child = open_entry(directory, name, &child_path, root)?;
-            require_identity(&planned.identity, child.identity(), &child_path)?;
-            Some(child)
-        };
-        if is_root && name == OsStr::new(CANONICAL_VOLUME) {
-            continue;
-        }
-        let child_directory = child.as_ref().and_then(Entry::directory);
-        if let Some(child_directory) = child_directory {
             delete_inventory(
                 child_directory,
                 &child_path,
                 root,
                 &planned.children,
                 false,
+                false,
                 hooks,
             )?;
         }
-        (hooks.before_unlink)(&child_path)?;
-        #[cfg(feature = "test-support")]
-        super::replay::before_unlink(&child_path)?;
-        // Recheck the captured identity after hooks and directory traversal.
-        // Do not unlink a replacement. unlinkat never follows a
-        // last-component redirect, even if replacement wins after this check.
-        let current = stat_entry(directory, name, &child_path)?;
-        require_identity(&planned.identity, &current, &child_path)?;
-        check_boundary(&child_path, root, &current)?;
-        #[cfg(target_os = "linux")]
-        let _mount_confirmation = {
-            // Bind mounts can preserve dev/ino/type while replacing a name.
-            let confirmation = open_entry(directory, name, &child_path, root)?;
-            require_identity(&planned.identity, confirmation.identity(), &child_path)?;
-            confirmation
-        };
-        let flags = if child_directory.is_some() {
-            UnlinkatFlags::RemoveDir
-        } else {
-            UnlinkatFlags::NoRemoveDir
-        };
-        unlinkat(directory, name.as_os_str(), flags).map_err(os_error)?;
-        if is_root && child_directory.is_some() {
-            // Preserve the existing root barrier after each top-level directory.
-            (hooks.sync_directory)(directory, path)?;
-        }
+    }
+    (hooks.before_unlink)(&child_path)?;
+    #[cfg(feature = "test-support")]
+    super::replay::before_unlink(&child_path)?;
+    // Recheck the captured identity after hooks and directory traversal.
+    // Do not unlink a replacement. unlinkat never follows a
+    // last-component redirect, even if replacement wins after this check.
+    let current = stat_entry(directory, name, &child_path)?;
+    require_identity(&planned.identity, &current, &child_path)?;
+    check_boundary(&child_path, root, &current)?;
+    #[cfg(target_os = "linux")]
+    let _mount_confirmation = {
+        // Bind mounts can preserve dev/ino/type while replacing a name.
+        let confirmation = open_entry(directory, name, &child_path, root)?;
+        require_identity(&planned.identity, confirmation.identity(), &child_path)?;
+        confirmation
+    };
+    let flags = if child_directory.is_some() {
+        UnlinkatFlags::RemoveDir
+    } else {
+        UnlinkatFlags::NoRemoveDir
+    };
+    unlinkat(directory, name.as_os_str(), flags).map_err(os_error)?;
+    if is_root && child_directory.is_some() {
+        // Preserve the existing root barrier after each top-level directory.
+        (hooks.sync_directory)(directory, path)?;
     }
     Ok(())
 }

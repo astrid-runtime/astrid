@@ -86,14 +86,8 @@ impl RepresentationStore {
             NativeCheckpointInstall::Adopt => {
                 let mut metadata = metadata;
                 let mut journal = journal;
-                let emit = self.emit_sealed_generation(&mut metadata, &mut journal)?;
-                let current = emit.current;
-                let proof = self.verify_sealed_generation_for_adoption(
-                    &mut metadata,
-                    &mut journal,
-                    emit,
-                    limits,
-                )?;
+                let (current, proof) =
+                    self.prepare_sealed_adoption(&mut metadata, &mut journal, limits)?;
                 PreparedNativeCheckpoint::Adopt {
                     metadata,
                     journal,

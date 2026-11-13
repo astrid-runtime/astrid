@@ -87,10 +87,7 @@ impl RepresentationStore {
         }
         let mut metadata = DurableFile::volume(Arc::clone(volume), &metadata_path, true)?;
         let mut journal = DurableFile::volume(Arc::clone(volume), &journal_path, true)?;
-        let emit = self.emit_sealed_generation(&mut metadata, &mut journal)?;
-        let current = emit.current;
-        let proof =
-            self.verify_sealed_generation_for_adoption(&mut metadata, &mut journal, emit, limits)?;
+        let (current, proof) = self.prepare_sealed_adoption(&mut metadata, &mut journal, limits)?;
         let pointer = DurableFile::volume(Arc::clone(volume), "representations/CURRENT.tmp", true)?;
         adoption::write_verified_current_tmp(pointer, current, limits)?;
         volume

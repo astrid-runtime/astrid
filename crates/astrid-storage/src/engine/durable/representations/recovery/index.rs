@@ -105,34 +105,6 @@ impl MetadataIndex {
             ))
     }
 
-    /// Prove every indexed `MapNode` is reachable from the tip authority roots and
-    /// that the unique resolved count matches the sealed tip emission.
-    pub(in crate::engine::durable::representations) fn ensure_exact_tip_closure(
-        &self,
-        roots: [Option<crate::storage_model::PhysicalMapNodeId>; 3],
-        expected_unique_nodes: usize,
-    ) -> Result<(), DurableError> {
-        if self.nodes.len() != expected_unique_nodes {
-            return Err(DurableError::InvalidRepresentationState(
-                "checkpoint metadata unique node count disagrees with the sealed tip",
-            ));
-        }
-        let mut closure = self.nodes.closure_checker();
-        for root in roots {
-            if !closure.complete(root) {
-                return Err(DurableError::InvalidRepresentationState(
-                    "checkpoint metadata tip closure is incomplete",
-                ));
-            }
-        }
-        if closure.len() != self.nodes.len() {
-            return Err(DurableError::InvalidRepresentationState(
-                "checkpoint metadata contains unreachable map nodes",
-            ));
-        }
-        Ok(())
-    }
-
     #[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all, fields(domain = ?domain, input_nodes = self.nodes.len(), active_nodes = tracing::field::Empty))]
     pub(in crate::engine::durable::representations) fn recover_active_map<F: DurableIo>(
         &mut self,

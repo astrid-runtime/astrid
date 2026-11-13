@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use crate::storage_model::BlobId;
 
 use super::PhysicalModelError;
-use super::codec::Encoder;
+use super::codec::{Encoder, EncodingSink};
 use super::identity::{
     PhysicalIdentity, PhysicalMapNodeId, RepresentationProfileId, RepresentationRecordId,
     encode_physical_digest,
@@ -20,6 +20,7 @@ mod radix;
 mod rebuild;
 mod residency;
 mod validation;
+pub(crate) use validation::CanonicalRootProof;
 
 #[cfg(test)]
 mod decode_tests;
@@ -275,8 +276,24 @@ impl PhysicalMapNode {
     /// Returns a length overflow when a leaf value cannot fit `u64`.
     pub fn encode(&self) -> Result<Vec<u8>, PhysicalModelError> {
         let mut encoder = Encoder::new();
+        self.encode_into(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    /// Compare every body field using the same encoder as ordinary publication.
+    /// The caller authenticates the original bytes with the borrowed decoder.
+    pub(crate) fn matches_encoded(&self, bytes: &[u8]) -> Result<(), PhysicalModelError> {
+        let mut encoder = Encoder::comparing(bytes);
+        self.encode_into(&mut encoder)?;
+        encoder.finish_comparison()
+    }
+
+    fn encode_into<W: EncodingSink>(
+        &self,
+        encoder: &mut Encoder<W>,
+    ) -> Result<(), PhysicalModelError> {
         match self {
-            Self::Leaf { domain, key, value } => encode::leaf(*domain, key, value, &mut encoder)?,
+            Self::Leaf { domain, key, value } => encode::leaf(*domain, key, value, encoder)?,
             Self::Branch {
                 domain,
                 prefix_bits,
@@ -292,10 +309,10 @@ impl PhysicalMapNode {
                     zero,
                     one,
                     *subtree_entries,
-                    &mut encoder,
+                    encoder,
                 );
             },
-            Self::Page { domain, entries } => encode::page(*domain, entries, &mut encoder)?,
+            Self::Page { domain, entries } => encode::page(*domain, entries, encoder)?,
             Self::Radix {
                 domain,
                 prefix_nibbles,
@@ -311,11 +328,11 @@ impl PhysicalMapNode {
                     *child_bitmap,
                     children,
                     *subtree_entries,
-                    &mut encoder,
+                    encoder,
                 );
             },
         }
-        Ok(encoder.finish())
+        Ok(())
     }
 
     /// Decode one canonical format-one node.
@@ -485,6 +502,23 @@ impl CanonicalPhysicalMap {
         nodes: &BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
     ) -> Result<u64, PhysicalModelError> {
         validation::validate_root(identity, domain, root, nodes)
+    }
+
+    /// Fully validate a fixed-domain root while retaining its borrowed closure.
+    pub(crate) fn prove_root<I: PhysicalIdentity>(
+        &self,
+        identity: &I,
+        domain: PhysicalMapDomain,
+    ) -> Result<CanonicalRootProof<'_>, PhysicalModelError> {
+        let proof = validation::prove_root(identity, domain, self.root, &self.nodes)?;
+        if u64::try_from(proof.entries().len()).map_err(|_| PhysicalModelError::LengthOverflow)?
+            != self.entry_count
+        {
+            return Err(PhysicalModelError::InvalidMap(
+                "live physical map count disagrees with canonical validation",
+            ));
+        }
+        Ok(proof)
     }
 
     /// Recover one active map, retaining every node supplied by the caller.

@@ -479,3 +479,49 @@ fn public_recovery_rejects_noncanonical_body_even_when_root_digest_collides() {
         ));
     }
 }
+
+#[test]
+fn canonical_proof_keeps_only_active_ids_and_borrows_sorted_leaf_values() {
+    let active = super::super::CanonicalPhysicalMap::build_dense(
+        &Identity,
+        PhysicalMapDomain::Placement,
+        vec![
+            (PhysicalMapKey::new([2; 32]), vec![7]),
+            (PhysicalMapKey::new([1; 32]), vec![8]),
+        ],
+    )
+    .unwrap();
+    let historical = super::super::CanonicalPhysicalMap::build_dense(
+        &Identity,
+        PhysicalMapDomain::Placement,
+        vec![(PhysicalMapKey::new([2; 32]), vec![9])],
+    )
+    .unwrap();
+    let old = historical.root().unwrap();
+    let mut nodes = active.nodes().clone();
+    nodes.extend(historical.nodes().clone());
+    let map = super::super::CanonicalPhysicalMap::recover(
+        &Identity,
+        PhysicalMapDomain::Placement,
+        active.root(),
+        nodes,
+    )
+    .unwrap();
+    let proof = map
+        .prove_root(&Identity, PhysicalMapDomain::Placement)
+        .unwrap();
+    assert!(!proof.visited().contains(&old));
+    assert!(proof.visited().contains(&map.root().unwrap()));
+    assert_eq!(proof.entries().len(), 2);
+    assert!(proof.entries().windows(2).all(|pair| pair[0].0 < pair[1].0));
+    for (key, value) in proof.entries() {
+        assert!(core::ptr::eq(*value, map.get(*key).unwrap()));
+    }
+    assert!(
+        map.prove_root(&Identity, PhysicalMapDomain::Profile)
+            .is_err()
+    );
+    let empty = prove_root(&Identity, PhysicalMapDomain::Placement, None, map.nodes()).unwrap();
+    assert!(empty.visited().is_empty());
+    assert!(empty.entries().is_empty());
+}
