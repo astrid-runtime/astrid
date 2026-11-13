@@ -11,6 +11,8 @@ description = "Unified storage integration for Astrid principal state and raw KV
 [features]
 default = []
 crash-replay = []
+# Read-only operation snapshots for cross-crate tests; no mutation controls.
+test-support = []
 # Deprecated compatibility alias. KV is always backed by the native object
 # store; this remains only so existing downstream feature selections compile.
 kv = []

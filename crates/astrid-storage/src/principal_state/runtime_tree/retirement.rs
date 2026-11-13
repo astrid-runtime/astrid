@@ -237,4 +237,4 @@ mod source;
 mod tests;
 
 #[cfg(test)]
-pub(super) mod publication_tests;
+mod publication_tests;

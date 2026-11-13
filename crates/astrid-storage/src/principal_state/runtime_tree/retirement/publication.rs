@@ -101,8 +101,8 @@ pub(super) fn publish_with_hook(
         .content()
         .flush()
         .map_err(|error| tree_error(home.root(), format!("flush retiring projection: {error}")))?;
-    #[cfg(test)]
-    super::publication_tests::record_completed_publication();
+    #[cfg(any(test, feature = "test-support"))]
+    super::super::operation_counts::record_completed_publication();
     tracing::debug!(target: "astrid_storage::runtime_tree_publication", elapsed = ?started.elapsed(), phase = "retiring", "published and flushed runtime projection");
     Ok(())
 }

@@ -1,52 +1,11 @@
 //! Exercise real preflight work and exact inventory publication checks.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
 use crate::content::{ContentIngest, ContentName};
-use crate::principal_state::runtime_tree::write_projection_file;
+use crate::principal_state::runtime_tree::{operation_counts, write_projection_file};
 use crate::{KvQuotaResolver, StateOwner, open_runtime_principal_store};
-
-#[derive(Clone, Default)]
-struct Operations {
-    scans: Arc<AtomicUsize>,
-    receipts: Arc<AtomicUsize>,
-}
-
-impl tracing::Subscriber for Operations {
-    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-        true
-    }
-    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-    fn event(&self, event: &tracing::Event<'_>) {
-        match event.metadata().target() {
-            "astrid_storage::runtime_tree_scan" => {
-                self.scans.fetch_add(1, Ordering::Relaxed);
-            },
-            "astrid_storage::projection_receipt_read" => {
-                self.receipts.fetch_add(1, Ordering::Relaxed);
-            },
-            _ => {},
-        }
-    }
-    fn enter(&self, _: &tracing::span::Id) {}
-    fn exit(&self, _: &tracing::span::Id) {}
-}
-
-thread_local! {
-    static COMPLETED_PUBLICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-// These synchronous API calls stay on the current test thread. Count their
-// actual successful flush boundaries independently of global tracing filters.
-pub(in crate::principal_state::runtime_tree) fn record_completed_publication() {
-    COMPLETED_PUBLICATIONS.with(|count| count.set(count.get().strict_add(1)));
-}
 
 async fn fixture() -> (
     crate::test_directory::TestDirectory,
@@ -70,17 +29,15 @@ fn name(value: &str) -> ContentName {
 #[tokio::test]
 async fn pack_uses_one_validating_walk_one_publication_and_two_receipt_reads() {
     let (_directory, home, store) = fixture().await;
-    let operations = Operations::default();
-    let before = COMPLETED_PUBLICATIONS.with(std::cell::Cell::get);
-    tracing::subscriber::with_default(operations.clone(), || {
+    let before = operation_counts::snapshot();
+    // Tracing callsite interest must never decide whether real work is counted.
+    tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
         store.pack_and_retire_runtime_projection(&home).unwrap();
     });
-    assert_eq!(operations.scans.load(Ordering::Relaxed), 1);
-    assert_eq!(operations.receipts.load(Ordering::Relaxed), 2);
-    assert_eq!(
-        COMPLETED_PUBLICATIONS.with(std::cell::Cell::get) - before,
-        1
-    );
+    let operations = operation_counts::snapshot().since(before);
+    assert_eq!(operations.scans, 1);
+    assert_eq!(operations.receipts, 2);
+    assert_eq!(operations.publications, 1);
     assert_eq!(std::fs::read_dir(home.root()).unwrap().count(), 1);
     assert!(active::read(&home, &store).unwrap().is_none());
 }
@@ -109,13 +66,12 @@ async fn payload_change_with_unchanged_receipt_revalidates_and_refuses_delete() 
             .unwrap(),
         receipt_before
     );
-    let operations = Operations::default();
-    let error = tracing::subscriber::with_default(operations.clone(), || {
-        retire_current_projection(&home, &store)
-    })
-    .expect_err("receipt identity alone must never authorize stale payload deletion");
+    let before = operation_counts::snapshot();
+    let error = retire_current_projection(&home, &store)
+        .expect_err("receipt identity alone must never authorize stale payload deletion");
+    let operations = operation_counts::snapshot().since(before);
     assert!(error.to_string().contains("does not match"), "{error}");
-    assert_eq!(operations.receipts.load(Ordering::Relaxed), 1);
+    assert_eq!(operations.receipts, 1);
     assert_eq!(
         std::fs::read(home.root().join("config.toml")).unwrap(),
         b"host generation"
@@ -139,11 +95,10 @@ async fn unrelated_catalogue_change_preserves_valid_retiring_inventory() {
         .content()
         .put(&StateOwner::System, &volume_only, b"new durable content")
         .unwrap();
-    let operations = Operations::default();
-    tracing::subscriber::with_default(operations.clone(), || {
-        retire_current_projection(&home, &store).unwrap();
-    });
-    assert_eq!(operations.receipts.load(Ordering::Relaxed), 1);
+    let before = operation_counts::snapshot();
+    retire_current_projection(&home, &store).unwrap();
+    let operations = operation_counts::snapshot().since(before);
+    assert_eq!(operations.receipts, 1);
     assert_eq!(std::fs::read_dir(home.root()).unwrap().count(), 1);
     assert_eq!(
         store
@@ -217,11 +172,10 @@ async fn large_complete_inventory_is_revalidated_and_keeps_volume_only_files() {
         descriptor.logical_bytes() > 4 * 1024 * 1024,
         "exercise the large inventory parser boundary"
     );
-    let operations = Operations::default();
-    tracing::subscriber::with_default(operations.clone(), || {
-        retire_current_projection(&home, &store).unwrap();
-    });
-    assert_eq!(operations.receipts.load(Ordering::Relaxed), 1);
+    let before = operation_counts::snapshot();
+    retire_current_projection(&home, &store).unwrap();
+    let operations = operation_counts::snapshot().since(before);
+    assert_eq!(operations.receipts, 1);
     assert_eq!(std::fs::read_dir(home.root()).unwrap().count(), 1);
     assert!(
         store

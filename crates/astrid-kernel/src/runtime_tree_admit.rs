@@ -239,36 +239,17 @@ mod tests {
         (parent, home)
     }
 
-    struct ScanObserver(Arc<std::sync::atomic::AtomicUsize>);
-
-    impl tracing::Subscriber for ScanObserver {
-        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-            metadata.is_event() && metadata.target() == "astrid_storage::runtime_tree_scan"
-        }
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-        fn event(&self, _: &tracing::Event<'_>) {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        fn enter(&self, _: &tracing::span::Id) {}
-        fn exit(&self, _: &tracing::span::Id) {}
-    }
-
     #[tokio::test]
     async fn cold_admission_walks_source_only_for_snapshot_and_final_check() {
         let (_directory, home) = private_home_fixture();
         let store = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
             .await
             .unwrap();
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        tracing::subscriber::with_default(ScanObserver(Arc::clone(&calls)), || {
-            admit_blocking(&home, &store).unwrap();
-        });
+        let before = astrid_storage::principal_state::runtime_tree_operation_counts();
+        admit_blocking(&home, &store).unwrap();
+        let after = astrid_storage::principal_state::runtime_tree_operation_counts();
         assert_eq!(
-            calls.load(std::sync::atomic::Ordering::Relaxed),
+            after.scans().strict_sub(before.scans()),
             2,
             "observe every real storage source-walk boundary, including kernel calls"
         );

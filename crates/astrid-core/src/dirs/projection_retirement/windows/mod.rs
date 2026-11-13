@@ -54,7 +54,7 @@ impl PreparedProjectionRetirement {
     /// Capture the complete inventory and verify selected regular source files.
     ///
     /// The predicate controls only read access: unselected entries still receive
-    /// all inventory, FileId and deletion checks. Selected leaves open read-only
+    /// all inventory, `FileId` and deletion checks. Selected leaves open read-only
     /// relative to their captured parent, without privacy repair or ACL changes.
     /// The canonical volume is never a source. Every callback completes before
     /// this method returns; no entry is deleted. Ordinary [`Self::prepare`]

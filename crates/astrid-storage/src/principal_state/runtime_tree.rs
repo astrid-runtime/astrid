@@ -23,6 +23,8 @@ pub(super) mod admission;
 mod key_recovery_tests;
 #[cfg(test)]
 mod lifecycle_tests;
+#[cfg(any(test, feature = "test-support"))]
+pub(in crate::principal_state) mod operation_counts;
 use active_receipt::ActiveReceiptDeriver;
 mod projection;
 mod restoration;
@@ -110,6 +112,8 @@ fn scan_with_policy(
     receipt: Option<&active::ActiveProjectionReceipt>,
     policy: ScanPolicy,
 ) -> StorageResult<Vec<RuntimeTreeEntry>> {
+    #[cfg(any(test, feature = "test-support"))]
+    operation_counts::record_scan();
     tracing::trace!(target: "astrid_storage::runtime_tree_scan", "scan runtime source tree");
     let metadata = std::fs::symlink_metadata(runtime_root)
         .map_err(|error| tree_error(runtime_root, format!("inspect source root: {error}")))?;
@@ -674,8 +678,8 @@ fn publish_scanned_projection(
         .content()
         .flush()
         .map_err(|error| tree_error(home.root(), format!("flush active projection: {error}")))?;
-    #[cfg(test)]
-    retirement::publication_tests::record_completed_publication();
+    #[cfg(any(test, feature = "test-support"))]
+    operation_counts::record_completed_publication();
     tracing::debug!(target: "astrid_storage::runtime_tree_publication", elapsed = ?started.elapsed(), phase = "active", "published and flushed runtime projection");
     Ok(())
 }
@@ -847,6 +851,10 @@ fn is_exactly_pack_open_staging_journal(scanned: &[RuntimeTreeEntry]) -> bool {
 /// host endpoints and media paths remain outside authority and cannot make an
 /// otherwise volume-only home look like a surviving projection.
 fn validate_surviving_projection(root: &Path, directory: &Path) -> StorageResult<bool> {
+    #[cfg(any(test, feature = "test-support"))]
+    if root == directory {
+        operation_counts::record_scan();
+    }
     if tracing::enabled!(target: "astrid_storage::runtime_tree_scan", tracing::Level::TRACE)
         && root == directory
     {

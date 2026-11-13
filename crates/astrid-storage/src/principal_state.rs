@@ -77,6 +77,11 @@ mod runtime_root_admission;
 #[cfg(test)]
 mod runtime_tests;
 mod runtime_tree;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use runtime_tree::operation_counts::{
+    RuntimeTreeOperationCounts, runtime_tree_operation_counts,
+};
 mod runtime_tree_active;
 mod startup_recovery;
 pub use startup_recovery::RuntimeProjectionRecovery;

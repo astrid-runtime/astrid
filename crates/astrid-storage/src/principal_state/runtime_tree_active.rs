@@ -161,6 +161,8 @@ pub(super) fn read_from_content(
     home: &AstridHome,
     content: &NativePrincipalContentStore,
 ) -> StorageResult<Option<ActiveProjectionReceipt>> {
+    #[cfg(any(test, feature = "test-support"))]
+    super::runtime_tree::operation_counts::record_receipt_read();
     tracing::trace!(target: "astrid_storage::projection_receipt_read", "read runtime projection receipt");
     let receipt = read_relocatable_from_content(home, content)?;
     if let Some(receipt) = &receipt

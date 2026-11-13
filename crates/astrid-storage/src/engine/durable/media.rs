@@ -137,6 +137,13 @@ impl std::io::Write for File {
         }
     }
 
+    fn write_vectored(&mut self, slices: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        match self {
+            Self::Native(file) => file.write_vectored(slices),
+            Self::Volume(file) => file.write_vectored(slices),
+        }
+    }
+
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::Native(file) => file.flush(),
