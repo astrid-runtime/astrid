@@ -17,7 +17,7 @@ use crate::storage_model::{
     RepresentationStateId,
 };
 
-use super::super::format::scan_frames_with_source;
+use super::super::format::{FrameLocation, scan_frames_with_source};
 use super::super::{FRAME_HEADER_LEN, scan_frames};
 use super::format::{
     Blake3PhysicalIdentity, CURRENT_FILE, CURRENT_MAGIC, CurrentPointer, JOURNAL_FILE,
@@ -32,13 +32,27 @@ use super::{
 mod index;
 use index::HistoricalMapClosure;
 pub(super) use index::MetadataIndex;
+#[cfg(test)]
+pub(super) use index::{recover_active_map_calls, reset_recover_active_map_calls};
 
-#[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all,
-    fields(map_nodes = tracing::field::Empty, authority_records = tracing::field::Empty,
-        map_frame_count = tracing::field::Empty))]
 pub(super) fn recover_metadata<F: DurableIo>(
     file: &mut F,
     limits: RecoveryLimits,
+) -> Result<MetadataIndex, DurableError> {
+    recover_metadata_inspecting(file, limits, |_, _| Ok(()))
+}
+
+/// Recover metadata while optionally inspecting each already-decoded frame during
+/// the one authoritative scan. Ordinary open/compaction callers pass a no-op
+/// inspector via [`recover_metadata`]. Automatic checkpoint adoption uses the
+/// inspector to prove sealed media equals the live tip without a second map rebuild.
+#[tracing::instrument(name = "recover_metadata", target = "astrid_storage::recovery", level = "debug", skip_all,
+    fields(map_nodes = tracing::field::Empty, authority_records = tracing::field::Empty,
+        map_frame_count = tracing::field::Empty))]
+pub(super) fn recover_metadata_inspecting<F: DurableIo>(
+    file: &mut F,
+    limits: RecoveryLimits,
+    mut inspect: impl FnMut(FrameLocation, &MetadataFrame<&[u8]>) -> Result<(), DurableError>,
 ) -> Result<MetadataIndex, DurableError> {
     let mut index = MetadataIndex::default();
     scan_frames_with_source(
@@ -47,7 +61,9 @@ pub(super) fn recover_metadata<F: DurableIo>(
         METADATA_MAGIC,
         limits,
         |location, payload, load_previous| {
-            index.insert_at(location, MetadataFrame::decode(payload)?, load_previous)
+            let frame = MetadataFrame::decode(payload)?;
+            inspect(location, &frame)?;
+            index.insert_at(location, frame, load_previous)
         },
     )?;
     if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {

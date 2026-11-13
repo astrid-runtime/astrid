@@ -178,3 +178,41 @@ fn engine_close_without_commits_does_not_reclaim_fat_representation_metadata() {
     assert_eq!(reopened.metadata.metadata().unwrap().len(), before_len);
     assert_eq!(reopened.journal_generation, before_generation);
 }
+
+#[test]
+fn post_publication_checkpoint_failure_poison_fences_the_engine_until_recovery() {
+    use super::adoption_tests::SyncFailOnceVolume;
+    let directory = tempfile::tempdir().unwrap();
+    let inner: Arc<dyn AstridVolume> =
+        HostedFileVolume::open(directory.path().join("checkpoint-poison.volume")).unwrap();
+    let failing = Arc::new(SyncFailOnceVolume::new(inner));
+    let volume: Arc<dyn AstridVolume> = failing.clone();
+    let engine = activated_engine(volume);
+    failing.arm_next_sync_failure();
+    let mut expected = None;
+    let mut committed = None;
+    let mut observed_poison = false;
+    for sequence in 0_u64..1024 {
+        let payload = sequence.to_le_bytes().to_vec();
+        let (commit, txn) = transaction("alice", expected, &payload);
+        expected = Some(engine.commit(txn).unwrap().root());
+        committed = Some((commit, payload));
+        if engine.inner.lock().poisoned {
+            observed_poison = true;
+            break;
+        }
+    }
+    assert!(
+        observed_poison,
+        "automatic maintenance must surface the injected failure"
+    );
+    // Public access must cross recovery before using the acknowledged durable tip.
+    assert_eq!(engine.root(&"alice".to_owned()).unwrap(), expected);
+    assert!(!engine.inner.lock().poisoned);
+    let (commit, payload) = committed.unwrap();
+    assert_eq!(
+        engine.object(commit).unwrap().unwrap().canonical_bytes(),
+        payload
+    );
+    engine.close().unwrap();
+}

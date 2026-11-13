@@ -5,14 +5,16 @@
 //! Publish CURRENT only after the replacement generation is durable and verified;
 //! reclaim the previous generation only after CURRENT itself is durable.
 
-use super::activation::visit_new_reachable_map_nodes;
 use super::{
-    BTreeSet, Blake3PhysicalIdentity, CurrentPointer, DurableError, DurableFile,
-    FramedAppendStream, JOURNAL_MAGIC, JOURNAL_PATH, JournalEntry, METADATA_MAGIC, METADATA_PATH,
-    MetadataFrame, RecoveryLimits, RepresentationStore, append_frame, digest_journal_file, format,
-    generation_name, increment, io_error, read_current_file, recover_journal, recover_metadata,
+    DurableError, DurableFile, JOURNAL_PATH, METADATA_PATH, RecoveryLimits, RepresentationStore,
+    generation_name, increment, io_error,
 };
 
+mod adoption;
+#[cfg(test)]
+mod adoption_counter_tests;
+#[cfg(test)]
+mod adoption_tests;
 #[cfg(test)]
 mod maintenance_tests;
 mod native;
@@ -25,72 +27,9 @@ impl RepresentationStore {
         mut metadata: DurableFile,
         mut journal: DurableFile,
         limits: RecoveryLimits,
-    ) -> Result<(Self, CurrentPointer), DurableError> {
-        self.flush()?;
-        let generation = increment(self.journal_generation)?;
-        // Stream tip-reachable MapNode frames through one framed append stream:
-        // seek once, reuse the shared transfer buffer, flush before sync/readback.
-        let mut appended = BTreeSet::new();
-        let mut complete = BTreeSet::new();
-        let mut durable = BTreeSet::new();
-        {
-            let mut stream = FramedAppendStream::begin(&mut metadata, METADATA_MAGIC)?;
-            for map in [
-                &self.profiles,
-                &self.representations,
-                &self.placement_entries,
-            ] {
-                visit_new_reachable_map_nodes(
-                    map,
-                    &mut durable,
-                    &mut appended,
-                    &mut complete,
-                    |node| {
-                        let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?;
-                        stream.append_payload(&frame.encode()?)
-                    },
-                )?;
-            }
-            for frame in [
-                MetadataFrame::catalogue(&Blake3PhysicalIdentity, self.catalogue),
-                MetadataFrame::placement(&Blake3PhysicalIdentity, self.placements),
-                MetadataFrame::state(&Blake3PhysicalIdentity, self.state),
-            ] {
-                stream.append_payload(&frame.encode()?)?;
-            }
-            stream.finish()?;
-        }
-        metadata
-            .sync_data()
-            .map_err(|source| io_error("flush checkpoint metadata", source))?;
-        let prior = digest_journal_file(&mut self.journal, "digest prior representation journal")?;
-        let checkpoint = JournalEntry::Checkpoint {
-            journal_generation: generation,
-            active: Some(self.active),
-            state_generation: self.state.generation(),
-            prior_journal_digest: Some(prior),
-        };
-        append_frame(&mut journal, JOURNAL_MAGIC, &checkpoint.encode())?;
-        journal
-            .sync_data()
-            .map_err(|source| io_error("flush checkpoint journal", source))?;
-        let current = CurrentPointer {
-            journal_generation: generation,
-            checkpoint_digest: digest_journal_file(&mut journal, "digest checkpoint journal")?,
-            max_tail_frames: u32::MAX,
-            max_tail_bytes: u64::MAX,
-        };
-        let index = recover_metadata(&mut metadata, limits)?;
-        let (active, state) = recover_journal(&mut journal, current, &index, limits)?;
-        let (recovered, _) = Self::from_recovered::<false>(
-            metadata, journal, generation, active, state, index, limits,
-        )?;
-        if recovered.active != self.active || recovered.reverse != self.reverse {
-            return Err(DurableError::InvalidRepresentationState(
-                "checkpoint changed physical authority",
-            ));
-        }
-        Ok((recovered, current))
+    ) -> Result<(Self, super::CurrentPointer), DurableError> {
+        let emit = self.emit_sealed_generation(&mut metadata, &mut journal)?;
+        self.materialize_sealed_generation(metadata, journal, emit, limits)
     }
 
     /// Prepare a private generation without changing CURRENT. Callers may rebase
@@ -113,17 +52,8 @@ impl RepresentationStore {
         let metadata = DurableFile::volume(Arc::clone(volume), &metadata_path, true)?;
         let journal = DurableFile::volume(Arc::clone(volume), &journal_path, true)?;
         let (replacement, current) = self.checkpoint_into(metadata, journal, limits)?;
-        let mut pointer =
-            DurableFile::volume(Arc::clone(volume), "representations/CURRENT.tmp", true)?;
-        append_frame(&mut pointer, format::CURRENT_MAGIC, &current.encode())?;
-        pointer
-            .sync_data()
-            .map_err(|source| io_error("flush checkpoint pointer", source))?;
-        if read_current_file(pointer, limits)? != current {
-            return Err(DurableError::InvalidRepresentationState(
-                "checkpoint pointer verification failed",
-            ));
-        }
+        let pointer = DurableFile::volume(Arc::clone(volume), "representations/CURRENT.tmp", true)?;
+        adoption::write_verified_current_tmp(pointer, current, limits)?;
         Ok(replacement)
     }
 
@@ -146,13 +76,29 @@ impl RepresentationStore {
         volume: &std::sync::Arc<dyn crate::volume::AstridVolume>,
         limits: RecoveryLimits,
     ) -> Result<(), DurableError> {
-        let replacement = self.prepare_checkpoint_volume(volume, limits)?;
+        use super::volume::{generation_region, remove_region_if_present};
+        use std::sync::Arc;
+
+        let next = generation_name(increment(self.journal_generation)?);
+        let metadata_path = generation_region(&next, METADATA_PATH);
+        let journal_path = generation_region(&next, JOURNAL_PATH);
+        for path in [&metadata_path, &journal_path, "representations/CURRENT.tmp"] {
+            remove_region_if_present(volume, path)?;
+        }
+        let mut metadata = DurableFile::volume(Arc::clone(volume), &metadata_path, true)?;
+        let mut journal = DurableFile::volume(Arc::clone(volume), &journal_path, true)?;
+        let emit = self.emit_sealed_generation(&mut metadata, &mut journal)?;
+        let current = emit.current;
+        let proof =
+            self.verify_sealed_generation_for_adoption(&mut metadata, &mut journal, emit, limits)?;
+        let pointer = DurableFile::volume(Arc::clone(volume), "representations/CURRENT.tmp", true)?;
+        adoption::write_verified_current_tmp(pointer, current, limits)?;
         volume
             .commit_metadata(&[Self::checkpoint_volume_publication()?])
             .map_err(|source| io_error("publish checkpoint pointer", source))?;
         // Once the namespace changes, subsequent writes must use the new handles
         // even if the durability barrier reports an error. Keep old regions then.
-        *self = replacement;
+        self.adopt_sealed_generation(metadata, journal, proof)?;
         volume
             .sync()
             .map_err(|source| io_error("flush checkpoint publication", source))?;
@@ -197,7 +143,9 @@ impl RepresentationStore {
         if !self.should_checkpoint_representations_metadata() {
             return Ok(false);
         }
-        self.checkpoint_native(store_root, limits)?;
+        // Automatic maintenance adopts live state. Native compaction keeps calling
+        // reconstructing `checkpoint_native` directly.
+        self.checkpoint_native_adopting(store_root, limits)?;
         debug_assert!(self.map_frame_count() <= self.resident_map_node_count());
         Ok(true)
     }
@@ -231,7 +179,7 @@ impl RepresentationStore {
     }
 }
 
-fn obsolete_generation(name: &str, current: u64) -> bool {
+pub(super) fn obsolete_generation(name: &str, current: u64) -> bool {
     name.len() == 16
         && name
             .bytes()

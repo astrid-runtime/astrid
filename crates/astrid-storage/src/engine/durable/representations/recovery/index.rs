@@ -20,6 +20,21 @@ pub(in crate::engine::durable::representations) struct MetadataIndex {
     pub(in crate::engine::durable::representations) map_frame_count: u64,
 }
 
+#[cfg(test)]
+thread_local! {
+    static RECOVER_ACTIVE_MAP_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(in crate::engine::durable::representations) fn reset_recover_active_map_calls() {
+    RECOVER_ACTIVE_MAP_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(in crate::engine::durable::representations) fn recover_active_map_calls() -> u64 {
+    RECOVER_ACTIVE_MAP_CALLS.with(std::cell::Cell::get)
+}
+
 impl MetadataIndex {
     pub(super) fn insert_at<V: AsRef<[u8]> + Into<Vec<u8>>>(
         &mut self,
@@ -90,6 +105,34 @@ impl MetadataIndex {
             ))
     }
 
+    /// Prove every indexed `MapNode` is reachable from the tip authority roots and
+    /// that the unique resolved count matches the sealed tip emission.
+    pub(in crate::engine::durable::representations) fn ensure_exact_tip_closure(
+        &self,
+        roots: [Option<crate::storage_model::PhysicalMapNodeId>; 3],
+        expected_unique_nodes: usize,
+    ) -> Result<(), DurableError> {
+        if self.nodes.len() != expected_unique_nodes {
+            return Err(DurableError::InvalidRepresentationState(
+                "checkpoint metadata unique node count disagrees with the sealed tip",
+            ));
+        }
+        let mut closure = self.nodes.closure_checker();
+        for root in roots {
+            if !closure.complete(root) {
+                return Err(DurableError::InvalidRepresentationState(
+                    "checkpoint metadata tip closure is incomplete",
+                ));
+            }
+        }
+        if closure.len() != self.nodes.len() {
+            return Err(DurableError::InvalidRepresentationState(
+                "checkpoint metadata contains unreachable map nodes",
+            ));
+        }
+        Ok(())
+    }
+
     #[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all, fields(domain = ?domain, input_nodes = self.nodes.len(), active_nodes = tracing::field::Empty))]
     pub(in crate::engine::durable::representations) fn recover_active_map<F: DurableIo>(
         &mut self,
@@ -98,6 +141,10 @@ impl MetadataIndex {
         source: &F,
         limits: RecoveryLimits,
     ) -> Result<CanonicalPhysicalMap, DurableError> {
+        #[cfg(test)]
+        {
+            RECOVER_ACTIVE_MAP_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+        }
         let mut nodes = BTreeMap::new();
         let mut pending: Vec<_> = root.into_iter().collect();
         while let Some(id) = pending.pop() {
