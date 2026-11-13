@@ -283,11 +283,19 @@ mod tests {
         copy_home.ensure().unwrap();
         let mut image = Vec::new();
         store.write_preclose_volume_image(&mut image).unwrap();
-        astrid_core::platform_fs::atomic_write_private_file(
-            &copy_home.storage_volume_path(),
-            &image,
-        )
-        .unwrap();
+        let entries_before = std::fs::read_dir(copy_home.root()).unwrap().count();
+        let projection =
+            astrid_core::platform_fs::PrivateFileProjection::open(copy_home.root()).unwrap();
+        projection
+            .write(std::path::Path::new("astrid.volume"), &image)
+            .unwrap();
+        projection.sync().unwrap();
+        drop(projection);
+        assert_eq!(
+            std::fs::read_dir(copy_home.root()).unwrap().count(),
+            entries_before.strict_add(1),
+            "volume image fixture left an unrelated lock or journal sidecar"
+        );
 
         store.engine.close().unwrap();
         drop(store);
