@@ -9,6 +9,7 @@ use super::{
     is_excluded, tree_error,
 };
 use crate::StorageResult;
+use crate::engine::PrincipalProjectionEngine;
 
 mod publication;
 pub(super) use publication::publish_retiring_projection;
@@ -60,18 +61,44 @@ impl Inventory {
     }
 }
 
+#[cfg(test)]
 pub(super) fn retire_current_projection(
     home: &AstridHome,
     store: &RuntimePrincipalStore,
 ) -> StorageResult<()> {
-    retire_current_with_hook(home, store, || Ok(()))
+    prepare_current_projection(home, store)?.retire()
 }
 
+pub(super) fn prepare_current_projection<'a>(
+    home: &'a AstridHome,
+    store: &'a RuntimePrincipalStore,
+) -> StorageResult<PreparedRetirement<'a>> {
+    prepare_current_with_hook(home, store, || Ok(()))
+}
+
+#[cfg(all(test, unix))]
 fn retire_current_with_hook(
     home: &AstridHome,
     store: &RuntimePrincipalStore,
     before_prepare: impl FnOnce() -> StorageResult<()>,
 ) -> StorageResult<()> {
+    prepare_current_with_hook(home, store, before_prepare)?.retire()
+}
+
+fn prepare_current_with_hook<'a>(
+    home: &'a AstridHome,
+    store: &'a RuntimePrincipalStore,
+    before_prepare: impl FnOnce() -> StorageResult<()>,
+) -> StorageResult<PreparedRetirement<'a>> {
+    let root = store
+        .engine
+        .current_root(&super::StateOwner::System)
+        .map_err(|error| {
+            tree_error(
+                home.root(),
+                format!("capture retirement validation root: {error}"),
+            )
+        })?;
     let receipt = active::read(home, store)?;
     if let Some(receipt) = &receipt
         && receipt.phase() != super::ReceiptPhase::Retiring
@@ -82,7 +109,29 @@ fn retire_current_with_hook(
         ));
     }
     let inventory = Inventory::Current(receipt);
-    retire(home, store, &inventory, before_prepare)
+    let prepared = prepare(home, store, &inventory, before_prepare)?;
+    if store
+        .engine
+        .current_root(&super::StateOwner::System)
+        .map_err(|error| {
+            tree_error(
+                home.root(),
+                format!("confirm retirement validation root: {error}"),
+            )
+        })?
+        != root
+    {
+        return Err(tree_error(
+            home.root(),
+            "retirement catalog changed during source validation",
+        ));
+    }
+    Ok(prepared)
+}
+
+#[cfg(test)]
+pub(super) fn after_final_publication(home: &AstridHome) -> StorageResult<()> {
+    publication::tests::after_final_publication(home)
 }
 
 pub(super) fn retire_legacy_projection(
@@ -97,15 +146,15 @@ pub(super) fn retire_legacy_projection(
         .list(&super::StateOwner::System)
         .map_err(|error| tree_error(home.root(), format!("list legacy retirement: {error}")))?;
     entries.sort_by(|left, right| left.name().as_str().cmp(right.name().as_str()));
-    retire(home, store, &Inventory::Legacy(entries), || Ok(()))
+    prepare(home, store, &Inventory::Legacy(entries), || Ok(()))?.retire()
 }
 
-fn retire(
-    home: &AstridHome,
-    store: &RuntimePrincipalStore,
+fn prepare<'a>(
+    home: &'a AstridHome,
+    store: &'a RuntimePrincipalStore,
     inventory: &Inventory,
     before_prepare: impl FnOnce() -> StorageResult<()>,
-) -> StorageResult<()> {
+) -> StorageResult<PreparedRetirement<'a>> {
     #[cfg(any(unix, windows))]
     {
         // Capture from the actual engine owner, before preflight can observe
@@ -117,15 +166,35 @@ fn retire(
             .map_err(|error| tree_error(home.root(), format!("prepare retirement: {error}")))?;
         tracing::debug!(elapsed = ?started.elapsed(), "captured projection retirement inventory");
         let started = std::time::Instant::now();
+        let inspection = if matches!(inventory, Inventory::Current(Some(_))) {
+            Some(
+                astrid_core::platform_fs::PrivateProjectionInspection::try_open(home.root())
+                    .map_err(|error| {
+                        tree_error(home.root(), format!("inspect retirement sources: {error}"))
+                    })?,
+            )
+        } else {
+            None
+        };
         for relative in prepared.regular_files() {
             inventory.require_file(home, relative)?;
+            if let (Inventory::Current(Some(receipt)), Some(inspection)) = (inventory, &inspection)
+            {
+                source::verify_file(home, store, receipt, inspection, relative)?;
+            }
         }
-        tracing::debug!(elapsed = ?started.elapsed(), "validated projection retirement inventory");
-        let started = std::time::Instant::now();
-        prepared
-            .retire(&volume)
-            .map_err(|error| tree_error(home.root(), format!("retire projection: {error}")))?;
-        tracing::debug!(elapsed = ?started.elapsed(), "deleted and synchronized runtime projection");
+        if let Some(inspection) = inspection {
+            inspection.confirm_absolute_root().map_err(|error| {
+                tree_error(home.root(), format!("confirm retirement sources: {error}"))
+            })?;
+        }
+        tracing::debug!(elapsed = ?started.elapsed(), "validated projection retirement inventory and bytes");
+        Ok(PreparedRetirement {
+            home,
+            store,
+            prepared,
+            volume,
+        })
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -135,15 +204,39 @@ fn retire(
             "projection retirement requires unix or windows",
         ));
     }
-    // Do not clear the durable receipt if the public binding changed during
-    // deletion, including after the core survivor and root barrier checks.
-    // With a real NTFS directory-structure flush barrier, existing active::clear
-    // after this function (pack_and_retire_projection) remains the Unix-parity path.
-    store.require_volume_binding(home)
 }
+
+/// Complete preflight bound to the same engine volume and captured host entries.
+/// Dropping this value performs no deletion and leaves RETIRING recovery intact.
+pub(super) struct PreparedRetirement<'a> {
+    home: &'a AstridHome,
+    store: &'a RuntimePrincipalStore,
+    #[cfg(any(unix, windows))]
+    prepared: astrid_core::dirs::PreparedProjectionRetirement,
+    #[cfg(any(unix, windows))]
+    volume: std::fs::File,
+}
+
+impl PreparedRetirement<'_> {
+    pub(super) fn retire(self) -> StorageResult<()> {
+        #[cfg(any(unix, windows))]
+        {
+            let started = std::time::Instant::now();
+            self.prepared.retire(&self.volume).map_err(|error| {
+                tree_error(self.home.root(), format!("retire projection: {error}"))
+            })?;
+            tracing::debug!(elapsed = ?started.elapsed(), "deleted and synchronized runtime projection");
+        }
+        // Keep the receipt if the public binding changed, including after the
+        // core's final survivor and root durability checks.
+        self.store.require_volume_binding(self.home)
+    }
+}
+
+mod source;
 
 #[cfg(all(test, unix))]
 mod tests;
 
 #[cfg(test)]
-mod publication_tests;
+pub(super) mod publication_tests;

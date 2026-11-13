@@ -6,8 +6,8 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::content::{
-    ContentBatchExpectation, ContentDescriptor, ContentIngest, ContentName,
-    PrepareDerivedBatchContent, PrincipalContentError, PrincipalContentStore,
+    ContentBatchExpectation, ContentBatchPreconditions, ContentDescriptor, ContentIngest,
+    ContentName, PrepareDerivedBatchContent, PrincipalContentError, PrincipalContentStore,
 };
 use crate::engine::{
     CommitOutcome, InMemoryEngine, PrincipalProjectionEngine, PrincipalProjectionError,
@@ -21,6 +21,72 @@ type Inner = InMemoryEngine<StateOwner, Blake3ObjectIdentityV1>;
 struct InterleavingEngine {
     inner: Arc<Inner>,
     before_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+#[test]
+fn complete_inventory_root_rejects_new_names_and_restored_ids_after_real_cas_conflict() {
+    for restore_same_identity in [false, true] {
+        let inner = Arc::new(Inner::new(Blake3ObjectIdentityV1));
+        let engine = Arc::new(InterleavingEngine {
+            inner: Arc::clone(&inner),
+            before_commit: Mutex::new(None),
+        });
+        let content = PrincipalContentStore::from_engine(Arc::clone(&engine));
+        let concurrent = PrincipalContentStore::from_engine(Arc::clone(&inner));
+        let owner = StateOwner::System;
+        let retained = ContentName::new("retained").unwrap();
+        let added = ContentName::new("previously-absent").unwrap();
+        let control = ContentName::new("control").unwrap();
+        let receipt = ContentName::new("RETIRING").unwrap();
+        content.put(&owner, &retained, b"before").unwrap();
+        let root = inner.current_root(&owner).unwrap().unwrap();
+        let changed_name = if restore_same_identity {
+            retained.clone()
+        } else {
+            added.clone()
+        };
+        *engine.before_commit.lock() = Some(Box::new(move || {
+            concurrent
+                .put(&StateOwner::System, &changed_name, b"concurrent")
+                .unwrap();
+            if restore_same_identity {
+                // All name/object expectations match again; the complete
+                // generation-bound snapshot still must not be resurrected.
+                concurrent
+                    .put(&StateOwner::System, &changed_name, b"before")
+                    .unwrap();
+            }
+        }));
+        let error = content
+            .replace_streaming_batch_with_expectation(
+                &owner,
+                [ContentIngest::new(control.clone(), Cursor::new(b"payload"))],
+                &[],
+                Some(&mut Derived(receipt.clone())),
+                ContentBatchPreconditions {
+                    names: None,
+                    root: Some(root),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PrincipalContentError::BatchPreconditionFailed
+        ));
+        assert_ne!(inner.current_root(&owner).unwrap(), Some(root));
+        assert_eq!(
+            content.read(&owner, &retained).unwrap(),
+            Some(b"before".to_vec())
+        );
+        assert_eq!(content.read(&owner, &control).unwrap(), None);
+        assert_eq!(content.read(&owner, &receipt).unwrap(), None);
+        if !restore_same_identity {
+            assert_eq!(
+                content.read(&owner, &added).unwrap(),
+                Some(b"concurrent".to_vec())
+            );
+        }
+    }
 }
 
 impl PrincipalProjectionEngine<StateOwner> for InterleavingEngine {
@@ -68,6 +134,47 @@ impl PrepareDerivedBatchContent for Derived {
 }
 
 #[test]
+fn root_bound_deletion_rejects_concurrent_catalog_addition() {
+    let inner = Arc::new(Inner::new(Blake3ObjectIdentityV1));
+    let engine = Arc::new(InterleavingEngine {
+        inner: Arc::clone(&inner),
+        before_commit: Mutex::new(None),
+    });
+    let content = PrincipalContentStore::from_engine(Arc::clone(&engine));
+    let concurrent = PrincipalContentStore::from_engine(Arc::clone(&inner));
+    let owner = StateOwner::System;
+    let retained = ContentName::new("retained").unwrap();
+    let added = ContentName::new("new-name").unwrap();
+    content.put(&owner, &retained, b"retained").unwrap();
+    let root = inner.current_root(&owner).unwrap().unwrap();
+    let added_name = added.clone();
+    *engine.before_commit.lock() = Some(Box::new(move || {
+        concurrent
+            .put(&StateOwner::System, &added_name, b"new")
+            .unwrap();
+    }));
+    let error = content
+        .delete_batch_with_preconditions(
+            &owner,
+            std::slice::from_ref(&retained),
+            ContentBatchPreconditions {
+                names: None,
+                root: Some(root),
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        PrincipalContentError::BatchPreconditionFailed
+    ));
+    assert_eq!(
+        content.read(&owner, &retained).unwrap(),
+        Some(b"retained".to_vec())
+    );
+    assert_eq!(content.read(&owner, &added).unwrap(), Some(b"new".to_vec()));
+}
+
+#[test]
 fn derived_receipt_rechecks_retained_identity_after_cas_conflict() {
     let inner = Arc::new(Inner::new(Blake3ObjectIdentityV1));
     let engine = Arc::new(InterleavingEngine {
@@ -99,7 +206,7 @@ fn derived_receipt_rechecks_retained_identity_after_cas_conflict() {
             [ContentIngest::new(control.clone(), Cursor::new(b"receipt"))],
             &[],
             Some(&mut Derived(active.clone())),
-            Some(&expectation),
+            Some(&expectation).into(),
         )
         .unwrap_err();
     assert!(matches!(
@@ -146,7 +253,7 @@ fn empty_source_derived_receipt_rechecks_removal_after_cas_conflict() {
             std::iter::empty::<ContentIngest<Cursor<&[u8]>>>(),
             std::slice::from_ref(&removed),
             Some(&mut Derived(active.clone())),
-            Some(&expectation),
+            Some(&expectation).into(),
         )
         .unwrap_err();
     assert!(matches!(
@@ -184,11 +291,12 @@ fn empty_source_derived_name_cannot_overlap_a_removal() {
     content.put(&owner, &removed, b"old").unwrap();
     let before = inner.current_root(&owner).unwrap();
     let error = content
-        .replace_streaming_batch_removing_exact(
+        .replace_streaming_batch_with_expectation(
             &owner,
             std::iter::empty::<ContentIngest<Cursor<&[u8]>>>(),
             std::slice::from_ref(&removed),
             Some(&mut Derived(removed.clone())),
+            ContentBatchPreconditions::default(),
         )
         .unwrap_err();
     assert!(matches!(error, PrincipalContentError::DuplicateBatchName(value) if value == removed));

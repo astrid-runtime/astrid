@@ -227,13 +227,19 @@ where
         Ok(())
     }
 
-    pub(super) fn check_batch_expectation(
+    pub(super) fn check_batch_preconditions(
         &self,
         principal: &P,
         header: &ContentHeader,
-        expectation: Option<&ContentBatchExpectation>,
+        preconditions: crate::content::ContentBatchPreconditions<'_>,
     ) -> Result<(), PrincipalContentError> {
-        let Some(ContentBatchExpectation::Exact(entries)) = expectation else {
+        if preconditions
+            .root
+            .is_some_and(|expected| header.root != Some(expected))
+        {
+            return Err(PrincipalContentError::BatchPreconditionFailed);
+        }
+        let Some(ContentBatchExpectation::Exact(entries)) = preconditions.names else {
             return Ok(());
         };
         for (name, expected) in entries {

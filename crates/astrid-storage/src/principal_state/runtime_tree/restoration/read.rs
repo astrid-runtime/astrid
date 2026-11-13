@@ -14,7 +14,7 @@ use crate::content::{
 use crate::engine::PrincipalProjectionEngine;
 
 /// Sequential `Read` over one opened principal-content handle.
-pub(super) struct AuthenticatedContentReader<'a, P: Ord, E> {
+pub(in crate::principal_state::runtime_tree) struct AuthenticatedContentReader<'a, P: Ord, E> {
     handle: &'a PrincipalContentReadHandle<P, E>,
     offset: u64,
     end: u64,
@@ -30,7 +30,9 @@ where
 {
     /// Borrow `handle` for sequential authenticated reconstruction.
     #[must_use]
-    pub(super) fn new(handle: &'a PrincipalContentReadHandle<P, E>) -> Self {
+    pub(in crate::principal_state::runtime_tree) fn new(
+        handle: &'a PrincipalContentReadHandle<P, E>,
+    ) -> Self {
         let end = handle.descriptor().logical_bytes();
         // Coalesce ranges just as native content writes coalesce object batches.
         // Chunk boundaries remain authenticated by the existing read_range path.

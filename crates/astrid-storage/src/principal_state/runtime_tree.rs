@@ -533,10 +533,13 @@ pub(super) fn pack_and_retire_projection(
     let scanned = scan_with_policy(home.root(), None, ScanPolicy::Publication)?;
     tracing::debug!(elapsed = ?started.elapsed(), files = scanned.len(), "scanned final runtime projection");
     retirement::publish_retiring_projection(home, store, scanned)?;
+    #[cfg(test)]
+    retirement::after_final_publication(home)?;
+    let prepared = retirement::prepare_current_projection(home, store)?;
     if let Some(token) = staging_close {
         token.commit();
     }
-    retirement::retire_current_projection(home, store)?;
+    prepared.retire()?;
     let started = std::time::Instant::now();
     active::clear(store, home)?;
     tracing::debug!(elapsed = ?started.elapsed(), "cleared retired projection receipt");
@@ -671,6 +674,8 @@ fn publish_scanned_projection(
         .content()
         .flush()
         .map_err(|error| tree_error(home.root(), format!("flush active projection: {error}")))?;
+    #[cfg(test)]
+    retirement::publication_tests::record_completed_publication();
     tracing::debug!(target: "astrid_storage::runtime_tree_publication", elapsed = ?started.elapsed(), phase = "active", "published and flushed runtime projection");
     Ok(())
 }

@@ -81,9 +81,13 @@ impl ActiveProjectionReceipt {
     }
 
     pub(super) fn inventory_object(&self, name: &str) -> StorageResult<Option<(ObjectId, u64)>> {
-        let Some(entry) = self.entries.iter().find(|entry| entry.name == name) else {
+        let Ok(index) = self
+            .entries
+            .binary_search_by(|entry| entry.name.as_str().cmp(name))
+        else {
             return Ok(None);
         };
+        let entry = &self.entries[index];
         let bytes = hex::decode(&entry.file).map_err(|error| {
             tree_error(
                 Path::new(&entry.name),

@@ -524,6 +524,15 @@ where
         names: &[ContentName],
         expectation: &ContentBatchExpectation,
     ) -> Result<bool, PrincipalContentError> {
+        self.delete_batch_with_preconditions(principal, names, Some(expectation).into())
+    }
+
+    pub(crate) fn delete_batch_with_preconditions(
+        &self,
+        principal: &P,
+        names: &[ContentName],
+        preconditions: crate::content::ContentBatchPreconditions<'_>,
+    ) -> Result<bool, PrincipalContentError> {
         if names.is_empty() {
             return Ok(false);
         }
@@ -535,7 +544,7 @@ where
         }
         loop {
             let mut header = self.header(principal)?.as_ref().clone();
-            self.check_batch_expectation(principal, &header, Some(expectation))?;
+            self.check_batch_preconditions(principal, &header, preconditions)?;
             let mut records = BTreeMap::<ObjectId, ObjectRecord>::new();
             let mut changed = false;
             for name in names {

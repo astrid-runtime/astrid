@@ -292,6 +292,21 @@ impl ContentBatchExpectation {
     }
 }
 
+/// Internal publication fences. A root-bound snapshot closes the entire
+/// principal state, including names that were absent during inventory capture.
+/// Public name-only expectations retain their existing conflict semantics.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ContentBatchPreconditions<'a> {
+    pub(crate) names: Option<&'a ContentBatchExpectation>,
+    pub(crate) root: Option<RootState>,
+}
+
+impl<'a> From<Option<&'a ContentBatchExpectation>> for ContentBatchPreconditions<'a> {
+    fn from(names: Option<&'a ContentBatchExpectation>) -> Self {
+        Self { names, root: None }
+    }
+}
+
 /// Operator-selectable CPU parallelism for bulk content construction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BulkIngestPolicy {

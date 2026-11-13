@@ -168,7 +168,7 @@ async fn lazy_packed_source_open_and_length_failures_publish_no_catalog_changes(
                 ],
                 std::slice::from_ref(&obsolete),
                 None,
-                None,
+                None.into(),
             )
             .expect_err("a late source failure must not publish the earlier source or removal");
         assert!(matches!(&error, StorageError::Internal(_)), "{error}");

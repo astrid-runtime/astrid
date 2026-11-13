@@ -446,7 +446,7 @@ pub(super) fn take_writer_opens(root: &std::path::Path) -> usize {
 }
 
 pub(super) mod names;
-mod read;
+pub(super) mod read;
 #[cfg(test)]
 mod read_tests;
 mod rollback;

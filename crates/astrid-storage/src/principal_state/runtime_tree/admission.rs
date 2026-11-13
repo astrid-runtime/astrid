@@ -104,7 +104,7 @@ impl RuntimePrincipalStore {
                 files,
                 &[],
                 Some(&mut derived),
-                Some(&expectation),
+                Some(&expectation).into(),
             )
             .map_err(io_error)?;
         if let Some(outcome) = outcome {
@@ -216,7 +216,7 @@ impl RuntimeTreeAdmission<'_> {
                 )],
                 &[],
                 Some(&mut derived),
-                Some(&expectation),
+                Some(&expectation).into(),
             )
             .map_err(io_error)?;
         self.store.content().flush().map_err(io_error)?;

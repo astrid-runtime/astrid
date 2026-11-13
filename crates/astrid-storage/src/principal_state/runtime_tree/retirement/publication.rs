@@ -9,8 +9,8 @@ use super::super::{
     validate_retiring_host_subset,
 };
 use crate::StorageResult;
-use crate::content::{ContentBatchExpectation, ContentName, PrepareDerivedBatchContent};
-use crate::engine::PrincipalProjectionError;
+use crate::content::{ContentBatchPreconditions, ContentName, PrepareDerivedBatchContent};
+use crate::engine::{PrincipalProjectionEngine, PrincipalProjectionError};
 
 pub(in crate::principal_state::runtime_tree) fn publish_retiring_projection(
     home: &AstridHome,
@@ -27,14 +27,13 @@ pub(super) fn publish_with_hook(
     before_publish: impl FnOnce() -> StorageResult<()>,
 ) -> StorageResult<()> {
     let started = std::time::Instant::now();
-    let name = active::active_projection_name()?;
-    // Capture before parsing: a concurrent receipt replacement must fail CAS,
-    // not bind newer authority to removals derived from an older receipt.
-    let expected = store
-        .content()
-        .describe(&StateOwner::System, &name)
-        .map_err(|error| tree_error(home.root(), format!("inspect retiring receipt: {error}")))?
-        .map(crate::content::ContentDescriptor::file);
+    // Capture the whole System generation before parsing the receipt or listing
+    // retained names. A fresh-name addition must fail just like replacement;
+    // per-name expectations cannot prove that the inventory is complete.
+    let root = store
+        .engine
+        .current_root(&StateOwner::System)
+        .map_err(|error| tree_error(home.root(), format!("capture retiring root: {error}")))?;
     let Some(receipt) = active::read(home, store)? else {
         return if scanned.is_empty() || is_exactly_pack_open_staging_journal(&scanned) {
             Ok(())
@@ -63,13 +62,8 @@ pub(super) fn publish_with_hook(
     let rewritten = surviving.iter().collect::<BTreeSet<_>>();
     let removed = removals.iter().collect::<BTreeSet<_>>();
     let complete = active_projection_entries(home, store)?;
-    let expectation = ContentBatchExpectation::exact(
-        complete
-            .iter()
-            .filter(|entry| !rewritten.contains(&entry.name))
-            .map(|entry| (entry.name.clone(), Some(entry.file)))
-            .chain([(name, expected)]),
-    );
+    let root =
+        root.ok_or_else(|| tree_error(home.root(), "active receipt has no principal root"))?;
     let retained = complete
         .iter()
         .filter(|entry| !rewritten.contains(&entry.name) && !removed.contains(&entry.name))
@@ -96,7 +90,10 @@ pub(super) fn publish_with_hook(
         ingests,
         &removals,
         Some(&mut derived),
-        Some(&expectation),
+        ContentBatchPreconditions {
+            names: None,
+            root: Some(root),
+        },
     )?;
     #[cfg(test)]
     tests::before_flush(home)?;
@@ -104,6 +101,8 @@ pub(super) fn publish_with_hook(
         .content()
         .flush()
         .map_err(|error| tree_error(home.root(), format!("flush retiring projection: {error}")))?;
+    #[cfg(test)]
+    super::publication_tests::record_completed_publication();
     tracing::debug!(target: "astrid_storage::runtime_tree_publication", elapsed = ?started.elapsed(), phase = "retiring", "published and flushed runtime projection");
     Ok(())
 }
@@ -133,4 +132,4 @@ impl PrepareDerivedBatchContent for RetiringReceiptDeriver<'_> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

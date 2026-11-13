@@ -143,7 +143,7 @@ async fn precommit_failure_preserves_active_payloads_and_retry_on_reopen() {
     assert_host(&home, b"host after");
     store.pack_and_retire_runtime_projection(&home).unwrap();
     drop(store);
-    let store = open(&home).await;
+    let _store = open(&home).await;
     assert_host(&home, b"host after");
 }
 
@@ -341,7 +341,7 @@ async fn failed_flush_boundary_leaves_host_and_durable_retiring_intent_for_retry
     assert_host(&home, b"host after");
     store.pack_and_retire_runtime_projection(&home).unwrap();
     drop(store);
-    let store = open(&home).await;
+    let _store = open(&home).await;
     assert_host(&home, b"host after");
 }
 
@@ -374,7 +374,7 @@ async fn failed_receipt_derivation_leaves_active_authority_untouched() {
         ))],
         &[],
         Some(&mut derived),
-        None,
+        ContentBatchPreconditions::default(),
     );
     assert!(result.is_err());
     assert_eq!(
@@ -389,4 +389,166 @@ async fn failed_receipt_derivation_leaves_active_authority_untouched() {
         ReceiptPhase::Active
     );
     assert_host(&home, b"host before");
+}
+
+thread_local! {
+    static MUTATE_AFTER_PUBLICATION: std::cell::RefCell<Option<(std::path::PathBuf, std::time::SystemTime)>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+pub(in crate::principal_state::runtime_tree::retirement) fn after_final_publication(
+    home: &AstridHome,
+) -> StorageResult<()> {
+    let mutation = MUTATE_AFTER_PUBLICATION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|(root, _)| root == home.root()) {
+            slot.take()
+        } else {
+            None
+        }
+    });
+    if let Some((_, modified)) = mutation {
+        use std::io::Write as _;
+        let path = home.root().join("zz-source.toml");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|error| tree_error(&path, error))?;
+        file.write_all(b"host newer!")
+            .map_err(|error| tree_error(&path, error))?;
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .map_err(|error| tree_error(&path, error))?;
+        file.sync_all().map_err(|error| tree_error(&path, error))?;
+    }
+    Ok(())
+}
+
+struct SourceMutation;
+
+impl Drop for SourceMutation {
+    fn drop(&mut self) {
+        MUTATE_AFTER_PUBLICATION.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[tokio::test]
+async fn same_length_postcommit_source_change_preserves_all_host_files_and_refuses_retry() {
+    let (_directory, home, store) = fixture().await;
+    write_projection_file(home.root(), "nested/other.toml", b"also preserve").unwrap();
+    write_projection_file(home.root(), "zz-source.toml", b"host before").unwrap();
+    let modified = std::fs::metadata(home.root().join("zz-source.toml"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    {
+        MUTATE_AFTER_PUBLICATION
+            .with(|slot| *slot.borrow_mut() = Some((home.root().to_path_buf(), modified)));
+        let _mutation = SourceMutation;
+        let error = store.pack_and_retire_runtime_projection(&home).unwrap_err();
+        assert!(error.to_string().contains("source bytes differ"), "{error}");
+    }
+    // The write occurs after the real durable payload/RETIRING CAS. Its size
+    // and mtime are unchanged; only authenticated byte comparison detects it.
+    assert_eq!(
+        std::fs::read(home.root().join("zz-source.toml")).unwrap(),
+        b"host newer!"
+    );
+    assert_host(&home, b"host before");
+    assert_eq!(
+        std::fs::metadata(home.root().join("zz-source.toml"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        modified
+    );
+    assert_eq!(
+        std::fs::read(home.root().join("nested/other.toml")).unwrap(),
+        b"also preserve"
+    );
+    assert_eq!(
+        active::read(&home, &store).unwrap().unwrap().phase(),
+        ReceiptPhase::Retiring
+    );
+    assert_eq!(
+        store
+            .content()
+            .read(&StateOwner::System, &name("zz-source.toml"))
+            .unwrap()
+            .unwrap(),
+        b"host before"
+    );
+    let retry = store.pack_and_retire_runtime_projection(&home).unwrap_err();
+    assert!(retry.to_string().contains("source bytes differ"), "{retry}");
+    assert_eq!(
+        std::fs::read(home.root().join("zz-source.toml")).unwrap(),
+        b"host newer!"
+    );
+    assert_host(&home, b"host before");
+    assert_eq!(
+        std::fs::read(home.root().join("nested/other.toml")).unwrap(),
+        b"also preserve"
+    );
+    // Restoring the receipted bytes permits the original bounded retry path.
+    write_projection_file(home.root(), "zz-source.toml", b"host before").unwrap();
+    store.pack_and_retire_runtime_projection(&home).unwrap();
+    assert_eq!(std::fs::read_dir(home.root()).unwrap().count(), 1);
+}
+
+#[tokio::test]
+async fn fresh_catalogue_addition_refuses_incomplete_retiring_inventory() {
+    for materialize in [false, true] {
+        let (_directory, home, store) = fixture().await;
+        let receipt_before = store
+            .content()
+            .describe(
+                &StateOwner::System,
+                &active::active_projection_name().unwrap(),
+            )
+            .unwrap();
+        let added = name("fresh-generation.toml");
+        let result = publish_with_hook(&home, &store, scan(home.root()).unwrap(), || {
+            store
+                .content()
+                .put(&StateOwner::System, &added, b"fresh")
+                .map_err(|error| tree_error(home.root(), error))?;
+            if materialize {
+                write_projection_file(home.root(), added.as_str(), b"fresh")?;
+            }
+            Ok(())
+        });
+        assert!(
+            result.is_err(),
+            "new names outside a captured inventory must fail its root precondition"
+        );
+        assert_eq!(
+            store
+                .content()
+                .describe(
+                    &StateOwner::System,
+                    &active::active_projection_name().unwrap()
+                )
+                .unwrap(),
+            receipt_before
+        );
+        assert_eq!(
+            active::read(&home, &store).unwrap().unwrap().phase(),
+            ReceiptPhase::Active
+        );
+        assert_host(&home, b"host before");
+        assert_eq!(
+            store
+                .content()
+                .read(&StateOwner::System, &added)
+                .unwrap()
+                .unwrap(),
+            b"fresh"
+        );
+        if materialize {
+            assert_eq!(
+                std::fs::read(home.root().join(added.as_str())).unwrap(),
+                b"fresh"
+            );
+        }
+    }
 }

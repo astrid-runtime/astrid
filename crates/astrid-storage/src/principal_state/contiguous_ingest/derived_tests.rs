@@ -7,7 +7,7 @@ use astrid_core::PrincipalUid;
 use astrid_core::dirs::AstridHome;
 
 use super::*;
-use crate::content::{ContentDescriptor, PrincipalContentError};
+use crate::content::{ContentBatchExpectation, ContentDescriptor, PrincipalContentError};
 use crate::engine::PrincipalProjectionEngine;
 use crate::{KvQuotaResolver, open_runtime_principal_store};
 
@@ -59,7 +59,7 @@ async fn empty_source_publishes_derived_receipt_without_removals() {
                 name: receipt.clone(),
                 fail: false,
             }),
-            None,
+            None.into(),
         )
         .unwrap()
         .expect("a derived-only publication has a root outcome");
@@ -95,7 +95,7 @@ async fn empty_source_removal_and_derived_receipt_survive_reopen() {
                 name: receipt.clone(),
                 fail: false,
             }),
-            Some(&expectation),
+            Some(&expectation).into(),
         )
         .unwrap()
         .expect("derived publication must not be silently dropped");
@@ -127,7 +127,7 @@ async fn empty_source_derivation_failure_keeps_removed_content_and_root() {
                 name: receipt.clone(),
                 fail: true,
             }),
-            None,
+            None.into(),
         )
         .expect_err("receipt derivation must run before any removal commits");
     assert!(error.to_string().contains("overflow"), "{error}");
@@ -167,7 +167,7 @@ async fn empty_source_stale_expectation_keeps_payload_and_receipt() {
                     name: receipt.clone(),
                     fail: false
                 }),
-                Some(&expectation),
+                Some(&expectation).into(),
             )
             .is_err()
     );

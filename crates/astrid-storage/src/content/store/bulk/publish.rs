@@ -72,7 +72,9 @@ where
         let completed = &publication_completed;
         loop {
             let mut header = self.header(principal)?.as_ref().clone();
-            self.check_batch_expectation(principal, &header, publication.expectation)?;
+            // Recheck the complete snapshot before every CAS attempt, including
+            // retries after another writer adds a previously unknown name.
+            self.check_batch_preconditions(principal, &header, publication.preconditions)?;
             let mut catalog_records = BTreeMap::<ObjectId, ObjectRecord>::new();
             let mut changed = false;
             changed |= self.apply_batch_removals(

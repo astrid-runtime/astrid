@@ -12,7 +12,6 @@ use crate::{KvQuotaResolver, StateOwner, open_runtime_principal_store};
 struct Operations {
     scans: Arc<AtomicUsize>,
     receipts: Arc<AtomicUsize>,
-    publications: Arc<AtomicUsize>,
 }
 
 impl tracing::Subscriber for Operations {
@@ -32,14 +31,21 @@ impl tracing::Subscriber for Operations {
             "astrid_storage::projection_receipt_read" => {
                 self.receipts.fetch_add(1, Ordering::Relaxed);
             },
-            "astrid_storage::runtime_tree_publication" => {
-                self.publications.fetch_add(1, Ordering::Relaxed);
-            },
             _ => {},
         }
     }
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
+}
+
+thread_local! {
+    static COMPLETED_PUBLICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// These synchronous API calls stay on the current test thread. Count their
+// actual successful flush boundaries independently of global tracing filters.
+pub(in crate::principal_state::runtime_tree) fn record_completed_publication() {
+    COMPLETED_PUBLICATIONS.with(|count| count.set(count.get().strict_add(1)));
 }
 
 async fn fixture() -> (
@@ -65,12 +71,16 @@ fn name(value: &str) -> ContentName {
 async fn pack_uses_one_validating_walk_one_publication_and_two_receipt_reads() {
     let (_directory, home, store) = fixture().await;
     let operations = Operations::default();
+    let before = COMPLETED_PUBLICATIONS.with(std::cell::Cell::get);
     tracing::subscriber::with_default(operations.clone(), || {
         store.pack_and_retire_runtime_projection(&home).unwrap();
     });
     assert_eq!(operations.scans.load(Ordering::Relaxed), 1);
     assert_eq!(operations.receipts.load(Ordering::Relaxed), 2);
-    assert_eq!(operations.publications.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        COMPLETED_PUBLICATIONS.with(std::cell::Cell::get) - before,
+        1
+    );
     assert_eq!(std::fs::read_dir(home.root()).unwrap().count(), 1);
     assert!(active::read(&home, &store).unwrap().is_none());
 }
