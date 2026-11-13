@@ -8,10 +8,6 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ## [Unreleased]
 
-### Fixed
-
-- Retain live representation maps during automatic storage checkpoints after verifying the new media against their complete canonical state. Preserve independent reconstruction for cold recovery and compaction, publication failure handling, and fresh closure proofs for subsequent writes.
-
 ## [2026.10.1] - 2026-10-15
 
 ### Fixed
