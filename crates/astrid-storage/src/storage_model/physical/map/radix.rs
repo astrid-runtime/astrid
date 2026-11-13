@@ -15,7 +15,7 @@ pub(super) fn build<I: PhysicalIdentity, V: AsRef<[u8]>, N: CanonicalNodeSink>(
     domain: PhysicalMapDomain,
     entries: &[(PhysicalMapKey, V)],
     nodes: &mut N,
-) -> Result<PhysicalMapNodeId, PhysicalModelError> {
+) -> Result<PhysicalMapNodeId, N::Error> {
     build_range(identity, domain, entries, 0, nodes)
 }
 
@@ -41,9 +41,9 @@ fn build_range<I: PhysicalIdentity, V: AsRef<[u8]>, N: CanonicalNodeSink>(
     entries: &[(PhysicalMapKey, V)],
     depth: u8,
     nodes: &mut N,
-) -> Result<PhysicalMapNodeId, PhysicalModelError> {
+) -> Result<PhysicalMapNodeId, N::Error> {
     if entries.is_empty() {
-        return Err(PhysicalModelError::InvalidMap("empty radix range"));
+        return Err(PhysicalModelError::InvalidMap("empty radix range").into());
     }
     if entries.len() <= RADIX_PAGE_CAPACITY {
         return insert_node(
@@ -71,7 +71,7 @@ fn build_range<I: PhysicalIdentity, V: AsRef<[u8]>, N: CanonicalNodeSink>(
         depth,
     );
     if prefix_nibbles >= DIGEST_NIBBLES {
-        return Err(PhysicalModelError::InvalidMap("duplicate radix key"));
+        return Err(PhysicalModelError::InvalidMap("duplicate radix key").into());
     }
 
     let mut child_bitmap = 0_u16;
@@ -271,9 +271,9 @@ fn insert_node<I: PhysicalIdentity, N: CanonicalNodeSink>(
     identity: &I,
     nodes: &mut N,
     node: PhysicalMapNode,
-) -> Result<PhysicalMapNodeId, PhysicalModelError> {
-    let id = node.identify(identity)?;
-    nodes.put(id, node)?;
+) -> Result<PhysicalMapNodeId, N::Error> {
+    let (bytes, id) = node.encode_and_identify(identity)?;
+    nodes.put(id, &bytes, node)?;
     Ok(id)
 }
 

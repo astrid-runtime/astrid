@@ -525,3 +525,30 @@ fn canonical_proof_keeps_only_active_ids_and_borrows_sorted_leaf_values() {
     assert!(empty.visited().is_empty());
     assert!(empty.entries().is_empty());
 }
+
+#[test]
+fn streaming_proof_checks_generated_and_walked_sets_independently() {
+    let map = super::super::CanonicalPhysicalMap::build_dense(
+        &Identity,
+        PhysicalMapDomain::Placement,
+        vec![(PhysicalMapKey::new([1; 32]), vec![7])],
+    )
+    .unwrap();
+    let proof = walk_root(PhysicalMapDomain::Placement, map.root(), map.nodes()).unwrap();
+    let mut generated = BTreeSet::new();
+    map.prove_root_into(&Identity, PhysicalMapDomain::Placement, |id, bytes| {
+        assert_eq!(PhysicalMapNode::decode(bytes).unwrap(), map.nodes()[&id]);
+        generated.insert(id);
+        Ok::<_, PhysicalModelError>(())
+    })
+    .unwrap();
+    ensure_generated_matches_walk(&generated, proof.visited()).unwrap();
+    let extra = PhysicalMapNodeId::new([255; 32]);
+    let mut extra_walked = proof.visited().clone();
+    extra_walked.insert(extra);
+    assert!(ensure_generated_matches_walk(&generated, &extra_walked).is_err());
+    generated.insert(extra);
+    assert!(ensure_generated_matches_walk(&generated, proof.visited()).is_err());
+    generated.clear();
+    assert!(ensure_generated_matches_walk(&generated, proof.visited()).is_err());
+}

@@ -372,7 +372,7 @@ fn delete_entry(
     }
     let child_directory = child.as_ref().and_then(Entry::directory);
     if let Some(child_directory) = child_directory {
-        if is_root && parallel_children {
+        if parallel_children {
             parallel::delete_children(child_directory, &child_path, root, &planned.children)?;
         } else {
             delete_inventory(

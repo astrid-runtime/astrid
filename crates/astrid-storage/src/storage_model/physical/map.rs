@@ -29,6 +29,12 @@ mod lookup_tests;
 #[cfg(test)]
 mod rebuild_tests;
 
+#[cfg(test)]
+std::thread_local! {
+    // Count owned node bodies separately from search-key/profile/record codecs.
+    static MAP_NODE_ENCODINGS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
 const LEGACY_MAP_NODE_VERSION: u16 = 1;
 const RADIX_MAP_NODE_VERSION: u16 = 2;
 const RADIX_PAGE_CAPACITY: usize = 1;
@@ -277,6 +283,8 @@ impl PhysicalMapNode {
     pub fn encode(&self) -> Result<Vec<u8>, PhysicalModelError> {
         let mut encoder = Encoder::new();
         self.encode_into(&mut encoder)?;
+        #[cfg(test)]
+        MAP_NODE_ENCODINGS.with(|count| count.set(count.get().strict_add(1)));
         Ok(encoder.finish())
     }
 
@@ -370,9 +378,16 @@ impl PhysicalMapNode {
 
     #[cfg(test)]
     pub(crate) fn count_encodings_during<T>(operation: impl FnOnce() -> T) -> (T, usize) {
-        super::codec::reset_encoder_finishes();
+        struct EncodingCountScope(usize);
+        impl Drop for EncodingCountScope {
+            fn drop(&mut self) {
+                // Preserve enclosing counts even when a nested scope unwinds.
+                MAP_NODE_ENCODINGS.with(|count| count.set(self.0.strict_add(count.get())));
+            }
+        }
+        let _scope = EncodingCountScope(MAP_NODE_ENCODINGS.with(|count| count.replace(0)));
         let value = operation();
-        (value, super::codec::encoder_finishes())
+        (value, MAP_NODE_ENCODINGS.with(core::cell::Cell::get))
     }
 
     /// Authenticate the original bytes after decode proves their canonical form.
@@ -505,6 +520,7 @@ impl CanonicalPhysicalMap {
     }
 
     /// Fully validate a fixed-domain root while retaining its borrowed closure.
+    #[cfg(test)]
     pub(crate) fn prove_root<I: PhysicalIdentity>(
         &self,
         identity: &I,
@@ -519,6 +535,24 @@ impl CanonicalPhysicalMap {
             ));
         }
         Ok(proof)
+    }
+
+    /// Prove the complete active map while forwarding each generated encoding.
+    /// Callback writes must remain private until independent media verification.
+    pub(crate) fn prove_root_into<I: PhysicalIdentity, E: From<PhysicalModelError>>(
+        &self,
+        identity: &I,
+        domain: PhysicalMapDomain,
+        emit: impl FnMut(PhysicalMapNodeId, &[u8]) -> Result<(), E>,
+    ) -> Result<CanonicalRootProof<'_>, E> {
+        validation::prove_root_into(
+            identity,
+            domain,
+            self.root,
+            &self.nodes,
+            self.entry_count,
+            emit,
+        )
     }
 
     /// Recover one active map, retaining every node supplied by the caller.

@@ -13,17 +13,23 @@ use super::{
 /// Canonical construction can retain nodes or only check and discard them.
 /// The validation sink borrows the input graph; it owns no second arena.
 pub(super) trait CanonicalNodeSink {
+    type Error: From<PhysicalModelError>;
+
     fn put(
         &mut self,
         id: PhysicalMapNodeId,
+        canonical_bytes: &[u8],
         node: PhysicalMapNode,
-    ) -> Result<(), PhysicalModelError>;
+    ) -> Result<(), Self::Error>;
 }
 
 impl CanonicalNodeSink for BTreeMap<PhysicalMapNodeId, PhysicalMapNode> {
+    type Error = PhysicalModelError;
+
     fn put(
         &mut self,
         id: PhysicalMapNodeId,
+        _canonical_bytes: &[u8],
         node: PhysicalMapNode,
     ) -> Result<(), PhysicalModelError> {
         match self.entry(id) {
@@ -71,16 +77,58 @@ pub(super) fn prove_root<'a, I: PhysicalIdentity>(
     root: Option<PhysicalMapNodeId>,
     nodes: &'a BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
 ) -> Result<CanonicalRootProof<'a>, PhysicalModelError> {
+    let proof = walk_root(domain, root, nodes)?;
+    validate_canonical_root(
+        identity,
+        domain,
+        root,
+        nodes,
+        &proof.entries,
+        &mut ValidationNodes(nodes),
+    )?;
+    Ok(proof)
+}
+
+/// Stream canonical bytes only after their corresponding live body matches.
+/// Partial callback effects are private; this function grants no publication right.
+pub(super) fn prove_root_into<'a, I: PhysicalIdentity, E: From<PhysicalModelError>>(
+    identity: &I,
+    domain: PhysicalMapDomain,
+    root: Option<PhysicalMapNodeId>,
+    nodes: &'a BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    expected_count: u64,
+    emit: impl FnMut(PhysicalMapNodeId, &[u8]) -> Result<(), E>,
+) -> Result<CanonicalRootProof<'a>, E> {
+    let proof = walk_root(domain, root, nodes)?;
+    if u64::try_from(proof.entries.len()).map_err(|_| PhysicalModelError::LengthOverflow)?
+        != expected_count
+    {
+        return Err(PhysicalModelError::InvalidMap(
+            "live physical map count disagrees with canonical validation",
+        )
+        .into());
+    }
+    let mut sink = StreamingValidationNodes {
+        nodes,
+        generated: BTreeSet::new(),
+        emit,
+    };
+    validate_canonical_root(identity, domain, root, nodes, &proof.entries, &mut sink)?;
+    ensure_generated_matches_walk(&sink.generated, &proof.visited)?;
+    Ok(proof)
+}
+
+fn walk_root(
+    domain: PhysicalMapDomain,
+    root: Option<PhysicalMapNodeId>,
+    nodes: &BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+) -> Result<CanonicalRootProof<'_>, PhysicalModelError> {
     let Some(root) = root else {
         return Ok(CanonicalRootProof {
             visited: BTreeSet::new(),
             entries: Vec::new(),
         });
     };
-    let construction = nodes
-        .get(&root)
-        .ok_or(PhysicalModelError::InvalidMap("missing map root"))?
-        .construction();
     let mut stack = vec![root];
     let mut visited = BTreeSet::new();
     let mut entries = Vec::new();
@@ -112,17 +160,76 @@ pub(super) fn prove_root<'a, I: PhysicalIdentity>(
     if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
         return Err(PhysicalModelError::InvalidMap("duplicate leaf key"));
     }
-    let mut proof = ValidationNodes(nodes);
+    Ok(CanonicalRootProof { visited, entries })
+}
+
+fn validate_canonical_root<I: PhysicalIdentity, N: CanonicalNodeSink>(
+    identity: &I,
+    domain: PhysicalMapDomain,
+    root: Option<PhysicalMapNodeId>,
+    nodes: &BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    entries: &[(PhysicalMapKey, &[u8])],
+    sink: &mut N,
+) -> Result<(), N::Error> {
+    let Some(root) = root else {
+        return Ok(());
+    };
+    let construction = nodes
+        .get(&root)
+        .ok_or(PhysicalModelError::InvalidMap("missing map root"))?
+        .construction();
     let canonical = match construction {
-        MapConstruction::LegacyBinary => legacy::build(identity, domain, &entries, &mut proof)?,
-        MapConstruction::DenseRadix => radix::build(identity, domain, &entries, &mut proof)?,
+        MapConstruction::LegacyBinary => legacy::build(identity, domain, entries, sink)?,
+        MapConstruction::DenseRadix => radix::build(identity, domain, entries, sink)?,
     };
     if canonical != root {
+        return Err(
+            PhysicalModelError::InvalidMap("node graph is not the unique canonical trie").into(),
+        );
+    }
+    Ok(())
+}
+
+fn ensure_generated_matches_walk(
+    generated: &BTreeSet<PhysicalMapNodeId>,
+    walked: &BTreeSet<PhysicalMapNodeId>,
+) -> Result<(), PhysicalModelError> {
+    if generated != walked {
         return Err(PhysicalModelError::InvalidMap(
-            "node graph is not the unique canonical trie",
+            "canonical generated nodes disagree with walked closure",
         ));
     }
-    Ok(CanonicalRootProof { visited, entries })
+    Ok(())
+}
+
+struct StreamingValidationNodes<'a, F> {
+    nodes: &'a BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    generated: BTreeSet<PhysicalMapNodeId>,
+    emit: F,
+}
+
+impl<E: From<PhysicalModelError>, F: FnMut(PhysicalMapNodeId, &[u8]) -> Result<(), E>>
+    CanonicalNodeSink for StreamingValidationNodes<'_, F>
+{
+    type Error = E;
+
+    fn put(
+        &mut self,
+        id: PhysicalMapNodeId,
+        canonical_bytes: &[u8],
+        node: PhysicalMapNode,
+    ) -> Result<(), E> {
+        // Body equality precedes every callback, including IDs already emitted
+        // from another map. An identity alone cannot authorize deduplication.
+        ValidationNodes(self.nodes).put(id, canonical_bytes, node)?;
+        if !self.generated.insert(id) {
+            return Err(PhysicalModelError::InvalidMap(
+                "canonical builder repeated a generated node",
+            )
+            .into());
+        }
+        (self.emit)(id, canonical_bytes)
+    }
 }
 
 /// Each production-built node is hashed, then must exist under that identity
@@ -133,9 +240,12 @@ pub(super) fn prove_root<'a, I: PhysicalIdentity>(
 struct ValidationNodes<'a>(&'a BTreeMap<PhysicalMapNodeId, PhysicalMapNode>);
 
 impl CanonicalNodeSink for ValidationNodes<'_> {
+    type Error = PhysicalModelError;
+
     fn put(
         &mut self,
         id: PhysicalMapNodeId,
+        _canonical_bytes: &[u8],
         node: PhysicalMapNode,
     ) -> Result<(), PhysicalModelError> {
         match self.0.get(&id) {

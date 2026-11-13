@@ -3,8 +3,8 @@
 //! Reconstruction-count regressions live in `adoption_counter_tests`.
 
 use std::io::{self, Seek, SeekFrom};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use super::super::volume::{generation_region, remove_region_if_present};
 use super::super::{
@@ -29,7 +29,7 @@ fn advance(store: &mut RepresentationStore, offset: u64) {
     store.rebase_all_direct(&[object]).unwrap();
 }
 
-fn primed_volume() -> (
+pub(super) fn primed_volume() -> (
     tempfile::TempDir,
     Arc<dyn AstridVolume>,
     RepresentationStore,
@@ -47,7 +47,7 @@ fn primed_volume() -> (
     (directory, volume, store, limits)
 }
 
-fn next_generation_files(
+pub(super) fn next_generation_files(
     store: &RepresentationStore,
     volume: &Arc<dyn AstridVolume>,
 ) -> (DurableFile, DurableFile) {
@@ -272,6 +272,9 @@ pub(super) struct SyncFailOnceVolume {
     inner: Arc<dyn AstridVolume>,
     fail_next_sync: AtomicBool,
     arm_after_current: AtomicBool,
+    watched_metadata: Mutex<Option<VolumeRegion>>,
+    fail_metadata_write: AtomicBool,
+    private_written: AtomicU64,
 }
 
 impl SyncFailOnceVolume {
@@ -280,7 +283,20 @@ impl SyncFailOnceVolume {
             inner,
             fail_next_sync: AtomicBool::new(false),
             arm_after_current: AtomicBool::new(false),
+            watched_metadata: Mutex::new(None),
+            fail_metadata_write: AtomicBool::new(false),
+            private_written: AtomicU64::new(0),
         }
+    }
+
+    pub(super) fn watch_metadata(&self, region: VolumeRegion, fail: bool) {
+        *self.watched_metadata.lock().unwrap() = Some(region);
+        self.fail_metadata_write.store(fail, Ordering::SeqCst);
+        self.private_written.store(0, Ordering::SeqCst);
+    }
+
+    pub(super) fn private_written(&self) -> u64 {
+        self.private_written.load(Ordering::SeqCst)
     }
 
     pub(super) fn arm_next_sync_failure(&self) {
@@ -317,8 +333,17 @@ impl AstridVolume for SyncFailOnceVolume {
         payload_len: u64,
         payload: &mut dyn io::Read,
     ) -> io::Result<()> {
+        let watched = self.watched_metadata.lock().unwrap().as_ref() == Some(region);
+        if watched && self.fail_metadata_write.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::other("injected private metadata write failure"));
+        }
         self.inner
-            .write_region_from(region, offset, payload_len, payload)
+            .write_region_from(region, offset, payload_len, payload)?;
+        if watched {
+            self.private_written
+                .fetch_add(payload_len, Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     fn set_region_len(&self, region: &VolumeRegion, length: u64) -> io::Result<()> {

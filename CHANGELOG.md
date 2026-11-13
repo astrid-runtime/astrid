@@ -8,18 +8,6 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ## [Unreleased]
 
-### Fixed
-
-- Reuse canonical map validation results within synchronous representation
-  checkpoints while retaining fresh sealed-media and journal validation.
-- Retire captured projection children concurrently within CPU and file-descriptor
-  budgets, preserving identity and mount checks and serial root durability barriers.
-
-### Security
-
-- Update Quinn protocol and UDP dependencies for RUSTSEC-2026-0523,
-  RUSTSEC-2026-0524 and RUSTSEC-2026-0538.
-
 ## [2026.10.1] - 2026-10-15
 
 ### Fixed

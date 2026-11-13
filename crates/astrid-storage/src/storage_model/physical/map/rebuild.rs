@@ -21,9 +21,12 @@ struct NewOnlySink<'a> {
 }
 
 impl CanonicalNodeSink for NewOnlySink<'_> {
+    type Error = PhysicalModelError;
+
     fn put(
         &mut self,
         id: PhysicalMapNodeId,
+        _canonical_bytes: &[u8],
         node: PhysicalMapNode,
     ) -> Result<(), PhysicalModelError> {
         if let Some(existing) = self.fresh.get(&id).or_else(|| self.existing.get(&id)) {

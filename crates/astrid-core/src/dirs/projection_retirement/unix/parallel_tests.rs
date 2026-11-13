@@ -1,10 +1,78 @@
 //! Exercise the common no-follow deletion path on actual scoped workers.
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use super::*;
+
+#[derive(Default)]
+struct DispatchObservations {
+    inventories: Vec<(PathBuf, usize)>,
+    workers: Vec<(PathBuf, usize)>,
+}
+
+thread_local! {
+    static DISPATCHES: RefCell<DispatchObservations> = RefCell::default();
+}
+
+pub(super) fn observe_dispatch(path: &Path, width: usize) {
+    DISPATCHES.with_borrow_mut(|events| events.inventories.push((path.to_owned(), width)));
+}
+
+pub(super) fn observe_workers(path: &Path, count: usize) {
+    DISPATCHES.with_borrow_mut(|events| events.workers.push((path.to_owned(), count)));
+}
+
+#[test]
+fn singleton_spines_reach_the_real_wide_dispatch_without_nested_worker_pools() {
+    for spine in ["log/principals", "etc/profiles"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for child in ["a", "b"] {
+            let directory = root.join(spine).join(child);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("leaf"), b"captured").unwrap();
+        }
+        std::fs::write(root.join(CANONICAL_VOLUME), b"authority").unwrap();
+        let volume = File::open(root.join(CANONICAL_VOLUME)).unwrap();
+        let plan = PreparedProjectionRetirement::prepare(root).unwrap();
+        DISPATCHES.with_borrow_mut(|events| *events = DispatchObservations::default());
+        plan.retire(&volume).unwrap();
+        let events = DISPATCHES.with_borrow_mut(std::mem::take);
+        let frontier = root.join(spine);
+        let widths = events
+            .inventories
+            .iter()
+            .filter_map(|(path, width)| (path == &frontier).then_some(*width))
+            .collect::<Vec<_>>();
+        assert_eq!(widths.len(), 1, "singleton descent must reach {spine}");
+        assert_eq!(
+            events.inventories.len(),
+            2,
+            "only the singleton and its wide frontier dispatch"
+        );
+        if widths[0] > 1 {
+            assert_eq!(events.workers.len(), 1);
+            assert_eq!(events.workers[0].0, frontier);
+            assert!(
+                events.workers[0].1 > 0,
+                "derived capacity must start a scoped worker"
+            );
+        } else {
+            assert!(
+                events.workers.is_empty(),
+                "resource-limited wide inventories stay serial"
+            );
+        }
+        assert_eq!(std::fs::read_dir(root).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read(root.join(CANONICAL_VOLUME)).unwrap(),
+            b"authority"
+        );
+    }
+}
 
 #[derive(Default)]
 struct Rendezvous {
@@ -184,8 +252,8 @@ fn parallel_retirement_still_rejects_final_root_volume_and_namespace_changes() {
     for mutation in ["root", "volume", "late"] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
-        std::fs::create_dir_all(root.join("a")).unwrap();
-        two_leaves(&root.join("a"));
+        std::fs::create_dir_all(root.join("log/principals")).unwrap();
+        two_leaves(&root.join("log/principals"));
         std::fs::write(root.join(CANONICAL_VOLUME), b"authority").unwrap();
         let volume = File::open(root.join(CANONICAL_VOLUME)).unwrap();
         let expected = fstat(&volume).unwrap();

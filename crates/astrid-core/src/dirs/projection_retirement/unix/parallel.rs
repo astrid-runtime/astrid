@@ -1,4 +1,4 @@
-//! Scoped concurrency only among captured children of one top-level directory.
+//! Scoped concurrency at the first wide inventory below each top-level directory.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
@@ -15,9 +15,17 @@ pub(super) fn delete_children(
     root: &RootBoundary,
     inventory: &[PlannedEntry],
 ) -> io::Result<()> {
-    delete_with_width(directory, path, root, inventory, width(inventory), || {
-        |_: &Path| Ok(())
-    })
+    let width = width(inventory);
+    #[cfg(test)]
+    super::parallel_tests::observe_dispatch(path, width);
+    delete_with_width(
+        directory,
+        path,
+        root,
+        inventory,
+        width,
+        || |_: &Path| Ok(()),
+    )
 }
 
 fn width(inventory: &[PlannedEntry]) -> usize {
@@ -80,8 +88,21 @@ pub(super) fn delete_with_width<U: FnMut(&Path) -> io::Result<()>>(
             before_unlink: hooks(),
             sync_directory: |_: &File, _: &Path| Ok(()),
         };
+        // A singleton spine contains no sibling work to distribute. Preserve
+        // eligibility until its first wide inventory; jobs at that frontier
+        // disable eligibility, so workers never create nested pools. A wide
+        // inventory limited to one worker by host resources stays serial.
+        let parallel_children = inventory.len() == 1;
         for entry in inventory {
-            super::delete_entry(directory, path, root, entry, false, false, &mut hooks)?;
+            super::delete_entry(
+                directory,
+                path,
+                root,
+                entry,
+                false,
+                parallel_children,
+                &mut hooks,
+            )?;
         }
         return Ok(());
     }
@@ -127,6 +148,8 @@ pub(super) fn delete_with_width<U: FnMut(&Path) -> io::Result<()>>(
                 Err(_) => break,
             }
         }
+        #[cfg(test)]
+        super::parallel_tests::observe_workers(path, workers.len());
         work();
         for worker in workers {
             if worker.join().is_err() {

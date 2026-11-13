@@ -63,6 +63,7 @@ struct CanonicalTip<'a> {
     reachable: BTreeSet<PhysicalMapNodeId>,
 }
 
+#[cfg(test)]
 impl<'a> LiveTipRefs<'a> {
     fn prove(&self) -> Result<CanonicalTip<'a>, DurableError> {
         self.ensure_live_authority_binds_sealed_tip()?;
@@ -102,7 +103,7 @@ impl RepresentationStore {
             active: self.active,
             direct_profile: self.direct_profile,
         };
-        tip.emit(metadata, journal, &mut self.journal, generation, None)
+        tip.emit(metadata, journal, &mut self.journal, generation)
     }
 
     pub(super) fn prepare_sealed_adoption(
@@ -124,14 +125,8 @@ impl RepresentationStore {
             active: self.active,
             direct_profile: self.direct_profile,
         };
-        let canonical = tip.prove()?;
-        let emit = tip.emit(
-            metadata,
-            journal,
-            &mut self.journal,
-            generation,
-            Some(&canonical),
-        )?;
+        let (canonical, emit) =
+            tip.emit_proven(metadata, journal, &mut self.journal, generation)?;
         let current = emit.current;
         let proof = tip.verify(metadata, journal, &emit, limits, canonical)?;
         Ok((current, proof))
@@ -192,6 +187,72 @@ impl RepresentationStore {
     }
 }
 
+impl<'a> LiveTipRefs<'a> {
+    fn emit_proven(
+        &self,
+        metadata: &mut DurableFile,
+        journal: &mut DurableFile,
+        prior_journal: &mut DurableFile,
+        generation: u64,
+    ) -> Result<(CanonicalTip<'a>, SealedGenerationEmit), DurableError> {
+        self.ensure_live_authority_binds_sealed_tip()?;
+        let mut stream = FramedAppendStream::begin(metadata, METADATA_MAGIC)?;
+        let mut emitted = BTreeSet::new();
+        let mut append = |id: PhysicalMapNodeId, bytes: &[u8]| {
+            // prove_root_into checks this map's exact live body before this
+            // cross-map deduplication. Bytes live only through this callback.
+            if emitted.insert(id) {
+                let frame = MetadataFrame {
+                    kind: MetadataKind::MapNode,
+                    identity: *id.as_bytes(),
+                    value: bytes,
+                };
+                stream.append_payload(&frame.encode()?)?;
+            }
+            Ok::<_, DurableError>(())
+        };
+        let roots = [
+            self.profiles.prove_root_into(
+                &Blake3PhysicalIdentity,
+                PhysicalMapDomain::Profile,
+                &mut append,
+            )?,
+            self.representations.prove_root_into(
+                &Blake3PhysicalIdentity,
+                PhysicalMapDomain::Representation,
+                &mut append,
+            )?,
+            self.placement_entries.prove_root_into(
+                &Blake3PhysicalIdentity,
+                PhysicalMapDomain::Placement,
+                &mut append,
+            )?,
+        ];
+        let reachable = roots
+            .iter()
+            .flat_map(|proof| proof.visited().iter().copied())
+            .collect();
+        if emitted != reachable {
+            return Err(DurableError::InvalidRepresentationState(
+                "emitted nodes disagree with canonical proof union",
+            ));
+        }
+        let canonical = CanonicalTip { roots, reachable };
+        // Incomplete private frames confer no authority. Do not finish/sync the
+        // stream, append authority or journal frames, or publish CURRENT until
+        // every root and independently walked set has passed its full proof.
+        self.finish_metadata(stream)?;
+        let emit = self.seal_generation(
+            metadata,
+            journal,
+            prior_journal,
+            generation,
+            BTreeSet::new(),
+        )?;
+        Ok((canonical, emit))
+    }
+}
+
 impl LiveTipRefs<'_> {
     fn emit(
         &self,
@@ -199,35 +260,13 @@ impl LiveTipRefs<'_> {
         journal: &mut DurableFile,
         prior_journal: &mut DurableFile,
         generation: u64,
-        tip: Option<&CanonicalTip<'_>>,
     ) -> Result<SealedGenerationEmit, DurableError> {
         let mut appended = BTreeSet::new();
         let mut complete = BTreeSet::new();
         let mut durable = BTreeSet::new();
         {
             let mut stream = FramedAppendStream::begin(metadata, METADATA_MAGIC)?;
-            for (slot, map) in [self.profiles, self.representations, self.placement_entries]
-                .into_iter()
-                .enumerate()
-            {
-                if let Some(tip) = tip {
-                    for id in tip.roots[slot].visited() {
-                        let node =
-                            map.nodes()
-                                .get(id)
-                                .ok_or(DurableError::InvalidRepresentationState(
-                                    "missing canonical map node",
-                                ))?;
-                        if !tip.roots[..slot]
-                            .iter()
-                            .any(|root| root.visited().contains(id))
-                        {
-                            let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?;
-                            stream.append_payload(&frame.encode()?)?;
-                        }
-                    }
-                    continue;
-                }
+            for map in [self.profiles, self.representations, self.placement_entries] {
                 visit_new_reachable_map_nodes(
                     map,
                     &mut durable,
@@ -239,15 +278,33 @@ impl LiveTipRefs<'_> {
                     },
                 )?;
             }
-            for frame in [
-                MetadataFrame::catalogue(&Blake3PhysicalIdentity, self.catalogue),
-                MetadataFrame::placement(&Blake3PhysicalIdentity, self.placements),
-                MetadataFrame::state(&Blake3PhysicalIdentity, self.state),
-            ] {
-                stream.append_payload(&frame.encode()?)?;
-            }
-            stream.finish()?;
+            self.finish_metadata(stream)?;
         }
+        self.seal_generation(metadata, journal, prior_journal, generation, appended)
+    }
+
+    fn finish_metadata(
+        &self,
+        mut stream: FramedAppendStream<'_, DurableFile>,
+    ) -> Result<(), DurableError> {
+        for frame in [
+            MetadataFrame::catalogue(&Blake3PhysicalIdentity, self.catalogue),
+            MetadataFrame::placement(&Blake3PhysicalIdentity, self.placements),
+            MetadataFrame::state(&Blake3PhysicalIdentity, self.state),
+        ] {
+            stream.append_payload(&frame.encode()?)?;
+        }
+        stream.finish()
+    }
+
+    fn seal_generation(
+        &self,
+        metadata: &mut DurableFile,
+        journal: &mut DurableFile,
+        prior_journal: &mut DurableFile,
+        generation: u64,
+        appended: BTreeSet<PhysicalMapNodeId>,
+    ) -> Result<SealedGenerationEmit, DurableError> {
         metadata
             .sync_data()
             .map_err(|source| io_error("flush checkpoint metadata", source))?;

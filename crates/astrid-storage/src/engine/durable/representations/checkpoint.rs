@@ -19,6 +19,8 @@ mod adoption_tests;
 mod maintenance_tests;
 mod native;
 #[cfg(test)]
+mod streaming_tests;
+#[cfg(test)]
 mod tests;
 
 impl RepresentationStore {

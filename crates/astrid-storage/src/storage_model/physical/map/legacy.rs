@@ -30,11 +30,11 @@ pub(super) fn build<I: PhysicalIdentity, V: AsRef<[u8]>, N: CanonicalNodeSink>(
     domain: PhysicalMapDomain,
     entries: &[(PhysicalMapKey, V)],
     nodes: &mut N,
-) -> Result<PhysicalMapNodeId, PhysicalModelError> {
+) -> Result<PhysicalMapNodeId, N::Error> {
     if entries.len() == 1 {
         let node = PhysicalMapNode::leaf(domain, entries[0].0, entries[0].1.as_ref().to_vec());
-        let id = node.identify(identity)?;
-        nodes.put(id, node)?;
+        let (bytes, id) = node.encode_and_identify(identity)?;
+        nodes.put(id, &bytes, node)?;
         return Ok(id);
     }
     let first = entries
@@ -49,11 +49,11 @@ pub(super) fn build<I: PhysicalIdentity, V: AsRef<[u8]>, N: CanonicalNodeSink>(
         .search_key();
     let prefix_bits = common_prefix_bits(&first, &last)?;
     if prefix_bits >= SEARCH_KEY_BITS {
-        return Err(PhysicalModelError::InvalidMap("duplicate branch key"));
+        return Err(PhysicalModelError::InvalidMap("duplicate branch key").into());
     }
     let split = entries.partition_point(|(key, _)| !bit(&key.search_key(), prefix_bits));
     if split == 0 || split == entries.len() {
-        return Err(PhysicalModelError::InvalidMap("canonical branch is unary"));
+        return Err(PhysicalModelError::InvalidMap("canonical branch is unary").into());
     }
     let zero = build(identity, domain, &entries[..split], nodes)?;
     let one = build(identity, domain, &entries[split..], nodes)?;
@@ -65,8 +65,8 @@ pub(super) fn build<I: PhysicalIdentity, V: AsRef<[u8]>, N: CanonicalNodeSink>(
         one,
         u64::try_from(entries.len()).map_err(|_| PhysicalModelError::LengthOverflow)?,
     )?;
-    let id = node.identify(identity)?;
-    nodes.put(id, node)?;
+    let (bytes, id) = node.encode_and_identify(identity)?;
+    nodes.put(id, &bytes, node)?;
     Ok(id)
 }
 
@@ -249,8 +249,8 @@ impl<I: PhysicalIdentity> Insertion<'_, I> {
         &mut self,
         node: PhysicalMapNode,
     ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
-        let id = node.identify(self.identity)?;
-        self.nodes.put(id, node)?;
+        let (bytes, id) = node.encode_and_identify(self.identity)?;
+        self.nodes.put(id, &bytes, node)?;
         Ok(id)
     }
 }
