@@ -14,6 +14,8 @@ use super::CANONICAL_VOLUME;
 
 #[cfg(test)]
 mod barrier_tests;
+#[cfg(all(test, not(target_os = "linux")))]
+mod leaf_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod mount_tests;
 
@@ -305,12 +307,23 @@ fn delete_inventory(
     for planned in inventory {
         let name = &planned.name;
         let child_path = path.join(name);
-        let child = open_entry(directory, name, &child_path, root)?;
-        require_identity(&planned.identity, child.identity(), &child_path)?;
+        let canonical = is_root && name == OsStr::new(CANONICAL_VOLUME);
+        // Non-Linux regular leaves need no content handle. Their only action is
+        // unlink, so defer observation to the fresh no-follow check below. Keep
+        // directories and the retained volume checked before using their handles;
+        // Linux also retains O_PATH custody and mount confirmation for leaves.
+        let child = if defer_leaf_check(&planned.identity, canonical) {
+            None
+        } else {
+            let child = open_entry(directory, name, &child_path, root)?;
+            require_identity(&planned.identity, child.identity(), &child_path)?;
+            Some(child)
+        };
         if is_root && name == OsStr::new(CANONICAL_VOLUME) {
             continue;
         }
-        if let Some(child_directory) = child.directory() {
+        let child_directory = child.as_ref().and_then(Entry::directory);
+        if let Some(child_directory) = child_directory {
             delete_inventory(
                 child_directory,
                 &child_path,
@@ -323,11 +336,10 @@ fn delete_inventory(
         (hooks.before_unlink)(&child_path)?;
         #[cfg(feature = "test-support")]
         super::replay::before_unlink(&child_path)?;
-        // Do not unlink a different object that replaced the opened entry
-        // while its contents were being walked. unlinkat never follows a
+        // Recheck the captured identity after hooks and directory traversal.
+        // Do not unlink a replacement. unlinkat never follows a
         // last-component redirect, even if replacement wins after this check.
-        let current =
-            fstatat(directory, name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW).map_err(os_error)?;
+        let current = stat_entry(directory, name, &child_path)?;
         require_identity(&planned.identity, &current, &child_path)?;
         check_boundary(&child_path, root, &current)?;
         #[cfg(target_os = "linux")]
@@ -337,13 +349,13 @@ fn delete_inventory(
             require_identity(&planned.identity, confirmation.identity(), &child_path)?;
             confirmation
         };
-        let flags = if child.directory().is_some() {
+        let flags = if child_directory.is_some() {
             UnlinkatFlags::RemoveDir
         } else {
             UnlinkatFlags::NoRemoveDir
         };
         unlinkat(directory, name.as_os_str(), flags).map_err(os_error)?;
-        if is_root && child.directory().is_some() {
+        if is_root && child_directory.is_some() {
             // Preserve the existing root barrier after each top-level directory.
             (hooks.sync_directory)(directory, path)?;
         }
@@ -351,8 +363,22 @@ fn delete_inventory(
     Ok(())
 }
 
+fn defer_leaf_check(identity: &FileStat, canonical: bool) -> bool {
+    cfg!(not(target_os = "linux"))
+        && !canonical
+        && SFlag::from_bits_truncate(identity.st_mode) & SFlag::S_IFMT == SFlag::S_IFREG
+}
+
+fn stat_entry(parent: &File, name: &OsStr, path: &Path) -> io::Result<FileStat> {
+    #[cfg(all(test, not(target_os = "linux")))]
+    leaf_tests::observe(path);
+    #[cfg(not(all(test, not(target_os = "linux"))))]
+    let _ = path;
+    fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW).map_err(os_error)
+}
+
 fn open_entry(parent: &File, name: &OsStr, path: &Path, root: &RootBoundary) -> io::Result<Entry> {
-    let before = fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW).map_err(os_error)?;
+    let before = stat_entry(parent, name, path)?;
     check_boundary(path, root, &before)?;
     match SFlag::from_bits_truncate(before.st_mode) & SFlag::S_IFMT {
         SFlag::S_IFDIR => {
