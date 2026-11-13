@@ -293,11 +293,14 @@ async fn keyless_sentinel_cleanup_requires_its_same_root_retiring_inventory() {
         InvalidSentinelIntent::ForeignRoot,
         InvalidSentinelIntent::MissingSentinel,
     ] {
-        reject_sentinel_cleanup(invalid).await;
+        let scoped = astrid_core::platform_fs::StagingScope::new().temporary_basename();
+        reject_sentinel_cleanup(invalid, &scoped).await;
+        #[cfg(unix)]
+        reject_sentinel_cleanup(invalid, ".astrid-private-00000000000040008000000000000001").await;
     }
 }
 
-async fn reject_sentinel_cleanup(invalid: InvalidSentinelIntent) {
+async fn reject_sentinel_cleanup(invalid: InvalidSentinelIntent, staging_name: &str) {
     use runtime_tree::ReceiptPhase;
 
     let root = crate::test_directory::temporary().unwrap();
@@ -337,15 +340,23 @@ async fn reject_sentinel_cleanup(invalid: InvalidSentinelIntent) {
     }
     let etc = home.root().join("etc");
     astrid_core::platform_fs::ensure_private_directory(&etc).unwrap();
-    let staging = etc.join(".astrid-private-00000000000040008000000000000001");
+    // Structural recognition grants no cleanup authority. Scoped names work on
+    // every target; the legacy spelling remains Unix-only and is also tested.
+    assert!(
+        astrid_core::platform_fs::is_structural_private_staging_name(std::ffi::OsStr::new(
+            staging_name
+        ))
+    );
+    let staging = etc.join(staging_name);
     runtime_tree::write_projection_file(
         home.root(),
-        "etc/.astrid-private-00000000000040008000000000000001",
+        &format!("etc/{staging_name}"),
         b"unadmitted partial sentinel",
     )
     .unwrap();
     drop(store);
-    home.ensure().unwrap();
+    home.ensure()
+        .unwrap_or_else(|error| panic!("structural staging setup for {invalid:?}: {error}"));
     assert!(
         open_runtime_principal_store(&home, quota).await.is_err(),
         "admitted {invalid:?}"
