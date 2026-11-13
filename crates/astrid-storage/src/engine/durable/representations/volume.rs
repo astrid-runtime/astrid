@@ -27,6 +27,22 @@ impl RepresentationStore {
         volume: &Arc<dyn AstridVolume>,
         limits: RecoveryLimits,
     ) -> Result<Option<Self>, DurableError> {
+        Ok(Self::open_volume_inner::<false>(volume, limits)?.map(|(store, _)| store))
+    }
+
+    pub(in crate::engine::durable) fn open_volume_for_recovery(
+        volume: &Arc<dyn AstridVolume>,
+        limits: RecoveryLimits,
+    ) -> Result<Option<(Self, super::index_validation::GenerationZeroPlacements)>, DurableError>
+    {
+        Self::open_volume_inner::<true>(volume, limits)
+    }
+
+    fn open_volume_inner<const COLLECT_PLACEMENTS: bool>(
+        volume: &Arc<dyn AstridVolume>,
+        limits: RecoveryLimits,
+    ) -> Result<Option<(Self, super::index_validation::GenerationZeroPlacements)>, DurableError>
+    {
         if !region_exists(volume, CURRENT_REGION)? {
             return Ok(None);
         }
@@ -45,7 +61,7 @@ impl RepresentationStore {
         )?;
         let index = recover_metadata(&mut metadata, limits)?;
         let (active, state) = recover_journal(&mut journal, current, &index, limits)?;
-        let recovered = Self::from_recovered(
+        let recovered = Self::from_recovered::<COLLECT_PLACEMENTS>(
             metadata,
             journal,
             current.journal_generation,

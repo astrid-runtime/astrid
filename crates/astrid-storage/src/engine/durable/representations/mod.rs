@@ -143,6 +143,20 @@ impl RepresentationStore {
         store_root: &cap_std::fs::Dir,
         limits: RecoveryLimits,
     ) -> Result<Option<Self>, DurableError> {
+        Ok(Self::open_inner::<false>(store_root, limits)?.map(|(store, _)| store))
+    }
+
+    pub(super) fn open_for_recovery(
+        store_root: &cap_std::fs::Dir,
+        limits: RecoveryLimits,
+    ) -> Result<Option<(Self, index_validation::GenerationZeroPlacements)>, DurableError> {
+        Self::open_inner::<true>(store_root, limits)
+    }
+
+    fn open_inner<const COLLECT_PLACEMENTS: bool>(
+        store_root: &cap_std::fs::Dir,
+        limits: RecoveryLimits,
+    ) -> Result<Option<(Self, index_validation::GenerationZeroPlacements)>, DurableError> {
         let root_directory = match contiguous::open_representation_root(store_root) {
             Ok(root) => root,
             Err(DurableError::Io { source, .. })
@@ -175,7 +189,7 @@ impl RepresentationStore {
         let mut journal = DurableFile::native(open_cap_file(&generation, Path::new(JOURNAL_PATH))?);
         let index = recover_metadata(&mut metadata, limits)?;
         let (active, state) = recover_journal(&mut journal, current, &index, limits)?;
-        let recovered = Self::from_recovered(
+        let recovered = Self::from_recovered::<COLLECT_PLACEMENTS>(
             metadata,
             journal,
             current.journal_generation,
@@ -785,7 +799,7 @@ impl RepresentationStore {
         Ok(direct)
     }
 
-    fn from_recovered(
+    fn from_recovered<const COLLECT_PLACEMENTS: bool>(
         metadata: DurableFile,
         journal: DurableFile,
         journal_generation: u64,
@@ -793,7 +807,7 @@ impl RepresentationStore {
         state: RepresentationState,
         mut index: MetadataIndex,
         limits: RecoveryLimits,
-    ) -> Result<Self, DurableError> {
+    ) -> Result<(Self, index_validation::GenerationZeroPlacements), DurableError> {
         let catalogue = RepresentationCatalogueRoot::decode(
             index.value(MetadataKind::Catalogue, state.catalogue().as_bytes())?,
         )?;
@@ -843,31 +857,42 @@ impl RepresentationStore {
         let residency =
             residency::MapResidency::new(&profiles, &representations, &placement_entries);
         let direct_profile = validate_profiles(&profiles)?;
-        let (reverse, extent_count) =
-            validate_representations(&profiles, &representations, &placement_entries)?;
+        let recovery::ValidatedRepresentations {
+            reverse,
+            extent_count,
+            generation_zero,
+        } = validate_representations::<COLLECT_PLACEMENTS>(
+            &profiles,
+            &representations,
+            &placement_entries,
+            direct_profile,
+        )?;
         if extent_count != placements.replica_extent_count() {
             return Err(DurableError::InvalidRepresentationState(
                 "placement extent count disagrees with map entries",
             ));
         }
-        Ok(Self {
-            metadata,
-            journal,
-            journal_generation,
-            active,
-            state,
-            catalogue,
-            placements,
-            residency,
-            profiles,
-            representations,
-            placement_entries,
-            persisted_map_nodes: BTreeSet::new(),
-            map_frame_count,
-            complete_map_subtrees,
-            direct_profile,
-            reverse,
-        })
+        Ok((
+            Self {
+                metadata,
+                journal,
+                journal_generation,
+                active,
+                state,
+                catalogue,
+                placements,
+                residency,
+                profiles,
+                representations,
+                placement_entries,
+                persisted_map_nodes: BTreeSet::new(),
+                map_frame_count,
+                complete_map_subtrees,
+                direct_profile,
+                reverse,
+            },
+            generation_zero,
+        ))
     }
 
     /// Resident `MapNode` count, including transient unreachable nodes.

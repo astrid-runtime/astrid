@@ -48,8 +48,8 @@ fn assert_single_placement_snapshot(hosted: bool) {
     for _ in 0..2 {
         let (reopened, extractions) = representations::count_extractions_during(mount);
         assert_eq!(
-            extractions, 1,
-            "one placement walk must serve both recovery checks"
+            extractions, 0,
+            "mount must consume validated placements without rereading physical maps"
         );
         assert_eq!(reopened.root(&"alice".to_owned()).unwrap(), Some(root));
         assert!(reopened.object(commit).unwrap().is_some());

@@ -49,10 +49,12 @@ where
     C: PrincipalCodec<P>,
 {
     recover_interrupted_compaction(store_root, principal_codec, identity, limits)?;
-    let mut representations =
-        super::representations::RepresentationStore::open(store_root, limits)?;
-    let generation_zero =
-        super::representations::GenerationZeroIndex::capture(representations.as_ref())?;
+    let recovered =
+        super::representations::RepresentationStore::open_for_recovery(store_root, limits)?;
+    let (mut representations, generation_zero) = match recovered {
+        Some((store, placements)) => (Some(store), placements.into_index()?),
+        None => (None, super::representations::GenerationZeroIndex::default()),
+    };
     let protected_arena_len = generation_zero.protected_len();
     let mut arena = open_rw_capability(store_root, Path::new(ARENA_FILE), true)?;
     let mut roots = open_rw_capability(store_root, Path::new(ROOT_FILE), true)?;
@@ -162,10 +164,12 @@ where
     volume
         .sync()
         .map_err(|source| io_error("flush Astrid volume namespace", source))?;
-    let mut representations =
-        super::representations::RepresentationStore::open_volume(volume, limits)?;
-    let generation_zero =
-        super::representations::GenerationZeroIndex::capture(representations.as_ref())?;
+    let recovered =
+        super::representations::RepresentationStore::open_volume_for_recovery(volume, limits)?;
+    let (mut representations, generation_zero) = match recovered {
+        Some((store, placements)) => (Some(store), placements.into_index()?),
+        None => (None, super::representations::GenerationZeroIndex::default()),
+    };
     let protected_arena_len = generation_zero.protected_len();
     let (index, arena_tail) = recover_volume_index(
         volume,

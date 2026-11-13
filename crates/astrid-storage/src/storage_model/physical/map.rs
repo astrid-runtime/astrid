@@ -24,6 +24,8 @@ mod validation;
 #[cfg(test)]
 mod decode_tests;
 #[cfg(test)]
+mod lookup_tests;
+#[cfg(test)]
 mod rebuild_tests;
 
 const LEGACY_MAP_NODE_VERSION: u16 = 1;
@@ -581,7 +583,7 @@ impl CanonicalPhysicalMap {
     #[must_use]
     pub fn get(&self, key: PhysicalMapKey) -> Option<&[u8]> {
         let mut current = self.root?;
-        let search = key.search_key();
+        let mut search = None;
         loop {
             match self.nodes.get(&current)? {
                 PhysicalMapNode::Leaf {
@@ -594,10 +596,11 @@ impl CanonicalPhysicalMap {
                     one,
                     ..
                 } => {
-                    if !legacy::matches_prefix(&search, *prefix_bits, prefix) {
+                    let search = search.get_or_insert_with(|| key.search_key());
+                    if !legacy::matches_prefix(search, *prefix_bits, prefix) {
                         return None;
                     }
-                    current = if legacy::bit(&search, *prefix_bits) {
+                    current = if legacy::bit(search, *prefix_bits) {
                         *one
                     } else {
                         *zero

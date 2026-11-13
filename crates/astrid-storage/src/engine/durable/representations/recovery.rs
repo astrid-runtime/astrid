@@ -367,11 +367,18 @@ pub(super) fn validate_profiles(
     ))
 }
 
-pub(super) fn validate_representations(
+pub(super) struct ValidatedRepresentations {
+    pub(super) reverse: BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
+    pub(super) extent_count: u64,
+    pub(super) generation_zero: super::index_validation::GenerationZeroPlacements,
+}
+
+pub(super) fn validate_representations<const COLLECT_PLACEMENTS: bool>(
     profiles: &CanonicalPhysicalMap,
     representations: &CanonicalPhysicalMap,
     placements: &CanonicalPhysicalMap,
-) -> Result<(BTreeMap<ObjectId, Vec<RepresentationRecordId>>, u64), DurableError> {
+    direct_profile: RepresentationProfileId,
+) -> Result<ValidatedRepresentations, DurableError> {
     let mut placement_by_blob = BTreeMap::new();
     let mut extent_count = 0_u64;
     for (key, bytes) in active_entries(placements)? {
@@ -398,6 +405,7 @@ pub(super) fn validate_representations(
         placement_by_blob.insert(entry.blob(), entry);
     }
     let mut reverse = BTreeMap::<ObjectId, Vec<RepresentationRecordId>>::new();
+    let mut generation_zero = super::index_validation::GenerationZeroPlacements::default();
     for (key, bytes) in active_entries(representations)? {
         let record = RepresentationRecord::decode(bytes)?;
         let id = record.identify(&Blake3PhysicalIdentity)?;
@@ -433,9 +441,16 @@ pub(super) fn validate_representations(
                 "direct representation placement does not match its record",
             ));
         }
+        if COLLECT_PLACEMENTS {
+            generation_zero.observe(object, record.profile() == direct_profile, placement);
+        }
         reverse.entry(object).or_default().push(id);
     }
-    Ok((reverse, extent_count))
+    Ok(ValidatedRepresentations {
+        reverse,
+        extent_count,
+        generation_zero,
+    })
 }
 
 /// Bootstrap startup guard: reject Exact coverage of excluded objects under any recipe.
@@ -597,3 +612,6 @@ fn first_frame_end<F: DurableIo>(file: &mut F) -> Result<usize, DurableError> {
         .checked_add(payload)
         .ok_or(DurableError::EncodingOverflow)
 }
+
+#[cfg(test)]
+mod generation_zero_tests;
