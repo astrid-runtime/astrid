@@ -18,9 +18,8 @@ mod barrier_tests;
 mod leaf_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod mount_tests;
-mod parallel;
 #[cfg(test)]
-mod parallel_tests;
+mod prepared_tests;
 
 struct RootBoundary {
     identity: FileStat,
@@ -90,9 +89,8 @@ impl PreparedProjectionRetirement {
     /// After any error the caller must retain its durable retirement receipt.
     pub fn retire(self, expected_volume: &File) -> io::Result<()> {
         let expected = fstat(expected_volume).map_err(os_error)?;
-        self.retire_impl(
+        self.retire_with_hooks(
             Some(&expected),
-            true,
             &mut RetirementHooks {
                 before_unlink: |_: &Path| Ok(()),
                 sync_directory: |directory: &File, _: &Path| directory.sync_all(),
@@ -162,18 +160,6 @@ impl PreparedProjectionRetirement {
             impl FnMut(&File, &Path) -> io::Result<()>,
         >,
     ) -> io::Result<()> {
-        self.retire_impl(expected, false, hooks)
-    }
-
-    fn retire_impl(
-        self,
-        expected: Option<&FileStat>,
-        parallel_children: bool,
-        hooks: &mut RetirementHooks<
-            impl FnMut(&Path) -> io::Result<()>,
-            impl FnMut(&File, &Path) -> io::Result<()>,
-        >,
-    ) -> io::Result<()> {
         self.require_root()?;
         self.require_volume(expected)?;
         delete_inventory(
@@ -182,7 +168,6 @@ impl PreparedProjectionRetirement {
             &self.boundary,
             &self.inventory,
             true,
-            parallel_children,
             hooks,
         )?;
         self.require_survivors(expected)?;
@@ -307,7 +292,6 @@ fn delete_inventory(
     root: &RootBoundary,
     inventory: &[PlannedEntry],
     is_root: bool,
-    parallel_children: bool,
     hooks: &mut RetirementHooks<
         impl FnMut(&Path) -> io::Result<()>,
         impl FnMut(&File, &Path) -> io::Result<()>,
@@ -315,15 +299,7 @@ fn delete_inventory(
 ) -> io::Result<()> {
     require_inventory(directory, path, inventory)?;
     for planned in inventory {
-        delete_entry(
-            directory,
-            path,
-            root,
-            planned,
-            is_root,
-            parallel_children,
-            hooks,
-        )?;
+        delete_entry(directory, path, root, planned, is_root, hooks)?;
     }
     Ok(())
 }
@@ -347,7 +323,6 @@ fn delete_entry(
     root: &RootBoundary,
     planned: &PlannedEntry,
     is_root: bool,
-    parallel_children: bool,
     hooks: &mut RetirementHooks<
         impl FnMut(&Path) -> io::Result<()>,
         impl FnMut(&File, &Path) -> io::Result<()>,
@@ -372,19 +347,14 @@ fn delete_entry(
     }
     let child_directory = child.as_ref().and_then(Entry::directory);
     if let Some(child_directory) = child_directory {
-        if parallel_children {
-            parallel::delete_children(child_directory, &child_path, root, &planned.children)?;
-        } else {
-            delete_inventory(
-                child_directory,
-                &child_path,
-                root,
-                &planned.children,
-                false,
-                false,
-                hooks,
-            )?;
-        }
+        delete_inventory(
+            child_directory,
+            &child_path,
+            root,
+            &planned.children,
+            false,
+            hooks,
+        )?;
     }
     (hooks.before_unlink)(&child_path)?;
     #[cfg(feature = "test-support")]
