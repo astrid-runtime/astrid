@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use astrid_core::platform_fs::PrivateProjectionInspection;
+use astrid_core::dirs::PreparedProjectionRetirement;
 
 use super::super::{
     AstridHome, RuntimePrincipalStore, StateOwner, active, content_name_from_relative,
@@ -10,11 +10,28 @@ use super::super::{
 };
 use crate::StorageResult;
 
+/// Exclusions affect content admission, not Core's complete namespace checks.
+pub(super) fn should_check(relative: &Path) -> bool {
+    let Some(name) = relative.to_str() else {
+        // Invalid UTF-8 must reach the fallible source-name validator; never
+        // grant an exclusion by lossy conversion.
+        return true;
+    };
+    #[cfg(windows)]
+    {
+        !super::super::is_excluded(&super::super::normalize_relative_path(name))
+    }
+    #[cfg(not(windows))]
+    {
+        !super::super::is_excluded(name)
+    }
+}
+
 pub(super) fn verify_file(
     home: &AstridHome,
     store: &RuntimePrincipalStore,
     receipt: &active::ActiveProjectionReceipt,
-    inspection: &PrivateProjectionInspection,
+    source: &mut std::fs::File,
     relative: &Path,
 ) -> StorageResult<()> {
     let name = content_name_from_relative(&home.root().join(relative), home.root())?;
@@ -39,8 +56,7 @@ pub(super) fn verify_file(
         ));
     }
     let mut reader = AuthenticatedContentReader::new(&handle);
-    if !inspection
-        .matches_private_file_from(relative, length, &mut reader)
+    if !PreparedProjectionRetirement::matches_file_from(source, length, &mut reader)
         .map_err(|error| tree_error(relative, format!("compare retirement source: {error}")))?
     {
         return Err(tree_error(
@@ -49,4 +65,25 @@ pub(super) fn verify_file(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_read_selection_keeps_exclusions_and_checks_unknown_sources() {
+        assert!(!should_check(Path::new("run/daemon.pid")));
+        assert!(!should_check(Path::new("astrid-daemon")));
+        assert!(should_check(Path::new("config.toml")));
+        #[cfg(windows)]
+        assert!(!should_check(Path::new("run\\daemon.pid")));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let invalid = std::ffi::OsStr::from_bytes(b"run/\xff");
+            assert!(should_check(Path::new(invalid)));
+            assert!(should_check(Path::new("run\\daemon.pid")));
+        }
+    }
 }

@@ -162,33 +162,30 @@ fn prepare<'a>(
         let volume = store.retirement_volume_file(home)?;
         before_prepare()?;
         let started = std::time::Instant::now();
-        let prepared = astrid_core::dirs::PreparedProjectionRetirement::prepare(home.root())
-            .map_err(|error| tree_error(home.root(), format!("prepare retirement: {error}")))?;
-        tracing::debug!(elapsed = ?started.elapsed(), "captured projection retirement inventory");
-        let started = std::time::Instant::now();
-        let inspection = if matches!(inventory, Inventory::Current(Some(_))) {
-            Some(
-                astrid_core::platform_fs::PrivateProjectionInspection::try_open(home.root())
-                    .map_err(|error| {
-                        tree_error(home.root(), format!("inspect retirement sources: {error}"))
-                    })?,
-            )
-        } else {
-            None
-        };
-        for relative in prepared.regular_files() {
-            inventory.require_file(home, relative)?;
-            if let (Inventory::Current(Some(receipt)), Some(inspection)) = (inventory, &inspection)
-            {
-                source::verify_file(home, store, receipt, inspection, relative)?;
+        let prepared = match inventory {
+            Inventory::Current(Some(receipt)) => {
+                astrid_core::dirs::PreparedProjectionRetirement::prepare_checked(
+                    home.root(),
+                    source::should_check,
+                    |relative, source| {
+                        inventory
+                            .require_file(home, relative)
+                            .and_then(|()| {
+                                source::verify_file(home, store, receipt, source, relative)
+                            })
+                            .map_err(std::io::Error::other)
+                    },
+                )
+            },
+            _ => astrid_core::dirs::PreparedProjectionRetirement::prepare(home.root()),
+        }
+        .map_err(|error| tree_error(home.root(), format!("prepare retirement: {error}")))?;
+        if !matches!(inventory, Inventory::Current(Some(_))) {
+            for relative in prepared.regular_files() {
+                inventory.require_file(home, relative)?;
             }
         }
-        if let Some(inspection) = inspection {
-            inspection.confirm_absolute_root().map_err(|error| {
-                tree_error(home.root(), format!("confirm retirement sources: {error}"))
-            })?;
-        }
-        tracing::debug!(elapsed = ?started.elapsed(), "validated projection retirement inventory and bytes");
+        tracing::debug!(elapsed = ?started.elapsed(), "captured and validated projection retirement sources");
         Ok(PreparedRetirement {
             home,
             store,
@@ -233,6 +230,7 @@ impl PreparedRetirement<'_> {
     }
 }
 
+#[cfg(any(unix, windows))]
 mod source;
 
 #[cfg(all(test, unix))]

@@ -17,6 +17,8 @@ mod mount_boundary;
 pub mod name_semantics;
 mod private_projection;
 pub use executable::replace_executable_set;
+#[cfg(any(unix, windows))]
+pub(crate) use private_projection::compare::matches_file_from as matches_projection_file_from;
 #[cfg(not(target_family = "wasm"))]
 mod private_scratch;
 mod staging_scope;

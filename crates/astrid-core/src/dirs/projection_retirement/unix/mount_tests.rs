@@ -63,3 +63,32 @@ fn bind_mount_added_after_open_is_rejected_before_unlink() {
         mounted.as_mut().unwrap().unmount().unwrap();
     }
 }
+
+#[test]
+#[ignore = "requires CAP_SYS_ADMIN in a caller-owned private mount namespace; run by native Linux CI"]
+fn bind_mount_added_during_checked_source_read_preserves_all_entries() {
+    require_private_namespace();
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("z-mounted");
+    std::fs::write(&target, b"captured").unwrap();
+    std::fs::write(temp.path().join("a"), b"untouched").unwrap();
+    let mut mounted = None;
+    let result = super::PreparedProjectionRetirement::prepare_checked(
+        temp.path(),
+        |relative| relative == std::path::Path::new("z-mounted"),
+        |_, _| {
+            mounted = Some(BindMount::attach(&target)?);
+            Ok(())
+        },
+    );
+    let error = result
+        .err()
+        .expect("fresh mount check must reject the new bind mount");
+    assert!(
+        error.to_string().contains("Linux mount boundary"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(temp.path().join("a")).unwrap(), b"untouched");
+    assert_eq!(std::fs::read(&target).unwrap(), b"captured");
+    mounted.as_mut().unwrap().unmount().unwrap();
+}

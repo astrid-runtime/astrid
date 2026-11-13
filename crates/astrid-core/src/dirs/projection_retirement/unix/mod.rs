@@ -10,7 +10,7 @@ use nix::fcntl::{AtFlags, OFlag, openat};
 use nix::sys::stat::{FileStat, Mode, SFlag, fstat, fstatat};
 use nix::unistd::{UnlinkatFlags, unlinkat};
 
-use super::CANONICAL_VOLUME;
+use super::{CANONICAL_VOLUME, SourceChecker};
 
 #[cfg(test)]
 mod barrier_tests;
@@ -52,6 +52,39 @@ impl PreparedProjectionRetirement {
     /// # Errors
     /// Returns an error for redirected, special, inaccessible, or cross-mount entries.
     pub fn prepare(root: &Path) -> io::Result<Self> {
+        Self::prepare_with_checker(root, None)
+    }
+
+    /// Capture the complete inventory and verify selected regular source files.
+    ///
+    /// The predicate controls only read access: unselected entries still receive
+    /// all inventory, identity, mount and deletion checks. Selected leaves open
+    /// read-only relative to the captured parent, without privacy repair or a
+    /// new file-mode requirement. The canonical volume is never a source.
+    /// Every callback completes before this method returns; no entry is deleted.
+    /// Ordinary [`Self::prepare`] remains metadata-only.
+    ///
+    /// # Errors
+    /// Returns the ordinary preflight errors, selected-source read/verification
+    /// failures, or changed source/root bindings. Failure leaves the tree intact.
+    pub fn prepare_checked(
+        root: &Path,
+        mut should_check: impl FnMut(&Path) -> bool,
+        mut check: impl FnMut(&Path, &mut File) -> io::Result<()>,
+    ) -> io::Result<Self> {
+        Self::prepare_with_checker(
+            root,
+            Some(SourceChecker {
+                select: &mut should_check,
+                verify: &mut check,
+            }),
+        )
+    }
+
+    fn prepare_with_checker(
+        root: &Path,
+        mut checker: Option<SourceChecker<'_>>,
+    ) -> io::Result<Self> {
         let directory = crate::platform_fs::open_existing_directory_no_follow(root)?;
         let boundary = RootBoundary {
             identity: fstat(&directory).map_err(os_error)?,
@@ -65,14 +98,19 @@ impl PreparedProjectionRetirement {
             Path::new(""),
             &boundary,
             &mut regular_files,
+            &mut checker,
         )?;
-        Ok(Self {
+        let prepared = Self {
             directory,
             path: root.to_owned(),
             boundary,
             inventory,
             regular_files,
-        })
+        };
+        if checker.is_some() {
+            prepared.require_root()?;
+        }
+        Ok(prepared)
     }
 
     /// Regular projection files relative to the captured root, excluding `astrid.volume`.
@@ -256,6 +294,7 @@ fn capture(
     relative: &Path,
     root: &RootBoundary,
     regular_files: &mut Vec<PathBuf>,
+    checker: &mut Option<SourceChecker<'_>>,
 ) -> io::Result<Vec<PlannedEntry>> {
     let mut inventory = Vec::new();
     for name in entries(directory)? {
@@ -270,9 +309,34 @@ fn capture(
             ));
         }
         let children = if let Some(handle) = child.directory() {
-            capture(handle, &child_path, &child_relative, root, regular_files)?
+            let children = capture(
+                handle,
+                &child_path,
+                &child_relative,
+                root,
+                regular_files,
+                checker,
+            )?;
+            if checker.is_some() {
+                let current = open_entry(directory, &name, &child_path, root)?;
+                require_identity(child.identity(), current.identity(), &child_path)?;
+            }
+            children
         } else {
             if !canonical {
+                if let Some(checker) = checker
+                    && (checker.select)(&child_relative)
+                {
+                    check_source(
+                        directory,
+                        &name,
+                        &child_path,
+                        &child_relative,
+                        root,
+                        child.identity(),
+                        checker,
+                    )?;
+                }
                 regular_files.push(child_relative);
             }
             Vec::new()
@@ -284,6 +348,31 @@ fn capture(
         });
     }
     Ok(inventory)
+}
+
+fn check_source(
+    parent: &File,
+    name: &OsStr,
+    path: &Path,
+    relative: &Path,
+    root: &RootBoundary,
+    expected: &FileStat,
+    checker: &mut SourceChecker<'_>,
+) -> io::Result<()> {
+    let (mut source, _) = open_checked(
+        parent,
+        name,
+        path,
+        root,
+        expected,
+        OFlag::O_RDONLY | OFlag::O_NONBLOCK,
+    )?;
+    (checker.verify)(relative, &mut source)?;
+    require_identity(expected, &fstat(&source).map_err(os_error)?, path)?;
+    // A new relative observation also catches a renamed/replaced leaf and,
+    // on Linux, a bind mount that preserves device/inode/type.
+    let current = open_entry(parent, name, path, root)?;
+    require_identity(expected, current.identity(), path)
 }
 
 fn delete_inventory(

@@ -552,3 +552,65 @@ async fn fresh_catalogue_addition_refuses_incomplete_retiring_inventory() {
         }
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn public_pack_preserves_readable_nonprivate_runtime_file_authority() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (_directory, home, store) = fixture().await;
+    let nested = home.root().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let source = nested.join("state.toml");
+    std::fs::write(&source, b"runtime generation").unwrap();
+    std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::set_permissions(
+        home.root().join("config.toml"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(
+        std::fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    store.pack_and_retire_runtime_projection(&home).unwrap();
+    assert_eq!(std::fs::read_dir(home.root()).unwrap().count(), 1);
+    drop(store);
+    let store = open(&home).await;
+    assert_host(&home, b"host before");
+    assert_eq!(std::fs::read(&source).unwrap(), b"runtime generation");
+    assert_eq!(
+        store
+            .content()
+            .read(&StateOwner::System, &name("nested/state.toml"))
+            .unwrap()
+            .unwrap(),
+        b"runtime generation"
+    );
+    store.pack_and_retire_runtime_projection(&home).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn excluded_host_executable_keeps_metadata_only_retirement_contract() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (_directory, home, store) = fixture().await;
+    let executable = home.root().join("astrid-daemon");
+    std::fs::write(&executable, b"excluded host executable").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o000)).unwrap();
+    store.pack_and_retire_runtime_projection(&home).unwrap();
+    assert_eq!(std::fs::read_dir(home.root()).unwrap().count(), 1);
+    assert!(
+        store
+            .content()
+            .describe(&StateOwner::System, &name("astrid-daemon"))
+            .unwrap()
+            .is_none()
+    );
+}

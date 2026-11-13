@@ -454,6 +454,22 @@ pub(crate) fn open_child_file_for_identity(
     Ok((file, identity))
 }
 
+/// Open a captured-parent leaf for content verification without changing ACLs.
+pub(crate) fn open_child_file_for_read(
+    parent: HANDLE,
+    name: &OsStr,
+) -> io::Result<(File, DirectoryIdentity)> {
+    let handle = open_relative_file(
+        parent,
+        name,
+        GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL,
+    )?;
+    let file = File::from(handle);
+    reject_directory_or_reparse(&file)?;
+    let identity = query_directory_identity(&file)?;
+    Ok((file, identity))
+}
+
 pub(crate) fn file_id_identity(file: &File) -> io::Result<DirectoryIdentity> {
     query_directory_identity(file)
 }

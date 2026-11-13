@@ -3,7 +3,7 @@
 use std::fs::File;
 use std::io::{self, Read};
 
-pub(in crate::platform_fs) fn matches_file_from(
+pub(crate) fn matches_file_from(
     file: &mut File,
     length: u64,
     expected: &mut dyn Read,

@@ -3,6 +3,8 @@
 use std::io;
 use std::path::Path;
 
+#[cfg(all(test, any(unix, windows)))]
+mod checked_tests;
 #[cfg(all(test, unix))]
 mod tests;
 #[cfg(unix)]
@@ -19,6 +21,34 @@ pub use windows::PreparedProjectionRetirement;
 mod replay;
 #[cfg(all(feature = "test-support", unix))]
 pub use replay::interrupt_retirement_before_unlink_once;
+
+/// Optional content admission during the same complete namespace capture.
+#[cfg(any(unix, windows))]
+struct SourceChecker<'a> {
+    select: &'a mut dyn FnMut(&Path) -> bool,
+    verify: &'a mut dyn FnMut(&Path, &mut std::fs::File) -> io::Result<()>,
+}
+
+#[cfg(any(unix, windows))]
+impl PreparedProjectionRetirement {
+    /// Compare an opened source with an exact-length authenticated stream.
+    ///
+    /// This read-only helper checks bytes and exact EOF using bounded buffers.
+    /// It performs no pathname, privacy, identity or mount checks; use it on
+    /// the read-only file supplied by [`Self::prepare_checked`], whose capture
+    /// owns those checks. Neither stream is rewound by this function.
+    ///
+    /// # Errors
+    /// Returns an error on source or authenticated-stream read failure, or an
+    /// expected stream longer than its declared length. Byte mismatch is false.
+    pub fn matches_file_from(
+        source: &mut std::fs::File,
+        length: u64,
+        expected: &mut dyn io::Read,
+    ) -> io::Result<bool> {
+        crate::platform_fs::matches_projection_file_from(source, length, expected)
+    }
+}
 
 const CANONICAL_VOLUME: &str = "astrid.volume";
 

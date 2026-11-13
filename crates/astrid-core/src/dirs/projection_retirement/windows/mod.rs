@@ -15,10 +15,11 @@ use crate::platform_fs::DirectoryIdentity;
 use crate::platform_fs::windows::retirement_support::{
     ListedEntry, RetirementRoot, delete_captured_file, delete_empty_captured_directory,
     file_id_identity, list_child_entries, open_child_directory, open_child_directory_for_capture,
-    open_child_file_for_delete, open_child_file_for_identity, require_identity,
+    open_child_file_for_delete, open_child_file_for_identity, open_child_file_for_read,
+    require_identity,
 };
 
-use super::CANONICAL_VOLUME;
+use super::{CANONICAL_VOLUME, SourceChecker};
 
 #[cfg(test)]
 mod tests;
@@ -47,15 +48,58 @@ impl PreparedProjectionRetirement {
     /// Returns an error for redirects, special entries, invalid identities, denied
     /// access, or a filesystem without NTFS directory-structure durability.
     pub fn prepare(root: &Path) -> io::Result<Self> {
+        Self::prepare_with_checker(root, None)
+    }
+
+    /// Capture the complete inventory and verify selected regular source files.
+    ///
+    /// The predicate controls only read access: unselected entries still receive
+    /// all inventory, FileId and deletion checks. Selected leaves open read-only
+    /// relative to their captured parent, without privacy repair or ACL changes.
+    /// The canonical volume is never a source. Every callback completes before
+    /// this method returns; no entry is deleted. Ordinary [`Self::prepare`]
+    /// remains metadata-only.
+    ///
+    /// # Errors
+    /// Returns ordinary preflight errors, selected-source read/verification
+    /// failures, or changed source/root bindings. Failure leaves the tree intact.
+    pub fn prepare_checked(
+        root: &Path,
+        mut should_check: impl FnMut(&Path) -> bool,
+        mut check: impl FnMut(&Path, &mut File) -> io::Result<()>,
+    ) -> io::Result<Self> {
+        Self::prepare_with_checker(
+            root,
+            Some(SourceChecker {
+                select: &mut should_check,
+                verify: &mut check,
+            }),
+        )
+    }
+
+    fn prepare_with_checker(
+        root: &Path,
+        mut checker: Option<SourceChecker<'_>>,
+    ) -> io::Result<Self> {
         let root_handle = RetirementRoot::open(root)?;
         let mut regular_files = Vec::new();
-        let inventory = capture(root_handle.file(), root, Path::new(""), &mut regular_files)?;
-        Ok(Self {
+        let inventory = capture(
+            root_handle.file(),
+            root,
+            Path::new(""),
+            &mut regular_files,
+            &mut checker,
+        )?;
+        let prepared = Self {
             root: root_handle,
             path: root.to_owned(),
             inventory,
             regular_files,
-        })
+        };
+        if checker.is_some() {
+            prepared.require_root()?;
+        }
+        Ok(prepared)
     }
 
     /// Regular projection files relative to the captured root, excluding root `astrid.volume`.
@@ -167,6 +211,7 @@ fn capture(
     absolute: &Path,
     relative: &Path,
     regular_files: &mut Vec<PathBuf>,
+    checker: &mut Option<SourceChecker<'_>>,
 ) -> io::Result<Vec<PlannedEntry>> {
     let listed = list_child_entries(parent)?;
     let parent = parent.as_raw_handle().cast();
@@ -184,6 +229,7 @@ fn capture(
             &child_relative,
             regular_files,
             canonical,
+            checker,
         )?;
         if !is_directory && !canonical {
             regular_files.push(child_relative);
@@ -205,6 +251,7 @@ fn classify_and_capture(
     relative: &Path,
     regular_files: &mut Vec<PathBuf>,
     canonical: bool,
+    checker: &mut Option<SourceChecker<'_>>,
 ) -> io::Result<(bool, DirectoryIdentity, Vec<PlannedEntry>)> {
     if listed.is_directory {
         if canonical {
@@ -212,12 +259,24 @@ fn classify_and_capture(
         }
         let (directory, identity) = open_child_directory_for_capture(parent, &listed.name)?;
         require_identity(listed.identity, identity, absolute)?;
-        let children = capture(&directory, absolute, relative, regular_files)?;
+        let children = capture(&directory, absolute, relative, regular_files, checker)?;
         drop(directory);
         Ok((true, identity, children))
     } else {
         let (file, identity) = open_child_file_for_identity(parent, &listed.name)?;
         require_identity(listed.identity, identity, absolute)?;
+        if !canonical
+            && let Some(checker) = checker
+            && (checker.select)(relative)
+        {
+            let (mut source, opened) = open_child_file_for_read(parent, &listed.name)?;
+            require_identity(identity, opened, absolute)?;
+            (checker.verify)(relative, &mut source)?;
+            require_identity(identity, file_id_identity(&source)?, absolute)?;
+            let (confirmation, current) = open_child_file_for_identity(parent, &listed.name)?;
+            require_identity(identity, current, absolute)?;
+            drop(confirmation);
+        }
         drop(file);
         Ok((false, identity, Vec::new()))
     }
