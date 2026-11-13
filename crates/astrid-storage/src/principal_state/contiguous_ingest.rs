@@ -13,6 +13,9 @@ use crate::error::{StorageError, StorageResult};
 
 use super::{RuntimePrincipalStore, StateOwner};
 
+mod lazy_source;
+use lazy_source::LazyHomeSource;
+
 /// One sealed regular file ready for packed home publication.
 pub struct ContiguousFileIngest {
     name: ContentName,
@@ -62,7 +65,7 @@ impl RuntimePrincipalStore {
     ) -> StorageResult<()> {
         let mut ingests = Vec::new();
         for file in files {
-            let source = open_home_source(&file)?;
+            let source = open_home_source(&file.path, file.logical_bytes)?;
             ingests.push(ContentIngest::new(file.name, source));
         }
         if ingests.is_empty() {
@@ -105,8 +108,12 @@ impl RuntimePrincipalStore {
         for file in files {
             let (name, source): (_, Box<dyn std::io::Read + Send>) = match file {
                 PackedProjectionIngest::File(file) => {
-                    let source = open_home_source(&file)?;
-                    (file.name, Box::new(source))
+                    let ContiguousFileIngest {
+                        name,
+                        path,
+                        logical_bytes,
+                    } = file;
+                    (name, Box::new(LazyHomeSource::new(path, logical_bytes)))
                 },
                 PackedProjectionIngest::Bytes { name, bytes } => {
                     (name, Box::new(Cursor::new(bytes)))
@@ -155,21 +162,21 @@ impl RuntimePrincipalStore {
     }
 }
 
-fn open_home_source(file: &ContiguousFileIngest) -> StorageResult<File> {
-    let source = File::open(&file.path).map_err(|error| {
-        StorageError::Connection(format!("open home source {}: {error}", file.path.display()))
+fn open_home_source(path: &std::path::Path, logical_bytes: u64) -> StorageResult<File> {
+    let source = File::open(path).map_err(|error| {
+        StorageError::Connection(format!("open home source {}: {error}", path.display()))
     })?;
     let actual_bytes = source
         .metadata()
         .map_err(|error| {
-            StorageError::Connection(format!("stat home source {}: {error}", file.path.display()))
+            StorageError::Connection(format!("stat home source {}: {error}", path.display()))
         })?
         .len();
-    if actual_bytes != file.logical_bytes {
+    if actual_bytes != logical_bytes {
         return Err(StorageError::Connection(format!(
             "home source {} changed length (expected {}, found {})",
-            file.path.display(),
-            file.logical_bytes,
+            path.display(),
+            logical_bytes,
             actual_bytes
         )));
     }
