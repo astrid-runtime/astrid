@@ -167,7 +167,7 @@ pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
         &volume.path,
         &mut state,
         #[cfg(windows)]
-        volume._retained_root.is_some(),
+        volume.retained_root.is_some(),
     )
 }
 

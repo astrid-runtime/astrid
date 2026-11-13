@@ -154,7 +154,7 @@ pub struct HostedFileVolume {
     /// Windows: keep admitted runtime-root authority after `state` so Drop
     /// releases the volume file before the namespace fence.
     #[cfg(windows)]
-    _retained_root:
+    retained_root:
         Option<std::sync::Arc<astrid_core::platform_fs::directory_capability::RetainedPrivateRoot>>,
 }
 

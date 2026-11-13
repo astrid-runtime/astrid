@@ -234,7 +234,7 @@ impl HostedFileVolume {
             open_lock,
             state: Mutex::new(state),
             #[cfg(windows)]
-            _retained_root: retained_root,
+            retained_root,
         }))
     }
 }
