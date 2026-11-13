@@ -4,11 +4,9 @@ use super::*;
 
 fn open(path: &std::path::Path) -> io::Result<Arc<HostedFileVolume>> {
     #[cfg(windows)]
-    let root = Arc::new(
-        astrid_core::platform_fs::directory_capability::RetainedPrivateRoot::admit(
-            path.parent().unwrap(),
-        )?,
-    );
+    let root = astrid_core::platform_fs::directory_capability::RetainedPrivateRoot::admit(
+        path.parent().unwrap(),
+    )?;
     HostedFileVolume::open_existing_canonical(
         path,
         #[cfg(windows)]
@@ -19,12 +17,10 @@ fn open(path: &std::path::Path) -> io::Result<Arc<HostedFileVolume>> {
 fn create(path: &std::path::Path) -> Arc<HostedFileVolume> {
     #[cfg(windows)]
     {
-        let root = Arc::new(
-            astrid_core::platform_fs::directory_capability::RetainedPrivateRoot::admit(
-                path.parent().unwrap(),
-            )
-            .unwrap(),
-        );
+        let root = astrid_core::platform_fs::directory_capability::RetainedPrivateRoot::admit(
+            path.parent().unwrap(),
+        )
+        .unwrap();
         HostedFileVolume::open_runtime(root, path).unwrap()
     }
     #[cfg(not(windows))]
