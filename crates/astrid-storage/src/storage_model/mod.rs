@@ -618,8 +618,7 @@ pub trait ObjectIdentity {
 mod derivation;
 mod derivation_evidence;
 mod gc_evidence;
-mod physical;
-pub(crate) use physical::CanonicalRootProof;
+pub(crate) mod physical;
 mod proof;
 
 pub use derivation::{

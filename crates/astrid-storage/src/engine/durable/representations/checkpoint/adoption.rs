@@ -5,10 +5,11 @@
 //! `prepare_checkpoint_volume` / `checkpoint_native`. Only automatic maintenance
 //! (`checkpoint_volume`, `maybe_checkpoint_native`) uses this path.
 
+use crate::storage_model::physical::CanonicalRootProof;
 use crate::storage_model::{
-    CanonicalPhysicalMap, CanonicalRootProof, ObjectId, PhysicalMapDomain, PhysicalMapNode,
-    PhysicalMapNodeId, PlacementSet, RepresentationCatalogueRoot, RepresentationProfileId,
-    RepresentationRecordId, RepresentationState, RepresentationStateId,
+    CanonicalPhysicalMap, ObjectId, PhysicalMapDomain, PhysicalMapNode, PhysicalMapNodeId,
+    PlacementSet, RepresentationCatalogueRoot, RepresentationProfileId, RepresentationRecordId,
+    RepresentationState, RepresentationStateId,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
