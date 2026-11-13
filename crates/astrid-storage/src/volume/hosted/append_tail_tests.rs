@@ -33,7 +33,7 @@ fn owned_lengths(volume: &HostedFileVolume) -> (u64, u64) {
 }
 
 #[test]
-fn dirty_plain_and_streamed_appends_truncate_once_after_sync() {
+fn dirty_plain_and_streamed_appends_overwrite_known_footer_without_truncation() {
     reset_faults();
     let directory = tempfile::tempdir().unwrap();
     let (volume, region, _) = open_ready_volume(&directory);
@@ -45,8 +45,8 @@ fn dirty_plain_and_streamed_appends_truncate_once_after_sync() {
     volume.rename_region(&region, &first).unwrap();
     assert_eq!(
         prepare_truncate_count(),
-        1,
-        "first plain append strips footer"
+        0,
+        "first plain append overwrites the known footer"
     );
     volume.rename_region(&first, &second).unwrap();
     volume
@@ -57,18 +57,18 @@ fn dirty_plain_and_streamed_appends_truncate_once_after_sync() {
         .unwrap();
     assert_eq!(
         prepare_truncate_count(),
-        1,
-        "later dirty plain/streamed appends must not re-truncate"
+        0,
+        "later dirty plain/streamed appends must not truncate"
     );
     volume.sync().unwrap();
     let after = VolumeRegion::new("after").unwrap();
     reset_prepare_truncate_count();
     volume.rename_region(&second, &after).unwrap();
-    assert_eq!(prepare_truncate_count(), 1);
+    assert_eq!(prepare_truncate_count(), 0);
     volume
         .write_region_from(&after, 0, 5, &mut &b"again"[..])
         .unwrap();
-    assert_eq!(prepare_truncate_count(), 1);
+    assert_eq!(prepare_truncate_count(), 0);
 }
 
 #[test]
@@ -82,6 +82,9 @@ fn failed_prepare_truncate_retries_on_next_append() {
         "synced fixture must carry a durable footer beyond valid_len"
     );
 
+    // Forget the footer proof to exercise an unknown tail. Such tails still
+    // require truncation even when their bytes happen to be a valid footer.
+    volume.state.lock().physical_tail = PhysicalTail::MayExceed;
     set_fail_prepare_truncate(true);
     reset_prepare_truncate_count();
     let error = volume.write_region_at(&region, 0, b"blocked").unwrap_err();

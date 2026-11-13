@@ -207,7 +207,7 @@ impl HostedFileVolume {
             boundary_pending: false,
             footer_pending,
             physical_tail: if recovery.footer_present {
-                super::PhysicalTail::MayExceed
+                super::PhysicalTail::Footer
             } else {
                 super::PhysicalTail::Exact
             },
