@@ -21,6 +21,18 @@ pub(super) trait CanonicalNodeSink {
         canonical_bytes: &[u8],
         node: PhysicalMapNode,
     ) -> Result<(), Self::Error>;
+
+    fn put_encoded<R>(
+        &mut self,
+        id: PhysicalMapNodeId,
+        canonical_bytes: &[u8],
+        retain: R,
+    ) -> Result<(), Self::Error>
+    where
+        R: FnOnce() -> Result<PhysicalMapNode, PhysicalModelError>,
+    {
+        self.put(id, canonical_bytes, retain()?)
+    }
 }
 
 impl CanonicalNodeSink for BTreeMap<PhysicalMapNodeId, PhysicalMapNode> {
@@ -219,9 +231,21 @@ impl<E: From<PhysicalModelError>, F: FnMut(PhysicalMapNodeId, &[u8]) -> Result<(
         canonical_bytes: &[u8],
         node: PhysicalMapNode,
     ) -> Result<(), E> {
+        self.put_encoded(id, canonical_bytes, || Ok(node))
+    }
+
+    fn put_encoded<R>(
+        &mut self,
+        id: PhysicalMapNodeId,
+        canonical_bytes: &[u8],
+        _retain: R,
+    ) -> Result<(), E>
+    where
+        R: FnOnce() -> Result<PhysicalMapNode, PhysicalModelError>,
+    {
         // Body equality precedes every callback, including IDs already emitted
         // from another map. An identity alone cannot authorize deduplication.
-        ValidationNodes(self.nodes).put(id, canonical_bytes, node)?;
+        check_live_encoded(self.nodes, id, canonical_bytes)?;
         if !self.generated.insert(id) {
             return Err(PhysicalModelError::InvalidMap(
                 "canonical builder repeated a generated node",
@@ -255,6 +279,35 @@ impl CanonicalNodeSink for ValidationNodes<'_> {
             )),
             None => Err(PhysicalModelError::InvalidMap("missing canonical map node")),
         }
+    }
+
+    fn put_encoded<R>(
+        &mut self,
+        id: PhysicalMapNodeId,
+        canonical_bytes: &[u8],
+        _retain: R,
+    ) -> Result<(), PhysicalModelError>
+    where
+        R: FnOnce() -> Result<PhysicalMapNode, PhysicalModelError>,
+    {
+        check_live_encoded(self.0, id, canonical_bytes)
+    }
+}
+
+fn check_live_encoded(
+    nodes: &BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    id: PhysicalMapNodeId,
+    canonical_bytes: &[u8],
+) -> Result<(), PhysicalModelError> {
+    match nodes.get(&id) {
+        Some(existing) => match existing.matches_encoded(canonical_bytes) {
+            Ok(()) => Ok(()),
+            Err(PhysicalModelError::NonCanonicalEncoding) => Err(PhysicalModelError::InvalidMap(
+                "physical map-node identity collision",
+            )),
+            Err(error) => Err(error),
+        },
+        None => Err(PhysicalModelError::InvalidMap("missing canonical map node")),
     }
 }
 
