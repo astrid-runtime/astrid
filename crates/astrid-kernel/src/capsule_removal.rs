@@ -91,7 +91,9 @@ impl Kernel {
             );
         }
 
-        self.publish_capsules_loaded().await;
+        // Other principals keep the same view; the departing view must also
+        // publish an empty inventory when its last capsule was removed.
+        self.publish_capsules_loaded_for(principal).await;
         Ok(true)
     }
 

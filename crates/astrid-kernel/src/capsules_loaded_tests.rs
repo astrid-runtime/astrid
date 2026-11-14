@@ -194,3 +194,80 @@ async fn global_capsule_inventory_still_describes_every_principal_view() {
         "a genuine global refresh must retain every-principal behavior"
     );
 }
+
+#[tokio::test]
+async fn capsule_unload_refreshes_only_the_affected_principal() {
+    for retain_another_capsule in [false, true] {
+        let (_directory, home) = scratch_home();
+        let kernel = test_kernel_with_home(home).await;
+        let affected = PrincipalId::new("unload-target").unwrap();
+        let peer = PrincipalId::new("unload-peer").unwrap();
+        let removed_id = CapsuleId::new("removed-probe").unwrap();
+        let mut counters = Vec::new();
+        {
+            let mut registry = kernel.capsules.write().await;
+            let views = [(&affected, "removed-probe"), (&peer, "peer-probe")]
+                .into_iter()
+                .chain(retain_another_capsule.then_some((&affected, "remaining-probe")));
+            for (principal, name) in views {
+                let calls = Arc::new(AtomicUsize::new(0));
+                registry
+                    .register_for(
+                        Box::new(InventoryProbeCapsule {
+                            id: CapsuleId::new(name).unwrap(),
+                            manifest: CapsuleManifest::default(),
+                            describe_calls: Arc::clone(&calls),
+                        }),
+                        WasmHash::from_raw(format!("unload-hash-{name}")),
+                        principal,
+                    )
+                    .unwrap();
+                counters.push((name, calls));
+            }
+        }
+        let mut events = kernel
+            .event_bus
+            .subscribe_topic("astrid.v1.capsules_loaded");
+        assert!(
+            kernel
+                .unload_one_capsule(&removed_id, &affected)
+                .await
+                .unwrap()
+        );
+        for (name, calls) in counters {
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                usize::from(name == "remaining-probe"),
+                "unload must describe only the affected principal's remaining capsules: {name}"
+            );
+        }
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("affected principal inventory")
+            .expect("event bus remains open");
+        let astrid_events::AstridEvent::Ipc { message, .. } = event.as_ref() else {
+            panic!("capsule inventory must be an IPC event");
+        };
+        assert_eq!(message.principal.as_deref(), Some(affected.as_str()));
+        let astrid_events::ipc::IpcPayload::RawJson(payload) = &message.payload else {
+            panic!("capsule inventory must carry raw JSON");
+        };
+        let capsules = payload["capsules"].as_array().expect("capsule inventory");
+        assert_eq!(capsules.len(), usize::from(retain_another_capsule));
+        if retain_another_capsule {
+            assert_eq!(capsules[0]["name"], "remaining-probe");
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), events.recv())
+                .await
+                .is_err(),
+            "one unload must publish exactly one affected-principal inventory"
+        );
+        let registry = kernel.capsules.read().await;
+        assert_eq!(registry.cloned_values_for(&peer).len(), 1);
+        assert_eq!(
+            registry.cloned_values_for(&affected).len(),
+            usize::from(retain_another_capsule)
+        );
+    }
+}
