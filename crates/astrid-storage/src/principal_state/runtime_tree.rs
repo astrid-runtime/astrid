@@ -564,7 +564,14 @@ fn active_projection_entries(
         .content()
         .list(&StateOwner::System)
         .map_err(|error| tree_error(home.root(), format!("list active projection: {error}")))?;
-    Ok(entries
+    Ok(projection_entries_from_catalog(home, entries))
+}
+
+fn projection_entries_from_catalog(
+    home: &AstridHome,
+    entries: Vec<crate::content::ContentEntry>,
+) -> Vec<ActiveProjectionEntry> {
+    entries
         .into_iter()
         .filter(|entry| !is_excluded(entry.name().as_str()))
         .filter(|entry| !is_retired_legacy_projection(home, entry.name().as_str()))
@@ -573,7 +580,7 @@ fn active_projection_entries(
             file: entry.file(),
             logical_bytes: entry.logical_bytes(),
         })
-        .collect())
+        .collect()
 }
 
 fn receipt_ingest(

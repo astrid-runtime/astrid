@@ -165,7 +165,36 @@ pub(super) fn read_from_content(
     super::runtime_tree::operation_counts::record_receipt_read();
     tracing::trace!(target: "astrid_storage::projection_receipt_read", "read runtime projection receipt");
     let receipt = read_relocatable_from_content(home, content)?;
-    if let Some(receipt) = &receipt
+    require_home_root(home, receipt.as_ref())?;
+    Ok(receipt)
+}
+
+/// Publication already needs the full catalog for retained entries. Authenticate
+/// the receipt against that same snapshot instead of repeating point lookups.
+/// The caller captures the System root before this read and binds publication
+/// to that root with its CAS; the snapshot is never a standalone authority.
+pub(super) fn read_for_publication(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+) -> StorageResult<(Option<ActiveProjectionReceipt>, Vec<ContentEntry>)> {
+    #[cfg(any(test, feature = "test-support"))]
+    super::runtime_tree::operation_counts::record_receipt_read();
+    let mut catalog = None;
+    let receipt = read_with_catalog(
+        home,
+        &store.content(),
+        &mut catalog,
+        ReceiptRead::Publication,
+    )?;
+    require_home_root(home, receipt.as_ref())?;
+    Ok((receipt, catalog.unwrap_or_default()))
+}
+
+fn require_home_root(
+    home: &AstridHome,
+    receipt: Option<&ActiveProjectionReceipt>,
+) -> StorageResult<()> {
+    if let Some(receipt) = receipt
         && receipt.root != canonical_root(home)?
     {
         return Err(tree_error(
@@ -173,7 +202,7 @@ pub(super) fn read_from_content(
             "active projection receipt is stale or redirected",
         ));
     }
-    Ok(receipt)
+    Ok(())
 }
 
 /// Parse and validate inventory without rejecting a root mismatch.
@@ -195,6 +224,21 @@ fn read_relocatable_from_content(
     home: &AstridHome,
     content: &NativePrincipalContentStore,
 ) -> StorageResult<Option<ActiveProjectionReceipt>> {
+    read_with_catalog(home, content, &mut None, ReceiptRead::Sparse)
+}
+
+#[derive(Clone, Copy)]
+enum ReceiptRead {
+    Sparse,
+    Publication,
+}
+
+fn read_with_catalog(
+    home: &AstridHome,
+    content: &NativePrincipalContentStore,
+    catalog: &mut Option<Vec<ContentEntry>>,
+    mode: ReceiptRead,
+) -> StorageResult<Option<ActiveProjectionReceipt>> {
     let host_receipt = home.root().join(ACTIVE_PROJECTION_NAME);
     if std::fs::symlink_metadata(&host_receipt).is_ok() {
         return Err(tree_error(
@@ -211,17 +255,15 @@ fn read_relocatable_from_content(
         return Ok(None);
     };
     // Small receipts retain the historical authenticated allocation ceiling and
-    // point lookups. Listing unrelated catalog content would make sparse reads
-    // scale with the whole owner inventory even when its header is warm.
-    let catalog = if metadata.logical_bytes() > RECEIPT_FRAMING_BYTES {
-        Some(
+    // point lookups. Publication instead reuses its required complete listing;
+    // ordinary sparse reads must not scale with unrelated owner inventory.
+    if metadata.logical_bytes() > RECEIPT_FRAMING_BYTES {
+        *catalog = Some(
             content
                 .list(&StateOwner::System)
                 .map_err(receipt_error("authenticate receipt inventory allowance"))?,
-        )
-    } else {
-        None
-    };
+        );
+    }
     let inventory = match catalog.as_deref() {
         Some(catalog) => ReceiptInventory::Listed(catalog),
         None => ReceiptInventory::Point(content),
@@ -240,7 +282,24 @@ fn read_relocatable_from_content(
                 "active projection receipt disappeared while being read",
             )
         })?;
-    decode_receipt(&host_receipt, &bytes, &inventory)
+    let receipt = parse_receipt(&host_receipt, &bytes, &inventory)?;
+    // Small RETIRING retries do not need a retained-entry catalog. Keep their
+    // sparse behavior; only ACTIVE publication already requires a full listing.
+    if matches!(mode, ReceiptRead::Publication)
+        && receipt.phase() == ReceiptPhase::Active
+        && catalog.is_none()
+    {
+        *catalog = Some(
+            content
+                .list(&StateOwner::System)
+                .map_err(receipt_error("authenticate publication inventory"))?,
+        );
+    }
+    let inventory = match catalog.as_deref() {
+        Some(catalog) => ReceiptInventory::Listed(catalog),
+        None => ReceiptInventory::Point(content),
+    };
+    validate_receipt(&host_receipt, receipt, &inventory).map(Some)
 }
 
 // Both sources authenticate the same metadata through ContentStore. Only the
@@ -272,25 +331,46 @@ impl ReceiptInventory<'_> {
     }
 }
 
+#[cfg(test)]
 fn decode_receipt(
     host_receipt: &Path,
     bytes: &[u8],
     inventory: &ReceiptInventory<'_>,
 ) -> StorageResult<Option<ActiveProjectionReceipt>> {
+    validate_receipt(
+        host_receipt,
+        parse_receipt(host_receipt, bytes, inventory)?,
+        inventory,
+    )
+    .map(Some)
+}
+
+fn parse_receipt(
+    host_receipt: &Path,
+    bytes: &[u8],
+    inventory: &ReceiptInventory<'_>,
+) -> StorageResult<ActiveProjectionReceipt> {
     enforce_receipt_bound(
         host_receipt,
         u64::try_from(bytes.len())
             .map_err(|_| StorageError::Internal("receipt length overflow".to_owned()))?,
         inventory.size_bound()?,
     )?;
-    let mut receipt =
-        serde_json::from_slice::<ActiveProjectionReceipt>(bytes).map_err(|error| {
-            tree_error(
-                host_receipt,
-                format!("parse active projection receipt: {error}"),
-            )
-        })?;
+    let receipt = serde_json::from_slice::<ActiveProjectionReceipt>(bytes).map_err(|error| {
+        tree_error(
+            host_receipt,
+            format!("parse active projection receipt: {error}"),
+        )
+    })?;
     validate_receipt_schema(&receipt, host_receipt)?;
+    Ok(receipt)
+}
+
+fn validate_receipt(
+    host_receipt: &Path,
+    mut receipt: ActiveProjectionReceipt,
+    inventory: &ReceiptInventory<'_>,
+) -> StorageResult<ActiveProjectionReceipt> {
     if let ReceiptInventory::Listed(catalog) = inventory {
         // ContentStore::list already returns unique canonical names in byte order.
         // Retain that authenticated inventory directly instead of cloning every
@@ -328,7 +408,7 @@ fn decode_receipt(
     for entry in &receipt.entries {
         validate_receipt_entry(inventory, entry)?;
     }
-    Ok(Some(receipt))
+    Ok(receipt)
 }
 
 pub(super) fn encode(

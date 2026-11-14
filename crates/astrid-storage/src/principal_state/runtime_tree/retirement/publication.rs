@@ -4,8 +4,8 @@ use std::collections::BTreeSet;
 
 use super::super::{
     ActiveProjectionEntry, AstridHome, ContiguousFileIngest, PackedProjectionIngest, ReceiptPhase,
-    RuntimePrincipalStore, RuntimeTreeEntry, StateOwner, active, active_projection_entries,
-    active_receipt::prepared_entries, is_exactly_pack_open_staging_journal, projection, tree_error,
+    RuntimePrincipalStore, RuntimeTreeEntry, StateOwner, active, active_receipt::prepared_entries,
+    is_exactly_pack_open_staging_journal, projection, projection_entries_from_catalog, tree_error,
     validate_retiring_host_subset,
 };
 use crate::StorageResult;
@@ -34,7 +34,8 @@ pub(super) fn publish_with_hook(
         .engine
         .current_root(&StateOwner::System)
         .map_err(|error| tree_error(home.root(), format!("capture retiring root: {error}")))?;
-    let Some(receipt) = active::read(home, store)? else {
+    let (receipt, catalog) = active::read_for_publication(home, store)?;
+    let Some(receipt) = receipt else {
         return if scanned.is_empty() || is_exactly_pack_open_staging_journal(&scanned) {
             Ok(())
         } else {
@@ -61,7 +62,7 @@ pub(super) fn publish_with_hook(
     removals.retain(|name| !projection::surviving_directory(home.root(), name.as_str()));
     let rewritten = surviving.iter().collect::<BTreeSet<_>>();
     let removed = removals.iter().collect::<BTreeSet<_>>();
-    let complete = active_projection_entries(home, store)?;
+    let complete = projection_entries_from_catalog(home, catalog);
     let root =
         root.ok_or_else(|| tree_error(home.root(), "active receipt has no principal root"))?;
     let retained = complete

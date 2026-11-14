@@ -43,6 +43,19 @@ async fn pack_uses_one_validating_walk_one_publication_and_two_receipt_reads() {
 }
 
 #[tokio::test]
+async fn small_retiring_retry_keeps_sparse_inventory_validation() {
+    let (_directory, home, store) = fixture().await;
+    transition_retiring_projection(&home, &store).unwrap();
+    let lists_before = store.content().list_invocations();
+    transition_retiring_projection(&home, &store).unwrap();
+    assert_eq!(store.content().list_invocations(), lists_before);
+    assert_eq!(
+        std::fs::read(home.root().join("config.toml")).unwrap(),
+        b"host generation"
+    );
+}
+
+#[tokio::test]
 async fn payload_change_with_unchanged_receipt_revalidates_and_refuses_delete() {
     let (_directory, home, store) = fixture().await;
     transition_retiring_projection(&home, &store).unwrap();
@@ -159,7 +172,21 @@ async fn large_complete_inventory_is_revalidated_and_keeps_volume_only_files() {
                 .map(|name| ContentIngest::new(name, std::io::Cursor::new(b""))),
         )
         .unwrap();
+    // Authenticate a large ACTIVE inventory before publication. The transition
+    // needs the same catalog for retained entries, so it must list it once.
+    let entries = super::super::active_projection_entries(&home, &store).unwrap();
+    let bytes = active::encode(&home, super::super::ReceiptPhase::Active, &entries, None).unwrap();
+    store
+        .content()
+        .put(
+            &StateOwner::System,
+            &active::active_projection_name().unwrap(),
+            &bytes,
+        )
+        .unwrap();
+    let lists_before = store.content().list_invocations();
     transition_retiring_projection(&home, &store).unwrap();
+    assert_eq!(store.content().list_invocations(), lists_before + 1);
     let descriptor = store
         .content()
         .describe(
