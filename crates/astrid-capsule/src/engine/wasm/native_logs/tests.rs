@@ -676,8 +676,12 @@ async fn live_uid_rename_keeps_pinned_destination_and_admits_the_current_alias()
     assert!(!root.home.log_dir().join("principals").exists());
     tracker.resume(&current_alias);
     state.log(LogLevel::Info, "renamed UID still logs".into());
-    let opened = pending.opened.get().unwrap().as_ref().unwrap();
-    assert_eq!(opened.principal_at_open, current_alias);
+    let admitted = pending.resolve(None).unwrap();
+    assert_eq!(
+        admitted._owner_operation.as_ref().unwrap().principal,
+        current_alias
+    );
+    drop(admitted);
     assert_eq!(pending.target, target);
     assert!(contents(&root, &pending).contains("renamed UID still logs"));
     tracker.retire(&current_alias);
@@ -728,4 +732,46 @@ async fn captured_runtime_uid_is_not_relooked_up_when_alias_is_reused_before_bin
     assert_eq!(pending.uid, captured_uid);
     assert!(pending.resolve(None).is_none());
     assert!(!root.home.log_dir().join("principals").exists());
+}
+
+#[tokio::test]
+async fn warm_log_admits_the_current_uid_alias_after_rename() {
+    let (_parent, root, mut state, tracker) = fixture();
+    let pending = Arc::clone(state.deferred_logs.owner.as_ref().unwrap());
+    state.log(LogLevel::Info, "before rename".into());
+    let before = contents(&root, &pending);
+    let previous = state.principal.clone();
+    let current = PrincipalId::new("warm-renamed").unwrap();
+    state
+        .principal_directory
+        .rename(pending.uid, &previous, current.clone())
+        .unwrap();
+    tracker.retire(&current);
+    state.log(LogLevel::Info, "retired current alias must refuse".into());
+    assert_eq!(contents(&root, &pending), before);
+    tracker.resume(&current);
+    state.log(LogLevel::Info, "current alias resumed".into());
+    assert_eq!(contents(&root, &pending).lines().count(), 2);
+}
+
+#[tokio::test]
+async fn warm_log_cannot_borrow_a_reused_alias_guard() {
+    let (_parent, _root, mut state, tracker) = fixture();
+    let pending = Arc::clone(state.deferred_logs.owner.as_ref().unwrap());
+    state.log(LogLevel::Info, "open before alias reuse".into());
+    let previous = state.principal.clone();
+    let current = PrincipalId::new("warm-owner").unwrap();
+    state
+        .principal_directory
+        .rename(pending.uid, &previous, current.clone())
+        .unwrap();
+    let peer_uid: PrincipalUid = "9".repeat(64).parse().unwrap();
+    assert_ne!(peer_uid, pending.uid);
+    state
+        .principal_directory
+        .register(previous.clone(), peer_uid)
+        .unwrap();
+    let peer_operation = tracker.begin(&previous).unwrap();
+    tracker.retire(&current);
+    assert!(resolve(&mut state, Some(&peer_operation)).file.is_none());
 }

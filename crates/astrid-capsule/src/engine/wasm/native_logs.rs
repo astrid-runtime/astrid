@@ -121,12 +121,7 @@ pub(super) struct PendingLog {
     root: Arc<NativeLogRoot>,
     directory: PrincipalDirectory,
     tracker: Arc<PrincipalInvocationTracker>,
-    opened: OnceLock<Option<OpenedLog>>,
-}
-
-struct OpenedLog {
-    file: LogFile,
-    principal_at_open: PrincipalId,
+    opened: OnceLock<Option<LogFile>>,
 }
 
 pub(super) fn bind(
@@ -263,13 +258,10 @@ impl PendingLog {
                     #[cfg(test)]
                     tests::before_open().ok()?;
                     let file = self.root.open(&self.target).ok()?;
-                    Some(OpenedLog {
-                        file: Arc::new(Mutex::new(file)),
-                        principal_at_open: current.clone(),
-                    })
+                    Some(Arc::new(Mutex::new(file)))
                 });
                 Ok(opened.as_ref().map(|opened| ResolvedLog {
-                    file: Some(Arc::clone(&opened.file)),
+                    file: Some(Arc::clone(opened)),
                     _owner_operation: operation,
                 }))
             })
@@ -316,27 +308,25 @@ fn resolve_file(
 ) -> ResolvedLog {
     // Only files known to originate in our private cache carry its owner fence.
     // Arbitrary explicit File injections retain the existing eager interface.
-    let cached = pending.and_then(|pending| {
+    let cached = pending.filter(|pending| {
         pending
             .opened
             .get()
             .and_then(Option::as_ref)
-            .filter(|opened| Arc::ptr_eq(&opened.file, file))
-            .map(|opened| (pending, opened))
+            .is_some_and(|opened| Arc::ptr_eq(opened, file))
     });
-    let operation = match cached {
-        Some((pending, opened)) => pending.admit(&opened.principal_at_open, admitted),
-        None => Some(None),
-    };
-    match operation {
-        Some(operation) => ResolvedLog {
-            file: Some(Arc::clone(file)),
-            _owner_operation: operation,
-        },
-        None => ResolvedLog {
+    if let Some(pending) = cached {
+        // The FD stays UID-bound, but aliases and their lifecycle views can
+        // change. Reuse the same live-binding admission for warm writes;
+        // the initialized OnceLock performs no filesystem open or lookup.
+        return pending.resolve(admitted).unwrap_or(ResolvedLog {
             file: None,
             _owner_operation: None,
-        },
+        });
+    }
+    ResolvedLog {
+        file: Some(Arc::clone(file)),
+        _owner_operation: None,
     }
 }
 
