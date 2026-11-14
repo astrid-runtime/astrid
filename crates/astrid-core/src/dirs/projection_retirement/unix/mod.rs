@@ -480,7 +480,7 @@ fn delete_entry(
     require_identity(&planned.identity, &current, &child_path)?;
     check_boundary(&child_path, root, &current)?;
     #[cfg(target_os = "linux")]
-    let _mount_confirmation = {
+    let mount_confirmation = {
         // Bind mounts can preserve dev/ino/type while replacing a name.
         let confirmation = open_entry(directory, name, &child_path, root)?;
         require_identity(&planned.identity, confirmation.identity(), &child_path)?;
@@ -489,7 +489,7 @@ fn delete_entry(
     if mode.empty() && child_directory.is_none() {
         empty::require_zero(&current, &child_path)?;
         #[cfg(target_os = "linux")]
-        empty::require_zero(_mount_confirmation.identity(), &child_path)?;
+        empty::require_zero(mount_confirmation.identity(), &child_path)?;
     }
     let flags = if child_directory.is_some() {
         UnlinkatFlags::RemoveDir

@@ -7,6 +7,26 @@ use std::io::{Seek as _, SeekFrom, Write as _};
 use std::path::Path;
 use std::sync::Arc;
 
+// Windows fault injectors share the native test lock. Keep it for the test,
+// and use a root whose ACL is private before the public API admits it.
+fn private_root() -> (
+    tempfile::TempDir,
+    Option<std::sync::MutexGuard<'static, ()>>,
+) {
+    #[cfg(windows)]
+    {
+        let guard = crate::platform_fs::windows::private_test_guard();
+        (
+            crate::platform_fs::windows::private_test_directory(),
+            Some(guard),
+        )
+    }
+    #[cfg(unix)]
+    {
+        (tempfile::tempdir().unwrap(), None)
+    }
+}
+
 fn root(path: &Path) -> PrivateAppendRoot {
     ensure_private_directory(path).unwrap();
     PrivateProjectionInspection::try_open(path)
@@ -24,7 +44,7 @@ fn append_authority_and_returned_file_are_send_sync() {
 
 #[test]
 fn capture_is_lazy_and_first_open_preserves_atomic_append_after_seek() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _native_guard) = private_root();
     let append = root(dir.path());
     assert!(!dir.path().join("log").exists());
     let name = Path::new("log/principals/uid/capsule/day.log");
@@ -43,7 +63,7 @@ fn capture_is_lazy_and_first_open_preserves_atomic_append_after_seek() {
 
 #[test]
 fn append_root_can_cross_threads_without_a_shared_write_lock() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _native_guard) = private_root();
     let append = Arc::new(root(dir.path()));
     let threads = (0..4)
         .map(|index| {
@@ -69,7 +89,7 @@ fn append_root_can_cross_threads_without_a_shared_write_lock() {
 
 #[test]
 fn invalid_names_and_nonregular_leaves_fail_without_writing() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _native_guard) = private_root();
     let append = root(dir.path());
     for name in ["", "../outside", "/absolute"] {
         assert!(append.open_private_append(Path::new(name)).is_err());
@@ -87,7 +107,7 @@ fn ordinary_returned_file_propagates_write_source_errors() {
             Err(std::io::Error::other("source failure"))
         }
     }
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _native_guard) = private_root();
     let append = root(dir.path());
     let mut file = append.open_private_append(Path::new("day.log")).unwrap();
     let error = std::io::copy(&mut Failed, &mut file).unwrap_err();

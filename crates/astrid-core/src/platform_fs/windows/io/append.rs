@@ -1,6 +1,7 @@
 //! Guarded private append open: create-or-open without overwrite authority.
 
 use super::super::acl::{apply_private_acl_to_handle, validate_private_acl_handle};
+use super::super::captured_directory::query_directory_identity;
 use super::super::path::{BoundaryContract, TrustedPathGuard};
 use super::super::prelude::*;
 use super::open_guarded_child_with_options;
@@ -8,6 +9,61 @@ use super::open_guarded_child_with_options;
 #[cfg(test)]
 thread_local! {
     pub(in crate::platform_fs::windows) static TEST_APPLY_PRIVATE_ACL_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn open_existing_private_append(
+    guard: &TrustedPathGuard,
+    name: &OsStr,
+    access: u32,
+    sharing: u32,
+) -> io::Result<File> {
+    // Keep the ordinary existing-private-file path to one leaf open. Only a
+    // DACL that denies append needs the separate owner-repair authority.
+    match open_guarded_child_with_options(
+        guard.authority_handle(),
+        name,
+        access,
+        sharing,
+        FILE_OPEN,
+    ) {
+        Ok(handle) => {
+            repair_existing_private_append_acl(handle.0)?;
+            return Ok(File::from(handle));
+        },
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {},
+        Err(error) => return Err(error),
+    }
+    // An owner retains READ_CONTROL/WRITE_DAC even when the existing DACL no
+    // longer grants append. Repair that retained identity before asking for
+    // append access, and omit delete sharing until the append handle is bound.
+    let repair = File::from(open_guarded_child_with_options(
+        guard.authority_handle(),
+        name,
+        FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_OPEN,
+    )?);
+    repair_existing_private_append_acl(repair.as_raw_handle().cast())?;
+    validate_private_acl_handle(
+        repair.as_raw_handle().cast(),
+        false,
+        &name.to_string_lossy(),
+    )?;
+    let handle = open_guarded_child_with_options(
+        guard.authority_handle(),
+        name,
+        access,
+        sharing,
+        FILE_OPEN,
+    )?;
+    let file = File::from(handle);
+    if query_directory_identity(&file)? != query_directory_identity(&repair)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "append leaf changed during ACL repair",
+        ));
+    }
+    Ok(file)
 }
 
 fn repair_existing_private_append_acl(handle: HANDLE) -> io::Result<()> {
@@ -23,35 +79,32 @@ pub(in crate::platform_fs::windows) fn open_guarded_private_append(
     guard.verify_contract(BoundaryContract::ExactPrivateDirectory)?;
     let access = FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC;
     let sharing = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-    let (handle, created) = match open_guarded_child_with_options(
+    let file = match open_guarded_child_with_options(
         guard.authority_handle(),
         name,
         access,
         sharing,
         FILE_CREATE,
     ) {
-        Ok(handle) => (handle, true),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (
-            open_guarded_child_with_options(
-                guard.authority_handle(),
-                name,
-                access,
-                sharing,
-                FILE_OPEN,
-            )?,
-            false,
-        ),
+        Ok(handle) => File::from(handle),
+        // An existing leaf can deny append before FILE_CREATE reports the
+        // collision. Only an independently authorized owner-repair open may
+        // recover that case; no write proceeds under the old DACL.
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::AlreadyExists | io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            open_existing_private_append(guard, name, access, sharing)?
+        },
         Err(error) => return Err(error),
     };
     // FILE_CREATE already installs the protected DACL. Existing leaves still
     // need repair. FILE_WRITE_DATA is never requested: ordinary writes append.
     // Rust 1.95 OpenOptions.append also withholds FILE_WRITE_DATA, and
     // File::sync_all is FlushFileBuffers on that same append handle.
-    if !created {
-        repair_existing_private_append_acl(handle.0)?;
-    }
-    validate_private_acl_handle(handle.0, false, &name.to_string_lossy())?;
-    let file = File::from(handle);
+    validate_private_acl_handle(file.as_raw_handle().cast(), false, &name.to_string_lossy())?;
     let observed = File::from(open_guarded_child_with_options(
         guard.authority_handle(),
         name,
@@ -59,9 +112,7 @@ pub(in crate::platform_fs::windows) fn open_guarded_private_append(
         sharing,
         FILE_OPEN,
     )?);
-    if super::super::captured_directory::query_directory_identity(&observed)?
-        != super::super::captured_directory::query_directory_identity(&file)?
-    {
+    if query_directory_identity(&observed)? != query_directory_identity(&file)? {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "append leaf binding changed",

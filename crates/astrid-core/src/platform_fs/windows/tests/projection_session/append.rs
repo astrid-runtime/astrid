@@ -150,11 +150,18 @@ fn append_repairs_existing_leaf_acl_without_rewriting_birth_acl() {
     assert_eq!(TEST_APPLY_PRIVATE_ACL_COUNT.with(std::cell::Cell::get), 0);
 
     super::super::set_world_entry(&dir.path().join("day.log"), FILE_GENERIC_READ, true);
-    let file = append.open_private_append(Path::new("day.log")).unwrap();
+    let mut file = append.open_private_append(Path::new("day.log")).unwrap();
     assert!(TEST_APPLY_PRIVATE_ACL_COUNT.with(std::cell::Cell::get) >= 1);
     validate_private_acl_handle(file.as_raw_handle().cast(), false, "repaired daily log").unwrap();
-    drop(file);
     assert_eq!(std::fs::read(dir.path().join("day.log")).unwrap(), b"kept");
+    file.seek(std::io::SeekFrom::Start(0)).unwrap();
+    file.write_all(b" appended").unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    assert_eq!(
+        std::fs::read(dir.path().join("day.log")).unwrap(),
+        b"kept appended"
+    );
 }
 
 #[test]
@@ -191,4 +198,17 @@ fn append_leaf_birth_does_not_add_a_projection_namespace_flush() {
     drop(fault);
     file.write_all(b"line").unwrap();
     assert_eq!(std::fs::read(dir.path().join("day.log")).unwrap(), b"line");
+}
+
+#[test]
+fn append_capture_rejects_an_existing_nonprivate_root_without_repair() {
+    use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
+
+    let _serial = serial_test_guard();
+    let dir = private_temp();
+    super::super::set_world_entry(dir.path(), FILE_GENERIC_READ, true);
+    assert!(crate::platform_fs::ensure_private_directory(dir.path()).is_err());
+    assert!(PrivateProjectionInspection::try_open(dir.path()).is_err());
+    assert!(validate_private_acl(dir.path(), true).is_err());
+    assert!(!dir.path().join("day.log").exists());
 }
