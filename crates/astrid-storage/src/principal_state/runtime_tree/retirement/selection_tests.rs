@@ -6,7 +6,7 @@ fn source_selection_preserves_component_prefix_authority() {
         Path::new("log").join("principals").join("a"),
         Path::new("log").join("principals").join("b").join("nested"),
     ];
-    let scopes = paths.iter().map(|path| path.as_path()).collect();
+    let scopes = paths.iter().map(std::path::PathBuf::as_path).collect();
     for (name, selected) in [
         ("log/principals/a", true),
         ("log/principals/a/capsule/day.log", true),

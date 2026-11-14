@@ -194,7 +194,7 @@ fn prepare<'a>(
                 let selected_sources = selected.map(|scopes| {
                     scopes
                         .iter()
-                        .map(|scope| scope.as_path())
+                        .map(std::path::PathBuf::as_path)
                         .collect::<BTreeSet<_>>()
                 });
                 astrid_core::dirs::PreparedProjectionRetirement::prepare_checked(
