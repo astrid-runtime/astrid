@@ -7,8 +7,8 @@
 
 use crate::storage_model::physical::CanonicalRootProof;
 use crate::storage_model::{
-    CanonicalPhysicalMap, ObjectId, PhysicalMapDomain, PhysicalMapNode, PhysicalMapNodeId,
-    PlacementSet, RepresentationCatalogueRoot, RepresentationProfileId, RepresentationRecordId,
+    CanonicalPhysicalMap, ObjectId, PhysicalMapDomain, PhysicalMapNodeId, PlacementSet,
+    RepresentationCatalogueRoot, RepresentationProfileId, RepresentationRecordId,
     RepresentationState, RepresentationStateId,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -383,7 +383,7 @@ impl LiveTipRefs<'_> {
                         ))
                     },
                     MetadataKind::MapNode => {
-                        inspect_map_node_frame(self, &canonical.reachable, &frame)?;
+                        inspect_map_node_frame(self, canonical, &frame)?;
                         if !observed.insert(PhysicalMapNodeId::new(frame.identity)) {
                             return Err(DurableError::InvalidRepresentationState(
                                 "checkpoint metadata frame count disagrees with unique node set",
@@ -546,25 +546,19 @@ impl RepresentationStore {
 
 fn inspect_map_node_frame(
     store: &LiveTipRefs<'_>,
-    reachable: &BTreeSet<PhysicalMapNodeId>,
+    canonical: &CanonicalTip<'_>,
     frame: &MetadataFrame<&[u8]>,
 ) -> Result<(), DurableError> {
     let id = PhysicalMapNodeId::new(frame.identity);
-    if !reachable.contains(&id) {
+    if !canonical.reachable.contains(&id) {
         return Err(DurableError::InvalidRepresentationState(
             "checkpoint metadata contains an unsealed map node",
         ));
     }
-    let identified = PhysicalMapNode::with_child_ids_and_identify(
-        frame.value,
-        &Blake3PhysicalIdentity,
-        |identified, _children| identified,
-    )?;
-    if identified != id {
-        return Err(DurableError::InvalidRepresentationState(
-            "metadata identity does not match canonical value",
-        ));
-    }
+    // The private canonical proof validated each immutable live body's grammar
+    // and identity. Exact comparison below binds fresh bytes to that same body;
+    // decoding and hashing them again adds no independent validation. Frame
+    // checksums and complete closure checks still authenticate fresh media.
     let mut matched = false;
     for map in [
         &store.profiles,

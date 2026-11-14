@@ -245,6 +245,102 @@ fn sealed_metadata_rejects_envelope_identity_body_mismatch() {
     );
 }
 
+fn rewrite_sealed_map_nodes(
+    metadata: &mut DurableFile,
+    limits: RecoveryLimits,
+    mut rewrite: impl FnMut(&mut MetadataFrame<Vec<u8>>) -> bool,
+) {
+    use super::super::super::scan_frames;
+    let mut payloads = Vec::new();
+    scan_frames(
+        metadata,
+        super::super::format::METADATA_FILE,
+        METADATA_MAGIC,
+        limits,
+        |_, payload| {
+            payloads.push(payload.to_vec());
+            Ok(())
+        },
+    )
+    .unwrap();
+    metadata.set_len(0).unwrap();
+    metadata.seek(SeekFrom::Start(0)).unwrap();
+    let mut rewritten = false;
+    for payload in payloads {
+        let decoded = MetadataFrame::decode(&payload).unwrap();
+        let mut frame = MetadataFrame {
+            kind: decoded.kind,
+            identity: decoded.identity,
+            value: decoded.value.to_vec(),
+        };
+        if !rewritten && frame.kind == MetadataKind::MapNode && rewrite(&mut frame) {
+            rewritten = true;
+            append_frame(metadata, METADATA_MAGIC, &frame.encode().unwrap()).unwrap();
+        } else {
+            append_frame(metadata, METADATA_MAGIC, &payload).unwrap();
+        }
+    }
+    assert!(rewritten, "expected to rewrite one sealed map node");
+    metadata.sync_data().unwrap();
+}
+
+#[test]
+fn sealed_map_node_trailing_body_bytes_disagree_with_the_live_tip() {
+    let (_directory, volume, mut store, limits) = primed_volume();
+    let (mut metadata, mut journal) = next_generation_files(&store, &volume);
+    let mut emit = store
+        .emit_sealed_generation(&mut metadata, &mut journal)
+        .unwrap();
+    let journal_len = journal.metadata().unwrap().len();
+    rewrite_sealed_map_nodes(&mut metadata, limits, |frame| {
+        frame.value.push(0);
+        true
+    });
+    emit.retarget_expected_lengths(metadata.metadata().unwrap().len(), journal_len);
+    store
+        .verify_sealed_generation_for_adoption(&mut metadata, &mut journal, &emit, limits)
+        .expect_err("trailing map-node bytes must fail closed");
+}
+
+#[test]
+fn sealed_map_node_keeps_reachable_identity_and_rejects_a_foreign_live_body() {
+    let (_directory, volume, mut store, limits) = primed_volume();
+    let (mut metadata, mut journal) = next_generation_files(&store, &volume);
+    let mut emit = store
+        .emit_sealed_generation(&mut metadata, &mut journal)
+        .unwrap();
+    let journal_len = journal.metadata().unwrap().len();
+    let foreign_body = store
+        .placement_entries
+        .nodes()
+        .values()
+        .chain(store.representations.nodes().values())
+        .chain(store.profiles.nodes().values())
+        .map(|node| node.encode().unwrap())
+        .find(|bytes| {
+            store
+                .profiles
+                .nodes()
+                .values()
+                .chain(store.representations.nodes().values())
+                .chain(store.placement_entries.nodes().values())
+                .any(|node| node.encode().unwrap() != *bytes)
+        })
+        .expect("need a distinct live map node body");
+    rewrite_sealed_map_nodes(&mut metadata, limits, |frame| {
+        if frame.value == foreign_body {
+            false
+        } else {
+            frame.value = foreign_body.clone();
+            true
+        }
+    });
+    emit.retarget_expected_lengths(metadata.metadata().unwrap().len(), journal_len);
+    store
+        .verify_sealed_generation_for_adoption(&mut metadata, &mut journal, &emit, limits)
+        .expect_err("foreign live body under a reachable identity must fail closed");
+}
+
 #[test]
 fn unpublished_verified_adoption_candidate_does_not_publish_current() {
     let (_directory, volume, mut store, limits) = primed_volume();
