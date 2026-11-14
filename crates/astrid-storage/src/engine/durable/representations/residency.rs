@@ -38,24 +38,32 @@ impl RepresentationStore {
             .len()
             .saturating_add(self.representations.nodes().len())
             .saturating_add(self.placement_entries.nodes().len());
-        let mut reclaimed = self.persisted_map_nodes.len() > resident;
+        let mut reclaimed = self
+            .persisted_map_nodes
+            .len()
+            .saturating_add(self.complete_map_subtrees.len())
+            > resident;
         let collection = (|| -> Result<(), DurableError> {
-            for (map, baseline) in [
-                (&mut self.profiles, &mut self.residency.profiles),
-                (
-                    &mut self.representations,
-                    &mut self.residency.representations,
-                ),
-                (&mut self.placement_entries, &mut self.residency.placements),
-            ] {
-                // Dense pages can contain many entries per node. Measure reachable
-                // nodes rather than treating the binary worst case as live memory.
-                // A doubling amortizes each traversal over growth or path copies.
-                if map.nodes().len() > baseline.saturating_mul(2) {
-                    map.reclaim_unreachable_nodes()?;
-                    *baseline = map.nodes().len();
-                    reclaimed = true;
-                }
+            // Dense pages can contain many entries per node. Measure reachable
+            // nodes rather than treating the binary worst case as live memory.
+            // A doubling amortizes each traversal over growth or path copies.
+            // Unrolled across typed maps: a shared loop cannot hold heterogeneous
+            // &mut ProfileMap / RepresentationMap / PlacementMap.
+            if self.profiles.nodes().len() > self.residency.profiles.saturating_mul(2) {
+                self.profiles.reclaim_unreachable_nodes()?;
+                self.residency.profiles = self.profiles.nodes().len();
+                reclaimed = true;
+            }
+            if self.representations.nodes().len() > self.residency.representations.saturating_mul(2)
+            {
+                self.representations.reclaim_unreachable_nodes()?;
+                self.residency.representations = self.representations.nodes().len();
+                reclaimed = true;
+            }
+            if self.placement_entries.nodes().len() > self.residency.placements.saturating_mul(2) {
+                self.placement_entries.reclaim_unreachable_nodes()?;
+                self.residency.placements = self.placement_entries.nodes().len();
+                reclaimed = true;
             }
             Ok(())
         })();
@@ -71,7 +79,10 @@ impl RepresentationStore {
                     || placements.contains_key(id)
             };
             if collection.is_err() {
-                self.complete_map_subtrees.clear();
+                // Retain knowledge of existing frames, but revoke their closure
+                // proofs when a later map fails after partial collection.
+                self.persisted_map_nodes
+                    .append(&mut self.complete_map_subtrees);
             } else {
                 // Immutable resident nodes keep their complete durable closure:
                 // successful collection retains every reachable descendant.
@@ -87,3 +98,6 @@ impl RepresentationStore {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod recovery_tests;

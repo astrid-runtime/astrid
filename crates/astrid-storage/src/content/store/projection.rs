@@ -1,8 +1,8 @@
 use super::{
-    Arc, BTreeMap, CatalogRoot, ContentObjectSink, InsertOutcome, ModelError, ObjectClass,
-    ObjectId, ObjectRecord, ObjectReference, PhantomData, PrincipalContentError,
-    PrincipalProjectionEngine, PrincipalProjectionError, ProjectionCachePayload, ReferenceKind,
-    ReferenceLabel, RootState, STAGING_BATCH_TARGET_BYTES, VerifiedContent,
+    Arc, BTreeMap, CatalogRoot, ContentObjectSink, InsertOutcome, ModelError,
+    NATIVE_CONTENT_BATCH_BYTES, ObjectClass, ObjectId, ObjectRecord, ObjectReference, PhantomData,
+    PrincipalContentError, PrincipalProjectionEngine, PrincipalProjectionError,
+    ProjectionCachePayload, ReferenceKind, ReferenceLabel, RootState, VerifiedContent,
 };
 use crate::content_dag::{
     ContentReadError, ContentSource, ContentStreamError, ContentVerificationState,
@@ -305,7 +305,7 @@ where
             .saturating_add(staged_record_size(&record));
         self.peak_pending_bytes = self.peak_pending_bytes.max(self.pending_bytes);
         self.pending.insert(id, record);
-        if self.pending_bytes >= STAGING_BATCH_TARGET_BYTES {
+        if self.pending_bytes >= NATIVE_CONTENT_BATCH_BYTES {
             self.finish()?;
         }
         Ok(id)

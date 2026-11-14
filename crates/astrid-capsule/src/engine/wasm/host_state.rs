@@ -272,6 +272,8 @@ pub struct HostState {
     /// Capsule `astrid_log` output writes here instead of the system tracing
     /// subscriber. `None` if the log file couldn't be opened.
     pub capsule_log: Option<Arc<std::sync::Mutex<std::fs::File>>>,
+    // Opt-in is private to the engine factory; public file fields never select it.
+    pub(super) deferred_logs: super::native_logs::DeferredBindings,
     /// Context of the current caller (set per-invocation by the dispatcher).
     pub caller_context: Option<astrid_events::ipc::IpcMessage>,
     /// `true` while a kernel-dispatched interceptor is executing.

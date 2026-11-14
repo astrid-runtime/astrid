@@ -1,35 +1,39 @@
 //! Authoritative physical representation catalogue and placement state.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::SeekFrom;
 use std::path::Path;
 
+use crate::storage_model::physical::{PlacementMap, ProfileMap, RepresentationMap};
 use crate::storage_model::{
-    CanonicalPhysicalMap, Coverage, Dependency, ObjectId, PhysicalMapDomain, PhysicalMapKey,
-    PlacementEntry, PlacementSet, ProfileDependency, Recipe, Replica, ReplicaLocator,
-    RepresentationCatalogueRoot, RepresentationProfile, RepresentationProfileId,
-    RepresentationRecord, RepresentationRecordId, RepresentationState, RepresentationStateId,
-    StorageNodeId,
+    Coverage, Dependency, ObjectId, PhysicalMapDomain, PhysicalMapKey, PlacementEntry,
+    PlacementSet, ProfileDependency, Recipe, Replica, ReplicaLocator, RepresentationCatalogueRoot,
+    RepresentationProfile, RepresentationProfileId, RepresentationRecord, RepresentationRecordId,
+    RepresentationState, RepresentationStateId, StorageNodeId,
 };
 
 use super::File as DurableFile;
 #[cfg(test)]
 use super::open_rw;
 use super::{
-    ArenaLocation, DurableError, DurableIo, FRAME_HEADER_LEN, PersistentObjectIdentity,
-    RecoveryLimits, append_frame, append_frames, canonical_record_bytes, io_error,
-    read_indexed_object_with_payload,
+    ArenaLocation, DurableError, DurableIo, FRAME_HEADER_LEN, FramedAppendStream,
+    PersistentObjectIdentity, RecoveryLimits, append_frame, append_frames, canonical_record_bytes,
+    io_error, read_indexed_object_with_payload,
 };
 use format::{
     Blake3PhysicalIdentity, CurrentPointer, JOURNAL_MAGIC, JournalEntry, METADATA_MAGIC,
-    MetadataFrame, MetadataKind, journal_digest,
+    MetadataFrame, MetadataKind,
 };
 
 mod activation;
 mod authority;
 mod checkpoint;
+mod digest;
 mod format;
+use digest::{digest_journal_file, digest_journal_prefix, journal_byte_len};
 mod index_validation;
+pub(super) use index_validation::GenerationZeroIndex;
+#[cfg(test)]
+pub(super) use index_validation::count_extractions_during;
 mod recovery;
 mod residency;
 
@@ -104,11 +108,15 @@ pub(super) struct RepresentationStore {
     catalogue: RepresentationCatalogueRoot,
     placements: PlacementSet,
     residency: residency::MapResidency,
-    profiles: CanonicalPhysicalMap,
-    representations: CanonicalPhysicalMap,
-    placement_entries: CanonicalPhysicalMap,
+    profiles: ProfileMap,
+    representations: RepresentationMap,
+    placement_entries: PlacementMap,
+    // Persisted frames without a memoized descendant closure. These IDs are
+    // disjoint from complete_map_subtrees; neither set retains evicted nodes.
     persisted_map_nodes: BTreeSet<crate::storage_model::PhysicalMapNodeId>,
-    // Memoized durable descendant closures; discarded when the store is reopened.
+    /// Durable `MapNode` frames in the current generation, including duplicates.
+    map_frame_count: u64,
+    // Complete durable closures, authenticated on recovery or checked by append.
     complete_map_subtrees: BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     direct_profile: RepresentationProfileId,
     reverse: BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
@@ -135,6 +143,20 @@ impl RepresentationStore {
         store_root: &cap_std::fs::Dir,
         limits: RecoveryLimits,
     ) -> Result<Option<Self>, DurableError> {
+        Ok(Self::open_inner::<false>(store_root, limits)?.map(|(store, _)| store))
+    }
+
+    pub(super) fn open_for_recovery(
+        store_root: &cap_std::fs::Dir,
+        limits: RecoveryLimits,
+    ) -> Result<Option<(Self, index_validation::GenerationZeroPlacements)>, DurableError> {
+        Self::open_inner::<true>(store_root, limits)
+    }
+
+    fn open_inner<const COLLECT_PLACEMENTS: bool>(
+        store_root: &cap_std::fs::Dir,
+        limits: RecoveryLimits,
+    ) -> Result<Option<(Self, index_validation::GenerationZeroPlacements)>, DurableError> {
         let root_directory = match contiguous::open_representation_root(store_root) {
             Ok(root) => root,
             Err(DurableError::Io { source, .. })
@@ -167,7 +189,7 @@ impl RepresentationStore {
         let mut journal = DurableFile::native(open_cap_file(&generation, Path::new(JOURNAL_PATH))?);
         let index = recover_metadata(&mut metadata, limits)?;
         let (active, state) = recover_journal(&mut journal, current, &index, limits)?;
-        let recovered = Self::from_recovered(
+        let recovered = Self::from_recovered::<COLLECT_PLACEMENTS>(
             metadata,
             journal,
             current.journal_generation,
@@ -218,8 +240,8 @@ impl RepresentationStore {
         journal
             .sync_data()
             .map_err(|source| io_error("flush representation checkpoint", source))?;
-        let checkpoint_bytes = read_all(&mut journal, "read representation checkpoint")?;
-        let checkpoint_digest = journal_digest(&checkpoint_bytes);
+        let checkpoint_digest =
+            digest_journal_file(&mut journal, "digest representation checkpoint")?;
         let state_cas = JournalEntry::StateCas {
             journal_generation: FIRST_JOURNAL_GENERATION,
             expected: None,
@@ -306,7 +328,7 @@ impl RepresentationStore {
 
     pub(super) fn logical_liveness_roots(&self) -> Result<BTreeSet<ObjectId>, DurableError> {
         let mut roots = BTreeSet::new();
-        for (_, bytes) in recovery::active_entries(&self.profiles)? {
+        for (_, bytes) in recovery::active_entries(self.profiles.as_canonical())? {
             let profile = RepresentationProfile::decode(bytes)?;
             roots.extend(
                 profile
@@ -318,7 +340,7 @@ impl RepresentationStore {
                     }),
             );
         }
-        for (_, bytes) in recovery::active_entries(&self.representations)? {
+        for (_, bytes) in recovery::active_entries(self.representations.as_canonical())? {
             let record = RepresentationRecord::decode(bytes)?;
             roots.extend(
                 record
@@ -372,7 +394,11 @@ impl RepresentationStore {
         &self,
         excluded: &BTreeSet<ObjectId>,
     ) -> Result<(), DurableError> {
-        recovery::ensure_no_excluded_object_coverage(&self.representations, &self.reverse, excluded)
+        recovery::ensure_no_excluded_object_coverage(
+            self.representations.as_canonical(),
+            &self.reverse,
+            excluded,
+        )
     }
 
     pub(super) fn contains_direct(&self, object: ObjectId) -> bool {
@@ -425,20 +451,18 @@ impl RepresentationStore {
             .collect::<Vec<_>>();
         if rebuild_representations {
             self.representations
-                .rebuild_with_entries(&Blake3PhysicalIdentity, representation_entries)?;
+                .rebuild_with_entries(representation_entries)?;
         } else {
             for (key, value) in representation_entries {
-                self.representations
-                    .insert(&Blake3PhysicalIdentity, key, value)?;
+                self.representations.insert(key, value)?;
             }
         }
         if rebuild_placements {
             self.placement_entries
-                .rebuild_with_entries(&Blake3PhysicalIdentity, placement_entries)?;
+                .rebuild_with_entries(placement_entries)?;
         } else {
             for (key, value) in placement_entries {
-                self.placement_entries
-                    .insert(&Blake3PhysicalIdentity, key, value)?;
+                self.placement_entries.insert(key, value)?;
             }
         }
         let reverse_additions = entries
@@ -448,15 +472,15 @@ impl RepresentationStore {
         let mut appended_map_nodes = BTreeSet::new();
         append_new_reachable_map_nodes(
             &mut metadata,
-            &self.representations,
-            &self.persisted_map_nodes,
+            self.representations.as_canonical(),
+            &mut self.persisted_map_nodes,
             &mut appended_map_nodes,
             &mut self.complete_map_subtrees,
         )?;
         append_new_reachable_map_nodes(
             &mut metadata,
-            &self.placement_entries,
-            &self.persisted_map_nodes,
+            self.placement_entries.as_canonical(),
+            &mut self.persisted_map_nodes,
             &mut appended_map_nodes,
             &mut self.complete_map_subtrees,
         )?;
@@ -472,8 +496,14 @@ impl RepresentationStore {
             .iter()
             .map(MetadataFrame::encode)
             .collect::<Result<Vec<_>, _>>()?;
+        let map_frames =
+            u64::try_from(appended_map_nodes.len()).map_err(|_| DurableError::EncodingOverflow)?;
         append_frames(&mut self.metadata, METADATA_MAGIC, &payloads)?;
         self.persisted_map_nodes.extend(appended_map_nodes);
+        self.map_frame_count = self
+            .map_frame_count
+            .checked_add(map_frames)
+            .ok_or(DurableError::EncodingOverflow)?;
         Ok(Some(PendingRepresentationUpdate {
             state,
             state_id,
@@ -512,20 +542,12 @@ impl RepresentationStore {
             .iter()
             .map(|entry| entry.placement.clone())
             .collect();
-        self.representations = CanonicalPhysicalMap::build_dense(
-            &Blake3PhysicalIdentity,
-            PhysicalMapDomain::Representation,
-            representation_entries,
-        )?;
-        self.placement_entries = CanonicalPhysicalMap::build_dense(
-            &Blake3PhysicalIdentity,
-            PhysicalMapDomain::Placement,
-            placement_entries,
-        )?;
+        self.representations = RepresentationMap::build_dense(representation_entries)?;
+        self.placement_entries = PlacementMap::build_dense(placement_entries)?;
         self.residency = residency::MapResidency::new(
-            &self.profiles,
-            &self.representations,
-            &self.placement_entries,
+            self.profiles.as_canonical(),
+            self.representations.as_canonical(),
+            self.placement_entries.as_canonical(),
         );
         let replacement_reverse = entries
             .into_iter()
@@ -534,11 +556,14 @@ impl RepresentationStore {
 
         let mut metadata = Vec::new();
         let mut appended_map_nodes = BTreeSet::new();
-        for map in [&self.representations, &self.placement_entries] {
+        for map in [
+            self.representations.as_canonical(),
+            self.placement_entries.as_canonical(),
+        ] {
             append_new_reachable_map_nodes(
                 &mut metadata,
                 map,
-                &self.persisted_map_nodes,
+                &mut self.persisted_map_nodes,
                 &mut appended_map_nodes,
                 &mut self.complete_map_subtrees,
             )?;
@@ -554,8 +579,14 @@ impl RepresentationStore {
             .iter()
             .map(MetadataFrame::encode)
             .collect::<Result<Vec<_>, _>>()?;
+        let map_frames =
+            u64::try_from(appended_map_nodes.len()).map_err(|_| DurableError::EncodingOverflow)?;
         append_frames(&mut self.metadata, METADATA_MAGIC, &payloads)?;
         self.persisted_map_nodes.extend(appended_map_nodes);
+        self.map_frame_count = self
+            .map_frame_count
+            .checked_add(map_frames)
+            .ok_or(DurableError::EncodingOverflow)?;
         let update = PendingRepresentationUpdate {
             state,
             state_id,
@@ -709,40 +740,9 @@ impl RepresentationStore {
             .map_err(|source| io_error("flush representation state journal", source))
     }
 
-    /// Return the arena prefix proven durable by published physical state.
-    ///
-    /// A malformed frame below this boundary is corruption, not a repairable
-    /// uncommitted tail. Recovery consults this value before it may truncate
-    /// the logical arena.
-    pub(super) fn generation_zero_protected_len(&self) -> Result<u64, DurableError> {
-        self.direct_arena_locations()?
-            .into_iter()
-            .try_fold(0_u64, |protected, (_, location)| {
-                let end = location
-                    .offset
-                    .checked_add(FRAME_HEADER_LEN)
-                    .and_then(|value| value.checked_add(location.payload_len))
-                    .ok_or(DurableError::EncodingOverflow)?;
-                Ok(protected.max(end))
-            })
-    }
-
-    /// Validate that generation-zero placements name the recovered arena
-    /// index exactly.
-    ///
-    /// This is mount-time topology validation, not an implicit full-store
-    /// scrub. Authoritative object reads verify the named frame checksum,
-    /// canonical encoding, and logical identity before returning bytes. A
-    /// scheduled refinery pass owns proactive full-corpus re-attestation.
-    pub(super) fn validate_generation_zero_index(
-        &self,
-        index: &BTreeMap<ObjectId, ArenaLocation>,
-    ) -> Result<(), DurableError> {
-        let direct = self.direct_arena_locations()?;
-        index_validation::validate(&direct, index)
-    }
-
     fn direct_arena_locations(&self) -> Result<Vec<(ObjectId, ArenaLocation)>, DurableError> {
+        #[cfg(test)]
+        index_validation::DIRECT_EXTRACTIONS.with(|count| count.set(count.get().strict_add(1)));
         let mut direct = Vec::new();
         for (object, records) in &self.reverse {
             let record = records
@@ -796,7 +796,7 @@ impl RepresentationStore {
         Ok(direct)
     }
 
-    fn from_recovered(
+    fn from_recovered<const COLLECT_PLACEMENTS: bool>(
         metadata: DurableFile,
         journal: DurableFile,
         journal_generation: u64,
@@ -804,31 +804,41 @@ impl RepresentationStore {
         state: RepresentationState,
         mut index: MetadataIndex,
         limits: RecoveryLimits,
-    ) -> Result<Self, DurableError> {
+    ) -> Result<(Self, index_validation::GenerationZeroPlacements), DurableError> {
         let catalogue = RepresentationCatalogueRoot::decode(
             index.value(MetadataKind::Catalogue, state.catalogue().as_bytes())?,
         )?;
         let placements = PlacementSet::decode(
             index.value(MetadataKind::Placement, state.placements().as_bytes())?,
         )?;
-        let profiles = index.recover_active_map(
-            PhysicalMapDomain::Profile,
+        let profiles = ProfileMap::recover_exact(
             catalogue.profiles_root(),
-            &metadata,
-            limits,
+            index.recover_active_nodes(
+                PhysicalMapDomain::Profile,
+                catalogue.profiles_root(),
+                &metadata,
+                limits,
+            )?,
         )?;
-        let representations = index.recover_active_map(
-            PhysicalMapDomain::Representation,
+        let representations = RepresentationMap::recover_exact(
             catalogue.representations_root(),
-            &metadata,
-            limits,
+            index.recover_active_nodes(
+                PhysicalMapDomain::Representation,
+                catalogue.representations_root(),
+                &metadata,
+                limits,
+            )?,
         )?;
-        let placement_entries = index.recover_active_map(
-            PhysicalMapDomain::Placement,
+        let placement_entries = PlacementMap::recover_exact(
             placements.entries_root(),
-            &metadata,
-            limits,
+            index.recover_active_nodes(
+                PhysicalMapDomain::Placement,
+                placements.entries_root(),
+                &metadata,
+                limits,
+            )?,
         )?;
+        let map_frame_count = index.map_frame_count;
         // Active closures now own their nodes. Release unused historical links
         // and replay metadata before allocating the validated reverse index.
         drop(index);
@@ -843,38 +853,91 @@ impl RepresentationStore {
         // This is an append memo, not the durable historical catalogue. Journal
         // recovery has checked historical frame identities and CAS closure
         // completeness. Active maps receive full canonical validation above.
-        // An evicted node can be appended again with its canonical ID.
-        let persisted_map_nodes = [&profiles, &representations, &placement_entries]
-            .into_iter()
-            .flat_map(|map| map.nodes().keys().copied())
-            .collect();
-        let residency =
-            residency::MapResidency::new(&profiles, &representations, &placement_entries);
-        let direct_profile = validate_profiles(&profiles)?;
-        let (reverse, extent_count) =
-            validate_representations(&profiles, &representations, &placement_entries)?;
+        // Seed closure proofs from those authenticated active nodes without a
+        // duplicate ID set or another first-write traversal. Evicted nodes can
+        // be appended again with their canonical IDs.
+        let complete_map_subtrees = [
+            profiles.as_canonical(),
+            representations.as_canonical(),
+            placement_entries.as_canonical(),
+        ]
+        .into_iter()
+        .flat_map(|map| map.nodes().keys().copied())
+        .collect();
+        let residency = residency::MapResidency::new(
+            profiles.as_canonical(),
+            representations.as_canonical(),
+            placement_entries.as_canonical(),
+        );
+        let direct_profile = validate_profiles(profiles.as_canonical())?;
+        let recovery::ValidatedRepresentations {
+            reverse,
+            extent_count,
+            generation_zero,
+        } = validate_representations::<COLLECT_PLACEMENTS>(
+            profiles.as_canonical(),
+            representations.as_canonical(),
+            placement_entries.as_canonical(),
+            direct_profile,
+        )?;
         if extent_count != placements.replica_extent_count() {
             return Err(DurableError::InvalidRepresentationState(
                 "placement extent count disagrees with map entries",
             ));
         }
-        Ok(Self {
-            metadata,
-            journal,
-            journal_generation,
-            active,
-            state,
-            catalogue,
-            placements,
-            residency,
-            profiles,
-            representations,
-            placement_entries,
-            persisted_map_nodes,
-            complete_map_subtrees: BTreeSet::new(),
-            direct_profile,
-            reverse,
-        })
+        Ok((
+            Self {
+                metadata,
+                journal,
+                journal_generation,
+                active,
+                state,
+                catalogue,
+                placements,
+                residency,
+                profiles,
+                representations,
+                placement_entries,
+                persisted_map_nodes: BTreeSet::new(),
+                map_frame_count,
+                complete_map_subtrees,
+                direct_profile,
+                reverse,
+            },
+            generation_zero,
+        ))
+    }
+
+    /// Resident `MapNode` count, including transient unreachable nodes.
+    ///
+    /// Residency collection bounds this above the reachable tip. Scheduling
+    /// against this upper bound avoids traversing the maps on every commit.
+    ///
+    /// Shared content-addressed node IDs across maps make the true unique tip
+    /// count `<=` this value; fire/residue math stays conservative.
+    pub(in crate::engine::durable) fn resident_map_node_count(&self) -> u64 {
+        u64::try_from(
+            self.profiles
+                .nodes()
+                .len()
+                .saturating_add(self.representations.nodes().len())
+                .saturating_add(self.placement_entries.nodes().len()),
+        )
+        .unwrap_or(u64::MAX)
+    }
+
+    pub(in crate::engine::durable) fn map_frame_count(&self) -> u64 {
+        self.map_frame_count
+    }
+
+    /// Rewrite when obsolete frames provably reach the resident node count.
+    ///
+    /// Subtracting resident nodes gives a lower bound on obsolete frames, so
+    /// transient unreachable residency can defer a checkpoint, never cause an
+    /// early one. This is scheduling evidence only, not recovery authority.
+    pub(in crate::engine::durable) fn should_checkpoint_representations_metadata(&self) -> bool {
+        let tip = self.resident_map_node_count();
+        tip > 0 && self.map_frame_count.saturating_sub(tip) >= tip
     }
 }
 
@@ -891,17 +954,6 @@ fn bulk_rebuild_is_cheaper(existing: u64, additions: usize) -> Result<bool, Dura
         .and_then(|nodes| nodes.checked_sub(1))
         .ok_or(DurableError::EncodingOverflow)?;
     Ok(estimated_path_nodes > final_tree_nodes)
-}
-
-fn read_all<F: DurableIo>(file: &mut F, operation: &'static str) -> Result<Vec<u8>, DurableError> {
-    file.seek(SeekFrom::Start(0))
-        .map_err(|source| io_error(operation, source))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|source| io_error(operation, source))?;
-    file.seek(SeekFrom::End(0))
-        .map_err(|source| io_error(operation, source))?;
-    Ok(bytes)
 }
 
 fn increment(value: u64) -> Result<u64, DurableError> {

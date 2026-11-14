@@ -65,7 +65,11 @@ fn begin_collision_preserves_the_existing_generation() {
     let directory = tempfile::tempdir().unwrap();
     let area = open_area(directory.path());
     let id = StagedContentId(Uuid::from_u128(42));
-    let path = area.inner.generations.join(open_generation_name(id));
+    let path = area
+        .acquire_open()
+        .unwrap()
+        .generations
+        .join(open_generation_name(id));
     std::fs::write(&path, b"other writer's bytes").unwrap();
 
     let error = area
@@ -191,7 +195,7 @@ fn seal_stays_bound_to_the_opened_generation_directory() {
         sequence: sealed.sequence,
         id,
     };
-    retirement::establish_in(&area.inner.generations_directory, key).unwrap();
+    retirement::establish_in(&area.acquire_open().unwrap().generations_directory, key).unwrap();
     let retired_name = retired_generation_name(key.sequence, key.id);
     let original_retired = displaced_root
         .join(GENERATIONS_DIRECTORY)
@@ -201,7 +205,7 @@ fn seal_stays_bound_to_the_opened_generation_directory() {
     assert!(replacement_sealed.is_file());
     assert!(!replacement_generations.join(&retired_name).exists());
 
-    retirement::remove_in(&area.inner.generations_directory, key).unwrap();
+    retirement::remove_in(&area.acquire_open().unwrap().generations_directory, key).unwrap();
     assert!(!original_retired.exists());
     assert!(replacement_sealed.is_file());
 }
@@ -705,7 +709,8 @@ fn unacknowledged_open_and_orphan_sealed_generations_are_quarantined() {
     orphan.write_all(b"renamed but not journalled").unwrap();
     let open_path = orphan.path.take().unwrap();
     let orphan_path = area
-        .inner
+        .acquire_open()
+        .unwrap()
         .generations
         .join(sealed_generation_name(9, orphan.id));
     std::fs::rename(&open_path, &orphan_path).unwrap();
@@ -770,7 +775,8 @@ fn torn_journal_tail_is_truncated_without_losing_the_valid_prefix() {
         logical_bytes: 4,
     };
     let frame = encoded_frame(&JournalRecord::Sealed(torn_intent)).unwrap();
-    let mut journal = area.inner.journal.lock();
+    let inner = area.acquire_open().unwrap();
+    let mut journal = inner.journal.lock();
     journal.file.seek(SeekFrom::End(0)).unwrap();
     journal.file.write_all(&frame[..frame.len() / 2]).unwrap();
     drop(journal);
@@ -805,7 +811,8 @@ fn torn_physical_header_tail_is_truncated_without_losing_the_valid_prefix() {
         let journal_path = directory.path().join(JOURNAL_FILE);
         let valid_len = std::fs::metadata(&journal_path).unwrap().len();
         {
-            let mut journal = area.inner.journal.lock();
+            let inner = area.acquire_open().unwrap();
+            let mut journal = inner.journal.lock();
             journal.file.seek(SeekFrom::End(0)).unwrap();
             journal.file.write_all(&frame).unwrap();
         }
@@ -841,7 +848,8 @@ fn overflowing_torn_length_tail_is_truncated_without_losing_the_valid_prefix() {
     let journal_path = directory.path().join(JOURNAL_FILE);
     let valid_len = std::fs::metadata(&journal_path).unwrap().len();
     {
-        let mut journal = area.inner.journal.lock();
+        let inner = area.acquire_open().unwrap();
+        let mut journal = inner.journal.lock();
         journal.file.seek(SeekFrom::End(0)).unwrap();
         journal.file.write_all(&frame).unwrap();
     }
@@ -877,7 +885,8 @@ fn self_consistent_future_header_fails_without_truncating_the_journal() {
         refresh_frame_checksum(&mut frame).unwrap();
         let journal_path = directory.path().join(JOURNAL_FILE);
         {
-            let mut journal = area.inner.journal.lock();
+            let inner = area.acquire_open().unwrap();
+            let mut journal = inner.journal.lock();
             journal.file.seek(SeekFrom::End(0)).unwrap();
             journal.file.write_all(&frame).unwrap();
             journal.file.sync_all().unwrap();
@@ -926,7 +935,8 @@ fn future_envelope_after_a_corrupt_frame_prevents_tail_truncation() {
     refresh_frame_checksum(&mut future).unwrap();
     let journal_path = directory.path().join(JOURNAL_FILE);
     {
-        let mut journal = area.inner.journal.lock();
+        let inner = area.acquire_open().unwrap();
+        let mut journal = inner.journal.lock();
         journal.file.seek(SeekFrom::End(0)).unwrap();
         journal.file.write_all(&corrupt).unwrap();
         journal.file.write_all(&future).unwrap();
@@ -1074,7 +1084,8 @@ fn retired_name_quarantines_reappeared_generation_without_republication() {
     staged_writer.write_all(b"published bytes").unwrap();
     let staged = staged_writer.seal().unwrap();
     let retired = area
-        .inner
+        .acquire_open()
+        .unwrap()
         .generations
         .join(retired_generation_name(staged.sequence(), staged.id()));
     std::fs::rename(staged.content_path(), &retired).unwrap();
@@ -1125,7 +1136,8 @@ fn poisoned_journal_never_reaps_completed_generations() {
         id: staged.id,
     };
     {
-        let mut journal = area.inner.journal.lock();
+        let inner = area.acquire_open().unwrap();
+        let mut journal = inner.journal.lock();
         append_records(&mut journal.file, &[JournalRecord::Published(key)]).unwrap();
         flush_journal(&journal.file).unwrap();
         journal.pending.remove(&key);
@@ -1180,7 +1192,13 @@ fn concurrent_seals_share_one_journal_group() {
     for worker in workers {
         worker.join().unwrap();
     }
-    assert_eq!(area.inner.seal_groups_completed.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        area.acquire_open()
+            .unwrap()
+            .seal_groups_completed
+            .load(Ordering::SeqCst),
+        1
+    );
     assert_eq!(area.ready().unwrap().len(), 8);
 }
 
@@ -1296,7 +1314,8 @@ fn journal_rejects_reused_sequences_and_identifiers() {
             logical_bytes: 0,
         };
         {
-            let mut journal = area.inner.journal.lock();
+            let inner = area.acquire_open().unwrap();
+            let mut journal = inner.journal.lock();
             append_records(
                 &mut journal.file,
                 &[JournalRecord::Sealed(first), JournalRecord::Sealed(second)],
@@ -1350,12 +1369,13 @@ fn corrupt_completion_tail_with_missing_generation_fails_closed() {
         id: staged.id(),
     };
     {
-        let mut journal = area.inner.journal.lock();
+        let inner = area.acquire_open().unwrap();
+        let mut journal = inner.journal.lock();
         append_records(&mut journal.file, &[JournalRecord::Published(key)]).unwrap();
         flush_journal(&journal.file).unwrap();
     }
     std::fs::remove_file(staged.content_path()).unwrap();
-    sync_directory(&area.inner.generations).unwrap();
+    sync_directory(&area.acquire_open().unwrap().generations).unwrap();
     drop(area);
 
     let journal_path = directory.path().join(JOURNAL_FILE);
@@ -1385,7 +1405,8 @@ fn published_record_reaps_every_interrupted_cleanup_state() {
             id: staged.id(),
         };
         {
-            let mut journal = area.inner.journal.lock();
+            let inner = area.acquire_open().unwrap();
+            let mut journal = inner.journal.lock();
             append_records(&mut journal.file, &[JournalRecord::Published(key)]).unwrap();
             flush_journal(&journal.file).unwrap();
         }
@@ -1418,7 +1439,8 @@ fn recovery_flushes_a_missing_completed_generation_before_dropping_its_record() 
         id: staged.id(),
     };
     {
-        let mut journal = area.inner.journal.lock();
+        let inner = area.acquire_open().unwrap();
+        let mut journal = inner.journal.lock();
         append_records(&mut journal.file, &[JournalRecord::Published(key)]).unwrap();
         flush_journal(&journal.file).unwrap();
     }
@@ -1948,7 +1970,11 @@ fn native_seal_group_scale_probe() {
             let elapsed = started.elapsed();
             latencies.sort_unstable();
             let operations = u32::from(writers) * u32::from(SEALS_PER_WRITER);
-            let groups = area.inner.seal_groups_completed.load(Ordering::SeqCst);
+            let groups = area
+                .acquire_open()
+                .unwrap()
+                .seal_groups_completed
+                .load(Ordering::SeqCst);
             let group_flushes = u32::try_from(groups).unwrap().checked_mul(2).unwrap();
             let durability_flushes = operations.checked_add(group_flushes).unwrap();
             let p95_index = latencies.len().saturating_mul(95).div_ceil(100) - 1;

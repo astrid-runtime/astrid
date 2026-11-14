@@ -109,6 +109,7 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         interceptor_active: false,
         invocation_kv: None,
         capsule_log: None,
+        deferred_logs: super::native_logs::DeferredBindings::default(),
         capsule_id: CapsuleId::from_static("test"),
         workspace_root: PathBuf::from("/tmp"),
         hosted_workspace_root: PathBuf::from("/tmp"),

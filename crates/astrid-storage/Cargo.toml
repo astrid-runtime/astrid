@@ -11,6 +11,8 @@ description = "Unified storage integration for Astrid principal state and raw KV
 [features]
 default = []
 crash-replay = []
+# Read-only operation snapshots for cross-crate tests; no mutation controls.
+test-support = []
 # Deprecated compatibility alias. KV is always backed by the native object
 # store; this remains only so existing downstream feature selections compile.
 kv = []
@@ -41,6 +43,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+astrid-core = { workspace = true, features = ["test-support"] }
 directories = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }

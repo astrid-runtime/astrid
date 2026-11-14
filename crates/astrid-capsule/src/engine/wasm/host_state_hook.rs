@@ -64,6 +64,7 @@ impl HostState {
             audit_sink: None,
             invocation_kv: None,
             capsule_log: None,
+            deferred_logs: crate::engine::wasm::native_logs::DeferredBindings::default(),
             capsule_id,
             hosted_workspace_root: workspace_root.clone(),
             workspace_root,

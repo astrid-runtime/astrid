@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 
 use cap_std::fs::Dir;
 
+#[path = "native_io/durability.rs"]
+mod durability;
+pub(super) use durability::{rename_private_entry, sync_directory};
+
 #[cfg(feature = "legacy-surrealkv")]
 mod retirement;
 #[cfg(all(feature = "legacy-surrealkv", not(windows)))]
@@ -16,6 +20,8 @@ pub(super) use retirement::validate_retirement_tree;
 pub(super) use retirement::{CapturedDirectory, remove_retirement_contents};
 #[cfg(feature = "legacy-surrealkv")]
 mod from_captured;
+#[cfg(windows)]
+mod windows_staging;
 
 use crate::error::{StorageError, StorageResult};
 
@@ -55,6 +61,8 @@ pub(super) struct PrivateDirectory {
     sync_handle: File,
     path: PathBuf,
     identity: PrivateDirectoryIdentity,
+    #[cfg(windows)]
+    flush: Option<astrid_core::platform_fs::directory_capability::DirectoryFlushCapability>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,12 +98,16 @@ impl PrivateDirectory {
         }
         #[cfg(unix)]
         let sync_handle = private_directory_sync_handle(&directory, path, identity)?;
+        #[cfg(windows)]
+        let flush = Some(windows_staging::open_flush_for_ambient(path, &directory)?);
         Ok(Self {
             directory,
             #[cfg(unix)]
             sync_handle,
             path: path.to_path_buf(),
             identity,
+            #[cfg(windows)]
+            flush,
         })
     }
 
@@ -123,18 +135,33 @@ impl PrivateDirectory {
         }
         #[cfg(unix)]
         let sync_handle = private_directory_sync_handle(&first, &self.path.join(name), identity)?;
+        #[cfg(windows)]
+        let flush =
+            windows_staging::child_flush(self.flush.as_ref(), &self.directory, name, &first)?;
         Ok(Self {
             directory: first,
             #[cfg(unix)]
             sync_handle,
             path: self.path.join(name),
             identity,
+            #[cfg(windows)]
+            flush,
         })
     }
 
     pub(super) fn ensure_child(&self, name: &Path) -> StorageResult<Self> {
         if !self.contains(name)? {
-            self.directory.create_dir(name).map_err(|error| {
+            #[cfg(windows)]
+            let created = {
+                use std::os::windows::io::AsHandle as _;
+                astrid_core::platform_fs::directory_capability::create_private_directory_relative(
+                    self.directory.as_handle(),
+                    name.as_os_str(),
+                )
+            };
+            #[cfg(not(windows))]
+            let created = self.directory.create_dir(name);
+            created.map_err(|error| {
                 connection(format!(
                     "create private directory {}: {error}",
                     self.path.join(name).display()
@@ -233,23 +260,34 @@ impl PrivateDirectory {
     }
 
     pub(super) fn create_file(&self, name: &Path) -> StorageResult<File> {
-        let mut options = cap_std::fs::OpenOptions::new();
-        options.create_new(true).read(true).write(true);
-        #[cfg(unix)]
-        {
-            use cap_std::fs::OpenOptionsExt as _;
-            options.mode(PRIVATE_FILE_MODE);
-        }
-        let file = self
-            .directory
-            .open_with(name, &options)
-            .map(cap_std::fs::File::into_std)
-            .map_err(|error| {
-                connection(format!(
-                    "create private file {}: {error}",
-                    self.path.join(name).display()
-                ))
-            })?;
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::io::AsHandle as _;
+
+            astrid_core::platform_fs::directory_capability::create_private_file_relative(
+                self.directory.as_handle(),
+                name.as_os_str(),
+            )
+        };
+        #[cfg(not(windows))]
+        let file = {
+            let mut options = cap_std::fs::OpenOptions::new();
+            options.create_new(true).read(true).write(true);
+            #[cfg(unix)]
+            {
+                use cap_std::fs::OpenOptionsExt as _;
+                options.mode(PRIVATE_FILE_MODE);
+            }
+            self.directory
+                .open_with(name, &options)
+                .map(cap_std::fs::File::into_std)
+        };
+        let file = file.map_err(|error| {
+            connection(format!(
+                "create private file {}: {error}",
+                self.path.join(name).display()
+            ))
+        })?;
         private_file_identity(&file)?;
         Ok(file)
     }
@@ -333,6 +371,15 @@ impl PrivateDirectory {
                 )));
             },
         }
+        #[cfg(windows)]
+        windows_staging::rename_no_replace_windows(
+            &self.directory,
+            source,
+            &self.directory,
+            destination,
+            windows_staging::ExpectedRenameIdentity::File(expected),
+        )?;
+        #[cfg(not(windows))]
         rename_no_replace(&self.directory, source, &self.directory, destination).map_err(
             |error| {
                 connection(format!(
@@ -372,6 +419,15 @@ impl PrivateDirectory {
                 destination_directory.path.join(destination).display()
             )));
         }
+        #[cfg(windows)]
+        windows_staging::rename_no_replace_windows(
+            &self.directory,
+            source,
+            &destination_directory.directory,
+            destination,
+            windows_staging::ExpectedRenameIdentity::File(expected),
+        )?;
+        #[cfg(not(windows))]
         rename_no_replace(
             &self.directory,
             source,
@@ -412,6 +468,15 @@ impl PrivateDirectory {
                 destination_directory.path.join(destination).display()
             )));
         }
+        #[cfg(windows)]
+        windows_staging::rename_no_replace_windows(
+            &self.directory,
+            source,
+            &destination_directory.directory,
+            destination,
+            windows_staging::ExpectedRenameIdentity::Directory(expected),
+        )?;
+        #[cfg(not(windows))]
         rename_no_replace(
             &self.directory,
             source,
@@ -435,7 +500,6 @@ impl PrivateDirectory {
         Ok(installed)
     }
 
-    #[cfg_attr(not(unix), allow(clippy::unnecessary_wraps, clippy::unused_self))]
     pub(super) fn sync(&self) -> StorageResult<()> {
         #[cfg(unix)]
         {
@@ -443,9 +507,16 @@ impl PrivateDirectory {
                 connection(format!("flush directory {}: {error}", self.path.display()))
             })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            Ok(())
+            windows_staging::sync_windows(&self.path, self.flush.as_ref())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(connection(format!(
+                "directory flush unsupported on this target: {}",
+                self.path.display()
+            )))
         }
     }
 }
@@ -555,6 +626,10 @@ mod tests {
     }
 }
 
+#[cfg(all(test, windows))]
+#[path = "native_io/windows_tests.rs"]
+mod windows_tests;
+
 #[cfg(target_os = "linux")]
 fn rename_no_replace(
     source_directory: &Dir,
@@ -622,16 +697,6 @@ fn rename_no_replace(
     } else {
         Err(std::io::Error::last_os_error())
     }
-}
-
-#[cfg(windows)]
-fn rename_no_replace(
-    source_directory: &Dir,
-    source: &Path,
-    destination_directory: &Dir,
-    destination: &Path,
-) -> std::io::Result<()> {
-    source_directory.rename(source, destination_directory, destination)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -770,81 +835,40 @@ pub(super) fn create_private_file(path: &Path) -> StorageResult<File> {
         .parent()
         .ok_or_else(|| connection(format!("private file {} has no parent", path.display())))?;
     ensure_private_directory(parent)?;
-    let mut options = OpenOptions::new();
-    options.create_new(true).read(true).write(true);
-    #[cfg(unix)]
+
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(PRIVATE_FILE_MODE);
+        // Privacy at birth: avoid path-based restrict/validate reopens that
+        // request FILE_SHARE_READ while this writer holds write access.
+        let file = astrid_core::platform_fs::create_new_private_file(path).map_err(|error| {
+            connection(format!("create private file {}: {error}", path.display()))
+        })?;
+        private_file_identity(&file)?;
+        Ok(file)
     }
-    let file = options
-        .open(path)
-        .map_err(|error| connection(format!("create private file {}: {error}", path.display())))?;
-    astrid_core::platform_fs::restrict_private_file(path).map_err(|error| {
-        connection(format!("restrict private file {}: {error}", path.display()))
-    })?;
-    validate_private_regular_file(path)?;
-    Ok(file)
+
+    #[cfg(not(windows))]
+    {
+        let mut options = OpenOptions::new();
+        options.create_new(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(PRIVATE_FILE_MODE);
+        }
+        let file = options.open(path).map_err(|error| {
+            connection(format!("create private file {}: {error}", path.display()))
+        })?;
+        astrid_core::platform_fs::restrict_private_file(path).map_err(|error| {
+            connection(format!("restrict private file {}: {error}", path.display()))
+        })?;
+        validate_private_regular_file(path)?;
+        Ok(file)
+    }
 }
 
 pub(super) fn open_private_file(path: &Path) -> StorageResult<File> {
     open_private_file_with_access(path, false)
-}
-
-pub(super) fn snapshot_private_file(path: &Path) -> StorageResult<Option<Vec<u8>>> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() => {
-            let parent = path.parent().ok_or_else(|| {
-                connection(format!("private file {} has no parent", path.display()))
-            })?;
-            let name = path.file_name().ok_or_else(|| {
-                connection(format!("private file {} has no name", path.display()))
-            })?;
-            let directory = PrivateDirectory::open(parent)?;
-            let mut file = directory.open_file(Path::new(name))?;
-            let mut bytes = Vec::new();
-            std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|error| {
-                connection(format!("read private file {}: {error}", path.display()))
-            })?;
-            Ok(Some(bytes))
-        },
-        Ok(_) => Err(connection(format!(
-            "private projection destination is not a regular file: {}",
-            path.display()
-        ))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(connection(format!(
-            "inspect private projection destination {}: {error}",
-            path.display()
-        ))),
-    }
-}
-
-pub(super) fn rollback_private_file(path: &Path, previous: Option<Vec<u8>>) -> StorageResult<()> {
-    if let Some(bytes) = previous {
-        return astrid_core::platform_fs::atomic_write_private_file(path, &bytes).map_err(
-            |error| connection(format!("restore private file {}: {error}", path.display())),
-        );
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| connection(format!("private file {} has no parent", path.display())))?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| connection(format!("private file {} has no name", path.display())))?;
-    PrivateDirectory::open(parent)?.remove_file(Path::new(name))
-}
-
-pub(super) fn rollback_private_files(written: Vec<(PathBuf, Option<Vec<u8>>)>) -> Vec<String> {
-    written
-        .into_iter()
-        .rev()
-        .filter_map(|(path, previous)| {
-            rollback_private_file(&path, previous)
-                .err()
-                .map(|error| format!("{}: {error}", path.display()))
-        })
-        .collect()
 }
 
 fn open_private_file_with_access(path: &Path, write: bool) -> StorageResult<File> {
@@ -951,37 +975,6 @@ pub(super) fn quarantine_directory(path: &Path, classification: &str) -> Storage
     rename_private_entry(path, &destination)?;
     sync_directory(parent)?;
     Ok(destination)
-}
-
-/// Rename an entry at the platform's durable namespace boundary.
-///
-/// Windows has no portable parent-directory flush equivalent, so the rename
-/// itself must request write-through. Unix callers retain their existing
-/// parent-directory synchronization after this atomic transition.
-pub(super) fn rename_private_entry(source: &Path, destination: &Path) -> StorageResult<()> {
-    astrid_core::platform_fs::rename_with_write_through(source, destination).map_err(|error| {
-        connection(format!(
-            "rename private entry {} as {}: {error}",
-            source.display(),
-            destination.display()
-        ))
-    })
-}
-
-#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
-pub(super) fn sync_directory(path: &Path) -> StorageResult<()> {
-    #[cfg(unix)]
-    {
-        File::open(path)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| connection(format!("flush directory {}: {error}", path.display())))
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
-    }
 }
 
 #[cfg(not(windows))]

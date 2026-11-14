@@ -16,17 +16,25 @@ const MAX_CUTOVER_RECEIPT_BYTES: u64 = 256;
 mod format_amendment_tests;
 
 pub(super) fn existing_volume_available(home: &AstridHome) -> StorageResult<bool> {
+    // Caller must already hold any Windows retained-root fence across this
+    // ambient legacy promotion; this helper only inspects/renames media.
     Ok(promote_legacy_volume(home)?.is_some())
 }
 
 pub(super) fn open_existing(
     home: &AstridHome,
     policy: DurableEnginePolicy<StateOwner>,
-) -> StorageResult<Option<(RuntimeEngine, String)>> {
+    #[cfg(windows)] retained_root: &super::runtime_root_admission::AdmittedRuntimeRoot,
+) -> StorageResult<Option<(RuntimeEngine, String, Arc<HostedFileVolume>)>> {
     let Some(path) = promote_legacy_volume(home)? else {
         return Ok(None);
     };
-    let volume = HostedFileVolume::open(&path).map_err(|error| {
+    let volume = open_hosted_volume(
+        &path,
+        #[cfg(windows)]
+        retained_root,
+    )
+    .map_err(|error| {
         connection(format!(
             "open Astrid storage volume {}: {error}",
             path.display()
@@ -44,7 +52,38 @@ pub(super) fn open_existing(
     // expected to advance after that boundary, so ordinary reopen validates
     // the durable marker without comparing it to the current mutable roots.
     let receipt = require_cutover_receipt(volume.as_ref(), None)?;
-    Ok(Some((engine, receipt)))
+    Ok(Some((engine, receipt, volume)))
+}
+
+/// Recover only existing canonical media, leaving all logical amendments and
+/// projection mutation to the caller's authenticated recovery gate.
+pub(super) fn open_existing_canonical_only(
+    home: &AstridHome,
+    policy: DurableEnginePolicy<StateOwner>,
+    #[cfg(windows)] retained_root: &super::runtime_root_admission::AdmittedRuntimeRoot,
+) -> StorageResult<(RuntimeEngine, String, Arc<HostedFileVolume>)> {
+    let canonical = home.storage_volume_path();
+    if inspect_volume_entry(&legacy_volume_path(home)?)? {
+        return Err(connection(
+            "recovery requires unambiguous canonical Astrid volume".to_owned(),
+        ));
+    }
+    let volume = HostedFileVolume::open_existing_canonical(
+        &canonical,
+        #[cfg(windows)]
+        Arc::clone(retained_root),
+    )
+    .map_err(|error| connection(format!("open existing canonical Astrid volume: {error}")))?;
+    let engine = RuntimeEngine::open_volume(
+        volume.clone(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+        policy,
+    )
+    .map_err(|error| connection(format!("recover canonical Astrid volume: {error}")))?;
+    let receipt = require_cutover_receipt(volume.as_ref(), None)?;
+    Ok((engine, receipt, volume))
 }
 
 /// Resolve the canonical volume and promote a released legacy path once.
@@ -101,7 +140,10 @@ fn legacy_volume_path(home: &AstridHome) -> StorageResult<std::path::PathBuf> {
 pub(super) fn initialize_volume(
     home: &AstridHome,
     policy: DurableEnginePolicy<StateOwner>,
-) -> StorageResult<(RuntimeEngine, String)> {
+    #[cfg(windows)] retained_root: &super::runtime_root_admission::AdmittedRuntimeRoot,
+) -> StorageResult<(RuntimeEngine, String, Arc<HostedFileVolume>)> {
+    // Windows: ExactPrivate root already admitted and retained by the caller.
+
     let destination = home.storage_volume_path();
     let temporary = destination.with_extension("migrating");
     if temporary.exists() {
@@ -110,7 +152,12 @@ pub(super) fn initialize_volume(
             temporary.display()
         )));
     }
-    let volume = HostedFileVolume::open(&temporary).map_err(|error| {
+    let volume = open_hosted_volume(
+        &temporary,
+        #[cfg(windows)]
+        retained_root,
+    )
+    .map_err(|error| {
         connection(format!(
             "create fresh Astrid volume {}: {error}",
             temporary.display()
@@ -139,10 +186,17 @@ pub(super) fn initialize_volume(
         .map_err(|error| connection(format!("close fresh Astrid volume: {error}")))?;
     drop(engine);
     drop(volume);
+    #[cfg(windows)]
+    super::runtime_root_admission::run_cutover_gap_hook();
 
     super::native_io::rename_private_entry(&temporary, &destination)?;
     super::native_io::sync_directory(home.root())?;
-    let volume = HostedFileVolume::open(&destination).map_err(|error| {
+    let volume = open_hosted_volume(
+        &destination,
+        #[cfg(windows)]
+        retained_root,
+    )
+    .map_err(|error| {
         connection(format!(
             "reopen fresh Astrid volume {}: {error}",
             destination.display()
@@ -157,7 +211,21 @@ pub(super) fn initialize_volume(
     )
     .map_err(|error| connection(format!("open verified fresh Astrid volume: {error}")))?;
     let receipt = require_cutover_receipt(volume.as_ref(), Some(&[]))?;
-    Ok((engine, receipt))
+    Ok((engine, receipt, volume))
+}
+
+fn open_hosted_volume(
+    path: &std::path::Path,
+    #[cfg(windows)] retained_root: &super::runtime_root_admission::AdmittedRuntimeRoot,
+) -> std::io::Result<Arc<HostedFileVolume>> {
+    #[cfg(windows)]
+    {
+        HostedFileVolume::open_runtime(std::sync::Arc::clone(retained_root), path)
+    }
+    #[cfg(not(windows))]
+    {
+        HostedFileVolume::open(path)
+    }
 }
 
 fn inspect_volume_entry(path: &std::path::Path) -> StorageResult<bool> {
@@ -181,7 +249,8 @@ pub(super) fn migrate_directory_store(
     home: &AstridHome,
     source: Arc<RuntimeEngine>,
     policy: DurableEnginePolicy<StateOwner>,
-) -> StorageResult<(RuntimeEngine, String)> {
+    #[cfg(windows)] retained_root: &super::runtime_root_admission::AdmittedRuntimeRoot,
+) -> StorageResult<(RuntimeEngine, String, Arc<HostedFileVolume>)> {
     let snapshots = snapshots(&source)?;
     let destination = home.storage_volume_path();
     let temporary = destination.with_extension("migrating");
@@ -194,7 +263,12 @@ pub(super) fn migrate_directory_store(
         })?;
     }
 
-    let volume = HostedFileVolume::open(&temporary).map_err(|error| {
+    let volume = open_hosted_volume(
+        &temporary,
+        #[cfg(windows)]
+        retained_root,
+    )
+    .map_err(|error| {
         connection(format!(
             "create migrating Astrid volume {}: {error}",
             temporary.display()
@@ -227,11 +301,18 @@ pub(super) fn migrate_directory_store(
         .map_err(|error| connection(format!("close migrating Astrid volume: {error}")))?;
     drop(migrated);
     drop(volume);
+    #[cfg(windows)]
+    super::runtime_root_admission::run_cutover_gap_hook();
 
     super::native_io::rename_private_entry(&temporary, &destination)?;
     super::native_io::sync_directory(home.root())?;
 
-    let volume = HostedFileVolume::open(&destination).map_err(|error| {
+    let volume = open_hosted_volume(
+        &destination,
+        #[cfg(windows)]
+        retained_root,
+    )
+    .map_err(|error| {
         connection(format!(
             "reopen Astrid volume {}: {error}",
             destination.display()
@@ -252,7 +333,7 @@ pub(super) fn migrate_directory_store(
         .close()
         .map_err(|error| connection(format!("close retired directory store: {error}")))?;
     drop(source);
-    Ok((engine, receipt))
+    Ok((engine, receipt, volume))
 }
 
 pub(super) fn retire_verified_directory_if_present(

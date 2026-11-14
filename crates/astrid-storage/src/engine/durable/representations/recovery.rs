@@ -1,6 +1,8 @@
 //! Recovery and closed-world validation for physical representation authority.
 
 #[cfg(test)]
+mod io_tests;
+#[cfg(test)]
 mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,23 +17,27 @@ use crate::storage_model::{
     RepresentationStateId,
 };
 
-use super::super::format::{read_frame_at, scan_frames_with_source};
+use super::super::format::scan_frames_with_source;
 use super::super::{FRAME_HEADER_LEN, scan_frames};
 use super::format::{
     Blake3PhysicalIdentity, CURRENT_FILE, CURRENT_MAGIC, CurrentPointer, JOURNAL_FILE,
     JOURNAL_MAGIC, JournalEntry, METADATA_FILE, METADATA_MAGIC, MetadataFrame, MetadataKind,
-    journal_digest, map_node_id,
+    map_node_id,
 };
 use super::{
-    DurableError, FIRST_JOURNAL_GENERATION, RecoveryLimits, increment, io_error, read_all,
+    DurableError, FIRST_JOURNAL_GENERATION, RecoveryLimits, digest_journal_prefix, increment,
+    io_error, journal_byte_len,
 };
 
 mod index;
 use index::HistoricalMapClosure;
 pub(super) use index::MetadataIndex;
+#[cfg(test)]
+pub(super) use index::{recover_active_nodes_calls, reset_recover_active_nodes_calls};
 
-#[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all,
-    fields(map_nodes = tracing::field::Empty, authority_records = tracing::field::Empty))]
+#[tracing::instrument(name = "recover_metadata", target = "astrid_storage::recovery", level = "debug", skip_all,
+    fields(map_nodes = tracing::field::Empty, authority_records = tracing::field::Empty,
+        map_frame_count = tracing::field::Empty))]
 pub(super) fn recover_metadata<F: DurableIo>(
     file: &mut F,
     limits: RecoveryLimits,
@@ -42,13 +48,15 @@ pub(super) fn recover_metadata<F: DurableIo>(
         METADATA_FILE,
         METADATA_MAGIC,
         limits,
-        |offset, payload, load_previous| {
-            index.insert_at(offset, MetadataFrame::decode(payload)?, load_previous)
+        |location, payload, load_previous| {
+            let frame = MetadataFrame::decode(payload)?;
+            index.insert_at(location, frame, load_previous)
         },
     )?;
     if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {
         tracing::Span::current().record("map_nodes", index.nodes.len());
         tracing::Span::current().record("authority_records", index.values.len());
+        tracing::Span::current().record("map_frame_count", index.map_frame_count);
     }
     Ok(index)
 }
@@ -74,18 +82,19 @@ pub(super) fn recover_journal<F: DurableIo>(
         },
     )?;
     let checkpoint_end = first_frame_end(file)?;
-    let bytes = read_all(file, "read representation journal")?;
-    let checkpoint_bytes =
-        bytes
-            .get(..checkpoint_end)
-            .ok_or(DurableError::InvalidRepresentationState(
-                "representation checkpoint frame is truncated",
-            ))?;
-    if journal_digest(checkpoint_bytes) != current.checkpoint_digest {
+    let checkpoint_end_u64 =
+        u64::try_from(checkpoint_end).map_err(|_| DurableError::EncodingOverflow)?;
+    // scan_frames already authenticated every frame. Hash only the checkpoint
+    // prefix and take journal length from metadata/seek instead of a second
+    // full-journal allocation.
+    if digest_journal_prefix(file, checkpoint_end_u64, "digest representation checkpoint")?
+        != current.checkpoint_digest
+    {
         return Err(DurableError::InvalidRepresentationState(
             "representation checkpoint digest mismatch",
         ));
     }
+    let journal_bytes = journal_byte_len(file, "measure representation journal")?;
     let first = entries.first().map(|(_, entry)| *entry).ok_or(
         DurableError::InvalidRepresentationState("representation journal is empty"),
     )?;
@@ -95,7 +104,7 @@ pub(super) fn recover_journal<F: DurableIo>(
     let mut complete_maps = metadata.nodes.closure_checker();
     let (mut active, mut generation) =
         recover_checkpoint(first, current, metadata, &mut complete_maps)?;
-    validate_tail_budget(entries.len(), bytes.len(), checkpoint_end, current)?;
+    validate_tail_budget(entries.len(), journal_bytes, checkpoint_end, current)?;
     let mut previous_state = active
         .map(|id| {
             RepresentationState::decode(metadata.value(MetadataKind::State, id.as_bytes())?)
@@ -105,7 +114,7 @@ pub(super) fn recover_journal<F: DurableIo>(
     let entry_count = entries.len();
     if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {
         tracing::Span::current().record("journal_frames", entry_count);
-        tracing::Span::current().record("journal_bytes", bytes.len());
+        tracing::Span::current().record("journal_bytes", journal_bytes);
     }
     for (position, (offset, entry)) in entries.into_iter().enumerate().skip(1) {
         let JournalEntry::StateCas {
@@ -261,7 +270,7 @@ fn truncate_repairable_journal_tail<F: DurableIo>(
 
 fn validate_tail_budget(
     entry_count: usize,
-    journal_bytes: usize,
+    journal_bytes: u64,
     checkpoint_end: usize,
     current: CurrentPointer,
 ) -> Result<(), DurableError> {
@@ -273,8 +282,7 @@ fn validate_tail_budget(
     }
     let checkpoint_bytes =
         u64::try_from(checkpoint_end).map_err(|_| DurableError::EncodingOverflow)?;
-    let tail_bytes = u64::try_from(journal_bytes)
-        .map_err(|_| DurableError::EncodingOverflow)?
+    let tail_bytes = journal_bytes
         .checked_sub(checkpoint_bytes)
         .ok_or(DurableError::EncodingOverflow)?;
     if tail_bytes > current.max_tail_bytes {
@@ -340,8 +348,14 @@ fn validate_root_generation(reused: bool, previous: u64, current: u64) -> Result
 pub(super) fn validate_profiles(
     map: &CanonicalPhysicalMap,
 ) -> Result<RepresentationProfileId, DurableError> {
+    validate_profile_entries(active_entries(map)?)
+}
+
+pub(super) fn validate_profile_entries<'a>(
+    entries: impl IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
+) -> Result<RepresentationProfileId, DurableError> {
     let mut direct = None;
-    for (key, value) in active_entries(map)? {
+    for (key, value) in entries {
         let profile = RepresentationProfile::decode(value)?;
         let id = profile.identify(&Blake3PhysicalIdentity)?;
         if PhysicalMapKey::from(id) != key {
@@ -362,14 +376,38 @@ pub(super) fn validate_profiles(
     ))
 }
 
-pub(super) fn validate_representations(
+pub(super) struct ValidatedRepresentations {
+    pub(super) reverse: BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
+    pub(super) extent_count: u64,
+    pub(super) generation_zero: super::index_validation::GenerationZeroPlacements,
+}
+
+pub(super) fn validate_representations<const COLLECT_PLACEMENTS: bool>(
     profiles: &CanonicalPhysicalMap,
     representations: &CanonicalPhysicalMap,
     placements: &CanonicalPhysicalMap,
-) -> Result<(BTreeMap<ObjectId, Vec<RepresentationRecordId>>, u64), DurableError> {
+    direct_profile: RepresentationProfileId,
+) -> Result<ValidatedRepresentations, DurableError> {
+    validate_representation_entries::<COLLECT_PLACEMENTS, _>(
+        profiles,
+        || active_entries(representations),
+        active_entries(placements)?,
+        direct_profile,
+    )
+}
+
+pub(super) fn validate_representation_entries<'a, const COLLECT_PLACEMENTS: bool, R>(
+    profiles: &CanonicalPhysicalMap,
+    representations: impl FnOnce() -> Result<R, DurableError>,
+    placements: impl IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
+    direct_profile: RepresentationProfileId,
+) -> Result<ValidatedRepresentations, DurableError>
+where
+    R: IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
+{
     let mut placement_by_blob = BTreeMap::new();
     let mut extent_count = 0_u64;
-    for (key, bytes) in active_entries(placements)? {
+    for (key, bytes) in placements {
         let entry = PlacementEntry::decode(bytes)?;
         if PhysicalMapKey::from(entry.blob()) != key {
             return Err(DurableError::InvalidRepresentationState(
@@ -393,7 +431,8 @@ pub(super) fn validate_representations(
         placement_by_blob.insert(entry.blob(), entry);
     }
     let mut reverse = BTreeMap::<ObjectId, Vec<RepresentationRecordId>>::new();
-    for (key, bytes) in active_entries(representations)? {
+    let mut generation_zero = super::index_validation::GenerationZeroPlacements::default();
+    for (key, bytes) in representations()? {
         let record = RepresentationRecord::decode(bytes)?;
         let id = record.identify(&Blake3PhysicalIdentity)?;
         if PhysicalMapKey::from(id) != key {
@@ -428,9 +467,16 @@ pub(super) fn validate_representations(
                 "direct representation placement does not match its record",
             ));
         }
+        if COLLECT_PLACEMENTS {
+            generation_zero.observe(object, record.profile() == direct_profile, placement);
+        }
         reverse.entry(object).or_default().push(id);
     }
-    Ok((reverse, extent_count))
+    Ok(ValidatedRepresentations {
+        reverse,
+        extent_count,
+        generation_zero,
+    })
 }
 
 /// Bootstrap startup guard: reject Exact coverage of excluded objects under any recipe.
@@ -592,3 +638,6 @@ fn first_frame_end<F: DurableIo>(file: &mut F) -> Result<usize, DurableError> {
         .checked_add(payload)
         .ok_or(DurableError::EncodingOverflow)
 }
+
+#[cfg(test)]
+mod generation_zero_tests;

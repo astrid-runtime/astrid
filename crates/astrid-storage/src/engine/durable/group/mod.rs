@@ -20,6 +20,7 @@ use crate::engine::{ProjectionObserver, ProjectionPhase};
 
 #[cfg(test)]
 mod checkpoint_publication_tests;
+mod representations_maintenance;
 mod wal;
 
 const DEFAULT_INITIAL_DELAY: Duration = Duration::from_micros(250);
@@ -90,7 +91,20 @@ pub(super) struct CommitGroup<P> {
     leader_active: bool,
     queue: VecDeque<QueuedCommit<P>>,
     #[cfg(test)]
-    drain_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+    drain_gate: Option<DrainGate>,
+}
+
+/// cfg(test) drain pause: Barrier keeps existing callers; Channel is cancellation-safe.
+#[cfg(test)]
+enum DrainGate {
+    Barrier(
+        std::sync::Arc<std::sync::Barrier>,
+        std::sync::Arc<std::sync::Barrier>,
+    ),
+    Channel {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    },
 }
 
 impl<P> Default for CommitGroup<P> {
@@ -101,6 +115,12 @@ impl<P> Default for CommitGroup<P> {
             #[cfg(test)]
             drain_gate: None,
         }
+    }
+}
+
+impl<P> CommitGroup<P> {
+    pub(super) fn is_idle(&self) -> bool {
+        !self.leader_active && self.queue.is_empty()
     }
 }
 
@@ -308,12 +328,33 @@ where
     }
 
     #[cfg(test)]
-    pub(super) fn gate_next_group_drain(
+    pub(crate) fn gate_next_group_drain(
         &self,
         reached: Arc<std::sync::Barrier>,
         release: Arc<std::sync::Barrier>,
     ) {
-        self.commit_group.lock().drain_gate = Some((reached, release));
+        self.commit_group.lock().drain_gate = Some(DrainGate::Barrier(reached, release));
+    }
+
+    /// Channel drain gate: parent holds the release sender; Drop always releases.
+    ///
+    /// Returns `(entered_rx, release_tx)`. The drain worker `try_send`s entry
+    /// (bounded capacity 1) then `recv`s release; closing/dropping `release_tx`
+    /// unblocks the worker even if entry was never observed.
+    #[cfg(test)]
+    pub(crate) fn gate_next_group_drain_channel(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        self.commit_group.lock().drain_gate = Some(DrainGate::Channel {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        (entered_rx, release_tx)
     }
 
     fn run_one_commit_group(&self) {
@@ -329,9 +370,17 @@ where
         #[cfg(test)]
         let drain_gate = { self.commit_group.lock().drain_gate.take() };
         #[cfg(test)]
-        if let Some((reached, release)) = drain_gate {
-            reached.wait();
-            release.wait();
+        if let Some(gate) = drain_gate {
+            match gate {
+                DrainGate::Barrier(reached, release) => {
+                    reached.wait();
+                    release.wait();
+                },
+                DrainGate::Channel { entered, release } => {
+                    let _ = entered.try_send(());
+                    let _ = release.recv();
+                },
+            }
         }
 
         let batch: Vec<_> = {
@@ -453,12 +502,18 @@ where
                 },
             }
         }
+        let ran_successful_commit = completions.iter().any(|(_, result)| result.is_ok());
         drop(inner);
         // Releasing superseded value buffers can be expensive; the writer
         // must already be available to other principals.
         drop(retired_projections);
         for (receipt, result) in completions {
             receipt.complete(result);
+        }
+        // Complete the batch before maintenance. New batches still serialize on
+        // the same engine writer while a representation generation is replaced.
+        if ran_successful_commit {
+            self.maintain_representations_after_commit();
         }
     }
 
@@ -770,3 +825,6 @@ fn complete_failed_group<P: Ord>(
         ));
     }
 }
+
+#[cfg(test)]
+mod retirement_tests;

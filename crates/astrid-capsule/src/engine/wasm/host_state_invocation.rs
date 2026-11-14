@@ -63,6 +63,7 @@ impl HostState {
         self.invocation_tmp = self.tmp.clone();
         self.invocation_secret_store = Some(Arc::clone(&self.secret_store));
         self.invocation_capsule_log = self.capsule_log.clone();
+        self.deferred_logs.inherit_owner();
         self.invocation_profile = Some(owner_profile);
         self.invocation_profile_authorized = true;
         self.invocation_env_overlay = owner_env;
@@ -246,6 +247,7 @@ impl HostState {
             self.invocation_kv = None;
             self.invocation_secret_store = None;
             self.invocation_capsule_log = None;
+            self.deferred_logs.clear_invocation();
             self.invocation_home = None;
             self.invocation_workspace = None;
             self.invocation_tmp = None;

@@ -1,7 +1,9 @@
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
 use wasmtime::Store;
@@ -62,6 +64,11 @@ pub mod host_state;
 #[cfg(test)]
 mod interruption_tests;
 mod invocation_failure;
+mod native_logs;
+pub use native_logs::NativeLogRoot;
+pub(crate) use native_logs::eager::open_capsule_log;
+#[cfg(test)]
+use native_logs::eager::open_capsule_log_at;
 #[cfg(test)]
 #[path = "lifecycle_audit_tests.rs"]
 mod lifecycle_audit_tests;
@@ -104,33 +111,6 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
-}
-
-/// Delete log files older than `max_days` from a capsule log directory.
-///
-/// Only deletes files matching the `YYYY-MM-DD.log` pattern.
-fn prune_old_logs(log_dir: &std::path::Path, max_days: u64) {
-    let cutoff = std::time::SystemTime::now()
-        .checked_sub(std::time::Duration::from_secs(max_days * 86400))
-        .unwrap_or(std::time::UNIX_EPOCH);
-
-    let Ok(entries) = std::fs::read_dir(log_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        // Only touch files matching YYYY-MM-DD.log pattern.
-        if !name_str.ends_with(".log") || name_str.len() != 14 {
-            continue;
-        }
-        if let Ok(meta) = entry.metadata()
-            && let Ok(modified) = meta.modified()
-            && modified < cutoff
-        {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
 }
 
 /// Returns `true` when `workspace_root` sits inside a git work tree.
@@ -200,6 +180,7 @@ pub struct WasmEngine {
     wasmtime_engine: Option<wasmtime::Engine>,
     /// Kernel-shared immutable compiled-artifact cache.
     compiled_cache: CompiledWasmCache,
+    native_log_root: Option<Arc<NativeLogRoot>>,
     /// Pins compiled code and its single epoch ticker while Stores exist.
     compiled_artifact: Option<Arc<CompiledWasmArtifact>>,
     /// The wasmtime store holding HostState. Wrapped in `Arc<AsyncMutex<>>`
@@ -1390,6 +1371,7 @@ fn install_principal_overlays_sync(
         state.invocation_kv = None;
         state.invocation_secret_store = None;
         state.invocation_capsule_log = None;
+        state.deferred_logs.clear_invocation();
         return false;
     };
 
@@ -1408,6 +1390,7 @@ fn install_principal_overlays_sync(
             state.invocation_kv = None;
             state.invocation_secret_store = None;
             state.invocation_capsule_log = None;
+            state.deferred_logs.clear_invocation();
             return false;
         },
     };
@@ -1426,6 +1409,7 @@ fn install_principal_overlays_sync(
             state.invocation_kv = None;
             state.invocation_secret_store = None;
             state.invocation_capsule_log = None;
+            state.deferred_logs.clear_invocation();
             return false;
         },
     };
@@ -1443,6 +1427,7 @@ fn install_principal_overlays_sync(
             state.invocation_kv = None;
             state.invocation_secret_store = None;
             state.invocation_capsule_log = None;
+            state.deferred_logs.clear_invocation();
             return false;
         },
     };
@@ -1452,12 +1437,7 @@ fn install_principal_overlays_sync(
         state.runtime_handle.clone(),
     ));
     state.invocation_kv = Some(kv);
-    state.invocation_capsule_log = open_capsule_log(
-        &state.principal_directory,
-        p,
-        state.capsule_id.as_str(),
-        false,
-    );
+    native_logs::install_invocation(state, p, principal_uid);
     true
 }
 
@@ -1496,37 +1476,6 @@ fn resume_principal_token(
         .remove(principal);
 }
 
-/// Open (creating the log dir if needed) the daily-rotated log file for
-/// `capsule_name` under an admitted principal's immutable UID. Logs are an
-/// operational native projection at `log/principals/<uid>/<capsule>/`; they
-/// are not part of the durable `home://` VFS and never use `PrincipalHome`.
-/// Returns `None` if the Astrid log root cannot be resolved, the principal is
-/// not admitted in `directory`, or the file cannot be opened safely.
-///
-/// When `prune` is true, deletes rotated logs older than 7 days before
-/// opening. Pruning is an O(N) directory scan and must only be requested on
-/// the load-time path — never from [`WasmEngine::invoke_interceptor`], which
-/// runs on the async hot path.
-///
-/// Mirrors the registration gate from [`build_principal_vfs_bundle`]: an
-/// invocation for an unregistered principal yields `None` instead of
-/// creating any native principal state.
-pub(crate) fn open_capsule_log(
-    directory: &astrid_storage::PrincipalDirectory,
-    principal: &astrid_core::PrincipalId,
-    capsule_name: &str,
-    prune: bool,
-) -> Option<Arc<Mutex<std::fs::File>>> {
-    let astrid_home = astrid_core::dirs::AstridHome::resolve().ok()?;
-    open_capsule_log_at(
-        &astrid_home.log_dir(),
-        directory,
-        principal,
-        capsule_name,
-        prune,
-    )
-}
-
 /// Read one principal's typed environment overlay from the host-only KV
 /// projection. Runtime lookup never consults native env JSON paths.
 pub(crate) async fn load_invocation_env_overlay_from_backend(
@@ -1549,53 +1498,6 @@ pub(crate) async fn load_invocation_env_overlay_from_backend(
             None
         },
     }
-}
-
-/// Test-friendly core of [`open_capsule_log`]: open a log file under a
-/// supplied top-level log root after resolving the principal's immutable UID.
-/// No alias is ever used as a physical path component.
-fn open_capsule_log_at(
-    log_root: &Path,
-    directory: &astrid_storage::PrincipalDirectory,
-    principal: &astrid_core::PrincipalId,
-    capsule_name: &str,
-    prune: bool,
-) -> Option<Arc<Mutex<std::fs::File>>> {
-    let uid = directory.uid_for(principal).ok()?;
-    let mut capsule_components = Path::new(capsule_name).components();
-    if capsule_name.is_empty()
-        || !matches!(
-            capsule_components.next(),
-            Some(std::path::Component::Normal(_))
-        )
-        || capsule_components.next().is_some()
-    {
-        return None;
-    }
-    astrid_core::platform_fs::ensure_private_directory(log_root).ok()?;
-    let principals_root = log_root.join("principals");
-    astrid_core::platform_fs::ensure_private_directory(&principals_root).ok()?;
-    let uid_root = principals_root.join(uid.to_string());
-    astrid_core::platform_fs::ensure_private_directory(&uid_root).ok()?;
-    let log_dir = uid_root.join(capsule_name);
-    astrid_core::platform_fs::ensure_private_directory(&log_dir).ok()?;
-    if prune {
-        prune_old_logs(&log_dir, 7);
-    }
-    let today = today_date_string();
-    let path = log_dir.join(format!("{today}.log"));
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o600)
-            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
-    }
-    let file = options.open(&path).ok()?;
-    astrid_core::platform_fs::restrict_private_file(&path).ok()?;
-    Some(Arc::new(Mutex::new(file)))
 }
 
 /// Refuse the invocation if the invoking principal's profile has
@@ -1816,6 +1718,14 @@ impl ExecutionEngine for WasmEngine {
 
         let capsule_dir_for_verify = self._capsule_dir.clone();
         let compiled_cache = self.compiled_cache.clone();
+        let native_log_root = self.native_log_root.clone();
+        let native_owner_uid =
+            self.runtime_id
+                .as_ref()
+                .and_then(|runtime| match runtime.key().scope() {
+                    crate::registry::RuntimeScope::Principal(uid) => Some(uid),
+                    crate::registry::RuntimeScope::SystemResident => None,
+                });
         // Authority scope comes only from the kernel-reserved RuntimeId. A
         // missing identity is a compatibility/test path and fails closed to a
         // principal runtime; context shape must never grant system authority.
@@ -2279,14 +2189,17 @@ impl ExecutionEngine for WasmEngine {
                     tokio::runtime::Handle::current(),
                 ))
             });
-            let owner_capsule_log = (!system_runtime).then(|| {
-                open_capsule_log(
-                    &ctx.principal_directory,
-                    &ctx.principal,
-                    capsule_id_val.as_str(),
-                    true,
+            let owner_log = if system_runtime {
+                native_logs::Binding::default()
+            } else {
+                native_logs::bind(
+                    native_log_root.as_ref(), &ctx.principal_directory,
+                    &ctx.principal, capsule_id_val.as_str(), true, &principal_invocations,
+                    native_owner_uid.or(owner_uid),
                 )
-            }).flatten();
+            };
+            let owner_capsule_log = owner_log.file;
+            let owner_pending_log = owner_log.pending;
             let owner_kv = Some(kv.clone());
 
             // Per-instance `HostState` factory. Shared services clone (Arc or
@@ -2341,6 +2254,8 @@ impl ExecutionEngine for WasmEngine {
             let st_owner_kv = owner_kv.clone();
             let st_owner_secret_store = owner_secret_store.clone();
             let st_owner_capsule_log = owner_capsule_log.clone();
+            let st_native_log_root = native_log_root.clone();
+            let st_owner_pending_log = owner_pending_log.clone();
             let kv_backend_for_state = kv_backend.clone();
             // Concurrent run-loop workers (Approach B, shared listener). Only a
             // loopback TCP server capsule (run-loop + TCP `net_bind`, no
@@ -2397,6 +2312,9 @@ impl ExecutionEngine for WasmEngine {
                 // Runtime-owned log; SystemResident contexts deliberately have
                 // no human-principal log fallback.
                 capsule_log: st_owner_capsule_log.clone(),
+                deferred_logs: native_logs::DeferredBindings::for_factory(
+                    st_native_log_root.clone(), st_owner_pending_log.clone(),
+                ),
                 capsule_id: capsule_id_val.clone(),
                 // The CoW merged path (non-git) or the pristine workspace
                 // (git-managed). This is the sandbox writable root + cwd for
@@ -3796,6 +3714,7 @@ async fn build_lifecycle_host_state(
         interceptor_active: false,
         invocation_kv: None,
         capsule_log: None,
+        deferred_logs: native_logs::DeferredBindings::default(),
         capsule_id: cfg.capsule_id.clone(),
         workspace_root: cfg.workspace_root.clone(),
         hosted_workspace_root: cfg.workspace_root.clone(),

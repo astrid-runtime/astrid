@@ -10,6 +10,8 @@ use crate::storage_model::{
 
 use super::*;
 
+mod clear;
+
 fn record(byte: u8) -> ObjectRecord {
     ObjectRecord::new(
         ObjectKind::Chunk,

@@ -53,12 +53,18 @@ pub use dirs_layout::{
     LayoutMigrationTarget, preserve_legacy_source_tree, retire_legacy_source_tree,
     retire_runtime_run_directory, validate_legacy_source_tree,
 };
-#[path = "dirs_projection_retirement.rs"]
+#[path = "dirs/projection_retirement/mod.rs"]
 mod projection_retirement;
+#[cfg(any(unix, windows))]
+pub use projection_retirement::PreparedProjectionRetirement;
+pub use projection_retirement::RetirementEntryKind;
+#[cfg(all(feature = "test-support", unix))]
+pub use projection_retirement::interrupt_retirement_before_unlink_once;
 pub use projection_retirement::retire_projection_root;
 #[path = "dirs_run_dir.rs"]
 mod run_dir;
 mod stopped_key;
+pub use stopped_key::StoppedProjectionRecovery;
 #[path = "dirs_workspace.rs"]
 mod workspace_dir;
 pub use workspace_dir::WorkspaceDir;
@@ -258,7 +264,7 @@ enum UnsentinelledRootState {
     Empty,
     RuntimeKeyBootstrap,
     StoppedVolume,
-    StoppedKeyRecovery,
+    StoppedRecovery,
 }
 
 impl AstridHome {
@@ -405,6 +411,10 @@ impl AstridHome {
                 self.wit_store_dir(),
             ]);
         }
+        // Stopped admission is read-only until storage records restoration intent.
+        if existing_layout.is_none() && stopped_key::admit_stopped_read_only(self)? {
+            return Ok(());
+        }
         crate::platform_fs::ensure_private_directory(self.root())?;
         for dir in &dirs {
             crate::platform_fs::ensure_private_directory(dir)?;
@@ -491,7 +501,7 @@ impl AstridHome {
 
         if matches!(
             self.validate_fresh_root_entries()?,
-            UnsentinelledRootState::StoppedVolume | UnsentinelledRootState::StoppedKeyRecovery
+            UnsentinelledRootState::StoppedVolume | UnsentinelledRootState::StoppedRecovery
         ) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -502,11 +512,15 @@ impl AstridHome {
     }
 
     fn validate_fresh_root_entries(&self) -> io::Result<UnsentinelledRootState> {
-        if self.requires_stopped_key_recovery()? {
-            return Ok(UnsentinelledRootState::StoppedKeyRecovery);
+        if self.stopped_projection_recovery()?.is_some() {
+            return Ok(UnsentinelledRootState::StoppedRecovery);
         }
         let mut entries = self.root().read_dir()?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(std::fs::DirEntry::file_name);
+        // The exact private singleton is ownership residue, never source data.
+        if stopped_key::only_boot_singleton(self)? {
+            entries.retain(|entry| entry.file_name() != "run");
+        }
         if entries.len() == 1 && entries[0].file_name() == std::ffi::OsStr::new("keys") {
             self.validate_runtime_key_bootstrap(&entries[0].path())?;
             return Ok(UnsentinelledRootState::RuntimeKeyBootstrap);
@@ -533,6 +547,7 @@ impl AstridHome {
                     ),
                 ));
             }
+            stopped_key::validate_recovery_root(self)?;
             crate::platform_fs::validate_private_file(&path)?;
             state = UnsentinelledRootState::StoppedVolume;
         }
@@ -703,6 +718,15 @@ impl AstridHome {
         crate::runtime_scratch::clear_principal_scratch(&self.run_dir().join("principals"))
     }
 
+    /// Canonical runtime socket filename; fixed by the host-local filesystem contract.
+    pub const SOCKET_FILE_NAME: &str = "system.sock";
+    /// Canonical authentication token filename in the admitted runtime directory.
+    pub const TOKEN_FILE_NAME: &str = "system.token";
+    /// Canonical readiness sentinel filename in the admitted runtime directory.
+    pub const READY_FILE_NAME: &str = "system.ready";
+    /// Canonical process identifier filename in the admitted runtime directory.
+    pub const PID_FILE_NAME: &str = "system.pid";
+
     /// Portable endpoint token for the kernel's host-local transport.
     ///
     /// Unix uses this as the domain-socket path (`run/system.sock`). Windows
@@ -710,13 +734,13 @@ impl AstridHome {
     /// deliberately ignores the filesystem-shaped value.
     #[must_use]
     pub fn socket_path(&self) -> PathBuf {
-        self.run_dir().join("system.sock")
+        self.run_dir().join(Self::SOCKET_FILE_NAME)
     }
 
     /// Path to the session authentication token (`run/system.token`).
     #[must_use]
     pub fn token_path(&self) -> PathBuf {
-        self.run_dir().join("system.token")
+        self.run_dir().join(Self::TOKEN_FILE_NAME)
     }
 
     /// Path to the daemon readiness sentinel (`run/system.ready`).
@@ -726,7 +750,7 @@ impl AstridHome {
     /// to avoid connecting before the daemon is fully initialized.
     #[must_use]
     pub fn ready_path(&self) -> PathBuf {
-        self.run_dir().join("system.ready")
+        self.run_dir().join(Self::READY_FILE_NAME)
     }
 
     /// Path to the daemon PID file (`run/system.pid`).
@@ -740,7 +764,7 @@ impl AstridHome {
     /// `astrid start`.
     #[must_use]
     pub fn pid_path(&self) -> PathBuf {
-        self.run_dir().join("system.pid")
+        self.run_dir().join(Self::PID_FILE_NAME)
     }
 
     /// Path to the deferred queue database (`run/deferred.db/`).

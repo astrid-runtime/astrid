@@ -34,6 +34,9 @@
 
 extern crate alloc;
 
+#[cfg(all(test, not(target_family = "wasm")))]
+mod test_directory;
+
 /// Durable owner-scoped installed capsule package registry.
 pub mod capsule_registry;
 pub mod content;
@@ -124,9 +127,11 @@ pub use kv::SurrealKvStore;
 pub use principal_state::{
     Blake3ObjectIdentityV1, Blake3PhysicalIdentityV1, ContiguousFileIngest,
     NativeContentStagingArea, NativePrincipalContentStore, RUNTIME_STORE_FORMAT_ID,
-    ReadyStagedContent, RuntimePrincipalStore, RuntimeTreeEntry, StagedContentId,
-    StagedContentWriter, StateOwner, StateOwnerCodecV1, StateOwnerCodecV2, StateOwnerResolver,
-    StateOwnerV1, open_runtime_kv, open_runtime_kv_with_directory, open_runtime_principal_store,
+    ReadyStagedContent, RuntimePrincipalStore, RuntimeProjectionRecovery, RuntimeTreeAdmission,
+    RuntimeTreeEntry, StagedContentId, StagedContentWriter, StateOwner, StateOwnerCodecV1,
+    StateOwnerCodecV2, StateOwnerResolver, StateOwnerV1, open_runtime_kv,
+    open_runtime_kv_with_directory, open_runtime_principal_store,
+    open_runtime_principal_store_recovering_projection,
     open_runtime_principal_store_with_directory, open_runtime_principal_store_with_object_cache,
     open_runtime_principal_store_with_policy,
 };

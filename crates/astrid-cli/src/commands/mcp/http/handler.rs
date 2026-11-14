@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, ListToolsResult, PaginatedRequestParams,
-    ProtocolVersion, ServerInfo, SubscriptionFilter,
+    ProtocolVersion, ServerConfig, SubscriptionFilter,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleServer, SubscriptionContext};
 use rmcp::{ErrorData, ServerHandler};
@@ -47,7 +47,7 @@ impl ServerHandler for HttpHandler {
         self.broker.supported_protocol_versions()
     }
 
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         self.broker.get_info()
     }
 

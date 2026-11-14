@@ -1,5 +1,5 @@
 //! Differential oracle for the frozen canonical-shape guarantee.
-use super::*;
+use super::{CanonicalNodeSink, *};
 use crate::storage_model::physical::map::PhysicalMapKey;
 
 struct Identity;
@@ -477,5 +477,216 @@ fn public_recovery_rejects_noncanonical_body_even_when_root_digest_collides() {
                 "physical map-node identity collision"
             ))
         ));
+    }
+}
+
+#[test]
+fn canonical_proof_keeps_only_active_ids_and_borrows_sorted_leaf_values() {
+    let active = super::super::CanonicalPhysicalMap::build_dense(
+        &Identity,
+        PhysicalMapDomain::Placement,
+        vec![
+            (PhysicalMapKey::new([2; 32]), vec![7]),
+            (PhysicalMapKey::new([1; 32]), vec![8]),
+        ],
+    )
+    .unwrap();
+    let historical = super::super::CanonicalPhysicalMap::build_dense(
+        &Identity,
+        PhysicalMapDomain::Placement,
+        vec![(PhysicalMapKey::new([2; 32]), vec![9])],
+    )
+    .unwrap();
+    let old = historical.root().unwrap();
+    let mut nodes = active.nodes().clone();
+    nodes.extend(historical.nodes().clone());
+    let map = super::super::CanonicalPhysicalMap::recover(
+        &Identity,
+        PhysicalMapDomain::Placement,
+        active.root(),
+        nodes,
+    )
+    .unwrap();
+    let proof = map
+        .prove_root(&Identity, PhysicalMapDomain::Placement)
+        .unwrap();
+    assert!(!proof.visited().contains(&old));
+    assert!(proof.visited().contains(&map.root().unwrap()));
+    assert_eq!(proof.entries().len(), 2);
+    assert!(proof.entries().windows(2).all(|pair| pair[0].0 < pair[1].0));
+    for (key, value) in proof.entries() {
+        assert!(core::ptr::eq(*value, map.get(*key).unwrap()));
+    }
+    assert!(
+        map.prove_root(&Identity, PhysicalMapDomain::Profile)
+            .is_err()
+    );
+    let empty = prove_root(&Identity, PhysicalMapDomain::Placement, None, map.nodes()).unwrap();
+    assert!(empty.visited().is_empty());
+    assert!(empty.entries().is_empty());
+}
+
+#[test]
+fn borrowed_builder_bytes_match_owned_node_encoding_and_identity() {
+    for construction in [MapConstruction::LegacyBinary, MapConstruction::DenseRadix] {
+        for count in [1_u32, 2, 17] {
+            let entries = (0..count)
+                .map(|n| {
+                    (
+                        PhysicalMapKey::new(*blake3::hash(&n.to_be_bytes()).as_bytes()),
+                        vec![u8::try_from(n % 251).unwrap().saturating_add(1); 17],
+                    )
+                })
+                .collect();
+            let map = super::super::CanonicalPhysicalMap::build_with_construction(
+                &Identity,
+                PhysicalMapDomain::Placement,
+                entries,
+                construction,
+            )
+            .unwrap();
+            let mut kinds = BTreeSet::new();
+            encode_live_root_into(
+                PhysicalMapDomain::Placement,
+                map.root(),
+                map.nodes(),
+                map.entry_count(),
+                |id, bytes| {
+                    let live = &map.nodes()[&id];
+                    kinds.insert(match live {
+                        PhysicalMapNode::Leaf { .. } => "leaf",
+                        PhysicalMapNode::Branch { .. } => "branch",
+                        PhysicalMapNode::Page { .. } => "page",
+                        PhysicalMapNode::Radix { .. } => "radix",
+                    });
+                    assert_eq!(
+                        bytes,
+                        live.encode().unwrap().as_slice(),
+                        "{construction:?} count={count}"
+                    );
+                    assert_eq!(live.identify(&Identity).unwrap(), id);
+                    assert_eq!(PhysicalMapNode::decode(bytes).unwrap(), *live);
+                    Ok::<_, PhysicalModelError>(())
+                },
+            )
+            .unwrap();
+            match construction {
+                MapConstruction::LegacyBinary if count == 1 => assert!(kinds.contains("leaf")),
+                MapConstruction::LegacyBinary => assert!(kinds.contains("branch")),
+                MapConstruction::DenseRadix if count == 1 => assert!(kinds.contains("page")),
+                MapConstruction::DenseRadix => assert!(kinds.contains("radix")),
+            }
+        }
+    }
+}
+
+#[test]
+fn encode_live_allocates_one_owned_encoding_per_visited_node() {
+    for construction in [MapConstruction::LegacyBinary, MapConstruction::DenseRadix] {
+        for count in [1_u32, 2, 17, 257] {
+            let entries = (0..count)
+                .map(|n| {
+                    (
+                        PhysicalMapKey::new(*blake3::hash(&n.to_be_bytes()).as_bytes()),
+                        vec![3; 9],
+                    )
+                })
+                .collect();
+            let map = super::super::CanonicalPhysicalMap::build_with_construction(
+                &Identity,
+                PhysicalMapDomain::Placement,
+                entries,
+                construction,
+            )
+            .unwrap();
+            // encode_live_root_into is the automatic-seal emitter: one owned
+            // encoding per visited live node, no rebuild/identify storm.
+            let (result, encodings) = PhysicalMapNode::count_encodings_during(|| {
+                encode_live_root_into(
+                    PhysicalMapDomain::Placement,
+                    map.root(),
+                    map.nodes(),
+                    map.entry_count(),
+                    |_, _| Ok::<_, PhysicalModelError>(()),
+                )
+            });
+            let proof = result.unwrap();
+            assert_eq!(
+                encodings,
+                proof.visited().len(),
+                "allocated live encodings {construction:?} count={count}"
+            );
+        }
+    }
+}
+
+#[test]
+fn matches_encoded_does_not_allocate_a_canonical_encoding() {
+    for construction in [MapConstruction::LegacyBinary, MapConstruction::DenseRadix] {
+        let map = super::super::CanonicalPhysicalMap::build_with_construction(
+            &Identity,
+            PhysicalMapDomain::Placement,
+            vec![
+                (PhysicalMapKey::new([1; 32]), vec![7, 8, 9]),
+                (PhysicalMapKey::new([2; 32]), vec![4, 5, 6]),
+            ],
+            construction,
+        )
+        .unwrap();
+        for node in map.nodes().values() {
+            let bytes = node.encode().unwrap();
+            let (result, encodings) =
+                PhysicalMapNode::count_encodings_during(|| node.matches_encoded(&bytes));
+            result.unwrap();
+            assert_eq!(
+                encodings, 0,
+                "matches_encoded must not count as an allocated encoding {construction:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn proof_sink_matches_encoded_bytes_without_retaining() {
+    for construction in [MapConstruction::LegacyBinary, MapConstruction::DenseRadix] {
+        let map = super::super::CanonicalPhysicalMap::build_with_construction(
+            &Identity,
+            PhysicalMapDomain::Placement,
+            vec![(PhysicalMapKey::new([1; 32]), vec![7, 8, 9])],
+            construction,
+        )
+        .unwrap();
+        let id = map.root().unwrap();
+        let bytes = map.nodes()[&id].encode().unwrap();
+        let mut sink = ValidationNodes(map.nodes());
+        sink.put_encoded(id, &bytes, || {
+            panic!("proof sink must not retain owned nodes")
+        })
+        .unwrap();
+
+        let empty = BTreeMap::new();
+        let mut missing = ValidationNodes(&empty);
+        assert_eq!(
+            missing.put_encoded(id, &bytes, || panic!(
+                "proof sink must not retain owned nodes"
+            )),
+            Err(PhysicalModelError::InvalidMap("missing canonical map node"))
+        );
+
+        let mut tampered = map.nodes().clone();
+        match tampered.get_mut(&id).unwrap() {
+            PhysicalMapNode::Leaf { value, .. } => value[0] ^= 1,
+            PhysicalMapNode::Page { entries, .. } => entries[0].1[0] ^= 1,
+            other => panic!("expected a leaf or page, got {other:?}"),
+        }
+        let mut colliding = ValidationNodes(&tampered);
+        assert_eq!(
+            colliding.put_encoded(id, &bytes, || panic!(
+                "proof sink must not retain owned nodes"
+            )),
+            Err(PhysicalModelError::InvalidMap(
+                "physical map-node identity collision"
+            ))
+        );
     }
 }

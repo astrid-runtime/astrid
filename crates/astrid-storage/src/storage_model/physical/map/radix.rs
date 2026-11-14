@@ -15,7 +15,7 @@ pub(super) fn build<I: PhysicalIdentity, V: AsRef<[u8]>, N: CanonicalNodeSink>(
     domain: PhysicalMapDomain,
     entries: &[(PhysicalMapKey, V)],
     nodes: &mut N,
-) -> Result<PhysicalMapNodeId, PhysicalModelError> {
+) -> Result<PhysicalMapNodeId, N::Error> {
     build_range(identity, domain, entries, 0, nodes)
 }
 
@@ -41,22 +41,12 @@ fn build_range<I: PhysicalIdentity, V: AsRef<[u8]>, N: CanonicalNodeSink>(
     entries: &[(PhysicalMapKey, V)],
     depth: u8,
     nodes: &mut N,
-) -> Result<PhysicalMapNodeId, PhysicalModelError> {
+) -> Result<PhysicalMapNodeId, N::Error> {
     if entries.is_empty() {
-        return Err(PhysicalModelError::InvalidMap("empty radix range"));
+        return Err(PhysicalModelError::InvalidMap("empty radix range").into());
     }
     if entries.len() <= RADIX_PAGE_CAPACITY {
-        return insert_node(
-            identity,
-            nodes,
-            PhysicalMapNode::page(
-                domain,
-                entries
-                    .iter()
-                    .map(|(key, value)| (*key, value.as_ref().to_vec()))
-                    .collect(),
-            )?,
-        );
+        return put_encoded_page(identity, domain, entries, nodes);
     }
 
     let prefix_nibbles = common_prefix_nibbles(
@@ -71,7 +61,7 @@ fn build_range<I: PhysicalIdentity, V: AsRef<[u8]>, N: CanonicalNodeSink>(
         depth,
     );
     if prefix_nibbles >= DIGEST_NIBBLES {
-        return Err(PhysicalModelError::InvalidMap("duplicate radix key"));
+        return Err(PhysicalModelError::InvalidMap("duplicate radix key").into());
     }
 
     let mut child_bitmap = 0_u16;
@@ -99,15 +89,99 @@ fn build_range<I: PhysicalIdentity, V: AsRef<[u8]>, N: CanonicalNodeSink>(
         )?);
         start = end;
     }
-    let node = PhysicalMapNode::radix(
+    put_encoded_radix(
+        identity,
         domain,
+        entries,
         prefix_nibbles,
-        canonical_nibble_prefix(entries[0].0, prefix_nibbles),
         child_bitmap,
         children,
-        u64::try_from(entries.len()).map_err(|_| PhysicalModelError::LengthOverflow)?,
+        nodes,
+    )
+}
+
+fn put_encoded_page<I, V, N>(
+    identity: &I,
+    domain: PhysicalMapDomain,
+    entries: &[(PhysicalMapKey, V)],
+    nodes: &mut N,
+) -> Result<PhysicalMapNodeId, N::Error>
+where
+    I: PhysicalIdentity,
+    V: AsRef<[u8]>,
+    N: CanonicalNodeSink,
+{
+    super::validate_page(entries)?;
+    let bytes = super::encode_body(|encoder| super::encode::page(domain, entries, encoder))?;
+    super::put_identified_bytes(
+        identity,
+        super::RADIX_MAP_NODE_IDENTITY,
+        nodes,
+        &bytes,
+        || {
+            Ok(PhysicalMapNode::Page {
+                domain,
+                entries: entries
+                    .iter()
+                    .map(|(key, value)| (*key, value.as_ref().to_vec()))
+                    .collect(),
+            })
+        },
+    )
+}
+
+fn put_encoded_radix<I, V, N>(
+    identity: &I,
+    domain: PhysicalMapDomain,
+    entries: &[(PhysicalMapKey, V)],
+    prefix_nibbles: u8,
+    child_bitmap: u16,
+    children: Vec<PhysicalMapNodeId>,
+    nodes: &mut N,
+) -> Result<PhysicalMapNodeId, N::Error>
+where
+    I: PhysicalIdentity,
+    V: AsRef<[u8]>,
+    N: CanonicalNodeSink,
+{
+    let prefix = canonical_nibble_prefix(entries[0].0, prefix_nibbles);
+    let subtree_entries =
+        u64::try_from(entries.len()).map_err(|_| PhysicalModelError::LengthOverflow)?;
+    super::validate_radix(
+        prefix_nibbles,
+        &prefix,
+        child_bitmap,
+        &children,
+        subtree_entries,
     )?;
-    insert_node(identity, nodes, node)
+    let bytes = super::encode_body(|encoder| {
+        super::encode::radix(
+            domain,
+            prefix_nibbles,
+            &prefix,
+            child_bitmap,
+            &children,
+            subtree_entries,
+            encoder,
+        );
+        Ok(())
+    })?;
+    super::put_identified_bytes(
+        identity,
+        super::RADIX_MAP_NODE_IDENTITY,
+        nodes,
+        &bytes,
+        || {
+            Ok(PhysicalMapNode::Radix {
+                domain,
+                prefix_nibbles,
+                prefix,
+                child_bitmap,
+                children,
+                subtree_entries,
+            })
+        },
+    )
 }
 
 struct DenseInsertion<'a, I> {
@@ -271,9 +345,9 @@ fn insert_node<I: PhysicalIdentity, N: CanonicalNodeSink>(
     identity: &I,
     nodes: &mut N,
     node: PhysicalMapNode,
-) -> Result<PhysicalMapNodeId, PhysicalModelError> {
-    let id = node.identify(identity)?;
-    nodes.put(id, node)?;
+) -> Result<PhysicalMapNodeId, N::Error> {
+    let (bytes, id) = node.encode_and_identify(identity)?;
+    nodes.put(id, &bytes, node)?;
     Ok(id)
 }
 

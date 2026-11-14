@@ -42,7 +42,8 @@ use rmcp::ErrorData as McpError;
 use rmcp::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig,
+    Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use serde_json::{Value, json};
@@ -475,7 +476,7 @@ impl ServerHandler for AstridMcpServer {
         Cow::Borrowed(ASTRID_MCP_PROTOCOL_VERSIONS)
     }
 
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         // Tools-only server. `listChanged = true` tells the client the
         // tool surface can change at runtime (capsules load/unload), so
         // it should honour `notifications/tools/list_changed`.
@@ -484,10 +485,10 @@ impl ServerHandler for AstridMcpServer {
         tools.list_changed = Some(true);
         capabilities.tools = Some(tools);
 
-        // `ServerInfo` (`InitializeResult`) is `#[non_exhaustive]`, so it
+        // `ServerConfig` (`InitializeResult`) is `#[non_exhaustive]`, so it
         // must be built through its constructor + setters rather than a
         // struct literal.
-        ServerInfo::new(capabilities)
+        ServerConfig::new(capabilities)
             .with_server_info(Implementation::new("astrid", env!("CARGO_PKG_VERSION")))
             // Keep this aligned with the preferred entry in
             // `supported_protocol_versions`; legacy clients negotiate 2025.

@@ -2,14 +2,10 @@
 
 use super::{
     BTreeMap, Blake3PhysicalIdentity, DurableError, DurableIo, METADATA_FILE, METADATA_MAGIC,
-    MetadataFrame, MetadataKind, RecoveryLimits, map_node_id, read_frame_at,
+    MetadataFrame, MetadataKind, RecoveryLimits, map_node_id,
 };
-use crate::storage_model::{
-    CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapNode, PhysicalMapNodeId,
-};
-
-#[derive(Clone, Copy, Debug)]
-pub(super) struct MetadataFrameOffset(u64);
+use crate::engine::durable::format::FrameLocation;
+use crate::storage_model::{PhysicalMapDomain, PhysicalMapNode, PhysicalMapNodeId};
 
 mod graph;
 pub(super) use graph::{HistoricalMapClosure, HistoricalMapGraph};
@@ -18,12 +14,29 @@ pub(super) use graph::{HistoricalMapClosure, HistoricalMapGraph};
 pub(in crate::engine::durable::representations) struct MetadataIndex {
     pub(super) values: BTreeMap<(MetadataKind, [u8; 32]), Vec<u8>>,
     pub(super) nodes: HistoricalMapGraph,
+    /// `MapNode` frames observed in this generation, including identical duplicates.
+    pub(in crate::engine::durable::representations) map_frame_count: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static RECOVER_ACTIVE_NODES_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(in crate::engine::durable::representations) fn reset_recover_active_nodes_calls() {
+    RECOVER_ACTIVE_NODES_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(in crate::engine::durable::representations) fn recover_active_nodes_calls() -> u64 {
+    RECOVER_ACTIVE_NODES_CALLS.with(std::cell::Cell::get)
 }
 
 impl MetadataIndex {
     pub(super) fn insert_at<V: AsRef<[u8]> + Into<Vec<u8>>>(
         &mut self,
-        offset: u64,
+        location: FrameLocation,
         frame: MetadataFrame<V>,
         load_previous: impl FnOnce(u64) -> Result<Vec<u8>, DurableError>,
     ) -> Result<(), DurableError> {
@@ -37,10 +50,10 @@ impl MetadataIndex {
                             "metadata identity does not match canonical value",
                         ));
                     }
-                    if let Some(existing) = self.nodes.offset(&id) {
+                    if let Some(existing) = self.nodes.location(&id) {
                         // Compare actual earlier bytes. Identity equality alone must
                         // not turn a collision into a successful duplicate append.
-                        let payload = load_previous(existing.0)?;
+                        let payload = load_previous(existing.offset())?;
                         let previous = MetadataFrame::decode(&payload)?;
                         if previous.kind != frame.kind
                             || previous.identity != frame.identity
@@ -51,9 +64,13 @@ impl MetadataIndex {
                             ));
                         }
                     } else {
-                        self.nodes
-                            .insert(id, MetadataFrameOffset(offset), children)?;
+                        self.nodes.insert(id, location, children)?;
                     }
+                    // Count every durable MapNode frame, including identical re-appends.
+                    self.map_frame_count = self
+                        .map_frame_count
+                        .checked_add(1)
+                        .ok_or(DurableError::EncodingOverflow)?;
                     Ok(())
                 },
             )?;
@@ -86,14 +103,22 @@ impl MetadataIndex {
             ))
     }
 
+    /// Extract the exact active closure as untrusted node bytes.
+    ///
+    /// Domain authentication happens at the typed `recover_exact` boundary so
+    /// this helper stays a lean traversal over already-indexed links.
     #[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all, fields(domain = ?domain, input_nodes = self.nodes.len(), active_nodes = tracing::field::Empty))]
-    pub(in crate::engine::durable::representations) fn recover_active_map<F: DurableIo>(
+    pub(in crate::engine::durable::representations) fn recover_active_nodes<F: DurableIo>(
         &mut self,
         domain: PhysicalMapDomain,
         root: Option<PhysicalMapNodeId>,
         source: &F,
         limits: RecoveryLimits,
-    ) -> Result<CanonicalPhysicalMap, DurableError> {
+    ) -> Result<BTreeMap<PhysicalMapNodeId, PhysicalMapNode>, DurableError> {
+        #[cfg(test)]
+        {
+            RECOVER_ACTIVE_NODES_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+        }
         let mut nodes = BTreeMap::new();
         let mut pending: Vec<_> = root.into_iter().collect();
         while let Some(id) = pending.pop() {
@@ -106,14 +131,10 @@ impl MetadataIndex {
                 .ok_or(DurableError::InvalidRepresentationState(
                     "active physical map closure is incomplete",
                 ))?;
-            let payload = read_frame_at(
-                source,
-                METADATA_FILE,
-                METADATA_MAGIC,
-                entry.offset.0,
-                limits,
-            )?;
-            let frame = MetadataFrame::decode(&payload)?;
+            let payload = entry
+                .location
+                .read(source, METADATA_FILE, METADATA_MAGIC, limits)?;
+            let frame = MetadataFrame::decode(payload.payload())?;
             let (node, computed) =
                 PhysicalMapNode::decode_and_identify(frame.value, &Blake3PhysicalIdentity)?;
             if frame.kind != MetadataKind::MapNode
@@ -144,15 +165,7 @@ impl MetadataIndex {
         if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {
             tracing::Span::current().record("active_nodes", nodes.len());
         }
-        // The indexed traversal already extracted exactly this active closure.
-        // Transfer its ownership directly; canonical recovery still validates
-        // identities, domains and shape, including cycles and shared children.
-        Ok(CanonicalPhysicalMap::recover(
-            &Blake3PhysicalIdentity,
-            domain,
-            root,
-            nodes,
-        )?)
+        Ok(nodes)
     }
 
     #[cfg(test)]
@@ -162,7 +175,9 @@ impl MetadataIndex {
     ) -> Result<(), DurableError> {
         // Synthetic journal fixtures contain unique identities and never read
         // bodies back. Real duplicate and reconstruction tests use framed IO.
-        self.insert_at(0, frame, |_| {
+        let payload_bytes =
+            u64::try_from(frame.encode()?.len()).map_err(|_| DurableError::EncodingOverflow)?;
+        self.insert_at(FrameLocation::for_test(0, payload_bytes), frame, |_| {
             Err(DurableError::InvalidRepresentationState(
                 "synthetic metadata fixture cannot reread duplicate frames",
             ))

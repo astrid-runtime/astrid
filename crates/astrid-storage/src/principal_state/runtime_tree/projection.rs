@@ -32,27 +32,20 @@ pub(super) fn confined_projection_path(root: &Path, relative: &str) -> StorageRe
     Ok(path)
 }
 
+#[cfg(test)]
 pub(super) fn write_projection_file(
     root: &Path,
     relative: &str,
     bytes: &[u8],
 ) -> StorageResult<()> {
     let path = confined_projection_path(root, relative)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| tree_error(&path, "projection path has no parent".to_owned()))?;
-    super::super::native_io::ensure_private_directory(parent)?;
-    astrid_core::platform_fs::atomic_write_private_file(&path, bytes)
+    let projection = astrid_core::platform_fs::PrivateFileProjection::open(root)
+        .map_err(|error| tree_error(&path, format!("open test projection: {error}")))?;
+    projection
+        .write(Path::new(relative), bytes)
+        .and_then(|()| projection.sync())
         .map_err(|error| tree_error(&path, format!("project volume-backed file: {error}")))?;
     Ok(())
-}
-
-pub(super) fn restore_directory(root: &Path, name: &str, logical_bytes: u64) -> StorageResult<()> {
-    if logical_bytes != 0 {
-        return Err(tree_error(root, "directory marker contains file bytes"));
-    }
-    let path = confined_projection_path(root, name)?;
-    super::super::native_io::ensure_private_directory(&path)
 }
 
 pub(super) fn surviving_directory(root: &Path, name: &str) -> bool {
@@ -74,7 +67,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_admin_directory_survives_volume_only_stop_and_reopen() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_directory::temporary().unwrap();
         let home = AstridHome::from_path(root.path());
         let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|_: &StateOwner| Ok(None));
         let store = open_runtime_principal_store(&home, quota.clone())

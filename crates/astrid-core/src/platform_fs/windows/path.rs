@@ -14,6 +14,17 @@ mod verification;
 pub(super) use verification::verify_captured_no_redirects;
 pub(in crate::platform_fs) use verification::verify_no_redirects;
 
+#[path = "path/capture.rs"]
+mod capture;
+#[path = "path/descendant.rs"]
+mod descendant;
+#[cfg(test)]
+pub(in crate::platform_fs::windows) use descendant::TEST_MOVE_DESCENDANT_DURING_CAPTURE;
+#[cfg(test)]
+pub(in crate::platform_fs::windows) use descendant::install_descendant_namespace_flush_failures;
+#[cfg(test)]
+pub(in crate::platform_fs::windows) use descendant::install_descendant_parent_namespace_flush_failure;
+
 pub(super) struct OwnedHandle(pub(super) HANDLE);
 
 impl Drop for OwnedHandle {
@@ -25,6 +36,15 @@ impl Drop for OwnedHandle {
                 CloseHandle(self.0);
             }
         }
+    }
+}
+
+impl From<OwnedHandle> for File {
+    fn from(handle: OwnedHandle) -> Self {
+        let raw = handle.0;
+        std::mem::forget(handle);
+        // SAFETY: OwnedHandle transfers its live file handle exactly once.
+        unsafe { Self::from_raw_handle(raw.cast()) }
     }
 }
 
@@ -193,83 +213,22 @@ pub(super) enum BoundaryContract {
 }
 
 impl TrustedPathGuard {
-    pub(super) fn capture(path: &Path) -> io::Result<Self> {
-        Self::capture_with_directory(path, None)
-    }
-
-    fn capture_with_directory(path: &Path, captured: Option<(&Path, &File)>) -> io::Result<Self> {
-        validate_local_absolute_path(path)?;
-        let mut components: Vec<LockedPathComponent> = Vec::new();
-        let mut current = PathBuf::new();
-        let mut rooted = false;
-        for component in path.components() {
-            current.push(component.as_os_str());
-            if matches!(component, Component::RootDir) {
-                rooted = true;
-            }
-            if !rooted {
-                continue;
-            }
-            let metadata = match std::fs::symlink_metadata(&current) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_dir()
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "trusted Windows path contains a redirect or non-directory component: {}",
-                        current.display()
-                    ),
-                ));
-            }
-            let (handle, identity) = if let Some((root, file)) = captured
-                && current == root
-            {
-                verification::capture_component(components.last(), &current, file)?
-            } else if let Some(parent) = components.last() {
-                open_directory_identity_relative(
-                    parent.handle.0,
-                    component.as_os_str(),
-                    current == path,
-                )?
-            } else if current == path {
-                open_locked_directory(&current)?
-            } else {
-                open_directory_identity(&current, true)?
-            };
-            components.push(LockedPathComponent {
-                path: current.clone(),
-                identity,
-                handle,
-            });
-        }
-        if components.last().map(|component| component.path.as_path()) != Some(path) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "trusted Windows authority boundary does not exist: {}",
-                    path.display()
-                ),
-            ));
-        }
-        // System ancestors such as the volume root and `Users` deliberately
-        // grant limited authority to principals outside Astrid's trust set.
-        // They remain open as identity handles while the caller-selected owned
-        // directory is the rename-locked ACL authority boundary. Critical
-        // child mutations resolve relative to that boundary handle, so an
-        // ancestor rename cannot redirect the operation into another tree.
-        let result = Self {
+    pub(super) fn try_clone(&self) -> io::Result<Self> {
+        let components = self
+            .components
+            .iter()
+            .map(|component| {
+                Ok(LockedPathComponent {
+                    path: component.path.clone(),
+                    identity: component.identity,
+                    handle: descendant::duplicate_handle_same_access(component.handle.0)?,
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(Self {
             components,
-            authority_boundary: path.to_path_buf(),
-        };
-        validate_trusted_parent_acl_handle(
-            result.authority_handle(),
-            &result.authority_boundary.display().to_string(),
-        )?;
-        Ok(result)
+            authority_boundary: self.authority_boundary.clone(),
+        })
     }
 
     pub(super) fn verify(&self) -> io::Result<()> {
@@ -330,6 +289,18 @@ impl TrustedPathGuard {
             .0
     }
 
+    pub(super) fn authority_identity(&self) -> FileIdentity {
+        self.components
+            .last()
+            .expect("captured Windows path has an authority component")
+            .identity
+    }
+
+    /// Create missing private descendants with paired child+parent NTFS fences.
+    ///
+    /// Each newly created component is flushed, then its parent namespace is
+    /// flushed, matching [`TrustedPathGuard::capture_descendant_directory`]
+    /// birth fencing. Partial failure cleans up created components.
     pub(super) fn create_private_descendants(&self, target: &Path) -> io::Result<()> {
         let relative = target.strip_prefix(&self.authority_boundary).map_err(|_| {
             io::Error::new(
@@ -374,13 +345,20 @@ impl TrustedPathGuard {
                 current.push(name);
                 let handle = create_private_directory_relative(parent, name)?;
                 created.push(current.clone(), handle);
-                validate_private_acl_handle(
-                    created
-                        .last_handle()
-                        .expect("created directory handle was just retained"),
-                    true,
-                    &current.display().to_string(),
-                )?;
+                let child = created
+                    .last_handle()
+                    .expect("created directory handle was just retained");
+                validate_private_acl_handle(child, true, &current.display().to_string())?;
+                // Same Unix create parity as capture_descendant_directory:
+                // NTFS flush new child, then flush the parent that gained it.
+                let parent_path = current.parent().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "created private directory has no parent path",
+                    )
+                })?;
+                descendant::flush_created_child_directory(parent, name, child)?;
+                descendant::flush_parent_directory_at(parent_path, parent)?;
 
                 #[cfg(test)]
                 after_test_directory_component(index)?;
@@ -500,17 +478,26 @@ fn test_probe_created_directory_acl(handle: HANDLE, disposition: u32) -> io::Res
     Ok(())
 }
 
-fn create_private_directory_relative(parent: HANDLE, name: &OsStr) -> io::Result<OwnedHandle> {
+pub(super) fn create_private_directory_relative(
+    parent: HANDLE,
+    name: &OsStr,
+) -> io::Result<OwnedHandle> {
+    create_private_directory_identity_relative(parent, name).map(|(handle, _)| handle)
+}
+
+fn create_private_directory_identity_relative(
+    parent: HANDLE,
+    name: &OsStr,
+) -> io::Result<(OwnedHandle, FileIdentity)> {
     let security = PrivateSecurityDescriptor::new(true)?;
-    let (handle, _) = open_directory_identity_relative_with_options(
+    open_directory_identity_relative_with_options(
         parent,
         name,
         true,
         WRITE_DAC | DELETE,
         FILE_CREATE,
         Some(&security),
-    )?;
-    Ok(handle)
+    )
 }
 
 fn open_directory_identity_relative(
@@ -790,6 +777,11 @@ pub(in crate::platform_fs) fn default_astrid_home_root() -> io::Result<PathBuf> 
     validate_local_absolute_path(&local_data)?;
     TrustedPathGuard::capture(&local_data)?.verify()?;
     Ok(local_data.join("Astrid").join("Runtime"))
+}
+
+/// Validate existing directory privacy without creation or permission repair.
+pub(in crate::platform_fs) fn validate_private_directory(path: &Path) -> io::Result<()> {
+    TrustedPathGuard::capture(path)?.verify_contract(BoundaryContract::ExactPrivateDirectory)
 }
 
 pub(in crate::platform_fs) fn ensure_private_directory(path: &Path) -> io::Result<()> {

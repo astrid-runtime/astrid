@@ -82,7 +82,13 @@ fn opener_rejects_a_retired_descriptor_after_atomic_replacement() {
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("astrid.volume");
     let volume = HostedFileVolume::open(&path).unwrap();
-    let stale = super::open::open_regular(&path, false).unwrap();
+    let stale = super::open::open_regular(
+        &path,
+        false,
+        #[cfg(windows)]
+        false,
+    )
+    .unwrap();
     volume.reclaim().unwrap();
     fs2::FileExt::try_lock_exclusive(&stale).unwrap();
     assert_eq!(
@@ -101,7 +107,12 @@ fn artifact_promotion_transfers_the_locked_open_description() {
     let path = temporary.path().join("astrid.volume");
     drop(HostedFileVolume::open(&path).unwrap());
     std::fs::rename(&path, reclaim::previous_path(&path)).unwrap();
-    let promoted = reclaim::recover_artifacts(&path).unwrap();
+    let promoted = reclaim::recover_artifacts(
+        &path,
+        #[cfg(windows)]
+        false,
+    )
+    .unwrap();
     // A fork can temporarily inherit this open description even with
     // close-on-exec enabled. Reusing it must not contend with its own lock.
     let inherited = promoted.try_clone().unwrap();
@@ -122,9 +133,77 @@ fn first_create_contender_opens_existing_inode_without_modifying_it() {
     let path = temporary.path().join("astrid.volume");
     let volume = HostedFileVolume::open(&path).unwrap();
     let before = super::test_support::read_container(&volume);
-    let contender = super::open::open_regular(&path, true).unwrap();
+    let contender = super::open::open_regular(
+        &path,
+        true,
+        #[cfg(windows)]
+        false,
+    )
+    .unwrap();
     super::open::require_current(&contender, &path).unwrap();
     assert!(fs2::FileExt::try_lock_exclusive(&contender).is_err());
     assert_eq!(super::test_support::read_container(&volume), before);
     drop(volume);
+}
+
+#[cfg(windows)]
+#[test]
+fn runtime_volume_is_private_and_retains_lock_through_reclaim() {
+    use astrid_core::platform_fs::directory_capability::RetainedPrivateRoot;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let root = RetainedPrivateRoot::admit(&scratch.path().join("runtime")).unwrap();
+    let path = root.path().join("astrid.volume");
+    let volume = HostedFileVolume::open_runtime(std::sync::Arc::clone(&root), &path).unwrap();
+    astrid_core::platform_fs::validate_private_file_handle(&volume.state.lock().file)
+        .expect("new runtime media must be private before first use");
+    assert!(
+        try_foreign_open(&path).status.success(),
+        "birth lost the exclusive lock"
+    );
+    volume
+        .reclaim()
+        .expect("private replacement must rename while both inode locks stay held");
+    astrid_core::platform_fs::validate_private_file_handle(&volume.state.lock().file)
+        .expect("reclaimed media must be private on its live handle");
+    assert!(
+        try_foreign_open(&path).status.success(),
+        "reclaim lost the exclusive lock"
+    );
+    drop(volume);
+    astrid_core::platform_fs::validate_private_file(&path).unwrap();
+    let reopened = HostedFileVolume::open_runtime(root, &path).unwrap();
+    astrid_core::platform_fs::validate_private_file_handle(&reopened.state.lock().file).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn runtime_open_rejects_existing_nonprivate_volume_without_repair() {
+    use astrid_core::platform_fs::directory_capability::RetainedPrivateRoot;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let root = RetainedPrivateRoot::admit(&scratch.path().join("runtime")).unwrap();
+    let path = root.path().join("astrid.volume");
+    drop(HostedFileVolume::open(&path).unwrap());
+    astrid_core::platform_fs::validate_private_file(&path)
+        .expect_err("generic inherited ACL must differ from ExactPrivate");
+    let before = std::fs::read(&path).unwrap();
+    let error = HostedFileVolume::open_runtime(root, &path)
+        .expect_err("existing nonprivate media must fail without repair");
+    assert!(
+        error.to_string().contains("private Windows path ACL"),
+        "{error}"
+    );
+    astrid_core::platform_fs::validate_private_file(&path)
+        .expect_err("rejection must not repair the volume ACL");
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[cfg(windows)]
+#[test]
+fn generic_volume_open_keeps_ordinary_parent_contract() {
+    let scratch = tempfile::tempdir().unwrap();
+    let path = scratch.path().join("nested/astrid.volume");
+    drop(HostedFileVolume::open(&path).unwrap());
+    assert!(path.is_file());
 }

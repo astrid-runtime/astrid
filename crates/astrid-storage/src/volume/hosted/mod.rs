@@ -16,7 +16,11 @@ use parking_lot::Mutex;
 
 use super::{AstridVolume, MAX_REGION_NAME_BYTES, VolumeMetadataMutation, VolumeRegion};
 
+#[cfg(test)]
+mod canonical_open_tests;
 mod extent_index;
+#[cfg(test)]
+mod footer_overwrite_tests;
 mod open;
 mod reclaim;
 mod recover;
@@ -26,6 +30,9 @@ mod stream;
 const VOLUME_MAGIC: [u8; 8] = *b"ASTVOL1\0";
 const RECORD_MAGIC: [u8; 8] = *b"ASTREG1\0";
 const RECORD_FIXED_BYTES: usize = 8 + 8 + 8 + 1 + 2 + 8 + 8 + 32;
+// A complete record must overwrite the entire known footer. An interrupted
+// prefix shorter than the fixed header cannot be mistaken for a new record.
+const _: () = assert!(RECORD_FIXED_BYTES > recover::FOOTER_BYTES);
 const MAX_METADATA_MUTATIONS: usize = 1_024;
 const METADATA_TRANSACTION_REGION: &str = "system/volume-metadata-transaction";
 const COMMIT_REGION: &str = "system/volume-commit";
@@ -83,11 +90,14 @@ enum FlushState {
     Confirmed,
 }
 
-/// Process-local proof that the owned handle's physical end matches `valid_len`.
+/// Process-local knowledge of bytes beyond the owned handle's `valid_len`.
 /// Independent of `footer_pending`, `flush_state` and durability acknowledgements.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PhysicalTail {
     Exact,
+    // Physical length is valid_len + FOOTER_BYTES, established only by a
+    // complete footer write or validated EOF recovery. A record overwrites it.
+    Footer,
     MayExceed,
 }
 
@@ -123,8 +133,8 @@ struct ContainerState {
     last_snapshot_end: u64,
     boundary_pending: bool,
     footer_pending: bool,
-    // Process-local proof that physical length may exceed valid_len (footer or
-    // uncertain mutation). Never derived from per-append metadata queries.
+    // Physical-tail knowledge, independent of durability acknowledgement.
+    // Never inferred from per-append metadata queries.
     physical_tail: PhysicalTail,
     // Process-local proof only: set after a successful full flush, cleared
     // before any file mutation. A recovered footer is not this proof.
@@ -141,6 +151,11 @@ pub struct HostedFileVolume {
     path: PathBuf,
     open_lock: open::OpenReclaimLock,
     state: Mutex<ContainerState>,
+    /// Windows: keep admitted runtime-root authority after `state` so Drop
+    /// releases the volume file before the namespace fence.
+    #[cfg(windows)]
+    retained_root:
+        Option<std::sync::Arc<astrid_core::platform_fs::directory_capability::RetainedPrivateRoot>>,
 }
 
 impl fmt::Debug for HostedFileVolume {
@@ -152,6 +167,34 @@ impl fmt::Debug for HostedFileVolume {
     }
 }
 impl HostedFileVolume {
+    /// Check the expected path against the currently owned container handle.
+    /// Reclaim can replace this handle, so callers must not cache its inode.
+    pub(crate) fn require_current_binding(&self, path: &std::path::Path) -> io::Result<()> {
+        self.with_current_binding(path, |_| Ok(()))
+    }
+
+    /// Capture the actual owned inode for one final projection retirement.
+    #[cfg(any(unix, windows))]
+    pub(crate) fn retirement_file(&self, path: &std::path::Path) -> io::Result<std::fs::File> {
+        self.with_current_binding(path, std::fs::File::try_clone)
+    }
+
+    fn with_current_binding<T>(
+        &self,
+        path: &std::path::Path,
+        operation: impl FnOnce(&std::fs::File) -> io::Result<T>,
+    ) -> io::Result<T> {
+        if self.path != std::path::absolute(path)? {
+            return Err(io::Error::other(
+                "Astrid volume belongs to a different home",
+            ));
+        }
+        astrid_core::platform_fs::verify_no_redirects(path)?;
+        let state = self.state.lock();
+        open::require_current(&state.file, path)?;
+        operation(&state.file)
+    }
+
     fn append(
         state: &mut ContainerState,
         operation: Operation,
@@ -163,8 +206,9 @@ impl HostedFileVolume {
         Ok((record.payload_offset, record.payload_len))
     }
 
-    /// Clear flush proof, ensure the previous physical tail is discarded when
-    /// needed, seek to `valid_len`, then mark `MayExceed` before any record write.
+    /// Discard unknown tails; overwrite a known footer in place. The format's
+    /// fixed header exceeds the footer, so no complete record can leave footer
+    /// bytes behind. Mark uncertainty before any record write, including errors.
     fn prepare_append(state: &mut ContainerState) -> io::Result<()> {
         state.flush_state = FlushState::Required;
         state.footer_pending = true;
@@ -325,8 +369,8 @@ impl HostedFileVolume {
             state.boundary_pending = true;
         }
         if state.footer_pending || state.boundary_pending {
-            // Footer IO extends physical length beyond valid_len on success or
-            // may leave an uncertain tail on failure; retain MayExceed either way.
+            // A failed footer write leaves an unknown tail. Only a complete
+            // write establishes that the next record may overwrite it in place.
             state.physical_tail = PhysicalTail::MayExceed;
             recover::write_footer(
                 &mut state.file,
@@ -334,6 +378,7 @@ impl HostedFileVolume {
                 state.durable_len,
                 state.sequence,
             )?;
+            state.physical_tail = PhysicalTail::Footer;
         }
         flush(&state.file)?;
         state.boundary_pending = false;
@@ -876,7 +921,7 @@ mod sync_tests;
 
 #[cfg(test)]
 mod checkpoint_tests;
-#[cfg(test)]
+#[cfg(any(test, feature = "crash-replay"))]
 mod test_support;
 
 #[cfg(test)]

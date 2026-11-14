@@ -22,15 +22,7 @@ where
     /// error.
     pub fn flush(&self) -> Result<(), DurableError> {
         let mut inner = self.lock_usable()?;
-        if let Err(error) = self.flush_authority(&mut inner) {
-            self.mark_requires_recovery(&mut inner);
-            return Err(error);
-        }
-        if let Err(error) = self.checkpoint_index(&mut inner, VolumeIndexPersist::RetainDeltas) {
-            self.mark_requires_recovery(&mut inner);
-            return Err(error);
-        }
-        Ok(())
+        self.flush_for_retirement(&mut inner)
     }
 
     /// Flush, unlock, and close the authoritative store files.
@@ -82,6 +74,20 @@ where
         };
         drop(self.volume.write().take());
         result.and(unlock)
+    }
+
+    pub(super) fn flush_for_retirement(
+        &self,
+        inner: &mut DurableInner<P>,
+    ) -> Result<(), DurableError> {
+        if let Err(error) = self
+            .flush_authority(inner)
+            .and_then(|()| self.checkpoint_index(inner, VolumeIndexPersist::RetainDeltas))
+        {
+            self.mark_requires_recovery(inner);
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn flush_authority(&self, inner: &mut DurableInner<P>) -> Result<(), DurableError> {

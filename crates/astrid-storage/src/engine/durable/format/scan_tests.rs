@@ -281,8 +281,8 @@ fn positional_callback_reads_preserve_sequential_scan_read_ahead() {
             "test frames",
             ARENA_MAGIC,
             limits,
-            |offset, bytes, load_previous| {
-                if offset != first.offset {
+            |location, bytes, load_previous| {
+                if location.offset() != first.offset {
                     assert_eq!(load_previous(first.offset)?, b"first frame");
                 }
                 seen.push(bytes.to_vec());

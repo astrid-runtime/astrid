@@ -52,7 +52,7 @@ mod format_identity_tests;
 #[cfg(test)]
 mod format_migration_tests;
 mod lifecycle;
-pub use lifecycle::RuntimeLifecycleGuard;
+pub use lifecycle::{PendingRuntimeFinalization, RuntimeFinalization, RuntimeLifecycleGuard};
 #[cfg(test)]
 mod hosted_volume_tests;
 #[cfg(feature = "legacy-surrealkv")]
@@ -72,10 +72,19 @@ mod owner_migration;
 mod projection_name_tests;
 #[cfg(all(test, feature = "legacy-surrealkv"))]
 mod release_fixture_tests;
+#[cfg(windows)]
+mod runtime_root_admission;
 #[cfg(test)]
 mod runtime_tests;
 mod runtime_tree;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use runtime_tree::operation_counts::{
+    RuntimeTreeOperationCounts, runtime_tree_operation_counts,
+};
 mod runtime_tree_active;
+mod startup_recovery;
+pub use startup_recovery::RuntimeProjectionRecovery;
 mod staging;
 mod store_open;
 #[cfg(test)]
@@ -99,13 +108,14 @@ use format_amendment::{
     prepare_format_specification, store_metadata,
 };
 use native_io::atomic_write;
-pub use runtime_tree::RuntimeTreeEntry;
+pub use runtime_tree::{RuntimeTreeEntry, admission::RuntimeTreeAdmission};
 pub use staging::{
     NativeContentStagingArea, ReadyStagedContent, StagedContentId, StagedContentWriter,
 };
 pub use store_open::open_runtime_principal_store_for_pack;
 pub use store_open::{
     open_runtime_kv, open_runtime_kv_with_directory, open_runtime_principal_store,
+    open_runtime_principal_store_recovering_projection,
     open_runtime_principal_store_with_directory, open_runtime_principal_store_with_object_cache,
     open_runtime_principal_store_with_policy,
 };
@@ -460,6 +470,8 @@ pub type NativePrincipalContentStore = PrincipalContentStore<
 /// Native principal-store projections opened over one durable engine.
 #[derive(Clone)]
 pub struct RuntimePrincipalStore {
+    quota: Arc<dyn crate::KvQuotaResolver<StateOwner>>,
+    volume_binding: std::sync::Weak<crate::volume::HostedFileVolume>,
     engine: Arc<RuntimeEngine>,
     directory_cutover_receipt: Arc<str>,
     runtime_kv: Arc<RuntimeStore>,
@@ -470,6 +482,28 @@ pub struct RuntimePrincipalStore {
 }
 
 impl RuntimePrincipalStore {
+    /// Write the current live container bytes for a quiescent replay fixture.
+    ///
+    /// Uses the lock-owning handle without flushing, closing, or releasing
+    /// volume custody. Callers must stop logical mutations before capture.
+    /// The byte image alone does not model power-loss persistence states.
+    /// Available only to tests and the explicit `crash-replay` tooling.
+    ///
+    /// # Errors
+    /// Rejects an unavailable or rebound volume and propagates read/write errors.
+    #[cfg(any(test, feature = "crash-replay"))]
+    pub fn write_preclose_volume_image(
+        &self,
+        output: &mut dyn std::io::Write,
+    ) -> StorageResult<u64> {
+        let volume = self.volume_binding.upgrade().ok_or_else(|| {
+            StorageError::Connection("runtime volume is unavailable for replay capture".into())
+        })?;
+        volume.write_preclose_volume_image(output).map_err(|error| {
+            StorageError::Connection(format!("capture pre-close runtime volume: {error}"))
+        })
+    }
+
     /// Retire the verified directory-store cutover source after the caller's
     /// global migration barrier is durable.
     ///

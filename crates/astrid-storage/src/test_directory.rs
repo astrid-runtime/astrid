@@ -3,14 +3,15 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub(super) struct TestDirectory(PathBuf);
+pub(crate) struct TestDirectory(PathBuf);
 
 impl TestDirectory {
-    pub(super) fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.0
     }
 
-    pub(super) fn keep(mut self) -> PathBuf {
+    #[cfg(feature = "legacy-surrealkv")]
+    pub(crate) fn keep(mut self) -> PathBuf {
         std::mem::take(&mut self.0)
     }
 }
@@ -30,7 +31,7 @@ impl Drop for TestDirectory {
     }
 }
 
-pub(super) fn temporary() -> io::Result<TestDirectory> {
+pub(crate) fn temporary() -> io::Result<TestDirectory> {
     #[cfg(windows)]
     {
         let base = directories::BaseDirs::new()

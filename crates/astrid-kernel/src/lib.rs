@@ -43,6 +43,8 @@ mod capsule_removal;
 mod capsule_removal_tests;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod capsule_restart;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod capsule_runtime;
 mod capsules_loaded;
 #[cfg(test)]
 mod capsules_loaded_tests;
@@ -74,6 +76,8 @@ pub mod kernel_router;
 mod kernel_shutdown_tests;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod legacy_migration_barrier;
+#[cfg(unix)]
+mod native_boot;
 mod native_input;
 mod runtime_work;
 mod shutdown;
@@ -350,6 +354,8 @@ pub struct Kernel {
     /// authority-scoped capsule runtimes in this kernel.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     compiled_wasm: astrid_capsule::engine::wasm::CompiledWasmCache,
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    native_log_root: Option<Arc<astrid_capsule::engine::wasm::NativeLogRoot>>,
     /// Host-derived (operator-overridable) concurrency ceilings for capsule
     /// host calls, resolved once by the daemon and forwarded to every
     /// `WasmEngine` via the loader. The kernel only stores and forwards this
@@ -781,35 +787,10 @@ impl Kernel {
                 "Failed to resolve Astrid home (set $ASTRID_HOME or $HOME): {e}"
             ))
         })?;
-        let layout_origin = legacy_migration_barrier::capture_layout_origin(&home)?;
-        // A layout-two sentinel is only authoritative together with the
-        // component migration ledger.  Check this before `AstridHome::ensure`
-        // can retire any released source on behalf of an incomplete cutover.
-        legacy_migration_barrier::reject_incomplete_layout_v2(&home)?;
-        home.ensure().map_err(|error| {
-            std::io::Error::other(format!("Failed to validate Astrid home layout: {error}"))
-        })?;
-
-        // Acquire the singleton advisory lock as the FIRST fallible boot step —
-        // BEFORE opening any shared state store. A boot-race loser then fails
-        // here with the actionable "already running (singleton lock held)"
-        // error and never opens (or even touches) the shared principal or audit
-        // stores, rather than dying on a raw `LOCK is already locked` from
-        // the store layer after having opened one. The listener bind below does
-        // NOT re-acquire the lock — it is already held for the process lifetime.
-        let singleton_lock = socket::acquire_boot_singleton_lock(&home)?;
-        home.clear_runtime_principal_scratch().map_err(|error| {
-            std::io::Error::other(format!(
-                "Failed to clear stale principal runtime scratch: {error}"
-            ))
-        })?;
-        if home.layout_version()?.as_deref() == Some(astrid_core::dirs::LEGACY_LAYOUT_VERSION) {
-            let migration_target =
-                astrid_core::dirs::LayoutMigrationTarget::for_current_executable(
-                    astrid_storage::RUNTIME_STORE_FORMAT_ID,
-                )?;
-            home.begin_layout_v2_migration(&migration_target)?;
-        }
+        // Home-bound custody acquires the singleton before opening stores.
+        // Interrupted projection subsets must authenticate their durable
+        // RETIRING authority before ordinary home admission or amendments.
+        let boot_admission = native_boot::NativeBootAdmission::acquire(&home)?;
 
         // Resolve quota policy before opening state so the durable adapter and
         // capsule engine share exactly one invalidatable profile cache.
@@ -846,13 +827,9 @@ impl Kernel {
 
         // Open the authoritative state store. First cutover imports and
         // verifies legacy SurrealKV under the singleton lock before serving.
-        let principal_store = astrid_storage::open_runtime_principal_store_with_directory(
-            &home,
-            quota,
-            principal_directory.clone(),
-        )
-        .await
-        .map_err(|e| std::io::Error::other(format!("Failed to open principal store: {e}")))?;
+        let (principal_store, singleton_lock, layout_origin) = boot_admission
+            .open(quota, principal_directory.clone())
+            .await?;
         let kv = principal_store.kv();
         // TODO: clear ephemeral keys (e: prefix) on boot when the key
         // lifecycle tier convention is established.
@@ -1412,6 +1389,8 @@ impl Kernel {
             principal_directory.clone(),
             resource_policy,
         );
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let native_log_root = capsule_runtime::capture_native_log_root(&home);
         let kernel = Arc::new(Self {
             session_id: session_id.clone(),
             event_bus,
@@ -1461,6 +1440,8 @@ impl Kernel {
             memory_ledger: astrid_capsule_types::MemoryLedger::default(),
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             compiled_wasm: astrid_capsule::engine::wasm::CompiledWasmCache::default(),
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            native_log_root,
             runtime_limits,
             local_egress: std::sync::RwLock::new(None),
             #[cfg(not(target_family = "wasm"))]
@@ -2011,132 +1992,6 @@ impl Kernel {
                     "cannot load capsule '{id}' for unadmitted principal '{principal}': {error}"
                 )
             })
-    }
-
-    /// Build and load one mutable runtime. `Some(principal)` installs that
-    /// principal's concrete KV/home/env authority from construction onward.
-    /// `None` is reserved for an explicitly classified `SystemResident` service
-    /// and receives a neutral system namespace rather than `default` authority.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the capsule cannot be created, the KV scope cannot be
-    /// built, or `capsule.load` fails.
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    async fn build_capsule_runtime(
-        &self,
-        manifest: astrid_capsule_types::manifest::CapsuleManifest,
-        dir: &std::path::Path,
-        principal: Option<&PrincipalId>,
-        runtime_id: astrid_capsule::registry::RuntimeId,
-    ) -> Result<Box<dyn astrid_capsule::capsule::Capsule>, anyhow::Error> {
-        self.verify_workspace_capsule_tree(dir)?;
-        let load_principal = principal.cloned().unwrap_or_default();
-
-        let loader = astrid_capsule::loader::CapsuleLoader::new(
-            self.mcp.clone(),
-            self.fuel_ledger.clone(),
-            self.fuel_rate.clone(),
-            self.memory_ledger.clone(),
-            self.runtime_limits,
-            self.http_limits,
-        )
-        .with_compiled_wasm_cache(self.compiled_wasm.clone())
-        .with_runtime_id(runtime_id)
-        .with_deferred_background_activation();
-        let mut capsule = loader.create_capsule(manifest, dir.to_path_buf())?;
-        let capsule_name = capsule.id().to_string();
-
-        let kv = astrid_storage::ScopedKvStore::new(
-            Arc::clone(&self.kv),
-            principal.map_or_else(
-                || format!("system:capsule:{}", capsule.id()),
-                |principal| format!("{principal}:capsule:{}", capsule.id()),
-            ),
-        )?;
-
-        // Environment configuration is loaded from the host-only typed
-        // control namespace during invocation setup. Never read a capsule
-        // directory `.env.json` or a principal-home env file here: those paths
-        // are legacy import sources only and are not authoritative runtime
-        // state.
-        self.verify_workspace_capsule_tree(dir)?;
-
-        let capsule_listener = (!self.native_uplink_owns_listener.load(Ordering::Acquire))
-            .then(|| self.cli_socket_listener.clone())
-            .flatten();
-        let mut ctx = astrid_capsule::context::CapsuleContext::new(
-            load_principal,
-            self.workspace_root.clone(),
-            // Durable home VFS authority is threaded separately through the
-            // UID-bound principal store. Do not pass a native PrincipalHome
-            // path into the steady-state capsule context.
-            None,
-            kv,
-            Arc::clone(&self.event_bus),
-            capsule_listener,
-        )
-        .with_astrid_workspace()
-        .with_principal_storage(
-            self.principal_store.clone().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "native capsule runtime requires the authoritative principal store"
-                )
-            })?,
-            self.principal_directory.clone(),
-        )
-        .with_workspace_branches(self.workspace_branches.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "canonical Astrid workspace requires the kernel workspace branch service"
-            )
-        })?)
-        .with_process_storage_mount_broker(
-            self.process_storage_mount_broker
-                .get()
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("native process storage mount broker unavailable"))?,
-        )
-        .with_registry(Arc::clone(&self.capsules))
-        .with_session_token(Arc::clone(&self.session_token))
-        .with_allowance_store(Arc::clone(&self.allowance_store))
-        .with_identity_store(Arc::clone(&self.identity_store))
-        .with_profile_cache(Arc::clone(&self.profile_cache))
-        .with_overlay_registry(Arc::clone(&self.overlay_registry))
-        // Thread the live group config so capsule invocation checks observe
-        // runtime group mutations without requiring capsule reloads. Load-time
-        // run-loop decisions take their own explicit snapshot.
-        .with_live_group_config(Arc::clone(&self.groups))
-        // Hand this capsule its operator-approved local-egress allowlist (if
-        // any) so the SSRF airlock can exempt sanctioned loopback/private
-        // endpoints for it. Absent entry = empty = no exemptions.
-        .with_local_egress(
-            self.local_egress
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .and_then(|snapshot| snapshot.get(&capsule_name))
-                .cloned()
-                .unwrap_or_default(),
-        )
-        // Hand the engine the signed per-action audit sink so sensitive
-        // fs/net/process host calls (allowed, failed, OR denied) land on the
-        // kernel's durable, hash-chained audit log — not just the
-        // off-by-default observability tracing targets.
-        .with_audit_sink(self.audit_sink.as_ref().clone());
-        ctx.user_cpu = Some(Arc::clone(&self.user_cpu));
-        #[cfg(not(target_family = "wasm"))]
-        {
-            ctx.secret_elicits = self.native_secret_inputs.get().cloned();
-        }
-        if let Some(project_root) = explicit_workspace_portal_root(dir) {
-            ctx = ctx.with_hosted_portal(project_root);
-        }
-        #[cfg(test)]
-        capsule_adversarial_tests::record_workspace_source(&capsule_name, &ctx.workspace_source);
-        capsule.load(&ctx).await?;
-        #[cfg(test)]
-        ingress_readiness::tests::pause_after_load(&capsule_name).await;
-        Ok(capsule)
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -3589,25 +3444,25 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
             .expect("test kernel: open audit log"),
     );
 
-    // Admin tests exercise the real UID-bound storage path. Seed the default
-    // principal through the authoritative identity store rather than merely
-    // writing a profile; handlers must be able to resolve its immutable UID.
-    // Production seeds the admitted profile immediately after the migration
-    // barrier and before root identity bootstrap; mirror that ordering here.
-    seed_default_principal_admin_profile(&home).expect("test kernel: seed default profile");
+    // Fresh admin fixtures seed default through the authoritative identity
+    // store. Reopening an existing fixture preserves identity and migration
+    // history instead of trying to mint another default generation.
     let (identity_store, ownership_store) =
         open_test_identity_stores(&kv, principal_directory.clone());
-    identity_store
-        .create_principal(PrincipalId::default(), [7; 32])
-        .await
-        .expect("test kernel: seed default principal identity");
-
-    // `AstridHome::ensure` has already written the v2 sentinel. Complete the
-    // fresh-home barrier receipt in the fixture so delete/reclaim tests model
-    // an admitted runtime rather than bypassing the production gate. The
-    // fixture writes the exact canonical empty-home ledger shape; production
-    // still obtains it only through `legacy_migration_barrier::run`.
-    seed_test_migration_ledger(&home);
+    if principal_directory.uid_for(&PrincipalId::default()).is_ok() {
+        astrid_core::PrincipalProfile::load_required(&home, &PrincipalId::default())
+            .expect("test kernel: existing default profile");
+    } else {
+        // Match production: admit the profile before creating the root identity.
+        seed_default_principal_admin_profile(&home).expect("test kernel: seed default profile");
+        identity_store
+            .create_principal(PrincipalId::default(), [7; 32])
+            .await
+            .expect("test kernel: seed default principal identity");
+        // Only a newly initialized fixture may write the canonical empty-home
+        // ledger. Existing-state construction must never replace this history.
+        seed_test_migration_ledger(&home);
+    }
 
     // MCP: use a no-op secure client wrapped around an empty manager.
     // Admin handlers do not touch MCP.
@@ -3637,6 +3492,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         GroupConfig::load(&home).expect("test kernel: load groups"),
     ));
 
+    let native_log_root = capsule_runtime::capture_native_log_root(&home);
     let kernel = Arc::new(Kernel {
         session_id: session_id.clone(),
         event_bus,
@@ -3680,6 +3536,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         memory_ledger: astrid_capsule_types::MemoryLedger::default(),
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         compiled_wasm: astrid_capsule::engine::wasm::CompiledWasmCache::default(),
+        native_log_root,
         runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits::default(),
         local_egress: std::sync::RwLock::new(None),
         #[cfg(not(target_family = "wasm"))]

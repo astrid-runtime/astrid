@@ -1,13 +1,140 @@
 //! Mount-time correspondence between direct replicas and the recovered index.
 
-use super::{ArenaLocation, BTreeMap, DurableError, ObjectId};
+use super::{ArenaLocation, BTreeMap, DurableError, FRAME_HEADER_LEN, ObjectId};
+
+#[cfg(test)]
+std::thread_local! {
+    pub(super) static PLACEMENT_COLLECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static DIRECT_EXTRACTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(in crate::engine::durable) fn count_extractions_during<T>(
+    operation: impl FnOnce() -> T,
+) -> (T, usize) {
+    DIRECT_EXTRACTIONS.with(|count| count.set(0));
+    let value = operation();
+    (value, DIRECT_EXTRACTIONS.with(std::cell::Cell::get))
+}
+
+/// Selected placements moved out of metadata validation, never retained by the
+/// store. Selection follows canonical record order, before filtering replicas.
+#[derive(Default)]
+pub(in crate::engine::durable) struct GenerationZeroPlacements {
+    // Ranges are formed only from this owned buffer before it is consumed.
+    selected: BTreeMap<ObjectId, Option<std::ops::Range<usize>>>,
+    locations: Vec<ArenaLocation>,
+}
+
+impl GenerationZeroPlacements {
+    pub(super) fn observe(
+        &mut self,
+        object: ObjectId,
+        is_direct_profile: bool,
+        placement: &super::PlacementEntry,
+    ) {
+        #[cfg(test)]
+        PLACEMENT_COLLECTIONS.with(|count| count.set(count.get().strict_add(1)));
+        let selected = self.selected.entry(object).or_default();
+        if !is_direct_profile || selected.is_some() {
+            return;
+        }
+        let start = self.locations.len();
+        self.locations
+            .extend(
+                placement
+                    .replicas()
+                    .iter()
+                    .filter_map(|replica| match replica.locator() {
+                        super::ReplicaLocator::ArenaFrame {
+                            arena_generation: 0,
+                            offset,
+                            payload_length,
+                            frame_checksum,
+                        } => Some(ArenaLocation {
+                            offset,
+                            payload_len: payload_length,
+                            checksum: frame_checksum,
+                        }),
+                        _ => None,
+                    }),
+            );
+        *selected = Some(start..self.locations.len());
+    }
+
+    pub(in crate::engine::durable) fn into_index(
+        self,
+    ) -> Result<GenerationZeroIndex, DurableError> {
+        let mut direct = Vec::new();
+        for (object, selected) in self.selected {
+            let range = selected.ok_or(DurableError::InvalidRepresentationState(
+                "reverse index has no direct representation",
+            ))?;
+            let replicas =
+                self.locations
+                    .get(range)
+                    .ok_or(DurableError::InvalidRepresentationState(
+                        "generation-zero placement range is invalid",
+                    ))?;
+            if replicas.is_empty() {
+                return Err(DurableError::InvalidRepresentationState(
+                    "direct representation has no generation-zero arena placement",
+                ));
+            }
+            direct.extend(replicas.iter().copied().map(|location| (object, location)));
+        }
+        GenerationZeroIndex::from_locations(direct)
+    }
+}
+
+/// One recovery-local placement snapshot, consumed before WAL replay can
+/// advance representation authority. Arena repair and index validation must
+/// consult the same checked placements. A malformed frame below the protected
+/// prefix is corruption, never a repairable uncommitted arena tail.
+///
+/// Index correspondence is mount-time topology validation. Authoritative reads
+/// still verify frame checksums, canonical encoding, and logical identity;
+/// proactive full-corpus re-attestation belongs to the refinery.
+#[derive(Default)]
+pub(in crate::engine::durable) struct GenerationZeroIndex {
+    direct: Vec<(ObjectId, ArenaLocation)>,
+    protected_len: u64,
+}
+
+impl GenerationZeroIndex {
+    fn from_locations(direct: Vec<(ObjectId, ArenaLocation)>) -> Result<Self, DurableError> {
+        let protected_len = direct.iter().try_fold(0_u64, |protected, (_, location)| {
+            let end = location
+                .offset
+                .checked_add(FRAME_HEADER_LEN)
+                .and_then(|value| value.checked_add(location.payload_len))
+                .ok_or(DurableError::EncodingOverflow)?;
+            Ok::<_, DurableError>(protected.max(end))
+        })?;
+        Ok(Self {
+            direct,
+            protected_len,
+        })
+    }
+
+    pub(in crate::engine::durable) fn protected_len(&self) -> u64 {
+        self.protected_len
+    }
+
+    pub(in crate::engine::durable) fn validate(
+        self,
+        index: &BTreeMap<ObjectId, ArenaLocation>,
+    ) -> Result<(), DurableError> {
+        validate(&self.direct, index)
+    }
+}
 
 pub(super) fn validate(
     direct: &[(ObjectId, ArenaLocation)],
     index: &BTreeMap<ObjectId, ArenaLocation>,
 ) -> Result<(), DurableError> {
-    // direct_arena_locations walks the ordered reverse map and emits every
-    // object's replicas contiguously, rejecting objects without a replica.
+    // Recovery evidence emits every object's selected replicas contiguously,
+    // rejecting objects without a replica before constructing this index.
     // Visit each group once rather than rescanning the whole corpus per object.
     for replicas in direct.chunk_by(|left, right| left.0 == right.0) {
         let object = replicas[0].0;
@@ -37,6 +164,27 @@ mod tests {
             payload_len: 8,
             checksum: [0; 32],
         }
+    }
+
+    #[test]
+    fn snapshot_checks_every_replica_end_before_recovery() {
+        let object = ObjectId::new([1; 32]);
+        let snapshot = GenerationZeroIndex::from_locations(vec![
+            (object, location(1)),
+            (object, location(100)),
+        ])
+        .unwrap();
+        assert_eq!(snapshot.protected_len(), 100 + FRAME_HEADER_LEN + 8);
+        snapshot
+            .validate(&BTreeMap::from([(object, location(1))]))
+            .unwrap();
+        assert!(matches!(
+            GenerationZeroIndex::from_locations(vec![(object, location(u64::MAX))]),
+            Err(DurableError::EncodingOverflow)
+        ));
+        let absent = GenerationZeroIndex::default();
+        assert_eq!(absent.protected_len(), 0);
+        absent.validate(&BTreeMap::new()).unwrap();
     }
 
     #[test]

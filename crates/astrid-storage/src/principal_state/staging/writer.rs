@@ -16,6 +16,8 @@ use crate::principal_state::native_io::private_file_identity;
 #[derive(Debug)]
 pub struct StagedContentWriter {
     pub(super) area: NativeContentStagingArea,
+    /// Open-host lease held for the writer lifetime (Write/Seek/seal/Drop).
+    pub(super) lease: std::sync::Arc<super::StagingInner>,
     pub(super) id: StagedContentId,
     pub(super) owner: StateOwner,
     pub(super) name: ContentName,
@@ -75,7 +77,7 @@ impl StagedContentWriter {
                 ))
             })?
             .len();
-        let active = self.area.register_seal(&self.owner, &self.name)?;
+        let active = NativeContentStagingArea::register_seal(&self.lease, &self.owner, &self.name)?;
         let sequence = active.sequence;
         let intent = StagingIntent {
             sequence,
@@ -91,8 +93,7 @@ impl StagedContentWriter {
         self.area.fail_if(StagingFaultPoint::ContentFlushed)?;
         drop(file);
         let sealed_path = self
-            .area
-            .inner
+            .lease
             .generations
             .join(sealed_generation_name(sequence, self.id));
         let source_name = path.file_name().ok_or_else(|| {
@@ -107,7 +108,7 @@ impl StagedContentWriter {
                 sealed_path.display()
             ))
         })?;
-        self.area.inner.generations_directory.rename_with_identity(
+        self.lease.generations_directory.rename_with_identity(
             Path::new(source_name),
             Path::new(destination_name),
             source_identity,
@@ -149,8 +150,7 @@ impl Drop for StagedContentWriter {
         if let Some(path) = self.path.take() {
             let _ = std::fs::remove_file(path);
         }
-        self.area
-            .inner
+        self.lease
             .seal_order
             .lock()
             .reserved_identifiers

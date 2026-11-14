@@ -1,8 +1,9 @@
 //! Construction and publication of the first physical authority generation.
 
+use crate::storage_model::physical::{PlacementMap, ProfileMap, RepresentationMap};
 use crate::storage_model::{
-    CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode,
-    PlacementEntry, PlacementSet, Recipe, ReconstructionBounds, Replica, ReplicaLocator,
+    CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapKey, PhysicalMapNode, PlacementEntry,
+    PlacementSet, Recipe, ReconstructionBounds, Replica, ReplicaLocator,
     RepresentationCatalogueRoot, RepresentationProfile, RepresentationRecord, RepresentationState,
 };
 use std::collections::BTreeSet;
@@ -22,11 +23,10 @@ pub(super) fn build_initial_state(
     let identity = Blake3PhysicalIdentity;
     let (profile, direct_profile) = direct_profile(frozen_specification)?;
     let mut metadata = Vec::new();
-    let profiles = CanonicalPhysicalMap::build_dense(
-        &identity,
-        PhysicalMapDomain::Profile,
-        vec![(PhysicalMapKey::from(direct_profile), profile.encode()?)],
-    )?;
+    let profiles = ProfileMap::build_dense(vec![(
+        PhysicalMapKey::from(direct_profile),
+        profile.encode()?,
+    )])?;
     append_map_nodes(&mut metadata, profiles.nodes())?;
     let mut representation_entries = Vec::new();
     let mut placement_entries = Vec::new();
@@ -60,17 +60,9 @@ pub(super) fn build_initial_state(
         )?;
         placement_entries.push((PhysicalMapKey::from(object.blob), placement.encode()?));
     }
-    let representations = CanonicalPhysicalMap::build_dense(
-        &identity,
-        PhysicalMapDomain::Representation,
-        representation_entries,
-    )?;
+    let representations = RepresentationMap::build_dense(representation_entries)?;
     append_map_nodes(&mut metadata, representations.nodes())?;
-    let placements = CanonicalPhysicalMap::build_dense(
-        &identity,
-        PhysicalMapDomain::Placement,
-        placement_entries,
-    )?;
+    let placements = PlacementMap::build_dense(placement_entries)?;
     append_map_nodes(&mut metadata, placements.nodes())?;
     let catalogue = RepresentationCatalogueRoot::new(
         1,
@@ -130,12 +122,16 @@ pub(super) fn append_map_nodes(
     Ok(())
 }
 
-pub(super) fn append_new_reachable_map_nodes(
-    metadata: &mut Vec<MetadataFrame>,
+/// Visit tip-reachable map nodes that still need durable publication.
+///
+/// `emit` runs once per newly appended node identity. Callers push into a Vec or
+/// write through a framed append stream; the walk/validation stays authoritative.
+pub(super) fn visit_new_reachable_map_nodes(
     map: &CanonicalPhysicalMap,
-    durable: &BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    durable: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    mut emit: impl FnMut(&PhysicalMapNode) -> Result<(), DurableError>,
 ) -> Result<usize, DurableError> {
     let Some(root) = map.root() else {
         return Ok(0);
@@ -151,7 +147,8 @@ pub(super) fn append_new_reachable_map_nodes(
                     "active physical map is missing a reachable node",
                 ))?;
             // A persisted parent alone does not establish durable descendants.
-            // Cache only closures checked against the append-only persisted set.
+            // Move checked IDs into the complete-closure partition so the two
+            // disposable memos never retain duplicate IDs.
             let children_complete = match node {
                 PhysicalMapNode::Branch { zero, one, .. } => {
                     complete.contains(zero) && complete.contains(one)
@@ -161,11 +158,13 @@ pub(super) fn append_new_reachable_map_nodes(
                 },
                 PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => true,
             };
-            if durable.contains(&id) && children_complete {
+            let persisted = durable.contains(&id);
+            if persisted && children_complete {
+                durable.remove(&id);
                 complete.insert(id);
             }
-            if !durable.contains(&id) && !appended.contains(&id) {
-                metadata.push(MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?);
+            if !persisted && !appended.contains(&id) {
+                emit(node)?;
                 appended.insert(id);
             }
             continue;
@@ -192,6 +191,19 @@ pub(super) fn append_new_reachable_map_nodes(
         }
     }
     Ok(visited.len())
+}
+
+pub(super) fn append_new_reachable_map_nodes(
+    metadata: &mut Vec<MetadataFrame>,
+    map: &CanonicalPhysicalMap,
+    durable: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+) -> Result<usize, DurableError> {
+    visit_new_reachable_map_nodes(map, durable, appended, complete, |node| {
+        metadata.push(MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?);
+        Ok(())
+    })
 }
 
 pub(super) trait MapNodeRef {
@@ -244,14 +256,15 @@ mod tests {
     #[test]
     fn verified_durable_subtrees_skip_unchanged_nodes() {
         let mut map = dense_map();
-        let durable = map.nodes().keys().copied().collect();
+        let mut durable: BTreeSet<_> = map.nodes().keys().copied().collect();
+        let mut reference_durable = durable.clone();
         let mut complete = BTreeSet::new();
         let mut metadata = Vec::new();
         let mut appended = BTreeSet::new();
         let cold = append_new_reachable_map_nodes(
             &mut metadata,
             &map,
-            &durable,
+            &mut durable,
             &mut appended,
             &mut complete,
         )
@@ -261,7 +274,7 @@ mod tests {
         let warm = append_new_reachable_map_nodes(
             &mut metadata,
             &map,
-            &durable,
+            &mut durable,
             &mut appended,
             &mut complete,
         )
@@ -277,7 +290,7 @@ mod tests {
         let changed = append_new_reachable_map_nodes(
             &mut metadata,
             &map,
-            &durable,
+            &mut durable,
             &mut appended,
             &mut complete,
         )
@@ -288,7 +301,7 @@ mod tests {
         append_new_reachable_map_nodes(
             &mut cold_metadata,
             &map,
-            &durable,
+            &mut reference_durable,
             &mut cold_appended,
             &mut BTreeSet::new(),
         )
@@ -317,7 +330,7 @@ mod tests {
         append_new_reachable_map_nodes(
             &mut metadata,
             &map,
-            &BTreeSet::from([root]),
+            &mut BTreeSet::from([root]),
             &mut appended,
             &mut complete,
         )
@@ -338,7 +351,7 @@ mod tests {
         append_new_reachable_map_nodes(
             &mut metadata,
             &map,
-            &BTreeSet::new(),
+            &mut BTreeSet::new(),
             &mut appended,
             &mut BTreeSet::new(),
         )

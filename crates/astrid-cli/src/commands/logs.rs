@@ -56,6 +56,17 @@ fn most_recent_log(dir: &Path) -> Result<Option<PathBuf>> {
     Ok(newest.map(|(_, p)| p))
 }
 
+/// Poll one resolved UID directory until its first log exists. Never resolve
+/// the principal alias again while waiting: it may be reassigned to another UID.
+fn wait_for_first_log(dir: &Path, mut wait: impl FnMut()) -> Result<PathBuf> {
+    loop {
+        if let Some(path) = most_recent_log(dir)? {
+            return Ok(path);
+        }
+        wait();
+    }
+}
+
 async fn resolve_principal_uid(principal: &PrincipalId) -> Result<PrincipalUid> {
     let mut client = crate::admin_client::connect_as_active_agent().await?;
     let body = client.request(AdminRequestKind::AgentList).await?;
@@ -143,12 +154,18 @@ fn follow_tail(path: &Path, n: usize) -> Result<()> {
 pub(crate) async fn run(args: &LogsArgs) -> Result<ExitCode> {
     let principal = context::resolve_agent(args.agent.as_deref())?;
     let dir = resolve_log_dir(&principal, args.capsule.as_deref()).await?;
-    let Some(path) = most_recent_log(&dir)? else {
-        eprintln!(
-            "{}",
-            Theme::info(&format!("(no logs in {})", dir.display()))
-        );
-        return Ok(ExitCode::SUCCESS);
+    let path = match most_recent_log(&dir)? {
+        Some(path) => path,
+        None if args.follow => wait_for_first_log(&dir, || {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        })?,
+        None => {
+            eprintln!(
+                "{}",
+                Theme::info(&format!("(no logs in {})", dir.display()))
+            );
+            return Ok(ExitCode::SUCCESS);
+        },
     };
 
     if args.follow {
@@ -163,6 +180,37 @@ pub(crate) async fn run(args: &LogsArgs) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn follow_waits_for_first_file_in_the_resolved_uid_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("original-uid/capsule");
+        let reused = root.path().join("reassigned-uid/capsule");
+        fs::create_dir_all(&reused).unwrap();
+        fs::write(reused.join("2026-11-14.log"), "another agent").unwrap();
+        let expected = dir.join("2026-11-14.log");
+        let mut waits = 0;
+        let actual = wait_for_first_log(&dir, || {
+            waits += 1;
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(&expected, "first line").unwrap();
+        })
+        .unwrap();
+        assert_eq!(waits, 1);
+        assert_eq!(actual, expected);
+        assert_eq!(fs::read_to_string(actual).unwrap(), "first line");
+    }
+
+    #[test]
+    fn follow_existing_log_never_waits() {
+        let root = tempfile::tempdir().unwrap();
+        let expected = root.path().join("2026-11-14.log");
+        fs::write(&expected, "existing").unwrap();
+        assert_eq!(
+            wait_for_first_log(root.path(), || panic!("unexpected wait")).unwrap(),
+            expected
+        );
+    }
 
     #[test]
     fn most_recent_log_returns_newest() {

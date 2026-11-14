@@ -22,11 +22,14 @@ pub use admission::{
     RepresentationOutputObservation,
 };
 pub use catalogue::RepresentationCatalogueRoot;
+pub(crate) use identity::Blake3PhysicalIdentity;
 pub use identity::{
     PhysicalIdentity, PhysicalMapNodeId, PlacementSetId, RepresentationCatalogueRootId,
     RepresentationProfileId, RepresentationRecordId, RepresentationStateId,
 };
+pub(crate) use map::CanonicalRootProof;
 pub use map::{CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode};
+pub(crate) use map::{PlacementMap, ProfileMap, RepresentationMap};
 pub use placement::{PlacementEntry, PlacementSet, Replica, ReplicaLocator};
 pub use profile::{
     Dependency, ProfileDependency, ProfileKind, ReconstructionBounds, RepresentationProfile,

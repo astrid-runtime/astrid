@@ -2,6 +2,8 @@
 
 #[cfg(not(target_family = "wasm"))]
 mod admission;
+#[cfg(test)]
+mod expectation_tests;
 mod publish;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -23,9 +25,9 @@ use super::{
 };
 use crate::content::{
     BulkIngestDiagnostics, BulkIngestPhaseDurations, BulkIngestPolicy, ChunkingProfile,
-    ContentBatchExpectation, ContentBatchWriteOutcome, ContentChangeCache, ContentIngest,
-    ContentName, ContentObservation, PrepareDerivedBatchContent, PrincipalContentError,
-    SourceObservation,
+    ContentBatchExpectation, ContentBatchPreconditions, ContentBatchWriteOutcome,
+    ContentChangeCache, ContentIngest, ContentName, ContentObservation, PrepareDerivedBatchContent,
+    PrincipalContentError, SourceObservation,
 };
 
 type PendingIngest<R> = (ContentName, (R, ChunkingProfile, Option<SourceObservation>));
@@ -76,14 +78,14 @@ struct PreparedContent {
 }
 
 struct BatchPublicationContext<'a> {
-    expectation: Option<&'a ContentBatchExpectation>,
+    preconditions: ContentBatchPreconditions<'a>,
     removals: &'a [ContentName],
     derived: Option<&'a mut dyn PrepareDerivedBatchContent>,
 }
 
 fn publish_only() -> BatchPublicationContext<'static> {
     BatchPublicationContext {
-        expectation: None,
+        preconditions: ContentBatchPreconditions::default(),
         removals: &[],
         derived: None,
     }
@@ -94,7 +96,7 @@ fn removing_exact<'a>(
     derived: Option<&'a mut dyn PrepareDerivedBatchContent>,
 ) -> BatchPublicationContext<'a> {
     BatchPublicationContext {
-        expectation: None,
+        preconditions: ContentBatchPreconditions::default(),
         removals,
         derived,
     }
@@ -259,7 +261,7 @@ where
             None,
             false,
             BatchPublicationContext {
-                expectation: Some(expectation),
+                preconditions: Some(expectation).into(),
                 removals: &[],
                 derived: None,
             },
@@ -329,12 +331,13 @@ where
     /// This is the internal runtime-tree publication seam. Removals are exact
     /// canonical names and never derive from a prefix, and no removal may also
     /// appear as an ingest.
-    pub(crate) fn replace_streaming_batch_removing_exact<'a, R, I>(
+    pub(crate) fn replace_streaming_batch_with_expectation<'a, R, I>(
         &self,
         principal: &P,
         ingests: I,
         removals: &'a [ContentName],
         derived: Option<&'a mut dyn PrepareDerivedBatchContent>,
+        preconditions: ContentBatchPreconditions<'a>,
     ) -> Result<ContentBatchWriteOutcome, PrincipalContentError>
     where
         R: Read + Send,
@@ -357,7 +360,10 @@ where
             BulkIngestPolicy::default(),
             None,
             false,
-            removing_exact(removals, derived),
+            BatchPublicationContext {
+                preconditions,
+                ..removing_exact(removals, derived)
+            },
         )
         .map(|execution| execution.outcome)
     }
@@ -376,6 +382,11 @@ where
         I: IntoIterator<Item = ContentIngest<R>>,
     {
         let ordered = ordered_ingests(ingests)?;
+        // A derivation supplies the publication entry for an empty source
+        // snapshot; ordinary streaming batches still require a source.
+        if ordered.is_empty() && publication.derived.is_none() {
+            return Err(PrincipalContentError::EmptyBatch);
+        }
         let phase_observer = observe.then(|| Arc::new(BulkPhaseObserver::default()));
         let (completed, pending) = self.partition_cached_ingests(principal, ordered, cache)?;
         if let Some((bound, limit)) = self.quota_staging_bound(principal)? {
@@ -694,9 +705,6 @@ where
         {
             return Err(PrincipalContentError::DuplicateBatchName(name));
         }
-    }
-    if ordered.is_empty() {
-        return Err(PrincipalContentError::EmptyBatch);
     }
     Ok(ordered)
 }

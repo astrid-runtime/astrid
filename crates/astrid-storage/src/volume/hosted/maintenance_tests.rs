@@ -293,7 +293,7 @@ fn windows_detached_active_name_remains_fenced_by_both_inode_locks() {
                 "contender must not create an empty active volume"
             );
             assert!(reclaim::temp_path(&captured).exists());
-        }))
+        }));
     });
     volume.reclaim().unwrap();
     assert!(path.exists());

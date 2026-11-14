@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use super::{DurableError, MetadataFrameOffset, PhysicalMapNodeId};
+use super::{DurableError, FrameLocation, PhysicalMapNodeId};
 
 #[cfg(test)]
 mod tests;
@@ -13,7 +13,7 @@ struct NodeIndex(usize);
 
 #[derive(Debug)]
 pub(in crate::engine::durable::representations::recovery) struct RecoveredMapNode {
-    pub(in crate::engine::durable::representations::recovery) offset: MetadataFrameOffset,
+    pub(in crate::engine::durable::representations::recovery) location: FrameLocation,
     children: Range<usize>,
 }
 
@@ -21,7 +21,7 @@ pub(in crate::engine::durable::representations::recovery) struct RecoveredMapNod
 enum NodeBody {
     #[default]
     Unresolved,
-    Available(MetadataFrameOffset),
+    Available(FrameLocation),
     Consumed,
 }
 
@@ -47,13 +47,13 @@ impl HistoricalMapGraph {
         self.resolved
     }
 
-    pub(in crate::engine::durable::representations::recovery) fn offset(
+    pub(in crate::engine::durable::representations::recovery) fn location(
         &self,
         id: &PhysicalMapNodeId,
-    ) -> Option<MetadataFrameOffset> {
+    ) -> Option<FrameLocation> {
         self.indices.get(id).and_then(|index| {
-            if let NodeBody::Available(offset) = self.nodes[index.0].body {
-                Some(offset)
+            if let NodeBody::Available(location) = self.nodes[index.0].body {
+                Some(location)
             } else {
                 None
             }
@@ -65,7 +65,7 @@ impl HistoricalMapGraph {
     pub(in crate::engine::durable::representations::recovery) fn insert(
         &mut self,
         id: PhysicalMapNodeId,
-        offset: MetadataFrameOffset,
+        location: FrameLocation,
         children: &[PhysicalMapNodeId],
     ) -> Result<(), DurableError> {
         if self
@@ -100,7 +100,7 @@ impl HistoricalMapGraph {
         }
         let end = self.edges.len();
         self.nodes[index.0] = NodeDescriptor {
-            body: NodeBody::Available(offset),
+            body: NodeBody::Available(location),
             children: start..end,
         };
         self.resolved = self.resolved.strict_add(1);
@@ -123,13 +123,13 @@ impl HistoricalMapGraph {
     ) -> Option<RecoveredMapNode> {
         let index = self.indices.get(id)?;
         let descriptor = &mut self.nodes[index.0];
-        let NodeBody::Available(offset) = descriptor.body else {
+        let NodeBody::Available(location) = descriptor.body else {
             return None;
         };
         descriptor.body = NodeBody::Consumed;
         self.resolved = self.resolved.strict_sub(1);
         Some(RecoveredMapNode {
-            offset,
+            location,
             children: descriptor.children.clone(),
         })
     }
