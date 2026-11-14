@@ -60,7 +60,7 @@ fn retained_parent_has_exactly_one_paired_before_and_after_fence() {
         .iter()
         .filter(|event| event.starts_with("sync:"))
         .collect::<Vec<_>>();
-    let expected = format!("sync:{}", Path::new("log/principals").display());
+    let expected = format!("sync:{}", Path::new("log").join("principals").display());
     assert_eq!(syncs, [&expected, &expected]);
     assert_eq!(events.first().unwrap(), &expected);
     assert_eq!(events.last().unwrap(), &expected);
