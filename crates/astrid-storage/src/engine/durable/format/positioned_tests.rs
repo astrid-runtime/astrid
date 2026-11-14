@@ -11,6 +11,26 @@ use super::{
 };
 use crate::engine::durable::media::StoreMetadata;
 
+#[test]
+fn shared_checksum_initial_state_preserves_frozen_frame_bytes() {
+    for magic in [ARENA_MAGIC, *b"ASTRPM1\0", *b"ASTREP1\0"] {
+        for length in [0_usize, 1, 64, 4096, 65_537] {
+            let payload = vec![0x71; length];
+            let declared = u64::try_from(length).unwrap();
+            let mut original =
+                blake3::Hasher::new_derive_key("astrid durable physical frame checksum v1");
+            original.update(&magic);
+            original.update(&FRAME_VERSION.to_le_bytes());
+            original.update(&declared.to_le_bytes());
+            original.update(&payload);
+            assert_eq!(
+                frame_checksum(magic, declared, &payload),
+                *original.finalize().as_bytes()
+            );
+        }
+    }
+}
+
 pub(super) struct ObservedSource {
     pub(super) file: File,
     pub(super) reads: RefCell<Vec<(u64, usize)>>,

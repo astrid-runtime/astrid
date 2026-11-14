@@ -54,6 +54,12 @@ impl Encoder {
         Self { bytes: Vec::new() }
     }
 
+    /// Own an existing allocation so canonical encoding can reuse capacity.
+    pub(super) fn with_cleared_buffer(mut bytes: Vec<u8>) -> Self {
+        bytes.clear();
+        Self { bytes }
+    }
+
     pub(super) fn finish(self) -> Vec<u8> {
         #[cfg(test)]
         ENCODER_FINISHES.with(|count| count.set(count.get().strict_add(1)));

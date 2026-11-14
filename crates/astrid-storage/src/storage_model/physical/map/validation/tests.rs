@@ -581,7 +581,7 @@ fn borrowed_builder_bytes_match_owned_node_encoding_and_identity() {
 }
 
 #[test]
-fn encode_live_allocates_one_owned_encoding_per_visited_node() {
+fn encode_live_reuses_buffer_for_one_canonical_encoding_per_visited_node() {
     for construction in [MapConstruction::LegacyBinary, MapConstruction::DenseRadix] {
         for count in [1_u32, 2, 17, 257] {
             let entries = (0..count)
@@ -599,8 +599,8 @@ fn encode_live_allocates_one_owned_encoding_per_visited_node() {
                 construction,
             )
             .unwrap();
-            // encode_live_root_into is the automatic-seal emitter: one owned
-            // encoding per visited live node, no rebuild/identify storm.
+            // The automatic-seal emitter encodes each visited live node once
+            // into its reusable buffer, without rebuilding or identifying it.
             let (result, encodings) = PhysicalMapNode::count_encodings_during(|| {
                 encode_live_root_into(
                     PhysicalMapDomain::Placement,
@@ -614,14 +614,51 @@ fn encode_live_allocates_one_owned_encoding_per_visited_node() {
             assert_eq!(
                 encodings,
                 proof.visited().len(),
-                "allocated live encodings {construction:?} count={count}"
+                "canonical live encodings {construction:?} count={count}"
             );
         }
     }
 }
 
 #[test]
-fn matches_encoded_does_not_allocate_a_canonical_encoding() {
+fn encode_to_buffer_matches_encode_and_reuses_one_allocation() {
+    for construction in [MapConstruction::LegacyBinary, MapConstruction::DenseRadix] {
+        let entries = (0_u32..17)
+            .map(|n| {
+                (
+                    PhysicalMapKey::new(*blake3::hash(&n.to_be_bytes()).as_bytes()),
+                    vec![u8::try_from(n % 251).unwrap().saturating_add(1); 17],
+                )
+            })
+            .collect();
+        let map = super::super::CanonicalPhysicalMap::build_with_construction(
+            &Identity,
+            PhysicalMapDomain::Placement,
+            entries,
+            construction,
+        )
+        .unwrap();
+        let needed = map
+            .nodes()
+            .values()
+            .map(|node| node.encode().unwrap().len())
+            .max()
+            .unwrap();
+        let mut buffer = Vec::with_capacity(needed);
+        let pointer = buffer.as_ptr();
+        let capacity = buffer.capacity();
+        for node in map.nodes().values() {
+            let owned = node.encode().unwrap();
+            node.encode_to_buffer(&mut buffer).unwrap();
+            assert_eq!(buffer.as_slice(), owned.as_slice(), "{construction:?}");
+            assert_eq!(buffer.as_ptr(), pointer, "{construction:?}");
+            assert_eq!(buffer.capacity(), capacity, "{construction:?}");
+        }
+    }
+}
+
+#[test]
+fn matches_encoded_does_not_materialize_a_canonical_encoding() {
     for construction in [MapConstruction::LegacyBinary, MapConstruction::DenseRadix] {
         let map = super::super::CanonicalPhysicalMap::build_with_construction(
             &Identity,
@@ -640,7 +677,7 @@ fn matches_encoded_does_not_allocate_a_canonical_encoding() {
             result.unwrap();
             assert_eq!(
                 encodings, 0,
-                "matches_encoded must not count as an allocated encoding {construction:?}"
+                "matches_encoded must not materialize a canonical encoding {construction:?}"
             );
         }
     }

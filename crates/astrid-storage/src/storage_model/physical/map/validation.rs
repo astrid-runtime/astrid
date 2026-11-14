@@ -122,12 +122,13 @@ pub(super) fn encode_live_root_into<E: From<PhysicalModelError>>(
         )
         .into());
     }
+    let mut encoded = Vec::new();
     for id in &proof.visited {
         let node = nodes
             .get(id)
             .ok_or(PhysicalModelError::InvalidMap("missing map node"))?;
-        let bytes = node.encode()?;
-        emit(*id, &bytes)?;
+        node.encode_to_buffer(&mut encoded)?;
+        emit(*id, encoded.as_slice())?;
     }
     Ok(proof)
 }

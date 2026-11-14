@@ -209,18 +209,18 @@ async fn mixed_history_explicit_markers_and_noncanonical_empty_logs_stay_eager()
     stop(store).await;
     let store = open_runtime_principal_store(&home, quota()).await.unwrap();
     assert_eq!(catalog(&store), before);
-    for name in [
-        &historical,
-        &newest,
-        &marked,
-        &log_under_marker,
-        &noncanonical,
-        &companion,
-        &uppercase_uid,
+    for (case, name) in [
+        ("historical", &historical),
+        ("newest", &newest),
+        ("marked", &marked),
+        ("child marker", &log_under_marker),
+        ("noncanonical date", &noncanonical),
+        ("companion", &companion),
+        ("noncanonical principal", &uppercase_uid),
     ] {
         assert!(
             home.root().join(name).is_file(),
-            "{name} must remain eagerly projected"
+            "{case} fixture must remain eagerly projected"
         );
     }
     assert_eq!(

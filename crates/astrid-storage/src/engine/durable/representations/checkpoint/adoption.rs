@@ -203,7 +203,8 @@ impl<'a> LiveTipRefs<'a> {
                 identity: *id.as_bytes(),
                 value: bytes,
             };
-            stream.append_payload(&frame.encode()?)?;
+            let (prefix, body) = frame.encoded_parts()?;
+            stream.append_payload_parts(&[&prefix, body])?;
             Ok::<_, DurableError>(())
         };
         let roots = [

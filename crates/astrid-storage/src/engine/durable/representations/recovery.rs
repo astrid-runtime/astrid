@@ -3,6 +3,8 @@
 #[cfg(test)]
 mod io_tests;
 #[cfg(test)]
+mod semantic_profile_tests;
+#[cfg(test)]
 mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,9 +14,8 @@ use super::super::DurableIo;
 
 use crate::storage_model::{
     CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapKey, PhysicalMapNode, PlacementEntry,
-    PlacementSet, Recipe, RepresentationCatalogueRoot, RepresentationProfile,
-    RepresentationProfileId, RepresentationRecord, RepresentationRecordId, RepresentationState,
-    RepresentationStateId,
+    PlacementSet, Recipe, RepresentationCatalogueRoot, RepresentationProfileId,
+    RepresentationRecord, RepresentationRecordId, RepresentationState, RepresentationStateId,
 };
 
 use super::super::format::scan_frames_with_source;
@@ -28,6 +29,7 @@ use super::{
     DurableError, FIRST_JOURNAL_GENERATION, RecoveryLimits, digest_journal_prefix, increment,
     io_error, journal_byte_len,
 };
+use crate::storage_model::physical::IdentifiedProfile;
 
 mod index;
 use index::HistoricalMapClosure;
@@ -356,14 +358,14 @@ pub(super) fn validate_profile_entries<'a>(
 ) -> Result<RepresentationProfileId, DurableError> {
     let mut direct = None;
     for (key, value) in entries {
-        let profile = RepresentationProfile::decode(value)?;
-        let id = profile.identify(&Blake3PhysicalIdentity)?;
+        let profile = IdentifiedProfile::decode(&Blake3PhysicalIdentity, value)?;
+        let id = profile.identity();
         if PhysicalMapKey::from(id) != key {
             return Err(DurableError::InvalidRepresentationState(
                 "profile leaf key does not match its value",
             ));
         }
-        if profile.kind() == crate::storage_model::ProfileKind::DirectCanonical
+        if profile.profile().kind() == crate::storage_model::ProfileKind::DirectCanonical
             && direct.replace(id).is_some()
         {
             return Err(DurableError::InvalidRepresentationState(
@@ -432,19 +434,24 @@ where
     }
     let mut reverse = BTreeMap::<ObjectId, Vec<RepresentationRecordId>>::new();
     let mut generation_zero = super::index_validation::GenerationZeroPlacements::default();
+    // Direct records share the one required builtin profile. Retain only that
+    // checked value for this pass, not a second index of every operator-defined
+    // profile and its potentially large parameters/dependencies.
+    let mut decoded_direct_profile = None;
     for (key, bytes) in representations()? {
-        let record = RepresentationRecord::decode(bytes)?;
-        let id = record.identify(&Blake3PhysicalIdentity)?;
+        let (record, id) =
+            RepresentationRecord::decode_and_identify(&Blake3PhysicalIdentity, bytes)?;
         if PhysicalMapKey::from(id) != key {
             return Err(DurableError::InvalidRepresentationState(
                 "representation leaf key does not match its value",
             ));
         }
-        let profile_bytes = profiles.get(PhysicalMapKey::from(record.profile())).ok_or(
-            DurableError::InvalidRepresentationState("representation profile is missing"),
+        validate_record_profile(
+            profiles,
+            &record,
+            direct_profile,
+            &mut decoded_direct_profile,
         )?;
-        let profile = RepresentationProfile::decode(profile_bytes)?;
-        record.validate_against_profile(&Blake3PhysicalIdentity, &profile)?;
         let (object, blob, canonical_length) = match (record.coverage(), record.recipe()) {
             (
                 Coverage::Exact {
@@ -477,6 +484,28 @@ where
         extent_count,
         generation_zero,
     })
+}
+
+fn validate_record_profile(
+    profiles: &CanonicalPhysicalMap,
+    record: &RepresentationRecord,
+    direct_profile: RepresentationProfileId,
+    decoded_direct: &mut Option<IdentifiedProfile>,
+) -> Result<(), DurableError> {
+    let decode = || {
+        let bytes = profiles.get(PhysicalMapKey::from(record.profile())).ok_or(
+            DurableError::InvalidRepresentationState("representation profile is missing"),
+        )?;
+        IdentifiedProfile::decode(&Blake3PhysicalIdentity, bytes).map_err(DurableError::from)
+    };
+    if record.profile() != direct_profile {
+        return Ok(record.validate_against_identified_profile(&decode()?)?);
+    }
+    let profile = match decoded_direct {
+        Some(profile) => profile,
+        None => decoded_direct.insert(decode()?),
+    };
+    Ok(record.validate_against_identified_profile(profile)?)
 }
 
 /// Bootstrap startup guard: reject Exact coverage of excluded objects under any recipe.

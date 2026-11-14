@@ -105,6 +105,7 @@ impl std::fmt::Debug for Unregistered {
         f.debug_struct("Unregistered")
             .field("capsule_id", &self.capsule.id())
             .field("torn_down", &self.torn_down)
+            .field("removed_view_count", &self.removed_principals.len())
             .finish()
     }
 }

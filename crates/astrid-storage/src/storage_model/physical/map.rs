@@ -36,7 +36,8 @@ mod typed_tests;
 
 #[cfg(test)]
 std::thread_local! {
-    // Count allocated (Vec-producing) node-body encodings only.
+    // Count canonical node-body encodings (`encode` / `encode_to_buffer`).
+    // Reusing a caller buffer still counts as one encoding per node.
     // `matches_encoded` is a separate borrowed encoder walk and is not counted.
     static MAP_NODE_ENCODINGS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
     // Count map-node identity minting (rebuild/validate/encode_and_identify).
@@ -292,12 +293,31 @@ impl PhysicalMapNode {
     ///
     /// Returns a length overflow when a leaf value cannot fit `u64`.
     pub fn encode(&self) -> Result<Vec<u8>, PhysicalModelError> {
-        encode_body(|encoder| self.encode_into(encoder))
+        let mut bytes = Vec::new();
+        self.encode_to_buffer(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Encode the same canonical grammar into `buffer`, reusing its allocation.
+    ///
+    /// Live map emission walks many nodes; one caller buffer avoids a fresh
+    /// Vec per node without changing the sealed bytes or identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a length overflow when a leaf value cannot fit `u64`.
+    pub(crate) fn encode_to_buffer(&self, buffer: &mut Vec<u8>) -> Result<(), PhysicalModelError> {
+        let mut encoder = Encoder::with_cleared_buffer(core::mem::take(buffer));
+        self.encode_into(&mut encoder)?;
+        #[cfg(test)]
+        MAP_NODE_ENCODINGS.with(|count| count.set(count.get().strict_add(1)));
+        *buffer = encoder.finish();
+        Ok(())
     }
 
     /// Compare every body field using the same encoder as ordinary publication.
-    /// This is a borrowed walk, not an allocated canonical encoding, and does
-    /// not increment the allocated-encoding counter.
+    /// This is a borrowed walk, not an allocated canonical encoding, and
+    /// does not increment the canonical node-encoding counter.
     /// The caller authenticates the original bytes with the borrowed decoder.
     pub(crate) fn matches_encoded(&self, bytes: &[u8]) -> Result<(), PhysicalModelError> {
         let mut encoder = Encoder::comparing(bytes);

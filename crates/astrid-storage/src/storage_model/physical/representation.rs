@@ -13,6 +13,7 @@ use super::identity::{
 use super::profile::{Dependency, ProfileKind, RepresentationProfile};
 
 const REPRESENTATION_VERSION: u16 = 1;
+const REPRESENTATION_IDENTITY_CONTEXT: &str = "astrid-representation-record-v1\0";
 
 /// Exact logical records recoverable from one physical representation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -305,7 +306,22 @@ impl RepresentationRecord {
         identity: &I,
         profile: &RepresentationProfile,
     ) -> Result<(), PhysicalModelError> {
-        if profile.identify(identity)? != self.profile {
+        self.validate_profile_identity(profile, profile.identify(identity)?)
+    }
+
+    pub(crate) fn validate_against_identified_profile(
+        &self,
+        profile: &super::profile::IdentifiedProfile,
+    ) -> Result<(), PhysicalModelError> {
+        self.validate_profile_identity(profile.profile(), profile.identity())
+    }
+
+    fn validate_profile_identity(
+        &self,
+        profile: &RepresentationProfile,
+        profile_identity: RepresentationProfileId,
+    ) -> Result<(), PhysicalModelError> {
+        if profile_identity != self.profile {
             return Err(PhysicalModelError::InvalidProfile(
                 "record names a different profile identity",
             ));
@@ -442,6 +458,18 @@ impl RepresentationRecord {
         Ok(record)
     }
 
+    /// Retain all canonical decode checks, then hash the exact checked input
+    /// rather than allocating another encoding solely to derive its identity.
+    pub(crate) fn decode_and_identify<I: PhysicalIdentity>(
+        identity: &I,
+        bytes: &[u8],
+    ) -> Result<(Self, RepresentationRecordId), PhysicalModelError> {
+        let record = Self::decode(bytes)?;
+        let id =
+            RepresentationRecordId::new(identity.identify(REPRESENTATION_IDENTITY_CONTEXT, bytes));
+        Ok((record, id))
+    }
+
     /// Derive this record's domain-separated physical identity.
     ///
     /// # Errors
@@ -453,7 +481,7 @@ impl RepresentationRecord {
         identity: &I,
     ) -> Result<RepresentationRecordId, PhysicalModelError> {
         Ok(RepresentationRecordId::new(identity.identify(
-            "astrid-representation-record-v1\0",
+            REPRESENTATION_IDENTITY_CONTEXT,
             &self.encode()?,
         )))
     }

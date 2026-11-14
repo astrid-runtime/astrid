@@ -799,7 +799,12 @@ pub(super) fn frame_checksum(magic: [u8; 8], payload_len: u64, payload: &[u8]) -
 }
 
 pub(super) fn frame_checksum_hasher(magic: [u8; 8], payload_len: u64) -> blake3::Hasher {
-    let mut hasher = blake3::Hasher::new_derive_key("astrid durable physical frame checksum v1");
+    // Only the immutable domain-derived initial state is shared. Every frame
+    // still hashes its own complete header fields and payload independently.
+    static INITIAL: std::sync::LazyLock<blake3::Hasher> = std::sync::LazyLock::new(|| {
+        blake3::Hasher::new_derive_key("astrid durable physical frame checksum v1")
+    });
+    let mut hasher = INITIAL.clone();
     hasher.update(&magic);
     hasher.update(&FRAME_VERSION.to_le_bytes());
     hasher.update(&payload_len.to_le_bytes());

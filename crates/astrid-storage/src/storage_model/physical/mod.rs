@@ -9,6 +9,8 @@ use core::fmt;
 mod admission;
 mod catalogue;
 mod codec;
+#[cfg(test)]
+mod decode_identity_tests;
 mod identity;
 mod map;
 mod placement;
@@ -31,6 +33,9 @@ pub(crate) use map::CanonicalRootProof;
 pub use map::{CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode};
 pub(crate) use map::{PlacementMap, ProfileMap, RepresentationMap};
 pub use placement::{PlacementEntry, PlacementSet, Replica, ReplicaLocator};
+pub(crate) use profile::IdentifiedProfile;
+#[cfg(test)]
+pub(crate) use profile::count_identified_profile_decodes_during;
 pub use profile::{
     Dependency, ProfileDependency, ProfileKind, ReconstructionBounds, RepresentationProfile,
 };
