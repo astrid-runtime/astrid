@@ -15,6 +15,7 @@ use crate::engine::{ProjectionCacheEntry, ProjectionCacheKey};
 use crate::storage_model::{ObjectId, ObjectRecord};
 use parking_lot::Mutex;
 
+mod clear;
 mod policy;
 
 pub use policy::{
@@ -492,12 +493,7 @@ where
 
     pub(super) fn clear(&self) {
         let _accounting = self.accounting.lock();
-        let mut state = self.state.lock();
-        let objects = state.entries.keys().copied().collect::<Vec<_>>();
-        for object in objects {
-            state.remove_physical(object);
-        }
-        drop(state);
+        self.state.lock().clear();
         self.controller.release_unused(0);
         self.principal_budget.release_unused_all(&BTreeMap::new());
     }
