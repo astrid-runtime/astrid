@@ -1,5 +1,7 @@
 //! Bind deletion to both the published inventory and the engine-owned volume.
 
+#[cfg(any(unix, windows))]
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use astrid_core::dirs::AstridHome;
@@ -141,6 +143,15 @@ fn prepare_current_with_hook<'a>(
     Ok(prepared)
 }
 
+#[cfg(any(unix, windows))]
+fn is_selected_source(scopes: Option<&BTreeSet<&Path>>, relative: &Path) -> bool {
+    scopes.is_none_or(|scopes| {
+        relative
+            .ancestors()
+            .any(|ancestor| scopes.contains(ancestor))
+    })
+}
+
 #[cfg(test)]
 pub(super) fn after_final_publication(home: &AstridHome) -> StorageResult<()> {
     publication::tests::after_final_publication(home)
@@ -177,13 +188,20 @@ fn prepare<'a>(
         let started = std::time::Instant::now();
         let prepared = match inventory {
             Inventory::Current(Some(receipt)) => {
+                // Index this captured selection once. Scanning every UID scope
+                // for every file makes bootstrap quadratic in the agent count.
+                // Ancestors retain the same component-prefix admission rule.
+                let selected_sources = selected.map(|scopes| {
+                    scopes
+                        .iter()
+                        .map(|scope| scope.as_path())
+                        .collect::<BTreeSet<_>>()
+                });
                 astrid_core::dirs::PreparedProjectionRetirement::prepare_checked(
                     home.root(),
                     |relative| {
                         source::should_check(relative)
-                            && selected.is_none_or(|scopes| {
-                                scopes.iter().any(|scope| relative.starts_with(scope))
-                            })
+                            && is_selected_source(selected_sources.as_ref(), relative)
                     },
                     |relative, source| {
                         inventory
@@ -282,3 +300,6 @@ mod tests;
 
 #[cfg(test)]
 mod publication_tests;
+
+#[cfg(all(test, any(unix, windows)))]
+mod selection_tests;
