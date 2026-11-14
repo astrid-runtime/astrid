@@ -34,8 +34,8 @@ pub use mount_boundary::fixtures as mount_test_fixtures;
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub use name_semantics::directory_is_case_sensitive;
 pub use private_projection::{
-    PrivateFileProjection, PrivateFilePublication, PrivateFileReplacement, PrivateFileWriteOutcome,
-    PrivateProjectionInspection,
+    PrivateAppendRoot, PrivateFileProjection, PrivateFilePublication, PrivateFileReplacement,
+    PrivateFileWriteOutcome, PrivateProjectionInspection,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use private_scratch::create_private_scratch_file;

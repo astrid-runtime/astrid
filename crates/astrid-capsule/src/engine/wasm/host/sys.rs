@@ -71,11 +71,12 @@ impl sys::Host for HostState {
     }
 
     fn log(&mut self, level: LogLevel, message: String) {
-        if !self.invocation_authority_active() {
+        let Ok(operation) = self.begin_host_operation() else {
             return;
-        }
+        };
         let capsule_id = self.capsule_id.as_str().to_owned();
-        let log_file = self.effective_capsule_log().cloned();
+        let resolved = crate::engine::wasm::native_logs::resolve(self, operation.as_ref());
+        let log_file = resolved.file.as_ref();
 
         let level_str = match level {
             LogLevel::Trace => "TRACE",

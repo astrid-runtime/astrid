@@ -144,7 +144,21 @@ fn restore<'a>(
     }
     ingest_runtime_key(home, store)?;
     seed_layout_version(home, store)?;
-    let entries = projection_entries(home, content)?;
+    // Selective omission is a bootstrap optimization. Once staging is
+    // installed this facade can serve writers, and its native journal need
+    // not yet belong to the durable catalog. Keep ordinary restoration then.
+    let root = store
+        .staging
+        .get()
+        .is_none()
+        .then(|| super::empty_logs::current_root(home, store))
+        .transpose()?;
+    let mut entries = projection_entries(home, content)?;
+    if let Some(root) = root {
+        let empty_logs = super::empty_logs::EmptyLogs::authenticate(home, content, &entries)?;
+        empty_logs.retire(home, store, &entries, root, &mut prepared)?;
+        entries.retain(|entry| !empty_logs.omits(entry));
+    }
     let mut written = Vec::new();
     let mut spool = rollback::RollbackSpool::default();
     let result = restore_entries(
@@ -182,7 +196,7 @@ fn restore<'a>(
     Ok(())
 }
 
-fn projection_entries(
+pub(super) fn projection_entries(
     home: &AstridHome,
     content: &NativePrincipalContentStore,
 ) -> StorageResult<Vec<ContentEntry>> {
@@ -201,6 +215,14 @@ fn projection_entries(
         confined_projection_path(home.root(), name.strip_suffix('/').unwrap_or(name))?;
     }
     names::validate(home, &entries)?;
+    for entry in &entries {
+        if entry.name().as_str().ends_with('/') && entry.logical_bytes() != 0 {
+            return Err(tree_error(
+                home.root(),
+                "directory marker contains file bytes",
+            ));
+        }
+    }
     Ok(entries)
 }
 
@@ -395,8 +417,47 @@ pub(super) fn record_intent<'a>(
 ) -> StorageResult<PreparedRestoration<'a>> {
     let staging_scope = reuse_or_mint_staging_scope(home, store)?;
     let entries = super::active_projection_entries(home, store)?;
-    let intent = super::receipt_ingest(home, ReceiptPhase::Retiring, &entries, staging_scope)?;
-    store.replace_contiguous_files_removing_exact(StateOwner::System, [intent], &[], None)?;
+    commit_inventory_intent(home, store, &entries, staging_scope, None)
+}
+
+/// Bind selective host omission to this complete, already validated catalog.
+/// All durable names remain in the RETIRING receipt; only its publication changes.
+pub(super) fn record_inventory_intent<'a>(
+    home: &'a AstridHome,
+    store: &'a RuntimePrincipalStore,
+    entries: &[ContentEntry],
+    expected: crate::storage_model::RootState,
+) -> StorageResult<PreparedRestoration<'a>> {
+    let staging_scope = reuse_or_mint_staging_scope(home, store)?;
+    let inventory = entries
+        .iter()
+        .map(|entry| super::ActiveProjectionEntry {
+            name: entry.name().clone(),
+            file: entry.file(),
+            logical_bytes: entry.logical_bytes(),
+        })
+        .collect::<Vec<_>>();
+    commit_inventory_intent(home, store, &inventory, staging_scope, Some(expected))
+}
+
+fn commit_inventory_intent<'a>(
+    home: &'a AstridHome,
+    store: &'a RuntimePrincipalStore,
+    entries: &[super::ActiveProjectionEntry],
+    staging_scope: Option<StagingScope>,
+    expected: Option<crate::storage_model::RootState>,
+) -> StorageResult<PreparedRestoration<'a>> {
+    let intent = super::receipt_ingest(home, ReceiptPhase::Retiring, entries, staging_scope)?;
+    store.replace_contiguous_files_with_expectation(
+        StateOwner::System,
+        [intent],
+        &[],
+        None,
+        crate::content::ContentBatchPreconditions {
+            names: None,
+            root: expected,
+        },
+    )?;
     store
         .content()
         .flush()

@@ -57,6 +57,7 @@ pub use dirs_layout::{
 mod projection_retirement;
 #[cfg(any(unix, windows))]
 pub use projection_retirement::PreparedProjectionRetirement;
+pub use projection_retirement::RetirementEntryKind;
 #[cfg(all(feature = "test-support", unix))]
 pub use projection_retirement::interrupt_retirement_before_unlink_once;
 pub use projection_retirement::retire_projection_root;

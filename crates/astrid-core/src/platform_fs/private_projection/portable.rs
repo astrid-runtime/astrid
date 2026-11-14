@@ -6,6 +6,17 @@ use std::path::{Path, PathBuf};
 use super::RelativePath;
 use crate::platform_fs::StagingScope;
 
+pub(super) struct AppendRoot;
+
+impl AppendRoot {
+    pub(super) fn open_private_append(&self, _: &RelativePath) -> io::Result<std::fs::File> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native private append unavailable",
+        ))
+    }
+}
+
 pub(super) struct Projection {
     root: PathBuf,
 }
@@ -151,6 +162,13 @@ pub(super) struct Inspection {
 }
 
 impl Inspection {
+    pub(super) fn capture_append_root(&self) -> io::Result<AppendRoot> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native private append unavailable",
+        ))
+    }
+
     pub(super) fn try_open(root: &Path) -> io::Result<Self> {
         crate::platform_fs::verify_no_redirects(root)?;
         if !std::fs::symlink_metadata(root)?.is_dir() {

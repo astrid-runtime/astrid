@@ -18,6 +18,8 @@ use super::RelativePath;
 use crate::platform_fs::{MountBoundary, StagingScope, nix_io_error};
 
 mod anchor;
+mod append;
+pub(super) use append::AppendRoot;
 #[cfg(test)]
 mod failure_tests;
 #[cfg(test)]

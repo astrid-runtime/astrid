@@ -92,11 +92,27 @@ impl Projection {
     }
 }
 
+pub(super) struct AppendRoot {
+    inner: crate::platform_fs::windows::ProjectionAppendRoot,
+}
+
+impl AppendRoot {
+    pub(super) fn open_private_append(&self, relative: &RelativePath) -> io::Result<std::fs::File> {
+        self.inner.open_private_append(&relative.0)
+    }
+}
+
 pub(super) struct Inspection {
     inner: NativeInspection,
 }
 
 impl Inspection {
+    pub(super) fn capture_append_root(&self) -> io::Result<AppendRoot> {
+        Ok(AppendRoot {
+            inner: self.inner.capture_append_root()?,
+        })
+    }
+
     pub(super) fn try_open(root: &std::path::Path) -> io::Result<Self> {
         Ok(Self {
             inner: NativeInspection::try_open(root)?,

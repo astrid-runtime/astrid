@@ -22,6 +22,37 @@ mod platform;
 #[path = "private_projection/portable.rs"]
 mod platform;
 
+/// Immutable captured home-root authority for opening private append streams.
+///
+/// Share one instance across sinks. Capture alone creates no descendants. Each
+/// open checks the original absolute root binding and live relative namespace;
+/// the returned file owns subsequent writes without a root lock. Existing
+/// regular leaves retain their bytes and are restricted to the private-file
+/// contract. Opening does not grant retirement or replacement authority.
+pub struct PrivateAppendRoot {
+    platform: platform::AppendRoot,
+}
+
+impl PrivateAppendRoot {
+    /// Open or create a private regular leaf with atomic append semantics.
+    ///
+    /// Missing parents follow native append initialization: Unix creates/repairs
+    /// privately without directory fences; Windows retains its paired NTFS
+    /// directory-birth fences. Unix file privacy repair retains its existing
+    /// file sync. The caller owns later write durability and stream ordering.
+    /// On Windows a later `File::sync_all` uses this append handle
+    /// (`FILE_APPEND_DATA`, not `FILE_WRITE_DATA`) and does not grant overwrite.
+    /// Unsupported native backends fail closed.
+    ///
+    /// # Errors
+    /// Returns an error for invalid relative names, changed root bindings,
+    /// redirects, mount transitions, unsafe leaves or native open/fence failures.
+    pub fn open_private_append(&self, relative: &Path) -> io::Result<std::fs::File> {
+        self.platform
+            .open_private_append(&RelativePath::parse(relative)?)
+    }
+}
+
 /// Restore private files relative to one captured projection root.
 ///
 /// Each Unix file retains its data and parent metadata fsyncs. Call [`Self::sync`]
@@ -192,6 +223,20 @@ pub struct PrivateProjectionInspection {
 }
 
 impl PrivateProjectionInspection {
+    /// Derive shareable append authority from this exact captured home root.
+    ///
+    /// Does not resolve an ambient home or create log directories. The retained
+    /// root must be the runtime home, so removable descendants are never pinned
+    /// as the append authority itself.
+    ///
+    /// # Errors
+    /// Returns an error on changed/nonprivate roots or unsupported backends.
+    pub fn capture_append_root(&self) -> io::Result<PrivateAppendRoot> {
+        Ok(PrivateAppendRoot {
+            platform: self.platform.capture_append_root()?,
+        })
+    }
+
     /// Open an already-private projection root without following redirects.
     ///
     /// # Errors
@@ -299,3 +344,7 @@ impl RelativePath {
 #[cfg(all(test, any(unix, windows)))]
 #[path = "private_projection/replacement_tests.rs"]
 mod replacement_tests;
+
+#[cfg(all(test, any(unix, windows)))]
+#[path = "private_projection/append_tests.rs"]
+mod append_tests;

@@ -3,6 +3,8 @@
 //! Leaf mutations stay handle-relative under one captured root. This is not a
 //! MOVE/empty-delete owner; [`super::CapturedDirectory`] remains that API.
 
+mod append;
+pub(in crate::platform_fs) use append::AppendRoot;
 mod publish;
 mod scratch;
 
@@ -363,6 +365,14 @@ pub(in crate::platform_fs) struct ProjectionInspection {
 }
 
 impl ProjectionInspection {
+    pub(in crate::platform_fs) fn capture_append_root(&self) -> io::Result<AppendRoot> {
+        self.confirm_absolute_root()?;
+        Ok(AppendRoot::captured(
+            self.guard.duplicate_authority_file()?,
+            self.absolute.clone(),
+        ))
+    }
+
     pub(in crate::platform_fs) fn try_open(root: &Path) -> io::Result<Self> {
         validate_local_absolute_path(root)?;
         // Retain the validated identity for the whole inspection; never repair.

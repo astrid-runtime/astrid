@@ -69,8 +69,9 @@ pub(super) use path::{
 };
 pub(super) use private_file::{atomic_write_private_file, read_private_file_to_string};
 pub(in crate::platform_fs) use projection_session::{
-    ProjectionInspection, ProjectionRoot, Publication as ProjectionPublication,
-    Replacement as ProjectionReplacement, create_private_scratch_file,
+    AppendRoot as ProjectionAppendRoot, ProjectionInspection, ProjectionRoot,
+    Publication as ProjectionPublication, Replacement as ProjectionReplacement,
+    create_private_scratch_file,
 };
 pub(super) use rename::rename_with_write_through;
 

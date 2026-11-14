@@ -3,6 +3,9 @@
 use std::io;
 use std::path::Path;
 
+#[cfg(any(unix, windows))]
+mod selection;
+
 #[cfg(all(test, any(unix, windows)))]
 mod checked_tests;
 #[cfg(all(test, unix))]
@@ -21,6 +24,34 @@ pub use windows::PreparedProjectionRetirement;
 mod replay;
 #[cfg(all(feature = "test-support", unix))]
 pub use replay::interrupt_retirement_before_unlink_once;
+
+/// Captured entry kind supplied to selected-subtree authorization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetirementEntryKind {
+    /// A regular captured file, freshly admitted as empty before deletion.
+    File,
+    /// A real captured directory, including each selected subtree root.
+    Directory,
+}
+
+#[cfg(any(unix, windows))]
+struct SelectedEntryChecker<'a> {
+    home: &'a Path,
+    authorize: &'a mut dyn FnMut(&Path, RetirementEntryKind) -> io::Result<()>,
+}
+
+#[cfg(any(unix, windows))]
+impl SelectedEntryChecker<'_> {
+    fn check(&mut self, path: &Path, kind: RetirementEntryKind) -> io::Result<()> {
+        let relative = path.strip_prefix(self.home).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "captured retirement entry escaped HOME",
+            )
+        })?;
+        (self.authorize)(relative, kind)
+    }
+}
 
 /// Optional content admission during the same complete namespace capture.
 #[cfg(any(unix, windows))]
@@ -89,3 +120,6 @@ pub fn retire_projection_root(root: &Path) -> io::Result<()> {
         ))
     }
 }
+
+#[cfg(all(test, any(unix, windows)))]
+mod empty_tests;

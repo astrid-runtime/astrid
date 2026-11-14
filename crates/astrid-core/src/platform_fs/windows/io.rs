@@ -11,6 +11,12 @@ use super::path::{
 };
 use super::prelude::*;
 
+#[path = "io/append.rs"]
+mod append;
+#[cfg(test)]
+pub(super) use append::TEST_APPLY_PRIVATE_ACL_COUNT;
+pub(super) use append::open_guarded_private_append;
+
 #[derive(Clone, Copy)]
 pub(super) enum FileContract {
     Trusted,

@@ -73,7 +73,18 @@ pub(super) fn prepare_current_projection<'a>(
     home: &'a AstridHome,
     store: &'a RuntimePrincipalStore,
 ) -> StorageResult<PreparedRetirement<'a>> {
-    prepare_current_with_hook(home, store, || Ok(()))
+    prepare_current_with_hook(home, store, || Ok(()), None)
+}
+
+/// Restoration is volume-authoritative for retained siblings. Authenticate the
+/// selected deletion sources while retaining the same complete namespace,
+/// RETIRING receipt, owner-root, and actual volume capture checks.
+pub(super) fn prepare_empty_projection<'a>(
+    home: &'a AstridHome,
+    store: &'a RuntimePrincipalStore,
+    selected: &[std::path::PathBuf],
+) -> StorageResult<PreparedRetirement<'a>> {
+    prepare_current_with_hook(home, store, || Ok(()), Some(selected))
 }
 
 #[cfg(all(test, unix))]
@@ -82,13 +93,14 @@ fn retire_current_with_hook(
     store: &RuntimePrincipalStore,
     before_prepare: impl FnOnce() -> StorageResult<()>,
 ) -> StorageResult<()> {
-    prepare_current_with_hook(home, store, before_prepare)?.retire()
+    prepare_current_with_hook(home, store, before_prepare, None)?.retire()
 }
 
 fn prepare_current_with_hook<'a>(
     home: &'a AstridHome,
     store: &'a RuntimePrincipalStore,
     before_prepare: impl FnOnce() -> StorageResult<()>,
+    selected: Option<&[std::path::PathBuf]>,
 ) -> StorageResult<PreparedRetirement<'a>> {
     let root = store
         .engine
@@ -109,7 +121,7 @@ fn prepare_current_with_hook<'a>(
         ));
     }
     let inventory = Inventory::Current(receipt);
-    let prepared = prepare(home, store, &inventory, before_prepare)?;
+    let prepared = prepare(home, store, &inventory, before_prepare, selected)?;
     if store
         .engine
         .current_root(&super::StateOwner::System)
@@ -146,7 +158,7 @@ pub(super) fn retire_legacy_projection(
         .list(&super::StateOwner::System)
         .map_err(|error| tree_error(home.root(), format!("list legacy retirement: {error}")))?;
     entries.sort_by(|left, right| left.name().as_str().cmp(right.name().as_str()));
-    prepare(home, store, &Inventory::Legacy(entries), || Ok(()))?.retire()
+    prepare(home, store, &Inventory::Legacy(entries), || Ok(()), None)?.retire()
 }
 
 fn prepare<'a>(
@@ -154,6 +166,7 @@ fn prepare<'a>(
     store: &'a RuntimePrincipalStore,
     inventory: &Inventory,
     before_prepare: impl FnOnce() -> StorageResult<()>,
+    selected: Option<&[std::path::PathBuf]>,
 ) -> StorageResult<PreparedRetirement<'a>> {
     #[cfg(any(unix, windows))]
     {
@@ -166,7 +179,12 @@ fn prepare<'a>(
             Inventory::Current(Some(receipt)) => {
                 astrid_core::dirs::PreparedProjectionRetirement::prepare_checked(
                     home.root(),
-                    source::should_check,
+                    |relative| {
+                        source::should_check(relative)
+                            && selected.is_none_or(|scopes| {
+                                scopes.iter().any(|scope| relative.starts_with(scope))
+                            })
+                    },
                     |relative, source| {
                         inventory
                             .require_file(home, relative)
@@ -195,7 +213,7 @@ fn prepare<'a>(
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (home, store, inventory, before_prepare);
+        let _ = (home, store, inventory, before_prepare, selected);
         return Err(tree_error(
             home.root(),
             "projection retirement requires unix or windows",
@@ -215,6 +233,32 @@ pub(super) struct PreparedRetirement<'a> {
 }
 
 impl PreparedRetirement<'_> {
+    /// Reuse complete receipt/source capture and the same volume-bound plan.
+    pub(super) fn retire_empty_subtrees(
+        self,
+        selected: &[std::path::PathBuf],
+        authorize: impl FnMut(&Path, astrid_core::dirs::RetirementEntryKind) -> std::io::Result<()>,
+    ) -> StorageResult<()> {
+        #[cfg(any(unix, windows))]
+        self.prepared
+            .retire_empty_subtrees(&self.volume, selected, authorize)
+            .map_err(|error| {
+                tree_error(
+                    self.home.root(),
+                    format!("retire empty log projection: {error}"),
+                )
+            })?;
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (selected, authorize);
+            return Err(tree_error(
+                self.home.root(),
+                "projection retirement requires unix or windows",
+            ));
+        }
+        self.store.require_volume_binding(self.home)
+    }
+
     pub(super) fn retire(self) -> StorageResult<()> {
         #[cfg(any(unix, windows))]
         {

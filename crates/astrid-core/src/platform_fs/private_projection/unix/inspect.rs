@@ -19,6 +19,12 @@ pub(in crate::platform_fs::private_projection) struct Inspection {
 }
 
 impl Inspection {
+    pub(in crate::platform_fs::private_projection) fn capture_append_root(
+        &self,
+    ) -> io::Result<super::AppendRoot> {
+        super::AppendRoot::capture(&self.root, &self.boundary)
+    }
+
     pub(in crate::platform_fs::private_projection) fn try_open(
         path: &std::path::Path,
     ) -> io::Result<Self> {

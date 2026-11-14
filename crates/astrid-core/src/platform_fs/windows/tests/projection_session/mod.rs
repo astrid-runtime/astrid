@@ -3,6 +3,8 @@
 //! These prove absolute-path replacement cannot redirect a live session, and
 //! that inspection never repairs privacy.
 
+mod append;
+
 use super::super::projection_session::{
     ProjectionInspection, ProjectionRoot, install_namespace_flush_failures,
     set_temporary_cleanup_failures,

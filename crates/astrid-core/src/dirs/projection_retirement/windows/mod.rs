@@ -19,7 +19,10 @@ use crate::platform_fs::windows::retirement_support::{
     require_identity,
 };
 
+use super::selection::{RetirementMode, SelectedDirectories};
 use super::{CANONICAL_VOLUME, SourceChecker};
+
+mod empty;
 
 #[cfg(test)]
 mod tests;
@@ -137,7 +140,12 @@ impl PreparedProjectionRetirement {
             &self.path,
             &self.inventory,
             true,
-            before_unlink,
+            RetirementMode::Full,
+            None,
+            &mut DeletionHooks {
+                before_unlink,
+                sync_retained: |_: &File, _: Option<(&File, &OsStr)>, _: &Path| Ok(()),
+            },
         )?;
         self.require_survivors(expected_volume)?;
         self.root.flush_namespace()?;
@@ -317,15 +325,24 @@ fn validate_inventory(parent: &File, path: &Path, inventory: &[PlannedEntry]) ->
     Ok(())
 }
 
+struct DeletionHooks<U, S> {
+    before_unlink: U,
+    sync_retained: S,
+}
+
 fn delete_inventory(
     parent: &File,
     path: &Path,
     inventory: &[PlannedEntry],
     is_root: bool,
-    before_unlink: &mut impl FnMut(&Path) -> io::Result<()>,
+    mode: RetirementMode<'_>,
+    containing: Option<(&File, &OsStr)>,
+    hooks: &mut DeletionHooks<
+        impl FnMut(&Path) -> io::Result<()>,
+        impl FnMut(&File, Option<(&File, &OsStr)>, &Path) -> io::Result<()>,
+    >,
 ) -> io::Result<()> {
     let names = list_child_entries(parent)?;
-    let parent = parent.as_raw_handle().cast();
     if !names
         .iter()
         .map(|entry| entry.name.as_os_str())
@@ -336,35 +353,87 @@ fn delete_inventory(
             "projection inventory changed after preflight",
         ));
     }
-
+    let changed = mode.needs_fence(|name| {
+        inventory
+            .binary_search_by(|entry| entry.name.as_os_str().cmp(name))
+            .is_ok()
+    });
+    if changed {
+        (hooks.sync_retained)(parent, containing, path)?;
+    }
     for planned in inventory {
-        let child_path = path.join(&planned.name);
-        if is_root && planned.name == OsStr::new(CANONICAL_VOLUME) {
-            let (file, identity) = open_child_file_for_identity(parent, &planned.name)?;
-            require_identity(planned.identity, identity, &child_path)?;
-            drop(file);
+        let operation = mode.child(&planned.name);
+        if !operation.visits() {
             continue;
         }
-        if planned.is_directory {
-            let (directory, identity) = open_child_directory(parent, &planned.name)?;
-            require_identity(planned.identity, identity, &child_path)?;
-            delete_inventory(
-                &directory,
-                &child_path,
-                &planned.children,
-                false,
-                before_unlink,
-            )?;
-            before_unlink(&child_path)?;
-            let still = file_id_identity(&directory)?;
-            require_identity(planned.identity, still, &child_path)?;
-            delete_empty_captured_directory(directory)?;
-        } else {
-            let (file, identity) = open_child_file_for_delete(parent, &planned.name)?;
-            require_identity(planned.identity, identity, &child_path)?;
-            before_unlink(&child_path)?;
-            delete_captured_file(file)?;
+        delete_entry(parent, path, planned, is_root, operation, hooks)?;
+    }
+    if mode.partial() {
+        empty::validate_scope(parent, path, inventory, mode, true, None)?;
+        if changed {
+            (hooks.sync_retained)(parent, containing, path)?;
+            empty::validate_scope(parent, path, inventory, mode, true, None)?;
         }
+    }
+    Ok(())
+}
+
+fn delete_entry(
+    parent: &File,
+    path: &Path,
+    planned: &PlannedEntry,
+    is_root: bool,
+    mode: RetirementMode<'_>,
+    hooks: &mut DeletionHooks<
+        impl FnMut(&Path) -> io::Result<()>,
+        impl FnMut(&File, Option<(&File, &OsStr)>, &Path) -> io::Result<()>,
+    >,
+) -> io::Result<()> {
+    let handle = parent.as_raw_handle().cast();
+    let child_path = path.join(&planned.name);
+    if is_root && planned.name == OsStr::new(CANONICAL_VOLUME) {
+        let (file, identity) = open_child_file_for_identity(handle, &planned.name)?;
+        require_identity(planned.identity, identity, &child_path)?;
+        drop(file);
+        return Ok(());
+    }
+    if planned.is_directory {
+        let (directory, identity) = if mode.partial() {
+            open_child_directory_for_capture(handle, &planned.name)?
+        } else {
+            open_child_directory(handle, &planned.name)?
+        };
+        require_identity(planned.identity, identity, &child_path)?;
+        delete_inventory(
+            &directory,
+            &child_path,
+            &planned.children,
+            false,
+            mode,
+            Some((parent, &planned.name)),
+            hooks,
+        )?;
+        if !mode.partial() {
+            (hooks.before_unlink)(&child_path)?;
+            require_identity(planned.identity, file_id_identity(&directory)?, &child_path)?;
+            delete_empty_captured_directory(directory)?;
+        }
+    } else {
+        if mode.partial() {
+            return Err(invalid(&child_path, "selected ancestor is not a directory"));
+        }
+        let (file, identity) = open_child_file_for_delete(handle, &planned.name)?;
+        require_identity(planned.identity, identity, &child_path)?;
+        (hooks.before_unlink)(&child_path)?;
+        if mode.empty() {
+            let (current, identity) = open_child_file_for_identity(handle, &planned.name)?;
+            require_identity(planned.identity, identity, &child_path)?;
+            require_identity(planned.identity, file_id_identity(&file)?, &child_path)?;
+            if file.metadata()?.len() != 0 || current.metadata()?.len() != 0 {
+                return Err(invalid(&child_path, "selected file is no longer empty"));
+            }
+        }
+        delete_captured_file(file)?;
     }
     Ok(())
 }

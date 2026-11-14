@@ -19,6 +19,7 @@ use super::{
 use super::runtime_tree_active as active;
 mod active_receipt;
 pub(super) mod admission;
+mod empty_logs;
 #[cfg(test)]
 mod key_recovery_tests;
 #[cfg(test)]
@@ -776,6 +777,7 @@ pub(super) fn reconcile_running_projection(
                 let scanned = scan(home.root())?;
                 if surviving && !is_bootstrap_surviving_projection(&scanned) {
                     publish_active_projection(home, store)?;
+                    empty_logs::cleanup_current(home, store)?;
                 } else {
                     restore_projection(home, store, &store.content)?;
                 }

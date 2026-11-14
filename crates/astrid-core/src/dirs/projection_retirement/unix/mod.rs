@@ -7,10 +7,13 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
 use nix::fcntl::{AtFlags, OFlag, openat};
-use nix::sys::stat::{FileStat, Mode, SFlag, fstat, fstatat};
+use nix::sys::stat::{FileStat, Mode as FileMode, SFlag, fstat, fstatat};
 use nix::unistd::{UnlinkatFlags, unlinkat};
 
+use super::selection::{RetirementMode, SelectedDirectories};
 use super::{CANONICAL_VOLUME, SourceChecker};
+
+mod empty;
 
 #[cfg(test)]
 mod barrier_tests;
@@ -206,6 +209,7 @@ impl PreparedProjectionRetirement {
             &self.boundary,
             &self.inventory,
             true,
+            RetirementMode::Full,
             hooks,
         )?;
         self.require_survivors(expected)?;
@@ -381,14 +385,30 @@ fn delete_inventory(
     root: &RootBoundary,
     inventory: &[PlannedEntry],
     is_root: bool,
+    mode: RetirementMode<'_>,
     hooks: &mut RetirementHooks<
         impl FnMut(&Path) -> io::Result<()>,
         impl FnMut(&File, &Path) -> io::Result<()>,
     >,
 ) -> io::Result<()> {
     require_inventory(directory, path, inventory)?;
+    let mut changed = mode.needs_fence(|name| {
+        inventory
+            .binary_search_by(|entry| entry.name.as_os_str().cmp(name))
+            .is_ok()
+    });
     for planned in inventory {
-        delete_entry(directory, path, root, planned, is_root, hooks)?;
+        let operation = mode.child(&planned.name);
+        if operation.visits() {
+            changed |= delete_entry(directory, path, root, planned, is_root, operation, hooks)?;
+        }
+    }
+    if mode.partial() {
+        empty::validate_scope(directory, path, root, inventory, mode, true, None)?;
+        if changed {
+            (hooks.sync_directory)(directory, path)?;
+            empty::validate_scope(directory, path, root, inventory, mode, true, None)?;
+        }
     }
     Ok(())
 }
@@ -412,11 +432,12 @@ fn delete_entry(
     root: &RootBoundary,
     planned: &PlannedEntry,
     is_root: bool,
+    mode: RetirementMode<'_>,
     hooks: &mut RetirementHooks<
         impl FnMut(&Path) -> io::Result<()>,
         impl FnMut(&File, &Path) -> io::Result<()>,
     >,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let name = &planned.name;
     let child_path = path.join(name);
     let canonical = is_root && name == OsStr::new(CANONICAL_VOLUME);
@@ -432,7 +453,7 @@ fn delete_entry(
         Some(child)
     };
     if canonical {
-        return Ok(());
+        return Ok(false);
     }
     let child_directory = child.as_ref().and_then(Entry::directory);
     if let Some(child_directory) = child_directory {
@@ -442,8 +463,12 @@ fn delete_entry(
             root,
             &planned.children,
             false,
+            mode,
             hooks,
         )?;
+    }
+    if mode.partial() {
+        return Ok(false);
     }
     (hooks.before_unlink)(&child_path)?;
     #[cfg(feature = "test-support")]
@@ -461,17 +486,22 @@ fn delete_entry(
         require_identity(&planned.identity, confirmation.identity(), &child_path)?;
         confirmation
     };
+    if mode.empty() && child_directory.is_none() {
+        empty::require_zero(&current, &child_path)?;
+        #[cfg(target_os = "linux")]
+        empty::require_zero(_mount_confirmation.identity(), &child_path)?;
+    }
     let flags = if child_directory.is_some() {
         UnlinkatFlags::RemoveDir
     } else {
         UnlinkatFlags::NoRemoveDir
     };
     unlinkat(directory, name.as_os_str(), flags).map_err(os_error)?;
-    if is_root && child_directory.is_some() {
+    if mode.full() && is_root && child_directory.is_some() {
         // Preserve the existing root barrier after each top-level directory.
         (hooks.sync_directory)(directory, path)?;
     }
-    Ok(())
+    Ok(true)
 }
 
 fn defer_leaf_check(identity: &FileStat, canonical: bool) -> bool {
@@ -536,7 +566,7 @@ fn open_checked(
     flags: OFlag,
 ) -> io::Result<(File, FileStat)> {
     let flags = flags | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
-    let child = File::from(openat(parent, name, flags, Mode::empty()).map_err(os_error)?);
+    let child = File::from(openat(parent, name, flags, FileMode::empty()).map_err(os_error)?);
     let after = fstat(&child).map_err(os_error)?;
     require_identity(before, &after, path)?;
     check_boundary(path, root, &after)?;
@@ -552,7 +582,7 @@ fn entries(directory: &File) -> io::Result<Vec<OsString>> {
         directory,
         Path::new("."),
         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-        Mode::empty(),
+        FileMode::empty(),
     )
     .map_err(os_error)?;
     let mut names = Vec::new();

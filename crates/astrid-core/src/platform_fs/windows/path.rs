@@ -215,6 +215,10 @@ impl TrustedPathGuard {
         Self::capture_with_directory(path, None)
     }
 
+    pub(super) fn capture_from_file(path: &Path, file: &File) -> io::Result<Self> {
+        Self::capture_with_directory(path, Some((path, file)))
+    }
+
     fn capture_with_directory(path: &Path, captured: Option<(&Path, &File)>) -> io::Result<Self> {
         validate_local_absolute_path(path)?;
         let mut components: Vec<LockedPathComponent> = Vec::new();

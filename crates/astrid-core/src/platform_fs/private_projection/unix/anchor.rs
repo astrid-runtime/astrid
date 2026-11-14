@@ -24,6 +24,9 @@ pub(super) enum WalkPolicy {
     Repair,
     /// Create missing private directories and repair privacy as needed.
     Create,
+    /// Native append initialization creates/repairs privately without adding
+    /// projection-directory durability fences; the append caller owns data flush.
+    Append,
 }
 
 pub(super) struct Root {
@@ -233,8 +236,11 @@ impl<'a> DirectoryChain<'a> {
             WalkPolicy::Inspect => {
                 validate_private_directory(&file)?;
             },
-            WalkPolicy::Repair | WalkPolicy::Create => {
-                if make_private_directory(&file)? || created {
+            WalkPolicy::Repair | WalkPolicy::Create | WalkPolicy::Append => {
+                let changed = make_private_directory(&file)? || created;
+                if changed && policy != WalkPolicy::Append {
+                    #[cfg(test)]
+                    DIRECTORY_FENCES.with(|count| count.set(count.get().strict_add(2)));
                     fsync(&file).map_err(nix_io_error)?;
                     fsync(parent).map_err(nix_io_error)?;
                 }
@@ -341,6 +347,7 @@ fn validate_private_directory(file: &File) -> io::Result<FileStat> {
 thread_local! {
     static RELATIVE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static NEW_BINDINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DIRECTORY_FENCES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 #[cfg(test)]
 pub(super) fn take_relative_walks() -> usize {
@@ -361,6 +368,11 @@ impl LastDirectoryChain {
     pub(super) fn clear(&self) {
         self.bindings.borrow_mut().clear();
     }
+}
+
+#[cfg(test)]
+pub(super) fn take_directory_fences() -> usize {
+    DIRECTORY_FENCES.with(|count| count.replace(0))
 }
 
 #[cfg(test)]
