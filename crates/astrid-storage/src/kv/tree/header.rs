@@ -94,12 +94,8 @@ where
             if let Some(cached) = cached {
                 (cached, None)
             } else {
-                let (decoded, checkpoint) = decode_kv_component::<P, E>(
-                    engine,
-                    &owner,
-                    reference.target(),
-                    &validation.trees,
-                )?;
+                let (decoded, checkpoint) =
+                    decode_kv_component::<P, E>(engine, &owner, reference.target(), validation)?;
                 (decoded, Some(checkpoint))
             }
         },
@@ -169,7 +165,7 @@ where
     if let Some(cached) = cached {
         return Ok(cached);
     }
-    let (decoded, checkpoint) = decode_kv_component(engine, owner, head, &validation.trees)?;
+    let (decoded, checkpoint) = decode_kv_component(engine, owner, head, validation)?;
     if let Some(root) = captured_root {
         validation.publish_if_current(
             engine,
@@ -319,12 +315,13 @@ fn decode_kv_component<P, E>(
     engine: &E,
     owner: &P,
     head_id: ObjectId,
-    validated_trees: &Mutex<BTreeMap<P, TreeValidation>>,
+    validation_cache: &KvValidationCache<P>,
 ) -> StorageResult<(Projection, TreeValidation)>
 where
     P: Clone + Ord,
     E: KvProjectionEngine<P>,
 {
+    let validated_trees = &validation_cache.trees;
     let mut deltas = Vec::<(ObjectId, u64, u64, Vec<Mutation>, NodeTotals)>::new();
     let mut cursor = Some(head_id);
     let mut visited = BTreeSet::new();
@@ -359,6 +356,8 @@ where
     let validation = if let Some(validation) = cached {
         validation
     } else {
+        #[cfg(test)]
+        validation_cache.record_tree_validation_for_test();
         let mut context = TreeContext::<P, E>::new(engine, owner);
         context.validate_tree(tree)?
     };
@@ -482,7 +481,7 @@ fn update_totals(
     Ok(())
 }
 
-fn load_typed<P, E>(
+pub(super) fn load_typed<P, E>(
     engine: &E,
     owner: &P,
     id: ObjectId,
@@ -501,7 +500,7 @@ where
     Ok(record)
 }
 
-fn require_structural(id: ObjectId, record: &ObjectRecord) -> StorageResult<()> {
+pub(super) fn require_structural(id: ObjectId, record: &ObjectRecord) -> StorageResult<()> {
     if !record.canonical_bytes().is_empty()
         || record.logical_bytes() != 0
         || record.class() != ObjectClass::Metadata
@@ -511,7 +510,11 @@ fn require_structural(id: ObjectId, record: &ObjectRecord) -> StorageResult<()> 
     Ok(())
 }
 
-fn owned_target(id: ObjectId, record: &ObjectRecord, label: &[u8]) -> StorageResult<ObjectId> {
+pub(super) fn owned_target(
+    id: ObjectId,
+    record: &ObjectRecord,
+    label: &[u8],
+) -> StorageResult<ObjectId> {
     let reference = record
         .reference(&ReferenceLabel::new(label))
         .ok_or_else(|| invalid(id, "required KV tree reference is missing"))?;

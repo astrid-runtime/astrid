@@ -7,6 +7,7 @@ use super::*;
 use crate::engine::durable::media::{File, StoreMetadata};
 use crate::engine::durable::representations::activation::visit_new_reachable_map_nodes;
 use crate::storage_model::PhysicalMapDomain;
+use crate::storage_model::physical::RepresentationMap;
 use crate::volume::HostedFileVolume;
 
 struct ObservedFile {
@@ -150,14 +151,18 @@ fn assert_active_map_reads(hosted: bool, historical: bool) {
     file.positioned_reads.set(0);
     file.positioned_bytes.set(0);
     file.requested_bytes.set(0);
-    let recovered = index
-        .recover_active_map(
-            PhysicalMapDomain::Representation,
-            original.root(),
-            &file,
-            limits,
-        )
-        .unwrap();
+    let recovered = RepresentationMap::recover_exact(
+        original.root(),
+        index
+            .recover_active_nodes(
+                PhysicalMapDomain::Representation,
+                original.root(),
+                &file,
+                limits,
+            )
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(recovered.root(), original.root());
     assert_eq!(recovered.nodes().len(), node_count);
     for (key, value) in entries {

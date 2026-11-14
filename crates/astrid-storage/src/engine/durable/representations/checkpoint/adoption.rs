@@ -6,10 +6,10 @@
 //! (`checkpoint_volume`, `maybe_checkpoint_native`) uses this path.
 
 use crate::storage_model::physical::CanonicalRootProof;
+use crate::storage_model::physical::{PlacementMap, ProfileMap, RepresentationMap};
 use crate::storage_model::{
-    CanonicalPhysicalMap, ObjectId, PhysicalMapDomain, PhysicalMapNodeId, PlacementSet,
-    RepresentationCatalogueRoot, RepresentationProfileId, RepresentationRecordId,
-    RepresentationState, RepresentationStateId,
+    ObjectId, PhysicalMapNodeId, PlacementSet, RepresentationCatalogueRoot,
+    RepresentationProfileId, RepresentationRecordId, RepresentationState, RepresentationStateId,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -47,9 +47,9 @@ pub(super) struct VerifiedSealedAdoption {
 /// Field-split borrows freeze the complete tip while the disjoint journal is
 /// digested. No proof crosses a mutation or survives this checkpoint operation.
 struct LiveTipRefs<'a> {
-    profiles: &'a CanonicalPhysicalMap,
-    representations: &'a CanonicalPhysicalMap,
-    placement_entries: &'a CanonicalPhysicalMap,
+    profiles: &'a ProfileMap,
+    representations: &'a RepresentationMap,
+    placement_entries: &'a PlacementMap,
     reverse: &'a BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
     catalogue: RepresentationCatalogueRoot,
     placements: PlacementSet,
@@ -68,12 +68,9 @@ impl<'a> LiveTipRefs<'a> {
     fn prove(&self) -> Result<CanonicalTip<'a>, DurableError> {
         self.ensure_live_authority_binds_sealed_tip()?;
         let roots = [
-            self.profiles
-                .prove_root(&Blake3PhysicalIdentity, PhysicalMapDomain::Profile)?,
-            self.representations
-                .prove_root(&Blake3PhysicalIdentity, PhysicalMapDomain::Representation)?,
-            self.placement_entries
-                .prove_root(&Blake3PhysicalIdentity, PhysicalMapDomain::Placement)?,
+            self.profiles.prove_root()?,
+            self.representations.prove_root()?,
+            self.placement_entries.prove_root()?,
         ];
         let reachable = roots
             .iter()
@@ -197,46 +194,27 @@ impl<'a> LiveTipRefs<'a> {
     ) -> Result<(CanonicalTip<'a>, SealedGenerationEmit), DurableError> {
         self.ensure_live_authority_binds_sealed_tip()?;
         let mut stream = FramedAppendStream::begin(metadata, METADATA_MAGIC)?;
-        let mut emitted = BTreeSet::new();
+        // Domain-separated node IDs make cross-map collision impossible. Emit each
+        // map's already-authenticated live bodies without a rebuild/identify storm;
+        // fresh media verification still compares against every matching live arena.
         let mut append = |id: PhysicalMapNodeId, bytes: &[u8]| {
-            // prove_root_into checks this map's exact live body before this
-            // cross-map deduplication. Bytes live only through this callback.
-            if emitted.insert(id) {
-                let frame = MetadataFrame {
-                    kind: MetadataKind::MapNode,
-                    identity: *id.as_bytes(),
-                    value: bytes,
-                };
-                stream.append_payload(&frame.encode()?)?;
-            }
+            let frame = MetadataFrame {
+                kind: MetadataKind::MapNode,
+                identity: *id.as_bytes(),
+                value: bytes,
+            };
+            stream.append_payload(&frame.encode()?)?;
             Ok::<_, DurableError>(())
         };
         let roots = [
-            self.profiles.prove_root_into(
-                &Blake3PhysicalIdentity,
-                PhysicalMapDomain::Profile,
-                &mut append,
-            )?,
-            self.representations.prove_root_into(
-                &Blake3PhysicalIdentity,
-                PhysicalMapDomain::Representation,
-                &mut append,
-            )?,
-            self.placement_entries.prove_root_into(
-                &Blake3PhysicalIdentity,
-                PhysicalMapDomain::Placement,
-                &mut append,
-            )?,
+            self.profiles.encode_live_into(&mut append)?,
+            self.representations.encode_live_into(&mut append)?,
+            self.placement_entries.encode_live_into(&mut append)?,
         ];
         let reachable = roots
             .iter()
             .flat_map(|proof| proof.visited().iter().copied())
             .collect();
-        if emitted != reachable {
-            return Err(DurableError::InvalidRepresentationState(
-                "emitted nodes disagree with canonical proof union",
-            ));
-        }
         let canonical = CanonicalTip { roots, reachable };
         // Incomplete private frames confer no authority. Do not finish/sync the
         // stream, append authority or journal frames, or publish CURRENT until
@@ -266,7 +244,11 @@ impl LiveTipRefs<'_> {
         let mut durable = BTreeSet::new();
         {
             let mut stream = FramedAppendStream::begin(metadata, METADATA_MAGIC)?;
-            for map in [self.profiles, self.representations, self.placement_entries] {
+            for map in [
+                self.profiles.as_canonical(),
+                self.representations.as_canonical(),
+                self.placement_entries.as_canonical(),
+            ] {
                 visit_new_reachable_map_nodes(
                     map,
                     &mut durable,
@@ -492,7 +474,7 @@ impl LiveTipRefs<'_> {
             ));
         }
         let validated = validate_representation_entries::<false, _>(
-            self.profiles,
+            self.profiles.as_canonical(),
             || Ok(canonical.roots[1].entries().iter().copied()),
             canonical.roots[2].entries().iter().copied(),
             direct_profile,
@@ -524,17 +506,13 @@ impl RepresentationStore {
         self.complete_map_subtrees.clear();
         self.persisted_map_nodes = proof.verified_reachable;
         self.map_frame_count = proof.map_frame_count;
-        for map in [
-            &mut self.profiles,
-            &mut self.representations,
-            &mut self.placement_entries,
-        ] {
-            map.reclaim_unreachable_nodes()?;
-        }
+        self.profiles.reclaim_unreachable_nodes()?;
+        self.representations.reclaim_unreachable_nodes()?;
+        self.placement_entries.reclaim_unreachable_nodes()?;
         self.residency = MapResidency::new(
-            &self.profiles,
-            &self.representations,
-            &self.placement_entries,
+            self.profiles.as_canonical(),
+            self.representations.as_canonical(),
+            self.placement_entries.as_canonical(),
         );
         // Exact media closure verification authenticated every retained node's
         // descendants. Carry that fresh proof just as cold recovery does, so
@@ -555,15 +533,16 @@ fn inspect_map_node_frame(
             "checkpoint metadata contains an unsealed map node",
         ));
     }
-    // The private canonical proof validated each immutable live body's grammar
-    // and identity. Exact comparison below binds fresh bytes to that same body;
-    // decoding and hashing them again adds no independent validation. Frame
-    // checksums and complete closure checks still authenticate fresh media.
+    // Typed birth/recovery already authenticated each live body's grammar and
+    // identity under its domain map. Exact comparison below still binds fresh
+    // media bytes to every matching live arena entry (including unreachable
+    // adversarial aliases); decoding and hashing again would not add an
+    // independent check beyond frame checksums and complete-closure scans.
     let mut matched = false;
     for map in [
-        &store.profiles,
-        &store.representations,
-        &store.placement_entries,
+        store.profiles.as_canonical(),
+        store.representations.as_canonical(),
+        store.placement_entries.as_canonical(),
     ] {
         if let Some(live) = map.nodes().get(&id) {
             matched = true;

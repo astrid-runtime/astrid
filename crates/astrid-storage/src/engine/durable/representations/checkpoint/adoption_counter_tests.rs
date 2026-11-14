@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use super::super::recovery::{recover_active_map_calls, reset_recover_active_map_calls};
+use super::super::recovery::{recover_active_nodes_calls, reset_recover_active_nodes_calls};
 use super::super::{ArenaLocation, ObjectId, open_store_root};
 use super::{RecoveryLimits, RepresentationStore};
 use crate::volume::{AstridVolume, HostedFileVolume};
@@ -36,10 +36,10 @@ fn automatic_volume_checkpoint_does_not_reconstruct_live_maps() {
     accumulate_history(&mut store);
     let active = store.active;
     let previous_generation = store.journal_generation;
-    reset_recover_active_map_calls();
+    reset_recover_active_nodes_calls();
     assert!(store.maybe_checkpoint_volume(&volume, limits).unwrap());
     assert_eq!(
-        recover_active_map_calls(),
+        recover_active_nodes_calls(),
         0,
         "automatic maintenance must retain live maps"
     );
@@ -47,12 +47,12 @@ fn automatic_volume_checkpoint_does_not_reconstruct_live_maps() {
     assert_eq!(store.journal_generation, previous_generation + 1);
     assert!(store.map_frame_count() <= store.resident_map_node_count());
     drop(store);
-    reset_recover_active_map_calls();
+    reset_recover_active_nodes_calls();
     let reopened = RepresentationStore::open_volume(&volume, limits)
         .unwrap()
         .unwrap();
     assert_eq!(
-        recover_active_map_calls(),
+        recover_active_nodes_calls(),
         3,
         "cold open must still independently reconstruct"
     );
@@ -71,19 +71,19 @@ fn automatic_native_checkpoint_does_not_reconstruct_live_maps() {
     accumulate_history(&mut store);
     let active = store.active;
     let previous_generation = store.journal_generation;
-    reset_recover_active_map_calls();
+    reset_recover_active_nodes_calls();
     assert!(store.maybe_checkpoint_native(&root, limits).unwrap());
     assert_eq!(
-        recover_active_map_calls(),
+        recover_active_nodes_calls(),
         0,
         "automatic maintenance must retain live maps"
     );
     assert_eq!(store.active, active);
     drop(store);
-    reset_recover_active_map_calls();
+    reset_recover_active_nodes_calls();
     let reopened = RepresentationStore::open(&root, limits).unwrap().unwrap();
     assert_eq!(
-        recover_active_map_calls(),
+        recover_active_nodes_calls(),
         3,
         "cold open must still independently reconstruct"
     );
@@ -103,9 +103,9 @@ fn independent_checkpoint_preparation_and_native_compaction_still_reconstruct() 
     accumulate_history(&mut store);
     let active = store.active;
     let generation = store.journal_generation;
-    reset_recover_active_map_calls();
+    reset_recover_active_nodes_calls();
     let prepared = store.prepare_checkpoint_volume(&volume, limits).unwrap();
-    assert_eq!(recover_active_map_calls(), 3);
+    assert_eq!(recover_active_nodes_calls(), 3);
     assert_eq!(prepared.active, active);
     assert_eq!(prepared.journal_generation, generation + 1);
     assert_eq!(
@@ -126,10 +126,10 @@ fn independent_checkpoint_preparation_and_native_compaction_still_reconstruct() 
         RepresentationStore::activate(&root, limits, ObjectId::new([1; 32]), []).unwrap();
     accumulate_history(&mut native);
     let active = native.active;
-    reset_recover_active_map_calls();
+    reset_recover_active_nodes_calls();
     native.checkpoint_native(&root, limits).unwrap();
     assert_eq!(
-        recover_active_map_calls(),
+        recover_active_nodes_calls(),
         3,
         "native compaction retains independent reconstruction"
     );

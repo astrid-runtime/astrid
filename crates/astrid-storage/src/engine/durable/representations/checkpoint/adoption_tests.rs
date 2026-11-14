@@ -589,24 +589,49 @@ fn corrupt_live_reverse_is_rejected_before_current_publication() {
 
 #[test]
 fn coherent_wrong_slot_domain_is_rejected_before_current_publication() {
+    use crate::storage_model::physical::ProfileMap;
     use crate::storage_model::{
-        CanonicalPhysicalMap, PhysicalMapDomain, RepresentationCatalogueRoot, RepresentationState,
+        CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapNode, RepresentationCatalogueRoot,
+        RepresentationState,
     };
     let (_directory, volume, mut store, limits) = primed_volume();
     let generation = store.journal_generation;
     let active = store.active;
     let mut entries = Vec::new();
-    super::super::recovery::visit_active_entries(&store.profiles, |key, bytes| {
+    super::super::recovery::visit_active_entries(store.profiles.as_canonical(), |key, bytes| {
         entries.push((key, bytes.to_vec()));
         Ok(())
     })
     .unwrap();
-    store.profiles = CanonicalPhysicalMap::build_dense(
+    let wrong = CanonicalPhysicalMap::build_dense(
         &Blake3PhysicalIdentity,
         PhysicalMapDomain::Representation,
         entries,
     )
     .unwrap();
+    assert!(
+        ProfileMap::recover_exact(wrong.root(), wrong.nodes().clone()).is_err(),
+        "typed recover must fail-fast on wrong-domain media"
+    );
+    // Preserve end-to-end rejection: corrupt an active profile node domain after
+    // legitimate birth so automatic seal cannot publish CURRENT. Wrong-domain
+    // assignment into ProfileMap is unconstructible; explicit tip mutation is
+    // required to exercise the runtime fence.
+    let (id, node) = store.profiles.nodes().iter().next().unwrap();
+    let id = *id;
+    let mut forged = node.clone();
+    match &mut forged {
+        PhysicalMapNode::Leaf { domain, .. }
+        | PhysicalMapNode::Branch { domain, .. }
+        | PhysicalMapNode::Page { domain, .. }
+        | PhysicalMapNode::Radix { domain, .. } => {
+            *domain = PhysicalMapDomain::Representation;
+        },
+    }
+    assert!(
+        store.profiles.replace_arena_node_for_fault(id, forged),
+        "fault injection must replace the active profile node under test"
+    );
     store.catalogue = RepresentationCatalogueRoot::new(
         store.catalogue.generation() + 1,
         store.profiles.root(),
@@ -682,6 +707,7 @@ fn publication_sync_failure_installs_new_handles_and_preserves_old_media() {
 
 #[test]
 fn coherent_extra_orphan_in_emitter_memo_cannot_authorize_sealed_media() {
+    use crate::storage_model::physical::ProfileMap;
     use crate::storage_model::{CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapKey};
     let (_directory, volume, mut store, limits) = primed_volume();
     let orphan = CanonicalPhysicalMap::build_dense(
@@ -691,15 +717,20 @@ fn coherent_extra_orphan_in_emitter_memo_cannot_authorize_sealed_media() {
     )
     .unwrap();
     let id = orphan.root().unwrap();
-    let mut nodes = store.profiles.nodes().clone();
-    nodes.extend(orphan.nodes().iter().map(|(id, node)| (*id, node.clone())));
-    store.profiles = CanonicalPhysicalMap::recover(
-        &Blake3PhysicalIdentity,
-        PhysicalMapDomain::Profile,
-        store.profiles.root(),
-        nodes,
-    )
-    .unwrap();
+    let mut with_orphan = store.profiles.nodes().clone();
+    with_orphan.extend(orphan.nodes().iter().map(|(id, node)| (*id, node.clone())));
+    assert!(
+        ProfileMap::recover_exact(store.profiles.root(), with_orphan).is_err(),
+        "typed recover must reject unauthenticated historical extras"
+    );
+    for (orphan_id, node) in orphan.nodes() {
+        assert!(
+            store
+                .profiles
+                .insert_unreachable_adversarial_node(*orphan_id, node.clone()),
+            "orphan must be unreachable in the live tip"
+        );
+    }
     let (mut metadata, mut journal) = next_generation_files(&store, &volume);
     let mut emit = store
         .emit_sealed_generation(&mut metadata, &mut journal)
@@ -829,7 +860,8 @@ fn sealed_media_fresh_scan_rejects_same_length_crc_corruption() {
 
 #[test]
 fn sealed_node_body_is_compared_against_every_matching_live_arena() {
-    use crate::storage_model::{CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapNode};
+    use crate::storage_model::PhysicalMapNode;
+    use crate::storage_model::physical::ProfileMap;
     let (_directory, volume, mut store, limits) = primed_volume();
     let (id, node) = store
         .placement_entries
@@ -849,17 +881,20 @@ fn sealed_node_body_is_compared_against_every_matching_live_arena() {
         PhysicalMapNode::Page { entries, .. } => entries[0].1[0] ^= 1,
         _ => unreachable!(),
     }
-    let mut nodes = store.profiles.nodes().clone();
-    assert!(nodes.insert(id, forged).is_none());
+    let mut with_forged = store.profiles.nodes().clone();
+    assert!(with_forged.insert(id, forged.clone()).is_none());
+    assert!(
+        ProfileMap::recover_exact(store.profiles.root(), with_forged).is_err(),
+        "typed recover must reject extras rather than minting a certificate"
+    );
     // A historical unreachable entry may occupy the same ID in another arena.
-    // The active canonical proof cannot alone establish cross-arena equality.
-    store.profiles = CanonicalPhysicalMap::recover(
-        &Blake3PhysicalIdentity,
-        PhysicalMapDomain::Profile,
-        store.profiles.root(),
-        nodes,
-    )
-    .unwrap();
+    // Fresh media verification still compares against every matching live arena.
+    assert!(
+        store
+            .profiles
+            .insert_unreachable_adversarial_node(id, forged),
+        "forged body must be unreachable in the profile arena"
+    );
     let error = store.checkpoint_volume(&volume, limits).unwrap_err();
     assert!(format!("{error:?}").contains("body disagrees"), "{error:?}");
 }

@@ -122,6 +122,12 @@ impl super::RuntimePrincipalStore {
 }
 
 impl RuntimeFinalization {
+    /// Borrow the transferred packing owner for focused handoff assertions.
+    #[cfg(test)]
+    pub(crate) fn store_for_test(&self) -> &super::RuntimePrincipalStore {
+        &self.store
+    }
+
     /// Retain an ancillary shutdown failure until packing and close complete.
     ///
     /// Custody must survive an old projection's close error. Finalization still

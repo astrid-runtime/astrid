@@ -527,33 +527,6 @@ fn canonical_proof_keeps_only_active_ids_and_borrows_sorted_leaf_values() {
 }
 
 #[test]
-fn streaming_proof_checks_generated_and_walked_sets_independently() {
-    let map = super::super::CanonicalPhysicalMap::build_dense(
-        &Identity,
-        PhysicalMapDomain::Placement,
-        vec![(PhysicalMapKey::new([1; 32]), vec![7])],
-    )
-    .unwrap();
-    let proof = walk_root(PhysicalMapDomain::Placement, map.root(), map.nodes()).unwrap();
-    let mut generated = BTreeSet::new();
-    map.prove_root_into(&Identity, PhysicalMapDomain::Placement, |id, bytes| {
-        assert_eq!(PhysicalMapNode::decode(bytes).unwrap(), map.nodes()[&id]);
-        generated.insert(id);
-        Ok::<_, PhysicalModelError>(())
-    })
-    .unwrap();
-    ensure_generated_matches_walk(&generated, proof.visited()).unwrap();
-    let extra = PhysicalMapNodeId::new([255; 32]);
-    let mut extra_walked = proof.visited().clone();
-    extra_walked.insert(extra);
-    assert!(ensure_generated_matches_walk(&generated, &extra_walked).is_err());
-    generated.insert(extra);
-    assert!(ensure_generated_matches_walk(&generated, proof.visited()).is_err());
-    generated.clear();
-    assert!(ensure_generated_matches_walk(&generated, proof.visited()).is_err());
-}
-
-#[test]
 fn borrowed_builder_bytes_match_owned_node_encoding_and_identity() {
     for construction in [MapConstruction::LegacyBinary, MapConstruction::DenseRadix] {
         for count in [1_u32, 2, 17] {
@@ -573,23 +546,29 @@ fn borrowed_builder_bytes_match_owned_node_encoding_and_identity() {
             )
             .unwrap();
             let mut kinds = BTreeSet::new();
-            map.prove_root_into(&Identity, PhysicalMapDomain::Placement, |id, bytes| {
-                let live = &map.nodes()[&id];
-                kinds.insert(match live {
-                    PhysicalMapNode::Leaf { .. } => "leaf",
-                    PhysicalMapNode::Branch { .. } => "branch",
-                    PhysicalMapNode::Page { .. } => "page",
-                    PhysicalMapNode::Radix { .. } => "radix",
-                });
-                assert_eq!(
-                    bytes,
-                    live.encode().unwrap().as_slice(),
-                    "{construction:?} count={count}"
-                );
-                assert_eq!(live.identify(&Identity).unwrap(), id);
-                assert_eq!(PhysicalMapNode::decode(bytes).unwrap(), *live);
-                Ok::<_, PhysicalModelError>(())
-            })
+            encode_live_root_into(
+                PhysicalMapDomain::Placement,
+                map.root(),
+                map.nodes(),
+                map.entry_count(),
+                |id, bytes| {
+                    let live = &map.nodes()[&id];
+                    kinds.insert(match live {
+                        PhysicalMapNode::Leaf { .. } => "leaf",
+                        PhysicalMapNode::Branch { .. } => "branch",
+                        PhysicalMapNode::Page { .. } => "page",
+                        PhysicalMapNode::Radix { .. } => "radix",
+                    });
+                    assert_eq!(
+                        bytes,
+                        live.encode().unwrap().as_slice(),
+                        "{construction:?} count={count}"
+                    );
+                    assert_eq!(live.identify(&Identity).unwrap(), id);
+                    assert_eq!(PhysicalMapNode::decode(bytes).unwrap(), *live);
+                    Ok::<_, PhysicalModelError>(())
+                },
+            )
             .unwrap();
             match construction {
                 MapConstruction::LegacyBinary if count == 1 => assert!(kinds.contains("leaf")),
@@ -602,7 +581,7 @@ fn borrowed_builder_bytes_match_owned_node_encoding_and_identity() {
 }
 
 #[test]
-fn borrowed_canonical_proof_allocates_one_canonical_encoding_per_generated_node() {
+fn encode_live_allocates_one_owned_encoding_per_visited_node() {
     for construction in [MapConstruction::LegacyBinary, MapConstruction::DenseRadix] {
         for count in [1_u32, 2, 17, 257] {
             let entries = (0..count)
@@ -620,18 +599,22 @@ fn borrowed_canonical_proof_allocates_one_canonical_encoding_per_generated_node(
                 construction,
             )
             .unwrap();
-            // MAP_NODE_ENCODINGS counts allocated Vec encodings only.
-            // `matches_encoded` still walks encoder fields and is not counted.
+            // encode_live_root_into is the automatic-seal emitter: one owned
+            // encoding per visited live node, no rebuild/identify storm.
             let (result, encodings) = PhysicalMapNode::count_encodings_during(|| {
-                map.prove_root_into(&Identity, PhysicalMapDomain::Placement, |_, _| {
-                    Ok::<_, PhysicalModelError>(())
-                })
+                encode_live_root_into(
+                    PhysicalMapDomain::Placement,
+                    map.root(),
+                    map.nodes(),
+                    map.entry_count(),
+                    |_, _| Ok::<_, PhysicalModelError>(()),
+                )
             });
             let proof = result.unwrap();
             assert_eq!(
                 encodings,
                 proof.visited().len(),
-                "allocated canonical encodings {construction:?} count={count}"
+                "allocated live encodings {construction:?} count={count}"
             );
         }
     }
@@ -705,32 +688,5 @@ fn proof_sink_matches_encoded_bytes_without_retaining() {
                 "physical map-node identity collision"
             ))
         );
-
-        let emitted = core::cell::Cell::new(0_usize);
-        let mut streaming = StreamingValidationNodes {
-            nodes: map.nodes(),
-            generated: BTreeSet::new(),
-            emit: |emit_id: PhysicalMapNodeId,
-                   emit_bytes: &[u8]|
-             -> Result<(), PhysicalModelError> {
-                assert_eq!(emit_id, id);
-                assert_eq!(emit_bytes, bytes.as_slice());
-                emitted.set(emitted.get().strict_add(1));
-                Ok::<_, PhysicalModelError>(())
-            },
-        };
-        streaming
-            .put_encoded(id, &bytes, || {
-                panic!("proof sink must not retain owned nodes")
-            })
-            .unwrap();
-        assert_eq!(emitted.get(), 1);
-        assert_eq!(
-            streaming.put(id, &bytes, map.nodes()[&id].clone()),
-            Err(PhysicalModelError::InvalidMap(
-                "canonical builder repeated a generated node"
-            ))
-        );
-        assert_eq!(emitted.get(), 1);
     }
 }

@@ -5,9 +5,7 @@ use super::{
     MetadataFrame, MetadataKind, RecoveryLimits, map_node_id,
 };
 use crate::engine::durable::format::FrameLocation;
-use crate::storage_model::{
-    CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapNode, PhysicalMapNodeId,
-};
+use crate::storage_model::{PhysicalMapDomain, PhysicalMapNode, PhysicalMapNodeId};
 
 mod graph;
 pub(super) use graph::{HistoricalMapClosure, HistoricalMapGraph};
@@ -22,17 +20,17 @@ pub(in crate::engine::durable::representations) struct MetadataIndex {
 
 #[cfg(test)]
 thread_local! {
-    static RECOVER_ACTIVE_MAP_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static RECOVER_ACTIVE_NODES_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
-pub(in crate::engine::durable::representations) fn reset_recover_active_map_calls() {
-    RECOVER_ACTIVE_MAP_CALLS.with(|calls| calls.set(0));
+pub(in crate::engine::durable::representations) fn reset_recover_active_nodes_calls() {
+    RECOVER_ACTIVE_NODES_CALLS.with(|calls| calls.set(0));
 }
 
 #[cfg(test)]
-pub(in crate::engine::durable::representations) fn recover_active_map_calls() -> u64 {
-    RECOVER_ACTIVE_MAP_CALLS.with(std::cell::Cell::get)
+pub(in crate::engine::durable::representations) fn recover_active_nodes_calls() -> u64 {
+    RECOVER_ACTIVE_NODES_CALLS.with(std::cell::Cell::get)
 }
 
 impl MetadataIndex {
@@ -105,17 +103,21 @@ impl MetadataIndex {
             ))
     }
 
+    /// Extract the exact active closure as untrusted node bytes.
+    ///
+    /// Domain authentication happens at the typed `recover_exact` boundary so
+    /// this helper stays a lean traversal over already-indexed links.
     #[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all, fields(domain = ?domain, input_nodes = self.nodes.len(), active_nodes = tracing::field::Empty))]
-    pub(in crate::engine::durable::representations) fn recover_active_map<F: DurableIo>(
+    pub(in crate::engine::durable::representations) fn recover_active_nodes<F: DurableIo>(
         &mut self,
         domain: PhysicalMapDomain,
         root: Option<PhysicalMapNodeId>,
         source: &F,
         limits: RecoveryLimits,
-    ) -> Result<CanonicalPhysicalMap, DurableError> {
+    ) -> Result<BTreeMap<PhysicalMapNodeId, PhysicalMapNode>, DurableError> {
         #[cfg(test)]
         {
-            RECOVER_ACTIVE_MAP_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+            RECOVER_ACTIVE_NODES_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
         }
         let mut nodes = BTreeMap::new();
         let mut pending: Vec<_> = root.into_iter().collect();
@@ -163,15 +165,7 @@ impl MetadataIndex {
         if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {
             tracing::Span::current().record("active_nodes", nodes.len());
         }
-        // The indexed traversal already extracted exactly this active closure.
-        // Transfer its ownership directly; canonical recovery still validates
-        // identities, domains and shape, including cycles and shared children.
-        Ok(CanonicalPhysicalMap::recover(
-            &Blake3PhysicalIdentity,
-            domain,
-            root,
-            nodes,
-        )?)
+        Ok(nodes)
     }
 
     #[cfg(test)]

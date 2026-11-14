@@ -33,7 +33,7 @@ mod index;
 use index::HistoricalMapClosure;
 pub(super) use index::MetadataIndex;
 #[cfg(test)]
-pub(super) use index::{recover_active_map_calls, reset_recover_active_map_calls};
+pub(super) use index::{recover_active_nodes_calls, reset_recover_active_nodes_calls};
 
 #[tracing::instrument(name = "recover_metadata", target = "astrid_storage::recovery", level = "debug", skip_all,
     fields(map_nodes = tracing::field::Empty, authority_records = tracing::field::Empty,

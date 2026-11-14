@@ -619,3 +619,292 @@ async fn old_staging_facade_is_closed_after_successful_handoff() {
     drop(finalization);
     drop(store);
 }
+
+async fn seed_system_kv_for_handoff(store: &crate::principal_state::RuntimePrincipalStore) {
+    store
+        .kv()
+        .set("system:retirement", "memo-seed", b"system-kv".to_vec())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn system_validation_memos_rebind_across_handoff_without_cold_walk() {
+    let parent = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(parent.path().join("runtime"));
+    let store = open_runtime_principal_store(&home, quota()).await.unwrap();
+    seed_system_kv_for_handoff(&store).await;
+    let name = ContentName::new("capsules/memo-warm.wasm").unwrap();
+    store
+        .content()
+        .put(&StateOwner::System, &name, b"warm-system")
+        .unwrap();
+    store.publish_runtime_projection(&home).unwrap();
+    assert_eq!(
+        store.content().read(&StateOwner::System, &name).unwrap(),
+        Some(b"warm-system".to_vec())
+    );
+    assert!(
+        store
+            .content()
+            .cached_catalog_owners_for_test()
+            .contains(&StateOwner::System),
+        "pre-handoff content path must publish a System catalog memo"
+    );
+    assert!(
+        store
+            .content()
+            .validated_kv_cache()
+            .cached_owners_for_test()
+            .contains(&StateOwner::System),
+        "pre-handoff content path must publish a System KV projection memo"
+    );
+
+    let old_kv = store.kv();
+    let old_content = store.content();
+    let finalization = store.handoff_for_finalization(&home).unwrap();
+    let transferred = finalization.store_for_test();
+    let content = transferred.content();
+
+    assert_eq!(
+        content.cached_catalog_owners_for_test(),
+        vec![StateOwner::System]
+    );
+    assert_eq!(
+        content.validated_kv_cache().cached_owners_for_test(),
+        vec![StateOwner::System]
+    );
+    assert_eq!(content.catalog_validation_invocations(), 0);
+    assert_eq!(content.kv_tree_validation_invocations(), 0);
+
+    assert_eq!(
+        content.read(&StateOwner::System, &name).unwrap(),
+        Some(b"warm-system".to_vec())
+    );
+    assert_eq!(
+        content.catalog_validation_invocations(),
+        0,
+        "seeded System catalog memo must avoid cold validate_catalog"
+    );
+    assert_eq!(
+        content.kv_tree_validation_invocations(),
+        0,
+        "seeded System KV projection memo must avoid cold validate_tree"
+    );
+    assert!(
+        old_kv
+            .set("system:retirement", "forbidden", b"x".to_vec())
+            .await
+            .is_err(),
+        "old kv facade stays revoked"
+    );
+    assert!(
+        old_content
+            .put(&StateOwner::System, &name, b"forbidden")
+            .is_err(),
+        "old content facade stays revoked"
+    );
+    drop(finalization);
+}
+
+#[tokio::test]
+async fn handoff_seeds_only_system_and_rejects_stale_catalog_memo() {
+    let parent = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(parent.path().join("runtime"));
+    let store = open_runtime_principal_store(&home, quota()).await.unwrap();
+    let name = ContentName::new("capsules/memo-stale.wasm").unwrap();
+    store
+        .content()
+        .put(&StateOwner::System, &name, b"system-bytes")
+        .unwrap();
+    store.publish_runtime_projection(&home).unwrap();
+    assert!(
+        store
+            .content()
+            .read(&StateOwner::System, &name)
+            .unwrap()
+            .is_some()
+    );
+
+    let foreign = StateOwner::Principal(crate::PrincipalUid::from_bytes([0x51; 32]));
+    store
+        .content()
+        .validated_kv_cache()
+        .insert_empty_owner_for_test(foreign);
+    store
+        .content()
+        .insert_catalog_unchecked_for_test(foreign, crate::content::CatalogValidation::default());
+    // Corrupt the live System catalog memo so rebind must refuse it.
+    let warm = store
+        .content()
+        .snapshot_catalog_owner(&StateOwner::System)
+        .expect("System catalog memo");
+    let mut stale = warm;
+    stale.summary.entries = stale.summary.entries.saturating_add(99);
+    store
+        .content()
+        .insert_catalog_unchecked_for_test(StateOwner::System, stale);
+
+    let finalization = store.handoff_for_finalization(&home).unwrap();
+    let content = finalization.store_for_test().content();
+    assert!(
+        !content.cached_catalog_owners_for_test().contains(&foreign),
+        "foreign owners must not cross handoff"
+    );
+    assert!(
+        !content
+            .validated_kv_cache()
+            .cached_owners_for_test()
+            .contains(&foreign),
+        "foreign KV memos must not cross handoff"
+    );
+    assert!(
+        !content
+            .cached_catalog_owners_for_test()
+            .contains(&StateOwner::System),
+        "stale System catalog memo must not rebind"
+    );
+
+    assert_eq!(content.catalog_validation_invocations(), 0);
+    assert_eq!(
+        content.read(&StateOwner::System, &name).unwrap(),
+        Some(b"system-bytes".to_vec())
+    );
+    assert_eq!(
+        content.catalog_validation_invocations(),
+        1,
+        "missing/stale System catalog memo must cold-validate once"
+    );
+    drop(finalization);
+}
+
+#[tokio::test]
+async fn seeded_catalog_memo_with_forged_totals_is_rejected() {
+    let parent = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(parent.path().join("runtime"));
+    let store = open_runtime_principal_store(&home, quota()).await.unwrap();
+    let name = ContentName::new("capsules/memo-forged.wasm").unwrap();
+    store
+        .content()
+        .put(&StateOwner::System, &name, b"exact")
+        .unwrap();
+    store.publish_runtime_projection(&home).unwrap();
+    assert!(
+        store
+            .content()
+            .read(&StateOwner::System, &name)
+            .unwrap()
+            .is_some()
+    );
+
+    let finalization = store.handoff_for_finalization(&home).unwrap();
+    let content = finalization.store_for_test().content();
+    let memo = content
+        .snapshot_catalog_owner(&StateOwner::System)
+        .expect("System catalog memo must rebind");
+    let mut forged = memo;
+    forged.summary.quota_bytes = forged.summary.quota_bytes.saturating_add(1);
+    content.insert_catalog_unchecked_for_test(StateOwner::System, forged);
+
+    let err = content
+        .read(&StateOwner::System, &name)
+        .expect_err("forged catalog totals must not be trusted");
+    assert!(
+        err.to_string()
+            .contains("content catalog validation totals disagree")
+            || err.to_string().contains("totals disagree"),
+        "{err}"
+    );
+    drop(finalization);
+}
+
+#[tokio::test]
+async fn missing_tree_certificate_keeps_kv_memo_cold_across_handoff() {
+    let parent = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(parent.path().join("runtime"));
+    let store = open_runtime_principal_store(&home, quota()).await.unwrap();
+    seed_system_kv_for_handoff(&store).await;
+    let name = ContentName::new("capsules/memo-missing-tree.wasm").unwrap();
+    store
+        .content()
+        .put(&StateOwner::System, &name, b"needs-tree")
+        .unwrap();
+    store.publish_runtime_projection(&home).unwrap();
+    assert!(
+        store
+            .content()
+            .read(&StateOwner::System, &name)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .content()
+            .validated_kv_cache()
+            .cached_owners_for_test()
+            .contains(&StateOwner::System)
+    );
+
+    // Projection without a matching tree certificate must not rebind.
+    store
+        .content()
+        .validated_kv_cache()
+        .clear_tree_validation_for_test(&StateOwner::System);
+
+    let finalization = store.handoff_for_finalization(&home).unwrap();
+    let content = finalization.store_for_test().content();
+    assert!(
+        !content
+            .validated_kv_cache()
+            .cached_owners_for_test()
+            .contains(&StateOwner::System),
+        "projection-only System memo must remain cold without a tree certificate"
+    );
+    assert_eq!(content.kv_tree_validation_invocations(), 0);
+    assert_eq!(
+        content.read(&StateOwner::System, &name).unwrap(),
+        Some(b"needs-tree".to_vec())
+    );
+    assert!(
+        content.kv_tree_validation_invocations() >= 1,
+        "cold path must validate_tree when the tree certificate was not rebound"
+    );
+    drop(finalization);
+}
+
+#[tokio::test]
+async fn stale_kv_projection_keeps_transferred_system_owner_cold() {
+    let parent = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(parent.path().join("runtime"));
+    let store = open_runtime_principal_store(&home, quota()).await.unwrap();
+    seed_system_kv_for_handoff(&store).await;
+    let name = ContentName::new("capsules/memo-stale-kv.wasm").unwrap();
+    store
+        .content()
+        .put(&StateOwner::System, &name, b"live-system")
+        .unwrap();
+    store.publish_runtime_projection(&home).unwrap();
+
+    // An empty projection has a valid empty-tree certificate, but its head
+    // predates the live System KV component created by projection publication.
+    store
+        .content()
+        .validated_kv_cache()
+        .insert_empty_owner_for_test(StateOwner::System);
+
+    let finalization = store.handoff_for_finalization(&home).unwrap();
+    let content = finalization.store_for_test().content();
+    assert!(
+        !content
+            .validated_kv_cache()
+            .cached_owners_for_test()
+            .contains(&StateOwner::System),
+        "a matching tree certificate cannot authorize a stale KV head"
+    );
+    assert_eq!(
+        content.read(&StateOwner::System, &name).unwrap(),
+        Some(b"live-system".to_vec())
+    );
+    assert!(content.kv_tree_validation_invocations() > 0);
+    drop(finalization);
+}

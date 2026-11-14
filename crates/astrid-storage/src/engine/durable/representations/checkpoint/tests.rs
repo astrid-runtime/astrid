@@ -217,9 +217,9 @@ fn recovered_maps_retain_only_their_active_closures() {
     assert_eq!(recovered.active, active);
     assert_eq!(recovered.reverse, reverse);
     for map in [
-        &recovered.profiles,
-        &recovered.representations,
-        &recovered.placement_entries,
+        recovered.profiles.as_canonical(),
+        recovered.representations.as_canonical(),
+        recovered.placement_entries.as_canonical(),
     ] {
         assert_eq!(map.entry_count(), 1);
         assert_eq!(map.nodes().len(), 1, "retain only this root's active page");

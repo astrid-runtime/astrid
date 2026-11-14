@@ -31,9 +31,9 @@ fn assert_first_walk_reuses_recovered_closure(mut store: RepresentationStore) {
     let mut metadata = Vec::new();
     let mut appended = BTreeSet::new();
     for map in [
-        &store.representations,
-        &store.placement_entries,
-        &store.profiles,
+        store.representations.as_canonical(),
+        store.placement_entries.as_canonical(),
+        store.profiles.as_canonical(),
     ] {
         let visited = append_new_reachable_map_nodes(
             &mut metadata,

@@ -49,7 +49,7 @@ pub use scoped::ScopedKvStore;
 pub use surreal::SurrealKvStore;
 pub(crate) use tree::{
     CertifiedValueMembership, KvCheckpointPublication, KvValidationCache, RetiredKvProjection,
-    migrate_legacy_avl, validated_projection_quota,
+    migrate_legacy_avl, seed_owner_memo_if_live, validated_projection_quota,
 };
 pub use tree::{KvReadCacheBudget, KvReadCacheCapacity, KvReadCacheConfig, TreeKvStore};
 

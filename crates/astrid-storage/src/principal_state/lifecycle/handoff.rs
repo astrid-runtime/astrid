@@ -2,7 +2,8 @@
 
 use super::{PendingRuntimeFinalization, RuntimeFinalization};
 use crate::principal_state::{
-    NativePrincipalContentStore, RuntimePrincipalStore, RuntimeStore, StateOwnerResolver,
+    NativePrincipalContentStore, RuntimePrincipalStore, RuntimeStore, StateOwner,
+    StateOwnerResolver,
 };
 use crate::{StorageError, StorageResult};
 use astrid_core::dirs::AstridHome;
@@ -59,8 +60,12 @@ impl RuntimePrincipalStore {
             token.commit();
         }
         // Keep the live quota policy while creating fresh projections: old
-        // handles and their validation/read caches cannot cross the handoff.
+        // handles and their mutable caches cannot cross the handoff. System
+        // validation memos may be rebound into new containers against the live
+        // transferred root; agent overlays and disposable caches stay cold.
         let quota = Arc::clone(&self.quota);
+        let source_kv = self.runtime_kv.validation_cache();
+        let source_catalogs = self.content.validated_catalogs();
         let catalogs = Arc::new(Mutex::new(BTreeMap::new()));
         let kv_validation = Arc::new(crate::kv::KvValidationCache::default());
         let runtime_kv = Arc::new(
@@ -81,6 +86,21 @@ impl RuntimePrincipalStore {
                 catalogs,
                 kv_validation,
             ),
+        );
+        // Best-effort System memo rebind into the fresh containers. Misses stay
+        // cold; optional cache failure must not affect transferred custody.
+        let system_kv_memo_rebound = crate::kv::seed_owner_memo_if_live(
+            engine.as_ref(),
+            source_kv.as_ref(),
+            runtime_kv.validation_cache(),
+            StateOwner::System,
+        );
+        let system_catalog_memo_rebound =
+            content.seed_catalog_owner_from(source_catalogs.as_ref(), StateOwner::System);
+        tracing::debug!(
+            system_kv_memo_rebound,
+            system_catalog_memo_rebound,
+            "Rebound finalization validation memos"
         );
         let store = Self {
             quota: Arc::clone(&quota),

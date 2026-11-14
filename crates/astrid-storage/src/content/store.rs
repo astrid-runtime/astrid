@@ -36,7 +36,7 @@ use crate::principal_graph::{LEGACY_PRINCIPAL_GRAPH_VERSION, PRINCIPAL_GRAPH_VER
 
 const KV_COMPONENT_LABEL: &[u8] = b"kv";
 const PARENT_LABEL: &[u8] = b"parent";
-const STATE_LABEL: &[u8] = b"state";
+pub(super) const STATE_LABEL: &[u8] = b"state";
 // Native content transfer target, shared by batched writers and restoration.
 // Coalesces verified I/O while keeping transfer memory independent of file size.
 // This is a soft I/O batch size, not a retention, record, or deployment limit.
@@ -82,6 +82,8 @@ pub struct PrincipalContentStore<P: Ord, E> {
     prefix_exists_invocations: AtomicU64,
     #[cfg(test)]
     decode_header_invocations: AtomicU64,
+    #[cfg(test)]
+    catalog_validation_invocations: AtomicU64,
 }
 
 impl<P: Ord, E> fmt::Debug for PrincipalContentStore<P, E> {
@@ -969,6 +971,7 @@ where
 mod append;
 mod bulk;
 mod constructors;
+mod handoff;
 mod internals;
 mod native;
 mod pending_catalog;

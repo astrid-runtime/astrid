@@ -19,7 +19,9 @@ mod legacy;
 mod radix;
 mod rebuild;
 mod residency;
+mod typed;
 mod validation;
+pub(crate) use typed::{PlacementMap, ProfileMap, RepresentationMap};
 use validation::CanonicalNodeSink;
 pub(crate) use validation::CanonicalRootProof;
 
@@ -29,12 +31,17 @@ mod decode_tests;
 mod lookup_tests;
 #[cfg(test)]
 mod rebuild_tests;
+#[cfg(test)]
+mod typed_tests;
 
 #[cfg(test)]
 std::thread_local! {
     // Count allocated (Vec-producing) node-body encodings only.
     // `matches_encoded` is a separate borrowed encoder walk and is not counted.
     static MAP_NODE_ENCODINGS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    // Count map-node identity minting (rebuild/validate/encode_and_identify).
+    // Automatic seal encode-live must not increment this after typed birth.
+    static MAP_NODE_IDENTIFIES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 const LEGACY_MAP_NODE_VERSION: u16 = 1;
@@ -375,6 +382,8 @@ impl PhysicalMapNode {
     ) -> Result<(Vec<u8>, PhysicalMapNodeId), PhysicalModelError> {
         let bytes = self.encode()?;
         let id = PhysicalMapNodeId::new(identity.identify(self.identity_context(), &bytes));
+        #[cfg(test)]
+        MAP_NODE_IDENTIFIES.with(|count| count.set(count.get().strict_add(1)));
         Ok((bytes, id))
     }
 
@@ -392,6 +401,20 @@ impl PhysicalMapNode {
         let _scope = EncodingCountScope(MAP_NODE_ENCODINGS.with(|count| count.replace(0)));
         let value = operation();
         (value, MAP_NODE_ENCODINGS.with(core::cell::Cell::get))
+    }
+
+    /// Count map-node identity minting produced during `operation`.
+    #[cfg(test)]
+    pub(crate) fn count_identifies_during<T>(operation: impl FnOnce() -> T) -> (T, usize) {
+        struct IdentifyCountScope(usize);
+        impl Drop for IdentifyCountScope {
+            fn drop(&mut self) {
+                MAP_NODE_IDENTIFIES.with(|count| count.set(self.0.strict_add(count.get())));
+            }
+        }
+        let _scope = IdentifyCountScope(MAP_NODE_IDENTIFIES.with(|count| count.replace(0)));
+        let value = operation();
+        (value, MAP_NODE_IDENTIFIES.with(core::cell::Cell::get))
     }
 
     /// Authenticate the original bytes after decode proves their canonical form.
@@ -541,24 +564,6 @@ impl CanonicalPhysicalMap {
         Ok(proof)
     }
 
-    /// Prove the complete active map while forwarding each generated encoding.
-    /// Callback writes must remain private until independent media verification.
-    pub(crate) fn prove_root_into<I: PhysicalIdentity, E: From<PhysicalModelError>>(
-        &self,
-        identity: &I,
-        domain: PhysicalMapDomain,
-        emit: impl FnMut(PhysicalMapNodeId, &[u8]) -> Result<(), E>,
-    ) -> Result<CanonicalRootProof<'_>, E> {
-        validation::prove_root_into(
-            identity,
-            domain,
-            self.root,
-            &self.nodes,
-            self.entry_count,
-            emit,
-        )
-    }
-
     /// Recover one active map, retaining every node supplied by the caller.
     ///
     /// A caller that needs only the active view should supply its reachable
@@ -619,8 +624,11 @@ impl CanonicalPhysicalMap {
                     PhysicalMapNode::page(self.domain, vec![(key, value)])?
                 },
             };
-            let id = node.identify(identity)?;
-            self.nodes.insert(id, node);
+            // Empty-root birth must honor the same identity/collision fence as
+            // path-copy inserts: unequal historical bodies under one id reject,
+            // equal historical bodies may reactivate without overwrite.
+            let (bytes, id) = node.encode_and_identify(identity)?;
+            self.nodes.put(id, &bytes, node)?;
             (id, true)
         };
         if inserted {
@@ -739,6 +747,8 @@ where
     R: FnOnce() -> Result<PhysicalMapNode, PhysicalModelError>,
 {
     let id = PhysicalMapNodeId::new(identity.identify(context, bytes));
+    #[cfg(test)]
+    MAP_NODE_IDENTIFIES.with(|count| count.set(count.get().strict_add(1)));
     nodes.put_encoded(id, bytes, retain)?;
     Ok(id)
 }

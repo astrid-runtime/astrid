@@ -46,9 +46,15 @@ fn published_updates_bound_resident_history_and_recover_every_entry() {
         assert!(store.complete_map_subtrees.len() <= all_resident);
         prior_nodes = resident;
         for (map, baseline) in [
-            (&store.profiles, store.residency.profiles),
-            (&store.representations, store.residency.representations),
-            (&store.placement_entries, store.residency.placements),
+            (store.profiles.as_canonical(), store.residency.profiles),
+            (
+                store.representations.as_canonical(),
+                store.residency.representations,
+            ),
+            (
+                store.placement_entries.as_canonical(),
+                store.residency.placements,
+            ),
         ] {
             assert!(map.nodes().len() <= baseline.saturating_mul(2));
         }
@@ -332,7 +338,7 @@ fn collection_retains_complete_live_closures_and_skips_their_next_append_walk() 
         // append traversal establish their complete durable-closure proofs.
         append_new_reachable_map_nodes(
             &mut metadata,
-            &store.representations,
+            store.representations.as_canonical(),
             &mut store.persisted_map_nodes,
             &mut appended,
             &mut store.complete_map_subtrees,
@@ -359,7 +365,7 @@ fn collection_retains_complete_live_closures_and_skips_their_next_append_walk() 
             assert!(store.complete_map_subtrees.len() <= resident);
             let warm = append_new_reachable_map_nodes(
                 &mut metadata,
-                &store.representations,
+                store.representations.as_canonical(),
                 &mut store.persisted_map_nodes,
                 &mut appended,
                 &mut store.complete_map_subtrees,
@@ -372,7 +378,7 @@ fn collection_retains_complete_live_closures_and_skips_their_next_append_walk() 
                 .collect();
             let cold = append_new_reachable_map_nodes(
                 &mut metadata,
-                &store.representations,
+                store.representations.as_canonical(),
                 &mut cold_durable,
                 &mut appended,
                 &mut BTreeSet::new(),

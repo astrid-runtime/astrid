@@ -1,8 +1,9 @@
 //! Construction and publication of the first physical authority generation.
 
+use crate::storage_model::physical::{PlacementMap, ProfileMap, RepresentationMap};
 use crate::storage_model::{
-    CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode,
-    PlacementEntry, PlacementSet, Recipe, ReconstructionBounds, Replica, ReplicaLocator,
+    CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapKey, PhysicalMapNode, PlacementEntry,
+    PlacementSet, Recipe, ReconstructionBounds, Replica, ReplicaLocator,
     RepresentationCatalogueRoot, RepresentationProfile, RepresentationRecord, RepresentationState,
 };
 use std::collections::BTreeSet;
@@ -22,11 +23,10 @@ pub(super) fn build_initial_state(
     let identity = Blake3PhysicalIdentity;
     let (profile, direct_profile) = direct_profile(frozen_specification)?;
     let mut metadata = Vec::new();
-    let profiles = CanonicalPhysicalMap::build_dense(
-        &identity,
-        PhysicalMapDomain::Profile,
-        vec![(PhysicalMapKey::from(direct_profile), profile.encode()?)],
-    )?;
+    let profiles = ProfileMap::build_dense(vec![(
+        PhysicalMapKey::from(direct_profile),
+        profile.encode()?,
+    )])?;
     append_map_nodes(&mut metadata, profiles.nodes())?;
     let mut representation_entries = Vec::new();
     let mut placement_entries = Vec::new();
@@ -60,17 +60,9 @@ pub(super) fn build_initial_state(
         )?;
         placement_entries.push((PhysicalMapKey::from(object.blob), placement.encode()?));
     }
-    let representations = CanonicalPhysicalMap::build_dense(
-        &identity,
-        PhysicalMapDomain::Representation,
-        representation_entries,
-    )?;
+    let representations = RepresentationMap::build_dense(representation_entries)?;
     append_map_nodes(&mut metadata, representations.nodes())?;
-    let placements = CanonicalPhysicalMap::build_dense(
-        &identity,
-        PhysicalMapDomain::Placement,
-        placement_entries,
-    )?;
+    let placements = PlacementMap::build_dense(placement_entries)?;
     append_map_nodes(&mut metadata, placements.nodes())?;
     let catalogue = RepresentationCatalogueRoot::new(
         1,

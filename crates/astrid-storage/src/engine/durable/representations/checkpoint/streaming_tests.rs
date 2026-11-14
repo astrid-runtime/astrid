@@ -6,9 +6,10 @@ use super::super::{
     ArenaLocation, Blake3PhysicalIdentity, ObjectId, RepresentationStore, generation_name,
 };
 use super::adoption_tests::{SyncFailOnceVolume, next_generation_files, primed_volume};
+use crate::storage_model::physical::{ProfileMap, RepresentationMap};
 use crate::storage_model::{
-    CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode,
-    RepresentationCatalogueRoot, RepresentationState,
+    PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode, RepresentationCatalogueRoot,
+    RepresentationState,
 };
 use crate::volume::{AstridVolume, VolumeRegion};
 
@@ -52,24 +53,16 @@ fn production_checkpoint_encoding_slope_is_one_per_node_and_cold_emit_is_unchang
             })
             .collect();
         store.rebase_all_direct(&objects).unwrap();
-        let entries = super::super::recovery::active_entries(&store.representations)
+        let entries = super::super::recovery::active_entries(store.representations.as_canonical())
             .unwrap()
             .into_iter()
             .map(|(key, value)| (key, value.to_vec()))
             .collect();
         let (rebuilt, build_encodes) = PhysicalMapNode::count_encodings_during(|| {
             if dense {
-                CanonicalPhysicalMap::build_dense(
-                    &Blake3PhysicalIdentity,
-                    PhysicalMapDomain::Representation,
-                    entries,
-                )
+                RepresentationMap::build_dense(entries)
             } else {
-                CanonicalPhysicalMap::build(
-                    &Blake3PhysicalIdentity,
-                    PhysicalMapDomain::Representation,
-                    entries,
-                )
+                RepresentationMap::build(entries)
             }
             .unwrap()
         });
@@ -81,14 +74,12 @@ fn production_checkpoint_encoding_slope_is_one_per_node_and_cold_emit_is_unchang
         store.representations = rebuilt;
         bind_tip(&mut store);
         // Capture the actual live size before the production checkpoint flushes.
-        let nodes: usize = [
-            &store.profiles,
-            &store.representations,
-            &store.placement_entries,
-        ]
-        .iter()
-        .map(|map| map.nodes().len())
-        .sum();
+        let nodes = store
+            .profiles
+            .nodes()
+            .len()
+            .strict_add(store.representations.nodes().len())
+            .strict_add(store.placement_entries.nodes().len());
         let (result, automatic) =
             PhysicalMapNode::count_encodings_during(|| store.checkpoint_volume(&volume, limits));
         result.unwrap();
@@ -124,23 +115,34 @@ fn production_checkpoint_encoding_slope_is_one_per_node_and_cold_emit_is_unchang
 }
 
 fn install_invalid_second_map(store: &mut RepresentationStore) {
-    // A frame larger than the stream buffer forces actual private I/O in
-    // the first map before the second map's proof can reject its domain.
-    store.profiles = CanonicalPhysicalMap::build_dense(
-        &Blake3PhysicalIdentity,
-        PhysicalMapDomain::Profile,
-        vec![(
-            PhysicalMapKey::new([13; 32]),
-            vec![1; super::super::super::format::TRANSFER_BUFFER_BYTES.strict_mul(2)],
-        )],
-    )
+    // A frame larger than the stream buffer forces actual private I/O in the
+    // first map before the second map's live walk rejects a wrong-domain node.
+    // Typed slots make cross-domain assignment unconstructible, so corrupt an
+    // active representation node in place after legitimate birth.
+    store.profiles = ProfileMap::build_dense(vec![(
+        PhysicalMapKey::new([13; 32]),
+        vec![1; super::super::super::format::TRANSFER_BUFFER_BYTES.strict_mul(2)],
+    )])
     .unwrap();
-    store.representations = CanonicalPhysicalMap::build_dense(
-        &Blake3PhysicalIdentity,
-        PhysicalMapDomain::Placement,
-        vec![(PhysicalMapKey::new([14; 32]), vec![2])],
-    )
-    .unwrap();
+    store.representations =
+        RepresentationMap::build_dense(vec![(PhysicalMapKey::new([14; 32]), vec![2])]).unwrap();
+    let (id, node) = store.representations.nodes().iter().next().unwrap();
+    let id = *id;
+    let mut forged = node.clone();
+    match &mut forged {
+        PhysicalMapNode::Leaf { domain, .. }
+        | PhysicalMapNode::Branch { domain, .. }
+        | PhysicalMapNode::Page { domain, .. }
+        | PhysicalMapNode::Radix { domain, .. } => {
+            *domain = PhysicalMapDomain::Placement;
+        },
+    }
+    assert!(
+        store
+            .representations
+            .replace_arena_node_for_fault(id, forged),
+        "fault injection must replace the active node under test"
+    );
     bind_tip(store);
 }
 
@@ -230,4 +232,54 @@ fn private_proof_failure_or_write_failure_leaves_old_authority_and_retry_cleans_
         assert_eq!(reopened.active, active);
         assert_eq!(reopened.journal_generation, generation + 1);
     }
+}
+
+#[test]
+fn automatic_checkpoint_skips_map_identify_rebuild_after_typed_birth() {
+    use super::super::activation::visit_new_reachable_map_nodes;
+    use std::collections::BTreeSet;
+
+    let (_directory, volume, mut store, limits) = primed_volume();
+    let mut live_nodes = 0usize;
+    for map in [
+        store.profiles.as_canonical(),
+        store.representations.as_canonical(),
+        store.placement_entries.as_canonical(),
+    ] {
+        live_nodes = live_nodes.strict_add(
+            visit_new_reachable_map_nodes(
+                map,
+                &mut BTreeSet::new(),
+                &mut BTreeSet::new(),
+                &mut BTreeSet::new(),
+                |_| Ok(()),
+            )
+            .unwrap(),
+        );
+    }
+    assert!(live_nodes > 0);
+
+    // Old prove_root_into / MetadataFrame::map_node seal minted one identify per
+    // live node while encoding. encode_live_into must perform zero identifies;
+    // cold prove_root still rebuilds/identifies the full tip.
+    let (result, identifies) =
+        PhysicalMapNode::count_identifies_during(|| store.checkpoint_volume(&volume, limits));
+    result.unwrap();
+    assert_eq!(
+        identifies, 0,
+        "automatic seal must not re-identify/rebuild authenticated live maps"
+    );
+
+    let (cold, cold_identifies) = PhysicalMapNode::count_identifies_during(|| {
+        store
+            .profiles
+            .prove_root()
+            .and_then(|_| store.representations.prove_root())
+            .and_then(|_| store.placement_entries.prove_root())
+    });
+    cold.unwrap();
+    assert_eq!(
+        cold_identifies, live_nodes,
+        "cold/independent proof must still identify every live node"
+    );
 }

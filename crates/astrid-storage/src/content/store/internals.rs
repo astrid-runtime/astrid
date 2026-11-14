@@ -90,6 +90,9 @@ where
                     let validation = if let Some(validation) = cached {
                         validation
                     } else {
+                        #[cfg(test)]
+                        self.catalog_validation_invocations
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let validation = validate_catalog(Some(root), &mut |object| {
                             self.load_required_for(principal, object)
                         })?;

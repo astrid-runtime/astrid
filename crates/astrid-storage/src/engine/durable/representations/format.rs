@@ -302,24 +302,7 @@ impl JournalEntry {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(in crate::engine::durable) struct Blake3PhysicalIdentity;
-
-impl PhysicalIdentity for Blake3PhysicalIdentity {
-    fn identify(&self, context: &'static str, material: &[u8]) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new_derive_key(context);
-        hasher.update(material);
-        *hasher.finalize().as_bytes()
-    }
-
-    fn identify_parts(&self, context: &'static str, parts: &[&[u8]]) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new_derive_key(context);
-        for part in parts {
-            hasher.update(part);
-        }
-        *hasher.finalize().as_bytes()
-    }
-}
+pub(in crate::engine::durable) use crate::storage_model::physical::Blake3PhysicalIdentity;
 
 /// Frozen BLAKE3 derive-key context for raw representation journal bytes.
 pub(super) const JOURNAL_BYTES_DIGEST_CONTEXT: &str = "astrid-representation-journal-bytes-v1\0";

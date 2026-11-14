@@ -29,6 +29,7 @@ use crate::principal_graph::PRINCIPAL_GRAPH_VERSION;
 mod adapter;
 mod context;
 mod delta;
+mod handoff;
 mod header;
 mod hot_cache;
 #[cfg(test)]
@@ -43,6 +44,7 @@ mod publication;
 mod retirement_tests;
 mod validation;
 
+pub(crate) use self::handoff::seed_owner_memo_if_live;
 pub(crate) use self::header::validated_projection_quota;
 pub use self::hot_cache::{KvReadCacheBudget, KvReadCacheCapacity, KvReadCacheConfig};
 pub(crate) use self::legacy_avl::migrate_principal as migrate_legacy_avl;
@@ -63,6 +65,8 @@ const CHECKPOINT_MIN_DELTA_BYTES: u64 = 4 * 1024 * 1024;
 pub(crate) struct KvValidationCache<P: Ord> {
     trees: Mutex<BTreeMap<P, TreeValidation>>,
     projections: Mutex<BTreeMap<P, Projection>>,
+    #[cfg(test)]
+    tree_validation_invocations: std::sync::atomic::AtomicU64,
 }
 
 impl<P: Ord> Default for KvValidationCache<P> {
@@ -70,6 +74,8 @@ impl<P: Ord> Default for KvValidationCache<P> {
         Self {
             trees: Mutex::new(BTreeMap::new()),
             projections: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            tree_validation_invocations: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -203,6 +209,11 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
             hot_cache: None,
             marker: PhantomData,
         }
+    }
+
+    /// Shared owner validation memos used by KV and content projections.
+    pub(crate) fn validation_cache(&self) -> &Arc<KvValidationCache<P>> {
+        &self.validation
     }
 
     fn blocking_store(&self) -> BlockingTreeStore<P, E> {

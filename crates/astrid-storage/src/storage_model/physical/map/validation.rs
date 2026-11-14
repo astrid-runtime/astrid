@@ -101,16 +101,18 @@ pub(super) fn prove_root<'a, I: PhysicalIdentity>(
     Ok(proof)
 }
 
-/// Stream canonical bytes only after their corresponding live body matches.
-/// Partial callback effects are private; this function grants no publication right.
-pub(super) fn prove_root_into<'a, I: PhysicalIdentity, E: From<PhysicalModelError>>(
-    identity: &I,
+/// Emit already-authenticated live bodies after an active-closure walk.
+///
+/// Typed maps use this for automatic sealing so the writer critical section does
+/// not rebuild the unique trie or re-identify every node. Cold recovery and
+/// compaction retain independent [`prove_root`] / reconstructing consumers.
+pub(super) fn encode_live_root_into<E: From<PhysicalModelError>>(
     domain: PhysicalMapDomain,
     root: Option<PhysicalMapNodeId>,
-    nodes: &'a BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    nodes: &BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
     expected_count: u64,
-    emit: impl FnMut(PhysicalMapNodeId, &[u8]) -> Result<(), E>,
-) -> Result<CanonicalRootProof<'a>, E> {
+    mut emit: impl FnMut(PhysicalMapNodeId, &[u8]) -> Result<(), E>,
+) -> Result<CanonicalRootProof<'_>, E> {
     let proof = walk_root(domain, root, nodes)?;
     if u64::try_from(proof.entries.len()).map_err(|_| PhysicalModelError::LengthOverflow)?
         != expected_count
@@ -120,17 +122,17 @@ pub(super) fn prove_root_into<'a, I: PhysicalIdentity, E: From<PhysicalModelErro
         )
         .into());
     }
-    let mut sink = StreamingValidationNodes {
-        nodes,
-        generated: BTreeSet::new(),
-        emit,
-    };
-    validate_canonical_root(identity, domain, root, nodes, &proof.entries, &mut sink)?;
-    ensure_generated_matches_walk(&sink.generated, &proof.visited)?;
+    for id in &proof.visited {
+        let node = nodes
+            .get(id)
+            .ok_or(PhysicalModelError::InvalidMap("missing map node"))?;
+        let bytes = node.encode()?;
+        emit(*id, &bytes)?;
+    }
     Ok(proof)
 }
 
-fn walk_root(
+pub(super) fn walk_root(
     domain: PhysicalMapDomain,
     root: Option<PhysicalMapNodeId>,
     nodes: &BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
@@ -200,60 +202,6 @@ fn validate_canonical_root<I: PhysicalIdentity, N: CanonicalNodeSink>(
         );
     }
     Ok(())
-}
-
-fn ensure_generated_matches_walk(
-    generated: &BTreeSet<PhysicalMapNodeId>,
-    walked: &BTreeSet<PhysicalMapNodeId>,
-) -> Result<(), PhysicalModelError> {
-    if generated != walked {
-        return Err(PhysicalModelError::InvalidMap(
-            "canonical generated nodes disagree with walked closure",
-        ));
-    }
-    Ok(())
-}
-
-struct StreamingValidationNodes<'a, F> {
-    nodes: &'a BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
-    generated: BTreeSet<PhysicalMapNodeId>,
-    emit: F,
-}
-
-impl<E: From<PhysicalModelError>, F: FnMut(PhysicalMapNodeId, &[u8]) -> Result<(), E>>
-    CanonicalNodeSink for StreamingValidationNodes<'_, F>
-{
-    type Error = E;
-
-    fn put(
-        &mut self,
-        id: PhysicalMapNodeId,
-        canonical_bytes: &[u8],
-        node: PhysicalMapNode,
-    ) -> Result<(), E> {
-        self.put_encoded(id, canonical_bytes, || Ok(node))
-    }
-
-    fn put_encoded<R>(
-        &mut self,
-        id: PhysicalMapNodeId,
-        canonical_bytes: &[u8],
-        _retain: R,
-    ) -> Result<(), E>
-    where
-        R: FnOnce() -> Result<PhysicalMapNode, PhysicalModelError>,
-    {
-        // Body equality precedes every callback, including IDs already emitted
-        // from another map. An identity alone cannot authorize deduplication.
-        check_live_encoded(self.nodes, id, canonical_bytes)?;
-        if !self.generated.insert(id) {
-            return Err(PhysicalModelError::InvalidMap(
-                "canonical builder repeated a generated node",
-            )
-            .into());
-        }
-        (self.emit)(id, canonical_bytes)
-    }
 }
 
 /// Each production-built node is hashed, then must exist under that identity

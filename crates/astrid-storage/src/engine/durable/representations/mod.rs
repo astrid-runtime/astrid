@@ -3,12 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use crate::storage_model::physical::{PlacementMap, ProfileMap, RepresentationMap};
 use crate::storage_model::{
-    CanonicalPhysicalMap, Coverage, Dependency, ObjectId, PhysicalMapDomain, PhysicalMapKey,
-    PlacementEntry, PlacementSet, ProfileDependency, Recipe, Replica, ReplicaLocator,
-    RepresentationCatalogueRoot, RepresentationProfile, RepresentationProfileId,
-    RepresentationRecord, RepresentationRecordId, RepresentationState, RepresentationStateId,
-    StorageNodeId,
+    Coverage, Dependency, ObjectId, PhysicalMapDomain, PhysicalMapKey, PlacementEntry,
+    PlacementSet, ProfileDependency, Recipe, Replica, ReplicaLocator, RepresentationCatalogueRoot,
+    RepresentationProfile, RepresentationProfileId, RepresentationRecord, RepresentationRecordId,
+    RepresentationState, RepresentationStateId, StorageNodeId,
 };
 
 use super::File as DurableFile;
@@ -108,9 +108,9 @@ pub(super) struct RepresentationStore {
     catalogue: RepresentationCatalogueRoot,
     placements: PlacementSet,
     residency: residency::MapResidency,
-    profiles: CanonicalPhysicalMap,
-    representations: CanonicalPhysicalMap,
-    placement_entries: CanonicalPhysicalMap,
+    profiles: ProfileMap,
+    representations: RepresentationMap,
+    placement_entries: PlacementMap,
     // Persisted frames without a memoized descendant closure. These IDs are
     // disjoint from complete_map_subtrees; neither set retains evicted nodes.
     persisted_map_nodes: BTreeSet<crate::storage_model::PhysicalMapNodeId>,
@@ -328,7 +328,7 @@ impl RepresentationStore {
 
     pub(super) fn logical_liveness_roots(&self) -> Result<BTreeSet<ObjectId>, DurableError> {
         let mut roots = BTreeSet::new();
-        for (_, bytes) in recovery::active_entries(&self.profiles)? {
+        for (_, bytes) in recovery::active_entries(self.profiles.as_canonical())? {
             let profile = RepresentationProfile::decode(bytes)?;
             roots.extend(
                 profile
@@ -340,7 +340,7 @@ impl RepresentationStore {
                     }),
             );
         }
-        for (_, bytes) in recovery::active_entries(&self.representations)? {
+        for (_, bytes) in recovery::active_entries(self.representations.as_canonical())? {
             let record = RepresentationRecord::decode(bytes)?;
             roots.extend(
                 record
@@ -394,7 +394,11 @@ impl RepresentationStore {
         &self,
         excluded: &BTreeSet<ObjectId>,
     ) -> Result<(), DurableError> {
-        recovery::ensure_no_excluded_object_coverage(&self.representations, &self.reverse, excluded)
+        recovery::ensure_no_excluded_object_coverage(
+            self.representations.as_canonical(),
+            &self.reverse,
+            excluded,
+        )
     }
 
     pub(super) fn contains_direct(&self, object: ObjectId) -> bool {
@@ -447,20 +451,18 @@ impl RepresentationStore {
             .collect::<Vec<_>>();
         if rebuild_representations {
             self.representations
-                .rebuild_with_entries(&Blake3PhysicalIdentity, representation_entries)?;
+                .rebuild_with_entries(representation_entries)?;
         } else {
             for (key, value) in representation_entries {
-                self.representations
-                    .insert(&Blake3PhysicalIdentity, key, value)?;
+                self.representations.insert(key, value)?;
             }
         }
         if rebuild_placements {
             self.placement_entries
-                .rebuild_with_entries(&Blake3PhysicalIdentity, placement_entries)?;
+                .rebuild_with_entries(placement_entries)?;
         } else {
             for (key, value) in placement_entries {
-                self.placement_entries
-                    .insert(&Blake3PhysicalIdentity, key, value)?;
+                self.placement_entries.insert(key, value)?;
             }
         }
         let reverse_additions = entries
@@ -470,14 +472,14 @@ impl RepresentationStore {
         let mut appended_map_nodes = BTreeSet::new();
         append_new_reachable_map_nodes(
             &mut metadata,
-            &self.representations,
+            self.representations.as_canonical(),
             &mut self.persisted_map_nodes,
             &mut appended_map_nodes,
             &mut self.complete_map_subtrees,
         )?;
         append_new_reachable_map_nodes(
             &mut metadata,
-            &self.placement_entries,
+            self.placement_entries.as_canonical(),
             &mut self.persisted_map_nodes,
             &mut appended_map_nodes,
             &mut self.complete_map_subtrees,
@@ -540,20 +542,12 @@ impl RepresentationStore {
             .iter()
             .map(|entry| entry.placement.clone())
             .collect();
-        self.representations = CanonicalPhysicalMap::build_dense(
-            &Blake3PhysicalIdentity,
-            PhysicalMapDomain::Representation,
-            representation_entries,
-        )?;
-        self.placement_entries = CanonicalPhysicalMap::build_dense(
-            &Blake3PhysicalIdentity,
-            PhysicalMapDomain::Placement,
-            placement_entries,
-        )?;
+        self.representations = RepresentationMap::build_dense(representation_entries)?;
+        self.placement_entries = PlacementMap::build_dense(placement_entries)?;
         self.residency = residency::MapResidency::new(
-            &self.profiles,
-            &self.representations,
-            &self.placement_entries,
+            self.profiles.as_canonical(),
+            self.representations.as_canonical(),
+            self.placement_entries.as_canonical(),
         );
         let replacement_reverse = entries
             .into_iter()
@@ -562,7 +556,10 @@ impl RepresentationStore {
 
         let mut metadata = Vec::new();
         let mut appended_map_nodes = BTreeSet::new();
-        for map in [&self.representations, &self.placement_entries] {
+        for map in [
+            self.representations.as_canonical(),
+            self.placement_entries.as_canonical(),
+        ] {
             append_new_reachable_map_nodes(
                 &mut metadata,
                 map,
@@ -814,23 +811,32 @@ impl RepresentationStore {
         let placements = PlacementSet::decode(
             index.value(MetadataKind::Placement, state.placements().as_bytes())?,
         )?;
-        let profiles = index.recover_active_map(
-            PhysicalMapDomain::Profile,
+        let profiles = ProfileMap::recover_exact(
             catalogue.profiles_root(),
-            &metadata,
-            limits,
+            index.recover_active_nodes(
+                PhysicalMapDomain::Profile,
+                catalogue.profiles_root(),
+                &metadata,
+                limits,
+            )?,
         )?;
-        let representations = index.recover_active_map(
-            PhysicalMapDomain::Representation,
+        let representations = RepresentationMap::recover_exact(
             catalogue.representations_root(),
-            &metadata,
-            limits,
+            index.recover_active_nodes(
+                PhysicalMapDomain::Representation,
+                catalogue.representations_root(),
+                &metadata,
+                limits,
+            )?,
         )?;
-        let placement_entries = index.recover_active_map(
-            PhysicalMapDomain::Placement,
+        let placement_entries = PlacementMap::recover_exact(
             placements.entries_root(),
-            &metadata,
-            limits,
+            index.recover_active_nodes(
+                PhysicalMapDomain::Placement,
+                placements.entries_root(),
+                &metadata,
+                limits,
+            )?,
         )?;
         let map_frame_count = index.map_frame_count;
         // Active closures now own their nodes. Release unused historical links
@@ -850,21 +856,28 @@ impl RepresentationStore {
         // Seed closure proofs from those authenticated active nodes without a
         // duplicate ID set or another first-write traversal. Evicted nodes can
         // be appended again with their canonical IDs.
-        let complete_map_subtrees = [&profiles, &representations, &placement_entries]
-            .into_iter()
-            .flat_map(|map| map.nodes().keys().copied())
-            .collect();
-        let residency =
-            residency::MapResidency::new(&profiles, &representations, &placement_entries);
-        let direct_profile = validate_profiles(&profiles)?;
+        let complete_map_subtrees = [
+            profiles.as_canonical(),
+            representations.as_canonical(),
+            placement_entries.as_canonical(),
+        ]
+        .into_iter()
+        .flat_map(|map| map.nodes().keys().copied())
+        .collect();
+        let residency = residency::MapResidency::new(
+            profiles.as_canonical(),
+            representations.as_canonical(),
+            placement_entries.as_canonical(),
+        );
+        let direct_profile = validate_profiles(profiles.as_canonical())?;
         let recovery::ValidatedRepresentations {
             reverse,
             extent_count,
             generation_zero,
         } = validate_representations::<COLLECT_PLACEMENTS>(
-            &profiles,
-            &representations,
-            &placement_entries,
+            profiles.as_canonical(),
+            representations.as_canonical(),
+            placement_entries.as_canonical(),
             direct_profile,
         )?;
         if extent_count != placements.replica_extent_count() {
