@@ -1,6 +1,49 @@
 use super::*;
 
 #[test]
+fn authenticated_map_publication_matches_independent_hashing_for_every_node_kind() {
+    use crate::storage_model::PhysicalMapKey;
+    use crate::storage_model::physical::{PlacementMap, ProfileMap, RepresentationMap};
+
+    let entries: Vec<_> = (0_u8..32)
+        .map(|index| (PhysicalMapKey::new([index; 32]), vec![index; 128]))
+        .collect();
+    let profiles = ProfileMap::build_dense(entries.clone()).unwrap();
+    let legacy = RepresentationMap::build(entries.clone()).unwrap();
+    let representations = RepresentationMap::build_dense(entries.clone()).unwrap();
+    let placements = PlacementMap::build_dense(entries).unwrap();
+    let maps: [&dyn AuthenticatedPhysicalMap; 4] =
+        [&profiles, &legacy, &representations, &placements];
+    let mut variants = [false; 4];
+    for map in maps {
+        for (id, node) in map.as_canonical().nodes() {
+            let (result, identifies) = PhysicalMapNode::count_identifies_during(|| {
+                MetadataFrame::authenticated_map_node(map, *id)
+            });
+            let frame = result.unwrap();
+            assert_eq!(identifies, 0);
+            let independently_hashed =
+                MetadataFrame::map_node(&Blake3PhysicalIdentity, node).unwrap();
+            assert_eq!(
+                frame.encode().unwrap(),
+                independently_hashed.encode().unwrap()
+            );
+            frame.verify(&Blake3PhysicalIdentity).unwrap();
+            let mut wrong_identity = frame;
+            wrong_identity.identity[0] ^= 1;
+            assert!(wrong_identity.verify(&Blake3PhysicalIdentity).is_err());
+            variants[match node {
+                PhysicalMapNode::Leaf { .. } => 0,
+                PhysicalMapNode::Branch { .. } => 1,
+                PhysicalMapNode::Page { .. } => 2,
+                PhysicalMapNode::Radix { .. } => 3,
+            }] = true;
+        }
+    }
+    assert_eq!(variants, [true; 4]);
+}
+
+#[test]
 fn map_node_metadata_encodes_the_identified_payload_once() {
     use crate::storage_model::{CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapKey};
 

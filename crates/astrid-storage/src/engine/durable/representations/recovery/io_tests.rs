@@ -80,7 +80,7 @@ fn append_active_map(
         &mut BTreeSet::new(),
         &mut BTreeSet::new(),
         &mut BTreeSet::new(),
-        |node| {
+        |_, node| {
             let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?;
             let location = super::super::append_frame(file, METADATA_MAGIC, &frame.encode()?)?;
             active_bytes =

@@ -30,8 +30,8 @@ pub use identity::{
     RepresentationProfileId, RepresentationRecordId, RepresentationStateId,
 };
 pub(crate) use map::CanonicalRootProof;
+pub(crate) use map::{AuthenticatedPhysicalMap, PlacementMap, ProfileMap, RepresentationMap};
 pub use map::{CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode};
-pub(crate) use map::{PlacementMap, ProfileMap, RepresentationMap};
 pub use placement::{PlacementEntry, PlacementSet, Replica, ReplicaLocator};
 pub(crate) use profile::IdentifiedProfile;
 #[cfg(test)]

@@ -281,7 +281,7 @@ impl LiveTipRefs<'_> {
                     &mut durable,
                     &mut appended,
                     &mut complete,
-                    |node| {
+                    |_, node| {
                         let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?;
                         stream.append_payload(&frame.encode()?)
                     },

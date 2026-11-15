@@ -1,6 +1,8 @@
 //! Construction and publication of the first physical authority generation.
 
-use crate::storage_model::physical::{PlacementMap, ProfileMap, RepresentationMap};
+use crate::storage_model::physical::{
+    AuthenticatedPhysicalMap, PlacementMap, ProfileMap, RepresentationMap,
+};
 use crate::storage_model::{
     CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapKey, PhysicalMapNode, PlacementEntry,
     PlacementSet, Recipe, ReconstructionBounds, Replica, ReplicaLocator,
@@ -131,7 +133,10 @@ pub(super) fn visit_new_reachable_map_nodes(
     durable: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
-    mut emit: impl FnMut(&PhysicalMapNode) -> Result<(), DurableError>,
+    mut emit: impl FnMut(
+        crate::storage_model::PhysicalMapNodeId,
+        &PhysicalMapNode,
+    ) -> Result<(), DurableError>,
 ) -> Result<usize, DurableError> {
     let Some(root) = map.root() else {
         return Ok(0);
@@ -167,7 +172,7 @@ pub(super) fn visit_new_reachable_map_nodes(
                 durable.contains(&id)
             };
             if !persisted && !appended.contains(&id) {
-                emit(node)?;
+                emit(id, node)?;
                 appended.insert(id);
             }
             continue;
@@ -201,6 +206,20 @@ pub(super) fn visit_new_reachable_map_nodes(
     Ok(map.nodes().len().strict_sub(remaining))
 }
 
+pub(super) fn append_authenticated_map_nodes(
+    metadata: &mut Vec<MetadataFrame>,
+    map: &(impl AuthenticatedPhysicalMap + ?Sized),
+    durable: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+) -> Result<usize, DurableError> {
+    visit_new_reachable_map_nodes(map.as_canonical(), durable, appended, complete, |id, _| {
+        metadata.push(MetadataFrame::authenticated_map_node(map, id)?);
+        Ok(())
+    })
+}
+
+#[cfg(test)]
 pub(super) fn append_new_reachable_map_nodes(
     metadata: &mut Vec<MetadataFrame>,
     map: &CanonicalPhysicalMap,
@@ -208,7 +227,7 @@ pub(super) fn append_new_reachable_map_nodes(
     appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
 ) -> Result<usize, DurableError> {
-    visit_new_reachable_map_nodes(map, durable, appended, complete, |node| {
+    visit_new_reachable_map_nodes(map, durable, appended, complete, |_, node| {
         metadata.push(MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?);
         Ok(())
     })
@@ -288,7 +307,7 @@ mod tests {
             &mut BTreeSet::new(),
             &mut BTreeSet::new(),
             &mut BTreeSet::new(),
-            |_| {
+            |_, _| {
                 emitted += 1;
                 Ok(())
             },

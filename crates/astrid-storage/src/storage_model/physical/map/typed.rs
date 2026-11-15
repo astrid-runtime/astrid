@@ -17,6 +17,16 @@ use super::{
     PhysicalMapNodeId,
 };
 
+mod sealed {
+    pub(crate) trait Sealed {}
+}
+
+/// Read-only publication authority for the three fixed-domain native maps.
+/// Generic maps with an injected identity cannot implement this sealed trait.
+pub(crate) trait AuthenticatedPhysicalMap: sealed::Sealed {
+    fn as_canonical(&self) -> &CanonicalPhysicalMap;
+}
+
 fn recover_exact_inner(
     domain: PhysicalMapDomain,
     root: Option<PhysicalMapNodeId>,
@@ -44,6 +54,14 @@ fn recover_exact_inner(
 
 macro_rules! typed_map_views {
     ($name:ident, $domain:expr) => {
+        impl sealed::Sealed for $name {}
+
+        impl AuthenticatedPhysicalMap for $name {
+            fn as_canonical(&self) -> &CanonicalPhysicalMap {
+                &self.inner
+            }
+        }
+
         impl $name {
             const DOMAIN: PhysicalMapDomain = $domain;
 

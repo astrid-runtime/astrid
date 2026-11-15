@@ -41,7 +41,9 @@ pub(super) use index_validation::count_extractions_during;
 mod recovery;
 mod residency;
 
-use activation::{append_new_reachable_map_nodes, build_initial_state, generation_name};
+#[cfg(test)]
+use activation::append_new_reachable_map_nodes;
+use activation::{append_authenticated_map_nodes, build_initial_state, generation_name};
 use recovery::{
     MetadataIndex, read_current_file, recover_journal, recover_metadata, validate_profiles,
     validate_representations,

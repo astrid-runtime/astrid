@@ -3,11 +3,11 @@
 use super::super::{
     ArenaLocation, Blake3PhysicalIdentity, DirectArenaObject, DurableError, FRAME_HEADER_LEN,
     JOURNAL_MAGIC, JournalEntry, LOCAL_STORAGE_NODE, METADATA_MAGIC, MetadataFrame,
-    PendingRepresentationUpdate, RepresentationStore, append_frame, append_frames,
-    append_new_reachable_map_nodes, bulk_rebuild_is_cheaper, increment, residency,
+    PendingRepresentationUpdate, RepresentationStore, append_authenticated_map_nodes, append_frame,
+    append_frames, bulk_rebuild_is_cheaper, increment, residency,
 };
 use crate::engine::durable::format::{DurableFrameRange, DurablePrefixEnd};
-use crate::storage_model::physical::{PlacementMap, RepresentationMap};
+use crate::storage_model::physical::{AuthenticatedPhysicalMap, PlacementMap, RepresentationMap};
 use crate::storage_model::{
     Coverage, ObjectId, PhysicalMapKey, PhysicalMapNodeId, PlacementEntry, PlacementSet, Recipe,
     Replica, ReplicaLocator, RepresentationCatalogueRoot, RepresentationProfile,
@@ -113,16 +113,16 @@ impl RepresentationStore {
             .map(|entry| (entry.object, entry.representation_id))
             .collect();
         let mut appended_map_nodes = BTreeSet::new();
-        append_new_reachable_map_nodes(
+        append_authenticated_map_nodes(
             &mut metadata,
-            self.representations.as_canonical(),
+            &self.representations,
             &mut self.persisted_map_nodes,
             &mut appended_map_nodes,
             &mut self.complete_map_subtrees,
         )?;
-        append_new_reachable_map_nodes(
+        append_authenticated_map_nodes(
             &mut metadata,
-            self.placement_entries.as_canonical(),
+            &self.placement_entries,
             &mut self.persisted_map_nodes,
             &mut appended_map_nodes,
             &mut self.complete_map_subtrees,
@@ -204,10 +204,10 @@ impl RepresentationStore {
         let mut metadata = Vec::new();
         let mut appended_map_nodes = BTreeSet::new();
         for map in [
-            self.representations.as_canonical(),
-            self.placement_entries.as_canonical(),
+            &self.representations as &dyn AuthenticatedPhysicalMap,
+            &self.placement_entries,
         ] {
-            append_new_reachable_map_nodes(
+            append_authenticated_map_nodes(
                 &mut metadata,
                 map,
                 &mut self.persisted_map_nodes,

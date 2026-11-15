@@ -259,7 +259,7 @@ fn automatic_checkpoint_skips_map_identify_rebuild_after_typed_birth() {
                 &mut BTreeSet::new(),
                 &mut BTreeSet::new(),
                 &mut BTreeSet::new(),
-                |_| Ok(()),
+                |_, _| Ok(()),
             )
             .unwrap(),
         );

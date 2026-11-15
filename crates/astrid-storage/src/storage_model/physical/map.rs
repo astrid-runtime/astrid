@@ -21,7 +21,7 @@ mod rebuild;
 mod residency;
 mod typed;
 mod validation;
-pub(crate) use typed::{PlacementMap, ProfileMap, RepresentationMap};
+pub(crate) use typed::{AuthenticatedPhysicalMap, PlacementMap, ProfileMap, RepresentationMap};
 use validation::CanonicalNodeSink;
 pub(crate) use validation::CanonicalRootProof;
 

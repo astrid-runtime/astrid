@@ -25,6 +25,38 @@ fn bytes(file: &mut DurableFile) -> Vec<u8> {
 }
 
 #[test]
+fn direct_publication_reuses_authenticated_node_identities() {
+    use crate::storage_model::PhysicalMapNode;
+
+    let directory = tempfile::tempdir().unwrap();
+    let volume: Arc<dyn AstridVolume> =
+        HostedFileVolume::open(directory.path().join("direct.volume")).unwrap();
+    let mut store = empty_store(&volume);
+    let direct = store
+        .describe_direct(
+            ObjectId::new([42; 32]),
+            &[42; 16],
+            ArenaLocation {
+                offset: 42,
+                payload_len: 16,
+                checksum: [42; 32],
+            },
+        )
+        .unwrap();
+    let ((result, encodings), identifies) = PhysicalMapNode::count_identifies_during(|| {
+        PhysicalMapNode::count_encodings_during(|| store.append_direct_update_observed(&[direct]))
+    });
+    let (update, evidence) = result.unwrap().unwrap();
+    assert!(!evidence.appended_map_nodes.is_empty());
+    assert_eq!(
+        encodings,
+        identifies + evidence.appended_map_nodes.len(),
+        "publication encodes each admitted node without minting its identity again"
+    );
+    store.publish_direct_update(update).unwrap();
+}
+
+#[test]
 fn observed_and_ordinary_direct_updates_emit_identical_metadata_and_journal() {
     let directory = tempfile::tempdir().unwrap();
     let normal_volume: Arc<dyn AstridVolume> =

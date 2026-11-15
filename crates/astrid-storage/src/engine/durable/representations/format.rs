@@ -7,6 +7,7 @@ use crate::storage_model::{
 };
 
 use super::super::DurableError;
+use crate::storage_model::physical::AuthenticatedPhysicalMap;
 
 pub(super) const METADATA_MAGIC: [u8; 8] = *b"ASTRPM1\0";
 pub(super) const JOURNAL_MAGIC: [u8; 8] = *b"ASTREP1\0";
@@ -69,6 +70,26 @@ pub(super) struct MetadataFrame<V = Vec<u8>> {
 }
 
 impl MetadataFrame {
+    pub(super) fn authenticated_map_node(
+        map: &(impl AuthenticatedPhysicalMap + ?Sized),
+        id: PhysicalMapNodeId,
+    ) -> Result<Self, DurableError> {
+        // Fixed-identity construction/recovery proved this immutable binding.
+        // Keep the map authority in the signature; generic maps must rehash.
+        let node =
+            map.as_canonical()
+                .nodes()
+                .get(&id)
+                .ok_or(DurableError::InvalidRepresentationState(
+                    "authenticated map is missing a requested node",
+                ))?;
+        Ok(Self::new(
+            MetadataKind::MapNode,
+            *id.as_bytes(),
+            node.encode()?,
+        ))
+    }
+
     #[cfg(test)]
     pub(super) fn profile<I: PhysicalIdentity>(
         identity: &I,
