@@ -511,7 +511,7 @@ fn expected_unit_byte(index: u64) -> u8 {
     u8::try_from(index % 251).unwrap()
 }
 
-/// Force an explicit `Paged` publication for an still-encodable map.
+/// Force an explicit `Paged` publication for a still-encodable map.
 ///
 /// Restored inline selection keeps moderate maps on `Legacy` through ordinary
 /// sync; these fixtures call `prepare_checkpoint` then `sync` so Paged cold

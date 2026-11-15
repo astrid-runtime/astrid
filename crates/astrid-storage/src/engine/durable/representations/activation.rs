@@ -136,16 +136,12 @@ pub(super) fn visit_new_reachable_map_nodes(
     let Some(root) = map.root() else {
         return Ok(0);
     };
-    let mut pending = vec![(root, false)];
+    // The map is immutable throughout this walk. Retain the body for the
+    // postorder visit rather than looking it up in the arena a second time.
+    let mut pending = vec![(root, None::<&PhysicalMapNode>)];
     let mut visited = BTreeSet::new();
-    while let Some((id, expanded)) = pending.pop() {
-        if expanded {
-            let node = map
-                .nodes()
-                .get(&id)
-                .ok_or(DurableError::InvalidRepresentationState(
-                    "active physical map is missing a reachable node",
-                ))?;
+    while let Some((id, body)) = pending.pop() {
+        if let Some(node) = body {
             // A persisted parent alone does not establish durable descendants.
             // Move checked IDs into the complete-closure partition so the two
             // disposable memos never retain duplicate IDs.
@@ -158,11 +154,15 @@ pub(super) fn visit_new_reachable_map_nodes(
                 },
                 PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => true,
             };
-            let persisted = durable.contains(&id);
-            if persisted && children_complete {
-                durable.remove(&id);
-                complete.insert(id);
-            }
+            let persisted = if children_complete {
+                let persisted = durable.remove(&id);
+                if persisted {
+                    complete.insert(id);
+                }
+                persisted
+            } else {
+                durable.contains(&id)
+            };
             if !persisted && !appended.contains(&id) {
                 emit(node)?;
                 appended.insert(id);
@@ -178,14 +178,14 @@ pub(super) fn visit_new_reachable_map_nodes(
             .ok_or(DurableError::InvalidRepresentationState(
                 "active physical map is missing a reachable node",
             ))?;
-        pending.push((id, true));
+        pending.push((id, Some(node)));
         match node {
             PhysicalMapNode::Branch { zero, one, .. } => {
-                pending.push((*one, false));
-                pending.push((*zero, false));
+                pending.push((*one, None));
+                pending.push((*zero, None));
             },
             PhysicalMapNode::Radix { children, .. } => {
-                pending.extend(children.iter().rev().map(|child| (*child, false)));
+                pending.extend(children.iter().rev().map(|child| (*child, None)));
             },
             PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => {},
         }
