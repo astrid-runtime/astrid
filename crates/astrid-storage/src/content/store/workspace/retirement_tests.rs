@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use super::test_support::fixture;
 use super::{
     ContentName, FilesystemPath, MAX_WORKSPACE_BRANCHES, WorkspaceBindingLifecycle,
@@ -35,7 +37,7 @@ fn retirement_preserves_an_extension_label_matching_the_bare_branch_uid() {
     next.preserved_state.push(extension.clone());
     let transaction = branches
         .content
-        .encode_transaction(owner, next, None, Default::default())
+        .encode_transaction(owner, next, None, BTreeMap::new())
         .unwrap();
     engine.commit_root(transaction).unwrap();
 
