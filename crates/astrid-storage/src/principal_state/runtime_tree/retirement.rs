@@ -280,11 +280,9 @@ impl PreparedRetirement<'_> {
     pub(super) fn retire(self) -> StorageResult<()> {
         #[cfg(any(unix, windows))]
         {
-            let started = std::time::Instant::now();
             self.prepared.retire(&self.volume).map_err(|error| {
                 tree_error(self.home.root(), format!("retire projection: {error}"))
             })?;
-            tracing::debug!(elapsed = ?started.elapsed(), "deleted and synchronized runtime projection");
         }
         // Keep the receipt if the public binding changed, including after the
         // core's final survivor and root durability checks.

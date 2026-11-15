@@ -545,9 +545,9 @@ pub(super) fn pack_and_retire_projection(
         token.commit();
     }
     prepared.retire()?;
-    let started = std::time::Instant::now();
+    // No subscriber dispatch after retirement: a file-backed logger could
+    // recreate the host projection we just removed.
     active::clear(store, home)?;
-    tracing::debug!(elapsed = ?started.elapsed(), "cleared retired projection receipt");
     Ok(())
 }
 

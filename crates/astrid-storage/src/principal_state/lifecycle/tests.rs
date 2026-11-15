@@ -1,6 +1,55 @@
 use super::*;
 use crate::{ContentName, open_runtime_principal_store};
 
+struct RecreatingLogSubscriber(std::path::PathBuf);
+
+impl tracing::Subscriber for RecreatingLogSubscriber {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target().starts_with("astrid_storage::")
+            && *metadata.level() == tracing::Level::DEBUG
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        if self.enabled(event.metadata()) {
+            std::fs::create_dir_all(self.0.parent().unwrap()).unwrap();
+            std::fs::write(&self.0, b"subscriber wrote a log\n").unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn retained_finalizer_diagnostics_do_not_recreate_retired_logs() {
+    let (_parent, home, lifecycle, store) = retained_fixture().await;
+    let token = store.handoff_for_finalization(&home).unwrap();
+    let log = home.root().join("log/finalizer.log");
+    tracing::subscriber::with_default(RecreatingLogSubscriber(log.clone()), || {
+        tracing::debug!(
+            target: "astrid_storage::principal_state::lifecycle",
+            "verify the subscriber really materializes a log"
+        );
+        assert!(log.is_file());
+        assert!(tracing::enabled!(
+            target: "astrid_storage::principal_state::lifecycle",
+            tracing::Level::DEBUG
+        ));
+        lifecycle.finish_retained(token).unwrap();
+    });
+    let names = std::fs::read_dir(home.root())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["astrid.volume"]);
+}
+
 #[tokio::test]
 async fn finalizer_fences_replacement_and_is_idempotent() {
     let parent = tempfile::tempdir().unwrap();

@@ -6,11 +6,26 @@ pub(in crate::principal_state) mod staging;
 use std::fs::File;
 use std::io;
 use std::sync::Arc;
+use std::time::Instant;
 
 use astrid_core::dirs::AstridHome;
 
 use super::{StateOwner, native_io, open_runtime_principal_store_for_pack};
 use crate::{KvQuotaResolver, StorageError, StorageResult};
+
+fn report_finalization_phase(started: Option<Instant>, phase: &'static str, success: Option<bool>) {
+    let Some(started) = started else {
+        return;
+    };
+    use std::io::Write as _;
+    // Tracing can recreate the retired log tree. Only use the existing stderr
+    // descriptor here, and never let diagnostic I/O failure interrupt close.
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "retained finalization phase={phase} elapsed_ns={} success={success:?}",
+        started.elapsed().as_nanos()
+    );
+}
 
 /// Fence a runtime from before boot until its host projection is retired.
 ///
@@ -225,7 +240,10 @@ impl RuntimeLifecycleGuard {
     /// Failures before retirement preserve host files. Later errors retain
     /// the durable volume and any surviving projection for recovery.
     pub fn finish_retained(self, mut finalization: RuntimeFinalization) -> StorageResult<()> {
-        tracing::debug!(phase = "pack.begin", "Retained runtime finalization");
+        // Capture the filter before packing; do not dispatch through a tracing
+        // subscriber after the log projection has been retired.
+        let diagnostic = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
+        report_finalization_phase(diagnostic, "pack.begin", None);
         // Keep shutdown-error aggregation: do not `?` past require_volume_binding.
         let packed = match finalization.store.require_volume_binding(&self.home) {
             Err(error) => Err(error),
@@ -233,24 +251,16 @@ impl RuntimeLifecycleGuard {
                 .store
                 .pack_and_retire_runtime_projection(&self.home),
         };
-        tracing::debug!(
-            phase = "pack.done",
-            success = packed.is_ok(),
-            "Retained runtime finalization"
-        );
-        tracing::debug!(phase = "close.begin", "Retained runtime finalization");
+        report_finalization_phase(diagnostic, "pack.done", Some(packed.is_ok()));
+        report_finalization_phase(diagnostic, "close.begin", None);
         let closed = finalization.store.engine.close().map_err(|error| {
             StorageError::Connection(format!("close finalized runtime volume: {error}"))
         });
-        tracing::debug!(
-            phase = "close.done",
-            success = closed.is_ok(),
-            "Retained runtime finalization"
-        );
+        report_finalization_phase(diagnostic, "close.done", Some(closed.is_ok()));
         let shutdown_error = finalization.shutdown_error.take();
-        tracing::debug!(phase = "drop.begin", "Retained runtime finalization");
+        report_finalization_phase(diagnostic, "drop.begin", None);
         drop(finalization);
-        tracing::debug!(phase = "drop.done", "Retained runtime finalization");
+        report_finalization_phase(diagnostic, "drop.done", None);
         let finalized = match (packed, closed) {
             (Err(pack), Err(close)) => Err(StorageError::Connection(format!(
                 "{pack}; additionally failed to close retained storage: {close}"
