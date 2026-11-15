@@ -21,6 +21,8 @@ use super::{FORMAT_VERSION, KV_LABEL, PARENT_LABEL, STATE_LABEL};
 use crate::error::{StorageError, StorageResult};
 use crate::kv::tree_error::{invalid, map_engine};
 
+mod checkpoint;
+mod range;
 pub(super) mod value;
 
 // A comparison and its mutation share one immutable header per CAS attempt.
@@ -195,6 +197,11 @@ where
             ));
         }
 
+        let leaves = self.pack_leaf_entries(entries)?;
+        self.build_leaf_level(leaves)
+    }
+
+    fn pack_leaf_entries(&mut self, entries: Vec<LeafEntry>) -> StorageResult<Vec<NodeHandle>> {
         let mut leaves = Vec::new();
         let mut current = Vec::new();
         for entry in entries {
@@ -212,6 +219,13 @@ where
             leaves.push(self.make_leaf_page(&current)?);
         }
 
+        Ok(leaves)
+    }
+
+    fn build_leaf_level(&mut self, leaves: Vec<NodeHandle>) -> StorageResult<Option<ObjectId>> {
+        if leaves.is_empty() {
+            return Ok(None);
+        }
         let mut level = leaves;
         while level.len() > 1 {
             let mut next = Vec::new();
@@ -251,169 +265,6 @@ where
             .pop()
             .map(|root| Some(root.object))
             .ok_or_else(|| StorageError::Internal("KV bulk root is missing".to_owned()))
-    }
-
-    pub(super) fn raw_keys_in_range(
-        &mut self,
-        root: Option<ObjectId>,
-        start: &[u8],
-        end: &[u8],
-    ) -> StorageResult<Vec<Vec<u8>>> {
-        let mut keys = Vec::new();
-        let Some(root) = root else {
-            return Ok(keys);
-        };
-        let mut stack = vec![root];
-        while let Some(object) = stack.pop() {
-            match self.node(object)?.node {
-                Node::Leaf(leaf) => {
-                    keys.extend(
-                        leaf.entries
-                            .into_iter()
-                            .filter(|entry| {
-                                entry.key.as_slice() >= start && entry.key.as_slice() < end
-                            })
-                            .map(|entry| entry.key),
-                    );
-                },
-                Node::Branch(branch) => {
-                    for (index, child) in branch.children.iter().enumerate().rev() {
-                        let upper = branch
-                            .children
-                            .get(index.saturating_add(1))
-                            .map(|next| next.lower_bound.as_slice());
-                        if upper.is_some_and(|upper| upper <= start)
-                            || child.lower_bound.as_slice() >= end
-                        {
-                            continue;
-                        }
-                        self.validate_pointer(child)?;
-                        stack.push(child.object);
-                    }
-                },
-            }
-        }
-        Ok(keys)
-    }
-
-    pub(super) fn projected_keys_in_range(
-        &mut self,
-        header: &TreeHeader<P>,
-        start: &[u8],
-        end: &[u8],
-        strip: usize,
-    ) -> StorageResult<Vec<String>> {
-        let mut keys = self
-            .raw_keys_in_range(header.tree, start, end)?
-            .into_iter()
-            .map(|key| (key, true))
-            .collect::<BTreeMap<_, _>>();
-        for (key, value) in header.overlay.range(start, end) {
-            keys.insert(key, value.is_some());
-        }
-        keys.into_iter()
-            .filter(|(_, present)| *present)
-            .map(|(key, _)| {
-                key.get(strip..)
-                    .ok_or_else(|| invalid(ObjectId::new([0; 32]), "KV key prefix underflow"))
-                    .and_then(|key| {
-                        std::str::from_utf8(key)
-                            .map(str::to_owned)
-                            .map_err(|error| StorageError::Serialization(error.to_string()))
-                    })
-            })
-            .collect()
-    }
-
-    // Repack the exact head's previously admitted, content-addressed value
-    // slots. Header validation and root admission establish the immutable
-    // closure; metadata checkpointing does not need a second content audit.
-    pub(super) fn checkpoint_entries(
-        &mut self,
-        header: &TreeHeader<P>,
-    ) -> StorageResult<Vec<LeafEntry>> {
-        let mut entries = BTreeMap::new();
-        let mut stack = header.tree.into_iter().collect::<Vec<_>>();
-        while let Some(object) = stack.pop() {
-            match self.node(object)?.node {
-                Node::Leaf(leaf) => {
-                    for entry in leaf.entries {
-                        if entries.insert(entry.key, entry.value).is_some() {
-                            return Err(invalid(object, "KV checkpoint contains duplicate keys"));
-                        }
-                    }
-                },
-                Node::Branch(branch) => {
-                    for child in branch.children.iter().rev() {
-                        self.validate_pointer(child)?;
-                        stack.push(child.object);
-                    }
-                },
-            }
-        }
-
-        // Latest occurrence wins. Values are immutable slots from the exact
-        // authoritative delta chain, rather than reconstructed overlay bytes.
-        let mut updates = BTreeMap::new();
-        let mut cursor = header.head;
-        let mut visited = BTreeSet::new();
-        let mut depth = 0_u64;
-        let mut checkpoint_tree = None;
-        while let Some(object) = cursor {
-            if !visited.insert(object) {
-                return Err(invalid(object, "KV delta chain contains a cycle"));
-            }
-            match decode_head(object, &self.record(object)?)? {
-                Head::Checkpoint { tree, .. } => {
-                    checkpoint_tree = tree;
-                    break;
-                },
-                Head::Delta {
-                    previous,
-                    mutations,
-                    ..
-                } => {
-                    depth = depth.checked_add(1).ok_or_else(arithmetic_overflow)?;
-                    for mutation in mutations {
-                        updates.entry(mutation.key).or_insert(mutation.value);
-                    }
-                    cursor = previous;
-                },
-            }
-        }
-        if checkpoint_tree != header.tree || depth != header.delta_depth {
-            return Err(StorageError::Serialization(
-                "KV checkpoint source disagrees with validated projection".to_owned(),
-            ));
-        }
-        for (key, value) in updates {
-            match value {
-                Some(value) => {
-                    entries.insert(key, value);
-                },
-                None => {
-                    entries.remove(&key);
-                },
-            }
-        }
-        let resolved = entries
-            .into_iter()
-            .map(|(key, value)| LeafEntry { key, value })
-            .collect::<Vec<_>>();
-        let totals = resolved
-            .iter()
-            .try_fold(NodeTotals::default(), |totals, entry| {
-                totals.add(entry.totals()?)
-            })?;
-        if totals.entries != header.entries
-            || totals.logical_bytes != header.logical_bytes
-            || totals.quota_bytes != header.quota_bytes
-        {
-            return Err(StorageError::Serialization(
-                "KV checkpoint slot accounting disagrees with validated projection".to_owned(),
-            ));
-        }
-        Ok(resolved)
     }
 
     pub(super) fn visit_entries(

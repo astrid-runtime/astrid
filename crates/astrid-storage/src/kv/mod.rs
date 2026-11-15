@@ -218,6 +218,30 @@ pub trait KvStore: Send + Sync {
         Ok(all.into_iter().filter(|k| k.starts_with(prefix)).collect())
     }
 
+    /// Read matching keys and values within a namespace.
+    ///
+    /// Range backends override this to read one captured projection rather
+    /// than dispatching a separate storage operation for every returned key.
+    /// The compatibility implementation has the same consistency as separate
+    /// key listing and reads; it does not promise a transactional snapshot.
+    async fn list_entries_with_prefix(
+        &self,
+        namespace: &str,
+        prefix: &str,
+    ) -> StorageResult<Vec<KvEntry>> {
+        let mut entries = Vec::new();
+        for key in self.list_keys_with_prefix(namespace, prefix).await? {
+            if let Some(value) = self.get(namespace, &key).await? {
+                entries.push(KvEntry {
+                    namespace: namespace.to_owned(),
+                    key,
+                    value,
+                });
+            }
+        }
+        Ok(entries)
+    }
+
     /// List at most `limit` keys after an exclusive lexical cursor.
     ///
     /// Durable range backends override this to avoid materializing an entire

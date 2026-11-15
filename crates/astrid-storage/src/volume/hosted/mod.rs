@@ -413,8 +413,11 @@ impl HostedFileVolume {
                 return Ok(Vec::new());
             }
         }
+        // One index page is the inline encoding crossover. Larger namespaces
+        // reuse immutable extent pages; the separate 16 MiB recovery bound
+        // still limits checkpoint catalogues and replay tails.
         if state.checkpoint_format == CheckpointFormat::Legacy
-            && recover::snapshot_bytes(&state.regions)? <= recover::MAX_COMMIT_SNAPSHOT_BYTES
+            && recover::snapshot_bytes(&state.regions)? <= extent_index::codec::PAGE_BYTES as u64
         {
             recover::encode_region_snapshot(&state.regions)
         } else {

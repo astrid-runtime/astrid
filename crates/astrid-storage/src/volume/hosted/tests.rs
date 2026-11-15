@@ -498,25 +498,125 @@ fn corrupt_write_checksum_does_not_block_footer_open() {
     assert_eq!(&recovered, b"firstsecond");
 }
 
+fn plant_unit_byte_extents(volume: &HostedFileVolume, region: &VolumeRegion, count: u64) {
+    volume.create_region(region, true).unwrap();
+    for index in 0..count {
+        let byte = [u8::try_from(index % 251).unwrap()];
+        volume.write_region_at(region, index, &byte).unwrap();
+    }
+    volume.sync().unwrap();
+}
+
+fn expected_unit_byte(index: u64) -> u8 {
+    u8::try_from(index % 251).unwrap()
+}
+
 #[test]
-fn footer_open_reads_only_the_commit_header_after_many_writes() {
+fn footer_open_reads_only_the_commit_header_for_legacy_page_fit() {
+    // 128 single-byte extents encode under PAGE_BYTES, so commit_payload stays
+    // Legacy ASTMAP1 and footer open needs only the commit header.
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("astrid.volume");
     let region = VolumeRegion::new("objects").unwrap();
     {
         let volume = HostedFileVolume::open(&path).unwrap();
-        volume.create_region(&region, true).unwrap();
-        for index in 0..256_u64 {
-            let byte = [u8::try_from(index % 251).unwrap()];
-            volume.write_region_at(&region, index, &byte).unwrap();
-        }
-        volume.sync().unwrap();
+        plant_unit_byte_extents(&volume, &region, 128);
+        assert_eq!(
+            volume.state.lock().checkpoint_format,
+            CheckpointFormat::Legacy
+        );
     }
 
     recover::reset_read_header_count();
     let volume = HostedFileVolume::open(&path).unwrap();
     assert_eq!(recover::read_header_count(), 1);
-    assert_eq!(volume.region_len(&region).unwrap(), 256);
+    assert_eq!(
+        volume.state.lock().checkpoint_format,
+        CheckpointFormat::Legacy
+    );
+    assert_eq!(volume.region_len(&region).unwrap(), 128);
+    let mut recovered = [0_u8; 128];
+    assert_eq!(
+        volume.read_region_at(&region, 0, &mut recovered).unwrap(),
+        128
+    );
+    for (index, byte) in recovered.iter().enumerate() {
+        assert_eq!(
+            *byte,
+            expected_unit_byte(index as u64),
+            "legacy byte {index}"
+        );
+    }
+}
+
+#[test]
+fn footer_open_reads_paged_index_pages_not_data_headers_after_page_cutover() {
+    // 256 extents exceed one leaf (LEAF_CAPACITY=170) and PAGE_BYTES ASTMAP1,
+    // so publication is Paged: commit catalogue + two leaves + branch root.
+    // Footer open must verify those index pages, never replay 256 data writes.
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let region = VolumeRegion::new("objects").unwrap();
+    let extent_count = 256_u64;
+    let leaf_capacity = u64::try_from(extent_index::codec::LEAF_CAPACITY).unwrap();
+    assert!(
+        extent_count > leaf_capacity,
+        "fixture must overflow one index leaf"
+    );
+    let leaf_pages = usize::try_from(extent_count.div_ceil(leaf_capacity)).unwrap();
+    assert_eq!(
+        leaf_pages, 2,
+        "256 extents => exactly two leaves at capacity 170"
+    );
+    let expected_headers = leaf_pages
+        .strict_add(1) // branch root over the two leaves
+        .strict_add(1); // commit catalogue header
+    {
+        let volume = HostedFileVolume::open(&path).unwrap();
+        plant_unit_byte_extents(&volume, &region, extent_count);
+        assert_eq!(
+            volume.state.lock().checkpoint_format,
+            CheckpointFormat::Paged
+        );
+        let root = volume
+            .state
+            .lock()
+            .regions
+            .get(&region)
+            .and_then(|state| state.root)
+            .expect("paged region root");
+        assert_eq!(root.level().get(), 1);
+        assert_eq!(root.extent_count().get(), extent_count);
+    }
+
+    recover::reset_read_header_count();
+    let volume = HostedFileVolume::open(&path).unwrap();
+    assert_eq!(
+        recover::read_header_count(),
+        expected_headers,
+        "paged footer open must read commit + index pages only"
+    );
+    assert!(
+        recover::read_header_count() < usize::try_from(extent_count).unwrap(),
+        "must not scan per-write data headers"
+    );
+    assert_eq!(
+        volume.state.lock().checkpoint_format,
+        CheckpointFormat::Paged
+    );
+    assert_eq!(volume.region_len(&region).unwrap(), extent_count);
+    let mut recovered = [0_u8; 256];
+    assert_eq!(
+        volume.read_region_at(&region, 0, &mut recovered).unwrap(),
+        256
+    );
+    for (index, byte) in recovered.iter().enumerate() {
+        assert_eq!(
+            *byte,
+            expected_unit_byte(index as u64),
+            "paged byte {index}"
+        );
+    }
 }
 
 #[test]
@@ -544,17 +644,27 @@ fn damaged_footer_falls_back_to_headers_and_is_reinstalled() {
 }
 
 #[test]
-fn read_region_at_copies_overlapping_extents_only() {
+fn read_region_at_copies_overlapping_extents_only_for_legacy_map() {
+    // Legacy namespaces keep the in-memory extent map; EXTENT_VISITS counts
+    // that map walk. Stay under PAGE_BYTES so sync does not convert to Paged.
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("astrid.volume");
     let region = VolumeRegion::new("objects").unwrap();
     let volume = HostedFileVolume::open(&path).unwrap();
-    volume.create_region(&region, true).unwrap();
-    for index in 0..256_u64 {
-        let byte = [u8::try_from(index % 251).unwrap()];
-        volume.write_region_at(&region, index, &byte).unwrap();
-    }
-    volume.sync().unwrap();
+    plant_unit_byte_extents(&volume, &region, 128);
+    assert_eq!(
+        volume.state.lock().checkpoint_format,
+        CheckpointFormat::Legacy
+    );
+    assert!(
+        volume
+            .state
+            .lock()
+            .regions
+            .get(&region)
+            .is_some_and(|state| state.root.is_none() && state.extents.len() == 128)
+    );
+
     REGION_STATE_CLONES.with(|count| count.set(0));
     EXTENT_VISITS.with(|count| count.set(0));
     let mut bytes = [0_u8; 4];
@@ -568,17 +678,81 @@ fn read_region_at_copies_overlapping_extents_only() {
     assert_eq!(
         EXTENT_VISITS.with(std::cell::Cell::get),
         4,
-        "mid-range read must not scan extents from 0"
+        "legacy mid-range read must visit only overlapping extents"
     );
 
     EXTENT_VISITS.with(|count| count.set(0));
     let mut tail = [0_u8; 4];
-    assert_eq!(volume.read_region_at(&region, 252, &mut tail).unwrap(), 4);
-    assert_eq!(&tail, &[1, 2, 3, 4]);
+    assert_eq!(volume.read_region_at(&region, 124, &mut tail).unwrap(), 4);
+    assert_eq!(&tail, &[124, 125, 126, 127]);
     assert_eq!(
         EXTENT_VISITS.with(std::cell::Cell::get),
         4,
-        "tail read must not scan extents from 0"
+        "legacy tail read must visit only overlapping extents"
+    );
+}
+
+#[test]
+fn read_region_at_paged_range_bounded_by_index_height_not_extent_walk() {
+    // After PAGE_BYTES cutover the authoritative map is the index tree.
+    // Range reads must not walk the legacy EXTENT_VISITS map; header reads for
+    // the lookup are bounded by root.level+1 (branch root + one leaf here).
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let region = VolumeRegion::new("objects").unwrap();
+    let volume = HostedFileVolume::open(&path).unwrap();
+    plant_unit_byte_extents(&volume, &region, 256);
+    assert_eq!(
+        volume.state.lock().checkpoint_format,
+        CheckpointFormat::Paged
+    );
+    let root = volume
+        .state
+        .lock()
+        .regions
+        .get(&region)
+        .and_then(|state| state.root)
+        .expect("paged region root");
+    let header_bound = usize::from(root.level().get()).strict_add(1);
+    assert_eq!(header_bound, 2, "level-1 root => root page + one leaf");
+    assert!(
+        volume
+            .state
+            .lock()
+            .regions
+            .get(&region)
+            .is_some_and(|state| state.extents.is_empty()),
+        "paged checkpoint must clear the legacy extent map"
+    );
+
+    REGION_STATE_CLONES.with(|count| count.set(0));
+    EXTENT_VISITS.with(|count| count.set(0));
+    recover::reset_read_header_count();
+    let mut bytes = [0_u8; 4];
+    assert_eq!(volume.read_region_at(&region, 10, &mut bytes).unwrap(), 4);
+    assert_eq!(&bytes, &[10, 11, 12, 13]);
+    assert_eq!(REGION_STATE_CLONES.with(std::cell::Cell::get), 0);
+    assert_eq!(
+        EXTENT_VISITS.with(std::cell::Cell::get),
+        0,
+        "paged reads must not use the legacy extent-map visitor"
+    );
+    assert!(
+        recover::read_header_count() <= header_bound,
+        "paged mid-range read headers {} exceed root.level+1={header_bound}",
+        recover::read_header_count()
+    );
+
+    EXTENT_VISITS.with(|count| count.set(0));
+    recover::reset_read_header_count();
+    let mut tail = [0_u8; 4];
+    assert_eq!(volume.read_region_at(&region, 252, &mut tail).unwrap(), 4);
+    assert_eq!(&tail, &[1, 2, 3, 4]);
+    assert_eq!(EXTENT_VISITS.with(std::cell::Cell::get), 0);
+    assert!(
+        recover::read_header_count() <= header_bound,
+        "paged tail read headers {} exceed root.level+1={header_bound}",
+        recover::read_header_count()
     );
 }
 

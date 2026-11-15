@@ -1,4 +1,5 @@
 use super::*;
+use std::io::Read;
 
 #[test]
 fn reclaim_streams_each_region_as_one_extent_without_cloning_namespace() {
@@ -375,4 +376,347 @@ fn windows_effective_move_error_adopts_current_inode_and_retries_flush() {
         reopened.read_region_at(&region, 0, &mut bytes).unwrap();
         assert_eq!(&bytes, b"after!");
     }
+}
+
+fn page_snapshot_bound() -> u64 {
+    u64::try_from(extent_index::codec::PAGE_BYTES).expect("PAGE_BYTES fits u64")
+}
+
+fn plant_shared_physical_extents(state: &mut ContainerState, region: &VolumeRegion, count: u64) {
+    let target = state.regions.get_mut(region).expect("region planted");
+    let physical = target.extents[&0].physical_offset;
+    target.extents = (0..count)
+        .map(|offset| {
+            (
+                offset,
+                Extent {
+                    logical_end: offset.strict_add(1),
+                    physical_offset: physical,
+                },
+            )
+        })
+        .collect();
+    target.length = count;
+}
+
+/// Smallest fragmented extent count whose `ASTMAP1` encoding exceeds one index
+/// page payload (`PAGE_BYTES`), while remaining under the hard 16 `MiB` commit bound.
+fn extent_count_above_one_page_snapshot(
+    state: &mut ContainerState,
+    region: &VolumeRegion,
+) -> (u64, u64) {
+    let page = page_snapshot_bound();
+    let mut count = 1_u64;
+    loop {
+        plant_shared_physical_extents(state, region, count);
+        let bytes = recover::snapshot_bytes(&state.regions).expect("snapshot size");
+        assert!(
+            bytes < recover::MAX_COMMIT_SNAPSHOT_BYTES,
+            "probe crossed the hard commit bound at count={count} bytes={bytes}"
+        );
+        if bytes > page {
+            return (count, bytes);
+        }
+        count = count.strict_add(1);
+        assert!(
+            count < 4096,
+            "unable to exceed PAGE_BYTES={page} with fragmented extents"
+        );
+    }
+}
+
+fn read_probe_byte(volume: &HostedFileVolume, region: &VolumeRegion, offset: u64) -> u8 {
+    let mut byte = [0];
+    assert_eq!(volume.read_region_at(region, offset, &mut byte).unwrap(), 1);
+    byte[0]
+}
+
+/// Seal the live `Legacy` map with an `ASTMAP1` commit using the unchanged v1
+/// encoder plus ordinary `append` / footer / flush. Explicitly a legacy-format
+/// fixture built with the current encoder, not an old-`6d` production binary.
+/// Skips `commit_payload` so a snapshot above one index page stays on the wire.
+fn seal_legacy_astmap1_commit(state: &mut ContainerState) {
+    assert_eq!(state.checkpoint_format, CheckpointFormat::Legacy);
+    let payload = recover::encode_region_snapshot(&state.regions)
+        .expect("legacy ASTMAP1 fixture must remain encodable");
+    assert!(
+        !payload.is_empty(),
+        "legacy fixture commit must carry a nonempty ASTMAP1 payload"
+    );
+    let commit_region = VolumeRegion::new(COMMIT_REGION).expect("commit region name");
+    let commit_start = state.valid_len;
+    HostedFileVolume::append(state, Operation::Commit, &commit_region, 0, &payload)
+        .expect("append legacy ASTMAP1 commit");
+    // Match nonempty-commit durable fields from `make_durable`.
+    state.last_commit_offset = commit_start;
+    state.last_snapshot_end = state.valid_len;
+    state.index_checkpoint = IndexCheckpoint::NotPrepared;
+    state.durable_len = state.valid_len;
+    state.boundary_pending = true;
+    state.physical_tail = PhysicalTail::MayExceed;
+    recover::write_footer(
+        &mut state.file,
+        state.last_commit_offset,
+        state.durable_len,
+        state.sequence,
+    )
+    .expect("write legacy fixture footer");
+    state.physical_tail = PhysicalTail::Footer;
+    state.file.sync_all().expect("flush legacy fixture");
+    state.boundary_pending = false;
+    state.footer_pending = false;
+    state.flush_state = FlushState::Confirmed;
+}
+
+fn assert_legacy_fragmented_map(
+    volume: &HostedFileVolume,
+    region: &VolumeRegion,
+    count: u64,
+    snapshot_len: Option<u64>,
+) {
+    let state = volume.state.lock();
+    assert_eq!(state.checkpoint_format, CheckpointFormat::Legacy);
+    assert_ne!(state.last_snapshot_end, 0);
+    assert!(state.regions[region].root.is_none());
+    assert_eq!(
+        state.regions[region].extents.len(),
+        usize::try_from(count).unwrap()
+    );
+    let live = recover::snapshot_bytes(&state.regions).unwrap();
+    assert!(live > page_snapshot_bound());
+    if let Some(snapshot_len) = snapshot_len {
+        assert_eq!(live, snapshot_len);
+    }
+}
+
+fn page_after_flush_retry(
+    state: &mut ContainerState,
+    expected_extents: u64,
+    region: &VolumeRegion,
+) {
+    let error = HostedFileVolume::make_durable_with(state, |_| {
+        Err(std::io::Error::other("injected file flush failure"))
+    })
+    .unwrap_err();
+    assert_eq!(error.to_string(), "injected file flush failure");
+    assert_eq!(state.flush_state, FlushState::Required);
+    let boundary = (state.valid_len, state.sequence, state.last_commit_offset);
+    HostedFileVolume::make_durable(state).unwrap();
+    assert_eq!(
+        (state.valid_len, state.sequence, state.last_commit_offset),
+        boundary,
+        "flush retry must not append another commit"
+    );
+    assert_eq!(state.flush_state, FlushState::Confirmed);
+    assert_eq!(state.checkpoint_format, CheckpointFormat::Paged);
+    assert!(state.regions[region].extents.is_empty());
+    assert_eq!(
+        state.regions[region].root.unwrap().extent_count().get(),
+        expected_extents
+    );
+}
+
+/// Compatibility: reopen an earlier-committed above-`PAGE_BYTES` `ASTMAP1`
+/// volume, keep `Legacy` through the empty-commit short-tail path, then page on
+/// the next necessary checkpoint (flush fail/retry + ordinary reopen).
+#[test]
+fn reopened_legacy_over_page_snapshot_pages_on_next_necessary_checkpoint() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let region = VolumeRegion::new("objects").unwrap();
+
+    let (count, snapshot_len) = {
+        let volume = HostedFileVolume::open(&path).unwrap();
+        volume.create_region(&region, true).unwrap();
+        volume.write_region_at(&region, 0, b"x").unwrap();
+        let mut state = volume.state.lock();
+        assert_eq!(state.last_snapshot_end, 0);
+        let planted = extent_count_above_one_page_snapshot(&mut state, &region);
+        assert!(planted.1 > page_snapshot_bound());
+        assert!(planted.1 < recover::MAX_COMMIT_SNAPSHOT_BYTES);
+        seal_legacy_astmap1_commit(&mut state);
+        assert_eq!(state.checkpoint_format, CheckpointFormat::Legacy);
+        // Confirmed flush => Drop's make_durable is a no-op (no conversion).
+        planted
+    };
+
+    let volume = HostedFileVolume::open(&path).unwrap();
+    assert_legacy_fragmented_map(&volume, &region, count, Some(snapshot_len));
+    assert_eq!(read_probe_byte(&volume, &region, 0), b'x');
+
+    // Small tail stays on the empty-commit path and must not convert.
+    volume.write_region_at(&region, 0, b"y").unwrap();
+    volume.sync().unwrap();
+    assert_legacy_fragmented_map(&volume, &region, count, None);
+    assert_eq!(read_probe_byte(&volume, &region, 0), b'y');
+
+    // Extend past the fragmented map so the physical tail exceeds 16 MiB while
+    // the live ASTMAP1 encoding remains above one index page.
+    let rollover = recover::MAX_COMMIT_SNAPSHOT_BYTES;
+    volume
+        .write_region_from(
+            &region,
+            count,
+            rollover,
+            &mut std::io::repeat(0x5A).take(rollover),
+        )
+        .unwrap();
+    let expected_len = count.strict_add(rollover);
+    assert_eq!(volume.region_len(&region).unwrap(), expected_len);
+    let expected_extents = {
+        let state = volume.state.lock();
+        assert_eq!(state.checkpoint_format, CheckpointFormat::Legacy);
+        assert!(recover::snapshot_bytes(&state.regions).unwrap() > page_snapshot_bound());
+        let extents = u64::try_from(state.regions[&region].extents.len()).unwrap();
+        assert!(
+            extents > count,
+            "rollover must retain prior fragmented extents"
+        );
+        extents
+    };
+    page_after_flush_retry(&mut volume.state.lock(), expected_extents, &region);
+
+    drop(volume);
+    let reopened = HostedFileVolume::open(&path).unwrap();
+    assert_eq!(
+        reopened.state.lock().checkpoint_format,
+        CheckpointFormat::Paged
+    );
+    assert_eq!(reopened.region_len(&region).unwrap(), expected_len);
+    assert_eq!(read_probe_byte(&reopened, &region, 0), b'y');
+    assert_eq!(read_probe_byte(&reopened, &region, count), 0x5A);
+    assert_eq!(
+        read_probe_byte(&reopened, &region, expected_len.strict_sub(1)),
+        0x5A
+    );
+}
+
+/// Falsifier for earlier ASTMAP1→ASTMAP2 cutover at `PAGE_BYTES`.
+///
+/// Plants a moderate map with `PAGE_BYTES < snapshot_bytes < 16MiB`, then runs the
+/// **first** necessary checkpoint (writes landed, no prior sync — empty-commit
+/// short-tail path does not apply). Old `commit_payload` keeps `Legacy` `ASTMAP1`;
+/// the `PAGE_BYTES` predicate must publish `Paged`. Integrates injected file-flush
+/// failure/retry and exact reopen through ordinary recovery validation.
+#[test]
+fn first_necessary_checkpoint_pages_when_astmap1_exceeds_one_index_page() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let volume = HostedFileVolume::open(&path).unwrap();
+    let region = VolumeRegion::new("objects").unwrap();
+    volume.create_region(&region, true).unwrap();
+    volume.write_region_at(&region, 0, b"x").unwrap();
+
+    let (count, snapshot_len) = {
+        let mut state = volume.state.lock();
+        assert_eq!(state.last_snapshot_end, 0, "no prior sync/checkpoint");
+        assert_eq!(state.checkpoint_format, CheckpointFormat::Legacy);
+        let planted = extent_count_above_one_page_snapshot(&mut state, &region);
+        assert!(
+            planted.1 > page_snapshot_bound(),
+            "expected snapshot above PAGE_BYTES, got {}",
+            planted.1
+        );
+        assert!(
+            planted.1 < recover::MAX_COMMIT_SNAPSHOT_BYTES,
+            "fixture must stay under the hard 16 MiB commit bound"
+        );
+        // Old predicate still admits ASTMAP1 at this size.
+        recover::encode_region_snapshot(&state.regions).expect("ASTMAP1 still encodable");
+        planted
+    };
+
+    {
+        let mut state = volume.state.lock();
+        let error = HostedFileVolume::make_durable_with(&mut state, |_| {
+            Err(std::io::Error::other("injected file flush failure"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "injected file flush failure");
+        assert_eq!(state.flush_state, FlushState::Required);
+        let boundary = (state.valid_len, state.sequence, state.last_commit_offset);
+        HostedFileVolume::make_durable(&mut state).unwrap();
+        assert_eq!(
+            (state.valid_len, state.sequence, state.last_commit_offset),
+            boundary,
+            "flush retry must not append another commit"
+        );
+        assert_eq!(state.flush_state, FlushState::Confirmed);
+        // Falsifier under the current 16 MiB Legacy retention predicate.
+        assert_eq!(state.checkpoint_format, CheckpointFormat::Paged);
+        assert!(state.regions[&region].extents.is_empty());
+        assert_eq!(
+            state.regions[&region].root.unwrap().extent_count().get(),
+            count
+        );
+        assert!(
+            snapshot_len > page_snapshot_bound(),
+            "measured ASTMAP1 length {snapshot_len} must remain the planted bound"
+        );
+    }
+
+    drop(volume);
+    let reopened = HostedFileVolume::open(&path).unwrap();
+    assert_eq!(
+        reopened.state.lock().checkpoint_format,
+        CheckpointFormat::Paged
+    );
+    for offset in [0, count / 2, count.strict_sub(1)] {
+        assert_eq!(read_probe_byte(&reopened, &region, offset), b'x');
+    }
+    assert_eq!(
+        reopened.region_len(&region).unwrap(),
+        count,
+        "reopen must recover the full logical region through ordinary validation"
+    );
+}
+
+/// Control: ASTMAP1 that fits in one index page stays Legacy on the first
+/// necessary checkpoint (no forced conversion below `PAGE_BYTES`).
+#[test]
+fn first_necessary_checkpoint_keeps_legacy_when_astmap1_fits_one_index_page() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let volume = HostedFileVolume::open(&path).unwrap();
+    let region = VolumeRegion::new("objects").unwrap();
+    volume.create_region(&region, true).unwrap();
+    volume.write_region_at(&region, 0, b"y").unwrap();
+
+    let (fit_count, fit_bytes) = {
+        let mut state = volume.state.lock();
+        let (above_count, _) = extent_count_above_one_page_snapshot(&mut state, &region);
+        let fit_count = above_count.strict_sub(1);
+        plant_shared_physical_extents(&mut state, &region, fit_count);
+        let fit_bytes = recover::snapshot_bytes(&state.regions).unwrap();
+        assert!(
+            fit_bytes <= page_snapshot_bound(),
+            "control snapshot {fit_bytes} must fit in PAGE_BYTES"
+        );
+        assert!(fit_bytes > 0);
+        recover::encode_region_snapshot(&state.regions).unwrap();
+        assert_eq!(state.last_snapshot_end, 0);
+        (fit_count, fit_bytes)
+    };
+
+    volume.sync().unwrap();
+    {
+        let state = volume.state.lock();
+        assert_eq!(state.checkpoint_format, CheckpointFormat::Legacy);
+        assert_eq!(
+            state.regions[&region].extents.len(),
+            usize::try_from(fit_count).unwrap()
+        );
+        assert!(state.regions[&region].root.is_none());
+    }
+    drop(volume);
+    let reopened = HostedFileVolume::open(&path).unwrap();
+    assert_eq!(
+        reopened.state.lock().checkpoint_format,
+        CheckpointFormat::Legacy
+    );
+    for offset in [0, fit_count / 2, fit_count.strict_sub(1)] {
+        assert_eq!(read_probe_byte(&reopened, &region, offset), b'y');
+    }
+    assert_eq!(reopened.region_len(&region).unwrap(), fit_count);
+    assert!(fit_bytes <= page_snapshot_bound());
 }
