@@ -4,7 +4,7 @@ mod handoff;
 pub(in crate::principal_state) mod staging;
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Write as _};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -17,7 +17,6 @@ fn report_finalization_phase(started: Option<Instant>, phase: &'static str, succ
     let Some(started) = started else {
         return;
     };
-    use std::io::Write as _;
     // Tracing can recreate the retired log tree. Only use the existing stderr
     // descriptor here, and never let diagnostic I/O failure interrupt close.
     let _ = writeln!(
