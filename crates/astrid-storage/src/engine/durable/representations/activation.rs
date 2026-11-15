@@ -139,7 +139,10 @@ pub(super) fn visit_new_reachable_map_nodes(
     // The map is immutable throughout this walk. Retain the body for the
     // postorder visit rather than looking it up in the arena a second time.
     let mut pending = vec![(root, None::<&PhysicalMapNode>)];
-    let mut visited = BTreeSet::new();
+    // Canonical reachable closures are trees. The arena also retains historical
+    // nodes, so its size bounds every valid walk and terminates corrupted cycles
+    // without allocating a second index of identities already held by the map.
+    let mut remaining = map.nodes().len();
     while let Some((id, body)) = pending.pop() {
         if let Some(node) = body {
             // A persisted parent alone does not establish durable descendants.
@@ -169,9 +172,14 @@ pub(super) fn visit_new_reachable_map_nodes(
             }
             continue;
         }
-        if complete.contains(&id) || !visited.insert(id) {
+        if complete.contains(&id) {
             continue;
         }
+        remaining = remaining
+            .checked_sub(1)
+            .ok_or(DurableError::InvalidRepresentationState(
+                "active physical map traversal exceeds its arena",
+            ))?;
         let node = map
             .nodes()
             .get(&id)
@@ -190,7 +198,7 @@ pub(super) fn visit_new_reachable_map_nodes(
             PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => {},
         }
     }
-    Ok(visited.len())
+    Ok(map.nodes().len().strict_sub(remaining))
 }
 
 pub(super) fn append_new_reachable_map_nodes(
@@ -234,7 +242,9 @@ mod tests {
         CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode,
     };
 
-    use super::{Blake3PhysicalIdentity, append_new_reachable_map_nodes};
+    use super::{
+        Blake3PhysicalIdentity, append_new_reachable_map_nodes, visit_new_reachable_map_nodes,
+    };
 
     fn dense_map() -> CanonicalPhysicalMap {
         CanonicalPhysicalMap::build_dense(
@@ -251,6 +261,40 @@ mod tests {
                 .collect(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn publication_rejects_a_cached_cycle_before_emitting_nodes() {
+        let mut map = crate::storage_model::physical::RepresentationMap::build_dense(vec![(
+            PhysicalMapKey::new([1; 32]),
+            vec![1],
+        )])
+        .unwrap();
+        let root = map.root().unwrap();
+        assert!(map.replace_arena_node_for_fault(
+            root,
+            PhysicalMapNode::Branch {
+                domain: PhysicalMapDomain::Representation,
+                prefix_bits: 0,
+                prefix: vec![],
+                zero: root,
+                one: root,
+                subtree_entries: 1,
+            },
+        ));
+        let mut emitted = 0;
+        let result = visit_new_reachable_map_nodes(
+            map.as_canonical(),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            |_| {
+                emitted += 1;
+                Ok(())
+            },
+        );
+        assert!(result.is_err(), "a cached cycle cannot be published");
+        assert_eq!(emitted, 0);
     }
 
     #[test]
