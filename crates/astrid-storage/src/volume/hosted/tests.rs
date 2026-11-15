@@ -511,10 +511,40 @@ fn expected_unit_byte(index: u64) -> u8 {
     u8::try_from(index % 251).unwrap()
 }
 
+/// Force an explicit `Paged` publication for an still-encodable map.
+///
+/// Restored inline selection keeps moderate maps on `Legacy` through ordinary
+/// sync; these fixtures call `prepare_checkpoint` then `sync` so Paged cold
+/// open / range-read coverage does not depend on the removed `PAGE_BYTES` cutover.
+fn publish_explicit_paged_fixture(volume: &HostedFileVolume, region: &VolumeRegion, count: u64) {
+    plant_unit_byte_extents(volume, region, count);
+    assert_eq!(
+        volume.state.lock().checkpoint_format,
+        CheckpointFormat::Legacy,
+        "encodable maps must stay Legacy until explicitly prepared"
+    );
+    {
+        let mut state = volume.state.lock();
+        extent_index::publication::prepare_checkpoint(&mut state)
+            .expect("explicit paged prepare for encodable fixture");
+        assert_eq!(state.checkpoint_format, CheckpointFormat::Paged);
+    }
+    volume.sync().unwrap();
+    let state = volume.state.lock();
+    assert_eq!(state.checkpoint_format, CheckpointFormat::Paged);
+    assert!(
+        state
+            .regions
+            .get(region)
+            .is_some_and(|region| region.extents.is_empty() && region.root.is_some()),
+        "explicit paged sync must install a root and clear legacy extents"
+    );
+}
+
 #[test]
 fn footer_open_reads_only_the_commit_header_for_legacy_page_fit() {
-    // 128 single-byte extents encode under PAGE_BYTES, so commit_payload stays
-    // Legacy ASTMAP1 and footer open needs only the commit header.
+    // 128 single-byte extents stay Legacy under the restored 16 MiB inline bound,
+    // so footer open needs only the commit header.
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("astrid.volume");
     let region = VolumeRegion::new("objects").unwrap();
@@ -550,9 +580,9 @@ fn footer_open_reads_only_the_commit_header_for_legacy_page_fit() {
 }
 
 #[test]
-fn footer_open_reads_paged_index_pages_not_data_headers_after_page_cutover() {
-    // 256 extents exceed one leaf (LEAF_CAPACITY=170) and PAGE_BYTES ASTMAP1,
-    // so publication is Paged: commit catalogue + two leaves + branch root.
+fn footer_open_reads_paged_index_pages_not_data_headers_for_explicit_fixture() {
+    // Explicit Paged fixture: 256 extents overflow one leaf (LEAF_CAPACITY=170)
+    // so the prepared tree is commit catalogue + two leaves + branch root.
     // Footer open must verify those index pages, never replay 256 data writes.
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("astrid.volume");
@@ -573,11 +603,7 @@ fn footer_open_reads_paged_index_pages_not_data_headers_after_page_cutover() {
         .strict_add(1); // commit catalogue header
     {
         let volume = HostedFileVolume::open(&path).unwrap();
-        plant_unit_byte_extents(&volume, &region, extent_count);
-        assert_eq!(
-            volume.state.lock().checkpoint_format,
-            CheckpointFormat::Paged
-        );
+        publish_explicit_paged_fixture(&volume, &region, extent_count);
         let root = volume
             .state
             .lock()
@@ -646,7 +672,7 @@ fn damaged_footer_falls_back_to_headers_and_is_reinstalled() {
 #[test]
 fn read_region_at_copies_overlapping_extents_only_for_legacy_map() {
     // Legacy namespaces keep the in-memory extent map; EXTENT_VISITS counts
-    // that map walk. Stay under PAGE_BYTES so sync does not convert to Paged.
+    // that map walk. 128 extents stay Legacy under the restored 16 MiB bound.
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("astrid.volume");
     let region = VolumeRegion::new("objects").unwrap();
@@ -694,18 +720,14 @@ fn read_region_at_copies_overlapping_extents_only_for_legacy_map() {
 
 #[test]
 fn read_region_at_paged_range_bounded_by_index_height_not_extent_walk() {
-    // After PAGE_BYTES cutover the authoritative map is the index tree.
+    // Explicit Paged fixture: authoritative map is the index tree.
     // Range reads must not walk the legacy EXTENT_VISITS map; header reads for
     // the lookup are bounded by root.level+1 (branch root + one leaf here).
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("astrid.volume");
     let region = VolumeRegion::new("objects").unwrap();
     let volume = HostedFileVolume::open(&path).unwrap();
-    plant_unit_byte_extents(&volume, &region, 256);
-    assert_eq!(
-        volume.state.lock().checkpoint_format,
-        CheckpointFormat::Paged
-    );
+    publish_explicit_paged_fixture(&volume, &region, 256);
     let root = volume
         .state
         .lock()

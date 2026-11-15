@@ -489,7 +489,7 @@ fn assert_legacy_fragmented_map(
     }
 }
 
-fn page_after_flush_retry(
+fn legacy_after_flush_retry(
     state: &mut ContainerState,
     expected_extents: u64,
     region: &VolumeRegion,
@@ -508,19 +508,22 @@ fn page_after_flush_retry(
         "flush retry must not append another commit"
     );
     assert_eq!(state.flush_state, FlushState::Confirmed);
-    assert_eq!(state.checkpoint_format, CheckpointFormat::Paged);
-    assert!(state.regions[region].extents.is_empty());
+    // Physical tail forced a nonempty commit, but ASTMAP1 is still encodable.
+    assert_eq!(state.checkpoint_format, CheckpointFormat::Legacy);
+    assert!(state.regions[region].root.is_none());
     assert_eq!(
-        state.regions[region].root.unwrap().extent_count().get(),
-        expected_extents
+        state.regions[region].extents.len(),
+        usize::try_from(expected_extents).unwrap()
     );
 }
 
 /// Compatibility: reopen an earlier-committed above-`PAGE_BYTES` `ASTMAP1`
-/// volume, keep `Legacy` through the empty-commit short-tail path, then page on
-/// the next necessary checkpoint (flush fail/retry + ordinary reopen).
+/// volume, keep `Legacy` through the empty-commit short-tail path, then keep
+/// `Legacy` on the next necessary 16 MiB-tail checkpoint while the live map is
+/// still encodable (flush fail/retry + ordinary reopen). Mandatory `Paged` for
+/// unencodable maps stays in `sync_pages_a_namespace_exceeding_the_legacy_snapshot_bound`.
 #[test]
-fn reopened_legacy_over_page_snapshot_pages_on_next_necessary_checkpoint() {
+fn reopened_legacy_over_page_snapshot_stays_legacy_on_necessary_encodable_checkpoint() {
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("astrid.volume");
     let region = VolumeRegion::new("objects").unwrap();
@@ -551,7 +554,7 @@ fn reopened_legacy_over_page_snapshot_pages_on_next_necessary_checkpoint() {
     assert_eq!(read_probe_byte(&volume, &region, 0), b'y');
 
     // Extend past the fragmented map so the physical tail exceeds 16 MiB while
-    // the live ASTMAP1 encoding remains above one index page.
+    // the live ASTMAP1 encoding remains under the hard commit bound.
     let rollover = recover::MAX_COMMIT_SNAPSHOT_BYTES;
     volume
         .write_region_from(
@@ -566,7 +569,12 @@ fn reopened_legacy_over_page_snapshot_pages_on_next_necessary_checkpoint() {
     let expected_extents = {
         let state = volume.state.lock();
         assert_eq!(state.checkpoint_format, CheckpointFormat::Legacy);
-        assert!(recover::snapshot_bytes(&state.regions).unwrap() > page_snapshot_bound());
+        let live = recover::snapshot_bytes(&state.regions).unwrap();
+        assert!(live > page_snapshot_bound());
+        assert!(
+            live < recover::MAX_COMMIT_SNAPSHOT_BYTES,
+            "fixture must stay ASTMAP1-encodable, got {live}"
+        );
         let extents = u64::try_from(state.regions[&region].extents.len()).unwrap();
         assert!(
             extents > count,
@@ -574,13 +582,13 @@ fn reopened_legacy_over_page_snapshot_pages_on_next_necessary_checkpoint() {
         );
         extents
     };
-    page_after_flush_retry(&mut volume.state.lock(), expected_extents, &region);
+    legacy_after_flush_retry(&mut volume.state.lock(), expected_extents, &region);
 
     drop(volume);
     let reopened = HostedFileVolume::open(&path).unwrap();
     assert_eq!(
         reopened.state.lock().checkpoint_format,
-        CheckpointFormat::Paged
+        CheckpointFormat::Legacy
     );
     assert_eq!(reopened.region_len(&region).unwrap(), expected_len);
     assert_eq!(read_probe_byte(&reopened, &region, 0), b'y');
@@ -591,15 +599,15 @@ fn reopened_legacy_over_page_snapshot_pages_on_next_necessary_checkpoint() {
     );
 }
 
-/// Falsifier for earlier ASTMAP1→ASTMAP2 cutover at `PAGE_BYTES`.
+/// Retention falsifier for the restored 16 `MiB` inline `ASTMAP1` bound.
 ///
 /// Plants a moderate map with `PAGE_BYTES < snapshot_bytes < 16MiB`, then runs the
 /// **first** necessary checkpoint (writes landed, no prior sync — empty-commit
-/// short-tail path does not apply). Old `commit_payload` keeps `Legacy` `ASTMAP1`;
-/// the `PAGE_BYTES` predicate must publish `Paged`. Integrates injected file-flush
-/// failure/retry and exact reopen through ordinary recovery validation.
+/// short-tail path does not apply). Restored `commit_payload` must keep `Legacy`
+/// `ASTMAP1`. Integrates injected file-flush failure/retry and exact reopen.
+/// Unencodable maps still page via `sync_pages_a_namespace_exceeding_the_legacy_snapshot_bound`.
 #[test]
-fn first_necessary_checkpoint_pages_when_astmap1_exceeds_one_index_page() {
+fn first_necessary_checkpoint_keeps_legacy_when_astmap1_exceeds_one_index_page() {
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("astrid.volume");
     let volume = HostedFileVolume::open(&path).unwrap();
@@ -621,7 +629,6 @@ fn first_necessary_checkpoint_pages_when_astmap1_exceeds_one_index_page() {
             planted.1 < recover::MAX_COMMIT_SNAPSHOT_BYTES,
             "fixture must stay under the hard 16 MiB commit bound"
         );
-        // Old predicate still admits ASTMAP1 at this size.
         recover::encode_region_snapshot(&state.regions).expect("ASTMAP1 still encodable");
         planted
     };
@@ -642,16 +649,19 @@ fn first_necessary_checkpoint_pages_when_astmap1_exceeds_one_index_page() {
             "flush retry must not append another commit"
         );
         assert_eq!(state.flush_state, FlushState::Confirmed);
-        // Falsifier under the current 16 MiB Legacy retention predicate.
-        assert_eq!(state.checkpoint_format, CheckpointFormat::Paged);
-        assert!(state.regions[&region].extents.is_empty());
+        assert_eq!(state.checkpoint_format, CheckpointFormat::Legacy);
+        assert!(state.regions[&region].root.is_none());
         assert_eq!(
-            state.regions[&region].root.unwrap().extent_count().get(),
-            count
+            state.regions[&region].extents.len(),
+            usize::try_from(count).unwrap()
         );
         assert!(
             snapshot_len > page_snapshot_bound(),
             "measured ASTMAP1 length {snapshot_len} must remain the planted bound"
+        );
+        assert_eq!(
+            recover::snapshot_bytes(&state.regions).unwrap(),
+            snapshot_len
         );
     }
 
@@ -659,7 +669,7 @@ fn first_necessary_checkpoint_pages_when_astmap1_exceeds_one_index_page() {
     let reopened = HostedFileVolume::open(&path).unwrap();
     assert_eq!(
         reopened.state.lock().checkpoint_format,
-        CheckpointFormat::Paged
+        CheckpointFormat::Legacy
     );
     for offset in [0, count / 2, count.strict_sub(1)] {
         assert_eq!(read_probe_byte(&reopened, &region, offset), b'x');
@@ -672,7 +682,7 @@ fn first_necessary_checkpoint_pages_when_astmap1_exceeds_one_index_page() {
 }
 
 /// Control: ASTMAP1 that fits in one index page stays Legacy on the first
-/// necessary checkpoint (no forced conversion below `PAGE_BYTES`).
+/// necessary checkpoint (still true under the restored 16 `MiB` inline bound).
 #[test]
 fn first_necessary_checkpoint_keeps_legacy_when_astmap1_fits_one_index_page() {
     let temporary = tempfile::tempdir().unwrap();

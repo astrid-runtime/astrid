@@ -97,11 +97,8 @@ Commit snapshots are bounded to 16 MiB; other non-write payloads are bounded to
 sync() appends operation 8 when mutations are pending and returns only after
 that boundary is durable. A pending tail shorter than 16 MiB, including the
 empty commit record itself, uses an empty payload and leaves the named snapshot
-unchanged. A tail that would exceed 16 MiB writes a new checkpoint. Writers may
-convert ASTMAP1 to ASTMAP2 before the 16 MiB hard bound; the current writer keeps
-at most one index page (4096 bytes) of namespace metadata inline and converts
-larger snapshots at the next necessary checkpoint. Conversion is mandatory
-before an ASTMAP1 snapshot would exceed 16 MiB. Subsequent
+unchanged. A tail that would exceed 16 MiB writes a new checkpoint. A namespace
+whose ASTMAP1 encoding would exceed 16 MiB converts to ASTMAP2. Subsequent
 paged checkpoints retain that representation, including after empty reclaim.
 Unchanged immutable pages may be reused; checkpoint preparation does not move
 application payloads. Page records and the catalogue precede the existing
