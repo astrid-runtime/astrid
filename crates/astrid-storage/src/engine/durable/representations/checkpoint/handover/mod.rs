@@ -1,7 +1,5 @@
 //! Bind a worker-validated checkpoint to the still-fenced live writer tip.
 
-use std::collections::BTreeSet;
-
 use crate::storage_model::{CanonicalPhysicalMap, PhysicalMapNode};
 
 use super::super::{DurableError, RepresentationStore};
@@ -62,11 +60,12 @@ fn verify_map_bodies(
         return Err(disagreement());
     }
     let mut pending: Vec<_> = prepared.root().into_iter().collect();
-    let mut visited = BTreeSet::new();
+    // Canonical reachable closures are trees: recovery and rebuild reject
+    // repeated nodes. The arena can contain historical extras, so its size
+    // bounds every valid traversal and also terminates a corrupted cycle.
+    let mut remaining = prepared.nodes().len();
     while let Some(id) = pending.pop() {
-        if !visited.insert(id) {
-            continue;
-        }
+        remaining = remaining.checked_sub(1).ok_or_else(disagreement)?;
         let node = prepared.nodes().get(&id).ok_or_else(disagreement)?;
         if live.nodes().get(&id) != Some(node) {
             return Err(disagreement());
@@ -75,7 +74,8 @@ fn verify_map_bodies(
         // hidden by selecting the first matching domain. This includes aliases
         // that are currently unreachable in the other map.
         for map in live_maps {
-            if let Some(alias) = map.nodes().get(&id)
+            if !std::ptr::eq(map, live)
+                && let Some(alias) = map.nodes().get(&id)
                 && alias != node
             {
                 return Err(disagreement());

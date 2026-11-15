@@ -4,6 +4,33 @@ use super::super::super::{ArenaLocation, RepresentationStore};
 use super::super::adoption_tests::primed_volume;
 
 #[test]
+fn handover_rejects_matching_cached_cycles() {
+    let (_directory, volume, mut live, limits) = primed_volume();
+    let mut prepared = RepresentationStore::open_volume(&volume, limits)
+        .unwrap()
+        .unwrap();
+    let root = prepared.representations.root().unwrap();
+    let cycle = PhysicalMapNode::Branch {
+        domain: PhysicalMapDomain::Representation,
+        prefix_bits: 0,
+        prefix: vec![],
+        zero: root,
+        one: root,
+        subtree_entries: 1,
+    };
+    assert!(
+        live.representations
+            .replace_arena_node_for_fault(root, cycle.clone())
+    );
+    assert!(
+        prepared
+            .representations
+            .replace_arena_node_for_fault(root, cycle)
+    );
+    assert!(live.verify_checkpoint_tip(&prepared).is_err());
+}
+
+#[test]
 fn handover_requires_exact_live_reverse_even_when_authority_roots_match() {
     let (_directory, volume, mut live, limits) = primed_volume();
     let prepared = RepresentationStore::open_volume(&volume, limits)
