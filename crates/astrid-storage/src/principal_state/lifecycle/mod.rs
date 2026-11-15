@@ -225,6 +225,7 @@ impl RuntimeLifecycleGuard {
     /// Failures before retirement preserve host files. Later errors retain
     /// the durable volume and any surviving projection for recovery.
     pub fn finish_retained(self, mut finalization: RuntimeFinalization) -> StorageResult<()> {
+        tracing::debug!(phase = "pack.begin", "Retained runtime finalization");
         // Keep shutdown-error aggregation: do not `?` past require_volume_binding.
         let packed = match finalization.store.require_volume_binding(&self.home) {
             Err(error) => Err(error),
@@ -232,11 +233,24 @@ impl RuntimeLifecycleGuard {
                 .store
                 .pack_and_retire_runtime_projection(&self.home),
         };
+        tracing::debug!(
+            phase = "pack.done",
+            success = packed.is_ok(),
+            "Retained runtime finalization"
+        );
+        tracing::debug!(phase = "close.begin", "Retained runtime finalization");
         let closed = finalization.store.engine.close().map_err(|error| {
             StorageError::Connection(format!("close finalized runtime volume: {error}"))
         });
+        tracing::debug!(
+            phase = "close.done",
+            success = closed.is_ok(),
+            "Retained runtime finalization"
+        );
         let shutdown_error = finalization.shutdown_error.take();
+        tracing::debug!(phase = "drop.begin", "Retained runtime finalization");
         drop(finalization);
+        tracing::debug!(phase = "drop.done", "Retained runtime finalization");
         let finalized = match (packed, closed) {
             (Err(pack), Err(close)) => Err(StorageError::Connection(format!(
                 "{pack}; additionally failed to close retained storage: {close}"
