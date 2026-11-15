@@ -340,7 +340,7 @@ async fn run_finished_delete_steps(
         let volume_finished = volume_len(home);
         let live_volume_delta = volume_finished.saturating_sub(volume_before);
         eprintln!(
-            "ownership_amplification_probe step={index} target={target} reserve_ms={} aux_delete_ms={} finish_ms={} wire_before={} wire_reserved={} wire_finished={} volume_before={volume_before} volume_finished={volume_finished} live_volume_delta={live_volume_delta}",
+            "ownership_amplification_probe step={index} reserve_ms={} aux_delete_ms={} finish_ms={} wire_before={} wire_reserved={} wire_finished={} volume_before={volume_before} volume_finished={volume_finished} live_volume_delta={live_volume_delta}",
             reserve.as_millis(),
             aux_delete.as_millis(),
             finish.as_millis(),
