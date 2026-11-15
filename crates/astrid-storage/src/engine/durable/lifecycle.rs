@@ -36,22 +36,43 @@ where
     /// Returns a recovery-required, flush, or unlock error after still
     /// releasing every owned file handle.
     pub fn close(&self) -> Result<(), DurableError> {
+        // Arbiter then inner. Drain/join happens while holding both and without
+        // the physical representation mutex so the worker can return Prepared.
+        let mut arbiter = self.checkpoint_arbiter.lock();
         let mut inner = self.inner.lock();
         if inner.files.is_none() && inner.lock.is_none() {
-            return Ok(());
-        }
-        let poisoned = inner.poisoned;
-        let mut result = if inner.files.is_some() {
-            if poisoned {
-                Err(DurableError::RequiresRecovery)
-            } else {
-                self.flush_authority(&mut inner)
+            // Idempotent close: absorb any stray slot, then leave the engine closed.
+            if let Ok(super::checkpoint_worker::DrainedWorker::Prepared { checkpoint, .. }) =
+                super::checkpoint_worker::drain_join_slot(&mut arbiter, self.lifecycle.as_ref())
+            {
+                drop(checkpoint);
             }
-        } else if poisoned {
-            Err(DurableError::RequiresRecovery)
-        } else {
-            Err(DurableError::Closed)
+            return arbiter.bump_custody();
+        }
+
+        let mut result = match super::checkpoint_worker::drain_join_slot(
+            &mut arbiter,
+            self.lifecycle.as_ref(),
+        ) {
+            Ok(joined) => self.finish_drained_checkpoint(&arbiter, &mut inner, joined),
+            Err(error) => Err(error),
         };
+
+        let lifecycle = self.lifecycle.load(std::sync::atomic::Ordering::Acquire);
+        let poisoned = inner.poisoned || lifecycle == super::LIFECYCLE_REQUIRES_RECOVERY;
+        if poisoned {
+            inner.poisoned = true;
+        }
+        if result.is_ok() && poisoned {
+            result = Err(DurableError::RequiresRecovery);
+        }
+
+        let bump = arbiter.bump_custody();
+        if result.is_ok()
+            && let Err(error) = bump
+        {
+            result = Err(error);
+        }
         if result.is_ok()
             && inner.files.is_some()
             && let Err(error) =
@@ -60,6 +81,8 @@ where
             self.mark_requires_recovery(&mut inner);
             result = Err(error);
         }
+        // Common teardown always runs: prepare failure, publish uncertainty, and
+        // every other close error still release owned handles.
         drop(self.wal.lock().take());
         drop(inner.representations.take());
         drop(inner.files.take());
@@ -74,6 +97,74 @@ where
         };
         drop(self.volume.write().take());
         result.and(unlock)
+    }
+
+    fn finish_drained_checkpoint(
+        &self,
+        arbiter: &super::checkpoint_worker::CheckpointArbiterState,
+        inner: &mut DurableInner<P>,
+        joined: super::checkpoint_worker::DrainedWorker,
+    ) -> Result<(), DurableError> {
+        use super::checkpoint_worker::{DrainedWorker, PublicationPoison};
+        if let DrainedWorker::Prepared {
+            custody_generation, ..
+        } = &joined
+            && *custody_generation != arbiter.custody_generation
+        {
+            drop(joined);
+            self.mark_requires_recovery(inner);
+            return Err(DurableError::RequiresRecovery);
+        }
+        if inner.poisoned
+            || self.lifecycle.load(std::sync::atomic::Ordering::Acquire)
+                == super::LIFECYCLE_REQUIRES_RECOVERY
+        {
+            drop(joined);
+            inner.poisoned = true;
+            return Err(DurableError::RequiresRecovery);
+        }
+        if inner.files.is_none() {
+            return Err(DurableError::Closed);
+        }
+        // Exactly one authoritative flush for every close. If a prepared job
+        // was drained, this may append source updates it must still catch up.
+        if let Err(error) = self.flush_authority(inner) {
+            drop(joined);
+            self.mark_requires_recovery(inner);
+            return Err(error);
+        }
+        let DrainedWorker::Prepared {
+            control,
+            checkpoint,
+            ..
+        } = joined
+        else {
+            return Ok(());
+        };
+        let Some(shared) = inner.representations.clone() else {
+            drop(checkpoint);
+            self.mark_requires_recovery(inner);
+            return Err(DurableError::RequiresRecovery);
+        };
+        let retired = {
+            let mut store = shared.lock();
+            let mut poison = PublicationPoison::armed(self.lifecycle.as_ref());
+            match checkpoint.finish_drained(&mut store, self.limits, control.as_ref()) {
+                Ok(retired) => {
+                    poison.disarm();
+                    retired
+                },
+                Err(error) => {
+                    self.mark_requires_recovery(inner);
+                    return Err(error);
+                },
+            }
+        };
+        if let Err(error) = retired.reclaim() {
+            self.mark_requires_recovery(inner);
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(super) fn flush_for_retirement(
@@ -92,30 +183,78 @@ where
 
     fn flush_authority(&self, inner: &mut DurableInner<P>) -> Result<(), DurableError> {
         if self.transaction_wal.is_enabled() {
-            return self.checkpoint_transaction_wal(inner);
-        }
-        let representation_update = self.append_pending_direct_update(inner, &[])?;
-        let DurableInner {
-            files,
-            representations,
-            ..
-        } = inner;
-        let files = live_files_mut(files)?;
-        files
-            .arena
-            .sync_data()
-            .map_err(|source| io_error("flush object arena", source))?;
-        if let Some(representations) = representations {
-            if let Some(update) = representation_update {
-                representations.publish_direct_update(update)?;
+            self.checkpoint_transaction_wal(inner)
+        } else {
+            let shared = inner.representations.clone();
+            let mut representations = super::checkpoint_worker::lock_live_representations(
+                shared.as_ref(),
+                self.lifecycle.as_ref(),
+            )?;
+            let mut poison =
+                super::checkpoint_worker::PublicationPoison::armed(self.lifecycle.as_ref());
+            let representation_update =
+                match self.append_pending_direct_update(inner, representations.as_deref_mut(), &[])
+                {
+                    Ok(update) => update,
+                    Err(error) => {
+                        self.mark_requires_recovery(inner);
+                        poison.disarm();
+                        return Err(error);
+                    },
+                };
+            let files = match live_files_mut(&mut inner.files) {
+                Ok(files) => files,
+                Err(error) => {
+                    self.mark_requires_recovery(inner);
+                    poison.disarm();
+                    return Err(error);
+                },
+            };
+            if let Err(error) = files
+                .arena
+                .sync_data()
+                .map_err(|source| io_error("flush object arena", source))
+            {
+                self.mark_requires_recovery(inner);
+                poison.disarm();
+                return Err(error);
             }
-            representations.flush()?;
+            if let Some(store) = representations.as_mut() {
+                if let Some(update) = representation_update
+                    && let Err(error) = store.publish_direct_update(update)
+                {
+                    self.mark_requires_recovery(inner);
+                    poison.disarm();
+                    return Err(error);
+                }
+                if let Err(error) = store.flush() {
+                    self.mark_requires_recovery(inner);
+                    poison.disarm();
+                    return Err(error);
+                }
+            }
+            if let Err(error) = files
+                .roots
+                .sync_data()
+                .map_err(|source| io_error("flush root journal", source))
+            {
+                self.mark_requires_recovery(inner);
+                poison.disarm();
+                return Err(error);
+            }
+            // Hold the physical guard through volume durability.
+            match self.sync_volume() {
+                Ok(()) => {
+                    poison.disarm();
+                    Ok(())
+                },
+                Err(error) => {
+                    self.mark_requires_recovery(inner);
+                    poison.disarm();
+                    Err(error)
+                },
+            }
         }
-        files
-            .roots
-            .sync_data()
-            .map_err(|source| io_error("flush root journal", source))?;
-        self.sync_volume()
     }
 
     pub(super) fn sync_volume(&self) -> Result<(), DurableError> {
@@ -131,8 +270,18 @@ where
         &self,
         inner: &mut DurableInner<P>,
     ) -> Result<(), DurableError> {
+        // Own one physical fence through canonical fold, WAL reset and index
+        // publication. Poison must become visible before that fence releases
+        // on every error or panic, including errors after the fold itself.
+        let shared = inner.representations.clone();
+        let mut representations = super::checkpoint_worker::lock_live_representations(
+            shared.as_ref(),
+            self.lifecycle.as_ref(),
+        )?;
+        let mut poison =
+            super::checkpoint_worker::PublicationPoison::armed(self.lifecycle.as_ref());
         let result = (|| {
-            self.fold_pending_wal(inner)?;
+            self.fold_pending_wal(inner, representations.as_deref_mut())?;
             let mut wal = self.wal.lock();
             if let Some(writer) = wal.as_mut() {
                 writer.checkpoint().map_err(wal_durable_error)?;
@@ -142,11 +291,17 @@ where
         })();
         if result.is_err() {
             self.mark_requires_recovery(inner);
+        } else {
+            poison.disarm();
         }
         result
     }
 
-    fn fold_pending_wal(&self, inner: &mut DurableInner<P>) -> Result<(), DurableError> {
+    fn fold_pending_wal(
+        &self,
+        inner: &mut DurableInner<P>,
+        mut representations: Option<&mut super::representations::RepresentationStore>,
+    ) -> Result<(), DurableError> {
         let pending = inner.pending_wal.take();
         let mut new_ids = Vec::new();
         let mut new_payloads = Vec::new();
@@ -200,30 +355,28 @@ where
             .objects()
             .filter_map(|(_, object)| object.direct().cloned())
             .collect::<Vec<_>>();
-        let representation_update = self.append_pending_direct_update(inner, &staged_direct)?;
-        {
-            let DurableInner {
-                files,
-                representations,
-                ..
-            } = inner;
-            let files = live_files_mut(files)?;
-            files
-                .arena
-                .sync_data()
-                .map_err(|source| io_error("flush WAL checkpoint object arena", source))?;
-            if let Some(representations) = representations {
-                if let Some(update) = representation_update {
-                    representations.publish_direct_update(update)?;
-                }
-                representations.flush()?;
+        let representation_update = self.append_pending_direct_update(
+            inner,
+            representations.as_deref_mut(),
+            &staged_direct,
+        )?;
+        let files = live_files_mut(&mut inner.files)?;
+        files
+            .arena
+            .sync_data()
+            .map_err(|source| io_error("flush WAL checkpoint object arena", source))?;
+        if let Some(store) = representations.as_mut() {
+            if let Some(update) = representation_update {
+                store.publish_direct_update(update)?;
             }
-            files
-                .roots
-                .sync_data()
-                .map_err(|source| io_error("flush WAL checkpoint root journal", source))?;
+            store.flush()?;
         }
-        self.sync_volume()
+        files
+            .roots
+            .sync_data()
+            .map_err(|source| io_error("flush WAL checkpoint root journal", source))?;
+        self.sync_volume()?;
+        Ok(())
     }
 
     fn checkpoint_index(

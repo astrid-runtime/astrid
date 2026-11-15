@@ -40,6 +40,112 @@ fn locations(source: &mut ObservedSource) -> Vec<FrameLocation> {
 }
 
 #[test]
+fn committed_cursor_reads_two_frames_without_touching_the_remaining_suffix() {
+    for hosted in [false, true] {
+        let (_dir, mut source) = source(hosted);
+        let mut produced = Vec::new();
+        for payload in [b"first".as_slice(), b"second", b"unreadable third"] {
+            produced.push(append_frame(&mut source, ARENA_MAGIC, payload).unwrap());
+        }
+        let end = DurablePrefixEnd::exclusive(source.file.metadata().unwrap().len());
+        let range = DurableFrameRange::prefix(end);
+        source.unreadable = Some(produced[2].offset..end.get());
+        let mut cursor = range.start();
+        for expected in [b"first".as_slice(), b"second"] {
+            let (location, payload) = read_frame_in_range(
+                &mut source,
+                ARENA_FILE,
+                ARENA_MAGIC,
+                RecoveryLimits::process_addressable(),
+                range,
+                cursor,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(payload, expected);
+            cursor = location.end().unwrap();
+        }
+        assert_eq!(cursor.get(), produced[2].offset);
+        assert!(
+            source
+                .reads
+                .borrow()
+                .iter()
+                .all(|(offset, _)| *offset < produced[2].offset)
+        );
+        assert!(
+            read_frame_in_range(
+                &mut source,
+                ARENA_FILE,
+                ARENA_MAGIC,
+                RecoveryLimits::process_addressable(),
+                range,
+                cursor,
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn committed_cursor_rejects_escape_and_partial_frames_without_repair() {
+    for hosted in [false, true] {
+        let (_dir, mut source) = source(hosted);
+        append_frame(&mut source, ARENA_MAGIC, b"first").unwrap();
+        let second = append_frame(&mut source, ARENA_MAGIC, b"second").unwrap();
+        let full_end = source.file.metadata().unwrap().len();
+        let start = DurablePrefixEnd::exclusive(second.offset);
+        let end = DurablePrefixEnd::exclusive(full_end);
+        let range = DurableFrameRange::try_new(start, end).unwrap();
+        for offset in [
+            DurablePrefixEnd::exclusive(0),
+            DurablePrefixEnd::exclusive(full_end.strict_add(1)),
+        ] {
+            source.reads.borrow_mut().clear();
+            assert!(
+                read_frame_in_range(
+                    &mut source,
+                    ARENA_FILE,
+                    ARENA_MAGIC,
+                    RecoveryLimits::process_addressable(),
+                    range,
+                    offset,
+                )
+                .is_err()
+            );
+            assert!(source.reads.borrow().is_empty());
+        }
+        let partial =
+            DurableFrameRange::try_new(start, DurablePrefixEnd::exclusive(full_end.strict_sub(1)))
+                .unwrap();
+        assert!(
+            read_frame_in_range(
+                &mut source,
+                ARENA_FILE,
+                ARENA_MAGIC,
+                RecoveryLimits::process_addressable(),
+                partial,
+                start,
+            )
+            .is_err()
+        );
+        assert_eq!(source.file.metadata().unwrap().len(), full_end);
+        assert!(
+            read_frame_in_range(
+                &mut source,
+                ARENA_FILE,
+                ARENA_MAGIC,
+                RecoveryLimits::process_addressable(),
+                range,
+                end,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+}
+
+#[test]
 fn validated_extents_read_only_one_complete_frame_and_leave_appending_usable() {
     for hosted in [false, true] {
         let (_dir, mut source) = source(hosted);

@@ -1,0 +1,113 @@
+//! Observing destination evidence must not introduce another update grammar.
+
+use std::io::{Read, Seek, SeekFrom};
+use std::sync::Arc;
+
+use super::super::{DurableFile, ObjectId, RecoveryLimits, RepresentationStore};
+use super::*;
+use crate::volume::{AstridVolume, HostedFileVolume};
+
+fn empty_store(volume: &Arc<dyn AstridVolume>) -> RepresentationStore {
+    RepresentationStore::activate_volume(
+        volume,
+        RecoveryLimits::process_addressable(),
+        ObjectId::new([1; 32]),
+        [],
+    )
+    .unwrap()
+}
+
+fn bytes(file: &mut DurableFile) -> Vec<u8> {
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn observed_and_ordinary_direct_updates_emit_identical_metadata_and_journal() {
+    let directory = tempfile::tempdir().unwrap();
+    let normal_volume: Arc<dyn AstridVolume> =
+        HostedFileVolume::open(directory.path().join("normal.volume")).unwrap();
+    let observed_volume: Arc<dyn AstridVolume> =
+        HostedFileVolume::open(directory.path().join("observed.volume")).unwrap();
+    let mut normal = empty_store(&normal_volume);
+    let mut observed = empty_store(&observed_volume);
+    for tag in [42, 43] {
+        let direct = normal
+            .describe_direct(
+                ObjectId::new([tag; 32]),
+                &[tag; 16],
+                ArenaLocation {
+                    offset: u64::from(tag),
+                    payload_len: 16,
+                    checksum: [tag; 32],
+                },
+            )
+            .unwrap();
+        let before_metadata = observed.metadata.metadata().unwrap().len();
+        let before_journal = observed.journal.metadata().unwrap().len();
+        let update = normal
+            .append_direct_update(std::slice::from_ref(&direct))
+            .unwrap()
+            .unwrap();
+        normal.publish_direct_update(update).unwrap();
+        let (update, evidence) = observed
+            .append_direct_update_observed(&[direct])
+            .unwrap()
+            .unwrap();
+        assert!(!evidence.appended_map_nodes.is_empty());
+        let journal = observed.publish_direct_update_observed(update).unwrap();
+        assert_eq!(evidence.metadata.start().get(), before_metadata);
+        assert_eq!(
+            evidence.metadata.end().get(),
+            observed.metadata.metadata().unwrap().len()
+        );
+        assert_eq!(journal.start().get(), before_journal);
+        assert_eq!(
+            journal.end().get(),
+            observed.journal.metadata().unwrap().len()
+        );
+        assert_eq!(bytes(&mut normal.metadata), bytes(&mut observed.metadata));
+        assert_eq!(bytes(&mut normal.journal), bytes(&mut observed.journal));
+        assert_eq!(normal.active, observed.active);
+        assert_eq!(normal.reverse, observed.reverse);
+        assert_eq!(normal.map_frame_count, observed.map_frame_count);
+        assert_eq!(normal.complete_map_subtrees, observed.complete_map_subtrees);
+        assert_eq!(normal.persisted_map_nodes, observed.persisted_map_nodes);
+    }
+}
+
+#[test]
+fn observing_an_already_direct_object_emits_no_append_evidence_or_frames() {
+    let directory = tempfile::tempdir().unwrap();
+    let volume: Arc<dyn AstridVolume> =
+        HostedFileVolume::open(directory.path().join("duplicate.volume")).unwrap();
+    let mut store = empty_store(&volume);
+    let direct = store
+        .describe_direct(
+            ObjectId::new([42; 32]),
+            &[7; 16],
+            ArenaLocation {
+                offset: 17,
+                payload_len: 16,
+                checksum: [8; 32],
+            },
+        )
+        .unwrap();
+    let update = store
+        .append_direct_update(std::slice::from_ref(&direct))
+        .unwrap()
+        .unwrap();
+    store.publish_direct_update(update).unwrap();
+    let metadata = bytes(&mut store.metadata);
+    let journal = bytes(&mut store.journal);
+    assert!(
+        store
+            .append_direct_update_observed(&[direct])
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(bytes(&mut store.metadata), metadata);
+    assert_eq!(bytes(&mut store.journal), journal);
+}

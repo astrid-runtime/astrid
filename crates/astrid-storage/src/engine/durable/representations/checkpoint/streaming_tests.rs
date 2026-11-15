@@ -147,7 +147,7 @@ fn install_invalid_second_map(store: &mut RepresentationStore) {
 }
 
 #[test]
-fn private_proof_failure_or_write_failure_leaves_old_authority_and_retry_cleans_up() {
+fn private_proof_failure_or_write_failure_preserves_authority_and_reclaims_private_media() {
     for fail_write in [false, true] {
         let (_directory, inner, mut store, limits) = primed_volume();
         let wrapper = Arc::new(SyncFailOnceVolume::new(Arc::clone(&inner)));
@@ -193,7 +193,14 @@ fn private_proof_failure_or_write_failure_leaves_old_authority_and_retry_cleans_
             generation_name(generation + 1)
         ))
         .unwrap();
-        assert_eq!(volume.region_len(&private_journal).unwrap(), 0);
+        for region in [&private_metadata, &private_journal] {
+            let error = volume.region_len(region).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::NotFound,
+                "unpublished checkpoint media must be reclaimed immediately"
+            );
+        }
         for (region, length) in old_regions.iter().zip(old_lengths) {
             assert_eq!(volume.region_len(region).unwrap(), length);
         }
@@ -218,8 +225,8 @@ fn private_proof_failure_or_write_failure_leaves_old_authority_and_retry_cleans_
             store.state,
             store.active,
         ) = original;
-        // The production retry removes failed private files, including a large
-        // partial frame written while the previous proof was still incomplete.
+        // The production retry remains valid after immediate cleanup, including
+        // a large partial frame written before the previous proof failed.
         store.checkpoint_volume(&volume, limits).unwrap();
         assert_eq!(store.journal_generation, generation + 1);
         assert!(

@@ -413,11 +413,32 @@ where
             _ => {},
         }
 
+        // Cancel/join outside `inner` first. Worker-only atomic poison must still
+        // heal here: reconcile into `inner.poisoned` before `recover_locked`.
+        let mut arbiter = super::checkpoint_worker::cancel_join_checkpoint_worker(
+            self.checkpoint_arbiter.as_ref(),
+            self.lifecycle.as_ref(),
+        );
+        arbiter.bump_custody()?;
         let mut inner = self.inner.lock();
-        self.recover_locked(&mut inner)
+        let lifecycle = self.lifecycle.load(std::sync::atomic::Ordering::Acquire);
+        if lifecycle == LIFECYCLE_CLOSED {
+            return Err(DurableError::Closed);
+        }
+        if lifecycle == super::LIFECYCLE_REQUIRES_RECOVERY || inner.poisoned {
+            inner.poisoned = true;
+        } else if inner.files.is_some() {
+            return Ok(false);
+        } else {
+            return Err(DurableError::Closed);
+        }
+        let recovered = self.recover_locked(&mut inner);
+        drop(inner);
+        drop(arbiter);
+        recovered
     }
 
-    fn recover_locked(&self, inner: &mut DurableInner<P>) -> Result<bool, DurableError> {
+    pub(super) fn recover_locked(&self, inner: &mut DurableInner<P>) -> Result<bool, DurableError> {
         if !inner.poisoned {
             return if inner.files.is_some() {
                 Ok(false)
@@ -462,7 +483,9 @@ where
                     inner.pending_wal = super::wal::PendingWalOverlay::default();
                     inner.validated = recovered.validated;
                     inner.files = Some(recovered.files);
-                    inner.representations = recovered.representations;
+                    inner.representations = recovered
+                        .representations
+                        .map(super::checkpoint_worker::wrap_representations);
                     *self.wal.lock() = wal;
                     inner.poisoned = false;
                     inner.arena_generation = next_generation;
@@ -526,10 +549,35 @@ where
         &self,
         recovery: &mut RecoveryScope,
     ) -> Result<MutexGuard<'_, DurableInner<P>>, DurableError> {
-        let mut inner = self.inner.lock();
-        if inner.poisoned {
+        let inner = self.inner.lock();
+        let lifecycle = self.lifecycle.load(std::sync::atomic::Ordering::Acquire);
+        if lifecycle == super::LIFECYCLE_CLOSED {
+            return Err(DurableError::Closed);
+        }
+        let needs_recovery = inner.poisoned || lifecycle == super::LIFECYCLE_REQUIRES_RECOVERY;
+        if needs_recovery {
             recovery.enter()?;
-            self.recover_locked(&mut inner)?;
+            // Never join a checkpoint worker while holding `inner`: the worker only
+            // try_locks the arbiter, but may hold the physical mutex. Release inner,
+            // cancel/join under the arbiter, then re-lock and recheck before recovering.
+            drop(inner);
+            let mut arbiter = super::checkpoint_worker::cancel_join_checkpoint_worker(
+                self.checkpoint_arbiter.as_ref(),
+                self.lifecycle.as_ref(),
+            );
+            arbiter.bump_custody()?;
+            let mut inner = self.inner.lock();
+            let lifecycle = self.lifecycle.load(std::sync::atomic::Ordering::Acquire);
+            if lifecycle == super::LIFECYCLE_CLOSED {
+                return Err(DurableError::Closed);
+            }
+            if inner.poisoned || lifecycle == super::LIFECYCLE_REQUIRES_RECOVERY {
+                inner.poisoned = true;
+                self.recover_locked(&mut inner)?;
+            }
+            drop(arbiter);
+            super::ensure_usable(&inner)?;
+            return Ok(inner);
         }
         super::ensure_usable(&inner)?;
         Ok(inner)

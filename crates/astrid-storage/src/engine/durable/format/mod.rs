@@ -10,7 +10,6 @@ use super::{
 };
 #[cfg(test)]
 use std::fs::OpenOptions;
-use std::io::{Read as _, Seek as _};
 #[cfg(test)]
 use std::path::Path;
 
@@ -32,6 +31,7 @@ mod location;
 mod positioned_tests;
 mod prepared;
 mod reader;
+mod scan;
 #[cfg(test)]
 mod scan_tests;
 
@@ -42,9 +42,18 @@ pub(super) use indexed::{
     read_indexed_object, read_indexed_object_with_payload, read_indexed_objects,
     visit_indexed_objects,
 };
-pub(super) use location::{FrameLocation, scan_frames_with_source};
+#[cfg(test)]
+pub(super) use location::scan_frames_prefix_with_source;
+pub(super) use location::{
+    DurableFrameRange, DurablePrefixEnd, FrameLocation, read_frame_in_range,
+    scan_frames_range_with_source, scan_frames_with_source,
+};
 pub(super) use prepared::{PreparedFrame, append_prepared_frames};
 use reader::SliceReader;
+#[cfg(test)]
+pub(super) use scan::scan_frames_prefix;
+use scan::{FrameScanBound, read_frame_preserving_cursor_within, scan_frames_with_bound};
+pub(super) use scan::{scan_frames, scan_frames_range, scan_frames_with_protected_prefix};
 
 pub(super) fn verify_indexed_location<F: DurableIo>(
     arena: &mut F,
@@ -347,194 +356,10 @@ pub(in crate::engine::durable) fn recovery_arena_scans() -> usize {
     RECOVERY_ARENA_SCANS.with(std::cell::Cell::get)
 }
 
-/// Successful scans leave the cursor at the current append boundary. After
-/// an error the cursor is unspecified: callers must abandon or reposition the
-/// handle before reuse. A rejected callback is never treated as tail damage.
-pub(super) fn scan_frames<F: DurableIo>(
-    file: &mut F,
-    file_name: &'static str,
-    magic: [u8; 8],
-    limits: RecoveryLimits,
-    mut accept: impl FnMut(u64, &[u8]) -> Result<(), DurableError>,
-) -> Result<(), DurableError> {
-    scan_frames_with_source(
-        file,
-        file_name,
-        magic,
-        limits,
-        |location, payload, _source| accept(location.offset(), payload),
-    )
-}
-
-fn read_frame_preserving_cursor<F: DurableIo>(
-    source: &mut F,
-    file_name: &'static str,
-    magic: [u8; 8],
-    offset: u64,
-    limits: RecoveryLimits,
-) -> Result<Vec<u8>, DurableError> {
-    let position = if source.durable_read_at_preserves_cursor() {
-        None
-    } else {
-        Some(
-            source
-                .stream_position()
-                .map_err(|error| io_error("save durable scan read-ahead position", error))?,
-        )
-    };
-    let payload = read_frame_at(source, file_name, magic, offset, limits)?;
-    if let Some(position) = position {
-        source
-            .seek(SeekFrom::Start(position))
-            .map_err(|error| io_error("restore durable scan read-ahead position", error))?;
-    }
-    Ok(payload)
-}
-
-fn scan_frames_with_protected_prefix<F: DurableIo>(
-    file: &mut F,
-    file_name: &'static str,
-    magic: [u8; 8],
-    limits: RecoveryLimits,
-    protected_len: u64,
-    mut accept: impl FnMut(u64, &[u8], &mut F) -> Result<(), DurableError>,
-) -> Result<(), DurableError> {
-    let file_len = validated_file_len(file, file_name, protected_len)?;
-    let policy = FrameScanPolicy {
-        magic,
-        limits,
-        protected_len,
-        file_len,
-    };
-    file.seek(SeekFrom::Start(0))
-        .map_err(|source| io_error("seek durable frame", source))?;
-    // The scan owns the cursor. Buffer sequential reads rather than seeking
-    // and issuing separate media reads for every header and small payload.
-    let mut reader = std::io::BufReader::new(file);
-    let mut offset = 0_u64;
-    while offset < file_len {
-        let remaining = file_len
-            .checked_sub(offset)
-            .ok_or(DurableError::EncodingOverflow)?;
-        if remaining < FRAME_HEADER_LEN {
-            if offset < protected_len {
-                return Err(corrupt(
-                    file_name,
-                    offset,
-                    "published frame header is truncated",
-                ));
-            }
-            truncate_tail(*reader.get_mut(), offset)?;
-            break;
-        }
-        let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
-        reader
-            .read_exact(&mut header)
-            .map_err(|source| io_error("read durable frame header", source))?;
-        if header[..8] != magic {
-            truncate_unpublished_tail_or_fail(
-                *reader.get_mut(),
-                policy,
-                offset,
-                false,
-                corrupt(file_name, offset, "frame magic mismatch"),
-            )?;
-            break;
-        }
-        let decoded = decode_frame_header(file_name, offset, &header)?;
-        let payload_len = decoded.payload_len;
-        if payload_len > limits.max_frame_bytes {
-            let error = DurableError::FrameTooLarge {
-                file: file_name,
-                offset,
-                declared: payload_len,
-                limit: limits.max_frame_bytes,
-            };
-            if offset < protected_len {
-                return Err(error);
-            }
-            let claimed_end = FRAME_HEADER_LEN
-                .checked_add(payload_len)
-                .and_then(|frame_len| offset.checked_add(frame_len));
-            truncate_unpublished_tail_or_fail(
-                *reader.get_mut(),
-                policy,
-                offset,
-                claimed_end.is_some_and(|end| end <= file_len),
-                error,
-            )?;
-            break;
-        }
-        let frame_len = FRAME_HEADER_LEN
-            .checked_add(payload_len)
-            .ok_or(DurableError::EncodingOverflow)?;
-        let frame_end = offset
-            .checked_add(frame_len)
-            .ok_or(DurableError::EncodingOverflow)?;
-        if frame_end > file_len {
-            if offset < protected_len {
-                return Err(corrupt(
-                    file_name,
-                    offset,
-                    "published frame payload is truncated",
-                ));
-            }
-            truncate_tail(*reader.get_mut(), offset)?;
-            break;
-        }
-        let payload = read_frame_payload(&mut reader, payload_len)?;
-        if frame_checksum(magic, payload_len, &payload) != decoded.checksum {
-            truncate_unpublished_tail_or_fail(
-                *reader.get_mut(),
-                policy,
-                offset,
-                false,
-                corrupt(file_name, offset, "frame checksum mismatch"),
-            )?;
-            break;
-        }
-        accept(offset, &payload, *reader.get_mut())?;
-        offset = frame_end;
-    }
-    // Tail repair above is terminal: discard any read-ahead before exposing
-    // the cursor again, including when repair shortened the underlying file.
-    reader
-        .seek(SeekFrom::End(0))
-        .map_err(|source| io_error("seek durable file tail", source))?;
-    Ok(())
-}
-
-fn validated_file_len<F: DurableIo>(
-    file: &F,
-    file_name: &'static str,
-    protected_len: u64,
-) -> Result<u64, DurableError> {
-    let file_len = file
-        .durable_metadata()
-        .map_err(|source| io_error("read principal-store metadata", source))?
-        .len();
-    if file_len < protected_len {
-        return Err(corrupt(
-            file_name,
-            file_len,
-            "published durable prefix is truncated",
-        ));
-    }
-    Ok(file_len)
-}
-
 #[derive(Clone, Copy)]
 struct DecodedFrameHeader {
     payload_len: u64,
     checksum: [u8; 32],
-}
-
-#[derive(Clone, Copy)]
-struct FrameScanPolicy {
-    magic: [u8; 8],
-    limits: RecoveryLimits,
-    protected_len: u64,
-    file_len: u64,
 }
 
 fn decode_frame_header(
@@ -563,165 +388,6 @@ fn decode_frame_header(
             .try_into()
             .map_err(|_| DurableError::EncodingOverflow)?,
     })
-}
-
-fn read_frame_payload<F: std::io::Read>(
-    file: &mut F,
-    payload_len: u64,
-) -> Result<Vec<u8>, DurableError> {
-    let payload_usize = usize::try_from(payload_len).map_err(|_| DurableError::EncodingOverflow)?;
-    let mut payload = Vec::new();
-    payload
-        .try_reserve_exact(payload_usize)
-        .map_err(|_| DurableError::EncodingOverflow)?;
-    payload.resize(payload_usize, 0);
-    file.read_exact(&mut payload)
-        .map_err(|source| io_error("read durable frame payload", source))?;
-    Ok(payload)
-}
-
-fn truncate_unpublished_tail_or_fail<F: DurableIo>(
-    file: &mut F,
-    policy: FrameScanPolicy,
-    offset: u64,
-    known_interior: bool,
-    error: DurableError,
-) -> Result<(), DurableError> {
-    if offset < policy.protected_len
-        || known_interior
-        || valid_frame_follows(file, policy.magic, offset, policy.file_len, policy.limits)?
-    {
-        return Err(error);
-    }
-    truncate_tail(file, offset)
-}
-
-fn valid_frame_follows<F: DurableIo>(
-    file: &mut F,
-    magic: [u8; 8],
-    invalid_offset: u64,
-    file_len: u64,
-    limits: RecoveryLimits,
-) -> Result<bool, DurableError> {
-    let Some(mut search_offset) = invalid_offset.checked_add(1) else {
-        return Ok(false);
-    };
-    let mut buffer = Vec::new();
-    buffer
-        .try_reserve_exact(65_543)
-        .map_err(|_| DurableError::EncodingOverflow)?;
-    buffer.resize(65_543, 0);
-    while search_offset < file_len {
-        file.seek(SeekFrom::Start(search_offset))
-            .map_err(|source| io_error("seek durable tail recovery scan", source))?;
-        let remaining = file_len
-            .checked_sub(search_offset)
-            .ok_or(DurableError::EncodingOverflow)?;
-        let wanted = usize::try_from(remaining.min(buffer.len() as u64))
-            .map_err(|_| DurableError::EncodingOverflow)?;
-        let read = file
-            .read(&mut buffer[..wanted])
-            .map_err(|source| io_error("read durable tail recovery scan", source))?;
-        if read < magic.len() {
-            return Ok(false);
-        }
-        for relative in 0..=read.saturating_sub(magic.len()) {
-            let candidate_end = relative
-                .checked_add(magic.len())
-                .ok_or(DurableError::EncodingOverflow)?;
-            if buffer.get(relative..candidate_end) != Some(magic.as_slice()) {
-                continue;
-            }
-            let candidate = search_offset
-                .checked_add(u64::try_from(relative).map_err(|_| DurableError::EncodingOverflow)?)
-                .ok_or(DurableError::EncodingOverflow)?;
-            if physical_frame_is_valid(file, magic, candidate, file_len, limits)? {
-                return Ok(true);
-            }
-        }
-        if read < wanted {
-            return Ok(false);
-        }
-        let overlap = magic.len().saturating_sub(1);
-        search_offset = search_offset
-            .checked_add(
-                u64::try_from(read.saturating_sub(overlap))
-                    .map_err(|_| DurableError::EncodingOverflow)?,
-            )
-            .ok_or(DurableError::EncodingOverflow)?;
-    }
-    Ok(false)
-}
-
-fn physical_frame_is_valid<F: DurableIo>(
-    file: &mut F,
-    magic: [u8; 8],
-    offset: u64,
-    file_len: u64,
-    limits: RecoveryLimits,
-) -> Result<bool, DurableError> {
-    let remaining = file_len
-        .checked_sub(offset)
-        .ok_or(DurableError::EncodingOverflow)?;
-    if remaining < FRAME_HEADER_LEN {
-        return Ok(false);
-    }
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|source| io_error("seek durable recovery candidate", source))?;
-    let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
-    file.read_exact(&mut header)
-        .map_err(|source| io_error("read durable recovery candidate", source))?;
-    if header[..8] != magic
-        || u16::from_le_bytes([header[8], header[9]]) != FRAME_VERSION
-        || header[10..12] != [0, 0]
-    {
-        return Ok(false);
-    }
-    let payload_len = u64::from_le_bytes(
-        header[12..20]
-            .try_into()
-            .map_err(|_| DurableError::EncodingOverflow)?,
-    );
-    let frame_len = FRAME_HEADER_LEN
-        .checked_add(payload_len)
-        .ok_or(DurableError::EncodingOverflow)?;
-    if frame_len > remaining {
-        return Ok(false);
-    }
-    if payload_len > limits.max_frame_bytes {
-        return Ok(true);
-    }
-    let expected: [u8; 32] = header[CHECKSUM_START..]
-        .try_into()
-        .map_err(|_| DurableError::EncodingOverflow)?;
-    let mut hasher = blake3::Hasher::new_derive_key("astrid durable physical frame checksum v1");
-    hasher.update(&magic);
-    hasher.update(&FRAME_VERSION.to_le_bytes());
-    hasher.update(&payload_len.to_le_bytes());
-    let mut unread = payload_len;
-    let mut buffer = Vec::new();
-    buffer
-        .try_reserve_exact(65_536)
-        .map_err(|_| DurableError::EncodingOverflow)?;
-    buffer.resize(65_536, 0);
-    while unread != 0 {
-        let chunk = usize::try_from(unread.min(buffer.len() as u64))
-            .map_err(|_| DurableError::EncodingOverflow)?;
-        file.read_exact(&mut buffer[..chunk])
-            .map_err(|source| io_error("read durable recovery candidate payload", source))?;
-        hasher.update(&buffer[..chunk]);
-        unread = unread
-            .checked_sub(u64::try_from(chunk).map_err(|_| DurableError::EncodingOverflow)?)
-            .ok_or(DurableError::EncodingOverflow)?;
-    }
-    Ok(hasher.finalize().as_bytes() == &expected)
-}
-
-fn truncate_tail<F: DurableIo>(file: &mut F, valid_len: u64) -> Result<(), DurableError> {
-    file.durable_set_len(valid_len)
-        .map_err(|source| io_error("truncate incomplete durable tail", source))?;
-    file.durable_sync_data()
-        .map_err(|source| io_error("flush durable tail truncation", source))
 }
 
 pub(super) fn append_frame<F: DurableIo>(

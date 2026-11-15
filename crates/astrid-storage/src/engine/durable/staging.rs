@@ -8,7 +8,7 @@ use crate::storage_model::{
     InsertOutcome, ModelError, ObjectId, ObjectRecord, RepresentationProfileId,
 };
 
-use super::representations::{PreparedDirectArenaObject, RepresentationStore};
+use super::representations::PreparedDirectArenaObject;
 use super::{
     ARENA_FILE, ARENA_MAGIC, ArenaLocation, DurableEngine, DurableError, DurableInner, File,
     PersistentObjectIdentity, PreparedFrame, PrincipalCodec, append_frame, append_prepared_frames,
@@ -324,17 +324,22 @@ where
         };
         match appended {
             Ok(location) => {
-                let direct = inner
-                    .representations
-                    .as_ref()
-                    .map(|representations| {
-                        representations.describe_direct(
-                            id,
-                            super::canonical_record_bytes(&payload, self.identity.scheme())?,
-                            location,
-                        )
-                    })
-                    .transpose();
+                let direct = {
+                    let representations = super::checkpoint_worker::lock_live_representations(
+                        inner.representations.as_ref(),
+                        self.lifecycle.as_ref(),
+                    )?;
+                    representations
+                        .as_ref()
+                        .map(|representations| {
+                            representations.describe_direct(
+                                id,
+                                super::canonical_record_bytes(&payload, self.identity.scheme())?,
+                                location,
+                            )
+                        })
+                        .transpose()
+                };
                 let direct = match direct {
                     Ok(direct) => direct,
                     Err(error) => {
@@ -454,10 +459,12 @@ where
             preparation_started,
         );
         let mut inner = self.lock_usable()?;
-        let direct_profile = inner
-            .representations
-            .as_ref()
-            .map(RepresentationStore::direct_profile);
+        let direct_profile = super::checkpoint_worker::lock_live_representations(
+            inner.representations.as_ref(),
+            self.lifecycle.as_ref(),
+        )?
+        .as_ref()
+        .map(|store| store.direct_profile());
         let probe_started = Instant::now();
         let already_present = self.verify_existing_batch(&mut inner, &prepared.unique)?;
         record_phase(observer, ProjectionPhase::AdmissionProbe, probe_started);
@@ -483,10 +490,12 @@ where
     {
         loop {
             let mut inner = self.lock_usable()?;
-            let active_profile = inner
-                .representations
-                .as_ref()
-                .map(RepresentationStore::direct_profile);
+            let active_profile = super::checkpoint_worker::lock_live_representations(
+                inner.representations.as_ref(),
+                self.lifecycle.as_ref(),
+            )?
+            .as_ref()
+            .map(|store| store.direct_profile());
             let probe_started = Instant::now();
             let already_present =
                 self.verify_existing_batch(&mut inner, &prepared_batch.prepared.unique)?;

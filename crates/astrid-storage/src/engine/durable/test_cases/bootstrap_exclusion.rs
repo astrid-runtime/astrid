@@ -14,6 +14,21 @@ fn evidence(bytes: &[u8]) -> ObjectRecord {
     .unwrap()
 }
 
+fn directly_covers(engine: &TestEngine, object: ObjectId) -> bool {
+    let inner = engine.inner.lock();
+    inner
+        .representations
+        .as_ref()
+        .unwrap()
+        .lock()
+        .contains_direct(object)
+}
+
+fn active_physical_state(engine: &TestEngine) -> crate::storage_model::RepresentationStateId {
+    let inner = engine.inner.lock();
+    inner.representations.as_ref().unwrap().lock().active()
+}
+
 #[test]
 fn predecessor_repair_cannot_silently_make_successor_bootstrap_relocatable() {
     for volume_backed in [false, true] {
@@ -48,15 +63,7 @@ fn predecessor_repair_cannot_silently_make_successor_bootstrap_relocatable() {
             .persist_bootstrap_object(&new_specification)
             .unwrap()
             .0;
-        assert!(
-            !engine
-                .inner
-                .lock()
-                .representations
-                .as_ref()
-                .unwrap()
-                .contains_direct(new_id)
-        );
+        assert!(!directly_covers(&engine, new_id));
         engine.close().unwrap();
         drop(engine);
 
@@ -66,26 +73,12 @@ fn predecessor_repair_cannot_silently_make_successor_bootstrap_relocatable() {
         predecessor
             .ensure_direct_representation_catalogue(old_id, &[old_id])
             .unwrap();
-        assert!(
-            predecessor
-                .inner
-                .lock()
-                .representations
-                .as_ref()
-                .unwrap()
-                .contains_direct(new_id)
-        );
+        assert!(directly_covers(&predecessor, new_id));
         predecessor.close().unwrap();
         drop(predecessor);
 
         let successor = reopen();
-        let before = successor
-            .inner
-            .lock()
-            .representations
-            .as_ref()
-            .unwrap()
-            .active();
+        let before = active_physical_state(&successor);
         let result = successor.ensure_direct_representation_catalogue_compatible_with(
             new_id,
             &[old_id],
@@ -100,16 +93,7 @@ fn predecessor_repair_cannot_silently_make_successor_bootstrap_relocatable() {
             ),
             "volume_backed={volume_backed}: {result:?}"
         );
-        assert_eq!(
-            successor
-                .inner
-                .lock()
-                .representations
-                .as_ref()
-                .unwrap()
-                .active(),
-            before
-        );
+        assert_eq!(active_physical_state(&successor), before);
         assert_eq!(
             successor.root(&"alice".to_owned()).unwrap(),
             Some(expected_root)

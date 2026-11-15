@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use parking_lot::{Mutex, RwLock};
 
 use super::{
-    CommitGroup, DurableEngine, DurableError, DurableInner, LIFECYCLE_CLOSED, LIFECYCLE_USABLE,
-    PersistentObjectIdentity, PrincipalCodec, PublishedRoots, io_error,
+    CommitGroup, DurableEngine, DurableError, DurableInner, LIFECYCLE_CLOSED,
+    LIFECYCLE_REQUIRES_RECOVERY, LIFECYCLE_USABLE, PersistentObjectIdentity, PrincipalCodec,
+    PublishedRoots, io_error,
 };
 
 impl<P, I, C> DurableEngine<P, I, C>
@@ -29,9 +30,24 @@ where
         if !group.is_idle() {
             return Err(busy());
         }
+        // Cancel/join checkpoint work under the arbiter before taking inner so a
+        // worker cannot publish while custody moves, and cannot deadlock on join.
+        let mut arbiter = super::checkpoint_worker::cancel_join_checkpoint_worker(
+            self.checkpoint_arbiter.as_ref(),
+            self.lifecycle.as_ref(),
+        );
+        arbiter.bump_custody()?;
         // Never wait for a stager while holding the commit queue. A caller
         // that has not actually quiesced must retry after joining its writers.
         let mut inner = self.inner.try_lock().ok_or_else(busy)?;
+        let lifecycle = self.lifecycle.load(Ordering::Acquire);
+        if lifecycle == LIFECYCLE_REQUIRES_RECOVERY || inner.poisoned {
+            inner.poisoned = true;
+            return Err(DurableError::RequiresRecovery);
+        }
+        if lifecycle == LIFECYCLE_CLOSED {
+            return Err(DurableError::Closed);
+        }
         super::ensure_usable(&inner)?;
         if inner.lock.is_none() || self.arena_reader.read().is_none() {
             return Err(DurableError::Closed);
@@ -49,6 +65,7 @@ where
             ),
         };
         self.object_cache.clear();
+        drop(arbiter);
         Ok(Self {
             directory: self.directory.clone(),
             directory_capability: self.directory_capability.clone(),
@@ -61,13 +78,16 @@ where
             commit_group: Mutex::new(CommitGroup::default()),
             transaction_wal: self.transaction_wal,
             wal: Mutex::new(self.wal.lock().take()),
-            lifecycle: AtomicU8::new(LIFECYCLE_USABLE),
+            lifecycle: Arc::new(AtomicU8::new(LIFECYCLE_USABLE)),
             arena_reader: RwLock::new(reader.take()),
             object_cache: self.object_cache.empty_peer(),
             recovery_policy: self.recovery_policy,
             preparation_authority: Arc::new(()),
             inner: Mutex::new(transferred),
             published_roots,
+            checkpoint_arbiter: Arc::new(Mutex::new(
+                super::checkpoint_worker::CheckpointArbiterState::default(),
+            )),
         })
     }
 }

@@ -467,40 +467,13 @@ where
                     return;
                 },
             };
-            match self.persist_group(&mut inner, &accepted) {
-                Ok(persisted) => {
-                    for location in persisted.locations {
-                        inner.index.insert(location.0, location.1);
-                        inner.pending_index_locations.push(location);
-                    }
-                    debug_assert!(
-                        live_files_mut(&mut inner.files)
-                            .map_or(true, |files| files.arena_len >= previous_arena_len)
-                    );
-                    let frontier = self.publish_commit_frontier(&mut inner, persisted.arena_len);
-                    if let Err(error) = frontier {
-                        self.mark_requires_recovery(&mut inner);
-                        complete_failed_group(&mut completions, accepted, error);
-                    } else {
-                        for mut accepted in accepted {
-                            retired_projections.extend(
-                                self.publish_durable_root(&mut inner, &mut accepted.prepared),
-                            );
-                            completions.push((
-                                accepted.receipt,
-                                Ok(CommitOutcome {
-                                    root: accepted.prepared.root,
-                                    objects_inserted: accepted.prepared.objects_inserted,
-                                }),
-                            ));
-                        }
-                    }
-                },
-                Err(error) => {
-                    self.mark_requires_recovery(&mut inner);
-                    complete_failed_group(&mut completions, accepted, error);
-                },
-            }
+            self.publish_accepted_under_physical_fence(
+                &mut inner,
+                previous_arena_len,
+                accepted,
+                &mut completions,
+                &mut retired_projections,
+            );
         }
         let ran_successful_commit = completions.iter().any(|(_, result)| result.is_ok());
         drop(inner);
@@ -515,6 +488,81 @@ where
         if ran_successful_commit {
             self.maintain_representations_after_commit();
         }
+    }
+
+    /// Persist accepted commits under one physical representation guard and
+    /// publication poison span through the commit frontier.
+    fn publish_accepted_under_physical_fence(
+        &self,
+        inner: &mut DurableInner<P>,
+        previous_arena_len: u64,
+        accepted: Vec<AcceptedCommit<P>>,
+        completions: &mut Vec<(Arc<CommitReceipt>, Result<CommitOutcome, DurableError>)>,
+        retired_projections: &mut Vec<crate::kv::RetiredKvProjection>,
+    ) {
+        // Clone the shared Arc first so the physical guard does not borrow
+        // `inner.representations`. WAL groups leave the guard empty because fold
+        // acquires its own custody; legacy holds one guard through StateCas,
+        // roots, and the commit frontier.
+        let shared = if self.transaction_wal.is_enabled() {
+            None
+        } else {
+            inner.representations.clone()
+        };
+        let mut representations = match super::checkpoint_worker::lock_live_representations(
+            shared.as_ref(),
+            self.lifecycle.as_ref(),
+        ) {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.mark_requires_recovery(inner);
+                complete_failed_group(completions, accepted, error);
+                return;
+            },
+        };
+        // parking_lot guards do not poison on panic. Arm after the physical
+        // guard so a mid-frontier panic marks recovery before the worker can
+        // capture a half-mutated tip.
+        let mut publication_poison =
+            super::checkpoint_worker::PublicationPoison::armed(self.lifecycle.as_ref());
+        match self.persist_group(inner, representations.as_deref_mut(), &accepted) {
+            Ok(persisted) => {
+                for location in persisted.locations {
+                    inner.index.insert(location.0, location.1);
+                    inner.pending_index_locations.push(location);
+                }
+                debug_assert!(
+                    live_files_mut(&mut inner.files)
+                        .map_or(true, |files| files.arena_len >= previous_arena_len)
+                );
+                let frontier = self.publish_commit_frontier(inner, persisted.arena_len);
+                if let Err(error) = frontier {
+                    self.mark_requires_recovery(inner);
+                    publication_poison.disarm();
+                    complete_failed_group(completions, accepted, error);
+                } else {
+                    publication_poison.disarm();
+                    for mut accepted in accepted {
+                        retired_projections
+                            .extend(self.publish_durable_root(inner, &mut accepted.prepared));
+                        completions.push((
+                            accepted.receipt,
+                            Ok(CommitOutcome {
+                                root: accepted.prepared.root,
+                                objects_inserted: accepted.prepared.objects_inserted,
+                            }),
+                        ));
+                    }
+                }
+            },
+            Err(error) => {
+                self.mark_requires_recovery(inner);
+                publication_poison.disarm();
+                complete_failed_group(completions, accepted, error);
+            },
+        }
+        drop(publication_poison);
+        drop(representations);
     }
 
     /// Called only after the batch's authoritative durability frontier succeeds.
@@ -555,24 +603,25 @@ where
     fn persist_group(
         &self,
         inner: &mut DurableInner<P>,
+        representations: Option<&mut RepresentationStore>,
         accepted: &[AcceptedCommit<P>],
     ) -> Result<Persisted, DurableError> {
         if self.transaction_wal.is_enabled() {
             self.maybe_checkpoint_transaction_wal(inner)?;
             self.persist_group_wal(inner, accepted)
         } else {
-            self.persist_group_legacy(inner, accepted)
+            self.persist_group_legacy(inner, representations, accepted)
         }
     }
 
     fn persist_group_legacy(
         &self,
         inner: &mut DurableInner<P>,
+        mut representations: Option<&mut RepresentationStore>,
         accepted: &[AcceptedCommit<P>],
     ) -> Result<Persisted, DurableError> {
         let DurableInner {
             files,
-            representations,
             pending_index_locations: pending_locations,
             pending_direct_objects: pending_direct,
             index,
@@ -604,7 +653,7 @@ where
         record_group(accepted, ProjectionPhase::ArenaAppend, append_started);
         self.fail_if(FaultPoint::AfterCommitAppend)?;
         let map_started = Instant::now();
-        let representation_update = if let Some(representations) = representations {
+        let representation_update = if let Some(store) = representations.as_mut() {
             let appended = ids
                 .iter()
                 .copied()
@@ -625,7 +674,7 @@ where
             );
             self.append_group_representations(
                 &files.arena,
-                representations,
+                store,
                 PendingRepresentations::new(pending_locations, pending_direct, validated),
                 accepted.iter().flat_map(|commit| {
                     commit
@@ -648,9 +697,9 @@ where
         record_group(accepted, ProjectionPhase::Flush, flush_started);
         self.fail_if(FaultPoint::AfterObjectFlush)?;
         self.fail_if(FaultPoint::AfterCommitFlush)?;
-        if let (Some(representations), Some(update)) = (representations, representation_update) {
+        if let (Some(store), Some(update)) = (representations.as_mut(), representation_update) {
             let map_started = Instant::now();
-            representations.publish_direct_update(update)?;
+            store.publish_direct_update(update)?;
             record_group(accepted, ProjectionPhase::PhysicalMapUpdate, map_started);
         }
         self.fail_if(FaultPoint::BeforeRootCas)?;

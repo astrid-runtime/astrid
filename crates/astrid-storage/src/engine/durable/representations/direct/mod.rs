@@ -57,3 +57,8 @@ impl DirectArenaObject {
         Ok(PreparedDirectArenaObject::identify(profile, object, canonical_record)?.place(location))
     }
 }
+
+mod update;
+
+#[cfg(test)]
+mod tests;

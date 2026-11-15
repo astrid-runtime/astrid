@@ -1,8 +1,9 @@
 //! Exclusive 256-byte content overwrite profile.
 //!
-//! Times a fixed number of durable named-content puts, then reports public
-//! generation-region census after close. Generation advance is observed, not
-//! required: main lacks automatic representation checkpointing.
+//! Times durable named-content puts, both store opens and closes, then reports
+//! the public generation-region census. Separate close timings expose pending
+//! maintenance drained at shutdown instead of hiding it in faster foreground
+//! puts. These opens measure storage recovery, not whole-daemon readiness.
 
 use std::hint::black_box;
 use std::path::Path;
@@ -35,6 +36,10 @@ pub(super) async fn run(config: &Config, root: &Path, report: &mut Report) -> Be
     let mut puts = Vec::new();
     let mut loops = Vec::new();
     let mut readbacks = Vec::new();
+    let mut opens = Vec::new();
+    let mut closes = Vec::new();
+    let mut reopens = Vec::new();
+    let mut reopened_closes = Vec::new();
     let mut generations = Vec::new();
     let mut region_counts = Vec::new();
     let mut metadata_lengths = Vec::new();
@@ -42,22 +47,30 @@ pub(super) async fn run(config: &Config, root: &Path, report: &mut Report) -> Be
         reset_benchmark_home(&home_path)?;
         let home = AstridHome::from_path(home_path.clone());
         home.ensure()?;
+        let started = Instant::now();
         let store = open_runtime_store(&home).await?;
+        opens.push(started.elapsed());
         let measured = overwrite_loop(&store, &owner, overwrites)?;
+        let started = Instant::now();
         store.kv().close().await?;
+        closes.push(started.elapsed());
         drop(store);
 
         let volume = HostedFileVolume::open(home.storage_volume_path())?;
         let (generation, region_count, metadata_bytes) = generation_census(volume.as_ref())?;
         drop(volume);
 
+        let started = Instant::now();
         let reopened = open_runtime_store(&home).await?;
+        reopens.push(started.elapsed());
         readbacks.extend(read_retained_content(
             reopened.content().as_ref(),
             &owner,
             &measured.expected,
         )?);
+        let started = Instant::now();
         reopened.kv().close().await?;
+        reopened_closes.push(started.elapsed());
         drop(reopened);
 
         puts.extend(measured.latencies);
@@ -70,6 +83,10 @@ pub(super) async fn run(config: &Config, root: &Path, report: &mut Report) -> Be
     report.record_operations("astrid_checkpoint_overwrite", 1, puts);
     report.record_operations("astrid_checkpoint_overwrite_loop", overwrites, loops);
     report.record_operations("astrid_checkpoint_verified_content_read", 1, readbacks);
+    report.record_operations("astrid_checkpoint_storage_open", 1, opens);
+    report.record_operations("astrid_checkpoint_storage_close", 1, closes);
+    report.record_operations("astrid_checkpoint_storage_reopen", 1, reopens);
+    report.record_operations("astrid_checkpoint_storage_reopen_close", 1, reopened_closes);
     report.record_counts("representations_max_generation", generations)?;
     report.record_counts("representations_generation_region_count", region_counts)?;
     report.record_resource_peak("representations_metadata_logical_bytes", metadata_lengths)?;

@@ -25,9 +25,13 @@ where
     pub(crate) fn direct_representation_specification(
         &self,
     ) -> Result<Option<ObjectId>, DurableError> {
-        self.lock_usable()?
-            .representations
-            .as_ref()
+        let inner = self.lock_usable()?;
+        let representations = super::checkpoint_worker::lock_live_representations(
+            inner.representations.as_ref(),
+            self.lifecycle.as_ref(),
+        )?;
+        representations
+            .as_deref()
             .map(RepresentationStore::frozen_specification)
             .transpose()
     }
@@ -142,7 +146,9 @@ where
             }
         };
         let active = representations.active();
-        inner.representations = Some(representations);
+        inner.representations = Some(super::checkpoint_worker::wrap_representations(
+            representations,
+        ));
         Ok(active)
     }
 
@@ -153,13 +159,16 @@ where
         compatible_frozen_specifications: &[ObjectId],
         excluded: &BTreeSet<ObjectId>,
     ) -> Result<RepresentationStateId, DurableError> {
-        let representations =
-            inner
-                .representations
-                .as_ref()
-                .ok_or(DurableError::InvalidRepresentationState(
-                    "active representation store disappeared",
-                ))?;
+        let shared = inner.representations.clone();
+        let mut representations = super::checkpoint_worker::lock_live_representations(
+            shared.as_ref(),
+            self.lifecycle.as_ref(),
+        )?
+        .ok_or(DurableError::InvalidRepresentationState(
+            "active representation store disappeared",
+        ))?;
+        let mut poison =
+            super::checkpoint_worker::PublicationPoison::armed(self.lifecycle.as_ref());
         let active_specification = representations.frozen_specification()?;
         if active_specification != frozen_specification
             && !compatible_frozen_specifications.contains(&active_specification)
@@ -177,7 +186,7 @@ where
         }
         // A predecessor may not know a successor's bootstrap identity and can
         // describe it during coverage repair. Exclusion must be checked against
-        // recovered authoritative state, not just the current writer's role.
+        // recovered authoritative state, not just the current writer's view.
         // Reverse is DirectCanonical-only; this also rejects PackedSlice,
         // Compressed, and Delta coverage without a redundant all-recipe index.
         representations.ensure_no_relocatable_coverage_for(excluded)?;
@@ -190,22 +199,12 @@ where
             .map(|(object, location)| (*object, *location))
             .collect::<Vec<_>>();
         if missing.is_empty() {
+            poison.disarm();
             return Ok(representations.active());
         }
         let scheme = self.identity.scheme();
         let appended = {
-            let DurableInner {
-                files,
-                representations,
-                ..
-            } = inner;
-            let files = live_files_mut(files)?;
-            let representations =
-                representations
-                    .as_ref()
-                    .ok_or(DurableError::InvalidRepresentationState(
-                        "active representation store disappeared during repair",
-                    ))?;
+            let files = live_files_mut(&mut inner.files)?;
             missing
                 .into_iter()
                 .map(|(object, location)| {
@@ -224,46 +223,52 @@ where
                 })
                 .collect::<Result<Vec<_>, _>>()?
         };
-        let update = match self.append_pending_direct_update(inner, &appended) {
+        let update = match self.append_pending_direct_update(
+            inner,
+            Some(&mut *representations),
+            &appended,
+        ) {
             Ok(update) => update,
             Err(error) => {
                 self.mark_requires_recovery(inner);
+                poison.disarm();
                 return Err(error);
             },
         };
-        if let Err(error) = Self::flush_standalone(inner, update) {
+        if let Err(error) = Self::flush_standalone(inner, Some(&mut *representations), update) {
             self.mark_requires_recovery(inner);
+            poison.disarm();
             return Err(error);
         }
-        if let Some(representations) = &mut inner.representations
-            && let Err(error) = representations.flush()
-        {
+        if let Err(error) = representations.flush() {
             self.mark_requires_recovery(inner);
+            poison.disarm();
             return Err(error);
         }
-        inner
-            .representations
-            .as_ref()
-            .map(RepresentationStore::active)
-            .ok_or(DurableError::InvalidRepresentationState(
-                "repaired representation store disappeared",
-            ))
+        if let Err(error) = self.finish_standalone_publication(inner) {
+            self.mark_requires_recovery(inner);
+            poison.disarm();
+            return Err(error);
+        }
+        let active = representations.active();
+        poison.disarm();
+        Ok(active)
     }
 
     pub(super) fn append_pending_direct_update(
         &self,
         inner: &mut DurableInner<P>,
+        representations: Option<&mut RepresentationStore>,
         appended: &[DirectArenaObject],
     ) -> Result<Option<PendingRepresentationUpdate>, DurableError> {
-        let DurableInner {
-            files,
-            representations,
-            pending_index_locations,
-            ..
-        } = inner;
         let Some(representations) = representations else {
             return Ok(None);
         };
+        let DurableInner {
+            files,
+            pending_index_locations,
+            ..
+        } = inner;
         let files = live_files_mut(files)?;
         let mut direct = Vec::new();
         direct

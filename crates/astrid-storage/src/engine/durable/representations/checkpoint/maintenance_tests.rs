@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::engine::durable::representations::RepresentationStore;
 use crate::engine::durable::tests::{TestIdentity, Utf8Codec, limits, transaction};
-use crate::engine::durable::{DurableEngine, DurableEnginePolicy, RecoveryLimits};
+use crate::engine::durable::{DurableEngine, DurableEnginePolicy, DurableError, RecoveryLimits};
 use crate::storage_model::{ObjectClass, ObjectFormatVersion, ObjectKind, ObjectRecord};
 use crate::volume::{AstridVolume, HostedFileVolume};
 
@@ -45,13 +45,14 @@ fn engine_commit_auto_checkpoints_representation_and_survives_close_reopen() {
     let path = directory.path().join("engine.volume");
     let volume: Arc<dyn AstridVolume> = HostedFileVolume::open(&path).unwrap();
     let engine = activated_engine(Arc::clone(&volume));
-    let before = engine
-        .inner
-        .lock()
-        .representations
-        .as_ref()
-        .unwrap()
-        .journal_generation;
+    let before = {
+        let inner = engine.inner.lock();
+        crate::engine::durable::checkpoint_worker::lock_representations(
+            inner.representations.as_ref(),
+        )
+        .expect("shared representation store")
+        .journal_generation
+    };
     let mut expected = None;
     let mut history = Vec::new();
     for sequence in 0_u64..1024 {
@@ -60,14 +61,14 @@ fn engine_commit_auto_checkpoints_representation_and_survives_close_reopen() {
         let (commit, txn) = transaction("alice", expected, &payload);
         expected = Some(engine.commit(txn).unwrap().root());
         history.push((commit, payload));
-        if engine
-            .inner
-            .lock()
-            .representations
-            .as_ref()
-            .unwrap()
+        if {
+            let inner = engine.inner.lock();
+            crate::engine::durable::checkpoint_worker::lock_representations(
+                inner.representations.as_ref(),
+            )
+            .expect("shared representation store")
             .journal_generation
-            > before
+        } > before
         {
             break;
         }
@@ -144,20 +145,24 @@ fn engine_close_without_commits_does_not_reclaim_fat_representation_metadata() {
         engine
             .persist_standalone_object(&evidence(sequence.to_le_bytes().to_vec()))
             .unwrap();
-        if engine
-            .inner
-            .lock()
-            .representations
-            .as_ref()
-            .unwrap()
+        let eligible = {
+            let inner = engine.inner.lock();
+            crate::engine::durable::checkpoint_worker::lock_representations(
+                inner.representations.as_ref(),
+            )
+            .expect("shared representation store")
             .should_checkpoint_representations_metadata()
-        {
+        };
+        if eligible {
             break;
         }
     }
     let (before_len, before_generation) = {
         let inner = engine.inner.lock();
-        let store = inner.representations.as_ref().unwrap();
+        let store = crate::engine::durable::checkpoint_worker::lock_representations(
+            inner.representations.as_ref(),
+        )
+        .expect("shared representation store");
         assert!(
             store.should_checkpoint_representations_metadata(),
             "fixture must contain reclaimable history: frames={}, resident_nodes={}",
@@ -197,7 +202,30 @@ fn post_publication_checkpoint_failure_poison_fences_the_engine_until_recovery()
         let (commit, txn) = transaction("alice", expected, &payload);
         expected = Some(engine.commit(txn).unwrap().root());
         committed = Some((commit, payload));
-        if engine.inner.lock().poisoned {
+        let worker = {
+            let arbiter = engine.checkpoint_arbiter_for_test();
+            let mut state = arbiter.lock();
+            std::mem::take(&mut state.worker)
+        };
+        if let crate::engine::durable::checkpoint_worker::CheckpointWorkerSlot::Preparing {
+            join,
+            ..
+        } = worker
+        {
+            // Stop submitting after automatic scheduling. The P-free worker
+            // poisons lifecycle, not inner, and a later API call may recover it.
+            // Join without arbiter/inner so the real publication can finish.
+            let outcome = join
+                .join()
+                .expect("automatic checkpoint worker must not panic");
+            let Err(error) = outcome else {
+                panic!("automatic checkpoint must report its injected publication failure");
+            };
+            assert!(
+                matches!(&error, DurableError::Io { source, .. }
+                    if source.to_string() == "injected post-CURRENT sync failure"),
+                "worker must report the injected publication failure: {error:?}"
+            );
             observed_poison = true;
             break;
         }
@@ -205,6 +233,12 @@ fn post_publication_checkpoint_failure_poison_fences_the_engine_until_recovery()
     assert!(
         observed_poison,
         "automatic maintenance must surface the injected failure"
+    );
+    assert_eq!(
+        engine
+            .lifecycle_for_test()
+            .load(std::sync::atomic::Ordering::Acquire),
+        crate::engine::durable::LIFECYCLE_REQUIRES_RECOVERY,
     );
     // Public access must cross recovery before using the acknowledged durable tip.
     assert_eq!(engine.root(&"alice".to_owned()).unwrap(), expected);

@@ -11,6 +11,17 @@ use super::{
 };
 
 mod adoption;
+pub(in crate::engine::durable) use adoption::is_checkpoint_cancelled;
+mod background;
+mod control;
+pub(in crate::engine::durable) use control::{CheckpointCancellation, CheckpointControl};
+mod handover;
+mod tail;
+#[cfg(test)]
+mod test_support;
+pub(in crate::engine::durable) use background::{
+    CapturedCheckpoint, CheckpointMedia, PreparedCheckpoint,
+};
 #[cfg(test)]
 mod adoption_counter_tests;
 #[cfg(test)]
@@ -73,108 +84,13 @@ impl RepresentationStore {
         })
     }
 
-    pub(in crate::engine::durable) fn checkpoint_volume(
-        &mut self,
-        volume: &std::sync::Arc<dyn crate::volume::AstridVolume>,
-        limits: RecoveryLimits,
-    ) -> Result<(), DurableError> {
-        use super::volume::{generation_region, remove_region_if_present};
-        use std::sync::Arc;
-
-        let next = generation_name(increment(self.journal_generation)?);
-        let metadata_path = generation_region(&next, METADATA_PATH);
-        let journal_path = generation_region(&next, JOURNAL_PATH);
-        for path in [&metadata_path, &journal_path, "representations/CURRENT.tmp"] {
-            remove_region_if_present(volume, path)?;
-        }
-        let mut metadata = DurableFile::volume(Arc::clone(volume), &metadata_path, true)?;
-        let mut journal = DurableFile::volume(Arc::clone(volume), &journal_path, true)?;
-        let (current, proof) = self.prepare_sealed_adoption(&mut metadata, &mut journal, limits)?;
-        let pointer = DurableFile::volume(Arc::clone(volume), "representations/CURRENT.tmp", true)?;
-        adoption::write_verified_current_tmp(pointer, current, limits)?;
-        volume
-            .commit_metadata(&[Self::checkpoint_volume_publication()?])
-            .map_err(|source| io_error("publish checkpoint pointer", source))?;
-        // Once the namespace changes, subsequent writes must use the new handles
-        // even if the durability barrier reports an error. Keep old regions then.
-        self.adopt_sealed_generation(metadata, journal, proof)?;
-        volume
-            .sync()
-            .map_err(|source| io_error("flush checkpoint publication", source))?;
-        self.reclaim_checkpoint_volume(volume)
-    }
-
-    /// Checkpoint once obsolete frames provably reach the resident map size.
-    ///
-    /// The resident count includes transient unreachable nodes and can defer
-    /// maintenance beyond one reachable tip's worth of obsolete frames. Conservative free-space gate uses current durable
-    /// metadata length as an upper bound for the tip rewrite. Unknown or
-    /// insufficient space skips without failing the caller.
-    pub(in crate::engine::durable) fn maybe_checkpoint_volume(
-        &mut self,
-        volume: &std::sync::Arc<dyn crate::volume::AstridVolume>,
-        limits: RecoveryLimits,
-    ) -> Result<bool, DurableError> {
-        if !self.should_checkpoint_representations_metadata() {
-            return Ok(false);
-        }
-        let durable_len = self
-            .metadata
-            .metadata()
-            .map_err(|source| io_error("measure representation metadata length", source))?
-            .len();
-        match volume.available_space() {
-            Ok(Some(space)) if space < durable_len => return Ok(false),
-            Ok(None) | Err(_) => return Ok(false),
-            Ok(Some(_)) => {},
-        }
-        self.checkpoint_volume(volume, limits)?;
-        debug_assert!(self.map_frame_count() <= self.resident_map_node_count());
-        Ok(true)
-    }
-
-    /// Apply the same resident-node scheduling bound to native capability media.
-    pub(in crate::engine::durable) fn maybe_checkpoint_native(
-        &mut self,
-        store_root: &cap_std::fs::Dir,
-        limits: RecoveryLimits,
-    ) -> Result<bool, DurableError> {
-        if !self.should_checkpoint_representations_metadata() {
-            return Ok(false);
-        }
-        // Automatic maintenance adopts live state. Native compaction keeps calling
-        // reconstructing `checkpoint_native` directly.
-        self.checkpoint_native_adopting(store_root, limits)?;
-        debug_assert!(self.map_frame_count() <= self.resident_map_node_count());
-        Ok(true)
-    }
-
     /// Only call after this generation and its matching arena are durable.
     pub(in crate::engine::durable) fn reclaim_checkpoint_volume(
         &self,
         volume: &std::sync::Arc<dyn crate::volume::AstridVolume>,
     ) -> Result<(), DurableError> {
-        use super::volume::remove_region_if_present;
-
-        for region in volume
-            .list_regions("representations/generations/")
-            .map_err(|source| io_error("list obsolete checkpoint regions", source))?
-        {
-            let Some(suffix) = region.as_str().strip_prefix("representations/generations/") else {
-                continue;
-            };
-            let Some((generation, file)) = suffix.split_once('/') else {
-                continue;
-            };
-            if obsolete_generation(generation, self.journal_generation)
-                && matches!(file, METADATA_PATH | JOURNAL_PATH)
-            {
-                remove_region_if_present(volume, region.as_str())?;
-            }
-        }
-        volume
-            .sync()
-            .map_err(|source| io_error("flush checkpoint reclamation", source))
+        background::CheckpointMedia::Volume(std::sync::Arc::clone(volume))
+            .reclaim_before(self.journal_generation)
     }
 }
 

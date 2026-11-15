@@ -157,6 +157,42 @@ fn streamed_digest_retries_interrupted_reads() {
 }
 
 #[test]
+fn checked_prefix_digest_cancels_at_transfer_boundary_without_reading_the_tail() {
+    let bytes = sample_bytes(TRANSFER_BUFFER_BYTES.strict_mul(3));
+    let end = u64::try_from(bytes.len()).unwrap();
+    let mut file = ProbeJournal::new(bytes);
+    let mut checks = 0_usize;
+    let result = super::digest_journal_prefix_with_check(&mut file, end, "cancel", || {
+        checks = checks.strict_add(1);
+        if checks == 3 {
+            return Err(DurableError::InvalidRepresentationState(
+                "cancelled test digest",
+            ));
+        }
+        Ok(())
+    });
+    assert!(result.is_err());
+    assert_eq!(file.total_read, TRANSFER_BUFFER_BYTES);
+}
+
+#[test]
+fn checked_prefix_digest_preserves_the_ordinary_hash_and_prefix_bound() {
+    let bytes = sample_bytes(TRANSFER_BUFFER_BYTES.strict_mul(2).strict_add(7));
+    let end = TRANSFER_BUFFER_BYTES.strict_add(3);
+    let expected = journal_digest(&bytes[..end]);
+    let mut file = ProbeJournal::new(bytes);
+    let actual = super::digest_journal_prefix_with_check(
+        &mut file,
+        u64::try_from(end).unwrap(),
+        "checked parity",
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(file.total_read, end);
+}
+
+#[test]
 fn prefix_digest_ignores_changed_tail_bytes() {
     let prefix = sample_bytes(TRANSFER_BUFFER_BYTES + 5);
     let expected = journal_digest(&prefix);

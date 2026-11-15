@@ -21,7 +21,7 @@ pub(super) fn digest_journal_file<F: DurableIo>(
     file: &mut F,
     operation: &'static str,
 ) -> Result<[u8; 32], DurableError> {
-    digest_journal_range(file, None, operation)
+    digest_journal_range(file, None, operation, || Ok(()))
 }
 
 /// Digest exactly the prefix `[0, end)` and ignore any later bytes.
@@ -33,7 +33,19 @@ pub(super) fn digest_journal_prefix<F: DurableIo>(
     end: u64,
     operation: &'static str,
 ) -> Result<[u8; 32], DurableError> {
-    digest_journal_range(file, Some(end), operation)
+    digest_journal_range(file, Some(end), operation, || Ok(()))
+}
+
+/// The same prefix digest with cooperative checks at transfer boundaries.
+/// Cancellation never changes the hashed domain, bounds, or truncated-prefix
+/// handling; it only abandons unpublished work on its independent reader.
+pub(super) fn digest_journal_prefix_with_check<F: DurableIo>(
+    file: &mut F,
+    end: u64,
+    operation: &'static str,
+    check: impl FnMut() -> Result<(), DurableError>,
+) -> Result<[u8; 32], DurableError> {
+    digest_journal_range(file, Some(end), operation, check)
 }
 
 /// Authoritative journal length for tail budgets without a second full read.
@@ -63,13 +75,16 @@ fn digest_journal_range<F: DurableIo>(
     file: &mut F,
     end: Option<u64>,
     operation: &'static str,
+    mut check: impl FnMut() -> Result<(), DurableError>,
 ) -> Result<[u8; 32], DurableError> {
+    check()?;
     file.seek(SeekFrom::Start(0))
         .map_err(|source| io_error(operation, source))?;
     let mut hasher = blake3::Hasher::new_derive_key(JOURNAL_BYTES_DIGEST_CONTEXT);
     let mut buffer = vec![0_u8; TRANSFER_BUFFER_BYTES].into_boxed_slice();
     let mut consumed = 0_u64;
     loop {
+        check()?;
         let want = match end {
             None => buffer.len(),
             Some(limit) => {

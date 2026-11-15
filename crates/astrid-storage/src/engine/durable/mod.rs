@@ -559,7 +559,7 @@ struct DurableInner<P: Ord> {
     pending_direct_objects: BTreeMap<ObjectId, representations::DirectArenaObject>,
     validated: BTreeSet<ObjectId>,
     files: Option<DurableFiles>,
-    representations: Option<representations::RepresentationStore>,
+    representations: Option<checkpoint_worker::SharedRepresentationStore>,
     lock: Option<StoreLock>,
     poisoned: bool,
     arena_generation: u64,
@@ -671,13 +671,14 @@ pub struct DurableEngine<P: Ord, I, C> {
     commit_group: Mutex<CommitGroup<P>>,
     transaction_wal: TransactionWalPolicy,
     wal: Mutex<Option<DurableWal<P, I, C>>>,
-    lifecycle: AtomicU8,
+    lifecycle: Arc<AtomicU8>,
     arena_reader: RwLock<Option<ArenaReader>>,
     object_cache: ObjectCache<P>,
     recovery_policy: RecoveryRetryPolicy,
     preparation_authority: Arc<()>,
     inner: Mutex<DurableInner<P>>,
     published_roots: PublishedRoots<P>,
+    checkpoint_arbiter: checkpoint_worker::SharedCheckpointArbiter,
 }
 
 impl<P: Ord, I, C> fmt::Debug for DurableEngine<P, I, C> {
@@ -697,7 +698,17 @@ mod opening;
 
 impl<P: Ord, I, C> Drop for DurableEngine<P, I, C> {
     fn drop(&mut self) {
+        // Join any checkpoint job before dropping physical custody. The worker
+        // never owns this engine, so this cannot recurse through Engine Drop.
+        // Hold the arbiter across join and custody take; the worker only try_locks.
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let mut arbiter = checkpoint_worker::cancel_join_checkpoint_worker(
+            self.checkpoint_arbiter.as_ref(),
+            lifecycle.as_ref(),
+        );
+        let _ = arbiter.bump_custody();
         let inner = self.inner.get_mut();
+        drop(inner.representations.take());
         if let Some(mut files) = inner.files.take()
             && let Some(cache) = &mut files.index_cache
         {
@@ -802,6 +813,9 @@ impl<P: Ord, I, C> DurableEngine<P, I, C> {
 mod staging;
 
 use crate::engine::durable_cache as cache;
+mod checkpoint_worker;
+#[cfg(test)]
+mod checkpoint_worker_tests;
 mod compaction;
 mod faults;
 mod format;

@@ -454,42 +454,74 @@ where
             return Err(ModelError::ObjectCollision(id).into());
         }
         let payload = encode_object_frame(self.identity.scheme(), id, &existing)?;
-        let appended = if role == StandaloneRole::Represented
-            && let Some(representations) = &inner.representations
-            && !representations.contains_direct(id)
-        {
-            vec![representations.describe_direct(
-                id,
-                canonical_record_bytes(&payload, self.identity.scheme())?,
-                location,
-            )?]
+        let shared = inner.representations.clone();
+        let mut representations = super::checkpoint_worker::lock_live_representations(
+            shared.as_ref(),
+            self.lifecycle.as_ref(),
+        )?;
+        let mut poison =
+            super::checkpoint_worker::PublicationPoison::armed(self.lifecycle.as_ref());
+        let appended = if role == StandaloneRole::Represented {
+            if let Some(store) = representations.as_mut()
+                && !store.contains_direct(id)
+            {
+                match store.describe_direct(
+                    id,
+                    canonical_record_bytes(&payload, self.identity.scheme())?,
+                    location,
+                ) {
+                    Ok(object) => vec![object],
+                    Err(error) => {
+                        self.mark_requires_recovery(inner);
+                        poison.disarm();
+                        return Err(error);
+                    },
+                }
+            } else {
+                Vec::new()
+            }
         } else {
             Vec::new()
         };
-        let representation_update = match self.append_pending_direct_update(inner, &appended) {
+        let representation_update = match self.append_pending_direct_update(
+            inner,
+            representations.as_deref_mut(),
+            &appended,
+        ) {
             Ok(update) => update,
             Err(error) => {
                 self.mark_requires_recovery(inner);
+                poison.disarm();
                 return Err(error);
             },
         };
         if needs_flush || representation_update.is_some() {
-            let persisted = Self::flush_standalone(inner, representation_update);
-            match persisted {
+            match Self::flush_standalone(
+                inner,
+                representations.as_deref_mut(),
+                representation_update,
+            ) {
                 Ok(arena_len) if needs_flush => {
                     if let Err(error) = self.advance_index_frontier(inner, arena_len) {
                         self.mark_requires_recovery(inner);
+                        poison.disarm();
                         return Err(error);
                     }
                 },
                 Ok(_) => {},
                 Err(error) => {
                     self.mark_requires_recovery(inner);
+                    poison.disarm();
                     return Err(error);
                 },
             }
-            self.finish_standalone_publication(inner)?;
+            if let Err(error) = self.finish_standalone_publication(inner) {
+                self.mark_requires_recovery(inner);
+                poison.disarm();
+                return Err(error);
+            }
         }
+        poison.disarm();
         Ok((id, InsertOutcome::AlreadyPresent))
     }
 
@@ -513,28 +545,54 @@ where
                 return Err(error);
             },
         };
-        let appended = if role == StandaloneRole::Represented
-            && let Some(representations) = &inner.representations
-        {
-            vec![representations.describe_direct(
-                id,
-                canonical_record_bytes(&payload, self.identity.scheme())?,
-                location,
-            )?]
+        let shared = inner.representations.clone();
+        let mut representations = super::checkpoint_worker::lock_live_representations(
+            shared.as_ref(),
+            self.lifecycle.as_ref(),
+        )?;
+        let mut poison =
+            super::checkpoint_worker::PublicationPoison::armed(self.lifecycle.as_ref());
+        let appended = if role == StandaloneRole::Represented {
+            if let Some(store) = representations.as_mut() {
+                match store.describe_direct(
+                    id,
+                    canonical_record_bytes(&payload, self.identity.scheme())?,
+                    location,
+                ) {
+                    Ok(object) => vec![object],
+                    Err(error) => {
+                        self.mark_requires_recovery(inner);
+                        poison.disarm();
+                        return Err(error);
+                    },
+                }
+            } else {
+                Vec::new()
+            }
         } else {
             Vec::new()
         };
-        let representation_update = match self.append_pending_direct_update(inner, &appended) {
+        let representation_update = match self.append_pending_direct_update(
+            inner,
+            representations.as_deref_mut(),
+            &appended,
+        ) {
             Ok(update) => update,
             Err(error) => {
                 self.mark_requires_recovery(inner);
+                poison.disarm();
                 return Err(error);
             },
         };
-        let arena_len = match Self::flush_standalone(inner, representation_update) {
+        let arena_len = match Self::flush_standalone(
+            inner,
+            representations.as_deref_mut(),
+            representation_update,
+        ) {
             Ok(arena_len) => arena_len,
             Err(error) => {
                 self.mark_requires_recovery(inner);
+                poison.disarm();
                 return Err(error);
             },
         };
@@ -547,13 +605,19 @@ where
         );
         if let Err(error) = self.advance_index_frontier(inner, arena_len) {
             self.mark_requires_recovery(inner);
+            poison.disarm();
             return Err(error);
         }
-        self.finish_standalone_publication(inner)?;
+        if let Err(error) = self.finish_standalone_publication(inner) {
+            self.mark_requires_recovery(inner);
+            poison.disarm();
+            return Err(error);
+        }
+        poison.disarm();
         Ok((id, InsertOutcome::Inserted))
     }
 
-    fn finish_standalone_publication(
+    pub(super) fn finish_standalone_publication(
         &self,
         inner: &mut DurableInner<P>,
     ) -> Result<(), DurableError> {
@@ -566,20 +630,16 @@ where
 
     pub(super) fn flush_standalone(
         inner: &mut DurableInner<P>,
+        representations: Option<&mut super::representations::RepresentationStore>,
         representation_update: Option<super::representations::PendingRepresentationUpdate>,
     ) -> Result<u64, DurableError> {
-        let DurableInner {
-            files,
-            representations,
-            ..
-        } = inner;
-        let files = live_files_mut(files)?;
+        let files = live_files_mut(&mut inner.files)?;
         files
             .arena
             .sync_data()
             .map_err(|source| io_error("flush standalone object frame", source))?;
-        if let (Some(representations), Some(update)) = (representations, representation_update) {
-            representations.publish_direct_update(update)?;
+        if let (Some(store), Some(update)) = (representations, representation_update) {
+            store.publish_direct_update(update)?;
         }
         files
             .arena

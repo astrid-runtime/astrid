@@ -279,7 +279,23 @@ where
         &self,
         authorization: &VerifiedCompactionPlan,
     ) -> Result<CompactionReport, DurableError> {
-        let mut inner = self.lock_usable()?;
+        // Exclusive generation work: cancel/join any checkpoint job and hold the
+        // arbiter through custody mutation so auto-maintenance cannot admit N+1.
+        let mut arbiter = super::checkpoint_worker::cancel_join_checkpoint_worker(
+            self.checkpoint_arbiter.as_ref(),
+            self.lifecycle.as_ref(),
+        );
+        arbiter.bump_custody()?;
+        let mut inner = self.inner.lock();
+        let lifecycle = self.lifecycle.load(std::sync::atomic::Ordering::Acquire);
+        if lifecycle == super::LIFECYCLE_CLOSED {
+            return Err(DurableError::Closed);
+        }
+        if inner.poisoned || lifecycle == super::LIFECYCLE_REQUIRES_RECOVERY {
+            inner.poisoned = true;
+            self.recover_locked(&mut inner)?;
+        }
+        super::ensure_usable(&inner)?;
         // The replacement must be the only remaining source of logical
         // objects. Fold and checkpoint committed WAL state under the same
         // mutation fence before rechecking the proof, so a later fold cannot
@@ -305,6 +321,8 @@ where
         {
             self.mark_requires_recovery(&mut inner);
         }
+        drop(inner);
+        drop(arbiter);
         result
     }
 
@@ -387,8 +405,11 @@ where
                     .map(|root| root.object()),
             )
             .collect::<Vec<_>>();
-        if let Some(representations) = &inner.representations {
-            roots.extend(representations.logical_liveness_roots()?);
+        if let Some(store) =
+            super::checkpoint_worker::lock_representations(inner.representations.as_ref())
+                .as_deref()
+        {
+            roots.extend(store.logical_liveness_roots()?);
         }
         let mut live = BTreeSet::new();
         let super::DurableInner {
@@ -573,7 +594,9 @@ where
                 "promoted compaction placement differs from its durable receipt",
             ));
         }
-        if let Some(representations) = inner.representations.as_mut() {
+        if let Some(mut representations) =
+            super::checkpoint_worker::lock_representations(inner.representations.as_ref())
+        {
             let arena = open_rw_capability(self.hosted_directory()?, Path::new(ARENA_FILE), false)?;
             representations.rebase_compacted_arena(
                 &arena,
