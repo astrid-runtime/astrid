@@ -3,14 +3,14 @@ use std::io;
 use crate::volume::{AstridVolume, HostedFileVolume, VolumeMetadataMutation, VolumeRegion};
 
 #[derive(Debug)]
-struct RecordingVolume {
+pub(super) struct RecordingVolume {
     inner: Arc<HostedFileVolume>,
     syncs: AtomicUsize,
     remaining_failures: AtomicUsize,
 }
 
 impl RecordingVolume {
-    fn wrap(inner: Arc<HostedFileVolume>) -> Arc<Self> {
+    pub(super) fn wrap(inner: Arc<HostedFileVolume>) -> Arc<Self> {
         Arc::new(Self {
             inner,
             syncs: AtomicUsize::new(0),
@@ -18,11 +18,11 @@ impl RecordingVolume {
         })
     }
 
-    fn sync_count(&self) -> usize {
+    pub(super) fn sync_count(&self) -> usize {
         self.syncs.load(Ordering::SeqCst)
     }
 
-    fn fail_next_syncs(&self, count: usize) {
+    pub(super) fn fail_next_syncs(&self, count: usize) {
         self.remaining_failures.store(count, Ordering::SeqCst);
     }
 }
