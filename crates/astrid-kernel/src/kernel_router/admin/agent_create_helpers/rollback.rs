@@ -185,6 +185,7 @@ async fn reclaim_derived_principal(
         // acquire fresh authority.
         return Err(cleanup_errors.join("; "));
     }
+    pending.retire_workspaces(kernel).await?;
     // Reclamation resolves quota through this profile. Keep it available for
     // retry if any package, KV or native cleanup above failed.
     collect_remove_file(

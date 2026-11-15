@@ -192,16 +192,33 @@ async fn failed_alias_validation_keeps_owner_and_device_bindings() {
 #[tokio::test]
 async fn interrupted_deletion_retains_fleet_authority_after_identity_removal() {
     let f = fixture().await;
+    let fleet = f
+        .store
+        .load()
+        .await
+        .unwrap()
+        .principal_owner(f.target)
+        .unwrap()
+        .fleet_uid;
     let guard = f
         .store
         .guard_principal_deletion_for_device(f.target, f.alias.clone(), f.operator, &[9; 32])
         .await
         .unwrap();
+    assert_eq!(guard.fleet_uid(), Some(fleet));
     let graph = f.store.load().await.unwrap();
+    assert!(graph.principal_is_retiring(f.target));
     assert!(graph.principal_owner(f.target).is_none());
     assert!(graph.user_for_device(f.target, &[8; 32]).is_none());
     assert!(f.store.ensure_alias_available(&f.alias).await.is_err());
     drop(guard);
+    let retried = f
+        .store
+        .guard_principal_deletion_for_device(f.target, f.alias.clone(), f.operator, &[9; 32])
+        .await
+        .unwrap();
+    assert_eq!(retried.fleet_uid(), Some(fleet));
+    drop(retried);
     f.directory.unregister(&f.alias, f.target);
     // Reopen the store so this exercises persisted reservation authority, not
     // a retained in-memory authorization object.
@@ -236,6 +253,7 @@ async fn interrupted_deletion_retains_fleet_authority_after_identity_removal() {
         .unwrap()
         .unwrap();
     assert_eq!(resumed.principal_uid(), f.target);
+    assert_eq!(resumed.fleet_uid(), Some(fleet));
     resumed.finish().await.unwrap();
     reopened.ensure_alias_available(&f.alias).await.unwrap();
 }

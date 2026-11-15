@@ -326,3 +326,33 @@ async fn ownership_move_invalidates_existing_branch_before_finish() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn retirement_closes_rebinding_and_forgets_the_cached_uid() {
+    let fixture = fixture().await;
+    let graph = Arc::new(
+        astrid_storage::OwnershipStore::new(fixture.store.kv(), fixture.directory.clone()).unwrap(),
+    );
+    let service = WorkspaceBranchService::new_with_ownership(
+        fixture.store.clone(),
+        fixture.directory.clone(),
+        Some(Arc::clone(&graph)),
+    );
+    let binding = service.bind(&fixture.alice).await.unwrap();
+    let peer = service.bind(&fixture.bob).await.unwrap();
+    let guard = graph
+        .guard_principal_deletion_for_alias(binding.uid, fixture.alice.clone())
+        .await
+        .unwrap();
+    assert!(service.bind(&fixture.alice).await.is_err());
+    assert_eq!(service.retire_for_deletion(&guard).await.unwrap(), 1);
+    assert_eq!(service.retire_for_deletion(&guard).await.unwrap(), 0);
+    assert!(!service.bindings.lock().unwrap().contains_key(&binding.uid));
+    assert!(service.bind(&fixture.alice).await.is_err());
+    assert!(service.binding_for(&fixture.alice).await.is_err());
+    let path = astrid_storage::FilesystemPath::new("late.txt").unwrap();
+    assert!(service.filesystem(binding).write(&path, b"late").is_err());
+    assert_eq!(service.bind(&fixture.bob).await.unwrap(), peer);
+    // This test stops before identity removal; leave the reservation intact.
+    drop(guard);
+}
