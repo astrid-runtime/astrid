@@ -7,7 +7,9 @@ use astrid_core::PrincipalUid;
 use crate::engine::{PrincipalProjectionEngine, PrincipalProjectionError};
 use crate::storage_model::ModelError;
 
-use super::{WorkspaceBranchError, WorkspaceBranchStore, parse_workspace_uid};
+use super::{
+    WorkspaceBranchError, WorkspaceBranchStore, is_workspace_branch_label, parse_workspace_uid,
+};
 
 impl<P, E> WorkspaceBranchStore<P, E>
 where
@@ -43,8 +45,9 @@ where
             }
             let mut next = header.as_ref().clone();
             next.preserved_state.retain(|reference| {
-                parse_workspace_uid(reference.label().as_bytes())
-                    .is_none_or(|id| !retired.contains(&id))
+                let label = reference.label().as_bytes();
+                !is_workspace_branch_label(label)
+                    || parse_workspace_uid(label).is_none_or(|id| !retired.contains(&id))
             });
             let transaction =
                 self.content

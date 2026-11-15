@@ -3,7 +3,53 @@ use super::{
     ContentName, FilesystemPath, MAX_WORKSPACE_BRANCHES, WorkspaceBindingLifecycle,
     WorkspaceBranchError, WorkspaceUid,
 };
+use crate::engine::PrincipalProjectionEngine;
+use crate::storage_model::{ObjectReference, ReferenceLabel};
 use astrid_core::PrincipalUid;
+
+#[test]
+fn retirement_preserves_an_extension_label_matching_the_bare_branch_uid() {
+    let (engine, branches, owner, _legacy) = fixture();
+    let uid = PrincipalUid::from_bytes([6; 32]);
+    let branch = branches
+        .begin_for_uid_at(
+            &owner,
+            uid,
+            WorkspaceUid::random(),
+            ContentName::new("workspace/default").unwrap(),
+        )
+        .unwrap();
+    let header = branches.content.header(&owner).unwrap();
+    let label = super::workspace_ref_label(branch.id());
+    let target = header
+        .preserved_state
+        .iter()
+        .find(|reference| reference.label() == &label)
+        .unwrap()
+        .target();
+    let extension = ObjectReference::owns(
+        ReferenceLabel::new(hex::encode(branch.id().as_bytes()).into_bytes()),
+        target,
+    );
+    let mut next = header.as_ref().clone();
+    next.preserved_state.push(extension.clone());
+    let transaction = branches
+        .content
+        .encode_transaction(owner, next, None, Default::default())
+        .unwrap();
+    engine.commit_root(transaction).unwrap();
+
+    assert_eq!(branches.retire_for_uid(&owner, uid).unwrap(), 1);
+    let retained = branches.content.header(&owner).unwrap();
+    assert!(retained.preserved_state.contains(&extension));
+    assert!(
+        !branches
+            .list_branches(&owner)
+            .unwrap()
+            .iter()
+            .any(|remaining| remaining.id() == branch.id())
+    );
+}
 
 #[test]
 fn retirement_releases_only_selected_owner_uid_live_branches() {
