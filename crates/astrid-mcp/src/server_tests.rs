@@ -126,6 +126,15 @@ where
         .expect("negotiation should record server information")
         .protocol_version
         .clone();
+    // Discovery is a bootstrap probe in current rmcp. Exercise the first
+    // ordinary request before expecting the server's serve future to finish.
+    assert!(
+        client
+            .list_all_tools()
+            .await
+            .expect("tools/list should work after negotiation")
+            .is_empty()
+    );
     client.cancel().await.expect("client should stop cleanly");
     tokio::time::timeout(std::time::Duration::from_secs(1), server_task)
         .await
