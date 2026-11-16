@@ -485,7 +485,7 @@ impl ServerHandler for AstridMcpServer {
         tools.list_changed = Some(true);
         capabilities.tools = Some(tools);
 
-        // `ServerConfig` (`InitializeResult`) is `#[non_exhaustive]`, so it
+        // `ServerConfig` is `#[non_exhaustive]`, so it
         // must be built through its constructor + setters rather than a
         // struct literal.
         ServerConfig::new(capabilities)

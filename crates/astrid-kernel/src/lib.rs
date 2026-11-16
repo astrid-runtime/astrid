@@ -1204,7 +1204,7 @@ impl Kernel {
         // Native-only: both are CLI/disk concepts; the browser host
         // establishes identity through its own uplink instead.
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        {
+        let audit_config = {
             if matches!(
                 layout_origin,
                 Some(legacy_migration_barrier::LayoutOrigin::Legacy)
@@ -1247,30 +1247,21 @@ impl Kernel {
                 runtime_tree_admit::admit(&home, store).await?;
             }
 
-            // Audit entry format, read from the admitted home like other boot
-            // policy and applied before anything can append. Nothing appends
-            // during the migrate-only window above, so every new entry is in
-            // the selected format. A configuration that cannot be read stops
-            // boot unless the store is already on v2 (which it never leaves).
-            // The browser profile reads no host config; its host enables v2
-            // on the audit log it injects (`AuditLog::enable_entry_v2`).
-            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-            {
-                let entry_format = astrid_config::Config::load_with_layout(
-                    Some(&workspace_root),
-                    &workspace_layout,
-                )
-                .map(|resolved| resolved.config.audit.entry_format)
-                .map_err(|error| error.to_string());
-                audit_keys::apply_entry_format(
-                    &audit_log,
-                    &home.keys_dir(),
-                    entry_format,
-                    &runtime_key,
-                    Arc::new(principal_directory.clone()),
-                )
-                .await?;
-            }
+            // Resolve the complete audit policy once from the admitted home.
+            // Entry format, retention and host admission must use the same
+            // snapshot; a later ambient-home lookup could weaken that policy.
+            // Migration above is append-free; select the format before any
+            // bootstrap audit entry. Browser hosts configure their injected log.
+            let audit_config =
+                audit_retention::load_audit_config(&home, &workspace_root, &workspace_layout)?;
+            audit_keys::apply_entry_format(
+                &audit_log,
+                &home.keys_dir(),
+                Ok(audit_config.entry_format),
+                &runtime_key,
+                Arc::new(principal_directory.clone()),
+            )
+            .await?;
 
             // The released profile, when present, is now represented by the
             // completed migration ledger. Apply the normal idempotent admin
@@ -1329,7 +1320,8 @@ impl Kernel {
                     .publish_runtime_projection(&home)
                     .map_err(std::io::Error::other)?;
             }
-        }
+            audit_config
+        };
 
         #[cfg(not(target_family = "wasm"))]
         let workspace_branches = principal_store.clone().map(|store| {
@@ -1350,9 +1342,6 @@ impl Kernel {
             })?;
         }
 
-        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let audit_config =
-            crate::audit_retention::load_audit_config(&workspace_root, &workspace_layout);
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         crate::audit_retention::apply_retention_config(&audit_log, &audit_config.retention);
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]

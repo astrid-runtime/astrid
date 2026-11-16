@@ -132,13 +132,15 @@ where
         .expect("negotiation should record server information")
         .protocol_version
         .clone();
-    // Drive the post-probe request that opens the durable server service under
-    // modern discovery. Legacy initialize already completed `serve()` during
-    // negotiation; this call is then an ordinary running-service request.
-    client
-        .list_all_tools()
-        .await
-        .expect("post-negotiation request should open or use the durable session");
+    // Discovery is a bootstrap probe in current rmcp. Exercise the first
+    // ordinary request before expecting the server's serve future to finish.
+    assert!(
+        client
+            .list_all_tools()
+            .await
+            .expect("tools/list should work after negotiation")
+            .is_empty()
+    );
     server_ready_rx
         .await
         .expect("server serve() should return before fixture teardown");
