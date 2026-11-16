@@ -8,7 +8,7 @@ use astrid_core::{
     ElicitationAction as CoreElicitationAction, ElicitationRequest, UrlElicitationRequest,
 };
 use rmcp::model::{
-    ClientCapabilities, ClientInfo, ElicitRequestParams, ElicitResult,
+    ClientCapabilities, ClientConfig, ElicitRequestParams, ElicitResult,
     ElicitationAction as RmcpElicitationAction, ElicitationCapability, FormElicitationCapability,
     Implementation, Role, RootsCapabilities, SamplingCapability, UrlElicitationCapability,
 };
@@ -39,7 +39,7 @@ use super::notice::ServerNotice;
     reason = "Astrid supports MCP roots and sampling until their protocol-compatible replacements are designed."
 )]
 impl rmcp::ClientHandler for AstridClientHandler {
-    fn get_info(&self) -> ClientInfo {
+    fn get_info(&self) -> ClientConfig {
         // `ClientCapabilities` is `#[non_exhaustive]`, so it can't be built with
         // a struct literal from this crate. Start from `default()` and set the
         // fields we care about via their public accessors — this keeps the
@@ -65,7 +65,7 @@ impl rmcp::ClientHandler for AstridClientHandler {
         let mut client_info = Implementation::new("astrid", env!("CARGO_PKG_VERSION"));
         client_info.title = Some("Astrid Secure Agent Runtime".to_string());
 
-        ClientInfo::new(capabilities, client_info).with_protocol_version(
+        ClientConfig::new(capabilities, client_info).with_protocol_version(
             serde_json::from_value(serde_json::json!("2025-11-25"))
                 .expect("valid protocol version"),
         )
