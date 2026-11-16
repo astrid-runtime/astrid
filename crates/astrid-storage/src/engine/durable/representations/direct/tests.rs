@@ -85,7 +85,9 @@ fn direct_publication_reuses_authenticated_node_identities() {
 
 #[test]
 fn failed_append_does_not_promote_unwritten_closures_and_retry_reopens() {
-    for successful_writes in [0, 1, 2, 3] {
+    // This bounded metadata batch now uses header/name/payload, with no
+    // fourth checksum backpatch. Fail every write before proof promotion.
+    for successful_writes in [0, 1, 2] {
         let directory = tempfile::tempdir().unwrap();
         let volume: Arc<dyn AstridVolume> =
             HostedFileVolume::open(directory.path().join("retry.volume")).unwrap();

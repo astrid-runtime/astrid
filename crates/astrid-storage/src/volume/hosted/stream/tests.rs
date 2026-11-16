@@ -160,3 +160,35 @@ fn stream_copy_buffer_matches_payload_bound_for_zero_small_and_max_chunks() {
     );
     assert_eq!(out, multi);
 }
+
+#[test]
+fn bounded_stream_preflight_rejects_before_consuming_input() {
+    struct NoReads;
+    impl std::io::Read for NoReads {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("record preflight must reject before consuming input");
+        }
+    }
+    let temporary = tempfile::tempdir().unwrap();
+    let (volume, region, _) = open_volume(&temporary);
+    let mut state = volume.state.lock();
+    let sequence = state.sequence;
+    for (test_sequence, payload_len) in [(u64::MAX, 1), (sequence, u64::MAX)] {
+        state.sequence = test_sequence;
+        let valid_len = state.valid_len;
+        let physical_len = state.file.metadata().unwrap().len();
+        let error = super::append_from_inner(
+            &mut state,
+            Operation::Write,
+            &region,
+            0,
+            payload_len,
+            &mut NoReads,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(state.valid_len, valid_len);
+        assert_eq!(state.file.metadata().unwrap().len(), physical_len);
+    }
+    state.sequence = sequence;
+}

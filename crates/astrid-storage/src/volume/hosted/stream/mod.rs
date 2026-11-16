@@ -1,7 +1,8 @@
 //! Stream a known-length payload as one ASTVOL1 Write record.
 //!
-//! Checksum lives in the record header. This hashes while copying, then
-//! patches the checksum slot. The on-disk grammar is unchanged.
+//! Bounded payloads reuse slice append with the checksum in the first header.
+//! Larger payloads hash while copying, then patch that header checksum slot.
+//! The on-disk grammar is unchanged.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
