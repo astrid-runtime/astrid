@@ -225,12 +225,21 @@ impl RepresentationMap {
     }
 
     /// Insert one immutable entry by path-copying the affected trie path.
+    #[cfg(test)]
     pub(crate) fn insert(
         &mut self,
         key: PhysicalMapKey,
         value: Vec<u8>,
     ) -> Result<bool, PhysicalModelError> {
         self.inner.insert(&Blake3PhysicalIdentity, key, value)
+    }
+
+    /// Insert owned entries by rewriting each affected dense ancestor once.
+    pub(crate) fn insert_entries(
+        &mut self,
+        entries: Vec<(PhysicalMapKey, Vec<u8>)>,
+    ) -> Result<u64, PhysicalModelError> {
+        self.inner.insert_entries(&Blake3PhysicalIdentity, entries)
     }
 
     /// Rebuild from the complete leaf set after a bulk update.
@@ -267,12 +276,21 @@ impl PlacementMap {
     }
 
     /// Insert one immutable entry by path-copying the affected trie path.
+    #[cfg(test)]
     pub(crate) fn insert(
         &mut self,
         key: PhysicalMapKey,
         value: Vec<u8>,
     ) -> Result<bool, PhysicalModelError> {
         self.inner.insert(&Blake3PhysicalIdentity, key, value)
+    }
+
+    /// Insert owned entries by rewriting each affected dense ancestor once.
+    pub(crate) fn insert_entries(
+        &mut self,
+        entries: Vec<(PhysicalMapKey, Vec<u8>)>,
+    ) -> Result<u64, PhysicalModelError> {
+        self.inner.insert_entries(&Blake3PhysicalIdentity, entries)
     }
 
     /// Rebuild from the complete leaf set after a bulk update.

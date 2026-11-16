@@ -2,7 +2,6 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::borrow::Borrow;
 
@@ -29,6 +28,8 @@ pub(crate) use validation::CanonicalRootProof;
 
 #[cfg(test)]
 mod decode_tests;
+#[cfg(test)]
+mod insert_tests;
 #[cfg(test)]
 mod lookup_tests;
 #[cfg(test)]
@@ -714,36 +715,74 @@ where
         key: PhysicalMapKey,
         value: Vec<u8>,
     ) -> Result<bool, PhysicalModelError> {
-        let (replacement, inserted) = if let Some(root) = self.root {
-            match self.construction {
-                MapConstruction::LegacyBinary => {
-                    legacy::insert(identity, self.domain, &mut self.nodes, root, key, value)?
-                },
-                MapConstruction::DenseRadix => {
-                    radix::insert(identity, self.domain, &mut self.nodes, root, key, value)?
-                },
-            }
-        } else {
-            let node = match self.construction {
-                MapConstruction::LegacyBinary => PhysicalMapNode::leaf(self.domain, key, value),
-                MapConstruction::DenseRadix => {
-                    PhysicalMapNode::page(self.domain, vec![(key, value)])?
-                },
-            };
-            // Empty-root birth must honor the same identity/collision fence as
-            // path-copy inserts: unequal historical bodies under one id reject,
-            // equal historical bodies may reactivate without overwrite.
-            let (bytes, id) = node.encode_and_identify(identity)?;
-            self.nodes.put(id, &bytes, node)?;
-            (id, true)
-        };
-        if inserted {
-            self.root = Some(replacement);
-            self.entry_count = self
-                .entry_count
-                .checked_add(1)
-                .ok_or(PhysicalModelError::LengthOverflow)?;
+        Ok(self.apply_insert(identity, radix::InsertBatch::single(key, value))? != 0)
+    }
+
+    /// Insert a sorted batch by rewriting each affected ancestor once.
+    ///
+    /// The final root, bytes, and counts are the sequential single-insert
+    /// result. Active root and count stay unchanged on error; historical extra
+    /// nodes may remain in the arena.
+    pub(crate) fn insert_entries<I: PhysicalIdentity>(
+        &mut self,
+        identity: &I,
+        entries: Vec<(PhysicalMapKey, Vec<u8>)>,
+    ) -> Result<u64, PhysicalModelError> {
+        self.apply_insert(identity, radix::InsertBatch::many(entries)?)
+    }
+
+    fn apply_insert<I: PhysicalIdentity>(
+        &mut self,
+        identity: &I,
+        mut batch: radix::InsertBatch,
+    ) -> Result<u64, PhysicalModelError> {
+        if batch.as_slice().is_empty() {
+            return Ok(0);
         }
+        match self.construction {
+            MapConstruction::LegacyBinary => {
+                let (root, inserted) = legacy::insert_entries(
+                    identity,
+                    self.domain,
+                    &mut self.nodes,
+                    self.root,
+                    batch,
+                )?;
+                match root {
+                    Some(replacement) => self.commit_root_after_count(replacement, inserted),
+                    None => Ok(0),
+                }
+            },
+            MapConstruction::DenseRadix => {
+                let (replacement, inserted) = match self.root {
+                    Some(root) => radix::insert_batch(
+                        identity,
+                        self.domain,
+                        &mut self.nodes,
+                        root,
+                        &mut batch,
+                    )?,
+                    None => radix::insert_new(identity, self.domain, &mut self.nodes, &mut batch)?,
+                };
+                self.commit_root_after_count(replacement, inserted)
+            },
+        }
+    }
+
+    fn commit_root_after_count(
+        &mut self,
+        replacement: PhysicalMapNodeId,
+        inserted: u64,
+    ) -> Result<u64, PhysicalModelError> {
+        if inserted == 0 {
+            return Ok(0);
+        }
+        let entry_count = self
+            .entry_count
+            .checked_add(inserted)
+            .ok_or(PhysicalModelError::LengthOverflow)?;
+        self.root = Some(replacement);
+        self.entry_count = entry_count;
         Ok(inserted)
     }
 

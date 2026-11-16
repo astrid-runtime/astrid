@@ -30,6 +30,29 @@ struct DirectMapEntry {
     placement: (PhysicalMapKey, Vec<u8>),
 }
 
+/// Move each prepared entry into its map input and reverse association once.
+struct DirectMapBatch {
+    representations: Vec<(PhysicalMapKey, Vec<u8>)>,
+    placements: Vec<(PhysicalMapKey, Vec<u8>)>,
+    reverse: Vec<(ObjectId, RepresentationRecordId)>,
+}
+
+impl DirectMapBatch {
+    fn new(entries: Vec<DirectMapEntry>) -> Self {
+        let mut batch = Self {
+            representations: Vec::with_capacity(entries.len()),
+            placements: Vec::with_capacity(entries.len()),
+            reverse: Vec::with_capacity(entries.len()),
+        };
+        for entry in entries {
+            batch.representations.push(entry.representation);
+            batch.placements.push(entry.placement);
+            batch.reverse.push((entry.object, entry.representation_id));
+        }
+        batch
+    }
+}
+
 impl RepresentationStore {
     pub(in crate::engine::durable) fn append_direct_update(
         &mut self,
@@ -87,34 +110,21 @@ impl RepresentationStore {
             bulk_rebuild_is_cheaper(self.representations.entry_count(), entries.len())?;
         let rebuild_placements =
             bulk_rebuild_is_cheaper(self.placement_entries.entry_count(), entries.len())?;
-        let representation_entries = entries
-            .iter()
-            .map(|entry| entry.representation.clone())
-            .collect::<Vec<_>>();
-        let placement_entries = entries
-            .iter()
-            .map(|entry| entry.placement.clone())
-            .collect::<Vec<_>>();
+        let DirectMapBatch {
+            representations,
+            placements,
+            reverse: reverse_additions,
+        } = DirectMapBatch::new(entries);
         if rebuild_representations {
-            self.representations
-                .rebuild_with_entries(representation_entries)?;
+            self.representations.rebuild_with_entries(representations)?;
         } else {
-            for (key, value) in representation_entries {
-                self.representations.insert(key, value)?;
-            }
+            self.representations.insert_entries(representations)?;
         }
         if rebuild_placements {
-            self.placement_entries
-                .rebuild_with_entries(placement_entries)?;
+            self.placement_entries.rebuild_with_entries(placements)?;
         } else {
-            for (key, value) in placement_entries {
-                self.placement_entries.insert(key, value)?;
-            }
+            self.placement_entries.insert_entries(placements)?;
         }
-        let reverse_additions = entries
-            .into_iter()
-            .map(|entry| (entry.object, entry.representation_id))
-            .collect();
         let mut appended_map_nodes = BTreeSet::new();
         append_authenticated_map_nodes(
             &mut metadata,
@@ -187,28 +197,22 @@ impl RepresentationStore {
             .iter()
             .map(|object| self.prepare_direct_entry(object, &profile))
             .collect::<Result<Vec<_>, _>>()?;
-        let representation_entries = entries
-            .iter()
-            .map(|entry| entry.representation.clone())
-            .collect();
-        let placement_entries = entries
-            .iter()
-            .map(|entry| entry.placement.clone())
-            .collect();
-        self.representations = RepresentationMap::build_dense(representation_entries)?;
-        self.placement_entries = PlacementMap::build_dense(placement_entries)?;
+        let DirectMapBatch {
+            representations,
+            placements,
+            reverse,
+        } = DirectMapBatch::new(entries);
+        self.representations = RepresentationMap::build_dense(representations)?;
+        self.placement_entries = PlacementMap::build_dense(placements)?;
         self.residency = residency::MapResidency::new(
             self.profiles.as_canonical(),
             self.representations.as_canonical(),
             self.placement_entries.as_canonical(),
         );
-        let replacement_reverse = entries
+        let replacement_reverse = reverse
             .into_iter()
-            .map(|entry| {
-                (
-                    entry.object,
-                    smallvec::SmallVec::from_buf([entry.representation_id]),
-                )
+            .map(|(object, representation)| {
+                (object, smallvec::SmallVec::from_buf([representation]))
             })
             .collect();
 

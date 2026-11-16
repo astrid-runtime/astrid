@@ -8,6 +8,13 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ## [Unreleased]
 
+### Fixed
+
+- Batch physical-map additions within each storage publication so shared radix
+  paths are rebuilt once, moving prepared payload buffers without cloning them.
+  Preserve canonical identities, collision checks, transaction boundaries and
+  legacy recovery.
+
 ## [2026.10.1] - 2026-10-15
 
 ### Fixed

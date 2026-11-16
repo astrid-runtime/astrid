@@ -29,6 +29,39 @@ where
     .insert_at(root, key, value)
 }
 
+pub(super) fn insert_entries<I, N>(
+    identity: &I,
+    domain: PhysicalMapDomain,
+    nodes: &mut BTreeMap<PhysicalMapNodeId, N>,
+    mut root: Option<PhysicalMapNodeId>,
+    batch: super::radix::InsertBatch,
+) -> Result<(Option<PhysicalMapNodeId>, u64), PhysicalModelError>
+where
+    I: PhysicalIdentity,
+    N: core::borrow::Borrow<PhysicalMapNode> + From<PhysicalMapNode>,
+{
+    let mut inserted = 0_u64;
+    batch.for_each_owned(|key, value| {
+        let (next, did_insert) = match root {
+            Some(current) => insert(identity, domain, nodes, current, key, value)?,
+            None => {
+                let node = PhysicalMapNode::leaf(domain, key, value);
+                let (bytes, id) = node.encode_and_identify(identity)?;
+                nodes.put(id, &bytes, node)?;
+                (id, true)
+            },
+        };
+        if did_insert {
+            root = Some(next);
+            inserted = inserted
+                .checked_add(1)
+                .ok_or(PhysicalModelError::LengthOverflow)?;
+        }
+        Ok(())
+    })?;
+    Ok((root, inserted))
+}
+
 pub(super) fn build<I: PhysicalIdentity, V: AsRef<[u8]>, N: CanonicalNodeSink>(
     identity: &I,
     domain: PhysicalMapDomain,
