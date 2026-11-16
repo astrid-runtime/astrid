@@ -42,14 +42,13 @@ where
 {
     let mut inserted = 0_u64;
     batch.for_each_owned(|key, value| {
-        let (next, did_insert) = match root {
-            Some(current) => insert(identity, domain, nodes, current, key, value)?,
-            None => {
-                let node = PhysicalMapNode::leaf(domain, key, value);
-                let (bytes, id) = node.encode_and_identify(identity)?;
-                nodes.put(id, &bytes, node)?;
-                (id, true)
-            },
+        let (next, did_insert) = if let Some(current) = root {
+            insert(identity, domain, nodes, current, key, value)?
+        } else {
+            let node = PhysicalMapNode::leaf(domain, key, value);
+            let (bytes, id) = node.encode_and_identify(identity)?;
+            nodes.put(id, &bytes, node)?;
+            (id, true)
         };
         if did_insert {
             root = Some(next);

@@ -283,12 +283,12 @@ where
         }
         let runs = collect_selector_runs(self.batch.as_slice(), range, split)?;
         self.wrap_with_existing(
-            ExistingChild {
+            &ExistingChild {
                 id: node_id,
                 selector: nibble(old_key, split),
                 entries: 1,
             },
-            runs,
+            &runs,
             old_key,
             split,
         )
@@ -328,7 +328,7 @@ where
             entries: view.subtree_entries,
         };
         let runs = collect_selector_runs(self.batch.as_slice(), range, common)?;
-        self.wrap_with_existing(existing, runs, prefix_key, common)
+        self.wrap_with_existing(&existing, &runs, prefix_key, common)
     }
 
     fn descend_radix(
@@ -382,8 +382,8 @@ where
 
     fn wrap_with_existing(
         &mut self,
-        existing: ExistingChild,
-        runs: SelectorRuns,
+        existing: &ExistingChild,
+        runs: &SelectorRuns,
         prefix_key: PhysicalMapKey,
         split: u8,
     ) -> Result<(PhysicalMapNodeId, u64), PhysicalModelError> {
@@ -452,7 +452,7 @@ where
         }
         let prefix_nibbles = {
             let entries = self.range_slice(range);
-            common_prefix_nibbles(entries[0].0, entries[len - 1].0, depth)
+            common_prefix_nibbles(entries[0].0, entries[len.strict_sub(1)].0, depth)
         };
         if prefix_nibbles >= DIGEST_NIBBLES {
             return Err(PhysicalModelError::InvalidMap("duplicate radix key"));
@@ -563,7 +563,7 @@ fn collect_selector_runs(
             ));
         }
         runs.runs[runs.len] = (selector, BatchRange { start: index, end });
-        runs.len += 1;
+        runs.len = runs.len.strict_add(1);
         index = end;
     }
     Ok(runs)

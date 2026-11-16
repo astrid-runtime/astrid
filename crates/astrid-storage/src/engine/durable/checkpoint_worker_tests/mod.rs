@@ -91,8 +91,13 @@ pub(super) fn open_store_snapshot(volume: &Arc<dyn AstridVolume>) -> (u64, u64, 
 
 pub(super) fn grow_until_checkpoint_eligible(engine: &Engine) {
     let mut expected = engine.root(&"alice".to_owned()).unwrap();
+    // Reopened cycles must create history rather than deduplicate the same
+    // immutable objects from a previous call's sequence. Reserve zero for the
+    // fresh principal, whose first committed generation is also zero.
+    let generation = expected.map_or(0, |root| root.generation.get().strict_add(1));
     for sequence in 0_u64..2048 {
-        let mut payload = sequence.to_le_bytes().to_vec();
+        let mut payload = generation.to_le_bytes().to_vec();
+        payload.extend(sequence.to_le_bytes());
         payload.extend([b'y'; 256]);
         let (_, txn) = transaction("alice", expected, &payload);
         expected = Some(engine.commit(txn).unwrap().root());
@@ -103,10 +108,17 @@ pub(super) fn grow_until_checkpoint_eligible(engine: &Engine) {
                 .should_checkpoint_representations_metadata()
         };
         if ready {
-            break;
+            return;
         }
     }
-    assert!(expected.is_some(), "fixture must commit at least once");
+    let inner = engine.inner.lock();
+    let store =
+        super::checkpoint_worker::lock_representations(inner.representations.as_ref()).unwrap();
+    panic!(
+        "fixture must grow checkpoint-eligible history: frames={} resident={}",
+        store.map_frame_count(),
+        store.resident_map_node_count()
+    );
 }
 
 #[derive(Debug, Default)]
