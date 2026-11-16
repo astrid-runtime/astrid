@@ -1,10 +1,10 @@
 //! Real-API coverage for coalesced stream record I/O.
 //!
-//! A small streamed write performs four `write_append_bytes` calls: fixed
-//! header, name, payload, and checksum patch. A scoped append budget of four
+//! A small streamed write performs three `write_append_bytes` calls: fixed
+//! header, name, and payload. A scoped append budget of three
 //! therefore succeeds for ordinary tiny payloads.
 //!
-//! `copy_and_hash` sizes its bounce buffer to `min(payload_len, 64KiB)` so tiny
+//! Both producers size their buffer to `min(payload_len, 64KiB)` so tiny
 //! writes do not allocate the full ceiling.
 
 use std::sync::Arc;
@@ -58,7 +58,7 @@ fn expected_stream_record(sequence: u64, name: &[u8], offset: u64, payload: &[u8
 }
 
 #[test]
-fn small_stream_write_succeeds_within_four_append_writes() {
+fn small_stream_write_succeeds_within_three_append_writes() {
     let temporary = tempfile::tempdir().unwrap();
     let (volume, region, path) = open_volume(&temporary);
     let payload = b"tiny-io";
@@ -74,10 +74,10 @@ fn small_stream_write_succeeds_within_four_append_writes() {
     };
     let before = test_support::read_container(&volume);
 
-    HostedFileVolume::with_append_failure_for_test(4, || {
+    HostedFileVolume::with_append_failure_for_test(3, || {
         volume
             .write_region_from(&region, 0, payload.len() as u64, &mut payload.as_slice())
-            .expect("coalesced stream write uses at most four append writes");
+            .expect("bounded stream write uses at most three append writes");
     });
     volume.sync().unwrap();
 

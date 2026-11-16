@@ -147,6 +147,20 @@ fn append_from_inner(
         .and_then(|fixed| fixed.checked_add(u64::from(name_len)))
         .and_then(|total| total.checked_add(payload_len))
         .ok_or_else(|| io::Error::other("volume record length overflow"))?;
+    // A bounded payload already fits in the existing bounce allocation. Reuse
+    // the slice producer so its checksum is in the first header, rather than
+    // seeking back to patch it. Keep this inside append_from_with's rollback
+    // wrapper and after all record preflight checks, before consuming input.
+    if payload_len <= STREAM_BUFFER_BYTES as u64 {
+        let capacity = usize::try_from(payload_len)
+            .map_err(|_| io::Error::other("volume stream copy length overflow"))?;
+        let mut buffered = vec![0_u8; capacity];
+        #[cfg(test)]
+        STREAM_COPY_BUFFER_CAPACITY.with(|cell| cell.set(cell.get().max(buffered.len())));
+        payload.read_exact(&mut buffered)?;
+        return HostedFileVolume::append(state, operation, region, offset, &buffered);
+    }
+
     let mut hasher = blake3::Hasher::new_derive_key("astrid volume record v1");
     hasher.update(&next_sequence.to_le_bytes());
     hasher.update(&[operation as u8]);

@@ -166,30 +166,31 @@ fn uncommitted_write_footer_reuse_recovers_every_interrupted_prefix() {
 
 #[test]
 fn streamed_write_failures_preserve_the_previous_commit() {
-    // Include the final checksum patch, which writes before the current file
-    // cursor. The contiguous-prefix matrix alone does not model that order.
-    // Coalesced stream writes use four counted calls for a small payload.
-    for writes_before_failure in 0..=3 {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("source.volume");
-        let volume = HostedFileVolume::open(&path).unwrap();
-        let region = VolumeRegion::new("seed").unwrap();
-        volume.create_region(&region, true).unwrap();
-        volume.write_region_at(&region, 0, b"old-value").unwrap();
-        volume.sync().unwrap();
-        set_remaining_append_writes(Some(writes_before_failure));
-        let result = volume.write_region_at(&region, 0, b"new-value");
-        set_remaining_append_writes(None);
-        assert!(result.is_err(), "failure point {writes_before_failure}");
-        let copy = directory.path().join("interrupted.volume");
-        test_support::copy_container(&volume, &copy);
-        let recovered = HostedFileVolume::open(&copy).unwrap();
-        assert_region(&recovered, &region, b"old-value");
-        volume.write_region_at(&region, 0, b"new-value").unwrap();
-        volume.sync().unwrap();
-        let retry = directory.path().join("retried.volume");
-        test_support::copy_container(&volume, &retry);
-        let reopened = HostedFileVolume::open(&retry).unwrap();
-        assert_region(&reopened, &region, b"new-value");
+    // Bounded payloads use the slice producer; larger streams still patch
+    // their checksum behind the cursor. Cover every write in both paths.
+    for (payload, last_failure) in [(b"new-value".to_vec(), 2), (vec![0x5A; 64 * 1024 + 1], 4)] {
+        for writes_before_failure in 0..=last_failure {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("source.volume");
+            let volume = HostedFileVolume::open(&path).unwrap();
+            let region = VolumeRegion::new("seed").unwrap();
+            volume.create_region(&region, true).unwrap();
+            volume.write_region_at(&region, 0, b"old-value").unwrap();
+            volume.sync().unwrap();
+            set_remaining_append_writes(Some(writes_before_failure));
+            let result = volume.write_region_at(&region, 0, &payload);
+            set_remaining_append_writes(None);
+            assert!(result.is_err(), "failure point {writes_before_failure}");
+            let copy = directory.path().join("interrupted.volume");
+            test_support::copy_container(&volume, &copy);
+            let recovered = HostedFileVolume::open(&copy).unwrap();
+            assert_region(&recovered, &region, b"old-value");
+            volume.write_region_at(&region, 0, &payload).unwrap();
+            volume.sync().unwrap();
+            let retry = directory.path().join("retried.volume");
+            test_support::copy_container(&volume, &retry);
+            let reopened = HostedFileVolume::open(&retry).unwrap();
+            assert_region(&reopened, &region, &payload);
+        }
     }
 }
