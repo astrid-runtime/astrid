@@ -130,3 +130,155 @@ async fn unwritable_archive_leaves_the_chain_intact() {
         6
     );
 }
+
+#[test]
+fn audit_policy_follows_captured_home() {
+    let workspace = tempfile::tempdir().unwrap();
+    for class in ["file_delete", "process_spawn"] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("config.toml"),
+            format!("[audit]\nhost_fail_closed = [\"{class}\"]\nentry_format = \"v2\"\n"),
+        )
+        .unwrap();
+        let config = super::load_audit_config(
+            &astrid_core::dirs::AstridHome::from_path(root.path()),
+            workspace.path(),
+            &astrid_core::dirs::WorkspaceLayout::default(),
+        )
+        .unwrap();
+        assert_eq!(config.host_fail_closed, [class]);
+        assert_eq!(
+            config.entry_format,
+            astrid_config::types::AuditEntryFormat::V2
+        );
+    }
+}
+
+#[test]
+fn workspace_audit_tightening_is_preserved() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let state = workspace.path().join(".astrid");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::write(
+        root.path().join("config.toml"),
+        "[audit]\nhost_fail_closed = [\"process_spawn\"]\n[audit.retention]\nrequire_anchor = true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        state.join("config.toml"),
+        "[audit]\nhost_fail_closed = [\"file_delete\"]\n",
+    )
+    .unwrap();
+    let config = super::load_audit_config(
+        &astrid_core::dirs::AstridHome::from_path(root.path()),
+        workspace.path(),
+        &astrid_core::dirs::WorkspaceLayout::default(),
+    )
+    .unwrap();
+    assert!(config.retention.require_anchor);
+    for class in ["process_spawn", "file_delete"] {
+        assert!(config.host_fail_closed.iter().any(|value| value == class));
+    }
+}
+
+#[test]
+fn invalid_audit_layers_cannot_fall_back_to_weaker_policy() {
+    for (operator, workspace_config) in [
+        (
+            "[audit]\nhost_fail_closed = [\"process_spawn\"]\n",
+            "[[[invalid",
+        ),
+        (
+            "[audit.retention]\nrequire_anchor = true\n",
+            "[audit]\nhost_queue_capacity = 1\n",
+        ),
+        (
+            "[[[invalid",
+            "[audit]\nhost_fail_closed = [\"file_delete\"]\n",
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = workspace.path().join(".astrid");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::write(root.path().join("config.toml"), operator).unwrap();
+        std::fs::write(state.join("config.toml"), workspace_config).unwrap();
+        let error = super::load_audit_config(
+            &astrid_core::dirs::AstridHome::from_path(root.path()),
+            workspace.path(),
+            &astrid_core::dirs::WorkspaceLayout::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("cannot load audit policy"));
+        assert!(error.to_string().contains(root.path().to_str().unwrap()));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn invalid_workspace_prevents_native_kernel_boot() {
+    // A subprocess supplies the native boot environment without racing other
+    // tests or changing this process's environment. Keep the Unix socket short.
+    let root = tempfile::Builder::new()
+        .prefix("audit-boot-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "audit_retention::tests::native_audit_boot_probe",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("ASTRID_HOME", root.path())
+        .env("ASTRID_AUDIT_BOOT_PROBE", root.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "subprocess fixture for invalid_workspace_prevents_native_kernel_boot"]
+async fn native_audit_boot_probe() {
+    let Some(expected_home) = std::env::var_os("ASTRID_AUDIT_BOOT_PROBE") else {
+        return;
+    };
+    assert_eq!(
+        astrid_core::dirs::AstridHome::resolve().unwrap().root(),
+        std::path::PathBuf::from(expected_home)
+    );
+    let workspace = tempfile::tempdir().unwrap();
+    let state = workspace.path().join(".astrid");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::write(
+        state.join("config.toml"),
+        "[audit]\nhost_queue_capacity = 1\n",
+    )
+    .unwrap();
+    let result = crate::Kernel::new(
+        astrid_core::SessionId::new(),
+        workspace.path().to_owned(),
+        astrid_capsule_types::CapsuleRuntimeLimits::default(),
+        std::collections::HashMap::new(),
+        astrid_capsule_types::HttpLimits::default(),
+    )
+    .await;
+    let error = result
+        .err()
+        .expect("invalid workspace must refuse kernel boot");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        error.to_string().contains("cannot load audit policy"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("host_queue_capacity"), "{error}");
+}
