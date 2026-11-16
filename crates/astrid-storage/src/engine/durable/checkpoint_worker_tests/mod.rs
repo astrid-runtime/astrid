@@ -4,7 +4,11 @@
 //! single-flight arbiter. They do not claim native 8s/10k runtime acceptance.
 
 mod adversarial_close;
+mod growth;
 mod wal_publication;
+
+use growth::commit_until_generation_advances;
+pub(super) use growth::grow_until_checkpoint_eligible;
 
 use std::collections::BTreeSet;
 use std::io::{self, Read};
@@ -87,38 +91,6 @@ pub(super) fn open_store_snapshot(volume: &Arc<dyn AstridVolume>) -> (u64, u64, 
     let frames = store.map_frame_count();
     drop(store);
     (generation, frames, generation_ids(volume.as_ref()))
-}
-
-pub(super) fn grow_until_checkpoint_eligible(engine: &Engine) {
-    let mut expected = engine.root(&"alice".to_owned()).unwrap();
-    // Reopened cycles must create history rather than deduplicate the same
-    // immutable objects from a previous call's sequence. Reserve zero for the
-    // fresh principal, whose first committed generation is also zero.
-    let generation = expected.map_or(0, |root| root.generation.get().strict_add(1));
-    for sequence in 0_u64..2048 {
-        let mut payload = generation.to_le_bytes().to_vec();
-        payload.extend(sequence.to_le_bytes());
-        payload.extend([b'y'; 256]);
-        let (_, txn) = transaction("alice", expected, &payload);
-        expected = Some(engine.commit(txn).unwrap().root());
-        let ready = {
-            let inner = engine.inner.lock();
-            super::checkpoint_worker::lock_representations(inner.representations.as_ref())
-                .unwrap()
-                .should_checkpoint_representations_metadata()
-        };
-        if ready {
-            return;
-        }
-    }
-    let inner = engine.inner.lock();
-    let store =
-        super::checkpoint_worker::lock_representations(inner.representations.as_ref()).unwrap();
-    panic!(
-        "fixture must grow checkpoint-eligible history: frames={} resident={}",
-        store.map_frame_count(),
-        store.resident_map_node_count()
-    );
 }
 
 #[derive(Debug, Default)]
@@ -636,57 +608,6 @@ pub(super) fn drain_close_while_prepare_gated(
     wait_control_draining(control.as_ref());
     drop(release_guard);
     closer.join().expect("close thread")
-}
-
-/// Wait for an admitted ordinary job without taking its join away from close.
-/// Stop feeding while it works, then keep the real Published close outcome.
-fn finish_scheduled_checkpoint(engine: &Engine) {
-    use super::checkpoint_worker::CheckpointWorkerSlot;
-    let arbiter = engine.checkpoint_arbiter_for_test();
-    loop {
-        let pending = {
-            let state = arbiter.lock();
-            match &state.worker {
-                CheckpointWorkerSlot::Idle => false,
-                CheckpointWorkerSlot::Preparing { control, join } => {
-                    assert!(!control.is_draining() && !control.is_cancelled());
-                    !join.is_finished()
-                },
-            }
-        };
-        if !pending {
-            assert_eq!(
-                engine.lifecycle_for_test().load(Ordering::Acquire),
-                super::LIFECYCLE_USABLE,
-                "ordinary publication must finish without recovery"
-            );
-            return;
-        }
-        // Observation cadence only; no completion deadline or product timeout.
-        thread::sleep(Duration::from_millis(1));
-    }
-}
-
-fn commit_until_generation_advances(engine: &Engine, before: u64, marker: u8) -> u64 {
-    let mut expected = engine.root(&"alice".to_owned()).unwrap();
-    for sequence in 0_u64..2048 {
-        finish_scheduled_checkpoint(engine);
-        let generation = {
-            let inner = engine.inner.lock();
-            super::checkpoint_worker::lock_representations(inner.representations.as_ref())
-                .unwrap()
-                .journal_generation_for_test()
-        };
-        if generation > before {
-            return generation;
-        }
-        let mut payload = sequence.to_le_bytes().to_vec();
-        payload.push(marker);
-        payload.extend([b'x'; 64]);
-        let (_, txn) = transaction("alice", expected, &payload);
-        expected = Some(engine.commit(txn).unwrap().root());
-    }
-    panic!("fixture must admit an ordinary checkpoint before exhausting its input");
 }
 
 fn measure_ungated_baseline(path: &std::path::Path) -> (u64, u64) {
