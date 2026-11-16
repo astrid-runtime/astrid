@@ -32,6 +32,23 @@ use super::{
 };
 use crate::storage_model::physical::IdentifiedProfile;
 
+#[cfg(test)]
+std::thread_local! {
+    static RETAINED_REVERSE_ENTRIES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_retained_reverse_entries() {
+    RETAINED_REVERSE_ENTRIES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn retained_reverse_entries() -> usize {
+    RETAINED_REVERSE_ENTRIES.with(core::cell::Cell::get)
+}
+
+mod reverse_comparison;
+
 mod index;
 use index::HistoricalMapClosure;
 pub(super) use index::MetadataIndex;
@@ -399,12 +416,84 @@ pub(super) fn validate_representations<const COLLECT_PLACEMENTS: bool>(
     )
 }
 
+/// Facts shared by collecting recovery and borrowed live-index comparison.
+struct RepresentationFacts {
+    extent_count: u64,
+    generation_zero: super::index_validation::GenerationZeroPlacements,
+}
+
+pub(super) struct ComparedRepresentations {
+    pub(super) extent_count: u64,
+    pub(super) reverse_matches: bool,
+}
+
 pub(super) fn validate_representation_entries<'a, const COLLECT_PLACEMENTS: bool, R>(
     profiles: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
     representations: impl FnOnce() -> Result<R, DurableError>,
     placements: impl IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
     direct_profile: RepresentationProfileId,
 ) -> Result<ValidatedRepresentations, DurableError>
+where
+    R: IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
+{
+    let mut reverse = BTreeMap::<ObjectId, Vec<RepresentationRecordId>>::new();
+    let facts = validate_representation_entries_with::<COLLECT_PLACEMENTS, _>(
+        profiles,
+        representations,
+        placements,
+        direct_profile,
+        |object, id| {
+            reverse.entry(object).or_default().push(id);
+            #[cfg(test)]
+            RETAINED_REVERSE_ENTRIES.with(|count| count.set(count.get().strict_add(1)));
+            Ok(())
+        },
+    )?;
+    Ok(ValidatedRepresentations {
+        reverse,
+        extent_count: facts.extent_count,
+        generation_zero: facts.generation_zero,
+    })
+}
+
+/// Validate the same semantic facts without retaining a second reverse index.
+///
+/// Sealed-tip proofs supply canonical key order. A mismatch is returned as a
+/// fact, so the caller can preserve cancellation precedence before rejecting it.
+pub(super) fn compare_representation_entries<'a, R>(
+    profiles: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
+    representations: impl FnOnce() -> Result<R, DurableError>,
+    placements: impl IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
+    direct_profile: RepresentationProfileId,
+    expected_reverse: &BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
+) -> Result<ComparedRepresentations, DurableError>
+where
+    R: IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
+{
+    let mut comparison = reverse_comparison::ReverseComparison::new(expected_reverse)?;
+    let facts = validate_representation_entries_with::<false, _>(
+        profiles,
+        representations,
+        placements,
+        direct_profile,
+        |object, id| {
+            comparison.observe(object, id);
+            Ok(())
+        },
+    )?;
+    Ok(ComparedRepresentations {
+        extent_count: facts.extent_count,
+        reverse_matches: comparison.matches(),
+    })
+}
+
+fn validate_representation_entries_with<'a, const COLLECT_PLACEMENTS: bool, R>(
+    profiles: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
+    representations: impl FnOnce() -> Result<R, DurableError>,
+    placements: impl IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
+    direct_profile: RepresentationProfileId,
+    mut observe_direct: impl FnMut(ObjectId, RepresentationRecordId) -> Result<(), DurableError>,
+) -> Result<RepresentationFacts, DurableError>
 where
     R: IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
 {
@@ -433,7 +522,6 @@ where
             .ok_or(DurableError::EncodingOverflow)?;
         placement_by_blob.insert(entry.blob(), entry);
     }
-    let mut reverse = BTreeMap::<ObjectId, Vec<RepresentationRecordId>>::new();
     let mut generation_zero = super::index_validation::GenerationZeroPlacements::default();
     // Direct records share the one required builtin profile. Retain only that
     // checked value for this pass, not a second index of every operator-defined
@@ -478,10 +566,9 @@ where
         if COLLECT_PLACEMENTS {
             generation_zero.observe(object, record.profile() == direct_profile, placement);
         }
-        reverse.entry(object).or_default().push(id);
+        observe_direct(object, id)?;
     }
-    Ok(ValidatedRepresentations {
-        reverse,
+    Ok(RepresentationFacts {
         extent_count,
         generation_zero,
     })

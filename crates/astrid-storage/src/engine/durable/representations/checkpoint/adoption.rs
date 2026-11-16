@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::super::super::scan_frames;
 use super::super::activation::visit_new_reachable_map_nodes;
 use super::super::recovery::{
-    read_current_file, recover_metadata, validate_profile_entries, validate_representation_entries,
+    compare_representation_entries, read_current_file, recover_metadata, validate_profile_entries,
 };
 use super::super::residency::MapResidency;
 use super::super::{
@@ -485,7 +485,7 @@ impl LiveTipRefs<'_> {
                 "live direct profile disagrees with catalogue validation",
             ));
         }
-        let validated = validate_representation_entries::<false, _>(
+        let validated = compare_representation_entries(
             self.profiles.as_canonical(),
             || {
                 Ok(canonical.entries[1]
@@ -498,9 +498,10 @@ impl LiveTipRefs<'_> {
                 .copied()
                 .take_while(|_| !cancel.is_cancelled()),
             direct_profile,
+            self.reverse,
         )?;
         ensure_not_cancelled(cancel)?;
-        if validated.reverse != *self.reverse
+        if !validated.reverse_matches
             || validated.extent_count != self.placements.replica_extent_count()
         {
             return Err(DurableError::InvalidRepresentationState(

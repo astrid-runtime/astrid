@@ -20,6 +20,8 @@ use astrid_storage::{
 use super::{Config, Report, benchmark_owner, reset_benchmark_home};
 use crate::BenchResult;
 
+mod phase_cpu;
+
 const SLOT_COUNT: u64 = 16;
 const PAYLOAD_BYTES: usize = 256;
 const ANCHOR_PERIOD: u64 = 256;
@@ -43,35 +45,49 @@ pub(super) async fn run(config: &Config, root: &Path, report: &mut Report) -> Be
     let mut generations = Vec::new();
     let mut region_counts = Vec::new();
     let mut metadata_lengths = Vec::new();
-    for _ in 0..config.samples {
+    for sample_index in 0..config.samples {
+        let mut phase = phase_cpu::PhaseTimer::start(sample_index)?;
         reset_benchmark_home(&home_path)?;
         let home = AstridHome::from_path(home_path.clone());
         home.ensure()?;
+        phase.mark("setup_home", report)?;
+
         let started = Instant::now();
         let store = open_runtime_store(&home).await?;
         opens.push(started.elapsed());
+        phase.mark("storage_open", report)?;
+
         let measured = overwrite_loop(&store, &owner, overwrites)?;
+        phase.mark("overwrite_loop", report)?;
+
         let started = Instant::now();
         store.kv().close().await?;
         closes.push(started.elapsed());
         drop(store);
+        phase.mark("storage_close", report)?;
 
         let volume = HostedFileVolume::open(home.storage_volume_path())?;
         let (generation, region_count, metadata_bytes) = generation_census(volume.as_ref())?;
         drop(volume);
+        phase.mark("generation_census", report)?;
 
         let started = Instant::now();
         let reopened = open_runtime_store(&home).await?;
         reopens.push(started.elapsed());
+        phase.mark("storage_reopen", report)?;
+
         readbacks.extend(read_retained_content(
             reopened.content().as_ref(),
             &owner,
             &measured.expected,
         )?);
+        phase.mark("verified_readback", report)?;
+
         let started = Instant::now();
         reopened.kv().close().await?;
         reopened_closes.push(started.elapsed());
         drop(reopened);
+        phase.mark("storage_reopen_close", report)?;
 
         puts.extend(measured.latencies);
         loops.push(measured.wall);

@@ -24,7 +24,7 @@ use crate::BenchResult;
 
 #[path = "workloads/bulk.rs"]
 mod bulk;
-#[path = "workloads/checkpoint_churn.rs"]
+#[path = "workloads/checkpoint_churn/mod.rs"]
 mod checkpoint_churn;
 #[path = "workloads/partial_verification_clone.rs"]
 mod partial_verification_clone;

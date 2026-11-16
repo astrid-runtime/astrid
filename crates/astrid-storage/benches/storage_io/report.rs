@@ -24,6 +24,8 @@ pub(super) struct Report {
     representation_metadata: [(); 0],
     resource_peaks: Vec<ResourcePeak>,
     count_samples: Vec<CountSamples>,
+    /// Flat per-boundary process CPU/RSS rows from checkpoint-churn samples.
+    process_phase_records: Vec<ProcessPhaseRecord>,
 }
 
 impl Report {
@@ -42,6 +44,7 @@ impl Report {
             representation_metadata: [],
             resource_peaks: Vec::new(),
             count_samples: Vec::new(),
+            process_phase_records: Vec::new(),
         }
     }
 
@@ -212,6 +215,10 @@ impl Report {
         Ok(())
     }
 
+    pub(super) fn record_process_phase(&mut self, record: ProcessPhaseRecord) {
+        self.process_phase_records.push(record);
+    }
+
     pub(super) fn print_table(&self) {
         println!(
             "{:<38} {:>12} {:>12} {:>12}",
@@ -298,6 +305,34 @@ struct CountSamples {
     minimum_count: u64,
     median_count: u64,
     maximum_count: u64,
+}
+
+/// One process-resource observation at a named checkpoint-churn phase boundary.
+#[derive(Debug, Serialize)]
+pub(super) struct ProcessPhaseRecord {
+    pub(super) sample_index: usize,
+    pub(super) phase: &'static str,
+    pub(super) status: ProcessPhaseStatus,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[allow(
+    dead_code,
+    reason = "the evidence schema includes both platform states; harness-free bench builds also set cfg(test)"
+)]
+pub(super) enum ProcessPhaseStatus {
+    #[cfg(any(unix, test))]
+    Measured {
+        user_cpu_nanoseconds: u128,
+        system_cpu_nanoseconds: u128,
+        /// Cumulative process-lifetime peak RSS in bytes at phase end.
+        /// Present on macOS/iOS (bytes) and Linux (`KiB` normalized to bytes);
+        /// `None` when platform `ru_maxrss` units are not interpreted here.
+        process_lifetime_peak_rss_bytes: Option<u64>,
+    },
+    #[cfg(any(not(unix), test))]
+    Unavailable { reason: &'static str },
 }
 
 #[derive(Debug, Serialize)]

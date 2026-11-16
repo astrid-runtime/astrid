@@ -7,14 +7,17 @@ use std::time::Duration;
 
 #[path = "../benches/storage_io/config.rs"]
 mod config;
+#[path = "../benches/storage_io/workloads/checkpoint_churn/phase_cpu.rs"]
+mod phase_cpu;
 #[path = "../benches/storage_io/provenance.rs"]
 mod provenance;
 #[path = "../benches/storage_io/report.rs"]
 mod report;
 
 use config::Config;
+use phase_cpu::{ProcessCpuTimes, checked_delta};
 use provenance::RunProvenance;
-use report::Report;
+use report::{ProcessPhaseRecord, ProcessPhaseStatus, Report};
 use sha2::{Digest, Sha256};
 
 type BenchResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -243,4 +246,87 @@ fn evidence_envelope_binds_the_complete_payload() {
         envelope["payload"]
     );
     assert_eq!(envelope["payload"]["provenance"]["git_revision"], revision);
+}
+
+#[test]
+fn process_phase_record_keeps_raw_measured_nanos_without_summary_fields() {
+    let mut report = Report::new(config(), provenance());
+    report.record_process_phase(ProcessPhaseRecord {
+        sample_index: 1,
+        phase: "overwrite_loop",
+        status: ProcessPhaseStatus::Measured {
+            user_cpu_nanoseconds: 12_000_000,
+            system_cpu_nanoseconds: 3_000_000,
+            process_lifetime_peak_rss_bytes: Some(4096),
+        },
+    });
+    let encoded = serde_json::to_value(&report).expect("serialize");
+    let row = &encoded["process_phase_records"][0];
+    assert_eq!(row["sample_index"], 1);
+    assert_eq!(row["phase"], "overwrite_loop");
+    assert_eq!(row["status"]["status"], "measured");
+    assert_eq!(row["status"]["user_cpu_nanoseconds"], 12_000_000);
+    assert_eq!(row["status"]["system_cpu_nanoseconds"], 3_000_000);
+    assert_eq!(row["status"]["process_lifetime_peak_rss_bytes"], 4096);
+}
+
+#[test]
+fn process_phase_unavailable_omits_zero_cpu_samples() {
+    let mut report = Report::new(config(), provenance());
+    report.record_process_phase(ProcessPhaseRecord {
+        sample_index: 0,
+        phase: "storage_open",
+        status: ProcessPhaseStatus::Unavailable {
+            reason: "unix getrusage only",
+        },
+    });
+    let encoded = serde_json::to_value(&report).expect("serialize");
+    let row = &encoded["process_phase_records"][0];
+    assert_eq!(row["status"]["status"], "unavailable");
+    assert_eq!(row["status"]["reason"], "unix getrusage only");
+    assert!(row["status"].get("user_cpu_nanoseconds").is_none());
+}
+
+#[test]
+fn checked_delta_subtracts_user_and_system_independently() {
+    let before = ProcessCpuTimes {
+        user: Duration::from_millis(10),
+        system: Duration::from_millis(4),
+    };
+    let after = ProcessCpuTimes {
+        user: Duration::from_millis(25),
+        system: Duration::from_millis(9),
+    };
+    let delta = checked_delta(before, after).expect("monotonic");
+    assert_eq!(delta.user, Duration::from_millis(15));
+    assert_eq!(delta.system, Duration::from_millis(5));
+}
+
+#[test]
+fn checked_delta_rejects_regressions_without_faking_zero() {
+    let before = ProcessCpuTimes {
+        user: Duration::from_millis(10),
+        system: Duration::from_millis(8),
+    };
+    let user_err = checked_delta(
+        before,
+        ProcessCpuTimes {
+            user: Duration::from_millis(9),
+            system: Duration::from_millis(9),
+        },
+    )
+    .expect_err("user regression");
+    assert!(user_err.contains("user CPU went backwards"), "{user_err}");
+    let system_err = checked_delta(
+        before,
+        ProcessCpuTimes {
+            user: Duration::from_millis(11),
+            system: Duration::from_millis(7),
+        },
+    )
+    .expect_err("system regression");
+    assert!(
+        system_err.contains("system CPU went backwards"),
+        "{system_err}"
+    );
 }
