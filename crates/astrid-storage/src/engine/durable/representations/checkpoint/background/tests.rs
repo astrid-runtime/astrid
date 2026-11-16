@@ -387,3 +387,119 @@ fn ordinary_direct_reverse_entries_do_not_reserve_unused_ids() {
         "cold recovery must keep singleton IDs compact"
     );
 }
+
+#[test]
+fn sealed_adoption_prunes_exact_arenas_without_rewalking_the_proven_closure() {
+    use crate::storage_model::physical::ProfileMap;
+    use crate::storage_model::{CanonicalPhysicalMap, PhysicalMapKey, PhysicalMapNode};
+    let (_directory, volume, mut store, limits) = primed_volume();
+    let orphan = ProfileMap::build_dense(vec![(PhysicalMapKey::new([0x79; 32]), vec![7])]).unwrap();
+    let orphan_id = orphan.root().unwrap();
+    let orphan_body = orphan.nodes()[&orphan_id].as_ref().clone();
+    let foreign_id = store.representations.root().unwrap();
+    let foreign_body = store.representations.nodes()[&foreign_id].as_ref().clone();
+    assert!(
+        store
+            .profiles
+            .insert_unreachable_adversarial_node(orphan_id, orphan_body)
+    );
+    assert!(
+        store
+            .profiles
+            .insert_unreachable_adversarial_node(foreign_id, foreign_body)
+    );
+    let capture = CapturedCheckpoint::capture_from_media(
+        &mut store,
+        CheckpointMedia::Volume(Arc::clone(&volume)),
+    )
+    .unwrap();
+    assert!(capture.snapshot.profiles.nodes().contains_key(&orphan_id));
+    assert!(capture.snapshot.profiles.nodes().contains_key(&foreign_id));
+    let before = CanonicalPhysicalMap::<PhysicalMapNode>::reclaim_walks_for_test();
+    let prepared = capture.prepare(limits, &AtomicBool::new(false)).unwrap();
+    let after = CanonicalPhysicalMap::<PhysicalMapNode>::reclaim_walks_for_test();
+    assert!(
+        !prepared
+            .replacement
+            .profiles
+            .nodes()
+            .contains_key(&orphan_id)
+    );
+    assert!(
+        !prepared
+            .replacement
+            .profiles
+            .nodes()
+            .contains_key(&foreign_id)
+    );
+    assert!(
+        prepared
+            .replacement
+            .representations
+            .nodes()
+            .contains_key(&foreign_id)
+    );
+    for (map, proof) in [
+        (
+            prepared.replacement.profiles.as_canonical(),
+            prepared.replacement.profiles.prove_root().unwrap(),
+        ),
+        (
+            prepared.replacement.representations.as_canonical(),
+            prepared.replacement.representations.prove_root().unwrap(),
+        ),
+        (
+            prepared.replacement.placement_entries.as_canonical(),
+            prepared.replacement.placement_entries.prove_root().unwrap(),
+        ),
+    ] {
+        assert_eq!(
+            map.nodes().keys().copied().collect::<BTreeSet<_>>(),
+            *proof.visited()
+        );
+    }
+    assert!(store.profiles.nodes().contains_key(&orphan_id));
+    assert!(store.profiles.nodes().contains_key(&foreign_id));
+    assert_eq!(
+        after - before,
+        0,
+        "the seal already walked each exact active closure"
+    );
+}
+
+#[test]
+fn same_domain_alias_under_foreign_reachable_id_is_rejected_before_adoption() {
+    use crate::storage_model::{CanonicalPhysicalMap, PhysicalMapNode};
+    let (_directory, volume, mut store, limits) = primed_volume();
+    let foreign_id = store.representations.root().unwrap();
+    let own_id = store.profiles.root().unwrap();
+    assert_ne!(own_id, foreign_id);
+    let own_body = store.profiles.nodes()[&own_id].as_ref().clone();
+    assert!(
+        store
+            .profiles
+            .insert_unreachable_adversarial_node(foreign_id, own_body)
+    );
+    let active = store.active;
+    let generation = store.journal_generation;
+    let capture = CapturedCheckpoint::capture_from_media(
+        &mut store,
+        CheckpointMedia::Volume(Arc::clone(&volume)),
+    )
+    .unwrap();
+    let before = CanonicalPhysicalMap::<PhysicalMapNode>::reclaim_walks_for_test();
+    let error = capture
+        .prepare(limits, &AtomicBool::new(false))
+        .err()
+        .unwrap();
+    assert!(format!("{error:?}").contains("map node body disagrees with the live tip"));
+    assert_eq!(
+        CanonicalPhysicalMap::<PhysicalMapNode>::reclaim_walks_for_test(),
+        before
+    );
+    let reopened = RepresentationStore::open_volume(&volume, limits)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reopened.active, active);
+    assert_eq!(reopened.journal_generation, generation);
+}

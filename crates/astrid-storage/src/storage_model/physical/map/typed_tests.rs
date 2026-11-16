@@ -131,7 +131,14 @@ fn legacy_and_dense_mutations_match_independent_proof_across_shapes() {
                     }
                     assert_eq!(rebuilt.root(), expected.root());
                     assert_eq!(rebuilt.rebuild_with_entries(entries.clone()).unwrap(), 0);
+                    let closure = rebuilt.prove_root().unwrap().visited().clone();
+                    let mut retained = rebuilt.clone();
+                    retained.retain_closed_nodes(&closure).unwrap();
                     rebuilt.reclaim_unreachable_nodes().unwrap();
+                    assert_eq!(
+                        retained, rebuilt,
+                        "closed retention must match independent reclaim"
+                    );
                     assert_independent_root_proof(&rebuilt);
                     let recovered =
                         RepresentationMap::recover_exact(rebuilt.root(), rebuilt.nodes().clone())
@@ -217,4 +224,28 @@ fn typed_map_clone_shares_immutable_node_bodies() {
     assert_ne!(live.root(), snapshot.root());
     assert_independent_root_proof(&live);
     assert_independent_root_proof(&snapshot);
+}
+
+#[test]
+fn closed_node_selection_cannot_drop_reachable_nodes_or_partially_mutate() {
+    for count in [0, 1, 17, 64] {
+        for construction in [MapConstruction::LegacyBinary, MapConstruction::DenseRadix] {
+            let map = build_representation_map(construction, sample_entries(0x62, count));
+            let selected = map.prove_root().unwrap().visited().clone();
+            for omitted in &selected {
+                let mut incomplete = selected.clone();
+                assert!(incomplete.remove(omitted));
+                let mut candidate = map.clone();
+                assert!(candidate.retain_closed_nodes(&incomplete).is_err());
+                assert_eq!(candidate, map, "failure must precede every arena mutation");
+            }
+            // A union may also contain IDs from other maps or no matching arena.
+            let mut union = selected;
+            union.insert(super::PhysicalMapNodeId::new([0xFA; 32]));
+            let mut candidate = map.clone();
+            candidate.retain_closed_nodes(&union).unwrap();
+            assert_eq!(candidate, map);
+            assert_independent_root_proof(&candidate);
+        }
+    }
 }

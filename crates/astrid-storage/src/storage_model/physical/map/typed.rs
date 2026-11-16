@@ -6,7 +6,7 @@
 //! and mutations exist, and a `ProfileMap` cannot be assigned into a
 //! representation or placement slot.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -149,6 +149,14 @@ macro_rules! typed_map_views {
 
             pub(crate) fn reclaim_unreachable_nodes(&mut self) -> Result<(), PhysicalModelError> {
                 self.inner.reclaim_unreachable_nodes()
+            }
+
+            /// Preserve the actual root/edges while pruning a verified tip union.
+            pub(crate) fn retain_closed_nodes(
+                &mut self,
+                retained: &BTreeSet<PhysicalMapNodeId>,
+            ) -> Result<(), PhysicalModelError> {
+                self.inner.retain_closed_nodes(retained)
             }
         }
     };

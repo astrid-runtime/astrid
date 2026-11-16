@@ -533,9 +533,15 @@ impl RepresentationStore {
         self.complete_map_subtrees.clear();
         self.persisted_map_nodes = proof.verified_reachable;
         self.map_frame_count = proof.map_frame_count;
-        self.profiles.reclaim_unreachable_nodes()?;
-        self.representations.reclaim_unreachable_nodes()?;
-        self.placement_entries.reclaim_unreachable_nodes()?;
+        // The seal proved this exact tip. Retain its closure without allocating
+        // another visited set; each map checks its actual root/edges and excludes
+        // foreign-domain aliases before mutating its arena.
+        self.profiles
+            .retain_closed_nodes(&self.persisted_map_nodes)?;
+        self.representations
+            .retain_closed_nodes(&self.persisted_map_nodes)?;
+        self.placement_entries
+            .retain_closed_nodes(&self.persisted_map_nodes)?;
         self.residency = MapResidency::new(
             self.profiles.as_canonical(),
             self.representations.as_canonical(),
