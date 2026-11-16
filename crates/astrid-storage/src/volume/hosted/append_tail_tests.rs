@@ -159,8 +159,8 @@ fn partial_plain_rename_failure_stays_uncertain_and_smaller_retry_reopens() {
     let long = VolumeRegion::new("long-payload-bytes").unwrap();
     let tiny = VolumeRegion::new("tiny").unwrap();
     // Rename reaches append_record directly, without streaming rollback. Allow
-    // its nine fixed/name header writes, then tear the destination-name payload.
-    set_remaining_append_writes(Some(9));
+    // the coalesced fixed header and name writes, then tear the destination-name payload.
+    set_remaining_append_writes(Some(2));
     let error = volume.rename_region(&region, &long).unwrap_err();
     assert!(error.to_string().contains("injected append write failure"));
     set_remaining_append_writes(None);
@@ -334,7 +334,7 @@ fn failed_vectored_write_rolls_back_whole_record_and_preserves_cursor() {
     use crate::volume::VolumeFile;
     use std::io::{IoSlice, Read, Seek, SeekFrom, Write};
 
-    for writes_before_failure in [0, 3, 9, 10] {
+    for writes_before_failure in [0, 1, 2, 3] {
         reset_faults();
         let directory = tempfile::tempdir().unwrap();
         let (volume, region, path) = open_ready_volume(&directory);

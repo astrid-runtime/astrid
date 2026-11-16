@@ -23,6 +23,7 @@ mod extent_index;
 mod footer_overwrite_tests;
 mod open;
 mod reclaim;
+mod record;
 mod recover;
 mod region_io;
 mod stream;
@@ -303,14 +304,16 @@ impl HostedFileVolume {
         // it only when the process-local proof says the physical end may exceed
         // valid_len; valid_len itself excludes the footer.
         Self::prepare_append(state)?;
-        Self::write_append_bytes(&mut state.file, &RECORD_MAGIC)?;
-        Self::write_append_bytes(&mut state.file, &total_len.to_le_bytes())?;
-        Self::write_append_bytes(&mut state.file, &next_sequence.to_le_bytes())?;
-        Self::write_append_bytes(&mut state.file, &[operation as u8])?;
-        Self::write_append_bytes(&mut state.file, &name_len.to_le_bytes())?;
-        Self::write_append_bytes(&mut state.file, &offset.to_le_bytes())?;
-        Self::write_append_bytes(&mut state.file, &payload_len.to_le_bytes())?;
-        Self::write_append_bytes(&mut state.file, &checksum)?;
+        let header = record::encode_record_fixed_header(
+            total_len,
+            next_sequence,
+            operation,
+            name_len,
+            offset,
+            payload_len,
+            &checksum,
+        );
+        Self::write_append_bytes(&mut state.file, &header)?;
         Self::write_append_bytes(&mut state.file, name)?;
         let physical_payload = state
             .valid_len

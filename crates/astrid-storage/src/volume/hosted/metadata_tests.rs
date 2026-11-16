@@ -133,7 +133,7 @@ fn invalid_late_metadata_mutation_leaves_media_and_namespace_unchanged() {
 
 #[test]
 fn failed_metadata_append_preserves_namespace_then_retries_and_recovers() {
-    for successful_writes in [0, 3, 8, 9] {
+    for successful_writes in [0, 1, 2] {
         let (directory, volume) = fixture();
         let before = {
             let state = volume.state.lock();

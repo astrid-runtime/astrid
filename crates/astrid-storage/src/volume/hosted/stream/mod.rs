@@ -8,17 +8,31 @@ use std::io::{self, Read, Seek, SeekFrom};
 #[cfg(test)]
 use std::path::Path;
 
-#[cfg(test)]
-use super::VOLUME_MAGIC;
+use super::record::{RECORD_CHECKSUM_OFFSET, encode_record_fixed_header};
 use super::{
-    ContainerState, HostedFileVolume, Operation, RECORD_FIXED_BYTES, RECORD_MAGIC, VolumeRegion,
-    overlay_extent,
+    ContainerState, HostedFileVolume, Operation, RECORD_FIXED_BYTES, VolumeRegion, overlay_extent,
 };
+#[cfg(test)]
+use super::{RECORD_MAGIC, VOLUME_MAGIC};
 
 /// Bounce buffer for payload copy and checksum. Not an operator policy knob:
 /// it does not cap blob size or change the record grammar.
 const STREAM_BUFFER_BYTES: usize = 64 * 1024;
-const RECORD_CHECKSUM_OFFSET: u64 = 43;
+
+#[cfg(test)]
+std::thread_local! {
+    static STREAM_COPY_BUFFER_CAPACITY: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_stream_copy_buffer_capacity() {
+    STREAM_COPY_BUFFER_CAPACITY.with(|cell| cell.set(0));
+}
+
+#[cfg(test)]
+fn stream_copy_buffer_capacity() -> usize {
+    STREAM_COPY_BUFFER_CAPACITY.with(core::cell::Cell::get)
+}
 
 pub(super) fn write_region_from(
     volume: &HostedFileVolume,
@@ -145,14 +159,16 @@ fn append_from_inner(
     // one may exist. A failed stream leaves footer_pending set so the next sync
     // restores the prior durable footer.
     HostedFileVolume::prepare_append(state)?;
-    HostedFileVolume::write_append_bytes(&mut state.file, &RECORD_MAGIC)?;
-    HostedFileVolume::write_append_bytes(&mut state.file, &total_len.to_le_bytes())?;
-    HostedFileVolume::write_append_bytes(&mut state.file, &next_sequence.to_le_bytes())?;
-    HostedFileVolume::write_append_bytes(&mut state.file, &[operation as u8])?;
-    HostedFileVolume::write_append_bytes(&mut state.file, &name_len.to_le_bytes())?;
-    HostedFileVolume::write_append_bytes(&mut state.file, &offset.to_le_bytes())?;
-    HostedFileVolume::write_append_bytes(&mut state.file, &payload_len.to_le_bytes())?;
-    HostedFileVolume::write_append_bytes(&mut state.file, &[0_u8; 32])?;
+    let header = encode_record_fixed_header(
+        total_len,
+        next_sequence,
+        operation,
+        name_len,
+        offset,
+        payload_len,
+        &[0_u8; 32],
+    );
+    HostedFileVolume::write_append_bytes(&mut state.file, &header)?;
     HostedFileVolume::write_append_bytes(&mut state.file, name)?;
     let physical_payload = state
         .valid_len
@@ -184,7 +200,11 @@ fn copy_and_hash(
     hasher: &mut blake3::Hasher,
 ) -> io::Result<()> {
     let mut remaining = payload_len;
-    let mut buffer = vec![0_u8; STREAM_BUFFER_BYTES];
+    let capacity = usize::try_from(payload_len.min(STREAM_BUFFER_BYTES as u64))
+        .map_err(|_| io::Error::other("volume stream copy length overflow"))?;
+    let mut buffer = vec![0_u8; capacity];
+    #[cfg(test)]
+    STREAM_COPY_BUFFER_CAPACITY.with(|cell| cell.set(cell.get().max(buffer.len())));
     while remaining != 0 {
         let want = usize::try_from(remaining.min(STREAM_BUFFER_BYTES as u64))
             .map_err(|_| io::Error::other("volume stream copy length overflow"))?;
@@ -259,3 +279,6 @@ fn scan_write_record_payloads(file: &mut File) -> io::Result<Vec<(String, u64)>>
     }
     Ok(records)
 }
+
+#[cfg(test)]
+mod tests;

@@ -114,10 +114,62 @@ fn in_place_write_footer_overwrite_recovers_every_interrupted_prefix() {
 }
 
 #[test]
+fn uncommitted_write_footer_reuse_recovers_every_interrupted_prefix() {
+    // prepare_append overwrites a known footer in place without truncating it.
+    // Crash images must keep the old footer remainder whenever the new record
+    // prefix is shorter than FOOTER_BYTES, and must never publish a Commit.
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("source.volume");
+    let volume = HostedFileVolume::open(&path).unwrap();
+    let seed = VolumeRegion::new("seed").unwrap();
+    let target = VolumeRegion::new("target").unwrap();
+    volume.create_region(&seed, true).unwrap();
+    volume.write_region_at(&seed, 0, b"unchanged").unwrap();
+    volume.create_region(&target, true).unwrap();
+    volume.write_region_at(&target, 0, b"old-value").unwrap();
+    volume.sync().unwrap();
+    let old = test_support::read_container(&volume);
+    let start = usize::try_from(volume.state.lock().valid_len).unwrap();
+    let commit_before = volume.state.lock().last_commit_offset;
+    let durable_before = volume.state.lock().durable_len;
+    assert_eq!(old.len().strict_sub(start), recover::FOOTER_BYTES);
+
+    volume.write_region_at(&target, 0, b"new-value").unwrap();
+    let dirty = test_support::read_container(&volume);
+    let state = volume.state.lock();
+    let dirty_end = usize::try_from(state.valid_len).unwrap();
+    assert_eq!(state.last_commit_offset, commit_before);
+    assert_eq!(state.durable_len, durable_before);
+    assert!(state.valid_len > state.durable_len);
+    drop(state);
+    assert!(dirty_end > start.strict_add(RECORD_FIXED_BYTES));
+
+    let record_len = dirty_end.strict_sub(start);
+    let crash_path = directory.path().join("crash.volume");
+    for prefix in 0..=record_len {
+        let image = interrupted_image(&old, &dirty, start, prefix);
+        if prefix < recover::FOOTER_BYTES {
+            assert_eq!(
+                &image[start.strict_add(prefix)..start.strict_add(recover::FOOTER_BYTES)],
+                &old[start.strict_add(prefix)..start.strict_add(recover::FOOTER_BYTES)],
+                "short prefix must retain the previous footer remainder"
+            );
+        }
+        std::fs::write(&crash_path, &image).unwrap();
+        let recovered = HostedFileVolume::open(&crash_path)
+            .unwrap_or_else(|error| panic!("uncommitted write prefix {prefix}: {error}"));
+        assert_region(&recovered, &seed, b"unchanged");
+        assert_region(&recovered, &target, b"old-value");
+        drop(recovered);
+    }
+}
+
+#[test]
 fn streamed_write_failures_preserve_the_previous_commit() {
     // Include the final checksum patch, which writes before the current file
     // cursor. The contiguous-prefix matrix alone does not model that order.
-    for writes_before_failure in 0..=10 {
+    // Coalesced stream writes use four counted calls for a small payload.
+    for writes_before_failure in 0..=3 {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("source.volume");
         let volume = HostedFileVolume::open(&path).unwrap();
