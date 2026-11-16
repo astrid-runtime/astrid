@@ -7,6 +7,8 @@ use crate::storage_model::{BlobId, ObjectId};
 use super::PhysicalModelError;
 use super::codec::{Decoder, Encoder, EncodingSink};
 
+mod hasher;
+
 const BLAKE3_ALGORITHM: u16 = 1;
 const LOGICAL_CONSTRUCTION: u16 = 1;
 const PHYSICAL_CONSTRUCTION: u16 = 2;
@@ -98,13 +100,13 @@ pub(crate) struct Blake3PhysicalIdentity;
 
 impl PhysicalIdentity for Blake3PhysicalIdentity {
     fn identify(&self, context: &'static str, material: &[u8]) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new_derive_key(context);
+        let mut hasher = hasher::physical_hasher(context);
         hasher.update(material);
         *hasher.finalize().as_bytes()
     }
 
     fn identify_parts(&self, context: &'static str, parts: &[&[u8]]) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new_derive_key(context);
+        let mut hasher = hasher::physical_hasher(context);
         for part in parts {
             hasher.update(part);
         }

@@ -47,8 +47,8 @@ std::thread_local! {
 
 const LEGACY_MAP_NODE_VERSION: u16 = 1;
 const RADIX_MAP_NODE_VERSION: u16 = 2;
-const LEGACY_MAP_NODE_IDENTITY: &str = "astrid-physical-map-node-v1\0";
-const RADIX_MAP_NODE_IDENTITY: &str = "astrid-physical-radix-map-node-v1\0";
+pub(super) const LEGACY_MAP_NODE_IDENTITY: &str = "astrid-physical-map-node-v1\0";
+pub(super) const RADIX_MAP_NODE_IDENTITY: &str = "astrid-physical-radix-map-node-v1\0";
 const RADIX_PAGE_CAPACITY: usize = 1;
 const DIGEST_NIBBLES: u8 = 64;
 const TAGGED_PHYSICAL_IDENTITY_BYTES: usize = 40;
