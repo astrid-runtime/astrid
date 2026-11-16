@@ -5,7 +5,7 @@
 //! independently; cloning a native file would share the writer's seek cursor.
 
 use super::super::CheckpointCancellation;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use super::super::super::format::{DurableFrameRange, DurablePrefixEnd};
 use super::super::{
@@ -65,7 +65,7 @@ impl CapturedCheckpoint {
             // Source-generation append memos confer no authority in the sealed
             // destination. Its ordinary adoption proof installs fresh memos.
             persisted_map_nodes: BTreeSet::new(),
-            complete_map_subtrees: BTreeSet::new(),
+            complete_map_subtrees: HashSet::new(),
             map_frame_count: 0,
             direct_profile: store.direct_profile,
             reverse: store.reverse.clone(),

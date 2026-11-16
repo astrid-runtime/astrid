@@ -244,7 +244,7 @@ fn private_proof_failure_or_write_failure_preserves_authority_and_reclaims_priva
 #[test]
 fn automatic_checkpoint_skips_map_identify_rebuild_after_typed_birth() {
     use super::super::activation::visit_new_reachable_map_nodes;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashSet};
 
     let (_directory, volume, mut store, limits) = primed_volume();
     let mut live_nodes = 0usize;
@@ -258,7 +258,7 @@ fn automatic_checkpoint_skips_map_identify_rebuild_after_typed_birth() {
                 map,
                 &mut BTreeSet::new(),
                 &mut BTreeSet::new(),
-                &mut BTreeSet::new(),
+                &mut HashSet::new(),
                 |_, _| Ok(()),
             )
             .unwrap(),

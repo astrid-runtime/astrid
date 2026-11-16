@@ -82,12 +82,16 @@ impl RepresentationStore {
             if collection.is_err() {
                 // Retain knowledge of existing frames, but revoke their closure
                 // proofs when a later map fails after partial collection.
+                // take() drops the HashSet table; drain() would keep its buckets.
                 self.persisted_map_nodes
-                    .append(&mut self.complete_map_subtrees);
+                    .extend(std::mem::take(&mut self.complete_map_subtrees));
             } else {
                 // Immutable resident nodes keep their complete durable closure:
                 // successful collection retains every reachable descendant.
                 self.complete_map_subtrees.retain(resident);
+                // Collection already paid for the walk. Release retired HashSet
+                // buckets here rather than after every PUT.
+                self.complete_map_subtrees.shrink_to_fit();
             }
             // Durable frames and historical roots remain unchanged;
             // reintroduced IDs are safely appended again.

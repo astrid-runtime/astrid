@@ -1,6 +1,6 @@
 //! Observing destination evidence must not introduce another update grammar.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
@@ -99,7 +99,7 @@ fn failed_append_does_not_promote_unwritten_closures_and_retry_reopens() {
             .chain(store.placement_entries.nodes().keys())
             .chain(store.profiles.nodes().keys())
             .copied()
-            .collect::<BTreeSet<_>>();
+            .collect::<HashSet<_>>();
         let before_active = store.active;
         let direct = store
             .describe_direct(

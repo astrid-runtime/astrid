@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::super::tests::empty_store;
@@ -17,7 +18,7 @@ fn failed_observation_does_not_promote_new_node_closures() {
         .chain(store.placement_entries.nodes().keys())
         .chain(store.profiles.nodes().keys())
         .copied()
-        .collect::<BTreeSet<_>>();
+        .collect::<HashSet<_>>();
     let direct = store
         .describe_direct(
             ObjectId::new([42; 32]),
@@ -63,6 +64,62 @@ fn successful_rebase_retains_closed_root_proofs() {
         )
         .unwrap();
     store.rebase_all_direct(&[direct]).unwrap();
+    for root in [store.representations.root(), store.placement_entries.root()] {
+        let root = root.unwrap();
+        assert!(store.complete_map_subtrees.contains(&root));
+        assert!(!store.persisted_map_nodes.contains(&root));
+    }
+}
+
+#[test]
+fn rebase_releases_oversized_complete_memo_capacity() {
+    let directory = tempfile::tempdir().unwrap();
+    let volume: Arc<dyn AstridVolume> =
+        HostedFileVolume::open(directory.path().join("rebase-capacity.volume")).unwrap();
+    let mut store = empty_store(&volume);
+    let mut survivor = None;
+    for sequence in 0_u64..256 {
+        let bytes = sequence.to_le_bytes();
+        let direct = store
+            .describe_direct(
+                ObjectId::new(*blake3::hash(&bytes).as_bytes()),
+                &bytes,
+                ArenaLocation {
+                    offset: sequence * 100,
+                    payload_len: 8,
+                    checksum: [3; 32],
+                },
+            )
+            .unwrap();
+        let update = store
+            .append_direct_update(std::slice::from_ref(&direct))
+            .unwrap()
+            .unwrap();
+        store.publish_direct_update(update).unwrap();
+        survivor = Some(direct);
+    }
+    let survivor = survivor.unwrap();
+    let highwater = store.complete_map_subtrees.capacity();
+    assert!(
+        highwater > 32,
+        "grown complete memo must have allocated HashSet buckets"
+    );
+    store.rebase_all_direct(&[survivor]).unwrap();
+    assert!(
+        store.complete_map_subtrees.capacity() < highwater,
+        "rebase collection must release retired complete HashSet buckets"
+    );
+    assert!(store.complete_map_subtrees.iter().all(|id| {
+        store.profiles.nodes().contains_key(id)
+            || store.representations.nodes().contains_key(id)
+            || store.placement_entries.nodes().contains_key(id)
+    }));
+    assert!(
+        store
+            .complete_map_subtrees
+            .iter()
+            .all(|id| !store.persisted_map_nodes.contains(id))
+    );
     for root in [store.representations.root(), store.placement_entries.root()] {
         let root = root.unwrap();
         assert!(store.complete_map_subtrees.contains(&root));
