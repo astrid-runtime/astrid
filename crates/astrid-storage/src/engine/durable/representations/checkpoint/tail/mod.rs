@@ -179,7 +179,11 @@ impl RepresentationStore {
             |_, payload, _source| {
                 ensure_not_cancelled(cancel)?;
                 let frame = MetadataFrame::decode(payload)?;
-                frame.verify(&Blake3PhysicalIdentity)?;
+                // Map nodes receive the same complete canonical decode and ID
+                // binding in accept as replay; do not materialize/hash them twice.
+                if frame.kind != MetadataKind::MapNode {
+                    frame.verify(&Blake3PhysicalIdentity)?;
+                }
                 if frame.kind == MetadataKind::State {
                     if saw_state || !publication.has_authority() {
                         return Err(invalid(
@@ -187,8 +191,7 @@ impl RepresentationStore {
                         ));
                     }
                     saw_state = true;
-                    additions = publication.count_new_direct(self)?;
-                    publication.clear_records();
+                    additions = std::mem::take(&mut publication).count_new_direct(self)?;
                     Ok(())
                 } else {
                     publication.accept(self, &frame)
@@ -363,16 +366,9 @@ impl DirectPublication {
         self.catalogue.is_some() && self.placement_set.is_some()
     }
 
-    fn clear_records(&mut self) {
-        self.records.clear();
-        self.placements.clear();
-        self.catalogue = None;
-        self.placement_set = None;
-    }
-
-    fn count_new_direct(&self, store: &RepresentationStore) -> Result<usize, DurableError> {
+    fn count_new_direct(self, store: &RepresentationStore) -> Result<usize, DurableError> {
         let mut additions = 0_usize;
-        let mut placements = self.placements.clone();
+        let mut placements = self.placements;
         for record in self.records.values() {
             let Recipe::DirectCanonical { blob } = record.recipe() else {
                 return Err(invalid("checkpoint tail adds a non-direct representation"));

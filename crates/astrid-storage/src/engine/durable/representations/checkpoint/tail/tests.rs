@@ -245,7 +245,10 @@ fn single_residual_is_nonbulk_and_preflight_does_not_mutate_destination() {
         let expected = source.store.active;
         // Appends after the captured fence must not enter destination replay.
         add(&mut source.store, 2, 1);
-        assert!(nonbulk(&target.store, &mut source.store, from, to, expected).unwrap());
+        let (preflight, owned_decodes) = PhysicalMapNode::count_owned_decodes_during(|| {
+            nonbulk(&target.store, &mut source.store, from, to, expected)
+        });
+        assert!(preflight.unwrap());
         assert_eq!(target.store.active, before);
         assert_eq!(target.store.reverse.len(), 1);
         replay(&mut target.store, &mut source.store, from, to, expected).unwrap();
@@ -256,6 +259,10 @@ fn single_residual_is_nonbulk_and_preflight_does_not_mutate_destination() {
             .unwrap_err();
         // Destination caught up to the captured residual tip, not later source.
         assert_eq!(target.store.reverse.len(), 2);
+        assert_eq!(
+            owned_decodes, 0,
+            "preflight must authenticate through the borrowed decoder without materializing nodes"
+        );
     }
 }
 
@@ -492,6 +499,13 @@ fn forged_crc_valid_map_identity_rejects_before_destination_mutation() {
         source.store.metadata.write_all(&header).unwrap();
         source.store.metadata.write_all(&forged).unwrap();
         source.store.metadata.sync_data().unwrap();
+        assert!(matches!(
+            nonbulk(&target.store, &mut source.store, from, to, expected),
+            Err(DurableError::InvalidRepresentationState(
+                "metadata identity does not match canonical value"
+            ))
+        ));
+        assert_eq!((target.store.active, ends(&target.store)), before);
         assert!(matches!(
             replay(&mut target.store, &mut source.store, from, to, expected),
             Err(DurableError::InvalidRepresentationState(

@@ -106,3 +106,32 @@ fn handover_rejects_a_writer_that_advanced_after_the_worker_finished() {
     live.publish_direct_update(update).unwrap();
     assert!(live.verify_checkpoint_tip(&prepared).is_err());
 }
+
+#[test]
+fn handover_shared_live_map_arc_bodies_skip_deep_node_eq() {
+    let (_directory, volume, live, limits) = primed_volume();
+    let mut prepared = RepresentationStore::open_volume(&volume, limits)
+        .unwrap()
+        .unwrap();
+
+    let before_independent = super::node_body_deep_comparisons_for_test();
+    live.verify_checkpoint_tip(&prepared).unwrap();
+    let independent = super::node_body_deep_comparisons_for_test() - before_independent;
+    assert!(
+        independent > 0,
+        "independent equal cold recoveries must still deep-compare node bodies"
+    );
+
+    // Distinct stores; share the live immutable map allocations only.
+    prepared.profiles = live.profiles.clone();
+    prepared.representations = live.representations.clone();
+    prepared.placement_entries = live.placement_entries.clone();
+
+    let before_shared = super::node_body_deep_comparisons_for_test();
+    live.verify_checkpoint_tip(&prepared).unwrap();
+    assert_eq!(
+        super::node_body_deep_comparisons_for_test() - before_shared,
+        0,
+        "shared Arc map bodies must not fall back to deep PartialEq"
+    );
+}

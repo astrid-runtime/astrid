@@ -5,6 +5,11 @@ use crate::storage_model::physical::SharedPhysicalMap;
 
 use super::super::{DurableError, RepresentationStore};
 
+#[cfg(test)]
+std::thread_local! {
+    static NODE_BODY_DEEP_COMPARISONS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
 impl RepresentationStore {
     /// The worker has already validated framing, canonical closures and full
     /// semantic associations, including all replayed direct transitions. This
@@ -49,6 +54,21 @@ fn disagreement() -> DurableError {
     )
 }
 
+/// Node body equality for tip binding only.
+///
+/// Same immutable allocation is sufficient for equality here. This is not
+/// authenticity, identity derivation, or a subtree proof. Callers must still
+/// walk roots, enforce counts/domains/cycle bounds, and compare every matching
+/// live-arena alias even when roots share an allocation.
+fn map_nodes_equal(left: &PhysicalMapNode, right: &PhysicalMapNode) -> bool {
+    if core::ptr::eq(left, right) {
+        return true;
+    }
+    #[cfg(test)]
+    NODE_BODY_DEEP_COMPARISONS.with(|count| count.set(count.get().strict_add(1)));
+    left == right
+}
+
 fn verify_map_bodies(
     live: &SharedPhysicalMap,
     prepared: &SharedPhysicalMap,
@@ -68,8 +88,9 @@ fn verify_map_bodies(
     while let Some(id) = pending.pop() {
         remaining = remaining.checked_sub(1).ok_or_else(disagreement)?;
         let node = prepared.nodes().get(&id).ok_or_else(disagreement)?.as_ref();
-        if live.nodes().get(&id).map(AsRef::as_ref) != Some(node) {
-            return Err(disagreement());
+        match live.nodes().get(&id) {
+            Some(live_node) if map_nodes_equal(live_node.as_ref(), node) => {},
+            _ => return Err(disagreement()),
         }
         // A shadow body under the same identity in another arena must not be
         // hidden by selecting the first matching domain. This includes aliases
@@ -77,7 +98,7 @@ fn verify_map_bodies(
         for map in live_maps {
             if !std::ptr::eq(map, live)
                 && let Some(alias) = map.nodes().get(&id)
-                && alias.as_ref() != node
+                && !map_nodes_equal(alias.as_ref(), node)
             {
                 return Err(disagreement());
             }
@@ -94,6 +115,11 @@ fn verify_map_bodies(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn node_body_deep_comparisons_for_test() -> usize {
+    NODE_BODY_DEEP_COMPARISONS.with(core::cell::Cell::get)
 }
 
 #[cfg(test)]
