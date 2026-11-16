@@ -45,6 +45,7 @@ pub(super) async fn run(config: &Config, root: &Path, report: &mut Report) -> Be
     let mut generations = Vec::new();
     let mut region_counts = Vec::new();
     let mut metadata_lengths = Vec::new();
+    let mut inserted_objects = Vec::new();
     for sample_index in 0..config.samples {
         let mut phase = phase_cpu::PhaseTimer::start(sample_index)?;
         reset_benchmark_home(&home_path)?;
@@ -89,6 +90,7 @@ pub(super) async fn run(config: &Config, root: &Path, report: &mut Report) -> Be
         drop(reopened);
         phase.mark("storage_reopen_close", report)?;
 
+        inserted_objects.push(measured.objects_inserted);
         puts.extend(measured.latencies);
         loops.push(measured.wall);
         generations.push(generation);
@@ -103,6 +105,7 @@ pub(super) async fn run(config: &Config, root: &Path, report: &mut Report) -> Be
     report.record_operations("astrid_checkpoint_storage_close", 1, closes);
     report.record_operations("astrid_checkpoint_storage_reopen", 1, reopens);
     report.record_operations("astrid_checkpoint_storage_reopen_close", 1, reopened_closes);
+    report.record_counts("astrid_checkpoint_objects_inserted", inserted_objects)?;
     report.record_counts("representations_max_generation", generations)?;
     report.record_counts("representations_generation_region_count", region_counts)?;
     report.record_resource_peak("representations_metadata_logical_bytes", metadata_lengths)?;
@@ -120,6 +123,7 @@ struct OverwriteMeasurements {
     latencies: Vec<Duration>,
     expected: Vec<(ContentName, [u8; PAYLOAD_BYTES])>,
     wall: Duration,
+    objects_inserted: u64,
 }
 
 fn overwrite_loop(
@@ -131,14 +135,18 @@ fn overwrite_loop(
     let mut latencies = Vec::with_capacity(overwrites);
     let mut expected = Vec::new();
     let mut latest = (0..SLOT_COUNT).map(|_| None).collect::<Vec<_>>();
+    let mut objects_inserted = 0_u64;
     let wall_started = Instant::now();
     for sequence in 0..overwrites {
         let sequence = u64::try_from(sequence)?;
         let payload = payload(sequence);
         let name = put_name(sequence)?;
         let started = Instant::now();
-        black_box(content.put(owner, &name, &payload)?);
+        let outcome = black_box(content.put(owner, &name, &payload)?);
         latencies.push(started.elapsed());
+        objects_inserted = objects_inserted
+            .checked_add(outcome.objects_inserted())
+            .ok_or("checkpoint admitted-object count overflow")?;
         if sequence.is_multiple_of(ANCHOR_PERIOD) {
             expected.push((name, payload));
         } else {
@@ -153,6 +161,7 @@ fn overwrite_loop(
         latencies,
         expected,
         wall,
+        objects_inserted,
     })
 }
 
