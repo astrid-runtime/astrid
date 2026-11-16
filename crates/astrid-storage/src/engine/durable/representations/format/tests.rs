@@ -3,7 +3,10 @@ use super::*;
 #[test]
 fn authenticated_map_publication_matches_independent_hashing_for_every_node_kind() {
     use crate::storage_model::PhysicalMapKey;
-    use crate::storage_model::physical::{PlacementMap, ProfileMap, RepresentationMap};
+    use crate::storage_model::physical::{
+        AuthenticatedPhysicalMap, PlacementMap, ProfileMap, RepresentationMap,
+    };
+    use std::collections::BTreeSet;
 
     let entries: Vec<_> = (0_u8..32)
         .map(|index| (PhysicalMapKey::new([index; 32]), vec![index; 128]))
@@ -16,12 +19,25 @@ fn authenticated_map_publication_matches_independent_hashing_for_every_node_kind
         [&profiles, &legacy, &representations, &placements];
     let mut variants = [false; 4];
     for map in maps {
-        for (id, node) in map.as_canonical().nodes() {
-            let (result, identifies) = PhysicalMapNode::count_identifies_during(|| {
-                MetadataFrame::authenticated_map_node(map, *id)
-            });
-            let frame = result.unwrap();
-            assert_eq!(identifies, 0);
+        let mut frames = Vec::new();
+        let (result, identifies) = PhysicalMapNode::count_identifies_during(|| {
+            super::super::activation::append_authenticated_map_nodes(
+                &mut frames,
+                map,
+                &mut BTreeSet::new(),
+                &mut BTreeSet::new(),
+                &mut BTreeSet::new(),
+            )
+        });
+        result.unwrap();
+        assert_eq!(identifies, 0);
+        assert_eq!(frames.len(), map.as_canonical().nodes().len());
+        for frame in frames {
+            let node = map
+                .as_canonical()
+                .nodes()
+                .get(&PhysicalMapNodeId::new(frame.identity))
+                .unwrap();
             let independently_hashed =
                 MetadataFrame::map_node(&Blake3PhysicalIdentity, node).unwrap();
             assert_eq!(

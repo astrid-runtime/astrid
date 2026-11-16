@@ -10,7 +10,7 @@ use crate::storage_model::{
 };
 use std::collections::BTreeSet;
 
-use super::format::{Blake3PhysicalIdentity, MetadataFrame};
+use super::format::{Blake3PhysicalIdentity, MetadataFrame, MetadataKind};
 use super::{DirectArenaObject, DurableError, LOCAL_STORAGE_NODE};
 
 pub(super) struct InitialState {
@@ -213,12 +213,25 @@ pub(super) fn append_authenticated_map_nodes(
     appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
 ) -> Result<usize, DurableError> {
-    visit_new_reachable_map_nodes(map.as_canonical(), durable, appended, complete, |id, _| {
-        metadata.push(MetadataFrame::authenticated_map_node(map, id)?);
-        Ok(())
-    })
+    visit_new_reachable_map_nodes(
+        map.as_canonical(),
+        durable,
+        appended,
+        complete,
+        |id, node| {
+            // The sealed input fixes the identity policy. This same walk supplied
+            // the ID and immutable body together; neither needs another lookup.
+            metadata.push(MetadataFrame {
+                kind: MetadataKind::MapNode,
+                identity: *id.as_bytes(),
+                value: node.encode()?,
+            });
+            Ok(())
+        },
+    )
 }
 
+// Hash-agile fixtures retain the generic, independently hashing encoder.
 #[cfg(test)]
 pub(super) fn append_new_reachable_map_nodes(
     metadata: &mut Vec<MetadataFrame>,
