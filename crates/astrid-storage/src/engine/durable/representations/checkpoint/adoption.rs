@@ -9,7 +9,7 @@ use super::super::CheckpointCancellation;
 use crate::storage_model::physical::CanonicalRootProof;
 use crate::storage_model::physical::{PlacementMap, ProfileMap, RepresentationMap};
 use crate::storage_model::{
-    ObjectId, PhysicalMapNodeId, PlacementSet, RepresentationCatalogueRoot,
+    ObjectId, PhysicalMapKey, PhysicalMapNodeId, PlacementSet, RepresentationCatalogueRoot,
     RepresentationProfileId, RepresentationRecordId, RepresentationState, RepresentationStateId,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -60,24 +60,40 @@ struct LiveTipRefs<'a> {
 }
 
 struct CanonicalTip<'a> {
-    roots: [CanonicalRootProof<'a>; 3],
+    /// Borrowed leaves from profile, representation, and placement proofs.
+    entries: [Vec<(PhysicalMapKey, &'a [u8])>; 3],
     reachable: BTreeSet<PhysicalMapNodeId>,
+}
+
+impl<'a> CanonicalTip<'a> {
+    /// Merge three independently proven roots into one tip view.
+    ///
+    /// Each proof's visited set is moved into the union with `BTreeSet::append`
+    /// (same membership as collecting borrowed IDs). Entry borrows remain for
+    /// semantic agreement; per-root visited sets are not retained afterward.
+    fn from_root_proofs(roots: [CanonicalRootProof<'a>; 3]) -> Self {
+        let [profiles, representations, placements] = roots;
+        let (mut reachable, profile_entries) = profiles.into_parts();
+        let (mut representation_visited, representation_entries) = representations.into_parts();
+        let (mut placement_visited, placement_entries) = placements.into_parts();
+        reachable.append(&mut representation_visited);
+        reachable.append(&mut placement_visited);
+        Self {
+            entries: [profile_entries, representation_entries, placement_entries],
+            reachable,
+        }
+    }
 }
 
 #[cfg(test)]
 impl<'a> LiveTipRefs<'a> {
     fn prove(&self) -> Result<CanonicalTip<'a>, DurableError> {
         self.ensure_live_authority_binds_sealed_tip()?;
-        let roots = [
+        Ok(CanonicalTip::from_root_proofs([
             self.profiles.prove_root()?,
             self.representations.prove_root()?,
             self.placement_entries.prove_root()?,
-        ];
-        let reachable = roots
-            .iter()
-            .flat_map(|proof| proof.visited().iter().copied())
-            .collect();
-        Ok(CanonicalTip { roots, reachable })
+        ]))
     }
 }
 
@@ -239,16 +255,11 @@ impl<'a> LiveTipRefs<'a> {
             stream.append_payload_parts(&[&prefix, body])?;
             Ok::<_, DurableError>(())
         };
-        let roots = [
+        let canonical = CanonicalTip::from_root_proofs([
             self.profiles.encode_live_into(&mut append)?,
             self.representations.encode_live_into(&mut append)?,
             self.placement_entries.encode_live_into(&mut append)?,
-        ];
-        let reachable = roots
-            .iter()
-            .flat_map(|proof| proof.visited().iter().copied())
-            .collect();
-        let canonical = CanonicalTip { roots, reachable };
+        ]);
         // Incomplete private frames confer no authority. Do not finish/sync the
         // stream, append authority or journal frames, or publish CURRENT until
         // every root and independently walked set has passed its full proof.
@@ -464,8 +475,7 @@ impl LiveTipRefs<'_> {
         cancel: &impl CheckpointCancellation,
     ) -> Result<(), DurableError> {
         let direct_profile = validate_profile_entries(
-            canonical.roots[0]
-                .entries()
+            canonical.entries[0]
                 .iter()
                 .copied()
                 .take_while(|_| !cancel.is_cancelled()),
@@ -478,14 +488,12 @@ impl LiveTipRefs<'_> {
         let validated = validate_representation_entries::<false, _>(
             self.profiles.as_canonical(),
             || {
-                Ok(canonical.roots[1]
-                    .entries()
+                Ok(canonical.entries[1]
                     .iter()
                     .copied()
                     .take_while(|_| !cancel.is_cancelled()))
             },
-            canonical.roots[2]
-                .entries()
+            canonical.entries[2]
                 .iter()
                 .copied()
                 .take_while(|_| !cancel.is_cancelled()),
@@ -818,3 +826,6 @@ pub(super) fn ensure_not_cancelled(
 pub(in crate::engine::durable) fn is_checkpoint_cancelled(error: &DurableError) -> bool {
     matches!(error, DurableError::InvalidRepresentationState(reason) if *reason == CHECKPOINT_CANCELLED)
 }
+
+#[cfg(test)]
+mod tests;

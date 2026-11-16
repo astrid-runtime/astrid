@@ -15,6 +15,9 @@ use crate::storage_model::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
+mod tests;
+
 pub(in crate::engine::durable::representations) struct DirectUpdateEvidence {
     pub(in crate::engine::durable::representations) metadata: DurableFrameRange,
     pub(in crate::engine::durable::representations) appended_map_nodes: BTreeSet<PhysicalMapNodeId>,
@@ -143,7 +146,10 @@ impl RepresentationStore {
             u64::try_from(appended_map_nodes.len()).map_err(|_| DurableError::EncodingOverflow)?;
         let locations = append_frames(&mut self.metadata, METADATA_MAGIC, &payloads)?;
         let evidence = observe(&locations, &appended_map_nodes)?;
-        self.persisted_map_nodes.extend(appended_map_nodes);
+        // The successful postorder batch wrote each new node and its closure.
+        // Retain that proof now; the next write need not rediscover it. Neither
+        // a partial write nor failed observation reaches this promotion.
+        self.complete_map_subtrees.extend(appended_map_nodes);
         self.map_frame_count = self
             .map_frame_count
             .checked_add(map_frames)
@@ -229,7 +235,8 @@ impl RepresentationStore {
         let map_frames =
             u64::try_from(appended_map_nodes.len()).map_err(|_| DurableError::EncodingOverflow)?;
         append_frames(&mut self.metadata, METADATA_MAGIC, &payloads)?;
-        self.persisted_map_nodes.extend(appended_map_nodes);
+        // Rebase uses the same postorder closure proof and successful batch.
+        self.complete_map_subtrees.extend(appended_map_nodes);
         self.map_frame_count = self
             .map_frame_count
             .checked_add(map_frames)

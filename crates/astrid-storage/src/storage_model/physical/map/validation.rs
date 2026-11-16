@@ -71,6 +71,18 @@ impl<'a> CanonicalRootProof<'a> {
     pub(crate) fn entries(&self) -> &[(PhysicalMapKey, &'a [u8])] {
         &self.entries
     }
+
+    /// Consume one root proof into its reachability set and borrowed leaves.
+    ///
+    /// Checkpoint adoption merges the three visited sets into one tip set and
+    /// retains only the entry borrows for semantic agreement. Keeping both the
+    /// per-root sets and the union would duplicate the same IDs in memory.
+    #[cfg(any(test, not(target_family = "wasm")))]
+    pub(crate) fn into_parts(
+        self,
+    ) -> (BTreeSet<PhysicalMapNodeId>, Vec<(PhysicalMapKey, &'a [u8])>) {
+        (self.visited, self.entries)
+    }
 }
 
 pub(super) fn validate_root<I: PhysicalIdentity>(

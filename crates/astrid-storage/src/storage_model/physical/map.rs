@@ -43,6 +43,7 @@ std::thread_local! {
     // Count map-node identity minting (rebuild/validate/encode_and_identify).
     // Automatic seal encode-live must not increment this after typed birth.
     static MAP_NODE_IDENTIFIES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static MAP_NODE_OWNED_DECODES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 const LEGACY_MAP_NODE_VERSION: u16 = 1;
@@ -378,7 +379,22 @@ impl PhysicalMapNode {
     ///
     /// Rejects invalid fields, trailing bytes, and second encodings.
     pub fn decode(bytes: &[u8]) -> Result<Self, PhysicalModelError> {
+        #[cfg(test)]
+        MAP_NODE_OWNED_DECODES.with(|count| count.set(count.get().strict_add(1)));
         decode::with_decoded(bytes, decode::into_owned)?
+    }
+
+    #[cfg(test)]
+    pub(crate) fn count_owned_decodes_during<T>(operation: impl FnOnce() -> T) -> (T, usize) {
+        struct DecodeCountScope(usize);
+        impl Drop for DecodeCountScope {
+            fn drop(&mut self) {
+                MAP_NODE_OWNED_DECODES.with(|count| count.set(self.0.strict_add(count.get())));
+            }
+        }
+        let _scope = DecodeCountScope(MAP_NODE_OWNED_DECODES.with(|count| count.replace(0)));
+        let value = operation();
+        (value, MAP_NODE_OWNED_DECODES.with(core::cell::Cell::get))
     }
 
     /// Derive the domain-separated node identity.

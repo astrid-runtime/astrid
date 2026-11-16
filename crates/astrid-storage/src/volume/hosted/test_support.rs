@@ -6,6 +6,24 @@ use std::io::{self, Seek, SeekFrom};
 use super::HostedFileVolume;
 
 impl HostedFileVolume {
+    /// Scope the existing thread-local partial-append fault to one operation.
+    #[cfg(test)]
+    pub(crate) fn with_append_failure_for_test<T>(
+        successful_writes: usize,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        struct Restore(Option<usize>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                super::set_remaining_append_writes(self.0);
+            }
+        }
+        let previous = super::REMAINING_APPEND_WRITES
+            .with(|remaining| remaining.replace(Some(successful_writes)));
+        let _restore = Restore(previous);
+        operation()
+    }
+
     #[cfg(test)]
     pub(crate) fn copy_container_for_test(&self, path: &std::path::Path) {
         copy_container(self, path);

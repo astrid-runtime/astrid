@@ -152,15 +152,21 @@ fn direct_tail_replays_in_new_epoch_and_ignores_later_appends() {
         let mut target = Fixture::new(hosted);
         target.checkpoint();
         let from = ends(&source.store);
+        let initial_map_frames = source.store.map_frame_count;
         add(&mut source.store, 1, 128);
         add(&mut source.store, 129, 3);
         let to = ends(&source.store);
+        let source_map_frames = source.store.map_frame_count - initial_map_frames;
         let expected = source.store.active;
         add(&mut source.store, 132, 7);
         let later = ends(&source.store);
         let generation = source.store.journal_generation;
         assert_ne!(generation, target.store.journal_generation);
-        replay(&mut target.store, &mut source.store, from, to, expected).unwrap();
+        let (result, owned_decodes) = PhysicalMapNode::count_owned_decodes_during(|| {
+            replay(&mut target.store, &mut source.store, from, to, expected)
+        });
+        result.unwrap();
+        assert_eq!(owned_decodes, usize::try_from(source_map_frames).unwrap());
         assert_eq!(target.store.active, expected);
         assert_ne!(target.store.active, source.store.active);
         assert_eq!(target.store.reverse.len(), 131);
@@ -435,6 +441,60 @@ fn source_metadata_crc_corruption_rejects_without_mutating_destination() {
         flip_last_byte(&mut source.store.metadata);
         assert!(replay(&mut target.store, &mut source.store, from, to, expected).is_err());
         assert_eq!(target.store.active, before);
+        assert_eq!(ends(&source.store), to);
+    }
+}
+
+#[test]
+fn forged_crc_valid_map_identity_rejects_before_destination_mutation() {
+    use crate::engine::durable::format::{frame_checksum, frame_header};
+
+    for hosted in [false, true] {
+        let mut source = Fixture::new(hosted);
+        let mut target = Fixture::new(hosted);
+        target.checkpoint();
+        let from = ends(&source.store);
+        add(&mut source.store, 1, 1);
+        let to = ends(&source.store);
+        let expected = source.store.active;
+        let before = (target.store.active, ends(&target.store));
+        let range = DurableFrameRange::try_new(from.0, to.0).unwrap();
+        let (location, payload) = read_frame_in_range(
+            &mut source.store.metadata,
+            format::METADATA_FILE,
+            METADATA_MAGIC,
+            RecoveryLimits::process_addressable(),
+            range,
+            from.0,
+        )
+        .unwrap()
+        .unwrap();
+        let mut frame = MetadataFrame::decode(&payload).unwrap();
+        assert_eq!(frame.kind, MetadataKind::MapNode);
+        frame.identity[0] ^= 1;
+        let forged = frame.encode().unwrap();
+        assert_eq!(forged.len(), payload.len());
+        let length = u64::try_from(forged.len()).unwrap();
+        let header = frame_header(
+            METADATA_MAGIC,
+            length,
+            frame_checksum(METADATA_MAGIC, length, &forged),
+        );
+        source
+            .store
+            .metadata
+            .seek(SeekFrom::Start(location.offset()))
+            .unwrap();
+        source.store.metadata.write_all(&header).unwrap();
+        source.store.metadata.write_all(&forged).unwrap();
+        source.store.metadata.sync_data().unwrap();
+        assert!(matches!(
+            replay(&mut target.store, &mut source.store, from, to, expected),
+            Err(DurableError::InvalidRepresentationState(
+                "metadata identity does not match canonical value"
+            ))
+        ));
+        assert_eq!((target.store.active, ends(&target.store)), before);
         assert_eq!(ends(&source.store), to);
     }
 }

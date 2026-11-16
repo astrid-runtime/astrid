@@ -87,7 +87,11 @@ impl RepresentationStore {
             |_, payload, _source| {
                 ensure_not_cancelled(cancel)?;
                 let frame = MetadataFrame::decode(payload)?;
-                frame.verify(&Blake3PhysicalIdentity)?;
+                // Map nodes are decoded and authenticated together in accept,
+                // which also consumes that same owned node's entries.
+                if frame.kind != MetadataKind::MapNode {
+                    frame.verify(&Blake3PhysicalIdentity)?;
+                }
                 if frame.kind == MetadataKind::State {
                     let state = RepresentationState::decode(frame.value)?;
                     let transition = cas.next(tail.source_generation)?;
@@ -407,7 +411,11 @@ impl DirectPublication {
     ) -> Result<(), DurableError> {
         match frame.kind {
             MetadataKind::MapNode => {
-                let node = PhysicalMapNode::decode(frame.value)?;
+                let (node, id) =
+                    PhysicalMapNode::decode_and_identify(frame.value, &Blake3PhysicalIdentity)?;
+                if id.as_bytes() != &frame.identity {
+                    return Err(invalid("metadata identity does not match canonical value"));
+                }
                 match &node {
                     PhysicalMapNode::Leaf { domain, key, value } => {
                         self.accept_entry(store, *domain, *key, value)?;

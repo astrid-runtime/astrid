@@ -1,13 +1,17 @@
 //! Observing destination evidence must not introduce another update grammar.
 
+use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
-use super::super::{DurableFile, ObjectId, RecoveryLimits, RepresentationStore};
+use super::super::{
+    DurableFile, ObjectId, RecoveryLimits, RepresentationStore, append_authenticated_map_nodes,
+};
 use super::*;
+use crate::storage_model::physical::AuthenticatedPhysicalMap;
 use crate::volume::{AstridVolume, HostedFileVolume};
 
-fn empty_store(volume: &Arc<dyn AstridVolume>) -> RepresentationStore {
+pub(super) fn empty_store(volume: &Arc<dyn AstridVolume>) -> RepresentationStore {
     RepresentationStore::activate_volume(
         volume,
         RecoveryLimits::process_addressable(),
@@ -48,12 +52,87 @@ fn direct_publication_reuses_authenticated_node_identities() {
     });
     let (update, evidence) = result.unwrap().unwrap();
     assert!(!evidence.appended_map_nodes.is_empty());
+    assert!(evidence.appended_map_nodes.iter().all(|id| {
+        store.complete_map_subtrees.contains(id) && !store.persisted_map_nodes.contains(id)
+    }));
+    let mut extra_frames = Vec::new();
+    let mut appended = BTreeSet::new();
+    for map in [
+        &store.representations as &dyn AuthenticatedPhysicalMap,
+        &store.placement_entries,
+    ] {
+        assert_eq!(
+            append_authenticated_map_nodes(
+                &mut extra_frames,
+                map,
+                &mut store.persisted_map_nodes,
+                &mut appended,
+                &mut store.complete_map_subtrees,
+            )
+            .unwrap(),
+            0,
+            "a successful append must retain its closed-subtree proof"
+        );
+    }
+    assert!(extra_frames.is_empty());
     assert_eq!(
         encodings,
         identifies + evidence.appended_map_nodes.len(),
         "publication encodes each admitted node without minting its identity again"
     );
     store.publish_direct_update(update).unwrap();
+}
+
+#[test]
+fn failed_append_does_not_promote_unwritten_closures_and_retry_reopens() {
+    for successful_writes in [0, 3, 9, 10] {
+        let directory = tempfile::tempdir().unwrap();
+        let volume: Arc<dyn AstridVolume> =
+            HostedFileVolume::open(directory.path().join("retry.volume")).unwrap();
+        let mut store = empty_store(&volume);
+        let before_nodes = store
+            .representations
+            .nodes()
+            .keys()
+            .chain(store.placement_entries.nodes().keys())
+            .chain(store.profiles.nodes().keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let before_active = store.active;
+        let direct = store
+            .describe_direct(
+                ObjectId::new([42; 32]),
+                &[42; 16],
+                ArenaLocation {
+                    offset: 42,
+                    payload_len: 16,
+                    checksum: [42; 32],
+                },
+            )
+            .unwrap();
+        let failed = HostedFileVolume::with_append_failure_for_test(successful_writes, || {
+            store.append_direct_update_observed(std::slice::from_ref(&direct))
+        });
+        assert!(failed.is_err(), "fault after {successful_writes} writes");
+        assert_eq!(store.active, before_active);
+        assert!(store.complete_map_subtrees.is_subset(&before_nodes));
+        let (update, evidence) = store
+            .append_direct_update_observed(std::slice::from_ref(&direct))
+            .unwrap()
+            .unwrap();
+        assert!(!evidence.appended_map_nodes.is_empty());
+        assert!(evidence.appended_map_nodes.iter().all(|id| {
+            store.complete_map_subtrees.contains(id) && !store.persisted_map_nodes.contains(id)
+        }));
+        store.publish_direct_update(update).unwrap();
+        store.flush().unwrap();
+        drop(store);
+        let reopened =
+            RepresentationStore::open_volume(&volume, RecoveryLimits::process_addressable())
+                .unwrap()
+                .unwrap();
+        assert!(reopened.contains_direct(direct.object));
+    }
 }
 
 #[test]
