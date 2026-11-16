@@ -71,7 +71,7 @@ astrid-vfs = { workspace = true }
 tokio = { workspace = true, features = ["full", "signal"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-libproc = "0.14.11"
+libproc = "0.15.0"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
