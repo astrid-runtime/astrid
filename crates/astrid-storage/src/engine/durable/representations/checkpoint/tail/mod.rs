@@ -87,8 +87,8 @@ impl RepresentationStore {
             |_, payload, _source| {
                 ensure_not_cancelled(cancel)?;
                 let frame = MetadataFrame::decode(payload)?;
-                // Map nodes are decoded and authenticated together in accept,
-                // which also consumes that same owned node's entries.
+                // Map nodes are canonically decoded and authenticated in accept,
+                // which borrows entries from the same source bytes.
                 if frame.kind != MetadataKind::MapNode {
                     frame.verify(&Blake3PhysicalIdentity)?;
                 }
@@ -411,22 +411,21 @@ impl DirectPublication {
     ) -> Result<(), DurableError> {
         match frame.kind {
             MetadataKind::MapNode => {
-                let (node, id) =
-                    PhysicalMapNode::decode_and_identify(frame.value, &Blake3PhysicalIdentity)?;
-                if id.as_bytes() != &frame.identity {
-                    return Err(invalid("metadata identity does not match canonical value"));
-                }
-                match &node {
-                    PhysicalMapNode::Leaf { domain, key, value } => {
-                        self.accept_entry(store, *domain, *key, value)?;
-                    },
-                    PhysicalMapNode::Page { domain, entries } => {
-                        for (key, value) in entries {
-                            self.accept_entry(store, *domain, *key, value)?;
+                PhysicalMapNode::with_entries_and_identify(
+                    frame.value,
+                    &Blake3PhysicalIdentity,
+                    |id, domain, entries| {
+                        if id.as_bytes() != &frame.identity {
+                            return Err(invalid(
+                                "metadata identity does not match canonical value",
+                            ));
                         }
+                        for (key, value) in entries {
+                            self.accept_entry(store, domain, *key, value)?;
+                        }
+                        Ok(())
                     },
-                    PhysicalMapNode::Branch { .. } | PhysicalMapNode::Radix { .. } => {},
-                }
+                )??;
             },
             MetadataKind::Catalogue => {
                 if self

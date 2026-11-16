@@ -44,6 +44,22 @@ where
         self.fresh.insert(id, N::from(node));
         Ok(())
     }
+
+    fn put_encoded<R>(
+        &mut self,
+        id: PhysicalMapNodeId,
+        canonical_bytes: &[u8],
+        retain: R,
+    ) -> Result<(), PhysicalModelError>
+    where
+        R: FnOnce() -> Result<PhysicalMapNode, PhysicalModelError>,
+    {
+        if let Some(existing) = self.fresh.get(&id).or_else(|| self.existing.get(&id)) {
+            return super::validation::check_node_encoded(existing.borrow(), canonical_bytes);
+        }
+        self.fresh.insert(id, N::from(retain()?));
+        Ok(())
+    }
 }
 
 fn collect_active_entries<'a, N>(
@@ -195,3 +211,6 @@ where
         Ok(inserted)
     }
 }
+
+#[cfg(test)]
+mod tests;

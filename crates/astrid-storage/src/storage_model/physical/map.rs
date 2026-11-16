@@ -323,6 +323,39 @@ impl PhysicalMapNode {
     /// does not increment the canonical node-encoding counter.
     /// The caller authenticates the original bytes with the borrowed decoder.
     pub(crate) fn matches_encoded(&self, bytes: &[u8]) -> Result<(), PhysicalModelError> {
+        // Prefix and child lengths are implicit on the wire. Public enum fields
+        // can be malformed, so byte equality implies field equality only after
+        // the same local grammar checks used by construction and decoding.
+        match self {
+            Self::Leaf { .. } => {},
+            Self::Branch {
+                prefix_bits,
+                prefix,
+                zero,
+                one,
+                subtree_entries,
+                ..
+            } => {
+                legacy::validate_branch(*prefix_bits, prefix, *zero, *one, *subtree_entries)?;
+            },
+            Self::Page { entries, .. } => validate_page(entries)?,
+            Self::Radix {
+                prefix_nibbles,
+                prefix,
+                child_bitmap,
+                children,
+                subtree_entries,
+                ..
+            } => {
+                validate_radix(
+                    *prefix_nibbles,
+                    prefix,
+                    *child_bitmap,
+                    children,
+                    *subtree_entries,
+                )?;
+            },
+        }
         let mut encoder = Encoder::comparing(bytes);
         self.encode_into(&mut encoder)?;
         encoder.finish_comparison()
@@ -478,6 +511,28 @@ impl PhysicalMapNode {
         decode::with_decoded(bytes, |node| {
             let id = PhysicalMapNodeId::new(identity.identify(node.identity_context(), bytes));
             node.with_child_ids(|children| consume(id, children))
+        })
+    }
+
+    /// Authenticate canonical metadata and borrow its entries without owning a node.
+    /// The same decoder checks every field and the complete body hash precedes
+    /// consumption, including for branch nodes with no leaf entries.
+    #[cfg(any(test, not(target_family = "wasm")))]
+    pub(crate) fn with_entries_and_identify<I: PhysicalIdentity, T>(
+        bytes: &[u8],
+        identity: &I,
+        consume: impl FnOnce(PhysicalMapNodeId, PhysicalMapDomain, &[(PhysicalMapKey, &[u8])]) -> T,
+    ) -> Result<T, PhysicalModelError> {
+        decode::with_decoded(bytes, |node| {
+            let id = PhysicalMapNodeId::new(identity.identify(node.identity_context(), bytes));
+            match node {
+                decode::MapNodeView::Leaf { domain, key, value } => {
+                    consume(id, domain, &[(key, value)])
+                },
+                decode::MapNodeView::Page { domain, entries } => consume(id, domain, entries),
+                decode::MapNodeView::Branch { domain, .. }
+                | decode::MapNodeView::Radix { domain, .. } => consume(id, domain, &[]),
+            }
         })
     }
 

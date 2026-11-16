@@ -166,7 +166,11 @@ fn direct_tail_replays_in_new_epoch_and_ignores_later_appends() {
             replay(&mut target.store, &mut source.store, from, to, expected)
         });
         result.unwrap();
-        assert_eq!(owned_decodes, usize::try_from(source_map_frames).unwrap());
+        assert!(source_map_frames > 0);
+        assert_eq!(
+            owned_decodes, 0,
+            "tail replay must consume borrowed entries without materializing nodes"
+        );
         assert_eq!(target.store.active, expected);
         assert_ne!(target.store.active, source.store.active);
         assert_eq!(target.store.reverse.len(), 131);

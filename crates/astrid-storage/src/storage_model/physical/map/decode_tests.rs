@@ -18,6 +18,39 @@ fn assert_borrowed(bytes: &[u8], borrowed: &[u8]) {
     assert!(pointer.strict_add(borrowed.len()) <= start.strict_add(bytes.len()));
 }
 
+fn assert_identified_entries(
+    bytes: &[u8],
+    identity: &Identity,
+    expected: PhysicalMapNodeId,
+    domain: PhysicalMapDomain,
+    owned: &PhysicalMapNode,
+) {
+    let calls = identity.0.get();
+    let (result, owned_decodes) = PhysicalMapNode::count_owned_decodes_during(|| {
+        PhysicalMapNode::with_entries_and_identify(bytes, identity, |id, actual_domain, entries| {
+            assert_eq!(identity.0.get(), calls.strict_add(1));
+            assert_eq!(id, expected);
+            assert_eq!(actual_domain, domain);
+            let expected_entries: Vec<_> = match owned {
+                PhysicalMapNode::Leaf { key, value, .. } => {
+                    vec![(*key, value.as_slice())]
+                },
+                PhysicalMapNode::Page { entries, .. } => entries
+                    .iter()
+                    .map(|(key, value)| (*key, value.as_slice()))
+                    .collect(),
+                PhysicalMapNode::Branch { .. } | PhysicalMapNode::Radix { .. } => Vec::new(),
+            };
+            assert_eq!(entries, expected_entries);
+            for (_, value) in entries {
+                assert_borrowed(bytes, value);
+            }
+        })
+    });
+    result.unwrap();
+    assert_eq!(owned_decodes, 0);
+}
+
 #[test]
 fn borrowed_map_decode_keeps_values_and_prefixes_in_the_original_payload() {
     let identity = Identity(Cell::new(0));
@@ -77,6 +110,7 @@ fn borrowed_map_decode_keeps_values_and_prefixes_in_the_original_payload() {
                 assert_eq!(identity.0.get(), calls.strict_add(1));
                 assert_eq!(&computed, expected);
                 assert_eq!(&*children, expected_children);
+                assert_identified_entries(&bytes, &identity, *expected, domain, owned);
                 assert_eq!(PhysicalMapNode::decode(&bytes).unwrap(), *owned);
                 assert_eq!(
                     super::super::codec::encoder_finishes(),
@@ -99,6 +133,15 @@ fn assert_rejected(bytes: &[u8]) {
     let borrowed = decode::with_decoded(bytes, |_| ()).unwrap_err();
     assert_eq!(format!("{owned:?}"), format!("{borrowed:?}"));
     assert!(PhysicalMapNode::with_child_ids_and_identify(bytes, &identity, |_, _| ()).is_err());
+    let called = Cell::new(false);
+    let entries_error =
+        PhysicalMapNode::with_entries_and_identify(bytes, &identity, |_, _, _| called.set(true))
+            .unwrap_err();
+    assert_eq!(format!("{owned:?}"), format!("{entries_error:?}"));
+    assert!(
+        !called.get(),
+        "malformed input must not reach the entry consumer"
+    );
     assert_eq!(
         identity.0.get(),
         0,
@@ -273,4 +316,45 @@ fn canonical_node_wire_vectors_cover_owned_and_borrowed_encoders() {
         assert_eq!(actual, expected);
         assert_eq!(PhysicalMapNode::decode(&expected).unwrap(), node);
     }
+}
+
+#[test]
+fn encoded_comparison_rejects_unequal_fields_with_identical_encoding() {
+    let mut first = [1; 32];
+    first[30..].copy_from_slice(&3_u16.to_le_bytes());
+    let children = vec![
+        PhysicalMapNodeId::new(first),
+        PhysicalMapNodeId::new([2; 32]),
+        PhysicalMapNodeId::new([3; 32]),
+    ];
+    let valid = PhysicalMapNode::radix(
+        PhysicalMapDomain::Representation,
+        0,
+        vec![],
+        7,
+        children.clone(),
+        3,
+    )
+    .unwrap();
+    let bytes = valid.encode().unwrap();
+    // A public enum can contain an invalid prefix length. Moving the bitmap
+    // and most of its first child into that prefix preserves encoded bytes,
+    // although the complete node fields differ from the canonical node.
+    let mut child_encoding = super::super::codec::Encoder::new();
+    super::super::identity::encode_map_node_id(&mut child_encoding, children[0]);
+    let child_encoding = child_encoding.finish();
+    let mut prefix = 7_u16.to_le_bytes().to_vec();
+    prefix.extend_from_slice(&child_encoding[..child_encoding.len() - 2]);
+    let malformed = PhysicalMapNode::Radix {
+        domain: PhysicalMapDomain::Representation,
+        prefix_nibbles: 0,
+        prefix,
+        child_bitmap: 3,
+        children: children[1..].to_vec(),
+        subtree_entries: 3,
+    };
+    assert_ne!(malformed, valid);
+    assert_eq!(malformed.encode().unwrap(), bytes);
+    assert_eq!(PhysicalMapNode::decode(&bytes).unwrap(), valid);
+    assert!(malformed.matches_encoded(&bytes).is_err());
 }

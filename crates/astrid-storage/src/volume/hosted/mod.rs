@@ -574,8 +574,7 @@ impl AstridVolume for HostedFileVolume {
             ));
         }
         let mut state = self.state.lock();
-        let mut next_regions = state.regions.clone();
-        apply_metadata_mutations(&mut next_regions, mutations)?;
+        preflight_metadata_mutations(&state.regions, mutations)?;
         let payload = encode_metadata_mutations(mutations)?;
         let transaction = VolumeRegion::new(METADATA_TRANSACTION_REGION)?;
         Self::append(
@@ -585,8 +584,9 @@ impl AstridVolume for HostedFileVolume {
             0,
             &payload,
         )?;
-        state.regions = next_regions;
-        Ok(())
+        // The same lock and transition function preserve the validated name
+        // occupancy across append. Payload ownership moves only after success.
+        apply_metadata_mutations(&mut state.regions, mutations)
     }
 
     fn list_regions(&self, prefix: &str) -> io::Result<Vec<VolumeRegion>> {
@@ -650,8 +650,39 @@ impl Operation {
     }
 }
 
-fn apply_metadata_mutations(
-    regions: &mut BTreeMap<VolumeRegion, RegionState>,
+fn preflight_metadata_mutations<T>(
+    regions: &BTreeMap<VolumeRegion, T>,
+    mutations: &[VolumeMetadataMutation],
+) -> io::Result<()> {
+    // Every transition observes only its two named keys. This closed projection
+    // includes intermediate names while leaving unrelated extents unborrowed.
+    #[expect(
+        clippy::zero_sized_map_values,
+        reason = "The occupancy projection must reuse the exact commit/recovery transition function without copying region data"
+    )]
+    let mut touched = BTreeMap::new();
+    for mutation in mutations {
+        let (source, destination) = match mutation {
+            VolumeMetadataMutation::Rename {
+                source,
+                destination,
+            }
+            | VolumeMetadataMutation::Replace {
+                source,
+                destination,
+            } => (source, destination),
+        };
+        for name in [source, destination] {
+            if regions.contains_key(name) {
+                touched.insert(name.clone(), ());
+            }
+        }
+    }
+    apply_metadata_mutations(&mut touched, mutations)
+}
+
+fn apply_metadata_mutations<T>(
+    regions: &mut BTreeMap<VolumeRegion, T>,
     mutations: &[VolumeMetadataMutation],
 ) -> io::Result<()> {
     for mutation in mutations {
@@ -934,3 +965,6 @@ mod open_tests;
 
 #[cfg(test)]
 mod maintenance_tests;
+
+#[cfg(test)]
+mod metadata_tests;

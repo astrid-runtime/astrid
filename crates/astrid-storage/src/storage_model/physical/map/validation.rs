@@ -62,6 +62,26 @@ where
             ),
         }
     }
+
+    fn put_encoded<R>(
+        &mut self,
+        id: PhysicalMapNodeId,
+        canonical_bytes: &[u8],
+        retain: R,
+    ) -> Result<(), PhysicalModelError>
+    where
+        R: FnOnce() -> Result<PhysicalMapNode, PhysicalModelError>,
+    {
+        match self.entry(id) {
+            alloc::collections::btree_map::Entry::Occupied(entry) => {
+                check_node_encoded(entry.get().borrow(), canonical_bytes)
+            },
+            alloc::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(N::from(retain()?));
+                Ok(())
+            },
+        }
+    }
 }
 
 /// A complete canonical proof borrowing its immutable leaf values. Construction
@@ -287,6 +307,19 @@ where
     }
 }
 
+pub(super) fn check_node_encoded(
+    existing: &PhysicalMapNode,
+    canonical_bytes: &[u8],
+) -> Result<(), PhysicalModelError> {
+    match existing.matches_encoded(canonical_bytes) {
+        Ok(()) => Ok(()),
+        Err(PhysicalModelError::NonCanonicalEncoding) => Err(PhysicalModelError::InvalidMap(
+            "physical map-node identity collision",
+        )),
+        Err(error) => Err(error),
+    }
+}
+
 fn check_live_encoded<N>(
     nodes: &BTreeMap<PhysicalMapNodeId, N>,
     id: PhysicalMapNodeId,
@@ -296,13 +329,7 @@ where
     N: core::borrow::Borrow<PhysicalMapNode>,
 {
     match nodes.get(&id) {
-        Some(existing) => match existing.borrow().matches_encoded(canonical_bytes) {
-            Ok(()) => Ok(()),
-            Err(PhysicalModelError::NonCanonicalEncoding) => Err(PhysicalModelError::InvalidMap(
-                "physical map-node identity collision",
-            )),
-            Err(error) => Err(error),
-        },
+        Some(existing) => check_node_encoded(existing.borrow(), canonical_bytes),
         None => Err(PhysicalModelError::InvalidMap("missing canonical map node")),
     }
 }
