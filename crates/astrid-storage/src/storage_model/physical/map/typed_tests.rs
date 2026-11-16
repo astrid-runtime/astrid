@@ -1,4 +1,3 @@
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -6,18 +5,9 @@ use alloc::vec::Vec;
 use super::super::Blake3PhysicalIdentity;
 use super::super::PhysicalModelError;
 use super::{
-    CanonicalPhysicalMap, MapConstruction, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode,
-    PhysicalMapNodeId, ProfileMap, RepresentationMap,
+    MapConstruction, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode, ProfileMap,
+    RepresentationMap,
 };
-
-fn owned_nodes(
-    nodes: &BTreeMap<PhysicalMapNodeId, Arc<PhysicalMapNode>>,
-) -> BTreeMap<PhysicalMapNodeId, PhysicalMapNode> {
-    nodes
-        .iter()
-        .map(|(id, node)| (*id, PhysicalMapNode::clone(node.as_ref())))
-        .collect()
-}
 
 fn key_material(tag: u8, ordinal: u32) -> PhysicalMapKey {
     let mut material = [tag; 32];
@@ -37,25 +27,15 @@ fn sample_entries(tag: u8, count: u32) -> Vec<(PhysicalMapKey, Vec<u8>)> {
 #[test]
 fn recover_exact_rejects_wrong_domain_and_unauthenticated_extras() {
     let entries = sample_entries(0xA1, 3);
-    let foreign = CanonicalPhysicalMap::build_dense(
-        &Blake3PhysicalIdentity,
-        PhysicalMapDomain::Representation,
-        entries.clone(),
-    )
-    .unwrap();
+    let foreign = RepresentationMap::build_dense(entries.clone()).unwrap();
     assert!(matches!(
         ProfileMap::recover_exact(foreign.root(), foreign.nodes().clone()),
         Err(PhysicalModelError::InvalidMap(_))
     ));
 
     let profile = ProfileMap::build_dense(entries).unwrap();
-    let orphan = CanonicalPhysicalMap::build_dense(
-        &Blake3PhysicalIdentity,
-        PhysicalMapDomain::Profile,
-        vec![(PhysicalMapKey::new([0xEE; 32]), vec![7])],
-    )
-    .unwrap();
-    let mut with_extra = owned_nodes(profile.nodes());
+    let orphan = ProfileMap::build_dense(vec![(PhysicalMapKey::new([0xEE; 32]), vec![7])]).unwrap();
+    let mut with_extra = profile.nodes().clone();
     with_extra.extend(orphan.nodes().iter().map(|(id, node)| (*id, node.clone())));
     assert!(matches!(
         ProfileMap::recover_exact(profile.root(), with_extra),
@@ -153,11 +133,9 @@ fn legacy_and_dense_mutations_match_independent_proof_across_shapes() {
                     assert_eq!(rebuilt.rebuild_with_entries(entries.clone()).unwrap(), 0);
                     rebuilt.reclaim_unreachable_nodes().unwrap();
                     assert_independent_root_proof(&rebuilt);
-                    let recovered = RepresentationMap::recover_exact(
-                        rebuilt.root(),
-                        owned_nodes(rebuilt.nodes()),
-                    )
-                    .unwrap();
+                    let recovered =
+                        RepresentationMap::recover_exact(rebuilt.root(), rebuilt.nodes().clone())
+                            .unwrap();
                     assert_eq!(recovered.root(), expected.root());
                     assert_eq!(recovered.entry_count(), u64::from(count));
                 }

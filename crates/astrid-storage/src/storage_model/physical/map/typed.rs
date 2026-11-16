@@ -31,9 +31,10 @@ pub(crate) trait AuthenticatedPhysicalMap: sealed::Sealed {
 fn recover_exact_inner(
     domain: PhysicalMapDomain,
     root: Option<PhysicalMapNodeId>,
-    nodes: BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    nodes: BTreeMap<PhysicalMapNodeId, Arc<PhysicalMapNode>>,
 ) -> Result<SharedPhysicalMap, PhysicalModelError> {
-    // Prove the exact owned-node closure with the existing entrypoint, then wrap once.
+    // Shared ownership is not authentication: prove the full exact closure before
+    // admitting this collected index as a typed map.
     let proof = validation::prove_root(&Blake3PhysicalIdentity, domain, root, &nodes)?;
     if proof.visited().len() != nodes.len() {
         return Err(PhysicalModelError::InvalidMap(
@@ -44,13 +45,9 @@ fn recover_exact_inner(
         u64::try_from(proof.entries().len()).map_err(|_| PhysicalModelError::LengthOverflow)?;
     let construction = root
         .and_then(|root| nodes.get(&root))
-        .map_or(MapConstruction::DenseRadix, PhysicalMapNode::construction);
-    // Drop borrowed proof before consuming `nodes` into Arc bodies.
+        .map_or(MapConstruction::DenseRadix, |node| node.construction());
+    // The proof borrows the collected index; retain its allocation after validation.
     drop(proof);
-    let nodes = nodes
-        .into_iter()
-        .map(|(id, node)| (id, Arc::new(node)))
-        .collect();
     Ok(CanonicalPhysicalMap {
         domain,
         construction,
@@ -80,7 +77,7 @@ macro_rules! typed_map_views {
             /// canonical proof; `visited.len()` then checks the arena bound.
             pub(crate) fn recover_exact(
                 root: Option<PhysicalMapNodeId>,
-                nodes: BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+                nodes: BTreeMap<PhysicalMapNodeId, Arc<PhysicalMapNode>>,
             ) -> Result<Self, PhysicalModelError> {
                 Ok(Self {
                     inner: recover_exact_inner(Self::DOMAIN, root, nodes)?,

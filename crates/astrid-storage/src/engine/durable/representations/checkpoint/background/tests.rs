@@ -351,3 +351,39 @@ fn drained_publication_barrier_failure_installs_new_custody_and_retains_old_medi
     assert_eq!(recovered.active, expected);
     assert!(recovered.contains_direct(ObjectId::new([49; 32])));
 }
+
+#[test]
+fn ordinary_direct_reverse_entries_do_not_reserve_unused_ids() {
+    let (_directory, volume, mut store, limits) = primed_volume();
+    let object = ObjectId::new([99; 32]);
+    let direct = store
+        .describe_direct(
+            object,
+            &[99; 8],
+            ArenaLocation {
+                offset: 99,
+                payload_len: 8,
+                checksum: [99; 32],
+            },
+        )
+        .unwrap();
+    let update = store.append_direct_update(&[direct]).unwrap().unwrap();
+    assert!(
+        update.replacement_reverse.is_none(),
+        "fixture must exercise ordinary incremental publication"
+    );
+    store.publish_direct_update(update).unwrap();
+    let ids = store.reverse.get(&object).unwrap();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(ids.capacity(), 1, "one ID must not reserve four ID slots");
+    let reopened = RepresentationStore::open_volume(&volume, limits)
+        .unwrap()
+        .unwrap();
+    let ids = reopened.reverse.get(&object).unwrap();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(
+        ids.capacity(),
+        1,
+        "cold recovery must keep singleton IDs compact"
+    );
+}

@@ -104,6 +104,11 @@ pub(super) fn append_legacy_profile_frame(
         .map_err(|source| io_error("flush legacy profile frame", source))
 }
 
+// Ordinary direct objects have one canonical representation. Keep that ID
+// inline; legacy multi-record candidates remain growable and preserve order.
+type ReverseIds = smallvec::SmallVec<[RepresentationRecordId; 1]>;
+type ReverseIndex = BTreeMap<ObjectId, ReverseIds>;
+
 #[derive(Debug)]
 pub(super) struct RepresentationStore {
     metadata: DurableFile,
@@ -125,7 +130,7 @@ pub(super) struct RepresentationStore {
     // Complete durable closures, authenticated on recovery or checked by append.
     complete_map_subtrees: BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     direct_profile: RepresentationProfileId,
-    reverse: BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
+    reverse: ReverseIndex,
 }
 
 pub(super) struct PendingRepresentationUpdate {
@@ -134,7 +139,7 @@ pub(super) struct PendingRepresentationUpdate {
     catalogue: RepresentationCatalogueRoot,
     placements: PlacementSet,
     reverse_additions: Vec<(ObjectId, RepresentationRecordId)>,
-    replacement_reverse: Option<BTreeMap<ObjectId, Vec<RepresentationRecordId>>>,
+    replacement_reverse: Option<ReverseIndex>,
 }
 
 impl RepresentationStore {

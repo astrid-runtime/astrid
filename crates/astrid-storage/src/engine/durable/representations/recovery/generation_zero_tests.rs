@@ -92,7 +92,33 @@ fn location(offset: u64) -> super::super::ArenaLocation {
 fn canonical_first_record_wins_over_later_different_placements() {
     let fixture = fixture(&[(0, 10)], &[(0, 100)]);
     let evidence = validate::<true>(&fixture);
-    assert_eq!(evidence.reverse[&OBJECT].len(), 2);
+    let ids = &evidence.reverse[&OBJECT];
+    assert_eq!(ids.len(), 2);
+    assert!(
+        ids.spilled(),
+        "multiple candidates must grow beyond inline storage"
+    );
+    let expected_keys = active_entries(&fixture.1)
+        .unwrap()
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids.iter()
+            .copied()
+            .map(PhysicalMapKey::from)
+            .collect::<Vec<_>>(),
+        expected_keys,
+        "recovered candidate order must remain canonical"
+    );
+    let before = ids.to_vec();
+    let mut snapshot = evidence.reverse.clone();
+    let later = RepresentationRecordId::new([33; 32]);
+    assert!(!ids.contains(&later));
+    snapshot.get_mut(&OBJECT).unwrap().push(later);
+    assert_eq!(evidence.reverse[&OBJECT].as_slice(), before);
+    assert_eq!(&snapshot[&OBJECT][..before.len()], before);
+    assert_eq!(snapshot[&OBJECT].last(), Some(&later));
     let index = evidence.generation_zero.into_index().unwrap();
     assert_eq!(
         index.protected_len(),

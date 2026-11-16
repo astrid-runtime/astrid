@@ -11,20 +11,19 @@ use super::super::{DurableError, ObjectId, RepresentationRecordId};
 /// map/list equality as collecting the validated stream and comparing it.
 /// Record mismatches without returning early: the caller must finish semantic
 /// validation and check cancellation before consulting `matches`.
-pub(super) struct ReverseComparison<'a> {
-    expected: &'a BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
+pub(super) struct ReverseComparison<'a, V> {
+    expected: &'a BTreeMap<ObjectId, V>,
     remaining: usize,
     previous: Option<RepresentationRecordId>,
     agrees: bool,
 }
 
-impl<'a> ReverseComparison<'a> {
-    pub(super) fn new(
-        expected: &'a BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
-    ) -> Result<Self, DurableError> {
+impl<'a, V: AsRef<[RepresentationRecordId]>> ReverseComparison<'a, V> {
+    pub(super) fn new(expected: &'a BTreeMap<ObjectId, V>) -> Result<Self, DurableError> {
         let mut remaining = 0_usize;
         let mut agrees = true;
         for records in expected.values() {
+            let records = records.as_ref();
             remaining = remaining
                 .checked_add(records.len())
                 .ok_or(DurableError::EncodingOverflow)?;
@@ -44,7 +43,7 @@ impl<'a> ReverseComparison<'a> {
         self.agrees &= self
             .expected
             .get(&object)
-            .is_some_and(|records| records.binary_search(&record).is_ok());
+            .is_some_and(|records| records.as_ref().binary_search(&record).is_ok());
         if let Some(remaining) = self.remaining.checked_sub(1) {
             self.remaining = remaining;
         } else {

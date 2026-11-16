@@ -102,11 +102,11 @@ fn streamed_reverse_comparison_matches_owned_semantic_validation() {
         vec![foreign_id, id],
     ] {
         let mut candidate = owned.reverse.clone();
-        candidate.insert(object, replacement);
+        candidate.insert(object, smallvec::SmallVec::from_vec(replacement));
         cases.push(candidate);
     }
     let mut extra_empty = owned.reverse.clone();
-    extra_empty.insert(foreign_object, Vec::new());
+    extra_empty.insert(foreign_object, smallvec::SmallVec::new());
     cases.push(extra_empty);
     let mut wrong_object = owned.reverse.clone();
     let moved = wrong_object.remove(&object).unwrap();

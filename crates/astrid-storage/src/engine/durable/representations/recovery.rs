@@ -27,8 +27,8 @@ use super::format::{
     map_node_id,
 };
 use super::{
-    DurableError, FIRST_JOURNAL_GENERATION, RecoveryLimits, digest_journal_prefix, increment,
-    io_error, journal_byte_len,
+    DurableError, FIRST_JOURNAL_GENERATION, RecoveryLimits, ReverseIndex, digest_journal_prefix,
+    increment, io_error, journal_byte_len,
 };
 use crate::storage_model::physical::IdentifiedProfile;
 
@@ -397,7 +397,7 @@ pub(super) fn validate_profile_entries<'a>(
 }
 
 pub(super) struct ValidatedRepresentations {
-    pub(super) reverse: BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
+    pub(super) reverse: ReverseIndex,
     pub(super) extent_count: u64,
     pub(super) generation_zero: super::index_validation::GenerationZeroPlacements,
 }
@@ -436,7 +436,7 @@ pub(super) fn validate_representation_entries<'a, const COLLECT_PLACEMENTS: bool
 where
     R: IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
 {
-    let mut reverse = BTreeMap::<ObjectId, Vec<RepresentationRecordId>>::new();
+    let mut reverse = ReverseIndex::new();
     let facts = validate_representation_entries_with::<COLLECT_PLACEMENTS, _>(
         profiles,
         representations,
@@ -465,7 +465,7 @@ pub(super) fn compare_representation_entries<'a, R>(
     representations: impl FnOnce() -> Result<R, DurableError>,
     placements: impl IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
     direct_profile: RepresentationProfileId,
-    expected_reverse: &BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
+    expected_reverse: &ReverseIndex,
 ) -> Result<ComparedRepresentations, DurableError>
 where
     R: IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
@@ -608,9 +608,9 @@ fn validate_record_profile(
 /// Duplicate directs for one object miss the fast path safely. Otherwise stream
 /// one authoritative visit over active leaves—no `Vec` materialization and no
 /// second walker. Decode errors fail closed.
-pub(super) fn ensure_no_excluded_object_coverage(
+pub(super) fn ensure_no_excluded_object_coverage<V: AsRef<[RepresentationRecordId]>>(
     representations: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
-    reverse: &BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
+    reverse: &BTreeMap<ObjectId, V>,
     excluded: &BTreeSet<ObjectId>,
 ) -> Result<(), DurableError> {
     ensure_no_excluded_object_coverage_scanned(representations, reverse, excluded).map(|_| ())
@@ -619,9 +619,9 @@ pub(super) fn ensure_no_excluded_object_coverage(
 /// Same guard as [`ensure_no_excluded_object_coverage`], returning how many map
 /// leaves the fallback visitor decoded (`0` when excluded is empty or the
 /// all-direct fast proof skips the walk).
-pub(super) fn ensure_no_excluded_object_coverage_scanned(
+pub(super) fn ensure_no_excluded_object_coverage_scanned<V: AsRef<[RepresentationRecordId]>>(
     representations: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
-    reverse: &BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
+    reverse: &BTreeMap<ObjectId, V>,
     excluded: &BTreeSet<ObjectId>,
 ) -> Result<u64, DurableError> {
     if excluded.is_empty() {
@@ -630,7 +630,7 @@ pub(super) fn ensure_no_excluded_object_coverage_scanned(
     if excluded.iter().any(|object| {
         reverse
             .get(object)
-            .is_some_and(|records| !records.is_empty())
+            .is_some_and(|records| !records.as_ref().is_empty())
     }) {
         return Err(DurableError::InvalidRepresentationState(
             "bootstrap object has a relocatable representation",

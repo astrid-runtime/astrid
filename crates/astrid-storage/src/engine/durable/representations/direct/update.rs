@@ -204,7 +204,12 @@ impl RepresentationStore {
         );
         let replacement_reverse = entries
             .into_iter()
-            .map(|entry| (entry.object, vec![entry.representation_id]))
+            .map(|entry| {
+                (
+                    entry.object,
+                    smallvec::SmallVec::from_buf([entry.representation_id]),
+                )
+            })
             .collect();
 
         let mut metadata = Vec::new();

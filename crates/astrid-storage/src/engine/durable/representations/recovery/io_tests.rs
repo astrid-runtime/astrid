@@ -151,18 +151,30 @@ fn assert_active_map_reads(hosted: bool, historical: bool) {
     file.positioned_reads.set(0);
     file.positioned_bytes.set(0);
     file.requested_bytes.set(0);
-    let recovered = RepresentationMap::recover_exact(
-        original.root(),
-        index
-            .recover_active_nodes(
-                PhysicalMapDomain::Representation,
-                original.root(),
-                &file,
-                limits,
-            )
-            .unwrap(),
-    )
-    .unwrap();
+    let nodes = index
+        .recover_active_nodes(
+            PhysicalMapDomain::Representation,
+            original.root(),
+            &file,
+            limits,
+        )
+        .unwrap();
+    let root = original.root().unwrap();
+    let root_slot = core::ptr::from_ref(nodes.get(&root).unwrap()).cast::<()>();
+    let root_body = core::ptr::from_ref(std::borrow::Borrow::<PhysicalMapNode>::borrow(
+        nodes.get(&root).unwrap(),
+    ));
+    let recovered = RepresentationMap::recover_exact(original.root(), nodes).unwrap();
+    assert_eq!(
+        core::ptr::from_ref(recovered.nodes().get(&root).unwrap()).cast::<()>(),
+        root_slot,
+        "authentication must retain the collected node index allocation"
+    );
+    assert_eq!(
+        core::ptr::from_ref(recovered.nodes()[&root].as_ref()),
+        root_body,
+        "authentication must retain the collected node body allocation"
+    );
     assert_eq!(recovered.root(), original.root());
     assert_eq!(recovered.nodes().len(), node_count);
     for (key, value) in entries {

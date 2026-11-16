@@ -1,5 +1,7 @@
 //! Historical recovery needs authenticated links, not every decoded value body.
 
+use std::sync::Arc;
+
 use super::{
     BTreeMap, Blake3PhysicalIdentity, DurableError, DurableIo, METADATA_FILE, METADATA_MAGIC,
     MetadataFrame, MetadataKind, RecoveryLimits, map_node_id,
@@ -114,7 +116,7 @@ impl MetadataIndex {
         root: Option<PhysicalMapNodeId>,
         source: &F,
         limits: RecoveryLimits,
-    ) -> Result<BTreeMap<PhysicalMapNodeId, PhysicalMapNode>, DurableError> {
+    ) -> Result<BTreeMap<PhysicalMapNodeId, Arc<PhysicalMapNode>>, DurableError> {
         #[cfg(test)]
         {
             RECOVER_ACTIVE_NODES_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
@@ -160,7 +162,7 @@ impl MetadataIndex {
                 ));
             }
             pending.extend(children.iter().copied());
-            nodes.insert(id, node);
+            nodes.insert(id, Arc::new(node));
         }
         if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {
             tracing::Span::current().record("active_nodes", nodes.len());

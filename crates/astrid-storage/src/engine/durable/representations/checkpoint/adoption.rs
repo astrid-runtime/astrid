@@ -8,11 +8,15 @@
 use super::super::CheckpointCancellation;
 use crate::storage_model::physical::CanonicalRootProof;
 use crate::storage_model::physical::{PlacementMap, ProfileMap, RepresentationMap};
+#[cfg(test)]
+use crate::storage_model::{ObjectId, RepresentationRecordId};
 use crate::storage_model::{
-    ObjectId, PhysicalMapKey, PhysicalMapNodeId, PlacementSet, RepresentationCatalogueRoot,
-    RepresentationProfileId, RepresentationRecordId, RepresentationState, RepresentationStateId,
+    PhysicalMapKey, PhysicalMapNodeId, PlacementSet, RepresentationCatalogueRoot,
+    RepresentationProfileId, RepresentationState, RepresentationStateId,
 };
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use super::super::super::scan_frames;
 use super::super::activation::visit_new_reachable_map_nodes;
@@ -23,7 +27,8 @@ use super::super::residency::MapResidency;
 use super::super::{
     Blake3PhysicalIdentity, CurrentPointer, DurableError, DurableFile, FramedAppendStream,
     JOURNAL_MAGIC, JournalEntry, METADATA_MAGIC, MetadataFrame, MetadataKind, RecoveryLimits,
-    RepresentationStore, append_frame, digest_journal_file, format, increment, io_error,
+    RepresentationStore, ReverseIndex, append_frame, digest_journal_file, format, increment,
+    io_error,
 };
 
 /// Emitted tip generation before media/journal correspondence proofs.
@@ -51,7 +56,7 @@ struct LiveTipRefs<'a> {
     profiles: &'a ProfileMap,
     representations: &'a RepresentationMap,
     placement_entries: &'a PlacementMap,
-    reverse: &'a BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
+    reverse: &'a ReverseIndex,
     catalogue: RepresentationCatalogueRoot,
     placements: PlacementSet,
     state: RepresentationState,

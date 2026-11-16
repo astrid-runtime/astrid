@@ -610,7 +610,15 @@ fn coherent_wrong_slot_domain_is_rejected_before_current_publication() {
     )
     .unwrap();
     assert!(
-        ProfileMap::recover_exact(wrong.root(), wrong.nodes().clone()).is_err(),
+        ProfileMap::recover_exact(
+            wrong.root(),
+            wrong
+                .nodes()
+                .iter()
+                .map(|(id, node)| (*id, std::sync::Arc::new(node.clone())))
+                .collect(),
+        )
+        .is_err(),
         "typed recover must fail-fast on wrong-domain media"
     );
     // Preserve end-to-end rejection: corrupt an active profile node domain after
@@ -717,13 +725,13 @@ fn coherent_extra_orphan_in_emitter_memo_cannot_authorize_sealed_media() {
     )
     .unwrap();
     let id = orphan.root().unwrap();
-    let mut with_orphan: std::collections::BTreeMap<_, _> = store
-        .profiles
-        .nodes()
-        .iter()
-        .map(|(id, node)| (*id, node.as_ref().clone()))
-        .collect();
-    with_orphan.extend(orphan.nodes().iter().map(|(id, node)| (*id, node.clone())));
+    let mut with_orphan = store.profiles.nodes().clone();
+    with_orphan.extend(
+        orphan
+            .nodes()
+            .iter()
+            .map(|(id, node)| (*id, std::sync::Arc::new(node.clone()))),
+    );
     assert!(
         ProfileMap::recover_exact(store.profiles.root(), with_orphan).is_err(),
         "typed recover must reject unauthenticated historical extras"
@@ -886,13 +894,12 @@ fn sealed_node_body_is_compared_against_every_matching_live_arena() {
         PhysicalMapNode::Page { entries, .. } => entries[0].1[0] ^= 1,
         _ => unreachable!(),
     }
-    let mut with_forged: std::collections::BTreeMap<_, _> = store
-        .profiles
-        .nodes()
-        .iter()
-        .map(|(id, node)| (*id, node.as_ref().clone()))
-        .collect();
-    assert!(with_forged.insert(id, forged.clone()).is_none());
+    let mut with_forged = store.profiles.nodes().clone();
+    assert!(
+        with_forged
+            .insert(id, std::sync::Arc::new(forged.clone()))
+            .is_none()
+    );
     assert!(
         ProfileMap::recover_exact(store.profiles.root(), with_forged).is_err(),
         "typed recover must reject extras rather than minting a certificate"
