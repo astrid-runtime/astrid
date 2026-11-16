@@ -5,7 +5,7 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::handler::{AgentHandler, CommandHandler, HttpHandler, WasmHandler};
+use crate::handler::{CommandHandler, HttpHandler, WasmHandler};
 use crate::hook::{FailAction, Hook, HookHandler, HookMatcher};
 use crate::result::{HookContext, HookExecution, HookExecutionResult, HookResult};
 
@@ -16,7 +16,6 @@ pub(crate) struct HookExecutor {
     command_handler: CommandHandler,
     http_handler: HttpHandler,
     wasm_handler: WasmHandler,
-    agent_handler: AgentHandler,
 }
 
 impl Default for HookExecutor {
@@ -34,7 +33,6 @@ impl HookExecutor {
             command_handler: CommandHandler::new(),
             http_handler: HttpHandler::new(),
             wasm_handler: WasmHandler::new(workspace_root),
-            agent_handler: AgentHandler::new(),
         }
     }
 
@@ -45,7 +43,6 @@ impl HookExecutor {
             command_handler: CommandHandler::new(),
             http_handler: HttpHandler::new(),
             wasm_handler: WasmHandler::new(workspace_root),
-            agent_handler: AgentHandler::new(),
         }
     }
 
@@ -105,11 +102,6 @@ impl HookExecutor {
             },
             HookHandler::Wasm { .. } => {
                 self.wasm_handler
-                    .execute(&hook.handler, context, timeout)
-                    .await
-            },
-            HookHandler::Agent { .. } => {
-                self.agent_handler
                     .execute(&hook.handler, context, timeout)
                     .await
             },

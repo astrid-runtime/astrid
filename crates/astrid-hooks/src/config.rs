@@ -151,13 +151,6 @@ impl HooksConfig {
         self
     }
 
-    /// Enable agent hooks.
-    #[must_use]
-    pub(crate) fn enable_agent(mut self) -> Self {
-        self.allow_agent_hooks = true;
-        self
-    }
-
     /// Add a global environment variable.
     #[must_use]
     pub(crate) fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
@@ -174,7 +167,6 @@ impl HooksConfig {
             HookHandler::Command { .. } => self.allow_command_hooks,
             HookHandler::Http { .. } => self.allow_http_hooks,
             HookHandler::Wasm { .. } => self.allow_wasm_hooks,
-            HookHandler::Agent { .. } => self.allow_agent_hooks,
         }
     }
 

@@ -2,12 +2,10 @@
 //!
 //! Each handler type has its own module with the execution logic.
 
-pub(crate) mod agent;
 pub(crate) mod command;
 pub(crate) mod http;
 pub(crate) mod wasm;
 
-pub(crate) use agent::AgentHandler;
 pub(crate) use command::CommandHandler;
 pub(crate) use http::HttpHandler;
 pub(crate) use wasm::WasmHandler;
@@ -30,10 +28,6 @@ pub(crate) enum HandlerError {
     /// WASM execution failed.
     #[error("WASM execution failed: {0}")]
     WasmFailed(String),
-
-    /// Agent execution failed.
-    #[error("agent execution failed: {0}")]
-    AgentFailed(String),
 
     /// Handler timed out.
     #[error("handler timed out after {0:?}")]

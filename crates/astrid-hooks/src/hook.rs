@@ -47,17 +47,6 @@ pub enum HookHandler {
         #[serde(default = "default_wasm_function")]
         function: String,
     },
-    /// Invoke an LLM-based agent handler (stubbed).
-    Agent {
-        /// Agent prompt template.
-        prompt_template: String,
-        /// Model to use.
-        #[serde(default)]
-        model: Option<String>,
-        /// Maximum tokens for response.
-        #[serde(default)]
-        max_tokens: Option<u32>,
-    },
 }
 
 fn default_http_method() -> String {
@@ -99,22 +88,6 @@ impl HookHandler {
             module_path: module_path.into(),
             function: "handle".to_string(),
         }
-    }
-
-    /// Create a new agent handler (stubbed).
-    #[must_use]
-    pub(crate) fn agent(prompt_template: impl Into<String>) -> Self {
-        Self::Agent {
-            prompt_template: prompt_template.into(),
-            model: None,
-            max_tokens: None,
-        }
-    }
-
-    /// Check if this handler is stubbed (not yet implemented).
-    #[must_use]
-    pub(crate) fn is_stubbed(&self) -> bool {
-        matches!(self, Self::Agent { .. })
     }
 }
 
@@ -355,13 +328,10 @@ mod tests {
     #[test]
     fn test_hook_handler_creation() {
         let cmd = HookHandler::command("echo");
-        assert!(!cmd.is_stubbed());
+        assert!(matches!(cmd, HookHandler::Command { .. }));
 
         let wasm = HookHandler::wasm("/path/to/module.wasm");
-        assert!(!wasm.is_stubbed());
-
-        let agent = HookHandler::agent("Analyze this event: {{event}}");
-        assert!(agent.is_stubbed());
+        assert!(matches!(wasm, HookHandler::Wasm { .. }));
     }
 
     #[test]
