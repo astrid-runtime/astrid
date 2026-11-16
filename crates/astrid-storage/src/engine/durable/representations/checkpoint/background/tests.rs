@@ -26,6 +26,58 @@ fn append_direct(store: &mut RepresentationStore, tag: u8) {
 }
 
 #[test]
+fn checkpoint_capture_shares_immutable_bodies_but_not_live_indices() {
+    let (_directory, volume, mut store, limits) = primed_volume();
+    let active = store.active;
+    let capture = CapturedCheckpoint::capture_from_media(
+        &mut store,
+        CheckpointMedia::Volume(Arc::clone(&volume)),
+    )
+    .unwrap();
+    let proofs = [
+        store.profiles.prove_root().unwrap(),
+        store.representations.prove_root().unwrap(),
+        store.placement_entries.prove_root().unwrap(),
+    ];
+    let captured_maps = [
+        capture.snapshot.profiles.as_canonical(),
+        capture.snapshot.representations.as_canonical(),
+        capture.snapshot.placement_entries.as_canonical(),
+    ];
+    let counts = captured_maps.map(|map| map.nodes().len());
+    for (proof, map) in proofs.iter().zip(captured_maps) {
+        for (key, body) in proof.entries() {
+            assert!(
+                core::ptr::eq(*body, map.get(*key).unwrap()),
+                "capturing an immutable node must share its body instead of copying it"
+            );
+        }
+    }
+    drop(proofs);
+    append_direct(&mut store, 99);
+    assert_ne!(store.active, active);
+    assert_eq!(capture.snapshot.active, active);
+    assert!(!capture.snapshot.contains_direct(ObjectId::new([99; 32])));
+    assert_eq!(
+        [
+            capture.snapshot.profiles.as_canonical(),
+            capture.snapshot.representations.as_canonical(),
+            capture.snapshot.placement_entries.as_canonical(),
+        ]
+        .map(|map| map.nodes().len()),
+        counts,
+        "the captured node indices must not acquire later source additions"
+    );
+    let prepared = capture.prepare(limits, &AtomicBool::new(false)).unwrap();
+    assert_eq!(prepared.replacement.active, active);
+    assert!(
+        !prepared
+            .replacement
+            .contains_direct(ObjectId::new([99; 32]))
+    );
+}
+
+#[test]
 fn capture_and_preparation_do_not_share_live_cursors_or_publish_current() {
     let (_directory, volume, mut store, limits) = primed_volume();
     store.metadata.seek(SeekFrom::Start(17)).unwrap();

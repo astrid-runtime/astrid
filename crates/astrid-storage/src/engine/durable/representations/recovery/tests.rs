@@ -224,7 +224,7 @@ fn metadata_recovery_keeps_only_links_and_loads_active_bodies() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(map.nodes()[&map_node_id(frame.identity)], node);
+    assert_eq!(map.nodes()[&map_node_id(frame.identity)].as_ref(), &node);
     assert!(index.nodes.len() == 0);
     assert!(
         index.values.is_empty(),
@@ -284,7 +284,13 @@ fn metadata_recovery_loads_root_before_child_history_without_retaining_old_value
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(recovered.nodes(), map.nodes());
+    assert!(
+        recovered
+            .nodes()
+            .iter()
+            .map(|(id, node)| (id, node.as_ref()))
+            .eq(map.nodes().iter())
+    );
     assert_eq!(index.nodes.len(), 64);
     assert!(
         index.values.is_empty(),
@@ -394,7 +400,8 @@ fn indexed_active_recovery_validates_domain_and_consumes_each_node_once() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(recovered.nodes(), &BTreeMap::from([(root, node)]));
+    assert_eq!(recovered.nodes().len(), 1);
+    assert_eq!(recovered.nodes()[&root].as_ref(), &node);
     assert_eq!(index.nodes.len(), 0);
     assert!(matches!(
         index.recover_active_nodes(PhysicalMapDomain::Profile, Some(root), &file, limits),

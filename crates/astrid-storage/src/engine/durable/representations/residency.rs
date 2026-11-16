@@ -1,6 +1,7 @@
 //! Keep active map residency independent of durable historical nodes.
 
-use crate::storage_model::{CanonicalPhysicalMap, PhysicalMapNodeId};
+use crate::storage_model::PhysicalMapNodeId;
+use crate::storage_model::physical::SharedPhysicalMap;
 
 use super::DurableError;
 use super::RepresentationStore;
@@ -15,9 +16,9 @@ pub(super) struct MapResidency {
 
 impl MapResidency {
     pub(super) fn new(
-        profiles: &CanonicalPhysicalMap,
-        representations: &CanonicalPhysicalMap,
-        placements: &CanonicalPhysicalMap,
+        profiles: &SharedPhysicalMap,
+        representations: &SharedPhysicalMap,
+        placements: &SharedPhysicalMap,
     ) -> Self {
         Self {
             profiles: profiles.nodes().len(),

@@ -3,9 +3,14 @@
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
+use core::borrow::Borrow;
+
 use super::{CanonicalPhysicalMap, PhysicalMapNode, PhysicalModelError};
 
-impl CanonicalPhysicalMap {
+impl<N> CanonicalPhysicalMap<N>
+where
+    N: Borrow<PhysicalMapNode>,
+{
     /// Discard unreachable nodes from a runtime view after its new root is durable.
     /// Historical roots must be recovered from durable metadata rather than this
     /// view. Ordinary model insertions continue to retain their historical nodes.
@@ -21,7 +26,8 @@ impl CanonicalPhysicalMap {
             let node = self
                 .nodes
                 .get(&id)
-                .ok_or(PhysicalModelError::InvalidMap("missing active map node"))?;
+                .ok_or(PhysicalModelError::InvalidMap("missing active map node"))?
+                .borrow();
             match node {
                 PhysicalMapNode::Branch { zero, one, .. } => pending.extend([*zero, *one]),
                 PhysicalMapNode::Radix { children, .. } => pending.extend(children.iter().copied()),

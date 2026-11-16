@@ -35,7 +35,10 @@ pub(super) trait CanonicalNodeSink {
     }
 }
 
-impl CanonicalNodeSink for BTreeMap<PhysicalMapNodeId, PhysicalMapNode> {
+impl<N> CanonicalNodeSink for BTreeMap<PhysicalMapNodeId, N>
+where
+    N: core::borrow::Borrow<PhysicalMapNode> + From<PhysicalMapNode>,
+{
     type Error = PhysicalModelError;
 
     fn put(
@@ -46,10 +49,14 @@ impl CanonicalNodeSink for BTreeMap<PhysicalMapNodeId, PhysicalMapNode> {
     ) -> Result<(), PhysicalModelError> {
         match self.entry(id) {
             alloc::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(node);
+                entry.insert(N::from(node));
                 Ok(())
             },
-            alloc::collections::btree_map::Entry::Occupied(entry) if entry.get() == &node => Ok(()),
+            alloc::collections::btree_map::Entry::Occupied(entry)
+                if entry.get().borrow() == &node =>
+            {
+                Ok(())
+            },
             alloc::collections::btree_map::Entry::Occupied(_) => Err(
                 PhysicalModelError::InvalidMap("physical map-node identity collision"),
             ),
@@ -85,22 +92,30 @@ impl<'a> CanonicalRootProof<'a> {
     }
 }
 
-pub(super) fn validate_root<I: PhysicalIdentity>(
+pub(super) fn validate_root<I, N>(
     identity: &I,
     domain: PhysicalMapDomain,
     root: Option<PhysicalMapNodeId>,
-    nodes: &BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
-) -> Result<u64, PhysicalModelError> {
+    nodes: &BTreeMap<PhysicalMapNodeId, N>,
+) -> Result<u64, PhysicalModelError>
+where
+    I: PhysicalIdentity,
+    N: core::borrow::Borrow<PhysicalMapNode>,
+{
     let proof = prove_root(identity, domain, root, nodes)?;
     u64::try_from(proof.entries.len()).map_err(|_| PhysicalModelError::LengthOverflow)
 }
 
-pub(super) fn prove_root<'a, I: PhysicalIdentity>(
+pub(super) fn prove_root<'a, I, N>(
     identity: &I,
     domain: PhysicalMapDomain,
     root: Option<PhysicalMapNodeId>,
-    nodes: &'a BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
-) -> Result<CanonicalRootProof<'a>, PhysicalModelError> {
+    nodes: &'a BTreeMap<PhysicalMapNodeId, N>,
+) -> Result<CanonicalRootProof<'a>, PhysicalModelError>
+where
+    I: PhysicalIdentity,
+    N: core::borrow::Borrow<PhysicalMapNode>,
+{
     let proof = walk_root(domain, root, nodes)?;
     validate_canonical_root(
         identity,
@@ -118,13 +133,17 @@ pub(super) fn prove_root<'a, I: PhysicalIdentity>(
 /// Typed maps use this for automatic sealing so the writer critical section does
 /// not rebuild the unique trie or re-identify every node. Cold recovery and
 /// compaction retain independent [`prove_root`] / reconstructing consumers.
-pub(super) fn encode_live_root_into<E: From<PhysicalModelError>>(
+pub(super) fn encode_live_root_into<E, N>(
     domain: PhysicalMapDomain,
     root: Option<PhysicalMapNodeId>,
-    nodes: &BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    nodes: &BTreeMap<PhysicalMapNodeId, N>,
     expected_count: u64,
     mut emit: impl FnMut(PhysicalMapNodeId, &[u8]) -> Result<(), E>,
-) -> Result<CanonicalRootProof<'_>, E> {
+) -> Result<CanonicalRootProof<'_>, E>
+where
+    E: From<PhysicalModelError>,
+    N: core::borrow::Borrow<PhysicalMapNode>,
+{
     let proof = walk_root(domain, root, nodes)?;
     if u64::try_from(proof.entries.len()).map_err(|_| PhysicalModelError::LengthOverflow)?
         != expected_count
@@ -139,17 +158,20 @@ pub(super) fn encode_live_root_into<E: From<PhysicalModelError>>(
         let node = nodes
             .get(id)
             .ok_or(PhysicalModelError::InvalidMap("missing map node"))?;
-        node.encode_to_buffer(&mut encoded)?;
+        node.borrow().encode_to_buffer(&mut encoded)?;
         emit(*id, encoded.as_slice())?;
     }
     Ok(proof)
 }
 
-pub(super) fn walk_root(
+pub(super) fn walk_root<N>(
     domain: PhysicalMapDomain,
     root: Option<PhysicalMapNodeId>,
-    nodes: &BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
-) -> Result<CanonicalRootProof<'_>, PhysicalModelError> {
+    nodes: &BTreeMap<PhysicalMapNodeId, N>,
+) -> Result<CanonicalRootProof<'_>, PhysicalModelError>
+where
+    N: core::borrow::Borrow<PhysicalMapNode>,
+{
     let Some(root) = root else {
         return Ok(CanonicalRootProof {
             visited: BTreeSet::new(),
@@ -167,7 +189,8 @@ pub(super) fn walk_root(
         }
         let node = nodes
             .get(&node_id)
-            .ok_or(PhysicalModelError::InvalidMap("missing map node"))?;
+            .ok_or(PhysicalModelError::InvalidMap("missing map node"))?
+            .borrow();
         if node.domain() != domain {
             return Err(PhysicalModelError::InvalidMap("map domain mismatch"));
         }
@@ -190,20 +213,26 @@ pub(super) fn walk_root(
     Ok(CanonicalRootProof { visited, entries })
 }
 
-fn validate_canonical_root<I: PhysicalIdentity, N: CanonicalNodeSink>(
+fn validate_canonical_root<I, MapN, Sink>(
     identity: &I,
     domain: PhysicalMapDomain,
     root: Option<PhysicalMapNodeId>,
-    nodes: &BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    nodes: &BTreeMap<PhysicalMapNodeId, MapN>,
     entries: &[(PhysicalMapKey, &[u8])],
-    sink: &mut N,
-) -> Result<(), N::Error> {
+    sink: &mut Sink,
+) -> Result<(), Sink::Error>
+where
+    I: PhysicalIdentity,
+    MapN: core::borrow::Borrow<PhysicalMapNode>,
+    Sink: CanonicalNodeSink,
+{
     let Some(root) = root else {
         return Ok(());
     };
     let construction = nodes
         .get(&root)
         .ok_or(PhysicalModelError::InvalidMap("missing map root"))?
+        .borrow()
         .construction();
     let canonical = match construction {
         MapConstruction::LegacyBinary => legacy::build(identity, domain, entries, sink)?,
@@ -222,9 +251,12 @@ fn validate_canonical_root<I: PhysicalIdentity, N: CanonicalNodeSink>(
 /// binds its complete canonical closure without hashing the input graph twice.
 /// Missing canonical nodes and unequal colliding bodies both fail closed. The
 /// builders remain shared with ordinary creation, not a second shape oracle.
-struct ValidationNodes<'a>(&'a BTreeMap<PhysicalMapNodeId, PhysicalMapNode>);
+struct ValidationNodes<'a, N>(&'a BTreeMap<PhysicalMapNodeId, N>);
 
-impl CanonicalNodeSink for ValidationNodes<'_> {
+impl<N> CanonicalNodeSink for ValidationNodes<'_, N>
+where
+    N: core::borrow::Borrow<PhysicalMapNode>,
+{
     type Error = PhysicalModelError;
 
     fn put(
@@ -234,7 +266,7 @@ impl CanonicalNodeSink for ValidationNodes<'_> {
         node: PhysicalMapNode,
     ) -> Result<(), PhysicalModelError> {
         match self.0.get(&id) {
-            Some(existing) if existing == &node => Ok(()),
+            Some(existing) if existing.borrow() == &node => Ok(()),
             Some(_) => Err(PhysicalModelError::InvalidMap(
                 "physical map-node identity collision",
             )),
@@ -255,13 +287,16 @@ impl CanonicalNodeSink for ValidationNodes<'_> {
     }
 }
 
-fn check_live_encoded(
-    nodes: &BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+fn check_live_encoded<N>(
+    nodes: &BTreeMap<PhysicalMapNodeId, N>,
     id: PhysicalMapNodeId,
     canonical_bytes: &[u8],
-) -> Result<(), PhysicalModelError> {
+) -> Result<(), PhysicalModelError>
+where
+    N: core::borrow::Borrow<PhysicalMapNode>,
+{
     match nodes.get(&id) {
-        Some(existing) => match existing.matches_encoded(canonical_bytes) {
+        Some(existing) => match existing.borrow().matches_encoded(canonical_bytes) {
             Ok(()) => Ok(()),
             Err(PhysicalModelError::NonCanonicalEncoding) => Err(PhysicalModelError::InvalidMap(
                 "physical map-node identity collision",

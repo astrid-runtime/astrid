@@ -19,14 +19,18 @@ pub(super) fn build<I: PhysicalIdentity, V: AsRef<[u8]>, N: CanonicalNodeSink>(
     build_range(identity, domain, entries, 0, nodes)
 }
 
-pub(super) fn insert<I: PhysicalIdentity>(
+pub(super) fn insert<I, N>(
     identity: &I,
     domain: PhysicalMapDomain,
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    nodes: &mut BTreeMap<PhysicalMapNodeId, N>,
     root: PhysicalMapNodeId,
     key: PhysicalMapKey,
     value: Vec<u8>,
-) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError> {
+) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError>
+where
+    I: PhysicalIdentity,
+    N: core::borrow::Borrow<PhysicalMapNode> + From<PhysicalMapNode>,
+{
     DenseInsertion {
         identity,
         domain,
@@ -184,13 +188,17 @@ where
     )
 }
 
-struct DenseInsertion<'a, I> {
+struct DenseInsertion<'a, I, N> {
     identity: &'a I,
     domain: PhysicalMapDomain,
-    nodes: &'a mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    nodes: &'a mut BTreeMap<PhysicalMapNodeId, N>,
 }
 
-impl<I: PhysicalIdentity> DenseInsertion<'_, I> {
+impl<I, N> DenseInsertion<'_, I, N>
+where
+    I: PhysicalIdentity,
+    N: core::borrow::Borrow<PhysicalMapNode> + From<PhysicalMapNode>,
+{
     fn insert_at(
         &mut self,
         node_id: PhysicalMapNodeId,
@@ -200,10 +208,11 @@ impl<I: PhysicalIdentity> DenseInsertion<'_, I> {
         let node = self
             .nodes
             .get(&node_id)
-            .cloned()
             .ok_or(PhysicalModelError::InvalidMap(
                 "missing radix insertion node",
-            ))?;
+            ))?
+            .borrow()
+            .clone();
         if node.domain() != self.domain {
             return Err(PhysicalModelError::InvalidMap(
                 "radix insertion crossed a map domain",

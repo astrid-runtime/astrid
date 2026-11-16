@@ -1,6 +1,7 @@
 //! Bind a worker-validated checkpoint to the still-fenced live writer tip.
 
-use crate::storage_model::{CanonicalPhysicalMap, PhysicalMapNode};
+use crate::storage_model::PhysicalMapNode;
+use crate::storage_model::physical::SharedPhysicalMap;
 
 use super::super::{DurableError, RepresentationStore};
 
@@ -49,9 +50,9 @@ fn disagreement() -> DurableError {
 }
 
 fn verify_map_bodies(
-    live: &CanonicalPhysicalMap,
-    prepared: &CanonicalPhysicalMap,
-    live_maps: [&CanonicalPhysicalMap; 3],
+    live: &SharedPhysicalMap,
+    prepared: &SharedPhysicalMap,
+    live_maps: [&SharedPhysicalMap; 3],
 ) -> Result<(), DurableError> {
     if live.domain() != prepared.domain()
         || live.root() != prepared.root()
@@ -66,8 +67,8 @@ fn verify_map_bodies(
     let mut remaining = prepared.nodes().len();
     while let Some(id) = pending.pop() {
         remaining = remaining.checked_sub(1).ok_or_else(disagreement)?;
-        let node = prepared.nodes().get(&id).ok_or_else(disagreement)?;
-        if live.nodes().get(&id) != Some(node) {
+        let node = prepared.nodes().get(&id).ok_or_else(disagreement)?.as_ref();
+        if live.nodes().get(&id).map(AsRef::as_ref) != Some(node) {
             return Err(disagreement());
         }
         // A shadow body under the same identity in another arena must not be
@@ -76,7 +77,7 @@ fn verify_map_bodies(
         for map in live_maps {
             if !std::ptr::eq(map, live)
                 && let Some(alias) = map.nodes().get(&id)
-                && alias != node
+                && alias.as_ref() != node
             {
                 return Err(disagreement());
             }

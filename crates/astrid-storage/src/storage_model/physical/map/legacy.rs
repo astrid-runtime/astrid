@@ -9,14 +9,18 @@ use super::{
     PhysicalModelError, SEARCH_KEY_BITS,
 };
 
-pub(super) fn insert<I: PhysicalIdentity>(
+pub(super) fn insert<I, N>(
     identity: &I,
     domain: PhysicalMapDomain,
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    nodes: &mut BTreeMap<PhysicalMapNodeId, N>,
     root: PhysicalMapNodeId,
     key: PhysicalMapKey,
     value: Vec<u8>,
-) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError> {
+) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError>
+where
+    I: PhysicalIdentity,
+    N: core::borrow::Borrow<PhysicalMapNode> + From<PhysicalMapNode>,
+{
     Insertion {
         identity,
         domain,
@@ -124,13 +128,17 @@ struct Branch {
     subtree_entries: u64,
 }
 
-struct Insertion<'a, I> {
+struct Insertion<'a, I, N> {
     identity: &'a I,
     domain: PhysicalMapDomain,
-    nodes: &'a mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    nodes: &'a mut BTreeMap<PhysicalMapNodeId, N>,
 }
 
-impl<I: PhysicalIdentity> Insertion<'_, I> {
+impl<I, N> Insertion<'_, I, N>
+where
+    I: PhysicalIdentity,
+    N: core::borrow::Borrow<PhysicalMapNode> + From<PhysicalMapNode>,
+{
     fn insert_at(
         &mut self,
         node_id: PhysicalMapNodeId,
@@ -140,8 +148,9 @@ impl<I: PhysicalIdentity> Insertion<'_, I> {
         let node = self
             .nodes
             .get(&node_id)
-            .cloned()
-            .ok_or(PhysicalModelError::InvalidMap("missing insertion node"))?;
+            .ok_or(PhysicalModelError::InvalidMap("missing insertion node"))?
+            .borrow()
+            .clone();
         if node.domain() != self.domain {
             return Err(PhysicalModelError::InvalidMap(
                 "insertion crossed a map domain",

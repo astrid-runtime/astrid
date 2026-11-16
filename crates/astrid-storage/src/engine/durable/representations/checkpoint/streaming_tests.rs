@@ -128,7 +128,7 @@ fn install_invalid_second_map(store: &mut RepresentationStore) {
         RepresentationMap::build_dense(vec![(PhysicalMapKey::new([14; 32]), vec![2])]).unwrap();
     let (id, node) = store.representations.nodes().iter().next().unwrap();
     let id = *id;
-    let mut forged = node.clone();
+    let mut forged = node.as_ref().clone();
     match &mut forged {
         PhysicalMapNode::Leaf { domain, .. }
         | PhysicalMapNode::Branch { domain, .. }

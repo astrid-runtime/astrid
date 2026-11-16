@@ -1,8 +1,10 @@
 //! Canonical authenticated maps for physical profiles, records, and placements.
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::borrow::Borrow;
 
 use crate::storage_model::BlobId;
 
@@ -491,14 +493,22 @@ impl PhysicalMapNode {
 ///
 /// Historical unreachable nodes may remain in `nodes`; validation and lookup
 /// begin at `root`, so append-only path copying never makes old nodes live.
+///
+/// The default node type is an owned [`PhysicalMapNode`] so public
+/// constructors, `recover` / `validate_root`, and `nodes()` stay monomorphic on
+/// owned bodies. Native typed maps store shared immutable node bodies (`Arc`)
+/// so checkpoint capture clones share those allocations without copying bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CanonicalPhysicalMap {
+pub struct CanonicalPhysicalMap<N = PhysicalMapNode> {
     domain: PhysicalMapDomain,
     construction: MapConstruction,
     root: Option<PhysicalMapNodeId>,
-    nodes: BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    nodes: BTreeMap<PhysicalMapNodeId, N>,
     entry_count: u64,
 }
+
+/// Private native arena: keys plus shared immutable node bodies.
+pub(crate) type SharedPhysicalMap = CanonicalPhysicalMap<Arc<PhysicalMapNode>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MapConstruction {
@@ -506,7 +516,7 @@ enum MapConstruction {
     DenseRadix,
 }
 
-impl CanonicalPhysicalMap {
+impl CanonicalPhysicalMap<PhysicalMapNode> {
     /// Build the unique canonical trie for a complete key/value set.
     ///
     /// # Errors
@@ -533,6 +543,54 @@ impl CanonicalPhysicalMap {
         Self::build_with_construction(identity, domain, entries, MapConstruction::DenseRadix)
     }
 
+    /// Validate one root against an arena containing current and historical nodes.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing/cyclic nodes, identity mismatch, wrong domains, forged
+    /// summaries, duplicate leaves, and every non-canonical trie shape.
+    pub fn validate_root<I: PhysicalIdentity>(
+        identity: &I,
+        domain: PhysicalMapDomain,
+        root: Option<PhysicalMapNodeId>,
+        nodes: &BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    ) -> Result<u64, PhysicalModelError> {
+        validation::validate_root(identity, domain, root, nodes)
+    }
+
+    /// Recover one active map, retaining every node supplied by the caller.
+    ///
+    /// A caller that needs only the active view should supply its reachable
+    /// closure. Historical-model callers may supply a larger arena to keep
+    /// older roots available; this function does not prune that arena.
+    ///
+    /// # Errors
+    ///
+    /// Applies the same complete canonical validation as [`Self::validate_root`].
+    pub fn recover<I: PhysicalIdentity>(
+        identity: &I,
+        domain: PhysicalMapDomain,
+        root: Option<PhysicalMapNodeId>,
+        nodes: BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    ) -> Result<Self, PhysicalModelError> {
+        let entry_count = Self::validate_root(identity, domain, root, &nodes)?;
+        let construction = root
+            .and_then(|root| nodes.get(&root))
+            .map_or(MapConstruction::DenseRadix, PhysicalMapNode::construction);
+        Ok(Self {
+            domain,
+            construction,
+            root,
+            nodes,
+            entry_count,
+        })
+    }
+}
+
+impl<N> CanonicalPhysicalMap<N>
+where
+    N: Borrow<PhysicalMapNode> + From<PhysicalMapNode>,
+{
     fn build_with_construction<I: PhysicalIdentity>(
         identity: &I,
         domain: PhysicalMapDomain,
@@ -567,21 +625,6 @@ impl CanonicalPhysicalMap {
         })
     }
 
-    /// Validate one root against an arena containing current and historical nodes.
-    ///
-    /// # Errors
-    ///
-    /// Rejects missing/cyclic nodes, identity mismatch, wrong domains, forged
-    /// summaries, duplicate leaves, and every non-canonical trie shape.
-    pub fn validate_root<I: PhysicalIdentity>(
-        identity: &I,
-        domain: PhysicalMapDomain,
-        root: Option<PhysicalMapNodeId>,
-        nodes: &BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
-    ) -> Result<u64, PhysicalModelError> {
-        validation::validate_root(identity, domain, root, nodes)
-    }
-
     /// Fully validate a fixed-domain root while retaining its borrowed closure.
     #[cfg(test)]
     pub(crate) fn prove_root<I: PhysicalIdentity>(
@@ -598,34 +641,6 @@ impl CanonicalPhysicalMap {
             ));
         }
         Ok(proof)
-    }
-
-    /// Recover one active map, retaining every node supplied by the caller.
-    ///
-    /// A caller that needs only the active view should supply its reachable
-    /// closure. Historical-model callers may supply a larger arena to keep
-    /// older roots available; this function does not prune that arena.
-    ///
-    /// # Errors
-    ///
-    /// Applies the same complete canonical validation as [`Self::validate_root`].
-    pub fn recover<I: PhysicalIdentity>(
-        identity: &I,
-        domain: PhysicalMapDomain,
-        root: Option<PhysicalMapNodeId>,
-        nodes: BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
-    ) -> Result<Self, PhysicalModelError> {
-        let entry_count = Self::validate_root(identity, domain, root, &nodes)?;
-        let construction = root
-            .and_then(|root| nodes.get(&root))
-            .map_or(MapConstruction::DenseRadix, PhysicalMapNode::construction);
-        Ok(Self {
-            domain,
-            construction,
-            root,
-            nodes,
-            entry_count,
-        })
     }
 
     /// Insert one immutable entry by path-copying only the affected trie path.
@@ -691,7 +706,7 @@ impl CanonicalPhysicalMap {
 
     /// Borrow all nodes emitted while building this map.
     #[must_use]
-    pub const fn nodes(&self) -> &BTreeMap<PhysicalMapNodeId, PhysicalMapNode> {
+    pub const fn nodes(&self) -> &BTreeMap<PhysicalMapNodeId, N> {
         &self.nodes
     }
 
@@ -701,7 +716,7 @@ impl CanonicalPhysicalMap {
         let mut current = self.root?;
         let mut search = None;
         loop {
-            match self.nodes.get(&current)? {
+            match self.nodes.get(&current)?.borrow() {
                 PhysicalMapNode::Leaf {
                     key: stored, value, ..
                 } => return (*stored == key).then_some(value.as_slice()),
@@ -740,11 +755,12 @@ impl CanonicalPhysicalMap {
                     }
                     let selector = radix::nibble(key, *prefix_nibbles);
                     let mask = 1_u16 << selector;
-                    if child_bitmap & mask == 0 {
+                    if *child_bitmap & mask == 0 {
                         return None;
                     }
                     let index =
-                        usize::try_from((child_bitmap & mask.wrapping_sub(1)).count_ones()).ok()?;
+                        usize::try_from((*child_bitmap & mask.wrapping_sub(1)).count_ones())
+                            .ok()?;
                     current = *children.get(index)?;
                 },
             }

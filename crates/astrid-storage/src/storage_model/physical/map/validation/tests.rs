@@ -42,7 +42,7 @@ fn reference(
             },
         }
     }
-    let rebuilt = super::super::CanonicalPhysicalMap::build_with_construction(
+    let rebuilt = super::super::CanonicalPhysicalMap::<PhysicalMapNode>::build_with_construction(
         &Identity,
         domain,
         entries,
@@ -73,13 +73,14 @@ fn borrowed_canonical_proof_agrees_with_full_rebuild_for_valid_and_forged_roots(
                         )
                     })
                     .collect();
-                let map = super::super::CanonicalPhysicalMap::build_with_construction(
-                    &Identity,
-                    domain,
-                    entries,
-                    construction,
-                )
-                .unwrap();
+                let map =
+                    super::super::CanonicalPhysicalMap::<PhysicalMapNode>::build_with_construction(
+                        &Identity,
+                        domain,
+                        entries,
+                        construction,
+                    )
+                    .unwrap();
                 let root = map.root().unwrap();
                 assert_eq!(
                     validate_root(&Identity, domain, Some(root), map.nodes()),
@@ -160,7 +161,7 @@ fn canonical_builders_hash_nonclone_borrowed_values_into_discarding_sink() {
         })
         .collect::<Vec<_>>();
     for construction in [MapConstruction::LegacyBinary, MapConstruction::DenseRadix] {
-        let map = super::super::CanonicalPhysicalMap::build_with_construction(
+        let map = super::super::CanonicalPhysicalMap::<PhysicalMapNode>::build_with_construction(
             &Identity,
             PhysicalMapDomain::Placement,
             entries.clone(),
@@ -207,7 +208,7 @@ fn canonical_builders_reject_unequal_nodes_with_the_same_identity() {
             (PhysicalMapKey::new([0; 32]), vec![1]),
             (PhysicalMapKey::new([1; 32]), vec![2]),
         ];
-        let result = super::super::CanonicalPhysicalMap::build_with_construction(
+        let result = super::super::CanonicalPhysicalMap::<PhysicalMapNode>::build_with_construction(
             &Collision,
             PhysicalMapDomain::Placement,
             entries,
@@ -234,13 +235,14 @@ fn incremental_builders_reject_collisions_without_changing_the_active_map() {
         }
     }
     for construction in [MapConstruction::LegacyBinary, MapConstruction::DenseRadix] {
-        let mut map = super::super::CanonicalPhysicalMap::build_with_construction(
-            &Collision,
-            PhysicalMapDomain::Placement,
-            vec![(PhysicalMapKey::new([0; 32]), vec![1])],
-            construction,
-        )
-        .unwrap();
+        let mut map =
+            super::super::CanonicalPhysicalMap::<PhysicalMapNode>::build_with_construction(
+                &Collision,
+                PhysicalMapDomain::Placement,
+                vec![(PhysicalMapKey::new([0; 32]), vec![1])],
+                construction,
+            )
+            .unwrap();
         let original = map.clone();
         let result = map.insert(&Collision, PhysicalMapKey::new([1; 32]), vec![2]);
         assert!(
@@ -279,13 +281,14 @@ fn public_recovery_identifies_each_canonical_node_once() {
                     )
                 })
                 .collect();
-            let map = super::super::CanonicalPhysicalMap::build_with_construction(
-                &Identity,
-                PhysicalMapDomain::Placement,
-                entries,
-                construction,
-            )
-            .unwrap();
+            let map =
+                super::super::CanonicalPhysicalMap::<PhysicalMapNode>::build_with_construction(
+                    &Identity,
+                    PhysicalMapDomain::Placement,
+                    entries,
+                    construction,
+                )
+                .unwrap();
             let identity = CountingIdentity(core::cell::Cell::new(0));
             let recovered = super::super::CanonicalPhysicalMap::recover(
                 &identity,
@@ -305,7 +308,7 @@ fn public_recovery_identifies_each_canonical_node_once() {
 fn canonical_builder_validation_requires_every_constructed_node() {
     let entries = vec![(PhysicalMapKey::new([1; 32]), vec![1])];
     for construction in [MapConstruction::LegacyBinary, MapConstruction::DenseRadix] {
-        let nodes = BTreeMap::new();
+        let nodes = BTreeMap::<PhysicalMapNodeId, PhysicalMapNode>::new();
         let mut sink = ValidationNodes(&nodes);
         let result = match construction {
             MapConstruction::LegacyBinary => {
@@ -333,7 +336,7 @@ fn public_recovery_rejects_forged_leaf_bodies_under_original_identities() {
                 )
             })
             .collect();
-        let map = super::super::CanonicalPhysicalMap::build_with_construction(
+        let map = super::super::CanonicalPhysicalMap::<PhysicalMapNode>::build_with_construction(
             &Identity,
             PhysicalMapDomain::Placement,
             entries,
@@ -379,7 +382,7 @@ fn validation_sink_rejects_unequal_bodies_even_when_identity_collides() {
     }
     for construction in [MapConstruction::LegacyBinary, MapConstruction::DenseRadix] {
         let entries = vec![(PhysicalMapKey::new([1; 32]), vec![1])];
-        let map = super::super::CanonicalPhysicalMap::build_with_construction(
+        let map = super::super::CanonicalPhysicalMap::<PhysicalMapNode>::build_with_construction(
             &Collision,
             PhysicalMapDomain::Placement,
             entries.clone(),
@@ -440,7 +443,7 @@ fn public_recovery_rejects_noncanonical_body_even_when_root_digest_collides() {
                 )
             })
             .collect();
-        let map = super::super::CanonicalPhysicalMap::build_with_construction(
+        let map = super::super::CanonicalPhysicalMap::<PhysicalMapNode>::build_with_construction(
             &Identity,
             PhysicalMapDomain::Placement,
             entries,
@@ -538,13 +541,14 @@ fn borrowed_builder_bytes_match_owned_node_encoding_and_identity() {
                     )
                 })
                 .collect();
-            let map = super::super::CanonicalPhysicalMap::build_with_construction(
-                &Identity,
-                PhysicalMapDomain::Placement,
-                entries,
-                construction,
-            )
-            .unwrap();
+            let map =
+                super::super::CanonicalPhysicalMap::<PhysicalMapNode>::build_with_construction(
+                    &Identity,
+                    PhysicalMapDomain::Placement,
+                    entries,
+                    construction,
+                )
+                .unwrap();
             let mut kinds = BTreeSet::new();
             encode_live_root_into(
                 PhysicalMapDomain::Placement,
@@ -592,13 +596,14 @@ fn encode_live_reuses_buffer_for_one_canonical_encoding_per_visited_node() {
                     )
                 })
                 .collect();
-            let map = super::super::CanonicalPhysicalMap::build_with_construction(
-                &Identity,
-                PhysicalMapDomain::Placement,
-                entries,
-                construction,
-            )
-            .unwrap();
+            let map =
+                super::super::CanonicalPhysicalMap::<PhysicalMapNode>::build_with_construction(
+                    &Identity,
+                    PhysicalMapDomain::Placement,
+                    entries,
+                    construction,
+                )
+                .unwrap();
             // The automatic-seal emitter encodes each visited live node once
             // into its reusable buffer, without rebuilding or identifying it.
             let (result, encodings) = PhysicalMapNode::count_encodings_during(|| {
@@ -631,7 +636,7 @@ fn encode_to_buffer_matches_encode_and_reuses_one_allocation() {
                 )
             })
             .collect();
-        let map = super::super::CanonicalPhysicalMap::build_with_construction(
+        let map = super::super::CanonicalPhysicalMap::<PhysicalMapNode>::build_with_construction(
             &Identity,
             PhysicalMapDomain::Placement,
             entries,
@@ -660,7 +665,7 @@ fn encode_to_buffer_matches_encode_and_reuses_one_allocation() {
 #[test]
 fn matches_encoded_does_not_materialize_a_canonical_encoding() {
     for construction in [MapConstruction::LegacyBinary, MapConstruction::DenseRadix] {
-        let map = super::super::CanonicalPhysicalMap::build_with_construction(
+        let map = super::super::CanonicalPhysicalMap::<PhysicalMapNode>::build_with_construction(
             &Identity,
             PhysicalMapDomain::Placement,
             vec![
@@ -686,7 +691,7 @@ fn matches_encoded_does_not_materialize_a_canonical_encoding() {
 #[test]
 fn proof_sink_matches_encoded_bytes_without_retaining() {
     for construction in [MapConstruction::LegacyBinary, MapConstruction::DenseRadix] {
-        let map = super::super::CanonicalPhysicalMap::build_with_construction(
+        let map = super::super::CanonicalPhysicalMap::<PhysicalMapNode>::build_with_construction(
             &Identity,
             PhysicalMapDomain::Placement,
             vec![(PhysicalMapKey::new([1; 32]), vec![7, 8, 9])],
@@ -701,7 +706,7 @@ fn proof_sink_matches_encoded_bytes_without_retaining() {
         })
         .unwrap();
 
-        let empty = BTreeMap::new();
+        let empty = BTreeMap::<PhysicalMapNodeId, PhysicalMapNode>::new();
         let mut missing = ValidationNodes(&empty);
         assert_eq!(
             missing.put_encoded(id, &bytes, || panic!(

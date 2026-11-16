@@ -48,7 +48,7 @@ fn authenticated_map_publication_matches_independent_hashing_for_every_node_kind
             let mut wrong_identity = frame;
             wrong_identity.identity[0] ^= 1;
             assert!(wrong_identity.verify(&Blake3PhysicalIdentity).is_err());
-            variants[match node {
+            variants[match node.as_ref() {
                 PhysicalMapNode::Leaf { .. } => 0,
                 PhysicalMapNode::Branch { .. } => 1,
                 PhysicalMapNode::Page { .. } => 2,

@@ -69,7 +69,7 @@ fn handover_compares_unreachable_aliases_in_every_live_arena() {
             .unwrap();
         let root = prepared.representations.root().unwrap();
         let alias = if equal {
-            prepared.representations.nodes()[&root].clone()
+            prepared.representations.nodes()[&root].as_ref().clone()
         } else {
             PhysicalMapNode::leaf(
                 PhysicalMapDomain::Profile,

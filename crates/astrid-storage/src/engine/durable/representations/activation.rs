@@ -8,6 +8,7 @@ use crate::storage_model::{
     PlacementSet, Recipe, ReconstructionBounds, Replica, ReplicaLocator,
     RepresentationCatalogueRoot, RepresentationProfile, RepresentationRecord, RepresentationState,
 };
+use std::borrow::Borrow;
 use std::collections::BTreeSet;
 
 use super::format::{Blake3PhysicalIdentity, MetadataFrame, MetadataKind};
@@ -29,7 +30,7 @@ pub(super) fn build_initial_state(
         PhysicalMapKey::from(direct_profile),
         profile.encode()?,
     )])?;
-    append_map_nodes(&mut metadata, profiles.nodes())?;
+    append_map_nodes(&mut metadata, profiles.nodes().values().map(AsRef::as_ref))?;
     let mut representation_entries = Vec::new();
     let mut placement_entries = Vec::new();
     for object in objects {
@@ -63,9 +64,15 @@ pub(super) fn build_initial_state(
         placement_entries.push((PhysicalMapKey::from(object.blob), placement.encode()?));
     }
     let representations = RepresentationMap::build_dense(representation_entries)?;
-    append_map_nodes(&mut metadata, representations.nodes())?;
+    append_map_nodes(
+        &mut metadata,
+        representations.nodes().values().map(AsRef::as_ref),
+    )?;
     let placements = PlacementMap::build_dense(placement_entries)?;
-    append_map_nodes(&mut metadata, placements.nodes())?;
+    append_map_nodes(
+        &mut metadata,
+        placements.nodes().values().map(AsRef::as_ref),
+    )?;
     let catalogue = RepresentationCatalogueRoot::new(
         1,
         profiles.root(),
@@ -111,15 +118,12 @@ pub(super) fn direct_profile(
     Ok((profile, id))
 }
 
-pub(super) fn append_map_nodes(
+pub(super) fn append_map_nodes<'a>(
     metadata: &mut Vec<MetadataFrame>,
-    nodes: impl IntoIterator<Item = impl MapNodeRef>,
+    nodes: impl IntoIterator<Item = &'a PhysicalMapNode>,
 ) -> Result<(), DurableError> {
     for node in nodes {
-        metadata.push(MetadataFrame::map_node(
-            &Blake3PhysicalIdentity,
-            node.node(),
-        )?);
+        metadata.push(MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?);
     }
     Ok(())
 }
@@ -128,8 +132,8 @@ pub(super) fn append_map_nodes(
 ///
 /// `emit` runs once per newly appended node identity. Callers push into a Vec or
 /// write through a framed append stream; the walk/validation stays authoritative.
-pub(super) fn visit_new_reachable_map_nodes(
-    map: &CanonicalPhysicalMap,
+pub(super) fn visit_new_reachable_map_nodes<N: Borrow<PhysicalMapNode> + From<PhysicalMapNode>>(
+    map: &CanonicalPhysicalMap<N>,
     durable: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
@@ -185,12 +189,13 @@ pub(super) fn visit_new_reachable_map_nodes(
             .ok_or(DurableError::InvalidRepresentationState(
                 "active physical map traversal exceeds its arena",
             ))?;
-        let node = map
+        let node: &PhysicalMapNode = map
             .nodes()
             .get(&id)
             .ok_or(DurableError::InvalidRepresentationState(
                 "active physical map is missing a reachable node",
-            ))?;
+            ))?
+            .borrow();
         pending.push((id, Some(node)));
         match node {
             PhysicalMapNode::Branch { zero, one, .. } => {
@@ -233,9 +238,9 @@ pub(super) fn append_authenticated_map_nodes(
 
 // Hash-agile fixtures retain the generic, independently hashing encoder.
 #[cfg(test)]
-pub(super) fn append_new_reachable_map_nodes(
+pub(super) fn append_new_reachable_map_nodes<N: Borrow<PhysicalMapNode> + From<PhysicalMapNode>>(
     metadata: &mut Vec<MetadataFrame>,
-    map: &CanonicalPhysicalMap,
+    map: &CanonicalPhysicalMap<N>,
     durable: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
@@ -244,22 +249,6 @@ pub(super) fn append_new_reachable_map_nodes(
         metadata.push(MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?);
         Ok(())
     })
-}
-
-pub(super) trait MapNodeRef {
-    fn node(&self) -> &PhysicalMapNode;
-}
-
-impl MapNodeRef for (&crate::storage_model::PhysicalMapNodeId, &PhysicalMapNode) {
-    fn node(&self) -> &PhysicalMapNode {
-        self.1
-    }
-}
-
-impl MapNodeRef for &(crate::storage_model::PhysicalMapNodeId, PhysicalMapNode) {
-    fn node(&self) -> &PhysicalMapNode {
-        &self.1
-    }
 }
 
 pub(super) fn generation_name(generation: u64) -> String {

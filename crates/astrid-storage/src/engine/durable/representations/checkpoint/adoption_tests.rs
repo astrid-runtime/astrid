@@ -619,7 +619,7 @@ fn coherent_wrong_slot_domain_is_rejected_before_current_publication() {
     // required to exercise the runtime fence.
     let (id, node) = store.profiles.nodes().iter().next().unwrap();
     let id = *id;
-    let mut forged = node.clone();
+    let mut forged = node.as_ref().clone();
     match &mut forged {
         PhysicalMapNode::Leaf { domain, .. }
         | PhysicalMapNode::Branch { domain, .. }
@@ -717,7 +717,12 @@ fn coherent_extra_orphan_in_emitter_memo_cannot_authorize_sealed_media() {
     )
     .unwrap();
     let id = orphan.root().unwrap();
-    let mut with_orphan = store.profiles.nodes().clone();
+    let mut with_orphan: std::collections::BTreeMap<_, _> = store
+        .profiles
+        .nodes()
+        .iter()
+        .map(|(id, node)| (*id, node.as_ref().clone()))
+        .collect();
     with_orphan.extend(orphan.nodes().iter().map(|(id, node)| (*id, node.clone())));
     assert!(
         ProfileMap::recover_exact(store.profiles.root(), with_orphan).is_err(),
@@ -869,19 +874,24 @@ fn sealed_node_body_is_compared_against_every_matching_live_arena() {
         .iter()
         .find(|(_, node)| {
             matches!(
-                node,
+                node.as_ref(),
                 PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. }
             )
         })
         .unwrap();
     let id = *id;
-    let mut forged = node.clone();
+    let mut forged = node.as_ref().clone();
     match &mut forged {
         PhysicalMapNode::Leaf { value, .. } => value[0] ^= 1,
         PhysicalMapNode::Page { entries, .. } => entries[0].1[0] ^= 1,
         _ => unreachable!(),
     }
-    let mut with_forged = store.profiles.nodes().clone();
+    let mut with_forged: std::collections::BTreeMap<_, _> = store
+        .profiles
+        .nodes()
+        .iter()
+        .map(|(id, node)| (*id, node.as_ref().clone()))
+        .collect();
     assert!(with_forged.insert(id, forged.clone()).is_none());
     assert!(
         ProfileMap::recover_exact(store.profiles.root(), with_forged).is_err(),

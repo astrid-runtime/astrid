@@ -1,12 +1,23 @@
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use super::super::Blake3PhysicalIdentity;
 use super::super::PhysicalModelError;
 use super::{
-    CanonicalPhysicalMap, MapConstruction, PhysicalMapDomain, PhysicalMapKey, ProfileMap,
-    RepresentationMap,
+    CanonicalPhysicalMap, MapConstruction, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode,
+    PhysicalMapNodeId, ProfileMap, RepresentationMap,
 };
+
+fn owned_nodes(
+    nodes: &BTreeMap<PhysicalMapNodeId, Arc<PhysicalMapNode>>,
+) -> BTreeMap<PhysicalMapNodeId, PhysicalMapNode> {
+    nodes
+        .iter()
+        .map(|(id, node)| (*id, PhysicalMapNode::clone(node.as_ref())))
+        .collect()
+}
 
 fn key_material(tag: u8, ordinal: u32) -> PhysicalMapKey {
     let mut material = [tag; 32];
@@ -44,7 +55,7 @@ fn recover_exact_rejects_wrong_domain_and_unauthenticated_extras() {
         vec![(PhysicalMapKey::new([0xEE; 32]), vec![7])],
     )
     .unwrap();
-    let mut with_extra = profile.nodes().clone();
+    let mut with_extra = owned_nodes(profile.nodes());
     with_extra.extend(orphan.nodes().iter().map(|(id, node)| (*id, node.clone())));
     assert!(matches!(
         ProfileMap::recover_exact(profile.root(), with_extra),
@@ -55,7 +66,7 @@ fn recover_exact_rejects_wrong_domain_and_unauthenticated_extras() {
 }
 
 fn assert_independent_root_proof(map: &RepresentationMap) {
-    let count = CanonicalPhysicalMap::validate_root(
+    let count = super::validation::validate_root(
         &Blake3PhysicalIdentity,
         PhysicalMapDomain::Representation,
         map.root(),
@@ -142,9 +153,11 @@ fn legacy_and_dense_mutations_match_independent_proof_across_shapes() {
                     assert_eq!(rebuilt.rebuild_with_entries(entries.clone()).unwrap(), 0);
                     rebuilt.reclaim_unreachable_nodes().unwrap();
                     assert_independent_root_proof(&rebuilt);
-                    let recovered =
-                        RepresentationMap::recover_exact(rebuilt.root(), rebuilt.nodes().clone())
-                            .unwrap();
+                    let recovered = RepresentationMap::recover_exact(
+                        rebuilt.root(),
+                        owned_nodes(rebuilt.nodes()),
+                    )
+                    .unwrap();
                     assert_eq!(recovered.root(), expected.root());
                     assert_eq!(recovered.entry_count(), u64::from(count));
                 }
@@ -162,9 +175,9 @@ fn collision_and_partial_mutation_keep_tip_valid() {
     let existing_key = map
         .nodes()
         .values()
-        .find_map(|node| match node {
-            super::PhysicalMapNode::Leaf { key, .. } => Some(*key),
-            super::PhysicalMapNode::Page { entries, .. } => entries.first().map(|(key, _)| *key),
+        .find_map(|node| match node.as_ref() {
+            PhysicalMapNode::Leaf { key, .. } => Some(*key),
+            PhysicalMapNode::Page { entries, .. } => entries.first().map(|(key, _)| *key),
             _ => None,
         })
         .expect("dense fixture retains at least one leaf or page");
@@ -190,4 +203,40 @@ fn collision_and_partial_mutation_keep_tip_valid() {
     assert_eq!(map.entry_count(), before_count);
     assert_eq!(map.nodes(), &before_nodes);
     assert_independent_root_proof(&map);
+}
+
+#[test]
+fn typed_map_clone_shares_immutable_node_bodies() {
+    let map = RepresentationMap::build_dense(sample_entries(0x55, 12)).unwrap();
+    let snapshot = map.clone();
+    assert_eq!(map.root(), snapshot.root());
+    assert_eq!(map.entry_count(), snapshot.entry_count());
+    for (id, node) in map.nodes() {
+        let shared = &snapshot.nodes()[id];
+        assert!(
+            Arc::ptr_eq(node, shared),
+            "clone must share immutable node body allocations"
+        );
+        assert_eq!(node.as_ref(), shared.as_ref());
+    }
+
+    let mut live = map;
+    let prior_len = snapshot.nodes().len();
+    assert!(
+        live.insert(key_material(0xAB, 99), vec![0xCA, 0xFE])
+            .unwrap()
+    );
+    // Path-copy retains historical IDs; snapshot bodies stay shared and unchanged.
+    for (id, snap) in snapshot.nodes() {
+        let retained = live
+            .nodes()
+            .get(id)
+            .expect("path-copy retains historical nodes");
+        assert!(Arc::ptr_eq(snap, retained));
+        assert_eq!(snap.as_ref(), retained.as_ref());
+    }
+    assert!(live.nodes().len() > prior_len);
+    assert_ne!(live.root(), snapshot.root());
+    assert_independent_root_proof(&live);
+    assert_independent_root_proof(&snapshot);
 }

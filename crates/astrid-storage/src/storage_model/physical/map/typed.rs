@@ -7,6 +7,7 @@
 //! representation or placement slot.
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use super::super::Blake3PhysicalIdentity;
@@ -14,7 +15,7 @@ use super::super::PhysicalModelError;
 use super::validation::{self, CanonicalRootProof};
 use super::{
     CanonicalPhysicalMap, MapConstruction, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode,
-    PhysicalMapNodeId,
+    PhysicalMapNodeId, SharedPhysicalMap,
 };
 
 mod sealed {
@@ -24,14 +25,15 @@ mod sealed {
 /// Read-only publication authority for the three fixed-domain native maps.
 /// Generic maps with an injected identity cannot implement this sealed trait.
 pub(crate) trait AuthenticatedPhysicalMap: sealed::Sealed {
-    fn as_canonical(&self) -> &CanonicalPhysicalMap;
+    fn as_canonical(&self) -> &SharedPhysicalMap;
 }
 
 fn recover_exact_inner(
     domain: PhysicalMapDomain,
     root: Option<PhysicalMapNodeId>,
     nodes: BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
-) -> Result<CanonicalPhysicalMap, PhysicalModelError> {
+) -> Result<SharedPhysicalMap, PhysicalModelError> {
+    // Prove the exact owned-node closure with the existing entrypoint, then wrap once.
     let proof = validation::prove_root(&Blake3PhysicalIdentity, domain, root, &nodes)?;
     if proof.visited().len() != nodes.len() {
         return Err(PhysicalModelError::InvalidMap(
@@ -43,6 +45,12 @@ fn recover_exact_inner(
     let construction = root
         .and_then(|root| nodes.get(&root))
         .map_or(MapConstruction::DenseRadix, PhysicalMapNode::construction);
+    // Drop borrowed proof before consuming `nodes` into Arc bodies.
+    drop(proof);
+    let nodes = nodes
+        .into_iter()
+        .map(|(id, node)| (id, Arc::new(node)))
+        .collect();
     Ok(CanonicalPhysicalMap {
         domain,
         construction,
@@ -57,7 +65,7 @@ macro_rules! typed_map_views {
         impl sealed::Sealed for $name {}
 
         impl AuthenticatedPhysicalMap for $name {
-            fn as_canonical(&self) -> &CanonicalPhysicalMap {
+            fn as_canonical(&self) -> &SharedPhysicalMap {
                 &self.inner
             }
         }
@@ -125,7 +133,7 @@ macro_rules! typed_map_views {
             }
 
             #[must_use]
-            pub(crate) const fn nodes(&self) -> &BTreeMap<PhysicalMapNodeId, PhysicalMapNode> {
+            pub(crate) const fn nodes(&self) -> &BTreeMap<PhysicalMapNodeId, Arc<PhysicalMapNode>> {
                 self.inner.nodes()
             }
 
@@ -134,9 +142,11 @@ macro_rules! typed_map_views {
                 self.inner.get(key)
             }
 
-            /// Borrow the authenticated generic view for shared read-only helpers.
+            /// Borrow the authenticated shared-body view for read-only helpers.
+            ///
+            /// Does not deep-clone into an owned-node map.
             #[must_use]
-            pub(crate) const fn as_canonical(&self) -> &CanonicalPhysicalMap {
+            pub(crate) const fn as_canonical(&self) -> &SharedPhysicalMap {
                 &self.inner
             }
 
@@ -150,7 +160,7 @@ macro_rules! typed_map_views {
 /// Authenticated profile catalogue map (Blake3, profile domain).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProfileMap {
-    inner: CanonicalPhysicalMap,
+    inner: SharedPhysicalMap,
 }
 
 typed_map_views!(ProfileMap, PhysicalMapDomain::Profile);
@@ -161,10 +171,11 @@ impl ProfileMap {
         entries: Vec<(PhysicalMapKey, Vec<u8>)>,
     ) -> Result<Self, PhysicalModelError> {
         Ok(Self {
-            inner: CanonicalPhysicalMap::build_dense(
+            inner: SharedPhysicalMap::build_with_construction(
                 &Blake3PhysicalIdentity,
                 Self::DOMAIN,
                 entries,
+                MapConstruction::DenseRadix,
             )?,
         })
     }
@@ -173,7 +184,7 @@ impl ProfileMap {
 /// Authenticated representation record map (Blake3, representation domain).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RepresentationMap {
-    inner: CanonicalPhysicalMap,
+    inner: SharedPhysicalMap,
 }
 
 typed_map_views!(RepresentationMap, PhysicalMapDomain::Representation);
@@ -185,7 +196,12 @@ impl RepresentationMap {
         entries: Vec<(PhysicalMapKey, Vec<u8>)>,
     ) -> Result<Self, PhysicalModelError> {
         Ok(Self {
-            inner: CanonicalPhysicalMap::build(&Blake3PhysicalIdentity, Self::DOMAIN, entries)?,
+            inner: SharedPhysicalMap::build_with_construction(
+                &Blake3PhysicalIdentity,
+                Self::DOMAIN,
+                entries,
+                MapConstruction::LegacyBinary,
+            )?,
         })
     }
 
@@ -194,10 +210,11 @@ impl RepresentationMap {
         entries: Vec<(PhysicalMapKey, Vec<u8>)>,
     ) -> Result<Self, PhysicalModelError> {
         Ok(Self {
-            inner: CanonicalPhysicalMap::build_dense(
+            inner: SharedPhysicalMap::build_with_construction(
                 &Blake3PhysicalIdentity,
                 Self::DOMAIN,
                 entries,
+                MapConstruction::DenseRadix,
             )?,
         })
     }
@@ -224,7 +241,7 @@ impl RepresentationMap {
 /// Authenticated placement entry map (Blake3, placement domain).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PlacementMap {
-    inner: CanonicalPhysicalMap,
+    inner: SharedPhysicalMap,
 }
 
 typed_map_views!(PlacementMap, PhysicalMapDomain::Placement);
@@ -235,10 +252,11 @@ impl PlacementMap {
         entries: Vec<(PhysicalMapKey, Vec<u8>)>,
     ) -> Result<Self, PhysicalModelError> {
         Ok(Self {
-            inner: CanonicalPhysicalMap::build_dense(
+            inner: SharedPhysicalMap::build_with_construction(
                 &Blake3PhysicalIdentity,
                 Self::DOMAIN,
                 entries,
+                MapConstruction::DenseRadix,
             )?,
         })
     }
@@ -276,7 +294,7 @@ impl ProfileMap {
         use alloc::collections::btree_map::Entry;
         match self.inner.nodes.entry(id) {
             Entry::Vacant(slot) => {
-                slot.insert(node);
+                slot.insert(Arc::new(node));
                 true
             },
             Entry::Occupied(_) => false,
@@ -293,7 +311,7 @@ impl ProfileMap {
         use alloc::collections::btree_map::Entry;
         match self.inner.nodes.entry(id) {
             Entry::Occupied(mut slot) => {
-                slot.insert(node);
+                slot.insert(Arc::new(node));
                 true
             },
             Entry::Vacant(_) => false,
@@ -313,7 +331,7 @@ impl RepresentationMap {
         use alloc::collections::btree_map::Entry;
         match self.inner.nodes.entry(id) {
             Entry::Occupied(mut slot) => {
-                slot.insert(node);
+                slot.insert(Arc::new(node));
                 true
             },
             Entry::Vacant(_) => false,

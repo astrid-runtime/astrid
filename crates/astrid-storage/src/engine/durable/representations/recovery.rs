@@ -7,6 +7,7 @@ mod semantic_profile_tests;
 #[cfg(test)]
 mod tests;
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::SeekFrom;
 
@@ -348,7 +349,7 @@ fn validate_root_generation(reused: bool, previous: u64, current: u64) -> Result
 }
 
 pub(super) fn validate_profiles(
-    map: &CanonicalPhysicalMap,
+    map: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
 ) -> Result<RepresentationProfileId, DurableError> {
     validate_profile_entries(active_entries(map)?)
 }
@@ -385,9 +386,9 @@ pub(super) struct ValidatedRepresentations {
 }
 
 pub(super) fn validate_representations<const COLLECT_PLACEMENTS: bool>(
-    profiles: &CanonicalPhysicalMap,
-    representations: &CanonicalPhysicalMap,
-    placements: &CanonicalPhysicalMap,
+    profiles: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
+    representations: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
+    placements: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
     direct_profile: RepresentationProfileId,
 ) -> Result<ValidatedRepresentations, DurableError> {
     validate_representation_entries::<COLLECT_PLACEMENTS, _>(
@@ -399,7 +400,7 @@ pub(super) fn validate_representations<const COLLECT_PLACEMENTS: bool>(
 }
 
 pub(super) fn validate_representation_entries<'a, const COLLECT_PLACEMENTS: bool, R>(
-    profiles: &CanonicalPhysicalMap,
+    profiles: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
     representations: impl FnOnce() -> Result<R, DurableError>,
     placements: impl IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
     direct_profile: RepresentationProfileId,
@@ -487,7 +488,7 @@ where
 }
 
 fn validate_record_profile(
-    profiles: &CanonicalPhysicalMap,
+    profiles: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
     record: &RepresentationRecord,
     direct_profile: RepresentationProfileId,
     decoded_direct: &mut Option<IdentifiedProfile>,
@@ -521,7 +522,7 @@ fn validate_record_profile(
 /// one authoritative visit over active leaves—no `Vec` materialization and no
 /// second walker. Decode errors fail closed.
 pub(super) fn ensure_no_excluded_object_coverage(
-    representations: &CanonicalPhysicalMap,
+    representations: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
     reverse: &BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
     excluded: &BTreeSet<ObjectId>,
 ) -> Result<(), DurableError> {
@@ -532,7 +533,7 @@ pub(super) fn ensure_no_excluded_object_coverage(
 /// leaves the fallback visitor decoded (`0` when excluded is empty or the
 /// all-direct fast proof skips the walk).
 pub(super) fn ensure_no_excluded_object_coverage_scanned(
-    representations: &CanonicalPhysicalMap,
+    representations: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
     reverse: &BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
     excluded: &BTreeSet<ObjectId>,
 ) -> Result<u64, DurableError> {
@@ -574,7 +575,7 @@ pub(super) fn ensure_no_excluded_object_coverage_scanned(
 /// missing-node validation. Prefer this over allocating [`active_entries`] when
 /// callers can decide per leaf without retaining the full collection.
 pub(super) fn visit_active_entries<'a, F>(
-    map: &'a CanonicalPhysicalMap,
+    map: &'a CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
     mut visit: F,
 ) -> Result<(), DurableError>
 where
@@ -596,7 +597,9 @@ where
             .get(&id)
             .ok_or(DurableError::InvalidRepresentationState(
                 "physical map traversal found a missing node",
-            ))? {
+            ))?
+            .borrow()
+        {
             PhysicalMapNode::Leaf { key, value, .. } => visit(*key, value.as_slice())?,
             PhysicalMapNode::Branch { zero, one, .. } => {
                 stack.push(*one);
@@ -619,7 +622,7 @@ where
 }
 
 pub(super) fn active_entries(
-    map: &CanonicalPhysicalMap,
+    map: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
 ) -> Result<Vec<(PhysicalMapKey, &[u8])>, DurableError> {
     let mut entries = Vec::new();
     visit_active_entries(map, |key, value| {

@@ -15,12 +15,15 @@ use super::{
 /// already-authenticated id are dropped; unequal bodies fail closed. The
 /// source arena stays immutable until the caller commits `fresh` after a
 /// successful root build.
-struct NewOnlySink<'a> {
-    existing: &'a BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
-    fresh: BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+struct NewOnlySink<'a, N> {
+    existing: &'a BTreeMap<PhysicalMapNodeId, N>,
+    fresh: BTreeMap<PhysicalMapNodeId, N>,
 }
 
-impl CanonicalNodeSink for NewOnlySink<'_> {
+impl<N> CanonicalNodeSink for NewOnlySink<'_, N>
+where
+    N: core::borrow::Borrow<PhysicalMapNode> + From<PhysicalMapNode>,
+{
     type Error = PhysicalModelError;
 
     fn put(
@@ -30,7 +33,7 @@ impl CanonicalNodeSink for NewOnlySink<'_> {
         node: PhysicalMapNode,
     ) -> Result<(), PhysicalModelError> {
         if let Some(existing) = self.fresh.get(&id).or_else(|| self.existing.get(&id)) {
-            return if existing == &node {
+            return if existing.borrow() == &node {
                 Ok(())
             } else {
                 Err(PhysicalModelError::InvalidMap(
@@ -38,16 +41,19 @@ impl CanonicalNodeSink for NewOnlySink<'_> {
                 ))
             };
         }
-        self.fresh.insert(id, node);
+        self.fresh.insert(id, N::from(node));
         Ok(())
     }
 }
 
-fn collect_active_entries<'a>(
+fn collect_active_entries<'a, N>(
     root: Option<PhysicalMapNodeId>,
-    nodes: &'a BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    nodes: &'a BTreeMap<PhysicalMapNodeId, N>,
     entry_count: u64,
-) -> Result<BTreeMap<PhysicalMapKey, Cow<'a, [u8]>>, PhysicalModelError> {
+) -> Result<BTreeMap<PhysicalMapKey, Cow<'a, [u8]>>, PhysicalModelError>
+where
+    N: core::borrow::Borrow<PhysicalMapNode>,
+{
     let mut entries = BTreeMap::<PhysicalMapKey, Cow<'a, [u8]>>::new();
     if let Some(root) = root {
         let mut stack = vec![root];
@@ -61,6 +67,7 @@ fn collect_active_entries<'a>(
             match nodes
                 .get(&node_id)
                 .ok_or(PhysicalModelError::InvalidMap("missing active map node"))?
+                .borrow()
             {
                 PhysicalMapNode::Leaf { key, value, .. } => {
                     if entries
@@ -130,7 +137,10 @@ fn merge_additions(
     Ok(inserted)
 }
 
-impl CanonicalPhysicalMap {
+impl<N> CanonicalPhysicalMap<N>
+where
+    N: core::borrow::Borrow<PhysicalMapNode> + From<PhysicalMapNode>,
+{
     /// Atomically rebuild the active canonical trie with additional entries.
     ///
     /// The resulting root is byte-identical to [`Self::build`] over the

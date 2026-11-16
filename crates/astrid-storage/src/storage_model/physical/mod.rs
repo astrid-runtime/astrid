@@ -30,6 +30,7 @@ pub use identity::{
     RepresentationProfileId, RepresentationRecordId, RepresentationStateId,
 };
 pub(crate) use map::CanonicalRootProof;
+pub(crate) use map::SharedPhysicalMap;
 pub(crate) use map::{AuthenticatedPhysicalMap, PlacementMap, ProfileMap, RepresentationMap};
 pub use map::{CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode};
 pub use placement::{PlacementEntry, PlacementSet, Replica, ReplicaLocator};
