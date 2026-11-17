@@ -16,7 +16,7 @@ use crate::storage_model::{
 };
 #[cfg(test)]
 use std::collections::BTreeMap;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 
 use super::super::super::scan_frames;
 use super::super::activation::visit_new_reachable_map_nodes;
@@ -283,7 +283,7 @@ impl LiveTipRefs<'_> {
         generation: u64,
     ) -> Result<SealedGenerationEmit, DurableError> {
         let mut appended = BTreeSet::new();
-        let mut complete = HashSet::new();
+        let mut complete = BTreeSet::new();
         let mut durable = BTreeSet::new();
         {
             let mut stream = FramedAppendStream::begin(metadata, METADATA_MAGIC)?;
@@ -530,7 +530,7 @@ impl RepresentationStore {
         self.journal_generation = proof.generation;
         // Generation-bound memos must not survive a published handle transition
         // when a later prune fails. Clear/replace them before any fallible prune.
-        self.complete_map_subtrees = HashSet::new();
+        self.complete_map_subtrees.clear();
         self.persisted_map_nodes = proof.verified_reachable;
         self.map_frame_count = proof.map_frame_count;
         // The seal proved this exact tip. Retain its closure without allocating
@@ -550,9 +550,7 @@ impl RepresentationStore {
         // Exact media closure verification authenticated every retained node's
         // descendants. Carry that fresh proof just as cold recovery does, so
         // the first following write need not traverse the whole unchanged tip.
-        self.complete_map_subtrees = std::mem::take(&mut self.persisted_map_nodes)
-            .into_iter()
-            .collect();
+        self.complete_map_subtrees = std::mem::take(&mut self.persisted_map_nodes);
         Ok(())
     }
 }

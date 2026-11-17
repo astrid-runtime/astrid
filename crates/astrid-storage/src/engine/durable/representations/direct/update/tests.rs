@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::super::tests::empty_store;
@@ -18,7 +17,7 @@ fn failed_observation_does_not_promote_new_node_closures() {
         .chain(store.placement_entries.nodes().keys())
         .chain(store.profiles.nodes().keys())
         .copied()
-        .collect::<HashSet<_>>();
+        .collect::<BTreeSet<_>>();
     let direct = store
         .describe_direct(
             ObjectId::new([42; 32]),
@@ -72,7 +71,7 @@ fn successful_rebase_retains_closed_root_proofs() {
 }
 
 #[test]
-fn rebase_releases_oversized_complete_memo_capacity() {
+fn rebase_releases_superseded_complete_memo_entries() {
     let directory = tempfile::tempdir().unwrap();
     let volume: Arc<dyn AstridVolume> =
         HostedFileVolume::open(directory.path().join("rebase-capacity.volume")).unwrap();
@@ -99,21 +98,25 @@ fn rebase_releases_oversized_complete_memo_capacity() {
         survivor = Some(direct);
     }
     let survivor = survivor.unwrap();
-    let highwater = store.complete_map_subtrees.capacity();
+    let highwater = store.complete_map_subtrees.len();
     assert!(
         highwater > 32,
-        "grown complete memo must have allocated HashSet buckets"
+        "grown complete memo must contain historical node identities"
     );
     store.rebase_all_direct(&[survivor]).unwrap();
     assert!(
-        store.complete_map_subtrees.capacity() < highwater,
-        "rebase collection must release retired complete HashSet buckets"
+        store.complete_map_subtrees.len() < highwater,
+        "rebase collection must release superseded complete memo entries"
     );
-    assert!(store.complete_map_subtrees.iter().all(|id| {
-        store.profiles.nodes().contains_key(id)
-            || store.representations.nodes().contains_key(id)
-            || store.placement_entries.nodes().contains_key(id)
-    }));
+    let resident: BTreeSet<_> = store
+        .profiles
+        .nodes()
+        .keys()
+        .chain(store.representations.nodes().keys())
+        .chain(store.placement_entries.nodes().keys())
+        .copied()
+        .collect();
+    assert_eq!(store.complete_map_subtrees, resident);
     assert!(
         store
             .complete_map_subtrees

@@ -1,6 +1,6 @@
 //! Authoritative physical representation catalogue and placement state.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::storage_model::physical::{PlacementMap, ProfileMap, RepresentationMap};
@@ -128,8 +128,9 @@ pub(super) struct RepresentationStore {
     /// Durable `MapNode` frames in the current generation, including duplicates.
     map_frame_count: u64,
     // Complete durable closures, authenticated on recovery or checked by append.
-    // Only membership is observed; traversal and ordered proof sets determine bytes.
-    complete_map_subtrees: HashSet<crate::storage_model::PhysicalMapNodeId>,
+    // Match the sealed proof's ordered set so adoption moves it without a
+    // second membership-table allocation or conversion.
+    complete_map_subtrees: BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     direct_profile: RepresentationProfileId,
     reverse: ReverseIndex,
 }

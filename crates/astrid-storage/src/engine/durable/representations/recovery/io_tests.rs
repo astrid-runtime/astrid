@@ -1,7 +1,6 @@
 //! Observe media reads through production map serialization and recovery.
 
 use std::cell::Cell;
-use std::collections::{BTreeSet, HashSet};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use super::*;
@@ -80,7 +79,7 @@ fn append_active_map(
         original,
         &mut BTreeSet::new(),
         &mut BTreeSet::new(),
-        &mut HashSet::new(),
+        &mut BTreeSet::new(),
         |_, node| {
             let frame = MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?;
             let location = super::super::append_frame(file, METADATA_MAGIC, &frame.encode()?)?;

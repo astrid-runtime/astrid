@@ -37,9 +37,8 @@ fn published_updates_bound_resident_history_and_recover_every_entry() {
         let all_resident = resident + store.profiles.nodes().len();
         assert!(
             store
-                .complete_map_subtrees
-                .iter()
-                .all(|id| !store.persisted_map_nodes.contains(id))
+                .persisted_map_nodes
+                .is_disjoint(&store.complete_map_subtrees)
         );
         assert!(
             store.persisted_map_nodes.len() + store.complete_map_subtrees.len() <= all_resident
@@ -293,11 +292,6 @@ fn later_map_reclaim_failure_clears_complete_proofs_after_earlier_shrink() {
         "earlier map must shrink before the later map fails"
     );
     assert!(store.complete_map_subtrees.is_empty());
-    assert_eq!(
-        store.complete_map_subtrees.capacity(),
-        0,
-        "failed collection must drop the complete HashSet table"
-    );
     for id in prior_proofs {
         if store.profiles.nodes().contains_key(&id)
             || store.representations.nodes().contains_key(&id)
@@ -314,7 +308,7 @@ fn later_map_reclaim_failure_clears_complete_proofs_after_earlier_shrink() {
 #[test]
 fn collection_retains_complete_live_closures_and_skips_their_next_append_walk() {
     use super::super::append_new_reachable_map_nodes;
-    use std::collections::{BTreeSet, HashSet};
+    use std::collections::BTreeSet;
 
     let directory = tempfile::tempdir().unwrap();
     let volume: Arc<dyn AstridVolume> =
@@ -377,14 +371,17 @@ fn collection_retains_complete_live_closures_and_skips_their_next_append_walk() 
                 &mut store.complete_map_subtrees,
             )
             .unwrap();
-            let mut cold_durable = store.persisted_map_nodes.clone();
-            cold_durable.extend(store.complete_map_subtrees.iter().copied());
+            let mut cold_durable = store
+                .persisted_map_nodes
+                .union(&store.complete_map_subtrees)
+                .copied()
+                .collect();
             let cold = append_new_reachable_map_nodes(
                 &mut metadata,
                 store.representations.as_canonical(),
                 &mut cold_durable,
                 &mut appended,
-                &mut HashSet::new(),
+                &mut BTreeSet::new(),
             )
             .unwrap();
             assert_eq!(warm, 0, "collection must preserve the live closure proof");

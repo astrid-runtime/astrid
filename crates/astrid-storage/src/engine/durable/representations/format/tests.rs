@@ -6,7 +6,7 @@ fn authenticated_map_publication_matches_independent_hashing_for_every_node_kind
     use crate::storage_model::physical::{
         AuthenticatedPhysicalMap, PlacementMap, ProfileMap, RepresentationMap,
     };
-    use std::collections::{BTreeSet, HashSet};
+    use std::collections::BTreeSet;
 
     let entries: Vec<_> = (0_u8..32)
         .map(|index| (PhysicalMapKey::new([index; 32]), vec![index; 128]))
@@ -26,7 +26,7 @@ fn authenticated_map_publication_matches_independent_hashing_for_every_node_kind
                 map,
                 &mut BTreeSet::new(),
                 &mut BTreeSet::new(),
-                &mut HashSet::new(),
+                &mut BTreeSet::new(),
             )
         });
         result.unwrap();

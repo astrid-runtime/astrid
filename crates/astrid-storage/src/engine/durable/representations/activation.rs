@@ -9,7 +9,7 @@ use crate::storage_model::{
     RepresentationCatalogueRoot, RepresentationProfile, RepresentationRecord, RepresentationState,
 };
 use std::borrow::Borrow;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 
 use super::format::{Blake3PhysicalIdentity, MetadataFrame, MetadataKind};
 use super::{DirectArenaObject, DurableError, LOCAL_STORAGE_NODE};
@@ -136,7 +136,7 @@ pub(super) fn visit_new_reachable_map_nodes<N: Borrow<PhysicalMapNode> + From<Ph
     map: &CanonicalPhysicalMap<N>,
     durable: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
-    complete: &mut HashSet<crate::storage_model::PhysicalMapNodeId>,
+    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     mut emit: impl FnMut(
         crate::storage_model::PhysicalMapNodeId,
         &PhysicalMapNode,
@@ -216,7 +216,7 @@ pub(super) fn append_authenticated_map_nodes(
     map: &(impl AuthenticatedPhysicalMap + ?Sized),
     durable: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
-    complete: &mut HashSet<crate::storage_model::PhysicalMapNodeId>,
+    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
 ) -> Result<usize, DurableError> {
     visit_new_reachable_map_nodes(
         map.as_canonical(),
@@ -243,7 +243,7 @@ pub(super) fn append_new_reachable_map_nodes<N: Borrow<PhysicalMapNode> + From<P
     map: &CanonicalPhysicalMap<N>,
     durable: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
-    complete: &mut HashSet<crate::storage_model::PhysicalMapNodeId>,
+    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
 ) -> Result<usize, DurableError> {
     visit_new_reachable_map_nodes(map, durable, appended, complete, |_, node| {
         metadata.push(MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?);
@@ -257,7 +257,7 @@ pub(super) fn generation_name(generation: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet, HashSet};
+    use std::collections::{BTreeMap, BTreeSet};
 
     use crate::storage_model::{
         CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode,
@@ -308,7 +308,7 @@ mod tests {
             map.as_canonical(),
             &mut BTreeSet::new(),
             &mut BTreeSet::new(),
-            &mut HashSet::new(),
+            &mut BTreeSet::new(),
             |_, _| {
                 emitted += 1;
                 Ok(())
@@ -323,7 +323,7 @@ mod tests {
         let mut map = dense_map();
         let mut durable: BTreeSet<_> = map.nodes().keys().copied().collect();
         let mut reference_durable = durable.clone();
-        let mut complete = HashSet::new();
+        let mut complete = BTreeSet::new();
         let mut metadata = Vec::new();
         let mut appended = BTreeSet::new();
         let cold = append_new_reachable_map_nodes(
@@ -368,7 +368,7 @@ mod tests {
             &map,
             &mut reference_durable,
             &mut cold_appended,
-            &mut HashSet::new(),
+            &mut BTreeSet::new(),
         )
         .unwrap();
         assert_eq!(appended, cold_appended);
@@ -391,7 +391,7 @@ mod tests {
         let mut metadata = Vec::new();
         let mut appended = BTreeSet::new();
 
-        let mut complete = HashSet::new();
+        let mut complete = BTreeSet::new();
         append_new_reachable_map_nodes(
             &mut metadata,
             &map,
@@ -418,7 +418,7 @@ mod tests {
             &map,
             &mut BTreeSet::new(),
             &mut appended,
-            &mut HashSet::new(),
+            &mut BTreeSet::new(),
         )
         .unwrap();
 

@@ -50,9 +50,8 @@ fn assert_first_walk_reuses_recovered_closure(mut store: RepresentationStore) {
     }
     assert!(
         store
-            .complete_map_subtrees
-            .iter()
-            .all(|id| !store.persisted_map_nodes.contains(id))
+            .persisted_map_nodes
+            .is_disjoint(&store.complete_map_subtrees)
     );
     assert!(metadata.is_empty());
     assert!(appended.is_empty());
