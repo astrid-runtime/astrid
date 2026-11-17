@@ -84,6 +84,53 @@ fn direct_publication_reuses_authenticated_node_identities() {
 }
 
 #[test]
+fn direct_append_retains_tight_payload_allocations() {
+    use crate::storage_model::PhysicalMapNode;
+
+    let directory = tempfile::tempdir().unwrap();
+    let volume: Arc<dyn AstridVolume> =
+        HostedFileVolume::open(directory.path().join("payload-capacity.volume")).unwrap();
+    let mut store = empty_store(&volume);
+    for ordinal in 42_u8..44 {
+        let direct = store
+            .describe_direct(
+                ObjectId::new([ordinal; 32]),
+                &[ordinal; 16],
+                ArenaLocation {
+                    offset: u64::from(ordinal),
+                    payload_len: 16,
+                    checksum: [ordinal; 32],
+                },
+            )
+            .unwrap();
+        let update = store.append_direct_update(&[direct]).unwrap().unwrap();
+        store.publish_direct_update(update).unwrap();
+    }
+    let mut payloads = 0;
+    for map in [
+        store.representations.as_canonical(),
+        store.placement_entries.as_canonical(),
+    ] {
+        for node in map.nodes().values() {
+            if let PhysicalMapNode::Page { entries, .. } = node.as_ref() {
+                for (_, value) in entries {
+                    assert_eq!(
+                        value.capacity(),
+                        value.len(),
+                        "persistent payloads must not retain encoder growth capacity"
+                    );
+                    payloads += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        payloads, 4,
+        "check both real direct-map payloads per object"
+    );
+}
+
+#[test]
 fn failed_append_does_not_promote_unwritten_closures_and_retry_reopens() {
     // This bounded metadata batch now uses header/name/payload, with no
     // fourth checksum backpatch. Fail every write before proof promotion.

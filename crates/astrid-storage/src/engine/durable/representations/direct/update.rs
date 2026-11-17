@@ -315,11 +315,19 @@ impl RepresentationStore {
             object.canonical_length,
             vec![replica],
         )?;
+        // Immutable map payloads never grow. Drop encoder spare capacity before
+        // foreground and checkpoint replay maps retain these allocations.
         Ok(DirectMapEntry {
             object: object.object,
-            representation: (PhysicalMapKey::from(record_id), record.encode()?),
+            representation: (
+                PhysicalMapKey::from(record_id),
+                record.encode()?.into_boxed_slice().into_vec(),
+            ),
             representation_id: record_id,
-            placement: (PhysicalMapKey::from(object.blob), placement.encode()?),
+            placement: (
+                PhysicalMapKey::from(object.blob),
+                placement.encode()?.into_boxed_slice().into_vec(),
+            ),
         })
     }
 
