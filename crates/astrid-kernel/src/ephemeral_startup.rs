@@ -27,13 +27,19 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn preflight_disconnect_does_not_consume_startup_grace() {
+    async fn pre_readiness_disconnect_does_not_consume_startup_grace() {
         let root = tempfile::tempdir().unwrap();
         let home = astrid_core::dirs::AstridHome::from_path(root.path());
         let kernel = crate::test_kernel_with_home(home).await;
         let principal = astrid_core::PrincipalId::new("operator").unwrap();
-        kernel.set_ephemeral(true);
+        kernel.begin_ephemeral_startup();
         let shutdown = kernel.shutdown_tx.subscribe();
+        kernel.connection_opened(&principal);
+        kernel.connection_closed(&principal);
+        assert!(
+            !*shutdown.borrow(),
+            "a status connection during cold boot must not request shutdown"
+        );
         let fallback =
             spawn_ephemeral_startup_fallback(Arc::clone(&kernel), Duration::from_millis(50));
         kernel.connection_opened(&principal);

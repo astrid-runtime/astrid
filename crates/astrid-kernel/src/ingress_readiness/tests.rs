@@ -68,11 +68,12 @@ file = "main.wasm"
         ),
     )
     .unwrap();
-    // load() spawns a deferred run worker. It cannot subscribe, so activation
-    // must fail readiness and execute the real cancel/unload cleanup path.
+    // load() spawns a deferred run worker. Returning without subscribing must
+    // fail readiness and execute the real cancel/unload cleanup path. This
+    // tests load ownership, without waiting for a CPU-bound guest's watchdog.
     let wasm = wat::parse_str(
         r#"(component
-        (core module $m (func (export "run") (loop $forever (br $forever))))
+        (core module $m (func (export "run")))
         (core instance $i (instantiate $m))
         (func (export "run") (canon lift (core func $i "run"))))"#,
     )
