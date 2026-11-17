@@ -17,6 +17,17 @@ impl EncodingSink for Vec<u8> {
     }
 }
 
+/// Counts emitted bytes without allocating canonical output.
+pub(super) struct Count {
+    len: Option<usize>,
+}
+
+impl EncodingSink for Count {
+    fn write(&mut self, bytes: &[u8]) {
+        self.len = self.len.and_then(|len| len.checked_add(bytes.len()));
+    }
+}
+
 pub(super) struct Comparison<'a> {
     remaining: Option<&'a [u8]>,
 }
@@ -71,6 +82,23 @@ impl Encoder {
             bytes: Comparison {
                 remaining: Some(bytes),
             },
+        }
+    }
+}
+
+impl Encoder<Count> {
+    pub(super) const fn counting() -> Self {
+        Self {
+            bytes: Count { len: Some(0) },
+        }
+    }
+
+    /// Counted length, or overflow when addition failed or the length cannot
+    /// be a `Vec` (`isize::MAX` addressability).
+    pub(super) fn finish_count(self) -> Result<usize, PhysicalModelError> {
+        match self.bytes.len {
+            Some(len) if isize::try_from(len).is_ok() => Ok(len),
+            _ => Err(PhysicalModelError::LengthOverflow),
         }
     }
 }

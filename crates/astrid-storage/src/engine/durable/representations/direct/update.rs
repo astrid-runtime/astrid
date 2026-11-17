@@ -299,7 +299,7 @@ impl RepresentationStore {
             None,
         )?;
         record.validate_against_profile(&Blake3PhysicalIdentity, profile)?;
-        let record_id = record.identify(&Blake3PhysicalIdentity)?;
+        let (record_bytes, record_id) = record.encode_and_identify(&Blake3PhysicalIdentity)?;
         let replica = Replica::new(
             LOCAL_STORAGE_NODE,
             ReplicaLocator::ArenaFrame {
@@ -315,19 +315,13 @@ impl RepresentationStore {
             object.canonical_length,
             vec![replica],
         )?;
-        // Immutable map payloads never grow. Drop encoder spare capacity before
-        // foreground and checkpoint replay maps retain these allocations.
+        // Keep the exactly sized canonical encoding used for the identity;
+        // immutable map payloads never need another encoding or spare capacity.
         Ok(DirectMapEntry {
             object: object.object,
-            representation: (
-                PhysicalMapKey::from(record_id),
-                record.encode()?.into_boxed_slice().into_vec(),
-            ),
+            representation: (PhysicalMapKey::from(record_id), record_bytes),
             representation_id: record_id,
-            placement: (
-                PhysicalMapKey::from(object.blob),
-                placement.encode()?.into_boxed_slice().into_vec(),
-            ),
+            placement: (PhysicalMapKey::from(object.blob), placement.encode()?),
         })
     }
 

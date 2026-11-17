@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use crate::storage_model::{BlobId, InvocationId, ObjectId};
 
 use super::PhysicalModelError;
-use super::codec::{Decoder, Encoder};
+use super::codec::{Decoder, Encoder, EncodingSink};
 use super::identity::{
     PhysicalIdentity, RepresentationProfileId, RepresentationRecordId, decode_blob_id,
     decode_object_id, decode_profile_id, decode_record_id, encode_blob_id, encode_object_id,
@@ -305,7 +305,7 @@ impl Dependency {
         }
     }
 
-    pub(super) fn encode_into(self, encoder: &mut Encoder) {
+    pub(super) fn encode_into<W: EncodingSink>(self, encoder: &mut Encoder<W>) {
         match self {
             Self::LogicalObject(object) => {
                 encoder.u8(0);

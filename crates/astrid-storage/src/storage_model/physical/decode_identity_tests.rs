@@ -80,6 +80,32 @@ fn checked_byte_identity_matches_encode_and_hash_for_profile_and_record() {
 }
 
 #[test]
+fn record_encoding_and_identity_share_one_tightly_sized_buffer() {
+    let identity = Blake3PhysicalIdentity;
+    for recipe in [
+        Recipe::DirectCanonical {
+            blob: BlobId::new([0x37; 32]),
+        },
+        Recipe::PackedSlice {
+            blob: BlobId::new([0x37; 32]),
+            offset: 3,
+            length: 64,
+        },
+    ] {
+        let original = record(RepresentationProfileId::new([0x45; 32]), recipe);
+        let expected_bytes = original.encode().unwrap();
+        let expected_identity = original.identify(&identity).unwrap();
+        super::codec::reset_encoder_finishes();
+        let (bytes, id) = original.encode_and_identify(&identity).unwrap();
+        assert_eq!(super::codec::encoder_finishes(), 1);
+        assert_eq!(bytes.capacity(), bytes.len());
+        assert_eq!(bytes, expected_bytes);
+        assert_eq!(id, expected_identity);
+        assert_eq!(RepresentationRecord::decode(&bytes).unwrap(), original);
+    }
+}
+
+#[test]
 fn shared_profile_validation_does_not_reencode_and_hash_profile_per_record() {
     let identity = ObservedIdentity {
         profile_hashes: Cell::new(0),
