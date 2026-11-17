@@ -39,6 +39,7 @@ pub struct CapsuleLoader {
     /// See [`HttpLimits`].
     http_limits: HttpLimits,
     compiled_wasm: crate::engine::wasm::CompiledWasmCache,
+    native_log_root: Option<Arc<crate::engine::wasm::NativeLogRoot>>,
     defer_background_activation: bool,
     runtime_id: Option<crate::registry::RuntimeId>,
 }
@@ -72,6 +73,7 @@ impl CapsuleLoader {
             runtime_limits,
             http_limits,
             compiled_wasm: crate::engine::wasm::CompiledWasmCache::default(),
+            native_log_root: None,
             defer_background_activation: false,
             runtime_id: None,
         }
@@ -101,6 +103,17 @@ impl CapsuleLoader {
         cache: crate::engine::wasm::CompiledWasmCache,
     ) -> Self {
         self.compiled_wasm = cache;
+        self
+    }
+
+    /// Share one already-captured native home authority with private WASM stores.
+    /// Without this service, log files retain their existing eager behavior.
+    #[must_use]
+    pub fn with_native_log_root(
+        mut self,
+        root: Option<Arc<crate::engine::wasm::NativeLogRoot>>,
+    ) -> Self {
+        self.native_log_root = root;
         self
     }
 
@@ -134,6 +147,7 @@ impl CapsuleLoader {
                     self.http_limits,
                 )
                 .with_compiled_cache(self.compiled_wasm.clone())
+                .with_native_log_root(self.native_log_root.clone())
                 .with_runtime_id(self.runtime_id.clone())
                 .with_deferred_activation(self.defer_background_activation),
             ));

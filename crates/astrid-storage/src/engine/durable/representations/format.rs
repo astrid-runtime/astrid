@@ -19,6 +19,7 @@ const BLAKE3_ALGORITHM: u16 = 1;
 const PHYSICAL_CONSTRUCTION: u16 = 2;
 const CURRENT_DIGEST_BYTES: u32 = 32;
 const TAGGED_IDENTITY_BYTES: usize = 40;
+const METADATA_PREFIX_BYTES: usize = 1 + TAGGED_IDENTITY_BYTES + 8;
 
 #[cfg(test)]
 mod tests;
@@ -85,12 +86,8 @@ impl MetadataFrame {
         identity: &I,
         value: &PhysicalMapNode,
     ) -> Result<Self, DurableError> {
-        let id = value.identify(identity)?;
-        Ok(Self::new(
-            MetadataKind::MapNode,
-            *id.as_bytes(),
-            value.encode()?,
-        ))
+        let (bytes, id) = value.encode_and_identify(identity)?;
+        Ok(Self::new(MetadataKind::MapNode, *id.as_bytes(), bytes))
     }
 
     pub(super) fn catalogue<I: PhysicalIdentity>(
@@ -122,22 +119,33 @@ impl MetadataFrame {
 
 impl<V: AsRef<[u8]>> MetadataFrame<V> {
     pub(super) fn encode(&self) -> Result<Vec<u8>, DurableError> {
-        let value_len =
-            u64::try_from(self.value.as_ref().len()).map_err(|_| DurableError::EncodingOverflow)?;
+        let (prefix, value) = self.encoded_parts()?;
         let mut bytes = Vec::new();
-        let capacity = 1_usize
-            .checked_add(TAGGED_IDENTITY_BYTES)
-            .and_then(|total| total.checked_add(8))
-            .and_then(|total| total.checked_add(self.value.as_ref().len()))
+        let capacity = prefix
+            .len()
+            .checked_add(value.len())
             .ok_or(DurableError::EncodingOverflow)?;
         bytes
             .try_reserve_exact(capacity)
             .map_err(|_| DurableError::EncodingOverflow)?;
-        bytes.push(self.kind.code());
-        encode_physical_identity(&mut bytes, &self.identity);
-        bytes.extend_from_slice(&value_len.to_le_bytes());
-        bytes.extend_from_slice(self.value.as_ref());
+        bytes.extend_from_slice(&prefix);
+        bytes.extend_from_slice(value);
         Ok(bytes)
+    }
+
+    /// One authoritative outer-frame encoding, available as borrowed parts so
+    /// a streamed checkpoint need not copy the already encoded map-node body.
+    pub(super) fn encoded_parts(
+        &self,
+    ) -> Result<([u8; METADATA_PREFIX_BYTES], &[u8]), DurableError> {
+        let value = self.value.as_ref();
+        let value_len = u64::try_from(value.len()).map_err(|_| DurableError::EncodingOverflow)?;
+        let mut prefix = [0_u8; METADATA_PREFIX_BYTES];
+        prefix[0] = self.kind.code();
+        let identity_end = 1 + TAGGED_IDENTITY_BYTES;
+        prefix[1..identity_end].copy_from_slice(&physical_identity_bytes(&self.identity));
+        prefix[identity_end..].copy_from_slice(&value_len.to_le_bytes());
+        Ok((prefix, value))
     }
 
     pub(super) fn verify<I: PhysicalIdentity>(&self, identity: &I) -> Result<(), DurableError> {
@@ -306,27 +314,14 @@ impl JournalEntry {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(in crate::engine::durable) struct Blake3PhysicalIdentity;
+pub(in crate::engine::durable) use crate::storage_model::physical::Blake3PhysicalIdentity;
 
-impl PhysicalIdentity for Blake3PhysicalIdentity {
-    fn identify(&self, context: &'static str, material: &[u8]) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new_derive_key(context);
-        hasher.update(material);
-        *hasher.finalize().as_bytes()
-    }
+/// Frozen BLAKE3 derive-key context for raw representation journal bytes.
+pub(super) const JOURNAL_BYTES_DIGEST_CONTEXT: &str = "astrid-representation-journal-bytes-v1\0";
 
-    fn identify_parts(&self, context: &'static str, parts: &[&[u8]]) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new_derive_key(context);
-        for part in parts {
-            hasher.update(part);
-        }
-        *hasher.finalize().as_bytes()
-    }
-}
-
+#[cfg(test)]
 pub(super) fn journal_digest(bytes: &[u8]) -> [u8; 32] {
-    Blake3PhysicalIdentity.identify("astrid-representation-journal-bytes-v1\0", bytes)
+    Blake3PhysicalIdentity.identify(JOURNAL_BYTES_DIGEST_CONTEXT, bytes)
 }
 
 pub(super) fn map_node_id(bytes: [u8; 32]) -> PhysicalMapNodeId {
@@ -334,10 +329,16 @@ pub(super) fn map_node_id(bytes: [u8; 32]) -> PhysicalMapNodeId {
 }
 
 fn encode_physical_identity(bytes: &mut Vec<u8>, digest: &[u8; 32]) {
-    bytes.extend_from_slice(&BLAKE3_ALGORITHM.to_le_bytes());
-    bytes.extend_from_slice(&PHYSICAL_CONSTRUCTION.to_le_bytes());
-    bytes.extend_from_slice(&CURRENT_DIGEST_BYTES.to_le_bytes());
-    bytes.extend_from_slice(digest);
+    bytes.extend_from_slice(&physical_identity_bytes(digest));
+}
+
+fn physical_identity_bytes(digest: &[u8; 32]) -> [u8; TAGGED_IDENTITY_BYTES] {
+    let mut bytes = [0_u8; TAGGED_IDENTITY_BYTES];
+    bytes[..2].copy_from_slice(&BLAKE3_ALGORITHM.to_le_bytes());
+    bytes[2..4].copy_from_slice(&PHYSICAL_CONSTRUCTION.to_le_bytes());
+    bytes[4..8].copy_from_slice(&CURRENT_DIGEST_BYTES.to_le_bytes());
+    bytes[8..].copy_from_slice(digest);
+    bytes
 }
 
 fn encode_optional_state(bytes: &mut Vec<u8>, value: Option<RepresentationStateId>) {

@@ -4,12 +4,36 @@
 //! independent of whichever media provider owns the bytes.
 
 use std::fs::File as NativeFile;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
 use crate::volume::{AstridVolume, VolumeFile, VolumeMetadata, VolumeRegion};
 
 use super::DurableError;
+
+// I/O coalescing only; neither frame sizes nor retained history depend on it.
+pub(in crate::engine::durable) const STREAM_WRITE_BUFFER_BYTES: usize = 64 * 1024;
+
+fn write_from_buffered(
+    destination: &mut (impl Write + ?Sized),
+    payload_len: u64,
+    payload: &mut dyn Read,
+) -> io::Result<()> {
+    let mut writer = BufWriter::with_capacity(STREAM_WRITE_BUFFER_BYTES, destination);
+    let copied = io::copy(&mut payload.take(payload_len), &mut writer)?;
+    if copied != payload_len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short durable stream",
+        ));
+    }
+    // Drain only the coalescing buffer. The caller still owns the final flush
+    // and its media-specific durability boundary.
+    writer
+        .into_inner()
+        .map(|_| ())
+        .map_err(io::IntoInnerError::into_error)
+}
 
 #[derive(Debug)]
 pub(in crate::engine::durable) enum StoreLock {
@@ -40,6 +64,11 @@ pub(in crate::engine::durable) trait DurableIo:
     fn durable_set_len(&self, length: u64) -> io::Result<()>;
     fn durable_sync_data(&self) -> io::Result<()>;
     fn durable_read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize>;
+
+    /// Emit exactly the known-length stream, without performing the final flush.
+    fn durable_write_from(&mut self, payload_len: u64, payload: &mut dyn Read) -> io::Result<()> {
+        write_from_buffered(self, payload_len, payload)
+    }
 
     /// Whether positional reads leave the sequential cursor unchanged.
     /// Unknown providers conservatively require cursor preservation.
@@ -137,6 +166,13 @@ impl std::io::Write for File {
         }
     }
 
+    fn write_vectored(&mut self, slices: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        match self {
+            Self::Native(file) => file.write_vectored(slices),
+            Self::Volume(file) => file.write_vectored(slices),
+        }
+    }
+
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::Native(file) => file.flush(),
@@ -155,6 +191,13 @@ impl std::io::Seek for File {
 }
 
 impl DurableIo for File {
+    fn durable_write_from(&mut self, payload_len: u64, payload: &mut dyn Read) -> io::Result<()> {
+        match self {
+            Self::Native(file) => write_from_buffered(file, payload_len, payload),
+            Self::Volume(file) => file.write_from(payload_len, payload),
+        }
+    }
+
     fn durable_read_at_preserves_cursor(&self) -> bool {
         match self {
             Self::Native(_) => cfg!(unix),

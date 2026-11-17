@@ -11,6 +11,12 @@ use super::path::{
 };
 use super::prelude::*;
 
+#[path = "io/append.rs"]
+mod append;
+#[cfg(test)]
+pub(super) use append::TEST_APPLY_PRIVATE_ACL_COUNT;
+pub(super) use append::open_guarded_private_append;
+
 #[derive(Clone, Copy)]
 pub(super) enum FileContract {
     Trusted,
@@ -65,7 +71,7 @@ pub(super) fn acquire_named_private_lock(
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             let name = guarded_child_name(guard, path)?;
             let handle = open_guarded_child_with_options(
-                guard,
+                guard.authority_handle(),
                 name,
                 GENERIC_READ | GENERIC_WRITE | READ_CONTROL,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -413,6 +419,29 @@ pub(super) fn remove_guarded_file(guard: &TrustedPathGuard, path: &Path) -> io::
     })
 }
 
+/// Validate a leaf contract and mark deletion on the same open handle.
+///
+/// Used when a prior read-only open would exclude `DELETE` sharing and make a
+/// second delete open fail with a sharing violation.
+pub(super) fn remove_guarded_file_with_contract(
+    guard: &TrustedPathGuard,
+    path: &Path,
+    file_contract: FileContract,
+) -> io::Result<()> {
+    let name = guarded_child_name(guard, path)?;
+    let handle = open_guarded_child(guard, name, DELETE | GENERIC_READ | READ_CONTROL)?;
+    validate_file_contract(handle.0, path, file_contract)?;
+    mark_handle_for_deletion(handle.0).map_err(|error| {
+        with_context(
+            error,
+            format!(
+                "could not mark handle-relative file for deletion: {}",
+                path.display()
+            ),
+        )
+    })
+}
+
 pub(super) fn guarded_file_exists(guard: &TrustedPathGuard, path: &Path) -> io::Result<bool> {
     let name = guarded_child_name(guard, path)?;
     match open_guarded_child(guard, name, FILE_READ_ATTRIBUTES) {
@@ -514,6 +543,22 @@ pub(super) fn rename_guarded_handle(
     replace: bool,
 ) -> io::Result<()> {
     let destination_name = guarded_child_name(guard, destination)?;
+    rename_by_parent_handle(source, guard.authority_handle(), destination_name, replace)
+}
+
+/// Handle-relative NT rename against an already-opened destination parent.
+pub(super) fn rename_by_parent_handle(
+    source: &impl AsRawHandle,
+    destination_parent: HANDLE,
+    destination_name: &OsStr,
+    replace: bool,
+) -> io::Result<()> {
+    if destination_name.is_empty() || destination_name.encode_wide().any(|unit| unit == 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid handle-relative Windows rename destination name",
+        ));
+    }
     let destination_wide = destination_name.encode_wide().collect::<Vec<_>>();
     let name_bytes = destination_wide
         .len()
@@ -543,7 +588,7 @@ pub(super) fn rename_guarded_handle(
         } else {
             (*info).Anonymous.ReplaceIfExists = false;
         }
-        (*info).RootDirectory = guard.authority_handle();
+        (*info).RootDirectory = destination_parent;
         (*info).FileNameLength = name_bytes;
         std::ptr::copy_nonoverlapping(
             destination_wide.as_ptr(),
@@ -574,6 +619,81 @@ pub(super) fn rename_guarded_handle(
     Ok(())
 }
 
+/// Mutation-specific regular-file open for exclusive rename.
+pub(super) fn open_relative_file_for_exclusive_rename(
+    parent: HANDLE,
+    name: &OsStr,
+) -> io::Result<File> {
+    let mut name_wide = name.encode_wide().collect::<Vec<_>>();
+    if name_wide.is_empty() || name_wide.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid handle-relative Windows file name",
+        ));
+    }
+    let byte_length = name_wide
+        .len()
+        .checked_mul(size_of::<u16>())
+        .and_then(|length| u16::try_from(length).ok())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Windows file name is too long")
+        })?;
+    let unicode = UNICODE_STRING {
+        Length: byte_length,
+        MaximumLength: byte_length,
+        Buffer: name_wide.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: u32::try_from(size_of::<OBJECT_ATTRIBUTES>()).expect("OBJECT_ATTRIBUTES fits u32"),
+        RootDirectory: parent,
+        ObjectName: &raw const unicode,
+        Attributes: 0x40, // OBJ_CASE_INSENSITIVE
+        SecurityDescriptor: null(),
+        SecurityQualityOfService: null(),
+    };
+    let mut handle = null_mut();
+    let mut status = IO_STATUS_BLOCK::default();
+    // SAFETY: parent/name buffers live for the call; OPEN_REPARSE_POINT avoids follow.
+    let result = unsafe {
+        NtCreateFile(
+            &raw mut handle,
+            DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            &raw const attributes,
+            &raw mut status,
+            null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            null(),
+            0,
+        )
+    };
+    if result < 0 {
+        let code = unsafe { RtlNtStatusToDosError(result) };
+        return Err(io::Error::from_raw_os_error(code.cast_signed()));
+    }
+    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        return Err(io::Error::other(
+            "NtCreateFile returned an invalid relative rename source handle",
+        ));
+    }
+    let owned = OwnedHandle(handle);
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(owned.0, &raw mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "exclusive rename source is redirected or not a regular file",
+        ));
+    }
+    let raw = owned.0;
+    std::mem::forget(owned);
+    Ok(unsafe { File::from_raw_handle(raw.cast()) })
+}
+
 fn guarded_child_name<'a>(guard: &TrustedPathGuard, path: &'a Path) -> io::Result<&'a OsStr> {
     if path.parent() != Some(guard.authority_boundary()) {
         return Err(io::Error::new(
@@ -599,7 +719,7 @@ fn open_guarded_child(
     desired_access: u32,
 ) -> io::Result<OwnedHandle> {
     open_guarded_child_with_options(
-        guard,
+        guard.authority_handle(),
         name,
         desired_access,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -612,10 +732,19 @@ fn open_guarded_child_locked(
     name: &OsStr,
     desired_access: u32,
 ) -> io::Result<OwnedHandle> {
-    open_guarded_child_with_options(guard, name, desired_access, FILE_SHARE_READ, FILE_OPEN)
+    open_guarded_child_with_options(
+        guard.authority_handle(),
+        name,
+        desired_access,
+        FILE_SHARE_READ,
+        FILE_OPEN,
+    )
 }
 
-fn create_guarded_private_file(guard: &TrustedPathGuard, path: &Path) -> io::Result<File> {
+pub(in crate::platform_fs::windows) fn create_guarded_private_file(
+    guard: &TrustedPathGuard,
+    path: &Path,
+) -> io::Result<File> {
     create_guarded_private_file_with_share(guard, path, FILE_SHARE_READ)
 }
 
@@ -625,14 +754,22 @@ fn create_guarded_private_file_with_share(
     share_access: u32,
 ) -> io::Result<File> {
     let name = guarded_child_name(guard, path)?;
+    create_private_relative_file(guard.authority_handle(), name, share_access)
+}
+
+pub(super) fn create_private_relative_file(
+    parent: HANDLE,
+    name: &OsStr,
+    share_access: u32,
+) -> io::Result<File> {
     let handle = open_guarded_child_with_options(
-        guard,
+        parent,
         name,
         GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC | DELETE,
         share_access,
         FILE_CREATE,
     )?;
-    if let Err(error) = validate_private_acl_handle(handle.0, false, &path.display().to_string()) {
+    if let Err(error) = validate_private_acl_handle(handle.0, false, &name.to_string_lossy()) {
         let _ = mark_file_for_deletion(handle.0);
         return Err(error);
     }
@@ -640,6 +777,55 @@ fn create_guarded_private_file_with_share(
     std::mem::forget(handle);
     // SAFETY: ownership transfers from the forgotten OwnedHandle exactly once.
     Ok(unsafe { File::from_raw_handle(raw.cast()) })
+}
+
+/// Create a new private regular file with the `ExactPrivate` ACL at birth.
+///
+/// Captures the parent as [`TrustedPathGuard`] and creates the child through
+/// [`create_guarded_private_file`], which applies the private ACL at `FILE_CREATE`,
+/// rejects redirects/non-regular types on that handle, and validates `ExactPrivate`
+/// before transferring the live read/write `File` (`FILE_SHARE_READ`). This
+/// function then re-verifies the retained parent `ExactPrivate` contract. Callers
+/// keep the returned handle without a path-based restrict/validate reopen that
+/// would share-conflict with the writer.
+///
+/// # Errors
+///
+/// Returns an error if the parent is missing, redirected, or not `ExactPrivate`;
+/// if the path already exists; if creation, type, or ACL validation fails; or if
+/// the parent contract fails after create. Failed parent postchecks mark the
+/// created handle for deletion before returning.
+pub fn create_new_private_file(path: &Path) -> io::Result<File> {
+    create_private_file_with_sharing(path, FILE_SHARE_READ)
+}
+
+/// Create private media whose owner supplies cross-process locking.
+///
+/// The ACL, captured parent and no-overwrite birth checks match
+/// [`create_new_private_file`]. Read/write/delete sharing permits identity
+/// probes and rename while the caller retains its exclusive file lock.
+/// This function does not acquire that lock; callers must do so before use.
+///
+/// # Errors
+/// Returns the same birth and parent-contract errors as
+/// [`create_new_private_file`]. Existing files are never repaired or replaced.
+pub fn create_new_private_file_shared(path: &Path) -> io::Result<File> {
+    create_private_file_with_sharing(path, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+}
+
+fn create_private_file_with_sharing(path: &Path, sharing: u32) -> io::Result<File> {
+    super::path::validate_local_absolute_path(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "private file has no parent"))?;
+    let guard = TrustedPathGuard::capture(parent)?;
+    guard.verify_contract(BoundaryContract::ExactPrivateDirectory)?;
+    let file = create_guarded_private_file_with_share(&guard, path, sharing)?;
+    if let Err(error) = guard.verify_contract(BoundaryContract::ExactPrivateDirectory) {
+        let _ = mark_file_for_deletion(file.as_raw_handle().cast());
+        return Err(error);
+    }
+    Ok(file)
 }
 
 pub(super) fn restrict_guarded_private_file(
@@ -681,7 +867,7 @@ impl Drop for DeleteCreatedFileOnDrop {
 }
 
 fn open_guarded_child_with_options(
-    guard: &TrustedPathGuard,
+    parent: HANDLE,
     name: &OsStr,
     desired_access: u32,
     share_access: u32,
@@ -714,7 +900,7 @@ fn open_guarded_child_with_options(
     let attributes = OBJECT_ATTRIBUTES {
         Length: u32::try_from(size_of::<OBJECT_ATTRIBUTES>())
             .expect("OBJECT_ATTRIBUTES fits in u32"),
-        RootDirectory: guard.authority_handle(),
+        RootDirectory: parent,
         ObjectName: &raw const unicode,
         Attributes: 0x40, // OBJ_CASE_INSENSITIVE
         SecurityDescriptor: security_descriptor

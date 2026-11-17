@@ -13,6 +13,12 @@ use super::{ContainerState, HostedFileVolume, VOLUME_MAGIC, reclaim, recover};
 
 type SharedOpenReclaimLock = Mutex<()>;
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum OpenMode {
+    Ordinary,
+    ExistingCanonical,
+}
+
 static OPEN_LOCKS: OnceLock<RwLock<BTreeMap<PathBuf, Weak<SharedOpenReclaimLock>>>> =
     OnceLock::new();
 
@@ -68,19 +74,108 @@ impl HostedFileVolume {
     /// checkpoints additionally verify every referenced immutable metadata
     /// page with bounded working memory before exposing the namespace.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Arc<Self>> {
+        Self::open_with_retained(
+            path,
+            OpenMode::Ordinary,
+            #[cfg(windows)]
+            None,
+        )
+    }
+
+    /// Open a volume file under an already-admitted Windows runtime root.
+    ///
+    /// `path` must be a direct child of the retained root (root-level media).
+    /// Recovery/reclaim algorithms match [`Self::open`].
+    #[cfg(windows)]
+    pub(crate) fn open_runtime(
+        retained_root: std::sync::Arc<
+            astrid_core::platform_fs::directory_capability::RetainedPrivateRoot,
+        >,
+        path: impl AsRef<Path>,
+    ) -> io::Result<Arc<Self>> {
+        let path = std::path::absolute(path.as_ref())?;
+        if path.parent() != Some(retained_root.path()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Astrid volume path is outside the admitted runtime root",
+            ));
+        }
+        Self::open_with_retained(path, OpenMode::Ordinary, Some(retained_root))
+    }
+
+    /// Recover only the named, already-existing canonical inode.
+    ///
+    /// Unlike ordinary open this cannot create media or promote/clean swap
+    /// artifacts. Physical container recovery remains shared; logical authority
+    /// must be authenticated by the caller before ordinary assembly begins.
+    pub(crate) fn open_existing_canonical(
+        path: impl AsRef<Path>,
+        #[cfg(windows)] retained_root: std::sync::Arc<
+            astrid_core::platform_fs::directory_capability::RetainedPrivateRoot,
+        >,
+    ) -> io::Result<Arc<Self>> {
+        Self::open_with_retained(
+            path,
+            OpenMode::ExistingCanonical,
+            #[cfg(windows)]
+            Some(retained_root),
+        )
+    }
+
+    /// Release obsolete swap artifacts after recovery authority is accepted.
+    pub(crate) fn finish_canonical_recovery(&self) -> io::Result<()> {
+        let _guard = self.open_lock.lock();
+        require_current(&self.state.lock().file, &self.path)?;
+        reclaim::cleanup_artifacts(&self.path)
+    }
+
+    fn open_with_retained(
+        path: impl AsRef<Path>,
+        mode: OpenMode,
+        #[cfg(windows)] retained_root: Option<
+            std::sync::Arc<astrid_core::platform_fs::directory_capability::RetainedPrivateRoot>,
+        >,
+    ) -> io::Result<Arc<Self>> {
         // Capture relative-path ownership once; later sync and reclaim must
         // still target this volume if the process changes its directory.
         let path = std::path::absolute(path.as_ref())?;
-        if let Some(parent) = path.parent() {
+        let existing_only = mode == OpenMode::ExistingCanonical;
+        #[cfg(windows)]
+        if let Some(root) = &retained_root
+            && path.parent() != Some(root.path())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Astrid volume path is outside the admitted runtime root",
+            ));
+        }
+        #[cfg(windows)]
+        let runtime_private = retained_root.is_some();
+        #[cfg(not(windows))]
+        let create_parent = true;
+        #[cfg(windows)]
+        let create_parent = !runtime_private;
+        if !existing_only
+            && create_parent
+            && let Some(parent) = path.parent()
+        {
             std::fs::create_dir_all(parent)?;
         }
         let open_lock = OpenReclaimLock::for_path(&path)?;
         let swap_guard = open_lock.lock();
-        let mut file = reclaim::recover_artifacts(&path)?;
-        // A descriptor opened before replacement may acquire the retired
-        // inode lock after publication. It must never become a writer.
-        require_current(&file, &path)?;
+        let mut file = open_locked_media(
+            &path,
+            mode,
+            #[cfg(windows)]
+            runtime_private,
+        )?;
         let length = file.metadata()?.len();
+        if length == 0 && existing_only {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "existing Astrid volume is empty",
+            ));
+        }
         if length == 0 {
             file.write_all(&VOLUME_MAGIC)?;
             file.sync_all()?;
@@ -112,7 +207,7 @@ impl HostedFileVolume {
             boundary_pending: false,
             footer_pending,
             physical_tail: if recovery.footer_present {
-                super::PhysicalTail::MayExceed
+                super::PhysicalTail::Footer
             } else {
                 super::PhysicalTail::Exact
             },
@@ -130,17 +225,72 @@ impl HostedFileVolume {
             // can use the footer even when no caller performs an explicit sync.
             HostedFileVolume::make_durable(&mut state)?;
         }
-        reclaim::cleanup_artifacts(&path)?;
+        if !existing_only {
+            reclaim::cleanup_artifacts(&path)?;
+        }
         drop(swap_guard);
         Ok(Arc::new(Self {
             path,
             open_lock,
             state: Mutex::new(state),
+            #[cfg(windows)]
+            retained_root,
         }))
     }
 }
 
-pub(super) fn open_regular(path: &Path, create: bool) -> io::Result<std::fs::File> {
+fn open_locked_media(
+    path: &Path,
+    mode: OpenMode,
+    #[cfg(windows)] runtime_private: bool,
+) -> io::Result<std::fs::File> {
+    let file = match mode {
+        OpenMode::ExistingCanonical => {
+            astrid_core::platform_fs::validate_private_file(path)?;
+            let file = open_regular(
+                path,
+                false,
+                #[cfg(windows)]
+                runtime_private,
+            )?;
+            reclaim::lock_active(&file)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                let metadata = file.metadata()?;
+                if metadata.uid() != nix::unistd::getuid().as_raw()
+                    || metadata.mode() & 0o777 != 0o600
+                    || metadata.nlink() != 1
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "existing canonical volume handle is not private single-link media",
+                    ));
+                }
+            }
+            file
+        },
+        OpenMode::Ordinary => reclaim::recover_artifacts(
+            path,
+            #[cfg(windows)]
+            runtime_private,
+        )?,
+    };
+    // A descriptor opened before replacement may acquire the retired inode
+    // lock after publication. It must never become a writer.
+    require_current(&file, path)?;
+    Ok(file)
+}
+
+pub(super) fn open_regular(
+    path: &Path,
+    create: bool,
+    #[cfg(windows)] runtime_private: bool,
+) -> io::Result<std::fs::File> {
+    #[cfg(windows)]
+    if runtime_private {
+        return open_private_regular(path, create);
+    }
     let mut options = OpenOptions::new();
     options.read(true).write(true).create_new(create);
     #[cfg(unix)]
@@ -160,7 +310,12 @@ pub(super) fn open_regular(path: &Path, create: bool) -> io::Result<std::fs::Fil
         // Open its inode without creation and let the common lock/identity
         // checks decide ownership. Never truncate or retry creation.
         Err(error) if create && error.kind() == io::ErrorKind::AlreadyExists => {
-            return open_regular(path, false);
+            return open_regular(
+                path,
+                false,
+                #[cfg(windows)]
+                false,
+            );
         },
         Err(error) => return Err(error),
     };
@@ -174,7 +329,12 @@ pub(super) fn open_regular(path: &Path, create: bool) -> io::Result<std::fs::Fil
 }
 
 pub(super) fn require_current(file: &std::fs::File, path: &Path) -> io::Result<()> {
-    let current = open_regular(path, false)?;
+    let current = open_regular(
+        path,
+        false,
+        #[cfg(windows)]
+        false,
+    )?;
     if same_file::Handle::from_file(file.try_clone()?)? != same_file::Handle::from_file(current)? {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
@@ -182,4 +342,20 @@ pub(super) fn require_current(file: &std::fs::File, path: &Path) -> io::Result<(
         ));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn open_private_regular(path: &Path, create: bool) -> io::Result<std::fs::File> {
+    if create {
+        match astrid_core::platform_fs::create_new_private_file_shared(path) {
+            Ok(file) => return Ok(file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
+            Err(error) => return Err(error),
+        }
+    }
+    // Validate the opened inode itself. Never repair an untrusted existing
+    // volume, or close/reopen a new inode to change its sharing contract.
+    let file = open_regular(path, false, false)?;
+    astrid_core::platform_fs::validate_private_file_handle(&file)?;
+    Ok(file)
 }

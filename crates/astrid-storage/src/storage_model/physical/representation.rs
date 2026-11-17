@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use crate::storage_model::{BlobId, InvocationId, ObjectId};
 
 use super::PhysicalModelError;
-use super::codec::{Decoder, Encoder};
+use super::codec::{Decoder, Encoder, EncodingSink};
 use super::identity::{
     PhysicalIdentity, RepresentationProfileId, RepresentationRecordId, decode_blob_id,
     decode_object_id, decode_profile_id, encode_blob_id, encode_object_id, encode_profile_id,
@@ -13,6 +13,7 @@ use super::identity::{
 use super::profile::{Dependency, ProfileKind, RepresentationProfile};
 
 const REPRESENTATION_VERSION: u16 = 1;
+const REPRESENTATION_IDENTITY_CONTEXT: &str = "astrid-representation-record-v1\0";
 
 /// Exact logical records recoverable from one physical representation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,7 +61,7 @@ impl Coverage {
         Ok(())
     }
 
-    fn encode_into(&self, encoder: &mut Encoder) {
+    fn encode_into<W: EncodingSink>(&self, encoder: &mut Encoder<W>) {
         match self {
             Self::Exact {
                 object,
@@ -124,7 +125,7 @@ pub enum Recipe {
 }
 
 impl Recipe {
-    fn encode_into(&self, encoder: &mut Encoder) {
+    fn encode_into<W: EncodingSink>(&self, encoder: &mut Encoder<W>) {
         match self {
             Self::DirectCanonical { blob } => {
                 encoder.u8(0);
@@ -305,7 +306,22 @@ impl RepresentationRecord {
         identity: &I,
         profile: &RepresentationProfile,
     ) -> Result<(), PhysicalModelError> {
-        if profile.identify(identity)? != self.profile {
+        self.validate_profile_identity(profile, profile.identify(identity)?)
+    }
+
+    pub(crate) fn validate_against_identified_profile(
+        &self,
+        profile: &super::profile::IdentifiedProfile,
+    ) -> Result<(), PhysicalModelError> {
+        self.validate_profile_identity(profile.profile(), profile.identity())
+    }
+
+    fn validate_profile_identity(
+        &self,
+        profile: &RepresentationProfile,
+        profile_identity: RepresentationProfileId,
+    ) -> Result<(), PhysicalModelError> {
+        if profile_identity != self.profile {
             return Err(PhysicalModelError::InvalidProfile(
                 "record names a different profile identity",
             ));
@@ -374,19 +390,42 @@ impl RepresentationRecord {
         dependencies: &[Dependency],
         verification_evidence: Option<ObjectId>,
     ) -> Result<Vec<u8>, PhysicalModelError> {
-        let mut encoder = Encoder::new();
+        let mut count = Encoder::counting();
+        self.write_fields(&mut count, dependencies, verification_evidence)?;
+        let mut encoder = Encoder::with_cleared_buffer(Vec::with_capacity(count.finish_count()?));
+        self.write_fields(&mut encoder, dependencies, verification_evidence)?;
+        Ok(encoder.finish())
+    }
+
+    fn write_fields<W: EncodingSink>(
+        &self,
+        encoder: &mut Encoder<W>,
+        dependencies: &[Dependency],
+        verification_evidence: Option<ObjectId>,
+    ) -> Result<(), PhysicalModelError> {
         encoder.u16(REPRESENTATION_VERSION);
-        encode_profile_id(&mut encoder, self.profile);
-        self.coverage.encode_into(&mut encoder);
-        self.recipe.encode_into(&mut encoder);
+        encode_profile_id(encoder, self.profile);
+        self.coverage.encode_into(encoder);
+        self.recipe.encode_into(encoder);
         encoder.count(dependencies.len())?;
         for dependency in dependencies {
-            dependency.encode_into(&mut encoder);
+            dependency.encode_into(encoder);
         }
         encoder.u64(self.canonical_output_bytes);
         encoder.u64(self.maximum_reconstruction_bytes);
-        encode_optional_object(&mut encoder, verification_evidence);
-        Ok(encoder.finish())
+        encode_optional_object(encoder, verification_evidence);
+        Ok(())
+    }
+
+    /// Encode once and hash those exact canonical bytes.
+    pub(crate) fn encode_and_identify<I: PhysicalIdentity>(
+        &self,
+        identity: &I,
+    ) -> Result<(Vec<u8>, RepresentationRecordId), PhysicalModelError> {
+        let bytes = self.encode()?;
+        let id =
+            RepresentationRecordId::new(identity.identify(REPRESENTATION_IDENTITY_CONTEXT, &bytes));
+        Ok((bytes, id))
     }
 
     /// Decode one byte-exact canonical format-one representation record.
@@ -442,6 +481,18 @@ impl RepresentationRecord {
         Ok(record)
     }
 
+    /// Retain all canonical decode checks, then hash the exact checked input
+    /// rather than allocating another encoding solely to derive its identity.
+    pub(crate) fn decode_and_identify<I: PhysicalIdentity>(
+        identity: &I,
+        bytes: &[u8],
+    ) -> Result<(Self, RepresentationRecordId), PhysicalModelError> {
+        let record = Self::decode(bytes)?;
+        let id =
+            RepresentationRecordId::new(identity.identify(REPRESENTATION_IDENTITY_CONTEXT, bytes));
+        Ok((record, id))
+    }
+
     /// Derive this record's domain-separated physical identity.
     ///
     /// # Errors
@@ -452,14 +503,11 @@ impl RepresentationRecord {
         &self,
         identity: &I,
     ) -> Result<RepresentationRecordId, PhysicalModelError> {
-        Ok(RepresentationRecordId::new(identity.identify(
-            "astrid-representation-record-v1\0",
-            &self.encode()?,
-        )))
+        Ok(self.encode_and_identify(identity)?.1)
     }
 }
 
-fn encode_optional_object(encoder: &mut Encoder, value: Option<ObjectId>) {
+fn encode_optional_object<W: EncodingSink>(encoder: &mut Encoder<W>, value: Option<ObjectId>) {
     match value {
         Some(value) => {
             encoder.u8(1);

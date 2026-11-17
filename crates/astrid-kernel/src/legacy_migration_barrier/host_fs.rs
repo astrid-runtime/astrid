@@ -268,24 +268,38 @@ pub(super) fn collect_workspace_targets(root: &Path) -> io::Result<Vec<PathBuf>>
 /// check runs before stores open, so a canonical but invented component list
 /// cannot authorize the legacy layout finalizer.
 pub(super) fn require_layout_provenance(migrations: &Path, fresh_layout: bool) -> io::Result<()> {
-    if fresh_layout {
-        return Ok(());
+    if let Some(path) = missing_layout_provenance(migrations, fresh_layout)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "layout-two ledger has no durable cutover record: {}",
+                path.display()
+            ),
+        ));
     }
+    Ok(())
+}
+
+/// Validate every present record while distinguishing a missing projection
+/// from a malformed record. Neither case grants recovery authority by itself.
+pub(super) fn missing_layout_provenance(
+    migrations: &Path,
+    fresh_layout: bool,
+) -> io::Result<Option<PathBuf>> {
+    if fresh_layout {
+        return Ok(None);
+    }
+    let mut missing = None;
     for name in ["layout-v1-to-v2.intent", "layout-v1-to-v2.complete"] {
         let path = migrations.join(name);
-        let metadata = fs::symlink_metadata(&path).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "layout-two ledger has no durable cutover record: {}",
-                        path.display()
-                    ),
-                )
-            } else {
-                error
-            }
-        })?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.get_or_insert(path);
+                continue;
+            },
+            Err(error) => return Err(error),
+        };
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -304,7 +318,7 @@ pub(super) fn require_layout_provenance(migrations: &Path, fresh_layout: bool) -
             ));
         }
     }
-    Ok(())
+    Ok(missing)
 }
 
 /// Validate the released audit-source boundary on every native host.  Unix

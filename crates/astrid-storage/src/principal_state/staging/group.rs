@@ -54,12 +54,17 @@ impl NativeContentStagingArea {
         reached: Arc<std::sync::Barrier>,
         release: Arc<std::sync::Barrier>,
     ) {
-        self.inner.seal_group.lock().drain_gate = Some((reached, release));
+        self.acquire_open()
+            .expect("open staging")
+            .seal_group
+            .lock()
+            .drain_gate = Some((reached, release));
     }
 
     #[cfg(test)]
     pub(super) fn queued_seal_count(&self) -> usize {
-        self.inner.seal_group.lock().queue.len()
+        self.acquire_open()
+            .map_or(0, |inner| inner.seal_group.lock().queue.len())
     }
 
     pub(super) fn submit_seal(
@@ -68,9 +73,12 @@ impl NativeContentStagingArea {
         path: PathBuf,
         source_identity: PrivateFileIdentity,
     ) -> StorageResult<ReadyStagedContent> {
+        // Leader and each waiter hold an open lease until their receipt completes,
+        // so reserve_for_close cannot race an in-flight seal group.
+        let lease = self.acquire_open()?;
         let receipt = Arc::new(SealReceipt::default());
         let mut lead = {
-            let mut group = self.inner.seal_group.lock();
+            let mut group = lease.seal_group.lock();
             group.queue.push_back(QueuedSeal {
                 intent,
                 path,
@@ -86,7 +94,7 @@ impl NativeContentStagingArea {
         };
         loop {
             if lead {
-                self.run_one_seal_group();
+                self.run_one_seal_group(&lease);
             }
             match receipt.wait() {
                 SealReceiptAction::Lead => lead = true,
@@ -95,26 +103,26 @@ impl NativeContentStagingArea {
         }
     }
 
-    fn run_one_seal_group(&self) {
-        if !self.inner.group_policy.initial_delay().is_zero() {
-            std::thread::sleep(self.inner.group_policy.initial_delay());
+    fn run_one_seal_group(&self, inner: &Arc<super::StagingInner>) {
+        if !inner.group_policy.initial_delay().is_zero() {
+            std::thread::sleep(inner.group_policy.initial_delay());
         }
-        let busy = self.inner.seal_group.lock().queue.len() > 1;
-        if busy && !self.inner.group_policy.busy_extension().is_zero() {
-            std::thread::sleep(self.inner.group_policy.busy_extension());
+        let busy = inner.seal_group.lock().queue.len() > 1;
+        if busy && !inner.group_policy.busy_extension().is_zero() {
+            std::thread::sleep(inner.group_policy.busy_extension());
         }
         #[cfg(test)]
-        let drain_gate = { self.inner.seal_group.lock().drain_gate.take() };
+        let drain_gate = { inner.seal_group.lock().drain_gate.take() };
         #[cfg(test)]
         if let Some((reached, release)) = drain_gate {
             reached.wait();
             release.wait();
         }
-        let batch: Vec<_> = self.inner.seal_group.lock().queue.drain(..).collect();
-        self.process_seal_group(batch);
+        let batch: Vec<_> = inner.seal_group.lock().queue.drain(..).collect();
+        self.process_seal_group(inner, batch);
 
         let next_leader = {
-            let mut group = self.inner.seal_group.lock();
+            let mut group = inner.seal_group.lock();
             if let Some(next) = group.queue.front() {
                 Some(Arc::clone(&next.receipt))
             } else {
@@ -127,8 +135,8 @@ impl NativeContentStagingArea {
         }
     }
 
-    fn process_seal_group(&self, batch: Vec<QueuedSeal>) {
-        let mut journal = self.inner.journal.lock();
+    fn process_seal_group(&self, inner: &Arc<super::StagingInner>, batch: Vec<QueuedSeal>) {
+        let mut journal = inner.journal.lock();
         if journal.poisoned {
             drop(journal);
             complete_failed_seals(batch, "staging journal requires recovery");
@@ -137,34 +145,36 @@ impl NativeContentStagingArea {
         let result = (|| {
             for request in &batch {
                 open_generation_in(
-                    &self.inner.generations_directory,
+                    &inner.generations_directory,
                     &request.path,
                     &request.intent,
                     Some(request.source_identity),
                 )?;
             }
-            self.inner.generations_directory.sync()?;
-            self.fail_if(StagingFaultPoint::GenerationDirectoryFlushed)?;
+            inner.generations_directory.sync()?;
+            inner
+                .faults
+                .fail(StagingFaultPoint::GenerationDirectoryFlushed)?;
             let records: Vec<_> = batch
                 .iter()
                 .map(|request| JournalRecord::Sealed(request.intent.clone()))
                 .collect();
             append_records(&mut journal.file, &records)?;
-            self.fail_if(StagingFaultPoint::SealJournalAppended)?;
+            inner.faults.fail(StagingFaultPoint::SealJournalAppended)?;
             flush_journal(&journal.file)?;
-            self.fail_if(StagingFaultPoint::SealJournalFlushed)
+            inner.faults.fail(StagingFaultPoint::SealJournalFlushed)
         })();
         match result {
             Ok(()) => {
                 #[cfg(test)]
-                self.inner
+                inner
                     .seal_groups_completed
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 for request in batch {
                     let key = StageKey::from_intent(&request.intent);
                     journal.pending.insert(key, request.intent.clone());
                     let ready = ReadyStagedContent::from_intent(
-                        self.inner.root.clone(),
+                        self.path().to_path_buf(),
                         request.path,
                         request.intent,
                         request.source_identity,

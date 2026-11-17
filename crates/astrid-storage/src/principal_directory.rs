@@ -99,6 +99,37 @@ impl PrincipalDirectory {
             })
     }
 
+    /// Run a synchronous native operation while this UID remains registered.
+    ///
+    /// The current alias is borrowed under the directory read lock. Renames,
+    /// unregister and replacement wait until the callback finishes. The UID,
+    /// rather than an earlier alias spelling, remains the destination authority.
+    /// Missing or inconsistent bindings return `None` without calling `operation`.
+    ///
+    /// The callback must not re-enter this directory or wait for work that needs
+    /// its write lock. Runtime callers separately hold lifecycle admission through
+    /// their complete operation; this guard covers the namespace binding only.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the callback's IO error after releasing the binding guard.
+    pub fn with_live_uid_binding<T>(
+        &self,
+        uid: PrincipalUid,
+        operation: impl FnOnce(&PrincipalId) -> std::io::Result<T>,
+    ) -> std::io::Result<Option<T>> {
+        let state = self.inner.read();
+        let Some(alias) = state.principals.get(&uid) else {
+            return Ok(None);
+        };
+        if state.aliases.get(alias) != Some(&uid) {
+            return Ok(None);
+        }
+        let result = operation(alias);
+        drop(state);
+        result.map(Some)
+    }
+
     /// Resolve a durable UID to its current alias.
     ///
     /// # Errors
@@ -170,3 +201,6 @@ impl PrincipalDirectory {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

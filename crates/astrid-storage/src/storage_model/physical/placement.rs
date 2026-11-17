@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use crate::storage_model::{BlobId, StorageNodeId};
 
 use super::PhysicalModelError;
-use super::codec::{Decoder, Encoder};
+use super::codec::{Decoder, Encoder, EncodingSink};
 use super::identity::{
     PhysicalIdentity, PhysicalMapNodeId, PlacementSetId, RepresentationProfileId, decode_blob_id,
     decode_map_node_id, decode_profile_id, encode_blob_id, encode_map_node_id, encode_profile_id,
@@ -63,7 +63,7 @@ impl ReplicaLocator {
         }
     }
 
-    fn encode_into(self, encoder: &mut Encoder) {
+    fn encode_into<W: EncodingSink>(self, encoder: &mut Encoder<W>) {
         encoder.u8(self.code());
         match self {
             Self::ArenaFrame {
@@ -168,7 +168,7 @@ impl Replica {
         )
     }
 
-    fn encode_into(self, encoder: &mut Encoder) {
+    fn encode_into<W: EncodingSink>(self, encoder: &mut Encoder<W>) {
         encoder.u32(self.storage_node.get());
         self.locator.encode_into(encoder);
     }
@@ -261,15 +261,25 @@ impl PlacementEntry {
     ///
     /// Returns a length overflow when the replica count cannot fit `u64`.
     pub fn encode(&self) -> Result<Vec<u8>, PhysicalModelError> {
-        let mut encoder = Encoder::new();
-        encode_blob_id(&mut encoder, self.blob);
-        encode_profile_id(&mut encoder, self.profile);
+        let mut count = Encoder::counting();
+        self.write_fields(&mut count)?;
+        let mut encoder = Encoder::with_cleared_buffer(Vec::with_capacity(count.finish_count()?));
+        self.write_fields(&mut encoder)?;
+        Ok(encoder.finish())
+    }
+
+    fn write_fields<W: EncodingSink>(
+        &self,
+        encoder: &mut Encoder<W>,
+    ) -> Result<(), PhysicalModelError> {
+        encode_blob_id(encoder, self.blob);
+        encode_profile_id(encoder, self.profile);
         encoder.u64(self.encoded_length);
         encoder.count(self.replicas.len())?;
         for replica in &self.replicas {
-            replica.encode_into(&mut encoder);
+            replica.encode_into(encoder);
         }
-        Ok(encoder.finish())
+        Ok(())
     }
 
     /// Decode one canonical format-one placement entry.

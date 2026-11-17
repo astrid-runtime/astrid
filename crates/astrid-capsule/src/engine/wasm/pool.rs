@@ -464,7 +464,7 @@ impl Drop for PoolCheckout {
 /// capsules import zero `wasi:*` functions, so the only WASI-created handles
 /// (streams/pollables) live in the `resource_table` cleared above, not in the
 /// ctx, whose sole content is the inherited-stderr stdio config.
-fn clear_on_return(state: &mut HostState, reset_resources: bool) {
+pub(super) fn clear_on_return(state: &mut HostState, reset_resources: bool) {
     state.caller_context = None;
     state.tool_result = None;
     state.interceptor_active = false;
@@ -474,6 +474,7 @@ fn clear_on_return(state: &mut HostState, reset_resources: bool) {
     state.invocation_tmp = None;
     state.invocation_secret_store = None;
     state.invocation_capsule_log = None;
+    state.deferred_logs.clear_invocation();
     state.invocation_profile = None;
     state.invocation_profile_authorized = true;
     state.invocation_env_overlay = None;

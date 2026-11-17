@@ -508,8 +508,6 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn hung_unmount_command_times_out_and_reaps() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let temporary = tempfile::tempdir().expect("hung unmount fixture");
         let script = temporary.path().join("hung-umount");
         let pidfile = temporary.path().join("pid");
@@ -521,10 +519,9 @@ mod tests {
             ),
         )
         .expect("hung unmount script");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("executable hung unmount script");
-        let mountpoint = temporary.path().join("mnt");
-        let error = run_unmount_command(&script, &mountpoint, Duration::from_millis(200))
+        // Read the fixture through an existing interpreter. Executing the newly
+        // written file can fail with ETXTBSY before exercising timeout/reaping.
+        let error = run_unmount_command("/bin/sh", &script, Duration::from_millis(200))
             .await
             .expect_err("hung unmount must time out");
         assert!(

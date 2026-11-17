@@ -12,7 +12,6 @@ use super::super::{File as DurableFile, RecoveryLimits};
 use super::activation::{build_initial_state, generation_name};
 use super::format::{
     CURRENT_MAGIC, CurrentPointer, JOURNAL_MAGIC, JournalEntry, METADATA_MAGIC, MetadataFrame,
-    journal_digest,
 };
 use super::recovery::{read_current_file, recover_journal, recover_metadata};
 use super::{
@@ -28,6 +27,22 @@ impl RepresentationStore {
         volume: &Arc<dyn AstridVolume>,
         limits: RecoveryLimits,
     ) -> Result<Option<Self>, DurableError> {
+        Ok(Self::open_volume_inner::<false>(volume, limits)?.map(|(store, _)| store))
+    }
+
+    pub(in crate::engine::durable) fn open_volume_for_recovery(
+        volume: &Arc<dyn AstridVolume>,
+        limits: RecoveryLimits,
+    ) -> Result<Option<(Self, super::index_validation::GenerationZeroPlacements)>, DurableError>
+    {
+        Self::open_volume_inner::<true>(volume, limits)
+    }
+
+    fn open_volume_inner<const COLLECT_PLACEMENTS: bool>(
+        volume: &Arc<dyn AstridVolume>,
+        limits: RecoveryLimits,
+    ) -> Result<Option<(Self, super::index_validation::GenerationZeroPlacements)>, DurableError>
+    {
         if !region_exists(volume, CURRENT_REGION)? {
             return Ok(None);
         }
@@ -46,7 +61,7 @@ impl RepresentationStore {
         )?;
         let index = recover_metadata(&mut metadata, limits)?;
         let (active, state) = recover_journal(&mut journal, current, &index, limits)?;
-        let recovered = Self::from_recovered(
+        let recovered = Self::from_recovered::<COLLECT_PLACEMENTS>(
             metadata,
             journal,
             current.journal_generation,
@@ -100,9 +115,8 @@ impl RepresentationStore {
         journal
             .sync_data()
             .map_err(|source| io_error("flush volume representation checkpoint", source))?;
-        let checkpoint_bytes =
-            super::read_all(&mut journal, "read volume representation checkpoint")?;
-        let checkpoint_digest = journal_digest(&checkpoint_bytes);
+        let checkpoint_digest =
+            super::digest_journal_file(&mut journal, "digest volume representation checkpoint")?;
         let state_cas = JournalEntry::StateCas {
             journal_generation: FIRST_JOURNAL_GENERATION,
             expected: None,

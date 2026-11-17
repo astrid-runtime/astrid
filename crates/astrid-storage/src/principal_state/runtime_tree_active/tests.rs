@@ -49,7 +49,7 @@ fn ten_thousand_entry_receipt_exceeds_old_cap_and_authenticates_every_identity()
             logical_bytes: entry.logical_bytes(),
         })
         .collect::<Vec<_>>();
-    let bytes = encode(&home, ReceiptPhase::Active, &entries).unwrap();
+    let bytes = encode(&home, ReceiptPhase::Active, &entries, None).unwrap();
     assert!(bytes.len() as u64 > RECEIPT_FRAMING_BYTES);
     assert!(
         bytes.len() as u64 <= receipt_size_bound(catalog.iter().map(ContentEntry::name)).unwrap()
@@ -95,7 +95,7 @@ fn receipt_cannot_amplify_inventory_with_duplicate_names() {
         file: catalog[0].file(),
         logical_bytes: 7,
     };
-    let bytes = encode(&home, ReceiptPhase::Active, &[entry.clone(), entry]).unwrap();
+    let bytes = encode(&home, ReceiptPhase::Active, &[entry.clone(), entry], None).unwrap();
     assert!(
         decode_listed_receipt(home.root(), &bytes, &catalog)
             .unwrap_err()
@@ -158,7 +158,7 @@ fn long_inventory_name(index: usize) -> ContentName {
 
 #[tokio::test]
 async fn sparse_receipt_reads_do_not_list_growing_unrelated_catalogs() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(directory.path());
     let store = open_runtime_principal_store(&home, unlimited_quota())
         .await
@@ -189,7 +189,7 @@ async fn sparse_receipt_reads_do_not_list_growing_unrelated_catalogs() {
             file: descriptor.file(),
             logical_bytes: descriptor.logical_bytes(),
         }];
-        let bytes = encode(&home, ReceiptPhase::Active, &entries).unwrap();
+        let bytes = encode(&home, ReceiptPhase::Active, &entries, None).unwrap();
         assert!((bytes.len() as u64) < RECEIPT_FRAMING_BYTES);
         store
             .content()
@@ -221,7 +221,7 @@ async fn sparse_receipt_reads_do_not_list_growing_unrelated_catalogs() {
 
 #[tokio::test]
 async fn receipt_allocation_boundary_selects_authenticated_inventory_source() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(directory.path());
     let store = open_runtime_principal_store(&home, unlimited_quota())
         .await
@@ -242,7 +242,7 @@ async fn receipt_allocation_boundary_selects_authenticated_inventory_source() {
         logical_bytes: descriptor.logical_bytes(),
     }];
     for (length, expected_lists) in [(RECEIPT_FRAMING_BYTES, 0), (RECEIPT_FRAMING_BYTES + 1, 1)] {
-        let mut bytes = encode(&home, ReceiptPhase::Active, &entries).unwrap();
+        let mut bytes = encode(&home, ReceiptPhase::Active, &entries, None).unwrap();
         bytes.resize(usize::try_from(length).unwrap(), b' ');
         store
             .content()
@@ -274,7 +274,7 @@ async fn receipt_allocation_boundary_selects_authenticated_inventory_source() {
 async fn public_receipt_read_scales_past_four_mib_with_one_catalog_list() {
     const COUNT: usize = 10_000;
 
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(directory.path());
     let store = open_runtime_principal_store(&home, unlimited_quota())
         .await
@@ -298,7 +298,7 @@ async fn public_receipt_read_scales_past_four_mib_with_one_catalog_list() {
             logical_bytes: entry.descriptor().logical_bytes(),
         })
         .collect::<Vec<_>>();
-    let bytes = encode(&home, ReceiptPhase::Active, &entries).unwrap();
+    let bytes = encode(&home, ReceiptPhase::Active, &entries, None).unwrap();
     assert!(
         bytes.len() > 4 * 1024 * 1024,
         "fixture must exceed the historical fixed receipt ceiling of 4194304 bytes; got {}",
@@ -346,7 +346,7 @@ fn receipt_rejects_noncanonical_authenticated_catalog_inventory() {
             logical_bytes: entry.logical_bytes(),
         })
         .collect::<Vec<_>>();
-    let bytes = encode(&home, ReceiptPhase::Active, &entries).unwrap();
+    let bytes = encode(&home, ReceiptPhase::Active, &entries, None).unwrap();
     let mut unordered = catalog.clone();
     unordered.reverse();
     for invalid in [unordered, vec![catalog[0].clone(), catalog[0].clone()]] {
@@ -458,7 +458,7 @@ fn publish_forged_system_catalog_leaf_length(
 
 #[tokio::test]
 async fn public_receipt_read_rejects_catalog_file_logical_length_disagreement() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(directory.path());
     let store = open_runtime_principal_store(&home, unlimited_quota())
         .await
@@ -476,7 +476,7 @@ async fn public_receipt_read_rejects_catalog_file_logical_length_disagreement() 
             );
         }
     }
-    let bytes = encode(&home, ReceiptPhase::Active, &[]).unwrap();
+    let bytes = encode(&home, ReceiptPhase::Active, &[], None).unwrap();
     let outcome = store
         .content()
         .put(&StateOwner::System, &receipt_name, &bytes)
@@ -502,4 +502,106 @@ async fn public_receipt_read_rejects_catalog_file_logical_length_disagreement() 
         text.contains("content catalog and file logical lengths disagree"),
         "{text}"
     );
+}
+
+#[test]
+fn schema_rules_accept_v1_without_scope_and_v2_retiring_with_scope() {
+    let host = Path::new("run/.active-projection-v1.json");
+    let scope = StagingScope::parse("0123456789abcdef0123456789abcdef").unwrap();
+    let v1 = ActiveProjectionReceipt {
+        schema: RECEIPT_SCHEMA_V1,
+        phase: ReceiptPhase::Retiring,
+        root: String::new(),
+        entries: Vec::new(),
+        staging_scope: None,
+    };
+    validate_receipt_schema(&v1, host).unwrap();
+
+    let v2 = ActiveProjectionReceipt {
+        schema: RECEIPT_SCHEMA_V2,
+        phase: ReceiptPhase::Retiring,
+        root: String::new(),
+        entries: Vec::new(),
+        staging_scope: Some(scope),
+    };
+    validate_receipt_schema(&v2, host).unwrap();
+}
+
+#[test]
+fn schema_rules_reject_malformed_and_phase_illegal_scopes() {
+    let host = Path::new("run/.active-projection-v1.json");
+    let scope = StagingScope::parse("0123456789abcdef0123456789abcdef").unwrap();
+
+    let v1_with_scope = ActiveProjectionReceipt {
+        schema: RECEIPT_SCHEMA_V1,
+        phase: ReceiptPhase::Retiring,
+        root: String::new(),
+        entries: Vec::new(),
+        staging_scope: Some(scope),
+    };
+    assert!(validate_receipt_schema(&v1_with_scope, host).is_err());
+
+    let v2_active = ActiveProjectionReceipt {
+        schema: RECEIPT_SCHEMA_V2,
+        phase: ReceiptPhase::Active,
+        root: String::new(),
+        entries: Vec::new(),
+        staging_scope: Some(scope),
+    };
+    assert!(validate_receipt_schema(&v2_active, host).is_err());
+
+    let v2_without_scope = ActiveProjectionReceipt {
+        schema: RECEIPT_SCHEMA_V2,
+        phase: ReceiptPhase::Retiring,
+        root: String::new(),
+        entries: Vec::new(),
+        staging_scope: None,
+    };
+    assert!(validate_receipt_schema(&v2_without_scope, host).is_err());
+
+    let unsupported = ActiveProjectionReceipt {
+        schema: 3,
+        phase: ReceiptPhase::Retiring,
+        root: String::new(),
+        entries: Vec::new(),
+        staging_scope: Some(scope),
+    };
+    assert!(validate_receipt_schema(&unsupported, host).is_err());
+}
+
+#[test]
+fn schema1_present_null_staging_scope_is_rejected() {
+    let rejected =
+        r#"{"schema":1,"phase":"retiring","root":"/tmp/x","entries":[],"staging_scope":null}"#;
+    let error = serde_json::from_str::<ActiveProjectionReceipt>(rejected).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("staging_scope must not be null when present"),
+        "{error}"
+    );
+}
+
+#[test]
+fn scoped_retiring_receipt_keeps_catalog_derived_large_inventory_bound() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let catalog = inventory(10_000);
+    let entries = catalog
+        .iter()
+        .map(|entry| ActiveProjectionEntry {
+            name: entry.name().clone(),
+            file: entry.file(),
+            logical_bytes: entry.logical_bytes(),
+        })
+        .collect::<Vec<_>>();
+    let scope = StagingScope::new();
+    let bytes = encode(&home, ReceiptPhase::Retiring, &entries, Some(scope)).unwrap();
+    assert!(bytes.len() as u64 > RECEIPT_FRAMING_BYTES);
+    let receipt = decode_listed_receipt(home.root(), &bytes, &catalog)
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.staging_scope(), Some(scope));
+    assert!(receipt.contains_inventory_name(catalog.first().unwrap().name().as_str()));
+    assert!(receipt.contains_inventory_name(catalog.last().unwrap().name().as_str()));
 }

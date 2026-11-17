@@ -285,7 +285,9 @@ fn compaction_rebases_direct_authority_before_retiring_old_placements() {
     assert!(engine.object(current.commit).unwrap().is_some());
     {
         let inner = engine.inner.lock();
-        let representations = inner.representations.as_ref().unwrap();
+        let representations =
+            super::checkpoint_worker::lock_representations(inner.representations.as_ref())
+                .expect("shared representation store");
         assert!(!representations.contains_direct(first.commit));
         assert!(representations.contains_direct(current.commit));
         assert!(!representations.contains_direct(specification_id));

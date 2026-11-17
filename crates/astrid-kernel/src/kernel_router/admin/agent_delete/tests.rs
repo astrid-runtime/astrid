@@ -108,3 +108,115 @@ async fn owned_deletion_rejects_missing_revoked_removed_and_attenuated_credentia
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deletion_releases_private_workspace_but_preserves_promotions_and_peer_branches() {
+    use astrid_capsule::context::WorkspaceCommitOp;
+    use astrid_storage::{FilesystemPath, WorkspaceBindingLifecycle, WorkspaceBranchStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let kernel = crate::test_kernel_with_home(AstridHome::from_path(dir.path())).await;
+    test_support::seed_operator(&kernel).await;
+    let caller = PrincipalId::default();
+    let alice = PrincipalId::new("workspace-alice").unwrap();
+    let bob = PrincipalId::new("workspace-bob").unwrap();
+    for target in [&alice, &bob] {
+        create_workspace_principal(&kernel, target).await;
+    }
+    let service = kernel.workspace_branches.as_ref().unwrap();
+    let published = FilesystemPath::new("published.txt").unwrap();
+    let private = FilesystemPath::new("alice-private.txt").unwrap();
+    let peer_private = FilesystemPath::new("bob-private.txt").unwrap();
+    let promoted = service.bind(&alice).await.unwrap();
+    service
+        .filesystem(promoted)
+        .write(&published, b"published")
+        .unwrap();
+    service
+        .finish(&alice, promoted, WorkspaceCommitOp::Promote)
+        .await
+        .unwrap();
+    let retired = service.bind(&alice).await.unwrap();
+    service
+        .filesystem(retired)
+        .write(&private, b"alice")
+        .unwrap();
+    let peer = service.bind(&bob).await.unwrap();
+    assert_eq!(retired.owner, peer.owner);
+    service
+        .filesystem(peer)
+        .write(&peer_private, b"bob")
+        .unwrap();
+    let branches = WorkspaceBranchStore::new(kernel.principal_store.as_ref().unwrap().content());
+    let deleted = test_support::dispatch_as_operator(
+        &kernel,
+        &caller,
+        AdminRequestKind::AgentDelete {
+            principal: alice.clone(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(deleted, AdminResponseBody::Success(_)),
+        "{deleted:?}"
+    );
+    assert!(
+        !branches
+            .list_branches(&retired.owner)
+            .unwrap()
+            .iter()
+            .any(|branch| branch.binding_uid() == Some(retired.uid)),
+        "authenticated deletion must release the retired UID's live workspace branches",
+    );
+    assert_eq!(
+        branches
+            .binding(&promoted.owner, promoted.branch)
+            .unwrap()
+            .lifecycle(),
+        WorkspaceBindingLifecycle::Promoted,
+    );
+    assert_eq!(service.binding_for(&bob).await.unwrap(), peer);
+    assert_eq!(
+        service.filesystem(peer).read(&peer_private, 0, 3).unwrap(),
+        b"bob"
+    );
+    assert_eq!(
+        service.filesystem(peer).read(&published, 0, 9).unwrap(),
+        b"published"
+    );
+    create_workspace_principal(&kernel, &alice).await;
+    let reused = service.bind(&alice).await.unwrap();
+    assert_ne!(reused.uid, retired.uid);
+    assert_ne!(reused.branch, retired.branch);
+    assert!(service.filesystem(reused).read(&private, 0, 5).is_err());
+    assert!(
+        service
+            .filesystem(reused)
+            .read(&peer_private, 0, 3)
+            .is_err()
+    );
+    assert_eq!(
+        service.filesystem(reused).read(&published, 0, 9).unwrap(),
+        b"published"
+    );
+}
+
+async fn create_workspace_principal(kernel: &std::sync::Arc<crate::Kernel>, target: &PrincipalId) {
+    let response = test_support::dispatch_as_operator(
+        kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentCreate {
+            name: target.to_string(),
+            groups: Vec::new(),
+            grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
+        },
+    )
+    .await;
+    assert!(
+        matches!(response, AdminResponseBody::Success(_)),
+        "{response:?}"
+    );
+}

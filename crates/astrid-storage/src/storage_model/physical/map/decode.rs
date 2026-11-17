@@ -41,8 +41,8 @@ impl MapNodeView<'_> {
     #[cfg(any(test, not(target_family = "wasm")))]
     pub(super) const fn identity_context(&self) -> &'static str {
         match self {
-            Self::Leaf { .. } | Self::Branch { .. } => "astrid-physical-map-node-v1\0",
-            Self::Page { .. } | Self::Radix { .. } => "astrid-physical-radix-map-node-v1\0",
+            Self::Leaf { .. } | Self::Branch { .. } => super::LEGACY_MAP_NODE_IDENTITY,
+            Self::Page { .. } | Self::Radix { .. } => super::RADIX_MAP_NODE_IDENTITY,
         }
     }
 

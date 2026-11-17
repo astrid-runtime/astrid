@@ -1,5 +1,6 @@
 //! Regressions for transactional borrowed/new-only map rebuild.
 
+use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -326,4 +327,75 @@ fn empty_map_rebuild_owns_all_additions() {
     );
     assert_eq!(map.root(), expected.root());
     assert_eq!(map.nodes().len(), expected.nodes().len());
+}
+
+#[derive(Clone, Copy)]
+struct ConstantIdentity;
+
+impl PhysicalIdentity for ConstantIdentity {
+    fn identify(&self, _context: &'static str, _material: &[u8]) -> [u8; 32] {
+        [0x44; 32]
+    }
+}
+
+#[test]
+fn empty_root_insert_rejects_unequal_historical_identity_collision() {
+    // recover(None, ...) keeps DenseRadix construction, so empty-root birth emits a page.
+    let historical = PhysicalMapNode::page(
+        PhysicalMapDomain::Representation,
+        vec![(key(1), vec![1, 2, 3])],
+    )
+    .unwrap();
+    let historical_id = historical.identify(&ConstantIdentity).unwrap();
+    let nodes = BTreeMap::from([(historical_id, historical.clone())]);
+    let mut map = CanonicalPhysicalMap::recover(
+        &ConstantIdentity,
+        PhysicalMapDomain::Representation,
+        None,
+        nodes.clone(),
+    )
+    .unwrap();
+    assert!(map.root().is_none());
+    assert_eq!(map.entry_count(), 0);
+    let err = map
+        .insert(&ConstantIdentity, key(2), vec![9, 9, 9])
+        .expect_err("unequal historical body under the same id must reject");
+    assert!(matches!(err, PhysicalModelError::InvalidMap(_)), "{err:?}");
+    assert!(map.root().is_none());
+    assert_eq!(map.entry_count(), 0);
+    assert_eq!(map.nodes(), &nodes);
+    assert_eq!(map.nodes()[&historical_id], historical);
+}
+
+#[test]
+fn empty_root_insert_can_reactivate_equal_historical_body() {
+    let historical = PhysicalMapNode::page(
+        PhysicalMapDomain::Representation,
+        vec![(key(3), vec![3, 4, 5])],
+    )
+    .unwrap();
+    let historical_id = historical.identify(&ConstantIdentity).unwrap();
+    let nodes = BTreeMap::from([(historical_id, historical.clone())]);
+    let mut map = CanonicalPhysicalMap::recover(
+        &ConstantIdentity,
+        PhysicalMapDomain::Representation,
+        None,
+        nodes,
+    )
+    .unwrap();
+    assert!(
+        map.insert(&ConstantIdentity, key(3), vec![3, 4, 5])
+            .unwrap()
+    );
+    assert_eq!(map.root(), Some(historical_id));
+    assert_eq!(map.entry_count(), 1);
+    assert_eq!(map.nodes().len(), 1);
+    assert_eq!(map.nodes()[&historical_id], historical);
+    CanonicalPhysicalMap::validate_root(
+        &ConstantIdentity,
+        PhysicalMapDomain::Representation,
+        map.root(),
+        map.nodes(),
+    )
+    .unwrap();
 }

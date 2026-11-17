@@ -60,3 +60,39 @@ fn comparison_handles_empty_fields_without_clearing_an_earlier_mismatch() {
         Err(PhysicalModelError::NonCanonicalEncoding)
     );
 }
+
+#[test]
+fn counting_sink_rejects_length_overflow() {
+    let mut encoder = Encoder::counting();
+    encoder.bytes.len = Some(usize::MAX);
+    encoder.u8(1);
+    encoder.raw(&[]);
+    assert_eq!(
+        encoder.finish_count(),
+        Err(PhysicalModelError::LengthOverflow)
+    );
+
+    let mut encoder = Encoder::counting();
+    encoder.bytes.len = Some(isize::MAX.unsigned_abs());
+    encoder.u8(1);
+    assert_eq!(
+        encoder.finish_count(),
+        Err(PhysicalModelError::LengthOverflow)
+    );
+}
+
+#[test]
+fn measured_encode_matches_grown_bytes_with_tight_capacity() {
+    let mut count = Encoder::counting();
+    fields(&mut count);
+    let len = count.finish_count().unwrap();
+    let mut measured = Encoder::with_cleared_buffer(alloc::vec::Vec::with_capacity(len));
+    fields(&mut measured);
+    let exact = measured.finish();
+    let mut grown = Encoder::new();
+    fields(&mut grown);
+    let grown = grown.finish();
+    assert_eq!(exact, grown);
+    assert_eq!(exact.len(), len);
+    assert_eq!(exact.capacity(), exact.len());
+}

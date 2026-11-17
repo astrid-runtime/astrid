@@ -36,9 +36,11 @@ use crate::principal_graph::{LEGACY_PRINCIPAL_GRAPH_VERSION, PRINCIPAL_GRAPH_VER
 
 const KV_COMPONENT_LABEL: &[u8] = b"kv";
 const PARENT_LABEL: &[u8] = b"parent";
-const STATE_LABEL: &[u8] = b"state";
-// Soft write-coalescing target, not a record, file, or deployment limit.
-pub(super) const STAGING_BATCH_TARGET_BYTES: usize = 4 * 1024 * 1024;
+pub(super) const STATE_LABEL: &[u8] = b"state";
+// Native content transfer target, shared by batched writers and restoration.
+// Coalesces verified I/O while keeping transfer memory independent of file size.
+// This is a soft I/O batch size, not a retention, record, or deployment limit.
+pub(crate) const NATIVE_CONTENT_BATCH_BYTES: usize = 4 * 1024 * 1024;
 pub(super) const VERIFIED_CONTENT_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(1);
 pub(super) const PARTIAL_VERIFICATION_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(2);
 const DECODED_HEADER_CACHE_KEY: ProjectionCacheKey = ProjectionCacheKey::new(3);
@@ -80,6 +82,8 @@ pub struct PrincipalContentStore<P: Ord, E> {
     prefix_exists_invocations: AtomicU64,
     #[cfg(test)]
     decode_header_invocations: AtomicU64,
+    #[cfg(test)]
+    catalog_validation_invocations: AtomicU64,
 }
 
 impl<P: Ord, E> fmt::Debug for PrincipalContentStore<P, E> {
@@ -522,6 +526,15 @@ where
         names: &[ContentName],
         expectation: &ContentBatchExpectation,
     ) -> Result<bool, PrincipalContentError> {
+        self.delete_batch_with_preconditions(principal, names, Some(expectation).into())
+    }
+
+    pub(crate) fn delete_batch_with_preconditions(
+        &self,
+        principal: &P,
+        names: &[ContentName],
+        preconditions: crate::content::ContentBatchPreconditions<'_>,
+    ) -> Result<bool, PrincipalContentError> {
         if names.is_empty() {
             return Ok(false);
         }
@@ -533,7 +546,7 @@ where
         }
         loop {
             let mut header = self.header(principal)?.as_ref().clone();
-            self.check_batch_expectation(principal, &header, Some(expectation))?;
+            self.check_batch_preconditions(principal, &header, preconditions)?;
             let mut records = BTreeMap::<ObjectId, ObjectRecord>::new();
             let mut changed = false;
             for name in names {
@@ -958,6 +971,7 @@ where
 mod append;
 mod bulk;
 mod constructors;
+mod handoff;
 mod internals;
 mod native;
 mod pending_catalog;

@@ -20,7 +20,7 @@ fn direct_representation_activation_reopens_and_tracks_later_commits() {
         .unwrap();
     {
         let inner = engine.inner.lock();
-        let representations = inner.representations.as_ref().unwrap();
+        let representations = crate::engine::durable::checkpoint_worker::lock_representations(inner.representations.as_ref()).expect("shared representation store");
         assert_eq!(representations.active(), initial_state);
         assert!(representations.contains_direct(first_commit));
         assert!(!representations.contains_direct(specification_id));
@@ -30,7 +30,7 @@ fn direct_representation_activation_reopens_and_tracks_later_commits() {
     engine.commit(second).unwrap();
     let advanced_state = {
         let inner = engine.inner.lock();
-        let representations = inner.representations.as_ref().unwrap();
+        let representations = crate::engine::durable::checkpoint_worker::lock_representations(inner.representations.as_ref()).expect("shared representation store");
         assert!(representations.contains_direct(second_commit));
         assert_ne!(representations.active(), initial_state);
         representations.active()
@@ -46,7 +46,7 @@ fn direct_representation_activation_reopens_and_tracks_later_commits() {
         advanced_state
     );
     let inner = reopened.inner.lock();
-    let representations = inner.representations.as_ref().unwrap();
+    let representations = crate::engine::durable::checkpoint_worker::lock_representations(inner.representations.as_ref()).expect("shared representation store");
     assert!(representations.contains_direct(first_commit));
     assert!(representations.contains_direct(second_commit));
     assert!(!representations.contains_direct(specification_id));
@@ -122,7 +122,7 @@ fn compatible_format_amendment_reopens_an_existing_direct_profile() {
         )
         .unwrap();
     let inner = reopened_again.inner.lock();
-    let representations = inner.representations.as_ref().unwrap();
+    let representations = crate::engine::durable::checkpoint_worker::lock_representations(inner.representations.as_ref()).expect("shared representation store");
     assert_eq!(
         representations.frozen_specification().unwrap(),
         old_specification_id
@@ -294,7 +294,7 @@ fn valid_representation_cas_without_its_metadata_repairs_from_the_arena() {
     assert_eq!(std::fs::metadata(&journal).unwrap().len(), journal_before);
     {
         let inner = repaired.inner.lock();
-        let representations = inner.representations.as_ref().unwrap();
+        let representations = crate::engine::durable::checkpoint_worker::lock_representations(inner.representations.as_ref()).expect("shared representation store");
         assert_eq!(representations.active(), initial_state);
         assert!(!representations.contains_direct(second_commit));
     }
@@ -317,15 +317,12 @@ fn valid_representation_cas_without_its_metadata_repairs_from_the_arena() {
         reopened.root(&"alice".to_owned()).unwrap(),
         Some(second_root)
     );
-    assert!(
-        reopened
-            .inner
-            .lock()
-            .representations
-            .as_ref()
-            .unwrap()
-            .contains_direct(second_commit)
-    );
+    {
+        let inner = reopened.inner.lock();
+        let representations = crate::engine::durable::checkpoint_worker::lock_representations(inner.representations.as_ref())
+            .expect("shared representation store");
+        assert!(representations.contains_direct(second_commit));
+    }
 }
 
 #[test]
@@ -363,13 +360,11 @@ fn representation_state_is_durable_before_root_publication() {
     );
     {
         let inner = interrupted.inner.lock();
-        assert!(
-            inner
-                .representations
-                .as_ref()
-                .unwrap()
-                .contains_direct(unpublished_commit)
-        );
+        {
+            let representations = crate::engine::durable::checkpoint_worker::lock_representations(inner.representations.as_ref())
+                .expect("shared representation store");
+            assert!(representations.contains_direct(unpublished_commit));
+        }
     }
     interrupted.close().unwrap();
     drop(interrupted);
@@ -377,13 +372,11 @@ fn representation_state_is_durable_before_root_publication() {
     let reopened = open(directory.path());
     assert_eq!(reopened.root(&"alice".to_owned()).unwrap(), Some(old_root));
     let inner = reopened.inner.lock();
-    assert!(
-        inner
-            .representations
-            .as_ref()
-            .unwrap()
-            .contains_direct(unpublished_commit)
-    );
+    {
+        let representations = crate::engine::durable::checkpoint_worker::lock_representations(inner.representations.as_ref())
+            .expect("shared representation store");
+        assert!(representations.contains_direct(unpublished_commit));
+    }
 }
 
 #[test]
@@ -434,29 +427,23 @@ fn activation_repair_covers_an_arena_flush_without_a_state_cas() {
     interrupted
         .ensure_direct_representation_catalogue(specification_id, &[specification_id])
         .unwrap();
-    assert!(
-        interrupted
-            .inner
-            .lock()
-            .representations
-            .as_ref()
-            .unwrap()
-            .contains_direct(unpublished_commit)
-    );
+    {
+        let inner = interrupted.inner.lock();
+        let representations = crate::engine::durable::checkpoint_worker::lock_representations(inner.representations.as_ref())
+            .expect("shared representation store");
+        assert!(representations.contains_direct(unpublished_commit));
+    }
     interrupted.close().unwrap();
     drop(interrupted);
 
     let reopened = open(directory.path());
     assert_eq!(reopened.root(&"alice".to_owned()).unwrap(), Some(old_root));
-    assert!(
-        reopened
-            .inner
-            .lock()
-            .representations
-            .as_ref()
-            .unwrap()
-            .contains_direct(unpublished_commit)
-    );
+    {
+        let inner = reopened.inner.lock();
+        let representations = crate::engine::durable::checkpoint_worker::lock_representations(inner.representations.as_ref())
+            .expect("shared representation store");
+        assert!(representations.contains_direct(unpublished_commit));
+    }
 }
 
 #[test]
@@ -506,15 +493,12 @@ fn retry_represents_a_recovered_orphan_without_reappending_it() {
             .len(),
         arena_after_fault
     );
-    assert!(
-        engine
-            .inner
-            .lock()
-            .representations
-            .as_ref()
-            .unwrap()
-            .contains_direct(commit)
-    );
+    {
+        let inner = engine.inner.lock();
+        let representations = crate::engine::durable::checkpoint_worker::lock_representations(inner.representations.as_ref())
+            .expect("shared representation store");
+        assert!(representations.contains_direct(commit));
+    }
 }
 
 #[test]
@@ -581,28 +565,22 @@ fn activated_flush_publishes_direct_paths_for_staged_prefix() {
     let (staged_id, _) = engine.stage_object(&staged).unwrap();
 
     engine.flush().unwrap();
-    assert!(
-        engine
-            .inner
-            .lock()
-            .representations
-            .as_ref()
-            .unwrap()
-            .contains_direct(staged_id)
-    );
+    {
+        let inner = engine.inner.lock();
+        let representations = crate::engine::durable::checkpoint_worker::lock_representations(inner.representations.as_ref())
+            .expect("shared representation store");
+        assert!(representations.contains_direct(staged_id));
+    }
     engine.close().unwrap();
     drop(engine);
 
     let reopened = open(directory.path());
-    assert!(
-        reopened
-            .inner
-            .lock()
-            .representations
-            .as_ref()
-            .unwrap()
-            .contains_direct(staged_id)
-    );
+    {
+        let inner = reopened.inner.lock();
+        let representations = crate::engine::durable::checkpoint_worker::lock_representations(inner.representations.as_ref())
+            .expect("shared representation store");
+        assert!(representations.contains_direct(staged_id));
+    }
 }
 
 #[test]
@@ -647,7 +625,7 @@ fn verified_staged_closure_consumes_direct_description_witnesses() {
 
     let inner = engine.inner.lock();
     assert!(inner.pending_direct_objects.is_empty());
-    let representations = inner.representations.as_ref().unwrap();
+    let representations = crate::engine::durable::checkpoint_worker::lock_representations(inner.representations.as_ref()).expect("shared representation store");
     assert!(
         object_ids
             .into_iter()
@@ -926,7 +904,7 @@ fn standalone_ack_covers_an_earlier_staged_prefix() {
 
     let reopened = open(directory.path());
     let inner = reopened.inner.lock();
-    let representations = inner.representations.as_ref().unwrap();
+    let representations = crate::engine::durable::checkpoint_worker::lock_representations(inner.representations.as_ref()).expect("shared representation store");
     assert!(representations.contains_direct(earlier_id));
     assert!(representations.contains_direct(later_id));
 }

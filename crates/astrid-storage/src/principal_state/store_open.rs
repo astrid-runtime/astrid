@@ -67,17 +67,26 @@ pub async fn open_runtime_principal_store_for_pack(
     home: &AstridHome,
     quota: Arc<dyn KvQuotaResolver<StateOwner>>,
 ) -> crate::principal_state::StorageResult<RuntimePrincipalStore> {
+    #[cfg(windows)]
+    let (home, retained_root) = super::runtime_root_admission::normalize_and_admit(home)?;
+    #[cfg(windows)]
+    let home = &home;
     let policy = DurableEnginePolicy::default();
     if volume_migration::existing_volume_available(home)? {
-        let (engine, receipt) =
-            volume_migration::open_existing(home, policy)?.ok_or_else(|| {
-                StorageError::Connection("Astrid volume disappeared while opening".to_owned())
-            })?;
-        let store = assemble_volume_store(
+        let (engine, receipt, volume) = volume_migration::open_existing(
+            home,
+            policy,
+            #[cfg(windows)]
+            &retained_root,
+        )?
+        .ok_or_else(|| {
+            StorageError::Connection("Astrid volume disappeared while opening".to_owned())
+        })?;
+        let store = assemble_runtime_store(
             home,
             quota,
             PrincipalDirectory::default(),
-            Arc::new(engine),
+            (Arc::new(engine), volume),
             receipt,
             false,
             false,
@@ -86,14 +95,82 @@ pub async fn open_runtime_principal_store_for_pack(
         quarantine_unrecognized_principal_store(home, &store)?;
         return Ok(store);
     }
-    let (engine, receipt) = volume_migration::initialize_volume(home, policy)?;
-    let store = assemble_volume_store(
+    let (engine, receipt, volume) = volume_migration::initialize_volume(
+        home,
+        policy,
+        #[cfg(windows)]
+        &retained_root,
+    )?;
+    let store = assemble_runtime_store(
         home,
         quota,
         PrincipalDirectory::default(),
-        Arc::new(engine),
+        (Arc::new(engine), volume),
         receipt,
         false,
+        false,
+    )
+    .await?;
+    quarantine_unrecognized_principal_store(home, &store)?;
+    Ok(store)
+}
+
+/// Recover an interrupted projection after authenticating caller-owned policy.
+///
+/// The caller must hold the boot singleton. Only existing private canonical
+/// media can open; no legacy/swap promotion, format amendment, identity loading,
+/// host reconciliation, or staging creation precedes the read-only callback.
+/// A successful callback hands the same locked engine to ordinary assembly.
+///
+/// # Errors
+/// Rejects absent/unsafe media, incomplete or foreign RETIRING inventory, failed
+/// policy validation, or ordinary assembly/restoration errors.
+pub async fn open_runtime_principal_store_recovering_projection<F>(
+    home: &AstridHome,
+    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
+    principals: PrincipalDirectory,
+    validate: F,
+) -> crate::principal_state::StorageResult<RuntimePrincipalStore>
+where
+    F: FnOnce(&super::startup_recovery::RuntimeProjectionRecovery<'_>) -> std::io::Result<()>,
+{
+    #[cfg(windows)]
+    let (home, retained_root) = super::runtime_root_admission::normalize_and_admit(home)?;
+    #[cfg(windows)]
+    let home = &home;
+    let root = astrid_core::platform_fs::PrivateProjectionInspection::try_open(home.root())
+        .map_err(super::startup_recovery::guard_error)?;
+    let (engine, receipt, volume) = volume_migration::open_existing_canonical_only(
+        home,
+        DurableEnginePolicy::default(),
+        #[cfg(windows)]
+        &retained_root,
+    )?;
+    root.confirm_absolute_root()
+        .map_err(super::startup_recovery::guard_error)?;
+    super::format_amendment::verify_volume_format_for_recovery(&engine)?;
+    let engine = Arc::new(engine);
+    let content = NativePrincipalContentStore::from_engine_with_quota(
+        Arc::clone(&engine),
+        Arc::clone(&quota),
+    );
+    {
+        let recovery = super::startup_recovery::authenticate(home, &content)?;
+        validate(&recovery).map_err(super::startup_recovery::guard_error)?;
+    }
+    drop(content);
+    root.confirm_absolute_root()
+        .map_err(super::startup_recovery::guard_error)?;
+    volume
+        .finish_canonical_recovery()
+        .map_err(super::startup_recovery::guard_error)?;
+    let store = assemble_runtime_store(
+        home,
+        quota,
+        principals,
+        (engine, volume),
+        receipt,
+        true,
         false,
     )
     .await?;
@@ -177,16 +254,25 @@ async fn open_runtime_principal_store_with_options(
     principals: PrincipalDirectory,
     policy: DurableEnginePolicy<StateOwner>,
 ) -> crate::principal_state::StorageResult<RuntimePrincipalStore> {
+    #[cfg(windows)]
+    let (home, retained_root) = super::runtime_root_admission::normalize_and_admit(home)?;
+    #[cfg(windows)]
+    let home = &home;
     if volume_migration::existing_volume_available(home)? {
-        let (engine, receipt) =
-            volume_migration::open_existing(home, policy)?.ok_or_else(|| {
-                StorageError::Connection("Astrid volume disappeared while opening".to_owned())
-            })?;
-        let store = assemble_volume_store(
+        let (engine, receipt, volume) = volume_migration::open_existing(
+            home,
+            policy,
+            #[cfg(windows)]
+            &retained_root,
+        )?
+        .ok_or_else(|| {
+            StorageError::Connection("Astrid volume disappeared while opening".to_owned())
+        })?;
+        let store = assemble_runtime_store(
             home,
             quota,
             principals,
-            Arc::new(engine),
+            (Arc::new(engine), volume),
             receipt,
             true,
             false,
@@ -200,12 +286,17 @@ async fn open_runtime_principal_store_with_options(
         .layout_version()
         .map_err(|error| StorageError::Connection(error.to_string()))?;
     if layout_version.as_deref() != Some(astrid_core::dirs::LEGACY_LAYOUT_VERSION) {
-        let (engine, receipt) = volume_migration::initialize_volume(home, policy)?;
-        let store = assemble_volume_store(
+        let (engine, receipt, volume) = volume_migration::initialize_volume(
+            home,
+            policy,
+            #[cfg(windows)]
+            &retained_root,
+        )?;
+        let store = assemble_runtime_store(
             home,
             quota,
             principals,
-            Arc::new(engine),
+            (Arc::new(engine), volume),
             receipt,
             true,
             true,
@@ -216,12 +307,17 @@ async fn open_runtime_principal_store_with_options(
         return Ok(store);
     }
     if unrecognized_principal_store_present(home)? {
-        let (engine, receipt) = volume_migration::initialize_volume(home, policy)?;
-        let store = assemble_volume_store(
+        let (engine, receipt, volume) = volume_migration::initialize_volume(
+            home,
+            policy,
+            #[cfg(windows)]
+            &retained_root,
+        )?;
+        let store = assemble_runtime_store(
             home,
             quota,
             principals,
-            Arc::new(engine),
+            (Arc::new(engine), volume),
             receipt,
             true,
             true,
@@ -231,7 +327,15 @@ async fn open_runtime_principal_store_with_options(
         super::runtime_tree::quarantine_principal_store(home, &store)?;
         return Ok(store);
     }
-    open_migrated_directory_store(home, quota, principals, policy).await
+    open_migrated_directory_store(
+        home,
+        quota,
+        principals,
+        policy,
+        #[cfg(windows)]
+        &retained_root,
+    )
+    .await
 }
 
 async fn open_migrated_directory_store(
@@ -239,6 +343,7 @@ async fn open_migrated_directory_store(
     quota: Arc<dyn KvQuotaResolver<StateOwner>>,
     principals: PrincipalDirectory,
     policy: DurableEnginePolicy<StateOwner>,
+    #[cfg(windows)] retained_root: &super::runtime_root_admission::AdmittedRuntimeRoot,
 ) -> crate::principal_state::StorageResult<RuntimePrincipalStore> {
     let store_path = home.principal_store_path();
     let open_path = store_path.clone();
@@ -303,36 +408,21 @@ async fn open_migrated_directory_store(
             })??;
     }
 
-    let (engine, receipt) = volume_migration::migrate_directory_store(home, engine, policy)?;
-    assemble_volume_store(
+    let (engine, receipt, volume) = volume_migration::migrate_directory_store(
         home,
-        quota,
-        principals,
-        Arc::new(engine),
-        receipt,
-        true,
-        true,
-    )
-    .await
-}
-
-async fn assemble_volume_store(
-    home: &AstridHome,
-    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
-    principals: PrincipalDirectory,
-    engine: Arc<RuntimeEngine>,
-    directory_cutover_receipt: String,
-    restore_projection: bool,
-    allow_receiptless_bootstrap: bool,
-) -> crate::principal_state::StorageResult<RuntimePrincipalStore> {
+        engine,
+        policy,
+        #[cfg(windows)]
+        retained_root,
+    )?;
     assemble_runtime_store(
         home,
         quota,
         principals,
-        engine,
-        directory_cutover_receipt,
-        restore_projection,
-        allow_receiptless_bootstrap,
+        (Arc::new(engine), volume),
+        receipt,
+        true,
+        true,
     )
     .await
 }
@@ -373,15 +463,25 @@ fn unrecognized_principal_store_present(home: &AstridHome) -> PrincipalStorageRe
     Ok(true)
 }
 
+pub(super) fn runtime_read_cache_config() -> KvReadCacheConfig<StateOwner> {
+    KvReadCacheConfig::bounded(
+        NonZeroUsize::new(256 * 1024 * 1024).expect("256 MiB"),
+        NonZeroUsize::new(64 * 1024 * 1024).expect("64 MiB"),
+        NonZeroUsize::new(4_096).expect("owner limit"),
+        NonZeroUsize::new(65_536).expect("entries per owner"),
+    )
+}
+
 async fn assemble_runtime_store(
     home: &AstridHome,
     quota: Arc<dyn KvQuotaResolver<StateOwner>>,
     principals: PrincipalDirectory,
-    engine: Arc<RuntimeEngine>,
+    engine: (Arc<RuntimeEngine>, Arc<crate::volume::HostedFileVolume>),
     directory_cutover_receipt: String,
     restore_projection: bool,
     allow_receiptless_bootstrap: bool,
 ) -> crate::principal_state::StorageResult<RuntimePrincipalStore> {
+    let (engine, volume) = engine;
     let format_spec = bootstrap::format_specification()?;
     let format_spec_id = engine.identify(&format_spec);
     let catalog_spec = bootstrap::content_catalog_format_specification()?;
@@ -419,12 +519,7 @@ async fn assemble_runtime_store(
             Arc::clone(&validated_kv),
             Arc::clone(&validated_catalogs),
         )
-        .with_read_cache(KvReadCacheConfig::bounded(
-            NonZeroUsize::new(256 * 1024 * 1024).expect("256 MiB"),
-            NonZeroUsize::new(64 * 1024 * 1024).expect("64 MiB"),
-            NonZeroUsize::new(4_096).expect("owner limit"),
-            NonZeroUsize::new(65_536).expect("entries per owner"),
-        )),
+        .with_read_cache(runtime_read_cache_config()),
     );
     let kv: Arc<dyn KvStore> = runtime_kv.clone();
     KvIdentityStore::with_principal_directory(
@@ -441,13 +536,15 @@ async fn assemble_runtime_store(
     let content = Arc::new(
         NativePrincipalContentStore::from_engine_with_quota_and_validation(
             Arc::clone(&engine),
-            quota,
+            Arc::clone(&quota),
             validated_catalogs,
             validated_kv,
         ),
     );
     let staging = Arc::new(OnceLock::new());
     let store = RuntimePrincipalStore {
+        quota,
+        volume_binding: Arc::downgrade(&volume),
         engine,
         directory_cutover_receipt: Arc::from(directory_cutover_receipt),
         runtime_kv,

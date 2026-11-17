@@ -1,27 +1,66 @@
 //! Inspect persisted fixture bytes through the owning locked handle.
 
-use super::*;
+use std::fs::File;
+use std::io::{self, Seek, SeekFrom};
+
+use super::HostedFileVolume;
 
 impl HostedFileVolume {
+    /// Scope the existing thread-local partial-append fault to one operation.
+    #[cfg(test)]
+    pub(crate) fn with_append_failure_for_test<T>(
+        successful_writes: usize,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        struct Restore(Option<usize>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                super::set_remaining_append_writes(self.0);
+            }
+        }
+        let previous = super::REMAINING_APPEND_WRITES
+            .with(|remaining| remaining.replace(Some(successful_writes)));
+        let _restore = Restore(previous);
+        operation()
+    }
+
+    #[cfg(test)]
     pub(crate) fn copy_container_for_test(&self, path: &std::path::Path) {
         copy_container(self, path);
     }
+
+    pub(crate) fn write_preclose_volume_image(
+        &self,
+        output: &mut dyn std::io::Write,
+    ) -> io::Result<u64> {
+        self.with_current_binding(&self.path, |file| write_locked_file(file, output))
+    }
 }
 
+#[cfg(test)]
 pub(super) fn read_container(volume: &HostedFileVolume) -> Vec<u8> {
     let mut state = volume.state.lock();
     read_locked_file(&mut state.file)
 }
 
+#[cfg(test)]
 pub(super) fn read_locked_file(file: &mut File) -> Vec<u8> {
-    let position = file.stream_position().unwrap();
-    file.seek(SeekFrom::Start(0)).unwrap();
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).unwrap();
-    file.seek(SeekFrom::Start(position)).unwrap();
+    write_locked_file(file, &mut bytes).unwrap();
     bytes
 }
 
+fn write_locked_file(mut file: &File, output: &mut dyn std::io::Write) -> io::Result<u64> {
+    let position = file.stream_position()?;
+    let result = (|| {
+        file.seek(SeekFrom::Start(0))?;
+        std::io::copy(&mut file, output)
+    })();
+    file.seek(SeekFrom::Start(position))?;
+    result
+}
+
+#[cfg(test)]
 pub(super) fn copy_container(volume: &HostedFileVolume, path: &std::path::Path) {
     // Reading the live path through a second handle violates Windows mandatory
     // byte-range locks. This captures bytes before Drop without another sync.

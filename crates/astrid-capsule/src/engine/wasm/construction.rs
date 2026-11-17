@@ -58,6 +58,7 @@ impl WasmEngine {
             _capsule_dir: capsule_dir,
             wasmtime_engine: None,
             compiled_cache: CompiledWasmCache::default(),
+            native_log_root: None,
             compiled_artifact: None,
             pool: None,
             inbound_rx: None,

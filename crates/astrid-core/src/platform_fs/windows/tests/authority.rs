@@ -134,3 +134,50 @@ fn captured_directory_handle_moves_without_adopting_a_late_source_name() {
         b"captured bytes"
     );
 }
+
+#[test]
+fn stopped_volume_metadata_observation_preserves_live_writer() {
+    let _serial = serial_test_guard();
+    let root = private_temp();
+    let path = root.path().join("astrid.volume");
+    let mut writer = create_new_private_file_shared(&path).unwrap();
+    writer.try_lock().unwrap();
+    // A content reader must still refuse concurrent writable media.
+    let error = validate_private_file(&path).unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(32));
+    super::super::validate_private_file_metadata(&path).unwrap();
+    let competing = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    assert!(
+        competing.try_lock().is_err(),
+        "observation released the live owner lock"
+    );
+    // Observation neither reads locked payload bytes nor releases the owner.
+    writer.write_all(b"owned volume").unwrap();
+    writer.sync_all().unwrap();
+    drop(writer);
+    competing.try_lock().unwrap();
+    drop(competing);
+    validate_private_file(&path).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"owned volume");
+}
+
+#[test]
+fn stopped_volume_metadata_observation_rejects_nonprivate_file_and_parent() {
+    let _serial = serial_test_guard();
+    let root = private_temp();
+    let path = root.path().join("astrid.volume");
+    drop(create_new_private_file_shared(&path).unwrap());
+    set_world_entry(&path, FILE_GENERIC_READ, true);
+    assert!(super::super::validate_private_file_metadata(&path).is_err());
+    apply_private_acl(&path, false).unwrap();
+    set_world_entry(root.path(), FILE_GENERIC_READ, true);
+    assert!(super::super::validate_private_file_metadata(&path).is_err());
+    // Validation must not repair either ACL.
+    assert!(validate_private_directory(root.path()).is_err());
+    apply_private_acl(root.path(), true).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+}

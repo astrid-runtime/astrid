@@ -3,7 +3,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use super::*;
 use crate::engine::durable::format::append_frame;
-use crate::engine::durable::media::StoreMetadata;
+use crate::engine::durable::media::{
+    STREAM_WRITE_BUFFER_BYTES as WRITE_BUFFER_BYTES, StoreMetadata,
+};
 
 struct ObservedFile {
     file: File,
@@ -141,4 +143,95 @@ fn streamed_snapshot_reports_mid_payload_io_failure() {
             .is_err()
     );
     assert_eq!(file.written, WRITE_BUFFER_BYTES + 123);
+}
+
+#[test]
+fn snapshot_payload_reader_handles_small_and_empty_reads() {
+    let scheme = IdentityScheme::new(1, 1).unwrap();
+    for count in [0, 1, 4096] {
+        let state = state(count);
+        let snapshot = Snapshot::new(&state, scheme).unwrap();
+        let expected = super::super::encode_snapshot(&state, scheme).unwrap();
+        for chunk in [1, 7, WRITE_BUFFER_BYTES] {
+            let mut reader = snapshot.payload_reader();
+            assert_eq!(reader.read(&mut []).unwrap(), 0);
+            let mut buffer = vec![0; chunk];
+            let mut actual = Vec::new();
+            loop {
+                let read = reader.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                actual.extend_from_slice(&buffer[..read]);
+                assert_eq!(reader.read(&mut []).unwrap(), 0);
+            }
+            assert_eq!(actual, expected, "count={count}, chunk={chunk}");
+        }
+    }
+}
+
+#[test]
+fn volume_index_snapshot_is_one_durable_streamed_record() {
+    use crate::engine::durable::tests::RecordingVolume;
+    use crate::engine::durable::{NoFaults, media};
+    use crate::volume::HostedFileVolume;
+
+    let state = state(4096);
+    let scheme = IdentityScheme::new(1, 1).unwrap();
+    let payload = super::super::encode_snapshot(&state, scheme).unwrap();
+    let mut expected = tempfile::tempfile().unwrap();
+    append_frame(&mut expected, INDEX_MAGIC, &payload).unwrap();
+    expected.rewind().unwrap();
+    let mut bytes = Vec::new();
+    expected.read_to_end(&mut bytes).unwrap();
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("astrid.volume");
+    let volume = HostedFileVolume::open(&path).unwrap();
+    let recording = RecordingVolume::wrap(volume.clone());
+    let index =
+        super::super::replace_volume_index(recording.clone(), &state, scheme, &NoFaults).unwrap();
+    assert_eq!(recording.sync_count(), 1);
+    let records = volume
+        .write_record_payloads()
+        .unwrap()
+        .into_iter()
+        .filter(|(name, _)| name == super::super::INDEX_FILE)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        records,
+        [(
+            super::super::INDEX_FILE.to_owned(),
+            u64::try_from(bytes.len()).unwrap()
+        )]
+    );
+    drop(index);
+    drop(recording);
+    drop(volume);
+
+    let reopened = HostedFileVolume::open(&path).unwrap();
+    let mut index = media::File::volume(reopened, super::super::INDEX_FILE, false).unwrap();
+    let mut actual = Vec::new();
+    index.read_to_end(&mut actual).unwrap();
+    assert_eq!(actual, bytes);
+}
+
+#[test]
+fn volume_index_snapshot_sync_failure_is_not_acknowledged() {
+    use crate::engine::durable::NoFaults;
+    use crate::engine::durable::tests::RecordingVolume;
+    use crate::volume::HostedFileVolume;
+
+    let directory = tempfile::tempdir().unwrap();
+    let volume = HostedFileVolume::open(directory.path().join("astrid.volume")).unwrap();
+    let recording = RecordingVolume::wrap(volume);
+    recording.fail_next_syncs(1);
+    let result = super::super::replace_volume_index(
+        recording.clone(),
+        &state(4096),
+        IdentityScheme::new(1, 1).unwrap(),
+        &NoFaults,
+    );
+    assert!(matches!(result, Err(DurableError::Io { .. })));
+    assert_eq!(recording.sync_count(), 1);
 }

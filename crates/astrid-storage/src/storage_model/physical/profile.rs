@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use crate::storage_model::{BlobId, InvocationId, ObjectId};
 
 use super::PhysicalModelError;
-use super::codec::{Decoder, Encoder};
+use super::codec::{Decoder, Encoder, EncodingSink};
 use super::identity::{
     PhysicalIdentity, RepresentationProfileId, RepresentationRecordId, decode_blob_id,
     decode_object_id, decode_profile_id, decode_record_id, encode_blob_id, encode_object_id,
@@ -14,6 +14,55 @@ use super::identity::{
 
 const PROFILE_VERSION: u16 = 1;
 const BOUNDS_VERSION: u16 = 1;
+const PROFILE_IDENTITY_CONTEXT: &str = "astrid-representation-profile-v1\0";
+
+#[cfg(test)]
+std::thread_local! {
+    static IDENTIFIED_PROFILE_DECODES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn count_identified_profile_decodes_during<T>(work: impl FnOnce() -> T) -> (T, usize) {
+    IDENTIFIED_PROFILE_DECODES.with(|count| count.set(0));
+    let result = work();
+    (
+        result,
+        IDENTIFIED_PROFILE_DECODES.with(core::cell::Cell::get),
+    )
+}
+
+/// An owned, canonically decoded profile bound to its actual byte identity.
+/// The fields stay private so a caller cannot substitute an unchecked ID.
+/// Validation passes may reuse this value for records sharing one profile;
+/// it is not a persistent cache or a substitute for decoding cold media.
+pub(crate) struct IdentifiedProfile {
+    profile: RepresentationProfile,
+    identity: RepresentationProfileId,
+}
+
+impl IdentifiedProfile {
+    pub(crate) fn decode<I: PhysicalIdentity>(
+        identity: &I,
+        bytes: &[u8],
+    ) -> Result<Self, PhysicalModelError> {
+        #[cfg(test)]
+        IDENTIFIED_PROFILE_DECODES.with(|count| count.set(count.get().strict_add(1)));
+        let profile = RepresentationProfile::decode(bytes)?;
+        // decode has already checked exact canonical re-encoding. Hashing that
+        // same input avoids allocating and encoding the owned value again.
+        let identity =
+            RepresentationProfileId::new(identity.identify(PROFILE_IDENTITY_CONTEXT, bytes));
+        Ok(Self { profile, identity })
+    }
+
+    pub(crate) const fn profile(&self) -> &RepresentationProfile {
+        &self.profile
+    }
+
+    pub(crate) const fn identity(&self) -> RepresentationProfileId {
+        self.identity
+    }
+}
 
 /// Execution and expansion ceilings pinned by one representation profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,7 +305,7 @@ impl Dependency {
         }
     }
 
-    pub(super) fn encode_into(self, encoder: &mut Encoder) {
+    pub(super) fn encode_into<W: EncodingSink>(self, encoder: &mut Encoder<W>) {
         match self {
             Self::LogicalObject(object) => {
                 encoder.u8(0);
@@ -528,10 +577,9 @@ impl RepresentationProfile {
         &self,
         identity: &I,
     ) -> Result<RepresentationProfileId, PhysicalModelError> {
-        Ok(RepresentationProfileId::new(identity.identify(
-            "astrid-representation-profile-v1\0",
-            &self.encode()?,
-        )))
+        Ok(RepresentationProfileId::new(
+            identity.identify(PROFILE_IDENTITY_CONTEXT, &self.encode()?),
+        ))
     }
 
     fn validate_parts(&self) -> Result<(), PhysicalModelError> {

@@ -29,11 +29,19 @@ async fn interrupted_key_recovery_resumes_with_atomic_sentinel_staging() {
     interrupted_recovery(RestoreCut::SentinelStaging).await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn legacy_retiring_sentinel_staging_remains_recoverable() {
+    interrupted_recovery(RestoreCut::LegacySentinelStaging).await;
+}
+
 enum RestoreCut {
     BeforeProjection,
     SentinelDirectory,
     #[cfg(unix)]
     SentinelStaging,
+    #[cfg(unix)]
+    LegacySentinelStaging,
     FirstProjectedFile,
 }
 
@@ -49,18 +57,16 @@ async fn atomic_sentinel_staging_without_recovery_intent_is_rejected() {
 }
 
 async fn reject_sentinel_without_intent(staging: bool) {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(root.path());
     home.ensure().unwrap();
     astrid_core::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();
-    astrid_core::platform_fs::atomic_write_private_file(&home.runtime_key_path(), &[7; 32])
-        .unwrap();
+    super::write_projection_file(home.root(), "keys/runtime.key", &[7; 32]).unwrap();
     let store = open_runtime_principal_store(&home, quota()).await.unwrap();
     store.pack_and_retire_runtime_projection(&home).unwrap();
     drop(store);
     astrid_core::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();
-    astrid_core::platform_fs::atomic_write_private_file(&home.runtime_key_path(), &[9; 32])
-        .unwrap();
+    super::write_projection_file(home.root(), "keys/runtime.key", &[9; 32]).unwrap();
     astrid_core::platform_fs::ensure_private_directory(&home.root().join("etc")).unwrap();
     let staged = home
         .root()
@@ -81,22 +87,24 @@ async fn reject_sentinel_without_intent(staging: bool) {
 }
 
 async fn interrupted_recovery(cut: RestoreCut) {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(root.path());
     home.ensure().unwrap();
     astrid_core::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();
-    astrid_core::platform_fs::atomic_write_private_file(&home.runtime_key_path(), &[7; 32])
-        .unwrap();
+    super::write_projection_file(home.root(), "keys/runtime.key", &[7; 32]).unwrap();
     let store = open_runtime_principal_store(&home, quota()).await.unwrap();
     store.pack_and_retire_runtime_projection(&home).unwrap();
     astrid_core::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();
-    astrid_core::platform_fs::atomic_write_private_file(&home.runtime_key_path(), &[9; 32])
-        .unwrap();
+    super::write_projection_file(home.root(), "keys/runtime.key", &[9; 32]).unwrap();
 
     // Stop at the production boundary after durable evidence preservation,
     // then materialize only one real volume-owned file. Drop the store without
     // graceful retirement, as an interrupted restore would leave it.
-    assert!(super::key_recovery::recover(&home, &store).unwrap());
+    assert!(
+        super::stopped_recovery::recover(&home, &store)
+            .unwrap()
+            .is_some()
+    );
     match cut {
         RestoreCut::BeforeProjection => {},
         RestoreCut::SentinelDirectory => {
@@ -105,14 +113,9 @@ async fn interrupted_recovery(cut: RestoreCut) {
             astrid_core::platform_fs::ensure_private_directory(&home.root().join("etc")).unwrap();
         },
         #[cfg(unix)]
-        RestoreCut::SentinelStaging => {
-            let staged = home
-                .root()
-                .join("etc/.astrid-private-00000000000040008000000000000001");
-            // These deliberately incomplete bytes must never become the
-            // layout version or any admitted System-owned content.
-            astrid_core::platform_fs::atomic_write_private_file(&staged, b"incomplete").unwrap();
-        },
+        RestoreCut::SentinelStaging => plant_sentinel_staging(&home, &store, false),
+        #[cfg(unix)]
+        RestoreCut::LegacySentinelStaging => plant_sentinel_staging(&home, &store, true),
         RestoreCut::FirstProjectedFile => {
             let sentinel = ContentName::new("etc/layout-version").unwrap();
             let bytes = store
@@ -158,15 +161,14 @@ async fn interrupted_recovery(cut: RestoreCut) {
 
 #[tokio::test]
 async fn replacement_key_cannot_seed_missing_volume_identity() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(root.path());
     home.ensure().unwrap();
     let store = open_runtime_principal_store(&home, quota()).await.unwrap();
     store.pack_and_retire_runtime_projection(&home).unwrap();
     drop(store);
     astrid_core::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();
-    astrid_core::platform_fs::atomic_write_private_file(&home.runtime_key_path(), &[9; 32])
-        .unwrap();
+    super::write_projection_file(home.root(), "keys/runtime.key", &[9; 32]).unwrap();
     let error = open_runtime_principal_store(&home, quota())
         .await
         .err()
@@ -177,7 +179,7 @@ async fn replacement_key_cannot_seed_missing_volume_identity() {
 
 #[tokio::test]
 async fn active_projection_cannot_be_reclassified_as_stopped_key_recovery() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(root.path());
     home.ensure().unwrap();
     let store = open_runtime_principal_store(&home, quota()).await.unwrap();
@@ -185,8 +187,7 @@ async fn active_projection_cannot_be_reclassified_as_stopped_key_recovery() {
     store.establish_runtime_projection_receipt(&home).unwrap();
     drop(store);
     astrid_core::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();
-    astrid_core::platform_fs::atomic_write_private_file(&home.runtime_key_path(), &[9; 32])
-        .unwrap();
+    super::write_projection_file(home.root(), "keys/runtime.key", &[9; 32]).unwrap();
     let error = open_runtime_principal_store(&home, quota())
         .await
         .err()
@@ -197,26 +198,27 @@ async fn active_projection_cannot_be_reclassified_as_stopped_key_recovery() {
 
 #[tokio::test]
 async fn stopped_volume_recovers_replacement_key_without_changing_identity() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_directory::temporary().unwrap();
     let home = AstridHome::from_path(root.path());
     home.ensure().unwrap();
     astrid_core::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();
-    astrid_core::platform_fs::atomic_write_private_file(&home.runtime_key_path(), &[7; 32])
-        .unwrap();
+    super::write_projection_file(home.root(), "keys/runtime.key", &[7; 32]).unwrap();
     let store = open_runtime_principal_store(&home, quota()).await.unwrap();
     store.pack_and_retire_runtime_projection(&home).unwrap();
     drop(store);
 
     // Published stopped-install code recreated this directory with the umask
     // and generated a new private key before the daemon admitted its volume.
+    #[cfg(not(windows))]
     std::fs::create_dir(home.keys_dir()).unwrap();
+    #[cfg(windows)]
+    astrid_core::platform_fs::create_private_directory(&home.keys_dir()).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(home.keys_dir(), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    astrid_core::platform_fs::atomic_write_private_file(&home.runtime_key_path(), &[9; 32])
-        .unwrap();
+    super::write_projection_file(home.root(), "keys/runtime.key", &[9; 32]).unwrap();
 
     home.ensure().expect("recognize stopped-key recovery shape");
     assert!(home.validate_runtime_identity_provisioning().is_err());
@@ -224,8 +226,7 @@ async fn stopped_volume_recovers_replacement_key_without_changing_identity() {
     // Its private lock directory is ephemeral, not a surviving projection.
     let boot_run = home.root().join("run");
     astrid_core::platform_fs::ensure_private_directory(&boot_run).unwrap();
-    astrid_core::platform_fs::atomic_write_private_file(&boot_run.join("system.lock"), b"")
-        .unwrap();
+    super::write_projection_file(home.root(), "run/system.lock", b"").unwrap();
     let store = open_runtime_principal_store(&home, quota()).await.unwrap();
     assert_eq!(std::fs::read(home.runtime_key_path()).unwrap(), [7; 32]);
     let name = ContentName::new(format!(
@@ -250,4 +251,28 @@ async fn stopped_volume_recovers_replacement_key_without_changing_identity() {
         Some(vec![9; 32])
     );
     store.pack_and_retire_runtime_projection(&home).unwrap();
+}
+
+#[cfg(unix)]
+fn plant_sentinel_staging(
+    home: &AstridHome,
+    store: &crate::principal_state::RuntimePrincipalStore,
+    legacy: bool,
+) {
+    let name = if legacy {
+        // Model an interrupted older release with its schema-1 inventory.
+        let entries = super::active_projection_entries(home, store).unwrap();
+        let receipt =
+            super::receipt_ingest(home, super::ReceiptPhase::Retiring, &entries, None).unwrap();
+        store
+            .replace_contiguous_files_removing_exact(StateOwner::System, [receipt], &[], None)
+            .unwrap();
+        store.content().flush().unwrap();
+        ".astrid-private-00000000000040008000000000000001".to_owned()
+    } else {
+        let receipt = super::active::read(home, store).unwrap().unwrap();
+        receipt.staging_scope().unwrap().temporary_basename()
+    };
+    let staged = home.root().join("etc").join(name);
+    astrid_core::platform_fs::atomic_write_private_file(&staged, b"incomplete").unwrap();
 }

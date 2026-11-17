@@ -18,6 +18,7 @@ fn sustained_overwrites_cross_checkpoint_boundaries() {
     }
     writer.sync().unwrap();
     let baseline = std::fs::metadata(&path).unwrap().len();
+    #[cfg(unix)]
     let started = std::time::Instant::now();
     for batch in 1_u64..=120 {
         for _ in 0..1000 {

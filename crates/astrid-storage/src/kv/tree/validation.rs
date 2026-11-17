@@ -233,8 +233,7 @@ where
                 "KV checkpoint requires a sealed certificate for the current tree".to_owned(),
             ));
         }
-        let entries = self.checkpoint_entries(header)?;
-        let tree = self.build_sorted_slots(entries)?;
+        let tree = self.rebuild_checkpoint(header)?;
         let certificate = tree.map_or(ValidatedCheckpoint::empty(), ValidatedCheckpoint::certified);
         Ok((
             tree,

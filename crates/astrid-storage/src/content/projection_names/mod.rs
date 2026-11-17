@@ -5,6 +5,18 @@
 //! [`ContentName`](super::ContentName).
 
 mod planner;
+mod raw;
+#[cfg(windows)]
+pub(crate) use raw::{
+    visit_raw_projection_collisions_with_key, visit_raw_protected_authority_collisions_with_key,
+};
+
+pub(crate) use raw::{
+    RawProjectionCollision, find_raw_projection_collision, find_raw_protected_authority_collision,
+    raw_projection_spelling_is_canonical,
+};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use raw::{visit_raw_projection_collisions, visit_raw_protected_authority_collisions};
 #[cfg(test)]
 mod tests;
 
@@ -19,6 +31,8 @@ use astrid_core::kernel_api::{
     ProjectionNamePolicyPreset,
 };
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use planner::comparison_key as projection_name_comparison_key;
 pub use planner::plan_projection_names;
 
 /// Versioned Unicode comparison applied independently to each path segment.

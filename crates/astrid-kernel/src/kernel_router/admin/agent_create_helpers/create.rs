@@ -31,6 +31,10 @@ pub(crate) async fn provision_new_principal(
     allow_admin_clone: bool,
     ownership: &super::super::handlers::creation_authority::CreationAuthority,
 ) -> AdminResponseBody {
+    let install_fence = match reserve_clone_installs(kernel, clone_from.as_ref()) {
+        Ok(fence) => fence,
+        Err(response) => return response,
+    };
     let RegisteredPrincipal { profile, user_id } = match register_new_principal(
         kernel,
         principal.clone(),
@@ -57,64 +61,27 @@ pub(crate) async fn provision_new_principal(
         },
     };
 
-    let views = if clone_from.is_some() {
-        match super::initialization::lock_initializing_capsules(
-            kernel,
-            &principal,
-            &profile.capsules,
-        )
-        .await
-        {
-            Ok(views) => views,
-            Err(error) => {
-                return super::rollback::rollback_failed_initialization(
-                    kernel,
-                    &principal,
-                    &initialization,
-                    err_internal(error),
-                )
-                .await;
-            },
-        }
-    } else {
-        Vec::new()
-    };
-
-    if let Err(e) = profile.save_to_path(&profile_path) {
-        return super::rollback::rollback_failed_initialization_with_views(
-            kernel,
-            &principal,
-            &initialization,
-            views,
-            err_internal(format!("profile save failed: {e}")),
-        )
-        .await;
-    }
-
-    #[cfg(all(test, not(target_family = "wasm")))]
-    super::super::state_tests_agent_derive::workspace::pause_after_profile_publication(&principal)
-        .await;
-
-    // Principal KV/content roots are UID-bound and provision lazily by the
-    // authoritative runtime store. Do not recreate the released native
-    // `~/.astrid/home/{alias}` tree here; that path is migration input only.
-
-    if let Some(source) = clone_from.as_ref()
-        && let Err(e) =
-            materialize_cloned_capsule_installs(kernel, source, &principal, &profile.capsules)
+    let views = match publish_initial_profile(
+        kernel,
+        &principal,
+        &profile,
+        &profile_path,
+        clone_from.as_ref(),
+    )
+    .await
     {
-        return super::rollback::rollback_failed_initialization_with_views(
-            kernel,
-            &principal,
-            &initialization,
-            views,
-            err_internal(format!("capsule install clone failed: {e}")),
-        )
-        .await;
-    }
-
-    #[cfg(all(test, not(target_family = "wasm")))]
-    super::super::state_tests_agent_derive::initialization::pause_after_install(&principal).await;
+        Ok(views) => views,
+        Err(ProfilePublicationFailure { message, views }) => {
+            return super::rollback::rollback_failed_initialization_with_views(
+                kernel,
+                &principal,
+                &initialization,
+                views,
+                err_internal(message),
+            )
+            .await;
+        },
+    };
 
     // State inheritance is OPT-IN. By default the new principal inherits
     // NOTHING — least privilege, and no silent leak of `default`'s env
@@ -134,6 +101,7 @@ pub(crate) async fn provision_new_principal(
     }
 
     drop(views);
+    drop(install_fence);
     warm_created_principal(kernel, principal.clone());
 
     info!(%principal, user_id = %user_id, "Layer 6 agent.create");
@@ -141,6 +109,114 @@ pub(crate) async fn provision_new_principal(
         "principal": principal.as_str(),
         "astrid_user_id": user_id,
     }))
+}
+
+fn reserve_clone_installs(
+    kernel: &crate::Kernel,
+    source: Option<&PrincipalId>,
+) -> Result<Option<tokio::sync::OwnedRwLockWriteGuard<()>>, AdminResponseBody> {
+    // Installs retain this fence even without environment changes. The admin
+    // lock pins source identity/removal, while this nonblocking fence pins its
+    // package inventory through copy. Waiting would invert install's lock order.
+    source
+        .map(|_| {
+            Arc::clone(&kernel.env_install_fence)
+                .try_write_owned()
+                .map_err(|_| {
+                    err_internal("capsule install in progress; retry the clone".to_owned())
+                })
+        })
+        .transpose()
+}
+
+async fn lock_clone_inventory(
+    kernel: &crate::Kernel,
+    source: Option<&PrincipalId>,
+    target: &PrincipalId,
+) -> Result<(Vec<String>, Vec<crate::CapsuleViewGuard>), String> {
+    let capsules = source
+        .map(|source| installed_capsules(kernel, source))
+        .transpose()?
+        .unwrap_or_default();
+    // Capsule grants describe the tool surface, not installed packages. Lock
+    // every package we will copy before making the target profile visible.
+    let views =
+        super::initialization::lock_initializing_capsules(kernel, target, &capsules).await?;
+    Ok((capsules, views))
+}
+
+/// Publication errors retain the initialization locks until rollback has
+/// reserved the exact assignment and closed capsule admission.
+struct ProfilePublicationFailure {
+    message: String,
+    views: Vec<crate::CapsuleViewGuard>,
+}
+
+async fn publish_initial_profile(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    profile: &PrincipalProfile,
+    profile_path: &Path,
+    source: Option<&PrincipalId>,
+) -> Result<Vec<crate::CapsuleViewGuard>, ProfilePublicationFailure> {
+    let (capsules, views) = lock_clone_inventory(kernel, source, principal)
+        .await
+        .map_err(|message| ProfilePublicationFailure {
+            message,
+            views: Vec::new(),
+        })?;
+    if let Err(error) = profile.save_to_path(profile_path) {
+        return Err(ProfilePublicationFailure {
+            message: format!("profile save failed: {error}"),
+            views,
+        });
+    }
+    #[cfg(all(test, not(target_family = "wasm")))]
+    super::super::state_tests_agent_derive::workspace::pause_after_profile_publication(principal)
+        .await;
+    #[cfg(all(test, not(target_family = "wasm")))]
+    super::super::state_tests_agent_clone::inventory::pause_after_profile_publication(principal)
+        .await;
+
+    // Principal KV/content roots are UID-bound and provision lazily by the
+    // authoritative runtime store. Do not recreate the released native
+    // `~/.astrid/home/{alias}` tree here; that path is migration input only.
+    if let Some(source) = source
+        && let Err(error) =
+            materialize_cloned_capsule_installs(kernel, source, principal, &capsules)
+    {
+        return Err(ProfilePublicationFailure {
+            message: format!("capsule install clone failed: {error}"),
+            views,
+        });
+    }
+    #[cfg(all(test, not(target_family = "wasm")))]
+    super::super::state_tests_agent_derive::initialization::pause_after_install(principal).await;
+    Ok(views)
+}
+
+/// Read the source's durable installation set while the caller retains both
+/// the admin identity lock and install fence. Runtime-loaded views and tool
+/// grants are deliberately not inventory authorities.
+fn installed_capsules(kernel: &crate::Kernel, source: &PrincipalId) -> Result<Vec<String>, String> {
+    let store = kernel
+        .principal_store
+        .as_ref()
+        .ok_or_else(|| "authoritative principal store is unavailable".to_owned())?;
+    let uid = kernel
+        .principal_directory
+        .uid_for(source)
+        .map_err(|error| format!("resolve source principal UID: {error}"))?;
+    store
+        .capsules()
+        .list(&astrid_storage::StateOwner::Principal(uid))
+        .map(|packages| {
+            packages
+                .into_iter()
+                .map(|package| package.id().to_owned())
+                .collect()
+        })
+        .map_err(|error| format!("read source capsule inventory: {error}"))
 }
 
 fn warm_created_principal(kernel: &Arc<crate::Kernel>, principal: PrincipalId) {

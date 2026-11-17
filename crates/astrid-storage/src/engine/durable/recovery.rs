@@ -1,5 +1,8 @@
 //! Authoritative startup and in-process recovery for the durable engine.
 
+#[cfg(test)]
+mod tests;
+
 use super::wal::{durable_error as wal_durable_error, recover_wal};
 use super::{
     ARENA_FILE, ArenaReader, DurableEngine, DurableError, DurableFiles, DurableInner, DurableWal,
@@ -46,12 +49,13 @@ where
     C: PrincipalCodec<P>,
 {
     recover_interrupted_compaction(store_root, principal_codec, identity, limits)?;
-    let mut representations =
-        super::representations::RepresentationStore::open(store_root, limits)?;
-    let protected_arena_len = representations.as_ref().map_or(
-        Ok(0),
-        super::representations::RepresentationStore::generation_zero_protected_len,
-    )?;
+    let recovered =
+        super::representations::RepresentationStore::open_for_recovery(store_root, limits)?;
+    let (mut representations, generation_zero) = match recovered {
+        Some((store, placements)) => (Some(store), placements.into_index()?),
+        None => (None, super::representations::GenerationZeroIndex::default()),
+    };
+    let protected_arena_len = generation_zero.protected_len();
     let mut arena = open_rw_capability(store_root, Path::new(ARENA_FILE), true)?;
     let mut roots = open_rw_capability(store_root, Path::new(ROOT_FILE), true)?;
     let mut index_cache = open_rw_capability(store_root, Path::new(INDEX_FILE), true).ok();
@@ -84,9 +88,7 @@ where
         index_cache = Some(replace_index(store_root, &state, scheme, faults)?);
         (state.objects, state.arena_tail)
     };
-    if let Some(representations) = &mut representations {
-        representations.validate_generation_zero_index(&index)?;
-    }
+    generation_zero.validate(&index)?;
     let mut index = index;
     let wal_writer = if let Some(wal_file) = wal_file {
         Some(replay_transaction_wal(
@@ -162,12 +164,13 @@ where
     volume
         .sync()
         .map_err(|source| io_error("flush Astrid volume namespace", source))?;
-    let mut representations =
-        super::representations::RepresentationStore::open_volume(volume, limits)?;
-    let protected_arena_len = representations.as_ref().map_or(
-        Ok(0),
-        super::representations::RepresentationStore::generation_zero_protected_len,
-    )?;
+    let recovered =
+        super::representations::RepresentationStore::open_volume_for_recovery(volume, limits)?;
+    let (mut representations, generation_zero) = match recovered {
+        Some((store, placements)) => (Some(store), placements.into_index()?),
+        None => (None, super::representations::GenerationZeroIndex::default()),
+    };
+    let protected_arena_len = generation_zero.protected_len();
     let (index, arena_tail) = recover_volume_index(
         volume,
         &mut arena,
@@ -177,9 +180,7 @@ where
         protected_arena_len,
         faults,
     )?;
-    if let Some(store) = &mut representations {
-        store.validate_generation_zero_index(&index)?;
-    }
+    generation_zero.validate(&index)?;
     let mut index = index;
     let wal_writer = if let Some(wal_file) = wal_file {
         Some(replay_transaction_wal(
@@ -412,11 +413,32 @@ where
             _ => {},
         }
 
+        // Cancel/join outside `inner` first. Worker-only atomic poison must still
+        // heal here: reconcile into `inner.poisoned` before `recover_locked`.
+        let mut arbiter = super::checkpoint_worker::cancel_join_checkpoint_worker(
+            self.checkpoint_arbiter.as_ref(),
+            self.lifecycle.as_ref(),
+        );
+        arbiter.bump_custody()?;
         let mut inner = self.inner.lock();
-        self.recover_locked(&mut inner)
+        let lifecycle = self.lifecycle.load(std::sync::atomic::Ordering::Acquire);
+        if lifecycle == LIFECYCLE_CLOSED {
+            return Err(DurableError::Closed);
+        }
+        if lifecycle == super::LIFECYCLE_REQUIRES_RECOVERY || inner.poisoned {
+            inner.poisoned = true;
+        } else if inner.files.is_some() {
+            return Ok(false);
+        } else {
+            return Err(DurableError::Closed);
+        }
+        let recovered = self.recover_locked(&mut inner);
+        drop(inner);
+        drop(arbiter);
+        recovered
     }
 
-    fn recover_locked(&self, inner: &mut DurableInner<P>) -> Result<bool, DurableError> {
+    pub(super) fn recover_locked(&self, inner: &mut DurableInner<P>) -> Result<bool, DurableError> {
         if !inner.poisoned {
             return if inner.files.is_some() {
                 Ok(false)
@@ -461,7 +483,9 @@ where
                     inner.pending_wal = super::wal::PendingWalOverlay::default();
                     inner.validated = recovered.validated;
                     inner.files = Some(recovered.files);
-                    inner.representations = recovered.representations;
+                    inner.representations = recovered
+                        .representations
+                        .map(super::checkpoint_worker::wrap_representations);
                     *self.wal.lock() = wal;
                     inner.poisoned = false;
                     inner.arena_generation = next_generation;
@@ -525,10 +549,35 @@ where
         &self,
         recovery: &mut RecoveryScope,
     ) -> Result<MutexGuard<'_, DurableInner<P>>, DurableError> {
-        let mut inner = self.inner.lock();
-        if inner.poisoned {
+        let inner = self.inner.lock();
+        let lifecycle = self.lifecycle.load(std::sync::atomic::Ordering::Acquire);
+        if lifecycle == super::LIFECYCLE_CLOSED {
+            return Err(DurableError::Closed);
+        }
+        let needs_recovery = inner.poisoned || lifecycle == super::LIFECYCLE_REQUIRES_RECOVERY;
+        if needs_recovery {
             recovery.enter()?;
-            self.recover_locked(&mut inner)?;
+            // Never join a checkpoint worker while holding `inner`: the worker only
+            // try_locks the arbiter, but may hold the physical mutex. Release inner,
+            // cancel/join under the arbiter, then re-lock and recheck before recovering.
+            drop(inner);
+            let mut arbiter = super::checkpoint_worker::cancel_join_checkpoint_worker(
+                self.checkpoint_arbiter.as_ref(),
+                self.lifecycle.as_ref(),
+            );
+            arbiter.bump_custody()?;
+            let mut inner = self.inner.lock();
+            let lifecycle = self.lifecycle.load(std::sync::atomic::Ordering::Acquire);
+            if lifecycle == super::LIFECYCLE_CLOSED {
+                return Err(DurableError::Closed);
+            }
+            if inner.poisoned || lifecycle == super::LIFECYCLE_REQUIRES_RECOVERY {
+                inner.poisoned = true;
+                self.recover_locked(&mut inner)?;
+            }
+            drop(arbiter);
+            super::ensure_usable(&inner)?;
+            return Ok(inner);
         }
         super::ensure_usable(&inner)?;
         Ok(inner)

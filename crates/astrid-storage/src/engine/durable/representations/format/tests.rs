@@ -1,5 +1,108 @@
 use super::*;
 
+#[test]
+fn authenticated_map_publication_matches_independent_hashing_for_every_node_kind() {
+    use crate::storage_model::PhysicalMapKey;
+    use crate::storage_model::physical::{
+        AuthenticatedPhysicalMap, PlacementMap, ProfileMap, RepresentationMap,
+    };
+    use std::collections::BTreeSet;
+
+    let entries: Vec<_> = (0_u8..32)
+        .map(|index| (PhysicalMapKey::new([index; 32]), vec![index; 128]))
+        .collect();
+    let profiles = ProfileMap::build_dense(entries.clone()).unwrap();
+    let legacy = RepresentationMap::build(entries.clone()).unwrap();
+    let representations = RepresentationMap::build_dense(entries.clone()).unwrap();
+    let placements = PlacementMap::build_dense(entries).unwrap();
+    let maps: [&dyn AuthenticatedPhysicalMap; 4] =
+        [&profiles, &legacy, &representations, &placements];
+    let mut variants = [false; 4];
+    for map in maps {
+        let mut frames = Vec::new();
+        let (result, identifies) = PhysicalMapNode::count_identifies_during(|| {
+            super::super::activation::append_authenticated_map_nodes(
+                &mut frames,
+                map,
+                &mut BTreeSet::new(),
+                &mut BTreeSet::new(),
+                &mut BTreeSet::new(),
+            )
+        });
+        result.unwrap();
+        assert_eq!(identifies, 0);
+        assert_eq!(frames.len(), map.as_canonical().nodes().len());
+        for frame in frames {
+            let node = map
+                .as_canonical()
+                .nodes()
+                .get(&PhysicalMapNodeId::new(frame.identity))
+                .unwrap();
+            let independently_hashed =
+                MetadataFrame::map_node(&Blake3PhysicalIdentity, node).unwrap();
+            assert_eq!(
+                frame.encode().unwrap(),
+                independently_hashed.encode().unwrap()
+            );
+            frame.verify(&Blake3PhysicalIdentity).unwrap();
+            let mut wrong_identity = frame;
+            wrong_identity.identity[0] ^= 1;
+            assert!(wrong_identity.verify(&Blake3PhysicalIdentity).is_err());
+            variants[match node.as_ref() {
+                PhysicalMapNode::Leaf { .. } => 0,
+                PhysicalMapNode::Branch { .. } => 1,
+                PhysicalMapNode::Page { .. } => 2,
+                PhysicalMapNode::Radix { .. } => 3,
+            }] = true;
+        }
+    }
+    assert_eq!(variants, [true; 4]);
+}
+
+#[test]
+fn map_node_metadata_encodes_the_identified_payload_once() {
+    use crate::storage_model::{CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapKey};
+
+    let identity = Blake3PhysicalIdentity;
+    let mut variants = [false; 4];
+    for domain in [
+        PhysicalMapDomain::Profile,
+        PhysicalMapDomain::Representation,
+        PhysicalMapDomain::Placement,
+    ] {
+        let entries: Vec<_> = (0_u8..16)
+            .map(|index| (PhysicalMapKey::new([index; 32]), vec![index; 4096]))
+            .collect();
+        for map in [
+            CanonicalPhysicalMap::build(&identity, domain, entries.clone()).unwrap(),
+            CanonicalPhysicalMap::build_dense(&identity, domain, entries).unwrap(),
+        ] {
+            for (expected_id, node) in map.nodes() {
+                let expected_bytes = node.encode().unwrap();
+                let (variant, context) = match node {
+                    PhysicalMapNode::Leaf { .. } => (0, "astrid-physical-map-node-v1\0"),
+                    PhysicalMapNode::Branch { .. } => (1, "astrid-physical-map-node-v1\0"),
+                    PhysicalMapNode::Page { .. } => (2, "astrid-physical-radix-map-node-v1\0"),
+                    PhysicalMapNode::Radix { .. } => (3, "astrid-physical-radix-map-node-v1\0"),
+                };
+                let (frame, encodings) = PhysicalMapNode::count_encodings_during(|| {
+                    MetadataFrame::map_node(&identity, node).unwrap()
+                });
+                assert_eq!(encodings, 1, "metadata must retain the identified bytes");
+                assert_eq!(frame.kind, MetadataKind::MapNode);
+                assert_eq!(frame.identity, *expected_id.as_bytes());
+                assert_eq!(frame.identity, blake3::derive_key(context, &expected_bytes));
+                assert_eq!(frame.value, expected_bytes);
+                frame.verify(&identity).unwrap();
+                let encoded = frame.encode().unwrap();
+                assert_eq!(MetadataFrame::decode(&encoded).unwrap().value, frame.value);
+                variants[variant] = true;
+            }
+        }
+    }
+    assert_eq!(variants, [true; 4]);
+}
+
 // Frozen pre-borrowing decoder: re-encoding is the canonicality oracle, not a
 // second production parser. Compare acceptance and bytes under malformed input.
 fn owned_reference(bytes: &[u8]) -> Result<MetadataFrame, DurableError> {

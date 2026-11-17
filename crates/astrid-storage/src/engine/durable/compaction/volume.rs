@@ -141,25 +141,28 @@ where
         // Never rebase the published generation against an unpublished arena.
         // Stage a private copy, then publish its pointer, arena and GC evidence
         // together. Every durable prefix consequently has matching placements.
-        let staged_representations = inner
-            .representations
-            .as_mut()
-            .map(|store| {
-                let mut staged = store.prepare_checkpoint_volume(volume, self.limits)?;
-                staged.rebase_compacted_arena(
-                    &arena,
-                    &replacement.index,
-                    &self.identity,
-                    self.limits,
-                )?;
-                // Discard the old placement closure copied for isolated rebasing.
-                // Both private generations remain unreachable until publication;
-                // reclamation below removes the intermediate one as well.
-                staged.prepare_checkpoint_volume(volume, self.limits)
-            })
-            .transpose()?;
+        let staged_reps = {
+            let mut live = super::super::checkpoint_worker::lock_representations(
+                inner.representations.as_ref(),
+            );
+            live.as_mut()
+                .map(|store| {
+                    let mut staged = store.prepare_checkpoint_volume(volume, self.limits)?;
+                    staged.rebase_compacted_arena(
+                        &arena,
+                        &replacement.index,
+                        &self.identity,
+                        self.limits,
+                    )?;
+                    // Discard the old placement closure copied for isolated rebasing.
+                    // Both private generations remain unreachable until publication;
+                    // reclamation below removes the intermediate one as well.
+                    staged.prepare_checkpoint_volume(volume, self.limits)
+                })
+                .transpose()?
+        };
         self.fail_if(super::FaultPoint::AfterCompactionEvidencePrepare)?;
-        let representation_publication = staged_representations
+        let representation_publication = staged_reps
             .as_ref()
             .map(|_| {
                 super::super::representations::RepresentationStore::checkpoint_volume_publication()
@@ -194,9 +197,12 @@ where
             self.limits,
         )?;
         self.fail_if(super::FaultPoint::AfterCompactionArenaPromote)?;
-        inner.representations = staged_representations;
+        inner.representations =
+            staged_reps.map(super::super::checkpoint_worker::wrap_representations);
         self.install_volume_replacement(inner, replacement, Arc::clone(volume))?;
-        if let Some(representations) = inner.representations.as_ref() {
+        if let Some(representations) =
+            super::super::checkpoint_worker::lock_representations(inner.representations.as_ref())
+        {
             representations.reclaim_checkpoint_volume(volume)?;
         }
         volume

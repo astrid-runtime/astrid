@@ -20,8 +20,12 @@ pub(super) struct Report {
     substrate_comparisons: Vec<SubstrateComparison>,
     throughput_scaling: Vec<ThroughputScaling>,
     write_amplifications: Vec<WriteAmplification>,
-    representation_metadata: Vec<RepresentationMetadata>,
+    // Compatibility placeholder. Fake zero-byte series are no longer recorded.
+    representation_metadata: [(); 0],
     resource_peaks: Vec<ResourcePeak>,
+    count_samples: Vec<CountSamples>,
+    /// Flat per-boundary process CPU/RSS rows from checkpoint-churn samples.
+    process_phase_records: Vec<ProcessPhaseRecord>,
 }
 
 impl Report {
@@ -37,8 +41,10 @@ impl Report {
             substrate_comparisons: Vec::new(),
             throughput_scaling: Vec::new(),
             write_amplifications: Vec::new(),
-            representation_metadata: Vec::new(),
+            representation_metadata: [],
             resource_peaks: Vec::new(),
+            count_samples: Vec::new(),
+            process_phase_records: Vec::new(),
         }
     }
 
@@ -171,68 +177,46 @@ impl Report {
         Ok(())
     }
 
-    pub(super) fn record_representation_metadata(
+    pub(super) fn record_resource_peak(
         &mut self,
         name: &'static str,
-        samples: Vec<(u64, u64)>,
+        samples_bytes: Vec<u64>,
     ) -> Result<(), String> {
-        if samples.is_empty() {
-            return Err(format!(
-                "representation metadata metric {name:?} has no samples"
-            ));
-        }
-        if samples.iter().any(|(objects, _)| *objects == 0) {
-            return Err(format!(
-                "representation metadata metric {name:?} has a zero-object sample"
-            ));
-        }
-        let mut encoded = samples
-            .into_iter()
-            .map(
-                |(new_objects, authoritative_bytes_appended)| RepresentationMetadataSample {
-                    new_objects,
-                    authoritative_bytes_appended,
-                    bytes_per_new_object: ratio(authoritative_bytes_appended, new_objects),
-                },
-            )
-            .collect::<Vec<_>>();
-        encoded.sort_by(|left, right| {
-            left.bytes_per_new_object
-                .total_cmp(&right.bytes_per_new_object)
-        });
-        let ratios = encoded
-            .iter()
-            .map(|sample| sample.bytes_per_new_object)
-            .collect::<Vec<_>>();
-        self.representation_metadata.push(RepresentationMetadata {
+        let Some((minimum_bytes, median_bytes, maximum_bytes)) = summarized_u64(&samples_bytes)
+        else {
+            return Err(format!("resource peak {name:?} has no samples"));
+        };
+        self.resource_peaks.push(ResourcePeak {
             name,
-            median_bytes_per_new_object: median_f64(&ratios),
-            samples: encoded,
+            samples_bytes,
+            minimum_bytes,
+            median_bytes,
+            maximum_bytes,
         });
         Ok(())
     }
 
-    pub(super) fn record_resource_peak(
+    pub(super) fn record_counts(
         &mut self,
         name: &'static str,
-        mut samples_bytes: Vec<u64>,
+        samples_counts: Vec<u64>,
     ) -> Result<(), String> {
-        if samples_bytes.is_empty() {
-            return Err(format!("resource peak {name:?} has no samples"));
-        }
-        samples_bytes.sort_unstable();
-        let maximum_bytes = samples_bytes
-            .last()
-            .copied()
-            .ok_or_else(|| format!("resource peak {name:?} has no maximum"))?;
-        self.resource_peaks.push(ResourcePeak {
+        let Some((minimum_count, median_count, maximum_count)) = summarized_u64(&samples_counts)
+        else {
+            return Err(format!("count series {name:?} has no samples"));
+        };
+        self.count_samples.push(CountSamples {
             name,
-            minimum_bytes: samples_bytes[0],
-            median_bytes: median_u64(&samples_bytes),
-            maximum_bytes,
-            samples_bytes,
+            samples_counts,
+            minimum_count,
+            median_count,
+            maximum_count,
         });
         Ok(())
+    }
+
+    pub(super) fn record_process_phase(&mut self, record: ProcessPhaseRecord) {
+        self.process_phase_records.push(record);
     }
 
     pub(super) fn print_table(&self) {
@@ -284,24 +268,18 @@ impl Report {
                 );
             }
         }
-        if !self.representation_metadata.is_empty() {
-            println!();
-            println!(
-                "{:<38} {:>24}",
-                "representation publication", "median bytes/new object"
-            );
-            for metadata in &self.representation_metadata {
-                println!(
-                    "{:<38} {:>24.1}",
-                    metadata.name, metadata.median_bytes_per_new_object
-                );
-            }
-        }
         if !self.resource_peaks.is_empty() {
             println!();
             println!("{:<38} {:>18}", "resource peak", "median bytes");
             for peak in &self.resource_peaks {
                 println!("{:<38} {:>18}", peak.name, peak.median_bytes);
+            }
+        }
+        if !self.count_samples.is_empty() {
+            println!();
+            println!("{:<38} {:>18}", "count", "median count");
+            for series in &self.count_samples {
+                println!("{:<38} {:>18}", series.name, series.median_count);
             }
         }
     }
@@ -318,6 +296,43 @@ struct ResourcePeak {
     minimum_bytes: u64,
     median_bytes: u64,
     maximum_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct CountSamples {
+    name: &'static str,
+    samples_counts: Vec<u64>,
+    minimum_count: u64,
+    median_count: u64,
+    maximum_count: u64,
+}
+
+/// One process-resource observation at a named checkpoint-churn phase boundary.
+#[derive(Debug, Serialize)]
+pub(super) struct ProcessPhaseRecord {
+    pub(super) sample_index: usize,
+    pub(super) phase: &'static str,
+    pub(super) status: ProcessPhaseStatus,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[allow(
+    dead_code,
+    reason = "the evidence schema includes both platform states; harness-free bench builds also set cfg(test)"
+)]
+pub(super) enum ProcessPhaseStatus {
+    #[cfg(any(unix, test))]
+    Measured {
+        user_cpu_nanoseconds: u128,
+        system_cpu_nanoseconds: u128,
+        /// Cumulative process-lifetime peak RSS in bytes at phase end.
+        /// Present on macOS/iOS (bytes) and Linux (`KiB` normalized to bytes);
+        /// `None` when platform `ru_maxrss` units are not interpreted here.
+        process_lifetime_peak_rss_bytes: Option<u64>,
+    },
+    #[cfg(any(not(unix), test))]
+    Unavailable { reason: &'static str },
 }
 
 #[derive(Debug, Serialize)]
@@ -375,20 +390,6 @@ struct WriteAmplification {
     median_physical_to_logical_ratio: f64,
 }
 
-#[derive(Debug, Serialize)]
-struct RepresentationMetadata {
-    name: &'static str,
-    samples: Vec<RepresentationMetadataSample>,
-    median_bytes_per_new_object: f64,
-}
-
-#[derive(Debug, Serialize)]
-struct RepresentationMetadataSample {
-    new_objects: u64,
-    authoritative_bytes_appended: u64,
-    bytes_per_new_object: f64,
-}
-
 impl Metric {
     fn bytes(name: &'static str, bytes: u64, samples: Vec<Duration>) -> Self {
         Self::new(name, Some(bytes), None, samples)
@@ -404,6 +405,7 @@ impl Metric {
         operations: Option<usize>,
         mut samples: Vec<Duration>,
     ) -> Self {
+        let samples_nanoseconds = samples.iter().map(Duration::as_nanos).collect();
         samples.sort_unstable();
         let minimum = samples.first().copied().unwrap_or(Duration::ZERO);
         let median = median_duration(&samples);
@@ -413,7 +415,7 @@ impl Metric {
             name,
             bytes_per_sample: bytes,
             operations_per_sample: operations,
-            samples_nanoseconds: samples.iter().map(Duration::as_nanos).collect(),
+            samples_nanoseconds,
             minimum_milliseconds: duration_milliseconds(minimum),
             median_milliseconds: duration_milliseconds(median),
             maximum_milliseconds: duration_milliseconds(maximum),
@@ -448,6 +450,12 @@ fn median_duration(sorted: &[Duration]) -> Duration {
     }
 }
 
+fn summarized_u64(samples: &[u64]) -> Option<(u64, u64, u64)> {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    Some((*sorted.first()?, median_u64(&sorted), *sorted.last()?))
+}
+
 fn median_u64(sorted: &[u64]) -> u64 {
     match sorted.len() {
         0 => 0,
@@ -465,20 +473,6 @@ fn median_u64(sorted: &[u64]) -> u64 {
             lower
                 .checked_add(half_difference)
                 .expect("the midpoint is bounded by the upper integer")
-        },
-    }
-}
-
-fn median_f64(sorted: &[f64]) -> f64 {
-    match sorted.len() {
-        0 => 0.0,
-        length if length % 2 == 1 => sorted[length / 2],
-        length => {
-            let middle = length / 2;
-            let lower = middle
-                .checked_sub(1)
-                .expect("a nonempty even slice has a lower midpoint");
-            sorted[lower].midpoint(sorted[middle])
         },
     }
 }

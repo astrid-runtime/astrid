@@ -18,6 +18,12 @@ use clap::Parser;
 /// Explicitly bound native secret responder; not enabled by default.
 pub mod native_input;
 
+#[derive(Clone, Copy)]
+enum StoreShutdown {
+    Close,
+    RetainForFinalization,
+}
+
 /// Run the daemon and finalize its durable home after all runtime tasks stop.
 ///
 /// Both binary entry points use this path for API, signal, and idle shutdown.
@@ -38,19 +44,21 @@ pub fn run_to_completion() -> Result<()> {
     }
     let home = astrid_core::dirs::AstridHome::resolve()?;
     let lifecycle = astrid_storage::principal_state::RuntimeLifecycleGuard::acquire(&home)?;
-    {
+    let pending = {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        runtime.block_on(run_with_args(args))?;
-        // Drop joins blocking work and cancels remaining async tasks before any
-        // projection file can be retired. No kernel handles cross this scope.
-    }
-    tracing::info!("Runtime tasks stopped; finalizing durable home");
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(lifecycle.finish())?;
+        let pending =
+            runtime.block_on(run_with_args(args, StoreShutdown::RetainForFinalization))?;
+        // Runtime drop joins blocking work (including gateway KV commits) and
+        // cancels remaining async tasks. Handoff must happen after this join.
+        drop(runtime);
+        pending.ok_or_else(|| anyhow::anyhow!("daemon did not retain finalization ownership"))?
+    };
+    tracing::info!("Runtime tasks stopped; transferring durable custody");
+    let finalization = pending.handoff_for_finalization()?;
+    tracing::info!("Durable custody transferred; finalizing durable home");
+    lifecycle.finish_retained(finalization)?;
     // Tracing can recreate a retired log projection; stderr cannot reopen it.
     eprintln!("Astrid durable home finalized");
     Ok(())
@@ -242,7 +250,9 @@ fn write_readiness_then_arm_ephemeral<T, E>(
 /// Returns an error if the kernel fails to boot, the native local uplink cannot
 /// claim its listener, or the readiness file cannot be written.
 pub async fn run() -> Result<()> {
-    run_with_args(Args::parse()).await
+    run_with_args(Args::parse(), StoreShutdown::Close)
+        .await
+        .map(|_| ())
 }
 
 #[cfg(unix)]
@@ -250,7 +260,10 @@ pub async fn run() -> Result<()> {
     clippy::too_many_lines,
     reason = "boot sequence: sequential config resolution + kernel/capsule setup that does not benefit from splitting"
 )]
-async fn run_with_args(args: Args) -> Result<()> {
+async fn run_with_args(
+    args: Args,
+    shutdown: StoreShutdown,
+) -> Result<Option<astrid_storage::principal_state::PendingRuntimeFinalization>> {
     let workspace_layout = match std::env::var("ASTRID_WORKSPACE_STATE_DIR") {
         Ok(value) => astrid_core::dirs::WorkspaceLayout::new(value)
             .context("invalid ASTRID_WORKSPACE_STATE_DIR")?,
@@ -493,20 +506,33 @@ async fn run_with_args(args: Args) -> Result<()> {
     // API requests and Unix signals have already set it; the non-Unix Ctrl-C
     // branch has not. `send_replace` is intentionally idempotent so the native
     // uplink and any future runtime-owned services always observe shutdown
-    // before their tasks are awaited.
+    // before their tasks are awaited. The gateway listens on this same sticky
+    // watch value; do not introduce a one-shot Notify on this path.
     kernel.shutdown_tx.send_replace(true);
 
-    if let Some(notify) = gateway_shutdown {
-        notify.notify_waiters();
+    if let Some(gateway) = gateway_shutdown {
+        // Abort accepts/handlers without awaiting open SSE/RPC bodies. In-flight
+        // spawn_blocking KV commits remain owned by the task runtime and are
+        // joined by runtime drop before deferred handoff.
+        gateway.abort();
     }
 
-    kernel.shutdown(Some("signal".to_string())).await;
+    let finalization = if matches!(shutdown, StoreShutdown::RetainForFinalization) {
+        Some(
+            kernel
+                .shutdown_retain_pending(Some("signal".to_string()))
+                .await,
+        )
+    } else {
+        kernel.shutdown(Some("signal".to_string())).await;
+        None
+    };
     if let Err(error) = native_uplink_task.await {
         tracing::warn!(%error, "native local uplink task did not exit cleanly");
     }
 
     tracing::info!("Kernel services and native uplink stopped");
-    Ok(())
+    finalization.transpose().map_err(Into::into)
 }
 
 /// Report that native daemon startup is unavailable on this platform.
@@ -523,7 +549,10 @@ async fn run_with_args(args: Args) -> Result<()> {
     clippy::unused_async,
     reason = "the cross-platform daemon entry point remains async even when startup is unsupported"
 )]
-async fn run_with_args(_args: Args) -> Result<()> {
+async fn run_with_args(
+    _args: Args,
+    _shutdown: StoreShutdown,
+) -> Result<Option<astrid_storage::principal_state::PendingRuntimeFinalization>> {
     anyhow::bail!("native Astrid daemon startup is not yet supported on this platform")
 }
 
@@ -549,7 +578,7 @@ async fn load_gateway_config() -> Result<Option<astrid_gateway::GatewayConfig>> 
 fn spawn_gateway(
     cfg: astrid_gateway::GatewayConfig,
     kernel: &std::sync::Arc<astrid_kernel::Kernel>,
-) -> Result<std::sync::Arc<tokio::sync::Notify>> {
+) -> Result<tokio::task::JoinHandle<()>> {
     // Plumb four kernel handles into the gateway:
     //
     //   * the event bus, so the SSE audit stream and the bus-direct
@@ -583,11 +612,12 @@ fn spawn_gateway(
         Some(topic_probe),
     )
     .context("build gateway state")?;
-    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-    let notify_for_task = std::sync::Arc::clone(&notify);
-    tokio::spawn(async move {
+    // Reuse the sticky kernel shutdown watch. A Notify published before the
+    // gateway task parks can be lost; watch retains the shutdown value.
+    let mut shutdown_rx = kernel.shutdown_tx.subscribe();
+    let handle = tokio::spawn(async move {
         let shutdown = async move {
-            notify_for_task.notified().await;
+            let _ = shutdown_rx.wait_for(|requested| *requested).await;
         };
         let capability_probe = move |principal: &astrid_core::PrincipalId,
                                      device_key_id: Option<&str>,
@@ -606,7 +636,7 @@ fn spawn_gateway(
             tracing::error!(error = %e, "astrid-gateway exited with error");
         }
     });
-    Ok(notify)
+    Ok(handle)
 }
 
 #[cfg(all(test, unix))]
@@ -727,5 +757,38 @@ mod tests {
         );
         assert_eq!(result, Err("failed"));
         assert_eq!(*steps.lock().expect("steps lock"), ["ready-failed"]);
+    }
+
+    #[tokio::test]
+    async fn gateway_shutdown_watch_is_sticky_and_abortible() {
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        tx.send_replace(true);
+        // Late subscribers must observe the already-published shutdown value.
+        let mut late = tx.subscribe();
+        assert!(*late.borrow());
+        let mut wait = std::pin::pin!(late.wait_for(|requested| *requested));
+        assert!(matches!(
+            std::future::Future::poll(
+                wait.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            ),
+            std::task::Poll::Ready(_)
+        ));
+        let mut early_wait = std::pin::pin!(rx.wait_for(|requested| *requested));
+        assert!(matches!(
+            std::future::Future::poll(
+                early_wait.as_mut(),
+                &mut std::task::Context::from_waker(std::task::Waker::noop())
+            ),
+            std::task::Poll::Ready(_)
+        ));
+
+        // Retained JoinHandle must be abortible without awaiting serve completion.
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        handle.abort();
+        let join = handle.await.expect_err("aborted gateway task");
+        assert!(join.is_cancelled());
     }
 }

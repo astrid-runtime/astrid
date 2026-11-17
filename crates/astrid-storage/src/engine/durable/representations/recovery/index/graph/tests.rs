@@ -7,7 +7,11 @@ fn id(value: u8) -> PhysicalMapNodeId {
 fn insert(graph: &mut HistoricalMapGraph, value: u8, children: &[u8]) {
     let children: Vec<_> = children.iter().map(|value| id(*value)).collect();
     graph
-        .insert(id(value), MetadataFrameOffset(u64::from(value)), &children)
+        .insert(
+            id(value),
+            FrameLocation::for_test(u64::from(value), 0),
+            &children,
+        )
         .unwrap();
 }
 
@@ -19,7 +23,7 @@ fn forward_references_resolve_without_duplicate_ids_or_per_node_edge_allocations
     assert_eq!(graph.nodes.len(), 3);
     assert_eq!(graph.indices.len(), 3);
     assert_eq!(graph.edge_count(), 2);
-    assert!(graph.offset(&id(2)).is_none());
+    assert!(graph.location(&id(2)).is_none());
     assert!(!graph.closure_checker().complete(Some(id(1))));
     insert(&mut graph, 3, &[]);
     insert(&mut graph, 2, &[3]);
@@ -45,13 +49,13 @@ fn duplicate_resolution_cannot_replace_body_or_grow_edges() {
     for children in [vec![id(2)], vec![id(3), id(4)]] {
         assert!(
             graph
-                .insert(id(1), MetadataFrameOffset(99), &children)
+                .insert(id(1), FrameLocation::for_test(99, 0), &children)
                 .is_err()
         );
         assert_eq!(graph.edge_count(), edges);
         assert_eq!(graph.nodes.len(), 2);
         assert_eq!(graph.len(), 1);
-        assert_eq!(graph.offset(&id(1)).unwrap().0, 1);
+        assert_eq!(graph.location(&id(1)).unwrap().offset(), 1);
     }
 }
 
@@ -123,11 +127,11 @@ fn consuming_offsets_preserves_ordered_child_inventory_and_interned_slots() {
     insert(&mut graph, 2, &[]);
     insert(&mut graph, 3, &[]);
     let node = graph.take(&id(1)).unwrap();
-    assert_eq!(node.offset.0, 1);
+    assert_eq!(node.location.offset(), 1);
     assert_eq!(graph.len(), 2);
     assert_eq!(graph.nodes.len(), 3);
     assert_eq!(graph.edge_count(), 2);
-    assert!(graph.offset(&id(1)).is_none());
+    assert!(graph.location(&id(1)).is_none());
     assert!(graph.take(&id(1)).is_none());
     assert!(graph.take(&id(99)).is_none());
     assert!(!graph.closure_checker().complete(Some(id(1))));
@@ -175,11 +179,11 @@ fn consumed_bodies_cannot_be_resolved_again_or_orphan_their_edges() {
         let counts = (graph.len(), graph.nodes.len(), graph.edge_count());
         assert!(
             graph
-                .insert(id(value), MetadataFrameOffset(99), &[id(3)])
+                .insert(id(value), FrameLocation::for_test(99, 0), &[id(3)])
                 .is_err()
         );
         assert_eq!((graph.len(), graph.nodes.len(), graph.edge_count()), counts);
-        assert!(graph.offset(&id(value)).is_none());
+        assert!(graph.location(&id(value)).is_none());
         assert!(graph.take(&id(value)).is_none());
         let children: &[PhysicalMapNodeId] = if value == 1 { &[id(2)] } else { &[] };
         assert!(graph.matches_children(&node, children));
@@ -190,4 +194,19 @@ fn consumed_bodies_cannot_be_resolved_again_or_orphan_their_edges() {
     assert!(graph.take(&id(5)).is_none());
     insert(&mut graph, 5, &[]);
     assert!(graph.closure_checker().complete(Some(id(4))));
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn historical_node_descriptor_extent_budget() {
+    eprintln!(
+        "historical NodeBody={} NodeDescriptor={} FrameLocation={}",
+        std::mem::size_of::<NodeBody>(),
+        std::mem::size_of::<NodeDescriptor>(),
+        std::mem::size_of::<FrameLocation>()
+    );
+    // Every historical node pays this transient descriptor cost. Guard the
+    // measured eight-byte increase over the previous 32-byte descriptor.
+    assert!(std::mem::size_of::<NodeBody>() <= 24);
+    assert!(std::mem::size_of::<NodeDescriptor>() <= 40);
 }

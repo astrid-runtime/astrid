@@ -312,7 +312,9 @@ async fn repeated_principal_kv_writes_measure_volume_growth_and_recover() {
         .unwrap();
     create_test_principal(&store, "alice").await;
     let path = home.storage_volume_path();
+    #[cfg(unix)]
     let baseline = std::fs::metadata(&path).unwrap().len();
+    #[cfg(unix)]
     let started = std::time::Instant::now();
     for batch in 1_u64..=8 {
         for index in 0_u64..250 {

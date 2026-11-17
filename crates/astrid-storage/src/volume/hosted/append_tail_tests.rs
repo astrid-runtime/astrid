@@ -33,7 +33,7 @@ fn owned_lengths(volume: &HostedFileVolume) -> (u64, u64) {
 }
 
 #[test]
-fn dirty_plain_and_streamed_appends_truncate_once_after_sync() {
+fn dirty_plain_and_streamed_appends_overwrite_known_footer_without_truncation() {
     reset_faults();
     let directory = tempfile::tempdir().unwrap();
     let (volume, region, _) = open_ready_volume(&directory);
@@ -45,8 +45,8 @@ fn dirty_plain_and_streamed_appends_truncate_once_after_sync() {
     volume.rename_region(&region, &first).unwrap();
     assert_eq!(
         prepare_truncate_count(),
-        1,
-        "first plain append strips footer"
+        0,
+        "first plain append overwrites the known footer"
     );
     volume.rename_region(&first, &second).unwrap();
     volume
@@ -57,18 +57,18 @@ fn dirty_plain_and_streamed_appends_truncate_once_after_sync() {
         .unwrap();
     assert_eq!(
         prepare_truncate_count(),
-        1,
-        "later dirty plain/streamed appends must not re-truncate"
+        0,
+        "later dirty plain/streamed appends must not truncate"
     );
     volume.sync().unwrap();
     let after = VolumeRegion::new("after").unwrap();
     reset_prepare_truncate_count();
     volume.rename_region(&second, &after).unwrap();
-    assert_eq!(prepare_truncate_count(), 1);
+    assert_eq!(prepare_truncate_count(), 0);
     volume
         .write_region_from(&after, 0, 5, &mut &b"again"[..])
         .unwrap();
-    assert_eq!(prepare_truncate_count(), 1);
+    assert_eq!(prepare_truncate_count(), 0);
 }
 
 #[test]
@@ -82,6 +82,9 @@ fn failed_prepare_truncate_retries_on_next_append() {
         "synced fixture must carry a durable footer beyond valid_len"
     );
 
+    // Forget the footer proof to exercise an unknown tail. Such tails still
+    // require truncation even when their bytes happen to be a valid footer.
+    volume.state.lock().physical_tail = PhysicalTail::MayExceed;
     set_fail_prepare_truncate(true);
     reset_prepare_truncate_count();
     let error = volume.write_region_at(&region, 0, b"blocked").unwrap_err();
@@ -156,8 +159,8 @@ fn partial_plain_rename_failure_stays_uncertain_and_smaller_retry_reopens() {
     let long = VolumeRegion::new("long-payload-bytes").unwrap();
     let tiny = VolumeRegion::new("tiny").unwrap();
     // Rename reaches append_record directly, without streaming rollback. Allow
-    // its nine fixed/name header writes, then tear the destination-name payload.
-    set_remaining_append_writes(Some(9));
+    // the coalesced fixed header and name writes, then tear the destination-name payload.
+    set_remaining_append_writes(Some(2));
     let error = volume.rename_region(&region, &long).unwrap_err();
     assert!(error.to_string().contains("injected append write failure"));
     set_remaining_append_writes(None);
@@ -288,9 +291,11 @@ fn rollback_truncate_failure_from_dirty_state_leaves_tail_for_retry() {
         "dirty prestate must sit past durable_len"
     );
 
+    // A larger stream writes its header before the short input fails. Keep
+    // a real physical tail rather than relying on small-input prebuffering.
     set_fail_rollback_truncate(true);
     let error = volume
-        .write_region_from(&region, 0, 64, &mut &b"short"[..])
+        .write_region_from(&region, 0, 64 * 1024 + 1, &mut &b"short"[..])
         .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
 
@@ -324,4 +329,50 @@ fn rollback_truncate_failure_from_dirty_state_leaves_tail_for_retry() {
         15
     );
     assert_eq!(&actual, b"after-uncertain");
+}
+
+#[test]
+fn failed_vectored_write_rolls_back_whole_record_and_preserves_cursor() {
+    use crate::volume::VolumeFile;
+    use std::io::{IoSlice, Read, Seek, SeekFrom, Write};
+
+    for (first, second, last_failure) in [
+        (b"new-".to_vec(), b"bytes!".to_vec(), 2),
+        (vec![0x51; 4], vec![0x5A; 64 * 1024], 4),
+    ] {
+        let expected = [first.as_slice(), second.as_slice()].concat();
+        for writes_before_failure in 0..=last_failure {
+            reset_faults();
+            let directory = tempfile::tempdir().unwrap();
+            let (volume, region, path) = open_ready_volume(&directory);
+            let mut file = VolumeFile::open(volume.clone(), region.clone(), false).unwrap();
+            let lengths = owned_lengths(&volume);
+            set_remaining_append_writes(Some(writes_before_failure));
+            assert!(
+                file.write_vectored(&[IoSlice::new(&first), IoSlice::new(&second)])
+                    .is_err()
+            );
+            set_remaining_append_writes(None);
+            assert_eq!(file.stream_position().unwrap(), 0);
+            assert_eq!(owned_lengths(&volume).0, lengths.0);
+            let mut actual = Vec::new();
+            file.read_to_end(&mut actual).unwrap();
+            assert_eq!(actual, b"seed-bytes");
+            file.seek(SeekFrom::Start(0)).unwrap();
+            assert_eq!(
+                file.write_vectored(&[IoSlice::new(&first), IoSlice::new(&second)])
+                    .unwrap(),
+                expected.len()
+            );
+            file.sync_all().unwrap();
+            drop(file);
+            drop(volume);
+            let reopened = HostedFileVolume::open(&path).unwrap();
+            let mut file = VolumeFile::open(reopened, region, false).unwrap();
+            actual.clear();
+            file.read_to_end(&mut actual).unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
+    reset_faults();
 }

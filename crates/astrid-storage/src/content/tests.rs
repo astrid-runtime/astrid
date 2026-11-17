@@ -1725,7 +1725,7 @@ fn faulted_derived_content_commits_neither_input_nor_derivation() {
 
     let mut derived = FaultedDerivedContent;
     let error = store
-        .replace_streaming_batch_removing_exact(
+        .replace_streaming_batch_with_expectation(
             &"alice".to_owned(),
             [ContentIngest::new(
                 name.clone(),
@@ -1733,6 +1733,7 @@ fn faulted_derived_content_commits_neither_input_nor_derivation() {
             )],
             &[],
             Some(&mut derived),
+            crate::content::ContentBatchPreconditions::default(),
         )
         .expect_err("injected derivation fault must stop the root transaction");
     assert!(
@@ -1766,7 +1767,7 @@ fn derived_name_colliding_with_input_publishes_neither() {
 
     let mut derived = FixedDerivedContent { name: name.clone() };
     let error = store
-        .replace_streaming_batch_removing_exact(
+        .replace_streaming_batch_with_expectation(
             &"alice".to_owned(),
             [ContentIngest::new(
                 name.clone(),
@@ -1774,6 +1775,7 @@ fn derived_name_colliding_with_input_publishes_neither() {
             )],
             &[],
             Some(&mut derived),
+            crate::content::ContentBatchPreconditions::default(),
         )
         .unwrap_err();
     assert!(matches!(
@@ -1811,7 +1813,7 @@ fn derived_name_colliding_with_removal_publishes_neither() {
         name: removed.clone(),
     };
     let error = store
-        .replace_streaming_batch_removing_exact(
+        .replace_streaming_batch_with_expectation(
             &"alice".to_owned(),
             [ContentIngest::new(
                 source.clone(),
@@ -1819,6 +1821,7 @@ fn derived_name_colliding_with_removal_publishes_neither() {
             )],
             std::slice::from_ref(&removed),
             Some(&mut derived),
+            crate::content::ContentBatchPreconditions::default(),
         )
         .unwrap_err();
     assert!(matches!(

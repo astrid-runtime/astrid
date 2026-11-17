@@ -1,8 +1,13 @@
 //! Recovery and closed-world validation for physical representation authority.
 
 #[cfg(test)]
+mod io_tests;
+#[cfg(test)]
+mod semantic_profile_tests;
+#[cfg(test)]
 mod tests;
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::SeekFrom;
 
@@ -10,28 +15,49 @@ use super::super::DurableIo;
 
 use crate::storage_model::{
     CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapKey, PhysicalMapNode, PlacementEntry,
-    PlacementSet, Recipe, RepresentationCatalogueRoot, RepresentationProfile,
-    RepresentationProfileId, RepresentationRecord, RepresentationRecordId, RepresentationState,
-    RepresentationStateId,
+    PlacementSet, Recipe, RepresentationCatalogueRoot, RepresentationProfileId,
+    RepresentationRecord, RepresentationRecordId, RepresentationState, RepresentationStateId,
 };
 
-use super::super::format::{read_frame_at, scan_frames_with_source};
+use super::super::format::scan_frames_with_source;
 use super::super::{FRAME_HEADER_LEN, scan_frames};
 use super::format::{
     Blake3PhysicalIdentity, CURRENT_FILE, CURRENT_MAGIC, CurrentPointer, JOURNAL_FILE,
     JOURNAL_MAGIC, JournalEntry, METADATA_FILE, METADATA_MAGIC, MetadataFrame, MetadataKind,
-    journal_digest, map_node_id,
+    map_node_id,
 };
 use super::{
-    DurableError, FIRST_JOURNAL_GENERATION, RecoveryLimits, increment, io_error, read_all,
+    DurableError, FIRST_JOURNAL_GENERATION, RecoveryLimits, ReverseIndex, digest_journal_prefix,
+    increment, io_error, journal_byte_len,
 };
+use crate::storage_model::physical::IdentifiedProfile;
+
+#[cfg(test)]
+std::thread_local! {
+    static RETAINED_REVERSE_ENTRIES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_retained_reverse_entries() {
+    RETAINED_REVERSE_ENTRIES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn retained_reverse_entries() -> usize {
+    RETAINED_REVERSE_ENTRIES.with(core::cell::Cell::get)
+}
+
+mod reverse_comparison;
 
 mod index;
 use index::HistoricalMapClosure;
 pub(super) use index::MetadataIndex;
+#[cfg(test)]
+pub(super) use index::{recover_active_nodes_calls, reset_recover_active_nodes_calls};
 
-#[tracing::instrument(target = "astrid_storage::recovery", level = "debug", skip_all,
-    fields(map_nodes = tracing::field::Empty, authority_records = tracing::field::Empty))]
+#[tracing::instrument(name = "recover_metadata", target = "astrid_storage::recovery", level = "debug", skip_all,
+    fields(map_nodes = tracing::field::Empty, authority_records = tracing::field::Empty,
+        map_frame_count = tracing::field::Empty))]
 pub(super) fn recover_metadata<F: DurableIo>(
     file: &mut F,
     limits: RecoveryLimits,
@@ -42,13 +68,15 @@ pub(super) fn recover_metadata<F: DurableIo>(
         METADATA_FILE,
         METADATA_MAGIC,
         limits,
-        |offset, payload, load_previous| {
-            index.insert_at(offset, MetadataFrame::decode(payload)?, load_previous)
+        |location, payload, load_previous| {
+            let frame = MetadataFrame::decode(payload)?;
+            index.insert_at(location, frame, load_previous)
         },
     )?;
     if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {
         tracing::Span::current().record("map_nodes", index.nodes.len());
         tracing::Span::current().record("authority_records", index.values.len());
+        tracing::Span::current().record("map_frame_count", index.map_frame_count);
     }
     Ok(index)
 }
@@ -74,18 +102,19 @@ pub(super) fn recover_journal<F: DurableIo>(
         },
     )?;
     let checkpoint_end = first_frame_end(file)?;
-    let bytes = read_all(file, "read representation journal")?;
-    let checkpoint_bytes =
-        bytes
-            .get(..checkpoint_end)
-            .ok_or(DurableError::InvalidRepresentationState(
-                "representation checkpoint frame is truncated",
-            ))?;
-    if journal_digest(checkpoint_bytes) != current.checkpoint_digest {
+    let checkpoint_end_u64 =
+        u64::try_from(checkpoint_end).map_err(|_| DurableError::EncodingOverflow)?;
+    // scan_frames already authenticated every frame. Hash only the checkpoint
+    // prefix and take journal length from metadata/seek instead of a second
+    // full-journal allocation.
+    if digest_journal_prefix(file, checkpoint_end_u64, "digest representation checkpoint")?
+        != current.checkpoint_digest
+    {
         return Err(DurableError::InvalidRepresentationState(
             "representation checkpoint digest mismatch",
         ));
     }
+    let journal_bytes = journal_byte_len(file, "measure representation journal")?;
     let first = entries.first().map(|(_, entry)| *entry).ok_or(
         DurableError::InvalidRepresentationState("representation journal is empty"),
     )?;
@@ -95,7 +124,7 @@ pub(super) fn recover_journal<F: DurableIo>(
     let mut complete_maps = metadata.nodes.closure_checker();
     let (mut active, mut generation) =
         recover_checkpoint(first, current, metadata, &mut complete_maps)?;
-    validate_tail_budget(entries.len(), bytes.len(), checkpoint_end, current)?;
+    validate_tail_budget(entries.len(), journal_bytes, checkpoint_end, current)?;
     let mut previous_state = active
         .map(|id| {
             RepresentationState::decode(metadata.value(MetadataKind::State, id.as_bytes())?)
@@ -105,7 +134,7 @@ pub(super) fn recover_journal<F: DurableIo>(
     let entry_count = entries.len();
     if tracing::enabled!(target: "astrid_storage::recovery", tracing::Level::DEBUG) {
         tracing::Span::current().record("journal_frames", entry_count);
-        tracing::Span::current().record("journal_bytes", bytes.len());
+        tracing::Span::current().record("journal_bytes", journal_bytes);
     }
     for (position, (offset, entry)) in entries.into_iter().enumerate().skip(1) {
         let JournalEntry::StateCas {
@@ -261,7 +290,7 @@ fn truncate_repairable_journal_tail<F: DurableIo>(
 
 fn validate_tail_budget(
     entry_count: usize,
-    journal_bytes: usize,
+    journal_bytes: u64,
     checkpoint_end: usize,
     current: CurrentPointer,
 ) -> Result<(), DurableError> {
@@ -273,8 +302,7 @@ fn validate_tail_budget(
     }
     let checkpoint_bytes =
         u64::try_from(checkpoint_end).map_err(|_| DurableError::EncodingOverflow)?;
-    let tail_bytes = u64::try_from(journal_bytes)
-        .map_err(|_| DurableError::EncodingOverflow)?
+    let tail_bytes = journal_bytes
         .checked_sub(checkpoint_bytes)
         .ok_or(DurableError::EncodingOverflow)?;
     if tail_bytes > current.max_tail_bytes {
@@ -338,18 +366,24 @@ fn validate_root_generation(reused: bool, previous: u64, current: u64) -> Result
 }
 
 pub(super) fn validate_profiles(
-    map: &CanonicalPhysicalMap,
+    map: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
+) -> Result<RepresentationProfileId, DurableError> {
+    validate_profile_entries(active_entries(map)?)
+}
+
+pub(super) fn validate_profile_entries<'a>(
+    entries: impl IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
 ) -> Result<RepresentationProfileId, DurableError> {
     let mut direct = None;
-    for (key, value) in active_entries(map)? {
-        let profile = RepresentationProfile::decode(value)?;
-        let id = profile.identify(&Blake3PhysicalIdentity)?;
+    for (key, value) in entries {
+        let profile = IdentifiedProfile::decode(&Blake3PhysicalIdentity, value)?;
+        let id = profile.identity();
         if PhysicalMapKey::from(id) != key {
             return Err(DurableError::InvalidRepresentationState(
                 "profile leaf key does not match its value",
             ));
         }
-        if profile.kind() == crate::storage_model::ProfileKind::DirectCanonical
+        if profile.profile().kind() == crate::storage_model::ProfileKind::DirectCanonical
             && direct.replace(id).is_some()
         {
             return Err(DurableError::InvalidRepresentationState(
@@ -362,14 +396,110 @@ pub(super) fn validate_profiles(
     ))
 }
 
-pub(super) fn validate_representations(
-    profiles: &CanonicalPhysicalMap,
-    representations: &CanonicalPhysicalMap,
-    placements: &CanonicalPhysicalMap,
-) -> Result<(BTreeMap<ObjectId, Vec<RepresentationRecordId>>, u64), DurableError> {
+pub(super) struct ValidatedRepresentations {
+    pub(super) reverse: ReverseIndex,
+    pub(super) extent_count: u64,
+    pub(super) generation_zero: super::index_validation::GenerationZeroPlacements,
+}
+
+pub(super) fn validate_representations<const COLLECT_PLACEMENTS: bool>(
+    profiles: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
+    representations: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
+    placements: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
+    direct_profile: RepresentationProfileId,
+) -> Result<ValidatedRepresentations, DurableError> {
+    validate_representation_entries::<COLLECT_PLACEMENTS, _>(
+        profiles,
+        || active_entries(representations),
+        active_entries(placements)?,
+        direct_profile,
+    )
+}
+
+/// Facts shared by collecting recovery and borrowed live-index comparison.
+struct RepresentationFacts {
+    extent_count: u64,
+    generation_zero: super::index_validation::GenerationZeroPlacements,
+}
+
+pub(super) struct ComparedRepresentations {
+    pub(super) extent_count: u64,
+    pub(super) reverse_matches: bool,
+}
+
+pub(super) fn validate_representation_entries<'a, const COLLECT_PLACEMENTS: bool, R>(
+    profiles: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
+    representations: impl FnOnce() -> Result<R, DurableError>,
+    placements: impl IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
+    direct_profile: RepresentationProfileId,
+) -> Result<ValidatedRepresentations, DurableError>
+where
+    R: IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
+{
+    let mut reverse = ReverseIndex::new();
+    let facts = validate_representation_entries_with::<COLLECT_PLACEMENTS, _>(
+        profiles,
+        representations,
+        placements,
+        direct_profile,
+        |object, id| {
+            reverse.entry(object).or_default().push(id);
+            #[cfg(test)]
+            RETAINED_REVERSE_ENTRIES.with(|count| count.set(count.get().strict_add(1)));
+            Ok(())
+        },
+    )?;
+    Ok(ValidatedRepresentations {
+        reverse,
+        extent_count: facts.extent_count,
+        generation_zero: facts.generation_zero,
+    })
+}
+
+/// Validate the same semantic facts without retaining a second reverse index.
+///
+/// Sealed-tip proofs supply canonical key order. A mismatch is returned as a
+/// fact, so the caller can preserve cancellation precedence before rejecting it.
+pub(super) fn compare_representation_entries<'a, R>(
+    profiles: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
+    representations: impl FnOnce() -> Result<R, DurableError>,
+    placements: impl IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
+    direct_profile: RepresentationProfileId,
+    expected_reverse: &ReverseIndex,
+) -> Result<ComparedRepresentations, DurableError>
+where
+    R: IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
+{
+    let mut comparison = reverse_comparison::ReverseComparison::new(expected_reverse)?;
+    let facts = validate_representation_entries_with::<false, _>(
+        profiles,
+        representations,
+        placements,
+        direct_profile,
+        |object, id| {
+            comparison.observe(object, id);
+            Ok(())
+        },
+    )?;
+    Ok(ComparedRepresentations {
+        extent_count: facts.extent_count,
+        reverse_matches: comparison.matches(),
+    })
+}
+
+fn validate_representation_entries_with<'a, const COLLECT_PLACEMENTS: bool, R>(
+    profiles: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
+    representations: impl FnOnce() -> Result<R, DurableError>,
+    placements: impl IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
+    direct_profile: RepresentationProfileId,
+    mut observe_direct: impl FnMut(ObjectId, RepresentationRecordId) -> Result<(), DurableError>,
+) -> Result<RepresentationFacts, DurableError>
+where
+    R: IntoIterator<Item = (PhysicalMapKey, &'a [u8])>,
+{
     let mut placement_by_blob = BTreeMap::new();
     let mut extent_count = 0_u64;
-    for (key, bytes) in active_entries(placements)? {
+    for (key, bytes) in placements {
         let entry = PlacementEntry::decode(bytes)?;
         if PhysicalMapKey::from(entry.blob()) != key {
             return Err(DurableError::InvalidRepresentationState(
@@ -392,20 +522,25 @@ pub(super) fn validate_representations(
             .ok_or(DurableError::EncodingOverflow)?;
         placement_by_blob.insert(entry.blob(), entry);
     }
-    let mut reverse = BTreeMap::<ObjectId, Vec<RepresentationRecordId>>::new();
-    for (key, bytes) in active_entries(representations)? {
-        let record = RepresentationRecord::decode(bytes)?;
-        let id = record.identify(&Blake3PhysicalIdentity)?;
+    let mut generation_zero = super::index_validation::GenerationZeroPlacements::default();
+    // Direct records share the one required builtin profile. Retain only that
+    // checked value for this pass, not a second index of every operator-defined
+    // profile and its potentially large parameters/dependencies.
+    let mut decoded_direct_profile = None;
+    for (key, bytes) in representations()? {
+        let (record, id) =
+            RepresentationRecord::decode_and_identify(&Blake3PhysicalIdentity, bytes)?;
         if PhysicalMapKey::from(id) != key {
             return Err(DurableError::InvalidRepresentationState(
                 "representation leaf key does not match its value",
             ));
         }
-        let profile_bytes = profiles.get(PhysicalMapKey::from(record.profile())).ok_or(
-            DurableError::InvalidRepresentationState("representation profile is missing"),
+        validate_record_profile(
+            profiles,
+            &record,
+            direct_profile,
+            &mut decoded_direct_profile,
         )?;
-        let profile = RepresentationProfile::decode(profile_bytes)?;
-        record.validate_against_profile(&Blake3PhysicalIdentity, &profile)?;
         let (object, blob, canonical_length) = match (record.coverage(), record.recipe()) {
             (
                 Coverage::Exact {
@@ -428,9 +563,37 @@ pub(super) fn validate_representations(
                 "direct representation placement does not match its record",
             ));
         }
-        reverse.entry(object).or_default().push(id);
+        if COLLECT_PLACEMENTS {
+            generation_zero.observe(object, record.profile() == direct_profile, placement);
+        }
+        observe_direct(object, id)?;
     }
-    Ok((reverse, extent_count))
+    Ok(RepresentationFacts {
+        extent_count,
+        generation_zero,
+    })
+}
+
+fn validate_record_profile(
+    profiles: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
+    record: &RepresentationRecord,
+    direct_profile: RepresentationProfileId,
+    decoded_direct: &mut Option<IdentifiedProfile>,
+) -> Result<(), DurableError> {
+    let decode = || {
+        let bytes = profiles.get(PhysicalMapKey::from(record.profile())).ok_or(
+            DurableError::InvalidRepresentationState("representation profile is missing"),
+        )?;
+        IdentifiedProfile::decode(&Blake3PhysicalIdentity, bytes).map_err(DurableError::from)
+    };
+    if record.profile() != direct_profile {
+        return Ok(record.validate_against_identified_profile(&decode()?)?);
+    }
+    let profile = match decoded_direct {
+        Some(profile) => profile,
+        None => decoded_direct.insert(decode()?),
+    };
+    Ok(record.validate_against_identified_profile(profile)?)
 }
 
 /// Bootstrap startup guard: reject Exact coverage of excluded objects under any recipe.
@@ -445,9 +608,9 @@ pub(super) fn validate_representations(
 /// Duplicate directs for one object miss the fast path safely. Otherwise stream
 /// one authoritative visit over active leaves—no `Vec` materialization and no
 /// second walker. Decode errors fail closed.
-pub(super) fn ensure_no_excluded_object_coverage(
-    representations: &CanonicalPhysicalMap,
-    reverse: &BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
+pub(super) fn ensure_no_excluded_object_coverage<V: AsRef<[RepresentationRecordId]>>(
+    representations: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
+    reverse: &BTreeMap<ObjectId, V>,
     excluded: &BTreeSet<ObjectId>,
 ) -> Result<(), DurableError> {
     ensure_no_excluded_object_coverage_scanned(representations, reverse, excluded).map(|_| ())
@@ -456,9 +619,9 @@ pub(super) fn ensure_no_excluded_object_coverage(
 /// Same guard as [`ensure_no_excluded_object_coverage`], returning how many map
 /// leaves the fallback visitor decoded (`0` when excluded is empty or the
 /// all-direct fast proof skips the walk).
-pub(super) fn ensure_no_excluded_object_coverage_scanned(
-    representations: &CanonicalPhysicalMap,
-    reverse: &BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
+pub(super) fn ensure_no_excluded_object_coverage_scanned<V: AsRef<[RepresentationRecordId]>>(
+    representations: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
+    reverse: &BTreeMap<ObjectId, V>,
     excluded: &BTreeSet<ObjectId>,
 ) -> Result<u64, DurableError> {
     if excluded.is_empty() {
@@ -467,7 +630,7 @@ pub(super) fn ensure_no_excluded_object_coverage_scanned(
     if excluded.iter().any(|object| {
         reverse
             .get(object)
-            .is_some_and(|records| !records.is_empty())
+            .is_some_and(|records| !records.as_ref().is_empty())
     }) {
         return Err(DurableError::InvalidRepresentationState(
             "bootstrap object has a relocatable representation",
@@ -499,7 +662,7 @@ pub(super) fn ensure_no_excluded_object_coverage_scanned(
 /// missing-node validation. Prefer this over allocating [`active_entries`] when
 /// callers can decide per leaf without retaining the full collection.
 pub(super) fn visit_active_entries<'a, F>(
-    map: &'a CanonicalPhysicalMap,
+    map: &'a CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
     mut visit: F,
 ) -> Result<(), DurableError>
 where
@@ -521,7 +684,9 @@ where
             .get(&id)
             .ok_or(DurableError::InvalidRepresentationState(
                 "physical map traversal found a missing node",
-            ))? {
+            ))?
+            .borrow()
+        {
             PhysicalMapNode::Leaf { key, value, .. } => visit(*key, value.as_slice())?,
             PhysicalMapNode::Branch { zero, one, .. } => {
                 stack.push(*one);
@@ -544,7 +709,7 @@ where
 }
 
 pub(super) fn active_entries(
-    map: &CanonicalPhysicalMap,
+    map: &CanonicalPhysicalMap<impl Borrow<PhysicalMapNode> + From<PhysicalMapNode>>,
 ) -> Result<Vec<(PhysicalMapKey, &[u8])>, DurableError> {
     let mut entries = Vec::new();
     visit_active_entries(map, |key, value| {
@@ -592,3 +757,6 @@ fn first_frame_end<F: DurableIo>(file: &mut F) -> Result<usize, DurableError> {
         .checked_add(payload)
         .ok_or(DurableError::EncodingOverflow)
 }
+
+#[cfg(test)]
+mod generation_zero_tests;

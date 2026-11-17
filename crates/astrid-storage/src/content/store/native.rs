@@ -29,6 +29,8 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             prefix_exists_invocations: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             decode_header_invocations: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            catalog_validation_invocations: std::sync::atomic::AtomicU64::new(0),
         }
     }
 

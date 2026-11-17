@@ -350,6 +350,9 @@ impl WorkspaceBranchService {
             .load()
             .await
             .map_err(|error| format!("resolve principal fleet ownership: {error}"))?;
+        if snapshot.principal_is_retiring(uid) {
+            return Err("principal workspace identity is retiring".to_owned());
+        }
         Ok(snapshot
             .principal_owner(uid)
             .map_or(astrid_storage::StateOwner::Principal(uid), |assignment| {
@@ -497,6 +500,37 @@ impl WorkspaceBranchService {
             .map_err(|_| "workspace branch binding lock poisoned".to_owned())?
             .remove(&binding.uid);
         Ok(())
+    }
+
+    /// Release private workspace staging during an authenticated deletion.
+    ///
+    /// The caller must first quiesce capsule views and keep the reservation
+    /// until identity removal completes. Ordinary unload, ownership movement
+    /// and boot recovery keep their existing retention behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on invalid branch state, failed publication or a
+    /// poisoned cache; the caller must retain its reservation for retry.
+    pub async fn retire_for_deletion(
+        &self,
+        guard: &astrid_storage::PrincipalDeletionGuard,
+    ) -> Result<usize, String> {
+        let _bind_guard = self.bind_lock.lock().await;
+        let uid = guard.principal_uid();
+        let owner = guard.fleet_uid().map_or(
+            astrid_storage::StateOwner::Principal(uid),
+            astrid_storage::StateOwner::Fleet,
+        );
+        let retired = self
+            .branches
+            .retire_for_uid(&owner, uid)
+            .map_err(|error| format!("retire principal workspace branches: {error}"))?;
+        self.bindings
+            .lock()
+            .map_err(|_| "workspace branch binding lock poisoned".to_owned())?
+            .remove(&uid);
+        Ok(retired)
     }
 
     /// Roll back all live branches during engine/kernel teardown.

@@ -80,7 +80,7 @@ impl PrincipalCodec<String> for Utf8Codec {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Resolver;
+pub(super) struct Resolver;
 
 impl KvPrincipalResolver<String> for Resolver {
     fn resolve(&self, namespace: &str) -> StorageResult<String> {
@@ -993,3 +993,6 @@ mod stale_publication_tests;
 
 #[path = "tree/header_read_tests.rs"]
 mod header_read_tests;
+
+#[path = "tree/checkpoint_reuse_tests.rs"]
+mod checkpoint_reuse_tests;

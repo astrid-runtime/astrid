@@ -48,6 +48,7 @@ impl Kernel {
             }
         };
 
+        let removed_principals = removed.removed_principals;
         if removed.torn_down {
             removed.capsule.retire();
             removed.capsule.request_cancel();
@@ -91,7 +92,12 @@ impl Kernel {
             );
         }
 
-        self.publish_capsules_loaded().await;
+        // The registry reports the exact views detached under its write lock,
+        // including dependent views when a System runtime's owner departed.
+        // Empty inventories clear those views without re-describing fleet peers.
+        for affected in removed_principals {
+            self.publish_capsules_loaded_for(&affected).await;
+        }
         Ok(true)
     }
 

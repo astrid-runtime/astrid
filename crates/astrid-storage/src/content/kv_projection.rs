@@ -1,5 +1,7 @@
 //! Read-only KV projection adapter used by content-side quota validation.
 
+use std::sync::Arc;
+
 use crate::engine::{
     CommitOutcome, KvProjectionEngine, KvProjectionError, PrincipalProjectionEngine,
     PrincipalProjectionError, RootSnapshot, RootTransaction,
@@ -30,6 +32,24 @@ where
         self.0.load_object(id).map_err(map_error)
     }
 
+    fn load_kv_object_for(
+        &self,
+        principal: &P,
+        id: ObjectId,
+    ) -> Result<Option<ObjectRecord>, KvProjectionError> {
+        self.0.load_object_for(principal, id).map_err(map_error)
+    }
+
+    fn load_shared_kv_object_for(
+        &self,
+        principal: &P,
+        id: ObjectId,
+    ) -> Result<Option<Arc<ObjectRecord>>, KvProjectionError> {
+        self.0
+            .load_shared_object_for(principal, id)
+            .map_err(map_error)
+    }
+
     fn snapshot_kv_root(&self, _principal: &P) -> Result<Option<RootSnapshot>, KvProjectionError> {
         Err(KvProjectionError::Engine(
             "content validation adapter does not capture root snapshots".to_owned(),
@@ -54,3 +74,6 @@ fn map_error(error: PrincipalProjectionError) -> KvProjectionError {
         PrincipalProjectionError::Engine(error) => KvProjectionError::Engine(error),
     }
 }
+
+#[cfg(test)]
+mod tests;

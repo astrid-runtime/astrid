@@ -124,6 +124,7 @@ impl OwnershipStore {
         Ok(PrincipalDeletionGuard {
             store: self.clone(),
             principal_uid: reservation_uid,
+            fleet: None,
             _guard: guard,
         })
     }
@@ -217,6 +218,10 @@ impl OwnershipStore {
         Ok(Some(PrincipalDeletionGuard {
             store: self.clone(),
             principal_uid,
+            fleet: graph
+                .principal_deletions
+                .get(&principal_uid)
+                .and_then(|pending| pending.fleet),
             _guard: guard,
         }))
     }
@@ -261,64 +266,66 @@ impl OwnershipStore {
         authorize: impl Fn(&OwnershipSnapshot) -> Result<Option<FleetUid>, OwnershipError>,
     ) -> Result<PrincipalDeletionGuard, OwnershipError> {
         let guard = Arc::clone(&self.mutation_lock).lock_owned().await;
-        self.mutate_unlocked(|graph| {
-            let fleet = authorize(graph)?;
-            if let Some(requested) = &alias
-                && let Ok(live_alias) = self.principals.alias_for(principal_uid)
-                && &live_alias != requested
-            {
-                return Err(OwnershipError::DeletionReservationConflict {
-                    principal: principal_uid,
-                    alias: live_alias,
-                });
-            }
-            if let Some(reservation) = graph.principal_deletions.get_mut(&principal_uid) {
-                match (&reservation.alias, &alias) {
-                    (Some(existing), Some(requested)) if existing != requested => {
-                        return Err(OwnershipError::DeletionReservationConflict {
-                            principal: principal_uid,
-                            alias: existing.clone(),
-                        });
-                    },
-                    (None, Some(requested)) => reservation.alias = Some(requested.clone()),
-                    _ => {},
-                }
-            } else {
-                if !self.principals.contains_uid(principal_uid) {
-                    return Err(OwnershipError::PrincipalNotFound(principal_uid));
-                }
+        let fleet = self
+            .mutate_unlocked(|graph| {
+                let fleet = authorize(graph)?;
                 if let Some(requested) = &alias
-                    && let Some((reserved_uid, _)) = graph
-                        .principal_deletions
-                        .iter()
-                        .find(|(_, reservation)| reservation.alias.as_ref() == Some(requested))
+                    && let Ok(live_alias) = self.principals.alias_for(principal_uid)
+                    && &live_alias != requested
                 {
-                    return Err(OwnershipError::DeletionAliasReserved {
-                        alias: requested.clone(),
-                        principal: *reserved_uid,
+                    return Err(OwnershipError::DeletionReservationConflict {
+                        principal: principal_uid,
+                        alias: live_alias,
                     });
                 }
-                graph.principal_deletions.insert(
-                    principal_uid,
-                    PrincipalDeletionReservation {
-                        alias: alias.clone(),
-                        fleet,
-                    },
-                );
-            }
-            // Ownership removal and retirement commit together. Retaining the
-            // fleet on the reservation protects retries after identity removal.
-            graph.principal_ownership.remove(&principal_uid);
-            graph.accountable_users.remove(&principal_uid);
-            graph
-                .user_bindings
-                .retain(|binding| !binding.for_principal(principal_uid));
-            Ok(())
-        })
-        .await?;
+                if let Some(reservation) = graph.principal_deletions.get_mut(&principal_uid) {
+                    match (&reservation.alias, &alias) {
+                        (Some(existing), Some(requested)) if existing != requested => {
+                            return Err(OwnershipError::DeletionReservationConflict {
+                                principal: principal_uid,
+                                alias: existing.clone(),
+                            });
+                        },
+                        (None, Some(requested)) => reservation.alias = Some(requested.clone()),
+                        _ => {},
+                    }
+                } else {
+                    if !self.principals.contains_uid(principal_uid) {
+                        return Err(OwnershipError::PrincipalNotFound(principal_uid));
+                    }
+                    if let Some(requested) = &alias
+                        && let Some((reserved_uid, _)) = graph
+                            .principal_deletions
+                            .iter()
+                            .find(|(_, reservation)| reservation.alias.as_ref() == Some(requested))
+                    {
+                        return Err(OwnershipError::DeletionAliasReserved {
+                            alias: requested.clone(),
+                            principal: *reserved_uid,
+                        });
+                    }
+                    graph.principal_deletions.insert(
+                        principal_uid,
+                        PrincipalDeletionReservation {
+                            alias: alias.clone(),
+                            fleet,
+                        },
+                    );
+                }
+                // Ownership removal and retirement commit together. Retaining the
+                // fleet on the reservation protects retries after identity removal.
+                graph.principal_ownership.remove(&principal_uid);
+                graph.accountable_users.remove(&principal_uid);
+                graph
+                    .user_bindings
+                    .retain(|binding| !binding.for_principal(principal_uid));
+                Ok(fleet)
+            })
+            .await?;
         Ok(PrincipalDeletionGuard {
             store: self.clone(),
             principal_uid,
+            fleet,
             _guard: guard,
         })
     }

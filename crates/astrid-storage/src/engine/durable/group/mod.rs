@@ -20,6 +20,7 @@ use crate::engine::{ProjectionObserver, ProjectionPhase};
 
 #[cfg(test)]
 mod checkpoint_publication_tests;
+mod representations_maintenance;
 mod wal;
 
 const DEFAULT_INITIAL_DELAY: Duration = Duration::from_micros(250);
@@ -90,7 +91,20 @@ pub(super) struct CommitGroup<P> {
     leader_active: bool,
     queue: VecDeque<QueuedCommit<P>>,
     #[cfg(test)]
-    drain_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+    drain_gate: Option<DrainGate>,
+}
+
+/// cfg(test) drain pause: Barrier keeps existing callers; Channel is cancellation-safe.
+#[cfg(test)]
+enum DrainGate {
+    Barrier(
+        std::sync::Arc<std::sync::Barrier>,
+        std::sync::Arc<std::sync::Barrier>,
+    ),
+    Channel {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    },
 }
 
 impl<P> Default for CommitGroup<P> {
@@ -101,6 +115,12 @@ impl<P> Default for CommitGroup<P> {
             #[cfg(test)]
             drain_gate: None,
         }
+    }
+}
+
+impl<P> CommitGroup<P> {
+    pub(super) fn is_idle(&self) -> bool {
+        !self.leader_active && self.queue.is_empty()
     }
 }
 
@@ -308,12 +328,33 @@ where
     }
 
     #[cfg(test)]
-    pub(super) fn gate_next_group_drain(
+    pub(crate) fn gate_next_group_drain(
         &self,
         reached: Arc<std::sync::Barrier>,
         release: Arc<std::sync::Barrier>,
     ) {
-        self.commit_group.lock().drain_gate = Some((reached, release));
+        self.commit_group.lock().drain_gate = Some(DrainGate::Barrier(reached, release));
+    }
+
+    /// Channel drain gate: parent holds the release sender; Drop always releases.
+    ///
+    /// Returns `(entered_rx, release_tx)`. The drain worker `try_send`s entry
+    /// (bounded capacity 1) then `recv`s release; closing/dropping `release_tx`
+    /// unblocks the worker even if entry was never observed.
+    #[cfg(test)]
+    pub(crate) fn gate_next_group_drain_channel(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        self.commit_group.lock().drain_gate = Some(DrainGate::Channel {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        (entered_rx, release_tx)
     }
 
     fn run_one_commit_group(&self) {
@@ -329,9 +370,17 @@ where
         #[cfg(test)]
         let drain_gate = { self.commit_group.lock().drain_gate.take() };
         #[cfg(test)]
-        if let Some((reached, release)) = drain_gate {
-            reached.wait();
-            release.wait();
+        if let Some(gate) = drain_gate {
+            match gate {
+                DrainGate::Barrier(reached, release) => {
+                    reached.wait();
+                    release.wait();
+                },
+                DrainGate::Channel { entered, release } => {
+                    let _ = entered.try_send(());
+                    let _ = release.recv();
+                },
+            }
         }
 
         let batch: Vec<_> = {
@@ -418,41 +467,15 @@ where
                     return;
                 },
             };
-            match self.persist_group(&mut inner, &accepted) {
-                Ok(persisted) => {
-                    for location in persisted.locations {
-                        inner.index.insert(location.0, location.1);
-                        inner.pending_index_locations.push(location);
-                    }
-                    debug_assert!(
-                        live_files_mut(&mut inner.files)
-                            .map_or(true, |files| files.arena_len >= previous_arena_len)
-                    );
-                    let frontier = self.publish_commit_frontier(&mut inner, persisted.arena_len);
-                    if let Err(error) = frontier {
-                        self.mark_requires_recovery(&mut inner);
-                        complete_failed_group(&mut completions, accepted, error);
-                    } else {
-                        for mut accepted in accepted {
-                            retired_projections.extend(
-                                self.publish_durable_root(&mut inner, &mut accepted.prepared),
-                            );
-                            completions.push((
-                                accepted.receipt,
-                                Ok(CommitOutcome {
-                                    root: accepted.prepared.root,
-                                    objects_inserted: accepted.prepared.objects_inserted,
-                                }),
-                            ));
-                        }
-                    }
-                },
-                Err(error) => {
-                    self.mark_requires_recovery(&mut inner);
-                    complete_failed_group(&mut completions, accepted, error);
-                },
-            }
+            self.publish_accepted_under_physical_fence(
+                &mut inner,
+                previous_arena_len,
+                accepted,
+                &mut completions,
+                &mut retired_projections,
+            );
         }
+        let ran_successful_commit = completions.iter().any(|(_, result)| result.is_ok());
         drop(inner);
         // Releasing superseded value buffers can be expensive; the writer
         // must already be available to other principals.
@@ -460,6 +483,86 @@ where
         for (receipt, result) in completions {
             receipt.complete(result);
         }
+        // Complete the batch before maintenance. New batches still serialize on
+        // the same engine writer while a representation generation is replaced.
+        if ran_successful_commit {
+            self.maintain_representations_after_commit();
+        }
+    }
+
+    /// Persist accepted commits under one physical representation guard and
+    /// publication poison span through the commit frontier.
+    fn publish_accepted_under_physical_fence(
+        &self,
+        inner: &mut DurableInner<P>,
+        previous_arena_len: u64,
+        accepted: Vec<AcceptedCommit<P>>,
+        completions: &mut Vec<(Arc<CommitReceipt>, Result<CommitOutcome, DurableError>)>,
+        retired_projections: &mut Vec<crate::kv::RetiredKvProjection>,
+    ) {
+        // Clone the shared Arc first so the physical guard does not borrow
+        // `inner.representations`. WAL groups leave the guard empty because fold
+        // acquires its own custody; legacy holds one guard through StateCas,
+        // roots, and the commit frontier.
+        let shared = if self.transaction_wal.is_enabled() {
+            None
+        } else {
+            inner.representations.clone()
+        };
+        let mut representations = match super::checkpoint_worker::lock_live_representations(
+            shared.as_ref(),
+            self.lifecycle.as_ref(),
+        ) {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.mark_requires_recovery(inner);
+                complete_failed_group(completions, accepted, error);
+                return;
+            },
+        };
+        // parking_lot guards do not poison on panic. Arm after the physical
+        // guard so a mid-frontier panic marks recovery before the worker can
+        // capture a half-mutated tip.
+        let mut publication_poison =
+            super::checkpoint_worker::PublicationPoison::armed(self.lifecycle.as_ref());
+        match self.persist_group(inner, representations.as_deref_mut(), &accepted) {
+            Ok(persisted) => {
+                for location in persisted.locations {
+                    inner.index.insert(location.0, location.1);
+                    inner.pending_index_locations.push(location);
+                }
+                debug_assert!(
+                    live_files_mut(&mut inner.files)
+                        .map_or(true, |files| files.arena_len >= previous_arena_len)
+                );
+                let frontier = self.publish_commit_frontier(inner, persisted.arena_len);
+                if let Err(error) = frontier {
+                    self.mark_requires_recovery(inner);
+                    publication_poison.disarm();
+                    complete_failed_group(completions, accepted, error);
+                } else {
+                    publication_poison.disarm();
+                    for mut accepted in accepted {
+                        retired_projections
+                            .extend(self.publish_durable_root(inner, &mut accepted.prepared));
+                        completions.push((
+                            accepted.receipt,
+                            Ok(CommitOutcome {
+                                root: accepted.prepared.root,
+                                objects_inserted: accepted.prepared.objects_inserted,
+                            }),
+                        ));
+                    }
+                }
+            },
+            Err(error) => {
+                self.mark_requires_recovery(inner);
+                publication_poison.disarm();
+                complete_failed_group(completions, accepted, error);
+            },
+        }
+        drop(publication_poison);
+        drop(representations);
     }
 
     /// Called only after the batch's authoritative durability frontier succeeds.
@@ -500,24 +603,25 @@ where
     fn persist_group(
         &self,
         inner: &mut DurableInner<P>,
+        representations: Option<&mut RepresentationStore>,
         accepted: &[AcceptedCommit<P>],
     ) -> Result<Persisted, DurableError> {
         if self.transaction_wal.is_enabled() {
             self.maybe_checkpoint_transaction_wal(inner)?;
             self.persist_group_wal(inner, accepted)
         } else {
-            self.persist_group_legacy(inner, accepted)
+            self.persist_group_legacy(inner, representations, accepted)
         }
     }
 
     fn persist_group_legacy(
         &self,
         inner: &mut DurableInner<P>,
+        mut representations: Option<&mut RepresentationStore>,
         accepted: &[AcceptedCommit<P>],
     ) -> Result<Persisted, DurableError> {
         let DurableInner {
             files,
-            representations,
             pending_index_locations: pending_locations,
             pending_direct_objects: pending_direct,
             index,
@@ -549,7 +653,7 @@ where
         record_group(accepted, ProjectionPhase::ArenaAppend, append_started);
         self.fail_if(FaultPoint::AfterCommitAppend)?;
         let map_started = Instant::now();
-        let representation_update = if let Some(representations) = representations {
+        let representation_update = if let Some(store) = representations.as_mut() {
             let appended = ids
                 .iter()
                 .copied()
@@ -570,7 +674,7 @@ where
             );
             self.append_group_representations(
                 &files.arena,
-                representations,
+                store,
                 PendingRepresentations::new(pending_locations, pending_direct, validated),
                 accepted.iter().flat_map(|commit| {
                     commit
@@ -593,9 +697,9 @@ where
         record_group(accepted, ProjectionPhase::Flush, flush_started);
         self.fail_if(FaultPoint::AfterObjectFlush)?;
         self.fail_if(FaultPoint::AfterCommitFlush)?;
-        if let (Some(representations), Some(update)) = (representations, representation_update) {
+        if let (Some(store), Some(update)) = (representations.as_mut(), representation_update) {
             let map_started = Instant::now();
-            representations.publish_direct_update(update)?;
+            store.publish_direct_update(update)?;
             record_group(accepted, ProjectionPhase::PhysicalMapUpdate, map_started);
         }
         self.fail_if(FaultPoint::BeforeRootCas)?;
@@ -770,3 +874,6 @@ fn complete_failed_group<P: Ord>(
         ));
     }
 }
+
+#[cfg(test)]
+mod retirement_tests;

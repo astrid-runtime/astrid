@@ -1,5 +1,7 @@
 use super::*;
+use crate::storage_model::physical::{PlacementMap, ProfileMap, RepresentationMap};
 use crate::storage_model::{PhysicalMapDomain, PhysicalMapKey, RepresentationProfileId};
+use std::collections::BTreeMap;
 
 #[test]
 fn recovery_memo_never_remembers_an_incomplete_closure() {
@@ -214,15 +216,15 @@ fn metadata_recovery_keeps_only_links_and_loads_active_bodies() {
     let mut index = recover_metadata(&mut file, limits).unwrap();
     assert_eq!(index.nodes.len(), 1);
     assert_eq!(index.nodes.edge_count(), 0);
-    let map = index
-        .recover_active_map(
-            PhysicalMapDomain::Representation,
-            Some(map_node_id(frame.identity)),
-            &file,
-            limits,
-        )
-        .unwrap();
-    assert_eq!(map.nodes()[&map_node_id(frame.identity)], node);
+    let root = Some(map_node_id(frame.identity));
+    let map = RepresentationMap::recover_exact(
+        root,
+        index
+            .recover_active_nodes(PhysicalMapDomain::Representation, root, &file, limits)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(map.nodes()[&map_node_id(frame.identity)].as_ref(), &node);
     assert!(index.nodes.len() == 0);
     assert!(
         index.values.is_empty(),
@@ -275,10 +277,20 @@ fn metadata_recovery_loads_root_before_child_history_without_retaining_old_value
     let mut complete = index.nodes.closure_checker();
     assert!(complete.complete(Some(root)));
     drop(complete);
-    let recovered = index
-        .recover_active_map(PhysicalMapDomain::Representation, Some(root), &file, limits)
-        .unwrap();
-    assert_eq!(recovered.nodes(), map.nodes());
+    let recovered = RepresentationMap::recover_exact(
+        Some(root),
+        index
+            .recover_active_nodes(PhysicalMapDomain::Representation, Some(root), &file, limits)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        recovered
+            .nodes()
+            .iter()
+            .map(|(id, node)| (id, node.as_ref()))
+            .eq(map.nodes().iter())
+    );
     assert_eq!(index.nodes.len(), 64);
     assert!(
         index.values.is_empty(),
@@ -311,7 +323,14 @@ fn metadata_duplicate_identity_requires_exact_body_equality() {
     .unwrap();
     // Deliberately supply an earlier body with the same identity envelope:
     // checking the envelope alone would wrongly accept this duplicate.
-    let result = index.insert_at(52, frame, |_| different.encode());
+    let result = index.insert_at(
+        crate::engine::durable::format::FrameLocation::for_test(
+            52,
+            u64::try_from(frame.encode().unwrap().len()).unwrap(),
+        ),
+        frame,
+        |_| different.encode(),
+    );
     assert!(matches!(
         result,
         Err(DurableError::InvalidRepresentationState(
@@ -343,7 +362,7 @@ fn active_map_body_rereads_validate_the_frame_again() {
     file.write_all(&[0xff]).unwrap();
     assert!(
         index
-            .recover_active_map(
+            .recover_active_nodes(
                 PhysicalMapDomain::Representation,
                 Some(map_node_id(frame.identity)),
                 &file,
@@ -366,20 +385,26 @@ fn indexed_active_recovery_validates_domain_and_consumes_each_node_once() {
     super::super::append_frame(&mut file, METADATA_MAGIC, &frame.encode().unwrap()).unwrap();
     let limits = RecoveryLimits::process_addressable();
     let mut index = recover_metadata(&mut file, limits).unwrap();
+    let nodes = index
+        .recover_active_nodes(PhysicalMapDomain::Placement, Some(root), &file, limits)
+        .unwrap();
     assert!(
-        index
-            .recover_active_map(PhysicalMapDomain::Placement, Some(root), &file, limits)
-            .is_err(),
+        PlacementMap::recover_exact(Some(root), nodes).is_err(),
         "authenticated node bytes must not authorize a different map domain"
     );
     let mut index = recover_metadata(&mut file, limits).unwrap();
-    let recovered = index
-        .recover_active_map(PhysicalMapDomain::Profile, Some(root), &file, limits)
-        .unwrap();
-    assert_eq!(recovered.nodes(), &BTreeMap::from([(root, node)]));
+    let recovered = ProfileMap::recover_exact(
+        Some(root),
+        index
+            .recover_active_nodes(PhysicalMapDomain::Profile, Some(root), &file, limits)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(recovered.nodes().len(), 1);
+    assert_eq!(recovered.nodes()[&root].as_ref(), &node);
     assert_eq!(index.nodes.len(), 0);
     assert!(matches!(
-        index.recover_active_map(PhysicalMapDomain::Profile, Some(root), &file, limits),
+        index.recover_active_nodes(PhysicalMapDomain::Profile, Some(root), &file, limits),
         Err(DurableError::InvalidRepresentationState(
             "active physical map closure is incomplete"
         ))
@@ -415,7 +440,7 @@ fn indexed_active_recovery_rejects_incomplete_and_forged_subtree_counts() {
     let limits = RecoveryLimits::process_addressable();
     let mut index = recover_metadata(&mut file, limits).unwrap();
     assert!(matches!(
-        index.recover_active_map(PhysicalMapDomain::Representation, Some(root), &file, limits),
+        index.recover_active_nodes(PhysicalMapDomain::Representation, Some(root), &file, limits),
         Err(DurableError::InvalidRepresentationState(
             "active physical map closure is incomplete"
         ))
@@ -427,7 +452,10 @@ fn indexed_active_recovery_rejects_incomplete_and_forged_subtree_counts() {
     let mut index = recover_metadata(&mut file, limits).unwrap();
     assert!(
         index
-            .recover_active_map(PhysicalMapDomain::Representation, Some(root), &file, limits)
+            .recover_active_nodes(PhysicalMapDomain::Representation, Some(root), &file, limits,)
+            .and_then(|nodes| {
+                RepresentationMap::recover_exact(Some(root), nodes).map_err(Into::into)
+            })
             .is_err(),
         "indexed traversal must retain canonical shape validation"
     );

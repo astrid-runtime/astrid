@@ -26,6 +26,7 @@ use astrid_core::principal::PrincipalId;
 use crate::PrincipalDirectory;
 use crate::kv::ScopedKvStore;
 
+mod links;
 mod persistence;
 use persistence::PersistedUser;
 
@@ -454,25 +455,12 @@ impl IdentityStore for KvIdentityStore {
     }
 
     async fn list_links(&self, astrid_user_id: Uuid) -> Result<Vec<FrontendLink>, IdentityError> {
-        let keys = self
-            .kv
-            .list_keys_with_prefix("link/")
-            .await
-            .map_err(|e| IdentityError::Storage(e.to_string()))?;
-
-        let mut links = Vec::new();
-        for key in keys {
-            if let Some(link) = self
-                .kv
-                .get_json::<FrontendLink>(&key)
-                .await
-                .map_err(|e| IdentityError::Storage(e.to_string()))?
-                && link.astrid_user_id == astrid_user_id
-            {
-                links.push(link);
-            }
-        }
-        Ok(links)
+        Ok(self
+            .scan_user_links(astrid_user_id)
+            .await?
+            .into_iter()
+            .map(|(_, link)| link)
+            .collect())
     }
 
     async fn get_user_by_name(&self, name: &str) -> Result<Option<AstridUserId>, IdentityError> {
@@ -501,15 +489,9 @@ impl IdentityStore for KvIdentityStore {
         };
         let user = record.user;
 
-        // Drop every link that points at this user. We scan `link/` and
-        // delete matches — O(links) per delete, but the link table is
-        // small (one row per (platform, platform_user) pair).
-        let link_keys = self
-            .kv
-            .list_keys_with_prefix("link/")
-            .await
-            .map_err(|e| IdentityError::Storage(e.to_string()))?;
-        for key in link_keys {
+        // A scan candidate may be stale. Re-read selected links before
+        // deletion; matching and deletion remain separate backend operations.
+        for (key, _) in self.scan_user_links(id).await? {
             if let Some(link) = self
                 .kv
                 .get_json::<FrontendLink>(&key)

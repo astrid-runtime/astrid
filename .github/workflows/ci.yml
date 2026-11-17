@@ -287,6 +287,9 @@ jobs:
           linux_native_fuse_mount_supports_all_required_operations --
           --ignored --nocapture
 
+      - name: Reject projection bind mounts in a private namespace
+        run: bash scripts/ci/test_projection_bind_mounts.sh
+
   check:
     name: Check
     runs-on: ubuntu-latest
@@ -382,37 +385,9 @@ jobs:
           key: windows-filesystem-${{ matrix.target }}
           cache-on-failure: true
 
-      - name: Run the filesystem prerequisite tests natively
+      - name: Run native Windows filesystem prerequisite tests
         shell: pwsh
-        run: cargo test --locked --target ${{ matrix.target }} -p astrid-core platform_fs -- --nocapture
-
-      - name: Run hosted volume recovery and publication tests natively
-        shell: pwsh
-        run: cargo test --locked --target ${{ matrix.target }} -p astrid-storage volume::hosted -- --nocapture
-
-      - name: Run legacy source locking and snapshot lifecycle tests natively
-        shell: pwsh
-        run: cargo test --locked --target ${{ matrix.target }} -p astrid-storage --features legacy-surrealkv principal_state::legacy_snapshot -- --nocapture
-
-      - name: Run captured workspace retirement tests natively
-        shell: pwsh
-        run: cargo test --locked --target ${{ matrix.target }} -p astrid-storage --features legacy-surrealkv principal_state::native_io::retirement -- --nocapture
-
-      - name: Run legacy audit source preservation tests natively
-        shell: pwsh
-        run: cargo test --locked --target ${{ matrix.target }} -p astrid-audit migration_source_tests -- --nocapture
-
-      - name: Run legacy audit boot migration tests natively
-        shell: pwsh
-        run: cargo test --locked --target ${{ matrix.target }} -p astrid-kernel legacy_audit::tests -- --nocapture
-
-      - name: Run audit retirement boundary tests natively
-        shell: pwsh
-        run: cargo test --locked --target ${{ matrix.target }} -p astrid-kernel audit_retirement_tests -- --nocapture
-
-      - name: Run disposable index cache recovery tests natively
-        shell: pwsh
-        run: cargo test --locked --target ${{ matrix.target }} -p astrid-storage engine::durable::index_tests::cache_rebuild -- --nocapture
+        run: ./scripts/ci/test_windows_filesystem.ps1 -Target ${{ matrix.target }}
 
       - name: Parse the Windows install scripts
         shell: pwsh

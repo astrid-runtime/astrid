@@ -9,14 +9,18 @@ use super::{
     PhysicalModelError, SEARCH_KEY_BITS,
 };
 
-pub(super) fn insert<I: PhysicalIdentity>(
+pub(super) fn insert<I, N>(
     identity: &I,
     domain: PhysicalMapDomain,
-    nodes: &mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    nodes: &mut BTreeMap<PhysicalMapNodeId, N>,
     root: PhysicalMapNodeId,
     key: PhysicalMapKey,
     value: Vec<u8>,
-) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError> {
+) -> Result<(PhysicalMapNodeId, bool), PhysicalModelError>
+where
+    I: PhysicalIdentity,
+    N: core::borrow::Borrow<PhysicalMapNode> + From<PhysicalMapNode>,
+{
     Insertion {
         identity,
         domain,
@@ -25,17 +29,46 @@ pub(super) fn insert<I: PhysicalIdentity>(
     .insert_at(root, key, value)
 }
 
+pub(super) fn insert_entries<I, N>(
+    identity: &I,
+    domain: PhysicalMapDomain,
+    nodes: &mut BTreeMap<PhysicalMapNodeId, N>,
+    mut root: Option<PhysicalMapNodeId>,
+    batch: super::radix::InsertBatch,
+) -> Result<(Option<PhysicalMapNodeId>, u64), PhysicalModelError>
+where
+    I: PhysicalIdentity,
+    N: core::borrow::Borrow<PhysicalMapNode> + From<PhysicalMapNode>,
+{
+    let mut inserted = 0_u64;
+    batch.for_each_owned(|key, value| {
+        let (next, did_insert) = if let Some(current) = root {
+            insert(identity, domain, nodes, current, key, value)?
+        } else {
+            let node = PhysicalMapNode::leaf(domain, key, value);
+            let (bytes, id) = node.encode_and_identify(identity)?;
+            nodes.put(id, &bytes, node)?;
+            (id, true)
+        };
+        if did_insert {
+            root = Some(next);
+            inserted = inserted
+                .checked_add(1)
+                .ok_or(PhysicalModelError::LengthOverflow)?;
+        }
+        Ok(())
+    })?;
+    Ok((root, inserted))
+}
+
 pub(super) fn build<I: PhysicalIdentity, V: AsRef<[u8]>, N: CanonicalNodeSink>(
     identity: &I,
     domain: PhysicalMapDomain,
     entries: &[(PhysicalMapKey, V)],
     nodes: &mut N,
-) -> Result<PhysicalMapNodeId, PhysicalModelError> {
+) -> Result<PhysicalMapNodeId, N::Error> {
     if entries.len() == 1 {
-        let node = PhysicalMapNode::leaf(domain, entries[0].0, entries[0].1.as_ref().to_vec());
-        let id = node.identify(identity)?;
-        nodes.put(id, node)?;
-        return Ok(id);
+        return put_encoded_leaf(identity, domain, &entries[0], nodes);
     }
     let first = entries
         .first()
@@ -49,25 +82,69 @@ pub(super) fn build<I: PhysicalIdentity, V: AsRef<[u8]>, N: CanonicalNodeSink>(
         .search_key();
     let prefix_bits = common_prefix_bits(&first, &last)?;
     if prefix_bits >= SEARCH_KEY_BITS {
-        return Err(PhysicalModelError::InvalidMap("duplicate branch key"));
+        return Err(PhysicalModelError::InvalidMap("duplicate branch key").into());
     }
     let split = entries.partition_point(|(key, _)| !bit(&key.search_key(), prefix_bits));
     if split == 0 || split == entries.len() {
-        return Err(PhysicalModelError::InvalidMap("canonical branch is unary"));
+        return Err(PhysicalModelError::InvalidMap("canonical branch is unary").into());
     }
     let zero = build(identity, domain, &entries[..split], nodes)?;
     let one = build(identity, domain, &entries[split..], nodes)?;
-    let node = PhysicalMapNode::branch(
-        domain,
-        prefix_bits,
-        canonical_prefix(&first, prefix_bits)?,
-        zero,
-        one,
-        u64::try_from(entries.len()).map_err(|_| PhysicalModelError::LengthOverflow)?,
-    )?;
-    let id = node.identify(identity)?;
-    nodes.put(id, node)?;
-    Ok(id)
+    let subtree_entries =
+        u64::try_from(entries.len()).map_err(|_| PhysicalModelError::LengthOverflow)?;
+    let prefix = canonical_prefix(&first, prefix_bits)?;
+    validate_branch(prefix_bits, &prefix, zero, one, subtree_entries)?;
+    let bytes = super::encode_body(|encoder| {
+        super::encode::branch(
+            domain,
+            prefix_bits,
+            &prefix,
+            &zero,
+            &one,
+            subtree_entries,
+            encoder,
+        );
+        Ok(())
+    })?;
+    super::put_identified_bytes(
+        identity,
+        super::LEGACY_MAP_NODE_IDENTITY,
+        nodes,
+        &bytes,
+        || {
+            Ok(PhysicalMapNode::Branch {
+                domain,
+                prefix_bits,
+                prefix,
+                zero,
+                one,
+                subtree_entries,
+            })
+        },
+    )
+}
+
+fn put_encoded_leaf<I, V, N>(
+    identity: &I,
+    domain: PhysicalMapDomain,
+    entry: &(PhysicalMapKey, V),
+    nodes: &mut N,
+) -> Result<PhysicalMapNodeId, N::Error>
+where
+    I: PhysicalIdentity,
+    V: AsRef<[u8]>,
+    N: CanonicalNodeSink,
+{
+    let key = entry.0;
+    let value = entry.1.as_ref();
+    let bytes = super::encode_body(|encoder| super::encode::leaf(domain, &key, value, encoder))?;
+    super::put_identified_bytes(
+        identity,
+        super::LEGACY_MAP_NODE_IDENTITY,
+        nodes,
+        &bytes,
+        || Ok(PhysicalMapNode::leaf(domain, key, value.to_vec())),
+    )
 }
 
 struct Leaf {
@@ -83,13 +160,17 @@ struct Branch {
     subtree_entries: u64,
 }
 
-struct Insertion<'a, I> {
+struct Insertion<'a, I, N> {
     identity: &'a I,
     domain: PhysicalMapDomain,
-    nodes: &'a mut BTreeMap<PhysicalMapNodeId, PhysicalMapNode>,
+    nodes: &'a mut BTreeMap<PhysicalMapNodeId, N>,
 }
 
-impl<I: PhysicalIdentity> Insertion<'_, I> {
+impl<I, N> Insertion<'_, I, N>
+where
+    I: PhysicalIdentity,
+    N: core::borrow::Borrow<PhysicalMapNode> + From<PhysicalMapNode>,
+{
     fn insert_at(
         &mut self,
         node_id: PhysicalMapNodeId,
@@ -99,8 +180,9 @@ impl<I: PhysicalIdentity> Insertion<'_, I> {
         let node = self
             .nodes
             .get(&node_id)
-            .cloned()
-            .ok_or(PhysicalModelError::InvalidMap("missing insertion node"))?;
+            .ok_or(PhysicalModelError::InvalidMap("missing insertion node"))?
+            .borrow()
+            .clone();
         if node.domain() != self.domain {
             return Err(PhysicalModelError::InvalidMap(
                 "insertion crossed a map domain",
@@ -249,8 +331,8 @@ impl<I: PhysicalIdentity> Insertion<'_, I> {
         &mut self,
         node: PhysicalMapNode,
     ) -> Result<PhysicalMapNodeId, PhysicalModelError> {
-        let id = node.identify(self.identity)?;
-        self.nodes.put(id, node)?;
+        let (bytes, id) = node.encode_and_identify(self.identity)?;
+        self.nodes.put(id, &bytes, node)?;
         Ok(id)
     }
 }

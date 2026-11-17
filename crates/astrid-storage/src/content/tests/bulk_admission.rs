@@ -107,7 +107,7 @@ fn parallel_admission_reports_a_source_independent_pending_bound() {
         )
         .unwrap();
 
-    let per_worker_bound = crate::content::store::STAGING_BATCH_TARGET_BYTES
+    let per_worker_bound = crate::content::store::NATIVE_CONTENT_BATCH_BYTES
         + usize::try_from(crate::content::ChunkingProfile::ASTRID_V1.maximum_bytes()).unwrap()
         + 64 * 1024;
     assert_eq!(outcome.entries().len(), workers.get());

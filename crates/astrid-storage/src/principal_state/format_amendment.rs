@@ -457,37 +457,70 @@ pub(super) fn prepare_format_specification(
 /// intentionally retains the original direct profile identity; only record-local
 /// value decoding, not a new volume-wide open gate, fences older readers.
 pub(super) fn prepare_volume_format_specification(engine: &RuntimeEngine) -> StorageResult<()> {
+    let destination = classify_volume_format(engine)?;
+    verify_catalogue_bootstrap(engine)?;
     let current = format_spec_record()?;
-    let current_id = engine.identify(&current);
-    let active = engine
+    prepare_format_specification(engine, destination, &current, engine.identify(&current))
+}
+
+/// Verify recovered format metadata without granting amendment authority.
+pub(super) fn verify_volume_format_for_recovery(engine: &RuntimeEngine) -> StorageResult<()> {
+    let destination = classify_volume_format(engine)?;
+    verify_catalogue_bootstrap(engine)?;
+    if matches!(destination, DestinationFormat::Current) {
+        let current = format_spec_record()?;
+        ensure_specification(
+            engine,
+            engine.identify(&current),
+            &current,
+            true,
+            "format specification",
+        )?;
+    }
+    if engine
         .direct_representation_specification()
         .map_err(|error| {
-            StorageError::Connection(format!("read volume format profile: {error}"))
-        })?;
-    let destination = match active {
+            StorageError::Connection(format!("read recovery format profile: {error}"))
+        })?
+        .is_none()
+    {
+        return Err(StorageError::Connection(
+            "recovery volume has no direct format profile".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn classify_volume_format(engine: &RuntimeEngine) -> StorageResult<DestinationFormat> {
+    let current = format_spec_record()?;
+    let current_id = engine.identify(&current);
+    match engine
+        .direct_representation_specification()
+        .map_err(|error| StorageError::Connection(format!("read volume format profile: {error}")))?
+    {
         Some(prior) if DIRECT_CATALOGUE_PREDECESSORS.contains(&prior) => {
-            DestinationFormat::PriorV1 {
+            Ok(DestinationFormat::PriorV1 {
                 format_spec: prior,
                 catalog_spec_was_declared: true,
-            }
+            })
         },
-        Some(id) if id != current_id => {
-            return Err(StorageError::Connection(
-                "volume direct profile selects an unsupported format".to_owned(),
-            ));
-        },
-        _ => DestinationFormat::Current,
-    };
-    // Every supported direct profile already declared the catalog grammar.
-    // Verify its bootstrap before admitting any successor format evidence.
+        Some(id) if id != current_id => Err(StorageError::Connection(
+            "volume direct profile selects an unsupported format".to_owned(),
+        )),
+        _ => Ok(DestinationFormat::Current),
+    }
+}
+
+fn verify_catalogue_bootstrap(engine: &RuntimeEngine) -> StorageResult<()> {
+    // Every supported direct profile already declared this grammar. Current
+    // classification intentionally forbids recreating a missing bootstrap.
     let catalog = super::bootstrap::content_catalog_format_specification()?;
     prepare_catalog_specification(
         engine,
         DestinationFormat::Current,
         &catalog,
         engine.identify(&catalog),
-    )?;
-    prepare_format_specification(engine, destination, &current, current_id)
+    )
 }
 
 pub(super) fn prepare_catalog_specification(

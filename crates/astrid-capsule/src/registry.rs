@@ -69,6 +69,9 @@ pub struct Unregistered {
     /// `true` when the runtime itself was removed. A dependent system view can
     /// detach while its explicit owner and singleton remain live.
     pub torn_down: bool,
+    /// Principal views removed by this operation, including dependent views
+    /// when an explicit system runtime loses its owner. Order is unspecified.
+    pub removed_principals: Vec<PrincipalId>,
 }
 
 /// Result of atomically replacing one runtime generation.
@@ -102,6 +105,7 @@ impl std::fmt::Debug for Unregistered {
         f.debug_struct("Unregistered")
             .field("capsule_id", &self.capsule.id())
             .field("torn_down", &self.torn_down)
+            .field("removed_view_count", &self.removed_principals.len())
             .finish()
     }
 }
@@ -502,10 +506,15 @@ impl CapsuleRegistry {
                 .views
                 .values()
                 .any(|view| view.values().any(|candidate| candidate == &runtime_id));
+        let mut removed_principals = vec![principal.clone()];
         if torn_down {
-            if owner_departed {
-                for view in self.views.values_mut() {
+            if owner_departed && runtime_id.key.scope() == RuntimeScope::SystemResident {
+                for (affected, view) in &mut self.views {
+                    let previous_len = view.len();
                     view.retain(|_, candidate| candidate != &runtime_id);
+                    if view.len() != previous_len {
+                        removed_principals.push(affected.clone());
+                    }
                 }
                 self.views.retain(|_, view| !view.is_empty());
             }
@@ -532,7 +541,11 @@ impl CapsuleRegistry {
             info!(capsule_id = %id, principal = %principal, generation = runtime_id.generation, "Unregistered system capsule view (runtime retained)");
         }
 
-        Ok(Unregistered { capsule, torn_down })
+        Ok(Unregistered {
+            capsule,
+            torn_down,
+            removed_principals,
+        })
     }
 
     // -----------------------------------------------------------------

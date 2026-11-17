@@ -12,9 +12,9 @@ use super::{BlockingTreeStore, Replacement, TreeKvStore, map_engine};
 use crate::error::{StorageError, StorageResult};
 use crate::kv::principal::KvPrincipalResolver;
 use crate::kv::{
-    KvBatchCondition, KvBatchMutation, KvBatchOutcome, KvConditionResult, KvMutationBatch, KvStore,
-    composite_key, namespace_range_end, namespace_range_start, prefix_range_end, validate_key,
-    validate_namespace, validate_prefix,
+    KvBatchCondition, KvBatchMutation, KvBatchOutcome, KvConditionResult, KvEntry, KvMutationBatch,
+    KvStore, composite_key, namespace_range_end, namespace_range_start, prefix_range_end,
+    validate_key, validate_namespace, validate_prefix,
 };
 
 #[async_trait]
@@ -153,6 +153,37 @@ where
         run_blocking(move || {
             blocking.read(owner, |context, header| {
                 context.projected_keys_in_range(header, &start, &end, strip)
+            })
+        })
+        .await
+    }
+
+    async fn list_entries_with_prefix(
+        &self,
+        namespace: &str,
+        prefix: &str,
+    ) -> StorageResult<Vec<KvEntry>> {
+        validate_namespace(namespace)?;
+        validate_prefix(prefix)?;
+        let owner = self.resolver.resolve(namespace)?;
+        let start = composite_key(namespace, prefix);
+        let end = prefix_range_end(namespace, prefix);
+        let namespace = namespace.to_owned();
+        let strip = namespace.len().saturating_add(1);
+        let blocking = self.blocking_store();
+        run_blocking(move || {
+            blocking.read(owner, |context, header| {
+                context
+                    .projected_entries_in_range(header, &start, &end, strip)?
+                    .into_iter()
+                    .map(|(key, value)| {
+                        Ok(KvEntry {
+                            namespace: namespace.clone(),
+                            key,
+                            value,
+                        })
+                    })
+                    .collect()
             })
         })
         .await

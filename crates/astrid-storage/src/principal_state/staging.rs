@@ -34,6 +34,7 @@ mod group;
 mod journal;
 mod legacy;
 mod migration;
+mod ready;
 mod recovery;
 mod retirement;
 #[cfg(test)]
@@ -49,6 +50,7 @@ use journal::{
 };
 pub(super) use migration::migrate_alias_owner_intents;
 use migration::{MigrationDirectories, migrate_legacy};
+pub use ready::ReadyStagedContent;
 use recovery::{load_generation, open_generation_in, recover_generations, sealed_generation_name};
 use retirement::{establish_in as establish_retired_generation, remove_in as remove_generation};
 pub use writer::StagedContentWriter;
@@ -70,12 +72,65 @@ impl fmt::Display for StagedContentId {
 /// Private native staging area shared by hosted filesystem providers.
 #[derive(Clone, Debug)]
 pub struct NativeContentStagingArea {
-    inner: Arc<StagingInner>,
+    /// Shared facade. Cloning does not pin open host capabilities.
+    body: Arc<StagingBody>,
+}
+
+/// Stable root plus a brief phase mutex over the open-host lease graph.
+#[derive(Debug)]
+struct StagingBody {
+    root: PathBuf,
+    phase: PoisoningMutex<StagingPhase>,
+}
+
+#[derive(Debug)]
+enum StagingPhase {
+    Open(Arc<StagingInner>),
+    Reserved,
+    Closed,
+}
+
+/// RAII close reservation: restores `Open` on drop unless committed.
+pub(in crate::principal_state) struct StagingCloseToken {
+    body: Arc<StagingBody>,
+    inner: Option<Arc<StagingInner>>,
+    committed: bool,
+}
+
+impl StagingCloseToken {
+    /// Finish close: drop native Dir/journal and publish `Closed` to all facades.
+    pub(in crate::principal_state) fn commit(mut self) {
+        self.committed = true;
+        self.inner = None;
+        *self.body.phase.lock() = StagingPhase::Closed;
+    }
+
+    fn already_closed(body: Arc<StagingBody>) -> Self {
+        Self {
+            body,
+            inner: None,
+            committed: true,
+        }
+    }
+}
+
+impl Drop for StagingCloseToken {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let Some(inner) = self.inner.take() else {
+            return;
+        };
+        let mut phase = self.body.phase.lock();
+        if matches!(*phase, StagingPhase::Reserved) {
+            *phase = StagingPhase::Open(inner);
+        }
+    }
 }
 
 #[derive(Debug)]
 struct StagingInner {
-    root: PathBuf,
     generations: PathBuf,
     generations_directory: PrivateDirectory,
     seal_order: PoisoningMutex<SealOrder>,
@@ -85,6 +140,18 @@ struct StagingInner {
     faults: Arc<dyn StagingFaultInjector>,
     #[cfg(test)]
     seal_groups_completed: AtomicU64,
+    #[cfg(test)]
+    publish_gate: std::sync::Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+}
+
+fn staging_closed() -> StorageError {
+    StorageError::Connection("runtime staging is closed after projection retirement".to_owned())
+}
+
+fn staging_busy() -> StorageError {
+    StorageError::Connection(
+        "runtime staging is still in use; stop all staging users before retirement".to_owned(),
+    )
 }
 
 #[derive(Debug)]
@@ -125,18 +192,13 @@ impl<T> PoisoningMutex<T> {
 }
 
 struct ActiveSeal {
-    area: NativeContentStagingArea,
+    inner: Arc<StagingInner>,
     sequence: u64,
 }
 
 impl Drop for ActiveSeal {
     fn drop(&mut self) {
-        self.area
-            .inner
-            .seal_order
-            .lock()
-            .active
-            .remove(&self.sequence);
+        self.inner.seal_order.lock().active.remove(&self.sequence);
     }
 }
 
@@ -170,6 +232,56 @@ impl StagingFaultInjector for NoStagingFaults {
 }
 
 impl NativeContentStagingArea {
+    /// Acquire an open-host lease. Idle facade clones do not hold this Arc.
+    fn acquire_open(&self) -> StorageResult<Arc<StagingInner>> {
+        match &*self.body.phase.lock() {
+            StagingPhase::Open(inner) => Ok(Arc::clone(inner)),
+            StagingPhase::Reserved => Err(staging_busy()),
+            StagingPhase::Closed => Err(staging_closed()),
+        }
+    }
+
+    /// Reserve close under the phase mutex using `Arc::get_mut` uniqueness.
+    ///
+    /// Does not hold the mutex across engine or filesystem IO. Live writer or
+    /// publish leases keep `get_mut` failing until they drop.
+    pub(in crate::principal_state) fn reserve_for_close(&self) -> StorageResult<StagingCloseToken> {
+        let mut phase = self.body.phase.lock();
+        match &mut *phase {
+            StagingPhase::Closed => Ok(StagingCloseToken::already_closed(Arc::clone(&self.body))),
+            StagingPhase::Reserved => Err(staging_busy()),
+            StagingPhase::Open(inner) => {
+                if Arc::get_mut(inner).is_none() {
+                    return Err(staging_busy());
+                }
+                let StagingPhase::Open(inner) =
+                    std::mem::replace(&mut *phase, StagingPhase::Reserved)
+                else {
+                    unreachable!("open phase checked above");
+                };
+                Ok(StagingCloseToken {
+                    body: Arc::clone(&self.body),
+                    inner: Some(inner),
+                    committed: false,
+                })
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::principal_state) fn gate_next_publish(
+        &self,
+        reached: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        *self
+            .acquire_open()
+            .expect("open staging")
+            .publish_gate
+            .lock()
+            .expect("publish gate") = Some((reached, release));
+    }
+
     /// Open a private staging area and recover writes interrupted after sealing.
     ///
     /// Unacknowledged `.open` generations are retained under `quarantine/`.
@@ -269,22 +381,26 @@ impl NativeContentStagingArea {
             .map(|key| key.id)
             .collect();
         Ok(Self {
-            inner: Arc::new(StagingInner {
+            body: Arc::new(StagingBody {
                 root,
-                generations,
-                generations_directory,
-                seal_order: PoisoningMutex::new(SealOrder {
-                    next_sequence,
-                    active: std::collections::BTreeMap::new(),
-                    reserved_identifiers,
-                    reaped_identifiers: std::collections::BTreeSet::new(),
-                }),
-                group_policy,
-                seal_group: PoisoningMutex::new(SealGroup::default()),
-                journal: PoisoningMutex::new(journal),
-                faults,
-                #[cfg(test)]
-                seal_groups_completed: AtomicU64::new(0),
+                phase: PoisoningMutex::new(StagingPhase::Open(Arc::new(StagingInner {
+                    generations,
+                    generations_directory,
+                    seal_order: PoisoningMutex::new(SealOrder {
+                        next_sequence,
+                        active: std::collections::BTreeMap::new(),
+                        reserved_identifiers,
+                        reaped_identifiers: std::collections::BTreeSet::new(),
+                    }),
+                    group_policy,
+                    seal_group: PoisoningMutex::new(SealGroup::default()),
+                    journal: PoisoningMutex::new(journal),
+                    faults,
+                    #[cfg(test)]
+                    seal_groups_completed: AtomicU64::new(0),
+                    #[cfg(test)]
+                    publish_gate: std::sync::Mutex::new(None),
+                }))),
             }),
         })
     }
@@ -314,9 +430,10 @@ impl NativeContentStagingArea {
         profile: ChunkingProfile,
         id: StagedContentId,
     ) -> StorageResult<StagedContentWriter> {
-        let path = self.inner.generations.join(open_generation_name(id));
+        let lease = self.acquire_open()?;
+        let path = lease.generations.join(open_generation_name(id));
         let file = {
-            let mut order = self.inner.seal_order.lock();
+            let mut order = lease.seal_order.lock();
             if !order.reserved_identifiers.insert(id) {
                 return Err(connection(format!(
                     "staged-write identifier {id} is already reserved"
@@ -332,6 +449,7 @@ impl NativeContentStagingArea {
         };
         Ok(StagedContentWriter {
             area: self.clone(),
+            lease,
             id,
             owner,
             name,
@@ -354,8 +472,9 @@ impl NativeContentStagingArea {
     /// redirected, or no longer matches its durable intent.
     pub fn ready(&self) -> StorageResult<Vec<ReadyStagedContent>> {
         self.reap_completed()?;
+        let inner = self.acquire_open()?;
         let pending: Vec<_> = {
-            let journal = self.inner.journal.lock();
+            let journal = inner.journal.lock();
             if journal.poisoned {
                 return Err(connection("staging journal requires recovery".to_owned()));
             }
@@ -364,16 +483,10 @@ impl NativeContentStagingArea {
         pending
             .into_iter()
             .map(|intent| {
-                let path = self
-                    .inner
+                let path = inner
                     .generations
                     .join(sealed_generation_name(intent.sequence, intent.id));
-                load_generation(
-                    &self.inner.root,
-                    &self.inner.generations_directory,
-                    path,
-                    intent,
-                )
+                load_generation(self.path(), &inner.generations_directory, path, intent)
             })
             .collect()
     }
@@ -395,14 +508,17 @@ impl NativeContentStagingArea {
         staged: ReadyStagedContent,
         content: Arc<NativePrincipalContentStore>,
     ) -> StorageResult<ContentWriteOutcome> {
-        if staged.staging_root != self.inner.root {
+        let lease = self.acquire_open()?;
+        if staged.staging_root != self.body.root {
             return Err(connection(
                 "staged write belongs to a different staging area".to_owned(),
             ));
         }
         self.ensure_publication_order(&staged)?;
         let area = self.clone();
-        tokio::task::spawn_blocking(move || publish_ready(&area, &staged, &content))
+        // Move the open lease into the worker so a canceled awaiter cannot drop
+        // the busy proof while publication continues.
+        tokio::task::spawn_blocking(move || publish_ready(&area, &lease, &staged, &content))
             .await
             .map_err(|error| {
                 StorageError::Internal(format!("staged content publication worker failed: {error}"))
@@ -430,9 +546,10 @@ impl NativeContentStagingArea {
             .first()
             .ok_or_else(|| connection("staged publication batch is empty".to_owned()))?;
         let owner = first.owner;
+        let lease = self.acquire_open()?;
         let mut names = std::collections::BTreeSet::new();
         for entry in &staged {
-            if entry.staging_root != self.inner.root {
+            if entry.staging_root != self.body.root {
                 return Err(connection(
                     "staged write belongs to a different staging area".to_owned(),
                 ));
@@ -451,11 +568,13 @@ impl NativeContentStagingArea {
             self.ensure_publication_order_excluding(entry, &staged)?;
         }
         let area = self.clone();
-        tokio::task::spawn_blocking(move || publish_ready_batch(&area, &staged, owner, &content))
-            .await
-            .map_err(|error| {
-                StorageError::Internal(format!("staged content batch worker failed: {error}"))
-            })?
+        tokio::task::spawn_blocking(move || {
+            publish_ready_batch(&area, &lease, &staged, owner, &content)
+        })
+        .await
+        .map_err(|error| {
+            StorageError::Internal(format!("staged content batch worker failed: {error}"))
+        })?
     }
 
     fn ensure_publication_order(&self, staged: &ReadyStagedContent) -> StorageResult<()> {
@@ -467,8 +586,9 @@ impl NativeContentStagingArea {
         staged: &ReadyStagedContent,
         included: &[ReadyStagedContent],
     ) -> StorageResult<()> {
+        let inner = self.acquire_open()?;
         let earlier_active =
-            self.inner
+            inner
                 .seal_order
                 .lock()
                 .active
@@ -477,7 +597,7 @@ impl NativeContentStagingArea {
                     *sequence < staged.sequence && owner == &staged.owner && name == &staged.name
                 });
         let earlier_pending = {
-            let journal = self.inner.journal.lock();
+            let journal = inner.journal.lock();
             if journal.poisoned {
                 return Err(connection("staging journal requires recovery".to_owned()));
             }
@@ -505,11 +625,15 @@ impl NativeContentStagingArea {
     /// filesystem root.
     #[must_use]
     pub fn path(&self) -> &Path {
-        &self.inner.root
+        &self.body.root
     }
 
-    fn register_seal(&self, owner: &StateOwner, name: &ContentName) -> StorageResult<ActiveSeal> {
-        let mut order = self.inner.seal_order.lock();
+    fn register_seal(
+        lease: &Arc<StagingInner>,
+        owner: &StateOwner,
+        name: &ContentName,
+    ) -> StorageResult<ActiveSeal> {
+        let mut order = lease.seal_order.lock();
         let sequence = order.next_sequence;
         order.next_sequence = sequence
             .checked_add(1)
@@ -517,7 +641,7 @@ impl NativeContentStagingArea {
         order.active.insert(sequence, (*owner, name.clone()));
         drop(order);
         Ok(ActiveSeal {
-            area: self.clone(),
+            inner: Arc::clone(lease),
             sequence,
         })
     }
@@ -535,12 +659,14 @@ impl NativeContentStagingArea {
             })
             .collect::<Vec<_>>();
         {
-            let mut journal = self.inner.journal.lock();
+            let lease = self.acquire_open()?;
+            let mut journal = lease.journal.lock();
             if journal.poisoned {
                 return Err(connection("staging journal requires recovery".to_owned()));
             }
             if keys.iter().all(|key| journal.completed.contains(key)) {
                 drop(journal);
+                drop(lease);
                 return self.reap_completed();
             }
             if let Some(missing) = keys.iter().find(|key| !journal.pending.contains_key(key)) {
@@ -571,7 +697,8 @@ impl NativeContentStagingArea {
     }
 
     fn reap_completed(&self) -> StorageResult<()> {
-        let mut journal = self.inner.journal.lock();
+        let inner = self.acquire_open()?;
+        let mut journal = inner.journal.lock();
         if journal.poisoned {
             return Err(connection("staging journal requires recovery".to_owned()));
         }
@@ -581,12 +708,12 @@ impl NativeContentStagingArea {
         }
         let cleanup = (|| {
             for key in &completed {
-                establish_retired_generation(&self.inner.generations_directory, *key)?;
-                self.fail_if(StagingFaultPoint::GenerationRetired)?;
-                remove_generation(&self.inner.generations_directory, *key)?;
+                establish_retired_generation(&inner.generations_directory, *key)?;
+                inner.faults.fail(StagingFaultPoint::GenerationRetired)?;
+                remove_generation(&inner.generations_directory, *key)?;
             }
-            self.inner.generations_directory.sync()?;
-            self.fail_if(StagingFaultPoint::GenerationCleaned)
+            inner.generations_directory.sync()?;
+            inner.faults.fail(StagingFaultPoint::GenerationCleaned)
         })();
         cleanup?;
         for key in &completed {
@@ -598,7 +725,7 @@ impl NativeContentStagingArea {
             return Err(error);
         }
         drop(journal);
-        let mut order = self.inner.seal_order.lock();
+        let mut order = inner.seal_order.lock();
         for key in completed {
             order.reaped_identifiers.insert(key.id);
         }
@@ -612,17 +739,24 @@ impl NativeContentStagingArea {
     }
 
     fn fail_if(&self, point: StagingFaultPoint) -> StorageResult<()> {
-        self.inner.faults.fail(point)
+        self.acquire_open()?.faults.fail(point)
     }
 }
 
 fn publish_ready(
     area: &NativeContentStagingArea,
+    lease: &Arc<StagingInner>,
     staged: &ReadyStagedContent,
     content: &NativePrincipalContentStore,
 ) -> StorageResult<ContentWriteOutcome> {
+    #[cfg(test)]
+    if let Some((reached, release)) = lease.publish_gate.lock().expect("publish gate").take() {
+        reached.wait();
+        release.wait();
+    }
+    let inner = lease;
     let (source, _) = open_generation_in(
-        &area.inner.generations_directory,
+        &inner.generations_directory,
         &staged.content_path(),
         &staged.intent(),
         Some(staged.source_identity),
@@ -675,6 +809,7 @@ fn publish_ready(
 
 fn publish_ready_batch(
     area: &NativeContentStagingArea,
+    lease: &Arc<StagingInner>,
     staged: &[ReadyStagedContent],
     owner: StateOwner,
     content: &NativePrincipalContentStore,
@@ -683,10 +818,11 @@ fn publish_ready_batch(
         content.quota_staging_bound(&owner).map_err(|error| {
             StorageError::Internal(format!("resolve staged content batch quota: {error}"))
         })? {
+        let inner = lease;
         let mut completed = Vec::with_capacity(staged.len());
         for entry in staged {
             let (source, _) = open_generation_in(
-                &area.inner.generations_directory,
+                &inner.generations_directory,
                 &entry.content_path(),
                 &entry.intent(),
                 Some(entry.source_identity),
@@ -719,23 +855,25 @@ fn publish_ready_batch(
                 StorageError::Internal(format!("publish staged content batch: {error}"))
             })?
     } else {
-        publish_ready_batch_unmetered(area, staged, &owner, content)?
+        publish_ready_batch_unmetered(area, lease, staged, &owner, content)?
     };
     area.mark_published_batch(staged)?;
     Ok(outcome)
 }
 
 fn publish_ready_batch_unmetered(
-    area: &NativeContentStagingArea,
+    _area: &NativeContentStagingArea,
+    lease: &Arc<StagingInner>,
     staged: &[ReadyStagedContent],
     owner: &StateOwner,
     content: &NativePrincipalContentStore,
 ) -> StorageResult<ContentBatchWriteOutcome> {
+    let inner = lease;
     let mut completed = Vec::with_capacity(staged.len());
     let mut objects_inserted = 0_u64;
     for entry in staged {
         let (source, _) = open_generation_in(
-            &area.inner.generations_directory,
+            &inner.generations_directory,
             &entry.content_path(),
             &entry.intent(),
             Some(entry.source_identity),
@@ -756,92 +894,6 @@ fn publish_ready_batch_unmetered(
     content
         .publish_verified_batch(owner, completed, objects_inserted)
         .map_err(|error| StorageError::Internal(format!("publish staged content batch: {error}")))
-}
-
-/// One sealed native write awaiting authoritative content publication.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReadyStagedContent {
-    staging_root: PathBuf,
-    path: PathBuf,
-    sequence: u64,
-    id: StagedContentId,
-    owner: StateOwner,
-    name: ContentName,
-    profile: ChunkingProfile,
-    logical_bytes: u64,
-    source_identity: PrivateFileIdentity,
-}
-
-impl ReadyStagedContent {
-    fn from_intent(
-        staging_root: PathBuf,
-        path: PathBuf,
-        intent: StagingIntent,
-        source_identity: PrivateFileIdentity,
-    ) -> Self {
-        Self {
-            staging_root,
-            path,
-            sequence: intent.sequence,
-            id: intent.id,
-            owner: intent.owner,
-            name: intent.name,
-            profile: intent.profile,
-            logical_bytes: intent.logical_bytes,
-            source_identity,
-        }
-    }
-
-    fn intent(&self) -> StagingIntent {
-        StagingIntent {
-            sequence: self.sequence,
-            id: self.id,
-            owner: self.owner,
-            name: self.name.clone(),
-            profile: self.profile,
-            logical_bytes: self.logical_bytes,
-        }
-    }
-
-    /// Return the close-order sequence.
-    #[must_use]
-    pub const fn sequence(&self) -> u64 {
-        self.sequence
-    }
-
-    /// Return the opaque staging identifier.
-    #[must_use]
-    pub const fn id(&self) -> StagedContentId {
-        self.id
-    }
-
-    /// Return the authoritative state owner.
-    #[must_use]
-    pub const fn owner(&self) -> &StateOwner {
-        &self.owner
-    }
-
-    /// Return the principal content name.
-    #[must_use]
-    pub const fn name(&self) -> &ContentName {
-        &self.name
-    }
-
-    /// Return the staged byte length.
-    #[must_use]
-    pub const fn logical_bytes(&self) -> u64 {
-        self.logical_bytes
-    }
-
-    /// Return the pinned chunking profile selected at write creation.
-    #[must_use]
-    pub const fn profile(&self) -> ChunkingProfile {
-        self.profile
-    }
-
-    pub(super) fn content_path(&self) -> PathBuf {
-        self.path.clone()
-    }
 }
 
 fn claim_generation_key(

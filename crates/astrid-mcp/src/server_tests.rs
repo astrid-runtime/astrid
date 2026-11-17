@@ -109,11 +109,17 @@ where
     S: rmcp::ServerHandler + Send + 'static,
 {
     let (server_transport, client_transport) = tokio::io::duplex(4096);
+    // rmcp >= 3.9: `server/discover` is only a bootstrap probe. `ServerHandler::serve`
+    // stays in the handshake loop until `initialize` or the first non-discover
+    // request that carries complete modern inline metadata. Signal that durable
+    // transition explicitly so teardown does not race a still-pending probe.
+    let (server_ready_tx, server_ready_rx) = tokio::sync::oneshot::channel();
     let server_task = tokio::spawn(async move {
         let service = server
             .serve(server_transport)
             .await
             .expect("test server should start");
+        let _ = server_ready_tx.send(());
         let _ = service.waiting().await;
     });
 
@@ -135,6 +141,9 @@ where
             .expect("tools/list should work after negotiation")
             .is_empty()
     );
+    server_ready_rx
+        .await
+        .expect("server serve() should return before fixture teardown");
     client.cancel().await.expect("client should stop cleanly");
     tokio::time::timeout(std::time::Duration::from_secs(1), server_task)
         .await

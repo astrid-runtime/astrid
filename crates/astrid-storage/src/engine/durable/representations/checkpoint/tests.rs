@@ -1,4 +1,4 @@
-use super::super::{ArenaLocation, ObjectId, open_store_root};
+use super::super::{ArenaLocation, DurableError, ObjectId, append_frame, format, open_store_root};
 use super::*;
 use crate::volume::{AstridVolume, HostedFileVolume};
 use std::sync::Arc;
@@ -217,14 +217,17 @@ fn recovered_maps_retain_only_their_active_closures() {
     assert_eq!(recovered.active, active);
     assert_eq!(recovered.reverse, reverse);
     for map in [
-        &recovered.profiles,
-        &recovered.representations,
-        &recovered.placement_entries,
+        recovered.profiles.as_canonical(),
+        recovered.representations.as_canonical(),
+        recovered.placement_entries.as_canonical(),
     ] {
         assert_eq!(map.entry_count(), 1);
         assert_eq!(map.nodes().len(), 1, "retain only this root's active page");
     }
-    assert_eq!(recovered.persisted_map_nodes.len(), 3);
+    assert_eq!(
+        recovered.persisted_map_nodes.len() + recovered.complete_map_subtrees.len(),
+        3
+    );
     assert_eq!(
         recovered.metadata.metadata().unwrap().len(),
         historical_bytes
@@ -234,10 +237,16 @@ fn recovered_maps_retain_only_their_active_closures() {
     // frames remain valid, and re-appending identical canonical nodes is safe.
     advance(&mut recovered, 1);
     assert_ne!(recovered.placement_entries.root(), final_placement);
-    assert_eq!(recovered.persisted_map_nodes.len(), 3);
+    assert_eq!(
+        recovered.persisted_map_nodes.len() + recovered.complete_map_subtrees.len(),
+        3
+    );
     advance(&mut recovered, 40);
     assert_eq!(recovered.placement_entries.root(), final_placement);
-    assert_eq!(recovered.persisted_map_nodes.len(), 3);
+    assert_eq!(
+        recovered.persisted_map_nodes.len() + recovered.complete_map_subtrees.len(),
+        3
+    );
     advance(&mut recovered, 41);
     let active = recovered.active;
     drop(recovered);
@@ -247,4 +256,113 @@ fn recovered_maps_retain_only_their_active_closures() {
     assert_eq!(reopened.active, active);
     assert_eq!(reopened.reverse, reverse);
     assert_eq!(reopened.placement_entries.nodes().len(), 1);
+}
+
+#[test]
+fn should_checkpoint_uses_live_frame_count_versus_tip_nodes() {
+    let directory = tempfile::tempdir().unwrap();
+    let volume: Arc<dyn AstridVolume> =
+        HostedFileVolume::open(directory.path().join("residue.volume")).unwrap();
+    let limits = RecoveryLimits::process_addressable();
+    let mut store =
+        RepresentationStore::activate_volume(&volume, limits, ObjectId::new([1; 32]), []).unwrap();
+    assert!(!store.should_checkpoint_representations_metadata());
+    for offset in 1..=40 {
+        advance(&mut store, offset);
+    }
+    assert!(
+        store.map_frame_count() > store.resident_map_node_count(),
+        "path-copy history should accumulate MapNode frames"
+    );
+    assert!(
+        store.should_checkpoint_representations_metadata(),
+        "O >= T must fire with live tip count, not a stale byte budget"
+    );
+    let before = store.metadata.metadata().unwrap().len();
+    assert!(store.maybe_checkpoint_volume(&volume, limits).unwrap());
+    assert!(!store.should_checkpoint_representations_metadata());
+    assert!(store.map_frame_count() <= store.resident_map_node_count());
+    assert!(store.metadata.metadata().unwrap().len() < before / 10);
+    // Idempotent when residue is below tip.
+    assert!(!store.maybe_checkpoint_volume(&volume, limits).unwrap());
+}
+
+#[test]
+fn checkpoint_reopen_restores_frame_count_from_scan_including_duplicates() {
+    let directory = tempfile::tempdir().unwrap();
+    let volume: Arc<dyn AstridVolume> =
+        HostedFileVolume::open(directory.path().join("frames.volume")).unwrap();
+    let limits = RecoveryLimits::process_addressable();
+    let mut store =
+        RepresentationStore::activate_volume(&volume, limits, ObjectId::new([1; 32]), []).unwrap();
+    for offset in 1..=24 {
+        advance(&mut store, offset);
+    }
+    // Force residency reclaim then reintroduce an earlier placement so an identical
+    // canonical MapNode is appended again (duplicate frame in the generation).
+    for offset in 1..=24 {
+        advance(&mut store, offset);
+    }
+    let frames_before = store.map_frame_count();
+    assert!(frames_before >= store.resident_map_node_count());
+    store.checkpoint_volume(&volume, limits).unwrap();
+    assert!(store.map_frame_count() <= store.resident_map_node_count());
+    let tip_frames = store.map_frame_count();
+    drop(store);
+
+    let recovered = RepresentationStore::open_volume(&volume, limits)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.map_frame_count(), tip_frames);
+    assert!(recovered.map_frame_count() <= recovered.resident_map_node_count());
+}
+
+#[test]
+fn prepare_checkpoint_recovery_limit_failure_keeps_old_handles_readable() {
+    let directory = tempfile::tempdir().unwrap();
+    let volume: Arc<dyn AstridVolume> =
+        HostedFileVolume::open(directory.path().join("fault-phase.volume")).unwrap();
+    let limits = RecoveryLimits::process_addressable();
+    let mut store =
+        RepresentationStore::activate_volume(&volume, limits, ObjectId::new([1; 32]), []).unwrap();
+    for offset in 1..=8 {
+        advance(&mut store, offset);
+    }
+    let active = store.active;
+    let frames = store.map_frame_count();
+    let generation = store.journal_generation;
+    let metadata_len = store.metadata.metadata().unwrap().len();
+    // Independent read handles on the published generation must remain usable.
+    let observer = RepresentationStore::open_volume(&volume, limits)
+        .unwrap()
+        .unwrap();
+    assert_eq!(observer.journal_generation, generation);
+    assert_eq!(observer.active, active);
+    assert_eq!(observer.metadata.metadata().unwrap().len(), metadata_len);
+
+    // Tiny frame ceiling makes tip verify fail after the replacement files are written.
+    let tiny = RecoveryLimits::new(1).unwrap();
+    let err = store
+        .prepare_checkpoint_volume(&volume, tiny)
+        .expect_err("prepare must fail under a one-byte frame ceiling");
+    assert!(
+        matches!(err, DurableError::FrameTooLarge { .. })
+            || err.to_string().contains("frame")
+            || err.to_string().contains("limit"),
+        "unexpected prepare error: {err:?}"
+    );
+    assert_eq!(store.journal_generation, generation);
+    assert_eq!(store.active, active);
+    assert_eq!(store.map_frame_count(), frames);
+    assert_eq!(store.metadata.metadata().unwrap().len(), metadata_len);
+    assert!(store.contains_direct(ObjectId::new([7; 32])));
+    assert_eq!(observer.journal_generation, generation);
+    assert_eq!(observer.active, active);
+    assert_eq!(observer.metadata.metadata().unwrap().len(), metadata_len);
+    assert!(observer.contains_direct(ObjectId::new([7; 32])));
+
+    store.checkpoint_volume(&volume, limits).unwrap();
+    assert!(store.journal_generation > generation);
+    assert_eq!(store.active, active);
+    assert!(store.contains_direct(ObjectId::new([7; 32])));
 }

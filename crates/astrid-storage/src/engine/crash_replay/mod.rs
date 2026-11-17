@@ -10,6 +10,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+pub mod host_projection;
 mod replay;
 
 pub use replay::{ConservativeDataSync, CrashImage, CrashImageSet, PersistenceModel, ReplayLimits};

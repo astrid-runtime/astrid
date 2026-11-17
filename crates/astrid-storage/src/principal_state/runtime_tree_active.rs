@@ -8,17 +8,21 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::content::{ContentEntry, ContentName};
 use crate::error::{StorageError, StorageResult};
 use crate::storage_model::ObjectId;
 use astrid_core::dirs::AstridHome;
+use astrid_core::platform_fs::StagingScope;
 
-use super::{RuntimePrincipalStore, StateOwner, runtime_tree::is_excluded};
+use super::{
+    NativePrincipalContentStore, RuntimePrincipalStore, StateOwner, runtime_tree::is_excluded,
+};
 
 pub(super) const ACTIVE_PROJECTION_NAME: &str = "run/.active-projection-v1.json";
-const RECEIPT_SCHEMA: u32 = 1;
+const RECEIPT_SCHEMA_V1: u32 = 1;
+const RECEIPT_SCHEMA_V2: u32 = 2;
 // Preserve the historical allowance for receipt framing and root spelling.
 // Inventory allowance is derived separately from authenticated live catalog
 // names, so a large fleet does not outgrow a fixed 4 MiB inventory ceiling.
@@ -45,6 +49,12 @@ pub(super) struct ActiveProjectionReceipt {
     phase: ReceiptPhase,
     root: String,
     entries: Vec<ActiveReceiptEntry>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_staging_scope",
+        skip_serializing_if = "Option::is_none"
+    )]
+    staging_scope: Option<StagingScope>,
 }
 
 impl ActiveProjectionReceipt {
@@ -62,11 +72,22 @@ impl ActiveProjectionReceipt {
             .is_ok()
     }
 
-    #[cfg(test)]
-    pub(super) fn inventory_identity(&self, name: &str) -> StorageResult<Option<ObjectId>> {
-        let Some(entry) = self.entries.iter().find(|entry| entry.name == name) else {
+    pub(super) const fn staging_scope(&self) -> Option<StagingScope> {
+        self.staging_scope
+    }
+
+    pub(super) fn inventory_names(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|entry| entry.name.as_str())
+    }
+
+    pub(super) fn inventory_object(&self, name: &str) -> StorageResult<Option<(ObjectId, u64)>> {
+        let Ok(index) = self
+            .entries
+            .binary_search_by(|entry| entry.name.as_str().cmp(name))
+        else {
             return Ok(None);
         };
+        let entry = &self.entries[index];
         let bytes = hex::decode(&entry.file).map_err(|error| {
             tree_error(
                 Path::new(&entry.name),
@@ -79,7 +100,13 @@ impl ActiveProjectionReceipt {
                 "receipt object identity is not 32 bytes",
             )
         })?;
-        Ok(Some(ObjectId::new(expected)))
+        Ok(Some((ObjectId::new(expected), entry.logical_bytes)))
+    }
+
+    #[cfg(test)]
+    pub(super) fn inventory_identity(&self, name: &str) -> StorageResult<Option<ObjectId>> {
+        self.inventory_object(name)
+            .map(|entry| entry.map(|(file, _)| file))
     }
 }
 
@@ -91,17 +118,83 @@ struct ActiveReceiptEntry {
     logical_bytes: u64,
 }
 
+fn deserialize_present_staging_scope<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<StagingScope>, D::Error> {
+    // Missing field uses serde `default` and never reaches this function.
+    // Explicit JSON null must fail closed rather than becoming no-epoch.
+    match Option::<StagingScope>::deserialize(deserializer)? {
+        Some(scope) => Ok(Some(scope)),
+        None => Err(serde::de::Error::custom(
+            "staging_scope must not be null when present",
+        )),
+    }
+}
+
 pub(super) fn active_projection_name() -> StorageResult<ContentName> {
     ContentName::new(ACTIVE_PROJECTION_NAME)
         .map_err(|error| StorageError::Internal(format!("validate active receipt: {error}")))
+}
+
+/// Verify that finalization is bound to this admitted runtime home.
+pub(super) fn validate_retirement_home(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+) -> StorageResult<()> {
+    if read(home, store)?.is_none() {
+        return Err(tree_error(
+            home.root(),
+            "runtime retirement requires an admitted projection receipt",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn read(
     home: &AstridHome,
     store: &RuntimePrincipalStore,
 ) -> StorageResult<Option<ActiveProjectionReceipt>> {
-    let receipt = read_relocatable(home, store)?;
-    if let Some(receipt) = &receipt
+    read_from_content(home, &store.content())
+}
+
+pub(super) fn read_from_content(
+    home: &AstridHome,
+    content: &NativePrincipalContentStore,
+) -> StorageResult<Option<ActiveProjectionReceipt>> {
+    #[cfg(any(test, feature = "test-support"))]
+    super::runtime_tree::operation_counts::record_receipt_read();
+    tracing::trace!(target: "astrid_storage::projection_receipt_read", "read runtime projection receipt");
+    let receipt = read_relocatable_from_content(home, content)?;
+    require_home_root(home, receipt.as_ref())?;
+    Ok(receipt)
+}
+
+/// Publication already needs the full catalog for retained entries. Authenticate
+/// the receipt against that same snapshot instead of repeating point lookups.
+/// The caller captures the System root before this read and binds publication
+/// to that root with its CAS; the snapshot is never a standalone authority.
+pub(super) fn read_for_publication(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+) -> StorageResult<(Option<ActiveProjectionReceipt>, Vec<ContentEntry>)> {
+    #[cfg(any(test, feature = "test-support"))]
+    super::runtime_tree::operation_counts::record_receipt_read();
+    let mut catalog = None;
+    let receipt = read_with_catalog(
+        home,
+        &store.content(),
+        &mut catalog,
+        ReceiptRead::Publication,
+    )?;
+    require_home_root(home, receipt.as_ref())?;
+    Ok((receipt, catalog.unwrap_or_default()))
+}
+
+fn require_home_root(
+    home: &AstridHome,
+    receipt: Option<&ActiveProjectionReceipt>,
+) -> StorageResult<()> {
+    if let Some(receipt) = receipt
         && receipt.root != canonical_root(home)?
     {
         return Err(tree_error(
@@ -109,7 +202,7 @@ pub(super) fn read(
             "active projection receipt is stale or redirected",
         ));
     }
-    Ok(receipt)
+    Ok(())
 }
 
 /// Parse and validate inventory without rejecting a root mismatch.
@@ -124,6 +217,28 @@ pub(super) fn read_relocatable(
     home: &AstridHome,
     store: &RuntimePrincipalStore,
 ) -> StorageResult<Option<ActiveProjectionReceipt>> {
+    read_relocatable_from_content(home, &store.content())
+}
+
+fn read_relocatable_from_content(
+    home: &AstridHome,
+    content: &NativePrincipalContentStore,
+) -> StorageResult<Option<ActiveProjectionReceipt>> {
+    read_with_catalog(home, content, &mut None, ReceiptRead::Sparse)
+}
+
+#[derive(Clone, Copy)]
+enum ReceiptRead {
+    Sparse,
+    Publication,
+}
+
+fn read_with_catalog(
+    home: &AstridHome,
+    content: &NativePrincipalContentStore,
+    catalog: &mut Option<Vec<ContentEntry>>,
+    mode: ReceiptRead,
+) -> StorageResult<Option<ActiveProjectionReceipt>> {
     let host_receipt = home.root().join(ACTIVE_PROJECTION_NAME);
     if std::fs::symlink_metadata(&host_receipt).is_ok() {
         return Err(tree_error(
@@ -133,37 +248,32 @@ pub(super) fn read_relocatable(
     }
 
     let name = active_projection_name()?;
-    let metadata = store
-        .content()
+    let metadata = content
         .describe(&StateOwner::System, &name)
         .map_err(receipt_error("inspect active projection receipt"))?;
     let Some(metadata) = metadata else {
         return Ok(None);
     };
     // Small receipts retain the historical authenticated allocation ceiling and
-    // point lookups. Listing unrelated catalog content would make sparse reads
-    // scale with the whole owner inventory even when its header is warm.
-    let catalog = if metadata.logical_bytes() > RECEIPT_FRAMING_BYTES {
-        Some(
-            store
-                .content()
+    // point lookups. Publication instead reuses its required complete listing;
+    // ordinary sparse reads must not scale with unrelated owner inventory.
+    if metadata.logical_bytes() > RECEIPT_FRAMING_BYTES {
+        *catalog = Some(
+            content
                 .list(&StateOwner::System)
                 .map_err(receipt_error("authenticate receipt inventory allowance"))?,
-        )
-    } else {
-        None
-    };
+        );
+    }
     let inventory = match catalog.as_deref() {
         Some(catalog) => ReceiptInventory::Listed(catalog),
-        None => ReceiptInventory::Point(store),
+        None => ReceiptInventory::Point(content),
     };
     enforce_receipt_bound(
         &host_receipt,
         metadata.logical_bytes(),
         inventory.size_bound()?,
     )?;
-    let bytes = store
-        .content()
+    let bytes = content
         .read(&StateOwner::System, &name)
         .map_err(receipt_error("read active projection receipt"))?
         .ok_or_else(|| {
@@ -172,13 +282,30 @@ pub(super) fn read_relocatable(
                 "active projection receipt disappeared while being read",
             )
         })?;
-    decode_receipt(&host_receipt, &bytes, &inventory)
+    let receipt = parse_receipt(&host_receipt, &bytes, &inventory)?;
+    // Small RETIRING retries do not need a retained-entry catalog. Keep their
+    // sparse behavior; only ACTIVE publication already requires a full listing.
+    if matches!(mode, ReceiptRead::Publication)
+        && receipt.phase() == ReceiptPhase::Active
+        && catalog.is_none()
+    {
+        *catalog = Some(
+            content
+                .list(&StateOwner::System)
+                .map_err(receipt_error("authenticate publication inventory"))?,
+        );
+    }
+    let inventory = match catalog.as_deref() {
+        Some(catalog) => ReceiptInventory::Listed(catalog),
+        None => ReceiptInventory::Point(content),
+    };
+    validate_receipt(&host_receipt, receipt, &inventory).map(Some)
 }
 
 // Both sources authenticate the same metadata through ContentStore. Only the
 // large-receipt path needs all catalog names to authorize its allocation bound.
 enum ReceiptInventory<'a> {
-    Point(&'a RuntimePrincipalStore),
+    Point(&'a NativePrincipalContentStore),
     Listed(&'a [ContentEntry]),
 }
 
@@ -192,8 +319,7 @@ impl ReceiptInventory<'_> {
 
     fn lookup(&self, name: &ContentName) -> StorageResult<Option<(ObjectId, u64)>> {
         match self {
-            Self::Point(store) => store
-                .content()
+            Self::Point(content) => content
                 .describe(&StateOwner::System, name)
                 .map(|descriptor| descriptor.map(|actual| (actual.file(), actual.logical_bytes())))
                 .map_err(receipt_error("inspect active receipt inventory entry")),
@@ -205,30 +331,46 @@ impl ReceiptInventory<'_> {
     }
 }
 
+#[cfg(test)]
 fn decode_receipt(
     host_receipt: &Path,
     bytes: &[u8],
     inventory: &ReceiptInventory<'_>,
 ) -> StorageResult<Option<ActiveProjectionReceipt>> {
+    validate_receipt(
+        host_receipt,
+        parse_receipt(host_receipt, bytes, inventory)?,
+        inventory,
+    )
+    .map(Some)
+}
+
+fn parse_receipt(
+    host_receipt: &Path,
+    bytes: &[u8],
+    inventory: &ReceiptInventory<'_>,
+) -> StorageResult<ActiveProjectionReceipt> {
     enforce_receipt_bound(
         host_receipt,
         u64::try_from(bytes.len())
             .map_err(|_| StorageError::Internal("receipt length overflow".to_owned()))?,
         inventory.size_bound()?,
     )?;
-    let mut receipt =
-        serde_json::from_slice::<ActiveProjectionReceipt>(bytes).map_err(|error| {
-            tree_error(
-                host_receipt,
-                format!("parse active projection receipt: {error}"),
-            )
-        })?;
-    if receipt.schema != RECEIPT_SCHEMA {
-        return Err(tree_error(
+    let receipt = serde_json::from_slice::<ActiveProjectionReceipt>(bytes).map_err(|error| {
+        tree_error(
             host_receipt,
-            "active projection receipt has an unsupported schema",
-        ));
-    }
+            format!("parse active projection receipt: {error}"),
+        )
+    })?;
+    validate_receipt_schema(&receipt, host_receipt)?;
+    Ok(receipt)
+}
+
+fn validate_receipt(
+    host_receipt: &Path,
+    mut receipt: ActiveProjectionReceipt,
+    inventory: &ReceiptInventory<'_>,
+) -> StorageResult<ActiveProjectionReceipt> {
     if let ReceiptInventory::Listed(catalog) = inventory {
         // ContentStore::list already returns unique canonical names in byte order.
         // Retain that authenticated inventory directly instead of cloning every
@@ -266,16 +408,27 @@ fn decode_receipt(
     for entry in &receipt.entries {
         validate_receipt_entry(inventory, entry)?;
     }
-    Ok(Some(receipt))
+    Ok(receipt)
 }
 
 pub(super) fn encode(
     home: &AstridHome,
     phase: ReceiptPhase,
     entries: &[ActiveProjectionEntry],
+    staging_scope: Option<StagingScope>,
 ) -> StorageResult<Vec<u8>> {
+    let schema = match (phase, staging_scope) {
+        (ReceiptPhase::Retiring, Some(_)) => RECEIPT_SCHEMA_V2,
+        (_, None) => RECEIPT_SCHEMA_V1,
+        (ReceiptPhase::Active, Some(_)) => {
+            return Err(tree_error(
+                home.root(),
+                "active projection receipt cannot carry a staging scope",
+            ));
+        },
+    };
     let receipt = ActiveProjectionReceipt {
-        schema: RECEIPT_SCHEMA,
+        schema,
         phase,
         root: canonical_root(home)?,
         entries: entries
@@ -286,6 +439,7 @@ pub(super) fn encode(
                 logical_bytes: entry.logical_bytes,
             })
             .collect(),
+        staging_scope,
     };
     let bytes = serde_json::to_vec(&receipt)
         .map_err(|error| tree_error(home.root(), format!("encode active receipt: {error}")))?;
@@ -297,6 +451,42 @@ pub(super) fn encode(
         receipt_size_bound(entries.iter().map(|entry| &entry.name))?,
     )?;
     Ok(bytes)
+}
+
+fn validate_receipt_schema(
+    receipt: &ActiveProjectionReceipt,
+    host_receipt: &Path,
+) -> StorageResult<()> {
+    match receipt.schema {
+        RECEIPT_SCHEMA_V1 => {
+            if receipt.staging_scope.is_some() {
+                return Err(tree_error(
+                    host_receipt,
+                    "schema 1 active projection receipt cannot carry a staging scope",
+                ));
+            }
+            Ok(())
+        },
+        RECEIPT_SCHEMA_V2 => {
+            if receipt.phase != ReceiptPhase::Retiring {
+                return Err(tree_error(
+                    host_receipt,
+                    "schema 2 active projection receipt must be RETIRING",
+                ));
+            }
+            if receipt.staging_scope.is_none() {
+                return Err(tree_error(
+                    host_receipt,
+                    "schema 2 retiring receipt requires a staging scope",
+                ));
+            }
+            Ok(())
+        },
+        _ => Err(tree_error(
+            host_receipt,
+            "active projection receipt has an unsupported schema",
+        )),
+    }
 }
 
 pub(super) fn clear(store: &RuntimePrincipalStore, home: &AstridHome) -> StorageResult<bool> {

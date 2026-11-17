@@ -136,6 +136,22 @@ impl CapturedDirectory {
         self.identity
     }
 
+    /// Open a paired NTFS flush capability for mutating captured trees.
+    ///
+    /// Uses the retained parent handle + component with this directory file as
+    /// authority (`open_flush_relative_bound_to_authority`). Does not ambient-open
+    /// the path and does not escalate routine readonly clones.
+    pub fn open_paired_flush(
+        &self,
+    ) -> io::Result<super::directory_capability::DirectoryFlushCapability> {
+        use std::os::windows::io::AsHandle as _;
+        super::directory_capability::open_directory_flush_relative(
+            self.parent.as_handle(),
+            &self.name,
+            self.file.as_handle(),
+        )
+    }
+
     /// Move the captured directory into `destination` without replacement.
     ///
     /// The destination parent is captured for the native call and retained

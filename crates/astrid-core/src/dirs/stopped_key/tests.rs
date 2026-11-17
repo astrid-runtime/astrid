@@ -121,3 +121,144 @@ fn legacy_key_directory_with_extended_acl_is_rejected() {
     assert!(home.ensure().is_err());
     assert_eq!(fs::read(home.runtime_key_path()).unwrap(), [9; 32]);
 }
+
+#[test]
+fn keyless_sentinel_residue_is_recognized_without_identity_authority() {
+    for staged in [false, true] {
+        let (_root, home) = fixture();
+        fs::remove_file(home.runtime_key_path()).unwrap();
+        fs::remove_dir(home.keys_dir()).unwrap();
+        let etc = home.root().join("etc");
+        crate::platform_fs::ensure_private_directory(&etc).unwrap();
+        if staged && cfg!(unix) {
+            crate::platform_fs::atomic_write_private_file(
+                &etc.join(".astrid-private-00000000000040008000000000000001"),
+                b"partial",
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            home.stopped_projection_recovery().unwrap(),
+            Some(StoppedProjectionRecovery::Sentinel)
+        );
+        assert!(!home.requires_stopped_key_recovery().unwrap());
+        home.ensure().unwrap();
+        assert!(home.validate_runtime_identity_provisioning().is_err());
+        let run = home.root().join("run");
+        crate::platform_fs::ensure_private_directory(&run).unwrap();
+        crate::platform_fs::atomic_write_private_file(&run.join("system.lock"), b"").unwrap();
+        home.ensure().unwrap();
+        crate::platform_fs::atomic_write_private_file(&etc.join("config.toml"), b"unadmitted")
+            .unwrap();
+        assert!(home.stopped_projection_recovery().unwrap().is_none());
+        assert!(home.ensure().is_err());
+        assert_eq!(fs::read(etc.join("config.toml")).unwrap(), b"unadmitted");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn stopped_recovery_admission_does_not_repair_root_before_authority() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    for residue in [
+        None,
+        Some(StoppedProjectionRecovery::RuntimeKey),
+        Some(StoppedProjectionRecovery::Sentinel),
+    ] {
+        for mode in [0o755, 0o777] {
+            let (_root, home) = fixture();
+            if residue != Some(StoppedProjectionRecovery::RuntimeKey) {
+                fs::remove_file(home.runtime_key_path()).unwrap();
+                fs::remove_dir(home.keys_dir()).unwrap();
+            }
+            if residue == Some(StoppedProjectionRecovery::Sentinel) {
+                crate::platform_fs::ensure_private_directory(&home.root().join("etc")).unwrap();
+            }
+            fs::set_permissions(home.root(), fs::Permissions::from_mode(mode)).unwrap();
+            let result = home.ensure();
+            assert_eq!(
+                result.is_ok(),
+                mode == 0o755,
+                "{residue:?}, {mode:o}: {result:?}"
+            );
+            assert_eq!(
+                fs::metadata(home.root()).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+            assert!(home.validate_runtime_identity_provisioning().is_err());
+            assert_eq!(fs::read(home.storage_volume_path()).unwrap(), b"media");
+            if mode == 0o755 {
+                assert_eq!(home.stopped_projection_recovery().unwrap(), residue);
+            }
+            if residue == Some(StoppedProjectionRecovery::Sentinel) {
+                assert_eq!(fs::read_dir(home.root().join("etc")).unwrap().count(), 0);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn scoped_sentinel_staging_is_recognized_without_cleanup_authority() {
+    let (_root, home) = fixture();
+    fs::remove_file(home.runtime_key_path()).unwrap();
+    fs::remove_dir(home.keys_dir()).unwrap();
+    let scope = crate::platform_fs::StagingScope::new();
+    let staged = home.root().join("etc").join(scope.temporary_basename());
+    crate::platform_fs::atomic_write_private_file(&staged, b"partial").unwrap();
+    assert_eq!(
+        home.stopped_projection_recovery().unwrap(),
+        Some(StoppedProjectionRecovery::Sentinel)
+    );
+    home.ensure().unwrap();
+    assert_eq!(fs::read(staged).unwrap(), b"partial");
+    assert!(home.validate_runtime_identity_provisioning().is_err());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn stopped_root_acl_is_rejected_without_repair() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (_root, home) = fixture();
+    fs::set_permissions(home.root(), fs::Permissions::from_mode(0o755)).unwrap();
+    let status = std::process::Command::new("/bin/chmod")
+        .args(["+a", "everyone allow read,readattr"])
+        .arg(home.root())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(home.ensure().is_err());
+    assert!(crate::platform_fs::validate_no_extended_acl(home.root()).is_err());
+    assert_eq!(
+        fs::metadata(home.root()).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(fs::read(home.runtime_key_path()).unwrap(), [9; 32]);
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_configuration_is_not_classified_as_stopped_sentinel_residue() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (_root, home) = fixture();
+    fs::remove_file(home.runtime_key_path()).unwrap();
+    fs::remove_dir(home.keys_dir()).unwrap();
+    let etc = home.root().join("etc");
+    fs::create_dir(&etc).unwrap();
+    fs::set_permissions(&etc, fs::Permissions::from_mode(0o755)).unwrap();
+    let configuration = etc.join("operator.conf");
+    fs::write(&configuration, b"unreceipted configuration").unwrap();
+    assert_eq!(home.stopped_projection_recovery().unwrap(), None);
+    assert!(home.validate_runtime_identity_provisioning().is_err());
+    assert_eq!(
+        fs::read(configuration).unwrap(),
+        b"unreceipted configuration"
+    );
+    assert_eq!(
+        fs::metadata(etc).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}

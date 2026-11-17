@@ -165,6 +165,59 @@ mod tests {
         assert_eq!(writer.bytes, [first.as_slice(), second.as_slice()].concat());
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn prepared_volume_append_coalesces_through_durable_media() {
+        use crate::volume::HostedFileVolume;
+        let directory = tempfile::tempdir().unwrap();
+        let volume = HostedFileVolume::open(directory.path().join("astrid.volume")).unwrap();
+        let mut actual =
+            crate::engine::durable::media::File::volume(volume.clone(), "objects", true).unwrap();
+        // Cross a full iovec batch and include an empty frame payload.
+        let payloads = (0_u8..35)
+            .map(|value| vec![value; usize::from(value)])
+            .collect::<Vec<_>>();
+        let frames = payloads
+            .iter()
+            .cloned()
+            .map(|payload| {
+                PreparedFrame::new(crate::engine::durable::ARENA_MAGIC, payload).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut expected = tempfile::tempfile().unwrap();
+        let expected_locations = append_frames(
+            &mut expected,
+            crate::engine::durable::ARENA_MAGIC,
+            &payloads,
+        )
+        .unwrap();
+        let actual_locations = append_prepared_frames(&mut actual, &frames).unwrap();
+        assert_eq!(actual_locations, expected_locations);
+        let records = volume.write_record_payloads().unwrap();
+        assert_eq!(
+            records.len(),
+            frames.len().div_ceil(MAX_IO_SLICES / 2),
+            "one volume record per prepared batch, never per slice"
+        );
+        actual.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        actual.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, read_all(&mut expected));
+        assert_eq!(
+            records.iter().map(|(_, length)| length).sum::<u64>(),
+            bytes.len() as u64
+        );
+        actual.flush().unwrap();
+        drop(actual);
+        drop(volume);
+        let volume = HostedFileVolume::open(directory.path().join("astrid.volume")).unwrap();
+        let mut reopened =
+            crate::engine::durable::media::File::volume(volume, "objects", false).unwrap();
+        let mut recovered = Vec::new();
+        reopened.read_to_end(&mut recovered).unwrap();
+        assert_eq!(recovered, bytes);
+    }
+
     #[derive(Default)]
     struct InterruptedShortWriter {
         bytes: Vec<u8>,

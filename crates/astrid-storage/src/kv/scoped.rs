@@ -190,6 +190,20 @@ impl ScopedKvStore {
             .await
     }
 
+    /// Read matching keys and values without leaving this namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the prefix or underlying projection is invalid.
+    pub async fn list_entries_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> StorageResult<Vec<super::KvEntry>> {
+        self.inner
+            .list_entries_with_prefix(&self.namespace, prefix)
+            .await
+    }
+
     /// Delete all keys matching a given prefix within this namespace.
     ///
     /// Returns the number of keys deleted.

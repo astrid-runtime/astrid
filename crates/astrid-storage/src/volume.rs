@@ -12,6 +12,8 @@ use std::sync::Arc;
 #[cfg(not(target_family = "wasm"))]
 mod hosted;
 
+mod vectored;
+
 #[cfg(not(target_family = "wasm"))]
 pub use hosted::HostedFileVolume;
 
@@ -371,12 +373,13 @@ impl VolumeFile {
         if payload_len == 0 {
             return Ok(());
         }
-        self.volume
-            .write_region_from(&self.region, self.cursor, payload_len, payload)?;
-        self.cursor = self
+        let next = self
             .cursor
             .checked_add(payload_len)
             .ok_or_else(|| io::Error::other("volume cursor overflow"))?;
+        self.volume
+            .write_region_from(&self.region, self.cursor, payload_len, payload)?;
+        self.cursor = next;
         Ok(())
     }
 }
@@ -402,6 +405,22 @@ impl Write for VolumeFile {
             &mut &bytes[..],
         )?;
         Ok(bytes.len())
+    }
+
+    fn write_vectored(&mut self, slices: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        let length = slices.iter().try_fold(0_usize, |total, slice| {
+            total
+                .checked_add(slice.len())
+                .ok_or_else(|| io::Error::other("volume vectored write length overflow"))
+        })?;
+        // One caller write remains one checksummed volume append. Streaming
+        // borrowed slices avoids both per-slice records and a joined allocation.
+        self.write_from(
+            u64::try_from(length)
+                .map_err(|_| io::Error::other("volume vectored write length overflow"))?,
+            &mut vectored::Reader::new(slices),
+        )?;
+        Ok(length)
     }
 
     fn flush(&mut self) -> io::Result<()> {

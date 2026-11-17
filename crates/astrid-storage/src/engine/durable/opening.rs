@@ -323,7 +323,7 @@ where
             principal_codec,
             limits,
             faults: options.faults,
-            lifecycle: std::sync::atomic::AtomicU8::new(LIFECYCLE_USABLE),
+            lifecycle: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(LIFECYCLE_USABLE)),
             arena_reader: RwLock::new(Some(ArenaReader {
                 file: recovered.arena_reader,
                 generation: 0,
@@ -336,6 +336,9 @@ where
             transaction_wal: options.policy.transaction_wal,
             wal: Mutex::new(wal),
             published_roots: super::PublishedRoots::new(&recovered.roots_by_principal),
+            checkpoint_arbiter: std::sync::Arc::new(Mutex::new(
+                super::checkpoint_worker::CheckpointArbiterState::default(),
+            )),
             inner: Mutex::new(DurableInner {
                 roots_by_principal: recovered.roots_by_principal,
                 index: recovered.index,
@@ -344,7 +347,9 @@ where
                 pending_direct_objects: BTreeMap::new(),
                 validated: recovered.validated,
                 files: Some(recovered.files),
-                representations: recovered.representations,
+                representations: recovered
+                    .representations
+                    .map(super::checkpoint_worker::wrap_representations),
                 lock: Some(lock),
                 poisoned: false,
                 arena_generation: 0,

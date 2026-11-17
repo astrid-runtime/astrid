@@ -1,13 +1,17 @@
 //! Construction and publication of the first physical authority generation.
 
+use crate::storage_model::physical::{
+    AuthenticatedPhysicalMap, PlacementMap, ProfileMap, RepresentationMap,
+};
 use crate::storage_model::{
-    CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode,
-    PlacementEntry, PlacementSet, Recipe, ReconstructionBounds, Replica, ReplicaLocator,
+    CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapKey, PhysicalMapNode, PlacementEntry,
+    PlacementSet, Recipe, ReconstructionBounds, Replica, ReplicaLocator,
     RepresentationCatalogueRoot, RepresentationProfile, RepresentationRecord, RepresentationState,
 };
+use std::borrow::Borrow;
 use std::collections::BTreeSet;
 
-use super::format::{Blake3PhysicalIdentity, MetadataFrame};
+use super::format::{Blake3PhysicalIdentity, MetadataFrame, MetadataKind};
 use super::{DirectArenaObject, DurableError, LOCAL_STORAGE_NODE};
 
 pub(super) struct InitialState {
@@ -22,12 +26,11 @@ pub(super) fn build_initial_state(
     let identity = Blake3PhysicalIdentity;
     let (profile, direct_profile) = direct_profile(frozen_specification)?;
     let mut metadata = Vec::new();
-    let profiles = CanonicalPhysicalMap::build_dense(
-        &identity,
-        PhysicalMapDomain::Profile,
-        vec![(PhysicalMapKey::from(direct_profile), profile.encode()?)],
-    )?;
-    append_map_nodes(&mut metadata, profiles.nodes())?;
+    let profiles = ProfileMap::build_dense(vec![(
+        PhysicalMapKey::from(direct_profile),
+        profile.encode()?,
+    )])?;
+    append_map_nodes(&mut metadata, profiles.nodes().values().map(AsRef::as_ref))?;
     let mut representation_entries = Vec::new();
     let mut placement_entries = Vec::new();
     for object in objects {
@@ -60,18 +63,16 @@ pub(super) fn build_initial_state(
         )?;
         placement_entries.push((PhysicalMapKey::from(object.blob), placement.encode()?));
     }
-    let representations = CanonicalPhysicalMap::build_dense(
-        &identity,
-        PhysicalMapDomain::Representation,
-        representation_entries,
+    let representations = RepresentationMap::build_dense(representation_entries)?;
+    append_map_nodes(
+        &mut metadata,
+        representations.nodes().values().map(AsRef::as_ref),
     )?;
-    append_map_nodes(&mut metadata, representations.nodes())?;
-    let placements = CanonicalPhysicalMap::build_dense(
-        &identity,
-        PhysicalMapDomain::Placement,
-        placement_entries,
+    let placements = PlacementMap::build_dense(placement_entries)?;
+    append_map_nodes(
+        &mut metadata,
+        placements.nodes().values().map(AsRef::as_ref),
     )?;
-    append_map_nodes(&mut metadata, placements.nodes())?;
     let catalogue = RepresentationCatalogueRoot::new(
         1,
         profiles.root(),
@@ -117,41 +118,45 @@ pub(super) fn direct_profile(
     Ok((profile, id))
 }
 
-pub(super) fn append_map_nodes(
+pub(super) fn append_map_nodes<'a>(
     metadata: &mut Vec<MetadataFrame>,
-    nodes: impl IntoIterator<Item = impl MapNodeRef>,
+    nodes: impl IntoIterator<Item = &'a PhysicalMapNode>,
 ) -> Result<(), DurableError> {
     for node in nodes {
-        metadata.push(MetadataFrame::map_node(
-            &Blake3PhysicalIdentity,
-            node.node(),
-        )?);
+        metadata.push(MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?);
     }
     Ok(())
 }
 
-pub(super) fn append_new_reachable_map_nodes(
-    metadata: &mut Vec<MetadataFrame>,
-    map: &CanonicalPhysicalMap,
-    durable: &BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+/// Visit tip-reachable map nodes that still need durable publication.
+///
+/// `emit` runs once per newly appended node identity. Callers push into a Vec or
+/// write through a framed append stream; the walk/validation stays authoritative.
+pub(super) fn visit_new_reachable_map_nodes<N: Borrow<PhysicalMapNode> + From<PhysicalMapNode>>(
+    map: &CanonicalPhysicalMap<N>,
+    durable: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    mut emit: impl FnMut(
+        crate::storage_model::PhysicalMapNodeId,
+        &PhysicalMapNode,
+    ) -> Result<(), DurableError>,
 ) -> Result<usize, DurableError> {
     let Some(root) = map.root() else {
         return Ok(0);
     };
-    let mut pending = vec![(root, false)];
-    let mut visited = BTreeSet::new();
-    while let Some((id, expanded)) = pending.pop() {
-        if expanded {
-            let node = map
-                .nodes()
-                .get(&id)
-                .ok_or(DurableError::InvalidRepresentationState(
-                    "active physical map is missing a reachable node",
-                ))?;
+    // The map is immutable throughout this walk. Retain the body for the
+    // postorder visit rather than looking it up in the arena a second time.
+    let mut pending = vec![(root, None::<&PhysicalMapNode>)];
+    // Canonical reachable closures are trees. The arena also retains historical
+    // nodes, so its size bounds every valid walk and terminates corrupted cycles
+    // without allocating a second index of identities already held by the map.
+    let mut remaining = map.nodes().len();
+    while let Some((id, body)) = pending.pop() {
+        if let Some(node) = body {
             // A persisted parent alone does not establish durable descendants.
-            // Cache only closures checked against the append-only persisted set.
+            // Move checked IDs into the complete-closure partition so the two
+            // disposable memos never retain duplicate IDs.
             let children_complete = match node {
                 PhysicalMapNode::Branch { zero, one, .. } => {
                     complete.contains(zero) && complete.contains(one)
@@ -161,53 +166,89 @@ pub(super) fn append_new_reachable_map_nodes(
                 },
                 PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => true,
             };
-            if durable.contains(&id) && children_complete {
-                complete.insert(id);
-            }
-            if !durable.contains(&id) && !appended.contains(&id) {
-                metadata.push(MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?);
+            let persisted = if children_complete {
+                let persisted = durable.remove(&id);
+                if persisted {
+                    complete.insert(id);
+                }
+                persisted
+            } else {
+                durable.contains(&id)
+            };
+            if !persisted && !appended.contains(&id) {
+                emit(id, node)?;
                 appended.insert(id);
             }
             continue;
         }
-        if complete.contains(&id) || !visited.insert(id) {
+        if complete.contains(&id) {
             continue;
         }
-        let node = map
+        remaining = remaining
+            .checked_sub(1)
+            .ok_or(DurableError::InvalidRepresentationState(
+                "active physical map traversal exceeds its arena",
+            ))?;
+        let node: &PhysicalMapNode = map
             .nodes()
             .get(&id)
             .ok_or(DurableError::InvalidRepresentationState(
                 "active physical map is missing a reachable node",
-            ))?;
-        pending.push((id, true));
+            ))?
+            .borrow();
+        pending.push((id, Some(node)));
         match node {
             PhysicalMapNode::Branch { zero, one, .. } => {
-                pending.push((*one, false));
-                pending.push((*zero, false));
+                pending.push((*one, None));
+                pending.push((*zero, None));
             },
             PhysicalMapNode::Radix { children, .. } => {
-                pending.extend(children.iter().rev().map(|child| (*child, false)));
+                pending.extend(children.iter().rev().map(|child| (*child, None)));
             },
             PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => {},
         }
     }
-    Ok(visited.len())
+    Ok(map.nodes().len().strict_sub(remaining))
 }
 
-pub(super) trait MapNodeRef {
-    fn node(&self) -> &PhysicalMapNode;
+pub(super) fn append_authenticated_map_nodes(
+    metadata: &mut Vec<MetadataFrame>,
+    map: &(impl AuthenticatedPhysicalMap + ?Sized),
+    durable: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+) -> Result<usize, DurableError> {
+    visit_new_reachable_map_nodes(
+        map.as_canonical(),
+        durable,
+        appended,
+        complete,
+        |id, node| {
+            // The sealed input fixes the identity policy. This same walk supplied
+            // the ID and immutable body together; neither needs another lookup.
+            metadata.push(MetadataFrame {
+                kind: MetadataKind::MapNode,
+                identity: *id.as_bytes(),
+                value: node.encode()?,
+            });
+            Ok(())
+        },
+    )
 }
 
-impl MapNodeRef for (&crate::storage_model::PhysicalMapNodeId, &PhysicalMapNode) {
-    fn node(&self) -> &PhysicalMapNode {
-        self.1
-    }
-}
-
-impl MapNodeRef for &(crate::storage_model::PhysicalMapNodeId, PhysicalMapNode) {
-    fn node(&self) -> &PhysicalMapNode {
-        &self.1
-    }
+// Hash-agile fixtures retain the generic, independently hashing encoder.
+#[cfg(test)]
+pub(super) fn append_new_reachable_map_nodes<N: Borrow<PhysicalMapNode> + From<PhysicalMapNode>>(
+    metadata: &mut Vec<MetadataFrame>,
+    map: &CanonicalPhysicalMap<N>,
+    durable: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    appended: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+) -> Result<usize, DurableError> {
+    visit_new_reachable_map_nodes(map, durable, appended, complete, |_, node| {
+        metadata.push(MetadataFrame::map_node(&Blake3PhysicalIdentity, node)?);
+        Ok(())
+    })
 }
 
 pub(super) fn generation_name(generation: u64) -> String {
@@ -222,7 +263,9 @@ mod tests {
         CanonicalPhysicalMap, PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode,
     };
 
-    use super::{Blake3PhysicalIdentity, append_new_reachable_map_nodes};
+    use super::{
+        Blake3PhysicalIdentity, append_new_reachable_map_nodes, visit_new_reachable_map_nodes,
+    };
 
     fn dense_map() -> CanonicalPhysicalMap {
         CanonicalPhysicalMap::build_dense(
@@ -242,16 +285,51 @@ mod tests {
     }
 
     #[test]
+    fn publication_rejects_a_cached_cycle_before_emitting_nodes() {
+        let mut map = crate::storage_model::physical::RepresentationMap::build_dense(vec![(
+            PhysicalMapKey::new([1; 32]),
+            vec![1],
+        )])
+        .unwrap();
+        let root = map.root().unwrap();
+        assert!(map.replace_arena_node_for_fault(
+            root,
+            PhysicalMapNode::Branch {
+                domain: PhysicalMapDomain::Representation,
+                prefix_bits: 0,
+                prefix: vec![],
+                zero: root,
+                one: root,
+                subtree_entries: 1,
+            },
+        ));
+        let mut emitted = 0;
+        let result = visit_new_reachable_map_nodes(
+            map.as_canonical(),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            |_, _| {
+                emitted += 1;
+                Ok(())
+            },
+        );
+        assert!(result.is_err(), "a cached cycle cannot be published");
+        assert_eq!(emitted, 0);
+    }
+
+    #[test]
     fn verified_durable_subtrees_skip_unchanged_nodes() {
         let mut map = dense_map();
-        let durable = map.nodes().keys().copied().collect();
+        let mut durable: BTreeSet<_> = map.nodes().keys().copied().collect();
+        let mut reference_durable = durable.clone();
         let mut complete = BTreeSet::new();
         let mut metadata = Vec::new();
         let mut appended = BTreeSet::new();
         let cold = append_new_reachable_map_nodes(
             &mut metadata,
             &map,
-            &durable,
+            &mut durable,
             &mut appended,
             &mut complete,
         )
@@ -261,7 +339,7 @@ mod tests {
         let warm = append_new_reachable_map_nodes(
             &mut metadata,
             &map,
-            &durable,
+            &mut durable,
             &mut appended,
             &mut complete,
         )
@@ -277,7 +355,7 @@ mod tests {
         let changed = append_new_reachable_map_nodes(
             &mut metadata,
             &map,
-            &durable,
+            &mut durable,
             &mut appended,
             &mut complete,
         )
@@ -288,7 +366,7 @@ mod tests {
         append_new_reachable_map_nodes(
             &mut cold_metadata,
             &map,
-            &durable,
+            &mut reference_durable,
             &mut cold_appended,
             &mut BTreeSet::new(),
         )
@@ -317,7 +395,7 @@ mod tests {
         append_new_reachable_map_nodes(
             &mut metadata,
             &map,
-            &BTreeSet::from([root]),
+            &mut BTreeSet::from([root]),
             &mut appended,
             &mut complete,
         )
@@ -338,7 +416,7 @@ mod tests {
         append_new_reachable_map_nodes(
             &mut metadata,
             &map,
-            &BTreeSet::new(),
+            &mut BTreeSet::new(),
             &mut appended,
             &mut BTreeSet::new(),
         )

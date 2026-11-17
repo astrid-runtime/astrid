@@ -61,7 +61,10 @@ fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-pub(super) fn recover_artifacts(path: &Path) -> io::Result<File> {
+pub(super) fn recover_artifacts(
+    path: &Path,
+    #[cfg(windows)] runtime_private: bool,
+) -> io::Result<File> {
     let temporary = temp_path(path);
     let previous = previous_path(path);
     let active = std::fs::symlink_metadata(path).is_ok();
@@ -75,7 +78,12 @@ pub(super) fn recover_artifacts(path: &Path) -> io::Result<File> {
             &temporary
         };
         if std::fs::symlink_metadata(candidate).is_ok() {
-            let file = super::open::open_regular(candidate, false)?;
+            let file = super::open::open_regular(
+                candidate,
+                false,
+                #[cfg(windows)]
+                runtime_private,
+            )?;
             lock_active(&file)?;
             super::open::require_current(&file, candidate)?;
             // No overwrite: a concurrent opener may have just created or
@@ -93,12 +101,17 @@ pub(super) fn recover_artifacts(path: &Path) -> io::Result<File> {
             return Ok(file);
         }
     }
-    let file = super::open::open_regular(path, !active)?;
+    let file = super::open::open_regular(
+        path,
+        !active,
+        #[cfg(windows)]
+        runtime_private,
+    )?;
     lock_active(&file)?;
     Ok(file)
 }
 
-fn lock_active(file: &File) -> io::Result<()> {
+pub(super) fn lock_active(file: &File) -> io::Result<()> {
     file.try_lock_exclusive().map_err(|error| {
         if error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
             || error.kind() == io::ErrorKind::WouldBlock
@@ -126,7 +139,11 @@ pub(super) fn cleanup_artifacts(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn create_file(path: &Path) -> io::Result<File> {
+fn create_file(path: &Path, #[cfg(windows)] runtime_private: bool) -> io::Result<File> {
+    #[cfg(windows)]
+    if runtime_private {
+        return astrid_core::platform_fs::create_new_private_file_shared(path);
+    }
     let mut options = OpenOptions::new();
     options.read(true).write(true).create_new(true);
     #[cfg(unix)]
@@ -146,10 +163,19 @@ fn create_file(path: &Path) -> io::Result<File> {
 pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
     let _open_guard = volume.open_lock.lock();
     let mut state = volume.state.lock();
-    reclaim_locked(&volume.path, &mut state)
+    reclaim_locked(
+        &volume.path,
+        &mut state,
+        #[cfg(windows)]
+        volume.retained_root.is_some(),
+    )
 }
 
-pub(super) fn reclaim_locked(path: &Path, state: &mut ContainerState) -> io::Result<()> {
+pub(super) fn reclaim_locked(
+    path: &Path,
+    state: &mut ContainerState,
+    #[cfg(windows)] runtime_private: bool,
+) -> io::Result<()> {
     finish_publication(path, state)?;
     let temporary = temp_path(path);
     let previous = previous_path(path);
@@ -159,7 +185,11 @@ pub(super) fn reclaim_locked(path: &Path, state: &mut ContainerState) -> io::Res
     if std::fs::symlink_metadata(&previous).is_ok() {
         std::fs::remove_file(&previous)?;
     }
-    let temporary_file = create_file(&temporary)?;
+    let temporary_file = create_file(
+        &temporary,
+        #[cfg(windows)]
+        runtime_private,
+    )?;
     let mut rebuilt = ContainerState {
         checkpoint_format: state.checkpoint_format,
         index_checkpoint: IndexCheckpoint::NotPrepared,
@@ -398,11 +428,11 @@ fn publish(
 
 #[cfg(windows)]
 fn promote(source: &Path, destination: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH;
     #[cfg(test)]
     if FAIL_PROMOTIONS.with(|fail| fail.borrow_mut().pop_front().unwrap_or(false)) {
         return Err(io::Error::other("injected Windows promotion failure"));
     }
-    use windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH;
     rename_windows(source, destination, MOVEFILE_WRITE_THROUGH)?;
     #[cfg(test)]
     if FAIL_AFTER_PROMOTIONS.with(|fail| fail.borrow_mut().pop_front().unwrap_or(false)) {

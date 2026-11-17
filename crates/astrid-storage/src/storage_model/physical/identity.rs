@@ -7,6 +7,8 @@ use crate::storage_model::{BlobId, ObjectId};
 use super::PhysicalModelError;
 use super::codec::{Decoder, Encoder, EncodingSink};
 
+mod hasher;
+
 const BLAKE3_ALGORITHM: u16 = 1;
 const LOGICAL_CONSTRUCTION: u16 = 1;
 const PHYSICAL_CONSTRUCTION: u16 = 2;
@@ -89,6 +91,29 @@ impl PlacementSetId {
     }
 }
 
+/// Fixed BLAKE3 construction-two physical identity used by authenticated maps.
+///
+/// Crate-private so production map certificates cannot be minted under an
+/// arbitrary injected hasher. Engine format reexports the same type.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Blake3PhysicalIdentity;
+
+impl PhysicalIdentity for Blake3PhysicalIdentity {
+    fn identify(&self, context: &'static str, material: &[u8]) -> [u8; 32] {
+        let mut hasher = hasher::physical_hasher(context);
+        hasher.update(material);
+        *hasher.finalize().as_bytes()
+    }
+
+    fn identify_parts(&self, context: &'static str, parts: &[&[u8]]) -> [u8; 32] {
+        let mut hasher = hasher::physical_hasher(context);
+        for part in parts {
+            hasher.update(part);
+        }
+        *hasher.finalize().as_bytes()
+    }
+}
+
 /// Computes current domain-separated physical identities.
 ///
 /// Native composition pins BLAKE3 construction two. Keeping the primitive
@@ -117,7 +142,7 @@ pub trait PhysicalIdentity {
     }
 }
 
-pub(super) fn encode_object_id(encoder: &mut Encoder, id: ObjectId) {
+pub(super) fn encode_object_id<W: EncodingSink>(encoder: &mut Encoder<W>, id: ObjectId) {
     encode_tagged(
         encoder,
         BLAKE3_ALGORITHM,
@@ -130,7 +155,7 @@ pub(super) fn decode_object_id(decoder: &mut Decoder<'_>) -> Result<ObjectId, Ph
     decode_tagged(decoder, BLAKE3_ALGORITHM, LOGICAL_CONSTRUCTION).map(ObjectId::new)
 }
 
-pub(super) fn encode_blob_id(encoder: &mut Encoder, id: BlobId) {
+pub(super) fn encode_blob_id<W: EncodingSink>(encoder: &mut Encoder<W>, id: BlobId) {
     encode_tagged(
         encoder,
         BLAKE3_ALGORITHM,
@@ -143,7 +168,10 @@ pub(super) fn decode_blob_id(decoder: &mut Decoder<'_>) -> Result<BlobId, Physic
     decode_tagged(decoder, BLAKE3_ALGORITHM, PHYSICAL_CONSTRUCTION).map(BlobId::new)
 }
 
-pub(super) fn encode_profile_id(encoder: &mut Encoder, id: RepresentationProfileId) {
+pub(super) fn encode_profile_id<W: EncodingSink>(
+    encoder: &mut Encoder<W>,
+    id: RepresentationProfileId,
+) {
     encode_tagged(
         encoder,
         BLAKE3_ALGORITHM,
@@ -159,7 +187,10 @@ pub(super) fn decode_profile_id(
         .map(RepresentationProfileId::new)
 }
 
-pub(super) fn encode_record_id(encoder: &mut Encoder, id: RepresentationRecordId) {
+pub(super) fn encode_record_id<W: EncodingSink>(
+    encoder: &mut Encoder<W>,
+    id: RepresentationRecordId,
+) {
     encode_tagged(
         encoder,
         BLAKE3_ALGORITHM,

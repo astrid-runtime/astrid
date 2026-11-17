@@ -107,6 +107,10 @@ pub(super) async fn agent_delete(
         ));
     }
 
+    if let Err(error) = pending.retire_workspaces(kernel).await {
+        return err_internal(error);
+    }
+
     // Native state reclamation resolves quota policy through the profile. Keep
     // it until that purge has committed, while the capability retirement fence
     // and identity unlink keep every authority and capsule-load edge closed.
@@ -143,6 +147,17 @@ pub(super) struct PendingIdentityRemoval {
 impl PendingIdentityRemoval {
     pub(super) const fn principal_uid(&self) -> Option<astrid_core::PrincipalUid> {
         self.principal_uid
+    }
+
+    /// Called after quiescence, before removing the profile needed by quotas.
+    pub(super) async fn retire_workspaces(&self, kernel: &crate::Kernel) -> Result<(), String> {
+        if let (Some(service), Some(guard)) = (
+            kernel.workspace_branches.as_ref(),
+            self.ownership_guard.as_ref(),
+        ) {
+            service.retire_for_deletion(guard).await?;
+        }
+        Ok(())
     }
 }
 

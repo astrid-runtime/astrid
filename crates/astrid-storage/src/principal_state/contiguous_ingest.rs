@@ -5,10 +5,16 @@
 use std::fs::File;
 use std::io::Cursor;
 
-use crate::content::{ChunkingProfile, ContentIngest, ContentName, PrepareDerivedBatchContent};
+use crate::content::{
+    ChunkingProfile, ContentBatchPreconditions, ContentBatchWriteOutcome, ContentIngest,
+    ContentName, PrepareDerivedBatchContent,
+};
 use crate::error::{StorageError, StorageResult};
 
 use super::{RuntimePrincipalStore, StateOwner};
+
+mod lazy_source;
+use lazy_source::LazyHomeSource;
 
 /// One sealed regular file ready for packed home publication.
 pub struct ContiguousFileIngest {
@@ -59,7 +65,7 @@ impl RuntimePrincipalStore {
     ) -> StorageResult<()> {
         let mut ingests = Vec::new();
         for file in files {
-            let source = open_home_source(&file)?;
+            let source = open_home_source(&file.path, file.logical_bytes)?;
             ingests.push(ContentIngest::new(file.name, source));
         }
         if ingests.is_empty() {
@@ -86,12 +92,34 @@ impl RuntimePrincipalStore {
         removals: &'a [ContentName],
         derived: Option<&'a mut dyn PrepareDerivedBatchContent>,
     ) -> StorageResult<()> {
+        self.replace_contiguous_files_with_expectation(
+            owner,
+            files,
+            removals,
+            derived,
+            ContentBatchPreconditions::default(),
+        )
+        .map(|_| ())
+    }
+
+    pub(crate) fn replace_contiguous_files_with_expectation<'a>(
+        &self,
+        owner: StateOwner,
+        files: impl IntoIterator<Item = PackedProjectionIngest>,
+        removals: &'a [ContentName],
+        derived: Option<&'a mut dyn PrepareDerivedBatchContent>,
+        preconditions: ContentBatchPreconditions<'a>,
+    ) -> StorageResult<Option<ContentBatchWriteOutcome>> {
         let mut ingests = Vec::new();
         for file in files {
             let (name, source): (_, Box<dyn std::io::Read + Send>) = match file {
                 PackedProjectionIngest::File(file) => {
-                    let source = open_home_source(&file)?;
-                    (file.name, Box::new(source))
+                    let ContiguousFileIngest {
+                        name,
+                        path,
+                        logical_bytes,
+                    } = file;
+                    (name, Box::new(LazyHomeSource::new(path, logical_bytes)))
                 },
                 PackedProjectionIngest::Bytes { name, bytes } => {
                     (name, Box::new(Cursor::new(bytes)))
@@ -103,40 +131,49 @@ impl RuntimePrincipalStore {
                 ChunkingProfile::ASTRID_V1,
             ));
         }
-        if ingests.is_empty() {
+        // Even an empty host snapshot must publish its derived receipt in the
+        // same root as removals. Only batches without a derivation may use the
+        // deletion-only path.
+        if ingests.is_empty() && derived.is_none() {
             return if removals.is_empty() {
-                Ok(())
+                Ok(None)
             } else {
                 self.content
-                    .delete_batch(&owner, removals)
-                    .map(|_| ())
+                    .delete_batch_with_preconditions(&owner, removals, preconditions)
+                    .map(|_| None)
                     .map_err(|error| {
                         StorageError::Internal(format!("remove packed home names: {error}"))
                     })
             };
         }
-        self.content
-            .replace_streaming_batch_removing_exact(&owner, ingests, removals, derived)
-            .map(|_| ())
+        let outcome = self.content.replace_streaming_batch_with_expectation(
+            &owner,
+            ingests,
+            removals,
+            derived,
+            preconditions,
+        );
+        outcome
+            .map(Some)
             .map_err(|error| StorageError::Internal(format!("replace packed home batch: {error}")))
     }
 }
 
-fn open_home_source(file: &ContiguousFileIngest) -> StorageResult<File> {
-    let source = File::open(&file.path).map_err(|error| {
-        StorageError::Connection(format!("open home source {}: {error}", file.path.display()))
+fn open_home_source(path: &std::path::Path, logical_bytes: u64) -> StorageResult<File> {
+    let source = File::open(path).map_err(|error| {
+        StorageError::Connection(format!("open home source {}: {error}", path.display()))
     })?;
     let actual_bytes = source
         .metadata()
         .map_err(|error| {
-            StorageError::Connection(format!("stat home source {}: {error}", file.path.display()))
+            StorageError::Connection(format!("stat home source {}: {error}", path.display()))
         })?
         .len();
-    if actual_bytes != file.logical_bytes {
+    if actual_bytes != logical_bytes {
         return Err(StorageError::Connection(format!(
             "home source {} changed length (expected {}, found {})",
-            file.path.display(),
-            file.logical_bytes,
+            path.display(),
+            logical_bytes,
             actual_bytes
         )));
     }
@@ -163,7 +200,7 @@ mod tests {
 
     #[tokio::test]
     async fn packed_volume_reopens_home_payloads() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_directory::temporary().unwrap();
         let home = AstridHome::from_path(directory.path());
         home.ensure().unwrap();
         let store = open_runtime_principal_store(&home, unlimited_quota())
@@ -199,7 +236,7 @@ mod tests {
 
     #[tokio::test]
     async fn packed_home_deduplicates_repeated_chunks_without_loose_regions() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_directory::temporary().unwrap();
         let home = AstridHome::from_path(directory.path());
         home.ensure().unwrap();
         let store = open_runtime_principal_store(&home, unlimited_quota())
@@ -238,10 +275,24 @@ mod tests {
             after_second.saturating_sub(after_first) < u64::try_from(bytes.len()).unwrap(),
             "identical second file recopied payload: {after_first} -> {after_second}"
         );
-        let copy_directory = tempfile::tempdir().unwrap();
+        let copy_directory = crate::test_directory::temporary().unwrap();
         let copy_home = AstridHome::from_path(copy_directory.path());
         copy_home.ensure().unwrap();
-        std::fs::copy(&volume_path, copy_home.storage_volume_path()).unwrap();
+        let mut image = Vec::new();
+        store.write_preclose_volume_image(&mut image).unwrap();
+        let entries_before = std::fs::read_dir(copy_home.root()).unwrap().count();
+        let projection =
+            astrid_core::platform_fs::PrivateFileProjection::open(copy_home.root()).unwrap();
+        projection
+            .write(std::path::Path::new("astrid.volume"), &image)
+            .unwrap();
+        projection.sync().unwrap();
+        drop(projection);
+        assert_eq!(
+            std::fs::read_dir(copy_home.root()).unwrap().count(),
+            entries_before.strict_add(1),
+            "volume image fixture left an unrelated lock or journal sidecar"
+        );
 
         store.engine.close().unwrap();
         drop(store);
@@ -283,44 +334,64 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn volume_flush_does_not_journal_a_full_index_snapshot_per_file() {
-        let directory = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(directory.path());
-        home.ensure().unwrap();
-        let store = open_runtime_principal_store(&home, unlimited_quota())
-            .await
-            .unwrap();
-        let owner = StateOwner::Principal(PrincipalUid::from_bytes([0x51; 32]));
-        let unique_dir = directory.path().join("unique");
-        std::fs::create_dir(&unique_dir).unwrap();
-        let file_count = 512_usize;
-        let mut files = Vec::with_capacity(file_count);
+    fn distinct_files(
+        directory: &std::path::Path,
+        count: usize,
+    ) -> (Vec<ContiguousFileIngest>, u64) {
+        std::fs::create_dir(directory).unwrap();
+        let mut files = Vec::with_capacity(count);
         let mut logical_bytes = 0_u64;
-        for index in 0..file_count {
+        for index in 0..count {
             let mut bytes = vec![0xA5_u8; 256];
             bytes[0] = u8::try_from(index % 256).unwrap();
             bytes[1] = u8::try_from(index / 256).unwrap();
-            let path = unique_dir.join(format!("{index:04}.bin"));
+            let path = directory.join(format!("{index:04}.bin"));
             std::fs::write(&path, &bytes).unwrap();
-            logical_bytes += u64::try_from(bytes.len()).unwrap();
+            logical_bytes = logical_bytes.strict_add(u64::try_from(bytes.len()).unwrap());
             files.push(ContiguousFileIngest::new(
                 ContentName::new(format!("u/{index:04}.bin")).unwrap(),
                 path,
                 u64::try_from(bytes.len()).unwrap(),
             ));
         }
+        (files, logical_bytes)
+    }
+
+    #[tokio::test]
+    async fn volume_flush_does_not_journal_a_full_index_snapshot_per_file() {
+        let directory = crate::test_directory::temporary().unwrap();
+        let home = AstridHome::from_path(directory.path());
+        home.ensure().unwrap();
+        let store = open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
+        let owner = StateOwner::Principal(PrincipalUid::from_bytes([0x51; 32]));
+        let volume_path = home.storage_volume_path();
+        // Opening durably initializes the home, including restoration intent.
+        // Measure ingest and its close fence separately from that fixed work.
+        let initialization = store
+            .volume_binding
+            .upgrade()
+            .unwrap()
+            .write_record_payloads()
+            .unwrap();
+        let (files, logical_bytes) = distinct_files(&directory.path().join("unique"), 512);
         store.put_contiguous_files(owner, files).unwrap();
         store.engine.close().unwrap();
         drop(store);
-        let volume_path = home.storage_volume_path();
         let volume_len = std::fs::metadata(&volume_path).unwrap().len();
+        let writes = crate::volume::write_record_payloads(&volume_path).unwrap();
+        assert!(
+            writes.starts_with(&initialization),
+            "ingest replaced the initialization journal; write accounting is invalid"
+        );
+        eprintln!("home initialization writes: {initialization:?}");
         let mut index_payload = 0_u64;
         let mut index_writes = 0_u32;
         let mut metadata_writes = 0_u32;
         let mut loose_payload = 0_u64;
         let mut buckets = std::collections::BTreeMap::<String, (u32, u64)>::new();
-        for (name, len) in crate::volume::write_record_payloads(&volume_path).unwrap() {
+        for (name, len) in writes.into_iter().skip(initialization.len()) {
             let bucket = if name == "objects.index" {
                 index_payload += len;
                 index_writes += 1;
@@ -376,3 +447,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod derived_tests;

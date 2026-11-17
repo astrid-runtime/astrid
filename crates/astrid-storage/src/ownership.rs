@@ -124,6 +124,12 @@ impl OwnershipSnapshot {
         self.principal_ownership.get(&uid)
     }
 
+    /// Whether durable retirement currently reserves this principal generation.
+    #[must_use]
+    pub fn principal_is_retiring(&self, uid: PrincipalUid) -> bool {
+        self.principal_deletions.contains_key(&uid)
+    }
+
     /// Iterate over users in stable UID order.
     pub fn users(&self) -> impl Iterator<Item = &UserIdentity> {
         self.users.values()
@@ -271,8 +277,8 @@ pub struct OwnershipStore {
     mutation_lock: Arc<AsyncMutex<()>>,
 }
 
-/// Exclusive barrier held while an unowned principal is removed from the
-/// durable identity directory.
+/// Exclusive barrier held while an authenticated principal generation is
+/// removed from the durable identity directory.
 ///
 /// Dropping this guard allows ownership mutations to resume. Callers must keep
 /// it alive until identity removal has either completed or been abandoned.
@@ -281,6 +287,7 @@ pub struct OwnershipStore {
 pub struct PrincipalDeletionGuard {
     store: OwnershipStore,
     principal_uid: PrincipalUid,
+    fleet: Option<FleetUid>,
     _guard: OwnedMutexGuard<()>,
 }
 
@@ -289,6 +296,12 @@ impl PrincipalDeletionGuard {
     #[must_use]
     pub const fn principal_uid(&self) -> PrincipalUid {
         self.principal_uid
+    }
+
+    /// Authenticated fleet retained by the deletion reservation, including retries.
+    #[must_use]
+    pub const fn fleet_uid(&self) -> Option<FleetUid> {
+        self.fleet
     }
 
     /// Remove the durable reservation after identity removal completes.

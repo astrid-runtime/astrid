@@ -11,21 +11,59 @@
 #[path = "platform_fs/macos_acl.rs"]
 mod macos_acl;
 
+mod executable;
+#[cfg(any(unix, test))]
+mod mount_boundary;
+pub mod name_semantics;
+mod private_projection;
+pub use executable::replace_executable_set;
+#[cfg(any(unix, windows))]
+pub(crate) use private_projection::compare::matches_file_from as matches_projection_file_from;
+#[cfg(not(target_family = "wasm"))]
+mod private_scratch;
+mod staging_scope;
+
+#[cfg(unix)]
+use mount_boundary::MountBoundary;
+#[cfg(target_os = "linux")]
+pub(crate) use mount_boundary::MountId;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use mount_boundary::fixtures as mount_fixtures;
+#[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
+pub use mount_boundary::fixtures as mount_test_fixtures;
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+pub use name_semantics::directory_is_case_sensitive;
+pub use private_projection::{
+    PrivateAppendRoot, PrivateFileProjection, PrivateFilePublication, PrivateFileReplacement,
+    PrivateFileWriteOutcome, PrivateProjectionInspection,
+};
+#[cfg(not(target_family = "wasm"))]
+pub use private_scratch::create_private_scratch_file;
+pub use staging_scope::{
+    StagingScope, StagingScopeError, is_private_atomic_staging_name,
+    is_scoped_private_staging_name, is_structural_private_staging_name, staging_name_scope,
+};
+
+#[cfg(any(windows, test))]
 use std::collections::HashSet;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
 #[path = "platform_fs/windows.rs"]
-mod windows;
+pub(crate) mod windows;
 
 #[path = "platform_fs/directory_identity.rs"]
 mod directory_identity;
 
 pub use directory_identity::DirectoryIdentity;
-
 #[cfg(windows)]
-pub use windows::CapturedDirectory;
+pub use windows::directory_capability;
+#[cfg(windows)]
+pub use windows::{
+    CapturedDirectory, create_new_private_file, create_new_private_file_shared,
+    validate_private_file_handle,
+};
 
 #[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -240,7 +278,7 @@ pub fn validate_private_directory(path: &Path) -> io::Result<()> {
 
     #[cfg(windows)]
     {
-        windows::ensure_private_directory(path)
+        windows::validate_private_directory(path)
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -346,6 +384,20 @@ pub fn validate_private_file(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Observe privacy without acquiring content-read authority or excluding a live
+/// writer. Stopped-volume recognition is only a structural preflight; storage
+/// subsequently authenticates and locks the canonical volume before recovery.
+pub(crate) fn validate_private_file_metadata(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        windows::validate_private_file_metadata(path)
+    }
+    #[cfg(not(windows))]
+    {
+        validate_private_file(path)
+    }
+}
+
 /// Reject a native path carrying an extended access-control list.
 ///
 /// macOS ACL entries can grant access beyond owner-only POSIX mode bits, so
@@ -442,20 +494,6 @@ pub fn atomic_write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
             "private atomic-file backend is selected by Windows callers only",
         ))
     }
-}
-
-/// Recognize the Unix private atomic writer's temporary basename.
-///
-/// This is only a naming check, not authority to read or discard the file.
-/// Recovery must separately validate private ownership and durable intent.
-#[must_use]
-pub fn is_private_atomic_staging_name(name: &std::ffi::OsStr) -> bool {
-    cfg!(unix)
-        && name.to_str().is_some_and(|name| {
-            name.strip_prefix(".astrid-private-").is_some_and(|suffix| {
-                suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
-            })
-        })
 }
 
 /// Reject redirecting path components at a security-sensitive boundary.
@@ -707,11 +745,29 @@ fn atomic_write_private_file_unix(path: &Path, bytes: &[u8]) -> io::Result<()> {
     validate_private_file(path)
 }
 
+/// Open the requested directory itself, rejecting missing tails and redirects.
+#[cfg(unix)]
+pub(crate) fn open_existing_directory_no_follow(path: &Path) -> io::Result<std::fs::File> {
+    let (directory, missing) = unix_directory_walk(path)?;
+    if !missing.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("directory does not exist: {}", path.display()),
+        ));
+    }
+    Ok(directory)
+}
+
 #[cfg(unix)]
 fn open_directory_no_follow_unix(path: &Path) -> io::Result<std::fs::File> {
     let (directory, _) = unix_directory_walk(path)?;
     Ok(directory)
 }
+
+#[cfg(all(unix, test))]
+pub(crate) use private_projection::walk_counter::{
+    directory_walk_count, reset_directory_walk_count,
+};
 
 #[cfg(unix)]
 fn unix_directory_walk(path: &Path) -> io::Result<(std::fs::File, Vec<std::ffi::OsString>)> {
@@ -719,6 +775,9 @@ fn unix_directory_walk(path: &Path) -> io::Result<(std::fs::File, Vec<std::ffi::
     use nix::fcntl::{OFlag, openat};
     use nix::sys::stat::Mode;
     use std::path::Component;
+
+    #[cfg(test)]
+    private_projection::walk_counter::record();
 
     let components = path.components().collect::<Vec<_>>();
     if components
@@ -800,164 +859,6 @@ fn normalize_unix_system_alias(path: PathBuf) -> PathBuf {
 #[cfg(unix)]
 fn nix_io_error(error: nix::errno::Errno) -> io::Error {
     io::Error::from_raw_os_error(error as i32)
-}
-
-/// Back up and replace a complete set of authenticated executables.
-///
-/// Staging always occurs beside the live files on the same volume. Unix keeps
-/// the existing copy, `rename`, and rollback behavior. Windows flushes staged
-/// bytes copied from identity-bound source handles, records a private recovery
-/// journal under an OS-backed exclusive process lock, and performs each
-/// same-directory name transition with
-/// `SetFileInformationByHandle(FileRenameInfo)`. Each rename is atomic at the
-/// individual name boundary; an interrupted or partially failed set is
-/// restored from independent rollback copies. Successful updates retain
-/// `<name>.bak`.
-///
-/// # Errors
-///
-/// Returns an error before mutation for invalid or missing inputs, or after
-/// attempting journal-backed recovery when replacement fails. A recovery
-/// failure leaves the journal and rollback copies in place for a later retry.
-pub fn replace_executable_set(
-    install_dir: &Path,
-    extract_dir: &Path,
-    names: &[&str],
-) -> io::Result<()> {
-    validate_replacement_inputs(install_dir, extract_dir, names)?;
-
-    #[cfg(windows)]
-    {
-        windows::replace_executable_set(install_dir, extract_dir, names)
-    }
-
-    #[cfg(not(windows))]
-    {
-        replace_executable_set_by_rename(install_dir, extract_dir, names)
-    }
-}
-
-fn validate_replacement_inputs(
-    install_dir: &Path,
-    extract_dir: &Path,
-    names: &[&str],
-) -> io::Result<()> {
-    if names.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "executable replacement set must not be empty",
-        ));
-    }
-    if !install_dir.is_dir() || !extract_dir.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "executable replacement directories must exist",
-        ));
-    }
-
-    let mut unique = HashSet::with_capacity(names.len());
-    for name in names {
-        let mut components = Path::new(name).components();
-        if !matches!(components.next(), Some(Component::Normal(_)))
-            || components.next().is_some()
-            || !unique.insert(*name)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid or duplicate executable name '{name}'"),
-            ));
-        }
-
-        let source = extract_dir.join(name);
-        let metadata = std::fs::symlink_metadata(&source).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("release archive is missing '{name}': {error}"),
-            )
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("release executable is redirected or not regular: {name}"),
-            ));
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn replace_executable_set_by_rename(
-    install_dir: &Path,
-    extract_dir: &Path,
-    names: &[&str],
-) -> io::Result<()> {
-    let mut backups = Vec::new();
-    for name in names {
-        let live = install_dir.join(name);
-        if live.exists() {
-            let backup = install_dir.join(format!("{name}.bak"));
-            std::fs::copy(&live, &backup)?;
-            backups.push((live, backup));
-        }
-    }
-
-    let mut staged = Vec::new();
-    for name in names {
-        let temporary = install_dir.join(format!(".{name}.new"));
-        let stage_result = (|| -> io::Result<()> {
-            std::fs::copy(extract_dir.join(name), &temporary)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))?;
-            }
-            Ok(())
-        })();
-        if let Err(error) = stage_result {
-            let _ = std::fs::remove_file(&temporary);
-            for (staged_temporary, _) in &staged {
-                let _ = std::fs::remove_file(staged_temporary);
-            }
-            return Err(io::Error::new(
-                error.kind(),
-                format!("failed to stage {}: {error}", temporary.display()),
-            ));
-        }
-        staged.push((temporary, install_dir.join(name)));
-    }
-
-    for (index, (temporary, live)) in staged.iter().enumerate() {
-        if let Err(error) = std::fs::rename(temporary, live) {
-            let mut rollback_errors = Vec::new();
-            for (_, installed_live) in &staged[..index] {
-                if let Some((_, backup)) = backups
-                    .iter()
-                    .find(|(backup_live, _)| backup_live == installed_live)
-                {
-                    if let Err(rollback_error) = std::fs::rename(backup, installed_live) {
-                        rollback_errors
-                            .push(format!("{}: {rollback_error}", installed_live.display()));
-                    }
-                } else if let Err(rollback_error) = std::fs::remove_file(installed_live) {
-                    rollback_errors.push(format!("{}: {rollback_error}", installed_live.display()));
-                }
-            }
-            for (remaining, _) in &staged[index..] {
-                let _ = std::fs::remove_file(remaining);
-            }
-            let detail = if rollback_errors.is_empty() {
-                format!("failed to install {}", live.display())
-            } else {
-                format!(
-                    "failed to install {}; rollback also failed ({}); restore *.bak manually",
-                    live.display(),
-                    rollback_errors.join("; ")
-                )
-            };
-            return Err(io::Error::new(error.kind(), format!("{detail}: {error}")));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

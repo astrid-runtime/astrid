@@ -1,0 +1,525 @@
+//! Atomic replacement and rollback within captured directory authority.
+
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
+use std::io;
+
+use nix::fcntl::{OFlag, openat, renameat};
+use nix::sys::stat::{Mode, fchmod, fstat};
+use nix::unistd::{UnlinkatFlags, fsync, getuid, unlinkat};
+
+use super::anchor::{DirectoryChain, WalkPolicy};
+use super::{
+    Identity, MountBoundary, Projection, RelativePath, entry_stat, invalid, invalid_path,
+    nix_io_error, require_regular, verify_identity,
+};
+
+impl Projection {
+    pub(in super::super) fn write(&self, relative: &RelativePath, bytes: &[u8]) -> io::Result<()> {
+        let length = u64::try_from(bytes.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "projection write length overflow",
+            )
+        })?;
+        let mut source = bytes;
+        self.write_from(relative, &mut source, length)
+    }
+
+    /// Stream exactly `length` bytes into a private temporary, then rename.
+    ///
+    /// Short or overlong streams fail before rename so the live destination is
+    /// left untouched. Fences and identity checks match [`Self::write`].
+    pub(in super::super) fn write_from(
+        &self,
+        relative: &RelativePath,
+        source: &mut dyn io::Read,
+        length: u64,
+    ) -> io::Result<()> {
+        Replacement::for_write(self, relative)?
+            .write_from(source, length)
+            .1
+    }
+
+    pub(super) fn cleanup_temporary(&self) -> io::Result<()> {
+        let mut pending = self.pending_temporary.borrow_mut();
+        if let Some(temporary) = pending.as_ref() {
+            temporary.cleanup(&self.boundary)?;
+        }
+        pending.take();
+        Ok(())
+    }
+
+    pub(in super::super) fn remove(&self, relative: &RelativePath) -> io::Result<()> {
+        self.remove_expected(relative, None)
+    }
+
+    pub(super) fn remove_expected(
+        &self,
+        relative: &RelativePath,
+        expected: Option<FileIdentity>,
+    ) -> io::Result<()> {
+        self.cleanup_temporary()?;
+        let (name, parents) = relative.0.split_last().ok_or_else(invalid_path)?;
+        let policy = if expected.is_some() {
+            WalkPolicy::Inspect
+        } else {
+            WalkPolicy::Repair
+        };
+        let Some(chain) = self.directories(parents, policy)? else {
+            return if expected.is_some() {
+                Err(invalid(
+                    "published projection parent disappeared before rollback",
+                ))
+            } else {
+                Ok(())
+            };
+        };
+        let parent = chain.directory();
+        let existing = Existing::capture(parent, name, &self.boundary)?;
+        if let Some(identity) = expected {
+            if self.root.identity != identity.root {
+                return Err(invalid(
+                    "publication belongs to a different projection root",
+                ));
+            }
+            existing.require_identity(identity)?;
+        }
+        #[cfg(test)]
+        super::hooks::after(super::hooks::Event::BeforeUnlink)?;
+        chain.validate(&self.boundary)?;
+        existing.validate(parent, name, &self.boundary)?;
+        if matches!(existing, Existing::Absent) {
+            return Ok(());
+        }
+        unlinkat(parent, name.as_os_str(), UnlinkatFlags::NoRemoveDir).map_err(nix_io_error)?;
+        fsync(parent).map_err(nix_io_error)?;
+        #[cfg(test)]
+        super::hooks::after(super::hooks::Event::ParentSynced)?;
+        chain.validate(&self.boundary)
+    }
+
+    /// Remove a durable-scope staging temporary with a private-file contract.
+    ///
+    /// Unlike [`Self::remove`], this path rejects ordinary/world-readable files
+    /// and requires the basename to embed `scope`. Rollback must keep using
+    /// [`Self::remove`] so prior host generations remain restorable.
+    pub(in super::super) fn remove_staging(
+        &self,
+        relative: &RelativePath,
+        scope: crate::platform_fs::StagingScope,
+    ) -> io::Result<()> {
+        let Some(bound) = self.staging_scope else {
+            return Err(invalid(
+                "staging removal requires a bound restoration scope",
+            ));
+        };
+        if bound != scope {
+            return Err(invalid(
+                "staging removal scope does not match the bound writer",
+            ));
+        }
+        let (name, _) = relative.0.split_last().ok_or_else(invalid_path)?;
+        if !scope.matches_temporary_basename(name) {
+            return Err(invalid(
+                "staging removal name is outside the durable restoration scope",
+            ));
+        }
+        self.remove_authorized_private_leaf(relative)
+    }
+
+    /// Remove a private single-link leaf under caller-established authority.
+    ///
+    /// Used for legacy etc sentinel cleanup after the receipt/etc gate has
+    /// already classified names. Still enforces private ownership through the
+    /// captured rooted unlink; never used for ordinary rollback.
+    pub(in super::super) fn remove_authorized_private_leaf(
+        &self,
+        relative: &RelativePath,
+    ) -> io::Result<()> {
+        self.cleanup_temporary()?;
+        let (name, parents) = relative.0.split_last().ok_or_else(invalid_path)?;
+        let Some(chain) = self.directories(parents, WalkPolicy::Repair)? else {
+            return Ok(());
+        };
+        let parent = chain.directory();
+        let Some(stat) = entry_stat(parent, name)? else {
+            chain.validate(&self.boundary)?;
+            return Ok(());
+        };
+        require_regular(&stat)?;
+        let identity = Identity::read(&stat);
+        self.boundary.validate_device(stat.st_dev)?;
+        let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK;
+        let file = File::from(
+            openat(parent, name.as_os_str(), flags, Mode::empty()).map_err(nix_io_error)?,
+        );
+        verify_identity(parent, name, &file, identity)?;
+        self.boundary.validate(&file)?;
+        require_private_file(&file)?;
+        #[cfg(test)]
+        super::hooks::after(super::hooks::Event::BeforeUnlink)?;
+        chain.validate(&self.boundary)?;
+        verify_identity(parent, name, &file, identity)?;
+        require_private_file(&file)?;
+        self.boundary.validate(&file)?;
+        unlinkat(parent, name.as_os_str(), UnlinkatFlags::NoRemoveDir).map_err(nix_io_error)?;
+        fsync(parent).map_err(nix_io_error)?;
+        #[cfg(test)]
+        super::hooks::after(super::hooks::Event::ParentSynced)?;
+        chain.validate(&self.boundary)
+    }
+}
+
+/// Installed identity is carried through failures after rename.
+#[derive(Clone, Copy)]
+pub(in crate::platform_fs::private_projection) struct FileIdentity {
+    root: Identity,
+    file: Identity,
+}
+
+pub(in crate::platform_fs::private_projection) struct Replacement<'a> {
+    projection: &'a Projection,
+    chain: DirectoryChain<'a>,
+    name: OsString,
+    previous: Existing,
+}
+impl<'a> Replacement<'a> {
+    pub(in crate::platform_fs::private_projection) fn for_write(
+        projection: &'a Projection,
+        relative: &RelativePath,
+    ) -> io::Result<Self> {
+        Self::open(projection, relative, WalkPolicy::Create)
+    }
+
+    pub(super) fn for_existing(
+        projection: &'a Projection,
+        relative: &RelativePath,
+    ) -> io::Result<Self> {
+        Self::open(projection, relative, WalkPolicy::Inspect)
+    }
+
+    fn open(
+        projection: &'a Projection,
+        relative: &RelativePath,
+        policy: WalkPolicy,
+    ) -> io::Result<Self> {
+        projection.cleanup_temporary()?;
+        let (name, parents) = relative.0.split_last().ok_or_else(invalid_path)?;
+        let chain = projection
+            .directories(parents, policy)?
+            .ok_or_else(invalid_path)?;
+        let previous = Existing::capture(chain.directory(), name, &projection.boundary)?;
+        Ok(Self {
+            projection,
+            chain,
+            name: name.clone(),
+            previous,
+        })
+    }
+    pub(in crate::platform_fs::private_projection) fn capture(
+        projection: &'a Projection,
+        relative: &RelativePath,
+        sink: &mut dyn io::Write,
+    ) -> io::Result<(Self, Option<u64>)> {
+        let replacement = Self::for_write(projection, relative)?;
+        let length = snapshot_captured(
+            projection,
+            &replacement.chain,
+            &replacement.name,
+            &replacement.previous,
+            sink,
+        )?;
+        Ok((replacement, length))
+    }
+    pub(in crate::platform_fs::private_projection) fn require_identity(
+        &self,
+        identity: FileIdentity,
+    ) -> io::Result<()> {
+        if self.projection.root.identity != identity.root {
+            return Err(invalid(
+                "publication belongs to a different projection root",
+            ));
+        }
+        self.previous.require_identity(identity)
+    }
+    pub(in crate::platform_fs::private_projection) fn write_from(
+        self,
+        source: &mut dyn io::Read,
+        length: u64,
+    ) -> (Option<FileIdentity>, io::Result<()>) {
+        let parent = self.chain.directory();
+        let name = &self.name;
+        if let Err(error) = self
+            .chain
+            .validate(&self.projection.boundary)
+            .and_then(|()| {
+                self.previous
+                    .validate(parent, name, &self.projection.boundary)
+            })
+        {
+            return (None, Err(error));
+        }
+        let mut temporary = match Temporary::create(parent, self.projection.staging_scope) {
+            Ok(temporary) => temporary,
+            Err(error) => return (None, Err(error)),
+        };
+        let mut published = None;
+        let result = (|| {
+            temporary.make_private(&self.projection.boundary)?;
+            copy_exact(source, &mut temporary.file, length)?;
+            fsync(&temporary.file).map_err(nix_io_error)?;
+            #[cfg(test)]
+            super::hooks::after(super::hooks::Event::FileSynced)?;
+            #[cfg(test)]
+            super::hooks::after(super::hooks::Event::BeforeRename)?;
+            self.chain.validate(&self.projection.boundary)?;
+            self.previous
+                .validate(parent, name, &self.projection.boundary)?;
+            verify_identity(parent, &temporary.name, &temporary.file, temporary.identity)?;
+            require_private_file(&temporary.file)?;
+            renameat(parent, temporary.name.as_os_str(), parent, name.as_os_str())
+                .map_err(nix_io_error)?;
+            published = Some(FileIdentity {
+                root: self.projection.root.identity,
+                file: temporary.identity,
+            });
+            verify_identity(parent, name, &temporary.file, temporary.identity)?;
+            require_private_file(&temporary.file)?;
+            fsync(parent).map_err(nix_io_error)?;
+            #[cfg(test)]
+            super::hooks::after(super::hooks::Event::ParentSynced)?;
+            self.chain.validate(&self.projection.boundary)
+        })();
+        if let Err(error) = result {
+            if let Err(cleanup) = temporary.cleanup(&self.projection.boundary) {
+                // One failed write owns at most one temporary. Later mutations
+                // must discharge it before creating another rollback obligation.
+                *self.projection.pending_temporary.borrow_mut() = Some(temporary);
+                return (
+                    published,
+                    Err(io::Error::new(
+                        error.kind(),
+                        format!("{error}; temporary cleanup failed: {cleanup}"),
+                    )),
+                );
+            }
+            return (published, Err(error));
+        }
+        (published, Ok(()))
+    }
+}
+
+pub(super) fn snapshot_previous(
+    projection: &Projection,
+    chain: &DirectoryChain<'_>,
+    name: &OsStr,
+    sink: &mut dyn io::Write,
+) -> io::Result<Option<u64>> {
+    let previous = Existing::capture(chain.directory(), name, &projection.boundary)?;
+    let length = snapshot_captured(projection, chain, name, &previous, sink)?;
+    Ok(length)
+}
+fn snapshot_captured(
+    projection: &Projection,
+    chain: &DirectoryChain<'_>,
+    name: &OsStr,
+    previous: &Existing,
+    sink: &mut dyn io::Write,
+) -> io::Result<Option<u64>> {
+    let parent = chain.directory();
+    previous.validate(parent, name, &projection.boundary)?;
+    if matches!(previous, Existing::Absent) {
+        chain.validate(&projection.boundary)?;
+        return Ok(None);
+    }
+    let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK;
+    let mut file = File::from(openat(parent, name, flags, Mode::empty()).map_err(nix_io_error)?);
+    let Existing::Present { identity, .. } = previous else {
+        unreachable!()
+    };
+    verify_identity(parent, name, &file, *identity)?;
+    projection.boundary.validate(&file)?;
+    let length = io::copy(&mut file, sink)?;
+    verify_identity(parent, name, &file, *identity)?;
+    previous.validate(parent, name, &projection.boundary)?;
+    chain.validate(&projection.boundary)?;
+    Ok(Some(length))
+}
+
+enum Existing {
+    Absent,
+    Present {
+        identity: Identity,
+        #[cfg(target_os = "linux")]
+        descriptor: File,
+    },
+}
+
+impl Existing {
+    fn capture(parent: &File, name: &OsStr, boundary: &MountBoundary) -> io::Result<Self> {
+        let Some(stat) = entry_stat(parent, name)? else {
+            return Ok(Self::Absent);
+        };
+        require_regular(&stat)?;
+        let identity = Identity::read(&stat);
+        boundary.validate_device(stat.st_dev)?;
+        #[cfg(target_os = "linux")]
+        {
+            let flags = OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+            let descriptor =
+                File::from(openat(parent, name, flags, Mode::empty()).map_err(nix_io_error)?);
+            verify_identity(parent, name, &descriptor, identity)?;
+            boundary.validate(&descriptor)?;
+            Ok(Self::Present {
+                identity,
+                descriptor,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(Self::Present { identity })
+        }
+    }
+
+    fn require_identity(&self, expected: FileIdentity) -> io::Result<()> {
+        match self {
+            Self::Present { identity, .. } if *identity == expected.file => Ok(()),
+            _ => Err(invalid(
+                "published projection file was replaced before rollback",
+            )),
+        }
+    }
+
+    fn validate(&self, parent: &File, name: &OsStr, boundary: &MountBoundary) -> io::Result<()> {
+        let current = entry_stat(parent, name)?;
+        match (self, current) {
+            (Self::Absent, None) => Ok(()),
+            (Self::Present { identity, .. }, Some(stat)) if Identity::read(&stat) == *identity => {
+                boundary.validate_device(stat.st_dev)?;
+                #[cfg(target_os = "linux")]
+                if let Self::Present { descriptor, .. } = self {
+                    verify_identity(parent, name, descriptor, *identity)?;
+                    boundary.validate(descriptor)?;
+                    // Reopening the live name also detects a same-inode bind
+                    // mount installed after the original descriptor opened.
+                    let flags = OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+                    let current = File::from(
+                        openat(parent, name, flags, Mode::empty()).map_err(nix_io_error)?,
+                    );
+                    verify_identity(parent, name, &current, *identity)?;
+                    boundary.validate(&current)?;
+                }
+                Ok(())
+            },
+            _ => Err(invalid("projection destination changed before mutation")),
+        }
+    }
+}
+
+pub(super) struct Temporary {
+    parent: File,
+    name: OsString,
+    file: File,
+    identity: Identity,
+}
+
+impl Temporary {
+    fn create(
+        parent: &File,
+        staging_scope: Option<crate::platform_fs::StagingScope>,
+    ) -> io::Result<Self> {
+        // Capture cleanup authority before creating any entry.
+        let parent = parent.try_clone()?;
+        let name = OsString::from(match staging_scope {
+            Some(scope) => scope.temporary_basename(),
+            None => format!(".astrid-private-{}", uuid::Uuid::new_v4().simple()),
+        });
+        let flags = OFlag::O_WRONLY
+            | OFlag::O_CREAT
+            | OFlag::O_EXCL
+            | OFlag::O_NOFOLLOW
+            | OFlag::O_CLOEXEC
+            | OFlag::O_NONBLOCK;
+        let file = File::from(
+            openat(
+                &parent,
+                name.as_os_str(),
+                flags,
+                Mode::from_bits_truncate(0o600),
+            )
+            .map_err(nix_io_error)?,
+        );
+        let identity = Identity::of(&file)?;
+        Ok(Self {
+            parent,
+            name,
+            file,
+            identity,
+        })
+    }
+
+    fn make_private(&self, boundary: &MountBoundary) -> io::Result<()> {
+        fchmod(&self.file, Mode::from_bits_truncate(0o600)).map_err(nix_io_error)?;
+        #[cfg(target_os = "macos")]
+        crate::platform_fs::macos_acl::restrict(&self.file)?;
+        boundary.validate(&self.file)?;
+        require_private_file(&self.file)
+    }
+
+    fn cleanup(&self, boundary: &MountBoundary) -> io::Result<()> {
+        #[cfg(test)]
+        super::hooks::after(super::hooks::Event::BeforeTemporaryCleanup)?;
+        let parent = &self.parent;
+        boundary.validate(parent)?;
+        let Some(stat) = entry_stat(parent, &self.name)? else {
+            // An earlier unlink can have succeeded before its fsync failed.
+            fsync(parent).map_err(nix_io_error)?;
+            return Ok(());
+        };
+        if Identity::read(&stat) != self.identity {
+            return Err(invalid("temporary projection entry was replaced"));
+        }
+        boundary.validate(&self.file)?;
+        unlinkat(parent, self.name.as_os_str(), UnlinkatFlags::NoRemoveDir)
+            .map_err(nix_io_error)?;
+        #[cfg(test)]
+        super::hooks::after(super::hooks::Event::TemporaryUnlinked)?;
+        fsync(parent).map_err(nix_io_error)
+    }
+}
+
+fn copy_exact(source: &mut dyn io::Read, destination: &mut File, length: u64) -> io::Result<()> {
+    let copied = io::copy(&mut io::Read::take(&mut *source, length), destination)?;
+    if copied != length {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "projection stream ended before exact length",
+        ));
+    }
+    let mut extra = [0_u8; 1];
+    loop {
+        match source.read(&mut extra) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "projection stream exceeded exact length",
+                ));
+            },
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+pub(super) fn require_private_file(file: &File) -> io::Result<()> {
+    let stat = fstat(file).map_err(nix_io_error)?;
+    require_regular(&stat)?;
+    if stat.st_uid != getuid().as_raw() || stat.st_mode & 0o777 != 0o600 || stat.st_nlink != 1 {
+        return Err(invalid("projection file is not private with a single link"));
+    }
+    #[cfg(target_os = "macos")]
+    crate::platform_fs::macos_acl::validate(file)?;
+    Ok(())
+}

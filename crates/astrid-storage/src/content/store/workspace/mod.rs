@@ -24,9 +24,14 @@ mod lifecycle;
 mod model;
 mod operations;
 mod rename_guards;
+mod retirement;
 
 #[cfg(test)]
 mod rename_tests;
+#[cfg(test)]
+mod retirement_tests;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;
 

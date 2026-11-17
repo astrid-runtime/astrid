@@ -155,7 +155,7 @@ pub(super) fn snapshot_error(error: impl std::fmt::Display) -> StorageError {
 #[cfg(test)]
 mod retire_tests;
 #[cfg(test)]
-mod test_directory;
+use crate::test_directory;
 #[cfg(test)]
 mod tests;
 

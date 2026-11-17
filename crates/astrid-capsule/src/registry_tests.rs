@@ -124,6 +124,10 @@ fn removing_system_owner_revokes_every_dependent_view() {
     assert!(registry.get_for(&alice, &id).is_none());
     assert!(registry.get_for(&bob, &id).is_none());
     assert!(registry.is_empty());
+    assert_eq!(removed.removed_principals.len(), 3);
+    for principal in [&owner, &alice, &bob] {
+        assert!(removed.removed_principals.contains(principal));
+    }
 }
 
 #[test]
