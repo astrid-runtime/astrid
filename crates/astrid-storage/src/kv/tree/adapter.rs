@@ -218,6 +218,34 @@ where
         .await
     }
 
+    async fn visit_entries_with_prefix(
+        &self,
+        namespace: &str,
+        prefix: &str,
+        mut visit: crate::kv::KvEntryVisitor,
+    ) -> StorageResult<()> {
+        validate_namespace(namespace)?;
+        validate_prefix(prefix)?;
+        let owner = self.resolver.resolve(namespace)?;
+        let start = composite_key(namespace, prefix);
+        let end = prefix_range_end(namespace, prefix);
+        let namespace = namespace.to_owned();
+        let strip = namespace.len().saturating_add(1);
+        let blocking = self.blocking_store();
+        run_blocking(move || {
+            blocking.read(owner, |context, header| {
+                context.visit_projected_entries_in_range(
+                    header,
+                    &start,
+                    &end,
+                    strip,
+                    |key, value| visit(&namespace, key, value),
+                )
+            })
+        })
+        .await
+    }
+
     async fn compare_and_swap(
         &self,
         namespace: &str,

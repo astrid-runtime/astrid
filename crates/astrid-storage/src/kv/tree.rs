@@ -406,26 +406,9 @@ where
 
     fn clear_range(&self, owner: &P, start: &[u8], end: &[u8]) -> StorageResult<u64> {
         self.mutate(owner, |context, header| {
-            let mut keys = context
-                .raw_keys_in_range(header.tree, start, end)?
-                .into_iter()
-                .collect::<BTreeSet<_>>();
-            for (key, value) in header.overlay.range(start, end) {
-                match value {
-                    Some(_) => {
-                        keys.insert(key);
-                    },
-                    None => {
-                        keys.remove(&key);
-                    },
-                }
-            }
-            let count = u64::try_from(keys.len())
+            let mutations = context.projected_deletions_in_range(header, start, end)?;
+            let count = u64::try_from(mutations.len())
                 .map_err(|_| StorageError::Internal("KV key count overflow".to_owned()))?;
-            let mutations = keys
-                .into_iter()
-                .map(|key| Replacement::new(key, None))
-                .collect();
             Ok((count, mutations, count != 0))
         })
     }

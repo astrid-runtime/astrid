@@ -258,15 +258,27 @@ where
         key: &[u8],
         certificate: ValidatedCheckpoint,
     ) -> StorageResult<Option<Vec<u8>>> {
+        self.get_slot(header.tree, key)?
+            .map(|value| self.read_certified_tree_slot(header, &value, certificate))
+            .transpose()
+    }
+
+    /// Read a slot retrieved from this header's tree by an authenticated walk.
+    /// The caller supplies its captured header; certificate use remains bound
+    /// to both the context principal and that exact checkpoint root.
+    pub(super) fn read_certified_tree_slot(
+        &self,
+        header: &super::header::TreeHeader<P>,
+        value: &ValueSlot,
+        certificate: ValidatedCheckpoint,
+    ) -> StorageResult<Vec<u8>> {
         if self.principal() != &header.owner
             || !certificate.matches_tree(header.tree)
             || certificate.root().is_none()
         {
-            return self.get(header.tree, key);
+            return self.value_bytes(value);
         }
-        self.get_slot(header.tree, key)?
-            .map(|value| self.certified_slot_bytes(&value, certificate))
-            .transpose()
+        self.certified_slot_bytes(value, certificate)
     }
 
     fn certified_slot_bytes(

@@ -3,14 +3,16 @@
 use std::collections::BTreeMap;
 
 use super::{
-    KvProjectionEngine, LeafEntry, Node, ObjectId, StorageError, StorageResult, TreeContext,
-    TreeHeader, invalid,
+    ChildPointer, KvProjectionEngine, LeafEntry, Node, ObjectId, PreviousValue, Replacement,
+    StorageError, StorageResult, TreeContext, TreeHeader, ValueSlot, decode_node, invalid,
 };
 
 #[cfg(test)]
 mod tests;
 
 impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
+    // Each range consumes its authenticated pages once. Deletion observations
+    // carry validated values forward, so subsequent accounting needs no page memo.
     fn visit_slots_in_range(
         &mut self,
         root: Option<ObjectId>,
@@ -21,9 +23,13 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         let Some(root) = root else {
             return Ok(());
         };
-        let mut stack = vec![root];
-        while let Some(object) = stack.pop() {
-            match self.node(object)?.node {
+        let mut stack: Vec<(ObjectId, Option<ChildPointer>)> = vec![(root, None)];
+        while let Some((object, expected)) = stack.pop() {
+            let handle = decode_node(object, &self.record(object)?)?;
+            if expected.is_some_and(|expected| handle.pointer() != expected) {
+                return Err(invalid(object, "persistent KV child summary disagrees"));
+            }
+            match handle.node {
                 Node::Leaf(leaf) => {
                     for entry in leaf.entries {
                         if entry.key.as_slice() >= start && entry.key.as_slice() < end {
@@ -42,8 +48,7 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
                         {
                             continue;
                         }
-                        self.validate_pointer(child)?;
-                        stack.push(child.object);
+                        stack.push((child.object, Some(child.clone())));
                     }
                 },
             }
@@ -51,18 +56,50 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         Ok(())
     }
 
-    pub(in crate::kv::tree) fn raw_keys_in_range(
+    pub(in crate::kv::tree) fn projected_deletions_in_range(
         &mut self,
-        root: Option<ObjectId>,
+        header: &TreeHeader<P>,
         start: &[u8],
         end: &[u8],
-    ) -> StorageResult<Vec<Vec<u8>>> {
-        let mut keys = Vec::new();
-        self.visit_slots_in_range(root, start, end, |_, entry| {
-            keys.push(entry.key);
+    ) -> StorageResult<Vec<Replacement>> {
+        let mut observed = BTreeMap::new();
+        self.visit_slots_in_range(header.tree, start, end, |context, entry| {
+            if header.overlay.get(&entry.key).is_none() {
+                // Preserve the existing body validation before deletion, but
+                // reuse this authenticated slot instead of looking it up again.
+                let value = match header.boundary {
+                    Some(certificate) => {
+                        context.read_certified_tree_slot(header, &entry.value, certificate)?
+                    },
+                    None => context.value_bytes(&entry.value)?,
+                };
+                let previous_len = Some(value.len());
+                drop(value);
+                observed.insert(
+                    entry.key,
+                    PreviousValue::Loaded {
+                        previous_len,
+                        unchanged: false,
+                    },
+                );
+            }
             Ok(())
         })?;
-        Ok(keys)
+        for (key, value) in header.overlay.range(start, end) {
+            if value.is_some() {
+                // apply_mutations reads the current overlay before consulting
+                // this hint, retaining its established live-value accounting.
+                observed.insert(key.to_vec(), PreviousValue::Unread);
+            }
+        }
+        Ok(observed
+            .into_iter()
+            .map(|(key, previous)| Replacement {
+                key,
+                previous,
+                value: None,
+            })
+            .collect())
     }
 
     pub(in crate::kv::tree) fn projected_keys_in_range(
@@ -72,13 +109,13 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         end: &[u8],
         strip: usize,
     ) -> StorageResult<Vec<String>> {
-        let mut keys = self
-            .raw_keys_in_range(header.tree, start, end)?
-            .into_iter()
-            .map(|key| (key, true))
-            .collect::<BTreeMap<_, _>>();
+        let mut keys = BTreeMap::new();
+        self.visit_slots_in_range(header.tree, start, end, |_, entry| {
+            keys.insert(entry.key, true);
+            Ok(())
+        })?;
         for (key, value) in header.overlay.range(start, end) {
-            keys.insert(key, value.is_some());
+            keys.insert(key.to_vec(), value.is_some());
         }
         keys.into_iter()
             .filter(|(_, present)| *present)
@@ -101,31 +138,50 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         end: &[u8],
         strip: usize,
     ) -> StorageResult<Vec<(String, Vec<u8>)>> {
-        let mut entries = BTreeMap::new();
+        let mut entries = Vec::new();
+        self.visit_projected_entries_in_range(header, start, end, strip, |key, value| {
+            entries.push((key.to_owned(), value.to_vec()));
+            Ok(())
+        })?;
+        entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        Ok(entries)
+    }
+
+    pub(in crate::kv::tree) fn visit_projected_entries_in_range(
+        &mut self,
+        header: &TreeHeader<P>,
+        start: &[u8],
+        end: &[u8],
+        strip: usize,
+        mut visit: impl FnMut(&str, &[u8]) -> StorageResult<()>,
+    ) -> StorageResult<()> {
         self.visit_slots_in_range(header.tree, start, end, |context, entry| {
-            // A replacement or tombstone shadows the old immutable value.
-            // Match point-read semantics without reconstructing stale bodies.
+            // Replacements and tombstones shadow checkpoint values before
+            // body reconstruction, just as in a point read.
             if header.overlay.get(&entry.key).is_none() {
-                let value = context.value_bytes(&entry.value)?;
-                entries.insert(entry.key, value);
+                let key = suffix(&entry.key, strip)?;
+                match &entry.value {
+                    ValueSlot::Inline(value) => visit(key, value)?,
+                    ValueSlot::Spilled { .. } => {
+                        let value = context.value_bytes(&entry.value)?;
+                        visit(key, &value)?;
+                    },
+                }
             }
             Ok(())
         })?;
         for (key, value) in header.overlay.range(start, end) {
             if let Some(value) = value {
-                entries.insert(key, value);
+                visit(suffix(key, strip)?, value)?;
             }
         }
-        entries
-            .into_iter()
-            .map(|(key, value)| {
-                let suffix = key
-                    .get(strip..)
-                    .ok_or_else(|| invalid(ObjectId::new([0; 32]), "KV key prefix underflow"))?;
-                let key = std::str::from_utf8(suffix)
-                    .map_err(|error| StorageError::Serialization(error.to_string()))?;
-                Ok((key.to_owned(), value))
-            })
-            .collect()
+        Ok(())
     }
+}
+
+fn suffix(key: &[u8], strip: usize) -> StorageResult<&str> {
+    let key = key
+        .get(strip..)
+        .ok_or_else(|| invalid(ObjectId::new([0; 32]), "KV key prefix underflow"))?;
+    std::str::from_utf8(key).map_err(|error| StorageError::Serialization(error.to_string()))
 }

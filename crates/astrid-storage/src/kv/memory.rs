@@ -133,6 +133,22 @@ impl KvStore for MemoryKvStore {
             .collect())
     }
 
+    async fn visit_entries_with_prefix(
+        &self,
+        namespace: &str,
+        prefix: &str,
+        mut visit: super::KvEntryVisitor,
+    ) -> StorageResult<()> {
+        // Keep the existing separate key-list/read consistency. In particular,
+        // do not hold the map lock while a caller parses or processes values.
+        for key in self.list_keys_with_prefix(namespace, prefix).await? {
+            if let Some(value) = self.get(namespace, &key).await? {
+                visit(namespace, &key, &value)?;
+            }
+        }
+        Ok(())
+    }
+
     async fn compare_and_swap(
         &self,
         namespace: &str,
