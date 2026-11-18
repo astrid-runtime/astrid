@@ -282,6 +282,24 @@ where
             .keys_with_prefix(namespace, prefix))
     }
 
+    async fn visit_entries_with_prefix(
+        &self,
+        namespace: &str,
+        prefix: &str,
+        mut visit: super::KvEntryVisitor,
+    ) -> StorageResult<()> {
+        validate_namespace(namespace)?;
+        validate_prefix(prefix)?;
+        let principal = self.resolver.resolve(namespace)?;
+        let snapshot = self.snapshot(&principal)?;
+        for (stored_namespace, key, value) in snapshot.state().entries() {
+            if stored_namespace == namespace && key.starts_with(prefix) {
+                visit(stored_namespace, key, value)?;
+            }
+        }
+        Ok(())
+    }
+
     async fn compare_and_swap(
         &self,
         namespace: &str,

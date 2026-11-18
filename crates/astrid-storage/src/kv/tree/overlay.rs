@@ -42,10 +42,31 @@ impl OverlayMap {
         self.root = Some(insert(self.root.take(), Arc::new(Entry { key, value })));
     }
 
-    pub(super) fn range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
-        let mut entries = Vec::new();
-        collect_range(self.root.as_deref(), start, end, &mut entries);
-        entries
+    pub(super) fn range<'a>(
+        &'a self,
+        start: &'a [u8],
+        end: &'a [u8],
+    ) -> impl Iterator<Item = (&'a [u8], Option<&'a [u8]>)> + 'a {
+        let mut cursor = self.root.as_deref();
+        let mut stack = Vec::new();
+        std::iter::from_fn(move || {
+            while let Some(node) = cursor {
+                if node.entry.key.as_slice() >= start {
+                    stack.push(node);
+                    cursor = node.left.as_deref();
+                } else {
+                    cursor = node.right.as_deref();
+                }
+            }
+            let node = stack.pop()?;
+            if node.entry.key.as_slice() >= end {
+                cursor = None;
+                stack.clear();
+                return None;
+            }
+            cursor = node.right.as_deref();
+            Some((node.entry.key.as_slice(), node.entry.value.as_deref()))
+        })
     }
 
     pub(super) fn all(&self) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
@@ -159,26 +180,6 @@ fn height(node: Option<&Arc<Node>>) -> u32 {
     node.map_or(0, |node| node.height)
 }
 
-fn collect_range(
-    node: Option<&Node>,
-    start: &[u8],
-    end: &[u8],
-    entries: &mut Vec<(Vec<u8>, Option<Vec<u8>>)>,
-) {
-    let Some(node) = node else {
-        return;
-    };
-    if node.entry.key.as_slice() >= start {
-        collect_range(node.left.as_deref(), start, end, entries);
-    }
-    if node.entry.key.as_slice() >= start && node.entry.key.as_slice() < end {
-        entries.push((node.entry.key.clone(), node.entry.value.clone()));
-    }
-    if node.entry.key.as_slice() < end {
-        collect_range(node.right.as_deref(), start, end, entries);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -253,7 +254,10 @@ mod tests {
                 snapshot.get(&[2]).unwrap().as_ref().unwrap(),
                 &vec![2; 64 * 1024]
             );
-            let range = overlay.range(&[1], &[3]);
+            let range = overlay
+                .range(&[1], &[3])
+                .map(|(key, value)| (key.to_vec(), value.map(<[u8]>::to_vec)))
+                .collect::<Vec<_>>();
             assert_eq!(range.len(), 2);
             assert_eq!(range[0].0, vec![1]);
             assert_eq!(range[1], (vec![2], None));

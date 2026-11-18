@@ -217,6 +217,22 @@ impl ScopedKvStore {
             .await
     }
 
+    /// Visit matching entries within this namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns backend, prefix-validation or visitor errors. See
+    /// [`KvStore::visit_entries_with_prefix`] for snapshot and callback semantics.
+    pub async fn visit_entries_with_prefix(
+        &self,
+        prefix: &str,
+        visit: super::KvEntryVisitor,
+    ) -> StorageResult<()> {
+        self.inner
+            .visit_entries_with_prefix(&self.namespace, prefix, visit)
+            .await
+    }
+
     /// Delete all keys matching a given prefix within this namespace.
     ///
     /// Returns the number of keys deleted.

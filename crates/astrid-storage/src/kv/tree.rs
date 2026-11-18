@@ -413,10 +413,10 @@ where
             for (key, value) in header.overlay.range(start, end) {
                 match value {
                     Some(_) => {
-                        keys.insert(key);
+                        keys.insert(key.to_vec());
                     },
                     None => {
-                        keys.remove(&key);
+                        keys.remove(key);
                     },
                 }
             }

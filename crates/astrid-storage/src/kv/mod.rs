@@ -35,6 +35,12 @@ mod conditional_delete_tests;
 #[cfg(test)]
 mod identity_delete_bench;
 mod memory;
+#[cfg(test)]
+mod prefix_scan_bench;
+#[cfg(test)]
+mod prefix_visit_compat_tests;
+#[cfg(test)]
+mod prefix_visit_tests;
 mod principal;
 mod scoped;
 #[cfg(feature = "legacy-surrealkv")]
@@ -180,6 +186,13 @@ pub struct KvEntry {
     pub value: Vec<u8>,
 }
 
+/// A synchronous visitor borrowing one namespaced key/value at a time.
+///
+/// Borrows end when the callback returns. Visitors may see a partial range if
+/// they or the backend return an error; completion requires every visit to
+/// finish. Callbacks must not await or retain the supplied borrows.
+pub type KvEntryVisitor = Box<dyn FnMut(&str, &str, &[u8]) -> StorageResult<()> + Send>;
+
 // ---------------------------------------------------------------------------
 // Trait
 // ---------------------------------------------------------------------------
@@ -246,6 +259,25 @@ pub trait KvStore: Send + Sync {
             }
         }
         Ok(entries)
+    }
+
+    /// Visit matching entries without requiring a collected result.
+    ///
+    /// Order is unspecified. Native range backends visit one captured
+    /// projection without retaining all raw entries. The compatibility path
+    /// uses the existing entry-list operation to preserve specialized
+    /// implementations' snapshot behavior; it may still materialize that list.
+    /// Errors stop traversal and propagate; callback effects are not rolled back.
+    async fn visit_entries_with_prefix(
+        &self,
+        namespace: &str,
+        prefix: &str,
+        mut visit: KvEntryVisitor,
+    ) -> StorageResult<()> {
+        for entry in self.list_entries_with_prefix(namespace, prefix).await? {
+            visit(&entry.namespace, &entry.key, &entry.value)?;
+        }
+        Ok(())
     }
 
     /// List at most `limit` keys after an exclusive lexical cursor.

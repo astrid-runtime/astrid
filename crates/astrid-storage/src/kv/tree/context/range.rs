@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use super::{
-    KvProjectionEngine, LeafEntry, Node, ObjectId, StorageError, StorageResult, TreeContext,
-    TreeHeader, invalid,
+    ChildPointer, KvProjectionEngine, LeafEntry, Node, NodeHandle, ObjectId, StorageError,
+    StorageResult, TreeContext, TreeHeader, ValueSlot, decode_node, invalid,
 };
 
 #[cfg(test)]
@@ -16,14 +16,29 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         root: Option<ObjectId>,
         start: &[u8],
         end: &[u8],
+        visit: impl FnMut(&Self, LeafEntry) -> StorageResult<()>,
+    ) -> StorageResult<()> {
+        self.walk_slots_in_range(root, start, end, Self::node, visit)
+    }
+
+    fn walk_slots_in_range(
+        &mut self,
+        root: Option<ObjectId>,
+        start: &[u8],
+        end: &[u8],
+        mut load: impl FnMut(&mut Self, ObjectId) -> StorageResult<NodeHandle>,
         mut visit: impl FnMut(&Self, LeafEntry) -> StorageResult<()>,
     ) -> StorageResult<()> {
         let Some(root) = root else {
             return Ok(());
         };
-        let mut stack = vec![root];
-        while let Some(object) = stack.pop() {
-            match self.node(object)?.node {
+        let mut stack: Vec<(ObjectId, Option<ChildPointer>)> = vec![(root, None)];
+        while let Some((object, expected)) = stack.pop() {
+            let handle = load(self, object)?;
+            if expected.is_some_and(|expected| handle.pointer() != expected) {
+                return Err(invalid(object, "persistent KV child summary disagrees"));
+            }
+            match handle.node {
                 Node::Leaf(leaf) => {
                     for entry in leaf.entries {
                         if entry.key.as_slice() >= start && entry.key.as_slice() < end {
@@ -42,8 +57,7 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
                         {
                             continue;
                         }
-                        self.validate_pointer(child)?;
-                        stack.push(child.object);
+                        stack.push((child.object, Some(child.clone())));
                     }
                 },
             }
@@ -72,13 +86,19 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         end: &[u8],
         strip: usize,
     ) -> StorageResult<Vec<String>> {
-        let mut keys = self
-            .raw_keys_in_range(header.tree, start, end)?
-            .into_iter()
-            .map(|key| (key, true))
-            .collect::<BTreeMap<_, _>>();
+        let mut keys = BTreeMap::new();
+        self.walk_slots_in_range(
+            header.tree,
+            start,
+            end,
+            |context, object| decode_node(object, &context.record(object)?),
+            |_, entry| {
+                keys.insert(entry.key, true);
+                Ok(())
+            },
+        )?;
         for (key, value) in header.overlay.range(start, end) {
-            keys.insert(key, value.is_some());
+            keys.insert(key.to_vec(), value.is_some());
         }
         keys.into_iter()
             .filter(|(_, present)| *present)
@@ -101,31 +121,59 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         end: &[u8],
         strip: usize,
     ) -> StorageResult<Vec<(String, Vec<u8>)>> {
-        let mut entries = BTreeMap::new();
-        self.visit_slots_in_range(header.tree, start, end, |context, entry| {
-            // A replacement or tombstone shadows the old immutable value.
-            // Match point-read semantics without reconstructing stale bodies.
-            if header.overlay.get(&entry.key).is_none() {
-                let value = context.value_bytes(&entry.value)?;
-                entries.insert(entry.key, value);
-            }
+        let mut entries = Vec::new();
+        self.visit_projected_entries_in_range(header, start, end, strip, |key, value| {
+            entries.push((key.to_owned(), value.to_vec()));
             Ok(())
         })?;
+        entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        Ok(entries)
+    }
+
+    pub(in crate::kv::tree) fn visit_projected_entries_in_range(
+        &mut self,
+        header: &TreeHeader<P>,
+        start: &[u8],
+        end: &[u8],
+        strip: usize,
+        mut visit: impl FnMut(&str, &[u8]) -> StorageResult<()>,
+    ) -> StorageResult<()> {
+        self.walk_slots_in_range(
+            header.tree,
+            start,
+            end,
+            // A read-only walk uses each decoded page once. Keep the existing
+            // mutation-side memo policy for key collection, but do not retain
+            // an entire checkpoint's decoded bodies as scan scratch.
+            |context, object| decode_node(object, &context.record(object)?),
+            |context, entry| {
+                // Replacements and tombstones shadow checkpoint values before
+                // body reconstruction, just as in a point read.
+                if header.overlay.get(&entry.key).is_none() {
+                    let key = suffix(&entry.key, strip)?;
+                    match &entry.value {
+                        ValueSlot::Inline(value) => visit(key, value)?,
+                        ValueSlot::Spilled { .. } => {
+                            let value = context.value_bytes(&entry.value)?;
+                            visit(key, &value)?;
+                        },
+                    }
+                }
+                Ok(())
+            },
+        )?;
         for (key, value) in header.overlay.range(start, end) {
             if let Some(value) = value {
-                entries.insert(key, value);
+                visit(suffix(key, strip)?, value)?;
             }
         }
-        entries
-            .into_iter()
-            .map(|(key, value)| {
-                let suffix = key
-                    .get(strip..)
-                    .ok_or_else(|| invalid(ObjectId::new([0; 32]), "KV key prefix underflow"))?;
-                let key = std::str::from_utf8(suffix)
-                    .map_err(|error| StorageError::Serialization(error.to_string()))?;
-                Ok((key.to_owned(), value))
-            })
-            .collect()
+        Ok(())
     }
+}
+
+fn suffix(key: &[u8], strip: usize) -> StorageResult<&str> {
+    let key = key
+        .get(strip..)
+        .ok_or_else(|| invalid(ObjectId::new([0; 32]), "KV key prefix underflow"))?;
+    std::str::from_utf8(key).map_err(|error| StorageError::Serialization(error.to_string()))
 }

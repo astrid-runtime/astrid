@@ -300,6 +300,39 @@ impl KvStore for SurrealKvStore {
         Ok(keys)
     }
 
+    async fn visit_entries_with_prefix(
+        &self,
+        namespace: &str,
+        prefix: &str,
+        mut visit: super::KvEntryVisitor,
+    ) -> StorageResult<()> {
+        validate_namespace(namespace)?;
+        validate_prefix(prefix)?;
+        let start = composite_key(namespace, prefix);
+        let end = prefix_range_end(namespace, prefix);
+        let strip = namespace.len().saturating_add(1);
+        let tx = self
+            .tree
+            .begin_with_mode(surrealkv::Mode::ReadOnly)
+            .map_err(|ref error| map_kv_err(error))?;
+        let mut iter = tx
+            .range(&start, &end)
+            .map_err(|ref error| map_kv_err(error))?;
+        iter.seek_first().map_err(|ref error| map_kv_err(error))?;
+        while iter.valid() {
+            let raw = iter.key().user_key();
+            // Preserve the legacy key-list API's invalid-key filtering.
+            if raw.len() > strip
+                && let Ok(key) = std::str::from_utf8(&raw[strip..])
+            {
+                let value = iter.value().map_err(|ref error| map_kv_err(error))?;
+                visit(namespace, key, &value)?;
+            }
+            iter.next().map_err(|ref error| map_kv_err(error))?;
+        }
+        Ok(())
+    }
+
     async fn list_keys_with_prefix_page(
         &self,
         namespace: &str,

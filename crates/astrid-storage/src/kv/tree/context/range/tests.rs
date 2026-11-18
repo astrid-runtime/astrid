@@ -74,3 +74,81 @@ async fn prefix_entries_merge_one_checkpoint_with_live_overlay() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn prefix_visitor_releases_decoded_checkpoint_pages_and_preserves_ordered_lists() {
+    let engine = Arc::new(InMemoryEngine::new(TestIdentity));
+    let store = TreeKvStore::<String, TestIdentity, Resolver, _>::from_engine(engine, Resolver);
+    let namespace = "alice:capsule:first";
+    for index in 0..512_u32 {
+        store
+            .set(namespace, &format!("link/{index:04}"), vec![0x51; 128])
+            .await
+            .unwrap();
+    }
+    store
+        .set(namespace, "link0/outside", vec![0x52; 128])
+        .await
+        .unwrap();
+    store.checkpoint_for_test("alice".to_owned()).unwrap();
+    store.delete(namespace, "link/0001").await.unwrap();
+    store
+        .set(namespace, "link/0000", b"replacement".to_vec())
+        .await
+        .unwrap();
+    store.set(namespace, "link/new", Vec::new()).await.unwrap();
+
+    let start = crate::kv::composite_key(namespace, "link/");
+    let end = crate::kv::prefix_range_end(namespace, "link/");
+    let blocking = store.blocking_store();
+    let actual = blocking
+        .read("alice".to_owned(), |context, header| {
+            let mut rows = BTreeMap::new();
+            context.visit_projected_entries_in_range(
+                header,
+                &start,
+                &end,
+                namespace.len().strict_add(1),
+                |key, value| {
+                    assert!(rows.insert(key.to_owned(), value.to_vec()).is_none());
+                    Ok(())
+                },
+            )?;
+            assert!(
+                context.nodes.is_empty(),
+                "read walk retained decoded checkpoint bodies"
+            );
+            let keys = context.projected_keys_in_range(
+                header,
+                &start,
+                &end,
+                namespace.len().strict_add(1),
+            )?;
+            assert_eq!(keys, rows.keys().cloned().collect::<Vec<_>>());
+            assert!(
+                context.nodes.is_empty(),
+                "key-only scan retained decoded checkpoint bodies"
+            );
+            Ok(rows)
+        })
+        .unwrap();
+    assert_eq!(actual.len(), 512);
+    assert_eq!(actual["link/0000"], b"replacement");
+    assert!(!actual.contains_key("link/0001"));
+    assert!(actual["link/new"].is_empty());
+    let entries = store
+        .list_entries_with_prefix(namespace, "link/")
+        .await
+        .unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect::<Vec<_>>(),
+        actual.keys().map(String::as_str).collect::<Vec<_>>()
+    );
+    for entry in entries {
+        assert_eq!(entry.namespace, namespace);
+        assert_eq!(entry.value, actual[&entry.key]);
+    }
+}
