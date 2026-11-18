@@ -134,3 +134,37 @@ async fn prefix_key_clear_measurement() {
         println!("prefix_clear_{name}_128_rows_us={clear_us:?}");
     }
 }
+
+#[tokio::test]
+#[ignore = "manual fresh clear-only control without preceding key scans"]
+async fn prefix_fresh_clear_measurement() {
+    for (name, checkpoint) in [("overlay", false), ("checkpoint", true)] {
+        let mut clear_us = Vec::new();
+        for _ in 0..9 {
+            let store = TreeKvStore::<String, TestIdentity, Resolver, _>::from_engine(
+                Arc::new(InMemoryEngine::new(TestIdentity)),
+                Resolver,
+            );
+            for index in 0..128 {
+                store
+                    .set(NS, &format!("link/{index:04}"), vec![0x51; 8192])
+                    .await
+                    .unwrap();
+            }
+            if checkpoint {
+                store.checkpoint_for_test("alice".to_owned()).unwrap();
+            }
+            let start = Instant::now();
+            assert_eq!(store.clear_prefix(NS, "link/").await.unwrap(), 128);
+            clear_us.push(start.elapsed().as_micros());
+            assert!(
+                store
+                    .list_keys_with_prefix(NS, "link/")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        println!("prefix_fresh_clear_{name}_128_rows_us={clear_us:?}");
+    }
+}

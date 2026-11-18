@@ -18,6 +18,13 @@ impl KvIdentityStore {
             .visit_entries_with_prefix(
                 "link/",
                 Box::new(move |namespace, key, value| {
+                    // Only the waiting caller and this callback own the result.
+                    // A dropped caller cannot consume further decoded rows.
+                    if Arc::strong_count(&selected) == 1 {
+                        return Err(StorageError::Internal(
+                            "identity link scan caller was dropped".to_owned(),
+                        ));
+                    }
                     if namespace != expected_namespace || !key.starts_with("link/") {
                         return Err(StorageError::Internal(
                             "identity link scan escaped its namespace or prefix".to_owned(),

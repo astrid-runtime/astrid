@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use super::{
-    ChildPointer, KvProjectionEngine, LeafEntry, Node, NodeHandle, ObjectId, StorageError,
-    StorageResult, TreeContext, TreeHeader, ValueSlot, decode_node, invalid,
+    ChildPointer, KvProjectionEngine, LeafEntry, Node, ObjectId, StorageError, StorageResult,
+    TreeContext, TreeHeader, ValueSlot, decode_node, invalid,
 };
 
 #[cfg(test)]
@@ -16,17 +16,48 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         root: Option<ObjectId>,
         start: &[u8],
         end: &[u8],
-        visit: impl FnMut(&Self, LeafEntry) -> StorageResult<()>,
+        mut visit: impl FnMut(&Self, LeafEntry) -> StorageResult<()>,
     ) -> StorageResult<()> {
-        self.walk_slots_in_range(root, start, end, Self::node, visit)
+        let Some(root) = root else {
+            return Ok(());
+        };
+        let mut stack = vec![root];
+        while let Some(object) = stack.pop() {
+            match self.node(object)?.node {
+                Node::Leaf(leaf) => {
+                    for entry in leaf.entries {
+                        if entry.key.as_slice() >= start && entry.key.as_slice() < end {
+                            visit(self, entry)?;
+                        }
+                    }
+                },
+                Node::Branch(branch) => {
+                    for (index, child) in branch.children.iter().enumerate().rev() {
+                        let upper = branch
+                            .children
+                            .get(index.saturating_add(1))
+                            .map(|next| next.lower_bound.as_slice());
+                        if upper.is_some_and(|upper| upper <= start)
+                            || child.lower_bound.as_slice() >= end
+                        {
+                            continue;
+                        }
+                        self.validate_pointer(child)?;
+                        stack.push(child.object);
+                    }
+                },
+            }
+        }
+        Ok(())
     }
 
-    fn walk_slots_in_range(
+    // A read walk releases each page after use; mutation enumeration above
+    // keeps its established memo for the subsequent edits in that transaction.
+    fn read_slots_in_range(
         &mut self,
         root: Option<ObjectId>,
         start: &[u8],
         end: &[u8],
-        mut load: impl FnMut(&mut Self, ObjectId) -> StorageResult<NodeHandle>,
         mut visit: impl FnMut(&Self, LeafEntry) -> StorageResult<()>,
     ) -> StorageResult<()> {
         let Some(root) = root else {
@@ -34,7 +65,7 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         };
         let mut stack: Vec<(ObjectId, Option<ChildPointer>)> = vec![(root, None)];
         while let Some((object, expected)) = stack.pop() {
-            let handle = load(self, object)?;
+            let handle = decode_node(object, &self.record(object)?)?;
             if expected.is_some_and(|expected| handle.pointer() != expected) {
                 return Err(invalid(object, "persistent KV child summary disagrees"));
             }
@@ -87,16 +118,10 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         strip: usize,
     ) -> StorageResult<Vec<String>> {
         let mut keys = BTreeMap::new();
-        self.walk_slots_in_range(
-            header.tree,
-            start,
-            end,
-            |context, object| decode_node(object, &context.record(object)?),
-            |_, entry| {
-                keys.insert(entry.key, true);
-                Ok(())
-            },
-        )?;
+        self.read_slots_in_range(header.tree, start, end, |_, entry| {
+            keys.insert(entry.key, true);
+            Ok(())
+        })?;
         for (key, value) in header.overlay.range(start, end) {
             keys.insert(key.to_vec(), value.is_some());
         }
@@ -138,14 +163,13 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         strip: usize,
         mut visit: impl FnMut(&str, &[u8]) -> StorageResult<()>,
     ) -> StorageResult<()> {
-        self.walk_slots_in_range(
+        self.read_slots_in_range(
             header.tree,
             start,
             end,
             // A read-only walk uses each decoded page once. Keep the existing
             // mutation-side memo policy for key collection, but do not retain
             // an entire checkpoint's decoded bodies as scan scratch.
-            |context, object| decode_node(object, &context.record(object)?),
             |context, entry| {
                 // Replacements and tombstones shadow checkpoint values before
                 // body reconstruction, just as in a point read.
