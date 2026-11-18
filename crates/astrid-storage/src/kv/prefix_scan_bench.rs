@@ -15,11 +15,13 @@ const QUERIES: usize = 128;
 #[tokio::test]
 #[ignore = "manual matched cold/warm sparse/all-result prefix profile"]
 async fn identity_prefix_query_measurement() {
-    for (name, checkpoint, all) in [
-        ("overlay-sparse", false, false),
-        ("overlay-all", false, true),
-        ("checkpoint-sparse", true, false),
-        ("checkpoint-all", true, true),
+    for (name, checkpoint, all, count) in [
+        ("empty", false, false, 0),
+        ("single", false, true, 1),
+        ("overlay-sparse", false, false, LINKS),
+        ("overlay-all", false, true, LINKS),
+        ("checkpoint-sparse", true, false, LINKS),
+        ("checkpoint-all", true, true, LINKS),
     ] {
         let engine = Arc::new(InMemoryEngine::new(TestIdentity));
         let backend = Arc::new(
@@ -28,7 +30,7 @@ async fn identity_prefix_query_measurement() {
         let writer = KvIdentityStore::new(ScopedKvStore::new(backend.clone(), NS).unwrap());
         let target = writer.create_user(Some("target")).await.unwrap();
         let other = writer.create_user(Some("other")).await.unwrap();
-        for index in 0..LINKS {
+        for index in 0..count {
             writer
                 .link(
                     "service",
@@ -63,7 +65,7 @@ async fn identity_prefix_query_measurement() {
             )
             .unwrap(),
         );
-        let expected = if all { LINKS } else { 1 };
+        let expected = if all { count } else { usize::from(count != 0) };
         let cold = Instant::now();
         assert_eq!(reader.list_links(target.id).await.unwrap().len(), expected);
         let cold_us = cold.elapsed().as_micros();
