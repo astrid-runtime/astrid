@@ -214,3 +214,64 @@ async fn tree_prefix_visit_keeps_one_snapshot_while_a_writer_commits() {
         Some(b"new root".to_vec())
     );
 }
+
+#[tokio::test]
+async fn checkpoint_prefix_clear_matches_canonical_batch_with_and_without_overlay() {
+    use super::{KvBatchMutation, KvEntryKey, KvMutationBatch};
+
+    for mode in ["none", "outside", "mixed"] {
+        let engines = [
+            Arc::new(InMemoryEngine::new(TestIdentity)),
+            Arc::new(InMemoryEngine::new(TestIdentity)),
+        ];
+        let stores = engines.each_ref().map(|engine| {
+            TreeKvStore::<String, TestIdentity, Resolver, _>::from_engine(engine.clone(), Resolver)
+        });
+        for store in &stores {
+            for key in ["link/a", "link/b", "link/z", "other/checkpoint"] {
+                store.set(NS, key, vec![0x51; 2048]).await.unwrap();
+            }
+            store.checkpoint_for_test("alice".to_owned()).unwrap();
+            if mode != "none" {
+                store
+                    .set(NS, "other/overlay", b"outside".to_vec())
+                    .await
+                    .unwrap();
+            }
+            if mode == "mixed" {
+                store.delete(NS, "link/b").await.unwrap();
+                store
+                    .set(NS, "link/a", b"replacement".to_vec())
+                    .await
+                    .unwrap();
+                store.set(NS, "link/c", Vec::new()).await.unwrap();
+            }
+        }
+        let owner = "alice".to_owned();
+        assert_eq!(engines[0].root(&owner), engines[1].root(&owner));
+        let keys = stores[1].list_keys_with_prefix(NS, "link/").await.unwrap();
+        let batch = KvMutationBatch::new(
+            [],
+            keys.iter().map(|key| KvBatchMutation::Delete {
+                key: KvEntryKey::new(NS, key).unwrap(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            stores[0].clear_prefix(NS, "link/").await.unwrap(),
+            keys.len() as u64
+        );
+        assert!(stores[1].apply_batch(&batch).await.unwrap().applied);
+        // Identical canonical roots cover accounting, ordering and untouched
+        // checkpoint/overlay data, not only the visible removed key count.
+        assert_eq!(engines[0].root(&owner), engines[1].root(&owner), "{mode}");
+        assert!(
+            stores[0]
+                .list_keys_with_prefix(NS, "link/")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(stores[0].clear_prefix(NS, "link/").await.unwrap(), 0);
+    }
+}
