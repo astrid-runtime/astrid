@@ -10,11 +10,30 @@ use crate::{KvStore, MemoryKvStore, StorageError, StorageResult};
 struct FailingSetKv {
     inner: MemoryKvStore,
     reject_sets: AtomicBool,
+    reject_conditional_deletes: AtomicBool,
     reject_prefix_reads: AtomicBool,
     link_gets: AtomicUsize,
     prefix_reads: AtomicUsize,
     relink_after_scan: std::sync::Mutex<Option<(String, Vec<u8>)>>,
+    reassign_before_delete: std::sync::Mutex<Option<(String, Vec<u8>)>>,
     scan_override: std::sync::Mutex<Option<Vec<crate::kv::KvEntry>>>,
+}
+
+impl FailingSetKv {
+    async fn reassign_at_delete_boundary(&self, namespace: &str, key: &str) -> StorageResult<()> {
+        let replacement = {
+            let mut pending = self.reassign_before_delete.lock().unwrap();
+            if pending.as_ref().is_some_and(|(target, _)| target == key) {
+                pending.take().map(|(_, value)| value)
+            } else {
+                None
+            }
+        };
+        if let Some(value) = replacement {
+            self.inner.set(namespace, key, value).await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -59,7 +78,25 @@ impl KvStore for FailingSetKv {
     }
 
     async fn delete(&self, namespace: &str, key: &str) -> StorageResult<bool> {
+        self.reassign_at_delete_boundary(namespace, key).await?;
         self.inner.delete(namespace, key).await
+    }
+
+    async fn compare_and_delete(
+        &self,
+        namespace: &str,
+        key: &str,
+        expected: Vec<u8>,
+    ) -> StorageResult<bool> {
+        if self.reject_conditional_deletes.load(Ordering::SeqCst) {
+            return Err(StorageError::Internal(
+                "injected conditional delete failure".to_owned(),
+            ));
+        }
+        self.reassign_at_delete_boundary(namespace, key).await?;
+        self.inner
+            .compare_and_delete(namespace, key, expected)
+            .await
     }
 
     async fn exists(&self, namespace: &str, key: &str) -> StorageResult<bool> {
@@ -262,4 +299,117 @@ async fn failed_identity_persistence_restores_the_exact_directory_state() {
     );
     assert_eq!(principals.uid_for(&original).unwrap(), identity.uid);
     assert!(principals.uid_for(&renamed).is_err());
+}
+
+#[tokio::test]
+async fn deletion_keeps_link_reassigned_after_its_final_ownership_read() {
+    let backend = Arc::new(FailingSetKv::default());
+    let store =
+        KvIdentityStore::new(ScopedKvStore::new(backend.clone(), "system:identity").unwrap());
+    let target = store.create_user(Some("target")).await.unwrap();
+    let other = store.create_user(Some("other")).await.unwrap();
+    let mut link = store
+        .link("service", "target", target.id, "operator")
+        .await
+        .unwrap();
+    link.astrid_user_id = other.id;
+    *backend.reassign_before_delete.lock().unwrap() = Some((
+        KvIdentityStore::link_key("service", "target"),
+        serde_json::to_vec(&link).unwrap(),
+    ));
+
+    assert!(store.delete_user(target.id).await.unwrap());
+    assert_eq!(
+        store
+            .resolve("service", "target")
+            .await
+            .unwrap()
+            .map(|user| user.id),
+        Some(other.id),
+        "cleanup deleted a link after another user acquired it"
+    );
+    assert!(store.get_user(target.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn deletion_keeps_name_reassigned_after_its_final_ownership_read() {
+    let backend = Arc::new(FailingSetKv::default());
+    let store =
+        KvIdentityStore::new(ScopedKvStore::new(backend.clone(), "system:identity").unwrap());
+    let target = store.create_user(Some("target")).await.unwrap();
+    let other = store.create_user(Some("other")).await.unwrap();
+    *backend.reassign_before_delete.lock().unwrap() = Some((
+        KvIdentityStore::name_key("target"),
+        other.id.to_string().into_bytes(),
+    ));
+
+    assert!(store.delete_user(target.id).await.unwrap());
+    assert_eq!(
+        store
+            .get_user_by_name("target")
+            .await
+            .unwrap()
+            .map(|user| user.id),
+        Some(other.id),
+        "cleanup deleted a name index after another user acquired it"
+    );
+    assert!(store.get_user(target.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn deletion_rechecks_same_owner_refresh_and_accepts_legacy_json_bytes() {
+    let backend = Arc::new(FailingSetKv::default());
+    let store =
+        KvIdentityStore::new(ScopedKvStore::new(backend.clone(), "system:identity").unwrap());
+    let target = store.create_user(Some("target")).await.unwrap();
+    let link = store
+        .link("service", "target", target.id, "operator")
+        .await
+        .unwrap();
+    let key = KvIdentityStore::link_key("service", "target");
+    let mut value = serde_json::to_value(&link).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("legacy_extension".to_owned(), serde_json::json!(true));
+    *backend.reassign_before_delete.lock().unwrap() =
+        Some((key.clone(), serde_json::to_vec_pretty(&value).unwrap()));
+    assert!(store.delete_user(target.id).await.unwrap());
+    assert!(
+        backend
+            .inner
+            .get("system:identity", &key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.get_user(target.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn failed_conditional_cleanup_preserves_the_user_name_and_link() {
+    let backend = Arc::new(FailingSetKv::default());
+    let store =
+        KvIdentityStore::new(ScopedKvStore::new(backend.clone(), "system:identity").unwrap());
+    let target = store.create_user(Some("target")).await.unwrap();
+    store
+        .link("service", "target", target.id, "operator")
+        .await
+        .unwrap();
+    backend
+        .reject_conditional_deletes
+        .store(true, Ordering::SeqCst);
+    assert!(store.delete_user(target.id).await.is_err());
+    assert_eq!(
+        store.get_user(target.id).await.unwrap(),
+        Some(target.clone())
+    );
+    assert_eq!(
+        store.get_user_by_name("target").await.unwrap(),
+        Some(target.clone())
+    );
+    assert_eq!(
+        store.resolve("service", "target").await.unwrap(),
+        Some(target)
+    );
 }

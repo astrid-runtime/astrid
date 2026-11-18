@@ -120,6 +120,35 @@ where
         .await
     }
 
+    async fn compare_and_delete(
+        &self,
+        namespace: &str,
+        key: &str,
+        expected: Vec<u8>,
+    ) -> StorageResult<bool> {
+        validate_namespace(namespace)?;
+        validate_key(key)?;
+        let owner = self.resolver.resolve(namespace)?;
+        let composite = composite_key(namespace, key);
+        let blocking = self.blocking_store();
+        run_blocking(move || {
+            // Root conflicts re-evaluate this predicate on the new projection.
+            // A replacement committed after the observation must survive.
+            blocking.mutate(&owner, |context, header| {
+                let previous = context.projected_get(header, &composite)?;
+                if previous.as_deref() != Some(expected.as_slice()) {
+                    return Ok((false, Vec::new(), false));
+                }
+                Ok((
+                    true,
+                    vec![Replacement::observed(composite.clone(), previous, None)],
+                    true,
+                ))
+            })
+        })
+        .await
+    }
+
     async fn exists(&self, namespace: &str, key: &str) -> StorageResult<bool> {
         Ok(self.get(namespace, key).await?.is_some())
     }

@@ -28,6 +28,12 @@ use crate::error::{StorageError, StorageResult};
 mod batch;
 #[cfg(test)]
 mod batch_tests;
+#[cfg(test)]
+mod conditional_conflict_tests;
+#[cfg(test)]
+mod conditional_delete_tests;
+#[cfg(test)]
+mod identity_delete_bench;
 mod memory;
 mod principal;
 mod scoped;
@@ -288,6 +294,34 @@ pub trait KvStore: Send + Sync {
         expected: Option<&[u8]>,
         new: Vec<u8>,
     ) -> StorageResult<bool>;
+
+    /// Delete an existing key only if its value still equals `expected`.
+    ///
+    /// Comparison and removal must be atomic against every mutation through
+    /// this backend, including unconditional writes. Missing or changed values
+    /// return `Ok(false)`. Ownership of the observed bytes avoids copying them
+    /// into a blocking backend task.
+    ///
+    /// The compatibility implementation uses the existing bounded atomic-batch
+    /// contract. Backends without that capability fail closed; an independent
+    /// read followed by unconditional deletion is not a valid implementation.
+    /// Native implementations support their full admitted value range directly.
+    async fn compare_and_delete(
+        &self,
+        namespace: &str,
+        key: &str,
+        expected: Vec<u8>,
+    ) -> StorageResult<bool> {
+        let key = KvEntryKey::new(namespace, key)?;
+        let batch = KvMutationBatch::new(
+            [KvBatchCondition::ValueEquals {
+                key: key.clone(),
+                expected: Some(expected),
+            }],
+            [KvBatchMutation::Delete { key }],
+        )?;
+        Ok(self.apply_batch(&batch).await?.applied)
+    }
 
     /// Atomically evaluate all conditions and apply all mutations in one
     /// backend transaction.
