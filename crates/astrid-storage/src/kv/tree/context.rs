@@ -43,6 +43,7 @@ enum PreviousValue {
 }
 
 impl Replacement {
+    #[cfg(any(test, all(feature = "legacy-surrealkv", not(target_family = "wasm"))))]
     pub(super) fn new(key: Vec<u8>, value: Option<Vec<u8>>) -> Self {
         Self {
             key,
