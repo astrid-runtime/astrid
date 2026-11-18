@@ -26,6 +26,7 @@ use astrid_core::principal::PrincipalId;
 use crate::PrincipalDirectory;
 use crate::kv::ScopedKvStore;
 
+mod deletion;
 mod links;
 mod persistence;
 use persistence::PersistedUser;
@@ -484,56 +485,7 @@ impl IdentityStore for KvIdentityStore {
     }
 
     async fn delete_user(&self, id: Uuid) -> Result<bool, IdentityError> {
-        let Some(record) = self.load_user_record(id).await? else {
-            return Ok(false);
-        };
-        let user = record.user;
-
-        // A scan candidate may be stale. Re-read selected links before
-        // deletion; matching and deletion remain separate backend operations.
-        for (key, _) in self.scan_user_links(id).await? {
-            if let Some(link) = self
-                .kv
-                .get_json::<FrontendLink>(&key)
-                .await
-                .map_err(|e| IdentityError::Storage(e.to_string()))?
-                && link.astrid_user_id == id
-            {
-                self.kv
-                    .delete(&key)
-                    .await
-                    .map_err(|e| IdentityError::Storage(e.to_string()))?;
-            }
-        }
-
-        // Drop the name index entry, but only if it still points at this
-        // UUID — `get_user_by_name` is best-effort and two users can
-        // share a display name if created in sequence.
-        if let Some(name) = user.display_name.as_deref() {
-            let key = Self::name_key(name.trim());
-            if let Some(bytes) = self
-                .kv
-                .get(&key)
-                .await
-                .map_err(|e| IdentityError::Storage(e.to_string()))?
-                && String::from_utf8(bytes).ok().as_deref() == Some(id.to_string().as_str())
-            {
-                self.kv
-                    .delete(&key)
-                    .await
-                    .map_err(|e| IdentityError::Storage(e.to_string()))?;
-            }
-        }
-
-        // Finally drop the user record itself.
-        self.kv
-            .delete(&Self::user_key(id))
-            .await
-            .map_err(|e| IdentityError::Storage(e.to_string()))?;
-        if let (Some(directory), Some(identity)) = (&self.principals, record.principal_identity) {
-            directory.unregister(&user.principal, identity.uid);
-        }
-        Ok(true)
+        self.delete_user_records(id).await
     }
 
     async fn list_users(&self) -> Result<Vec<AstridUserId>, IdentityError> {

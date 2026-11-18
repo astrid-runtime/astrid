@@ -175,6 +175,19 @@ impl ScopedKvStore {
             .await
     }
 
+    /// Atomically delete a key only while its bytes equal the observation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid keys, unsupported atomic operations, or
+    /// backend I/O/validation failure. A changed or missing value returns false.
+    pub async fn compare_and_delete(&self, key: &str, expected: Vec<u8>) -> StorageResult<bool> {
+        validate_key(key)?;
+        self.inner
+            .compare_and_delete(&self.namespace, key, expected)
+            .await
+    }
+
     // -- Prefix operations --
 
     /// List all keys matching a given prefix within this namespace.

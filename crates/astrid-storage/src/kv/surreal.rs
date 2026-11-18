@@ -1,10 +1,9 @@
 //! Persistent `KvStore` backed by `SurrealKV`.
 //!
-//! All operations use `SurrealKV` transactions. The store is MVCC, so
-//! `compare_and_swap` runs as a single read-then-conditional-write
-//! transaction: a concurrent commit that mutates the same key
-//! invalidates the comparison and the swap returns `Ok(false)` rather
-//! than overwriting a value the caller didn't expect.
+//! Transactions validate write conflicts through the pinned `SurrealKV` 1.2
+//! commit oracle, including in-flight writes. Conditional read/write/remove
+//! operations therefore use the same transaction as unconditional mutations,
+//! without a second backend lock.
 
 use async_trait::async_trait;
 use surrealkv::LSMIterator;
@@ -30,20 +29,6 @@ use crate::error::{StorageError, StorageResult};
 /// ```
 pub struct SurrealKvStore {
     tree: surrealkv::Tree,
-    /// Serializes `compare_and_swap` calls.
-    ///
-    /// `SurrealKV`'s `Transaction::validate_write_conflicts` reads the
-    /// memtable *before* `Core::commit` acquires its write mutex.
-    /// Concurrent CAS calls on the same key can therefore both pass
-    /// validation (memtable still empty) before either commit writes,
-    /// and both succeed — which violates the CAS contract.
-    ///
-    /// We close that TOCTOU window with a backend-level mutex held
-    /// across read+conditional-write+commit. CAS is a rare operation
-    /// (no current capsule hot-loops on it), so a single global lock
-    /// is acceptable; if contention becomes a problem we can shard
-    /// by key prefix without changing the API.
-    cas_lock: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for SurrealKvStore {
@@ -68,10 +53,7 @@ impl SurrealKvStore {
             .with_path(path.as_ref().to_path_buf())
             .build()
             .map_err(|e| StorageError::Connection(e.to_string()))?;
-        Ok(Self {
-            tree,
-            cas_lock: tokio::sync::Mutex::new(()),
-        })
+        Ok(Self { tree })
     }
 
     /// Open a persistent KV store with custom options.
@@ -86,10 +68,7 @@ impl SurrealKvStore {
         let tree = surrealkv::TreeBuilder::with_options(opts)
             .build()
             .map_err(|e| StorageError::Connection(e.to_string()))?;
-        Ok(Self {
-            tree,
-            cas_lock: tokio::sync::Mutex::new(()),
-        })
+        Ok(Self { tree })
     }
 
     /// Close the store, flushing any pending writes.
@@ -227,6 +206,32 @@ impl KvStore for SurrealKvStore {
         Ok(existed)
     }
 
+    async fn compare_and_delete(
+        &self,
+        namespace: &str,
+        key: &str,
+        expected: Vec<u8>,
+    ) -> StorageResult<bool> {
+        validate_namespace(namespace)?;
+        validate_key(key)?;
+        let ck = composite_key(namespace, key);
+        loop {
+            let mut tx = self.tree.begin().map_err(|ref error| map_kv_err(error))?;
+            let current = tx.get(&ck).map_err(|ref error| map_kv_err(error))?;
+            if current.as_deref() != Some(expected.as_slice()) {
+                return Ok(false);
+            }
+            tx.delete(&ck).map_err(|ref error| map_kv_err(error))?;
+            match tx.commit().await {
+                Ok(()) => return Ok(true),
+                // Re-read after a speculative conflict, just like the native
+                // root-CAS adapter. A same-value refresh still matches.
+                Err(error) if is_transaction_conflict(&error) => {},
+                Err(error) => return Err(map_kv_err(&error)),
+            }
+        }
+    }
+
     async fn exists(&self, namespace: &str, key: &str) -> StorageResult<bool> {
         validate_namespace(namespace)?;
         validate_key(key)?;
@@ -338,11 +343,6 @@ impl KvStore for SurrealKvStore {
         validate_key(key)?;
         let ck = composite_key(namespace, key);
 
-        // Serialize CAS across the whole store. See `cas_lock`'s
-        // docstring for why surrealkv's transaction conflict
-        // detection alone isn't sufficient.
-        let _guard = self.cas_lock.lock().await;
-
         let mut tx = self.tree.begin().map_err(|ref e| map_kv_err(e))?;
         let current = tx.get(&ck).map_err(|ref e| map_kv_err(e))?;
         if current.as_deref() != expected {
@@ -352,9 +352,8 @@ impl KvStore for SurrealKvStore {
         match tx.commit().await {
             Ok(()) => Ok(true),
             Err(e) if is_transaction_conflict(&e) => {
-                // Defensive: even with the global lock, surrealkv may
-                // surface conflicts from background flush activity
-                // racing the commit. Treat that as "stale expected".
+                // The commit oracle found a concurrent same-key write.
+                // Preserve CAS's existing false-on-conflict contract.
                 Ok(false)
             },
             Err(e) => Err(map_kv_err(&e)),
@@ -422,6 +421,9 @@ impl KvStore for SurrealKvStore {
         Ok(count)
     }
 }
+
+#[cfg(test)]
+mod conditional_tests;
 
 #[cfg(test)]
 mod tests {

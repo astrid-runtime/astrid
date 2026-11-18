@@ -234,6 +234,24 @@ where
         })
     }
 
+    async fn compare_and_delete(
+        &self,
+        namespace: &str,
+        key: &str,
+        expected: Vec<u8>,
+    ) -> StorageResult<bool> {
+        validate_namespace(namespace)?;
+        validate_key(key)?;
+        let principal = self.resolver.resolve(namespace)?;
+        self.update(&principal, |state| {
+            if state.get(namespace, key) != Some(expected.as_slice()) {
+                return Ok((false, false));
+            }
+            let removed = state.delete(namespace, key).is_some();
+            Ok((removed, removed))
+        })
+    }
+
     async fn exists(&self, namespace: &str, key: &str) -> StorageResult<bool> {
         validate_namespace(namespace)?;
         validate_key(key)?;

@@ -69,6 +69,27 @@ impl KvStore for MemoryKvStore {
         Ok(data.remove(&Self::full_key(namespace, key)).is_some())
     }
 
+    async fn compare_and_delete(
+        &self,
+        namespace: &str,
+        key: &str,
+        expected: Vec<u8>,
+    ) -> StorageResult<bool> {
+        validate_namespace(namespace)?;
+        validate_key(key)?;
+        let mut data = self
+            .data
+            .write()
+            .map_err(|error| StorageError::Internal(error.to_string()))?;
+        match data.entry(Self::full_key(namespace, key)) {
+            std::collections::hash_map::Entry::Occupied(entry) if entry.get() == &expected => {
+                entry.remove();
+                Ok(true)
+            },
+            _ => Ok(false),
+        }
+    }
+
     async fn exists(&self, namespace: &str, key: &str) -> StorageResult<bool> {
         validate_namespace(namespace)?;
         validate_key(key)?;
