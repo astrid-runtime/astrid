@@ -1,6 +1,6 @@
-//! Cancellation must stop parsing a native scan once its caller is gone.
+//! Native prefix reads preserve cancellation and value-validation boundaries.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -19,6 +19,18 @@ struct PausingReader {
     inner: InMemoryEngine<String, TestIdentity>,
     pause: Mutex<Option<Pause>>,
     value_reads: AtomicUsize,
+    reject_values: AtomicBool,
+}
+
+impl PausingReader {
+    fn new() -> Self {
+        Self {
+            inner: InMemoryEngine::new(TestIdentity),
+            pause: Mutex::new(None),
+            value_reads: AtomicUsize::new(0),
+            reject_values: AtomicBool::new(false),
+        }
+    }
 }
 
 impl KvProjectionEngine<String> for PausingReader {
@@ -39,6 +51,9 @@ impl KvProjectionEngine<String> for PausingReader {
             record.kind() == ObjectKind::KvLeaf && record.class() == ObjectClass::Data
         }) {
             self.value_reads.fetch_add(1, Ordering::Relaxed);
+            if self.reject_values.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
         }
         Ok(record)
     }
@@ -61,11 +76,7 @@ impl KvProjectionEngine<String> for PausingReader {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn canceled_identity_prefix_scan_stops_reading_values() {
-    let engine = Arc::new(PausingReader {
-        inner: InMemoryEngine::new(TestIdentity),
-        pause: Mutex::new(None),
-        value_reads: AtomicUsize::new(0),
-    });
+    let engine = Arc::new(PausingReader::new());
     let backend = Arc::new(
         TreeKvStore::<String, TestIdentity, Resolver, _>::from_engine(engine.clone(), Resolver),
     );
@@ -112,4 +123,66 @@ async fn canceled_identity_prefix_scan_stops_reading_values() {
         engine.value_reads.load(Ordering::Relaxed) <= 1,
         "canceled scan kept reconstructing unrelated values"
     );
+}
+
+#[tokio::test]
+async fn checkpoint_clear_validates_live_bodies_and_skips_shadowed_bodies() {
+    let namespace = "alice:capsule:identity";
+    let owner = "alice".to_owned();
+    for shadowed in [false, true] {
+        let engine = Arc::new(PausingReader::new());
+        let store =
+            TreeKvStore::<String, TestIdentity, Resolver, _>::from_engine(engine.clone(), Resolver);
+        for (key, value) in [
+            ("link/a", Vec::new()),
+            ("link/b", vec![0x51; 2048]),
+            ("link/c", vec![0x52; 512 * 1024]),
+        ] {
+            store.set(namespace, key, value).await.unwrap();
+        }
+        store.checkpoint_for_test(owner.clone()).unwrap();
+        store
+            .set(namespace, "other/overlay", b"outside".to_vec())
+            .await
+            .unwrap();
+        if shadowed {
+            store
+                .set(namespace, "link/b", b"replacement".to_vec())
+                .await
+                .unwrap();
+            store.delete(namespace, "link/c").await.unwrap();
+        }
+        // Settle header validation before making old value bodies unavailable.
+        store
+            .list_keys_with_prefix(namespace, "link/")
+            .await
+            .unwrap();
+        let before = engine.inner.root(&owner);
+        engine.value_reads.store(0, Ordering::Relaxed);
+        engine.reject_values.store(true, Ordering::Relaxed);
+        let result = store.clear_prefix(namespace, "link/").await;
+        if shadowed {
+            assert_eq!(result.unwrap(), 2);
+            assert_eq!(engine.value_reads.load(Ordering::Relaxed), 0);
+        } else {
+            assert!(
+                result.is_err(),
+                "clear skipped a live value's existing validation"
+            );
+            assert_eq!(
+                engine.inner.root(&owner),
+                before,
+                "failed clear published partial mutations"
+            );
+            assert_eq!(engine.value_reads.load(Ordering::Relaxed), 1);
+            engine.reject_values.store(false, Ordering::Relaxed);
+            engine.value_reads.store(0, Ordering::Relaxed);
+            assert_eq!(store.clear_prefix(namespace, "link/").await.unwrap(), 3);
+            assert_eq!(engine.value_reads.load(Ordering::Relaxed), 2);
+        }
+        assert_eq!(
+            store.get(namespace, "other/overlay").await.unwrap(),
+            Some(b"outside".to_vec())
+        );
+    }
 }

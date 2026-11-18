@@ -406,32 +406,7 @@ where
 
     fn clear_range(&self, owner: &P, start: &[u8], end: &[u8]) -> StorageResult<u64> {
         self.mutate(owner, |context, header| {
-            let mut keys = context.raw_keys_in_range(header.tree, start, end)?;
-            let mut overlay = header.overlay.range(start, end).peekable();
-            let mutations: Vec<_> = if overlay.peek().is_none() {
-                // With no changes in this range, a second tree collection is
-                // redundant. Preserve the set's ordering and deduplication.
-                keys.sort_unstable();
-                keys.dedup();
-                keys.into_iter()
-                    .map(|key| Replacement::new(key, None))
-                    .collect()
-            } else {
-                let mut keys = keys.into_iter().collect::<BTreeSet<_>>();
-                for (key, value) in overlay {
-                    match value {
-                        Some(_) => {
-                            keys.insert(key.to_vec());
-                        },
-                        None => {
-                            keys.remove(key);
-                        },
-                    }
-                }
-                keys.into_iter()
-                    .map(|key| Replacement::new(key, None))
-                    .collect()
-            };
+            let mutations = context.projected_deletions_in_range(header, start, end)?;
             let count = u64::try_from(mutations.len())
                 .map_err(|_| StorageError::Internal("KV key count overflow".to_owned()))?;
             Ok((count, mutations, count != 0))

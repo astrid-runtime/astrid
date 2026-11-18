@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use super::{
-    ChildPointer, KvProjectionEngine, LeafEntry, Node, ObjectId, StorageError, StorageResult,
-    TreeContext, TreeHeader, ValueSlot, decode_node, invalid,
+    ChildPointer, KvProjectionEngine, LeafEntry, Node, ObjectId, PreviousValue, Replacement,
+    StorageError, StorageResult, TreeContext, TreeHeader, ValueSlot, decode_node, invalid,
 };
 
 #[cfg(test)]
@@ -96,18 +96,50 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         Ok(())
     }
 
-    pub(in crate::kv::tree) fn raw_keys_in_range(
+    pub(in crate::kv::tree) fn projected_deletions_in_range(
         &mut self,
-        root: Option<ObjectId>,
+        header: &TreeHeader<P>,
         start: &[u8],
         end: &[u8],
-    ) -> StorageResult<Vec<Vec<u8>>> {
-        let mut keys = Vec::new();
-        self.visit_slots_in_range(root, start, end, |_, entry| {
-            keys.push(entry.key);
+    ) -> StorageResult<Vec<Replacement>> {
+        let mut observed = BTreeMap::new();
+        self.visit_slots_in_range(header.tree, start, end, |context, entry| {
+            if header.overlay.get(&entry.key).is_none() {
+                // Preserve the existing body validation before deletion, but
+                // reuse this authenticated slot instead of looking it up again.
+                let value = match header.boundary {
+                    Some(certificate) => {
+                        context.read_certified_tree_slot(header, &entry.value, certificate)?
+                    },
+                    None => context.value_bytes(&entry.value)?,
+                };
+                let previous_len = Some(value.len());
+                drop(value);
+                observed.insert(
+                    entry.key,
+                    PreviousValue::Loaded {
+                        previous_len,
+                        unchanged: false,
+                    },
+                );
+            }
             Ok(())
         })?;
-        Ok(keys)
+        for (key, value) in header.overlay.range(start, end) {
+            if value.is_some() {
+                // apply_mutations reads the current overlay before consulting
+                // this hint, retaining its established live-value accounting.
+                observed.insert(key.to_vec(), PreviousValue::Unread);
+            }
+        }
+        Ok(observed
+            .into_iter()
+            .map(|(key, previous)| Replacement {
+                key,
+                previous,
+                value: None,
+            })
+            .collect())
     }
 
     pub(in crate::kv::tree) fn projected_keys_in_range(

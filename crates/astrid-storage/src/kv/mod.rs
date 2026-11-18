@@ -36,7 +36,7 @@ mod conditional_delete_tests;
 mod identity_delete_bench;
 mod memory;
 #[cfg(test)]
-mod prefix_cancellation_tests;
+mod prefix_read_tests;
 #[cfg(test)]
 mod prefix_scan_bench;
 #[cfg(test)]
