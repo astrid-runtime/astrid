@@ -19,6 +19,7 @@ pub(super) fn spawn_ephemeral_startup_fallback(
             .ephemeral_startup_pending
             .store(false, Ordering::Release);
         kernel.request_ephemeral_shutdown_if_idle();
+        tracing::debug!("Ephemeral startup handoff completed");
     })
 }
 

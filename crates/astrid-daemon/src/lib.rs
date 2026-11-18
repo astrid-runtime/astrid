@@ -34,7 +34,10 @@ enum StoreShutdown {
 /// successful retirement. Failed boots retain their recovery evidence.
 pub fn run_to_completion() -> Result<()> {
     // Help/version must not acquire ownership of a running installation.
-    let args = Args::parse();
+    run_to_completion_with_args(Args::parse())
+}
+
+fn run_to_completion_with_args(args: Args) -> Result<()> {
     if args.setup_sandbox_probe {
         anyhow::ensure!(
             astrid_workspace::sandbox::probe_native_process_sandbox(),
@@ -235,9 +238,14 @@ fn claim_daemon_listener(
     if ephemeral {
         kernel.begin_ephemeral_startup();
     }
-    kernel
+    let listener = kernel
         .claim_native_uplink_listener()
-        .ok_or_else(|| anyhow::anyhow!("native local uplink listener is unavailable"))
+        .ok_or_else(|| anyhow::anyhow!("native local uplink listener is unavailable"))?;
+    tracing::debug!(
+        ephemeral = kernel.ephemeral.load(std::sync::atomic::Ordering::Relaxed),
+        "Daemon claimed native listener"
+    );
+    Ok(listener)
 }
 
 #[cfg(unix)]
@@ -640,9 +648,11 @@ fn spawn_gateway(
 
 #[cfg(all(test, unix))]
 mod tests {
+    mod startup;
+
     use super::{
-        DAEMON_LOG_TARGET_ENV, claim_daemon_listener, daemon_log_config,
-        defer_file_logging_until_kernel_admission, write_readiness_then_arm_ephemeral,
+        DAEMON_LOG_TARGET_ENV, daemon_log_config, defer_file_logging_until_kernel_admission,
+        write_readiness_then_arm_ephemeral,
     };
     use std::sync::Mutex;
 
@@ -729,53 +739,6 @@ mod tests {
             !root.exists(),
             "logging selection must not create content before kernel admission"
         );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ephemeral_daemon_protects_disconnect_at_listener_handoff() -> anyhow::Result<()> {
-        const CHILD: &str = "ASTRID_TEST_LISTENER_HANDOFF_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            // Kernel boot resolves its home and run directory from the process environment.
-            let temp = tempfile::tempdir()?;
-            let output = std::process::Command::new(std::env::current_exe()?)
-                .arg("--exact")
-                .arg("tests::ephemeral_daemon_protects_disconnect_at_listener_handoff")
-                .current_dir(temp.path())
-                .env(CHILD, "1")
-                .env("HOME", temp.path())
-                .env("ASTRID_HOME", temp.path().join("astrid"))
-                .env("XDG_CONFIG_HOME", temp.path().join("config"))
-                .env_remove("ASTRID_RUN_DIR")
-                .env_remove("ASTRID_CONFIG")
-                .output()?;
-            assert!(
-                output.status.success() && temp.path().join("astrid").is_dir(),
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-            return Ok(());
-        }
-
-        let kernel = astrid_kernel::Kernel::new(
-            astrid_core::SessionId::SYSTEM,
-            std::env::current_dir()?,
-            astrid_capsule::CapsuleRuntimeLimits::default(),
-            std::collections::HashMap::new(),
-            astrid_capsule::HttpLimits::default(),
-        )
-        .await?;
-
-        let _listener = claim_daemon_listener(&kernel, true)?;
-        assert!(kernel.ephemeral.load(std::sync::atomic::Ordering::Relaxed));
-        let principal = astrid_core::PrincipalId::default();
-        kernel.connection_opened(&principal);
-        kernel.connection_closed(&principal);
-        assert!(
-            !*kernel.shutdown_tx.borrow(),
-            "early disconnect requested shutdown"
-        );
-        Ok(())
     }
 
     #[test]
