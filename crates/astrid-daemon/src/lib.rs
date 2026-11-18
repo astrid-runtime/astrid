@@ -238,9 +238,14 @@ fn claim_daemon_listener(
     if ephemeral {
         kernel.begin_ephemeral_startup();
     }
-    kernel
+    let listener = kernel
         .claim_native_uplink_listener()
-        .ok_or_else(|| anyhow::anyhow!("native local uplink listener is unavailable"))
+        .ok_or_else(|| anyhow::anyhow!("native local uplink listener is unavailable"))?;
+    tracing::debug!(
+        ephemeral = kernel.ephemeral.load(std::sync::atomic::Ordering::Relaxed),
+        "Daemon claimed native listener"
+    );
+    Ok(listener)
 }
 
 #[cfg(unix)]

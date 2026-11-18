@@ -1,6 +1,6 @@
 //! Exercise the production boot ordering through real signed local clients.
 
-use super::super::{Args, run_to_completion_with_args};
+use super::super::{Args, claim_daemon_listener, run_to_completion_with_args};
 use anyhow::{Context, Result, ensure};
 use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
@@ -25,7 +25,9 @@ struct BootObservation {
     entered: Notify,
     disconnected: Notify,
     ready: Notify,
+    handoff_completed: Notify,
     shutdown_requested: AtomicBool,
+    listener_ephemeral: AtomicBool,
     released: Mutex<bool>,
     release: Condvar,
 }
@@ -67,44 +69,63 @@ impl Drop for ReleaseBoot {
 struct BootObserver(Arc<BootObservation>);
 
 #[derive(Default)]
-struct Message(String);
+struct EventFields {
+    message: String,
+    ephemeral: Option<bool>,
+}
 
-impl Visit for Message {
+impl Visit for EventFields {
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        if field.name() == "ephemeral" {
+            self.ephemeral = Some(value);
+        }
+    }
+
     fn record_str(&mut self, field: &Field, value: &str) {
         if field.name() == "message" {
-            value.clone_into(&mut self.0);
+            value.clone_into(&mut self.message);
         }
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
-            self.0 = format!("{value:?}");
+            self.message = format!("{value:?}");
         }
     }
 }
 
 impl<S: tracing::Subscriber> Layer<S> for BootObserver {
     fn on_event(&self, event: &tracing::Event<'_>, _: TraceContext<'_, S>) {
-        let mut message = Message::default();
-        event.record(&mut message);
+        let mut fields = EventFields::default();
+        event.record(&mut fields);
         match event.metadata().target() {
-            "astrid_kernel" if message.0.starts_with("Agent chat is not configured") => {
+            "astrid_daemon" if fields.message == "Daemon claimed native listener" => {
+                self.0
+                    .listener_ephemeral
+                    .store(fields.ephemeral == Some(true), Ordering::Release);
+            },
+            "astrid_kernel" if fields.message.starts_with("Agent chat is not configured") => {
                 // This existing diagnostic runs after native accept is spawned,
                 // before Ready. The boot thread holds a shared registry read;
                 // GetStatus can take another read, and the fresh empty fixture
                 // has no capsule writers. The runtime still serves clients.
                 self.0.pause();
             },
-            "astrid_uplink::native" if message.0 == "local client disconnected" => {
+            "astrid_uplink::native" if fields.message == "local client disconnected" => {
                 // Emitted after the real lifecycle publication has closed its
                 // counted lease. No test-side connection bookkeeping is used.
                 self.0.disconnected.notify_one();
             },
-            "astrid_daemon" if message.0 == "Kernel booted successfully" => {
+            "astrid_kernel::ephemeral_startup"
+                if fields.message == "Ephemeral startup handoff completed" =>
+            {
+                self.0.handoff_completed.notify_one();
+            },
+            "astrid_daemon" if fields.message == "Kernel booted successfully" => {
                 self.0.ready.notify_one();
             },
             "astrid_kernel"
-                if message.0 == "Last client disconnected, shutting down ephemeral kernel" =>
+                if fields.message == "Last client disconnected, shutting down ephemeral kernel" =>
             {
                 self.0.shutdown_requested.store(true, Ordering::Release);
             },
@@ -151,6 +172,10 @@ async fn socket_handoff(observation: Arc<BootObservation>) -> Result<()> {
         !home.ready_path().exists(),
         "Ready preceded the boot barrier"
     );
+    ensure!(
+        observation.listener_ephemeral.load(Ordering::Acquire),
+        "production listener handoff did not enable ephemeral mode"
+    );
 
     let preflight = status_client().await?;
     ensure!(
@@ -181,9 +206,18 @@ async fn socket_handoff(observation: Arc<BootObservation>) -> Result<()> {
     let mut host = status_client()
         .await
         .context("lasting host could not attach")?;
-    // Keep a real host beyond the existing five-second startup grace. This is
-    // a lifecycle assertion, not a startup-performance benchmark or a new limit.
-    tokio::time::sleep(Duration::from_millis(5100)).await;
+    // Observe completion of the real fallback task while the host is counted.
+    // Elapsed wall time cannot prove that the task was actually polled.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        observation.handoff_completed.notified(),
+    )
+    .await
+    .context("startup handoff did not complete with the host connected")?;
+    ensure!(
+        !observation.shutdown_requested.load(Ordering::Acquire),
+        "startup fallback requested shutdown with a connected host"
+    );
     ensure!(
         !daemon.is_finished(),
         "daemon exited with its host connected"
@@ -199,6 +233,10 @@ async fn socket_handoff(observation: Arc<BootObservation>) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(8), completion)
         .await
         .context("last disconnect exceeded the product shutdown limit")???;
+    ensure!(
+        observation.shutdown_requested.load(Ordering::Acquire),
+        "last host disconnect did not request ephemeral shutdown"
+    );
     daemon
         .join()
         .map_err(|_| anyhow::anyhow!("daemon boot thread panicked"))?;
@@ -218,19 +256,28 @@ impl Drop for OwnedChild {
     }
 }
 
-fn isolated_child() -> Result<()> {
-    let root = tempfile::tempdir()?;
+fn isolated_child(test: &str) -> Result<()> {
+    // Unix socket limits include the full physical path; ignore long TMPDIRs.
+    let root = tempfile::Builder::new()
+        .prefix("handoff-")
+        .tempdir_in("/tmp")?;
     let fixture = root.path().canonicalize()?;
-    let child = Command::new(std::env::current_exe()?)
-        .args(["--exact", TEST, "--nocapture"])
+    let mut command = Command::new(std::env::current_exe()?);
+    // Keep the parent's build environment untouched. Only this test executable
+    // runs in the child; no Cargo or rustup command uses its private HOME.
+    for (name, _) in std::env::vars_os() {
+        if name.as_encoded_bytes().starts_with(b"ASTRID_") {
+            command.env_remove(name);
+        }
+    }
+    let child = command
+        .args(["--exact", test, "--nocapture"])
         .current_dir(root.path())
-        .env(CHILD, "1")
+        .env(CHILD, test)
+        .env("HOME", &fixture)
         .env("ASTRID_HOME", fixture.join("home"))
         .env("XDG_CONFIG_HOME", fixture.join("config"))
         .env("ASTRID_DAEMON_LOG_TARGET", "stderr")
-        .env_remove("ASTRID_RUN_DIR")
-        .env_remove("ASTRID_CONFIG")
-        .env_remove("ASTRID_WORKSPACE_STATE_DIR")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -265,13 +312,13 @@ fn isolated_child() -> Result<()> {
 
 #[test]
 fn pre_ready_status_disconnect_preserves_host_handoff() -> Result<()> {
-    if std::env::var_os(CHILD).is_none() {
-        return isolated_child();
+    if std::env::var(CHILD).ok().as_deref() != Some(TEST) {
+        return isolated_child(TEST);
     }
     let observation = Arc::new(BootObservation::default());
     Registry::default()
         .with(BootObserver(Arc::clone(&observation)))
-        .with(tracing_subscriber::filter::LevelFilter::INFO)
+        .with(tracing_subscriber::filter::LevelFilter::DEBUG)
         .try_init()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -285,4 +332,42 @@ fn pre_ready_status_disconnect_preserves_host_handoff() -> Result<()> {
         "daemon retained its runtime projections"
     );
     Ok(())
+}
+
+// The socket test proves production behavior at its boot barrier. This narrower
+// check also protects the listener helper's contract: ephemeral mode must be
+// enabled and an early disconnect must be protected at the handoff itself.
+#[test]
+fn listener_handoff_enables_protected_ephemeral_mode() -> Result<()> {
+    const LISTENER_TEST: &str = "tests::startup::listener_handoff_enables_protected_ephemeral_mode";
+    if std::env::var(CHILD).ok().as_deref() != Some(LISTENER_TEST) {
+        return isolated_child(LISTENER_TEST);
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let kernel = astrid_kernel::Kernel::new(
+            astrid_core::SessionId::SYSTEM,
+            std::env::current_dir()?,
+            astrid_capsule::CapsuleRuntimeLimits::default(),
+            std::collections::HashMap::new(),
+            astrid_capsule::HttpLimits::default(),
+        )
+        .await?;
+        let _listener = claim_daemon_listener(&kernel, true)?;
+        ensure!(
+            kernel.ephemeral.load(Ordering::Relaxed),
+            "listener handoff did not enable ephemeral mode"
+        );
+        let principal = PrincipalId::default();
+        kernel.connection_opened(&principal);
+        kernel.connection_closed(&principal);
+        ensure!(
+            !*kernel.shutdown_tx.borrow(),
+            "listener handoff did not protect early disconnect"
+        );
+        Ok(())
+    })
 }
