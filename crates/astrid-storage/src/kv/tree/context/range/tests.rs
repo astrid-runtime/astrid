@@ -152,3 +152,47 @@ async fn prefix_visitor_releases_decoded_checkpoint_pages_and_preserves_ordered_
         assert_eq!(entry.value, actual[&entry.key]);
     }
 }
+
+#[tokio::test]
+async fn prefix_deletions_release_pages_and_reuse_observed_values() {
+    let engine = Arc::new(InMemoryEngine::new(TestIdentity));
+    let store = TreeKvStore::<String, TestIdentity, Resolver, _>::from_engine(engine, Resolver);
+    let namespace = "alice:capsule:first";
+    for index in 0..512 {
+        store
+            .set(namespace, &format!("link/{index:04}"), vec![0x51; 128])
+            .await
+            .unwrap();
+    }
+    store
+        .set(namespace, "outside", b"untouched".to_vec())
+        .await
+        .unwrap();
+    store.checkpoint_for_test("alice".to_owned()).unwrap();
+    store
+        .set(namespace, "link/0001", b"replacement".to_vec())
+        .await
+        .unwrap();
+    store.delete(namespace, "link/0002").await.unwrap();
+    store.set(namespace, "link/new", Vec::new()).await.unwrap();
+    let start = crate::kv::composite_key(namespace, "link/");
+    let end = crate::kv::prefix_range_end(namespace, "link/");
+    store
+        .blocking_store()
+        .read("alice".to_owned(), |context, header| {
+            let deletions = context.projected_deletions_in_range(header, &start, &end)?;
+            assert_eq!(deletions.len(), 512);
+            assert!(
+                context.nodes.is_empty(),
+                "clear retained decoded checkpoint pages"
+            );
+            let projection = context.apply_mutations(header, deletions)?;
+            assert!(
+                context.nodes.is_empty(),
+                "clear repeated point lookups after observing the values"
+            );
+            assert_eq!(projection.totals.entries, 1);
+            Ok(())
+        })
+        .unwrap();
+}

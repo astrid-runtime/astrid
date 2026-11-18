@@ -11,49 +11,9 @@ use super::{
 mod tests;
 
 impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
+    // Each range consumes its authenticated pages once. Deletion observations
+    // carry validated values forward, so subsequent accounting needs no page memo.
     fn visit_slots_in_range(
-        &mut self,
-        root: Option<ObjectId>,
-        start: &[u8],
-        end: &[u8],
-        mut visit: impl FnMut(&Self, LeafEntry) -> StorageResult<()>,
-    ) -> StorageResult<()> {
-        let Some(root) = root else {
-            return Ok(());
-        };
-        let mut stack = vec![root];
-        while let Some(object) = stack.pop() {
-            match self.node(object)?.node {
-                Node::Leaf(leaf) => {
-                    for entry in leaf.entries {
-                        if entry.key.as_slice() >= start && entry.key.as_slice() < end {
-                            visit(self, entry)?;
-                        }
-                    }
-                },
-                Node::Branch(branch) => {
-                    for (index, child) in branch.children.iter().enumerate().rev() {
-                        let upper = branch
-                            .children
-                            .get(index.saturating_add(1))
-                            .map(|next| next.lower_bound.as_slice());
-                        if upper.is_some_and(|upper| upper <= start)
-                            || child.lower_bound.as_slice() >= end
-                        {
-                            continue;
-                        }
-                        self.validate_pointer(child)?;
-                        stack.push(child.object);
-                    }
-                },
-            }
-        }
-        Ok(())
-    }
-
-    // A read walk releases each page after use; mutation enumeration above
-    // keeps its established memo for the subsequent edits in that transaction.
-    fn read_slots_in_range(
         &mut self,
         root: Option<ObjectId>,
         start: &[u8],
@@ -150,7 +110,7 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         strip: usize,
     ) -> StorageResult<Vec<String>> {
         let mut keys = BTreeMap::new();
-        self.read_slots_in_range(header.tree, start, end, |_, entry| {
+        self.visit_slots_in_range(header.tree, start, end, |_, entry| {
             keys.insert(entry.key, true);
             Ok(())
         })?;
@@ -195,29 +155,21 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         strip: usize,
         mut visit: impl FnMut(&str, &[u8]) -> StorageResult<()>,
     ) -> StorageResult<()> {
-        self.read_slots_in_range(
-            header.tree,
-            start,
-            end,
-            // A read-only walk uses each decoded page once. Keep the existing
-            // mutation-side memo policy for key collection, but do not retain
-            // an entire checkpoint's decoded bodies as scan scratch.
-            |context, entry| {
-                // Replacements and tombstones shadow checkpoint values before
-                // body reconstruction, just as in a point read.
-                if header.overlay.get(&entry.key).is_none() {
-                    let key = suffix(&entry.key, strip)?;
-                    match &entry.value {
-                        ValueSlot::Inline(value) => visit(key, value)?,
-                        ValueSlot::Spilled { .. } => {
-                            let value = context.value_bytes(&entry.value)?;
-                            visit(key, &value)?;
-                        },
-                    }
+        self.visit_slots_in_range(header.tree, start, end, |context, entry| {
+            // Replacements and tombstones shadow checkpoint values before
+            // body reconstruction, just as in a point read.
+            if header.overlay.get(&entry.key).is_none() {
+                let key = suffix(&entry.key, strip)?;
+                match &entry.value {
+                    ValueSlot::Inline(value) => visit(key, value)?,
+                    ValueSlot::Spilled { .. } => {
+                        let value = context.value_bytes(&entry.value)?;
+                        visit(key, &value)?;
+                    },
                 }
-                Ok(())
-            },
-        )?;
+            }
+            Ok(())
+        })?;
         for (key, value) in header.overlay.range(start, end) {
             if let Some(value) = value {
                 visit(suffix(key, strip)?, value)?;
