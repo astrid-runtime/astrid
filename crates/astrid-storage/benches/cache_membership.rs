@@ -152,7 +152,10 @@ fn cpu_and_rss() -> BenchResult<(Option<u64>, Option<u64>)> {
 }
 
 fn main() -> BenchResult<()> {
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let args = std::env::args()
+        .skip(1)
+        .filter(|argument| argument != "--bench")
+        .collect::<Vec<_>>();
     if args.len() != 3 {
         return Err(
             "usage: cache_membership <single|shared|retire> <objects> <reads|rounds>".into(),
