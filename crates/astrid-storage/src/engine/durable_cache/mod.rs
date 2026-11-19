@@ -15,6 +15,7 @@ use crate::engine::{ProjectionCacheEntry, ProjectionCacheKey};
 use crate::storage_model::{ObjectId, ObjectRecord};
 use parking_lot::Mutex;
 
+mod access;
 mod clear;
 mod policy;
 
@@ -170,7 +171,8 @@ where
                 state.bypasses = state.bypasses.saturating_add(1);
                 break 'cache None;
             }
-            if !state.is_attached(principal, object) {
+            let register_membership = !state.is_attached(principal, object);
+            if register_membership {
                 let association_weight = association_weight::<P>();
                 state.evict_global_until_fits(association_weight, global_capacity, Some(object));
                 if !state.can_fit_global(association_weight, global_capacity)
@@ -180,7 +182,7 @@ where
                     break 'cache None;
                 }
             }
-            let Some(record) = state.touch(principal, object) else {
+            let Some(record) = state.touch(principal, object, register_membership) else {
                 break 'cache None;
             };
             state.hits = state.hits.saturating_add(1);
@@ -245,7 +247,8 @@ where
             }
 
             if state.entries.contains_key(&object) {
-                if !state.is_attached(principal, object) {
+                let register_membership = !state.is_attached(principal, object);
+                if register_membership {
                     state.evict_global_until_fits(
                         association_weight,
                         global_capacity,
@@ -258,7 +261,7 @@ where
                     }
                 }
                 break 'cache state
-                    .touch(principal, object)
+                    .touch(principal, object, register_membership)
                     .unwrap_or_else(|| Arc::clone(&record));
             }
 
@@ -372,7 +375,7 @@ where
             .and_then(|partition| partition.entries.get(&object))
             .and_then(|entry| entry.projections.get(&key))
             .map_or(0, |entry| entry.weight);
-        if state.touch(principal, object).is_none() {
+        if state.touch(principal, object, false).is_none() {
             state.projection_misses = state.projection_misses.saturating_add(1);
             return None;
         }
@@ -612,7 +615,7 @@ where
             self.resident_projection_entries = self.resident_projection_entries.saturating_add(1);
         }
         self.projection_insertions = self.projection_insertions.saturating_add(1);
-        self.touch(principal, object).is_some()
+        self.touch(principal, object, false).is_some()
     }
 
     fn remove_projection(
@@ -638,29 +641,6 @@ where
         self.resident_projection_entries = self.resident_projection_entries.saturating_sub(1);
         self.projection_evictions = self.projection_evictions.saturating_add(1);
         true
-    }
-
-    fn touch(&mut self, principal: &P, object: ObjectId) -> Option<Arc<ObjectRecord>> {
-        if !self.entries.contains_key(&object) || !self.principals.contains_key(principal) {
-            return None;
-        }
-        let tick = self.tick();
-        let (previous_tick, record) = {
-            let entry = self.entries.get_mut(&object)?;
-            let previous_tick = entry.last_access;
-            entry.last_access = tick;
-            entry.principals.insert(principal.clone());
-            (previous_tick, Arc::clone(&entry.record))
-        };
-        self.lru.remove(&(previous_tick, object));
-        self.lru.insert((tick, object));
-        let partition = self.principals.get_mut(principal)?;
-        let entry = partition.entries.get_mut(&object)?;
-        let previous_tick = entry.last_access;
-        entry.last_access = tick;
-        partition.lru.remove(&(previous_tick, object));
-        partition.lru.insert((tick, object));
-        Some(record)
     }
 
     fn is_attached(&self, principal: &P, object: ObjectId) -> bool {
