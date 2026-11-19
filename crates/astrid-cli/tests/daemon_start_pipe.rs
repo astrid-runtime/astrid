@@ -21,11 +21,41 @@ fn cli(home: &Path) -> Command {
     command
 }
 
-struct StopOnDrop<'a>(&'a Path);
+struct StopOnDrop<'a>(Option<&'a Path>);
+
+impl StopOnDrop<'_> {
+    fn finish(mut self) {
+        let home = self.0.expect("armed owned cleanup");
+        let output = cli(home)
+            .arg("stop")
+            .stderr(Stdio::piped())
+            .output()
+            .expect("stop launcher");
+        assert!(
+            output.status.success(),
+            "stop failed: {}; stderr: {}; entries: {:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+            entries(home)
+        );
+        self.0 = None;
+    }
+}
+
+fn entries(home: &Path) -> Vec<std::ffi::OsString> {
+    let mut entries: Vec<_> = std::fs::read_dir(home)
+        .expect("runtime root")
+        .map(|entry| entry.expect("runtime entry").file_name())
+        .collect();
+    entries.sort();
+    entries
+}
 
 impl Drop for StopOnDrop<'_> {
     fn drop(&mut self) {
-        let _ = cli(self.0).arg("stop").stderr(Stdio::null()).status();
+        if let Some(home) = self.0 {
+            let _ = cli(home).arg("stop").stderr(Stdio::null()).status();
+        }
     }
 }
 
@@ -46,7 +76,7 @@ fn start_and_check_eof(home: &Path, ephemeral: bool) {
     // Command retains its configured Stdio after spawn; the test itself must
     // release that writer before checking the child's inherited descriptors.
     drop(command);
-    let _cleanup = StopOnDrop(home);
+    let cleanup = StopOnDrop(Some(home));
     let started = Instant::now();
     loop {
         if let Some(status) = launcher.try_wait().expect("launcher status") {
@@ -71,6 +101,7 @@ fn start_and_check_eof(home: &Path, ephemeral: bool) {
         home.join("run/system.ready").exists(),
         "EOF must not depend on shutdown"
     );
+    cleanup.finish();
 }
 
 fn check_fresh_and_volume_only_homes(ephemeral: bool) {
@@ -78,10 +109,10 @@ fn check_fresh_and_volume_only_homes(ephemeral: bool) {
     let home = directory.path().join("runtime");
     std::fs::create_dir(&home).expect("runtime root");
     start_and_check_eof(&home, ephemeral);
-    assert_eq!(std::fs::read_dir(&home).expect("stopped root").count(), 1);
+    assert_eq!(entries(&home), [std::ffi::OsString::from("astrid.volume")]);
     assert!(home.join("astrid.volume").is_file());
     start_and_check_eof(&home, ephemeral);
-    assert_eq!(std::fs::read_dir(&home).expect("stopped root").count(), 1);
+    assert_eq!(entries(&home), [std::ffi::OsString::from("astrid.volume")]);
 }
 
 #[test]

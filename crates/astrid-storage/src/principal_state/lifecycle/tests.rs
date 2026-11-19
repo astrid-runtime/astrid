@@ -115,6 +115,22 @@ async fn finalizer_fences_replacement_and_is_idempotent() {
     );
 }
 
+#[test]
+fn lifecycle_contention_is_distinct_from_unsafe_control_state() {
+    let parent = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(parent.path().join("runtime"));
+    let owner = RuntimeLifecycleGuard::acquire(&home).unwrap();
+    let contention = RuntimeLifecycleGuard::acquire(&home).err().unwrap();
+    assert_eq!(contention.kind(), std::io::ErrorKind::WouldBlock);
+    drop(owner);
+    let path = home.lifecycle_lock_path().unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let unsafe_state = RuntimeLifecycleGuard::acquire(&home).err().unwrap();
+    assert_ne!(unsafe_state.kind(), std::io::ErrorKind::WouldBlock);
+    assert!(!home.root().exists());
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn failed_finalization_preserves_recovery_evidence() {

@@ -67,7 +67,11 @@ impl RuntimeLifecycleGuard {
         }
         let lock = directory.open_with(name, &options)?.into_std();
         lock.try_lock().map_err(|error| {
-            io::Error::other(format!("runtime is running or finalizing: {error}"))
+            let kind = match &error {
+                std::fs::TryLockError::WouldBlock => io::ErrorKind::WouldBlock,
+                std::fs::TryLockError::Error(error) => error.kind(),
+            };
+            io::Error::new(kind, format!("runtime is running or finalizing: {error}"))
         })?;
         Ok(Self {
             home: home.clone(),
