@@ -11,6 +11,7 @@ use crate::storage_model::{
 use super::*;
 
 mod clear;
+mod membership;
 
 fn record(byte: u8) -> ObjectRecord {
     ObjectRecord::new(

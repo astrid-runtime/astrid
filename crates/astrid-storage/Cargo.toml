@@ -60,6 +60,10 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 name = "storage_io"
 harness = false
 
+[[bench]]
+name = "cache_membership"
+harness = false
+
 # Astrid's wasm-capable crates use getrandom 0.4 with its `wasm_js` backend.
 # surrealkv still pulls a separate getrandom 0.3 edge; its backend is configured
 # for portability checks through RUSTFLAGS below. wasm-only; native builds are
