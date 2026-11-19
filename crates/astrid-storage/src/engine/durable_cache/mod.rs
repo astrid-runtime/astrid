@@ -17,6 +17,9 @@ use parking_lot::Mutex;
 
 mod clear;
 mod policy;
+mod principals;
+
+use principals::CachedPrincipals;
 
 pub use policy::{
     ObjectCacheCapacity, ObjectCacheConfig, ObjectCacheController, ObjectCacheMemoryBudget,
@@ -27,7 +30,7 @@ struct CachedObject<P: Ord> {
     record: Arc<ObjectRecord>,
     weight: u64,
     last_access: u64,
-    principals: BTreeSet<P>,
+    principals: CachedPrincipals<P>,
 }
 
 struct CachedProjection {
@@ -271,8 +274,7 @@ where
             }
 
             let tick = state.tick();
-            let mut principals = BTreeSet::new();
-            principals.insert(principal.clone());
+            let principals = CachedPrincipals::new(principal.clone());
             state.entries.insert(
                 object,
                 CachedObject {
@@ -912,7 +914,7 @@ where
             return;
         };
         self.lru.remove(&(entry.last_access, object));
-        for principal in entry.principals {
+        for principal in entry.principals.into_iter() {
             if let Some(partition) = self.principals.get_mut(&principal)
                 && let Some(principal_entry) = partition.entries.remove(&object)
             {
