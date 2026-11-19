@@ -274,8 +274,7 @@ where
             }
 
             let tick = state.tick();
-            let mut principals = BTreeSet::new();
-            principals.insert(principal.clone());
+            let principals = BTreeSet::from([principal.clone()]);
             state.entries.insert(
                 object,
                 CachedObject {
