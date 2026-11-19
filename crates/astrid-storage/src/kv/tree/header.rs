@@ -523,3 +523,6 @@ pub(super) fn owned_target(
     }
     Ok(reference.target())
 }
+
+#[cfg(test)]
+mod tests;

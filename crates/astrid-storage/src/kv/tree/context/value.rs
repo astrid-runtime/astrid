@@ -8,14 +8,15 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use super::super::node::{decode_value, value_record};
+use super::super::node::{decode_value, spilled_opaque_payload, value_record};
 use super::{
     INLINE_VALUE_MAX, KvProjectionEngine, ObjectClass, ObjectId, ObjectKind, ObjectRecord,
     ObjectReference, ReferenceKind, StorageError, StorageResult, TreeContext, ValueSlot,
     arithmetic_overflow, invalid, map_engine,
 };
 use crate::content_dag::{
-    ChunkingProfile, ContentSource, OpenedContent, build_content, open_content, read_opened_content,
+    ChunkingProfile, ContentSource, OpenedContent, build_content, open_content,
+    read_opened_content, validate_opened_content,
 };
 use crate::storage_model::{ModelError, ObjectFormatVersion, ObjectIdentity, ReferenceLabel};
 
@@ -86,6 +87,25 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
                     self.read_chunked_value(*object, *length, &record)
                 } else {
                     decode_value(*object, *length, &record)
+                }
+            },
+        }
+    }
+
+    pub(in crate::kv::tree) fn validate_value(&self, value: &ValueSlot) -> StorageResult<()> {
+        match value {
+            ValueSlot::Inline(_) => Ok(()),
+            ValueSlot::Spilled { object, length } => {
+                let record = self.record(*object)?;
+                if record.format_version() == CHUNKED_VALUE_VERSION {
+                    let opened = self.open_chunked_value(*object, *length, &record)?;
+                    validate_opened_content(self, opened).map_err(|error| {
+                        StorageError::Serialization(format!(
+                            "read chunked KV value {object:?}: {error}"
+                        ))
+                    })
+                } else {
+                    spilled_opaque_payload(*object, *length, &record).map(|_| ())
                 }
             },
         }
