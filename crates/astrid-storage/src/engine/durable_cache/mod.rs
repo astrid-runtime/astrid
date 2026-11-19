@@ -18,6 +18,9 @@ use parking_lot::Mutex;
 mod access;
 mod clear;
 mod policy;
+mod principals;
+
+use principals::{CachedPrincipals, PrincipalRef};
 
 pub use policy::{
     ObjectCacheCapacity, ObjectCacheConfig, ObjectCacheController, ObjectCacheMemoryBudget,
@@ -28,7 +31,7 @@ struct CachedObject<P: Ord> {
     record: Arc<ObjectRecord>,
     weight: u64,
     last_access: u64,
-    principals: BTreeSet<P>,
+    principals: CachedPrincipals<P>,
 }
 
 struct CachedProjection {
@@ -57,7 +60,7 @@ struct PrincipalPartition {
 struct CacheState<P: Ord> {
     entries: BTreeMap<ObjectId, CachedObject<P>>,
     lru: BTreeSet<(u64, ObjectId)>,
-    principals: BTreeMap<P, PrincipalPartition>,
+    principals: BTreeMap<Arc<P>, PrincipalPartition>,
     resident_record_bytes: u64,
     resident_association_bytes: u64,
     resident_associations: u64,
@@ -182,7 +185,7 @@ where
                     break 'cache None;
                 }
             }
-            let Some(record) = state.touch(principal, object, register_membership) else {
+            let Some(record) = state.touch(principal, object) else {
                 break 'cache None;
             };
             state.hits = state.hits.saturating_add(1);
@@ -261,7 +264,7 @@ where
                     }
                 }
                 break 'cache state
-                    .touch(principal, object, register_membership)
+                    .touch(principal, object)
                     .unwrap_or_else(|| Arc::clone(&record));
             }
 
@@ -273,34 +276,7 @@ where
                 break 'cache Arc::clone(&record);
             }
 
-            let tick = state.tick();
-            let principals = BTreeSet::from([principal.clone()]);
-            state.entries.insert(
-                object,
-                CachedObject {
-                    record: Arc::clone(&record),
-                    weight,
-                    last_access: tick,
-                    principals,
-                },
-            );
-            state.lru.insert((tick, object));
-            let partition = state.principals.entry(principal.clone()).or_default();
-            partition.entries.insert(
-                object,
-                PrincipalEntry {
-                    last_access: tick,
-                    projections: BTreeMap::new(),
-                },
-            );
-            partition.lru.insert((tick, object));
-            partition.charged_bytes = partition.charged_bytes.saturating_add(weight);
-            state.resident_record_bytes = state.resident_record_bytes.saturating_add(weight);
-            state.resident_association_bytes = state
-                .resident_association_bytes
-                .saturating_add(association_weight);
-            state.resident_associations = state.resident_associations.saturating_add(1);
-            state.insertions = state.insertions.saturating_add(1);
+            state.admit_record(principal, object, Arc::clone(&record), weight);
             Arc::clone(&record)
         };
         let resident = state.resident_bytes();
@@ -374,7 +350,7 @@ where
             .and_then(|partition| partition.entries.get(&object))
             .and_then(|entry| entry.projections.get(&key))
             .map_or(0, |entry| entry.weight);
-        if state.touch(principal, object, false).is_none() {
+        if state.touch(principal, object).is_none() {
             state.projection_misses = state.projection_misses.saturating_add(1);
             return None;
         }
@@ -484,7 +460,7 @@ where
         let charges = state
             .principals
             .iter()
-            .map(|(principal, partition)| (principal.clone(), partition.charged_bytes))
+            .map(|(principal, partition)| ((**principal).clone(), partition.charged_bytes))
             .collect::<Vec<_>>();
         drop(state);
         self.controller.reconcile(resident);
@@ -509,7 +485,11 @@ where
     pub(super) fn reclaim(&self) {
         let _accounting = self.accounting.lock();
         let mut state = self.state.lock();
-        let principals = state.principals.keys().cloned().collect::<Vec<_>>();
+        let principals = state
+            .principals
+            .keys()
+            .map(|key| (**key).clone())
+            .collect::<Vec<_>>();
         let capacities = principals
             .iter()
             .map(|principal| (principal.clone(), self.principal_budget.capacity(principal)))
@@ -523,7 +503,7 @@ where
         let charges = state
             .principals
             .iter()
-            .map(|(principal, partition)| (principal.clone(), partition.charged_bytes))
+            .map(|(principal, partition)| ((**principal).clone(), partition.charged_bytes))
             .collect::<BTreeMap<_, _>>();
 
         drop(state);
@@ -614,7 +594,7 @@ where
             self.resident_projection_entries = self.resident_projection_entries.saturating_add(1);
         }
         self.projection_insertions = self.projection_insertions.saturating_add(1);
-        self.touch(principal, object, false).is_some()
+        self.touch(principal, object).is_some()
     }
 
     fn remove_projection(
@@ -662,18 +642,21 @@ where
         if !self.can_fit_principal(principal, weight, capacity) {
             return false;
         }
-        let partition = self.principals.entry(principal.clone()).or_default();
+        let principal_key = self.principal_key(principal);
+        let Some(physical) = self.entries.get_mut(&object) else {
+            return false;
+        };
+        let membership = PrincipalRef::new(Arc::clone(&principal_key));
+        let partition = self.principals.entry(principal_key).or_default();
         partition.charged_bytes = partition.charged_bytes.saturating_add(weight);
         partition.entries.insert(
             object,
             PrincipalEntry {
-                last_access: self
-                    .entries
-                    .get(&object)
-                    .map_or(self.clock, |entry| entry.last_access),
+                last_access: physical.last_access,
                 projections: BTreeMap::new(),
             },
         );
+        physical.principals.insert(membership);
         self.resident_association_bytes = self
             .resident_association_bytes
             .saturating_add(association_weight::<P>());
@@ -849,6 +832,10 @@ where
         let Some(weight) = weight else {
             return;
         };
+        let membership = self
+            .principals
+            .get_key_value(principal)
+            .map(|(key, _)| PrincipalRef::new(Arc::clone(key)));
         if let Some(partition) = self.principals.get_mut(principal)
             && let Some(entry) = partition.entries.remove(&object)
         {
@@ -878,7 +865,9 @@ where
             self.principals.remove(principal);
         }
         let remove_physical = self.entries.get_mut(&object).is_some_and(|entry| {
-            entry.principals.remove(principal);
+            if let Some(membership) = &membership {
+                entry.principals.remove(membership);
+            }
             entry.principals.is_empty()
         });
         if remove_physical {
@@ -891,8 +880,9 @@ where
             return;
         };
         self.lru.remove(&(entry.last_access, object));
-        for principal in entry.principals {
-            if let Some(partition) = self.principals.get_mut(&principal)
+        for membership in entry.principals.into_iter() {
+            let principal = membership.principal();
+            if let Some(partition) = self.principals.get_mut(principal)
                 && let Some(principal_entry) = partition.entries.remove(&object)
             {
                 let projection = projection_weight(&principal_entry);
@@ -917,10 +907,10 @@ where
             }
             if self
                 .principals
-                .get(&principal)
+                .get(principal)
                 .is_some_and(|partition| partition.entries.is_empty())
             {
-                self.principals.remove(&principal);
+                self.principals.remove(principal);
             }
         }
         self.resident_record_bytes = self.resident_record_bytes.saturating_sub(entry.weight);
