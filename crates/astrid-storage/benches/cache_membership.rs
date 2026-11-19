@@ -1,7 +1,8 @@
 //! Decoded-cache owner membership cost through the public durable engine.
 //!
 //! `cargo bench -p astrid-storage --bench cache_membership -- single 128 1000000`
-//! Also measure `shared` and `retire`; the latter's count is retirement rounds.
+//! No workload arguments runs `single 128 2000000`. Also measure `shared` and
+//! `retire`; the latter's count is retirement rounds.
 //! Uses native StateOwner/codec, isolated files and the normal allocator. No
 //! allocation observation/logging is compiled into this benchmark binary.
 #![deny(unsafe_code)]
@@ -156,6 +157,11 @@ fn main() -> BenchResult<()> {
         .skip(1)
         .filter(|argument| argument != "--bench")
         .collect::<Vec<_>>();
+    let args = if args.is_empty() {
+        vec!["single".to_owned(), "128".to_owned(), "2000000".to_owned()]
+    } else {
+        args
+    };
     if args.len() != 3 {
         return Err(
             "usage: cache_membership <single|shared|retire> <objects> <reads|rounds>".into(),
