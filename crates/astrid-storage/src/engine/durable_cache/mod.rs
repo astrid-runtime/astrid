@@ -20,7 +20,7 @@ mod clear;
 mod policy;
 mod principals;
 
-use principals::{CachedPrincipals, PrincipalRef};
+use principals::CachedPrincipals;
 
 pub use policy::{
     ObjectCacheCapacity, ObjectCacheConfig, ObjectCacheController, ObjectCacheMemoryBudget,
@@ -485,19 +485,19 @@ where
     pub(super) fn reclaim(&self) {
         let _accounting = self.accounting.lock();
         let mut state = self.state.lock();
-        let principals = state
+        let capacities = state
             .principals
             .keys()
-            .map(|key| (**key).clone())
-            .collect::<Vec<_>>();
-        let capacities = principals
-            .iter()
-            .map(|principal| (principal.clone(), self.principal_budget.capacity(principal)))
+            .map(|key| {
+                let principal = (**key).clone();
+                let capacity = self.principal_budget.capacity(&principal);
+                (principal, capacity)
+            })
             .collect::<Vec<_>>();
         let global_capacity = self.controller.capacity();
         state.trim_global(global_capacity);
-        for (principal, capacity) in &capacities {
-            state.trim_principal(principal, *capacity);
+        for (principal, capacity) in capacities {
+            state.trim_principal(&principal, capacity);
         }
         let resident = state.resident_bytes();
         let charges = state
@@ -646,7 +646,7 @@ where
         let Some(physical) = self.entries.get_mut(&object) else {
             return false;
         };
-        let membership = PrincipalRef::new(Arc::clone(&principal_key));
+        let membership = Arc::clone(&principal_key);
         let partition = self.principals.entry(principal_key).or_default();
         partition.charged_bytes = partition.charged_bytes.saturating_add(weight);
         partition.entries.insert(
@@ -759,6 +759,10 @@ where
     }
 
     fn trim_principal(&mut self, principal: &P, capacity: ObjectCacheCapacity) {
+        if capacity == ObjectCacheCapacity::Disabled {
+            self.clear_principal(principal);
+            return;
+        }
         while capacity.limit().is_some_and(|limit| {
             self.principals
                 .get(principal)
@@ -832,10 +836,6 @@ where
         let Some(weight) = weight else {
             return;
         };
-        let membership = self
-            .principals
-            .get_key_value(principal)
-            .map(|(key, _)| PrincipalRef::new(Arc::clone(key)));
         if let Some(partition) = self.principals.get_mut(principal)
             && let Some(entry) = partition.entries.remove(&object)
         {
@@ -857,6 +857,12 @@ where
                 .saturating_sub(projection_count);
             self.projection_evictions = self.projection_evictions.saturating_add(projection_count);
         }
+        let remove_physical = self.entries.get_mut(&object).is_some_and(|entry| {
+            if let Some((membership, _)) = self.principals.get_key_value(principal) {
+                entry.principals.remove(membership);
+            }
+            entry.principals.is_empty()
+        });
         if self
             .principals
             .get(principal)
@@ -864,12 +870,6 @@ where
         {
             self.principals.remove(principal);
         }
-        let remove_physical = self.entries.get_mut(&object).is_some_and(|entry| {
-            if let Some(membership) = &membership {
-                entry.principals.remove(membership);
-            }
-            entry.principals.is_empty()
-        });
         if remove_physical {
             self.remove_physical(object);
         }
@@ -881,7 +881,7 @@ where
         };
         self.lru.remove(&(entry.last_access, object));
         for membership in entry.principals.into_iter() {
-            let principal = membership.principal();
+            let principal = membership.as_ref();
             if let Some(partition) = self.principals.get_mut(principal)
                 && let Some(principal_entry) = partition.entries.remove(&object)
             {

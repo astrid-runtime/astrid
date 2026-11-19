@@ -2,7 +2,8 @@
 //!
 //! `cargo bench -p astrid-storage --bench cache_membership -- single 128 1000000`
 //! No workload arguments runs `single 128 2000000`. Also measure `shared` and
-//! `retire`; the latter's count is retirement rounds. The optional fourth
+//! `retire` and `pressure` (half the owner quota); their counts are rounds.
+//! The optional fourth
 //! argument sets the number of sharing owners (default two), and the fifth
 //! sets how many retire together (default one, leaving at least one owner).
 //! Uses native StateOwner/codec, isolated files and the normal allocator. No
@@ -12,9 +13,9 @@
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::hint::black_box;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use astrid_core::identity::PrincipalUid;
@@ -34,6 +35,7 @@ enum Mode {
     Single,
     Shared,
     Retire,
+    Pressure,
 }
 
 struct Fixture {
@@ -41,14 +43,15 @@ struct Fixture {
     ids: Vec<ObjectId>,
     owners: Vec<StateOwner>,
     retiring_owners: usize,
-    retire_second: Arc<AtomicBool>,
+    pressure_active: Arc<AtomicBool>,
+    pressure_target: Arc<AtomicU64>,
     _directory: tempfile::TempDir,
 }
 
 impl Fixture {
     fn new(
         count: NonZeroUsize,
-        shared: bool,
+        mode: Mode,
         owner_count: NonZeroUsize,
         retiring_owners: usize,
     ) -> BenchResult<Self> {
@@ -61,8 +64,10 @@ impl Fixture {
                 StateOwner::Principal(PrincipalUid::from_bytes(bytes))
             })
             .collect::<Vec<_>>();
-        let retire_second = Arc::new(AtomicBool::new(false));
-        let retired = retire_second.clone();
+        let pressure_active = Arc::new(AtomicBool::new(false));
+        let retired = pressure_active.clone();
+        let pressure_target = Arc::new(AtomicU64::new(0));
+        let target = Arc::clone(&pressure_target);
         let retirement = owners
             .iter()
             .rev()
@@ -78,7 +83,8 @@ impl Fixture {
                 ObjectCacheController::new(ObjectCacheCapacity::Unbounded),
                 Arc::new(move |owner: &StateOwner| {
                     if retired.load(Ordering::Relaxed) && retirement.contains(owner) {
-                        ObjectCacheCapacity::Disabled
+                        NonZeroU64::new(target.load(Ordering::Relaxed))
+                            .map_or(ObjectCacheCapacity::Disabled, ObjectCacheCapacity::Bounded)
                     } else {
                         ObjectCacheCapacity::Unbounded
                     }
@@ -97,34 +103,43 @@ impl Fixture {
             )?;
             let id = engine.persist_standalone_object(&record)?.0;
             require_record(&engine, owners[0], id)?;
-            if shared {
+            if mode != Mode::Single {
                 for owner in owners.iter().skip(1) {
                     require_record(&engine, *owner, id)?;
                 }
             }
             ids.push(id);
         }
+        if mode == Mode::Pressure {
+            pressure_target.store(
+                engine.object_cache_principal_charge(&owners[0]) / 2,
+                Ordering::Relaxed,
+            );
+        }
         Ok(Self {
             engine,
             ids,
             owners,
             retiring_owners,
-            retire_second,
+            pressure_active,
+            pressure_target,
             _directory: directory,
         })
     }
 
     fn run(&self, mode: Mode, count: NonZeroUsize) -> BenchResult<()> {
-        if mode == Mode::Retire {
+        if matches!(mode, Mode::Retire | Mode::Pressure) {
             for _ in 0..count.get() {
-                self.retire_second.store(true, Ordering::Relaxed);
+                self.pressure_active.store(true, Ordering::Relaxed);
                 self.engine.reclaim_object_cache();
                 for owner in self.owners.iter().rev().take(self.retiring_owners) {
-                    if self.engine.object_cache_principal_charge(owner) != 0 {
-                        return Err("retired principal retained a cache charge".into());
+                    if self.engine.object_cache_principal_charge(owner)
+                        > self.pressure_target.load(Ordering::Relaxed)
+                    {
+                        return Err("principal retained more than its pressure target".into());
                     }
                 }
-                self.retire_second.store(false, Ordering::Relaxed);
+                self.pressure_active.store(false, Ordering::Relaxed);
                 for id in &self.ids {
                     for owner in self.owners.iter().rev().take(self.retiring_owners) {
                         require_record(&self.engine, *owner, *id)?;
@@ -199,7 +214,7 @@ fn main() -> BenchResult<()> {
     };
     if !(3..=5).contains(&args.len()) {
         return Err(
-            "usage: cache_membership <single|shared|retire> <objects> <reads|rounds> [owners] [retiring-owners]"
+            "usage: cache_membership <single|shared|retire|pressure> <objects> <reads|rounds> [owners] [retiring-owners]"
                 .into(),
         );
     }
@@ -207,6 +222,7 @@ fn main() -> BenchResult<()> {
         "single" => Mode::Single,
         "shared" => Mode::Shared,
         "retire" => Mode::Retire,
+        "pressure" => Mode::Pressure,
         _ => return Err("unknown cache membership workload".into()),
     };
     let objects = args[1].parse::<NonZeroUsize>()?;
@@ -225,7 +241,7 @@ fn main() -> BenchResult<()> {
     if retiring.get() >= owners.get() {
         return Err("at least one owner must remain".into());
     }
-    let fixture = Fixture::new(objects, mode != Mode::Single, owners, retiring.get())?;
+    let fixture = Fixture::new(objects, mode, owners, retiring.get())?;
     let before = fixture.engine.object_cache_stats();
     let (cpu_before, _) = cpu_and_rss()?;
     let started = Instant::now();

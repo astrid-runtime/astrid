@@ -1,6 +1,6 @@
 //! Admission and LRU access under the cache-state lock.
 
-use super::principals::{CachedPrincipals, PrincipalRef};
+use super::principals::CachedPrincipals;
 use super::{CacheState, CachedObject, PrincipalEntry, association_weight};
 use crate::storage_model::{ObjectId, ObjectRecord};
 use std::collections::BTreeMap;
@@ -19,7 +19,7 @@ impl<P: Clone + Ord> CacheState<P> {
         let association_weight = association_weight::<P>();
         let tick = self.tick();
         let principal_key = self.principal_key(principal);
-        let principals = CachedPrincipals::new(PrincipalRef::new(Arc::clone(&principal_key)));
+        let principals = CachedPrincipals::new(Arc::clone(&principal_key));
         self.entries.insert(
             object,
             CachedObject {
@@ -56,7 +56,7 @@ impl<P: Clone + Ord> CacheState<P> {
 
     pub(super) fn touch(&mut self, principal: &P, object: ObjectId) -> Option<Arc<ObjectRecord>> {
         #[cfg(debug_assertions)]
-        let membership = PrincipalRef::new(Arc::clone(self.principals.get_key_value(principal)?.0));
+        let membership = Arc::clone(self.principals.get_key_value(principal)?.0);
         // Resolve both directions before mutating either LRU. Admission owns
         // membership registration; hits only update these existing entries.
         let partition = self.principals.get_mut(principal)?;

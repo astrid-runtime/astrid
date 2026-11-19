@@ -1,14 +1,15 @@
 use super::*;
 use std::sync::Arc;
 
-fn owner(value: u64) -> PrincipalRef<u64> {
-    PrincipalRef::new(Arc::new(value))
+fn owner(value: u64) -> Arc<u64> {
+    Arc::new(value)
 }
 
 #[test]
 fn inline_membership_reuses_holes_and_releases_spill_storage() {
     let owners = (0..5).map(owner).collect::<Vec<_>>();
     let mut members = CachedPrincipals::new(owners[0].clone());
+    members.insert(owner(0)); // Equal values remain one member even across allocations.
     for owner in &owners[..3] {
         members.insert(owner.clone());
     }
@@ -35,7 +36,7 @@ fn inline_membership_reuses_holes_and_releases_spill_storage() {
     assert_eq!(
         members
             .into_iter()
-            .map(|owner| *owner.principal())
+            .map(|owner| *owner.as_ref())
             .collect::<Vec<_>>(),
         vec![9]
     );
@@ -57,7 +58,7 @@ fn ten_thousand_principals_keep_exact_membership_during_retirement() {
     };
     let mut actual = shared
         .iter()
-        .map(|owner| *owner.principal())
+        .map(|owner| *owner.as_ref())
         .collect::<Vec<_>>();
     actual.sort_unstable();
     assert_eq!(actual, (1..10_000).step_by(2).collect::<Vec<_>>());
@@ -79,6 +80,6 @@ fn membership_header_does_not_duplicate_the_principal_value() {
     );
     assert!(
         size_of::<CachedPrincipals<[u8; 128]>>()
-            <= size_of::<BTreeSet<PrincipalRef<[u8; 128]>>>() + size_of::<usize>()
+            <= size_of::<BTreeSet<Arc<[u8; 128]>>>() + size_of::<usize>()
     );
 }
