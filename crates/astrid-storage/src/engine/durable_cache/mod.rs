@@ -759,20 +759,24 @@ where
     }
 
     fn trim_principal(&mut self, principal: &P, capacity: ObjectCacheCapacity) {
-        if capacity == ObjectCacheCapacity::Disabled {
+        let Some(limit) = capacity.limit() else {
+            return;
+        };
+        // Every retained record includes this existing metadata charge. A
+        // smaller target cannot keep any record, just like Disabled's zero.
+        if limit < cache_metadata_weight() {
             self.clear_principal(principal);
             return;
         }
-        while capacity.limit().is_some_and(|limit| {
-            self.principals
-                .get(principal)
-                .is_some_and(|partition| partition.charged_bytes > limit)
-        }) {
-            let victim = self
-                .principals
-                .get(principal)
-                .and_then(|partition| partition.lru.first().map(|(_, object)| *object));
-            let Some(victim) = victim else {
+        while let Some(partition) = self.principals.get(principal) {
+            if partition.charged_bytes <= limit {
+                break;
+            }
+            if partition.entries.len() == 1 {
+                self.clear_principal(principal);
+                break;
+            }
+            let Some(victim) = partition.lru.first().map(|(_, object)| *object) else {
                 break;
             };
             self.detach_principal(principal, victim);
@@ -857,12 +861,6 @@ where
                 .saturating_sub(projection_count);
             self.projection_evictions = self.projection_evictions.saturating_add(projection_count);
         }
-        let remove_physical = self.entries.get_mut(&object).is_some_and(|entry| {
-            if let Some((membership, _)) = self.principals.get_key_value(principal) {
-                entry.principals.remove(membership);
-            }
-            entry.principals.is_empty()
-        });
         if self
             .principals
             .get(principal)
@@ -870,6 +868,10 @@ where
         {
             self.principals.remove(principal);
         }
+        let remove_physical = self.entries.get_mut(&object).is_some_and(|entry| {
+            entry.principals.remove(principal);
+            entry.principals.is_empty()
+        });
         if remove_physical {
             self.remove_physical(object);
         }
@@ -925,14 +927,18 @@ where
 }
 
 fn cache_weight(record: &ObjectRecord) -> u64 {
+    record
+        .retained_bytes()
+        .unwrap_or(u64::MAX)
+        .saturating_add(cache_metadata_weight())
+}
+
+fn cache_metadata_weight() -> u64 {
     let resident_metadata = std::mem::size_of::<ObjectRecord>()
         .saturating_add(std::mem::size_of::<Arc<ObjectRecord>>())
         .saturating_add(std::mem::size_of::<ObjectId>())
         .saturating_add(std::mem::size_of::<u64>());
-    record
-        .retained_bytes()
-        .unwrap_or(u64::MAX)
-        .saturating_add(u64::try_from(resident_metadata).unwrap_or(u64::MAX))
+    u64::try_from(resident_metadata).unwrap_or(u64::MAX)
 }
 
 fn association_weight<P>() -> u64 {

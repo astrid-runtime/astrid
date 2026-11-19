@@ -48,18 +48,18 @@ impl<P: Ord> CachedPrincipals<P> {
         }
     }
 
-    pub(super) fn remove(&mut self, principal: &Arc<P>) {
+    pub(super) fn remove(&mut self, principal: &P) {
         match self {
             Self::Inline(inline) => {
                 if let Some(slot) = inline
                     .iter_mut()
-                    .find(|slot| slot.as_ref().is_some_and(|old| old == principal))
+                    .find(|slot| slot.as_deref() == Some(principal))
                 {
                     *slot = None;
                 }
             },
             Self::Shared(shared) => {
-                shared.remove(principal.as_ref());
+                shared.remove(principal);
                 if shared.len() <= 1 {
                     *self = Self::Inline([shared.pop_first(), None, None]);
                 }

@@ -46,7 +46,7 @@ impl<P: Clone + Ord> CacheState<P> {
                 self.resident_projection_entries.saturating_sub(projections);
             self.projection_evictions = self.projection_evictions.saturating_add(projections);
             let remove_physical = self.entries.get_mut(&object).is_some_and(|entry| {
-                entry.principals.remove(&membership);
+                entry.principals.remove(membership.as_ref());
                 entry.principals.is_empty()
             });
             if remove_physical {

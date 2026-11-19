@@ -149,32 +149,41 @@ fn whole_cache_clear_drops_payloads_before_releasing_leases_and_preserves_metric
 
 #[test]
 fn principal_retirement_does_not_rebalance_discarded_indexes() {
-    let comparisons = Arc::new(AtomicU64::new(0));
-    let cache = ObjectCache::new(ObjectCacheConfig::new(
-        ObjectCacheController::new(ObjectCacheCapacity::Unbounded),
-        Arc::new(|_: &CountedPrincipal| ObjectCacheCapacity::Unbounded),
-    ));
-    let retired = CountedPrincipal(0, Arc::clone(&comparisons));
-    let retained = CountedPrincipal(1, Arc::clone(&comparisons));
-    for index in 0..64 {
-        cache.insert(&retired, object(index), record(index));
-        assert!(cache.get(&retained, object(index)).is_some());
+    let one_record_target = cache_weight(&record(0)) / 2;
+    assert!(one_record_target >= cache_metadata_weight());
+    for (capacity, count) in [
+        (ObjectCacheCapacity::Disabled, 64_u8),
+        (ObjectCacheCapacity::Bounded(NonZeroU64::MIN), 64),
+        (
+            ObjectCacheCapacity::Bounded(NonZeroU64::new(one_record_target).unwrap()),
+            1,
+        ),
+    ] {
+        let comparisons = Arc::new(AtomicU64::new(0));
+        let cache = ObjectCache::new(ObjectCacheConfig::new(
+            ObjectCacheController::new(ObjectCacheCapacity::Unbounded),
+            Arc::new(|_: &CountedPrincipal| ObjectCacheCapacity::Unbounded),
+        ));
+        let retired = CountedPrincipal(0, Arc::clone(&comparisons));
+        let retained = CountedPrincipal(1, Arc::clone(&comparisons));
+        for index in 0..count {
+            cache.insert(&retired, object(index), record(index));
+            assert!(cache.get(&retained, object(index)).is_some());
+        }
+        comparisons.store(0, Ordering::Relaxed);
+        cache.state.lock().trim_principal(&retired, capacity);
+        // One two-key map removal and, for a fitting metadata floor, at most
+        // one charge check; no per-object principal-map searches.
+        assert!(
+            comparisons.load(Ordering::Relaxed) <= 2,
+            "retirement repeatedly searched/rebalanced a discarded principal partition: {} comparisons",
+            comparisons.load(Ordering::Relaxed)
+        );
+        assert_eq!(cache.principal_charge(&retired), 0);
+        assert!(cache.principal_charge(&retained) > 0);
+        assert_eq!(cache.stats().resident_objects, u64::from(count));
+        assert_eq!(cache.stats().resident_associations, u64::from(count));
     }
-    comparisons.store(0, Ordering::Relaxed);
-    cache
-        .state
-        .lock()
-        .trim_principal(&retired, ObjectCacheCapacity::Disabled);
-    // One two-key principal-map removal; no per-object principal-map searches.
-    assert!(
-        comparisons.load(Ordering::Relaxed) <= 2,
-        "retirement repeatedly searched/rebalanced a discarded principal partition: {} comparisons",
-        comparisons.load(Ordering::Relaxed)
-    );
-    assert_eq!(cache.principal_charge(&retired), 0);
-    assert!(cache.principal_charge(&retained) > 0);
-    assert_eq!(cache.stats().resident_objects, 64);
-    assert_eq!(cache.stats().resident_associations, 64);
 }
 
 #[derive(Default)]
