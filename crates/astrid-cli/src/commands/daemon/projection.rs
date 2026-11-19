@@ -108,3 +108,57 @@ pub(super) async fn pack_stopped_projection_for_home(home: &AstridHome) -> Resul
 
 #[cfg(test)]
 mod tests;
+
+/// Serialize control-file cleanup and packing with an already-running finalizer.
+/// PID and socket absence do not prove that durable retirement has completed.
+pub(super) async fn finish_stopped_daemon() -> Result<()> {
+    let home =
+        AstridHome::resolve().context("shutdown stage durable_projection_home_resolution")?;
+    let lifecycle = wait_for_finalization(&home).await?;
+    super::cleanup_daemon_runtime_for_home(&home, &home.socket_path(), &home.pid_path()).await?;
+    if home
+        .storage_volume_path()
+        .try_exists()
+        .context("shutdown stage durable_media_probe")?
+    {
+        lifecycle
+            .finish()
+            .await
+            .context("shutdown stage durable_projection_pack")?;
+    }
+    Ok(())
+}
+
+async fn wait_for_finalization(
+    home: &AstridHome,
+) -> Result<astrid_storage::principal_state::RuntimeLifecycleGuard> {
+    use astrid_storage::principal_state::RuntimeLifecycleGuard;
+    let first_error = match RuntimeLifecycleGuard::acquire(home) {
+        Ok(owner) => return Ok(owner),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => error,
+        Err(error) => return Err(error).context("shutdown stage durable_projection_fence"),
+    };
+    let budget = std::time::Duration::from_secs(
+        astrid_config::client::production_daemon_shutdown_timeout()?,
+    );
+    let deadline = tokio::time::Instant::now()
+        .checked_add(budget)
+        .context("shutdown stage durable_projection_fence: deadline overflow")?;
+    tracing::debug!("waiting for runtime finalization");
+    let mut blocked = first_error;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(blocked).context("shutdown stage durable_projection_fence: finalization did not release ownership within the client shutdown budget");
+        }
+        tokio::time::sleep(
+            super::super::daemon_control::POLL.min(deadline.saturating_duration_since(now)),
+        )
+        .await;
+        match RuntimeLifecycleGuard::acquire(home) {
+            Ok(owner) => return Ok(owner),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => blocked = error,
+            Err(error) => return Err(error).context("shutdown stage durable_projection_fence"),
+        }
+    }
+}

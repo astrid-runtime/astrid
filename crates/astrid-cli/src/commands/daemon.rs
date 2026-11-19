@@ -19,7 +19,7 @@ mod start_fence;
 mod temporary;
 mod workspace_fingerprint;
 use boot_log::prepare_boot_stderr;
-use projection::pack_stopped_projection;
+use projection::finish_stopped_daemon;
 pub(crate) use projection::retire_disconnected_projection;
 pub(crate) use projection::with_persistent_daemon_projection;
 pub(crate) use ready::disown_if_still_running;
@@ -639,7 +639,7 @@ pub(crate) async fn handle_stop() -> Result<()> {
     let start_fence = acquire_daemon_start_fence().await?;
     let daemon = stop_daemon().await;
     let projection = if daemon.is_ok() {
-        pack_stopped_projection().await
+        finish_stopped_daemon().await
     } else {
         Ok(())
     };
@@ -658,7 +658,7 @@ pub(crate) async fn handle_gateway_stop() -> Result<()> {
 pub(crate) async fn handle_daemon_stop_locked() -> Result<()> {
     let result = stop_daemon().await;
     let projection = if result.is_ok() {
-        pack_stopped_projection().await
+        finish_stopped_daemon().await
     } else {
         Ok(())
     };
@@ -714,7 +714,6 @@ async fn stop_daemon() -> Result<DaemonStopDisposition> {
         .as_ref()
         .is_some_and(|identity| daemon_control::is_process_alive(identity.pid));
     if !socket_present && !recorded_alive {
-        cleanup_daemon_runtime(&socket_path, &pid_path).await?;
         return Ok(DaemonStopDisposition::AlreadyStopped);
     }
 
@@ -742,7 +741,6 @@ async fn stop_daemon() -> Result<DaemonStopDisposition> {
                 anyhow::bail!("shutdown stage daemon.shutdown_ack: unexpected response: {other:?}")
             },
         };
-        cleanup_daemon_runtime(&socket_path, &pid_path).await?;
         return Ok(disposition);
     }
 
@@ -757,7 +755,6 @@ async fn stop_daemon() -> Result<DaemonStopDisposition> {
         None => daemon_control::KillOutcome::NotRunning,
     };
     let disposition = confirm_kill_outcome(outcome)?;
-    cleanup_daemon_runtime(&socket_path, &pid_path).await?;
     Ok(disposition)
 }
 
@@ -815,15 +812,10 @@ fn confirm_kill_outcome(outcome: daemon_control::KillOutcome) -> Result<DaemonSt
     }
 }
 
-/// Fence marker cleanup with the same singleton lock the daemon owns. Holding
+/// The caller owns lifecycle custody before entering this marker cleanup.
+/// Fence cleanup with the same singleton lock the daemon owns. Holding
 /// it through removal prevents a replacement daemon from publishing fresh
 /// markers between liveness proof and cleanup.
-async fn cleanup_daemon_runtime(socket_path: &Path, pid_path: &Path) -> Result<()> {
-    let home = astrid_core::dirs::AstridHome::resolve()
-        .context("shutdown stage daemon.home_resolution")?;
-    cleanup_daemon_runtime_for_home(&home, socket_path, pid_path).await
-}
-
 async fn cleanup_daemon_runtime_for_home(
     home: &astrid_core::dirs::AstridHome,
     socket_path: &Path,

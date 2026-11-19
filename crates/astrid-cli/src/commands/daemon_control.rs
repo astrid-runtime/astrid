@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 pub(crate) const GRACE: Duration = Duration::from_secs(3);
 
 /// Poll interval while waiting for a signalled process to exit.
-const POLL: Duration = Duration::from_millis(100);
+pub(super) const POLL: Duration = Duration::from_millis(100);
 
 /// Read and parse the daemon PID (and recorded executable path) from `pid_path`.
 ///
