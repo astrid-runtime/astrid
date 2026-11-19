@@ -292,6 +292,25 @@ pub fn read_opened_content<S: ContentSource>(
     read_opened_content_and_verify(source, opened).map(|(bytes, _)| bytes)
 }
 
+/// Validate all content through the same traversal without retaining its output.
+/// The bounded `FastCDC` window and every object/shape/length check still run.
+pub(crate) fn validate_opened_content<S: ContentSource>(
+    source: &S,
+    opened: OpenedContent,
+) -> Result<(), ContentReadError<S::Error>> {
+    let descriptor = opened.descriptor();
+    traversal::validate_decoded_content(
+        source,
+        descriptor.file(),
+        (
+            descriptor.profile(),
+            descriptor.logical_bytes(),
+            descriptor.chunk_count(),
+            opened.content_root(),
+        ),
+    )
+}
+
 /// Reconstruct all bytes and return proof of complete boundary validation.
 ///
 /// # Errors

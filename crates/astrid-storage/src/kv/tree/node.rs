@@ -292,6 +292,14 @@ pub(super) fn decode_value(
     expected_length: u64,
     record: &ObjectRecord,
 ) -> StorageResult<Vec<u8>> {
+    Ok(spilled_opaque_payload(id, expected_length, record)?.to_vec())
+}
+
+pub(super) fn spilled_opaque_payload(
+    id: ObjectId,
+    expected_length: u64,
+    record: &ObjectRecord,
+) -> StorageResult<&[u8]> {
     if record.kind() != ObjectKind::KvLeaf
         || record.format_version() != FORMAT_VERSION
         || record.class() != ObjectClass::Data
@@ -302,7 +310,7 @@ pub(super) fn decode_value(
     {
         return Err(invalid(id, "invalid spilled KV value"));
     }
-    Ok(record.canonical_bytes().to_vec())
+    Ok(record.canonical_bytes())
 }
 
 fn decode_leaf(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
