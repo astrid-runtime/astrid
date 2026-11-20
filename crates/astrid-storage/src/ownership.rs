@@ -240,8 +240,9 @@ impl OwnershipSnapshot {
                 )));
             }
         }
-        if let Some(principal_uid) =
-            principals.first_missing_uid(self.principal_ownership.keys().copied())
+        if !self.principal_ownership.is_empty()
+            && let Some(principal_uid) =
+                principals.first_missing_uid(self.principal_ownership.keys().copied())
         {
             return Err(OwnershipError::CorruptGraph(format!(
                 "principal {principal_uid} is absent from the admitted principal directory"
