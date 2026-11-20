@@ -6,7 +6,9 @@ use std::cell::Cell;
 use std::hint::black_box;
 use std::sync::Arc;
 
+use astrid_core::PrincipalId;
 use astrid_events::rate_limiter::IpcRateLimiter;
+use uuid::Uuid;
 
 #[derive(Clone, Copy, Default)]
 struct Probe {
@@ -92,24 +94,35 @@ fn unused_limiter_requires_no_heap_allocation() {
 
 #[test]
 fn native_idle_allocation_profile() {
-    drop(black_box(IpcRateLimiter::new()));
-    for count in [1, 16, 10_000] {
-        // Vec storage is outside the observation; runtime-owned Arc wrappers
-        // remain included. This is requested heap storage, not logical charge
-        // or allocator/process RSS. Every fixture is dropped before the next.
-        let mut held = Vec::with_capacity(count);
-        let ((), creation) = observe(|| {
-            for _ in 0..count {
-                held.push(black_box(Arc::new(IpcRateLimiter::new())));
-            }
-        });
-        let ((), destruction) = observe(|| held.clear());
-        assert_eq!(creation.allocated, destruction.deallocated);
-        assert_eq!(creation.deallocated, 0);
-        assert_eq!(destruction.allocated, 0);
-        println!(
-            "{}",
-            serde_json::json!({"limiters":count,"retained_requested_bytes":creation.allocated})
-        );
+    let principal = PrincipalId::new("rate-bench").unwrap();
+    IpcRateLimiter::new()
+        .check_quota(Uuid::nil(), &principal, 0, usize::MAX)
+        .unwrap();
+    for active in [false, true] {
+        for count in [1, 16, 10_000] {
+            // Vec storage is outside observation; runtime Arc wrappers and
+            // any real bucket/key allocations are included. Every fixture is
+            // dropped before the next. Requested heap is distinct from RSS.
+            let mut held = Vec::with_capacity(count);
+            let ((), creation) = observe(|| {
+                for _ in 0..count {
+                    let limiter = Arc::new(IpcRateLimiter::new());
+                    if active {
+                        limiter
+                            .check_quota(Uuid::nil(), &principal, 1, usize::MAX)
+                            .unwrap();
+                    }
+                    held.push(black_box(limiter));
+                }
+            });
+            let ((), destruction) = observe(|| held.clear());
+            assert_eq!(creation.allocated, destruction.deallocated);
+            assert_eq!(creation.deallocated, 0);
+            assert_eq!(destruction.allocated, 0);
+            println!(
+                "{}",
+                serde_json::json!({"limiters":count,"active":active,"retained_requested_bytes":creation.allocated})
+            );
+        }
     }
 }
