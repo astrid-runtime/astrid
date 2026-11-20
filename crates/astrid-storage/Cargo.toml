@@ -94,3 +94,7 @@ workspace = true
 # observe the use.
 [package.metadata.cargo-machete]
 ignored = ["getrandom"]
+
+[[bench]]
+name = "ownership_reads"
+harness = false

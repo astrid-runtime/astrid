@@ -21,6 +21,7 @@ mod deletion;
 mod derived;
 mod provision;
 mod resources;
+mod shared_snapshot;
 pub use derived::DerivedPrincipalOwnership;
 mod initialization;
 pub use initialization::PrincipalInitialization;
@@ -275,6 +276,7 @@ pub struct OwnershipStore {
     storage: ScopedKvStore,
     principals: PrincipalDirectory,
     mutation_lock: Arc<AsyncMutex<()>>,
+    snapshots: Arc<shared_snapshot::SharedSnapshots>,
 }
 
 /// Exclusive barrier held while an authenticated principal generation is
@@ -335,6 +337,7 @@ impl OwnershipStore {
             storage: ScopedKvStore::new(storage, OWNERSHIP_NAMESPACE)?,
             principals,
             mutation_lock: Arc::new(AsyncMutex::new(())),
+            snapshots: Arc::default(),
         })
     }
 
