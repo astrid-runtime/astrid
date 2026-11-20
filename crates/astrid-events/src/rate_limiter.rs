@@ -29,16 +29,17 @@ pub const MAX_IPC_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
 /// it resets.
 #[derive(Debug)]
 pub struct IpcRateLimiter {
-    state: dashmap::DashMap<RateLimiterKey, (web_time::Instant, usize)>,
+    state: std::sync::OnceLock<dashmap::DashMap<RateLimiterKey, (web_time::Instant, usize)>>,
     last_prune: std::sync::Mutex<web_time::Instant>,
 }
 
 impl IpcRateLimiter {
-    /// Create a new IPC rate limiter.
+    /// Create a new IPC rate limiter. Bucket storage is allocated on the first
+    /// quota check that passes the hard payload cap.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            state: dashmap::DashMap::new(),
+            state: std::sync::OnceLock::new(),
             last_prune: std::sync::Mutex::new(web_time::Instant::now()),
         }
     }
@@ -52,7 +53,6 @@ impl IpcRateLimiter {
     /// Returns an error string if the payload exceeds
     /// [`MAX_IPC_PAYLOAD_BYTES`] or if adding it would push the bucket over
     /// `max_throughput_bytes_per_sec` within the current 1-second window.
-    #[expect(clippy::collapsible_if)]
     pub fn check_quota(
         &self,
         capsule_uuid: Uuid,
@@ -66,21 +66,21 @@ impl IpcRateLimiter {
             return Err("Payload too large".to_string());
         }
 
+        let state = self.state.get_or_init(dashmap::DashMap::new);
         let now = web_time::Instant::now();
 
-        // Lazy prune stale entries to prevent memory leaks when shared globally.
-        if self.state.len() > 1000 {
-            if let Ok(mut last) = self.last_prune.try_lock() {
-                if now.saturating_duration_since(*last).as_secs() > 60 {
-                    *last = now;
-                    self.state
-                        .retain(|_, v| now.saturating_duration_since(v.0).as_secs() < 1);
-                }
-            }
+        // Check the interval before scanning every shard. Keep the timestamp
+        // unchanged until a sufficiently large map is actually pruned.
+        if let Ok(mut last) = self.last_prune.try_lock()
+            && now.saturating_duration_since(*last).as_secs() > 60
+            && state.len() > 1000
+        {
+            *last = now;
+            state.retain(|_, v| now.saturating_duration_since(v.0).as_secs() < 1);
         }
 
         let key: RateLimiterKey = (capsule_uuid, principal.clone());
-        let mut entry = self.state.entry(key).or_insert((now, 0));
+        let mut entry = state.entry(key).or_insert((now, 0));
 
         // Reset window if more than 1 second has passed
         if now.saturating_duration_since(entry.0).as_secs() >= 1 {
@@ -200,3 +200,6 @@ mod tests {
             .expect("after window reset, fresh budget");
     }
 }
+
+#[cfg(test)]
+mod initialization_tests;

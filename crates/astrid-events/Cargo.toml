@@ -40,3 +40,10 @@ metrics-util = "0.20"
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "rate_limiter"
+harness = false
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true }

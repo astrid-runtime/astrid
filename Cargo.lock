@@ -664,6 +664,7 @@ dependencies = [
  "dashmap",
  "metrics",
  "metrics-util",
+ "nix 0.31.3",
  "parking_lot",
  "serde",
  "serde_json",
