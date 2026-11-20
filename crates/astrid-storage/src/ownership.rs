@@ -181,11 +181,13 @@ impl OwnershipSnapshot {
         let mut admitted = principals.admitted();
         for (principal_uid, ownership) in &self.principal_ownership {
             if *principal_uid != ownership.principal_uid {
+                drop(admitted);
                 return Err(OwnershipError::CorruptGraph(format!(
                     "principal ownership key {principal_uid} disagrees with its record"
                 )));
             }
             if !admitted.contains_uid(*principal_uid) {
+                drop(admitted);
                 return Err(OwnershipError::CorruptGraph(format!(
                     "principal {principal_uid} is absent from the admitted principal directory"
                 )));
@@ -193,6 +195,7 @@ impl OwnershipSnapshot {
             if !self.fleets.contains_key(&ownership.fleet_uid)
                 || !self.users.contains_key(&ownership.assigned_by)
             {
+                drop(admitted);
                 return Err(OwnershipError::CorruptGraph(format!(
                     "principal {principal_uid} ownership references an absent identity"
                 )));
