@@ -272,10 +272,10 @@ wasmparser = "0.257.1"
 windows-sys = "0.61"
 wit-component = "0.257.1"
 wit-parser = "0.257.1"
-# Wasmtime 48.0.9 defaults include `cache` -> wasmtime-internal-cache -> zstd ^0.13.
+# Wasmtime 48.0.10 defaults include `cache` -> wasmtime-internal-cache -> zstd ^0.13.
 # Astrid never calls Config::cache(); compiled-code reuse is CompiledWasmCache.
-# Keep every other 48.0.9 default plus the existing extra `call-hook`.
-wasmtime = { version = "48.0.9", default-features = false, features = [
+# Keep every other 48.0.10 default plus the existing extra `call-hook`.
+wasmtime = { version = "48.0.10", default-features = false, features = [
     "anyhow",
     "async",
     "backtrace",
@@ -303,7 +303,7 @@ wasmtime = { version = "48.0.9", default-features = false, features = [
     "wit-parser",
     "call-hook",
 ] }
-wasmtime-wasi = "48.0.9"
+wasmtime-wasi = "48.0.10"
 unicode-normalization = "=0.1.25"
 unicode-width = "0.2"
 which = "8"
