@@ -6,7 +6,10 @@
 //! `PrincipalProfile::quotas::max_ipc_throughput_bytes`) and is applied
 //! independently per bucket.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use astrid_core::principal::PrincipalId;
+use dashmap::mapref::entry::Entry;
 use uuid::Uuid;
 
 /// Composite bucket key: per-capsule **and** per-principal.
@@ -29,17 +32,20 @@ pub const MAX_IPC_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
 /// it resets.
 #[derive(Debug)]
 pub struct IpcRateLimiter {
-    state: dashmap::DashMap<RateLimiterKey, (web_time::Instant, usize)>,
+    state: std::sync::OnceLock<dashmap::DashMap<RateLimiterKey, (web_time::Instant, usize)>>,
     last_prune: std::sync::Mutex<web_time::Instant>,
+    bucket_count: AtomicUsize,
 }
 
 impl IpcRateLimiter {
-    /// Create a new IPC rate limiter.
+    /// Create a new IPC rate limiter. Bucket storage is allocated on the first
+    /// quota check that passes the hard payload cap.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            state: dashmap::DashMap::new(),
+            state: std::sync::OnceLock::new(),
             last_prune: std::sync::Mutex::new(web_time::Instant::now()),
+            bucket_count: AtomicUsize::new(0),
         }
     }
 
@@ -52,7 +58,6 @@ impl IpcRateLimiter {
     /// Returns an error string if the payload exceeds
     /// [`MAX_IPC_PAYLOAD_BYTES`] or if adding it would push the bucket over
     /// `max_throughput_bytes_per_sec` within the current 1-second window.
-    #[expect(clippy::collapsible_if)]
     pub fn check_quota(
         &self,
         capsule_uuid: Uuid,
@@ -66,21 +71,41 @@ impl IpcRateLimiter {
             return Err("Payload too large".to_string());
         }
 
+        let state = self.state.get_or_init(dashmap::DashMap::new);
         let now = web_time::Instant::now();
 
-        // Lazy prune stale entries to prevent memory leaks when shared globally.
-        if self.state.len() > 1000 {
-            if let Ok(mut last) = self.last_prune.try_lock() {
-                if now.saturating_duration_since(*last).as_secs() > 60 {
-                    *last = now;
-                    self.state
-                        .retain(|_, v| now.saturating_duration_since(v.0).as_secs() < 1);
+        // Count updates are covered by the insertion shard guard or the
+        // prune mutex. This avoids locking every shard just to count buckets.
+        // The relaxed count only gates cleanup; quota authority remains under
+        // the bucket's write guard.
+        if self.bucket_count.load(Ordering::Relaxed) > 1000
+            && let Ok(mut last) = self.last_prune.try_lock()
+            && now.saturating_duration_since(*last).as_secs() > 60
+        {
+            *last = now;
+            let mut removed = 0_usize;
+            state.retain(|_, v| {
+                let keep = now.saturating_duration_since(v.0).as_secs() < 1;
+                if !keep {
+                    removed = removed.saturating_add(1);
                 }
-            }
+                keep
+            });
+            // Insertions publish their count before releasing the shard guard,
+            // so every removed bucket is already included in this subtraction.
+            let previous = self.bucket_count.fetch_sub(removed, Ordering::Relaxed);
+            debug_assert!(previous >= removed);
         }
 
         let key: RateLimiterKey = (capsule_uuid, principal.clone());
-        let mut entry = self.state.entry(key).or_insert((now, 0));
+        let mut entry = match state.entry(key) {
+            Entry::Occupied(entry) => entry.into_ref(),
+            Entry::Vacant(entry) => {
+                let entry = entry.insert((now, 0));
+                self.bucket_count.fetch_add(1, Ordering::Relaxed);
+                entry
+            },
+        };
 
         // Reset window if more than 1 second has passed
         if now.saturating_duration_since(entry.0).as_secs() >= 1 {
@@ -200,3 +225,9 @@ mod tests {
             .expect("after window reset, fresh budget");
     }
 }
+
+#[cfg(test)]
+mod initialization_tests;
+
+#[cfg(all(test, unix))]
+mod profile_tests;
