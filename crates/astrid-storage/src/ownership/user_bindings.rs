@@ -77,7 +77,6 @@ impl OwnershipSnapshot {
         let mut seen = BTreeSet::new();
         for binding in &self.user_bindings {
             if !seen.insert((binding.principal, binding.public_key))
-                || !principals.contains_uid(binding.principal)
                 || !self.users.contains_key(&binding.user)
                 || !self.users.contains_key(&binding.granted_by)
                 || !self.fleets.contains_key(&binding.fleet)
@@ -86,6 +85,15 @@ impl OwnershipSnapshot {
                     "invalid user-device binding".to_owned(),
                 ));
             }
+        }
+        if !self.user_bindings.is_empty()
+            && principals
+                .first_missing_uid(self.user_bindings.iter().map(|binding| binding.principal))
+                .is_some()
+        {
+            return Err(OwnershipError::CorruptGraph(
+                "invalid user-device binding".to_owned(),
+            ));
         }
         Ok(())
     }

@@ -21,6 +21,7 @@ mod deletion;
 mod derived;
 mod provision;
 mod resources;
+mod shared_snapshot;
 pub use derived::DerivedPrincipalOwnership;
 mod initialization;
 pub use initialization::PrincipalInitialization;
@@ -168,6 +169,41 @@ impl OwnershipSnapshot {
         })
     }
 
+    fn validate_principal_owners(
+        &self,
+        principals: &PrincipalDirectory,
+    ) -> Result<(), OwnershipError> {
+        if self.principal_ownership.is_empty() {
+            return Ok(());
+        }
+        // Walk once, yielding to pending directory writers before each UID
+        // lookup. The borrowed view spans only bounded in-memory checks.
+        let mut admitted = principals.admitted();
+        for (principal_uid, ownership) in &self.principal_ownership {
+            if *principal_uid != ownership.principal_uid {
+                drop(admitted);
+                return Err(OwnershipError::CorruptGraph(format!(
+                    "principal ownership key {principal_uid} disagrees with its record"
+                )));
+            }
+            if !admitted.contains_uid(*principal_uid) {
+                drop(admitted);
+                return Err(OwnershipError::CorruptGraph(format!(
+                    "principal {principal_uid} is absent from the admitted principal directory"
+                )));
+            }
+            if !self.fleets.contains_key(&ownership.fleet_uid)
+                || !self.users.contains_key(&ownership.assigned_by)
+            {
+                drop(admitted);
+                return Err(OwnershipError::CorruptGraph(format!(
+                    "principal {principal_uid} ownership references an absent identity"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn validate(&self, principals: &PrincipalDirectory) -> Result<(), OwnershipError> {
         self.validate_accountable_users()?;
         self.validate_user_bindings(principals)?;
@@ -225,25 +261,7 @@ impl OwnershipSnapshot {
                 )));
             }
         }
-        for (principal_uid, ownership) in &self.principal_ownership {
-            if *principal_uid != ownership.principal_uid {
-                return Err(OwnershipError::CorruptGraph(format!(
-                    "principal ownership key {principal_uid} disagrees with its record"
-                )));
-            }
-            if !principals.contains_uid(*principal_uid) {
-                return Err(OwnershipError::CorruptGraph(format!(
-                    "principal {principal_uid} is absent from the admitted principal directory"
-                )));
-            }
-            if !self.fleets.contains_key(&ownership.fleet_uid)
-                || !self.users.contains_key(&ownership.assigned_by)
-            {
-                return Err(OwnershipError::CorruptGraph(format!(
-                    "principal {principal_uid} ownership references an absent identity"
-                )));
-            }
-        }
+        self.validate_principal_owners(principals)?;
         let mut deletion_aliases = BTreeMap::new();
         for (principal_uid, reservation) in &self.principal_deletions {
             if let Some(fleet) = reservation.fleet
@@ -275,6 +293,7 @@ pub struct OwnershipStore {
     storage: ScopedKvStore,
     principals: PrincipalDirectory,
     mutation_lock: Arc<AsyncMutex<()>>,
+    snapshots: Arc<shared_snapshot::SharedSnapshots>,
 }
 
 /// Exclusive barrier held while an authenticated principal generation is
@@ -335,6 +354,7 @@ impl OwnershipStore {
             storage: ScopedKvStore::new(storage, OWNERSHIP_NAMESPACE)?,
             principals,
             mutation_lock: Arc::new(AsyncMutex::new(())),
+            snapshots: Arc::default(),
         })
     }
 
@@ -620,16 +640,20 @@ impl OwnershipStore {
     {
         for _ in 0..MAX_CAS_ATTEMPTS {
             let current = self.storage.get(GRAPH_KEY).await?;
-            let mut graph = self.decode(current.as_deref())?;
+            let (mut graph, cached) = self.decode_mutation_input(current.as_deref())?;
             let output = apply(&mut graph)?;
             graph.validate(&self.principals)?;
             let encoded = serde_json::to_vec(&graph)
                 .map_err(|error| OwnershipError::Serialization(error.to_string()))?;
+            let invalidation = cached.and_then(|entry| entry.invalidated_by(&encoded));
             if self
                 .storage
                 .compare_and_swap(GRAPH_KEY, current.as_deref(), encoded)
                 .await?
             {
+                if let Some(entry) = invalidation {
+                    self.snapshots.discard(entry);
+                }
                 return Ok(output);
             }
         }
