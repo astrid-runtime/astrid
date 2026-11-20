@@ -232,11 +232,6 @@ impl OwnershipSnapshot {
                     "principal ownership key {principal_uid} disagrees with its record"
                 )));
             }
-            if !principals.contains_uid(*principal_uid) {
-                return Err(OwnershipError::CorruptGraph(format!(
-                    "principal {principal_uid} is absent from the admitted principal directory"
-                )));
-            }
             if !self.fleets.contains_key(&ownership.fleet_uid)
                 || !self.users.contains_key(&ownership.assigned_by)
             {
@@ -244,6 +239,13 @@ impl OwnershipSnapshot {
                     "principal {principal_uid} ownership references an absent identity"
                 )));
             }
+        }
+        if let Some(principal_uid) =
+            principals.first_missing_uid(self.principal_ownership.keys().copied())
+        {
+            return Err(OwnershipError::CorruptGraph(format!(
+                "principal {principal_uid} is absent from the admitted principal directory"
+            )));
         }
         let mut deletion_aliases = BTreeMap::new();
         for (principal_uid, reservation) in &self.principal_deletions {

@@ -2,6 +2,8 @@
 //! `cargo bench -p astrid-storage --bench ownership_reads -- alias 1000 1000 1`
 //! Count is calls per worker. `cold` includes store creation, one alias read,
 //! and drop. `mutate` exercises unchanged fresh-read/CAS with a warmed reader.
+//! For `contended`, count is the writer window in milliseconds. Optional fifth
+//! argument sets each reader's offered period in microseconds (zero = saturated).
 #![deny(unsafe_code)]
 
 use astrid_core::{
@@ -23,6 +25,7 @@ enum Mode {
     Owned,
     Cold,
     Mutate,
+    Contended,
 }
 
 struct Args {
@@ -31,6 +34,7 @@ struct Args {
     rows: usize,
     calls: usize,
     workers: usize,
+    read_period: std::time::Duration,
 }
 impl Args {
     fn parse() -> Result<Self> {
@@ -43,9 +47,9 @@ impl Args {
         } else {
             values
         };
-        if values.len() != 4 {
+        if !(4..=5).contains(&values.len()) {
             return Err(
-                "usage: ownership_reads <alias|derive|owned|cold|mutate> <rows> <calls> <workers>"
+                "usage: ownership_reads <alias|derive|owned|cold|mutate|contended> <rows> <calls> <workers> [reader_period_us]"
                     .into(),
             );
         }
@@ -55,11 +59,12 @@ impl Args {
             "owned" => Mode::Owned,
             "cold" => Mode::Cold,
             "mutate" => Mode::Mutate,
+            "contended" => Mode::Contended,
             _ => return Err("unknown ownership workload".into()),
         };
         let rows = values[1].parse()?;
-        if matches!(mode, Mode::Derive | Mode::Mutate) && rows == 0 {
-            return Err("derive and mutate require a populated graph".into());
+        if matches!(mode, Mode::Derive | Mode::Mutate | Mode::Contended) && rows == 0 {
+            return Err("derive, mutate and contended require a populated graph".into());
         }
         Ok(Self {
             name: values[0].clone(),
@@ -67,6 +72,13 @@ impl Args {
             rows,
             calls: values[2].parse::<NonZeroUsize>()?.get(),
             workers: values[3].parse::<NonZeroUsize>()?.get(),
+            read_period: std::time::Duration::from_micros(
+                values
+                    .get(4)
+                    .map(|v| v.parse::<u64>())
+                    .transpose()?
+                    .unwrap_or(0),
+            ),
         })
     }
 }
@@ -154,7 +166,7 @@ impl Fixture {
 
     async fn operation(&self, mode: Mode) -> Result<()> {
         match mode {
-            Mode::Alias => {
+            Mode::Alias | Mode::Contended => {
                 self.store
                     .ensure_alias_available(black_box(&self.alias))
                     .await?;
@@ -218,6 +230,113 @@ fn cpu_ns() -> Result<Option<u64>> {
     Ok(None)
 }
 
+/// Rename one stable UID while public ownership readers keep validating it.
+/// Latency includes real directory lock admission and both alias-map updates.
+async fn contended(fixture: Arc<Fixture>, args: &Args) -> Result<()> {
+    use std::sync::{
+        Barrier,
+        atomic::{AtomicBool, Ordering},
+    };
+    let done = Arc::new(AtomicBool::new(false));
+    let barrier = Arc::new(Barrier::new(
+        args.workers.checked_add(1).ok_or("worker count overflow")?,
+    ));
+    let mut readers = tokio::task::JoinSet::new();
+    let before = cpu_ns()?;
+    let started = Instant::now();
+    for _ in 0..args.workers {
+        let (fixture, done, barrier) = (fixture.clone(), done.clone(), barrier.clone());
+        let read_period = args.read_period;
+        readers.spawn(async move {
+            let warmup = fixture.operation(Mode::Alias).await;
+            barrier.wait();
+            warmup?;
+            let mut count = 0_u64;
+            let mut next_read = Instant::now();
+            while !done.load(Ordering::Acquire) {
+                fixture.operation(Mode::Alias).await?;
+                count = count.checked_add(1).ok_or("reader count overflow")?;
+                if !read_period.is_zero() {
+                    next_read = next_read
+                        .checked_add(read_period)
+                        .ok_or("reader schedule overflow")?;
+                    std::thread::sleep(next_read.saturating_duration_since(Instant::now()));
+                }
+            }
+            Ok::<_, Box<dyn Error + Send + Sync>>(count)
+        });
+    }
+    let writer_fixture = fixture.clone();
+    let writer_done = done.clone();
+    let calls = args.calls;
+    let writer = std::thread::spawn(move || {
+        let result = directory_writes(&writer_fixture, &barrier, calls);
+        writer_done.store(true, Ordering::Release);
+        result
+    });
+    let mut reads = 0_u64;
+    while let Some(result) = readers.join_next().await {
+        reads = reads.checked_add(result??).ok_or("reader count overflow")?;
+    }
+    let mut samples = writer.join().map_err(|_| "directory writer panicked")??;
+    let wall = started.elapsed();
+    let cpu = match (before, cpu_ns()?) {
+        (Some(a), Some(b)) => Some(b.checked_sub(a).ok_or("CPU reversed")?),
+        _ => None,
+    };
+    samples.sort_unstable();
+    let maximum = samples.last().ok_or("writer window produced no samples")?;
+    let percentile = |percent: usize| -> Result<u64> {
+        let index = samples
+            .len()
+            .checked_sub(1)
+            .and_then(|last| last.checked_mul(percent))
+            .ok_or("percentile index overflow")?
+            / 100;
+        samples
+            .get(index)
+            .copied()
+            .ok_or_else(|| "percentile index out of range".into())
+    };
+    println!(
+        "{}",
+        serde_json::json!({"mode":args.name,"rows":args.rows,
+        "writer_window_ms":args.calls,"writer_calls":samples.len(),"workers":args.workers,"reads":reads,
+        "reader_period_us":u64::try_from(args.read_period.as_micros())?,
+        "cpu_ns":cpu,"wall_ns":u64::try_from(wall.as_nanos())?,
+        "writer_p50_ns":percentile(50)?,"writer_p95_ns":percentile(95)?,
+        "writer_p99_ns":percentile(99)?,"writer_max_ns":maximum})
+    );
+    Ok(())
+}
+
+fn directory_writes(
+    fixture: &Fixture,
+    barrier: &std::sync::Barrier,
+    calls: usize,
+) -> Result<Vec<u64>> {
+    let original = PrincipalId::new("agent-0")?;
+    let temporary = PrincipalId::new("writer-agent-0")?;
+    let window = std::time::Duration::from_millis(u64::try_from(calls)?);
+    let mut samples = Vec::new();
+    barrier.wait();
+    let window_start = Instant::now();
+    while window_start.elapsed() < window {
+        let index = samples.len();
+        let (from, to) = if index % 2 == 0 {
+            (&original, &temporary)
+        } else {
+            (&temporary, &original)
+        };
+        let started = Instant::now();
+        fixture
+            .directory
+            .rename(fixture.principal, from, to.clone())?;
+        samples.push(u64::try_from(started.elapsed().as_nanos())?);
+    }
+    Ok(samples)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -226,6 +345,7 @@ fn main() -> Result<()> {
         .build()?;
     runtime.block_on(async {
         let fixture = Arc::new(Fixture::new(args.rows).await?);
+        if args.mode == Mode::Contended { return contended(fixture, &args).await; }
         // Warm actual public readers and executor threads outside timing.
         fixture.operation(if args.mode == Mode::Mutate { Mode::Alias } else { args.mode }).await?;
         let cpu_before = cpu_ns()?;
