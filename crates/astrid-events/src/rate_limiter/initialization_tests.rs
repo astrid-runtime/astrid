@@ -179,6 +179,16 @@ fn concurrent_insertions_and_pruning_keep_the_bucket_count_exact() {
         }
     });
     assert_eq!(limiter.bucket_count.load(Ordering::Relaxed), state.len());
+    // The race may legitimately expire buckets on a delayed runner. Seed a
+    // fresh threshold-sized group with cleanup disabled before the second
+    // prune, so this assertion does not depend on the race finishing in 1s.
+    *limiter.last_prune.lock().unwrap() =
+        Instant::now().checked_add(Duration::from_hours(1)).unwrap();
+    for index in 0_u128..1001 {
+        let key = Uuid::from_u128(index.checked_add(10_000).unwrap());
+        limiter.check_quota(key, &principal, 0, 0).unwrap();
+    }
+    assert!(state.len() > 1000);
     // Force another real prune after the race and verify the count again.
     for mut entry in state.iter_mut() {
         entry.0 = expired;
