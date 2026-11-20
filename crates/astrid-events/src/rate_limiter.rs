@@ -203,3 +203,6 @@ mod tests {
 
 #[cfg(test)]
 mod initialization_tests;
+
+#[cfg(all(test, unix))]
+mod profile_tests;
