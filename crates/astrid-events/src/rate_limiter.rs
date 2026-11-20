@@ -6,7 +6,10 @@
 //! `PrincipalProfile::quotas::max_ipc_throughput_bytes`) and is applied
 //! independently per bucket.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use astrid_core::principal::PrincipalId;
+use dashmap::mapref::entry::Entry;
 use uuid::Uuid;
 
 /// Composite bucket key: per-capsule **and** per-principal.
@@ -31,6 +34,7 @@ pub const MAX_IPC_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
 pub struct IpcRateLimiter {
     state: std::sync::OnceLock<dashmap::DashMap<RateLimiterKey, (web_time::Instant, usize)>>,
     last_prune: std::sync::Mutex<web_time::Instant>,
+    bucket_count: AtomicUsize,
 }
 
 impl IpcRateLimiter {
@@ -41,6 +45,7 @@ impl IpcRateLimiter {
         Self {
             state: std::sync::OnceLock::new(),
             last_prune: std::sync::Mutex::new(web_time::Instant::now()),
+            bucket_count: AtomicUsize::new(0),
         }
     }
 
@@ -69,18 +74,38 @@ impl IpcRateLimiter {
         let state = self.state.get_or_init(dashmap::DashMap::new);
         let now = web_time::Instant::now();
 
-        // Check the interval before scanning every shard. Keep the timestamp
-        // unchanged until a sufficiently large map is actually pruned.
-        if let Ok(mut last) = self.last_prune.try_lock()
+        // Count updates are covered by the insertion shard guard or the
+        // prune mutex. This avoids locking every shard just to count buckets.
+        // The relaxed count only gates cleanup; quota authority remains under
+        // the bucket's write guard.
+        if self.bucket_count.load(Ordering::Relaxed) > 1000
+            && let Ok(mut last) = self.last_prune.try_lock()
             && now.saturating_duration_since(*last).as_secs() > 60
-            && state.len() > 1000
         {
             *last = now;
-            state.retain(|_, v| now.saturating_duration_since(v.0).as_secs() < 1);
+            let mut removed = 0_usize;
+            state.retain(|_, v| {
+                let keep = now.saturating_duration_since(v.0).as_secs() < 1;
+                if !keep {
+                    removed = removed.saturating_add(1);
+                }
+                keep
+            });
+            // Insertions publish their count before releasing the shard guard,
+            // so every removed bucket is already included in this subtraction.
+            let previous = self.bucket_count.fetch_sub(removed, Ordering::Relaxed);
+            debug_assert!(previous >= removed);
         }
 
         let key: RateLimiterKey = (capsule_uuid, principal.clone());
-        let mut entry = state.entry(key).or_insert((now, 0));
+        let mut entry = match state.entry(key) {
+            Entry::Occupied(entry) => entry.into_ref(),
+            Entry::Vacant(entry) => {
+                let entry = entry.insert((now, 0));
+                self.bucket_count.fetch_add(1, Ordering::Relaxed);
+                entry
+            },
+        };
 
         // Reset window if more than 1 second has passed
         if now.saturating_duration_since(entry.0).as_secs() >= 1 {

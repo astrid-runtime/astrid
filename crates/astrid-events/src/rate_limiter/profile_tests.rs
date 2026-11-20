@@ -22,12 +22,13 @@ fn cpu_micros() -> i64 {
 #[test]
 #[ignore = "Opt-in native release profile; not a CI timing gate"]
 fn mature_quota_profile() {
-    for (workers, split, count) in [
-        (1, false, 500_000),
-        (4, false, 100_000),
-        (16, false, 25_000),
-        (4, true, 100_000),
-        (16, true, 25_000),
+    for (workers, split, count, extra_buckets) in [
+        (1, false, 500_000, 0),
+        (4, false, 100_000, 0),
+        (16, false, 25_000, 0),
+        (4, true, 100_000, 0),
+        (16, true, 25_000, 0),
+        (1, false, 500_000, 1000),
     ] {
         let limiter = Arc::new(IpcRateLimiter::new());
         let principal = PrincipalId::new("rate-bench").unwrap();
@@ -45,7 +46,11 @@ fn mature_quota_profile() {
                 .check_quota(*key, &principal, 0, usize::MAX)
                 .unwrap();
         }
-        // Exercise the real mature small-map path immediately, without a
+        for extra in 0_u128..extra_buckets {
+            let key = Uuid::from_u128(extra.checked_add(10_000).unwrap());
+            limiter.check_quota(key, &principal, 0, usize::MAX).unwrap();
+        }
+        // Exercise the real mature path immediately, without a
         // minute-long sleep or exposing a clock setter in the library API.
         *limiter.last_prune.lock().unwrap() = web_time::Instant::now()
             .checked_sub(Duration::from_mins(2))
@@ -73,7 +78,7 @@ fn mature_quota_profile() {
         let cpu = cpu_micros().checked_sub(cpu_before).unwrap();
         println!(
             "{}",
-            serde_json::json!({"workers":workers,"split":split,"count":count,
+            serde_json::json!({"workers":workers,"split":split,"count":count,"extra_buckets":extra_buckets,
                 "cpu_micros":cpu,"wall_ns":u64::try_from(wall.as_nanos()).unwrap()})
         );
     }

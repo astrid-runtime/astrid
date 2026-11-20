@@ -41,6 +41,7 @@ fn concurrent_first_checks_share_one_bucket() {
         }
     });
     assert_eq!(limiter.state.get().unwrap().len(), 1);
+    assert_eq!(limiter.bucket_count.load(Ordering::Relaxed), 1);
 }
 
 #[test]
@@ -57,7 +58,8 @@ fn concurrent_quota_is_atomic_and_isolated_by_principal_and_capsule() {
     let future = Instant::now().checked_add(Duration::from_hours(1)).unwrap();
     let state = limiter.state.get_or_init(dashmap::DashMap::new);
     for key in &keys {
-        state.insert(key.clone(), (future, 0));
+        limiter.check_quota(key.0, &key.1, 0, usize::MAX).unwrap();
+        *state.get_mut(key).unwrap() = (future, 0);
     }
     let admitted = std::array::from_fn::<_, 4, _>(|_| AtomicUsize::new(0));
     let barrier = Barrier::new(16);
@@ -94,7 +96,9 @@ fn crossing_size_threshold_does_not_delay_prune_or_reset_live_quotas() {
     let principal = PrincipalId::new("alice").unwrap();
     let state = limiter.state.get_or_init(dashmap::DashMap::new);
     for index in 0..1000 {
-        state.insert((Uuid::from_u128(index), principal.clone()), (expired, 1));
+        let key = (Uuid::from_u128(index), principal.clone());
+        limiter.check_quota(key.0, &key.1, 0, usize::MAX).unwrap();
+        *state.get_mut(&key).unwrap() = (expired, 1);
     }
     let live = Uuid::from_u128(1000);
     limiter.check_quota(live, &principal, 100, 100).unwrap();
@@ -107,6 +111,7 @@ fn crossing_size_threshold_does_not_delay_prune_or_reset_live_quotas() {
         Err("Rate limit exceeded".to_owned())
     );
     assert_eq!(state.len(), 1, "stale keys should be removed at 1001");
+    assert_eq!(limiter.bucket_count.load(Ordering::Relaxed), state.len());
     assert_eq!(state.get(&(live, principal)).unwrap().1, 100);
     assert!(*limiter.last_prune.lock().unwrap() > last);
 }
@@ -121,11 +126,67 @@ fn prune_interval_does_not_allow_an_early_prune() {
     let principal = PrincipalId::new("alice").unwrap();
     let state = limiter.state.get_or_init(dashmap::DashMap::new);
     for index in 0..1001 {
-        state.insert((Uuid::from_u128(index), principal.clone()), (expired, 1));
+        let key = (Uuid::from_u128(index), principal.clone());
+        limiter.check_quota(key.0, &key.1, 0, usize::MAX).unwrap();
+        *state.get_mut(&key).unwrap() = (expired, 1);
     }
     limiter
         .check_quota(Uuid::from_u128(1001), &principal, 0, 0)
         .unwrap();
     assert_eq!(state.len(), 1002);
+    assert_eq!(limiter.bucket_count.load(Ordering::Relaxed), state.len());
     assert_eq!(*limiter.last_prune.lock().unwrap(), last);
+}
+
+#[test]
+fn concurrent_insertions_and_pruning_keep_the_bucket_count_exact() {
+    let limiter = IpcRateLimiter::new();
+    let principal = PrincipalId::new("alice").unwrap();
+    for index in 0..1001 {
+        limiter
+            .check_quota(Uuid::from_u128(index), &principal, 0, 0)
+            .unwrap();
+    }
+    let state = limiter.state.get().unwrap();
+    let expired = Instant::now().checked_sub(Duration::from_mins(2)).unwrap();
+    for mut entry in state.iter_mut() {
+        entry.0 = expired;
+    }
+    *limiter.last_prune.lock().unwrap() = expired;
+    let barrier = Barrier::new(16);
+    std::thread::scope(|scope| {
+        for worker in 0_u128..16 {
+            let (limiter, barrier, principal) = (&limiter, &barrier, &principal);
+            scope.spawn(move || {
+                barrier.wait();
+                for index in 0_u128..128 {
+                    let key = worker
+                        .checked_mul(128)
+                        .unwrap()
+                        .checked_add(index)
+                        .unwrap()
+                        .checked_add(1001)
+                        .unwrap();
+                    // Rejected quota attempts still create exactly one bucket,
+                    // preserving the original limiter's accounting semantics.
+                    assert!(
+                        limiter
+                            .check_quota(Uuid::from_u128(key), principal, 1, 0)
+                            .is_err()
+                    );
+                }
+            });
+        }
+    });
+    assert_eq!(limiter.bucket_count.load(Ordering::Relaxed), state.len());
+    // Force another real prune after the race and verify the count again.
+    for mut entry in state.iter_mut() {
+        entry.0 = expired;
+    }
+    *limiter.last_prune.lock().unwrap() = expired;
+    limiter
+        .check_quota(Uuid::from_u128(u128::MAX), &principal, 0, 0)
+        .unwrap();
+    assert_eq!(state.len(), 1);
+    assert_eq!(limiter.bucket_count.load(Ordering::Relaxed), 1);
 }
