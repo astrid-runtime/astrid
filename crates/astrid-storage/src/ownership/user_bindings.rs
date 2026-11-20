@@ -86,9 +86,10 @@ impl OwnershipSnapshot {
                 ));
             }
         }
-        if principals
-            .first_missing_uid(self.user_bindings.iter().map(|binding| binding.principal))
-            .is_some()
+        if !self.user_bindings.is_empty()
+            && principals
+                .first_missing_uid(self.user_bindings.iter().map(|binding| binding.principal))
+                .is_some()
         {
             return Err(OwnershipError::CorruptGraph(
                 "invalid user-device binding".to_owned(),
