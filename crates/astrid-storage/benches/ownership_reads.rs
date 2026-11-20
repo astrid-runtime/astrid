@@ -126,13 +126,20 @@ impl Fixture {
             document["accountable_users"] = serde_json::Value::Object(accountable);
             // Populate the real persisted grammar once; validation remains in
             // the public reader. Avoid O(N²) fixture-creation CAS work.
+            let keys = backend.list_keys(OWNERSHIP_NAMESPACE).await?;
+            let [graph_key] = keys.as_slice() else {
+                return Err("ownership fixture must have exactly one graph key".into());
+            };
             backend
                 .set(
                     OWNERSHIP_NAMESPACE,
-                    "graph-v1",
+                    graph_key,
                     serde_json::to_vec(&document)?,
                 )
                 .await?;
+            if store.load().await?.principal_owners().count() != rows {
+                return Err("ownership fixture does not contain the requested principals".into());
+            }
         }
         Ok(Self {
             backend,
