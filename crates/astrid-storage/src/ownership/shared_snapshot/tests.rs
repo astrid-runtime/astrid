@@ -18,6 +18,10 @@ struct ObservedKv {
     reads: AtomicUsize,
     fail: AtomicBool,
     block_next: AtomicBool,
+    reject_cas: AtomicBool,
+    block_cas_result: AtomicBool,
+    cas_committed: Notify,
+    release_cas: Notify,
     blocked: Notify,
     release: Notify,
 }
@@ -58,7 +62,15 @@ impl KvStore for ObservedKv {
         expected: Option<&[u8]>,
         new: Vec<u8>,
     ) -> StorageResult<bool> {
-        self.inner.compare_and_swap(n, k, expected, new).await
+        if self.reject_cas.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let applied = self.inner.compare_and_swap(n, k, expected, new).await?;
+        if applied && self.block_cas_result.swap(false, Ordering::SeqCst) {
+            self.cas_committed.notify_one();
+            self.release_cas.notified().await;
+        }
+        Ok(applied)
     }
 }
 
@@ -296,4 +308,132 @@ async fn warmed_readers_do_not_supply_mutation_authority_or_mask_retirement() {
         store.capture_derived_ownership(uid).await,
         Err(OwnershipError::PrincipalDeletionInProgress(_))
     ));
+}
+
+fn another_user() -> UserIdentity {
+    UserIdentity::from_genesis(UserGenesis::from_parts(
+        Uuid::from_u128(10),
+        Utc.timestamp_opt(1_700_000_000, 0).single().unwrap(),
+        [10; 32],
+    ))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn matching_cached_mutation_input_is_revalidated_before_applying() {
+    let (_, directory, store) = fixture();
+    let (alias, uid) = populate(&store, &directory).await;
+    let first = store.load_shared().await.unwrap();
+    directory.unregister(&alias, uid);
+    let applied = AtomicBool::new(false);
+    let result = store
+        .mutate(|_| {
+            applied.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+    assert!(result.is_err());
+    assert!(!applied.load(Ordering::SeqCst));
+    directory.register(alias, uid).unwrap();
+    assert!(Arc::ptr_eq(&first, &store.load_shared().await.unwrap()));
+}
+
+#[tokio::test]
+async fn mutation_preserves_external_updates_despite_an_old_read_cache() {
+    let (backend, directory, store) = fixture();
+    let (_, uid) = populate(&store, &directory).await;
+    let first = store.load_shared().await.unwrap();
+    let owner = first.principal_owner(uid).unwrap();
+    let peer = OwnershipStore::new(backend, directory).unwrap();
+    let user = another_user();
+    peer.create_user(user.clone()).await.unwrap();
+    store
+        .set_membership(
+            owner.fleet_uid,
+            owner.assigned_by,
+            astrid_core::FleetRole::Owner,
+            owner.assigned_by,
+        )
+        .await
+        .unwrap();
+    assert!(store.load().await.unwrap().user(user.uid).is_some());
+    assert!(first.user(user.uid).is_none());
+}
+
+#[tokio::test]
+async fn committed_change_releases_obsolete_cache_but_keeps_pinned_views() {
+    let (_, directory, store) = fixture();
+    populate(&store, &directory).await;
+    let first = store.load_shared().await.unwrap();
+    let old_entry = Arc::downgrade(store.snapshots.current.lock().as_ref().unwrap());
+    let old_graph = Arc::downgrade(&first);
+    let user = another_user();
+    store.create_user(user.clone()).await.unwrap();
+    assert!(store.snapshots.current.lock().is_none());
+    assert!(
+        old_entry.upgrade().is_none(),
+        "obsolete raw document must be released"
+    );
+    assert!(first.user(user.uid).is_none());
+    assert!(store.load_shared().await.unwrap().user(user.uid).is_some());
+    drop(first);
+    assert!(old_graph.upgrade().is_none());
+}
+
+#[tokio::test]
+async fn unchanged_write_and_failed_cas_keep_the_valid_read_cache() {
+    let (backend, directory, store) = fixture();
+    let (_, uid) = populate(&store, &directory).await;
+    let first = store.load_shared().await.unwrap();
+    let owner = first.principal_owner(uid).unwrap();
+    backend.reads.store(0, Ordering::SeqCst);
+    store
+        .set_membership(
+            owner.fleet_uid,
+            owner.assigned_by,
+            astrid_core::FleetRole::Owner,
+            owner.assigned_by,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.reads.load(Ordering::SeqCst),
+        1,
+        "one fresh KV get per CAS attempt"
+    );
+    assert!(Arc::ptr_eq(&first, &store.load_shared().await.unwrap()));
+    backend.reads.store(0, Ordering::SeqCst);
+    backend.reject_cas.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        store.create_user(another_user()).await,
+        Err(OwnershipError::ConcurrentModification)
+    ));
+    assert_eq!(backend.reads.load(Ordering::SeqCst), MAX_CAS_ATTEMPTS);
+    backend.reject_cas.store(false, Ordering::SeqCst);
+    assert!(Arc::ptr_eq(&first, &store.load_shared().await.unwrap()));
+    assert!(
+        store
+            .load()
+            .await
+            .unwrap()
+            .user(another_user().uid)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn committed_writer_does_not_discard_a_newer_read_publication() {
+    let (backend, directory, store) = fixture();
+    populate(&store, &directory).await;
+    let first = store.load_shared().await.unwrap();
+    backend.block_cas_result.store(true, Ordering::SeqCst);
+    let writer = store.clone();
+    let write = tokio::spawn(async move { writer.create_user(another_user()).await });
+    backend.cas_committed.notified().await;
+    let current = store.load_shared().await.unwrap();
+    assert!(current.user(another_user().uid).is_some());
+    assert!(first.user(another_user().uid).is_none());
+    backend.release_cas.notify_one();
+    write.await.unwrap().unwrap();
+    assert!(Arc::ptr_eq(&current, &store.load_shared().await.unwrap()));
 }

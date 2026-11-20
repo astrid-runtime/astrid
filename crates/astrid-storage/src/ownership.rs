@@ -626,16 +626,20 @@ impl OwnershipStore {
     {
         for _ in 0..MAX_CAS_ATTEMPTS {
             let current = self.storage.get(GRAPH_KEY).await?;
-            let mut graph = self.decode(current.as_deref())?;
+            let (mut graph, cached) = self.decode_mutation_input(current.as_deref())?;
             let output = apply(&mut graph)?;
             graph.validate(&self.principals)?;
             let encoded = serde_json::to_vec(&graph)
                 .map_err(|error| OwnershipError::Serialization(error.to_string()))?;
+            let invalidation = cached.and_then(|entry| entry.invalidated_by(&encoded));
             if self
                 .storage
                 .compare_and_swap(GRAPH_KEY, current.as_deref(), encoded)
                 .await?
             {
+                if let Some(entry) = invalidation {
+                    self.snapshots.discard(entry);
+                }
                 return Ok(output);
             }
         }
