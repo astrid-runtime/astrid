@@ -169,6 +169,38 @@ impl OwnershipSnapshot {
         })
     }
 
+    fn validate_principal_owners(
+        &self,
+        principals: &PrincipalDirectory,
+    ) -> Result<(), OwnershipError> {
+        if self.principal_ownership.is_empty() {
+            return Ok(());
+        }
+        // Walk once, yielding to pending directory writers before each UID
+        // lookup. The borrowed view spans only bounded in-memory checks.
+        let mut admitted = principals.admitted();
+        for (principal_uid, ownership) in &self.principal_ownership {
+            if *principal_uid != ownership.principal_uid {
+                return Err(OwnershipError::CorruptGraph(format!(
+                    "principal ownership key {principal_uid} disagrees with its record"
+                )));
+            }
+            if !admitted.contains_uid(*principal_uid) {
+                return Err(OwnershipError::CorruptGraph(format!(
+                    "principal {principal_uid} is absent from the admitted principal directory"
+                )));
+            }
+            if !self.fleets.contains_key(&ownership.fleet_uid)
+                || !self.users.contains_key(&ownership.assigned_by)
+            {
+                return Err(OwnershipError::CorruptGraph(format!(
+                    "principal {principal_uid} ownership references an absent identity"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn validate(&self, principals: &PrincipalDirectory) -> Result<(), OwnershipError> {
         self.validate_accountable_users()?;
         self.validate_user_bindings(principals)?;
@@ -226,28 +258,7 @@ impl OwnershipSnapshot {
                 )));
             }
         }
-        for (principal_uid, ownership) in &self.principal_ownership {
-            if *principal_uid != ownership.principal_uid {
-                return Err(OwnershipError::CorruptGraph(format!(
-                    "principal ownership key {principal_uid} disagrees with its record"
-                )));
-            }
-            if !self.fleets.contains_key(&ownership.fleet_uid)
-                || !self.users.contains_key(&ownership.assigned_by)
-            {
-                return Err(OwnershipError::CorruptGraph(format!(
-                    "principal {principal_uid} ownership references an absent identity"
-                )));
-            }
-        }
-        if !self.principal_ownership.is_empty()
-            && let Some(principal_uid) =
-                principals.first_missing_uid(self.principal_ownership.keys().copied())
-        {
-            return Err(OwnershipError::CorruptGraph(format!(
-                "principal {principal_uid} is absent from the admitted principal directory"
-            )));
-        }
+        self.validate_principal_owners(principals)?;
         let mut deletion_aliases = BTreeMap::new();
         for (principal_uid, reservation) in &self.principal_deletions {
             if let Some(fleet) = reservation.fleet

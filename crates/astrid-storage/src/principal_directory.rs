@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use astrid_core::identity::PrincipalUid;
 use astrid_core::principal::PrincipalId;
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockReadGuard};
 
 use crate::error::{StorageError, StorageResult};
 
@@ -24,6 +24,20 @@ pub struct PrincipalDirectory {
 struct PrincipalDirectoryState {
     aliases: HashMap<PrincipalId, PrincipalUid>,
     principals: HashMap<PrincipalUid, PrincipalId>,
+}
+
+/// Borrowed live-membership view that fairly admits writers between lookups.
+/// Keep the scope synchronous and limited to bounded in-memory checks.
+pub(crate) struct AdmittedPrincipals<'a> {
+    state: RwLockReadGuard<'a, PrincipalDirectoryState>,
+}
+
+impl AdmittedPrincipals<'_> {
+    #[inline]
+    pub(crate) fn contains_uid(&mut self, uid: PrincipalUid) -> bool {
+        RwLockReadGuard::bump(&mut self.state);
+        self.state.principals.contains_key(&uid)
+    }
 }
 
 impl PrincipalDirectory {
@@ -164,13 +178,17 @@ impl PrincipalDirectory {
     ) -> Option<PrincipalUid> {
         let mut uids = uids.into_iter();
         let first = uids.next()?;
-        let mut state = self.inner.read();
-        std::iter::once(first).chain(uids).find(|uid| {
-            // Fast state check without a lock-word RMW when uncontended;
-            // fairly yield before consulting current membership if needed.
-            parking_lot::RwLockReadGuard::bump(&mut state);
-            !state.principals.contains_key(uid)
-        })
+        let mut admitted = self.admitted();
+        std::iter::once(first)
+            .chain(uids)
+            .find(|uid| !admitted.contains_uid(*uid))
+    }
+
+    /// Borrow membership for synchronous checks without repeated lock acquisition.
+    pub(crate) fn admitted(&self) -> AdmittedPrincipals<'_> {
+        AdmittedPrincipals {
+            state: self.inner.read(),
+        }
     }
 
     /// Snapshot every admitted alias-to-UID binding in deterministic order.
