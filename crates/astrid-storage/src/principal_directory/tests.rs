@@ -111,3 +111,70 @@ fn unwinding_native_callback_releases_binding_without_poisoning() {
     directory.unregister(&alias("alice"), uid(1));
     assert!(!directory.contains_uid(uid(1)));
 }
+
+#[test]
+fn batch_membership_checks_every_uid_with_one_live_read_guard() {
+    let directory = PrincipalDirectory::default();
+    directory.register(alias("alice"), uid(1)).unwrap();
+    directory.register(alias("bob"), uid(2)).unwrap();
+    assert_eq!(directory.first_missing_uid([]), None);
+    assert_eq!(directory.first_missing_uid([uid(1), uid(2)]), None);
+    assert_eq!(directory.first_missing_uid([uid(3), uid(1)]), Some(uid(3)));
+    let yielded = std::cell::Cell::new(0);
+    let identities = [uid(1), uid(2), uid(3)].into_iter().inspect(|_| {
+        // The first item is pulled before locking, to skip empty batches.
+        // Remaining items must see the same held guard, not separate lookups.
+        if yielded.get() != 0 {
+            assert!(directory.inner.try_write().is_none());
+        }
+        yielded.set(yielded.get() + 1);
+    });
+    assert_eq!(directory.first_missing_uid(identities), Some(uid(3)));
+    assert_eq!(yielded.get(), 3);
+    assert!(directory.inner.try_write().is_some());
+    directory.replace_all([(alias("third"), uid(3))]).unwrap();
+    assert_eq!(directory.first_missing_uid([uid(1), uid(3)]), Some(uid(1)));
+}
+
+#[test]
+fn batch_membership_yields_to_pending_writers_before_completing() {
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    let directory = PrincipalDirectory::default();
+    directory.register(alias("alice"), uid(1)).unwrap();
+    let scanning = Arc::new(Barrier::new(2));
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader_directory = directory.clone();
+    let reader_scanning = scanning.clone();
+    let reader_stop = stop.clone();
+    let reader = std::thread::spawn(move || {
+        let mut signaled = false;
+        let rest = std::iter::repeat(uid(1))
+            .take_while(|_| !reader_stop.load(Ordering::Acquire))
+            .inspect(|_| {
+                if !signaled {
+                    signaled = true;
+                    reader_scanning.wait();
+                }
+            });
+        reader_directory.first_missing_uid(std::iter::once(uid(1)).chain(rest))
+    });
+    scanning.wait(); // The reader holds its guard and has not completed its batch.
+    let (sent, received) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        directory
+            .rename(uid(1), &alias("alice"), alias("bob"))
+            .unwrap();
+        sent.send(()).unwrap();
+    });
+    let progressed = received.recv_timeout(std::time::Duration::from_secs(2));
+    // Always release the synthetic reader and join both threads, including on
+    // the old non-yielding implementation's failure path.
+    stop.store(true, Ordering::Release);
+    assert_eq!(reader.join().unwrap(), None);
+    writer.join().unwrap();
+    progressed.expect("a pending writer must progress before the batch finishes");
+}

@@ -154,6 +154,25 @@ impl PrincipalDirectory {
         self.inner.read().principals.contains_key(&uid)
     }
 
+    /// Check a UID batch without allocating or repeatedly acquiring the lock.
+    /// Only membership lookups run under the read guard; callers perform graph
+    /// decoding and structural validation outside it. Pending writers can proceed
+    /// between lookups, as with individual checks. Empty batches take no lock.
+    pub(crate) fn first_missing_uid(
+        &self,
+        uids: impl IntoIterator<Item = PrincipalUid>,
+    ) -> Option<PrincipalUid> {
+        let mut uids = uids.into_iter();
+        let first = uids.next()?;
+        let mut state = self.inner.read();
+        std::iter::once(first).chain(uids).find(|uid| {
+            // Fast state check without a lock-word RMW when uncontended;
+            // fairly yield before consulting current membership if needed.
+            parking_lot::RwLockReadGuard::bump(&mut state);
+            !state.principals.contains_key(uid)
+        })
+    }
+
     /// Snapshot every admitted alias-to-UID binding in deterministic order.
     #[must_use]
     pub fn bindings(&self) -> Vec<(PrincipalId, PrincipalUid)> {
