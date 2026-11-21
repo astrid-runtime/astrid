@@ -9,12 +9,6 @@ use super::super::{ContentName, ContentWriteOutcome, PrincipalContentError};
 use super::PrincipalContentStore;
 
 impl<P: Ord, E> PrincipalContentStore<P, E> {
-    /// Forget reconstructible state while preserving immutable read leases.
-    pub(crate) fn forget_owner_projection_state(&self, principal: &P) {
-        self.validated_catalogs.lock().remove(principal);
-        self.validated_kv.forget_owner(principal);
-    }
-
     /// Construct without a principal-specific quota.
     #[must_use]
     pub fn from_engine(engine: Arc<E>) -> Self {
