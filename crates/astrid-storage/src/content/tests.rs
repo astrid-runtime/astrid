@@ -27,6 +27,8 @@ use crate::StorageError;
 use crate::kv::{KvStore, TreeKvStore};
 use crate::principal_graph::PRINCIPAL_GRAPH_VERSION;
 
+mod projection_cache;
+
 #[derive(Clone, Copy)]
 struct TestIdentity;
 
@@ -601,6 +603,8 @@ fn one_shot_reads_reuse_the_current_decoded_header() {
             .unwrap();
     }
 
+    // Start cold even though the writer seeded the shared governed cache.
+    engine.clear_projection_cache();
     engine.reset_object_loads();
     assert_eq!(
         reader.read_range(&owner, &name, 999_000, 12_345).unwrap(),
@@ -619,22 +623,12 @@ fn one_shot_reads_reuse_the_current_decoded_header() {
         "cached one-shot read loaded {cached_loads} objects; first read loaded {first_loads}"
     );
 
-    writer
-        .put(
-            &owner,
-            &ContentName::new("catalog/new-generation.bin").unwrap(),
-            b"new root generation",
-        )
-        .unwrap();
+    let replacement = vec![0xa7; value.len()];
+    writer.put(&owner, &name, &replacement).unwrap();
     engine.reset_object_loads();
     assert_eq!(
         reader.read_range(&owner, &name, 999_000, 12_345).unwrap(),
-        Some(value[999_000..1_011_345].to_vec())
-    );
-    let next_generation_loads = engine.object_loads();
-    assert!(
-        next_generation_loads > cached_loads,
-        "new generation loaded {next_generation_loads} objects; cached generation loaded {cached_loads}"
+        Some(replacement[999_000..1_011_345].to_vec())
     );
 }
 

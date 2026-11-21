@@ -53,3 +53,18 @@ async fn retirement_rejects_growth_and_ordinary_writes_still_require_live_policy
     assert_eq!(store.clear_owner(&"agent".to_owned()).unwrap(), 1);
     assert_eq!(store.clear_owner(&"agent".to_owned()).unwrap(), 0);
 }
+
+#[tokio::test]
+async fn successful_retirement_forgets_projection_memos() {
+    let engine = Arc::new(InMemoryEngine::<String, _>::new(Blake3ObjectIdentityV1));
+    let store = TreeKvStore::<String, Blake3ObjectIdentityV1, _, _>::from_engine(
+        engine,
+        |namespace: &str| Ok(namespace.to_owned()),
+    );
+    let owner = "retiring".to_owned();
+    store.set(&owner, "key", b"private".to_vec()).await.unwrap();
+    assert!(store.validation.projections.lock().contains_key(&owner));
+    assert_eq!(store.clear_owner(&owner).unwrap(), 1);
+    assert!(!store.validation.projections.lock().contains_key(&owner));
+    assert!(!store.validation.trees.lock().contains_key(&owner));
+}
