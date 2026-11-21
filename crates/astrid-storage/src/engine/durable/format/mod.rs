@@ -21,7 +21,7 @@ const MIN_REFERENCE_WIRE_BYTES: usize =
 
 #[cfg(test)]
 thread_local! {
-    static FRAME_CHECKSUM_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static FRAME_CHECKSUM_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static RECOVERY_ARENA_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 

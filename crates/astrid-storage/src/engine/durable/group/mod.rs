@@ -19,9 +19,14 @@ use super::{
 use crate::engine::{ProjectionObserver, ProjectionPhase};
 
 #[cfg(test)]
+mod cache_admission_tests;
+#[cfg(test)]
 mod checkpoint_publication_tests;
+mod commit_cache;
 mod representations_maintenance;
 mod wal;
+
+use commit_cache::PublishedCommitPayload;
 
 const DEFAULT_INITIAL_DELAY: Duration = Duration::from_micros(250);
 const DEFAULT_BUSY_EXTENSION: Duration = Duration::from_micros(250);
@@ -416,6 +421,7 @@ where
     fn process_commit_batch(&self, batch: Vec<QueuedCommit<P>>) {
         let mut completions = Vec::new();
         let mut retired_projections = Vec::new();
+        let mut published_commits = BTreeMap::new();
         let mut inner = match self.lock_usable() {
             Ok(inner) => inner,
             Err(error) => {
@@ -473,6 +479,7 @@ where
                 accepted,
                 &mut completions,
                 &mut retired_projections,
+                &mut published_commits,
             );
         }
         let ran_successful_commit = completions.iter().any(|(_, result)| result.is_ok());
@@ -483,6 +490,7 @@ where
         for (receipt, result) in completions {
             receipt.complete(result);
         }
+        self.warm_published_commits(published_commits);
         // Complete the batch before maintenance. New batches still serialize on
         // the same engine writer while a representation generation is replaced.
         if ran_successful_commit {
@@ -499,6 +507,7 @@ where
         accepted: Vec<AcceptedCommit<P>>,
         completions: &mut Vec<(Arc<CommitReceipt>, Result<CommitOutcome, DurableError>)>,
         retired_projections: &mut Vec<crate::kv::RetiredKvProjection>,
+        published_commits: &mut BTreeMap<P, PublishedCommitPayload>,
     ) {
         // Clone the shared Arc first so the physical guard does not borrow
         // `inner.representations`. WAL groups leave the guard empty because fold
@@ -545,6 +554,20 @@ where
                     for mut accepted in accepted {
                         retired_projections
                             .extend(self.publish_durable_root(inner, &mut accepted.prepared));
+                        if let Some((id, payload)) = accepted.prepared.commit.take()
+                            && let Some(location) = inner.index.get(&id).copied()
+                            && inner.pending_wal.get_object(&id).is_none()
+                        {
+                            published_commits.insert(
+                                accepted.prepared.principal.clone(),
+                                PublishedCommitPayload {
+                                    root: accepted.prepared.root,
+                                    arena_generation: inner.arena_generation,
+                                    location,
+                                    payload,
+                                },
+                            );
+                        }
                         completions.push((
                             accepted.receipt,
                             Ok(CommitOutcome {

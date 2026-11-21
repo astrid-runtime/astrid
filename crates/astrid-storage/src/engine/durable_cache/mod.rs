@@ -130,6 +130,16 @@ where
         ))
     }
 
+    /// A best-effort warm-up may decline before decoding an oversized payload.
+    /// Ordinary miss admission may still request a larger governed lease.
+    pub(super) fn may_retain(&self, principal: &P, payload_bytes: u64) -> bool {
+        self.controller.capacity().accepts(payload_bytes)
+            && self
+                .principal_budget
+                .capacity(principal)
+                .accepts(payload_bytes)
+    }
+
     pub(super) fn get(&self, principal: &P, object: ObjectId) -> Option<Arc<ObjectRecord>> {
         let _accounting = self.accounting.lock();
         let (global_required, principal_required) = {
