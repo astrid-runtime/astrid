@@ -60,6 +60,7 @@ impl ObservedSource {
             offset,
             RecoveryLimits::process_addressable(),
         )
+        .map(positioned::ValidatedFrame::into_payload)
     }
 }
 
@@ -126,7 +127,8 @@ fn descending_frames_read_only_the_requested_ranges() {
             location.offset,
             RecoveryLimits::process_addressable(),
         )
-        .unwrap();
+        .unwrap()
+        .into_payload();
         assert_eq!(payload, u64::try_from(value).unwrap().to_le_bytes());
     }
     assert_eq!(
@@ -159,7 +161,8 @@ fn boundary_headers_payloads_and_large_frames_use_the_same_validator() {
                     location.offset,
                     RecoveryLimits::process_addressable(),
                 )
-                .unwrap(),
+                .unwrap()
+                .into_payload(),
                 expected
             );
             if length >= TRANSFER_BUFFER_BYTES {
@@ -217,7 +220,8 @@ fn sparse_active_frames_read_no_unrequested_history() {
                 location.offset,
                 RecoveryLimits::process_addressable(),
             )
-            .unwrap(),
+            .unwrap()
+            .into_payload(),
             expected
         );
     }
@@ -302,4 +306,128 @@ fn malformed_frames_and_limits_fail_closed() {
             ..
         })
     ));
+}
+
+#[test]
+fn indexed_object_hashes_frame_once_and_still_checks_index_and_object_identity() {
+    use crate::engine::durable::tests::{TEST_IDENTITY_SCHEME, TestIdentity};
+    use crate::storage_model::ObjectIdentity;
+    let mut source = ObservedSource::new();
+    let record = ObjectRecord::new(
+        ObjectKind::Chunk,
+        ObjectFormatVersion::V1,
+        vec![0x42; 262_144],
+        Vec::new(),
+        262_144,
+        ObjectClass::Data,
+    )
+    .unwrap();
+    let id = TestIdentity.identify(&record);
+    let payload = encode_object_frame(TEST_IDENTITY_SCHEME, id, &record).unwrap();
+    let location = append_frame(&mut source, ARENA_MAGIC, &payload).unwrap();
+    FRAME_CHECKSUM_PASSES.with(|passes| passes.set(0));
+    assert_eq!(
+        read_indexed_object(
+            &source,
+            id,
+            location,
+            &TestIdentity,
+            RecoveryLimits::process_addressable()
+        )
+        .unwrap(),
+        record
+    );
+    assert_eq!(
+        FRAME_CHECKSUM_PASSES.with(Cell::get),
+        1,
+        "one immutable payload must not be rehashed to compare its verified digest with the index"
+    );
+    let mut wrong_index = location;
+    wrong_index.checksum[0] ^= 1;
+    assert!(
+        read_indexed_object(
+            &source,
+            id,
+            wrong_index,
+            &TestIdentity,
+            RecoveryLimits::process_addressable()
+        )
+        .is_err()
+    );
+    assert!(
+        read_indexed_object(
+            &source,
+            ObjectId::new([0x99; 32]),
+            location,
+            &TestIdentity,
+            RecoveryLimits::process_addressable()
+        )
+        .is_err()
+    );
+    let fake_id = ObjectId::new([0x77; 32]);
+    let wrong_identity = encode_object_frame(TEST_IDENTITY_SCHEME, fake_id, &record).unwrap();
+    let wrong_location = append_frame(&mut source, ARENA_MAGIC, &wrong_identity).unwrap();
+    assert!(
+        read_indexed_object(
+            &source,
+            id,
+            wrong_location,
+            &TestIdentity,
+            RecoveryLimits::process_addressable()
+        )
+        .is_err(),
+        "wire ID must match the index independently of canonical identity"
+    );
+    assert!(
+        read_indexed_object(
+            &source,
+            fake_id,
+            wrong_location,
+            &TestIdentity,
+            RecoveryLimits::process_addressable()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn indexed_tail_hashes_frame_once_and_still_checks_index_checksum() {
+    let mut source = ObservedSource::new();
+    let location = append_frame(&mut source, ARENA_MAGIC, b"verified tail").unwrap();
+    FRAME_CHECKSUM_PASSES.with(|passes| passes.set(0));
+    verify_indexed_tail(&mut source, location, RecoveryLimits::process_addressable()).unwrap();
+    assert_eq!(FRAME_CHECKSUM_PASSES.with(Cell::get), 1);
+    let mut wrong_index = location;
+    wrong_index.checksum[0] ^= 1;
+    assert!(
+        verify_indexed_tail(
+            &mut source,
+            wrong_index,
+            RecoveryLimits::process_addressable()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn indexed_tail_preserves_header_checksum_and_index_length_guards() {
+    let mut source = ObservedSource::new();
+    let location = append_frame(&mut source, ARENA_MAGIC, b"verified tail").unwrap();
+    let mut wrong_length = location;
+    wrong_length.payload_len = wrong_length.payload_len.strict_add(1);
+    assert!(
+        verify_indexed_tail(
+            &mut source,
+            wrong_length,
+            RecoveryLimits::process_addressable()
+        )
+        .is_err()
+    );
+    source
+        .seek(SeekFrom::Start(u64::try_from(CHECKSUM_START).unwrap()))
+        .unwrap();
+    source.write_all(&[location.checksum[0] ^ 1]).unwrap();
+    assert!(
+        verify_indexed_tail(&mut source, location, RecoveryLimits::process_addressable()).is_err()
+    );
 }

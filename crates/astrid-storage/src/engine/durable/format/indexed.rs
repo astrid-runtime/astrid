@@ -40,17 +40,17 @@ pub(in crate::engine::durable) fn read_indexed_object_with_payload<
     limits: RecoveryLimits,
 ) -> Result<(ObjectRecord, Vec<u8>), DurableError> {
     let scheme = identity.scheme();
-    let payload = read_frame_at(arena, ARENA_FILE, ARENA_MAGIC, location.offset, limits)?;
-    let payload_len = u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
-    if payload_len != location.payload_len
-        || frame_checksum(ARENA_MAGIC, payload_len, &payload) != location.checksum
-    {
+    let frame = read_frame_at(arena, ARENA_FILE, ARENA_MAGIC, location.offset, limits)?;
+    let payload_len =
+        u64::try_from(frame.payload().len()).map_err(|_| DurableError::EncodingOverflow)?;
+    if payload_len != location.payload_len || frame.checksum() != location.checksum {
         return Err(corrupt(
             ARENA_FILE,
             location.offset,
             "indexed frame location no longer matches the arena",
         ));
     }
+    let payload = frame.into_payload();
     let (id, record) = decode_object_frame(&payload, scheme)
         .map_err(|detail| corrupt(ARENA_FILE, location.offset, detail))?;
     if id != expected_id {
