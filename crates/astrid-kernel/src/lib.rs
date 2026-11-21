@@ -1186,9 +1186,6 @@ impl Kernel {
                 std::io::Error::other(format!("Failed to bootstrap CLI root ownership: {error}"))
             })?;
 
-            // Apply pre-configured identity links from config.
-            apply_identity_config(&identity_store, &config).await;
-
             // Import ordinary user files from the released principal-home
             // tree before the layout receipt allows the daemon to serve the
             // logical `home://` projection. Dedicated policy, capsule,
@@ -1226,6 +1223,10 @@ impl Kernel {
             all(target_arch = "wasm32", target_os = "unknown") => None,
             _ => Some(&boot_config),
         })?;
+        // Configured logging can now report nonfatal link errors without
+        // creating files before layout admission and publication complete.
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        apply_identity_config(&identity_store, &boot_config).await;
 
         #[cfg(not(target_family = "wasm"))]
         let workspace_branches = principal_store.clone().map(|store| {

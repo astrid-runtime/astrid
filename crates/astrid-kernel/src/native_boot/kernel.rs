@@ -8,9 +8,11 @@ use std::{path::PathBuf, sync::Arc};
 impl Kernel {
     /// Resolve host-call limits from the restored, admitted boot configuration.
     ///
-    /// The resolver runs once after native migration and runtime-tree admission,
-    /// before capsule engines consume their limits. The returned configuration
-    /// is the same validated snapshot used for audit and resource policy.
+    /// The resolver runs once after native migration, runtime-tree admission
+    /// and layout publication, before configured identity links and capsule
+    /// engines consume policy. It may initialize logging for identity-link
+    /// diagnostics without writing into an unadmitted home. The returned
+    /// configuration is the same validated snapshot used for audit and resources.
     ///
     /// # Errors
     /// Returns native admission, configuration, resolver or kernel wiring errors.

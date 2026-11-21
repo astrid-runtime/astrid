@@ -46,7 +46,14 @@ fn daemon_command(
 }
 
 fn launch(home: &AstridHome, workspace: &Path, log: &Path, override_limits: bool) -> OwnedDaemon {
-    let mut command = daemon_command(home, workspace, log, override_limits);
+    launch_command(
+        daemon_command(home, workspace, log, override_limits),
+        home,
+        log,
+    )
+}
+
+fn launch_command(mut command: Command, home: &AstridHome, log: &Path) -> OwnedDaemon {
     let mut daemon = OwnedDaemon(command.spawn().unwrap());
     let started = Instant::now();
     while !home.ready_path().exists() {
@@ -278,5 +285,84 @@ fn packed_restart_uses_restored_logging_format() {
         .find(|event| event["fields"]["message"] == "Resolved native boot limits")
         .expect("restored logging policy must select the JSON formatter");
     assert_eq!(fields["fields"]["io_concurrency"], 73);
+    stop(&home, &mut daemon);
+}
+
+fn identity_warning_reaches_configured_logging(file_logging: bool) {
+    let config = "[[identity.links]]\nplatform = 'regression'\nplatform_user_id = 'missing-user'\nastrid_user = '11111111-1111-4111-8111-111111111111'\n";
+    for packed in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(root.path().join("home"));
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        if packed {
+            let mut daemon = launch(&home, &workspace, &root.path().join("seed.log"), false);
+            std::fs::write(home.config_path(), config).unwrap();
+            stop(&home, &mut daemon);
+        } else {
+            astrid_core::platform_fs::create_private_directory(&workspace.join(".astrid")).unwrap();
+            std::fs::write(workspace.join(".astrid/config.toml"), config).unwrap();
+        }
+        let log = root.path().join("warning.log");
+        let mut command = daemon_command(&home, &workspace, &log, false);
+        if file_logging {
+            command.env_remove("ASTRID_DAEMON_LOG_TARGET");
+        }
+        let mut daemon = launch_command(command, &home, &log);
+        let text = if file_logging {
+            std::fs::read_dir(home.log_dir())
+                .unwrap()
+                .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            std::fs::read_to_string(&log).unwrap()
+        };
+        assert!(
+            text.contains("Failed to apply identity link from config")
+                && text.contains("11111111-1111-4111-8111-111111111111"),
+            "missing identity warning (packed={packed}, file={file_logging}): {text}"
+        );
+        stop(&home, &mut daemon);
+    }
+}
+
+#[test]
+fn identity_warning_reaches_configured_stderr() {
+    identity_warning_reaches_configured_logging(false);
+}
+
+#[test]
+fn identity_warning_reaches_configured_file() {
+    identity_warning_reaches_configured_logging(true);
+}
+
+#[test]
+fn configured_identity_link_survives_public_stop_and_packed_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(root.path().join("home"));
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    astrid_core::platform_fs::create_private_directory(&workspace.join(".astrid")).unwrap();
+    std::fs::write(workspace.join(".astrid/config.toml"),
+        "[logging]\nlevel = 'debug'\n[[identity.links]]\nplatform = 'regression'\nplatform_user_id = 'durable-user'\nastrid_user = 'configured-user'\n").unwrap();
+    let log = root.path().join("identity.log");
+    let mut daemon = launch(&home, &workspace, &log, false);
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("Created user from config identity link")
+    );
+    stop(&home, &mut daemon);
+    let mut daemon = launch(&home, &workspace, &log, false);
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        text.contains("Identity link from config already exists"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("Created user from config identity link"),
+        "{text}"
+    );
     stop(&home, &mut daemon);
 }

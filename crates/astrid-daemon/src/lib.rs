@@ -298,7 +298,6 @@ async fn run_with_args(
         uuid::Uuid::parse_str(&args.session)
             .map_err(|e| anyhow::anyhow!("Invalid UUID format: {e}"))?,
     );
-    let mut resolved = None;
     let (kernel, unified_cfg) = astrid_kernel::Kernel::new_configured_with_workspace_layout(
         session_id.clone(),
         workspace_root,
@@ -314,29 +313,22 @@ async fn run_with_args(
                 daemon_log_target.as_deref(),
             )
             .map_err(std::io::Error::other)?;
-            // Stderr cannot amend the admitted tree. File logging waits until
-            // the constructor has completed layout publication below.
-            if matches!(logging.target, astrid_telemetry::LogTarget::Stderr) {
-                init_logging(&logging);
-            }
-            resolved = Some((limits, http, logging));
+            // Both targets are safe after layout admission and publication.
+            // Start them before the kernel applies configured identity links,
+            // so a skipped link is observable on the selected target.
+            init_logging(&logging);
+            tracing::info!(
+                blocking_concurrency = limits.blocking_concurrency,
+                io_concurrency = limits.io_concurrency,
+                instance_pool_size = limits.instance_pool_size,
+                http_timeout_secs = http.default_total_timeout.as_secs(),
+                "Resolved native boot limits"
+            );
             Ok((limits, http))
         },
     )
     .await
     .map_err(|e| anyhow::anyhow!("Failed to boot Kernel: {e}"))?;
-    let (runtime_limits, http_limits, log_config) =
-        resolved.ok_or_else(|| anyhow::anyhow!("native boot limits were not resolved"))?;
-    if matches!(log_config.target, astrid_telemetry::LogTarget::File(_)) {
-        init_logging(&log_config);
-    }
-    tracing::info!(
-        blocking_concurrency = runtime_limits.blocking_concurrency,
-        io_concurrency = runtime_limits.io_concurrency,
-        instance_pool_size = runtime_limits.instance_pool_size,
-        http_timeout_secs = http_limits.default_total_timeout.as_secs(),
-        "Resolved native boot limits"
-    );
     let native_listener = claim_daemon_listener(&kernel, args.ephemeral)?;
     let private_inputs = native_input::configure(&kernel, &unified_cfg)?;
     kernel
