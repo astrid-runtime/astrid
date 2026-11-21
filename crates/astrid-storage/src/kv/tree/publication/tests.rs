@@ -14,6 +14,7 @@ fn cache_contention_never_blocks_admission_or_partially_publishes() {
             commit,
             Projection::empty(),
             TreeValidation::EMPTY,
+            cache.memo_epoch(),
         );
         let projections = (!lock_trees).then(|| cache.projections.lock());
         let trees = lock_trees.then(|| cache.trees.lock());
@@ -45,12 +46,40 @@ fn mismatched_commit_cannot_publish_a_checkpoint_certificate() {
         ObjectId::new([7; 32]),
         Projection::empty(),
         TreeValidation::EMPTY,
+        cache.memo_epoch(),
     );
     assert!(
         publication
             .try_publish(RootState {
                 generation: RootGeneration::INITIAL,
                 commit: ObjectId::new([8; 32]),
+            })
+            .is_none()
+    );
+    assert!(cache.projections.lock().is_empty());
+    assert!(cache.trees.lock().is_empty());
+}
+
+#[test]
+fn admitted_checkpoint_cannot_publish_after_no_op_owner_forget() {
+    let cache = Arc::new(KvValidationCache::<String>::default());
+    let owner = "retiring".to_owned();
+    let commit = ObjectId::new([7; 32]);
+    let publication = KvCheckpointPublication::new(
+        Arc::clone(&cache),
+        owner.clone(),
+        commit,
+        Projection::empty(),
+        TreeValidation::EMPTY,
+        cache.memo_epoch(),
+    );
+    let catalogs = parking_lot::Mutex::new(std::collections::BTreeMap::new());
+    cache.forget_owner(&owner, &catalogs);
+    assert!(
+        publication
+            .try_publish(RootState {
+                generation: RootGeneration::INITIAL,
+                commit
             })
             .is_none()
     );

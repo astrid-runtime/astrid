@@ -376,7 +376,17 @@ where
                 .map_err(|error| map_engine(&error))?
                 .ok_or_else(|| map_engine(&ModelError::MissingObject(object).into()))?;
             if record.format_version() == FORMAT_VERSION {
-                validated_projection(engine, owner, object, None, &KvValidationCache::default())?;
+                {
+                    let validation = KvValidationCache::default();
+                    validated_projection(
+                        engine,
+                        owner,
+                        object,
+                        None,
+                        &validation,
+                        validation.memo_epoch(),
+                    )?
+                };
                 true
             } else {
                 false

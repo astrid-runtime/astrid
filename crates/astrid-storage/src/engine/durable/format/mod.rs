@@ -21,12 +21,14 @@ const MIN_REFERENCE_WIRE_BYTES: usize =
 
 #[cfg(test)]
 thread_local! {
+    pub(super) static FRAME_CHECKSUM_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static RECOVERY_ARENA_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 mod framed_append;
 mod indexed;
 mod location;
+mod positioned;
 #[cfg(test)]
 mod positioned_tests;
 mod prepared;
@@ -50,6 +52,7 @@ pub(super) use location::{
     DurableFrameRange, DurablePrefixEnd, FrameLocation, read_frame_in_range,
     scan_frames_range_with_source, scan_frames_with_source,
 };
+pub(super) use positioned::read_frame_at;
 pub(super) use prepared::{PreparedFrame, append_prepared_frames};
 use reader::SliceReader;
 #[cfg(test)]
@@ -143,11 +146,10 @@ pub(super) fn verify_indexed_tail<F: DurableIo>(
     location: ArenaLocation,
     limits: RecoveryLimits,
 ) -> Result<(), DurableError> {
-    let payload = read_frame_at(arena, ARENA_FILE, ARENA_MAGIC, location.offset, limits)?;
-    let payload_len = u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?;
-    if payload_len != location.payload_len
-        || frame_checksum(ARENA_MAGIC, payload_len, &payload) != location.checksum
-    {
+    let frame = read_frame_at(arena, ARENA_FILE, ARENA_MAGIC, location.offset, limits)?;
+    let payload_len =
+        u64::try_from(frame.payload().len()).map_err(|_| DurableError::EncodingOverflow)?;
+    if payload_len != location.payload_len || frame.checksum() != location.checksum {
         return Err(corrupt(
             ARENA_FILE,
             location.offset,
@@ -155,46 +157,6 @@ pub(super) fn verify_indexed_tail<F: DurableIo>(
         ));
     }
     Ok(())
-}
-
-pub(super) fn read_frame_at<F: DurableIo>(
-    file: &F,
-    file_name: &'static str,
-    magic: [u8; 8],
-    offset: u64,
-    limits: RecoveryLimits,
-) -> Result<Vec<u8>, DurableError> {
-    read_frame_with(file_name, magic, offset, limits, |buffer, position| {
-        read_exact_at(file, buffer, position)
-    })
-}
-
-// All positioned reads share framing, size, and checksum validation.
-fn read_frame_with(
-    file_name: &'static str,
-    magic: [u8; 8],
-    offset: u64,
-    limits: RecoveryLimits,
-    mut read_exact: impl FnMut(&mut [u8], u64) -> io::Result<()>,
-) -> Result<Vec<u8>, DurableError> {
-    let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
-    read_exact(&mut header, offset)
-        .map_err(|source| io_error("read indexed durable frame header", source))?;
-    let decoded = validate_positioned_header(file_name, magic, offset, &header, limits)?;
-    let payload_len = decoded.payload_len;
-    let payload_usize = usize::try_from(payload_len).map_err(|_| DurableError::EncodingOverflow)?;
-    let mut payload = Vec::new();
-    payload
-        .try_reserve_exact(payload_usize)
-        .map_err(|_| DurableError::EncodingOverflow)?;
-    payload.resize(payload_usize, 0);
-    let payload_offset = offset
-        .checked_add(FRAME_HEADER_LEN)
-        .ok_or(DurableError::EncodingOverflow)?;
-    read_exact(&mut payload, payload_offset)
-        .map_err(|source| io_error("read indexed durable frame payload", source))?;
-    validate_positioned_payload(file_name, magic, offset, decoded, &payload)?;
-    Ok(payload)
 }
 
 fn validate_positioned_header(
@@ -235,16 +197,17 @@ fn validate_positioned_payload(
     offset: u64,
     decoded: DecodedFrameHeader,
     payload: &[u8],
-) -> Result<(), DurableError> {
+) -> Result<[u8; 32], DurableError> {
     if u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)?
         != decoded.payload_len
     {
         return Err(corrupt(file_name, offset, "frame payload length mismatch"));
     }
-    if frame_checksum(magic, decoded.payload_len, payload) != decoded.checksum {
+    let actual = frame_checksum(magic, decoded.payload_len, payload);
+    if actual != decoded.checksum {
         return Err(corrupt(file_name, offset, "frame checksum mismatch"));
     }
-    Ok(())
+    Ok(actual)
 }
 
 fn read_exact_at<F: DurableIo>(file: &F, buffer: &mut [u8], offset: u64) -> io::Result<()> {
@@ -461,6 +424,8 @@ pub(super) fn append_frames<T: AsRef<[u8]>, F: DurableIo>(
 }
 
 pub(super) fn frame_checksum(magic: [u8; 8], payload_len: u64, payload: &[u8]) -> [u8; 32] {
+    #[cfg(test)]
+    FRAME_CHECKSUM_PASSES.with(|passes| passes.set(passes.get().strict_add(1)));
     let mut hasher = frame_checksum_hasher(magic, payload_len);
     hasher.update(payload);
     *hasher.finalize().as_bytes()

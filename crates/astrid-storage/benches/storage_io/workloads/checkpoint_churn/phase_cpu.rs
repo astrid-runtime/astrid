@@ -27,14 +27,14 @@ struct Snapshot {
 }
 
 /// Previous CPU snapshot plus outer sample index; marks push flat report rows.
-pub(super) struct PhaseTimer {
+pub(crate) struct PhaseTimer {
     sample_index: usize,
     #[cfg(unix)]
     previous_cpu: ProcessCpuTimes,
 }
 
 impl PhaseTimer {
-    pub(super) fn start(sample_index: usize) -> CaptureResult<Self> {
+    pub(crate) fn start(sample_index: usize) -> CaptureResult<Self> {
         Ok(Self {
             sample_index,
             #[cfg(unix)]
@@ -42,7 +42,7 @@ impl PhaseTimer {
         })
     }
 
-    pub(super) fn mark(&mut self, phase: &'static str, report: &mut Report) -> CaptureResult<()> {
+    pub(crate) fn mark(&mut self, phase: &'static str, report: &mut Report) -> CaptureResult<()> {
         #[cfg(unix)]
         let status = {
             let snapshot = capture()?;

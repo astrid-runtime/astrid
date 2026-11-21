@@ -36,6 +36,7 @@ fn config() -> Config {
         object_cache_bytes: None,
         partial_verification_clone: false,
         checkpoint_overwrites: None,
+        projection_churn_owners: None,
         root: Some(PathBuf::from("unused")),
         output: None,
     }
@@ -329,4 +330,25 @@ fn checked_delta_rejects_regressions_without_faking_zero() {
         system_err.contains("system CPU went backwards"),
         "{system_err}"
     );
+}
+
+#[test]
+fn projection_churn_requires_nonzero_owners_and_runtime_cache_policy() {
+    assert!(Config::from_args_iter(["--projection-churn-owners".into(), "0".into()]).is_err());
+    let config =
+        Config::from_args_iter(["--projection-churn-owners".into(), "128".into()]).unwrap();
+    assert_eq!(
+        config.projection_churn_owners.map(NonZeroUsize::get),
+        Some(128)
+    );
+    assert!(config.object_cache_bytes.is_none());
+    for extra in [
+        vec!["--checkpoint-overwrites", "512"],
+        vec!["--object-cache-bytes", "1024"],
+        vec!["--partial-verification-clone"],
+    ] {
+        let mut args = vec!["--projection-churn-owners".to_owned(), "128".to_owned()];
+        args.extend(extra.into_iter().map(str::to_owned));
+        assert!(Config::from_args_iter(args).is_err());
+    }
 }

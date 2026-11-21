@@ -47,7 +47,12 @@ async fn main() -> BenchResult<()> {
     prepare_root(&root)?;
     println!("benchmark root: {}", root.display());
     let mut report = Report::new(config.clone(), provenance);
-    if let Some(overwrites) = config.checkpoint_overwrites {
+    if let Some(owners) = config.projection_churn_owners {
+        println!(
+            "projection churn owners: {owners}; live catalog: 64 entries; runtime cache defaults"
+        );
+        workloads::run(&config, &root, Path::new(""), [0; 32], &mut report).await?;
+    } else if let Some(overwrites) = config.checkpoint_overwrites {
         println!(
             "checkpoint overwrites: {overwrites}; payload: 256 bytes; object cache: runtime defaults"
         );

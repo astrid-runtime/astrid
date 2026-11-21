@@ -206,9 +206,14 @@ impl ProjectionCacheEntry {
     /// Wrap one typed accelerator and capture its resident-memory charge.
     #[must_use]
     pub fn new<T: ProjectionCachePayload>(value: T) -> Self {
+        Self::from_shared(Arc::new(value))
+    }
+
+    /// Share an existing payload without duplicating its owned heap buffers.
+    pub(crate) fn from_shared<T: ProjectionCachePayload>(value: Arc<T>) -> Self {
         Self {
             retained_bytes: value.retained_bytes(),
-            value: Arc::new(value),
+            value,
         }
     }
 

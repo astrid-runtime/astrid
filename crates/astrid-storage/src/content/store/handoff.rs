@@ -9,6 +9,7 @@ use crate::content::PrincipalContentError;
 use crate::content::catalog::{
     CONTENT_COMPONENT_LABEL, CatalogSummary, CatalogValidation, root_from_record,
 };
+use crate::content_dag::ContentError;
 use crate::engine::PrincipalProjectionEngine;
 use crate::storage_model::{ObjectId, ObjectKind, ReferenceKind, ReferenceLabel, RootState};
 
@@ -31,15 +32,16 @@ where
     pub(crate) fn seed_catalog_owner_from(
         &self,
         source: &Mutex<BTreeMap<P, CatalogValidation>>,
-        owner: P,
+        owner: &P,
     ) -> bool {
-        let Some(memo) = source.lock().get(&owner).copied() else {
+        let epoch = self.validated_kv.memo_epoch();
+        let Some(memo) = source.lock().get(owner).copied() else {
             return false;
         };
-        let Ok(live_root) = self.engine.current_root(&owner) else {
+        let Ok(live_root) = self.engine.current_root(owner) else {
             return false;
         };
-        let Ok(live) = self.live_content_catalog(&owner, live_root) else {
+        let Ok(live) = self.live_content_catalog(owner, live_root) else {
             return false;
         };
         match (live, memo.root) {
@@ -52,14 +54,13 @@ where
                 if memo_root == object && memo.summary == summary => {},
             _ => return false,
         }
-        let Ok(current) = self.engine.current_root(&owner) else {
-            return false;
-        };
-        if current != live_root {
-            return false;
-        }
-        self.validated_catalogs.lock().insert(owner, memo);
-        true
+        self.validated_kv.publish_catalog_if_current(
+            &self.validated_catalogs,
+            owner,
+            epoch,
+            memo,
+            || matches!(self.engine.current_root(owner), Ok(current) if current == live_root),
+        )
     }
 
     fn live_content_catalog(
@@ -94,7 +95,10 @@ where
                 "principal content component is not owning",
             ));
         }
-        let record = self.load_required_for(owner, reference.target())?;
+        let record = self
+            .engine
+            .load_shared_object_for(owner, reference.target())?
+            .ok_or(ContentError::MissingObject(reference.target()))?;
         let catalog = root_from_record(reference.target(), &record)?;
         Ok(Some((catalog.object, catalog.summary)))
     }

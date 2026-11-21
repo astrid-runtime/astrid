@@ -35,6 +35,7 @@ impl<P: Clone + Ord> KvValidationCache<P> {
         owner: P,
         projection: Projection,
         tree: TreeValidation,
+        epoch: super::MemoEpoch,
     ) -> bool {
         if tree.root() != projection.tree
             || projection.boundary != Some(tree.certificate())
@@ -62,6 +63,9 @@ impl<P: Clone + Ord> KvValidationCache<P> {
         }
         // Mirror publish_if_current lock order: projections, then trees.
         let mut projections = self.projections.lock();
+        if !self.epoch_is_current(epoch) {
+            return false;
+        }
         let Ok(current) = engine.current_kv_root(&owner) else {
             return false;
         };
@@ -130,10 +134,11 @@ where
     P: Clone + Ord,
     E: KvProjectionEngine<P>,
 {
+    let epoch = destination.memo_epoch();
     let Some((projection, tree)) = source.snapshot_owner(&owner) else {
         return false;
     };
-    destination.try_seed_owner_if_live(engine, owner, projection, tree)
+    destination.try_seed_owner_if_live(engine, owner, projection, tree, epoch)
 }
 
 fn live_kv_component_head<P, E>(

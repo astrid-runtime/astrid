@@ -4,7 +4,7 @@
 //! folds accumulated transitions into page-bounded B+-trees without changing
 //! the logical projection.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -35,6 +35,8 @@ mod hot_cache;
 #[cfg(test)]
 mod hot_cache_integration_tests;
 mod legacy_avl;
+mod maintenance;
+mod memo;
 mod node;
 mod overlay;
 #[cfg(all(test, feature = "legacy-surrealkv"))]
@@ -48,6 +50,7 @@ pub(crate) use self::handoff::seed_owner_memo_if_live;
 pub(crate) use self::header::validated_projection_quota;
 pub use self::hot_cache::{KvReadCacheBudget, KvReadCacheCapacity, KvReadCacheConfig};
 pub(crate) use self::legacy_avl::migrate_principal as migrate_legacy_avl;
+pub(crate) use self::memo::MemoEpoch;
 pub(crate) use self::publication::{KvCheckpointPublication, RetiredKvProjection};
 pub(crate) use self::validation::CertifiedValueMembership;
 pub(super) use self::validation::TreeValidation;
@@ -63,6 +66,7 @@ const CHECKPOINT_MIN_DELTA_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug)]
 pub(crate) struct KvValidationCache<P: Ord> {
+    epoch: std::sync::atomic::AtomicU64,
     trees: Mutex<BTreeMap<P, TreeValidation>>,
     projections: Mutex<BTreeMap<P, Projection>>,
     #[cfg(test)]
@@ -72,6 +76,7 @@ pub(crate) struct KvValidationCache<P: Ord> {
 impl<P: Ord> Default for KvValidationCache<P> {
     fn default() -> Self {
         Self {
+            epoch: std::sync::atomic::AtomicU64::new(0),
             trees: Mutex::new(BTreeMap::new()),
             projections: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
@@ -88,6 +93,7 @@ impl<P: Clone + Ord> KvValidationCache<P> {
         expected: RootState,
         projection: Projection,
         checkpoint: Option<TreeValidation>,
+        epoch: MemoEpoch,
     ) {
         if let Some(checkpoint) = checkpoint
             && (checkpoint.root() != projection.tree
@@ -98,6 +104,9 @@ impl<P: Clone + Ord> KvValidationCache<P> {
         // Order every cache publisher and check currency inside that guard.
         // Never hold it across graph validation or an authoritative commit.
         let mut projections = self.projections.lock();
+        if !self.epoch_is_current(epoch) {
+            return;
+        }
         let Ok(Some(current)) = engine.current_kv_root(&owner) else {
             // An optional cache query must not false-fail an already successful
             // commit or historical snapshot read.
@@ -122,7 +131,7 @@ pub struct TreeKvStore<P: Ord, I, R, E> {
     quota: Option<Arc<dyn KvQuotaResolver<P>>>,
     validation: Arc<KvValidationCache<P>>,
     validated_content: Arc<Mutex<BTreeMap<P, crate::content::CatalogValidation>>>,
-    checkpointing: Arc<Mutex<BTreeSet<P>>>,
+    checkpointing: maintenance::Checkpointing<P>,
     hot_cache: Option<Arc<KvHotCache<P>>>,
     marker: PhantomData<fn() -> (P, I)>,
 }
@@ -140,7 +149,7 @@ struct BlockingTreeStore<P: Ord, E> {
     quota: Option<Arc<dyn KvQuotaResolver<P>>>,
     validation: Arc<KvValidationCache<P>>,
     validated_content: Arc<Mutex<BTreeMap<P, crate::content::CatalogValidation>>>,
-    checkpointing: Arc<Mutex<BTreeSet<P>>>,
+    checkpointing: maintenance::Checkpointing<P>,
     hot_cache: Option<Arc<KvHotCache<P>>>,
 }
 
@@ -167,7 +176,7 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
             quota: None,
             validation: Arc::new(KvValidationCache::default()),
             validated_content: Arc::new(Mutex::new(BTreeMap::new())),
-            checkpointing: Arc::new(Mutex::new(BTreeSet::new())),
+            checkpointing: Arc::new(Mutex::new(BTreeMap::new())),
             hot_cache: None,
             marker: PhantomData,
         }
@@ -186,7 +195,7 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
             quota: Some(quota),
             validation: Arc::new(KvValidationCache::default()),
             validated_content: Arc::new(Mutex::new(BTreeMap::new())),
-            checkpointing: Arc::new(Mutex::new(BTreeSet::new())),
+            checkpointing: Arc::new(Mutex::new(BTreeMap::new())),
             hot_cache: None,
             marker: PhantomData,
         }
@@ -205,7 +214,7 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
             quota: Some(quota),
             validation,
             validated_content,
-            checkpointing: Arc::new(Mutex::new(BTreeSet::new())),
+            checkpointing: Arc::new(Mutex::new(BTreeMap::new())),
             hot_cache: None,
             marker: PhantomData,
         }
@@ -263,6 +272,10 @@ where
     E: KvProjectionEngine<P> + 'static,
 {
     fn header(&self, owner: P) -> StorageResult<TreeHeader<P>> {
+        self.header_at_epoch(owner, self.validation.memo_epoch())
+    }
+
+    fn header_at_epoch(&self, owner: P, epoch: MemoEpoch) -> StorageResult<TreeHeader<P>> {
         // Pin only this operation's existing immutable projection before root
         // capture. A concurrent checkpoint may replace the shared cache while
         // this reader loads its captured commit/state. Head matching below
@@ -282,6 +295,7 @@ where
             self.validation.as_ref(),
             self.validated_content.as_ref(),
             captured_projection,
+            epoch,
         )
     }
 
@@ -316,7 +330,8 @@ where
         ) -> StorageResult<(T, Vec<Replacement>, bool)>,
     ) -> StorageResult<T> {
         loop {
-            let header = self.header(owner.clone())?;
+            let epoch = self.validation.memo_epoch();
+            let header = self.header_at_epoch(owner.clone(), epoch)?;
             let mut context = TreeContext::new(self.engine.as_ref(), owner);
             let (result, mutations, changed) = mutation(&mut context, &header)?;
             if !changed {
@@ -365,6 +380,7 @@ where
                         outcome.root(),
                         validated_projection,
                         checkpoint,
+                        epoch,
                     );
                     if should_checkpoint(&projection) {
                         self.schedule_checkpoint(owner.clone());
@@ -413,54 +429,18 @@ where
         })
     }
 
-    fn schedule_checkpoint(&self, owner: P) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        self.schedule_checkpoint_on(owner, runtime);
-    }
-
-    fn schedule_checkpoint_on(&self, owner: P, runtime: tokio::runtime::Handle) {
-        if !self.checkpointing.lock().insert(owner.clone()) {
-            return;
-        }
-        let store = self.clone();
-        let spawn_runtime = runtime.clone();
-        let _task = spawn_runtime.spawn_blocking(move || {
-            let outcome = store.checkpoint_once(owner.clone(), false);
-            store.checkpointing.lock().remove(&owner);
-            let retry = if matches!(outcome.as_ref(), Ok(false)) {
-                match store.header(owner.clone()) {
-                    Ok(header) => should_checkpoint(&projection_from_header(&header)),
-                    Err(error) => {
-                        tracing::warn!(%error, "principal KV checkpoint retry check failed");
-                        false
-                    },
-                }
-            } else {
-                false
-            };
-            if let Err(error) = outcome {
-                tracing::warn!(%error, "principal KV checkpoint failed");
-            }
-            if retry {
-                std::thread::yield_now();
-                store.schedule_checkpoint_on(owner, runtime);
-            }
-        });
-    }
-
     fn checkpoint_once(&self, owner: P, force: bool) -> StorageResult<bool> {
-        self.checkpoint_once_after(owner, force, || Ok(()))
+        self.checkpoint_once_after(owner, force, self.validation.memo_epoch(), || Ok(()))
     }
 
     fn checkpoint_once_after(
         &self,
         owner: P,
         force: bool,
+        epoch: MemoEpoch,
         interleave: impl FnOnce() -> StorageResult<()>,
     ) -> StorageResult<bool> {
-        let base = self.header(owner.clone())?;
+        let base = self.header_at_epoch(owner.clone(), epoch)?;
         let base_projection = projection_from_header(&base);
         if base_projection.depth == 0 {
             return Ok(false);
@@ -472,7 +452,7 @@ where
         let (tree, validation) = context.build_validated_checkpoint(&base)?;
         let checkpoint_totals = base_projection.totals;
         interleave()?;
-        let current = self.header(owner.clone())?;
+        let current = self.header_at_epoch(owner.clone(), epoch)?;
         let current_projection = projection_from_header(&current);
         if !force && !should_checkpoint(&current_projection) {
             return Ok(false);
@@ -495,6 +475,7 @@ where
                 commit,
                 rebased.clone(),
                 validation,
+                epoch,
             )
         });
         match self.engine.commit_kv_root(transaction) {
@@ -505,6 +486,7 @@ where
                     outcome.root(),
                     rebased,
                     Some(validation),
+                    epoch,
                 );
                 Ok(true)
             },
@@ -586,6 +568,7 @@ where
         if let Some(cache) = &self.hot_cache {
             cache.remove_owner(owner);
         }
+        self.blocking_store().forget_owner_projection_state(owner);
         Ok(removed)
     }
 
@@ -713,7 +696,7 @@ where
         let blocking = self.blocking_store();
         let interleaved = blocking.clone();
         let mutation_owner = owner.clone();
-        blocking.checkpoint_once_after(owner, true, move || {
+        blocking.checkpoint_once_after(owner, true, blocking.validation.memo_epoch(), move || {
             interleaved.mutate(&mutation_owner, |context, header| {
                 let previous = context.projected_get(header, &key)?;
                 if previous.as_deref() == Some(value.as_slice()) {

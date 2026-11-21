@@ -1,13 +1,13 @@
 use super::workspace::{is_workspace_branch_label, workspace_branch_quota};
 use super::{
-    BTreeMap, BuiltContent, CONTENT_COMPONENT_LABEL, CatalogRoot, CatalogSummary, CatalogValue,
-    ContentBatchExpectation, ContentError, ContentHeader, ContentName, KV_COMPONENT_LABEL,
-    LEGACY_PRINCIPAL_GRAPH_VERSION, ModelError, ObjectClass, ObjectFormatVersion, ObjectId,
-    ObjectKind, ObjectRecord, ObjectReference, PARENT_LABEL, PRINCIPAL_GRAPH_VERSION,
-    PrincipalContentError, PrincipalContentStore, PrincipalKvAdapter, PrincipalProjectionEngine,
-    PrincipalProjectionError, ReferenceKind, ReferenceLabel, RootState, RootTransaction,
-    STATE_LABEL, invalid, lookup, owned_target, require_structural, root_from_record,
-    validate_catalog, validated_projection_quota,
+    Arc, BTreeMap, BuiltContent, CONTENT_COMPONENT_LABEL, CatalogRoot, CatalogSummary,
+    CatalogValue, ContentBatchExpectation, ContentError, ContentHeader, ContentName,
+    KV_COMPONENT_LABEL, LEGACY_PRINCIPAL_GRAPH_VERSION, ModelError, ObjectClass,
+    ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ObjectReference, PARENT_LABEL,
+    PRINCIPAL_GRAPH_VERSION, PrincipalContentError, PrincipalContentStore, PrincipalKvAdapter,
+    PrincipalProjectionEngine, PrincipalProjectionError, ReferenceKind, ReferenceLabel, RootState,
+    RootTransaction, STATE_LABEL, invalid, lookup, owned_target, require_structural,
+    root_from_record, validate_catalog, validated_projection_quota,
 };
 use crate::content::catalog::prefix_exists as catalog_prefix_exists;
 
@@ -21,29 +21,40 @@ where
         principal: &P,
         mut header: ContentHeader,
         root: RootState,
+        epoch: crate::kv::MemoEpoch,
     ) {
-        self.validated_catalogs.lock().insert(
-            principal.clone(),
+        self.validated_kv.publish_catalog_if_current(
+            &self.validated_catalogs,
+            principal,
+            epoch,
             crate::content::catalog::CatalogValidation {
                 root: header.catalog.map(|catalog| catalog.object),
                 summary: header
                     .catalog
                     .map_or(CatalogSummary::default(), |catalog| catalog.summary),
             },
+            || matches!(self.engine.current_root(principal), Ok(Some(current)) if current == root),
         );
         header.root = Some(root);
         header.previous_catalog_quota_bytes = header
             .catalog
             .map_or(0, |catalog| catalog.summary.quota_bytes);
-        self.decoded_headers
-            .lock()
-            .insert(principal.clone(), std::sync::Arc::new(header));
+        // A header is an accelerator, governed by the same budget as its
+        // authenticated commit. Do not retain an uncharged per-UID duplicate.
+        let _ = self.engine.load_shared_object_for(principal, root.commit);
+        let _ = self.engine.retain_projection_cache(
+            principal,
+            root.commit,
+            super::DECODED_HEADER_CACHE_KEY,
+            crate::engine::ProjectionCacheEntry::new(header),
+        );
     }
 
     pub(super) fn decode_header(
         &self,
         principal: &P,
         root: Option<RootState>,
+        epoch: crate::kv::MemoEpoch,
     ) -> Result<ContentHeader, PrincipalContentError> {
         #[cfg(test)]
         self.decode_header_invocations
@@ -78,8 +89,9 @@ where
                 CONTENT_COMPONENT_LABEL => {
                     let record = self
                         .engine
-                        .load_object_for(principal, reference.target())?
+                        .load_shared_object_for(principal, reference.target())?
                         .ok_or_else(|| ContentError::MissingObject(reference.target()))?;
+                    let captured_root = root;
                     let root = root_from_record(reference.target(), &record)?;
                     let cached = self
                         .validated_catalogs
@@ -96,9 +108,10 @@ where
                         let validation = validate_catalog(Some(root), &mut |object| {
                             self.load_required_for(principal, object)
                         })?;
-                        self.validated_catalogs
-                            .lock()
-                            .insert(principal.clone(), validation);
+                        self.validated_kv.publish_catalog_if_current(
+                            &self.validated_catalogs, principal, epoch, validation,
+                            || matches!(self.engine.current_root(principal), Ok(Some(current)) if current == captured_root),
+                        );
                         validation
                     };
                     if validation.summary != root.summary {
@@ -111,7 +124,7 @@ where
                 },
                 KV_COMPONENT_LABEL => {
                     other_quota_bytes = other_quota_bytes
-                        .checked_add(self.kv_quota(principal, reference.target(), root)?)
+                        .checked_add(self.kv_quota(principal, reference.target(), root, epoch)?)
                         .ok_or(PrincipalContentError::AccountingOverflow)?;
                     preserved_state.push(reference.clone());
                 },
@@ -150,6 +163,7 @@ where
         principal: &P,
         object: ObjectId,
         root: RootState,
+        epoch: crate::kv::MemoEpoch,
     ) -> Result<u64, PrincipalContentError> {
         validated_projection_quota(
             &PrincipalKvAdapter::new(self.engine.as_ref()),
@@ -157,6 +171,7 @@ where
             object,
             Some(root),
             self.validated_kv.as_ref(),
+            epoch,
         )
         .map_err(|_| invalid(object, "invalid KV component accounting"))
     }
@@ -167,10 +182,10 @@ where
         object: ObjectId,
         kind: ObjectKind,
         version: ObjectFormatVersion,
-    ) -> Result<ObjectRecord, PrincipalContentError> {
+    ) -> Result<Arc<ObjectRecord>, PrincipalContentError> {
         let record = self
             .engine
-            .load_object_for(principal, object)?
+            .load_shared_object_for(principal, object)?
             .ok_or(ContentError::MissingObject(object))?;
         if record.kind() != kind || record.format_version() != version {
             return Err(invalid(
@@ -448,3 +463,6 @@ where
         Ok(id)
     }
 }
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod retirement_tests;
