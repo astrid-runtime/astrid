@@ -1,13 +1,13 @@
 use super::workspace::{is_workspace_branch_label, workspace_branch_quota};
 use super::{
-    BTreeMap, BuiltContent, CONTENT_COMPONENT_LABEL, CatalogRoot, CatalogSummary, CatalogValue,
-    ContentBatchExpectation, ContentError, ContentHeader, ContentName, KV_COMPONENT_LABEL,
-    LEGACY_PRINCIPAL_GRAPH_VERSION, ModelError, ObjectClass, ObjectFormatVersion, ObjectId,
-    ObjectKind, ObjectRecord, ObjectReference, PARENT_LABEL, PRINCIPAL_GRAPH_VERSION,
-    PrincipalContentError, PrincipalContentStore, PrincipalKvAdapter, PrincipalProjectionEngine,
-    PrincipalProjectionError, ReferenceKind, ReferenceLabel, RootState, RootTransaction,
-    STATE_LABEL, invalid, lookup, owned_target, require_structural, root_from_record,
-    validate_catalog, validated_projection_quota,
+    Arc, BTreeMap, BuiltContent, CONTENT_COMPONENT_LABEL, CatalogRoot, CatalogSummary,
+    CatalogValue, ContentBatchExpectation, ContentError, ContentHeader, ContentName,
+    KV_COMPONENT_LABEL, LEGACY_PRINCIPAL_GRAPH_VERSION, ModelError, ObjectClass,
+    ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ObjectReference, PARENT_LABEL,
+    PRINCIPAL_GRAPH_VERSION, PrincipalContentError, PrincipalContentStore, PrincipalKvAdapter,
+    PrincipalProjectionEngine, PrincipalProjectionError, ReferenceKind, ReferenceLabel, RootState,
+    RootTransaction, STATE_LABEL, invalid, lookup, owned_target, require_structural,
+    root_from_record, validate_catalog, validated_projection_quota,
 };
 use crate::content::catalog::prefix_exists as catalog_prefix_exists;
 
@@ -89,7 +89,7 @@ where
                 CONTENT_COMPONENT_LABEL => {
                     let record = self
                         .engine
-                        .load_object_for(principal, reference.target())?
+                        .load_shared_object_for(principal, reference.target())?
                         .ok_or_else(|| ContentError::MissingObject(reference.target()))?;
                     let captured_root = root;
                     let root = root_from_record(reference.target(), &record)?;
@@ -182,10 +182,10 @@ where
         object: ObjectId,
         kind: ObjectKind,
         version: ObjectFormatVersion,
-    ) -> Result<ObjectRecord, PrincipalContentError> {
+    ) -> Result<Arc<ObjectRecord>, PrincipalContentError> {
         let record = self
             .engine
-            .load_object_for(principal, object)?
+            .load_shared_object_for(principal, object)?
             .ok_or(ContentError::MissingObject(object))?;
         if record.kind() != kind || record.format_version() != version {
             return Err(invalid(

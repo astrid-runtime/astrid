@@ -9,6 +9,7 @@ use crate::content::PrincipalContentError;
 use crate::content::catalog::{
     CONTENT_COMPONENT_LABEL, CatalogSummary, CatalogValidation, root_from_record,
 };
+use crate::content_dag::ContentError;
 use crate::engine::PrincipalProjectionEngine;
 use crate::storage_model::{ObjectId, ObjectKind, ReferenceKind, ReferenceLabel, RootState};
 
@@ -94,7 +95,10 @@ where
                 "principal content component is not owning",
             ));
         }
-        let record = self.load_required_for(owner, reference.target())?;
+        let record = self
+            .engine
+            .load_shared_object_for(owner, reference.target())?
+            .ok_or(ContentError::MissingObject(reference.target()))?;
         let catalog = root_from_record(reference.target(), &record)?;
         Ok(Some((catalog.object, catalog.summary)))
     }
