@@ -161,12 +161,12 @@ pub(crate) fn validated_projection<P, E>(
     head: ObjectId,
     captured_root: Option<RootState>,
     validation: &KvValidationCache<P>,
+    epoch: super::MemoEpoch,
 ) -> StorageResult<Projection>
 where
     P: Clone + Ord,
     E: KvProjectionEngine<P>,
 {
-    let epoch = validation.memo_epoch();
     let cached = validation
         .projections
         .lock()
@@ -196,12 +196,13 @@ pub(crate) fn validated_projection_quota<P, E>(
     head: ObjectId,
     captured_root: Option<RootState>,
     validation: &KvValidationCache<P>,
+    epoch: super::MemoEpoch,
 ) -> StorageResult<u64>
 where
     P: Clone + Ord,
     E: KvProjectionEngine<P>,
 {
-    validated_projection(engine, owner, head, captured_root, validation)
+    validated_projection(engine, owner, head, captured_root, validation, epoch)
         .map(|projection| projection.totals.quota_bytes)
 }
 

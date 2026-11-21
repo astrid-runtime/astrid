@@ -272,11 +272,14 @@ where
     E: KvProjectionEngine<P> + 'static,
 {
     fn header(&self, owner: P) -> StorageResult<TreeHeader<P>> {
+        self.header_at_epoch(owner, self.validation.memo_epoch())
+    }
+
+    fn header_at_epoch(&self, owner: P, epoch: MemoEpoch) -> StorageResult<TreeHeader<P>> {
         // Pin only this operation's existing immutable projection before root
         // capture. A concurrent checkpoint may replace the shared cache while
         // this reader loads its captured commit/state. Head matching below
         // preserves that snapshot without retaining an extra owner history.
-        let epoch = self.validation.memo_epoch();
         let captured_projection = self.validation.projections.lock().get(&owner).cloned();
         let Some(root) = self
             .engine
@@ -328,7 +331,7 @@ where
     ) -> StorageResult<T> {
         loop {
             let epoch = self.validation.memo_epoch();
-            let header = self.header(owner.clone())?;
+            let header = self.header_at_epoch(owner.clone(), epoch)?;
             let mut context = TreeContext::new(self.engine.as_ref(), owner);
             let (result, mutations, changed) = mutation(&mut context, &header)?;
             if !changed {
@@ -427,17 +430,17 @@ where
     }
 
     fn checkpoint_once(&self, owner: P, force: bool) -> StorageResult<bool> {
-        self.checkpoint_once_after(owner, force, || Ok(()))
+        self.checkpoint_once_after(owner, force, self.validation.memo_epoch(), || Ok(()))
     }
 
     fn checkpoint_once_after(
         &self,
         owner: P,
         force: bool,
+        epoch: MemoEpoch,
         interleave: impl FnOnce() -> StorageResult<()>,
     ) -> StorageResult<bool> {
-        let epoch = self.validation.memo_epoch();
-        let base = self.header(owner.clone())?;
+        let base = self.header_at_epoch(owner.clone(), epoch)?;
         let base_projection = projection_from_header(&base);
         if base_projection.depth == 0 {
             return Ok(false);
@@ -449,7 +452,7 @@ where
         let (tree, validation) = context.build_validated_checkpoint(&base)?;
         let checkpoint_totals = base_projection.totals;
         interleave()?;
-        let current = self.header(owner.clone())?;
+        let current = self.header_at_epoch(owner.clone(), epoch)?;
         let current_projection = projection_from_header(&current);
         if !force && !should_checkpoint(&current_projection) {
             return Ok(false);
@@ -693,7 +696,7 @@ where
         let blocking = self.blocking_store();
         let interleaved = blocking.clone();
         let mutation_owner = owner.clone();
-        blocking.checkpoint_once_after(owner, true, move || {
+        blocking.checkpoint_once_after(owner, true, blocking.validation.memo_epoch(), move || {
             interleaved.mutate(&mutation_owner, |context, header| {
                 let previous = context.projected_get(header, &key)?;
                 if previous.as_deref() == Some(value.as_slice()) {

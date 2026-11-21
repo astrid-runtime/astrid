@@ -1,31 +1,29 @@
-//! Checkpoint work owns its cache-cleanup obligation until every retry ends.
+//! One scoped admission and publication ticket spans every checkpoint retry.
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use super::{BlockingTreeStore, KvProjectionEngine, projection_from_header, should_checkpoint};
+use super::{
+    BlockingTreeStore, KvProjectionEngine, MemoEpoch, projection_from_header, should_checkpoint,
+};
 
 pub(super) type Checkpointing<P> = Arc<Mutex<BTreeMap<P, CheckpointState>>>;
 
 pub(super) struct CheckpointState {
-    retention: CacheRetention,
     requested: bool,
-}
-
-pub(super) enum CacheRetention {
-    Keep,
-    ForgetAfterCompletion,
 }
 
 struct CheckpointRegistration<P: Ord, E> {
     store: BlockingTreeStore<P, E>,
     owner: P,
     registered: bool,
+    epoch: MemoEpoch,
 }
 
 impl<P: Clone + Ord, E> CheckpointRegistration<P, E> {
     fn acquire(store: BlockingTreeStore<P, E>, owner: P) -> Option<Self> {
+        let epoch = store.validation.memo_epoch();
         {
             let mut active = store.checkpointing.lock();
             match active.entry(owner.clone()) {
@@ -34,10 +32,7 @@ impl<P: Clone + Ord, E> CheckpointRegistration<P, E> {
                     return None;
                 },
                 Entry::Vacant(entry) => {
-                    entry.insert(CheckpointState {
-                        retention: CacheRetention::Keep,
-                        requested: false,
-                    });
+                    entry.insert(CheckpointState { requested: false });
                 },
             }
         }
@@ -45,6 +40,7 @@ impl<P: Clone + Ord, E> CheckpointRegistration<P, E> {
             store,
             owner,
             registered: true,
+            epoch,
         })
     }
 }
@@ -60,7 +56,7 @@ impl<P: Ord, E> CheckpointRegistration<P, E> {
             state.requested = false;
             return false;
         }
-        release_owner(&self.store, &self.owner, &mut active);
+        active.remove(&self.owner);
         self.registered = false;
         true
     }
@@ -69,30 +65,20 @@ impl<P: Ord, E> CheckpointRegistration<P, E> {
 impl<P: Ord, E> Drop for CheckpointRegistration<P, E> {
     fn drop(&mut self) {
         if self.registered {
-            release_owner(
-                &self.store,
-                &self.owner,
-                &mut self.store.checkpointing.lock(),
-            );
+            self.store.checkpointing.lock().remove(&self.owner);
         }
     }
 }
 
-fn release_owner<P: Ord, E>(
-    store: &BlockingTreeStore<P, E>,
-    owner: &P,
-    active: &mut BTreeMap<P, CheckpointState>,
-) {
-    // Purge marks the registration before clearing caches under this same lock.
-    if active
-        .get(owner)
-        .is_some_and(|state| matches!(state.retention, CacheRetention::ForgetAfterCompletion))
-    {
-        store
-            .validation
-            .forget_owner(owner, &store.validated_content);
+impl<P, E> CheckpointRegistration<P, E>
+where
+    P: Clone + Ord + Send + Sync + 'static,
+    E: KvProjectionEngine<P> + 'static,
+{
+    fn checkpoint_once(&self) -> crate::StorageResult<bool> {
+        self.store
+            .checkpoint_once_after(self.owner.clone(), false, self.epoch, || Ok(()))
     }
-    active.remove(owner);
 }
 
 impl<P, E> BlockingTreeStore<P, E>
@@ -101,10 +87,6 @@ where
     E: KvProjectionEngine<P> + 'static,
 {
     pub(super) fn forget_owner_projection_state(&self, owner: &P) {
-        let mut active = self.checkpointing.lock();
-        if let Some(state) = active.get_mut(owner) {
-            state.retention = CacheRetention::ForgetAfterCompletion;
-        }
         self.validation.forget_owner(owner, &self.validated_content);
     }
 
@@ -120,9 +102,9 @@ where
         let _task = runtime.spawn_blocking(move || {
             let store = registration.store.clone();
             loop {
-                let outcome = store.checkpoint_once(registration.owner.clone(), false);
+                let outcome = registration.checkpoint_once();
                 let retry = if matches!(outcome.as_ref(), Ok(false)) {
-                    match store.header(registration.owner.clone()) {
+                    match store.header_at_epoch(registration.owner.clone(), registration.epoch) {
                         Ok(header) => should_checkpoint(&projection_from_header(&header)),
                         Err(error) => {
                             tracing::warn!(%error, "principal KV checkpoint retry check failed");

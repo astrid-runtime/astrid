@@ -66,15 +66,20 @@ async fn purged_owner_pending_checkpoint_cannot_leave_repopulated_caches() {
     let registration = CheckpointRegistration::acquire(blocking.clone(), owner.clone()).unwrap();
     assert!(CheckpointRegistration::acquire(blocking.clone(), owner.clone()).is_none());
     blocking
-        .checkpoint_once_after(owner.clone(), true, || {
-            assert_eq!(store.clear_owner(&owner)?, 1);
-            assert_forgotten(&store, &owner);
-            Ok(())
-        })
+        .checkpoint_once_after(
+            owner.clone(),
+            true,
+            blocking.validation.memo_epoch(),
+            || {
+                assert_eq!(store.clear_owner(&owner)?, 1);
+                assert_forgotten(&store, &owner);
+                Ok(())
+            },
+        )
         .unwrap();
-    // The admitted checkpoint's fresh header/commit may refill accelerators.
-    assert!(store.validation.projections.lock().contains_key(&owner));
-    assert!(store.validated_content.lock().contains_key(&owner));
+    // The complete operation retains its pre-purge ticket, including the
+    // second root observation. No post-completion sweep is needed.
+    assert_forgotten(&store, &owner);
     drop(registration);
     assert_forgotten(&store, &owner);
     assert!(store.checkpointing.lock().is_empty());
@@ -100,15 +105,19 @@ async fn ordinary_checkpoint_keeps_live_accelerators() {
 }
 
 #[tokio::test]
-async fn unwinding_checkpoint_releases_retirement_cleanup_obligation() {
+async fn unwinding_checkpoint_releases_admission_without_republishing() {
     let (store, _) = fixture();
     let owner = "retiring".to_owned();
     store.set(&owner, "key", b"value".to_vec()).await.unwrap();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _registration =
+        let registration =
             CheckpointRegistration::acquire(store.blocking_store(), owner.clone()).unwrap();
         store.clear_owner(&owner).unwrap();
-        store.blocking_store().header(owner.clone()).unwrap();
+        store
+            .blocking_store()
+            .header_at_epoch(owner.clone(), registration.epoch)
+            .unwrap();
+        assert_forgotten(&store, &owner);
         panic!("injected checkpoint unwind");
     }));
     assert!(result.is_err());
@@ -185,4 +194,65 @@ async fn no_op_purge_also_rejects_pre_purge_kv_header_publication() {
     )
     .unwrap();
     assert_forgotten(&store, &owner);
+}
+
+#[tokio::test]
+async fn explicit_compaction_does_not_recapture_a_post_purge_epoch() {
+    let (store, content) = fixture();
+    let owner = "retiring".to_owned();
+    store.set(&owner, "key", b"private".to_vec()).await.unwrap();
+    content
+        .put(&owner, &ContentName::new("retained").unwrap(), b"non-KV")
+        .unwrap();
+    // Explicit compaction does not own a background registration. Its second
+    // header observation must use the ticket captured before the first one.
+    let blocking = store.blocking_store();
+    blocking
+        .checkpoint_once_after(
+            owner.clone(),
+            true,
+            blocking.validation.memo_epoch(),
+            || {
+                assert_eq!(store.clear_owner(&owner)?, 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_forgotten(&store, &owner);
+}
+
+#[tokio::test]
+async fn queued_checkpoint_keeps_its_admission_epoch_after_purge() {
+    let (store, content) = fixture();
+    let owner = "retiring".to_owned();
+    store.set(&owner, "key", b"private".to_vec()).await.unwrap();
+    content
+        .put(&owner, &ContentName::new("retained").unwrap(), b"non-KV")
+        .unwrap();
+    let registration =
+        CheckpointRegistration::acquire(store.blocking_store(), owner.clone()).unwrap();
+    assert_eq!(store.clear_owner(&owner).unwrap(), 1);
+    registration.checkpoint_once().unwrap();
+    assert_forgotten(&store, &owner);
+    drop(registration);
+    assert!(store.checkpointing.lock().is_empty());
+}
+
+#[tokio::test]
+async fn completing_old_registration_preserves_fresh_authorized_memos() {
+    let (store, content) = fixture();
+    let owner = "retiring".to_owned();
+    store.set(&owner, "key", b"private".to_vec()).await.unwrap();
+    content
+        .put(&owner, &ContentName::new("retained").unwrap(), b"non-KV")
+        .unwrap();
+    let registration =
+        CheckpointRegistration::acquire(store.blocking_store(), owner.clone()).unwrap();
+    assert_eq!(store.clear_owner(&owner).unwrap(), 1);
+    store.blocking_store().header(owner.clone()).unwrap();
+    assert!(store.validated_content.lock().contains_key(&owner));
+    drop(registration);
+    assert!(store.validated_content.lock().contains_key(&owner));
+    assert!(store.validation.projections.lock().contains_key(&owner));
+    assert!(store.checkpointing.lock().is_empty());
 }

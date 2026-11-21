@@ -72,7 +72,7 @@ where
         let completed = &publication_completed;
         loop {
             let epoch = self.validated_kv.memo_epoch();
-            let mut header = self.header(principal)?.as_ref().clone();
+            let mut header = self.header_at_epoch(principal, epoch)?.as_ref().clone();
             // Recheck the complete snapshot before every CAS attempt, including
             // retries after another writer adds a previously unknown name.
             self.check_batch_preconditions(principal, &header, publication.preconditions)?;

@@ -329,7 +329,7 @@ where
         let descriptor = verified.descriptor();
         loop {
             let epoch = self.validated_kv.memo_epoch();
-            let mut header = self.header(principal)?.as_ref().clone();
+            let mut header = self.header_at_epoch(principal, epoch)?.as_ref().clone();
             let previous = self.catalog_lookup(principal, header.catalog, name)?;
             if previous.is_some_and(|entry| entry.file == descriptor.file()) {
                 let root = header.root.ok_or_else(|| {
@@ -403,7 +403,7 @@ where
         let descriptor = verified.descriptor();
         loop {
             let epoch = self.validated_kv.memo_epoch();
-            let mut header = self.header(principal)?.as_ref().clone();
+            let mut header = self.header_at_epoch(principal, epoch)?.as_ref().clone();
             let previous = self.catalog_lookup(principal, header.catalog, name)?;
             if let Some(expected) = expected_file
                 && previous.is_none_or(|entry| entry.file != expected)
@@ -470,7 +470,7 @@ where
     pub fn delete(&self, principal: &P, name: &ContentName) -> Result<bool, PrincipalContentError> {
         loop {
             let epoch = self.validated_kv.memo_epoch();
-            let mut header = self.header(principal)?.as_ref().clone();
+            let mut header = self.header_at_epoch(principal, epoch)?.as_ref().clone();
             let mutation = delete(
                 header.catalog,
                 name,
@@ -548,7 +548,7 @@ where
         }
         loop {
             let epoch = self.validated_kv.memo_epoch();
-            let mut header = self.header(principal)?.as_ref().clone();
+            let mut header = self.header_at_epoch(principal, epoch)?.as_ref().clone();
             self.check_batch_preconditions(principal, &header, preconditions)?;
             let mut records = BTreeMap::<ObjectId, ObjectRecord>::new();
             let mut changed = false;
@@ -628,7 +628,7 @@ where
         };
         loop {
             let epoch = self.validated_kv.memo_epoch();
-            let mut header = self.header(principal)?.as_ref().clone();
+            let mut header = self.header_at_epoch(principal, epoch)?.as_ref().clone();
             let mut values = Vec::with_capacity(moves.len());
             for (source, destination) in moves {
                 let Some(value) = self.catalog_lookup(principal, header.catalog, source)? else {
@@ -935,7 +935,14 @@ where
     }
 
     fn header(&self, principal: &P) -> Result<Arc<ContentHeader>, PrincipalContentError> {
-        let epoch = self.validated_kv.memo_epoch();
+        self.header_at_epoch(principal, self.validated_kv.memo_epoch())
+    }
+
+    fn header_at_epoch(
+        &self,
+        principal: &P,
+        epoch: crate::kv::MemoEpoch,
+    ) -> Result<Arc<ContentHeader>, PrincipalContentError> {
         let root = self.engine.current_root(principal)?;
         if let Some(root) = root
             && let Some(header) = self
