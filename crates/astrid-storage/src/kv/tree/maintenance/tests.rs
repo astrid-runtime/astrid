@@ -147,7 +147,6 @@ async fn historical_kv_header_cannot_republish_catalog_after_purge() {
     let name = ContentName::new("retained").unwrap();
     content.put(&owner, &name, b"non-KV").unwrap();
     let blocking = store.blocking_store();
-    let epoch = store.validation.memo_epoch();
     let root = blocking.engine.current_kv_root(&owner).unwrap().unwrap();
     assert_eq!(store.clear_owner(&owner).unwrap(), 1);
     let header = super::super::header::decode_header(
@@ -157,7 +156,7 @@ async fn historical_kv_header_cannot_republish_catalog_after_purge() {
         &store.validation,
         &store.validated_content,
         None,
-        epoch,
+        store.validation.memo_epoch(),
     )
     .unwrap();
     assert_eq!(header.root, Some(root));

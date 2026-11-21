@@ -54,10 +54,12 @@ async fn historical_content_decode_does_not_republish_after_purge() {
     kv.set(&owner, "key", b"private".to_vec()).await.unwrap();
     let name = ContentName::new("retained").unwrap();
     content.put(&owner, &name, b"non-KV").unwrap();
-    let epoch = content.validated_kv.memo_epoch();
     let root = content.engine.current_root(&owner).unwrap();
     assert_eq!(kv.clear_owner(&owner).unwrap(), 1);
-    let header = content.decode_header(&owner, root, epoch).unwrap();
+    // A fresh ticket alone must not let a historical root refill the map.
+    let header = content
+        .decode_header(&owner, root, content.validated_kv.memo_epoch())
+        .unwrap();
     assert_eq!(header.root, root);
     assert!(header.catalog.is_some());
     assert!(content.validated_catalogs.lock().is_empty());
