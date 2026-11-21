@@ -51,7 +51,7 @@ async fn terminal(client: &mut SocketClient) -> (serde_json::Value, String) {
 }
 
 #[tokio::test]
-#[ignore = "requires disposable daemon, fake-echo and aos-react streaming_timeout_secs=20"]
+#[ignore = "requires disposable daemon, fake-echo, aos-react streaming_timeout_secs=20 and HTTP stream read/total budgets exceeding 20s"]
 async fn autonomous_watchdog_timeout_then_success_on_same_connection() {
     let mut client = disposable_client().await;
     select_model(&mut client, "openai-compat:fake-echo").await;
@@ -59,7 +59,11 @@ async fn autonomous_watchdog_timeout_then_success_on_same_connection() {
         .send_input("ASTRID_E2E_INFLIGHT_CRASH_watchdog".to_owned())
         .await
         .expect("held prompt");
-    let timed_out = tokio::time::timeout(Duration::from_secs(30), async {
+    // This is a whole-turn fixture deadline, not the Streaming phase limit.
+    // AOS can spend 30s in each of identity and prompt preparation before
+    // entering the configured 20s phase; allow two 5s watchdog scheduling
+    // intervals as well. The exact 20s typed terminal below is unchanged.
+    let timed_out = tokio::time::timeout(Duration::from_secs(30 + 30 + 20 + 5 + 5), async {
         loop {
             let message = client
                 .read_message()
