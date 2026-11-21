@@ -962,7 +962,7 @@ where
             principal,
             root.commit,
             DECODED_HEADER_CACHE_KEY,
-            ProjectionCacheEntry::new(header.as_ref().clone()),
+            ProjectionCacheEntry::from_shared(Arc::clone(&header)),
         );
         Ok(header)
     }
