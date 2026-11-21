@@ -596,7 +596,13 @@ pub(super) fn decode_object_frame(
     let canonical_len = reader.usize_len()?;
     let reference_count = reader.usize_len()?;
     let canonical_bytes = reader.take(canonical_len)?.to_vec();
-    let references = decode_references(&mut reader, scheme, reference_count)?;
+    // Empty records have no reference bytes to decode. Avoid an out-of-line
+    // decoder call while keeping the trailing-byte and record checks below.
+    let references = if reference_count == 0 {
+        Vec::new()
+    } else {
+        decode_references(&mut reader, scheme, reference_count)?
+    };
     if reader.remaining() != 0 {
         return Err("trailing object-frame bytes");
     }
