@@ -39,10 +39,16 @@ pub(super) async fn run(config: &Config, root: &Path, report: &mut Report) -> Be
         let home = AstridHome::from_path(path.clone());
         home.ensure()?;
         let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|_: &StateOwner| Ok(None));
-        let store = open_runtime_principal_store(&home, Arc::clone(&quota)).await?;
+        let store = Arc::new(open_runtime_principal_store(&home, Arc::clone(&quota)).await?);
         let retiring = prepare(&store, owners).await?;
         phase.mark("projection_churn_setup", report)?;
-        let measured = concurrent_churn(&store, &retiring)?;
+        // Keep the current-thread runtime driving engine maintenance while
+        // the scoped foreground and retirement threads perform blocking I/O.
+        let measured = {
+            let store = Arc::clone(&store);
+            let retiring = retiring.clone();
+            tokio::task::spawn_blocking(move || concurrent_churn(&store, &retiring)).await??
+        };
         elapsed.push(measured.0);
         writes.push(measured.1);
         purges.push(measured.2);
