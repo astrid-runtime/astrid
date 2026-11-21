@@ -29,6 +29,8 @@ mod audit_retention;
 mod audit_retirement_tests;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod audit_sink;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod boot_policy;
 /// Passive event-bus storm diagnostics (publish-rate monitor).
 mod bus_monitor;
 #[cfg(test)]
@@ -778,123 +780,15 @@ impl Kernel {
         http_limits: astrid_capsule_types::HttpLimits,
         workspace_layout: WorkspaceLayout,
     ) -> Result<Arc<Self>, std::io::Error> {
-        use astrid_core::dirs::AstridHome;
-
-        // Resolve the Astrid home directory. Required for persistent KV store
-        // and audit log. Fails boot if neither $ASTRID_HOME nor $HOME is set.
-        let home = AstridHome::resolve().map_err(|e| {
-            std::io::Error::other(format!(
-                "Failed to resolve Astrid home (set $ASTRID_HOME or $HOME): {e}"
-            ))
-        })?;
-        // Home-bound custody acquires the singleton before opening stores.
-        // Interrupted projection subsets must authenticate their durable
-        // RETIRING authority before ordinary home admission or amendments.
-        let boot_admission = native_boot::NativeBootAdmission::acquire(&home)?;
-
-        // Resolve quota policy before opening state so the durable adapter and
-        // capsule engine share exactly one invalidatable profile cache.
-        let profile_cache = Arc::new(PrincipalProfileCache::with_home(home.clone()));
-        let principal_directory = astrid_storage::PrincipalDirectory::default();
-        let quota_cache = Arc::clone(&profile_cache);
-        let quota_principals = principal_directory.clone();
-        let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
-            Arc::new(move |owner: &astrid_storage::StateOwner| {
-                match owner {
-                    astrid_storage::StateOwner::System => Ok(None),
-                    astrid_storage::StateOwner::Principal(owner) => {
-                        quota_principals.alias_for(*owner).and_then(|principal| {
-                            quota_cache
-                                .resolve(&principal)
-                                .map(|profile| Some(profile.quotas.max_storage_bytes))
-                                .map_err(|error| {
-                                    astrid_storage::StorageError::Internal(format!(
-                                        "resolve storage quota for {principal}: {error}"
-                                    ))
-                                })
-                        })
-                    },
-                    // A fleet is a real writable owner. Until the allocation-policy
-                    // capsule admits a tighter fleet budget, retain the same hard
-                    // storage ceiling used by an unconfigured principal. Accounting
-                    // and enforcement remain in the kernel; policy does not run in
-                    // the storage transaction.
-                    astrid_storage::StateOwner::Fleet(_) => {
-                        Ok(Some(astrid_core::profile::DEFAULT_MAX_STORAGE_BYTES))
-                    },
-                }
-            });
-
-        // Open the authoritative state store. First cutover imports and
-        // verifies legacy SurrealKV under the singleton lock before serving.
-        let (principal_store, singleton_lock, layout_origin) = boot_admission
-            .open(quota, principal_directory.clone())
-            .await?;
-        let kv = principal_store.kv();
-        // TODO: clear ephemeral keys (e: prefix) on boot when the key
-        // lifecycle tier convention is established.
-
-        // Load the runtime signing key ONCE and share it (issue #929): the
-        // audit log signs chain entries with it, and the admin token-mint path
-        // signs capability tokens with the same key. Never load it from disk
-        // twice — a second load would still yield the same persisted bytes, but
-        // routing one `Arc` makes the single-source-of-truth explicit and lets
-        // `kernel.runtime_key` mint tokens the approval interceptor's validator
-        // trusts as issuer.
-        let runtime_key = Arc::new(load_or_generate_runtime_key(&home.keys_dir())?);
-        let audit_store = principal_store
-            .system_control_kv("audit")
-            .map_err(|e| std::io::Error::other(format!("Failed to open audit projection: {e}")))?
-            .backend();
-        let audit_log = open_audit_log(
-            &home,
-            audit_store,
-            &principal_store,
-            Arc::clone(&runtime_key),
-        )
-        .await?;
-
-        // Bind the secure Unix socket (the singleton lock is already held). The
-        // socket is bound here, but not yet listened on. The token is generated
-        // before any capsule can accept connections, preventing a race where a
-        // client connects before the token file exists.
-        let listener = socket::bind_listener(&home)?;
-        // Record our PID immediately after acquiring the singleton lock, so the
-        // PID on disk always belongs to the process that holds the state-db
-        // lock. The CLI reads this to signal a wedged daemon that is no longer
-        // reachable over the socket but still holding the lock (which would
-        // otherwise wedge the next `astrid start`). Best-effort: a write
-        // failure only degrades `stop`/`restart` to socket-only cleanup.
-        if let Err(e) = socket::write_pid_file() {
-            tracing::warn!(error = %e, "Failed to write daemon PID file; stop/restart will fall back to socket-only cleanup");
-        }
-        let (session_token, token_path) = socket::generate_session_token()?;
-
-        let resources = KernelResources::new(
-            home,
-            kv,
-            audit_log,
-            runtime_key,
-            Arc::new(session_token),
-            token_path,
-            Some(Arc::new(tokio::sync::Mutex::new(listener))),
-            Some(singleton_lock),
-        )
-        .with_layout_origin(layout_origin);
-
-        Self::with_resources_and_workspace_layout_with_profile_cache_and_directory(
+        Self::new_configured_with_workspace_layout(
             session_id,
             workspace_root,
-            runtime_limits,
             local_egress,
-            http_limits,
-            resources,
             workspace_layout,
-            Some(profile_cache),
-            principal_directory,
-            Some(principal_store),
+            |_| Ok((runtime_limits, http_limits)),
         )
         .await
+        .map(|(kernel, _)| kernel)
     }
 
     /// Construct a Kernel from already-acquired host resources.
@@ -1024,17 +918,17 @@ impl Kernel {
         Self::with_resources_and_workspace_layout_with_profile_cache_and_directory(
             session_id,
             workspace_root,
-            runtime_limits,
             local_egress,
-            http_limits,
             resources,
             workspace_layout,
             profile_cache,
             astrid_storage::PrincipalDirectory::default(),
             #[cfg(not(target_family = "wasm"))]
             None,
+            |_| Ok((runtime_limits, http_limits)),
         )
         .await
+        .map(|(kernel, _)| kernel)
     }
 
     #[expect(
@@ -1045,9 +939,7 @@ impl Kernel {
     async fn with_resources_and_workspace_layout_with_profile_cache_and_directory(
         session_id: SessionId,
         workspace_root: PathBuf,
-        runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits,
         local_egress: std::collections::HashMap<String, Vec<String>>,
-        http_limits: astrid_capsule_types::HttpLimits,
         resources: KernelResources,
         workspace_layout: WorkspaceLayout,
         profile_cache: Option<Arc<PrincipalProfileCache>>,
@@ -1055,7 +947,13 @@ impl Kernel {
         #[cfg(not(target_family = "wasm"))] principal_store: Option<
             astrid_storage::RuntimePrincipalStore,
         >,
-    ) -> Result<Arc<Self>, std::io::Error> {
+        resolve_boot_limits: impl FnOnce(
+            Option<&astrid_config::Config>,
+        ) -> std::io::Result<(
+            astrid_capsule_types::CapsuleRuntimeLimits,
+            astrid_capsule_types::HttpLimits,
+        )>,
+    ) -> Result<(Arc<Self>, Option<astrid_config::Config>), std::io::Error> {
         // The native capsule engine uses `block_in_place`, which requires a
         // multi-thread runtime. The browser profile has no such runtime (and no
         // `block_in_place`), so the assert is native-only.
@@ -1204,7 +1102,7 @@ impl Kernel {
         // Native-only: both are CLI/disk concepts; the browser host
         // establishes identity through its own uplink instead.
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let audit_config = {
+        let boot_config = {
             if matches!(
                 layout_origin,
                 Some(legacy_migration_barrier::LayoutOrigin::Legacy)
@@ -1252,8 +1150,8 @@ impl Kernel {
             // snapshot; a later ambient-home lookup could weaken that policy.
             // Migration above is append-free; select the format before any
             // bootstrap audit entry. Browser hosts configure their injected log.
-            let audit_config =
-                audit_retention::load_audit_config(&home, &workspace_root, &workspace_layout)?;
+            let config = boot_policy::load_config(&home, &workspace_root, &workspace_layout)?;
+            let audit_config = &config.audit;
             audit_keys::apply_entry_format(
                 &audit_log,
                 &home.keys_dir(),
@@ -1288,9 +1186,6 @@ impl Kernel {
                 std::io::Error::other(format!("Failed to bootstrap CLI root ownership: {error}"))
             })?;
 
-            // Apply pre-configured identity links from config.
-            apply_identity_config(&identity_store, &workspace_root, &workspace_layout).await;
-
             // Import ordinary user files from the released principal-home
             // tree before the layout receipt allows the daemon to serve the
             // logical `home://` projection. Dedicated policy, capsule,
@@ -1320,8 +1215,18 @@ impl Kernel {
                     .publish_runtime_projection(&home)
                     .map_err(std::io::Error::other)?;
             }
-            audit_config
+            config
         };
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let audit_config = &boot_config.audit;
+        let (runtime_limits, http_limits) = resolve_boot_limits(cfg_select! {
+            all(target_arch = "wasm32", target_os = "unknown") => None,
+            _ => Some(&boot_config),
+        })?;
+        // Configured logging can now report nonfatal link errors without
+        // creating files before layout admission and publication complete.
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        apply_identity_config(&identity_store, &boot_config).await;
 
         #[cfg(not(target_family = "wasm"))]
         let workspace_branches = principal_store.clone().map(|store| {
@@ -1345,7 +1250,7 @@ impl Kernel {
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         crate::audit_retention::apply_retention_config(&audit_log, &audit_config.retention);
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let host_audit_policy = crate::audit_sink::HostAuditPolicy::from(&audit_config);
+        let host_audit_policy = crate::audit_sink::HostAuditPolicy::from(audit_config);
         // The host-audit lane keeps its marker (which lane run is open, and
         // which chains it wrote to) beside the audit projection, so a run
         // that stops without draining leaves a signed gap entry at the next
@@ -1366,8 +1271,7 @@ impl Kernel {
         let host_audit_marker: Option<astrid_storage::ScopedKvStore> = None;
 
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let resource_policy =
-            user_resources::load_policy(&home, &workspace_root, &workspace_layout)?;
+        let resource_policy = boot_config.resources.clone();
         #[cfg(not(target_family = "wasm"))]
         if let Some(store) = principal_store.as_ref() {
             user_resources::configure_object_cache(store, &resource_policy);
@@ -1536,7 +1440,13 @@ impl Kernel {
             "INTERNAL_SUBSCRIBER_COUNT is stale; update it when adding permanent subscribers"
         );
 
-        Ok(kernel)
+        Ok((
+            kernel,
+            cfg_select! {
+                all(target_arch = "wasm32", target_os = "unknown") => None,
+                _ => Some(boot_config),
+            },
+        ))
     }
 
     fn verify_workspace_capsule_tree(&self, dir: &Path) -> anyhow::Result<()> {
@@ -5104,18 +5014,8 @@ fn mint_default_principal_keypair(
 /// but does not abort boot.
 async fn apply_identity_config(
     store: &Arc<dyn astrid_storage::IdentityStore>,
-    workspace_root: &std::path::Path,
-    workspace_layout: &WorkspaceLayout,
+    config: &astrid_config::Config,
 ) {
-    let config =
-        match astrid_config::Config::load_with_layout(Some(workspace_root), workspace_layout) {
-            Ok(resolved) => resolved.config,
-            Err(e) => {
-                tracing::debug!(error = %e, "No config loaded for identity links");
-                return;
-            },
-        };
-
     for link_cfg in &config.identity.links {
         let result = apply_single_identity_link(store, link_cfg).await;
         if let Err(e) = result {

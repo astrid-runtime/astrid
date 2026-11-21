@@ -1,5 +1,7 @@
 //! Singleton-owned native storage acquisition with authenticated retry.
 
+mod kernel;
+
 use std::{io, sync::Arc};
 
 use astrid_core::dirs::AstridHome;

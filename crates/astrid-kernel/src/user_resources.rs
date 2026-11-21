@@ -52,21 +52,3 @@ pub(crate) fn configure_object_cache(
         ));
     }
 }
-
-pub(crate) fn load_policy(
-    home: &astrid_core::dirs::AstridHome,
-    workspace: &std::path::Path,
-    layout: &astrid_core::dirs::WorkspaceLayout,
-) -> std::io::Result<astrid_config::resources::ResourceConfig> {
-    // The kernel may have been constructed with an explicit home independent
-    // of process-wide ASTRID_HOME. Resource authority follows that captured
-    // home, never a second ambient home lookup.
-    Ok(
-        astrid_config::Config::load_with_home_and_layout(Some(workspace), home.root(), layout)
-            .map_err(|error| {
-                std::io::Error::other(format!("load operator resource allocations: {error}"))
-            })?
-            .config
-            .resources,
-    )
-}
