@@ -88,8 +88,9 @@ fn release_owner<P: Ord, E>(
         .get(owner)
         .is_some_and(|state| matches!(state.retention, CacheRetention::ForgetAfterCompletion))
     {
-        store.validation.forget_owner(owner);
-        store.validated_content.lock().remove(owner);
+        store
+            .validation
+            .forget_owner(owner, &store.validated_content);
     }
     active.remove(owner);
 }
@@ -104,8 +105,7 @@ where
         if let Some(state) = active.get_mut(owner) {
             state.retention = CacheRetention::ForgetAfterCompletion;
         }
-        self.validation.forget_owner(owner);
-        self.validated_content.lock().remove(owner);
+        self.validation.forget_owner(owner, &self.validated_content);
     }
 
     pub(super) fn schedule_checkpoint(&self, owner: P) {

@@ -4,7 +4,7 @@ use std::fmt;
 use std::panic::{AssertUnwindSafe, RefUnwindSafe, UnwindSafe};
 use std::sync::Arc;
 
-use super::{KvValidationCache, Projection, TreeValidation};
+use super::{KvValidationCache, MemoEpoch, Projection, TreeValidation};
 use crate::storage_model::{ObjectId, RootState};
 
 /// A closed, process-local cache update, never an arbitrary engine callback.
@@ -28,6 +28,7 @@ struct CheckpointPublication<P: Ord> {
     owner: P,
     checkpoint_owner: P,
     commit: ObjectId,
+    epoch: MemoEpoch,
     projection: Projection,
     validation: TreeValidation,
 }
@@ -46,6 +47,7 @@ impl KvCheckpointPublication {
         commit: ObjectId,
         projection: Projection,
         validation: TreeValidation,
+        epoch: MemoEpoch,
     ) -> Self {
         // This closed operation updates only disposable validation metadata;
         // unwinding cannot invalidate the admitted root or its immutable bytes.
@@ -56,6 +58,7 @@ impl KvCheckpointPublication {
             checkpoint_owner: owner.clone(),
             owner,
             commit,
+            epoch,
             projection,
             validation,
         })))
@@ -79,6 +82,9 @@ impl<P: Ord + Send + Sync> PublishCheckpoint for AssertUnwindSafe<CheckpointPubl
         // the engine. Never wait on either cache while holding its writer:
         // contention leaves publication to the ordinary post-commit path.
         let mut projections = publication.cache.projections.try_lock()?;
+        if !publication.cache.epoch_is_current(publication.epoch) {
+            return None;
+        }
         let mut trees = publication.cache.trees.try_lock()?;
         trees.insert(publication.checkpoint_owner, publication.validation);
         projections

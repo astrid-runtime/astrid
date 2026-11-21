@@ -9,6 +9,7 @@ use crate::storage_model::{
 use parking_lot::Mutex;
 
 use super::delta::{Head, Mutation, Projection, decode_head, mutation_payload_bytes};
+use super::memo::MemoSnapshot;
 use super::node::NodeTotals;
 use super::overlay::OverlayMap;
 use super::{
@@ -68,6 +69,7 @@ pub(super) fn decode_header<P, E>(
     validation: &KvValidationCache<P>,
     validated_content: &Mutex<BTreeMap<P, CatalogValidation>>,
     captured_projection: Option<Projection>,
+    epoch: super::MemoEpoch,
 ) -> StorageResult<TreeHeader<P>>
 where
     P: Clone + Ord,
@@ -103,8 +105,15 @@ where
             return Err(invalid(state_id, "principal KV component is not owning"));
         },
     };
-    let (preserved_state, other_quota_bytes) =
-        decode_other_components(engine, &owner, state_id, &state, validated_content)?;
+    let (preserved_state, other_quota_bytes) = decode_other_components(
+        engine,
+        &owner,
+        state_id,
+        &state,
+        validated_content,
+        validation,
+        MemoSnapshot { root, epoch },
+    )?;
     let preserved_commit = commit
         .references()
         .iter()
@@ -121,6 +130,7 @@ where
             root,
             projection.clone(),
             Some(checkpoint),
+            epoch,
         );
     }
     Ok(TreeHeader {
@@ -156,6 +166,7 @@ where
     P: Clone + Ord,
     E: KvProjectionEngine<P>,
 {
+    let epoch = validation.memo_epoch();
     let cached = validation
         .projections
         .lock()
@@ -173,6 +184,7 @@ where
             root,
             decoded.clone(),
             Some(checkpoint),
+            epoch,
         );
     }
     Ok(decoded)
@@ -199,6 +211,8 @@ fn decode_other_components<P, E>(
     state_id: ObjectId,
     state: &ObjectRecord,
     validated_content: &Mutex<BTreeMap<P, CatalogValidation>>,
+    validation_cache: &KvValidationCache<P>,
+    snapshot: MemoSnapshot,
 ) -> StorageResult<(Vec<ObjectReference>, u64)>
 where
     P: Clone + Ord,
@@ -219,6 +233,8 @@ where
                     state_id,
                     reference,
                     validated_content,
+                    validation_cache,
+                    snapshot,
                 )?)
                 .ok_or_else(|| {
                     StorageError::Internal("principal quota total overflow".to_owned())
@@ -259,6 +275,8 @@ fn validate_content_component<P, E>(
     state_id: ObjectId,
     reference: &ObjectReference,
     validated_content: &Mutex<BTreeMap<P, CatalogValidation>>,
+    validation_cache: &KvValidationCache<P>,
+    snapshot: MemoSnapshot,
 ) -> StorageResult<u64>
 where
     P: Clone + Ord,
@@ -299,7 +317,10 @@ where
                 })
         })
         .map_err(|error| StorageError::Serialization(error.to_string()))?;
-        validated_content.lock().insert(owner.clone(), validation);
+        validation_cache.publish_catalog_if_current(
+            validated_content, owner, snapshot.epoch, validation,
+            || matches!(engine.current_kv_root(owner), Ok(Some(current)) if current == snapshot.root),
+        );
         validation
     };
     if validation.summary != catalog_root.summary {

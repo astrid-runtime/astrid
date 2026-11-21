@@ -138,3 +138,52 @@ async fn writer_request_before_atomic_completion_is_not_lost() {
     drop(second);
     assert!(store.checkpointing.lock().is_empty());
 }
+
+#[tokio::test]
+async fn historical_kv_header_cannot_republish_catalog_after_purge() {
+    let (store, content) = fixture();
+    let owner = "retiring".to_owned();
+    store.set(&owner, "key", b"private".to_vec()).await.unwrap();
+    let name = ContentName::new("retained").unwrap();
+    content.put(&owner, &name, b"non-KV").unwrap();
+    let blocking = store.blocking_store();
+    let epoch = store.validation.memo_epoch();
+    let root = blocking.engine.current_kv_root(&owner).unwrap().unwrap();
+    assert_eq!(store.clear_owner(&owner).unwrap(), 1);
+    let header = super::super::header::decode_header(
+        blocking.engine.as_ref(),
+        owner.clone(),
+        root,
+        &store.validation,
+        &store.validated_content,
+        None,
+        epoch,
+    )
+    .unwrap();
+    assert_eq!(header.root, Some(root));
+    assert_forgotten(&store, &owner);
+}
+
+#[tokio::test]
+async fn no_op_purge_also_rejects_pre_purge_kv_header_publication() {
+    let (store, content) = fixture();
+    let owner = "retiring".to_owned();
+    let name = ContentName::new("retained").unwrap();
+    content.put(&owner, &name, b"non-KV").unwrap();
+    let blocking = store.blocking_store();
+    let epoch = store.validation.memo_epoch();
+    let root = blocking.engine.current_kv_root(&owner).unwrap().unwrap();
+    assert_eq!(store.clear_owner(&owner).unwrap(), 0);
+    assert_eq!(blocking.engine.current_kv_root(&owner).unwrap(), Some(root));
+    super::super::header::decode_header(
+        blocking.engine.as_ref(),
+        owner.clone(),
+        root,
+        &store.validation,
+        &store.validated_content,
+        None,
+        epoch,
+    )
+    .unwrap();
+    assert_forgotten(&store, &owner);
+}

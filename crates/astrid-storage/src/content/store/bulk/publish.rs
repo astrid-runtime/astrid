@@ -71,6 +71,7 @@ where
         )?;
         let completed = &publication_completed;
         loop {
+            let epoch = self.validated_kv.memo_epoch();
             let mut header = self.header(principal)?.as_ref().clone();
             // Recheck the complete snapshot before every CAS attempt, including
             // retries after another writer adds a previously unknown name.
@@ -127,9 +128,7 @@ where
                         "unchanged batch exists without a principal root",
                     )
                 })?;
-                for prepared in completed.values() {
-                    self.mark_verified(principal, prepared.verified);
-                }
+                self.mark_batch_verified(principal, completed);
                 return Ok(batch_outcome(completed, root, staged_objects_inserted));
             }
 
@@ -155,10 +154,8 @@ where
             };
             match commit {
                 Ok(outcome) => {
-                    self.finish_catalog_commit(principal, header, outcome.root());
-                    for prepared in completed.values() {
-                        self.mark_verified(principal, prepared.verified);
-                    }
+                    self.finish_catalog_commit(principal, header, outcome.root(), epoch);
+                    self.mark_batch_verified(principal, completed);
                     let objects_inserted = staged_objects_inserted
                         .checked_add(outcome.objects_inserted())
                         .ok_or(PrincipalContentError::AccountingOverflow)?;
@@ -167,6 +164,16 @@ where
                 Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
                 Err(error) => return Err(error.into()),
             }
+        }
+    }
+
+    fn mark_batch_verified(
+        &self,
+        principal: &P,
+        completed: &BTreeMap<ContentName, super::PreparedContent>,
+    ) {
+        for prepared in completed.values() {
+            self.mark_verified(principal, prepared.verified);
         }
     }
 

@@ -36,6 +36,7 @@ mod hot_cache;
 mod hot_cache_integration_tests;
 mod legacy_avl;
 mod maintenance;
+mod memo;
 mod node;
 mod overlay;
 #[cfg(all(test, feature = "legacy-surrealkv"))]
@@ -49,6 +50,7 @@ pub(crate) use self::handoff::seed_owner_memo_if_live;
 pub(crate) use self::header::validated_projection_quota;
 pub use self::hot_cache::{KvReadCacheBudget, KvReadCacheCapacity, KvReadCacheConfig};
 pub(crate) use self::legacy_avl::migrate_principal as migrate_legacy_avl;
+pub(crate) use self::memo::MemoEpoch;
 pub(crate) use self::publication::{KvCheckpointPublication, RetiredKvProjection};
 pub(crate) use self::validation::CertifiedValueMembership;
 pub(super) use self::validation::TreeValidation;
@@ -64,6 +66,7 @@ const CHECKPOINT_MIN_DELTA_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug)]
 pub(crate) struct KvValidationCache<P: Ord> {
+    epoch: std::sync::atomic::AtomicU64,
     trees: Mutex<BTreeMap<P, TreeValidation>>,
     projections: Mutex<BTreeMap<P, Projection>>,
     #[cfg(test)]
@@ -73,22 +76,12 @@ pub(crate) struct KvValidationCache<P: Ord> {
 impl<P: Ord> Default for KvValidationCache<P> {
     fn default() -> Self {
         Self {
+            epoch: std::sync::atomic::AtomicU64::new(0),
             trees: Mutex::new(BTreeMap::new()),
             projections: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             tree_validation_invocations: std::sync::atomic::AtomicU64::new(0),
         }
-    }
-}
-
-impl<P: Ord> KvValidationCache<P> {
-    /// Drop reconstructible accelerators without changing durable owner state.
-    pub(crate) fn forget_owner(&self, owner: &P) {
-        // Match every publisher's projections -> trees lock order. Keep the
-        // publication guard until both maps are empty.
-        let mut projections = self.projections.lock();
-        self.trees.lock().remove(owner);
-        projections.remove(owner);
     }
 }
 
@@ -100,6 +93,7 @@ impl<P: Clone + Ord> KvValidationCache<P> {
         expected: RootState,
         projection: Projection,
         checkpoint: Option<TreeValidation>,
+        epoch: MemoEpoch,
     ) {
         if let Some(checkpoint) = checkpoint
             && (checkpoint.root() != projection.tree
@@ -110,6 +104,9 @@ impl<P: Clone + Ord> KvValidationCache<P> {
         // Order every cache publisher and check currency inside that guard.
         // Never hold it across graph validation or an authoritative commit.
         let mut projections = self.projections.lock();
+        if !self.epoch_is_current(epoch) {
+            return;
+        }
         let Ok(Some(current)) = engine.current_kv_root(&owner) else {
             // An optional cache query must not false-fail an already successful
             // commit or historical snapshot read.
@@ -279,6 +276,7 @@ where
         // capture. A concurrent checkpoint may replace the shared cache while
         // this reader loads its captured commit/state. Head matching below
         // preserves that snapshot without retaining an extra owner history.
+        let epoch = self.validation.memo_epoch();
         let captured_projection = self.validation.projections.lock().get(&owner).cloned();
         let Some(root) = self
             .engine
@@ -294,6 +292,7 @@ where
             self.validation.as_ref(),
             self.validated_content.as_ref(),
             captured_projection,
+            epoch,
         )
     }
 
@@ -328,6 +327,7 @@ where
         ) -> StorageResult<(T, Vec<Replacement>, bool)>,
     ) -> StorageResult<T> {
         loop {
+            let epoch = self.validation.memo_epoch();
             let header = self.header(owner.clone())?;
             let mut context = TreeContext::new(self.engine.as_ref(), owner);
             let (result, mutations, changed) = mutation(&mut context, &header)?;
@@ -377,6 +377,7 @@ where
                         outcome.root(),
                         validated_projection,
                         checkpoint,
+                        epoch,
                     );
                     if should_checkpoint(&projection) {
                         self.schedule_checkpoint(owner.clone());
@@ -435,6 +436,7 @@ where
         force: bool,
         interleave: impl FnOnce() -> StorageResult<()>,
     ) -> StorageResult<bool> {
+        let epoch = self.validation.memo_epoch();
         let base = self.header(owner.clone())?;
         let base_projection = projection_from_header(&base);
         if base_projection.depth == 0 {
@@ -470,6 +472,7 @@ where
                 commit,
                 rebased.clone(),
                 validation,
+                epoch,
             )
         });
         match self.engine.commit_kv_root(transaction) {
@@ -480,6 +483,7 @@ where
                     outcome.root(),
                     rebased,
                     Some(validation),
+                    epoch,
                 );
                 Ok(true)
             },

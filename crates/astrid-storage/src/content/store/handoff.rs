@@ -31,15 +31,16 @@ where
     pub(crate) fn seed_catalog_owner_from(
         &self,
         source: &Mutex<BTreeMap<P, CatalogValidation>>,
-        owner: P,
+        owner: &P,
     ) -> bool {
-        let Some(memo) = source.lock().get(&owner).copied() else {
+        let epoch = self.validated_kv.memo_epoch();
+        let Some(memo) = source.lock().get(owner).copied() else {
             return false;
         };
-        let Ok(live_root) = self.engine.current_root(&owner) else {
+        let Ok(live_root) = self.engine.current_root(owner) else {
             return false;
         };
-        let Ok(live) = self.live_content_catalog(&owner, live_root) else {
+        let Ok(live) = self.live_content_catalog(owner, live_root) else {
             return false;
         };
         match (live, memo.root) {
@@ -52,14 +53,13 @@ where
                 if memo_root == object && memo.summary == summary => {},
             _ => return false,
         }
-        let Ok(current) = self.engine.current_root(&owner) else {
-            return false;
-        };
-        if current != live_root {
-            return false;
-        }
-        self.validated_catalogs.lock().insert(owner, memo);
-        true
+        self.validated_kv.publish_catalog_if_current(
+            &self.validated_catalogs,
+            owner,
+            epoch,
+            memo,
+            || matches!(self.engine.current_root(owner), Ok(current) if current == live_root),
+        )
     }
 
     fn live_content_catalog(

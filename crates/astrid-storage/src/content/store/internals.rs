@@ -21,15 +21,19 @@ where
         principal: &P,
         mut header: ContentHeader,
         root: RootState,
+        epoch: crate::kv::MemoEpoch,
     ) {
-        self.validated_catalogs.lock().insert(
-            principal.clone(),
+        self.validated_kv.publish_catalog_if_current(
+            &self.validated_catalogs,
+            principal,
+            epoch,
             crate::content::catalog::CatalogValidation {
                 root: header.catalog.map(|catalog| catalog.object),
                 summary: header
                     .catalog
                     .map_or(CatalogSummary::default(), |catalog| catalog.summary),
             },
+            || matches!(self.engine.current_root(principal), Ok(Some(current)) if current == root),
         );
         header.root = Some(root);
         header.previous_catalog_quota_bytes = header
@@ -50,6 +54,7 @@ where
         &self,
         principal: &P,
         root: Option<RootState>,
+        epoch: crate::kv::MemoEpoch,
     ) -> Result<ContentHeader, PrincipalContentError> {
         #[cfg(test)]
         self.decode_header_invocations
@@ -86,6 +91,7 @@ where
                         .engine
                         .load_object_for(principal, reference.target())?
                         .ok_or_else(|| ContentError::MissingObject(reference.target()))?;
+                    let captured_root = root;
                     let root = root_from_record(reference.target(), &record)?;
                     let cached = self
                         .validated_catalogs
@@ -102,9 +108,10 @@ where
                         let validation = validate_catalog(Some(root), &mut |object| {
                             self.load_required_for(principal, object)
                         })?;
-                        self.validated_catalogs
-                            .lock()
-                            .insert(principal.clone(), validation);
+                        self.validated_kv.publish_catalog_if_current(
+                            &self.validated_catalogs, principal, epoch, validation,
+                            || matches!(self.engine.current_root(principal), Ok(Some(current)) if current == captured_root),
+                        );
                         validation
                     };
                     if validation.summary != root.summary {
@@ -454,3 +461,6 @@ where
         Ok(id)
     }
 }
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod retirement_tests;

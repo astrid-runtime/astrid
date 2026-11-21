@@ -96,7 +96,7 @@ impl RuntimePrincipalStore {
             StateOwner::System,
         );
         let system_catalog_memo_rebound =
-            content.seed_catalog_owner_from(source_catalogs.as_ref(), StateOwner::System);
+            content.seed_catalog_owner_from(source_catalogs.as_ref(), &StateOwner::System);
         tracing::debug!(
             system_kv_memo_rebound,
             system_catalog_memo_rebound,

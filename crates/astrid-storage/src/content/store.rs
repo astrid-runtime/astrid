@@ -106,6 +106,7 @@ where
         principal: &P,
     ) -> Result<bool, PrincipalContentError> {
         loop {
+            let epoch = self.validated_kv.memo_epoch();
             let Some(root) = self.engine.current_root(principal)? else {
                 return Ok(false);
             };
@@ -128,12 +129,13 @@ where
             let catalog_id = content_reference.target();
             let catalog_record = self.load_required(catalog_id)?;
             if catalog_record.format_version() != ObjectFormatVersion::V1 {
-                let root = root_from_record(catalog_id, &catalog_record)?;
+                let catalog_root = root_from_record(catalog_id, &catalog_record)?;
                 let validation =
-                    validate_catalog(Some(root), &mut |object| self.load_required(object))?;
-                self.validated_catalogs
-                    .lock()
-                    .insert(principal.clone(), validation);
+                    validate_catalog(Some(catalog_root), &mut |object| self.load_required(object))?;
+                self.validated_kv.publish_catalog_if_current(
+                    &self.validated_catalogs, principal, epoch, validation,
+                    || matches!(self.engine.current_root(principal), Ok(Some(current)) if current == root),
+                );
                 return Ok(false);
             }
             let legacy = decode_legacy_catalog(catalog_id, &catalog_record)?;
@@ -180,7 +182,7 @@ where
                 self.encode_transaction(principal.clone(), header.clone(), None, catalog_records)?;
             match self.engine.commit_root(transaction) {
                 Ok(outcome) => {
-                    self.finish_catalog_commit(principal, header, outcome.root());
+                    self.finish_catalog_commit(principal, header, outcome.root(), epoch);
                     return Ok(true);
                 },
                 Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
@@ -326,6 +328,7 @@ where
     ) -> Result<ContentWriteOutcome, PrincipalContentError> {
         let descriptor = verified.descriptor();
         loop {
+            let epoch = self.validated_kv.memo_epoch();
             let mut header = self.header(principal)?.as_ref().clone();
             let previous = self.catalog_lookup(principal, header.catalog, name)?;
             if previous.is_some_and(|entry| entry.file == descriptor.file()) {
@@ -362,7 +365,7 @@ where
             )?;
             match self.engine.commit_root(transaction) {
                 Ok(outcome) => {
-                    self.finish_catalog_commit(principal, header, outcome.root());
+                    self.finish_catalog_commit(principal, header, outcome.root(), epoch);
                     self.mark_verified(principal, verified);
                     let objects_inserted = staged_objects_inserted
                         .checked_add(outcome.objects_inserted())
@@ -399,6 +402,7 @@ where
     ) -> Result<ContentWriteOutcome, PrincipalContentError> {
         let descriptor = verified.descriptor();
         loop {
+            let epoch = self.validated_kv.memo_epoch();
             let mut header = self.header(principal)?.as_ref().clone();
             let previous = self.catalog_lookup(principal, header.catalog, name)?;
             if let Some(expected) = expected_file
@@ -440,7 +444,7 @@ where
                 self.encode_transaction(principal.clone(), header.clone(), None, records)?;
             match self.engine.commit_root(transaction) {
                 Ok(outcome) => {
-                    self.finish_catalog_commit(principal, header, outcome.root());
+                    self.finish_catalog_commit(principal, header, outcome.root(), epoch);
                     self.mark_verified(principal, verified);
                     return Ok(ContentWriteOutcome::new(
                         descriptor,
@@ -465,6 +469,7 @@ where
     /// changing the catalog.
     pub fn delete(&self, principal: &P, name: &ContentName) -> Result<bool, PrincipalContentError> {
         loop {
+            let epoch = self.validated_kv.memo_epoch();
             let mut header = self.header(principal)?.as_ref().clone();
             let mutation = delete(
                 header.catalog,
@@ -480,7 +485,7 @@ where
                 self.encode_transaction(principal.clone(), header.clone(), None, mutation.records)?;
             match self.engine.commit_root(transaction) {
                 Ok(outcome) => {
-                    self.finish_catalog_commit(principal, header, outcome.root());
+                    self.finish_catalog_commit(principal, header, outcome.root(), epoch);
                     return Ok(true);
                 },
                 Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
@@ -542,6 +547,7 @@ where
             }
         }
         loop {
+            let epoch = self.validated_kv.memo_epoch();
             let mut header = self.header(principal)?.as_ref().clone();
             self.check_batch_preconditions(principal, &header, preconditions)?;
             let mut records = BTreeMap::<ObjectId, ObjectRecord>::new();
@@ -570,7 +576,7 @@ where
                 self.encode_transaction(principal.clone(), header.clone(), None, records)?;
             match self.engine.commit_root(transaction) {
                 Ok(outcome) => {
-                    self.finish_catalog_commit(principal, header, outcome.root());
+                    self.finish_catalog_commit(principal, header, outcome.root(), epoch);
                     return Ok(true);
                 },
                 Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
@@ -621,6 +627,7 @@ where
             return Ok(false);
         };
         loop {
+            let epoch = self.validated_kv.memo_epoch();
             let mut header = self.header(principal)?.as_ref().clone();
             let mut values = Vec::with_capacity(moves.len());
             for (source, destination) in moves {
@@ -697,7 +704,7 @@ where
                 self.encode_transaction(principal.clone(), header.clone(), None, records)?;
             match self.engine.commit_root(transaction) {
                 Ok(outcome) => {
-                    self.finish_catalog_commit(principal, header, outcome.root());
+                    self.finish_catalog_commit(principal, header, outcome.root(), epoch);
                     return Ok(true);
                 },
                 Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
@@ -928,6 +935,7 @@ where
     }
 
     fn header(&self, principal: &P) -> Result<Arc<ContentHeader>, PrincipalContentError> {
+        let epoch = self.validated_kv.memo_epoch();
         let root = self.engine.current_root(principal)?;
         if let Some(root) = root
             && let Some(header) = self
@@ -938,7 +946,7 @@ where
         {
             return Ok(header);
         }
-        let header = self.decode_header(principal, root)?;
+        let header = self.decode_header(principal, root, epoch)?;
         let Some(root) = root else {
             return Ok(Arc::new(header));
         };
