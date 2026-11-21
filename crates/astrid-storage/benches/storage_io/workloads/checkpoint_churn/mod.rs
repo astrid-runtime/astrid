@@ -20,7 +20,7 @@ use astrid_storage::{
 use super::{Config, Report, benchmark_owner, reset_benchmark_home};
 use crate::BenchResult;
 
-mod phase_cpu;
+pub(super) mod phase_cpu;
 
 const SLOT_COUNT: u64 = 16;
 const PAYLOAD_BYTES: usize = 256;

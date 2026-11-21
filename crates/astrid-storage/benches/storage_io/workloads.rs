@@ -28,6 +28,8 @@ mod bulk;
 mod checkpoint_churn;
 #[path = "workloads/partial_verification_clone.rs"]
 mod partial_verification_clone;
+#[path = "workloads/projection_churn.rs"]
+mod projection_churn;
 
 use bulk::benchmark_bulk_ingest;
 use partial_verification_clone::benchmark_partial_verification_clone;
@@ -39,6 +41,9 @@ pub(super) async fn run(
     source_digest: [u8; 32],
     report: &mut Report,
 ) -> BenchResult<()> {
+    if config.projection_churn_owners.is_some() {
+        return projection_churn::run(config, root, report).await;
+    }
     if config.checkpoint_overwrites.is_some() {
         return checkpoint_churn::run(config, root, report).await;
     }

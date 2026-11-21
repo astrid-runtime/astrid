@@ -31,6 +31,7 @@ pub(super) struct Config {
     pub(super) object_cache_bytes: Option<u64>,
     pub(super) partial_verification_clone: bool,
     pub(super) checkpoint_overwrites: Option<NonZeroUsize>,
+    pub(super) projection_churn_owners: Option<NonZeroUsize>,
     pub(super) root: Option<PathBuf>,
     pub(super) output: Option<PathBuf>,
 }
@@ -54,6 +55,7 @@ impl Config {
             object_cache_bytes: None,
             partial_verification_clone: false,
             checkpoint_overwrites: None,
+            projection_churn_owners: None,
             root: None,
             output: None,
         };
@@ -93,6 +95,12 @@ impl Config {
                 "--partial-verification-clone" => {
                     config.partial_verification_clone = true;
                 },
+                "--projection-churn-owners" => {
+                    config.projection_churn_owners = Some(parse_nonzero_usize(
+                        &mut arguments,
+                        "--projection-churn-owners",
+                    )?);
+                },
                 "--checkpoint-overwrites" => {
                     config.checkpoint_overwrites = Some(parse_nonzero_usize(
                         &mut arguments,
@@ -112,6 +120,16 @@ impl Config {
     }
 
     fn validate(self) -> BenchResult<Self> {
+        if self.projection_churn_owners.is_some()
+            && (self.checkpoint_overwrites.is_some()
+                || self.partial_verification_clone
+                || self.object_cache_bytes.is_some())
+        {
+            return Err(
+                "--projection-churn-owners is exclusive and uses runtime cache defaults".into(),
+            );
+        }
+
         if self.bytes == 0 {
             return Err("--bytes must be greater than zero".into());
         }
@@ -209,6 +227,9 @@ fn print_help() {
            --partial-verification-clone\n\
                                  run only matched cold read() vs windowed\n\
                                  read_range(--range-bytes) (requires --object-cache-bytes)\n\
+           --projection-churn-owners N\n\
+                                 concurrent live content writes and N UID purges;\n\
+                                 exclusive profile using runtime cache defaults.\n\
            --checkpoint-overwrites N\n\
                                  exclusive 256-byte content overwrite profile; omit\n\
                                  for the existing full bench. Rejects 0. Matched arms\n\
