@@ -11,35 +11,9 @@ use astrid_audit::{
     AuditArchiveWriter, AuditArchiver, AuditEntry, AuditError, AuditLog, AuditPruneReceipt,
     AuditResult,
 };
-use astrid_config::types::{AuditConfig, AuditRetentionConfig};
+use astrid_config::types::AuditRetentionConfig;
 use astrid_core::PrincipalId;
 use async_trait::async_trait;
-
-/// Load one audit policy snapshot from the captured runtime home and workspace.
-///
-/// A workspace can tighten host-call admission, so an unreadable merged policy
-/// must stop boot rather than discard either the operator or workspace layer.
-pub(crate) fn load_audit_config(
-    home: &astrid_core::dirs::AstridHome,
-    workspace_root: &Path,
-    workspace_layout: &astrid_core::dirs::WorkspaceLayout,
-) -> std::io::Result<AuditConfig> {
-    astrid_config::Config::load_with_home_and_layout(
-        Some(workspace_root),
-        home.root(),
-        workspace_layout,
-    )
-    .map(|resolved| resolved.config.audit)
-    .map_err(|error| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "cannot load audit policy from runtime home {}: {error}",
-                home.root().display()
-            ),
-        )
-    })
-}
 
 /// Apply `[audit.retention]` to the kernel's audit log.
 pub(crate) fn apply_retention_config(audit_log: &AuditLog, config: &AuditRetentionConfig) {

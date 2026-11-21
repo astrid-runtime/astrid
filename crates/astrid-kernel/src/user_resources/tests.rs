@@ -192,3 +192,11 @@ async fn configured_cache_budget_reclaims_and_preserves_authoritative_reads() {
     );
     assert_eq!(store.object_cache_stats().resident_bytes, 0);
 }
+
+fn load_policy(
+    home: &astrid_core::dirs::AstridHome,
+    workspace: &std::path::Path,
+    layout: &astrid_core::dirs::WorkspaceLayout,
+) -> std::io::Result<astrid_config::resources::ResourceConfig> {
+    crate::boot_policy::load_config(home, workspace, layout).map(|config| config.resources)
+}

@@ -141,7 +141,7 @@ fn audit_policy_follows_captured_home() {
             format!("[audit]\nhost_fail_closed = [\"{class}\"]\nentry_format = \"v2\"\n"),
         )
         .unwrap();
-        let config = super::load_audit_config(
+        let config = load_audit_config(
             &astrid_core::dirs::AstridHome::from_path(root.path()),
             workspace.path(),
             &astrid_core::dirs::WorkspaceLayout::default(),
@@ -171,7 +171,7 @@ fn workspace_audit_tightening_is_preserved() {
         "[audit]\nhost_fail_closed = [\"file_delete\"]\n",
     )
     .unwrap();
-    let config = super::load_audit_config(
+    let config = load_audit_config(
         &astrid_core::dirs::AstridHome::from_path(root.path()),
         workspace.path(),
         &astrid_core::dirs::WorkspaceLayout::default(),
@@ -205,14 +205,14 @@ fn invalid_audit_layers_cannot_fall_back_to_weaker_policy() {
         std::fs::create_dir(&state).unwrap();
         std::fs::write(root.path().join("config.toml"), operator).unwrap();
         std::fs::write(state.join("config.toml"), workspace_config).unwrap();
-        let error = super::load_audit_config(
+        let error = load_audit_config(
             &astrid_core::dirs::AstridHome::from_path(root.path()),
             workspace.path(),
             &astrid_core::dirs::WorkspaceLayout::default(),
         )
         .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("cannot load audit policy"));
+        assert!(error.to_string().contains("cannot load boot policy"));
         assert!(error.to_string().contains(root.path().to_str().unwrap()));
     }
 }
@@ -277,8 +277,16 @@ async fn native_audit_boot_probe() {
         .expect("invalid workspace must refuse kernel boot");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert!(
-        error.to_string().contains("cannot load audit policy"),
+        error.to_string().contains("cannot load boot policy"),
         "{error}"
     );
     assert!(error.to_string().contains("host_queue_capacity"), "{error}");
+}
+
+fn load_audit_config(
+    home: &astrid_core::dirs::AstridHome,
+    workspace: &std::path::Path,
+    layout: &astrid_core::dirs::WorkspaceLayout,
+) -> std::io::Result<astrid_config::types::AuditConfig> {
+    crate::boot_policy::load_config(home, workspace, layout).map(|config| config.audit)
 }
