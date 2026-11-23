@@ -81,6 +81,7 @@ fn packs_one_cdylib_with_pinned_prebuilt_worker_and_assets() {
     assert_eq!(observed["assets/kernel.img"], kernel);
     assert_eq!(observed["Capsule.toml"], manifest.as_bytes());
     assert_eq!(observed["renamed_controller.wasm"], b"\0asm\x01\0\0\0");
+    drop(archive); // Windows cannot replace an archive while this reader holds it open.
     let key = astrid_crypto::KeyPair::generate();
     crate::artifact::sign_archive(&archive_path, &key).unwrap();
     assert!(matches!(
