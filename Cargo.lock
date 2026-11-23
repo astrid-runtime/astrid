@@ -421,6 +421,7 @@ dependencies = [
  "cargo_metadata",
  "clap",
  "flate2",
+ "libc",
  "serde",
  "serde_json",
  "tar",

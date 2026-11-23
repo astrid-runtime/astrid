@@ -389,6 +389,10 @@ jobs:
         shell: pwsh
         run: ./scripts/ci/test_windows_filesystem.ps1 -Target ${{ matrix.target }}
 
+      - name: Test pinned component packaging on native Windows
+        shell: pwsh
+        run: cargo test --locked -p astrid-build --lib --target ${{ matrix.target }} rust::component_pins::tests
+
       - name: Parse the Windows install scripts
         shell: pwsh
         run: |

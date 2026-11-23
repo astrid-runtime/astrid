@@ -34,6 +34,9 @@ tracing = { workspace = true }
 wit-component = { workspace = true }
 wit-parser = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 uuid = { workspace = true }
 
