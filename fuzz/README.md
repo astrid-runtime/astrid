@@ -17,8 +17,22 @@ cargo fuzz run ip_blockset
 cargo fuzz run manifest_capabilities
 cargo fuzz run topic_patterns
 cargo fuzz run crypto_wire
+cargo fuzz run admin_json
+cargo fuzz run config_toml
+cargo fuzz run manifest_toml
+cargo fuzz run gateway_request_json --features gateway-target
 cargo fuzz run capability_patterns --features capabilities-target
 cargo fuzz run ssrf_helpers --features ssrf-target
+```
+
+Tracked `fuzz/seeds/<target>/` inputs include accepted wire shapes and rejected
+security shapes. Copy them to a disposable corpus before running a target so
+mutation does not modify the checked-in seeds. Deterministic seed controls
+verify that intended accepted inputs really parse and malformed inputs reject:
+
+```sh
+cargo test --manifest-path fuzz/Cargo.toml --test parser_seeds
+cargo test --manifest-path fuzz/Cargo.toml --test parser_seeds --features gateway-target
 ```
 
 Short smoke runs are useful before longer campaigns:
@@ -45,5 +59,12 @@ authority expansion, and human-facing semantic cards cannot disagree.
 `capability_patterns` is feature-gated because the full
 `astrid-capabilities` crate pulls storage dependencies, and `ssrf_helpers` is
 feature-gated because it compiles the Wasmtime-backed `astrid-capsule` crate.
-Parser, archive, admin-state, HTTP, CLI, and Wasm/WIT targets should be added
-in follow-up slices.
+`admin_json` checks tagged admin/kernel wire roundtrips and unknown-method
+rejection. `config_toml` runs the real config parser and validator.
+`manifest_toml` checks normalized publish/subscribe tables and rejects ambiguous
+source pins and handler-less priorities through the engine-independent manifest
+types. `gateway_request_json` is opt-in because it pulls the full HTTP gateway
+dependency graph; it checks request DTO deserialization, not authenticated HTTP
+behavior. TOML targets use the same parser minor line as the workspace.
+Archive, admin-state, full HTTP boundary, CLI, and Wasm/WIT targets remain
+follow-up slices.
