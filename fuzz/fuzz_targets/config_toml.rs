@@ -20,6 +20,9 @@ fuzz_target!(|data: &[u8]| {
         let serialized = toml::to_string(&config).expect("parsed config must serialize");
         let roundtrip: Config =
             toml::from_str(&serialized).expect("serialized config must deserialize");
-        let _ = astrid_config::validate::validate(&roundtrip);
+        if astrid_config::validate::validate(&config).is_ok() {
+            astrid_config::validate::validate(&roundtrip)
+                .expect("valid configuration must remain valid after serialization");
+        }
     }
 });

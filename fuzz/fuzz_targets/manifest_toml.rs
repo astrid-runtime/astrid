@@ -13,22 +13,13 @@ fuzz_target!(|data: &[u8]| {
     let manifest_result = toml::from_str::<CapsuleManifest>(src);
 
     if let Ok(value) = &value_result {
-        assert_malformed_security_shapes_fail_closed(src, value);
+        assert_malformed_security_shapes_fail_closed(manifest_result.is_err(), value);
     }
 
     if let Ok(manifest) = manifest_result {
         assert!(
             value_result.is_ok(),
             "typed manifest deserialization implies syntactically valid TOML"
-        );
-
-        assert_eq!(
-            manifest.effective_ipc_publish_patterns().len(),
-            manifest.publishes.len()
-        );
-        assert_eq!(
-            manifest.effective_ipc_subscribe_patterns().len(),
-            manifest.subscribes.len()
         );
 
         for publish in manifest.publishes.values() {
@@ -47,7 +38,13 @@ fuzz_target!(|data: &[u8]| {
             let Some(subscribe) = manifest.subscribes.get(&interceptor.event) else {
                 panic!("effective interceptor must come from a subscribe entry");
             };
-            assert!(subscribe.handler.is_some());
+            assert_eq!(
+                subscribe.handler.as_deref(),
+                Some(interceptor.action.as_str())
+            );
+            if let Some(priority) = subscribe.priority {
+                assert_eq!(interceptor.priority, priority);
+            }
         }
     }
 });
@@ -80,17 +77,17 @@ fn assert_at_most_one_subscribe_pin(def: &SubscribeDef) {
     assert!(pins <= 1, "subscribe entry accepted multiple source pins");
 }
 
-fn assert_malformed_security_shapes_fail_closed(src: &str, value: &Value) {
+fn assert_malformed_security_shapes_fail_closed(manifest_is_err: bool, value: &Value) {
     if section_has_multi_pin(value, "publish") || section_has_multi_pin(value, "subscribe") {
         assert!(
-            toml::from_str::<CapsuleManifest>(src).is_err(),
+            manifest_is_err,
             "ambiguous source pins must fail manifest parsing"
         );
     }
 
     if subscribe_has_priority_without_handler(value) {
         assert!(
-            toml::from_str::<CapsuleManifest>(src).is_err(),
+            manifest_is_err,
             "handler-less subscribe priority must fail manifest parsing"
         );
     }

@@ -1,2 +1,2 @@
 [capsule]
-pool_size = "invalid"
+instance_pool_size = "invalid"

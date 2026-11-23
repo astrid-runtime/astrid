@@ -27,7 +27,13 @@ cargo fuzz run ssrf_helpers --features ssrf-target
 
 Tracked `fuzz/seeds/<target>/` inputs include accepted wire shapes and rejected
 security shapes. Copy them to a disposable corpus before running a target so
-mutation does not modify the checked-in seeds.
+mutation does not modify the checked-in seeds. Deterministic seed controls
+verify that intended accepted inputs really parse and malformed inputs reject:
+
+```sh
+cargo test --manifest-path fuzz/Cargo.toml --test parser_seeds
+cargo test --manifest-path fuzz/Cargo.toml --test parser_seeds --features gateway-target
+```
 
 Short smoke runs are useful before longer campaigns:
 
