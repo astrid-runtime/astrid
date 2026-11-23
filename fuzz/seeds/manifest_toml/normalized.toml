@@ -1,0 +1,7 @@
+[package]
+name = "fuzz"
+version = "1.0.0"
+[publish]
+"event.v1.short" = "opaque"
+[subscribe]
+"event.v1.long" = { wit = "opaque", handler = "handle", priority = 10 }

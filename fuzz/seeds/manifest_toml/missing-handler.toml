@@ -1,0 +1,5 @@
+[package]
+name = "fuzz"
+version = "1.0.0"
+[subscribe]
+"event.v1.invalid" = { wit = "opaque", priority = 10 }

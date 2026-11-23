@@ -14,14 +14,21 @@ arbitrary = { version = "1", features = ["derive"] }
 astrid-capabilities = { path = "../crates/astrid-capabilities", optional = true }
 astrid-capsule-types = { path = "../crates/astrid-capsule-types", optional = true }
 astrid-capsule = { path = "../crates/astrid-capsule", features = ["fuzzing"], optional = true }
+astrid-config = { path = "../crates/astrid-config", optional = true }
+astrid-gateway = { path = "../crates/astrid-gateway", optional = true }
 astrid-core = { path = "../crates/astrid-core", optional = true }
 astrid-crypto = { path = "../crates/astrid-crypto", optional = true }
 astrid-events = { path = "../crates/astrid-events", optional = true }
 libfuzzer-sys = "0.4"
-toml = "0.8"
+serde = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
+toml = "~1.1.4"
 
 [features]
-default = ["core-target", "crypto-target", "events-target", "manifest-target"]
+default = ["admin-json-target", "config-target", "core-target", "crypto-target", "events-target", "manifest-target"]
+admin-json-target = ["core-target", "dep:serde", "dep:serde_json"]
+config-target = ["dep:astrid-config"]
+gateway-target = ["dep:astrid-gateway", "dep:serde", "dep:serde_json"]
 capabilities-target = ["dep:astrid-capabilities"]
 manifest-target = ["dep:astrid-capsule-types"]
 core-target = ["dep:astrid-core"]
@@ -76,3 +83,35 @@ test = false
 doc = false
 bench = false
 required-features = ["events-target"]
+
+[[bin]]
+name = "admin_json"
+path = "fuzz_targets/admin_json.rs"
+test = false
+doc = false
+bench = false
+required-features = ["admin-json-target"]
+
+[[bin]]
+name = "config_toml"
+path = "fuzz_targets/config_toml.rs"
+test = false
+doc = false
+bench = false
+required-features = ["config-target"]
+
+[[bin]]
+name = "gateway_request_json"
+path = "fuzz_targets/gateway_request_json.rs"
+test = false
+doc = false
+bench = false
+required-features = ["gateway-target"]
+
+[[bin]]
+name = "manifest_toml"
+path = "fuzz_targets/manifest_toml.rs"
+test = false
+doc = false
+bench = false
+required-features = ["manifest-target"]
