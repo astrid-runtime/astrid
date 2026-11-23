@@ -44,21 +44,22 @@ fn ordinary_url_origins_and_gateway_cors_validation_preserve_their_contracts() {
         config.validate().unwrap();
     }
     let nested = format!("{}https://example.com/", "blob:".repeat(10_000));
-    for origin in [
-        "blob:https://example.com/id",
-        "blob:blob:https://example.com/id",
-        "file:///tmp/untrusted",
-        "ws://example.com",
-        "https://example.com/",
-        nested.as_str(),
+    for (origin, expected_reason) in [
+        ("blob:https://example.com/id", "scheme"),
+        ("blob:blob:https://example.com/id", "scheme"),
+        ("file:///tmp/untrusted", "scheme"),
+        ("ws://example.com", "scheme"),
+        ("https://example.com/", "trailing slash"),
+        (nested.as_str(), "scheme"),
     ] {
         let config = GatewayConfig {
             cors_allow_origins: vec![origin.to_owned()],
             ..GatewayConfig::default()
         };
+        let error = config.validate().expect_err("invalid origin accepted");
         assert!(
-            config.validate().is_err(),
-            "gateway origin policy became permissive"
+            format!("{error:#}").contains(expected_reason),
+            "origin rejected for an unexpected reason: {error:#}"
         );
     }
 }
