@@ -47,6 +47,8 @@ on:
       - 'scripts/test_channel_publication.py'
       - 'scripts/test_channel_workflow_contract.sh'
       - 'scripts/test_ci_workflow_contract.sh'
+      - 'scripts/test_runtime_recovery_contract.sh'
+      - '.github/workflows/runtime-recovery.yml'
       - 'scripts/test_gnu_build_packages.py'
       - 'scripts/nightly_version.py'
       - 'scripts/test_nightly_version.py'
@@ -706,6 +708,9 @@ jobs:
           RUST_BACKTRACE: full
         run: scripts/ci/test-workspace-macos.sh
 
+      - name: Qualify interrupted-instance recovery regressions
+        run: bash scripts/ci/test-runtime-recovery.sh
+
   msrv:
     name: MSRV
     runs-on: ubuntu-latest
@@ -795,14 +800,14 @@ jobs:
 
       - name: Install cargo-semver-checks for core report
         id: install-internal-semver
-        if: always() && steps.api-inputs.outputs.run == 'true'
+        if: ${{ !cancelled() && steps.api-inputs.outputs.run == 'true' }}
         uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2
         with:
           tool: cargo-semver-checks
 
       - name: Report core crate API compatibility
         id: internal-semver
-        if: always() && steps.api-inputs.outputs.run == 'true' && steps.install-internal-semver.outcome == 'success'
+        if: ${{ !cancelled() && steps.api-inputs.outputs.run == 'true' && steps.install-internal-semver.outcome == 'success' }}
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           INTERNAL_EXCLUDES: ${{ steps.api-inputs.outputs.internal-excludes }}
@@ -810,7 +815,7 @@ jobs:
         run: scripts/ci/report-core-api-compatibility.sh
 
       - name: Summarize Rust API compatibility policy
-        if: always() && steps.api-inputs.outputs.run == 'true'
+        if: ${{ !cancelled() && steps.api-inputs.outputs.run == 'true' }}
         env:
           INTERNAL_OUTCOME: ${{ steps.internal-semver.outcome }}
           INTERNAL_RESULT: ${{ steps.internal-semver.outputs.result }}

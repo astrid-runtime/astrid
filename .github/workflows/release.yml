@@ -114,10 +114,17 @@ jobs:
             echo "build-matrix=$BUILD_MATRIX"
           } >> "$GITHUB_OUTPUT"
 
+  # ── Qualify interrupted-instance recovery before signed builds ──
+  runtime-recovery:
+    needs: classify
+    uses: ./.github/workflows/runtime-recovery.yml
+    with:
+      source-commit: ${{ needs.classify.outputs.source-commit }}
+
   # ── Build binaries for each platform ──────────────────────────────
   build:
     name: Build (${{ matrix.target }})
-    needs: classify
+    needs: [classify, runtime-recovery]
     runs-on: ${{ matrix.os }}
     env: { ASTRID_GIT_COMMIT: '${{ needs.classify.outputs.source-commit }}' }
     strategy:
@@ -605,43 +612,14 @@ jobs:
 
       - name: Generate immutable release manifest
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          CARGO_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)
-          test "$VERSION" = "$CARGO_VERSION"
-          if compgen -G "artifacts/*x86_64-pc-windows-msvc*" >/dev/null || \
-            compgen -G "artifacts/astrid-*-windows-release.toml*" >/dev/null || \
-            grep -Eq 'x86_64-pc-windows-msvc' \
-              artifacts/BLAKE3SUMS.txt artifacts/SHA256SUMS.txt; then
-            echo "stable release rejects Windows archives and Windows metadata" >&2
-            exit 1
-          fi
           SOURCE_COMMIT=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
           CONTRACTS_COMMIT=$(git -C wit rev-parse HEAD)
-          python3 scripts/release_manifest.py generate \
-            --artifacts artifacts \
-            --version "$VERSION" \
+          python3 scripts/release_manifest.py materialize \
             --tag "$GITHUB_REF_NAME" \
+            --artifacts artifacts \
             --source-commit "$SOURCE_COMMIT" \
             --contracts-commit "$CONTRACTS_COMMIT" \
-            --output "artifacts/astrid-${VERSION}-release.toml"
-          python3 scripts/release_manifest.py validate \
-            "artifacts/astrid-${VERSION}-release.toml" \
-            --artifacts artifacts \
-            --verify-artifacts
-          python3 scripts/musl_release_manifest.py generate \
-            --artifacts artifacts \
-            --legacy-manifest "artifacts/astrid-${VERSION}-release.toml" \
-            --output "artifacts/astrid-${VERSION}-musl-release.toml"
-          python3 scripts/musl_release_manifest.py validate \
-            "artifacts/astrid-${VERSION}-musl-release.toml" \
-            --legacy-manifest "artifacts/astrid-${VERSION}-release.toml" \
-            --artifacts artifacts \
-            --verify-artifacts
-          {
-            echo "VERSION=$VERSION"
-            echo "SOURCE_COMMIT=$SOURCE_COMMIT"
-            echo "CONTRACTS_COMMIT=$CONTRACTS_COMMIT"
-          } >> "$GITHUB_ENV"
+            --github-env "$GITHUB_ENV"
 
       - name: Detect an interrupted never-published draft
         env:

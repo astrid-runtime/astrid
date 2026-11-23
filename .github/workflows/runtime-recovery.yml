@@ -1,0 +1,46 @@
+name: Qualify runtime recovery
+
+on:
+  workflow_call:
+    inputs:
+      source-commit:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  recovery:
+    name: Interrupted-instance recovery (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    env:
+      # Match required Test jobs: astrid-capsule link memory on recovery hosts.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source-commit }}
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: astrid-release-recovery-${{ matrix.os }}
+
+      - name: Exercise interrupted guards and pool recovery
+        run: bash scripts/ci/test-runtime-recovery.sh

@@ -216,5 +216,145 @@ class ReleaseManifestTests(unittest.TestCase):
             release_manifest.validate_checksum_manifest(manifest, checksums, "blake3")
 
 
+    def _six_archive_artifacts(self) -> dict[str, str]:
+        digests: dict[str, str] = {}
+        b3_lines: list[str] = []
+        sha_lines: list[str] = []
+        for index, target in enumerate(
+            (*release_manifest.TARGETS, *release_manifest.EXTENSION_TARGETS), 1
+        ):
+            name = release_manifest.expected_asset(VERSION, target)
+            payload = bytes([index]) * index
+            (self.artifacts / name).write_bytes(payload)
+            digest = f"{index:064x}"
+            digests[name] = digest
+            b3_lines.append(f"{digest}  {name}")
+            sha_lines.append(f"{hashlib.sha256(payload).hexdigest()}  {name}")
+        (self.artifacts / "BLAKE3SUMS.txt").write_text("\n".join(b3_lines) + "\n")
+        (self.artifacts / "SHA256SUMS.txt").write_text("\n".join(sha_lines) + "\n")
+        return digests
+
+    def _workspace_root(self, version: str = VERSION) -> pathlib.Path:
+        root = self.artifacts / "workspace-root"
+        root.mkdir()
+        (root / "Cargo.toml").write_text(
+            f'[workspace.package]\nversion = "{version}"\n',
+            encoding="utf-8",
+        )
+        return root
+
+    def test_materialize_writes_manifests_and_github_env(self) -> None:
+        digests = self._six_archive_artifacts()
+        root = self._workspace_root()
+        env_path = self.artifacts / "github.env"
+        env_path.write_text("KEEP=1\n", encoding="utf-8")
+
+        def fake_blake3(path: pathlib.Path) -> str:
+            if path.name.endswith(".toml"):
+                return "c" * 64
+            return digests[path.name]
+
+        with mock.patch.object(release_manifest, "blake3_file", side_effect=fake_blake3):
+            version = release_manifest.materialize(
+                tag=f"v{VERSION}",
+                artifacts=self.artifacts,
+                source_commit=COMMIT,
+                contracts_commit=CONTRACTS_COMMIT,
+                github_env=env_path,
+                root=root,
+            )
+        self.assertEqual(version, VERSION)
+        legacy = self.artifacts / f"astrid-{VERSION}-release.toml"
+        musl = self.artifacts / f"astrid-{VERSION}-musl-release.toml"
+        self.assertTrue(legacy.is_file())
+        self.assertTrue(musl.is_file())
+        env_text = env_path.read_text(encoding="utf-8")
+        self.assertIn("KEEP=1\n", env_text)
+        self.assertIn(f"VERSION={VERSION}\n", env_text)
+        self.assertIn(f"SOURCE_COMMIT={COMMIT}\n", env_text)
+        self.assertIn(f"CONTRACTS_COMMIT={CONTRACTS_COMMIT}\n", env_text)
+        loaded = release_manifest.load_manifest(legacy)
+        self.assertEqual(loaded["version"], VERSION)
+        self.assertEqual(len(loaded["targets"]), len(release_manifest.TARGETS))
+
+    def test_materialize_rejects_windows_artifacts(self) -> None:
+        self._six_archive_artifacts()
+        root = self._workspace_root()
+        windows = release_manifest.expected_asset(
+            VERSION, release_manifest.WINDOWS_TARGETS[0]
+        )
+        (self.artifacts / windows).write_bytes(b"windows")
+        with self.assertRaisesRegex(ValueError, "rejects Windows"):
+            release_manifest.materialize(
+                tag=f"v{VERSION}",
+                artifacts=self.artifacts,
+                source_commit=COMMIT,
+                contracts_commit=CONTRACTS_COMMIT,
+                github_env=self.artifacts / "github.env",
+                root=root,
+            )
+
+    def test_reject_windows_metadata_matches_compgen_toml_wildcard(self) -> None:
+        # Preserve old ``astrid-*-windows-release.toml*`` semantics: any version
+        # and any suffix (including Sigstore bundles) fail closed.
+        cases = (
+            f"astrid-{VERSION}-windows-release.toml",
+            "astrid-0.0.1-windows-release.toml",
+            f"astrid-{VERSION}-windows-release.toml.sigstore.json",
+            "astrid-9.9.9-windows-release.toml.backup",
+        )
+        for name in cases:
+            with self.subTest(name=name):
+                self.assertTrue(release_manifest.is_windows_release_metadata_name(name))
+                marker = self.artifacts / name
+                marker.write_bytes(b"windows-meta")
+                with self.assertRaisesRegex(ValueError, "rejects Windows"):
+                    release_manifest.reject_windows_release_artifacts(self.artifacts)
+                marker.unlink()
+        self.assertFalse(
+            release_manifest.is_windows_release_metadata_name(
+                f"astrid-{VERSION}-musl-release.toml"
+            )
+        )
+        self.assertFalse(
+            release_manifest.is_windows_release_metadata_name(
+                "notes-windows-release.toml"
+            )
+        )
+
+    def test_materialize_rejects_workspace_version_mismatch(self) -> None:
+        self._six_archive_artifacts()
+        root = self._workspace_root("9.9.9")
+        with self.assertRaisesRegex(ValueError, "does not match workspace package version"):
+            release_manifest.materialize(
+                tag=f"v{VERSION}",
+                artifacts=self.artifacts,
+                source_commit=COMMIT,
+                contracts_commit=CONTRACTS_COMMIT,
+                github_env=self.artifacts / "github.env",
+                root=root,
+            )
+
+    def test_forbidden_windows_release_names_shared_helper(self) -> None:
+        windows = release_manifest.expected_asset(
+            VERSION, release_manifest.WINDOWS_TARGETS[0]
+        )
+        names = release_manifest.forbidden_windows_release_names(
+            {windows, "keep.tar.gz"},
+            {f"astrid-{VERSION}-windows-release.toml"},
+            VERSION,
+        )
+        self.assertEqual(
+            names,
+            sorted(
+                {
+                    windows,
+                    f"astrid-{VERSION}-windows-release.toml",
+                }
+            ),
+        )
+
+
+
 if __name__ == "__main__":
     unittest.main()

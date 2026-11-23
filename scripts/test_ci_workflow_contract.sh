@@ -148,5 +148,169 @@ if spoofed_concurrency["group"] == expected_group || spoofed_concurrency["cancel
   fail("commented expressions must not satisfy the parsed concurrency contract")
 end
 
+
+# Release must gate signed multi-target builds on runtime-recovery qualification.
+runtime = release.fetch("jobs").fetch("runtime-recovery") do
+  fail("release.yml must define jobs.runtime-recovery")
+end
+unless runtime.is_a?(Hash) && runtime["uses"] == "./.github/workflows/runtime-recovery.yml"
+  fail("runtime-recovery must call ./.github/workflows/runtime-recovery.yml")
+end
+unless runtime.dig("with", "source-commit") == "${{ needs.classify.outputs.source-commit }}"
+  fail("runtime-recovery must qualify the selected source commit")
+end
+needs = build.fetch("needs")
+needs_list = case needs
+             when Array then needs
+             when String then [needs]
+             else fail("build.needs must be present")
+             end
+unless needs_list.include?("classify") && needs_list.include?("runtime-recovery")
+  fail("build.needs must include classify and runtime-recovery")
+end
+
+release_path = File.join(File.dirname(workflow_path), "release.yml")
+release_lines = File.readlines(release_path).length
+fail("release.yml must stay <= 1000 lines (have #{release_lines})") if release_lines > 1000
+
+release_text = File.read(release_path)
+unless release_text.include?("scripts/release_manifest.py materialize")
+  fail("release.yml must materialize manifests through release_manifest.py")
+end
+if release_text.match?(/compgen -G "artifacts\/\*x86_64-pc-windows-msvc\*"/)
+  fail("Windows reject preflight must live in release_manifest materialize, not inline release.yml")
+end
+
+recovery_path = File.join(File.dirname(workflow_path), "runtime-recovery.yml")
+fail("missing runtime-recovery.yml") unless File.file?(recovery_path)
+recovery = YAML.safe_load(File.read(recovery_path), aliases: false)
+
+# Shared validators: live workflow and mutated fixtures must use the same functions.
+def runtime_recovery_workflow_error(recovery)
+  triggers = recovery["on"] || recovery[true]
+  return "runtime-recovery trigger map missing" unless triggers.is_a?(Hash)
+  trigger_names = triggers.keys.map(&:to_s)
+  unless trigger_names == ["workflow_call"]
+    return "runtime-recovery must be workflow_call-only (found #{trigger_names.inspect})"
+  end
+  call = triggers["workflow_call"]
+  return "workflow_call must be a mapping" unless call.is_a?(Hash)
+  inputs = call["inputs"]
+  return "workflow_call.inputs missing" unless inputs.is_a?(Hash)
+  source = inputs["source-commit"]
+  return "source-commit input missing" unless source.is_a?(Hash)
+  return "source-commit input must be required" unless source["required"] == true
+  return "source-commit input must be a string" unless source["type"].to_s == "string"
+
+  job = recovery.dig("jobs", "recovery")
+  return "recovery job missing" unless job.is_a?(Hash)
+  matrix_os = job.dig("strategy", "matrix", "os")
+  unless matrix_os == ["ubuntu-latest", "macos-latest"]
+    return "recovery matrix.os must be exactly [ubuntu-latest, macos-latest]"
+  end
+  checkout = job.fetch("steps", []).find { |step| step.fetch("uses", "").start_with?("actions/checkout@") }
+  return "recovery checkout step missing" unless checkout
+  unless checkout.dig("with", "ref") == "${{ inputs.source-commit }}"
+    return "recovery checkout.ref must use inputs.source-commit"
+  end
+  nil
+end
+
+def assert_runtime_recovery_workflow!(recovery)
+  error = runtime_recovery_workflow_error(recovery)
+  fail(error) if error
+end
+
+assert_runtime_recovery_workflow!(recovery)
+
+recovery_job = recovery.fetch("jobs").fetch("recovery")
+recovery_env = recovery_job.fetch("env")
+%w[CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG].each do |key|
+  fail("runtime-recovery must set #{key}=0") unless recovery_env[key].to_s == "0"
+end
+pins = recovery_job.fetch("steps").map { |step| step["uses"] }.compact
+{
+  "step-security/harden-runner@" => "05e31511f85b41b11d1cf0ef85d0992719546e2c",
+  "actions/checkout@" => "3d3c42e5aac5ba805825da76410c181273ba90b1",
+  "dtolnay/rust-toolchain@" => "29eef336d9b2848a0b548edc03f92a220660cdb8",
+  "Swatinem/rust-cache@" => "e18b497796c12c097a38f9edb9d0641fb99eee32",
+}.each do |prefix, sha|
+  step = pins.find { |value| value.start_with?(prefix) }
+  fail("runtime-recovery missing #{prefix}") unless step
+  fail("runtime-recovery must pin #{prefix}#{sha}") unless step.split("@", 2)[1] == sha
+end
+toolchain = recovery_job.fetch("steps").find { |step| step.fetch("uses", "").start_with?("dtolnay/rust-toolchain@") }
+unless toolchain.dig("with", "toolchain").to_s == "1.95.0"
+  fail("runtime-recovery must install exact toolchain 1.95.0")
+end
+
+# Extra triggers must fail the same workflow_call-only validator.
+spoof_triggers = Marshal.load(Marshal.dump(recovery))
+spoof_on = spoof_triggers["on"] || spoof_triggers[true]
+spoof_on["push"] = { "branches" => ["main"] }
+extra_trigger_error = runtime_recovery_workflow_error(spoof_triggers)
+fail("additional triggers must fail workflow_call-only contract") if extra_trigger_error.nil?
+fail("additional-trigger failure must mention workflow_call-only") unless extra_trigger_error.include?("workflow_call-only")
+
+# Wrong checkout ref must fail the same validator.
+spoof_ref = Marshal.load(Marshal.dump(recovery))
+checkout = spoof_ref.fetch("jobs").fetch("recovery").fetch("steps").find do |step|
+  step.fetch("uses", "").start_with?("actions/checkout@")
+end
+checkout.fetch("with")["ref"] = "${{ github.sha }}"
+ref_error = runtime_recovery_workflow_error(spoof_ref)
+fail("checkout ref spoof must fail recovery contract") if ref_error.nil?
+
+# Narrowed/expanded matrix must fail the same validator.
+spoof_matrix = Marshal.load(Marshal.dump(recovery))
+spoof_matrix.fetch("jobs").fetch("recovery").fetch("strategy").fetch("matrix")["os"] = ["ubuntu-latest"]
+matrix_error = runtime_recovery_workflow_error(spoof_matrix)
+fail("matrix spoof must fail recovery contract") if matrix_error.nil?
+
+API_CANCEL_SAFE_STEPS = {
+  "Install cargo-semver-checks for core report" => ["install-internal-semver", "${{ !cancelled() && steps.api-inputs.outputs.run == 'true' }}"],
+  "Report core crate API compatibility" => ["internal-semver", "${{ !cancelled() && steps.api-inputs.outputs.run == 'true' && steps.install-internal-semver.outcome == 'success' }}"],
+  "Summarize Rust API compatibility policy" => [nil, "${{ !cancelled() && steps.api-inputs.outputs.run == 'true' }}"],
+}.freeze
+
+def api_cancel_safe_error(api_job)
+  API_CANCEL_SAFE_STEPS.each do |name, (expected_id, expected_condition)|
+    step = api_job.fetch("steps").find { |candidate| candidate["name"] == name }
+    return "missing api-compatibility step #{name}" unless step
+    return "api step #{name} id drift" if expected_id && step["id"] != expected_id
+    condition = step["if"].to_s
+    return "api step #{name} must not use always()" if condition.include?("always()")
+    return "api step #{name} must use the exact cancel-safe condition" unless condition == expected_condition
+  end
+  nil
+end
+
+def assert_api_cancel_safe!(api_job)
+  error = api_cancel_safe_error(api_job)
+  fail(error) if error
+end
+
+api = workflow.fetch("jobs").fetch("api-compatibility")
+assert_api_cancel_safe!(api)
+
+# Mutated parsed workflow must fail through the same validator (not a mirror check).
+spoof_always = Marshal.load(Marshal.dump(api))
+spoof_always.fetch("steps").each do |step|
+  next unless API_CANCEL_SAFE_STEPS.key?(step["name"].to_s)
+  step["if"] = step["if"].to_s.gsub("!cancelled()", "always()")
+end
+always_error = api_cancel_safe_error(spoof_always)
+fail("always() spoof must fail cancel-safe contract") if always_error.nil?
+fail("always() spoof must be rejected for using always()") unless always_error.include?("must not use always()")
+
+spoof_dead = Marshal.load(Marshal.dump(api))
+spoof_dead.fetch("steps").each do |step|
+  next unless API_CANCEL_SAFE_STEPS.key?(step["name"].to_s)
+  step["if"] = step["if"].to_s.sub("!cancelled()", "false && !cancelled()")
+end
+dead_error = api_cancel_safe_error(spoof_dead)
+fail("dead cancel-safe expression must fail") if dead_error.nil?
+fail("dead expression must fail the exact condition") unless dead_error.include?("exact cancel-safe condition")
+
 puts "CI workflow contract: PASS"
 RB
