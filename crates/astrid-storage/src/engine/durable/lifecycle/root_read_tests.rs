@@ -234,6 +234,15 @@ fn a_read_started_during_poison_cannot_serve_the_pre_recovery_root() {
 
 #[test]
 fn retired_principal_destructors_run_after_the_engine_guards_are_released() {
+    assert_destructors_run_unlocked(false);
+}
+
+#[test]
+fn cached_principal_destructors_observe_closed_without_engine_guards() {
+    assert_destructors_run_unlocked(true);
+}
+
+fn assert_destructors_run_unlocked(warm_cache: bool) {
     let directory = tempfile::tempdir().unwrap();
     let (entered, _receive) = mpsc::sync_channel(1);
     let (_release, released) = mpsc::sync_channel(1);
@@ -248,23 +257,34 @@ fn retired_principal_destructors_run_after_the_engine_guards_are_released() {
         gate: Arc::clone(&gate),
     };
     let engine = Arc::new(
-        DurableEngine::open(
+        DurableEngine::open_with_object_cache(
             directory.path(),
             TestIdentity,
             GatedCodec(Arc::clone(&gate)),
             limits(),
+            if warm_cache {
+                crate::engine::ObjectCacheConfig::bounded(
+                    std::num::NonZeroU64::new(512 * 1024).unwrap(),
+                )
+            } else {
+                crate::engine::ObjectCacheConfig::disabled()
+            },
         )
         .unwrap(),
     );
     let (commit, source) = transaction("alice", None, b"principal cleanup");
     engine
         .commit(RootTransaction::new(
-            principal,
+            principal.clone(),
             None,
             commit,
             source.records().to_vec(),
         ))
         .unwrap();
+    if warm_cache {
+        assert!(engine.object_for(&principal, commit).unwrap().is_some());
+        assert!(engine.object_cache_stats().resident_associations > 0);
+    }
     let drops = Arc::new(AtomicUsize::new(0));
     let locked = Arc::new(AtomicBool::new(false));
     let bad_reentry = Arc::new(AtomicBool::new(false));
@@ -276,13 +296,16 @@ fn retired_principal_destructors_run_after_the_engine_guards_are_released() {
     *gate.on_drop.lock().unwrap() = Some(Box::new(move || {
         if std::thread::current().id() == closing_thread
             && let Some(engine) = weak.upgrade()
-            && engine.lifecycle.load(AtomicOrdering::Acquire) == LIFECYCLE_CLOSED
+            && (warm_cache || engine.lifecycle.load(AtomicOrdering::Acquire) == LIFECYCLE_CLOSED)
         {
             count.fetch_add(1, AtomicOrdering::Relaxed);
             // A normal destructor may query its now-closed engine. Probe the
             // locks without blocking so a regression fails instead of hangs.
             let writer_locked = engine.inner.try_lock().is_none();
             let arbiter_locked = engine.checkpoint_arbiter.try_lock().is_none();
+            if engine.lifecycle.load(AtomicOrdering::Acquire) != LIFECYCLE_CLOSED {
+                bad.store(true, AtomicOrdering::Relaxed);
+            }
             if writer_locked || arbiter_locked {
                 observed.store(true, AtomicOrdering::Relaxed);
             } else if !matches!(

@@ -91,7 +91,6 @@ where
         drop(inner.representations.take());
         drop(inner.files.take());
         drop(self.arena_reader.write().take());
-        self.object_cache.clear();
         self.lifecycle
             .store(LIFECYCLE_CLOSED, std::sync::atomic::Ordering::Release);
         let retired_metadata = self.retire_closed_metadata(&mut inner);
@@ -106,6 +105,7 @@ where
         drop(inner);
         drop(arbiter);
         drop(retired_metadata);
+        self.object_cache.clear();
         result.and(unlock)
     }
 
