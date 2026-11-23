@@ -659,12 +659,14 @@ where
     }
 
     pub(crate) fn root_if_ready(&self, principal: &P) -> Option<crate::engine::ReadyKvRoot> {
+        let root = self.published_roots.get(principal);
+        // Validate the terminal fence AFTER the immutable snapshot. Close may
+        // clear the map during lookup; that must mean unavailable, not a live
+        // empty store. One acquire also preserves the ready-path load count.
         if self.lifecycle.load(std::sync::atomic::Ordering::Acquire) != LIFECYCLE_USABLE {
             return None;
         }
-        Some(crate::engine::ReadyKvRoot::new(
-            self.published_roots.get(principal),
-        ))
+        Some(crate::engine::ReadyKvRoot::new(root))
     }
 
     /// Return a consistent copy of every current principal root.

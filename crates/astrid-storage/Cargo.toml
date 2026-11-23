@@ -98,3 +98,7 @@ ignored = ["getrandom"]
 [[bench]]
 name = "ownership_reads"
 harness = false
+
+[[bench]]
+name = "ready_roots"
+harness = false

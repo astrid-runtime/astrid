@@ -90,6 +90,7 @@ where
         self.object_cache.clear();
         self.lifecycle
             .store(LIFECYCLE_CLOSED, std::sync::atomic::Ordering::Release);
+        self.discard_closed_metadata(&mut inner);
         let unlock = match inner.lock.take() {
             Some(StoreLock::Native(lock)) => fs2::FileExt::unlock(&lock)
                 .map_err(|source| io_error("unlock principal store while closing", source)),
@@ -97,6 +98,19 @@ where
         };
         drop(self.volume.write().take());
         result.and(unlock)
+    }
+
+    fn discard_closed_metadata(&self, inner: &mut DurableInner<P>) {
+        // Close is terminal even after a flush error: only a fresh engine may
+        // reconstruct from the unchanged arena/WAL. Retained handles cannot
+        // serve these disposable views and must not keep their history alive.
+        inner.index.clear();
+        inner.validated.clear();
+        inner.roots_by_principal.clear();
+        inner.pending_direct_objects.clear();
+        inner.pending_index_locations = Vec::new();
+        drop(inner.pending_wal.take());
+        self.published_roots.replace(&inner.roots_by_principal);
     }
 
     fn finish_drained_checkpoint(
@@ -513,3 +527,9 @@ fn index_cache_has_one_frame(file: &mut File) -> bool {
         .checked_add(payload_len)
         .is_some_and(|frame_end| frame_end == length)
 }
+
+#[cfg(test)]
+mod retention_tests;
+
+#[cfg(test)]
+mod root_read_tests;
