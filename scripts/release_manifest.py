@@ -128,6 +128,113 @@ def expected_asset(version: str, target: str) -> str:
     return f"astrid-{version}-{target}.tar.gz"
 
 
+def workspace_package_version(root: pathlib.Path) -> str:
+    cargo = root / "Cargo.toml"
+    try:
+        data = tomllib.loads(cargo.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        fail(f"could not parse {cargo}: {error}")
+    try:
+        value = data["workspace"]["package"]["version"]
+    except (KeyError, TypeError) as error:
+        fail(f"workspace package version missing in {cargo}: {error}")
+    if not isinstance(value, str):
+        fail("workspace package version must be a string")
+    return canonical_version(value)
+
+
+def windows_release_markers(version: str) -> set[str]:
+    assets = {expected_asset(version, target) for target in WINDOWS_TARGETS}
+    markers = {f"astrid-{version}-windows-release.toml", *assets}
+    markers |= {f"{name}.sigstore.json" for name in markers}
+    return markers
+
+
+def forbidden_windows_release_names(
+    entry_names: set[str], checksum_assets: set[str], version: str
+) -> list[str]:
+    return sorted((entry_names | checksum_assets) & windows_release_markers(version))
+
+
+def is_windows_release_metadata_name(name: str) -> bool:
+    """Match the old release.yml compgen: astrid-*-windows-release.toml*."""
+    return re.fullmatch(r"astrid-.*-windows-release\.toml.*", name) is not None
+
+
+def reject_windows_release_artifacts(artifacts: pathlib.Path) -> None:
+    """Fail closed if Windows archives or metadata appear in a stable candidate.
+
+    Mirrors the release workflow preflight: path globs plus checksum substring.
+    The windows-release.toml* glob rejects any version and any suffix
+    (including .toml.sigstore.json), matching ``compgen -G ...toml*``.
+    """
+    if not artifacts.is_dir() or artifacts.is_symlink():
+        fail("release artifacts must be a directory")
+    names = {path.name for path in artifacts.iterdir()}
+    if any("x86_64-pc-windows-msvc" in name for name in names) or any(
+        is_windows_release_metadata_name(name) for name in names
+    ):
+        fail("stable release rejects Windows archives and Windows metadata")
+    for checksum_name in ("BLAKE3SUMS.txt", "SHA256SUMS.txt"):
+        path = artifacts / checksum_name
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as error:
+            fail(f"could not read {path}: {error}")
+        if "x86_64-pc-windows-msvc" in text:
+            fail("stable release rejects Windows archives and Windows metadata")
+
+
+def materialize(
+    *,
+    tag: str,
+    artifacts: pathlib.Path,
+    source_commit: str,
+    contracts_commit: str,
+    github_env: pathlib.Path,
+    root: pathlib.Path,
+) -> str:
+    """Generate and validate fixed + musl manifests; append release env exports.
+
+    Imports musl_release_manifest inside the function to avoid an import cycle:
+    musl_release_manifest imports this module at load time.
+    """
+    if not tag.startswith("v"):
+        fail(f"tag must start with v, got {tag!r}")
+    version = tag[1:]
+    cargo_version = workspace_package_version(root)
+    if version != cargo_version:
+        fail(f"tag version {version} does not match workspace package version {cargo_version}")
+    reject_windows_release_artifacts(artifacts)
+
+    manifest = build_manifest(artifacts, version, tag, source_commit, contracts_commit)
+    output = artifacts / f"astrid-{version}-release.toml"
+    output.write_text(render_manifest(manifest), encoding="utf-8")
+    validate_manifest(load_manifest(output), artifacts, verify_artifacts=True)
+
+    import musl_release_manifest  # scoped: musl module imports release_manifest
+
+    musl_output = artifacts / f"astrid-{version}-musl-release.toml"
+    musl_data = musl_release_manifest.build_manifest(artifacts, output)
+    musl_output.write_text(musl_release_manifest.render_manifest(musl_data), encoding="utf-8")
+    musl_release_manifest.validate_manifest(
+        musl_release_manifest.load_manifest(musl_output),
+        legacy_manifest=load_manifest(output),
+        legacy_manifest_blake3=blake3_file(output),
+        artifacts=artifacts,
+        verify_artifacts=True,
+    )
+
+    with github_env.open("a", encoding="utf-8") as env_file:
+        env_file.write(f"VERSION={version}\n")
+        env_file.write(f"SOURCE_COMMIT={source_commit}\n")
+        env_file.write(f"CONTRACTS_COMMIT={contracts_commit}\n")
+    return version
+
+
+
 def validate_release_checksum_names(entries: dict[str, str], version: str, label: str) -> None:
     """Keep fixed and musl manifests compatible with parked combined checksums."""
     legacy = {expected_asset(version, target) for target in TARGETS}
@@ -390,6 +497,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     validate_checksums.add_argument("manifest", type=pathlib.Path)
     validate_checksums.add_argument("checksums", type=pathlib.Path)
     validate_checksums.add_argument("--algorithm", choices=("blake3", "sha256"), required=True)
+    materialize_cmd = subparsers.add_parser("materialize")
+    materialize_cmd.add_argument("--tag", required=True)
+    materialize_cmd.add_argument("--artifacts", type=pathlib.Path, required=True)
+    materialize_cmd.add_argument("--source-commit", required=True)
+    materialize_cmd.add_argument("--contracts-commit", required=True)
+    materialize_cmd.add_argument("--github-env", type=pathlib.Path, required=True)
+    materialize_cmd.add_argument("--root", type=pathlib.Path, default=pathlib.Path("."))
     return parser.parse_args(argv)
 
 
@@ -414,12 +528,23 @@ def main(argv: list[str] | None = None) -> int:
                 verify_artifacts=args.verify_artifacts,
                 require_bundles=args.require_bundles,
             )
-        else:
+        elif args.command == "validate-checksums":
             validate_checksum_manifest(
                 load_manifest(args.manifest),
                 args.checksums,
                 args.algorithm,
             )
+        elif args.command == "materialize":
+            materialize(
+                tag=args.tag,
+                artifacts=args.artifacts,
+                source_commit=args.source_commit,
+                contracts_commit=args.contracts_commit,
+                github_env=args.github_env,
+                root=args.root,
+            )
+        else:
+            fail(f"unsupported command: {args.command}")
     except (OSError, ValueError) as error:
         print(error, file=sys.stderr)
         return 1

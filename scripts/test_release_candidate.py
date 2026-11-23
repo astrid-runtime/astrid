@@ -62,7 +62,7 @@ SOURCE_APP=/fixture/source DESTINATION_APP=/fixture/destination APP_EXECUTABLE=/
     def test_tag_push_executes_the_actual_workflow_classifier(self) -> None:
         root = release_candidate.nightly_version.ROOT
         workflow = (root / ".github/workflows/release.yml").read_text()
-        block = workflow.split("      - name: Bind event, tag, and source commit\n", 1)[1].split("\n  # ── Build", 1)[0]
+        block = workflow.split("      - name: Bind event, tag, and source commit\n", 1)[1].split("\n  # ──", 1)[0]
         body = block.split("        run: |\n", 1)[1]
         body = "\n".join(line[10:] for line in body.splitlines())
         base = release_candidate.nightly_version.source_version(root)

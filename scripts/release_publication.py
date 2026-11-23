@@ -67,15 +67,6 @@ def validate_release_assets(
         "release manifest contracts commit does not match the tagged submodule",
     )
 
-    windows_assets = {
-        release_manifest.expected_asset(version, target)
-        for target in release_manifest.WINDOWS_TARGETS
-    }
-    windows_markers = {
-        f"astrid-{version}-windows-release.toml",
-        *windows_assets,
-    }
-    windows_markers |= {f"{name}.sigstore.json" for name in windows_markers}
     checksum_assets = set(
         release_manifest.read_checksums(
             directory / "BLAKE3SUMS.txt", "BLAKE3"
@@ -86,7 +77,9 @@ def validate_release_assets(
         )
     )
     entry_names = {path.name for path in entries}
-    forbidden_windows = sorted((entry_names | checksum_assets) & windows_markers)
+    forbidden_windows = release_manifest.forbidden_windows_release_names(
+        entry_names, checksum_assets, version
+    )
     require(
         not forbidden_windows,
         f"stable publication rejects Windows release assets: {forbidden_windows}",
