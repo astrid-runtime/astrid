@@ -91,7 +91,6 @@ where
         drop(inner.representations.take());
         drop(inner.files.take());
         drop(self.arena_reader.write().take());
-        self.object_cache.clear();
         self.lifecycle
             .store(LIFECYCLE_CLOSED, std::sync::atomic::Ordering::Release);
         let retired_metadata = self.retire_closed_metadata(&mut inner);
@@ -101,11 +100,12 @@ where
             Some(StoreLock::Volume) | None => Ok(()),
         };
         drop(self.volume.write().take());
-        // Principal keys may have destructors that query the closed engine.
-        // Release both guards before freeing the retired metadata containers.
+        // Key destructors may observe Closed through writer-backed queries
+        // such as object_count. Release both engine guards before retiring them.
         drop(inner);
         drop(arbiter);
         drop(retired_metadata);
+        self.object_cache.clear();
         result.and(unlock)
     }
 
