@@ -105,13 +105,14 @@ async fn watchdog_response<T>(
             tokio::select! {
                 message = &mut terminal => return Some(message),
                 _ = poll.tick() => {
+                    let probe_started = tokio::time::Instant::now();
                     if held_provider_request_seen(&mut provider_log, &mut pending, marker) {
                         return None;
                     }
                     // The provider had not recorded entry at this probe. Anchor
                     // conservatively here so polling delay cannot extend its budget.
                     if pending.is_empty() {
-                        response_deadline = tokio::time::Instant::now()
+                        response_deadline = probe_started
                             .checked_add(Duration::from_secs(30))
                             .expect("fixture deadline fits monotonic clock");
                     }
