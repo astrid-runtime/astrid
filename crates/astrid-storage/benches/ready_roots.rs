@@ -164,11 +164,19 @@ fn main() -> BenchResult<()> {
         }
     }
     reopened.close()?;
+    let final_drop_cpu = cpu_ns()?;
+    let final_drop = Instant::now();
+    drop(retained);
+    drop(engine);
+    let final_drop_seconds = final_drop.elapsed().as_secs_f64();
+    let final_drop_cpu_nanoseconds = cpu_delta(final_drop_cpu)?;
     println!(
         "{}",
         serde_json::json!({"lookups": lookups.get(), "objects": objects.get(),
         "query_seconds": query_seconds, "query_cpu_nanoseconds": query_cpu_nanoseconds,
         "close_seconds": close_seconds, "close_cpu_nanoseconds": close_cpu_nanoseconds,
+        "final_drop_seconds": final_drop_seconds,
+        "final_drop_cpu_nanoseconds": final_drop_cpu_nanoseconds,
         "retained_handle": true, "verified_reopen_all_objects": true})
     );
     Ok(())
