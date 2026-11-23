@@ -743,7 +743,7 @@ fn nonmatching_target_cfg_is_not_detected_for_getrandom_merge() {
     );
 }
 
-fn rust_target_is_installed(target: &str) -> bool {
+pub(super) fn rust_target_is_installed(target: &str) -> bool {
     let Ok(output) = std::process::Command::new("rustc")
         .args(["--print", "target-libdir", "--target", target])
         .output()

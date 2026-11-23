@@ -5,7 +5,7 @@ use flate2::read::GzDecoder;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table};
 
 /// Validated archive paths and parsed BLAKE3 pins, carried through packaging.
@@ -172,20 +172,14 @@ fn validate_asset_path(relative: &str) -> Result<()> {
     if relative.contains('\\') || relative.contains('\0') {
         bail!("unsafe component asset path: {relative}");
     }
-    let path = Path::new(relative);
-    let parts = path.components().collect::<Vec<_>>();
-    if parts.len() < 2
-        || parts[0] != Component::Normal("assets".as_ref())
-        || parts
-            .iter()
-            .any(|part| !matches!(part, Component::Normal(_)))
-        || parts
-            .iter()
-            .map(|part| part.as_os_str())
-            .collect::<PathBuf>()
-            .as_os_str()
-            != path.as_os_str()
-    {
+    // Archive names use '/' on every host. Validate the original spelling
+    // directly: host Path normalization would hide aliases and Windows would
+    // reconstruct a canonical archive name with native backslash separators.
+    if relative.strip_prefix("assets/").is_none_or(|suffix| {
+        suffix
+            .split('/')
+            .any(|part| matches!(part, "" | "." | ".."))
+    }) {
         bail!("component asset must be a canonical relative path under assets/: {relative}");
     }
     Ok(())

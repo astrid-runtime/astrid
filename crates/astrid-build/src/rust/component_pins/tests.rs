@@ -1,6 +1,7 @@
 use super::super::{build_manifest_content, discover_opaque_assets, pack_capsule_archive};
 use super::*;
 use std::fs;
+use std::path::PathBuf;
 
 #[test]
 fn preserves_a_pinned_worker_in_the_generated_manifest() {
@@ -253,6 +254,11 @@ fn asset_paths_have_one_canonical_spelling() {
         "assets",
         "skills/a",
         "assets\\a",
+        "assets/\0a",
+        "assets/.",
+        "assets/..",
+        "assets/",
+        "C:/assets/a",
     ] {
         assert!(
             validate_asset_path(path).is_err(),
@@ -308,15 +314,7 @@ fn missing_or_linked_archive_worker_cannot_satisfy_its_pin() {
 
 #[test]
 fn build_dispatch_packages_and_signs_pinned_worker_bytes() {
-    let installed = std::process::Command::new("rustup")
-        .args(["target", "list", "--installed"])
-        .output()
-        .unwrap();
-    if !String::from_utf8(installed.stdout)
-        .unwrap()
-        .lines()
-        .any(|line| line == "wasm32-unknown-unknown")
-    {
+    if !super::super::tests::rust_target_is_installed("wasm32-unknown-unknown") {
         eprintln!("requires the installed wasm32-unknown-unknown target");
         return;
     }
