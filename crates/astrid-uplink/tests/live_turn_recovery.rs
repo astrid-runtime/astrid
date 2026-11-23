@@ -97,7 +97,9 @@ async fn watchdog_response<T>(
     let started = tokio::time::Instant::now();
     let mut poll = tokio::time::interval(Duration::from_millis(50));
     let mut pending = Vec::new();
-    let mut response_deadline = started + Duration::from_secs(30);
+    let mut response_deadline = started
+        .checked_add(Duration::from_secs(30))
+        .expect("fixture deadline fits monotonic clock");
     let early_terminal = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             tokio::select! {
@@ -109,7 +111,9 @@ async fn watchdog_response<T>(
                     // The provider had not recorded entry at this probe. Anchor
                     // conservatively here so polling delay cannot extend its budget.
                     if pending.is_empty() {
-                        response_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+                        response_deadline = tokio::time::Instant::now()
+                            .checked_add(Duration::from_secs(30))
+                            .expect("fixture deadline fits monotonic clock");
                     }
                 }
             }
