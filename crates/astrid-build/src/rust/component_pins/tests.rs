@@ -407,3 +407,57 @@ fn non_regular_sources_are_rejected_before_open() {
     let error = validate_source_path(source.path(), "assets/worker.wasm").unwrap_err();
     assert!(error.to_string().contains("regular file"));
 }
+
+#[cfg(unix)]
+#[test]
+fn replacing_a_validated_source_with_a_fifo_cannot_block_open() {
+    let source = tempfile::tempdir().unwrap();
+    fs::create_dir(source.path().join("assets")).unwrap();
+    let path = source.path().join("assets/worker.wasm");
+    fs::write(&path, b"worker").unwrap();
+    validate_source_path(source.path(), "assets/worker.wasm").unwrap();
+    fs::remove_file(&path).unwrap();
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader_path = path.clone();
+    let reader = std::thread::spawn(move || {
+        sender
+            .send(open_pinned_source(&reader_path).map(|_| ()))
+            .unwrap();
+    });
+    let observed = receiver.recv_timeout(std::time::Duration::from_secs(1));
+    // A broken blocking open must not leave a stuck test thread: pair its read
+    // with an owned writer, reap it, then fail the bounded observation.
+    let writer = if matches!(observed, Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+        Some(fs::OpenOptions::new().write(true).open(&path).unwrap())
+    } else {
+        None
+    };
+    reader.join().unwrap();
+    drop(writer);
+    let error = observed
+        .expect("pinned source open must not wait for a FIFO writer")
+        .unwrap_err();
+    assert!(error.to_string().contains("regular file"));
+}
+
+#[cfg(unix)]
+#[test]
+fn replacing_a_validated_leaf_with_a_symlink_is_refused_at_open() {
+    let source = tempfile::tempdir().unwrap();
+    fs::create_dir(source.path().join("assets")).unwrap();
+    let path = source.path().join("assets/worker.wasm");
+    fs::write(&path, b"worker").unwrap();
+    validate_source_path(source.path(), "assets/worker.wasm").unwrap();
+    fs::remove_file(&path).unwrap();
+    let target = source.path().join("replacement");
+    fs::write(&target, b"worker").unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    assert!(open_pinned_source(&path).is_err());
+}

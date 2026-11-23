@@ -74,14 +74,7 @@ pub(super) fn bind_manifest_to_packaged_wasm(
     for (relative, expected) in &pins {
         let path = source.join(relative);
         validate_source_path(source, relative)?;
-        let file = File::open(&path)
-            .with_context(|| format!("pinned capsule asset is missing: {}", path.display()))?;
-        if !file.metadata()?.is_file() {
-            bail!(
-                "pinned capsule asset must be a regular file: {}",
-                path.display()
-            );
-        }
+        let file = open_pinned_source(&path)?;
         verify_hash(file, expected, relative)?;
     }
     Ok(ArchivePins(pins))
@@ -220,6 +213,28 @@ fn validate_source_path(source: &Path, relative: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Open the validated leaf without following a replacement link or blocking on
+/// a replacement FIFO. The descriptor check validates what was actually opened.
+fn open_pinned_source(path: &Path) -> Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("cannot open pinned capsule asset: {}", path.display()))?;
+    if !file.metadata()?.is_file() {
+        bail!(
+            "pinned capsule asset must be a regular file: {}",
+            path.display()
+        );
+    }
+    Ok(file)
 }
 
 fn verify_hash(mut reader: impl Read, expected: &blake3::Hash, path: &str) -> Result<()> {
