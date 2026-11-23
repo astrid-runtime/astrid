@@ -390,3 +390,20 @@ fn build_dispatch_probe() {
     crate::build::run_build(Some(&source), Some("dist"), None, None).unwrap();
     println!("pinned build completed");
 }
+
+#[cfg(unix)]
+#[test]
+fn non_regular_sources_are_rejected_before_open() {
+    let source = tempfile::tempdir().unwrap();
+    fs::create_dir(source.path().join("assets")).unwrap();
+    let pipe = source.path().join("assets/worker.wasm");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&pipe)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let error = validate_source_path(source.path(), "assets/worker.wasm").unwrap_err();
+    assert!(error.to_string().contains("regular file"));
+}

@@ -73,7 +73,7 @@ pub(super) fn bind_manifest_to_packaged_wasm(
     let pins = collect_pins(components, packaged_name)?;
     for (relative, expected) in &pins {
         let path = source.join(relative);
-        reject_symlink_path(source, relative)?;
+        validate_source_path(source, relative)?;
         let file = File::open(&path)
             .with_context(|| format!("pinned capsule asset is missing: {}", path.display()))?;
         if !file.metadata()?.is_file() {
@@ -198,15 +198,23 @@ fn validate_asset_path(relative: &str) -> Result<()> {
     Ok(())
 }
 
-fn reject_symlink_path(source: &Path, relative: &str) -> Result<()> {
+fn validate_source_path(source: &Path, relative: &str) -> Result<()> {
     let mut path = source.to_path_buf();
-    for component in Path::new(relative).components() {
+    let mut components = Path::new(relative).components().peekable();
+    while let Some(component) = components.next() {
         path.push(component.as_os_str());
         let metadata = fs::symlink_metadata(&path)
             .with_context(|| format!("pinned capsule asset is missing: {}", path.display()))?;
         if metadata.file_type().is_symlink() {
             bail!(
                 "pinned capsule asset cannot traverse a symlink: {}",
+                path.display()
+            );
+        }
+        // Reject a FIFO/device before opening it: open itself may otherwise block.
+        if components.peek().is_none() && !metadata.is_file() {
+            bail!(
+                "pinned capsule asset must be a regular file: {}",
                 path.display()
             );
         }
