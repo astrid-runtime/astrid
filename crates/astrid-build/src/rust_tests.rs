@@ -1221,7 +1221,7 @@ fn existing_manifest_is_bound_to_renamed_cdylib_in_archive() {
     )
     .unwrap();
 
-    let manifest = build_manifest_content(
+    let (manifest, _pins) = build_manifest_content(
         source.path(),
         &wasm_path,
         "original-package",
@@ -1273,5 +1273,5 @@ fn existing_manifest_with_multiple_components_fails_closed() {
 
     let error = build_manifest_content(source.path(), &wasm_path, "capsule", "1.0.0", "capsule")
         .unwrap_err();
-    assert!(error.to_string().contains("exactly one cdylib"));
+    assert!(error.to_string().contains("component id"));
 }
