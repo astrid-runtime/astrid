@@ -253,7 +253,7 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["cors", "trace", "limit", "set-header"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-url = "2"
+url = "2.5.9"
 # `default-features = false` strips the `js` auto-feature that uuid
 # enables on `wasm32-unknown-unknown`, which would pull `wasm-bindgen`.
 # The `v4` feature uses `getrandom` under the hood — on host this is
