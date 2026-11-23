@@ -1,7 +1,14 @@
 //! Real-daemon regression. Requires the AOS chat capsules and fake-echo provider
 //! installed in a disposable home; never run against an operator's live home.
+//! Point `ASTRID_E2E_PROVIDER_LOG` at fake-openai-compat.py's `--log` JSONL file
+//! for the watchdog case. Preparation and provider response have separate bounds.
 
-use std::{fmt::Write as _, time::Duration};
+use std::{
+    fmt::Write as _,
+    future::Future,
+    io::{BufRead, BufReader},
+    time::Duration,
+};
 
 use astrid_core::kernel_api::KernelRequest;
 use astrid_core::{PrincipalId, SessionId};
@@ -50,19 +57,91 @@ async fn terminal(client: &mut SocketClient) -> (serde_json::Value, String) {
     .expect("terminal within fixture deadline")
 }
 
+// The fake provider already records streaming POSTs before writing its first
+// chunk. Observe that entry, not a client delta: buffering can legitimately
+// keep the first text hidden until after the watchdog terminal.
+fn held_provider_request_seen(log: &mut impl BufRead, pending: &mut Vec<u8>, marker: &str) -> bool {
+    loop {
+        if log.read_until(b'\n', pending).expect("read provider log") == 0
+            || !pending.ends_with(b"\n")
+        {
+            return false;
+        }
+        let record: serde_json::Value =
+            serde_json::from_slice(pending).expect("complete provider JSONL record");
+        pending.clear();
+        let user_content = record["messages"].as_array().and_then(|messages| {
+            messages
+                .iter()
+                .rev()
+                .find(|message| message["role"] == "user")
+        });
+        if record["method"] == "POST"
+            && record["path"] == "/v1/chat/completions"
+            && record["stream"] == true
+            && user_content.is_some_and(|message| message["content"].to_string().contains(marker))
+        {
+            return true;
+        }
+    }
+}
+
+async fn watchdog_response<T>(
+    terminal: impl Future<Output = T>,
+    mut provider_log: impl BufRead,
+    marker: &str,
+) -> T {
+    // Pin one continuous reader: losing a select! branch must not cancel a
+    // partially read native frame or discard a pre-delta terminal.
+    tokio::pin!(terminal);
+    let started = tokio::time::Instant::now();
+    let mut poll = tokio::time::interval(Duration::from_millis(50));
+    let mut pending = Vec::new();
+    let early_terminal = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            tokio::select! {
+                message = &mut terminal => return Some(message),
+                _ = poll.tick() => {
+                    if held_provider_request_seen(&mut provider_log, &mut pending, marker) {
+                        return None;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("provider entry or watchdog terminal within preparation deadline");
+    if let Some(message) = early_terminal {
+        return message;
+    }
+    eprintln!("watchdog provider entry after {:?}", started.elapsed());
+    let streaming_wait = tokio::time::Instant::now();
+    let message = tokio::time::timeout(Duration::from_secs(30), &mut terminal)
+        .await
+        .expect("typed watchdog terminal within fixture deadline");
+    eprintln!(
+        "watchdog terminal after provider entry: {:?}",
+        streaming_wait.elapsed()
+    );
+    message
+}
+
 #[tokio::test]
-#[ignore = "requires disposable daemon, fake-echo, aos-react streaming_timeout_secs=20 and HTTP read/total budgets exceeding 30s"]
+#[ignore = "requires disposable daemon, fake-echo JSONL at ASTRID_E2E_PROVIDER_LOG, aos-react streaming_timeout_secs=20 and HTTP stream_read_timeout_secs >30"]
 async fn autonomous_watchdog_timeout_then_success_on_same_connection() {
     let mut client = disposable_client().await;
     select_model(&mut client, "openai-compat:fake-echo").await;
+    let log_path = std::env::var_os("ASTRID_E2E_PROVIDER_LOG")
+        .expect("explicit owned fake-provider JSONL log");
+    // Consume the append-only file once; the unique marker excludes old records.
+    let log = std::fs::File::open(log_path).expect("open fake-provider log");
+    let provider_log = BufReader::new(log);
+    let marker = format!("ASTRID_E2E_INFLIGHT_CRASH_watchdog_{}", client.session_id.0);
     client
-        .send_input("ASTRID_E2E_INFLIGHT_CRASH_watchdog".to_owned())
+        .send_input(marker.clone())
         .await
         .expect("held prompt");
-    // Keep HTTP budgets beyond this response wait so the AOS watchdog supplies
-    // the terminal. Connection, model selection and the recovery turn have
-    // separate bounds; total test wall time can exceed these 30 seconds.
-    let timed_out = tokio::time::timeout(Duration::from_secs(30), async {
+    let timeout_response = async {
         loop {
             let message = client
                 .read_message()
@@ -73,9 +152,8 @@ async fn autonomous_watchdog_timeout_then_success_on_same_connection() {
                 return message;
             }
         }
-    })
-    .await
-    .expect("typed watchdog terminal within fixture deadline");
+    };
+    let timed_out = watchdog_response(timeout_response, provider_log, &marker).await;
     // A short watchdog deadline can beat the provider's first buffered delta.
     // The named Streaming phase proves generation was entered; waiting for a
     // delta would discard the pre-delta timeout this test must recover.
@@ -335,4 +413,110 @@ fn expected_stream_text() -> String {
         write!(expected, "unit-{index:05} ").expect("write expected reply");
     }
     expected
+}
+
+mod watchdog_fixture_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    fn provider_record(marker: &str) -> String {
+        serde_json::json!({
+            "method": "POST", "path": "/v1/chat/completions", "stream": true,
+            "messages": [{"role": "user", "content": marker}]
+        })
+        .to_string()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preparation_is_not_charged_to_streaming_response_wait() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let log = BufReader::new(file.reopen().unwrap());
+        let terminal = async move {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            writeln!(file, "{}", provider_record("current")).unwrap();
+            file.flush().unwrap();
+            tokio::time::sleep(Duration::from_secs(24)).await;
+            7
+        };
+        assert_eq!(watchdog_response(terminal, log, "current").await, 7);
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[should_panic(expected = "typed watchdog terminal within fixture deadline")]
+    async fn streaming_response_still_expires_after_thirty_seconds() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let log = BufReader::new(file.reopen().unwrap());
+        let terminal = async move {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            writeln!(file, "{}", provider_record("current")).unwrap();
+            file.flush().unwrap();
+            tokio::time::sleep(Duration::from_secs(31)).await;
+        };
+        watchdog_response(terminal, log, "current").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_before_provider_entry_needs_no_delta_or_marker() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let log = BufReader::new(file.reopen().unwrap());
+        let terminal = async {
+            tokio::time::sleep(Duration::from_secs(25)).await;
+            7
+        };
+        assert_eq!(watchdog_response(terminal, log, "current").await, 7);
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[should_panic(expected = "provider entry or watchdog terminal within preparation deadline")]
+    async fn preparation_still_expires_after_thirty_seconds() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let log = BufReader::new(file.reopen().unwrap());
+        let terminal = async {
+            tokio::time::sleep(Duration::from_secs(31)).await;
+        };
+        watchdog_response(terminal, log, "current").await;
+    }
+
+    #[test]
+    fn provider_log_retains_partial_records_and_ignores_old_history() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "method":"POST", "path":"/v1/chat/completions", "stream":false,
+                "messages":[{"role":"user", "content":"current"}]
+            })
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "method":"POST", "path":"/v1/chat/completions", "stream":true,
+                "messages":[{"role":"user", "content":"current"},
+                            {"role":"user", "content":"other"}]
+            })
+        )
+        .unwrap();
+        let record = provider_record("current");
+        let split = record.len() / 2;
+        write!(file, "{}", &record[..split]).unwrap();
+        file.flush().unwrap();
+        let mut log = BufReader::new(file.reopen().unwrap());
+        let mut pending = Vec::new();
+        assert!(!held_provider_request_seen(
+            &mut log,
+            &mut pending,
+            "current"
+        ));
+        assert!(!pending.is_empty());
+        writeln!(file, "{}", &record[split..]).unwrap();
+        file.flush().unwrap();
+        assert!(held_provider_request_seen(
+            &mut log,
+            &mut pending,
+            "current"
+        ));
+    }
 }
