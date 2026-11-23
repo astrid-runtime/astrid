@@ -1,5 +1,9 @@
 //! Explicit flush and close lifecycle for the durable engine.
 
+use crate::storage_model::{ObjectId, RootState};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
 use super::wal::durable_error as wal_durable_error;
 use super::{
     ARENA_MAGIC, DurableEngine, DurableError, DurableInner, FRAME_HEADER_LEN,
@@ -90,27 +94,34 @@ where
         self.object_cache.clear();
         self.lifecycle
             .store(LIFECYCLE_CLOSED, std::sync::atomic::Ordering::Release);
-        self.discard_closed_metadata(&mut inner);
+        let retired_metadata = self.retire_closed_metadata(&mut inner);
         let unlock = match inner.lock.take() {
             Some(StoreLock::Native(lock)) => fs2::FileExt::unlock(&lock)
                 .map_err(|source| io_error("unlock principal store while closing", source)),
             Some(StoreLock::Volume) | None => Ok(()),
         };
         drop(self.volume.write().take());
+        // Principal keys may have destructors that query the closed engine.
+        // Release both guards before freeing the retired metadata containers.
+        drop(inner);
+        drop(arbiter);
+        drop(retired_metadata);
         result.and(unlock)
     }
 
-    fn discard_closed_metadata(&self, inner: &mut DurableInner<P>) {
+    fn retire_closed_metadata(&self, inner: &mut DurableInner<P>) -> RetiredMetadata<P> {
         // Close is terminal even after a flush error: only a fresh engine may
-        // reconstruct from the unchanged arena/WAL. Retained handles cannot
-        // serve these disposable views and must not keep their history alive.
-        inner.index.clear();
-        inner.validated.clear();
-        inner.roots_by_principal.clear();
-        inner.pending_direct_objects.clear();
-        inner.pending_index_locations = Vec::new();
-        drop(inner.pending_wal.take());
-        self.published_roots.replace(&inner.roots_by_principal);
+        // reconstruct from the unchanged arena/WAL. Swap out the disposable
+        // views now, but defer their destructors until the writer is released.
+        RetiredMetadata {
+            _index: std::mem::take(&mut inner.index),
+            _validated: std::mem::take(&mut inner.validated),
+            _roots: std::mem::take(&mut inner.roots_by_principal),
+            _direct_objects: std::mem::take(&mut inner.pending_direct_objects),
+            _locations: std::mem::take(&mut inner.pending_index_locations),
+            _wal: inner.pending_wal.take(),
+            _published_roots: self.published_roots.entries.swap(Arc::new(BTreeMap::new())),
+        }
     }
 
     fn finish_drained_checkpoint(
@@ -526,6 +537,17 @@ fn index_cache_has_one_frame(file: &mut File) -> bool {
     FRAME_HEADER_LEN
         .checked_add(payload_len)
         .is_some_and(|frame_end| frame_end == length)
+}
+
+/// Disposable views kept alive only until close releases its engine guards.
+struct RetiredMetadata<P: Ord> {
+    _index: BTreeMap<ObjectId, super::ArenaLocation>,
+    _validated: BTreeSet<ObjectId>,
+    _roots: BTreeMap<P, RootState>,
+    _direct_objects: BTreeMap<ObjectId, super::representations::DirectArenaObject>,
+    _locations: Vec<(ObjectId, super::ArenaLocation)>,
+    _wal: super::wal::PendingWalOverlay<P>,
+    _published_roots: Arc<BTreeMap<P, Arc<super::PublishedRoot>>>,
 }
 
 #[cfg(test)]
