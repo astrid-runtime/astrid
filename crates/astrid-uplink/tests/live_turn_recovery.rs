@@ -97,6 +97,7 @@ async fn watchdog_response<T>(
     let started = tokio::time::Instant::now();
     let mut poll = tokio::time::interval(Duration::from_millis(50));
     let mut pending = Vec::new();
+    let mut response_deadline = started + Duration::from_secs(30);
     let early_terminal = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             tokio::select! {
@@ -104,6 +105,11 @@ async fn watchdog_response<T>(
                 _ = poll.tick() => {
                     if held_provider_request_seen(&mut provider_log, &mut pending, marker) {
                         return None;
+                    }
+                    // The provider had not recorded entry at this probe. Anchor
+                    // conservatively here so polling delay cannot extend its budget.
+                    if pending.is_empty() {
+                        response_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
                     }
                 }
             }
@@ -116,7 +122,7 @@ async fn watchdog_response<T>(
     }
     eprintln!("watchdog provider entry after {:?}", started.elapsed());
     let streaming_wait = tokio::time::Instant::now();
-    let message = tokio::time::timeout(Duration::from_secs(30), &mut terminal)
+    let message = tokio::time::timeout_at(response_deadline, &mut terminal)
         .await
         .expect("typed watchdog terminal within fixture deadline");
     eprintln!(
@@ -451,6 +457,40 @@ mod watchdog_fixture_tests {
             writeln!(file, "{}", provider_record("current")).unwrap();
             file.flush().unwrap();
             tokio::time::sleep(Duration::from_secs(31)).await;
+        };
+        watchdog_response(terminal, log, "current").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[should_panic(expected = "typed watchdog terminal within fixture deadline")]
+    async fn delayed_log_observation_does_not_extend_response_budget() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let log = BufReader::new(file.reopen().unwrap());
+        let terminal = async move {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            writeln!(file, "{}", provider_record("current")).unwrap();
+            file.flush().unwrap();
+            tokio::time::advance(Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_secs(29)).await;
+        };
+        watchdog_response(terminal, log, "current").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[should_panic(expected = "typed watchdog terminal within fixture deadline")]
+    async fn partial_entry_does_not_extend_response_budget() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let log = BufReader::new(file.reopen().unwrap());
+        let terminal = async move {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            let record = provider_record("current");
+            let split = record.len() / 2;
+            write!(file, "{}", &record[..split]).unwrap();
+            file.flush().unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            writeln!(file, "{}", &record[split..]).unwrap();
+            file.flush().unwrap();
+            tokio::time::sleep(Duration::from_secs(29)).await;
         };
         watchdog_response(terminal, log, "current").await;
     }
