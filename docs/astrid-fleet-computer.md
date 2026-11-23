@@ -4,6 +4,8 @@ Status: accepted architecture; authoritative owner filesystem and native mount p
 
 Last reviewed: 2026-08-15
 
+Linux Realm status reviewed: 2026-11-23
+
 Related documents:
 
 - [Astrid user and fleet ownership](astrid-user-fleet-ownership.md)
@@ -11,7 +13,7 @@ Related documents:
 - [Astrid Principal Store Runtime Realization](astrid-principal-store-runtime.md)
 - [Astrid Hosted Volume Format 1](../crates/astrid-storage/formats/astrid-volume-v1.txt)
 - [Astrid Native Component Kernel](astrid-native-kernel.md)
-- [AOS Principal Linux Realm](https://github.com/unicity-aos/aos-ce/blob/main/docs/principal-linux-realm.md), an optional Linux capsule consumer
+- AOS Principal Linux Realm — optional Linux capsule consumer owned in [`unicity-aos/aos-ce`](https://github.com/unicity-aos/aos-ce); evidence pin: canonical aos-ce `main` tip [`6e4e8ec147ea693a895721c04811d69cee3268ed`](https://github.com/unicity-aos/aos-ce/commit/6e4e8ec147ea693a895721c04811d69cee3268ed) lacks `docs/principal-linux-realm.md` and does not ship the capsule, while unmerged Realm drafts remain open (e.g. [aos-ce#77](https://github.com/unicity-aos/aos-ce/pull/77)). Tracking: [astrid#1564](https://github.com/astrid-runtime/astrid/issues/1564).
 
 ## 1. Product ruling
 
@@ -188,8 +190,8 @@ The complete execution key is at least:
 ```
 
 The current Astrid runtime does not yet supply every application and instance
-component of this key. The Linux Realm capsule is one consumer that currently
-binds residency and durable home state to a principal.
+component of this key. The proposed Linux Realm consumer would initially bind
+residency and durable home state to a principal.
 
 ## 4. One store, several authorities
 
@@ -245,7 +247,8 @@ provider supplies a cooperative fleet-wide environment.
 
 ### 5.1 Linux Realm projection
 
-Realm is the Linux capsule's compatibility abstraction. It may render an
+This section describes a proposed adapter, not a shipped Linux Realm capsule.
+Realm would be the Linux capsule's compatibility abstraction. It may render an
 Astrid-owned fleet computer as a Linux filesystem, process environment, browser,
 or desktop, but it does not own the canonical fleet, principal, storage, or mount
 semantics.
@@ -261,7 +264,7 @@ fleet/profile. Same-fleet principals may share:
 - network, graphics, storage, and device provider implementations; and
 - an ambient Linux authority profile and ordinary Unix user environment.
 
-The Realm constructs a principal view with its overlay, workspace attachment,
+A Realm would construct a principal view with its overlay, workspace attachment,
 process/session namespace, resource slice, and audit context. Independent views
 prevent accidental interference; shared ambient fleet authority means they are
 not a hostile-tenancy boundary.
@@ -272,8 +275,8 @@ capability tokens. They may share verified immutable pages and physical content
 below the authority line. UID 1000 in separate fleet Realms names unrelated
 guest users and confers no cross-fleet authority.
 
-The existing Linux Realm capsule is principal-affine. A fleet-affine cooperative
-mode is therefore separate AOS capsule work, not an Astrid core rename or a
+The proposed principal-affine Linux Realm profile and any later fleet-affine
+cooperative mode are separate AOS capsule work, not an Astrid core rename or a
 prerequisite for the provider-neutral storage mount. A principal-isolated Realm
 profile should remain available for agents or applications that are not trusted
 with fleet-wide ambient Linux authority.
