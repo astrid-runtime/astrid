@@ -2,9 +2,11 @@
 
 Status: exploratory architecture and execution plan
 
-Last reviewed: 2026-07-18
+Last reviewed: 2026-09-01
 
-Code baseline: Astrid Runtime `v0.10.1` (`4771bab3`)
+Linux Realm status reviewed: 2026-11-23
+
+Code baseline: published Astrid Runtime `v2026.10.1` (`db4193957b3038c28d6033f30dfea05eadfda48a`); Linux Realm status re-grounded on main `856f7d46d4f766ddf65cff4a7097a521671d2e2d`
 
 Decision state: scope an Astrid-owned kernel; implementation choices remain open
 
@@ -16,11 +18,13 @@ boundary is in the [Driver Domain Contract](astrid-driver-domain-contract.md).
 
 Build an actual Astrid kernel.
 
-Do not make that kernel a prerequisite for the first agent OS. The immediate
-workbench is the principal-owned `AOS Realm` capsule in `unicity-aos/aos-ce`: a
-Linux-shaped environment hosted by today's daemon and, later, unchanged by the
-native host. It gives the kernel programme a real workload while keeping Linux
-syscall emulation, filesystems, shells, compilers, and package policy out of ring 0.
+Do not make that kernel a prerequisite for the first agent OS, and do not make
+Linux Realm a prerequisite for the kernel. Linux Realm is a separate confined
+compatibility consumer above the capsule boundary
+([astrid#1564](https://github.com/astrid-runtime/astrid/issues/1564); AOS-owned).
+Linux syscall emulation, filesystems, shells, compilers, and package policy stay
+out of ring 0 whether or not a Realm capsule is present. Current shipping status
+is pinned in the AI-Native OS Workplan baselines, not restated here.
 
 The target is not Astrid statically linked into somebody else's library OS. It is
 an Astrid-owned capability microkernel that boots on hardware or a microVM, creates
@@ -1015,10 +1019,10 @@ security model while becoming operationally smaller and more local.
 
 ## 12. Recommended next native-kernel artifact
 
-The product-wide immediate implementation is the AOS Realm's principal-scoped
-durable VFS and process environment. Within the independent native-kernel track,
-the next implementation should be a bounded native-kernel skeleton, not a Hermit
-host:
+Linux Realm VFS, process, shell, and toolchain work remains useful optional
+parallel consumer work in `unicity-aos/aos-ce`; it is not the next native-kernel
+artifact. Within the independent native-kernel track, the next implementation
+should be a bounded native-kernel skeleton, not a Hermit host:
 
 1. Add the isolated `native-kernel/` workspace with pinned toolchain, loader,
    x86-64 architecture crate, deterministic image builder, QEMU runner, and serial
@@ -1050,8 +1054,8 @@ sound.
 - Driver and Dock contracts that alter WIT require an Astrid RFC before adoption.
 - Public capsule and wire shapes remain stable; host profiles are additive.
 - The current native daemon remains supported while the image path matures.
-- The AOS Realm is a system capsule, not a second authority kernel. Its Linux guest
-  ABI remains above the stable Astrid capsule boundary and runs unchanged on daemon
-  and native hosts.
+- When present, the AOS Realm is a system capsule, not a second authority kernel.
+  Its Linux guest ABI remains above the stable Astrid capsule boundary and must
+  run unchanged on daemon and native hosts.
 - A signed single-purpose machine image is an additional deployment surface, not a
   release-channel alias and not an implicit promotion of experimental code.
