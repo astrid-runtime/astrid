@@ -39,15 +39,13 @@ write_cargo() {
 set -euo pipefail
 fixture="$fixture"
 args=("\$@")
-listing=false
-for arg in "\${args[@]}"; do
-  if [[ "\$arg" == "--list" ]]; then
-    listing=true
-  fi
-done
-if [[ "\$listing" == true ]]; then
+if [[ "\${args[*]}" == "test --locked -p astrid-capsule --lib ${module} -- --list" ]]; then
   cat "\$fixture/list"
   exit 0
+fi
+if [[ "\${args[*]}" != "test --locked -p astrid-capsule --lib ${module}" ]]; then
+  echo "unexpected recovery cargo arguments: \${args[*]}" >&2
+  exit 64
 fi
 cat "\$fixture/result"
 if grep -Fq 'FAILED' "\$fixture/result"; then

@@ -237,7 +237,7 @@ pins = recovery_job.fetch("steps").map { |step| step["uses"] }.compact
 }.each do |prefix, sha|
   step = pins.find { |value| value.start_with?(prefix) }
   fail("runtime-recovery missing #{prefix}") unless step
-  fail("runtime-recovery must pin #{prefix}#{sha}") unless step.split("@", 2)[1].start_with?(sha)
+  fail("runtime-recovery must pin #{prefix}#{sha}") unless step.split("@", 2)[1] == sha
 end
 toolchain = recovery_job.fetch("steps").find { |step| step.fetch("uses", "").start_with?("dtolnay/rust-toolchain@") }
 unless toolchain.dig("with", "toolchain").to_s == "1.95.0"
@@ -268,19 +268,19 @@ matrix_error = runtime_recovery_workflow_error(spoof_matrix)
 fail("matrix spoof must fail recovery contract") if matrix_error.nil?
 
 API_CANCEL_SAFE_STEPS = {
-  "Install cargo-semver-checks for core report" => "install-internal-semver",
-  "Report core crate API compatibility" => "internal-semver",
-  "Summarize Rust API compatibility policy" => nil,
+  "Install cargo-semver-checks for core report" => ["install-internal-semver", "${{ !cancelled() && steps.api-inputs.outputs.run == 'true' }}"],
+  "Report core crate API compatibility" => ["internal-semver", "${{ !cancelled() && steps.api-inputs.outputs.run == 'true' && steps.install-internal-semver.outcome == 'success' }}"],
+  "Summarize Rust API compatibility policy" => [nil, "${{ !cancelled() && steps.api-inputs.outputs.run == 'true' }}"],
 }.freeze
 
 def api_cancel_safe_error(api_job)
-  API_CANCEL_SAFE_STEPS.each do |name, expected_id|
+  API_CANCEL_SAFE_STEPS.each do |name, (expected_id, expected_condition)|
     step = api_job.fetch("steps").find { |candidate| candidate["name"] == name }
     return "missing api-compatibility step #{name}" unless step
     return "api step #{name} id drift" if expected_id && step["id"] != expected_id
     condition = step["if"].to_s
     return "api step #{name} must not use always()" if condition.include?("always()")
-    return "api step #{name} must use !cancelled()" unless condition.include?("!cancelled()")
+    return "api step #{name} must use the exact cancel-safe condition" unless condition == expected_condition
   end
   nil
 end
@@ -302,6 +302,15 @@ end
 always_error = api_cancel_safe_error(spoof_always)
 fail("always() spoof must fail cancel-safe contract") if always_error.nil?
 fail("always() spoof must be rejected for using always()") unless always_error.include?("must not use always()")
+
+spoof_dead = Marshal.load(Marshal.dump(api))
+spoof_dead.fetch("steps").each do |step|
+  next unless API_CANCEL_SAFE_STEPS.key?(step["name"].to_s)
+  step["if"] = step["if"].to_s.sub("!cancelled()", "false && !cancelled()")
+end
+dead_error = api_cancel_safe_error(spoof_dead)
+fail("dead cancel-safe expression must fail") if dead_error.nil?
+fail("dead expression must fail the exact condition") unless dead_error.include?("exact cancel-safe condition")
 
 puts "CI workflow contract: PASS"
 RB
