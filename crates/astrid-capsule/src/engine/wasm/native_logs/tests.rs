@@ -650,9 +650,12 @@ async fn live_uid_rename_keeps_pinned_destination_and_admits_the_current_alias()
     tracker.resume(&current_alias);
     state.log(LogLevel::Info, "renamed UID still logs".into());
     let admitted = pending.resolve(None).unwrap();
-    assert_eq!(
-        admitted._owner_operation.as_ref().unwrap().principal,
-        current_alias
+    assert!(
+        admitted
+            ._owner_operation
+            .as_ref()
+            .unwrap()
+            .belongs_to(&tracker, &current_alias)
     );
     drop(admitted);
     assert_eq!(pending.target, target);
