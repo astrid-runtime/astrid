@@ -186,6 +186,13 @@ pub fn capability_matches(pattern: &str, cap: &str) -> bool {
     matcher::matches(pattern.as_bytes(), cap.as_bytes())
 }
 
+/// Whether every concrete capability matching `child` also matches `parent`.
+/// Both patterns must have passed [`validate_capability`].
+#[must_use]
+pub fn capability_pattern_covers(parent: &str, child: &str) -> bool {
+    matcher::covers(parent.as_bytes(), child.as_bytes())
+}
+
 /// Coarse category for dashboard grouping. Dashboards bucket
 /// capabilities by category to render permissions panels
 /// Discord-style (one collapsible section per family).

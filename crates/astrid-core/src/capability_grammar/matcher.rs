@@ -128,4 +128,65 @@ pub(super) fn matches(pattern: &[u8], capability: &[u8]) -> (result: bool)
     }
 }
 
+
+// For this grammar the same segment comparison establishes inclusion:
+// a parent's literal forces a child literal, and a child tail wildcard can
+// match a parent pattern only when the parent has a covering tail wildcard.
+proof fn cover_sound(
+    parent: Seq<u8>, child: Seq<u8>, target: Seq<u8>, p: int, c: int, t: int,
+)
+    requires matches_from(parent, child, p, c), matches_from(child, target, c, t),
+    ensures matches_from(parent, target, p, t),
+    decreases parent.len() - p,
+{
+    let pe = end_of(parent, p);
+    let ce = end_of(child, c);
+    let te = end_of(target, t);
+    if star(parent, p, pe) && pe == parent.len() {
+        return;
+    }
+    if !star(parent, p, pe) {
+        assert(pe - p == ce - c);
+        assert(equal_segment(parent, child, p, c, pe - p));
+        if star(child, c, ce) {
+            assert(pe - p == 1);
+            assert(parent[p + 0] == child[c + 0]);
+            assert(star(parent, p, pe));
+        }
+        assert(!star(child, c, ce));
+        assert(ce - c == te - t);
+        assert forall|offset: int| 0 <= offset < pe - p implies
+            #[trigger] parent[p + offset] == #[trigger] target[t + offset] by {
+            assert(parent[p + offset] == child[c + offset]);
+            assert(child[c + offset] == target[t + offset]);
+        }
+        assert(equal_segment(parent, target, p, t, pe - p));
+    } else {
+        assert(pe < parent.len());
+    }
+    assert(!(star(child, c, ce) && ce == child.len()));
+    if pe < parent.len() {
+        assert(ce < child.len() && te < target.len());
+        cover_sound(parent, child, target, pe + 1, ce + 1, te + 1);
+    }
+}
+
+pub(super) fn covers(parent: &[u8], child: &[u8]) -> (result: bool)
+    ensures
+        result == matches_from(parent@, child@, 0, 0),
+        result ==> forall|target: Seq<u8>|
+            matches_from(child@, target, 0, 0) ==> matches_from(parent@, target, 0, 0),
+{
+    let covered = matches(parent, child);
+    proof {
+        if covered {
+            assert forall|target: Seq<u8>| matches_from(child@, target, 0, 0)
+                implies matches_from(parent@, target, 0, 0) by {
+                cover_sound(parent@, child@, target, 0, 0, 0);
+            }
+        }
+    }
+    covered
+}
+
 }

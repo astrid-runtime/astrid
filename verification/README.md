@@ -55,6 +55,13 @@ part of the assurance argument for this path.
 Verus checks the production static capability matcher against a segment
 specification. A middle wildcard consumes one segment and a trailing wildcard
 consumes one or more. Exact segments compare byte for byte. This covers the
-shared matcher used for principal and device policy decisions. Delegation
-requires a separate language-containment proof, including deny and revoke
-precedence. URI-based runtime capability tokens use a different matcher.
+shared matcher used for principal and device policy decisions. URI-based
+runtime capability tokens use a different matcher.
+
+Scoped device issuance also checks every requested allow pattern for semantic
+containment in an issuer allow pattern. Verus proves that a positive containment
+decision implies every concrete capability accepted by the child pattern is
+accepted by the covering issuer pattern. The pairing adapter still checks the
+principal decision and inherits explicit issuer denies. This proof covers the
+pattern relation, with the policy adapter, persistence, and use-time checks
+remaining separate obligations.

@@ -43,6 +43,7 @@
 
 use std::borrow::Cow;
 
+use astrid_core::capability_grammar::capability_pattern_covers;
 use astrid_core::{
     CapabilityPattern, DeviceScope, GroupConfig, PrincipalId, PrincipalProfile,
     ValidatedGroupConfig, ValidatedProfileFields, capability_matches,
@@ -186,6 +187,10 @@ impl<'a> CapabilityCheck<'a> {
     /// a capability the principal lacks become held.
     #[must_use]
     pub fn has(&self, cap: &str) -> bool {
+        self.has_with_device_match(cap, capability_matches)
+    }
+
+    fn has_with_device_match(&self, cap: &str, allow_matches: impl Fn(&str, &str) -> bool) -> bool {
         let profile = match &self.profile {
             Ok(profile) => profile,
             Err(e) => {
@@ -201,7 +206,7 @@ impl<'a> CapabilityCheck<'a> {
         if !self.principal_has(profile, cap) {
             return false;
         }
-        self.device_scope_admits(cap)
+        self.device_scope_admits_with(cap, allow_matches)
     }
 
     /// Enforce that the principal holds capability `cap` and the
@@ -275,10 +280,18 @@ impl<'a> CapabilityCheck<'a> {
     /// [`DeviceScope::Scoped`] floor admits iff `cap` matches an `allow`
     /// pattern and matches no `deny` pattern (deny wins).
     fn device_scope_admits(&self, cap: &str) -> bool {
+        self.device_scope_admits_with(cap, capability_matches)
+    }
+
+    fn device_scope_admits_with(
+        &self,
+        cap: &str,
+        allow_matches: impl Fn(&str, &str) -> bool,
+    ) -> bool {
         match self.device_scope {
             None | Some(DeviceScope::Full) => true,
             Some(DeviceScope::Scoped { allow, deny }) => {
-                matches_any(allow.iter().map(String::as_str), cap)
+                allow.iter().any(|parent| allow_matches(parent, cap))
                     && !matches_any(deny.iter().map(String::as_str), cap)
             },
         }
@@ -342,10 +355,10 @@ where
 /// `issuer_check` is the issuer's *effective* check: its principal decision
 /// already narrowed by the issuer's OWN authenticating device scope (a scoped
 /// device can only mint a child no broader than itself). For a
-/// [`DeviceScope::Scoped`] request, every `allow` pattern `P` must satisfy
-/// `issuer_check.has(P)` — the issuer can only confer capabilities it actually
-/// holds. `deny` patterns need no validation: they purely restrict, so a child
-/// denying something is always safe.
+/// [`DeviceScope::Scoped`] request, each allow pattern must pass the issuer's
+/// principal and device deny checks and be contained in an issuer device allow
+/// pattern when the issuer device is scoped. Parent denies are carried into
+/// the issued scope by the pairing adapter.
 ///
 /// A [`DeviceScope::Full`] request is *not* validated here — minting an
 /// unattenuated device is gated separately by the `self:auth:pair:admin`
@@ -355,7 +368,8 @@ where
 /// # Errors
 ///
 /// Returns [`PermissionError::MissingCapability`] naming the first `allow`
-/// pattern the issuer does not effectively hold, so the issue is rejected
+/// pattern the issuer does not effectively hold or that exceeds the issuer's
+/// device allow language, so the issue is rejected
 /// fail-closed. `MissingCapability` (not `DeviceScopeDenied`) is the accurate
 /// shape here: this is the *issuer authority* subset check, and the pattern may
 /// be unheld because the principal lacks it OR because the issuer's own device
@@ -370,7 +384,7 @@ pub fn device_scope_within(
         return Ok(());
     };
     for pattern in allow {
-        if !issuer_check.has(pattern) {
+        if !issuer_check.has_with_device_match(pattern, capability_pattern_covers) {
             return Err(PermissionError::MissingCapability {
                 principal: issuer_check.principal.as_ref().clone(),
                 required: pattern.clone(),
@@ -784,6 +798,25 @@ mod tests {
             chk.require("self:auth:pair").unwrap_err(),
             PermissionError::DeviceScopeDenied { .. }
         ));
+    }
+
+    #[test]
+    fn scoped_issuer_can_confer_only_covered_capability_patterns() {
+        let profile = profile_in(&["admin"]);
+        let groups = gc();
+        let parent = DeviceScope::Scoped {
+            allow: vec!["test:*:read".into()],
+            deny: vec![],
+        };
+        let issuer = CapabilityCheck::new(&profile, &groups, pid()).with_device_scope(&parent);
+        let child = |pattern: &str| DeviceScope::Scoped {
+            allow: vec![pattern.into()],
+            deny: vec![],
+        };
+
+        assert!(device_scope_within(&issuer, &child("test:state:read")).is_ok());
+        assert!(device_scope_within(&issuer, &child("test:*:read")).is_ok());
+        assert!(device_scope_within(&issuer, &child("test:*")).is_err());
     }
 
     #[test]
