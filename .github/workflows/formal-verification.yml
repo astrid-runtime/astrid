@@ -1,0 +1,40 @@
+name: Formal verification
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  fuel-ledger:
+    name: Verify fuel ledger arithmetic
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned verifier
+        working-directory: ${{ runner.temp }}
+        run: |
+          version=0.2026.11.22.1ce6a59
+          archive="verus-${version}-x86-linux.zip"
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://github.com/verus-lang/verus/releases/download/release/${version}/${archive}" \
+            --output "$archive"
+          echo "c955d5958877f4f907cce80aa996d4239a481984829d82e325938c7bf242b0db  $archive" | sha256sum --check
+          unzip -q "$archive"
+          rustup toolchain install 1.100.0 --profile minimal --no-self-update
+          echo "$PWD/verus-x86-linux" >> "$GITHUB_PATH"
+
+      - name: Check contracts against production source
+        run: verus --edition=2024 --crate-type=lib --no-cheating verification/fuel_ledger.rs
