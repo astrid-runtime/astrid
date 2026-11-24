@@ -276,10 +276,7 @@ async fn already_admitted_matching_guard_can_finish_first_open_after_retirement(
         .expect("admitted operation must not re-enter admission");
     assert!(resolved.file.is_some());
     assert!(root.home.root().join(&owner.target).exists());
-    assert_eq!(
-        tracker.state.lock().unwrap().active.get(&state.principal),
-        Some(&1)
-    );
+    assert_eq!(tracker.active(&state.principal), 1);
     drop(resolved);
     drop(guard);
     tracker.wait_for_quiescence(&state.principal).await;
@@ -298,19 +295,9 @@ async fn retired_pending_owner_cannot_borrow_a_different_callers_guard() {
     tracker.resume(&state.principal);
     let resolved = resolve(&mut state, Some(&guard));
     assert!(resolved.file.is_some());
-    assert_eq!(
-        tracker.state.lock().unwrap().active.get(&state.principal),
-        Some(&1)
-    );
+    assert_eq!(tracker.active(&state.principal), 1);
     drop(resolved);
-    assert!(
-        !tracker
-            .state
-            .lock()
-            .unwrap()
-            .active
-            .contains_key(&state.principal)
-    );
+    assert_eq!(tracker.active(&state.principal), 0);
 }
 
 #[tokio::test]
@@ -602,31 +589,17 @@ async fn admitted_first_sys_log_open_and_write_drain_before_quiescence() {
             .await;
     });
     observed_rx.await.unwrap();
-    let active = tracker
-        .state
-        .lock()
-        .unwrap()
-        .active
-        .get(&principal)
-        .copied();
+    let active = tracker.active(&principal);
     release_tx.send(()).unwrap();
     writer.join().unwrap();
     resume_tx.send(()).unwrap();
     waiter.await.unwrap();
     assert_eq!(
-        active,
-        Some(1),
+        active, 1,
         "the existing operation must cover first open and write"
     );
     assert!(contents(&root, &owner).contains("admitted first write drains"));
-    assert!(
-        !tracker
-            .state
-            .lock()
-            .unwrap()
-            .active
-            .contains_key(&principal)
-    );
+    assert_eq!(tracker.active(&principal), 0);
 }
 
 #[tokio::test]

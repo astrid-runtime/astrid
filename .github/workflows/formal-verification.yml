@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   fuel-ledger:
-    name: Verify fuel ledger arithmetic
+    name: Verify hosted authority transitions
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -37,4 +37,4 @@ jobs:
           echo "$PWD/verus-x86-linux" >> "$GITHUB_PATH"
 
       - name: Check contracts against production source
-        run: verus --edition=2024 --crate-type=lib --no-cheating verification/fuel_ledger.rs
+        run: verus --edition=2024 --crate-type=lib --no-cheating verification/hosted_authority.rs

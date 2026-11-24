@@ -65,10 +65,15 @@ pub mod host_state;
 mod interruption_tests;
 mod invocation_failure;
 mod native_logs;
+mod principal_tracker;
 pub use native_logs::NativeLogRoot;
 pub(crate) use native_logs::eager::open_capsule_log;
 #[cfg(test)]
 use native_logs::eager::open_capsule_log_at;
+pub(crate) use principal_tracker::PrincipalInvocationGuard;
+pub(super) use principal_tracker::PrincipalInvocationTracker;
+#[cfg(test)]
+pub(crate) use principal_tracker::QuiescenceObservationHook;
 #[cfg(test)]
 #[path = "lifecycle_audit_tests.rs"]
 mod lifecycle_audit_tests;
@@ -354,134 +359,6 @@ pub struct WasmEngine {
     /// (processes that outlive their spawning invocation).
     persistent_processes:
         Option<Arc<crate::engine::wasm::host::process::PersistentProcessRegistry>>,
-}
-
-#[derive(Default)]
-pub(super) struct PrincipalInvocationTracker {
-    state: std::sync::Mutex<PrincipalInvocationState>,
-    changed: tokio::sync::Notify,
-}
-
-#[derive(Default)]
-struct PrincipalInvocationState {
-    retired: std::collections::HashSet<astrid_core::PrincipalId>,
-    active: std::collections::HashMap<astrid_core::PrincipalId, usize>,
-}
-
-pub(crate) struct PrincipalInvocationGuard {
-    tracker: Arc<PrincipalInvocationTracker>,
-    principal: astrid_core::PrincipalId,
-}
-
-#[cfg(test)]
-pub(crate) struct QuiescenceObservationHook {
-    pub(crate) observed: tokio::sync::oneshot::Sender<()>,
-    pub(crate) resume: tokio::sync::oneshot::Receiver<()>,
-}
-
-impl PrincipalInvocationTracker {
-    pub(super) fn begin(
-        self: &Arc<Self>,
-        principal: &astrid_core::PrincipalId,
-    ) -> Option<PrincipalInvocationGuard> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.retired.contains(principal) {
-            return None;
-        }
-        *state.active.entry(principal.clone()).or_default() += 1;
-        Some(PrincipalInvocationGuard {
-            tracker: Arc::clone(self),
-            principal: principal.clone(),
-        })
-    }
-
-    fn retire(&self, principal: &astrid_core::PrincipalId) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retired
-            .insert(principal.clone());
-    }
-
-    fn resume(&self, principal: &astrid_core::PrincipalId) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retired
-            .remove(principal);
-    }
-
-    async fn wait_for_quiescence(&self, principal: &astrid_core::PrincipalId) {
-        self.wait_for_quiescence_inner(
-            principal,
-            #[cfg(test)]
-            None,
-        )
-        .await;
-    }
-
-    async fn wait_for_quiescence_inner(
-        &self,
-        principal: &astrid_core::PrincipalId,
-        #[cfg(test)] mut observation_hook: Option<QuiescenceObservationHook>,
-    ) {
-        loop {
-            let notified = self.changed.notified();
-            tokio::pin!(notified);
-            // notify_waiters does not retain a permit for a future that has
-            // not registered yet. Register before sampling active, otherwise
-            // the final guard can drop between the sample and first poll and
-            // leave retirement asleep after the principal is already drained.
-            notified.as_mut().enable();
-            let active = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .active
-                .get(principal)
-                .copied()
-                .unwrap_or(0);
-            #[cfg(test)]
-            if let Some(hook) = observation_hook.take() {
-                let _ = hook.observed.send(());
-                let _ = hook.resume.await;
-            }
-            if active == 0 {
-                return;
-            }
-            notified.await;
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn wait_for_quiescence_with_observation_hook(
-        &self,
-        principal: &astrid_core::PrincipalId,
-        hook: QuiescenceObservationHook,
-    ) {
-        self.wait_for_quiescence_inner(principal, Some(hook)).await;
-    }
-}
-
-impl Drop for PrincipalInvocationGuard {
-    fn drop(&mut self) {
-        let mut state = self
-            .tracker
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(active) = state.active.get_mut(&self.principal) {
-            *active = active.saturating_sub(1);
-            if *active == 0 {
-                state.active.remove(&self.principal);
-            }
-        }
-        drop(state);
-        self.tracker.changed.notify_waiters();
-    }
 }
 
 impl WasmEngine {

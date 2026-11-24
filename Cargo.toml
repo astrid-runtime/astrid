@@ -266,6 +266,7 @@ url = "2.5.9"
 utoipa = { version = "5", features = ["axum_extras"] }
 uuid = { version = "~1.25.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
 walkdir = "2.5"
+vstd = { version = "=0.0.0-2026-11-22-0344", default-features = false }
 wasm-encoder = "0.257.1"
 wat = "=1.257.1"
 wasmparser = "0.257.1"
@@ -311,6 +312,7 @@ zeroize = { version = "1.8", features = ["derive"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)', 'cfg(verus_keep_ghost)', 'cfg(verus_verify_core)'] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

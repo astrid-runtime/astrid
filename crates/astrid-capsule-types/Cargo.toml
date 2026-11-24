@@ -10,7 +10,7 @@ description = "Engine-agnostic capsule types shared by all Astrid capsule engine
 
 [dependencies]
 web-time = "1.1.0"
-vstd = { version = "=0.0.0-2026-11-22-0344", default-features = false }
+vstd = { workspace = true }
 astrid-core = { workspace = true }
 dashmap = { workspace = true }
 event-listener = "5.4.2"

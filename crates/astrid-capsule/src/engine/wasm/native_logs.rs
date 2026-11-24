@@ -233,9 +233,7 @@ impl PendingLog {
         principal: &PrincipalId,
         admitted: Option<&PrincipalInvocationGuard>,
     ) -> Option<Option<PrincipalInvocationGuard>> {
-        let covered = admitted.is_some_and(|guard| {
-            Arc::ptr_eq(&guard.tracker, &self.tracker) && &guard.principal == principal
-        });
+        let covered = admitted.is_some_and(|guard| guard.belongs_to(&self.tracker, principal));
         if covered {
             Some(None)
         } else {

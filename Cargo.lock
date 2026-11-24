@@ -497,6 +497,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "vstd",
  "wasm-encoder 0.257.1",
  "wasmparser 0.257.1",
  "wasmtime",
@@ -589,6 +590,7 @@ dependencies = [
  "tokio",
  "toml",
  "uuid",
+ "vstd",
  "windows-sys 0.61.2",
 ]
 

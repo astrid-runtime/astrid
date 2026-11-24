@@ -346,9 +346,13 @@ async fn publish_inner(
         astrid_events::DeliveryAdmissionError::InvalidEvent => ErrorCode::InvalidInput,
         astrid_events::DeliveryAdmissionError::Closed => ErrorCode::CapabilityDenied,
     })?;
-    // Retirement while waiting must not let the old invocation commit an
-    // effect after its view has been revoked. Dropping releases all permits.
-    if !state.invocation_authority_active() || cancel_token.is_cancelled() {
+    // Admit after the capacity wait. Retirement serializes with admission
+    // and waits for the guard through publication. Dropping an unadmitted
+    // publication releases its reserved capacity.
+    let _operation = state
+        .begin_host_operation()
+        .map_err(|()| ErrorCode::CapabilityDenied)?;
+    if cancel_token.is_cancelled() {
         return Err(ErrorCode::CapabilityDenied);
     }
     publication
