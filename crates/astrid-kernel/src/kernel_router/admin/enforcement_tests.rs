@@ -365,6 +365,42 @@ async fn additive_derive_endpoint_preserves_correlation_and_authorization() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn retiring_admin_cannot_derive_through_the_dedicated_ipc_route() {
+    let (_dir, kernel) = fixture().await;
+    super::test_support::seed_operator(&kernel).await;
+    let caller = PrincipalId::default();
+    seed_profile(
+        &kernel,
+        &caller,
+        &PrincipalProfile {
+            groups: vec!["admin".to_owned()],
+            ..Default::default()
+        },
+    );
+
+    // Leave the profile and identity in place as they may be during recovery.
+    kernel
+        .capabilities
+        .begin_principal_retirement(caller.clone())
+        .await;
+    let denied = send_derive(&kernel, Some(caller.as_str()), "retiring-derive").await;
+    assert_eq!(denied["request_id"], "retiring-derive");
+    assert_eq!(denied["status"], "Error");
+    assert!(
+        denied["data"]
+            .as_str()
+            .unwrap()
+            .contains("agent is retiring")
+    );
+    assert!(
+        kernel
+            .principal_directory
+            .uid_for(&PrincipalId::new("derived-test").unwrap())
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn admin_router_denies_missing_and_invalid_principals_deterministically() {
     let (_dir, kernel) = fixture().await;
 

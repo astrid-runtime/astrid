@@ -1,9 +1,10 @@
 //! Capability authority across abrupt exit and reopen of hosted storage.
 
+use astrid_approval::{Allowance, AllowanceId, AllowancePattern, AllowanceStore};
 use astrid_capabilities::{
     AuditEntryId, CapabilityError, CapabilityStore, CapabilityToken, ResourcePattern, TokenScope,
 };
-use astrid_core::{Permission, PrincipalId, TokenId, dirs::AstridHome};
+use astrid_core::{Permission, PrincipalId, TokenId, dirs::AstridHome, types::Timestamp};
 use astrid_crypto::KeyPair;
 use std::io::Write as _;
 
@@ -112,14 +113,32 @@ async fn hosted_token_revocation_and_consumption_survive_storage_reopen() {
     let retiring_alias = PrincipalId::new("deletion-in-progress").unwrap();
     // The token payload survived, so denial must come from recovered authority.
     assert!(reopened.get(&retiring_id).await.unwrap().is_some());
+    let allowances = AllowanceStore::new();
+    let allowance = Allowance {
+        id: AllowanceId::new(),
+        principal: retiring_alias.clone(),
+        action_pattern: AllowancePattern::ServerTools {
+            server: "test".to_owned(),
+        },
+        created_at: Timestamp::now(),
+        expires_at: None,
+        max_uses: None,
+        uses_remaining: None,
+        session_only: true,
+        workspace_root: None,
+        signature: KeyPair::generate().sign(b"retirement test allowance"),
+    };
+    allowances.add_allowance(allowance.clone()).unwrap();
     super::authority_recovery::restore_retirement_fences(
         &snapshot,
         &directory,
         &reopened,
-        &astrid_approval::AllowanceStore::new(),
+        &allowances,
     )
     .await
     .unwrap();
+    assert_eq!(allowances.count_for(&retiring_alias), 0);
+    assert!(allowances.add_allowance(allowance).is_err());
     assert!(reopened.is_principal_retiring(&retiring_alias).await);
     assert!(matches!(
         reopened.use_token(&retiring_id).await,

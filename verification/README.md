@@ -85,8 +85,10 @@ win a second CAS.
 
 Startup loads both marker namespaces before exposing the store. It also uses
 the authoritative ownership snapshot to restore capability and allowance
-fences for pending principal deletions. The kernel and admin IPC routers
-check those fences before admitting management effects. A kernel regression exits a subprocess
+fences for pending principal deletions. The authenticated kernel and admin
+IPC preambles check those fences. Principal derivation checks under the
+same management write lock as deletion. Invite and device redemption use
+their own durable reservation paths. A kernel regression exits a subprocess
 without calling shutdown, reopens the hosted backend, and checks revocation,
 single use, incomplete principal retirement, and a live control token.
 
