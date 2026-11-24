@@ -1854,3 +1854,30 @@ async fn capsule_service_probe_accepts_only_one_compatible_interface_provider() 
     );
     assert!(probe.subscriber_source_ids(&service_key).await.is_empty());
 }
+
+#[tokio::test]
+async fn retiring_principal_cannot_admit_management_with_a_live_profile() {
+    let (_dir, kernel) = kernel_with_inventory_capsules().await;
+    let caller = PrincipalId::new("retiring-admin").unwrap();
+    seed_profile(
+        &kernel,
+        &caller,
+        &PrincipalProfile {
+            grants: vec!["system:status".to_owned()],
+            ..Default::default()
+        },
+    );
+    assert!(
+        super::admit_management_request(&kernel, &caller, None, "system:status")
+            .await
+            .is_ok()
+    );
+    kernel
+        .capabilities
+        .begin_principal_retirement(caller.clone())
+        .await;
+    assert!(matches!(
+        super::admit_management_request(&kernel, &caller, None, "system:status").await,
+        Err(super::ManagementAdmissionError::Retiring(principal)) if principal == caller,
+    ));
+}

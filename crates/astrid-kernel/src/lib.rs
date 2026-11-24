@@ -29,6 +29,9 @@ mod audit_retention;
 mod audit_retirement_tests;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod audit_sink;
+mod authority_recovery;
+#[cfg(test)]
+mod authority_restart_tests;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod boot_policy;
 /// Passive event-bus storm diagnostics (publish-rate monitor).
@@ -1079,9 +1082,16 @@ impl Kernel {
                     std::io::Error::other(format!("Failed to create ownership store: {error}"))
                 })?,
         );
-        ownership_store.load().await.map_err(|error| {
+        let ownership = ownership_store.load().await.map_err(|error| {
             std::io::Error::other(format!("Failed to load ownership graph: {error}"))
         })?;
+        authority_recovery::restore_retirement_fences(
+            &ownership,
+            &principal_directory,
+            &capabilities,
+            &allowance_store,
+        )
+        .await?;
 
         // Load group config (issue #670). Boot-loaded once, then swapped
         // atomically by Layer 6 admin topics (issue #672). Missing file

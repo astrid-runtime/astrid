@@ -206,7 +206,7 @@ async fn handle_request(
     let requested_target = request_target_principal(&req, &caller);
     let required_cap = required_capability(&req, scope);
     let install_authorization =
-        authorize_request(kernel, &caller, device_key_id.as_deref(), required_cap);
+        admit_management_request(kernel, &caller, device_key_id.as_deref(), required_cap).await;
     // Install secrets are staged in the host-wide Shared namespace, not the
     // target principal's namespace. Install permission must never substitute
     // for the same global env authority required by an explicit Shared write.
@@ -215,7 +215,12 @@ async fn handle_request(
             if matches!(&req, KernelRequest::InstallCapsule { env, .. }
                 if env.iter().any(|value| value.kind == astrid_core::kernel_api::EnvValueKind::Secret)) =>
         {
-            ("env:write", authorization.require_shared_env_write())
+            (
+                "env:write",
+                authorization
+                    .require_shared_env_write()
+                    .map_err(ManagementAdmissionError::Policy),
+            )
         },
         result => (required_cap, result),
     };
@@ -740,6 +745,42 @@ impl AuthorizedRequest {
             None => check,
         }
     }
+}
+
+#[derive(Debug)]
+enum ManagementAdmissionError {
+    Policy(PermissionError),
+    Retiring(PrincipalId),
+}
+
+impl std::fmt::Display for ManagementAdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Policy(error) => error.fmt(formatter),
+            Self::Retiring(principal) => {
+                write!(
+                    formatter,
+                    "permission denied for principal {principal}: agent is retiring"
+                )
+            },
+        }
+    }
+}
+
+/// Admit through the same retirement fence restored before daemon startup.
+/// A successful decision is bound to the caller and checked policy snapshot.
+async fn admit_management_request(
+    kernel: &crate::Kernel,
+    caller: &PrincipalId,
+    device_key_id: Option<&str>,
+    required_cap: &str,
+) -> Result<AuthorizedRequest, ManagementAdmissionError> {
+    let authorization = authorize_request(kernel, caller, device_key_id, required_cap)
+        .map_err(ManagementAdmissionError::Policy)?;
+    if kernel.capabilities.is_principal_retiring(caller).await {
+        return Err(ManagementAdmissionError::Retiring(caller.clone()));
+    }
+    Ok(authorization)
 }
 
 /// Evaluate the capability check for `caller` against the kernel's resolved

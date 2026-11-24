@@ -329,12 +329,21 @@ impl CapabilityToken {
     /// Returns [`CapabilityError::TokenExpired`] if expired,
     /// or [`CapabilityError::InvalidSignature`] if the signature is invalid.
     pub fn validate_with_skew(&self, skew_secs: i64) -> CapabilityResult<()> {
+        self.check_expiry_with_skew(skew_secs)?;
+        self.verify_signature()
+    }
+
+    pub(crate) fn check_admission_expiry(&self) -> CapabilityResult<()> {
+        self.check_expiry_with_skew(DEFAULT_CLOCK_SKEW_SECS)
+    }
+
+    fn check_expiry_with_skew(&self, skew_secs: i64) -> CapabilityResult<()> {
         if self.is_expired_with_skew(skew_secs) {
             return Err(CapabilityError::TokenExpired {
                 token_id: self.id.to_string(),
             });
         }
-        self.verify_signature()
+        Ok(())
     }
 
     /// Check if this is a single-use token.

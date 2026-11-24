@@ -131,6 +131,16 @@ impl OwnershipSnapshot {
         self.principal_deletions.contains_key(&uid)
     }
 
+    /// Retirements that still reserve their principal generation at this
+    /// snapshot. The retained alias can survive deletion of the identity.
+    pub fn pending_principal_deletions(
+        &self,
+    ) -> impl Iterator<Item = (PrincipalUid, Option<&PrincipalId>)> {
+        self.principal_deletions
+            .iter()
+            .map(|(&uid, reservation)| (uid, reservation.alias.as_ref()))
+    }
+
     /// Iterate over users in stable UID order.
     pub fn users(&self) -> impl Iterator<Item = &UserIdentity> {
         self.users.values()

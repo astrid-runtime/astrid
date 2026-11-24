@@ -449,6 +449,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "vstd",
 ]
 
 [[package]]

@@ -123,6 +123,40 @@ impl<'a> CapabilityValidator<'a> {
         Ok(())
     }
 
+    /// Admit one operation using a particular token and consume a single-use
+    /// token before returning. The selected signed grant must still bind the
+    /// caller, resource, required permission and trusted issuer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the token or its operation binding is invalid, the
+    /// token is unavailable, or durable consumption fails.
+    pub async fn authorize_by_id(
+        &self,
+        principal: &PrincipalId,
+        resource: &str,
+        permission: Permission,
+        token_id: &astrid_core::TokenId,
+    ) -> CapabilityResult<CapabilityToken> {
+        self.store
+            .use_checked(token_id, |token| {
+                if token.principal != *principal
+                    || (!self.trusted_issuers.is_empty()
+                        && !self.trusted_issuers.contains(&token.issuer))
+                {
+                    return Err(CapabilityError::InvalidSignature);
+                }
+                if !token.grants(resource, permission) {
+                    return Err(CapabilityError::InsufficientPermission {
+                        required: permission.to_string(),
+                        resource: resource.to_owned(),
+                    });
+                }
+                Ok(())
+            })
+            .await
+    }
+
     /// Validate a token by ID, rejecting cross-principal use.
     ///
     /// `validate_token` itself is intentionally principal-agnostic (it

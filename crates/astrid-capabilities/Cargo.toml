@@ -20,6 +20,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
+vstd = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

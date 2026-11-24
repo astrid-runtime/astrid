@@ -678,3 +678,116 @@ async fn test_persistent_v1_token_rejected_after_upgrade() {
         "v1 tokens must be rejected with InvalidSignature; got {result:?}"
     );
 }
+
+fn single_use_token() -> CapabilityToken {
+    let key = test_keypair();
+    CapabilityToken::create_with_options(
+        ResourcePattern::exact("mcp://test:tool").unwrap(),
+        vec![Permission::Invoke],
+        TokenScope::Persistent,
+        key.key_id(),
+        AuditEntryId::new(),
+        &key,
+        None,
+        true,
+        alice(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revocation_fences_a_validated_token_before_consumption() {
+    let store = Arc::new(CapabilityStore::in_memory());
+    let token = single_use_token();
+    let id = token.id.clone();
+    store.add(token).await.unwrap();
+
+    let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let contender = {
+        let store = Arc::clone(&store);
+        let id = id.clone();
+        tokio::spawn(async move {
+            store
+                .use_checked(&id, move |_| {
+                    checked_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    Ok(())
+                })
+                .await
+        })
+    };
+
+    checked_rx.await.unwrap();
+    store.revoke(&id).await.unwrap();
+    resume_tx.send(()).unwrap();
+    assert!(matches!(
+        contender.await.unwrap(),
+        Err(CapabilityError::TokenRevoked { .. })
+    ));
+    assert!(!store.is_used(&id).await);
+}
+
+#[tokio::test]
+async fn a_retry_cannot_win_after_a_durable_but_unobserved_consumption() {
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let store = CapabilityStore::with_kv_store(Arc::clone(&kv))
+        .await
+        .unwrap();
+    let token = single_use_token();
+    let id = token.id.clone();
+    store.add(token).await.unwrap();
+
+    // Storage committed the marker, but this instance did not observe the
+    // result before the caller canceled. The live cache still has no entry.
+    kv.set(NS_USED, &id.0.to_string(), PRESENCE_MARKER.to_vec())
+        .await
+        .unwrap();
+    assert!(!store.is_used(&id).await);
+    assert!(matches!(
+        store.use_token(&id).await,
+        Err(CapabilityError::TokenAlreadyUsed { .. })
+    ));
+    assert!(store.is_used(&id).await);
+}
+
+#[tokio::test]
+async fn operation_binding_mismatch_does_not_consume_the_grant() {
+    let store = CapabilityStore::in_memory();
+    let token = single_use_token();
+    let id = token.id.clone();
+    let validator = crate::CapabilityValidator::new(&store).trust_issuer(token.issuer);
+    store.add(token).await.unwrap();
+
+    assert!(matches!(
+        validator
+            .authorize_by_id(&bob(), "mcp://test:tool", Permission::Invoke, &id)
+            .await,
+        Err(CapabilityError::InvalidSignature),
+    ));
+    assert!(matches!(
+        validator
+            .authorize_by_id(&alice(), "mcp://test:other", Permission::Invoke, &id)
+            .await,
+        Err(CapabilityError::InsufficientPermission { .. }),
+    ));
+    assert!(!store.is_used(&id).await);
+    validator
+        .authorize_by_id(&alice(), "mcp://test:tool", Permission::Invoke, &id)
+        .await
+        .unwrap();
+    assert!(store.is_used(&id).await);
+}
+
+#[tokio::test]
+async fn unreadable_marker_identity_prevents_authority_startup() {
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    kv.set(NS_REVOKED, "invalid-id", PRESENCE_MARKER.to_vec())
+        .await
+        .unwrap();
+    assert!(matches!(
+        CapabilityStore::with_kv_store(kv).await,
+        Err(CapabilityError::StorageError(_)),
+    ));
+}

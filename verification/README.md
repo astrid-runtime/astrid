@@ -65,3 +65,35 @@ accepted by the covering issuer pattern. The pairing adapter still checks the
 principal decision and inherits explicit issuer denies. This proof covers the
 pattern relation, with the policy adapter, persistence, and use-time checks
 remaining separate obligations.
+
+## Durable token authority and restart
+
+Verus checks the token status functions used by the capability store. Any
+revocation marker denies admission. A consumption marker denies single-use
+admission. A consume attempt succeeds only for a live unused token and a
+winning persistence result. Recovery folds the durable markers for the same
+token ID through monotone transitions. The replay lemma proves that an
+arbitrary order or duplication of records preserves each observed marker.
+
+The adapter orders final admission and revocation using one authority lock.
+The live revocation fence closes before persistence. If persistence fails or
+the task is canceled, the live fence stays closed. An acknowledged durable
+revocation survives restart, even if physical token cleanup is incomplete.
+Previously admitted operations can finish. Single-use consumption uses a
+durable insert-if-absent, so retry after an ambiguous or canceled write cannot
+win a second CAS.
+
+Startup loads both marker namespaces before exposing the store. It also uses
+the authoritative ownership snapshot to restore capability and allowance
+fences for pending principal deletions. The kernel and admin IPC routers
+check those fences before admitting management effects. A kernel regression exits a subprocess
+without calling shutdown, reopens the hosted backend, and checks revocation,
+single use, incomplete principal retirement, and a live control token.
+
+The token proof assumes one active capability-store authority per hosted
+instance, correctly keyed complete storage reads, and the hosted backend's
+atomic and durable CAS contract. Operation binding is checked on the actual
+signed token admitted by the MCP adapter. The proof covers the token state
+transitions and marker fold. It does not establish the cryptographic verifier,
+storage engine crash model, distributed revocation, or complete mediation of
+every hosted effect.
