@@ -91,8 +91,8 @@ use tracing::warn;
 
 use super::caller::{CallerResolutionError, MANAGEMENT_CALLER_REQUIRED};
 use super::{
-    AdminAuditEntry, AuthorityScope, authorize_request, publish_response, record_admin_audit,
-    resolve_caller, resolve_device_key_id,
+    AdminAuditEntry, AuthorityScope, publish_response, record_admin_audit, resolve_caller,
+    resolve_device_key_id,
 };
 use request_authorization::{
     AdminAuthorizationContext, authorize_admin_request, record_admin_request_failure,
