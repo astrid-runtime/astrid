@@ -323,10 +323,23 @@ proof fn theorem_acknowledged_consumption_keeps_grant_used(events: Seq<GrantEven
     acknowledged_consumption_closes(events, index);
 }
 
+/// The consumption theorem states that the grant is used at the index
+/// itself. A caller that only calls the theorem needs that point.
+proof fn acknowledged_consumption_is_used_at_index(events: Seq<GrantEvent>, i: int)
+    requires
+        0 <= i <= events.len(),
+        consumption_acknowledged_before(events, i),
+        recovery_observes_acknowledged_markers(events),
+    ensures
+        (grant_run(events, i)).used,
+{
+    theorem_acknowledged_consumption_keeps_grant_used(events, i);
+}
+
 /// A revoke after an acknowledged consumption leaves the grant used from the
 /// revocation on and revoked right after it. That needs the consumed component
-/// of the consumption theorem over its whole range, which single-use denial
-/// alone does not state.
+/// of the consumption theorem through the end of the trace, which single-use
+/// denial alone does not state.
 proof fn acknowledged_consumption_survives_a_later_revocation(
     events: Seq<GrantEvent>,
     i: int,
@@ -343,7 +356,6 @@ proof fn acknowledged_consumption_survives_a_later_revocation(
     theorem_acknowledged_consumption_keeps_grant_used(events, i);
     assert(grant_run(events, i + 1) == grant_step(grant_run(events, i), events[i]));
 }
-
 
 /// No recovery transition occurs strictly between `i` and `k`.
 closed spec fn no_recovery_between(events: Seq<GrantEvent>, i: int, k: int) -> bool {
