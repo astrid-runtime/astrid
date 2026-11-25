@@ -125,7 +125,9 @@ impl CapabilityStore {
             }
         }
         // Each token's live authority is replayed from the markers the store
-        // reports for it, as `TokenStatus::recover_markers` verifies.
+        // reports for it, as `TokenStatus::recover_markers` verifies. A token
+        // has at most one marker in each namespace, so each list is short and
+        // this map is released once the authority map is built.
         let authority = recorded
             .into_iter()
             .map(|(id, markers)| (id, TokenStatus::recover_markers(&markers)))

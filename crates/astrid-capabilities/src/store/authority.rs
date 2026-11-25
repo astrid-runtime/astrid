@@ -94,7 +94,8 @@ impl TokenStatus {
 
     /// Replay the durable markers recorded for one token. Startup calls this
     /// for each token it reads, so neither the order nor a duplicate record
-    /// can reopen authority.
+    /// can reopen authority. A token has at most one marker in each of the
+    /// two namespaces, so the list is short.
     #[expect(clippy::arithmetic_side_effects, reason = "the early return leaves a non-empty slice")]
     pub(super) fn recover_markers(markers: &[Marker]) -> (status: Self)
         ensures

@@ -12,7 +12,7 @@ jobs:
   fuel-ledger:
     name: Verify hosted authority transitions
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
@@ -38,3 +38,6 @@ jobs:
 
       - name: Check contracts against production source
         run: verus --edition=2024 --crate-type=lib --no-cheating verification/hosted_authority.rs
+
+      - name: Check that deliberate defects fail the verifier
+        run: python3 scripts/verification_defect_checks.py

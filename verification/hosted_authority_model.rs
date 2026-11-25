@@ -182,7 +182,7 @@ proof fn revoked_persists(events: Seq<GrantEvent>, k: int)
         revocation_acknowledged_before(events, k),
         recovery_observes_acknowledged_markers(events),
     ensures
-        forall|j: int| k <= j <= events.len() ==> grant_run(events, j).revoked,
+        forall|j: int| k <= j <= events.len() ==> (#[trigger] grant_run(events, j)).revoked,
     decreases events.len() - k,
 {
     if k < events.len() {
@@ -206,7 +206,7 @@ proof fn acknowledged_revocation_closes(events: Seq<GrantEvent>, i: int)
         events[i] is Revoke && events[i]->Revoke_completed,
         recovery_observes_acknowledged_markers(events),
     ensures
-        forall|j: int| i < j <= events.len() ==> grant_run(events, j).revoked,
+        forall|j: int| i < j <= events.len() ==> (#[trigger] grant_run(events, j)).revoked,
 {
     assert(grant_run(events, i + 1) == grant_step(grant_run(events, i), events[i]));
     vstd::seq_lib::lemma_seq_take_contains(events, i + 1, GrantEvent::Revoke { completed: true });
@@ -222,8 +222,8 @@ proof fn theorem_acknowledged_revocation_denies_admission(events: Seq<GrantEvent
         revocation_acknowledged_before(events, i),
         recovery_observes_acknowledged_markers(events),
     ensures
-        forall|j: int| i <= j <= events.len() ==> !grant_admits(grant_run(events, j), false),
-        forall|j: int| i <= j <= events.len() ==> !grant_admits(grant_run(events, j), true),
+        forall|j: int| i <= j <= events.len() ==> !grant_admits(#[trigger] grant_run(events, j), false),
+        forall|j: int| i <= j <= events.len() ==> !grant_admits(#[trigger] grant_run(events, j), true),
 {
     let index = acknowledged_at(events, i, GrantEvent::Revoke { completed: true });
     acknowledged_revocation_closes(events, index);
@@ -238,7 +238,7 @@ proof fn used_persists(events: Seq<GrantEvent>, k: int)
         consumption_acknowledged_before(events, k),
         recovery_observes_acknowledged_markers(events),
     ensures
-        forall|j: int| k <= j <= events.len() ==> grant_run(events, j).used,
+        forall|j: int| k <= j <= events.len() ==> (#[trigger] grant_run(events, j)).used,
     decreases events.len() - k,
 {
     if k < events.len() {
@@ -263,7 +263,7 @@ proof fn acknowledged_consumption_closes(events: Seq<GrantEvent>, i: int)
         events[i] is Consume && events[i]->Consume_won,
         recovery_observes_acknowledged_markers(events),
     ensures
-        forall|j: int| i < j <= events.len() ==> grant_run(events, j).used,
+        forall|j: int| i < j <= events.len() ==> (#[trigger] grant_run(events, j)).used,
 {
     assert(grant_run(events, i + 1) == grant_step(grant_run(events, i), events[i]));
     vstd::seq_lib::lemma_seq_take_contains(events, i + 1, GrantEvent::Consume { won: true });
@@ -305,16 +305,54 @@ proof fn theorem_acknowledged_consumption_denies_admission(events: Seq<GrantEven
         consumption_acknowledged_before(events, i),
         recovery_observes_acknowledged_markers(events),
     ensures
-        forall|j: int| i <= j <= events.len() ==> !grant_admits(grant_run(events, j), true),
+        forall|j: int| i <= j <= events.len() ==> !grant_admits(#[trigger] grant_run(events, j), true),
 {
     let index = acknowledged_at(events, i, GrantEvent::Consume { won: true });
     acknowledged_consumption_closes(events, index);
 }
 
-/// A revocation whose durable write did not complete fences live admission
-/// until recovery reads markers that lack it. This is the boundary of the
-/// restart guarantee.
-proof fn theorem_unacknowledged_revocation_ends_at_recovery() {
+/// No recovery transition occurs strictly between `i` and `k`.
+closed spec fn no_recovery_between(events: Seq<GrantEvent>, i: int, k: int) -> bool {
+    forall|m: int| i < m < k ==> !(#[trigger] events[m] is Restart)
+}
+
+/// A revocation without a completed write keeps the grant closed until the
+/// next recovery.
+proof fn revoked_until_recovery(events: Seq<GrantEvent>, i: int, k: int)
+    requires
+        0 <= i < k <= events.len(),
+        events[i] is Revoke,
+        no_recovery_between(events, i, k),
+    ensures grant_run(events, k).revoked,
+    decreases k - i,
+{
+    assert(grant_run(events, k) == grant_step(grant_run(events, k - 1), events[k - 1]));
+    if i < k - 1 {
+        revoked_until_recovery(events, i, k - 1);
+    }
+}
+
+/// An unacknowledged revocation denies admission until the next recovery.
+proof fn theorem_unacknowledged_revocation_fences_until_recovery(events: Seq<GrantEvent>, i: int)
+    requires
+        0 <= i < events.len(),
+        events[i] is Revoke,
+    ensures
+        forall|k: int| i < k <= events.len() && #[trigger] no_recovery_between(events, i, k)
+            ==> !grant_admits(grant_run(events, k), false),
+        forall|k: int| i < k <= events.len() && #[trigger] no_recovery_between(events, i, k)
+            ==> !grant_admits(grant_run(events, k), true),
+{
+    assert forall|k: int| i < k <= events.len() && no_recovery_between(events, i, k)
+        implies !grant_admits(#[trigger] grant_run(events, k), false) && !grant_admits(grant_run(events, k), true) by {
+        revoked_until_recovery(events, i, k);
+    };
+}
+
+/// A checked witness to the boundary of the restart guarantee: a recovery
+/// that reads no marker for the grant reopens it. This is one trace and
+/// states no general property.
+proof fn witness_unacknowledged_revocation_reopens_at_recovery() {
     let recovered = seq![
         GrantEvent::Revoke { completed: false },
         GrantEvent::Restart { markers: Seq::empty() },
@@ -367,43 +405,57 @@ fn apply_recovery(markers: &[Marker]) -> (status: TokenStatus)
 
 // ---- One principal ----
 
+/// No resume transition occurs strictly between `i` and `k`.
+closed spec fn no_resume_between(events: Seq<OperationEvent>, i: int, k: int) -> bool {
+    forall|m: int| i < m < k ==> !(#[trigger] events[m] is Resume)
+}
+
 /// Once retirement has closed the principal, it stays closed until a resume.
 proof fn retired_until_resume(events: Seq<OperationEvent>, i: int, k: int)
     requires
         0 <= i < k <= events.len(),
         events[i] is Retire,
-        forall|m: int| i < m < k ==> !(events[m] is Resume),
+        no_resume_between(events, i, k),
     ensures !operation_admits(operation_run(events, k)),
     decreases k - i,
 {
     assert(operation_run(events, k) == operation_step(operation_run(events, k - 1), events[k - 1]));
     if i < k - 1 {
         retired_until_resume(events, i, k - 1);
-        assert(!(events[k - 1] is Resume));
     }
 }
 
 /// Retirement admits no operation until the principal is resumed. The
 /// caller of the tracker resumes only once the kernel's retirement of the
-/// principal has ended.
+/// principal has ended. Each engine instance has its own tracker.
 proof fn theorem_retirement_admits_no_operation(events: Seq<OperationEvent>, i: int)
     requires
         0 <= i < events.len(),
         events[i] is Retire,
     ensures
         forall|k: int| i < k <= events.len()
-            && !(events.take(k).contains(OperationEvent::Resume))
+            && #[trigger] no_resume_between(events, i, k)
             ==> !operation_admits(operation_run(events, k)),
 {
     assert forall|k: int| i < k <= events.len()
-        && !(events.take(k).contains(OperationEvent::Resume))
-        implies !operation_admits(operation_run(events, k)) by {
-        assert forall|m: int| i < m < k implies !(events[m] is Resume) by {
-            vstd::seq_lib::lemma_seq_take_contains(events, k, OperationEvent::Resume);
-            vstd::seq_lib::lemma_seq_take_index(events, k, m);
-        };
+        && no_resume_between(events, i, k)
+        implies !operation_admits(#[trigger] operation_run(events, k)) by {
         retired_until_resume(events, i, k);
     };
+}
+
+/// A checked witness: a resume before the retirement does not reopen the
+/// principal after it. The begin after the retirement changes nothing.
+proof fn witness_earlier_resume_does_not_reopen_retirement() {
+    let trace = seq![
+        OperationEvent::Begin,
+        OperationEvent::Finish,
+        OperationEvent::Resume,
+        OperationEvent::Retire,
+        OperationEvent::Begin,
+    ];
+    assert(!operation_admits(operation_run(trace, 4)));
+    assert(operation_run(trace, 5).active == operation_run(trace, 4).active);
 }
 
 /// The model state of the principal as the tracker keeps it.
@@ -419,7 +471,6 @@ fn apply_operation(state: &mut PrincipalInvocation, event: OperationEvent) -> (a
             == (event is Begin
                 && operation_admits(tracker_state(old(state)))
                 && old(state).active_count() < usize::MAX),
-        admitted ==> operation_admits(tracker_state(old(state))),
         (event is Begin && old(state).active_count() == usize::MAX)
             ==> tracker_state(final(state)) == tracker_state(old(state)),
         (event is Begin && old(state).active_count() < usize::MAX)
@@ -450,18 +501,24 @@ fn apply_operation(state: &mut PrincipalInvocation, event: OperationEvent) -> (a
 enum FuelEvent {
     /// Promise the maximum fuel one invocation may consume.
     Reserve { requested: u64 },
-    /// Release a promise and charge the fuel the invocation consumed.
+    /// Release a promise and charge the fuel the invocation consumed. A
+    /// metered call can consume more than it was promised before the meter
+    /// traps, so the charge may exceed the promise.
     Settle { released: u64, actual: u64 },
+    /// Start a new window. Charged fuel is dropped and promises are kept.
+    Roll,
 }
 
-/// Charged and promised fuel over mathematical integers.
+/// Charged and promised fuel over mathematical integers, and the fuel
+/// settlements have charged beyond what they released.
 struct FuelState {
     spent: int,
     reserved: int,
+    excess: int,
 }
 
 closed spec fn fuel_initial() -> FuelState {
-    FuelState { spent: 0, reserved: 0 }
+    FuelState { spent: 0, reserved: 0, excess: 0 }
 }
 
 /// A reservation fits when charged and promised fuel leave room for it.
@@ -475,6 +532,7 @@ closed spec fn fuel_step(state: FuelState, event: FuelEvent) -> FuelState {
         FuelEvent::Reserve { requested } => FuelState {
             spent: state.spent,
             reserved: state.reserved + requested as int,
+            excess: state.excess,
         },
         FuelEvent::Settle { released, actual } => FuelState {
             spent: if state.spent + actual as int > u64::MAX as int {
@@ -483,6 +541,13 @@ closed spec fn fuel_step(state: FuelState, event: FuelEvent) -> FuelState {
                 state.spent + actual as int
             },
             reserved: if released as int > state.reserved { 0 } else { state.reserved - released as int },
+            excess: state.excess
+                + if actual as int > released as int { actual as int - released as int } else { 0 },
+        },
+        FuelEvent::Roll => FuelState {
+            spent: 0,
+            reserved: state.reserved,
+            excess: state.excess,
         },
     }
 }
@@ -499,54 +564,153 @@ spec fn fuel_run(events: Seq<FuelEvent>, k: int) -> FuelState
     }
 }
 
-/// The limiter's obligations for one transition: a reservation fits, and a
-/// settlement releases no more than it promised and charges no more than it
-/// released.
+/// What production guarantees for one transition: a reservation fits, and a
+/// settlement releases no more than it promised.
 closed spec fn fuel_transition_is_admitted(events: Seq<FuelEvent>, k: int, limit: u64) -> bool {
     let state = fuel_run(events, k);
     match events[k] {
         FuelEvent::Reserve { requested } => fuel_admits(state, requested as int, limit),
-        FuelEvent::Settle { released, actual } => {
-            released as int <= state.reserved && actual <= released
-        },
+        FuelEvent::Settle { released, .. } => released as int <= state.reserved,
+        FuelEvent::Roll => true,
     }
 }
 
-proof fn committed_fuel_within_budget_upto(events: Seq<FuelEvent>, limit: u64, k: int)
+/// The settlement at `events[k]` charges no more fuel than it released.
+closed spec fn settlement_charges_within_promise(events: Seq<FuelEvent>, k: int) -> bool {
+    match events[k] {
+        FuelEvent::Settle { released, actual } => actual <= released,
+        FuelEvent::Reserve { .. } | FuelEvent::Roll => true,
+    }
+}
+
+proof fn committed_fuel_upto(events: Seq<FuelEvent>, limit: u64, k: int)
     requires
         0 <= k <= events.len(),
         forall|m: int| 0 <= m < events.len() ==> #[trigger] fuel_transition_is_admitted(events, m, limit),
     ensures
-        fuel_run(events, k).spent + fuel_run(events, k).reserved <= limit as int,
+        0 <= fuel_run(events, k).excess,
+        0 <= fuel_run(events, k).spent,
+        fuel_run(events, k).spent + fuel_run(events, k).reserved
+            <= limit as int + fuel_run(events, k).excess,
     decreases k,
 {
     if k > 0 {
-        committed_fuel_within_budget_upto(events, limit, k - 1);
+        committed_fuel_upto(events, limit, k - 1);
         assert(fuel_transition_is_admitted(events, k - 1, limit));
+        let prior = fuel_run(events, k - 1);
+        let next = fuel_run(events, k);
+        assert(next == fuel_step(prior, events[k - 1]));
+        match events[k - 1] {
+            FuelEvent::Reserve { requested } => {
+                assert(fuel_admits(prior, requested as int, limit));
+                assert(next.spent + next.reserved == prior.spent + prior.reserved + requested as int);
+                assert(next.excess == prior.excess);
+                assert(next.spent == prior.spent);
+            },
+            FuelEvent::Settle { released, actual } => {
+                assert(released as int <= prior.reserved);
+                assert(next.reserved == prior.reserved - released as int);
+                assert(next.excess
+                    == prior.excess
+                        + if actual as int > released as int { actual as int - released as int } else { 0 });
+                if prior.spent + actual as int > u64::MAX as int {
+                    assert(next.spent == u64::MAX as int);
+                } else {
+                    assert(next.spent == prior.spent + actual as int);
+                }
+            },
+            FuelEvent::Roll => {
+                assert(next.spent == 0);
+                assert(next.reserved == prior.reserved);
+                assert(next.excess == prior.excess);
+            },
+        }
     }
 }
 
-/// Charged and promised fuel never exceed the budget through any sequence of
-/// admitted reservations and admitted settlements.
-proof fn theorem_committed_fuel_stays_within_budget(events: Seq<FuelEvent>, limit: u64)
+/// Charged and promised fuel never exceed the budget by more than the fuel
+/// that settlements charged beyond what they released.
+proof fn theorem_committed_fuel_is_budget_plus_charged_excess(events: Seq<FuelEvent>, limit: u64)
     requires
         forall|m: int| 0 <= m < events.len() ==> #[trigger] fuel_transition_is_admitted(events, m, limit),
     ensures
-        forall|k: int| 0 <= k <= events.len() ==> fuel_run(events, k).spent
+        forall|k: int| 0 <= k <= events.len() ==> #[trigger] fuel_run(events, k).spent
             + fuel_run(events, k).reserved
-            <= limit as int,
+            <= limit as int + fuel_run(events, k).excess,
 {
-    assert forall|k: int| 0 <= k <= events.len() implies fuel_run(events, k).spent
+    assert forall|k: int| 0 <= k <= events.len() implies (#[trigger] fuel_run(events, k)).spent
         + fuel_run(events, k).reserved
-        <= limit as int by {
-        committed_fuel_within_budget_upto(events, limit, k);
+        <= limit as int + fuel_run(events, k).excess by {
+        committed_fuel_upto(events, limit, k);
     };
 }
 
-/// The limiter's reservation arithmetic is the model's admission predicate.
+proof fn unexcessed_settlements_add_no_excess_upto(events: Seq<FuelEvent>, k: int)
+    requires
+        0 <= k <= events.len(),
+        forall|m: int| 0 <= m < events.len() ==> #[trigger] settlement_charges_within_promise(events, m),
+    ensures fuel_run(events, k).excess == 0,
+    decreases k,
+{
+    if k > 0 {
+        unexcessed_settlements_add_no_excess_upto(events, k - 1);
+        assert(settlement_charges_within_promise(events, k - 1));
+        match events[k - 1] {
+            FuelEvent::Settle { released, actual } => {
+                assert(actual <= released);
+                assert(fuel_run(events, k).excess == fuel_run(events, k - 1).excess);
+            },
+            FuelEvent::Reserve { .. } | FuelEvent::Roll => {
+                assert(fuel_run(events, k).excess == fuel_run(events, k - 1).excess);
+            },
+        }
+    }
+}
+
+/// Charged and promised fuel never exceed the budget when no settlement
+/// charges more than it released.
+proof fn theorem_committed_fuel_stays_within_budget(events: Seq<FuelEvent>, limit: u64)
+    requires
+        forall|m: int| 0 <= m < events.len() ==> #[trigger] fuel_transition_is_admitted(events, m, limit),
+        forall|m: int| 0 <= m < events.len() ==> #[trigger] settlement_charges_within_promise(events, m),
+    ensures
+        forall|k: int| 0 <= k <= events.len() ==> #[trigger] fuel_run(events, k).spent
+            + fuel_run(events, k).reserved
+            <= limit as int,
+{
+    theorem_committed_fuel_is_budget_plus_charged_excess(events, limit);
+    assert forall|k: int| 0 <= k <= events.len() implies (#[trigger] fuel_run(events, k)).spent
+        + fuel_run(events, k).reserved
+        <= limit as int by {
+        unexcessed_settlements_add_no_excess_upto(events, k);
+    };
+}
+
+/// A checked witness that the bound is tight: a settlement charging fifty
+/// beyond its promise leaves the window fifty over the budget, exactly the
+/// excess charged.
+proof fn witness_charged_excess_is_the_only_overshoot() {
+    let trace = seq![
+        FuelEvent::Reserve { requested: 100 },
+        FuelEvent::Settle { released: 100, actual: 150 },
+    ];
+    let limit = 100u64;
+    assert(fuel_transition_is_admitted(trace, 0, limit));
+    assert(fuel_transition_is_admitted(trace, 1, limit));
+    assert(fuel_run(trace, 2).spent + fuel_run(trace, 2).reserved == 150);
+    assert(fuel_run(trace, 2).excess == 50);
+}
+
+/// The window the limiter's arithmetic reads. The excess is not an input of
+/// that arithmetic.
+closed spec fn arithmetic_state(spent: u64, reserved: u64) -> FuelState {
+    FuelState { spent: spent as int, reserved: reserved as int, excess: 0 }
+}
+
+/// The limiter's reservation arithmetic decides the model's admission.
 fn fuel_reservation_fits(spent: u64, reserved: u64, requested: u64, limit: u64) -> (fits: bool)
     ensures
-        fits == fuel_admits(FuelState { spent: spent as int, reserved: reserved as int }, requested as int, limit),
+        fits == fuel_admits(arithmetic_state(spent, reserved), requested as int, limit),
 {
     crate::arithmetic::reservation_fits(spent, reserved, requested, limit)
 }
@@ -556,12 +720,12 @@ fn fuel_settlement(spent: u64, reserved: u64, released: u64, actual: u64) -> (ne
     ensures
         next.0 as int
             == fuel_step(
-                FuelState { spent: spent as int, reserved: reserved as int },
+                arithmetic_state(spent, reserved),
                 FuelEvent::Settle { released, actual },
             ).spent,
         next.1 as int
             == fuel_step(
-                FuelState { spent: spent as int, reserved: reserved as int },
+                arithmetic_state(spent, reserved),
                 FuelEvent::Settle { released, actual },
             ).reserved,
 {

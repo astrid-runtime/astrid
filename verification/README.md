@@ -106,21 +106,23 @@ every hosted effect.
 
 `hosted_authority_model.rs` is the specification side of the security contract.
 A trace follows one grant through the transitions that change who may act
-under it, or one principal through the transitions of its operations. Verus
-checks a theorem about every trace of each kind:
+under it, the operations of one principal's tracker, or the fuel charged to
+one principal in one accounting window. Verus checks a theorem about every
+trace of each kind:
 
 - Once a revocation's durable write completed, admission stays closed for the
   rest of the trace, across retries and restarts.
-- A single-use grant is consumed at most once in a trace.
+- A single-use grant admits at most one consumption in a trace.
 - Once a consumption's durable write completed, single-use admission stays
   closed for the rest of the trace.
-- After retirement, a principal admits no operation until it is resumed.
-- A revocation whose durable write did not complete reopens after a recovery
-  that reads no marker for it. This theorem states the boundary of the
-  restart guarantee.
-- Charged and promised fuel never exceed the budget, through any sequence of
-  reservations that fit and settlements that release no more than they
-  promised.
+- A revocation whose durable write did not complete denies admission until the
+  next recovery. A checked witness shows that a recovery which reads no marker
+  for the grant reopens it. That is the boundary of the restart guarantee.
+- After retirement, a principal admits no operation until a resume that
+  follows the retirement. Each engine instance has its own tracker.
+- Charged and promised fuel never exceed the budget by more than the fuel that
+  settlements charged beyond what they released. When no settlement charges
+  beyond what it released, committed fuel stays within the budget.
 
 The theorems are conditional on obligations the model cannot observe:
 
@@ -128,18 +130,26 @@ The theorems are conditional on obligations the model cannot observe:
   are only ever added, so the storage adapter must report them completely.
 - The caller resumes a retired principal only once the kernel's retirement of
   that principal has ended.
-- A settlement releases no more fuel than was promised and charges no more
-  than it released. Rolling the window only lowers the charged fuel.
+- A settlement releases no more fuel than was promised. Production does not
+  bound the fuel it charges: a metered call can consume more than it was
+  promised before the meter traps at its next hook, and the settlement charges
+  all of it. The fuel theorem bounds that overshoot by the excess charged.
+  The within-budget statement holds only when no settlement charges beyond
+  its promise.
+- Rolling the window drops charged fuel and keeps promises, which the model's
+  roll transition expresses. A zero budget means unlimited and is handled in
+  the caller, outside the model.
 
-The `apply_*` and `fuel_*` functions perform each transition by calling the
-production function the capability store, the invocation tracker or the fuel
-limiter calls, with the model's transition as the postcondition. Startup
-replays each token's markers through the verified
-`TokenStatus::recover_markers`. The store's `revoke`, `consume`, `is_available`
-and `use_checked` adapters, and the limiter's window and reservation counters,
-remain the unverified callers of these transitions.
+Production calls the transitions directly. Each carries the verified
+postcondition that the `apply_*` and `fuel_*` functions restate in the model's
+terms. Those functions decide admission and compute settlement and do not
+update the limiter's counters. Startup replays each token's markers through
+the verified `TokenStatus::recover_markers`. The store's `revoke`, `consume`,
+`is_available` and `use_checked` adapters, and the limiter's window and
+reservation counters, remain the unverified callers of these transitions.
 
-Five deliberate defects fail the checker: `admit` ignoring revocation for
-reusable tokens, `recover_markers` dropping its last marker, the revocation
-theorem stated without the storage condition, the model's recovery ignoring
-markers, and a settlement charging more than it released.
+Run `python3 scripts/verification_defect_checks.py` with the pinned verifier on
+the path. It applies deliberate defects to a scratch copy and fails if any
+still verifies: a false assertion at the start of each proof item, and defects
+in the production transitions, the bridges and the conditions of the proofs.
+CI runs it after the main check.
