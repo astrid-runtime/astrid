@@ -34,10 +34,12 @@ INPUTS = [
     Path("crates/astrid-core/src/capability_grammar/matcher.rs"),
 ]
 PROOF_ITEMS = [
-    "theorem_acknowledged_revocation_denies_admission",
+    "theorem_acknowledged_revocation_keeps_grant_revoked",
+    "acknowledged_revocation_denies_reusable_admission",
     "theorem_single_use_grant_admits_one_consumption",
-    "theorem_acknowledged_consumption_denies_admission",
-    "theorem_revocation_fences_until_recovery",
+    "theorem_acknowledged_consumption_keeps_grant_used",
+    "theorem_revocation_keeps_grant_revoked_until_recovery",
+    "revocation_denies_reusable_admission_until_recovery",
     "witness_unacknowledged_revocation_reopens_at_recovery",
     "theorem_retirement_admits_no_operation",
     "retirement_closes_after_an_earlier_resume",
@@ -47,7 +49,7 @@ PROOF_ITEMS = [
     "witness_charged_excess_is_the_only_overshoot",
 ]
 RESULT = re.compile(r"verification results:: (\d+) verified, (\d+) errors")
-LOCATION = re.compile(r"^\s*--> (\S+):\d+:\d+", re.MULTILINE)
+LOCATION = re.compile(r"^error[^\n]*\n\s+--> (\S+):\d+:\d+", re.MULTILINE)
 
 
 def replace_once(text: str, old: str, new: str) -> str:
@@ -171,9 +173,31 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             MODEL,
             lambda text: edit_function(
                 text,
-                "theorem_acknowledged_revocation_denies_admission",
+                "theorem_acknowledged_revocation_keeps_grant_revoked",
                 "        recovery_observes_acknowledged_markers(events),\n",
                 "",
+            ),
+        ),
+        (
+            "acknowledged revocation theorem reports only single-use denial",
+            MODEL,
+            lambda text: edit_function(
+                text,
+                "theorem_acknowledged_revocation_keeps_grant_revoked",
+                "        forall|j: int| i <= j <= events.len()"
+                " ==> (#[trigger] grant_run(events, j)).revoked,\n",
+                "        forall|j: int| i <= j <= events.len()"
+                " ==> !grant_admits(#[trigger] grant_run(events, j), true),\n",
+            ),
+        ),
+        (
+            "recovery-fence theorem reports only single-use denial",
+            MODEL,
+            lambda text: edit_function(
+                text,
+                "theorem_revocation_keeps_grant_revoked_until_recovery",
+                "            ==> (grant_run(events, k)).revoked,",
+                "            ==> !grant_admits(grant_run(events, k), true),",
             ),
         ),
         (

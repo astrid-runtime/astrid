@@ -110,15 +110,17 @@ under it, the operations of one principal's tracker, or the fuel charged to
 one principal under a fixed budget. Verus checks a theorem about every trace
 of each kind:
 
-- Once a revocation's durable write completed, admission stays closed for the
-  rest of the trace, across retries and restarts.
+- Once a revocation's durable write completed, the grant stays revoked for the
+  rest of the trace, across retries and restarts, which closes every admission
+  under it.
 - A single-use grant admits at most one consumption in a trace.
-- Once a consumption's durable write completed, single-use admission stays
-  closed for the rest of the trace.
-- A revocation denies admission until the next recovery, whether or not its
-  durable write completed. A checked witness shows that a recovery which
-  reads no marker for the grant reopens one whose write did not complete.
-  That is the boundary of the restart guarantee.
+- Once a consumption's durable write completed, the grant stays consumed for
+  the rest of the trace, which closes single-use admission under it.
+- A revocation keeps the grant revoked until the next recovery, whether or
+  not its durable write completed, which closes every admission under it
+  until then. A checked witness shows that a recovery which reads no marker
+  for the grant reopens one whose write did not complete. That is the
+  boundary of the restart guarantee.
 - After retirement, a principal admits no operation until a resume that
   follows the retirement. Each engine instance has its own tracker.
 - Charged and promised fuel never exceed the budget by more than the fuel that
@@ -143,16 +145,18 @@ The theorems are conditional on obligations the model cannot observe:
   decrease while promises are outstanding is outside the model.
 - A zero budget means unlimited. Admission is exempt and settlement still
   charges the observed fuel to the window. Both are outside the model.
-- The trace applies transitions one at a time. Concurrent reservations can
-  both pass the admission check before either adds to the reserved counter.
+- The trace applies transitions one at a time. Production serializes a
+  principal's reservations with its window lock, which `try_reserve` holds
+  from the admission check through the reservation.
 - `FuelRateLimiter::record` charges the window with no reservation. The
   hosted invocation path settles a reservation instead. `record` has no
   production caller there and is outside the model.
 
 Production calls the transitions directly. Each carries the verified
 postcondition that the `apply_*` and `fuel_*` functions restate in the model's
-terms. Those functions decide admission and compute settlement and do not
-update the limiter's counters. Startup replays each token's markers through
+terms. Those functions record the grant and tracker transitions, decide
+admission and compute settlement, and do not update the limiter's counters.
+Startup replays each token's markers through
 the verified `TokenStatus::recover_markers`. The store's `revoke`, `consume`,
 `is_available` and `use_checked` adapters, and the limiter's window and
 reservation counters, remain the unverified callers of these transitions.
@@ -162,9 +166,13 @@ the path. It applies deliberate defects to a scratch copy and fails unless the
 verifier reports an error in the edited file for each. One defect puts a false
 assertion at the start of every proof item, which shows the item's body is
 checked. The others edit the production transitions, every bridge and the
-conditions of the proofs. CI runs it after the main check.
+conditions of the proofs. Two consumers derive reusable denial from the two
+revocation theorems, so narrowing either theorem back to single-use denial
+fails a check. CI runs it after the main check.
 
-A defect check cannot detect a statement that is weakened but still true.
+A defect check cannot detect a statement that is weakened but still true
+unless a listed proof derives its conclusion from the stronger statement.
 `retirement_closes_after_an_earlier_resume` derives its conclusion from the
 retirement theorem on an abstract trace, so restoring the earlier vacuous
-condition of that theorem fails a check.
+condition of that theorem fails a check. The two revocation consumers are the
+same guard for the revocation theorems.

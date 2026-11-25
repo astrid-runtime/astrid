@@ -80,6 +80,18 @@ class Results(unittest.TestCase):
         self.assertTrue(checks.error_in(output, checks.AUTHORITY))
         self.assertFalse(checks.error_in(output, checks.MODEL))
 
+    def test_ignores_locations_that_are_not_errors(self) -> None:
+        output = "\n".join(
+            [
+                "note: automatically chose triggers for this expression:",
+                "   --> verification/hosted_authority_model.rs:449:5",
+                "error: assertion failed",
+                "   --> verification/../crates/x/store/authority.rs:131:13",
+            ]
+        )
+        self.assertFalse(checks.error_in(output, checks.MODEL))
+        self.assertTrue(checks.error_in(output, checks.AUTHORITY))
+
 
 class Defects(unittest.TestCase):
     def test_every_defect_applies_to_the_sources(self) -> None:

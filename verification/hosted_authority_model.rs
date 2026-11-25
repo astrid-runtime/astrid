@@ -3,10 +3,10 @@
 //! This is the specification side of the hosted security contract. A trace
 //! follows one grant, the operations of one principal, or the fuel charged to
 //! one principal, through the transitions that change what it may do. The
-//! `apply_*` and `fuel_*` functions decide admission and compute settlement
-//! with the production function the fuel limiter, the capability store or
-//! the invocation tracker calls, and the theorems constrain every sequence
-//! of those decisions and computations. Whatever the model cannot see, it
+//! `apply_*` and `fuel_*` functions call the production function the fuel
+//! limiter, the capability store or the invocation tracker calls, to decide
+//! admission, to record a transition or to compute a settlement. The theorems
+//! constrain every trace of those calls. Whatever the model cannot see, it
 //! states as a condition on the trace.
 
 use vstd::prelude::*;
@@ -214,18 +214,31 @@ proof fn acknowledged_revocation_closes(events: Seq<GrantEvent>, i: int)
     revoked_persists(events, i + 1);
 }
 
-/// An acknowledged revocation denies admission for the rest of the trace,
-/// across retries and restarts.
-proof fn theorem_acknowledged_revocation_denies_admission(events: Seq<GrantEvent>, i: int)
+/// An acknowledged revocation keeps the grant revoked for the rest of the
+/// trace, across retries and restarts.
+proof fn theorem_acknowledged_revocation_keeps_grant_revoked(events: Seq<GrantEvent>, i: int)
     requires
         0 <= i <= events.len(),
         revocation_acknowledged_before(events, i),
         recovery_observes_acknowledged_markers(events),
     ensures
-        forall|j: int| i <= j <= events.len() ==> !grant_admits(#[trigger] grant_run(events, j), true),
+        forall|j: int| i <= j <= events.len() ==> (#[trigger] grant_run(events, j)).revoked,
 {
     let index = acknowledged_at(events, i, GrantEvent::Revoke { completed: true });
     acknowledged_revocation_closes(events, index);
+}
+
+/// The theorem closes admission for a reusable grant, which is denied only
+/// by revocation.
+proof fn acknowledged_revocation_denies_reusable_admission(events: Seq<GrantEvent>, i: int)
+    requires
+        0 <= i <= events.len(),
+        revocation_acknowledged_before(events, i),
+        recovery_observes_acknowledged_markers(events),
+    ensures
+        forall|j: int| i <= j <= events.len() ==> !grant_admits(#[trigger] grant_run(events, j), false),
+{
+    theorem_acknowledged_revocation_keeps_grant_revoked(events, i);
 }
 
 /// Once an acknowledged consumption has closed single-use admission, no later
@@ -296,15 +309,15 @@ proof fn theorem_single_use_grant_admits_one_consumption(events: Seq<GrantEvent>
     };
 }
 
-/// An acknowledged consumption closes single-use admission for the rest of
-/// the trace.
-proof fn theorem_acknowledged_consumption_denies_admission(events: Seq<GrantEvent>, i: int)
+/// An acknowledged consumption keeps the grant consumed for the rest of the
+/// trace.
+proof fn theorem_acknowledged_consumption_keeps_grant_used(events: Seq<GrantEvent>, i: int)
     requires
         0 <= i <= events.len(),
         consumption_acknowledged_before(events, i),
         recovery_observes_acknowledged_markers(events),
     ensures
-        forall|j: int| i <= j <= events.len() ==> !grant_admits(#[trigger] grant_run(events, j), true),
+        forall|j: int| i <= j <= events.len() ==> (#[trigger] grant_run(events, j)).used,
 {
     let index = acknowledged_at(events, i, GrantEvent::Consume { won: true });
     acknowledged_consumption_closes(events, index);
@@ -330,20 +343,35 @@ proof fn revoked_until_recovery(events: Seq<GrantEvent>, i: int, k: int)
     }
 }
 
-/// A revocation denies admission until the next recovery, whether or not
-/// its durable write completed.
-proof fn theorem_revocation_fences_until_recovery(events: Seq<GrantEvent>, i: int)
+/// A revocation keeps the grant revoked until the next recovery, whether or
+/// not its durable write completed.
+proof fn theorem_revocation_keeps_grant_revoked_until_recovery(events: Seq<GrantEvent>, i: int)
     requires
         0 <= i < events.len(),
         events[i] is Revoke,
     ensures
         forall|k: int| i < k <= events.len() && #[trigger] no_recovery_between(events, i, k)
-            ==> !grant_admits(grant_run(events, k), true),
+            ==> (grant_run(events, k)).revoked,
 {
     assert forall|k: int| i < k <= events.len() && no_recovery_between(events, i, k)
-        implies !grant_admits(#[trigger] grant_run(events, k), true) by {
+        implies (#[trigger] grant_run(events, k)).revoked by {
         revoked_until_recovery(events, i, k);
     };
+}
+
+/// The theorem closes admission for a reusable grant until the next recovery.
+proof fn revocation_denies_reusable_admission_until_recovery(
+    events: Seq<GrantEvent>,
+    i: int,
+)
+    requires
+        0 <= i < events.len(),
+        events[i] is Revoke,
+    ensures
+        forall|k: int| i < k <= events.len() && #[trigger] no_recovery_between(events, i, k)
+            ==> !grant_admits(grant_run(events, k), false),
+{
+    theorem_revocation_keeps_grant_revoked_until_recovery(events, i);
 }
 
 /// A checked witness to the boundary of the restart guarantee: a recovery
@@ -442,11 +470,11 @@ proof fn theorem_retirement_admits_no_operation(events: Seq<OperationEvent>, i: 
 }
 
 /// The theorem covers an earlier resume. For an abstract trace with a
-/// resume before the retirement and none after it, the last transition
-/// cannot be an admitted begin.
+/// resume before the retirement and none after it, the final state admits
+/// nothing.
 proof fn retirement_closes_after_an_earlier_resume(events: Seq<OperationEvent>, i: int)
     requires
-        2 <= i < events.len() as int,
+        2 < i < events.len() as int,
         events[2] is Resume,
         events[i] is Retire,
         no_resume_between(events, i, events.len() as int),
