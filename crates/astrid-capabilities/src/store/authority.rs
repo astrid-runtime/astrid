@@ -92,6 +92,27 @@ impl TokenStatus {
         admitted
     }
 
+    /// Replay the durable markers recorded for one token. Startup calls this
+    /// for each token it reads, so neither the order nor a duplicate record
+    /// can reopen authority.
+    #[expect(clippy::arithmetic_side_effects, reason = "the early return leaves a non-empty slice")]
+    pub(super) fn recover_markers(markers: &[Marker]) -> (status: Self)
+        ensures
+            (status.revoked(), status.used()) == replay(markers@),
+        decreases markers.len(),
+    {
+        let Some(last) = markers.last() else {
+            return Self::recover(false, false);
+        };
+        let (prefix, _) = markers.split_at(markers.len() - 1);
+        let mut status = Self::recover_markers(prefix);
+        proof {
+            markers@.lemma_add_last_back();
+        }
+        status.restore(*last);
+        status
+    }
+
     // Connect each production restore step to the abstract history for
     // this token. The adapter may encounter either namespace first.
     proof fn restore_refines_replay(before: Self, after: Self, prefix: Seq<Marker>, marker: Marker)
@@ -136,7 +157,7 @@ pub(super) closed spec fn replay(markers: Seq<Marker>) -> (bool, bool)
 }
 
 // Ordering and duplication of durable records do not resurrect authority.
-proof fn replay_keeps_markers(markers: Seq<Marker>)
+pub(super) proof fn replay_keeps_markers(markers: Seq<Marker>)
     ensures
         replay(markers).0 == markers.contains(Marker::Revoked),
         replay(markers).1 == markers.contains(Marker::Consumed),

@@ -437,6 +437,51 @@ async fn test_mark_used_survives_restart() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_revoked_and_used_token_stays_closed_after_restart() {
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let store = CapabilityStore::with_kv_store(Arc::clone(&kv))
+        .await
+        .unwrap();
+    let keypair = test_keypair();
+
+    let token = CapabilityToken::create_with_options(
+        ResourcePattern::exact("mcp://test:tool").unwrap(),
+        vec![Permission::Invoke],
+        TokenScope::Persistent,
+        keypair.key_id(),
+        AuditEntryId::new(),
+        &keypair,
+        None,
+        true,
+        default_principal(),
+    );
+
+    let token_id = token.id.clone();
+    store.add(token).await.unwrap();
+    store.mark_used(&token_id).await.unwrap();
+    store.revoke(&token_id).await.unwrap();
+
+    // Reload. Both markers are replayed for the token: a retry neither
+    // consumes it again nor reads it.
+    drop(store);
+    let store2 = CapabilityStore::with_kv_store(kv).await.unwrap();
+    assert!(store2.is_used(&token_id).await);
+    assert!(matches!(
+        store2.get(&token_id).await,
+        Err(CapabilityError::TokenRevoked { .. })
+    ));
+    assert!(matches!(
+        store2.mark_used(&token_id).await,
+        Err(CapabilityError::TokenRevoked { .. })
+    ));
+    assert!(
+        !store2
+            .has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke)
+            .await
+    );
+}
+
 #[tokio::test]
 async fn test_find_capability_excludes_used_single_use() {
     let store = CapabilityStore::in_memory();

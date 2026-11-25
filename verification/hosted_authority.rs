@@ -11,3 +11,6 @@ mod matcher;
 
 #[path = "../crates/astrid-capabilities/src/store/authority.rs"]
 mod token_authority;
+
+#[path = "hosted_authority_model.rs"]
+mod model;

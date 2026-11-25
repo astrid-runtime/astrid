@@ -107,7 +107,7 @@ impl CapabilityStore {
     ///
     /// Returns an error if loading existing revoked/used tokens fails.
     pub async fn with_kv_store(store: Arc<dyn KvStore>) -> CapabilityResult<Self> {
-        let mut authority = HashMap::new();
+        let mut recorded: HashMap<TokenId, Vec<Marker>> = HashMap::new();
         for (namespace, marker) in [(NS_REVOKED, Marker::Revoked), (NS_USED, Marker::Consumed)] {
             for key in store
                 .list_keys(namespace)
@@ -121,12 +121,15 @@ impl CapabilityStore {
                             "invalid token marker in {namespace}: {error}"
                         ))
                     })?;
-                let status = authority
-                    .entry(id)
-                    .or_insert_with(|| TokenStatus::recover(false, false));
-                status.restore(marker);
+                recorded.entry(id).or_default().push(marker);
             }
         }
+        // Each token's live authority is replayed from the markers the store
+        // reports for it, as `TokenStatus::recover_markers` verifies.
+        let authority = recorded
+            .into_iter()
+            .map(|(id, markers)| (id, TokenStatus::recover_markers(&markers)))
+            .collect();
         Ok(Self {
             persistent_store: Some(store),
             authority: tokio::sync::RwLock::new(authority),
