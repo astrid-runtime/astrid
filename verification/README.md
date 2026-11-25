@@ -177,5 +177,5 @@ unless a listed proof derives its conclusion from the stronger statement.
 `retirement_closes_after_an_earlier_resume` derives its conclusion from the
 retirement theorem on an abstract trace, so restoring the earlier vacuous
 condition of that theorem fails a check. The two revocation consumers are the
-same guard for the revocation theorems, and the consumption consumer is that
-guard for the consumption theorem.
+same guard for the revocation theorems, and the two consumption consumers
+are that guard for the consumption theorem's component and its first index.
