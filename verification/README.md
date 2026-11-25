@@ -168,9 +168,9 @@ verifier reports an error in the edited file for each. One defect puts a false
 assertion at the start of every listed theorem, consumer and witness, which
 shows that body is checked. The others edit the production transitions, every
 bridge and the conditions of the proofs. Consumers derive reusable denial from
-the two revocation theorems and the consumed component from the consumption
-theorem, so narrowing any of the three back to single-use denial fails a
-check. CI runs it after the main check.
+the two revocation theorems and the consumed component over its whole range
+from the consumption theorem, so narrowing any of the three back to
+single-use denial fails a check. CI runs it after the main check.
 
 A defect check cannot detect a statement that is weakened but still true
 unless a listed proof derives its conclusion from the stronger statement.

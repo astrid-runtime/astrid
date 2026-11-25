@@ -323,6 +323,28 @@ proof fn theorem_acknowledged_consumption_keeps_grant_used(events: Seq<GrantEven
     acknowledged_consumption_closes(events, index);
 }
 
+/// A revoke after an acknowledged consumption leaves the grant used from the
+/// revocation on and revoked right after it. That needs the consumed component
+/// of the consumption theorem over its whole range, which single-use denial
+/// alone does not state.
+proof fn acknowledged_consumption_survives_a_later_revocation(
+    events: Seq<GrantEvent>,
+    i: int,
+)
+    requires
+        0 <= i < events.len(),
+        consumption_acknowledged_before(events, i),
+        recovery_observes_acknowledged_markers(events),
+        events[i] is Revoke,
+    ensures
+        forall|j: int| i <= j <= events.len() ==> (#[trigger] grant_run(events, j)).used,
+        (grant_run(events, i + 1)).revoked,
+{
+    theorem_acknowledged_consumption_keeps_grant_used(events, i);
+    assert(grant_run(events, i + 1) == grant_step(grant_run(events, i), events[i]));
+}
+
+
 /// No recovery transition occurs strictly between `i` and `k`.
 closed spec fn no_recovery_between(events: Seq<GrantEvent>, i: int, k: int) -> bool {
     forall|m: int| i < m < k ==> !(#[trigger] events[m] is Restart)
@@ -372,25 +394,6 @@ proof fn revocation_denies_reusable_admission_until_recovery(
             ==> !grant_admits(grant_run(events, k), false),
 {
     theorem_revocation_keeps_grant_revoked_until_recovery(events, i);
-}
-
-/// A revoke after an acknowledged consumption leaves the grant both used
-/// and revoked. That needs the consumed component of the consumption
-/// theorem, which single-use denial alone does not state.
-proof fn acknowledged_consumption_survives_a_later_revocation(
-    events: Seq<GrantEvent>,
-    i: int,
-)
-    requires
-        0 <= i < events.len(),
-        consumption_acknowledged_before(events, i),
-        recovery_observes_acknowledged_markers(events),
-        events[i] is Revoke,
-    ensures
-        (grant_run(events, i + 1)).used && (grant_run(events, i + 1)).revoked,
-{
-    theorem_acknowledged_consumption_keeps_grant_used(events, i);
-    assert(grant_run(events, i + 1) == grant_step(grant_run(events, i), events[i]));
 }
 
 /// A checked witness to the boundary of the restart guarantee: a recovery
