@@ -63,11 +63,20 @@ impl TokenStatus {
         ensures
             final(self).revoked() == (old(self).revoked() || marker is Revoked),
             final(self).used() == (old(self).used() || marker is Consumed),
+            forall|prefix: Seq<Marker>| (old(self).revoked(), old(self).used()) == replay(prefix)
+                ==> (final(self).revoked(), final(self).used()) == #[trigger] replay(prefix.push(marker)),
     {
+        let ghost before = *self;
         match marker {
             Marker::Revoked => self.record_revocation(),
             Marker::Consumed => self.record_consumption(),
         }
+        proof {
+            assert forall|prefix: Seq<Marker>| (before.revoked(), before.used()) == replay(prefix)
+                implies (self.revoked(), self.used()) == #[trigger] replay(prefix.push(marker)) by {
+                Self::restore_refines_replay(before, *self, prefix, marker);
+            }
+        };
     }
 
     /// Reflect the consume CAS result. A loser may observe a prior durable
@@ -81,6 +90,19 @@ impl TokenStatus {
         let admitted = won && !self.revoked && !self.used;
         self.record_consumption();
         admitted
+    }
+
+    // Connect each production restore step to the abstract history for
+    // this token. The adapter may encounter either namespace first.
+    proof fn restore_refines_replay(before: Self, after: Self, prefix: Seq<Marker>, marker: Marker)
+        requires
+            (before.revoked(), before.used()) == replay(prefix),
+            after.revoked() == (before.revoked() || marker is Revoked),
+            after.used() == (before.used() || marker is Consumed),
+        ensures
+            (after.revoked(), after.used()) == replay(prefix.push(marker)),
+    {
+        assert(prefix.push(marker).drop_last() =~= prefix);
     }
 
     pub(super) fn admit(self, single_use: bool) -> (decision: Admission)
@@ -102,7 +124,7 @@ impl TokenStatus {
 
 // Project replay to the markers for one token. The store indexes tokens by
 // ID and invokes restore only on that entry.
-spec fn replay(markers: Seq<Marker>) -> (bool, bool)
+pub(super) closed spec fn replay(markers: Seq<Marker>) -> (bool, bool)
     decreases markers.len(),
 {
     if markers.len() == 0 {

@@ -1,5 +1,7 @@
 # Hosted Astrid verification
 
+The [hosted security contract](hosted-security-contract.md) defines the full authority claim, identifies production entry points and records the outstanding refinement obligations.
+
 CI checks the Rust arithmetic called by `FuelRateLimiter::try_reserve` and
 `FuelRateLimiter::settle_reserved`. The verifier entry point imports the
 production source file directly. Cargo builds that same file on Astrid's normal
