@@ -39,5 +39,8 @@ jobs:
       - name: Check contracts against production source
         run: verus --edition=2024 --crate-type=lib --no-cheating verification/hosted_authority.rs
 
+      - name: Test the edit helpers of the defect script
+        run: python3 -m unittest scripts/test_verification_defect_checks.py
+
       - name: Check that deliberate defects fail the verifier
         run: python3 scripts/verification_defect_checks.py

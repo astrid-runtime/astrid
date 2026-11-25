@@ -107,17 +107,18 @@ every hosted effect.
 `hosted_authority_model.rs` is the specification side of the security contract.
 A trace follows one grant through the transitions that change who may act
 under it, the operations of one principal's tracker, or the fuel charged to
-one principal in one accounting window. Verus checks a theorem about every
-trace of each kind:
+one principal under a fixed budget. Verus checks a theorem about every trace
+of each kind:
 
 - Once a revocation's durable write completed, admission stays closed for the
   rest of the trace, across retries and restarts.
 - A single-use grant admits at most one consumption in a trace.
 - Once a consumption's durable write completed, single-use admission stays
   closed for the rest of the trace.
-- A revocation whose durable write did not complete denies admission until the
-  next recovery. A checked witness shows that a recovery which reads no marker
-  for the grant reopens it. That is the boundary of the restart guarantee.
+- A revocation denies admission until the next recovery, whether or not its
+  durable write completed. A checked witness shows that a recovery which
+  reads no marker for the grant reopens one whose write did not complete.
+  That is the boundary of the restart guarantee.
 - After retirement, a principal admits no operation until a resume that
   follows the retirement. Each engine instance has its own tracker.
 - Charged and promised fuel never exceed the budget by more than the fuel that
@@ -137,8 +138,16 @@ The theorems are conditional on obligations the model cannot observe:
   The within-budget statement holds only when no settlement charges beyond
   its promise.
 - Rolling the window drops charged fuel and keeps promises, which the model's
-  roll transition expresses. A zero budget means unlimited and is handled in
-  the caller, outside the model.
+  roll transition expresses.
+- The budget is fixed along a trace. Production resolves it per call, so a
+  decrease while promises are outstanding is outside the model.
+- A zero budget means unlimited. Admission is exempt and settlement still
+  charges the observed fuel to the window. Both are outside the model.
+- The trace applies transitions one at a time. Concurrent reservations can
+  both pass the admission check before either adds to the reserved counter.
+- `FuelRateLimiter::record` charges the window with no reservation. The
+  hosted invocation path settles a reservation instead. `record` has no
+  production caller there and is outside the model.
 
 Production calls the transitions directly. Each carries the verified
 postcondition that the `apply_*` and `fuel_*` functions restate in the model's
@@ -149,7 +158,13 @@ the verified `TokenStatus::recover_markers`. The store's `revoke`, `consume`,
 reservation counters, remain the unverified callers of these transitions.
 
 Run `python3 scripts/verification_defect_checks.py` with the pinned verifier on
-the path. It applies deliberate defects to a scratch copy and fails if any
-still verifies: a false assertion at the start of each proof item, and defects
-in the production transitions, the bridges and the conditions of the proofs.
-CI runs it after the main check.
+the path. It applies deliberate defects to a scratch copy and fails unless the
+verifier reports an error in the edited file for each. One defect puts a false
+assertion at the start of every proof item, which shows the item's body is
+checked. The others edit the production transitions, every bridge and the
+conditions of the proofs. CI runs it after the main check.
+
+A defect check cannot detect a statement that is weakened but still true.
+`retirement_closes_after_an_earlier_resume` derives its conclusion from the
+retirement theorem on an abstract trace, so restoring the earlier vacuous
+condition of that theorem fails a check.

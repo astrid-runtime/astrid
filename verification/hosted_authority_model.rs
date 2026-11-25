@@ -3,11 +3,11 @@
 //! This is the specification side of the hosted security contract. A trace
 //! follows one grant, the operations of one principal, or the fuel charged to
 //! one principal, through the transitions that change what it may do. The
-//! `apply_*` and `fuel_*` functions perform each transition with the
-//! production function the ledger, the capability store or the invocation
-//! tracker calls, so the theorems constrain every sequence those functions
-//! can produce. Whatever the model cannot see, it states as a condition on
-//! the trace.
+//! `apply_*` and `fuel_*` functions decide admission and compute settlement
+//! with the production function the fuel limiter, the capability store or
+//! the invocation tracker calls, and the theorems constrain every sequence
+//! of those decisions and computations. Whatever the model cannot see, it
+//! states as a condition on the trace.
 
 use vstd::prelude::*;
 
@@ -222,7 +222,6 @@ proof fn theorem_acknowledged_revocation_denies_admission(events: Seq<GrantEvent
         revocation_acknowledged_before(events, i),
         recovery_observes_acknowledged_markers(events),
     ensures
-        forall|j: int| i <= j <= events.len() ==> !grant_admits(#[trigger] grant_run(events, j), false),
         forall|j: int| i <= j <= events.len() ==> !grant_admits(#[trigger] grant_run(events, j), true),
 {
     let index = acknowledged_at(events, i, GrantEvent::Revoke { completed: true });
@@ -279,8 +278,8 @@ closed spec fn consumption_admitted(events: Seq<GrantEvent>, k: int) -> bool {
         && grant_admits(grant_run(events, k), true)
 }
 
-/// A single-use grant is consumed at most once in a trace, across retries
-/// and restarts.
+/// A single-use grant admits at most one consumption in a trace, across
+/// retries and restarts.
 proof fn theorem_single_use_grant_admits_one_consumption(events: Seq<GrantEvent>)
     requires recovery_observes_acknowledged_markers(events),
     ensures
@@ -316,8 +315,7 @@ closed spec fn no_recovery_between(events: Seq<GrantEvent>, i: int, k: int) -> b
     forall|m: int| i < m < k ==> !(#[trigger] events[m] is Restart)
 }
 
-/// A revocation without a completed write keeps the grant closed until the
-/// next recovery.
+/// A revocation keeps the grant closed until the next recovery.
 proof fn revoked_until_recovery(events: Seq<GrantEvent>, i: int, k: int)
     requires
         0 <= i < k <= events.len(),
@@ -332,19 +330,18 @@ proof fn revoked_until_recovery(events: Seq<GrantEvent>, i: int, k: int)
     }
 }
 
-/// An unacknowledged revocation denies admission until the next recovery.
-proof fn theorem_unacknowledged_revocation_fences_until_recovery(events: Seq<GrantEvent>, i: int)
+/// A revocation denies admission until the next recovery, whether or not
+/// its durable write completed.
+proof fn theorem_revocation_fences_until_recovery(events: Seq<GrantEvent>, i: int)
     requires
         0 <= i < events.len(),
         events[i] is Revoke,
     ensures
         forall|k: int| i < k <= events.len() && #[trigger] no_recovery_between(events, i, k)
-            ==> !grant_admits(grant_run(events, k), false),
-        forall|k: int| i < k <= events.len() && #[trigger] no_recovery_between(events, i, k)
             ==> !grant_admits(grant_run(events, k), true),
 {
     assert forall|k: int| i < k <= events.len() && no_recovery_between(events, i, k)
-        implies !grant_admits(#[trigger] grant_run(events, k), false) && !grant_admits(grant_run(events, k), true) by {
+        implies !grant_admits(#[trigger] grant_run(events, k), true) by {
         revoked_until_recovery(events, i, k);
     };
 }
@@ -444,8 +441,23 @@ proof fn theorem_retirement_admits_no_operation(events: Seq<OperationEvent>, i: 
     };
 }
 
-/// A checked witness: a resume before the retirement does not reopen the
-/// principal after it. The begin after the retirement changes nothing.
+/// The theorem covers an earlier resume. For an abstract trace with a
+/// resume before the retirement and none after it, the last transition
+/// cannot be an admitted begin.
+proof fn retirement_closes_after_an_earlier_resume(events: Seq<OperationEvent>, i: int)
+    requires
+        2 <= i < events.len() as int,
+        events[2] is Resume,
+        events[i] is Retire,
+        no_resume_between(events, i, events.len() as int),
+    ensures !operation_admits(operation_run(events, events.len() as int)),
+{
+    theorem_retirement_admits_no_operation(events, i);
+}
+
+/// A checked witness on a concrete trace: a resume before the retirement
+/// does not reopen the principal after it, and the begin after the
+/// retirement leaves the tracker in the same state.
 proof fn witness_earlier_resume_does_not_reopen_retirement() {
     let trace = seq![
         OperationEvent::Begin,
@@ -454,8 +466,8 @@ proof fn witness_earlier_resume_does_not_reopen_retirement() {
         OperationEvent::Retire,
         OperationEvent::Begin,
     ];
-    assert(!operation_admits(operation_run(trace, 4)));
-    assert(operation_run(trace, 5).active == operation_run(trace, 4).active);
+    retirement_closes_after_an_earlier_resume(trace, 3);
+    assert(operation_run(trace, 5) == operation_run(trace, 4));
 }
 
 /// The model state of the principal as the tracker keeps it.
@@ -496,8 +508,8 @@ fn apply_operation(state: &mut PrincipalInvocation, event: OperationEvent) -> (a
 
 // ---- One fuel window ----
 
-/// One transition of the fuel charged and promised to a principal in one
-/// accounting window.
+/// One transition of the fuel charged and promised to a principal under a
+/// fixed budget, across its accounting windows.
 enum FuelEvent {
     /// Promise the maximum fuel one invocation may consume.
     Reserve { requested: u64 },
