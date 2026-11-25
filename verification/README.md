@@ -145,9 +145,10 @@ The theorems are conditional on obligations the model cannot observe:
   decrease while promises are outstanding is outside the model.
 - A zero budget means unlimited. Admission is exempt and settlement still
   charges the observed fuel to the window. Both are outside the model.
-- The trace applies transitions one at a time. Production serializes a
-  principal's reservations with its window lock, which `try_reserve` holds
-  from the admission check through the reservation.
+- The trace applies transitions one at a time. Production serializes each
+  principal's fuel transitions with its window lock: `try_reserve` holds it
+  from the admission check through the reservation, and settlement holds it
+  across its load, arithmetic and store.
 - `FuelRateLimiter::record` charges the window with no reservation. The
   hosted invocation path settles a reservation instead. `record` has no
   production caller there and is outside the model.
@@ -164,15 +165,17 @@ reservation counters, remain the unverified callers of these transitions.
 Run `python3 scripts/verification_defect_checks.py` with the pinned verifier on
 the path. It applies deliberate defects to a scratch copy and fails unless the
 verifier reports an error in the edited file for each. One defect puts a false
-assertion at the start of every proof item, which shows the item's body is
-checked. The others edit the production transitions, every bridge and the
-conditions of the proofs. Two consumers derive reusable denial from the two
-revocation theorems, so narrowing either theorem back to single-use denial
-fails a check. CI runs it after the main check.
+assertion at the start of every listed theorem, consumer and witness, which
+shows that body is checked. The others edit the production transitions, every
+bridge and the conditions of the proofs. Consumers derive reusable denial from
+the two revocation theorems and the consumed component from the consumption
+theorem, so narrowing any of the three back to single-use denial fails a
+check. CI runs it after the main check.
 
 A defect check cannot detect a statement that is weakened but still true
 unless a listed proof derives its conclusion from the stronger statement.
 `retirement_closes_after_an_earlier_resume` derives its conclusion from the
 retirement theorem on an abstract trace, so restoring the earlier vacuous
 condition of that theorem fails a check. The two revocation consumers are the
-same guard for the revocation theorems.
+same guard for the revocation theorems, and the consumption consumer is that
+guard for the consumption theorem.

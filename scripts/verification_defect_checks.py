@@ -38,6 +38,7 @@ PROOF_ITEMS = [
     "acknowledged_revocation_denies_reusable_admission",
     "theorem_single_use_grant_admits_one_consumption",
     "theorem_acknowledged_consumption_keeps_grant_used",
+    "acknowledged_consumption_survives_a_later_revocation",
     "theorem_revocation_keeps_grant_revoked_until_recovery",
     "revocation_denies_reusable_admission_until_recovery",
     "witness_unacknowledged_revocation_reopens_at_recovery",
@@ -198,6 +199,17 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
                 "theorem_revocation_keeps_grant_revoked_until_recovery",
                 "            ==> (grant_run(events, k)).revoked,",
                 "            ==> !grant_admits(grant_run(events, k), true),",
+            ),
+        ),
+        (
+            "consumption theorem reports only single-use denial",
+            MODEL,
+            lambda text: edit_function(
+                text,
+                "theorem_acknowledged_consumption_keeps_grant_used",
+                "        forall|j: int| i <= j <= events.len() ==> (#[trigger] grant_run(events, j)).used,\n",
+                "        forall|j: int| i <= j <= events.len()"
+                " ==> !grant_admits(#[trigger] grant_run(events, j), true),\n",
             ),
         ),
         (
