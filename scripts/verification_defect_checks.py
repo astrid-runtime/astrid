@@ -243,6 +243,21 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             lambda text: replace_once(text, "(n % 256) as u8", "(upper % 256) as u8"),
         ),
         (
+            "incoming socket frame consumes a byte of its successor",
+            NATIVE_FRAME,
+            lambda text: replace_once(text, "consumed: 4 + len as usize", "consumed: 5 + len as usize"),
+        ),
+        (
+            "incoming socket frame admits an oversized declaration",
+            NATIVE_FRAME,
+            lambda text: replace_once(text, "if len as usize > limit", "if false && len as usize > limit"),
+        ),
+        (
+            "incoming socket frame supplies the suffix as its body",
+            NATIVE_FRAME,
+            lambda text: replace_once(text, "let (body, _) = payload.split_at", "let (_, body) = payload.split_at"),
+        ),
+        (
             "socket starts with the body instead of the length prefix",
             NATIVE_FRAME,
             lambda text: replace_once(text, "else { self.prefix }", "else { self.body }"),

@@ -250,6 +250,15 @@ phase. The map operations, mutex, delivery reservation, and operating system
 socket identity remain refinement obligations. The registry and transport
 have separate closure conditions.
 
+The established native reader classifies the buffered wire bytes before JSON
+decoding. Its checked transition derives the big-endian length from the four
+header bytes, rejects an oversized declaration as soon as the header is
+available, and returns a borrowed slice of exactly the first complete body.
+The consumed count ends at the same boundary. The production reader drains
+that count after decoding. A back-to-back transport regression checks both
+payloads and source IDs. The async read, dequeuing of bytes, and JSON parser
+remain trusted by this transition.
+
 The handshake and established connection writers both use `framing::write_frame`.
 The checked header constructor rejects lengths above the four-byte wire limit
 and encodes every representable body length exactly in big-endian order.

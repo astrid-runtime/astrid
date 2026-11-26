@@ -4,6 +4,7 @@ use astrid_types::ipc::IpcMessage;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::MAX_FRAME_BYTES;
+use super::frame_segments::{Incoming, incoming};
 
 /// The connection owner closes the transport on error or task cancellation.
 pub(super) async fn write_frame(
@@ -48,32 +49,21 @@ impl<R: AsyncRead + Unpin> FramedReader<R> {
     /// partially received prefix or body.
     pub(super) async fn read_message(&mut self) -> std::io::Result<Option<IpcMessage>> {
         loop {
-            if self.buffered.len() >= 4 {
-                let len = u32::from_be_bytes(
-                    self.buffered[..4]
-                        .try_into()
-                        .expect("four-byte frame prefix"),
-                ) as usize;
-                if len > MAX_FRAME_BYTES {
+            match incoming(&self.buffered, MAX_FRAME_BYTES) {
+                Incoming::Incomplete => {},
+                Incoming::Oversized(len) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("IPC frame too large: {len} bytes"),
                     ));
-                }
-                let frame_len = 4_usize.checked_add(len).ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "IPC frame overflow")
-                })?;
-                if self.buffered.len() >= frame_len {
-                    let message =
-                        serde_json::from_slice(&self.buffered[4..frame_len]).map_err(|_| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "invalid IPC message",
-                            )
-                        })?;
-                    self.buffered.drain(..frame_len);
+                },
+                Incoming::Complete { body, consumed } => {
+                    let message = serde_json::from_slice(body).map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid IPC message")
+                    })?;
+                    self.buffered.drain(..consumed);
                     return Ok(Some(message));
-                }
+                },
             }
 
             let mut chunk = [0_u8; 8192];
@@ -201,6 +191,31 @@ mod tests {
         writer.write_all(&bytes).await.unwrap();
         let error = FramedReader::new(reader).read_message().await.unwrap_err();
         assert_eq!(error.to_string(), "invalid IPC message");
+    }
+
+    #[tokio::test]
+    async fn buffered_messages_keep_their_own_payload_and_source() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let messages = ["first", "second"].map(|label| {
+            IpcMessage::new(
+                Topic::from_raw("astrid.v1.admin.status.test"),
+                IpcPayload::RawJson(serde_json::json!({"label":label})),
+                Uuid::new_v4(),
+            )
+        });
+        for message in &messages {
+            write_frame(&mut writer, &serde_json::to_vec(message).unwrap())
+                .await
+                .unwrap();
+        }
+        drop(writer);
+        let mut reader = FramedReader::new(reader);
+        for expected in messages {
+            let actual = reader.read_message().await.unwrap().unwrap();
+            assert_eq!(actual.source_id, expected.source_id);
+            assert_eq!(actual.payload, expected.payload);
+        }
+        assert!(reader.read_message().await.unwrap().is_none());
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-//! Bytes remaining in one length-prefixed socket frame after short writes.
+//! Boundaries of length-prefixed frames across partial socket reads and writes.
 
 use vstd::prelude::*;
 
@@ -10,7 +10,7 @@ pub(super) fn body_prefix(body: &[u8]) -> (prefix: Option<[u8; 4]>)
     ensures
         prefix.is_some() == (body.len() <= u32::MAX),
         prefix matches Some(bytes) ==> (
-            bytes[0] as int * 16777216 + bytes[1] as int * 65536
+            bytes[0] as int * 16_777_216 + bytes[1] as int * 65_536
             + bytes[2] as int * 256 + bytes[3] as int == body.len()
         ),
 {
@@ -19,6 +19,42 @@ pub(super) fn body_prefix(body: &[u8]) -> (prefix: Option<[u8; 4]>)
     let upper = n / 256;
     let high = upper / 256;
     Some([(high / 256) as u8, (high % 256) as u8, (upper % 256) as u8, (n % 256) as u8])
+}
+
+/// A complete body borrows the original buffer and carries its consumption boundary.
+pub(super) enum Incoming<'a> {
+    Incomplete,
+    Oversized(u32),
+    Complete { body: &'a [u8], consumed: usize },
+}
+
+pub(super) open spec fn declared(bytes: Seq<u8>) -> int
+    recommends bytes.len() >= 4,
+{
+    bytes[0] as int * 16_777_216 + bytes[1] as int * 65_536
+        + bytes[2] as int * 256 + bytes[3] as int
+}
+
+#[expect(clippy::arithmetic_side_effects, reason = "Verus proves the header fits u32 and the consumed count fits the buffered slice")]
+pub(super) fn incoming(bytes: &[u8], limit: usize) -> (result: Incoming<'_>)
+    ensures
+        match result {
+            Incoming::Incomplete => bytes.len() < 4 || (
+                declared(bytes@) <= limit && bytes.len() < 4 + declared(bytes@)),
+            Incoming::Oversized(n) => bytes.len() >= 4 && n == declared(bytes@) && n > limit,
+            Incoming::Complete { body, consumed } => bytes.len() >= 4
+                && declared(bytes@) <= limit && consumed == 4 + declared(bytes@)
+                && consumed <= bytes.len() && body@ == bytes@.subrange(4, consumed as int),
+        },
+{
+    if bytes.len() < 4 { return Incoming::Incomplete; }
+    let len = u32::from(bytes[0]) * 16_777_216 + u32::from(bytes[1]) * 65_536
+        + u32::from(bytes[2]) * 256 + u32::from(bytes[3]);
+    if len as usize > limit { return Incoming::Oversized(len); }
+    let (_, payload) = bytes.split_at(4);
+    if payload.len() < len as usize { return Incoming::Incomplete; }
+    let (body, _) = payload.split_at(len as usize);
+    Incoming::Complete { body, consumed: 4 + len as usize }
 }
 
 pub(super) struct FrameSegments<'a> {
