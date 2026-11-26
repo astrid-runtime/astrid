@@ -280,7 +280,12 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
         (
             "socket writer binds another connection's queue",
             NATIVE_QUEUE,
-            lambda text: replace_once(text, "    if registered == handshake", "    if true"),
+            lambda text: replace_once(text, "registered.owner != handshake.owner || ", ""),
+        ),
+        (
+            "native writer accepts a replacement registration",
+            NATIVE_QUEUE,
+            lambda text: replace_once(text, "(Some(a), Some(b)) if a == b => Some(handle)", "(Some(_), Some(_)) => Some(handle)"),
         ),
         (
             "native FIFO delivers the newest event first",

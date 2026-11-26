@@ -563,7 +563,11 @@ async fn serve_connection(
 ) {
     let services = services.into();
     let principal = identity.principal.to_string();
-    let Some(egress) = receiver.egress_queue(identity.request_owner) else {
+    let Some(egress) = receiver.egress_queue(
+        identity.request_owner,
+        identity.principal.as_str(),
+        identity.device_stamp(),
+    ) else {
         tracing::error!(security_event = true, %principal, "socket handshake owner does not match the registered delivery queue");
         return;
     };

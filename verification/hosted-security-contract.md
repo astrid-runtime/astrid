@@ -231,10 +231,11 @@ the correlation for an unbound turn. A subsequent ownerless terminal frame
 must match both captured values. An explicitly foreign owner cannot use that
 exception. The registry and turn locks supply the active turn.
 
-Before serving the accepted socket, the native connection handler compares
-its handshake owner with the owner registered on the queue. The checked
-binding function returns the supplied handle exactly when the full owner IDs
-match. The normal writer and shutdown drain use this handle. The checked
+Before serving the accepted socket, the handler compares its authenticated
+owner, principal, fingerprint and registration with the fields on the egress
+queue itself. The checked binding function returns that exact queue handle
+only for matching identities. A registration without a fingerprint is
+rejected. The normal writer and shutdown drain use this handle. The checked
 FIFO appends the actual event, returns the oldest retained event, and counts
 the sum of the charges supplied with all retained events. Slot exhaustion,
 byte overflow or a reply-record conflict closes and empties the queue.

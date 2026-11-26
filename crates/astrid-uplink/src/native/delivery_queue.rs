@@ -5,11 +5,41 @@ use vstd::prelude::*;
 
 verus! {
 
-/// Release this queue handle only to the socket whose handshake minted its owner.
-pub(super) fn bind_writer<T>(registered: u128, handshake: u128, handle: T) -> (bound: Option<T>)
-    ensures bound == if registered == handshake { Some(handle) } else { None },
+#[derive(Clone, Copy)]
+pub(super) struct Writer<'a> {
+    pub owner: u128,
+    pub principal: &'a str,
+    pub fingerprint: Option<&'a str>,
+    pub registration: Option<u128>,
+}
+
+impl Writer<'_> {
+    pub(super) open spec fn matches(&self, peer: &Writer<'_>) -> bool {
+        self.owner == peer.owner && self.principal@ == peer.principal@
+            && self.registration == peer.registration
+            && match (self.fingerprint, peer.fingerprint) {
+                (Some(a), Some(b)) => a@ == b@,
+                (None, None) => self.registration.is_none(),
+                _ => false,
+            }
+    }
+}
+
+/// Release this exact queue handle to its authenticated socket writer.
+pub(super) fn bind_writer<T>(registered: Writer<'_>, handshake: Writer<'_>, handle: T) -> (bound: Option<T>)
+    ensures bound == if registered.matches(&handshake) { Some(handle) } else { None },
 {
-    if registered == handshake { Some(handle) } else { None }
+    if registered.owner != handshake.owner || registered.principal != handshake.principal { return None; }
+    match (registered.fingerprint, handshake.fingerprint) {
+        (Some(a), Some(b)) if a == b => {},
+        (None, None) if registered.registration.is_none() => {},
+        _ => return None,
+    }
+    match (registered.registration, handshake.registration) {
+        (Some(a), Some(b)) if a == b => Some(handle),
+        (None, None) => Some(handle),
+        _ => None,
+    }
 }
 
 pub(super) struct DeliveryQueue<T> {

@@ -84,6 +84,8 @@ impl ReplyKey {
 }
 
 pub(super) struct EgressQueue {
+    principal: String,
+    device: astrid_events::ipc::OwnedDeviceStamp,
     owner: RequestOwnerId,
     state: Mutex<QueueState>,
     ready: tokio::sync::Notify,
@@ -126,9 +128,6 @@ pub(super) enum TryRecvError {
 }
 
 struct ClientQueue {
-    principal: String,
-    device: astrid_events::ipc::OwnedDeviceStamp,
-    request_owner: RequestOwnerId,
     session: Arc<RwLock<Option<ActiveTurn>>>,
     queue: Arc<EgressQueue>,
 }
@@ -157,7 +156,7 @@ impl ClientQueue {
                 )
             });
         }
-        request_owner_allows(message, self.request_owner)
+        request_owner_allows(message, self.queue.owner)
             || session
                 .as_ref()
                 .is_some_and(|turn| request_owner_allows(message, turn.request_owner))
@@ -177,7 +176,6 @@ pub(super) struct Registry {
 pub(super) struct Subscription {
     id: uuid::Uuid,
     registry: Weak<Registry>,
-    principal: String,
     session: Arc<RwLock<Option<ActiveTurn>>>,
     queue: Arc<EgressQueue>,
 }
@@ -270,8 +268,8 @@ impl Registry {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if !routing::should_deliver(
                     message,
-                    &client.principal,
-                    client.device.as_stamp(),
+                    &client.queue.principal,
+                    client.queue.device.as_stamp(),
                     session.as_ref().map(|turn| turn.session_id.as_str()),
                 ) {
                     continue;
@@ -288,7 +286,7 @@ impl Registry {
                 // Legacy kernel elicitation has principal authority but
                 // no invocation owner. Bind its delivered copy to this
                 // authenticated connection, never to an unrelated chat.
-                let mut delivered = connection_owned_elicitation(&event, client.request_owner);
+                let mut delivered = connection_owned_elicitation(&event, client.queue.owner);
                 if turn_key.is_some()
                     && message.request_owner.is_none()
                     && let AstridEvent::Ipc { message, .. } = Arc::make_mut(&mut delivered)
@@ -340,16 +338,13 @@ impl Registry {
     ) -> Subscription {
         let id = uuid::Uuid::new_v4();
         let session = Arc::new(RwLock::new(None));
-        let queue = Arc::new(EgressQueue::new(request_owner));
+        let queue = Arc::new(EgressQueue::new(principal, device, request_owner));
         self.clients
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(
                 id,
                 ClientQueue {
-                    principal: principal.clone(),
-                    device: device.into(),
-                    request_owner,
                     session: Arc::clone(&session),
                     queue: Arc::clone(&queue),
                 },
@@ -357,7 +352,6 @@ impl Registry {
         Subscription {
             id,
             registry: Arc::downgrade(self),
-            principal,
             session,
             queue,
         }
@@ -469,10 +463,31 @@ impl Subscription {
         }
     }
 
-    pub(super) fn egress_queue(&self, handshake_owner: RequestOwnerId) -> Option<Arc<EgressQueue>> {
+    pub(super) fn egress_queue(
+        &self,
+        owner: RequestOwnerId,
+        principal: &str,
+        device: DeviceStamp<'_>,
+    ) -> Option<Arc<EgressQueue>> {
+        fn writer<'a>(
+            owner: RequestOwnerId,
+            principal: &'a str,
+            device: DeviceStamp<'a>,
+        ) -> super::delivery_queue::Writer<'a> {
+            super::delivery_queue::Writer {
+                owner: owner.as_u128(),
+                principal,
+                fingerprint: device.fingerprint,
+                registration: device.registration.map(|id| id.as_u128()),
+            }
+        }
         super::delivery_queue::bind_writer(
-            self.queue.owner.as_u128(),
-            handshake_owner.as_u128(),
+            writer(
+                self.queue.owner,
+                &self.queue.principal,
+                self.queue.device.as_stamp(),
+            ),
+            writer(owner, principal, device),
             &self.queue,
         )
         .map(Arc::clone)
@@ -492,7 +507,7 @@ impl Subscription {
             .active_turns
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry((self.principal.clone(), session.to_owned()))
+            .entry((self.queue.principal.clone(), session.to_owned()))
         {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(self.id);
@@ -537,7 +552,7 @@ impl Subscription {
                 .active_turns
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let key = (self.principal.clone(), turn.session_id);
+            let key = (self.queue.principal.clone(), turn.session_id);
             if active.get(&key) == Some(&self.id) {
                 active.remove(&key);
             }
@@ -564,8 +579,10 @@ impl Subscription {
 }
 
 impl EgressQueue {
-    fn new(owner: RequestOwnerId) -> Self {
+    fn new(principal: String, device: DeviceStamp<'_>, owner: RequestOwnerId) -> Self {
         Self {
+            principal,
+            device: device.into(),
             owner,
             state: Mutex::new(QueueState::default()),
             ready: tokio::sync::Notify::new(),
@@ -697,7 +714,7 @@ impl Drop for Subscription {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.id);
         if let Some(session) = self.session() {
-            let key = (self.principal.clone(), session);
+            let key = (self.queue.principal.clone(), session);
             let mut active = registry
                 .active_turns
                 .lock()

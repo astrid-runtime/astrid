@@ -26,7 +26,11 @@ fn terminal_failure_is_delivered_only_to_its_captured_owner() {
 
 #[test]
 fn unanswered_human_requests_have_a_bounded_lifetime_on_the_connection() {
-    let queue = EgressQueue::new(RequestOwnerId::generate());
+    let queue = EgressQueue::new(
+        "alice".into(),
+        DeviceStamp::default(),
+        RequestOwnerId::generate(),
+    );
     let owner = RequestOwnerId::generate();
     for index in 0..=CLIENT_EGRESS_CAPACITY {
         queue.enqueue(
@@ -71,7 +75,11 @@ fn event() -> Arc<AstridEvent> {
 
 #[tokio::test]
 async fn byte_budget_fail_closes_and_releases_retained_events() {
-    let queue = EgressQueue::new(RequestOwnerId::generate());
+    let queue = EgressQueue::new(
+        "alice".into(),
+        DeviceStamp::default(),
+        RequestOwnerId::generate(),
+    );
     queue.enqueue(event(), CLIENT_EGRESS_BYTE_BUDGET);
     queue.enqueue(event(), 1);
 
@@ -296,11 +304,23 @@ fn socket_writer_requires_the_registered_connection_owner() {
     let other = RequestOwnerId::generate();
     let first = registry.subscribe_principal("alice".into(), owner);
     let second = registry.subscribe_principal("alice".into(), other);
-    assert!(first.egress_queue(other).is_none());
-    assert!(second.egress_queue(owner).is_none());
+    assert!(
+        first
+            .egress_queue(other, "alice", DeviceStamp::default())
+            .is_none()
+    );
+    assert!(
+        second
+            .egress_queue(owner, "alice", DeviceStamp::default())
+            .is_none()
+    );
     assert!(!Arc::ptr_eq(
-        &first.egress_queue(owner).unwrap(),
-        &second.egress_queue(other).unwrap()
+        &first
+            .egress_queue(owner, "alice", DeviceStamp::default())
+            .unwrap(),
+        &second
+            .egress_queue(other, "alice", DeviceStamp::default())
+            .unwrap()
     ));
 }
 
@@ -338,4 +358,38 @@ fn queued_management_reply_selects_the_authenticated_registration() {
             }
         }
     }
+}
+
+#[test]
+fn writer_binds_principal_and_registration_even_if_owner_is_reused() {
+    let bus = Arc::new(EventBus::new());
+    let registry = Registry::install(&bus);
+    let owner = RequestOwnerId::generate();
+    let stamp = DeviceStamp {
+        fingerprint: Some("paired"),
+        registration: Some(uuid::Uuid::new_v4()),
+    };
+    let queue = registry.subscribe("alice".into(), stamp, owner);
+    assert!(queue.egress_queue(owner, "bob", stamp).is_none());
+    for other in [
+        DeviceStamp {
+            registration: None,
+            ..stamp
+        },
+        DeviceStamp {
+            registration: Some(uuid::Uuid::new_v4()),
+            ..stamp
+        },
+        DeviceStamp {
+            fingerprint: Some("other"),
+            ..stamp
+        },
+        DeviceStamp {
+            fingerprint: None,
+            ..stamp
+        },
+    ] {
+        assert!(queue.egress_queue(owner, "alice", other).is_none());
+    }
+    assert!(queue.egress_queue(owner, "alice", stamp).is_some());
 }
