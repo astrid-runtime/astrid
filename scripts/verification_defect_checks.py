@@ -337,6 +337,21 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             lambda text: replace_once(text, "Some(end) => WriteRange::End(end)", "Some(end) => WriteRange::End(length)"),
         ),
         (
+            "logical home gate selects a workspace destination",
+            MOUNT,
+            lambda text: replace_once(text, '("home://", VfsTarget::Home)', '("home://", VfsTarget::Workspace)'),
+        ),
+        (
+            "logical capability gate omits the destination suffix",
+            MOUNT,
+            lambda text: replace_once(text, "gate.push_str(relative);", 'gate.push_str("");'),
+        ),
+        (
+            "logical storage operation drops the admitted relative path",
+            MOUNT,
+            lambda text: replace_once(text, "(gate, relative, target)", '(gate, "", target)'),
+        ),
+        (
             "mount selection discards the invocation override",
             MOUNT,
             lambda text: replace_once(text, "Some(value) => Some(value), None => runtime", "Some(_) => runtime, None => runtime"),

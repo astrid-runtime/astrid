@@ -18,6 +18,29 @@ pub(super) enum VfsTarget {
     Tmp,
 }
 
+/// Storage-backed roots whose capability spelling and VFS destination must agree.
+#[derive(Clone, Copy)]
+pub(super) enum LogicalRoot { Home, Workspace }
+
+impl LogicalRoot {
+    pub(super) fn bind_path(self, relative: &str) -> (bound: (String, &str, VfsTarget))
+        ensures
+            bound.1@ == relative@,
+            match self {
+                Self::Home => bound.0@ == "home://"@ + relative@ && bound.2 == VfsTarget::Home,
+                Self::Workspace => bound.0@ == "workspace://"@ + relative@ && bound.2 == VfsTarget::Workspace,
+            },
+    {
+        let (scheme, target) = match self {
+            Self::Home => ("home://", VfsTarget::Home),
+            Self::Workspace => ("workspace://", VfsTarget::Workspace),
+        };
+        let mut gate = scheme.to_owned();
+        gate.push_str(relative);
+        (gate, relative, target)
+    }
+}
+
 impl VfsTarget {
     /// Return the selected mount with the same admitted relative path.
     #[expect(clippy::manual_map, reason = "The explicit match lets Verus track the original mount and path through both branches")]

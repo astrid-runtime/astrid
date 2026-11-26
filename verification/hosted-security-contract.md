@@ -541,3 +541,15 @@ Native stdio MCP capsules requesting network domains or outbound TCP destination
 The current verifier entry point imports production modules directly alongside an abstract model of grant and principal authority. Their contracts cover fuel arithmetic, per-principal operation tracking, static pattern matching and containment, token status transitions, the startup marker fold, guest owner selection, KV address encoding, and overlay lookup and update. The model's theorems state what every trace of the grant, tracker and fuel transitions preserves, conditional on the stated storage, settlement and lifecycle obligations: an acknowledged revocation keeps the grant revoked across recovery and an acknowledged consumption keeps it used, a revocation keeps the grant revoked until the next recovery whether or not its write completed, retirement keeps the principal closed until a resume, and committed fuel exceeds the budget only by the fuel charged beyond a promise. Its `apply_*` and `fuel_*` functions show that the production transitions compute the model's steps. The hosted backend regression exercises abrupt exit and reopening. Complete mediation of hosted effects and concurrent runtime refinement remain open.
 
 The hosted security argument must state its assumptions about the OS, hardware, Wasmtime, cryptography, persistent storage, compiler and verifier. Release evidence must identify the source, build configuration, binary digest and proof result. Evidence about an installed instance must also identify the running binary and security-relevant configuration through a measurement mechanism whose trust assumptions are disclosed.
+
+
+### Logical filesystem authorization paths
+
+For a storage-backed home or workspace, the filesystem host passes the validated
+relative path to `LogicalRoot::bind_path`. Its checked result couples the gate
+string, the relative path and the mount selector. The home case prepends
+`home://` and selects the home mount. The workspace case prepends
+`workspace://` and selects the workspace mount. Both preserve the entire
+relative path, including an empty root path. The adapter converts the returned
+suffix to a platform path. Native path resolution, platform path conversion,
+profile matching and backend publication remain separate obligations.

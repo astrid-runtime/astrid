@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use crate::engine::wasm::host_state::HostState;
-use crate::engine::wasm::mount_selection::VfsTarget;
+use crate::engine::wasm::mount_selection::{LogicalRoot, VfsTarget};
 
 /// URI scheme prefix for the principal's home directory.
 pub(super) const HOME_SCHEME: &str = "home://";
@@ -17,7 +17,8 @@ pub(super) const HOME_SCHEME: &str = "home://";
 /// URI scheme prefix for the daemon's current working directory.
 pub(super) const CWD_SCHEME: &str = "cwd://";
 /// Logical scheme used for the path-free canonical Astrid workspace.
-pub(super) const WORKSPACE_SCHEME: &str = "workspace://";
+#[cfg(test)]
+const WORKSPACE_SCHEME: &str = "workspace://";
 
 /// Path prefix that maps to the principal's tmp directory.
 pub(super) const TMP_PREFIX: &str = "/tmp/";
@@ -157,17 +158,7 @@ pub(super) fn resolve_path(state: &HostState, raw_path: &str) -> Result<Resolved
         ) {
             let path = astrid_storage::FilesystemPath::new(stripped.to_owned())
                 .map_err(|error| error.to_string())?;
-            let gate_path = if path.as_str().is_empty() {
-                HOME_SCHEME.to_owned()
-            } else {
-                format!("{HOME_SCHEME}{}", path.as_str())
-            };
-            return Ok(ResolvedPath {
-                gate_path,
-                physical: None,
-                relative: PathBuf::from(path.as_str()),
-                target: VfsTarget::Home,
-            });
+            return Ok(logical_path(LogicalRoot::Home, &path));
         }
         let crate::engine::wasm::host_state::PrincipalMountLocation::Native(root) = &home.location
         else {
@@ -244,17 +235,17 @@ fn resolve_logical_workspace(raw_path: &str) -> Result<ResolvedPath, String> {
         .collect::<Vec<_>>()
         .join("/");
     let path = astrid_storage::FilesystemPath::new(relative).map_err(|error| error.to_string())?;
-    let gate_path = if path.as_str().is_empty() {
-        WORKSPACE_SCHEME.to_owned()
-    } else {
-        format!("{WORKSPACE_SCHEME}{}", path.as_str())
-    };
-    Ok(ResolvedPath {
+    Ok(logical_path(LogicalRoot::Workspace, &path))
+}
+
+fn logical_path(root: LogicalRoot, path: &astrid_storage::FilesystemPath) -> ResolvedPath {
+    let (gate_path, relative, target) = root.bind_path(path.as_str());
+    ResolvedPath {
         gate_path,
         physical: None,
-        relative: PathBuf::from(path.as_str()),
-        target: VfsTarget::Workspace,
-    })
+        relative: PathBuf::from(relative),
+        target,
+    }
 }
 
 /// Phase 2: pick the VFS instance + capability handle for `resolved`.
