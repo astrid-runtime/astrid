@@ -207,6 +207,10 @@ impl RouteEntry {
         }
     }
 
+    pub(super) fn gate(&self) -> &RouteAdmissionGate {
+        &self.gate
+    }
+
     pub(crate) fn with_receipt_publisher(mut self, publisher: Uuid) -> Self {
         self.receipt_publisher = Some(publisher);
         self
@@ -231,16 +235,17 @@ impl RouteEntry {
     ///
     /// [`dispatch_to_routes`]: crate::bus::EventBus
     pub(crate) fn accepts(&self, publisher: &PrincipalKey) -> bool {
+        use super::scope::Scope;
         if !self.gate.is_published() {
             return false;
         }
-        match &self.scope {
-            RouteAdmission::All => true,
-            RouteAdmission::Exact(expected) => expected == publisher,
-            RouteAdmission::PrincipalOrSystem(expected) => {
-                publisher.as_ref().is_none_or(|actual| actual == expected)
-            },
-        }
+        let scope = match &self.scope {
+            RouteAdmission::All => Scope::All,
+            RouteAdmission::Exact(None) => Scope::System,
+            RouteAdmission::Exact(Some(owner)) => Scope::Principal(owner.as_bytes()),
+            RouteAdmission::PrincipalOrSystem(owner) => Scope::PrincipalOrSystem(owner.as_bytes()),
+        };
+        scope.accepts(publisher.as_deref().map(str::as_bytes))
     }
 
     pub(crate) fn accepts_event(&self, publisher: &PrincipalKey, event: &AstridEvent) -> bool {

@@ -41,3 +41,9 @@ mod runtime_generation;
 
 #[path = "../crates/astrid-capsule/src/registry/view_owner.rs"]
 mod view_owner;
+
+#[path = "../crates/astrid-events/src/route/gate/state.rs"]
+mod route_gate;
+
+#[path = "../crates/astrid-events/src/route/scope.rs"]
+mod route_scope;

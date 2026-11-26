@@ -678,6 +678,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "vstd",
  "web-time",
 ]
 

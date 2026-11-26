@@ -98,3 +98,58 @@ fn staged_route_cannot_acquire_a_prepublication_snapshot() {
     bus.publish((*event).clone());
     assert_eq!(receiver.try_drain(MAX_SUBSCRIPTION_BUDGET_BYTES).len(), 1);
 }
+
+#[tokio::test]
+async fn retired_receiver_with_buffered_events_cannot_deliver_or_park() {
+    let bus = EventBus::new();
+    let gate = RouteAdmissionGate::published();
+    let mut receiver = bus.subscribe_topic_routed_scoped_gated(
+        Uuid::new_v4(),
+        "scale.*",
+        "retiring",
+        "test",
+        Some(Some("alice".into())),
+        gate.clone(),
+    );
+    for _ in 0..3 {
+        bus.publish((*event()).clone());
+    }
+    assert!(receiver.total_bytes() > 0);
+    gate.retire();
+    assert!(receiver.try_recv_one().is_none());
+    assert!(receiver.try_drain(MAX_SUBSCRIPTION_BUDGET_BYTES).is_empty());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), receiver.recv(None))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn waiting_receiver_finishes_when_its_runtime_retires() {
+    let bus = EventBus::new();
+    let gate = RouteAdmissionGate::staged();
+    let mut receiver = bus.subscribe_topic_routed_scoped_gated(
+        Uuid::new_v4(),
+        "scale.*",
+        "waiting",
+        "test",
+        Some(Some("alice".into())),
+        gate.clone(),
+    );
+    let receive = receiver.recv(None);
+    tokio::pin!(receive);
+    tokio::select! {
+        biased;
+        _ = &mut receive => panic!("empty staged receiver must wait"),
+        () = std::future::ready(()) => {},
+    }
+    gate.retire();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), receive)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

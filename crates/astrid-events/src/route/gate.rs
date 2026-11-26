@@ -3,12 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-#[repr(u8)]
-enum AdmissionState {
-    Staged,
-    Published,
-    Retired,
-}
+mod state;
 
 /// Admission gate shared by every routed subscription owned by one runtime.
 ///
@@ -34,7 +29,7 @@ impl RouteAdmissionGate {
     #[must_use]
     pub fn published() -> Self {
         Self {
-            state: Arc::new(AtomicU8::new(AdmissionState::Published as u8)),
+            state: Arc::new(AtomicU8::new(state::PUBLISHED)),
             commit: Arc::new(parking_lot::Mutex::new(())),
             retired: Arc::new(tokio::sync::Notify::new()),
         }
@@ -44,7 +39,7 @@ impl RouteAdmissionGate {
     #[must_use]
     pub fn staged() -> Self {
         Self {
-            state: Arc::new(AtomicU8::new(AdmissionState::Staged as u8)),
+            state: Arc::new(AtomicU8::new(state::STAGED)),
             commit: Arc::new(parking_lot::Mutex::new(())),
             retired: Arc::new(tokio::sync::Notify::new()),
         }
@@ -53,24 +48,26 @@ impl RouteAdmissionGate {
     /// Atomically admit future matching events on every route sharing this gate.
     pub fn publish(&self) {
         let _guard = self.commit.lock();
-        if self.state.load(Ordering::Acquire) != AdmissionState::Retired as u8 {
-            self.state
-                .store(AdmissionState::Published as u8, Ordering::Release);
-        }
+        let current = self.state.load(Ordering::Acquire);
+        self.state.store(state::publish(current), Ordering::Release);
     }
 
     /// Atomically reject all future events for a retiring runtime.
     pub fn retire(&self) {
         let _guard = self.commit.lock();
-        self.state
-            .store(AdmissionState::Retired as u8, Ordering::Release);
+        self.state.store(state::RETIRED, Ordering::Release);
         self.retired.notify_waiters();
     }
 
     /// Whether this runtime's routes currently admit external events.
     #[must_use]
     pub fn is_published(&self) -> bool {
-        self.state.load(Ordering::Acquire) == AdmissionState::Published as u8
+        state::admits(self.state.load(Ordering::Acquire))
+    }
+
+    /// Linearize delivery after extracting the payload from its private queue.
+    pub(super) fn release<T>(&self, pending: T) -> Option<T> {
+        state::release(self.state.load(Ordering::Acquire), pending)
     }
 
     /// Wait for permanent retirement, including retirement before registration.
@@ -81,7 +78,7 @@ impl RouteAdmissionGate {
             let notified = self.retired.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self.state.load(Ordering::Acquire) == AdmissionState::Retired as u8 {
+            if self.state.load(Ordering::Acquire) == state::RETIRED {
                 return;
             }
             notified.await;

@@ -34,7 +34,11 @@ BINDING = Path("crates/astrid-storage/src/principal_directory/binding.rs")
 CACHE_ADDRESS = Path("crates/astrid-kernel/src/capsule_materialization/cache_address.rs")
 GENERATION = Path("crates/astrid-capsule/src/registry/generation.rs")
 VIEW_OWNER = Path("crates/astrid-capsule/src/registry/view_owner.rs")
+ROUTE_GATE = Path("crates/astrid-events/src/route/gate/state.rs")
+ROUTE_SCOPE = Path("crates/astrid-events/src/route/scope.rs")
 INPUTS = [
+    ROUTE_SCOPE,
+    ROUTE_GATE,
     VIEW_OWNER,
     GENERATION,
     CACHE_ADDRESS,
@@ -143,6 +147,31 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "shared runtime rejects its separately admitted viewer",
             VIEW_OWNER,
             lambda text: replace_once(text, "else { return true; }", "else { return false; }"),
+        ),
+        (
+            "publication reopens retired gates",
+            ROUTE_GATE,
+            lambda text: replace_once(text, "_ => RETIRED", "_ => PUBLISHED"),
+        ),
+        (
+            "route admission accepts staged gates",
+            ROUTE_GATE,
+            lambda text: replace_once(text, "    current == PUBLISHED\n", "    current != RETIRED\n"),
+        ),
+        (
+            "retired receiver releases its buffered payload",
+            ROUTE_GATE,
+            lambda text: replace_once(text, "if admits(current) { Some(pending)", "if true { Some(pending)"),
+        ),
+        (
+            "scoped IPC route accepts foreign publisher bytes",
+            ROUTE_SCOPE,
+            lambda text: replace_once(text, "if *owner != actual", "if false"),
+        ),
+        (
+            "principal-only IPC route admits system events",
+            ROUTE_SCOPE,
+            lambda text: replace_once(text, "Scope::System | Scope::PrincipalOrSystem(_), None", "Scope::System | Scope::PrincipalOrSystem(_) | Scope::Principal(_), None"),
         ),
         (
             "registry reuses the same generation",

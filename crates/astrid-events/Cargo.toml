@@ -9,6 +9,7 @@ rust-version.workspace = true
 description = "Event bus for Astrid secure agent runtime"
 
 [dependencies]
+vstd = { workspace = true }
 astrid-runtime = { workspace = true }
 web-time = "1.1.0"
 astrid-types = { workspace = true }

@@ -54,6 +54,7 @@ pub(crate) mod entry;
 mod gate;
 pub(crate) mod matcher;
 pub(crate) mod receiver;
+mod scope;
 mod state;
 
 pub(crate) use entry::RouteEntry;

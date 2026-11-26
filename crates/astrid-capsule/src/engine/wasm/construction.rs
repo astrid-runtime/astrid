@@ -106,7 +106,7 @@ version = "0.0.1"
         )
         .unwrap();
         let manifest = Arc::new(manifest);
-        let capsule = CompositeCapsule::new(Arc::clone(&manifest)).unwrap();
+        let capsule = CompositeCapsule::new(Arc::clone(&manifest), false).unwrap();
         let engine = WasmEngine::new_shared(
             Arc::clone(&manifest),
             PathBuf::new(),

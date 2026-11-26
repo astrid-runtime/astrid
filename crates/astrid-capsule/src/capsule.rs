@@ -264,11 +264,15 @@ pub(crate) struct CompositeCapsule {
     engines: Vec<Box<dyn crate::engine::ExecutionEngine>>,
     capsule_dir: Option<PathBuf>,
     delivery_gate: astrid_events::RouteAdmissionGate,
+    defer_publication: bool,
 }
 
 impl CompositeCapsule {
     /// Create a new, empty Composite Capsule from a manifest.
-    pub(crate) fn new(manifest: impl Into<Arc<CapsuleManifest>>) -> CapsuleResult<Self> {
+    pub(crate) fn new(
+        manifest: impl Into<Arc<CapsuleManifest>>,
+        defer_publication: bool,
+    ) -> CapsuleResult<Self> {
         let manifest = manifest.into();
         let id = CapsuleId::new(manifest.package.name.clone())?;
         Ok(Self {
@@ -277,7 +281,12 @@ impl CompositeCapsule {
             state: CapsuleState::Unloaded,
             engines: Vec::new(),
             capsule_dir: None,
-            delivery_gate: astrid_events::RouteAdmissionGate::published(),
+            delivery_gate: if defer_publication {
+                astrid_events::RouteAdmissionGate::staged()
+            } else {
+                astrid_events::RouteAdmissionGate::published()
+            },
+            defer_publication,
         })
     }
 
@@ -333,7 +342,9 @@ impl Capsule for CompositeCapsule {
             }
         }
         self.state = CapsuleState::Ready;
-        self.delivery_gate.publish();
+        if !self.defer_publication {
+            self.delivery_gate.publish();
+        }
         Ok(())
     }
 
@@ -574,7 +585,7 @@ mod tests {
 
     #[test]
     fn composite_check_health_all_healthy() {
-        let mut capsule = CompositeCapsule::new(test_manifest()).unwrap();
+        let mut capsule = CompositeCapsule::new(test_manifest(), false).unwrap();
         capsule.state = CapsuleState::Ready;
         capsule.add_engine(Box::new(HealthyEngine));
         capsule.add_engine(Box::new(HealthyEngine));
@@ -583,13 +594,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deferred_delivery_waits_for_publication_on_each_load() {
+        let kv = astrid_storage::ScopedKvStore::new(
+            Arc::new(astrid_storage::MemoryKvStore::new()),
+            "deferred-delivery",
+        )
+        .unwrap();
+        let ctx = CapsuleContext::new(
+            astrid_core::PrincipalId::default(),
+            PathBuf::new(),
+            None,
+            kv,
+            Arc::new(astrid_events::EventBus::new()),
+            None,
+        );
+        let mut capsule = CompositeCapsule::new(test_manifest(), true).unwrap();
+        let mut previous = capsule.delivery_admission_gate().unwrap();
+        assert!(previous.commit_guard().is_none());
+        for _ in 0..2 {
+            capsule.load(&ctx).await.unwrap();
+            capsule.activate().await.unwrap();
+            let current = capsule.delivery_admission_gate().unwrap();
+            assert!(current.commit_guard().is_none());
+            previous.publish();
+            assert!(previous.commit_guard().is_none());
+            capsule.publish();
+            assert!(current.commit_guard().is_some());
+            previous = current;
+        }
+    }
+
+    #[tokio::test]
     async fn composite_retirement_and_unload_close_delivery_admission() {
-        let capsule = CompositeCapsule::new(test_manifest()).unwrap();
+        let capsule = CompositeCapsule::new(test_manifest(), false).unwrap();
         let gate = capsule.delivery_admission_gate().unwrap();
         assert!(gate.commit_guard().is_some());
         capsule.retire();
         assert!(gate.commit_guard().is_none());
-        let mut direct_unload = CompositeCapsule::new(test_manifest()).unwrap();
+        let mut direct_unload = CompositeCapsule::new(test_manifest(), false).unwrap();
         let unload_gate = direct_unload.delivery_admission_gate().unwrap();
         direct_unload.unload().await.unwrap();
         assert!(unload_gate.commit_guard().is_none());
@@ -597,7 +639,7 @@ mod tests {
 
     #[test]
     fn composite_check_health_returns_first_failure() {
-        let mut capsule = CompositeCapsule::new(test_manifest()).unwrap();
+        let mut capsule = CompositeCapsule::new(test_manifest(), false).unwrap();
         capsule.state = CapsuleState::Ready;
         capsule.add_engine(Box::new(HealthyEngine));
         capsule.add_engine(Box::new(FailedEngine));
@@ -610,7 +652,7 @@ mod tests {
 
     #[test]
     fn composite_check_health_no_engines_returns_state() {
-        let mut capsule = CompositeCapsule::new(test_manifest()).unwrap();
+        let mut capsule = CompositeCapsule::new(test_manifest(), false).unwrap();
         capsule.state = CapsuleState::Ready;
 
         assert_eq!(capsule.check_health(), CapsuleState::Ready);
@@ -640,7 +682,7 @@ mod tests {
         // With a shared deadline, if the first engine consumes the entire
         // budget, the second engine gets zero time and returns Timeout
         // immediately. This test locks in the shared-deadline contract.
-        let mut capsule = CompositeCapsule::new(test_manifest()).unwrap();
+        let mut capsule = CompositeCapsule::new(test_manifest(), false).unwrap();
         capsule.add_engine(Box::new(SlowEngine));
         capsule.add_engine(Box::new(HealthyEngine));
 
@@ -652,7 +694,7 @@ mod tests {
 
     #[tokio::test]
     async fn composite_wait_ready_all_healthy() {
-        let mut capsule = CompositeCapsule::new(test_manifest()).unwrap();
+        let mut capsule = CompositeCapsule::new(test_manifest(), false).unwrap();
         capsule.add_engine(Box::new(HealthyEngine));
         capsule.add_engine(Box::new(HealthyEngine));
 
