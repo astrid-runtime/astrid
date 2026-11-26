@@ -553,7 +553,7 @@ pub(crate) async fn pair_device_revoke(
     principal: &PrincipalId,
     key_id: &str,
 ) -> AdminResponseBody {
-    let key_id = match DeviceKeyId::new(key_id) {
+    let key_id = match DeviceKeyId::new(key_id.to_owned()) {
         Ok(key_id) => key_id,
         Err(e) => return err_bad_input(e),
     };
@@ -594,6 +594,11 @@ pub(crate) async fn pair_device_revoke(
         return err_internal(format!("profile save failed: {e}"));
     }
     kernel.profile_cache.invalidate(principal);
+    if let Err(error) = kernel.device_sessions.retire(principal, &key_id).await {
+        return err_internal(format!(
+            "device removed but session retirement failed: {error}"
+        ));
+    }
 
     info!(
         principal = %principal,

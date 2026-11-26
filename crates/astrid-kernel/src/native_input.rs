@@ -29,6 +29,12 @@ pub fn native_input_device_is_live(
 }
 
 impl crate::Kernel {
+    /// Registry shared with the daemon's local device authenticator.
+    #[must_use]
+    pub fn device_sessions(&self) -> astrid_core::profile::device_sessions::DeviceSessions {
+        self.device_sessions.clone()
+    }
+
     /// Bind private secret routing before loading boot capsules. This shares
     /// waiter ownership with the native responder; it does not register keys.
     ///
