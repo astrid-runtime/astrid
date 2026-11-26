@@ -23,7 +23,7 @@ fn principal(name: &str) -> PrincipalId {
     PrincipalId::new(name).expect("valid principal")
 }
 
-fn command_fixture() -> (tempfile::TempDir, PrincipalProfileCache) {
+fn provisioned_fixture() -> (tempfile::TempDir, PrincipalProfileCache) {
     let (dir, cache) = fixture();
     for name in ["alice", "bob"] {
         PrincipalProfile::default()
@@ -34,8 +34,8 @@ fn command_fixture() -> (tempfile::TempDir, PrincipalProfileCache) {
 }
 
 #[test]
-fn command_approval_does_not_recreate_deleted_principal() {
-    let (_dir, cache) = command_fixture();
+fn persistent_consent_does_not_recreate_deleted_principal() {
+    let (_dir, cache) = provisioned_fixture();
     let p = principal("alice");
     cache.resolve(&p).expect("prime cache");
     let path = cache.astrid_home.profile_path(&p);
@@ -45,12 +45,13 @@ fn command_approval_does_not_recreate_deleted_principal() {
             .persist_command_always(&p, "git push", Some("/tmp"))
             .is_err()
     );
+    assert!(cache.persist_egress(&p, "react", "localhost:443").is_err());
     assert!(!path.exists(), "approval must not recreate the principal");
 }
 
 #[test]
-fn command_approval_does_not_modify_disabled_principal() {
-    let (_dir, cache) = command_fixture();
+fn persistent_consent_does_not_modify_disabled_principal() {
+    let (_dir, cache) = provisioned_fixture();
     let p = principal("alice");
     let path = cache.astrid_home.profile_path(&p);
     let profile = PrincipalProfile {
@@ -59,6 +60,7 @@ fn command_approval_does_not_modify_disabled_principal() {
     };
     profile.save_to_path(&path).expect("disable test principal");
     let before = fs::read(&path).expect("profile bytes");
+    assert!(cache.persist_egress(&p, "react", "localhost:443").is_err());
     assert!(
         cache
             .persist_command_always(&p, "git push", Some("/tmp"))
@@ -290,6 +292,23 @@ fn concurrent_readers_do_not_race() {
 }
 
 #[test]
+fn replaced_profile_cannot_inherit_a_pending_egress_approval() {
+    let (_dir, cache) = provisioned_fixture();
+    let principal = principal("alice");
+    let captured = cache.resolve(&principal).unwrap();
+    cache.invalidate(&principal);
+    let replacement = cache.resolve(&principal).unwrap();
+    assert_eq!(replacement, captured);
+    assert!(
+        cache
+            .persist_egress_for_profile(&principal, "react", "127.0.0.1:443", Some(&captured))
+            .is_err()
+    );
+    let current = PrincipalProfile::load_required(&cache.astrid_home, &principal).unwrap();
+    assert!(current.network.capsule_egress.is_empty());
+}
+
+#[test]
 fn persist_egress_appends_under_capsule_key_and_invalidates() {
     let (dir, cache) = fixture();
     let p = principal("alice");
@@ -348,7 +367,7 @@ fn persist_egress_is_per_capsule_isolated() {
     // Spec (FIX 1b): a persisted grant for capsule "react" reaching
     // 127.0.0.1:1234 must NOT exempt capsule "openai-compat" reaching the
     // same endpoint for the same principal.
-    let (_dir, cache) = fixture();
+    let (_dir, cache) = provisioned_fixture();
     let p = principal("alice");
     cache
         .persist_egress(&p, "react", "127.0.0.1:1234")
@@ -368,10 +387,9 @@ fn persist_egress_is_per_capsule_isolated() {
 
 #[test]
 fn persist_egress_is_idempotent() {
-    let (_dir, cache) = fixture();
+    let (_dir, cache) = provisioned_fixture();
     let p = principal("bob");
     let stale_load = cache.begin_load(&p);
-    // No file on disk → starts from default (empty capsule_egress).
     cache
         .persist_egress(&p, "react", "10.0.0.5:8080")
         .expect("first persist");
@@ -437,7 +455,7 @@ fn persist_command_always_appends_and_invalidates() {
 
 #[test]
 fn persist_command_always_is_idempotent_for_same_command_and_workspace() {
-    let (_dir, cache) = command_fixture();
+    let (_dir, cache) = provisioned_fixture();
     let p = principal("bob");
     let stale_load = cache.begin_load(&p);
     cache
@@ -458,7 +476,7 @@ fn persist_command_always_is_idempotent_for_same_command_and_workspace() {
 
 #[test]
 fn persist_command_always_isolates_workspace_and_principal() {
-    let (_dir, cache) = command_fixture();
+    let (_dir, cache) = provisioned_fixture();
     let alice = principal("alice");
     let bob = principal("bob");
     cache
@@ -527,7 +545,7 @@ fn persist_command_always_rejects_empty_workspace() {
 
 #[test]
 fn persist_command_always_preserves_workspace_bytes() {
-    let (_dir, cache) = command_fixture();
+    let (_dir, cache) = provisioned_fixture();
     let p = principal("alice");
     cache
         .persist_command_always(&p, "  git push  ", Some(" /tmp "))
@@ -548,7 +566,7 @@ fn persist_command_always_preserves_workspace_bytes() {
 
 #[test]
 fn persist_egress_then_command_always_keeps_both() {
-    let (_dir, cache) = fixture();
+    let (_dir, cache) = provisioned_fixture();
     let p = principal("alice");
     cache
         .persist_egress(&p, "react", "127.0.0.1:1234")
