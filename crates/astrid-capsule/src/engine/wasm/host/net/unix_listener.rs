@@ -20,6 +20,15 @@ use crate::engine::wasm::bindings::astrid::net::host::{
 };
 use crate::engine::wasm::host::util;
 
+/// Authentication reloads device keys from disk under the same root used for
+/// dispatch. Standalone hosts without an injected cache use the process home.
+fn handshake_home(state: &HostState) -> std::io::Result<astrid_core::dirs::AstridHome> {
+    match &state.profile_cache {
+        Some(cache) => Ok(cache.home().clone()),
+        None => astrid_core::dirs::AstridHome::resolve(),
+    }
+}
+
 impl HostUnixListener for HostState {
     fn accept(&mut self, _self_: Resource<UnixListener>) -> Result<Resource<TcpStream>, ErrorCode> {
         if self.capsule_net_stream_count.load(Ordering::Acquire) >= MAX_ACTIVE_STREAMS {
@@ -50,7 +59,7 @@ impl HostUnixListener for HostState {
         // `validate_handshake`, so `None` is fine there.
         let astrid_home = if session_token.is_some() {
             Some(
-                astrid_core::dirs::AstridHome::resolve()
+                handshake_home(self)
                     .map_err(|e| ErrorCode::Unknown(format!("cannot resolve astrid home: {e}")))?,
             )
         } else {
@@ -229,7 +238,7 @@ impl HostUnixListener for HostState {
         let mut verified_identity: Option<(astrid_core::principal::PrincipalId, String)> = None;
         if let Some(ref token) = session_token {
             // See `accept` for why home is resolved here (issue #45/#852).
-            let home = match astrid_core::dirs::AstridHome::resolve() {
+            let home = match handshake_home(self) {
                 Ok(h) => h,
                 Err(e) => {
                     tracing::warn!(

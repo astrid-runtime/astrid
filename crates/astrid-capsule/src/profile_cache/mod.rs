@@ -108,6 +108,11 @@ impl PrincipalProfileCache {
         Ok(profile)
     }
 
+    /// Profile root captured by this kernel, including for uncached authentication.
+    pub(crate) fn home(&self) -> &AstridHome {
+        &self.astrid_home
+    }
+
     /// Resolve the profile for `principal`, populating the cache on first use.
     ///
     /// The first call for a given principal reads

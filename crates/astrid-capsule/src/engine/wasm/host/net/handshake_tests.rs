@@ -190,18 +190,12 @@ async fn handshake_unsigned_returns_no_principal() {
     );
 }
 
-#[tokio::test]
-async fn handshake_signed_returns_verified_principal() {
-    let principal = PrincipalId::new("alice").expect("valid principal");
-    let keypair = astrid_crypto::KeyPair::generate();
-    let (_dir, home) = home_with_registered_key(&principal, &keypair);
-
-    let (mut server, mut client) = tokio::io::duplex(16 * 1024);
-    let tok = token();
-    let tok_hex = tok.to_hex();
-    let server_task =
-        tokio::spawn(async move { validate_handshake(&mut server, &tok, &home).await });
-
+async fn sign_challenge<S: AsyncRead + AsyncWrite + Unpin>(
+    client: &mut S,
+    tok_hex: String,
+    principal: &PrincipalId,
+    keypair: &astrid_crypto::KeyPair,
+) {
     // Frame 1: claim the principal, no signature → expect a challenge back.
     let first = HandshakeRequest {
         token: tok_hex.clone(),
@@ -210,7 +204,7 @@ async fn handshake_signed_returns_verified_principal() {
         claimed_principal: Some(principal.to_string()),
         signature: None,
     };
-    let challenge_resp: HandshakeResponse = client_send_recv(&mut client, &first).await;
+    let challenge_resp: HandshakeResponse = client_send_recv(client, &first).await;
     let nonce_hex = challenge_resp
         .challenge
         .expect("daemon must issue a challenge");
@@ -225,8 +219,70 @@ async fn handshake_signed_returns_verified_principal() {
         claimed_principal: Some(principal.to_string()),
         signature: Some(signature),
     };
-    let final_resp: HandshakeResponse = client_send_recv(&mut client, &second).await;
+    let final_resp: HandshakeResponse = client_send_recv(client, &second).await;
     assert!(final_resp.is_ok(), "signed handshake must succeed");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn socket_accept_and_poll_authenticate_against_the_configured_home() {
+    use crate::engine::wasm::bindings::astrid::net::host::{Host, HostUnixListener};
+    use crate::engine::wasm::test_fixtures::minimal_host_state;
+    use crate::profile_cache::PrincipalProfileCache;
+    use astrid_core::local_transport;
+    use std::sync::Arc;
+
+    let principal = PrincipalId::new("socket-home-test").unwrap();
+    let keypair = astrid_crypto::KeyPair::generate();
+    let (dir, home) = home_with_registered_key(&principal, &keypair);
+    let path = dir.path().join("cli.sock");
+    let listener = local_transport::bind(&path).unwrap();
+    let token = Arc::new(token());
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.profile_cache = Some(Arc::new(PrincipalProfileCache::with_home(home)));
+    state.session_token = Some(token.clone());
+    state.cli_socket_listener = Some(Arc::new(tokio::sync::Mutex::new(listener)));
+
+    for poll in [false, true] {
+        let slot = state.bind_unix().unwrap();
+        let mut client = local_transport::connect(&path).await.unwrap();
+        let cancel = state.effective_cancel_token();
+        let server = tokio::task::spawn_blocking(move || {
+            let stream = if poll {
+                state.poll_accept(slot, 1000).unwrap().unwrap()
+            } else {
+                state.accept(slot).unwrap()
+            };
+            let identity = state.connection_principal(stream.rep());
+            (state, identity)
+        });
+        let guard = cancel.drop_guard();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            sign_challenge(&mut client, token.to_hex(), &principal, &keypair),
+        )
+        .await
+        .unwrap();
+        let identity;
+        (state, identity) = server.await.unwrap();
+        let _ = guard.disarm();
+        assert_eq!(identity.as_ref(), Some(&principal));
+    }
+}
+
+#[tokio::test]
+async fn handshake_signed_returns_verified_principal() {
+    let principal = PrincipalId::new("alice").expect("valid principal");
+    let keypair = astrid_crypto::KeyPair::generate();
+    let (_dir, home) = home_with_registered_key(&principal, &keypair);
+
+    let (mut server, mut client) = tokio::io::duplex(16 * 1024);
+    let tok = token();
+    let tok_hex = tok.to_hex();
+    let server_task =
+        tokio::spawn(async move { validate_handshake(&mut server, &tok, &home).await });
+
+    sign_challenge(&mut client, tok_hex, &principal, &keypair).await;
 
     let verified = server_task.await.unwrap().expect("handshake ok");
     let expected_key_id = full_device(&keypair).key_id;
