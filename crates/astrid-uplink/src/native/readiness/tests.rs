@@ -13,6 +13,7 @@ fn identity() -> AuthenticatedIdentity {
     AuthenticatedIdentity {
         principal: PrincipalId::new("alice").unwrap(),
         device_key_id: Some("verified-key".into()),
+        registration: Some(Uuid::new_v4().to_string().parse().unwrap()),
         request_owner: RequestOwnerId::generate(),
     }
 }
@@ -81,6 +82,10 @@ async fn assert_cold_request_gated(topic: &'static str) {
     };
     assert_eq!(message.principal.as_deref(), Some("alice"));
     assert_eq!(message.device_key_id, identity.device_key_id);
+    assert_eq!(
+        message.device_registration_id,
+        identity.registration.map(Into::into)
+    );
 }
 
 #[tokio::test]

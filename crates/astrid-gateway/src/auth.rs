@@ -100,6 +100,7 @@ impl CallerContext {
     /// interactive replies use the request owner to reach the issuing client.
     pub(crate) fn stamp_ipc(&self, mut message: IpcMessage) -> IpcMessage {
         message.device_key_id.clone_from(&self.device_key_id);
+        message.device_registration_id = self.registration_id.map(Into::into);
         message
             .with_principal(self.principal.to_string())
             .with_request_owner(self.request_owner)
@@ -176,15 +177,44 @@ pub(crate) fn mint_device_bearer(
     let mut unsigned = format!("{p_b64}.{i_b64}.{e_b64}.{k_b64}.{request_owner}");
     let transcript = if let Some(id) = registration {
         let registration = id.to_string();
-        let signed = registration_transcript(&unsigned, &registration);
+        let transcript = registration_transcript(&unsigned, &registration);
         unsigned.push('.');
         unsigned.push_str(&registration);
-        signed
+        transcript
     } else {
         format!("{principal}:{now}:{expires}:{key_id}:{request_owner}")
     };
     let sig = signer.sign(transcript.as_bytes());
     format!("{unsigned}.{}", hex::encode(sig.to_bytes()))
+}
+
+fn decode_device(
+    key: Option<&str>,
+    has_owner: bool,
+    registration: Option<&str>,
+) -> Result<(Option<String>, Option<DeviceRegistrationId>), GatewayError> {
+    let key_id = match key {
+        None => None,
+        Some("~") if has_owner => None,
+        Some(encoded) => {
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded)
+                .map_err(|_| GatewayError::Unauthorized)?;
+            Some(String::from_utf8(bytes).map_err(|_| GatewayError::Unauthorized)?)
+        },
+    };
+    let generation = if let Some(raw) = registration {
+        DeviceKeyId::new(key_id.as_deref().ok_or(GatewayError::Unauthorized)?)
+            .map_err(|_| GatewayError::Unauthorized)?;
+        let id: DeviceRegistrationId = raw.parse().map_err(|_| GatewayError::Unauthorized)?;
+        if id.to_string() != raw {
+            return Err(GatewayError::Unauthorized);
+        }
+        Some(id)
+    } else {
+        None
+    };
+    Ok((key_id, generation))
 }
 
 /// Parse and verify a bearer token. Returns the [`CallerContext`] on
@@ -217,33 +247,11 @@ pub fn verify_bearer(state: &GatewayState, raw: &str) -> Result<CallerContext, G
     let e_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(parts[2])
         .map_err(|_| GatewayError::Unauthorized)?;
-    // The device key_id segment (5-segment form only). Decoded BEFORE the
-    // signature so the signed message can be reconstructed exactly.
-    let device_key_id = match key_id_seg {
-        Some(idx) if owner_seg.is_some() && parts[idx] == "~" => None,
-        Some(idx) => {
-            let k_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(parts[idx])
-                .map_err(|_| GatewayError::Unauthorized)?;
-            let k = std::str::from_utf8(&k_bytes)
-                .map_err(|_| GatewayError::Unauthorized)?
-                .to_string();
-            Some(k)
-        },
-        None => None,
-    };
-    let registration_id = if let Some(idx) = registration_seg {
-        DeviceKeyId::new(device_key_id.as_deref().ok_or(GatewayError::Unauthorized)?)
-            .map_err(|_| GatewayError::Unauthorized)?;
-        let id: DeviceRegistrationId =
-            parts[idx].parse().map_err(|_| GatewayError::Unauthorized)?;
-        if id.to_string() != parts[idx] {
-            return Err(GatewayError::Unauthorized);
-        }
-        Some(id)
-    } else {
-        None
-    };
+    let (device_key_id, registration_id) = decode_device(
+        key_id_seg.map(|idx| parts[idx]),
+        owner_seg.is_some(),
+        registration_seg.map(|idx| parts[idx]),
+    )?;
     let request_owner = owner_seg
         .map(|idx| parts[idx].parse::<RequestOwnerId>())
         .transpose()

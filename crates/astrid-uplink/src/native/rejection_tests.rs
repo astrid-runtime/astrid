@@ -24,6 +24,7 @@ fn identity() -> AuthenticatedIdentity {
     AuthenticatedIdentity {
         principal: PrincipalId::new("alice").expect("principal"),
         device_key_id: None,
+        registration: None,
         request_owner: RequestOwnerId::generate(),
     }
 }

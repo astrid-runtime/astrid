@@ -160,6 +160,11 @@ pub struct IpcMessage {
     /// `DeviceKey` happens at the kernel boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_key_id: Option<String>,
+    /// Persisted registration that authenticated this device, captured at ingress.
+    /// Legacy device registrations have no generation. Host publishers inherit
+    /// the original value when forwarding work or creating a response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_registration_id: Option<Uuid>,
 
     /// Exact authenticated connection that owns this request, if any.
     ///
@@ -226,6 +231,7 @@ impl IpcMessage {
             seq: 0,
             principal: None,
             device_key_id: None,
+            device_registration_id: None,
             request_owner: None,
             origin: MessageOrigin::System,
         }

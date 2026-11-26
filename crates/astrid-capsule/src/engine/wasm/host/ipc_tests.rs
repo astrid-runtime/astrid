@@ -602,14 +602,15 @@ async fn publish_as_unbound_connection_is_stamped_anonymous() {
 /// drops `device_key_id`, so the stamping must be observed on the internal
 /// `IpcMessage` the kernel cap-gate actually reads — subscribe straight on
 /// the bus, not through `IpcHost::subscribe`.
-fn first_device_key_id(
+fn first_device_binding(
     receiver: &mut astrid_events::EventReceiver,
-) -> (Option<String>, Option<String>) {
+) -> (Option<String>, Option<uuid::Uuid>) {
     let event = receiver.try_recv().expect("one published message");
     match &*event {
-        AstridEvent::Ipc { message, .. } => {
-            (message.principal.clone(), message.device_key_id.clone())
-        },
+        AstridEvent::Ipc { message, .. } => (
+            message.device_key_id.clone(),
+            message.device_registration_id,
+        ),
         _ => panic!("expected an Ipc event"),
     }
 }
@@ -664,7 +665,8 @@ async fn publish_as_unbound_stamps_no_device_key_id() {
     .await
     .expect("publish_as should succeed");
 
-    let (_principal, device_key_id) = first_device_key_id(&mut receiver);
+    let (device_key_id, registration) = first_device_binding(&mut receiver);
+    assert_eq!(registration, None);
     assert_eq!(
         device_key_id, None,
         "an unbound connection must not stamp a device key_id"
@@ -686,7 +688,8 @@ async fn self_triggered_publish_stamps_no_device_key_id() {
         .await
         .expect("publish should succeed");
 
-    let (_principal, device_key_id) = first_device_key_id(&mut receiver);
+    let (device_key_id, registration) = first_device_binding(&mut receiver);
+    assert_eq!(registration, None);
     assert_eq!(
         device_key_id, None,
         "a publish without caller context must not borrow forwarding state"
@@ -700,18 +703,20 @@ async fn publish_inherits_device_key_id_from_caller_context() {
     let rt = tokio::runtime::Handle::current();
     let mut state = minimal_host_state(rt);
     state.ipc_publish_patterns = vec!["capsule.v1.*".to_string()];
-    state.caller_context = Some(
-        caller_with_origin(astrid_events::ipc::MessageOrigin::LocalSocket)
-            .with_device_key_id("dev-abc123"),
-    );
+    let generation = uuid::Uuid::new_v4();
+    let mut caller = caller_with_origin(astrid_events::ipc::MessageOrigin::LocalSocket)
+        .with_device_key_id("dev-abc123");
+    caller.device_registration_id = Some(generation);
+    state.caller_context = Some(caller);
 
     let mut receiver = state.event_bus.subscribe_topic("capsule.v1.ping");
     IpcHost::publish(&mut state, "capsule.v1.ping".to_string(), "{}".to_string())
         .await
         .expect("publish should succeed");
 
-    let (_principal, device_key_id) = first_device_key_id(&mut receiver);
+    let (device_key_id, registration) = first_device_binding(&mut receiver);
     assert_eq!(device_key_id.as_deref(), Some("dev-abc123"));
+    assert_eq!(registration, Some(generation));
 }
 
 #[tokio::test]

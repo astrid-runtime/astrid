@@ -607,10 +607,11 @@ async fn device_retirement_drains_wasmtime_socket_and_captured_publication() {
         let registry = state.device_sessions.clone();
         let principal = astrid_core::PrincipalId::new("alice").unwrap();
         let key = DeviceKeyId::new("a".repeat(16)).unwrap();
+        let generation = uuid::Uuid::new_v4();
         let session = registry
             .challenge(principal.clone())
             .unwrap()
-            .bind(key.clone(), None)
+            .bind(key.clone(), Some(generation.to_string().parse().unwrap()))
             .unwrap();
         let (socket, mut peer) = tokio::net::UnixStream::pair().unwrap();
         let mut disconnected = state.event_bus.subscribe_topic("client.v1.disconnect");
@@ -650,6 +651,7 @@ async fn device_retirement_drains_wasmtime_socket_and_captured_publication() {
                 };
                 assert_eq!(message.principal.as_deref(), Some(principal.as_str()));
                 assert_eq!(message.device_key_id.as_deref(), Some(key.as_str()));
+                assert_eq!(message.device_registration_id, Some(generation));
             }
         }
 

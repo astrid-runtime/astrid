@@ -22,6 +22,8 @@ pub struct AuthenticatedIdentity {
     pub principal: PrincipalId,
     /// Fingerprint of the device key that signed the challenge.
     pub device_key_id: Option<String>,
+    /// Registration captured by this socket challenge.
+    pub registration: Option<DeviceRegistrationId>,
     /// Opaque owner unique to this accepted local connection.
     pub request_owner: RequestOwnerId,
 }
@@ -57,6 +59,7 @@ pub async fn authenticate(
         AuthenticatedIdentity {
             principal,
             device_key_id,
+            registration: session.as_ref().and_then(DeviceSession::registration),
             request_owner: RequestOwnerId::generate(),
         },
         session,

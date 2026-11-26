@@ -157,6 +157,7 @@ async fn elicitation_reply_retains_completed_turn_owner() {
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").expect("principal"),
         device_key_id: None,
+        registration: None,
         request_owner: connection_owner,
     };
     assert!(receiver.begin_turn("old-chat"));
@@ -223,6 +224,7 @@ async fn management_approval_reply_preserves_request_owner_during_chat() {
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").expect("principal"),
         device_key_id: None,
+        registration: None,
         request_owner: connection_owner,
     };
     assert!(receiver.begin_turn("chat"));
@@ -294,6 +296,7 @@ async fn legacy_kernel_elicitation_gets_connection_reply_ownership_outside_chat(
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").unwrap(),
         device_key_id: None,
+        registration: None,
         request_owner: astrid_types::ipc::RequestOwnerId::generate(),
     };
     let mut receiver = registry.subscribe("alice".into(), None, identity.request_owner);
@@ -358,6 +361,7 @@ async fn selection_reply_keeps_picker_owner_and_standalone_selection_stays_conne
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").unwrap(),
         device_key_id: None,
+        registration: None,
         request_owner: astrid_types::ipc::RequestOwnerId::generate(),
     };
     let receiver = registry.subscribe("alice".into(), None, identity.request_owner);
@@ -459,6 +463,7 @@ async fn cancel_turn_is_forwarded_only_by_the_active_connection() {
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").expect("valid principal"),
         device_key_id: None,
+        registration: None,
         request_owner: owner_id,
     };
     let mut inbound = bus.subscribe_topic(routing::CHAT_REQUEST_TOPIC);

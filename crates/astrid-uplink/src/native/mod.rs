@@ -344,6 +344,7 @@ async fn publish_trusted_ingress(
         .with_principal(principal)
         .with_request_owner(request_owner);
     trusted.device_key_id.clone_from(&identity.device_key_id);
+    trusted.device_registration_id = identity.registration.map(Into::into);
     trusted.origin = if identity.is_principal_verified() {
         MessageOrigin::LocalSocket
     } else {

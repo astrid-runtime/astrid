@@ -451,7 +451,7 @@ impl GatewayState {
     ) -> Result<crate::bus_admin::BusAdminClient, crate::error::GatewayError> {
         Ok(self
             .admin_client(caller.principal.clone())?
-            .with_device_key_id(caller.device_key_id.clone()))
+            .with_caller_device(caller))
     }
 
     /// Build a bus-direct kernel client bound to an authenticated caller.
@@ -480,7 +480,7 @@ impl GatewayState {
         })?;
         Ok(
             crate::bus_kernel::BusKernelClient::new(bus, caller.principal.clone(), session_id.0)
-                .with_device_key_id(caller.device_key_id.clone()),
+                .with_caller_device(caller),
         )
     }
 }

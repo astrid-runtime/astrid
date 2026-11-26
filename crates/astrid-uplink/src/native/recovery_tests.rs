@@ -37,6 +37,7 @@ async fn native_input_waits_for_capacity_and_cancelled_admission_releases_turn()
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").unwrap(),
         device_key_id: None,
+        registration: None,
         request_owner: RequestOwnerId::generate(),
     };
     let receiver = registry.subscribe("alice".to_owned(), None, identity.request_owner);
@@ -119,6 +120,7 @@ async fn socket_answers_delivered_approval_while_ordinary_input_is_blocked() {
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").unwrap(),
         device_key_id: None,
+        registration: None,
         request_owner: owner,
     };
     let receiver = registry.subscribe("alice".into(), None, owner);
@@ -239,6 +241,7 @@ async fn overlapping_human_replies_claim_once_and_abandoned_wait_allows_retry() 
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").unwrap(),
         device_key_id: None,
+        registration: None,
         request_owner: RequestOwnerId::generate(),
     };
     let receiver = registry.subscribe("alice".into(), None, identity.request_owner);
@@ -366,6 +369,7 @@ async fn buffered_management_inputs_commit_before_the_next_frame_is_admitted() {
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").unwrap(),
         device_key_id: None,
+        registration: None,
         request_owner: RequestOwnerId::generate(),
     };
     let receiver = registry.subscribe("alice".into(), None, identity.request_owner);
@@ -420,6 +424,7 @@ async fn unpolled_busy_prompt_does_not_swallow_cancellation_of_the_existing_turn
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").unwrap(),
         device_key_id: None,
+        registration: None,
         request_owner: RequestOwnerId::generate(),
     };
     let mut receiver = registry.subscribe("alice".into(), None, identity.request_owner);
@@ -510,6 +515,7 @@ async fn pending_socket_admission_drains_egress_and_releases_on_eof_or_shutdown(
         let identity = AuthenticatedIdentity {
             principal: PrincipalId::new("alice").unwrap(),
             device_key_id: None,
+            registration: None,
             request_owner: RequestOwnerId::generate(),
         };
         let owner = identity.request_owner;
@@ -596,6 +602,7 @@ async fn pending_input_cancellation_is_private_and_allows_a_subsequent_turn() {
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").unwrap(),
         device_key_id: None,
+        registration: None,
         request_owner: RequestOwnerId::generate(),
     };
     let receiver = registry.subscribe("alice".into(), None, identity.request_owner);
@@ -696,6 +703,7 @@ async fn cancellation_releases_turn_when_forwarding_consumer_has_closed() {
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").expect("principal"),
         device_key_id: None,
+        registration: None,
         request_owner: RequestOwnerId::generate(),
     };
     let mut receiver = registry.subscribe("alice".to_owned(), None, identity.request_owner);
@@ -762,6 +770,7 @@ async fn cancellation_releases_abandoned_turn_without_capsule_response() {
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").expect("principal"),
         device_key_id: None,
+        registration: None,
         request_owner: RequestOwnerId::generate(),
     };
     let mut receiver = registry.subscribe("alice".to_owned(), None, identity.request_owner);
@@ -843,6 +852,7 @@ async fn cancellation_releases_turn_when_open_consumer_stops_draining() {
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").unwrap(),
         device_key_id: None,
+        registration: None,
         request_owner: RequestOwnerId::generate(),
     };
     let mut receiver = registry.subscribe("alice".into(), None, identity.request_owner);
@@ -908,6 +918,7 @@ async fn active_cancellation_preserves_blocked_management_and_human_reply() {
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").unwrap(),
         device_key_id: None,
+        registration: None,
         request_owner: RequestOwnerId::generate(),
     };
     let mut receiver = registry.subscribe("alice".into(), None, identity.request_owner);
@@ -1006,6 +1017,7 @@ async fn socket_cancels_active_turn_with_both_other_input_slots_blocked() {
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").unwrap(),
         device_key_id: None,
+        registration: None,
         request_owner: RequestOwnerId::generate(),
     };
     let receiver = registry.subscribe("alice".into(), None, identity.request_owner);
@@ -1115,6 +1127,7 @@ async fn ready_cancellation_settles_buffered_prompt_before_management_frame() {
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").unwrap(),
         device_key_id: None,
+        registration: None,
         request_owner: RequestOwnerId::generate(),
     };
     let receiver = registry.subscribe("alice".into(), None, identity.request_owner);
@@ -1181,6 +1194,7 @@ async fn assert_buffered_prompt_after_cancel(extra_frame: bool) {
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").unwrap(),
         device_key_id: None,
+        registration: None,
         request_owner: RequestOwnerId::generate(),
     };
     let receiver = registry.subscribe("alice".into(), None, identity.request_owner);
@@ -1277,6 +1291,7 @@ async fn management_reply_survives_chat_completion() {
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").expect("principal"),
         device_key_id: None,
+        registration: None,
         request_owner: RequestOwnerId::generate(),
     };
     let mut receiver = registry.subscribe("alice".to_owned(), None, identity.request_owner);
@@ -1337,6 +1352,7 @@ async fn late_terminal_from_previous_turn_cannot_complete_next_turn() {
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").expect("principal"),
         device_key_id: None,
+        registration: None,
         request_owner: RequestOwnerId::generate(),
     };
     let mut receiver = registry.subscribe("alice".to_owned(), None, identity.request_owner);

@@ -206,6 +206,11 @@ fn check_subscribe_acl(state: &HostState, topic_pattern: &str) -> Result<(), Err
     Ok(())
 }
 
+struct PublishingDevice<'a> {
+    fingerprint: Option<&'a str>,
+    registration: Option<uuid::Uuid>,
+}
+
 /// Shared publish path used by [`ipc::Host::publish`] and
 /// [`ipc::Host::publish_as`].
 ///
@@ -230,7 +235,7 @@ async fn publish_inner(
     topic: String,
     payload: String,
     principal: astrid_core::PrincipalId,
-    device_key_id: Option<&str>,
+    device: PublishingDevice<'_>,
     request_owner: Option<astrid_events::ipc::RequestOwnerId>,
     origin: astrid_events::ipc::MessageOrigin,
 ) -> Result<(), ErrorCode> {
@@ -317,8 +322,9 @@ async fn publish_inner(
             .with_origin(origin);
     // Stamp the host-derived authenticating-device fingerprint so the kernel
     // cap-gate can apply the device's scope as an attenuation floor.
-    if let Some(id) = device_key_id {
+    if let Some(id) = device.fingerprint {
         message = message.with_device_key_id(id);
+        message.device_registration_id = device.registration;
     }
     if let Some(owner) = request_owner {
         message = message.with_request_owner(owner);
@@ -399,12 +405,19 @@ async fn publish_for_caller(
         .caller_context
         .as_ref()
         .and_then(|message| message.request_owner);
+    let registration = state
+        .caller_context
+        .as_ref()
+        .and_then(|m| m.device_registration_id);
     publish_inner(
         state,
         topic,
         payload,
         principal,
-        device_key_id.as_deref(),
+        PublishingDevice {
+            fingerprint: device_key_id.as_deref(),
+            registration,
+        },
         request_owner,
         origin,
     )
@@ -511,7 +524,10 @@ impl ipc::Host for HostState {
                 topic,
                 payload,
                 effective,
-                device_key_id.as_deref(),
+                PublishingDevice {
+                    fingerprint: device_key_id.as_deref(),
+                    registration: authority.as_ref().and_then(|s| s.registration),
+                },
                 request_owner,
                 origin,
             );

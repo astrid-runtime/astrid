@@ -20,6 +20,7 @@ struct LiveSocket {
 #[derive(Clone, Debug)]
 pub(crate) struct SocketAuthority {
     session: Weak<DeviceSession>,
+    pub(crate) registration: Option<uuid::Uuid>,
     pub(crate) identity: Arc<ConnectionIdentity>,
     _owner: Arc<oneshot::Sender<()>>,
 }
@@ -59,6 +60,7 @@ impl SignedSocket {
             socket: Arc::downgrade(&live),
             authority: SocketAuthority {
                 session: Arc::downgrade(&session),
+                registration: session.registration().map(Into::into),
                 identity: Arc::new(identity),
                 _owner: Arc::new(frame_owner),
             },
