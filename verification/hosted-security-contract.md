@@ -39,7 +39,7 @@ The function and implicit destructor counts below come from the resolved kernel 
 | `astrid:sys/host@1.0.0` | 10 | 0 | `sys.rs` | Account for config and capability disclosure, log writes, readiness, sleep, clock and randomness. |
 | `astrid:uplink/host@1.0.0` | 2 | 0 | `uplink.rs` | Bind registration and queued inbound delivery to the capsule, selected uplink and platform identity. |
 
-Fourteen HTTP, network, IPC and process adapter call sites currently allocate placeholder resources. Their successful allocation returns an always-ready pollable, a closed input stream or a closed output stream. These methods do not attach the returned resource to the underlying transport or process. The accounting and identity of the resource table entry, including allocation failure, remain part of the proof obligation. The file-handle destructor above is distinct from the internal storage-backed file publication described below.
+Fourteen HTTP, network, IPC and process adapter call sites currently allocate placeholder resources. Their successful allocation returns an always-ready pollable, a closed input stream or a closed output stream. These methods do not attach the returned resource to the underlying transport or process. The constructors propagate allocation errors through trappable host imports. A failed pollable subscription releases its partially allocated parent. Resource identity, accounting and guest-visible trap refinement remain proof obligations. The file-handle destructor above is distinct from the internal storage-backed file publication described below.
 
 ## Hosted management IPC inventory
 
@@ -191,8 +191,7 @@ declared strings. A resolve grant permits resolution only. A link grant
 also permits creating or removing links and listing a user's links. An admin
 grant permits all five operations, including user creation. The checked
 decision requires at least one sufficient grant, independent of its position
-in the list. The five current host methods sample invocation authority before waiting for capacity. They acquire no principal tracker guard around the store call. Binding the issuer, platform identity and user ID through the
-capacity wait, storage call and reply remains an implementation obligation.
+in the list. All five host methods acquire the effective principal’s operation guard where its tracker is installed, before waiting for capacity. A WIT user-creation regression holds the backend write, observes principal retirement waiting, then releases the write and checks the stored user and denial at all five imports. A machine-checked connection from the lifecycle guard, caller and device registration to the actual store arguments and reply remains open.
 
 ## Guest key-value storage
 
