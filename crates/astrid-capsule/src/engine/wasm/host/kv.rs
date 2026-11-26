@@ -2,7 +2,8 @@
 //!
 //! Per-(principal, capsule) namespaced key-value store. Reads and writes
 //! are routed to the invoking principal's `ScopedKvStore`, falling back
-//! to the capsule owner's store when no invocation is in scope.
+//! to the runtime load-time store. Principal runtimes use their owner namespace.
+//! The explicit system runtime uses an isolated neutral store.
 
 use crate::engine::wasm::bindings::astrid::kv::host::{self as kv, ErrorCode, KeyPage};
 use crate::engine::wasm::host::util;
@@ -120,18 +121,23 @@ impl HostState {
         name: &str,
         operation: impl AsyncFnOnce(&astrid_storage::ScopedKvStore) -> astrid_storage::StorageResult<T>,
     ) -> Result<T, ErrorCode> {
-        let _guard = self.begin_host_operation().map_err(|()| {
+        let guard = self.begin_host_operation().map_err(|()| {
             ErrorCode::Unknown("principal capsule view is retired or unauthorized".to_string())
         })?;
-        util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
-            // Admit after the host capacity wait and keep the registration
-            // live across the backend future, including a blocking mutation.
-            let _device = self
-                .begin_device_operation()
-                .map_err(|()| ErrorCode::Unknown("device registration unavailable".into()))?;
-            operation(self.effective_kv())
-                .await
-                .map_err(|error| store_err(name, error))
-        })
+        crate::engine::wasm::guest_kv::dispatch(
+            guard,
+            self.effective_kv(),
+            operation,
+            |_owner, store, operation| {
+                util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
+                    let _device = self.begin_device_operation().map_err(|()| {
+                        ErrorCode::Unknown("device registration unavailable".into())
+                    })?;
+                    operation(store)
+                        .await
+                        .map_err(|error| store_err(name, error))
+                })
+            },
+        )
     }
 }

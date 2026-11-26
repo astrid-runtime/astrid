@@ -73,6 +73,7 @@ use compiled::CompiledWasmArtifact;
 pub use compiled::{COMPILED_ENGINE_ABI, CompiledWasmCache};
 #[cfg(test)]
 mod fuel_scheduling_tests;
+mod guest_kv;
 pub mod host;
 pub mod host_state;
 #[cfg(test)]

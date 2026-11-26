@@ -32,7 +32,7 @@ pub(super) fn select(
 ) -> (owner: Option<[u8; 32]>)
     ensures
         owner.is_some() == (admitted@ == requested@ && pinned@ == observed@),
-        owner matches Some(uid) ==> uid@ == pinned@ && uid@ == observed@,
+        owner matches Some(uid) ==> uid == pinned && uid@ == observed@,
 {
     if same_bytes(admitted, requested) && same_bytes(pinned.as_slice(), observed.as_slice()) {
         Some(pinned)

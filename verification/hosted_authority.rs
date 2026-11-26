@@ -1,6 +1,12 @@
 // Verus entry point for transitions used by hosted Astrid.
 
 extern crate self as astrid_core;
+#[path = "../crates/astrid-capsule/src/engine/wasm/guest_kv.rs"]
+mod guest_kv_dispatch;
+#[path = "hosted_kv_model.rs"]
+mod guest_kv_model;
+#[path = "../crates/astrid-capsule/src/security/identity.rs"]
+mod manifest_identity;
 #[path = "../crates/astrid-kernel/src/storage_mount/lease_authority/worker.rs"]
 mod worker;
 #[path = "../crates/astrid-kernel/src/storage_mount/lease_authority/reservation.rs"]

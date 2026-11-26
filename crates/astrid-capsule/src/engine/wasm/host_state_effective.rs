@@ -81,7 +81,7 @@ impl HostState {
     pub fn effective_kv(&self) -> &ScopedKvStore {
         #[cfg(debug_assertions)]
         self.debug_assert_invocation_field_set(self.invocation_kv.is_some(), "invocation_kv");
-        self.invocation_kv.as_ref().unwrap_or(&self.kv)
+        crate::engine::wasm::guest_kv::select(self.invocation_kv.as_ref(), &self.kv)
     }
 
     /// The current invocation's capsule KV namespace,

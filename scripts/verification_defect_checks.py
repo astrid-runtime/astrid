@@ -73,11 +73,14 @@ INPUTS = [
     STORAGE_FILE,
     PAIR_RESULT,
     LEASE_CALLBACK,
+    Path("crates/astrid-capsule/src/engine/wasm/guest_kv.rs"),
+    Path("crates/astrid-capsule/src/security/identity.rs"),
     Path("crates/astrid-kernel/src/storage_mount/lease_authority/destination.rs"),
     Path("crates/astrid-kernel/src/storage_mount/lease_authority/worker.rs"),
     LEASE_SUBTREE,
     LEASE_RESERVATION,
     Path("verification/hosted_lease_model.rs"),
+    Path("verification/hosted_kv_model.rs"),
     Path("crates/astrid-core/src/storage_filesystem/operation.rs"),
     LEASE_REQUESTER,
     INVOCATION_OWNER,
@@ -451,6 +454,31 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "workspace writes select the host administration projection",
             Path("crates/astrid-kernel/src/storage_mount/lease_authority/destination.rs"),
             lambda source: replace_once(source, "(Self::OwnerRoot(Owner::System), OperationClass::Write) =>", "(_, OperationClass::Write) =>"),
+        ),
+        (
+            "stale KV view falls back to neutral and completes the request",
+            Path("verification/hosted_kv_model.rs"),
+            lambda source: replace_once(source, "Some(uid) => Some(Destination::Principal(uid)),\n                None => None,", "Some(uid) => Some(Destination::Principal(uid)),\n                None => Some(Destination::Neutral),"),
+        ),
+        (
+            "KV completion fails to release its acquired owner count",
+            Path("verification/hosted_kv_model.rs"),
+            lambda source: replace_once(source, "    tracker.finish();", ""),
+        ),
+        (
+            "guest KV substitutes the runtime namespace for a present invocation",
+            Path("crates/astrid-capsule/src/engine/wasm/guest_kv.rs"),
+            lambda source: replace_once(source, "match invocation { Some(store) => store, None => runtime }\n}", "runtime\n}"),
+        ),
+        (
+            "resolve grant authorizes identity link modification",
+            Path("crates/astrid-capsule/src/security/identity.rs"),
+            lambda source: replace_once(source, 'required == "resolve" && grant == "link"', 'required == "link" && grant == "resolve"'),
+        ),
+        (
+            "identity gate checks only the first declared manifest grant",
+            Path("crates/astrid-capsule/src/security/identity.rs"),
+            lambda source: replace_once(source, "while i < grants.len()", "while i < grants.len() && i == 0"),
         ),
         (
             "serialized worker accepts a stale lease after its wait",
@@ -1402,6 +1430,12 @@ def copy_inputs(source: Path, tree: Path) -> None:
 
 def consumer_defects():
     """Weaken a production guarantee and require its trace consumer to fail."""
+    yield (
+        "KV handoff no longer guarantees the exact sink receipt",
+        Path("crates/astrid-capsule/src/engine/wasm/guest_kv.rs"),
+        lambda source: replace_once(source, "ensures sink.ensures((&guard, store, effect), result)", "ensures true"),
+        Path("verification/hosted_kv_model.rs"),
+    )
     consumer = Path("verification/hosted_lease_model.rs")
     yield (
         "worker loses the sink's completion guarantee",

@@ -181,11 +181,35 @@ lemma establishes that joining two canonical nonempty byte names this way
 preserves canonicality. The root is the empty spelling. The byte-level lemma
 and string-level executable contract rely on Rust UTF-8 string semantics.
 
+## Guest identity policy
+
+All five identity host methods call the security gate before using the
+injected identity store. The production manifest gate checks the actual
+declared strings. A resolve grant permits resolution only. A link grant
+also permits creating or removing links and listing a user's links. An admin
+grant permits all five operations, including user creation. The checked
+decision requires at least one sufficient grant, independent of its position
+in the list. Binding the issuer, platform identity and user ID through the
+capacity wait, storage call and reply remains an implementation obligation.
+
 ## Guest key-value storage
 
 All seven operations in `astrid:kv/host@1.0.0` enter through `impl kv::Host for HostState` in `crates/astrid-capsule/src/engine/wasm/host/kv.rs`. Get, set, delete and compare-and-swap take a key. List, paginated list and clear take a prefix. Both list operations call the same backend prefix listing. The cursor and limit select a page after that listing returns.
 
 The shared host adapter checks invocation authority and, where installed, acquires the effective principal's tracker guard before handing the selected scoped store to the operation. It holds admission through the semaphore wait and completion of the storage future. The scoped store supplies the namespace to the backend independently of the guest's key or prefix.
+
+The production store selector takes the invocation store when present and
+otherwise keeps the runtime's load-time store. The shared WIT adapter hands
+that store and the unchanged operation to a synchronous sink which borrows the
+owner guard until it returns. The sink waits for the backend future. The
+tracked-call model composes this handoff with the production tracker and
+durable owner selector. A retired tracker cannot admit a new call. For an
+admitted call, an isolated neutral store remains neutral, and a pinned store
+can address only its original owner, with both namespace and current UID
+matching. A mismatch denies the modeled action. The active count returns to
+its prior value on completion. This result assumes store construction matches
+the modeled binding. Interleaved retirement, future cancellation, reply
+delivery and backend persistence need separate refinement.
 
 The retirement regression exercises all seven WIT methods. A second regression starts the actual WIT set method, holds its backend write at a barrier, and observes retirement waiting for it. The hosted tree view keeps the original namespace encoding and pins the principal UID when the view is constructed. The production selector proves that a storage operation selects an owner exactly when both the namespace bytes and the current directory UID match the admitted values. The tree adapter uses the returned UID for storage access. A native storage regression rebinds an alias and checks that the former view loses access while the new view and the ordinary backend agree on the replacement's data.
 
