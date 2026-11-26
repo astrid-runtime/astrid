@@ -83,10 +83,16 @@ The production adapter takes the VFS instance and directory handle from that
 one bundle. A WIT host regression reads distinct file contents from six real
 mounts using the same relative filename across invocation and runtime scopes.
 
+For a device caller, path resolution holds its registration guard. Each of the
+eight guest filesystem operations reacquires the guard after obtaining I/O
+capacity and holds it while awaiting the VFS. A real WIT regression replaces
+the registration for the same key while a write waits for capacity. All eight
+operations reject the old registration, and the original file bytes survive.
+
 This covers the handoff from a resolved target to its VFS operation. Physical
 canonicalization, symlink changes, the relationship between the path checked
 by the manifest gate and the file opened by the VFS, installation of a mount
-under the correct owner, and device retirement during file I/O remain open.
+under the correct owner, and refinement of backend completion and cancellation remain open.
 
 ## Guest key-value storage
 

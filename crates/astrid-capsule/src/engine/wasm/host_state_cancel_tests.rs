@@ -650,3 +650,115 @@ async fn guest_kv_requires_the_publishing_device_to_still_be_active() {
         Some(vec![1])
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filesystem_rechecks_device_after_wait_and_rejects_revoked_path_operations() {
+    use crate::audit_sink::{HostAuditEvent, HostAuditOutcome, HostAuditRefusal, HostAuditSink};
+    use crate::engine::wasm::host_state::{PrincipalMount, PrincipalMountLocation};
+    use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope, PrincipalProfile};
+
+    struct Admitted(tokio::sync::Notify);
+    impl HostAuditSink for Admitted {
+        fn record(
+            &self,
+            _: &astrid_core::PrincipalId,
+            _: HostAuditEvent<'_>,
+            _: HostAuditOutcome<'_>,
+        ) {
+        }
+        fn admit(
+            &self,
+            _: &astrid_core::PrincipalId,
+            _: HostAuditEvent<'_>,
+        ) -> Result<(), HostAuditRefusal> {
+            self.0.notify_one();
+            Ok(())
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("marker"), b"original").unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(directory.path());
+    let principal = alice();
+    let device = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+    let mut profile = PrincipalProfile::default();
+    profile.auth.methods.push(AuthMethod::Keypair);
+    profile.auth.public_keys.push(device.clone());
+    profile.save(&home, &principal).unwrap();
+    let cache = Arc::new(crate::profile_cache::PrincipalProfileCache::with_home(
+        home.clone(),
+    ));
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.profile_cache = Some(cache.clone());
+    let mut caller = msg_from(&principal).with_device_key_id(device.key_id.clone());
+    caller.device_registration_id = device.registration_id.map(Into::into);
+    state.caller_context = Some(caller);
+    let handle = astrid_capabilities::DirHandle::new();
+    state.workspace = Some(PrincipalMount {
+        location: PrincipalMountLocation::Native(root.clone()),
+        vfs: Arc::new(astrid_vfs::HostVfs::with_registered_dir(handle.clone(), &root).unwrap()),
+        handle,
+    });
+    state.workspace_root = root.clone();
+    assert_eq!(state.read_file("marker".into()).unwrap(), b"original");
+
+    let admitted = Arc::new(Admitted(tokio::sync::Notify::new()));
+    state.audit_sink = Some(admitted.clone());
+    state.blocking_semaphore = Arc::new(Semaphore::new(1));
+    let permit = state
+        .blocking_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    let writer = tokio::spawn(async move {
+        let result = state.write_file("marker".into(), b"updated".to_vec());
+        (result, state)
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), admitted.0.notified())
+        .await
+        .unwrap();
+    profile.auth.public_keys.clear();
+    let replacement = DeviceKey::new(device.pubkey.clone(), DeviceScope::Full, None, 0);
+    assert_ne!(replacement.registration_id, device.registration_id);
+    profile.add_device(replacement);
+    profile.save(&home, &principal).unwrap();
+    cache.invalidate(&principal);
+    drop(permit);
+    let (result, mut state) = writer.await.unwrap();
+    assert!(matches!(result, Err(FsError::CapabilityDenied)));
+    assert!(matches!(
+        state.fs_exists("marker".into()),
+        Err(FsError::CapabilityDenied)
+    ));
+    assert!(matches!(
+        state.fs_mkdir("dir".into()),
+        Err(FsError::CapabilityDenied)
+    ));
+    assert!(matches!(
+        state.fs_mkdir_all("nested/dir".into()),
+        Err(FsError::CapabilityDenied)
+    ));
+    assert!(matches!(
+        state.fs_readdir(".".into()),
+        Err(FsError::CapabilityDenied)
+    ));
+    assert!(matches!(
+        state.fs_stat("marker".into()),
+        Err(FsError::CapabilityDenied)
+    ));
+    assert!(matches!(
+        state.fs_unlink("marker".into()),
+        Err(FsError::CapabilityDenied)
+    ));
+    assert!(matches!(
+        state.read_file("marker".into()),
+        Err(FsError::CapabilityDenied)
+    ));
+    state.caller_context = Some(msg_from(&principal));
+    assert_eq!(state.read_file("marker".into()).unwrap(), b"original");
+    assert!(!root.join("dir").exists());
+    assert!(!root.join("nested").exists());
+}
