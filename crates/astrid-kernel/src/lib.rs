@@ -5056,18 +5056,15 @@ fn mint_default_principal_keypair(
     // with the principal's full authority. Dedup by canonical pubkey.
     let pubkey_hex = keypair.export_public_key().to_hex();
     if profile.auth.device_by_pubkey(&pubkey_hex).is_none() {
-        profile
-            .auth
-            .public_keys
-            .push(astrid_core::profile::DeviceKey::new(
-                pubkey_hex,
-                astrid_core::profile::DeviceScope::Full,
-                None,
-                // Stamp the real mint epoch — `0` is the migrated-legacy-key
-                // sentinel, so using it for a freshly minted key would show a
-                // 1970 timestamp in `pair-device list` / audit.
-                i64::try_from(crate::invite::now_epoch()).unwrap_or(0),
-            ));
+        profile.add_device(astrid_core::profile::DeviceKey::new(
+            pubkey_hex,
+            astrid_core::profile::DeviceScope::Full,
+            None,
+            // Stamp the real mint epoch — `0` is the migrated-legacy-key
+            // sentinel, so using it for a freshly minted key would show a
+            // 1970 timestamp in `pair-device list` / audit.
+            i64::try_from(crate::invite::now_epoch()).unwrap_or(0),
+        ));
     }
     if !profile.auth.methods.contains(&AuthMethod::Keypair) {
         profile.auth.methods.push(AuthMethod::Keypair);
@@ -7012,6 +7009,7 @@ mod tests {
         let default = astrid_core::PrincipalId::default();
 
         let existing = astrid_core::PrincipalProfile {
+            profile_version: 1,
             grants: vec!["system:status".to_string()],
             ..Default::default()
         };
@@ -7022,6 +7020,16 @@ mod tests {
         seed_default_principal_admin_profile(&home).unwrap();
 
         let profile = astrid_core::PrincipalProfile::load_from_path(&path).unwrap();
+        assert_eq!(profile.profile_version, 2);
+        let registration = profile.auth.public_keys[0]
+            .registration_id
+            .expect("bootstrap registration");
+        seed_default_principal_admin_profile(&home).unwrap();
+        let reloaded = astrid_core::PrincipalProfile::load_from_path(&path).unwrap();
+        assert_eq!(
+            reloaded.auth.public_keys[0].registration_id,
+            Some(registration)
+        );
         // admin not auto-added because grants are non-empty.
         assert!(profile.groups.is_empty());
         assert_eq!(profile.grants, vec!["system:status".to_string()]);

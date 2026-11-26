@@ -191,7 +191,7 @@ fn mint_bootstrap_keypair(
     let keypair = astrid_crypto::load_or_generate_keypair(&key_path)?;
     let pubkey_hex = keypair.export_public_key().to_hex();
     if profile.auth.device_by_pubkey(&pubkey_hex).is_none() {
-        profile.auth.public_keys.push(DeviceKey::new(
+        profile.add_device(DeviceKey::new(
             pubkey_hex,
             DeviceScope::Full,
             None,
