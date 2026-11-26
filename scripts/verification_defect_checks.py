@@ -461,6 +461,15 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             lambda source: replace_once(source, "Some(uid) => Some(Destination::Principal(uid)),\n                None => None,", "Some(uid) => Some(Destination::Principal(uid)),\n                None => Some(Destination::Neutral),"),
         ),
         (
+            "guest KV releases admission before invoking the sink",
+            Path("verification/hosted_kv_model.rs"),
+            lambda source: replace_once(
+                replace_once(source, "    tracker.finish();", ""),
+                "if !tracker.begin() { return None; }",
+                "if !tracker.begin() { return None; } tracker.finish();",
+            ),
+        ),
+        (
             "KV completion fails to release its acquired owner count",
             Path("verification/hosted_kv_model.rs"),
             lambda source: replace_once(source, "    tracker.finish();", ""),

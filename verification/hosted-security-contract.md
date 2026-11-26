@@ -22,7 +22,7 @@ The function and implicit destructor counts below come from the resolved kernel 
 | --- | ---: | ---: | --- | --- |
 | `astrid:approval/host@1.0.0` | 1 | 0 | `approval.rs` | Bind the action, target, requester and responder through approval, allowance lookup and persistence. |
 | `astrid:elicit/host@1.0.0` | 2 | 0 | `elicit.rs` | Bind requested input or secret presence to the principal and responder. Account for release of the reply. |
-| `astrid:fs/host@1.0.0` | 23 | 1 | `fs/mod.rs` | Trace path resolution and handle methods through the selected mount or native filesystem, including writeback on drop. |
+| `astrid:fs/host@1.0.0` | 23 | 1 | `fs/mod.rs` | Trace implemented path operations through the selected mount or filesystem. The guest file-handle constructor and positional methods return errors. Its destructor returns success without performing I/O. |
 | `astrid:guest/lifecycle@1.0.0` | 0 | 0 | `mod.rs` | This imported interface declares types only. Guest lifecycle invocation uses the configured linker. |
 | `astrid:http/host@1.0.0` | 8 | 1 | `http/mod.rs` | Bind the V1 request, redirects, credentials and response stream to their admitted destinations. |
 | `astrid:http/host@1.1.0` | 15 | 2 | `http/mod.rs` | Also account for request options, streamed uploads, trailers and ownership of the upload and response resources. |
@@ -38,6 +38,8 @@ The function and implicit destructor counts below come from the resolved kernel 
 | `astrid:request-context/host@1.0.0` | 2 | 0 | `request_context.rs` | Bind returned caller and owner observations to the borrowed connection and its current registration. |
 | `astrid:sys/host@1.0.0` | 10 | 0 | `sys.rs` | Account for config and capability disclosure, log writes, readiness, sleep, clock and randomness. |
 | `astrid:uplink/host@1.0.0` | 2 | 0 | `uplink.rs` | Bind registration and queued inbound delivery to the capsule, selected uplink and platform identity. |
+
+Fourteen HTTP, network, IPC and process adapter call sites currently allocate placeholder resources. Their successful allocation returns an always-ready pollable, a closed input stream or a closed output stream. These methods do not attach the returned resource to the underlying transport or process. The accounting and identity of the resource table entry, including allocation failure, remain part of the proof obligation. The file-handle destructor above is distinct from the internal storage-backed file publication described below.
 
 ## Hosted management IPC inventory
 
@@ -189,7 +191,7 @@ declared strings. A resolve grant permits resolution only. A link grant
 also permits creating or removing links and listing a user's links. An admin
 grant permits all five operations, including user creation. The checked
 decision requires at least one sufficient grant, independent of its position
-in the list. Binding the issuer, platform identity and user ID through the
+in the list. The five current host methods sample invocation authority before waiting for capacity. They acquire no principal tracker guard around the store call. Binding the issuer, platform identity and user ID through the
 capacity wait, storage call and reply remains an implementation obligation.
 
 ## Guest key-value storage
@@ -207,7 +209,7 @@ durable owner selector. A retired tracker cannot admit a new call. For an
 admitted call, an isolated neutral store remains neutral, and a pinned store
 can address only its original owner, with both namespace and current UID
 matching. A mismatch denies the modeled action. The active count returns to
-its prior value on completion. This result assumes store construction matches
+its prior value on completion. The modeled sink receives a borrow of the same tracker after admission, with its active count one above entry. The model covers a tracked call; deployment paths without a tracker and namespace-only stores require separate treatment. This result assumes store construction matches
 the modeled binding. Interleaved retirement, future cancellation, reply
 delivery and backend persistence need separate refinement.
 
