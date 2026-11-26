@@ -39,6 +39,9 @@ use tokio::sync::watch;
 use crate::Kernel;
 
 mod admin_projection;
+mod requester_lifecycle;
+use requester_lifecycle::{Issue, Requester};
+pub(crate) use requester_lifecycle::{PendingMountIssues, retire_requester};
 #[cfg(target_os = "macos")]
 mod callback_resolver;
 mod filesystem;
@@ -76,7 +79,7 @@ enum CallbackResponse {
 /// In-memory authority fixed when a native filesystem lease is issued.
 pub(crate) struct StorageMountLeaseState {
     mount_id: StorageMountId,
-    requester_uid: Option<astrid_core::PrincipalUid>,
+    requester: Requester,
     owner: StateOwner,
     view: StorageProviderViewV1,
     target: StorageFilesystemTargetV1,
@@ -121,10 +124,6 @@ struct MutationTestGate {
 }
 
 impl StorageMountLeaseState {
-    fn is_owned_by(&self, caller: Option<astrid_core::PrincipalUid>) -> bool {
-        self.requester_uid.is_some() && self.requester_uid == caller
-    }
-
     fn is_live(&self) -> bool {
         !self.revoked.load(Ordering::Acquire)
             && now_epoch_secs() <= self.expires_at_epoch_secs.load(Ordering::Acquire)
@@ -178,6 +177,9 @@ pub(crate) async fn issue_lease(
         Err(_) if allow_cross_owner => None,
         Err(error) => return Err(format!("resolve storage lease requester: {error}")),
     };
+    let mount_id = StorageMountId::new();
+    let requester = Requester::new(&caller, requester_uid);
+    let issue = Issue::admit(kernel, mount_id, &caller, &requester).await?;
     let (owner, target) = resolve_owner(
         kernel,
         &caller,
@@ -187,7 +189,6 @@ pub(crate) async fn issue_lease(
         target,
     )
     .await?;
-    let mount_id = StorageMountId::new();
     #[cfg(unix)]
     let resource_path = private_mount_resource_path(mount_id)?;
     #[cfg(not(unix))]
@@ -212,7 +213,7 @@ pub(crate) async fn issue_lease(
         .map_err(|error| format!("create private mount resource: {error}"))?;
     let state = Arc::new(StorageMountLeaseState {
         mount_id,
-        requester_uid,
+        requester,
         owner,
         view,
         target,
@@ -242,7 +243,13 @@ pub(crate) async fn issue_lease(
         cleanup_resource(&resource_path, &callback_path);
         return Err(format!("write private mount manifest: {error}"));
     }
-    kernel.storage_mounts.insert(mount_id, Arc::clone(&state));
+    if !issue.publish(|| {
+        kernel.storage_mounts.insert(mount_id, Arc::clone(&state));
+    }) {
+        drop(listener);
+        cleanup_resource(&resource_path, &callback_path);
+        return Err("storage mount requester retired during issuance".to_owned());
+    }
 
     #[cfg(any(unix, windows))]
     {
