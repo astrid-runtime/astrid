@@ -107,3 +107,63 @@ async fn bound_load_refuses_host_wasm_when_catalog_entry_is_missing_or_tampered(
         ));
     }
 }
+
+#[tokio::test]
+async fn load_refuses_a_component_reserved_for_a_different_storage_owner() {
+    let capsule = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let bytes = wat::parse_str("(component)").unwrap();
+    let manifest: CapsuleManifest = toml::from_str(
+        r#"
+        [package]
+        name = "owner-test"
+        version = "1.0.0"
+        [[component]]
+        id = "main"
+        file = "main.wasm"
+    "#,
+    )
+    .unwrap();
+    std::fs::write(capsule.path().join("main.wasm"), &bytes).unwrap();
+    std::fs::write(
+        capsule.path().join("meta.json"),
+        serde_json::json!({"wasm_hash":blake3::hash(&bytes).to_hex().to_string()}).to_string(),
+    )
+    .unwrap();
+    let runtime = crate::registry::RuntimeId::for_test_scope(
+        crate::capsule::CapsuleId::from_static("owner-test"),
+        1,
+        crate::registry::RuntimeScope::Principal(astrid_core::PrincipalUid::from_bytes([1; 32])),
+    );
+    let mut engine = WasmEngine::new(
+        manifest,
+        capsule.path().to_owned(),
+        crate::FuelLedger::default(),
+        crate::FuelRateLimiter::default(),
+        crate::MemoryLedger::default(),
+        limits::CapsuleRuntimeLimits::default(),
+        limits::HttpLimits::default(),
+    )
+    .with_runtime_id(Some(runtime));
+    let owner = astrid_core::PrincipalId::default();
+    let kv = astrid_storage::ScopedKvStore::new(
+        Arc::new(astrid_storage::MemoryKvStore::new()),
+        "owner-test",
+    )
+    .unwrap();
+    let ctx = CapsuleContext::new(
+        owner.clone(),
+        workspace.path().to_owned(),
+        None,
+        kv,
+        Arc::new(astrid_events::EventBus::new()),
+        None,
+    );
+    ctx.principal_directory
+        .register(owner, astrid_core::PrincipalUid::from_bytes([2; 32]))
+        .unwrap();
+    let result = engine.load(&ctx).await;
+    assert!(
+        matches!(result, Err(CapsuleError::UnsupportedEntryPoint(reason)) if reason == "principal runtime owner changed before mount setup")
+    );
+}

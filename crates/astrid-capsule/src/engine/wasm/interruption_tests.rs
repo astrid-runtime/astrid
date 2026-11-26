@@ -72,6 +72,59 @@ async fn engine(max: usize) -> WasmEngine {
     engine_with_pause(max, Arc::new(tokio::sync::Notify::new())).await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interceptor_requires_the_reserved_owner_before_guest_entry() {
+    let engine = engine(1).await;
+    let principal = astrid_core::PrincipalId::default();
+    let root = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(root.path());
+    home.ensure().unwrap();
+    let mut checkout = engine.pool.as_ref().unwrap().checkout().await.unwrap();
+    let state = checkout.store_mut().data_mut();
+    let directory = state.principal_directory.clone();
+    let owner = directory.uid_for(&principal).unwrap();
+    state.runtime_owner_uid = Some(owner);
+    state.deferred_logs = super::native_logs::DeferredBindings::for_factory(
+        Some(Arc::new(
+            super::native_logs::NativeLogRoot::capture(&home).unwrap(),
+        )),
+        None,
+    );
+    drop(checkout);
+    let caller = astrid_events::ipc::IpcMessage::new(
+        astrid_events::ipc::Topic::from_raw("test.owner"),
+        astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
+        uuid::Uuid::new_v4(),
+    )
+    .with_principal(principal.to_string());
+    assert!(matches!(
+        engine
+            .invoke_interceptor("read", &[], Some(&caller))
+            .await
+            .unwrap(),
+        InterceptResult::Continue(_)
+    ));
+    directory
+        .rename(
+            owner,
+            &principal,
+            astrid_core::PrincipalId::new("previous").unwrap(),
+        )
+        .unwrap();
+    directory
+        .register(principal, astrid_core::PrincipalUid::from_bytes([0x42; 32]))
+        .unwrap();
+    for message in [Some(&caller), None] {
+        let result = engine
+            .invoke_interceptor("read", &[], message)
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, InterceptResult::Deny { reason } if reason == "interceptor caller no longer owns the runtime")
+        );
+    }
+}
+
 #[tokio::test]
 async fn occupied_pool_cannot_outlive_the_invocation_deadline() {
     let dir = tempfile::tempdir().unwrap();
