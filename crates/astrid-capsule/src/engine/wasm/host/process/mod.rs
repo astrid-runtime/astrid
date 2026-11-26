@@ -102,6 +102,9 @@ fn authenticated_principal(state: &HostState) -> Option<astrid_core::principal::
         .and_then(|p| astrid_core::principal::PrincipalId::new(p).ok())
 }
 
+#[cfg(test)]
+mod storage_mount_tests;
+
 fn prepare_process_storage_mount(
     state: &HostState,
     op: &str,
@@ -126,11 +129,23 @@ fn prepare_process_storage_mount(
         record_process_denied(state, op, command, reason);
         return Err(ErrorCode::CapabilityDenied);
     };
+    let uid = state
+        .invocation_storage_uid
+        .or(state.runtime_owner_uid)
+        .ok_or_else(|| {
+            record_process_denied(
+                state,
+                op,
+                command,
+                "process storage requires an admitted owner UID",
+            );
+            ErrorCode::CapabilityDenied
+        })?;
     let principal = state.effective_principal();
     util::bounded_block_on(
         &state.runtime_handle,
         &state.io_semaphore,
-        broker.mount(&principal),
+        broker.mount_for(&principal, uid),
     )
     .map(Some)
     .map_err(|error| {

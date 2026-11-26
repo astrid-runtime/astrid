@@ -39,6 +39,8 @@ use tokio::sync::watch;
 use crate::Kernel;
 
 mod admin_projection;
+mod lease_authority;
+use lease_authority::{LeaseAuthority, resolve_owner};
 #[cfg(target_os = "macos")]
 mod callback_resolver;
 mod filesystem;
@@ -167,13 +169,37 @@ pub(crate) async fn issue_lease(
     provider: String,
     mountpoint: PathBuf,
 ) -> Result<StorageMountLeaseV1, String> {
+    issue_bound_lease(
+        kernel,
+        caller,
+        LeaseAuthority::Management { allow_cross_owner },
+        view,
+        target,
+        access,
+        provider,
+        mountpoint,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn issue_bound_lease(
+    kernel: &Arc<Kernel>,
+    caller: PrincipalId,
+    authority: LeaseAuthority,
+    view: StorageProviderViewV1,
+    target: StorageFilesystemTargetV1,
+    access: StorageProviderAccessV1,
+    provider: String,
+    mountpoint: PathBuf,
+) -> Result<StorageMountLeaseV1, String> {
     if provider.is_empty() || provider.len() > 128 || provider.chars().any(char::is_control) {
         return Err("native storage provider identity is invalid".to_owned());
     }
     if !mountpoint.is_absolute() {
         return Err("native storage mountpoint must be absolute".to_owned());
     }
-    let (owner, target) = resolve_owner(kernel, &caller, allow_cross_owner, &view, target).await?;
+    let (owner, target) = resolve_owner(kernel, &caller, authority, &view, target).await?;
     let mount_id = StorageMountId::new();
     #[cfg(unix)]
     let resource_path = private_mount_resource_path(mount_id)?;
@@ -383,101 +409,6 @@ async fn finish_revoke(kernel: &Kernel, state: Arc<StorageMountLeaseState>) -> R
     kernel.storage_mounts.remove(&state.mount_id);
     cleanup_resource(&state.resource_path, &state.callback_path);
     Ok(())
-}
-
-async fn resolve_owner(
-    kernel: &Kernel,
-    caller: &PrincipalId,
-    allow_cross_owner: bool,
-    view: &StorageProviderViewV1,
-    target: StorageFilesystemTargetV1,
-) -> Result<(StateOwner, StorageFilesystemTargetV1), String> {
-    let owner = match view {
-        StorageProviderViewV1::Principal(principal) => {
-            if principal != caller && !allow_cross_owner {
-                return Err("principal filesystem view belongs to another principal".to_owned());
-            }
-            kernel
-                .principal_directory
-                .uid_for(principal)
-                .map(StateOwner::Principal)
-                .map_err(|error| {
-                    format!("principal `{principal}` has no immutable storage identity: {error}")
-                })?
-        },
-        StorageProviderViewV1::Fleet(fleet) => {
-            if !allow_cross_owner {
-                let caller_uid = kernel
-                    .principal_directory
-                    .uid_for(caller)
-                    .map_err(|error| {
-                        format!("principal `{caller}` has no immutable storage identity: {error}")
-                    })?;
-                let ownership = kernel
-                    .ownership_store()
-                    .load()
-                    .await
-                    .map_err(|error| format!("read fleet ownership graph: {error}"))?;
-                let admitted = ownership
-                    .principal_owner(caller_uid)
-                    .is_some_and(|owner| owner.fleet_uid == *fleet);
-                if !admitted {
-                    return Err(
-                        "requested fleet filesystem is outside the caller's fleet".to_owned()
-                    );
-                }
-            }
-            StateOwner::Fleet(*fleet)
-        },
-        StorageProviderViewV1::Admin => {
-            if !allow_cross_owner {
-                return Err("system filesystem view requires global storage authority".to_owned());
-            }
-            StateOwner::System
-        },
-    };
-
-    if let StorageFilesystemTargetV1::WorkspaceBranch { workspace } = &target {
-        let store = kernel
-            .principal_store
-            .clone()
-            .ok_or_else(|| "native principal store is unavailable".to_owned())?;
-        let branches = WorkspaceBranchStore::new(store.content());
-        let descriptor = branches
-            .describe(&owner, *workspace)
-            .map_err(|error| format!("resolve workspace branch: {error}"))?;
-        // A caller-scoped branch lease may only target the branch that the
-        // kernel's durable workspace binding assigned to that immutable UID.
-        // Fleet membership authorizes the shared base owner, not another
-        // principal's divergent branch. Global storage authority may inspect
-        // an explicitly selected branch through the administrative path.
-        if !allow_cross_owner {
-            let caller_uid = kernel
-                .principal_directory
-                .uid_for(caller)
-                .map_err(|error| format!("resolve workspace branch caller UID: {error}"))?;
-            if descriptor.binding_uid() != Some(caller_uid) {
-                return Err(
-                    "workspace branch is not bound to the authenticated principal".to_owned(),
-                );
-            }
-        }
-    }
-    if let StorageFilesystemTargetV1::OwnerSubtree { prefix } = &target {
-        if prefix != "home" && prefix != "shared" {
-            return Err("owner subtree prefix is not a kernel-admitted attachment".to_owned());
-        }
-        if prefix == "home" && !matches!(owner, StateOwner::Principal(_)) {
-            return Err("principal HOME must resolve to the principal owner".to_owned());
-        }
-        if prefix == "shared" && !matches!(owner, StateOwner::Fleet(_)) {
-            return Err("Fleet shared attachment requires a Fleet owner".to_owned());
-        }
-        FilesystemPath::new(prefix.clone())
-            .map_err(|error| format!("resolve owner subtree prefix: {error}"))?;
-    }
-
-    Ok((owner, target))
 }
 
 #[cfg(any(unix, windows))]

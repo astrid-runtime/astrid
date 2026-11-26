@@ -161,6 +161,15 @@ impl Drop for ProcessStorageMount {
 pub trait ProcessStorageMountBroker: Send + Sync {
     /// Mount the authenticated principal's process view.
     async fn mount(&self, principal: &PrincipalId) -> Result<ProcessStorageMount, String>;
+
+    /// Mount storage for the immutable owner selected at guest admission.
+    async fn mount_for(
+        &self,
+        _principal: &PrincipalId,
+        _uid: astrid_core::PrincipalUid,
+    ) -> Result<ProcessStorageMount, String> {
+        Err("process storage broker does not support UID-bound projections".to_owned())
+    }
 }
 
 /// One immutable principal binding to the canonical workspace attachment.
@@ -273,6 +282,19 @@ impl WorkspaceBranchService {
     /// owner catalog.
     pub async fn bind(&self, principal: &PrincipalId) -> Result<WorkspaceBranchBinding, String> {
         self.bind_for(principal, None).await
+    }
+
+    /// Bind the workspace belonging to an already-admitted principal UID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the alias has changed owners or the workspace cannot be opened.
+    pub async fn bind_for_uid(
+        &self,
+        principal: &PrincipalId,
+        uid: astrid_core::PrincipalUid,
+    ) -> Result<WorkspaceBranchBinding, String> {
+        self.bind_for(principal, Some(uid)).await
     }
 
     pub(crate) async fn bind_for(
