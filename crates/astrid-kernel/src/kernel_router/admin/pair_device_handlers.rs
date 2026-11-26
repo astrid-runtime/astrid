@@ -52,20 +52,11 @@ fn pair_token_store(
         .map_err(|_| err_internal("pair-token durable storage is unavailable".into()))
 }
 
-fn resolve_pair_issuer_authority(
+fn current_pair_issuer_authority(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
-    authorization: Option<&AuthorizedRequest>,
     issuer_device_key_id: Option<&str>,
 ) -> Result<PairIssuerAuthority, AdminResponseBody> {
-    if let Some(authorization) = authorization {
-        return Ok((
-            Arc::clone(&authorization.profile),
-            Arc::clone(&authorization.groups),
-            authorization.device_scope.clone(),
-        ));
-    }
-
     let profile_path = kernel.astrid_home.profile_path(caller);
     if !profile_path.exists() {
         return Err(err_bad_input(format!(
@@ -76,6 +67,11 @@ fn resolve_pair_issuer_authority(
         .profile_cache
         .resolve(caller)
         .map_err(|error| err_internal(format!("issuer profile resolution failed: {error}")))?;
+    if !profile.enabled {
+        return Err(err_unauthorized(format!(
+            "caller principal {caller} is disabled"
+        )));
+    }
     let issuer_scope = crate::kernel_router::resolve_device_scope(
         profile.as_ref(),
         caller,
@@ -100,26 +96,38 @@ pub(super) async fn pair_device_issue(
         Err(error) => return err_bad_input(error),
     };
 
+    // Preserve restrictions from ingress if policy widens while this issue waits.
+    let admitted_scope = if let Some(auth) = authorization {
+        match validate_pair_issue_authority(
+            caller,
+            &auth.profile,
+            &auth.groups,
+            auth.device_scope.as_ref(),
+            &requested_scope,
+        ) {
+            Ok(scope) => scope,
+            Err(error) => return err_unauthorized(error),
+        }
+    } else {
+        requested_scope
+    };
+
+    let _guard = kernel.admin_write_lock.lock().await;
     let (profile, groups, issuer_scope) =
-        match resolve_pair_issuer_authority(kernel, caller, authorization, issuer_device_key_id) {
+        match current_pair_issuer_authority(kernel, caller, issuer_device_key_id) {
             Ok(authority) => authority,
             Err(response) => return response,
         };
     let stored_scope = match validate_pair_issue_authority(
         caller,
-        profile.as_ref(),
-        groups.as_ref(),
+        &profile,
+        &groups,
         issuer_scope.as_ref(),
-        &requested_scope,
+        &admitted_scope,
     ) {
         Ok(scope) => scope,
         Err(error) => return err_unauthorized(error),
     };
-    // Release the pinned authority snapshot before awaiting the write lock.
-    drop(profile);
-    drop(groups);
-
-    let _guard = kernel.admin_write_lock.lock().await;
     let store = match pair_token_store(kernel) {
         Ok(store) => store,
         Err(response) => return response,
