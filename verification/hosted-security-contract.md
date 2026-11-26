@@ -153,6 +153,37 @@ rejects duplicate fingerprints. The cryptographic signature check, the
 freshness of the resolved profile at effect admission and the generation of
 the socket owner still require refinement.
 
+## Native local socket transport
+
+The built-in local server in `astrid-uplink/src/native` accepts a socket,
+authenticates it, and subscribes a per-connection queue. Its topic policy uses
+a checked byte-slice search for exact topics and prefixes. A blocked ingress
+prefix always denies a request, including one in an allowed control family.
+The checked lookup assumes the allowlists defined in `routing.rs`.
+
+At outbound publication, `egress::Registry::install` iterates the subscribed
+clients. Its checked recipient predicate requires an allowed topic, matching
+principal (or an explicitly allowed untargeted broadcast), matching device
+when targeted, and a present matching session for chat. Ordinary messages
+carrying an owner must match the connection owner or active turn owner.
+Approval messages additionally require a kernel source, matching envelope
+owner, and matching owner text in the typed approval payload.
+
+The checked chat transition admits a matching host-stamped owner. Only an
+owned nonterminal message with a nonzero producer and nonce can establish
+the correlation for an unbound turn. A subsequent ownerless terminal frame
+must match both captured values. An explicitly foreign owner cannot use that
+exception. The routing caller supplies the active turn; admission, queue
+mutation and turn retirement are still ordinary Rust lock operations.
+
+| Native effect | Production path | Outstanding refinement |
+| --- | --- | --- |
+| Register a connection and emit lifecycle events | `ConnectionRuntime::handle`, `serve_connection`, `publish_lifecycle` | Peer identity, durable owner, subscription lifetime and disconnect accounting |
+| Demand-load a capsule runtime and publish a client operation | `input::PendingInput`, `readiness::ensure`, `publish_trusted_ingress` | Caller generation, asynchronous readiness, publication reservation and commit |
+| Deliver a private answer | `private_elicit` calls the configured responder directly | Registry owner, cancellation and handling of secret bytes |
+| Queue a bus event and write a client frame | `Registry::install`, `forward_outbound`, `write_message` | Ownership of the queue and socket, turn locks, buffered delivery across revocation and shutdown, wire serialization |
+| Return handshake, refusal and completion frames directly | `handshake`, `route_connection_message`, `write_ingress_refusal`, `input` | Binding each response to its accepted socket, including partial writes and canceled requests |
+
 ## Remembered local egress consent
 
 A local egress consent reply must carry the expected principal bytes and full

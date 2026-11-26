@@ -21,16 +21,21 @@ fn request_owner_allows(message: &IpcMessage, client_owner: RequestOwnerId) -> b
         return match &message.payload {
             astrid_types::ipc::IpcPayload::ApprovalRequired { request_owner, .. }
             | astrid_types::ipc::IpcPayload::GrantRequired { request_owner, .. } => {
-                message.source_id == uuid::Uuid::nil()
-                    && message.request_owner == Some(client_owner)
-                    && request_owner.as_str() == expected_owner.as_str()
+                super::recipient::approval_owner(
+                    message.source_id.as_u128(),
+                    message.request_owner.map(RequestOwnerId::as_u128),
+                    client_owner.as_u128(),
+                    request_owner.as_bytes(),
+                    expected_owner.as_bytes(),
+                )
             },
             _ => false,
         };
     }
-    message
-        .request_owner
-        .is_none_or(|owner| owner == client_owner)
+    super::recipient::ordinary_owner(
+        message.request_owner.map(RequestOwnerId::as_u128),
+        client_owner.as_u128(),
+    )
 }
 
 #[derive(Default)]
@@ -129,7 +134,7 @@ struct ClientQueue {
 struct ActiveTurn {
     session_id: String,
     request_owner: RequestOwnerId,
-    correlation: Option<super::turn_correlation::ResponseCorrelation>,
+    correlation: Option<super::recipient::ResponseCorrelation>,
 }
 
 impl ClientQueue {

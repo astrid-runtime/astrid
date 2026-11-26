@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use super::topic_policy;
+
 use astrid_types::ipc::{IpcMessage, IpcPayload};
 
 pub(super) const CHAT_REQUEST_TOPIC: &str = "user.v1.prompt";
@@ -10,76 +12,68 @@ const CHAT_DELTA_TOPIC: &str = "agent.v1.stream.delta";
 const MAX_STREAM_SESSIONS: usize = 64;
 const MAX_STREAM_BYTES: usize = super::MAX_PAYLOAD_BYTES;
 
-const ALLOWED_INGRESS_EXACT: &[&str] = &[
-    "user.v1.prompt",
-    "cli.v1.command.execute",
+const ALLOWED_INGRESS_EXACT: &[&[u8]] = &[
+    b"user.v1.prompt",
+    b"cli.v1.command.execute",
     // These request topics are broker-owned despite sharing the kernel request
     // prefix. Consent replies below that prefix remain on the control path.
-    "astrid.v1.request.mcp.tools.list",
-    "astrid.v1.request.mcp.tool.call",
+    b"astrid.v1.request.mcp.tools.list",
+    b"astrid.v1.request.mcp.tool.call",
 ];
-const CONTROL_INGRESS_PREFIXES: &[&str] = &[
-    "astrid.v1.request.",
-    "astrid.v1.admin.",
-    "astrid.v1.elicit.response.",
-    "astrid.v1.approval.response.",
+const CONTROL_INGRESS_PREFIXES: &[&[u8]] = &[
+    b"astrid.v1.request.",
+    b"astrid.v1.admin.",
+    b"astrid.v1.elicit.response.",
+    b"astrid.v1.approval.response.",
 ];
-const CAPSULE_INGRESS_PREFIXES: &[&str] = &[
-    "registry.v1.selection.",
-    "session.v1.request.",
-    "cli.v1.command.run.",
-    "sage.v1.hook.",
+const CAPSULE_INGRESS_PREFIXES: &[&[u8]] = &[
+    b"registry.v1.selection.",
+    b"session.v1.request.",
+    b"cli.v1.command.run.",
+    b"sage.v1.hook.",
 ];
-const BLOCKED_INGRESS_PREFIXES: &[&str] = &["astrid.v1.admin.response."];
+const BLOCKED_INGRESS_PREFIXES: &[&[u8]] = &[b"astrid.v1.admin.response."];
 
-const ALLOWED_EGRESS_EXACT: &[&str] = &[
-    CHAT_DELTA_TOPIC,
-    CHAT_RESPONSE_TOPIC,
-    "astrid.v1.elicit",
-    "astrid.v1.private.elicit.request",
-    "astrid.v1.onboarding.required",
-    "astrid.v1.approval",
-    "astrid.v1.capsules_loaded",
-    "registry.v1.active_model_changed",
+const ALLOWED_EGRESS_EXACT: &[&[u8]] = &[
+    CHAT_DELTA_TOPIC.as_bytes(),
+    CHAT_RESPONSE_TOPIC.as_bytes(),
+    b"astrid.v1.elicit",
+    b"astrid.v1.private.elicit.request",
+    b"astrid.v1.onboarding.required",
+    b"astrid.v1.approval",
+    b"astrid.v1.capsules_loaded",
+    b"registry.v1.active_model_changed",
 ];
-const ALLOWED_EGRESS_PREFIXES: &[&str] = &[
-    "astrid.v1.response.",
-    "astrid.v1.admin.response.",
-    "registry.v1.response.",
-    "registry.v1.selection.",
-    "session.v1.response.",
-    "cli.v1.command.result.",
-    "astrid.v1.grant.result.",
+const ALLOWED_EGRESS_PREFIXES: &[&[u8]] = &[
+    b"astrid.v1.response.",
+    b"astrid.v1.admin.response.",
+    b"registry.v1.response.",
+    b"registry.v1.selection.",
+    b"session.v1.response.",
+    b"cli.v1.command.result.",
+    b"astrid.v1.grant.result.",
 ];
 
-const SYSTEM_BROADCAST_EXACT: &[&str] = &["registry.v1.active_model_changed"];
+const SYSTEM_BROADCAST_EXACT: &[&[u8]] = &[b"registry.v1.active_model_changed"];
 
 pub(super) fn ingress_allowed(topic: &str) -> bool {
-    if BLOCKED_INGRESS_PREFIXES
-        .iter()
-        .any(|prefix| topic.starts_with(prefix))
-    {
-        return false;
-    }
-    capsule_request_topic(topic)
-        || CONTROL_INGRESS_PREFIXES
-            .iter()
-            .any(|prefix| topic.starts_with(prefix))
+    let bytes = topic.as_bytes();
+    topic_policy::ingress(
+        topic_policy::under(BLOCKED_INGRESS_PREFIXES, bytes),
+        capsule_request_topic(topic),
+        topic_policy::under(CONTROL_INGRESS_PREFIXES, bytes),
+    )
 }
 
 /// Request families owned by capsules, shared by ACL and readiness policy.
 pub(super) fn capsule_request_topic(topic: &str) -> bool {
-    ALLOWED_INGRESS_EXACT.contains(&topic)
-        || CAPSULE_INGRESS_PREFIXES
-            .iter()
-            .any(|prefix| topic.starts_with(prefix))
+    topic_policy::exact(ALLOWED_INGRESS_EXACT, topic.as_bytes())
+        || topic_policy::under(CAPSULE_INGRESS_PREFIXES, topic.as_bytes())
 }
 
 pub(super) fn egress_allowed(topic: &str) -> bool {
-    ALLOWED_EGRESS_EXACT.contains(&topic)
-        || ALLOWED_EGRESS_PREFIXES
-            .iter()
-            .any(|prefix| topic.starts_with(prefix))
+    topic_policy::exact(ALLOWED_EGRESS_EXACT, topic.as_bytes())
+        || topic_policy::under(ALLOWED_EGRESS_PREFIXES, topic.as_bytes())
 }
 
 pub(super) fn payload_session_id(payload: &IpcPayload) -> Option<&str> {
@@ -117,26 +111,24 @@ pub(super) fn should_deliver(
     device_key_id: Option<&str>,
     session: Option<&str>,
 ) -> bool {
-    if !egress_allowed(message.topic.as_str()) {
-        return false;
-    }
-    match message.principal.as_deref() {
-        Some(target) if target != principal => return false,
-        None if !SYSTEM_BROADCAST_EXACT.contains(&message.topic.as_str()) => return false,
-        Some(_) | None => {},
-    }
-    if let Some(target) = message.device_key_id.as_deref()
-        && device_key_id != Some(target)
-    {
-        return false;
-    }
-    if matches!(
-        message.topic.as_str(),
-        CHAT_RESPONSE_TOPIC | CHAT_DELTA_TOPIC
-    ) {
-        return outbound_session(message).is_some_and(|target| session == Some(target));
-    }
-    true
+    use super::recipient::{Address, admits};
+
+    let topic = message.topic.as_str();
+    admits(
+        &Address {
+            principal: message.principal.as_deref().map(str::as_bytes),
+            device: message.device_key_id.as_deref().map(str::as_bytes),
+            session: outbound_session(message).map(str::as_bytes),
+        },
+        &Address {
+            principal: Some(principal.as_bytes()),
+            device: device_key_id.map(str::as_bytes),
+            session: session.map(str::as_bytes),
+        },
+        egress_allowed(topic),
+        topic_policy::exact(SYSTEM_BROADCAST_EXACT, topic.as_bytes()),
+        matches!(topic, CHAT_RESPONSE_TOPIC | CHAT_DELTA_TOPIC),
+    )
 }
 
 pub(super) fn completed_chat_session(message: &IpcMessage) -> Option<&str> {

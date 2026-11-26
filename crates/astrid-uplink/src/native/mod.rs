@@ -9,6 +9,7 @@ mod handshake;
 mod input;
 pub mod private_elicit;
 mod readiness;
+mod recipient;
 #[cfg(all(test, unix))]
 mod recovery_tests;
 #[cfg(all(test, unix))]
@@ -16,6 +17,7 @@ mod rejection_tests;
 mod routing;
 #[cfg(all(test, unix))]
 mod tests;
+mod topic_policy;
 mod turn_correlation;
 
 use std::collections::HashMap;

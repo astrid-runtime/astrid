@@ -8,11 +8,7 @@ use astrid_events::ipc::{IpcMessage, RequestOwnerId};
 use astrid_types::ipc::IpcPayload;
 use uuid::Uuid;
 
-#[derive(Clone, Copy)]
-pub(super) struct ResponseCorrelation {
-    producer: Uuid,
-    nonce: Uuid,
-}
+use super::recipient::ResponseCorrelation;
 
 fn nonce(message: &IpcMessage) -> Option<Uuid> {
     let (IpcPayload::Custom { data: value } | IpcPayload::RawJson(value)) = &message.payload else {
@@ -29,25 +25,14 @@ pub(super) fn owner_allows(
     binding: &mut Option<ResponseCorrelation>,
     completed: bool,
 ) -> bool {
-    if message.request_owner == Some(owner) {
-        if !completed
-            && binding.is_none()
-            && !message.source_id.is_nil()
-            && let Some(nonce) = nonce(message)
-        {
-            *binding = Some(ResponseCorrelation {
-                producer: message.source_id,
-                nonce,
-            });
-        }
-        return true;
-    }
-    // A foreign explicit owner never falls back to autonomous correlation.
-    message.request_owner.is_none()
-        && completed
-        && binding.as_ref().is_some_and(|binding| {
-            message.source_id == binding.producer && nonce(message) == Some(binding.nonce)
-        })
+    super::recipient::admit_turn(
+        owner.as_u128(),
+        message.request_owner.map(RequestOwnerId::as_u128),
+        message.source_id.as_u128(),
+        nonce(message).map(|id| id.as_u128()),
+        completed,
+        binding,
+    )
 }
 
 pub(super) fn bind_terminal(message: &mut IpcMessage, owner: Option<RequestOwnerId>) {

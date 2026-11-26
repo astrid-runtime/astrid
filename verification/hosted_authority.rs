@@ -59,3 +59,9 @@ mod device_admission;
 
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/consent_identity.rs"]
 mod consent_identity;
+
+#[path = "../crates/astrid-uplink/src/native/recipient.rs"]
+mod native_recipient;
+
+#[path = "../crates/astrid-uplink/src/native/topic_policy.rs"]
+mod native_topic_policy;

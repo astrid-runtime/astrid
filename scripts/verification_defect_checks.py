@@ -40,7 +40,11 @@ PRINCIPAL_SYNTAX = Path("crates/astrid-core/src/principal/syntax.rs")
 INGRESS_FRAME = Path("crates/astrid-capsule/src/engine/wasm/host/net/ingress_frame.rs")
 DEVICE_ADMISSION = Path("crates/astrid-core/src/profile/device_admission.rs")
 CONSENT_IDENTITY = Path("crates/astrid-capsule/src/engine/wasm/host/consent_identity.rs")
+NATIVE_TOPIC = Path("crates/astrid-uplink/src/native/topic_policy.rs")
+NATIVE_RECIPIENT = Path("crates/astrid-uplink/src/native/recipient.rs")
 INPUTS = [
+    NATIVE_TOPIC,
+    NATIVE_RECIPIENT,
     CONSENT_IDENTITY,
     DEVICE_ADMISSION,
     INGRESS_FRAME,
@@ -175,6 +179,81 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "frame consumption drops the captured operation",
             INGRESS_FRAME,
             lambda text: replace_once(text, "    slot.take()", "    *slot = None; None"),
+        ),
+        (
+            "native approval accepts an untrusted producer",
+            NATIVE_RECIPIENT,
+            lambda text: replace_once(text, "    source == 0 && stamp", "    true && stamp"),
+        ),
+        (
+            "native approval ignores the payload owner",
+            NATIVE_RECIPIENT,
+            lambda text: replace_once(text, "&& same(Some(payload_owner), Some(client_text))", "&& true"),
+        ),
+        (
+            "native ordinary frame ignores an explicit owner",
+            NATIVE_RECIPIENT,
+            lambda text: replace_once(text, "Some(actual) => actual == expected", "Some(actual) => true"),
+        ),
+        (
+            "exact native topic accepts a suffix",
+            NATIVE_TOPIC,
+            lambda text: replace_once(text, "    listed(rules, topic, false)", "    listed(rules, topic, true)"),
+        ),
+        (
+            "native prefix lookup accepts unlisted bytes",
+            NATIVE_TOPIC,
+            lambda text: replace_once(text, "if candidate != rule", "if false"),
+        ),
+        (
+            "blocked native request inherits control prefix access",
+            NATIVE_TOPIC,
+            lambda text: replace_once(text, "    !blocked && (capsule || control)", "    capsule || control"),
+        ),
+        (
+            "native egress delivers disallowed topics",
+            NATIVE_RECIPIENT,
+            lambda text: replace_once(text, "    allowed\n        && match", "    true\n        && match"),
+        ),
+        (
+            "untargeted native message is broadcast on every topic",
+            NATIVE_RECIPIENT,
+            lambda text: replace_once(text, "None => broadcast,", "None => true,"),
+        ),
+        (
+            "native egress ignores the target principal",
+            NATIVE_RECIPIENT,
+            lambda text: replace_once(text, "Some(_) => same(target.principal, client.principal)", "Some(_) => true"),
+        ),
+        (
+            "native egress ignores device restriction",
+            NATIVE_RECIPIENT,
+            lambda text: replace_once(text, "|| same(target.device, client.device)", "|| true"),
+        ),
+        (
+            "chat delivery accepts another session",
+            NATIVE_RECIPIENT,
+            lambda text: replace_once(text, "|| same(target.session, client.session)", "|| true"),
+        ),
+        (
+            "foreign explicit owner uses autonomous correlation",
+            NATIVE_RECIPIENT,
+            lambda text: replace_once(text, "if stamp.is_some() || !completed", "if !completed"),
+        ),
+        (
+            "unowned completion accepts another producer",
+            NATIVE_RECIPIENT,
+            lambda text: replace_once(text, "saved.producer == producer && saved.nonce == actual", "saved.nonce == actual"),
+        ),
+        (
+            "unowned completion accepts another nonce",
+            NATIVE_RECIPIENT,
+            lambda text: replace_once(text, "saved.producer == producer && saved.nonce == actual", "saved.producer == producer"),
+        ),
+        (
+            "owned response can replace an established correlation",
+            NATIVE_RECIPIENT,
+            lambda text: replace_once(text, "!completed && binding.is_none() && producer", "!completed && producer"),
         ),
         (
             "egress consent accepts a different principal",

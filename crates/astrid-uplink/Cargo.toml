@@ -13,6 +13,7 @@ default = []
 test-support = []
 
 [dependencies]
+vstd = { workspace = true }
 anyhow = { workspace = true }
 astrid-config = { workspace = true }
 astrid-core = { workspace = true }
