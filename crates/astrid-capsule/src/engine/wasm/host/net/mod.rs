@@ -42,7 +42,9 @@ use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::{HostState, NetStream, SharedTcpListener, TcpStreamSlot};
 
 mod client_lifecycle;
+pub(crate) use client_lifecycle::disconnect_remaining_clients;
 pub(crate) mod handshake;
+mod ingress_frame;
 mod stream;
 mod tcp_listener;
 mod tcp_stream;

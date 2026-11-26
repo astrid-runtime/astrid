@@ -2277,14 +2277,6 @@ impl ExecutionEngine for WasmEngine {
             // Interceptor / non-worker pool instances each get a fresh map so a
             // concrete-port bind is not cloned across pooled HostStates.
             let shared_listeners = share_tcp_listeners.then(HostState::new_shared_listeners);
-            // Interceptor pools share identity maps: accept and drop may land
-            // on different Stores. Run-loop workers must NOT share them —
-            // each worker has its own Wasmtime ResourceTable, so u32 reps
-            // collide (two unix accepts can overwrite identity).
-            let share_identity_maps = !has_run_export;
-            let connection_principals =
-                share_identity_maps.then(HostState::new_connection_principals);
-            let client_connections = share_identity_maps.then(HostState::new_client_connections);
             let tcp_listener_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let capsule_net_stream_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let st_route_admission_gate = self.route_admission_gate.clone();
@@ -2415,12 +2407,8 @@ impl ExecutionEngine for WasmEngine {
                 subscription_count: 0,
                 process_count_total: 0,
                 process_count_by_principal: std::collections::HashMap::new(),
-                connection_principals: connection_principals
-                    .clone()
-                    .unwrap_or_else(HostState::new_connection_principals),
-                client_connections: client_connections
-                    .clone()
-                    .unwrap_or_else(HostState::new_client_connections),
+                connection_principals: HostState::new_connection_principals(),
+                client_connections: HostState::new_client_connections(),
                 shared_listeners: shared_listeners
                     .clone()
                     .unwrap_or_else(HostState::new_shared_listeners),
@@ -3816,10 +3804,10 @@ async fn build_lifecycle_host_state(
         process_count_by_principal: std::collections::HashMap::new(),
         // Lifecycle hooks never accept socket connections; a throwaway
         // registry satisfies the field (issue #45/#852).
-        connection_principals: Arc::new(dashmap::DashMap::new()),
+        connection_principals: HostState::new_connection_principals(),
         // Lifecycle hooks never accept inbound uplink connections; a throwaway
         // lifecycle registry satisfies the field.
-        client_connections: Arc::new(dashmap::DashMap::new()),
+        client_connections: HostState::new_client_connections(),
         // Lifecycle hooks never bind a listener; a throwaway registry satisfies
         // the field.
         shared_listeners: HostState::new_shared_listeners(),

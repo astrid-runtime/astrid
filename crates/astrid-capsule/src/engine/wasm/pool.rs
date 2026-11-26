@@ -482,18 +482,7 @@ pub(super) fn clear_on_return(state: &mut HostState, reset_resources: bool) {
     // by a view release) must not decide which teardown signal the NEXT
     // lease's waits listen to; the next invocation installs its own.
     state.invocation_cancel_token = None;
-    // The in-flight verified ingress principal AND its authenticating device
-    // key_id are per-frame state; a fresh lease must not inherit a stale one
-    // (issue #45/#852).
-    state.ingress_principal = None;
-    state.ingress_device_key_id = None;
-    state.ingress_request_owner = None;
-    // The in-flight transport origin is the same per-frame state: a fresh lease
-    // must never inherit a stale `LocalSocket`, or a later request on a
-    // different (remote) connection could be mis-attributed as a local operator
-    // and wrongly earn local-egress consent. Cleared to `None` (= `System`,
-    // fail-closed) in lockstep.
-    state.ingress_origin = None;
+    state.clear_ingress_frame();
 
     if reset_resources {
         // Drops every entry still in the old table (orphaned subscriptions,
@@ -523,6 +512,7 @@ pub(super) fn clear_on_return(state: &mut HostState, reset_resources: bool) {
         // leaking entries for connections whose stream is now gone
         // (issue #45/#852).
         state.connection_principals.clear();
+        super::host::net::disconnect_remaining_clients(state);
     }
 }
 
