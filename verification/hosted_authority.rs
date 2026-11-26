@@ -1,5 +1,8 @@
 // Verus entry point for transitions used by hosted Astrid.
 
+#[path = "../crates/astrid-capsule/src/engine/wasm/invocation_owner/admission.rs"]
+mod invocation_owner_admission;
+
 #[path = "../crates/astrid-kernel/src/kernel_router/admin/pair_issue_result.rs"]
 mod pair_issue_result;
 

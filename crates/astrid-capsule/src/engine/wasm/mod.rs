@@ -78,6 +78,7 @@ pub mod host_state;
 #[cfg(test)]
 mod interruption_tests;
 mod invocation_failure;
+mod invocation_owner;
 mod mount_selection;
 mod native_logs;
 mod principal_tracker;
@@ -1740,7 +1741,7 @@ impl ExecutionEngine for WasmEngine {
             let owner_uid = (!system_runtime)
                 .then(|| ctx.principal_directory.uid_for(&ctx.principal).ok())
                 .flatten();
-            if native_owner_uid.is_some() && owner_uid != native_owner_uid {
+            if !invocation_owner::accepts(native_owner_uid, owner_uid) {
                 return Err(CapsuleError::UnsupportedEntryPoint(
                     "principal runtime owner changed before mount setup".to_owned(),
                 ));
@@ -3352,6 +3353,11 @@ impl ExecutionEngine for WasmEngine {
                         .bound_uid(&invoking_principal, state.runtime_owner_uid)
                         .ok()
                 };
+                if !invocation_owner::accepts(state.runtime_owner_uid, env_uid) {
+                    return Ok(crate::capsule::InterceptResult::Deny {
+                        reason: "interceptor caller no longer owns the runtime".to_owned(),
+                    });
+                }
                 state.invocation_env_overlay = match env_uid {
                     Some(uid) => {
                         load_invocation_env_overlay_from_backend(

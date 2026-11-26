@@ -58,6 +58,7 @@ UID_TEXT = Path("crates/astrid-core/src/identity/principal/text.rs")
 FILESYSTEM_PATH = Path("crates/astrid-storage/src/filesystem/path_validation.rs")
 STORAGE_HANDLES = Path("crates/astrid-capsule/src/engine/wasm/storage_handles.rs")
 STORAGE_FILE = Path("crates/astrid-capsule/src/engine/wasm/storage_file.rs")
+INVOCATION_OWNER = Path("crates/astrid-capsule/src/engine/wasm/invocation_owner/admission.rs")
 MOUNT = Path("crates/astrid-capsule/src/engine/wasm/mount_selection.rs")
 PAIR_RESULT = Path("crates/astrid-kernel/src/kernel_router/admin/pair_issue_result.rs")
 INPUTS = [
@@ -66,6 +67,7 @@ INPUTS = [
     STORAGE_HANDLES,
     STORAGE_FILE,
     PAIR_RESULT,
+    INVOCATION_OWNER,
     MOUNT,
     RECEIPT,
     PAIR_DENIES,
@@ -355,6 +357,16 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "missing invocation workspace falls back to the runtime despite required binding",
             MOUNT,
             lambda text: replace_once(text, "if requires_binding { invocation }", "if requires_binding { runtime }"),
+        ),
+        (
+            "typed runtime accepts an unregistered owner",
+            INVOCATION_OWNER,
+            lambda text: replace_once(text, "(Some(_), None) => false", "(Some(_), None) => true"),
+        ),
+        (
+            "interceptor compares its observed UID to itself",
+            INVOCATION_OWNER,
+            lambda text: replace_once(text, "uid.as_slice() != owner.as_slice()", "uid.as_slice() != uid.as_slice()"),
         ),
         (
             "mount selection discards the invocation override",
