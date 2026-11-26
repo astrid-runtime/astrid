@@ -19,6 +19,9 @@ pub(in crate::engine::wasm) fn open_capsule_log_at(
     open_capsule_log_at_uid(log_root, uid, capsule_name, prune)
 }
 
+/// Open an operational log under `log/principals/<uid>/<capsule>/`, outside
+/// the durable home VFS. Only load-time callers request pruning, which scans
+/// existing rotated files in this directory.
 pub(super) fn open_capsule_log_at_uid(
     log_root: &Path,
     uid: astrid_core::PrincipalUid,

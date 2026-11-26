@@ -786,6 +786,7 @@ fn eager_invocation_logs_follow_the_captured_uid() {
                 .unwrap()
                 .1,
         ])
+        .env("ASTRID_TEST_EAGER_LOG_HOME", home.path())
         .env("ASTRID_HOME", home.path())
         .output()
         .unwrap();
@@ -794,12 +795,16 @@ fn eager_invocation_logs_follow_the_captured_uid() {
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
-    assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
+    assert!(String::from_utf8_lossy(&result.stdout).contains("test result: ok. 1 passed"));
 }
 
 #[tokio::test]
 #[ignore = "run by eager_invocation_logs_follow_the_captured_uid with a private home"]
 async fn eager_invocation_log_child() {
+    let Some(private_home) = std::env::var_os("ASTRID_TEST_EAGER_LOG_HOME") else {
+        return;
+    };
+    assert_eq!(std::env::var_os("ASTRID_HOME"), Some(private_home));
     let (_parent, _root, mut state, tracker) = fixture();
     state.deferred_logs = DeferredBindings::default();
     let original = state.principal.clone();
@@ -828,5 +833,31 @@ async fn eager_invocation_log_child() {
             .join(state.capsule_id.as_str())
             .is_dir()
     );
+    let log_dir = logs.join(uid.to_string()).join(state.capsule_id.as_str());
+    let rotated = log_dir.join("2000-01-01.log");
+    let file = File::create(&rotated).unwrap();
+    file.set_modified(
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000),
+    )
+    .unwrap();
+    drop(file);
+    let bind_owner = |captured_uid| {
+        super::bind(
+            None,
+            &state.principal_directory,
+            state.capsule_id.as_str(),
+            true,
+            &tracker,
+            captured_uid,
+        )
+    };
+    assert!(bind_owner(None).file.is_none());
+    assert!(rotated.is_file());
+    tracker.retire(&renamed);
+    assert!(bind_owner(Some(uid)).file.is_none());
+    assert!(rotated.is_file());
+    tracker.resume(&renamed);
+    assert!(bind_owner(Some(uid)).file.is_some());
+    assert!(!rotated.exists());
     assert!(!logs.join(replacement.to_string()).exists());
 }
