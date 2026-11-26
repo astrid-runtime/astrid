@@ -347,6 +347,8 @@ pub(crate) async fn sync_lease(
     let target = state.target;
     tokio::task::spawn_blocking(move || {
         let _guard = guard;
+        #[cfg(test)]
+        tokio::runtime::Handle::current().block_on(pause_mutation_for_test(&state));
         match target {
             LeaseTarget::OwnerRoot(owner) => AstridFilesystem::new(store.content(), owner)
                 .sync()
