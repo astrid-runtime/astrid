@@ -43,69 +43,54 @@ pub(super) struct ResolvedPhysical {
 }
 
 /// Compute the true physical absolute path for the security gate by
-/// canonicalizing on the host filesystem. This prevents symlink bypass
-/// attacks where a lexical path passes the gate but cap-std follows a
-/// symlink at a later resolution step.
+/// canonicalizing the existing prefix and appending only absent children.
 pub(super) fn resolve_physical_absolute(
     root: &Path,
     requested: &str,
 ) -> Result<ResolvedPhysical, String> {
-    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-
-    let relative_requested = make_relative(requested);
-    let joined = canonical_root.join(relative_requested);
-
-    let mut current_check = joined.clone();
-    let mut unexisting_components = Vec::new();
-
-    loop {
-        if std::fs::symlink_metadata(&current_check).is_ok() {
-            let canonical =
-                std::fs::canonicalize(&current_check).unwrap_or_else(|_| current_check.clone());
-            let mut final_path = canonical;
-            for comp in unexisting_components.into_iter().rev() {
-                final_path.push(comp);
-            }
-            if !final_path.starts_with(&canonical_root) {
-                return Err(format!(
-                    "path escapes root boundary: {requested} resolves to {}",
-                    final_path.display()
-                ));
-            }
-            return Ok(ResolvedPhysical {
-                physical: final_path,
-                canonical_root,
-            });
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve filesystem root {}: {error}", root.display()))?;
+    let joined = canonical_root.join(make_relative(requested));
+    let mut existing = joined.as_path();
+    let mut missing = Vec::new();
+    let mut physical = loop {
+        match std::fs::symlink_metadata(existing) {
+            Ok(_) => {
+                break existing.canonicalize().map_err(|error| {
+                    format!(
+                        "cannot resolve existing path {}: {error}",
+                        existing.display()
+                    )
+                })?;
+            },
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && existing != canonical_root =>
+            {
+                let name = existing.file_name().ok_or_else(|| {
+                    format!("cannot resolve missing path component in {requested}")
+                })?;
+                missing.push(name);
+                existing = existing
+                    .parent()
+                    .ok_or_else(|| format!("path escapes root boundary: {requested}"))?;
+            },
+            Err(error) => return Err(format!("cannot inspect {}: {error}", existing.display())),
         }
-        if let Some(parent) = current_check.parent() {
-            if let Some(file_name) = current_check.file_name() {
-                unexisting_components.push(file_name.to_os_string());
-            }
-            current_check = parent.to_path_buf();
-        } else {
-            break;
-        }
+    };
+    for name in missing.into_iter().rev() {
+        physical.push(name);
     }
-
-    if !joined.starts_with(&canonical_root) {
+    if !physical.starts_with(&canonical_root) {
         return Err(format!(
             "path escapes root boundary: {requested} resolves to {}",
-            joined.display()
+            physical.display()
         ));
     }
-
     Ok(ResolvedPhysical {
-        physical: joined,
+        physical,
         canonical_root,
     })
-}
-
-/// Which VFS target a resolved path points at.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum VfsTarget {
-    Workspace,
-    Home,
-    Tmp,
 }
 
 /// Phase-1 resolution: physical path for the security gate + VFS-relative
@@ -299,6 +284,27 @@ pub(super) fn resolve_vfs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_paths_require_a_resolved_root_and_allow_new_children() {
+        let root = tempfile::tempdir().unwrap();
+        let absent = root.path().join("absent");
+        assert!(resolve_physical_absolute(&absent, "child").is_err());
+        let result = resolve_physical_absolute(root.path(), "absent/child").unwrap();
+        assert_eq!(
+            result.physical,
+            root.path().canonicalize().unwrap().join("absent/child")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_unresolvable_link_is_not_an_absent_child() {
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("absent", root.path().join("link")).unwrap();
+        assert!(resolve_physical_absolute(root.path(), "link").is_err());
+        assert!(resolve_physical_absolute(root.path(), "link/child").is_err());
+    }
 
     #[test]
     fn logical_workspace_accepts_current_directory_spellings() {
