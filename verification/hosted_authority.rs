@@ -12,6 +12,9 @@ mod storage_handles;
 #[path = "../crates/astrid-storage/src/filesystem/path_validation.rs"]
 mod path_validation;
 
+#[path = "../crates/astrid-core/src/identity/principal/text.rs"]
+mod principal_uid_text;
+
 #[path = "../crates/astrid-capsule/src/engine/wasm/mount_selection.rs"]
 mod mount_selection;
 

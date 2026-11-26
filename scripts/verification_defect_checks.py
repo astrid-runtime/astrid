@@ -54,12 +54,14 @@ REGISTERED_BEARER = Path("crates/astrid-core/src/session_token/registered_bearer
 PRIVATE_RESPONDER = Path("crates/astrid-capsule/src/elicitation/responder.rs")
 PAIR_DENIES = Path("crates/astrid-kernel/src/kernel_router/admin/pair_device_handlers/deny_patterns.rs")
 RECEIPT = Path("crates/astrid-kernel/src/kernel_router/resume_receipt/validation.rs")
+UID_TEXT = Path("crates/astrid-core/src/identity/principal/text.rs")
 FILESYSTEM_PATH = Path("crates/astrid-storage/src/filesystem/path_validation.rs")
 STORAGE_HANDLES = Path("crates/astrid-capsule/src/engine/wasm/storage_handles.rs")
 STORAGE_FILE = Path("crates/astrid-capsule/src/engine/wasm/storage_file.rs")
 MOUNT = Path("crates/astrid-capsule/src/engine/wasm/mount_selection.rs")
 PAIR_RESULT = Path("crates/astrid-kernel/src/kernel_router/admin/pair_issue_result.rs")
 INPUTS = [
+    UID_TEXT,
     FILESYSTEM_PATH,
     STORAGE_HANDLES,
     STORAGE_FILE,
@@ -268,6 +270,16 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "receipt acknowledgement accepts equal length but different bytes",
             RECEIPT,
             lambda text: replace_once(text, "Some(bytes) => bytes == expected", "Some(bytes) => bytes.len() == expected.len()"),
+        ),
+        (
+            "principal UID text loses the upper nibble",
+            UID_TEXT,
+            lambda text: replace_once(text, "digit(uid[i] / 16)", "digit(uid[i] % 16)"),
+        ),
+        (
+            "a principal UID decoder interchanges nibbles",
+            UID_TEXT,
+            lambda text: replace_once(text, "high * 16 + low", "low * 16 + high"),
         ),
         (
             "a content name admits a terminal parent component",

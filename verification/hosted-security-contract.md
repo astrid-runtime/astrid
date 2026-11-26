@@ -94,6 +94,17 @@ canonicalization, symlink changes, the relationship between the path checked
 by the manifest gate and the file opened by the VFS, installation of a mount
 under the correct owner, and refinement of backend completion and cancellation remain open.
 
+For scratch mounts the opened runtime store retains its principal scratch root,
+including during finalization handoff. The mount builder appends the resolved
+UID and `tmp` below that root. A receive-loop regression writes bytes and checks
+their location under an explicit runtime home, then switches principals and
+checks isolation. The production UID text encoder and decoder are checked:
+each of the 32 input bytes supplies its high and low nibble to the corresponding
+two lowercase hex digits, and decoding accepts exactly 64 lowercase hex digits.
+A uniqueness theorem rules out two different UIDs with the same spelling.
+Filesystem directory creation, canonicalization, and identity-to-UID resolution
+remain trust or refinement obligations at this boundary.
+
 ### Storage-backed file publication
 
 For the owner-backed home and workspace-branch adapters, the checked
