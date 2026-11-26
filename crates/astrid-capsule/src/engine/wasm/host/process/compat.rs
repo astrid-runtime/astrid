@@ -390,11 +390,17 @@ impl v10::HostProcessHandle for HostState {
         v11::HostProcessHandle::os_pid(self, handle_v10_to_v11(&self_)).map_err(err_v11_to_v10)
     }
 
-    fn subscribe_exit(&mut self, self_: Resource<v10::ProcessHandle>) -> Resource<DynPollable> {
+    fn subscribe_exit(
+        &mut self,
+        self_: Resource<v10::ProcessHandle>,
+    ) -> wasmtime::Result<Resource<DynPollable>> {
         v11::HostProcessHandle::subscribe_exit(self, handle_v10_to_v11(&self_))
     }
 
-    fn subscribe_logs(&mut self, self_: Resource<v10::ProcessHandle>) -> Resource<DynPollable> {
+    fn subscribe_logs(
+        &mut self,
+        self_: Resource<v10::ProcessHandle>,
+    ) -> wasmtime::Result<Resource<DynPollable>> {
         v11::HostProcessHandle::subscribe_logs(self, handle_v10_to_v11(&self_))
     }
 

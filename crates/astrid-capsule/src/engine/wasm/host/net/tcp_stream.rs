@@ -499,7 +499,10 @@ impl HostTcpStream for HostState {
         })
     }
 
-    fn subscribe_readable(&mut self, _self_: Resource<TcpStream>) -> Resource<DynPollable> {
+    fn subscribe_readable(
+        &mut self,
+        _self_: Resource<TcpStream>,
+    ) -> wasmtime::Result<Resource<DynPollable>> {
         // Real pollable wiring (tokio AsyncRead readiness over the
         // NetStream) lands with the stream-half adapter commit.
         // Always-ready sentinel until then; guests poll then call
@@ -507,7 +510,10 @@ impl HostTcpStream for HostState {
         super::super::stubs::always_ready_pollable(&mut self.resource_table)
     }
 
-    fn read_stream(&mut self, _self_: Resource<TcpStream>) -> Resource<InputStream> {
+    fn read_stream(
+        &mut self,
+        _self_: Resource<TcpStream>,
+    ) -> wasmtime::Result<Resource<InputStream>> {
         self.clear_ingress_frame();
         // Real adapter (wasmtime-wasi-io InputStream impl over our
         // NetStream) lands with the stream-half commit. Closed-on-read
@@ -516,7 +522,10 @@ impl HostTcpStream for HostState {
         super::super::stubs::closed_input_stream(&mut self.resource_table)
     }
 
-    fn write_stream(&mut self, _self_: Resource<TcpStream>) -> Resource<OutputStream> {
+    fn write_stream(
+        &mut self,
+        _self_: Resource<TcpStream>,
+    ) -> wasmtime::Result<Resource<OutputStream>> {
         // Same story as read_stream — closed-on-write sentinel.
         super::super::stubs::closed_output_stream(&mut self.resource_table)
     }

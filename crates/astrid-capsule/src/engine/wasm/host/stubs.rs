@@ -51,16 +51,16 @@ impl Pollable for AlwaysReadyPollable {
 /// resource handle the guest sees.
 pub(super) fn always_ready_pollable(
     table: &mut wasmtime::component::ResourceTable,
-) -> Resource<DynPollable> {
-    // Fail-soft: if pushing or wrapping somehow fails, fall back to a
-    // never-allocated sentinel rep. The guest sees a Closed-on-read /
-    // never-firing-poll handle either way; this branch should never
-    // trip on a healthy store.
-    let stub = match table.push(AlwaysReadyPollable) {
-        Ok(r) => r,
-        Err(_) => return Resource::new_own(0),
-    };
-    subscribe(table, stub).unwrap_or_else(|_| Resource::new_own(0))
+) -> wasmtime::Result<Resource<DynPollable>> {
+    let parent = table.push(AlwaysReadyPollable)?;
+    let parent_index = parent.rep();
+    match subscribe(table, parent) {
+        Ok(child) => Ok(child),
+        Err(error) => {
+            table.delete(Resource::<AlwaysReadyPollable>::new_own(parent_index))?;
+            Err(error)
+        },
+    }
 }
 
 /// An input-stream sentinel that reports EOF on every read.
@@ -83,10 +83,10 @@ impl InputStream for ClosedInputStream {
 /// resource handle the guest sees.
 pub(super) fn closed_input_stream(
     table: &mut wasmtime::component::ResourceTable,
-) -> Resource<wasmtime_wasi::p2::bindings::sync::io::streams::InputStream> {
+) -> wasmtime::Result<Resource<wasmtime_wasi::p2::bindings::sync::io::streams::InputStream>> {
     let boxed: DynInputStream = Box::new(ClosedInputStream);
-    let res = table.push(boxed).unwrap_or_else(|_| Resource::new_own(0));
-    Resource::new_own(res.rep())
+    let stream = table.push(boxed)?;
+    Ok(Resource::new_own(stream.rep()))
 }
 
 /// An output-stream sentinel that reports Closed on every operation.
@@ -117,8 +117,34 @@ impl OutputStream for ClosedOutputStream {
 /// Allocate a closed-on-write output-stream sentinel.
 pub(super) fn closed_output_stream(
     table: &mut wasmtime::component::ResourceTable,
-) -> Resource<wasmtime_wasi::p2::bindings::sync::io::streams::OutputStream> {
+) -> wasmtime::Result<Resource<wasmtime_wasi::p2::bindings::sync::io::streams::OutputStream>> {
     let boxed: DynOutputStream = Box::new(ClosedOutputStream);
-    let res = table.push(boxed).unwrap_or_else(|_| Resource::new_own(0));
-    Resource::new_own(res.rep())
+    let stream = table.push(boxed)?;
+    Ok(Resource::new_own(stream.rep()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{always_ready_pollable, closed_input_stream, closed_output_stream};
+    use wasmtime::component::ResourceTable;
+
+    #[test]
+    fn unavailable_capacity_returns_an_allocation_error() {
+        let mut table = ResourceTable::new();
+        table.set_max_capacity(0);
+
+        assert!(closed_input_stream(&mut table).is_err());
+        assert!(closed_output_stream(&mut table).is_err());
+        assert!(always_ready_pollable(&mut table).is_err());
+    }
+
+    #[test]
+    fn failed_subscription_releases_its_parent_slot() {
+        let mut table = ResourceTable::new();
+        table.set_max_capacity(1);
+
+        assert!(always_ready_pollable(&mut table).is_err());
+        let stream = closed_input_stream(&mut table).unwrap();
+        assert!(table.get(&stream).is_ok());
+    }
 }

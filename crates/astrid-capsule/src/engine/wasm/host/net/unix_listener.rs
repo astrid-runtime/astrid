@@ -288,7 +288,10 @@ impl HostUnixListener for HostState {
         install_accepted(self, stream, verified_identity).map(Some)
     }
 
-    fn subscribe_readiness(&mut self, _self_: Resource<UnixListener>) -> Resource<DynPollable> {
+    fn subscribe_readiness(
+        &mut self,
+        _self_: Resource<UnixListener>,
+    ) -> wasmtime::Result<Resource<DynPollable>> {
         // Real wiring (tokio UnixListener::poll_accept-backed) lands
         // with the dedicated pollable commit. Always-ready sentinel
         // until then — guests poll, call accept, get a connection or

@@ -80,6 +80,19 @@ wasmtime::component::bindgen!({
     },
     imports: {
         "astrid:io/streams": trappable,
+        // Resource exhaustion must reach the guest as a trap before a handle is returned.
+        "astrid:http/host.[method]http-stream.subscribe-readable": trappable,
+        "astrid:http/host.[method]http-stream.body-stream": trappable,
+        "astrid:http/host.[method]http-upload.body-sink": trappable,
+        "astrid:http/host.[method]http-upload.subscribe-writable": trappable,
+        "astrid:net/host.[method]tcp-stream.subscribe-readable": trappable,
+        "astrid:net/host.[method]tcp-stream.read-stream": trappable,
+        "astrid:net/host.[method]tcp-stream.write-stream": trappable,
+        "astrid:net/host.[method]udp-socket.subscribe-readable": trappable,
+        "astrid:net/host.[method]unix-listener.subscribe-readiness": trappable,
+        "astrid:ipc/host.[method]subscription.subscribe-readiness": trappable,
+        "astrid:process/host.[method]process-handle.subscribe-exit": trappable,
+        "astrid:process/host.[method]process-handle.subscribe-logs": trappable,
         // `subscription.recv` is the only host import on the orchestration
         // hot path that *blocks* — every chained capsule (react ->
         // prompt-builder -> registry -> openai-compat) waits here for the
