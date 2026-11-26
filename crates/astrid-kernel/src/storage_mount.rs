@@ -243,16 +243,17 @@ pub(crate) async fn issue_lease(
         cleanup_resource(&resource_path, &callback_path);
         return Err(format!("write private mount manifest: {error}"));
     }
-    if !issue.install(kernel, &state) {
-        drop(listener);
+    if !issue.install(kernel, &state, || {
+        #[cfg(any(unix, windows))]
+        astrid_runtime::spawn(serve_listener(
+            Arc::downgrade(kernel),
+            Arc::clone(&state),
+            listener,
+            shutdown_rx,
+        ));
+    }) {
         cleanup_resource(&resource_path, &callback_path);
         return Err("storage mount requester retired during issuance".to_owned());
-    }
-
-    #[cfg(any(unix, windows))]
-    {
-        let weak_kernel = Arc::downgrade(kernel);
-        astrid_runtime::spawn(serve_listener(weak_kernel, state, listener, shutdown_rx));
     }
     Ok(lease)
 }

@@ -115,7 +115,12 @@ impl<'a> Issue<'a> {
         Ok(Self { issues, id })
     }
 
-    pub(super) fn install(self, kernel: &Kernel, state: &Arc<StorageMountLeaseState>) -> bool {
+    pub(super) fn install(
+        self,
+        kernel: &Kernel,
+        state: &Arc<StorageMountLeaseState>,
+        start_listener: impl FnOnce(),
+    ) -> bool {
         #[cfg(test)]
         {
             let pause = self.issues.1.lock().unwrap().take();
@@ -133,6 +138,7 @@ impl<'a> Issue<'a> {
             kernel
                 .storage_mounts
                 .insert(state.mount_id, Arc::clone(state));
+            start_listener();
         })
     }
 
