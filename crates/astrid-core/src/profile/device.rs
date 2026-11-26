@@ -78,6 +78,12 @@ impl DeviceScope {
     }
 }
 
+/// Identity of one persisted device registration. A new pairing of the same
+/// public key receives an independent ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DeviceRegistrationId(uuid::Uuid);
+
 /// A public key registered to a principal, with the capability scope the
 /// device pairing was granted.
 ///
@@ -103,6 +109,9 @@ pub struct DeviceKey {
     /// Unix epoch seconds when the device was paired. `0` for migrated legacy
     /// keys that predate pairing-time recording.
     pub created_at: i64,
+    /// Absent on records created before registration IDs were persisted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration_id: Option<DeviceRegistrationId>,
 }
 
 /// Length, in hex characters, of a [`DeviceKey::key_id`] fingerprint
@@ -483,7 +492,7 @@ impl DeviceKey {
     }
 
     /// Build a [`DeviceKey`] from a canonical lowercase-hex pubkey and a
-    /// scope, deriving the deterministic `key_id` and defaulting label/time.
+    /// scope, deriving the stable key fingerprint and minting a new registration ID.
     ///
     /// The caller is responsible for having already validated `pubkey_hex`
     /// (e.g. via the redeem/issue paths); the fingerprint is computed over
@@ -500,6 +509,7 @@ impl DeviceKey {
         Self {
             key_id,
             pubkey: pubkey.into_inner(),
+            registration_id: Some(DeviceRegistrationId(uuid::Uuid::new_v4())),
             scope,
             label,
             created_at,
@@ -566,6 +576,8 @@ struct DeviceKeyData {
     label: Option<String>,
     #[serde(default)]
     created_at: i64,
+    #[serde(default)]
+    registration_id: Option<DeviceRegistrationId>,
 }
 
 /// serde default helper: a missing `scope` on a full `DeviceKey` struct means
@@ -599,7 +611,14 @@ impl<'de> Deserialize<'de> for DeviceKey {
                 // string is a hard error — never a silently-dropped or
                 // partially-trusted key.
                 let hex = normalise_pubkey_hex(&s).map_err(D::Error::custom)?;
-                Ok(DeviceKey::new(hex, DeviceScope::Full, None, 0))
+                Ok(DeviceKey {
+                    key_id: device_key_id_fingerprint(&hex),
+                    pubkey: hex,
+                    scope: DeviceScope::Full,
+                    label: None,
+                    created_at: 0,
+                    registration_id: None,
+                })
             },
             DeviceKeyRepr::Full(d) => {
                 // Full struct form. The canonical source of `key_id` is ALWAYS
@@ -619,6 +638,7 @@ impl<'de> Deserialize<'de> for DeviceKey {
                     scope: d.scope,
                     label: d.label,
                     created_at: d.created_at,
+                    registration_id: d.registration_id,
                 })
             },
         }
@@ -762,6 +782,32 @@ mod tests {
         assert_eq!(json["scope"]["type"], "full");
         assert_eq!(json["label"], "laptop");
         assert_eq!(json["created_at"], 42);
+    }
+
+    #[test]
+    fn repeated_pairing_gets_a_new_identity_at_the_same_timestamp() {
+        let pair = || DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 42);
+        let first = pair();
+        let second = pair();
+        assert_eq!(first.key_id, second.key_id);
+        assert!(first.registration_id.is_some());
+        assert_ne!(first.registration_id, second.registration_id);
+        let saved = toml::to_string(&first).unwrap();
+        assert_eq!(toml::from_str::<DeviceKey>(&saved).unwrap(), first);
+    }
+
+    #[test]
+    fn loading_either_legacy_form_preserves_its_unversioned_identity() {
+        let hex = "a".repeat(64);
+        let bare = serde_json::json!(format!("ed25519:{hex}"));
+        let structured = serde_json::json!({"pubkey": hex});
+        for original in [bare, structured] {
+            let device: DeviceKey = serde_json::from_value(original).unwrap();
+            assert_eq!(device.registration_id, None);
+            let saved = serde_json::to_value(&device).unwrap();
+            assert!(saved.get("registration_id").is_none());
+            assert_eq!(serde_json::from_value::<DeviceKey>(saved).unwrap(), device);
+        }
     }
 
     #[test]

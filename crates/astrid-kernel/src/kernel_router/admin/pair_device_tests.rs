@@ -520,6 +520,58 @@ async fn valid_explicit_allow_and_deny_survive_issue_and_redeem() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn pairing_preserves_a_live_registration_and_rotates_after_revocation() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("device_registration");
+    seed(&kernel, &caller, &["self:*"], vec![]);
+    let mut legacy = load(&kernel, &caller);
+    legacy.profile_version = 1;
+    legacy
+        .save(&kernel.astrid_home, &caller)
+        .expect("save v1 profile");
+    let public_key = "d".repeat(64);
+    let key_id = device_key_id_fingerprint(&public_key);
+    let redeem = async || {
+        let response = handlers::dispatch(&kernel, &caller, issue(PairScopeArg::Full)).await;
+        let AdminResponseBody::PairToken(token) = response else {
+            panic!("pair token issue failed: {response:?}");
+        };
+        let response = handlers::dispatch(
+            &kernel,
+            &PrincipalId::default(),
+            AdminRequestKind::PairDeviceRedeem {
+                token: token.token,
+                public_key: public_key.clone(),
+            },
+        )
+        .await;
+        assert!(matches!(response, AdminResponseBody::PairTokenRedeemed(_)));
+        load(&kernel, &caller)
+            .auth
+            .device_by_key_id(&key_id)
+            .expect("device on disk")
+            .registration_id
+            .expect("fresh registration")
+    };
+    let original = redeem().await;
+    assert_eq!(redeem().await, original);
+    let response = handlers::dispatch(
+        &kernel,
+        &caller,
+        AdminRequestKind::PairDeviceRevoke {
+            principal: caller.clone(),
+            key_id: key_id.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        response,
+        AdminResponseBody::PairDeviceRevoked { .. }
+    ));
+    assert_ne!(redeem().await, original);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn failed_pair_provisioning_does_not_burn_the_token() {
     let (_dir, kernel) = fixture().await;
     let caller = pid("retryable-pair");

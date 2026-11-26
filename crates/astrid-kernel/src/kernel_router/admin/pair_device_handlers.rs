@@ -423,7 +423,7 @@ async fn pair_device_redeem_reserved(
         .device_by_typed_pubkey(&normalised_key)
         .is_none()
     {
-        profile.auth.public_keys.push(DeviceKey::new(
+        profile.add_device(DeviceKey::new(
             normalised_key.as_str().to_string(),
             chosen.scope.clone(),
             chosen.label.clone(),

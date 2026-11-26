@@ -26,6 +26,17 @@ impl PrincipalProfile {
                 self.profile_version, CURRENT_PROFILE_VERSION
             )));
         }
+        if self.profile_version < super::DEVICE_REGISTRATION_PROFILE_VERSION
+            && self
+                .auth
+                .public_keys
+                .iter()
+                .any(|key| key.registration_id.is_some())
+        {
+            return Err(ProfileError::Invalid(
+                "device registration IDs require profile_version 2 or later".into(),
+            ));
+        }
         self.quotas.validate()?;
         self.auth.validate()?;
         self.typed_fields()?;
@@ -390,6 +401,7 @@ mod tests {
             scope: DeviceScope::Full,
             label: None,
             created_at: 0,
+            registration_id: None,
         }];
         assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
     }
@@ -404,6 +416,7 @@ mod tests {
             scope: DeviceScope::Full,
             label: None,
             created_at: 0,
+            registration_id: None,
         }];
         assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
     }
@@ -440,6 +453,7 @@ mod tests {
             scope: DeviceScope::Full,
             label: None,
             created_at: 0,
+            registration_id: None,
         }];
         assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
     }
