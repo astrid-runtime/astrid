@@ -610,7 +610,7 @@ async fn device_retirement_drains_wasmtime_socket_and_captured_publication() {
         let session = registry
             .challenge(principal.clone())
             .unwrap()
-            .bind(key.clone())
+            .bind(key.clone(), None)
             .unwrap();
         let (socket, mut peer) = tokio::net::UnixStream::pair().unwrap();
         let mut disconnected = state.event_bus.subscribe_topic("client.v1.disconnect");

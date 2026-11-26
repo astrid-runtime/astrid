@@ -12,18 +12,22 @@ async fn retire_waits_for_every_matching_session_and_fences_earlier_challenges()
     let mut a = sessions
         .challenge(alice.clone())
         .unwrap()
-        .bind(key.clone())
+        .bind(key.clone(), None)
         .unwrap();
     let mut b = sessions
         .challenge(alice.clone())
         .unwrap()
-        .bind(key.clone())
+        .bind(key.clone(), None)
         .unwrap();
-    let foreign = sessions.challenge(bob).unwrap().bind(key.clone()).unwrap();
+    let foreign = sessions
+        .challenge(bob)
+        .unwrap()
+        .bind(key.clone(), None)
+        .unwrap();
     let sibling = sessions
         .challenge(alice.clone())
         .unwrap()
-        .bind(other.clone())
+        .bind(other.clone(), None)
         .unwrap();
     {
         let mut retiring = std::pin::pin!(sessions.retire_with_receipt(&alice, &key));
@@ -46,14 +50,14 @@ async fn retire_waits_for_every_matching_session_and_fences_earlier_challenges()
         assert_eq!(receipt.key_id(), key.as_str());
     }
     assert!(matches!(
-        pending.bind(key.clone()),
+        pending.bind(key.clone(), None),
         Err(DeviceSessionError::Retired)
     ));
-    assert!(pending_sibling.bind(other).is_ok());
-    assert!(!foreign.0.has_changed().unwrap());
-    assert!(!sibling.0.has_changed().unwrap());
+    assert!(pending_sibling.bind(other, None).is_ok());
+    assert!(!foreign.signal.has_changed().unwrap());
+    assert!(!sibling.signal.has_changed().unwrap());
     // A new challenge may authenticate the same key after an authorized re-pair.
-    assert!(sessions.challenge(alice).unwrap().bind(key).is_ok());
+    assert!(sessions.challenge(alice).unwrap().bind(key, None).is_ok());
 }
 
 struct ObservedWork {
@@ -108,7 +112,7 @@ async fn serving_work_drops_before_session_closure_on_every_exit() {
         let key = DeviceKeyId::new("a".repeat(16)).unwrap();
         let challenge = registry.challenge(owner.clone()).unwrap();
         let channel = challenge.signal.clone();
-        let session = challenge.bind(key.clone()).unwrap();
+        let session = challenge.bind(key.clone(), None).unwrap();
         let (first_poll, started) = tokio::sync::oneshot::channel();
         let (drop_tx, dropped) = tokio::sync::oneshot::channel();
         let work = ObservedWork {

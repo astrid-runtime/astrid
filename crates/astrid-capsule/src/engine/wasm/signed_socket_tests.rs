@@ -11,7 +11,7 @@ fn connection(
     let session = registry
         .challenge(owner.clone())
         .unwrap()
-        .bind(key.clone())
+        .bind(key.clone(), None)
         .unwrap();
     let (server, peer) = LocalStream::pair().unwrap();
     (

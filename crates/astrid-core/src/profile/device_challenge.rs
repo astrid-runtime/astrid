@@ -88,18 +88,17 @@ fn accepts<T, S, K: Fn(&T) -> Option<&str>, V: Fn(&S, &str, &[u8]) -> bool>(
     }
 }
 
-/// Return the fingerprint of the very record whose public key validated the signature.
-pub(super) fn signed_device_id<T, S, K: Fn(&T) -> Option<&str>, I: Fn(&T) -> &str, V: Fn(&S, &str, &[u8]) -> bool>(
-    records: &[T], signature: &S, message: &[u8], public_key: K, fingerprint: I, verify: V,
-) -> (selected: Option<String>)
+/// Return the complete record whose public key validated the signature.
+pub(super) fn signed_device<'a, T, S, K: Fn(&T) -> Option<&str>, V: Fn(&S, &str, &[u8]) -> bool>(
+    records: &'a [T], signature: &S, message: &[u8], public_key: K, verify: V,
+) -> (selected: Option<&'a T>)
     requires
         forall|r: &T| #[trigger] public_key.requires((r,)),
-        forall|r: &T| #[trigger] fingerprint.requires((r,)),
         forall|k: &str| #[trigger] verify.requires((signature, k, message)),
     ensures match selected {
-        Some(id) => exists|i: int| 0 <= i < records.len()
+        Some(record) => exists|i: int| 0 <= i < records.len()
             && observed(&records@[i], signature, message, public_key, verify, true)
-            && (exists|label: &str| fingerprint.ensures((&records@[i],), label) && label@ == id@)
+            && *record == records@[i]
             && forall|j: int| 0 <= j < i ==>
                 observed(&records@[j], signature, message, public_key, verify, false),
         None => forall|j: int| 0 <= j < records.len() ==>
@@ -111,14 +110,13 @@ pub(super) fn signed_device_id<T, S, K: Fn(&T) -> Option<&str>, I: Fn(&T) -> &st
         invariant
             i <= records.len(),
             forall|r: &T| #[trigger] public_key.requires((r,)),
-            forall|r: &T| #[trigger] fingerprint.requires((r,)),
             forall|k: &str| #[trigger] verify.requires((signature, k, message)),
             forall|j: int| 0 <= j < i ==> observed(&records@[j], signature, message, public_key, verify, false),
         decreases records.len() - i,
     {
         let record = &records[i];
         if accepts(record, signature, message, &public_key, &verify) {
-            return Some(fingerprint(record).to_owned());
+            return Some(record);
         }
         i = i.saturating_add(1);
     }

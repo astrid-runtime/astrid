@@ -489,7 +489,7 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
         (
             "signature selects another registered device",
             DEVICE_CHALLENGE,
-            lambda text: replace_once(text, "fingerprint(record).to_owned()", "fingerprint(&records[0]).to_owned()"),
+            lambda text: replace_once(text, "return Some(record);", "return Some(&records[0]);"),
         ),
         (
             "device verification drops the signed message",

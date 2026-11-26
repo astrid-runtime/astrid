@@ -8,7 +8,7 @@ mod phase;
 pub use phase::DeviceRetirement;
 use phase::{Entry, Phase};
 
-use super::DeviceKeyId;
+use super::{DeviceKeyId, DeviceRegistrationId};
 use crate::PrincipalId;
 
 /// Failure to establish or retire local device authority.
@@ -35,7 +35,10 @@ pub struct DeviceChallenge {
 
 /// Held until the serving future and its transport have been dropped.
 #[derive(Debug)]
-pub struct DeviceSession(watch::Receiver<bool>);
+pub struct DeviceSession {
+    signal: watch::Receiver<bool>,
+    registration: Option<DeviceRegistrationId>,
+}
 
 impl DeviceSessions {
     /// Register before consulting the profile or issuing a challenge.
@@ -103,7 +106,11 @@ impl DeviceChallenge {
     ///
     /// # Errors
     /// Fails if the key retired or the registry state is unavailable.
-    pub fn bind(self, key: DeviceKeyId) -> Result<DeviceSession, DeviceSessionError> {
+    pub fn bind(
+        self,
+        key: DeviceKeyId,
+        registration: Option<DeviceRegistrationId>,
+    ) -> Result<DeviceSession, DeviceSessionError> {
         let mut entries = self
             .sessions
             .0
@@ -115,7 +122,10 @@ impl DeviceChallenge {
             key.into_inner(),
             watch::Sender::same_channel,
         ) {
-            phase::Binding::Bound => Ok(DeviceSession(self.receiver)),
+            phase::Binding::Bound => Ok(DeviceSession {
+                signal: self.receiver,
+                registration,
+            }),
             phase::Binding::Retired => Err(DeviceSessionError::Retired),
             phase::Binding::Missing => Err(DeviceSessionError::Unavailable),
         }
@@ -145,6 +155,12 @@ impl<Start> ServingSession<Start> {
 }
 
 impl DeviceSession {
+    /// Registration that signed the challenge. Legacy profile entries have no generation.
+    #[must_use]
+    pub fn registration(&self) -> Option<DeviceRegistrationId> {
+        self.registration
+    }
+
     /// Own the serving future and release its transport and pending operations
     /// before the registry can observe this session closed.
     pub fn serve<F: Future<Output = ()>>(
@@ -162,13 +178,13 @@ impl DeviceSession {
     /// session throughout a synchronous effect admitted by this observation.
     #[must_use]
     pub fn is_retired(&self) -> bool {
-        *self.0.borrow()
+        *self.signal.borrow()
     }
 
     /// Run one operation under this session. Retirement cancels the operation,
     /// and the receiver stays live until its future has been dropped.
     pub async fn while_live<F: Future>(&self, operation: F) -> Option<F::Output> {
-        let mut signal = self.0.clone();
+        let mut signal = self.signal.clone();
         tokio::select! {
             biased;
             _ = signal.wait_for(|retired| *retired) => None,
@@ -178,7 +194,7 @@ impl DeviceSession {
 
     /// Resolves on retirement, including retirement before the first poll.
     pub async fn retired(&mut self) {
-        let _ = self.0.wait_for(|retired| *retired).await;
+        let _ = self.signal.wait_for(|retired| *retired).await;
     }
 }
 

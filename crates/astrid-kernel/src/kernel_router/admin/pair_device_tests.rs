@@ -761,6 +761,7 @@ async fn post_rename_sync_error_withholds_ack_and_invalidates_the_live_profile()
     let (_dir, kernel) = fixture().await;
     let caller = pid("device_owner");
     let key = full_device('a');
+    let registration = key.registration_id;
     let id = key.key_id.clone();
     seed(&kernel, &caller, &["self:*"], vec![key]);
     assert!(
@@ -776,7 +777,10 @@ async fn post_rename_sync_error_withholds_ack_and_invalidates_the_live_profile()
         .device_sessions()
         .challenge(caller.clone())
         .unwrap()
-        .bind(astrid_core::profile::DeviceKeyId::new(id.clone()).unwrap())
+        .bind(
+            astrid_core::profile::DeviceKeyId::new(id.clone()).unwrap(),
+            registration,
+        )
         .unwrap();
     let mut revoke = std::pin::pin!(
         super::pair_device_handlers::revoke_with_failed_directory_sync(&kernel, &caller, &id)
@@ -812,6 +816,7 @@ async fn list_and_revoke_round_trip_and_fail_closed() {
     let full = full_device('a');
     let scoped = scoped_device('b', &["self:*"], &["self:auth:pair"]);
     let full_id = full.key_id.clone();
+    let registration = scoped.registration_id;
     let scoped_id = scoped.key_id.clone();
     seed(&kernel, &caller, &["self:*"], vec![full, scoped]);
 
@@ -841,7 +846,10 @@ async fn list_and_revoke_round_trip_and_fail_closed() {
         .device_sessions()
         .challenge(caller.clone())
         .unwrap()
-        .bind(astrid_core::profile::DeviceKeyId::new(scoped_id.clone()).unwrap())
+        .bind(
+            astrid_core::profile::DeviceKeyId::new(scoped_id.clone()).unwrap(),
+            registration,
+        )
         .unwrap();
     let mut revoke = std::pin::pin!(handlers::dispatch(
         &kernel,

@@ -32,7 +32,7 @@
 use astrid_core::local_transport::{self, LocalStream};
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::device_sessions::{DeviceSession, DeviceSessions};
-use astrid_core::profile::{DeviceKey, DeviceKeyId};
+use astrid_core::profile::{DeviceKey, DeviceKeyId, DeviceRegistrationId};
 use astrid_core::session_token::{
     HandshakeRequest, HandshakeResponse, PRINCIPAL_AUTH_NONCE_LEN, PROTOCOL_VERSION, SessionToken,
 };
@@ -208,15 +208,16 @@ where
     // Verify against a key registered on the claimed principal's profile.
     // On success this yields the matched device's `key_id` so the connection
     // can be scoped to that device at the cap-gate.
-    let key_id = match verify_principal_signature(&principal, &nonce_hex, &signature_hex, home) {
-        Ok(key_id) => key_id,
-        Err(reason) => {
-            send_auth_failed(stream).await;
-            return Err(reason);
-        },
-    };
+    let (key_id, registration) =
+        match verify_principal_signature(&principal, &nonce_hex, &signature_hex, home) {
+            Ok(binding) => binding,
+            Err(reason) => {
+                send_auth_failed(stream).await;
+                return Err(reason);
+            },
+        };
 
-    let session = match admission.bind(DeviceKeyId::new(key_id.clone())?) {
+    let session = match admission.bind(DeviceKeyId::new(key_id.clone())?, registration) {
         Ok(session) => session,
         Err(error) => {
             send_auth_failed(stream).await;
@@ -232,16 +233,14 @@ where
 /// Loads the principal's profile from the resolved [`AstridHome`] and
 /// delegates the pure check to [`verify_signature_against_keys`].
 ///
-/// Returns `Ok(key_id)` — the matched [`DeviceKey`]'s fingerprint — if any
-/// registered `ed25519:<hex>` key verifies the signature, `Err(reason)`
-/// otherwise. Fail-closed: an unreadable profile, a disabled principal, a
+/// Returns the fingerprint and persisted registration ID of the signing key. Fail-closed: an unreadable profile, a disabled principal, a
 /// principal with no registered keys, or a malformed signature all reject.
 fn verify_principal_signature(
     principal: &PrincipalId,
     nonce_hex: &str,
     signature_hex: &str,
     home: &astrid_core::dirs::AstridHome,
-) -> Result<String, String> {
+) -> Result<(String, Option<DeviceRegistrationId>), String> {
     let profile = astrid_core::PrincipalProfile::load(home, principal)
         .map_err(|e| format!("cannot load principal profile: {e}"))?;
 
@@ -254,7 +253,7 @@ fn verify_principal_signature(
 /// Pure signature check: does `signature_hex` verify the challenge message for
 /// `principal` against any registered [`DeviceKey`] in `public_keys`?
 ///
-/// Returns the matched [`DeviceKey::key_id`] on success so the caller can bind
+/// Returns both identity fields of the signing registration so the caller can bind
 /// the connection to that specific device for scope attenuation at the
 /// cap-gate. Separated from profile/disk loading so it is unit-testable
 /// without an `AstridHome` or environment. We do NOT short-circuit on the
@@ -267,7 +266,7 @@ fn verify_signature_against_keys(
     public_keys: &[DeviceKey],
     nonce_hex: &str,
     signature_hex: &str,
-) -> Result<String, String> {
+) -> Result<(String, Option<DeviceRegistrationId>), String> {
     let signature = astrid_crypto::Signature::from_hex(signature_hex)
         .map_err(|e| format!("malformed signature: {e}"))?;
 
@@ -278,6 +277,7 @@ fn verify_signature_against_keys(
         &signature,
         astrid_crypto::Signature::verifies_with_hex_key,
     )
+    .map(|device| (device.key_id.clone(), device.registration_id))
 }
 
 /// Generate a fresh hex-encoded challenge nonce from the OS CSPRNG.

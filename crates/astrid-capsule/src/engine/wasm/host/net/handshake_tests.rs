@@ -55,9 +55,8 @@ fn challenge_signature_verifies_against_registered_key() {
             &[other_registered.clone(), registered.clone()],
             &nonce_hex,
             &signature
-        )
-        .as_deref(),
-        Ok(registered.key_id.as_str()),
+        ),
+        Ok((registered.key_id.clone(), registered.registration_id)),
         "valid signature must verify and return the matched device key_id"
     );
 
@@ -287,6 +286,9 @@ async fn handshake_signed_returns_verified_principal() {
     let principal = PrincipalId::new("alice").expect("valid principal");
     let keypair = astrid_crypto::KeyPair::generate();
     let (_dir, home) = home_with_registered_key(&principal, &keypair);
+    let saved = astrid_core::PrincipalProfile::load(&home, &principal).unwrap();
+    let expected = &saved.auth.public_keys[0];
+    assert!(expected.registration_id.is_some());
 
     let (mut server, mut client) = tokio::io::duplex(16 * 1024);
     let tok = token();
@@ -298,10 +300,9 @@ async fn handshake_signed_returns_verified_principal() {
     sign_challenge(&mut client, tok_hex, &principal, &keypair).await;
 
     let verified = server_task.await.unwrap().expect("handshake ok");
-    let expected_key_id = full_device(&keypair).key_id;
     assert_eq!(
-        verified.map(|(p, key, _session)| (p, key)),
-        Some((principal, expected_key_id)),
+        verified.map(|(p, key, session)| (p, key, session.registration())),
+        Some((principal, expected.key_id.clone(), expected.registration_id)),
         "a valid signed handshake yields the verified principal and matched device key_id"
     );
 }

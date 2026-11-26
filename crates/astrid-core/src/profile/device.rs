@@ -464,25 +464,24 @@ impl DeviceKey {
     ///
     /// # Errors
     /// Fails if no admitted device verifies the signature.
-    pub fn identify_signer<S>(
-        keys: &[Self],
+    pub fn identify_signer<'a, S>(
+        keys: &'a [Self],
         principal: &crate::PrincipalId,
         nonce_hex: &str,
         signature: &S,
         verify: impl Fn(&S, &str, &[u8]) -> bool,
-    ) -> Result<String, String> {
+    ) -> Result<&'a Self, String> {
         let message =
             crate::session_token::principal_auth_challenge_message(principal.as_str(), nonce_hex);
-        let device = super::device_challenge::signed_device_id(
+        let device = super::device_challenge::signed_device(
             keys,
             signature,
             message.as_bytes(),
             |record| record.typed_pubkey().ok().map(|key| key.0),
-            |record| record.key_id.as_str(),
             verify,
         );
         match device {
-            Some(id) => Ok(id),
+            Some(record) => Ok(record),
             None if keys.is_empty() => Err(format!(
                 "principal {principal} has no registered ed25519 key"
             )),

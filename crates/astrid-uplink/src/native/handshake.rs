@@ -4,7 +4,7 @@ use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
 use astrid_core::local_transport::{self, LocalStream};
 use astrid_core::profile::device_sessions::{DeviceSession, DeviceSessions};
-use astrid_core::profile::{DeviceKey, DeviceKeyId};
+use astrid_core::profile::{DeviceKey, DeviceKeyId, DeviceRegistrationId};
 use astrid_core::session_token::{
     HandshakeRequest, HandshakeResponse, PRINCIPAL_AUTH_NONCE_LEN, PROTOCOL_VERSION, SessionToken,
 };
@@ -162,9 +162,9 @@ where
         return Err("missing signature in second handshake frame".to_string());
     };
     match verify_signature(&principal, &nonce_hex, &signature_hex, home) {
-        Ok(key_id) => {
+        Ok((key_id, registration)) => {
             let key = DeviceKeyId::new(key_id.clone())?;
-            let session = match admission.bind(key) {
+            let session = match admission.bind(key, registration) {
                 Ok(session) => session,
                 Err(error) => {
                     send_auth_failed(stream).await;
@@ -185,7 +185,7 @@ fn verify_signature(
     nonce_hex: &str,
     signature_hex: &str,
     home: &AstridHome,
-) -> Result<String, String> {
+) -> Result<(String, Option<DeviceRegistrationId>), String> {
     let profile = astrid_core::PrincipalProfile::load(home, principal)
         .map_err(|error| format!("cannot load principal profile: {error}"))?;
     let keys = profile.active_keypair_keys().ok_or_else(|| {
@@ -199,7 +199,7 @@ fn verify_signature_against_keys(
     public_keys: &[DeviceKey],
     nonce_hex: &str,
     signature_hex: &str,
-) -> Result<String, String> {
+) -> Result<(String, Option<DeviceRegistrationId>), String> {
     let signature = astrid_crypto::Signature::from_hex(signature_hex)
         .map_err(|error| format!("malformed signature: {error}"))?;
     DeviceKey::identify_signer(
@@ -209,6 +209,7 @@ fn verify_signature_against_keys(
         &signature,
         astrid_crypto::Signature::verifies_with_hex_key,
     )
+    .map(|device| (device.key_id.clone(), device.registration_id))
 }
 
 fn generate_nonce_hex() -> Result<String, String> {
@@ -328,6 +329,9 @@ mod tests {
         let principal = PrincipalId::new("alice").expect("principal");
         let keypair = astrid_crypto::KeyPair::generate();
         let (_temp, home) = home_with_key(&principal, &keypair);
+        let saved = astrid_core::PrincipalProfile::load(&home, &principal).unwrap();
+        let expected = &saved.auth.public_keys[0];
+        assert!(expected.registration_id.is_some());
         let token = SessionToken::generate();
         let token_hex = token.to_hex();
         let (mut server, mut client) = tokio::io::duplex(16 * 1024);
@@ -374,8 +378,8 @@ mod tests {
         assert!(response.is_ok());
         let identity = task.await.expect("server task").expect("valid handshake");
         assert_eq!(
-            identity.map(|(p, k, _)| (p, k)),
-            Some((principal, full_device(&keypair).key_id))
+            identity.map(|(p, k, session)| (p, k, session.registration())),
+            Some((principal, expected.key_id.clone(), expected.registration_id))
         );
     }
 

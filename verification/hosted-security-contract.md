@@ -170,10 +170,11 @@ message with the same checked function. For a fixed protocol prefix and
 colon-free principal names, equal transcripts imply equal principals and
 nonces, even if the nonce contains a colon. The shared registration scan
 passes the actual signature, message bytes and each candidate's canonical
-public key to the verifier. It returns the fingerprint from the first
-accepting record and skips records without a canonical key. These guarantees
-are relative to the production key and fingerprint projections and the
-verification callback. Hex decoding, Ed25519 verification, nonce generation,
+public key to the verifier. It returns the complete first accepting record, including its persisted registration ID,
+and skips records without a canonical key. Both socket adapters copy the fingerprint
+and registration ID from that record into handshake admission. The resulting session
+retains the registration ID, including its absence on a legacy key. The scan proof
+assumes the production key projection and signature verification callback. Hex decoding, Ed25519 verification, nonce generation,
 profile freshness at effect admission and the lifetime of the socket owner's
 generation remain outside these theorems.
 

@@ -303,7 +303,7 @@ async fn workspace_portal_discovery_and_runtime_keep_the_selected_hosted_portal(
         .await
         .unwrap();
     assert!(matches!(
-        challenge.bind(key),
+        challenge.bind(key, None),
         Err(astrid_core::profile::device_sessions::DeviceSessionError::Retired)
     ));
     let Some(mut capsule) = runtime.ok() else {
