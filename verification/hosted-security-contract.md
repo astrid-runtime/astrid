@@ -287,6 +287,14 @@ Kernel capsule-context construction withholds this listener once claimed.
 An embedded kernel may instead supply its listener to a capsule, so its
 authenticated socket path is a separate production obligation.
 
+Live device admission and profile revocation use the same checked search.
+For the fingerprint projected from each record, a unique match selects the
+entire original record, including its persisted registration ID and scope.
+No match or multiple matches yield a denial for admission and leave the
+registration vector untouched on removal. The profile file, UUID generator and
+its atomic publication remain trusted for this step. Generation-aware binding
+at ingress and subsequent consumer effects is still required.
+
 Both Wasmtime socket accept methods read device registrations from the
 profile home captured by the kernel cache when supplied. A signed socket test
 exercises both methods with an explicit temporary home. Each method registers

@@ -41,7 +41,7 @@ use thiserror::Error;
 mod device;
 mod device_admission;
 pub(crate) mod device_challenge;
-mod device_removal;
+mod device_registration;
 pub mod device_sessions;
 mod field;
 mod io_impl;
@@ -517,15 +517,9 @@ impl PrincipalProfile {
     /// Ambiguous fingerprints confer no device authority.
     #[must_use]
     pub fn active_device<S: AsRef<str>>(&self, id: &DeviceKeyId<S>) -> Option<&DeviceKey> {
-        let mut matches = self
-            .active_keypair_keys()?
-            .iter()
-            .filter(|key| device_admission::same_id(key.key_id.as_bytes(), id.as_str().as_bytes()));
-        let device = matches.next()?;
-        if matches.next().is_some() {
-            return None;
-        }
-        Some(device)
+        device_registration::resolve_unique(self.active_keypair_keys()?, id.as_str(), |key| {
+            key.key_id.as_str()
+        })
     }
 
     /// Append a device and declare the profile format required to retain its

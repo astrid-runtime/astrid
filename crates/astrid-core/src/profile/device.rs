@@ -137,7 +137,7 @@ impl super::AuthConfig {
     #[must_use]
     pub fn remove_device<S: AsRef<str>>(&mut self, key: &DeviceKeyId<S>) -> Option<DeviceKeyId> {
         let removed =
-            super::device_removal::remove_unique(&mut self.public_keys, key.as_str(), |device| {
+            super::device_registration::remove_unique(&mut self.public_keys, key.as_str(), |device| {
                 device.key_id.as_str()
             })?;
         if self.public_keys.is_empty() {

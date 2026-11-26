@@ -48,13 +48,13 @@ NATIVE_QUEUE = Path("crates/astrid-uplink/src/native/delivery_queue.rs")
 NATIVE_REPLY = Path("crates/astrid-uplink/src/native/reply_claim.rs")
 NATIVE_FRAME = Path("crates/astrid-uplink/src/native/frame_segments.rs")
 DEVICE_SESSIONS = Path("crates/astrid-core/src/profile/device_sessions/phase.rs")
-DEVICE_REMOVAL = Path("crates/astrid-core/src/profile/device_removal.rs")
+DEVICE_REGISTRATION = Path("crates/astrid-core/src/profile/device_registration.rs")
 DEVICE_CHALLENGE = Path("crates/astrid-core/src/profile/device_challenge.rs")
 INPUTS = [
     ORDERED_DISPATCH,
     DELIVERY_COMMIT,
     DEVICE_CHALLENGE,
-    DEVICE_REMOVAL,
+    DEVICE_REGISTRATION,
     DEVICE_SESSIONS,
     NATIVE_FRAME,
     NATIVE_REPLY,
@@ -468,12 +468,12 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
         ),
         (
             "profile removal selects an unrelated key",
-            DEVICE_REMOVAL,
+            DEVICE_REGISTRATION,
             lambda text: replace_once(text, "if k == requested {", "if k != requested {"),
         ),
         (
             "profile removal drops the first record instead of its unique match",
-            DEVICE_REMOVAL,
+            DEVICE_REGISTRATION,
             lambda text: replace_once(text, "registrations.remove(index)", "registrations.remove(0)"),
         ),
         (
@@ -512,9 +512,14 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             lambda text: replace_once(text, "    if enabled && keypair", "    if enabled"),
         ),
         (
-            "device stamp matches another fingerprint",
-            DEVICE_ADMISSION,
-            lambda text: replace_once(text, "    if registered != stamped", "    if false"),
+            "device admission returns the first record instead of its unique match",
+            DEVICE_REGISTRATION,
+            lambda text: replace_once(text, "Some(&registrations[index])", "Some(&registrations[0])"),
+        ),
+        (
+            "duplicate device records authorize the first registration",
+            DEVICE_REGISTRATION,
+            lambda text: replace_once(text, "                return None;", "                return Some(_previous);"),
         ),
         (
             "authenticated forward ignores topic",
