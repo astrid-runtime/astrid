@@ -29,6 +29,7 @@ use std::sync::Arc;
 use astrid_core::dirs::AstridHome;
 use astrid_core::kernel_api::{KernelRequest, KernelResponse};
 use astrid_core::local_transport::{self, LocalListener, LocalStream, LocalWriteHalf};
+use astrid_core::profile::device_sessions::DeviceSessions;
 use astrid_core::session_token::SessionToken;
 use astrid_events::{AstridEvent, EventBus, EventMetadata};
 use astrid_types::Topic;
@@ -71,6 +72,7 @@ struct ConnectionAdmission {
 }
 
 struct ConnectionRuntime {
+    device_sessions: DeviceSessions,
     services: ConnectionServices,
     session_token: Arc<SessionToken>,
     home: AstridHome,
@@ -88,14 +90,14 @@ impl ConnectionRuntime {
         handshake_permit: tokio::sync::OwnedSemaphorePermit,
     ) {
         let mut shutdown = self.shutdown.clone();
-        let identity = tokio::select! {
+        let (identity, session) = tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     return;
                 }
                 return;
             },
-            result = handshake::authenticate(&mut stream, &self.session_token, &self.home) => {
+            result = handshake::authenticate(&mut stream, &self.session_token, &self.home, &self.device_sessions) => {
                 match result {
                     Ok(identity) => identity,
                     Err(reason) => {
@@ -109,6 +111,25 @@ impl ConnectionRuntime {
                 }
             },
         };
+        let serving = self.serve_authenticated(stream, handshake_permit, identity, shutdown);
+        if let Some(mut session) = session {
+            tokio::select! {
+                biased;
+                () = session.retired() => {},
+                () = serving => {},
+            }
+        } else {
+            serving.await;
+        }
+    }
+
+    async fn serve_authenticated(
+        &self,
+        mut stream: LocalStream,
+        handshake_permit: tokio::sync::OwnedSemaphorePermit,
+        identity: AuthenticatedIdentity,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
         let admission =
             if let Ok(permit) = Arc::clone(&self.established_permits).try_acquire_owned() {
                 ConnectionAdmission {
@@ -196,7 +217,7 @@ impl NativeUplink {
     /// requested or the listener becomes unusable.
     #[must_use]
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(self.run(ConnectionServices::default()))
+        tokio::spawn(self.run(ConnectionServices::default(), DeviceSessions::default()))
     }
 
     /// Attach a runtime-owned private reply handler without changing legacy
@@ -206,7 +227,7 @@ impl NativeUplink {
         self,
         handler: Arc<dyn private_elicit::PrivateElicitResponder>,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(self.run(Some(handler).into()))
+        tokio::spawn(self.run(Some(handler).into(), DeviceSessions::default()))
     }
 
     /// Attach principal-scoped capsule readiness to native input admission.
@@ -217,13 +238,27 @@ impl NativeUplink {
         probe: astrid_core::kernel_api::CapsuleTopicProbe,
         private_elicits: Option<Arc<dyn private_elicit::PrivateElicitResponder>>,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(self.run(ConnectionServices {
-            private_elicits,
-            topic_probe: Some(probe),
-        }))
+        self.spawn_with_device_sessions(probe, private_elicits, DeviceSessions::default())
     }
 
-    async fn run(mut self, services: ConnectionServices) {
+    /// Attach the kernel registry that drains connections on device removal.
+    #[must_use]
+    pub fn spawn_with_device_sessions(
+        self,
+        probe: astrid_core::kernel_api::CapsuleTopicProbe,
+        private_elicits: Option<Arc<dyn private_elicit::PrivateElicitResponder>>,
+        device_sessions: DeviceSessions,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(self.run(
+            ConnectionServices {
+                private_elicits,
+                topic_probe: Some(probe),
+            },
+            device_sessions,
+        ))
+    }
+
+    async fn run(mut self, services: ConnectionServices, device_sessions: DeviceSessions) {
         let handshake_permits = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
         let established_permits =
             Arc::new(tokio::sync::Semaphore::new(MAX_ESTABLISHED_CONNECTIONS));
@@ -232,6 +267,7 @@ impl NativeUplink {
         let egress_registry = egress::Registry::install(&self.event_bus);
         let (connection_shutdown_tx, connection_shutdown_rx) = tokio::sync::watch::channel(false);
         let runtime = Arc::new(ConnectionRuntime {
+            device_sessions,
             services,
             session_token: Arc::clone(&self.session_token),
             home: self.home.clone(),
@@ -502,6 +538,23 @@ async fn process_inbound(
     process_validated_inbound(event_bus, identity, principal, receiver, validated).await
 }
 
+struct ConnectedClient<'a> {
+    bus: &'a EventBus,
+    principal: &'a str,
+}
+
+impl Drop for ConnectedClient<'_> {
+    fn drop(&mut self) {
+        publish_lifecycle(
+            self.bus,
+            Topic::client_disconnect(),
+            self.principal,
+            Some("socket closed"),
+        );
+        tracing::info!(principal = %self.principal, "local client disconnected");
+    }
+}
+
 async fn serve_connection(
     stream: LocalStream,
     identity: AuthenticatedIdentity,
@@ -524,6 +577,12 @@ async fn serve_connection(
     let reserved_deadline = tokio::time::Instant::now()
         .checked_add(RESERVED_ADMIN_LIFETIME)
         .unwrap_or_else(tokio::time::Instant::now);
+    // Pending inputs drop before disconnect publication, including on revocation.
+    let _connected = ConnectedClient {
+        bus: &event_bus,
+        principal: &principal,
+    };
+    publish_lifecycle(&event_bus, Topic::client_connect(), &principal, None);
     let mut pending = admission
         .initial_message
         .take()
@@ -534,7 +593,6 @@ async fn serve_connection(
     // Cancellation must remain available while ordinary input and a human
     // reply both wait. Exactly one independently polled, timeout-bounded slot.
     let mut cancellation: Option<PendingInput<'_>> = None;
-    publish_lifecycle(&event_bus, Topic::client_connect(), &principal, None);
     tracing::info!(%principal, authenticated = identity.is_principal_verified(), "local client connected");
 
     loop {
@@ -610,17 +668,6 @@ async fn serve_connection(
             },
         }
     }
-
-    drop(pending); // Abandon any unpublished turn before disconnect notification.
-    drop(control);
-    drop(cancellation);
-    publish_lifecycle(
-        &event_bus,
-        Topic::client_disconnect(),
-        &principal,
-        Some("socket closed"),
-    );
-    tracing::info!(%principal, "local client disconnected");
 }
 
 async fn forward_connection_egress(

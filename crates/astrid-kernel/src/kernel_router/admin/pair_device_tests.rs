@@ -736,16 +736,28 @@ async fn list_and_revoke_round_trip_and_fail_closed() {
             .any(|d| d.key_id == scoped_id && matches!(d.scope, DeviceScope::Scoped { .. })),
     );
 
-    // Revoke the scoped device.
-    let resp = handlers::dispatch(
+    // Acknowledgement must follow release of the signed connection.
+    let mut live = kernel
+        .device_sessions()
+        .challenge(caller.clone())
+        .unwrap()
+        .bind(astrid_core::profile::DeviceKeyId::new(scoped_id.clone()).unwrap())
+        .unwrap();
+    let mut revoke = std::pin::pin!(handlers::dispatch(
         &kernel,
         &caller,
         AdminRequestKind::PairDeviceRevoke {
             principal: caller.clone(),
             key_id: scoped_id.clone(),
         },
-    )
-    .await;
+    ));
+    tokio::select! {
+        biased;
+        _ = &mut revoke => panic!("revocation acknowledged a live device session"),
+        () = live.retired() => {}
+    }
+    drop(live);
+    let resp = revoke.await;
     match resp {
         AdminResponseBody::PairDeviceRevoked { key_id } => assert_eq!(key_id, scoped_id),
         other => panic!("revoke must return PairDeviceRevoked: {other:?}"),
