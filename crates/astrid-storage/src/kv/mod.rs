@@ -116,13 +116,11 @@ pub(super) fn validate_key(key: &str) -> StorageResult<()> {
     Ok(())
 }
 
+mod encoding;
+
 /// Build the composite key `"{namespace}\0{key}"` as bytes.
 pub(super) fn composite_key(namespace: &str, key: &str) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(namespace.len().saturating_add(1).saturating_add(key.len()));
-    buf.extend_from_slice(namespace.as_bytes());
-    buf.push(0);
-    buf.extend_from_slice(key.as_bytes());
-    buf
+    encoding::composite(namespace.as_bytes(), key.as_bytes())
 }
 
 /// Build the start of the namespace range (inclusive): `"{namespace}\0"`.

@@ -26,7 +26,9 @@ ENTRY = Path("verification/hosted_authority.rs")
 MODEL = Path("verification/hosted_authority_model.rs")
 AUTHORITY = Path("crates/astrid-capabilities/src/store/authority.rs")
 GUEST_AUTHORITY = Path("crates/astrid-storage/src/principal_state/guest_authority.rs")
+KV_ENCODING = Path("crates/astrid-storage/src/kv/encoding.rs")
 INPUTS = [
+    KV_ENCODING,
     GUEST_AUTHORITY,
     ENTRY,
     MODEL,
@@ -108,6 +110,16 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
         for item in PROOF_ITEMS
     ]
     return [
+        (
+            "physical entry drops the requested key",
+            KV_ENCODING,
+            lambda text: replace_once(text, "address.extend_from_slice(key);", ""),
+        ),
+        (
+            "physical address loses namespace separation",
+            KV_ENCODING,
+            lambda text: replace_once(text, "address.push(0);", ""),
+        ),
         (
             "guest namespace can follow a replacement owner",
             GUEST_AUTHORITY,

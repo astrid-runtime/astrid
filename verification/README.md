@@ -52,6 +52,22 @@ authenticated ingress for forwarded requests, bus implementation, or global
 coverage of privileged effects. The cancellation check and adapter tests remain
 part of the assurance argument for this path.
 
+## Durable guest KV addresses
+
+The verifier checks two stages of durable point addressing. The namespace selector
+returns the admitted UID exactly when the requested namespace and observed UID
+match the binding. The production entry encoder appends a zero byte and the
+complete key to the namespace bytes. Its injectivity theorem shows two distinct
+namespace/key pairs cannot share an entry address when both namespaces exclude
+zero bytes, as required by the tree adapter. The proof applies equally to
+non-ASCII UTF-8 and keys of different lengths.
+
+The synchronous Wasmtime KV host call holds its operation guard across semaphore
+acquisition and the backend future. On the native tree write path that future
+waits for the blocking worker. The address theorem covers the bytes passed to
+storage. Establishing when a mutation becomes visible relative to retirement,
+cancellation or restart still requires a proof of the surrounding execution.
+
 ## Static capability patterns
 
 Verus checks the production static capability matcher against a segment
