@@ -176,8 +176,16 @@ pub trait WorkspaceMountResolver: Send + Sync {
     async fn resolve(
         &self,
         principal: &astrid_core::principal::PrincipalId,
-        uid: astrid_core::PrincipalUid,
     ) -> Result<PrincipalMount, String>;
+
+    /// Bind this exact admitted UID. Alias-only resolvers cannot establish ownership.
+    async fn resolve_for(
+        &self,
+        _principal: &astrid_core::principal::PrincipalId,
+        _uid: astrid_core::PrincipalUid,
+    ) -> Result<PrincipalMount, String> {
+        Err("workspace resolver does not support UID-bound mounts".to_owned())
+    }
 }
 
 impl std::fmt::Debug for PrincipalMount {

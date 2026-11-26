@@ -28,9 +28,22 @@ impl WorkspaceMountResolver for WorkspaceBranchResolver {
     async fn resolve(
         &self,
         principal: &astrid_core::PrincipalId,
+    ) -> Result<PrincipalMount, String> {
+        Ok(self.mount(self.0.bind(principal).await?))
+    }
+
+    async fn resolve_for(
+        &self,
+        principal: &astrid_core::PrincipalId,
         uid: astrid_core::PrincipalUid,
     ) -> Result<PrincipalMount, String> {
-        let binding = self.0.bind_for(principal, Some(uid)).await?;
+        Ok(self.mount(self.0.bind_for(principal, Some(uid)).await?))
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl WorkspaceBranchResolver {
+    fn mount(&self, binding: crate::context::WorkspaceBranchBinding) -> PrincipalMount {
         let handle = astrid_capabilities::DirHandle::new();
         let vfs = storage_vfs::AstridStorageVfs::workspace(
             &self.0.store(),
@@ -38,11 +51,11 @@ impl WorkspaceMountResolver for WorkspaceBranchResolver {
             binding.branch,
             handle.clone(),
         );
-        Ok(PrincipalMount {
+        PrincipalMount {
             location: PrincipalMountLocation::AstridFilesystem,
             vfs: Arc::new(vfs),
             handle,
-        })
+        }
     }
 }
 
@@ -1207,7 +1220,7 @@ async fn install_principal_overlays(
     let bundle = build_principal_vfs_bundle(store, p, uid);
     state.invocation_home = bundle.home;
     state.invocation_workspace = if let Some(resolver) = state.workspace_mount_resolver.as_ref() {
-        match resolver.resolve(p, uid).await {
+        match resolver.resolve_for(p, uid).await {
             Ok(mount) => Some(mount),
             Err(error) => {
                 tracing::warn!(%p, %error, "failed to resolve Astrid workspace branch; denying workspace access");
@@ -1738,7 +1751,7 @@ impl ExecutionEngine for WasmEngine {
                 ))?;
                 Some(
                     WorkspaceBranchResolver(branches.clone())
-                        .resolve(&ctx.principal, uid)
+                        .resolve_for(&ctx.principal, uid)
                         .await
                         .map_err(CapsuleError::UnsupportedEntryPoint)?,
                 )
