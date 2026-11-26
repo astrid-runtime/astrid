@@ -32,7 +32,7 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
             match handle.node {
                 Node::Leaf(leaf) => {
                     for entry in leaf.entries {
-                        if entry.key.as_slice() >= start && entry.key.as_slice() < end {
+                        if crate::kv::encoding::entry_in_range(&entry.key, start, end) {
                             visit(self, entry)?;
                         }
                     }
@@ -43,8 +43,7 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
                             .children
                             .get(index.saturating_add(1))
                             .map(|next| next.lower_bound.as_slice());
-                        if upper.is_some_and(|upper| upper <= start)
-                            || child.lower_bound.as_slice() >= end
+                        if !crate::kv::encoding::visit_child(&child.lower_bound, upper, start, end)
                         {
                             continue;
                         }

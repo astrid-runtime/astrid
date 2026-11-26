@@ -51,15 +51,15 @@ impl OverlayMap {
         let mut stack = Vec::new();
         std::iter::from_fn(move || {
             while let Some(node) = cursor {
-                if node.entry.key.as_slice() >= start {
+                if crate::kv::encoding::bytewise_less(&node.entry.key, start) {
+                    cursor = node.right.as_deref();
+                } else {
                     stack.push(node);
                     cursor = node.left.as_deref();
-                } else {
-                    cursor = node.right.as_deref();
                 }
             }
             let node = stack.pop()?;
-            if node.entry.key.as_slice() >= end {
+            if !crate::kv::encoding::bytewise_less(&node.entry.key, end) {
                 cursor = None;
                 stack.clear();
                 return None;

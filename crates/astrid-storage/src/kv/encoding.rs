@@ -71,6 +71,72 @@ pub(super) open spec fn below(a: Seq<u8>, b: Seq<u8>) -> bool
     else { a[0] < b[0] || (a[0] == b[0] && below(a.skip(1), b.skip(1))) }
 }
 
+/// Compare the physical addresses used by checkpoint and overlay scans.
+#[inline]
+pub(super) fn bytewise_less(left: &[u8], right: &[u8]) -> (less: bool)
+    ensures less == below(left@, right@),
+{
+    assert(left@.skip(0) =~= left@);
+    assert(right@.skip(0) =~= right@);
+    let mut i = 0usize;
+    while i < left.len() && i < right.len()
+        invariant
+            i <= left.len() && i <= right.len(),
+            below(left@, right@) == below(left@.skip(i as int), right@.skip(i as int)),
+        decreases left.len() - i,
+    {
+        let a = left[i];
+        let b = right[i];
+        if a != b { return a < b; }
+        assert(left@.skip(i as int).skip(1) =~= left@.skip(i as int + 1));
+        assert(right@.skip(i as int).skip(1) =~= right@.skip(i as int + 1));
+        i = i.saturating_add(1);
+    }
+    left.len() < right.len()
+}
+
+#[inline]
+pub(super) fn entry_in_range(key: &[u8], start: &[u8], end: &[u8]) -> (selected: bool)
+    ensures selected == range_contains(start@, end@, key@),
+{
+    !bytewise_less(key, start) && bytewise_less(key, end)
+}
+
+proof fn ordered_split(a: Seq<u8>, middle: Seq<u8>, b: Seq<u8>)
+    requires below(a, b),
+    ensures below(a, middle) || below(middle, b),
+    decreases b.len(),
+{
+    if a.len() > 0 && middle.len() > 0 && a[0] == b[0] && a[0] == middle[0] {
+        ordered_split(a.skip(1), middle.skip(1), b.skip(1));
+    }
+}
+
+/// Prune only children whose key interval cannot contain a requested entry.
+/// The last child has no upper fence.
+#[inline]
+pub(super) fn visit_child(lower: &[u8], upper: Option<&[u8]>, start: &[u8], end: &[u8]) -> (visit: bool)
+    ensures
+        visit == (below(lower@, end@) && match upper { Some(u) => below(start@, u@), None => true }),
+        forall|k: Seq<u8>| #[trigger] range_contains(start@, end@, k)
+            && !below(k, lower@) && (match upper { Some(u) => below(k, u@), None => true })
+            ==> visit,
+{
+    proof {
+        assert forall|k: Seq<u8>| #[trigger] range_contains(start@, end@, k)
+            && !below(k, lower@) && (match upper { Some(u) => below(k, u@), None => true })
+            implies below(lower@, end@) && (match upper { Some(u) => below(start@, u@), None => true })
+        by {
+            ordered_split(k, lower@, end@);
+            if let Some(u) = upper { ordered_split(k, start@, u@); }
+        }
+    }
+    match upper {
+        Some(fence) if !bytewise_less(start, fence) => false,
+        _ => bytewise_less(lower, end),
+    }
+}
+
 pub(super) open spec fn matches_prefix(key: Seq<u8>, prefix: Seq<u8>) -> bool {
     &&& prefix.len() <= key.len()
     &&& forall|i: int| 0 <= i < prefix.len() ==> key[i] == #[trigger] prefix[i]

@@ -111,6 +111,21 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
     ]
     return [
         (
+            "checkpoint leaf ignores the lower fence",
+            KV_ENCODING,
+            lambda text: replace_once(text, "!bytewise_less(key, start) && bytewise_less(key, end)", "bytewise_less(key, end)"),
+        ),
+        (
+            "checkpoint traversal skips the last child",
+            KV_ENCODING,
+            lambda text: replace_once(text, "_ => bytewise_less(lower, end),", "None => false, _ => bytewise_less(lower, end),"),
+        ),
+        (
+            "byte order reverses strict-prefix ties",
+            KV_ENCODING,
+            lambda text: edit_function(text, "bytewise_less", "left.len() < right.len()", "left.len() > right.len()"),
+        ),
+        (
             "prefix range includes sibling namespaces",
             KV_ENCODING,
             lambda text: edit_function(
