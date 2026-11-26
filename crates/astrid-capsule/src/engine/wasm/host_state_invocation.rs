@@ -58,7 +58,7 @@ impl HostState {
             )));
         }
         if let crate::registry::RuntimeScope::Principal(uid) = runtime_id.key().scope() {
-            if self.runtime_owner_uid.is_some_and(|owner| owner != uid) {
+            if !crate::engine::wasm::invocation_owner::accepts(self.runtime_owner_uid, Some(uid)) {
                 return Err(crate::error::CapsuleError::ExecutionFailed(
                     "runtime UID differs from the loaded owner".into(),
                 ));
@@ -708,6 +708,20 @@ mod recv_vfs_tests {
         assert!(
             state
                 .install_run_loop_owner_context(&wrong_capsule, profile, None)
+                .is_err()
+        );
+        state.runtime_owner_uid = Some(astrid_core::PrincipalUid::from_bytes([1; 32]));
+        let foreign_owner = crate::registry::RuntimeId::for_test_scope(
+            state.capsule_id.clone(),
+            2,
+            crate::registry::RuntimeScope::Principal(astrid_core::PrincipalUid::from_bytes(
+                [2; 32],
+            )),
+        );
+        let profile = Arc::new(astrid_core::profile::PrincipalProfile::default());
+        assert!(
+            state
+                .install_run_loop_owner_context(&foreign_owner, profile, None)
                 .is_err()
         );
         assert!(state.invocation_kv.is_none());
