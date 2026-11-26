@@ -81,6 +81,59 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn scoped_native_network_request_cannot_prepare_or_activate() {
+        let root = tempdir().unwrap();
+        let kv = astrid_storage::ScopedKvStore::new(
+            std::sync::Arc::new(astrid_storage::MemoryKvStore::new()),
+            "test",
+        )
+        .unwrap();
+        let context = CapsuleContext::new(
+            astrid_core::PrincipalId::default(),
+            root.path().into(),
+            None,
+            kv,
+            std::sync::Arc::new(astrid_events::EventBus::new()),
+            None,
+        );
+        for tcp in [false, true] {
+            let mut manifest = dummy_manifest("test-command", vec!["test-command"]);
+            manifest.capabilities.uplink = true;
+            if tcp {
+                manifest
+                    .capabilities
+                    .net_connect
+                    .push("example.org:443".into());
+            } else {
+                manifest.capabilities.net.push("example.org".into());
+            }
+            let server = manifest.mcp_servers[0].clone();
+            let mut engine = McpHostEngine::new(
+                manifest,
+                server,
+                root.path().into(),
+                test_secure_mcp_client(),
+            );
+            assert!(
+                engine
+                    .load(&context)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("cannot enforce destination-scoped network access")
+            );
+            assert!(
+                engine
+                    .activate()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not been prepared")
+            );
+        }
+    }
+
     #[cfg(unix)]
     fn write_exiting_test_binary(path: &Path) {
         let src = ["/usr/bin/false", "/bin/false"]

@@ -117,6 +117,16 @@ impl ExecutionEngine for McpHostEngine {
             )));
         }
 
+        // Native process sandboxes expose an on/off network switch. A
+        // destination grant must never be widened to that switch.
+        if !self.manifest.capabilities.net.is_empty()
+            || !self.manifest.capabilities.net_connect.is_empty()
+        {
+            return Err(CapsuleError::UnsupportedEntryPoint(
+                "native stdio MCP cannot enforce destination-scoped network access; use an Astrid WASM component for network requests".into(),
+            ));
+        }
+
         let mut command_str = original_command_str.clone();
 
         // 2. Fat Binary Resolution:
@@ -196,11 +206,6 @@ impl ExecutionEngine for McpHostEngine {
         let server_id =
             runtime_server_id(&self.manifest.package.name, &self.server_def.id, runtime_id);
 
-        // Determine network access from the capsule's `net` capability.
-        // If the capsule declared any net domains, allow network access.
-        let allow_network =
-            !self.manifest.capabilities.net.is_empty() || self.manifest.capabilities.uplink;
-
         let config = astrid_mcp::ServerConfig {
             name: server_id.clone(),
             command: Some(command_str),
@@ -208,7 +213,7 @@ impl ExecutionEngine for McpHostEngine {
             env: resolved_env,
             cwd: Some(self.capsule_dir.clone()),
             restart_policy: astrid_mcp::RestartPolicy::Always, // Host engines should restart on crash
-            allow_network,
+            allow_network: false,
             ..Default::default()
         };
 
