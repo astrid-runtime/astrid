@@ -25,6 +25,7 @@ fn alice() -> astrid_core::PrincipalId {
 }
 
 struct BlockingSetStore {
+    block_first_set: std::sync::atomic::AtomicBool,
     inner: astrid_storage::MemoryKvStore,
     entered: Arc<tokio::sync::Barrier>,
     release: Arc<tokio::sync::Barrier>,
@@ -45,8 +46,13 @@ impl astrid_storage::KvStore for BlockingSetStore {
         key: &str,
         value: Vec<u8>,
     ) -> astrid_storage::StorageResult<()> {
-        self.entered.wait().await;
-        self.release.wait().await;
+        if self
+            .block_first_set
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.entered.wait().await;
+            self.release.wait().await;
+        }
         self.inner.set(namespace, key, value).await
     }
     async fn delete(&self, namespace: &str, key: &str) -> astrid_storage::StorageResult<bool> {
@@ -392,6 +398,7 @@ async fn retirement_waits_for_admitted_recv_kv_effect_before_reclamation() {
     let entered = Arc::new(tokio::sync::Barrier::new(2));
     let release = Arc::new(tokio::sync::Barrier::new(2));
     let backend: Arc<dyn astrid_storage::KvStore> = Arc::new(BlockingSetStore {
+        block_first_set: true.into(),
         inner: astrid_storage::MemoryKvStore::new(),
         entered: Arc::clone(&entered),
         release: Arc::clone(&release),
@@ -404,6 +411,7 @@ async fn retirement_waits_for_admitted_recv_kv_effect_before_reclamation() {
     // Restore the barrier backend after overlay installation selected the
     // production principal store.
     let backend: Arc<dyn astrid_storage::KvStore> = Arc::new(BlockingSetStore {
+        block_first_set: true.into(),
         inner: astrid_storage::MemoryKvStore::new(),
         entered: Arc::clone(&entered),
         release: Arc::clone(&release),
@@ -521,6 +529,89 @@ async fn quiescence_wait_registers_before_sampling_active_operations() {
         .expect("quiescence task should join");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn device_retirement_drains_kv_and_all_seven_imports_reject_the_old_registration() {
+    use astrid_core::profile::{AuthMethod, DeviceKey, DeviceKeyId, DeviceScope, PrincipalProfile};
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let principal = alice();
+    let device = || DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+    let first = device();
+    let replacement = device();
+    let key = DeviceKeyId::new(first.key_id.clone()).unwrap();
+    let mut profile = PrincipalProfile::default();
+    profile.auth.methods.push(AuthMethod::Keypair);
+    profile.add_device(first.clone());
+    profile.save(&home, &principal).unwrap();
+    let cache = Arc::new(crate::profile_cache::PrincipalProfileCache::with_home(
+        home.clone(),
+    ));
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    let release = Arc::new(tokio::sync::Barrier::new(2));
+    let backend = Arc::new(BlockingSetStore {
+        block_first_set: true.into(),
+        inner: astrid_storage::MemoryKvStore::new(),
+        entered: entered.clone(),
+        release: release.clone(),
+    });
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.profile_cache = Some(cache.clone());
+    state.invocation_kv = Some(astrid_storage::ScopedKvStore::new(backend, "alice:test").unwrap());
+    let mut caller = msg_from(&principal).with_device_key_id(first.key_id);
+    caller.device_registration_id = first.registration_id.map(Into::into);
+    state.caller_context = Some(caller);
+    let sessions = state.device_sessions.clone();
+
+    let operation = tokio::spawn(async move {
+        let result = KvHost::kv_set(&mut state, "sentinel".into(), vec![7]);
+        (state, result)
+    });
+    let timeout = std::time::Duration::from_secs(5);
+    tokio::time::timeout(timeout, entered.wait())
+        .await
+        .expect("backend entered");
+    profile.auth.public_keys.clear();
+    profile.save(&home, &principal).unwrap();
+    cache.invalidate(&principal);
+    let mut retirement = std::pin::pin!(sessions.retire(&principal, &key));
+    tokio::select! {
+        biased;
+        result = &mut retirement => panic!("acknowledged pending backend write: {result:?}"),
+        () = std::future::ready(()) => {}
+    }
+    release.wait().await;
+    let (mut state, result) = tokio::time::timeout(timeout, operation)
+        .await
+        .unwrap()
+        .unwrap();
+    result.unwrap();
+    tokio::time::timeout(timeout, retirement)
+        .await
+        .unwrap()
+        .unwrap();
+
+    profile.add_device(replacement.clone());
+    profile.save(&home, &principal).unwrap();
+    cache.invalidate(&principal);
+    assert!(KvHost::kv_get(&mut state, "sentinel".into()).is_err());
+    assert!(KvHost::kv_set(&mut state, "sentinel".into(), vec![8]).is_err());
+    assert!(KvHost::kv_delete(&mut state, "sentinel".into()).is_err());
+    assert!(KvHost::kv_list_keys(&mut state, String::new()).is_err());
+    assert!(KvHost::kv_list_keys_page(&mut state, String::new(), None, 32).is_err());
+    assert!(KvHost::kv_clear_prefix(&mut state, "sent".into()).is_err());
+    assert!(KvHost::kv_cas(&mut state, "sentinel".into(), Some(vec![7]), vec![9]).is_err());
+    state
+        .caller_context
+        .as_mut()
+        .unwrap()
+        .device_registration_id = replacement.registration_id.map(Into::into);
+    assert_eq!(
+        KvHost::kv_get(&mut state, "sentinel".into()).unwrap(),
+        Some(vec![7])
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guest_kv_requires_the_publishing_device_to_still_be_active() {
     use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope, PrincipalProfile};
@@ -539,7 +630,9 @@ async fn guest_kv_requires_the_publishing_device_to_still_be_active() {
     let mut state = minimal_host_state(tokio::runtime::Handle::current());
     state.profile_cache = Some(cache.clone());
     state.invocation_kv = Some(state.kv.clone());
-    state.caller_context = Some(msg_from(&principal).with_device_key_id(device.key_id));
+    let mut caller = msg_from(&principal).with_device_key_id(device.key_id);
+    caller.device_registration_id = device.registration_id.map(Into::into);
+    state.caller_context = Some(caller);
     KvHost::kv_set(&mut state, "saved".into(), vec![1]).unwrap();
     profile.auth.public_keys.clear();
     profile.save(&home, &principal).unwrap();

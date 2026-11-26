@@ -17,6 +17,45 @@ impl HostState {
             .map(|tracker| tracker.begin(&self.effective_principal()).ok_or(()))
             .transpose()
     }
+    /// Bind an effect to the registration captured by its caller. Register the
+    /// pending lookup before reading the profile so retirement also fences a
+    /// concurrent lookup. The caller holds the session until the effect ends.
+    pub(crate) fn begin_device_operation(
+        &self,
+    ) -> Result<Option<astrid_core::profile::device_sessions::DeviceSession>, ()> {
+        let Some(message) = self.caller_context.as_ref() else {
+            return Ok(None);
+        };
+        let device = message.device_stamp();
+        let Some(raw) = device.fingerprint else {
+            return if device.registration.is_none() {
+                Ok(None)
+            } else {
+                Err(())
+            };
+        };
+        let principal = astrid_core::PrincipalId::new(message.principal.as_deref().ok_or(())?)
+            .map_err(|_| ())?;
+        let key = astrid_core::profile::DeviceKeyId::new(raw.to_owned()).map_err(|_| ())?;
+        let challenge = self
+            .device_sessions
+            .challenge(principal.clone())
+            .map_err(|_| ())?;
+        let profile = self
+            .profile_cache
+            .as_ref()
+            .ok_or(())?
+            .resolve(&principal)
+            .map_err(|_| ())?;
+        let record = profile
+            .active_registration(&key, device.registration)
+            .ok_or(())?;
+        challenge
+            .bind(key, record.registration_id)
+            .map(Some)
+            .map_err(|_| ())
+    }
+
     /// Return the effective KV store for the current invocation.
     ///
     /// Per-principal isolation lives HERE, not in capsule keys. Every real store
