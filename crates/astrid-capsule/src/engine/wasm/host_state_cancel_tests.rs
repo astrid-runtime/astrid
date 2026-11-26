@@ -651,30 +651,49 @@ async fn guest_kv_requires_the_publishing_device_to_still_be_active() {
     );
 }
 
+#[derive(Default)]
+struct FilesystemAudit {
+    admitted: tokio::sync::Notify,
+    events: std::sync::Mutex<Vec<(&'static str, String)>>,
+}
+
+impl crate::audit_sink::HostAuditSink for FilesystemAudit {
+    fn record(
+        &self,
+        _: &astrid_core::PrincipalId,
+        event: crate::audit_sink::HostAuditEvent<'_>,
+        outcome: crate::audit_sink::HostAuditOutcome<'_>,
+    ) {
+        use crate::audit_sink::HostAuditOutcome;
+        let label = match outcome {
+            HostAuditOutcome::Denied(_) => "denied",
+            HostAuditOutcome::Allowed => "allowed",
+            HostAuditOutcome::Failed(_) => "failed",
+        };
+        self.events
+            .lock()
+            .unwrap()
+            .push((label, format!("{event:?}")));
+    }
+
+    fn admit(
+        &self,
+        _: &astrid_core::PrincipalId,
+        event: crate::audit_sink::HostAuditEvent<'_>,
+    ) -> Result<(), crate::audit_sink::HostAuditRefusal> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(("admit", format!("{event:?}")));
+        self.admitted.notify_one();
+        Ok(())
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn filesystem_rechecks_device_after_wait_and_rejects_revoked_path_operations() {
-    use crate::audit_sink::{HostAuditEvent, HostAuditOutcome, HostAuditRefusal, HostAuditSink};
     use crate::engine::wasm::host_state::{PrincipalMount, PrincipalMountLocation};
     use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope, PrincipalProfile};
-
-    struct Admitted(tokio::sync::Notify);
-    impl HostAuditSink for Admitted {
-        fn record(
-            &self,
-            _: &astrid_core::PrincipalId,
-            _: HostAuditEvent<'_>,
-            _: HostAuditOutcome<'_>,
-        ) {
-        }
-        fn admit(
-            &self,
-            _: &astrid_core::PrincipalId,
-            _: HostAuditEvent<'_>,
-        ) -> Result<(), HostAuditRefusal> {
-            self.0.notify_one();
-            Ok(())
-        }
-    }
 
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("workspace");
@@ -704,7 +723,7 @@ async fn filesystem_rechecks_device_after_wait_and_rejects_revoked_path_operatio
     state.workspace_root = root.clone();
     assert_eq!(state.read_file("marker".into()).unwrap(), b"original");
 
-    let admitted = Arc::new(Admitted(tokio::sync::Notify::new()));
+    let admitted = Arc::new(FilesystemAudit::default());
     state.audit_sink = Some(admitted.clone());
     state.blocking_semaphore = Arc::new(Semaphore::new(1));
     let permit = state
@@ -717,9 +736,12 @@ async fn filesystem_rechecks_device_after_wait_and_rejects_revoked_path_operatio
         let result = state.write_file("marker".into(), b"updated".to_vec());
         (result, state)
     });
-    tokio::time::timeout(std::time::Duration::from_secs(5), admitted.0.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        admitted.admitted.notified(),
+    )
+    .await
+    .unwrap();
     profile.auth.public_keys.clear();
     let replacement = DeviceKey::new(device.pubkey.clone(), DeviceScope::Full, None, 0);
     assert_ne!(replacement.registration_id, device.registration_id);
@@ -757,6 +779,13 @@ async fn filesystem_rechecks_device_after_wait_and_rejects_revoked_path_operatio
         state.read_file("marker".into()),
         Err(FsError::CapabilityDenied)
     ));
+    {
+        let events = admitted.events.lock().unwrap();
+        assert_eq!(events.len(), 9);
+        assert_eq!(events[0].0, "admit");
+        assert_eq!(events[0].1, events[1].1);
+        assert!(events[1..].iter().all(|(outcome, _)| *outcome == "denied"));
+    }
     state.caller_context = Some(msg_from(&principal));
     assert_eq!(state.read_file("marker".into()).unwrap(), b"original");
     assert!(!root.join("dir").exists());
