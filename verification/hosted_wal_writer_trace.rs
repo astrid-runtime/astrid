@@ -262,4 +262,44 @@ fn recover_root<H,F,K:Ord+Copy,L>(sequence:u64,begin:&[u8],owner:Owner,scheme:ro
     }
 }
 
+/// Two independent root transactions may carry the same UID bytes under
+/// different owner tags. Applying the second preserves the first entry.
+fn recover_principal_and_fleet<H,F,K:Ord+Copy,L>(sequence:u64,begin:&[u8],uid:[u8;32],
+    scheme:root_wire::Scheme,first:[u8;32],second:[u8;32],chunk:usize,hash:H,
+    checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]>,finish:F,digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>,
+    key_of:L,key_spec:Ghost<spec_fn(Seq<u8>)->K>,history:&mut BTreeMap<K,(Version,u64)>)
+    -> (replayed:bool)
+    where H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,F:Fn(&[u8])->[u8;32]+Copy,L:Fn(Owner)->K+Copy,
+    requires sequence != 0, begin.len() as int + 138 + 288 <= usize::MAX,
+        forall|m:[u8;8],n:u64,p:&[u8]| #[trigger] hash.requires((m,n,p)),
+        forall|p:&[u8],v:[u8;32]| #[trigger] hash.ensures((physical::MAGIC,p.len() as u64,p),v) ==> v == (checksum@)(p@),
+        forall|p:&[u8]| #[trigger] finish.requires((p,)),
+        forall|p:&[u8],v:[u8;32]| #[trigger] finish.ensures((p,),v) ==> v == (digest@)(p@),
+        forall|o:Owner| #[trigger] key_of.requires((o,)),
+        forall|o:Owner,k:K| #[trigger] key_of.ensures((o,),k) ==> k == (key_spec@)(o.bytes()),
+        forall|a:Owner,b:Owner| #[trigger] (key_spec@)(a.bytes()) == #[trigger] (key_spec@)(b.bytes()) ==> a.bytes() == b.bytes(),
+        obeys_cmp::<K>(), obeys_cmp_concrete_eq::<K>(), btree_map_inv(old(history)),
+        sequence < u64::MAX,
+        !old(history)@.contains_key((key_spec@)(Owner::Principal(uid).bytes())),
+        !old(history)@.contains_key((key_spec@)(Owner::Fleet(uid).bytes())),
+    ensures replayed && final(history)@ == old(history)@
+        .insert((key_spec@)(Owner::Principal(uid).bytes()),(Version {generation:0,commit:first},(72+begin.len()) as u64))
+        .insert((key_spec@)(Owner::Fleet(uid).bytes()),(Version {generation:0,commit:second},(72+begin.len()) as u64)),
+{
+    let principal = Owner::Principal(uid);
+    let fleet = Owner::Fleet(uid);
+    let zero = commit_wire::little_endian(0);
+    proof {
+        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+        assert(principal.bytes()[0] != fleet.bytes()[0]);
+        assert((key_spec@)(principal.bytes()) != (key_spec@)(fleet.bytes()));
+    }
+    let p = root_wire::Root {generation:zero,commit:first};
+    let f = root_wire::Root {generation:zero,commit:second};
+    let applied = recover_root(sequence,begin,principal,scheme,None,p,chunk,hash,checksum,finish,digest,key_of,key_spec,history);
+    if !matches!(applied,Some(Replay::Apply)) {return false;}
+    let applied = recover_root(sequence+1,begin,fleet,scheme,None,f,chunk,hash,checksum,finish,digest,key_of,key_spec,history);
+    matches!(applied,Some(Replay::Apply))
+}
+
 }

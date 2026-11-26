@@ -51,47 +51,8 @@ impl ObjectId {
     }
 }
 
-/// Reachability meaning of a reference between immutable objects.
-///
-/// Only [`Self::Owns`] contributes to a principal's durable closure, usage,
-/// default export, and garbage-collection reachability. Other relations bind
-/// identity without silently transferring ownership or retention.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ReferenceKind {
-    /// Strong ownership: the target is required to reconstruct the source.
-    Owns,
-    /// Observation or audit evidence retained under its own root or pin.
-    Evidence,
-    /// Historical/fork/merge lineage that does not import the target closure.
-    Lineage,
-    /// Rebuildable index or materialization.
-    Derived,
-}
-
-impl ReferenceKind {
-    /// Return the stable identity code for this reachability meaning.
-    #[must_use]
-    pub const fn code(self) -> u8 {
-        match self {
-            Self::Owns => 0,
-            Self::Evidence => 1,
-            Self::Lineage => 2,
-            Self::Derived => 3,
-        }
-    }
-
-    /// Decode a stable reachability code.
-    #[must_use]
-    pub const fn from_code(code: u8) -> Option<Self> {
-        match code {
-            0 => Some(Self::Owns),
-            1 => Some(Self::Evidence),
-            2 => Some(Self::Lineage),
-            3 => Some(Self::Derived),
-            _ => None,
-        }
-    }
-}
+mod reference_kind;
+pub use reference_kind::ReferenceKind;
 
 /// Canonical relation label within an immutable object.
 ///
@@ -509,8 +470,7 @@ impl ObjectRecord {
     pub fn owning_references(&self) -> impl DoubleEndedIterator<Item = ObjectId> + '_ {
         self.references
             .iter()
-            .filter(|reference| reference.kind == ReferenceKind::Owns)
-            .map(|reference| reference.target)
+            .filter_map(|reference| reference.kind.owned_target(reference.target))
     }
 
     /// Return the stable bytes charged for retaining this canonical record.

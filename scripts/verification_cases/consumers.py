@@ -9,7 +9,56 @@ from .common import (
 
 def consumer_defects():
     """Weaken a production guarantee and require its trace consumer to fail."""
+    walk = Path("crates/astrid-storage/src/engine/durable/closure_walk.rs")
+    graph = Path("verification/hosted_closure_model.rs")
+    yield (
+        "closure walker accepts a cached root without checking its kind", walk,
+        lambda s: replace_once(s, "source.check_root(root) {return", "(if cached.contains(&root) {Ok(())} else {source.check_root(root)}) {return"), walk,
+    )
+    yield (
+        "closure walker drops the active cycle error", walk,
+        lambda s: replace_once(s, "return Err(Failure::Cycle(id));", "continue;"), walk,
+    )
+    yield (
+        "closure walker omits a newly loaded object from its result", walk,
+        lambda s: replace_once(s, "marks.insert(id,Mark::Active);\n                        seen.insert(id);", "marks.insert(id,Mark::Active);"), walk,
+    )
+    yield (
+        "closure scheduling substitutes the first edge for the selected edge", walk,
+        lambda s: replace_once(s, "refs[pos].owned_target()", "refs[0].owned_target()"), walk,
+    )
+    yield (
+        "closure completeness loses the source of an error", walk,
+        lambda s: replace_once(s, "S::failed(old(source).edges(),k,e) && !cached@.contains(k)", "!cached@.contains(k)"), graph,
+    )
+    yield (
+        "closure success forgets acyclicity", walk,
+        lambda s: replace_once(s, "&&& exists|done:Map<K,nat>| done.dom() == seen@.difference(cached@) && #[trigger] ranked(old(source).edges(),cached@,done)", "&&& true"), graph,
+    )
+    yield (
+        "closure validation forgets the inductive cache guarantee", walk,
+        lambda s: replace_once(s, "&&& (certified(old(source).edges(),cached@) ==> certified(old(source).edges(),cached@.union(seen@)))",
+                               "&&& true"), graph,
+    )
+    kind = Path("crates/astrid-storage/src/storage_model/reference_kind.rs")
+    yield (
+        "closure data classifies evidence as ownership", kind,
+        lambda s: replace_once(s, "Self::Owns => Some(target),\n            Self::Evidence | Self::Lineage | Self::Derived => None",
+                               "Self::Owns | Self::Evidence => Some(target),\n            Self::Lineage | Self::Derived => None"), kind,
+    )
+    yield (
+        "closure wire decoder interprets lineage as ownership", kind,
+        lambda s: replace_once(s, "2 => Some(Self::Lineage)", "2 => Some(Self::Owns)"), kind,
+    )
     trace = Path("verification/hosted_wal_writer_trace.rs")
+    yield (
+        "paired owner recovery loses the applied map update", trace,
+        lambda s: replace_once(s, "&&& final(history)@ == if out matches Some(Replay::Apply)", "&&& true || final(history)@ == if out matches Some(Replay::Apply)"), trace,
+    )
+    yield (
+        "paired owner recovery loses successful generation admission", trace,
+        lambda s: replace_once(s, "&&& out.is_some() == valid", "&&& true"), trace,
+    )
     history = Path("crates/astrid-storage/src/engine/durable/wal/root_history.rs")
     yield (
         "WAL owner map drops the source offset", history,

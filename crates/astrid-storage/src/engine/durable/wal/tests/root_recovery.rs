@@ -433,3 +433,55 @@ fn replay_failure_and_retry_preserve_owner_tags_and_the_first_offset() {
         BTreeMap::from([(fleet, (root(4), 19)), (owner, (root(0), 71))])
     );
 }
+
+#[test]
+fn incremental_closure_checks_the_root_kind_and_follows_only_owning_edges() {
+    use crate::engine::durable::{
+        DurableError, File,
+        validation::{ClosureObjects, validate_incremental_closure},
+    };
+    use crate::storage_model::{ModelError, ObjectReference, ReferenceKind, ReferenceLabel};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let commit = object_id(1);
+    let chunk = object_id(2);
+    let absent = object_id(3);
+    let mut refs = Vec::new();
+    for (label, id, kind) in [
+        (0, chunk, ReferenceKind::Owns),
+        (1, absent, ReferenceKind::Evidence),
+        (2, absent, ReferenceKind::Lineage),
+        (3, absent, ReferenceKind::Derived),
+    ] {
+        refs.push(ObjectReference::new(
+            ReferenceLabel::new(vec![label]),
+            id,
+            kind,
+        ));
+    }
+    let commit_record = ObjectRecord::new(
+        ObjectKind::Commit,
+        ObjectFormatVersion::V1,
+        vec![],
+        refs,
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let incoming = BTreeMap::from([(commit, commit_record), (chunk, record(2, 8))]);
+    let mut arena = File::Native(tempfile::tempfile().unwrap());
+    let mut source = ClosureObjects::<_, String> {
+        arena: &mut arena,
+        index: &BTreeMap::new(),
+        incoming: &incoming,
+        pending: None,
+        identity: &TestIdentity,
+        limits: RecoveryLimits::process_addressable(),
+    };
+    let seen = validate_incremental_closure(&mut source, &BTreeSet::new(), commit).unwrap();
+    assert_eq!(seen, BTreeSet::from([commit, chunk]));
+    assert!(
+        matches!(validate_incremental_closure(&mut source, &seen, chunk),
+        Err(DurableError::Model(ModelError::RootNotCommit {object, ..})) if object == chunk)
+    );
+}

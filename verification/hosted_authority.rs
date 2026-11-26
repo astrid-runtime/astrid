@@ -92,6 +92,11 @@ mod owner_codec;
 mod root_transition;
 #[path = "../crates/astrid-storage/src/engine/durable/wal/root_history.rs"]
 mod wal_root_history;
+#[path = "../crates/astrid-storage/src/engine/durable/closure_walk.rs"]
+mod closure_walk;
+#[path = "../crates/astrid-storage/src/storage_model/reference_kind.rs"]
+mod reference_kind;
+mod hosted_closure_model;
 
 #[path = "../crates/astrid-storage/src/engine/durable/frontier.rs"]
 mod group_frontier;

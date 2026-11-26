@@ -1,7 +1,10 @@
 //! Owning-closure loading, graph validation, and usage accounting.
 
-use crate::storage_model::{ModelError, ObjectId, ObjectKind, ObjectRecord, PrincipalUsage, World};
+use crate::storage_model::{
+    ModelError, ObjectId, ObjectKind, ObjectRecord, ObjectReference, PrincipalUsage, World,
+};
 
+use super::closure_walk::{self, Failure, Source, Work};
 use super::format::{read_indexed_object, visit_indexed_objects};
 use super::wal::PendingWalOverlay;
 use super::{
@@ -34,6 +37,38 @@ impl<I: PersistentObjectIdentity, P: Ord> ClosureObjects<'_, I, P> {
             return read_indexed_object(self.arena, id, location, self.identity, self.limits);
         }
         Err(ModelError::MissingObject(id).into())
+    }
+}
+
+impl closure_walk::Edge<ObjectId> for ObjectReference {
+    fn owned_target(&self) -> Option<ObjectId> {
+        self.kind().owned_target(self.target())
+    }
+}
+
+impl<I: PersistentObjectIdentity, P: Ord> Source<ObjectId> for ClosureObjects<'_, I, P> {
+    type Error = DurableError;
+
+    fn check_root(&mut self, root: ObjectId) -> Result<(), DurableError> {
+        let root_record = self.load(root)?;
+        if root_record.kind() != ObjectKind::Commit {
+            return Err(ModelError::RootNotCommit {
+                object: root,
+                actual: root_record.kind(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    fn expand(
+        &mut self,
+        id: ObjectId,
+        stack: &mut Vec<Work<ObjectId>>,
+    ) -> Result<(), DurableError> {
+        let record = self.load(id)?;
+        closure_walk::schedule(record.references(), stack);
+        Ok(())
     }
 }
 
@@ -134,41 +169,10 @@ pub(super) fn validate_incremental_closure<I: PersistentObjectIdentity, P: Ord>(
     validated: &BTreeSet<ObjectId>,
     root: ObjectId,
 ) -> Result<BTreeSet<ObjectId>, DurableError> {
-    let root_record = source.load(root)?;
-    if root_record.kind() != ObjectKind::Commit {
-        return Err(ModelError::RootNotCommit {
-            object: root,
-            actual: root_record.kind(),
-        }
-        .into());
-    }
-    let mut reachable = BTreeSet::new();
-    let mut marks = BTreeMap::<ObjectId, u8>::new();
-    let mut stack = vec![(root, false)];
-
-    while let Some((id, expanded)) = stack.pop() {
-        if validated.contains(&id) {
-            reachable.insert(id);
-            continue;
-        }
-        if expanded {
-            marks.insert(id, 2);
-            continue;
-        }
-        match marks.get(&id).copied() {
-            Some(2) => continue,
-            Some(1) => return Err(ModelError::ObjectCycle(id).into()),
-            Some(_) | None => {},
-        }
-        let record = source.load(id)?;
-        reachable.insert(id);
-        marks.insert(id, 1);
-        stack.push((id, true));
-        for child in record.owning_references().rev() {
-            stack.push((child, false));
-        }
-    }
-    Ok(reachable)
+    closure_walk::walk(source, validated, root).map_err(|error| match error {
+        Failure::Cycle(id) => ModelError::ObjectCycle(id).into(),
+        Failure::Root(e) | Failure::Source(_, e) => e,
+    })
 }
 
 pub(super) fn usage_from_closure(
