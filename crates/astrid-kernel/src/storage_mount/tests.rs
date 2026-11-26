@@ -211,6 +211,60 @@ impl<F: CallbackFilesystem> CallbackFilesystem for ReadBoundarySpy<F> {
 }
 
 #[tokio::test]
+async fn elapsed_idle_deadline_denies_callback_status_and_sync_despite_renewal() {
+    let root = tempfile::tempdir().unwrap();
+    let kernel =
+        crate::test_kernel_with_home(astrid_core::dirs::AstridHome::from_path(root.path())).await;
+    let caller = PrincipalId::default();
+    let lease = issue_lease(
+        &kernel,
+        caller.clone(),
+        false,
+        StorageProviderViewV1::Principal(caller.clone()),
+        StorageFilesystemTargetV1::OwnerRoot,
+        StorageProviderAccessV1::ReadOnly,
+        "test-provider".into(),
+        root.path().join("mount"),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        callback(
+            &lease,
+            &lease.lease_token,
+            StorageFilesystemOperationV1::Sync
+        )
+        .await,
+        StorageFilesystemOutcomeV1::Success(_)
+    ));
+    let state = Arc::clone(kernel.storage_mounts.get(&lease.mount_id).unwrap().value());
+    state.expiry.elapse_idle_for_test();
+    std::thread::scope(|scope| {
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let other = Arc::clone(&start);
+        let state = &state;
+        scope.spawn(move || {
+            other.wait();
+            state.renew();
+        });
+        start.wait();
+        assert!(lease_status(&kernel, &caller, false, lease.mount_id).is_err());
+    });
+    assert!(
+        matches!(callback(&lease, &lease.lease_token, StorageFilesystemOperationV1::Sync).await,
+        StorageFilesystemOutcomeV1::Failure(error) if error.code == "stale-lease")
+    );
+    assert!(
+        sync_lease(&kernel, &caller, false, lease.mount_id)
+            .await
+            .is_err()
+    );
+    revoke_lease_if_present(&kernel, &caller, false, lease.mount_id)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn oversized_set_length_and_random_write_preflight_before_full_read() {
     let temporary = tempfile::tempdir().unwrap();
     let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));

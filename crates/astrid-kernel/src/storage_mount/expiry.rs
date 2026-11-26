@@ -2,6 +2,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Preserve the native provider protocol's one-hour idle window.
 const IDLE_TIMEOUT: Duration = Duration::from_hours(1);
 
 #[derive(Clone, Copy)]
@@ -78,6 +79,11 @@ impl LeaseExpiry {
 
     pub(super) fn renew(&self) {
         self.lock().renew(Clock::now());
+    }
+
+    #[cfg(test)]
+    pub(super) fn elapse_idle_for_test(&self) {
+        self.lock().monotonic = Instant::now().checked_sub(Duration::from_secs(1));
     }
 
     pub(super) fn epoch_secs(&self) -> u64 {
