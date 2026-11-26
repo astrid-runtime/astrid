@@ -178,6 +178,14 @@ assumes the production key projection and signature verification callback. Hex d
 profile freshness at effect admission and the lifetime of the socket owner's
 generation remain outside these theorems.
 
+Gateway pair redemption puts the kernel-returned registration into the signed device
+bearer. On refresh the gateway signs the same registration as the verified input.
+Legacy bearers keep their existing format and have no registration ID. The v4
+transcript proof binds the exact first five encoded fields and the canonical UUID.
+Equal transcripts with dot-free registration strings require both inputs to be equal.
+Base64, UUID parsing and Ed25519 remain trusted adapters. Downstream effect
+admission still needs to compare the original generation to the live registration.
+
 ## Native local socket transport
 
 The built-in local server in `astrid-uplink/src/native` accepts a socket,

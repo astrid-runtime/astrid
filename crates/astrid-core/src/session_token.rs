@@ -8,6 +8,9 @@
 //!
 //! This follows the same pattern used by Jupyter notebooks and Docker.
 
+mod registered_bearer;
+pub use registered_bearer::registration_transcript;
+
 use std::fmt;
 use std::io;
 use std::path::Path;

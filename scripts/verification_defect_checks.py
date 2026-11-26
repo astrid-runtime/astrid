@@ -50,7 +50,9 @@ NATIVE_FRAME = Path("crates/astrid-uplink/src/native/frame_segments.rs")
 DEVICE_SESSIONS = Path("crates/astrid-core/src/profile/device_sessions/phase.rs")
 DEVICE_REGISTRATION = Path("crates/astrid-core/src/profile/device_registration.rs")
 DEVICE_CHALLENGE = Path("crates/astrid-core/src/profile/device_challenge.rs")
+REGISTERED_BEARER = Path("crates/astrid-core/src/session_token/registered_bearer.rs")
 INPUTS = [
+    REGISTERED_BEARER,
     ORDERED_DISPATCH,
     DELIVERY_COMMIT,
     DEVICE_CHALLENGE,
@@ -485,6 +487,11 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "signed challenge substitutes the principal for the nonce",
             DEVICE_CHALLENGE,
             lambda text: replace_once(text, "message.push_str(nonce);", "message.push_str(principal);"),
+        ),
+        (
+            "registered bearer omits the pairing generation",
+            REGISTERED_BEARER,
+            lambda text: replace_once(text, "signed.push_str(registration);", "signed.push_str(claims);"),
         ),
         (
             "signature selects another registered device",

@@ -85,3 +85,6 @@ mod delivery_commit;
 
 #[path = "../crates/astrid-events/src/ordered_dispatch.rs"]
 mod ordered_dispatch;
+
+#[path = "../crates/astrid-core/src/session_token/registered_bearer.rs"]
+mod registered_bearer;

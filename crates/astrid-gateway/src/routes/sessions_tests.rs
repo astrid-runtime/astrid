@@ -4,6 +4,7 @@ use astrid_events::ipc::MessageOrigin;
 fn session_caller(principal: &PrincipalId) -> crate::auth::CallerContext {
     crate::auth::CallerContext {
         principal: principal.clone(),
+        registration_id: None,
         device_key_id: Some("0123456789abcdef".to_owned()),
         request_owner: astrid_events::ipc::RequestOwnerId::generate(),
         issued_at_epoch: 1,

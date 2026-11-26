@@ -19,7 +19,7 @@ use axum::http::Request;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::{CallerContext, mint_bearer, mint_bearer_scoped};
+use crate::auth::{CallerContext, mint_bearer, mint_device_bearer};
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
 use crate::state::GatewayState;
 
@@ -418,10 +418,11 @@ pub async fn post_pair_device_redeem(
     // The new device's bearer is scoped to ITS key_id (returned by the kernel
     // redeem), so the device authenticates as — and is attenuated to — its own
     // registered key at the cap-gate, not the principal's full authority.
-    let session_token = mint_bearer_scoped(
+    let session_token = mint_device_bearer(
         &state.signing.signer,
         &redeemed.principal,
         &redeemed.key_id,
+        redeemed.registration_id,
         state.config.session_lifetime_secs,
     );
     let session_expires_at_epoch = std::time::SystemTime::now()
@@ -470,10 +471,11 @@ pub async fn post_refresh(
     // re-mints as legacy. Otherwise a scoped device could shed its
     // attenuation simply by refreshing.
     let session_token = match &caller.device_key_id {
-        Some(key_id) => mint_bearer_scoped(
+        Some(key_id) => mint_device_bearer(
             &state.signing.signer,
             &caller.principal,
             key_id,
+            caller.registration_id,
             state.config.session_lifetime_secs,
         ),
         None => mint_bearer(

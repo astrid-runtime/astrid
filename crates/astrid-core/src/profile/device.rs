@@ -84,6 +84,19 @@ impl DeviceScope {
 #[serde(transparent)]
 pub struct DeviceRegistrationId(uuid::Uuid);
 
+impl std::fmt::Display for DeviceRegistrationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::str::FromStr for DeviceRegistrationId {
+    type Err = uuid::Error;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        uuid::Uuid::parse_str(value).map(Self)
+    }
+}
+
 /// A public key registered to a principal, with the capability scope the
 /// device pairing was granted.
 ///

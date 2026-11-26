@@ -15,6 +15,7 @@ fn device_caller() -> CallerContext {
         principal: astrid_core::PrincipalId::new("agent-alice").unwrap(),
         issued_at_epoch: 1,
         expires_at_epoch: 60,
+        registration_id: None,
         device_key_id: Some("0123456789abcdef".to_owned()),
         request_owner: RequestOwnerId::generate(),
     }
