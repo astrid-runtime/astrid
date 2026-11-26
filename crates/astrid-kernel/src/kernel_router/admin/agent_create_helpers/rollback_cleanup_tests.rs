@@ -254,28 +254,17 @@ async fn rollback_fence_waits_for_an_admitted_capsule_constructor() {
 }
 
 #[cfg(any(unix, windows))]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rollback_closes_only_mounts_from_the_captured_generation() {
-    use astrid_core::storage_filesystem::StorageFilesystemTargetV1;
-    use astrid_core::storage_provider::{StorageProviderAccessV1, StorageProviderViewV1};
+    use super::super::test_support::mounts::{PreparedIssue, issue};
 
     let dir = tempfile::tempdir().unwrap();
     let kernel = crate::test_kernel_with_home(AstridHome::from_path(dir.path())).await;
     let alias = PrincipalId::default();
     let captured = kernel.principal_directory.uid_for(&alias).unwrap();
-    let issue = || {
-        crate::storage_mount::issue_lease(
-            &kernel,
-            alias.clone(),
-            false,
-            StorageProviderViewV1::Principal(alias.clone()),
-            StorageFilesystemTargetV1::OwnerRoot,
-            StorageProviderAccessV1::ReadOnly,
-            "test-provider".to_owned(),
-            dir.path().join("mount"),
-        )
-    };
-    let old = issue().await.unwrap();
+    let mountpoint = dir.path().join("mount");
+    let old = issue(&kernel, &alias, &mountpoint).await.unwrap();
+    let late = PreparedIssue::begin(&kernel, &alias, &mountpoint).await;
     kernel
         .principal_directory
         .rename(captured, &alias, PrincipalId::new("previous").unwrap())
@@ -285,11 +274,12 @@ async fn rollback_closes_only_mounts_from_the_captured_generation() {
         .principal_directory
         .register(alias.clone(), replacement)
         .unwrap();
-    let current = issue().await.unwrap();
+    let current = issue(&kernel, &alias, &mountpoint).await.unwrap();
 
     super::rollback::fence_failed_initialization(&kernel, &alias, Some(captured), Vec::new())
         .await
         .unwrap();
+    late.assert_retired().await;
     assert!(!kernel.storage_mounts.contains_key(&old.mount_id));
     assert!(kernel.storage_mounts.contains_key(&current.mount_id));
     crate::storage_mount::revoke_lease(&kernel, &alias, true, current.mount_id)
