@@ -140,7 +140,8 @@ impl HostState {
     /// caller; principal runtimes use their load-time branch.
     #[must_use]
     pub fn effective_workspace(&self) -> Option<&PrincipalMount> {
-        crate::engine::wasm::mount_selection::effective(
+        crate::engine::wasm::mount_selection::workspace(
+            self.workspace_mount_resolver.is_some() && self.invocation_storage_uid.is_some(),
             self.invocation_workspace.as_ref(),
             self.workspace.as_ref(),
         )

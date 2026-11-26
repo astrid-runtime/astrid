@@ -11,6 +11,13 @@ pub(super) fn effective<T>(invocation: Option<T>, runtime: Option<T>) -> (mount:
     match invocation { Some(value) => Some(value), None => runtime }
 }
 
+/// A principal-bound workspace lookup must never inherit a load-time branch.
+pub(super) fn workspace<T>(requires_binding: bool, invocation: Option<T>, runtime: Option<T>) -> (mount: Option<T>)
+    ensures mount == if requires_binding || invocation.is_some() { invocation } else { runtime },
+{
+    if requires_binding { invocation } else { effective(invocation, runtime) }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum VfsTarget {
     Workspace,

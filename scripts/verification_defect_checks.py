@@ -352,6 +352,11 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             lambda text: replace_once(text, "(gate, relative, target)", '(gate, "", target)'),
         ),
         (
+            "missing invocation workspace falls back to the runtime despite required binding",
+            MOUNT,
+            lambda text: replace_once(text, "if requires_binding { invocation }", "if requires_binding { runtime }"),
+        ),
+        (
             "mount selection discards the invocation override",
             MOUNT,
             lambda text: replace_once(text, "Some(value) => Some(value), None => runtime", "Some(_) => runtime, None => runtime"),

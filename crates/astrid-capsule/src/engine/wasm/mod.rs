@@ -1277,6 +1277,9 @@ fn install_principal_overlays_sync(
     {
         Ok(uid) => uid,
         Err(error) => {
+            if state.runtime_owner_uid.is_some() {
+                state.invocation_profile_authorized = false;
+            }
             tracing::warn!(
                 principal = %p,
                 error = %error,
