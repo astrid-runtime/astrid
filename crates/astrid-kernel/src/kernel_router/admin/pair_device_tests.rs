@@ -606,15 +606,14 @@ async fn scoped_issuer_child_inherits_issuer_denies() {
     let authorization =
         crate::kernel_router::authorize_request(&kernel, &caller, Some(&dev_id), "self:auth:pair")
             .expect("authorize pair issuance");
-    let mut revoked = load(&kernel, &caller);
-    revoked.auth.public_keys.clear();
-    revoked
-        .save_to_path(&PrincipalProfile::path_for(&kernel.astrid_home, &caller))
-        .expect("revoke issuer device");
-    kernel.profile_cache.invalidate(&caller);
-    crate::kernel_router::authorize_request(&kernel, &caller, Some(&dev_id), "self:auth:pair")
-        .expect_err("a later request must observe the revoked issuer");
-
+    // An updated policy relaxes one restriction and introduces another.
+    // Neither snapshot alone describes the scope that may be minted.
+    seed(
+        &kernel,
+        &caller,
+        &["self:*"],
+        vec![scoped_device('a', &["self:*"], &["self:capsule:remove"])],
+    );
     // The issuer requests a broad child: allow self:*. The stored child scope
     // must inherit the issuer's deny (self:capsule:install) so the child can
     // never exceed the parent on that cap.
@@ -650,12 +649,51 @@ async fn scoped_issuer_child_inherits_issuer_denies() {
         DeviceScope::Scoped { allow, deny } => {
             assert!(allow.iter().any(|a| a == "self:*"), "child keeps its allow");
             assert!(
+                deny.iter().any(|d| d == "self:capsule:remove"),
+                "child inherits current policy"
+            );
+            assert!(
                 deny.iter().any(|d| d == "self:capsule:install"),
                 "child must inherit the issuer's deny: {deny:?}"
             );
         },
         DeviceScope::Full => panic!("child must be Scoped, not Full"),
     }
+}
+
+#[tokio::test]
+async fn queued_pair_issue_cannot_mint_after_issuer_removal() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("queued_issuer");
+    let dev = scoped_device('a', &["self:*"], &[]);
+    let key = dev.key_id.clone();
+    seed(&kernel, &caller, &["self:*"], vec![dev]);
+    let authorization =
+        crate::kernel_router::authorize_request(&kernel, &caller, Some(&key), "self:auth:pair")
+            .unwrap();
+    let store = DurablePairTokenStore::new(kernel.principal_store.as_ref().unwrap().kv()).unwrap();
+    let guard = kernel.admin_write_lock.lock().await;
+    let request = issue(PairScopeArg::Explicit {
+        allow: vec!["self:*".into()],
+        deny: vec![],
+    });
+    let mut queued = std::pin::pin!(handlers::dispatch_authorized(
+        &kernel,
+        &authorization,
+        request
+    ));
+    tokio::select! {
+        biased;
+        result = &mut queued => panic!("pair issue completed under another writer: {result:?}"),
+        () = std::future::ready(()) => {}
+    }
+    let mut profile = load(&kernel, &caller);
+    profile.auth.public_keys.clear();
+    profile.save(&kernel.astrid_home, &caller).unwrap();
+    kernel.profile_cache.invalidate(&caller);
+    drop(guard);
+    assert!(matches!(queued.await, AdminResponseBody::Error(_)));
+    assert!(store.list().await.unwrap().is_empty());
 }
 
 // ── Criterion 1 (socket/kernel path): use-only denied, use cap allowed ─
