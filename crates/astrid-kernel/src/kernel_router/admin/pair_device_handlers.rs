@@ -18,6 +18,9 @@
 
 mod deny_patterns;
 
+pub(super) use super::pair_issue_result::PairIssueError;
+use super::pair_issue_result::{self, Inserted};
+
 use std::sync::Arc;
 
 use astrid_capabilities::{CapabilityCheck, device_scope_within};
@@ -163,19 +166,19 @@ pub(super) async fn pair_device_issue(
         label: label.clone(),
         scope: stored_scope.clone(),
     };
-    match store.issue(&record).await {
-        Ok(true) => {},
-        Ok(false) => {
+    let token = match pair_issue_result::finish(&store.issue(&record).await, token) {
+        Inserted::Issued(value) => value,
+        Inserted::Collision => {
             return Err(PairIssueError::Internal(
                 "pair-token identifier collision".into(),
             ));
         },
-        Err(_) => {
+        Inserted::Unavailable => {
             return Err(PairIssueError::Internal(
                 "pair-token durable storage write failed".into(),
             ));
         },
-    }
+    };
 
     info!(
         token_fingerprint = %token_hash,
@@ -222,14 +225,6 @@ pub(super) fn pair_scope_requires_admin(scope: &PairScopeArg) -> bool {
         },
         PairScopeArg::Explicit { allow, .. } => allow.iter().any(|pattern| pattern == "*"),
     }
-}
-
-/// Pair-issuance failure class used to keep audit authorization and operation
-/// outcomes distinct without changing the public error wire shape.
-pub(super) enum PairIssueError {
-    BadInput(String),
-    Unauthorized(String),
-    Internal(String),
 }
 
 impl PairIssueError {

@@ -155,7 +155,7 @@ pub(super) async fn record_pair_issue_outcome(
         super::pair_device_handlers::PairIssueError,
     >,
 ) {
-    use super::pair_device_handlers::PairIssueError;
+    use super::pair_issue_result::{self, Audit};
     let params = super::sanitize_admin_audit_params(request);
     let context = AdminAuthorizationContext {
         caller,
@@ -168,12 +168,12 @@ pub(super) async fn record_pair_issue_outcome(
         target_principal: super::admin_target_principal(request),
         audit_params: params.as_ref(),
     };
-    match result {
-        Ok(_) => record_admin_success(kernel, &context).await,
-        Err(PairIssueError::Unauthorized(error)) => {
+    match pair_issue_result::audit(result) {
+        Audit::Success => record_admin_success(kernel, &context).await,
+        Audit::Denied(error) => {
             record_admin_authorization_failure(kernel, &context, error).await;
         },
-        Err(PairIssueError::BadInput(error) | PairIssueError::Internal(error)) => {
+        Audit::Failure(error) => {
             record_admin_request_failure(kernel, &context, error).await;
         },
     }

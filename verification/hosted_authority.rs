@@ -1,5 +1,8 @@
 // Verus entry point for transitions used by hosted Astrid.
 
+#[path = "../crates/astrid-kernel/src/kernel_router/admin/pair_issue_result.rs"]
+mod pair_issue_result;
+
 #[path = "../crates/astrid-capsule/src/engine/wasm/mount_selection.rs"]
 mod mount_selection;
 

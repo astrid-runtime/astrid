@@ -41,6 +41,7 @@ mod invite_handlers;
 mod pair_device_handlers;
 #[cfg(test)]
 mod pair_device_tests;
+mod pair_issue_result;
 #[cfg(test)]
 mod principal_ownership;
 mod quota;

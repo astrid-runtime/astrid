@@ -55,7 +55,9 @@ PRIVATE_RESPONDER = Path("crates/astrid-capsule/src/elicitation/responder.rs")
 PAIR_DENIES = Path("crates/astrid-kernel/src/kernel_router/admin/pair_device_handlers/deny_patterns.rs")
 RECEIPT = Path("crates/astrid-kernel/src/kernel_router/resume_receipt/validation.rs")
 MOUNT = Path("crates/astrid-capsule/src/engine/wasm/mount_selection.rs")
+PAIR_RESULT = Path("crates/astrid-kernel/src/kernel_router/admin/pair_issue_result.rs")
 INPUTS = [
+    PAIR_RESULT,
     MOUNT,
     RECEIPT,
     PAIR_DENIES,
@@ -270,6 +272,21 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "home file operation captures the workspace bundle",
             MOUNT,
             lambda text: replace_once(text, "            Self::Home => home,", "            Self::Home => workspace,"),
+        ),
+        (
+            "pair token is returned after a storage collision",
+            PAIR_RESULT,
+            lambda text: replace_once(text, "Ok(false) => Inserted::Collision", "Ok(false) => Inserted::Issued(token)"),
+        ),
+        (
+            "pair token is returned after a storage error",
+            PAIR_RESULT,
+            lambda text: replace_once(text, "Err(_) => Inserted::Unavailable", "Err(_) => Inserted::Issued(token)"),
+        ),
+        (
+            "pair authorization refusal emits a successful audit outcome",
+            PAIR_RESULT,
+            lambda text: replace_once(text, "=> Audit::Denied(error)", "=> Audit::Success"),
         ),
         (
             "wire header misstates the low byte of the body length",

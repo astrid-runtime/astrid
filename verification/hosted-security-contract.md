@@ -115,6 +115,15 @@ Ordinary requests, typed admin requests subject to capability admission, agent d
 
 Pairing-token issuance preserves restrictions from the policy snapshot admitted by the router, then checks the issuer again while holding the administration write lock through durable token creation. On the device-authenticated route the second lookup uses the registration recorded in the admitted snapshot. Kernel regressions queue issuance behind a writer and exercise both removal and replacement by the same key. Both deny issuance and leave the token store empty. A policy-only change on the same registration retains restrictions from both snapshots. The production deny-list fold proves exact union membership, retention of the original ordered prefix, and that each newly appended pattern was absent from all earlier entries. This binds the inherited pattern strings. Their interpretation depends on the capability matcher. The lock interval and durable store operation are runtime-tested refinement obligations.
 
+The production insertion transition releases the supplied pairing token only
+when the durable store reports a successful new insertion. A collision and
+a store error have distinct outcomes. The checked audit classifier maps
+issuance to success, a policy refusal to denied authorization, and bad input
+or storage failure to a failed operation. Failure rows preserve the original
+error. A router regression disables a queued issuer and checks for exactly
+one denied row and an empty durable token store. Atomicity between the token
+store and the audit log across a crash is a separate obligation.
+
 The ordinary kernel router matches every `KernelRequest` variant in
 `request_policy::request_principal`. Install, install-batch and targeted
 metadata dispatch reuse the explicit principal selected for admission.
