@@ -127,6 +127,20 @@ delivery after an
 already admitted handoff and confinement of subsequent handler effects remain
 separate obligations.
 
+At reserved bus commit, the Verus-checked decision returns the exact delivery
+reservation and ordered handoff supplied by the publisher. A missing reservation
+requires an observation that the corresponding lane is absent. A captured
+handoff requires an observation that its own sender is open. The bus makes
+these observations under its publication-order lock, then acquires route guards
+from the returned delivery reservation. The proof treats the observed slot occupancy and sender closure as inputs.
+
+The ordered receiver and its shutdown drain consume each dequeued item through
+the same checked dispatch. An ordinary item returns its exact event for
+matching. A reserved item applies the supplied delivery callback to its original
+reservation and event and returns its result. The production callback invokes
+the reservation’s delivery method. Queue scheduling, callback effects and
+source-device grant continuity after commit remain open.
+
 For host-local framed ingress, each Wasmtime Store owns the connection
 identities indexed by its own resource table. The framed read clears any
 previous stamp before resolving the handle. Its checked selector returns

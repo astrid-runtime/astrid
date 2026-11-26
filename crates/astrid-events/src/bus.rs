@@ -264,29 +264,25 @@ impl EventBus {
         let _guard = self.publish_order.lock();
         // A reservation taken while the bus was unconfigured must not turn
         // into an unreserved publication through a newly installed dispatcher.
-        if publication.delivery.is_none() && self.delivery_admitter.read().is_some() {
-            return Err(crate::DeliveryAdmissionError::Closed);
-        }
-        if publication.handoff.is_none() && self.ordered_delivery.lock().is_some() {
-            return Err(crate::DeliveryAdmissionError::Closed);
-        }
-        if publication
-            .handoff
-            .as_ref()
-            .is_some_and(|handoff| handoff.sender.is_closed())
-        {
-            return Err(crate::DeliveryAdmissionError::Closed);
-        }
-        let guards = publication
-            .delivery
+        let delivery_required =
+            publication.delivery.is_none() && self.delivery_admitter.read().is_some();
+        let inbox_required =
+            publication.handoff.is_none() && self.ordered_delivery.lock().is_some();
+        let observed_handoff = publication.handoff.map(|handoff| {
+            let closed = handoff.sender.is_closed();
+            (handoff, closed)
+        });
+        let (delivery, handoff) = crate::admission::commit::recheck(
+            publication.delivery,
+            observed_handoff,
+            delivery_required,
+            inbox_required,
+        )
+        .ok_or(crate::DeliveryAdmissionError::Closed)?;
+        let guards = delivery
             .as_ref()
             .map_or_else(|| Ok(Vec::new()), |delivery| delivery.commit_guards())?;
-        Ok(self.publish_reserved(
-            publication.event,
-            publication.delivery,
-            publication.handoff,
-            guards,
-        ))
+        Ok(self.publish_reserved(publication.event, delivery, handoff, guards))
     }
 
     pub(crate) fn publish_reserved(

@@ -79,3 +79,9 @@ mod native_delivery_queue;
 
 #[path = "../crates/astrid-uplink/src/native/reply_claim.rs"]
 mod native_reply_claim;
+
+#[path = "../crates/astrid-events/src/admission/commit.rs"]
+mod delivery_commit;
+
+#[path = "../crates/astrid-events/src/ordered_dispatch.rs"]
+mod ordered_dispatch;

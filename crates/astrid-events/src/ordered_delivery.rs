@@ -18,12 +18,10 @@ impl OrderedDelivery {
     /// matching by the dispatcher. Call in inbox order, before the next recv.
     #[must_use]
     pub fn into_unreserved(self) -> Option<Arc<AstridEvent>> {
-        if let Some(reservation) = self.reservation {
-            reservation.deliver(&self.event);
-            None
-        } else {
-            Some(self.event)
-        }
+        crate::ordered_dispatch::dispatch(self.event, self.reservation, |reservation, event| {
+            reservation.deliver(&event);
+        })
+        .err()
     }
 }
 

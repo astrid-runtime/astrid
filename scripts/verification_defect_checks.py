@@ -34,6 +34,8 @@ BINDING = Path("crates/astrid-storage/src/principal_directory/binding.rs")
 CACHE_ADDRESS = Path("crates/astrid-kernel/src/capsule_materialization/cache_address.rs")
 GENERATION = Path("crates/astrid-capsule/src/registry/generation.rs")
 VIEW_OWNER = Path("crates/astrid-capsule/src/registry/view_owner.rs")
+ORDERED_DISPATCH = Path("crates/astrid-events/src/ordered_dispatch.rs")
+DELIVERY_COMMIT = Path("crates/astrid-events/src/admission/commit.rs")
 ROUTE_GATE = Path("crates/astrid-events/src/route/gate/state.rs")
 ROUTE_SCOPE = Path("crates/astrid-events/src/route/scope.rs")
 PRINCIPAL_SYNTAX = Path("crates/astrid-core/src/principal/syntax.rs")
@@ -49,6 +51,8 @@ DEVICE_SESSIONS = Path("crates/astrid-core/src/profile/device_sessions/phase.rs"
 DEVICE_REMOVAL = Path("crates/astrid-core/src/profile/device_removal.rs")
 DEVICE_CHALLENGE = Path("crates/astrid-core/src/profile/device_challenge.rs")
 INPUTS = [
+    ORDERED_DISPATCH,
+    DELIVERY_COMMIT,
     DEVICE_CHALLENGE,
     DEVICE_REMOVAL,
     DEVICE_SESSIONS,
@@ -152,6 +156,41 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
         for item in PROOF_ITEMS
     ]
     return [
+        (
+            "reserved handoff leaks into ordinary dispatch",
+            ORDERED_DISPATCH,
+            lambda text: replace_once(text, "Ok(deliver(reserved, event))", "Err(event)"),
+        ),
+        (
+            "publication accepts a missing delivery reservation",
+            DELIVERY_COMMIT,
+            lambda text: replace_once(text, "if delivery.is_none() && delivery_required", "if false"),
+        ),
+        (
+            "publication ignores inbox installation",
+            DELIVERY_COMMIT,
+            lambda text: replace_once(text, "None if inbox_required => return None,", "None if inbox_required => None,"),
+        ),
+        (
+            "publication ignores captured inbox closure",
+            DELIVERY_COMMIT,
+            lambda text: replace_once(text, "Some((_, true)) => return None,", "Some((handoff, true)) => Some(handoff),"),
+        ),
+        (
+            "publication discards captured delivery",
+            DELIVERY_COMMIT,
+            lambda text: replace_once(text, "Some((delivery, handoff))", "Some((None, handoff))"),
+        ),
+        (
+            "publication discards captured handoff",
+            DELIVERY_COMMIT,
+            lambda text: replace_once(text, "Some((delivery, handoff))", "Some((delivery, None))"),
+        ),
+        (
+            "publication rejects all valid reservations",
+            DELIVERY_COMMIT,
+            lambda text: replace_once(text, "    Some((delivery, handoff))", "    None"),
+        ),
         (
             "publication accepts a mismatched forward binding",
             BINDING,

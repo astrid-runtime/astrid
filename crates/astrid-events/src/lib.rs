@@ -19,6 +19,7 @@ mod bus;
 mod event;
 pub mod ipc;
 mod ordered_delivery;
+mod ordered_dispatch;
 pub mod rate_limiter;
 mod route;
 mod subscriber;
