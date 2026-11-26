@@ -424,6 +424,11 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             lambda text: replace_once(text, "destinations.home, operation, self.class)", "destinations.home, operation, OperationClass::Read)"),
         ),
         (
+            "published authenticated callback loses its authorized effect",
+            Path("verification/hosted_lease_model.rs"),
+            lambda text: replace_once(text, "Admission::Accepted(ticket) => Some(ticket.into_effect())", "Admission::Accepted(_) => None"),
+        ),
+        (
             "filesystem operation is redirected to backing capacity",
             LEASE_CALLBACK,
             lambda text: replace_once(text, "operation => Effect::Filesystem", "Operation::Sync => Effect::Volume(destinations.home),\n            operation => Effect::Filesystem"),

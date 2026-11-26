@@ -2,7 +2,7 @@
 use vstd::prelude::*;
 
 use crate::mount_reservation::Reservation;
-use crate::storage_callback::{self, Admission, OperationClass};
+use crate::storage_callback::{self, Admission, Destinations, Effect, OperationClass};
 use crate::storage_filesystem::StorageFilesystemOperationV1;
 
 verus! {
@@ -96,6 +96,25 @@ impl RuntimeLease {
     {
         let active = self.published && storage_callback::live(self.revoked, now, expires);
         storage_callback::admit(lease, active, authenticated, writable, operation)
+    }
+
+    /// Compose lease phase, credential and access checks with final dispatch.
+    fn effect<L,T,H>(&self, destinations: Destinations<L,T,H>, now: u64, expires: u64,
+        authenticated: bool, writable: bool, operation: StorageFilesystemOperationV1)
+        -> (result: Option<Effect<L,T,H>>)
+        ensures
+            result.is_some() == (self.phase() == Phase::Published && now <= expires &&
+                authenticated && (storage_callback::access_class(operation) != OperationClass::Write || writable)),
+            result matches Some(Effect::Volume(home)) ==>
+                operation is VolumeInfo && home == destinations.home,
+            result matches Some(Effect::Filesystem(lease, target, home, op, class)) ==>
+                !(operation is VolumeInfo) && lease == destinations.lease && target == destinations.mount &&
+                home == destinations.home && op == operation && class == storage_callback::access_class(operation),
+    {
+        match self.callback(destinations, now, expires, authenticated, writable, operation) {
+            Admission::Accepted(ticket) => Some(ticket.into_effect()),
+            _ => None,
+        }
     }
 }
 
