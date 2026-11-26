@@ -168,6 +168,21 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             lambda text: replace_once(text, "if admits(current) { Some(pending)", "if true { Some(pending)"),
         ),
         (
+            "frame consumption drops the captured operation",
+            INGRESS_FRAME,
+            lambda text: replace_once(text, "    slot.take()", "    *slot = None; None"),
+        ),
+        (
+            "authenticated forward ignores topic",
+            INGRESS_FRAME,
+            lambda text: replace_once(text, "if topic != offered_topic", "if false"),
+        ),
+        (
+            "authenticated forward ignores payload",
+            INGRESS_FRAME,
+            lambda text: replace_once(text, "if body != offered_body", "if false"),
+        ),
+        (
             "non-uplink read earns ingress identity",
             INGRESS_FRAME,
             lambda text: replace_once(text, "    if uplink && data", "    if data"),

@@ -2332,6 +2332,7 @@ impl ExecutionEngine for WasmEngine {
                 // No frame in flight at construction; both the ingress
                 // principal and its authenticating device key_id are set per
                 // framed read.
+                ingress_publication: None,
                 ingress_principal: None,
                 ingress_device_key_id: None,
                 ingress_request_owner: None,
@@ -3767,6 +3768,7 @@ async fn build_lifecycle_host_state(
         share_tcp_listeners: false,
         // Lifecycle hooks never forward client frames; no in-flight principal
         // or authenticating device.
+        ingress_publication: None,
         ingress_principal: None,
         ingress_device_key_id: None,
         ingress_request_owner: None,

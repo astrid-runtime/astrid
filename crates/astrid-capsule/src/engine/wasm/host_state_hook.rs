@@ -163,6 +163,7 @@ impl HostState {
             share_tcp_listeners: false,
             // No client frame in flight; hooks never forward over publish-as, so
             // neither the ingress principal nor its device id / origin is set.
+            ingress_publication: None,
             ingress_principal: None,
             ingress_device_key_id: None,
             ingress_request_owner: None,

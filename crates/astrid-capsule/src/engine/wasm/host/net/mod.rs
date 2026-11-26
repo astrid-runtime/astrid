@@ -45,6 +45,7 @@ mod client_lifecycle;
 pub(crate) use client_lifecycle::disconnect_remaining_clients;
 pub(crate) mod handshake;
 mod ingress_frame;
+pub(crate) use ingress_frame::{matches_publication, take_publication};
 mod stream;
 mod tcp_listener;
 mod tcp_stream;

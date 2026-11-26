@@ -215,6 +215,65 @@ async fn ingress_stamp_expires_at_each_new_read_and_at_connection_drop() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn authenticated_local_frame_authorizes_one_matching_publication() {
+    use crate::engine::wasm::bindings::astrid::ipc::host::{
+        ErrorCode as IpcError, Host as IpcHost,
+    };
+    use crate::engine::wasm::test_fixtures::minimal_host_state;
+    use tokio::io::AsyncWriteExt;
+
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.has_uplink_capability = true;
+    state.ipc_publish_patterns = vec!["test.v1.*".into()];
+    let mut rx = state.event_bus.subscribe_topic_as("test.v1.*", "test");
+    let (socket, mut peer) = tokio::net::UnixStream::pair().unwrap();
+    let stream = NetStream::Unix(std::sync::Arc::new(tokio::sync::Mutex::new(socket)));
+    let rep = state.resource_table.push(stream).unwrap().rep();
+    state.bind_connection_principal(rep, astrid_core::PrincipalId::new("alice").unwrap(), None);
+
+    let frame = br#"{"topic":"test.v1.request","payload":{"z":1,"a":"target"}}"#;
+    for (topic, body, allowed) in [
+        ("test.v1.other", r#"{"z":1,"a":"target"}"#, false),
+        ("test.v1.request", r#"{"z":1,"a":"other"}"#, false),
+        ("test.v1.request", r#"{ "a":"target", "z":1 }"#, true),
+    ] {
+        peer.write_all(&u32::try_from(frame.len()).unwrap().to_be_bytes())
+            .await
+            .unwrap();
+        peer.write_all(frame).await.unwrap();
+        assert!(matches!(
+            HostTcpStream::read(&mut state, Resource::new_borrow(rep)),
+            Ok(NetReadStatus::Data(_))
+        ));
+        let result =
+            IpcHost::publish_as(&mut state, topic.into(), body.into(), "unused".into()).await;
+        if allowed {
+            result.unwrap();
+            let event = rx.try_recv().expect("matching frame forwarded");
+            let astrid_events::AstridEvent::Ipc { message, .. } = &*event else {
+                panic!("expected IPC");
+            };
+            assert_eq!(message.principal.as_deref(), Some("alice"));
+            assert_eq!(message.topic.as_str(), topic);
+        } else {
+            assert!(matches!(result, Err(IpcError::CapabilityDenied)));
+        }
+        assert!(matches!(
+            IpcHost::publish_as(
+                &mut state,
+                "test.v1.request".into(),
+                r#"{"z":1,"a":"target"}"#.into(),
+                "unused".into()
+            )
+            .await,
+            Err(IpcError::CapabilityDenied)
+        ));
+        assert!(rx.try_recv().is_none());
+    }
+}
+
 /// A non-uplink capsule never records an ingress principal even when it
 /// reads a (hypothetically) bound stream — the gate keeps the registry
 /// lookup off every non-uplink framed read and prevents any cross-capsule

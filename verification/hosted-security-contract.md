@@ -133,9 +133,15 @@ previous stamp before resolving the handle. Its checked selector returns
 the supplied identity exactly when the capsule holds the uplink capability
 and the read produced data. A byte read, read-stream request, lease reset
 or successful drop of the stamped connection also clears the stamp.
-The selector theorem assumes its binding input. Handshake authenticity,
-Wasmtime handle allocation and attribution of a later guest publication
-to the contents of that frame still require refinement.
+For a bound frame the host extracts its topic and JSON payload. An
+authenticated publish-as attempt consumes that operation before awaiting
+delivery. The checked comparison requires equality of the topic bytes and
+normalized payload bytes. The host forwards the captured topic and body.
+A second attempt under the same stamp is denied. Object key order and JSON
+whitespace do not affect the comparison. An unbound publication retains
+the anonymous principal and system origin. The selector theorem assumes its
+binding input. Handshake authenticity, Wasmtime handle allocation, the JSON
+parser and serializer, and downstream interpretation remain proof obligations.
 
 ## Native MCP network authority
 

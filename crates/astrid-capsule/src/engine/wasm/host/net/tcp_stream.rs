@@ -108,6 +108,10 @@ impl HostTcpStream for HostState {
                 principal = %identity.principal,
                 "tcp-stream.read stamped LocalSocket origin (uplink-gated)"
             );
+            if let Ok(NetReadStatus::Data(frame)) = &result {
+                self.ingress_publication =
+                    crate::engine::wasm::host_state::IngressPublication::from_frame(frame);
+            }
             self.ingress_principal = Some(identity.principal);
             self.ingress_device_key_id = identity.device_key_id;
             self.ingress_request_owner = Some(identity.request_owner);

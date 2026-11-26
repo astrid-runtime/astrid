@@ -522,6 +522,9 @@ async fn publish_as_verified_principal_overrides_claimed_name() {
     state.ipc_publish_patterns = vec!["client.v1.*".to_string()];
     state.ipc_subscribe_patterns = vec!["client.v1.*".to_string()];
     // The framed read recorded the connection's verified principal.
+    state.ingress_publication = crate::engine::wasm::host_state::IngressPublication::from_frame(
+        br#"{"topic":"client.v1.connect","payload":{}}"#,
+    );
     state.ingress_principal = Some(astrid_core::PrincipalId::new("claude").unwrap());
     let request_owner = astrid_events::ipc::RequestOwnerId::generate();
     state.ingress_request_owner = Some(request_owner);
@@ -623,6 +626,9 @@ async fn publish_as_stamps_host_derived_device_key_id() {
     state.ipc_publish_patterns = vec!["client.v1.*".to_string()];
     // The framed read recorded the connection's verified principal AND the
     // device key_id that authenticated it.
+    state.ingress_publication = crate::engine::wasm::host_state::IngressPublication::from_frame(
+        br#"{"topic":"client.v1.connect","payload":{}}"#,
+    );
     state.ingress_principal = Some(astrid_core::PrincipalId::new("claude").unwrap());
     state.ingress_device_key_id = Some("dev-abc123".to_string());
 
@@ -909,6 +915,9 @@ async fn publish_as_bound_connection_stamps_local_socket_origin() {
     state.has_uplink_capability = true;
     state.ipc_publish_patterns = vec!["client.v1.*".to_string()];
     // The framed read off a bound connection recorded LocalSocket.
+    state.ingress_publication = crate::engine::wasm::host_state::IngressPublication::from_frame(
+        br#"{"topic":"client.v1.connect","payload":{}}"#,
+    );
     state.ingress_principal = Some(astrid_core::PrincipalId::new("claude").unwrap());
     state.ingress_origin = Some(astrid_events::ipc::MessageOrigin::LocalSocket);
 
