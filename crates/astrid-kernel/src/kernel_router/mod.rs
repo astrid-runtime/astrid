@@ -197,6 +197,14 @@ async fn handle_request(
         return;
     };
 
+    // Receipt storage resolves the caller's durable UID. Keep the profile
+    // decision, namespace access and response publication in the same owner
+    // lifetime as principal creation and deletion.
+    let _receipt_owner_guard = match &req {
+        G { .. } | P { .. } => Some(kernel.admin_write_lock.lock().await),
+        _ => None,
+    };
+
     // Capability enforcement preamble (issue #670). Resolve the caller's
     // profile, compute the required capability for this request, and
     // reject with an audited `Denied` entry on failure. No match arm
