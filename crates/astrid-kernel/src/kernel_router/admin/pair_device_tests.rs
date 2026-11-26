@@ -703,6 +703,40 @@ async fn use_only_device_denied_pair_issue_but_holds_use_cap() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn post_rename_sync_error_withholds_ack_and_invalidates_the_live_profile() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("device_owner");
+    let key = full_device('a');
+    let id = key.key_id.clone();
+    seed(&kernel, &caller, &["self:*"], vec![key]);
+    assert!(
+        kernel
+            .profile_cache
+            .resolve(&caller)
+            .unwrap()
+            .auth
+            .device_by_key_id(&id)
+            .is_some()
+    );
+    let response =
+        super::pair_device_handlers::revoke_with_failed_directory_sync(&kernel, &caller, &id).await;
+    assert!(load(&kernel, &caller).auth.device_by_key_id(&id).is_none());
+    assert!(
+        matches!(response, AdminResponseBody::Error(message) if message.contains("persistence is unconfirmed"))
+    );
+    assert!(
+        kernel
+            .profile_cache
+            .resolve(&caller)
+            .unwrap()
+            .auth
+            .device_by_key_id(&id)
+            .is_none()
+    );
+}
+
 // ── Criterion 4: list + revoke; revoked device fails closed at the gate ─
 
 #[tokio::test(flavor = "multi_thread")]
