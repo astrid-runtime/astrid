@@ -16,4 +16,17 @@ pub(super) fn select(expected: Option<[u8; 32]>, observed: [u8; 32]) -> (owner: 
     }
 }
 
+pub(super) fn matches_pair(
+    alias: &[u8], uid: &[u8; 32], forward: Option<&[u8; 32]>, reverse: Option<&[u8]>,
+) -> (accepted: bool)
+    ensures accepted == ((forward matches Some(f) && f@ == uid@)
+        && (reverse matches Some(r) && r@ == alias@)),
+{
+    let (Some(f), Some(r)) = (forward, reverse) else { return false; };
+    if f.as_slice() != uid.as_slice() || r != alias { return false; }
+    assert(f@ =~= uid@);
+    assert(r@ =~= alias@);
+    true
+}
+
 }

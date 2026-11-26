@@ -10,6 +10,36 @@ fn uid(byte: u8) -> PrincipalUid {
 }
 
 #[test]
+fn owned_publication_runs_under_the_binding_or_returns_its_candidate() {
+    let directory = PrincipalDirectory::default();
+    let original = alias("original");
+    let renamed = alias("renamed");
+    let owner = uid(1);
+    directory.register(original.clone(), owner).unwrap();
+    let candidate = Box::new(37);
+    let candidate = directory
+        .with_bound_input(&original, owner, candidate, |candidate| {
+            assert!(directory.inner.try_write().is_none());
+            candidate
+        })
+        .unwrap();
+    directory.rename(owner, &original, renamed.clone()).unwrap();
+    directory.register(original.clone(), uid(2)).unwrap();
+    let candidate = directory
+        .with_bound_input(&original, owner, candidate, |_| {
+            panic!("cannot publish an old owner's candidate into a reused alias")
+        })
+        .unwrap_err();
+    directory.inner.write().principals.remove(&owner);
+    let candidate = directory
+        .with_bound_input(&renamed, owner, candidate, |_| {
+            panic!("cannot publish through a one-way binding")
+        })
+        .unwrap_err();
+    assert_eq!(*candidate, 37);
+}
+
+#[test]
 fn live_binding_holds_read_authority_through_the_callback() {
     let directory = PrincipalDirectory::default();
     let owner = alias("alice");

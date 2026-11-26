@@ -1814,7 +1814,7 @@ impl Kernel {
             self.capsules
                 .write()
                 .await
-                .reserve_runtime_id(id.clone(), wasm_hash.clone(), scope)?;
+                .reserve_runtime_id(id.clone(), wasm_hash, scope)?;
         let mut capsule = self
             .build_capsule_runtime(
                 manifest,
@@ -1835,7 +1835,7 @@ impl Kernel {
             return Ok(());
         }
 
-        self.publish_initial_runtime(capsule, runtime_id, &wasm_hash, system_runtime, principal)
+        self.publish_initial_runtime(capsule, runtime_id, principal)
             .await
     }
 
@@ -1843,14 +1843,15 @@ impl Kernel {
         &self,
         mut candidate: Box<dyn astrid_capsule::capsule::Capsule>,
         runtime_id: astrid_capsule::registry::RuntimeId,
-        artifact: &astrid_capsule::registry::WasmHash,
-        system_runtime: bool,
         principal: &PrincipalId,
     ) -> Result<(), anyhow::Error> {
         let id = candidate.id().clone();
         let mut registry = self.capsules.write().await;
         let already_in_view = registry.get_for(principal, &id).is_some();
-        let system_winner = system_runtime && registry.contains_system_runtime(&id, artifact);
+        let scope = runtime_id.key().scope();
+        let artifact = runtime_id.key().artifact();
+        let system_winner = scope == astrid_capsule::registry::RuntimeScope::SystemResident
+            && registry.contains_system_runtime(&id, artifact);
         if already_in_view || system_winner {
             if system_winner && !already_in_view {
                 registry.register_existing(&id, artifact, principal)?;
@@ -1868,10 +1869,29 @@ impl Kernel {
 
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let identity = capsule_audit::CapsuleIdentity::of(candidate.as_ref());
-        let owner = Some(principal.clone());
-        if let Err(publication) =
-            registry.try_register_reserved_runtime(candidate, runtime_id, principal, owner)
-        {
+        let register = |candidate| {
+            registry.try_register_reserved_runtime(
+                candidate,
+                runtime_id,
+                principal,
+                Some(principal.clone()),
+            )
+        };
+        let publication = match scope {
+            astrid_capsule::registry::RuntimeScope::Principal(uid) => self
+                .principal_directory
+                .with_bound_input(principal, uid, candidate, register)
+                .unwrap_or_else(|capsule| {
+                    Err(astrid_capsule::registry::RuntimePublicationError {
+                        capsule,
+                        error: astrid_capsule::error::CapsuleError::ExecutionFailed(format!(
+                            "owner of '{principal}' changed before registering capsule '{id}'"
+                        )),
+                    })
+                }),
+            astrid_capsule::registry::RuntimeScope::SystemResident => register(candidate),
+        };
+        if let Err(publication) = publication {
             drop(registry);
             let mut candidate = publication.capsule;
             candidate.retire();
@@ -5516,6 +5536,64 @@ mod tests {
             kernel.capsule_view_locks.is_empty(),
             "the final guard must evict its exact dead weak entry"
         );
+    }
+
+    #[tokio::test]
+    async fn initial_publication_unloads_candidate_when_owner_changed_after_reservation() {
+        use astrid_capsule::registry::{RuntimeScope, WasmHash};
+        let (_dir, home) = scratch_home();
+        let kernel = test_kernel_with_home(home).await;
+        let principal = PrincipalId::new("publish-owner").unwrap();
+        let uid = astrid_core::PrincipalUid::from_bytes([91; 32]);
+        let id = CapsuleId::new("publish-candidate").unwrap();
+        let directory = &kernel.principal_directory;
+        directory.register(principal.clone(), uid).unwrap();
+        let runtime = kernel
+            .capsules
+            .write()
+            .await
+            .reserve_runtime_id(
+                id.clone(),
+                WasmHash::synthetic(id.as_str(), "1.0"),
+                RuntimeScope::Principal(uid),
+            )
+            .unwrap();
+        directory
+            .rename(uid, &principal, PrincipalId::new("renamed-owner").unwrap())
+            .unwrap();
+        directory
+            .register(
+                principal.clone(),
+                astrid_core::PrincipalUid::from_bytes([92; 32]),
+            )
+            .unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let unloaded = Arc::new(AtomicBool::new(false));
+        let candidate = Box::new(CancellableTestCapsule {
+            id: id.clone(),
+            manifest: CapsuleManifest::default(),
+            cancelled: cancelled.clone(),
+            unloaded: unloaded.clone(),
+            cancelled_for: Arc::default(),
+        });
+        let error = kernel
+            .publish_initial_runtime(candidate, runtime, &principal)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("changed before registering"),
+            "{error}"
+        );
+        assert!(
+            kernel
+                .capsules
+                .read()
+                .await
+                .get_for(&principal, &id)
+                .is_none()
+        );
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(unloaded.load(Ordering::Acquire));
     }
 
     #[tokio::test]

@@ -162,6 +162,34 @@ impl PrincipalDirectory {
         result.map(Some)
     }
 
+    /// Run a synchronous operation with an owned input while both sides of the
+    /// captured binding match. The callback must not re-enter the directory
+    /// or wait for work requiring its write lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original input for cleanup when either binding has changed.
+    pub fn with_bound_input<T, R>(
+        &self,
+        alias: &PrincipalId,
+        uid: PrincipalUid,
+        input: T,
+        operation: impl FnOnce(T) -> R,
+    ) -> Result<R, T> {
+        let state = self.inner.read();
+        if !binding::matches_pair(
+            alias.as_str().as_bytes(),
+            uid.as_bytes(),
+            state.aliases.get(alias).map(PrincipalUid::as_bytes),
+            state.principals.get(&uid).map(|id| id.as_str().as_bytes()),
+        ) {
+            return Err(input);
+        }
+        let result = operation(input);
+        drop(state);
+        Ok(result)
+    }
+
     /// Resolve a durable UID to its current alias.
     ///
     /// # Errors

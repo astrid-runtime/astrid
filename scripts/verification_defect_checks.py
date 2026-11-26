@@ -123,6 +123,16 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
     ]
     return [
         (
+            "publication accepts a mismatched forward binding",
+            BINDING,
+            lambda text: replace_once(text, "f.as_slice() != uid.as_slice() || ", ""),
+        ),
+        (
+            "publication accepts a mismatched reverse binding",
+            BINDING,
+            lambda text: replace_once(text, " || r != alias", ""),
+        ),
+        (
             "registry reuses the same generation",
             GENERATION,
             lambda text: replace_once(text, "*next = successor;", "*next = current;"),

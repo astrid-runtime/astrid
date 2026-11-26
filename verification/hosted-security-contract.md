@@ -74,8 +74,12 @@ passes the observed generation into restart, and reports a superseded generation
 as a failed reload. Verus checks the production generation allocator: a successful
 reservation returns the previous counter and advances it by one. At exhaustion
 the counter remains unchanged and reservation fails. This covers a single
-registry lifetime. Fresh discovery, singleton views and alias changes before
-final publication still need end-to-end binding. Ordering with
+registry lifetime. Initial principal runtime registration and replacement both
+hold a directory read lock through the registry mutation. The verified
+predicate requires the current UID for the alias and the current alias for the
+UID to match. Rejection returns the candidate
+for cancellation and unloading. Route opening after the swap, fresh discovery,
+and singleton views still need end-to-end binding. Ordering with
 retirement, authenticated request admission and durable commit still needs a
 proof across the full operation.
 
