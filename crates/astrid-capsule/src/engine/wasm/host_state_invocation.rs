@@ -9,11 +9,10 @@ impl HostState {
     /// interceptor path awaits the same storage read directly.
     fn load_invocation_env_overlay(
         &self,
-        principal: &astrid_core::PrincipalId,
+        principal_uid: astrid_core::PrincipalUid,
     ) -> Option<HashMap<String, String>> {
         let backend = self.kv_backend.clone();
         let capsule = self.capsule_id.to_string();
-        let principal_uid = self.principal_directory.uid_for(principal).ok()?;
         crate::engine::wasm::host::util::bounded_block_on(
             &self.runtime_handle,
             &self.io_semaphore,
@@ -57,6 +56,9 @@ impl HostState {
                 runtime_id.key().capsule_id(),
                 self.capsule_id
             )));
+        }
+        if let crate::registry::RuntimeScope::Principal(uid) = runtime_id.key().scope() {
+            self.invocation_storage_uid = Some(uid);
         }
         self.invocation_kv = Some(self.kv.clone());
         self.invocation_home = self.home.clone();
@@ -265,15 +267,20 @@ impl HostState {
             .caller_context
             .as_ref()
             .and_then(|c| c.principal.clone());
-        if new_principal == existing_principal && self.invocation_profile_authorized {
+        let current_uid = publisher
+            .as_ref()
+            .and_then(|p| self.principal_directory.uid_for(p).ok());
+        if new_principal == existing_principal
+            && self.invocation_profile_authorized
+            && current_uid == self.invocation_storage_uid
+        {
             // Refresh the caller context so e.g. topic name / payload
             // tracking stays current. Also refresh the env overlay: dashboard
             // onboarding can write config after a capsule is already loaded,
             // and a same-principal recv loop must observe the new file on the
             // next message without requiring a capsule reload.
             self.caller_context = Some(msg.clone());
-            let env_principal = publisher.as_ref().unwrap_or(&self.principal);
-            self.invocation_env_overlay = self.load_invocation_env_overlay(env_principal);
+            self.invocation_env_overlay = self.recv_env_overlay(publisher.is_some());
             if self.invocation_home.is_none() {
                 self.install_recv_invocation_vfs(publisher.as_ref());
             }
@@ -353,8 +360,6 @@ impl HostState {
             }
         });
 
-        self.invocation_env_overlay = self.load_invocation_env_overlay(&profile_principal);
-
         // Install every principal-scoped overlay for the publisher (owner
         // included), or clear to the neutral floor for a principal-less event.
         if crate::engine::wasm::install_principal_overlays_sync(self, publisher.as_ref()) {
@@ -364,6 +369,16 @@ impl HostState {
             self.invocation_workspace = None;
             self.invocation_tmp = None;
         }
+        self.invocation_env_overlay = self.recv_env_overlay(publisher.is_some());
+    }
+
+    fn recv_env_overlay(&self, has_publisher: bool) -> Option<HashMap<String, String>> {
+        let uid = if has_publisher {
+            self.invocation_storage_uid
+        } else {
+            self.principal_directory.uid_for(&self.principal).ok()
+        }?;
+        self.load_invocation_env_overlay(uid)
     }
 
     /// Build the recv message's home/tmp VFS bundle synchronously. Principal
@@ -377,23 +392,20 @@ impl HostState {
             self.invocation_tmp = None;
             return;
         };
-        let Some(store) = self.principal_store.as_ref() else {
+        let (Some(store), Some(uid)) = (self.principal_store.as_ref(), self.invocation_storage_uid)
+        else {
             self.invocation_home = None;
             self.invocation_workspace = None;
             self.invocation_tmp = None;
             return;
         };
-        let bundle = crate::engine::wasm::build_principal_vfs_bundle(
-            store,
-            &self.principal_directory,
-            principal,
-        );
+        let bundle = crate::engine::wasm::build_principal_vfs_bundle(store, principal, uid);
         self.invocation_home = bundle.home;
         self.invocation_workspace = if let Some(resolver) = self.workspace_mount_resolver.as_ref() {
             match crate::engine::wasm::host::util::bounded_block_on(
                 &self.runtime_handle,
                 &self.io_semaphore,
-                resolver.resolve(principal),
+                resolver.resolve(principal, uid),
             ) {
                 Ok(mount) => Some(mount),
                 Err(error) => {
@@ -457,9 +469,23 @@ mod recv_vfs_tests {
         );
         state.principal_store = Some(store);
         state.principal_directory = directory;
+        assert!(crate::engine::wasm::install_principal_overlays_sync(
+            &mut state,
+            Some(&alice)
+        ));
+        let alice_uid = state.principal_directory.uid_for(&alice).unwrap();
+        let previous_alias = astrid_core::PrincipalId::new("previous-alice").unwrap();
+        state
+            .principal_directory
+            .rename(alice_uid, &alice, previous_alias)
+            .unwrap();
+        let replacement = astrid_core::PrincipalUid::from_bytes([0xC3; 32]);
+        state
+            .principal_directory
+            .register(alice.clone(), replacement)
+            .unwrap();
         state.install_recv_invocation_vfs(Some(&alice));
         let scratch = astrid_home.runtime_principal_scratch_root();
-        let alice_uid = state.principal_directory.uid_for(&alice).unwrap();
         let alice_path = scratch.join(alice_uid.to_string()).join("tmp");
         let tmp = state.invocation_tmp.as_ref().expect("Alice scratch mount");
         let marker = tmp
@@ -470,12 +496,17 @@ mod recv_vfs_tests {
         tmp.vfs.write(&marker, b"alice").await.unwrap();
         tmp.vfs.close(&marker).await.unwrap();
         assert_eq!(std::fs::read(alice_path.join("marker")).unwrap(), b"alice");
+        assert!(!scratch.join(replacement.to_string()).exists());
         let alice_mount = state.invocation_home.as_ref().expect("Alice mount").clone();
         assert!(matches!(
             alice_mount.location,
             crate::engine::wasm::host_state::PrincipalMountLocation::AstridFilesystem
         ));
 
+        assert!(crate::engine::wasm::install_principal_overlays_sync(
+            &mut state,
+            Some(&bob)
+        ));
         state.install_recv_invocation_vfs(Some(&bob));
         let bob_uid = state.principal_directory.uid_for(&bob).unwrap();
         let bob_path = scratch.join(bob_uid.to_string()).join("tmp");
