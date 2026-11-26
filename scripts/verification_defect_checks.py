@@ -58,6 +58,7 @@ UID_TEXT = Path("crates/astrid-core/src/identity/principal/text.rs")
 FILESYSTEM_PATH = Path("crates/astrid-storage/src/filesystem/path_validation.rs")
 STORAGE_HANDLES = Path("crates/astrid-capsule/src/engine/wasm/storage_handles.rs")
 STORAGE_FILE = Path("crates/astrid-capsule/src/engine/wasm/storage_file.rs")
+LEASE_RESERVATION = Path("crates/astrid-kernel/src/storage_mount/lease_authority/reservation.rs")
 LEASE_SUBTREE = Path("crates/astrid-kernel/src/storage_mount/lease_authority/subtree.rs")
 LEASE_CALLBACK = Path("crates/astrid-kernel/src/storage_mount/lease_authority/callback.rs")
 LEASE_REQUESTER = Path("crates/astrid-kernel/src/storage_mount/lease_authority/requester.rs")
@@ -72,6 +73,8 @@ INPUTS = [
     PAIR_RESULT,
     LEASE_CALLBACK,
     LEASE_SUBTREE,
+    LEASE_RESERVATION,
+    Path("verification/hosted_lease_model.rs"),
     Path("crates/astrid-core/src/storage_filesystem/operation.rs"),
     LEASE_REQUESTER,
     INVOCATION_OWNER,
@@ -364,6 +367,36 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "missing invocation workspace falls back to the runtime despite required binding",
             MOUNT,
             lambda text: replace_once(text, "if requires_binding { invocation }", "if requires_binding { runtime }"),
+        ),
+        (
+            "restart retains a published native lease",
+            Path("verification/hosted_lease_model.rs"),
+            lambda text: replace_once(text, "| Event::Revoke | Event::Restart => Phase::Closed", "| Event::Revoke => Phase::Closed"),
+        ),
+        (
+            "late publication reopens a retired lease identity",
+            Path("verification/hosted_lease_model.rs"),
+            lambda text: replace_once(text, "Event::Publish if phase == Phase::Preparing => Phase::Published", "Event::Publish => Phase::Published"),
+        ),
+        (
+            "retiring a requester keeps its preparation open",
+            LEASE_RESERVATION,
+            lambda text: replace_once(text, "if affected { *self = Self::Closed; }", "if !affected { *self = Self::Closed; }"),
+        ),
+        (
+            "one reservation allows repeated callback listener publication",
+            LEASE_RESERVATION,
+            lambda text: replace_once(text, "        *self = Self::Closed;\n        admitted", "        admitted"),
+        ),
+        (
+            "retired preparation grants publication",
+            LEASE_RESERVATION,
+            lambda text: replace_once(text, "let admitted = matches!(self, Self::Preparing(_));", "let admitted = true;"),
+        ),
+        (
+            "profile-only retirement closes unrelated management requesters",
+            LEASE_RESERVATION,
+            lambda text: replace_once(text, "Self::Management(name) => name == alias,", "Self::Management(name) => true,"),
         ),
         (
             "native mount recognizes home as the shared subtree",

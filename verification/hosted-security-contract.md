@@ -612,20 +612,25 @@ and crash durability remain separate refinement obligations.
 
 ### Principal retirement and native lease lifetime
 
-The callback currently samples the lease's revocation bit, expiry and bearer
-token. The typed subtree binds its storage owner, which can differ from the
-requester on a cross-owner lease. Principal disable changes the requester's
-profile, and deletion fences capabilities and allowances. Neither transition
-currently closes admission on every issued native lease. A successful callback
-renews its idle timeout. The current lease proof therefore supplies no bound
-on continued callback admission after principal disable or deletion.
+Native lease issue registers a reservation before checking the requester's live
+directory binding, profile and retirement fence. Registered requesters are
+matched by durable UID. Profile-only management requesters are matched by
+alias. Disable, deletion and failed initialization close matching reservations
+and issued leases. Publication and retirement share a lock. Re-enable requires
+a fresh lease. Integration tests exercise the management handlers, failed late
+publication, and survival of an unrelated requester's lease.
 
-To close this obligation the execution permit must bind the requester's UID
-and authority generation alongside the operation and its resolved target.
-Disable and deletion must close that same generation for future admissions,
-including a lease concurrently being issued. Re-enable must not revive a
-lease from a closed generation. The worker must retain the admitted generation
-through completion under the interface's drain rule. Recovery must establish
-whether a permit can survive restart for each transport and store. The capacity
-diagnostic (`VolumeInfo`) needs an explicit backing-store target because its
-result describes the hosted volume rather than the mounted subtree.
+The production reservation transitions are checked. A matching retirement
+closes a reservation; a publication claim consumes it. A closed reservation
+cannot publish. The lease trace model represents preparation, publication,
+callback admission, explicit revoke, requester retirement and restart for one
+mount identity. Revocation, matching retirement and restart permanently close
+that identity in the model. The callback refinement uses the production liveness
+and operation admission functions and preserves the supplied lease and operation.
+
+The remaining proof must establish that publication, enumeration of affected
+leases, profile transitions, callback observations and worker completion refine
+those events under concurrency. Restart in this model discards process-local
+authority; recovery must prove that no old listener, worker or credential can
+admit an effect in the replacement daemon. The backing volume described by
+`VolumeInfo` is a distinct target from the mounted subtree.

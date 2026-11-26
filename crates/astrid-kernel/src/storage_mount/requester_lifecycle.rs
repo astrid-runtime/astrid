@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use astrid_core::storage_provider::StorageMountId;
 use astrid_core::{PrincipalId, PrincipalUid};
 
+use super::lease_authority::reservation::{RequesterKey, Reservation};
 use super::{Kernel, StorageMountLeaseState, cleanup_resource};
 
 #[derive(Clone)]
@@ -29,10 +30,11 @@ impl Requester {
     }
 
     fn retiring(&self, alias: &PrincipalId, uid: Option<PrincipalUid>) -> bool {
-        match self {
-            Self::Registered(id) => Some(*id) == uid,
-            Self::Management(name) => name == alias,
-        }
+        let key = match self {
+            Self::Registered(id) => RequesterKey::Registered(*id.as_bytes()),
+            Self::Management(name) => RequesterKey::Management(name.as_str()),
+        };
+        key.retires(alias.as_str(), uid.map(|id| *id.as_bytes()))
     }
 }
 
@@ -45,7 +47,7 @@ impl StorageMountLeaseState {
     }
 }
 
-type Reservations = HashMap<StorageMountId, Option<Requester>>;
+type Reservations = HashMap<StorageMountId, Reservation<Requester>>;
 
 #[derive(Default)]
 pub(crate) struct PendingMountIssues(Mutex<Reservations>);
@@ -90,13 +92,16 @@ impl<'a> Issue<'a> {
         if pending.contains_key(&id) || kernel.storage_mounts.contains_key(&id) {
             return Err("storage mount identity already allocated".to_owned());
         }
-        pending.insert(id, Some(requester));
+        pending.insert(id, Reservation::Preparing(requester));
         Ok(Self { issues, id })
     }
 
     pub(super) fn publish(self, install: impl FnOnce()) -> bool {
-        let pending = self.issues.lock();
-        if !matches!(pending.get(&self.id), Some(Some(_))) {
+        let mut pending = self.issues.lock();
+        if !pending
+            .get_mut(&self.id)
+            .is_some_and(Reservation::claim_publication)
+        {
             return false;
         }
         install();
@@ -119,13 +124,10 @@ pub(crate) async fn retire_requester(
     let retired = {
         let mut pending = kernel.pending_mount_issues.lock();
         for reservation in pending.values_mut() {
-            if reservation
-                .as_ref()
-                .is_some_and(|requester| requester.retiring(alias, uid))
-            {
-                // Keep this mount ID reserved until its preparation unwinds.
-                *reservation = None;
-            }
+            let affected = reservation
+                .requester()
+                .is_some_and(|requester| requester.retiring(alias, uid));
+            reservation.retire(affected);
         }
         let mut retired = Vec::new();
         for lease in kernel.storage_mounts.iter() {

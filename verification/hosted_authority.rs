@@ -1,6 +1,9 @@
 // Verus entry point for transitions used by hosted Astrid.
 
 extern crate self as astrid_core;
+#[path = "../crates/astrid-kernel/src/storage_mount/lease_authority/reservation.rs"]
+mod mount_reservation;
+
 #[path = "../crates/astrid-kernel/src/storage_mount/lease_authority/subtree.rs"]
 mod storage_subtree;
 
@@ -12,6 +15,7 @@ mod storage_callback;
 
 #[path = "../crates/astrid-kernel/src/storage_mount/lease_authority/requester.rs"]
 mod storage_lease_requester;
+use storage_lease_requester as requester;
 
 #[path = "../crates/astrid-capsule/src/engine/wasm/invocation_owner/admission.rs"]
 mod invocation_owner_admission;
@@ -57,6 +61,9 @@ mod token_authority;
 
 #[path = "hosted_authority_model.rs"]
 mod model;
+
+#[path = "hosted_lease_model.rs"]
+mod lease_model;
 
 #[path = "../crates/astrid-storage/src/principal_state/guest_authority.rs"]
 mod guest_authority;

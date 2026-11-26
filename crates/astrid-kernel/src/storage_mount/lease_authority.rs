@@ -2,6 +2,7 @@
 
 pub(super) mod callback;
 mod requester;
+pub(super) mod reservation;
 pub(super) mod subtree;
 pub(super) use requester::same_requester;
 use subtree::{BoundSubtree, Owner, Subtree};
@@ -42,6 +43,29 @@ impl LeaseTarget {
 pub(super) enum LeaseAuthority {
     Management { allow_cross_owner: bool },
     Process(astrid_core::PrincipalUid),
+}
+
+impl LeaseAuthority {
+    pub(super) fn requester(
+        self,
+        kernel: &Kernel,
+        caller: &PrincipalId,
+    ) -> Result<(Option<astrid_core::PrincipalUid>, bool), String> {
+        match self {
+            Self::Process(uid) => kernel
+                .principal_directory
+                .bound_uid(caller, Some(uid))
+                .map(|bound| (Some(bound), false))
+                .map_err(|_| "process projection owner changed".to_owned()),
+            Self::Management { allow_cross_owner } => {
+                match kernel.principal_directory.uid_for(caller) {
+                    Ok(uid) => Ok((Some(uid), allow_cross_owner)),
+                    Err(_) if allow_cross_owner => Ok((None, true)),
+                    Err(error) => Err(format!("resolve storage lease requester: {error}")),
+                }
+            },
+        }
+    }
 }
 
 pub(super) async fn resolve_owner(

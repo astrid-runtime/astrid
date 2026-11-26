@@ -206,25 +206,7 @@ async fn issue_bound_lease(
     if !mountpoint.is_absolute() {
         return Err("native storage mountpoint must be absolute".to_owned());
     }
-    let allow_cross_owner = matches!(
-        authority,
-        LeaseAuthority::Management {
-            allow_cross_owner: true
-        }
-    );
-    let requester_uid = match authority {
-        LeaseAuthority::Process(uid) => Some(
-            kernel
-                .principal_directory
-                .bound_uid(&caller, Some(uid))
-                .map_err(|_| "process projection owner changed".to_owned())?,
-        ),
-        LeaseAuthority::Management { .. } => match kernel.principal_directory.uid_for(&caller) {
-            Ok(uid) => Some(uid),
-            Err(_) if allow_cross_owner => None,
-            Err(error) => return Err(format!("resolve storage lease requester: {error}")),
-        },
-    };
+    let (requester_uid, allow_cross_owner) = authority.requester(kernel, &caller)?;
     let mount_id = StorageMountId::new();
     let requester = Requester::new(&caller, requester_uid);
     let issue = Issue::admit(kernel, mount_id, &caller, &requester).await?;
