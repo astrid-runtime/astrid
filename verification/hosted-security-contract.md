@@ -14,6 +14,14 @@ The production Wasmtime linker uses the synthetic world in `crates/astrid-capsul
 
 Kernel management IPC, enrollment and redemption, MCP invocation, and native capsule execution also require coverage. Their authority may come from authenticated management policy, durable reservations or trusted runtime ownership. Each path needs a specification for its own authorization decision and a connection between that decision and the eventual effect.
 
+## Guest key-value storage
+
+All seven operations in `astrid:kv/host@1.0.0` enter through `impl kv::Host for HostState` in `crates/astrid-capsule/src/engine/wasm/host/kv.rs`. Get, set, delete and compare-and-swap take a key. List, paginated list and clear take a prefix. Both list operations call the same backend prefix listing. The cursor and limit select a page after that listing returns.
+
+The shared host adapter checks invocation authority and, where installed, acquires the effective principal's tracker guard before handing the selected scoped store to the operation. It holds admission through the semaphore wait and completion of the storage future. The scoped store supplies the namespace to the backend independently of the guest's key or prefix.
+
+The retirement regression exercises all seven WIT methods. A second regression starts the actual WIT set method, holds its backend write at a barrier, and observes retirement waiting for it. In hosted storage, `StateOwnerResolver::resolve` splits the capsule namespace and resolves the alias through the principal directory at storage access time. The lifecycle argument must keep that resolution consistent with the generation admitted by the caller. End-to-end proof requires establishing that every reachable host state selects the store for the admitted principal and capsule, that the namespace resolves to the correct principal generation across alias reuse, and that the backend confines the effect to that namespace and key or prefix. The tracker transition proof alone leaves these obligations open.
+
 ## Native MCP network authority
 
 Native stdio MCP capsules requesting network domains or outbound TCP destinations fail during load. The process sandbox accepts only a Boolean network setting and cannot express the manifest's destination policy. Accepted native capsule configurations request networking disabled, including for uplinks. The scope of this decision is the capsule host engine. Standalone MCP server configurations and operator-selected sandbox policies require separate treatment in the hosted security argument.

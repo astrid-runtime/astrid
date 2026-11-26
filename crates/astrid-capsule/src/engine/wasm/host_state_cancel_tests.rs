@@ -327,6 +327,30 @@ fn retired_principal_loses_kv_fs_and_secret_host_authority_without_harming_peer(
         Err(KvError::Unknown(_))
     ));
     assert!(matches!(
+        KvHost::kv_get(&mut state, "before".into()),
+        Err(KvError::Unknown(_))
+    ));
+    assert!(matches!(
+        KvHost::kv_delete(&mut state, "before".into()),
+        Err(KvError::Unknown(_))
+    ));
+    assert!(matches!(
+        KvHost::kv_list_keys(&mut state, String::new()),
+        Err(KvError::Unknown(_))
+    ));
+    assert!(matches!(
+        KvHost::kv_list_keys_page(&mut state, String::new(), None, 1),
+        Err(KvError::Unknown(_))
+    ));
+    assert!(matches!(
+        KvHost::kv_clear_prefix(&mut state, String::new()),
+        Err(KvError::Unknown(_))
+    ));
+    assert!(matches!(
+        KvHost::kv_cas(&mut state, "after".into(), None, vec![1]),
+        Err(KvError::Unknown(_))
+    ));
+    assert!(matches!(
         FsHost::write_file(
             &mut state,
             "cwd://retired-effect".into(),
@@ -372,11 +396,7 @@ async fn retirement_waits_for_admitted_recv_kv_effect_before_reclamation() {
     state.invocation_kv = Some(astrid_storage::ScopedKvStore::new(backend, "alice:test").unwrap());
 
     let mut operation = tokio::spawn(async move {
-        let _operation = state
-            .begin_host_operation()
-            .expect("principal storage operation should be admitted");
-        let kv = state.effective_kv().clone();
-        let result = kv.set("effect", b"committed".to_vec()).await;
+        let result = KvHost::kv_set(&mut state, "effect".into(), b"committed".to_vec());
         (state, result)
     });
     if tokio::time::timeout(std::time::Duration::from_secs(5), entered.wait())
