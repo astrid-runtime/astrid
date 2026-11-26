@@ -828,7 +828,17 @@ mod representation_engine;
 mod representations;
 mod restore;
 mod retirement;
+mod root_transition;
 mod roots;
+
+impl From<RootState> for root_transition::Version {
+    fn from(root: RootState) -> Self {
+        Self {
+            generation: root.generation.get(),
+            commit: *root.commit.as_bytes(),
+        }
+    }
+}
 mod validation;
 mod wal;
 

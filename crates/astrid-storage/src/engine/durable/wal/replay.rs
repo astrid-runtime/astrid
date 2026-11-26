@@ -22,6 +22,7 @@ use super::types::{WalEvent, WalObjectDescriptor, WalRootDescriptor, WalRootTran
 use super::{WalLimits, durable_error};
 use crate::engine::durable::format::{append_frames, canonical_record_bytes, encode_object_frame};
 use crate::engine::durable::representations::RepresentationStore;
+use crate::engine::durable::root_transition::{self, Replay};
 use crate::engine::durable::roots::encode_root_record;
 use crate::engine::durable::validation::{ClosureObjects, validate_incremental_closure};
 use crate::engine::durable::{
@@ -340,7 +341,14 @@ where
         }
         let actual = root_history.get(&principal).map(|(root, _)| *root);
         let replacement = transition.replacement();
-        if actual != transition.expected() && actual != Some(replacement) {
+        if matches!(
+            root_transition::replay(
+                actual.map(Into::into),
+                transition.expected().map(Into::into),
+                replacement.into()
+            ),
+            Replay::Conflict
+        ) {
             return Err(ModelError::RootConflict {
                 expected: transition.expected(),
                 actual,
@@ -397,15 +405,20 @@ where
     let mut journals = Vec::new();
     for (principal, transition, offset) in roots_to_publish {
         let actual = root_history.get(&principal).map(|(root, _)| *root);
-        if actual == Some(transition.replacement()) {
-            continue;
-        }
-        if actual != transition.expected() {
-            return Err(ModelError::RootConflict {
-                expected: transition.expected(),
-                actual,
-            }
-            .into());
+        match root_transition::replay(
+            actual.map(Into::into),
+            transition.expected().map(Into::into),
+            transition.replacement().into(),
+        ) {
+            Replay::AlreadyPublished => continue,
+            Replay::Conflict => {
+                return Err(ModelError::RootConflict {
+                    expected: transition.expected(),
+                    actual,
+                }
+                .into());
+            },
+            Replay::Apply => {},
         }
         journals.push(encode_root_record(
             identity.scheme(),

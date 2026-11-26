@@ -114,6 +114,7 @@ INPUTS = [
     OVERLAY,
     KV_ENCODING,
     GUEST_AUTHORITY,
+    Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),
     ENTRY,
     MODEL,
     AUTHORITY,
@@ -459,6 +460,21 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "stale KV view falls back to neutral and completes the request",
             Path("verification/hosted_kv_model.rs"),
             lambda source: replace_once(source, "Some(uid) => Some(Destination::Principal(uid)),\n                None => None,", "Some(uid) => Some(Destination::Principal(uid)),\n                None => Some(Destination::Neutral),"),
+        ),
+        (
+            "durable root admission ignores the commit digest",
+            Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),
+            lambda source: replace_once(source, " || a.commit.as_slice() != b.commit.as_slice()", ""),
+        ),
+        (
+            "durable root admission accepts a mismatched generation",
+            Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),
+            lambda source: replace_once(source, "a.generation != b.generation || ", ""),
+        ),
+        (
+            "WAL replay publishes an already committed replacement",
+            Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),
+            lambda source: replace_once(source, "{ Replay::AlreadyPublished }", "{ Replay::Apply }"),
         ),
         (
             "guest KV releases admission before invoking the sink",
@@ -1443,6 +1459,16 @@ def consumer_defects():
         "KV handoff no longer guarantees the exact sink receipt",
         Path("crates/astrid-capsule/src/engine/wasm/guest_kv.rs"),
         lambda source: replace_once(source, "ensures sink.ensures((&guard, store, effect), result)", "ensures true"),
+        Path("verification/hosted_kv_model.rs"),
+    )
+    yield (
+        "WAL replay contract loses idempotent publication",
+        Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),
+        lambda source: replace_once(
+            replace_once(source, "(decision is AlreadyPublished) == matches_root(actual, Some(replacement)),", ""),
+            "(decision is Apply) == (!matches_root(actual, Some(replacement)) && matches_root(actual, expected)),",
+            "",
+        ),
         Path("verification/hosted_kv_model.rs"),
     )
     consumer = Path("verification/hosted_lease_model.rs")

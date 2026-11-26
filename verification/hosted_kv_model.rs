@@ -1,6 +1,7 @@
 //! Composition for a tracked guest KV call. Store construction, guard lifetime,
 //! device admission and backend atomicity require separate runtime refinement.
 use crate::{guest_authority, guest_kv_dispatch, principal_invocation_state::PrincipalInvocation};
+use crate::root_transition::{Advance, Replay, Version, advance, replay};
 use vstd::prelude::*;
 
 verus! {
@@ -70,6 +71,19 @@ fn tracked_call<E,R,F>(tracker: &mut PrincipalInvocation, runtime: Store,
     };
     tracker.finish();
     result
+}
+
+/// An admitted live publication can be replayed from the prior root exactly
+/// once. A second replay sees the published version, even with the same digest
+/// as the prior generation.
+fn replay_admitted(expected: Option<Version>, commit: [u8;32]) {
+    if let Advance::Next(generation) = advance(expected, expected) {
+        let replacement = Version { generation, commit };
+        let first = replay(expected, expected, replacement);
+        assert(first is Apply);
+        let second = replay(Some(replacement), expected, replacement);
+        assert(second is AlreadyPublished);
+    }
 }
 
 }

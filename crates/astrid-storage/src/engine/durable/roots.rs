@@ -178,25 +178,29 @@ where
 {
     let principal = decode_principal(codec, &record.principal, offset)?;
     let actual = recovered.get(&principal).map(|(root, _)| *root);
-    if actual != record.expected {
-        return Err(DurableError::RecoveryModel {
-            file: ROOT_FILE,
-            offset,
-            source: ModelError::RootConflict {
-                expected: record.expected,
-                actual,
-            },
-        });
-    }
-    let generation = match actual {
-        Some(root) => root.generation.checked_next(),
-        None => Some(RootGeneration::INITIAL),
-    }
-    .ok_or(DurableError::RecoveryModel {
-        file: ROOT_FILE,
-        offset,
-        source: ModelError::ArithmeticOverflow,
-    })?;
+    let generation = match super::root_transition::advance(
+        actual.map(Into::into),
+        record.expected.map(Into::into),
+    ) {
+        super::root_transition::Advance::Conflict => {
+            return Err(DurableError::RecoveryModel {
+                file: ROOT_FILE,
+                offset,
+                source: ModelError::RootConflict {
+                    expected: record.expected,
+                    actual,
+                },
+            });
+        },
+        super::root_transition::Advance::Overflow => {
+            return Err(DurableError::RecoveryModel {
+                file: ROOT_FILE,
+                offset,
+                source: ModelError::ArithmeticOverflow,
+            });
+        },
+        super::root_transition::Advance::Next(next) => RootGeneration::new(next),
+    };
     if record.replacement.generation != generation {
         return Err(corrupt(
             ROOT_FILE,

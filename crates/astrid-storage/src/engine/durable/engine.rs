@@ -803,16 +803,17 @@ where
             .get(&principal)
             .copied()
             .or_else(|| inner.roots_by_principal.get(&principal).copied());
-        if actual != expected {
-            return Err(ModelError::RootConflict { expected, actual }.into());
-        }
-        let generation = match actual {
-            Some(root) => root
-                .generation
-                .checked_next()
-                .ok_or(ModelError::ArithmeticOverflow)?,
-            None => RootGeneration::INITIAL,
-        };
+        let generation =
+            match super::root_transition::advance(actual.map(Into::into), expected.map(Into::into))
+            {
+                super::root_transition::Advance::Conflict => {
+                    return Err(ModelError::RootConflict { expected, actual }.into());
+                },
+                super::root_transition::Advance::Overflow => {
+                    return Err(ModelError::ArithmeticOverflow.into());
+                },
+                super::root_transition::Advance::Next(next) => RootGeneration::new(next),
+            };
         let root = RootState {
             generation,
             commit: commit_id,
