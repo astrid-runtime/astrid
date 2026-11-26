@@ -246,6 +246,8 @@ async fn request_capsule_round_trips_scoped_reply() {
     let mut req_rx = bus.subscribe_topic(TOPIC_LIST_REQUEST.to_string());
     let bus_capsule = Arc::clone(&bus);
     let resp_topic = response_topic.clone();
+    let caller = session_caller(&principal);
+    let owner = caller.request_owner;
     let cid = correlation_id.to_string();
     let capsule = tokio::spawn(async move {
         let event = req_rx.recv().await.expect("request arrives");
@@ -255,7 +257,7 @@ async fn request_capsule_round_trips_scoped_reply() {
             assert_ne!(message.source_id, Uuid::nil());
             assert_eq!(message.origin, MessageOrigin::RemoteGateway);
             assert_eq!(message.device_key_id.as_deref(), Some("0123456789abcdef"));
-            assert!(message.request_owner.is_some());
+            assert_eq!(message.request_owner, Some(owner));
         } else {
             panic!("expected an IPC request event");
         }
@@ -287,7 +289,7 @@ async fn request_capsule_round_trips_scoped_reply() {
         &response_topic,
         payload,
         correlation_id,
-        &session_caller(&principal),
+        &caller,
         &[test_provider_source_id()],
         CAPSULE_TIMEOUT,
     )
