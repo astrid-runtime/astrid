@@ -39,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod device;
+mod device_admission;
 mod field;
 mod io_impl;
 mod validation;
@@ -498,6 +499,31 @@ impl Default for PrincipalProfile {
 }
 
 impl PrincipalProfile {
+    /// Registered signing keys usable under this profile's current policy.
+    #[must_use]
+    pub fn active_keypair_keys(&self) -> Option<&[DeviceKey]> {
+        device_admission::enabled_keys(
+            self.enabled,
+            self.auth.methods.contains(&AuthMethod::Keypair),
+            &self.auth.public_keys,
+        )
+    }
+
+    /// Resolve a transport's device stamp under the current keypair policy.
+    /// Ambiguous fingerprints confer no device authority.
+    #[must_use]
+    pub fn active_device<S: AsRef<str>>(&self, id: &DeviceKeyId<S>) -> Option<&DeviceKey> {
+        let mut matches = self
+            .active_keypair_keys()?
+            .iter()
+            .filter(|key| device_admission::same_id(key.key_id.as_bytes(), id.as_str().as_bytes()));
+        let device = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(device)
+    }
+
     /// Borrow the process-global default profile.
     ///
     /// Layer 3's `effective_profile()` accessor returns `&PrincipalProfile`,

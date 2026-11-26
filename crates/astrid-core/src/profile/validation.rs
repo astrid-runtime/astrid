@@ -113,8 +113,15 @@ impl AuthConfig {
     ///
     /// Returns [`ProfileError::Invalid`] on the first failing rule.
     pub fn validate(&self) -> ProfileResult<()> {
+        let mut registered_ids = std::collections::HashSet::new();
         for key in &self.public_keys {
             validate_device_key(key)?;
+            if !registered_ids.insert(key.key_id.as_str()) {
+                return Err(ProfileError::Invalid(format!(
+                    "auth.public_keys: duplicate device fingerprint {}",
+                    key.key_id
+                )));
+            }
         }
         Ok(())
     }
@@ -323,6 +330,28 @@ mod tests {
         let mut p = PrincipalProfile::default();
         p.auth.methods = vec![AuthMethod::Keypair, AuthMethod::Passkey, AuthMethod::System];
         p.validate().unwrap();
+    }
+
+    #[test]
+    fn ambiguous_device_fingerprint_rejects_profile_and_authority() {
+        use super::super::{AuthMethod, DeviceKey, DeviceScope};
+        let mut profile = PrincipalProfile::default();
+        let full = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+        let scoped = DeviceKey {
+            scope: DeviceScope::Scoped {
+                allow: vec![],
+                deny: vec![],
+            },
+            ..full.clone()
+        };
+        profile.auth.methods.push(AuthMethod::Keypair);
+        profile.auth.public_keys = vec![full.clone(), scoped];
+        assert!(profile.validate().is_err());
+        assert!(
+            profile
+                .active_device(&full.typed_key_id().unwrap())
+                .is_none()
+        );
     }
 
     #[test]

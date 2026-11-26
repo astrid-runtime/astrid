@@ -143,6 +143,16 @@ the anonymous principal and system origin. The selector theorem assumes its
 binding input. Handshake authenticity, Wasmtime handle allocation, the JSON
 parser and serializer, and downstream interpretation remain proof obligations.
 
+Both socket handshake implementations select candidate signing keys from the
+validated principal profile. The checked selector returns the supplied keys
+only if the profile is enabled and permits keypair authentication. Both capsule
+dispatch and the kernel's device-scoped capability and native private-input
+checks use that same selector on the resolved profile. A supplied device stamp
+must match exactly one registered fingerprint byte for byte. Profile validation
+rejects duplicate fingerprints. The cryptographic signature check, the
+freshness of the resolved profile at effect admission and the generation of
+the socket owner still require refinement.
+
 ## Native MCP network authority
 
 Native stdio MCP capsules requesting network domains or outbound TCP destinations fail during load. The process sandbox accepts only a Boolean network setting and cannot express the manifest's destination policy. Accepted native capsule configurations request networking disabled, including for uplinks. The scope of this decision is the capsule host engine. Standalone MCP server configurations and operator-selected sandbox policies require separate treatment in the hosted security argument.

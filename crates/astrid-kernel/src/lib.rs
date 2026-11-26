@@ -2563,7 +2563,7 @@ impl Kernel {
                 let Ok(key_id) = astrid_core::profile::DeviceKeyId::new(key_id) else {
                     return false;
                 };
-                let Some(device) = profile.auth.device_by_typed_key_id(&key_id) else {
+                let Some(device) = profile.active_device(&key_id) else {
                     return false;
                 };
                 Some(&device.scope)

@@ -38,7 +38,9 @@ ROUTE_GATE = Path("crates/astrid-events/src/route/gate/state.rs")
 ROUTE_SCOPE = Path("crates/astrid-events/src/route/scope.rs")
 PRINCIPAL_SYNTAX = Path("crates/astrid-core/src/principal/syntax.rs")
 INGRESS_FRAME = Path("crates/astrid-capsule/src/engine/wasm/host/net/ingress_frame.rs")
+DEVICE_ADMISSION = Path("crates/astrid-core/src/profile/device_admission.rs")
 INPUTS = [
+    DEVICE_ADMISSION,
     INGRESS_FRAME,
     PRINCIPAL_SYNTAX,
     ROUTE_SCOPE,
@@ -171,6 +173,21 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "frame consumption drops the captured operation",
             INGRESS_FRAME,
             lambda text: replace_once(text, "    slot.take()", "    *slot = None; None"),
+        ),
+        (
+            "disabled profile supplies device keys",
+            DEVICE_ADMISSION,
+            lambda text: replace_once(text, "    if enabled && keypair", "    if keypair"),
+        ),
+        (
+            "disabled keypair method supplies device keys",
+            DEVICE_ADMISSION,
+            lambda text: replace_once(text, "    if enabled && keypair", "    if enabled"),
+        ),
+        (
+            "device stamp matches another fingerprint",
+            DEVICE_ADMISSION,
+            lambda text: replace_once(text, "    if registered != stamped", "    if false"),
         ),
         (
             "authenticated forward ignores topic",

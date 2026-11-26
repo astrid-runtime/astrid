@@ -53,3 +53,6 @@ mod principal_syntax;
 
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/net/ingress_frame.rs"]
 mod ingress_frame;
+
+#[path = "../crates/astrid-core/src/profile/device_admission.rs"]
+mod device_admission;

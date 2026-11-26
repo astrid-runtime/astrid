@@ -233,25 +233,10 @@ fn verify_principal_signature(
     let profile = astrid_core::PrincipalProfile::load(home, principal)
         .map_err(|e| format!("cannot load principal profile: {e}"))?;
 
-    if !profile.enabled {
-        return Err(format!("principal {principal} is disabled"));
-    }
-    if !profile
-        .auth
-        .methods
-        .contains(&astrid_core::profile::AuthMethod::Keypair)
-    {
-        return Err(format!(
-            "principal {principal} has keypair authentication disabled"
-        ));
-    }
-
-    verify_signature_against_keys(
-        principal,
-        &profile.auth.public_keys,
-        nonce_hex,
-        signature_hex,
-    )
+    let keys = profile.active_keypair_keys().ok_or_else(|| {
+        format!("principal {principal} is disabled or has keypair authentication disabled")
+    })?;
+    verify_signature_against_keys(principal, keys, nonce_hex, signature_hex)
 }
 
 /// Pure signature check: does `signature_hex` verify the challenge message for
