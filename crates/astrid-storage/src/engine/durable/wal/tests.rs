@@ -633,7 +633,7 @@ fn compressed_object_flag_changes_transaction_digest() {
 fn incompressible_object_falls_back_to_flags_zero() {
     let canonical = *blake3::hash(b"bounded incompressible WAL body").as_bytes();
     let (flags, stored) = super::codec::encode_object_storage_body(&canonical).unwrap();
-    assert_eq!(flags, 0);
+    assert_eq!(flags.wire_flag(), 0);
     assert_eq!(stored.as_ref(), canonical);
 }
 
@@ -641,14 +641,14 @@ fn incompressible_object_falls_back_to_flags_zero() {
 fn compressed_object_rejects_corruption_and_oversized_declaration() {
     let canonical = encode_object_frame(scheme(), object_id(1), &record(1, 4096)).unwrap();
     let (flags, stored) = super::codec::encode_object_storage_body(&canonical).unwrap();
-    assert_eq!(flags, super::codec::OBJECT_FLAG_LZ4);
+    assert_eq!(flags.wire_flag(), super::codec::OBJECT_FLAG_LZ4);
 
     let mut corrupt = stored.into_owned();
     corrupt[..8].copy_from_slice(&(u64::try_from(canonical.len()).unwrap() - 1).to_le_bytes());
     assert!(matches!(
         super::codec::decode_object_storage_body(
             &corrupt,
-            flags,
+            flags.wire_flag(),
             RecoveryLimits::process_addressable(),
             WalOffset::new(0),
         ),
@@ -659,7 +659,12 @@ fn compressed_object_rejects_corruption_and_oversized_declaration() {
     let mut oversized = vec![0_u8; 9];
     oversized[..8].copy_from_slice(&129_u64.to_le_bytes());
     assert!(matches!(
-        super::codec::decode_object_storage_body(&oversized, flags, limits, WalOffset::new(0),),
+        super::codec::decode_object_storage_body(
+            &oversized,
+            flags.wire_flag(),
+            limits,
+            WalOffset::new(0),
+        ),
         Err(WalError::FrameTooLarge { .. })
     ));
 }

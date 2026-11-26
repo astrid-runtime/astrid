@@ -210,7 +210,7 @@ fn incomplete_and_complete_oversized_candidates_have_different_recovery_boundari
 
 #[test]
 fn measured_writer_matches_reference_frame_and_digest_vectors() {
-    use super::super::measured_record::{DataKind, Measured};
+    use super::super::measured_record::{DataKind, Measured, ObjectEncoding};
     // The reference encoder packed the frozen ASTWAL2 fields independently
     // and hashed them with b3sum's two domain-separated derive-key contexts.
     let mut digest = super::super::codec::new_digest();
@@ -221,7 +221,7 @@ fn measured_writer_matches_reference_frame_and_digest_vectors() {
         hex::encode(bytes),
         "41535457414c3200010000001900000000000000c8ebf8f4785f8dcbe8e3f3f2a7d05d6948603580701fbfabeaed0d1ca7a8e1b30100000001020000000000000000000000000000626567696e"
     );
-    let object = Measured::append(counts, DataKind::Object(1), b"compressed")
+    let object = Measured::append(counts, DataKind::Object(ObjectEncoding::Lz4), b"compressed")
         .ok()
         .unwrap();
     let (bytes, counts) = super::super::codec::write_measured(object, limits, &mut digest).unwrap();

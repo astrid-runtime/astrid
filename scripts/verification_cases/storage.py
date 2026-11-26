@@ -15,6 +15,21 @@ from .common import (
 def defects():
     return [
         (
+            "measured WAL reader ignores the supplied frame offset",
+            Path("verification/hosted_wal_binding.rs"),
+            lambda source: replace_once(source, "read_at(&stream,prefix.len(),limit,hash,checksum)", "read_at(&stream,0,limit,hash,checksum)"),
+        ),
+        (
+            "measured WAL reader ignores the supplied payload limit",
+            Path("verification/hosted_wal_binding.rs"),
+            lambda source: replace_once(source, "read_at(&stream,prefix.len(),limit,hash,checksum)", "read_at(&stream,prefix.len(),u64::MAX,hash,checksum)"),
+        ),
+        (
+            "measured WAL object parser accepts an unknown storage flag",
+            Path("crates/astrid-storage/src/engine/durable/wal/measured_record.rs"),
+            lambda source: replace_once(source, "1 => Some(Self::Lz4), _ => None", "1 => Some(Self::Lz4), _ => Some(Self::Plain)"),
+        ),
+        (
             "measured WAL physical features admit flagged roots",
             Path("crates/astrid-storage/src/engine/durable/wal/physical_wire.rs"),
             lambda source: replace_once(source, "2 => matches!(kind,WalRecordKind::Object) && flags == 1", "2 => flags == 1"),

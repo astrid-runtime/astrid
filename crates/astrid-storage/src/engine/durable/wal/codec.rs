@@ -5,6 +5,7 @@ use super::super::{IdentityScheme, PersistentObjectIdentity, PrincipalCodec};
 use crate::storage_model::{ObjectId, ObjectRecord, RootState};
 use std::borrow::Cow;
 
+use super::measured_record::ObjectEncoding;
 use super::types::{
     WalBeginHints, WalCount, WalDigest, WalError, WalLength, WalLimits, WalOrdinal,
     WalPhysicalLimit, WalRecordKind, WalRootTransition, WalSequence,
@@ -17,6 +18,7 @@ pub(super) use super::physical_wire::{
 pub(super) const RECORD_HEADER_LEN: usize = super::record_wire::HEADER_LEN;
 const BEGIN_FIXED_LEN: usize = 8;
 const DIGEST_DOMAIN: &str = "astrid durable transaction wal v2";
+#[cfg(test)]
 pub(super) const OBJECT_FLAG_LZ4: u8 = 1;
 const COMPRESSED_OBJECT_LENGTH_LEN: usize = 8;
 
@@ -192,7 +194,7 @@ pub(super) fn decode_record(
     })?;
     let flags = header.flags;
     if header.reserved != [0, 0]
-        || (kind == WalRecordKind::Object && flags & !OBJECT_FLAG_LZ4 != 0)
+        || (kind == WalRecordKind::Object && ObjectEncoding::from_flag(flags).is_none())
         || (kind != WalRecordKind::Object && flags != 0)
     {
         return Err(WalError::Corrupt {
@@ -352,13 +354,15 @@ pub(super) fn decode_object_body<I: PersistentObjectIdentity>(
 
 /// Select compression only when its explicit length prefix and compressed
 /// bytes are strictly smaller than the canonical object frame.
-pub(super) fn encode_object_storage_body(body: &[u8]) -> Result<(u8, Cow<'_, [u8]>), WalError> {
+pub(super) fn encode_object_storage_body(
+    body: &[u8],
+) -> Result<(ObjectEncoding, Cow<'_, [u8]>), WalError> {
     let compressed = lz4_flex::block::compress(body);
     let stored_len = COMPRESSED_OBJECT_LENGTH_LEN
         .checked_add(compressed.len())
         .ok_or(WalError::Encoding("WAL compressed object length overflow"))?;
     if stored_len >= body.len() {
-        return Ok((0, Cow::Borrowed(body)));
+        return Ok((ObjectEncoding::Plain, Cow::Borrowed(body)));
     }
     let mut stored = Vec::new();
     stored
@@ -370,7 +374,7 @@ pub(super) fn encode_object_storage_body(body: &[u8]) -> Result<(u8, Cow<'_, [u8
             .to_le_bytes(),
     );
     stored.extend_from_slice(&compressed);
-    Ok((OBJECT_FLAG_LZ4, Cow::Owned(stored)))
+    Ok((ObjectEncoding::Lz4, Cow::Owned(stored)))
 }
 
 /// Recover a canonical object frame with allocation bounded by the declared
@@ -380,12 +384,16 @@ pub(super) fn decode_object_storage_body(
     flags: u8,
     limits: WalLimits,
     offset: super::types::WalOffset,
-) -> Result<Cow<'_, [u8]>, WalError> {
-    if flags == 0 {
+) -> Result<(ObjectEncoding, Cow<'_, [u8]>), WalError> {
+    let encoding = ObjectEncoding::from_flag(flags).ok_or(WalError::Corrupt {
+        offset,
+        detail: "WAL compressed object body is invalid",
+    })?;
+    if encoding == ObjectEncoding::Plain {
         validate_logical_body(body, limits, offset)?;
-        return Ok(Cow::Borrowed(body));
+        return Ok((encoding, Cow::Borrowed(body)));
     }
-    if flags != OBJECT_FLAG_LZ4 || body.len() < COMPRESSED_OBJECT_LENGTH_LEN {
+    if body.len() < COMPRESSED_OBJECT_LENGTH_LEN {
         return Err(WalError::Corrupt {
             offset,
             detail: "WAL compressed object body is invalid",
@@ -422,7 +430,7 @@ pub(super) fn decode_object_storage_body(
             detail: "WAL compressed object length does not match payload",
         });
     }
-    Ok(Cow::Owned(decoded))
+    Ok((encoding, Cow::Owned(decoded)))
 }
 
 /// Decode a canonical root transition and validate its principal codec.

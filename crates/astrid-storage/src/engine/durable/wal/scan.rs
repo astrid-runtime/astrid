@@ -344,13 +344,13 @@ where
         if active.counts.roots != 0 {
             return Err(WalError::OrderingViolation);
         }
-        let canonical = decode_object_storage_body(body, flags, self.limits, offset)?;
+        let (encoding, canonical) = decode_object_storage_body(body, flags, self.limits, offset)?;
         let (id, body_length) = decode_object_body(&canonical, scheme, &self.identity, offset)?;
         if previous.is_some_and(|previous| previous >= id) {
             return Err(WalError::OrderingViolation);
         }
         let measured =
-            Measured::append(active.counts, DataKind::Object(flags), body).map_err(|error| {
+            Measured::append(active.counts, DataKind::Object(encoding), body).map_err(|error| {
                 WalError::CountOverflow {
                     field: error.field("ordinals"),
                 }

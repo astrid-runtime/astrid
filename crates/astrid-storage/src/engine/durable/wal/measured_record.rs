@@ -9,8 +9,29 @@ use vstd::prelude::*;
 
 verus! {
 
+/// Encoding of the object bytes stored in a WAL record.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub(super) enum ObjectEncoding { Plain, Lz4 }
+
+impl ObjectEncoding {
+    pub(super) open spec fn flag(self) -> u8 {
+        match self { Self::Plain => 0, Self::Lz4 => 1 }
+    }
+
+    pub(super) fn from_flag(flag:u8) -> (result:Option<Self>)
+        ensures result.is_some() == (flag <= 1),
+            result matches Some(encoding) ==> encoding.flag() == flag,
+    {
+        match flag { 0 => Some(Self::Plain), 1 => Some(Self::Lz4), _ => None }
+    }
+
+    pub(super) fn wire_flag(self) -> (flag:u8) ensures flag == self.flag() {
+        match self { Self::Plain => 0, Self::Lz4 => 1 }
+    }
+}
+
 #[derive(Clone,Copy)]
-pub(super) enum DataKind { Object(u8), Root }
+pub(super) enum DataKind { Object(ObjectEncoding), Root }
 
 pub(super) struct Measured<'a> {
     kind: WalRecordKind,
@@ -40,7 +61,7 @@ impl<'a> Measured<'a> {
             (if entry is Object {before.objects < u64::MAX} else {before.roots < u64::MAX})),
             result matches Ok(r) ==> ({
                 let (kind,flags,ordinal,c,stored) = r.parts();
-                &&& (kind,flags) == match entry {DataKind::Object(f) => (WalRecordKind::Object,f), DataKind::Root => (WalRecordKind::Root,0u8)}
+                &&& (kind,flags) == match entry {DataKind::Object(f) => (WalRecordKind::Object,f.flag()), DataKind::Root => (WalRecordKind::Root,0u8)}
                 &&& ordinal == before.logical && stored == body
                 &&& c.sequence == before.sequence && c.logical as int == 1 + before.logical
                 &&& c.bytes as int == before.bytes as int + super::record_wire::HEADER_LEN as int + body.len()
@@ -49,7 +70,7 @@ impl<'a> Measured<'a> {
             }),
     {
         let (counter,kind,flags) = match entry {
-            DataKind::Object(f) => (Entry::Object,WalRecordKind::Object,f),
+            DataKind::Object(f) => (Entry::Object,WalRecordKind::Object,f.wire_flag()),
             DataKind::Root => (Entry::Root,WalRecordKind::Root,0),
         };
         let counts = measurement::append(before,counter,body)?;

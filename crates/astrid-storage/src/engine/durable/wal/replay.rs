@@ -449,7 +449,7 @@ fn read_object_record<I: PersistentObjectIdentity>(
         ));
     }
     validate_logical_body(body, limits, descriptor.offset()).map_err(durable_error)?;
-    let decoded = decode_object_storage_body(body, record.flags, limits, descriptor.offset())
+    let (_, decoded) = decode_object_storage_body(body, record.flags, limits, descriptor.offset())
         .map_err(durable_error)?;
     let (id, _length) =
         decode_object_body(&decoded, identity.scheme(), identity, descriptor.offset())

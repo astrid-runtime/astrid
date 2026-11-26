@@ -295,8 +295,8 @@ where
             u64::try_from(body.len())
                 .map_err(|_| WalError::Encoding("WAL object length overflow"))?,
         );
-        let (flags, stored_body) = encode_object_storage_body(body)?;
-        let measured = Measured::append(active.counts, DataKind::Object(flags), &stored_body)
+        let (encoding, stored_body) = encode_object_storage_body(body)?;
+        let measured = Measured::append(active.counts, DataKind::Object(encoding), &stored_body)
             .map_err(|error| WalError::CountOverflow {
                 field: error.field("logical records"),
             })?;

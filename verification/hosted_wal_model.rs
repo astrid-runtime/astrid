@@ -195,7 +195,7 @@ fn measured_marker<H: Fn([u8;8],u64,&[u8])->[u8;32] + Copy, F: FnOnce(&[u8]) -> 
         &&& exists|data:&[u8]| data@ == transcript(begin,sequence,records@) && #[trigger] finish.ensures((data,),marker.marker().digest)
     },
 {
-    let (_,mut data,mut counts) = crate::hosted_wal_binding::stored_record(None,sequence,begin,hash,checksum)?;
+    let (_,mut data,mut counts) = crate::hosted_wal_binding::stored_record(None,sequence,begin,&[],&[],u64::MAX,hash,checksum)?;
     assert(fits(begin,records@.take(0)));
     assert(data@ =~= transcript(begin,sequence,records@.take(0)));
     let mut i = 0;
@@ -222,10 +222,10 @@ fn measured_marker<H: Fn([u8;8],u64,&[u8])->[u8;32] + Copy, F: FnOnce(&[u8]) -> 
             assert(next.last() == (kind,flags,body));
         }
         let entry = match kind {
-            crate::wal_measurement::Entry::Object => crate::wal_measured_record::DataKind::Object(flags),
+            crate::wal_measurement::Entry::Object => crate::wal_measured_record::DataKind::Object(crate::wal_measured_record::ObjectEncoding::from_flag(flags)?),
             crate::wal_measurement::Entry::Root => crate::wal_measured_record::DataKind::Root,
         };
-        let (_,chunk,next) = match crate::hosted_wal_binding::stored_record(Some((counts,entry)),sequence,body,hash,checksum) {
+        let (_,chunk,next) = match crate::hosted_wal_binding::stored_record(Some((counts,entry)),sequence,body,&[],&[],u64::MAX,hash,checksum) {
             Some(result) => result,
             None => { assert(!fits(begin,records@.take(i as int + 1))); return None; },
         };
