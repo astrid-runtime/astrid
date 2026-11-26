@@ -1948,16 +1948,21 @@ async fn retiring_principal_cannot_admit_management_with_a_live_profile() {
         },
     );
     assert!(
-        super::admit_management_request(&kernel, &caller, Default::default(), "system:status")
-            .await
-            .is_ok()
+        super::admit_management_request(
+            &kernel,
+            &caller,
+            astrid_events::ipc::DeviceStamp::default(),
+            "system:status"
+        )
+        .await
+        .is_ok()
     );
     kernel
         .capabilities
         .begin_principal_retirement(caller.clone())
         .await;
     assert!(matches!(
-        super::admit_management_request(&kernel, &caller, Default::default(), "system:status").await,
+        super::admit_management_request(&kernel, &caller, astrid_events::ipc::DeviceStamp::default(), "system:status").await,
         Err(super::ManagementAdmissionError::Retiring(principal)) if principal == caller,
     ));
 }

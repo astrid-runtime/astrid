@@ -139,7 +139,7 @@ async fn terminal_install_response_skips_queued_keepalives() {
             &kernel,
             topic.clone(),
             "default",
-            Default::default(),
+            astrid_events::ipc::DeviceStamp::default(),
             response,
         );
     }
@@ -227,7 +227,7 @@ async fn check_install_authority(grants: &[&str], allowed: bool, secret: Option<
         &mut super::install_batch::InstallBatchRegistry::default(),
         topic,
         caller,
-        Default::default(),
+        astrid_events::ipc::DeviceStamp::default(),
         request,
     )
     .await;
