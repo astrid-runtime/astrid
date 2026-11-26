@@ -62,6 +62,14 @@ namespace/key pairs cannot share an entry address when both namespaces exclude
 zero bytes, as required by the tree adapter. The proof applies equally to
 non-ASCII UTF-8 and keys of different lengths.
 
+For listing and deletion, the tree adapter uses that same encoder for the
+inclusive lower bound. The verified upper-bound constructor increments the
+last byte with a successor and discards trailing maximal bytes. The separator
+always has a successor, including for an empty prefix. The interval theorem
+uses unsigned lexicographic byte order and proves membership in both directions
+for every encoded entry in a validated namespace. Correct traversal of those
+bounds by the tree and the visibility of deletions remain separate obligations.
+
 The synchronous Wasmtime KV host call holds its operation guard across semaphore
 acquisition and the backend future. On the native tree write path that future
 waits for the blocking worker. The address theorem covers the bytes passed to

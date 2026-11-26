@@ -111,6 +111,26 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
     ]
     return [
         (
+            "prefix range includes sibling namespaces",
+            KV_ENCODING,
+            lambda text: edit_function(
+                text, "logical_prefix_range", "== (ns == other && matches_prefix(key, prefix))",
+                "== matches_prefix(key, prefix)",
+            ),
+        ),
+        (
+            "prefix range excludes the exact prefix",
+            KV_ENCODING,
+            lambda text: replace_once(text, "end[pivot] = byte.saturating_add(1);", "end[pivot] = byte;"),
+        ),
+        (
+            "prefix interval ignores its lower bound",
+            KV_ENCODING,
+            lambda text: edit_function(
+                text, "prefix_interval", "(!below(key, start) && below(key, end))", "below(key, end)"
+            ),
+        ),
+        (
             "physical entry drops the requested key",
             KV_ENCODING,
             lambda text: replace_once(text, "address.extend_from_slice(key);", ""),
