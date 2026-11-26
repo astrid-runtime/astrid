@@ -127,24 +127,42 @@ pub(super) struct PendingLog {
 pub(super) fn bind(
     root: Option<&Arc<NativeLogRoot>>,
     directory: &PrincipalDirectory,
-    principal: &PrincipalId,
     capsule: &str,
     prune: bool,
     tracker: &Arc<PrincipalInvocationTracker>,
     captured_uid: Option<PrincipalUid>,
 ) -> Binding {
-    let Some(root) = root else {
-        return Binding {
-            file: super::open_capsule_log(directory, principal, capsule, prune),
-            pending: None,
-        };
-    };
     let Some(uid) = captured_uid else {
         return Binding::default();
     };
     if !valid_name(capsule) {
         return Binding::default();
     }
+    let eager_binding = || {
+        let file = directory
+            .with_live_uid_binding(uid, |current| {
+                let Some(_operation) = tracker.begin(current) else {
+                    return Ok(None);
+                };
+                let log_dir = match root {
+                    Some(root) => root.home.log_dir(),
+                    None => AstridHome::resolve()?.log_dir(),
+                };
+                Ok(eager::open_capsule_log_at_uid(
+                    &log_dir, uid, capsule, prune,
+                ))
+            })
+            .ok()
+            .flatten()
+            .flatten();
+        Binding {
+            file,
+            pending: None,
+        }
+    };
+    let Some(root) = root else {
+        return eager_binding();
+    };
     let group = Path::new("log")
         .join("principals")
         .join(uid.to_string())
@@ -155,25 +173,7 @@ pub(super) fn bind(
     let absent = std::fs::symlink_metadata(root.home.root().join(&group))
         .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
     if !absent {
-        let file = directory
-            .with_live_uid_binding(uid, |current| {
-                let Some(_operation) = tracker.begin(current) else {
-                    return Ok(None);
-                };
-                Ok(eager::open_capsule_log_at_uid(
-                    &root.home.log_dir(),
-                    uid,
-                    capsule,
-                    prune,
-                ))
-            })
-            .ok()
-            .flatten()
-            .flatten();
-        return Binding {
-            file,
-            pending: None,
-        };
+        return eager_binding();
     }
     Binding {
         file: None,
@@ -188,29 +188,15 @@ pub(super) fn bind(
     }
 }
 
-pub(super) fn install_invocation(
-    state: &mut HostState,
-    principal: &PrincipalId,
-    uid: PrincipalUid,
-) {
+pub(super) fn install_invocation(state: &mut HostState, uid: PrincipalUid) {
     state.deferred_logs.clear_invocation();
-    let Some(root) = state.deferred_logs.root.as_ref() else {
-        state.invocation_capsule_log = super::open_capsule_log(
-            &state.principal_directory,
-            principal,
-            state.capsule_id.as_str(),
-            false,
-        );
-        return;
-    };
     let Some(tracker) = state.principal_invocations.as_ref() else {
         state.invocation_capsule_log = None;
         return;
     };
     let binding = bind(
-        Some(root),
+        state.deferred_logs.root.as_ref(),
         &state.principal_directory,
-        principal,
         state.capsule_id.as_str(),
         false,
         tracker,

@@ -19,7 +19,6 @@ fn bind(
     super::bind(
         root,
         directory,
-        principal,
         capsule,
         prune,
         tracker,
@@ -29,7 +28,7 @@ fn bind(
 
 fn install_invocation(state: &mut HostState, principal: &PrincipalId) {
     let uid = state.principal_directory.uid_for(principal).unwrap();
-    super::install_invocation(state, principal, uid);
+    super::install_invocation(state, uid);
 }
 
 fn fixture() -> (
@@ -722,7 +721,6 @@ async fn captured_runtime_uid_is_not_relooked_up_when_alias_is_reused_before_bin
     let binding = super::bind(
         Some(&root),
         &directory,
-        &principal,
         "test",
         true,
         &tracker,
@@ -774,4 +772,61 @@ async fn warm_log_cannot_borrow_a_reused_alias_guard() {
     let peer_operation = tracker.begin(&previous).unwrap();
     tracker.retire(&current);
     assert!(resolve(&mut state, Some(&peer_operation)).file.is_none());
+}
+
+#[test]
+fn eager_invocation_logs_follow_the_captured_uid() {
+    let home = tempfile::tempdir().unwrap();
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            concat!(module_path!(), "::eager_invocation_log_child")
+                .split_once("::")
+                .unwrap()
+                .1,
+        ])
+        .env("ASTRID_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
+}
+
+#[tokio::test]
+#[ignore = "run by eager_invocation_logs_follow_the_captured_uid with a private home"]
+async fn eager_invocation_log_child() {
+    let (_parent, _root, mut state, tracker) = fixture();
+    state.deferred_logs = DeferredBindings::default();
+    let original = state.principal.clone();
+    let uid = state.principal_directory.uid_for(&original).unwrap();
+    let renamed = PrincipalId::new("renamed-log-owner").unwrap();
+    state
+        .principal_directory
+        .rename(uid, &original, renamed.clone())
+        .unwrap();
+    let replacement: PrincipalUid = "9".repeat(64).parse().unwrap();
+    assert_ne!(replacement, uid);
+    state
+        .principal_directory
+        .register(original, replacement)
+        .unwrap();
+    let logs = AstridHome::resolve().unwrap().log_dir().join("principals");
+    tracker.retire(&renamed);
+    super::install_invocation(&mut state, uid);
+    assert!(state.invocation_capsule_log.is_none());
+    assert!(!logs.exists());
+    tracker.resume(&renamed);
+    super::install_invocation(&mut state, uid);
+    assert!(state.invocation_capsule_log.is_some());
+    assert!(
+        logs.join(uid.to_string())
+            .join(state.capsule_id.as_str())
+            .is_dir()
+    );
+    assert!(!logs.join(replacement.to_string()).exists());
 }

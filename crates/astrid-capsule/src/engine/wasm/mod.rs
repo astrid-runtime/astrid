@@ -66,7 +66,6 @@ mod interruption_tests;
 mod invocation_failure;
 mod native_logs;
 pub use native_logs::NativeLogRoot;
-pub(crate) use native_logs::eager::open_capsule_log;
 #[cfg(test)]
 use native_logs::eager::open_capsule_log_at;
 #[cfg(test)]
@@ -1437,7 +1436,7 @@ fn install_principal_overlays_sync(
         state.runtime_handle.clone(),
     ));
     state.invocation_kv = Some(kv);
-    native_logs::install_invocation(state, p, principal_uid);
+    native_logs::install_invocation(state, principal_uid);
     true
 }
 
@@ -2194,7 +2193,7 @@ impl ExecutionEngine for WasmEngine {
             } else {
                 native_logs::bind(
                     native_log_root.as_ref(), &ctx.principal_directory,
-                    &ctx.principal, capsule_id_val.as_str(), true, &principal_invocations,
+                    capsule_id_val.as_str(), true, &principal_invocations,
                     native_owner_uid.or(owner_uid),
                 )
             };
