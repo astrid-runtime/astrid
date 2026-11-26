@@ -152,6 +152,11 @@ impl<P: Ord> PendingWalOverlay<P> {
         self.objects.iter()
     }
 
+    /// Borrow the committed object index for transaction closure lookup.
+    pub(in crate::engine::durable) fn object_index(&self) -> &BTreeMap<ObjectId, PendingWalObject> {
+        &self.objects
+    }
+
     /// Return an overlay object by identity.
     #[allow(dead_code)]
     pub(in crate::engine::durable) fn get_object(

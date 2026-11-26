@@ -24,6 +24,27 @@ fn header_round_trip(kind:crate::ObjectKind,version:u16,class:crate::ObjectClass
     Some(())
 }
 
+/// Untrusted media may contain a zero version even when a valid writer never emits one.
+fn zero_version(bytes:&[u8],start:usize)
+    requires start as int+5 <= bytes.len(), bytes@[start as int+2] == 0,bytes@[start as int+3] == 0,
+{
+    let mut cursor = start;
+    let out = record::header(bytes,&mut cursor);
+    assert((0u16 | (0u16 << 8)) == 0) by(bit_vector);
+    assert(record::field16(bytes@,start as int+2) == 0);
+    assert(out.is_err());
+}
+
+/// Reject an overstated canonical length before consuming any reference bytes.
+fn truncated_payload(bytes:&[u8],start:usize)
+    requires start as int+24 <= bytes.len(),
+        start as int+24+vstd::bytes::spec_u64_from_le_bytes(bytes@.subrange(start as int+8,start as int+16)) > bytes.len(),
+{
+    let mut cursor = start;
+    let out = record::payload(bytes,&mut cursor);
+    assert(out.is_err());
+}
+
 /// A record may charge a logical size different from its payload length.
 fn payload_round_trip(prefix:&[u8],suffix:&[u8],logical:u64,data:&[u8],count:usize) -> (result:Option<()>)
     requires prefix.len() as int + 24 + data.len() + suffix.len() <= usize::MAX,
@@ -154,6 +175,25 @@ fn two_references(prefix:&[u8],suffix:&[u8],name:&[u8],other:&[u8],owner:[u8;32]
         assert forall|i:nat| i < 2 implies record::complete_reference(frame@,#[trigger] record::position(frame@,p,i),scheme) by {
             assert(i == 0 || i == 1);
         }
+    }
+    let mut actual_cursor = prefix.len();
+    let actual = record::read_references(&frame,&mut actual_cursor,scheme,2,Vec::new()).ok()?;
+    proof {
+        assert(actual_cursor == end);
+        assert(record::stored_reference(frame@,prefix.len() as int,actual@[0]));
+        assert(record::stored_reference(frame@,second as int,actual@[1]));
+        assert(actual@[0].fields().0 =~= name@ && actual@[1].fields().0 =~= other@);
+        assert(actual@[0].fields().1.digest() =~= owner@);
+        assert(actual@[1].fields().1.digest() =~= evidence@);
+        assert(actual@[0].fields().2 is Owns && actual@[1].fields().2 is Evidence);
+    }
+    let mut actions = Vec::new();
+    crate::closure_walk::schedule(&actual,&mut actions);
+    proof {
+        reveal_with_fuel(crate::closure_walk::reversed_visits,3);
+        assert(actual@.skip(1).first() == actual@[1]);
+        assert(actions.len() == 1);
+        assert(actions@[0] == crate::closure_walk::Work::Visit(actual@[0].fields().1));
     }
     let pack = |l:&[u8],id:[u8;32],k:ReferenceKind| -> (r:Row) ensures r.0@ == l@ && r.1 == id && r.2 == k {
         let mut label = Vec::new(); label.extend_from_slice(l); assert(label@ =~= l@); (label,id,k)

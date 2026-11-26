@@ -24,19 +24,12 @@ impl<'a> SliceReader<'a> {
     ) -> Result<Vec<super::ObjectReference>, &'static str> {
         use super::root_wire::ReadError;
         use super::verified_record::{self, ReferenceError};
-        verified_record::read_many(
+        verified_record::read_references(
             self.bytes,
             &mut self.offset,
             scheme.into(),
             count,
             reserved,
-            |label, id, kind| {
-                super::ObjectReference::new(
-                    super::ReferenceLabel::new(label.to_vec()),
-                    ObjectId::new(id),
-                    kind,
-                )
-            },
         )
         .map_err(|e| match e {
             ReferenceError::Read(ReadError::Overflow(_)) => "frame length overflow",

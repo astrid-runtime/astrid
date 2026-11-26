@@ -1,8 +1,6 @@
 //! Owning-closure loading, graph validation, and usage accounting.
 
-use crate::storage_model::{
-    ModelError, ObjectId, ObjectKind, ObjectRecord, ObjectReference, PrincipalUsage, World,
-};
+use crate::storage_model::{ModelError, ObjectId, ObjectKind, ObjectRecord, PrincipalUsage, World};
 
 use super::closure_walk::{self, Failure, Source, Work};
 use super::format::{read_indexed_object, visit_indexed_objects};
@@ -27,22 +25,20 @@ pub(super) struct ClosureObjects<'a, I, P: Ord> {
 
 impl<I: PersistentObjectIdentity, P: Ord> ClosureObjects<'_, I, P> {
     fn load(&mut self, id: ObjectId) -> Result<ObjectRecord, DurableError> {
-        if let Some(record) = self.incoming.get(&id) {
-            return Ok(record.clone());
-        }
-        if let Some(record) = self.pending.and_then(|pending| pending.get_object(&id)) {
-            return Ok(record.record().clone());
-        }
-        if let Some(location) = self.index.get(&id).copied() {
-            return read_indexed_object(self.arena, id, location, self.identity, self.limits);
-        }
-        Err(ModelError::MissingObject(id).into())
-    }
-}
-
-impl closure_walk::Edge<ObjectId> for ObjectReference {
-    fn owned_target(&self) -> Option<ObjectId> {
-        self.kind().owned_target(self.target())
+        super::closure_load::load(
+            id,
+            &super::closure_load::Layers {
+                incoming: self.incoming,
+                pending: self.pending.map(PendingWalOverlay::object_index),
+                index: self.index,
+            },
+            ObjectRecord::clone,
+            |pending| pending.record().clone(),
+            |requested, location| {
+                read_indexed_object(self.arena, requested, *location, self.identity, self.limits)
+            },
+            |missing| ModelError::MissingObject(missing).into(),
+        )
     }
 }
 

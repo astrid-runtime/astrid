@@ -17,6 +17,46 @@ def consumer_defects():
     )
     record = Path("crates/astrid-storage/src/engine/durable/format/verified_record.rs")
     record_trace = Path("verification/hosted_record_model.rs")
+    layers = Path("crates/astrid-storage/src/engine/durable/closure_load.rs")
+    closure_trace = Path("verification/hosted_closure_model.rs")
+    yield (
+        "closure authentication omits the last transaction row", layers,
+        lambda s: replace_once(s, "while i < records.len()", "while i < records.len().saturating_sub(1)"), layers,
+    )
+    yield (
+        "closure authentication forgets the first mismatched declaration", layers,
+        lambda s: replace_once(s, "name == records@[i].0 &&", "true &&"), closure_trace,
+    )
+    for name, original, changed in [
+        ("drops the incoming record", "from_incoming.ensures((&layers.incoming@[id],),record)", "true"),
+        ("drops the pending record", "from_pending.ensures((&layers.pending.unwrap()@[id],),record)", "true"),
+        ("loses the physical location and requested id", "from_index.ensures((id,&layers.index@[id]),out)", "true"),
+        ("loses the missing identity", "missing.ensures((id,),error)", "true"),
+    ]:
+        yield (
+            f"closure lookup {name}", layers,
+            lambda s, a=original, b=changed: replace_once(s, a, b), closure_trace,
+        )
+    def admit_zero_version(source):
+        for original, changed in [
+            ("kind < 18 && version != 0 &&", "kind < 18 &&"),
+            ("v == version && v != 0 &&", "v == version &&"),
+            ("if version == 0 {return Err(HeaderError::Version);}", ""),
+        ]:
+            source = replace_once(source, original, changed)
+        return source
+
+    yield ("arena storage admits zero version", record, admit_zero_version, record_trace)
+    for name, original, changed in [
+        ("payload admits truncated canonical data", "out.is_ok() == (end <= bytes.len()", "out.is_ok() <== (end <= bytes.len()"),
+        ("decoded edge loses concrete label", "r.fields().0 == bytes.subrange(at+8,t)", "true"),
+        ("decoded edge loses concrete target", "r.fields().1.digest() == bytes.subrange(t+8,t+40)", "true"),
+        ("decoded edge loses concrete kind", "meaning(bytes[t+40],r.fields().2)", "true"),
+    ]:
+        yield (
+            f"arena storage {name}", record,
+            lambda s, a=original, b=changed: replace_once(s, a, b), record_trace,
+        )
     for name, original, changed in [
         ("kind", "k.wire_code() == kind &&", "true &&"),
         ("class", "c.wire_code() == bytes@[start+4] &&", "true &&"),
@@ -62,7 +102,7 @@ def consumer_defects():
     )
     yield (
         "arena reference list loses its returned cursor", record,
-        lambda s: replace_once(s, "*final(cursor) as int == position(bytes@,*old(cursor) as int,count as nat) &&", "true &&"), record_trace,
+        lambda s: replace_once(s, "v.len() == count && *final(cursor) as int == position(bytes@,*old(cursor) as int,count as nat) &&", "v.len() == count &&"), record_trace,
     )
     yield (
         "arena reference list forgets the packed record fields", record,

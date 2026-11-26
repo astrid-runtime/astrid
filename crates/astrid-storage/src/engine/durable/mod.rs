@@ -813,6 +813,7 @@ use crate::engine::durable_cache as cache;
 mod checkpoint_worker;
 #[cfg(test)]
 mod checkpoint_worker_tests;
+mod closure_load;
 mod closure_walk;
 mod compaction;
 mod faults;

@@ -519,6 +519,75 @@ fn incremental_closure_checks_the_root_kind_and_follows_only_owning_edges() {
 }
 
 #[test]
+fn closure_prefers_incoming_then_pending_then_the_indexed_record() {
+    use crate::engine::durable::{
+        ARENA_MAGIC, DurableError, File,
+        format::append_frame,
+        validation::{ClosureObjects, validate_incremental_closure},
+    };
+    use crate::storage_model::ModelError;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+
+    let commit = ObjectRecord::new(
+        ObjectKind::Commit,
+        ObjectFormatVersion::V1,
+        vec![],
+        vec![],
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let id = TestIdentity.identify(&commit);
+    let payload = encode_object_frame(scheme(), id, &commit).unwrap();
+    let mut arena = File::Native(tempfile::tempfile().unwrap());
+    let location = append_frame(&mut arena, ARENA_MAGIC, &payload).unwrap();
+    let index = BTreeMap::from([(id, location)]);
+    // Distinct in-memory fixtures make the selected layer observable. The arena
+    // contains real frame bytes under the independently computed commit id.
+    let mut pending = PendingWalOverlay::<String>::default();
+    let chunk = record(2, 8);
+    pending
+        .insert_prepared(
+            id,
+            encode_object_frame(scheme(), id, &chunk).unwrap().into(),
+            Arc::new(chunk),
+        )
+        .unwrap();
+    let incoming = BTreeMap::from([(id, commit)]);
+    let mut source = ClosureObjects {
+        arena: &mut arena,
+        index: &index,
+        incoming: &incoming,
+        pending: Some(&pending),
+        identity: &TestIdentity,
+        limits: RecoveryLimits::process_addressable(),
+    };
+    let cached = BTreeSet::new();
+    assert_eq!(
+        validate_incremental_closure(&mut source, &cached, id).unwrap(),
+        BTreeSet::from([id])
+    );
+    let empty = BTreeMap::new();
+    let mut source = ClosureObjects {
+        incoming: &empty,
+        ..source
+    };
+    assert!(
+        matches!(validate_incremental_closure(&mut source,&cached,id),
+        Err(DurableError::Model(ModelError::RootNotCommit {object,actual})) if object == id && actual == ObjectKind::Chunk)
+    );
+    let mut source = ClosureObjects {
+        pending: None,
+        ..source
+    };
+    assert_eq!(
+        validate_incremental_closure(&mut source, &cached, id).unwrap(),
+        BTreeSet::from([id])
+    );
+}
+
+#[test]
 fn single_and_batched_arena_reads_bind_the_frame_and_canonical_record_to_the_request() {
     use crate::engine::durable::{
         ARENA_FILE, ARENA_MAGIC, DurableError, File,

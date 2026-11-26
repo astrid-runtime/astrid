@@ -1,6 +1,6 @@
 //! Bind the canonical record returned by a decoder to the requested object.
 use super::root_wire::{self, ReadError, Scheme};
-use super::{ObjectClass, ObjectKind, ReferenceKind};
+use super::{ObjectClass, ObjectId, ObjectKind, ObjectReference, ReferenceKind, ReferenceLabel};
 use vstd::prelude::*;
 
 verus! {
@@ -292,6 +292,38 @@ pub(super) fn read_many<R,F>(bytes:&[u8],cursor:&mut usize,scheme:Scheme,count:u
     }
     assert forall|i:nat| i < count implies complete_reference(bytes@,#[trigger] position(bytes@,start,i),scheme) by {
         assert(entry(bytes@,position(bytes@,start,i),scheme,pack,rows@[i as int]));
+    }
+    Ok(rows)
+}
+
+pub(super) open spec fn stored_reference(bytes:Seq<u8>,at:int,r:ObjectReference) -> bool {
+    let t = target_offset(bytes,at);
+    &&& r.fields().0 == bytes.subrange(at+8,t)
+    &&& r.fields().1.digest() == bytes.subrange(t+8,t+40)
+    &&& meaning(bytes[t+40],r.fields().2)
+}
+
+/// Construct the production representation that is retained in `ObjectRecord`.
+pub(super) fn read_references(bytes:&[u8],cursor:&mut usize,scheme:Scheme,count:usize,
+    reserved:Vec<ObjectReference>) -> (out:Result<Vec<ObjectReference>,ReferenceError>)
+    requires reserved.len() == 0,
+    ensures out.is_ok() == (forall|i:nat| i < count ==> complete_reference(bytes@,#[trigger] position(bytes@,*old(cursor) as int,i),scheme)),
+        out matches Ok(rows) ==> rows.len() == count && *final(cursor) as int == position(bytes@,*old(cursor) as int,count as nat) &&
+            forall|i:nat| i < count ==> #[trigger] stored_reference(bytes@,position(bytes@,*old(cursor) as int,i),rows@[i as int]),
+{
+    let pack = |label:&[u8],id:[u8;32],kind:ReferenceKind| -> (r:ObjectReference)
+        ensures r.fields().0 == label@ && r.fields().1.digest() == id@ && r.fields().2 == kind,
+    {
+        let mut data = Vec::with_capacity(label.len());
+        data.extend_from_slice(label);
+        assert(data@ =~= label@);
+        ObjectReference::new(ReferenceLabel::new(data),ObjectId::new(id),kind)
+    };
+    let rows = read_many(bytes,cursor,scheme,count,reserved,pack)?;
+    proof {
+        assert forall|i:nat| i < count implies #[trigger] stored_reference(bytes@,position(bytes@,*old(cursor) as int,i),rows@[i as int]) by {
+            assert(entry(bytes@,position(bytes@,*old(cursor) as int,i),scheme,pack,rows@[i as int]));
+        }
     }
     Ok(rows)
 }

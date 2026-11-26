@@ -5,6 +5,58 @@ use vstd::{prelude::*,std_specs::btree::{btree_map_inv,btree_set_inv}};
 
 verus! {
 
+/// An unsealed batch can enter preparation only when every supplied name
+/// matches the identity of its own record. A rejection names the first bad row.
+fn supplied_names(rows:&[(crate::ObjectId,[u8;32])])
+    -> (out:Result<(),(crate::ObjectId,crate::ObjectId)>)
+    ensures match out {
+        Ok(()) => forall|i:int| 0 <= i < rows.len() ==> #[trigger] rows@[i].0.digest() == rows@[i].1@,
+        Err((name,computed)) => exists|i:int| 0 <= i < rows.len() && #[trigger] rows@[i].0 == name &&
+            rows@[i].1@ == computed.digest() && name.digest() != computed.digest() &&
+            forall|j:int| 0 <= j < i ==> #[trigger] rows@[j].0.digest() == rows@[j].1@,
+    },
+{
+    let identify = |data:&[u8;32]| -> (id:crate::ObjectId) ensures id.digest() == data@ {crate::ObjectId::new(*data)};
+    let out = crate::closure_load::check_transaction(rows,identify);
+    proof {
+        if let Err((name,computed)) = out {
+            let i = choose|i:int| 0 <= i < rows.len() && name == rows@[i].0 &&
+                #[trigger] identify.ensures((&rows@[i].1,),computed) && computed.digest() != name.digest() &&
+                forall|j:int| 0 <= j < i ==> #[trigger] crate::closure_load::authentic(rows@[j],identify);
+            assert forall|j:int| 0 <= j < i implies #[trigger] rows@[j].0.digest() == rows@[j].1@ by {
+                assert(crate::closure_load::authentic(rows@[j],identify));
+            }
+        } else {
+            assert forall|i:int| 0 <= i < rows.len() implies #[trigger] rows@[i].0.digest() == rows@[i].1@ by {
+                assert(crate::closure_load::authentic(rows@[i],identify));
+            }
+        }
+    }
+    out
+}
+
+/// Overlapping keys must obey transaction precedence. The physical reader
+/// receives both the requested id and its own index entry, including on failure.
+fn layered_read(id:u64,incoming:&BTreeMap<u64,u32>,pending:Option<&BTreeMap<u64,u16>>,
+    index:&BTreeMap<u64,u64>,disk_ok:bool) -> (out:Result<(u64,u64),(u64,Option<u64>)>)
+    requires btree_map_inv(incoming), btree_map_inv(index),
+        pending matches Some(table) ==> btree_map_inv(table),
+    ensures if incoming@.contains_key(id) {out == Ok((1,incoming@[id] as u64))}
+        else if pending matches Some(table) && table@.contains_key(id) {out == Ok((2,pending.unwrap()@[id] as u64))}
+        else if index@.contains_key(id) {
+            out == if disk_ok {Ok((id,index@[id]))} else {Err((id,Some(index@[id])))}
+        } else {out == Err((id,None))},
+{
+    crate::closure_load::load(id,&crate::closure_load::Layers {incoming,pending,index},
+        |v:&u32| -> (r:(u64,u64)) ensures r == (1,*v as u64) {(1,u64::from(*v))},
+        |v:&u16| -> (r:(u64,u64)) ensures r == (2,*v as u64) {(2,u64::from(*v))},
+        |key:u64,loc:&u64| -> (r:Result<(u64,u64),(u64,Option<u64>)>)
+            ensures r == if disk_ok {Ok((key,*loc))} else {Err((key,Some(*loc)))} {
+            if disk_ok {Ok((key,*loc))} else {Err((key,Some(*loc)))}
+        },
+        |key:u64| -> (e:(u64,Option<u64>)) ensures e == (key,None) {(key,None)})
+}
+
 use crate::reference_kind::ReferenceKind;
 struct Reference {kind:ReferenceKind,id:u64}
 

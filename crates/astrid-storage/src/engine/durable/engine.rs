@@ -764,17 +764,9 @@ where
         if proof.matches(&self.preparation_authority) {
             return Ok(());
         }
-        for (declared, record) in records {
-            let computed = self.identify(record);
-            if computed != *declared {
-                return Err(ModelError::ObjectIdentityMismatch {
-                    declared: *declared,
-                    computed,
-                }
-                .into());
-            }
-        }
-        Ok(())
+        super::closure_load::check_transaction(records, |record| self.identify(record)).map_err(
+            |(declared, computed)| ModelError::ObjectIdentityMismatch { declared, computed }.into(),
+        )
     }
 
     pub(super) fn prepare(
