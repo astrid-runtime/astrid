@@ -86,8 +86,8 @@ bytes = "1"
 # hash kind. Both are on so discovery succeeds regardless of a repo's object
 # format; with `sha1` alone, a SHA-256 repo in a detached-HEAD state would be
 # missed and fall back to the CoW overlay.
-gix-discover = { version = "0.55.0", default-features = false, features = ["sha1", "sha256"] }
-notify = "8"
+gix-discover = { version = "0.58.0", default-features = false, features = ["sha1", "sha256"] }
+notify = "9"
 # `astrid:http@1.1.0` `auto-decompress` toggles gzip/brotli/deflate/zstd per
 # request; those builder methods are feature-gated in reqwest. Enabled here so
 # the host can honour (and disable) decompression. The workspace base dep stays
