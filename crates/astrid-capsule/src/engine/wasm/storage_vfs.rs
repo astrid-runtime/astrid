@@ -448,16 +448,18 @@ impl Vfs for AstridStorageVfs {
         }
         let (bytes, dirty) = self.file_entry(&path, write, truncate).await?;
         let new_handle = FileHandle::new();
-        self.open_files.write().await.insert(
-            new_handle.clone(),
-            Mutex::new(OpenFile {
-                path,
-                bytes,
-                offset: 0,
-                writable: write,
-                dirty,
-            }),
-        );
+        let mut files = self.open_files.write().await;
+        let std::collections::hash_map::Entry::Vacant(entry) = files.entry(new_handle.clone())
+        else {
+            return Err(VfsError::Io(std::io::Error::other("file handle collision")));
+        };
+        entry.insert(Mutex::new(OpenFile {
+            path,
+            bytes,
+            offset: 0,
+            writable: write,
+            dirty,
+        }));
         Ok(new_handle)
     }
 
