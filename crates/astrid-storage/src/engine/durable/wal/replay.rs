@@ -199,8 +199,8 @@ where
         scanner.restore_cursor().map_err(durable_error)?;
     }
 
-    // Keep the scanner-owned sink alive until all canonical files are stable;
-    // `into_writer` truncates the WAL, so it is intentionally the final step.
+    // Resume at the committed boundary after the canonical file flushes below.
+    // The writer discards any uncommitted tail and retains the committed prefix.
     let resume = scanner
         .into_scanned()
         .map_err(durable_error)?

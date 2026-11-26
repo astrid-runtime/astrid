@@ -338,7 +338,7 @@ where
     let mut wal_validated = BTreeSet::new();
     let mut root_history =
         recover_root_history::<P, _, _>(roots, codec, identity.scheme(), limits)?;
-    let mut wal_writer = recover_wal(
+    recover_wal(
         wal_file,
         arena,
         roots,
@@ -349,9 +349,21 @@ where
         identity.clone(),
         codec.clone(),
         limits,
-    )?;
-    wal_writer.checkpoint().map_err(wal_durable_error)?;
-    Ok(wal_writer)
+    )
+}
+
+pub(super) fn checkpoint_recovered_wal<P, I, C>(
+    (recovered, mut wal): RecoveredWal<P, I, C>,
+) -> Result<RecoveredWal<P, I, C>, DurableError>
+where
+    P: Clone + Ord,
+    I: PersistentObjectIdentity,
+    C: PrincipalCodec<P>,
+{
+    if let Some(writer) = &mut wal {
+        writer.checkpoint().map_err(wal_durable_error)?;
+    }
+    Ok((recovered, wal))
 }
 
 fn stabilize_recovered_store<P: Ord>(
@@ -470,7 +482,7 @@ where
             } else {
                 self.recover_media().and_then(|(mut recovered, wal)| {
                     stabilize_recovered_store(&mut recovered, self.faults.as_ref())?;
-                    Ok((recovered, wal))
+                    checkpoint_recovered_wal((recovered, wal))
                 })
             };
             match recovered {
