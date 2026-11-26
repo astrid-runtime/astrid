@@ -4,6 +4,56 @@ use vstd::prelude::*;
 
 verus! {
 
+/// Every stored kind, including a principal state, retains its semantics and accounting class.
+fn header_round_trip(kind:crate::ObjectKind,version:u16,class:crate::ObjectClass) -> (out:Option<()>)
+    requires version != 0,
+    ensures out.is_some(),
+{
+    let mut bytes = Vec::new();
+    record::append_header(&mut bytes,kind,version,class);
+    proof {
+        assert forall|n:u16| (n as u8 as u16) | (((n >> 8) as u8 as u16) << 8) == n by {
+            assert((n as u8 as u16) | (((n >> 8) as u8 as u16) << 8) == n) by(bit_vector);
+        }
+        assert(bytes@.subrange(0,2) =~= record::le16(kind.wire_code()));
+        assert(bytes@.subrange(2,4) =~= record::le16(version));
+    }
+    let mut cursor = 0;
+    let (k,v,c) = record::header(&bytes,&mut cursor).ok()?;
+    assert(k == kind && c == class && v == version && cursor == 5);
+    Some(())
+}
+
+/// A record may charge a logical size different from its payload length.
+fn payload_round_trip(prefix:&[u8],suffix:&[u8],logical:u64,data:&[u8],count:usize) -> (result:Option<()>)
+    requires prefix.len() as int + 24 + data.len() + suffix.len() <= usize::MAX,
+    ensures result.is_some(),
+{
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(prefix);
+    let mut cursor = bytes.len();
+    record::append_payload(&mut bytes,logical,data,count).ok()?;
+    let end = bytes.len();
+    bytes.extend_from_slice(suffix);
+    proof {
+        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+        let at = prefix.len() as int;
+        let wire = record::payload_wire(logical,data@,count);
+        assert(bytes@.subrange(at,end as int) =~= wire);
+        crate::root_wire::subfield(bytes@,at,wire,0,8);
+        crate::root_wire::subfield(bytes@,at,wire,8,8);
+        crate::root_wire::subfield(bytes@,at,wire,16,8);
+        crate::root_wire::subfield(bytes@,at,wire,24,data.len() as int);
+        assert(bytes@.subrange(at,at+8) =~= vstd::bytes::spec_u64_to_le_bytes(logical));
+        assert(bytes@.subrange(at+8,at+16) =~= vstd::bytes::spec_u64_to_le_bytes(data.len() as u64));
+        assert(bytes@.subrange(at+16,at+24) =~= vstd::bytes::spec_u64_to_le_bytes(count as u64));
+        assert(bytes@.subrange(at+24,end as int) =~= data@);
+    }
+    let (decoded,canonical,refs) = record::payload(&bytes,&mut cursor).ok()?;
+    assert(decoded == logical && canonical@ == data@ && refs == count && cursor == end);
+    Some(())
+}
+
 /// A writer-produced name is accepted exactly when both the embedded name
 /// and the identity independently computed on the decoded record match.
 fn indexed<R:Copy,H>(scheme:Scheme,embedded:[u8;32],expected:[u8;32],suffix:&[u8],value:R,hash:H,

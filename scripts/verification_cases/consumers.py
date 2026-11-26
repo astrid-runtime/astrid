@@ -17,6 +17,25 @@ def consumer_defects():
     )
     record = Path("crates/astrid-storage/src/engine/durable/format/verified_record.rs")
     record_trace = Path("verification/hosted_record_model.rs")
+    for name, original, changed in [
+        ("kind", "k.wire_code() == kind &&", "true &&"),
+        ("class", "c.wire_code() == bytes@[start+4] &&", "true &&"),
+        ("version", "v == version &&", "true &&"),
+    ]:
+        yield (
+            f"arena header loses the stored {name}", record,
+            lambda s, a=original, b=changed: replace_once(s, a, b), record_trace,
+        )
+    for name, original, changed, target in [
+        ("writes logical size as reference count", "little_endian(refs)", "little_endian(logical)", record),
+        ("loses canonical payload contents", "data@ == bytes@.subrange(start+24,end)", "data.len() == end-start-24", record_trace),
+        ("loses reference count", "refs == count &&", "true &&", record_trace),
+        ("loses first reference offset", "*final(cursor) as int == end", "true", record_trace),
+    ]:
+        yield (
+            f"arena payload {name}", record,
+            lambda s, a=original, b=changed: replace_once(s, a, b), target,
+        )
     yield (
         "indexed read accepts a different embedded name", record,
         lambda s: replace_once(s, "return Err(Error::Identifier);", "return Ok(record);"), record,

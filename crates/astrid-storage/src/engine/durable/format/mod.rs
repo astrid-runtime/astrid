@@ -494,19 +494,21 @@ pub(super) fn encode_object_frame(
     id: ObjectId,
     record: &ObjectRecord,
 ) -> Result<Vec<u8>, DurableError> {
-    let canonical_len = u64::try_from(record.canonical_bytes().len())
-        .map_err(|_| DurableError::EncodingOverflow)?;
-    let reference_count =
-        u64::try_from(record.references().len()).map_err(|_| DurableError::EncodingOverflow)?;
     let mut bytes = Vec::new();
     encode_identity(&mut bytes, scheme, id);
-    bytes.extend_from_slice(&record.kind().code().to_le_bytes());
-    bytes.extend_from_slice(&record.format_version().get().to_le_bytes());
-    bytes.push(record.class().code());
-    bytes.extend_from_slice(&record.logical_bytes().to_le_bytes());
-    bytes.extend_from_slice(&canonical_len.to_le_bytes());
-    bytes.extend_from_slice(&reference_count.to_le_bytes());
-    bytes.extend_from_slice(record.canonical_bytes());
+    verified_record::append_header(
+        &mut bytes,
+        record.kind(),
+        record.format_version().get(),
+        record.class(),
+    );
+    verified_record::append_payload(
+        &mut bytes,
+        record.logical_bytes(),
+        record.canonical_bytes(),
+        record.references().len(),
+    )
+    .map_err(|()| DurableError::EncodingOverflow)?;
     for reference in record.references() {
         verified_record::append_reference(
             &mut bytes,
@@ -573,14 +575,31 @@ fn decode_record_body(
 ) -> Result<ObjectRecord, &'static str> {
     let mut reader = SliceReader::new(bytes);
     reader.offset = start;
-    let kind = ObjectKind::from_code(reader.u16()?).ok_or("unknown object-kind code")?;
+    let (kind, version, class) =
+        verified_record::header(bytes, &mut reader.offset).map_err(|error| match error {
+            verified_record::HeaderError::Read(root_wire::ReadError::Overflow(_)) => {
+                "frame length overflow"
+            },
+            verified_record::HeaderError::Read(root_wire::ReadError::Truncated) => {
+                "truncated frame payload"
+            },
+            verified_record::HeaderError::Kind => "unknown object-kind code",
+            verified_record::HeaderError::Version => "object-format version must be non-zero",
+            verified_record::HeaderError::Class => "unknown object-class code",
+        })?;
     let version =
-        ObjectFormatVersion::new(reader.u16()?).ok_or("object-format version must be non-zero")?;
-    let class = ObjectClass::from_code(reader.u8()?).ok_or("unknown object-class code")?;
-    let logical_bytes = reader.u64()?;
-    let canonical_len = reader.usize_len()?;
-    let reference_count = reader.usize_len()?;
-    let canonical_bytes = reader.take(canonical_len)?.to_vec();
+        ObjectFormatVersion::new(version).ok_or("object-format version must be non-zero")?;
+    let (logical_bytes, canonical_bytes, reference_count) =
+        verified_record::payload(bytes, &mut reader.offset).map_err(|error| match error {
+            verified_record::PayloadError::Read(root_wire::ReadError::Overflow(_)) => {
+                "frame length overflow"
+            },
+            verified_record::PayloadError::Read(root_wire::ReadError::Truncated) => {
+                "truncated frame payload"
+            },
+            verified_record::PayloadError::Length => "length is not process-addressable",
+        })?;
+    let canonical_bytes = canonical_bytes.to_vec();
     // Empty records have no reference bytes to decode. Avoid an out-of-line
     // decoder call while keeping the trailing-byte and record checks below.
     let references = if reference_count == 0 {

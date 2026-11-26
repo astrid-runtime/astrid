@@ -16,43 +16,6 @@ impl<'a> SliceReader<'a> {
         self.bytes.len().saturating_sub(self.offset)
     }
 
-    pub(super) fn take(&mut self, len: usize) -> Result<&'a [u8], &'static str> {
-        let end = self
-            .offset
-            .checked_add(len)
-            .ok_or("frame length overflow")?;
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or("truncated frame payload")?;
-        self.offset = end;
-        Ok(value)
-    }
-
-    pub(super) fn u8(&mut self) -> Result<u8, &'static str> {
-        self.take(1)?.first().copied().ok_or("truncated u8 field")
-    }
-
-    pub(super) fn u16(&mut self) -> Result<u16, &'static str> {
-        Ok(u16::from_le_bytes(
-            self.take(2)?
-                .try_into()
-                .map_err(|_| "truncated u16 field")?,
-        ))
-    }
-
-    pub(super) fn u64(&mut self) -> Result<u64, &'static str> {
-        Ok(u64::from_le_bytes(
-            self.take(8)?
-                .try_into()
-                .map_err(|_| "truncated u64 field")?,
-        ))
-    }
-
-    pub(super) fn usize_len(&mut self) -> Result<usize, &'static str> {
-        usize::try_from(self.u64()?).map_err(|_| "length is not process-addressable")
-    }
-
     pub(super) fn references(
         &mut self,
         scheme: IdentityScheme,

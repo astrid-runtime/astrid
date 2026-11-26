@@ -1,6 +1,6 @@
 //! Bind the canonical record returned by a decoder to the requested object.
-use super::ReferenceKind;
 use super::root_wire::{self, ReadError, Scheme};
+use super::{ObjectClass, ObjectKind, ReferenceKind};
 use vstd::prelude::*;
 
 verus! {
@@ -100,6 +100,108 @@ pub(super) fn append_reference(bytes:&mut Vec<u8>,label:&[u8],scheme:Scheme,id:[
     bytes.push(code);
     assert(bytes@ =~= old(bytes)@ + field@ + label@ + wire(scheme,id) + seq![code]);
     Ok(())
+}
+
+pub(super) enum HeaderError { Read(ReadError), Kind, Version, Class }
+
+pub(super) open spec fn field16(bytes:Seq<u8>,start:int) -> u16 {
+    (bytes[start] as u16) | ((bytes[start+1] as u16) << 8)
+}
+
+pub(super) open spec fn le16(value:u16) -> Seq<u8> {
+    seq![value as u8,(value >> 8) as u8]
+}
+
+pub(super) open spec fn header_wire(kind:ObjectKind,version:u16,class:ObjectClass) -> Seq<u8> {
+    le16(kind.wire_code()) +
+        le16(version) + seq![class.wire_code()]
+}
+
+fn little_endian_u16(value:u16) -> (field:[u8;2])
+    ensures field@ == le16(value),
+{
+    assert((value & 255) as u8 == value as u8) by(bit_vector);
+    let field = [(value & 255) as u8,(value >> 8) as u8];
+    assert(field@ =~= le16(value));
+    field
+}
+
+pub(super) fn append_header(bytes:&mut Vec<u8>,kind:ObjectKind,version:u16,class:ObjectClass)
+    ensures final(bytes)@ == old(bytes)@ + header_wire(kind,version,class),
+{
+    bytes.extend_from_slice(&little_endian_u16(kind.code()));
+    bytes.extend_from_slice(&little_endian_u16(version));
+    bytes.push(class.code());
+    assert(bytes@ =~= old(bytes)@ + header_wire(kind,version,class));
+}
+
+/// Read the semantic header in wire order so invalid values retain their
+/// precedence over later truncated fields.
+#[expect(clippy::redundant_closure, reason = "Verus requires an explicit closure for enum constructors")]
+pub(super) fn header(bytes:&[u8],cursor:&mut usize) -> (out:Result<(ObjectKind,u16,ObjectClass),HeaderError>)
+    ensures ({
+        let start = *old(cursor) as int;
+        let kind = field16(bytes@,start);
+        let version = field16(bytes@,start+2);
+        &&& out.is_ok() == (start+5 <= bytes.len() && kind < 18 && version != 0 && bytes@[start+4] < 2)
+        &&& out matches Ok((k,v,c)) ==> k.wire_code() == kind && v == version && v != 0 &&
+            c.wire_code() == bytes@[start+4] && *final(cursor) as int == start+5
+    }),
+{
+    let k = root_wire::fixed::<2>(bytes,cursor).map_err(|e| HeaderError::Read(e))?;
+    let kind = ObjectKind::from_code(u16::from(k[0]) | (u16::from(k[1]) << 8)).ok_or(HeaderError::Kind)?;
+    let v = root_wire::fixed::<2>(bytes,cursor).map_err(|e| HeaderError::Read(e))?;
+    let version = u16::from(v[0]) | (u16::from(v[1]) << 8);
+    if version == 0 {return Err(HeaderError::Version);}
+    let [c] = root_wire::fixed::<1>(bytes,cursor).map_err(|e| HeaderError::Read(e))?;
+    let class = ObjectClass::from_code(c).ok_or(HeaderError::Class)?;
+    Ok((kind,version,class))
+}
+
+pub(super) enum PayloadError { Read(ReadError), Length }
+
+pub(super) open spec fn payload_wire(logical:u64,data:Seq<u8>,count:usize) -> Seq<u8> {
+    vstd::bytes::spec_u64_to_le_bytes(logical) + vstd::bytes::spec_u64_to_le_bytes(data.len() as u64) +
+        vstd::bytes::spec_u64_to_le_bytes(count as u64) + data
+}
+
+pub(super) fn append_payload(bytes:&mut Vec<u8>,logical:u64,data:&[u8],count:usize)
+    -> (result:Result<(),()>)
+    ensures result.is_ok(),final(bytes)@ == old(bytes)@ + payload_wire(logical,data@,count),
+{
+    let length = u64::try_from(data.len()).map_err(|_| ())?;
+    let refs = u64::try_from(count).map_err(|_| ())?;
+    bytes.extend_from_slice(&root_wire::little_endian(logical));
+    bytes.extend_from_slice(&root_wire::little_endian(length));
+    bytes.extend_from_slice(&root_wire::little_endian(refs));
+    bytes.extend_from_slice(data);
+    assert(bytes@ =~= old(bytes)@ + payload_wire(logical,data@,count));
+    Ok(())
+}
+
+/// The logical size is independent of the encoded payload length. The
+/// reference count follows both sizes and the first reference follows the payload.
+#[expect(clippy::redundant_closure, reason = "Verus requires an explicit closure for enum constructors")]
+pub(super) fn payload<'a>(bytes:&'a [u8],cursor:&mut usize)
+    -> (out:Result<(u64,&'a [u8],usize),PayloadError>)
+    ensures ({
+        let start = *old(cursor) as int;
+        let logical = vstd::bytes::spec_u64_from_le_bytes(bytes@.subrange(start,start+8));
+        let length = vstd::bytes::spec_u64_from_le_bytes(bytes@.subrange(start+8,start+16));
+        let count = vstd::bytes::spec_u64_from_le_bytes(bytes@.subrange(start+16,start+24));
+        let end = start + 24 + length;
+        &&& out.is_ok() == (end <= bytes.len() && start+24 <= bytes.len() && count <= usize::MAX)
+        &&& out matches Ok((size,data,refs)) ==> size == logical && refs == count &&
+            data@ == bytes@.subrange(start+24,end) && *final(cursor) as int == end
+    }),
+{
+    let logical = u64::from_le_bytes(root_wire::fixed::<8>(bytes,cursor).map_err(|e| PayloadError::Read(e))?);
+    let length = u64::from_le_bytes(root_wire::fixed::<8>(bytes,cursor).map_err(|e| PayloadError::Read(e))?);
+    let length = usize::try_from(length).map_err(|_| PayloadError::Length)?;
+    let count = u64::from_le_bytes(root_wire::fixed::<8>(bytes,cursor).map_err(|e| PayloadError::Read(e))?);
+    let count = usize::try_from(count).map_err(|_| PayloadError::Length)?;
+    let data = root_wire::take(bytes,cursor,length).map_err(|e| PayloadError::Read(e))?;
+    Ok((logical,data,count))
 }
 
 pub(super) enum ReferenceError { Read(ReadError), Length, Target(TagError), Kind }

@@ -94,6 +94,9 @@ mod root_transition;
 mod wal_root_history;
 #[path = "../crates/astrid-storage/src/engine/durable/closure_walk.rs"]
 mod closure_walk;
+#[path = "../crates/astrid-storage/src/storage_model/object_codes.rs"]
+mod object_codes;
+use object_codes::{ObjectClass, ObjectKind};
 #[path = "../crates/astrid-storage/src/storage_model/reference_kind.rs"]
 mod reference_kind;
 use reference_kind::ReferenceKind;
