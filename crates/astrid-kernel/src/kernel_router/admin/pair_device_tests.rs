@@ -663,6 +663,30 @@ async fn scoped_issuer_child_inherits_issuer_denies() {
 
 #[tokio::test]
 async fn queued_pair_issue_cannot_mint_after_issuer_removal() {
+    queued_pair_denial(
+        |profile| profile.auth.public_keys.clear(),
+        "outside the authenticating device",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn queued_pair_issue_cannot_mint_after_principal_disable() {
+    queued_pair_denial(|profile| profile.enabled = false, "is disabled").await;
+}
+
+#[tokio::test]
+async fn queued_pair_issue_cannot_mint_after_scope_narrows() {
+    queued_pair_denial(
+        |profile| {
+            profile.auth.public_keys[0].scope = scoped_device('a', &["self:auth:pair"], &[]).scope;
+        },
+        "requested device scope exceeds",
+    )
+    .await;
+}
+
+async fn queued_pair_denial(update: impl FnOnce(&mut PrincipalProfile), reason: &str) {
     let (_dir, kernel) = fixture().await;
     let caller = pid("queued_issuer");
     let dev = scoped_device('a', &["self:*"], &[]);
@@ -688,11 +712,15 @@ async fn queued_pair_issue_cannot_mint_after_issuer_removal() {
         () = std::future::ready(()) => {}
     }
     let mut profile = load(&kernel, &caller);
-    profile.auth.public_keys.clear();
+    update(&mut profile);
+    // Leave the admitted profile cached: issuance must consult durable policy.
     profile.save(&kernel.astrid_home, &caller).unwrap();
-    kernel.profile_cache.invalidate(&caller);
     drop(guard);
-    assert!(matches!(queued.await, AdminResponseBody::Error(_)));
+    let result = queued.await;
+    assert!(
+        matches!(&result, AdminResponseBody::Error(message) if message.contains(reason)),
+        "{result:?}"
+    );
     assert!(store.list().await.unwrap().is_empty());
 }
 
