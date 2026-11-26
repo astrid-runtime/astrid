@@ -12,7 +12,7 @@ use astrid_core::{PrincipalId, profile::DeviceKeyId};
 use astrid_uplink::native::private_elicit::{PrivateElicitRejection, PrivateElicitResponder};
 use uuid::Uuid;
 
-type LiveDeviceCheck = Arc<dyn Fn(&PrincipalId, &str) -> bool + Send + Sync>;
+type LiveDeviceCheck = Arc<dyn Fn(&PrincipalId, &str, Option<Uuid>) -> bool + Send + Sync>;
 
 /// A runtime-owned responder restricted to explicitly trusted principal/device
 /// pairs. The uplink supplies the verified identity; the registry owns
@@ -27,7 +27,8 @@ impl NativeSecretResponder {
     /// Bind a device fingerprint already approved by the operator/runtime.
     /// Live profile revalidation is a constructor dependency so a revoked
     /// device cannot skip the check. This does not grant permissions or
-    /// register device keys.
+    /// register device keys. This fingerprint-only callback admits legacy
+    /// unversioned devices. For versioned keys use [`Self::with_registration_check`].
     ///
     /// # Errors
     /// Refuses a malformed fingerprint or the unauthenticated principal.
@@ -36,6 +37,24 @@ impl NativeSecretResponder {
         principal: PrincipalId,
         device_key_id: String,
         device_is_live: impl Fn(&PrincipalId, &str) -> bool + Send + Sync + 'static,
+    ) -> Result<Self, PrivateElicitRejection> {
+        Self::with_registration_check(
+            registry,
+            principal,
+            device_key_id,
+            move |owner, key, registration| registration.is_none() && device_is_live(owner, key),
+        )
+    }
+
+    /// Bind a single operator-selected device and check its captured registration at reply time.
+    ///
+    /// # Errors
+    /// Refuses a malformed fingerprint or an unauthenticated principal.
+    pub fn with_registration_check(
+        registry: Arc<PendingSecretElicits>,
+        principal: PrincipalId,
+        device_key_id: String,
+        device_is_live: impl Fn(&PrincipalId, &str, Option<Uuid>) -> bool + Send + Sync + 'static,
     ) -> Result<Self, PrivateElicitRejection> {
         if principal == PrincipalId::anonymous() {
             return Err(PrivateElicitRejection::Forbidden);
@@ -61,11 +80,16 @@ impl NativeSecretResponder {
         }
     }
 
-    fn device_may_reply(&self, principal: &PrincipalId, device_key_id: &str) -> bool {
+    fn device_may_reply(
+        &self,
+        principal: &PrincipalId,
+        device_key_id: &str,
+        registration: Option<Uuid>,
+    ) -> bool {
         self.bindings
             .get(principal)
             .is_some_and(|device| device.as_str() == device_key_id)
-            && (self.device_is_live)(principal, device_key_id)
+            && (self.device_is_live)(principal, device_key_id, registration)
     }
 }
 
@@ -78,13 +102,37 @@ impl PrivateElicitResponder for NativeSecretResponder {
         value: Option<String>,
         values: Option<Vec<String>>,
     ) -> Result<(), PrivateElicitRejection> {
-        if !self.device_may_reply(principal, device_key_id) {
+        self.reply_for_registration(
+            principal,
+            astrid_types::ipc::DeviceStamp {
+                fingerprint: Some(device_key_id),
+                registration: None,
+            },
+            request_id,
+            value,
+            values,
+        )
+    }
+
+    fn reply_for_registration(
+        &self,
+        principal: &PrincipalId,
+        device: astrid_types::ipc::DeviceStamp<'_>,
+        request_id: Uuid,
+        value: Option<String>,
+        values: Option<Vec<String>>,
+    ) -> Result<(), PrivateElicitRejection> {
+        let device_key_id = device
+            .fingerprint
+            .ok_or(PrivateElicitRejection::Forbidden)?;
+        if !self.device_may_reply(principal, device_key_id, device.registration) {
             return Err(PrivateElicitRejection::Forbidden);
         }
         self.registry
-            .reply_for_principal(
+            .reply_for_device(
                 SecretElicitId::from_uuid(request_id),
                 principal,
+                device,
                 value,
                 values,
             )
@@ -125,8 +173,8 @@ pub(crate) fn configure(
     Ok(Some(Arc::new(NativeSecretResponder::from_bindings(
         registry,
         bindings,
-        Arc::new(move |principal, device_key_id| {
-            kernel.native_input_device_is_live(principal, device_key_id)
+        Arc::new(move |principal, device_key_id, registration| {
+            kernel.native_input_registration_is_live(principal, device_key_id, registration)
         }),
     ))))
 }

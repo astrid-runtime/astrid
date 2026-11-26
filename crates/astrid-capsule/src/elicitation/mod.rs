@@ -24,6 +24,9 @@ use zeroize::Zeroizing;
 
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::DeviceKeyId;
+use astrid_events::ipc::DeviceStamp;
+
+mod responder;
 
 use crate::capsule::CapsuleId;
 
@@ -227,6 +230,7 @@ pub struct PendingSecretElicits {
 }
 
 struct Slot {
+    responder: Option<(DeviceKeyId, Option<Uuid>)>,
     identity: SecretElicitIdentity,
     expected: ElicitAnswerKind,
     tx: oneshot::Sender<SecretElicitReply>,
@@ -313,6 +317,34 @@ impl PendingSecretElicits {
         identity: SecretElicitIdentity,
         expected: ElicitAnswerKind,
     ) -> Result<SecretElicitWait, SecretElicitError> {
+        self.insert_slot(identity, expected, None)
+    }
+
+    pub(crate) fn register_for_device(
+        self: &Arc<Self>,
+        identity: SecretElicitIdentity,
+        expected: ElicitAnswerKind,
+        responder: DeviceStamp<'_>,
+    ) -> Result<SecretElicitWait, SecretElicitError> {
+        let Some(bound) = self.bound_device(identity.principal()) else {
+            return Err(SecretElicitError::IdentityMismatch);
+        };
+        if responder.fingerprint != Some(bound.as_str()) {
+            return Err(SecretElicitError::IdentityMismatch);
+        }
+        self.insert_slot(
+            identity,
+            expected,
+            Some((bound.clone(), responder.registration)),
+        )
+    }
+
+    fn insert_slot(
+        self: &Arc<Self>,
+        identity: SecretElicitIdentity,
+        expected: ElicitAnswerKind,
+        responder: Option<(DeviceKeyId, Option<Uuid>)>,
+    ) -> Result<SecretElicitWait, SecretElicitError> {
         if !self.routes_principal(identity.principal()) {
             return Err(SecretElicitError::IdentityMismatch);
         }
@@ -327,6 +359,7 @@ impl PendingSecretElicits {
             slots.insert(
                 id,
                 Slot {
+                    responder,
                     identity,
                     expected,
                     tx,
@@ -433,16 +466,46 @@ impl PendingSecretElicits {
         value: Option<String>,
         values: Option<Vec<String>>,
     ) -> Result<(), SecretElicitError> {
+        self.reply_for_device(id, principal, DeviceStamp::default(), value, values)
+    }
+
+    /// Resolve the original device-bound request under the same lock that consumes it.
+    ///
+    /// # Errors
+    /// A different principal, device or registration cannot consume the request.
+    /// The answer must satisfy the kind recorded by the waiter.
+    pub fn reply_for_device(
+        &self,
+        id: SecretElicitId,
+        principal: &PrincipalId,
+        device: DeviceStamp<'_>,
+        value: Option<String>,
+        values: Option<Vec<String>>,
+    ) -> Result<(), SecretElicitError> {
+        let presented = device
+            .fingerprint
+            .map(|key| (key, device.registration.map(|id| id.as_u128())));
         let value = value.map(Zeroizing::new);
         let (slot, reply) = {
             let mut slots = self.slots.lock();
-            let slot = slots.get(&id).ok_or(SecretElicitError::UnknownRequest)?;
-            if slot.identity.principal() != principal {
+            let std::collections::hash_map::Entry::Occupied(entry) = slots.entry(id) else {
+                return Err(SecretElicitError::UnknownRequest);
+            };
+            let slot = entry.get();
+            let expected = slot
+                .responder
+                .as_ref()
+                .map(|(key, generation)| (key.as_str(), generation.map(|id| id.as_u128())));
+            if !responder::admits(
+                slot.identity.principal().as_str(),
+                principal.as_str(),
+                expected,
+                presented,
+            ) {
                 return Err(SecretElicitError::IdentityMismatch);
             }
             let reply = classify_answer(&slot.expected, value, values)?;
-            let slot = slots.remove(&id).ok_or(SecretElicitError::UnknownRequest)?;
-            (slot, reply)
+            (entry.remove(), reply)
         };
         send_or_unknown(slot, reply)
     }

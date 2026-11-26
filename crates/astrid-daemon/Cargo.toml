@@ -26,6 +26,7 @@ astrid-gateway = { workspace = true }
 astrid-kernel = { workspace = true }
 astrid-storage = { workspace = true }
 astrid-telemetry = { workspace = true, features = ["config"] }
+astrid-types = { workspace = true }
 astrid-uplink = { workspace = true }
 clap = { workspace = true }
 colored = { workspace = true }
@@ -54,7 +55,6 @@ mimalloc = { workspace = true }
 [dev-dependencies]
 astrid-crypto = { workspace = true }
 astrid-events = { workspace = true }
-astrid-types = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }

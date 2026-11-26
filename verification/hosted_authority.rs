@@ -1,5 +1,8 @@
 // Verus entry point for transitions used by hosted Astrid.
 
+#[path = "../crates/astrid-capsule/src/elicitation/responder.rs"]
+mod private_responder;
+
 #[path = "../crates/astrid-capsule-types/src/fuel_ledger/arithmetic.rs"]
 mod arithmetic;
 

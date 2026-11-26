@@ -61,15 +61,13 @@ fn live_handler(
     registry: Arc<PendingSecretElicits>,
     native: &SignedNative,
 ) -> NativeSecretResponder {
-    NativeSecretResponder::new(
+    let cache = Arc::clone(&native.cache);
+    NativeSecretResponder::with_registration_check(
         registry,
         native.identity.principal().clone(),
         native.device.key_id.clone(),
-        {
-            let cache = Arc::clone(&native.cache);
-            move |principal, device| {
-                astrid_kernel::native_input_device_is_live(&cache, principal, device)
-            }
+        move |principal, key, registration| {
+            astrid_kernel::native_input_registration_is_live(&cache, principal, key, registration)
         },
     )
     .unwrap()
@@ -307,6 +305,18 @@ async fn revoked_device_cannot_answer_pending_secret_on_existing_socket() {
 async fn disabled_principal_cannot_answer_pending_secret_on_existing_socket() {
     pending_socket_after_profile_change(|profile| {
         profile.enabled = false;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signed_private_reply_requires_the_original_pairing_of_the_key() {
+    pending_socket_after_profile_change(|profile| {
+        let previous = profile.auth.public_keys.pop().unwrap();
+        let replacement = DeviceKey::new(previous.pubkey, DeviceScope::Full, None, 0);
+        assert_eq!(replacement.key_id, previous.key_id);
+        assert_ne!(replacement.registration_id, previous.registration_id);
+        profile.add_device(replacement);
     })
     .await;
 }

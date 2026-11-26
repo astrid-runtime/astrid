@@ -51,7 +51,9 @@ DEVICE_SESSIONS = Path("crates/astrid-core/src/profile/device_sessions/phase.rs"
 DEVICE_REGISTRATION = Path("crates/astrid-core/src/profile/device_registration.rs")
 DEVICE_CHALLENGE = Path("crates/astrid-core/src/profile/device_challenge.rs")
 REGISTERED_BEARER = Path("crates/astrid-core/src/session_token/registered_bearer.rs")
+PRIVATE_RESPONDER = Path("crates/astrid-capsule/src/elicitation/responder.rs")
 INPUTS = [
+    PRIVATE_RESPONDER,
     REGISTERED_BEARER,
     ORDERED_DISPATCH,
     DELIVERY_COMMIT,
@@ -352,6 +354,16 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "untargeted native message is broadcast on every topic",
             NATIVE_RECIPIENT,
             lambda text: replace_once(text, "None => broadcast,", "None => true,"),
+        ),
+        (
+            "private answer consumes a slot for another principal",
+            PRIVATE_RESPONDER,
+            lambda text: replace_once(text, "if owner != caller { return false; }", ""),
+        ),
+        (
+            "private answer consumes a slot for another registration",
+            PRIVATE_RESPONDER,
+            lambda text: replace_once(text, "(Some(a), Some(b)) => a == b", "(Some(a), Some(b)) => true"),
         ),
         (
             "native egress ignores the target principal",

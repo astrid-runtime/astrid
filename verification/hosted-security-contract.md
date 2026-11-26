@@ -260,6 +260,12 @@ advancement. Serialization, the driver's control flow,
 Tokio's reported count, the OS peer binding and what the peer actually receives
 are outside these theorems. Cancellation can leave a prefix at the peer.
 
+### Private input and secret answers
+
+For a device-bound private prompt, the Wasmtime host resolves the operator-selected responder, captures its registration in the pending slot and sends the same stamp on the notification. The daemon's native reply adapter supplies the identity of the authenticated socket and checks the current registration. Under the registry mutex, the checked responder predicate requires the captured principal, fingerprint and generation before the slot can consume the answer. A rejected answer leaves the slot available. Host-opened slots without a device binding retain their principal-only contract. The request ID, capsule and secret key remain host-owned.
+
+The host waits for input without holding a device session. After receipt it binds the request caller (if device-authenticated) and the selected responder again. It holds both sessions through conversion to a guest value or return from the selected secret store. A WIT regression replaces the responder registration while a guest is waiting, delivers the old answer to the slot, and observes cancellation at the guest. A separate case rejects a replacement's cancellation and an unstamped reply without losing the rightful request. The predicate is machine-checked. Registry-lock implementation, waiter cancellation, choice of secret-store target, backend durability, and recovery still require refinement.
+
 ### Paired-device removal on the native daemon
 
 The daemon passes its kernel's `DeviceSessions` to the native listener. The

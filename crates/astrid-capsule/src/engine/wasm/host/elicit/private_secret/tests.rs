@@ -89,6 +89,12 @@ fn identity_for(state: &HostState, key: &str) -> SecretElicitIdentity {
 }
 
 async fn request_id(rx: &mut astrid_events::EventReceiver) -> SecretElicitId {
+    request_address(rx).await.0
+}
+
+async fn request_address(
+    rx: &mut astrid_events::EventReceiver,
+) -> (SecretElicitId, astrid_events::ipc::OwnedDeviceStamp) {
     let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .unwrap()
@@ -103,7 +109,10 @@ async fn request_id(rx: &mut astrid_events::EventReceiver) -> SecretElicitId {
         panic!("expected schema")
     };
     assert!(field.default.is_none());
-    SecretElicitId::from_uuid(*request_id)
+    (
+        SecretElicitId::from_uuid(*request_id),
+        message.device_stamp().into(),
+    )
 }
 
 fn setup() -> (
@@ -321,9 +330,27 @@ async fn private_text_empty_and_cancel_are_distinct() {
         .event_bus
         .subscribe_topic(Topic::private_elicit_request().as_str());
     let host = tokio::task::spawn_blocking(move || state.elicit(text_request()));
-    let id = request_id(&mut requests).await;
+    let (id, device) = request_address(&mut requests).await;
+    let replacement = astrid_events::ipc::DeviceStamp {
+        registration: Some(Uuid::new_v4()),
+        ..device.as_stamp()
+    };
+    assert!(matches!(
+        registry.reply_for_device(id, identity.principal(), replacement, None, None),
+        Err(SecretElicitError::IdentityMismatch)
+    ));
+    assert!(matches!(
+        registry.reply_for_principal(id, identity.principal(), None, None),
+        Err(SecretElicitError::IdentityMismatch)
+    ));
     registry
-        .reply_for_principal(id, identity.principal(), Some(String::new()), None)
+        .reply_for_device(
+            id,
+            identity.principal(),
+            device.as_stamp(),
+            Some(String::new()),
+            None,
+        )
         .unwrap();
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(5), host)
@@ -339,9 +366,9 @@ async fn private_text_empty_and_cancel_are_distinct() {
         .event_bus
         .subscribe_topic(Topic::private_elicit_request().as_str());
     let host = tokio::task::spawn_blocking(move || state.elicit(text_request()));
-    let id = request_id(&mut requests).await;
+    let (id, device) = request_address(&mut requests).await;
     registry
-        .reply_for_principal(id, identity.principal(), None, None)
+        .reply_for_device(id, identity.principal(), device.as_stamp(), None, None)
         .unwrap();
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(5), host)
@@ -360,9 +387,15 @@ async fn private_array_empty_list_is_distinct_from_cancel() {
         .event_bus
         .subscribe_topic(Topic::private_elicit_request().as_str());
     let host = tokio::task::spawn_blocking(move || state.elicit(array_request()));
-    let id = request_id(&mut requests).await;
+    let (id, device) = request_address(&mut requests).await;
     registry
-        .reply_for_principal(id, identity.principal(), None, Some(Vec::new()))
+        .reply_for_device(
+            id,
+            identity.principal(),
+            device.as_stamp(),
+            None,
+            Some(Vec::new()),
+        )
         .unwrap();
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(5), host)
@@ -380,7 +413,7 @@ async fn private_select_member_completes_and_bus_cannot_answer() {
     let bus = state.event_bus.clone();
     let mut requests = bus.subscribe_topic(Topic::private_elicit_request().as_str());
     let host = tokio::task::spawn_blocking(move || state.elicit(select_request()));
-    let id = request_id(&mut requests).await;
+    let (id, device) = request_address(&mut requests).await;
     bus.publish(AstridEvent::Ipc {
         message: IpcMessage::new(
             Topic::elicit_response(id.as_uuid()),
@@ -397,7 +430,13 @@ async fn private_select_member_completes_and_bus_cannot_answer() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(!host.is_finished());
     registry
-        .reply_for_principal(id, identity.principal(), Some("mainnet".into()), None)
+        .reply_for_device(
+            id,
+            identity.principal(),
+            device.as_stamp(),
+            Some("mainnet".into()),
+            None,
+        )
         .unwrap();
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(5), host)
@@ -550,4 +589,53 @@ async fn private_route_without_bound_device_fails_closed_before_wait() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacing_the_responder_while_waiting_cancels_guest_delivery() {
+    let (dir, mut state, registry, _) = setup();
+    let principal = state.effective_principal();
+    let cache = state.profile_cache.clone().unwrap();
+    let mut requests = state
+        .event_bus
+        .subscribe_topic(Topic::private_elicit_request().as_str());
+    let task = tokio::task::spawn_blocking(move || state.elicit(text_request()));
+    let (id, captured) = request_address(&mut requests).await;
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let mut profile =
+        astrid_core::profile::PrincipalProfile::load_required(&home, &principal).unwrap();
+    let replacement = astrid_core::profile::DeviceKey::new(
+        "a".repeat(64),
+        astrid_core::profile::DeviceScope::Full,
+        None,
+        0,
+    );
+    assert_eq!(
+        Some(replacement.key_id.as_str()),
+        captured.as_stamp().fingerprint
+    );
+    assert_ne!(
+        replacement.registration_id.map(Into::into),
+        captured.as_stamp().registration
+    );
+    profile.auth.public_keys.clear();
+    profile.add_device(replacement);
+    profile.save(&home, &principal).unwrap();
+    cache.invalidate(&principal);
+    registry
+        .reply_for_device(
+            id,
+            &principal,
+            captured.as_stamp(),
+            Some("original answer".into()),
+            None,
+        )
+        .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(ErrorCode::Cancelled)
+    ));
 }

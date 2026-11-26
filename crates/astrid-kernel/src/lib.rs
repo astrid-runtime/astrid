@@ -88,7 +88,7 @@ mod runtime_work;
 mod shutdown;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod user_resources;
-pub use native_input::native_input_device_is_live;
+pub use native_input::{native_input_device_is_live, native_input_registration_is_live};
 /// Deterministic CLI-root user/fleet bootstrap and unowned-principal upgrade.
 mod ownership_bootstrap;
 /// Persistent pair-device token store (issue #756).

@@ -37,6 +37,17 @@ impl HostState {
         let principal = astrid_core::PrincipalId::new(message.principal.as_deref().ok_or(())?)
             .map_err(|_| ())?;
         let key = astrid_core::profile::DeviceKeyId::new(raw.to_owned()).map_err(|_| ())?;
+        self.bind_device_operation(&principal, key, device.registration)
+            .map(Some)
+    }
+
+    /// Bind an effect to the exact registration selected for this principal.
+    pub(crate) fn bind_device_operation(
+        &self,
+        principal: &astrid_core::PrincipalId,
+        key: astrid_core::profile::DeviceKeyId,
+        registration: Option<uuid::Uuid>,
+    ) -> Result<astrid_core::profile::device_sessions::DeviceSession, ()> {
         let challenge = self
             .device_sessions
             .challenge(principal.clone())
@@ -45,15 +56,10 @@ impl HostState {
             .profile_cache
             .as_ref()
             .ok_or(())?
-            .resolve(&principal)
+            .resolve(principal)
             .map_err(|_| ())?;
-        let record = profile
-            .active_registration(&key, device.registration)
-            .ok_or(())?;
-        challenge
-            .bind(key, record.registration_id)
-            .map(Some)
-            .map_err(|_| ())
+        let record = profile.active_registration(&key, registration).ok_or(())?;
+        challenge.bind(key, record.registration_id).map_err(|_| ())
     }
 
     /// Return the effective KV store for the current invocation.
