@@ -94,6 +94,8 @@ mod root_transition;
 mod wal_root_history;
 #[path = "../crates/astrid-storage/src/engine/durable/closure_load.rs"]
 mod closure_load;
+#[path = "../crates/astrid-storage/src/engine/transaction_records.rs"]
+mod transaction_records;
 #[path = "../crates/astrid-storage/src/engine/durable/closure_walk.rs"]
 mod closure_walk;
 #[path = "../crates/astrid-storage/src/storage_model/object_codes.rs"]

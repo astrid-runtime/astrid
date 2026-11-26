@@ -5,8 +5,124 @@ use vstd::{prelude::*,std_specs::btree::{btree_map_inv,btree_set_inv}};
 
 verus! {
 
-/// An unsealed batch can enter preparation only when every supplied name
-/// matches the identity of its own record. A rejection names the first bad row.
+/// Equal duplicate declarations are admitted. A rejected name actually
+/// appears twice with different records in the supplied batch.
+fn duplicate_declarations(rows:Vec<(u64,u64)>)
+    -> (out:Result<BTreeMap<u64,u64>,u64>)
+    ensures out.is_ok() == (forall|i:int,j:int| 0 <= i < j < rows.len() &&
+        #[trigger] rows@[i].0 == #[trigger] rows@[j].0 ==> rows@[i].1 == rows@[j].1),
+        out matches Ok(map) ==> crate::transaction_records::represents(map@,rows@),
+        out matches Err(id) ==> exists|i:int,j:int| 0 <= i < j < rows.len() &&
+            #[trigger] rows@[i].0 == id && #[trigger] rows@[j].0 == id && rows@[i].1 != rows@[j].1,
+{
+    let out = crate::transaction_records::unique(rows);
+    if let Ok(ref map) = out {
+        assert forall|i:int,j:int| 0 <= i < j < rows.len() && #[trigger] rows@[i].0 == #[trigger] rows@[j].0
+            implies rows@[i].1 == rows@[j].1 by {
+            assert(map@[rows@[i].0] == rows@[i].1);
+            assert(map@[rows@[j].0] == rows@[j].1);
+        }
+    }
+    out
+}
+
+/// The map used for closure lookup carries the exact authenticated records
+/// even when the transaction repeats declarations or names unrelated objects.
+fn authenticated_map<R:PartialEq,F:Fn(&R)->crate::ObjectId>(
+    rows:Vec<(crate::ObjectId,R)>,identify:F,
+) -> (out:Result<BTreeMap<crate::ObjectId,R>,()>)
+    requires vstd::laws_cmp::obeys_cmp::<crate::ObjectId>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<crate::ObjectId>(),
+        vstd::laws_eq::obeys_concrete_eq::<R>(),forall|r:&R| #[trigger] identify.requires((r,)),
+    ensures out matches Ok(map) ==> {
+        &&& btree_map_inv(&map)
+        &&& crate::transaction_records::represents(map@,rows@)
+        &&& forall|id:crate::ObjectId| map@.contains_key(id) ==> #[trigger] crate::transaction_records::authentic((id,map@[id]),identify)
+    },
+{
+    crate::transaction_records::check_transaction(&rows,&identify).map_err(|_| ())?;
+    let map = crate::transaction_records::unique(rows).map_err(|_| ())?;
+    assert forall|id:crate::ObjectId| map@.contains_key(id) implies #[trigger] crate::transaction_records::authentic((id,map@[id]),identify) by {
+        let i = choose|i:int| 0 <= i < rows.len() && #[trigger] rows@[i].0 == id;
+        assert(crate::transaction_records::authentic(rows@[i],&identify));
+        assert(rows@[i] == (id,map@[id]));
+    }
+    Ok(map)
+}
+
+/// Compose unsealed preparation, deduplication and live layered lookup.
+/// The pending producer and indexed reader must separately authenticate their results.
+fn prepared_lookup<R:PartialEq,P,L,H,C,Q,D>(rows:Vec<(crate::ObjectId,R)>,id:crate::ObjectId,
+    pending:&BTreeMap<crate::ObjectId,P>,index:&BTreeMap<crate::ObjectId,L>,
+    identify:H,copy:C,unpack:Q,disk:D) -> (out:Result<R,()>)
+    where H:Fn(&R)->crate::ObjectId,C:Fn(&R)->R,Q:Fn(&P)->R,D:Fn(crate::ObjectId,&L)->Result<R,()>,
+    requires vstd::laws_cmp::obeys_cmp::<crate::ObjectId>(),vstd::laws_cmp::obeys_cmp_concrete_eq::<crate::ObjectId>(),
+        vstd::laws_eq::obeys_concrete_eq::<R>(),btree_map_inv(pending),btree_map_inv(index),
+        forall|r:&R| #[trigger] identify.requires((r,)),
+        forall|r:&R| #[trigger] copy.requires((r,)),
+        forall|r:&R,v:R| #[trigger] copy.ensures((r,),v) ==> v == *r,
+        forall|r:&P| #[trigger] unpack.requires((r,)),
+        forall|r:R| pending@.contains_key(id) && #[trigger] unpack.ensures((&pending@[id],),r) ==>
+            crate::transaction_records::authentic((id,r),identify),
+        forall|l:&L| #[trigger] disk.requires((id,l)),
+        forall|r:R| index@.contains_key(id) && #[trigger] disk.ensures((id,&index@[id]),Ok(r)) ==>
+            crate::transaction_records::authentic((id,r),identify),
+    ensures out matches Ok(r) ==> crate::transaction_records::authentic((id,r),identify) &&
+        forall|i:int| 0 <= i < rows.len() && #[trigger] rows@[i].0 == id ==> rows@[i].1 == r,
+{
+    let map = authenticated_map(rows,&identify)?;
+    let result = crate::closure_load::load(id,&crate::closure_load::Layers {incoming:&map,pending:Some(pending),index},
+        copy,unpack,disk,|_:crate::ObjectId| ());
+    proof { if let Ok(ref r) = result {
+        if map@.contains_key(id) {
+            assert(crate::transaction_records::authentic((id,map@[id]),&identify));
+        }
+        assert forall|i:int| 0 <= i < rows.len() && #[trigger] rows@[i].0 == id implies rows@[i].1 == *r by {
+            assert(map@.contains_key(rows@[i].0));
+        }
+    } }
+    result
+}
+
+/// The checkpoint returned by admission must belong to the same engine.
+fn seal_admission<F:Fn(&[u8;32])->crate::ObjectId>(bound:Option<u64>,current:u64,
+    rows:&[(crate::ObjectId,[u8;32])],mut checkpoint:Option<u64>,identify:F)
+    -> (out:Result<Option<u64>,(crate::ObjectId,crate::ObjectId)>)
+    requires forall|r:&[u8;32]| #[trigger] identify.requires((r,)),
+        forall|r:&[u8;32],id:crate::ObjectId| #[trigger] identify.ensures((r,),id) ==> id.digest() == r@,
+    ensures if bound == Some(current) {out == Ok(checkpoint)}
+        else {match out {
+            Ok(result) => result.is_none() && forall|i:int| 0 <= i < rows.len() ==> #[trigger] rows@[i].0.digest() == rows@[i].1@,
+            Err((name,computed)) => name.digest() != computed.digest() &&
+                exists|i:int| 0 <= i < rows.len() && #[trigger] rows@[i].0 == name && rows@[i].1@ == computed.digest(),
+        }},
+{
+    let proof_value = match bound {
+        Some(owner) => crate::transaction_records::IdentityProof::Engine(owner),
+        None => crate::transaction_records::IdentityProof::Untrusted,
+    };
+    let matches = |a:&u64,b:&u64| -> (out:bool) ensures out == (*a == *b) {*a == *b};
+    let admission = proof_value.admit(&current,matches,rows,identify)?;
+    if let crate::transaction_records::Admission::Rechecked = admission {
+        assert forall|i:int| 0 <= i < rows.len() implies #[trigger] rows@[i].0.digest() == rows@[i].1@ by {
+            assert(crate::transaction_records::authentic(rows@[i],identify));
+        }
+    }
+    Ok(admission.take_checkpoint(&mut checkpoint))
+}
+
+/// Staging returns the identity of its input and retains the original map on collision.
+fn staged_record(map:&mut BTreeMap<u64,u64>,value:u64) -> (out:Result<u64,u64>)
+    requires btree_map_inv(old(map)),
+    ensures if old(map)@.contains_key(value) && old(map)@[value] != value {
+        out == Err(value) && final(map)@ == old(map)@
+    } else {out == Ok(value) && final(map)@ == old(map)@.insert(value,value)},
+{
+    let (id,r) = crate::transaction_records::identify(value,|r:&u64| -> (id:u64) ensures id == *r {*r});
+    crate::transaction_records::insert(map,id,r)
+}
+
+/// Isolate row ordering with the identity function on 32-byte payloads.
+/// A rejection names the first row whose declared digest differs from its payload.
 fn supplied_names(rows:&[(crate::ObjectId,[u8;32])])
     -> (out:Result<(),(crate::ObjectId,crate::ObjectId)>)
     ensures match out {
@@ -17,18 +133,18 @@ fn supplied_names(rows:&[(crate::ObjectId,[u8;32])])
     },
 {
     let identify = |data:&[u8;32]| -> (id:crate::ObjectId) ensures id.digest() == data@ {crate::ObjectId::new(*data)};
-    let out = crate::closure_load::check_transaction(rows,identify);
+    let out = crate::transaction_records::check_transaction(rows,identify);
     proof {
         if let Err((name,computed)) = out {
             let i = choose|i:int| 0 <= i < rows.len() && name == rows@[i].0 &&
                 #[trigger] identify.ensures((&rows@[i].1,),computed) && computed.digest() != name.digest() &&
-                forall|j:int| 0 <= j < i ==> #[trigger] crate::closure_load::authentic(rows@[j],identify);
+                forall|j:int| 0 <= j < i ==> #[trigger] crate::transaction_records::authentic(rows@[j],identify);
             assert forall|j:int| 0 <= j < i implies #[trigger] rows@[j].0.digest() == rows@[j].1@ by {
-                assert(crate::closure_load::authentic(rows@[j],identify));
+                assert(crate::transaction_records::authentic(rows@[j],identify));
             }
         } else {
             assert forall|i:int| 0 <= i < rows.len() implies #[trigger] rows@[i].0.digest() == rows@[i].1@ by {
-                assert(crate::closure_load::authentic(rows@[i],identify));
+                assert(crate::transaction_records::authentic(rows@[i],identify));
             }
         }
     }

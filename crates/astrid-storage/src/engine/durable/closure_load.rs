@@ -22,55 +22,6 @@ impl Edge<ObjectId> for ObjectReference {
     }
 }
 
-/// Check the digest computed over this exact record before it enters an
-/// externally supplied transaction or restore snapshot.
-pub(super) fn check_identity<R,F>(declared:ObjectId,record:&R,identify:&F)
-    -> (out:Result<(),(ObjectId,ObjectId)>)
-    where F:Fn(&R)->ObjectId,
-    requires identify.requires((record,)),
-    ensures match out {
-        Ok(()) => exists|computed:ObjectId| #[trigger] identify.ensures((record,),computed) && computed.digest() == declared.digest(),
-        Err((name,computed)) => name == declared && identify.ensures((record,),computed) && computed.digest() != declared.digest(),
-    },
-{
-    let computed = identify(record);
-    if computed.as_bytes().as_slice() == declared.as_bytes().as_slice() {Ok(())}
-    else {Err((declared,computed))}
-}
-
-pub(super) open spec fn authentic<R,F:Fn(&R)->ObjectId>(row:(ObjectId,R),identify:F) -> bool {
-    exists|computed:ObjectId| #[trigger] identify.ensures((&row.1,),computed) && computed.digest() == row.0.digest()
-}
-
-/// Preserve the first mismatched declaration and check every earlier row.
-pub(super) fn check_transaction<R,F>(records:&[(ObjectId,R)],identify:F)
-    -> (out:Result<(),(ObjectId,ObjectId)>)
-    where F:Fn(&R)->ObjectId,
-    requires forall|r:&R| #[trigger] identify.requires((r,)),
-    ensures match out {
-        Ok(()) => forall|i:int| 0 <= i < records.len() ==> #[trigger] authentic(records@[i],identify),
-        Err((name,computed)) => exists|i:int| 0 <= i < records.len() && name == records@[i].0 &&
-            #[trigger] identify.ensures((&records@[i].1,),computed) && computed.digest() != name.digest() &&
-            forall|j:int| 0 <= j < i ==> #[trigger] authentic(records@[j],identify),
-    },
-{
-    let mut i = 0;
-    while i < records.len()
-        invariant i <= records.len(),
-            forall|r:&R| #[trigger] identify.requires((r,)),
-            forall|j:int| 0 <= j < i ==> #[trigger] authentic(records@[j],identify),
-        decreases records.len()-i,
-    {
-        let row = &records[i];
-        if let Err((name,computed)) = check_identity(row.0,&row.1,&identify) {
-            assert(identify.ensures((&records@[i as int].1,),computed));
-            return Err((name,computed));
-        }
-        i = i.saturating_add(1);
-    }
-    Ok(())
-}
-
 pub(super) struct Layers<'a,K,I,P,L> {
     pub(super) incoming:&'a BTreeMap<K,I>,
     pub(super) pending:Option<&'a BTreeMap<K,P>>,

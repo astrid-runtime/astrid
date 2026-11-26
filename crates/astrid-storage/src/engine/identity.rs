@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use crate::storage_model::{ObjectId, ObjectIdentity, ObjectRecord, RootState};
+use crate::storage_model::{ModelError, ObjectId, ObjectIdentity, ObjectRecord, RootState};
 
 use super::RootTransaction;
 
@@ -65,17 +65,19 @@ impl<'a> KvIdentitySession<'a> {
 
 /// Process-local proof that a transaction's declared identities were computed
 /// by the same engine instance that now consumes it.
-#[derive(Debug)]
-pub(crate) enum IdentityProof {
-    Untrusted,
-    Engine(Arc<()>),
-}
+pub(crate) type IdentityProof = super::transaction_records::IdentityProof<Arc<()>>;
 
 impl IdentityProof {
-    pub(crate) fn matches(&self, authority: &Arc<()>) -> bool {
-        match self {
-            Self::Engine(bound) => Arc::ptr_eq(bound, authority),
-            Self::Untrusted => false,
-        }
+    pub(crate) fn admit_records(
+        &self,
+        authority: &Arc<()>,
+        records: &[(ObjectId, ObjectRecord)],
+        identify: impl Fn(&ObjectRecord) -> ObjectId,
+    ) -> Result<super::transaction_records::Admission, ModelError> {
+        self.admit(authority, Arc::ptr_eq, records, identify)
+            .map_err(|(declared, computed)| ModelError::ObjectIdentityMismatch {
+                declared,
+                computed,
+            })
     }
 }

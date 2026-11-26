@@ -441,13 +441,8 @@ pub(crate) fn insert_record<I: crate::storage_model::ObjectIdentity>(
     records: &mut BTreeMap<ObjectId, ObjectRecord>,
     record: ObjectRecord,
 ) -> Result<ObjectId, ContentError> {
-    let id = identity.identify(&record);
-    match records.get(&id) {
-        Some(existing) if existing == &record => {},
-        Some(_) => return Err(ContentError::Model(ModelError::ObjectCollision(id))),
-        None => {
-            records.insert(id, record);
-        },
-    }
-    Ok(id)
+    let (id, record) =
+        crate::engine::transaction_records::identify(record, |r| identity.identify(r));
+    crate::engine::transaction_records::insert(records, id, record)
+        .map_err(|id| ContentError::Model(ModelError::ObjectCollision(id)))
 }

@@ -10,7 +10,7 @@ verus! {
 /// of the object format version, object kind, complete canonical object
 /// encoding, and identity-bearing accounting fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ObjectId(pub(super) [u8; 32]);
+pub struct ObjectId([u8; 32]);
 
 impl ObjectId {
     pub closed spec fn digest(self) -> Seq<u8> { self.0@ }
@@ -34,7 +34,7 @@ impl ObjectId {
 /// relation. This wrapper prevents canonical payload bytes, object
 /// identifiers, and relation labels from being interchanged accidentally.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ReferenceLabel<B = Vec<u8>>(pub(super) B);
+pub struct ReferenceLabel<B = Vec<u8>>(B);
 
 impl<B> ReferenceLabel<B> {
     pub closed spec fn value(&self) -> B {self.0}
@@ -58,6 +58,7 @@ impl<B> ReferenceLabel<B> {
 /// Different labels may intentionally point to the same target.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectReference {
+    // The parent model validates label order and replaces one target on an owned record.
     pub(super) label: ReferenceLabel,
     pub(super) target: ObjectId,
     pub(super) kind: ReferenceKind,

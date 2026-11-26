@@ -8,7 +8,7 @@ use super::{
     ensure_payload_limit, io_error, live_files_mut, materialize_closure, read_indexed_object,
     read_indexed_objects, usage_from_closure, validate_incremental_closure,
 };
-use crate::engine::{IdentityProof, KvIdentitySession, ProjectionObserver, ProjectionPhase};
+use crate::engine::{KvIdentitySession, ProjectionObserver, ProjectionPhase};
 use crate::storage_model::ObjectIdentity;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -756,19 +756,6 @@ where
         usage_from_closure(&records, root.commit).map_err(Into::into)
     }
 
-    fn verify_declared_identities(
-        &self,
-        records: &[(ObjectId, ObjectRecord)],
-        proof: &IdentityProof,
-    ) -> Result<(), DurableError> {
-        if proof.matches(&self.preparation_authority) {
-            return Ok(());
-        }
-        super::closure_load::check_transaction(records, |record| self.identify(record)).map_err(
-            |(declared, computed)| ModelError::ObjectIdentityMismatch { declared, computed }.into(),
-        )
-    }
-
     pub(super) fn prepare(
         &self,
         inner: &mut DurableInner<P>,
@@ -782,15 +769,13 @@ where
             commit: commit_id,
             records,
             identity_proof,
-            kv_checkpoint_publication,
+            mut kv_checkpoint_publication,
         } = transaction;
-        let same_engine = identity_proof.matches(&self.preparation_authority);
-        self.verify_declared_identities(&records, &identity_proof)?;
-        let kv_checkpoint_publication = if same_engine {
-            kv_checkpoint_publication
-        } else {
-            None
-        };
+        let admission =
+            identity_proof.admit_records(&self.preparation_authority, &records, |record| {
+                self.identify(record)
+            })?;
+        let kv_checkpoint_publication = admission.take_checkpoint(&mut kv_checkpoint_publication);
         let actual = pending_roots
             .get(&principal)
             .copied()
@@ -811,7 +796,8 @@ where
             commit: commit_id,
         };
 
-        let unique = unique_transaction_records(records)?;
+        let unique = crate::engine::transaction_records::unique(records)
+            .map_err(ModelError::ObjectCollision)?;
         let closure_started = std::time::Instant::now();
         let reachable = self.validate_pending_closure(inner, &unique, commit_id);
         if let Some(observer) = observer {
@@ -910,20 +896,4 @@ where
         }
         Ok(())
     }
-}
-
-fn unique_transaction_records(
-    records: Vec<(ObjectId, ObjectRecord)>,
-) -> Result<BTreeMap<ObjectId, ObjectRecord>, DurableError> {
-    let mut unique = BTreeMap::new();
-    for (id, record) in records {
-        match unique.get(&id) {
-            Some(existing) if existing == &record => {},
-            Some(_) => return Err(ModelError::ObjectCollision(id).into()),
-            None => {
-                unique.insert(id, record);
-            },
-        }
-    }
-    Ok(unique)
 }

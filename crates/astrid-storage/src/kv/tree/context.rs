@@ -586,7 +586,9 @@ where
     }
 
     pub(super) fn insert(&mut self, record: ObjectRecord) -> StorageResult<ObjectId> {
-        self.stage_identified_record(self.identify_record(&record), record)
+        let (id, record) =
+            crate::engine::transaction_records::identify(record, |r| self.identify_record(r));
+        self.stage_identified_record(id, record)
     }
 
     pub(super) fn identify_record(&self, record: &ObjectRecord) -> ObjectId {
@@ -604,14 +606,8 @@ where
         object: ObjectId,
         record: ObjectRecord,
     ) -> StorageResult<ObjectId> {
-        match self.records.get(&object) {
-            Some(existing) if existing == &record => {},
-            Some(_) => return Err(map_engine(&ModelError::ObjectCollision(object).into())),
-            None => {
-                self.records.insert(object, record);
-            },
-        }
-        Ok(object)
+        crate::engine::transaction_records::insert(&mut self.records, object, record)
+            .map_err(|id| map_engine(&ModelError::ObjectCollision(id).into()))
     }
 
     fn retain_reachable(&mut self, root: ObjectId) {

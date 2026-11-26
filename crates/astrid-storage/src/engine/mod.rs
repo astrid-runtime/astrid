@@ -35,6 +35,7 @@ mod kv;
 mod muninn;
 mod projection;
 mod refinery;
+pub(crate) mod transaction_records;
 
 #[cfg(not(target_family = "wasm"))]
 pub use durable::{
@@ -385,7 +386,9 @@ impl<P: Ord, I: ObjectIdentity> InMemoryEngine<P, I> {
         records: &[(ObjectId, ObjectRecord)],
         root: ObjectId,
     ) -> Result<u64, ModelError> {
-        self.verify_identities(records)?;
+        transaction_records::check_transaction(records, |record| self.identify(record)).map_err(
+            |(declared, computed)| ModelError::ObjectIdentityMismatch { declared, computed },
+        )?;
         self.world.write().import_closure(records, root)
     }
 
@@ -408,20 +411,18 @@ impl<P: Ord, I: ObjectIdentity> InMemoryEngine<P, I> {
             commit,
             records,
             identity_proof,
-            kv_checkpoint_publication,
+            mut kv_checkpoint_publication,
         } = transaction;
-        let same_engine = identity_proof.matches(&self.preparation_authority);
-        if !same_engine {
-            self.verify_identities(&records)?;
-        }
+        let admission =
+            identity_proof.admit_records(&self.preparation_authority, &records, |record| {
+                self.identify(record)
+            })?;
         let world = self.world.upgradable_read();
         let (world, root, objects_inserted) =
             World::commit_closure_owned(world, principal, expected, commit, records)?;
-        let retired_projection = if same_engine {
-            kv_checkpoint_publication.and_then(|publication| publication.try_publish(root))
-        } else {
-            None
-        };
+        let retired_projection = admission
+            .take_checkpoint(&mut kv_checkpoint_publication)
+            .and_then(|publication| publication.try_publish(root));
         drop(world);
         drop(retired_projection);
         Ok(CommitOutcome {
@@ -444,19 +445,6 @@ impl<P: Ord, I: ObjectIdentity> InMemoryEngine<P, I> {
         self.world
             .write()
             .compare_and_swap_root(principal, expected, commit)
-    }
-
-    fn verify_identities(&self, records: &[(ObjectId, ObjectRecord)]) -> Result<(), ModelError> {
-        for (declared, record) in records {
-            let computed = self.identify(record);
-            if computed != *declared {
-                return Err(ModelError::ObjectIdentityMismatch {
-                    declared: *declared,
-                    computed,
-                });
-            }
-        }
-        Ok(())
     }
 }
 

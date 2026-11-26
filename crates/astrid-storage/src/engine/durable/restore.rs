@@ -157,11 +157,13 @@ where
         }
         let mut declared = BTreeSet::new();
         for (id, record) in snapshot.records() {
-            super::closure_load::check_identity(*id, record, &|record| engine.identify(record))
-                .map_err(|(declared, computed)| ModelError::ObjectIdentityMismatch {
-                    declared,
-                    computed,
-                })?;
+            crate::engine::transaction_records::check_identity(*id, record, &|record| {
+                engine.identify(record)
+            })
+            .map_err(|(declared, computed)| ModelError::ObjectIdentityMismatch {
+                declared,
+                computed,
+            })?;
             if !declared.insert(*id) {
                 return Err(DurableError::InvalidRestore(
                     "one snapshot declares a duplicate object",

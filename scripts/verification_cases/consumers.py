@@ -18,13 +18,45 @@ def consumer_defects():
     record = Path("crates/astrid-storage/src/engine/durable/format/verified_record.rs")
     record_trace = Path("verification/hosted_record_model.rs")
     layers = Path("crates/astrid-storage/src/engine/durable/closure_load.rs")
+    transactions = Path("crates/astrid-storage/src/engine/transaction_records.rs")
     closure_trace = Path("verification/hosted_closure_model.rs")
+    for name, original, changed, target in [
+        ("admits an authority match for unsealed input", "Self::Untrusted => false", "Self::Untrusted => true", transactions),
+        ("returns a foreign checkpoint", "Self::Rechecked => None}", "Self::Rechecked => value.take()}", transactions),
+        ("loses matching engine provenance", "Ok(Admission::SameEngine) => self.compared(current,same,true)", "Ok(Admission::SameEngine) => true", closure_trace),
+        ("loses identity checking on foreign admission", "0 <= i < rows.len() ==> #[trigger] authentic(rows@[i],identify)", "false ==> #[trigger] authentic(rows@[i],identify)", closure_trace),
+        ("forgets a supplied row after deduplication", "btree_map_inv(&map) && represents(map@,records@)", "btree_map_inv(&map)", closure_trace),
+        ("reports a collision for identical declarations", "Some(existing) if existing == &record => Ok(id)", "Some(existing) if existing == &record => Err(id)", transactions),
+        ("loses the conflicting values on rejection", "records@[i].1 != records@[j].1", "true", closure_trace),
+        ("misbinds the newly named record", "row.1 == record && derive_id.ensures((&row.1,),row.0)", "true", closure_trace),
+    ]:
+        yield (
+            f"transaction staging {name}", transactions,
+            lambda s, a=original, b=changed: replace_once(s, a, b), target,
+        )
+    def pending_before_incoming(source):
+        incoming = """    if let Some(record) = layers.incoming.get(&id) {
+        return Ok(from_incoming(record));
+    }
+"""
+        pending = """    let pending = match layers.pending {Some(table) => table.get(&id), None => None};
+    if let Some(record) = pending {
+        return Ok(from_pending(record));
+    }
+"""
+        return replace_once(source, incoming + pending, pending + incoming)
+
+    yield ("closure lookup substitutes pending for incoming", layers, pending_before_incoming, layers)
     yield (
-        "closure authentication omits the last transaction row", layers,
-        lambda s: replace_once(s, "while i < records.len()", "while i < records.len().saturating_sub(1)"), layers,
+        "closure lookup treats an evidence reference as owned", layers,
+        lambda s: replace_once(s, "self.kind().owned_target(self.target())", "Some(self.target())"), walk_source,
     )
     yield (
-        "closure authentication forgets the first mismatched declaration", layers,
+        "closure authentication omits the last transaction row", transactions,
+        lambda s: replace_once(s, "while i < records.len()", "while i < records.len().saturating_sub(1)"), transactions,
+    )
+    yield (
+        "closure authentication forgets the first mismatched declaration", transactions,
         lambda s: replace_once(s, "name == records@[i].0 &&", "true &&"), closure_trace,
     )
     for name, original, changed in [
