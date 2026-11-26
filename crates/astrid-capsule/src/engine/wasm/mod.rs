@@ -2121,7 +2121,7 @@ impl ExecutionEngine for WasmEngine {
                 )
             };
             let owner_capsule_log = owner_log.file;
-            let owner_pending_log = owner_log.pending;
+            let owner_log_binding = owner_log.bound;
             let runtime_owner_uid = self.runtime_id.as_ref().and_then(|id| match id.key().scope() {
                 crate::registry::RuntimeScope::Principal(uid) => Some(uid),
                 crate::registry::RuntimeScope::SystemResident => None,
@@ -2189,7 +2189,7 @@ impl ExecutionEngine for WasmEngine {
             let st_owner_secret_store = owner_secret_store.clone();
             let st_owner_capsule_log = owner_capsule_log.clone();
             let st_native_log_root = native_log_root.clone();
-            let st_owner_pending_log = owner_pending_log.clone();
+            let st_owner_log_binding = owner_log_binding.clone();
             let kv_backend_for_state = kv_backend.clone();
             // Concurrent run-loop workers (Approach B, shared listener). Only a
             // loopback TCP server capsule (run-loop + TCP `net_bind`, no
@@ -2240,7 +2240,7 @@ impl ExecutionEngine for WasmEngine {
                 // no human-principal log fallback.
                 capsule_log: st_owner_capsule_log.clone(),
                 deferred_logs: native_logs::DeferredBindings::for_factory(
-                    st_native_log_root.clone(), st_owner_pending_log.clone(),
+                    st_native_log_root.clone(), st_owner_log_binding.clone(),
                 ),
                 capsule_id: capsule_id_val.clone(),
                 // The CoW merged path (non-git) or the pristine workspace
