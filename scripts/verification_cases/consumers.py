@@ -10,6 +10,24 @@ from .common import (
 def consumer_defects():
     """Weaken a production guarantee and require its trace consumer to fail."""
     yield (
+        "stream scan loses the released descriptor batch",
+        Path("crates/astrid-storage/src/engine/durable/wal/transaction.rs"),
+        lambda source: replace_once(source, "result matches Ok(Step::Committed(b)) && b == p", "result matches Ok(Step::Committed(_))"),
+        Path("verification/hosted_wal_stream.rs"),
+    )
+    yield (
+        "stream scan loses acceptance of valid logical headers",
+        Path("crates/astrid-storage/src/engine/durable/wal/record_wire.rs"),
+        lambda source: replace_once(source, "out.is_ok() == (1 <= self.kind <= 4", "out.is_ok() ==> (1 <= self.kind <= 4"),
+        Path("verification/hosted_wal_stream.rs"),
+    )
+    yield (
+        "stream scan loses the exact header kind",
+        Path("crates/astrid-storage/src/engine/durable/wal/record_wire.rs"),
+        lambda source: replace_once(source, "out matches Ok(kind) ==> self.kind == match kind", "out matches Ok(kind) ==> true || self.kind == match kind"),
+        Path("verification/hosted_wal_stream.rs"),
+    )
+    yield (
         "Commit reader loses the physical marker binding",
         Path("crates/astrid-storage/src/engine/durable/wal/commit_wire.rs"),
         lambda source: replace_once(source, "bytes@ == (physical_wire::Envelope {version:1,size:p.len() as u64,checksum:sum}).wire() + p@", "bytes.len() == physical_wire::WIDTH + p.len()"),

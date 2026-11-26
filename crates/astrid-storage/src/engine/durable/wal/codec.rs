@@ -208,20 +208,16 @@ pub(super) fn decode_record(
         offset,
         detail: "WAL record header is truncated",
     })?;
-    let kind = WalRecordKind::from_tag(header.kind).ok_or(WalError::Corrupt {
+    let kind = header.classify().map_err(|error| WalError::Corrupt {
         offset,
-        detail: "WAL record kind is unknown",
+        detail: match error {
+            super::record_wire::HeaderError::UnknownKind => "WAL record kind is unknown",
+            super::record_wire::HeaderError::InvalidFeatures => {
+                "WAL record flags or reserved bytes are non-zero"
+            },
+        },
     })?;
     let flags = header.flags;
-    if header.reserved != [0, 0]
-        || (kind == WalRecordKind::Object && ObjectEncoding::from_flag(flags).is_none())
-        || (kind != WalRecordKind::Object && flags != 0)
-    {
-        return Err(WalError::Corrupt {
-            offset,
-            detail: "WAL record flags or reserved bytes are non-zero",
-        });
-    }
     let sequence =
         WalSequence::new(u64::from_le_bytes(header.sequence)).ok_or(WalError::Corrupt {
             offset,

@@ -112,6 +112,7 @@ mod wal_physical_wire;
 mod wal_interior;
 mod hosted_wal_physical_model;
 mod hosted_wal_binding;
+mod hosted_wal_stream;
 #[path = "../crates/astrid-storage/src/engine/durable/root_wire.rs"]
 mod root_wire;
 

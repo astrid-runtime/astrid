@@ -1,6 +1,28 @@
 use super::*;
 
 #[test]
+fn logical_header_reports_unknown_kind_before_feature_errors_at_original_offset() {
+    let offset = WalOffset::new(731);
+    let mut header = [0_u8; codec::RECORD_HEADER_LEN];
+    header[0] = WalRecordKind::Object.tag();
+    header[4] = 1;
+    for flag in [2, 0x80, 0xff] {
+        header[1] = flag;
+        assert!(matches!(
+            codec::decode_record(&header, offset),
+            Err(WalError::Corrupt { offset: found, detail: "WAL record flags or reserved bytes are non-zero" })
+                if found == offset
+        ));
+    }
+    header[0] = 0xff;
+    header[2] = 1;
+    assert!(matches!(
+        codec::decode_record(&header, offset),
+        Err(WalError::Corrupt { offset: found, detail: "WAL record kind is unknown" }) if found == offset
+    ));
+}
+
+#[test]
 fn decoder_rejects_malformed_root_fields_at_the_original_offset() {
     let offset = WalOffset::new(731);
     let prior = root(16);

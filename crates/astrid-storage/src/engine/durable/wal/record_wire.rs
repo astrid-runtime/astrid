@@ -53,7 +53,26 @@ pub(super) struct Header {
     pub(super) ordinal: [u8;8],
 }
 
+pub(super) enum HeaderError { UnknownKind, InvalidFeatures }
+
 impl Header {
+    /// Validate the kind, flags and reserved bytes before accepting a body.
+    pub(super) fn classify(&self) -> (out:Result<WalRecordKind,HeaderError>)
+        ensures out.is_ok() == (1 <= self.kind <= 4 && self.reserved@[0] == 0 && self.reserved@[1] == 0 &&
+                    (self.flags == 0 || (self.kind == 2 && self.flags == 1))),
+            out matches Ok(kind) ==> self.kind == match kind {
+                WalRecordKind::Begin=>1u8,WalRecordKind::Object=>2,WalRecordKind::Root=>3,WalRecordKind::Commit=>4,
+            },
+            (out matches Err(HeaderError::UnknownKind)) == !(1 <= self.kind <= 4),
+    {
+        let kind = WalRecordKind::from_tag(self.kind).ok_or(HeaderError::UnknownKind)?;
+        if self.reserved != [0;2] || (self.flags != 0 && !(matches!(kind,WalRecordKind::Object) && self.flags == 1)) {
+            return Err(HeaderError::InvalidFeatures);
+        }
+        Ok(kind)
+    }
+
+
     pub(super) open spec fn bytes(&self) -> Seq<u8> {
         seq![self.kind,self.flags] + self.reserved@ + self.sequence@ + self.ordinal@
     }

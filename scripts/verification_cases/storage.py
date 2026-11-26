@@ -13,7 +13,43 @@ from .common import (
 
 
 def defects():
+    stream = Path("verification/hosted_wal_stream.rs")
     return [
+        (
+            "stream scan releases the batch against the Commit offset",
+            stream,
+            lambda source: replace_once(source, "Event::Commit {offset:start as u64,marker:checked}", "Event::Commit {offset:cursor as u64,marker:checked}"),
+        ),
+        (
+            "stream scan swaps a root span for the Begin span",
+            stream,
+            lambda source: replace_once(source, "DataKind::Root => Event::Root(r)", "DataKind::Root => Event::Root(begin)"),
+        ),
+        (
+            "stream scan restarts at Begin instead of advancing",
+            stream,
+            lambda source: replace_once(source, "read_record(stream,cursor,limit,hash,checksum,Ghost(hint))", "read_record(stream,start,limit,hash,checksum,Ghost(hint))"),
+        ),
+        (
+            "stream scan refuses every completed transaction",
+            stream,
+            lambda source: replace_once(source, "return Some(Scan {end:r.next,marker:checked,batch,trace:Ghost((rs,r))});", "return None;"),
+        ),
+        (
+            "stream scan returns the start of Commit as the next cursor",
+            stream,
+            lambda source: replace_once(source, "Scan {end:r.next,marker:checked", "Scan {end:cursor,marker:checked"),
+        ),
+        (
+            "stream scan digests only the last stored record",
+            stream,
+            lambda source: replace_once(source, "data.extend_from_slice(&part);", "data = part;"),
+        ),
+        (
+            "stream scan admits objects after a root",
+            stream,
+            lambda source: replace_once(source, "if counts.roots != 0 { return None; }", ""),
+        ),
         (
             "Commit frame takes its ordinal from the root count",
             Path("crates/astrid-storage/src/engine/durable/wal/commit_wire.rs"),

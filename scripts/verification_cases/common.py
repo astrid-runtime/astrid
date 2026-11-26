@@ -62,6 +62,7 @@ INPUTS = [
     Path("verification/hosted_lease_model.rs"),
     Path("verification/hosted_wal_physical_model.rs"),
     Path("verification/hosted_wal_binding.rs"),
+    Path("verification/hosted_wal_stream.rs"),
     Path("verification/hosted_uplink_model.rs"),
     Path("verification/hosted_kv_model.rs"),
     Path("verification/hosted_wal_model.rs"),

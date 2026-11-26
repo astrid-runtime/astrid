@@ -5,7 +5,7 @@ use vstd::prelude::*;
 
 verus! {
 
-proof fn unique_marker(decoded: Marker, marker: Marker)
+pub(super) proof fn unique_marker(decoded: Marker, marker: Marker)
     requires decoded.wire() == marker.wire(),
     ensures decoded == marker,
 {
