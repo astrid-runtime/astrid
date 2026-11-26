@@ -722,15 +722,45 @@ async fn scoped_issuer_child_inherits_issuer_denies() {
 
 #[tokio::test]
 async fn queued_pair_issue_cannot_mint_after_issuer_removal() {
-    assert_retired_pair_issuer_denied(false).await;
+    queued_pair_denial(
+        |profile| profile.auth.public_keys.clear(),
+        "outside the authenticating device",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn queued_pair_issue_cannot_mint_after_principal_disable() {
+    queued_pair_denial(|profile| profile.enabled = false, "is disabled").await;
+}
+
+#[tokio::test]
+async fn queued_pair_issue_cannot_mint_after_scope_narrows() {
+    queued_pair_denial(
+        |profile| {
+            profile.auth.public_keys[0].scope = scoped_device('a', &["self:auth:pair"], &[]).scope;
+        },
+        "requested device scope exceeds",
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn queued_pair_issue_cannot_mint_after_the_same_key_is_repaired() {
-    assert_retired_pair_issuer_denied(true).await;
+    queued_pair_denial(
+        |profile| {
+            let replacement = scoped_device('a', &["self:*"], &[]);
+            let previous = &mut profile.auth.public_keys[0];
+            assert_eq!(previous.key_id, replacement.key_id);
+            assert_ne!(previous.registration_id, replacement.registration_id);
+            *previous = replacement;
+        },
+        "outside the authenticating device",
+    )
+    .await;
 }
 
-async fn assert_retired_pair_issuer_denied(repair: bool) {
+async fn queued_pair_denial(update: impl FnOnce(&mut PrincipalProfile), reason: &str) {
     let (_dir, kernel) = fixture().await;
     let caller = pid("queued_issuer");
     let dev = scoped_device('a', &["self:*"], &[]);
@@ -756,20 +786,15 @@ async fn assert_retired_pair_issuer_denied(repair: bool) {
         () = std::future::ready(()) => {}
     }
     let mut profile = load(&kernel, &caller);
-    profile.auth.public_keys.clear();
-    if repair {
-        let replacement = scoped_device('a', &["self:*"], &[]);
-        assert_eq!(key, replacement.key_id);
-        assert_ne!(
-            authorization.device_registration,
-            replacement.registration_id
-        );
-        profile.add_device(replacement);
-    }
+    update(&mut profile);
+    // Leave the admitted profile cached: issuance must consult durable policy.
     profile.save(&kernel.astrid_home, &caller).unwrap();
-    kernel.profile_cache.invalidate(&caller);
     drop(guard);
-    assert!(matches!(queued.await, AdminResponseBody::Error(_)));
+    let result = queued.await;
+    assert!(
+        matches!(&result, AdminResponseBody::Error(message) if message.contains(reason)),
+        "{result:?}"
+    );
     assert!(store.list().await.unwrap().is_empty());
 }
 

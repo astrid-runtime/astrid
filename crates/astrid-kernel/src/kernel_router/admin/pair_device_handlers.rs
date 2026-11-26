@@ -40,7 +40,7 @@ use crate::pair_token::{self, DurablePairToken, DurablePairTokenStore, MAX_EXPIR
 /// device to be close at hand.
 const DEFAULT_EXPIRY_SECS: u64 = 5 * 60;
 
-type PairIssuerAuthority = (Arc<PrincipalProfile>, Arc<GroupConfig>, Option<DeviceScope>);
+type PairIssuerAuthority = (PrincipalProfile, Arc<GroupConfig>, Option<DeviceScope>);
 
 fn pair_token_store(
     kernel: &Arc<crate::Kernel>,
@@ -60,16 +60,13 @@ fn current_pair_issuer_authority(
     admitted: Option<&AuthorizedRequest>,
     issuer_device_key_id: Option<&str>,
 ) -> Result<PairIssuerAuthority, AdminResponseBody> {
-    let profile_path = kernel.astrid_home.profile_path(caller);
-    if !profile_path.exists() {
-        return Err(err_bad_input(format!(
-            "caller principal {caller} does not exist (no profile.toml)"
-        )));
-    }
-    let profile = kernel
-        .profile_cache
-        .resolve(caller)
-        .map_err(|error| err_internal(format!("issuer profile resolution failed: {error}")))?;
+    let profile = PrincipalProfile::load_required(&kernel.astrid_home, caller).map_err(|error| {
+        if matches!(&error, astrid_core::profile::ProfileError::Io(io) if io.kind() == std::io::ErrorKind::NotFound) {
+            err_bad_input(format!("caller principal {caller} does not exist (no profile.toml)"))
+        } else {
+            err_internal(format!("issuer profile resolution failed: {error}"))
+        }
+    })?;
     if !profile.enabled {
         return Err(err_unauthorized(format!(
             "caller principal {caller} is disabled"
