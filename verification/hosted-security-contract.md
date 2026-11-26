@@ -77,9 +77,17 @@ the counter remains unchanged and reservation fails. This covers a single
 registry lifetime. Initial principal runtime registration and replacement both
 hold a directory read lock through the registry mutation. The verified
 predicate requires the current UID for the alias and the current alias for the
-UID to match. Rejection returns the candidate
-for cancellation and unloading. Route opening after the swap, fresh discovery,
-and singleton views still need end-to-end binding. Ordering with
+UID to match. Rejection returns the candidate for cancellation and unloading.
+Fresh install reload passes the admitted UID through dependency discovery,
+durable package lookup, cache repair selection, fallback loading and the final
+registry lookup. A reused principal runtime must match the admitted viewer UID.
+For a shared runtime the scope check delegates authority to the explicit system
+classification and view attachment. When discovery supplies a viewer UID,
+attachment and resumption of an existing singleton hold the viewer binding
+through the synchronous registry operation. Initial publication also holds the
+owner binding through route opening when a UID is available. Route opening
+after replacement, continuity of package generation and the full
+singleton replacement path still require end-to-end proof. Ordering with
 retirement, authenticated request admission and durable commit still needs a
 proof across the full operation.
 

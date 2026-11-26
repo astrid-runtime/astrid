@@ -43,6 +43,19 @@ pub enum RuntimeScope {
     SystemResident,
 }
 
+impl RuntimeScope {
+    /// Compare a pinned viewer to the instance owner. System residency has
+    /// separate operator admission and an explicit principal view.
+    #[must_use]
+    pub fn matches_view_owner(&self, viewer: PrincipalUid) -> bool {
+        let owner = match self {
+            Self::Principal(uid) => Some(uid.as_bytes()),
+            Self::SystemResident => None,
+        };
+        super::view_owner::matches(owner, viewer.as_bytes())
+    }
+}
+
 /// Logical runtime slot. Artifact identity and authority identity are distinct.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RuntimeKey {

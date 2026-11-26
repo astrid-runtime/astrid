@@ -1534,7 +1534,8 @@ impl Kernel {
         principal: &PrincipalId,
         manifest: &astrid_capsule_types::manifest::CapsuleManifest,
     ) -> anyhow::Result<bool> {
-        let Some((uid, snapshot)) = self.published_capsule_snapshot(principal, manifest)? else {
+        let Some((uid, snapshot)) = self.published_capsule_snapshot(principal, manifest, None)?
+        else {
             return Ok(false);
         };
         self.verify_published_materialization(dir, uid, manifest, &snapshot)?;
@@ -1547,6 +1548,7 @@ impl Kernel {
         &self,
         principal: &PrincipalId,
         manifest: &astrid_capsule_types::manifest::CapsuleManifest,
+        expected_uid: Option<astrid_core::PrincipalUid>,
     ) -> anyhow::Result<
         Option<(
             astrid_core::PrincipalUid,
@@ -1558,7 +1560,7 @@ impl Kernel {
         };
         let uid = self
             .principal_directory
-            .uid_for(principal)
+            .bound_uid(principal, expected_uid)
             .map_err(|error| anyhow::anyhow!("resolve capsule cache owner UID: {error}"))?;
         let owner = astrid_storage::StateOwner::Principal(uid);
         let capsule_id = astrid_capsule_types::CapsuleId::new(manifest.package.name.clone())
@@ -1724,6 +1726,16 @@ impl Kernel {
         dir: PathBuf,
         principal: &PrincipalId,
     ) -> Result<(), anyhow::Error> {
+        self.load_capsule_for_owner(dir, principal, None).await
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn load_capsule_for_owner(
+        &self,
+        dir: PathBuf,
+        principal: &PrincipalId,
+        expected_uid: Option<astrid_core::PrincipalUid>,
+    ) -> Result<(), anyhow::Error> {
         let _work = self
             .runtime_work
             .admit()
@@ -1732,7 +1744,8 @@ impl Kernel {
         let manifest_path = dir.join("Capsule.toml");
         let manifest = astrid_capsule::discovery::load_manifest(&manifest_path)
             .map_err(|e| anyhow::anyhow!(e))?;
-        let bound = self.capture_bound_materialization(&dir, principal, &manifest, "load")?;
+        let bound =
+            self.capture_bound_materialization(&dir, principal, &manifest, "load", expected_uid)?;
         let runtime_dir = bound
             .as_ref()
             .map_or_else(|| dir.clone(), |bound| bound.runtime_dir.clone());
@@ -1744,6 +1757,9 @@ impl Kernel {
         let id = astrid_capsule_types::CapsuleId::from_static(&manifest.package.name);
         let _view_guard = self.lock_capsule_view(principal, &id).await;
         let _load_guard = self.capsule_load_lock.lock().await;
+        if let Some(uid) = expected_uid {
+            self.principal_directory.bound_uid(principal, Some(uid))?;
+        }
         if let Some(bound) = bound.as_ref() {
             self.confirm_published_materialization(&runtime_dir, principal, &manifest, bound)?;
         }
@@ -1771,21 +1787,17 @@ impl Kernel {
         }
         self.verify_workspace_capsule_tree(&runtime_dir)?;
 
-        // Mutable runtimes are authority-scoped. A principal always receives a
-        // fresh runtime for its immutable UID; only an explicitly classified
-        // SystemResident service may attach another view to one runtime.
+        let viewer_uid = expected_uid.or_else(|| bound.as_ref().map(|b| b.uid));
         {
             let mut registry = self.capsules.write().await;
-            if registry.get_for(principal, &id).is_some() {
-                return Ok(());
-            }
-            if system_runtime && registry.contains_system_runtime(&id, &wasm_hash) {
-                registry
-                    .register_existing(&id, &wasm_hash, principal)
-                    .map_err(|e| anyhow::anyhow!("Failed to add capsule view: {e}"))?;
-                if let Some(capsule) = registry.get_for(principal, &id) {
-                    capsule.resume_for(principal);
-                }
+            if self.attach_existing_capsule(
+                &mut registry,
+                principal,
+                viewer_uid,
+                &id,
+                &wasm_hash,
+                system_runtime,
+            )? {
                 return Ok(());
             }
         }
@@ -1800,12 +1812,8 @@ impl Kernel {
         // is the authenticated admission set and the installed authority
         // receipt was verified above.
 
-        let principal_uid = self.runtime_principal_uid(
-            system_runtime,
-            principal,
-            &id,
-            bound.as_ref().map(|b| b.uid),
-        )?;
+        let principal_uid =
+            self.runtime_principal_uid(system_runtime, principal, &id, viewer_uid)?;
         let scope = principal_uid.map_or(
             astrid_capsule::registry::RuntimeScope::SystemResident,
             astrid_capsule::registry::RuntimeScope::Principal,
@@ -1835,8 +1843,48 @@ impl Kernel {
             return Ok(());
         }
 
-        self.publish_initial_runtime(capsule, runtime_id, principal)
+        self.publish_initial_runtime(capsule, runtime_id, principal, viewer_uid)
             .await
+    }
+
+    /// Reuse an installed view or attach an explicitly shared singleton under
+    /// the same viewer binding used to discover its package.
+    fn attach_existing_capsule(
+        &self,
+        registry: &mut astrid_capsule::registry::CapsuleRegistry,
+        principal: &PrincipalId,
+        viewer_uid: Option<astrid_core::PrincipalUid>,
+        id: &astrid_capsule_types::CapsuleId,
+        artifact: &astrid_capsule::registry::WasmHash,
+        system_runtime: bool,
+    ) -> anyhow::Result<bool> {
+        let mut attach = |()| {
+            if let Some(runtime) = registry.runtime_id_for(principal, id) {
+                if viewer_uid.is_some_and(|uid| !runtime.key().scope().matches_view_owner(uid)) {
+                    anyhow::bail!("capsule '{id}' belongs to a different principal UID");
+                }
+                return Ok(true);
+            }
+            if system_runtime && registry.contains_system_runtime(id, artifact) {
+                registry.register_existing(id, artifact, principal)?;
+                if let Some(capsule) = registry.get_for(principal, id) {
+                    capsule.resume_for(principal);
+                }
+                return Ok(true);
+            }
+            Ok(false)
+        };
+        if let Some(uid) = viewer_uid {
+            self.principal_directory
+                .with_bound_input(principal, uid, (), attach)
+                .map_err(|()| {
+                    anyhow::anyhow!(
+                        "owner of '{principal}' changed before attaching capsule '{id}'"
+                    )
+                })?
+        } else {
+            attach(())
+        }
     }
 
     async fn publish_initial_runtime(
@@ -1844,27 +1892,31 @@ impl Kernel {
         mut candidate: Box<dyn astrid_capsule::capsule::Capsule>,
         runtime_id: astrid_capsule::registry::RuntimeId,
         principal: &PrincipalId,
+        viewer_uid: Option<astrid_core::PrincipalUid>,
     ) -> Result<(), anyhow::Error> {
         let id = candidate.id().clone();
         let mut registry = self.capsules.write().await;
-        let already_in_view = registry.get_for(principal, &id).is_some();
         let scope = runtime_id.key().scope();
-        let artifact = runtime_id.key().artifact();
-        let system_winner = scope == astrid_capsule::registry::RuntimeScope::SystemResident
-            && registry.contains_system_runtime(&id, artifact);
-        if already_in_view || system_winner {
-            if system_winner && !already_in_view {
-                registry.register_existing(&id, artifact, principal)?;
-                if let Some(capsule) = registry.get_for(principal, &id) {
-                    capsule.resume_for(principal);
-                }
-            }
+        let uid = match scope {
+            astrid_capsule::registry::RuntimeScope::Principal(uid) => Some(uid),
+            astrid_capsule::registry::RuntimeScope::SystemResident => viewer_uid,
+        };
+        let attached = self.attach_existing_capsule(
+            &mut registry,
+            principal,
+            uid,
+            &id,
+            runtime_id.key().artifact(),
+            scope == astrid_capsule::registry::RuntimeScope::SystemResident,
+        );
+        if !matches!(attached, Ok(false)) {
             drop(registry);
+            candidate.retire();
             candidate.request_cancel();
             if let Err(error) = candidate.unload().await {
                 tracing::warn!(capsule_id = %id, %principal, %error, "Redundant capsule candidate failed to unload");
             }
-            return Ok(());
+            return attached.map(|_| ());
         }
 
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -1875,10 +1927,16 @@ impl Kernel {
                 runtime_id,
                 principal,
                 Some(principal.clone()),
-            )
+            )?;
+            let runtime = registry
+                .get_for(principal, &id)
+                .expect("successful registration installed the principal view");
+            runtime.resume_for(principal);
+            runtime.publish();
+            Ok(())
         };
-        let publication = match scope {
-            astrid_capsule::registry::RuntimeScope::Principal(uid) => self
+        let publication = match uid {
+            Some(uid) => self
                 .principal_directory
                 .with_bound_input(principal, uid, candidate, register)
                 .unwrap_or_else(|capsule| {
@@ -1889,7 +1947,7 @@ impl Kernel {
                         )),
                     })
                 }),
-            astrid_capsule::registry::RuntimeScope::SystemResident => register(candidate),
+            None => register(candidate),
         };
         if let Err(publication) = publication {
             drop(registry);
@@ -1900,10 +1958,6 @@ impl Kernel {
                 tracing::warn!(capsule_id = %id, %cleanup, "Failed to unload rejected publication candidate");
             }
             return Err(anyhow::anyhow!(publication.error));
-        }
-        if let Some(capsule) = registry.get_for(principal, &id) {
-            capsule.resume_for(principal);
-            capsule.publish();
         }
         drop(registry);
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -1954,6 +2008,10 @@ impl Kernel {
             principal,
             &manifest,
             "replacement source",
+            match expected_scope {
+                astrid_capsule::registry::RuntimeScope::Principal(uid) => Some(uid),
+                astrid_capsule::registry::RuntimeScope::SystemResident => None,
+            },
         )?;
         let runtime_dir = bound.as_ref().map_or_else(
             || source_dir.to_path_buf(),
@@ -2129,6 +2187,16 @@ impl Kernel {
     /// Build or refresh one principal's capsule view from its own install set.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub async fn ensure_principal_loaded(&self, principal: &PrincipalId) {
+        self.ensure_principal_loaded_for_owner(principal, None)
+            .await;
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn ensure_principal_loaded_for_owner(
+        &self,
+        principal: &PrincipalId,
+        expected_uid: Option<astrid_core::PrincipalUid>,
+    ) {
         let Some(_work) = self.runtime_work.admit() else {
             return;
         };
@@ -2148,7 +2216,7 @@ impl Kernel {
                 return;
             }
         }
-        let sorted = self.sorted_principal_capsules(principal);
+        let sorted = self.sorted_principal_capsules(principal, expected_uid);
         validate_principal_capsules(principal, &sorted);
 
         let (uplinks, others): (Vec<_>, Vec<_>) =
@@ -2158,7 +2226,10 @@ impl Kernel {
             .map(|(m, _)| m.package.name.clone())
             .collect();
         for (manifest, dir) in &uplinks {
-            if let Err(e) = self.load_capsule(dir.clone(), principal).await {
+            if let Err(e) = self
+                .load_capsule_for_owner(dir.clone(), principal, expected_uid)
+                .await
+            {
                 tracing::warn!(
                     %principal,
                     capsule = %manifest.package.name,
@@ -2171,7 +2242,10 @@ impl Kernel {
             .await;
 
         for (manifest, dir) in &others {
-            if let Err(e) = self.load_capsule(dir.clone(), principal).await {
+            if let Err(e) = self
+                .load_capsule_for_owner(dir.clone(), principal, expected_uid)
+                .await
+            {
                 tracing::warn!(
                     %principal,
                     capsule = %manifest.package.name,
@@ -2268,7 +2342,7 @@ impl Kernel {
             tracing::debug!(%principal, "Skipping uplink load for principal without a profile");
             return;
         }
-        let sorted = self.sorted_principal_capsules(principal);
+        let sorted = self.sorted_principal_capsules(principal, None);
         validate_principal_capsules(principal, &sorted);
 
         let uplinks: Vec<_> = sorted
@@ -2297,10 +2371,11 @@ impl Kernel {
     fn sorted_principal_capsules(
         &self,
         principal: &PrincipalId,
+        expected_uid: Option<astrid_core::PrincipalUid>,
     ) -> Vec<(astrid_capsule_types::manifest::CapsuleManifest, PathBuf)> {
         use astrid_capsule::toposort::toposort_manifests;
 
-        let mut paths = self.durable_principal_capsule_paths(principal);
+        let mut paths = self.durable_principal_capsule_paths(principal, expected_uid);
         // Workspace capsules are an explicit project portal and remain the
         // lowest-priority discovery source. They never establish authority
         // for an Astrid principal package.
@@ -2330,10 +2405,14 @@ impl Kernel {
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    fn durable_principal_capsule_paths(&self, principal: &PrincipalId) -> Vec<PathBuf> {
+    fn durable_principal_capsule_paths(
+        &self,
+        principal: &PrincipalId,
+        expected_uid: Option<astrid_core::PrincipalUid>,
+    ) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         if let Some(store) = self.principal_store.as_ref() {
-            match self.principal_directory.uid_for(principal) {
+            match self.principal_directory.bound_uid(principal, expected_uid) {
                 Ok(uid) => {
                     let owner = astrid_storage::StateOwner::Principal(uid);
                     match store.capsules().list(&owner) {
@@ -5577,11 +5656,11 @@ mod tests {
             cancelled_for: Arc::default(),
         });
         let error = kernel
-            .publish_initial_runtime(candidate, runtime, &principal)
+            .publish_initial_runtime(candidate, runtime, &principal, Some(uid))
             .await
             .unwrap_err();
         assert!(
-            error.to_string().contains("changed before registering"),
+            error.to_string().contains("changed before attaching"),
             "{error}"
         );
         assert!(
@@ -5729,7 +5808,23 @@ mod tests {
                 )
                 .unwrap();
             registry.register_existing(&id, &hash, &bob).unwrap();
-            registry.register_existing(&id, &hash, &alice).unwrap();
+            let viewer = astrid_core::PrincipalUid::from_bytes([83; 32]);
+            let stale = astrid_core::PrincipalUid::from_bytes([84; 32]);
+            kernel
+                .principal_directory
+                .register(alice.clone(), viewer)
+                .unwrap();
+            assert!(
+                kernel
+                    .attach_existing_capsule(&mut registry, &alice, Some(stale), &id, &hash, true)
+                    .is_err()
+            );
+            assert!(registry.get_for(&alice, &id).is_none());
+            assert!(
+                kernel
+                    .attach_existing_capsule(&mut registry, &alice, Some(viewer), &id, &hash, true)
+                    .unwrap()
+            );
         }
 
         let removed = kernel.unload_one_capsule(&id, &alice).await.unwrap();

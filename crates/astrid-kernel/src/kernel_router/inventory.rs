@@ -68,7 +68,7 @@ pub(super) async fn inventory_manifest_map(
     visibility: &CapsuleVisibility,
 ) -> BTreeMap<String, astrid_capsule::manifest::CapsuleManifest> {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    let mut paths = kernel.durable_principal_capsule_paths(&visibility.principal);
+    let mut paths = kernel.durable_principal_capsule_paths(&visibility.principal, None);
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     let mut paths = Vec::new();
     paths.extend(crate::capsule_discovery_paths_for(

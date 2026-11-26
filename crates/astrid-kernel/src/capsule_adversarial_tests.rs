@@ -443,7 +443,7 @@ async fn durable_activation_remains_principal_scoped_after_upgrade() {
     publish_without_running_lifecycle(&kernel, &principal_a, old_source.path()).unwrap();
     publish_without_running_lifecycle(&kernel, &principal_b, b_source.path()).unwrap();
 
-    let old_paths = kernel.durable_principal_capsule_paths(&principal_a);
+    let old_paths = kernel.durable_principal_capsule_paths(&principal_a, None);
     assert_eq!(old_paths.len(), 1);
     assert!(old_paths[0].join("main.wasm").is_file());
     assert_eq!(std::fs::read(old_paths[0].join("main.wasm")).unwrap(), wasm);
@@ -462,7 +462,7 @@ async fn durable_activation_remains_principal_scoped_after_upgrade() {
     publish_without_running_lifecycle(&kernel, &principal_a, new_source.path()).unwrap();
     std::fs::write(old_paths[0].join("main.wasm"), b"stale hostile bytes").unwrap();
 
-    let upgraded_paths = kernel.durable_principal_capsule_paths(&principal_a);
+    let upgraded_paths = kernel.durable_principal_capsule_paths(&principal_a, None);
     assert_eq!(upgraded_paths.len(), 1);
     assert_ne!(upgraded_paths[0], old_paths[0]);
     assert_eq!(
@@ -479,10 +479,11 @@ async fn durable_activation_remains_principal_scoped_after_upgrade() {
         .unwrap()
         .unwrap();
     assert_eq!(before_b, after_b);
-    let b_paths = kernel.durable_principal_capsule_paths(&principal_b);
+    let b_paths = kernel.durable_principal_capsule_paths(&principal_b, None);
     assert_eq!(b_paths.len(), 1);
     assert_eq!(std::fs::read(b_paths[0].join("main.wasm")).unwrap(), wasm);
     let a_uid = kernel.principal_directory.uid_for(&principal_a).unwrap();
+
     assert!(
         store
             .capsules()
@@ -494,7 +495,7 @@ async fn durable_activation_remains_principal_scoped_after_upgrade() {
     );
     assert!(
         kernel
-            .durable_principal_capsule_paths(&principal_a)
+            .durable_principal_capsule_paths(&principal_a, None)
             .is_empty()
     );
     let after_removal_b = store
@@ -506,6 +507,58 @@ async fn durable_activation_remains_principal_scoped_after_upgrade() {
         .unwrap()
         .unwrap();
     assert_eq!(before_b, after_removal_b);
+}
+
+#[tokio::test]
+async fn fresh_discovery_preserves_admitted_owner_after_alias_reassignment() {
+    let (_temp, home) = scratch_home();
+    let kernel = crate::test_kernel_with_home(home.clone()).await;
+    let alias = seed_isolated_principal(&kernel, &home, "prior-owner", [0x83; 32]).await;
+    let next = seed_isolated_principal(&kernel, &home, "next-owner", [0x84; 32]).await;
+    let directory = &kernel.principal_directory;
+    let a_uid = directory.uid_for(&alias).unwrap();
+    let b_uid = directory.uid_for(&next).unwrap();
+    let source = tempfile::tempdir().unwrap();
+    let wasm = write_component_source(source.path(), "principal-b-package", None);
+    publish_without_running_lifecycle(&kernel, &next, source.path()).unwrap();
+    let b_paths = kernel.durable_principal_capsule_paths(&next, Some(b_uid));
+    assert_eq!(b_paths.len(), 1);
+    directory
+        .rename(a_uid, &alias, PrincipalId::new("moved-owner").unwrap())
+        .unwrap();
+    directory.rename(b_uid, &next, alias.clone()).unwrap();
+    // An install carrying A's UID cannot discover, repair or start B's package,
+    // even if discovery is handed B's current alias and cache location.
+    let component = b_paths[0].join("main.wasm");
+    std::fs::write(&component, b"projection requires repair").unwrap();
+    kernel
+        .ensure_principal_loaded_for_owner(&alias, Some(a_uid))
+        .await;
+    let wrong_paths = kernel.durable_principal_capsule_paths(&alias, Some(a_uid));
+    assert!(wrong_paths.is_empty());
+    let error = kernel
+        .load_capsule_for_owner(b_paths[0].clone(), &alias, Some(a_uid))
+        .await
+        .expect_err("owner comparison must precede projection repair");
+    assert!(error.to_string().contains("changed owners"), "{error:#}");
+    assert_eq!(
+        std::fs::read(&component).unwrap(),
+        b"projection requires repair"
+    );
+    let package_id = astrid_capsule_types::CapsuleId::new("principal-b-package").unwrap();
+    assert!(
+        kernel
+            .capsules
+            .read()
+            .await
+            .get_for(&alias, &package_id)
+            .is_none()
+    );
+    assert_eq!(
+        kernel.durable_principal_capsule_paths(&alias, Some(b_uid)),
+        b_paths
+    );
+    assert_eq!(std::fs::read(component).unwrap(), wasm);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -604,7 +657,7 @@ async fn purged_removal_erases_only_the_callers_capsule_kv_and_is_retryable() {
 
     assert!(
         kernel
-            .durable_principal_capsule_paths(&principal)
+            .durable_principal_capsule_paths(&principal, None)
             .is_empty()
     );
 }
@@ -661,7 +714,7 @@ async fn nested_wit_ancestors_activate_from_a_durable_package() {
     )
     .unwrap();
 
-    let targets = kernel.durable_principal_capsule_paths(&principal);
+    let targets = kernel.durable_principal_capsule_paths(&principal, None);
     assert_eq!(targets.len(), 1);
     assert!(targets[0].join("wit").is_dir());
     assert!(targets[0].join("wit/deps").is_dir());
@@ -682,7 +735,7 @@ async fn empty_directories_activate_and_survive_durable_activation() {
     std::fs::create_dir_all(source.path().join("empty/nested")).unwrap();
     let package = publish_component_source_at(&kernel, &principal, source.path(), None).unwrap();
     let target = durable_target(&kernel, &principal, &package, "empty-directory-projection");
-    let targets = kernel.durable_principal_capsule_paths(&principal);
+    let targets = kernel.durable_principal_capsule_paths(&principal, None);
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0], target);
     assert!(targets[0].join("empty").is_dir());

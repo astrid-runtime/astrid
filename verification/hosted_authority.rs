@@ -38,3 +38,6 @@ mod cache_address;
 
 #[path = "../crates/astrid-capsule/src/registry/generation.rs"]
 mod runtime_generation;
+
+#[path = "../crates/astrid-capsule/src/registry/view_owner.rs"]
+mod view_owner;

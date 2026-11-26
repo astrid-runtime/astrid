@@ -79,7 +79,11 @@ async fn exercise_initialization(index: usize, derived: bool, fail: bool) {
     // An unrelated principal still passes the actual loader's global lock
     // while target initialization is paused. Only its target view may block.
     let source = PrincipalId::default();
-    let source_dir = kernel.sorted_principal_capsules(&source).pop().unwrap().1;
+    let source_dir = kernel
+        .sorted_principal_capsules(&source, None)
+        .pop()
+        .unwrap()
+        .1;
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
         kernel.load_capsule(source_dir, &source),
@@ -89,7 +93,7 @@ async fn exercise_initialization(index: usize, derived: bool, fail: bool) {
     .unwrap();
     let target_uid = kernel.principal_directory.uid_for(&principal).unwrap();
     let target_dir = kernel
-        .sorted_principal_capsules(&principal)
+        .sorted_principal_capsules(&principal, None)
         .pop()
         .unwrap()
         .1;
@@ -212,7 +216,11 @@ async fn prepare_source(kernel: &Arc<Kernel>) {
     kernel.profile_cache.invalidate(&source);
     // Use the real source manifest as well: ordinary create snapshots its
     // declared secrets, including API_KEY. No target runtime is pre-registered.
-    let source_dir = kernel.sorted_principal_capsules(&source).pop().unwrap().1;
+    let source_dir = kernel
+        .sorted_principal_capsules(&source, None)
+        .pop()
+        .unwrap()
+        .1;
     kernel.load_capsule(source_dir, &source).await.unwrap();
 }
 

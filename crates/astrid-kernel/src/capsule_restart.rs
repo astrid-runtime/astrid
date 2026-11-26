@@ -34,10 +34,7 @@ impl Kernel {
                 .bound_uid(principal, Some(expected))?;
         }
         if let Some(runtime) = registered {
-            if let (Some(expected), astrid_capsule::registry::RuntimeScope::Principal(actual)) =
-                (admitted_uid, runtime.key().scope())
-                && actual != expected
-            {
+            if admitted_uid.is_some_and(|uid| !runtime.key().scope().matches_view_owner(uid)) {
                 anyhow::bail!("capsule '{id}' belongs to a different principal UID");
             }
             if self.capabilities.is_principal_retiring(principal).await {
@@ -53,21 +50,31 @@ impl Kernel {
         } else {
             drop(view_guard);
             // Build or refresh this principal's view from its installed set.
-            self.ensure_principal_loaded(principal).await;
+            self.ensure_principal_loaded_for_owner(principal, admitted_uid)
+                .await;
             if self.capsules.read().await.get_for(principal, id).is_none()
                 && let Some((_, dir)) = self
-                    .sorted_principal_capsules(principal)
+                    .sorted_principal_capsules(principal, admitted_uid)
                     .into_iter()
                     .find(|(manifest, _)| manifest.package.name == id.as_str())
             {
-                self.load_capsule(dir, principal)
+                self.load_capsule_for_owner(dir, principal, admitted_uid)
                     .await
                     .map_err(|error| anyhow::anyhow!("capsule '{id}' failed to load: {error:#}"))?;
             }
-            if self.capsules.read().await.get_for(principal, id).is_none() {
-                return Err(anyhow::anyhow!(
-                    "capsule '{id}' was not found in the install directories or failed to load"
-                ));
+            {
+                let registry = self.capsules.read().await;
+                let runtime = registry.runtime_id_for(principal, id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "capsule '{id}' was not found in the install directories or failed to load"
+                    )
+                })?;
+                if let Some(uid) = admitted_uid {
+                    self.principal_directory.bound_uid(principal, Some(uid))?;
+                    if !runtime.key().scope().matches_view_owner(uid) {
+                        anyhow::bail!("capsule '{id}' belongs to a different principal UID");
+                    }
+                }
             }
             self.publish_capsules_loaded().await;
         }

@@ -237,8 +237,9 @@ impl Kernel {
         principal: &astrid_core::principal::PrincipalId,
         manifest: &astrid_capsule_types::manifest::CapsuleManifest,
         operation: &str,
+        expected_uid: Option<astrid_core::PrincipalUid>,
     ) -> anyhow::Result<Option<BoundMaterialization>> {
-        let snapshot = self.published_capsule_snapshot(principal, manifest)?;
+        let snapshot = self.published_capsule_snapshot(principal, manifest, expected_uid)?;
         if let Some((uid, snapshot)) = snapshot {
             let runtime_dir = self.published_cache_target(uid, manifest, &snapshot)?;
             let bound_manifest =

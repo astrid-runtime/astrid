@@ -33,7 +33,9 @@ PRINCIPAL_SCOPE = Path("crates/astrid-kernel/src/kernel_router/principal_scope.r
 BINDING = Path("crates/astrid-storage/src/principal_directory/binding.rs")
 CACHE_ADDRESS = Path("crates/astrid-kernel/src/capsule_materialization/cache_address.rs")
 GENERATION = Path("crates/astrid-capsule/src/registry/generation.rs")
+VIEW_OWNER = Path("crates/astrid-capsule/src/registry/view_owner.rs")
 INPUTS = [
+    VIEW_OWNER,
     GENERATION,
     CACHE_ADDRESS,
     BINDING,
@@ -131,6 +133,16 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "publication accepts a mismatched reverse binding",
             BINDING,
             lambda text: replace_once(text, " || r != alias", ""),
+        ),
+        (
+            "view accepts a different runtime owner",
+            VIEW_OWNER,
+            lambda text: replace_once(text, "if uid.as_slice() != viewer.as_slice()", "if false"),
+        ),
+        (
+            "shared runtime rejects its separately admitted viewer",
+            VIEW_OWNER,
+            lambda text: replace_once(text, "else { return true; }", "else { return false; }"),
         ),
         (
             "registry reuses the same generation",

@@ -25,6 +25,7 @@ mod generation;
 mod replacement;
 mod runtime_id;
 mod uplinks;
+mod view_owner;
 pub use runtime_id::{RuntimeId, RuntimeKey, RuntimeScope, WasmHash};
 
 fn capsule_source_uuid(id: &CapsuleId, artifact: &WasmHash) -> Uuid {
