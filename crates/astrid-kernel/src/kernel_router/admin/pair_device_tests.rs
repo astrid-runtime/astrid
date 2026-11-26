@@ -545,13 +545,19 @@ async fn pairing_preserves_a_live_registration_and_rotates_after_revocation() {
             },
         )
         .await;
-        assert!(matches!(response, AdminResponseBody::PairTokenRedeemed(_)));
-        load(&kernel, &caller)
+        let AdminResponseBody::PairTokenRedeemed(paired) = response else {
+            panic!("pair token redeem failed: {response:?}");
+        };
+        assert_eq!(paired.principal, caller);
+        assert_eq!(paired.key_id, key_id);
+        let saved = load(&kernel, &caller)
             .auth
             .device_by_key_id(&key_id)
             .expect("device on disk")
             .registration_id
-            .expect("fresh registration")
+            .expect("fresh registration");
+        assert_eq!(paired.registration_id, Some(saved));
+        saved
     };
     let original = redeem().await;
     assert_eq!(redeem().await, original);

@@ -418,18 +418,20 @@ async fn pair_device_redeem_reserved(
     // + validated at issue time, with the issuer's denies already folded in),
     // so the paired device is attenuated to exactly that scope on every
     // transport — not hard-coded to Full.
-    if profile
-        .auth
-        .device_by_typed_pubkey(&normalised_key)
-        .is_none()
-    {
-        profile.add_device(DeviceKey::new(
-            normalised_key.as_str().to_string(),
-            chosen.scope.clone(),
-            chosen.label.clone(),
-            i64::try_from(now).unwrap_or(0),
-        ));
-    }
+    let registration_id =
+        if let Some(registered) = profile.auth.device_by_typed_pubkey(&normalised_key) {
+            registered.registration_id
+        } else {
+            let device = DeviceKey::new(
+                normalised_key.as_str().to_string(),
+                chosen.scope.clone(),
+                chosen.label.clone(),
+                i64::try_from(now).unwrap_or(0),
+            );
+            let registration_id = device.registration_id;
+            profile.add_device(device);
+            registration_id
+        };
     if !profile.auth.methods.contains(&AuthMethod::Keypair) {
         profile.auth.methods.push(AuthMethod::Keypair);
     }
@@ -497,6 +499,7 @@ async fn pair_device_redeem_reserved(
     Ok(AdminResponseBody::PairTokenRedeemed(PairTokenRedeemed {
         principal,
         public_key_fingerprint: fingerprint,
+        registration_id,
         key_id: key_id.into_inner(),
     }))
 }
