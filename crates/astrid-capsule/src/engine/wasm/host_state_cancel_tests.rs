@@ -805,6 +805,7 @@ async fn identity_creation_holds_principal_admission_through_storage() {
     let entered = Arc::new(tokio::sync::Barrier::new(2));
     let release = Arc::new(tokio::sync::Barrier::new(2));
     let backend = Arc::new(BlockingSetStore {
+        block_first_set: std::sync::atomic::AtomicBool::new(true),
         inner: MemoryKvStore::new(),
         entered: Arc::clone(&entered),
         release: Arc::clone(&release),
