@@ -5,6 +5,27 @@ use astrid_core::PrincipalUid;
 use super::*;
 use crate::{KvQuotaResolver, StateOwner, open_runtime_principal_store};
 
+#[test]
+fn relative_paths_preserve_the_directory_and_exact_utf8_suffix() {
+    let root = FilesystemPath::root();
+    let base = root.join("home/私").unwrap();
+    assert_eq!(base.join("").unwrap(), base);
+    for suffix in [".profile", "..name", "...", "資料/.隠し", "a.../🛰"] {
+        assert_eq!(root.join(suffix).unwrap().as_str(), suffix);
+        assert_eq!(
+            base.join(suffix).unwrap().as_str(),
+            format!("home/私/{suffix}")
+        );
+    }
+    for suffix in [
+        ".", "..", "./x", "x/..", "x/./y", "/x", "x//y", "x/", "a\0b",
+    ] {
+        assert!(
+            matches!(base.join(suffix), Err(FilesystemError::InvalidPath(raw)) if raw == suffix)
+        );
+    }
+}
+
 #[tokio::test]
 async fn canonical_append_uses_durable_proof_and_survives_reopen() {
     let (directory, filesystem) = filesystem().await;

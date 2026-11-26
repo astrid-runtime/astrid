@@ -6,6 +6,8 @@
 //! implicit. Mutations publish through the same owner-root compare-and-swap as
 //! content and KV state.
 
+mod path_validation;
+
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 use std::sync::{Arc, OnceLock};
@@ -35,19 +37,20 @@ impl FilesystemPath {
     /// on host path normalization for authority.
     pub fn new(value: impl Into<String>) -> Result<Self, FilesystemError> {
         let value = value.into();
-        if value.is_empty() {
-            return Ok(Self::root());
-        }
-        if value.starts_with('/') || value.ends_with('/') || value.as_bytes().contains(&0) {
-            return Err(FilesystemError::InvalidPath(value));
-        }
-        if value
-            .split('/')
-            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
-        {
+        if !path_validation::is_canonical(value.as_bytes()) {
             return Err(FilesystemError::InvalidPath(value));
         }
         Ok(Self(value))
+    }
+
+    /// Resolve a relative content name below this directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation error as [`Self::new`] for an invalid suffix.
+    pub fn join(&self, raw: &str) -> Result<Self, FilesystemError> {
+        let relative = Self::new(raw)?;
+        Ok(Self(path_validation::join(self.as_str(), relative.0)))
     }
 
     /// Borrow the canonical relative spelling. The root is the empty string.

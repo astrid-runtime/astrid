@@ -250,7 +250,7 @@ impl AstridStorageVfs {
         }
         let mut current = FilesystemPath::root();
         for segment in prefix.as_str().split('/') {
-            current = Self::join(&current, segment)?;
+            current = current.join(segment).map_err(map_filesystem_error)?;
             match self.filesystem.stat(&current) {
                 Ok(entry) if entry.kind() == FilesystemEntryKind::Directory => continue,
                 Ok(_) => {
@@ -286,24 +286,9 @@ impl AstridStorageVfs {
             .ok_or(VfsError::InvalidHandle)
     }
 
-    fn parse_relative(raw: &str) -> VfsResult<FilesystemPath> {
-        FilesystemPath::new(raw.to_owned()).map_err(map_filesystem_error)
-    }
-
-    fn join(base: &FilesystemPath, raw: &str) -> VfsResult<FilesystemPath> {
-        let relative = Self::parse_relative(raw)?;
-        if relative.as_str().is_empty() {
-            return Ok(base.clone());
-        }
-        if base.as_str().is_empty() {
-            return Ok(relative);
-        }
-        Self::parse_relative(&format!("{}/{}", base.as_str(), relative.as_str()))
-    }
-
     async fn path_for(&self, handle: &DirHandle, raw: &str) -> VfsResult<FilesystemPath> {
         let base = self.dir_path(handle).await?;
-        Self::join(&base, raw)
+        base.join(raw).map_err(map_filesystem_error)
     }
 
     async fn file_entry(
@@ -401,7 +386,7 @@ impl Vfs for AstridStorageVfs {
         // existing HostVfs contract; fs-mkdir performs its own parent check.
         let mut current = FilesystemPath::root();
         for segment in path.as_str().split('/') {
-            current = Self::join(&current, segment)?;
+            current = current.join(segment).map_err(map_filesystem_error)?;
             match self.filesystem.stat(&current) {
                 Ok(entry) if entry.kind() == FilesystemEntryKind::Directory => continue,
                 Ok(_) => {

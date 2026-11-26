@@ -120,8 +120,15 @@ Seven adapter tests cover owner isolation, a foreign handle, independent
 open handles and cancellation of a waiting close while a write holds admission.
 The synchronization argument relies on Tokio lock semantics and the inspected
 production call sites. Machine-checked refinement still needs
-to establish ownership at mount installation, directory-handle resolution,
-path composition and durable backend publication.
+to establish ownership at mount installation, directory-handle resolution and durable backend publication.
+
+For logical storage paths, the production validator checks all UTF-8 bytes. A
+nonempty name has no NUL, leading, trailing or doubled separator, or complete
+`.` or `..` component. The directory join preserves the complete base and
+suffix, inserting one slash when both are nonempty. A checked composition
+lemma establishes that joining two canonical nonempty byte names this way
+preserves canonicality. The root is the empty spelling. The byte-level lemma
+and string-level executable contract rely on Rust UTF-8 string semantics.
 
 ## Guest key-value storage
 

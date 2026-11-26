@@ -9,6 +9,9 @@ mod storage_file;
 #[path = "../crates/astrid-capsule/src/engine/wasm/storage_handles.rs"]
 mod storage_handles;
 
+#[path = "../crates/astrid-storage/src/filesystem/path_validation.rs"]
+mod path_validation;
+
 #[path = "../crates/astrid-capsule/src/engine/wasm/mount_selection.rs"]
 mod mount_selection;
 
