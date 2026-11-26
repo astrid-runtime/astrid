@@ -115,6 +115,33 @@ pub struct DeviceStamp<'a> {
     pub registration: Option<Uuid>,
 }
 
+/// Device authority retained by an asynchronous consumer of an IPC envelope.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnedDeviceStamp {
+    fingerprint: Option<String>,
+    registration: Option<Uuid>,
+}
+
+impl From<DeviceStamp<'_>> for OwnedDeviceStamp {
+    fn from(stamp: DeviceStamp<'_>) -> Self {
+        Self {
+            fingerprint: stamp.fingerprint.map(str::to_owned),
+            registration: stamp.registration,
+        }
+    }
+}
+
+impl OwnedDeviceStamp {
+    /// Borrow the original fingerprint and registration together.
+    #[must_use]
+    pub fn as_stamp(&self) -> DeviceStamp<'_> {
+        DeviceStamp {
+            fingerprint: self.fingerprint.as_deref(),
+            registration: self.registration,
+        }
+    }
+}
+
 /// A cross-boundary message sent over the event bus between WASM guests and the host.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IpcMessage {

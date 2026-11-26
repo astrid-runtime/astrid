@@ -15,7 +15,7 @@ use crate::kernel_router::{
 
 pub(super) struct AdminAuthorizationContext<'a> {
     pub(super) caller: &'a PrincipalId,
-    pub(super) device_key_id: Option<&'a str>,
+    pub(super) device: astrid_events::ipc::DeviceStamp<'a>,
     pub(super) method: &'static str,
     pub(super) required_cap: &'static str,
     pub(super) target_principal: Option<&'a PrincipalId>,
@@ -50,7 +50,7 @@ async fn record_admin_authorization_failure(
             caller: context.caller,
             method: context.method,
             required_cap: context.required_cap,
-            device_key_id: context.device_key_id,
+            device_key_id: context.device.fingerprint,
             target_principal: context.target_principal.cloned(),
             params: context.audit_params.cloned(),
             authorization: AuthorizationProof::Denied {
@@ -74,7 +74,7 @@ pub(super) async fn record_admin_request_failure(
             caller: context.caller,
             method: context.method,
             required_cap: context.required_cap,
-            device_key_id: context.device_key_id,
+            device_key_id: context.device.fingerprint,
             target_principal: context.target_principal.cloned(),
             params: context.audit_params.cloned(),
             authorization: allowed_admin_authorization(context),
@@ -92,7 +92,7 @@ pub(super) async fn authorize_admin_request(
     let authorization = match admit_management_request(
         kernel,
         context.caller,
-        context.device_key_id,
+        context.device,
         context.required_cap,
     )
     .await
@@ -145,7 +145,7 @@ pub(super) async fn authorize_admin_request(
             caller: context.caller,
             method: context.method,
             required_cap: context.required_cap,
-            device_key_id: context.device_key_id,
+            device_key_id: context.device.fingerprint,
             target_principal: context.target_principal.cloned(),
             params: context.audit_params.cloned(),
             authorization: allowed_admin_authorization(context),

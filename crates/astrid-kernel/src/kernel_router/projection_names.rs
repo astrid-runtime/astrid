@@ -18,7 +18,7 @@ use tracing::warn;
 use super::caller::{MANAGEMENT_CALLER_REQUIRED, resolve_caller};
 use super::{
     AdminAuditEntry, admit_management_request, publish_response, record_admin_audit,
-    resolve_device_key_id, response_topic_for,
+    response_topic_for,
 };
 
 const REQUIRED_CAPABILITY: &str = "system:status";
@@ -56,7 +56,7 @@ pub(super) async fn try_handle(
                 kernel,
                 response_topic_for(&message.topic),
                 message.principal.as_deref().unwrap_or("anonymous"),
-                message.device_key_id.as_deref(),
+                message.device_stamp(),
                 KernelResponse::Error("invalid projection-name diagnostic request".to_owned()),
             );
             return true;
@@ -75,7 +75,7 @@ pub(super) async fn try_handle(
                 kernel,
                 response_topic_for(&message.topic),
                 message.principal.as_deref().unwrap_or("anonymous"),
-                message.device_key_id.as_deref(),
+                message.device_stamp(),
                 KernelResponse::Error(MANAGEMENT_CALLER_REQUIRED.to_string()),
             );
             return true;
@@ -86,7 +86,7 @@ pub(super) async fn try_handle(
         kernel,
         message.topic.clone(),
         caller,
-        resolve_device_key_id(message),
+        message.device_stamp(),
         request.params.policy,
     )
     .await;
@@ -97,18 +97,12 @@ async fn handle(
     kernel: &Arc<crate::Kernel>,
     topic: Topic,
     caller: astrid_core::principal::PrincipalId,
-    device_key_id: Option<String>,
+    device: astrid_events::ipc::DeviceStamp<'_>,
     policy: ProjectionNamePolicyPreset,
 ) {
     let audit_params = Some(serde_json::json!({ "policy": policy }));
     let response_topic = response_topic_for(&topic);
-    if let Err(error) = admit_management_request(
-        kernel,
-        &caller,
-        device_key_id.as_deref(),
-        REQUIRED_CAPABILITY,
-    )
-    .await
+    if let Err(error) = admit_management_request(kernel, &caller, device, REQUIRED_CAPABILITY).await
     {
         let reason = error.to_string();
         record_admin_audit(
@@ -117,7 +111,7 @@ async fn handle(
                 caller: &caller,
                 method: PROJECTION_NAME_DIAGNOSTIC_METHOD,
                 required_cap: REQUIRED_CAPABILITY,
-                device_key_id: device_key_id.as_deref(),
+                device_key_id: device.fingerprint,
                 target_principal: None,
                 params: audit_params.clone(),
                 authorization: AuthorizationProof::Denied {
@@ -131,7 +125,7 @@ async fn handle(
             kernel,
             response_topic,
             caller.as_str(),
-            device_key_id.as_deref(),
+            device,
             KernelResponse::Error(reason),
         );
         return;
@@ -143,7 +137,7 @@ async fn handle(
             caller: &caller,
             method: PROJECTION_NAME_DIAGNOSTIC_METHOD,
             required_cap: REQUIRED_CAPABILITY,
-            device_key_id: device_key_id.as_deref(),
+            device_key_id: device.fingerprint,
             target_principal: None,
             params: audit_params,
             authorization: AuthorizationProof::System {
@@ -181,11 +175,5 @@ async fn handle(
         let _ = policy;
         KernelResponse::Error("projection-name diagnosis is unavailable on this host".to_owned())
     };
-    publish_response(
-        kernel,
-        response_topic,
-        caller.as_str(),
-        device_key_id.as_deref(),
-        response,
-    );
+    publish_response(kernel, response_topic, caller.as_str(), device, response);
 }

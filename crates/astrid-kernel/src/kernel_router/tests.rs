@@ -1357,6 +1357,48 @@ async fn capsule_visibility_uses_the_authorized_device_scope_snapshot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn kernel_inventory_requires_the_generation_stamped_before_repairing() {
+    let (_dir, kernel) = kernel_with_inventory_capsules().await;
+    let caller = PrincipalId::new("registered-device-admin").unwrap();
+    let before = seed_inventory_device_scopes(&kernel, &caller);
+    let original = capture_test_device(&kernel, &caller, Some(&before.full));
+    let after = seed_inventory_device_scopes(&kernel, &caller);
+    let current = capture_test_device(&kernel, &caller, Some(&after.full));
+    assert_eq!(original.fingerprint, current.fingerprint);
+    assert_ne!(original.registration, current.registration);
+    for denied in [
+        original,
+        astrid_events::ipc::DeviceStamp {
+            registration: None,
+            ..current
+        },
+        astrid_events::ipc::DeviceStamp {
+            fingerprint: None,
+            ..current
+        },
+    ] {
+        let result = request_kernel_with_stamp(
+            &kernel,
+            &caller,
+            denied,
+            "retired",
+            KernelRequest::ListCapsules,
+        )
+        .await;
+        assert!(matches!(result, KernelResponse::Error(_)), "{result:?}");
+    }
+    let result = request_kernel_with_stamp(
+        &kernel,
+        &caller,
+        current,
+        "current",
+        KernelRequest::ListCapsules,
+    )
+    .await;
+    assert!(matches!(result, KernelResponse::Success(_)), "{result:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn device_scope_denials_do_not_expose_key_resolution() {
     let (_dir, kernel) = kernel_with_inventory_capsules().await;
     let caller = PrincipalId::new("device-denial-oracle").expect("valid principal");
@@ -1657,10 +1699,42 @@ async fn request_kernel(
     request_kernel_for_device(kernel, caller, None, suffix, request).await
 }
 
+pub(super) fn capture_test_device<'a>(
+    kernel: &crate::Kernel,
+    caller: &PrincipalId,
+    fingerprint: Option<&'a str>,
+) -> astrid_events::ipc::DeviceStamp<'a> {
+    let registration = fingerprint.and_then(|id| {
+        kernel
+            .profile_cache
+            .resolve(caller)
+            .ok()?
+            .auth
+            .device_by_key_id(id)?
+            .registration_id
+            .map(Into::into)
+    });
+    astrid_events::ipc::DeviceStamp {
+        fingerprint,
+        registration,
+    }
+}
+
 async fn request_kernel_for_device(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
     device_key_id: Option<&str>,
+    suffix: &str,
+    request: KernelRequest,
+) -> KernelResponse {
+    let device = capture_test_device(kernel, caller, device_key_id);
+    request_kernel_with_stamp(kernel, caller, device, suffix, request).await
+}
+
+async fn request_kernel_with_stamp(
+    kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
+    device: astrid_events::ipc::DeviceStamp<'_>,
     suffix: &str,
     request: KernelRequest,
 ) -> KernelResponse {
@@ -1674,7 +1748,8 @@ async fn request_kernel_for_device(
         kernel.session_id.0,
     );
     msg.principal = Some(caller.as_str().to_string());
-    msg.device_key_id = device_key_id.map(str::to_owned);
+    msg.device_key_id = device.fingerprint.map(str::to_owned);
+    msg.device_registration_id = device.registration;
     let _ = kernel.event_bus.publish(astrid_events::AstridEvent::Ipc {
         metadata: astrid_events::EventMetadata::new("test"),
         message: msg,
@@ -1686,6 +1761,7 @@ async fn request_kernel_for_device(
             if let astrid_events::AstridEvent::Ipc { message, .. } = &*event
                 && let IpcPayload::RawJson(val) = &message.payload
             {
+                assert_eq!(message.device_stamp(), device);
                 return serde_json::from_value(val.clone())
                     .expect("response deserializes as KernelResponse");
             }
@@ -1872,7 +1948,7 @@ async fn retiring_principal_cannot_admit_management_with_a_live_profile() {
         },
     );
     assert!(
-        super::admit_management_request(&kernel, &caller, None, "system:status")
+        super::admit_management_request(&kernel, &caller, Default::default(), "system:status")
             .await
             .is_ok()
     );
@@ -1881,7 +1957,7 @@ async fn retiring_principal_cannot_admit_management_with_a_live_profile() {
         .begin_principal_retirement(caller.clone())
         .await;
     assert!(matches!(
-        super::admit_management_request(&kernel, &caller, None, "system:status").await,
+        super::admit_management_request(&kernel, &caller, Default::default(), "system:status").await,
         Err(super::ManagementAdmissionError::Retiring(principal)) if principal == caller,
     ));
 }

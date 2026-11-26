@@ -37,6 +37,8 @@ The management wire API defines 20 `KernelRequest` variants and 48
 The admin listener also dispatches agent derivation before deserializing the
 admin enum. The two variant counts therefore do not exhaust management ingress.
 
+Ordinary requests, typed admin requests subject to capability admission, agent derivation, and the projection-name diagnostic pass the device fingerprint and registration from the IPC envelope into the common management admission check. The scope and public key used for authorization come from the same selected profile record. Production calls the checked registration selector on that record. A generation without a fingerprint denies admission. Token redemption has its own authorization path. Management errors, keepalives and terminal responses retain the request stamp. A bus regression replaces a registration for the same key and checks both the authorization outcome and the response stamp. This establishes the decision at admission. The remaining obligations include ordering individual management effects with acknowledged retirement and binding each final transport delivery to the recipient registration.
+
 The ordinary kernel router matches every `KernelRequest` variant in
 `request_policy::request_principal`. Install, install-batch and targeted
 metadata dispatch reuse the explicit principal selected for admission.

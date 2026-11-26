@@ -135,7 +135,13 @@ async fn terminal_install_response_skips_queued_keepalives() {
         KernelResponse::Working,
         KernelResponse::Error("expected terminal refusal".into()),
     ] {
-        super::publish_response(&kernel, topic.clone(), "default", None, response);
+        super::publish_response(
+            &kernel,
+            topic.clone(),
+            "default",
+            Default::default(),
+            response,
+        );
     }
     assert!(matches!(
         terminal_install_response(&mut responses).await,
@@ -221,7 +227,7 @@ async fn check_install_authority(grants: &[&str], allowed: bool, secret: Option<
         &mut super::install_batch::InstallBatchRegistry::default(),
         topic,
         caller,
-        None,
+        Default::default(),
         request,
     )
     .await;

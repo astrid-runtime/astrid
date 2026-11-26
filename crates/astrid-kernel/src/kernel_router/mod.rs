@@ -127,20 +127,19 @@ pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> astrid_runtime:
                                 &kernel,
                                 response_topic_for(&message.topic),
                                 message.principal.as_deref().unwrap_or("anonymous"),
-                                message.device_key_id.as_deref(),
+                                message.device_stamp(),
                                 KernelResponse::Error(MANAGEMENT_CALLER_REQUIRED.to_string()),
                             );
                             continue;
                         },
                     };
-                    let device_key_id = resolve_device_key_id(message);
                     handle_request(
                         &kernel,
                         &mut rate_limiter,
                         &mut install_batches,
                         message.topic.clone(),
                         caller,
-                        device_key_id,
+                        message.device_stamp(),
                         req,
                     )
                     .await;
@@ -183,16 +182,17 @@ async fn handle_request(
     install_batches: &mut install_batch::InstallBatchRegistry,
     topic: Topic,
     caller: PrincipalId,
-    device_key_id: Option<String>,
+    device: astrid_events::ipc::DeviceStamp<'_>,
     req: KernelRequest,
 ) {
+    let device_key_id = device.fingerprint;
     let response_topic = response_topic_for(&topic);
     let Some(_work) = kernel.runtime_work.admit() else {
         publish_response(
             kernel,
             response_topic,
             caller.as_str(),
-            device_key_id.as_deref(),
+            device,
             KernelResponse::Error("runtime is shutting down".to_owned()),
         );
         return;
@@ -210,7 +210,7 @@ async fn handle_request(
         .filter(|_| scope == AuthorityScope::Global);
     let required_cap = required_capability(&req, scope);
     let install_authorization =
-        admit_management_request(kernel, &caller, device_key_id.as_deref(), required_cap).await;
+        admit_management_request(kernel, &caller, device, required_cap).await;
     // Install secrets are staged in the host-wide Shared namespace, not the
     // target principal's namespace. Install permission must never substitute
     // for the same global env authority required by an explicit Shared write.
@@ -244,7 +244,7 @@ async fn handle_request(
                     caller: &caller,
                     method,
                     required_cap,
-                    device_key_id: device_key_id.as_deref(),
+                    device_key_id,
                     target_principal: requested_target.cloned(),
                     params: None,
                     authorization: AuthorizationProof::Denied {
@@ -258,7 +258,7 @@ async fn handle_request(
                 kernel,
                 response_topic,
                 caller.as_str(),
-                device_key_id.as_deref(),
+                device,
                 KernelResponse::Error(e.to_string()),
             );
             return;
@@ -285,7 +285,7 @@ async fn handle_request(
                             caller: &caller,
                             method,
                             required_cap,
-                            device_key_id: device_key_id.as_deref(),
+                            device_key_id,
                             target_principal: requested_target.cloned(),
                             params: None,
                             authorization: authorization_proof.clone(),
@@ -297,7 +297,7 @@ async fn handle_request(
                         kernel,
                         response_topic,
                         caller.as_str(),
-                        device_key_id.as_deref(),
+                        device,
                         KernelResponse::Error(reason),
                     );
                     return;
@@ -327,7 +327,7 @@ async fn handle_request(
                 caller: &caller,
                 method,
                 required_cap,
-                device_key_id: device_key_id.as_deref(),
+                device_key_id,
                 target_principal: requested_target.cloned(),
                 params: None,
                 authorization: authorization_proof,
@@ -339,7 +339,7 @@ async fn handle_request(
             kernel,
             response_topic,
             caller.as_str(),
-            device_key_id.as_deref(),
+            device,
             KernelResponse::Error(reason),
         );
         return;
@@ -354,7 +354,7 @@ async fn handle_request(
                 caller: &caller,
                 method,
                 required_cap,
-                device_key_id: device_key_id.as_deref(),
+                device_key_id,
                 target_principal: requested_target.cloned(),
                 params: None,
                 authorization: authorization_proof,
@@ -373,12 +373,7 @@ async fn handle_request(
     // across every request — no per-endpoint config. Dropped before each
     // terminal publish below so the terminal frame is never preceded by a late
     // redundant ping.
-    let pinger = KeepalivePinger::spawn(
-        kernel,
-        response_topic.clone(),
-        &caller,
-        device_key_id.as_deref(),
-    );
+    let pinger = KeepalivePinger::spawn(kernel, response_topic.clone(), &caller, device);
     let res = match req {
         KernelRequest::BeginCapsuleInstallBatch { members, .. } => {
             let target = explicit.as_ref().unwrap_or(&caller);
@@ -592,7 +587,7 @@ async fn handle_request(
                 kernel,
                 response_topic.clone(),
                 caller.as_str(),
-                device_key_id.as_deref(),
+                device,
                 KernelResponse::Success(serde_json::json!({"status": "shutting_down"})),
             );
             // Signal the daemon's main loop to exit gracefully.
@@ -644,13 +639,7 @@ async fn handle_request(
     // Stop the keepalive before the terminal frame so it isn't preceded by a
     // late redundant `Working`.
     drop(pinger);
-    publish_response(
-        kernel,
-        response_topic,
-        caller.as_str(),
-        device_key_id.as_deref(),
-        res,
-    );
+    publish_response(kernel, response_topic, caller.as_str(), device, res);
 }
 
 fn schedule_reload_capsules(kernel: Arc<crate::Kernel>) -> bool {
@@ -697,17 +686,6 @@ async fn unregister_failed_capsules(kernel: &crate::Kernel) {
     for (principal, id) in failed {
         let _ = reg.unregister_for(&principal, &id);
     }
-}
-
-/// Resolve the authenticating device `key_id` from an incoming [`IpcMessage`].
-///
-/// Host-derived metadata stamped by the socket per-connection registry or the
-/// gateway-signed bearer (never a client-controlled field). `Some(key_id)`
-/// means the request authenticated with a specific registered device, whose
-/// scope the cap-gate applies as an attenuation floor; `None` means an
-/// unattenuated full-principal request (every legacy / unpaired connection).
-fn resolve_device_key_id(message: &IpcMessage) -> Option<String> {
-    message.device_key_id.clone()
 }
 
 /// Authorization inputs pinned at the request's policy decision point.
@@ -767,11 +745,13 @@ impl std::fmt::Display for ManagementAdmissionError {
 async fn admit_management_request(
     kernel: &crate::Kernel,
     caller: &PrincipalId,
-    device_key_id: Option<&str>,
+    device: astrid_events::ipc::DeviceStamp<'_>,
     required_cap: &str,
 ) -> Result<AuthorizedRequest, ManagementAdmissionError> {
-    let authorization = authorize_request(kernel, caller, device_key_id, required_cap)
-        .map_err(ManagementAdmissionError::Policy)?;
+    let authorization = authorize_with(kernel, caller, required_cap, |profile| {
+        device_scope::resolve_stamp(profile, caller, device, required_cap)
+    })
+    .map_err(ManagementAdmissionError::Policy)?;
     if kernel.capabilities.is_principal_retiring(caller).await {
         return Err(ManagementAdmissionError::Retiring(caller.clone()));
     }
@@ -790,6 +770,19 @@ fn authorize_request(
     caller: &PrincipalId,
     device_key_id: Option<&str>,
     required_cap: &str,
+) -> Result<AuthorizedRequest, PermissionError> {
+    authorize_with(kernel, caller, required_cap, |profile| {
+        resolve_device(profile, caller, device_key_id, required_cap)
+    })
+}
+
+fn authorize_with(
+    kernel: &crate::Kernel,
+    caller: &PrincipalId,
+    required_cap: &str,
+    device_for: impl FnOnce(
+        &PrincipalProfile,
+    ) -> Result<Option<&astrid_core::profile::DeviceKey>, PermissionError>,
 ) -> Result<AuthorizedRequest, PermissionError> {
     let profile = match kernel.profile_cache.resolve(caller) {
         Ok(p) => p,
@@ -825,7 +818,7 @@ fn authorize_request(
     }
     let groups = kernel.groups.load_full();
 
-    let device = resolve_device(profile.as_ref(), caller, device_key_id, required_cap)?;
+    let device = device_for(&profile)?;
     let device_scope = device.map(|device| device.scope.clone());
     let authenticated_device_id = device
         .map(|device| astrid_core::profile::DeviceKeyId::new(device.key_id.clone()))

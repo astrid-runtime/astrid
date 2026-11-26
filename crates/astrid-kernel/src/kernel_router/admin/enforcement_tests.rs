@@ -478,6 +478,9 @@ async fn send_admin_scoped(
     let mut msg = IpcMessage::new(topic, IpcPayload::RawJson(payload), kernel.session_id.0);
     msg.principal = Some(caller.as_str().to_string());
     msg.device_key_id = device_key_id.map(str::to_owned);
+    msg.device_registration_id =
+        crate::kernel_router::tests::capture_test_device(kernel, caller, device_key_id)
+            .registration;
     let _ = kernel.event_bus.publish(astrid_events::AstridEvent::Ipc {
         metadata: astrid_events::EventMetadata::new("test"),
         message: msg,

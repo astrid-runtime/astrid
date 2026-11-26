@@ -31,6 +31,35 @@ pub(super) fn resolve_device<'a>(
     device_key_id: Option<&str>,
     required_cap: &str,
 ) -> Result<Option<&'a DeviceKey>, PermissionError> {
+    resolve_key(caller, device_key_id, required_cap, |key| {
+        profile.active_device(&key)
+    })
+}
+
+/// Resolve the exact registration observed by the authenticating transport.
+pub(super) fn resolve_stamp<'a>(
+    profile: &'a PrincipalProfile,
+    caller: &PrincipalId,
+    stamp: astrid_events::ipc::DeviceStamp<'_>,
+    required_cap: &str,
+) -> Result<Option<&'a DeviceKey>, PermissionError> {
+    if stamp.fingerprint.is_none() && stamp.registration.is_some() {
+        return Err(PermissionError::DeviceScopeDenied {
+            principal: caller.clone(),
+            required: required_cap.to_owned(),
+        });
+    }
+    resolve_key(caller, stamp.fingerprint, required_cap, |key| {
+        profile.active_registration(&key, stamp.registration)
+    })
+}
+
+fn resolve_key<'a>(
+    caller: &PrincipalId,
+    device_key_id: Option<&str>,
+    required_cap: &str,
+    lookup: impl FnOnce(DeviceKeyId<&str>) -> Option<&'a DeviceKey>,
+) -> Result<Option<&'a DeviceKey>, PermissionError> {
     let Some(raw_key_id) = device_key_id else {
         return Ok(None);
     };
@@ -51,7 +80,7 @@ pub(super) fn resolve_device<'a>(
             });
         },
     };
-    let Some(device) = profile.active_device(&key_id) else {
+    let Some(device) = lookup(key_id) else {
         warn!(
             security_event = true,
             principal = %caller,
