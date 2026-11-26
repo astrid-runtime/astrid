@@ -157,6 +157,10 @@ async fn self_scoped_admin_device_cannot_assign_its_resource_user() {
         1,
     );
     let key = device.key_id.clone();
+    profile
+        .auth
+        .methods
+        .push(astrid_core::profile::AuthMethod::Keypair);
     profile.auth.public_keys.push(device);
     profile.save_to_path(&path).unwrap();
     kernel.profile_cache.invalidate(&caller);
