@@ -134,9 +134,9 @@ pub(super) fn retire_entries<S>(entries: &mut [Entry<S>], owner: &str, key: &str
 
 /// Capture channel handles while the registry is still locked. The returned
 /// vector can be drained after the lock has been released.
-pub(super) fn retire_and_capture<S, T, F: Fn(&S) -> T>(
-    entries: &mut [Entry<S>], owner: &str, key: &str, capture: F,
-) -> (signals: Vec<T>)
+pub(super) fn retire_and_capture<'a, S, T, F: Fn(&S) -> T>(
+    entries: &mut [Entry<S>], owner: &'a str, key: &'a str, capture: F,
+) -> (batch: DrainBatch<'a, T>)
     requires
         forall|j: int| 0 <= j < old(entries).len() ==> old(entries)@[j].phase.consistent(),
         forall|s: &S| #[trigger] capture.requires((s,)),
@@ -144,11 +144,12 @@ pub(super) fn retire_and_capture<S, T, F: Fn(&S) -> T>(
         final(entries).len() == old(entries).len(),
         forall|j: int| 0 <= j < old(entries).len() ==>
             updated(old(entries)@[j], final(entries)@[j], owner, key),
-        exists|slots: Seq<usize>| slots.len() == signals.len() && slots.no_duplicates()
+        batch.identity() == (owner, key),
+        exists|slots: Seq<usize>| slots.len() == batch.handles().len() && slots.no_duplicates()
             && (forall|j: usize| #[trigger] slots.contains(j) ==
                 (j < old(entries).len() && target(old(entries)@[j as int], owner, key)))
             && (forall|k: int| 0 <= k < slots.len() ==>
-                capture.ensures((&old(entries)@[slots[k] as int].signal,), signals@[k])),
+                capture.ensures((&old(entries)@[slots[k] as int].signal,), batch.handles()[k])),
 {
     let slots = retire_entries(entries, owner, key);
     let mut signals = Vec::with_capacity(slots.len());
@@ -172,7 +173,7 @@ pub(super) fn retire_and_capture<S, T, F: Fn(&S) -> T>(
         i = i.saturating_add(1);
     }
     assert(slots@.no_duplicates());
-    signals
+    DrainBatch { owner, key, signals }
 }
 
 }
@@ -188,50 +189,72 @@ impl std::fmt::Debug for Phase {
 
 verus! {
 
-/// The cursor keeps the actual notification handles in their captured order.
-/// Only an affirmative observation on the current handle advances it.
-pub(super) struct DrainBatch<S> {
+/// The registry snapshot and the exact operation that selected its channels.
+pub(super) struct DrainBatch<'a, S> {
+    owner: &'a str,
+    key: &'a str,
     signals: Vec<S>,
-    confirmed: usize,
 }
 
-impl<S> DrainBatch<S> {
+/// Evidence that the native device registry observed all selected channels closed.
+#[derive(Debug)]
+pub struct DeviceRetirement<'a> {
+    owner: &'a str,
+    key: &'a str,
+}
+
+impl<'a> DeviceRetirement<'a> {
+    pub closed spec fn identity(&self) -> (&'a str, &'a str) { (self.owner, self.key) }
+
+    /// Principal whose device sessions were retired.
+    #[must_use]
+    pub fn principal(&self) -> (owner: &'a str)
+        ensures owner == self.identity().0,
+    { self.owner }
+
+    /// Registered key whose device sessions were retired.
+    #[must_use]
+    pub fn key_id(&self) -> (key: &'a str)
+        ensures key == self.identity().1,
+    { self.key }
+}
+
+impl<'a, S> DrainBatch<'a, S> {
+    pub(super) closed spec fn identity(&self) -> (&'a str, &'a str) { (self.owner, self.key) }
+
     pub(super) closed spec fn handles(&self) -> Seq<S> { self.signals@ }
-    pub(super) closed spec fn count(&self) -> nat { self.confirmed as nat }
 
-    pub(super) fn new(signals: Vec<S>) -> (batch: Self)
-        ensures batch.handles() == signals@, batch.count() == 0,
-    {
-        Self { signals, confirmed: 0 }
-    }
+    pub(super) fn signals(&self) -> (signals: &[S])
+        ensures signals@ == self.handles(),
+    { self.signals.as_slice() }
 
-    pub(super) fn pending(&self) -> (signal: Option<&S>)
-        requires self.count() <= self.handles().len(),
-        ensures match signal {
-            None => self.count() == self.handles().len(),
-            Some(s) => self.count() < self.handles().len() && *s == self.handles()[self.count() as int],
-        },
-    {
-        self.signals.get(self.confirmed)
-    }
-
-    pub(super) fn confirm<F: Fn(&S) -> bool>(&mut self, closed: F) -> (advanced: bool)
-        requires
-            old(self).count() <= old(self).handles().len(),
-            forall|s: &S| #[trigger] closed.requires((s,)),
+    /// A completed wait alone cannot mint a receipt. Observe closure on
+    /// every selected channel before releasing either response identifier.
+    pub(super) fn certify<F: Fn(&S) -> bool>(self, closed: F) -> (receipt: Option<DeviceRetirement<'a>>)
+        requires forall|s: &S| #[trigger] closed.requires((s,)),
         ensures
-            final(self).handles() == old(self).handles(),
-            final(self).count() == old(self).count() + if advanced { 1nat } else { 0nat },
-            final(self).count() <= final(self).handles().len(),
-            old(self).count() == old(self).handles().len() ==> !advanced,
-            old(self).count() < old(self).handles().len() ==>
-                closed.ensures((&old(self).handles()[old(self).count() as int],), advanced),
+            receipt matches Some(r) ==> r.identity() == self.identity(),
+            receipt.is_some() ==> forall|j: int| 0 <= j < self.handles().len() ==>
+                closed.ensures((&self.handles()[j],), true),
+            receipt.is_none() ==> exists|j: int| 0 <= j < self.handles().len() &&
+                closed.ensures((&self.handles()[j],), false),
     {
-        if self.confirmed >= self.signals.len() { return false; }
-        let signal = &self.signals[self.confirmed];
-        if !closed(signal) { return false; }
-        self.confirmed = self.confirmed.saturating_add(1);
-        true
+        let mut confirmed = 0usize;
+        while confirmed < self.signals.len()
+            invariant
+                confirmed <= self.signals.len(),
+                forall|s: &S| #[trigger] closed.requires((s,)),
+                forall|j: int| 0 <= j < confirmed ==> closed.ensures((&self.handles()[j],), true),
+            decreases self.signals.len() - confirmed,
+        {
+            let signal = &self.signals[confirmed];
+            if !closed(signal) {
+                assert(closed.ensures((&self.handles()[confirmed as int],), false));
+                return None;
+            }
+            confirmed = confirmed.saturating_add(1);
+        }
+        Some(DeviceRetirement { owner: self.owner, key: self.key })
     }
 }
 

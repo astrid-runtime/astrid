@@ -121,6 +121,25 @@ const ED25519_PUBKEY_HEX_LEN: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DeviceKeyId<S = String>(S);
 
+impl super::AuthConfig {
+    /// Remove the unique registration matching a validated fingerprint.
+    /// Missing or ambiguous fingerprints leave the configuration unchanged.
+    /// Removing the last key also disables the keypair method.
+    #[must_use]
+    pub fn remove_device<S: AsRef<str>>(&mut self, key: &DeviceKeyId<S>) -> Option<DeviceKeyId> {
+        let removed =
+            super::device_removal::remove_unique(&mut self.public_keys, key.as_str(), |device| {
+                device.key_id.as_str()
+            })?;
+        if self.public_keys.is_empty() {
+            self.methods
+                .retain(|method| *method != super::AuthMethod::Keypair);
+        }
+        // The removed record's fingerprint equals the validated selector.
+        Some(DeviceKeyId(removed.key_id))
+    }
+}
+
 impl<S: AsRef<str>> DeviceKeyId<S> {
     /// Create a validated device key handle.
     ///
@@ -612,6 +631,19 @@ mod tests {
             DeviceScope::Full => panic!("use-only must be Scoped, got DeviceScope::Full"),
         }
         assert_eq!(DeviceScope::preset("nonexistent"), None);
+    }
+
+    #[test]
+    fn ambiguous_device_removal_preserves_records_and_authentication_methods() {
+        let device = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+        let id = DeviceKeyId::new(device.key_id.clone()).unwrap();
+        let mut config = crate::profile::AuthConfig {
+            methods: vec![crate::profile::AuthMethod::Keypair],
+            public_keys: vec![device.clone(), device.clone()],
+        };
+        assert!(config.remove_device(&id).is_none());
+        assert_eq!(config.public_keys, [device.clone(), device]);
+        assert_eq!(config.methods, [crate::profile::AuthMethod::Keypair]);
     }
 
     #[test]

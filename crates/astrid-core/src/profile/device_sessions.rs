@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
 mod phase;
-use phase::{DrainBatch, Entry, Phase};
+pub use phase::DeviceRetirement;
+use phase::{Entry, Phase};
 
 use super::DeviceKeyId;
 use crate::PrincipalId;
@@ -67,7 +68,19 @@ impl DeviceSessions {
         principal: &PrincipalId,
         key: &DeviceKeyId,
     ) -> Result<(), DeviceSessionError> {
-        let drains = {
+        self.retire_with_receipt(principal, key).await.map(|_| ())
+    }
+
+    /// Retire sessions and return the principal and key certified by the registry.
+    ///
+    /// # Errors
+    /// Fails if closure cannot be established for all selected channels.
+    pub async fn retire_with_receipt<'a>(
+        &self,
+        principal: &'a PrincipalId,
+        key: &'a DeviceKeyId,
+    ) -> Result<DeviceRetirement<'a>, DeviceSessionError> {
+        let batch = {
             let mut entries = self.0.lock().map_err(|_| DeviceSessionError::Unavailable)?;
             entries.retain(|entry| !entry.signal.is_closed());
             phase::retire_and_capture(&mut entries, principal.as_str(), key.as_str(), |signal| {
@@ -75,14 +88,12 @@ impl DeviceSessions {
                 signal.clone()
             })
         };
-        let mut batch = DrainBatch::new(drains);
-        while let Some(signal) = batch.pending() {
+        for signal in batch.signals() {
             signal.closed().await;
-            if !batch.confirm(watch::Sender::is_closed) {
-                return Err(DeviceSessionError::Unavailable);
-            }
         }
-        Ok(())
+        batch
+            .certify(watch::Sender::is_closed)
+            .ok_or(DeviceSessionError::Unavailable)
     }
 }
 
@@ -109,7 +120,42 @@ impl DeviceChallenge {
     }
 }
 
+// Rust drops fields in declaration order. This also covers a connection
+// discarded before the returned future is polled for the first time.
+struct ServingSession<Start> {
+    start: Start,
+    session: DeviceSession,
+}
+
+impl<Start> ServingSession<Start> {
+    async fn run<F: Future<Output = ()>>(mut self)
+    where
+        Start: FnOnce() -> F,
+    {
+        // The select owns the work and only borrows the receiver. Cancellation
+        // drops the select and its work before releasing the receiver.
+        tokio::select! {
+            biased;
+            () = self.session.retired() => {},
+            () = (self.start)() => {},
+        }
+    }
+}
+
 impl DeviceSession {
+    /// Own the serving future and release its transport and pending operations
+    /// before the registry can observe this session closed.
+    pub fn serve<F: Future<Output = ()>>(
+        self,
+        start: impl FnOnce() -> F,
+    ) -> impl Future<Output = ()> {
+        ServingSession {
+            start,
+            session: self,
+        }
+        .run()
+    }
+
     /// Resolves on retirement, including retirement before the first poll.
     pub async fn retired(&mut self) {
         let _ = self.0.wait_for(|retired| *retired).await;

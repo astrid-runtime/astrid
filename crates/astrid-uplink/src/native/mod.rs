@@ -111,15 +111,11 @@ impl ConnectionRuntime {
                 }
             },
         };
-        let serving = self.serve_authenticated(stream, handshake_permit, identity, shutdown);
-        if let Some(mut session) = session {
-            tokio::select! {
-                biased;
-                () = session.retired() => {},
-                () = serving => {},
-            }
+        let serve = || self.serve_authenticated(stream, handshake_permit, identity, shutdown);
+        if let Some(session) = session {
+            session.serve(serve).await;
         } else {
-            serving.await;
+            serve().await;
         }
     }
 

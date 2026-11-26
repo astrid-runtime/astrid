@@ -46,7 +46,9 @@ NATIVE_QUEUE = Path("crates/astrid-uplink/src/native/delivery_queue.rs")
 NATIVE_REPLY = Path("crates/astrid-uplink/src/native/reply_claim.rs")
 NATIVE_FRAME = Path("crates/astrid-uplink/src/native/frame_segments.rs")
 DEVICE_SESSIONS = Path("crates/astrid-core/src/profile/device_sessions/phase.rs")
+DEVICE_REMOVAL = Path("crates/astrid-core/src/profile/device_removal.rs")
 INPUTS = [
+    DEVICE_REMOVAL,
     DEVICE_SESSIONS,
     NATIVE_FRAME,
     NATIVE_REPLY,
@@ -386,17 +388,37 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
         (
             "acknowledgement skips the first registered device session",
             DEVICE_SESSIONS,
-            lambda text: replace_once(text, "signals, confirmed: 0", "signals, confirmed: 1"),
+            lambda text: replace_once(text, "let mut confirmed = 0usize;", "let mut confirmed = 1usize;"),
         ),
         (
             "retirement confirms a socket whose receiver is still live",
             DEVICE_SESSIONS,
-            lambda text: replace_once(text, "if !closed(signal) { return false; }", "if false { return false; }"),
+            lambda text: replace_once(text, "if !closed(signal) {", "if false {"),
         ),
         (
             "device retirement captures another registration's channel",
             DEVICE_SESSIONS,
             lambda text: replace_once(text, "capture(&entries[slot].signal)", "capture(&entries[0].signal)"),
+        ),
+        (
+            "native revocation receipt acknowledges another device",
+            DEVICE_SESSIONS,
+            lambda text: replace_once(text, "owner: self.owner, key: self.key", "owner: self.owner, key: self.owner"),
+        ),
+        (
+            "native revocation receipt checks the first channel twice",
+            DEVICE_SESSIONS,
+            lambda text: replace_once(text, "&self.signals[confirmed]", "&self.signals[0]"),
+        ),
+        (
+            "profile removal selects an unrelated key",
+            DEVICE_REMOVAL,
+            lambda text: replace_once(text, "if k == requested {", "if k != requested {"),
+        ),
+        (
+            "profile removal drops the first record instead of its unique match",
+            DEVICE_REMOVAL,
+            lambda text: replace_once(text, "registrations.remove(index)", "registrations.remove(0)"),
         ),
         (
             "disabled profile supplies device keys",

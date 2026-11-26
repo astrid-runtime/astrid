@@ -220,17 +220,30 @@ the keys excluded before plus the removed key. A challenge for another
 principal retains its exclusions. Binding a previously excluded key fails.
 An established entry retains its owner, bound key and channel. The capture
 callback receives the channel of each established entry matching both
-principal and key, once per entry. The batch cursor exposes successive
-captured handles. It advances only on an affirmative observation of closure
-for the current handle and reports exhaustion after all handles have advanced.
+principal and key, once per entry. The same verified routine binds the selected handles to the requested
+principal and key. After awaiting receiver closure, the adapter submits that
+batch for certification. A successful receipt requires an affirmative closure
+observation on every handle and carries exactly the batch's principal and key.
+Failure to certify requires a negative observation on at least one handle.
+The kernel builds the revocation response from the receipt's key.
 
-The Rust adapter signals and clones the selected Tokio senders while holding
-the mutex. After releasing it, the adapter awaits receiver closure and checks
-`is_closed` on each selected sender. The kernel returns its acknowledgement
-after successful retirement. The proof assumes the hash-set library contracts.
-Composition with the mutex, Tokio channel identity, scheduling, drop order,
-profile persistence and the kernel response path still requires refinement.
-Previously accepted OS bytes may arrive after local retirement. Whole-principal
+Profile removal scans the actual registered records using their fingerprint
+field. The checked routine removes the unique match and preserves the order
+and contents of every survivor. An absent or ambiguous match leaves the
+vector unchanged. The adapter disables the keypair method when the set becomes
+empty and uses the removed record's fingerprint for session retirement.
+
+The signed native socket's serving future and its session receiver have a
+single owner. Its field order and the Tokio select scope release the work
+before the receiver on completion, retirement or task cancellation. A runtime
+regression observes destructor order on those paths and before the first poll.
+The argument relies on Rust destruction semantics, Tokio channel identity and
+closure, the profile fingerprint projection, filesystem behavior and the OS
+transport. It does not yet prove the complete concurrent transition or the
+response serialization. Previously accepted OS bytes may arrive after local
+retirement. On Unix, profile replacement syncs the temporary file and then
+renames it. A parent-directory durability barrier for power-loss recovery is
+still outstanding. Whole-principal
 deletion, alias reuse and Wasmtime socket resources have separate obligations.
 
 | Native effect | Production path | Outstanding refinement |

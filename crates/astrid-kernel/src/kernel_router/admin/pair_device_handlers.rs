@@ -553,7 +553,7 @@ pub(crate) async fn pair_device_revoke(
     principal: &PrincipalId,
     key_id: &str,
 ) -> AdminResponseBody {
-    let key_id = match DeviceKeyId::new(key_id.to_owned()) {
+    let key_id = match DeviceKeyId::new(key_id) {
         Ok(key_id) => key_id,
         Err(e) => return err_bad_input(e),
     };
@@ -569,23 +569,11 @@ pub(crate) async fn pair_device_revoke(
         Err(e) => return err_internal(format!("profile load failed: {e}")),
     };
 
-    let before = profile.auth.public_keys.len();
-    profile
-        .auth
-        .public_keys
-        .retain(|k| k.key_id != key_id.as_str());
-    if profile.auth.public_keys.len() == before {
+    let Some(removed_key) = profile.auth.remove_device(&key_id) else {
         return err_bad_input(format!(
             "no paired device with key_id {key_id} on principal {principal}"
         ));
-    }
-
-    // If that was the last keypair, drop the Keypair auth method so the
-    // profile's declared auth surface matches its registered keys (mirrors the
-    // add-side logic in redeem).
-    if profile.auth.public_keys.is_empty() {
-        profile.auth.methods.retain(|m| *m != AuthMethod::Keypair);
-    }
+    };
 
     if let Err(e) = profile.validate() {
         return err_internal(format!("profile rejected after device removal: {e}"));
@@ -594,21 +582,28 @@ pub(crate) async fn pair_device_revoke(
         return err_internal(format!("profile save failed: {e}"));
     }
     kernel.profile_cache.invalidate(principal);
-    if let Err(error) = kernel.device_sessions.retire(principal, &key_id).await {
-        return err_internal(format!(
-            "device removed but session retirement failed: {error}"
-        ));
-    }
+    let receipt = match kernel
+        .device_sessions
+        .retire_with_receipt(principal, &removed_key)
+        .await
+    {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            return err_internal(format!(
+                "device removed but session retirement failed: {error}"
+            ));
+        },
+    };
 
     info!(
-        principal = %principal,
-        key_id = %key_id,
+        principal = receipt.principal(),
+        key_id = receipt.key_id(),
         security_event = true,
         "Layer 6 auth.pair.revoke"
     );
 
     AdminResponseBody::PairDeviceRevoked {
-        key_id: key_id.to_string(),
+        key_id: receipt.key_id().to_owned(),
     }
 }
 
