@@ -2339,7 +2339,7 @@ impl ExecutionEngine for WasmEngine {
                 ingress_device_key_id: None,
                 ingress_request_owner: None,
                 ingress_origin: None,
-            ingress_socket: None,
+                ingress_socket: None,
                 // Run-loop epoch-interrupt state. `recv_yielded` is set true by
                 // a cooperative recv/accept or completed nonzero sleep; the
                 // bound run-loop's epoch callback reads + clears it to

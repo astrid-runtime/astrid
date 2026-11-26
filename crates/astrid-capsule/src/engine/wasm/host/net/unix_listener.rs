@@ -108,7 +108,7 @@ impl HostUnixListener for HostState {
             None
         };
 
-        // The handshake yields `Some((principal, device_key_id))` for a
+        // The handshake yields `Some((principal, device_key_id, session))` for a
         // crypto-authenticated connection — the device id rides forward so the
         // cap-gate can scope it — or `None` for a legacy/unauthenticated peer.
         let (stream, verified_identity) = loop {

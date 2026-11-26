@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use astrid_capsule::context::WorkspaceSource;
 use astrid_capsule::registry::{RuntimeScope, WasmHash};
@@ -21,19 +21,25 @@ use astrid_storage::CapsulePackage;
 
 /// `build_capsule_runtime` records only the uniquely named test capsule. A
 /// global slot keeps the capture independent of Tokio worker-thread hops.
-static WORKSPACE_SOURCE_CAPTURE: OnceLock<Mutex<Option<WorkspaceSource>>> = OnceLock::new();
-
-fn workspace_source_capture() -> &'static Mutex<Option<WorkspaceSource>> {
-    WORKSPACE_SOURCE_CAPTURE.get_or_init(|| Mutex::new(None))
+struct CapturedContext {
+    workspace_source: WorkspaceSource,
+    sessions: astrid_core::profile::device_sessions::DeviceSessions,
 }
 
-pub(super) fn record_workspace_source(capsule_name: &str, source: &WorkspaceSource) {
-    if capsule_name != "hosted-portal-runtime-selection" {
-        return;
+static CONTEXT_CAPTURE: Mutex<Option<CapturedContext>> = Mutex::new(None);
+
+pub(super) fn record_capsule_context(
+    capsule_name: &str,
+    ctx: &astrid_capsule::context::CapsuleContext,
+) {
+    if capsule_name == "hosted-portal-runtime-selection" {
+        *CONTEXT_CAPTURE
+            .lock()
+            .expect("capsule context capture lock") = Some(CapturedContext {
+            workspace_source: ctx.workspace_source.clone(),
+            sessions: ctx.device_sessions.clone(),
+        });
     }
-    *workspace_source_capture()
-        .lock()
-        .expect("workspace source capture lock") = Some(source.clone());
 }
 
 pub(super) fn publish_without_running_lifecycle(
@@ -87,13 +93,6 @@ pub(super) fn publish_without_running_lifecycle(
             .clone(),
     );
     publish_package(&store, uid, inspection.capsule_id.as_str(), &package)
-}
-
-fn take_workspace_source() -> Option<WorkspaceSource> {
-    workspace_source_capture()
-        .lock()
-        .expect("workspace source capture lock")
-        .take()
 }
 
 async fn seed_isolated_principal(
@@ -250,7 +249,7 @@ async fn workspace_portal_discovery_and_runtime_keep_the_selected_hosted_portal(
     let portal_capsule = portal_capsules.join("portal-capsule");
     std::fs::create_dir_all(&portal_capsule).unwrap();
     write_manifest(&portal_capsule, "portal-capsule");
-    let _ = take_workspace_source();
+    CONTEXT_CAPTURE.lock().unwrap().take();
 
     let discovered = astrid_capsule::discovery::discover_manifests_in_workspace(
         None,
@@ -290,14 +289,30 @@ async fn workspace_portal_discovery_and_runtime_keep_the_selected_hosted_portal(
             runtime_id,
         )
         .await;
+    let captured = CONTEXT_CAPTURE
+        .lock()
+        .unwrap()
+        .take()
+        .expect("constructed runtime context");
+    let principal = PrincipalId::default();
+    let key = astrid_core::DeviceKeyId::new("abcdef0123456789".to_owned()).unwrap();
+    let challenge = captured.sessions.challenge(principal.clone()).unwrap();
+    kernel
+        .device_sessions()
+        .retire(&principal, &key)
+        .await
+        .unwrap();
+    assert!(matches!(
+        challenge.bind(key),
+        Err(astrid_core::profile::device_sessions::DeviceSessionError::Retired)
+    ));
     let Some(mut capsule) = runtime.ok() else {
         // An implementation may reject a portal it cannot isolate. That is
         // secure; only a successful load is required to preserve the selected
         // HostedPortal source.
         return;
     };
-    let captured = take_workspace_source().expect("runtime source capture");
-    match captured {
+    match captured.workspace_source {
         WorkspaceSource::HostedPortal(root) => assert_eq!(
             std::fs::canonicalize(root).expect("canonical runtime workspace source"),
             std::fs::canonicalize(portal.path()).expect("canonical selected portal root")

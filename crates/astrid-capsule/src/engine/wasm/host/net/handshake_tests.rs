@@ -351,3 +351,7 @@ async fn handshake_bad_signature_fails_closed() {
         "a bad signature must fail the handshake, never fall back to unauthenticated"
     );
 }
+
+#[cfg(unix)]
+#[path = "handshake_tests/listener_retirement.rs"]
+mod listener_retirement;

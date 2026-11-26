@@ -42,7 +42,7 @@ impl HostState {
         dashmap::DashMap::new()
     }
 
-    /// Track inbound client lifecycle events for this Store's resource table.
+    /// Track unsigned inbound client lifecycles in this Store's resource table.
     #[must_use]
     pub fn new_client_connections() -> dashmap::DashMap<u32, astrid_core::principal::PrincipalId> {
         dashmap::DashMap::new()

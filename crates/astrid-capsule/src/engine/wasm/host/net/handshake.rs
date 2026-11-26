@@ -53,10 +53,10 @@ const MAX_HANDSHAKE_SIZE: usize = 4096;
 /// challenge path is unit-testable against a tempdir-backed home (the crate
 /// is `#![deny(unsafe_code)]`, so env mutation in tests is impossible).
 ///
-/// Returns `Ok(Some((principal, key_id)))` when the client signed a valid
+/// Returns `Ok(Some((principal, key_id, session)))` when the client signed a valid
 /// challenge for a registered key (`key_id` is the matched [`DeviceKey`]'s
 /// fingerprint, carried forward so the cap-gate can apply that device's
-/// scope), `Ok(None)` for a legacy/unauthenticated handshake, or
+/// scope, and `session` carries the retirement signal), `Ok(None)` for a legacy/unauthenticated handshake, or
 /// `Err(reason)` with a human-readable rejection reason.
 pub(crate) async fn validate_handshake<S>(
     stream: &mut S,
@@ -157,8 +157,8 @@ where
 /// principal: issue a random nonce, read the signed second frame, and verify
 /// the signature against a registered key.
 ///
-/// Returns the verified [`PrincipalId`] paired with the `key_id` of the
-/// matched [`DeviceKey`] on success, or `Err(reason)` on any failure
+/// Returns the verified [`PrincipalId`], matched device fingerprint and live
+/// session on success, or `Err(reason)` on any failure
 /// (unknown/disabled principal, missing/invalid signature). Sends an
 /// `authentication failed` response before returning an error so the client
 /// observes a uniform rejection. The `key_id` carries the matched device's
