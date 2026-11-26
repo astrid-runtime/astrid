@@ -27,10 +27,8 @@ impl HostState {
 
     /// Build a fresh, empty per-connection client-lifecycle registry.
     ///
-    /// Distinct from [`new_connection_principals`](Self::new_connection_principals):
-    /// `client_connections` maps a stream rep to the verified principal alone
-    /// (no device id) for the connect/disconnect counter, whereas
-    /// `connection_principals` carries the device-aware [`ConnectionIdentity`].
+    /// Unsigned inbound streams use this map to balance connect and disconnect.
+    /// A signed stream keeps its lifecycle identity on its live transport.
     /// Out-of-pool constructors (lifecycle hooks, the hook handler, tests) use
     /// this so they do not have to name the `dashmap` type.
     #[must_use]

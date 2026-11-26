@@ -16,12 +16,9 @@
 //! the real principal, disconnect decremented `anonymous` (a saturating no-op),
 //! and the real principal's counter leaked `+1` per connection, unbounded.
 //!
-//! Emitting from the host fixes this at the root: the host holds the
-//! handshake-verified principal for the connection's whole lifetime (stored in
-//! [`HostState::client_connections`](crate::engine::wasm::host_state::HostState::client_connections)),
-//! so connect AND disconnect carry the IDENTICAL host-verified principal and
-//! the counter balances. A legacy/unauthenticated peer balances on the reserved
-//! `anonymous` identity.
+//! For a signed peer, the live transport owns the handshake principal through
+//! disconnect. The Store tracks unsigned inbound peers in its lifecycle map
+//! under the reserved anonymous principal. Both events use the same identity.
 //!
 //! SECURITY INVARIANT: the stamped principal is ALWAYS the host-verified one
 //! recorded at the handshake — never a value supplied by guest/capsule code.

@@ -141,7 +141,7 @@ impl Kernel {
             ctx = ctx.with_hosted_portal(project_root);
         }
         #[cfg(test)]
-        capsule_adversarial_tests::record_workspace_source(&capsule_name, &ctx.workspace_source);
+        capsule_adversarial_tests::record_capsule_context(&capsule_name, &ctx);
         capsule.load(&ctx).await?;
         #[cfg(test)]
         ingress_readiness::tests::pause_after_load(&capsule_name).await;
