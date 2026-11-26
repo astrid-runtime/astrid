@@ -10,6 +10,7 @@ use super::codec::{
     validate_record_version, wal_physical_limit,
 };
 use super::measurement::{self, Entry};
+use super::physical_wire::{Extent, extent};
 use super::types::{
     WalBeginDescriptor, WalError, WalEvent, WalLength, WalLimits, WalObjectDescriptor, WalOffset,
     WalOrdinal, WalRecordKind, WalResumeState, WalRootDescriptor, WalScanTail, WalSequence,
@@ -142,7 +143,7 @@ where
         let Ok(physical) = decode_physical_header(&header, record_offset) else {
             return self.bad_physical(record_offset);
         };
-        let payload_len = physical.payload_len;
+        let payload_len = WalLength::new(physical.size);
         let limit = wal_physical_limit(self.limits).length();
         let payload_start = self
             .offset
@@ -152,39 +153,40 @@ where
             )
             .ok_or(WalError::LengthOverflow { value: payload_len })?;
         let file_len = stream_len_at(&mut self.reader, payload_start)?;
-        let payload_end = payload_start
-            .checked_add(payload_len.get())
-            .ok_or(WalError::LengthOverflow { value: payload_len })?;
-        if payload_end > file_len {
-            if has_valid_physical_after(
-                &mut self.reader,
-                record_offset.get().saturating_add(1),
-                self.limits,
-            )? {
-                return Err(WalError::InteriorCorruption {
+        let payload_end = match extent(payload_start, physical.size, file_len, limit.get()) {
+            Extent::Complete(end) => end,
+            Extent::Overflow => return Err(WalError::LengthOverflow { value: payload_len }),
+            Extent::Incomplete => {
+                if has_valid_physical_after(
+                    &mut self.reader,
+                    record_offset.get().saturating_add(1),
+                    self.limits,
+                )? {
+                    return Err(WalError::InteriorCorruption {
+                        offset: record_offset,
+                        detail: "incomplete WAL record before a later record",
+                    });
+                }
+                return Ok(self.tail_or_end(record_offset, WalTailKind::Incomplete, true));
+            },
+            Extent::Oversized => {
+                if has_valid_physical_after(
+                    &mut self.reader,
+                    record_offset.get().saturating_add(1),
+                    self.limits,
+                )? {
+                    return Err(WalError::InteriorCorruption {
+                        offset: record_offset,
+                        detail: "oversized WAL record before a later record",
+                    });
+                }
+                return Err(WalError::FrameTooLarge {
                     offset: record_offset,
-                    detail: "incomplete WAL record before a later record",
+                    declared: payload_len,
+                    limit,
                 });
-            }
-            return Ok(self.tail_or_end(record_offset, WalTailKind::Incomplete, true));
-        }
-        if payload_len > limit {
-            if has_valid_physical_after(
-                &mut self.reader,
-                record_offset.get().saturating_add(1),
-                self.limits,
-            )? {
-                return Err(WalError::InteriorCorruption {
-                    offset: record_offset,
-                    detail: "oversized WAL record before a later record",
-                });
-            }
-            return Err(WalError::FrameTooLarge {
-                offset: record_offset,
-                declared: payload_len,
-                limit,
-            });
-        }
+            },
+        };
         let payload_size = payload_len.as_usize()?;
         let mut payload = Vec::new();
         payload
@@ -483,22 +485,21 @@ where
         kind: WalTailKind,
         force_tail: bool,
     ) -> Option<WalEvent> {
-        if self.active.is_some() || force_tail {
-            let tail_offset = self
-                .active
-                .as_ref()
-                .map_or(offset, |active| active.begin_offset);
-            self.resume_offset = Some(tail_offset);
-            self.active = None;
-            self.finished = true;
-            return Some(WalEvent::Tail(WalScanTail {
-                offset: tail_offset,
-                kind,
-            }));
-        }
-        self.resume_offset = Some(offset);
+        use super::interior::{Boundary, boundary};
+        let active_begin = self.active.as_ref().map(|active| active.begin_offset.get());
         self.finished = true;
-        None
+        match boundary(active_begin, offset.get(), force_tail) {
+            Boundary::Tail(begin) => {
+                let offset = WalOffset::new(begin);
+                self.resume_offset = Some(offset);
+                self.active = None;
+                Some(WalEvent::Tail(WalScanTail { offset, kind }))
+            },
+            Boundary::End(end) => {
+                self.resume_offset = Some(WalOffset::new(end));
+                None
+            },
+        }
     }
 }
 
@@ -563,12 +564,8 @@ fn stream_len_at<R: Seek>(reader: &mut R, restore: u64) -> Result<u64, WalError>
     Ok(length)
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "interior physical recovery must keep its bounded byte-stream state together"
-)]
 fn has_valid_physical_after<R: Read + Seek>(
-    mut reader: &mut R,
+    reader: &mut R,
     start: u64,
     limits: WalLimits,
 ) -> Result<bool, WalError> {
@@ -582,103 +579,73 @@ fn has_valid_physical_after<R: Read + Seek>(
             operation: "read ASTWAL2 length",
             source,
         })?;
-    let mut candidate = start;
-    while candidate < file_len {
-        reader
-            .seek(SeekFrom::Start(candidate))
-            .map_err(|source| WalError::Io {
-                operation: "seek ASTWAL2 interior candidate",
-                source,
-            })?;
-        let mut first = [0_u8; 1];
-        if !read_probe(&mut reader, &mut first, "read ASTWAL2 interior candidate")? {
-            break;
-        }
-        if first[0] != WAL_MAGIC[0] {
-            candidate = candidate.checked_add(1).ok_or(WalError::CountOverflow {
-                field: "candidate offsets",
-            })?;
-            continue;
-        }
-        let mut header = [0_u8; PHYSICAL_HEADER_LEN];
-        header[0] = first[0];
-        if !read_probe(
-            &mut reader,
-            &mut header[1..],
-            "read ASTWAL2 interior header",
-        )? {
-            candidate = candidate.checked_add(1).ok_or(WalError::CountOverflow {
-                field: "candidate offsets",
-            })?;
-            continue;
-        }
-        let offset = WalOffset::new(candidate);
-        let Ok(physical) = super::codec::decode_physical_header(&header, offset) else {
-            candidate = candidate.checked_add(1).ok_or(WalError::CountOverflow {
-                field: "candidate offsets",
-            })?;
-            continue;
-        };
-        let end = candidate
-            .checked_add(
-                u64::try_from(PHYSICAL_HEADER_LEN)
-                    .map_err(|_| WalError::Encoding("WAL physical header length overflow"))?,
-            )
-            .and_then(|value| value.checked_add(physical.payload_len.get()));
-        let Some(end) = end else {
-            candidate = candidate.checked_add(1).ok_or(WalError::CountOverflow {
-                field: "candidate offsets",
-            })?;
-            continue;
-        };
-        if end <= file_len && physical.payload_len > wal_physical_limit(limits).length() {
-            reader
-                .seek(SeekFrom::Start(saved))
-                .map_err(|source| WalError::Io {
-                    operation: "restore ASTWAL2 cursor",
-                    source,
-                })?;
-            return Ok(true);
-        }
-        if end > file_len {
-            candidate = candidate.checked_add(1).ok_or(WalError::CountOverflow {
-                field: "candidate offsets",
-            })?;
-            continue;
-        }
-        let Ok(payload_len) = physical.payload_len.as_usize() else {
-            candidate = candidate.checked_add(1).ok_or(WalError::CountOverflow {
-                field: "candidate offsets",
-            })?;
-            continue;
-        };
-        let mut payload = Vec::new();
-        payload
-            .try_reserve_exact(payload_len)
-            .map_err(|_| WalError::Encoding("WAL interior allocation failed"))?;
-        payload.resize(payload_len, 0);
-        if read_probe(&mut reader, &mut payload, "read ASTWAL2 interior payload")?
-            && checksum_valid(physical, &payload)
-        {
-            reader
-                .seek(SeekFrom::Start(saved))
-                .map_err(|source| WalError::Io {
-                    operation: "restore ASTWAL2 cursor",
-                    source,
-                })?;
-            return Ok(true);
-        }
-        candidate = candidate.checked_add(1).ok_or(WalError::CountOverflow {
-            field: "candidate offsets",
-        })?;
-    }
+    let (reader, result) = super::interior::search(reader, start, file_len, |reader, offset| {
+        let probe = probe_candidate(reader, offset, file_len, limits);
+        (reader, probe)
+    });
+    let found = result.map_err(|(_, error)| error)?;
     reader
         .seek(SeekFrom::Start(saved))
         .map_err(|source| WalError::Io {
             operation: "restore ASTWAL2 cursor",
             source,
         })?;
-    Ok(false)
+    Ok(found.is_some())
+}
+
+fn probe_candidate<R: Read + Seek>(
+    reader: &mut R,
+    candidate: u64,
+    file_len: u64,
+    limits: WalLimits,
+) -> Result<super::interior::Probe, WalError> {
+    use super::interior::Probe;
+    reader
+        .seek(SeekFrom::Start(candidate))
+        .map_err(|source| WalError::Io {
+            operation: "seek ASTWAL2 interior candidate",
+            source,
+        })?;
+    let mut header = [0u8; PHYSICAL_HEADER_LEN];
+    if !read_probe(reader, &mut header[..1], "read ASTWAL2 interior candidate")? {
+        return Ok(Probe::End);
+    }
+    if header[0] != WAL_MAGIC[0]
+        || !read_probe(reader, &mut header[1..], "read ASTWAL2 interior header")?
+    {
+        return Ok(Probe::Miss);
+    }
+    let Ok(physical) = decode_physical_header(&header, WalOffset::new(candidate)) else {
+        return Ok(Probe::Miss);
+    };
+    let Some(start) = candidate.checked_add(PHYSICAL_HEADER_LEN as u64) else {
+        return Ok(Probe::Miss);
+    };
+    match extent(
+        start,
+        physical.size,
+        file_len,
+        wal_physical_limit(limits).length().get(),
+    ) {
+        Extent::Oversized => return Ok(Probe::Found),
+        Extent::Overflow | Extent::Incomplete => return Ok(Probe::Miss),
+        Extent::Complete(_) => {},
+    }
+    let Ok(size) = WalLength::new(physical.size).as_usize() else {
+        return Ok(Probe::Miss);
+    };
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(size)
+        .map_err(|_| WalError::Encoding("WAL interior allocation failed"))?;
+    payload.resize(size, 0);
+    if read_probe(reader, &mut payload, "read ASTWAL2 interior payload")?
+        && checksum_valid(physical, &payload)
+    {
+        Ok(Probe::Found)
+    } else {
+        Ok(Probe::Miss)
+    }
 }
 
 fn read_probe<R: Read>(

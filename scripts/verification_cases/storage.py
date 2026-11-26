@@ -1,0 +1,315 @@
+"""Implementation mutations for storage verification."""
+
+from pathlib import Path
+from .common import (
+    BINDING,
+    GUEST_AUTHORITY,
+    KV_ENCODING,
+    OVERLAY,
+    OVERLAY_UPDATE,
+    edit_function,
+    replace_once,
+)
+
+
+def defects():
+    return [
+        (
+            "publication accepts a mismatched forward binding",
+            BINDING,
+            lambda text: replace_once(text, "f.as_slice() != uid.as_slice() || ", ""),
+        ),
+        (
+            "publication accepts a mismatched reverse binding",
+            BINDING,
+            lambda text: replace_once(text, " || r != alias", ""),
+        ),
+        (
+            "WAL physical header accepts unknown versions",
+            Path("crates/astrid-storage/src/engine/durable/wal/physical_wire.rs"),
+            lambda source: replace_once(source, "|| !(header[8] == 1 || header[8] == 2)", "|| header[8] == 0"),
+        ),
+        (
+            "WAL physical checksum compares a prefix",
+            Path("crates/astrid-storage/src/engine/durable/wal/physical_wire.rs"),
+            lambda source: replace_once(source, "sum.as_slice() != self.checksum.as_slice()", "sum[..16] != self.checksum[..16]"),
+        ),
+        (
+            "WAL physical seal writes a legacy version for compressed data",
+            Path("crates/astrid-storage/src/engine/durable/wal/physical_wire.rs"),
+            lambda source: replace_once(source, "let header = Envelope { version:if flags == 0 {1} else {2}", "let header = Envelope { version:if flags == 0 {1} else {1}"),
+        ),
+        (
+            "WAL physical exact fit is discarded",
+            Path("crates/astrid-storage/src/engine/durable/wal/physical_wire.rs"),
+            lambda source: replace_once(source, "if end > file {", "if end >= file {"),
+        ),
+        (
+            "WAL physical scan skips an interior offset",
+            Path("crates/astrid-storage/src/engine/durable/wal/interior.rs"),
+            lambda source: replace_once(source, "at.saturating_add(1)", "at.saturating_add(2)"),
+        ),
+        (
+            "WAL physical tail resumes within the active transaction",
+            Path("crates/astrid-storage/src/engine/durable/wal/interior.rs"),
+            lambda source: replace_once(source, "Some(begin) => Boundary::Tail(begin),\n        None if damaged", "Some(_) => Boundary::Tail(cursor),\n        None if damaged"),
+        ),
+        (
+            "WAL physical probe loses its I/O error",
+            Path("crates/astrid-storage/src/engine/durable/wal/interior.rs"),
+            lambda source: replace_once(source, "return (reader,Err((at,error)));", "return (reader,Ok(None));"),
+        ),
+        (
+            "WAL measurement counts the wrong stored length",
+            Path("crates/astrid-storage/src/engine/durable/wal/measurement.rs"),
+            lambda source: replace_once(source, "(HEADER_LEN as u64).checked_add(body.len() as u64)", "(HEADER_LEN as u64).checked_add(0)"),
+        ),
+        (
+            "WAL measurement drops the Begin record",
+            Path("crates/astrid-storage/src/engine/durable/wal/measurement.rs"),
+            lambda source: replace_once(source, "sequence, logical: 1, objects: 0", "sequence, logical: 0, objects: 0"),
+        ),
+        (
+            "WAL measurement increments the wrong object counter",
+            Path("crates/astrid-storage/src/engine/durable/wal/measurement.rs"),
+            lambda source: replace_once(source, "next.objects = before.objects.checked_add", "next.roots = before.objects.checked_add"),
+        ),
+        (
+            "WAL measurement advances ordinal twice",
+            Path("crates/astrid-storage/src/engine/durable/wal/measurement.rs"),
+            lambda source: replace_once(source, "next.logical = before.logical.checked_add(1)", "next.logical = before.logical.checked_add(2)"),
+        ),
+        (
+            "WAL measurement digest drops the object flags",
+            Path("crates/astrid-storage/src/engine/durable/wal/measurement.rs"),
+            lambda source: replace_once(source, "header[2] = flags;", "header[2] = 0;"),
+        ),
+        (
+            "WAL measurement digest swaps ordinal and sequence",
+            Path("crates/astrid-storage/src/engine/durable/wal/measurement.rs"),
+            lambda source: replace_once(source, "little_endian(ordinal)", "little_endian(sequence)"),
+        ),
+        (
+            "stale KV view falls back to neutral and completes the request",
+            Path("verification/hosted_kv_model.rs"),
+            lambda source: replace_once(source, "Some(uid) => Some(Destination::Principal(uid)),\n                None => None,", "Some(uid) => Some(Destination::Principal(uid)),\n                None => Some(Destination::Neutral),"),
+        ),
+        (
+            "WAL Commit wire writes an object count in the root count slot",
+            Path("crates/astrid-storage/src/engine/durable/wal/commit_wire.rs"),
+            lambda source: replace_once(source, "body[24..32].copy_from_slice(&little_endian(self.counts.roots));",
+                                       "body[24..32].copy_from_slice(&little_endian(self.counts.objects));"),
+        ),
+        (
+            "WAL Commit validator accepts a different byte count",
+            Path("crates/astrid-storage/src/engine/durable/wal/commit_wire.rs"),
+            lambda source: replace_once(source, "if self.bytes != observed.bytes", "if self.bytes < observed.bytes"),
+        ),
+        (
+            "WAL Commit validator authenticates its own stored digest",
+            Path("crates/astrid-storage/src/engine/durable/wal/commit_wire.rs"),
+            lambda source: replace_once(source, "if !self.digest_matches(&digest)", "if !self.digest_matches(&self.digest)"),
+        ),
+        (
+            "WAL replay commits descriptors from another begin offset",
+            Path("crates/astrid-storage/src/engine/durable/wal/transaction.rs"),
+            lambda source: replace_once(source, " || batch.origin.offset != offset", ""),
+        ),
+        (
+            "WAL replay releases descriptors at an uncommitted tail",
+            Path("crates/astrid-storage/src/engine/durable/wal/transaction.rs"),
+            lambda source: replace_once(source, "Event::Tail => Ok(Step::End),",
+                                       "Event::Tail => match pending { Some(b) => Ok(Step::Committed(b)), None => Ok(Step::End) },"),
+        ),
+        (
+            "WAL record header repeats the sequence in the ordinal field",
+            Path("crates/astrid-storage/src/engine/durable/wal/record_wire.rs"),
+            lambda source: replace_once(source, "encoded.extend_from_slice(&self.ordinal);", "encoded.extend_from_slice(&self.sequence);"),
+        ),
+        (
+            "WAL scanner skips the first logical body byte",
+            Path("crates/astrid-storage/src/engine/durable/wal/record_wire.rs"),
+            lambda source: replace_once(source, "let body = &payload[HEADER_LEN..];", "let body = &payload[HEADER_LEN.saturating_add(1).min(payload.len())..];"),
+        ),
+        (
+            "WAL dispatch accepts a record with an old ordinal",
+            Path("crates/astrid-storage/src/engine/durable/wal/record_wire.rs"),
+            lambda source: replace_once(source, "if ordinal != expected_ordinal", "if ordinal > expected_ordinal"),
+        ),
+        (
+            "WAL writer binds a different prepared replacement",
+            Path("crates/astrid-storage/src/engine/durable/root_wire.rs"),
+            lambda source: replace_once(source, "!equal_root(replacement,next)", "!equal_root(replacement,replacement)"),
+        ),
+        (
+            "WAL sync failure leaves the writer usable",
+            Path("crates/astrid-storage/src/engine/durable/frontier.rs"),
+            lambda source: replace_once(source, "*poisoned = true;", "*poisoned = false;"),
+        ),
+        (
+            "successful WAL sync acknowledges an empty group",
+            Path("crates/astrid-storage/src/engine/durable/frontier.rs"),
+            lambda source: replace_once(source, "Ok(count)", "Ok(0)"),
+        ),
+        (
+            "WAL frontier rewinds to a shorter arena",
+            Path("crates/astrid-storage/src/engine/durable/frontier.rs"),
+            lambda source: replace_once(source, "Ordering::Less => None", "Ordering::Less => Some((observed, tail))"),
+        ),
+        (
+            "unchanged WAL frontier replaces the published tail",
+            Path("crates/astrid-storage/src/engine/durable/frontier.rs"),
+            lambda source: replace_once(source, "Ordering::Equal => Some((current, tail))", "Ordering::Equal => Some((current, pending))"),
+        ),
+        (
+            "transition journals record the construction in place of the algorithm",
+            Path("crates/astrid-storage/src/engine/durable/root_wire.rs"),
+            lambda source: replace_once(source, "bytes.extend_from_slice(&scheme.algorithm);", "bytes.extend_from_slice(&scheme.construction);"),
+        ),
+        (
+            "root payload reader skips the last byte of a field",
+            Path("crates/astrid-storage/src/engine/durable/root_wire.rs"),
+            lambda source: replace_once(source, "*cursor = end;", "*cursor = end.saturating_sub(1);"),
+        ),
+        (
+            "WAL transition accepts trailing bytes",
+            Path("crates/astrid-storage/src/engine/durable/root_wire.rs"),
+            lambda source: replace_once(source, "if *cursor != bytes.len()", "if *cursor > bytes.len()"),
+        ),
+        (
+            "durable principal encoded as fleet",
+            Path("crates/astrid-storage/src/principal_state/owner_codec.rs"),
+            lambda source: replace_once(source, "Self::Principal(id) => (1u8, id)", "Self::Principal(id) => (2u8, id)"),
+        ),
+        (
+            "owner recovery substitutes the first UID byte",
+            Path("crates/astrid-storage/src/principal_state/owner_codec.rs"),
+            lambda source: replace_once(source, "id[i] = bytes[i.saturating_add(1)]", "id[i] = bytes[1]"),
+        ),
+        (
+            "prepared root encodes a different expected root",
+            Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),
+            lambda source: replace_once(source, "encode(&owner,expected,replacement)?", "encode(&owner,None,replacement)?"),
+        ),
+        (
+            "WAL staging discards prepared journal bytes",
+            Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),
+            lambda source: replace_once(source, "write(&self.owner,self.expected,self.replacement,&self.journal)", "write(&self.owner,self.expected,self.replacement,&Vec::new())"),
+        ),
+        (
+            "durable root admission ignores the commit digest",
+            Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),
+            lambda source: replace_once(source, " || a.commit.as_slice() != b.commit.as_slice()", ""),
+        ),
+        (
+            "durable root admission accepts a mismatched generation",
+            Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),
+            lambda source: replace_once(source, "a.generation != b.generation || ", ""),
+        ),
+        (
+            "WAL replay publishes an already committed replacement",
+            Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),
+            lambda source: replace_once(source, "{ Replay::AlreadyPublished }", "{ Replay::Apply }"),
+        ),
+        (
+            "guest KV releases admission before invoking the sink",
+            Path("verification/hosted_kv_model.rs"),
+            lambda source: replace_once(
+                replace_once(source, "    tracker.finish();", ""),
+                "if !tracker.begin() { return None; }",
+                "if !tracker.begin() { return None; } tracker.finish();",
+            ),
+        ),
+        (
+            "KV completion fails to release its acquired owner count",
+            Path("verification/hosted_kv_model.rs"),
+            lambda source: replace_once(source, "    tracker.finish();", ""),
+        ),
+        (
+            "stale install ownership follows a reassigned alias",
+            BINDING,
+            lambda text: replace_once(text, "uid.as_slice() != observed.as_slice() => None",
+                                      "uid.as_slice() != observed.as_slice() => Some(observed)"),
+        ),
+        (
+            "ordered overlay replacement retains its old value",
+            OVERLAY_UPDATE,
+            lambda text: replace_once(text, "make_node(entry, node.left.clone(), node.right.clone())",
+                                      "make_node(Arc::clone(&node.entry), node.left.clone(), node.right.clone())"),
+        ),
+        (
+            "left rotation drops the inner subtree",
+            OVERLAY_UPDATE,
+            lambda text: edit_function(text, "rotate_left", "right.left.clone()", "None"),
+        ),
+        (
+            "right rotation drops the inner subtree",
+            OVERLAY_UPDATE,
+            lambda text: edit_function(text, "rotate_right", "left.right.clone()", "None"),
+        ),
+        (
+            "overlay drops an exact key including its tombstone",
+            OVERLAY,
+            lambda text: replace_once(text, "Ordering::Equal => return Some(&node.entry.value)", "Ordering::Equal => return None"),
+        ),
+        (
+            "overlay searches the wrong subtree",
+            OVERLAY,
+            lambda text: replace_once(text, "Ordering::Less => node.left.as_ref()", "Ordering::Less => node.right.as_ref()"),
+        ),
+        (
+            "checkpoint leaf ignores the lower fence",
+            KV_ENCODING,
+            lambda text: replace_once(text, "!bytewise_less(key, start) && bytewise_less(key, end)", "bytewise_less(key, end)"),
+        ),
+        (
+            "checkpoint traversal skips the last child",
+            KV_ENCODING,
+            lambda text: replace_once(text, "_ => bytewise_less(lower, end),", "None => false, _ => bytewise_less(lower, end),"),
+        ),
+        (
+            "byte order reverses strict-prefix ties",
+            KV_ENCODING,
+            lambda text: edit_function(text, "bytewise_cmp", "left.len().cmp(&right.len())", "right.len().cmp(&left.len())"),
+        ),
+        (
+            "prefix range includes sibling namespaces",
+            KV_ENCODING,
+            lambda text: edit_function(
+                text, "logical_prefix_range", "== (ns == other && matches_prefix(key, prefix))",
+                "== matches_prefix(key, prefix)",
+            ),
+        ),
+        (
+            "prefix range excludes the exact prefix",
+            KV_ENCODING,
+            lambda text: replace_once(text, "end[pivot] = byte.saturating_add(1);", "end[pivot] = byte;"),
+        ),
+        (
+            "prefix interval ignores its lower bound",
+            KV_ENCODING,
+            lambda text: edit_function(
+                text, "prefix_interval", "(!below(key, start) && below(key, end))", "below(key, end)"
+            ),
+        ),
+        (
+            "physical entry drops the requested key",
+            KV_ENCODING,
+            lambda text: replace_once(text, "address.extend_from_slice(key);", ""),
+        ),
+        (
+            "physical address loses namespace separation",
+            KV_ENCODING,
+            lambda text: replace_once(text, "address.push(0);", ""),
+        ),
+        (
+            "guest namespace can follow a replacement owner",
+            GUEST_AUTHORITY,
+            lambda text: replace_once(text, " && same_bytes(pinned.as_slice(), observed.as_slice())", ""),
+        ),
+        (
+            "guest owner can access a sibling namespace",
+            GUEST_AUTHORITY,
+            lambda text: replace_once(text, "same_bytes(admitted, requested) && ", ""),
+        ),
+    ]

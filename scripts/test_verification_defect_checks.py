@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import pathlib
 import re
 import tempfile
@@ -11,16 +10,10 @@ import unittest
 from unittest.mock import patch
 
 
-def load_script(name: str):
-    path = pathlib.Path(__file__).with_name(name)
-    spec = importlib.util.spec_from_file_location(name.removesuffix(".py"), path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-checks = load_script("verification_defect_checks.py")
+if __package__:
+    from . import verification_defect_checks as checks
+else:
+    import verification_defect_checks as checks
 
 TEXT = "\n".join(
     [

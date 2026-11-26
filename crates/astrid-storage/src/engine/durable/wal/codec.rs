@@ -10,14 +10,11 @@ use super::types::{
     WalPhysicalLimit, WalRecordKind, WalRootTransition, WalSequence,
 };
 
-/// ASTWAL2 physical magic.
-pub(super) const WAL_MAGIC: [u8; 8] = *b"ASTWAL2\0";
-/// Physical header width shared by every ASTWAL2 record.
-pub(super) const PHYSICAL_HEADER_LEN: usize = 52;
+pub(super) use super::physical_wire::{
+    Envelope as PhysicalHeader, MAGIC as WAL_MAGIC, WIDTH as PHYSICAL_HEADER_LEN,
+};
 /// Logical record header width inside each physical payload.
 pub(super) const RECORD_HEADER_LEN: usize = super::record_wire::HEADER_LEN;
-const LEGACY_VERSION: u16 = 1;
-const COMPRESSED_OBJECT_VERSION: u16 = 2;
 const BEGIN_FIXED_LEN: usize = 8;
 const DIGEST_DOMAIN: &str = "astrid durable transaction wal v2";
 pub(super) const OBJECT_FLAG_LZ4: u8 = 1;
@@ -48,14 +45,6 @@ pub(super) fn validate_logical_body(
         });
     }
     Ok(declared)
-}
-
-/// Parsed physical header fields.
-#[derive(Clone, Copy)]
-pub(super) struct PhysicalHeader {
-    pub(super) version: u16,
-    pub(super) payload_len: WalLength,
-    pub(super) checksum: [u8; 32],
 }
 
 /// Parsed logical record header fields.
@@ -109,16 +98,7 @@ pub(super) fn encode_physical_record_with_flags(
     encoded
         .try_reserve_exact(total_len)
         .map_err(|_| WalError::Encoding("WAL physical allocation failed"))?;
-    encoded.extend_from_slice(&WAL_MAGIC);
-    let version = if flags == 0 {
-        LEGACY_VERSION
-    } else {
-        COMPRESSED_OBJECT_VERSION
-    };
-    encoded.extend_from_slice(&version.to_le_bytes());
-    encoded.extend_from_slice(&0_u16.to_le_bytes());
-    encoded.extend_from_slice(&payload_len.get().to_le_bytes());
-    encoded.extend_from_slice(&[0_u8; 32]);
+    encoded.resize(PHYSICAL_HEADER_LEN, 0);
     super::record_wire::Header {
         kind: kind.tag(),
         flags,
@@ -127,12 +107,9 @@ pub(super) fn encode_physical_record_with_flags(
         ordinal: ordinal.get().to_le_bytes(),
     }
     .append(&mut encoded, body);
-    let checksum = frame_checksum(
-        WAL_MAGIC,
-        payload_len.get(),
-        &encoded[PHYSICAL_HEADER_LEN..],
-    );
-    encoded[20..PHYSICAL_HEADER_LEN].copy_from_slice(&checksum);
+    if !super::physical_wire::seal(&mut encoded, flags, frame_checksum) {
+        return Err(WalError::Encoding("WAL physical header is truncated"));
+    }
     Ok(encoded)
 }
 
@@ -141,29 +118,9 @@ pub(super) fn decode_physical_header(
     header: &[u8; PHYSICAL_HEADER_LEN],
     offset: super::types::WalOffset,
 ) -> Result<PhysicalHeader, WalError> {
-    let version = u16::from_le_bytes([header[8], header[9]]);
-    if header[..8] != WAL_MAGIC
-        || !matches!(version, LEGACY_VERSION | COMPRESSED_OBJECT_VERSION)
-        || header[10..12] != [0, 0]
-    {
-        return Err(WalError::Corrupt {
-            offset,
-            detail: "WAL physical header is invalid",
-        });
-    }
-    let payload_len =
-        u64::from_le_bytes(header[12..20].try_into().map_err(|_| WalError::Corrupt {
-            offset,
-            detail: "WAL physical length is truncated",
-        })?);
-    let checksum = header[20..].try_into().map_err(|_| WalError::Corrupt {
+    super::physical_wire::decode(header).ok_or(WalError::Corrupt {
         offset,
-        detail: "WAL checksum is truncated",
-    })?;
-    Ok(PhysicalHeader {
-        version,
-        payload_len: WalLength::new(payload_len),
-        checksum,
+        detail: "WAL physical header is invalid",
     })
 }
 
@@ -176,14 +133,7 @@ pub(super) fn validate_record_version(
     record: RecordHeader,
     offset: super::types::WalOffset,
 ) -> Result<(), WalError> {
-    let valid = match physical.version {
-        LEGACY_VERSION => record.flags == 0,
-        COMPRESSED_OBJECT_VERSION => {
-            record.kind == WalRecordKind::Object && record.flags == OBJECT_FLAG_LZ4
-        },
-        _ => false,
-    };
-    if !valid {
+    if !physical.accepts(record.kind, record.flags) {
         return Err(WalError::Corrupt {
             offset,
             detail: "WAL record features do not match its physical version",
@@ -194,7 +144,7 @@ pub(super) fn validate_record_version(
 
 /// Verify a payload checksum.
 pub(super) fn checksum_valid(header: PhysicalHeader, payload: &[u8]) -> bool {
-    frame_checksum(WAL_MAGIC, header.payload_len.get(), payload) == header.checksum
+    header.validates(payload, frame_checksum)
 }
 
 /// Parse the logical record header.

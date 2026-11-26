@@ -177,3 +177,33 @@ fn digest_matches_the_astwal2_transcript_across_record_boundaries() {
         assert_eq!(actual.finalize(), expected.finalize());
     }
 }
+
+#[test]
+fn incomplete_and_complete_oversized_candidates_have_different_recovery_boundaries() {
+    let limits = RecoveryLimits::new(128).unwrap();
+    let size = super::super::codec::wal_physical_limit(limits)
+        .length()
+        .get()
+        + 1;
+    let mut later = Vec::from(*b"ASTWAL2\0");
+    later.extend_from_slice(&[1, 0, 0, 0]);
+    later.extend_from_slice(&size.to_le_bytes());
+    // A complete oversized candidate stops truncation without a checksum read.
+    later.extend_from_slice(&[0; 32]);
+    later.resize(later.len() + usize::try_from(size).unwrap(), 0);
+    for gap in [1, 7, 52, 53] {
+        let mut image = vec![0; gap];
+        image.extend_from_slice(&later);
+        let mut full =
+            WalScanner::new(Cursor::new(&image), TestIdentity, TestCodec, limits).unwrap();
+        assert!(
+            matches!(full.next_event(), Err(WalError::InteriorCorruption { offset, .. }) if offset.get() == 0)
+        );
+        image.pop();
+        let mut truncated =
+            WalScanner::new(Cursor::new(&image), TestIdentity, TestCodec, limits).unwrap();
+        assert!(
+            matches!(truncated.next_event().unwrap(), Some(WalEvent::Tail(tail)) if tail.offset.get() == 0)
+        );
+    }
+}

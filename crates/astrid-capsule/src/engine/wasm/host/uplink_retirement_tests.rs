@@ -141,3 +141,30 @@ async fn uplink_send_preserves_selected_descriptor_and_reports_queue_refusal() {
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
     ));
 }
+
+#[tokio::test]
+async fn uplink_selector_holds_the_callers_runtime_guard_through_enqueue() {
+    let tracker = Arc::new(PrincipalInvocationTracker::default());
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.principal_invocations = Some(Arc::clone(&tracker));
+    let caller = state.effective_principal();
+    let admission = state.begin_host_operation().unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let sent = crate::engine::wasm::guest_uplink::send(
+        admission,
+        &[17u128, 23],
+        23,
+        "in flight",
+        |id| *id,
+        |held, id, content| {
+            tracker.retire(&caller);
+            assert!(held.as_ref().unwrap().belongs_to(&tracker, &caller));
+            assert_eq!(tracker.active(&caller), 1);
+            tx.try_send((*id, content)).unwrap();
+            assert_eq!(tracker.active(&caller), 1);
+        },
+    );
+    assert_eq!(sent, Some(()));
+    assert_eq!(tracker.active(&caller), 0);
+    assert_eq!(rx.try_recv().unwrap(), (23, "in flight"));
+}

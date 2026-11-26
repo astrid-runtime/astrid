@@ -108,6 +108,7 @@ impl uplink::Host for HostState {
                     content,
                 )
                 .build();
+                // The WIT represents an undeliverable message as an intentional drop.
                 Ok(tx.try_send(message).is_ok())
             },
         )

@@ -423,14 +423,16 @@ fn read_object_record<I: PersistentObjectIdentity>(
     let physical = decode_physical_header(&header, descriptor.offset()).map_err(durable_error)?;
     let expected_length = u64::try_from(PHYSICAL_HEADER_LEN)
         .ok()
-        .and_then(|header| header.checked_add(physical.payload_len.get()))
+        .and_then(|header| header.checked_add(physical.size))
         .ok_or(DurableError::EncodingOverflow)?;
     if expected_length != descriptor.length().get()
-        || physical.payload_len > wal_physical_limit(limits).length()
+        || physical.size > wal_physical_limit(limits).length().get()
     {
         return Err(corrupt_wal("WAL object descriptor length mismatch"));
     }
-    let payload_len = physical.payload_len.as_usize().map_err(durable_error)?;
+    let payload_len = super::types::WalLength::new(physical.size)
+        .as_usize()
+        .map_err(durable_error)?;
     let mut payload = Vec::new();
     payload
         .try_reserve_exact(payload_len)

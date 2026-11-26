@@ -102,6 +102,11 @@ mod wal_record_wire;
 use wal_record_wire as record_wire;
 #[path = "../crates/astrid-storage/src/engine/durable/wal/measurement.rs"]
 mod wal_measurement;
+#[path = "../crates/astrid-storage/src/engine/durable/wal/physical_wire.rs"]
+mod wal_physical_wire;
+#[path = "../crates/astrid-storage/src/engine/durable/wal/interior.rs"]
+mod wal_interior;
+mod hosted_wal_physical_model;
 #[path = "../crates/astrid-storage/src/engine/durable/root_wire.rs"]
 mod root_wire;
 
