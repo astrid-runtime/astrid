@@ -67,7 +67,7 @@ fn open_volume(
 fn failed_recovery_root_flush_preserves_committed_wal_for_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let volume: Arc<dyn AstridVolume> =
-        HostedFileVolume::open(&directory.path().join("astrid.volume")).unwrap();
+        HostedFileVolume::open(directory.path().join("astrid.volume")).unwrap();
     let engine = DurableEngine::open_volume_with_faults(
         Arc::clone(&volume),
         TestIdentity,
