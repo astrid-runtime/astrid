@@ -16,6 +16,7 @@ description = "Astrid micro-kernel, the core of the Astrid OS"
 # machinery) live in the target table below and are gated out on
 # `wasm32-unknown-unknown`.
 [dependencies]
+vstd = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 arc-swap = { workspace = true }

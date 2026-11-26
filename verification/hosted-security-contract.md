@@ -28,12 +28,36 @@ The production point-address encoder in `kv/encoding.rs` proves its output is th
 
 These results still depend on correct invocation provenance, the directory lookup, and backend confinement of each operation to its selected owner and key or prefix. An operation which already obtained its owner may finish against that owner. Serialization with deletion and reclamation, lifecycle retirement tracking, and the neutral system fallback remain runtime refinement obligations.
 
+## Management request targets
+
+The management wire API defines 20 `KernelRequest` variants and 48
+`AdminRequestKind` variants in `astrid-core/src/kernel_api/mod.rs`.
+The admin listener also dispatches agent derivation before deserializing the
+admin enum. The two variant counts therefore do not exhaust management ingress.
+
+The ordinary kernel router matches every `KernelRequest` variant in
+`request_policy::request_principal`. Install, install-batch and targeted
+metadata dispatch reuse the explicit principal selected for admission.
+The checked `AuthorityScope::for_target` function returns self scope exactly
+when the supplied caller and target bytes match and the shared-state flag is
+clear. Selected administrative requests use the same decision, including
+shared environment writes and deletes. Capability selection for each operation
+remains in `request_policy::required_capability` and
+`admin::required_capability_for_admin_request`. An explicit metadata read
+checks global list authority on the pinned profile, groups and device scope
+before constructing a cross-principal view.
+
+This proves scope classification for the supplied identities. The authenticated
+origin of the caller, alias-to-UID continuity through handlers, capability-table
+correctness and sink coverage still require production refinement. Invite and
+device redemption have separate admission paths.
+
 ## Native MCP network authority
 
 Native stdio MCP capsules requesting network domains or outbound TCP destinations fail during load. The process sandbox accepts only a Boolean network setting and cannot express the manifest's destination policy. Accepted native capsule configurations request networking disabled, including for uplinks. The scope of this decision is the capsule host engine. Standalone MCP server configurations and operator-selected sandbox policies require separate treatment in the hosted security argument.
 
 ## Evidence and trust
 
-The current verifier entry point imports eight production modules and an abstract model of grant and principal authority. Their contracts cover fuel arithmetic, per-principal operation tracking, static pattern matching and containment, token status transitions, the startup marker fold, guest owner selection, KV address encoding, and overlay lookup and update. The model's theorems state what every trace of the grant, tracker and fuel transitions preserves, conditional on the stated storage, settlement and lifecycle obligations: an acknowledged revocation keeps the grant revoked across recovery and an acknowledged consumption keeps it used, a revocation keeps the grant revoked until the next recovery whether or not its write completed, retirement keeps the principal closed until a resume, and committed fuel exceeds the budget only by the fuel charged beyond a promise. Its `apply_*` and `fuel_*` functions show that the production transitions compute the model's steps. The hosted backend regression exercises abrupt exit and reopening. Complete mediation of hosted effects and concurrent runtime refinement remain open.
+The current verifier entry point imports nine production modules and an abstract model of grant and principal authority. Their contracts cover fuel arithmetic, per-principal operation tracking, static pattern matching and containment, token status transitions, the startup marker fold, guest owner selection, KV address encoding, and overlay lookup and update. The model's theorems state what every trace of the grant, tracker and fuel transitions preserves, conditional on the stated storage, settlement and lifecycle obligations: an acknowledged revocation keeps the grant revoked across recovery and an acknowledged consumption keeps it used, a revocation keeps the grant revoked until the next recovery whether or not its write completed, retirement keeps the principal closed until a resume, and committed fuel exceeds the budget only by the fuel charged beyond a promise. Its `apply_*` and `fuel_*` functions show that the production transitions compute the model's steps. The hosted backend regression exercises abrupt exit and reopening. Complete mediation of hosted effects and concurrent runtime refinement remain open.
 
 The hosted security argument must state its assumptions about the OS, hardware, Wasmtime, cryptography, persistent storage, compiler and verifier. Release evidence must identify the source, build configuration, binary digest and proof result. Evidence about an installed instance must also identify the running binary and security-relevant configuration through a measurement mechanism whose trust assumptions are disclosed.

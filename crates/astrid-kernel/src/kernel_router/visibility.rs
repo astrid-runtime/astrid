@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use astrid_core::principal::PrincipalId;
 
-use super::AuthorizedRequest;
+use super::{AuthorityScope, AuthorizedRequest, PermissionError};
 
 pub(super) struct CapsuleVisibility {
     pub(super) principal: PrincipalId,
@@ -31,19 +31,27 @@ impl CapsuleVisibility {
         }
     }
 
-    pub(super) fn for_target(authorization: &AuthorizedRequest, target: &PrincipalId) -> Self {
-        if target == &authorization.principal {
+    pub(super) fn for_target(
+        authorization: &AuthorizedRequest,
+        target: &PrincipalId,
+    ) -> Result<Self, PermissionError> {
+        if AuthorityScope::for_target(
+            authorization.principal.as_str().as_bytes(),
+            target.as_str().as_bytes(),
+            false,
+        ) == AuthorityScope::Self_
+        {
             let mut visibility = Self::new(authorization);
             visibility.all_principals = false;
-            return visibility;
+            return Ok(visibility);
         }
-        debug_assert!(authorization.capability_check().has("capsule:list"));
-        Self {
+        authorization.capability_check().require("capsule:list")?;
+        Ok(Self {
             principal: target.clone(),
             is_admin: true,
             all_principals: false,
             capsule_grants: BTreeSet::new(),
-        }
+        })
     }
 
     fn denied(caller: &PrincipalId) -> Self {

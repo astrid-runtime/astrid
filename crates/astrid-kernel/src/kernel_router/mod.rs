@@ -14,6 +14,7 @@ mod install_generation;
 mod install_generation_cas_tests;
 mod installed_identity;
 mod inventory;
+mod principal_scope;
 mod projection_names;
 mod rate_limit;
 mod request_policy;
@@ -28,7 +29,7 @@ pub(crate) use rate_limit::rate_limit_for_request;
 pub use request_policy::{
     AuthorityScope, kernel_request_method, required_capability, resolve_scope,
 };
-use request_policy::{omit_success_admin_audit, request_target_principal};
+use request_policy::{omit_success_admin_audit, request_principal};
 pub(crate) use response::{KeepalivePinger, publish_response, workspace_commit_response};
 
 use std::sync::Arc;
@@ -202,8 +203,11 @@ async fn handle_request(
     // reject with an audited `Denied` entry on failure. No match arm
     // below is reached without `authorize_request` returning Ok.
     let method = kernel_request_method(&req);
-    let scope = resolve_scope(&req, &caller);
-    let requested_target = request_target_principal(&req, &caller);
+    let (scope, explicit) = request_principal(&req, &caller);
+    let explicit = explicit.cloned();
+    let requested_target = explicit
+        .as_ref()
+        .filter(|_| scope == AuthorityScope::Global);
     let required_cap = required_capability(&req, scope);
     let install_authorization =
         admit_management_request(kernel, &caller, device_key_id.as_deref(), required_cap).await;
@@ -241,7 +245,7 @@ async fn handle_request(
                     method,
                     required_cap,
                     device_key_id: device_key_id.as_deref(),
-                    target_principal: requested_target.clone(),
+                    target_principal: requested_target.cloned(),
                     params: None,
                     authorization: AuthorizationProof::Denied {
                         reason: e.to_string(),
@@ -267,12 +271,11 @@ async fn handle_request(
     let batch_reservation = match &req {
         KernelRequest::InstallCapsule {
             source,
-            target_principal,
             provenance,
             batch: Some(context),
             ..
         } => {
-            let target = target_principal.as_ref().unwrap_or(&caller);
+            let target = explicit.as_ref().unwrap_or(&caller);
             match install_batches.reserve(&caller, target, context, source, provenance.as_ref()) {
                 Ok(member) => Some(member),
                 Err(reason) => {
@@ -283,7 +286,7 @@ async fn handle_request(
                             method,
                             required_cap,
                             device_key_id: device_key_id.as_deref(),
-                            target_principal: requested_target.clone(),
+                            target_principal: requested_target.cloned(),
                             params: None,
                             authorization: authorization_proof.clone(),
                             outcome: AuditOutcome::failure(reason.clone()),
@@ -325,7 +328,7 @@ async fn handle_request(
                 method,
                 required_cap,
                 device_key_id: device_key_id.as_deref(),
-                target_principal: requested_target.clone(),
+                target_principal: requested_target.cloned(),
                 params: None,
                 authorization: authorization_proof,
                 outcome: AuditOutcome::failure(reason.clone()),
@@ -352,7 +355,7 @@ async fn handle_request(
                 method,
                 required_cap,
                 device_key_id: device_key_id.as_deref(),
-                target_principal: requested_target,
+                target_principal: requested_target.cloned(),
                 params: None,
                 authorization: authorization_proof,
                 outcome: AuditOutcome::success(),
@@ -377,11 +380,8 @@ async fn handle_request(
         device_key_id.as_deref(),
     );
     let res = match req {
-        KernelRequest::BeginCapsuleInstallBatch {
-            target_principal,
-            members,
-        } => {
-            let target = target_principal.as_ref().unwrap_or(&caller);
+        KernelRequest::BeginCapsuleInstallBatch { members, .. } => {
+            let target = explicit.as_ref().unwrap_or(&caller);
             match kernel.principal_directory.uid_for(target) {
                 Err(error) => KernelResponse::Error(format!(
                     "resolve capsule install batch target {target}: {error}"
@@ -398,7 +398,7 @@ async fn handle_request(
         KernelRequest::InstallCapsule {
             source,
             workspace,
-            target_principal,
+            target_principal: _,
             provenance,
             authority,
             env,
@@ -408,10 +408,10 @@ async fn handle_request(
             info!(
                 source = %source,
                 workspace,
-                target = ?target_principal,
+                target = ?explicit,
                 "Kernel received install request"
             );
-            let target = target_principal.as_ref().unwrap_or(&caller);
+            let target = explicit.as_ref().unwrap_or(&caller);
             if let Some(install_batch::InstallBatchReservation::Completed(member)) =
                 batch_reservation.as_ref()
             {
@@ -428,7 +428,7 @@ async fn handle_request(
                     kernel,
                     install::InstallCapsuleRequest {
                         caller: &caller,
-                        requested_target: target_principal.as_ref(),
+                        requested_target: explicit.as_ref(),
                         source: &source,
                         workspace,
                         provenance: provenance.as_ref(),
@@ -451,11 +451,8 @@ async fn handle_request(
                 }
             }
         },
-        KernelRequest::FinishCapsuleInstallBatch {
-            batch_id,
-            target_principal,
-        } => {
-            let target = target_principal.as_ref().unwrap_or(&caller);
+        KernelRequest::FinishCapsuleInstallBatch { batch_id, .. } => {
+            let target = explicit.as_ref().unwrap_or(&caller);
             match install_batches.finish(&caller, target, batch_id, |target, member| {
                 install_batch::installed_member_matches(kernel, target, member)
             }) {
@@ -632,11 +629,9 @@ async fn handle_request(
             };
             KernelResponse::Status(status)
         },
-        KernelRequest::GetCapsuleMetadata => {
-            capsule_metadata::response(kernel, &authorization, None).await
-        },
-        KernelRequest::GetCapsuleMetadataForPrincipal { target_principal } => {
-            capsule_metadata::response(kernel, &authorization, Some(&target_principal)).await
+        KernelRequest::GetCapsuleMetadata
+        | KernelRequest::GetCapsuleMetadataForPrincipal { .. } => {
+            capsule_metadata::response(kernel, &authorization, explicit.as_ref()).await
         },
         KernelRequest::GetAgentReadiness => {
             let visibility = CapsuleVisibility::new(&authorization);

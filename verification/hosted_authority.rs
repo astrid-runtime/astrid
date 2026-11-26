@@ -26,3 +26,6 @@ mod traversal;
 
 #[path = "../crates/astrid-storage/src/kv/tree/overlay/update.rs"]
 mod overlay_update;
+
+#[path = "../crates/astrid-kernel/src/kernel_router/principal_scope.rs"]
+mod principal_scope;

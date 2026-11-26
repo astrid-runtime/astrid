@@ -277,11 +277,7 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
             scope,
             ..
         } => {
-            if *scope == EnvStorageScope::Shared || principal != caller {
-                AuthorityScope::Global
-            } else {
-                AuthorityScope::Self_
-            }
+            AuthorityScope::for_target(caller.as_str().as_bytes(), principal.as_str().as_bytes(), *scope == EnvStorageScope::Shared)
         }
         AdminRequestKind::QuotaGet { principal }
         | AdminRequestKind::QuotaSet { principal, .. }
@@ -299,11 +295,7 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
             view: astrid_core::storage_provider::StorageProviderViewV1::Principal(principal),
             ..
         } => {
-            if principal == caller {
-                AuthorityScope::Self_
-            } else {
-                AuthorityScope::Global
-            }
+            AuthorityScope::for_target(caller.as_str().as_bytes(), principal.as_str().as_bytes(), false)
         },
         // `GroupList` is read-only over system config and carries no
         // target principal; every agent legitimately needs to read it

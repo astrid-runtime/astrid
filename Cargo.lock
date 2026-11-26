@@ -836,6 +836,7 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "vstd",
  "wat",
  "windows-sys 0.61.2",
 ]

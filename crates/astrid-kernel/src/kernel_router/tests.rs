@@ -500,7 +500,7 @@ fn cross_principal_metadata_requires_global_authority() {
         AuthorityScope::Global
     );
     assert_eq!(
-        request_target_principal(&cross_metadata, &caller),
+        request_principal(&cross_metadata, &caller).1.cloned(),
         Some(PrincipalId::new("bob").unwrap())
     );
     assert_eq!(
@@ -1165,6 +1165,10 @@ async fn capsule_visibility_precomputes_admin_and_capsule_grants() {
     let admin_visibility = CapsuleVisibility::new(&admin_authorization);
     let global_lister_visibility = CapsuleVisibility::new(&global_lister_authorization);
     let limited_visibility = CapsuleVisibility::new(&limited_authorization);
+    assert!(matches!(
+        capsule_metadata::response(&kernel, &limited_authorization, Some(&admin)).await,
+        KernelResponse::Error(_)
+    ));
 
     assert!(admin_visibility.allows(&allowed));
     assert!(admin_visibility.allows(&default_only));

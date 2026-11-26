@@ -29,7 +29,9 @@ GUEST_AUTHORITY = Path("crates/astrid-storage/src/principal_state/guest_authorit
 KV_ENCODING = Path("crates/astrid-storage/src/kv/encoding.rs")
 OVERLAY = Path("crates/astrid-storage/src/kv/tree/overlay/traversal.rs")
 OVERLAY_UPDATE = Path("crates/astrid-storage/src/kv/tree/overlay/update.rs")
+PRINCIPAL_SCOPE = Path("crates/astrid-kernel/src/kernel_router/principal_scope.rs")
 INPUTS = [
+    PRINCIPAL_SCOPE,
     OVERLAY_UPDATE,
     OVERLAY,
     KV_ENCODING,
@@ -114,6 +116,16 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
         for item in PROOF_ITEMS
     ]
     return [
+        (
+            "shared state accepts a self-scoped grant",
+            PRINCIPAL_SCOPE,
+            lambda text: replace_once(text, "if shared || caller != target", "if caller != target"),
+        ),
+        (
+            "another principal accepts a self-scoped grant",
+            PRINCIPAL_SCOPE,
+            lambda text: replace_once(text, "if shared || caller != target", "if shared"),
+        ),
         (
             "ordered overlay replacement retains its old value",
             OVERLAY_UPDATE,
