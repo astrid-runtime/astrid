@@ -407,7 +407,7 @@ where
             op(slot);
             Ok(())
         },
-        NetStream::Unix(_) => Err(ErrorCode::NotTcp),
+        NetStream::Unix(_) | NetStream::Signed(_) => Err(ErrorCode::NotTcp),
     }
 }
 
@@ -429,7 +429,7 @@ where
             });
             result.unwrap_or(Err(ErrorCode::Closed))
         },
-        NetStream::Unix(_) => Err(ErrorCode::NotTcp),
+        NetStream::Unix(_) | NetStream::Signed(_) => Err(ErrorCode::NotTcp),
     }
 }
 

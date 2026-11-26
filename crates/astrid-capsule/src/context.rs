@@ -705,6 +705,8 @@ pub struct CapsuleContext {
     /// Session token for authenticating CLI socket connections. Only set for
     /// capsules with `net_bind` capability (the CLI proxy capsule).
     pub session_token: Option<Arc<SessionToken>>,
+    /// Registry shared with the kernel that retires signed local sessions.
+    pub device_sessions: astrid_core::profile::device_sessions::DeviceSessions,
     /// Shared allowance store for capsule-level approval requests.
     pub allowance_store: Option<Arc<astrid_approval::AllowanceStore>>,
     /// Shared identity store for resolving platform users to `AstridUserId`.
@@ -784,6 +786,7 @@ impl CapsuleContext {
             cli_socket_listener,
             capsule_registry: None,
             session_token: None,
+            device_sessions: Default::default(),
             allowance_store: None,
             identity_store: None,
             schema_catalog: Arc::new(SchemaCatalog::new()),
@@ -851,6 +854,16 @@ impl CapsuleContext {
     #[must_use]
     pub fn with_session_token(mut self, token: Arc<SessionToken>) -> Self {
         self.session_token = Some(token);
+        self
+    }
+
+    /// Share the boot registry with the local signed-socket handshake.
+    #[must_use]
+    pub fn with_device_sessions(
+        mut self,
+        sessions: astrid_core::profile::device_sessions::DeviceSessions,
+    ) -> Self {
+        self.device_sessions = sessions;
         self
     }
 

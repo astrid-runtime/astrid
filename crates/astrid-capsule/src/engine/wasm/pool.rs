@@ -494,6 +494,7 @@ pub(super) fn clear_on_return(state: &mut HostState, reset_resources: bool) {
     // and wrongly earn local-egress consent. Cleared to `None` (= `System`,
     // fail-closed) in lockstep.
     state.ingress_origin = None;
+    state.ingress_socket = None;
 
     if reset_resources {
         // Drops every entry still in the old table (orphaned subscriptions,
