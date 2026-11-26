@@ -3,7 +3,6 @@
 //! Nodes are immutable and reference-counted, so each published projection
 //! reuses the previous projection and copies only one balanced search path.
 
-use std::cmp::Ordering;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Default)]
@@ -13,7 +12,8 @@ pub(super) struct OverlayMap {
 
 use crate::kv::encoding;
 mod traversal;
-use traversal::{Entry, Node};
+mod update;
+use traversal::Node;
 
 impl OverlayMap {
     pub(super) fn get(&self, key: &[u8]) -> Option<&Option<Vec<u8>>> {
@@ -21,7 +21,7 @@ impl OverlayMap {
     }
 
     pub(super) fn insert(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) {
-        self.root = Some(insert(self.root.take(), Arc::new(Entry { key, value })));
+        update::put(&mut self.root, key, value);
     }
 
     pub(super) fn range<'a>(
@@ -65,101 +65,6 @@ fn collect_all(node: Option<&Node>, entries: &mut Vec<(Vec<u8>, Option<Vec<u8>>)
     collect_all(node.left.as_deref(), entries);
     entries.push((node.entry.key.clone(), node.entry.value.clone()));
     collect_all(node.right.as_deref(), entries);
-}
-
-fn insert(root: Option<Arc<Node>>, entry: Arc<Entry>) -> Arc<Node> {
-    let Some(node) = root else {
-        return make_node(entry, None, None);
-    };
-    let rebuilt = match encoding::bytewise_cmp(&entry.key, &node.entry.key) {
-        Ordering::Less => make_node(
-            Arc::clone(&node.entry),
-            Some(insert(node.left.clone(), entry)),
-            node.right.clone(),
-        ),
-        Ordering::Greater => make_node(
-            Arc::clone(&node.entry),
-            node.left.clone(),
-            Some(insert(node.right.clone(), entry)),
-        ),
-        Ordering::Equal => make_node(entry, node.left.clone(), node.right.clone()),
-    };
-    rebalance(rebuilt)
-}
-
-fn make_node(entry: Arc<Entry>, left: Option<Arc<Node>>, right: Option<Arc<Node>>) -> Arc<Node> {
-    Arc::new(Node {
-        entry,
-        height: height(left.as_ref())
-            .max(height(right.as_ref()))
-            .saturating_add(1),
-        left,
-        right,
-    })
-}
-
-fn rebalance(node: Arc<Node>) -> Arc<Node> {
-    let balance = i64::from(height(node.left.as_ref()))
-        .saturating_sub(i64::from(height(node.right.as_ref())));
-    if balance > 1 {
-        let Some(left) = node.left.as_ref() else {
-            return node;
-        };
-        let node = if height(left.left.as_ref()) < height(left.right.as_ref()) {
-            make_node(
-                Arc::clone(&node.entry),
-                Some(rotate_left(left)),
-                node.right.clone(),
-            )
-        } else {
-            node
-        };
-        return rotate_right(&node);
-    }
-    if balance < -1 {
-        let Some(right) = node.right.as_ref() else {
-            return node;
-        };
-        let node = if height(right.right.as_ref()) < height(right.left.as_ref()) {
-            make_node(
-                Arc::clone(&node.entry),
-                node.left.clone(),
-                Some(rotate_right(right)),
-            )
-        } else {
-            node
-        };
-        return rotate_left(&node);
-    }
-    node
-}
-
-fn rotate_left(node: &Arc<Node>) -> Arc<Node> {
-    let Some(right) = node.right.as_ref() else {
-        return Arc::clone(node);
-    };
-    let left = make_node(
-        Arc::clone(&node.entry),
-        node.left.clone(),
-        right.left.clone(),
-    );
-    make_node(Arc::clone(&right.entry), Some(left), right.right.clone())
-}
-
-fn rotate_right(node: &Arc<Node>) -> Arc<Node> {
-    let Some(left) = node.left.as_ref() else {
-        return Arc::clone(node);
-    };
-    let right = make_node(
-        Arc::clone(&node.entry),
-        left.right.clone(),
-        node.right.clone(),
-    );
-    make_node(Arc::clone(&left.entry), left.left.clone(), Some(right))
-}
-
-fn height(node: Option<&Arc<Node>>) -> u32 {
-    node.map_or(0, |node| node.height)
 }
 
 #[cfg(test)]

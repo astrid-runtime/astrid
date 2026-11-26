@@ -75,9 +75,12 @@ The point lookup used to suppress superseded checkpoint entries is checked on
 the actual immutable overlay nodes. For a strictly ordered overlay, it returns
 the stored value or explicit deletion marker for the requested key exactly
 when that entry occurs anywhere in the tree. A missing key returns no entry.
-Lookup and insertion use the same checked three-way comparator. Establishing
-that insertion and rotations preserve ordering remains an obligation, as do
-checkpoint decoding, the declared child fences and full stack traversal. Applying the resulting deletion
+The default overlay has an empty root. Its production insertion function now
+proves that an ordered root stays ordered, including both rebalancing rotations.
+For every query key, lookup on the new root returns the supplied value or
+explicit tombstone for the written key and preserves the old result for every
+other key. The proof concerns logical contents and ordering. Checkpoint decoding,
+the declared child fences and full range traversal remain open. Applying the resulting deletion
 replacements and publishing their new root remain open obligations.
 
 The synchronous Wasmtime KV host call holds its operation guard across semaphore

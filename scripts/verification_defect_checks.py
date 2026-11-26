@@ -28,7 +28,9 @@ AUTHORITY = Path("crates/astrid-capabilities/src/store/authority.rs")
 GUEST_AUTHORITY = Path("crates/astrid-storage/src/principal_state/guest_authority.rs")
 KV_ENCODING = Path("crates/astrid-storage/src/kv/encoding.rs")
 OVERLAY = Path("crates/astrid-storage/src/kv/tree/overlay/traversal.rs")
+OVERLAY_UPDATE = Path("crates/astrid-storage/src/kv/tree/overlay/update.rs")
 INPUTS = [
+    OVERLAY_UPDATE,
     OVERLAY,
     KV_ENCODING,
     GUEST_AUTHORITY,
@@ -112,6 +114,22 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
         for item in PROOF_ITEMS
     ]
     return [
+        (
+            "ordered overlay replacement retains its old value",
+            OVERLAY_UPDATE,
+            lambda text: replace_once(text, "make_node(entry, node.left.clone(), node.right.clone())",
+                                      "make_node(Arc::clone(&node.entry), node.left.clone(), node.right.clone())"),
+        ),
+        (
+            "left rotation drops the inner subtree",
+            OVERLAY_UPDATE,
+            lambda text: edit_function(text, "rotate_left", "right.left.clone()", "None"),
+        ),
+        (
+            "right rotation drops the inner subtree",
+            OVERLAY_UPDATE,
+            lambda text: edit_function(text, "rotate_right", "left.right.clone()", "None"),
+        ),
         (
             "overlay drops an exact key including its tombstone",
             OVERLAY,

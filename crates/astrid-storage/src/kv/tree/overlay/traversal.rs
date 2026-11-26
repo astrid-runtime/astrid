@@ -64,7 +64,7 @@ pub(super) open spec fn ordered(node: Option<Arc<Node>>) -> bool
     }
 }
 
-proof fn strict_order(a: Seq<u8>, b: Seq<u8>)
+pub(super) proof fn strict_order(a: Seq<u8>, b: Seq<u8>)
     ensures encoding::below(a, b) ==> !encoding::below(b, a) && a != b,
             !encoding::below(a,b) && a != b ==> encoding::below(b,a),
     decreases a.len(),
@@ -83,7 +83,7 @@ proof fn strict_order(a: Seq<u8>, b: Seq<u8>)
     }
 }
 
-proof fn lookup_membership(node: Option<Arc<Node>>, key: Seq<u8>, value: Option<Vec<u8>>)
+pub(super) proof fn lookup_membership(node: Option<Arc<Node>>, key: Seq<u8>, value: Option<Vec<u8>>)
     requires ordered(node),
     ensures (lookup_spec(node, key) == Some(value)) == contains_entry(node, key, value),
     decreases node,
