@@ -8,6 +8,7 @@ use astrid_core::profile::{DeviceKey, DeviceKeyId, DeviceRegistrationId};
 use astrid_core::session_token::{
     HandshakeRequest, HandshakeResponse, PRINCIPAL_AUTH_NONCE_LEN, PROTOCOL_VERSION, SessionToken,
 };
+use astrid_events::ipc::DeviceStamp;
 use astrid_types::ipc::RequestOwnerId;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
@@ -29,6 +30,13 @@ pub struct AuthenticatedIdentity {
 }
 
 impl AuthenticatedIdentity {
+    pub(super) fn device_stamp(&self) -> DeviceStamp<'_> {
+        DeviceStamp {
+            fingerprint: self.device_key_id.as_deref(),
+            registration: self.registration.map(Into::into),
+        }
+    }
+
     /// Whether this connection proved a principal key rather than only
     /// possession of the daemon's session token.
     #[must_use]

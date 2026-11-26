@@ -1,5 +1,6 @@
 //! Wire-topic policy and per-connection response demultiplexing.
 
+use astrid_events::ipc::DeviceStamp;
 use std::collections::HashMap;
 
 use super::topic_policy;
@@ -108,7 +109,7 @@ pub(super) fn is_cancel_turn(payload: &IpcPayload) -> bool {
 pub(super) fn should_deliver(
     message: &IpcMessage,
     principal: &str,
-    device_key_id: Option<&str>,
+    device: DeviceStamp<'_>,
     session: Option<&str>,
 ) -> bool {
     use super::recipient::{Address, admits};
@@ -118,11 +119,13 @@ pub(super) fn should_deliver(
         &Address {
             principal: message.principal.as_deref().map(str::as_bytes),
             device: message.device_key_id.as_deref().map(str::as_bytes),
+            registration: message.device_registration_id.map(|id| id.as_u128()),
             session: outbound_session(message).map(str::as_bytes),
         },
         &Address {
             principal: Some(principal.as_bytes()),
-            device: device_key_id.map(str::as_bytes),
+            device: device.fingerprint.map(str::as_bytes),
+            registration: device.registration.map(|id| id.as_u128()),
             session: session.map(str::as_bytes),
         },
         egress_allowed(topic),
@@ -287,22 +290,57 @@ mod tests {
     #[test]
     fn principal_less_management_responses_never_broadcast() {
         let response = message("astrid.v1.admin.response.status", None, "one");
-        assert!(!should_deliver(&response, "alice", None, None));
+        assert!(!should_deliver(
+            &response,
+            "alice",
+            DeviceStamp::default(),
+            None
+        ));
 
         let onboarding = message("astrid.v1.onboarding.required", None, "one");
-        assert!(!should_deliver(&onboarding, "alice", None, None));
+        assert!(!should_deliver(
+            &onboarding,
+            "alice",
+            DeviceStamp::default(),
+            None
+        ));
 
         let onboarding = message("astrid.v1.onboarding.required", Some("alice"), "one");
-        assert!(should_deliver(&onboarding, "alice", None, None));
-        assert!(!should_deliver(&onboarding, "bob", None, None));
+        assert!(should_deliver(
+            &onboarding,
+            "alice",
+            DeviceStamp::default(),
+            None
+        ));
+        assert!(!should_deliver(
+            &onboarding,
+            "bob",
+            DeviceStamp::default(),
+            None
+        ));
     }
 
     #[test]
     fn demuxes_by_principal_and_chat_session() {
         let message = message(CHAT_RESPONSE_TOPIC, Some("alice"), "one");
-        assert!(should_deliver(&message, "alice", None, Some("one")));
-        assert!(!should_deliver(&message, "bob", None, Some("one")));
-        assert!(!should_deliver(&message, "alice", None, Some("two")));
+        assert!(should_deliver(
+            &message,
+            "alice",
+            DeviceStamp::default(),
+            Some("one")
+        ));
+        assert!(!should_deliver(
+            &message,
+            "bob",
+            DeviceStamp::default(),
+            Some("one")
+        ));
+        assert!(!should_deliver(
+            &message,
+            "alice",
+            DeviceStamp::default(),
+            Some("two")
+        ));
     }
 
     #[test]
@@ -314,7 +352,12 @@ mod tests {
                 Uuid::nil(),
             )
             .with_principal("alice");
-            assert!(!should_deliver(&message, "alice", None, Some("session-1")));
+            assert!(!should_deliver(
+                &message,
+                "alice",
+                DeviceStamp::default(),
+                Some("session-1")
+            ));
         }
     }
 
@@ -330,16 +373,27 @@ mod tests {
         assert!(should_deliver(
             &response,
             "alice",
-            Some("full-device"),
+            DeviceStamp {
+                fingerprint: Some("full-device"),
+                registration: None
+            },
             None
         ));
         assert!(!should_deliver(
             &response,
             "alice",
-            Some("use-only-device"),
+            DeviceStamp {
+                fingerprint: Some("use-only-device"),
+                registration: None
+            },
             None
         ));
-        assert!(!should_deliver(&response, "alice", None, None));
+        assert!(!should_deliver(
+            &response,
+            "alice",
+            DeviceStamp::default(),
+            None
+        ));
     }
 
     #[test]

@@ -361,7 +361,17 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
         (
             "native egress ignores device restriction",
             NATIVE_RECIPIENT,
-            lambda text: replace_once(text, "|| same(target.device, client.device)", "|| true"),
+            lambda text: replace_once(text, "Some(_) => same(target.device, client.device) && match", "Some(_) => true && match"),
+        ),
+        (
+            "native egress admits another registration of the same key",
+            NATIVE_RECIPIENT,
+            lambda text: replace_once(text, "(Some(a), Some(b)) => a == b,", "(Some(a), Some(b)) => true,"),
+        ),
+        (
+            "native egress accepts a versioned target on an unversioned socket",
+            NATIVE_RECIPIENT,
+            lambda text: replace_once(text, "(None, None) => true,", "(None, None) | (Some(_), None) => true,"),
         ),
         (
             "chat delivery accepts another session",

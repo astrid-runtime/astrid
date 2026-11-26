@@ -70,7 +70,7 @@ fn elicit_request_event(
     capsule_id: String,
     field: OnboardingField,
     principal: String,
-    device_key_id: Option<String>,
+    device: astrid_events::ipc::DeviceStamp<'_>,
 ) -> AstridEvent {
     let mut message = IpcMessage::new(
         topic,
@@ -82,9 +82,8 @@ fn elicit_request_event(
         Uuid::nil(), // Kernel-originated
     )
     .with_principal(principal);
-    if let Some(device_key_id) = device_key_id {
-        message = message.with_device_key_id(device_key_id);
-    }
+    message.device_key_id = device.fingerprint.map(str::to_owned);
+    message.device_registration_id = device.registration;
     AstridEvent::Ipc {
         message,
         metadata: astrid_events::EventMetadata::default(),
@@ -218,7 +217,7 @@ impl elicit::Host for HostState {
             capsule_id.clone(),
             field,
             originating_principal.clone(),
-            None,
+            astrid_events::ipc::DeviceStamp::default(),
         ));
 
         tracing::debug!(
@@ -505,7 +504,7 @@ mod tests {
             "test".to_owned(),
             field,
             "agent-alice".to_owned(),
-            None,
+            astrid_events::ipc::DeviceStamp::default(),
         );
 
         assert_eq!(event_principal(&event), Some("agent-alice"));

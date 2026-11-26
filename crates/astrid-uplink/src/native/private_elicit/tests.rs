@@ -1,3 +1,4 @@
+use astrid_events::ipc::DeviceStamp;
 use std::sync::Mutex;
 
 use super::*;
@@ -239,26 +240,38 @@ fn unstamped_private_request_reaches_same_principal_devices() {
     assert!(super::super::routing::should_deliver(
         &unstamped,
         principal,
-        Some(bound),
+        DeviceStamp {
+            fingerprint: Some(bound),
+            registration: None
+        },
         None,
     ));
     assert!(super::super::routing::should_deliver(
         &unstamped,
         principal,
-        Some(other),
+        DeviceStamp {
+            fingerprint: Some(other),
+            registration: None
+        },
         None,
     ));
     let stamped = unstamped.with_device_key_id(bound);
     assert!(super::super::routing::should_deliver(
         &stamped,
         principal,
-        Some(bound),
+        DeviceStamp {
+            fingerprint: Some(bound),
+            registration: None
+        },
         None,
     ));
     assert!(!super::super::routing::should_deliver(
         &stamped,
         principal,
-        Some(other),
+        DeviceStamp {
+            fingerprint: Some(other),
+            registration: None
+        },
         None,
     ));
 }

@@ -13,7 +13,6 @@ use crate::elicitation::{SecretElicitError, SecretElicitId};
 use crate::engine::wasm::bindings::astrid::elicit::host::{ElicitType, Host};
 use crate::engine::wasm::test_fixtures::{mem_secret_store, minimal_host_state};
 
-const BOUND_DEVICE: &str = "0123456789abcdef";
 const INGRESS_DEVICE: &str = "fedcba9876543210";
 
 fn request() -> ElicitRequest {
@@ -60,7 +59,7 @@ fn array_request() -> ElicitRequest {
 async fn ordinary_answer_cannot_resume_retired_or_unauthorized_invocation() {
     for unauthorized in [false, true] {
         for req in [text_request(), select_request(), array_request()] {
-            let (mut state, _, _) = setup();
+            let (_dir, mut state, _, _) = setup();
             let field = super::super::map_to_onboarding_field(&req).unwrap();
             let reply = match req.kind {
                 ElicitType::Text => SecretElicitReply::Value("text".into()),
@@ -107,15 +106,38 @@ async fn request_id(rx: &mut astrid_events::EventReceiver) -> SecretElicitId {
     SecretElicitId::from_uuid(*request_id)
 }
 
-fn setup() -> (HostState, Arc<PendingSecretElicits>, SecretElicitIdentity) {
+fn setup() -> (
+    tempfile::TempDir,
+    HostState,
+    Arc<PendingSecretElicits>,
+    SecretElicitIdentity,
+) {
     let rt = tokio::runtime::Handle::current();
     let mut state = minimal_host_state(rt.clone());
     state.secret_store = mem_secret_store("capsule:private-test", rt);
+    let dir = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let responder = astrid_core::profile::DeviceKey::new(
+        "a".repeat(64),
+        astrid_core::profile::DeviceScope::Full,
+        None,
+        0,
+    );
+    let mut profile = astrid_core::profile::PrincipalProfile::default();
+    profile
+        .auth
+        .methods
+        .push(astrid_core::profile::AuthMethod::Keypair);
+    profile.add_device(responder.clone());
+    profile.save(&home, &state.effective_principal()).unwrap();
+    state.profile_cache = Some(Arc::new(
+        crate::profile_cache::PrincipalProfileCache::with_home(home),
+    ));
     let registry = Arc::new(PendingSecretElicits::for_bindings(
         NonZeroUsize::new(2).unwrap(),
         [(
             state.effective_principal(),
-            DeviceKeyId::new(BOUND_DEVICE.to_owned()).unwrap(),
+            DeviceKeyId::new(responder.key_id).unwrap(),
         )]
         .into(),
     ));
@@ -125,12 +147,12 @@ fn setup() -> (HostState, Arc<PendingSecretElicits>, SecretElicitIdentity) {
         state.capsule_id.clone(),
         SecretElicitKey::new("token").unwrap(),
     );
-    (state, registry, identity)
+    (dir, state, registry, identity)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unselected_principal_keeps_legacy_transport() {
-    let (mut state, _, identity) = setup();
+    let (_dir, mut state, _, identity) = setup();
     let registry = Arc::new(PendingSecretElicits::for_principals(
         NonZeroUsize::MIN,
         [astrid_core::PrincipalId::new("other-principal").unwrap()].into(),
@@ -175,7 +197,7 @@ async fn unselected_principal_keeps_legacy_transport() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn private_secret_resumes_host_without_bus_reply_or_reload() {
-    let (mut state, registry, identity) = setup();
+    let (_dir, mut state, registry, identity) = setup();
     let bus = state.event_bus.clone();
     let mut requests = bus.subscribe_topic(Topic::private_elicit_request().as_str());
     let mut legacy_requests = bus.subscribe_topic(Topic::elicit_request().as_str());
@@ -214,7 +236,7 @@ async fn private_secret_resumes_host_without_bus_reply_or_reload() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bus_answer_cannot_complete_private_secret_and_cancel_writes_nothing() {
-    let (mut state, registry, identity) = setup();
+    let (_dir, mut state, registry, identity) = setup();
     let bus = state.event_bus.clone();
     let mut requests = bus.subscribe_topic(Topic::private_elicit_request().as_str());
     let host = tokio::task::spawn_blocking(move || {
@@ -248,7 +270,7 @@ async fn bus_answer_cannot_complete_private_secret_and_cancel_writes_nothing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unload_cancels_private_wait_and_rejects_late_secret() {
-    let (mut state, registry, identity) = setup();
+    let (_dir, mut state, registry, identity) = setup();
     let cancellation = state.effective_cancel_token();
     let mut requests = state
         .event_bus
@@ -273,7 +295,7 @@ async fn unload_cancels_private_wait_and_rejects_late_secret() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn secret_default_is_rejected_before_public_notification() {
-    let (mut state, _, _) = setup();
+    let (_dir, mut state, _, _) = setup();
     // Keep the publisher alive after the host returns, so this checks absence
     // of a notification rather than observing a closed receiver.
     let bus = state.event_bus.clone();
@@ -293,7 +315,7 @@ async fn secret_default_is_rejected_before_public_notification() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn private_text_empty_and_cancel_are_distinct() {
-    let (mut state, registry, _) = setup();
+    let (_dir, mut state, registry, _) = setup();
     let identity = identity_for(&state, "name");
     let mut requests = state
         .event_bus
@@ -311,7 +333,7 @@ async fn private_text_empty_and_cancel_are_distinct() {
         Ok(ElicitResponse::Value(value)) if value.is_empty()
     ));
 
-    let (mut state, registry, _) = setup();
+    let (_dir, mut state, registry, _) = setup();
     let identity = identity_for(&state, "name");
     let mut requests = state
         .event_bus
@@ -332,7 +354,7 @@ async fn private_text_empty_and_cancel_are_distinct() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn private_array_empty_list_is_distinct_from_cancel() {
-    let (mut state, registry, _) = setup();
+    let (_dir, mut state, registry, _) = setup();
     let identity = identity_for(&state, "relays");
     let mut requests = state
         .event_bus
@@ -353,7 +375,7 @@ async fn private_array_empty_list_is_distinct_from_cancel() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn private_select_member_completes_and_bus_cannot_answer() {
-    let (mut state, registry, _) = setup();
+    let (_dir, mut state, registry, _) = setup();
     let identity = identity_for(&state, "network");
     let bus = state.event_bus.clone();
     let mut requests = bus.subscribe_topic(Topic::private_elicit_request().as_str());
@@ -388,7 +410,7 @@ async fn private_select_member_completes_and_bus_cannot_answer() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unselected_principal_text_keeps_legacy_transport() {
-    let (mut state, _, identity) = setup();
+    let (_dir, mut state, _, identity) = setup();
     let registry = Arc::new(PendingSecretElicits::for_principals(
         NonZeroUsize::MIN,
         [astrid_core::PrincipalId::new("other-principal").unwrap()].into(),
@@ -428,7 +450,7 @@ async fn unselected_principal_text_keeps_legacy_transport() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn array_default_and_select_non_member_default_reject_before_notification() {
-    let (mut state, _, _) = setup();
+    let (_dir, mut state, _, _) = setup();
     let bus = state.event_bus.clone();
     let mut requests = bus.subscribe_topic(Topic::private_elicit_request().as_str());
     let mut array = array_request();
@@ -438,7 +460,7 @@ async fn array_default_and_select_non_member_default_reject_before_notification(
         .unwrap();
     assert!(matches!(result, Err(ErrorCode::InvalidInput)));
 
-    let (mut state, _, _) = setup();
+    let (_dir, mut state, _, _) = setup();
     let mut select = select_request();
     select.default_value = Some("devnet".into());
     let result = tokio::task::spawn_blocking(move || state.elicit(select))
@@ -454,7 +476,17 @@ async fn array_default_and_select_non_member_default_reject_before_notification(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn private_collect_stamps_bound_device_not_ingress() {
-    let (mut state, registry, identity) = setup();
+    let (_dir, mut state, registry, identity) = setup();
+    let principal = state.effective_principal();
+    let expected = state
+        .profile_cache
+        .as_ref()
+        .unwrap()
+        .resolve(&principal)
+        .unwrap();
+    let responder = expected
+        .active_device(registry.bound_device(&principal).unwrap())
+        .unwrap();
     state.ingress_device_key_id = Some(INGRESS_DEVICE.into());
     let bus = state.event_bus.clone();
     let mut requests = bus.subscribe_topic(Topic::private_elicit_request().as_str());
@@ -466,7 +498,14 @@ async fn private_collect_stamps_bound_device_not_ingress() {
     let AstridEvent::Ipc { message, .. } = &*event else {
         panic!("expected IPC")
     };
-    assert_eq!(message.device_key_id.as_deref(), Some(BOUND_DEVICE));
+    assert_eq!(
+        message.device_key_id.as_deref(),
+        Some(responder.key_id.as_str())
+    );
+    assert_eq!(
+        message.device_registration_id,
+        responder.registration_id.map(Into::into)
+    );
     assert_ne!(message.device_key_id.as_deref(), Some(INGRESS_DEVICE));
     let IpcPayload::ElicitRequest { request_id, .. } = &message.payload else {
         panic!("expected schema")
@@ -486,7 +525,7 @@ async fn private_collect_stamps_bound_device_not_ingress() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn private_route_without_bound_device_fails_closed_before_wait() {
-    let (mut state, _, identity) = setup();
+    let (_dir, mut state, _, identity) = setup();
     let registry = Arc::new(PendingSecretElicits::for_principals(
         NonZeroUsize::MIN,
         [identity.principal().clone()].into(),

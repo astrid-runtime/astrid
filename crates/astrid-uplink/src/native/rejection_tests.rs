@@ -2,6 +2,7 @@
 
 use super::*;
 use astrid_core::PrincipalId;
+
 use astrid_types::ipc::RequestOwnerId;
 use std::time::Duration;
 use uuid::Uuid;
@@ -34,7 +35,7 @@ async fn busy_prompt_returns_terminal_error_without_releasing_existing_turn() {
     let bus = Arc::new(EventBus::new());
     let registry = egress::Registry::install(&bus);
     let identity = identity();
-    let mut receiver = registry.subscribe("alice".to_owned(), None, identity.request_owner);
+    let mut receiver = registry.subscribe_principal("alice".to_owned(), identity.request_owner);
     process_inbound(&bus, &identity, "alice", &receiver, prompt("original"))
         .await
         .expect("first prompt admitted");
@@ -109,7 +110,7 @@ async fn malformed_chat_and_foreign_cancel_return_terminal_reasons() {
     let bus = Arc::new(EventBus::new());
     let registry = egress::Registry::install(&bus);
     let identity = identity();
-    let receiver = registry.subscribe("alice".to_owned(), None, identity.request_owner);
+    let receiver = registry.subscribe_principal("alice".to_owned(), identity.request_owner);
     process_inbound(&bus, &identity, "alice", &receiver, prompt("original"))
         .await
         .expect("original turn");
@@ -162,7 +163,7 @@ async fn forbidden_non_chat_request_receives_reason_and_disconnects() {
     let bus = Arc::new(EventBus::new());
     let registry = egress::Registry::install(&bus);
     let identity = identity();
-    let receiver = registry.subscribe("alice".to_owned(), None, identity.request_owner);
+    let receiver = registry.subscribe_principal("alice".to_owned(), identity.request_owner);
     let request = IpcMessage::new(
         Topic::from_raw("internal.v1.forbidden"),
         IpcPayload::RawJson(serde_json::json!({"secret": "must not be echoed"})),
@@ -197,8 +198,8 @@ async fn another_connection_receives_busy_error_but_cannot_finish_owner_turn() {
     let registry = egress::Registry::install(&bus);
     let owner_identity = identity();
     let other_identity = identity();
-    let owner = registry.subscribe("alice".to_owned(), None, owner_identity.request_owner);
-    let other = registry.subscribe("alice".to_owned(), None, other_identity.request_owner);
+    let owner = registry.subscribe_principal("alice".to_owned(), owner_identity.request_owner);
+    let other = registry.subscribe_principal("alice".to_owned(), other_identity.request_owner);
     process_inbound(
         &bus,
         &owner_identity,

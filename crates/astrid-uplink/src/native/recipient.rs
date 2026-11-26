@@ -7,6 +7,7 @@ verus! {
 pub(super) struct Address<'a> {
     pub principal: Option<&'a [u8]>,
     pub device: Option<&'a [u8]>,
+    pub registration: Option<u128>,
     pub session: Option<&'a [u8]>,
 }
 
@@ -33,7 +34,9 @@ fn same(left: Option<&[u8]>, right: Option<&[u8]>) -> (equal: bool)
 pub(super) fn admits(target: &Address<'_>, client: &Address<'_>, allowed: bool, broadcast: bool, chat: bool) -> (admitted: bool)
     ensures admitted == (allowed
         && (present_equal(target.principal, client.principal) || (target.principal.is_none() && broadcast))
-        && (target.device.is_none() || present_equal(target.device, client.device))
+        && (target.device.is_none() ==> target.registration.is_none())
+        && (target.device.is_some() ==> present_equal(target.device, client.device)
+            && target.registration == client.registration)
         && (!chat || present_equal(target.session, client.session))),
 {
     allowed
@@ -41,7 +44,14 @@ pub(super) fn admits(target: &Address<'_>, client: &Address<'_>, allowed: bool, 
             Some(_) => same(target.principal, client.principal),
             None => broadcast,
         }
-        && (target.device.is_none() || same(target.device, client.device))
+        && match target.device {
+            None => target.registration.is_none(),
+            Some(_) => same(target.device, client.device) && match (target.registration, client.registration) {
+                (Some(a), Some(b)) => a == b,
+                (None, None) => true,
+                _ => false,
+            },
+        }
         && (!chat || same(target.session, client.session))
 }
 

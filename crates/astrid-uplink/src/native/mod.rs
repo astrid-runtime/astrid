@@ -142,7 +142,7 @@ impl ConnectionRuntime {
         drop(handshake_permit);
         let egress = self.egress_registry.subscribe(
             identity.principal.to_string(),
-            identity.device_key_id.clone(),
+            identity.device_stamp(),
             identity.request_owner,
         );
         serve_connection(

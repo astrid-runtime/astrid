@@ -26,7 +26,14 @@ pub(super) fn collect(
             "private secret input has no bound responder device".into(),
         ));
     };
-    let device_key_id = device.as_str().to_owned();
+    let profile = state
+        .profile_cache
+        .as_ref()
+        .and_then(|cache| cache.resolve(&principal).ok())
+        .ok_or_else(|| ErrorCode::Unknown("private responder profile unavailable".into()))?;
+    let responder = profile
+        .active_device(device)
+        .ok_or_else(|| ErrorCode::Unknown("private responder device is inactive".into()))?;
     let identity = SecretElicitIdentity::new(
         principal.clone(),
         state.capsule_id.clone(),
@@ -41,7 +48,10 @@ pub(super) fn collect(
         state.capsule_id.to_string(),
         field.clone(),
         principal.to_string(),
-        Some(device_key_id),
+        astrid_events::ipc::DeviceStamp {
+            fingerprint: Some(device.as_str()),
+            registration: responder.registration_id.map(Into::into),
+        },
     );
     let bus = state.event_bus.clone();
     let cancellation = state.effective_cancel_token();

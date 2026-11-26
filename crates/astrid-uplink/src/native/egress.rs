@@ -1,5 +1,6 @@
 //! Per-connection egress queues for the native local transport.
 
+use astrid_events::ipc::DeviceStamp;
 use std::collections::HashMap;
 
 use super::delivery_queue::{DeliveryQueue, Receipt};
@@ -126,7 +127,7 @@ pub(super) enum TryRecvError {
 
 struct ClientQueue {
     principal: String,
-    device_key_id: Option<String>,
+    device: astrid_events::ipc::OwnedDeviceStamp,
     request_owner: RequestOwnerId,
     session: Arc<RwLock<Option<ActiveTurn>>>,
     queue: Arc<EgressQueue>,
@@ -270,7 +271,7 @@ impl Registry {
                 if !routing::should_deliver(
                     message,
                     &client.principal,
-                    client.device_key_id.as_deref(),
+                    client.device.as_stamp(),
                     session.as_ref().map(|turn| turn.session_id.as_str()),
                 ) {
                     continue;
@@ -322,10 +323,19 @@ impl Registry {
         registry
     }
 
+    #[cfg(test)]
+    pub(super) fn subscribe_principal(
+        self: &Arc<Self>,
+        principal: String,
+        owner: RequestOwnerId,
+    ) -> Subscription {
+        self.subscribe(principal, DeviceStamp::default(), owner)
+    }
+
     pub(super) fn subscribe(
         self: &Arc<Self>,
         principal: String,
-        device_key_id: Option<String>,
+        device: DeviceStamp<'_>,
         request_owner: RequestOwnerId,
     ) -> Subscription {
         let id = uuid::Uuid::new_v4();
@@ -338,7 +348,7 @@ impl Registry {
                 id,
                 ClientQueue {
                     principal: principal.clone(),
-                    device_key_id,
+                    device: device.into(),
                     request_owner,
                     session: Arc::clone(&session),
                     queue: Arc::clone(&queue),

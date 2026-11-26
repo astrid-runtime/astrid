@@ -48,6 +48,7 @@ pub(super) fn bind_terminal(message: &mut IpcMessage, owner: Option<RequestOwner
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::native::egress::{Registry, TryRecvError};
     use astrid_events::{AstridEvent, EventBus, EventMetadata};
@@ -58,7 +59,7 @@ mod tests {
     fn autonomous_timeout_requires_bound_producer_and_current_nonce() {
         let bus = Arc::new(EventBus::new());
         let registry = Registry::install(&bus);
-        let mut receiver = registry.subscribe("alice".into(), None, RequestOwnerId::generate());
+        let mut receiver = registry.subscribe_principal("alice".into(), RequestOwnerId::generate());
         let producer = Uuid::new_v4();
         let nonce = Uuid::new_v4();
         assert!(receiver.begin_turn("conversation"));

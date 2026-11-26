@@ -207,6 +207,8 @@ fences. Kernel management and reply routing remain separate obligations.
 
 ## Native local socket transport
 
+Native queue admission compares the target registration with the registration captured by the receiving socket handshake. A device-addressed message requires the same fingerprint and generation, including the unversioned case. A generation without a target fingerprint is rejected. Principal-only destinations retain their principal, session and connection-owner constraints. The Verus contract on the production recipient selector states these conditions. A registry regression subscribes three sockets with one principal and one fingerprint and confirms that each of two versioned replies and a legacy reply appears only on its corresponding queue. A configured private elicitation resolves its responder in the active profile before publication and stamps that registration on the notification. Enqueue selection is one step in the transport proof. Final socket writes, retirement acknowledgement and durable recovery require their own refinement evidence.
+
 The built-in local server in `astrid-uplink/src/native` accepts a socket,
 authenticates it, and subscribes a per-connection queue. Its topic policy uses
 a checked byte-slice search for exact topics and prefixes. A blocked ingress

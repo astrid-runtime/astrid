@@ -40,7 +40,7 @@ async fn native_input_waits_for_capacity_and_cancelled_admission_releases_turn()
         registration: None,
         request_owner: RequestOwnerId::generate(),
     };
-    let receiver = registry.subscribe("alice".to_owned(), None, identity.request_owner);
+    let receiver = registry.subscribe_principal("alice".to_owned(), identity.request_owner);
     let capacity = Arc::new(tokio::sync::Semaphore::new(0));
     let admitter: Arc<dyn astrid_events::EventDeliveryAdmitter> =
         Arc::new(BlockedDelivery(capacity.clone()));
@@ -123,7 +123,7 @@ async fn socket_answers_delivered_approval_while_ordinary_input_is_blocked() {
         registration: None,
         request_owner: owner,
     };
-    let receiver = registry.subscribe("alice".into(), None, owner);
+    let receiver = registry.subscribe_principal("alice".into(), owner);
     let blocked = Arc::new(BlockedPromptDelivery(tokio::sync::Notify::new()));
     let admitter: Arc<dyn astrid_events::EventDeliveryAdmitter> = blocked.clone();
     assert!(bus.register_delivery_admitter(&admitter));
@@ -208,7 +208,7 @@ async fn socket_answers_delivered_approval_while_ordinary_input_is_blocked() {
         .unwrap()
         .unwrap();
     assert_eq!(permits.available_permits(), 1);
-    let retry = registry.subscribe("alice".into(), None, RequestOwnerId::generate());
+    let retry = registry.subscribe_principal("alice".into(), RequestOwnerId::generate());
     assert!(
         retry.begin_turn("conversation"),
         "shutdown releases pending turn"
@@ -244,7 +244,7 @@ async fn overlapping_human_replies_claim_once_and_abandoned_wait_allows_retry() 
         registration: None,
         request_owner: RequestOwnerId::generate(),
     };
-    let receiver = registry.subscribe("alice".into(), None, identity.request_owner);
+    let receiver = registry.subscribe_principal("alice".into(), identity.request_owner);
     let mut receiver = receiver;
     bus.publish(approval_event(identity.request_owner));
     receiver.try_recv().unwrap();
@@ -372,7 +372,7 @@ async fn buffered_management_inputs_commit_before_the_next_frame_is_admitted() {
         registration: None,
         request_owner: RequestOwnerId::generate(),
     };
-    let receiver = registry.subscribe("alice".into(), None, identity.request_owner);
+    let receiver = registry.subscribe_principal("alice".into(), identity.request_owner);
     let request = |id| {
         IpcMessage::new(
             Topic::from_raw(format!("astrid.v1.request.commands.{id}")),
@@ -427,7 +427,7 @@ async fn unpolled_busy_prompt_does_not_swallow_cancellation_of_the_existing_turn
         registration: None,
         request_owner: RequestOwnerId::generate(),
     };
-    let mut receiver = registry.subscribe("alice".into(), None, identity.request_owner);
+    let mut receiver = registry.subscribe_principal("alice".into(), identity.request_owner);
     let prompt = |context| {
         IpcMessage::new(
             Topic::user_prompt(),
@@ -519,7 +519,7 @@ async fn pending_socket_admission_drains_egress_and_releases_on_eof_or_shutdown(
             request_owner: RequestOwnerId::generate(),
         };
         let owner = identity.request_owner;
-        let receiver = registry.subscribe("alice".into(), None, owner);
+        let receiver = registry.subscribe_principal("alice".into(), owner);
         let blocked = Arc::new(PendingDelivery(tokio::sync::Notify::new()));
         let admitter: Arc<dyn astrid_events::EventDeliveryAdmitter> = blocked.clone();
         assert!(bus.register_delivery_admitter(&admitter));
@@ -587,7 +587,7 @@ async fn pending_socket_admission_drains_egress_and_releases_on_eof_or_shutdown(
             .expect("pending admission does not obstruct lifecycle")
             .unwrap();
         assert_eq!(permits.available_permits(), 1);
-        let retry = registry.subscribe("alice".into(), None, RequestOwnerId::generate());
+        let retry = registry.subscribe_principal("alice".into(), RequestOwnerId::generate());
         assert!(
             retry.begin_turn("conversation"),
             "connection closure releases unpublished turn"
@@ -605,7 +605,7 @@ async fn pending_input_cancellation_is_private_and_allows_a_subsequent_turn() {
         registration: None,
         request_owner: RequestOwnerId::generate(),
     };
-    let receiver = registry.subscribe("alice".into(), None, identity.request_owner);
+    let receiver = registry.subscribe_principal("alice".into(), identity.request_owner);
     let capacity = Arc::new(tokio::sync::Semaphore::new(0));
     let admitter: Arc<dyn astrid_events::EventDeliveryAdmitter> =
         Arc::new(BlockedDelivery(capacity.clone()));
@@ -706,7 +706,7 @@ async fn cancellation_releases_turn_when_forwarding_consumer_has_closed() {
         registration: None,
         request_owner: RequestOwnerId::generate(),
     };
-    let mut receiver = registry.subscribe("alice".to_owned(), None, identity.request_owner);
+    let mut receiver = registry.subscribe_principal("alice".to_owned(), identity.request_owner);
     let prompt = |context| {
         IpcMessage::new(
             Topic::user_prompt(),
@@ -773,7 +773,7 @@ async fn cancellation_releases_abandoned_turn_without_capsule_response() {
         registration: None,
         request_owner: RequestOwnerId::generate(),
     };
-    let mut receiver = registry.subscribe("alice".to_owned(), None, identity.request_owner);
+    let mut receiver = registry.subscribe_principal("alice".to_owned(), identity.request_owner);
     let prompt = |context| {
         IpcMessage::new(
             Topic::from_raw(routing::CHAT_REQUEST_TOPIC),
@@ -855,7 +855,7 @@ async fn cancellation_releases_turn_when_open_consumer_stops_draining() {
         registration: None,
         request_owner: RequestOwnerId::generate(),
     };
-    let mut receiver = registry.subscribe("alice".into(), None, identity.request_owner);
+    let mut receiver = registry.subscribe_principal("alice".into(), identity.request_owner);
     let prompt = |context| {
         IpcMessage::new(
             Topic::user_prompt(),
@@ -921,7 +921,7 @@ async fn active_cancellation_preserves_blocked_management_and_human_reply() {
         registration: None,
         request_owner: RequestOwnerId::generate(),
     };
-    let mut receiver = registry.subscribe("alice".into(), None, identity.request_owner);
+    let mut receiver = registry.subscribe_principal("alice".into(), identity.request_owner);
     let prompt = |context| {
         IpcMessage::new(
             Topic::user_prompt(),
@@ -1020,7 +1020,7 @@ async fn socket_cancels_active_turn_with_both_other_input_slots_blocked() {
         registration: None,
         request_owner: RequestOwnerId::generate(),
     };
-    let receiver = registry.subscribe("alice".into(), None, identity.request_owner);
+    let receiver = registry.subscribe_principal("alice".into(), identity.request_owner);
     let prompt = |context| {
         IpcMessage::new(
             Topic::user_prompt(),
@@ -1130,7 +1130,7 @@ async fn ready_cancellation_settles_buffered_prompt_before_management_frame() {
         registration: None,
         request_owner: RequestOwnerId::generate(),
     };
-    let receiver = registry.subscribe("alice".into(), None, identity.request_owner);
+    let receiver = registry.subscribe_principal("alice".into(), identity.request_owner);
     let prompt = |context| {
         IpcMessage::new(
             Topic::user_prompt(),
@@ -1197,7 +1197,7 @@ async fn assert_buffered_prompt_after_cancel(extra_frame: bool) {
         registration: None,
         request_owner: RequestOwnerId::generate(),
     };
-    let receiver = registry.subscribe("alice".into(), None, identity.request_owner);
+    let receiver = registry.subscribe_principal("alice".into(), identity.request_owner);
     let prompt = |context| {
         IpcMessage::new(
             Topic::user_prompt(),
@@ -1294,7 +1294,7 @@ async fn management_reply_survives_chat_completion() {
         registration: None,
         request_owner: RequestOwnerId::generate(),
     };
-    let mut receiver = registry.subscribe("alice".to_owned(), None, identity.request_owner);
+    let mut receiver = registry.subscribe_principal("alice".to_owned(), identity.request_owner);
     receiver.begin_turn("conversation");
     let mut ingress = bus.subscribe_topic("astrid.v1.request.status.test");
     process_inbound(
@@ -1355,7 +1355,7 @@ async fn late_terminal_from_previous_turn_cannot_complete_next_turn() {
         registration: None,
         request_owner: RequestOwnerId::generate(),
     };
-    let mut receiver = registry.subscribe("alice".to_owned(), None, identity.request_owner);
+    let mut receiver = registry.subscribe_principal("alice".to_owned(), identity.request_owner);
     let mut ingress = bus.subscribe_topic(routing::CHAT_REQUEST_TOPIC);
     let prompt = || {
         IpcMessage::new(
