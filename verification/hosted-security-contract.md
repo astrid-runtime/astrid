@@ -609,3 +609,23 @@ Both filesystem adapters route relative paths through the checked join used
 by `FilesystemPath`. Rename joins each of its two paths independently.
 Owner lookup, workspace branch membership, physical storage key resolution
 and crash durability remain separate refinement obligations.
+
+### Principal retirement and native lease lifetime
+
+The callback currently samples the lease's revocation bit, expiry and bearer
+token. The typed subtree binds its storage owner, which can differ from the
+requester on a cross-owner lease. Principal disable changes the requester's
+profile, and deletion fences capabilities and allowances. Neither transition
+currently closes admission on every issued native lease. A successful callback
+renews its idle timeout. The current lease proof therefore supplies no bound
+on continued callback admission after principal disable or deletion.
+
+To close this obligation the execution permit must bind the requester's UID
+and authority generation alongside the operation and its resolved target.
+Disable and deletion must close that same generation for future admissions,
+including a lease concurrently being issued. Re-enable must not revive a
+lease from a closed generation. The worker must retain the admitted generation
+through completion under the interface's drain rule. Recovery must establish
+whether a permit can survive restart for each transport and store. The capacity
+diagnostic (`VolumeInfo`) needs an explicit backing-store target because its
+result describes the hosted volume rather than the mounted subtree.
