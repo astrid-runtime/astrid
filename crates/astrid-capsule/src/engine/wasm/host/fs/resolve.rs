@@ -298,11 +298,30 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let absent = root.path().join("absent");
         assert!(resolve_physical_absolute(&absent, "child").is_err());
-        let result = resolve_physical_absolute(root.path(), "absent/child").unwrap();
+        for spelling in ["absent/child", "absent/./child", "./absent/child"] {
+            let result = resolve_physical_absolute(root.path(), spelling).unwrap();
+            assert_eq!(
+                result.physical,
+                root.path().canonicalize().unwrap().join("absent/child")
+            );
+        }
+        assert!(resolve_physical_absolute(root.path(), "absent/../child").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_links_must_resolve_within_the_mounted_root() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("child")).unwrap();
+        std::os::unix::fs::symlink("child", root.path().join("inside")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("outside")).unwrap();
+        let resolved = resolve_physical_absolute(root.path(), "inside/new").unwrap();
         assert_eq!(
-            result.physical,
-            root.path().canonicalize().unwrap().join("absent/child")
+            resolved.physical,
+            root.path().canonicalize().unwrap().join("child/new")
         );
+        assert!(resolve_physical_absolute(root.path(), "outside/new").is_err());
     }
 
     #[cfg(unix)]
