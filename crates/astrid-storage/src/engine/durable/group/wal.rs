@@ -45,19 +45,20 @@ where
             .last()
             .map(|(_, location)| *location);
         let files = live_files_mut(&mut inner.files)?;
-        if arena_len < files.arena_len {
+        let Some((length, tail)) = super::super::frontier::wal_position(
+            files.arena_len,
+            files.arena_tail,
+            arena_len,
+            arena_tail,
+        ) else {
             return Err(DurableError::Corrupt {
                 file: ARENA_FILE,
                 offset: arena_len,
                 detail: "object arena moved behind the cached WAL frontier",
             });
-        }
-        if arena_len > files.arena_len {
-            files.arena_len = arena_len;
-            if arena_tail.is_some() {
-                files.arena_tail = arena_tail;
-            }
-        }
+        };
+        files.arena_len = length;
+        files.arena_tail = tail;
         Ok(())
     }
 

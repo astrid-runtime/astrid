@@ -816,6 +816,7 @@ mod checkpoint_worker_tests;
 mod compaction;
 mod faults;
 mod format;
+mod frontier;
 mod group;
 mod index;
 mod lifecycle;

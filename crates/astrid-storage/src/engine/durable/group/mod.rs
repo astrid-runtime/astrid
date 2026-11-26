@@ -535,8 +535,12 @@ where
         // capture a half-mutated tip.
         let mut publication_poison =
             super::checkpoint_worker::PublicationPoison::armed(self.lifecycle.as_ref());
-        match self.persist_group(inner, representations.as_deref_mut(), &accepted) {
-            Ok(persisted) => {
+        let persisted = super::frontier::PersistedGroup::persist(accepted, |batch| {
+            self.persist_group(inner, representations.as_deref_mut(), batch)
+        });
+        let published = match persisted {
+            Err(failure) => Err(failure),
+            Ok(group) => group.publish(|persisted| {
                 for location in persisted.locations {
                     inner.index.insert(location.0, location.1);
                     inner.pending_index_locations.push(location);
@@ -545,42 +549,40 @@ where
                     live_files_mut(&mut inner.files)
                         .map_or(true, |files| files.arena_len >= previous_arena_len)
                 );
-                let frontier = self.publish_commit_frontier(inner, persisted.arena_len);
-                if let Err(error) = frontier {
-                    self.mark_requires_recovery(inner);
-                    publication_poison.disarm();
-                    complete_failed_group(completions, accepted, error);
-                } else {
-                    publication_poison.disarm();
-                    for mut accepted in accepted {
-                        let (published, retired) =
-                            self.publish_durable_root(inner, &mut accepted.prepared);
-                        retired_projections.extend(retired);
-                        if let Some((id, payload)) = accepted.prepared.commit.take()
-                            && let Some(location) = inner.index.get(&id).copied()
-                            && inner.pending_wal.get_object(&id).is_none()
-                        {
-                            published_commits.insert(
-                                accepted.prepared.root.owner().clone(),
-                                PublishedCommitPayload {
-                                    root: published,
-                                    arena_generation: inner.arena_generation,
-                                    location,
-                                    payload,
-                                },
-                            );
-                        }
-                        completions.push((
-                            accepted.receipt,
-                            Ok(CommitOutcome {
+                self.publish_commit_frontier(inner, persisted.arena_len)
+            }),
+        };
+        match published {
+            Ok((accepted, ())) => {
+                publication_poison.disarm();
+                for mut accepted in accepted {
+                    let (published, retired) =
+                        self.publish_durable_root(inner, &mut accepted.prepared);
+                    retired_projections.extend(retired);
+                    if let Some((id, payload)) = accepted.prepared.commit.take()
+                        && let Some(location) = inner.index.get(&id).copied()
+                        && inner.pending_wal.get_object(&id).is_none()
+                    {
+                        published_commits.insert(
+                            accepted.prepared.root.owner().clone(),
+                            PublishedCommitPayload {
                                 root: published,
-                                objects_inserted: accepted.prepared.objects_inserted,
-                            }),
-                        ));
+                                arena_generation: inner.arena_generation,
+                                location,
+                                payload,
+                            },
+                        );
                     }
+                    completions.push((
+                        accepted.receipt,
+                        Ok(CommitOutcome {
+                            root: published,
+                            objects_inserted: accepted.prepared.objects_inserted,
+                        }),
+                    ));
                 }
             },
-            Err(error) => {
+            Err((accepted, error)) => {
                 self.mark_requires_recovery(inner);
                 publication_poison.disarm();
                 complete_failed_group(completions, accepted, error);

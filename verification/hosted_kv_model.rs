@@ -223,6 +223,25 @@ fn guest_wal_round_trip(scope: &[u8], requested: &[u8], admitted: [u8;32], curre
     Some((restored,e,r))
 }
 
+/// A success receipt for the group requires both operations to have accepted
+/// the very same persisted frontier, preserving all entries and their order.
+fn complete_group<B,D,T,E,P,F>(batch: B, persist: P, advance: F)
+    -> (outcome: Result<(B,T),(B,E)>)
+    where P: FnOnce(&B) -> Result<D,E>, F: FnOnce(D) -> Result<T,E>,
+    requires
+        persist.requires((&batch,)),
+        forall|d: D| #[trigger] persist.ensures((&batch,), Ok(d)) ==> advance.requires((d,)),
+    ensures
+        outcome matches Ok((entries,receipt)) ==> entries == batch && exists|d: D|
+            #[trigger] persist.ensures((&batch,), Ok(d)) && advance.ensures((d,), Ok(receipt)),
+        outcome matches Err((entries,error)) ==> entries == batch && (
+            persist.ensures((&batch,), Err(error)) || exists|d: D|
+                #[trigger] persist.ensures((&batch,), Ok(d)) && advance.ensures((d,), Err(error))),
+{
+    let staged = crate::group_frontier::PersistedGroup::persist(batch, persist)?;
+    staged.publish(advance)
+}
+
 /// An admitted live publication can be replayed from the prior root exactly
 /// once. A second replay sees the published version, even with the same digest
 /// as the prior generation.

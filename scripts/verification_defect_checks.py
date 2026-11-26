@@ -114,6 +114,7 @@ INPUTS = [
     OVERLAY,
     KV_ENCODING,
     GUEST_AUTHORITY,
+    Path("crates/astrid-storage/src/engine/durable/frontier.rs"),
     Path("crates/astrid-storage/src/engine/durable/root_wire.rs"),
     Path("crates/astrid-storage/src/principal_state/owner_codec.rs"),
     Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),
@@ -462,6 +463,26 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "stale KV view falls back to neutral and completes the request",
             Path("verification/hosted_kv_model.rs"),
             lambda source: replace_once(source, "Some(uid) => Some(Destination::Principal(uid)),\n                None => None,", "Some(uid) => Some(Destination::Principal(uid)),\n                None => Some(Destination::Neutral),"),
+        ),
+        (
+            "WAL sync failure leaves the writer usable",
+            Path("crates/astrid-storage/src/engine/durable/frontier.rs"),
+            lambda source: replace_once(source, "*poisoned = true;", "*poisoned = false;"),
+        ),
+        (
+            "successful WAL sync acknowledges an empty group",
+            Path("crates/astrid-storage/src/engine/durable/frontier.rs"),
+            lambda source: replace_once(source, "Ok(count)", "Ok(0)"),
+        ),
+        (
+            "WAL frontier rewinds to a shorter arena",
+            Path("crates/astrid-storage/src/engine/durable/frontier.rs"),
+            lambda source: replace_once(source, "Ordering::Less => None", "Ordering::Less => Some((observed, tail))"),
+        ),
+        (
+            "unchanged WAL frontier replaces the published tail",
+            Path("crates/astrid-storage/src/engine/durable/frontier.rs"),
+            lambda source: replace_once(source, "Ordering::Equal => Some((current, tail))", "Ordering::Equal => Some((current, pending))"),
         ),
         (
             "transition journals record the construction in place of the algorithm",
@@ -1530,6 +1551,15 @@ def consumer_defects():
         lambda source: replace_once(source, "&&& bytes@.skip(*old(cursor) as int) == prior(expected,scheme) + replacement.wire(scheme)", "&&& true"),
         Path("verification/hosted_kv_model.rs"),
     )
+    for name, clause in [
+        ("group frontier loses the staged persistence result", "persist.ensures((&batch,), Ok(group.binding().1))"),
+        ("group completion loses the matching frontier receipt", "advance.ensures((self.binding().1,), Ok(frontier))"),
+    ]:
+        yield (
+            name, Path("crates/astrid-storage/src/engine/durable/frontier.rs"),
+            lambda source, clause=clause: replace_once(source, clause, "true"),
+            Path("verification/hosted_kv_model.rs"),
+        )
     consumer = Path("verification/hosted_lease_model.rs")
     yield (
         "worker loses the sink's completion guarantee",

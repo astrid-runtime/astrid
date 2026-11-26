@@ -1,3 +1,4 @@
+use super::super::frontier::{PublicationError, sync_pending};
 use std::fs::File;
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
@@ -542,26 +543,24 @@ where
     /// Sync all complete transactions appended since the previous publication.
     pub(in crate::engine::durable) fn publish(&mut self) -> Result<u64, WalError> {
         self.ensure_usable()?;
-        if self.active.is_some() {
-            return Err(WalError::InvalidTransaction(
-                "cannot publish an active transaction",
-            ));
-        }
-        if self.pending_publications == 0 {
-            return Err(WalError::InvalidTransaction(
-                "no complete transaction is pending publication",
-            ));
-        }
-        if let Err(source) = self.sink.sync_data() {
-            self.poisoned = true;
-            return Err(WalError::Io {
+        sync_pending(
+            self.active.is_some(),
+            &mut self.pending_publications,
+            &mut self.poisoned,
+            || self.sink.sync_data(),
+        )
+        .map_err(|error| match error {
+            PublicationError::Active => {
+                WalError::InvalidTransaction("cannot publish an active transaction")
+            },
+            PublicationError::Empty => {
+                WalError::InvalidTransaction("no complete transaction is pending publication")
+            },
+            PublicationError::Sync(source) => WalError::Io {
                 operation: "sync ASTWAL2 publication",
                 source,
-            });
-        }
-        let published = self.pending_publications;
-        self.pending_publications = 0;
-        Ok(published)
+            },
+        })
     }
 
     /// Retire every committed WAL record after the canonical arena, root
