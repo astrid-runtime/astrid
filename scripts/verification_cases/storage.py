@@ -15,6 +15,51 @@ from .common import (
 def defects():
     return [
         (
+            "measured WAL physical features admit flagged roots",
+            Path("crates/astrid-storage/src/engine/durable/wal/physical_wire.rs"),
+            lambda source: replace_once(source, "2 => matches!(kind,WalRecordKind::Object) && flags == 1", "2 => flags == 1"),
+        ),
+        (
+            "measured WAL physical frame drops the checksum tail",
+            Path("crates/astrid-storage/src/engine/durable/wal/physical_wire.rs"),
+            lambda source: replace_once(source, "header[20..].copy_from_slice(&self.checksum);", "header[20..51].copy_from_slice(&self.checksum[..31]);"),
+        ),
+        (
+            "measured WAL oversized record masks an incomplete span",
+            Path("crates/astrid-storage/src/engine/durable/wal/physical_wire.rs"),
+            lambda source: replace_once(source, "if end > file {Extent::Incomplete} else if size > limit {Extent::Oversized}", "if size > limit {Extent::Oversized} else if end > file {Extent::Incomplete}"),
+        ),
+        (
+            "measured WAL writer frames the next ordinal",
+            Path("crates/astrid-storage/src/engine/durable/wal/measured_record.rs"),
+            lambda source: replace_once(source, "ordinal:little_endian(self.ordinal)", "ordinal:little_endian(self.counts.logical)"),
+        ),
+        (
+            "measured WAL writer omits the stored payload",
+            Path("crates/astrid-storage/src/engine/durable/wal/measured_record.rs"),
+            lambda source: replace_once(source, "header.append(&mut frame,self.body);", "header.append(&mut frame,&[]);"),
+        ),
+        (
+            "measured WAL observer drops object flags",
+            Path("crates/astrid-storage/src/engine/durable/wal/measured_record.rs"),
+            lambda source: replace_once(source, "digest_record(self.kind,self.flags,self.counts.sequence", "digest_record(self.kind,0,self.counts.sequence"),
+        ),
+        (
+            "measured WAL root is classified as an object",
+            Path("crates/astrid-storage/src/engine/durable/wal/measured_record.rs"),
+            lambda source: replace_once(source, "(Entry::Root,WalRecordKind::Root,0)", "(Entry::Root,WalRecordKind::Object,0)"),
+        ),
+        (
+            "measured WAL begin skips ordinal zero",
+            Path("crates/astrid-storage/src/engine/durable/wal/measured_record.rs"),
+            lambda source: replace_once(source, "flags:0,ordinal:0,counts,body", "flags:0,ordinal:1,counts,body"),
+        ),
+        (
+            "measured WAL writer drops the declared seal",
+            Path("crates/astrid-storage/src/engine/durable/wal/measured_record.rs"),
+            lambda source: replace_once(source, "let bytes = self.encode(frame,hash)?;", "let bytes = frame;"),
+        ),
+        (
             "publication accepts a mismatched forward binding",
             BINDING,
             lambda text: replace_once(text, "f.as_slice() != uid.as_slice() || ", ""),

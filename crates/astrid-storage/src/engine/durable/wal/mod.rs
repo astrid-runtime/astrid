@@ -6,6 +6,7 @@
 mod codec;
 mod commit_wire;
 mod interior;
+mod measured_record;
 mod measurement;
 mod overlay;
 mod physical_wire;

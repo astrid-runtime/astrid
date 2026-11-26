@@ -207,3 +207,48 @@ fn incomplete_and_complete_oversized_candidates_have_different_recovery_boundari
         );
     }
 }
+
+#[test]
+fn measured_writer_matches_reference_frame_and_digest_vectors() {
+    use super::super::measured_record::{DataKind, Measured};
+    // The reference encoder packed the frozen ASTWAL2 fields independently
+    // and hashed them with b3sum's two domain-separated derive-key contexts.
+    let mut digest = super::super::codec::new_digest();
+    let limits = RecoveryLimits::process_addressable();
+    let begin = Measured::begin(513, b"begin").ok().unwrap();
+    let (bytes, counts) = super::super::codec::write_measured(begin, limits, &mut digest).unwrap();
+    assert_eq!(
+        hex::encode(bytes),
+        "41535457414c3200010000001900000000000000c8ebf8f4785f8dcbe8e3f3f2a7d05d6948603580701fbfabeaed0d1ca7a8e1b30100000001020000000000000000000000000000626567696e"
+    );
+    let object = Measured::append(counts, DataKind::Object(1), b"compressed")
+        .ok()
+        .unwrap();
+    let (bytes, counts) = super::super::codec::write_measured(object, limits, &mut digest).unwrap();
+    assert_eq!(
+        hex::encode(bytes),
+        "41535457414c3200020000001e00000000000000469ab70d3831d16bddb67d211bea265d9db2aff463ea9fc5edcb481295dc921b0201000001020000000000000100000000000000636f6d70726573736564"
+    );
+    let root = Measured::append(counts, DataKind::Root, b"root")
+        .ok()
+        .unwrap();
+    let (bytes, counts) = super::super::codec::write_measured(root, limits, &mut digest).unwrap();
+    assert_eq!(
+        hex::encode(bytes),
+        "41535457414c3200010000001800000000000000defd8718428c66690b9822495718565e0f6c5d17cc7e1e9a7c37bcee8fbc4d680300000001020000000000000200000000000000726f6f74"
+    );
+    assert_eq!(
+        (
+            counts.sequence,
+            counts.logical,
+            counts.objects,
+            counts.roots,
+            counts.bytes
+        ),
+        (513, 3, 1, 1, 79)
+    );
+    assert_eq!(
+        digest.finalize().to_hex().as_str(),
+        "9be4a0c43266399e10756cf2a26b845af308852ad1b0ca292a379cc922cd205d"
+    );
+}

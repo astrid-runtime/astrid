@@ -76,6 +76,22 @@ pub(super) fn encode_physical_record_with_flags(
     body: &[u8],
     limits: WalLimits,
 ) -> Result<Vec<u8>, WalError> {
+    let mut encoded = reserve_frame(body, limits)?;
+    super::record_wire::Header {
+        kind: kind.tag(),
+        flags,
+        reserved: [0; 2],
+        sequence: sequence.get().to_le_bytes(),
+        ordinal: ordinal.get().to_le_bytes(),
+    }
+    .append(&mut encoded, body);
+    if !super::physical_wire::seal(&mut encoded, flags, frame_checksum) {
+        return Err(WalError::Encoding("WAL physical header is truncated"));
+    }
+    Ok(encoded)
+}
+
+fn reserve_frame(body: &[u8], limits: WalLimits) -> Result<Vec<u8>, WalError> {
     validate_logical_body(body, limits, super::types::WalOffset::new(0))?;
     let record_len = u64::try_from(RECORD_HEADER_LEN)
         .ok()
@@ -99,18 +115,32 @@ pub(super) fn encode_physical_record_with_flags(
         .try_reserve_exact(total_len)
         .map_err(|_| WalError::Encoding("WAL physical allocation failed"))?;
     encoded.resize(PHYSICAL_HEADER_LEN, 0);
-    super::record_wire::Header {
-        kind: kind.tag(),
-        flags,
-        reserved: [0; 2],
-        sequence: sequence.get().to_le_bytes(),
-        ordinal: ordinal.get().to_le_bytes(),
-    }
-    .append(&mut encoded, body);
-    if !super::physical_wire::seal(&mut encoded, flags, frame_checksum) {
-        return Err(WalError::Encoding("WAL physical header is truncated"));
-    }
     Ok(encoded)
+}
+
+pub(super) fn write_measured(
+    record: super::measured_record::Measured<'_>,
+    limits: WalLimits,
+    hasher: &mut blake3::Hasher,
+) -> Result<(Vec<u8>, super::commit_wire::Counts), WalError> {
+    let frame = reserve_frame(record.body(), limits)?;
+    let (bytes, counts, ()) = record
+        .write(frame, frame_checksum, update_digest(hasher))
+        .ok_or(WalError::Encoding("WAL physical header is truncated"))?;
+    Ok((bytes, counts))
+}
+
+pub(super) fn update_digest(hasher: &mut blake3::Hasher) -> impl FnOnce(&[u8], &[u8]) + '_ {
+    |header, body| {
+        hasher.update(header);
+        hasher.update(body);
+    }
+}
+
+impl PhysicalHeader {
+    pub(super) fn payload_len(self) -> WalLength {
+        WalLength::new(self.size)
+    }
 }
 
 /// Parse and validate a physical header without allocating its payload.
@@ -254,6 +284,7 @@ pub(super) fn decode_begin_body(
 }
 
 /// Encode a Commit body.
+#[cfg(test)]
 pub(super) fn encode_commit_body(
     sequence: WalSequence,
     logical_count: WalCount,
@@ -521,6 +552,7 @@ pub(super) fn new_digest() -> blake3::Hasher {
 }
 
 /// Feed one canonical logical record into a digest.
+#[cfg(test)]
 pub(super) fn digest_record(
     hasher: &mut blake3::Hasher,
     kind: WalRecordKind,
@@ -536,6 +568,7 @@ pub(super) fn digest_record(
 /// Flags-zero records retain the original digest grammar exactly. A non-zero
 /// flag uses an otherwise-invalid kind prefix so decoding semantics cannot be
 /// changed without invalidating Commit.digest.
+#[cfg(test)]
 pub(super) fn digest_record_with_flags(
     hasher: &mut blake3::Hasher,
     kind: WalRecordKind,
@@ -557,7 +590,7 @@ pub(super) fn digest_record_with_flags(
     );
 }
 
-/// Return the canonical logical record length used by Commit accounting.
+/// Compute a fixture record length independently of the measured writer.
 #[cfg(test)]
 pub(super) fn logical_record_length(body: &[u8]) -> Result<WalLength, WalError> {
     let body_length = WalLength::new(

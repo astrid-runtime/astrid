@@ -6,7 +6,7 @@ verus! {
 
 /// Recover a single physical payload from a cursor in the supplied stream.
 /// The kernel state machine separately decides what to do with rejected frames.
-fn read_at<'a,F>(stream:&'a [u8], at:usize, limit:u64, hash:F,
+pub(super) fn read_at<'a,F>(stream:&'a [u8], at:usize, limit:u64, hash:F,
     Ghost(checksum):Ghost<spec_fn(Seq<u8>) -> [u8;32]>)
     -> (out:Option<(usize,&'a [u8],physical::Envelope)>)
     where F: FnOnce([u8;8],u64,&[u8]) -> [u8;32],
@@ -54,7 +54,7 @@ fn read_at<'a,F>(stream:&'a [u8], at:usize, limit:u64, hash:F,
 
 /// A sealed logical frame is readable at its actual offset between arbitrary
 /// neighboring bytes. No bytes in either neighbor enter the selected payload.
-fn round_trip<F>(prefix:&[u8], suffix:&[u8], record:logical::Header, body:&[u8], hash:F,
+fn round_trip<F>(prefix:&[u8], suffix:&[u8], record:logical::Header, body:&[u8], limit:u64, hash:F,
     Ghost(checksum):Ghost<spec_fn(Seq<u8>) -> [u8;32]>)
     -> (out:Option<(usize,Vec<u8>,bool)>)
     where F: Fn([u8;8],u64,&[u8]) -> [u8;32] + Copy,
@@ -62,7 +62,8 @@ fn round_trip<F>(prefix:&[u8], suffix:&[u8], record:logical::Header, body:&[u8],
         forall|m:[u8;8],n:u64,data:&[u8]| #[trigger] hash.requires((m,n,data)),
         forall|data:&[u8],sum:[u8;32]| #[trigger] hash.ensures((physical::MAGIC,data.len() as u64,data),sum)
             ==> sum == checksum(data@),
-    ensures out matches Some((next,bytes,features)) && next as int == prefix.len() + physical::WIDTH + logical::HEADER_LEN + body.len()
+    ensures out.is_some() == (logical::HEADER_LEN as int + body.len() <= limit),
+        out matches Some((next,bytes,features)) ==> next as int == prefix.len() + physical::WIDTH + logical::HEADER_LEN + body.len()
         && bytes@ == body@ && features == ((1 <= record.kind <= 4 && record.flags == 0) || (record.kind == 2 && record.flags == 1)),
 {
     let mut frame = vec![0u8;52];
@@ -99,7 +100,7 @@ fn round_trip<F>(prefix:&[u8], suffix:&[u8], record:logical::Header, body:&[u8],
     assert(h.subrange(12,20) =~= vstd::bytes::spec_u64_to_le_bytes(expected.size));
     assert(h.skip(20) =~= sum@);
     assert(stream@.subrange(start,start+data.len()) =~= data);
-    let result = read_at(&stream,prefix.len(),u64::MAX,hash,Ghost(checksum));
+    let result = read_at(&stream,prefix.len(),limit,hash,Ghost(checksum));
     let (next,payload,envelope) = result?;
     assert(next as int == prefix.len() + frame.len());
     assert(payload@ =~= data);

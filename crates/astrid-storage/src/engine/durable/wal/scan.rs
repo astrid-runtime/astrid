@@ -6,10 +6,10 @@ use super::super::{PersistentObjectIdentity, PrincipalCodec};
 use super::codec::{
     PHYSICAL_HEADER_LEN, RecordHeader, WAL_MAGIC, checksum_valid, decode_begin_body,
     decode_object_body, decode_object_storage_body, decode_physical_header, decode_record,
-    decode_root_body, digest_record, digest_record_with_flags, new_digest, validate_logical_body,
-    validate_record_version, wal_physical_limit,
+    decode_root_body, new_digest, update_digest, validate_logical_body, validate_record_version,
+    wal_physical_limit,
 };
-use super::measurement::{self, Entry};
+use super::measured_record::{DataKind, Measured};
 use super::physical_wire::{Extent, extent};
 use super::types::{
     WalBeginDescriptor, WalError, WalEvent, WalLength, WalLimits, WalObjectDescriptor, WalOffset,
@@ -143,7 +143,7 @@ where
         let Ok(physical) = decode_physical_header(&header, record_offset) else {
             return self.bad_physical(record_offset);
         };
-        let payload_len = WalLength::new(physical.size);
+        let payload_len = physical.payload_len();
         let limit = wal_physical_limit(self.limits).length();
         let payload_start = self
             .offset
@@ -153,7 +153,12 @@ where
             )
             .ok_or(WalError::LengthOverflow { value: payload_len })?;
         let file_len = stream_len_at(&mut self.reader, payload_start)?;
-        let payload_end = match extent(payload_start, physical.size, file_len, limit.get()) {
+        let payload_end = match extent(
+            payload_start,
+            physical.payload_len().get(),
+            file_len,
+            limit.get(),
+        ) {
             Extent::Complete(end) => end,
             Extent::Overflow => return Err(WalError::LengthOverflow { value: payload_len }),
             Extent::Incomplete => {
@@ -301,18 +306,12 @@ where
         if self.identity.scheme() != scheme {
             return Err(WalError::IdentitySchemeMismatch);
         }
-        let counts =
-            measurement::begin(record.sequence.get(), body).ok_or(WalError::CountOverflow {
+        let measured =
+            Measured::begin(record.sequence.get(), body).map_err(|_| WalError::CountOverflow {
                 field: "logical bytes",
             })?;
         let mut digest = new_digest();
-        digest_record(
-            &mut digest,
-            WalRecordKind::Begin,
-            record.sequence,
-            record.ordinal,
-            body,
-        );
+        let (counts, ()) = measured.observe(update_digest(&mut digest));
         self.active = Some(ActiveScan {
             begin_offset: offset,
             sequence: record.sequence,
@@ -350,22 +349,15 @@ where
         if previous.is_some_and(|previous| previous >= id) {
             return Err(WalError::OrderingViolation);
         }
-        let counts = measurement::append(active.counts, Entry::Object, body).map_err(|error| {
-            WalError::CountOverflow {
-                field: error.field("ordinals"),
-            }
-        })?;
-        let ordinal = WalOrdinal::new(active.counts.logical);
-        active.previous_object = Some(id);
-        digest_record_with_flags(
-            &mut active.digest,
-            WalRecordKind::Object,
-            flags,
-            active.sequence,
-            ordinal,
-            body,
-        );
+        let measured =
+            Measured::append(active.counts, DataKind::Object(flags), body).map_err(|error| {
+                WalError::CountOverflow {
+                    field: error.field("ordinals"),
+                }
+            })?;
+        let (counts, ()) = measured.observe(update_digest(&mut active.digest));
         active.counts = counts;
+        active.previous_object = Some(id);
         Ok(Some(WalEvent::Object(WalObjectDescriptor {
             offset,
             length: physical_length,
@@ -389,21 +381,14 @@ where
         if previous.is_some_and(|previous| previous >= transition.principal()) {
             return Err(WalError::OrderingViolation);
         }
-        let counts = measurement::append(active.counts, Entry::Root, body).map_err(|error| {
+        let measured = Measured::append(active.counts, DataKind::Root, body).map_err(|error| {
             WalError::CountOverflow {
                 field: error.field("ordinals"),
             }
         })?;
-        let ordinal = WalOrdinal::new(active.counts.logical);
-        active.previous_principal = Some(transition.principal().to_vec());
-        digest_record(
-            &mut active.digest,
-            WalRecordKind::Root,
-            active.sequence,
-            ordinal,
-            body,
-        );
+        let (counts, ()) = measured.observe(update_digest(&mut active.digest));
         active.counts = counts;
+        active.previous_principal = Some(transition.principal().to_vec());
         Ok(Some(WalEvent::Root(WalRootDescriptor {
             offset,
             length: physical_length,
@@ -623,7 +608,7 @@ fn probe_candidate<R: Read + Seek>(
     };
     match extent(
         start,
-        physical.size,
+        physical.payload_len().get(),
         file_len,
         wal_physical_limit(limits).length().get(),
     ) {
@@ -631,7 +616,7 @@ fn probe_candidate<R: Read + Seek>(
         Extent::Overflow | Extent::Incomplete => return Ok(Probe::Miss),
         Extent::Complete(_) => {},
     }
-    let Ok(size) = WalLength::new(physical.size).as_usize() else {
+    let Ok(size) = physical.payload_len().as_usize() else {
         return Ok(Probe::Miss);
     };
     let mut payload = Vec::new();

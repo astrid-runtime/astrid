@@ -8,11 +8,10 @@ use super::super::{IdentityScheme, PersistentObjectIdentity, PrincipalCodec};
 use crate::storage_model::{ObjectId, ObjectRecord, RootState};
 
 use super::codec::{
-    digest_record, digest_record_with_flags, encode_begin_body, encode_commit_body,
-    encode_object_body, encode_object_storage_body, encode_physical_record,
-    encode_physical_record_with_flags, finish_digest, new_digest,
+    encode_begin_body, encode_object_body, encode_object_storage_body, encode_physical_record,
+    finish_digest, new_digest, write_measured,
 };
-use super::measurement::{self, Entry};
+use super::measured_record::{DataKind, Measured};
 use super::scan::ScannedWal;
 use super::types::{
     WalBeginHints, WalCommitDescriptor, WalCount, WalError, WalLength, WalLimits,
@@ -220,24 +219,12 @@ where
         }
         let scheme = self.identity.scheme();
         let body = encode_begin_body(scheme, hints)?;
-        let counts = measurement::begin(sequence.get(), &body).ok_or(WalError::CountOverflow {
-            field: "logical bytes",
-        })?;
+        let measured =
+            Measured::begin(sequence.get(), &body).map_err(|_| WalError::CountOverflow {
+                field: "logical bytes",
+            })?;
         let mut digest = new_digest();
-        digest_record(
-            &mut digest,
-            WalRecordKind::Begin,
-            sequence,
-            WalOrdinal::new(0),
-            &body,
-        );
-        let encoded = encode_physical_record(
-            WalRecordKind::Begin,
-            sequence,
-            WalOrdinal::new(0),
-            &body,
-            self.limits,
-        )?;
+        let (encoded, counts) = write_measured(measured, self.limits, &mut digest)?;
         self.append_encoded(&encoded)?;
         self.active = Some(ActiveWrite {
             sequence,
@@ -300,8 +287,6 @@ where
         let active = self.active.as_ref().ok_or(WalError::InvalidTransaction(
             "WAL object requires an active transaction",
         ))?;
-        let sequence = active.sequence;
-        let ordinal = WalOrdinal::new(active.counts.logical);
         let previous = active.previous_object;
         if active.counts.roots != 0 || previous.is_some_and(|previous| previous >= id) {
             return Err(WalError::OrderingViolation);
@@ -311,30 +296,13 @@ where
                 .map_err(|_| WalError::Encoding("WAL object length overflow"))?,
         );
         let (flags, stored_body) = encode_object_storage_body(body)?;
-        let counts =
-            measurement::append(active.counts, Entry::Object, &stored_body).map_err(|error| {
-                WalError::CountOverflow {
-                    field: error.field("logical records"),
-                }
+        let measured = Measured::append(active.counts, DataKind::Object(flags), &stored_body)
+            .map_err(|error| WalError::CountOverflow {
+                field: error.field("logical records"),
             })?;
-        let encoded = encode_physical_record_with_flags(
-            WalRecordKind::Object,
-            flags,
-            sequence,
-            ordinal,
-            &stored_body,
-            self.limits,
-        )?;
-        let encoded_length = encoded_length(&encoded)?;
         let mut next_digest = active.digest.clone();
-        digest_record_with_flags(
-            &mut next_digest,
-            WalRecordKind::Object,
-            flags,
-            sequence,
-            ordinal,
-            &stored_body,
-        );
+        let (encoded, counts) = write_measured(measured, self.limits, &mut next_digest)?;
+        let encoded_length = encoded_length(&encoded)?;
         let offset = self.append_encoded(&encoded)?;
         let active = self.active.as_mut().ok_or(WalError::InvalidTransaction(
             "WAL transaction disappeared while appending object",
@@ -362,8 +330,6 @@ where
         let active = self.active.as_ref().ok_or(WalError::InvalidTransaction(
             "WAL root requires an active transaction",
         ))?;
-        let sequence = active.sequence;
-        let ordinal = WalOrdinal::new(active.counts.logical);
         let scheme = active.scheme;
         let previous = active.previous_principal.as_deref();
         let principal_bytes = super::codec::prepared_owner(
@@ -374,25 +340,17 @@ where
             scheme,
             &self.codec,
         )?;
-        let body = journal;
         if previous.is_some_and(|previous| previous >= principal_bytes.as_slice()) {
             return Err(WalError::OrderingViolation);
         }
-        let counts = measurement::append(active.counts, Entry::Root, body).map_err(|error| {
-            WalError::CountOverflow {
-                field: error.field("logical records"),
-            }
-        })?;
-        let encoded =
-            encode_physical_record(WalRecordKind::Root, sequence, ordinal, body, self.limits)?;
+        let measured =
+            Measured::append(active.counts, DataKind::Root, journal).map_err(|error| {
+                WalError::CountOverflow {
+                    field: error.field("logical records"),
+                }
+            })?;
         let mut next_digest = active.digest.clone();
-        digest_record(
-            &mut next_digest,
-            WalRecordKind::Root,
-            sequence,
-            ordinal,
-            body,
-        );
+        let (encoded, counts) = write_measured(measured, self.limits, &mut next_digest)?;
         self.append_encoded(&encoded)?;
         let active = self.active.as_mut().ok_or(WalError::InvalidTransaction(
             "WAL transaction disappeared while appending root",
@@ -427,14 +385,11 @@ where
                     field: "pending publications",
                 })?;
         let digest = finish_digest(&active.digest);
-        let body = encode_commit_body(
-            sequence,
-            logical_count,
-            object_count,
-            root_count,
-            logical_bytes,
-            digest,
-        );
+        let body = super::commit_wire::Marker {
+            counts: active.counts,
+            digest: *digest.as_bytes(),
+        }
+        .encode();
         let encoded =
             encode_physical_record(WalRecordKind::Commit, sequence, ordinal, &body, self.limits)?;
         let encoded_length = encoded_length(&encoded)?;

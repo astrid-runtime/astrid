@@ -94,7 +94,7 @@ class Results(unittest.TestCase):
 
 class Defects(unittest.TestCase):
     def test_every_defect_applies_to_the_sources(self) -> None:
-        for name, relative, defect in checks.defects():
+        for name, relative, defect, *_ in [*checks.defects(), *checks.consumer_defects()]:
             with self.subTest(defect=name):
                 defect((checks.ROOT / relative).read_text())
 

@@ -171,29 +171,19 @@ spec fn transcript(begin: &[u8], sequence:u64, records: Seq<(crate::wal_measurem
     }
 }
 
-fn extend_digest(prefix:Vec<u8>, kind:crate::wal_record_wire::WalRecordKind, flags:u8,
-    sequence:u64, ordinal:u64, body:&[u8]) -> (out:Vec<u8>)
-    ensures out@ == prefix@ + crate::wal_measurement::digest_header(kind,flags,sequence,ordinal,body.len() as u64) + body@,
-{
-    let ghost prior = prefix@;
-    let update = |header:&[u8],payload:&[u8]| -> (out:Vec<u8>)
-        ensures out@ == prior + header@ + payload@,
-    {
-        let mut next = prefix;
-        next.extend_from_slice(header);
-        next.extend_from_slice(payload);
-        assert(next@ =~= prior + header@ + payload@);
-        next
-    };
-    crate::wal_measurement::digest_record(kind,flags,sequence,ordinal,body,update)
-}
-
 /// Measure arbitrary prefixes with the production writer/scanner transitions,
 /// then serialize and confirm the marker using this exact observation.
-fn measured_marker<F: FnOnce(&[u8]) -> [u8;32]>(sequence: u64, begin: &[u8],
-    records: &[(crate::wal_measurement::Entry,u8,&[u8])], finish:F)
+fn measured_marker<H: Fn([u8;8],u64,&[u8])->[u8;32] + Copy, F: FnOnce(&[u8]) -> [u8;32]>(sequence: u64, begin: &[u8],
+    records: &[(crate::wal_measurement::Entry,u8,&[u8])], hash:H, checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]>, finish:F)
     -> (result: Option<CheckedMarker>)
     requires sequence != 0, forall|data:&[u8]| #[trigger] finish.requires((data,)),
+        forall|m:[u8;8],n:u64,p:&[u8]| #[trigger] hash.requires((m,n,p)),
+        forall|p:&[u8],v:[u8;32]| #[trigger] hash.ensures((crate::physical_wire::MAGIC,p.len() as u64,p),v) ==> v == (checksum@)(p@),
+        begin.len() as int + 72 <= usize::MAX,
+        forall|j:int| 0 <= j < records.len() ==> ({
+            let (entry,flags,body) = #[trigger] records@[j];
+            body.len() as int + 72 <= usize::MAX && (entry is Object ==> flags <= 1)
+        }),
     ensures result.is_some() == (forall|j:int| 0 <= j <= records.len() ==>
             #[trigger] fits(begin,records@.take(j))),
         result matches Some(marker) ==> {
@@ -205,16 +195,18 @@ fn measured_marker<F: FnOnce(&[u8]) -> [u8;32]>(sequence: u64, begin: &[u8],
         &&& exists|data:&[u8]| data@ == transcript(begin,sequence,records@) && #[trigger] finish.ensures((data,),marker.marker().digest)
     },
 {
-    let mut counts = match crate::wal_measurement::begin(sequence,begin) {
-        Some(c) => c,
-        None => { assert(!fits(begin,records@.take(0))); return None; },
-    };
+    let (_,mut data,mut counts) = crate::hosted_wal_binding::stored_record(None,sequence,begin,hash,checksum)?;
     assert(fits(begin,records@.take(0)));
-    let mut data = extend_digest(Vec::new(),crate::wal_record_wire::WalRecordKind::Begin,0,sequence,0,begin);
     assert(data@ =~= transcript(begin,sequence,records@.take(0)));
     let mut i = 0;
     while i < records.len()
         invariant data@ == transcript(begin,sequence,records@.take(i as int)),
+        forall|m:[u8;8],n:u64,p:&[u8]| #[trigger] hash.requires((m,n,p)),
+        forall|p:&[u8],v:[u8;32]| #[trigger] hash.ensures((crate::physical_wire::MAGIC,p.len() as u64,p),v) ==> v == (checksum@)(p@),
+        forall|j:int| 0 <= j < records.len() ==> ({
+            let (entry,flags,body) = #[trigger] records@[j];
+            body.len() as int + 72 <= usize::MAX && (entry is Object ==> flags <= 1)
+        }),
             forall|data:&[u8]| #[trigger] finish.requires((data,)), i <= records.len(), counts.sequence == sequence,
             counts.logical as int == 1 + i,
             forall|j:int| 0 <= j <= i ==> #[trigger] fits(begin,records@.take(j)),
@@ -229,17 +221,17 @@ fn measured_marker<F: FnOnce(&[u8]) -> [u8;32]>(sequence: u64, begin: &[u8],
             assert(next.drop_last() =~= records@.take(i as int));
             assert(next.last() == (kind,flags,body));
         }
-        let ordinal = counts.logical;
-        counts = match crate::wal_measurement::append(counts,kind,body) {
-            Ok(next) => next,
-            Err(_) => { assert(!fits(begin,records@.take(i as int + 1))); return None; },
+        let entry = match kind {
+            crate::wal_measurement::Entry::Object => crate::wal_measured_record::DataKind::Object(flags),
+            crate::wal_measurement::Entry::Root => crate::wal_measured_record::DataKind::Root,
         };
+        let (_,chunk,next) = match crate::hosted_wal_binding::stored_record(Some((counts,entry)),sequence,body,hash,checksum) {
+            Some(result) => result,
+            None => { assert(!fits(begin,records@.take(i as int + 1))); return None; },
+        };
+        counts = next;
+        data.extend_from_slice(&chunk);
         assert(fits(begin,records@.take(i as int + 1)));
-        let (tag,flags) = match kind {
-            crate::wal_measurement::Entry::Object => (crate::wal_record_wire::WalRecordKind::Object,flags),
-            crate::wal_measurement::Entry::Root => (crate::wal_record_wire::WalRecordKind::Root,0u8),
-        };
-        data = extend_digest(data,tag,flags,sequence,ordinal,body);
         i += 1;
     }
     assert(records@.take(i as int) =~= records@);

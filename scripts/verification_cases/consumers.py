@@ -10,6 +10,30 @@ from .common import (
 def consumer_defects():
     """Weaken a production guarantee and require its trace consumer to fail."""
     yield (
+        "measured WAL consumer loses the written physical payload",
+        Path("crates/astrid-storage/src/engine/durable/wal/measured_record.rs"),
+        lambda source: replace_once(source, "self.sealed(hash,bytes@) && c == self.parts().3", "c == self.parts().3"),
+        Path("verification/hosted_wal_binding.rs"),
+    )
+    yield (
+        "measured WAL consumer loses the digest input at write",
+        Path("crates/astrid-storage/src/engine/durable/wal/measured_record.rs"),
+        lambda source: replace_once(source, "c == self.parts().3 && self.observed(update,value)", "c == self.parts().3"),
+        Path("verification/hosted_wal_binding.rs"),
+    )
+    yield (
+        "measured WAL consumer loses the post-write counters",
+        Path("crates/astrid-storage/src/engine/durable/wal/measured_record.rs"),
+        lambda source: replace_once(source, "self.sealed(hash,bytes@) && c == self.parts().3 && self.observed(update,value)", "self.sealed(hash,bytes@) && self.observed(update,value)"),
+        Path("verification/hosted_wal_binding.rs"),
+    )
+    yield (
+        "measured WAL consumer loses the reader count binding",
+        Path("crates/astrid-storage/src/engine/durable/wal/measured_record.rs"),
+        lambda source: replace_once(source, "ensures result.0 == self.parts().3, self.observed(update,result.1),", "ensures self.observed(update,result.1),"),
+        Path("verification/hosted_wal_binding.rs"),
+    )
+    yield (
         "WAL physical consumer loses size equality",
         Path("crates/astrid-storage/src/engine/durable/wal/physical_wire.rs"),
         lambda source: replace_once(source, "e.size == vstd::bytes::spec_u64_from_le_bytes(header@.subrange(12,20))", "true"),
@@ -146,6 +170,13 @@ def consumer_defects():
         ("WAL measurement loses the exact stored byte total", "measurement.rs", "c.bytes as int == before.bytes as int + HEADER_LEN as int + body.len(),", "true,"),
         ("WAL measurement loses the digest transcript", "measurement.rs", "h@ == digest_header(kind,flags,sequence,ordinal,body.len() as u64)", "true"),
         ("WAL measurement loses overflow completeness", "measurement.rs", "result.is_ok() == (before.logical", "result.is_ok() ==> (before.logical"),
+    ]:
+        yield (
+            name, Path("crates/astrid-storage/src/engine/durable/wal") / path,
+            lambda source, clause=clause, weaker=weaker: replace_once(source, clause, weaker),
+            Path("crates/astrid-storage/src/engine/durable/wal/measured_record.rs"),
+        )
+    for name, path, clause, weaker in [
         ("WAL Commit encoding loses its wire contract", "commit_wire.rs", "ensures body@ == self.wire()", "ensures true"),
         ("checked WAL Commit loses the observed digest", "commit_wire.rs", "&& finish_digest.ensures((),self.digest)", "&& true"),
         ("committed prefix loses its ordered descriptors", "transaction.rs", "Ok(Step::Committed(b)) && b == p", "Ok(Step::Committed(b))"),
