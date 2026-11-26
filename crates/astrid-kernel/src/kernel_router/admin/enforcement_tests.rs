@@ -674,7 +674,7 @@ async fn queued_pair_refusal(remove_profile: bool) {
         Topic::from_raw("astrid.v1.admin.auth.pair.issue"),
         caller.clone(),
         astrid_events::ipc::DeviceStamp::default(),
-        request.into()
+        request.into(),
     ));
     tokio::select! {
         biased;

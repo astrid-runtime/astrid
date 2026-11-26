@@ -2,7 +2,7 @@
 use vstd::prelude::*;
 
 use crate::mount_reservation::Reservation;
-use crate::storage_callback::{self, Admission, ClockObservation, Issued, Effect, OperationClass};
+use crate::storage_callback::{self, Admission, ClockObservation, Effect, Issued, OperationClass};
 use crate::storage_filesystem::StorageFilesystemOperationV1;
 
 verus! {

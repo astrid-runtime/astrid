@@ -1,7 +1,7 @@
 //! Select the system administration projection only for writes on the system root.
 use super::callback::{OperationClass, operation_class};
-use astrid_core::storage_filesystem::StorageFilesystemOperationV1 as Operation;
 use super::subtree::{BoundSubtree, Owner};
+use astrid_core::storage_filesystem::StorageFilesystemOperationV1 as Operation;
 use vstd::prelude::*;
 
 verus! {
