@@ -175,7 +175,7 @@ def consumer_defects():
     yield (
         "WAL measurement loses the encoded marker witness",
         Path("verification/hosted_wal_model.rs"),
-        lambda source: replace_once(source, "ensures accepted matches Some(m) && m.marker() == marker,", "ensures true,"),
+        lambda source: replace_once(source, "out matches Some(checked) ==> checked.marker() == marker,", "true,"),
         Path("verification/hosted_wal_model.rs"),
     )
     for name, path, clause, weaker in [
