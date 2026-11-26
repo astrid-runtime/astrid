@@ -7,6 +7,14 @@ verus! {
 pub(super) const WIDTH: usize = 52;
 pub(super) const MAGIC: [u8;8] = [b'A', b'S', b'T', b'W', b'A', b'L', b'2', 0];
 
+/// Offset at which the payload of this physical frame starts.
+pub(super) fn payload_start(offset:u64) -> (out:Option<u64>)
+    ensures out.is_some() == (offset as int + WIDTH <= u64::MAX),
+        out matches Some(start) ==> start as int == offset as int + WIDTH,
+{
+    offset.checked_add(WIDTH as u64)
+}
+
 #[derive(Clone,Copy)]
 pub(super) struct Envelope {
     pub(super) version: u8,

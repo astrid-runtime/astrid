@@ -1,13 +1,44 @@
 //! Physical WAL framing under a fixed checksum function and stable stream bytes.
 use crate::{wal_physical_wire as physical, wal_record_wire as logical};
+use crate::wal_read_buffer::{self as read_buffer, Payload, Positioned, Source};
 use vstd::prelude::*;
 
 verus! {
 
+/// A stable byte reader whose maximum progress per call can be any positive
+/// size. Its cursor is advanced by exactly the bytes returned to the destination.
+struct SliceInput<'a> { image:&'a [u8], bytes:&'a [u8], chunk:usize }
+
+impl Source for SliceInput<'_> {
+    type Error = ();
+    closed spec fn image(&self) -> Seq<u8> { self.image@ }
+    closed spec fn remaining(&self) -> Seq<u8> { self.bytes@ }
+    closed spec fn failed(_remaining:Seq<u8>,_error:()) -> bool { false }
+    fn read_part(&mut self,destination:&mut [u8]) -> Result<usize,()> {
+        let n = self.bytes.len().min(destination.len()).min(self.chunk.max(1));
+        destination[..n].copy_from_slice(&self.bytes[..n]);
+        self.bytes = &self.bytes[n..];
+        Ok(n)
+    }
+}
+
+impl Positioned for SliceInput<'_> {
+    type SeekError = ();
+    closed spec fn seek_failed(_image:Seq<u8>,_start:Option<u64>,_error:()) -> bool { false }
+    fn seek_end(&mut self) -> Result<u64,Self::SeekError> {
+        self.bytes = &[];
+        Ok(self.image.len() as u64)
+    }
+    fn seek_start(&mut self,offset:u64) -> Result<(),Self::SeekError> {
+        self.bytes = if offset <= self.image.len() as u64 {&self.image[offset as usize..]} else {&[]};
+        Ok(())
+    }
+}
+
 /// Recover a single physical payload from a cursor in the supplied stream.
 /// The kernel state machine separately decides what to do with rejected frames.
 pub(super) fn read_at<'a,F>(stream:&'a [u8], at:usize, limit:u64, hash:F,
-    Ghost(checksum):Ghost<spec_fn(Seq<u8>) -> [u8;32]>)
+    Ghost(checksum):Ghost<spec_fn(Seq<u8>) -> [u8;32]>, chunk:usize)
     -> (out:Option<(usize,&'a [u8],physical::Envelope)>)
     where F: FnOnce([u8;8],u64,&[u8]) -> [u8;32],
     requires forall|m:[u8;8],len:u64,data:&[u8]| #[trigger] hash.requires((m,len,data)),
@@ -29,26 +60,53 @@ pub(super) fn read_at<'a,F>(stream:&'a [u8], at:usize, limit:u64, hash:F,
             }}
         }),
 {
-    let start = at.checked_add(physical::WIDTH)?;
-    if start > stream.len() {return None;}
+    let start = physical::payload_start(at as u64)?;
+    if start > stream.len() as u64 {return None;}
+    let start = start as usize;
     let mut raw = [0u8;52];
-    raw.copy_from_slice(&stream[at..start]);
+    let mut source = SliceInput {image:stream,bytes:&stream[at..],chunk};
+    let ghost initial = source.remaining();
+    assert(initial =~= stream@.skip(at as int));
+    let n = read_buffer::fill(&mut source,&mut raw).ok()?;
+    if n != physical::WIDTH {return None;}
+    assert(raw@.take(52) == initial.take(52));
+    assert(initial.take(52) =~= stream@.subrange(at as int,start as int));
+    assert(raw@ =~= stream@.subrange(at as int,start as int));
+    assert(source.bytes@ =~= stream@.skip(start as int));
     let header = physical::decode(&raw)?;
-    let end = match physical::extent(start as u64,header.size,stream.len() as u64,limit) {
+    let length = match read_buffer::length_at(&mut source,start as u64) {
+        Ok(n)=>n, Err(read_buffer::LengthError::End(_))|Err(read_buffer::LengthError::Restore(_))=>return None,
+    };
+    let end = match physical::extent(start as u64,header.size,length,limit) {
         physical::Extent::Complete(end) => end as usize, _ => return None,
     };
     let payload = &stream[start..end];
     assert(payload.len() as u64 == header.size);
-    if !header.validates(payload,hash) {
-        proof {
-            let sum = choose|sum:[u8;32]| sum@ != header.checksum@ && #[trigger] hash.ensures((physical::MAGIC,header.size,payload),sum);
-            assert(hash.ensures((physical::MAGIC,payload.len() as u64,payload),sum));
-            assert(sum == checksum(payload@));
-            assert(sum@ != header.checksum@);
-        }
-        return None;
+    let mut buffer = vec![0u8;end-start];
+    let ghost available = source.remaining();
+    assert(available =~= stream@.skip(start as int));
+    let integrity = read_buffer::read_payload(&mut source,buffer.as_mut_slice(),header,hash).ok()?;
+    assert(buffer@.take(buffer.len() as int) == available.take(buffer.len() as int));
+    assert(available.take(buffer.len() as int) =~= payload@);
+    assert(buffer@ =~= payload@);
+    match integrity {
+        Payload::Short => return None,
+        Payload::BadChecksum => {
+            proof {
+                let (p,sum) = choose|p:&[u8],sum:[u8;32]| p@ == buffer@ && sum@ != header.checksum@ &&
+                    #[trigger] hash.ensures((physical::MAGIC,header.size,p),sum);
+                assert(hash.ensures((physical::MAGIC,p.len() as u64,p),sum));
+                assert(sum == checksum(payload@));
+            }
+            return None;
+        },
+        Payload::Complete => {
+            proof {
+                let p = choose|p:&[u8]| p@ == buffer@ && #[trigger] hash.ensures((physical::MAGIC,header.size,p),header.checksum);
+                assert(hash.ensures((physical::MAGIC,p.len() as u64,p),header.checksum));
+            }
+        },
     }
-    assert(hash.ensures((physical::MAGIC,payload.len() as u64,payload),header.checksum));
     Some((end,payload,header))
 }
 
@@ -100,7 +158,7 @@ fn round_trip<F>(prefix:&[u8], suffix:&[u8], record:logical::Header, body:&[u8],
     assert(h.subrange(12,20) =~= vstd::bytes::spec_u64_to_le_bytes(expected.size));
     assert(h.skip(20) =~= sum@);
     assert(stream@.subrange(start,start+data.len()) =~= data);
-    let result = read_at(&stream,prefix.len(),limit,hash,Ghost(checksum));
+    let result = read_at(&stream,prefix.len(),limit,hash,Ghost(checksum),usize::MAX);
     let (next,payload,envelope) = result?;
     assert(next as int == prefix.len() + frame.len());
     assert(payload@ =~= data);
@@ -147,7 +205,7 @@ fn candidate_at<F>(stream:&[u8],at:u64,limit:u64,hash:F,Ghost(checksum):Ghost<sp
     if matches!(physical::extent(start as u64,envelope.size,stream.len() as u64,limit), physical::Extent::Oversized) {
         return true;
     }
-    read_at(stream,at as usize,limit,hash,Ghost(checksum)).is_some()
+    read_at(stream,at as usize,limit,hash,Ghost(checksum),usize::MAX).is_some()
 }
 
 fn first_interior<F>(stream:&[u8], start:u64, limit:u64, hash:F, checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]>)

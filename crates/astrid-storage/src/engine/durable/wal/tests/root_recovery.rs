@@ -1,5 +1,87 @@
 use super::*;
 
+struct ShortReads<'a> {
+    stream: Cursor<&'a [u8]>,
+    chunk: usize,
+    fail_seek: Option<SeekFrom>,
+}
+
+impl Read for ShortReads<'_> {
+    fn read(&mut self, destination: &mut [u8]) -> io::Result<usize> {
+        let n = self.chunk.min(destination.len());
+        self.stream.read(&mut destination[..n])
+    }
+}
+
+impl Seek for ShortReads<'_> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        if self.fail_seek == Some(position) {
+            return Err(io::Error::other("injected WAL seek failure"));
+        }
+        self.stream.seek(position)
+    }
+}
+
+#[test]
+fn short_reads_preserve_every_transaction_descriptor_and_restore_the_payload_cursor() {
+    let mut bytes = raw_transaction(1, Some(object_id(1)), b"alice", true);
+    bytes.extend_from_slice(&raw_transaction(2, None, b"bob", true));
+    let expected = scan_events(bytes.clone()).unwrap();
+    for chunk in [
+        1,
+        7,
+        codec::PHYSICAL_HEADER_LEN - 1,
+        codec::PHYSICAL_HEADER_LEN + 1,
+    ] {
+        let input = ShortReads {
+            stream: Cursor::new(&bytes),
+            chunk,
+            fail_seek: None,
+        };
+        let mut scanner = WalScanner::new(
+            input,
+            TestIdentity,
+            TestCodec,
+            RecoveryLimits::process_addressable(),
+        )
+        .unwrap();
+        for expected_event in &expected {
+            assert_eq!(scanner.next_event().unwrap().as_ref(), Some(expected_event));
+        }
+        assert!(scanner.next_event().unwrap().is_none());
+        assert_eq!(
+            scanner.reader().stream.position(),
+            u64::try_from(bytes.len()).unwrap()
+        );
+    }
+}
+
+#[test]
+fn length_probe_preserves_the_failed_seek_operation() {
+    let bytes = raw_transaction(1, None, b"alice", true);
+    let header_end = u64::try_from(codec::PHYSICAL_HEADER_LEN).unwrap();
+    for (seek, expected) in [
+        (SeekFrom::End(0), "read ASTWAL2 length"),
+        (SeekFrom::Start(header_end), "restore ASTWAL2 cursor"),
+    ] {
+        let reader = ShortReads {
+            stream: Cursor::new(&bytes),
+            chunk: 7,
+            fail_seek: Some(seek),
+        };
+        let mut scanner = WalScanner::new(
+            reader,
+            TestIdentity,
+            TestCodec,
+            RecoveryLimits::process_addressable(),
+        )
+        .unwrap();
+        assert!(
+            matches!(scanner.next_event(), Err(WalError::Io {operation, ..}) if operation == expected)
+        );
+    }
+}
+
 #[test]
 fn logical_header_reports_unknown_kind_before_feature_errors_at_original_offset() {
     let offset = WalOffset::new(731);
@@ -14,8 +96,14 @@ fn logical_header_reports_unknown_kind_before_feature_errors_at_original_offset(
                 if found == offset
         ));
     }
-    header[0] = 0xff;
+    header[1] = 0;
     header[2] = 1;
+    assert!(matches!(
+        codec::decode_record(&header, offset),
+        Err(WalError::Corrupt {offset: found, detail: "WAL record flags or reserved bytes are non-zero"})
+            if found == offset
+    ));
+    header[0] = 0xff;
     assert!(matches!(
         codec::decode_record(&header, offset),
         Err(WalError::Corrupt { offset: found, detail: "WAL record kind is unknown" }) if found == offset

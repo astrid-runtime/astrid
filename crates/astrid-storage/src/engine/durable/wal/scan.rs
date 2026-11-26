@@ -133,7 +133,11 @@ where
         }
         let record_offset = WalOffset::new(self.offset);
         let mut header = [0_u8; PHYSICAL_HEADER_LEN];
-        let header_bytes = read_prefix(&mut self.reader, &mut header)?;
+        let mut input = FrameInput {
+            reader: &mut self.reader,
+            purpose: ReadPurpose::Header,
+        };
+        let header_bytes = super::read_buffer::fill(&mut input, &mut header)?;
         if header_bytes == 0 {
             return Ok(self.tail_or_end(record_offset, WalTailKind::Incomplete, false));
         }
@@ -145,14 +149,9 @@ where
         };
         let payload_len = physical.payload_len();
         let limit = wal_physical_limit(self.limits).length();
-        let payload_start = self
-            .offset
-            .checked_add(
-                u64::try_from(PHYSICAL_HEADER_LEN)
-                    .map_err(|_| WalError::Encoding("WAL physical header length overflow"))?,
-            )
+        let payload_start = super::physical_wire::payload_start(record_offset.get())
             .ok_or(WalError::LengthOverflow { value: payload_len })?;
-        let file_len = stream_len_at(&mut self.reader, payload_start)?;
+        let file_len = stream_len_at(&mut input, payload_start)?;
         let payload_end = match extent(
             payload_start,
             physical.payload_len().get(),
@@ -198,9 +197,21 @@ where
             .try_reserve_exact(payload_size)
             .map_err(|_| WalError::Encoding("WAL record allocation failed"))?;
         payload.resize(payload_size, 0);
-        read_exact_payload(&mut self.reader, &mut payload, record_offset)?;
+        input.purpose = ReadPurpose::Payload;
+        let integrity = super::read_buffer::read_payload(
+            &mut input,
+            &mut payload,
+            physical,
+            super::super::format::frame_checksum,
+        )?;
+        if matches!(integrity, super::read_buffer::Payload::Short) {
+            return Err(WalError::Corrupt {
+                offset: record_offset,
+                detail: "WAL payload ended unexpectedly",
+            });
+        }
         self.offset = payload_end;
-        if !checksum_valid(physical, &payload) {
+        if matches!(integrity, super::read_buffer::Payload::BadChecksum) {
             return self.bad_physical(record_offset);
         }
         let (record, body) = decode_record(&payload, record_offset)?;
@@ -488,65 +499,67 @@ where
     }
 }
 
-fn read_prefix<R: Read>(reader: &mut R, destination: &mut [u8]) -> Result<usize, WalError> {
-    let mut read = 0_usize;
-    while read < destination.len() {
-        let amount = reader
-            .read(&mut destination[read..])
-            .map_err(|source| WalError::Io {
-                operation: "read ASTWAL2 header",
-                source,
-            })?;
-        if amount == 0 {
-            break;
-        }
-        read = read.checked_add(amount).ok_or(WalError::CountOverflow {
-            field: "header bytes",
-        })?;
-    }
-    Ok(read)
+#[derive(Clone, Copy)]
+enum ReadPurpose {
+    Header,
+    Payload,
+    Interior(&'static str),
 }
 
-fn read_exact_payload<R: Read>(
-    reader: &mut R,
-    payload: &mut [u8],
-    offset: WalOffset,
-) -> Result<(), WalError> {
-    let mut read = 0_usize;
-    while read < payload.len() {
-        let amount = reader
-            .read(&mut payload[read..])
-            .map_err(|source| WalError::Io {
-                operation: "read ASTWAL2 payload",
-                source,
-            })?;
-        if amount == 0 {
-            return Err(WalError::Corrupt {
-                offset,
-                detail: "WAL payload ended unexpectedly",
-            });
-        }
-        read = read.checked_add(amount).ok_or(WalError::CountOverflow {
-            field: "payload bytes",
-        })?;
-    }
-    Ok(())
+struct FrameInput<'a, R> {
+    reader: &'a mut R,
+    purpose: ReadPurpose,
 }
 
-fn stream_len_at<R: Seek>(reader: &mut R, restore: u64) -> Result<u64, WalError> {
-    let length = reader
-        .seek(SeekFrom::End(0))
-        .map_err(|source| WalError::Io {
+impl<R: Read> super::read_buffer::Source for FrameInput<'_, R> {
+    type Error = WalError;
+
+    fn read_part(&mut self, destination: &mut [u8]) -> Result<usize, WalError> {
+        let (operation, field) = match self.purpose {
+            ReadPurpose::Header => ("read ASTWAL2 header", "header bytes"),
+            ReadPurpose::Payload => ("read ASTWAL2 payload", "payload bytes"),
+            ReadPurpose::Interior(operation) => (operation, "interior probe bytes"),
+        };
+        loop {
+            match self.reader.read(destination) {
+                Ok(n) if n <= destination.len() => return Ok(n),
+                Ok(_) => return Err(WalError::CountOverflow { field }),
+                Err(source)
+                    if matches!(self.purpose, ReadPurpose::Interior(_))
+                        && source.kind() == std::io::ErrorKind::Interrupted => {},
+                Err(source) => return Err(WalError::Io { operation, source }),
+            }
+        }
+    }
+}
+
+impl<R: Read + Seek> super::read_buffer::Positioned for FrameInput<'_, R> {
+    type SeekError = std::io::Error;
+
+    fn seek_end(&mut self) -> Result<u64, Self::SeekError> {
+        self.reader.seek(SeekFrom::End(0))
+    }
+
+    fn seek_start(&mut self, offset: u64) -> Result<(), Self::SeekError> {
+        self.reader.seek(SeekFrom::Start(offset)).map(|_| ())
+    }
+}
+
+fn stream_len_at<R: Read + Seek>(
+    input: &mut FrameInput<'_, R>,
+    restore: u64,
+) -> Result<u64, WalError> {
+    use super::read_buffer::LengthError;
+    super::read_buffer::length_at(input, restore).map_err(|error| match error {
+        LengthError::End(source) => WalError::Io {
             operation: "read ASTWAL2 length",
             source,
-        })?;
-    reader
-        .seek(SeekFrom::Start(restore))
-        .map_err(|source| WalError::Io {
+        },
+        LengthError::Restore(source) => WalError::Io {
             operation: "restore ASTWAL2 cursor",
             source,
-        })?;
-    Ok(length)
+        },
+    })
 }
 
 fn has_valid_physical_after<R: Read + Seek>(
@@ -603,7 +616,7 @@ fn probe_candidate<R: Read + Seek>(
     let Ok(physical) = decode_physical_header(&header, WalOffset::new(candidate)) else {
         return Ok(Probe::Miss);
     };
-    let Some(start) = candidate.checked_add(PHYSICAL_HEADER_LEN as u64) else {
+    let Some(start) = super::physical_wire::payload_start(candidate) else {
         return Ok(Probe::Miss);
     };
     match extent(
@@ -638,19 +651,15 @@ fn read_probe<R: Read>(
     destination: &mut [u8],
     operation: &'static str,
 ) -> Result<bool, WalError> {
-    let mut read = 0_usize;
-    while read < destination.len() {
-        match reader.read(&mut destination[read..]) {
-            Ok(0) => return Ok(false),
-            Ok(amount) => {
-                read = read.checked_add(amount).ok_or(WalError::CountOverflow {
-                    field: "interior probe bytes",
-                })?;
-            },
-            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {},
-            Err(source) if source.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
-            Err(source) => return Err(WalError::Io { operation, source }),
-        }
+    let mut input = FrameInput {
+        reader,
+        purpose: ReadPurpose::Interior(operation),
+    };
+    match super::read_buffer::fill(&mut input, destination) {
+        Ok(filled) => Ok(filled == destination.len()),
+        Err(WalError::Io { source, .. }) if source.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Ok(false)
+        },
+        Err(error) => Err(error),
     }
-    Ok(true)
 }

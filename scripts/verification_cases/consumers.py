@@ -10,6 +10,36 @@ from .common import (
 def consumer_defects():
     """Weaken a production guarantee and require its trace consumer to fail."""
     yield (
+        "WAL Commit encoding loses its wire contract",
+        Path("crates/astrid-storage/src/engine/durable/wal/commit_wire.rs"),
+        lambda source: replace_once(source, "ensures body@ == self.wire()", "ensures true"),
+        Path("verification/hosted_wal_writer_trace.rs"),
+    )
+    yield (
+        "file reader loses the bytes preceding EOF",
+        Path("crates/astrid-storage/src/engine/durable/wal/read_buffer.rs"),
+        lambda source: replace_once(source, "&&& final(destination)@.take(n as int) == input.take(n as int)", "&&& true"),
+        Path("verification/hosted_wal_physical_model.rs"),
+    )
+    yield (
+        "file reader loses the confirmed payload checksum",
+        Path("crates/astrid-storage/src/engine/durable/wal/read_buffer.rs"),
+        lambda source: replace_once(source, "exists|p:&[u8]| p@ == final(destination)@ && #[trigger] hash.ensures((MAGIC,envelope.size,p),envelope.checksum)", "true"),
+        Path("verification/hosted_wal_physical_model.rs"),
+    )
+    yield (
+        "file reader loses the observed file length",
+        Path("crates/astrid-storage/src/engine/durable/wal/read_buffer.rs"),
+        lambda source: replace_once(source, "out matches Ok(length) ==> length == old(source).image().len() &&", "out matches Ok(length) ==>"),
+        Path("verification/hosted_wal_physical_model.rs"),
+    )
+    yield (
+        "writer trace loses the reader's exact root span",
+        Path("verification/hosted_wal_stream.rs"),
+        lambda source: replace_once(source, "scanned.trace@.0 == w.rows && scanned.trace@.1 == w.commit &&", ""),
+        Path("verification/hosted_wal_writer_trace.rs"),
+    )
+    yield (
         "stream scan loses the released descriptor batch",
         Path("crates/astrid-storage/src/engine/durable/wal/transaction.rs"),
         lambda source: replace_once(source, "result matches Ok(Step::Committed(b)) && b == p", "result matches Ok(Step::Committed(_))"),
@@ -73,7 +103,7 @@ def consumer_defects():
         "WAL physical consumer loses checksum refusal witness",
         Path("crates/astrid-storage/src/engine/durable/wal/physical_wire.rs"),
         lambda source: replace_once(source, "!ok && payload.len() == self.size ==>", "false ==>"),
-        Path("verification/hosted_wal_physical_model.rs"),
+        Path("crates/astrid-storage/src/engine/durable/wal/read_buffer.rs"),
     )
     yield (
         "WAL physical consumer loses first candidate completeness",
@@ -207,7 +237,6 @@ def consumer_defects():
             Path("crates/astrid-storage/src/engine/durable/wal/measured_record.rs"),
         )
     for name, path, clause, weaker in [
-        ("WAL Commit encoding loses its wire contract", "commit_wire.rs", "ensures body@ == self.wire()", "ensures true"),
         ("checked WAL Commit loses the observed digest", "commit_wire.rs", "&& finish_digest.ensures((),self.digest)", "&& true"),
         ("committed prefix loses its ordered descriptors", "transaction.rs", "Ok(Step::Committed(b)) && b == p", "Ok(Step::Committed(b))"),
         ("WAL prefix loses its terminal tail guarantee", "transaction.rs", "Event::Tail => result matches Ok(Step::End)", "Event::Tail => true"),

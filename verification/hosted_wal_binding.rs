@@ -75,7 +75,7 @@ fn write_and_read<F>(record:Measured, prior:Option<Counts>, prefix:&[u8], suffix
     assert(h.subrange(12,20) =~= vstd::bytes::spec_u64_to_le_bytes(envelope.size));
     assert(h.skip(20) =~= sum@);
     assert(stream@.subrange(start,start + payload.len()) =~= payload);
-    let (end,bytes,physical) = read_at(&stream,prefix.len(),limit,hash,checksum)?;
+    let (end,bytes,physical) = read_at(&stream,prefix.len(),limit,hash,checksum,usize::MAX)?;
     assert(end as int == prefix.len() + frame.len());
     assert(bytes@ =~= payload);
     let (decoded,body) = logical::split(bytes)?;

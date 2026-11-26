@@ -99,6 +99,8 @@ mod commit_wire;
 mod wal_transaction;
 #[path = "../crates/astrid-storage/src/engine/durable/wal/record_wire.rs"]
 mod wal_record_wire;
+#[path = "../crates/astrid-storage/src/engine/durable/wal/read_buffer.rs"]
+mod wal_read_buffer;
 use wal_record_wire as record_wire;
 #[path = "../crates/astrid-storage/src/engine/durable/wal/measurement.rs"]
 mod wal_measurement;

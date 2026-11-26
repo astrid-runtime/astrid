@@ -14,7 +14,33 @@ from .common import (
 
 def defects():
     stream = Path("verification/hosted_wal_stream.rs")
+    buffer = Path("crates/astrid-storage/src/engine/durable/wal/read_buffer.rs")
     return [
+        (
+            "file reader repeats the first destination after a short read",
+            buffer,
+            lambda source: replace_once(source, "destination[filled..]", "destination[..]"),
+        ),
+        (
+            "file reader treats the first fragment as the entire buffer",
+            buffer,
+            lambda source: replace_once(source, "filled = filled.saturating_add(n);", "return Ok(n);"),
+        ),
+        (
+            "file reader accepts a missing payload suffix",
+            buffer,
+            lambda source: replace_once(source, "return Ok(Payload::Short)", "return Ok(Payload::Complete)"),
+        ),
+        (
+            "file reader restores the file length instead of the payload cursor",
+            buffer,
+            lambda source: replace_once(source, "source.seek_start(restore)", "source.seek_start(length)"),
+        ),
+        (
+            "file reader accepts a failed cursor restoration",
+            buffer,
+            lambda source: replace_once(source, "Err(e)=>Err(LengthError::Restore(e))", "Err(_)=>Ok(length)"),
+        ),
         (
             "stream scan releases the batch against the Commit offset",
             stream,
@@ -28,7 +54,7 @@ def defects():
         (
             "stream scan restarts at Begin instead of advancing",
             stream,
-            lambda source: replace_once(source, "read_record(stream,cursor,limit,hash,checksum,Ghost(hint))", "read_record(stream,start,limit,hash,checksum,Ghost(hint))"),
+            lambda source: replace_once(source, "read_record(stream,cursor,limit,chunk_size,hash,checksum,Ghost(hint))", "read_record(stream,start,limit,chunk_size,hash,checksum,Ghost(hint))"),
         ),
         (
             "stream scan refuses every completed transaction",
@@ -68,12 +94,12 @@ def defects():
         (
             "measured WAL reader ignores the supplied frame offset",
             Path("verification/hosted_wal_binding.rs"),
-            lambda source: replace_once(source, "read_at(&stream,prefix.len(),limit,hash,checksum)", "read_at(&stream,0,limit,hash,checksum)"),
+            lambda source: replace_once(source, "read_at(&stream,prefix.len(),limit,hash,checksum,usize::MAX)", "read_at(&stream,0,limit,hash,checksum,usize::MAX)"),
         ),
         (
             "measured WAL reader ignores the supplied payload limit",
             Path("verification/hosted_wal_binding.rs"),
-            lambda source: replace_once(source, "read_at(&stream,prefix.len(),limit,hash,checksum)", "read_at(&stream,prefix.len(),u64::MAX,hash,checksum)"),
+            lambda source: replace_once(source, "read_at(&stream,prefix.len(),limit,hash,checksum,usize::MAX)", "read_at(&stream,prefix.len(),u64::MAX,hash,checksum,usize::MAX)"),
         ),
         (
             "measured WAL object parser accepts an unknown storage flag",

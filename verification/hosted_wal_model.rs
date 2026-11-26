@@ -86,7 +86,7 @@ fn writer_marker_is_readable<H>(marker:Marker, observed:Counts, digest:[u8;32],
     assert(h.subrange(12,20) =~= vstd::bytes::spec_u64_to_le_bytes(92));
     assert(h.skip(20) =~= sum@);
     assert(stream@.subrange(start,start+92) =~= data);
-    let (next,bytes,physical) = crate::hosted_wal_physical_model::read_at(&stream,prefix.len(),limit,hash,checksum)?;
+    let (next,bytes,physical) = crate::hosted_wal_physical_model::read_at(&stream,prefix.len(),limit,hash,checksum,usize::MAX)?;
     assert(next as int == prefix.len() + 144);
     assert(bytes@ =~= data);
     let (header,body) = logical::split(bytes)?;

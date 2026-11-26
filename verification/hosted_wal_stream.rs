@@ -5,6 +5,9 @@ use crate::{commit_wire::{self, CheckedMarker, Counts}, hosted_wal_physical_mode
 use crate::wal_transaction::{advance, Batch, Event, Origin, Step};
 use vstd::prelude::*;
 
+#[path = "hosted_wal_writer_trace.rs"]
+mod writer_trace;
+
 verus! {
 
 #[derive(Clone, Copy)]
@@ -29,7 +32,7 @@ spec fn at_record(stream:Seq<u8>, at:int, r:Record, limit:u64, checksum:spec_fn(
     &&& r.next as int == at + physical::WIDTH + logical::HEADER_LEN + r.body.len()
 }
 
-fn read_record<'a,H>(stream:&'a [u8],at:usize,limit:u64,hash:H,checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]>, hint:Ghost<Option<Record<'a>>>)
+fn read_record<'a,H>(stream:&'a [u8],at:usize,limit:u64,chunk_size:usize,hash:H,checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]>, hint:Ghost<Option<Record<'a>>>)
     -> (out:Option<Record<'a>>) where H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,
     requires forall|m:[u8;8],n:u64,p:&[u8]| #[trigger] hash.requires((m,n,p)),
         forall|p:&[u8],v:[u8;32]| #[trigger] hash.ensures((physical::MAGIC,p.len() as u64,p),v) ==> v == (checksum@)(p@),
@@ -57,7 +60,7 @@ fn read_record<'a,H>(stream:&'a [u8],at:usize,limit:u64,hash:H,checksum:Ghost<sp
             assert(stream@.subrange(at as int+52,r.next as int) =~= span.skip(52));
         }
     }
-    let (next,payload,envelope) = read_at(stream,at,limit,hash,checksum)?;
+    let (next,payload,envelope) = read_at(stream,at,limit,hash,checksum,chunk_size)?;
     let (header,body) = logical::split(payload)?;
     proof {
         if let Some(r) = hint@ {
@@ -257,7 +260,7 @@ struct Scan<'a> {
 /// at successive offsets from this stream. No caller-supplied event list or
 /// record count controls the loop or chooses the Commit.
 #[verifier::rlimit(15)]
-fn scan_transaction<'a,H,F>(stream:&'a [u8],start:usize,limit:u64,hash:H,
+fn scan_transaction<'a,H,F>(stream:&'a [u8],start:usize,limit:u64,chunk_size:usize,hash:H,
     checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]>,finish:F, digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>, witness:Ghost<Option<Layout<'a>>>)
     -> (out:Option<Scan<'a>>)
     where H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,F:FnOnce(&[u8])->[u8;32],
@@ -266,13 +269,13 @@ fn scan_transaction<'a,H,F>(stream:&'a [u8],start:usize,limit:u64,hash:H,
         forall|p:&[u8]| #[trigger] finish.requires((p,)),
         forall|p:&[u8],v:[u8;32]| #[trigger] finish.ensures((p,),v) ==> v == (digest@)(p@),
         witness@ matches Some(w) ==> complete(w,stream@,start,limit,checksum@,digest@),
-    ensures witness@ matches Some(w) ==> out matches Some(scanned) && scanned.end == w.commit.next &&
+    ensures witness@ matches Some(w) ==> out matches Some(scanned) && scanned.end == w.commit.next && scanned.trace@.0 == w.rows && scanned.trace@.1 == w.commit &&
         scanned.marker.marker() == (commit_wire::Marker {counts:w.states.last(),digest:(digest@)(transcript(w.rows))}),
         out matches Some(scanned) ==> receipt(stream@,start,limit,checksum@,digest@,
         scanned.end,scanned.marker,scanned.trace@.0,scanned.trace@.1) && released(scanned,start),
 {
     proof { if let Some(w) = witness@ {begin_facts(w,stream@,start,limit,checksum@,digest@);} }
-    let begin = read_record(stream,start,limit,hash,checksum,Ghost(match witness@ {Some(w)=>Some(w.rows[0]),None=>None}))?;
+    let begin = read_record(stream,start,limit,chunk_size,hash,checksum,Ghost(match witness@ {Some(w)=>Some(w.rows[0]),None=>None}))?;
     if !matches!(begin.kind,WalRecordKind::Begin) || begin.ordinal != 0 {return None;}
     let sequence = begin.sequence;
     let mut cursor = begin.next;
@@ -317,7 +320,7 @@ fn scan_transaction<'a,H,F>(stream:&'a [u8],start:usize,limit:u64,hash:H,
                 else { assert(step(w.rows[rs.len() as int],counts,w.states[rs.len() as int])); }
             }
         }
-        let r = read_record(stream,cursor,limit,hash,checksum,Ghost(hint))?;
+        let r = read_record(stream,cursor,limit,chunk_size,hash,checksum,Ghost(hint))?;
         let body = logical::body_at_position(r.body,r.sequence,r.ordinal,sequence,counts.logical).ok()?;
         let kind = match r.kind {
             WalRecordKind::Begin => return None,
@@ -379,7 +382,7 @@ fn scan_transaction<'a,H,F>(stream:&'a [u8],start:usize,limit:u64,hash:H,
 
 /// The external byte-stream contract needs no record list. A mathematical
 /// layout, when one exists, supplies hints only to the verifier.
-fn recover<'a,H,F>(stream:&'a [u8],start:usize,limit:u64,hash:H,
+fn recover<'a,H,F>(stream:&'a [u8],start:usize,limit:u64,chunk_size:usize,hash:H,
     checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]>,finish:F,digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>)
     -> (out:Option<Scan<'a>>)
     where H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,F:FnOnce(&[u8])->[u8;32],
@@ -393,7 +396,7 @@ fn recover<'a,H,F>(stream:&'a [u8],start:usize,limit:u64,hash:H,
     let ghost hint = if exists|w:Layout| #[trigger] complete(w,stream@,start,limit,checksum@,digest@) {
         Some(choose|w:Layout| #[trigger] complete(w,stream@,start,limit,checksum@,digest@))
     } else {None};
-    scan_transaction(stream,start,limit,hash,checksum,finish,digest,Ghost(hint))
+    scan_transaction(stream,start,limit,chunk_size,hash,checksum,finish,digest,Ghost(hint))
 }
 
 }

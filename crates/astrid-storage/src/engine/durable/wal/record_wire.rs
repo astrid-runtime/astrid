@@ -72,7 +72,6 @@ impl Header {
         Ok(kind)
     }
 
-
     pub(super) open spec fn bytes(&self) -> Seq<u8> {
         seq![self.kind,self.flags] + self.reserved@ + self.sequence@ + self.ordinal@
     }

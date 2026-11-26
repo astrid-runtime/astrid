@@ -10,6 +10,7 @@ mod measured_record;
 mod measurement;
 mod overlay;
 mod physical_wire;
+mod read_buffer;
 mod record_wire;
 mod replay;
 mod scan;
