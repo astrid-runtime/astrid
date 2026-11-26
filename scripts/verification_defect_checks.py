@@ -37,7 +37,9 @@ VIEW_OWNER = Path("crates/astrid-capsule/src/registry/view_owner.rs")
 ROUTE_GATE = Path("crates/astrid-events/src/route/gate/state.rs")
 ROUTE_SCOPE = Path("crates/astrid-events/src/route/scope.rs")
 PRINCIPAL_SYNTAX = Path("crates/astrid-core/src/principal/syntax.rs")
+INGRESS_FRAME = Path("crates/astrid-capsule/src/engine/wasm/host/net/ingress_frame.rs")
 INPUTS = [
+    INGRESS_FRAME,
     PRINCIPAL_SYNTAX,
     ROUTE_SCOPE,
     ROUTE_GATE,
@@ -164,6 +166,16 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "retired receiver releases its buffered payload",
             ROUTE_GATE,
             lambda text: replace_once(text, "if admits(current) { Some(pending)", "if true { Some(pending)"),
+        ),
+        (
+            "non-uplink read earns ingress identity",
+            INGRESS_FRAME,
+            lambda text: replace_once(text, "    if uplink && data", "    if data"),
+        ),
+        (
+            "empty read earns ingress identity",
+            INGRESS_FRAME,
+            lambda text: replace_once(text, "    if uplink && data", "    if uplink"),
         ),
         (
             "scoped IPC route accepts foreign publisher bytes",

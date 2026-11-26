@@ -67,12 +67,24 @@ pub(super) fn emit_client_disconnect(state: &HostState, rep: u32) {
     let Some((_, principal)) = state.client_connections.remove(&rep) else {
         return;
     };
+    publish_disconnect(state, &principal);
+}
+
+fn publish_disconnect(state: &HostState, principal: &PrincipalId) {
     publish_lifecycle(
         state,
         Topic::client_disconnect(),
         IpcPayload::RawJson(serde_json::json!({ "reason": "socket closed" })),
-        &principal,
+        principal,
     );
+}
+
+/// Pair outstanding accepts with disconnects when the Store discards its table.
+pub(crate) fn disconnect_remaining_clients(state: &mut HostState) {
+    let connections = std::mem::take(&mut state.client_connections);
+    for (_, principal) in connections {
+        publish_disconnect(state, &principal);
+    }
 }
 
 /// Publish a lifecycle event on the kernel event bus stamped with the

@@ -50,3 +50,6 @@ mod route_scope;
 
 #[path = "../crates/astrid-core/src/principal/syntax.rs"]
 mod principal_syntax;
+
+#[path = "../crates/astrid-capsule/src/engine/wasm/host/net/ingress_frame.rs"]
+mod ingress_frame;

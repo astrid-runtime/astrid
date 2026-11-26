@@ -6,27 +6,23 @@ use super::*;
 impl HostState {
     /// Build a fresh, empty per-connection identity registry.
     ///
-    /// Callers that construct a `HostState` outside the pooled-capsule path
-    /// (lifecycle hooks, the hook handler, tests) use this so they do not have
-    /// to name the `dashmap` type. The pooled path instead clones one shared
-    /// registry into every instance (issue #45/#852).
+    /// Each registry belongs to the Store whose resource table allocated the handles.
     #[must_use]
-    pub fn new_connection_principals() -> Arc<dashmap::DashMap<u32, ConnectionIdentity>> {
-        Arc::new(dashmap::DashMap::new())
+    pub fn new_connection_principals() -> dashmap::DashMap<u32, ConnectionIdentity> {
+        dashmap::DashMap::new()
     }
 
-    /// Build a fresh, empty per-connection client-lifecycle registry.
-    ///
-    /// Distinct from [`new_connection_principals`](Self::new_connection_principals):
-    /// `client_connections` maps a stream rep to the verified principal alone
-    /// (no device id) for the connect/disconnect counter, whereas
-    /// `connection_principals` carries the device-aware [`ConnectionIdentity`].
-    /// Out-of-pool constructors (lifecycle hooks, the hook handler, tests) use
-    /// this so they do not have to name the `dashmap` type.
+    /// Track inbound client lifecycle events for this Store's resource table.
     #[must_use]
-    pub fn new_client_connections()
-    -> Arc<dashmap::DashMap<u32, astrid_core::principal::PrincipalId>> {
-        Arc::new(dashmap::DashMap::new())
+    pub fn new_client_connections() -> dashmap::DashMap<u32, astrid_core::principal::PrincipalId> {
+        dashmap::DashMap::new()
+    }
+
+    pub(crate) fn clear_ingress_frame(&mut self) {
+        self.ingress_principal = None;
+        self.ingress_device_key_id = None;
+        self.ingress_request_owner = None;
+        self.ingress_origin = None;
     }
 
     /// Build a fresh, empty shared-listener registry.

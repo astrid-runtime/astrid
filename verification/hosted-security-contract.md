@@ -127,6 +127,16 @@ delivery after an
 already admitted handoff and confinement of subsequent handler effects remain
 separate obligations.
 
+For host-local framed ingress, each Wasmtime Store owns the connection
+identities indexed by its own resource table. The framed read clears any
+previous stamp before resolving the handle. Its checked selector returns
+the supplied identity exactly when the capsule holds the uplink capability
+and the read produced data. A byte read, read-stream request, lease reset
+or successful drop of the stamped connection also clears the stamp.
+The selector theorem assumes its binding input. Handshake authenticity,
+Wasmtime handle allocation and attribution of a later guest publication
+to the contents of that frame still require refinement.
+
 ## Native MCP network authority
 
 Native stdio MCP capsules requesting network domains or outbound TCP destinations fail during load. The process sandbox accepts only a Boolean network setting and cannot express the manifest's destination policy. Accepted native capsule configurations request networking disabled, including for uplinks. The scope of this decision is the capsule host engine. Standalone MCP server configurations and operator-selected sandbox policies require separate treatment in the hosted security argument.
