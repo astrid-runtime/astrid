@@ -6,6 +6,9 @@ mod pair_issue_result;
 #[path = "../crates/astrid-capsule/src/engine/wasm/storage_file.rs"]
 mod storage_file;
 
+#[path = "../crates/astrid-capsule/src/engine/wasm/storage_handles.rs"]
+mod storage_handles;
+
 #[path = "../crates/astrid-capsule/src/engine/wasm/mount_selection.rs"]
 mod mount_selection;
 

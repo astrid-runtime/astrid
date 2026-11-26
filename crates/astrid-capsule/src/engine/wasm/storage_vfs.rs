@@ -11,6 +11,7 @@
 #![cfg(not(target_family = "wasm"))]
 
 use super::storage_file::{OpenFile, WriteRange};
+use super::storage_handles::FileHandles;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -148,7 +149,7 @@ pub(crate) struct AstridStorageVfs {
     open_dirs: RwLock<HashMap<DirHandle, FilesystemPath>>,
     // Read/write borrow an entry through the table guard. Removing it gives close
     // exclusive ownership, with no further lock wait before publication.
-    open_files: RwLock<HashMap<FileHandle, Mutex<OpenFile<FilesystemPath>>>>,
+    open_files: RwLock<FileHandles<Mutex<OpenFile<FilesystemPath>>>>,
 }
 
 impl AstridStorageVfs {
@@ -189,7 +190,7 @@ impl AstridStorageVfs {
         Self {
             filesystem: Box::new(WorkspaceBackend(filesystem)),
             open_dirs: RwLock::new(open_dirs),
-            open_files: RwLock::new(HashMap::new()),
+            open_files: RwLock::new(FileHandles::new()),
         }
     }
 
@@ -206,7 +207,7 @@ impl AstridStorageVfs {
         Self {
             filesystem: Box::new(OwnerBackend(AstridFilesystem::new(content, owner))),
             open_dirs: RwLock::new(open_dirs),
-            open_files: RwLock::new(HashMap::new()),
+            open_files: RwLock::new(FileHandles::new()),
         }
     }
 
@@ -231,7 +232,7 @@ impl AstridStorageVfs {
         let vfs = Self {
             filesystem,
             open_dirs: RwLock::new(HashMap::new()),
-            open_files: RwLock::new(HashMap::new()),
+            open_files: RwLock::new(FileHandles::new()),
         };
         vfs.ensure_prefix(&prefix)?;
         let mut open_dirs = HashMap::new();
@@ -441,10 +442,13 @@ impl Vfs for AstridStorageVfs {
         }
         let (bytes, dirty) = self.file_entry(&path, write, truncate).await?;
         let new_handle = FileHandle::new();
-        self.open_files.write().await.insert(
-            new_handle.clone(),
+        let registered = self.open_files.write().await.register(
+            new_handle.0.clone(),
             Mutex::new(OpenFile::new(path, bytes, write, dirty)),
         );
+        if !registered {
+            return Err(VfsError::Io(std::io::Error::other("file handle collision")));
+        }
         Ok(new_handle)
     }
 
@@ -474,14 +478,14 @@ impl Vfs for AstridStorageVfs {
 
     async fn read(&self, handle: &FileHandle) -> VfsResult<Vec<u8>> {
         let files = self.open_files.read().await;
-        let file = files.get(handle).ok_or(VfsError::InvalidHandle)?;
+        let file = files.lookup(&handle.0).ok_or(VfsError::InvalidHandle)?;
         let mut file = file.lock().await;
         Ok(file.read_remaining())
     }
 
     async fn write(&self, handle: &FileHandle, content: &[u8]) -> VfsResult<()> {
         let files = self.open_files.read().await;
-        let file = files.get(handle).ok_or(VfsError::InvalidHandle)?;
+        let file = files.lookup(&handle.0).ok_or(VfsError::InvalidHandle)?;
         let mut file = file.lock().await;
         match file.write_bytes(content) {
             WriteRange::End(_) => Ok(()),
@@ -497,7 +501,7 @@ impl Vfs for AstridStorageVfs {
             .open_files
             .write()
             .await
-            .remove(handle)
+            .retire(&handle.0)
             .ok_or(VfsError::InvalidHandle)?;
         let file = file.into_inner();
         if let Some((path, bytes)) = file.publication() {
@@ -683,6 +687,14 @@ mod tests {
             .open(&second_root, path, false, false)
             .await
             .expect("reopen second");
+        assert!(matches!(
+            first.close(&second_read).await,
+            Err(VfsError::InvalidHandle)
+        ));
+        assert!(matches!(
+            second.read(&first_read).await,
+            Err(VfsError::InvalidHandle)
+        ));
         assert_eq!(first.read(&first_read).await.expect("read first"), b"first");
         assert_eq!(
             second.read(&second_read).await.expect("read second"),
@@ -751,7 +763,7 @@ mod tests {
         );
         let handle = vfs.open(&root, "note", true, true).await.unwrap();
         let files = vfs.open_files.read().await;
-        let file = files.get(&handle).unwrap().lock().await;
+        let file = files.lookup(&handle.0).unwrap().lock().await;
         let mut write = Box::pin(vfs.write(&handle, b"saved"));
         tokio::select! {
             biased;

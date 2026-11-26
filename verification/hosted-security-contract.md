@@ -107,13 +107,21 @@ Construction starts the cursor at zero and successful reads and writes leave
 it in bounds. The adapter locks the handle around each transition.
 On close, the checked publication decision yields the original path and
 the complete current buffer exactly when the handle is writable and dirty.
-The adapter removes the handle from its table and calls its bound backend
-with that path and buffer while holding the file lock. Six adapter tests
-exercise storage, including independent owner views and last-close-wins.
+The production handle table is checked against a map. It starts empty,
+rejects duplicate handle text without changing any binding, returns only
+the entry bound to the requested text and removes exactly that entry on
+retirement. A uniqueness lemma proves that two bindings of the same handle
+text in a valid table have equal values. Each storage VFS owns its table.
+Its read and write methods borrow the entry under a table read lock. Close
+acquires the write lock, removes the entry and owns its buffer. There is no
+await between removal and synchronous publication to the bound backend.
 
-The proof assumes handle lookup returned the intended file. Correct path
-composition, handle-table interleavings, backend ownership
-and durable publication still require refinement.
+Seven adapter tests cover owner isolation, a foreign handle, independent
+open handles and cancellation of a waiting close while a write holds admission.
+The synchronization argument relies on Tokio lock semantics and the inspected
+production call sites. Machine-checked refinement still needs
+to establish ownership at mount installation, directory-handle resolution,
+path composition and durable backend publication.
 
 ## Guest key-value storage
 

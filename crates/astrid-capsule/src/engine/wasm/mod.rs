@@ -85,6 +85,8 @@ mod pool;
 mod readiness;
 #[cfg(not(target_family = "wasm"))]
 mod storage_file;
+#[cfg(not(target_family = "wasm"))]
+mod storage_handles;
 mod storage_vfs;
 #[cfg(test)]
 mod test_fixtures;

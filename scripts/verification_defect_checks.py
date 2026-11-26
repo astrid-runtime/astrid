@@ -54,10 +54,12 @@ REGISTERED_BEARER = Path("crates/astrid-core/src/session_token/registered_bearer
 PRIVATE_RESPONDER = Path("crates/astrid-capsule/src/elicitation/responder.rs")
 PAIR_DENIES = Path("crates/astrid-kernel/src/kernel_router/admin/pair_device_handlers/deny_patterns.rs")
 RECEIPT = Path("crates/astrid-kernel/src/kernel_router/resume_receipt/validation.rs")
+STORAGE_HANDLES = Path("crates/astrid-capsule/src/engine/wasm/storage_handles.rs")
 STORAGE_FILE = Path("crates/astrid-capsule/src/engine/wasm/storage_file.rs")
 MOUNT = Path("crates/astrid-capsule/src/engine/wasm/mount_selection.rs")
 PAIR_RESULT = Path("crates/astrid-kernel/src/kernel_router/admin/pair_issue_result.rs")
 INPUTS = [
+    STORAGE_HANDLES,
     STORAGE_FILE,
     PAIR_RESULT,
     MOUNT,
@@ -264,6 +266,21 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "receipt acknowledgement accepts equal length but different bytes",
             RECEIPT,
             lambda text: replace_once(text, "Some(bytes) => bytes == expected", "Some(bytes) => bytes.len() == expected.len()"),
+        ),
+        (
+            "storage registration reports a collision as successful",
+            STORAGE_HANDLES,
+            lambda text: replace_once(text, "Entry::Occupied(_) => false", "Entry::Occupied(_) => true"),
+        ),
+        (
+            "storage lookup suppresses a live binding",
+            STORAGE_HANDLES,
+            lambda text: replace_once(text, "self.entries.get(key)", "None"),
+        ),
+        (
+            "storage retirement leaves the handle usable",
+            STORAGE_HANDLES,
+            lambda text: replace_once(text, "self.entries.remove(key)", "None"),
         ),
         (
             "a storage read exposes bytes before the open cursor",
