@@ -365,6 +365,27 @@ mod tests {
             .expect("admitted profile");
     }
 
+    #[test]
+    fn keyless_v1_profile_gains_one_durable_registration() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(temp.path());
+        let alias = PrincipalId::new("legacy").unwrap();
+        let legacy = PrincipalProfile {
+            profile_version: 1,
+            ..Default::default()
+        };
+        legacy.save(&home, &alias).unwrap();
+        super::ensure_profile_with_genesis_key(&home, &alias).unwrap();
+        let upgraded = PrincipalProfile::load_required(&home, &alias).unwrap();
+        assert_eq!(upgraded.profile_version, 2);
+        assert!(upgraded.auth.public_keys[0].registration_id.is_some());
+        super::ensure_profile_with_genesis_key(&home, &alias).unwrap();
+        assert_eq!(
+            PrincipalProfile::load_required(&home, &alias).unwrap(),
+            upgraded
+        );
+    }
+
     #[tokio::test]
     async fn leftover_alias_home_and_capsule_kv_import_without_prior_identity() {
         let directory = tempfile::tempdir().unwrap();

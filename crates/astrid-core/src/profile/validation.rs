@@ -361,6 +361,22 @@ mod tests {
     }
 
     #[test]
+    fn version_one_cannot_persist_a_versioned_registration() {
+        use super::super::{DeviceKey, DeviceScope};
+        let mut profile = PrincipalProfile {
+            profile_version: 1,
+            ..Default::default()
+        };
+        profile
+            .auth
+            .public_keys
+            .push(DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 1));
+        assert!(
+            matches!(profile.validate(), Err(ProfileError::Invalid(reason)) if reason.contains("profile_version"))
+        );
+    }
+
+    #[test]
     fn rejects_device_key_with_bad_pubkey_len() {
         use super::super::{DeviceKey, DeviceScope};
         let mut p = PrincipalProfile::default();

@@ -339,3 +339,29 @@ fn identity_io(error: &IdentityError) -> io::Error {
 fn profile_io(error: &astrid_core::ProfileError) -> io::Error {
     io::Error::other(format!("unbound layout-1 principal profile: {error}"))
 }
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+
+    #[test]
+    fn keyless_v1_profile_gains_one_durable_registration() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(temp.path());
+        let alias = PrincipalId::new("legacy").unwrap();
+        let legacy = PrincipalProfile {
+            profile_version: 1,
+            ..Default::default()
+        };
+        legacy.save(&home, &alias).unwrap();
+        ensure_profile_with_genesis_key(&home, &alias).unwrap();
+        let upgraded = PrincipalProfile::load_required(&home, &alias).unwrap();
+        assert_eq!(upgraded.profile_version, 2);
+        assert!(upgraded.auth.public_keys[0].registration_id.is_some());
+        ensure_profile_with_genesis_key(&home, &alias).unwrap();
+        assert_eq!(
+            PrincipalProfile::load_required(&home, &alias).unwrap(),
+            upgraded
+        );
+    }
+}
