@@ -243,9 +243,7 @@ pub(crate) async fn issue_lease(
         cleanup_resource(&resource_path, &callback_path);
         return Err(format!("write private mount manifest: {error}"));
     }
-    if !issue.publish(|| {
-        kernel.storage_mounts.insert(mount_id, Arc::clone(&state));
-    }) {
+    if !issue.install(kernel, &state) {
         drop(listener);
         cleanup_resource(&resource_path, &callback_path);
         return Err("storage mount requester retired during issuance".to_owned());
