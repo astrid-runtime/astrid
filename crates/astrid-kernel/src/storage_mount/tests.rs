@@ -1428,6 +1428,23 @@ async fn internal_workspace_branch_lease_fixes_branch_target() {
     .await
     .unwrap();
     let uid = kernel.principal_directory.uid_for(&caller).unwrap();
+    let replaced = astrid_core::PrincipalUid::from_bytes([0xEE; 32]);
+    let denied = issue_bound_lease(
+        &kernel,
+        caller.clone(),
+        LeaseAuthority::Process(replaced),
+        StorageProviderViewV1::Principal(caller.clone()),
+        astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerSubtree {
+            prefix: "home".into(),
+        },
+        StorageProviderAccessV1::ReadWrite,
+        "owner-test".to_owned(),
+        temporary.path().join("owner-mount"),
+    )
+    .await
+    .expect_err("process lease must match the admitted UID");
+    assert_eq!(denied, "process projection owner changed");
+    assert!(kernel.storage_mounts.is_empty());
     let owner = astrid_storage::StateOwner::Principal(uid);
     let store = kernel.principal_store.clone().unwrap();
     let branches = astrid_storage::WorkspaceBranchStore::new(store.content());
