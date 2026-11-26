@@ -251,4 +251,13 @@ fn measured_writer_matches_reference_frame_and_digest_vectors() {
         digest.finalize().to_hex().as_str(),
         "9be4a0c43266399e10756cf2a26b845af308852ad1b0ca292a379cc922cd205d"
     );
+    let marker = super::super::commit_wire::Marker {
+        counts,
+        digest: *digest.finalize().as_bytes(),
+    };
+    let frame = super::super::codec::write_marker(&marker, limits).unwrap();
+    assert_eq!(
+        hex::encode(frame),
+        "41535457414c3200010000005c00000000000000f1360c7a3ec12c4f8447e1a44a37708ba92dd079a96635b436abcfa69fc8f01c040000000102000000000000030000000000000001020000000000000300000000000000010000000000000001000000000000004f000000000000009be4a0c43266399e10756cf2a26b845af308852ad1b0ca292a379cc922cd205d"
+    );
 }

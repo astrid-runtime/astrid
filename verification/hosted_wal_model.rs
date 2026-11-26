@@ -47,13 +47,63 @@ fn check_body(body: &[u8], observed: Counts, digest: [u8;32]) -> (accepted: Opti
     }
 }
 
-fn writer_marker_is_readable(marker: Marker) -> (accepted: Option<CheckedMarker>)
-    requires marker.counts.sequence != 0,
-    ensures accepted matches Some(m) && m.marker() == marker,
+/// Check the bytes emitted by the production Commit writer against the
+/// scanner's independent observations at the supplied stream position.
+fn writer_marker_is_readable<H>(marker:Marker, observed:Counts, digest:[u8;32],
+    prefix:&[u8], suffix:&[u8], limit:u64, hash:H, checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]>)
+    -> (out:Option<CheckedMarker>)
+    where H:Fn([u8;8],u64,&[u8])->[u8;32] + Copy,
+    requires prefix.len() as int + suffix.len() + 144 <= usize::MAX,
+        forall|m:[u8;8],n:u64,p:&[u8]| #[trigger] hash.requires((m,n,p)),
+        forall|p:&[u8],v:[u8;32]| #[trigger] hash.ensures((crate::physical_wire::MAGIC,p.len() as u64,p),v) ==> v == (checksum@)(p@),
+    ensures out.is_some() == (limit >= 92 && observed.sequence != 0 && observed.roots != 0 &&
+            observed == marker.counts && digest == marker.digest),
+        out matches Some(checked) ==> checked.marker() == marker,
 {
-    let bytes = marker.encode();
-    let accepted = check_body(&bytes,marker.counts,marker.digest);
-    accepted
+    use crate::{physical_wire as physical, record_wire as logical};
+    let frame = marker.frame(vec![0u8;52],hash)?;
+    let ghost data = marker.payload();
+    let ghost sum = (checksum@)(data);
+    let ghost envelope = physical::Envelope {version:1,size:92,checksum:sum};
+    proof {
+        vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+        assert(data.len() == 92);
+        let (p,q) = choose|p:&[u8],q:[u8;32]| p@ == data &&
+            #[trigger] hash.ensures((physical::MAGIC,p.len() as u64,p),q) &&
+            frame@ == (physical::Envelope {version:1,size:p.len() as u64,checksum:q}).wire() + p@;
+        assert(hash.ensures((physical::MAGIC,p.len() as u64,p),q));
+        assert(q == sum);
+    }
+    let mut stream = Vec::new();
+    stream.extend_from_slice(prefix);
+    stream.extend_from_slice(&frame);
+    stream.extend_from_slice(suffix);
+    let ghost start = prefix.len() as int + physical::WIDTH;
+    let ghost h = stream@.subrange(prefix.len() as int,start);
+    assert(stream@ =~= prefix@ + envelope.wire() + data + suffix@);
+    assert(h =~= envelope.wire());
+    assert(h.take(8) =~= physical::MAGIC@);
+    assert(h.subrange(12,20) =~= vstd::bytes::spec_u64_to_le_bytes(92));
+    assert(h.skip(20) =~= sum@);
+    assert(stream@.subrange(start,start+92) =~= data);
+    let (next,bytes,physical) = crate::hosted_wal_physical_model::read_at(&stream,prefix.len(),limit,hash,checksum)?;
+    assert(next as int == prefix.len() + 144);
+    assert(bytes@ =~= data);
+    let (header,body) = logical::split(bytes)?;
+    assert(header.sequence@ =~= vstd::bytes::spec_u64_to_le_bytes(marker.counts.sequence));
+    assert(header.ordinal@ =~= vstd::bytes::spec_u64_to_le_bytes(marker.counts.logical));
+    let kind = logical::WalRecordKind::from_tag(header.kind)?;
+    if !matches!(kind,logical::WalRecordKind::Commit) || !physical.accepts(kind,header.flags)
+        || header.reserved != [0;2] || observed.roots == 0 { return None; }
+    let body = logical::body_at_position(body,u64::from_le_bytes(header.sequence),u64::from_le_bytes(header.ordinal),
+        observed.sequence,observed.logical).ok()?;
+    assert(body@ =~= marker.wire());
+    let checked = check_body(body,observed,digest);
+    proof {
+        let expected = Marker {counts:observed,digest};
+        if expected.wire() == marker.wire() { unique_marker(expected,marker); }
+    }
+    checked
 }
 
 /// The concrete accumulator retains the order and identity of arbitrary
@@ -184,8 +234,8 @@ fn measured_marker<H: Fn([u8;8],u64,&[u8])->[u8;32] + Copy, F: FnOnce(&[u8]) -> 
             let (entry,flags,body) = #[trigger] records@[j];
             body.len() as int + 72 <= usize::MAX && (entry is Object ==> flags <= 1)
         }),
-    ensures result.is_some() == (forall|j:int| 0 <= j <= records.len() ==>
-            #[trigger] fits(begin,records@.take(j))),
+    ensures result.is_some() == (totals(records@).1 > 0 && (forall|j:int| 0 <= j <= records.len() ==>
+            #[trigger] fits(begin,records@.take(j)))),
         result matches Some(marker) ==> {
         let (objects,roots,bytes) = totals(records@);
         let c = marker.marker().counts;
@@ -238,7 +288,8 @@ fn measured_marker<H: Fn([u8;8],u64,&[u8])->[u8;32] + Copy, F: FnOnce(&[u8]) -> 
     let bytes = data.as_slice();
     let digest = finish(bytes);
     assert(finish.ensures((bytes,),digest));
-    let marker = writer_marker_is_readable(Marker { counts,digest });
+    let marker = writer_marker_is_readable(Marker { counts,digest },counts,digest,&[],&[],u64::MAX,hash,checksum);
+    if marker.is_none() { return None; }
     assert(bytes@ == transcript(begin,sequence,records@));
     assert(finish.ensures((bytes,),marker.unwrap().marker().digest));
     marker

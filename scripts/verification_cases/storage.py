@@ -15,6 +15,21 @@ from .common import (
 def defects():
     return [
         (
+            "Commit frame takes its ordinal from the root count",
+            Path("crates/astrid-storage/src/engine/durable/wal/commit_wire.rs"),
+            lambda source: replace_once(source, "ordinal:little_endian(self.counts.logical)", "ordinal:little_endian(self.counts.roots)"),
+        ),
+        (
+            "Commit frame sets a nonzero physical feature flag",
+            Path("crates/astrid-storage/src/engine/durable/wal/commit_wire.rs"),
+            lambda source: replace_once(source, "seal(frame.as_mut_slice(),0,hash)", "seal(frame.as_mut_slice(),1,hash)"),
+        ),
+        (
+            "Commit reader skips the transaction root requirement",
+            Path("verification/hosted_wal_model.rs"),
+            lambda source: replace_once(source, " || observed.roots == 0 { return None; }", " { return None; }"),
+        ),
+        (
             "measured WAL reader ignores the supplied frame offset",
             Path("verification/hosted_wal_binding.rs"),
             lambda source: replace_once(source, "read_at(&stream,prefix.len(),limit,hash,checksum)", "read_at(&stream,0,limit,hash,checksum)"),

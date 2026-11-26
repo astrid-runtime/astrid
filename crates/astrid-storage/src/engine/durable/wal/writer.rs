@@ -8,14 +8,14 @@ use super::super::{IdentityScheme, PersistentObjectIdentity, PrincipalCodec};
 use crate::storage_model::{ObjectId, ObjectRecord, RootState};
 
 use super::codec::{
-    encode_begin_body, encode_object_body, encode_object_storage_body, encode_physical_record,
-    finish_digest, new_digest, write_measured,
+    encode_begin_body, encode_object_body, encode_object_storage_body, finish_digest, new_digest,
+    write_marker, write_measured,
 };
 use super::measured_record::{DataKind, Measured};
 use super::scan::ScannedWal;
 use super::types::{
     WalBeginHints, WalCommitDescriptor, WalCount, WalError, WalLength, WalLimits,
-    WalObjectDescriptor, WalOffset, WalOrdinal, WalRecordKind, WalResumeState, WalSequence,
+    WalObjectDescriptor, WalOffset, WalResumeState, WalSequence,
 };
 
 /// A stream capable of one explicit durability publication.
@@ -87,7 +87,6 @@ pub(crate) struct WalWriter<S, I, C, P> {
 }
 
 struct ActiveWrite {
-    sequence: WalSequence,
     scheme: IdentityScheme,
     counts: super::commit_wire::Counts,
     digest: blake3::Hasher,
@@ -227,7 +226,6 @@ where
         let (encoded, counts) = write_measured(measured, self.limits, &mut digest)?;
         self.append_encoded(&encoded)?;
         self.active = Some(ActiveWrite {
-            sequence,
             scheme,
             counts,
             digest,
@@ -372,8 +370,8 @@ where
         if active.counts.roots == 0 {
             return Err(WalError::ZeroRoots);
         }
-        let sequence = active.sequence;
-        let ordinal = WalOrdinal::new(active.counts.logical);
+        let sequence = WalSequence::new(active.counts.sequence)
+            .ok_or(WalError::InvalidTransaction("active WAL sequence is zero"))?;
         let logical_count = WalCount::new(active.counts.logical);
         let object_count = WalCount::new(active.counts.objects);
         let root_count = WalCount::new(active.counts.roots);
@@ -385,13 +383,11 @@ where
                     field: "pending publications",
                 })?;
         let digest = finish_digest(&active.digest);
-        let body = super::commit_wire::Marker {
+        let marker = super::commit_wire::Marker {
             counts: active.counts,
             digest: *digest.as_bytes(),
-        }
-        .encode();
-        let encoded =
-            encode_physical_record(WalRecordKind::Commit, sequence, ordinal, &body, self.limits)?;
+        };
+        let encoded = write_marker(&marker, self.limits)?;
         let encoded_length = encoded_length(&encoded)?;
         let offset = self.append_encoded(&encoded)?;
         let descriptor = WalCommitDescriptor {

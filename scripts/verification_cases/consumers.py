@@ -10,6 +10,12 @@ from .common import (
 def consumer_defects():
     """Weaken a production guarantee and require its trace consumer to fail."""
     yield (
+        "Commit reader loses the physical marker binding",
+        Path("crates/astrid-storage/src/engine/durable/wal/commit_wire.rs"),
+        lambda source: replace_once(source, "bytes@ == (physical_wire::Envelope {version:1,size:p.len() as u64,checksum:sum}).wire() + p@", "bytes.len() == physical_wire::WIDTH + p.len()"),
+        Path("verification/hosted_wal_model.rs"),
+    )
+    yield (
         "WAL prefix consumer loses the recovered transcript",
         Path("verification/hosted_wal_binding.rs"),
         lambda source: replace_once(source, "transcript@ == wal_measurement::digest_header(kind,flags,seq,ordinal,body.len() as u64) + body@ &&", ""),

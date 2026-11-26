@@ -1,4 +1,5 @@
 //! ASTWAL2 Commit body. All counts and the sequence are little-endian u64s.
+use super::{physical_wire, record_wire};
 use vstd::prelude::*;
 
 verus! {
@@ -71,6 +72,29 @@ impl Marker {
         body[40..].copy_from_slice(&self.digest);
         assert(body@ =~= self.wire());
         body
+    }
+
+    pub(super) open spec fn payload(&self) -> Seq<u8> {
+        seq![4u8,0u8,0u8,0u8] + vstd::bytes::spec_u64_to_le_bytes(self.counts.sequence)
+            + vstd::bytes::spec_u64_to_le_bytes(self.counts.logical) + self.wire()
+    }
+
+    /// Both the logical header and the marker body come from this transaction.
+    pub(super) fn frame<H>(&self, mut frame:Vec<u8>, hash:H) -> (out:Option<Vec<u8>>)
+        where H:FnOnce([u8;8],u64,&[u8])->[u8;32],
+        requires forall|p:&[u8],n:u64| #[trigger] hash.requires((physical_wire::MAGIC,n,p)),
+        ensures out.is_some() == (frame.len() == physical_wire::WIDTH),
+            out matches Some(bytes) ==> exists|p:&[u8],sum:[u8;32]| p@ == self.payload() &&
+                #[trigger] hash.ensures((physical_wire::MAGIC,p.len() as u64,p),sum) &&
+                bytes@ == (physical_wire::Envelope {version:1,size:p.len() as u64,checksum:sum}).wire() + p@,
+    {
+        if frame.len() != physical_wire::WIDTH { return None; }
+        let header = record_wire::Header { kind:record_wire::WalRecordKind::Commit.tag(), flags:0, reserved:[0;2],
+            sequence:little_endian(self.counts.sequence), ordinal:little_endian(self.counts.logical) };
+        header.append(&mut frame,&self.encode());
+        assert(frame@.skip(52) =~= self.payload());
+        if !physical_wire::seal(frame.as_mut_slice(),0,hash) { return None; }
+        Some(frame)
     }
 
     pub(super) fn digest_matches(&self, observed: &[u8;32]) -> (matches: bool)

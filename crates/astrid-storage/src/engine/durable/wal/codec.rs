@@ -35,8 +35,16 @@ pub(super) fn validate_logical_body(
     limits: WalLimits,
     offset: super::types::WalOffset,
 ) -> Result<WalLength, WalError> {
+    validate_body_length(body.len(), limits, offset)
+}
+
+fn validate_body_length(
+    len: usize,
+    limits: WalLimits,
+    offset: super::types::WalOffset,
+) -> Result<WalLength, WalError> {
     let declared = WalLength::new(
-        u64::try_from(body.len()).map_err(|_| WalError::Encoding("WAL body length overflow"))?,
+        u64::try_from(len).map_err(|_| WalError::Encoding("WAL body length overflow"))?,
     );
     let limit = WalLength::new(limits.max_frame_bytes());
     if declared > limit {
@@ -60,6 +68,7 @@ pub(super) struct RecordHeader {
 
 /// Encode one bounded physical record. The caller supplies one record body,
 /// so allocation is proportional to that record rather than its transaction.
+#[cfg(test)]
 pub(super) fn encode_physical_record(
     kind: WalRecordKind,
     sequence: WalSequence,
@@ -70,6 +79,7 @@ pub(super) fn encode_physical_record(
     encode_physical_record_with_flags(kind, 0, sequence, ordinal, body, limits)
 }
 
+#[cfg(test)]
 pub(super) fn encode_physical_record_with_flags(
     kind: WalRecordKind,
     flags: u8,
@@ -78,7 +88,7 @@ pub(super) fn encode_physical_record_with_flags(
     body: &[u8],
     limits: WalLimits,
 ) -> Result<Vec<u8>, WalError> {
-    let mut encoded = reserve_frame(body, limits)?;
+    let mut encoded = reserve_frame(body.len(), limits)?;
     super::record_wire::Header {
         kind: kind.tag(),
         flags,
@@ -93,11 +103,11 @@ pub(super) fn encode_physical_record_with_flags(
     Ok(encoded)
 }
 
-fn reserve_frame(body: &[u8], limits: WalLimits) -> Result<Vec<u8>, WalError> {
-    validate_logical_body(body, limits, super::types::WalOffset::new(0))?;
+fn reserve_frame(body_len: usize, limits: WalLimits) -> Result<Vec<u8>, WalError> {
+    let body_len = validate_body_length(body_len, limits, super::types::WalOffset::new(0))?;
     let record_len = u64::try_from(RECORD_HEADER_LEN)
         .ok()
-        .and_then(|header| header.checked_add(u64::try_from(body.len()).ok()?))
+        .and_then(|header| header.checked_add(body_len.get()))
         .ok_or(WalError::Encoding("WAL record length overflow"))?;
     let payload_len = WalLength::new(record_len);
     let limit = wal_physical_limit(limits).length();
@@ -120,12 +130,22 @@ fn reserve_frame(body: &[u8], limits: WalLimits) -> Result<Vec<u8>, WalError> {
     Ok(encoded)
 }
 
+pub(super) fn write_marker(
+    marker: &super::commit_wire::Marker,
+    limits: WalLimits,
+) -> Result<Vec<u8>, WalError> {
+    let frame = reserve_frame(super::commit_wire::LENGTH, limits)?;
+    marker
+        .frame(frame, frame_checksum)
+        .ok_or(WalError::Encoding("WAL physical header is truncated"))
+}
+
 pub(super) fn write_measured(
     record: super::measured_record::Measured<'_>,
     limits: WalLimits,
     hasher: &mut blake3::Hasher,
 ) -> Result<(Vec<u8>, super::commit_wire::Counts), WalError> {
-    let frame = reserve_frame(record.body(), limits)?;
+    let frame = reserve_frame(record.body().len(), limits)?;
     let (bytes, counts, ()) = record
         .write(frame, frame_checksum, update_digest(hasher))
         .ok_or(WalError::Encoding("WAL physical header is truncated"))?;
