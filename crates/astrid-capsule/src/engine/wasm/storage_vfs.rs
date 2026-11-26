@@ -11,8 +11,7 @@
 #![cfg(not(target_family = "wasm"))]
 
 use super::storage_file::{OpenFile, WriteRange};
-use super::storage_handles::FileHandles;
-use std::collections::HashMap;
+use super::storage_handles::HandleTable;
 use std::sync::Arc;
 
 use astrid_capabilities::{DirHandle, FileHandle};
@@ -146,10 +145,10 @@ impl StorageBackend for WorkspaceBackend {
 /// A principal-owned VFS view over `AstridFilesystem`.
 pub(crate) struct AstridStorageVfs {
     filesystem: Box<dyn StorageBackend>,
-    open_dirs: RwLock<HashMap<DirHandle, FilesystemPath>>,
+    open_dirs: RwLock<HandleTable<FilesystemPath>>,
     // Read/write borrow an entry through the table guard. Removing it gives close
     // exclusive ownership, with no further lock wait before publication.
-    open_files: RwLock<FileHandles<Mutex<OpenFile<FilesystemPath>>>>,
+    open_files: RwLock<HandleTable<Mutex<OpenFile<FilesystemPath>>>>,
 }
 
 impl AstridStorageVfs {
@@ -185,12 +184,11 @@ impl AstridStorageVfs {
     ) -> Self {
         let branches = astrid_storage::WorkspaceBranchStore::new(store.content());
         let filesystem = branches.filesystem(owner, branch);
-        let mut open_dirs = HashMap::new();
-        open_dirs.insert(root, FilesystemPath::root());
+        let open_dirs = HandleTable::with_root(root.0, FilesystemPath::root());
         Self {
             filesystem: Box::new(WorkspaceBackend(filesystem)),
             open_dirs: RwLock::new(open_dirs),
-            open_files: RwLock::new(FileHandles::new()),
+            open_files: RwLock::new(HandleTable::new()),
         }
     }
 
@@ -202,12 +200,11 @@ impl AstridStorageVfs {
         owner: StateOwner,
         root: DirHandle,
     ) -> Self {
-        let mut open_dirs = HashMap::new();
-        open_dirs.insert(root, FilesystemPath::root());
+        let open_dirs = HandleTable::with_root(root.0, FilesystemPath::root());
         Self {
             filesystem: Box::new(OwnerBackend(AstridFilesystem::new(content, owner))),
             open_dirs: RwLock::new(open_dirs),
-            open_files: RwLock::new(FileHandles::new()),
+            open_files: RwLock::new(HandleTable::new()),
         }
     }
 
@@ -231,12 +228,11 @@ impl AstridStorageVfs {
     ) -> VfsResult<Self> {
         let vfs = Self {
             filesystem,
-            open_dirs: RwLock::new(HashMap::new()),
-            open_files: RwLock::new(FileHandles::new()),
+            open_dirs: RwLock::new(HandleTable::new()),
+            open_files: RwLock::new(HandleTable::new()),
         };
         vfs.ensure_prefix(&prefix)?;
-        let mut open_dirs = HashMap::new();
-        open_dirs.insert(root, prefix);
+        let open_dirs = HandleTable::with_root(root.0, prefix);
         Ok(Self {
             filesystem: vfs.filesystem,
             open_dirs: RwLock::new(open_dirs),
@@ -281,7 +277,7 @@ impl AstridStorageVfs {
         self.open_dirs
             .read()
             .await
-            .get(handle)
+            .lookup(&handle.0)
             .cloned()
             .ok_or(VfsError::InvalidHandle)
     }
@@ -448,7 +444,10 @@ impl Vfs for AstridStorageVfs {
         if entry.kind() != FilesystemEntryKind::Directory {
             return Err(map_filesystem_error(FilesystemError::NotDirectory(path)));
         }
-        self.open_dirs.write().await.insert(new_handle, path);
+        self.open_dirs
+            .write()
+            .await
+            .bind_directory(new_handle.0, path);
         Ok(())
     }
 
@@ -456,7 +455,7 @@ impl Vfs for AstridStorageVfs {
         self.open_dirs
             .write()
             .await
-            .remove(handle)
+            .retire(&handle.0)
             .map(|_| ())
             .ok_or(VfsError::InvalidHandle)
     }
@@ -735,6 +734,39 @@ mod tests {
             .close(&reopened_handle)
             .await
             .expect("close persisted");
+    }
+
+    #[tokio::test]
+    async fn directory_handles_bind_the_selected_subtree_until_closed() {
+        let (_directory, store) = fixture().await;
+        let root = DirHandle::new();
+        let vfs = AstridStorageVfs::new(
+            &store,
+            StateOwner::Principal(PrincipalUid::from_bytes([0x44; 32])),
+            root.clone(),
+        );
+        vfs.mkdir(&root, "first/nested").await.unwrap();
+        vfs.mkdir(&root, "second").await.unwrap();
+        let child = DirHandle::new();
+        vfs.open_dir(&root, "first/nested", child.clone())
+            .await
+            .unwrap();
+        let file = vfs.open(&child, "note", true, true).await.unwrap();
+        vfs.write(&file, b"first").await.unwrap();
+        vfs.close(&file).await.unwrap();
+        vfs.open_dir(&root, "second", child.clone()).await.unwrap();
+        assert!(!vfs.exists(&child, "note").await.unwrap());
+        vfs.close_dir(&child).await.unwrap();
+        assert!(matches!(
+            vfs.stat(&child, "note").await,
+            Err(VfsError::InvalidHandle)
+        ));
+        let first = vfs
+            .open(&root, "first/nested/note", false, false)
+            .await
+            .unwrap();
+        assert_eq!(vfs.read(&first).await.unwrap(), b"first");
+        vfs.close(&first).await.unwrap();
     }
 
     #[tokio::test]

@@ -116,11 +116,21 @@ Its read and write methods borrow the entry under a table read lock. Close
 acquires the write lock, removes the entry and owns its buffer. There is no
 await between removal and synchronous publication to the bound backend.
 
-Seven adapter tests cover owner isolation, a foreign handle, independent
+Adapter tests cover owner isolation, a foreign handle, independent
 open handles and cancellation of a waiting close while a write holds admission.
 The synchronization argument relies on Tokio lock semantics and the inspected
 production call sites. Machine-checked refinement still needs
-to establish ownership at mount installation, directory-handle resolution and durable backend publication.
+to establish ownership at mount installation and durable backend publication.
+
+The directory table belongs to the same VFS instance as its backend. At mount
+construction it contains exactly the supplied root handle and prefix. The guest
+path adapter snapshots that handle's current directory and joins the validated
+relative suffix below it. The host VFS method `open_dir` can bind a supplied
+directory handle again. Its verified table update affects only the supplied handle.
+Closing a directory removes its binding. A storage regression writes through a
+subdirectory handle, rebinds it, closes it, and reads the original bytes by
+their full name from the root. Directory close does not revoke earlier file
+handles or undo a directory snapshot already taken by a concurrent operation.
 
 For logical storage paths, the production validator checks all UTF-8 bytes. A
 nonempty name has no NUL, leading, trailing or doubled separator, or complete

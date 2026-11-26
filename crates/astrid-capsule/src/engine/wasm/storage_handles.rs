@@ -1,4 +1,4 @@
-//! Table of open file descriptions owned by one storage-backed VFS.
+//! Handle bindings within one storage-backed VFS. Directory and file tables are distinct.
 
 use std::collections::{HashMap, hash_map::Entry};
 use vstd::prelude::*;
@@ -7,11 +7,11 @@ verus! {
 
 broadcast use vstd::std_specs::hash::group_hash_axioms;
 
-pub(super) struct FileHandles<V> {
+pub(super) struct HandleTable<V> {
     entries: HashMap<String, V>,
 }
 
-impl<V> FileHandles<V> {
+impl<V> HandleTable<V> {
     pub(super) closed spec fn valid(&self) -> bool { vstd::std_specs::hash::hash_map_inv(&self.entries) }
 
     pub(super) closed spec fn contents(&self) -> Map<String, V> { self.entries@ }
@@ -24,6 +24,41 @@ impl<V> FileHandles<V> {
         ensures table.valid(), table.contents() == Map::<String, V>::empty(),
     {
         Self { entries: HashMap::new() }
+    }
+
+    pub(super) fn with_root(key: String, root: V) -> (table: Self)
+        ensures table.valid(), table.contents() == Map::<String, V>::empty().insert(key, root),
+    {
+        let mut table = Self::new();
+        table.register(key, root);
+        table
+    }
+
+    /// Bind the caller-supplied directory handle, preserving the VFS rebinding semantics.
+    pub(super) fn bind_directory(&mut self, key: String, directory: V)
+        requires old(self).valid(),
+        ensures final(self).valid(), final(self).binds(key@, directory),
+            if old(self).has(key@) {
+                old(self).updated(key@, directory, final(self))
+            } else { final(self).contents() == old(self).contents().insert(key, directory) },
+    {
+        let ghost before = self.contents();
+        self.entries.insert(key, directory);
+        proof {
+            if old(self).has(key@) {
+                assert(old(self).updated(key@, directory, self));
+                let k = choose|k: String| #[trigger] before.contains_key(k)
+                    && k@ == key@ && self.contents() == before.insert(k, directory);
+                assert(self.entries@.contains_key(k));
+            } else {
+                assert(self.entries@.contains_key(key));
+            }
+        }
+    }
+
+    pub(super) closed spec fn updated(&self, text: Seq<char>, value: V, next: &Self) -> bool {
+        exists|k: String| #[trigger] self.entries@.contains_key(k)
+            && k@ == text && next.contents() == self.contents().insert(k, value)
     }
 
     pub(super) fn register(&mut self, key: String, value: V) -> (fresh: bool)

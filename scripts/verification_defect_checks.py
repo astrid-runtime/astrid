@@ -280,6 +280,16 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             lambda text: replace_once(text, "path.push('/');", "path.push('.');"),
         ),
         (
+            "a storage mount omits its supplied root handle",
+            STORAGE_HANDLES,
+            lambda text: replace_once(text, "table.register(key, root);", "let _ = (key, root);"),
+        ),
+        (
+            "directory registration discards the resolved subdirectory",
+            STORAGE_HANDLES,
+            lambda text: replace_once(text, "self.entries.insert(key, directory);", "let _ = directory;"),
+        ),
+        (
             "storage registration reports a collision as successful",
             STORAGE_HANDLES,
             lambda text: replace_once(text, "Entry::Occupied(_) => false", "Entry::Occupied(_) => true"),
