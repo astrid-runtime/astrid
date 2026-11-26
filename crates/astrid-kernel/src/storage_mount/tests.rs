@@ -1377,6 +1377,15 @@ enum WorkerCase {
     CancelledAdminSync,
 }
 
+fn hold_worker(state: &StorageMountLeaseState) -> Arc<MutationTestGate> {
+    let gate = Arc::new(MutationTestGate {
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    *state.mutation_test_gate.lock().unwrap() = Some(Arc::clone(&gate));
+    gate
+}
+
 async fn check_worker_drain(case: WorkerCase) {
     let sync = matches!(case, WorkerCase::CancelledAdminSync);
     let temporary = tempfile::tempdir().unwrap();
@@ -1405,11 +1414,7 @@ async fn check_worker_drain(case: WorkerCase) {
             .unwrap();
     }
     let state = Arc::clone(kernel.storage_mounts.get(&lease.mount_id).unwrap().value());
-    let gate = Arc::new(MutationTestGate {
-        entered: tokio::sync::Semaphore::new(0),
-        release: tokio::sync::Semaphore::new(0),
-    });
-    *state.mutation_test_gate.lock().unwrap() = Some(Arc::clone(&gate));
+    let gate = hold_worker(&state);
     let mutation_kernel = Arc::clone(&kernel);
     let mutation_state = Arc::clone(&state);
     let token = lease.lease_token.clone();
@@ -1439,12 +1444,13 @@ async fn check_worker_drain(case: WorkerCase) {
         u64::from(!sync)
     );
     assert_eq!(state.dirty.load(Ordering::Acquire), sync);
-    let waiter = if !matches!(case, WorkerCase::Write) {
-        mutation.abort();
-        assert!(mutation.await.unwrap_err().is_cancelled());
-        None
-    } else {
-        Some(mutation)
+    let waiter = match case {
+        WorkerCase::Write => Some(mutation),
+        WorkerCase::CancelledWrite | WorkerCase::CancelledAdminSync => {
+            mutation.abort();
+            assert!(mutation.await.unwrap_err().is_cancelled());
+            None
+        },
     };
     let revocation_kernel = Arc::clone(&kernel);
     let revocation_caller = caller.clone();
