@@ -153,6 +153,19 @@ rejects duplicate fingerprints. The cryptographic signature check, the
 freshness of the resolved profile at effect admission and the generation of
 the socket owner still require refinement.
 
+## Remembered local egress consent
+
+A local egress consent reply must carry the expected principal bytes and full
+128-bit request owner. The checked matcher rejects missing or different
+stamps. The host captures the current profile before asking for consent.
+A changed or missing profile cancels the decision. With a profile cache,
+durable approval compares the captured profile again under the cache write
+lock and loads the enabled profile before saving. Removing a non-default
+profile prevents its recreation through consent. A durable approval has no
+duplicate process-lifetime allowance. Direct filesystem edits, alias ownership
+across profile replacement, and the interval between consent and socket
+connection still require separate treatment.
+
 ## Native MCP network authority
 
 Native stdio MCP capsules requesting network domains or outbound TCP destinations fail during load. The process sandbox accepts only a Boolean network setting and cannot express the manifest's destination policy. Accepted native capsule configurations request networking disabled, including for uplinks. The scope of this decision is the capsule host engine. Standalone MCP server configurations and operator-selected sandbox policies require separate treatment in the hosted security argument.

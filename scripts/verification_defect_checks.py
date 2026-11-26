@@ -39,7 +39,9 @@ ROUTE_SCOPE = Path("crates/astrid-events/src/route/scope.rs")
 PRINCIPAL_SYNTAX = Path("crates/astrid-core/src/principal/syntax.rs")
 INGRESS_FRAME = Path("crates/astrid-capsule/src/engine/wasm/host/net/ingress_frame.rs")
 DEVICE_ADMISSION = Path("crates/astrid-core/src/profile/device_admission.rs")
+CONSENT_IDENTITY = Path("crates/astrid-capsule/src/engine/wasm/host/consent_identity.rs")
 INPUTS = [
+    CONSENT_IDENTITY,
     DEVICE_ADMISSION,
     INGRESS_FRAME,
     PRINCIPAL_SYNTAX,
@@ -173,6 +175,16 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "frame consumption drops the captured operation",
             INGRESS_FRAME,
             lambda text: replace_once(text, "    slot.take()", "    *slot = None; None"),
+        ),
+        (
+            "egress consent accepts a different principal",
+            CONSENT_IDENTITY,
+            lambda text: replace_once(text, "if bytes != principal", "if false"),
+        ),
+        (
+            "egress consent accepts a different request owner",
+            CONSENT_IDENTITY,
+            lambda text: replace_once(text, "Some(actual) => actual == owner", "Some(actual) => true"),
         ),
         (
             "disabled profile supplies device keys",

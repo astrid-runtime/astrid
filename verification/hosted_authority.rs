@@ -56,3 +56,6 @@ mod ingress_frame;
 
 #[path = "../crates/astrid-core/src/profile/device_admission.rs"]
 mod device_admission;
+
+#[path = "../crates/astrid-capsule/src/engine/wasm/host/consent_identity.rs"]
+mod consent_identity;
