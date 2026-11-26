@@ -23,9 +23,12 @@ impl uplink::Host for HostState {
         platform: String,
         profile: UplinkProfile,
     ) -> Result<String, ErrorCode> {
-        if !self.invocation_authority_active() || !self.has_uplink_capability {
+        if !self.has_uplink_capability {
             return Err(ErrorCode::CapabilityDenied);
         }
+        let _admission = self
+            .begin_host_operation()
+            .map_err(|()| ErrorCode::CapabilityDenied)?;
         let platform = platform.trim().to_ascii_lowercase();
         if name.trim().is_empty() || platform.is_empty() {
             return Err(ErrorCode::InvalidInput);
@@ -78,9 +81,12 @@ impl uplink::Host for HostState {
         platform_user_id: String,
         content: String,
     ) -> Result<bool, ErrorCode> {
-        if !self.invocation_authority_active() || !self.has_uplink_capability {
+        if !self.has_uplink_capability {
             return Err(ErrorCode::CapabilityDenied);
         }
+        let _admission = self
+            .begin_host_operation()
+            .map_err(|()| ErrorCode::CapabilityDenied)?;
         if uplink_id.len() > 64 {
             return Err(ErrorCode::InvalidInput);
         }
@@ -110,3 +116,7 @@ impl uplink::Host for HostState {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "uplink_retirement_tests.rs"]
+mod retirement_tests;
