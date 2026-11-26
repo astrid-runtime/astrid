@@ -252,3 +252,47 @@ async fn rollback_fence_waits_for_an_admitted_capsule_constructor() {
     fence.await.unwrap();
     assert!(kernel.capabilities.is_principal_retiring(&principal).await);
 }
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn rollback_closes_only_mounts_from_the_captured_generation() {
+    use astrid_core::storage_filesystem::StorageFilesystemTargetV1;
+    use astrid_core::storage_provider::{StorageProviderAccessV1, StorageProviderViewV1};
+
+    let dir = tempfile::tempdir().unwrap();
+    let kernel = crate::test_kernel_with_home(AstridHome::from_path(dir.path())).await;
+    let alias = PrincipalId::default();
+    let captured = kernel.principal_directory.uid_for(&alias).unwrap();
+    let issue = || {
+        crate::storage_mount::issue_lease(
+            &kernel,
+            alias.clone(),
+            false,
+            StorageProviderViewV1::Principal(alias.clone()),
+            StorageFilesystemTargetV1::OwnerRoot,
+            StorageProviderAccessV1::ReadOnly,
+            "test-provider".to_owned(),
+            dir.path().join("mount"),
+        )
+    };
+    let old = issue().await.unwrap();
+    kernel
+        .principal_directory
+        .rename(captured, &alias, PrincipalId::new("previous").unwrap())
+        .unwrap();
+    let replacement = astrid_core::PrincipalUid::from_bytes([0x91; 32]);
+    kernel
+        .principal_directory
+        .register(alias.clone(), replacement)
+        .unwrap();
+    let current = issue().await.unwrap();
+
+    super::rollback::fence_failed_initialization(&kernel, &alias, Some(captured), Vec::new())
+        .await
+        .unwrap();
+    assert!(!kernel.storage_mounts.contains_key(&old.mount_id));
+    assert!(kernel.storage_mounts.contains_key(&current.mount_id));
+    crate::storage_mount::revoke_lease(&kernel, &alias, true, current.mount_id)
+        .await
+        .unwrap();
+}
