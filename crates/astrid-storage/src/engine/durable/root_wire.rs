@@ -213,6 +213,36 @@ pub(super) open spec fn same_expected(a: Option<Root>,b: Option<Root>) -> bool {
     match (a,b) { (None,None) => true, (Some(x),Some(y)) => same(x,y), _ => false }
 }
 
+pub(super) enum BindingError { Owner, Roots }
+
+fn equal_root(a: Root,b: Root) -> (equal: bool)
+    ensures equal == same(a,b),
+{
+    if a.generation.as_slice() != b.generation.as_slice() || a.commit.as_slice() != b.commit.as_slice() { return false; }
+    assert(a.generation@ =~= b.generation@);
+    assert(a.commit@ =~= b.commit@);
+    true
+}
+
+/// Bind the canonical body to the live transaction before it enters a frame.
+pub(super) fn bind_owner(live: Vec<u8>, saved: &[u8], expected: Option<Root>,
+    prior: Option<Root>, replacement: Root, next: Root) -> (outcome: Result<Vec<u8>,BindingError>)
+    ensures
+        outcome.is_ok() == (live@ == saved@ && same_expected(expected,prior) && same(replacement,next)),
+        outcome matches Ok(owner) ==> owner == live,
+        (outcome matches Err(BindingError::Owner)) == (live@ != saved@),
+{
+    if live.as_slice() != saved { return Err(BindingError::Owner); }
+    assert(live@ =~= saved@);
+    let matches_prior = match (expected,prior) {
+        (None,None) => true,
+        (Some(a),Some(b)) => equal_root(a,b),
+        _ => false,
+    };
+    if !matches_prior || !equal_root(replacement,next) { return Err(BindingError::Roots); }
+    Ok(live)
+}
+
 proof fn same_field(bytes: Seq<u8>, start: int, scheme: Scheme, a: Root, b: Root)
     requires at(bytes,start,a.wire(scheme)), at(bytes,start,b.wire(scheme)),
     ensures same(a,b),

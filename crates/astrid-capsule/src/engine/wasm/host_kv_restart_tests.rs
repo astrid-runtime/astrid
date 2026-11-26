@@ -15,12 +15,15 @@ use super::super::{
 use super::HostState;
 
 const CHILD_HOME: &str = "ASTRID_GUEST_KV_RESTART_TEST_HOME";
+const CHILD_WAL: &str = "ASTRID_GUEST_KV_RESTART_TEST_WAL";
 const ACKNOWLEDGED: i32 = 73;
 
-async fn open(root: &Path) -> RuntimePrincipalStore {
-    astrid_storage::open_runtime_principal_store(
+async fn open(root: &Path, wal: astrid_storage::TransactionWalPolicy) -> RuntimePrincipalStore {
+    astrid_storage::open_runtime_principal_store_with_policy(
         &AstridHome::from_path(root),
         Arc::new(|_: &StateOwner| Ok(None)),
+        astrid_storage::PrincipalDirectory::default(),
+        astrid_storage::DurableEnginePolicy::default().with_transaction_wal(wal),
     )
     .await
     .unwrap()
@@ -50,7 +53,12 @@ fn guest(store: &RuntimePrincipalStore, alias: &str) -> HostState {
 #[ignore = "internal writer for the hosted guest KV restart regression"]
 async fn exit_after_acknowledged_guest_writes() {
     let home = std::env::var_os(CHILD_HOME).unwrap();
-    let store = open(Path::new(&home)).await;
+    let wal = match std::env::var(CHILD_WAL).unwrap().as_str() {
+        "enabled" => astrid_storage::TransactionWalPolicy::enabled(std::num::NonZeroU64::MAX),
+        "disabled" => astrid_storage::TransactionWalPolicy::disabled(),
+        other => panic!("unknown test WAL policy {other}"),
+    };
+    let store = open(Path::new(&home), wal).await;
     let identities = KvIdentityStore::with_principal_directory(
         ScopedKvStore::new(store.kv(), "system:identity").unwrap(),
         store.principal_directory(),
@@ -84,6 +92,16 @@ async fn exit_after_acknowledged_guest_writes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovered_guest_reads_its_own_acknowledged_value() {
+    check_acknowledged_restart(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovered_guest_reads_its_acknowledged_wal_value() {
+    check_acknowledged_restart(true).await;
+}
+
+async fn check_acknowledged_restart(with_wal: bool) {
+    use astrid_storage::volume::{AstridVolume, HostedFileVolume, VolumeRegion};
     let root = tempfile::tempdir().unwrap();
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -92,10 +110,26 @@ async fn recovered_guest_reads_its_own_acknowledged_value() {
             "engine::wasm::host_state::kv_restart_tests::exit_after_acknowledged_guest_writes",
         ])
         .env(CHILD_HOME, root.path())
+        .env(CHILD_WAL, if with_wal { "enabled" } else { "disabled" })
         .status()
         .unwrap();
     assert_eq!(status.code(), Some(ACKNOWLEDGED));
-    let store = open(root.path()).await;
+    if with_wal {
+        let path = AstridHome::from_path(root.path()).storage_volume_path();
+        let volume = HostedFileVolume::open(path).unwrap();
+        assert!(
+            volume
+                .region_len(&VolumeRegion::new("transactions.wal").unwrap())
+                .unwrap()
+                > 0
+        );
+    }
+    // Reopen with new WAL writes disabled. Existing WAL must still be replayed.
+    let store = open(
+        root.path(),
+        astrid_storage::TransactionWalPolicy::disabled(),
+    )
+    .await;
     for (alias, value) in [
         ("bob", b"bob-value".as_slice()),
         ("alice", b"alice-value".as_slice()),

@@ -10,8 +10,7 @@ use crate::storage_model::{ObjectId, ObjectRecord, RootState};
 use super::codec::{
     digest_record, digest_record_with_flags, encode_begin_body, encode_commit_body,
     encode_object_body, encode_object_storage_body, encode_physical_record,
-    encode_physical_record_with_flags, encode_root_body, finish_digest, logical_record_length,
-    new_digest,
+    encode_physical_record_with_flags, finish_digest, logical_record_length, new_digest,
 };
 use super::scan::ScannedWal;
 use super::types::{
@@ -392,12 +391,13 @@ where
         })
     }
 
-    /// Append one codec-validated canonical root transition without syncing.
-    pub(in crate::engine::durable) fn append_root(
+    /// Frame and digest the very same payload that preparation supplied.
+    pub(in crate::engine::durable) fn append_prepared_root(
         &mut self,
         principal: &P,
         expected: Option<RootState>,
         replacement: RootState,
+        journal: &[u8],
     ) -> Result<(), WalError> {
         self.ensure_usable()?;
         let (sequence, ordinal, scheme, previous, count, logical) = {
@@ -413,8 +413,15 @@ where
                 active.logical_bytes,
             )
         };
-        let (principal_bytes, body) =
-            encode_root_body(scheme, principal, expected, replacement, &self.codec)?;
+        let principal_bytes = super::codec::prepared_owner(
+            journal,
+            principal,
+            expected,
+            replacement,
+            scheme,
+            &self.codec,
+        )?;
+        let body = journal;
         if previous
             .as_deref()
             .is_some_and(|previous| previous >= principal_bytes.as_slice())
@@ -424,7 +431,7 @@ where
         let next_count = count
             .checked_inc()
             .ok_or(WalError::CountOverflow { field: "roots" })?;
-        let logical_record = logical_record_length(&body)?;
+        let logical_record = logical_record_length(body)?;
         let next_logical = logical
             .checked_add(logical_record)
             .ok_or(WalError::CountOverflow {
@@ -445,7 +452,7 @@ where
             .checked_next()
             .ok_or(WalError::CountOverflow { field: "ordinals" })?;
         let encoded =
-            encode_physical_record(WalRecordKind::Root, sequence, ordinal, &body, self.limits)?;
+            encode_physical_record(WalRecordKind::Root, sequence, ordinal, body, self.limits)?;
         let mut next_digest = self
             .active
             .as_ref()
@@ -459,7 +466,7 @@ where
             WalRecordKind::Root,
             sequence,
             ordinal,
-            &body,
+            body,
         )?;
         self.append_encoded(&encoded)?;
         let active = self.active.as_mut().ok_or(WalError::InvalidTransaction(

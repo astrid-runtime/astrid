@@ -14,8 +14,8 @@ use crate::storage_model::{ModelError, ObjectId, ObjectRecord, RootState};
 
 use super::codec::{
     PHYSICAL_HEADER_LEN, checksum_valid, decode_object_body, decode_object_storage_body,
-    decode_physical_header, decode_record_header, record_body, validate_logical_body,
-    validate_record_version, wal_physical_limit,
+    decode_physical_header, decode_record, validate_logical_body, validate_record_version,
+    wal_physical_limit,
 };
 use super::scan::WalScanner;
 use super::types::{WalEvent, WalObjectDescriptor, WalRootDescriptor, WalRootTransition};
@@ -467,14 +467,13 @@ fn read_object_record<I: PersistentObjectIdentity>(
     if !checksum_valid(physical, &payload) {
         return Err(corrupt_wal("WAL object replay checksum mismatch"));
     }
-    let record = decode_record_header(&payload, descriptor.offset()).map_err(durable_error)?;
+    let (record, body) = decode_record(&payload, descriptor.offset()).map_err(durable_error)?;
     validate_record_version(physical, record, descriptor.offset()).map_err(durable_error)?;
     if record.kind != super::types::WalRecordKind::Object {
         return Err(corrupt_wal(
             "WAL object descriptor points to another record",
         ));
     }
-    let body = record_body(&payload, descriptor.offset()).map_err(durable_error)?;
     validate_logical_body(body, limits, descriptor.offset()).map_err(durable_error)?;
     let decoded = decode_object_storage_body(body, record.flags, limits, descriptor.offset())
         .map_err(durable_error)?;

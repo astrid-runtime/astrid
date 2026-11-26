@@ -115,6 +115,7 @@ INPUTS = [
     KV_ENCODING,
     GUEST_AUTHORITY,
     Path("crates/astrid-storage/src/engine/durable/frontier.rs"),
+    Path("crates/astrid-storage/src/engine/durable/wal/record_wire.rs"),
     Path("crates/astrid-storage/src/engine/durable/root_wire.rs"),
     Path("crates/astrid-storage/src/principal_state/owner_codec.rs"),
     Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),
@@ -463,6 +464,26 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "stale KV view falls back to neutral and completes the request",
             Path("verification/hosted_kv_model.rs"),
             lambda source: replace_once(source, "Some(uid) => Some(Destination::Principal(uid)),\n                None => None,", "Some(uid) => Some(Destination::Principal(uid)),\n                None => Some(Destination::Neutral),"),
+        ),
+        (
+            "WAL record header repeats the sequence in the ordinal field",
+            Path("crates/astrid-storage/src/engine/durable/wal/record_wire.rs"),
+            lambda source: replace_once(source, "encoded.extend_from_slice(&self.ordinal);", "encoded.extend_from_slice(&self.sequence);"),
+        ),
+        (
+            "WAL scanner skips the first logical body byte",
+            Path("crates/astrid-storage/src/engine/durable/wal/record_wire.rs"),
+            lambda source: replace_once(source, "let body = &payload[HEADER_LEN..];", "let body = &payload[HEADER_LEN.saturating_add(1).min(payload.len())..];"),
+        ),
+        (
+            "WAL dispatch accepts a record with an old ordinal",
+            Path("crates/astrid-storage/src/engine/durable/wal/record_wire.rs"),
+            lambda source: replace_once(source, "if ordinal != expected_ordinal", "if ordinal > expected_ordinal"),
+        ),
+        (
+            "WAL writer binds a different prepared replacement",
+            Path("crates/astrid-storage/src/engine/durable/root_wire.rs"),
+            lambda source: replace_once(source, "!equal_root(replacement,next)", "!equal_root(replacement,replacement)"),
         ),
         (
             "WAL sync failure leaves the writer usable",
@@ -1558,6 +1579,36 @@ def consumer_defects():
         yield (
             name, Path("crates/astrid-storage/src/engine/durable/frontier.rs"),
             lambda source, clause=clause: replace_once(source, clause, "true"),
+            Path("verification/hosted_kv_model.rs"),
+        )
+    yield (
+        "WAL position gate loses the exact admitted body",
+        Path("crates/astrid-storage/src/engine/durable/wal/record_wire.rs"),
+        lambda source: replace_once(source, "result matches Ok(accepted) ==> accepted == body,", ""),
+        Path("verification/hosted_kv_model.rs"),
+    )
+    for name, clause in [
+        ("staged group loses the ordered batch", "group.binding().0 == batch"),
+        ("failed persistence loses the original group", "submitted == batch"),
+        ("published receipts lose the persisted group", "batch == self.binding().0"),
+        ("failed frontier loses the submitted group", "submitted == self.binding().0"),
+        ("failed persistence loses the original error", "persist.ensures((&batch,), Err(error))"),
+        ("failed frontier loses the original error", "advance.ensures((self.binding().1,), Err(error))"),
+    ]:
+        yield (
+            name, Path("crates/astrid-storage/src/engine/durable/frontier.rs"),
+            lambda source, clause=clause: replace_once(source, clause, "true"),
+            Path("verification/hosted_kv_model.rs"),
+        )
+    for name, clause in [
+        ("sync failure loses the unacknowledged batch count", "*final(pending) == if outcome.is_ok() { 0 } else { *old(pending) },"),
+        ("sync failure loses writer poisoning", "*final(poisoned) == (*old(poisoned) || outcome matches Err(PublicationError::Sync(_))),"),
+        ("sync success loses its connection to the physical sink", "&& exists|w: Result<(),E>| w.is_ok() && #[trigger] sync.ensures((),w)"),
+        ("unchanged WAL arena loses its published tail contract", "else if observed == current { Some((current, tail)) }"),
+    ]:
+        yield (
+            name, Path("crates/astrid-storage/src/engine/durable/frontier.rs"),
+            lambda source, clause=clause: replace_once(source, clause, "else if observed == current { position }" if clause.startswith("else if") else ""),
             Path("verification/hosted_kv_model.rs"),
         )
     consumer = Path("verification/hosted_lease_model.rs")

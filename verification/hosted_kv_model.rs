@@ -163,10 +163,14 @@ fn guest_publication<R: Copy, E, U, T, W, A, F>(scope: &[u8], requested: &[u8], 
 /// Durable transition bytes for a guest-selected principal recover that
 /// principal and both prepared root fields, without a model decoder.
 fn guest_wal_round_trip(scope: &[u8], requested: &[u8], admitted: [u8;32], current: [u8;32],
+    sequence: [u8;8], ordinal: [u8;8], expected_sequence: u64, expected_ordinal: u64,
     scheme: root_wire::Scheme, expected: Option<root_wire::Root>, replacement: root_wire::Root)
     -> (decoded: Option<(Owner, Option<root_wire::Root>, root_wire::Root)>)
+    requires expected_sequence > 0,
     ensures
-        decoded.is_some() == (scope@ == requested@ && admitted@ == current@),
+        decoded.is_some() == (scope@ == requested@ && admitted@ == current@
+            && vstd::bytes::spec_u64_from_le_bytes(sequence@) == expected_sequence
+            && vstd::bytes::spec_u64_from_le_bytes(ordinal@) == expected_ordinal),
         decoded matches Some((owner,e,r)) ==> {
             &&& (owner matches Owner::Principal(id) && id@ == admitted@)
             &&& root_wire::same_expected(e,expected)
@@ -192,7 +196,28 @@ fn guest_wal_round_trip(scope: &[u8], requested: &[u8], admitted: [u8;32], curre
         Ok(prepared) => prepared,
         Err(()) => { assert(false); return None; },
     };
-    let frame = prepared.journal();
+    let journal = prepared.journal();
+    let mut payload = Vec::new();
+    let header = crate::wal_record_wire::Header {
+        kind: 3, flags: 0, reserved: [0;2], sequence, ordinal,
+    };
+    header.append(&mut payload,journal);
+    assert(payload@ =~= header.bytes() + journal@);
+    let (scanned,frame) = match crate::wal_record_wire::split(&payload) {
+        Some(parts) => parts,
+        None => { assert(false); return None; },
+    };
+    assert(payload@.subrange(4,12) =~= sequence@);
+    assert(payload@.subrange(12,20) =~= ordinal@);
+    assert(scanned.sequence@ =~= sequence@);
+    assert(scanned.ordinal@ =~= ordinal@);
+    assert(scanned.kind == 3 && scanned.flags == 0);
+    assert(frame@ =~= journal@);
+    let frame = match crate::wal_record_wire::body_at_position(frame,u64::from_le_bytes(scanned.sequence),
+        u64::from_le_bytes(scanned.ordinal),expected_sequence,expected_ordinal) {
+        Ok(body) => body,
+        Err(_) => return None,
+    };
     proof { vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes(); }
     assert(frame@.take(8) =~= vstd::bytes::spec_u64_to_le_bytes(33));
     let (saved,mut cursor) = match root_wire::read_owner(frame) {
@@ -220,7 +245,37 @@ fn guest_wal_round_trip(scope: &[u8], requested: &[u8], admitted: [u8;32], curre
         Err(_) => { assert(false); return None; },
     };
     proof { root_wire::unique_tail(frame@,start,scheme,e,r,expected,replacement); }
+    let bound = root_wire::bind_owner(name,saved,expected,e,replacement,r);
+    assert(bound.is_ok());
     Some((restored,e,r))
+}
+
+/// A completed batch is acknowledged only on sync success. A failed sync
+/// leaves the entire pending count available to recovery and poisons the writer.
+fn publish_completed_batch(count: u64, success: bool, current: u64, observed: u64,
+    tail: Option<u64>, pending_tail: Option<u64>)
+    requires count > 0,
+{
+    let mut pending = count;
+    let mut poisoned = false;
+    let sync = || -> (result: Result<(),()>) ensures result.is_ok() == success {
+        if success { Ok(()) } else { Err(()) }
+    };
+    match crate::group_frontier::sync_pending(false,&mut pending,&mut poisoned,sync) {
+        Ok(reported) => {
+            assert(success && reported == count && pending == 0 && !poisoned);
+            let position = crate::group_frontier::wal_position(current,tail,observed,pending_tail);
+            assert(position.is_some() == (current <= observed));
+            if let Some((end,last)) = position {
+                assert(end == observed);
+                assert(last == if current < observed && pending_tail.is_some() { pending_tail } else { tail });
+            }
+        },
+        Err(crate::group_frontier::PublicationError::Sync(_)) => {
+            assert(!success && poisoned && pending == count);
+        },
+        Err(_) => assert(false),
+    }
 }
 
 /// A success receipt for the group requires both operations to have accepted

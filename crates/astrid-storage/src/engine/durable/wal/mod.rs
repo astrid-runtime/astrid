@@ -5,6 +5,7 @@
 
 mod codec;
 mod overlay;
+mod record_wire;
 mod replay;
 mod scan;
 mod types;

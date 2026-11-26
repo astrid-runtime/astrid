@@ -441,3 +441,7 @@ impl<'a> RootReader<'a> {
         "identity digest length does not match the supported scheme"
     }
 }
+
+#[cfg(test)]
+#[path = "root_journal_decode_tests.rs"]
+mod decode_tests;

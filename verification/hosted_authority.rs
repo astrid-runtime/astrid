@@ -88,6 +88,8 @@ mod root_transition;
 
 #[path = "../crates/astrid-storage/src/engine/durable/frontier.rs"]
 mod group_frontier;
+#[path = "../crates/astrid-storage/src/engine/durable/wal/record_wire.rs"]
+mod wal_record_wire;
 #[path = "../crates/astrid-storage/src/engine/durable/root_wire.rs"]
 mod root_wire;
 

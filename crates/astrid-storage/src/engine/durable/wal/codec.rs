@@ -1,4 +1,5 @@
 use super::super::format::{decode_object_frame, encode_object_frame, frame_checksum};
+use super::super::root_wire::{self, BindingError, OwnerError, RootError, TailError};
 use super::super::roots::encode_root_record;
 use super::super::{IdentityScheme, PersistentObjectIdentity, PrincipalCodec};
 use crate::storage_model::{ObjectId, ObjectRecord, RootState};
@@ -14,7 +15,7 @@ pub(super) const WAL_MAGIC: [u8; 8] = *b"ASTWAL2\0";
 /// Physical header width shared by every ASTWAL2 record.
 pub(super) const PHYSICAL_HEADER_LEN: usize = 52;
 /// Logical record header width inside each physical payload.
-pub(super) const RECORD_HEADER_LEN: usize = 20;
+pub(super) const RECORD_HEADER_LEN: usize = super::record_wire::HEADER_LEN;
 const LEGACY_VERSION: u16 = 1;
 const COMPRESSED_OBJECT_VERSION: u16 = 2;
 const BEGIN_FIXED_LEN: usize = 8;
@@ -119,10 +120,14 @@ pub(super) fn encode_physical_record_with_flags(
     encoded.extend_from_slice(&0_u16.to_le_bytes());
     encoded.extend_from_slice(&payload_len.get().to_le_bytes());
     encoded.extend_from_slice(&[0_u8; 32]);
-    let mut record_header = [0_u8; RECORD_HEADER_LEN];
-    write_record_header(&mut record_header, kind, flags, sequence, ordinal);
-    encoded.extend_from_slice(&record_header);
-    encoded.extend_from_slice(body);
+    super::record_wire::Header {
+        kind: kind.tag(),
+        flags,
+        reserved: [0; 2],
+        sequence: sequence.get().to_le_bytes(),
+        ordinal: ordinal.get().to_le_bytes(),
+    }
+    .append(&mut encoded, body);
     let checksum = frame_checksum(
         WAL_MAGIC,
         payload_len.get(),
@@ -194,22 +199,20 @@ pub(super) fn checksum_valid(header: PhysicalHeader, payload: &[u8]) -> bool {
 }
 
 /// Parse the logical record header.
-pub(super) fn decode_record_header(
+pub(super) fn decode_record(
     payload: &[u8],
     offset: super::types::WalOffset,
-) -> Result<RecordHeader, WalError> {
-    if payload.len() < RECORD_HEADER_LEN {
-        return Err(WalError::Corrupt {
-            offset,
-            detail: "WAL record header is truncated",
-        });
-    }
-    let kind = WalRecordKind::from_tag(payload[0]).ok_or(WalError::Corrupt {
+) -> Result<(RecordHeader, &[u8]), WalError> {
+    let (header, body) = super::record_wire::split(payload).ok_or(WalError::Corrupt {
+        offset,
+        detail: "WAL record header is truncated",
+    })?;
+    let kind = WalRecordKind::from_tag(header.kind).ok_or(WalError::Corrupt {
         offset,
         detail: "WAL record kind is unknown",
     })?;
-    let flags = payload[1];
-    if payload[2..4] != [0, 0]
+    let flags = header.flags;
+    if header.reserved != [0, 0]
         || (kind == WalRecordKind::Object && flags & !OBJECT_FLAG_LZ4 != 0)
         || (kind != WalRecordKind::Object && flags != 0)
     {
@@ -218,39 +221,21 @@ pub(super) fn decode_record_header(
             detail: "WAL record flags or reserved bytes are non-zero",
         });
     }
-    let sequence = WalSequence::new(u64::from_le_bytes(payload[4..12].try_into().map_err(
-        |_| WalError::Corrupt {
+    let sequence =
+        WalSequence::new(u64::from_le_bytes(header.sequence)).ok_or(WalError::Corrupt {
             offset,
-            detail: "WAL record sequence is truncated",
+            detail: "WAL record sequence is zero",
+        })?;
+    let ordinal = WalOrdinal::new(u64::from_le_bytes(header.ordinal));
+    Ok((
+        RecordHeader {
+            kind,
+            flags,
+            sequence,
+            ordinal,
         },
-    )?))
-    .ok_or(WalError::Corrupt {
-        offset,
-        detail: "WAL record sequence is zero",
-    })?;
-    let ordinal = WalOrdinal::new(u64::from_le_bytes(payload[12..20].try_into().map_err(
-        |_| WalError::Corrupt {
-            offset,
-            detail: "WAL record ordinal is truncated",
-        },
-    )?));
-    Ok(RecordHeader {
-        kind,
-        flags,
-        sequence,
-        ordinal,
-    })
-}
-
-/// Return the body after a validated logical record header.
-pub(super) fn record_body(
-    payload: &[u8],
-    offset: super::types::WalOffset,
-) -> Result<&[u8], WalError> {
-    payload.get(RECORD_HEADER_LEN..).ok_or(WalError::Corrupt {
-        offset,
-        detail: "WAL record body is truncated",
-    })
+        body,
+    ))
 }
 
 /// Encode a Begin body with optional non-authoritative hints.
@@ -505,25 +490,6 @@ pub(super) fn decode_object_storage_body(
     Ok(Cow::Owned(decoded))
 }
 
-/// Encode a canonical root transition after codec round-trip validation.
-pub(super) fn encode_root_body<P, C>(
-    scheme: IdentityScheme,
-    principal: &P,
-    expected: Option<RootState>,
-    replacement: RootState,
-    codec: &C,
-) -> Result<(Vec<u8>, Vec<u8>), WalError>
-where
-    C: PrincipalCodec<P>,
-{
-    validate_root_generation(expected, replacement)?;
-    let bytes = codec.encode(principal);
-    validate_principal(codec, &bytes)?;
-    let payload = encode_root_record(scheme, &bytes, expected, replacement)
-        .map_err(|_| WalError::Encoding("WAL root-record encoding failed"))?;
-    Ok((bytes, payload))
-}
-
 /// Decode a canonical root transition and validate its principal codec.
 pub(super) fn decode_root_body<P, C>(
     body: &[u8],
@@ -534,27 +500,7 @@ pub(super) fn decode_root_body<P, C>(
 where
     C: PrincipalCodec<P>,
 {
-    use super::super::root_wire::{self, OwnerError, RootError, TailError};
-    let (principal, mut cursor) = root_wire::read_owner(body).map_err(|error| match error {
-        OwnerError::Read(error) => root_read_error(offset, error),
-        OwnerError::Length(length) => WalError::LengthOverflow {
-            value: WalLength::new(length),
-        },
-    })?;
-    validate_principal(codec, principal)?;
-    let (expected, replacement) =
-        root_wire::read_tail(body, &mut cursor, scheme.into()).map_err(|error| match error {
-            TailError::Read(e) | TailError::Root(RootError::Read(e)) => root_read_error(offset, e),
-            TailError::Root(RootError::Scheme { .. }) => WalError::IdentitySchemeMismatch,
-            TailError::ExpectedTag => WalError::Corrupt {
-                offset,
-                detail: "WAL root expected tag is invalid",
-            },
-            TailError::Trailing => WalError::Corrupt {
-                offset,
-                detail: "WAL root record has trailing bytes",
-            },
-        })?;
+    let (principal, expected, replacement) = root_fields(body, scheme, codec, offset)?;
     let expected = expected.map(Into::into);
     let replacement = replacement.into();
     validate_root_generation(expected, replacement).map_err(|_| WalError::Corrupt {
@@ -579,6 +525,63 @@ where
         WalRootTransition::new(principal.to_vec(), expected, replacement),
         WalLength::new(length),
     ))
+}
+
+/// Validate the prepared bytes at the live writer boundary. Return the owner
+/// used for WAL ordering only when both roots and the live owner codec agree.
+pub(super) fn prepared_owner<P, C: PrincipalCodec<P>>(
+    body: &[u8],
+    owner: &P,
+    expected: Option<RootState>,
+    replacement: RootState,
+    scheme: IdentityScheme,
+    codec: &C,
+) -> Result<Vec<u8>, WalError> {
+    validate_root_generation(expected, replacement)?;
+    let (saved, prior, next) = root_fields(body, scheme, codec, super::types::WalOffset::new(0))?;
+    root_wire::bind_owner(
+        codec.encode(owner),
+        saved,
+        expected.map(Into::into),
+        prior,
+        replacement.into(),
+        next,
+    )
+    .map_err(|error| match error {
+        BindingError::Owner => WalError::PrincipalMismatch,
+        BindingError::Roots => {
+            WalError::InvalidTransaction("prepared WAL root differs from its transaction")
+        },
+    })
+}
+
+fn root_fields<'a, P, C: PrincipalCodec<P>>(
+    body: &'a [u8],
+    scheme: IdentityScheme,
+    codec: &C,
+    offset: super::types::WalOffset,
+) -> Result<(&'a [u8], Option<root_wire::Root>, root_wire::Root), WalError> {
+    let (principal, mut cursor) = root_wire::read_owner(body).map_err(|error| match error {
+        OwnerError::Read(error) => root_read_error(offset, error),
+        OwnerError::Length(length) => WalError::LengthOverflow {
+            value: WalLength::new(length),
+        },
+    })?;
+    validate_principal(codec, principal)?;
+    let (expected, replacement) =
+        root_wire::read_tail(body, &mut cursor, scheme.into()).map_err(|error| match error {
+            TailError::Read(e) | TailError::Root(RootError::Read(e)) => root_read_error(offset, e),
+            TailError::Root(RootError::Scheme { .. }) => WalError::IdentitySchemeMismatch,
+            TailError::ExpectedTag => WalError::Corrupt {
+                offset,
+                detail: "WAL root expected tag is invalid",
+            },
+            TailError::Trailing => WalError::Corrupt {
+                offset,
+                detail: "WAL root record has trailing bytes",
+            },
+        })?;
+    Ok((principal, expected, replacement))
 }
 
 fn validate_root_generation(
@@ -669,19 +672,6 @@ pub(super) fn logical_record_length(body: &[u8]) -> Result<WalLength, WalError> 
 /// Finalize a logical-record digest.
 pub(super) fn finish_digest(hasher: &blake3::Hasher) -> WalDigest {
     WalDigest::new(*hasher.finalize().as_bytes())
-}
-
-fn write_record_header(
-    destination: &mut [u8],
-    kind: WalRecordKind,
-    flags: u8,
-    sequence: WalSequence,
-    ordinal: WalOrdinal,
-) {
-    destination[0] = kind.tag();
-    destination[1] = flags;
-    destination[4..12].copy_from_slice(&sequence.get().to_le_bytes());
-    destination[12..20].copy_from_slice(&ordinal.get().to_le_bytes());
 }
 
 fn read_u64(

@@ -238,8 +238,8 @@ where
             accepted
                 .prepared
                 .root
-                .write_wal(|owner, expected, replacement, _journal| {
-                    writer.append_root(owner, expected, replacement)
+                .write_wal(|owner, expected, replacement, journal| {
+                    writer.append_prepared_root(owner, expected, replacement, journal)
                 })
                 .map_err(wal_durable_error)?;
             writer.finish_commit().map_err(wal_durable_error)?;

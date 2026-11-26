@@ -6,8 +6,8 @@ use super::super::{PersistentObjectIdentity, PrincipalCodec};
 use super::codec::{
     PHYSICAL_HEADER_LEN, RecordHeader, WAL_MAGIC, checksum_valid, decode_begin_body,
     decode_commit_body, decode_object_body, decode_object_storage_body, decode_physical_header,
-    decode_record_header, decode_root_body, digest_record, digest_record_with_flags,
-    logical_record_length, new_digest, record_body, validate_logical_body, validate_record_version,
+    decode_record, decode_root_body, digest_record, digest_record_with_flags,
+    logical_record_length, new_digest, validate_logical_body, validate_record_version,
     wal_physical_limit,
 };
 use super::types::{
@@ -201,9 +201,8 @@ where
         if !checksum_valid(physical, &payload) {
             return self.bad_physical(record_offset);
         }
-        let record = decode_record_header(&payload, record_offset)?;
+        let (record, body) = decode_record(&payload, record_offset)?;
         validate_record_version(physical, record, record_offset)?;
-        let body = record_body(&payload, record_offset)?;
         validate_logical_body(body, self.limits, record_offset)?;
         self.consume_record(record_offset, payload_end, record, body)
     }
@@ -245,18 +244,23 @@ where
         let active = self.active.as_ref().ok_or(WalError::InvalidTransaction(
             "WAL active transaction disappeared",
         ))?;
-        if record.sequence != active.sequence {
-            return Err(WalError::SequenceMismatch {
+        let body = super::record_wire::body_at_position(
+            body,
+            record.sequence.get(),
+            record.ordinal.get(),
+            active.sequence.get(),
+            active.next_ordinal.get(),
+        )
+        .map_err(|error| match error {
+            super::record_wire::PositionError::Sequence => WalError::SequenceMismatch {
                 expected: active.sequence,
                 found: record.sequence,
-            });
-        }
-        if record.ordinal != active.next_ordinal {
-            return Err(WalError::OrdinalMismatch {
+            },
+            super::record_wire::PositionError::Ordinal => WalError::OrdinalMismatch {
                 expected: active.next_ordinal,
                 found: record.ordinal,
-            });
-        }
+            },
+        })?;
         match record.kind {
             WalRecordKind::Begin => Err(WalError::Corrupt {
                 offset,

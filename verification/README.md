@@ -2,6 +2,8 @@
 
 The [hosted security contract](hosted-security-contract.md) defines the full authority claim, identifies production entry points and records the outstanding refinement obligations.
 
+For hosted guest KV, Verus checks owner selection, root transition bytes, the WAL record position and body, and publication bookkeeping. The production scanner checks a record's active transaction sequence and ordinal before dispatch. The storage proof assumes the host supplies the correct physical stream. The contract lists the remaining obligations for crash recovery and caller receipts.
+
 CI checks the Rust arithmetic called by `FuelRateLimiter::try_reserve` and
 `FuelRateLimiter::settle_reserved`. The verifier entry point imports the
 production source file directly. Cargo builds that same file on Astrid's normal
