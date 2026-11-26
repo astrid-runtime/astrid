@@ -10,7 +10,7 @@ use tracing::warn;
 
 use super::{audit_handlers, pair_device_handlers};
 use crate::kernel_router::{
-    AdminAuditEntry, AuthorizedRequest, authorize_request, record_admin_audit,
+    AdminAuditEntry, AuthorizedRequest, admit_management_request, record_admin_audit,
 };
 
 pub(super) struct AdminAuthorizationContext<'a> {
@@ -89,12 +89,14 @@ pub(super) async fn authorize_admin_request(
     context: &AdminAuthorizationContext<'_>,
     kind: &AdminRequestKind,
 ) -> Result<AuthorizedRequest, String> {
-    let authorization = match authorize_request(
+    let authorization = match admit_management_request(
         kernel,
         context.caller,
         context.device_key_id,
         context.required_cap,
-    ) {
+    )
+    .await
+    {
         Ok(authorization) => authorization,
         Err(error) => {
             let error = error.to_string();

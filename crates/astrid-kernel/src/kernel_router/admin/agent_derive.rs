@@ -113,12 +113,18 @@ async fn handle_request(
         return;
     };
     let params = serde_json::to_value(&request.request).ok();
-    let body = match super::authorize_request(
+    // Deletion closes admission under this same lock. Check the caller only
+    // after obtaining it so a queued request cannot carry stale authority
+    // into provisioning.
+    let guard = kernel.admin_write_lock.lock().await;
+    let body = match super::super::admit_management_request(
         kernel,
         &caller,
         device_key_id.as_deref(),
         REQUIRED_CAPABILITY,
-    ) {
+    )
+    .await
+    {
         Ok(_) => {
             super::record_admin_audit(
                 kernel,
@@ -136,9 +142,10 @@ async fn handle_request(
                 },
             )
             .await;
-            agent_derive_from_req(kernel, &caller, request.request).await
+            derive_under_admin_lock(kernel, &caller, request.request, guard).await
         },
         Err(error) => {
+            drop(guard);
             let error = error.to_string();
             super::record_admin_audit(
                 kernel,
@@ -186,10 +193,21 @@ fn publish(
     );
 }
 
+#[cfg(test)]
 pub(super) async fn agent_derive_from_req(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
     req: AgentDeriveRequest,
+) -> AdminResponseBody {
+    let guard = kernel.admin_write_lock.lock().await;
+    derive_under_admin_lock(kernel, caller, req, guard).await
+}
+
+async fn derive_under_admin_lock(
+    kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
+    req: AgentDeriveRequest,
+    _guard: tokio::sync::MutexGuard<'_, ()>,
 ) -> AdminResponseBody {
     let AgentDeriveRequest {
         name,
@@ -206,7 +224,6 @@ pub(super) async fn agent_derive_from_req(
     if let Some(reason) = principal.reserved_reason() {
         return err_bad_input(format!("principal {name:?} is {reason}"));
     }
-    let _guard = kernel.admin_write_lock.lock().await;
     let profile_path = principal_profile_path(kernel, &principal);
     if profile_path.exists() {
         return err_bad_input(format!("principal `{principal}` already exists"));

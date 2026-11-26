@@ -17,7 +17,7 @@ use tracing::warn;
 
 use super::caller::{MANAGEMENT_CALLER_REQUIRED, resolve_caller};
 use super::{
-    AdminAuditEntry, authorize_request, publish_response, record_admin_audit,
+    AdminAuditEntry, admit_management_request, publish_response, record_admin_audit,
     resolve_device_key_id, response_topic_for,
 };
 
@@ -102,12 +102,14 @@ async fn handle(
 ) {
     let audit_params = Some(serde_json::json!({ "policy": policy }));
     let response_topic = response_topic_for(&topic);
-    if let Err(error) = authorize_request(
+    if let Err(error) = admit_management_request(
         kernel,
         &caller,
         device_key_id.as_deref(),
         REQUIRED_CAPABILITY,
-    ) {
+    )
+    .await
+    {
         let reason = error.to_string();
         record_admin_audit(
             kernel,

@@ -365,6 +365,56 @@ async fn additive_derive_endpoint_preserves_correlation_and_authorization() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn retiring_admin_cannot_list_or_derive_through_the_ipc_routes() {
+    let (_dir, kernel) = fixture().await;
+    super::test_support::seed_operator(&kernel).await;
+    let caller = PrincipalId::default();
+    seed_profile(
+        &kernel,
+        &caller,
+        &PrincipalProfile {
+            groups: vec!["admin".to_owned()],
+            ..Default::default()
+        },
+    );
+
+    let list = || AdminKernelRequest::with_request_id("retiring-list", AdminRequestKind::AgentList);
+    let allowed = send_admin(&kernel, &caller, "agent.list", list()).await;
+    assert_eq!(allowed["status"], "AgentList");
+
+    // Retirement starts while the profile and its grants remain readable.
+    kernel
+        .capabilities
+        .begin_principal_retirement(caller.clone())
+        .await;
+    let denied_list = send_admin(&kernel, &caller, "agent.list", list()).await;
+    assert_eq!(denied_list["request_id"], "retiring-list");
+    assert_eq!(denied_list["status"], "Error");
+    assert!(
+        denied_list["data"]
+            .as_str()
+            .unwrap()
+            .contains("agent is retiring")
+    );
+
+    let denied = send_derive(&kernel, Some(caller.as_str()), "retiring-derive").await;
+    assert_eq!(denied["request_id"], "retiring-derive");
+    assert_eq!(denied["status"], "Error");
+    assert!(
+        denied["data"]
+            .as_str()
+            .unwrap()
+            .contains("agent is retiring")
+    );
+    assert!(
+        kernel
+            .principal_directory
+            .uid_for(&PrincipalId::new("derived-test").unwrap())
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn admin_router_denies_missing_and_invalid_principals_deterministically() {
     let (_dir, kernel) = fixture().await;
 
