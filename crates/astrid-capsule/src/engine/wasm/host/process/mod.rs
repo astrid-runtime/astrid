@@ -102,6 +102,9 @@ fn authenticated_principal(state: &HostState) -> Option<astrid_core::principal::
         .and_then(|p| astrid_core::principal::PrincipalId::new(p).ok())
 }
 
+#[cfg(test)]
+mod storage_mount_tests;
+
 fn prepare_process_storage_mount(
     state: &HostState,
     op: &str,
