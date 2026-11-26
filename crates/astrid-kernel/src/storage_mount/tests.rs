@@ -1333,6 +1333,15 @@ async fn dirty_tracks_only_successfully_acknowledged_unsynced_mutations() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revoke_drains_an_in_flight_mutation_and_fences_new_mutation() {
+    check_worker_drain(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_drains_a_worker_after_its_waiter_is_cancelled() {
+    check_worker_drain(true).await;
+}
+
+async fn check_worker_drain(cancel_waiter: bool) {
     let temporary = tempfile::tempdir().unwrap();
     let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
     let kernel = Arc::new(crate::test_kernel_with_home(home).await);
@@ -1379,6 +1388,13 @@ async fn revoke_drains_an_in_flight_mutation_and_fences_new_mutation() {
     gate.entered.acquire().await.unwrap().forget();
     assert_eq!(state.in_flight_mutations.load(Ordering::Acquire), 1);
     assert!(!state.dirty.load(Ordering::Acquire));
+    let waiter = if cancel_waiter {
+        mutation.abort();
+        assert!(mutation.await.unwrap_err().is_cancelled());
+        None
+    } else {
+        Some(mutation)
+    };
     let revocation_kernel = Arc::clone(&kernel);
     let revocation_caller = caller.clone();
     let revocation = tokio::spawn(async move {
@@ -1391,11 +1407,12 @@ async fn revoke_drains_an_in_flight_mutation_and_fences_new_mutation() {
     assert_eq!(state.in_flight_mutations.load(Ordering::Acquire), 1);
     gate.release.add_permits(1);
 
-    let outcome = mutation.await.unwrap();
-    assert!(matches!(
-        outcome,
-        StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Written(64))
-    ));
+    if let Some(waiter) = waiter {
+        assert!(matches!(
+            waiter.await.unwrap(),
+            StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Written(64))
+        ));
+    }
     revocation.await.unwrap().unwrap();
     assert_eq!(state.in_flight_mutations.load(Ordering::Acquire), 0);
     assert!(state.dirty.load(Ordering::Acquire));
