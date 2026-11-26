@@ -5,15 +5,14 @@ use super::super::{PersistentObjectIdentity, PrincipalCodec};
 
 use super::codec::{
     PHYSICAL_HEADER_LEN, RecordHeader, WAL_MAGIC, checksum_valid, decode_begin_body,
-    decode_commit_body, decode_object_body, decode_object_storage_body, decode_physical_header,
-    decode_record, decode_root_body, digest_record, digest_record_with_flags,
-    logical_record_length, new_digest, validate_logical_body, validate_record_version,
-    wal_physical_limit,
+    decode_object_body, decode_object_storage_body, decode_physical_header, decode_record,
+    decode_root_body, digest_record, digest_record_with_flags, logical_record_length, new_digest,
+    validate_logical_body, validate_record_version, wal_physical_limit,
 };
 use super::types::{
-    WalBeginDescriptor, WalCommitDescriptor, WalCount, WalError, WalEvent, WalLength, WalLimits,
-    WalObjectDescriptor, WalOffset, WalOrdinal, WalRecordKind, WalResumeState, WalRootDescriptor,
-    WalScanTail, WalSequence, WalTailKind, WalTransactionDescriptor,
+    WalBeginDescriptor, WalCount, WalError, WalEvent, WalLength, WalLimits, WalObjectDescriptor,
+    WalOffset, WalOrdinal, WalRecordKind, WalResumeState, WalRootDescriptor, WalScanTail,
+    WalSequence, WalTailKind, WalTransactionDescriptor,
 };
 
 /// A scanner-finished stream paired with the exact validated append state.
@@ -483,47 +482,49 @@ where
         if !active.saw_root {
             return Err(WalError::ZeroRoots);
         }
-        let (sequence, logical_count, object_count, root_count, logical_bytes, digest) =
-            decode_commit_body(body, offset)?;
-        if sequence != active.sequence {
-            return Err(WalError::CommitSequenceMismatch {
-                expected: active.sequence,
-                found: sequence,
-            });
-        }
-        if logical_count != active.logical_count {
-            return Err(WalError::CommitCountMismatch {
-                field: "logical records",
-            });
-        }
-        if object_count != active.object_count {
-            return Err(WalError::CommitCountMismatch { field: "objects" });
-        }
-        if root_count != active.root_count {
-            return Err(WalError::CommitCountMismatch { field: "roots" });
-        }
-        if logical_bytes != active.logical_bytes {
-            return Err(WalError::CommitCountMismatch {
-                field: "logical bytes",
-            });
-        }
-        let expected_digest = super::codec::finish_digest(&active.digest);
-        if digest != expected_digest {
-            return Err(WalError::DigestMismatch);
-        }
-        let descriptor = WalCommitDescriptor {
+        let marker = super::commit_wire::decode(body).ok_or(WalError::Corrupt {
             offset,
-            length: physical_length,
-            sequence,
-            logical_count,
-            object_count,
-            root_count,
-            logical_bytes,
-            digest,
+            detail: "WAL Commit body length is invalid",
+        })?;
+        let sequence = WalSequence::new(marker.counts.sequence).ok_or(WalError::Corrupt {
+            offset,
+            detail: "WAL Commit sequence is zero",
+        })?;
+        let observed = super::commit_wire::Counts {
+            sequence: active.sequence.get(),
+            logical: active.logical_count.get(),
+            objects: active.object_count.get(),
+            roots: active.root_count.get(),
+            bytes: active.logical_bytes.get(),
         };
+        let checked = marker
+            .confirm(&observed, || {
+                *super::codec::finish_digest(&active.digest).as_bytes()
+            })
+            .map_err(|mismatch| match mismatch {
+                super::commit_wire::Mismatch::Digest => WalError::DigestMismatch,
+                super::commit_wire::Mismatch::Sequence => WalError::CommitSequenceMismatch {
+                    expected: active.sequence,
+                    found: sequence,
+                },
+                super::commit_wire::Mismatch::Logical => WalError::CommitCountMismatch {
+                    field: "logical records",
+                },
+                super::commit_wire::Mismatch::Objects => {
+                    WalError::CommitCountMismatch { field: "objects" }
+                },
+                super::commit_wire::Mismatch::Roots => {
+                    WalError::CommitCountMismatch { field: "roots" }
+                },
+                super::commit_wire::Mismatch::Bytes => WalError::CommitCountMismatch {
+                    field: "logical bytes",
+                },
+            })?;
         let transaction = WalTransactionDescriptor {
             begin_offset: active.begin_offset,
-            commit: descriptor,
+            offset,
+            length: physical_length,
+            marker: checked,
         };
         self.last_sequence = Some(sequence);
         self.active = None;

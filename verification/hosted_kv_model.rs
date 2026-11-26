@@ -161,7 +161,8 @@ fn guest_publication<R: Copy, E, U, T, W, A, F>(scope: &[u8], requested: &[u8], 
 }
 
 /// Durable transition bytes for a guest-selected principal recover that
-/// principal and both prepared root fields, without a model decoder.
+/// principal and both prepared root fields, without a model decoder. The
+/// scanner represents a sequence as nonzero; an ordinal may start at zero.
 fn guest_wal_round_trip(scope: &[u8], requested: &[u8], admitted: [u8;32], current: [u8;32],
     sequence: [u8;8], ordinal: [u8;8], expected_sequence: u64, expected_ordinal: u64,
     scheme: root_wire::Scheme, expected: Option<root_wire::Root>, replacement: root_wire::Root)
@@ -199,7 +200,7 @@ fn guest_wal_round_trip(scope: &[u8], requested: &[u8], admitted: [u8;32], curre
     let journal = prepared.journal();
     let mut payload = Vec::new();
     let header = crate::wal_record_wire::Header {
-        kind: 3, flags: 0, reserved: [0;2], sequence, ordinal,
+        kind: crate::wal_record_wire::WalRecordKind::Root.tag(), flags: 0, reserved: [0;2], sequence, ordinal,
     };
     header.append(&mut payload,journal);
     assert(payload@ =~= header.bytes() + journal@);
@@ -212,6 +213,8 @@ fn guest_wal_round_trip(scope: &[u8], requested: &[u8], admitted: [u8;32], curre
     assert(scanned.sequence@ =~= sequence@);
     assert(scanned.ordinal@ =~= ordinal@);
     assert(scanned.kind == 3 && scanned.flags == 0);
+    let kind = crate::wal_record_wire::WalRecordKind::from_tag(scanned.kind);
+    assert(kind matches Some(crate::wal_record_wire::WalRecordKind::Root));
     assert(frame@ =~= journal@);
     let frame = match crate::wal_record_wire::body_at_position(frame,u64::from_le_bytes(scanned.sequence),
         u64::from_le_bytes(scanned.ordinal),expected_sequence,expected_ordinal) {
@@ -248,6 +251,18 @@ fn guest_wal_round_trip(scope: &[u8], requested: &[u8], admitted: [u8;32], curre
     let bound = root_wire::bind_owner(name,saved,expected,e,replacement,r);
     assert(bound.is_ok());
     Some((restored,e,r))
+}
+
+/// Even a valid body cannot publish for another owner or a different pair of roots.
+fn reject_other_binding(live: Vec<u8>, saved: &[u8], expected: Option<root_wire::Root>,
+    prior: Option<root_wire::Root>, replacement: root_wire::Root, next: root_wire::Root)
+    requires live@ != saved@ || !root_wire::same_expected(expected,prior) || !root_wire::same(replacement,next),
+{
+    let result = root_wire::bind_owner(live,saved,expected,prior,replacement,next);
+    proof {
+        if live@ != saved@ { assert(result matches Err(root_wire::BindingError::Owner)); }
+        else { assert(result matches Err(root_wire::BindingError::Roots)); }
+    }
 }
 
 /// A completed batch is acknowledged only on sync success. A failed sync

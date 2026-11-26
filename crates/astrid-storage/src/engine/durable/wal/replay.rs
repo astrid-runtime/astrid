@@ -18,7 +18,8 @@ use super::codec::{
     wal_physical_limit,
 };
 use super::scan::WalScanner;
-use super::types::{WalEvent, WalObjectDescriptor, WalRootDescriptor, WalRootTransition};
+use super::transaction::{self, Batch, Event, Origin, Step};
+use super::types::{WalEvent, WalObjectDescriptor, WalRootDescriptor};
 use super::{WalLimits, durable_error};
 use crate::engine::durable::format::{append_frames, canonical_record_bytes, encode_object_frame};
 use crate::engine::durable::representations::RepresentationStore;
@@ -30,10 +31,48 @@ use crate::engine::durable::{
     RecoveryLimits, SharedIdentity, SharedPrincipalCodec,
 };
 
-/// One scanner-complete transaction retained until its commit marker is seen.
-struct PendingTransaction {
-    objects: Vec<WalObjectDescriptor>,
-    roots: Vec<WalRootDescriptor>,
+type PendingTransaction = Batch<WalObjectDescriptor, WalRootDescriptor>;
+
+/// Both canonical replay and the protected-arena repair probe consume only
+/// complete transactions. Uncommitted descriptors stay private to this call.
+pub(super) fn next_transaction<P, I, C, R: Read + Seek>(
+    scanner: &mut WalScanner<R, I, C, P>,
+) -> Result<Option<PendingTransaction>, DurableError>
+where
+    I: PersistentObjectIdentity,
+    C: PrincipalCodec<P>,
+{
+    let mut pending = None;
+    loop {
+        let event = match scanner.next_event().map_err(durable_error)? {
+            Some(WalEvent::Begin(begin)) => Event::Begin(Origin {
+                sequence: begin.sequence.get(),
+                offset: begin.offset.get(),
+            }),
+            Some(WalEvent::Object(object)) => Event::Object(object),
+            Some(WalEvent::Root(root)) => Event::Root(root),
+            Some(WalEvent::Commit(tx)) => Event::Commit {
+                offset: tx.begin_offset.get(),
+                marker: tx.marker,
+            },
+            Some(WalEvent::Tail(_)) => Event::Tail,
+            None => Event::Eof,
+        };
+        match transaction::advance(pending, event).map_err(|error| {
+            corrupt_wal(match error {
+                transaction::Error::Nested => "nested WAL transaction",
+                transaction::Error::ObjectBeforeBegin => "WAL object appeared before Begin",
+                transaction::Error::RootBeforeBegin => "WAL root appeared before Begin",
+                transaction::Error::CommitBeforeBegin => "WAL Commit appeared before Begin",
+                transaction::Error::Mismatch => "WAL commit does not match pending transaction",
+                transaction::Error::Unfinished => "WAL scanner ended with an active transaction",
+            })
+        })? {
+            Step::Pending(batch) => pending = Some(batch),
+            Step::Committed(batch) => return Ok(Some(batch)),
+            Step::End => return Ok(None),
+        }
+    }
 }
 
 /// Return object identities from complete WAL transactions whose object
@@ -67,63 +106,45 @@ where
         .reader()
         .try_clone()
         .map_err(|source| io_error("clone ASTWAL2 probe payload reader", source))?;
-    let mut pending = Vec::<WalObjectDescriptor>::new();
-    let mut pending_roots = Vec::<WalRootTransition>::new();
     let mut committed = BTreeSet::new();
     let mut roots = root_history.clone();
-    while let Some(event) = scanner.next_event().map_err(durable_error)? {
-        match event {
-            WalEvent::Begin(_) => {
-                pending.clear();
-                pending_roots.clear();
-            },
-            WalEvent::Object(object) => {
-                pending.push(object);
-            },
-            WalEvent::Root(root) => {
-                pending_roots.push(root.transition().clone());
-            },
-            WalEvent::Commit(_) => {
-                let mut object_ids = BTreeSet::new();
-                for descriptor in &pending {
-                    let (id, _record, _payload) =
-                        read_object_record(&mut payload_reader, *descriptor, &identity, limits)?;
-                    if id != descriptor.id() {
-                        return Err(corrupt_wal("WAL object descriptor identity mismatch"));
-                    }
-                    object_ids.insert(id);
-                }
-                scanner.restore_cursor().map_err(durable_error)?;
-                let mut next_roots = roots.clone();
-                let mut root_conflict = false;
-                for transition in &pending_roots {
-                    let principal = codec
-                        .decode(transition.principal())
-                        .ok_or(DurableError::InvalidPrincipal { offset: 0 })?;
-                    if codec.encode(&principal) != transition.principal() {
-                        return Err(DurableError::InvalidPrincipal { offset: 0 });
-                    }
-                    let actual = roots.get(&principal).map(|(root, _)| *root);
-                    if actual != transition.expected() && actual != Some(transition.replacement()) {
-                        // Object bytes remain safe repair evidence even when
-                        // this transaction's root CAS is stale. Replay folds
-                        // them before reporting the conflict, while the WAL
-                        // stays available because checkpointing is deferred.
-                        root_conflict = true;
-                        break;
-                    }
-                    if actual != Some(transition.replacement()) {
-                        next_roots.insert(principal, (transition.replacement(), 0));
-                    }
-                }
-                committed.extend(object_ids);
-                if !root_conflict {
-                    roots = next_roots;
-                }
-                pending.clear();
-                pending_roots.clear();
-            },
-            WalEvent::Tail(_) => break,
+    while let Some(transaction) = next_transaction(&mut scanner)? {
+        let mut object_ids = BTreeSet::new();
+        for descriptor in &transaction.objects {
+            let (id, _record, _payload) =
+                read_object_record(&mut payload_reader, *descriptor, &identity, limits)?;
+            if id != descriptor.id() {
+                return Err(corrupt_wal("WAL object descriptor identity mismatch"));
+            }
+            object_ids.insert(id);
+        }
+        scanner.restore_cursor().map_err(durable_error)?;
+        let mut next_roots = roots.clone();
+        let mut root_conflict = false;
+        for descriptor in &transaction.roots {
+            let transition = descriptor.transition();
+            let principal = codec
+                .decode(transition.principal())
+                .ok_or(DurableError::InvalidPrincipal { offset: 0 })?;
+            if codec.encode(&principal) != transition.principal() {
+                return Err(DurableError::InvalidPrincipal { offset: 0 });
+            }
+            let actual = roots.get(&principal).map(|(root, _)| *root);
+            if actual != transition.expected() && actual != Some(transition.replacement()) {
+                // Object bytes remain safe repair evidence even when
+                // this transaction's root CAS is stale. Replay folds
+                // them before reporting the conflict, while the WAL
+                // stays available because checkpointing is deferred.
+                root_conflict = true;
+                break;
+            }
+            if actual != Some(transition.replacement()) {
+                next_roots.insert(principal, (transition.replacement(), 0));
+            }
+        }
+        committed.extend(object_ids);
+        if !root_conflict {
+            roots = next_roots;
         }
     }
     Ok(committed)
@@ -160,63 +181,22 @@ where
         .reader()
         .try_clone()
         .map_err(|source| io_error("clone ASTWAL2 replay reader", source))?;
-    let mut pending = None;
     let mut representations = representations;
-    loop {
-        let event = scanner.next_event().map_err(durable_error)?;
-        let Some(event) = event else { break };
-        match event {
-            WalEvent::Begin(_) => {
-                if pending.is_some() {
-                    return Err(corrupt_wal("nested WAL transaction"));
-                }
-                pending = Some(PendingBuilding::default());
-            },
-            WalEvent::Object(object) => {
-                let current = pending
-                    .as_mut()
-                    .ok_or_else(|| corrupt_wal("WAL object appeared before Begin"))?;
-                current.objects.push(object);
-            },
-            WalEvent::Root(root) => {
-                let current = pending
-                    .as_mut()
-                    .ok_or_else(|| corrupt_wal("WAL root appeared before Begin"))?;
-                current.roots.push(root);
-            },
-            WalEvent::Commit(_) => {
-                let current = pending
-                    .take()
-                    .ok_or_else(|| corrupt_wal("WAL Commit appeared before Begin"))?;
-                replay_transaction(
-                    PendingTransaction {
-                        objects: current.objects,
-                        roots: current.roots,
-                    },
-                    &mut payload_reader,
-                    arena,
-                    roots,
-                    index,
-                    validated,
-                    root_history,
-                    representations.as_deref_mut(),
-                    &replay_identity,
-                    &replay_codec,
-                    limits,
-                )?;
-                scanner.restore_cursor().map_err(durable_error)?;
-            },
-            WalEvent::Tail(_) => {
-                // The scanner has already proved this is the final
-                // uncommitted physical tail.  A transaction that was active
-                // at the tail is intentionally discarded.
-                pending = None;
-                break;
-            },
-        }
-    }
-    if pending.is_some() {
-        return Err(corrupt_wal("WAL scanner ended with an active transaction"));
+    while let Some(transaction) = next_transaction(&mut scanner)? {
+        replay_transaction(
+            transaction,
+            &mut payload_reader,
+            arena,
+            roots,
+            index,
+            validated,
+            root_history,
+            representations.as_deref_mut(),
+            &replay_identity,
+            &replay_codec,
+            limits,
+        )?;
+        scanner.restore_cursor().map_err(durable_error)?;
     }
 
     // Keep the scanner-owned sink alive until all canonical files are stable;
@@ -244,12 +224,6 @@ where
     // authority check succeeds, so a failed recovery keeps the WAL evidence
     // available for the next attempt.
     resume.into_writer(limits).map_err(durable_error)
-}
-
-#[derive(Default)]
-struct PendingBuilding {
-    objects: Vec<WalObjectDescriptor>,
-    roots: Vec<WalRootDescriptor>,
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]

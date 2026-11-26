@@ -19,7 +19,6 @@ pub(super) const RECORD_HEADER_LEN: usize = super::record_wire::HEADER_LEN;
 const LEGACY_VERSION: u16 = 1;
 const COMPRESSED_OBJECT_VERSION: u16 = 2;
 const BEGIN_FIXED_LEN: usize = 8;
-const COMMIT_BODY_LEN: usize = 8 + 8 + 8 + 8 + 8 + 32;
 const DIGEST_DOMAIN: &str = "astrid durable transaction wal v2";
 pub(super) const OBJECT_FLAG_LZ4: u8 = 1;
 const COMPRESSED_OBJECT_LENGTH_LEN: usize = 8;
@@ -312,63 +311,18 @@ pub(super) fn encode_commit_body(
     root_count: WalCount,
     logical_bytes: WalLength,
     digest: WalDigest,
-) -> [u8; COMMIT_BODY_LEN] {
-    let mut body = [0_u8; COMMIT_BODY_LEN];
-    body[..8].copy_from_slice(&sequence.get().to_le_bytes());
-    body[8..16].copy_from_slice(&logical_count.get().to_le_bytes());
-    body[16..24].copy_from_slice(&object_count.get().to_le_bytes());
-    body[24..32].copy_from_slice(&root_count.get().to_le_bytes());
-    body[32..40].copy_from_slice(&logical_bytes.get().to_le_bytes());
-    body[40..].copy_from_slice(digest.as_bytes());
-    body
-}
-
-/// Decode a Commit body.
-pub(super) fn decode_commit_body(
-    body: &[u8],
-    offset: super::types::WalOffset,
-) -> Result<
-    (
-        WalSequence,
-        WalCount,
-        WalCount,
-        WalCount,
-        WalLength,
-        WalDigest,
-    ),
-    WalError,
-> {
-    if body.len() != COMMIT_BODY_LEN {
-        return Err(WalError::Corrupt {
-            offset,
-            detail: "WAL Commit body length is invalid",
-        });
-    }
-    let sequence = WalSequence::new(read_u64(&body[..8], offset, "Commit sequence")?).ok_or(
-        WalError::Corrupt {
-            offset,
-            detail: "WAL Commit sequence is zero",
+) -> [u8; super::commit_wire::LENGTH] {
+    super::commit_wire::Marker {
+        counts: super::commit_wire::Counts {
+            sequence: sequence.get(),
+            logical: logical_count.get(),
+            objects: object_count.get(),
+            roots: root_count.get(),
+            bytes: logical_bytes.get(),
         },
-    )?;
-    let logical_count = WalCount::new(read_u64(&body[8..16], offset, "Commit logical count")?);
-    let object_count = WalCount::new(read_u64(&body[16..24], offset, "Commit object count")?);
-    let root_count = WalCount::new(read_u64(&body[24..32], offset, "Commit root count")?);
-    let logical_bytes = WalLength::new(read_u64(&body[32..40], offset, "Commit byte count")?);
-    let digest = body[40..]
-        .try_into()
-        .map(WalDigest::new)
-        .map_err(|_| WalError::Corrupt {
-            offset,
-            detail: "WAL Commit digest is truncated",
-        })?;
-    Ok((
-        sequence,
-        logical_count,
-        object_count,
-        root_count,
-        logical_bytes,
-        digest,
-    ))
+        digest: *digest.as_bytes(),
+    }
+    .encode()
 }
 
 /// Encode the caller-validated object frame.

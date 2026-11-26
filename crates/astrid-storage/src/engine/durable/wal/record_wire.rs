@@ -3,6 +3,46 @@ use vstd::prelude::*;
 
 verus! {
 
+/// A kind byte in the ASTWAL2 logical record grammar.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WalRecordKind {
+    /// Starts one transaction.
+    Begin,
+    /// Carries one canonical immutable object frame.
+    Object,
+    /// Carries one canonical principal-root transition.
+    Root,
+    /// Commits one transaction after all prior records.
+    Commit,
+}
+
+impl WalRecordKind {
+    /// Return the stable wire tag.
+    pub(super) fn tag(self) -> (tag: u8)
+        ensures tag == match self { Self::Begin => 1u8, Self::Object => 2, Self::Root => 3, Self::Commit => 4 },
+    {
+        match self {
+            Self::Begin => 1,
+            Self::Object => 2,
+            Self::Root => 3,
+            Self::Commit => 4,
+        }
+    }
+
+    /// Decode a stable wire tag.
+    pub(super) fn from_tag(tag: u8) -> (kind: Option<Self>)
+        ensures kind == match tag { 1 => Some(Self::Begin), 2 => Some(Self::Object), 3 => Some(Self::Root), 4 => Some(Self::Commit), _ => None },
+    {
+        match tag {
+            1 => Some(Self::Begin),
+            2 => Some(Self::Object),
+            3 => Some(Self::Root),
+            4 => Some(Self::Commit),
+            _ => None,
+        }
+    }
+}
+
 pub(super) const HEADER_LEN: usize = 20;
 
 pub(super) struct Header {

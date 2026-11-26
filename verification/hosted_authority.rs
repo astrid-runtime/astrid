@@ -3,6 +3,8 @@
 extern crate self as astrid_core;
 #[path = "../crates/astrid-capsule/src/engine/wasm/guest_kv.rs"]
 mod guest_kv_dispatch;
+mod hosted_wal_model;
+
 #[path = "hosted_kv_model.rs"]
 mod guest_kv_model;
 #[path = "../crates/astrid-capsule/src/security/identity.rs"]
@@ -88,6 +90,10 @@ mod root_transition;
 
 #[path = "../crates/astrid-storage/src/engine/durable/frontier.rs"]
 mod group_frontier;
+#[path = "../crates/astrid-storage/src/engine/durable/wal/commit_wire.rs"]
+mod commit_wire;
+#[path = "../crates/astrid-storage/src/engine/durable/wal/transaction.rs"]
+mod wal_transaction;
 #[path = "../crates/astrid-storage/src/engine/durable/wal/record_wire.rs"]
 mod wal_record_wire;
 #[path = "../crates/astrid-storage/src/engine/durable/root_wire.rs"]

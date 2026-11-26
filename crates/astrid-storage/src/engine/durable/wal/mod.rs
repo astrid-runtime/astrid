@@ -4,10 +4,12 @@
 //! checkpoint folds them into the canonical object arena and root journal.
 
 mod codec;
+mod commit_wire;
 mod overlay;
 mod record_wire;
 mod replay;
 mod scan;
+mod transaction;
 mod types;
 mod writer;
 

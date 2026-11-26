@@ -81,6 +81,7 @@ INPUTS = [
     LEASE_RESERVATION,
     Path("verification/hosted_lease_model.rs"),
     Path("verification/hosted_kv_model.rs"),
+    Path("verification/hosted_wal_model.rs"),
     Path("crates/astrid-core/src/storage_filesystem/operation.rs"),
     LEASE_REQUESTER,
     INVOCATION_OWNER,
@@ -115,6 +116,8 @@ INPUTS = [
     KV_ENCODING,
     GUEST_AUTHORITY,
     Path("crates/astrid-storage/src/engine/durable/frontier.rs"),
+    Path("crates/astrid-storage/src/engine/durable/wal/commit_wire.rs"),
+    Path("crates/astrid-storage/src/engine/durable/wal/transaction.rs"),
     Path("crates/astrid-storage/src/engine/durable/wal/record_wire.rs"),
     Path("crates/astrid-storage/src/engine/durable/root_wire.rs"),
     Path("crates/astrid-storage/src/principal_state/owner_codec.rs"),
@@ -464,6 +467,33 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "stale KV view falls back to neutral and completes the request",
             Path("verification/hosted_kv_model.rs"),
             lambda source: replace_once(source, "Some(uid) => Some(Destination::Principal(uid)),\n                None => None,", "Some(uid) => Some(Destination::Principal(uid)),\n                None => Some(Destination::Neutral),"),
+        ),
+        (
+            "WAL Commit wire writes an object count in the root count slot",
+            Path("crates/astrid-storage/src/engine/durable/wal/commit_wire.rs"),
+            lambda source: replace_once(source, "body[24..32].copy_from_slice(&little_endian(self.counts.roots));",
+                                       "body[24..32].copy_from_slice(&little_endian(self.counts.objects));"),
+        ),
+        (
+            "WAL Commit validator accepts a different byte count",
+            Path("crates/astrid-storage/src/engine/durable/wal/commit_wire.rs"),
+            lambda source: replace_once(source, "if self.bytes != observed.bytes", "if self.bytes < observed.bytes"),
+        ),
+        (
+            "WAL Commit validator authenticates its own stored digest",
+            Path("crates/astrid-storage/src/engine/durable/wal/commit_wire.rs"),
+            lambda source: replace_once(source, "if !self.digest_matches(&digest)", "if !self.digest_matches(&self.digest)"),
+        ),
+        (
+            "WAL replay commits descriptors from another begin offset",
+            Path("crates/astrid-storage/src/engine/durable/wal/transaction.rs"),
+            lambda source: replace_once(source, " || batch.origin.offset != offset", ""),
+        ),
+        (
+            "WAL replay releases descriptors at an uncommitted tail",
+            Path("crates/astrid-storage/src/engine/durable/wal/transaction.rs"),
+            lambda source: replace_once(source, "Event::Tail => Ok(Step::End),",
+                                       "Event::Tail => match pending { Some(b) => Ok(Step::Committed(b)), None => Ok(Step::End) },"),
         ),
         (
             "WAL record header repeats the sequence in the ordinal field",
@@ -1610,6 +1640,25 @@ def consumer_defects():
             name, Path("crates/astrid-storage/src/engine/durable/frontier.rs"),
             lambda source, clause=clause: replace_once(source, clause, "else if observed == current { position }" if clause.startswith("else if") else ""),
             Path("verification/hosted_kv_model.rs"),
+        )
+    yield (
+        "prepared binding loses the mismatched root rejection",
+        Path("crates/astrid-storage/src/engine/durable/root_wire.rs"),
+        lambda source: replace_once(source,
+            "outcome.is_ok() == (live@ == saved@ && same_expected(expected,prior) && same(replacement,next))",
+            "(live@ == saved@ && same_expected(expected,prior) && same(replacement,next)) ==> outcome.is_ok()"),
+        Path("verification/hosted_kv_model.rs"),
+    )
+    for name, path, clause, weaker in [
+        ("WAL Commit encoding loses its wire contract", "commit_wire.rs", "ensures body@ == self.wire()", "ensures true"),
+        ("checked WAL Commit loses the observed digest", "commit_wire.rs", "&& finish_digest.ensures((),self.digest)", "&& true"),
+        ("committed prefix loses its ordered descriptors", "transaction.rs", "Ok(Step::Committed(b)) && b == p", "Ok(Step::Committed(b))"),
+        ("WAL prefix loses its terminal tail guarantee", "transaction.rs", "Event::Tail => result matches Ok(Step::End)", "Event::Tail => true"),
+    ]:
+        yield (
+            name, Path("crates/astrid-storage/src/engine/durable/wal") / path,
+            lambda source, clause=clause, weaker=weaker: replace_once(source, clause, weaker),
+            Path("verification/hosted_wal_model.rs"),
         )
     consumer = Path("verification/hosted_lease_model.rs")
     yield (
