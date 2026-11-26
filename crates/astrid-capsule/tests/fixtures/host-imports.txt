@@ -1,0 +1,252 @@
+astrid:approval/host@1.0.0
+  request-approval
+
+astrid:elicit/host@1.0.0
+  elicit
+  has-secret
+
+astrid:fs/host@1.0.0
+  [drop]file-handle
+  [method]file-handle.read-at
+  [method]file-handle.set-len
+  [method]file-handle.stat
+  [method]file-handle.sync-all
+  [method]file-handle.sync-data
+  [method]file-handle.write-at
+  fs-append
+  fs-canonicalize
+  fs-copy
+  fs-exists
+  fs-hard-link
+  fs-mkdir
+  fs-mkdir-all
+  fs-open
+  fs-read-link
+  fs-readdir
+  fs-remove-dir-all
+  fs-rename
+  fs-stat
+  fs-stat-symlink
+  fs-unlink
+  read-file
+  write-file
+
+astrid:guest/lifecycle@1.0.0
+
+astrid:http/host@1.0.0
+  [drop]http-stream
+  [method]http-stream.body-stream
+  [method]http-stream.close
+  [method]http-stream.headers
+  [method]http-stream.read-chunk
+  [method]http-stream.status
+  [method]http-stream.subscribe-readable
+  http-request
+  http-stream-start
+
+astrid:http/host@1.1.0
+  [drop]http-stream
+  [drop]http-upload
+  [method]http-stream.body-stream
+  [method]http-stream.close
+  [method]http-stream.headers
+  [method]http-stream.read-chunk
+  [method]http-stream.status
+  [method]http-stream.subscribe-readable
+  [method]http-stream.trailers
+  [method]http-upload.body-sink
+  [method]http-upload.finish
+  [method]http-upload.subscribe-writable
+  http-request
+  http-request-opts
+  http-stream-start
+  http-stream-start-opts
+  http-upload-start
+
+astrid:identity/host@1.0.0
+  identity-create-user
+  identity-link
+  identity-list-links
+  identity-resolve
+  identity-unlink
+
+astrid:io/error@1.0.0
+  [drop]error
+  [method]error.to-debug-string
+
+astrid:io/poll@1.0.0
+  [drop]pollable
+  [method]pollable.block
+  [method]pollable.ready
+  poll
+
+astrid:io/streams@1.0.0
+  [drop]input-stream
+  [drop]output-stream
+  [method]input-stream.blocking-read
+  [method]input-stream.blocking-skip
+  [method]input-stream.read
+  [method]input-stream.skip
+  [method]input-stream.subscribe
+  [method]output-stream.blocking-flush
+  [method]output-stream.blocking-splice
+  [method]output-stream.blocking-write-and-flush
+  [method]output-stream.blocking-write-zeroes-and-flush
+  [method]output-stream.check-write
+  [method]output-stream.flush
+  [method]output-stream.splice
+  [method]output-stream.subscribe
+  [method]output-stream.write
+  [method]output-stream.write-zeroes
+
+astrid:ipc/host@1.0.0
+  [drop]subscription
+  [method]subscription.poll
+  [method]subscription.recv
+  [method]subscription.subscribe-readiness
+  get-interceptor-bindings
+  publish
+  publish-as
+  subscribe
+
+astrid:kv/host@1.0.0
+  kv-cas
+  kv-clear-prefix
+  kv-delete
+  kv-get
+  kv-list-keys
+  kv-list-keys-page
+  kv-set
+
+astrid:net/host@1.0.0
+  [drop]tcp-listener
+  [drop]tcp-stream
+  [drop]udp-socket
+  [drop]unix-listener
+  [method]tcp-listener.accept
+  [method]tcp-listener.local-addr
+  [method]tcp-listener.poll-accept
+  [method]tcp-listener.subscribe-readiness
+  [method]tcp-stream.hop-limit
+  [method]tcp-stream.keepalive
+  [method]tcp-stream.linger
+  [method]tcp-stream.local-addr
+  [method]tcp-stream.nodelay
+  [method]tcp-stream.peek
+  [method]tcp-stream.peer-addr
+  [method]tcp-stream.read
+  [method]tcp-stream.read-bytes
+  [method]tcp-stream.read-stream
+  [method]tcp-stream.read-timeout
+  [method]tcp-stream.reuseaddr
+  [method]tcp-stream.set-hop-limit
+  [method]tcp-stream.set-keepalive
+  [method]tcp-stream.set-linger
+  [method]tcp-stream.set-nodelay
+  [method]tcp-stream.set-read-timeout
+  [method]tcp-stream.set-reuseaddr
+  [method]tcp-stream.set-write-timeout
+  [method]tcp-stream.shutdown
+  [method]tcp-stream.subscribe-readable
+  [method]tcp-stream.write
+  [method]tcp-stream.write-bytes
+  [method]tcp-stream.write-stream
+  [method]tcp-stream.write-timeout
+  [method]udp-socket.connect
+  [method]udp-socket.disconnect
+  [method]udp-socket.local-addr
+  [method]udp-socket.peer-addr
+  [method]udp-socket.recv
+  [method]udp-socket.recv-from
+  [method]udp-socket.send
+  [method]udp-socket.send-to
+  [method]udp-socket.set-read-timeout
+  [method]udp-socket.subscribe-readable
+  [method]unix-listener.accept
+  [method]unix-listener.poll-accept
+  [method]unix-listener.subscribe-readiness
+  bind-tcp
+  bind-unix
+  connect-tcp
+  lookup-host
+  udp-bind
+
+astrid:process/host@1.0.0
+  [drop]process-handle
+  [method]process-handle.close-stdin
+  [method]process-handle.kill
+  [method]process-handle.os-pid
+  [method]process-handle.read-logs
+  [method]process-handle.signal
+  [method]process-handle.subscribe-exit
+  [method]process-handle.subscribe-logs
+  [method]process-handle.wait
+  [method]process-handle.wait-with-output
+  [method]process-handle.write-stdin
+  attach
+  close-stdin
+  list-processes
+  read-logs
+  read-since
+  release-process
+  signal
+  spawn
+  spawn-background
+  spawn-persistent
+  status
+  status-many
+  stop
+  unwatch
+  wait
+  watch
+  write-stdin
+
+astrid:process/host@1.1.0
+  [drop]process-handle
+  [method]process-handle.close-stdin
+  [method]process-handle.kill
+  [method]process-handle.os-pid
+  [method]process-handle.read-logs
+  [method]process-handle.signal
+  [method]process-handle.subscribe-exit
+  [method]process-handle.subscribe-logs
+  [method]process-handle.wait
+  [method]process-handle.wait-with-output
+  [method]process-handle.write-stdin
+  attach
+  close-stdin
+  list-processes
+  read-logs
+  read-since
+  release-process
+  signal
+  spawn
+  spawn-background
+  spawn-persistent
+  status
+  status-many
+  stop
+  unwatch
+  wait
+  watch
+  write-stdin
+
+astrid:request-context/host@1.0.0
+  connection-owner
+  connection-principal
+
+astrid:sys/host@1.0.0
+  check-capsule-capability
+  clock-monotonic-ns
+  clock-ms
+  enumerate-capabilities
+  get-caller
+  get-config
+  log
+  random-bytes
+  signal-ready
+  sleep-ns
+
+astrid:uplink/host@1.0.0
+  uplink-register
+  uplink-send

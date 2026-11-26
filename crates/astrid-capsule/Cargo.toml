@@ -104,6 +104,7 @@ wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
 
 [dev-dependencies]
+wit-parser = { workspace = true }
 astrid-crypto = { workspace = true }
 astrid-mcp = { workspace = true, features = ["test-support"] }
 astrid-uplink = { workspace = true, features = ["test-support"] }

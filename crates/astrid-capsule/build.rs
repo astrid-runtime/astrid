@@ -13,8 +13,7 @@
 //!    dir by the full `<pkg>@<ver>` stem (not just the package name) keeps two
 //!    versions of the same package (e.g. `http@1.0.0` and `http@1.1.0`) in
 //!    separate `deps/` dirs — wasmtime errors if one dir holds two package
-//!    declarations. The synthetic kernel world is supplied via the `inline:`
-//!    option in `bindings.rs`.
+//!    declarations. The kernel world is checked in at `wit-staging/kernel.wit`.
 //!
 //! No external WIT packages are vendored — the host ABI is fully
 //! Astrid-owned (`astrid:*` only, no `wasi:*` dependency).
@@ -75,13 +74,10 @@ fn stage_wit() {
 
     let deps = staging.join("deps");
 
-    if staging.exists() {
-        fs::remove_dir_all(&staging).expect("clean wit-staging");
+    if deps.exists() {
+        fs::remove_dir_all(&deps).expect("clean staged WIT dependencies");
     }
     fs::create_dir_all(&deps).expect("create wit-staging/deps");
-
-    fs::write(staging.join("kernel.wit"), "package kernel:placeholder;\n")
-        .expect("write kernel.wit");
 
     for entry in fs::read_dir(&host_src).expect("read wit/host") {
         let entry = entry.unwrap();
