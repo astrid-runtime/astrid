@@ -170,6 +170,15 @@ pub trait WorkspaceMountResolver: Send + Sync {
         &self,
         principal: &astrid_core::principal::PrincipalId,
     ) -> Result<PrincipalMount, String>;
+
+    /// Bind this exact admitted UID. Alias-only resolvers cannot establish ownership.
+    async fn resolve_for(
+        &self,
+        _principal: &astrid_core::principal::PrincipalId,
+        _uid: astrid_core::PrincipalUid,
+    ) -> Result<PrincipalMount, String> {
+        Err("workspace resolver does not support UID-bound mounts".to_owned())
+    }
 }
 
 impl std::fmt::Debug for PrincipalMount {
@@ -265,6 +274,8 @@ pub struct HostState {
     /// Explicit kernel-service scope. When false, every long-lived IPC route
     /// is restricted to `principal`; default-principal is still a principal.
     pub system_runtime: bool,
+    /// Immutable owner of a kernel-reserved principal runtime.
+    pub(crate) runtime_owner_uid: Option<astrid_core::PrincipalUid>,
     /// The plugin this state belongs to.
     pub capsule_id: CapsuleId,
     /// Per-capsule native operational log under
@@ -358,6 +369,8 @@ pub struct HostState {
     /// principal differs from `self.principal`. When set, overrides `home`
     /// for scheme resolution and security gate checks. Cleared on exit.
     pub invocation_home: Option<PrincipalMount>,
+    /// Durable identity captured when the invocation storage overlays were admitted.
+    pub(crate) invocation_storage_uid: Option<astrid_core::PrincipalUid>,
     /// Per-invocation authoritative workspace branch for the authenticated
     /// caller. Cleared when the invocation returns to the pool.
     pub invocation_workspace: Option<PrincipalMount>,

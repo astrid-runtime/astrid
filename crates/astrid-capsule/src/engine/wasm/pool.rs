@@ -470,6 +470,7 @@ pub(super) fn clear_on_return(state: &mut HostState, reset_resources: bool) {
     state.interceptor_active = false;
     state.invocation_kv = None;
     state.invocation_home = None;
+    state.invocation_storage_uid = None;
     state.invocation_workspace = None;
     state.invocation_tmp = None;
     state.invocation_secret_store = None;

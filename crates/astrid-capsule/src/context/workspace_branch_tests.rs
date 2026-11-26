@@ -85,6 +85,30 @@ pub(super) fn user_identity(id: u128, key: u8) -> UserIdentity {
 }
 
 #[tokio::test]
+async fn workspace_rejects_an_owner_change_before_binding() {
+    let fixture = fixture().await;
+    let admitted = fixture.directory.uid_for(&fixture.bob).unwrap();
+    assert!(
+        fixture
+            .service
+            .bind_for(&fixture.alice, Some(admitted))
+            .await
+            .is_err()
+    );
+    assert!(fixture.service.bindings.lock().unwrap().is_empty());
+    let current = fixture.directory.uid_for(&fixture.alice).unwrap();
+    assert_eq!(
+        fixture
+            .service
+            .bind_for(&fixture.alice, Some(current))
+            .await
+            .unwrap()
+            .uid,
+        current
+    );
+}
+
+#[tokio::test]
 async fn concurrent_capsules_share_one_uid_branch() {
     let fixture = fixture().await;
     let left = Arc::clone(&fixture.service);
