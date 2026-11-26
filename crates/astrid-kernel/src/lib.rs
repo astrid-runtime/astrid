@@ -436,6 +436,9 @@ pub struct Kernel {
     ownership_store: Arc<astrid_storage::OwnershipStore>,
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     user_cpu: Arc<astrid_capsule::user_cpu::UserCpuAccounting>,
+    /// Native lease preparations ordered against requester retirement.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    pub(crate) pending_mount_issues: storage_mount::PendingMountIssues,
     /// Live native filesystem leases, each fixed to one authenticated caller
     /// and one typed storage owner.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -1369,6 +1372,8 @@ impl Kernel {
             ownership_store,
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             user_cpu,
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            pending_mount_issues: storage_mount::PendingMountIssues::default(),
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             storage_mounts: Arc::new(DashMap::new()),
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -3542,6 +3547,8 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
             std::collections::BTreeMap::default(),
         )),
         ownership_store,
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        pending_mount_issues: storage_mount::PendingMountIssues::default(),
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         storage_mounts: Arc::new(DashMap::new()),
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]

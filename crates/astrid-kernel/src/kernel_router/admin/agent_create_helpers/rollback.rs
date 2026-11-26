@@ -244,6 +244,13 @@ pub(super) async fn fence_failed_initialization(
             .capabilities
             .begin_principal_retirement(principal.clone())
             .await;
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        crate::storage_mount::retire_requester(
+            kernel,
+            principal,
+            kernel.principal_directory.uid_for(principal).ok(),
+        )
+        .await;
         kernel
             .allowance_store
             .begin_principal_retirement(principal)
