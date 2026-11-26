@@ -492,6 +492,14 @@ impl ipc::Host for HostState {
         let bytes = payload.len() as u64;
         let topic_for_audit = topic.clone();
         let authority = self.ingress_socket.clone();
+        match &authority {
+            Some(socket)
+                if socket.identity.principal.as_str() == effective.as_str()
+                    && socket.identity.device_key_id == device_key_id
+                    && Some(socket.identity.request_owner) == request_owner => {},
+            None if device_key_id.is_none() => {},
+            _ => return Err(ErrorCode::CapabilityDenied),
+        }
         let publication = publish_inner(
             self,
             topic,

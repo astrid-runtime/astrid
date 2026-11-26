@@ -15,7 +15,12 @@ fn connection(
         .unwrap();
     let (server, peer) = LocalStream::pair().unwrap();
     (
-        SignedSocket::new(server, session, &tokio::runtime::Handle::current()),
+        SignedSocket::new(
+            server,
+            session,
+            ConnectionIdentity::new(owner.clone(), Some(key.as_str().to_owned())),
+            &tokio::runtime::Handle::current(),
+        ),
         peer,
     )
 }
@@ -34,6 +39,7 @@ async fn captured_frame_outlives_socket_but_not_device_grant() {
     );
     assert_eq!(frame.run(async { 1 }).await, Some(1));
     registry.retire(&owner, &key).await.unwrap();
+    let (_paired_again, _peer) = connection(&registry, &owner, &key);
     assert_eq!(frame.run(async { 1 }).await, None);
 }
 

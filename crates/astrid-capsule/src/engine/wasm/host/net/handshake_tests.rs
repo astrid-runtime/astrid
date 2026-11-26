@@ -254,7 +254,7 @@ async fn socket_accept_and_poll_authenticate_against_the_configured_home() {
             } else {
                 state.accept(slot).unwrap()
             };
-            let identity = state.connection_principal(stream.rep());
+            let identity = crate::engine::wasm::bindings::astrid::request_context::host::Host::connection_principal(&mut state, stream).unwrap();
             (state, identity)
         });
         let guard = cancel.drop_guard();
@@ -267,7 +267,7 @@ async fn socket_accept_and_poll_authenticate_against_the_configured_home() {
         let identity;
         (state, identity) = server.await.unwrap();
         let _ = guard.disarm();
-        assert_eq!(identity.as_ref(), Some(&principal));
+        assert_eq!(identity.as_deref(), Some(principal.as_str()));
         let key = DeviceKeyId::new(full_device(&keypair).key_id).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             state

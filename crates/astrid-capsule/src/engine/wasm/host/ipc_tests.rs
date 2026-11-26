@@ -614,12 +614,8 @@ fn first_device_key_id(
     }
 }
 
-/// `publish_as` stamps the host-derived `ingress_device_key_id` onto the
-/// outbound message alongside the verified principal, so the kernel cap-gate
-/// can resolve the device's scope. The key_id is host-derived (from the
-/// in-flight connection), never the capsule-supplied name.
 #[tokio::test]
-async fn publish_as_stamps_host_derived_device_key_id() {
+async fn publish_as_refuses_a_device_stamp_without_a_session() {
     let rt = tokio::runtime::Handle::current();
     let mut state = minimal_host_state(rt);
     state.has_uplink_capability = true;
@@ -634,22 +630,15 @@ async fn publish_as_stamps_host_derived_device_key_id() {
 
     let mut receiver = state.event_bus.subscribe_topic("client.v1.connect");
 
-    IpcHost::publish_as(
+    let result = IpcHost::publish_as(
         &mut state,
         "client.v1.connect".to_string(),
         "{}".to_string(),
         "default".to_string(),
     )
-    .await
-    .expect("publish_as should succeed");
-
-    let (principal, device_key_id) = first_device_key_id(&mut receiver);
-    assert_eq!(principal.as_deref(), Some("claude"));
-    assert_eq!(
-        device_key_id.as_deref(),
-        Some("dev-abc123"),
-        "publish_as must stamp the host-derived device key_id for cap-gate scoping"
-    );
+    .await;
+    assert!(matches!(result, Err(ErrorCode::CapabilityDenied)));
+    assert!(receiver.try_recv().is_none());
 }
 
 /// An unbound (unauthenticated) connection carries no device key_id, so

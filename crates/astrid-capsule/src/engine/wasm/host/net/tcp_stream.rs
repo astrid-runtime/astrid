@@ -92,10 +92,13 @@ impl HostTcpStream for HostState {
             // Closed terminates the read loop cleanly.
             None => Ok(NetReadStatus::Closed),
         };
-        let binding = self
-            .connection_principals
-            .get(&self_.rep())
-            .map(|entry| entry.clone());
+        let binding = match &authority {
+            Some(socket) => Some(socket.identity.as_ref().clone()),
+            None => self
+                .connection_principals
+                .get(&self_.rep())
+                .map(|entry| entry.clone()),
+        };
         if let Some(identity) = super::ingress_frame::select(
             self.has_uplink_capability,
             matches!(&result, Ok(NetReadStatus::Data(_))),
