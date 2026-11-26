@@ -98,22 +98,24 @@ pub(crate) struct StorageMountLeaseState {
     mutation_test_gate: std::sync::Mutex<Option<Arc<MutationTestGate>>>,
 }
 
-struct InFlightMutation<'a> {
-    count: &'a AtomicU64,
+struct InFlightMutation {
+    lease: Arc<StorageMountLeaseState>,
 }
 
-impl<'a> InFlightMutation<'a> {
-    fn begin(state: &'a StorageMountLeaseState) -> Self {
+impl InFlightMutation {
+    fn begin(state: &Arc<StorageMountLeaseState>) -> Self {
         state.in_flight_mutations.fetch_add(1, Ordering::AcqRel);
         Self {
-            count: &state.in_flight_mutations,
+            lease: Arc::clone(state),
         }
     }
 }
 
-impl Drop for InFlightMutation<'_> {
+impl Drop for InFlightMutation {
     fn drop(&mut self) {
-        self.count.fetch_sub(1, Ordering::AcqRel);
+        self.lease
+            .in_flight_mutations
+            .fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -331,7 +333,9 @@ pub(crate) async fn sync_lease(
     mount_id: StorageMountId,
 ) -> Result<(), String> {
     let state = owned_lease(kernel, caller, allow_cross_owner, mount_id)?;
-    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
+    let guard = Arc::clone(&kernel.storage_mount_mutations)
+        .lock_owned()
+        .await;
     if !state.is_live() {
         return Err("storage mount lease is expired or revoked".to_owned());
     }
@@ -341,35 +345,38 @@ pub(crate) async fn sync_lease(
         .ok_or_else(|| "native principal store is unavailable".to_owned())?;
     let owner = state.owner;
     let target = state.target.clone();
-    tokio::task::spawn_blocking(move || match target {
-        StorageFilesystemTargetV1::OwnerRoot => AstridFilesystem::new(store.content(), owner)
-            .sync()
-            .map_err(|error| error.to_string()),
-        StorageFilesystemTargetV1::WorkspaceBranch { workspace } => {
-            WorkspaceBranchStore::new(store.content())
-                .filesystem(owner, workspace)
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        match target {
+            StorageFilesystemTargetV1::OwnerRoot => AstridFilesystem::new(store.content(), owner)
                 .sync()
-                .map_err(|error| error.to_string())
-        },
-        StorageFilesystemTargetV1::OwnerSubtree { prefix } => {
-            if prefix == "shared" {
-                AstridFilesystem::new_fleet_shared(store.content(), owner)
+                .map_err(|error| error.to_string()),
+            StorageFilesystemTargetV1::WorkspaceBranch { workspace } => {
+                WorkspaceBranchStore::new(store.content())
+                    .filesystem(owner, workspace)
                     .sync()
                     .map_err(|error| error.to_string())
-            } else {
-                let filesystem = PrefixedFilesystem {
-                    inner: AstridFilesystem::new(store.content(), owner),
-                    prefix,
-                };
-                filesystem.sync().map_err(|error| error.to_string())
-            }
-        },
+            },
+            StorageFilesystemTargetV1::OwnerSubtree { prefix } => {
+                if prefix == "shared" {
+                    AstridFilesystem::new_fleet_shared(store.content(), owner)
+                        .sync()
+                        .map_err(|error| error.to_string())
+                } else {
+                    let filesystem = PrefixedFilesystem {
+                        inner: AstridFilesystem::new(store.content(), owner),
+                        prefix,
+                    };
+                    filesystem.sync().map_err(|error| error.to_string())
+                }
+            },
+        }?;
+        state.dirty.store(false, Ordering::Release);
+        state.renew();
+        Ok(())
     })
     .await
-    .map_err(|error| format!("mount sync worker failed: {error}"))??;
-    state.dirty.store(false, Ordering::Release);
-    state.renew();
-    Ok(())
+    .map_err(|error| format!("mount sync worker failed: {error}"))?
 }
 
 /// Revoke one lease and drain any in-flight mutation before cleanup.
@@ -703,7 +710,7 @@ async fn write_response(
 
 async fn dispatch_request(
     kernel: &Kernel,
-    state: &StorageMountLeaseState,
+    state: &Arc<StorageMountLeaseState>,
     callback: CallbackRequest,
 ) -> CallbackResponse {
     let request = callback.request;
@@ -762,7 +769,7 @@ fn response_v2(response: StorageFilesystemResponseV1) -> StorageFilesystemRespon
 
 async fn execute_operation(
     kernel: &Kernel,
-    state: &StorageMountLeaseState,
+    state: &Arc<StorageMountLeaseState>,
     operation: StorageFilesystemOperationV1,
 ) -> StorageFilesystemOutcomeV1 {
     let class = operation_class(&operation);
@@ -774,8 +781,10 @@ async fn execute_operation(
     if matches!(&operation, StorageFilesystemOperationV1::VolumeInfo) {
         return volume_info::read(kernel).await;
     }
-    let _mutation_guard = if class.requires_serialization() {
-        let guard = kernel.storage_mount_mutations.lock().await;
+    let guard = if class.requires_serialization() {
+        let guard = Arc::clone(&kernel.storage_mount_mutations)
+            .lock_owned()
+            .await;
         if !state.is_live() {
             return failure("stale-lease", "storage mount lease is expired or revoked");
         }
@@ -783,58 +792,60 @@ async fn execute_operation(
     } else {
         None
     };
-    let _in_flight = is_mutation.then(|| InFlightMutation::begin(state));
-    #[cfg(test)]
-    if is_mutation {
-        pause_mutation_for_test(state).await;
-    }
     let Some(store) = kernel.principal_store.clone() else {
         return failure("unavailable", "native principal store is unavailable");
     };
     let owner = state.owner;
     let target = state.target.clone();
     let runtime_home = kernel.astrid_home.clone();
-    let result = tokio::task::spawn_blocking(move || match target {
-        StorageFilesystemTargetV1::OwnerRoot => {
-            let filesystem = AstridFilesystem::new(store.content(), owner);
-            if owner == StateOwner::System && is_mutation {
-                admin_projection::execute(&runtime_home, &store, operation)
-            } else {
-                execute_blocking(&filesystem, operation)
-            }
-        },
-        StorageFilesystemTargetV1::WorkspaceBranch { workspace } => {
-            let branches = WorkspaceBranchStore::new(store.content());
-            let filesystem = branches.filesystem(owner, workspace);
-            execute_blocking(&filesystem, operation)
-        },
-        StorageFilesystemTargetV1::OwnerSubtree { prefix } => {
-            if prefix == "shared" {
-                let filesystem = AstridFilesystem::new_fleet_shared(store.content(), owner);
-                execute_blocking(&filesystem, operation)
-            } else {
-                let filesystem = PrefixedFilesystem {
-                    inner: AstridFilesystem::new(store.content(), owner),
-                    prefix,
-                };
-                execute_blocking(&filesystem, operation)
-            }
-        },
-    })
-    .await;
-    let outcome = match result {
-        Ok(Ok(success)) => StorageFilesystemOutcomeV1::Success(success),
-        Ok(Err(error)) => map_filesystem_error(&error),
-        Err(error) => failure("internal", &format!("filesystem worker failed: {error}")),
-    };
-    if matches!(&outcome, StorageFilesystemOutcomeV1::Success(_)) {
+    let in_flight = is_mutation.then(|| InFlightMutation::begin(state));
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        // A cancelled waiter cannot join a blocking worker. The worker owns
+        // serialization through both the filesystem effect and dirty accounting.
+        let _guard = guard;
+        let _in_flight = in_flight;
+        #[cfg(test)]
         if is_mutation {
-            state.dirty.store(true, Ordering::Release);
-        } else if is_sync {
-            state.dirty.store(false, Ordering::Release);
+            tokio::runtime::Handle::current().block_on(pause_mutation_for_test(&state));
         }
-    }
-    outcome
+        let result = match target {
+            StorageFilesystemTargetV1::OwnerRoot => {
+                let filesystem = AstridFilesystem::new(store.content(), owner);
+                if owner == StateOwner::System && is_mutation {
+                    admin_projection::execute(&runtime_home, &store, operation)
+                } else {
+                    execute_blocking(&filesystem, operation)
+                }
+            },
+            StorageFilesystemTargetV1::WorkspaceBranch { workspace } => {
+                let branches = WorkspaceBranchStore::new(store.content());
+                let filesystem = branches.filesystem(owner, workspace);
+                execute_blocking(&filesystem, operation)
+            },
+            StorageFilesystemTargetV1::OwnerSubtree { prefix } => {
+                if prefix == "shared" {
+                    let filesystem = AstridFilesystem::new_fleet_shared(store.content(), owner);
+                    execute_blocking(&filesystem, operation)
+                } else {
+                    let filesystem = PrefixedFilesystem {
+                        inner: AstridFilesystem::new(store.content(), owner),
+                        prefix,
+                    };
+                    execute_blocking(&filesystem, operation)
+                }
+            },
+        };
+        if result.is_ok() && (is_mutation || is_sync) {
+            state.dirty.store(is_mutation, Ordering::Release);
+        }
+        match result {
+            Ok(success) => StorageFilesystemOutcomeV1::Success(success),
+            Err(error) => map_filesystem_error(&error),
+        }
+    })
+    .await
+    .unwrap_or_else(|error| failure("internal", &format!("filesystem worker failed: {error}")))
 }
 
 #[cfg(test)]
@@ -846,9 +857,11 @@ async fn pause_mutation_for_test(state: &StorageMountLeaseState) {
         .clone();
     if let Some(gate) = gate {
         gate.entered.add_permits(1);
-        if let Ok(permit) = gate.release.acquire().await {
-            permit.forget();
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(20), gate.release.acquire())
+            .await
+            .expect("test must release the filesystem worker")
+            .unwrap()
+            .forget();
     }
 }
 

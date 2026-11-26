@@ -448,7 +448,7 @@ pub struct Kernel {
     /// Linearizes read-modify-publish filesystem mutations across all native
     /// mounts so concurrent views cannot lose non-overlapping writes.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    pub(crate) storage_mount_mutations: tokio::sync::Mutex<()>,
+    pub(crate) storage_mount_mutations: Arc<Mutex<()>>,
     /// System-wide per-principal profile cache (Layer 3 quota enforcement).
     ///
     /// One instance per kernel boot. Every capsule load plumbs this into
@@ -1372,7 +1372,7 @@ impl Kernel {
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             storage_mounts: Arc::new(DashMap::new()),
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-            storage_mount_mutations: tokio::sync::Mutex::new(()),
+            storage_mount_mutations: Arc::new(Mutex::new(())),
             profile_cache: profile_cache
                 .unwrap_or_else(|| Arc::new(PrincipalProfileCache::with_home(home.clone()))),
             groups,
@@ -3545,7 +3545,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         storage_mounts: Arc::new(DashMap::new()),
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        storage_mount_mutations: tokio::sync::Mutex::new(()),
+        storage_mount_mutations: Arc::new(Mutex::new(())),
         profile_cache: Arc::new(PrincipalProfileCache::with_home(home.clone())),
         groups,
         astrid_home: home,
