@@ -121,7 +121,7 @@ where
         scanner.restore_cursor().map_err(durable_error)?;
         let mut next_roots = roots.clone();
         let mut root_conflict = false;
-        for descriptor in &transaction.roots {
+        for descriptor in transaction.roots() {
             let transition = descriptor.transition();
             let principal = codec
                 .decode(transition.principal())

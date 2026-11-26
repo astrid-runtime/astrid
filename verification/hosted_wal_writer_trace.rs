@@ -1,5 +1,6 @@
 //! Construct a complete layout from the real Begin, Root and Commit encoders.
 use super::*;
+use crate::{owner_codec::{self,Owner},root_wire,root_transition::{self,Version,Replay}};
 use vstd::prelude::*;
 
 verus! {
@@ -43,15 +44,16 @@ fn write_data<H>(record:Measured,hash:H,checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]
 /// and recover the exact stored Root bytes in its released batch.
 fn begin_root<H,F>(sequence:u64,begin_body:&[u8],root_body:&[u8],chunk_size:usize,hash:H,
     checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]>,finish:F,digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>)
-    -> (out:Option<CheckedMarker>)
+    -> (out:Option<(CheckedMarker,Vec<u8>)>)
     where H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,F:Fn(&[u8])->[u8;32]+Copy,
     requires sequence != 0, begin_body.len() as int + root_body.len() + 288 <= usize::MAX,
         forall|m:[u8;8],n:u64,p:&[u8]| #[trigger] hash.requires((m,n,p)),
         forall|p:&[u8],v:[u8;32]| #[trigger] hash.ensures((physical::MAGIC,p.len() as u64,p),v) ==> v == (checksum@)(p@),
         forall|p:&[u8]| #[trigger] finish.requires((p,)),
         forall|p:&[u8],v:[u8;32]| #[trigger] finish.ensures((p,),v) ==> v == (digest@)(p@),
-    ensures out matches Some(checked) && {
+    ensures out matches Some((checked,recovered)) && {
         let m = checked.marker();
+        &&& recovered@ == root_body@
         &&& m.counts.sequence == sequence && m.counts.logical == 2 && m.counts.objects == 0 && m.counts.roots == 1
         &&& m.counts.bytes as int == 40 + begin_body.len() + root_body.len()
         &&& m.digest == (digest@)(wal_measurement::digest_header(WalRecordKind::Begin,0,sequence,0,begin_body.len() as u64) + begin_body@
@@ -111,7 +113,78 @@ fn begin_root<H,F>(sequence:u64,begin_body:&[u8],root_body:&[u8],chunk_size:usiz
         assert(data@ =~= expected);
         assert(scan.marker.marker().digest == (digest@)(expected));
     }
-    Some(scan.marker)
+    let mut recovered = Vec::new();
+    recovered.extend_from_slice(scan.batch.roots()[0].body);
+    Some((scan.marker,recovered))
+}
+
+spec fn version(r:root_wire::Root) -> Version {
+    Version {generation:vstd::bytes::spec_u64_from_le_bytes(r.generation@),commit:r.commit}
+}
+
+fn decode_version(r:root_wire::Root) -> (v:Version)
+    ensures v == version(r),
+{
+    Version {generation:u64::from_le_bytes(r.generation),commit:r.commit}
+}
+
+/// Consult the history of the owner decoded from the released record, then
+/// classify the replay against the full versions that the writer serialized.
+/// The maximum body is 138 bytes (8-byte length, 33-byte owner, 1-byte
+/// expected tag and two 48-byte roots). The three frames add 288 bytes.
+fn recover_root<H,F,L>(sequence:u64,begin:&[u8],owner:Owner,scheme:root_wire::Scheme,
+    prior:Option<root_wire::Root>,next:root_wire::Root,chunk:usize,hash:H,
+    checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]>,finish:F,digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>,
+    lookup:L,history:Ghost<spec_fn(Seq<u8>)->Option<Version>>)
+    -> (out:Option<Replay>)
+    where H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,F:Fn(&[u8])->[u8;32]+Copy,L:FnOnce(Owner)->Option<Version>,
+    requires sequence != 0, begin.len() as int + 138 + 288 <= usize::MAX,
+        forall|m:[u8;8],n:u64,p:&[u8]| #[trigger] hash.requires((m,n,p)),
+        forall|p:&[u8],v:[u8;32]| #[trigger] hash.ensures((physical::MAGIC,p.len() as u64,p),v) ==> v == (checksum@)(p@),
+        forall|p:&[u8]| #[trigger] finish.requires((p,)),
+        forall|p:&[u8],v:[u8;32]| #[trigger] finish.ensures((p,),v) ==> v == (digest@)(p@),
+        forall|o:Owner| #[trigger] lookup.requires((o,)),
+        forall|o:Owner,v:Option<Version>| #[trigger] lookup.ensures((o,),v) ==> v == (history@)(o.bytes()),
+    ensures ({
+        let actual = (history@)(owner.bytes());
+        let expected = match prior {Some(r) => Some(version(r)),None => None};
+        let replacement = version(next);
+        let valid = match expected {None => replacement.generation == 0,
+            Some(e) => replacement.generation as int == e.generation as int + 1};
+        &&& out.is_some() == valid
+        &&& out matches Some(d) ==> {
+            &&& (d is AlreadyPublished) == root_transition::matches_root(actual,Some(replacement))
+            &&& (d is Apply) == (!root_transition::matches_root(actual,Some(replacement)) && root_transition::matches_root(actual,expected))
+            &&& (d is Conflict) == (!root_transition::matches_root(actual,Some(replacement)) && !root_transition::matches_root(actual,expected))
+        }
+    }),
+{
+    let key = owner.encode();
+    let wire = root_wire::encode(&key,scheme,prior,next)?;
+    assert(wire.len() <= 138) by {
+        match prior {Some(r) => {assert(r.wire(scheme).len() == 48);},None => {}}
+        assert(next.wire(scheme).len() == 48);
+        assert(key.len() <= 33);
+        assert(vstd::bytes::spec_u64_to_le_bytes(key.len() as u64).len() == 8) by {
+            vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+        }
+    }
+    let (_,body) = begin_root(sequence,begin,&wire,chunk,hash,checksum,finish,digest)?;
+    proof { vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes(); }
+    assert(body@.take(8) =~= vstd::bytes::spec_u64_to_le_bytes(key.len() as u64));
+    let (saved,mut cursor) = root_wire::read_owner(&body).ok()?;
+    assert(saved@ =~= key@);
+    let recovered = owner_codec::decode(saved)?;
+    let ghost start = cursor as int;
+    assert(body@.skip(start) =~= root_wire::prior(prior,scheme) + next.wire(scheme));
+    assert(root_wire::tail(body@,start,scheme,prior,next));
+    let (e,r) = root_wire::read_tail(&body,&mut cursor,scheme).ok()?;
+    proof { root_wire::unique_tail(body@,start,scheme,e,r,prior,next); }
+    let expected = match e {Some(v) => Some(decode_version(v)), None => None};
+    let replacement = decode_version(r);
+    if !root_transition::valid_generation(expected,replacement.generation) {return None;}
+    let actual = lookup(recovered);
+    Some(root_transition::replay(actual,expected,replacement))
 }
 
 }

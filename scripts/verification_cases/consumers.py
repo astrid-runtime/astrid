@@ -9,6 +9,20 @@ from .common import (
 
 def consumer_defects():
     """Weaken a production guarantee and require its trace consumer to fail."""
+    trace = Path("verification/hosted_wal_writer_trace.rs")
+    yield (
+        "released WAL root loses its body before owner recovery", trace,
+        lambda source: replace_once(source, "&&& recovered@ == root_body@", "&&& true"), trace,
+    )
+    yield (
+        "replay reads another owner's history", trace,
+        lambda source: replace_once(source, "lookup(recovered)", "lookup(Owner::System)"), trace,
+    )
+    yield (
+        "replay reconstructs the wrong commit identity", trace,
+        lambda source: replace_once(source, "generation:u64::from_le_bytes(r.generation),commit:r.commit",
+                                    "generation:u64::from_le_bytes(r.generation),commit:[0;32]"), trace,
+    )
     yield (
         "WAL Commit encoding loses its wire contract",
         Path("crates/astrid-storage/src/engine/durable/wal/commit_wire.rs"),

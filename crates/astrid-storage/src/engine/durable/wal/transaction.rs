@@ -41,6 +41,10 @@ pub(super) ghost struct Contents<O,R> {
 }
 
 impl<O,R> Batch<O,R> {
+    pub(super) fn roots(&self) -> (records:&[R])
+        ensures records@ == self.contents().roots,
+    { self.roots.as_slice() }
+
     pub(super) closed spec fn contents(&self) -> Contents<O,R> {
         Contents { origin: self.origin, objects: self.objects@, roots: self.roots@ }
     }
