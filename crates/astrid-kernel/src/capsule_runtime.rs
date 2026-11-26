@@ -106,6 +106,7 @@ impl Kernel {
         )
         .with_registry(Arc::clone(&self.capsules))
         .with_session_token(Arc::clone(&self.session_token))
+        .with_device_sessions(self.device_sessions())
         .with_allowance_store(Arc::clone(&self.allowance_store))
         .with_identity_store(Arc::clone(&self.identity_store))
         .with_profile_cache(Arc::clone(&self.profile_cache))

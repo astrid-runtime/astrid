@@ -29,6 +29,29 @@ fn handshake_home(state: &HostState) -> std::io::Result<astrid_core::dirs::Astri
     }
 }
 
+fn accepted_stream(
+    stream: local_transport::LocalStream,
+    identity: Option<(
+        astrid_core::PrincipalId,
+        String,
+        astrid_core::profile::device_sessions::DeviceSession,
+    )>,
+    runtime: &tokio::runtime::Handle,
+) -> (NetStream, Option<(astrid_core::PrincipalId, String)>) {
+    match identity {
+        Some((principal, key, session)) => (
+            NetStream::Signed(crate::engine::wasm::host_state::SignedSocket::new(
+                stream, session, runtime,
+            )),
+            Some((principal, key)),
+        ),
+        None => (
+            NetStream::Unix(Arc::new(tokio::sync::Mutex::new(stream))),
+            None,
+        ),
+    }
+}
+
 impl HostUnixListener for HostState {
     fn accept(&mut self, _self_: Resource<UnixListener>) -> Result<Resource<TcpStream>, ErrorCode> {
         if self.capsule_net_stream_count.load(Ordering::Acquire) >= MAX_ACTIVE_STREAMS {
@@ -69,10 +92,7 @@ impl HostUnixListener for HostState {
         // The handshake yields `Some((principal, device_key_id))` for a
         // crypto-authenticated connection — the device id rides forward so the
         // cap-gate can scope it — or `None` for a legacy/unauthenticated peer.
-        let (stream, verified_identity): (
-            _,
-            Option<(astrid_core::principal::PrincipalId, String)>,
-        ) = loop {
+        let (stream, verified_identity) = loop {
             let accept_result = util::bounded_block_on_cancellable(
                 &rt_handle,
                 &blocking_semaphore,
@@ -116,7 +136,7 @@ impl HostUnixListener for HostState {
                     &rt_handle,
                     &blocking_semaphore,
                     &cancel_token,
-                    validate_handshake(&mut stream, token, home),
+                    validate_handshake(&mut stream, token, home, &self.device_sessions),
                 );
                 match handshake_result {
                     None => return Err(ErrorCode::Closed),
@@ -141,7 +161,8 @@ impl HostUnixListener for HostState {
             return Err(ErrorCode::Quota);
         }
 
-        let net_stream = NetStream::Unix(Arc::new(tokio::sync::Mutex::new(stream)));
+        let (net_stream, verified_identity) =
+            accepted_stream(stream, verified_identity, &rt_handle);
         let res = match self.resource_table.push(net_stream) {
             Ok(resource) => resource,
             Err(error) => {
@@ -235,7 +256,7 @@ impl HostUnixListener for HostState {
         }
 
         let mut stream = stream;
-        let mut verified_identity: Option<(astrid_core::principal::PrincipalId, String)> = None;
+        let mut verified_identity = None;
         if let Some(ref token) = session_token {
             // See `accept` for why home is resolved here (issue #45/#852).
             let home = match handshake_home(self) {
@@ -254,7 +275,7 @@ impl HostUnixListener for HostState {
                 &rt_handle,
                 &blocking_semaphore,
                 &cancel_token,
-                validate_handshake(&mut stream, token, &home),
+                validate_handshake(&mut stream, token, &home, &self.device_sessions),
             );
             match handshake_result {
                 None => return Ok(None),
@@ -276,7 +297,8 @@ impl HostUnixListener for HostState {
             return Ok(None);
         }
 
-        let net_stream = NetStream::Unix(Arc::new(tokio::sync::Mutex::new(stream)));
+        let (net_stream, verified_identity) =
+            accepted_stream(stream, verified_identity, &rt_handle);
         let res = match self.resource_table.push(net_stream) {
             Ok(resource) => resource,
             Err(error) => {

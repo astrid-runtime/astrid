@@ -491,7 +491,8 @@ impl ipc::Host for HostState {
             .unwrap_or(astrid_events::ipc::MessageOrigin::System);
         let bytes = payload.len() as u64;
         let topic_for_audit = topic.clone();
-        let result = publish_inner(
+        let authority = self.ingress_socket.clone();
+        let publication = publish_inner(
             self,
             topic,
             payload,
@@ -499,8 +500,14 @@ impl ipc::Host for HostState {
             device_key_id.as_deref(),
             request_owner,
             origin,
-        )
-        .await;
+        );
+        let result = match authority {
+            Some(authority) => authority
+                .run(publication)
+                .await
+                .unwrap_or(Err(ErrorCode::CapabilityDenied)),
+            None => publication.await,
+        };
         audit_ipc(
             self,
             "astrid:ipc/host.publish-as",

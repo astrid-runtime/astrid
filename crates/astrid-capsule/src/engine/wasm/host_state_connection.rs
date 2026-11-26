@@ -40,6 +40,7 @@ impl HostState {
 
     pub(crate) fn clear_ingress_frame(&mut self) {
         self.ingress_publication = None;
+        self.ingress_socket = None;
         self.ingress_principal = None;
         self.ingress_device_key_id = None;
         self.ingress_request_owner = None;

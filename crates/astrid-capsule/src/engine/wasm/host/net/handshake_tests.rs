@@ -168,8 +168,9 @@ async fn handshake_unsigned_returns_no_principal() {
     let home = AstridHome::from_path(dir.path());
 
     let tok_hex = tok.to_hex();
-    let server_task =
-        tokio::spawn(async move { validate_handshake(&mut server, &tok, &home).await });
+    let server_task = tokio::spawn(async move {
+        validate_handshake(&mut server, &tok, &home, &DeviceSessions::default()).await
+    });
 
     // Legacy single-frame client: no claimed_principal, no signature.
     let request = HandshakeRequest {
@@ -184,8 +185,8 @@ async fn handshake_unsigned_returns_no_principal() {
     assert!(response.challenge.is_none(), "no challenge without a claim");
 
     let verified = server_task.await.unwrap().expect("handshake ok");
-    assert_eq!(
-        verified, None,
+    assert!(
+        verified.is_none(),
         "unsigned handshake yields no verified principal"
     );
 }
@@ -267,6 +268,17 @@ async fn socket_accept_and_poll_authenticate_against_the_configured_home() {
         (state, identity) = server.await.unwrap();
         let _ = guard.disarm();
         assert_eq!(identity.as_ref(), Some(&principal));
+        let key = DeviceKeyId::new(full_device(&keypair).key_id).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            state
+                .device_sessions
+                .retire(&principal, &key)
+                .await
+                .unwrap();
+            assert_eq!(client.read(&mut [0u8; 1]).await.unwrap(), 0);
+        })
+        .await
+        .expect("retirement must close the accepted resource on both listener paths");
     }
 }
 
@@ -279,15 +291,16 @@ async fn handshake_signed_returns_verified_principal() {
     let (mut server, mut client) = tokio::io::duplex(16 * 1024);
     let tok = token();
     let tok_hex = tok.to_hex();
-    let server_task =
-        tokio::spawn(async move { validate_handshake(&mut server, &tok, &home).await });
+    let server_task = tokio::spawn(async move {
+        validate_handshake(&mut server, &tok, &home, &DeviceSessions::default()).await
+    });
 
     sign_challenge(&mut client, tok_hex, &principal, &keypair).await;
 
     let verified = server_task.await.unwrap().expect("handshake ok");
     let expected_key_id = full_device(&keypair).key_id;
     assert_eq!(
-        verified,
+        verified.map(|(p, key, _session)| (p, key)),
         Some((principal, expected_key_id)),
         "a valid signed handshake yields the verified principal and matched device key_id"
     );
@@ -302,8 +315,9 @@ async fn handshake_bad_signature_fails_closed() {
     let (mut server, mut client) = tokio::io::duplex(16 * 1024);
     let tok = token();
     let tok_hex = tok.to_hex();
-    let server_task =
-        tokio::spawn(async move { validate_handshake(&mut server, &tok, &home).await });
+    let server_task = tokio::spawn(async move {
+        validate_handshake(&mut server, &tok, &home, &DeviceSessions::default()).await
+    });
 
     let first = HandshakeRequest {
         token: tok_hex.clone(),

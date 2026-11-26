@@ -158,6 +158,17 @@ impl DeviceSession {
         .run()
     }
 
+    /// Run one operation under this session. Retirement cancels the operation,
+    /// and the receiver stays live until its future has been dropped.
+    pub async fn while_live<F: Future>(&self, operation: F) -> Option<F::Output> {
+        let mut signal = self.0.clone();
+        tokio::select! {
+            biased;
+            _ = signal.wait_for(|retired| *retired) => None,
+            value = operation => Some(value),
+        }
+    }
+
     /// Resolves on retirement, including retirement before the first poll.
     pub async fn retired(&mut self) {
         let _ = self.0.wait_for(|retired| *retired).await;

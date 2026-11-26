@@ -1915,6 +1915,7 @@ impl ExecutionEngine for WasmEngine {
             } else {
                 ctx.cli_socket_listener.clone()
             };
+            let device_sessions = ctx.device_sessions.clone();
             let session_tok = if !has_unix_bind {
                 None
             } else {
@@ -2311,6 +2312,7 @@ impl ExecutionEngine for WasmEngine {
                 principal_cancel_tokens: principal_cancel_tokens_for_state.clone(),
                 invocation_cancel_token: None,
                 session_token: session_tok.clone(),
+                device_sessions: device_sessions.clone(),
                 interceptor_handles: Vec::new(),
                 allowance_store: st_allowance_store.clone(),
                 identity_store: st_identity_store.clone(),
@@ -2337,6 +2339,7 @@ impl ExecutionEngine for WasmEngine {
                 ingress_device_key_id: None,
                 ingress_request_owner: None,
                 ingress_origin: None,
+            ingress_socket: None,
                 // Run-loop epoch-interrupt state. `recv_yielded` is set true by
                 // a cooperative recv/accept or completed nonzero sleep; the
                 // bound run-loop's epoch callback reads + clears it to
@@ -3739,6 +3742,7 @@ async fn build_lifecycle_host_state(
         principal_cancel_tokens: HostState::new_principal_cancel_tokens(),
         invocation_cancel_token: None,
         session_token: None,
+        device_sessions: Default::default(),
         interceptor_handles: Vec::new(),
         allowance_store: None,
         identity_store: None,
@@ -3773,6 +3777,7 @@ async fn build_lifecycle_host_state(
         ingress_device_key_id: None,
         ingress_request_owner: None,
         ingress_origin: None,
+        ingress_socket: None,
         // Lifecycle hooks are not run loops; the epoch-interrupt run-loop
         // state is inert here but initialised for completeness.
         recv_yielded: false,

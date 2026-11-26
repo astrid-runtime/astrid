@@ -16,6 +16,11 @@ use astrid_core::uplink::{InboundMessage, MAX_UPLINKS_PER_CAPSULE, UplinkDescrip
 use astrid_storage::ScopedKvStore;
 use astrid_storage::secret::SecretStore;
 
+#[path = "signed_socket.rs"]
+mod signed_socket;
+pub use signed_socket::SignedSocket;
+pub(crate) use signed_socket::SocketAuthority;
+
 /// An active network stream owned by a capsule.
 ///
 /// Holds either an inbound host-local connection (accepted from the
@@ -29,6 +34,8 @@ use astrid_storage::secret::SecretStore;
 pub enum NetStream {
     /// Inbound Unix-domain socket accepted from the kernel's listener.
     Unix(Arc<tokio::sync::Mutex<LocalStream>>),
+    /// Signed local connection drained by its device retirement barrier.
+    Signed(SignedSocket),
     /// Outbound TCP connection opened via `net.connect-tcp`.
     Tcp(TcpStreamSlot),
 }
@@ -611,6 +618,8 @@ pub struct HostState {
     /// Session token for authenticating CLI socket connections. Only set for
     /// the CLI proxy capsule (which has `net_bind` capability).
     pub session_token: Option<std::sync::Arc<astrid_core::session_token::SessionToken>>,
+    /// Registry shared with the kernel that retires signed local sessions.
+    pub device_sessions: astrid_core::profile::device_sessions::DeviceSessions,
     /// Interceptor binding metadata, populated during `WasmEngine::load()`
     /// from `[[interceptor]]` entries in `Capsule.toml`. The kernel
     /// matches incoming IPC messages against these patterns and calls
@@ -754,6 +763,8 @@ pub struct HostState {
     /// connection does NOT earn `LocalSocket`, parallel to how an unbound
     /// principal stamps the reserved `anonymous` identity.
     pub ingress_origin: Option<astrid_events::ipc::MessageOrigin>,
+    /// Authority of the signed resource from which this frame was read.
+    pub(crate) ingress_socket: Option<SocketAuthority>,
     /// Host-verified principal each INBOUND uplink connection was accepted
     /// under, keyed by stream resource rep (`u32`). The lifecycle registry the
     /// kernel connection counter rides on: `net.unix-listener.{accept,
