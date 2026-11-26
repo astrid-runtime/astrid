@@ -450,7 +450,8 @@ where
                         completions.push((request.receipt, Err(error)));
                         continue;
                     }
-                    pending_roots.insert(prepared.principal.clone(), prepared.root);
+                    pending_roots
+                        .insert(prepared.root.owner().clone(), prepared.root.replacement());
                     accepted.push(AcceptedCommit {
                         prepared,
                         receipt: request.receipt,
@@ -552,16 +553,17 @@ where
                 } else {
                     publication_poison.disarm();
                     for mut accepted in accepted {
-                        retired_projections
-                            .extend(self.publish_durable_root(inner, &mut accepted.prepared));
+                        let (published, retired) =
+                            self.publish_durable_root(inner, &mut accepted.prepared);
+                        retired_projections.extend(retired);
                         if let Some((id, payload)) = accepted.prepared.commit.take()
                             && let Some(location) = inner.index.get(&id).copied()
                             && inner.pending_wal.get_object(&id).is_none()
                         {
                             published_commits.insert(
-                                accepted.prepared.principal.clone(),
+                                accepted.prepared.root.owner().clone(),
                                 PublishedCommitPayload {
-                                    root: accepted.prepared.root,
+                                    root: published,
                                     arena_generation: inner.arena_generation,
                                     location,
                                     payload,
@@ -571,7 +573,7 @@ where
                         completions.push((
                             accepted.receipt,
                             Ok(CommitOutcome {
-                                root: accepted.prepared.root,
+                                root: published,
                                 objects_inserted: accepted.prepared.objects_inserted,
                             }),
                         ));
@@ -593,21 +595,22 @@ where
         &self,
         inner: &mut DurableInner<P>,
         prepared: &mut Prepared<P>,
-    ) -> Option<crate::kv::RetiredKvProjection> {
+    ) -> (
+        crate::storage_model::RootState,
+        Option<crate::kv::RetiredKvProjection>,
+    ) {
         inner.validated.extend(prepared.validated.iter().copied());
-        inner
-            .roots_by_principal
-            .insert(prepared.principal.clone(), prepared.root);
-        // Publish validation before the lock-free root, without waiting on a
-        // cache lock under the engine writer. The caller releases any evicted
-        // value buffers only after dropping that writer.
-        let retired = prepared
-            .kv_checkpoint_publication
-            .take()
-            .and_then(|publication| publication.try_publish(prepared.root));
-        self.published_roots
-            .publish(&prepared.principal, prepared.root);
-        retired
+        prepared.root.publish(|owner, replacement| {
+            inner.roots_by_principal.insert(owner.clone(), replacement);
+            // Publish validation before the lock-free root. The caller drops
+            // evicted value buffers after releasing the engine writer.
+            let retired = prepared
+                .kv_checkpoint_publication
+                .take()
+                .and_then(|publication| publication.try_publish(replacement));
+            self.published_roots.publish(owner, replacement);
+            retired
+        })
     }
 
     fn publish_commit_frontier(
@@ -751,7 +754,7 @@ where
     ) -> Result<(), DurableError> {
         let journals: Vec<_> = accepted
             .iter()
-            .map(|accepted| accepted.prepared.journal.as_slice())
+            .map(|accepted| accepted.prepared.root.journal().as_slice())
             .collect();
         let publication_started = Instant::now();
         append_frames(&mut files.roots, ROOT_MAGIC, &journals)?;

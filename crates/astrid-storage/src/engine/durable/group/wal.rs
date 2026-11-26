@@ -148,12 +148,17 @@ where
             }
         }
         for accepted in accepted {
-            inner.pending_wal.push_root(
-                accepted.prepared.principal.clone(),
-                accepted.prepared.expected,
-                accepted.prepared.root,
-                accepted.prepared.journal.clone(),
-            );
+            accepted
+                .prepared
+                .root
+                .write_wal(|owner, expected, replacement, journal| {
+                    inner.pending_wal.push_root(
+                        owner.clone(),
+                        expected,
+                        replacement,
+                        journal.clone(),
+                    );
+                });
         }
         Ok(())
     }
@@ -229,12 +234,12 @@ where
                         .map_err(wal_durable_error)?;
                 }
             }
-            writer
-                .append_root(
-                    &accepted.prepared.principal,
-                    accepted.prepared.expected,
-                    accepted.prepared.root,
-                )
+            accepted
+                .prepared
+                .root
+                .write_wal(|owner, expected, replacement, _journal| {
+                    writer.append_root(owner, expected, replacement)
+                })
                 .map_err(wal_durable_error)?;
             writer.finish_commit().map_err(wal_durable_error)?;
         }

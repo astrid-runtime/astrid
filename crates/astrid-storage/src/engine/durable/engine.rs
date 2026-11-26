@@ -860,13 +860,18 @@ where
                 objects.push((id, payload));
             }
         }
-        let principal_bytes = self.principal_codec.encode(&principal);
-        let journal = encode_root_record(self.identity.scheme(), &principal_bytes, expected, root)?;
-        ensure_payload_limit(ROOT_FILE, 0, journal.len(), self.limits)?;
-
-        Ok(Prepared {
+        let root = super::root_transition::PreparedRoot::encode(
             principal,
             expected,
+            root,
+            |owner, expected, replacement| {
+                let bytes = self.principal_codec.encode(owner);
+                encode_root_record(self.identity.scheme(), &bytes, expected, replacement)
+            },
+        )?;
+        ensure_payload_limit(ROOT_FILE, 0, root.journal().len(), self.limits)?;
+
+        Ok(Prepared {
             root,
             objects_inserted: u64::try_from(objects.len())
                 .map_err(|_| ModelError::ArithmeticOverflow)?
@@ -874,7 +879,6 @@ where
                 .ok_or(ModelError::ArithmeticOverflow)?,
             objects,
             commit: commit_frame,
-            journal,
             validated: reachable,
             kv_checkpoint_publication,
         })

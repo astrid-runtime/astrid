@@ -1,7 +1,8 @@
 //! Composition for a tracked guest KV call. Store construction, guard lifetime,
 //! device admission and backend atomicity require separate runtime refinement.
 use crate::{guest_authority, guest_kv_dispatch, principal_invocation_state::PrincipalInvocation};
-use crate::root_transition::{Advance, Replay, Version, advance, replay};
+use crate::owner_codec::{self, Owner};
+use crate::root_transition::{Advance, PreparedRoot, Replay, Version, advance, replay};
 use vstd::prelude::*;
 
 verus! {
@@ -71,6 +72,91 @@ fn tracked_call<E,R,F>(tracker: &mut PrincipalInvocation, runtime: Store,
     };
     tracker.finish();
     result
+}
+
+/// The physical owner spelling selected for a pinned guest namespace can
+/// recover only the admitted principal, including when a fleet has the same UID bytes.
+fn recovered_guest_owner(scope: &[u8], requested: &[u8], admitted: [u8;32], current: [u8;32])
+    -> (owner: Option<Owner>)
+    ensures
+        owner.is_some() == (scope@ == requested@ && admitted@ == current@),
+        owner matches Some(o) ==> (o matches Owner::Principal(id) && id@ == admitted@),
+{
+    let uid = match guest_authority::select(scope, requested, admitted, current) {
+        Some(uid) => uid,
+        None => return None,
+    };
+    let bytes = Owner::Principal(uid).encode();
+    assert(bytes@[0] == 1);
+    let recovered = owner_codec::decode(&bytes);
+    match recovered {
+        Some(Owner::Principal(id)) => {
+            assert(id@ =~= admitted@) by {
+                assert forall|i:int| 0 <= i < 32 implies #[trigger] id@[i] == admitted@[i] by {
+                    assert(bytes@[1+i] == id@[i]);
+                    assert(bytes@[1+i] == uid@[i]);
+                }
+            }
+        },
+        _ => { assert(false); },
+    }
+    recovered
+}
+
+spec fn recorded<R: Copy,E,U,W,A>(admitted: [u8;32], expected: Option<R>, replacement: R,
+    encode: W, append: A, result: Result<U,E>) -> bool
+    where W: FnOnce(&[u8;32],Option<R>,R) -> Result<Vec<u8>,E>,
+          A: FnOnce(&[u8;32],Option<R>,R,&Vec<u8>) -> Result<U,E>,
+{
+    exists|j: &Vec<u8>| encode.ensures((&admitted, expected, replacement), Ok(*j))
+        && #[trigger] append.ensures((&admitted,expected,replacement,j), result)
+}
+
+/// Compose the pinned owner with the production journal encoder handoff and
+/// post-frontier publication. Persistence of these bytes is a caller obligation.
+fn guest_publication<R: Copy, E, U, T, W, A, F>(scope: &[u8], requested: &[u8], admitted: [u8;32],
+    observed: [u8;32], expected: Option<R>, replacement: R, encode: W, append: A, publish: F)
+    -> (outcome: Option<Result<(R,U,T), E>>)
+    where W: FnOnce(&[u8;32],Option<R>,R) -> Result<Vec<u8>,E>,
+          A: FnOnce(&[u8;32], Option<R>, R, &Vec<u8>) -> Result<U,E>,
+          F: FnOnce(&[u8;32],R) -> T,
+    requires encode.requires((&admitted, expected, replacement)),
+        publish.requires((&admitted, replacement)),
+        forall|j: &Vec<u8>| encode.ensures((&admitted, expected, replacement), Ok(*j))
+            ==> #[trigger] append.requires((&admitted,expected,replacement,j)),
+    ensures
+        outcome.is_some() == (scope@ == requested@ && admitted@ == observed@),
+        outcome matches Some(Err(e)) ==> encode.ensures((&admitted, expected, replacement), Err(e))
+            || recorded(admitted, expected, replacement, encode, append, Err(e)),
+        outcome matches Some(Ok((ack, written, receipt))) ==> {
+            &&& ack == replacement
+            &&& publish.ensures((&admitted, ack), receipt)
+            &&& recorded(admitted, expected, replacement, encode, append, Ok(written))
+        },
+{
+    let owner = match guest_authority::select(scope, requested, admitted, observed) {
+        Some(id) => id,
+        None => return None,
+    };
+    let prepared = match PreparedRoot::encode(owner, expected, replacement, encode) {
+        Ok(prepared) => prepared,
+        Err(e) => return Some(Err(e)),
+    };
+    let journal = prepared.journal();
+    assert(encode.ensures((&admitted, expected, replacement), Ok(*journal)));
+    let written = prepared.write_wal(append);
+    assert(append.ensures((&admitted,expected,replacement,journal), written));
+    assert(recorded(admitted, expected, replacement, encode, append, written));
+    match written {
+        Ok(staged) => {
+            assert(recorded(admitted, expected, replacement, encode, append, Ok(staged)));
+            let (ack, receipt) = prepared.publish(publish);
+            assert(ack == replacement);
+            assert(publish.ensures((&admitted, ack), receipt));
+            Some(Ok((ack,staged,receipt)))
+        },
+        Err(e) => Some(Err(e)),
+    }
 }
 
 /// An admitted live publication can be replayed from the prior root exactly

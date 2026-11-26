@@ -80,6 +80,9 @@ mod lease_model;
 #[path = "../crates/astrid-storage/src/principal_state/guest_authority.rs"]
 mod guest_authority;
 
+#[path = "../crates/astrid-storage/src/principal_state/owner_codec.rs"]
+mod owner_codec;
+
 #[path = "../crates/astrid-storage/src/engine/durable/root_transition.rs"]
 mod root_transition;
 

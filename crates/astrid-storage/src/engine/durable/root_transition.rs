@@ -68,4 +68,58 @@ pub(super) fn replay(actual: Option<Version>, expected: Option<Version>, replace
     else { Replay::Conflict }
 }
 
+/// The journal payload and the root publication it describes travel together.
+#[derive(Debug)]
+pub(super) struct PreparedRoot<P, R> {
+    owner: P,
+    expected: Option<R>,
+    replacement: R,
+    journal: Vec<u8>,
+}
+
+impl<P,R: Copy> PreparedRoot<P,R> {
+    pub(super) closed spec fn binding(&self) -> (P, Option<R>, R, Vec<u8>) {
+        (self.owner, self.expected, self.replacement, self.journal)
+    }
+
+    pub(super) fn encode<E,F>(owner: P, expected: Option<R>, replacement: R, encode: F)
+        -> (result: Result<Self,E>) where F: FnOnce(&P,Option<R>,R) -> Result<Vec<u8>,E>,
+        requires encode.requires((&owner, expected, replacement)),
+        ensures
+            result matches Ok(prepared) ==> {
+                let (p,e,r,bytes) = prepared.binding();
+                &&& (p,e,r) == (owner,expected,replacement)
+                &&& encode.ensures((&owner,expected,replacement), Ok(bytes))
+            },
+            result matches Err(error) ==> encode.ensures((&owner,expected,replacement), Err(error)),
+    {
+        let journal = encode(&owner,expected,replacement)?;
+        Ok(Self {owner,expected,replacement,journal})
+    }
+
+    pub(super) fn owner(&self) -> (p: &P) ensures *p == self.binding().0 { &self.owner }
+    pub(super) fn replacement(&self) -> (r: R) ensures r == self.binding().2 { self.replacement }
+    pub(super) fn journal(&self) -> (j: &Vec<u8>) ensures *j == self.binding().3 { &self.journal }
+
+    /// Stage or append this owner's prepared transition in the WAL.
+    pub(super) fn write_wal<T,F>(&self, write: F) -> (result: T)
+        where F: FnOnce(&P,Option<R>,R,&Vec<u8>) -> T,
+        requires write.requires((&self.binding().0,self.binding().1,self.binding().2,&self.binding().3)),
+        ensures write.ensures((&self.binding().0,self.binding().1,self.binding().2,&self.binding().3),result),
+    {
+        write(&self.owner,self.expected,self.replacement,&self.journal)
+    }
+
+    /// Return the acknowledged root after passing this entry's owner and
+    /// replacement to the engine's publication operation.
+    pub(super) fn publish<T,F>(&self, publish: F) -> (result: (R,T)) where F: FnOnce(&P,R) -> T,
+        requires publish.requires((&self.binding().0,self.binding().2)),
+        ensures result.0 == self.binding().2,
+            publish.ensures((&self.binding().0,self.binding().2),result.1),
+    {
+        let outcome = publish(&self.owner,self.replacement);
+        (self.replacement,outcome)
+    }
+}
+
 }

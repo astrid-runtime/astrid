@@ -114,6 +114,7 @@ INPUTS = [
     OVERLAY,
     KV_ENCODING,
     GUEST_AUTHORITY,
+    Path("crates/astrid-storage/src/principal_state/owner_codec.rs"),
     Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),
     ENTRY,
     MODEL,
@@ -460,6 +461,26 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "stale KV view falls back to neutral and completes the request",
             Path("verification/hosted_kv_model.rs"),
             lambda source: replace_once(source, "Some(uid) => Some(Destination::Principal(uid)),\n                None => None,", "Some(uid) => Some(Destination::Principal(uid)),\n                None => Some(Destination::Neutral),"),
+        ),
+        (
+            "durable principal encoded as fleet",
+            Path("crates/astrid-storage/src/principal_state/owner_codec.rs"),
+            lambda source: replace_once(source, "Self::Principal(id) => (1u8, id)", "Self::Principal(id) => (2u8, id)"),
+        ),
+        (
+            "owner recovery substitutes the first UID byte",
+            Path("crates/astrid-storage/src/principal_state/owner_codec.rs"),
+            lambda source: replace_once(source, "id[i] = bytes[i.saturating_add(1)]", "id[i] = bytes[1]"),
+        ),
+        (
+            "prepared root encodes a different expected root",
+            Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),
+            lambda source: replace_once(source, "encode(&owner,expected,replacement)?", "encode(&owner,None,replacement)?"),
+        ),
+        (
+            "WAL staging discards prepared journal bytes",
+            Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),
+            lambda source: replace_once(source, "write(&self.owner,self.expected,self.replacement,&self.journal)", "write(&self.owner,self.expected,self.replacement,&Vec::new())"),
         ),
         (
             "durable root admission ignores the commit digest",
@@ -1471,6 +1492,22 @@ def consumer_defects():
         ),
         Path("verification/hosted_kv_model.rs"),
     )
+    yield (
+        "owner decoding contract omits the recovered UID",
+        Path("crates/astrid-storage/src/principal_state/owner_codec.rs"),
+        lambda source: replace_once(source, "owner matches Some(o) ==> o.bytes() == bytes@,", ""),
+        Path("verification/hosted_kv_model.rs"),
+    )
+    for name, clause in [
+        ("encoder omits the prepared journal postcondition", "&&& encode.ensures((&owner,expected,replacement), Ok(bytes))"),
+        ("root publication loses the matching acknowledgement", "publish.ensures((&self.binding().0,self.binding().2),result.1)"),
+        ("WAL append loses the matching journal postcondition", "write.ensures((&self.binding().0,self.binding().1,self.binding().2,&self.binding().3),result)"),
+    ]:
+        yield (
+            name, Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),
+            lambda source, clause=clause: replace_once(source, clause, "&&& true" if clause.startswith("&&&") else "true"),
+            Path("verification/hosted_kv_model.rs"),
+        )
     consumer = Path("verification/hosted_lease_model.rs")
     yield (
         "worker loses the sink's completion guarantee",

@@ -53,6 +53,7 @@ mod format_identity_tests;
 mod format_migration_tests;
 mod guest_authority;
 mod lifecycle;
+mod owner_codec;
 pub use lifecycle::{PendingRuntimeFinalization, RuntimeFinalization, RuntimeLifecycleGuard};
 #[cfg(test)]
 mod hosted_volume_tests;
@@ -258,35 +259,21 @@ pub struct StateOwnerCodecV2;
 impl PrincipalCodec<StateOwner> for StateOwnerCodecV2 {
     fn encode(&self, owner: &StateOwner) -> Vec<u8> {
         match owner {
-            StateOwner::System => vec![0],
-            StateOwner::Principal(principal) => {
-                let mut bytes = Vec::with_capacity(33);
-                bytes.push(1);
-                bytes.extend_from_slice(principal.as_bytes());
-                bytes
-            },
-            StateOwner::Fleet(fleet) => {
-                let mut bytes = Vec::with_capacity(33);
-                bytes.push(2);
-                bytes.extend_from_slice(fleet.as_bytes());
-                bytes
-            },
+            StateOwner::System => owner_codec::Owner::System,
+            StateOwner::Principal(uid) => owner_codec::Owner::Principal(*uid.as_bytes()),
+            StateOwner::Fleet(uid) => owner_codec::Owner::Fleet(*uid.as_bytes()),
         }
+        .encode()
     }
 
     fn decode(&self, bytes: &[u8]) -> Option<StateOwner> {
-        match bytes.split_first()? {
-            (0, []) => Some(StateOwner::System),
-            (1, principal) if principal.len() == 32 => {
-                let uid = PrincipalUid::from_bytes(<[u8; 32]>::try_from(principal).ok()?);
-                Some(StateOwner::Principal(uid))
+        Some(match owner_codec::decode(bytes)? {
+            owner_codec::Owner::System => StateOwner::System,
+            owner_codec::Owner::Principal(uid) => {
+                StateOwner::Principal(PrincipalUid::from_bytes(uid))
             },
-            (2, fleet) if fleet.len() == 32 => {
-                let uid = FleetUid::from_bytes(<[u8; 32]>::try_from(fleet).ok()?);
-                Some(StateOwner::Fleet(uid))
-            },
-            _ => None,
-        }
+            owner_codec::Owner::Fleet(uid) => StateOwner::Fleet(FleetUid::from_bytes(uid)),
+        })
     }
 }
 

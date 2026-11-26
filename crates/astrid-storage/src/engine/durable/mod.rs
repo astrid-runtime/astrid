@@ -733,13 +733,10 @@ struct Persisted {
 
 #[derive(Debug)]
 struct Prepared<P: Ord> {
-    principal: P,
-    expected: Option<RootState>,
-    root: RootState,
+    root: root_transition::PreparedRoot<P, RootState>,
     objects_inserted: u64,
     objects: Vec<(ObjectId, Arc<[u8]>)>,
     commit: Option<(ObjectId, Arc<[u8]>)>,
-    journal: Vec<u8>,
     validated: BTreeSet<ObjectId>,
     kv_checkpoint_publication: Option<crate::kv::KvCheckpointPublication>,
 }
