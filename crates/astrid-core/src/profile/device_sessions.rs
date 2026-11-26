@@ -109,14 +109,16 @@ impl DeviceChallenge {
             .0
             .lock()
             .map_err(|_| DeviceSessionError::Unavailable)?;
-        let entry = entries
-            .iter_mut()
-            .find(|e| self.signal.same_channel(&e.signal))
-            .ok_or(DeviceSessionError::Unavailable)?;
-        if entry.phase.bind(key.into_inner()) {
-            return Ok(DeviceSession(self.receiver));
+        match phase::bind_registered(
+            &mut entries,
+            &self.signal,
+            key.into_inner(),
+            watch::Sender::same_channel,
+        ) {
+            phase::Binding::Bound => Ok(DeviceSession(self.receiver)),
+            phase::Binding::Retired => Err(DeviceSessionError::Retired),
+            phase::Binding::Missing => Err(DeviceSessionError::Unavailable),
         }
-        Err(DeviceSessionError::Retired)
     }
 }
 

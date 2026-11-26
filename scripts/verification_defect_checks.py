@@ -358,6 +358,21 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             lambda text: replace_once(text, "Some(actual) => actual == owner", "Some(actual) => true"),
         ),
         (
+            "registration compares the challenge channel with itself",
+            DEVICE_SESSIONS,
+            lambda text: replace_once(text, "if same_channel(challenge, &entries[i].signal)", "if same_channel(challenge, challenge)"),
+        ),
+        (
+            "registration binds the first entry instead of the matched channel",
+            DEVICE_SESSIONS,
+            lambda text: replace_once(text, "if entries[i].phase.bind(key)", "if entries[0].phase.bind(key)"),
+        ),
+        (
+            "registration reports success after a rejected binding",
+            DEVICE_SESSIONS,
+            lambda text: replace_once(text, "return Binding::Retired;", "return Binding::Bound;"),
+        ),
+        (
             "retired challenge accepts its removed key",
             DEVICE_SESSIONS,
             lambda text: replace_once(text, "if retired.contains(&key) { return false; }", "if false { return false; }"),
@@ -380,7 +395,7 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
         (
             "registry never visits its last session",
             DEVICE_SESSIONS,
-            lambda text: replace_once(text, "while i < entries.len()", "while i < entries.len() && entries.len() - i > 1"),
+            lambda text: edit_function(text, "retire_entries<S>", "while i < entries.len()", "while i < entries.len() && entries.len() - i > 1"),
         ),
         (
             "registry substitutes the first drain slot",

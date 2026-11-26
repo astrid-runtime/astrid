@@ -70,6 +70,64 @@ pub(super) struct Entry<S> {
     pub(super) signal: S,
 }
 
+pub(super) enum Binding {
+    Missing,
+    Retired,
+    Bound,
+}
+
+/// Bind the registered challenge identified by its channel, preserving every
+/// other entry (including concurrent challenges for the same principal).
+pub(super) fn bind_registered<S, F: Fn(&S, &S) -> bool>(
+    entries: &mut [Entry<S>], challenge: &S, key: String, same_channel: F,
+) -> (result: Binding)
+    requires
+        forall|j: int| 0 <= j < old(entries).len() ==> old(entries)@[j].phase.consistent(),
+        forall|s: &S| #[trigger] same_channel.requires((challenge, s)),
+    ensures
+        final(entries).len() == old(entries).len(),
+        match result {
+            Binding::Missing => final(entries)@ == old(entries)@ &&
+                forall|j: int| 0 <= j < old(entries).len() ==>
+                    same_channel.ensures((challenge, &old(entries)@[j].signal), false),
+            Binding::Retired | Binding::Bound => exists|i: int| 0 <= i < old(entries).len()
+                && same_channel.ensures((challenge, &old(entries)@[i].signal), true)
+                && (forall|j: int| 0 <= j < i ==>
+                    same_channel.ensures((challenge, &old(entries)@[j].signal), false))
+                && (forall|j: int| 0 <= j < old(entries).len() && j != i ==>
+                    final(entries)@[j] == old(entries)@[j])
+                && final(entries)@[i].owner == old(entries)@[i].owner
+                && final(entries)@[i].signal == old(entries)@[i].signal
+                && match result {
+                    Binding::Bound => old(entries)@[i].phase.bound().is_none()
+                        && !old(entries)@[i].phase.excludes(key@)
+                        && final(entries)@[i].phase.bound() == Some(key@)
+                        && final(entries)@[i].phase.consistent(),
+                    _ => final(entries)@ == old(entries)@ && (old(entries)@[i].phase.bound().is_some()
+                        || old(entries)@[i].phase.excludes(key@)),
+                },
+        },
+{
+    let mut i = 0usize;
+    while i < entries.len()
+        invariant entries@ == old(entries)@, i <= entries.len(),
+            forall|j: int| 0 <= j < old(entries).len() ==> old(entries)@[j].phase.consistent(),
+            forall|s: &S| #[trigger] same_channel.requires((challenge, s)),
+            forall|j: int| 0 <= j < i ==> same_channel.ensures((challenge, &old(entries)@[j].signal), false),
+        decreases entries.len() - i,
+    {
+        if same_channel(challenge, &entries[i].signal) {
+            if entries[i].phase.bind(key) {
+                return Binding::Bound;
+            }
+            assert(entries@ =~= old(entries)@);
+            return Binding::Retired;
+        }
+        i = i.saturating_add(1);
+    }
+    Binding::Missing
+}
+
 pub(super) closed spec fn target<S>(entry: Entry<S>, owner: &str, key: &str) -> bool {
     entry.owner@ == owner@ && entry.phase.bound() == Some(key@)
 }

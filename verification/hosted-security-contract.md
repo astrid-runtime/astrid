@@ -222,7 +222,12 @@ The daemon passes its kernel's `DeviceSessions` to the native listener. The
 listener registers a challenge before sending the nonce and binds the key that
 verified the signature before sending success. Device removal saves the profile
 and invalidates its cache before retiring sessions. Registration, binding and
-selection of channels to drain use the same registry mutex.
+selection of channels to drain use the same registry mutex. The checked
+binding scan compares the challenge channel with each entry using Tokio's
+channel-identity callback. It changes only the first matching entry and
+preserves its owner and channel. A missing entry, an excluded key, or an
+already-bound entry leaves the registry unchanged and denies admission.
+Channel identity and mutex linearization are assumptions of this scan.
 
 For the actual registry slice supplied to `retire_and_capture`, Verus checks
 that each pending challenge owned by the removed principal excludes exactly
@@ -261,8 +266,21 @@ joined to the retirement proof. A Unix regression runs the management removal
 in a child process and exits immediately after checking its acknowledgement.
 A fresh kernel reopens the same home and denies the removed key while accepting
 the surviving key. This exercises process exit with an intact filesystem.
-Whole-principal
-deletion, alias reuse and Wasmtime socket resources have separate obligations.
+Whole-principal deletion, alias reuse and Wasmtime socket resources have separate obligations.
+
+The Unix daemon claims the native listener before loading boot capsules.
+Kernel capsule-context construction withholds this listener once claimed.
+An embedded kernel may instead supply its listener to a capsule, so its
+authenticated socket path is a separate production obligation.
+
+Both Wasmtime socket accept methods read device registrations from the
+profile home captured by the kernel cache when supplied. A signed socket test
+exercises both methods with an explicit temporary home. The accepted local
+stream lives in the Store resource table. Its framed and raw read and write
+methods acquire the stream mutex and use the Store cancellation token. The
+native device-retirement registry does not own this resource or the captured
+publication from a completed read. Proving closure here requires fencing both
+I/O and subsequent authenticated publication through device retirement.
 
 | Native effect | Production path | Outstanding refinement |
 | --- | --- | --- |
