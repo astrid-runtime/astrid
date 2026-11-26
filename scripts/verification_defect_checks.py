@@ -266,6 +266,16 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             lambda text: replace_once(text, "Some(bytes) => bytes == expected", "Some(bytes) => bytes.len() == expected.len()"),
         ),
         (
+            "a storage read exposes bytes before the open cursor",
+            STORAGE_FILE,
+            lambda text: replace_once(text, "as_slice().split_at(self.offset)", "as_slice().split_at(0)"),
+        ),
+        (
+            "a buffered storage write discards the supplied content",
+            STORAGE_FILE,
+            lambda text: replace_once(text, "destination.copy_from_slice(content);", "let _ = destination;"),
+        ),
+        (
             "a dirty storage handle publishes without write authority",
             STORAGE_FILE,
             lambda text: replace_once(text, "if self.writable && self.dirty { Some", "if self.dirty { Some"),

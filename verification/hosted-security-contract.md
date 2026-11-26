@@ -99,6 +99,12 @@ under the correct owner, and refinement of backend completion and cancellation r
 For the owner-backed home and workspace-branch adapters, the checked
 `OpenFile` constructor keeps the resolved destination, initial bytes and
 open mode. Write admission rejects read-only handles and offset overflow.
+A successful write copies exactly the supplied bytes at the cursor, preserves
+the other existing bytes, advances the cursor by the input length and marks
+the handle dirty. Both error paths preserve the complete state. A read from
+an in-bounds cursor returns exactly the unread suffix and advances to EOF.
+Construction starts the cursor at zero and successful reads and writes leave
+it in bounds. The adapter locks the handle around each transition.
 On close, the checked publication decision yields the original path and
 the complete current buffer exactly when the handle is writable and dirty.
 The adapter removes the handle from its table and calls its bound backend
@@ -106,7 +112,7 @@ with that path and buffer while holding the file lock. Six adapter tests
 exercise storage, including independent owner views and last-close-wins.
 
 The proof assumes handle lookup returned the intended file. Correct path
-composition, handle-table interleavings, buffer updates, backend ownership
+composition, handle-table interleavings, backend ownership
 and durable publication still require refinement.
 
 ## Guest key-value storage

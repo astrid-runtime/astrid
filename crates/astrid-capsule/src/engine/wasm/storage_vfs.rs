@@ -479,9 +479,7 @@ impl Vfs for AstridStorageVfs {
             .cloned()
             .ok_or(VfsError::InvalidHandle)?;
         let mut file = file.lock().await;
-        let bytes = file.bytes[file.offset..].to_vec();
-        file.offset = file.bytes.len();
-        Ok(bytes)
+        Ok(file.read_remaining())
     }
 
     async fn write(&self, handle: &FileHandle, content: &[u8]) -> VfsResult<()> {
@@ -493,25 +491,13 @@ impl Vfs for AstridStorageVfs {
             .cloned()
             .ok_or(VfsError::InvalidHandle)?;
         let mut file = file.lock().await;
-        let end = match file.write_range(content.len()) {
-            WriteRange::End(end) => end,
-            WriteRange::ReadOnly => {
-                return Err(VfsError::PermissionDenied(
-                    "file was not opened for writing".to_owned(),
-                ));
-            },
-            WriteRange::Overflow => {
-                return Err(VfsError::PermissionDenied("file is too large".to_owned()));
-            },
-        };
-        if end > file.bytes.len() {
-            file.bytes.resize(end, 0);
+        match file.write_bytes(content) {
+            WriteRange::End(_) => Ok(()),
+            WriteRange::ReadOnly => Err(VfsError::PermissionDenied(
+                "file was not opened for writing".to_owned(),
+            )),
+            WriteRange::Overflow => Err(VfsError::PermissionDenied("file is too large".to_owned())),
         }
-        let offset = file.offset;
-        file.bytes[offset..end].copy_from_slice(content);
-        file.offset = end;
-        file.dirty = true;
-        Ok(())
     }
 
     async fn close(&self, handle: &FileHandle) -> VfsResult<()> {
