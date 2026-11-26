@@ -63,10 +63,36 @@ impl<L, O> Admitted<L, O> {
         (self.lease, self.operation, self.class)
     }
 
-    pub(crate) fn into_effect(self) -> (effect: (L, O, OperationClass))
-        ensures effect == self.binding(),
+}
+
+/// The issuer supplies the concrete mount and backing home together with the
+/// lease. Dispatch consumes this evidence exactly once.
+pub(crate) struct Destinations<L, T, H> {
+    pub(crate) lease: L,
+    pub(crate) mount: T,
+    pub(crate) home: H,
+}
+
+pub(crate) enum Effect<L, T, H> {
+    Volume(H),
+    Filesystem(L, T, H, Operation, OperationClass),
+}
+
+impl<L, T, H> Admitted<Destinations<L, T, H>, Operation> {
+    pub(crate) fn into_effect(self) -> (effect: Effect<L, T, H>)
+        ensures
+            (effect is Volume) == (self.binding().1 is VolumeInfo),
+            effect matches Effect::Volume(home) ==> home == self.binding().0.home,
+            effect matches Effect::Filesystem(lease, target, home, op, class) ==>
+                lease == self.binding().0.lease && target == self.binding().0.mount &&
+                home == self.binding().0.home && op == self.binding().1 && class == self.binding().2,
     {
-        (self.lease, self.operation, self.class)
+        let destinations = self.lease;
+        match self.operation {
+            Operation::VolumeInfo => Effect::Volume(destinations.home),
+            operation => Effect::Filesystem(destinations.lease, destinations.mount,
+                destinations.home, operation, self.class),
+        }
     }
 }
 

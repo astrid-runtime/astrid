@@ -627,6 +627,11 @@ callback admission, explicit revoke, requester retirement and restart for one
 mount identity. Revocation, matching retirement and restart permanently close
 that identity in the model. The callback refinement uses the production liveness
 and operation admission functions and preserves the supplied lease and operation.
+The executor consumes a checked destination choice. A volume query carries the
+backing home supplied at admission. Every filesystem operation carries the
+admitted lease, logical mount target, runtime home, operation and access class.
+The worker uses that target to select the storage interface. Correctness of the
+underlying filesystem and the host volume query remains a separate obligation.
 
 The remaining proof must establish that publication, enumeration of affected
 leases, profile transitions, callback observations and worker completion refine

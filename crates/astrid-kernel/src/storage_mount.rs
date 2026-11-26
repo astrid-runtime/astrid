@@ -40,7 +40,7 @@ use crate::Kernel;
 
 mod admin_projection;
 mod lease_authority;
-use lease_authority::callback::{Admission, Admitted, OperationClass, admit};
+use lease_authority::callback::{Admission, Admitted, Destinations, Effect, OperationClass, admit};
 use lease_authority::{
     LeaseAuthority, LeaseTarget, resolve_owner,
     subtree::{BoundSubtree, Subtree},
@@ -703,7 +703,11 @@ async fn dispatch_request(
     let live = state.is_live();
     let authenticated = live && token_matches(&state.token_hash, &request.lease_token);
     let outcome = match admit(
-        state,
+        Destinations {
+            lease: state,
+            mount: state.target,
+            home: &kernel.astrid_home,
+        },
         live,
         authenticated,
         state.access == StorageProviderAccessV1::ReadWrite,
@@ -762,16 +766,23 @@ fn response_v2(response: StorageFilesystemResponseV1) -> StorageFilesystemRespon
     }
 }
 
+type CallbackAdmission<'a> = Admitted<
+    Destinations<&'a Arc<StorageMountLeaseState>, LeaseTarget, &'a astrid_core::dirs::AstridHome>,
+    StorageFilesystemOperationV1,
+>;
+
 async fn execute_operation(
     kernel: &Kernel,
-    admission: Admitted<&Arc<StorageMountLeaseState>, StorageFilesystemOperationV1>,
+    admission: CallbackAdmission<'_>,
 ) -> StorageFilesystemOutcomeV1 {
-    let (state, operation, class) = admission.into_effect();
+    let (state, target, runtime_home, operation, class) = match admission.into_effect() {
+        Effect::Volume(home) => return volume_info::read(home).await,
+        Effect::Filesystem(state, target, home, operation, class) => {
+            (state, target, home.clone(), operation, class)
+        },
+    };
     let is_mutation = matches!(class, OperationClass::Write);
     let is_sync = matches!(class, OperationClass::Sync);
-    if matches!(&operation, StorageFilesystemOperationV1::VolumeInfo) {
-        return volume_info::read(kernel).await;
-    }
     let guard = if class.requires_serialization() {
         let guard = Arc::clone(&kernel.storage_mount_mutations)
             .lock_owned()
@@ -786,8 +797,6 @@ async fn execute_operation(
     let Some(store) = kernel.principal_store.clone() else {
         return failure("unavailable", "native principal store is unavailable");
     };
-    let target = state.target;
-    let runtime_home = kernel.astrid_home.clone();
     let in_flight = is_mutation.then(|| InFlightMutation::begin(state));
     let state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {

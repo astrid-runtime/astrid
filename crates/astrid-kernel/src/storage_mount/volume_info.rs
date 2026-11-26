@@ -4,10 +4,10 @@
 //! resource directory (which can be on a different device). Available capacity
 //! is an observation, not a reservation; normal owner quotas still govern writes.
 
-use super::{Kernel, StorageFilesystemOutcomeV1, StorageFilesystemSuccessV1, failure, io};
+use super::{StorageFilesystemOutcomeV1, StorageFilesystemSuccessV1, failure, io};
 
-pub(super) async fn read(kernel: &Kernel) -> StorageFilesystemOutcomeV1 {
-    let home = kernel.astrid_home.clone();
+pub(super) async fn read(home: &astrid_core::dirs::AstridHome) -> StorageFilesystemOutcomeV1 {
+    let home = home.clone();
     match tokio::task::spawn_blocking(move || snapshot(home.root())).await {
         Ok(Ok(bytes)) => {
             StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Data(bytes))

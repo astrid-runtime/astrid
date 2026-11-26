@@ -421,7 +421,12 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
         (
             "callback ticket downgrades a write to a read before execution",
             LEASE_CALLBACK,
-            lambda text: replace_once(text, "(self.lease, self.operation, self.class)\n    }\n}", "(self.lease, self.operation, OperationClass::Read)\n    }\n}"),
+            lambda text: replace_once(text, "destinations.home, operation, self.class)", "destinations.home, operation, OperationClass::Read)"),
+        ),
+        (
+            "filesystem operation is redirected to backing capacity",
+            LEASE_CALLBACK,
+            lambda text: replace_once(text, "operation => Effect::Filesystem", "Operation::Sync => Effect::Volume(destinations.home),\n            operation => Effect::Filesystem"),
         ),
         (
             "callback admission issues a ticket for a read-only write",
