@@ -3,6 +3,9 @@
 extern crate self as astrid_core;
 #[path = "../crates/astrid-capsule/src/engine/wasm/guest_kv.rs"]
 mod guest_kv_dispatch;
+#[path = "../crates/astrid-capsule/src/engine/wasm/guest_uplink.rs"]
+mod guest_uplink;
+mod hosted_uplink_model;
 mod hosted_wal_model;
 
 #[path = "hosted_kv_model.rs"]

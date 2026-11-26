@@ -84,7 +84,7 @@ impl uplink::Host for HostState {
         if !self.has_uplink_capability {
             return Err(ErrorCode::CapabilityDenied);
         }
-        let _admission = self
+        let admission = self
             .begin_host_operation()
             .map_err(|()| ErrorCode::CapabilityDenied)?;
         if uplink_id.len() > 64 {
@@ -92,28 +92,26 @@ impl uplink::Host for HostState {
         }
 
         let uplink_uuid: uuid::Uuid = uplink_id.parse().map_err(|_| ErrorCode::InvalidInput)?;
-        let uplink_id = astrid_core::UplinkId::from_uuid(uplink_uuid);
-
-        let inbound_tx = self.inbound_tx.clone();
-        let platform = self
-            .registered_uplinks
-            .iter()
-            .find(|c| c.id == uplink_id)
-            .map(|c| c.platform.clone())
-            .ok_or(ErrorCode::UnknownUplink)?;
-
-        let tx = inbound_tx.ok_or(ErrorCode::Quota)?;
-
-        let message =
-            astrid_core::InboundMessage::builder(uplink_id, platform, platform_user_id, content)
+        let inbound_tx = self.inbound_tx.as_ref();
+        crate::engine::wasm::guest_uplink::send(
+            admission,
+            &self.registered_uplinks,
+            uplink_uuid.as_u128(),
+            (platform_user_id, content),
+            |descriptor| descriptor.id.as_uuid().as_u128(),
+            |_held, descriptor, (platform_user_id, content)| {
+                let tx = inbound_tx.ok_or(ErrorCode::Quota)?;
+                let message = astrid_core::InboundMessage::builder(
+                    descriptor.id,
+                    descriptor.platform.clone(),
+                    platform_user_id,
+                    content,
+                )
                 .build();
-
-        // Per WIT: a send to a principal with no active session returns
-        // `false` (intentional drop), not an error.
-        match tx.try_send(message) {
-            Ok(()) => Ok(true),
-            Err(_) => Ok(false),
-        }
+                Ok(tx.try_send(message).is_ok())
+            },
+        )
+        .ok_or(ErrorCode::UnknownUplink)?
     }
 }
 

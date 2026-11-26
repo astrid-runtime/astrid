@@ -100,3 +100,44 @@ async fn registration_drains_before_retirement_and_late_sends_are_refused() {
     assert_eq!(message.platform_user_id, "user");
     assert_eq!(message.content, "live");
 }
+
+#[tokio::test]
+async fn uplink_send_preserves_selected_descriptor_and_reports_queue_refusal() {
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.has_uplink_capability = true;
+    let first = state
+        .uplink_register("one".into(), "chat".into(), UplinkProfile::Chat)
+        .unwrap();
+    let second = state
+        .uplink_register("two".into(), " BRIDGE ".into(), UplinkProfile::Bridge)
+        .unwrap();
+    assert!(matches!(
+        state.uplink_send(uuid::Uuid::nil().to_string(), "a".into(), "b".into()),
+        Err(ErrorCode::UnknownUplink)
+    ));
+    assert!(matches!(
+        state.uplink_send(second.clone(), "a".into(), "b".into()),
+        Err(ErrorCode::Quota)
+    ));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    state.set_inbound_tx(tx);
+    assert!(
+        state
+            .uplink_send(second.clone(), "bob".into(), "hello".into())
+            .unwrap()
+    );
+    assert!(
+        !state
+            .uplink_send(first, "alice".into(), "full".into())
+            .unwrap()
+    );
+    let message = rx.try_recv().unwrap();
+    assert_eq!(message.uplink_id.to_string(), second);
+    assert_eq!(message.platform, "bridge");
+    assert_eq!(message.platform_user_id, "bob");
+    assert_eq!(message.content, "hello");
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}

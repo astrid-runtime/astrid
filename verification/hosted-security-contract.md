@@ -41,6 +41,14 @@ The function and implicit destructor counts below come from the resolved kernel 
 
 Fourteen HTTP, network, IPC and process adapter call sites currently allocate placeholder resources. Their successful allocation returns an always-ready pollable, a closed input stream or a closed output stream. These methods do not attach the returned resource to the underlying transport or process. The constructors propagate allocation errors through trappable host imports. A failed pollable subscription releases its partially allocated parent. Resource identity, accounting and guest-visible trap refinement remain proof obligations. The file-handle destructor above is distinct from the internal storage-backed file publication described below.
 
+### Guest uplink registration and enqueue
+
+Each pooled Wasmtime store owns a descriptor vector and takes its uplink capability bit from the manifest. Stores in one pool share the optional channel sender created at load when the manifest declares uplinks. Registration normalizes the platform, checks the configured gate, constructs a descriptor for the capsule and appends it through the verified registry routine. The routine preserves the vector on rejection and appends exactly the supplied descriptor on success. Its comparison uses both name and platform. At capacity it refuses even a fresh pair.
+
+Send supplies the verified selector with the store's registry, the parsed uplink ID, the operation guard and the guest's two message fields. The selector calls the enqueue closure on the first descriptor with that ID. The closure passes the selected descriptor's ID and platform to the message builder, which normalizes the platform, and reports the result of the channel's nonblocking send. The composition in `verification/hosted_uplink_model.rs` checks refusal for a retired or saturated tracker, absence of a matching descriptor, and the exact fields and active count observed at the modeled sink.
+
+The registry belongs to the capsule instance. A descriptor can survive the calling principal's retirement. The tracked-call theorem assumes a tracker. The pooled constructor installs one. Constructors with optional or absent trackers require separate reachability analysis. The proof still needs to establish the authority of each store configuration, the binding between a runtime guard and its principal generation, and channel creation and lifetime. The tracked tree exposes the receiver to embedders through `take_inbound_rx`. Successful enqueue alone establishes no claim about processing by a downstream recipient.
+
 ## Hosted management IPC inventory
 
 The request bus has two management subscribers. The kernel subscriber decodes

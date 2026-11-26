@@ -854,19 +854,25 @@ impl HostState {
     /// - The per-capsule uplink limit ([`MAX_UPLINKS_PER_CAPSULE`]) has been reached.
     /// - A uplink with the same name and platform already exists.
     pub fn register_uplink(&mut self, descriptor: UplinkDescriptor) -> Result<(), &'static str> {
-        if self.registered_uplinks.len() >= MAX_UPLINKS_PER_CAPSULE {
-            return Err("uplink registration limit reached");
-        }
-        // Reject duplicate name+platform combinations
-        let duplicate = self
-            .registered_uplinks
-            .iter()
-            .any(|c| c.name == descriptor.name && c.platform == descriptor.platform);
-        if duplicate {
-            return Err("duplicate uplink name and platform");
-        }
-        self.registered_uplinks.push(descriptor);
-        Ok(())
+        super::guest_uplink::register(
+            &mut self.registered_uplinks,
+            descriptor,
+            MAX_UPLINKS_PER_CAPSULE,
+            |existing, new| {
+                super::guest_uplink::same_endpoint(
+                    &existing.name,
+                    &existing.platform,
+                    &new.name,
+                    &new.platform,
+                )
+            },
+        )
+        .map_err(|error| match error {
+            super::guest_uplink::RegistrationError::Full => "uplink registration limit reached",
+            super::guest_uplink::RegistrationError::Duplicate => {
+                "duplicate uplink name and platform"
+            },
+        })
     }
 
     /// Return the registered uplinks.

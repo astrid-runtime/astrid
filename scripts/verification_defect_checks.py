@@ -74,12 +74,14 @@ INPUTS = [
     PAIR_RESULT,
     LEASE_CALLBACK,
     Path("crates/astrid-capsule/src/engine/wasm/guest_kv.rs"),
+    Path("crates/astrid-capsule/src/engine/wasm/guest_uplink.rs"),
     Path("crates/astrid-capsule/src/security/identity.rs"),
     Path("crates/astrid-kernel/src/storage_mount/lease_authority/destination.rs"),
     Path("crates/astrid-kernel/src/storage_mount/lease_authority/worker.rs"),
     LEASE_SUBTREE,
     LEASE_RESERVATION,
     Path("verification/hosted_lease_model.rs"),
+    Path("verification/hosted_uplink_model.rs"),
     Path("verification/hosted_kv_model.rs"),
     Path("verification/hosted_wal_model.rs"),
     Path("crates/astrid-core/src/storage_filesystem/operation.rs"),
@@ -462,6 +464,31 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "workspace writes select the host administration projection",
             Path("crates/astrid-kernel/src/storage_mount/lease_authority/destination.rs"),
             lambda source: replace_once(source, "(Self::OwnerRoot(Owner::System), OperationClass::Write) =>", "(_, OperationClass::Write) =>"),
+        ),
+        (
+            "guest uplink admits registrations at capacity",
+            Path("crates/astrid-capsule/src/engine/wasm/guest_uplink.rs"),
+            lambda source: replace_once(source, "registry.len() >= limit {", "registry.len() > limit {"),
+        ),
+        (
+            "guest uplink rejects a different endpoint",
+            Path("crates/astrid-capsule/src/engine/wasm/guest_uplink.rs"),
+            lambda source: replace_once(source, "if same(&registry[i],&descriptor)", "if !same(&registry[i],&descriptor)"),
+        ),
+        (
+            "guest uplink matches the wrong descriptor",
+            Path("crates/astrid-capsule/src/engine/wasm/guest_uplink.rs"),
+            lambda source: replace_once(source, "if id == requested {", "if id != requested {"),
+        ),
+        (
+            "guest uplink loses a selected enqueue receipt",
+            Path("crates/astrid-capsule/src/engine/wasm/guest_uplink.rs"),
+            lambda source: replace_once(source, "return Some(result);", "return None;"),
+        ),
+        (
+            "guest uplink accepts an endpoint with only a matching name",
+            Path("crates/astrid-capsule/src/engine/wasm/guest_uplink.rs"),
+            lambda source: replace_once(source, "name == other_name && platform == other_platform", "name == other_name || platform == other_platform"),
         ),
         (
             "stale KV view falls back to neutral and completes the request",
@@ -1564,6 +1591,24 @@ def copy_inputs(source: Path, tree: Path) -> None:
 
 def consumer_defects():
     """Weaken a production guarantee and require its trace consumer to fail."""
+    yield (
+        "guest uplink consumer loses enqueue argument binding",
+        Path("crates/astrid-capsule/src/engine/wasm/guest_uplink.rs"),
+        lambda source: replace_once(source, "&& enqueue.ensures((&guard,&registry@[i],event),value)", "&& true"),
+        Path("verification/hosted_uplink_model.rs"),
+    )
+    yield (
+        "guest uplink consumer loses first-match guarantee",
+        Path("crates/astrid-capsule/src/engine/wasm/guest_uplink.rs"),
+        lambda source: replace_once(source, "&& forall|j:int| 0 <= j < i ==> #[trigger] skipped(identify,&registry@[j],requested),", ","),
+        Path("verification/hosted_uplink_model.rs"),
+    )
+    yield (
+        "guest uplink consumer loses duplicate rejection witness",
+        Path("crates/astrid-capsule/src/engine/wasm/guest_uplink.rs"),
+        lambda source: replace_once(source, "result matches Err(RegistrationError::Duplicate) ==> exists|i:int| 0 <= i < old(registry).len()\n            && #[trigger] same.ensures((&old(registry)@[i],&descriptor),true),", ""),
+        Path("verification/hosted_uplink_model.rs"),
+    )
     yield (
         "KV handoff no longer guarantees the exact sink receipt",
         Path("crates/astrid-capsule/src/engine/wasm/guest_kv.rs"),
