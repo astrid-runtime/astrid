@@ -18,8 +18,8 @@
 //!   process spawn default to empty → fail-closed).
 //! - Malformed TOML, failed validation, or a future `profile_version` → hard
 //!   error. The operator must correct the file.
-//! - Unknown keys are ignored so upgrade and rollback across binaries do not
-//!   brick a home. `profile_version` is the breaking-change gate.
+//! - A profile carrying device registration IDs requires a version-2 reader.
+//!   Existing version-1 profiles upgrade when a new device is registered.
 //! - Save is atomic on Unix (write to `.tmp` with `0o600`, then `rename`).
 //!
 //! # Defaults
