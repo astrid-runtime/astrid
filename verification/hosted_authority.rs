@@ -20,3 +20,6 @@ mod guest_authority;
 
 #[path = "../crates/astrid-storage/src/kv/encoding.rs"]
 mod encoding;
+
+#[path = "../crates/astrid-storage/src/kv/tree/overlay/traversal.rs"]
+mod overlay_traversal;

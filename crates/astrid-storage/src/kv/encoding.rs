@@ -1,5 +1,6 @@
 //! Canonical durable KV entry addresses.
 
+use std::cmp::Ordering;
 use vstd::prelude::*;
 
 verus! {
@@ -73,8 +74,11 @@ pub(super) open spec fn below(a: Seq<u8>, b: Seq<u8>) -> bool
 
 /// Compare the physical addresses used by checkpoint and overlay scans.
 #[inline]
-pub(super) fn bytewise_less(left: &[u8], right: &[u8]) -> (less: bool)
-    ensures less == below(left@, right@),
+pub(super) fn bytewise_cmp(left: &[u8], right: &[u8]) -> (order: Ordering)
+    ensures
+        (order == Ordering::Less) == below(left@, right@),
+        (order == Ordering::Equal) == (left@ == right@),
+
 {
     assert(left@.skip(0) =~= left@);
     assert(right@.skip(0) =~= right@);
@@ -82,17 +86,26 @@ pub(super) fn bytewise_less(left: &[u8], right: &[u8]) -> (less: bool)
     while i < left.len() && i < right.len()
         invariant
             i <= left.len() && i <= right.len(),
+            forall|j: int| 0 <= j < i ==> #[trigger] left@[j] == right@[j],
             below(left@, right@) == below(left@.skip(i as int), right@.skip(i as int)),
         decreases left.len() - i,
     {
         let a = left[i];
         let b = right[i];
-        if a != b { return a < b; }
+        if a != b { return a.cmp(&b); }
         assert(left@.skip(i as int).skip(1) =~= left@.skip(i as int + 1));
         assert(right@.skip(i as int).skip(1) =~= right@.skip(i as int + 1));
         i = i.saturating_add(1);
     }
-    left.len() < right.len()
+    if left.len() == right.len() { assert(left@ =~= right@); }
+    left.len().cmp(&right.len())
+}
+
+#[inline]
+pub(super) fn bytewise_less(left: &[u8], right: &[u8]) -> (less: bool)
+    ensures less == below(left@, right@),
+{
+    matches!(bytewise_cmp(left, right), Ordering::Less)
 }
 
 #[inline]

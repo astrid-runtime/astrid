@@ -27,7 +27,9 @@ MODEL = Path("verification/hosted_authority_model.rs")
 AUTHORITY = Path("crates/astrid-capabilities/src/store/authority.rs")
 GUEST_AUTHORITY = Path("crates/astrid-storage/src/principal_state/guest_authority.rs")
 KV_ENCODING = Path("crates/astrid-storage/src/kv/encoding.rs")
+OVERLAY = Path("crates/astrid-storage/src/kv/tree/overlay/traversal.rs")
 INPUTS = [
+    OVERLAY,
     KV_ENCODING,
     GUEST_AUTHORITY,
     ENTRY,
@@ -111,6 +113,16 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
     ]
     return [
         (
+            "overlay drops an exact key including its tombstone",
+            OVERLAY,
+            lambda text: replace_once(text, "Ordering::Equal => return Some(&node.entry.value)", "Ordering::Equal => return None"),
+        ),
+        (
+            "overlay searches the wrong subtree",
+            OVERLAY,
+            lambda text: replace_once(text, "Ordering::Less => node.left.as_ref()", "Ordering::Less => node.right.as_ref()"),
+        ),
+        (
             "checkpoint leaf ignores the lower fence",
             KV_ENCODING,
             lambda text: replace_once(text, "!bytewise_less(key, start) && bytewise_less(key, end)", "bytewise_less(key, end)"),
@@ -123,7 +135,7 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
         (
             "byte order reverses strict-prefix ties",
             KV_ENCODING,
-            lambda text: edit_function(text, "bytewise_less", "left.len() < right.len()", "left.len() > right.len()"),
+            lambda text: edit_function(text, "bytewise_cmp", "left.len().cmp(&right.len())", "right.len().cmp(&left.len())"),
         ),
         (
             "prefix range includes sibling namespaces",

@@ -11,31 +11,13 @@ pub(super) struct OverlayMap {
     root: Option<Arc<Node>>,
 }
 
-#[derive(Debug)]
-struct Entry {
-    key: Vec<u8>,
-    value: Option<Vec<u8>>,
-}
-
-#[derive(Debug)]
-struct Node {
-    entry: Arc<Entry>,
-    left: Option<Arc<Self>>,
-    right: Option<Arc<Self>>,
-    height: u32,
-}
+use crate::kv::encoding;
+mod traversal;
+use traversal::{Entry, Node};
 
 impl OverlayMap {
     pub(super) fn get(&self, key: &[u8]) -> Option<&Option<Vec<u8>>> {
-        let mut cursor = self.root.as_deref();
-        while let Some(node) = cursor {
-            match key.cmp(node.entry.key.as_slice()) {
-                Ordering::Less => cursor = node.left.as_deref(),
-                Ordering::Greater => cursor = node.right.as_deref(),
-                Ordering::Equal => return Some(&node.entry.value),
-            }
-        }
-        None
+        traversal::lookup(self.root.as_ref(), key)
     }
 
     pub(super) fn insert(&mut self, key: Vec<u8>, value: Option<Vec<u8>>) {
@@ -89,7 +71,7 @@ fn insert(root: Option<Arc<Node>>, entry: Arc<Entry>) -> Arc<Node> {
     let Some(node) = root else {
         return make_node(entry, None, None);
     };
-    let rebuilt = match entry.key.as_slice().cmp(node.entry.key.as_slice()) {
+    let rebuilt = match encoding::bytewise_cmp(&entry.key, &node.entry.key) {
         Ordering::Less => make_node(
             Arc::clone(&node.entry),
             Some(insert(node.left.clone(), entry)),

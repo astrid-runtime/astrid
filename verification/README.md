@@ -71,8 +71,13 @@ for every encoded entry in a validated namespace. Checkpoint leaf selection, bra
 comparisons now use a production comparator verified against that byte order.
 A child containing any requested key between its declared fences must pass
 the checked pruning decision, including the final child with no upper fence.
-Completeness still depends on tree decoding and the declared child fences,
-stack traversal and overlay ordering. Applying the resulting deletion
+The point lookup used to suppress superseded checkpoint entries is checked on
+the actual immutable overlay nodes. For a strictly ordered overlay, it returns
+the stored value or explicit deletion marker for the requested key exactly
+when that entry occurs anywhere in the tree. A missing key returns no entry.
+Lookup and insertion use the same checked three-way comparator. Establishing
+that insertion and rotations preserve ordering remains an obligation, as do
+checkpoint decoding, the declared child fences and full stack traversal. Applying the resulting deletion
 replacements and publishing their new root remain open obligations.
 
 The synchronous Wasmtime KV host call holds its operation guard across semaphore
