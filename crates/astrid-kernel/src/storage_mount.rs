@@ -167,13 +167,43 @@ pub(crate) async fn issue_lease(
     provider: String,
     mountpoint: PathBuf,
 ) -> Result<StorageMountLeaseV1, String> {
+    issue_bound_lease(
+        kernel,
+        caller,
+        LeaseAuthority::Management { allow_cross_owner },
+        view,
+        target,
+        access,
+        provider,
+        mountpoint,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum LeaseAuthority {
+    Management { allow_cross_owner: bool },
+    Process(astrid_core::PrincipalUid),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn issue_bound_lease(
+    kernel: &Arc<Kernel>,
+    caller: PrincipalId,
+    authority: LeaseAuthority,
+    view: StorageProviderViewV1,
+    target: StorageFilesystemTargetV1,
+    access: StorageProviderAccessV1,
+    provider: String,
+    mountpoint: PathBuf,
+) -> Result<StorageMountLeaseV1, String> {
     if provider.is_empty() || provider.len() > 128 || provider.chars().any(char::is_control) {
         return Err("native storage provider identity is invalid".to_owned());
     }
     if !mountpoint.is_absolute() {
         return Err("native storage mountpoint must be absolute".to_owned());
     }
-    let (owner, target) = resolve_owner(kernel, &caller, allow_cross_owner, &view, target).await?;
+    let (owner, target) = resolve_owner(kernel, &caller, authority, &view, target).await?;
     let mount_id = StorageMountId::new();
     #[cfg(unix)]
     let resource_path = private_mount_resource_path(mount_id)?;
@@ -388,31 +418,48 @@ async fn finish_revoke(kernel: &Kernel, state: Arc<StorageMountLeaseState>) -> R
 async fn resolve_owner(
     kernel: &Kernel,
     caller: &PrincipalId,
-    allow_cross_owner: bool,
+    authority: LeaseAuthority,
     view: &StorageProviderViewV1,
     target: StorageFilesystemTargetV1,
 ) -> Result<(StateOwner, StorageFilesystemTargetV1), String> {
+    let allow_cross_owner = matches!(
+        authority,
+        LeaseAuthority::Management {
+            allow_cross_owner: true
+        }
+    );
+    let caller_uid = || match authority {
+        LeaseAuthority::Process(expected) => kernel
+            .principal_directory
+            .bound_uid(caller, Some(expected))
+            .map_err(|_| "process projection owner changed".to_owned()),
+        LeaseAuthority::Management { .. } => kernel
+            .principal_directory
+            .uid_for(caller)
+            .map_err(|error| error.to_string()),
+    };
     let owner = match view {
         StorageProviderViewV1::Principal(principal) => {
             if principal != caller && !allow_cross_owner {
                 return Err("principal filesystem view belongs to another principal".to_owned());
             }
-            kernel
-                .principal_directory
-                .uid_for(principal)
-                .map(StateOwner::Principal)
-                .map_err(|error| {
-                    format!("principal `{principal}` has no immutable storage identity: {error}")
-                })?
+            if principal == caller {
+                StateOwner::Principal(caller_uid()?)
+            } else {
+                kernel
+                    .principal_directory
+                    .uid_for(principal)
+                    .map(StateOwner::Principal)
+                    .map_err(|error| {
+                        format!(
+                            "principal `{principal}` has no immutable storage identity: {error}"
+                        )
+                    })?
+            }
         },
         StorageProviderViewV1::Fleet(fleet) => {
             if !allow_cross_owner {
-                let caller_uid = kernel
-                    .principal_directory
-                    .uid_for(caller)
-                    .map_err(|error| {
-                        format!("principal `{caller}` has no immutable storage identity: {error}")
-                    })?;
+                let caller_uid = caller_uid()?;
                 let ownership = kernel
                     .ownership_store()
                     .load()
@@ -452,10 +499,7 @@ async fn resolve_owner(
         // principal's divergent branch. Global storage authority may inspect
         // an explicitly selected branch through the administrative path.
         if !allow_cross_owner {
-            let caller_uid = kernel
-                .principal_directory
-                .uid_for(caller)
-                .map_err(|error| format!("resolve workspace branch caller UID: {error}"))?;
+            let caller_uid = caller_uid()?;
             if descriptor.binding_uid() != Some(caller_uid) {
                 return Err(
                     "workspace branch is not bound to the authenticated principal".to_owned(),

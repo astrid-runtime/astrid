@@ -553,3 +553,11 @@ string, the relative path and the mount selector. The home case prepends
 relative path, including an empty root path. The adapter converts the returned
 suffix to a platform path. Native path resolution, platform path conversion,
 profile matching and backend publication remain separate obligations.
+
+
+For native child-process storage, the guest adapter supplies an admitted UID
+to the kernel broker. Workspace binding checks this UID. It also identifies the
+private home, the process projection cache key and the caller checked at lease
+issuance. For a fleet view, authorization still depends on the ownership graph
+and workspace branch descriptor. The proof of UID selection does not discharge
+provider startup, cache lifetime, fleet ownership changes or callback teardown.
