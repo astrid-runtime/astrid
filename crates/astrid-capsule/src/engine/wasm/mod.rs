@@ -2985,9 +2985,17 @@ impl ExecutionEngine for WasmEngine {
         // Invoking principal, derived once: used both for the quota profile
         // below and the per-invocation diagnostic span at the end. Lock-free
         // — `owner_principal` is the immutable load-time `state.principal`.
-        let invoking_principal = caller
+        let Ok(caller_principal) = caller
             .and_then(|msg| msg.principal.as_deref())
-            .and_then(|p| astrid_core::PrincipalId::new(p).ok())
+            .map(astrid_core::PrincipalId::new)
+            .transpose()
+        else {
+            return Ok(crate::capsule::InterceptResult::Deny {
+                reason: "invalid caller principal stamp".to_owned(),
+            });
+        };
+        let invoking_principal = caller_principal
+            .clone()
             .or_else(|| self.owner_principal.clone())
             .unwrap_or_default();
         if !self.system_runtime
@@ -3190,20 +3198,15 @@ impl ExecutionEngine for WasmEngine {
         // the overlay, that layer will add the field + accessor and
         // consume the resolved `Arc<OverlayVfs>` here.
         if let Some(registry) = self.overlay_registry.as_ref() {
-            let invoking = caller
-                .and_then(|msg| msg.principal.as_deref())
-                .and_then(|p| astrid_core::PrincipalId::new(p).ok())
-                .or_else(|| self.owner_principal.clone())
-                .unwrap_or_default();
-            let resolved = registry.resolve(&invoking).await;
+            let resolved = registry.resolve(&invoking_principal).await;
             if let Err(e) = resolved {
                 tracing::error!(
-                    principal = %invoking,
+                    principal = %invoking_principal,
                     error = %e,
                     "overlay registry resolve failed; denying invocation (issue #668)"
                 );
                 return Err(CapsuleError::WasmError(format!(
-                    "principal '{invoking}' overlay resolve failed: {e}"
+                    "principal '{invoking_principal}' overlay resolve failed: {e}"
                 )));
             }
         }
@@ -3343,11 +3346,7 @@ impl ExecutionEngine for WasmEngine {
                 // Refine the invocation context. Principal runtimes reject peer
                 // callers before checkout; SystemResident runtimes may install
                 // an explicitly authenticated caller overlay.
-                let invocation_principal: Option<astrid_core::PrincipalId> = caller
-                    .and_then(|msg| msg.principal.as_deref())
-                    .and_then(|p| astrid_core::PrincipalId::new(p).ok());
-
-                install_principal_overlays(state, invocation_principal.as_ref()).await;
+                install_principal_overlays(state, caller_principal.as_ref()).await;
                 state.tool_result = None;
                 tool_audit = crate::engine::wasm::host::tool_audit::ToolCallAudit::arm(
                     state,

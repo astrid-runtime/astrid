@@ -32,4 +32,15 @@ impl Scope<'_> {
     }
 }
 
+/// An owner-scoped subscription requires a present, identical host stamp.
+pub(super) fn accepts_owner(required: Option<u128>, stamped: Option<u128>) -> (accepted: bool)
+    ensures accepted == (required.is_none() || required == stamped),
+{
+    match (required, stamped) {
+        (None, _) => true,
+        (Some(expected), Some(actual)) => expected == actual,
+        (Some(_), None) => false,
+    }
+}
+
 }

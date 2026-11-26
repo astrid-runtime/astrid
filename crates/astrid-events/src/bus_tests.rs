@@ -1072,6 +1072,7 @@ async fn request_owner_scope_rejects_peer_before_queue_admission() {
         owner,
     );
 
+    bus.publish(ipc_evt("astrid.v1.approval", Some("alice")));
     bus.publish(ipc_evt_with_owner("astrid.v1.approval", "alice", peer));
     bus.publish(ipc_evt_with_owner("astrid.v1.approval", "bob", owner));
     assert_eq!(sub.active_principals(), 0);

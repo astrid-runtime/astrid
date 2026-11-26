@@ -228,14 +228,18 @@ impl HostState {
             return;
         }
 
-        let publisher: Option<astrid_core::PrincipalId> = msg
+        let parsed = msg
             .principal
             .as_deref()
-            .and_then(|p| astrid_core::PrincipalId::new(p).ok());
-        if !self.system_runtime
-            && publisher
-                .as_ref()
-                .is_some_and(|publisher| publisher != &self.principal)
+            .map(astrid_core::PrincipalId::new)
+            .transpose();
+        let invalid_stamp = parsed.is_err();
+        let publisher = parsed.ok().flatten();
+        if invalid_stamp
+            || (!self.system_runtime
+                && publisher
+                    .as_ref()
+                    .is_some_and(|publisher| publisher != &self.principal))
         {
             self.caller_context = Some(msg.clone());
             self.invocation_profile_authorized = false;
@@ -256,7 +260,7 @@ impl HostState {
                 owner = %self.principal,
                 publisher = ?publisher,
                 capsule = %self.capsule_id,
-                "principal runtime received a peer event; installing restricted authority floor"
+                "received event has an invalid or unauthorized principal; installing restricted authority floor"
             );
             return;
         }

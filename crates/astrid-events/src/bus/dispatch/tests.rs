@@ -40,7 +40,7 @@ fn foreign_principals_do_not_enter_the_delivery_snapshot() {
     );
     let _all = bus.subscribe_topic_routed(Uuid::new_v4(), "scale.*", "all", "test");
     let event = event();
-    let matched = bus.matching_routes(&event, &Some("alice".into()));
+    let matched = bus.matching_routes(&event);
     assert_eq!(
         matched.len(),
         2,
@@ -61,12 +61,11 @@ async fn retirement_after_snapshot_skips_queue_and_wakeup() {
         gate.clone(),
     );
     let event = event();
-    let principal = Some("alice".into());
-    let matched = bus.matching_routes(&event, &principal);
+    let matched = bus.matching_routes(&event);
     assert_eq!(matched.len(), 1);
     let notify = Arc::clone(&matched[0].lock().notify);
     gate.retire();
-    EventBus::enqueue_routes(matched, &event, &principal);
+    EventBus::enqueue_routes(matched, &event);
     assert!(receiver.try_drain(MAX_SUBSCRIPTION_BUDGET_BYTES).is_empty());
     assert!(
         tokio::time::timeout(Duration::from_millis(20), notify.notified())
@@ -89,11 +88,10 @@ fn staged_route_cannot_acquire_a_prepublication_snapshot() {
         gate.clone(),
     );
     let event = event();
-    let principal = Some("alice".into());
-    let matched = bus.matching_routes(&event, &principal);
+    let matched = bus.matching_routes(&event);
     assert!(matched.is_empty());
     gate.publish();
-    EventBus::enqueue_routes(matched, &event, &principal);
+    EventBus::enqueue_routes(matched, &event);
     assert!(receiver.try_drain(MAX_SUBSCRIPTION_BUDGET_BYTES).is_empty());
     bus.publish((*event).clone());
     assert_eq!(receiver.try_drain(MAX_SUBSCRIPTION_BUDGET_BYTES).len(), 1);

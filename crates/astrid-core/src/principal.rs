@@ -5,6 +5,8 @@
 //! `~/.astrid/home/{principal}/` with its own capsules, KV data, audit
 //! chain, and capability tokens.
 
+mod syntax;
+
 use std::fmt;
 use std::str::FromStr;
 
@@ -39,19 +41,20 @@ impl PrincipalId {
     /// characters, or contains characters outside `[a-zA-Z0-9_-]`.
     pub fn new(id: impl Into<String>) -> Result<Self, PrincipalIdError> {
         let id = id.into();
-        if id.is_empty() {
-            return Err(PrincipalIdError::Empty);
+        match syntax::classify(id.as_bytes()) {
+            syntax::Syntax::Valid => Ok(Self(id)),
+            syntax::Syntax::Empty => Err(PrincipalIdError::Empty),
+            syntax::Syntax::TooLong => Err(PrincipalIdError::TooLong),
+            syntax::Syntax::InvalidAt(index) => {
+                // Every preceding byte is valid ASCII, so this indexes the first
+                // byte of the rejected Unicode scalar.
+                let invalid = id
+                    .get(index..)
+                    .and_then(|tail| tail.chars().next())
+                    .unwrap_or(char::REPLACEMENT_CHARACTER);
+                Err(PrincipalIdError::InvalidChar(invalid))
+            },
         }
-        if id.len() > 64 {
-            return Err(PrincipalIdError::TooLong);
-        }
-        if let Some(ch) = id
-            .chars()
-            .find(|c| !c.is_ascii_alphanumeric() && *c != '-' && *c != '_')
-        {
-            return Err(PrincipalIdError::InvalidChar(ch));
-        }
-        Ok(Self(id))
     }
 
     /// Return the underlying string slice.
@@ -167,6 +170,10 @@ mod tests {
 
     #[test]
     fn rejects_invalid_chars() {
+        assert!(matches!(
+            PrincipalId::new("valid_prefix-🦀"),
+            Err(PrincipalIdError::InvalidChar('🦀'))
+        ));
         assert!(matches!(
             PrincipalId::new("foo bar"),
             Err(PrincipalIdError::InvalidChar(' '))

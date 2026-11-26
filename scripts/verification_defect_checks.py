@@ -36,7 +36,9 @@ GENERATION = Path("crates/astrid-capsule/src/registry/generation.rs")
 VIEW_OWNER = Path("crates/astrid-capsule/src/registry/view_owner.rs")
 ROUTE_GATE = Path("crates/astrid-events/src/route/gate/state.rs")
 ROUTE_SCOPE = Path("crates/astrid-events/src/route/scope.rs")
+PRINCIPAL_SYNTAX = Path("crates/astrid-core/src/principal/syntax.rs")
 INPUTS = [
+    PRINCIPAL_SYNTAX,
     ROUTE_SCOPE,
     ROUTE_GATE,
     VIEW_OWNER,
@@ -172,6 +174,26 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "principal-only IPC route admits system events",
             ROUTE_SCOPE,
             lambda text: replace_once(text, "Scope::System | Scope::PrincipalOrSystem(_), None", "Scope::System | Scope::PrincipalOrSystem(_) | Scope::Principal(_), None"),
+        ),
+        (
+            "request-owner route accepts unstamped traffic",
+            ROUTE_SCOPE,
+            lambda text: replace_once(text, "(Some(_), None) => false", "(Some(_), None) => true"),
+        ),
+        (
+            "request-owner route accepts another request",
+            ROUTE_SCOPE,
+            lambda text: replace_once(text, "=> expected == actual", "=> true"),
+        ),
+        (
+            "principal parser accepts the empty stamp",
+            PRINCIPAL_SYNTAX,
+            lambda text: replace_once(text, "return Syntax::Empty;", "return Syntax::Valid;"),
+        ),
+        (
+            "principal parser accepts an invalid byte",
+            PRINCIPAL_SYNTAX,
+            lambda text: replace_once(text, "return Syntax::InvalidAt(i);", "return Syntax::Valid;"),
         ),
         (
             "registry reuses the same generation",

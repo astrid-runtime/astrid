@@ -21,6 +21,12 @@ pub mod request_failure;
 pub struct RequestOwnerId(Uuid);
 
 impl RequestOwnerId {
+    /// The complete UUID value for comparing host-stamped routing metadata.
+    #[must_use]
+    pub const fn as_u128(self) -> u128 {
+        self.0.as_u128()
+    }
+
     /// Mint a fresh request owner for an authenticated connection.
     #[must_use]
     pub fn generate() -> Self {

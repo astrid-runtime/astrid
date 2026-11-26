@@ -47,3 +47,6 @@ mod route_gate;
 
 #[path = "../crates/astrid-events/src/route/scope.rs"]
 mod route_scope;
+
+#[path = "../crates/astrid-core/src/principal/syntax.rs"]
+mod principal_syntax;

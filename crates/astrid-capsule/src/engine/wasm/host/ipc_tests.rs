@@ -742,6 +742,20 @@ async fn publish_inherits_authenticated_request_owner_from_caller_context() {
     assert_eq!(message.request_owner, Some(owner));
 }
 
+#[tokio::test]
+async fn invalid_caller_stamp_denies_publication_before_quota_or_delivery() {
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.ipc_publish_patterns = vec!["capsule.v1.*".to_owned()];
+    state.caller_context = Some(
+        caller_with_origin(astrid_events::ipc::MessageOrigin::LocalSocket)
+            .with_principal("invalid@caller"),
+    );
+    let mut receiver = state.event_bus.subscribe_topic("capsule.v1.ping");
+    let result = IpcHost::publish(&mut state, "capsule.v1.ping".to_owned(), "{}".to_owned()).await;
+    assert!(matches!(result, Err(ErrorCode::CapabilityDenied)));
+    assert!(receiver.try_recv().is_none());
+}
+
 /// Pull the `origin` off the first published message.
 fn first_origin(receiver: &mut astrid_events::EventReceiver) -> astrid_events::ipc::MessageOrigin {
     let event = receiver.try_recv().expect("one published message");

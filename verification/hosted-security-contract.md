@@ -111,8 +111,19 @@ on the next admission check.
 Matching and enqueue use a checked principal predicate over the unrestricted,
 system-only, exact-principal and principal-or-system cases. A principal match
 requires equality of the publisher and owner bytes. The predicate takes the
-publisher identity supplied by the bus. Message provenance, receipt visibility,
-request-owner authentication, mutex and atomic ordering, delivery after an
+publisher identity stamped on the same IPC message that is enqueued. The
+fan-out bucket is keyed by that stamp. The checked request-owner predicate
+requires equality of the full 128-bit ID for an owner-scoped subscription.
+An absent stamp fails that comparison. Ordinary guest publication validates
+a present caller principal before accounting or delivery. The checked principal
+parser accepts exactly 1–64 ASCII letters, digits, hyphens or underscores and
+identifies the first invalid byte within that length range. Both the throughput
+charge and the outgoing stamp use the resulting typed principal. Interceptor
+admission rejects a malformed caller stamp before acquiring its invocation
+guard. The receive path installs restricted authority for a malformed stamp on
+both private and shared runtimes. The upstream
+authentication of these stamps, receipt visibility, mutex and atomic ordering,
+delivery after an
 already admitted handoff and confinement of subsequent handler effects remain
 separate obligations.
 

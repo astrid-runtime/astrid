@@ -304,6 +304,26 @@ fn effective_principal_prefers_caller_over_owner() {
     assert_eq!(state.effective_principal(), owner);
 }
 
+#[test]
+fn malformed_recv_stamp_denies_host_operations_for_private_and_shared_runtimes() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    for system_runtime in [false, true] {
+        let mut state = minimal_host_state(rt.handle().clone());
+        state.system_runtime = system_runtime;
+        let message = astrid_events::ipc::IpcMessage::new(
+            Topic::from_raw("test"),
+            astrid_events::ipc::IpcPayload::Connect,
+            uuid::Uuid::nil(),
+        )
+        .with_principal("invalid@caller");
+        state.install_recv_invocation_context(&message);
+        assert!(!state.invocation_authority_active());
+        assert!(state.begin_host_operation().is_err());
+    }
+}
+
 /// Regression for the prompt-pipeline stall investigated under
 /// the v0.7 smoke test: nested `ipc::recv` inside an interceptor
 /// (e.g. prompt-builder waiting on plugin hook responses) used to
