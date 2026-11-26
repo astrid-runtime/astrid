@@ -44,7 +44,7 @@ mod io_impl;
 mod validation;
 
 pub use device::{
-    DEVICE_KEY_ID_HEX_LEN, DeviceKey, DeviceKeyId, DevicePubkey, DeviceScope,
+    DEVICE_KEY_ID_HEX_LEN, DeviceKey, DeviceKeyId, DevicePubkey, DeviceRegistrationId, DeviceScope,
     device_key_id_fingerprint,
 };
 pub use field::{
@@ -56,7 +56,8 @@ pub use field::{
 /// Profiles on disk with a version greater than this constant are rejected
 /// by [`PrincipalProfile::validate`] — a forward-dated profile would otherwise
 /// be silently truncated to whatever fields this binary understands.
-pub const CURRENT_PROFILE_VERSION: u32 = 1;
+pub const CURRENT_PROFILE_VERSION: u32 = DEVICE_REGISTRATION_PROFILE_VERSION;
+const DEVICE_REGISTRATION_PROFILE_VERSION: u32 = 2;
 
 /// Default per-principal memory ceiling in bytes (64 `MiB`).
 pub const DEFAULT_MAX_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
@@ -152,7 +153,7 @@ pub struct PrincipalProfile {
     /// Schema version. Bumped on breaking field changes.
     ///
     /// Values above [`CURRENT_PROFILE_VERSION`] are rejected at load time.
-    #[serde(default = "current_profile_version")]
+    #[serde(default = "legacy_profile_version")]
     pub profile_version: u32,
 
     /// Master enable switch. When `false`, the kernel will refuse every
@@ -441,8 +442,8 @@ pub struct Quotas {
 
 // ── serde default helpers ────────────────────────────────────────────────
 
-fn current_profile_version() -> u32 {
-    CURRENT_PROFILE_VERSION
+fn legacy_profile_version() -> u32 {
+    1
 }
 
 fn default_true() -> bool {
@@ -498,6 +499,17 @@ impl Default for PrincipalProfile {
 }
 
 impl PrincipalProfile {
+    /// Append a device and declare the profile format required to retain its
+    /// registration identity on disk.
+    pub fn add_device(&mut self, device: DeviceKey) {
+        if device.registration_id.is_some() {
+            self.profile_version = self
+                .profile_version
+                .max(DEVICE_REGISTRATION_PROFILE_VERSION);
+        }
+        self.auth.public_keys.push(device);
+    }
+
     /// Borrow the process-global default profile.
     ///
     /// Layer 3's `effective_profile()` accessor returns `&PrincipalProfile`,
@@ -614,7 +626,7 @@ mod tests {
     #[test]
     fn roundtrip_populated() {
         let p = PrincipalProfile {
-            profile_version: 1,
+            profile_version: CURRENT_PROFILE_VERSION,
             enabled: false,
             groups: vec!["admins".into(), "ops_team".into()],
             grants: vec!["capsule:install".into()],

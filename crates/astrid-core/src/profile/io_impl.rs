@@ -216,13 +216,18 @@ mod tests {
     #[test]
     fn load_empty_file_is_valid_default_like() {
         // Empty TOML is a valid document → all #[serde(default)] fire.
-        // File existence is not a "reset"; the defaults are the same
-        // whether the file is absent or empty.
+        // A pre-versioned file retains the original schema on its next save.
         let (_d, home, principal) = scratch_home();
         let path = PrincipalProfile::path_for(&home, &principal);
         fs::write(&path, "").unwrap();
         let loaded = PrincipalProfile::load(&home, &principal).unwrap();
-        assert_eq!(loaded, PrincipalProfile::default());
+        assert_eq!(
+            loaded,
+            PrincipalProfile {
+                profile_version: 1,
+                ..PrincipalProfile::default()
+            }
+        );
     }
 
     #[test]
