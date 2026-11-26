@@ -124,22 +124,8 @@ impl HostState {
             ErrorCode::Unknown("principal capsule view is retired or unauthorized".to_string())
         })?;
         util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
-            if let Some(caller) = &self.caller_context
-                && let Some(id) = caller.device_key_id.as_deref()
-            {
-                let denied = || ErrorCode::Unknown("device registration unavailable".into());
-                let principal =
-                    astrid_core::PrincipalId::new(caller.principal.as_deref().ok_or_else(denied)?)
-                        .map_err(|_| denied())?;
-                let key = astrid_core::profile::DeviceKeyId::new(id).map_err(|_| denied())?;
-                let profile = self
-                    .profile_cache
-                    .as_ref()
-                    .ok_or_else(denied)?
-                    .resolve(&principal)
-                    .map_err(|_| denied())?;
-                profile.active_device(&key).ok_or_else(denied)?;
-            }
+            self.check_caller_device()
+                .map_err(|()| ErrorCode::Unknown("device registration unavailable".into()))?;
             operation(self.effective_kv())
                 .await
                 .map_err(|error| store_err(name, error))

@@ -33,7 +33,7 @@ use crate::engine::wasm::bindings::astrid::fs::host::{
 };
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
-use resolve::{resolve_path, resolve_vfs};
+use resolve::{ResolvedPath, resolve_vfs};
 
 /// Audit envelope for path-based fs operations.
 ///
@@ -319,12 +319,65 @@ fn gate_write_path(
     Ok(operation)
 }
 
+#[derive(Clone, Copy)]
+enum FsAccess {
+    Probe,
+    Read,
+    Write(Option<astrid_crypto::ContentHash>),
+    Delete,
+}
+
+impl FsAccess {
+    fn event(self, path: &str) -> HostAuditEvent<'_> {
+        match self {
+            Self::Probe => HostAuditEvent::FileProbe { path },
+            Self::Read => HostAuditEvent::FileRead { path },
+            Self::Write(content_hash) => HostAuditEvent::FileWrite { path, content_hash },
+            Self::Delete => HostAuditEvent::FileDelete { path },
+        }
+    }
+
+    fn device_denied(self, state: &HostState, path: &str) -> ErrorCode {
+        record_fs_denied(
+            state,
+            self.event(path),
+            "caller device registration is unavailable",
+        );
+        ErrorCode::CapabilityDenied
+    }
+}
+
+fn resolve_guest_path(
+    state: &HostState,
+    path: &str,
+    access: FsAccess,
+) -> Result<ResolvedPath, ErrorCode> {
+    state
+        .check_caller_device()
+        .map_err(|()| access.device_denied(state, path))?;
+    resolve::resolve_path(state, path).map_err(map_resolve_err)
+}
+
+fn with_vfs_operation<F: Future>(
+    state: &HostState,
+    access: FsAccess,
+    path: &str,
+    operation: F,
+) -> Result<F::Output, ErrorCode> {
+    util::bounded_block_on(&state.runtime_handle, &state.blocking_semaphore, async {
+        state
+            .check_caller_device()
+            .map_err(|()| access.device_denied(state, path))?;
+        Ok(operation.await)
+    })
+}
+
 /// Resolve and read-authorize a VFS path exposed to a sandboxed native child.
 pub(super) fn authorize_process_read_path(
     state: &HostState,
     raw_path: &str,
 ) -> Result<std::path::PathBuf, ErrorCode> {
-    let resolved = resolve_path(state, raw_path).map_err(map_resolve_err)?;
+    let resolved = resolve_guest_path(state, raw_path, FsAccess::Read)?;
     let Some(physical) = resolved.physical else {
         return Err(ErrorCode::CapabilityDenied);
     };
@@ -383,20 +436,20 @@ impl fs::Host for HostState {
     }
 
     fn fs_exists(&mut self, path: String) -> Result<bool, ErrorCode> {
-        let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
+        let access = FsAccess::Probe;
+        let resolved = resolve_guest_path(self, &path, access)?;
         let _operation = gate_read_path(self, &resolved.gate_path)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
-        let exists =
-            util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
-                vfs_path
-                    .vfs
-                    .exists(
-                        &vfs_path.handle,
-                        vfs_path.relative.to_string_lossy().as_ref(),
-                    )
-                    .await
-            })
-            .unwrap_or(false);
+        let exists = with_vfs_operation(self, access, &resolved.gate_path, async {
+            vfs_path
+                .vfs
+                .exists(
+                    &vfs_path.handle,
+                    vfs_path.relative.to_string_lossy().as_ref(),
+                )
+                .await
+        })?
+        .unwrap_or(false);
         let result: Result<bool, ErrorCode> = Ok(exists);
         audit_fs(
             self,
@@ -408,16 +461,11 @@ impl fs::Host for HostState {
     }
 
     fn fs_mkdir(&mut self, path: String) -> Result<(), ErrorCode> {
-        let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
+        let access = FsAccess::Write(None);
+        let resolved = resolve_guest_path(self, &path, access)?;
         let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Write)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
-        admit(
-            self,
-            HostAuditEvent::FileWrite {
-                path: &resolved.gate_path,
-                content_hash: None,
-            },
-        )?;
+        admit(self, access.event(&resolved.gate_path))?;
 
         // Strict-create semantics per `astrid:fs@1.0.0` (fs-mkdir
         // distinguished from fs-mkdir-all by failing when an
@@ -434,11 +482,10 @@ impl fs::Host for HostState {
             && !parent.as_os_str().is_empty()
         {
             let parent_rel = parent.to_string_lossy().to_string();
-            let parent_exists =
-                util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
-                    vfs_path.vfs.exists(&vfs_path.handle, &parent_rel).await
-                })
-                .unwrap_or(false);
+            let parent_exists = with_vfs_operation(self, access, &resolved.gate_path, async {
+                vfs_path.vfs.exists(&vfs_path.handle, &parent_rel).await
+            })?
+            .unwrap_or(false);
             if !parent_exists {
                 let result: Result<(), ErrorCode> = Err(ErrorCode::NotFound);
                 audit_fs(
@@ -451,11 +498,10 @@ impl fs::Host for HostState {
             }
         }
 
-        let result =
-            util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
-                vfs_path.vfs.mkdir(&vfs_path.handle, &relative).await
-            })
-            .map_err(map_vfs_err);
+        let result = with_vfs_operation(self, access, &resolved.gate_path, async {
+            vfs_path.vfs.mkdir(&vfs_path.handle, &relative).await
+        })?
+        .map_err(map_vfs_err);
         audit_fs(
             self,
             "astrid:fs/host.fs-mkdir",
@@ -475,27 +521,21 @@ impl fs::Host for HostState {
         // recursive is a separate behaviour change; this commit only
         // unstubs the idempotent variant the capsule contract
         // promises.
-        let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
+        let access = FsAccess::Write(None);
+        let resolved = resolve_guest_path(self, &path, access)?;
         let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Write)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
-        admit(
-            self,
-            HostAuditEvent::FileWrite {
-                path: &resolved.gate_path,
-                content_hash: None,
-            },
-        )?;
-        let result =
-            util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
-                vfs_path
-                    .vfs
-                    .mkdir(
-                        &vfs_path.handle,
-                        vfs_path.relative.to_string_lossy().as_ref(),
-                    )
-                    .await
-            })
-            .map_err(map_vfs_err);
+        admit(self, access.event(&resolved.gate_path))?;
+        let result = with_vfs_operation(self, access, &resolved.gate_path, async {
+            vfs_path
+                .vfs
+                .mkdir(
+                    &vfs_path.handle,
+                    vfs_path.relative.to_string_lossy().as_ref(),
+                )
+                .await
+        })?
+        .map_err(map_vfs_err);
         audit_fs(
             self,
             "astrid:fs/host.fs-mkdir-all",
@@ -506,21 +546,21 @@ impl fs::Host for HostState {
     }
 
     fn fs_readdir(&mut self, path: String) -> Result<Vec<String>, ErrorCode> {
-        let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
+        let access = FsAccess::Probe;
+        let resolved = resolve_guest_path(self, &path, access)?;
         let _operation = gate_read_path(self, &resolved.gate_path)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
-        let result =
-            util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
-                vfs_path
-                    .vfs
-                    .readdir(
-                        &vfs_path.handle,
-                        vfs_path.relative.to_string_lossy().as_ref(),
-                    )
-                    .await
-            })
-            .map(|entries| entries.into_iter().map(|e| e.name).collect::<Vec<_>>())
-            .map_err(map_vfs_err);
+        let result = with_vfs_operation(self, access, &resolved.gate_path, async {
+            vfs_path
+                .vfs
+                .readdir(
+                    &vfs_path.handle,
+                    vfs_path.relative.to_string_lossy().as_ref(),
+                )
+                .await
+        })?
+        .map(|entries| entries.into_iter().map(|e| e.name).collect::<Vec<_>>())
+        .map_err(map_vfs_err);
         audit_fs(
             self,
             "astrid:fs/host.fs-readdir",
@@ -531,21 +571,21 @@ impl fs::Host for HostState {
     }
 
     fn fs_stat(&mut self, path: String) -> Result<FileStat, ErrorCode> {
-        let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
+        let access = FsAccess::Probe;
+        let resolved = resolve_guest_path(self, &path, access)?;
         let _operation = gate_read_path(self, &resolved.gate_path)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
-        let result =
-            util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
-                vfs_path
-                    .vfs
-                    .stat(
-                        &vfs_path.handle,
-                        vfs_path.relative.to_string_lossy().as_ref(),
-                    )
-                    .await
-            })
-            .map(|m| to_file_stat(&m))
-            .map_err(map_vfs_err);
+        let result = with_vfs_operation(self, access, &resolved.gate_path, async {
+            vfs_path
+                .vfs
+                .stat(
+                    &vfs_path.handle,
+                    vfs_path.relative.to_string_lossy().as_ref(),
+                )
+                .await
+        })?
+        .map(|m| to_file_stat(&m))
+        .map_err(map_vfs_err);
         audit_fs(self, "astrid:fs/host.fs-stat", &resolved.gate_path, &result);
         result
     }
@@ -557,26 +597,21 @@ impl fs::Host for HostState {
     }
 
     fn fs_unlink(&mut self, path: String) -> Result<(), ErrorCode> {
-        let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
+        let access = FsAccess::Delete;
+        let resolved = resolve_guest_path(self, &path, access)?;
         let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Delete)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
-        admit(
-            self,
-            HostAuditEvent::FileDelete {
-                path: &resolved.gate_path,
-            },
-        )?;
-        let result =
-            util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
-                vfs_path
-                    .vfs
-                    .unlink(
-                        &vfs_path.handle,
-                        vfs_path.relative.to_string_lossy().as_ref(),
-                    )
-                    .await
-            })
-            .map_err(map_vfs_err);
+        admit(self, access.event(&resolved.gate_path))?;
+        let result = with_vfs_operation(self, access, &resolved.gate_path, async {
+            vfs_path
+                .vfs
+                .unlink(
+                    &vfs_path.handle,
+                    vfs_path.relative.to_string_lossy().as_ref(),
+                )
+                .await
+        })?
+        .map_err(map_vfs_err);
         audit_fs(
             self,
             "astrid:fs/host.fs-unlink",
@@ -587,56 +622,50 @@ impl fs::Host for HostState {
     }
 
     fn read_file(&mut self, path: String) -> Result<Vec<u8>, ErrorCode> {
-        let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
+        let access = FsAccess::Read;
+        let resolved = resolve_guest_path(self, &path, access)?;
         let _operation = gate_read_path(self, &resolved.gate_path)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
-        admit(
-            self,
-            HostAuditEvent::FileRead {
-                path: &resolved.gate_path,
-            },
-        )?;
+        admit(self, access.event(&resolved.gate_path))?;
         // Sentinel string used to encode the "too large at stat time"
         // case as a `PermissionDenied` payload so we can re-raise it
         // as `TooLarge` outside the async block. Keep the marker on a
         // local constant so the `map_err` matcher can compare against
         // a single source of truth instead of an inline literal.
         const TOO_LARGE_TAG: &str = "astrid-read-file:too-large";
-        let result =
-            util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
-                let metadata = vfs_path
-                    .vfs
-                    .stat(
-                        &vfs_path.handle,
-                        vfs_path.relative.to_string_lossy().as_ref(),
-                    )
-                    .await?;
-                if metadata.size > util::MAX_GUEST_PAYLOAD_LEN {
-                    return Err(astrid_vfs::VfsError::PermissionDenied(
-                        TOO_LARGE_TAG.to_string(),
-                    ));
-                }
-                let handle = vfs_path
-                    .vfs
-                    .open(
-                        &vfs_path.handle,
-                        vfs_path.relative.to_string_lossy().as_ref(),
-                        false,
-                        false,
-                    )
-                    .await?;
-                let data = vfs_path.vfs.read(&handle).await;
-                let _ = vfs_path.vfs.close(&handle).await;
-                data
-            })
-            .map_err(|e| {
-                if matches!(&e, astrid_vfs::VfsError::PermissionDenied(msg) if msg == TOO_LARGE_TAG)
-                {
-                    ErrorCode::TooLarge
-                } else {
-                    map_vfs_err(e)
-                }
-            });
+        let result = with_vfs_operation(self, access, &resolved.gate_path, async {
+            let metadata = vfs_path
+                .vfs
+                .stat(
+                    &vfs_path.handle,
+                    vfs_path.relative.to_string_lossy().as_ref(),
+                )
+                .await?;
+            if metadata.size > util::MAX_GUEST_PAYLOAD_LEN {
+                return Err(astrid_vfs::VfsError::PermissionDenied(
+                    TOO_LARGE_TAG.to_string(),
+                ));
+            }
+            let handle = vfs_path
+                .vfs
+                .open(
+                    &vfs_path.handle,
+                    vfs_path.relative.to_string_lossy().as_ref(),
+                    false,
+                    false,
+                )
+                .await?;
+            let data = vfs_path.vfs.read(&handle).await;
+            let _ = vfs_path.vfs.close(&handle).await;
+            data
+        })?
+        .map_err(|e| {
+            if matches!(&e, astrid_vfs::VfsError::PermissionDenied(msg) if msg == TOO_LARGE_TAG) {
+                ErrorCode::TooLarge
+            } else {
+                map_vfs_err(e)
+            }
+        });
         // Post-read enforcement closes a TOCTOU window: the stat check
         // above sees the size at `t0`, but the file can grow between
         // stat and the open/read syscalls. The VFS read path has its
@@ -664,38 +693,34 @@ impl fs::Host for HostState {
         if content.len() as u64 > util::MAX_GUEST_PAYLOAD_LEN {
             return Err(ErrorCode::TooLarge);
         }
-        let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
+        let access = FsAccess::Write(None);
+        let resolved = resolve_guest_path(self, &path, access)?;
         let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Write)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
-        admit(
-            self,
-            HostAuditEvent::FileWrite {
-                path: &resolved.gate_path,
-                content_hash: Some(astrid_crypto::ContentHash::hash(&content)),
-            },
-        )?;
-        let result =
-            util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
-                let handle = vfs_path
-                    .vfs
-                    .open(
-                        &vfs_path.handle,
-                        vfs_path.relative.to_string_lossy().as_ref(),
-                        true,
-                        true,
-                    )
-                    .await?;
-                let write_result = vfs_path.vfs.write(&handle, &content).await;
-                let close_result = vfs_path.vfs.close(&handle).await;
-                write_result?;
-                close_result
-            })
-            .map_err(map_vfs_err);
+        let content_hash = Some(astrid_crypto::ContentHash::hash(&content));
+        let access = FsAccess::Write(content_hash);
+        admit(self, access.event(&resolved.gate_path))?;
+        let result = with_vfs_operation(self, access, &resolved.gate_path, async {
+            let handle = vfs_path
+                .vfs
+                .open(
+                    &vfs_path.handle,
+                    vfs_path.relative.to_string_lossy().as_ref(),
+                    true,
+                    true,
+                )
+                .await?;
+            let write_result = vfs_path.vfs.write(&handle, &content).await;
+            let close_result = vfs_path.vfs.close(&handle).await;
+            write_result?;
+            close_result
+        })?
+        .map_err(map_vfs_err);
         audit_fs_content(
             self,
             "astrid:fs/host.write-file",
             &resolved.gate_path,
-            Some(astrid_crypto::ContentHash::hash(&content)),
+            content_hash,
             &result,
         );
         result

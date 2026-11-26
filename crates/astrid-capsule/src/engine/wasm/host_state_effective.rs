@@ -4,6 +4,27 @@
 use super::*;
 
 impl HostState {
+    /// Revalidate the device that authenticated the current caller before a host effect.
+    pub(crate) fn check_caller_device(&self) -> Result<(), ()> {
+        let Some(caller) = &self.caller_context else {
+            return Ok(());
+        };
+        let Some(id) = caller.device_key_id.as_deref() else {
+            return Ok(());
+        };
+        let principal = astrid_core::PrincipalId::new(caller.principal.as_deref().ok_or(())?)
+            .map_err(|_| ())?;
+        let key = astrid_core::profile::DeviceKeyId::new(id).map_err(|_| ())?;
+        let profile = self
+            .profile_cache
+            .as_ref()
+            .ok_or(())?
+            .resolve(&principal)
+            .map_err(|_| ())?;
+        profile.active_device(&key).ok_or(())?;
+        Ok(())
+    }
+
     /// Admit one principal-scoped host operation and hold its lifecycle count
     /// until the returned guard drops.
     pub(crate) fn begin_host_operation(
