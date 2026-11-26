@@ -1429,6 +1429,12 @@ async fn internal_workspace_branch_lease_fixes_branch_target() {
     .unwrap();
     let uid = kernel.principal_directory.uid_for(&caller).unwrap();
     let replaced = astrid_core::PrincipalUid::from_bytes([0xEE; 32]);
+    {
+        use astrid_capsule::context::ProcessStorageMountBroker as _;
+        let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
+        assert!(broker.mount_for(&caller, replaced).await.is_err());
+        assert!(kernel.storage_mounts.is_empty());
+    }
     let denied = issue_bound_lease(
         &kernel,
         caller.clone(),
