@@ -1244,20 +1244,12 @@ pub(crate) fn build_principal_vfs_bundle(
 
     // `/tmp` remains an explicitly ephemeral native scratch mount.  It is
     // intentionally independent from the durable `home://` namespace.
-    let tmp = astrid_core::dirs::AstridHome::resolve()
-        .ok()
-        .and_then(|home| {
-            let path = home
-                .run_dir()
-                .join("principals")
-                .join(uid.to_string())
-                .join("tmp");
-            if astrid_core::platform_fs::ensure_private_directory(&path).is_ok() {
-                mount_dir_sync(&path)
-            } else {
-                None
-            }
-        });
+    let path = store.principal_tmp_dir(uid);
+    let tmp = if astrid_core::platform_fs::ensure_private_directory(&path).is_ok() {
+        mount_dir_sync(&path)
+    } else {
+        None
+    };
     PrincipalVfsBundle { home, tmp }
 }
 

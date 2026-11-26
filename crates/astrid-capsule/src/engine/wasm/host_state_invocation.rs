@@ -454,6 +454,18 @@ mod recv_vfs_tests {
         state.principal_store = Some(store);
         state.principal_directory = directory;
         state.install_recv_invocation_vfs(Some(&alice));
+        let scratch = astrid_home.run_dir().join("principals");
+        let alice_uid = state.principal_directory.uid_for(&alice).unwrap();
+        let alice_path = scratch.join(alice_uid.to_string()).join("tmp");
+        let tmp = state.invocation_tmp.as_ref().expect("Alice scratch mount");
+        let marker = tmp
+            .vfs
+            .open(&tmp.handle, "marker", true, true)
+            .await
+            .unwrap();
+        tmp.vfs.write(&marker, b"alice").await.unwrap();
+        tmp.vfs.close(&marker).await.unwrap();
+        assert_eq!(std::fs::read(alice_path.join("marker")).unwrap(), b"alice");
         let alice_mount = state.invocation_home.as_ref().expect("Alice mount").clone();
         assert!(matches!(
             alice_mount.location,
@@ -461,6 +473,12 @@ mod recv_vfs_tests {
         ));
 
         state.install_recv_invocation_vfs(Some(&bob));
+        let bob_uid = state.principal_directory.uid_for(&bob).unwrap();
+        let bob_path = scratch.join(bob_uid.to_string()).join("tmp");
+        let tmp = state.invocation_tmp.as_ref().expect("Bob scratch mount");
+        assert_ne!(alice_path, bob_path);
+        assert!(bob_path.is_dir());
+        assert!(!tmp.vfs.exists(&tmp.handle, "marker").await.unwrap());
         let bob_mount = state.invocation_home.as_ref().expect("Bob mount").clone();
         assert!(matches!(
             bob_mount.location,
