@@ -75,7 +75,8 @@ pub struct StorageMountLeaseV1 {
     pub callback_path: PathBuf,
     /// Random bearer secret used only on the private callback endpoint.
     pub lease_token: String,
-    /// Unix epoch second after which callbacks fail closed.
+    /// Current Unix expiry cutoff. Idle expiry or revocation can close the
+    /// lease earlier, and successful renewal can move this cutoff.
     pub expires_at_epoch_secs: u64,
 }
 
