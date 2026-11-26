@@ -22,23 +22,28 @@ of `AdminRequestKind`. The table lists the methods to account for at the
 effect boundary. A read also has an effect when data leaves its owner's
 domain. The authority for a response must cover its recipient.
 
-| Effect family | Request variants | Target or state the proof must bind |
-| --- | --- | --- |
-| Package publication and recovery | `BeginCapsuleInstallBatch`, `InstallCapsule`, `FinishCapsuleInstallBatch`, `GetInstalledCapsuleIdentity`, `GetCapsuleInstallResumeReceipt`, `PutCapsuleInstallResumeReceipt` | Owner UID, archive digest, installed generation, batch member and durable receipt |
-| Runtime lifecycle | `ReloadCapsules`, `ReloadCapsule`, `UnloadCapsule`, `RemoveCapsule` | Captured runtime generation and owner, including optional state purge |
-| Workspace changes | `PromoteWorkspace`, `RollbackWorkspace` | Workspace owner, source generation and resulting directory state |
-| Runtime visibility | `ListCapsules`, `GetCommands`, `GetCapsuleMetadata`, `GetCapsuleMetadataForPrincipal`, `GetAgentReadiness` | Caller-visible runtime set and recipient of the response |
-| Daemon operations | `Shutdown`, `GetStatus`, `ApproveCapability` | Daemon shutdown, status recipient or exact pending approval |
-| Principal management | `AgentCreate`, `AgentDelete`, `AgentEnable`, `AgentDisable`, `AgentList`, `AgentModify`, `UserPrincipalList`, `UserPrincipalClaim` | Principal alias and UID, source and target of inheritance, ownership and retirement |
-| Quota and usage | `QuotaUserList`, `QuotaAssignUser`, `QuotaSet`, `QuotaGet`, `UsageGet` | Resource ledger owner and assigned user |
-| Environment and secrets | `EnvSet`, `EnvSetIfAbsent`, `EnvList`, `EnvDelete` | Owner, capsule, key, kind and visibility of returned data |
-| Distribution policy | `DistroLockGet`, `DistroLockSet`, `DistroSelfGrant` | Lock owner, desired distribution and policy revision |
-| Groups and capability profiles | `GroupCreate`, `GroupDelete`, `GroupModify`, `GroupList`, `CapsGrant`, `CapsRevoke` | Group definition, affected principal and capability pattern |
-| Capability tokens | `CapsTokenMint`, `CapsTokenRevoke`, `CapsTokenList` | Token owner, audience, scope and durable grant state |
-| Enrollment | `InviteIssue`, `InviteRedeem`, `InviteList`, `InviteRevoke` | Invitation owner, redemption input and durable consumption |
-| Device pairing | `PairDeviceIssue`, `PairDeviceRedeem`, `PairDeviceList`, `PairDeviceRevoke` | Issuing principal and registration, requested child scope, redeemed credential or revoked registration |
-| Audit | `AuditStats`, `AuditPrune`, `AuditHealth`, `AuditHeads`, `AuditExport`, `AuditAnchorMark`, `AuditAnchorStatus` | Selected chains, exported entries, prune boundary and anchor |
-| Storage mounts | `StorageMountIssue`, `StorageMountStatus`, `StorageMountSync`, `StorageMountRevoke` | Mount owner, mount identity, sync target and revocation state |
+| Subscriber | Effect family | Request variants | Target or state the proof must bind |
+| --- | --- | --- | --- |
+| Kernel | Package publication and recovery | `BeginCapsuleInstallBatch`, `InstallCapsule`, `FinishCapsuleInstallBatch`, `GetInstalledCapsuleIdentity`, `GetCapsuleInstallResumeReceipt`, `PutCapsuleInstallResumeReceipt` | Owner UID, archive digest, installed generation, batch member and durable receipt |
+| Kernel | Runtime lifecycle | `ReloadCapsules`, `ReloadCapsule`, `UnloadCapsule`, `RemoveCapsule` | Captured runtime generation and owner, including optional state purge |
+| Kernel | Workspace changes | `PromoteWorkspace`, `RollbackWorkspace` | Workspace owner, source generation and resulting directory state |
+| Kernel | Runtime visibility | `ListCapsules`, `GetCommands`, `GetCapsuleMetadata`, `GetCapsuleMetadataForPrincipal`, `GetAgentReadiness` | Caller-visible runtime set and recipient of the response |
+| Kernel | Daemon operations | `Shutdown`, `GetStatus`, `ApproveCapability` | Daemon shutdown, status recipient or exact pending approval |
+| Admin | Principal management | `AgentCreate`, `AgentDelete`, `AgentEnable`, `AgentDisable`, `AgentList`, `AgentModify`, `UserPrincipalList`, `UserPrincipalClaim` | Principal alias and UID, source and target of inheritance, ownership and retirement |
+| Admin | Quota and usage | `QuotaUserList`, `QuotaAssignUser`, `QuotaSet`, `QuotaGet`, `UsageGet` | Resource ledger owner and assigned user |
+| Admin | Environment and secrets | `EnvSet`, `EnvSetIfAbsent`, `EnvList`, `EnvDelete` | Owner, capsule, key, kind and visibility of returned data |
+| Admin | Distribution policy | `DistroLockGet`, `DistroLockSet`, `DistroSelfGrant` | Lock owner, desired distribution and policy revision |
+| Admin | Groups and capability profiles | `GroupCreate`, `GroupDelete`, `GroupModify`, `GroupList`, `CapsGrant`, `CapsRevoke` | Group definition, affected principal and capability pattern |
+| Admin | Capability tokens | `CapsTokenMint`, `CapsTokenRevoke`, `CapsTokenList` | Token owner, audience, scope and durable grant state |
+| Admin | Enrollment | `InviteIssue`, `InviteRedeem`, `InviteList`, `InviteRevoke` | Invitation owner, redemption input and durable consumption |
+| Admin | Device pairing | `PairDeviceIssue`, `PairDeviceRedeem`, `PairDeviceList`, `PairDeviceRevoke` | Issuing principal and registration, requested child scope, redeemed credential or revoked registration |
+| Admin | Audit | `AuditStats`, `AuditPrune`, `AuditHealth`, `AuditHeads`, `AuditExport`, `AuditAnchorMark`, `AuditAnchorStatus` | Selected chains, exported entries, prune boundary and anchor |
+| Admin | Storage mounts | `StorageMountIssue`, `StorageMountStatus`, `StorageMountSync`, `StorageMountRevoke` | Mount owner, mount identity, sync target and revocation state |
+
+The `hosted_management_inventory` integration test reads the supported method
+names from both production Serde decoders and compares each subscriber with
+the table. Each method occurs once and has a target obligation. This checks
+wire coverage; the handler and sink refinement obligations are tracked separately.
 
 Two wire paths branch before enum decoding. On the request subscriber,
 `projection_names::try_handle` recognizes `ProjectionNameDiagnosticV1`
