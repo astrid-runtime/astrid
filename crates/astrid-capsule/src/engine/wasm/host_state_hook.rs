@@ -51,6 +51,7 @@ impl HostState {
             store_meter,
             principal: astrid_core::PrincipalId::default(),
             system_runtime: false,
+            runtime_owner_uid: None,
             capsule_uuid: uuid::Uuid::new_v4(),
             caller_context: None,
             interceptor_active: false,

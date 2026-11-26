@@ -58,10 +58,17 @@ impl HostState {
             )));
         }
         if let crate::registry::RuntimeScope::Principal(uid) = runtime_id.key().scope() {
+            if self.runtime_owner_uid.is_some_and(|owner| owner != uid) {
+                return Err(crate::error::CapsuleError::ExecutionFailed(
+                    "runtime UID differs from the loaded owner".into(),
+                ));
+            }
+            self.runtime_owner_uid = Some(uid);
             self.invocation_storage_uid = Some(uid);
         }
         self.invocation_kv = Some(self.kv.clone());
         self.invocation_home = self.home.clone();
+        self.invocation_workspace = self.workspace.clone();
         self.invocation_tmp = self.tmp.clone();
         self.invocation_secret_store = Some(Arc::clone(&self.secret_store));
         self.invocation_capsule_log = self.capsule_log.clone();
@@ -234,10 +241,14 @@ impl HostState {
             .principal
             .as_deref()
             .and_then(|p| astrid_core::PrincipalId::new(p).ok());
-        if !self.system_runtime
-            && publisher
-                .as_ref()
-                .is_some_and(|publisher| publisher != &self.principal)
+        let current_uid = publisher
+            .as_ref()
+            .and_then(|p| self.principal_directory.uid_for(p).ok());
+        if (!self.system_runtime && publisher.as_ref().is_some_and(|p| p != &self.principal))
+            || (publisher.is_some()
+                && self
+                    .runtime_owner_uid
+                    .is_some_and(|owner| Some(owner) != current_uid))
         {
             self.caller_context = Some(msg.clone());
             self.invocation_profile_authorized = false;
@@ -268,9 +279,6 @@ impl HostState {
             .caller_context
             .as_ref()
             .and_then(|c| c.principal.clone());
-        let current_uid = publisher
-            .as_ref()
-            .and_then(|p| self.principal_directory.uid_for(p).ok());
         if new_principal == existing_principal
             && self.invocation_profile_authorized
             && current_uid == self.invocation_storage_uid
@@ -377,7 +385,8 @@ impl HostState {
         let uid = if has_publisher {
             self.invocation_storage_uid
         } else {
-            self.principal_directory.uid_for(&self.principal).ok()
+            self.runtime_owner_uid
+                .or_else(|| self.principal_directory.uid_for(&self.principal).ok())
         }?;
         self.load_invocation_env_overlay(uid)
     }
@@ -426,7 +435,7 @@ mod recv_vfs_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn recv_vfs_switches_principals_and_clears_without_one() {
         use astrid_storage::{
             IdentityStore, KvIdentityStore, KvQuotaResolver, ScopedKvStore, StateOwner,
@@ -468,6 +477,15 @@ mod recv_vfs_tests {
         let mut state = crate::engine::wasm::test_fixtures::minimal_host_state(
             tokio::runtime::Handle::current(),
         );
+        use crate::engine::wasm::{WorkspaceBranchResolver, native_logs};
+        let log_root = native_logs::NativeLogRoot::capture(&astrid_home).unwrap();
+        state.deferred_logs =
+            native_logs::DeferredBindings::for_factory(Some(Arc::new(log_root)), None);
+        let branches =
+            crate::context::WorkspaceBranchService::new(store.clone(), directory.clone());
+        state.workspace_mount_resolver =
+            Some(Arc::new(WorkspaceBranchResolver(Arc::new(branches))));
+        state.workspace = crate::engine::wasm::mount_dir_sync(root.path());
         state.principal_store = Some(store);
         state.principal_directory = directory;
         assert!(crate::engine::wasm::install_principal_overlays_sync(
@@ -486,6 +504,18 @@ mod recv_vfs_tests {
             .register(alice.clone(), replacement)
             .unwrap();
         state.install_recv_invocation_vfs(Some(&alice));
+        assert!(state.effective_workspace().is_none());
+        let env = astrid_storage::env::principal_env_store(
+            state.kv_backend.clone(),
+            alice_uid,
+            state.capsule_id.as_str(),
+        )
+        .unwrap();
+        astrid_storage::env::set_env(&env, "OWNER", "original")
+            .await
+            .unwrap();
+        let overlay = state.recv_env_overlay(true).unwrap();
+        assert_eq!(overlay.get("OWNER").map(String::as_str), Some("original"));
         let scratch = astrid_home.runtime_principal_scratch_root();
         let alice_path = scratch.join(alice_uid.to_string()).join("tmp");
         let tmp = state.invocation_tmp.as_ref().expect("Alice scratch mount");
@@ -521,6 +551,20 @@ mod recv_vfs_tests {
             crate::engine::wasm::host_state::PrincipalMountLocation::AstridFilesystem
         ));
         assert_ne!(alice_mount.handle, bob_mount.handle);
+
+        // A typed runtime cannot admit the new owner of its original alias.
+        state.principal = alice.clone();
+        state.runtime_owner_uid = Some(alice_uid);
+        let message = astrid_events::ipc::IpcMessage::new(
+            astrid_events::ipc::Topic::from_raw("some.v1.event"),
+            astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
+            uuid::Uuid::new_v4(),
+        )
+        .with_principal(alice.to_string());
+        state.install_recv_invocation_context(&message);
+        assert!(!state.invocation_profile_authorized);
+        assert!(state.begin_host_operation().is_err());
+        assert!(state.invocation_storage_uid.is_none());
 
         state.install_recv_invocation_vfs(None);
         assert!(state.invocation_home.is_none());

@@ -274,6 +274,8 @@ pub struct HostState {
     /// Explicit kernel-service scope. When false, every long-lived IPC route
     /// is restricted to `principal`; default-principal is still a principal.
     pub system_runtime: bool,
+    /// Immutable owner of a kernel-reserved principal runtime.
+    pub(crate) runtime_owner_uid: Option<astrid_core::PrincipalUid>,
     /// The plugin this state belongs to.
     pub capsule_id: CapsuleId,
     /// Per-capsule native operational log under

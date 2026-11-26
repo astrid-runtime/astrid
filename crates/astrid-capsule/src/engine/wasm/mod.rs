@@ -1402,9 +1402,19 @@ fn install_principal_overlays_sync(
     // Secrets use a separate host-only control namespace. Never build the
     // SecretStore over the guest's ordinary `{principal}:capsule:*` view:
     // that would let a capsule enumerate or forge its own control keys.
-    let principal_uid = match state.principal_directory.uid_for(p) {
+    let principal_uid = match state.principal_directory.uid_for(p).and_then(|uid| {
+        if state.runtime_owner_uid.is_some_and(|owner| owner != uid) {
+            return Err(astrid_storage::StorageError::InvalidKey(
+                "invocation alias no longer belongs to the runtime owner".into(),
+            ));
+        }
+        Ok(uid)
+    }) {
         Ok(uid) => uid,
         Err(error) => {
+            if state.runtime_owner_uid.is_some() {
+                state.invocation_profile_authorized = false;
+            }
             tracing::warn!(
                 principal = %p,
                 error = %error,
@@ -2319,6 +2329,7 @@ impl ExecutionEngine for WasmEngine {
                 ),
                 principal: st_principal.clone(),
                 system_runtime: st_system_runtime,
+                runtime_owner_uid: native_owner_uid,
                 capsule_uuid,
                 caller_context: None,
                 interceptor_active: false,
@@ -3436,7 +3447,9 @@ impl ExecutionEngine for WasmEngine {
                 let env_uid = if invocation_principal.is_some() {
                     state.invocation_storage_uid
                 } else {
-                    state.principal_directory.uid_for(&invoking_principal).ok()
+                    state
+                        .runtime_owner_uid
+                        .or_else(|| state.principal_directory.uid_for(&invoking_principal).ok())
                 };
                 state.invocation_env_overlay = match env_uid {
                     Some(uid) => {
@@ -3727,6 +3740,7 @@ async fn build_lifecycle_host_state(
         resource_table: wasmtime::component::ResourceTable::new(),
         principal: principal.clone(),
         system_runtime: false,
+        runtime_owner_uid: None,
         capsule_uuid: uuid::Uuid::new_v4(),
         caller_context: None,
         interceptor_active: false,
