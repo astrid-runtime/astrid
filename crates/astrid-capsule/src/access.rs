@@ -311,7 +311,7 @@ impl CapsuleAccessResolver {
                         return None;
                     },
                 };
-                let Some(device) = profile.auth.device_by_typed_key_id(&key_id) else {
+                let Some(device) = profile.active_device(&key_id) else {
                     warn!(
                         security_event = true,
                         principal = %pid,

@@ -51,7 +51,7 @@ pub(super) fn resolve_device<'a>(
             });
         },
     };
-    let Some(device) = profile.auth.device_by_typed_key_id(&key_id) else {
+    let Some(device) = profile.active_device(&key_id) else {
         warn!(
             security_event = true,
             principal = %caller,
@@ -77,6 +77,10 @@ mod tests {
         let first = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
         let second = DeviceKey::new("b".repeat(64), DeviceScope::Full, None, 0);
         let mut profile = PrincipalProfile::default();
+        profile
+            .auth
+            .methods
+            .push(astrid_core::profile::AuthMethod::Keypair);
         profile.auth.public_keys = vec![first.clone(), second.clone()];
         let resolved = resolve_device(&profile, &caller, Some(&second.key_id), "agent:create")
             .unwrap()

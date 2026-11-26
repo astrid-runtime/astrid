@@ -56,6 +56,10 @@ async fn delegate_device(kernel: &Kernel, user: UserUid) -> String {
     let mut profile = PrincipalProfile::load_from_path(&path).unwrap();
     let device = DeviceKey::new("ab".repeat(32), DeviceScope::Full, None, 1);
     let id = device.key_id.clone();
+    profile
+        .auth
+        .methods
+        .push(astrid_core::profile::AuthMethod::Keypair);
     profile.auth.public_keys.push(device);
     profile.save_to_path(&path).unwrap();
     kernel.profile_cache.invalidate(&caller);
