@@ -492,29 +492,37 @@ impl ipc::Host for HostState {
         let bytes = payload.len() as u64;
         let topic_for_audit = topic.clone();
         let authority = self.ingress_socket.clone();
-        match &authority {
-            Some(socket)
-                if socket.identity.principal.as_str() == effective.as_str()
-                    && socket.identity.device_key_id == device_key_id
-                    && Some(socket.identity.request_owner) == request_owner => {},
-            None if device_key_id.is_none() => {},
-            _ => return Err(ErrorCode::CapabilityDenied),
-        }
-        let publication = publish_inner(
-            self,
-            topic,
-            payload,
-            effective,
+        let guard = super::net::publication_guard(
+            authority.as_ref().map(|socket| {
+                (
+                    socket,
+                    socket.identity.principal.as_str(),
+                    socket.identity.device_key_id.as_deref(),
+                    socket.identity.request_owner.as_u128(),
+                )
+            }),
+            effective.as_str(),
             device_key_id.as_deref(),
-            request_owner,
-            origin,
+            request_owner.map(astrid_events::ipc::RequestOwnerId::as_u128),
         );
-        let result = match authority {
-            Some(authority) => authority
-                .run(publication)
-                .await
-                .unwrap_or(Err(ErrorCode::CapabilityDenied)),
-            None => publication.await,
+        let result = {
+            let publication = publish_inner(
+                self,
+                topic,
+                payload,
+                effective,
+                device_key_id.as_deref(),
+                request_owner,
+                origin,
+            );
+            match guard {
+                super::net::PublicationGuard::Denied => Err(ErrorCode::CapabilityDenied),
+                super::net::PublicationGuard::Signed(authority) => authority
+                    .run(publication)
+                    .await
+                    .unwrap_or(Err(ErrorCode::CapabilityDenied)),
+                super::net::PublicationGuard::Unbound => publication.await,
+            }
         };
         audit_ipc(
             self,

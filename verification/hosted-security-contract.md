@@ -275,12 +275,25 @@ authenticated socket path is a separate production obligation.
 
 Both Wasmtime socket accept methods read device registrations from the
 profile home captured by the kernel cache when supplied. A signed socket test
-exercises both methods with an explicit temporary home. The accepted local
-stream lives in the Store resource table. Its framed and raw read and write
-methods acquire the stream mutex and use the Store cancellation token. The
-native device-retirement registry does not own this resource or the captured
-publication from a completed read. Proving closure here requires fencing both
-I/O and subsequent authenticated publication through device retirement.
+exercises both methods with an explicit temporary home. Each method registers
+a challenge with the kernel's device registry before issuing the nonce and bind the verified key before handshake
+success. The signed resource owns the resulting principal, key and request
+owner. Each raw or framed I/O operation holds the session while touching the
+socket. A captured frame retains forwarding authority across ordinary socket
+release. Retirement closes the transport, emits its disconnect, cancels pending
+forwards and prevents future operations on the old grant after re-pairing.
+
+The checked publication selector returns the supplied lease only for an exact
+principal, device and 128-bit request-owner match. A missing lease with a
+device stamp is denied. The unguarded branch requires both the lease and
+device stamp to be absent. The production caller dispatches the signed
+operation through that lease around bus reservation and publication. Runtime
+tests cover retirement on both WIT accept paths, sibling isolation, an active
+read, a forward blocked on I/O admission, a frame held over socket release,
+and the ordering of disconnect and acknowledgement. The concurrent argument
+still relies on the semantics of Rust futures and field destruction, Tokio
+watch and mutexes, bus publication, and OS socket close. Downstream consumption
+of work already published before retirement needs its own generation fence.
 
 | Native effect | Production path | Outstanding refinement |
 | --- | --- | --- |

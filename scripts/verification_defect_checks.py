@@ -483,6 +483,31 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             lambda text: replace_once(text, "if topic != offered_topic", "if false"),
         ),
         (
+            "device-stamped forward without a session takes the unguarded path",
+            INGRESS_FRAME,
+            lambda text: replace_once(text, "return if key.is_none()", "return if true"),
+        ),
+        (
+            "signed forward ignores the captured device",
+            INGRESS_FRAME,
+            lambda text: replace_once(text, "if a != b || peer != principal", "if peer != principal"),
+        ),
+        (
+            "signed forward ignores the captured principal",
+            INGRESS_FRAME,
+            lambda text: replace_once(text, "if a != b || peer != principal", "if a != b"),
+        ),
+        (
+            "signed forward ignores the connection generation",
+            INGRESS_FRAME,
+            lambda text: replace_once(text, "|| owner != Some(connection) { return", "{ return"),
+        ),
+        (
+            "matching signed forward skips the lease",
+            INGRESS_FRAME,
+            lambda text: replace_once(text, "    PublicationGuard::Signed(lease)\n}", "    PublicationGuard::Unbound\n}"),
+        ),
+        (
             "authenticated forward ignores payload",
             INGRESS_FRAME,
             lambda text: replace_once(text, "if body != offered_body", "if false"),
