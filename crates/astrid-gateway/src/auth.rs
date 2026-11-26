@@ -87,6 +87,8 @@ pub struct CallerContext {
 
 impl CallerContext {
     /// Bind a gateway-originated publication to this authenticated bearer.
+    /// Downstream capability checks use the device and transport origin, and
+    /// interactive replies use the request owner to reach the issuing client.
     pub(crate) fn stamp_ipc(&self, mut message: IpcMessage) -> IpcMessage {
         message.device_key_id.clone_from(&self.device_key_id);
         message

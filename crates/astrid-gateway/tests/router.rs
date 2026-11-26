@@ -90,6 +90,42 @@ fn fresh_state_with_distro(distro: Option<&str>) -> Arc<GatewayState> {
     })
 }
 
+#[tokio::test]
+async fn prompt_publishes_the_verified_bearer_identity() {
+    let mut state = fresh_state_with_distro(None);
+    let bus = Arc::new(astrid_events::EventBus::new());
+    Arc::get_mut(&mut state).unwrap().event_bus = Some(bus.clone());
+    let mut prompts = bus.subscribe_topic(astrid_events::ipc::Topic::user_prompt().as_str());
+    let principal = PrincipalId::new("prompt-owner").unwrap();
+    let bearer = mint_bearer_scoped(&state.signing.signer, &principal, "0123456789abcdef", 600);
+    let caller = verify_bearer(&state, &bearer).unwrap();
+    let response = routes::build(state)
+        .oneshot(
+            Request::post("/api/agent/prompt")
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"text":"hello"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), prompts.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let astrid_events::AstridEvent::Ipc { message, .. } = &*event else {
+        panic!("expected prompt")
+    };
+    assert_eq!(message.principal.as_deref(), Some(principal.as_str()));
+    assert_eq!(message.device_key_id, caller.device_key_id);
+    assert_eq!(message.request_owner, Some(caller.request_owner));
+    assert_eq!(
+        message.origin,
+        astrid_events::ipc::MessageOrigin::RemoteGateway
+    );
+}
+
 fn fresh_state_with_audit_log() -> (Arc<GatewayState>, Arc<AuditLog>, SessionId) {
     let session_id = SessionId::from_uuid(uuid::Uuid::new_v4());
     let audit_log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
