@@ -520,3 +520,40 @@ async fn quiescence_wait_registers_before_sampling_active_operations() {
         .expect("registered notification must wake quiescence")
         .expect("quiescence task should join");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guest_kv_requires_the_publishing_device_to_still_be_active() {
+    use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope, PrincipalProfile};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(tmp.path());
+    let principal = alice();
+    let device = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+    let mut profile = PrincipalProfile::default();
+    profile.auth.methods.push(AuthMethod::Keypair);
+    profile.auth.public_keys.push(device.clone());
+    profile.save(&home, &principal).unwrap();
+    let cache = Arc::new(crate::profile_cache::PrincipalProfileCache::with_home(
+        home.clone(),
+    ));
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.profile_cache = Some(cache.clone());
+    state.invocation_kv = Some(state.kv.clone());
+    state.caller_context = Some(msg_from(&principal).with_device_key_id(device.key_id));
+    KvHost::kv_set(&mut state, "saved".into(), vec![1]).unwrap();
+    profile.auth.public_keys.clear();
+    profile.save(&home, &principal).unwrap();
+    cache.invalidate(&principal);
+    assert!(KvHost::kv_get(&mut state, "saved".into()).is_err());
+    assert!(KvHost::kv_set(&mut state, "saved".into(), vec![2]).is_err());
+    assert!(KvHost::kv_delete(&mut state, "saved".into()).is_err());
+    assert!(KvHost::kv_list_keys(&mut state, String::new()).is_err());
+    assert!(KvHost::kv_list_keys_page(&mut state, String::new(), None, 10).is_err());
+    assert!(KvHost::kv_clear_prefix(&mut state, String::new()).is_err());
+    assert!(KvHost::kv_cas(&mut state, "saved".into(), Some(vec![1]), vec![2]).is_err());
+    state.caller_context = Some(msg_from(&principal));
+    assert_eq!(
+        KvHost::kv_get(&mut state, "saved".into()).unwrap(),
+        Some(vec![1])
+    );
+}
