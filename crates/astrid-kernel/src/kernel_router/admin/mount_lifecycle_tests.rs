@@ -21,7 +21,7 @@ async fn issue(
     .await
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disabling_and_deleting_a_requester_permanently_close_its_old_leases() {
     let (dir, kernel) = fixture().await;
     let operator = PrincipalId::default();
@@ -44,6 +44,15 @@ async fn disabling_and_deleting_a_requester_permanently_close_its_old_leases() {
     let mountpoint = dir.path().join("mount");
     let first = issue(&kernel, &caller, &mountpoint).await.unwrap();
     let independent = issue(&kernel, &operator, &mountpoint).await.unwrap();
+    let (prepared, resume) = kernel.pending_mount_issues.hold_next_publication();
+    let late_issue = {
+        let kernel = Arc::clone(&kernel);
+        let caller = caller.clone();
+        let mountpoint = mountpoint.clone();
+        tokio::spawn(async move { issue(&kernel, &caller, &mountpoint).await })
+    };
+    let (resource, socket) = prepared.await.unwrap();
+    assert!(resource.join("lease.json").is_file());
     assert_success(
         &handlers::dispatch(
             &kernel,
@@ -68,6 +77,16 @@ async fn disabling_and_deleting_a_requester_permanently_close_its_old_leases() {
         )
         .await,
     );
+    resume.send(()).unwrap();
+    assert!(
+        late_issue
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("retired during issuance")
+    );
+    assert!(!resource.exists());
+    assert!(!socket.exists());
     let second = issue(&kernel, &caller, &mountpoint).await.unwrap();
     assert_ne!(first.mount_id, second.mount_id);
     assert!(!kernel.storage_mounts.contains_key(&first.mount_id));

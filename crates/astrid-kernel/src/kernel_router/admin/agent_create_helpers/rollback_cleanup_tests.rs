@@ -241,6 +241,7 @@ async fn rollback_fence_waits_for_an_admitted_capsule_constructor() {
     let mut fence = Box::pin(super::rollback::fence_failed_initialization(
         &kernel,
         &principal,
+        kernel.principal_directory.uid_for(&principal).ok(),
         Vec::new(),
     ));
     let mut context = Context::from_waker(Waker::noop());

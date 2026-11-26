@@ -50,7 +50,31 @@ impl StorageMountLeaseState {
 type Reservations = HashMap<StorageMountId, Reservation<Requester>>;
 
 #[derive(Default)]
-pub(crate) struct PendingMountIssues(Mutex<Reservations>);
+pub(crate) struct PendingMountIssues(
+    Mutex<Reservations>,
+    #[cfg(test)] Mutex<Option<PublicationPause>>,
+);
+
+#[cfg(test)]
+struct PublicationPause {
+    prepared: tokio::sync::oneshot::Sender<(std::path::PathBuf, std::path::PathBuf)>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl PendingMountIssues {
+    pub(crate) fn hold_next_publication(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<(std::path::PathBuf, std::path::PathBuf)>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (prepared, received) = tokio::sync::oneshot::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        *self.1.lock().unwrap() = Some(PublicationPause { prepared, resume });
+        (received, release)
+    }
+}
 
 impl PendingMountIssues {
     fn lock(&self) -> std::sync::MutexGuard<'_, Reservations> {
@@ -96,7 +120,28 @@ impl<'a> Issue<'a> {
         Ok(Self { issues, id })
     }
 
-    pub(super) fn publish(self, install: impl FnOnce()) -> bool {
+    pub(super) fn install(self, kernel: &Kernel, state: &Arc<StorageMountLeaseState>) -> bool {
+        #[cfg(test)]
+        {
+            let pause = self.issues.1.lock().unwrap().take();
+            if let Some(pause) = pause {
+                let _ = pause
+                    .prepared
+                    .send((state.resource_path.clone(), state.callback_path.clone()));
+                pause
+                    .resume
+                    .recv_timeout(std::time::Duration::from_secs(20))
+                    .expect("test must release prepared listener");
+            }
+        }
+        self.publish(|| {
+            kernel
+                .storage_mounts
+                .insert(state.mount_id, Arc::clone(state));
+        })
+    }
+
+    fn publish(self, install: impl FnOnce()) -> bool {
         let mut pending = self.issues.lock();
         if !pending
             .get_mut(&self.id)
