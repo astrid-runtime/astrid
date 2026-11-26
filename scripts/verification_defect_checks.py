@@ -45,7 +45,9 @@ NATIVE_RECIPIENT = Path("crates/astrid-uplink/src/native/recipient.rs")
 NATIVE_QUEUE = Path("crates/astrid-uplink/src/native/delivery_queue.rs")
 NATIVE_REPLY = Path("crates/astrid-uplink/src/native/reply_claim.rs")
 NATIVE_FRAME = Path("crates/astrid-uplink/src/native/frame_segments.rs")
+DEVICE_SESSIONS = Path("crates/astrid-core/src/profile/device_sessions/phase.rs")
 INPUTS = [
+    DEVICE_SESSIONS,
     NATIVE_FRAME,
     NATIVE_REPLY,
     NATIVE_QUEUE,
@@ -350,6 +352,51 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "egress consent accepts a different request owner",
             CONSENT_IDENTITY,
             lambda text: replace_once(text, "Some(actual) => actual == owner", "Some(actual) => true"),
+        ),
+        (
+            "retired challenge accepts its removed key",
+            DEVICE_SESSIONS,
+            lambda text: replace_once(text, "if retired.contains(&key) { return false; }", "if false { return false; }"),
+        ),
+        (
+            "foreign principal is retired",
+            DEVICE_SESSIONS,
+            lambda text: replace_once(text, "if owner != requested { return false; }", "if false { return false; }"),
+        ),
+        (
+            "retirement omits the pending challenge exclusion",
+            DEVICE_SESSIONS,
+            lambda text: replace_once(text, "keys.insert(key.to_owned()); false", "false"),
+        ),
+        (
+            "retirement drains the wrong serving device",
+            DEVICE_SESSIONS,
+            lambda text: replace_once(text, "bound.as_str() == key", "bound.as_str() != key"),
+        ),
+        (
+            "registry never visits its last session",
+            DEVICE_SESSIONS,
+            lambda text: replace_once(text, "while i < entries.len()", "while i < entries.len() && entries.len() - i > 1"),
+        ),
+        (
+            "registry substitutes the first drain slot",
+            DEVICE_SESSIONS,
+            lambda text: replace_once(text, "drains.push(i);", "drains.push(0);"),
+        ),
+        (
+            "acknowledgement skips the first registered device session",
+            DEVICE_SESSIONS,
+            lambda text: replace_once(text, "signals, confirmed: 0", "signals, confirmed: 1"),
+        ),
+        (
+            "retirement confirms a socket whose receiver is still live",
+            DEVICE_SESSIONS,
+            lambda text: replace_once(text, "if !closed(signal) { return false; }", "if false { return false; }"),
+        ),
+        (
+            "device retirement captures another registration's channel",
+            DEVICE_SESSIONS,
+            lambda text: replace_once(text, "capture(&entries[slot].signal)", "capture(&entries[0].signal)"),
         ),
         (
             "disabled profile supplies device keys",

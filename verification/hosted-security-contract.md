@@ -190,8 +190,8 @@ Its checked transition permits one live claim for the registered owner.
 Cancellation restores availability, and successful completion spends the
 claim before removal. Repeated delivery of an outstanding request keeps its
 phase. The map operations, mutex, delivery reservation, and operating system
-socket identity remain refinement obligations. In particular, queue closure
-on overflow does not establish closure on device or principal revocation.
+socket identity remain refinement obligations. The registry and transport
+have separate closure conditions.
 
 The handshake and established connection writers both use `framing::write_frame`.
 The checked header constructor rejects lengths above the four-byte wire limit
@@ -205,6 +205,33 @@ flushes once all bytes have been accepted. These proofs cover selection and
 advancement. Serialization, the driver's control flow,
 Tokio's reported count, the OS peer binding and what the peer actually receives
 are outside these theorems. Cancellation can leave a prefix at the peer.
+
+### Paired-device removal on the native daemon
+
+The daemon passes its kernel's `DeviceSessions` to the native listener. The
+listener registers a challenge before sending the nonce and binds the key that
+verified the signature before sending success. Device removal saves the profile
+and invalidates its cache before retiring sessions. Registration, binding and
+selection of channels to drain use the same registry mutex.
+
+For the actual registry slice supplied to `retire_and_capture`, Verus checks
+that each pending challenge owned by the removed principal excludes exactly
+the keys excluded before plus the removed key. A challenge for another
+principal retains its exclusions. Binding a previously excluded key fails.
+An established entry retains its owner, bound key and channel. The capture
+callback receives the channel of each established entry matching both
+principal and key, once per entry. The batch cursor exposes successive
+captured handles. It advances only on an affirmative observation of closure
+for the current handle and reports exhaustion after all handles have advanced.
+
+The Rust adapter signals and clones the selected Tokio senders while holding
+the mutex. After releasing it, the adapter awaits receiver closure and checks
+`is_closed` on each selected sender. The kernel returns its acknowledgement
+after successful retirement. The proof assumes the hash-set library contracts.
+Composition with the mutex, Tokio channel identity, scheduling, drop order,
+profile persistence and the kernel response path still requires refinement.
+Previously accepted OS bytes may arrive after local retirement. Whole-principal
+deletion, alias reuse and Wasmtime socket resources have separate obligations.
 
 | Native effect | Production path | Outstanding refinement |
 | --- | --- | --- |

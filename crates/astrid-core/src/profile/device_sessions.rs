@@ -1,9 +1,11 @@
 //! Lifetime of signed device sessions served by the local daemon.
 
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::watch;
+
+mod phase;
+use phase::{DrainBatch, Entry, Phase};
 
 use super::DeviceKeyId;
 use crate::PrincipalId;
@@ -21,21 +23,7 @@ pub enum DeviceSessionError {
 
 /// Shared by the signed handshake and the device-revocation handler.
 #[derive(Clone, Default, Debug)]
-pub struct DeviceSessions(Arc<Mutex<Vec<Entry>>>);
-
-#[derive(Debug)]
-struct Entry {
-    principal: PrincipalId,
-    phase: Phase,
-    signal: watch::Sender<bool>,
-}
-
-#[derive(Debug)]
-enum Phase {
-    /// Keys removed while this challenge was outstanding.
-    Challenge(HashSet<DeviceKeyId>),
-    Serving(DeviceKeyId),
-}
+pub struct DeviceSessions(Arc<Mutex<Vec<Entry<watch::Sender<bool>>>>>);
 
 /// A challenge registered before its nonce is sent.
 pub struct DeviceChallenge {
@@ -58,8 +46,8 @@ impl DeviceSessions {
         let mut entries = self.0.lock().map_err(|_| DeviceSessionError::Unavailable)?;
         entries.retain(|entry| !entry.signal.is_closed());
         entries.push(Entry {
-            principal,
-            phase: Phase::Challenge(HashSet::new()),
+            owner: principal.into_inner(),
+            phase: Phase::challenge(),
             signal: signal.clone(),
         });
         Ok(DeviceChallenge {
@@ -82,23 +70,17 @@ impl DeviceSessions {
         let drains = {
             let mut entries = self.0.lock().map_err(|_| DeviceSessionError::Unavailable)?;
             entries.retain(|entry| !entry.signal.is_closed());
-            let mut drains = Vec::new();
-            for entry in entries.iter_mut().filter(|e| &e.principal == principal) {
-                match &mut entry.phase {
-                    Phase::Challenge(keys) => {
-                        keys.insert(key.clone());
-                    },
-                    Phase::Serving(bound) if bound.as_str() == key.as_str() => {
-                        entry.signal.send_replace(true);
-                        drains.push(entry.signal.clone());
-                    },
-                    Phase::Serving(_) => {},
-                }
-            }
-            drains
+            phase::retire_and_capture(&mut entries, principal.as_str(), key.as_str(), |signal| {
+                signal.send_replace(true);
+                signal.clone()
+            })
         };
-        for signal in drains {
+        let mut batch = DrainBatch::new(drains);
+        while let Some(signal) = batch.pending() {
             signal.closed().await;
+            if !batch.confirm(watch::Sender::is_closed) {
+                return Err(DeviceSessionError::Unavailable);
+            }
         }
         Ok(())
     }
@@ -120,10 +102,7 @@ impl DeviceChallenge {
             .iter_mut()
             .find(|e| self.signal.same_channel(&e.signal))
             .ok_or(DeviceSessionError::Unavailable)?;
-        if let Phase::Challenge(retired) = &entry.phase
-            && !retired.contains(&key)
-        {
-            entry.phase = Phase::Serving(key);
+        if entry.phase.bind(key.into_inner()) {
             return Ok(DeviceSession(self.receiver));
         }
         Err(DeviceSessionError::Retired)
