@@ -9,6 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use crate::engine::wasm::host_state::HostState;
+use crate::engine::wasm::mount_selection::VfsTarget;
 
 /// URI scheme prefix for the principal's home directory.
 pub(super) const HOME_SCHEME: &str = "home://";
@@ -98,14 +99,6 @@ pub(super) fn resolve_physical_absolute(
         physical: joined,
         canonical_root,
     })
-}
-
-/// Which VFS target a resolved path points at.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum VfsTarget {
-    Workspace,
-    Home,
-    Tmp,
 }
 
 /// Phase-1 resolution: physical path for the security gate + VFS-relative
@@ -269,36 +262,75 @@ pub(super) fn resolve_vfs(
     state: &HostState,
     resolved: &ResolvedPath,
 ) -> Result<ResolvedVfsPath, String> {
-    let (vfs, handle) = match resolved.target {
-        VfsTarget::Home => {
-            let m = state
-                .effective_home()
-                .ok_or_else(|| "home:// VFS is not mounted".to_string())?;
-            (m.vfs.clone(), m.handle.clone())
-        },
-        VfsTarget::Tmp => {
-            let m = state
-                .effective_tmp()
-                .ok_or_else(|| "/tmp VFS is not mounted".to_string())?;
-            (m.vfs.clone(), m.handle.clone())
-        },
-        VfsTarget::Workspace => {
-            let mount = state
-                .effective_workspace()
-                .ok_or_else(|| "workspace VFS is not mounted".to_owned())?;
-            (mount.vfs.clone(), mount.handle.clone())
-        },
-    };
+    let (mount, relative) = resolved
+        .target
+        .bind(
+            &resolved.relative,
+            state.effective_workspace(),
+            state.effective_home(),
+            state.effective_tmp(),
+        )
+        .ok_or_else(|| match resolved.target {
+            VfsTarget::Home => "home:// VFS is not mounted".to_owned(),
+            VfsTarget::Tmp => "/tmp VFS is not mounted".to_owned(),
+            VfsTarget::Workspace => "workspace VFS is not mounted".to_owned(),
+        })?;
     Ok(ResolvedVfsPath {
-        relative: resolved.relative.clone(),
-        vfs,
-        handle,
+        relative: relative.clone(),
+        vfs: mount.vfs.clone(),
+        handle: mount.handle.clone(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_reads_use_the_selected_mount_and_its_registered_handle() {
+        use crate::engine::wasm::bindings::astrid::fs::host::Host;
+        use crate::engine::wasm::host_state::{PrincipalMount, PrincipalMountLocation};
+        use crate::engine::wasm::test_fixtures::minimal_host_state;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mount = |name: &str| {
+            let root = directory.path().join(name);
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("marker"), name).unwrap();
+            let handle = astrid_capabilities::DirHandle::new();
+            PrincipalMount {
+                vfs: Arc::new(
+                    astrid_vfs::HostVfs::with_registered_dir(handle.clone(), &root).unwrap(),
+                ),
+                location: PrincipalMountLocation::Native(root),
+                handle,
+            }
+        };
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        state.workspace = Some(mount("workspace"));
+        state.home = Some(mount("home"));
+        state.tmp = Some(mount("tmp"));
+        state.invocation_workspace = Some(mount("caller-workspace"));
+        state.invocation_home = Some(mount("caller-home"));
+        state.invocation_tmp = Some(mount("caller-tmp"));
+        for prefix in ["caller-", ""] {
+            state.workspace_root = directory.path().join(format!("{prefix}workspace"));
+            for (path, target) in [
+                ("cwd://marker", "workspace"),
+                ("marker", "workspace"),
+                ("home://marker", "home"),
+                ("/tmp/marker", "tmp"),
+            ] {
+                assert_eq!(
+                    state.read_file(path.to_owned()).unwrap(),
+                    format!("{prefix}{target}").as_bytes()
+                );
+            }
+            state.invocation_workspace = None;
+            state.invocation_home = None;
+            state.invocation_tmp = None;
+        }
+    }
 
     #[test]
     fn logical_workspace_accepts_current_directory_spellings() {

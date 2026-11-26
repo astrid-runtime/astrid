@@ -54,7 +54,9 @@ REGISTERED_BEARER = Path("crates/astrid-core/src/session_token/registered_bearer
 PRIVATE_RESPONDER = Path("crates/astrid-capsule/src/elicitation/responder.rs")
 PAIR_DENIES = Path("crates/astrid-kernel/src/kernel_router/admin/pair_device_handlers/deny_patterns.rs")
 RECEIPT = Path("crates/astrid-kernel/src/kernel_router/resume_receipt/validation.rs")
+MOUNT = Path("crates/astrid-capsule/src/engine/wasm/mount_selection.rs")
 INPUTS = [
+    MOUNT,
     RECEIPT,
     PAIR_DENIES,
     PRIVATE_RESPONDER,
@@ -258,6 +260,16 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "receipt acknowledgement accepts equal length but different bytes",
             RECEIPT,
             lambda text: replace_once(text, "Some(bytes) => bytes == expected", "Some(bytes) => bytes.len() == expected.len()"),
+        ),
+        (
+            "mount selection discards the invocation override",
+            MOUNT,
+            lambda text: replace_once(text, "Some(value) => Some(value), None => runtime", "Some(_) => runtime, None => runtime"),
+        ),
+        (
+            "home file operation captures the workspace bundle",
+            MOUNT,
+            lambda text: replace_once(text, "            Self::Home => home,", "            Self::Home => workspace,"),
         ),
         (
             "wire header misstates the low byte of the body length",

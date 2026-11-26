@@ -64,6 +64,7 @@ pub mod host_state;
 #[cfg(test)]
 mod interruption_tests;
 mod invocation_failure;
+mod mount_selection;
 mod native_logs;
 mod principal_tracker;
 pub use native_logs::NativeLogRoot;

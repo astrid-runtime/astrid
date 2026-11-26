@@ -117,7 +117,10 @@ impl HostState {
     /// for principal-less work.
     #[must_use]
     pub fn effective_home(&self) -> Option<&PrincipalMount> {
-        self.invocation_home.as_ref().or(self.home.as_ref())
+        crate::engine::wasm::mount_selection::effective(
+            self.invocation_home.as_ref(),
+            self.home.as_ref(),
+        )
     }
 
     /// Return the effective tmp mount for the current invocation. Same
@@ -125,7 +128,10 @@ impl HostState {
     /// [`effective_home`](Self::effective_home).
     #[must_use]
     pub fn effective_tmp(&self) -> Option<&PrincipalMount> {
-        self.invocation_tmp.as_ref().or(self.tmp.as_ref())
+        crate::engine::wasm::mount_selection::effective(
+            self.invocation_tmp.as_ref(),
+            self.tmp.as_ref(),
+        )
     }
 
     /// Return the effective authoritative workspace branch for this call.
@@ -134,9 +140,10 @@ impl HostState {
     /// caller; principal runtimes use their load-time branch.
     #[must_use]
     pub fn effective_workspace(&self) -> Option<&PrincipalMount> {
-        self.invocation_workspace
-            .as_ref()
-            .or(self.workspace.as_ref())
+        crate::engine::wasm::mount_selection::effective(
+            self.invocation_workspace.as_ref(),
+            self.workspace.as_ref(),
+        )
     }
 
     /// Return an owned native home root when the effective mount has one.

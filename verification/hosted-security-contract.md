@@ -73,6 +73,21 @@ the addressed key, and on serialization, principal lifecycle locking and
 recovery. Digest syntax alone establishes no relationship with installed
 archive contents.
 
+## Guest filesystem mount selection
+
+For each of the workspace, home and temporary mounts, the checked selector
+returns the invocation's mount when present, otherwise the runtime's mount.
+The checked VFS binding returns the selected bundle and the supplied relative
+path together. A missing selected mount fails even if a sibling is present.
+The production adapter takes the VFS instance and directory handle from that
+one bundle. A WIT host regression reads distinct file contents from six real
+mounts using the same relative filename across invocation and runtime scopes.
+
+This covers the handoff from a resolved target to its VFS operation. Physical
+canonicalization, symlink changes, the relationship between the path checked
+by the manifest gate and the file opened by the VFS, installation of a mount
+under the correct owner, and device retirement during file I/O remain open.
+
 ## Guest key-value storage
 
 All seven operations in `astrid:kv/host@1.0.0` enter through `impl kv::Host for HostState` in `crates/astrid-capsule/src/engine/wasm/host/kv.rs`. Get, set, delete and compare-and-swap take a key. List, paginated list and clear take a prefix. Both list operations call the same backend prefix listing. The cursor and limit select a page after that listing returns.
