@@ -31,7 +31,7 @@ use astrid_core::kernel_api::{
 };
 use astrid_core::profile::{
     AuthMethod, CapabilityPattern, DeviceKey, DeviceKeyId, DevicePubkey, DeviceScope,
-    PrincipalProfile,
+    PrincipalProfile, ProfileError,
 };
 use tracing::{info, warn};
 
@@ -57,13 +57,19 @@ fn current_pair_issuer_authority(
     admitted: Option<&AuthorizedRequest>,
     issuer_device_key_id: Option<&str>,
 ) -> Result<PairIssuerAuthority, PairIssueError> {
-    let profile = PrincipalProfile::load_required(&kernel.astrid_home, caller).map_err(|error| {
-        if matches!(&error, astrid_core::profile::ProfileError::Io(io) if io.kind() == std::io::ErrorKind::NotFound) {
-            PairIssueError::BadInput(format!("caller principal {caller} does not exist (no profile.toml)"))
-        } else {
-            PairIssueError::Internal(format!("issuer profile resolution failed: {error}"))
-        }
-    })?;
+    let profile =
+        PrincipalProfile::load_required(&kernel.astrid_home, caller).map_err(|error| {
+            if matches!(&error, ProfileError::Io(io) if io.kind() == std::io::ErrorKind::NotFound) {
+                let message = format!("caller principal {caller} does not exist (no profile.toml)");
+                if admitted.is_some() {
+                    PairIssueError::Unauthorized(message)
+                } else {
+                    PairIssueError::BadInput(message)
+                }
+            } else {
+                PairIssueError::Internal(format!("issuer profile resolution failed: {error}"))
+            }
+        })?;
     if !profile.enabled {
         return Err(PairIssueError::Unauthorized(format!(
             "caller principal {caller} is disabled"

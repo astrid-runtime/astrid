@@ -504,7 +504,7 @@ async fn send_admin_scoped(
 enum PairIssueAuditExpectation {
     Success,
     Denied,
-    BadInput,
+    RequestFailed,
 }
 
 async fn assert_pair_issue_audit(
@@ -556,7 +556,7 @@ async fn assert_pair_issue_audit(
             ));
             assert!(matches!(&entry.outcome, AuditOutcome::Failure { .. }));
         },
-        PairIssueAuditExpectation::BadInput => {
+        PairIssueAuditExpectation::RequestFailed => {
             assert!(matches!(
                 &entry.authorization,
                 AuthorizationProof::System { .. }
@@ -601,6 +601,43 @@ fn seed_principal_with_devices(kernel: &Arc<Kernel>, principal: &PrincipalId) ->
 
 #[tokio::test]
 async fn queued_pair_refusal_has_one_denied_audit_row_and_no_token() {
+    queued_pair_refusal(false).await;
+}
+
+#[tokio::test]
+async fn queued_pair_profile_removal_has_one_denied_audit_row_and_no_token() {
+    queued_pair_refusal(true).await;
+}
+
+#[tokio::test]
+async fn pair_storage_error_is_a_failed_authorized_operation() {
+    let (_dir, kernel) = fixture().await;
+    let request = AdminRequestKind::PairDeviceIssue {
+        expires_secs: Some(300),
+        label: None,
+        scope: astrid_events::kernel_api::PairScopeArg::Explicit {
+            allow: vec!["self:*".into()],
+            deny: vec![],
+        },
+    };
+    let error = super::pair_device_handlers::PairIssueError::Internal("storage unavailable".into());
+    super::request_authorization::record_pair_issue_outcome(
+        &kernel,
+        &pid("storage_audit"),
+        astrid_events::ipc::DeviceStamp::default(),
+        &request,
+        &Err(error),
+    )
+    .await;
+    assert_pair_issue_audit(
+        &kernel,
+        "self:auth:pair",
+        PairIssueAuditExpectation::RequestFailed,
+    )
+    .await;
+}
+
+async fn queued_pair_refusal(remove_profile: bool) {
     let (_dir, kernel) = fixture().await;
     let caller = pid("queued_pair_audit");
     let mut profile = PrincipalProfile {
@@ -629,8 +666,12 @@ async fn queued_pair_refusal_has_one_denied_audit_row_and_no_token() {
         () = &mut queued => panic!("pair issue finished under another writer"),
         () = std::future::ready(()) => {}
     }
-    profile.enabled = false;
-    seed_profile(&kernel, &caller, &profile);
+    if remove_profile {
+        std::fs::remove_file(kernel.astrid_home.profile_path(&caller)).unwrap();
+    } else {
+        profile.enabled = false;
+        seed_profile(&kernel, &caller, &profile);
+    }
     drop(guard);
     queued.await;
     assert_pair_issue_audit(&kernel, "self:auth:pair", PairIssueAuditExpectation::Denied).await;
@@ -875,7 +916,7 @@ async fn malformed_pair_scope_audits_bad_input_not_permission_denial() {
     assert_pair_issue_audit(
         &kernel,
         "self:auth:pair",
-        PairIssueAuditExpectation::BadInput,
+        PairIssueAuditExpectation::RequestFailed,
     )
     .await;
 }
