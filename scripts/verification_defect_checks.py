@@ -25,7 +25,9 @@ ROOT = Path(__file__).resolve().parent.parent
 ENTRY = Path("verification/hosted_authority.rs")
 MODEL = Path("verification/hosted_authority_model.rs")
 AUTHORITY = Path("crates/astrid-capabilities/src/store/authority.rs")
+GUEST_AUTHORITY = Path("crates/astrid-storage/src/principal_state/guest_authority.rs")
 INPUTS = [
+    GUEST_AUTHORITY,
     ENTRY,
     MODEL,
     AUTHORITY,
@@ -106,6 +108,16 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
         for item in PROOF_ITEMS
     ]
     return [
+        (
+            "guest namespace can follow a replacement owner",
+            GUEST_AUTHORITY,
+            lambda text: replace_once(text, " && same_bytes(pinned.as_slice(), observed.as_slice())", ""),
+        ),
+        (
+            "guest owner can access a sibling namespace",
+            GUEST_AUTHORITY,
+            lambda text: replace_once(text, "same_bytes(admitted, requested) && ", ""),
+        ),
         (
             "admit ignores revocation for reusable tokens",
             AUTHORITY,

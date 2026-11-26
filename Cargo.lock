@@ -926,6 +926,7 @@ dependencies = [
  "tracing",
  "unicode-normalization",
  "uuid",
+ "vstd",
  "windows-sys 0.61.2",
 ]
 

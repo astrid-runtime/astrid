@@ -51,6 +51,7 @@ mod format_amendment_tests;
 mod format_identity_tests;
 #[cfg(test)]
 mod format_migration_tests;
+mod guest_authority;
 mod lifecycle;
 pub use lifecycle::{PendingRuntimeFinalization, RuntimeFinalization, RuntimeLifecycleGuard};
 #[cfg(test)]
@@ -574,6 +575,44 @@ impl RuntimePrincipalStore {
     #[must_use]
     pub fn kv(&self) -> Arc<dyn KvStore> {
         Arc::clone(&self.kv)
+    }
+
+    /// Open the existing guest namespace with its admitted owner pinned.
+    /// Reads and writes retain the original durable key encoding. The tree
+    /// adapter resolves each operation directly to this UID or rejects it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the alias no longer belongs to the admitted UID
+    /// or the capsule name cannot form an ordinary guest namespace.
+    pub fn principal_capsule_kv(
+        &self,
+        alias: &PrincipalId,
+        uid: PrincipalUid,
+        capsule: &str,
+    ) -> StorageResult<ScopedKvStore> {
+        if capsule.is_empty() || capsule.contains(':') {
+            return Err(StorageError::InvalidKey(
+                "invalid guest capsule namespace".into(),
+            ));
+        }
+        let namespace = format!("{alias}:capsule:{capsule}");
+        let expected_namespace = namespace.clone();
+        let principals = self.principals.clone();
+        let alias = alias.clone();
+        let resolve = move |requested: &str| {
+            let observed = principals.uid_for(&alias)?;
+            guest_authority::select(
+                expected_namespace.as_bytes(),
+                requested.as_bytes(),
+                *uid.as_bytes(),
+                *observed.as_bytes(),
+            )
+            .map(|owner| StateOwner::Principal(PrincipalUid::from_bytes(owner)))
+            .ok_or_else(|| StorageError::InvalidKey("guest KV owner or namespace changed".into()))
+        };
+        resolve(&namespace)?;
+        ScopedKvStore::new(Arc::new(self.runtime_kv.with_resolver(resolve)), namespace)
     }
 
     /// Return a host-only system-control projection over the authoritative

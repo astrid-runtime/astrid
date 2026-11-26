@@ -1252,8 +1252,45 @@ fn install_principal_overlays_sync(
         return false;
     };
 
-    let ns = format!("{}:capsule:{}", p, state.capsule_id);
-    let kv = match astrid_storage::ScopedKvStore::new(state.kv_backend.clone(), &ns) {
+    // Secrets use a separate host-only control namespace. Never build the
+    // SecretStore over the guest's ordinary `{principal}:capsule:*` view:
+    // that would let a capsule enumerate or forge its own control keys.
+    let principal_uid = match state.principal_directory.uid_for(p).and_then(|uid| {
+        if state.runtime_owner_uid.is_some_and(|owner| uid != owner) {
+            return Err(astrid_storage::StorageError::InvalidKey(
+                "invocation alias no longer belongs to the runtime owner".into(),
+            ));
+        }
+        Ok(uid)
+    }) {
+        Ok(uid) => uid,
+        Err(error) => {
+            tracing::warn!(
+                principal = %p,
+                error = %error,
+                "principal has no immutable UID for secret control scope; failing closed"
+            );
+            state.invocation_kv = None;
+            state.invocation_secret_store = None;
+            state.invocation_capsule_log = None;
+            state.deferred_logs.clear_invocation();
+            return false;
+        },
+    };
+    // A caller may inject independent KV and VFS backends. Only bind
+    // the native tree when KV already refers to that tree.
+    let durable = state
+        .principal_store
+        .as_ref()
+        .filter(|store| Arc::ptr_eq(&state.kv_backend, &store.kv()));
+    let scoped = match durable {
+        Some(store) => store.principal_capsule_kv(p, principal_uid, state.capsule_id.as_str()),
+        None => astrid_storage::ScopedKvStore::new(
+            state.kv_backend.clone(),
+            format!("{p}:capsule:{}", state.capsule_id),
+        ),
+    };
+    let kv = match scoped {
         Ok(kv) => kv,
         Err(e) => {
             // FAIL CLOSED: a construction failure for principal `p` must NEVER
@@ -1272,24 +1309,6 @@ fn install_principal_overlays_sync(
         },
     };
 
-    // Secrets use a separate host-only control namespace. Never build the
-    // SecretStore over the guest's ordinary `{principal}:capsule:*` view:
-    // that would let a capsule enumerate or forge its own control keys.
-    let principal_uid = match state.principal_directory.uid_for(p) {
-        Ok(uid) => uid,
-        Err(error) => {
-            tracing::warn!(
-                principal = %p,
-                error = %error,
-                "principal has no immutable UID for secret control scope; failing closed"
-            );
-            state.invocation_kv = None;
-            state.invocation_secret_store = None;
-            state.invocation_capsule_log = None;
-            state.deferred_logs.clear_invocation();
-            return false;
-        },
-    };
     let secret_scope = match astrid_storage::ScopedKvStore::new(
         state.kv_backend.clone(),
         astrid_storage::env::principal_secret_namespace(principal_uid, state.capsule_id.as_str()),
@@ -2077,7 +2096,19 @@ impl ExecutionEngine for WasmEngine {
             };
             let owner_capsule_log = owner_log.file;
             let owner_pending_log = owner_log.pending;
-            let owner_kv = Some(kv.clone());
+            let runtime_owner_uid = self.runtime_id.as_ref().and_then(|id| match id.key().scope() {
+                crate::registry::RuntimeScope::Principal(uid) => Some(uid),
+                crate::registry::RuntimeScope::SystemResident => None,
+            });
+            let durable_kv = ctx.principal_store.as_ref()
+                .filter(|store| Arc::ptr_eq(&kv_backend, &store.kv()));
+            let owner_kv = match (durable_kv, runtime_owner_uid) {
+                (Some(store), Some(uid)) => Some(
+                    store.principal_capsule_kv(&ctx.principal, uid, capsule_id_val.as_str())
+                        .map_err(|error| CapsuleError::ExecutionFailed(format!("bind owner KV: {error}")))?
+                ),
+                _ => Some(kv.clone()),
+            };
 
             // Per-instance `HostState` factory. Shared services clone (Arc or
             // cheap value clones); per-Store fields (`wasi_ctx`,
@@ -2182,6 +2213,7 @@ impl ExecutionEngine for WasmEngine {
                 ),
                 principal: st_principal.clone(),
                 system_runtime: st_system_runtime,
+                runtime_owner_uid,
                 capsule_uuid,
                 caller_context: None,
                 interceptor_active: false,
@@ -3586,6 +3618,7 @@ async fn build_lifecycle_host_state(
         resource_table: wasmtime::component::ResourceTable::new(),
         principal: principal.clone(),
         system_runtime: false,
+        runtime_owner_uid: None,
         capsule_uuid: uuid::Uuid::new_v4(),
         caller_context: None,
         interceptor_active: false,

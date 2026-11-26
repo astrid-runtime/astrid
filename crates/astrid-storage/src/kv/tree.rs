@@ -220,6 +220,20 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
         }
     }
 
+    /// A view over the same engine, quotas, caches and checkpoint state.
+    pub(crate) fn with_resolver<S>(&self, resolver: S) -> TreeKvStore<P, I, S, E> {
+        TreeKvStore {
+            engine: Arc::clone(&self.engine),
+            resolver,
+            quota: self.quota.clone(),
+            validation: Arc::clone(&self.validation),
+            validated_content: Arc::clone(&self.validated_content),
+            checkpointing: Arc::clone(&self.checkpointing),
+            hot_cache: self.hot_cache.clone(),
+            marker: PhantomData,
+        }
+    }
+
     /// Shared owner validation memos used by KV and content projections.
     pub(crate) fn validation_cache(&self) -> &Arc<KvValidationCache<P>> {
         &self.validation

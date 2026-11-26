@@ -14,3 +14,6 @@ mod token_authority;
 
 #[path = "hosted_authority_model.rs"]
 mod model;
+
+#[path = "../crates/astrid-storage/src/principal_state/guest_authority.rs"]
+mod guest_authority;

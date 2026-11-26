@@ -309,6 +309,21 @@ async fn retirement_fence_rejects_late_admission_and_drains_existing_call() {
     assert!(tracker.begin(&principal).is_some());
 }
 
+#[tokio::test]
+async fn stale_runtime_owner_cannot_install_replacement_kv_overlay() {
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    let alias = alice();
+    let uid = state.principal_directory.uid_for(&alias).unwrap();
+    state.runtime_owner_uid = Some(uid);
+    assert!(install_principal_overlays_sync(&mut state, Some(&alias)));
+    let stale_uid = astrid_core::PrincipalUid::from_bytes([0x97; 32]);
+    assert_ne!(uid, stale_uid);
+    state.runtime_owner_uid = Some(stale_uid);
+    assert!(!install_principal_overlays_sync(&mut state, Some(&alias)));
+    assert!(state.invocation_kv.is_none());
+    assert!(state.invocation_secret_store.is_none());
+}
+
 #[test]
 fn retired_principal_loses_kv_fs_and_secret_host_authority_without_harming_peer() {
     let rt = tokio::runtime::Builder::new_current_thread()
