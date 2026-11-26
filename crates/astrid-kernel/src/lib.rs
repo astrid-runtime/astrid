@@ -162,6 +162,7 @@ struct CapsuleViewLease {
 /// One immutable publication and the projection activated from it.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) struct BoundMaterialization {
+    uid: astrid_core::PrincipalUid,
     snapshot: astrid_storage::CapsulePackageSnapshot,
     runtime_dir: PathBuf,
     manifest: astrid_capsule_types::manifest::CapsuleManifest,
@@ -1526,17 +1527,17 @@ impl Kernel {
     /// when they exactly match one authenticated immutable-UID snapshot.
     /// `false` means this is an explicit workspace/project portal and must use
     /// its separate installation receipt policy.
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
     fn verify_registry_materialization(
         &self,
         dir: &Path,
         principal: &PrincipalId,
         manifest: &astrid_capsule_types::manifest::CapsuleManifest,
     ) -> anyhow::Result<bool> {
-        let Some(snapshot) = self.published_capsule_snapshot(principal, manifest)? else {
+        let Some((uid, snapshot)) = self.published_capsule_snapshot(principal, manifest)? else {
             return Ok(false);
         };
-        self.verify_published_materialization(dir, principal, manifest, &snapshot)?;
+        self.verify_published_materialization(dir, uid, manifest, &snapshot)?;
         Ok(true)
     }
 
@@ -1546,7 +1547,12 @@ impl Kernel {
         &self,
         principal: &PrincipalId,
         manifest: &astrid_capsule_types::manifest::CapsuleManifest,
-    ) -> anyhow::Result<Option<astrid_storage::CapsulePackageSnapshot>> {
+    ) -> anyhow::Result<
+        Option<(
+            astrid_core::PrincipalUid,
+            astrid_storage::CapsulePackageSnapshot,
+        )>,
+    > {
         let Some(store) = self.principal_store.as_ref() else {
             return Ok(None);
         };
@@ -1560,6 +1566,7 @@ impl Kernel {
         store
             .capsules()
             .get_snapshot(&owner, capsule_id.as_str())
+            .map(|snapshot| snapshot.map(|snapshot| (uid, snapshot)))
             .map_err(|error| anyhow::anyhow!("read durable capsule registry: {error}"))
     }
 
@@ -1567,14 +1574,10 @@ impl Kernel {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     fn published_cache_target(
         &self,
-        principal: &PrincipalId,
+        uid: astrid_core::PrincipalUid,
         manifest: &astrid_capsule_types::manifest::CapsuleManifest,
         snapshot: &astrid_storage::CapsulePackageSnapshot,
     ) -> anyhow::Result<PathBuf> {
-        let uid = self
-            .principal_directory
-            .uid_for(principal)
-            .map_err(|error| anyhow::anyhow!("resolve capsule cache owner UID: {error}"))?;
         let digest = blake3::hash(&snapshot.package().archive)
             .to_hex()
             .to_string();
@@ -1595,40 +1598,44 @@ impl Kernel {
     fn validate_published_cache_path(
         &self,
         dir: &Path,
-        principal: &PrincipalId,
+        uid: astrid_core::PrincipalUid,
         manifest: &astrid_capsule_types::manifest::CapsuleManifest,
         snapshot: &astrid_storage::CapsulePackageSnapshot,
     ) -> anyhow::Result<()> {
+        use capsule_materialization::cache_address::Address;
+
         let cache_root = self.astrid_home.run_dir().join("capsules");
         let relative = dir.strip_prefix(&cache_root).map_err(|_| {
             anyhow::anyhow!("capsule cache path is outside the durable registry cache")
         })?;
         astrid_core::platform_fs::verify_no_redirects(dir)
             .map_err(|error| anyhow::anyhow!("capsule cache path is redirected: {error}"))?;
-        let components: Vec<String> = relative
-            .components()
-            .map(|component| match component {
-                std::path::Component::Normal(value) => Ok(value.to_string_lossy().into_owned()),
-                _ => Err(anyhow::anyhow!(
-                    "capsule cache path contains unsafe components"
-                )),
-            })
-            .collect::<anyhow::Result<_>>()?;
-        if components.len() != 3 {
+        let mut components = relative.components();
+        let mut next = || match components.next() {
+            Some(std::path::Component::Normal(name)) => name.to_str().map(str::as_bytes),
+            _ => None,
+        };
+        let (Some(owner), Some(capsule), Some(digest), None) =
+            (next(), next(), next(), components.next())
+        else {
             anyhow::bail!("capsule cache path does not contain owner/id/digest components");
-        }
-        let uid = self
-            .principal_directory
-            .uid_for(principal)
-            .map_err(|error| anyhow::anyhow!("resolve capsule cache owner UID: {error}"))?;
-        if components[0] != uid.to_string() || components[1] != manifest.package.name {
-            anyhow::bail!("capsule cache owner or id does not match authenticated registry scope");
-        }
-        let digest = blake3::hash(&snapshot.package().archive)
-            .to_hex()
-            .to_string();
-        if components[2] != digest {
-            anyhow::bail!("materialized capsule digest does not match durable registry");
+        };
+        let actual = Address {
+            owner,
+            capsule,
+            digest,
+        };
+        let owner = uid.to_string();
+        let digest = blake3::hash(&snapshot.package().archive).to_hex();
+        let expected = Address {
+            owner: owner.as_bytes(),
+            capsule: manifest.package.name.as_bytes(),
+            digest: digest.as_bytes(),
+        };
+        if !actual.matches(&expected) {
+            anyhow::bail!(
+                "capsule cache owner, id or digest does not match authenticated registry scope"
+            );
         }
         Ok(())
     }
@@ -1738,12 +1745,7 @@ impl Kernel {
         let _view_guard = self.lock_capsule_view(principal, &id).await;
         let _load_guard = self.capsule_load_lock.lock().await;
         if let Some(bound) = bound.as_ref() {
-            self.confirm_published_materialization(
-                &runtime_dir,
-                principal,
-                &manifest,
-                &bound.snapshot,
-            )?;
+            self.confirm_published_materialization(&runtime_dir, principal, &manifest, bound)?;
         }
         if *principal != PrincipalId::default()
             && self.capabilities.is_principal_retiring(principal).await
@@ -1798,7 +1800,12 @@ impl Kernel {
         // is the authenticated admission set and the installed authority
         // receipt was verified above.
 
-        let principal_uid = self.runtime_principal_uid(system_runtime, principal, &id)?;
+        let principal_uid = self.runtime_principal_uid(
+            system_runtime,
+            principal,
+            &id,
+            bound.as_ref().map(|b| b.uid),
+        )?;
         let scope = principal_uid.map_or(
             astrid_capsule::registry::RuntimeScope::SystemResident,
             astrid_capsule::registry::RuntimeScope::Principal,
@@ -1889,12 +1896,13 @@ impl Kernel {
         system_runtime: bool,
         principal: &PrincipalId,
         id: &astrid_capsule_types::CapsuleId,
+        expected: Option<astrid_core::PrincipalUid>,
     ) -> Result<Option<astrid_core::identity::PrincipalUid>, anyhow::Error> {
         if system_runtime {
             return Ok(None);
         }
         self.principal_directory
-            .uid_for(principal)
+            .bound_uid(principal, expected)
             .map(Some)
             .map_err(|error| {
                 anyhow::anyhow!(
@@ -1955,7 +1963,8 @@ impl Kernel {
             astrid_capsule::registry::RuntimeScope::SystemResident
         } else {
             astrid_capsule::registry::RuntimeScope::Principal(
-                self.principal_directory.uid_for(principal)?,
+                self.principal_directory
+                    .bound_uid(principal, bound.as_ref().map(|b| b.uid))?,
             )
         };
         if actual_scope != expected_scope {
@@ -1965,14 +1974,12 @@ impl Kernel {
             );
         }
         if let Some(bound) = bound.as_ref() {
-            self.confirm_published_materialization(
-                &runtime_dir,
-                principal,
-                &manifest,
-                &bound.snapshot,
-            )?;
+            self.confirm_published_materialization(&runtime_dir, principal, &manifest, bound)?;
         }
-        let principal_uid = self.runtime_principal_uid(system_runtime, principal, id)?;
+        let principal_uid = match actual_scope {
+            astrid_capsule::registry::RuntimeScope::Principal(uid) => Some(uid),
+            astrid_capsule::registry::RuntimeScope::SystemResident => None,
+        };
         let runtime_id =
             self.capsules
                 .write()
@@ -2354,7 +2361,7 @@ impl Kernel {
                                     .map(|package| package.manifest().clone());
                                 let materialized = match manifest {
                                     Some(manifest) => self.ensure_published_materialization(
-                                        &target, principal, &manifest, &snapshot,
+                                        &target, uid, &manifest, &snapshot,
                                     ),
                                     None => {
                                         Err(anyhow::anyhow!("durable capsule package is malformed"))

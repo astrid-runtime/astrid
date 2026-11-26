@@ -56,6 +56,14 @@ returns an owner exactly when the observed UID matches the supplied pin, or
 when the caller supplies no pin for initial resolution. A regression reassigns
 the alias before install and checks both package registries for absence.
 
+Durable activation captures the owner UID together with the package snapshot.
+The cache path check compares all three normalized components (UID, capsule ID,
+and archive digest) against the expected bytes. Repair checks the owner’s
+published package against the supplied snapshot under the repair lock before
+removing or creating a projection. The repair lock and registry read use the
+same UID. Principal runtime construction checks the binding against the
+captured UID. A replacement retains the UID from its validated runtime scope.
+
 Live activation rechecks the binding before it dispatches reload by alias.
 That check leaves concurrent alias changes during reload open. Ordering with
 retirement, authenticated request admission and durable commit still needs a
@@ -72,6 +80,6 @@ Native stdio MCP capsules requesting network domains or outbound TCP destination
 
 ## Evidence and trust
 
-The current verifier entry point imports ten production modules and an abstract model of grant and principal authority. Their contracts cover fuel arithmetic, per-principal operation tracking, static pattern matching and containment, token status transitions, the startup marker fold, guest owner selection, KV address encoding, and overlay lookup and update. The model's theorems state what every trace of the grant, tracker and fuel transitions preserves, conditional on the stated storage, settlement and lifecycle obligations: an acknowledged revocation keeps the grant revoked across recovery and an acknowledged consumption keeps it used, a revocation keeps the grant revoked until the next recovery whether or not its write completed, retirement keeps the principal closed until a resume, and committed fuel exceeds the budget only by the fuel charged beyond a promise. Its `apply_*` and `fuel_*` functions show that the production transitions compute the model's steps. The hosted backend regression exercises abrupt exit and reopening. Complete mediation of hosted effects and concurrent runtime refinement remain open.
+The current verifier entry point imports eleven production modules and an abstract model of grant and principal authority. Their contracts cover fuel arithmetic, per-principal operation tracking, static pattern matching and containment, token status transitions, the startup marker fold, guest owner selection, KV address encoding, and overlay lookup and update. The model's theorems state what every trace of the grant, tracker and fuel transitions preserves, conditional on the stated storage, settlement and lifecycle obligations: an acknowledged revocation keeps the grant revoked across recovery and an acknowledged consumption keeps it used, a revocation keeps the grant revoked until the next recovery whether or not its write completed, retirement keeps the principal closed until a resume, and committed fuel exceeds the budget only by the fuel charged beyond a promise. Its `apply_*` and `fuel_*` functions show that the production transitions compute the model's steps. The hosted backend regression exercises abrupt exit and reopening. Complete mediation of hosted effects and concurrent runtime refinement remain open.
 
 The hosted security argument must state its assumptions about the OS, hardware, Wasmtime, cryptography, persistent storage, compiler and verifier. Release evidence must identify the source, build configuration, binary digest and proof result. Evidence about an installed instance must also identify the running binary and security-relevant configuration through a measurement mechanism whose trust assumptions are disclosed.

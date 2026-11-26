@@ -32,3 +32,6 @@ mod principal_scope;
 
 #[path = "../crates/astrid-storage/src/principal_directory/binding.rs"]
 mod principal_binding;
+
+#[path = "../crates/astrid-kernel/src/capsule_materialization/cache_address.rs"]
+mod cache_address;

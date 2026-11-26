@@ -31,7 +31,9 @@ OVERLAY = Path("crates/astrid-storage/src/kv/tree/overlay/traversal.rs")
 OVERLAY_UPDATE = Path("crates/astrid-storage/src/kv/tree/overlay/update.rs")
 PRINCIPAL_SCOPE = Path("crates/astrid-kernel/src/kernel_router/principal_scope.rs")
 BINDING = Path("crates/astrid-storage/src/principal_directory/binding.rs")
+CACHE_ADDRESS = Path("crates/astrid-kernel/src/capsule_materialization/cache_address.rs")
 INPUTS = [
+    CACHE_ADDRESS,
     BINDING,
     PRINCIPAL_SCOPE,
     OVERLAY_UPDATE,
@@ -118,6 +120,21 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
         for item in PROOF_ITEMS
     ]
     return [
+        (
+            "cache repair accepts a different owner",
+            CACHE_ADDRESS,
+            lambda text: replace_once(text, "self.owner != expected.owner || ", ""),
+        ),
+        (
+            "cache repair accepts a different capsule",
+            CACHE_ADDRESS,
+            lambda text: replace_once(text, "self.capsule != expected.capsule ||", ""),
+        ),
+        (
+            "cache repair accepts a different archive",
+            CACHE_ADDRESS,
+            lambda text: replace_once(text, "self.digest != expected.digest", "false"),
+        ),
         (
             "stale install ownership follows a reassigned alias",
             BINDING,
