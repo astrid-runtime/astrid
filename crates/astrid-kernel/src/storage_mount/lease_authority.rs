@@ -2,12 +2,41 @@
 
 pub(super) mod callback;
 mod requester;
+pub(super) mod subtree;
 pub(super) use requester::same_requester;
+use subtree::{BoundSubtree, Owner, Subtree};
 
 use super::{
-    FilesystemPath, Kernel, PrincipalId, StateOwner, StorageFilesystemTargetV1,
-    StorageProviderViewV1, WorkspaceBranchStore,
+    Kernel, PrincipalId, StateOwner, StorageFilesystemTargetV1, StorageProviderViewV1,
+    WorkspaceBranchStore,
 };
+
+/// Internal destinations can only designate a subtree admitted at issue time.
+#[derive(Clone, Copy)]
+pub(super) enum LeaseTarget {
+    OwnerRoot(StateOwner),
+    WorkspaceBranch(StateOwner, astrid_core::WorkspaceUid),
+    Subtree(BoundSubtree<astrid_core::PrincipalUid, astrid_core::FleetUid>),
+}
+
+impl LeaseTarget {
+    pub(super) fn wire(self) -> StorageFilesystemTargetV1 {
+        match self {
+            Self::OwnerRoot(_) => StorageFilesystemTargetV1::OwnerRoot,
+            Self::WorkspaceBranch(_, workspace) => {
+                StorageFilesystemTargetV1::WorkspaceBranch { workspace }
+            },
+            Self::Subtree(subtree) => StorageFilesystemTargetV1::OwnerSubtree {
+                prefix: match subtree {
+                    BoundSubtree::PrincipalHome(_) => Subtree::PrincipalHome,
+                    BoundSubtree::FleetShared(_) => Subtree::FleetShared,
+                }
+                .prefix()
+                .to_owned(),
+            },
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum LeaseAuthority {
@@ -22,7 +51,7 @@ pub(super) async fn resolve_owner(
     allow_cross_owner: bool,
     view: &StorageProviderViewV1,
     target: StorageFilesystemTargetV1,
-) -> Result<(StateOwner, StorageFilesystemTargetV1), String> {
+) -> Result<LeaseTarget, String> {
     let caller_uid = || {
         requester_uid
             .ok_or_else(|| format!("principal `{caller}` has no immutable storage identity"))
@@ -96,19 +125,27 @@ pub(super) async fn resolve_owner(
             }
         }
     }
-    if let StorageFilesystemTargetV1::OwnerSubtree { prefix } = &target {
-        if prefix != "home" && prefix != "shared" {
-            return Err("owner subtree prefix is not a kernel-admitted attachment".to_owned());
-        }
-        if prefix == "home" && !matches!(owner, StateOwner::Principal(_)) {
-            return Err("principal HOME must resolve to the principal owner".to_owned());
-        }
-        if prefix == "shared" && !matches!(owner, StateOwner::Fleet(_)) {
-            return Err("Fleet shared attachment requires a Fleet owner".to_owned());
-        }
-        FilesystemPath::new(prefix.clone())
-            .map_err(|error| format!("resolve owner subtree prefix: {error}"))?;
-    }
-
-    Ok((owner, target))
+    let target = match target {
+        StorageFilesystemTargetV1::OwnerRoot => LeaseTarget::OwnerRoot(owner),
+        StorageFilesystemTargetV1::WorkspaceBranch { workspace } => {
+            LeaseTarget::WorkspaceBranch(owner, workspace)
+        },
+        StorageFilesystemTargetV1::OwnerSubtree { prefix } => {
+            let subtree = Subtree::parse(&prefix).ok_or_else(|| {
+                "owner subtree prefix is not a kernel-admitted attachment".to_owned()
+            })?;
+            let bound_owner = match owner {
+                StateOwner::System => Owner::System,
+                StateOwner::Principal(uid) => Owner::Principal(uid),
+                StateOwner::Fleet(uid) => Owner::Fleet(uid),
+            };
+            LeaseTarget::Subtree(subtree.bind(bound_owner).ok_or_else(|| match subtree {
+                Subtree::PrincipalHome => {
+                    "principal HOME must resolve to the principal owner".to_owned()
+                },
+                Subtree::FleetShared => "Fleet shared attachment requires a Fleet owner".to_owned(),
+            })?)
+        },
+    };
+    Ok(target)
 }

@@ -593,3 +593,14 @@ bit. The worker-drain integration test cancels the async waiter while the worker
 is active and exercises revocation before and after release. This is execution
 evidence. Concurrent refinement still requires proving the correspondence
 between the lock, lifecycle transitions, worker effects and durable storage.
+
+
+At lease issue, the native subtree selector accepts the exact spellings
+`home` and `shared`. The checked binding function carries the original
+principal UID into a home target and the original fleet UID into a shared
+target. A mismatched owner kind or the system owner yields no binding.
+The callback worker and administrative sync consume that typed destination.
+Both filesystem adapters route relative paths through the checked join used
+by `FilesystemPath`. Rename joins each of its two paths independently.
+Owner lookup, workspace branch membership, physical storage key resolution
+and crash durability remain separate refinement obligations.

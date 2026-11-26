@@ -256,10 +256,7 @@ pub struct OwnerSubtreeFilesystem<P: Ord, E> {
 
 impl<P: Ord, E> OwnerSubtreeFilesystem<P, E> {
     fn path(&self, path: &FilesystemPath) -> Result<FilesystemPath, FilesystemError> {
-        if path.as_str().is_empty() {
-            return Ok(self.prefix.clone());
-        }
-        FilesystemPath::new(format!("{}/{}", self.prefix.as_str(), path.as_str()))
+        self.prefix.join(path.as_str())
     }
 }
 

@@ -58,6 +58,7 @@ UID_TEXT = Path("crates/astrid-core/src/identity/principal/text.rs")
 FILESYSTEM_PATH = Path("crates/astrid-storage/src/filesystem/path_validation.rs")
 STORAGE_HANDLES = Path("crates/astrid-capsule/src/engine/wasm/storage_handles.rs")
 STORAGE_FILE = Path("crates/astrid-capsule/src/engine/wasm/storage_file.rs")
+LEASE_SUBTREE = Path("crates/astrid-kernel/src/storage_mount/lease_authority/subtree.rs")
 LEASE_CALLBACK = Path("crates/astrid-kernel/src/storage_mount/lease_authority/callback.rs")
 LEASE_REQUESTER = Path("crates/astrid-kernel/src/storage_mount/lease_authority/requester.rs")
 INVOCATION_OWNER = Path("crates/astrid-capsule/src/engine/wasm/invocation_owner/admission.rs")
@@ -70,6 +71,7 @@ INPUTS = [
     STORAGE_FILE,
     PAIR_RESULT,
     LEASE_CALLBACK,
+    LEASE_SUBTREE,
     Path("crates/astrid-core/src/storage_filesystem/operation.rs"),
     LEASE_REQUESTER,
     INVOCATION_OWNER,
@@ -362,6 +364,21 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "missing invocation workspace falls back to the runtime despite required binding",
             MOUNT,
             lambda text: replace_once(text, "if requires_binding { invocation }", "if requires_binding { runtime }"),
+        ),
+        (
+            "native mount recognizes home as the shared subtree",
+            LEASE_SUBTREE,
+            lambda text: replace_once(text, 'if prefix == "home" { Some(Self::PrincipalHome) }', 'if prefix == "home" { Some(Self::FleetShared) }'),
+        ),
+        (
+            "fleet subtree reports the principal home prefix",
+            LEASE_SUBTREE,
+            lambda text: replace_once(text, 'Self::FleetShared => "shared" }', 'Self::FleetShared => "home" }'),
+        ),
+        (
+            "native mount drops the owner of an admitted home",
+            LEASE_SUBTREE,
+            lambda text: replace_once(text, "\n        match (self, owner) {\n            (Self::PrincipalHome, Owner::Principal(uid)) => Some(BoundSubtree::PrincipalHome(uid)),", "\n        match (self, owner) {\n            (Self::PrincipalHome, Owner::Principal(_)) => None,"),
         ),
         (
             "native mount wire rename is classified as a read",

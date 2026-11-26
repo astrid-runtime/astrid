@@ -1,6 +1,9 @@
 // Verus entry point for transitions used by hosted Astrid.
 
 extern crate self as astrid_core;
+#[path = "../crates/astrid-kernel/src/storage_mount/lease_authority/subtree.rs"]
+mod storage_subtree;
+
 #[path = "../crates/astrid-core/src/storage_filesystem/operation.rs"]
 pub mod storage_filesystem;
 

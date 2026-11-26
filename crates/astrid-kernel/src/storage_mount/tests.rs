@@ -397,10 +397,7 @@ async fn principal_home_subtree_cannot_reach_capsule_catalog() {
     )
     .unwrap();
 
-    let scoped = PrefixedFilesystem {
-        inner: root,
-        prefix: "home".to_owned(),
-    };
+    let scoped = PrefixedFilesystem::principal_home(root);
     let listing = execute_blocking(
         &scoped,
         StorageFilesystemOperationV1::ReadDirectory {
@@ -1557,13 +1554,11 @@ async fn internal_workspace_branch_lease_fixes_branch_target() {
         .storage_mounts
         .get(&lease.mount_id)
         .expect("internal branch lease is registered")
-        .target
-        .clone();
+        .target;
     assert!(matches!(
         target,
-        astrid_core::storage_filesystem::StorageFilesystemTargetV1::WorkspaceBranch {
-            workspace: actual
-        } if actual == workspace
+        LeaseTarget::WorkspaceBranch(actual_owner, actual_workspace)
+            if actual_owner == owner && actual_workspace == workspace
     ));
     assert_eq!(
         callback(&lease, &lease.lease_token, create("branch.txt")).await,
