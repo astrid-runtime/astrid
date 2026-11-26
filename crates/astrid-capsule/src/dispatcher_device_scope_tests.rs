@@ -243,13 +243,14 @@ async fn cancelled_admission_does_not_prompt_for_an_unpublished_invocation() {
     let registry = registry_for(capsule, &["alice"]);
     let bus = Arc::new(EventBus::with_capacity(16));
     let mut approval = bus.subscribe_topic("astrid.v1.approval");
+    let queues = Arc::new(ConsumerQueues::default());
+    queues.resolver.set(fixture.resolver).unwrap();
     let admitter: Arc<dyn astrid_events::EventDeliveryAdmitter> =
         Arc::new(crate::dispatcher::admission::Admitter {
             registry,
             event_bus: Arc::downgrade(&bus),
-            queues: Arc::default(),
+            queues,
             chain_locks: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-            access_resolver: Some(fixture.resolver),
             waits: crate::dispatcher::wait_graph::WaitGraph::default(),
         });
     assert!(bus.register_delivery_admitter(&admitter));
@@ -630,4 +631,98 @@ async fn device_scoped_dispatch_requires_a_resolver() {
             expected
         );
     }
+}
+
+#[tokio::test]
+async fn reserved_fifo_and_chain_recheck_registration_at_invocation() {
+    for chain in [false, true] {
+        check_reserved_registration(chain).await;
+    }
+}
+
+async fn check_reserved_registration(chain: bool) {
+    use astrid_events::ipc::delivery_failure::{DeliveryId, failure_topic};
+
+    let fixture = resolver_fixture();
+    let original = device('a', DeviceScope::Full);
+    let replacement = device('a', DeviceScope::Full);
+    let principal = astrid_core::PrincipalId::new("alice").unwrap();
+    let mut profile = PrincipalProfile::default();
+    profile.auth.methods.push(AuthMethod::Keypair);
+    profile.add_device(original.clone());
+    write_profile(&fixture.home, "alice", &profile);
+    let topic = "session.v1.append";
+    let (first, invoked) = TestCapsule::new("first", &[topic]);
+    let registry = registry_for(first, &["alice"]);
+    let mut observers = vec![invoked];
+    if chain {
+        let (mut second, invoked) = TestCapsule::new("second", &[topic]);
+        second.manifest.subscribes.get_mut(topic).unwrap().priority = Some(200);
+        let hash = crate::registry::WasmHash::synthetic("second", &second.manifest.package.version);
+        registry
+            .write()
+            .await
+            .register_system_runtime(Box::new(second), hash, &principal)
+            .unwrap();
+        observers.push(invoked);
+    }
+    let bus = Arc::new(EventBus::with_capacity(32));
+    let queues = Arc::new(ConsumerQueues::default());
+    queues.resolver.set(fixture.resolver).unwrap();
+    let admitter: Arc<dyn astrid_events::EventDeliveryAdmitter> = Arc::new(admission::Admitter {
+        registry,
+        event_bus: Arc::downgrade(&bus),
+        queues,
+        chain_locks: Arc::default(),
+        waits: wait_graph::WaitGraph::default(),
+    });
+    assert!(bus.register_delivery_admitter(&admitter));
+    let publisher = uuid::Uuid::new_v4();
+    let delivery = DeliveryId::parse("123456781234123412341234567890ab").unwrap();
+    let mut failures = bus.subscribe_topic(failure_topic(publisher, delivery).as_str());
+    let event = |device: &DeviceKey| {
+        let mut message = astrid_events::IpcMessage::new(
+            Topic::from_raw(topic),
+            IpcPayload::RawJson(serde_json::json!({})),
+            publisher,
+        )
+        .with_principal("alice")
+        .with_device_key_id(device.key_id.clone());
+        message.device_registration_id = device.registration_id.map(Into::into);
+        message.delivery_id = Some(delivery);
+        AstridEvent::Ipc {
+            metadata: astrid_events::EventMetadata::new("test"),
+            message,
+        }
+    };
+    let reserved = bus.reserve_publication(event(&original)).await.unwrap();
+    profile.auth.public_keys.clear();
+    profile.add_device(replacement.clone());
+    write_profile(&fixture.home, "alice", &profile);
+    fixture.cache.invalidate(&principal);
+    reserved.publish().unwrap();
+    let failure = tokio::time::timeout(Duration::from_secs(5), failures.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let AstridEvent::Ipc { message, .. } = failure.as_ref() else {
+        panic!("expected receipt")
+    };
+    assert_eq!(
+        message.device_registration_id,
+        original.registration_id.map(Into::into)
+    );
+    assert!(observers.iter().all(|ran| !ran.load(Ordering::SeqCst)));
+    bus.reserve_publication(event(&replacement))
+        .await
+        .unwrap()
+        .publish()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !observers.iter().all(|ran| ran.load(Ordering::SeqCst)) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replacement registration reaches all selected handlers");
 }

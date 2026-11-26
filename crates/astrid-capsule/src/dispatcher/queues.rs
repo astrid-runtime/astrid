@@ -9,6 +9,7 @@ type QueueMap = HashMap<(RuntimeId, PrincipalKey), mpsc::Sender<InterceptorWork>
 pub(super) struct ConsumerQueues {
     entries: parking_lot::Mutex<QueueMap>,
     stopping: RouteAdmissionGate,
+    pub(super) resolver: std::sync::OnceLock<CapsuleAccessResolver>,
 }
 
 impl ConsumerQueues {
@@ -18,6 +19,34 @@ impl ConsumerQueues {
 
     pub(super) fn stopping(&self) -> &RouteAdmissionGate {
         &self.stopping
+    }
+
+    /// Recheck the registration after the FIFO or chain wait, immediately before
+    /// handing the event to the selected capsule.
+    pub(super) async fn invoke(
+        &self,
+        capsule: &dyn Capsule,
+        action: &str,
+        payload: &[u8],
+        caller: Option<&astrid_events::IpcMessage>,
+    ) -> crate::error::CapsuleResult<crate::capsule::InterceptResult> {
+        if let Some(message) = caller {
+            let device = message.device_stamp();
+            if device.fingerprint.is_some() || device.registration.is_some() {
+                let access = self.resolver.get().and_then(|resolver| {
+                    resolver.resolve_access(message.principal.as_deref(), device)
+                });
+                if !access.is_some_and(|access| {
+                    !crate::access::is_user_invocable_surface(message.topic.as_str())
+                        || access.is_capsule_allowed(capsule.id())
+                }) {
+                    return Ok(crate::capsule::InterceptResult::Deny {
+                        reason: "device authority unavailable at invocation".into(),
+                    });
+                }
+            }
+        }
+        capsule.invoke_interceptor(action, payload, caller).await
     }
 
     fn stop(&self) {

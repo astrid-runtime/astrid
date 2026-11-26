@@ -20,6 +20,7 @@ pub struct RequestFailureBinding {
     principal: String,
     owner: RequestOwnerId,
     device_key_id: Option<String>,
+    registration: Option<Uuid>,
 }
 
 /// A terminal invocation failure, not a guarantee that no side effects occurred.
@@ -55,6 +56,7 @@ impl RequestFailureBinding {
             principal: request.principal.clone()?,
             owner: request.request_owner?,
             device_key_id: request.device_key_id.clone(),
+            registration: request.device_registration_id,
         })
     }
 
@@ -74,6 +76,7 @@ impl RequestFailureBinding {
         .with_principal(self.principal.clone())
         .with_request_owner(self.owner);
         message.device_key_id.clone_from(&self.device_key_id);
+        message.device_registration_id = self.registration;
         message
     }
 }
@@ -134,10 +137,12 @@ mod tests {
     fn failure_preserves_owner_and_does_not_shadow_success_topic() {
         let mut request = request();
         request.device_key_id = Some("device-a".into());
+        request.device_registration_id = Some(Uuid::new_v4());
         let binding = RequestFailureBinding::capture(&request).expect("native request");
         let reply = binding.message("invocation deadline exceeded");
         assert_eq!(reply.request_owner, request.request_owner);
         assert_eq!(reply.device_key_id, request.device_key_id);
+        assert_eq!(reply.device_registration_id, request.device_registration_id);
         let req_id = "1234567890abcdef1234567890abcdef";
         assert_ne!(reply.topic, Topic::kernel_response(req_id));
         let failure = RequestFailure::from_message(&reply, req_id, "alice").expect("host failure");

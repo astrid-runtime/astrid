@@ -30,7 +30,6 @@ pub(super) struct Admitter {
     pub event_bus: std::sync::Weak<EventBus>,
     pub queues: CapsuleQueues,
     pub chain_locks: ChainLocks,
-    pub access_resolver: Option<CapsuleAccessResolver>,
     pub waits: super::wait_graph::WaitGraph,
 }
 
@@ -170,7 +169,7 @@ impl EventDeliveryAdmitter for Admitter {
             message
                 .map(astrid_events::ipc::IpcMessage::device_stamp)
                 .unwrap_or_default(),
-            self.access_resolver.as_ref(),
+            self.queues.resolver.get(),
         )
         .await;
         // Capture each runtime once even if several of its handlers match.
@@ -193,7 +192,7 @@ impl EventDeliveryAdmitter for Admitter {
                 grants,
                 principal: principal.map(str::to_owned),
                 owner: message.and_then(|message| message.request_owner),
-                resolver: self.access_resolver.clone(),
+                resolver: self.queues.resolver.get().cloned(),
                 bus: Arc::downgrade(&bus),
                 gates,
             })

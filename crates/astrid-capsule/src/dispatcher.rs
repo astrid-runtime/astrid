@@ -225,6 +225,12 @@ impl EventDispatcher {
         // is N independent FIFO consumers, not a single class-keyed
         // queue collapsing the load (#813 Layer 3).
         let capsule_queues = Arc::clone(&self.queues);
+        if let Some(resolver) = self.access_resolver.take() {
+            capsule_queues
+                .resolver
+                .set(resolver)
+                .expect("dispatcher starts once");
+        }
         assert!(
             self.admitter
                 .active
@@ -233,7 +239,6 @@ impl EventDispatcher {
                     event_bus: Arc::downgrade(&self.event_bus),
                     queues: Arc::clone(&capsule_queues),
                     chain_locks: Arc::clone(&self.chain_locks),
-                    access_resolver: self.access_resolver.clone(),
                     waits: wait_graph::WaitGraph::default(),
                 })
                 .is_ok(),
@@ -324,7 +329,7 @@ impl EventDispatcher {
                 caller_principal,
                 caller_device,
                 caller_request_owner,
-                self.access_resolver.as_ref(),
+                capsule_queues.resolver.get(),
                 &self.event_bus,
             )
             .await;
@@ -438,6 +443,7 @@ fn dispatch_to_capsule_queues(
     let topic_clone = Arc::clone(&topic);
     let ipc_clone = ipc_message.clone();
     let chain_locks_clone = Arc::clone(chain_locks);
+    let execution_queues = Arc::clone(queues);
     let terminal_failure = failure::TerminalFailure::capture(event_bus, ipc_message.as_deref());
     astrid_runtime::spawn(async move {
         let mut current_payload = (*payload_bytes).clone();
@@ -463,8 +469,8 @@ fn dispatch_to_capsule_queues(
             let _chain_guard = acquire_chain_lock(&chain_locks_clone, chain_key).await;
 
             let caller = ipc_clone.as_deref();
-            match capsule
-                .invoke_interceptor(action, &current_payload, caller)
+            match execution_queues
+                .invoke(capsule.as_ref(), action, &current_payload, caller)
                 .await
             {
                 Ok(crate::capsule::InterceptResult::Continue(modified_payload)) => {

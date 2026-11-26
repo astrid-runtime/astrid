@@ -193,9 +193,13 @@ exactly when the captured and live generations agree. A legacy record matches an
 absent generation. Missing profile resolution denies device-stamped matches.
 Tests remove a key, re-pair it and compare the old, absent and new generations.
 
-Matching precedes asynchronous queue waits and handler execution. The proof
-does not yet establish freshness at invocation, revocation of work already admitted,
-or generation enforcement across all kernel management and reply paths.
+FIFO consumers repeat registration resolution after dequeue. Each ordered-chain
+handler repeats it after taking its execution lock. A reserved-publication test
+replaces the registration between selection and commit, observes a terminal failure
+for the original registration and observes execution for the replacement. Native
+and guest failure receipts carry the registration of the request. These checks
+establish admission observations. In-flight effects require their own lifetime
+fences. Kernel management and reply routing remain separate obligations.
 
 ## Native local socket transport
 
