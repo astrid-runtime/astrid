@@ -42,6 +42,7 @@ mod lease_authority;
 use lease_authority::callback::{
     Admission, Admitted, Destinations, Effect, Issued, OperationClass, admit, prepare_worker,
 };
+use lease_authority::destination::Backend;
 use lease_authority::worker::Worker;
 use lease_authority::{
     LeaseAuthority, LeaseTarget, resolve_owner,
@@ -354,12 +355,14 @@ pub(crate) async fn sync_lease(
             #[cfg(test)]
             tokio::runtime::Handle::current().block_on(pause_mutation_for_test(&state));
             match target {
-                LeaseTarget::OwnerRoot(owner) => AstridFilesystem::new(store.content(), owner)
-                    .sync()
-                    .map_err(|error| error.to_string()),
+                LeaseTarget::OwnerRoot(owner) => {
+                    AstridFilesystem::new(store.content(), owner.into())
+                        .sync()
+                        .map_err(|error| error.to_string())
+                },
                 LeaseTarget::WorkspaceBranch(owner, workspace) => {
                     WorkspaceBranchStore::new(store.content())
-                        .filesystem(owner, workspace)
+                        .filesystem(owner.into(), workspace)
                         .sync()
                         .map_err(|error| error.to_string())
                 },
@@ -824,26 +827,25 @@ async fn execute_operation(admission: CallbackAdmission<'_>) -> StorageFilesyste
             if is_mutation {
                 tokio::runtime::Handle::current().block_on(pause_mutation_for_test(&state));
             }
-            let result = match target {
-                LeaseTarget::OwnerRoot(owner) => {
-                    let filesystem = AstridFilesystem::new(store.content(), owner);
-                    if owner == StateOwner::System && is_mutation {
-                        admin_projection::execute(&backing.home, store, operation)
-                    } else {
-                        execute_blocking(&filesystem, operation)
-                    }
+            let result = match target.backend(&operation) {
+                Backend::SystemProjection => {
+                    admin_projection::execute(&backing.home, store, operation)
                 },
-                LeaseTarget::WorkspaceBranch(owner, workspace) => {
-                    let branches = WorkspaceBranchStore::new(store.content());
-                    let filesystem = branches.filesystem(owner, workspace);
+                Backend::Filesystem(LeaseTarget::OwnerRoot(owner)) => {
+                    let filesystem = AstridFilesystem::new(store.content(), owner.into());
                     execute_blocking(&filesystem, operation)
                 },
-                LeaseTarget::Subtree(BoundSubtree::FleetShared(uid)) => {
+                Backend::Filesystem(LeaseTarget::WorkspaceBranch(owner, workspace)) => {
+                    let branches = WorkspaceBranchStore::new(store.content());
+                    let filesystem = branches.filesystem(owner.into(), workspace);
+                    execute_blocking(&filesystem, operation)
+                },
+                Backend::Filesystem(LeaseTarget::Subtree(BoundSubtree::FleetShared(uid))) => {
                     let filesystem =
                         AstridFilesystem::new_fleet_shared(store.content(), StateOwner::Fleet(uid));
                     execute_blocking(&filesystem, operation)
                 },
-                LeaseTarget::Subtree(BoundSubtree::PrincipalHome(uid)) => {
+                Backend::Filesystem(LeaseTarget::Subtree(BoundSubtree::PrincipalHome(uid))) => {
                     let filesystem = PrefixedFilesystem::principal_home(AstridFilesystem::new(
                         store.content(),
                         StateOwner::Principal(uid),

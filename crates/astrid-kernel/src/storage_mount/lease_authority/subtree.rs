@@ -6,6 +6,7 @@ verus! {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Subtree { PrincipalHome, FleetShared }
 
+#[derive(Clone, Copy)]
 pub(crate) enum Owner<P, F> { System, Principal(P), Fleet(F) }
 
 #[derive(Clone, Copy)]

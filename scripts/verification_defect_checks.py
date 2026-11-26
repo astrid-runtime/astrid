@@ -73,6 +73,7 @@ INPUTS = [
     STORAGE_FILE,
     PAIR_RESULT,
     LEASE_CALLBACK,
+    Path("crates/astrid-kernel/src/storage_mount/lease_authority/destination.rs"),
     Path("crates/astrid-kernel/src/storage_mount/lease_authority/worker.rs"),
     LEASE_SUBTREE,
     LEASE_RESERVATION,
@@ -426,6 +427,12 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             lambda text: replace_once(text, "destinations.backing, operation, self.class)", "destinations.backing, operation, OperationClass::Read)"),
         ),
         (
+            "false assertion in the lease closure consumer",
+            Path("verification/hosted_lease_model.rs"),
+            lambda source: replace_once(source, "proof { no_admission_after_close(events, closed, count); }",
+                "proof { assert(false); no_admission_after_close(events, closed, count); }"),
+        ),
+        (
             "trace closure no longer establishes the runtime phase for dispatch",
             Path("verification/hosted_lease_model.rs"),
             lambda source: replace_once(source, "self.phase() == after(events, count),", "true,"),
@@ -434,6 +441,16 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "published authenticated callback loses its authorized effect",
             Path("verification/hosted_lease_model.rs"),
             lambda text: replace_once(text, "Admission::Accepted(ticket) => Some(ticket.into_effect())", "Admission::Accepted(_) => None"),
+        ),
+        (
+            "system reads select the host administration projection",
+            Path("crates/astrid-kernel/src/storage_mount/lease_authority/destination.rs"),
+            lambda source: replace_once(source, "(Self::OwnerRoot(Owner::System), OperationClass::Write) =>", "(Self::OwnerRoot(Owner::System), _) =>"),
+        ),
+        (
+            "workspace writes select the host administration projection",
+            Path("crates/astrid-kernel/src/storage_mount/lease_authority/destination.rs"),
+            lambda source: replace_once(source, "(Self::OwnerRoot(Owner::System), OperationClass::Write) =>", "(_, OperationClass::Write) =>"),
         ),
         (
             "serialized worker accepts a stale lease after its wait",

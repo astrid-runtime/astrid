@@ -45,7 +45,7 @@ pub(crate) open spec fn access_class(operation: Operation) -> OperationClass {
     }
 }
 
-fn operation_class(operation: &Operation) -> (class: OperationClass)
+pub(super) fn operation_class(operation: &Operation) -> (class: OperationClass)
     ensures class == access_class(*operation),
 {
     match operation {

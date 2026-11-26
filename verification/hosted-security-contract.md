@@ -645,9 +645,11 @@ lease. The scope fixes the mount ID, requester identity and logical target at
 issuance. The backing captures the principal store,
 runtime home and mutation lock at issue. Volume queries use that home.
 Filesystem operations preserve the issued target, lease, operation and access
-class. System-owner mutations call the admin projection against the captured
-runtime home. Correct selection and confinement of the concrete backend, host
-filesystem operations and worker completion require further refinement.
+class. The checked backend selector routes only writes on the system owner root to
+the admin projection. All other filesystem calls keep the exact issued owner,
+workspace branch or subtree target. The production admin projection uses the
+captured runtime home. Owner conversion, filesystem construction, confinement,
+host filesystem operations and worker completion require further refinement.
 
 The remaining proof must establish that publication, enumeration of affected
 leases, profile transitions, callback observations and worker completion refine

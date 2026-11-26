@@ -14,6 +14,10 @@ pub mod storage_filesystem;
 
 #[path = "../crates/astrid-kernel/src/storage_mount/lease_authority/callback.rs"]
 mod storage_callback;
+use storage_callback as callback;
+use storage_subtree as subtree;
+#[path = "../crates/astrid-kernel/src/storage_mount/lease_authority/destination.rs"]
+mod mount_destination;
 
 #[path = "../crates/astrid-kernel/src/storage_mount/lease_authority/requester.rs"]
 mod storage_lease_requester;

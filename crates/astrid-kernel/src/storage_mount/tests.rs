@@ -1603,7 +1603,7 @@ async fn internal_workspace_branch_lease_fixes_branch_target() {
     assert!(matches!(
         target,
         LeaseTarget::WorkspaceBranch(actual_owner, actual_workspace)
-            if actual_owner == owner && actual_workspace == workspace
+            if StateOwner::from(actual_owner) == owner && actual_workspace == workspace
     ));
     assert_eq!(
         callback(&lease, &lease.lease_token, create("branch.txt")).await,
