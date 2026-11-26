@@ -2,7 +2,7 @@
 use vstd::prelude::*;
 
 use crate::mount_reservation::Reservation;
-use crate::storage_callback::{self, Admission, Issued, Effect, OperationClass};
+use crate::storage_callback::{self, Admission, ClockObservation, Issued, Effect, OperationClass};
 use crate::storage_filesystem::StorageFilesystemOperationV1;
 
 verus! {
@@ -86,25 +86,25 @@ impl<T,B> RuntimeLease<T,B> {
         if affected { self.revoked = true; }
     }
 
-    fn callback<L>(&self, lease: L, now: u64, expires: u64, authenticated: bool,
+    fn callback<L>(&self, lease: L, clock: &ClockObservation, authenticated: bool,
         writable: bool, operation: StorageFilesystemOperationV1)
         -> (result: Admission<L, StorageFilesystemOperationV1>)
         ensures
-            (result is Accepted) == (self.phase() == Phase::Published && now <= expires &&
+            (result is Accepted) == (self.phase() == Phase::Published && clock.valid() &&
                 authenticated && (storage_callback::access_class(operation) != OperationClass::Write || writable)),
             result matches Admission::Accepted(value) ==>
                 value.binding() == (lease, operation, storage_callback::access_class(operation)),
     {
-        let active = self.published && storage_callback::live(self.revoked, now, expires);
+        let active = self.published && storage_callback::live(self.revoked, clock.permits());
         storage_callback::admit(lease, active, authenticated, writable, operation)
     }
 
     /// Compose lease phase, credential and access checks with final dispatch.
-    fn effect<'a,L>(&'a self, lease_id: L, now: u64, expires: u64,
+    fn effect<'a,L>(&'a self, lease_id: L, clock: &ClockObservation,
         authenticated: bool, writable: bool, operation: StorageFilesystemOperationV1)
         -> (result: Option<Effect<L,&'a T,&'a B>>)
         ensures
-            result.is_some() == (self.phase() == Phase::Published && now <= expires &&
+            result.is_some() == (self.phase() == Phase::Published && clock.valid() &&
                 authenticated && (storage_callback::access_class(operation) != OperationClass::Write || writable)),
             result matches Some(Effect::Volume(lease, scope, backing)) ==>
                 operation is VolumeInfo && lease == lease_id && *scope == self.issued.scope && *backing == self.issued.backing,
@@ -112,7 +112,7 @@ impl<T,B> RuntimeLease<T,B> {
                 !(operation is VolumeInfo) && lease == lease_id && *target == self.issued.scope &&
                 *backing == self.issued.backing && op == operation && class == storage_callback::access_class(operation),
     {
-        match self.callback(self.issued.bind(lease_id), now, expires, authenticated, writable, operation) {
+        match self.callback(self.issued.bind(lease_id), clock, authenticated, writable, operation) {
             Admission::Accepted(ticket) => Some(ticket.into_effect()),
             _ => None,
         }
@@ -120,7 +120,7 @@ impl<T,B> RuntimeLease<T,B> {
 
     /// A serialized filesystem sink is called with the fence and scope that
     /// survived both initial admission and the post-wait liveness observation.
-    fn serialized_effect<G,R,F>(&self, guard: Option<G>, now: u64, expires: u64,
+    fn serialized_effect<G,R,F>(&self, guard: Option<G>, clock: &ClockObservation,
         authenticated: bool, writable: bool, live_after_wait: bool,
         operation: StorageFilesystemOperationV1, sink: F) -> (result: Option<R>)
         where F: FnOnce(&Option<G>, (&T, StorageFilesystemOperationV1, OperationClass)) -> R,
@@ -128,14 +128,14 @@ impl<T,B> RuntimeLease<T,B> {
             storage_callback::access_class(operation) != OperationClass::Read,
             sink.requires((&guard, (&self.issued.scope, operation, storage_callback::access_class(operation)))),
         ensures
-            result.is_some() == (self.phase() == Phase::Published && now <= expires &&
+            result.is_some() == (self.phase() == Phase::Published && clock.valid() &&
                 authenticated && (storage_callback::access_class(operation) != OperationClass::Write || writable) &&
                 guard.is_some() && live_after_wait),
             result matches Some(receipt) ==> sink.ensures((&guard,
                 (&self.issued.scope, operation, storage_callback::access_class(operation))), receipt),
     {
         if let Some(Effect::Filesystem(_, scope, _, op, _)) =
-                self.effect((), now, expires, authenticated, writable, operation) {
+                self.effect((), clock, authenticated, writable, operation) {
             if let Some(worker) = storage_callback::prepare_worker(guard, live_after_wait, scope, op) {
                 return Some(worker.run(sink));
             }
@@ -145,7 +145,7 @@ impl<T,B> RuntimeLease<T,B> {
 
     /// Once the runtime phase refines this trace prefix, even an authenticated
     /// caller with write permission can obtain no effect after closure.
-    fn effect_after_closure<'a,L>(&'a self, lease: L, now: u64, expires: u64,
+    fn effect_after_closure<'a,L>(&'a self, lease: L, clock: &ClockObservation,
         operation: StorageFilesystemOperationV1, Ghost(events): Ghost<Seq<Event>>,
         Ghost(closed): Ghost<int>, Ghost(count): Ghost<int>)
         -> (result: Option<Effect<L,&'a T,&'a B>>)
@@ -156,7 +156,7 @@ impl<T,B> RuntimeLease<T,B> {
         ensures result.is_none(),
     {
         proof { no_admission_after_close(events, closed, count); }
-        self.effect(lease, now, expires, true, true, operation)
+        self.effect(lease, clock, true, true, operation)
     }
 }
 

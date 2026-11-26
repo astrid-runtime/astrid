@@ -577,8 +577,10 @@ and backing from the issued lease. Both effect variants retain the lease.
 The Unix restart regression exits after a real callback without shutdown,
 reopens the same home, and checks old and fresh credentials against the
 replacement callback. The test observes kernel and local transport behavior on
-the tested platform. Admission still assumes the adapter's observations of
-revocation, expiry and token authenticity. Expiry also assumes a valid clock.
+the tested platform. The clock adapter samples both monotonic idle time and wall time. The checked
+gate requires both deadlines and a valid epoch reading. The deadline mutex
+latches an observed expiry. Sampling clocks, binding the deadline to issuance
+and ordering the revocation read with those samples are runtime obligations.
 The proof still needs the correspondence to a coherent concurrent observation,
 the V2 decoder, token hashing, backend execution and durable completion.
 

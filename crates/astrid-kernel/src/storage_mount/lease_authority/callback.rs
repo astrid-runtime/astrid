@@ -5,10 +5,31 @@ use astrid_core::storage_filesystem::StorageFilesystemOperationV1 as Operation;
 
 verus! {
 
-pub(crate) fn live(revoked: bool, now: u64, expires: u64) -> (accepted: bool)
-    ensures accepted == (!revoked && now <= expires),
+pub(crate) struct ClockObservation {
+    pub(crate) within_idle: bool,
+    pub(crate) now: Option<u64>,
+    pub(crate) expires: u64,
+}
+
+impl ClockObservation {
+    pub(crate) open spec fn valid(self) -> bool {
+        self.within_idle && (self.now matches Some(sec) && sec <= self.expires)
+    }
+
+    pub(crate) fn permits(&self) -> (accepted: bool)
+        ensures accepted == self.valid(),
+    {
+        match self.now {
+            Some(sec) => self.within_idle && sec <= self.expires,
+            None => false,
+        }
+    }
+}
+
+pub(crate) fn live(revoked: bool, within_deadlines: bool) -> (accepted: bool)
+    ensures accepted == (!revoked && within_deadlines),
 {
-    !revoked && now <= expires
+    !revoked && within_deadlines
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

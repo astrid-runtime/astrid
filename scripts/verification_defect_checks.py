@@ -476,14 +476,24 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             lambda text: replace_once(text, 'Self::Revoked => "caps:revoked", Self::Consumed => "caps:used"', 'Self::Revoked => "caps:used", Self::Consumed => "caps:used"'),
         ),
         (
+            "mount clock ignores monotonic idle expiration",
+            LEASE_CALLBACK,
+            lambda source: replace_once(source, "Some(sec) => self.within_idle && sec <= self.expires", "Some(sec) => sec <= self.expires"),
+        ),
+        (
+            "mount clock admits an unavailable wall clock",
+            LEASE_CALLBACK,
+            lambda source: replace_once(source, "None => false,", "None => true,"),
+        ),
+        (
             "revoked callback lease is live before its expiry",
             LEASE_CALLBACK,
-            lambda text: replace_once(text, "\n    !revoked && now <= expires\n", "\n    now <= expires\n"),
+            lambda text: replace_once(text, "\n    !revoked && within_deadlines\n", "\n    within_deadlines\n"),
         ),
         (
             "callback drops the inclusive expiry boundary",
             LEASE_CALLBACK,
-            lambda text: replace_once(text, "\n    !revoked && now <= expires\n", "\n    !revoked && now < expires\n"),
+            lambda text: replace_once(text, "Some(sec) => self.within_idle && sec <= self.expires", "Some(sec) => self.within_idle && sec < self.expires"),
         ),
         (
             "private callback executes without token authentication",
