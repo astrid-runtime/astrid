@@ -16,6 +16,8 @@
 //! hashes. Audit redaction lives in `admin::mod::sanitize_admin_audit_params`
 //! so neither the raw token nor the ed25519 key ever reaches the audit log.
 
+mod deny_patterns;
+
 use std::sync::Arc;
 
 use astrid_capabilities::{CapabilityCheck, device_scope_within};
@@ -55,6 +57,7 @@ fn pair_token_store(
 fn current_pair_issuer_authority(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
+    admitted: Option<&AuthorizedRequest>,
     issuer_device_key_id: Option<&str>,
 ) -> Result<PairIssuerAuthority, AdminResponseBody> {
     let profile_path = kernel.astrid_home.profile_path(caller);
@@ -72,12 +75,29 @@ fn current_pair_issuer_authority(
             "caller principal {caller} is disabled"
         )));
     }
-    let issuer_scope = crate::kernel_router::resolve_device_scope(
-        profile.as_ref(),
-        caller,
-        issuer_device_key_id,
-        "self:auth:pair",
-    )
+    let issuer_scope = if let Some(auth) = admitted {
+        let device = astrid_events::ipc::DeviceStamp {
+            fingerprint: auth
+                .device_key_id
+                .as_ref()
+                .map(astrid_core::profile::DeviceKeyId::as_str),
+            registration: auth.device_registration.map(Into::into),
+        };
+        crate::kernel_router::device_scope::resolve_stamp(
+            &profile,
+            caller,
+            device,
+            "self:auth:pair",
+        )
+        .map(|record| record.map(|record| record.scope.clone()))
+    } else {
+        crate::kernel_router::resolve_device_scope(
+            &profile,
+            caller,
+            issuer_device_key_id,
+            "self:auth:pair",
+        )
+    }
     .map_err(|error| err_unauthorized(error.to_string()))?;
     Ok((profile, kernel.groups.load_full(), issuer_scope))
 }
@@ -114,7 +134,7 @@ pub(super) async fn pair_device_issue(
 
     let _guard = kernel.admin_write_lock.lock().await;
     let (profile, groups, issuer_scope) =
-        match current_pair_issuer_authority(kernel, caller, issuer_device_key_id) {
+        match current_pair_issuer_authority(kernel, caller, authorization, issuer_device_key_id) {
             Ok(authority) => authority,
             Err(response) => return response,
         };
@@ -331,11 +351,7 @@ fn inherit_issuer_denies(child: DeviceScope, issuer_scope: Option<&DeviceScope>)
         return child;
     };
     let mut merged_deny = deny.clone();
-    for pattern in issuer_deny {
-        if !merged_deny.contains(pattern) {
-            merged_deny.push(pattern.clone());
-        }
-    }
+    deny_patterns::inherit(&mut merged_deny, issuer_deny);
     DeviceScope::Scoped {
         allow: allow.clone(),
         deny: merged_deny,

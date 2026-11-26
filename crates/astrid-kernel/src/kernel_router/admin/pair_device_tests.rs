@@ -666,12 +666,13 @@ async fn scoped_issuer_child_inherits_issuer_denies() {
             .expect("authorize pair issuance");
     // An updated policy relaxes one restriction and introduces another.
     // Neither snapshot alone describes the scope that may be minted.
-    seed(
-        &kernel,
-        &caller,
-        &["self:*"],
-        vec![scoped_device('a', &["self:*"], &["self:capsule:remove"])],
-    );
+    let mut updated = load(&kernel, &caller);
+    updated.auth.public_keys[0].scope = DeviceScope::Scoped {
+        allow: vec!["self:*".into()],
+        deny: vec!["self:capsule:remove".into()],
+    };
+    updated.save(&kernel.astrid_home, &caller).unwrap();
+    kernel.profile_cache.invalidate(&caller);
     // The issuer requests a broad child: allow self:*. The stored child scope
     // must inherit the issuer's deny (self:capsule:install) so the child can
     // never exceed the parent on that cap.
@@ -721,6 +722,15 @@ async fn scoped_issuer_child_inherits_issuer_denies() {
 
 #[tokio::test]
 async fn queued_pair_issue_cannot_mint_after_issuer_removal() {
+    assert_retired_pair_issuer_denied(false).await;
+}
+
+#[tokio::test]
+async fn queued_pair_issue_cannot_mint_after_the_same_key_is_repaired() {
+    assert_retired_pair_issuer_denied(true).await;
+}
+
+async fn assert_retired_pair_issuer_denied(repair: bool) {
     let (_dir, kernel) = fixture().await;
     let caller = pid("queued_issuer");
     let dev = scoped_device('a', &["self:*"], &[]);
@@ -747,6 +757,15 @@ async fn queued_pair_issue_cannot_mint_after_issuer_removal() {
     }
     let mut profile = load(&kernel, &caller);
     profile.auth.public_keys.clear();
+    if repair {
+        let replacement = scoped_device('a', &["self:*"], &[]);
+        assert_eq!(key, replacement.key_id);
+        assert_ne!(
+            authorization.device_registration,
+            replacement.registration_id
+        );
+        profile.add_device(replacement);
+    }
     profile.save(&kernel.astrid_home, &caller).unwrap();
     kernel.profile_cache.invalidate(&caller);
     drop(guard);

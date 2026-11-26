@@ -696,6 +696,7 @@ struct AuthorizedRequest {
     groups: Arc<GroupConfig>,
     device_scope: Option<DeviceScope>,
     device_key_id: Option<astrid_core::profile::DeviceKeyId>,
+    device_registration: Option<astrid_core::profile::DeviceRegistrationId>,
     authenticated_public_key: Option<[u8; 32]>,
 }
 
@@ -843,12 +844,14 @@ fn authorize_with(
         check = check.with_device_scope(scope);
     }
     check.require(required_cap)?;
+    let device_registration = device.and_then(|record| record.registration_id);
     Ok(AuthorizedRequest {
         principal: caller.clone(),
         profile,
         groups,
         device_scope,
         device_key_id: authenticated_device_id,
+        device_registration,
         authenticated_public_key,
     })
 }

@@ -52,7 +52,9 @@ DEVICE_REGISTRATION = Path("crates/astrid-core/src/profile/device_registration.r
 DEVICE_CHALLENGE = Path("crates/astrid-core/src/profile/device_challenge.rs")
 REGISTERED_BEARER = Path("crates/astrid-core/src/session_token/registered_bearer.rs")
 PRIVATE_RESPONDER = Path("crates/astrid-capsule/src/elicitation/responder.rs")
+PAIR_DENIES = Path("crates/astrid-kernel/src/kernel_router/admin/pair_device_handlers/deny_patterns.rs")
 INPUTS = [
+    PAIR_DENIES,
     PRIVATE_RESPONDER,
     REGISTERED_BEARER,
     ORDERED_DISPATCH,
@@ -354,6 +356,21 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "untargeted native message is broadcast on every topic",
             NATIVE_RECIPIENT,
             lambda text: replace_once(text, "None => broadcast,", "None => true,"),
+        ),
+        (
+            "pairing child omits an issuer deny",
+            PAIR_DENIES,
+            lambda text: replace_once(text, "child.push(copy);", "let _ = copy;"),
+        ),
+        (
+            "pairing child repeats a deny already in its policy",
+            PAIR_DENIES,
+            lambda text: replace_once(text, "if !contains(child, pattern.as_str()) {", "if true {"),
+        ),
+        (
+            "pairing child discards restrictions already inherited at admission",
+            PAIR_DENIES,
+            lambda text: replace_once(text, "let mut i = 0usize;", "child.clear(); let mut i = 0usize;"),
         ),
         (
             "private answer consumes a slot for another principal",

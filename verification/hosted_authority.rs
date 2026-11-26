@@ -1,5 +1,8 @@
 // Verus entry point for transitions used by hosted Astrid.
 
+#[path = "../crates/astrid-kernel/src/kernel_router/admin/pair_device_handlers/deny_patterns.rs"]
+mod pair_deny_patterns;
+
 #[path = "../crates/astrid-capsule/src/elicitation/responder.rs"]
 mod private_responder;
 
