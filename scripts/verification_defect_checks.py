@@ -363,6 +363,16 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             lambda text: replace_once(text, "if requires_binding { invocation }", "if requires_binding { runtime }"),
         ),
         (
+            "read-only mount accepts a mutating callback",
+            LEASE_CALLBACK,
+            lambda text: replace_once(text, "Self::Write => writable", "Self::Write => true"),
+        ),
+        (
+            "mount callback sync bypasses mutation serialization",
+            LEASE_CALLBACK,
+            lambda text: replace_once(text, "Self::Write | Self::Sync => true", "Self::Write => true, Self::Sync => false"),
+        ),
+        (
             "revoked callback lease is live before its expiry",
             LEASE_CALLBACK,
             lambda text: replace_once(text, "\n    !revoked && now <= expires\n", "\n    now <= expires\n"),

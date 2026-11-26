@@ -40,6 +40,7 @@ use crate::Kernel;
 
 mod admin_projection;
 mod lease_authority;
+use lease_authority::callback::{Admission, OperationClass, admit};
 use lease_authority::{LeaseAuthority, resolve_owner};
 #[cfg(target_os = "macos")]
 mod callback_resolver;
@@ -707,8 +708,6 @@ async fn dispatch_request(
 ) -> CallbackResponse {
     let request = callback.request;
     let request_id = request.request_id.clone();
-    use lease_authority::callback::{Admission, admit};
-
     let live = state.is_live();
     let authenticated = live && token_matches(&state.token_hash, &request.lease_token);
     let outcome = match admit(live, authenticated, request.operation) {
@@ -717,7 +716,7 @@ async fn dispatch_request(
         Admission::Accepted(operation) => {
             state.renew();
             execute_operation(kernel, state, operation).await
-        }
+        },
     };
     let response = StorageFilesystemResponseV1 {
         protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V1,
@@ -766,15 +765,16 @@ async fn execute_operation(
     state: &StorageMountLeaseState,
     operation: StorageFilesystemOperationV1,
 ) -> StorageFilesystemOutcomeV1 {
+    let class = operation_class(&operation);
+    let is_mutation = matches!(class, OperationClass::Write);
+    let is_sync = matches!(class, OperationClass::Sync);
+    if !class.permits(state.access == StorageProviderAccessV1::ReadWrite) {
+        return failure("read-only", "storage mount lease is read-only");
+    }
     if matches!(&operation, StorageFilesystemOperationV1::VolumeInfo) {
         return volume_info::read(kernel).await;
     }
-    let is_mutation = is_mutation(&operation);
-    let is_sync = matches!(&operation, StorageFilesystemOperationV1::Sync);
-    if is_mutation && state.access != StorageProviderAccessV1::ReadWrite {
-        return failure("read-only", "storage mount lease is read-only");
-    }
-    let _mutation_guard = if requires_mutation_serialization(&operation) {
+    let _mutation_guard = if class.requires_serialization() {
         let guard = kernel.storage_mount_mutations.lock().await;
         if !state.is_live() {
             return failure("stale-lease", "storage mount lease is expired or revoked");
@@ -885,19 +885,19 @@ fn failure(code: &str, message: &str) -> StorageFilesystemOutcomeV1 {
     })
 }
 
-fn is_mutation(operation: &StorageFilesystemOperationV1) -> bool {
-    matches!(
-        operation,
-        StorageFilesystemOperationV1::Write { .. }
-            | StorageFilesystemOperationV1::SetLength { .. }
-            | StorageFilesystemOperationV1::Create { .. }
-            | StorageFilesystemOperationV1::Remove { .. }
-            | StorageFilesystemOperationV1::Rename { .. }
-    )
-}
-
-fn requires_mutation_serialization(operation: &StorageFilesystemOperationV1) -> bool {
-    is_mutation(operation) || matches!(operation, StorageFilesystemOperationV1::Sync)
+fn operation_class(operation: &StorageFilesystemOperationV1) -> OperationClass {
+    use StorageFilesystemOperationV1 as Op;
+    match operation {
+        Op::VolumeInfo | Op::Stat { .. } | Op::ReadDirectory { .. } | Op::Read { .. } => {
+            OperationClass::Read
+        },
+        Op::Write { .. }
+        | Op::SetLength { .. }
+        | Op::Create { .. }
+        | Op::Remove { .. }
+        | Op::Rename { .. } => OperationClass::Write,
+        Op::Sync => OperationClass::Sync,
+    }
 }
 
 fn generate_lease_token() -> Result<(String, [u8; 32]), String> {

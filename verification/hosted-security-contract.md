@@ -572,3 +572,12 @@ data, and passes it to the backend dispatcher. These statements concern the
 clock, expiry, revocation and authentication values sampled by the adapter.
 The proof still needs the correspondence to a coherent concurrent observation,
 the V2 decoder, token hashing, backend execution and durable completion.
+
+
+The native backend dispatcher exhaustively classifies all V1 operations.
+Stat, directory enumeration, range reads and volume information are reads.
+Write, set-length, create, remove and rename require a writable lease. Sync
+is permitted on a read-only lease and takes the same serialization lock as
+mutations. Verus checks the access and serialization decisions for every
+class. Rust enforces exhaustiveness of the wire operation match. The actual
+OS lock, worker lifetime and stable-storage semantics remain obligations.
