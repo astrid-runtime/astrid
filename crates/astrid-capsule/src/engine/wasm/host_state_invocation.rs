@@ -241,6 +241,7 @@ impl HostState {
         {
             self.caller_context = Some(msg.clone());
             self.invocation_profile_authorized = false;
+            self.invocation_storage_uid = None;
             self.invocation_profile = Some(Arc::new(astrid_core::profile::PrincipalProfile {
                 groups: vec![astrid_core::groups::BUILTIN_RESTRICTED.to_string()],
                 ..Default::default()
@@ -405,7 +406,7 @@ impl HostState {
             match crate::engine::wasm::host::util::bounded_block_on(
                 &self.runtime_handle,
                 &self.io_semaphore,
-                resolver.resolve(principal, uid),
+                resolver.resolve_for(principal, uid),
             ) {
                 Ok(mount) => Some(mount),
                 Err(error) => {
