@@ -1386,6 +1386,34 @@ fn hold_worker(state: &StorageMountLeaseState) -> Arc<MutationTestGate> {
     gate
 }
 
+fn start_worker(
+    case: WorkerCase,
+    kernel: Arc<Kernel>,
+    state: Arc<StorageMountLeaseState>,
+    caller: PrincipalId,
+    token: String,
+) -> tokio::task::JoinHandle<StorageFilesystemOutcomeV1> {
+    tokio::spawn(async move {
+        if matches!(case, WorkerCase::CancelledAdminSync) {
+            sync_lease(&kernel, &caller, true, state.mount_id)
+                .await
+                .unwrap();
+            return StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done);
+        }
+        dispatch_v1_operation(
+            &kernel,
+            &state,
+            &token,
+            StorageFilesystemOperationV1::Write {
+                path: "in-flight.bin".to_owned(),
+                offset: 0,
+                data: vec![0x36_u8; 64],
+            },
+        )
+        .await
+    })
+}
+
 async fn check_worker_drain(case: WorkerCase) {
     let sync = matches!(case, WorkerCase::CancelledAdminSync);
     let temporary = tempfile::tempdir().unwrap();
@@ -1415,29 +1443,13 @@ async fn check_worker_drain(case: WorkerCase) {
     }
     let state = Arc::clone(kernel.storage_mounts.get(&lease.mount_id).unwrap().value());
     let gate = hold_worker(&state);
-    let mutation_kernel = Arc::clone(&kernel);
-    let mutation_state = Arc::clone(&state);
-    let token = lease.lease_token.clone();
-    let worker_caller = caller.clone();
-    let mutation = tokio::spawn(async move {
-        if sync {
-            sync_lease(&mutation_kernel, &worker_caller, true, lease.mount_id)
-                .await
-                .unwrap();
-            return StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done);
-        }
-        dispatch_v1_operation(
-            &mutation_kernel,
-            &mutation_state,
-            &token,
-            StorageFilesystemOperationV1::Write {
-                path: "in-flight.bin".to_owned(),
-                offset: 0,
-                data: vec![0x36_u8; 64],
-            },
-        )
-        .await
-    });
+    let mutation = start_worker(
+        case,
+        Arc::clone(&kernel),
+        Arc::clone(&state),
+        caller.clone(),
+        lease.lease_token.clone(),
+    );
     gate.entered.acquire().await.unwrap().forget();
     assert_eq!(
         state.in_flight_mutations.load(Ordering::Acquire),
