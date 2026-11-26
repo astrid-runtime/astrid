@@ -406,18 +406,15 @@ pub(super) fn mint_principal_keypair(
     // pubkey so a re-mint is idempotent.
     let pubkey_hex = keypair.export_public_key().to_hex();
     if profile.auth.device_by_pubkey(&pubkey_hex).is_none() {
-        profile
-            .auth
-            .public_keys
-            .push(astrid_core::profile::DeviceKey::new(
-                pubkey_hex,
-                astrid_core::profile::DeviceScope::Full,
-                None,
-                // Stamp the real mint epoch — `0` is the migrated-legacy-key
-                // sentinel, so using it for a freshly minted key would show a
-                // 1970 timestamp in `pair-device list` / audit.
-                i64::try_from(crate::invite::now_epoch()).unwrap_or(0),
-            ));
+        profile.add_device(astrid_core::profile::DeviceKey::new(
+            pubkey_hex,
+            astrid_core::profile::DeviceScope::Full,
+            None,
+            // Stamp the real mint epoch — `0` is the migrated-legacy-key
+            // sentinel, so using it for a freshly minted key would show a
+            // 1970 timestamp in `pair-device list` / audit.
+            i64::try_from(crate::invite::now_epoch()).unwrap_or(0),
+        ));
     }
     if !profile
         .auth
