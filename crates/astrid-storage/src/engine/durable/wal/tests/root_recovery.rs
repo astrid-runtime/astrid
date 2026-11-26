@@ -371,3 +371,65 @@ fn measured_writer_matches_reference_frame_and_digest_vectors() {
         "41535457414c3200010000005c00000000000000f1360c7a3ec12c4f8447e1a44a37708ba92dd079a96635b436abcfa69fc8f01c040000000102000000000000030000000000000001020000000000000300000000000000010000000000000001000000000000004f000000000000009be4a0c43266399e10756cf2a26b845af308852ad1b0ca292a379cc922cd205d"
     );
 }
+
+#[test]
+fn replay_failure_and_retry_preserve_owner_tags_and_the_first_offset() {
+    use crate::principal_state::{StateOwner, StateOwnerCodecV2};
+    use astrid_core::{FleetUid, identity::PrincipalUid};
+    use root_history::Decision;
+    use std::collections::BTreeMap;
+
+    let bytes = [7; 32];
+    let owner = StateOwner::Principal(PrincipalUid::from_bytes(bytes));
+    let fleet = StateOwner::Fleet(FleetUid::from_bytes(bytes));
+    let recovered = StateOwnerCodecV2
+        .decode(&StateOwnerCodecV2.encode(&owner))
+        .unwrap();
+    assert_eq!(recovered, owner);
+    let mut history = BTreeMap::from([(fleet, (root(4), 19))]);
+    let before = history.clone();
+    let refused = root_history::fold(
+        &mut history,
+        recovered,
+        None,
+        root(0),
+        71,
+        Into::into,
+        |_, _, _| Err::<(), _>("encoding failed"),
+    );
+    assert!(matches!(refused, Err("encoding failed")));
+    assert_eq!(history, before);
+
+    let applied = root_history::fold(
+        &mut history,
+        recovered,
+        None,
+        root(0),
+        71,
+        Into::into,
+        |key, expected, replacement| {
+            encode_root_record(
+                scheme(),
+                &StateOwnerCodecV2.encode(key),
+                expected,
+                replacement,
+            )
+        },
+    );
+    assert!(matches!(applied, Ok(Decision::Applied(wire)) if wire ==
+        encode_root_record(scheme(), &StateOwnerCodecV2.encode(&owner), None, root(0)).unwrap()));
+    let repeat = root_history::fold(
+        &mut history,
+        recovered,
+        None,
+        root(0),
+        83,
+        Into::into,
+        |_, _, _| -> Result<(), ()> { panic!("idempotent replay attempted journal encoding") },
+    );
+    assert!(matches!(repeat, Ok(Decision::AlreadyPublished)));
+    assert_eq!(
+        history,
+        BTreeMap::from([(fleet, (root(4), 19)), (owner, (root(0), 71))])
+    );
+}

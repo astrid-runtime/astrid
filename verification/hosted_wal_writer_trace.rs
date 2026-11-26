@@ -1,5 +1,8 @@
 //! Construct a complete layout from the real Begin, Root and Commit encoders.
 use super::*;
+use std::collections::BTreeMap;
+use crate::wal_root_history::{self as table,Decision};
+use vstd::{laws_cmp::{obeys_cmp,obeys_cmp_concrete_eq},std_specs::btree::btree_map_inv};
 use crate::{owner_codec::{self,Owner},root_wire,root_transition::{self,Version,Replay}};
 use vstd::prelude::*;
 
@@ -42,18 +45,20 @@ fn write_data<H>(record:Measured,hash:H,checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]
 /// Any nonzero transaction sequence and representable Begin and Root bodies
 /// provide a concrete writer-produced layout. Require success in the reader
 /// and recover the exact stored Root bytes in its released batch.
+#[verifier::rlimit(25)]
 fn begin_root<H,F>(sequence:u64,begin_body:&[u8],root_body:&[u8],chunk_size:usize,hash:H,
     checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]>,finish:F,digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>)
-    -> (out:Option<(CheckedMarker,Vec<u8>)>)
+    -> (out:Option<(CheckedMarker,Vec<u8>,u64)>)
     where H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,F:Fn(&[u8])->[u8;32]+Copy,
     requires sequence != 0, begin_body.len() as int + root_body.len() + 288 <= usize::MAX,
         forall|m:[u8;8],n:u64,p:&[u8]| #[trigger] hash.requires((m,n,p)),
         forall|p:&[u8],v:[u8;32]| #[trigger] hash.ensures((physical::MAGIC,p.len() as u64,p),v) ==> v == (checksum@)(p@),
         forall|p:&[u8]| #[trigger] finish.requires((p,)),
         forall|p:&[u8],v:[u8;32]| #[trigger] finish.ensures((p,),v) ==> v == (digest@)(p@),
-    ensures out matches Some((checked,recovered)) && {
+    ensures out matches Some((checked,recovered,start)) && {
         let m = checked.marker();
         &&& recovered@ == root_body@
+        &&& start as int == 72 + begin_body.len()
         &&& m.counts.sequence == sequence && m.counts.logical == 2 && m.counts.objects == 0 && m.counts.roots == 1
         &&& m.counts.bytes as int == 40 + begin_body.len() + root_body.len()
         &&& m.digest == (digest@)(wal_measurement::digest_header(WalRecordKind::Begin,0,sequence,0,begin_body.len() as u64) + begin_body@
@@ -115,7 +120,9 @@ fn begin_root<H,F>(sequence:u64,begin_body:&[u8],root_body:&[u8],chunk_size:usiz
     }
     let mut recovered = Vec::new();
     recovered.extend_from_slice(scan.batch.roots()[0].body);
-    Some((scan.marker,recovered))
+    let released = scan.batch.roots()[0];
+    let start = released.next - (72 + released.body.len());
+    Some((scan.marker,recovered,start as u64))
 }
 
 spec fn version(r:root_wire::Root) -> Version {
@@ -128,29 +135,47 @@ fn decode_version(r:root_wire::Root) -> (v:Version)
     Version {generation:u64::from_le_bytes(r.generation),commit:r.commit}
 }
 
+fn wire_version(v:Version) -> (r:root_wire::Root)
+    ensures r.generation@ == vstd::bytes::spec_u64_to_le_bytes(v.generation), r.commit == v.commit,
+{
+    root_wire::Root {generation:commit_wire::little_endian(v.generation),commit:v.commit}
+}
+
 /// Consult the history of the owner decoded from the released record, then
 /// classify the replay against the full versions that the writer serialized.
 /// The maximum body is 138 bytes (8-byte length, 33-byte owner, 1-byte
 /// expected tag and two 48-byte roots). The three frames add 288 bytes.
-fn recover_root<H,F,L>(sequence:u64,begin:&[u8],owner:Owner,scheme:root_wire::Scheme,
+fn recover_root<H,F,K:Ord+Copy,L>(sequence:u64,begin:&[u8],owner:Owner,scheme:root_wire::Scheme,
     prior:Option<root_wire::Root>,next:root_wire::Root,chunk:usize,hash:H,
     checksum:Ghost<spec_fn(Seq<u8>)->[u8;32]>,finish:F,digest:Ghost<spec_fn(Seq<u8>)->[u8;32]>,
-    lookup:L,history:Ghost<spec_fn(Seq<u8>)->Option<Version>>)
+    key_of:L,key_spec:Ghost<spec_fn(Seq<u8>)->K>,history:&mut BTreeMap<K,(Version,u64)>)
     -> (out:Option<Replay>)
-    where H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,F:Fn(&[u8])->[u8;32]+Copy,L:FnOnce(Owner)->Option<Version>,
+    where H:Fn([u8;8],u64,&[u8])->[u8;32]+Copy,F:Fn(&[u8])->[u8;32]+Copy,L:FnOnce(Owner)->K,
     requires sequence != 0, begin.len() as int + 138 + 288 <= usize::MAX,
         forall|m:[u8;8],n:u64,p:&[u8]| #[trigger] hash.requires((m,n,p)),
         forall|p:&[u8],v:[u8;32]| #[trigger] hash.ensures((physical::MAGIC,p.len() as u64,p),v) ==> v == (checksum@)(p@),
         forall|p:&[u8]| #[trigger] finish.requires((p,)),
         forall|p:&[u8],v:[u8;32]| #[trigger] finish.ensures((p,),v) ==> v == (digest@)(p@),
-        forall|o:Owner| #[trigger] lookup.requires((o,)),
-        forall|o:Owner,v:Option<Version>| #[trigger] lookup.ensures((o,),v) ==> v == (history@)(o.bytes()),
+        forall|o:Owner| #[trigger] key_of.requires((o,)),
+        forall|o:Owner,k:K| #[trigger] key_of.ensures((o,),k) ==> k == (key_spec@)(o.bytes()),
+        forall|a:Owner,b:Owner| #[trigger] (key_spec@)(a.bytes()) == #[trigger] (key_spec@)(b.bytes()) ==> a.bytes() == b.bytes(),
+        obeys_cmp::<K>(), obeys_cmp_concrete_eq::<K>(), btree_map_inv(old(history)),
     ensures ({
-        let actual = (history@)(owner.bytes());
+        let k = (key_spec@)(owner.bytes());
+        let actual = if old(history)@.contains_key(k) {Some(old(history)@[k].0)} else {None};
         let expected = match prior {Some(r) => Some(version(r)),None => None};
         let replacement = version(next);
         let valid = match expected {None => replacement.generation == 0,
             Some(e) => replacement.generation as int == e.generation as int + 1};
+        &&& btree_map_inv(final(history))
+        &&& final(history)@ == if out matches Some(Replay::Apply) {
+            old(history)@.insert(k,(replacement,(72 + begin.len()) as u64))
+        } else { old(history)@ }
+        &&& forall|other:Owner| other.bytes() != owner.bytes() ==> {
+            let other_key = #[trigger] (key_spec@)(other.bytes());
+            &&& final(history)@.contains_key(other_key) == old(history)@.contains_key(other_key)
+            &&& old(history)@.contains_key(other_key) ==> final(history)@[other_key] == old(history)@[other_key]
+        }
         &&& out.is_some() == valid
         &&& out matches Some(d) ==> {
             &&& (d is AlreadyPublished) == root_transition::matches_root(actual,Some(replacement))
@@ -169,7 +194,7 @@ fn recover_root<H,F,L>(sequence:u64,begin:&[u8],owner:Owner,scheme:root_wire::Sc
             vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
         }
     }
-    let (_,body) = begin_root(sequence,begin,&wire,chunk,hash,checksum,finish,digest)?;
+    let (_,body,offset) = begin_root(sequence,begin,&wire,chunk,hash,checksum,finish,digest)?;
     proof { vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes(); }
     assert(body@.take(8) =~= vstd::bytes::spec_u64_to_le_bytes(key.len() as u64));
     let (saved,mut cursor) = root_wire::read_owner(&body).ok()?;
@@ -180,11 +205,61 @@ fn recover_root<H,F,L>(sequence:u64,begin:&[u8],owner:Owner,scheme:root_wire::Sc
     assert(root_wire::tail(body@,start,scheme,prior,next));
     let (e,r) = root_wire::read_tail(&body,&mut cursor,scheme).ok()?;
     proof { root_wire::unique_tail(body@,start,scheme,e,r,prior,next); }
+    proof {
+        assert(r.commit =~= next.commit);
+        assert(r.generation =~= next.generation);
+        if let Some(x) = e {
+            let y = prior.unwrap();
+            assert(x.commit =~= y.commit);
+            assert(x.generation =~= y.generation);
+        }
+        assert(r == next && e == prior);
+    }
     let expected = match e {Some(v) => Some(decode_version(v)), None => None};
     let replacement = decode_version(r);
     if !root_transition::valid_generation(expected,replacement.generation) {return None;}
-    let actual = lookup(recovered);
-    Some(root_transition::replay(actual,expected,replacement))
+    let owner_key = key_of(recovered);
+    let identity = |v:Version| -> (r:Version) ensures r == v { v };
+    assert forall|v:Version,r:Version| #[trigger] identity.ensures((v,),r) implies r == table::version(identity,v) by {
+        assert(exists|t:Version| identity.ensures((v,),t));
+    }
+    let ghost before = history@;
+    let ghost actual = if before.contains_key(owner_key) {Some(before[owner_key].0)} else {None};
+    let encode = |_:&K,expected:Option<Version>,replacement:Version| -> (journal:Result<Vec<u8>,()>)
+        requires expected == (match prior {Some(r) => Some(version(r)),None => None}), replacement == version(next),
+        ensures journal matches Ok(bytes) && bytes@ == body@,
+    {
+        let prev = match expected {Some(v) => Some(wire_version(v)),None => None};
+        let wire_next = wire_version(replacement);
+        proof {
+            vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+            assert(wire_next.generation =~= next.generation);
+            if let Some(p) = prev { assert(p.generation =~= prior.unwrap().generation); }
+            assert(prev == prior && wire_next == next);
+            assert(body@ =~= vstd::bytes::spec_u64_to_le_bytes(saved.len() as u64) + saved@ +
+                root_wire::prior(prior,scheme) + next.wire(scheme));
+        }
+        root_wire::encode(saved,scheme,prev,wire_next).ok_or(())
+    };
+    let decision = table::fold(history,owner_key,expected,replacement,offset,identity,encode).ok()?;
+    assert(table::optional_version(identity,actual) == actual);
+    assert(table::optional_version(identity,expected) == expected);
+    assert(table::version(identity,replacement) == replacement);
+    assert(owner_key == (key_spec@)(owner.bytes()));
+    assert(expected == match prior {Some(r) => Some(version(r)),None => None});
+    match decision {
+        Decision::AlreadyPublished => Some(Replay::AlreadyPublished),
+        Decision::Conflict(_) => Some(Replay::Conflict),
+        Decision::Applied(journal) => {
+            assert(journal@ == body@);
+            // A repeated recovery must preserve the first offset even if the
+            // journal encoder would now fail and the observed offset differs.
+            let unavailable = |_:&K,_:Option<Version>,_:Version| -> (res:Result<(),()>) ensures res.is_err() {Err(())};
+            let again = table::fold(history,owner_key,expected,replacement,0,identity,unavailable);
+            assert(again matches Ok(Decision::AlreadyPublished));
+            Some(Replay::Apply)
+        },
+    }
 }
 
 }

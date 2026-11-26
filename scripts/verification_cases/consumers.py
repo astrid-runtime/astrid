@@ -10,13 +10,33 @@ from .common import (
 def consumer_defects():
     """Weaken a production guarantee and require its trace consumer to fail."""
     trace = Path("verification/hosted_wal_writer_trace.rs")
+    history = Path("crates/astrid-storage/src/engine/durable/wal/root_history.rs")
+    yield (
+        "WAL owner map drops the source offset", history,
+        lambda s: replace_once(s, "history.insert(owner,(replacement,offset))", "history.insert(owner,(replacement,0))"), history,
+    )
+    yield (
+        "WAL owner map publishes despite journal failure", history,
+        lambda s: replace_once(s, "let journal = encode(&owner,expected,replacement)?;",
+                               "let encoded = encode(&owner,expected,replacement);\n"
+                               "            if encoded.is_err() {history.insert(owner,(replacement,offset)); return Err(encoded.err().unwrap());}\n"
+                               "            let journal = encoded?;"), history,
+    )
+    yield (
+        "WAL root history loses precision for unrelated owners", history,
+        lambda s: replace_once(s, "history.insert(owner,(replacement,offset));", "history.clear(); history.insert(owner,(replacement,offset));"), history,
+    )
+    yield (
+        "WAL publication forgets the encoded journal", history,
+        lambda s: replace_once(s, "applicable && encode.ensures((&owner,expected,replacement),Ok(j))", "applicable"), trace,
+    )
     yield (
         "released WAL root loses its body before owner recovery", trace,
         lambda source: replace_once(source, "&&& recovered@ == root_body@", "&&& true"), trace,
     )
     yield (
         "replay reads another owner's history", trace,
-        lambda source: replace_once(source, "lookup(recovered)", "lookup(Owner::System)"), trace,
+        lambda source: replace_once(source, "key_of(recovered)", "key_of(Owner::System)"), trace,
     )
     yield (
         "replay reconstructs the wrong commit identity", trace,

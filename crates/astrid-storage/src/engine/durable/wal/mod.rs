@@ -13,6 +13,7 @@ mod physical_wire;
 mod read_buffer;
 mod record_wire;
 mod replay;
+mod root_history;
 mod scan;
 mod transaction;
 mod types;
@@ -33,7 +34,7 @@ pub(super) use types::{
 #[allow(unused_imports)]
 pub(super) use writer::{WalSink, WalWriter};
 
-use super::{DurableError, WAL_FILE, io_error};
+use super::{DurableError, WAL_FILE, io_error, root_transition};
 
 /// Convert the private WAL grammar error into the durable engine's stable
 /// public error surface without discarding underlying I/O failures.

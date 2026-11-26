@@ -17,6 +17,7 @@ use super::codec::{
     decode_physical_header, decode_record, validate_logical_body, validate_record_version,
     wal_physical_limit,
 };
+use super::root_history::{self, Decision};
 use super::scan::WalScanner;
 use super::transaction::{self, Batch, Event, Origin, Step};
 use super::types::{WalEvent, WalObjectDescriptor, WalRootDescriptor};
@@ -129,7 +130,7 @@ where
             if codec.encode(&principal) != transition.principal() {
                 return Err(DurableError::InvalidPrincipal { offset: 0 });
             }
-            let actual = roots.get(&principal).map(|(root, _)| *root);
+            let actual = root_history::lookup(&roots, &principal);
             if actual != transition.expected() && actual != Some(transition.replacement()) {
                 // Object bytes remain safe repair evidence even when
                 // this transaction's root CAS is stale. Replay folds
@@ -313,7 +314,7 @@ where
                 offset: descriptor.offset().get(),
             });
         }
-        let actual = root_history.get(&principal).map(|(root, _)| *root);
+        let actual = root_history::lookup(root_history, &principal);
         let replacement = transition.replacement();
         if matches!(
             root_transition::replay(
@@ -378,29 +379,32 @@ where
 
     let mut journals = Vec::new();
     for (principal, transition, offset) in roots_to_publish {
-        let actual = root_history.get(&principal).map(|(root, _)| *root);
-        match root_transition::replay(
-            actual.map(Into::into),
-            transition.expected().map(Into::into),
-            transition.replacement().into(),
-        ) {
-            Replay::AlreadyPublished => continue,
-            Replay::Conflict => {
+        match root_history::fold(
+            root_history,
+            principal,
+            transition.expected(),
+            transition.replacement(),
+            offset,
+            Into::into,
+            |_, expected, replacement| {
+                encode_root_record(
+                    identity.scheme(),
+                    transition.principal(),
+                    expected,
+                    replacement,
+                )
+            },
+        )? {
+            Decision::AlreadyPublished => {},
+            Decision::Conflict(actual) => {
                 return Err(ModelError::RootConflict {
                     expected: transition.expected(),
                     actual,
                 }
                 .into());
             },
-            Replay::Apply => {},
+            Decision::Applied(journal) => journals.push(journal),
         }
-        journals.push(encode_root_record(
-            identity.scheme(),
-            transition.principal(),
-            transition.expected(),
-            transition.replacement(),
-        )?);
-        root_history.insert(principal, (transition.replacement(), offset));
     }
     if !journals.is_empty() {
         append_frames(roots_file, ROOT_MAGIC, &journals)?;
