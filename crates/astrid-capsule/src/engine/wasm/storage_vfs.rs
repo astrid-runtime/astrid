@@ -146,7 +146,9 @@ impl StorageBackend for WorkspaceBackend {
 pub(crate) struct AstridStorageVfs {
     filesystem: Box<dyn StorageBackend>,
     open_dirs: RwLock<HashMap<DirHandle, FilesystemPath>>,
-    open_files: RwLock<HashMap<FileHandle, Arc<Mutex<OpenFile<FilesystemPath>>>>>,
+    // Read/write borrow an entry through the table guard. Removing it gives close
+    // exclusive ownership, with no further lock wait before publication.
+    open_files: RwLock<HashMap<FileHandle, Mutex<OpenFile<FilesystemPath>>>>,
 }
 
 impl AstridStorageVfs {
@@ -441,7 +443,7 @@ impl Vfs for AstridStorageVfs {
         let new_handle = FileHandle::new();
         self.open_files.write().await.insert(
             new_handle.clone(),
-            Arc::new(Mutex::new(OpenFile::new(path, bytes, write, dirty))),
+            Mutex::new(OpenFile::new(path, bytes, write, dirty)),
         );
         Ok(new_handle)
     }
@@ -471,25 +473,15 @@ impl Vfs for AstridStorageVfs {
     }
 
     async fn read(&self, handle: &FileHandle) -> VfsResult<Vec<u8>> {
-        let file = self
-            .open_files
-            .read()
-            .await
-            .get(handle)
-            .cloned()
-            .ok_or(VfsError::InvalidHandle)?;
+        let files = self.open_files.read().await;
+        let file = files.get(handle).ok_or(VfsError::InvalidHandle)?;
         let mut file = file.lock().await;
         Ok(file.read_remaining())
     }
 
     async fn write(&self, handle: &FileHandle, content: &[u8]) -> VfsResult<()> {
-        let file = self
-            .open_files
-            .read()
-            .await
-            .get(handle)
-            .cloned()
-            .ok_or(VfsError::InvalidHandle)?;
+        let files = self.open_files.read().await;
+        let file = files.get(handle).ok_or(VfsError::InvalidHandle)?;
         let mut file = file.lock().await;
         match file.write_bytes(content) {
             WriteRange::End(_) => Ok(()),
@@ -507,7 +499,7 @@ impl Vfs for AstridStorageVfs {
             .await
             .remove(handle)
             .ok_or(VfsError::InvalidHandle)?;
-        let file = file.lock().await;
+        let file = file.into_inner();
         if let Some((path, bytes)) = file.publication() {
             self.filesystem
                 .write(path, bytes)
@@ -746,6 +738,45 @@ mod tests {
             .close(&reopened_handle)
             .await
             .expect("close persisted");
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_an_admitted_write_and_can_be_cancelled_before_retirement() {
+        let (_directory, store) = fixture().await;
+        let root = DirHandle::new();
+        let vfs = AstridStorageVfs::new(
+            &store,
+            StateOwner::Principal(PrincipalUid::from_bytes([0x44; 32])),
+            root.clone(),
+        );
+        let handle = vfs.open(&root, "note", true, true).await.unwrap();
+        let files = vfs.open_files.read().await;
+        let file = files.get(&handle).unwrap().lock().await;
+        let mut write = Box::pin(vfs.write(&handle, b"saved"));
+        tokio::select! {
+            biased;
+            _ = &mut write => panic!("write completed while its buffer was locked"),
+            () = std::future::ready(()) => {}
+        }
+        drop(file);
+        drop(files);
+        {
+            let mut close = Box::pin(vfs.close(&handle));
+            tokio::select! {
+                biased;
+                _ = &mut close => panic!("close overtook an admitted write"),
+                () = std::future::ready(()) => {}
+            }
+        }
+        write.await.unwrap();
+        vfs.close(&handle).await.unwrap();
+        assert!(matches!(
+            vfs.read(&handle).await,
+            Err(VfsError::InvalidHandle)
+        ));
+        let reopened = vfs.open(&root, "note", false, false).await.unwrap();
+        assert_eq!(vfs.read(&reopened).await.unwrap(), b"saved");
+        vfs.close(&reopened).await.unwrap();
     }
 
     #[tokio::test]
