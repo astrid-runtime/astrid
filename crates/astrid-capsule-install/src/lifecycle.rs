@@ -315,8 +315,8 @@ fn run_lifecycle_in_scope(
             .with_secret_env(secret_env)
             .with_execution_throttle(cpu);
     let principal_context = if let Some(storage) = principal_storage {
-        let directory = storage.principal_directory();
-        principal_context.with_principal_storage(storage, directory)
+        let uid = principal_uid.context("missing admitted lifecycle principal UID")?;
+        principal_context.with_admitted_principal_storage(storage, uid)
     } else {
         principal_context
     };

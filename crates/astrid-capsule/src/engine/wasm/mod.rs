@@ -1097,8 +1097,33 @@ pub(crate) fn build_principal_vfs_bundle(
         tracing::warn!(%principal, "principal has no durable UID; denying home:// access");
         return PrincipalVfsBundle::default();
     };
+    let home = build_principal_home(store, principal, uid);
+    // `/tmp` remains an explicitly ephemeral native scratch mount.  It is
+    // intentionally independent from the durable `home://` namespace.
+    let tmp = astrid_core::dirs::AstridHome::resolve()
+        .ok()
+        .and_then(|home| {
+            let path = home
+                .run_dir()
+                .join("principals")
+                .join(uid.to_string())
+                .join("tmp");
+            if astrid_core::platform_fs::ensure_private_directory(&path).is_ok() {
+                mount_dir_sync(&path)
+            } else {
+                None
+            }
+        });
+    PrincipalVfsBundle { home, tmp }
+}
+
+fn build_principal_home(
+    store: &astrid_storage::RuntimePrincipalStore,
+    principal: &astrid_core::PrincipalId,
+    uid: astrid_core::PrincipalUid,
+) -> Option<PrincipalMount> {
     let handle = astrid_capabilities::DirHandle::new();
-    let home = match storage_vfs::AstridStorageVfs::home(
+    match storage_vfs::AstridStorageVfs::home(
         store,
         astrid_storage::StateOwner::Principal(uid),
         principal,
@@ -1117,25 +1142,7 @@ pub(crate) fn build_principal_vfs_bundle(
             );
             None
         },
-    };
-
-    // `/tmp` remains an explicitly ephemeral native scratch mount.  It is
-    // intentionally independent from the durable `home://` namespace.
-    let tmp = astrid_core::dirs::AstridHome::resolve()
-        .ok()
-        .and_then(|home| {
-            let path = home
-                .run_dir()
-                .join("principals")
-                .join(uid.to_string())
-                .join("tmp");
-            if astrid_core::platform_fs::ensure_private_directory(&path).is_ok() {
-                mount_dir_sync(&path)
-            } else {
-                None
-            }
-        });
-    PrincipalVfsBundle { home, tmp }
+    }
 }
 
 fn mount_dir_sync(root: &std::path::Path) -> Option<PrincipalMount> {
@@ -3510,6 +3517,7 @@ pub struct LifecycleConfig {
 #[derive(Clone)]
 pub struct LifecyclePrincipalContext {
     principal: astrid_core::PrincipalId,
+    admitted_uid: Option<astrid_core::PrincipalUid>,
     secret_env: std::collections::HashSet<String>,
     file_secret_root: Option<PathBuf>,
     principal_directory: astrid_storage::PrincipalDirectory,
@@ -3524,6 +3532,7 @@ impl LifecyclePrincipalContext {
     pub fn new(principal: astrid_core::PrincipalId) -> Self {
         Self {
             principal,
+            admitted_uid: None,
             secret_env: std::collections::HashSet::new(),
             file_secret_root: None,
             principal_directory: astrid_storage::PrincipalDirectory::default(),
@@ -3566,8 +3575,22 @@ impl LifecyclePrincipalContext {
         principal_store: astrid_storage::RuntimePrincipalStore,
         principal_directory: astrid_storage::PrincipalDirectory,
     ) -> Self {
+        self.admitted_uid = principal_directory.uid_for(&self.principal).ok();
         self.principal_store = Some(principal_store);
         self.principal_directory = principal_directory;
+        self
+    }
+
+    /// Use the same owner already admitted for the lifecycle environment and secrets.
+    #[must_use]
+    pub fn with_admitted_principal_storage(
+        mut self,
+        store: astrid_storage::RuntimePrincipalStore,
+        uid: astrid_core::PrincipalUid,
+    ) -> Self {
+        self.principal_directory = store.principal_directory();
+        self.principal_store = Some(store);
+        self.admitted_uid = Some(uid);
         self
     }
 }
@@ -3580,6 +3603,7 @@ async fn build_lifecycle_host_state(
 ) -> CapsuleResult<HostState> {
     let LifecyclePrincipalContext {
         principal,
+        admitted_uid,
         secret_env,
         file_secret_root,
         principal_directory,
@@ -3600,9 +3624,33 @@ async fn build_lifecycle_host_state(
     // Lifecycle home access is the same UID-bound logical projection as the
     // steady-state load/recv paths. A legacy native `home_root` is retained
     // in the public config for source compatibility but is never mounted.
-    let home_mount = principal_store
-        .as_ref()
-        .and_then(|store| build_principal_vfs_bundle(store, &principal_directory, &principal).home);
+    let kv_backend = cfg.kv.backend();
+    let mut kv = cfg.kv.clone();
+    let mut home_mount = None;
+    if let Some(store) = &principal_store {
+        let uid = admitted_uid.ok_or_else(|| {
+            CapsuleError::ExecutionFailed("lifecycle principal has no admitted UID".into())
+        })?;
+        if store.principal_directory().uid_for(&principal).ok() != Some(uid) {
+            return Err(CapsuleError::ExecutionFailed(
+                "lifecycle principal owner changed".into(),
+            ));
+        }
+        if Arc::ptr_eq(&kv_backend, &store.kv()) {
+            let bound = store
+                .principal_capsule_kv(&principal, uid, cfg.capsule_id.as_str())
+                .map_err(|error| {
+                    CapsuleError::ExecutionFailed(format!("bind lifecycle KV: {error}"))
+                })?;
+            if bound.namespace() != kv.namespace() {
+                return Err(CapsuleError::ExecutionFailed(
+                    "lifecycle KV namespace mismatch".into(),
+                ));
+            }
+            kv = bound;
+        }
+        home_mount = build_principal_home(store, &principal, uid);
+    }
 
     Ok(HostState {
         wasi_ctx: build_wasi_ctx(),
@@ -3618,7 +3666,7 @@ async fn build_lifecycle_host_state(
         resource_table: wasmtime::component::ResourceTable::new(),
         principal: principal.clone(),
         system_runtime: false,
-        runtime_owner_uid: None,
+        runtime_owner_uid: admitted_uid,
         capsule_uuid: uuid::Uuid::new_v4(),
         caller_context: None,
         interceptor_active: false,
@@ -3651,15 +3699,10 @@ async fn build_lifecycle_host_state(
         // Lifecycle hooks don't run the per-principal recv loop; no cache needed.
         profile_cache: None,
         invocation_env_overlay: None,
-        // Lifecycle hooks (install/upgrade) run a ONE-SHOT, single-principal,
-        // NON-shared instance: `cfg.kv` / `cfg.secret_store` are already scoped to
-        // the specific principal the operator is installing for, no other
-        // principal ever touches this throwaway instance, and no per-invocation
-        // overlays are installed. So the load-time `kv` legitimately IS this
-        // principal's real store (not the shared-runtime neutral placeholder).
-        // `kv_backend` mirrors it for API completeness; overlays are never built.
-        kv_backend: cfg.kv.backend(),
-        kv: cfg.kv.clone(),
+        // Host-only control scopes retain the injected backend. Guest operations
+        // use the admitted UID view when backed by the durable principal store.
+        kv_backend,
+        kv,
         event_bus: cfg.event_bus.clone(),
         route_admission_gate: astrid_events::RouteAdmissionGate::default(),
         ipc_limiter: Arc::new(astrid_events::ipc::IpcRateLimiter::new()),
@@ -4050,7 +4093,8 @@ mod lifecycle_context_tests {
         let mut bob_state = build_lifecycle_host_state(
             &cfg,
             LifecyclePhase::Install,
-            LifecyclePrincipalContext::new(bob).with_principal_storage(principal_store, principals),
+            LifecyclePrincipalContext::new(bob)
+                .with_principal_storage(principal_store.clone(), principals.clone()),
             ledger.clone(),
         )
         .await
@@ -4068,6 +4112,53 @@ mod lifecycle_context_tests {
             reopened.get_config("API_KEY".into()).unwrap().as_deref(),
             Some("alice-secret")
         );
+
+        // A separately injected KV stays isolated even when durable home is available.
+        reopened.kv.set("preview", vec![1]).await.unwrap();
+        let durable = principal_store
+            .principal_capsule_kv(&principal, principal_uid, "test")
+            .unwrap();
+        assert_eq!(durable.get("preview").await.unwrap(), None);
+
+        let mut durable_cfg = cfg;
+        durable_cfg.kv = astrid_storage::ScopedKvStore::new(
+            principal_store.kv(),
+            format!("{principal}:capsule:test"),
+        )
+        .unwrap();
+        let admitted = || {
+            LifecyclePrincipalContext::new(principal.clone())
+                .with_admitted_principal_storage(principal_store.clone(), principal_uid)
+        };
+        let running = build_lifecycle_host_state(
+            &durable_cfg,
+            LifecyclePhase::Upgrade,
+            admitted(),
+            ledger.clone(),
+        )
+        .await
+        .unwrap();
+        running.kv.set("before", vec![1]).await.unwrap();
+        let replacement = astrid_core::PrincipalUid::from_bytes([0x93; 32]);
+        principals
+            .rename(
+                principal_uid,
+                &principal,
+                astrid_core::PrincipalId::new("agent-renamed").unwrap(),
+            )
+            .unwrap();
+        principals.register(principal.clone(), replacement).unwrap();
+        assert!(running.kv.set("after", vec![2]).await.is_err());
+        assert!(
+            build_lifecycle_host_state(&durable_cfg, LifecyclePhase::Upgrade, admitted(), ledger)
+                .await
+                .is_err()
+        );
+        let new_view = principal_store
+            .principal_capsule_kv(&principal, replacement, "test")
+            .unwrap();
+        assert_eq!(new_view.get("before").await.unwrap(), None);
+        assert_eq!(new_view.get("after").await.unwrap(), None);
     }
 }
 

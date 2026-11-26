@@ -22,7 +22,9 @@ The shared host adapter checks invocation authority and, where installed, acquir
 
 The retirement regression exercises all seven WIT methods. A second regression starts the actual WIT set method, holds its backend write at a barrier, and observes retirement waiting for it. The hosted tree view keeps the original namespace encoding and pins the principal UID when the view is constructed. The production selector proves that a storage operation selects an owner exactly when both the namespace bytes and the current directory UID match the admitted values. The tree adapter uses the returned UID for storage access. A native storage regression rebinds an alias and checks that the former view loses access while the new view and the ordinary backend agree on the replacement's data.
 
-These results still depend on correct invocation provenance, the directory lookup, and backend confinement of each operation to its selected owner and key or prefix. An operation which already obtained its owner may finish against that owner. Serialization with deletion and reclamation, unstamped lifecycle contexts, and the neutral system fallback remain runtime refinement obligations.
+Install and upgrade hooks pass the UID admitted for their secret and environment scopes into construction of the durable guest KV view and home mount. A changed alias denies startup, and an existing durable guest KV view can only select its admitted UID. Independently injected KV backends retain their original scope.
+
+These results still depend on correct invocation provenance, the directory lookup, and backend confinement of each operation to its selected owner and key or prefix. An operation which already obtained its owner may finish against that owner. Serialization with deletion and reclamation, lifecycle retirement tracking, and the neutral system fallback remain runtime refinement obligations.
 
 ## Native MCP network authority
 
