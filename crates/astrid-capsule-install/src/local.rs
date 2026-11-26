@@ -42,7 +42,7 @@ use std::cell::RefCell;
 
 use anyhow::{Context, bail};
 use astrid_capsule::capsule::CapsuleId;
-use astrid_capsule::discovery::load_manifest;
+use astrid_capsule::discovery::parse_manifest;
 use astrid_capsule::engine::wasm::host_state::LifecyclePhase;
 use astrid_core::PrincipalId;
 use astrid_core::dirs::{AstridHome, WorkspaceLayout};
@@ -162,6 +162,10 @@ pub struct InstallOptions {
 /// structured fields a dashboard can display.
 #[derive(Debug)]
 pub struct InstallOutput {
+    /// Validated identity of the capsule selected by this installation.
+    pub capsule_id: CapsuleId,
+    /// BLAKE3 of the manifest bytes accepted by the install authority.
+    pub manifest_hash: astrid_crypto::ContentHash,
     /// Final on-disk location of the capsule's per-install directory.
     pub target_dir: PathBuf,
     /// Whether this was a first install or an upgrade.
@@ -578,7 +582,9 @@ pub(crate) fn install_from_local_path_internal(
     if !manifest_path.exists() {
         bail!("No Capsule.toml found in {}", source_dir.display());
     }
-    let manifest = load_manifest(&manifest_path).context("failed to load Capsule manifest")?;
+    let manifest_text = std::fs::read_to_string(&manifest_path).context("read capsule manifest")?;
+    let manifest = parse_manifest(&manifest_path, &manifest_text)
+        .context("failed to load Capsule manifest")?;
     let id = CapsuleId::new(manifest.package.name.clone())?;
     if let Some(expected) = expected
         && id != *expected.id
@@ -610,6 +616,12 @@ pub(crate) fn install_from_local_path_internal(
     // decision-bound source digest before any install read or target mutation.
     let mut installed_authority =
         authority_for_install_source(source_dir, &manifest, Some(installed_authority))?;
+    if crate::authority::digest_manifest(manifest_text.as_bytes())
+        != installed_authority.manifest_digest
+    {
+        bail!("capsule manifest changed before installation");
+    }
+    let manifest_hash = astrid_crypto::ContentHash::hash(manifest_text.as_bytes());
 
     // Pre-flight checks — pure reads, no target mutation.
     let durable = options
@@ -924,6 +936,8 @@ pub(crate) fn install_from_local_path_internal(
     }
 
     Ok(InstallOutput {
+        capsule_id: id,
+        manifest_hash,
         target_dir,
         phase,
         installed_version,

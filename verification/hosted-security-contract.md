@@ -64,6 +64,10 @@ removing or creating a projection. The repair lock and registry read use the
 same UID. Principal runtime construction checks the binding against the
 captured UID. A replacement retains the UID from its validated runtime scope.
 
+Install activation uses the validated capsule ID returned by the installer. The
+install audit takes that same ID and the hash of the receipt-checked manifest
+bytes from the install result.
+
 Live activation rechecks the binding before it dispatches reload by alias.
 That check leaves concurrent alias changes during reload open. Ordering with
 retirement, authenticated request admission and durable commit still needs a

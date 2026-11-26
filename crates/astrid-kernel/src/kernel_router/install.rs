@@ -237,7 +237,9 @@ async fn install_and_activate(
     // must create a new runtime generation even when its bytes/hash are
     // unchanged (configuration and lifecycle state may have changed); merely
     // calling `ensure_principal_loaded` would return early on the old view.
-    if let Err(error) = activate_installed_capsule(kernel, target, admitted_uid, &output).await {
+    if let Err(error) =
+        activate_installed_capsule(kernel, target, admitted_uid, &output.capsule_id).await
+    {
         if let Some(transaction) = env_transaction {
             transaction.rollback(kernel).await;
         }
@@ -714,18 +716,14 @@ async fn activate_installed_capsule(
     kernel: &Arc<crate::Kernel>,
     target: &astrid_core::principal::PrincipalId,
     admitted_uid: astrid_core::PrincipalUid,
-    output: &InstallOutput,
+    id: &astrid_capsule_types::CapsuleId,
 ) -> Result<(), String> {
-    let manifest =
-        astrid_capsule::discovery::load_manifest(&output.target_dir.join("Capsule.toml"))
-            .map_err(|error| format!("installed capsule could not be activated: {error}"))?;
-    let id = astrid_capsule_types::CapsuleId::from_static(&manifest.package.name);
     kernel
         .principal_directory
         .bound_uid(target, Some(admitted_uid))
         .map_err(|error| format!("validate capsule activation owner: {error}"))?;
     kernel
-        .reload_one_capsule(&id, target)
+        .reload_one_capsule(id, target)
         .await
         .map_err(|error| format!("capsule installed on disk but live activation failed: {error:#}"))
 }
