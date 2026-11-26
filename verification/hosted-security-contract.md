@@ -594,9 +594,14 @@ the class-specific serialization decision. The actual
 OS lock, worker lifetime and stable-storage semantics remain obligations.
 
 
-For serialized writes and sync, the production blocking worker owns the
-serialization guard through filesystem execution and publication of the dirty
-bit. The worker-drain integration test cancels the async waiter while the worker
+For serialized writes and sync, worker preparation checks for a guard and a
+live lease after waiting. The production blocking worker owns that guard. The
+checked synchronous handoff invokes its sink with the admitted work and a
+borrow of the guard. The sink performs the filesystem operation and publishes
+the dirty bit before returning. The trace consumer connects the sink's result
+to the issued scope and operation under the observed phase, liveness and
+credential conditions. The concrete sink implementation, Tokio mutex semantics
+and the order of revocation acknowledgement remain refinement obligations. The worker-drain integration test cancels the async waiter while the worker
 is active and exercises revocation before and after release. This is execution
 evidence. Concurrent refinement still requires proving the correspondence
 between the lock, lifecycle transitions, worker effects and durable storage.

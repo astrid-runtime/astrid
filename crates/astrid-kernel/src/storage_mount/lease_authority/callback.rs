@@ -1,4 +1,5 @@
 //! Admission of a decoded operation on a private storage mount callback.
+use super::worker::Worker;
 use vstd::prelude::*;
 use astrid_core::storage_filesystem::StorageFilesystemOperationV1 as Operation;
 
@@ -49,6 +50,22 @@ impl OperationClass {
     {
         match self { Self::Read => false, Self::Write | Self::Sync => true }
     }
+}
+
+/// Queue a filesystem worker only with the fence required by this operation.
+pub(crate) fn prepare_worker<G,T>(guard: Option<G>, live_after_wait: bool,
+    target: T, operation: Operation) -> (work: Option<Worker<Option<G>, (T, Operation, OperationClass)>>)
+    ensures
+        work.is_some() == (if access_class(operation) == OperationClass::Read {
+            guard.is_none()
+        } else { guard.is_some() && live_after_wait }),
+        work matches Some(worker) ==> worker.binding() == (guard, (target, operation, access_class(operation))),
+{
+    let class = operation_class(&operation);
+    if class.requires_serialization() {
+        if guard.is_none() || !live_after_wait { return None; }
+    } else if guard.is_some() { return None; }
+    Some(Worker::new(guard, (target, operation, class)))
 }
 
 /// One-use evidence for the effect executor. Only admission can construct it.

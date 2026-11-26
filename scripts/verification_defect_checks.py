@@ -73,6 +73,7 @@ INPUTS = [
     STORAGE_FILE,
     PAIR_RESULT,
     LEASE_CALLBACK,
+    Path("crates/astrid-kernel/src/storage_mount/lease_authority/worker.rs"),
     LEASE_SUBTREE,
     LEASE_RESERVATION,
     Path("verification/hosted_lease_model.rs"),
@@ -433,6 +434,16 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "published authenticated callback loses its authorized effect",
             Path("verification/hosted_lease_model.rs"),
             lambda text: replace_once(text, "Admission::Accepted(ticket) => Some(ticket.into_effect())", "Admission::Accepted(_) => None"),
+        ),
+        (
+            "serialized worker accepts a stale lease after its wait",
+            LEASE_CALLBACK,
+            lambda source: replace_once(source, "guard.is_none() || !live_after_wait", "guard.is_none()"),
+        ),
+        (
+            "serialized worker accepts a missing serialization guard",
+            LEASE_CALLBACK,
+            lambda source: replace_once(source, "guard.is_none() || !live_after_wait", "!live_after_wait"),
         ),
         (
             "filesystem operation is redirected to backing capacity",
@@ -1365,6 +1376,13 @@ def copy_inputs(source: Path, tree: Path) -> None:
 def consumer_defects():
     """Weaken a production guarantee and require its trace consumer to fail."""
     consumer = Path("verification/hosted_lease_model.rs")
+    yield (
+        "worker loses the sink's completion guarantee",
+        Path("crates/astrid-kernel/src/storage_mount/lease_authority/worker.rs"),
+        lambda source: replace_once(source,
+            "ensures sink.ensures((&self.binding().0, self.binding().1), result)",
+            "ensures true"), consumer,
+    )
     for name, clause in [
         ("issued scope", "*bound.parts().1 == self.scope, "),
         ("issued backing", ", *bound.parts().2 == self.backing"),

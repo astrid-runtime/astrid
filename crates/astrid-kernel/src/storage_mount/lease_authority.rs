@@ -1,6 +1,7 @@
 //! Resolve mount lease authority and its immutable storage target.
 
 pub(super) mod callback;
+pub(super) mod worker;
 mod requester;
 pub(super) mod reservation;
 pub(super) mod subtree;

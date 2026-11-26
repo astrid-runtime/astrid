@@ -41,8 +41,9 @@ use crate::Kernel;
 mod admin_projection;
 mod lease_authority;
 use lease_authority::callback::{
-    Admission, Admitted, Destinations, Effect, Issued, OperationClass, admit,
+    Admission, Admitted, Destinations, Effect, Issued, OperationClass, admit, prepare_worker,
 };
+use lease_authority::worker::Worker;
 use lease_authority::{
     LeaseAuthority, LeaseTarget, resolve_owner,
     subtree::{BoundSubtree, Subtree},
@@ -340,7 +341,7 @@ pub(crate) async fn sync_lease(
     mount_id: StorageMountId,
 ) -> Result<(), String> {
     let state = owned_lease(kernel, caller, allow_cross_owner, mount_id)?;
-    let guard = Arc::clone(&kernel.storage_mount_mutations)
+    let guard = Arc::clone(&state.issued.backing.mutations)
         .lock_owned()
         .await;
     if !state.is_live() {
@@ -353,36 +354,38 @@ pub(crate) async fn sync_lease(
         .clone()
         .ok_or_else(|| "native principal store is unavailable".to_owned())?;
     let target = state.issued.scope.target;
+    let worker = Worker::new(guard, (target, store, state));
     tokio::task::spawn_blocking(move || {
-        let _guard = guard;
-        #[cfg(test)]
-        tokio::runtime::Handle::current().block_on(pause_mutation_for_test(&state));
-        match target {
-            LeaseTarget::OwnerRoot(owner) => AstridFilesystem::new(store.content(), owner)
-                .sync()
-                .map_err(|error| error.to_string()),
-            LeaseTarget::WorkspaceBranch(owner, workspace) => {
-                WorkspaceBranchStore::new(store.content())
-                    .filesystem(owner, workspace)
+        worker.run(|_guard, (target, store, state)| {
+            #[cfg(test)]
+            tokio::runtime::Handle::current().block_on(pause_mutation_for_test(&state));
+            match target {
+                LeaseTarget::OwnerRoot(owner) => AstridFilesystem::new(store.content(), owner)
                     .sync()
-                    .map_err(|error| error.to_string())
-            },
-            LeaseTarget::Subtree(BoundSubtree::FleetShared(uid)) => {
-                AstridFilesystem::new_fleet_shared(store.content(), StateOwner::Fleet(uid))
-                    .sync()
-                    .map_err(|error| error.to_string())
-            },
-            LeaseTarget::Subtree(BoundSubtree::PrincipalHome(uid)) => {
-                let filesystem = PrefixedFilesystem::principal_home(AstridFilesystem::new(
-                    store.content(),
-                    StateOwner::Principal(uid),
-                ));
-                filesystem.sync().map_err(|error| error.to_string())
-            },
-        }?;
-        state.dirty.store(false, Ordering::Release);
-        state.renew();
-        Ok(())
+                    .map_err(|error| error.to_string()),
+                LeaseTarget::WorkspaceBranch(owner, workspace) => {
+                    WorkspaceBranchStore::new(store.content())
+                        .filesystem(owner, workspace)
+                        .sync()
+                        .map_err(|error| error.to_string())
+                },
+                LeaseTarget::Subtree(BoundSubtree::FleetShared(uid)) => {
+                    AstridFilesystem::new_fleet_shared(store.content(), StateOwner::Fleet(uid))
+                        .sync()
+                        .map_err(|error| error.to_string())
+                },
+                LeaseTarget::Subtree(BoundSubtree::PrincipalHome(uid)) => {
+                    let filesystem = PrefixedFilesystem::principal_home(AstridFilesystem::new(
+                        store.content(),
+                        StateOwner::Principal(uid),
+                    ));
+                    filesystem.sync().map_err(|error| error.to_string())
+                },
+            }?;
+            state.dirty.store(false, Ordering::Release);
+            state.renew();
+            Ok(())
+        })
     })
     .await
     .map_err(|error| format!("mount sync worker failed: {error}"))?
@@ -799,65 +802,69 @@ async fn execute_operation(admission: CallbackAdmission<'_>) -> StorageFilesyste
         },
     };
     let is_mutation = matches!(class, OperationClass::Write);
-    let is_sync = matches!(class, OperationClass::Sync);
     let guard = if class.requires_serialization() {
-        let guard = Arc::clone(&backing.mutations).lock_owned().await;
-        if !state.is_live() {
-            return failure("stale-lease", "storage mount lease is expired or revoked");
-        }
-        Some(guard)
+        Some(Arc::clone(&backing.mutations).lock_owned().await)
     } else {
         None
     };
-    let runtime_home = backing.home.clone();
-    let Some(store) = backing.store.clone() else {
-        return failure("unavailable", "native principal store is unavailable");
+    let live_after_wait = guard.is_none() || state.is_live();
+    let Some(worker) = prepare_worker(
+        guard,
+        live_after_wait,
+        (Arc::clone(state), target),
+        operation,
+    ) else {
+        return failure("stale-lease", "storage mount lease is expired or revoked");
     };
     let in_flight = is_mutation.then(|| InFlightMutation::begin(state));
-    let state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
-        // A cancelled waiter cannot join a blocking worker. The worker owns
-        // serialization through both the filesystem effect and dirty accounting.
-        let _guard = guard;
-        let _in_flight = in_flight;
-        #[cfg(test)]
-        if is_mutation {
-            tokio::runtime::Handle::current().block_on(pause_mutation_for_test(&state));
-        }
-        let result = match target {
-            LeaseTarget::OwnerRoot(owner) => {
-                let filesystem = AstridFilesystem::new(store.content(), owner);
-                if owner == StateOwner::System && is_mutation {
-                    admin_projection::execute(&runtime_home, &store, operation)
-                } else {
+        worker.run(|_guard, ((state, target), operation, class)| {
+            let backing = &state.issued.backing;
+            let Some(store) = &backing.store else {
+                return failure("unavailable", "native principal store is unavailable");
+            };
+            let _in_flight = in_flight;
+            let is_mutation = matches!(class, OperationClass::Write);
+            let is_sync = matches!(class, OperationClass::Sync);
+            #[cfg(test)]
+            if is_mutation {
+                tokio::runtime::Handle::current().block_on(pause_mutation_for_test(&state));
+            }
+            let result = match target {
+                LeaseTarget::OwnerRoot(owner) => {
+                    let filesystem = AstridFilesystem::new(store.content(), owner);
+                    if owner == StateOwner::System && is_mutation {
+                        admin_projection::execute(&backing.home, store, operation)
+                    } else {
+                        execute_blocking(&filesystem, operation)
+                    }
+                },
+                LeaseTarget::WorkspaceBranch(owner, workspace) => {
+                    let branches = WorkspaceBranchStore::new(store.content());
+                    let filesystem = branches.filesystem(owner, workspace);
                     execute_blocking(&filesystem, operation)
-                }
-            },
-            LeaseTarget::WorkspaceBranch(owner, workspace) => {
-                let branches = WorkspaceBranchStore::new(store.content());
-                let filesystem = branches.filesystem(owner, workspace);
-                execute_blocking(&filesystem, operation)
-            },
-            LeaseTarget::Subtree(BoundSubtree::FleetShared(uid)) => {
-                let filesystem =
-                    AstridFilesystem::new_fleet_shared(store.content(), StateOwner::Fleet(uid));
-                execute_blocking(&filesystem, operation)
-            },
-            LeaseTarget::Subtree(BoundSubtree::PrincipalHome(uid)) => {
-                let filesystem = PrefixedFilesystem::principal_home(AstridFilesystem::new(
-                    store.content(),
-                    StateOwner::Principal(uid),
-                ));
-                execute_blocking(&filesystem, operation)
-            },
-        };
-        if result.is_ok() && (is_mutation || is_sync) {
-            state.dirty.store(is_mutation, Ordering::Release);
-        }
-        match result {
-            Ok(success) => StorageFilesystemOutcomeV1::Success(success),
-            Err(error) => map_filesystem_error(&error),
-        }
+                },
+                LeaseTarget::Subtree(BoundSubtree::FleetShared(uid)) => {
+                    let filesystem =
+                        AstridFilesystem::new_fleet_shared(store.content(), StateOwner::Fleet(uid));
+                    execute_blocking(&filesystem, operation)
+                },
+                LeaseTarget::Subtree(BoundSubtree::PrincipalHome(uid)) => {
+                    let filesystem = PrefixedFilesystem::principal_home(AstridFilesystem::new(
+                        store.content(),
+                        StateOwner::Principal(uid),
+                    ));
+                    execute_blocking(&filesystem, operation)
+                },
+            };
+            if result.is_ok() && (is_mutation || is_sync) {
+                state.dirty.store(is_mutation, Ordering::Release);
+            }
+            match result {
+                Ok(success) => StorageFilesystemOutcomeV1::Success(success),
+                Err(error) => map_filesystem_error(&error),
+            }
+        })
     })
     .await
     .unwrap_or_else(|error| failure("internal", &format!("filesystem worker failed: {error}")))

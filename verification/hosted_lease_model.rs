@@ -118,6 +118,31 @@ impl<T,B> RuntimeLease<T,B> {
         }
     }
 
+    /// A serialized filesystem sink is called with the fence and scope that
+    /// survived both initial admission and the post-wait liveness observation.
+    fn serialized_effect<G,R,F>(&self, guard: Option<G>, now: u64, expires: u64,
+        authenticated: bool, writable: bool, live_after_wait: bool,
+        operation: StorageFilesystemOperationV1, sink: F) -> (result: Option<R>)
+        where F: FnOnce(&Option<G>, (&T, StorageFilesystemOperationV1, OperationClass)) -> R,
+        requires
+            storage_callback::access_class(operation) != OperationClass::Read,
+            sink.requires((&guard, (&self.issued.scope, operation, storage_callback::access_class(operation)))),
+        ensures
+            result.is_some() == (self.phase() == Phase::Published && now <= expires &&
+                authenticated && (storage_callback::access_class(operation) != OperationClass::Write || writable) &&
+                guard.is_some() && live_after_wait),
+            result matches Some(receipt) ==> sink.ensures((&guard,
+                (&self.issued.scope, operation, storage_callback::access_class(operation))), receipt),
+    {
+        if let Some(Effect::Filesystem(_, scope, _, op, _)) =
+                self.effect((), now, expires, authenticated, writable, operation) {
+            if let Some(worker) = storage_callback::prepare_worker(guard, live_after_wait, scope, op) {
+                return Some(worker.run(sink));
+            }
+        }
+        None
+    }
+
     /// Once the runtime phase refines this trace prefix, even an authenticated
     /// caller with write permission can obtain no effect after closure.
     fn effect_after_closure<'a,L>(&'a self, lease: L, now: u64, expires: u64,
