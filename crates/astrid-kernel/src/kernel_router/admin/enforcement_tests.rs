@@ -581,15 +581,30 @@ async fn pair_storage_error_is_a_failed_authorized_operation() {
             deny: vec![],
         },
     };
-    let error = super::pair_device_handlers::PairIssueError::Internal("storage unavailable".into());
-    super::request_authorization::record_pair_issue_outcome(
+    // A legacy source which cannot be imported makes the real durable store
+    // unavailable after policy admission and before token insertion.
+    let path = crate::pair_token::PairTokenStore::path_for(&kernel.astrid_home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let response = send_admin(
         &kernel,
-        &pid("storage_audit"),
-        None,
-        &request,
-        &Err(error),
+        &PrincipalId::default(),
+        "auth.pair.issue",
+        request.into(),
     )
     .await;
+    assert_eq!(response["status"], "Error", "{response}");
+    assert!(
+        response
+            .to_string()
+            .contains("pair-token durable storage is unavailable"),
+        "{response}"
+    );
+    let store = crate::pair_token::DurablePairTokenStore::new(
+        kernel.principal_store.as_ref().unwrap().kv(),
+    )
+    .unwrap();
+    assert!(store.list().await.unwrap().is_empty());
     assert_pair_issue_audit(
         &kernel,
         "self:auth:pair",
@@ -620,7 +635,7 @@ async fn queued_pair_refusal(remove_profile: bool) {
         Topic::from_raw("astrid.v1.admin.auth.pair.issue"),
         caller.clone(),
         None,
-        request.into()
+        request.into(),
     ));
     tokio::select! {
         biased;
