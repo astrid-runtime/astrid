@@ -3,6 +3,7 @@
 use crate::{guest_authority, guest_kv_dispatch, principal_invocation_state::PrincipalInvocation};
 use crate::owner_codec::{self, Owner};
 use crate::root_transition::{Advance, PreparedRoot, Replay, Version, advance, replay};
+use crate::root_wire;
 use vstd::prelude::*;
 
 verus! {
@@ -112,8 +113,8 @@ spec fn recorded<R: Copy,E,U,W,A>(admitted: [u8;32], expected: Option<R>, replac
         && #[trigger] append.ensures((&admitted,expected,replacement,j), result)
 }
 
-/// Compose the pinned owner with the production journal encoder handoff and
-/// post-frontier publication. Persistence of these bytes is a caller obligation.
+/// Compose pinned selection with the checked callbacks. Concrete encoder,
+/// append and publication semantics are obligations of this model’s caller.
 fn guest_publication<R: Copy, E, U, T, W, A, F>(scope: &[u8], requested: &[u8], admitted: [u8;32],
     observed: [u8;32], expected: Option<R>, replacement: R, encode: W, append: A, publish: F)
     -> (outcome: Option<Result<(R,U,T), E>>)
@@ -157,6 +158,69 @@ fn guest_publication<R: Copy, E, U, T, W, A, F>(scope: &[u8], requested: &[u8], 
         },
         Err(e) => Some(Err(e)),
     }
+}
+
+/// Durable transition bytes for a guest-selected principal recover that
+/// principal and both prepared root fields, without a model decoder.
+fn guest_wal_round_trip(scope: &[u8], requested: &[u8], admitted: [u8;32], current: [u8;32],
+    scheme: root_wire::Scheme, expected: Option<root_wire::Root>, replacement: root_wire::Root)
+    -> (decoded: Option<(Owner, Option<root_wire::Root>, root_wire::Root)>)
+    ensures
+        decoded.is_some() == (scope@ == requested@ && admitted@ == current@),
+        decoded matches Some((owner,e,r)) ==> {
+            &&& (owner matches Owner::Principal(id) && id@ == admitted@)
+            &&& root_wire::same_expected(e,expected)
+            &&& root_wire::same(r,replacement)
+        },
+{
+    let owner = match guest_authority::select(scope,requested,admitted,current) {
+        Some(uid) => Owner::Principal(uid),
+        None => return None,
+    };
+    let name = owner.encode();
+    let encoder = |selected: &Owner, e: Option<root_wire::Root>, r: root_wire::Root| -> (out: Result<Vec<u8>,()>)
+        ensures out matches Ok(bytes) && bytes@ == vstd::bytes::spec_u64_to_le_bytes(selected.bytes().len() as u64)
+            + selected.bytes() + root_wire::prior(e,scheme) + r.wire(scheme),
+    {
+        let key = (*selected).encode();
+        match root_wire::encode(&key,scheme,e,r) {
+            Some(bytes) => Ok(bytes),
+            None => { assert(false); Err(()) },
+        }
+    };
+    let prepared = match PreparedRoot::encode(owner,expected,replacement,encoder) {
+        Ok(prepared) => prepared,
+        Err(()) => { assert(false); return None; },
+    };
+    let frame = prepared.journal();
+    proof { vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes(); }
+    assert(frame@.take(8) =~= vstd::bytes::spec_u64_to_le_bytes(33));
+    let (saved,mut cursor) = match root_wire::read_owner(frame) {
+        Ok(binding) => binding,
+        Err(_) => { assert(false); return None; },
+    };
+    assert(saved@ =~= name@);
+    let restored = match owner_codec::decode(saved) {
+        Some(Owner::Principal(id)) => {
+            assert(id@ =~= admitted@) by {
+                assert forall|i:int| 0 <= i < 32 implies #[trigger] id@[i] == admitted@[i] by {
+                    assert(saved@[1+i] == id@[i]);
+                    assert(name@[1+i] == admitted@[i]);
+                }
+            }
+            Owner::Principal(id)
+        },
+        _ => { assert(false); return None; },
+    };
+    let ghost start = cursor as int;
+    assert(frame@.skip(start) =~= root_wire::prior(expected,scheme) + replacement.wire(scheme));
+    assert(root_wire::tail(frame@,start,scheme,expected,replacement));
+    let (e,r) = match root_wire::read_tail(frame,&mut cursor,scheme) {
+        Ok(roots) => roots,
+        Err(_) => { assert(false); return None; },
+    };
+    proof { root_wire::unique_tail(frame@,start,scheme,e,r,expected,replacement); }
+    Some((restored,e,r))
 }
 
 /// An admitted live publication can be replayed from the prior root exactly

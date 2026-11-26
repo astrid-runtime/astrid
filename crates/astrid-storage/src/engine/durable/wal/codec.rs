@@ -1,7 +1,7 @@
 use super::super::format::{decode_object_frame, encode_object_frame, frame_checksum};
 use super::super::roots::encode_root_record;
 use super::super::{IdentityScheme, PersistentObjectIdentity, PrincipalCodec};
-use crate::storage_model::{ObjectId, ObjectRecord, RootGeneration, RootState};
+use crate::storage_model::{ObjectId, ObjectRecord, RootState};
 use std::borrow::Cow;
 
 use super::types::{
@@ -534,39 +534,39 @@ pub(super) fn decode_root_body<P, C>(
 where
     C: PrincipalCodec<P>,
 {
-    let mut reader = BodyReader::new(body, offset);
-    let principal_len = reader.u64()?;
-    let principal_len = WalLength::new(principal_len).as_usize()?;
-    let principal = reader.take(principal_len)?.to_vec();
-    validate_principal(codec, &principal)?;
-    let expected = match reader.u8()? {
-        0 => None,
-        1 => Some(reader.root_state(scheme)?),
-        _ => {
-            return Err(WalError::Corrupt {
+    use super::super::root_wire::{self, OwnerError, RootError, TailError};
+    let (principal, mut cursor) = root_wire::read_owner(body).map_err(|error| match error {
+        OwnerError::Read(error) => root_read_error(offset, error),
+        OwnerError::Length(length) => WalError::LengthOverflow {
+            value: WalLength::new(length),
+        },
+    })?;
+    validate_principal(codec, principal)?;
+    let (expected, replacement) =
+        root_wire::read_tail(body, &mut cursor, scheme.into()).map_err(|error| match error {
+            TailError::Read(e) | TailError::Root(RootError::Read(e)) => root_read_error(offset, e),
+            TailError::Root(RootError::Scheme { .. }) => WalError::IdentitySchemeMismatch,
+            TailError::ExpectedTag => WalError::Corrupt {
                 offset,
                 detail: "WAL root expected tag is invalid",
-            });
-        },
-    };
-    let replacement = reader.root_state(scheme)?;
-    if reader.remaining() != 0 {
-        return Err(WalError::Corrupt {
-            offset,
-            detail: "WAL root record has trailing bytes",
-        });
-    }
+            },
+            TailError::Trailing => WalError::Corrupt {
+                offset,
+                detail: "WAL root record has trailing bytes",
+            },
+        })?;
+    let expected = expected.map(Into::into);
+    let replacement = replacement.into();
     validate_root_generation(expected, replacement).map_err(|_| WalError::Corrupt {
         offset,
         detail: "WAL root generation transition is invalid",
     })?;
-    let canonical =
-        encode_root_record(scheme, &principal, expected, replacement).map_err(|_| {
-            WalError::Corrupt {
-                offset,
-                detail: "WAL root canonical encoding failed",
-            }
-        })?;
+    let canonical = encode_root_record(scheme, principal, expected, replacement).map_err(|_| {
+        WalError::Corrupt {
+            offset,
+            detail: "WAL root canonical encoding failed",
+        }
+    })?;
     if canonical.as_slice() != body {
         return Err(WalError::Corrupt {
             offset,
@@ -576,7 +576,7 @@ where
     let length =
         u64::try_from(body.len()).map_err(|_| WalError::Encoding("WAL root length overflow"))?;
     Ok((
-        WalRootTransition::new(principal, expected, replacement),
+        WalRootTransition::new(principal.to_vec(), expected, replacement),
         WalLength::new(length),
     ))
 }
@@ -585,14 +585,15 @@ fn validate_root_generation(
     expected: Option<RootState>,
     replacement: RootState,
 ) -> Result<(), WalError> {
-    match expected {
-        None if replacement.generation == RootGeneration::INITIAL => Ok(()),
-        Some(expected) if expected.generation.checked_next() == Some(replacement.generation) => {
-            Ok(())
-        },
-        _ => Err(WalError::InvalidTransaction(
+    if super::super::root_transition::valid_generation(
+        expected.map(Into::into),
+        replacement.generation.get(),
+    ) {
+        Ok(())
+    } else {
+        Err(WalError::InvalidTransaction(
             "WAL root generation transition is invalid",
-        )),
+        ))
     }
 }
 
@@ -697,101 +698,17 @@ fn read_u64(
         })
 }
 
-struct BodyReader<'a> {
-    bytes: &'a [u8],
+fn root_read_error(
     offset: super::types::WalOffset,
-    position: usize,
-}
-
-impl<'a> BodyReader<'a> {
-    fn new(bytes: &'a [u8], offset: super::types::WalOffset) -> Self {
-        Self {
-            bytes,
+    error: super::super::root_wire::ReadError,
+) -> WalError {
+    match error {
+        super::super::root_wire::ReadError::Overflow(length) => WalError::LengthOverflow {
+            value: WalLength::new(length as u64),
+        },
+        super::super::root_wire::ReadError::Truncated => WalError::Corrupt {
             offset,
-            position: 0,
-        }
-    }
-
-    fn take(&mut self, length: usize) -> Result<&'a [u8], WalError> {
-        let end = self
-            .position
-            .checked_add(length)
-            .ok_or(WalError::LengthOverflow {
-                value: WalLength::new(length as u64),
-            })?;
-        let bytes = self
-            .bytes
-            .get(self.position..end)
-            .ok_or(WalError::Corrupt {
-                offset: self.offset,
-                detail: "WAL root record is truncated",
-            })?;
-        self.position = end;
-        Ok(bytes)
-    }
-
-    fn u8(&mut self) -> Result<u8, WalError> {
-        self.take(1)?.first().copied().ok_or(WalError::Corrupt {
-            offset: self.offset,
-            detail: "WAL root byte is truncated",
-        })
-    }
-
-    fn u64(&mut self) -> Result<u64, WalError> {
-        self.take(8)?
-            .try_into()
-            .map(u64::from_le_bytes)
-            .map_err(|_| WalError::Corrupt {
-                offset: self.offset,
-                detail: "WAL root integer is truncated",
-            })
-    }
-
-    fn root_state(&mut self, scheme: IdentityScheme) -> Result<RootState, WalError> {
-        Ok(RootState {
-            generation: RootGeneration::new(self.u64()?),
-            commit: self.identity(scheme)?,
-        })
-    }
-
-    fn identity(&mut self, scheme: IdentityScheme) -> Result<ObjectId, WalError> {
-        let algorithm = self.u16()?;
-        let construction = self.u16()?;
-        let digest_len = self.u32()?;
-        if algorithm != scheme.algorithm()
-            || construction != scheme.construction()
-            || digest_len != 32
-        {
-            return Err(WalError::IdentitySchemeMismatch);
-        }
-        let digest = self.take(32)?.try_into().map_err(|_| WalError::Corrupt {
-            offset: self.offset,
-            detail: "WAL root identity is truncated",
-        })?;
-        Ok(ObjectId::new(digest))
-    }
-
-    fn u16(&mut self) -> Result<u16, WalError> {
-        self.take(2)?
-            .try_into()
-            .map(u16::from_le_bytes)
-            .map_err(|_| WalError::Corrupt {
-                offset: self.offset,
-                detail: "WAL root u16 is truncated",
-            })
-    }
-
-    fn u32(&mut self) -> Result<u32, WalError> {
-        self.take(4)?
-            .try_into()
-            .map(u32::from_le_bytes)
-            .map_err(|_| WalError::Corrupt {
-                offset: self.offset,
-                detail: "WAL root u32 is truncated",
-            })
-    }
-
-    fn remaining(&self) -> usize {
-        self.bytes.len().saturating_sub(self.position)
+            detail: "WAL root record is truncated",
+        },
     }
 }

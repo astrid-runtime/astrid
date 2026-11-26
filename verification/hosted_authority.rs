@@ -86,6 +86,9 @@ mod owner_codec;
 #[path = "../crates/astrid-storage/src/engine/durable/root_transition.rs"]
 mod root_transition;
 
+#[path = "../crates/astrid-storage/src/engine/durable/root_wire.rs"]
+mod root_wire;
+
 #[path = "../crates/astrid-storage/src/kv/encoding.rs"]
 mod encoding;
 

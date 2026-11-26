@@ -826,6 +826,7 @@ mod representations;
 mod restore;
 mod retirement;
 mod root_transition;
+mod root_wire;
 mod roots;
 
 impl From<RootState> for root_transition::Version {

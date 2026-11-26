@@ -958,3 +958,7 @@ mod tests;
 #[cfg(test)]
 #[path = "host_state_cancel_tests.rs"]
 mod cancel_tests;
+
+#[cfg(test)]
+#[path = "host_kv_restart_tests.rs"]
+mod kv_restart_tests;

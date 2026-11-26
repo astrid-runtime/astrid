@@ -53,6 +53,19 @@ pub(super) fn advance(actual: Option<Version>, expected: Option<Version>) -> (de
     }
 }
 
+/// A WAL descriptor must name the successor permitted at preparation.
+pub(super) fn valid_generation(expected: Option<Version>, replacement: u64) -> (valid: bool)
+    ensures valid == match expected {
+        None => replacement == 0,
+        Some(v) => replacement as int == v.generation as int + 1,
+    },
+{
+    match advance(expected, expected) {
+        Advance::Next(next) => next == replacement,
+        Advance::Conflict | Advance::Overflow => false,
+    }
+}
+
 /// A previously published WAL transition can be replayed idempotently.
 pub(super) enum Replay { AlreadyPublished, Apply, Conflict }
 

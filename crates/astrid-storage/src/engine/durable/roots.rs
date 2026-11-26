@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::storage_model::{ModelError, ObjectId, RootGeneration, RootState};
 
+use super::root_wire::{self, TailError};
 use super::{
     ArenaLocation, DurableError, DurableIo, File, IdentityScheme, PersistentObjectIdentity,
     PrincipalCodec, ROOT_FILE, ROOT_MAGIC, RecoveryLimits, corrupt, materialize_closure,
@@ -12,7 +13,32 @@ use super::{
 
 const SNAPSHOT_SENTINEL: u64 = u64::MAX;
 const SNAPSHOT_RECORD: u8 = 1;
-const CURRENT_DIGEST_BYTES: u32 = 32;
+impl From<IdentityScheme> for super::root_wire::Scheme {
+    fn from(scheme: IdentityScheme) -> Self {
+        Self {
+            algorithm: scheme.algorithm().to_le_bytes(),
+            construction: scheme.construction().to_le_bytes(),
+        }
+    }
+}
+
+impl From<RootState> for super::root_wire::Root {
+    fn from(root: RootState) -> Self {
+        Self {
+            generation: root.generation.get().to_le_bytes(),
+            commit: *root.commit.as_bytes(),
+        }
+    }
+}
+
+impl From<super::root_wire::Root> for RootState {
+    fn from(root: super::root_wire::Root) -> Self {
+        Self {
+            generation: RootGeneration::new(u64::from_le_bytes(root.generation)),
+            commit: ObjectId::new(root.commit),
+        }
+    }
+}
 
 pub(super) fn recover_root_history<P, C, R>(
     roots: &mut R,
@@ -231,23 +257,13 @@ pub(super) fn encode_root_record(
     expected: Option<RootState>,
     replacement: RootState,
 ) -> Result<Vec<u8>, DurableError> {
-    let principal_len =
-        u64::try_from(principal.len()).map_err(|_| DurableError::EncodingOverflow)?;
-    if principal_len == SNAPSHOT_SENTINEL {
-        return Err(DurableError::EncodingOverflow);
-    }
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&principal_len.to_le_bytes());
-    bytes.extend_from_slice(principal);
-    match expected {
-        None => bytes.push(0),
-        Some(root) => {
-            bytes.push(1);
-            encode_root_state(&mut bytes, scheme, root);
-        },
-    }
-    encode_root_state(&mut bytes, scheme, replacement);
-    Ok(bytes)
+    super::root_wire::encode(
+        principal,
+        scheme.into(),
+        expected.map(Into::into),
+        replacement.into(),
+    )
+    .ok_or(DurableError::EncodingOverflow)
 }
 
 pub(super) fn encode_root_snapshot(
@@ -280,15 +296,7 @@ pub(super) fn encode_root_snapshot(
 }
 
 fn encode_root_state(bytes: &mut Vec<u8>, scheme: IdentityScheme, root: RootState) {
-    bytes.extend_from_slice(&root.generation.get().to_le_bytes());
-    encode_identity(bytes, scheme, root.commit);
-}
-
-fn encode_identity(bytes: &mut Vec<u8>, scheme: IdentityScheme, id: ObjectId) {
-    bytes.extend_from_slice(&scheme.algorithm().to_le_bytes());
-    bytes.extend_from_slice(&scheme.construction().to_le_bytes());
-    bytes.extend_from_slice(&CURRENT_DIGEST_BYTES.to_le_bytes());
-    bytes.extend_from_slice(id.as_bytes());
+    super::root_wire::Root::from(root).append(bytes, scheme.into());
 }
 
 enum DecodedRootJournalRecord {
@@ -338,20 +346,25 @@ fn decode_root_journal_record(
     let principal_len =
         usize::try_from(prefix).map_err(|_| "principal length is not process-addressable")?;
     let principal = reader.take(principal_len)?.to_vec();
-    let expected = match reader.u8()? {
-        0 => None,
-        1 => Some(reader.root_state(scheme)?),
-        _ => return Err("invalid expected-root tag"),
-    };
-    let replacement = reader.root_state(scheme)?;
-    if reader.remaining() != 0 {
-        return Err("trailing root-journal bytes");
-    }
+    let (expected, replacement) = root_wire::read_tail(bytes, &mut reader.offset, scheme.into())
+        .map_err(|error| match error {
+            TailError::Read(e) => read_error(e),
+            TailError::Root(e) => reader.root_error(e, scheme),
+            TailError::ExpectedTag => "invalid expected-root tag",
+            TailError::Trailing => "trailing root-journal bytes",
+        })?;
     Ok(DecodedRootJournalRecord::Transition(DecodedRootRecord {
         principal,
-        expected,
-        replacement,
+        expected: expected.map(Into::into),
+        replacement: replacement.into(),
     }))
+}
+
+fn read_error(error: super::root_wire::ReadError) -> &'static str {
+    match error {
+        super::root_wire::ReadError::Overflow(_) => "frame length overflow",
+        super::root_wire::ReadError::Truncated => "truncated frame payload",
+    }
 }
 
 struct RootReader<'a> {
@@ -369,36 +382,11 @@ impl<'a> RootReader<'a> {
     }
 
     fn take(&mut self, len: usize) -> Result<&'a [u8], &'static str> {
-        let end = self
-            .offset
-            .checked_add(len)
-            .ok_or("frame length overflow")?;
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or("truncated frame payload")?;
-        self.offset = end;
-        Ok(value)
+        super::root_wire::take(self.bytes, &mut self.offset, len).map_err(read_error)
     }
 
     fn u8(&mut self) -> Result<u8, &'static str> {
         self.take(1)?.first().copied().ok_or("truncated u8 field")
-    }
-
-    fn u16(&mut self) -> Result<u16, &'static str> {
-        Ok(u16::from_le_bytes(
-            self.take(2)?
-                .try_into()
-                .map_err(|_| "truncated u16 field")?,
-        ))
-    }
-
-    fn u32(&mut self) -> Result<u32, &'static str> {
-        Ok(u32::from_le_bytes(
-            self.take(4)?
-                .try_into()
-                .map_err(|_| "truncated u32 field")?,
-        ))
     }
 
     fn u64(&mut self) -> Result<u64, &'static str> {
@@ -413,28 +401,43 @@ impl<'a> RootReader<'a> {
         usize::try_from(self.u64()?).map_err(|_| "length is not process-addressable")
     }
 
-    fn identity(&mut self, scheme: IdentityScheme) -> Result<ObjectId, &'static str> {
-        let algorithm = self.u16()?;
-        let construction = self.u16()?;
-        let digest_len =
-            usize::try_from(self.u32()?).map_err(|_| "identity digest length overflow")?;
-        if algorithm == 0 || construction == 0 || digest_len == 0 {
-            return Err("identity tag fields must be non-zero");
-        }
-        let digest = self.take(digest_len)?;
-        if algorithm != scheme.algorithm() || construction != scheme.construction() {
-            return Err("unsupported identity algorithm or construction version");
-        }
-        digest
-            .try_into()
-            .map(ObjectId::new)
-            .map_err(|_| "identity digest length does not match the supported scheme")
+    fn root_state(&mut self, scheme: IdentityScheme) -> Result<RootState, &'static str> {
+        super::root_wire::read_root(self.bytes, &mut self.offset, scheme.into())
+            .map(Into::into)
+            .map_err(|error| self.root_error(error, scheme))
     }
 
-    fn root_state(&mut self, scheme: IdentityScheme) -> Result<RootState, &'static str> {
-        Ok(RootState {
-            generation: RootGeneration::new(self.u64()?),
-            commit: self.identity(scheme)?,
-        })
+    fn root_error(
+        &mut self,
+        error: super::root_wire::RootError,
+        scheme: IdentityScheme,
+    ) -> &'static str {
+        let (algorithm, construction, size) = match error {
+            super::root_wire::RootError::Read(e) => return read_error(e),
+            super::root_wire::RootError::Scheme {
+                algorithm,
+                construction,
+                size,
+            } => (
+                u16::from_le_bytes(algorithm),
+                u16::from_le_bytes(construction),
+                u32::from_le_bytes(size),
+            ),
+        };
+        let Ok(len) = usize::try_from(size) else {
+            return "identity digest length overflow";
+        };
+        if algorithm == 0 || construction == 0 || len == 0 {
+            return "identity tag fields must be non-zero";
+        }
+        // Journal diagnostics distinguish an incomplete digest from an
+        // unsupported identity. Preserve the existing error precedence.
+        if let Err(error) = self.take(len) {
+            return error;
+        }
+        if algorithm != scheme.algorithm() || construction != scheme.construction() {
+            return "unsupported identity algorithm or construction version";
+        }
+        "identity digest length does not match the supported scheme"
     }
 }

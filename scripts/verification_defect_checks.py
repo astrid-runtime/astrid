@@ -114,6 +114,7 @@ INPUTS = [
     OVERLAY,
     KV_ENCODING,
     GUEST_AUTHORITY,
+    Path("crates/astrid-storage/src/engine/durable/root_wire.rs"),
     Path("crates/astrid-storage/src/principal_state/owner_codec.rs"),
     Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),
     ENTRY,
@@ -461,6 +462,21 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "stale KV view falls back to neutral and completes the request",
             Path("verification/hosted_kv_model.rs"),
             lambda source: replace_once(source, "Some(uid) => Some(Destination::Principal(uid)),\n                None => None,", "Some(uid) => Some(Destination::Principal(uid)),\n                None => Some(Destination::Neutral),"),
+        ),
+        (
+            "transition journals record the construction in place of the algorithm",
+            Path("crates/astrid-storage/src/engine/durable/root_wire.rs"),
+            lambda source: replace_once(source, "bytes.extend_from_slice(&scheme.algorithm);", "bytes.extend_from_slice(&scheme.construction);"),
+        ),
+        (
+            "root payload reader skips the last byte of a field",
+            Path("crates/astrid-storage/src/engine/durable/root_wire.rs"),
+            lambda source: replace_once(source, "*cursor = end;", "*cursor = end.saturating_sub(1);"),
+        ),
+        (
+            "WAL transition accepts trailing bytes",
+            Path("crates/astrid-storage/src/engine/durable/root_wire.rs"),
+            lambda source: replace_once(source, "if *cursor != bytes.len()", "if *cursor > bytes.len()"),
         ),
         (
             "durable principal encoded as fleet",
@@ -1508,6 +1524,12 @@ def consumer_defects():
             lambda source, clause=clause: replace_once(source, clause, "&&& true" if clause.startswith("&&&") else "true"),
             Path("verification/hosted_kv_model.rs"),
         )
+    yield (
+        "WAL parser loses the recovered transition fields",
+        Path("crates/astrid-storage/src/engine/durable/root_wire.rs"),
+        lambda source: replace_once(source, "&&& bytes@.skip(*old(cursor) as int) == prior(expected,scheme) + replacement.wire(scheme)", "&&& true"),
+        Path("verification/hosted_kv_model.rs"),
+    )
     consumer = Path("verification/hosted_lease_model.rs")
     yield (
         "worker loses the sink's completion guarantee",
