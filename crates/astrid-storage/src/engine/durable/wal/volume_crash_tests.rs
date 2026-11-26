@@ -64,6 +64,58 @@ fn open_volume(
 }
 
 #[test]
+fn failed_recovery_root_flush_preserves_committed_wal_for_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let volume: Arc<dyn AstridVolume> =
+        HostedFileVolume::open(&directory.path().join("astrid.volume")).unwrap();
+    let engine = DurableEngine::open_volume_with_faults(
+        Arc::clone(&volume),
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        wal_policy(),
+        Arc::new(FailAt(FaultPoint::BeforeInProcessRecoveryRootFlush)),
+    )
+    .unwrap();
+    let (commit, tx) = kv_transaction("alice", None, b"retain until stable");
+    engine.commit(tx).unwrap();
+    let wal = VolumeRegion::new(WAL_FILE).unwrap();
+    let read_wal = || {
+        let len = usize::try_from(volume.region_len(&wal).unwrap()).unwrap();
+        let mut bytes = vec![0; len];
+        assert_eq!(volume.read_region_at(&wal, 0, &mut bytes).unwrap(), len);
+        bytes
+    };
+    let before = read_wal();
+    assert!(!before.is_empty());
+    engine.mark_requires_recovery(&mut engine.inner.lock());
+    assert!(matches!(
+        engine.recover_if_required(),
+        Err(DurableError::Io {
+            operation: "flush recovered root journal",
+            ..
+        })
+    ));
+    assert_eq!(read_wal(), before);
+    drop(engine);
+
+    let reopened = DurableEngine::open_volume(
+        Arc::clone(&volume),
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        wal_policy(),
+    )
+    .unwrap();
+    assert_eq!(
+        reopened.root(&"alice".to_owned()).unwrap().unwrap().commit,
+        commit
+    );
+    assert!(reopened.object(commit).unwrap().is_some());
+    assert_eq!(volume.region_len(&wal).unwrap(), 0);
+}
+
+#[test]
 fn after_wal_publication_crash_replays_committed_visibility() {
     let directory = tempfile::tempdir().unwrap();
     let volume_path = directory.path().join("astrid.volume");

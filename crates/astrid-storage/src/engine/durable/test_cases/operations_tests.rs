@@ -889,8 +889,21 @@ fn live_snapshot_reads_indexed_objects_lazily_from_the_arena() {
 #[test]
 fn recovery_reports_root_journal_model_failure_with_offset() {
     let directory = tempfile::tempdir().unwrap();
-    drop(open(directory.path()));
+    let open = || {
+        let policy = DurableEnginePolicy::default().with_transaction_wal(
+            TransactionWalPolicy::enabled(std::num::NonZeroU64::new(u64::MAX).unwrap()),
+        );
+        DurableEngine::open_with_policy(directory.path(), TestIdentity, Utf8Codec, limits(), policy)
+    };
+    let engine = open().unwrap();
+    let (commit, tx) = transaction("bob", None, b"committed before recovery");
+    engine.commit(tx).unwrap();
+    drop(engine);
+    let wal = directory.path().join(WAL_FILE);
+    let before = std::fs::read(&wal).unwrap();
+    assert!(!before.is_empty());
     let journal = directory.path().join(ROOT_FILE);
+    let original = std::fs::read(&journal).unwrap();
     let payload = encode_root_record(
         TEST_IDENTITY_SCHEME,
         b"alice",
@@ -904,20 +917,30 @@ fn recovery_reports_root_journal_model_failure_with_offset() {
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(journal)
+        .open(&journal)
         .unwrap();
+    file.seek(SeekFrom::End(0)).unwrap();
     append_frame(&mut file, ROOT_MAGIC, &payload).unwrap();
     file.sync_data().unwrap();
     drop(file);
 
     assert!(matches!(
-        DurableEngine::open(directory.path(), TestIdentity, Utf8Codec, limits()),
+        open(),
         Err(DurableError::RecoveryModel {
             file: ROOT_FILE,
-            offset: 0,
+            offset,
             source: ModelError::MissingObject(_),
-        })
+        }) if offset == original.len() as u64
     ));
+    assert_eq!(std::fs::read(&wal).unwrap(), before);
+    std::fs::write(journal, original).unwrap();
+    let engine = open().unwrap();
+    assert_eq!(
+        engine.root(&"bob".to_owned()).unwrap().unwrap().commit,
+        commit
+    );
+    assert!(engine.object(commit).unwrap().is_some());
+    assert_eq!(std::fs::metadata(wal).unwrap().len(), 0);
 }
 
 #[test]
