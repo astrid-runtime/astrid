@@ -615,7 +615,7 @@ async fn queued_pair_refusal(remove_profile: bool) {
             deny: vec![],
         },
     };
-    let mut queued = std::pin::pin!(super::handle_admin_request(
+    let mut queued = Box::pin(super::handle_admin_request(
         &kernel,
         Topic::from_raw("astrid.v1.admin.auth.pair.issue"),
         caller.clone(),
