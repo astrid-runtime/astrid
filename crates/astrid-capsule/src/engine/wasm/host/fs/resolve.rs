@@ -93,6 +93,14 @@ pub(super) fn resolve_physical_absolute(
     })
 }
 
+/// Which VFS target a resolved path points at.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum VfsTarget {
+    Workspace,
+    Home,
+    Tmp,
+}
+
 /// Phase-1 resolution: physical path for the security gate + VFS-relative
 /// path + which VFS bundle to use.
 pub(super) struct ResolvedPath {
