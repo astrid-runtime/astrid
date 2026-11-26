@@ -887,7 +887,7 @@ fn live_snapshot_reads_indexed_objects_lazily_from_the_arena() {
 }
 
 #[test]
-fn recovery_reports_root_journal_model_failure_with_offset() {
+fn cold_recovery_retains_wal_on_root_validation_failure() {
     let directory = tempfile::tempdir().unwrap();
     let open = || {
         let policy = DurableEnginePolicy::default().with_transaction_wal(
@@ -1443,13 +1443,18 @@ fn in_process_recovery_retries_ordered_stabilization_flushes() {
                     GroupCommitPolicy::immediate(),
                     RecoveryRetryPolicy::new(std::num::NonZeroU32::new(2).unwrap(), Duration::ZERO),
                     ObjectCacheConfig::disabled(),
-                ),
+                )
+                .with_transaction_wal(TransactionWalPolicy::enabled(
+                    std::num::NonZeroU64::new(u64::MAX).unwrap(),
+                )),
                 faults: failure.clone(),
             },
         )
         .unwrap();
-        let (_, transaction) = transaction("alice", None, b"durable");
+        let (commit, transaction) = transaction("alice", None, b"durable");
         let root = engine.commit(transaction).unwrap().root();
+        let wal = directory.path().join(WAL_FILE);
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0);
         {
             let mut inner = engine.inner.lock();
             engine.mark_requires_recovery(&mut inner);
@@ -1457,6 +1462,8 @@ fn in_process_recovery_retries_ordered_stabilization_flushes() {
 
         assert_eq!(engine.root(&"alice".to_owned()).unwrap(), Some(root));
         assert_eq!(failure.observed(), expected);
+        assert!(engine.object(commit).unwrap().is_some());
+        assert_eq!(std::fs::metadata(wal).unwrap().len(), 0);
     }
 }
 
