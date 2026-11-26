@@ -1,252 +1,1102 @@
-astrid:approval/host@1.0.0
-  request-approval
+## astrid:approval/host@1.0.0
 
-astrid:elicit/host@1.0.0
-  elicit
-  has-secret
+variant error-code {
+  invalid-input,
+  timeout,
+  store-unavailable,
+  unknown(string),
+}
 
-astrid:fs/host@1.0.0
-  [drop]file-handle
-  [method]file-handle.read-at
-  [method]file-handle.set-len
-  [method]file-handle.stat
-  [method]file-handle.sync-all
-  [method]file-handle.sync-data
-  [method]file-handle.write-at
-  fs-append
-  fs-canonicalize
-  fs-copy
-  fs-exists
-  fs-hard-link
-  fs-mkdir
-  fs-mkdir-all
-  fs-open
-  fs-read-link
-  fs-readdir
-  fs-remove-dir-all
-  fs-rename
-  fs-stat
-  fs-stat-symlink
-  fs-unlink
-  read-file
-  write-file
+record approval-request {
+  action: string,
+  target-resource: string,
+}
 
-astrid:guest/lifecycle@1.0.0
+enum approval-decision {
+  denied,
+  approved,
+  approved-session,
+  approved-always,
+  allowance,
+}
 
-astrid:http/host@1.0.0
-  [drop]http-stream
-  [method]http-stream.body-stream
-  [method]http-stream.close
-  [method]http-stream.headers
-  [method]http-stream.read-chunk
-  [method]http-stream.status
-  [method]http-stream.subscribe-readable
-  http-request
-  http-stream-start
+record approval-response {
+  decision: approval-decision,
+}
 
-astrid:http/host@1.1.0
-  [drop]http-stream
-  [drop]http-upload
-  [method]http-stream.body-stream
-  [method]http-stream.close
-  [method]http-stream.headers
-  [method]http-stream.read-chunk
-  [method]http-stream.status
-  [method]http-stream.subscribe-readable
-  [method]http-stream.trailers
-  [method]http-upload.body-sink
-  [method]http-upload.finish
-  [method]http-upload.subscribe-writable
-  http-request
-  http-request-opts
-  http-stream-start
-  http-stream-start-opts
-  http-upload-start
+request-approval: func(request: approval-request) -> result<approval-response, error-code>;
 
-astrid:identity/host@1.0.0
-  identity-create-user
-  identity-link
-  identity-list-links
-  identity-resolve
-  identity-unlink
+## astrid:elicit/host@1.0.0
 
-astrid:io/error@1.0.0
-  [drop]error
-  [method]error.to-debug-string
+variant error-code {
+  not-in-lifecycle,
+  timeout,
+  cancelled,
+  invalid-input,
+  store-unavailable,
+  unknown(string),
+}
 
-astrid:io/poll@1.0.0
-  [drop]pollable
-  [method]pollable.block
-  [method]pollable.ready
-  poll
+enum elicit-type {
+  text,
+  secret,
+  select,
+  array,
+}
 
-astrid:io/streams@1.0.0
-  [drop]input-stream
-  [drop]output-stream
-  [method]input-stream.blocking-read
-  [method]input-stream.blocking-skip
-  [method]input-stream.read
-  [method]input-stream.skip
-  [method]input-stream.subscribe
-  [method]output-stream.blocking-flush
-  [method]output-stream.blocking-splice
-  [method]output-stream.blocking-write-and-flush
-  [method]output-stream.blocking-write-zeroes-and-flush
-  [method]output-stream.check-write
-  [method]output-stream.flush
-  [method]output-stream.splice
-  [method]output-stream.subscribe
-  [method]output-stream.write
-  [method]output-stream.write-zeroes
+record elicit-request {
+  kind: elicit-type,
+  key: string,
+  description: string,
+  options: option<list<string>>,
+  default-value: option<string>,
+}
 
-astrid:ipc/host@1.0.0
-  [drop]subscription
-  [method]subscription.poll
-  [method]subscription.recv
-  [method]subscription.subscribe-readiness
-  get-interceptor-bindings
-  publish
-  publish-as
-  subscribe
+variant elicit-response {
+  value(string),
+  values(list<string>),
+  secret-stored,
+}
 
-astrid:kv/host@1.0.0
-  kv-cas
-  kv-clear-prefix
-  kv-delete
-  kv-get
-  kv-list-keys
-  kv-list-keys-page
-  kv-set
+elicit: func(request: elicit-request) -> result<elicit-response, error-code>;
 
-astrid:net/host@1.0.0
-  [drop]tcp-listener
-  [drop]tcp-stream
-  [drop]udp-socket
-  [drop]unix-listener
-  [method]tcp-listener.accept
-  [method]tcp-listener.local-addr
-  [method]tcp-listener.poll-accept
-  [method]tcp-listener.subscribe-readiness
-  [method]tcp-stream.hop-limit
-  [method]tcp-stream.keepalive
-  [method]tcp-stream.linger
-  [method]tcp-stream.local-addr
-  [method]tcp-stream.nodelay
-  [method]tcp-stream.peek
-  [method]tcp-stream.peer-addr
-  [method]tcp-stream.read
-  [method]tcp-stream.read-bytes
-  [method]tcp-stream.read-stream
-  [method]tcp-stream.read-timeout
-  [method]tcp-stream.reuseaddr
-  [method]tcp-stream.set-hop-limit
-  [method]tcp-stream.set-keepalive
-  [method]tcp-stream.set-linger
-  [method]tcp-stream.set-nodelay
-  [method]tcp-stream.set-read-timeout
-  [method]tcp-stream.set-reuseaddr
-  [method]tcp-stream.set-write-timeout
-  [method]tcp-stream.shutdown
-  [method]tcp-stream.subscribe-readable
-  [method]tcp-stream.write
-  [method]tcp-stream.write-bytes
-  [method]tcp-stream.write-stream
-  [method]tcp-stream.write-timeout
-  [method]udp-socket.connect
-  [method]udp-socket.disconnect
-  [method]udp-socket.local-addr
-  [method]udp-socket.peer-addr
-  [method]udp-socket.recv
-  [method]udp-socket.recv-from
-  [method]udp-socket.send
-  [method]udp-socket.send-to
-  [method]udp-socket.set-read-timeout
-  [method]udp-socket.subscribe-readable
-  [method]unix-listener.accept
-  [method]unix-listener.poll-accept
-  [method]unix-listener.subscribe-readiness
-  bind-tcp
-  bind-unix
-  connect-tcp
-  lookup-host
-  udp-bind
+has-secret: func(key: string) -> result<bool, error-code>;
 
-astrid:process/host@1.0.0
-  [drop]process-handle
-  [method]process-handle.close-stdin
-  [method]process-handle.kill
-  [method]process-handle.os-pid
-  [method]process-handle.read-logs
-  [method]process-handle.signal
-  [method]process-handle.subscribe-exit
-  [method]process-handle.subscribe-logs
-  [method]process-handle.wait
-  [method]process-handle.wait-with-output
-  [method]process-handle.write-stdin
-  attach
-  close-stdin
-  list-processes
-  read-logs
-  read-since
-  release-process
-  signal
-  spawn
-  spawn-background
-  spawn-persistent
-  status
-  status-many
-  stop
-  unwatch
-  wait
-  watch
-  write-stdin
+## astrid:fs/host@1.0.0
 
-astrid:process/host@1.1.0
-  [drop]process-handle
-  [method]process-handle.close-stdin
-  [method]process-handle.kill
-  [method]process-handle.os-pid
-  [method]process-handle.read-logs
-  [method]process-handle.signal
-  [method]process-handle.subscribe-exit
-  [method]process-handle.subscribe-logs
-  [method]process-handle.wait
-  [method]process-handle.wait-with-output
-  [method]process-handle.write-stdin
-  attach
-  close-stdin
-  list-processes
-  read-logs
-  read-since
-  release-process
-  signal
-  spawn
-  spawn-background
-  spawn-persistent
-  status
-  status-many
-  stop
-  unwatch
-  wait
-  watch
-  write-stdin
+variant error-code {
+  not-found,
+  access,
+  capability-denied,
+  boundary-escape,
+  invalid-path,
+  would-block,
+  is-directory,
+  not-directory,
+  not-empty,
+  too-large,
+  quota,
+  cross-vfs,
+  already-exists,
+  closed,
+  unknown(string),
+}
 
-astrid:request-context/host@1.0.0
-  connection-owner
-  connection-principal
+enum file-type {
+  type-unknown,
+  regular,
+  directory,
+  symlink,
+  block-device,
+  character-device,
+  fifo,
+  socket,
+}
 
-astrid:sys/host@1.0.0
-  check-capsule-capability
-  clock-monotonic-ns
-  clock-ms
-  enumerate-capabilities
-  get-caller
-  get-config
-  log
-  random-bytes
-  signal-ready
-  sleep-ns
+record datetime {
+  seconds: s64,
+  nanoseconds: u32,
+}
 
-astrid:uplink/host@1.0.0
-  uplink-register
-  uplink-send
+record file-stat {
+  size: u64,
+  kind: file-type,
+  mode: u32,
+  modified: option<datetime>,
+  created: option<datetime>,
+  accessed: option<datetime>,
+}
+
+enum open-mode {
+  read,
+  write,
+  append,
+  read-write,
+}
+
+resource file-handle {
+  read-at: func(offset: u64, max-bytes: u32) -> result<list<u8>, error-code>;
+  write-at: func(offset: u64, data: list<u8>) -> result<u32, error-code>;
+  sync-data: func() -> result<_, error-code>;
+  sync-all: func() -> result<_, error-code>;
+  stat: func() -> result<file-stat, error-code>;
+  set-len: func(size: u64) -> result<_, error-code>;
+}
+
+fs-open: func(path: string, mode: open-mode) -> result<file-handle, error-code>;
+
+fs-exists: func(path: string) -> result<bool, error-code>;
+
+fs-mkdir: func(path: string) -> result<_, error-code>;
+
+fs-mkdir-all: func(path: string) -> result<_, error-code>;
+
+fs-readdir: func(path: string) -> result<list<string>, error-code>;
+
+fs-stat: func(path: string) -> result<file-stat, error-code>;
+
+fs-stat-symlink: func(path: string) -> result<file-stat, error-code>;
+
+fs-unlink: func(path: string) -> result<_, error-code>;
+
+read-file: func(path: string) -> result<list<u8>, error-code>;
+
+write-file: func(path: string, content: list<u8>) -> result<_, error-code>;
+
+fs-append: func(path: string, content: list<u8>) -> result<_, error-code>;
+
+fs-copy: func(src: string, dst: string) -> result<_, error-code>;
+
+fs-rename: func(src: string, dst: string) -> result<_, error-code>;
+
+fs-remove-dir-all: func(path: string) -> result<u64, error-code>;
+
+fs-canonicalize: func(path: string) -> result<string, error-code>;
+
+fs-read-link: func(path: string) -> result<string, error-code>;
+
+fs-hard-link: func(src: string, link-path: string) -> result<_, error-code>;
+[drop]file-handle
+
+## astrid:guest/lifecycle@1.0.0
+
+record capsule-result {
+  action: string,
+  data: option<string>,
+}
+
+## astrid:http/host@1.0.0
+
+use astrid:io/poll@1.0.0.{pollable};
+use astrid:io/streams@1.0.0.{input-stream};
+
+variant error-code {
+  capability-denied,
+  invalid-request,
+  dns-error,
+  airlock-rejected,
+  tls-error,
+  timeout,
+  connection-error,
+  body-too-large,
+  closed,
+  quota,
+  protocol(string),
+  unknown(string),
+}
+
+variant http-method {
+  get,
+  head,
+  post,
+  put,
+  delete,
+  connect,
+  options,
+  trace,
+  patch,
+  other(string),
+}
+
+record key-value-pair {
+  key: string,
+  value: string,
+}
+
+record http-request-data {
+  url: string,
+  method: http-method,
+  headers: list<key-value-pair>,
+  body: option<list<u8>>,
+}
+
+record http-response-data {
+  status: u16,
+  headers: list<key-value-pair>,
+  body: list<u8>,
+}
+
+resource http-stream {
+  status: func() -> u16;
+  headers: func() -> list<key-value-pair>;
+  read-chunk: func() -> result<list<u8>, error-code>;
+  close: func() -> result<_, error-code>;
+  subscribe-readable: func() -> pollable;
+  body-stream: func() -> input-stream;
+}
+
+http-request: func(request: http-request-data) -> result<http-response-data, error-code>;
+
+http-stream-start: func(request: http-request-data) -> result<http-stream, error-code>;
+[drop]http-stream
+
+## astrid:http/host@1.1.0
+
+use astrid:io/poll@1.0.0.{pollable};
+use astrid:io/streams@1.0.0.{input-stream, output-stream};
+
+variant error-code {
+  capability-denied,
+  invalid-request,
+  dns-error,
+  airlock-rejected,
+  tls-error,
+  timeout,
+  connection-error,
+  body-too-large,
+  closed,
+  quota,
+  redirect-blocked,
+  too-many-redirects,
+  integrity-mismatch,
+  scheme-denied,
+  decompression-bomb,
+  protocol(string),
+  unknown(string),
+}
+
+variant http-method {
+  get,
+  head,
+  post,
+  put,
+  delete,
+  connect,
+  options,
+  trace,
+  patch,
+  other(string),
+}
+
+record key-value-pair {
+  key: string,
+  value: string,
+}
+
+record http-request-data {
+  url: string,
+  method: http-method,
+  headers: list<key-value-pair>,
+  body: option<list<u8>>,
+}
+
+record timeout-config {
+  connect-ms: option<u64>,
+  first-byte-ms: option<u64>,
+  between-bytes-ms: option<u64>,
+  total-ms: option<u64>,
+}
+
+enum redirect-policy {
+  follow,
+  error,
+  manual,
+}
+
+record request-options {
+  timeouts: option<timeout-config>,
+  redirect: option<redirect-policy>,
+  max-redirects: option<u32>,
+  max-response-bytes: option<u64>,
+  max-decompressed-bytes: option<u64>,
+  auto-decompress: option<bool>,
+  https-only: option<bool>,
+  integrity: option<string>,
+}
+
+record response-meta {
+  final-url: string,
+  redirect-count: u32,
+  elapsed-ms: u64,
+  wire-bytes: u64,
+}
+
+record http-response-data {
+  status: u16,
+  headers: list<key-value-pair>,
+  body: list<u8>,
+  meta: response-meta,
+}
+
+resource http-stream {
+  status: func() -> u16;
+  headers: func() -> list<key-value-pair>;
+  read-chunk: func() -> result<list<u8>, error-code>;
+  close: func() -> result<_, error-code>;
+  subscribe-readable: func() -> pollable;
+  body-stream: func() -> input-stream;
+  trailers: func() -> result<option<list<key-value-pair>>, error-code>;
+}
+
+resource http-upload {
+  body-sink: func() -> output-stream;
+  subscribe-writable: func() -> pollable;
+  finish: func() -> result<http-stream, error-code>;
+}
+
+http-request: func(request: http-request-data) -> result<http-response-data, error-code>;
+
+http-request-opts: func(request: http-request-data, options: request-options) -> result<http-response-data, error-code>;
+
+http-stream-start: func(request: http-request-data) -> result<http-stream, error-code>;
+
+http-stream-start-opts: func(request: http-request-data, options: request-options) -> result<http-stream, error-code>;
+
+http-upload-start: func(request: http-request-data, options: request-options) -> result<http-upload, error-code>;
+[drop]http-stream
+[drop]http-upload
+
+## astrid:identity/host@1.0.0
+
+variant error-code {
+  capability-denied,
+  invalid-input,
+  user-not-found,
+  link-not-found,
+  already-linked,
+  store-unavailable,
+  unknown(string),
+}
+
+record identity-resolve-request {
+  platform: string,
+  platform-user-id: string,
+}
+
+record identity-resolve-response {
+  user-id: string,
+  display-name: option<string>,
+}
+
+record identity-link-request {
+  platform: string,
+  platform-user-id: string,
+  astrid-user-id: string,
+  method: string,
+}
+
+record identity-unlink-request {
+  platform: string,
+  platform-user-id: string,
+}
+
+record identity-create-user-request {
+  display-name: option<string>,
+}
+
+record identity-create-user-response {
+  user-id: string,
+}
+
+record platform-link {
+  platform: string,
+  platform-user-id: string,
+  linked-at: string,
+  method: string,
+}
+
+identity-resolve: func(request: identity-resolve-request) -> result<identity-resolve-response, error-code>;
+
+identity-link: func(request: identity-link-request) -> result<_, error-code>;
+
+identity-unlink: func(request: identity-unlink-request) -> result<_, error-code>;
+
+identity-create-user: func(request: identity-create-user-request) -> result<identity-create-user-response, error-code>;
+
+identity-list-links: func(astrid-user-id: string) -> result<list<platform-link>, error-code>;
+
+## astrid:io/error@1.0.0
+
+resource error {
+  to-debug-string: func() -> string;
+}
+[drop]error
+
+## astrid:io/poll@1.0.0
+
+variant error-code {
+  invalid-input,
+  closed,
+  too-large,
+  cancelled,
+  unknown(string),
+}
+
+resource pollable {
+  ready: func() -> bool;
+  block: func() -> result<_, error-code>;
+}
+
+poll: func(pollables: list<borrow<pollable>>) -> result<list<u32>, error-code>;
+[drop]pollable
+
+## astrid:io/streams@1.0.0
+
+use error.{error};
+use poll.{pollable};
+
+variant stream-error {
+  last-operation-failed(error),
+  closed,
+}
+
+resource input-stream {
+  read: func(len: u64) -> result<list<u8>, stream-error>;
+  blocking-read: func(len: u64) -> result<list<u8>, stream-error>;
+  skip: func(len: u64) -> result<u64, stream-error>;
+  blocking-skip: func(len: u64) -> result<u64, stream-error>;
+  subscribe: func() -> pollable;
+}
+
+resource output-stream {
+  check-write: func() -> result<u64, stream-error>;
+  write: func(contents: list<u8>) -> result<_, stream-error>;
+  blocking-write-and-flush: func(contents: list<u8>) -> result<_, stream-error>;
+  flush: func() -> result<_, stream-error>;
+  blocking-flush: func() -> result<_, stream-error>;
+  subscribe: func() -> pollable;
+  write-zeroes: func(len: u64) -> result<_, stream-error>;
+  blocking-write-zeroes-and-flush: func(len: u64) -> result<_, stream-error>;
+  splice: func(src: borrow<input-stream>, len: u64) -> result<u64, stream-error>;
+  blocking-splice: func(src: borrow<input-stream>, len: u64) -> result<u64, stream-error>;
+}
+[drop]input-stream
+[drop]output-stream
+
+## astrid:ipc/host@1.0.0
+
+use astrid:io/poll@1.0.0.{pollable};
+
+variant error-code {
+  capability-denied,
+  invalid-input,
+  closed,
+  rate-limited,
+  backpressure,
+  quota,
+  timeout,
+  unknown(string),
+}
+
+variant principal-attribution {
+  verified(string),
+  claimed(string),
+  system,
+}
+
+record ipc-message {
+  topic: string,
+  payload: string,
+  source-id: string,
+  principal: principal-attribution,
+}
+
+record ipc-envelope {
+  messages: list<ipc-message>,
+  dropped: u64,
+  lagged: u64,
+}
+
+record interceptor-binding {
+  handle-id: u64,
+  action: string,
+  topic: string,
+}
+
+resource subscription {
+  poll: func() -> result<ipc-envelope, error-code>;
+  recv: func(timeout-ms: u64) -> result<ipc-envelope, error-code>;
+  subscribe-readiness: func() -> pollable;
+}
+
+publish: func(topic: string, payload: string) -> result<_, error-code>;
+
+publish-as: func(topic: string, payload: string, principal: string) -> result<_, error-code>;
+
+subscribe: func(topic-pattern: string) -> result<subscription, error-code>;
+
+get-interceptor-bindings: func() -> result<list<interceptor-binding>, error-code>;
+[drop]subscription
+
+## astrid:kv/host@1.0.0
+
+variant error-code {
+  invalid-key,
+  too-large,
+  quota,
+  cas-mismatch,
+  unknown(string),
+}
+
+record key-page {
+  keys: list<string>,
+  next-cursor: option<string>,
+}
+
+kv-get: func(key: string) -> result<option<list<u8>>, error-code>;
+
+kv-set: func(key: string, value: list<u8>) -> result<_, error-code>;
+
+kv-delete: func(key: string) -> result<_, error-code>;
+
+kv-list-keys: func(prefix: string) -> result<list<string>, error-code>;
+
+kv-list-keys-page: func(prefix: string, cursor: option<string>, limit: u32) -> result<key-page, error-code>;
+
+kv-clear-prefix: func(prefix: string) -> result<u64, error-code>;
+
+kv-cas: func(key: string, expected: option<list<u8>>, new: list<u8>) -> result<_, error-code>;
+
+## astrid:net/host@1.0.0
+
+use astrid:io/poll@1.0.0.{pollable};
+use astrid:io/streams@1.0.0.{input-stream, output-stream};
+
+variant error-code {
+  would-block,
+  closed,
+  capability-denied,
+  airlock-rejected,
+  connection-refused,
+  connection-reset,
+  timeout,
+  address-in-use,
+  address-not-available,
+  name-unresolvable,
+  invalid-handle,
+  not-tcp,
+  quota,
+  unknown(string),
+}
+
+variant net-read-status {
+  data(list<u8>),
+  closed,
+  pending,
+}
+
+enum shutdown-how {
+  receive,
+  send,
+  both,
+}
+
+record udp-datagram {
+  data: list<u8>,
+  peer-host: string,
+  peer-port: u16,
+}
+
+resource unix-listener {
+  accept: func() -> result<tcp-stream, error-code>;
+  poll-accept: func(timeout-ms: u64) -> result<option<tcp-stream>, error-code>;
+  subscribe-readiness: func() -> pollable;
+}
+
+resource tcp-listener {
+  accept: func() -> result<tcp-stream, error-code>;
+  poll-accept: func(timeout-ms: u64) -> result<option<tcp-stream>, error-code>;
+  local-addr: func() -> result<string, error-code>;
+  subscribe-readiness: func() -> pollable;
+}
+
+resource tcp-stream {
+  read: func() -> result<net-read-status, error-code>;
+  write: func(data: list<u8>) -> result<_, error-code>;
+  read-bytes: func(max-bytes: u32) -> result<list<u8>, error-code>;
+  write-bytes: func(data: list<u8>) -> result<u32, error-code>;
+  peek: func(max-bytes: u32) -> result<list<u8>, error-code>;
+  shutdown: func(how: shutdown-how) -> result<_, error-code>;
+  peer-addr: func() -> result<string, error-code>;
+  local-addr: func() -> result<string, error-code>;
+  set-nodelay: func(nodelay: bool) -> result<_, error-code>;
+  nodelay: func() -> result<bool, error-code>;
+  set-read-timeout: func(timeout-ms: option<u64>) -> result<_, error-code>;
+  read-timeout: func() -> result<option<u64>, error-code>;
+  set-write-timeout: func(timeout-ms: option<u64>) -> result<_, error-code>;
+  write-timeout: func() -> result<option<u64>, error-code>;
+  set-hop-limit: func(hops: u32) -> result<_, error-code>;
+  hop-limit: func() -> result<u32, error-code>;
+  set-keepalive: func(keepalive-secs: option<u64>) -> result<_, error-code>;
+  keepalive: func() -> result<option<u64>, error-code>;
+  set-linger: func(linger-ms: option<u64>) -> result<_, error-code>;
+  linger: func() -> result<option<u64>, error-code>;
+  set-reuseaddr: func(reuse: bool) -> result<_, error-code>;
+  reuseaddr: func() -> result<bool, error-code>;
+  subscribe-readable: func() -> pollable;
+  read-stream: func() -> input-stream;
+  write-stream: func() -> output-stream;
+}
+
+resource udp-socket {
+  send-to: func(data: list<u8>, peer-host: string, peer-port: u16) -> result<u32, error-code>;
+  recv-from: func(max-bytes: u32) -> result<option<udp-datagram>, error-code>;
+  connect: func(peer-host: string, peer-port: u16) -> result<_, error-code>;
+  disconnect: func() -> result<_, error-code>;
+  send: func(data: list<u8>) -> result<u32, error-code>;
+  recv: func(max-bytes: u32) -> result<option<list<u8>>, error-code>;
+  peer-addr: func() -> result<option<string>, error-code>;
+  set-read-timeout: func(timeout-ms: option<u64>) -> result<_, error-code>;
+  local-addr: func() -> result<string, error-code>;
+  subscribe-readable: func() -> pollable;
+}
+
+bind-unix: func() -> result<unix-listener, error-code>;
+
+bind-tcp: func(host: string, port: u16) -> result<tcp-listener, error-code>;
+
+connect-tcp: func(host: string, port: u16) -> result<tcp-stream, error-code>;
+
+udp-bind: func(host: string, port: u16) -> result<udp-socket, error-code>;
+
+lookup-host: func(host: string) -> result<list<string>, error-code>;
+[drop]unix-listener
+[drop]tcp-listener
+[drop]tcp-stream
+[drop]udp-socket
+
+## astrid:process/host@1.0.0
+
+use astrid:io/poll@1.0.0.{pollable};
+
+variant error-code {
+  capability-denied,
+  invalid-input,
+  boundary-escape,
+  quota,
+  too-large,
+  closed,
+  cancelled,
+  wait-timeout,
+  no-such-process,
+  registry-full,
+  persist-unsupported,
+  unknown(string),
+}
+
+enum process-signal {
+  term,
+  hup,
+  usr1,
+  usr2,
+  int,
+  stop,
+  cont,
+}
+
+record env-var {
+  key: string,
+  value: string,
+}
+
+enum overflow-policy {
+  drop-oldest,
+  backpressure,
+}
+
+record resource-limits {
+  max-memory-bytes: option<u64>,
+  max-cpu-secs: option<u64>,
+  max-pids: option<u32>,
+  max-open-files: option<u32>,
+}
+
+record spawn-request {
+  cmd: string,
+  args: list<string>,
+  stdin: option<list<u8>>,
+  env: list<env-var>,
+  cwd: option<string>,
+  limits: option<resource-limits>,
+  label: option<string>,
+  keep-stdin-open: option<bool>,
+  overflow: option<overflow-policy>,
+  log-ring-bytes: option<u32>,
+  max-lifetime-ms: option<u64>,
+  idle-timeout-ms: option<u64>,
+  exit-retention-ms: option<u64>,
+}
+
+record exit-info {
+  exit-code: option<s32>,
+  signal: option<s32>,
+}
+
+record process-result {
+  stdout: string,
+  stderr: string,
+  exit: exit-info,
+}
+
+record read-logs-result {
+  stdout: string,
+  stderr: string,
+  running: bool,
+  exit: option<exit-info>,
+}
+
+record kill-result {
+  killed: bool,
+  exit: option<exit-info>,
+  stdout: string,
+  stderr: string,
+}
+
+type process-id = string;
+
+enum process-phase {
+  starting,
+  running,
+  exited,
+}
+
+record log-cursor {
+  token: option<string>,
+}
+
+enum log-stream {
+  stdout,
+  stderr,
+}
+
+record log-chunk {
+  data: list<u8>,
+  next: log-cursor,
+  bytes-dropped: u64,
+  drained-eof: bool,
+}
+
+record process-info {
+  id: process-id,
+  label: string,
+  command: string,
+  os-pid: option<u32>,
+  phase: process-phase,
+  exit: option<exit-info>,
+  age-ms: u64,
+  idle-ms: u64,
+  buffered-bytes: u64,
+  bytes-dropped: u64,
+  stdin-open: bool,
+  cpu-ms: option<u64>,
+  mem-bytes-peak: option<u64>,
+}
+
+resource process-handle {
+  read-logs: func() -> result<read-logs-result, error-code>;
+  write-stdin: func(data: list<u8>) -> result<u32, error-code>;
+  close-stdin: func() -> result<_, error-code>;
+  signal: func(sig: process-signal) -> result<_, error-code>;
+  kill: func() -> result<kill-result, error-code>;
+  wait: func(timeout-ms: option<u64>) -> result<exit-info, error-code>;
+  wait-with-output: func(timeout-ms: option<u64>) -> result<process-result, error-code>;
+  os-pid: func() -> result<u32, error-code>;
+  subscribe-exit: func() -> pollable;
+  subscribe-logs: func() -> pollable;
+}
+
+spawn: func(request: spawn-request) -> result<process-result, error-code>;
+
+spawn-background: func(request: spawn-request) -> result<process-handle, error-code>;
+
+spawn-persistent: func(request: spawn-request) -> result<process-id, error-code>;
+
+attach: func(id: process-id) -> result<process-handle, error-code>;
+
+list-processes: func(label-filter: option<string>) -> result<list<process-info>, error-code>;
+
+status: func(id: process-id) -> result<process-info, error-code>;
+
+status-many: func(ids: list<process-id>) -> result<list<process-info>, error-code>;
+
+read-logs: func(id: process-id) -> result<read-logs-result, error-code>;
+
+read-since: func(id: process-id, which-stream: log-stream, cursor: log-cursor, max-bytes: u32) -> result<log-chunk, error-code>;
+
+write-stdin: func(id: process-id, data: list<u8>) -> result<u32, error-code>;
+
+close-stdin: func(id: process-id) -> result<_, error-code>;
+
+signal: func(id: process-id, sig: process-signal) -> result<_, error-code>;
+
+wait: func(id: process-id, timeout-ms: u64) -> result<exit-info, error-code>;
+
+stop: func(id: process-id, grace-ms: option<u64>) -> result<exit-info, error-code>;
+
+release-process: func(id: process-id) -> result<_, error-code>;
+
+watch: func(id: process-id, suffix: option<string>) -> result<_, error-code>;
+
+unwatch: func(id: process-id) -> result<_, error-code>;
+[drop]process-handle
+
+## astrid:process/host@1.1.0
+
+use astrid:io/poll@1.0.0.{pollable};
+
+variant error-code {
+  capability-denied,
+  invalid-input,
+  boundary-escape,
+  quota,
+  too-large,
+  closed,
+  cancelled,
+  wait-timeout,
+  no-such-process,
+  registry-full,
+  persist-unsupported,
+  unknown(string),
+}
+
+enum process-signal {
+  term,
+  hup,
+  usr1,
+  usr2,
+  int,
+  stop,
+  cont,
+}
+
+record env-var {
+  key: string,
+  value: string,
+}
+
+enum overflow-policy {
+  drop-oldest,
+  backpressure,
+}
+
+record resource-limits {
+  max-memory-bytes: option<u64>,
+  max-cpu-secs: option<u64>,
+  max-pids: option<u32>,
+  max-open-files: option<u32>,
+}
+
+variant injection-placement {
+  env-pointer(string),
+  fixed-path(string),
+}
+
+record file-injection {
+  content: list<u8>,
+  placement: injection-placement,
+}
+
+record spawn-request {
+  cmd: string,
+  args: list<string>,
+  stdin: option<list<u8>>,
+  env: list<env-var>,
+  cwd: option<string>,
+  limits: option<resource-limits>,
+  file-injections: list<file-injection>,
+  label: option<string>,
+  keep-stdin-open: option<bool>,
+  overflow: option<overflow-policy>,
+  log-ring-bytes: option<u32>,
+  max-lifetime-ms: option<u64>,
+  idle-timeout-ms: option<u64>,
+  exit-retention-ms: option<u64>,
+}
+
+record exit-info {
+  exit-code: option<s32>,
+  signal: option<s32>,
+}
+
+record process-result {
+  stdout: string,
+  stderr: string,
+  exit: exit-info,
+}
+
+record read-logs-result {
+  stdout: string,
+  stderr: string,
+  running: bool,
+  exit: option<exit-info>,
+}
+
+record kill-result {
+  killed: bool,
+  exit: option<exit-info>,
+  stdout: string,
+  stderr: string,
+}
+
+type process-id = string;
+
+enum process-phase {
+  starting,
+  running,
+  exited,
+}
+
+record log-cursor {
+  token: option<string>,
+}
+
+enum log-stream {
+  stdout,
+  stderr,
+}
+
+record log-chunk {
+  data: list<u8>,
+  next: log-cursor,
+  bytes-dropped: u64,
+  drained-eof: bool,
+}
+
+record process-info {
+  id: process-id,
+  label: string,
+  command: string,
+  os-pid: option<u32>,
+  phase: process-phase,
+  exit: option<exit-info>,
+  age-ms: u64,
+  idle-ms: u64,
+  buffered-bytes: u64,
+  bytes-dropped: u64,
+  stdin-open: bool,
+  cpu-ms: option<u64>,
+  mem-bytes-peak: option<u64>,
+}
+
+resource process-handle {
+  read-logs: func() -> result<read-logs-result, error-code>;
+  write-stdin: func(data: list<u8>) -> result<u32, error-code>;
+  close-stdin: func() -> result<_, error-code>;
+  signal: func(sig: process-signal) -> result<_, error-code>;
+  kill: func() -> result<kill-result, error-code>;
+  wait: func(timeout-ms: option<u64>) -> result<exit-info, error-code>;
+  wait-with-output: func(timeout-ms: option<u64>) -> result<process-result, error-code>;
+  os-pid: func() -> result<u32, error-code>;
+  subscribe-exit: func() -> pollable;
+  subscribe-logs: func() -> pollable;
+}
+
+spawn: func(request: spawn-request) -> result<process-result, error-code>;
+
+spawn-background: func(request: spawn-request) -> result<process-handle, error-code>;
+
+spawn-persistent: func(request: spawn-request) -> result<process-id, error-code>;
+
+attach: func(id: process-id) -> result<process-handle, error-code>;
+
+list-processes: func(label-filter: option<string>) -> result<list<process-info>, error-code>;
+
+status: func(id: process-id) -> result<process-info, error-code>;
+
+status-many: func(ids: list<process-id>) -> result<list<process-info>, error-code>;
+
+read-logs: func(id: process-id) -> result<read-logs-result, error-code>;
+
+read-since: func(id: process-id, which-stream: log-stream, cursor: log-cursor, max-bytes: u32) -> result<log-chunk, error-code>;
+
+write-stdin: func(id: process-id, data: list<u8>) -> result<u32, error-code>;
+
+close-stdin: func(id: process-id) -> result<_, error-code>;
+
+signal: func(id: process-id, sig: process-signal) -> result<_, error-code>;
+
+wait: func(id: process-id, timeout-ms: u64) -> result<exit-info, error-code>;
+
+stop: func(id: process-id, grace-ms: option<u64>) -> result<exit-info, error-code>;
+
+release-process: func(id: process-id) -> result<_, error-code>;
+
+watch: func(id: process-id, suffix: option<string>) -> result<_, error-code>;
+
+unwatch: func(id: process-id) -> result<_, error-code>;
+[drop]process-handle
+
+## astrid:request-context/host@1.0.0
+
+use astrid:net/host@1.0.0.{error-code, tcp-stream};
+
+connection-owner: func(connection: borrow<tcp-stream>) -> result<option<string>, error-code>;
+
+connection-principal: func(connection: borrow<tcp-stream>) -> result<option<string>, error-code>;
+
+## astrid:sys/host@1.0.0
+
+variant error-code {
+  capability-denied,
+  config-key-reserved,
+  too-large,
+  registry-unavailable,
+  cancelled,
+  unknown(string),
+}
+
+enum log-level {
+  trace,
+  debug,
+  info,
+  warn,
+  error,
+}
+
+record caller-context {
+  principal: option<string>,
+  source-id: string,
+  timestamp: string,
+}
+
+record capability-check-request {
+  source-uuid: string,
+  capability: string,
+}
+
+record capability-check-response {
+  allowed: bool,
+}
+
+get-config: func(key: string) -> result<option<string>, error-code>;
+
+get-caller: func() -> result<caller-context, error-code>;
+
+log: func(level: log-level, message: string);
+
+signal-ready: func();
+
+clock-ms: func() -> u64;
+
+clock-monotonic-ns: func() -> u64;
+
+sleep-ns: func(duration-ns: u64) -> result<_, error-code>;
+
+random-bytes: func(length: u64) -> result<list<u8>, error-code>;
+
+check-capsule-capability: func(request: capability-check-request) -> result<capability-check-response, error-code>;
+
+enumerate-capabilities: func() -> list<string>;
+
+## astrid:uplink/host@1.0.0
+
+variant error-code {
+  capability-denied,
+  invalid-input,
+  invalid-profile,
+  unknown-uplink,
+  no-session,
+  quota,
+  unknown(string),
+}
+
+enum uplink-profile {
+  chat,
+  interactive,
+  notify,
+  bridge,
+}
+
+uplink-register: func(name: string, platform: string, profile: uplink-profile) -> result<string, error-code>;
+
+uplink-send: func(uplink-id: string, platform-user-id: string, content: string) -> result<bool, error-code>;

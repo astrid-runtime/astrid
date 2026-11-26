@@ -505,6 +505,7 @@ dependencies = [
  "wasmtime-wasi",
  "wat",
  "web-time",
+ "wit-component 0.257.1",
  "wit-parser 0.257.1",
  "zeroize",
 ]
