@@ -126,6 +126,7 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         principal_store: None,
         tmp: None,
         invocation_home: None,
+        invocation_storage_uid: None,
         invocation_workspace: None,
         invocation_tmp: None,
         invocation_secret_store: None,

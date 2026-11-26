@@ -84,6 +84,7 @@ impl HostState {
             principal_store: None,
             tmp: None,
             invocation_home: None,
+            invocation_storage_uid: None,
             invocation_workspace: None,
             invocation_tmp: None,
             invocation_secret_store: None,

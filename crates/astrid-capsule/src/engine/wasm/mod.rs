@@ -28,8 +28,9 @@ impl WorkspaceMountResolver for WorkspaceBranchResolver {
     async fn resolve(
         &self,
         principal: &astrid_core::PrincipalId,
+        uid: astrid_core::PrincipalUid,
     ) -> Result<PrincipalMount, String> {
-        let binding = self.0.bind(principal).await?;
+        let binding = self.0.bind_for(principal, Some(uid)).await?;
         let handle = astrid_capabilities::DirHandle::new();
         let vfs = storage_vfs::AstridStorageVfs::workspace(
             &self.0.store(),
@@ -1090,18 +1091,14 @@ pub(crate) struct PrincipalVfsBundle {
 /// Build a home/tmp VFS bundle for `principal`.
 ///
 /// `home://` is always an authoritative AstridFilesystem view.  The mutable
-/// alias is resolved through the kernel-owned directory and only the resulting
-/// immutable UID is passed to the storage provider.  No host directory is
+/// alias labels the view. The storage provider receives the UID captured
+/// during admission for both mounts. No host directory is
 /// created, opened, canonicalized, or consulted for home access.
 pub(crate) fn build_principal_vfs_bundle(
     store: &astrid_storage::RuntimePrincipalStore,
-    directory: &astrid_storage::PrincipalDirectory,
     principal: &astrid_core::PrincipalId,
+    uid: astrid_core::PrincipalUid,
 ) -> PrincipalVfsBundle {
-    let Ok(uid) = directory.uid_for(principal) else {
-        tracing::warn!(%principal, "principal has no durable UID; denying home:// access");
-        return PrincipalVfsBundle::default();
-    };
     let home = build_principal_home(store, principal, uid);
     // `/tmp` remains an explicitly ephemeral native scratch mount.  It is
     // intentionally independent from the durable `home://` namespace.
@@ -1200,16 +1197,17 @@ async fn install_principal_overlays(
     // Safe to unwrap: `install_principal_overlays_sync` returned `true` only for
     // a present, parseable principal.
     let p = principal.expect("overlays installed only for a present principal");
-    let Some(store) = state.principal_store.as_ref() else {
+    let (Some(store), Some(uid)) = (state.principal_store.as_ref(), state.invocation_storage_uid)
+    else {
         state.invocation_home = None;
         state.invocation_workspace = None;
         state.invocation_tmp = None;
         return;
     };
-    let bundle = build_principal_vfs_bundle(store, &state.principal_directory, p);
+    let bundle = build_principal_vfs_bundle(store, p, uid);
     state.invocation_home = bundle.home;
     state.invocation_workspace = if let Some(resolver) = state.workspace_mount_resolver.as_ref() {
-        match resolver.resolve(p).await {
+        match resolver.resolve(p, uid).await {
             Ok(mount) => Some(mount),
             Err(error) => {
                 tracing::warn!(%p, %error, "failed to resolve Astrid workspace branch; denying workspace access");
@@ -1245,6 +1243,7 @@ fn install_principal_overlays_sync(
     // it only decides which teardown signal this invocation's waits listen to,
     // and a principal-scoped cancel must still be able to unwedge a caller
     // whose data overlays degraded to the neutral floor.
+    state.invocation_storage_uid = None;
     state.install_invocation_cancel_token(principal);
 
     let Some(p) = principal else {
@@ -1259,14 +1258,10 @@ fn install_principal_overlays_sync(
     // Secrets use a separate host-only control namespace. Never build the
     // SecretStore over the guest's ordinary `{principal}:capsule:*` view:
     // that would let a capsule enumerate or forge its own control keys.
-    let principal_uid = match state.principal_directory.uid_for(p).and_then(|uid| {
-        if state.runtime_owner_uid.is_some_and(|owner| uid != owner) {
-            return Err(astrid_storage::StorageError::InvalidKey(
-                "invocation alias no longer belongs to the runtime owner".into(),
-            ));
-        }
-        Ok(uid)
-    }) {
+    let principal_uid = match state
+        .principal_directory
+        .bound_uid(p, state.runtime_owner_uid)
+    {
         Ok(uid) => uid,
         Err(error) => {
             tracing::warn!(
@@ -1337,6 +1332,7 @@ fn install_principal_overlays_sync(
         state.runtime_handle.clone(),
     ));
     state.invocation_kv = Some(kv);
+    state.invocation_storage_uid = Some(principal_uid);
     native_logs::install_invocation(state, p, principal_uid);
     true
 }
@@ -1725,13 +1721,24 @@ impl ExecutionEngine for WasmEngine {
             //
             // Detection is automatic (no config flag) via gitoxide work-tree
             // discovery (see `workspace_is_git_managed`).
+            let owner_uid = (!system_runtime)
+                .then(|| ctx.principal_directory.uid_for(&ctx.principal).ok())
+                .flatten();
+            if native_owner_uid.is_some() && owner_uid != native_owner_uid {
+                return Err(CapsuleError::UnsupportedEntryPoint(
+                    "principal runtime owner changed before mount setup".to_owned(),
+                ));
+            }
             #[cfg(not(target_family = "wasm"))]
             let owner_workspace_mount = if let Some(branches) = workspace_branches.as_ref()
                 && !system_runtime
             {
+                let uid = owner_uid.ok_or_else(|| CapsuleError::UnsupportedEntryPoint(
+                    "principal workspace has no registered owner".to_owned(),
+                ))?;
                 Some(
                     WorkspaceBranchResolver(branches.clone())
-                        .resolve(&ctx.principal)
+                        .resolve(&ctx.principal, uid)
                         .await
                         .map_err(CapsuleError::UnsupportedEntryPoint)?,
                 )
@@ -2053,7 +2060,7 @@ impl ExecutionEngine for WasmEngine {
             // recv. Explicit system runtimes retain the neutral deny-all
             // fallback and are never aliases for the default human principal.
             let owner_vfs = if !system_runtime {
-                ctx.principal_store.as_ref().map_or_else(
+                ctx.principal_store.as_ref().zip(owner_uid).map_or_else(
                     || {
                         tracing::warn!(
                             principal = %ctx.principal,
@@ -2061,15 +2068,13 @@ impl ExecutionEngine for WasmEngine {
                         );
                         PrincipalVfsBundle::default()
                     },
-                    |store| build_principal_vfs_bundle(store, &ctx.principal_directory, &ctx.principal),
+                    |(store, uid)| build_principal_vfs_bundle(store, &ctx.principal, uid),
                 )
             } else {
                 PrincipalVfsBundle::default()
             };
             let kv_backend = kv.backend();
-            let owner_uid = (!system_runtime)
-                .then(|| ctx.principal_directory.uid_for(&ctx.principal).ok())
-                .flatten();
+
             let owner_secret_namespace = if system_runtime {
                 Some(astrid_storage::env::system_secret_namespace(capsule_id_val.as_str()))
             } else {
@@ -2255,6 +2260,7 @@ impl ExecutionEngine for WasmEngine {
                 principal_store: st_principal_store.clone(),
                 tmp: st_owner_tmp.clone(),
                 invocation_home: None,
+                invocation_storage_uid: None,
                 invocation_workspace: None,
                 invocation_tmp: None,
                 invocation_secret_store: None,
@@ -2597,7 +2603,6 @@ impl ExecutionEngine for WasmEngine {
                     ))
                 })?;
                 let runtime_id = principal_runtime_id.expect("typed principal run has runtime id");
-                let owner_uid = ctx.principal_directory.uid_for(&ctx.principal).ok();
                 let owner_env = match owner_uid {
                     Some(owner_uid) => {
                         load_invocation_env_overlay_from_backend(
@@ -3319,23 +3324,29 @@ impl ExecutionEngine for WasmEngine {
                 );
                 state.invocation_profile = invocation_profile.clone();
                 state.invocation_profile_authorized = true;
-                state.invocation_env_overlay =
-                    match state.principal_directory.uid_for(&invoking_principal) {
-                        Ok(principal_uid) => {
-                            load_invocation_env_overlay_from_backend(
-                                state.kv_backend.clone(),
-                                principal_uid,
-                                state.capsule_id.as_str(),
-                            )
-                            .await
-                        },
-                        Err(_) => None,
-                    };
-
                 // Refine the invocation context. Principal runtimes reject peer
                 // callers before checkout; SystemResident runtimes may install
                 // an explicitly authenticated caller overlay.
                 install_principal_overlays(state, caller_principal.as_ref()).await;
+                let env_uid = if caller_principal.is_some() {
+                    state.invocation_storage_uid
+                } else {
+                    state
+                        .principal_directory
+                        .bound_uid(&invoking_principal, state.runtime_owner_uid)
+                        .ok()
+                };
+                state.invocation_env_overlay = match env_uid {
+                    Some(uid) => {
+                        load_invocation_env_overlay_from_backend(
+                            state.kv_backend.clone(),
+                            uid,
+                            state.capsule_id.as_str(),
+                        )
+                        .await
+                    },
+                    None => None,
+                };
                 state.tool_result = None;
                 tool_audit = crate::engine::wasm::host::tool_audit::ToolCallAudit::arm(
                     state,
@@ -3619,7 +3630,11 @@ async fn build_lifecycle_host_state(
         let uid = admitted_uid.ok_or_else(|| {
             CapsuleError::ExecutionFailed("lifecycle principal has no admitted UID".into())
         })?;
-        if store.principal_directory().uid_for(&principal).ok() != Some(uid) {
+        if store
+            .principal_directory()
+            .bound_uid(&principal, Some(uid))
+            .is_err()
+        {
             return Err(CapsuleError::ExecutionFailed(
                 "lifecycle principal owner changed".into(),
             ));
@@ -3677,6 +3692,7 @@ async fn build_lifecycle_host_state(
         principal_store,
         tmp: None,
         invocation_home: None,
+        invocation_storage_uid: None,
         invocation_workspace: None,
         invocation_tmp: None,
         invocation_secret_store: None,

@@ -272,10 +272,18 @@ impl WorkspaceBranchService {
     /// selected `workspace/default` attachment and never expose the complete
     /// owner catalog.
     pub async fn bind(&self, principal: &PrincipalId) -> Result<WorkspaceBranchBinding, String> {
+        self.bind_for(principal, None).await
+    }
+
+    pub(crate) async fn bind_for(
+        &self,
+        principal: &PrincipalId,
+        expected: Option<astrid_core::PrincipalUid>,
+    ) -> Result<WorkspaceBranchBinding, String> {
         let _bind_guard = self.bind_lock.lock().await;
         let uid = self
             .directory
-            .uid_for(principal)
+            .bound_uid(principal, expected)
             .map_err(|error| format!("resolve principal workspace identity: {error}"))?;
         let owner = self.owner_for(uid).await?;
         let existing = self

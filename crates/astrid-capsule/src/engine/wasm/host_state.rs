@@ -176,6 +176,7 @@ pub trait WorkspaceMountResolver: Send + Sync {
     async fn resolve(
         &self,
         principal: &astrid_core::principal::PrincipalId,
+        uid: astrid_core::PrincipalUid,
     ) -> Result<PrincipalMount, String>;
 }
 
@@ -368,6 +369,8 @@ pub struct HostState {
     /// principal differs from `self.principal`. When set, overrides `home`
     /// for scheme resolution and security gate checks. Cleared on exit.
     pub invocation_home: Option<PrincipalMount>,
+    /// Durable identity captured when the invocation storage overlays were admitted.
+    pub(crate) invocation_storage_uid: Option<astrid_core::PrincipalUid>,
     /// Per-invocation authoritative workspace branch for the authenticated
     /// caller. Cleared when the invocation returns to the pool.
     pub invocation_workspace: Option<PrincipalMount>,
