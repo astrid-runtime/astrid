@@ -193,6 +193,19 @@ phase. The map operations, mutex, delivery reservation, and operating system
 socket identity remain refinement obligations. In particular, queue closure
 on overflow does not establish closure on device or principal revocation.
 
+The handshake and established connection writers both use `framing::write_frame`.
+The checked header constructor rejects lengths above the four-byte wire limit
+and encodes every representable body length exactly in big-endian order.
+For that header and serialized body, `FrameSegments::next` returns
+a prefix of exactly the remaining bytes. It is empty exactly at completion.
+An accepted short write drops precisely the count reported for that offered
+slice. Zero or excessive counts leave the cursor unchanged. The async driver
+passes each offered slice to Tokio, advances after a successful write, and
+flushes once all bytes have been accepted. These proofs cover selection and
+advancement. Serialization, the driver's control flow,
+Tokio's reported count, the OS peer binding and what the peer actually receives
+are outside these theorems. Cancellation can leave a prefix at the peer.
+
 | Native effect | Production path | Outstanding refinement |
 | --- | --- | --- |
 | Register a connection and emit lifecycle events | `ConnectionRuntime::handle`, `serve_connection`, `publish_lifecycle` | Peer identity, durable owner, subscription lifetime and disconnect accounting |

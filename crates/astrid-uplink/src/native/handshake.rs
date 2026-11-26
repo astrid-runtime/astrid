@@ -9,7 +9,7 @@ use astrid_core::session_token::{
     principal_auth_challenge_message,
 };
 use astrid_types::ipc::RequestOwnerId;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_HANDSHAKE_SIZE: usize = 4096;
@@ -239,11 +239,7 @@ where
     tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let bytes = serde_json::to_vec(response)
             .map_err(|error| std::io::Error::other(format!("serialize handshake: {error}")))?;
-        let len = u32::try_from(bytes.len())
-            .map_err(|_| std::io::Error::other("handshake response too large"))?;
-        stream.write_all(&len.to_be_bytes()).await?;
-        stream.write_all(&bytes).await?;
-        stream.flush().await
+        super::framing::write_frame(stream, &bytes).await
     })
     .await
     .map_err(|_| std::io::Error::other("handshake response write timed out (5s)"))?
@@ -264,6 +260,7 @@ mod tests {
     use tokio::io::{AsyncRead, AsyncWrite};
 
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     fn full_device(keypair: &astrid_crypto::KeyPair) -> DeviceKey {
         DeviceKey::new(

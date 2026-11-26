@@ -44,7 +44,9 @@ NATIVE_TOPIC = Path("crates/astrid-uplink/src/native/topic_policy.rs")
 NATIVE_RECIPIENT = Path("crates/astrid-uplink/src/native/recipient.rs")
 NATIVE_QUEUE = Path("crates/astrid-uplink/src/native/delivery_queue.rs")
 NATIVE_REPLY = Path("crates/astrid-uplink/src/native/reply_claim.rs")
+NATIVE_FRAME = Path("crates/astrid-uplink/src/native/frame_segments.rs")
 INPUTS = [
+    NATIVE_FRAME,
     NATIVE_REPLY,
     NATIVE_QUEUE,
     NATIVE_TOPIC,
@@ -183,6 +185,26 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "frame consumption drops the captured operation",
             INGRESS_FRAME,
             lambda text: replace_once(text, "    slot.take()", "    *slot = None; None"),
+        ),
+        (
+            "wire header misstates the low byte of the body length",
+            NATIVE_FRAME,
+            lambda text: replace_once(text, "(n % 256) as u8", "(upper % 256) as u8"),
+        ),
+        (
+            "socket starts with the body instead of the length prefix",
+            NATIVE_FRAME,
+            lambda text: replace_once(text, "else { self.prefix }", "else { self.body }"),
+        ),
+        (
+            "socket repeats a previously accepted byte after a short write",
+            NATIVE_FRAME,
+            lambda text: replace_once(text, "segment.split_at(count)", "segment.split_at(count - 1)"),
+        ),
+        (
+            "socket reports progress for a zero-byte write",
+            NATIVE_FRAME,
+            lambda text: replace_once(text, "count == 0 || count >", "count >"),
         ),
         (
             "claimed native reply can be claimed twice",

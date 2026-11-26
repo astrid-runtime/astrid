@@ -5,6 +5,7 @@
 
 mod delivery_queue;
 mod egress;
+mod frame_segments;
 mod framing;
 mod handshake;
 mod input;
@@ -32,6 +33,7 @@ use astrid_core::session_token::SessionToken;
 use astrid_events::{AstridEvent, EventBus, EventMetadata};
 use astrid_types::Topic;
 use astrid_types::ipc::{IpcMessage, IpcPayload, MessageOrigin};
+#[cfg(all(test, unix))]
 use tokio::io::AsyncWriteExt;
 
 use framing::FramedReader;
@@ -806,15 +808,9 @@ async fn write_message(writer: &mut LocalWriteHalf, message: &IpcMessage) -> std
     let frame = message_frame(message)?;
     let bytes = serde_json::to_vec(&frame)
         .map_err(|error| std::io::Error::other(format!("serialize IPC message: {error}")))?;
-    let len = u32::try_from(bytes.len())
-        .map_err(|_| std::io::Error::other("IPC message exceeds 4 GiB"))?;
-    tokio::time::timeout(WRITE_TIMEOUT, async {
-        writer.write_all(&len.to_be_bytes()).await?;
-        writer.write_all(&bytes).await?;
-        writer.flush().await
-    })
-    .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "IPC write timed out"))?
+    tokio::time::timeout(WRITE_TIMEOUT, framing::write_frame(writer, &bytes))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "IPC write timed out"))?
 }
 
 fn message_frame(message: &IpcMessage) -> std::io::Result<serde_json::Value> {

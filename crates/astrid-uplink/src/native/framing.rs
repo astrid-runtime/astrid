@@ -1,9 +1,31 @@
 //! Cancellation-safe length-prefixed IPC framing.
 
 use astrid_types::ipc::IpcMessage;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::MAX_FRAME_BYTES;
+
+/// The connection owner closes the transport on error or task cancellation.
+pub(super) async fn write_frame(
+    writer: &mut (impl AsyncWrite + Unpin),
+    body: &[u8],
+) -> std::io::Result<()> {
+    let prefix = super::frame_segments::body_prefix(body)
+        .ok_or_else(|| std::io::Error::other("frame exceeds 4 GiB"))?;
+    let mut frame = super::frame_segments::FrameSegments::new(&prefix, body);
+    while !frame.next().is_empty() {
+        let count = writer.write(frame.next()).await?;
+        if count == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        if !frame.accept(count) {
+            return Err(std::io::Error::other(
+                "transport reported more bytes than offered",
+            ));
+        }
+    }
+    writer.flush().await
+}
 
 pub(super) struct FramedReader<R> {
     reader: R,
@@ -80,6 +102,41 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[tokio::test]
+    async fn short_writes_preserve_back_to_back_frame_boundaries() {
+        let (mut writer, mut reader) = tokio::io::duplex(1);
+        let send = async move {
+            write_frame(&mut writer, &[]).await.unwrap();
+            write_frame(&mut writer, b"abc").await.unwrap();
+        };
+        let receive = async move {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes, b"\0\0\0\0\0\0\0\x03abc");
+        };
+        tokio::join!(send, receive);
+    }
+
+    #[tokio::test]
+    async fn dropping_connection_task_during_write_leaves_only_a_frame_prefix() {
+        for capacity in [1, 4, 6] {
+            let (mut writer, mut reader) = tokio::io::duplex(capacity);
+            let task = tokio::spawn(async move {
+                write_frame(&mut writer, b"payload").await.unwrap();
+                write_frame(&mut writer, b"later").await.unwrap();
+            });
+            // Observe the first byte before cancellation so the test cannot
+            // pass just because the connection task has not started writing.
+            let first = reader.read_u8().await.unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            let mut written = vec![first];
+            reader.read_to_end(&mut written).await.unwrap();
+            assert!(b"\0\0\0\x07payload".starts_with(&written));
+            assert!(written.len() < 11);
+        }
+    }
 
     #[tokio::test]
     async fn retains_partial_body_when_read_is_cancelled() {
