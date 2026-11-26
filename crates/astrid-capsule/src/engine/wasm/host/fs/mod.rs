@@ -319,18 +319,55 @@ fn gate_write_path(
     Ok(operation)
 }
 
-fn resolve_guest_path(state: &HostState, path: &str) -> Result<ResolvedPath, ErrorCode> {
+#[derive(Clone, Copy)]
+enum FsAccess {
+    Probe,
+    Read,
+    Write(Option<astrid_crypto::ContentHash>),
+    Delete,
+}
+
+impl FsAccess {
+    fn event(self, path: &str) -> HostAuditEvent<'_> {
+        match self {
+            Self::Probe => HostAuditEvent::FileProbe { path },
+            Self::Read => HostAuditEvent::FileRead { path },
+            Self::Write(content_hash) => HostAuditEvent::FileWrite { path, content_hash },
+            Self::Delete => HostAuditEvent::FileDelete { path },
+        }
+    }
+
+    fn device_denied(self, state: &HostState, path: &str) -> ErrorCode {
+        record_fs_denied(
+            state,
+            self.event(path),
+            "caller device registration is unavailable",
+        );
+        ErrorCode::CapabilityDenied
+    }
+}
+
+fn resolve_guest_path(
+    state: &HostState,
+    path: &str,
+    access: FsAccess,
+) -> Result<ResolvedPath, ErrorCode> {
     state
         .check_caller_device()
-        .map_err(|()| ErrorCode::CapabilityDenied)?;
+        .map_err(|()| access.device_denied(state, path))?;
     resolve::resolve_path(state, path).map_err(map_resolve_err)
 }
 
-fn with_vfs_operation<F: Future>(state: &HostState, operation: F) -> Result<F::Output, ErrorCode> {
+fn with_vfs_operation<F: Future>(
+    state: &HostState,
+    access: FsAccess,
+    path: &str,
+    operation: F,
+) -> Result<F::Output, ErrorCode> {
     util::bounded_block_on(&state.runtime_handle, &state.blocking_semaphore, async {
         state
             .check_caller_device()
-            .map_err(|()| ErrorCode::CapabilityDenied)?;
+            .map_err(|()| access.device_denied(state, path))?;
         Ok(operation.await)
     })
 }
@@ -340,7 +377,7 @@ pub(super) fn authorize_process_read_path(
     state: &HostState,
     raw_path: &str,
 ) -> Result<std::path::PathBuf, ErrorCode> {
-    let resolved = resolve_guest_path(state, raw_path)?;
+    let resolved = resolve_guest_path(state, raw_path, FsAccess::Read)?;
     let Some(physical) = resolved.physical else {
         return Err(ErrorCode::CapabilityDenied);
     };
@@ -399,10 +436,11 @@ impl fs::Host for HostState {
     }
 
     fn fs_exists(&mut self, path: String) -> Result<bool, ErrorCode> {
-        let resolved = resolve_guest_path(self, &path)?;
+        let access = FsAccess::Probe;
+        let resolved = resolve_guest_path(self, &path, access)?;
         let _operation = gate_read_path(self, &resolved.gate_path)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
-        let exists = with_vfs_operation(self, async {
+        let exists = with_vfs_operation(self, access, &resolved.gate_path, async {
             vfs_path
                 .vfs
                 .exists(
@@ -423,16 +461,11 @@ impl fs::Host for HostState {
     }
 
     fn fs_mkdir(&mut self, path: String) -> Result<(), ErrorCode> {
-        let resolved = resolve_guest_path(self, &path)?;
+        let access = FsAccess::Write(None);
+        let resolved = resolve_guest_path(self, &path, access)?;
         let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Write)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
-        admit(
-            self,
-            HostAuditEvent::FileWrite {
-                path: &resolved.gate_path,
-                content_hash: None,
-            },
-        )?;
+        admit(self, access.event(&resolved.gate_path))?;
 
         // Strict-create semantics per `astrid:fs@1.0.0` (fs-mkdir
         // distinguished from fs-mkdir-all by failing when an
@@ -449,7 +482,7 @@ impl fs::Host for HostState {
             && !parent.as_os_str().is_empty()
         {
             let parent_rel = parent.to_string_lossy().to_string();
-            let parent_exists = with_vfs_operation(self, async {
+            let parent_exists = with_vfs_operation(self, access, &resolved.gate_path, async {
                 vfs_path.vfs.exists(&vfs_path.handle, &parent_rel).await
             })?
             .unwrap_or(false);
@@ -465,7 +498,7 @@ impl fs::Host for HostState {
             }
         }
 
-        let result = with_vfs_operation(self, async {
+        let result = with_vfs_operation(self, access, &resolved.gate_path, async {
             vfs_path.vfs.mkdir(&vfs_path.handle, &relative).await
         })?
         .map_err(map_vfs_err);
@@ -488,17 +521,12 @@ impl fs::Host for HostState {
         // recursive is a separate behaviour change; this commit only
         // unstubs the idempotent variant the capsule contract
         // promises.
-        let resolved = resolve_guest_path(self, &path)?;
+        let access = FsAccess::Write(None);
+        let resolved = resolve_guest_path(self, &path, access)?;
         let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Write)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
-        admit(
-            self,
-            HostAuditEvent::FileWrite {
-                path: &resolved.gate_path,
-                content_hash: None,
-            },
-        )?;
-        let result = with_vfs_operation(self, async {
+        admit(self, access.event(&resolved.gate_path))?;
+        let result = with_vfs_operation(self, access, &resolved.gate_path, async {
             vfs_path
                 .vfs
                 .mkdir(
@@ -518,10 +546,11 @@ impl fs::Host for HostState {
     }
 
     fn fs_readdir(&mut self, path: String) -> Result<Vec<String>, ErrorCode> {
-        let resolved = resolve_guest_path(self, &path)?;
+        let access = FsAccess::Probe;
+        let resolved = resolve_guest_path(self, &path, access)?;
         let _operation = gate_read_path(self, &resolved.gate_path)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
-        let result = with_vfs_operation(self, async {
+        let result = with_vfs_operation(self, access, &resolved.gate_path, async {
             vfs_path
                 .vfs
                 .readdir(
@@ -542,10 +571,11 @@ impl fs::Host for HostState {
     }
 
     fn fs_stat(&mut self, path: String) -> Result<FileStat, ErrorCode> {
-        let resolved = resolve_guest_path(self, &path)?;
+        let access = FsAccess::Probe;
+        let resolved = resolve_guest_path(self, &path, access)?;
         let _operation = gate_read_path(self, &resolved.gate_path)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
-        let result = with_vfs_operation(self, async {
+        let result = with_vfs_operation(self, access, &resolved.gate_path, async {
             vfs_path
                 .vfs
                 .stat(
@@ -567,16 +597,12 @@ impl fs::Host for HostState {
     }
 
     fn fs_unlink(&mut self, path: String) -> Result<(), ErrorCode> {
-        let resolved = resolve_guest_path(self, &path)?;
+        let access = FsAccess::Delete;
+        let resolved = resolve_guest_path(self, &path, access)?;
         let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Delete)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
-        admit(
-            self,
-            HostAuditEvent::FileDelete {
-                path: &resolved.gate_path,
-            },
-        )?;
-        let result = with_vfs_operation(self, async {
+        admit(self, access.event(&resolved.gate_path))?;
+        let result = with_vfs_operation(self, access, &resolved.gate_path, async {
             vfs_path
                 .vfs
                 .unlink(
@@ -596,22 +622,18 @@ impl fs::Host for HostState {
     }
 
     fn read_file(&mut self, path: String) -> Result<Vec<u8>, ErrorCode> {
-        let resolved = resolve_guest_path(self, &path)?;
+        let access = FsAccess::Read;
+        let resolved = resolve_guest_path(self, &path, access)?;
         let _operation = gate_read_path(self, &resolved.gate_path)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
-        admit(
-            self,
-            HostAuditEvent::FileRead {
-                path: &resolved.gate_path,
-            },
-        )?;
+        admit(self, access.event(&resolved.gate_path))?;
         // Sentinel string used to encode the "too large at stat time"
         // case as a `PermissionDenied` payload so we can re-raise it
         // as `TooLarge` outside the async block. Keep the marker on a
         // local constant so the `map_err` matcher can compare against
         // a single source of truth instead of an inline literal.
         const TOO_LARGE_TAG: &str = "astrid-read-file:too-large";
-        let result = with_vfs_operation(self, async {
+        let result = with_vfs_operation(self, access, &resolved.gate_path, async {
             let metadata = vfs_path
                 .vfs
                 .stat(
@@ -671,17 +693,14 @@ impl fs::Host for HostState {
         if content.len() as u64 > util::MAX_GUEST_PAYLOAD_LEN {
             return Err(ErrorCode::TooLarge);
         }
-        let resolved = resolve_guest_path(self, &path)?;
+        let access = FsAccess::Write(None);
+        let resolved = resolve_guest_path(self, &path, access)?;
         let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Write)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
-        admit(
-            self,
-            HostAuditEvent::FileWrite {
-                path: &resolved.gate_path,
-                content_hash: Some(astrid_crypto::ContentHash::hash(&content)),
-            },
-        )?;
-        let result = with_vfs_operation(self, async {
+        let content_hash = Some(astrid_crypto::ContentHash::hash(&content));
+        let access = FsAccess::Write(content_hash);
+        admit(self, access.event(&resolved.gate_path))?;
+        let result = with_vfs_operation(self, access, &resolved.gate_path, async {
             let handle = vfs_path
                 .vfs
                 .open(
@@ -701,7 +720,7 @@ impl fs::Host for HostState {
             self,
             "astrid:fs/host.write-file",
             &resolved.gate_path,
-            Some(astrid_crypto::ContentHash::hash(&content)),
+            content_hash,
             &result,
         );
         result
