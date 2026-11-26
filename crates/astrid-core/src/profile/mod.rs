@@ -40,6 +40,7 @@ use thiserror::Error;
 
 mod device;
 mod device_admission;
+pub(crate) mod device_challenge;
 mod device_removal;
 pub mod device_sessions;
 mod field;

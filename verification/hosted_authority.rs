@@ -58,6 +58,8 @@ mod ingress_frame;
 mod device_removal;
 #[path = "../crates/astrid-core/src/profile/device_sessions/phase.rs"]
 mod device_session_phase;
+#[path = "../crates/astrid-core/src/profile/device_challenge.rs"]
+mod device_challenge;
 #[path = "../crates/astrid-core/src/profile/device_admission.rs"]
 mod device_admission;
 

@@ -43,12 +43,16 @@ fn challenge_signature_verifies_against_registered_key() {
     let message = principal_auth_challenge_message(principal.as_str(), &nonce_hex);
     let signature = keypair.sign(message.as_bytes()).to_hex();
 
+    // An earlier valid registration need not be the signer. The returned
+    // fingerprint must identify the public key that actually verified.
+    let other = astrid_crypto::KeyPair::generate();
+    let other_registered = full_device(&other);
     // A registered key over the exact challenge message verifies, returning
     // THAT device's key_id so the connection can be scoped to it.
     assert_eq!(
         verify_signature_against_keys(
             &principal,
-            std::slice::from_ref(&registered),
+            &[other_registered.clone(), registered.clone()],
             &nonce_hex,
             &signature
         )
@@ -58,8 +62,6 @@ fn challenge_signature_verifies_against_registered_key() {
     );
 
     // A DIFFERENT key fails.
-    let other = astrid_crypto::KeyPair::generate();
-    let other_registered = full_device(&other);
     assert!(
         verify_signature_against_keys(&principal, &[other_registered], &nonce_hex, &signature)
             .is_err(),

@@ -16,6 +16,12 @@ use crate::error::{CryptoError, CryptoResult};
 pub struct Signature([u8; 64]);
 
 impl Signature {
+    /// Verify the message with a hex-encoded Ed25519 public key.
+    #[must_use]
+    pub fn verifies_with_hex_key(&self, public_key: &str, message: &[u8]) -> bool {
+        crate::PublicKey::from_hex(public_key).is_ok_and(|key| key.verify(message, self).is_ok())
+    }
+
     /// Create from raw bytes.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; 64]) -> Self {

@@ -448,6 +448,40 @@ fn validate_device_key_id(id: &str) -> Result<(), String> {
 }
 
 impl DeviceKey {
+    /// Identify the registered device that signed this principal's exact challenge.
+    /// The caller supplies the candidates admitted by the active profile and
+    /// the signature verifier for their canonical public keys.
+    ///
+    /// # Errors
+    /// Fails if no admitted device verifies the signature.
+    pub fn identify_signer<S>(
+        keys: &[Self],
+        principal: &crate::PrincipalId,
+        nonce_hex: &str,
+        signature: &S,
+        verify: impl Fn(&S, &str, &[u8]) -> bool,
+    ) -> Result<String, String> {
+        let message =
+            crate::session_token::principal_auth_challenge_message(principal.as_str(), nonce_hex);
+        let device = super::device_challenge::signed_device_id(
+            keys,
+            signature,
+            message.as_bytes(),
+            |record| record.typed_pubkey().ok().map(|key| key.0),
+            |record| record.key_id.as_str(),
+            verify,
+        );
+        match device {
+            Some(id) => Ok(id),
+            None if keys.is_empty() => Err(format!(
+                "principal {principal} has no registered ed25519 key"
+            )),
+            None => Err(format!(
+                "signature did not verify against any registered key for {principal}"
+            )),
+        }
+    }
+
     /// Build a [`DeviceKey`] from a canonical lowercase-hex pubkey and a
     /// scope, deriving the deterministic `key_id` and defaulting label/time.
     ///

@@ -149,9 +149,19 @@ only if the profile is enabled and permits keypair authentication. Both capsule
 dispatch and the kernel's device-scoped capability and native private-input
 checks use that same selector on the resolved profile. A supplied device stamp
 must match exactly one registered fingerprint byte for byte. Profile validation
-rejects duplicate fingerprints. The cryptographic signature check, the
-freshness of the resolved profile at effect admission and the generation of
-the socket owner still require refinement.
+rejects duplicate fingerprints.
+
+Both native and Wasmtime socket authentication construct the signed UTF-8
+message with the same checked function. For a fixed protocol prefix and
+colon-free principal names, equal transcripts imply equal principals and
+nonces, even if the nonce contains a colon. The shared registration scan
+passes the actual signature, message bytes and each candidate's canonical
+public key to the verifier. It returns the fingerprint from the first
+accepting record and skips records without a canonical key. These guarantees
+are relative to the production key and fingerprint projections and the
+verification callback. Hex decoding, Ed25519 verification, nonce generation,
+profile freshness at effect admission and the lifetime of the socket owner's
+generation remain outside these theorems.
 
 ## Native local socket transport
 

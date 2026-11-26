@@ -7,7 +7,6 @@ use astrid_core::profile::device_sessions::{DeviceSession, DeviceSessions};
 use astrid_core::profile::{DeviceKey, DeviceKeyId};
 use astrid_core::session_token::{
     HandshakeRequest, HandshakeResponse, PRINCIPAL_AUTH_NONCE_LEN, PROTOCOL_VERSION, SessionToken,
-    principal_auth_challenge_message,
 };
 use astrid_types::ipc::RequestOwnerId;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
@@ -203,27 +202,13 @@ fn verify_signature_against_keys(
 ) -> Result<String, String> {
     let signature = astrid_crypto::Signature::from_hex(signature_hex)
         .map_err(|error| format!("malformed signature: {error}"))?;
-    let message = principal_auth_challenge_message(principal.as_str(), nonce_hex);
-    for key in public_keys {
-        let Ok(pubkey) = key.typed_pubkey() else {
-            continue;
-        };
-        let Ok(public_key) = astrid_crypto::PublicKey::from_hex(pubkey.as_str()) else {
-            continue;
-        };
-        if public_key.verify(message.as_bytes(), &signature).is_ok() {
-            return Ok(key.key_id.clone());
-        }
-    }
-    if public_keys.is_empty() {
-        Err(format!(
-            "principal {principal} has no registered ed25519 key"
-        ))
-    } else {
-        Err(format!(
-            "signature did not verify against any registered key for {principal}"
-        ))
-    }
+    DeviceKey::identify_signer(
+        public_keys,
+        principal,
+        nonce_hex,
+        &signature,
+        astrid_crypto::Signature::verifies_with_hex_key,
+    )
 }
 
 fn generate_nonce_hex() -> Result<String, String> {

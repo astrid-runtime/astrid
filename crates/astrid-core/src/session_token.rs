@@ -40,7 +40,11 @@ pub const PRINCIPAL_AUTH_NONCE_LEN: usize = 32;
 /// drift.
 #[must_use]
 pub fn principal_auth_challenge_message(principal: &str, nonce_hex: &str) -> String {
-    format!("{PRINCIPAL_AUTH_CHALLENGE_PREFIX}{principal}:{nonce_hex}")
+    crate::profile::device_challenge::challenge_message(
+        PRINCIPAL_AUTH_CHALLENGE_PREFIX,
+        principal,
+        nonce_hex,
+    )
 }
 
 /// A 256-bit random session token for socket authentication.

@@ -47,7 +47,9 @@ NATIVE_REPLY = Path("crates/astrid-uplink/src/native/reply_claim.rs")
 NATIVE_FRAME = Path("crates/astrid-uplink/src/native/frame_segments.rs")
 DEVICE_SESSIONS = Path("crates/astrid-core/src/profile/device_sessions/phase.rs")
 DEVICE_REMOVAL = Path("crates/astrid-core/src/profile/device_removal.rs")
+DEVICE_CHALLENGE = Path("crates/astrid-core/src/profile/device_challenge.rs")
 INPUTS = [
+    DEVICE_CHALLENGE,
     DEVICE_REMOVAL,
     DEVICE_SESSIONS,
     NATIVE_FRAME,
@@ -419,6 +421,31 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "profile removal drops the first record instead of its unique match",
             DEVICE_REMOVAL,
             lambda text: replace_once(text, "registrations.remove(index)", "registrations.remove(0)"),
+        ),
+        (
+            "signed challenge omits the principal separator",
+            DEVICE_CHALLENGE,
+            lambda text: replace_once(text, "message.push(':');", ""),
+        ),
+        (
+            "signed challenge substitutes the principal for the nonce",
+            DEVICE_CHALLENGE,
+            lambda text: replace_once(text, "message.push_str(nonce);", "message.push_str(principal);"),
+        ),
+        (
+            "signature selects another registered device",
+            DEVICE_CHALLENGE,
+            lambda text: replace_once(text, "fingerprint(record).to_owned()", "fingerprint(&records[0]).to_owned()"),
+        ),
+        (
+            "device verification drops the signed message",
+            DEVICE_CHALLENGE,
+            lambda text: replace_once(text, "Some(k) => verify(signature, k, message)", "Some(k) => verify(signature, k, &[])"),
+        ),
+        (
+            "registration without a canonical public key authenticates",
+            DEVICE_CHALLENGE,
+            lambda text: replace_once(text, "None => false,", "None => true,"),
         ),
         (
             "disabled profile supplies device keys",
