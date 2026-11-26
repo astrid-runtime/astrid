@@ -9,6 +9,50 @@ from .common import (
 
 def consumer_defects():
     """Weaken a production guarantee and require its trace consumer to fail."""
+    walk_source = Path("crates/astrid-storage/src/engine/durable/closure_walk.rs")
+    yield (
+        "closure diagnostic loses the cycle through its reported object", walk_source,
+        lambda s: replace_once(s, "&& reaches(old(source).edges(),cached@,k,k) &&", "&& true &&"),
+        Path("verification/hosted_closure_model.rs"),
+    )
+    record = Path("crates/astrid-storage/src/engine/durable/format/verified_record.rs")
+    record_trace = Path("verification/hosted_record_model.rs")
+    yield (
+        "indexed read accepts a different embedded name", record,
+        lambda s: replace_once(s, "return Err(Error::Identifier);", "return Ok(record);"), record,
+    )
+    yield (
+        "indexed read releases an unconfirmed record identity", record,
+        lambda s: replace_once(s, "return Err(Error::Identity);", "return Ok(record);"), record,
+    )
+    yield (
+        "indexed read loses the provenance of the identity failure", record,
+        lambda s: replace_once(s, "actual@ != expected@ &&\n            body.ensures", "true &&\n            body.ensures"), record_trace,
+    )
+    yield (
+        "indexed read parses the wrong body offset", record,
+        lambda s: replace_once(s, "match body(payload,cursor)", "match body(payload,0)"), record,
+    )
+    yield (
+        "arena reference reader omits the exact target bytes", record,
+        lambda s: replace_once(s, "&&& id@ == bytes@.subrange(target+8,target+40)", "&&& true"), record,
+    )
+    yield (
+        "arena reference list starts with the second entry", record,
+        lambda s: replace_once(s, "let (label,id,kind) = match reference(bytes,cursor,scheme)", "let _ = reference(bytes,cursor,scheme);\n        let (label,id,kind) = match reference(bytes,cursor,scheme)"), record,
+    )
+    yield (
+        "arena reference list loses its returned cursor", record,
+        lambda s: replace_once(s, "*final(cursor) as int == position(bytes@,*old(cursor) as int,count as nat) &&", "true &&"), record_trace,
+    )
+    yield (
+        "arena reference list forgets the packed record fields", record,
+        lambda s: replace_once(s, "forall|i:nat| i < count ==> #[trigger] entry(bytes@,position(bytes@,*old(cursor) as int,i),scheme,pack,v@[i as int])", "true"), record_trace,
+    )
+    yield (
+        "arena reference writer emits the wrong reachability code", record,
+        lambda s: replace_once(s, "bytes.push(code);", "bytes.push(0);"), record,
+    )
     walk = Path("crates/astrid-storage/src/engine/durable/closure_walk.rs")
     graph = Path("verification/hosted_closure_model.rs")
     yield (

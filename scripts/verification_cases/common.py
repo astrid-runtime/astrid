@@ -65,6 +65,8 @@ INPUTS = [
     Path("verification/hosted_wal_stream.rs"),
     Path("verification/hosted_wal_writer_trace.rs"),
     Path("verification/hosted_closure_model.rs"),
+    Path("verification/hosted_record_model.rs"),
+    Path("crates/astrid-storage/src/engine/durable/format/verified_record.rs"),
     Path("crates/astrid-storage/src/storage_model/reference_kind.rs"),
     Path("verification/hosted_uplink_model.rs"),
     Path("verification/hosted_kv_model.rs"),

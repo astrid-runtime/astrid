@@ -3,6 +3,22 @@ use vstd::prelude::*;
 
 verus! {
 
+pub(super) fn little_endian(value: u64) -> (bytes: [u8;8])
+    ensures bytes@ == vstd::bytes::spec_u64_to_le_bytes(value),
+{
+    proof { vstd::bytes::spec_u64_to_le_bytes_to_open(value); }
+    let bytes = [
+        (value & 255) as u8, ((value >> 8) & 255) as u8,
+        ((value >> 16) & 255) as u8, ((value >> 24) & 255) as u8,
+        ((value >> 32) & 255) as u8, ((value >> 40) & 255) as u8,
+        ((value >> 48) & 255) as u8, ((value >> 56) & 255) as u8,
+    ];
+    assert(bytes@ =~= vstd::bytes::spec_u64_to_le_bytes_open(value));
+    bytes
+}
+
+
+
 #[derive(Clone, Copy)]
 pub(super) struct Scheme {
     pub(super) algorithm: [u8; 2],
@@ -84,7 +100,7 @@ pub(super) open spec fn at(bytes: Seq<u8>, offset: int, field: Seq<u8>) -> bool 
         bytes.subrange(offset, offset + field.len()) == field
 }
 
-proof fn subfield(bytes: Seq<u8>, start: int, whole: Seq<u8>, pos: int, len: int)
+pub(super) proof fn subfield(bytes: Seq<u8>, start: int, whole: Seq<u8>, pos: int, len: int)
     requires at(bytes,start,whole), 0 <= pos, 0 <= len, pos+len <= whole.len(),
     ensures bytes.subrange(start+pos,start+pos+len) == whole.subrange(pos,pos+len),
 {
@@ -95,7 +111,7 @@ proof fn subfield(bytes: Seq<u8>, start: int, whole: Seq<u8>, pos: int, len: int
     }
 }
 
-fn fixed<const N: usize>(bytes: &[u8], cursor: &mut usize) -> (value: Result<[u8;N],ReadError>)
+pub(super) fn fixed<const N: usize>(bytes: &[u8], cursor: &mut usize) -> (value: Result<[u8;N],ReadError>)
     ensures value.is_ok() == (*old(cursor) as int + N <= bytes.len()),
         value matches Ok(array) ==> *final(cursor) as int == *old(cursor) as int + N
             && at(bytes@,*old(cursor) as int,array@),

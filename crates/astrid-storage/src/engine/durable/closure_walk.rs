@@ -167,6 +167,48 @@ pub(super) open spec fn descending<K>(graph:Map<K,Set<K>>,cache:Set<K>,domain:Se
         graph.contains_key(p) && #[trigger] graph[p].contains(k) ==> rank[k] < rank[p]
 }
 
+pub(super) open spec fn owning_step<K>(graph:Map<K,Set<K>>,cache:Set<K>,p:K,k:K) -> bool {
+    graph.contains_key(p) && !cache.contains(p) && graph[p].contains(k)
+}
+
+pub(super) open spec fn path<K>(graph:Map<K,Set<K>>,cache:Set<K>,first:K,last:K,vertices:Seq<K>) -> bool {
+    &&& vertices.len() >= 2
+    &&& vertices.first() == first && vertices.last() == last
+    &&& forall|i:int| 0 <= i < vertices.len()-1 ==> #[trigger] owning_step(graph,cache,vertices[i],vertices[i+1])
+}
+
+pub(super) open spec fn reaches<K>(graph:Map<K,Set<K>>,cache:Set<K>,first:K,last:K) -> bool {
+    exists|vertices:Seq<K>| #[trigger] path(graph,cache,first,last,vertices)
+}
+
+spec fn ancestor<K>(graph:Map<K,Set<K>>,cache:Set<K>,older:Work<K>,younger:Work<K>) -> bool {
+    match (older,younger) {
+        (Work::Finish(p),Work::Visit(k)) | (Work::Finish(p),Work::Finish(k)) => reaches(graph,cache,p,k),
+        _ => true,
+    }
+}
+
+proof fn child_path<K>(graph:Map<K,Set<K>>,cache:Set<K>,parent:K,id:K,child:K)
+    requires parent == id || reaches(graph,cache,parent,id),
+        graph.contains_key(id),!cache.contains(id),graph[id].contains(child),
+    ensures reaches(graph,cache,parent,child),
+{
+    if parent == id {
+        assert(path(graph,cache,parent,child,seq![id,child]));
+    } else {
+        let chain = choose|v:Seq<K>| #[trigger] path(graph,cache,parent,id,v);
+        assert(path(graph,cache,parent,id,chain));
+        let next = chain.push(child);
+        assert forall|j:int| 0 <= j < next.len()-1 implies #[trigger] owning_step(graph,cache,next[j],next[j+1]) by {
+            if j+1 < chain.len() {assert(next[j] == chain[j] && next[j+1] == chain[j+1]);
+                assert(owning_step(graph,cache,chain[j],chain[j+1]));}
+            else {assert(next[j] == id && next[j+1] == child);}
+        }
+        assert(next.first() == parent && next.last() == child && next.len() >= 2);
+        assert(path(graph,cache,parent,child,next));
+    }
+}
+
 spec fn below<K>(older:Work<K>,younger:Work<K>,cache:Set<K>,rank:Map<K,nat>) -> bool {
     match (older,younger) {
         (Work::Finish(p),Work::Visit(k)) | (Work::Finish(p),Work::Finish(k)) =>
@@ -184,7 +226,8 @@ pub(super) fn walk<K:Ord+Copy,S:Source<K>>(source:&mut S,cached:&BTreeSet<K>,roo
     requires old(source).valid(), obeys_cmp::<K>(), obeys_cmp_concrete_eq::<K>(), btree_set_inv(cached),
     ensures final(source).edges() == old(source).edges(),
         out matches Err(Failure::Root(e)) ==> old(source).root_failed(root,e),
-        out matches Err(Failure::Cycle(k)) ==> !cached@.contains(k) &&
+        out matches Err(Failure::Cycle(k)) ==> !cached@.contains(k) && reaches(old(source).edges(),cached@,k,k) &&
+            (forall|nodes:Set<K>| #[trigger] closed(root,cached@,old(source).edges(),nodes) ==> nodes.contains(k)) &&
             (forall|nodes:Set<K>,rank:Map<K,nat>| closed(root,cached@,old(source).edges(),nodes) ==>
                 ! #[trigger] descending(old(source).edges(),cached@,nodes,rank)),
         out matches Err(Failure::Source(k,e)) ==> S::failed(old(source).edges(),k,e) && !cached@.contains(k) &&
@@ -211,6 +254,7 @@ pub(super) fn walk<K:Ord+Copy,S:Source<K>>(source:&mut S,cached:&BTreeSet<K>,roo
             old(source).commit(root), source.valid(), source.edges() == graph, btree_set_inv(cached),
             btree_map_inv(&marks), btree_set_inv(&seen),
             marks@.dom().subset_of(graph.dom()), marks@.dom().subset_of(seen@),
+            forall|i:int,j:int| 0 <= i < j < stack.len() ==> #[trigger] ancestor(graph,cached@,stack@[i],stack@[j]),
             forall|nodes:Set<K>,rank:Map<K,nat>| closed(root,cached@,graph,nodes) && #[trigger] descending(graph,cached@,nodes,rank) ==>
                 (forall|i:int,j:int| 0 <= i < j < stack.len() ==> #[trigger] below(stack@[i],stack@[j],cached@,rank)),
             done.dom().subset_of(marks@.dom()), ranked(graph,cached@,done),
@@ -283,6 +327,10 @@ pub(super) fn walk<K:Ord+Copy,S:Source<K>>(source:&mut S,cached:&BTreeSet<K>,roo
                     Some(Mark::Active) => {
                         proof {
                             let j = choose|j:int| 0 <= j < pending.len() && pending[j] == Work::Finish(id);
+                            assert(ancestor(graph,cached@,pending[j],pending[pending.len()-1]));
+                            assert forall|nodes:Set<K>| #[trigger] closed(root,cached@,graph,nodes) implies nodes.contains(id) by {
+                                assert(pending[pending.len()-1] == Work::Visit(id));
+                            }
                             assert forall|nodes:Set<K>,rank:Map<K,nat>| closed(root,cached@,graph,nodes) implies
                                 ! #[trigger] descending(graph,cached@,nodes,rank) by {
                                 if descending(graph,cached@,nodes,rank) {
@@ -307,6 +355,23 @@ pub(super) fn walk<K:Ord+Copy,S:Source<K>>(source:&mut S,cached:&BTreeSet<K>,roo
                         }
                         proof {
 
+                            let top = pending.len()-1;
+                            assert forall|i:int,j:int| 0 <= i < j < stack.len() implies #[trigger] ancestor(graph,cached@,stack@[i],stack@[j]) by {
+                                if j < top {
+                                    assert(stack@[i] == pending[i] && stack@[j] == pending[j]);
+                                } else if i <= top {
+                                    if i < top {
+                                        assert(pending[i] == stack@[i]);
+                                        assert(ancestor(graph,cached@,pending[i],pending[top]));
+                                    }
+                                    if j > top {
+                                        if let (Work::Finish(p),Work::Visit(k)) = (stack@[i],stack@[j]) {
+                                            assert(graph[id].contains(k));
+                                            child_path(graph,cached@,p,id,k);
+                                        }
+                                    }
+                                }
+                            }
                             assert forall|nodes:Set<K>,rank:Map<K,nat>| closed(root,cached@,graph,nodes) && #[trigger] descending(graph,cached@,nodes,rank) implies
                                 (forall|i:int,j:int| 0 <= i < j < stack.len() ==> #[trigger] below(stack@[i],stack@[j],cached@,rank)) by {
                                 assert(nodes.contains(id));

@@ -484,4 +484,87 @@ fn incremental_closure_checks_the_root_kind_and_follows_only_owning_edges() {
         matches!(validate_incremental_closure(&mut source, &seen, chunk),
         Err(DurableError::Model(ModelError::RootNotCommit {object, ..})) if object == chunk)
     );
+    let missing = BTreeMap::from([(commit, incoming[&commit].clone())]);
+    let mut source = ClosureObjects {
+        incoming: &missing,
+        ..source
+    };
+    assert!(
+        matches!(validate_incremental_closure(&mut source,&BTreeSet::new(),commit),
+        Err(DurableError::Model(ModelError::MissingObject(id))) if id == chunk)
+    );
+    assert_eq!(
+        validate_incremental_closure(&mut source, &BTreeSet::from([chunk]), commit).unwrap(),
+        BTreeSet::from([commit, chunk])
+    );
+
+    let cycle_member = ObjectRecord::new(
+        ObjectKind::Directory,
+        ObjectFormatVersion::V1,
+        vec![],
+        vec![ObjectReference::owns(ReferenceLabel::new(vec![0]), commit)],
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let cyclic = BTreeMap::from([(commit, incoming[&commit].clone()), (chunk, cycle_member)]);
+    let mut source = ClosureObjects {
+        incoming: &cyclic,
+        ..source
+    };
+    assert!(
+        matches!(validate_incremental_closure(&mut source,&BTreeSet::new(),commit),
+        Err(DurableError::Model(ModelError::ObjectCycle(id))) if id == commit)
+    );
+}
+
+#[test]
+fn single_and_batched_arena_reads_bind_the_frame_and_canonical_record_to_the_request() {
+    use crate::engine::durable::{
+        ARENA_FILE, ARENA_MAGIC, DurableError, File,
+        format::{append_frame, read_indexed_object, read_indexed_objects},
+    };
+    let mut arena = File::Native(tempfile::tempfile().unwrap());
+    let value = record(1, 8);
+    let correct = TestIdentity.identify(&value);
+    let other = object_id(2);
+    let good = append_frame(
+        &mut arena,
+        ARENA_MAGIC,
+        &encode_object_frame(scheme(), correct, &value).unwrap(),
+    )
+    .unwrap();
+    let mislabeled = append_frame(
+        &mut arena,
+        ARENA_MAGIC,
+        &encode_object_frame(scheme(), other, &value).unwrap(),
+    )
+    .unwrap();
+    let limits = RecoveryLimits::process_addressable();
+    assert_eq!(
+        read_indexed_object(&arena, correct, good, &TestIdentity, limits).unwrap(),
+        value
+    );
+    assert_eq!(
+        read_indexed_objects(&arena, &[(correct, good)], &TestIdentity, limits).unwrap()[&correct],
+        value
+    );
+    for (location, detail) in [
+        (good, "indexed object identifier mismatch"),
+        (
+            mislabeled,
+            "indexed object identity does not match its canonical record",
+        ),
+    ] {
+        let single =
+            read_indexed_object(&arena, other, location, &TestIdentity, limits).unwrap_err();
+        let batch =
+            read_indexed_objects(&arena, &[(other, location)], &TestIdentity, limits).unwrap_err();
+        for error in [single, batch] {
+            assert!(
+                matches!(error, DurableError::Corrupt {file:ARENA_FILE,offset, detail: actual}
+                if offset == location.offset && actual == detail)
+            );
+        }
+    }
 }

@@ -1,4 +1,5 @@
 //! ASTWAL2 Commit body. All counts and the sequence are little-endian u64s.
+pub(super) use super::root_wire::little_endian;
 use super::{physical_wire, record_wire};
 use vstd::prelude::*;
 
@@ -34,20 +35,6 @@ impl Counts {
         if self.bytes != observed.bytes { return Err(Mismatch::Bytes); }
         Ok(())
     }
-}
-
-pub(super) fn little_endian(value: u64) -> (bytes: [u8;8])
-    ensures bytes@ == vstd::bytes::spec_u64_to_le_bytes(value),
-{
-    proof { vstd::bytes::spec_u64_to_le_bytes_to_open(value); }
-    let bytes = [
-        (value & 255) as u8, ((value >> 8) & 255) as u8,
-        ((value >> 16) & 255) as u8, ((value >> 24) & 255) as u8,
-        ((value >> 32) & 255) as u8, ((value >> 40) & 255) as u8,
-        ((value >> 48) & 255) as u8, ((value >> 56) & 255) as u8,
-    ];
-    assert(bytes@ =~= vstd::bytes::spec_u64_to_le_bytes_open(value));
-    bytes
 }
 
 impl Marker {

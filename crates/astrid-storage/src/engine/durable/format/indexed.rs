@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use super::{
     ARENA_FILE, ARENA_MAGIC, ArenaLocation, CHECKSUM_START, DurableError, DurableIo,
     FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE, FRAME_VERSION, ObjectId, ObjectRecord,
-    PersistentObjectIdentity, RecoveryLimits, corrupt, decode_object_frame, frame_checksum,
-    io_error, read_exact_at, read_frame_at,
+    PersistentObjectIdentity, RecoveryLimits, corrupt, frame_checksum, io_error, read_exact_at,
+    read_frame_at,
 };
 
 #[cfg(test)]
@@ -51,22 +51,7 @@ pub(in crate::engine::durable) fn read_indexed_object_with_payload<
         ));
     }
     let payload = frame.into_payload();
-    let (id, record) = decode_object_frame(&payload, scheme)
-        .map_err(|detail| corrupt(ARENA_FILE, location.offset, detail))?;
-    if id != expected_id {
-        return Err(corrupt(
-            ARENA_FILE,
-            location.offset,
-            "indexed object identifier mismatch",
-        ));
-    }
-    if identity.identify(&record) != expected_id {
-        return Err(corrupt(
-            ARENA_FILE,
-            location.offset,
-            "indexed object identity does not match its canonical record",
-        ));
-    }
+    let record = verified_payload(&payload, expected_id, location.offset, scheme, identity)?;
     Ok((record, payload))
 }
 
@@ -258,23 +243,41 @@ fn decode_indexed_frame<I: PersistentObjectIdentity>(
             "indexed frame checksum no longer matches the arena",
         ));
     }
-    let (id, record) = decode_object_frame(payload, identity.scheme())
-        .map_err(|detail| corrupt(ARENA_FILE, location.offset, detail))?;
-    if id != expected_id {
-        return Err(corrupt(
+    verified_payload(
+        payload,
+        expected_id,
+        location.offset,
+        identity.scheme(),
+        identity,
+    )
+}
+
+fn verified_payload<I: PersistentObjectIdentity>(
+    payload: &[u8],
+    expected: ObjectId,
+    offset: u64,
+    scheme: super::IdentityScheme,
+    identity: &I,
+) -> Result<ObjectRecord, DurableError> {
+    use super::verified_record::{self, Error};
+    verified_record::read(
+        payload,
+        scheme.into(),
+        *expected.as_bytes(),
+        |input, start| super::decode_record_body(input, start, scheme),
+        |record| *identity.identify(record).as_bytes(),
+    )
+    .map_err(|error| {
+        corrupt(
             ARENA_FILE,
-            location.offset,
-            "indexed object identifier mismatch",
-        ));
-    }
-    if identity.identify(&record) != expected_id {
-        return Err(corrupt(
-            ARENA_FILE,
-            location.offset,
-            "indexed object identity does not match its canonical record",
-        ));
-    }
-    Ok(record)
+            offset,
+            match error {
+                Error::Decode(e) => super::decode_error_detail(e),
+                Error::Identifier => "indexed object identifier mismatch",
+                Error::Identity => "indexed object identity does not match its canonical record",
+            },
+        )
+    })
 }
 
 fn frame_len(location: ArenaLocation) -> Result<u64, DurableError> {

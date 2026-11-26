@@ -96,6 +96,10 @@ mod wal_root_history;
 mod closure_walk;
 #[path = "../crates/astrid-storage/src/storage_model/reference_kind.rs"]
 mod reference_kind;
+use reference_kind::ReferenceKind;
+#[path = "../crates/astrid-storage/src/engine/durable/format/verified_record.rs"]
+mod verified_record;
+mod hosted_record_model;
 mod hosted_closure_model;
 
 #[path = "../crates/astrid-storage/src/engine/durable/frontier.rs"]

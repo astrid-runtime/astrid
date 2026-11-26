@@ -110,4 +110,45 @@ fn self_reference(cached_root:bool) {
     }
 }
 
+/// The reachable cycle is below the Commit. Its diagnostic must identify
+/// the child on that cycle; the Commit itself has no incoming edge.
+fn descendant_cycle() {
+    let root = 1u64;
+    let child = 2u64;
+    let mut records = Records {records:BTreeMap::new(),commits:BTreeSet::new()};
+    records.records.insert(root,vec![Reference {kind:ReferenceKind::Owns,id:child}]);
+    records.records.insert(child,vec![Reference {kind:ReferenceKind::Owns,id:child}]);
+    records.commits.insert(root);
+    let cached = BTreeSet::new();
+    let ghost graph = records.edges();
+    proof {
+        reveal_with_fuel(walk::children,2);
+        assert(graph[root] =~= set![child]); assert(graph[child] =~= set![child]);
+        assert(graph.dom() =~= set![root,child]);
+        assert(walk::closed(root,cached@,graph,graph.dom()));
+    }
+    match walk::walk(&mut records,&cached,root) {
+        Ok(seen) => {
+            assert(seen@.contains(root) && graph[root].contains(child));
+            assert(seen@.contains(child));
+            let ghost d = choose|d:Map<u64,nat>| d.dom() == seen@.difference(cached@) && #[trigger] walk::ranked(graph,cached@,d);
+            assert(d.contains_key(child));
+            assert(d[child] < d[child]);
+            assert(false);
+        },
+        Err(Failure::Cycle(k)) => {
+            proof {
+                let chain = choose|v:Seq<u64>| #[trigger] walk::path(graph,cached@,k,k,v);
+                assert(walk::path(graph,cached@,k,k,chain));
+                let before = chain.len()-2;
+                assert(walk::owning_step(graph,cached@,chain[before],chain[before+1]));
+                assert(chain[before+1] == k);
+                assert(k == child);
+            }
+        },
+        Err(Failure::Root(_)) => {assert(false);},
+        Err(Failure::Source(id,_)) => {assert(graph.dom().contains(id));assert(false);},
+    }
+}
+
 }

@@ -7,6 +7,7 @@ use super::{
     FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE, FRAME_VERSION, IdentityScheme, ModelError,
     ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ObjectReference,
     PersistentObjectIdentity, RecoveryLimits, ReferenceKind, ReferenceLabel, SeekFrom, io,
+    root_wire,
 };
 #[cfg(test)]
 use std::fs::OpenOptions;
@@ -38,6 +39,7 @@ mod scan;
 mod scan_tests;
 #[cfg(test)]
 mod tests;
+mod verified_record;
 
 pub(super) use framed_append::{FramedAppendStream, TRANSFER_BUFFER_BYTES};
 #[cfg(test)]
@@ -484,10 +486,7 @@ pub(super) fn ensure_payload_limit(
 }
 
 fn encode_identity(bytes: &mut Vec<u8>, scheme: IdentityScheme, id: ObjectId) {
-    bytes.extend_from_slice(&scheme.algorithm().to_le_bytes());
-    bytes.extend_from_slice(&scheme.construction().to_le_bytes());
-    bytes.extend_from_slice(&CURRENT_DIGEST_BYTES.to_le_bytes());
-    bytes.extend_from_slice(id.as_bytes());
+    verified_record::append_identity(bytes, scheme.into(), *id.as_bytes());
 }
 
 pub(super) fn encode_object_frame(
@@ -509,12 +508,14 @@ pub(super) fn encode_object_frame(
     bytes.extend_from_slice(&reference_count.to_le_bytes());
     bytes.extend_from_slice(record.canonical_bytes());
     for reference in record.references() {
-        let label_len = u64::try_from(reference.label().as_bytes().len())
-            .map_err(|_| DurableError::EncodingOverflow)?;
-        bytes.extend_from_slice(&label_len.to_le_bytes());
-        bytes.extend_from_slice(reference.label().as_bytes());
-        encode_identity(&mut bytes, scheme, reference.target());
-        bytes.push(reference.kind().code());
+        verified_record::append_reference(
+            &mut bytes,
+            reference.label().as_bytes(),
+            scheme.into(),
+            *reference.target().as_bytes(),
+            reference.kind(),
+        )
+        .map_err(|()| DurableError::EncodingOverflow)?;
     }
     Ok(bytes)
 }
@@ -551,8 +552,27 @@ pub(super) fn decode_object_frame(
     bytes: &[u8],
     scheme: IdentityScheme,
 ) -> Result<(ObjectId, ObjectRecord), &'static str> {
+    verified_record::decode(bytes, scheme.into(), |input, start| {
+        decode_record_body(input, start, scheme)
+    })
+    .map(|(id, record)| (ObjectId::new(id), record))
+    .map_err(decode_error_detail)
+}
+
+fn decode_error_detail(error: verified_record::DecodeError<&'static str>) -> &'static str {
+    match error {
+        verified_record::DecodeError::Tag(e) => e.detail(),
+        verified_record::DecodeError::Record(detail) => detail,
+    }
+}
+
+fn decode_record_body(
+    bytes: &[u8],
+    start: usize,
+    scheme: IdentityScheme,
+) -> Result<ObjectRecord, &'static str> {
     let mut reader = SliceReader::new(bytes);
-    let id = reader.identity(scheme)?;
+    reader.offset = start;
     let kind = ObjectKind::from_code(reader.u16()?).ok_or("unknown object-kind code")?;
     let version =
         ObjectFormatVersion::new(reader.u16()?).ok_or("object-format version must be non-zero")?;
@@ -580,7 +600,7 @@ pub(super) fn decode_object_frame(
         class,
     )
     .map_err(|_| "non-canonical object references")?;
-    Ok((id, record))
+    Ok(record)
 }
 
 fn decode_references(
@@ -597,17 +617,5 @@ fn decode_references(
     references
         .try_reserve_exact(count)
         .map_err(|_| "reference allocation failed")?;
-    for _ in 0..count {
-        let label_len = reader.usize_len()?;
-        let label = reader.take(label_len)?.to_vec();
-        let target = reader.identity(scheme)?;
-        let reference_kind =
-            ReferenceKind::from_code(reader.u8()?).ok_or("unknown reference-kind code")?;
-        references.push(ObjectReference::new(
-            ReferenceLabel::new(label),
-            target,
-            reference_kind,
-        ));
-    }
-    Ok(references)
+    reader.references(scheme, count, references)
 }

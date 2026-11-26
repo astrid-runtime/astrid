@@ -41,14 +41,6 @@ impl<'a> SliceReader<'a> {
         ))
     }
 
-    pub(super) fn u32(&mut self) -> Result<u32, &'static str> {
-        Ok(u32::from_le_bytes(
-            self.take(4)?
-                .try_into()
-                .map_err(|_| "truncated u32 field")?,
-        ))
-    }
-
     pub(super) fn u64(&mut self) -> Result<u64, &'static str> {
         Ok(u64::from_le_bytes(
             self.take(8)?
@@ -61,21 +53,54 @@ impl<'a> SliceReader<'a> {
         usize::try_from(self.u64()?).map_err(|_| "length is not process-addressable")
     }
 
+    pub(super) fn references(
+        &mut self,
+        scheme: IdentityScheme,
+        count: usize,
+        reserved: Vec<super::ObjectReference>,
+    ) -> Result<Vec<super::ObjectReference>, &'static str> {
+        use super::root_wire::ReadError;
+        use super::verified_record::{self, ReferenceError};
+        verified_record::read_many(
+            self.bytes,
+            &mut self.offset,
+            scheme.into(),
+            count,
+            reserved,
+            |label, id, kind| {
+                super::ObjectReference::new(
+                    super::ReferenceLabel::new(label.to_vec()),
+                    ObjectId::new(id),
+                    kind,
+                )
+            },
+        )
+        .map_err(|e| match e {
+            ReferenceError::Read(ReadError::Overflow(_)) => "frame length overflow",
+            ReferenceError::Read(ReadError::Truncated) => "truncated frame payload",
+            ReferenceError::Length => "length is not process-addressable",
+            ReferenceError::Target(e) => e.detail(),
+            ReferenceError::Kind => "unknown reference-kind code",
+        })
+    }
+
     pub(super) fn identity(&mut self, scheme: IdentityScheme) -> Result<ObjectId, &'static str> {
-        let algorithm = self.u16()?;
-        let construction = self.u16()?;
-        let digest_len =
-            usize::try_from(self.u32()?).map_err(|_| "identity digest length overflow")?;
-        if algorithm == 0 || construction == 0 || digest_len == 0 {
-            return Err("identity tag fields must be non-zero");
-        }
-        let digest = self.take(digest_len)?;
-        if algorithm != scheme.algorithm() || construction != scheme.construction() {
-            return Err("unsupported identity algorithm or construction version");
-        }
-        digest
-            .try_into()
+        super::verified_record::identity(self.bytes, &mut self.offset, scheme.into())
             .map(ObjectId::new)
-            .map_err(|_| "identity digest length does not match the supported scheme")
+            .map_err(super::verified_record::TagError::detail)
+    }
+}
+
+impl super::verified_record::TagError {
+    pub(super) fn detail(self) -> &'static str {
+        use super::root_wire::ReadError;
+        match self {
+            Self::Read(ReadError::Overflow(_)) => "frame length overflow",
+            Self::Read(ReadError::Truncated) => "truncated frame payload",
+            Self::LengthOverflow => "identity digest length overflow",
+            Self::Zero => "identity tag fields must be non-zero",
+            Self::Scheme => "unsupported identity algorithm or construction version",
+            Self::DigestLength => "identity digest length does not match the supported scheme",
+        }
     }
 }
