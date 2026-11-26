@@ -1,11 +1,11 @@
 //! Principal-scoped durable capsule-install resume receipts.
 
+mod validation;
+
 use std::sync::Arc;
 
 use astrid_core::PrincipalId;
-use astrid_core::kernel_api::{
-    CapsuleInstallResumeReceipt, InstalledCapsuleGeneration, KernelResponse,
-};
+use astrid_core::kernel_api::{CapsuleInstallResumeReceipt, KernelResponse};
 use astrid_storage::ScopedKvStore;
 
 use crate::Kernel;
@@ -93,18 +93,18 @@ pub(super) async fn put(
             return KernelResponse::Error(format!("write capsule resume receipt: {error}"));
         },
     };
-    if !swapped {
+    let Some((store, key, encoded)) = validation::after_swap(swapped, (store, key, encoded)) else {
         return KernelResponse::Error(
             "capsule install resume receipt changed concurrently; retry".to_owned(),
         );
-    }
+    };
     let read_back = match store.get(key).await {
         Ok(read_back) => read_back,
         Err(error) => {
             return KernelResponse::Error(format!("verify capsule resume receipt write: {error}"));
         },
     };
-    if read_back.as_deref() != Some(encoded.as_slice()) {
+    if !validation::confirmed(&encoded, read_back.as_deref()) {
         return KernelResponse::Error("capsule resume receipt write did not read back".to_owned());
     }
     KernelResponse::Success(serde_json::json!({ "stored": true }))
@@ -131,20 +131,14 @@ fn principal_store(kernel: &Arc<Kernel>, caller: &PrincipalId) -> Result<ScopedK
 }
 
 fn valid_receipt(receipt: &CapsuleInstallResumeReceipt, key: &str) -> bool {
-    receipt.id == key && is_digest(&receipt.archive_digest) && valid_generation(&receipt.generation)
-}
-
-fn valid_generation(generation: &InstalledCapsuleGeneration) -> bool {
-    is_digest(&generation.archive)
-        && is_digest(&generation.metadata)
-        && is_digest(&generation.authority)
-}
-
-fn is_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    validation::valid(
+        &receipt.id,
+        key,
+        receipt.archive_digest.as_bytes(),
+        receipt.generation.archive.as_bytes(),
+        receipt.generation.metadata.as_bytes(),
+        receipt.generation.authority.as_bytes(),
+    )
 }
 
 #[cfg(test)]
@@ -292,6 +286,28 @@ mod tests {
             get(&kernel, &caller, "scoped-capsule").await,
             KernelResponse::CapsuleInstallResumeReceipt(Some(found)) if found == value
         ));
+    }
+
+    #[tokio::test]
+    async fn receipts_require_the_addressed_capsule_and_a_valid_authority_digest() {
+        let directory = tempfile::tempdir().unwrap();
+        let kernel = crate::test_kernel_with_home(AstridHome::from_path(directory.path())).await;
+        let caller = PrincipalId::default();
+        let store = principal_store(&kernel, &caller).unwrap();
+        let other = serde_json::to_vec(&receipt("other", 'a')).unwrap();
+        store.set("target", other.clone()).await.unwrap();
+        assert!(matches!(
+            get(&kernel, &caller, "target").await,
+            KernelResponse::CapsuleInstallResumeReceipt(None)
+        ));
+
+        let mut malformed = receipt("target", 'b');
+        malformed.generation.authority.replace_range(63.., "G");
+        assert!(matches!(
+            put(&kernel, &caller, malformed).await,
+            KernelResponse::Error(_)
+        ));
+        assert_eq!(store.get("target").await.unwrap(), Some(other));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -57,6 +57,22 @@ including `request_policy.rs`, `admin/request_authorization.rs` and
 writes, profile changes, publication and replies. These rows enumerate entry
 points. The contracts below identify the effects already covered.
 
+### Capsule install resume receipts
+
+The two receipt methods acquire the administration write lock before checking
+the caller's policy and hold it through lookup of the caller's UID, access
+to its control namespace, and publication of the response. An integration
+test exercises both request methods while a writer reassigns the alias.
+The checked receipt validator requires the decoded capsule ID to equal the
+requested key and each of the four digest fields to contain exactly 64
+lowercase hexadecimal bytes. The checked transition after compare-and-swap
+returns the same store, key and encoded bytes only on reported success.
+The read-back acknowledgement requires a present value equal at every byte.
+These contracts rely on the store implementing compare-and-swap and reading
+the addressed key, and on serialization, principal lifecycle locking and
+recovery. Digest syntax alone establishes no relationship with installed
+archive contents.
+
 ## Guest key-value storage
 
 All seven operations in `astrid:kv/host@1.0.0` enter through `impl kv::Host for HostState` in `crates/astrid-capsule/src/engine/wasm/host/kv.rs`. Get, set, delete and compare-and-swap take a key. List, paginated list and clear take a prefix. Both list operations call the same backend prefix listing. The cursor and limit select a page after that listing returns.

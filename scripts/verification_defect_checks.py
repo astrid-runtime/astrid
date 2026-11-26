@@ -53,7 +53,9 @@ DEVICE_CHALLENGE = Path("crates/astrid-core/src/profile/device_challenge.rs")
 REGISTERED_BEARER = Path("crates/astrid-core/src/session_token/registered_bearer.rs")
 PRIVATE_RESPONDER = Path("crates/astrid-capsule/src/elicitation/responder.rs")
 PAIR_DENIES = Path("crates/astrid-kernel/src/kernel_router/admin/pair_device_handlers/deny_patterns.rs")
+RECEIPT = Path("crates/astrid-kernel/src/kernel_router/resume_receipt/validation.rs")
 INPUTS = [
+    RECEIPT,
     PAIR_DENIES,
     PRIVATE_RESPONDER,
     REGISTERED_BEARER,
@@ -236,6 +238,26 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "frame consumption drops the captured operation",
             INGRESS_FRAME,
             lambda text: replace_once(text, "    slot.take()", "    *slot = None; None"),
+        ),
+        (
+            "receipt validation accepts a different capsule identifier",
+            RECEIPT,
+            lambda text: replace_once(text, "    id == key && digest", "    id != key && digest"),
+        ),
+        (
+            "receipt validation omits the installed authority digest",
+            RECEIPT,
+            lambda text: replace_once(text, "&& digest(authority)", "&& digest(metadata)"),
+        ),
+        (
+            "receipt read-back proceeds after a failed compare-and-swap",
+            RECEIPT,
+            lambda text: replace_once(text, "    if swapped { Some(target)", "    if true { Some(target)"),
+        ),
+        (
+            "receipt acknowledgement accepts equal length but different bytes",
+            RECEIPT,
+            lambda text: replace_once(text, "Some(bytes) => bytes == expected", "Some(bytes) => bytes.len() == expected.len()"),
         ),
         (
             "wire header misstates the low byte of the body length",
