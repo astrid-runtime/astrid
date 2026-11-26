@@ -1,6 +1,9 @@
 //! Per-connection egress queues for the native local transport.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+
+use super::delivery_queue::{DeliveryQueue, Receipt};
+use super::reply_claim::Phase;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use astrid_events::ipc::{IpcMessage, RequestOwnerId, Topic};
@@ -9,11 +12,6 @@ use astrid_events::{AstridEvent, EventBus};
 use super::{CLIENT_EGRESS_CAPACITY, EVENT_SOURCE, MAX_PAYLOAD_BYTES, event_topic, routing};
 
 const CLIENT_EGRESS_BYTE_BUDGET: usize = 4 * MAX_PAYLOAD_BYTES;
-
-struct QueuedEvent {
-    event: Arc<AstridEvent>,
-    bytes: usize,
-}
 
 fn request_owner_allows(message: &IpcMessage, client_owner: RequestOwnerId) -> bool {
     if message.topic == Topic::approval_request() {
@@ -38,14 +36,16 @@ fn request_owner_allows(message: &IpcMessage, client_owner: RequestOwnerId) -> b
     )
 }
 
+struct PendingReply {
+    owner: RequestOwnerId,
+    phase: Phase,
+}
+
 #[derive(Default)]
 struct QueueState {
-    events: VecDeque<QueuedEvent>,
-    human_replies: HashMap<ReplyKey, RequestOwnerId>,
-    claimed_replies: std::collections::HashSet<ReplyKey>,
+    events: DeliveryQueue<Arc<AstridEvent>>,
+    human_replies: HashMap<ReplyKey, PendingReply>,
     human_reply_bytes: usize,
-    bytes: usize,
-    overflowed: bool,
 }
 
 #[derive(Clone, Hash, Eq, PartialEq)]
@@ -83,6 +83,7 @@ impl ReplyKey {
 }
 
 pub(super) struct EgressQueue {
+    owner: RequestOwnerId,
     state: Mutex<QueueState>,
     ready: tokio::sync::Notify,
 }
@@ -189,7 +190,8 @@ pub(super) struct HumanReplyClaim<'a> {
 
 impl HumanReplyClaim<'_> {
     pub(super) fn complete(mut self) {
-        self.receiver.complete_human_reply(&self.key, self.owner);
+        self.receiver
+            .finish_human_reply(&self.key, self.owner, true);
         self.completed = true;
     }
 }
@@ -200,12 +202,7 @@ impl Drop for HumanReplyClaim<'_> {
             return;
         }
         self.receiver
-            .queue
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .claimed_replies
-            .remove(&self.key);
+            .finish_human_reply(&self.key, self.owner, false);
     }
 }
 
@@ -333,7 +330,7 @@ impl Registry {
     ) -> Subscription {
         let id = uuid::Uuid::new_v4();
         let session = Arc::new(RwLock::new(None));
-        let queue = Arc::new(EgressQueue::new());
+        let queue = Arc::new(EgressQueue::new(request_owner));
         self.clients
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -371,10 +368,12 @@ impl Subscription {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.overflowed
-            || state.human_replies.get(&key) != Some(&owner)
-            || !state.claimed_replies.insert(key.clone())
-        {
+        let closed = state.events.is_closed();
+        if !state.human_replies.get_mut(&key).is_some_and(|reply| {
+            reply
+                .phase
+                .claim(reply.owner.as_u128(), owner.as_u128(), closed)
+        }) {
             return Err("human reply is no longer available on this connection");
         }
         Ok(Some(HumanReplyClaim {
@@ -398,17 +397,17 @@ impl Subscription {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let key = ReplyKey::from_reply(message);
-            let Some(owner) = state.human_replies.get(&key) else {
+            let Some(reply) = state.human_replies.get(&key) else {
                 return if key.selection_id.is_some() {
                     Err("selection reply does not match a request on this connection")
                 } else {
                     Ok(None) // Standalone model-selection command.
                 };
             };
-            if state.overflowed || state.claimed_replies.contains(&key) {
+            if state.events.is_closed() || reply.phase != Phase::Available {
                 return Err("selection reply does not match the delivered request");
             }
-            return Ok(Some(*owner));
+            return Ok(Some(reply.owner));
         }
         if !topic.starts_with("astrid.v1.approval.response.")
             && !topic.starts_with("astrid.v1.elicit.response.")
@@ -428,45 +427,45 @@ impl Subscription {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.overflowed {
+        if state.events.is_closed() {
             return Err("human request delivery overflowed");
         }
-        if state
-            .claimed_replies
-            .contains(&ReplyKey::from_reply(message))
-        {
-            return Err("human reply is already awaiting runtime delivery");
-        }
-        state
+        let reply = state
             .human_replies
             .get(&ReplyKey {
                 topic: expected,
                 selection_id: None,
             })
-            .copied()
-            .map(Some)
-            .ok_or("human reply does not match a request on this connection")
+            .ok_or("human reply does not match a request on this connection")?;
+        if reply.phase != Phase::Available {
+            return Err("human reply is already awaiting runtime delivery");
+        }
+        Ok(Some(reply.owner))
     }
 
-    pub(super) fn complete_human_reply(&self, key: &ReplyKey, owner: RequestOwnerId) {
+    fn finish_human_reply(&self, key: &ReplyKey, owner: RequestOwnerId, committed: bool) {
         let mut state = self
             .queue
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state
-            .human_replies
-            .get(key)
-            .is_some_and(|existing| *existing == owner)
-            && state.human_replies.remove(key).is_some()
-        {
+        if state.human_replies.get_mut(key).is_some_and(|reply| {
+            reply
+                .phase
+                .finish(reply.owner.as_u128(), owner.as_u128(), committed)
+        }) {
+            state.human_replies.remove(key);
             state.human_reply_bytes = state.human_reply_bytes.saturating_sub(key.bytes());
-            state.claimed_replies.remove(key);
         }
     }
 
-    pub(super) fn egress_queue(&self) -> Arc<EgressQueue> {
-        Arc::clone(&self.queue)
+    pub(super) fn egress_queue(&self, handshake_owner: RequestOwnerId) -> Option<Arc<EgressQueue>> {
+        super::delivery_queue::bind_writer(
+            self.queue.owner.as_u128(),
+            handshake_owner.as_u128(),
+            &self.queue,
+        )
+        .map(Arc::clone)
     }
     pub(super) fn begin_turn(&self, session: &str) -> bool {
         let Some(registry) = self.registry.upgrade() else {
@@ -555,8 +554,9 @@ impl Subscription {
 }
 
 impl EgressQueue {
-    fn new() -> Self {
+    fn new(owner: RequestOwnerId) -> Self {
         Self {
+            owner,
             state: Mutex::new(QueueState::default()),
             ready: tokio::sync::Notify::new(),
         }
@@ -567,7 +567,7 @@ impl EgressQueue {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.overflowed {
+        if state.events.is_closed() {
             return;
         }
         let human_reply = event_message(&event).and_then(|message| {
@@ -611,25 +611,21 @@ impl EgressQueue {
             state
                 .human_replies
                 .get(topic)
-                .is_some_and(|existing| existing != owner)
+                .is_some_and(|existing| existing.owner != *owner)
                 || (!state.human_replies.contains_key(topic)
                     && (state.human_replies.len() >= CLIENT_EGRESS_CAPACITY
                         || topic.bytes()
                             > CLIENT_EGRESS_BYTE_BUDGET.saturating_sub(state.human_reply_bytes)))
         });
-        if state.events.len() >= CLIENT_EGRESS_CAPACITY
-            || bytes > CLIENT_EGRESS_BYTE_BUDGET.saturating_sub(state.bytes)
-            || reply_overflow
-        {
-            // Release retained frames immediately. The affected connection
-            // observes Lagged and fail-closes; other clients have independent
-            // queues and remain available.
-            state.events.clear();
+        if !state.events.enqueue(
+            event,
+            bytes,
+            CLIENT_EGRESS_CAPACITY,
+            CLIENT_EGRESS_BYTE_BUDGET,
+            reply_overflow,
+        ) {
             state.human_replies.clear();
-            state.claimed_replies.clear();
             state.human_reply_bytes = 0;
-            state.bytes = 0;
-            state.overflowed = true;
             drop(state);
             self.ready.notify_one();
             return;
@@ -638,10 +634,11 @@ impl EgressQueue {
             if !state.human_replies.contains_key(&topic) {
                 state.human_reply_bytes = state.human_reply_bytes.saturating_add(topic.bytes());
             }
-            state.human_replies.insert(topic, owner);
+            state.human_replies.entry(topic).or_insert(PendingReply {
+                owner,
+                phase: Phase::Available,
+            });
         }
-        state.bytes = state.bytes.saturating_add(bytes);
-        state.events.push_back(QueuedEvent { event, bytes });
         drop(state);
         self.ready.notify_one();
     }
@@ -656,12 +653,10 @@ impl EgressQueue {
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if state.overflowed {
-                    return Err(RecvError::Lagged);
-                }
-                if let Some(queued) = state.events.pop_front() {
-                    state.bytes = state.bytes.saturating_sub(queued.bytes);
-                    return Ok(queued.event);
+                match state.events.receive() {
+                    Receipt::Event(event) => return Ok(event),
+                    Receipt::Closed => return Err(RecvError::Lagged),
+                    Receipt::Empty => {},
                 }
             }
             ready.await;
@@ -673,14 +668,11 @@ impl EgressQueue {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.overflowed {
-            return Err(TryRecvError::Lagged);
+        match state.events.receive() {
+            Receipt::Event(event) => Ok(event),
+            Receipt::Closed => Err(TryRecvError::Lagged),
+            Receipt::Empty => Err(TryRecvError::Empty),
         }
-        let Some(queued) = state.events.pop_front() else {
-            return Err(TryRecvError::Empty);
-        };
-        state.bytes = state.bytes.saturating_sub(queued.bytes);
-        Ok(queued.event)
     }
 }
 

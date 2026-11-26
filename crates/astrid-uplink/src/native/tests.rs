@@ -381,6 +381,16 @@ async fn selection_reply_keeps_picker_owner_and_standalone_selection_stays_conne
     };
     assert!(receiver.human_reply_owner(&response("wrong")).is_err());
     assert!(foreign.human_reply_owner(&response("picker")).is_err());
+    let cancelled = receiver
+        .claim_human_reply(&response("picker"))
+        .unwrap()
+        .unwrap();
+    assert!(receiver.claim_human_reply(&response("picker")).is_err());
+    assert_eq!(
+        receiver.human_reply_owner(&response("second")).unwrap(),
+        Some(identity.request_owner)
+    );
+    drop(cancelled);
     let mut replies = bus.subscribe_topic(topic.as_str());
     process_inbound(&bus, &identity, "alice", &receiver, response("picker"))
         .await

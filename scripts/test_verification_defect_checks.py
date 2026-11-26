@@ -6,7 +6,9 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import re
+import tempfile
 import unittest
+from unittest.mock import patch
 
 
 def load_script(name: str):
@@ -98,6 +100,22 @@ class Defects(unittest.TestCase):
         for name, relative, defect in checks.defects():
             with self.subTest(defect=name):
                 defect((checks.ROOT / relative).read_text())
+
+    def test_each_defect_uses_the_verified_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            relative = pathlib.Path("proof.rs")
+            working, baseline = root / "working", root / "baseline"
+            working.mkdir()
+            (working / relative).write_text("original")
+            with patch.object(checks, "INPUTS", [relative]), patch.object(checks, "ROOT", working):
+                checks.copy_inputs(working, baseline)
+                (working / relative).write_text("later edit")
+                def inspect(_verus, tree):
+                    self.assertEqual((tree / relative).read_text(), "modified original")
+                    return 1, "error: assertion failed\n --> proof.rs:1:1\nverification results:: 0 verified, 1 errors"
+                with patch.object(checks, "verify", inspect):
+                    self.assertTrue(checks.check_defect("verus", baseline, "snapshot", relative, lambda text: "modified " + text))
 
     def test_names_are_unique(self) -> None:
         names = [name for name, _, _ in checks.defects()]

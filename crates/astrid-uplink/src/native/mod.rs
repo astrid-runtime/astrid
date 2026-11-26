@@ -3,6 +3,7 @@
 //! This is the baseline control-plane transport. Distributions may add
 //! frontends, but daemon boot and the `astrid` CLI do not depend on one.
 
+mod delivery_queue;
 mod egress;
 mod framing;
 mod handshake;
@@ -14,6 +15,7 @@ mod recipient;
 mod recovery_tests;
 #[cfg(all(test, unix))]
 mod rejection_tests;
+mod reply_claim;
 mod routing;
 #[cfg(all(test, unix))]
 mod tests;
@@ -509,6 +511,10 @@ async fn serve_connection(
 ) {
     let services = services.into();
     let principal = identity.principal.to_string();
+    let Some(egress) = receiver.egress_queue(identity.request_owner) else {
+        tracing::error!(security_event = true, %principal, "socket handshake owner does not match the registered delivery queue");
+        return;
+    };
     let (reader, mut writer) = local_transport::split(stream);
     let mut reader = FramedReader::new(reader);
     let mut stream_accumulators = HashMap::new();
@@ -516,7 +522,6 @@ async fn serve_connection(
     let reserved_deadline = tokio::time::Instant::now()
         .checked_add(RESERVED_ADMIN_LIFETIME)
         .unwrap_or_else(tokio::time::Instant::now);
-    let egress = receiver.egress_queue();
     let mut pending = admission
         .initial_message
         .take()

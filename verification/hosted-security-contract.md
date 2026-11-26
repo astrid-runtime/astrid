@@ -173,15 +173,32 @@ The checked chat transition admits a matching host-stamped owner. Only an
 owned nonterminal message with a nonzero producer and nonce can establish
 the correlation for an unbound turn. A subsequent ownerless terminal frame
 must match both captured values. An explicitly foreign owner cannot use that
-exception. The routing caller supplies the active turn; admission, queue
-mutation and turn retirement are still ordinary Rust lock operations.
+exception. The registry and turn locks supply the active turn.
+
+Before serving the accepted socket, the native connection handler compares
+its handshake owner with the owner registered on the queue. The checked
+binding function returns the supplied handle exactly when the full owner IDs
+match. The normal writer and shutdown drain use this handle. The checked
+FIFO appends the actual event, returns the oldest retained event, and counts
+the sum of the charges supplied with all retained events. Slot exhaustion,
+byte overflow or a reply-record conflict closes and empties the queue.
+Closure is permanent. These statements use the verifier library's contracts
+for the Rust standard library deque. The byte charge is a runtime estimate.
+
+A pending human reply carries its owner and claim phase in one map entry.
+Its checked transition permits one live claim for the registered owner.
+Cancellation restores availability, and successful completion spends the
+claim before removal. Repeated delivery of an outstanding request keeps its
+phase. The map operations, mutex, delivery reservation, and operating system
+socket identity remain refinement obligations. In particular, queue closure
+on overflow does not establish closure on device or principal revocation.
 
 | Native effect | Production path | Outstanding refinement |
 | --- | --- | --- |
 | Register a connection and emit lifecycle events | `ConnectionRuntime::handle`, `serve_connection`, `publish_lifecycle` | Peer identity, durable owner, subscription lifetime and disconnect accounting |
 | Demand-load a capsule runtime and publish a client operation | `input::PendingInput`, `readiness::ensure`, `publish_trusted_ingress` | Caller generation, asynchronous readiness, publication reservation and commit |
 | Deliver a private answer | `private_elicit` calls the configured responder directly | Registry owner, cancellation and handling of secret bytes |
-| Queue a bus event and write a client frame | `Registry::install`, `forward_outbound`, `write_message` | Ownership of the queue and socket, turn locks, buffered delivery across revocation and shutdown, wire serialization |
+| Queue a bus event and write a client frame | `Registry::install`, `forward_outbound`, `write_message` | Authenticated socket identity, mutex ordering, device revocation during buffering, wire serialization and partial writes |
 | Return handshake, refusal and completion frames directly | `handshake`, `route_connection_message`, `write_ingress_refusal`, `input` | Binding each response to its accepted socket, including partial writes and canceled requests |
 
 ## Remembered local egress consent

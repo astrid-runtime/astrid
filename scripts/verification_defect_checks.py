@@ -42,7 +42,11 @@ DEVICE_ADMISSION = Path("crates/astrid-core/src/profile/device_admission.rs")
 CONSENT_IDENTITY = Path("crates/astrid-capsule/src/engine/wasm/host/consent_identity.rs")
 NATIVE_TOPIC = Path("crates/astrid-uplink/src/native/topic_policy.rs")
 NATIVE_RECIPIENT = Path("crates/astrid-uplink/src/native/recipient.rs")
+NATIVE_QUEUE = Path("crates/astrid-uplink/src/native/delivery_queue.rs")
+NATIVE_REPLY = Path("crates/astrid-uplink/src/native/reply_claim.rs")
 INPUTS = [
+    NATIVE_REPLY,
+    NATIVE_QUEUE,
     NATIVE_TOPIC,
     NATIVE_RECIPIENT,
     CONSENT_IDENTITY,
@@ -179,6 +183,66 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "frame consumption drops the captured operation",
             INGRESS_FRAME,
             lambda text: replace_once(text, "    slot.take()", "    *slot = None; None"),
+        ),
+        (
+            "claimed native reply can be claimed twice",
+            NATIVE_REPLY,
+            lambda text: replace_once(text, "|| !matches!(self, Phase::Available)", "|| false"),
+        ),
+        (
+            "native queue claims a reply for another owner",
+            NATIVE_REPLY,
+            lambda text: replace_once(text, "if closed || registered != offered", "if closed"),
+        ),
+        (
+            "cancelling a native reply loses its retry",
+            NATIVE_REPLY,
+            lambda text: replace_once(text, "*self = Phase::Available", "*self = Phase::Spent"),
+        ),
+        (
+            "foreign completion consumes a native reply",
+            NATIVE_REPLY,
+            lambda text: replace_once(text, "if registered != offered || !matches!(self, Phase::Claimed)", "if !matches!(self, Phase::Claimed)"),
+        ),
+        (
+            "socket writer binds another connection's queue",
+            NATIVE_QUEUE,
+            lambda text: replace_once(text, "    if registered == handshake", "    if true"),
+        ),
+        (
+            "native FIFO delivers the newest event first",
+            NATIVE_QUEUE,
+            lambda text: replace_once(text, "self.events.pop_front()", "self.events.pop_back()"),
+        ),
+        (
+            "native FIFO puts new events ahead of queued events",
+            NATIVE_QUEUE,
+            lambda text: replace_once(text, "self.events.push_back((event, bytes))", "self.events.push_front((event, bytes))"),
+        ),
+        (
+            "overflow discards the closure fence",
+            NATIVE_QUEUE,
+            lambda text: replace_once(text, "self.closed = true;", "self.closed = false;"),
+        ),
+        (
+            "empty closed socket appears temporarily idle",
+            NATIVE_QUEUE,
+            lambda text: replace_once(text, "if self.closed { return Receipt::Closed; }", "if self.closed { return Receipt::Empty; }"),
+        ),
+        (
+            "native FIFO ignores reply overflow",
+            NATIVE_QUEUE,
+            lambda text: replace_once(text, "self.closed || reply_overflow ||", "self.closed ||"),
+        ),
+        (
+            "native FIFO fails to charge an admitted event",
+            NATIVE_QUEUE,
+            lambda text: replace_once(text, "self.bytes.saturating_add(bytes)", "self.bytes"),
+        ),
+        (
+            "native FIFO fails to release a dequeued byte charge",
+            NATIVE_QUEUE,
+            lambda text: replace_once(text, "self.bytes.saturating_sub(bytes)", "self.bytes"),
         ),
         (
             "native approval accepts an untrusted producer",
@@ -727,16 +791,16 @@ def verify(verus: str, tree: Path) -> tuple[int, str]:
     return result.returncode, result.stdout + result.stderr
 
 
-def copy_inputs(tree: Path) -> None:
+def copy_inputs(source: Path, tree: Path) -> None:
     for relative in INPUTS:
         (tree / relative).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(ROOT / relative, tree / relative)
+        shutil.copyfile(source / relative, tree / relative)
 
 
 def check_defect(verus: str, base: Path, name: str, relative: Path, defect) -> bool:
     """Apply one defect to a scratch copy and report whether it was rejected."""
     tree = base / "defect"
-    copy_inputs(tree)
+    copy_inputs(base, tree)
     source = tree / relative
     try:
         source.write_text(defect(source.read_text()))
@@ -745,7 +809,11 @@ def check_defect(verus: str, base: Path, name: str, relative: Path, defect) -> b
         return False
     _, output = verify(verus, tree)
     counts = verified_counts(output)
-    if counts is None or counts[1] == 0:
+    if counts is None:
+        print(f"FAIL: {name}: verifier did not produce verification counts")
+        print(output[-2000:])
+        return False
+    if counts[1] == 0:
         print(f"FAIL: {name}: the verifier reported no error")
         return False
     if not error_in(output, relative):
@@ -762,7 +830,7 @@ def main() -> int:
     checks = defects()
     with tempfile.TemporaryDirectory(prefix="astrid-verification-defects-") as scratch:
         base = Path(scratch)
-        copy_inputs(base)
+        copy_inputs(ROOT, base)
         code, output = verify(args.verus, base)
         counts = verified_counts(output)
         if code != 0 or counts is None or counts[1] != 0:

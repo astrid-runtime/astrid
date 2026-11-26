@@ -65,3 +65,9 @@ mod native_recipient;
 
 #[path = "../crates/astrid-uplink/src/native/topic_policy.rs"]
 mod native_topic_policy;
+
+#[path = "../crates/astrid-uplink/src/native/delivery_queue.rs"]
+mod native_delivery_queue;
+
+#[path = "../crates/astrid-uplink/src/native/reply_claim.rs"]
+mod native_reply_claim;

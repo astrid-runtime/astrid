@@ -25,7 +25,7 @@ fn terminal_failure_is_delivered_only_to_its_captured_owner() {
 
 #[test]
 fn unanswered_human_requests_have_a_bounded_lifetime_on_the_connection() {
-    let queue = EgressQueue::new();
+    let queue = EgressQueue::new(RequestOwnerId::generate());
     let owner = RequestOwnerId::generate();
     for index in 0..=CLIENT_EGRESS_CAPACITY {
         queue.enqueue(
@@ -70,7 +70,7 @@ fn event() -> Arc<AstridEvent> {
 
 #[tokio::test]
 async fn byte_budget_fail_closes_and_releases_retained_events() {
-    let queue = EgressQueue::new();
+    let queue = EgressQueue::new(RequestOwnerId::generate());
     queue.enqueue(event(), CLIENT_EGRESS_BYTE_BUDGET);
     queue.enqueue(event(), 1);
 
@@ -79,8 +79,7 @@ async fn byte_budget_fail_closes_and_releases_retained_events() {
         .state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert!(state.events.is_empty());
-    assert_eq!(state.bytes, 0);
+    assert_eq!(state.events.retained_size(), (0, 0));
 }
 
 #[tokio::test]
@@ -286,4 +285,20 @@ fn dropping_turn_owner_releases_only_its_admission() {
     assert!(first.begin_turn("session-1"));
     drop(first);
     assert!(second.begin_turn("session-1"));
+}
+
+#[test]
+fn socket_writer_requires_the_registered_connection_owner() {
+    let bus = Arc::new(EventBus::new());
+    let registry = Registry::install(&bus);
+    let owner = RequestOwnerId::generate();
+    let other = RequestOwnerId::generate();
+    let first = registry.subscribe("alice".into(), None, owner);
+    let second = registry.subscribe("alice".into(), None, other);
+    assert!(first.egress_queue(other).is_none());
+    assert!(second.egress_queue(owner).is_none());
+    assert!(!Arc::ptr_eq(
+        &first.egress_queue(owner).unwrap(),
+        &second.egress_queue(other).unwrap()
+    ));
 }

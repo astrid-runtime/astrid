@@ -969,7 +969,8 @@ async fn active_cancellation_preserves_blocked_management_and_human_reply() {
     .unwrap();
     drop(cancellation.take());
     let terminal = receiver
-        .egress_queue()
+        .egress_queue(identity.request_owner)
+        .expect("queue belongs to test connection")
         .recv()
         .await
         .expect("native terminal despite non-draining consumer");
