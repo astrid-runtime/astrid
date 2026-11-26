@@ -169,10 +169,10 @@ pub(super) async fn record_pair_issue_outcome(
     match result {
         Ok(_) => record_admin_success(kernel, &context).await,
         Err(PairIssueError::Unauthorized(error)) => {
-            record_admin_authorization_failure(kernel, &context, error).await
+            record_admin_authorization_failure(kernel, &context, error).await;
         },
         Err(PairIssueError::BadInput(error) | PairIssueError::Internal(error)) => {
-            record_admin_request_failure(kernel, &context, error).await
+            record_admin_request_failure(kernel, &context, error).await;
         },
     }
 }
