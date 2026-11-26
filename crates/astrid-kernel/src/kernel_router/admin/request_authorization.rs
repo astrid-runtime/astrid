@@ -8,7 +8,7 @@ use astrid_core::principal::PrincipalId;
 use astrid_events::kernel_api::AdminRequestKind;
 use tracing::warn;
 
-use super::{audit_handlers, pair_device_handlers};
+use super::audit_handlers;
 use crate::kernel_router::{
     AdminAuditEntry, AuthorizedRequest, authorize_request, record_admin_audit,
 };
@@ -103,40 +103,29 @@ pub(super) async fn authorize_admin_request(
         },
     };
 
-    let preflight = if let AdminRequestKind::PairDeviceIssue {
-        expires_secs,
-        scope,
-        ..
-    } = kind
-    {
-        pair_device_handlers::preflight_pair_device_issue(&authorization, *expires_secs, scope)
-    } else {
-        Ok(())
-    };
-    match preflight {
-        Ok(()) => {},
-        Err(pair_device_handlers::PairIssuePreflightError::BadInput(error)) => {
-            record_admin_request_failure(kernel, context, &error).await;
-            return Err(error);
-        },
-        Err(pair_device_handlers::PairIssuePreflightError::Unauthorized(error)) => {
-            record_admin_authorization_failure(kernel, context, &error).await;
-            return Err(error);
-        },
-    }
     // Anchoring polls read the audit log itself. Denials above stay audited,
     // and the caller records the request if its handler fails.
-    // Quota changes also require a locked comparison with the current allocation.
-    // Their handler records the final result after that check and persistence.
+    // Quota changes and pairing recheck policy under the administration lock.
+    // Their handlers record the outcome after the check and persistence.
     if audit_handlers::omit_success_admin_audit(kind)
         || matches!(
             kind,
-            AdminRequestKind::QuotaSet { .. } | AdminRequestKind::QuotaAssignUser { .. }
+            AdminRequestKind::QuotaSet { .. }
+                | AdminRequestKind::QuotaAssignUser { .. }
+                | AdminRequestKind::PairDeviceIssue { .. }
         )
     {
         return Ok(authorization);
     }
 
+    record_admin_success(kernel, context).await;
+    Ok(authorization)
+}
+
+async fn record_admin_success(
+    kernel: &Arc<crate::Kernel>,
+    context: &AdminAuthorizationContext<'_>,
+) {
     record_admin_audit(
         kernel,
         AdminAuditEntry {
@@ -151,5 +140,39 @@ pub(super) async fn authorize_admin_request(
         },
     )
     .await;
-    Ok(authorization)
+}
+
+/// Record the terminal decision after pairing has rechecked policy and attempted the mint.
+pub(super) async fn record_pair_issue_outcome(
+    kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
+    key: Option<&str>,
+    request: &AdminRequestKind,
+    result: &Result<
+        astrid_core::kernel_api::PairTokenIssued,
+        super::pair_device_handlers::PairIssueError,
+    >,
+) {
+    use super::pair_device_handlers::PairIssueError;
+    let params = super::sanitize_admin_audit_params(request);
+    let context = AdminAuthorizationContext {
+        caller,
+        device_key_id: key,
+        method: super::admin_request_method(request),
+        required_cap: super::required_capability_for_admin_request(
+            request,
+            super::resolve_admin_scope(request, caller),
+        ),
+        target_principal: super::admin_target_principal(request),
+        audit_params: params.as_ref(),
+    };
+    match result {
+        Ok(_) => record_admin_success(kernel, &context).await,
+        Err(PairIssueError::Unauthorized(error)) => {
+            record_admin_authorization_failure(kernel, &context, error).await
+        },
+        Err(PairIssueError::BadInput(error) | PairIssueError::Internal(error)) => {
+            record_admin_request_failure(kernel, &context, error).await
+        },
+    }
 }

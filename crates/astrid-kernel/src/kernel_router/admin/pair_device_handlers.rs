@@ -40,32 +40,26 @@ const DEFAULT_EXPIRY_SECS: u64 = 5 * 60;
 
 type PairIssuerAuthority = (PrincipalProfile, Arc<GroupConfig>, Option<DeviceScope>);
 
-fn pair_token_store(
-    kernel: &Arc<crate::Kernel>,
-) -> Result<DurablePairTokenStore, AdminResponseBody> {
-    let Some(store) = kernel.principal_store.as_ref() else {
-        return Err(err_internal(
-            "pair-token durable storage is unavailable".into(),
-        ));
-    };
-    DurablePairTokenStore::new(store.kv())
-        .map_err(|_| err_internal("pair-token durable storage is unavailable".into()))
+fn pair_token_store(kernel: &Arc<crate::Kernel>) -> Result<DurablePairTokenStore, String> {
+    let unavailable = || "pair-token durable storage is unavailable".to_owned();
+    let store = kernel.principal_store.as_ref().ok_or_else(unavailable)?;
+    DurablePairTokenStore::new(store.kv()).map_err(|_| unavailable())
 }
 
 fn current_pair_issuer_authority(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
     issuer_device_key_id: Option<&str>,
-) -> Result<PairIssuerAuthority, AdminResponseBody> {
+) -> Result<PairIssuerAuthority, PairIssueError> {
     let profile = PrincipalProfile::load_required(&kernel.astrid_home, caller).map_err(|error| {
         if matches!(&error, astrid_core::profile::ProfileError::Io(io) if io.kind() == std::io::ErrorKind::NotFound) {
-            err_bad_input(format!("caller principal {caller} does not exist (no profile.toml)"))
+            PairIssueError::BadInput(format!("caller principal {caller} does not exist (no profile.toml)"))
         } else {
-            err_internal(format!("issuer profile resolution failed: {error}"))
+            PairIssueError::Internal(format!("issuer profile resolution failed: {error}"))
         }
     })?;
     if !profile.enabled {
-        return Err(err_unauthorized(format!(
+        return Err(PairIssueError::Unauthorized(format!(
             "caller principal {caller} is disabled"
         )));
     }
@@ -75,7 +69,7 @@ fn current_pair_issuer_authority(
         issuer_device_key_id,
         "self:auth:pair",
     )
-    .map_err(|error| err_unauthorized(error.to_string()))?;
+    .map_err(|error| PairIssueError::Unauthorized(error.to_string()))?;
     Ok((profile, kernel.groups.load_full(), issuer_scope))
 }
 
@@ -86,61 +80,54 @@ pub(super) async fn pair_device_issue(
     issuer_device_key_id: Option<&str>,
     expires_secs: Option<u64>,
     label: Option<String>,
-    requested: PairScopeArg,
-) -> AdminResponseBody {
-    let (lifetime, requested_scope) = match validate_pair_issue(expires_secs, &requested) {
-        Ok(values) => values,
-        Err(error) => return err_bad_input(error),
-    };
-
+    requested: &PairScopeArg,
+) -> Result<PairTokenIssued, PairIssueError> {
+    let (lifetime, requested_scope) =
+        validate_pair_issue(expires_secs, requested).map_err(PairIssueError::BadInput)?;
     // Preserve restrictions from ingress if policy widens while this issue waits.
     let admitted_scope = if let Some(auth) = authorization {
-        match validate_pair_issue_authority(
+        validate_pair_issue_authority(
             caller,
             &auth.profile,
             &auth.groups,
             auth.device_scope.as_ref(),
             &requested_scope,
-        ) {
-            Ok(scope) => scope,
-            Err(error) => return err_unauthorized(error),
-        }
+        )
+        .map_err(PairIssueError::Unauthorized)?
     } else {
         requested_scope
     };
 
     let _guard = kernel.admin_write_lock.lock().await;
     let (profile, groups, issuer_scope) =
-        match current_pair_issuer_authority(kernel, caller, issuer_device_key_id) {
-            Ok(authority) => authority,
-            Err(response) => return response,
-        };
-    let stored_scope = match validate_pair_issue_authority(
+        current_pair_issuer_authority(kernel, caller, issuer_device_key_id)?;
+    let stored_scope = validate_pair_issue_authority(
         caller,
         &profile,
         &groups,
         issuer_scope.as_ref(),
         &admitted_scope,
-    ) {
-        Ok(scope) => scope,
-        Err(error) => return err_unauthorized(error),
-    };
-    let store = match pair_token_store(kernel) {
-        Ok(store) => store,
-        Err(response) => return response,
-    };
+    )
+    .map_err(PairIssueError::Unauthorized)?;
+    let store = pair_token_store(kernel).map_err(PairIssueError::Internal)?;
     if store
         .ensure_legacy_import(&kernel.astrid_home, &kernel.principal_directory)
         .await
         .is_err()
     {
-        return err_internal("pair-token durable storage is unavailable".into());
+        return Err(PairIssueError::Internal(
+            "pair-token durable storage is unavailable".into(),
+        ));
     }
     if store.prune().await.is_err() {
-        return err_internal("pair-token durable storage could not be pruned".into());
+        return Err(PairIssueError::Internal(
+            "pair-token durable storage could not be pruned".into(),
+        ));
     }
     let Ok(principal_uid) = kernel.principal_directory.uid_for(caller) else {
-        return err_internal("caller has no durable principal identity".into());
+        return Err(PairIssueError::Internal(
+            "caller has no durable principal identity".into(),
+        ));
     };
 
     let now = pair_token::now_epoch();
@@ -158,8 +145,16 @@ pub(super) async fn pair_device_issue(
     };
     match store.issue(&record).await {
         Ok(true) => {},
-        Ok(false) => return err_internal("pair-token identifier collision".into()),
-        Err(_) => return err_internal("pair-token durable storage write failed".into()),
+        Ok(false) => {
+            return Err(PairIssueError::Internal(
+                "pair-token identifier collision".into(),
+            ));
+        },
+        Err(_) => {
+            return Err(PairIssueError::Internal(
+                "pair-token durable storage write failed".into(),
+            ));
+        },
     }
 
     info!(
@@ -170,7 +165,7 @@ pub(super) async fn pair_device_issue(
         "Layer 6 auth.pair.issue"
     );
 
-    AdminResponseBody::PairToken(PairTokenIssued {
+    Ok(PairTokenIssued {
         token,
         principal: caller.clone(),
         expires_at_epoch,
@@ -211,31 +206,20 @@ pub(super) fn pair_scope_requires_admin(scope: &PairScopeArg) -> bool {
 
 /// Pair-issuance failure class used to keep audit authorization and operation
 /// outcomes distinct without changing the public error wire shape.
-pub(super) enum PairIssuePreflightError {
-    /// The caller was authorized, but the requested expiry or scope is invalid.
+pub(super) enum PairIssueError {
     BadInput(String),
-    /// The requested scope exceeds the issuer's effective authority.
     Unauthorized(String),
+    Internal(String),
 }
 
-/// Validate pair issuance against the exact policy snapshot pinned by the
-/// router before it records an authorization success audit row.
-pub(super) fn preflight_pair_device_issue(
-    authorization: &AuthorizedRequest,
-    expires_secs: Option<u64>,
-    requested: &PairScopeArg,
-) -> Result<(), PairIssuePreflightError> {
-    let (_, requested_scope) =
-        validate_pair_issue(expires_secs, requested).map_err(PairIssuePreflightError::BadInput)?;
-    validate_pair_issue_authority(
-        &authorization.principal,
-        authorization.profile.as_ref(),
-        authorization.groups.as_ref(),
-        authorization.device_scope.as_ref(),
-        &requested_scope,
-    )
-    .map_err(PairIssuePreflightError::Unauthorized)?;
-    Ok(())
+impl PairIssueError {
+    pub(super) fn into_body(self) -> AdminResponseBody {
+        match self {
+            Self::BadInput(message) => err_bad_input(message),
+            Self::Unauthorized(message) => err_unauthorized(message),
+            Self::Internal(message) => err_internal(message),
+        }
+    }
 }
 
 fn validate_pair_issue_authority(
@@ -355,7 +339,7 @@ pub(crate) async fn pair_device_redeem(
     let _guard = kernel.admin_write_lock.lock().await;
     let store = match pair_token_store(kernel) {
         Ok(store) => store,
-        Err(response) => return response,
+        Err(error) => return err_internal(error),
     };
     if store
         .ensure_legacy_import(&kernel.astrid_home, &kernel.principal_directory)

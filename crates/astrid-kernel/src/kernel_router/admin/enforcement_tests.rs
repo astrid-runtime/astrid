@@ -560,6 +560,48 @@ fn seed_principal_with_devices(kernel: &Arc<Kernel>, principal: &PrincipalId) ->
     (full_id, scoped_id)
 }
 
+#[tokio::test]
+async fn queued_pair_refusal_has_one_denied_audit_row_and_no_token() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("queued_pair_audit");
+    let mut profile = PrincipalProfile {
+        grants: vec!["self:*".into()],
+        ..Default::default()
+    };
+    seed_profile(&kernel, &caller, &profile);
+    let guard = kernel.admin_write_lock.lock().await;
+    let request = AdminRequestKind::PairDeviceIssue {
+        expires_secs: Some(300),
+        label: None,
+        scope: astrid_events::kernel_api::PairScopeArg::Explicit {
+            allow: vec!["self:*".into()],
+            deny: vec![],
+        },
+    };
+    let mut queued = std::pin::pin!(super::handle_admin_request(
+        &kernel,
+        Topic::from_raw("astrid.v1.admin.auth.pair.issue"),
+        caller.clone(),
+        None,
+        request.into()
+    ));
+    tokio::select! {
+        biased;
+        () = &mut queued => panic!("pair issue finished under another writer"),
+        () = std::future::ready(()) => {}
+    }
+    profile.enabled = false;
+    seed_profile(&kernel, &caller, &profile);
+    drop(guard);
+    queued.await;
+    assert_pair_issue_audit(&kernel, "self:auth:pair", PairIssueAuditExpectation::Denied).await;
+    let store = crate::pair_token::DurablePairTokenStore::new(
+        kernel.principal_store.as_ref().unwrap().kv(),
+    )
+    .unwrap();
+    assert!(store.list().await.unwrap().is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn device_scope_denies_pair_issue_but_full_device_and_none_allow() {
     let (_dir, kernel) = fixture().await;
