@@ -373,6 +373,16 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             lambda text: replace_once(text, "Self::Write | Self::Sync => true", "Self::Write => true, Self::Sync => false"),
         ),
         (
+            "restart enumerates revoked markers twice and drops consumption",
+            AUTHORITY,
+            lambda text: replace_once(text, "[Self::Revoked, Self::Consumed]", "[Self::Revoked, Self::Revoked]"),
+        ),
+        (
+            "revoked tokens are written to the used marker namespace",
+            AUTHORITY,
+            lambda text: replace_once(text, 'Self::Revoked => "caps:revoked", Self::Consumed => "caps:used"', 'Self::Revoked => "caps:used", Self::Consumed => "caps:used"'),
+        ),
+        (
             "revoked callback lease is live before its expiry",
             LEASE_CALLBACK,
             lambda text: replace_once(text, "\n    !revoked && now <= expires\n", "\n    now <= expires\n"),

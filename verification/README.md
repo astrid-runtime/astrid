@@ -122,7 +122,7 @@ Previously admitted operations can finish. Single-use consumption uses a
 durable insert-if-absent, so retry after an ambiguous or canceled write cannot
 win a second CAS.
 
-Startup loads both marker namespaces before exposing the store. It also uses
+Startup loads both marker namespaces before exposing the store. Verus checks the two-element recovery schedule, the exact namespace used for each marker kind, and preservation of the supplied token key when constructing the write address. UUID formatting and parsing and complete enumeration by the backend remain assumptions. It also uses
 the authoritative ownership snapshot to restore capability and allowance
 fences for pending principal deletions. The authenticated kernel and admin
 IPC preambles check those fences. Principal derivation checks under the

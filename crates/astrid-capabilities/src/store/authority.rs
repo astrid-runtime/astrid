@@ -25,6 +25,35 @@ pub(super) enum Marker {
     Consumed,
 }
 
+impl Marker {
+    /// Both durable namespaces must be replayed before publishing authority.
+    pub(super) fn recovery_order() -> (markers: [Self; 2])
+        ensures markers[0] is Revoked, markers[1] is Consumed,
+    {
+        [Self::Revoked, Self::Consumed]
+    }
+
+    pub(super) fn namespace(self) -> (name: &'static str)
+        ensures name@ == match self {
+            Self::Revoked => "caps:revoked"@,
+            Self::Consumed => "caps:used"@,
+        },
+    {
+        match self { Self::Revoked => "caps:revoked", Self::Consumed => "caps:used" }
+    }
+
+    /// Writes address the same namespace that recovery enumerates and keep the entire token key.
+    pub(super) fn address<T>(self, token_key: T) -> (address: (&'static str, T))
+        ensures address.1 == token_key,
+            address.0@ == match self {
+                Self::Revoked => "caps:revoked"@,
+                Self::Consumed => "caps:used"@,
+            },
+    {
+        (self.namespace(), token_key)
+    }
+}
+
 impl TokenStatus {
     pub(super) closed spec fn revoked(&self) -> bool { self.revoked }
     pub(super) closed spec fn used(&self) -> bool { self.used }

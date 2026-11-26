@@ -29,7 +29,9 @@ const NS_TOKENS: &str = "caps:tokens";
 /// though the primary layout is principal-prefixed. Kept in sync with
 /// [`NS_TOKENS`] by `add`/`revoke`/`cleanup_expired`.
 const NS_TOKEN_INDEX: &str = "caps:token_index";
+#[cfg(test)]
 const NS_REVOKED: &str = "caps:revoked";
+#[cfg(test)]
 const NS_USED: &str = "caps:used";
 
 /// Build the persistent-token key for a given principal and token id.
@@ -108,7 +110,8 @@ impl CapabilityStore {
     /// Returns an error if loading existing revoked/used tokens fails.
     pub async fn with_kv_store(store: Arc<dyn KvStore>) -> CapabilityResult<Self> {
         let mut recorded: HashMap<TokenId, Vec<Marker>> = HashMap::new();
-        for (namespace, marker) in [(NS_REVOKED, Marker::Revoked), (NS_USED, Marker::Consumed)] {
+        for marker in Marker::recovery_order() {
+            let namespace = marker.namespace();
             for key in store
                 .list_keys(namespace)
                 .await
@@ -518,12 +521,9 @@ impl CapabilityStore {
                 .or_insert_with(|| TokenStatus::recover(false, false))
                 .record_revocation();
             if let Some(store) = &self.persistent_store {
+                let (namespace, key) = Marker::Revoked.address(token_id.0.to_string());
                 store
-                    .set(
-                        NS_REVOKED,
-                        &token_id.0.to_string(),
-                        PRESENCE_MARKER.to_vec(),
-                    )
+                    .set(namespace, &key, PRESENCE_MARKER.to_vec())
                     .await
                     .map_err(|error| CapabilityError::StorageError(error.to_string()))?;
             }
@@ -684,13 +684,9 @@ impl CapabilityStore {
         // A canceled or ambiguous write can have committed. Requiring
         // durable absence atomically prevents a retry from winning twice.
         let won = if let Some(store) = &self.persistent_store {
+            let (namespace, key) = Marker::Consumed.address(token_id.0.to_string());
             store
-                .compare_and_swap(
-                    NS_USED,
-                    &token_id.0.to_string(),
-                    None,
-                    PRESENCE_MARKER.to_vec(),
-                )
+                .compare_and_swap(namespace, &key, None, PRESENCE_MARKER.to_vec())
                 .await
                 .map_err(|error| CapabilityError::StorageError(error.to_string()))?
         } else {
