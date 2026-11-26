@@ -481,7 +481,7 @@ async fn device_retirement_drains_wasmtime_socket_and_captured_publication() {
     use crate::engine::wasm::bindings::astrid::ipc::host::{
         ErrorCode as IpcError, Host as IpcHost,
     };
-    use crate::engine::wasm::host_state::SignedSocket;
+    use crate::engine::wasm::bindings::astrid::request_context::host::Host as RequestContext;
     use crate::engine::wasm::test_fixtures::minimal_host_state;
     use astrid_core::profile::DeviceKeyId;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -501,13 +501,22 @@ async fn device_retirement_drains_wasmtime_socket_and_captured_publication() {
             .bind(key.clone())
             .unwrap();
         let (socket, mut peer) = tokio::net::UnixStream::pair().unwrap();
-        let signed = SignedSocket::new(socket, session, &rt);
-        let rep = state
-            .resource_table
-            .push(NetStream::Signed(signed))
-            .unwrap()
-            .rep();
-        state.bind_connection_principal(rep, principal.clone(), Some(key.as_str().to_owned()));
+        let mut disconnected = state.event_bus.subscribe_topic("client.v1.disconnect");
+        assert!(state.reserve_net_stream());
+        let rep = super::super::unix_listener::install_accepted(
+            &mut state,
+            socket,
+            Some((principal.clone(), key.as_str().to_owned(), session)),
+        )
+        .unwrap()
+        .rep();
+        assert_eq!(
+            RequestContext::connection_principal(&mut state, Resource::new_borrow(rep))
+                .unwrap()
+                .as_deref(),
+            Some(principal.as_str())
+        );
+
         let topic = "client.v1.sample";
         let mut events = state.event_bus.subscribe_topic(topic);
         let frame = br#"{"topic":"client.v1.sample","payload":{}}"#;
@@ -523,7 +532,12 @@ async fn device_retirement_drains_wasmtime_socket_and_captured_publication() {
                 IpcHost::publish_as(&mut state, topic.into(), "{}".into(), "ignored".into())
                     .await
                     .unwrap();
-                events.recv().await.unwrap();
+                let event = events.recv().await.unwrap();
+                let astrid_events::AstridEvent::Ipc { message, .. } = event.as_ref() else {
+                    panic!("expected forwarded IPC message")
+                };
+                assert_eq!(message.principal.as_deref(), Some(principal.as_str()));
+                assert_eq!(message.device_key_id.as_deref(), Some(key.as_str()));
             }
         }
 
@@ -567,6 +581,18 @@ async fn device_retirement_drains_wasmtime_socket_and_captured_publication() {
             };
             assert!(matches!(outcome, Err(IpcError::CapabilityDenied)));
         }
+        let event = disconnected
+            .try_recv()
+            .expect("disconnect before acknowledgement");
+        let astrid_events::AstridEvent::Ipc { message, .. } = event.as_ref() else {
+            panic!("expected disconnect")
+        };
+        assert_eq!(message.principal.as_deref(), Some(principal.as_str()));
+        assert!(
+            RequestContext::connection_owner(&mut state, Resource::new_borrow(rep))
+                .unwrap()
+                .is_none()
+        );
         assert!(events.try_recv().is_none());
         assert_eq!(peer.read(&mut [0u8; 1]).await.unwrap(), 0);
         assert!(matches!(
@@ -576,5 +602,7 @@ async fn device_retirement_drains_wasmtime_socket_and_captured_publication() {
         assert!(
             HostTcpStream::write_bytes(&mut state, Resource::new_borrow(rep), vec![1]).is_err()
         );
+        HostTcpStream::drop(&mut state, Resource::new_own(rep)).unwrap();
+        assert!(disconnected.try_recv().is_none());
     }
 }

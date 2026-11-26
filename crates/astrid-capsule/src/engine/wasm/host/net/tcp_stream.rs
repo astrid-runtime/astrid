@@ -105,6 +105,9 @@ impl HostTcpStream for HostState {
         // and skips the registry lookup.
         if self.has_uplink_capability {
             let bound = match &result {
+                Ok(NetReadStatus::Data(_)) if authority.is_some() => {
+                    authority.as_ref().map(|a| a.identity.as_ref().clone())
+                },
                 Ok(NetReadStatus::Data(_)) => self
                     .connection_principals
                     .get(&self_.rep())

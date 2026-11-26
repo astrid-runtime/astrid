@@ -41,7 +41,7 @@ use crate::engine::wasm::host::http::is_safe_ip;
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::{HostState, NetStream, SharedTcpListener, TcpStreamSlot};
 
-mod client_lifecycle;
+pub(crate) mod client_lifecycle;
 pub(crate) mod handshake;
 mod stream;
 mod tcp_listener;

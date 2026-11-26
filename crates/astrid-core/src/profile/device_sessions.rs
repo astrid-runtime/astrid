@@ -131,6 +131,13 @@ impl DeviceChallenge {
 }
 
 impl DeviceSession {
+    /// Whether retirement has been signalled. The caller must retain the
+    /// session throughout a synchronous effect admitted by this observation.
+    #[must_use]
+    pub fn is_retired(&self) -> bool {
+        *self.0.borrow()
+    }
+
     /// Run one operation under this session. Retirement cancels the operation,
     /// and the receiver stays live until its future has been dropped.
     pub async fn while_live<F: Future>(&self, operation: F) -> Option<F::Output> {

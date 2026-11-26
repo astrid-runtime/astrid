@@ -2,6 +2,8 @@
 
 use std::sync::{Arc, Weak};
 
+use super::{ConnectionIdentity, HostState};
+use crate::engine::wasm::host::net::client_lifecycle::SignedLifecycle;
 use astrid_core::local_transport::LocalStream;
 use astrid_core::profile::device_sessions::DeviceSession;
 use tokio::sync::{Mutex, oneshot};
@@ -10,6 +12,7 @@ use tokio::sync::{Mutex, oneshot};
 struct LiveSocket {
     // Close the OS handle before releasing this operation's retirement receiver.
     stream: Mutex<LocalStream>,
+    lifecycle: std::sync::OnceLock<SignedLifecycle>,
     session: Arc<DeviceSession>,
 }
 
@@ -17,6 +20,7 @@ struct LiveSocket {
 #[derive(Clone, Debug)]
 pub(crate) struct SocketAuthority {
     session: Weak<DeviceSession>,
+    pub(crate) identity: Arc<ConnectionIdentity>,
     _owner: Arc<oneshot::Sender<()>>,
 }
 
@@ -40,11 +44,13 @@ impl SignedSocket {
     pub(crate) fn new(
         stream: LocalStream,
         session: DeviceSession,
+        identity: ConnectionIdentity,
         runtime: &tokio::runtime::Handle,
     ) -> Self {
         let session = Arc::new(session);
         let live = Arc::new(LiveSocket {
             stream: Mutex::new(stream),
+            lifecycle: std::sync::OnceLock::new(),
             session: Arc::clone(&session),
         });
         let (socket_owner, socket_released) = oneshot::channel();
@@ -53,6 +59,7 @@ impl SignedSocket {
             socket: Arc::downgrade(&live),
             authority: SocketAuthority {
                 session: Arc::downgrade(&session),
+                identity: Arc::new(identity),
                 _owner: Arc::new(frame_owner),
             },
             _owner: Arc::new(socket_owner),
@@ -67,6 +74,26 @@ impl SignedSocket {
                 .await;
         });
         handle
+    }
+
+    pub(crate) fn register_connection(&self, state: &HostState) -> bool {
+        let Some(live) = self.socket.upgrade() else {
+            return false;
+        };
+        if live.session.is_retired() {
+            return false;
+        }
+        // Holding live across both the event and installation orders the
+        // matching disconnect before device retirement can acknowledge.
+        live.lifecycle.get_or_init(|| {
+            SignedLifecycle::connect(state, self.authority.identity.principal.clone())
+        });
+        true
+    }
+
+    pub(crate) fn live_identity(&self) -> Option<ConnectionIdentity> {
+        let live = self.socket.upgrade()?;
+        (!live.session.is_retired()).then(|| self.authority.identity.as_ref().clone())
     }
 
     pub(crate) fn authority(&self) -> &SocketAuthority {
