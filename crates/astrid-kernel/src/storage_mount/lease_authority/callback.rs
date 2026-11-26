@@ -25,18 +25,41 @@ impl OperationClass {
     }
 }
 
-pub(crate) enum Admission<T> { Stale, Unauthorized, Accepted(T) }
+/// One-use evidence for the effect executor. Only admission can construct it.
+pub(crate) struct Admitted<L, O> {
+    lease: L,
+    operation: O,
+    class: OperationClass,
+}
 
-pub(crate) fn admit<T>(live: bool, authenticated: bool, operation: T) -> (outcome: Admission<T>)
+impl<L, O> Admitted<L, O> {
+    pub(crate) closed spec fn binding(self) -> (L, O, OperationClass) {
+        (self.lease, self.operation, self.class)
+    }
+
+    pub(crate) fn into_effect(self) -> (effect: (L, O, OperationClass))
+        ensures effect == self.binding(),
+    {
+        (self.lease, self.operation, self.class)
+    }
+}
+
+pub(crate) enum Admission<L, O> { Stale, Unauthorized, ReadOnly, Accepted(Admitted<L, O>) }
+
+pub(crate) fn admit<L, O>(
+    lease: L, live: bool, authenticated: bool, writable: bool, operation: O, class: OperationClass,
+) -> (outcome: Admission<L, O>)
     ensures
         (outcome is Stale) == !live,
         (outcome is Unauthorized) == (live && !authenticated),
-        (outcome is Accepted) == (live && authenticated),
-        outcome matches Admission::Accepted(actual) ==> actual == operation,
+        (outcome is ReadOnly) == (live && authenticated && class == OperationClass::Write && !writable),
+        (outcome is Accepted) == (live && authenticated && (class != OperationClass::Write || writable)),
+        outcome matches Admission::Accepted(actual) ==> actual.binding() == (lease, operation, class),
 {
     if !live { Admission::Stale }
     else if !authenticated { Admission::Unauthorized }
-    else { Admission::Accepted(operation) }
+    else if !class.permits(writable) { Admission::ReadOnly }
+    else { Admission::Accepted(Admitted { lease, operation, class }) }
 }
 
 }

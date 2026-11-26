@@ -363,6 +363,16 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             lambda text: replace_once(text, "if requires_binding { invocation }", "if requires_binding { runtime }"),
         ),
         (
+            "callback ticket downgrades a write to a read before execution",
+            LEASE_CALLBACK,
+            lambda text: replace_once(text, "(self.lease, self.operation, self.class)\n    }\n}", "(self.lease, self.operation, OperationClass::Read)\n    }\n}"),
+        ),
+        (
+            "callback admission issues a ticket for a read-only write",
+            LEASE_CALLBACK,
+            lambda text: replace_once(text, "else if !class.permits(writable)", "else if false"),
+        ),
+        (
             "read-only mount accepts a mutating callback",
             LEASE_CALLBACK,
             lambda text: replace_once(text, "Self::Write => writable", "Self::Write => true"),

@@ -1341,6 +1341,33 @@ async fn revoke_drains_a_worker_after_its_waiter_is_cancelled() {
     check_worker_drain(true).await;
 }
 
+async fn dispatch_v1_operation(
+    kernel: &Kernel,
+    state: &Arc<StorageMountLeaseState>,
+    token: &str,
+    operation: StorageFilesystemOperationV1,
+) -> StorageFilesystemOutcomeV1 {
+    let request = StorageFilesystemRequestV1 {
+        protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V1,
+        request_id: "worker-drain".into(),
+        lease_token: token.into(),
+        operation,
+    };
+    match dispatch_request(
+        kernel,
+        state,
+        CallbackRequest {
+            request,
+            response_version: STORAGE_FILESYSTEM_PROTOCOL_V1,
+        },
+    )
+    .await
+    {
+        CallbackResponse::V1(response) => response.outcome,
+        CallbackResponse::V2(_) => panic!("expected v1 response"),
+    }
+}
+
 async fn check_worker_drain(cancel_waiter: bool) {
     let temporary = tempfile::tempdir().unwrap();
     let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
@@ -1373,10 +1400,12 @@ async fn check_worker_drain(cancel_waiter: bool) {
     *state.mutation_test_gate.lock().unwrap() = Some(Arc::clone(&gate));
     let mutation_kernel = Arc::clone(&kernel);
     let mutation_state = Arc::clone(&state);
+    let token = lease.lease_token.clone();
     let mutation = tokio::spawn(async move {
-        execute_operation(
+        dispatch_v1_operation(
             &mutation_kernel,
             &mutation_state,
+            &token,
             StorageFilesystemOperationV1::Write {
                 path: "in-flight.bin".to_owned(),
                 offset: 0,
@@ -1418,7 +1447,13 @@ async fn check_worker_drain(cancel_waiter: bool) {
     assert!(state.dirty.load(Ordering::Acquire));
     assert!(!kernel.storage_mounts.contains_key(&lease.mount_id));
     assert!(!lease.callback_path.exists());
-    let fenced = execute_operation(&kernel, &state, create("after-revoke.txt")).await;
+    let fenced = dispatch_v1_operation(
+        &kernel,
+        &state,
+        &lease.lease_token,
+        create("after-revoke.txt"),
+    )
+    .await;
     assert!(matches!(
         fenced,
         StorageFilesystemOutcomeV1::Failure(StorageFilesystemFailureV1 { code, .. })

@@ -538,7 +538,7 @@ Native stdio MCP capsules requesting network domains or outbound TCP destination
 
 ## Evidence and trust
 
-The current verifier entry point imports production modules directly alongside an abstract model of grant and principal authority. Their contracts cover fuel arithmetic, per-principal operation tracking, static pattern matching and containment, token status transitions, the startup marker fold, guest owner selection, KV address encoding, and overlay lookup and update. The model's theorems state what every trace of the grant, tracker and fuel transitions preserves, conditional on the stated storage, settlement and lifecycle obligations: an acknowledged revocation keeps the grant revoked across recovery and an acknowledged consumption keeps it used, a revocation keeps the grant revoked until the next recovery whether or not its write completed, retirement keeps the principal closed until a resume, and committed fuel exceeds the budget only by the fuel charged beyond a promise. Its `apply_*` and `fuel_*` functions show that the production transitions compute the model's steps. The hosted backend regression exercises abrupt exit and reopening. Complete mediation of hosted effects and concurrent runtime refinement remain open.
+The current verifier entry point imports production modules directly alongside an abstract model of grant and principal authority. Their contracts cover fuel arithmetic, per-principal operation tracking, static pattern matching and containment, token status transitions, the startup marker fold, guest owner selection, KV address encoding, overlay lookup and update, filesystem gate paths, native transport and device identity decisions, and native mount callback admission. The model's theorems state what every trace of the grant, tracker and fuel transitions preserves, conditional on the stated storage, settlement and lifecycle obligations: an acknowledged revocation keeps the grant revoked across recovery and an acknowledged consumption keeps it used, a revocation keeps the grant revoked until the next recovery whether or not its write completed, retirement keeps the principal closed until a resume, and committed fuel exceeds the budget only by the fuel charged beyond a promise. Its `apply_*` and `fuel_*` functions show that the production transitions compute the model's steps. The hosted backend regression exercises abrupt exit and reopening. Complete mediation of hosted effects and concurrent runtime refinement remain open.
 
 The hosted security argument must state its assumptions about the OS, hardware, Wasmtime, cryptography, persistent storage, compiler and verifier. Release evidence must identify the source, build configuration, binary digest and proof result. Evidence about an installed instance must also identify the running binary and security-relevant configuration through a measurement mechanism whose trust assumptions are disclosed.
 
@@ -566,9 +566,11 @@ provider startup, cache lifetime, fleet ownership changes or callback teardown.
 Native mount callbacks decode a V1 operation directly or translate a V2 request
 to that operation. The checked callback gate consumes the decoded operation.
 A revoked lease or an observation after expiry yields a stale response. A live
-lease with a failed token comparison yields an unauthorized response. The
-accepted branch contains the original operation, including its paths and write
-data, and passes it to the backend dispatcher. These statements concern the
+lease with a failed token comparison yields an unauthorized response. A write on a read-only lease yields a read-only response. On success, the gate
+issues a single-use value containing the original lease reference, decoded
+operation (including paths and write data), and access class. Verus checks
+that consuming this value returns the same three inputs. The executor takes
+its lease and operation exclusively through that value. These statements concern the
 clock, expiry, revocation and authentication values sampled by the adapter.
 The proof still needs the correspondence to a coherent concurrent observation,
 the V2 decoder, token hashing, backend execution and durable completion.
@@ -581,3 +583,11 @@ is permitted on a read-only lease and takes the same serialization lock as
 mutations. Verus checks the access and serialization decisions for every
 class. Rust enforces exhaustiveness of the wire operation match. The actual
 OS lock, worker lifetime and stable-storage semantics remain obligations.
+
+
+For serialized writes and sync, the production blocking worker owns the
+serialization guard through filesystem execution and publication of the dirty
+bit. The worker-drain integration test cancels the async waiter while the worker
+is active and exercises revocation before and after release. This is execution
+evidence. Concurrent refinement still requires proving the correspondence
+between the lock, lifecycle transitions, worker effects and durable storage.

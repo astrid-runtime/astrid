@@ -40,7 +40,7 @@ use crate::Kernel;
 
 mod admin_projection;
 mod lease_authority;
-use lease_authority::callback::{Admission, OperationClass, admit};
+use lease_authority::callback::{Admission, Admitted, OperationClass, admit};
 use lease_authority::{LeaseAuthority, resolve_owner};
 #[cfg(target_os = "macos")]
 mod callback_resolver;
@@ -717,12 +717,24 @@ async fn dispatch_request(
     let request_id = request.request_id.clone();
     let live = state.is_live();
     let authenticated = live && token_matches(&state.token_hash, &request.lease_token);
-    let outcome = match admit(live, authenticated, request.operation) {
+    let class = operation_class(&request.operation);
+    let outcome = match admit(
+        state,
+        live,
+        authenticated,
+        state.access == StorageProviderAccessV1::ReadWrite,
+        request.operation,
+        class,
+    ) {
         Admission::Stale => failure("stale-lease", "storage mount lease is expired or revoked"),
         Admission::Unauthorized => failure("unauthorized", "storage mount lease token is invalid"),
+        Admission::ReadOnly => {
+            state.renew();
+            failure("read-only", "storage mount lease is read-only")
+        },
         Admission::Accepted(operation) => {
             state.renew();
-            execute_operation(kernel, state, operation).await
+            execute_operation(kernel, operation).await
         },
     };
     let response = StorageFilesystemResponseV1 {
@@ -769,15 +781,11 @@ fn response_v2(response: StorageFilesystemResponseV1) -> StorageFilesystemRespon
 
 async fn execute_operation(
     kernel: &Kernel,
-    state: &Arc<StorageMountLeaseState>,
-    operation: StorageFilesystemOperationV1,
+    admission: Admitted<&Arc<StorageMountLeaseState>, StorageFilesystemOperationV1>,
 ) -> StorageFilesystemOutcomeV1 {
-    let class = operation_class(&operation);
+    let (state, operation, class) = admission.into_effect();
     let is_mutation = matches!(class, OperationClass::Write);
     let is_sync = matches!(class, OperationClass::Sync);
-    if !class.permits(state.access == StorageProviderAccessV1::ReadWrite) {
-        return failure("read-only", "storage mount lease is read-only");
-    }
     if matches!(&operation, StorageFilesystemOperationV1::VolumeInfo) {
         return volume_info::read(kernel).await;
     }
