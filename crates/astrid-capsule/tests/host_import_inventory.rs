@@ -74,3 +74,64 @@ fn changing_resource_ownership_changes_the_inventory() {
         inventory_for("borrow<file>", "Read its contents.")
     );
 }
+
+#[test]
+fn guest_effect_contract_covers_the_resolved_interfaces_and_resource_drops() {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let contract = include_str!("../../../verification/hosted-security-contract.md");
+    let section = contract
+        .split_once("## Guest host implementation inventory")
+        .unwrap()
+        .1
+        .split_once("\n## ")
+        .unwrap()
+        .0;
+    let mut documented = BTreeMap::new();
+    for row in section
+        .lines()
+        .filter(|line| line.starts_with("| `astrid:"))
+    {
+        let mut cells = row.trim_matches('|').split('|').map(str::trim);
+        let name = cells.next().unwrap().trim_matches('`');
+        let functions: usize = cells.next().unwrap().parse().unwrap();
+        let drops: usize = cells.next().unwrap().parse().unwrap();
+        let adapter = cells.next().unwrap().trim_matches('`');
+        assert!(
+            crate_dir
+                .join("src/engine/wasm/host")
+                .join(adapter)
+                .is_file(),
+            "{name} adapter"
+        );
+        assert!(
+            !cells.next().unwrap().is_empty(),
+            "{name} effect obligation"
+        );
+        assert!(
+            documented
+                .insert(name.to_owned(), (functions, drops))
+                .is_none()
+        );
+    }
+
+    let mut resolve = Resolve::default();
+    let (package, _) = resolve.push_dir(crate_dir.join("wit-staging")).unwrap();
+    let world = resolve.packages[package].worlds["kernel"];
+    let mut actual = BTreeMap::new();
+    for item in resolve.worlds[world].imports.values() {
+        let WorldItem::Interface { id, .. } = item else {
+            panic!("classify the new world-level import in the hosted security contract");
+        };
+        let interface = &resolve.interfaces[*id];
+        let drops = interface
+            .types
+            .values()
+            .filter(|ty| matches!(resolve.types[**ty].kind, TypeDefKind::Resource))
+            .count();
+        actual.insert(
+            resolve.id_of(*id).unwrap(),
+            (interface.functions.len(), drops),
+        );
+    }
+    assert_eq!(documented, actual);
+}

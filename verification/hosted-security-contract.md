@@ -14,6 +14,31 @@ The production Wasmtime linker and the inventory test resolve the same checked-i
 
 Kernel management IPC, enrollment and redemption, MCP invocation, and native capsule execution also require coverage. Their authority may come from authenticated management policy, durable reservations or trusted runtime ownership. Each path needs a specification for its own authorization decision and a connection between that decision and the eventual effect.
 
+## Guest host implementation inventory
+
+The function and implicit destructor counts below come from the resolved kernel world. Each adapter path is relative to `crates/astrid-capsule/src/engine/wasm/host`. The table identifies where to start tracing each family. A trace must also account for callbacks, shared backends and errors that publish state before returning.
+
+| Interface | Functions | Drops | Adapter | Effect obligation |
+| --- | ---: | ---: | --- | --- |
+| `astrid:approval/host@1.0.0` | 1 | 0 | `approval.rs` | Bind the action, target, requester and responder through approval, allowance lookup and persistence. |
+| `astrid:elicit/host@1.0.0` | 2 | 0 | `elicit.rs` | Bind requested input or secret presence to the principal and responder. Account for release of the reply. |
+| `astrid:fs/host@1.0.0` | 23 | 1 | `fs/mod.rs` | Trace path resolution and handle methods through the selected mount or native filesystem, including writeback on drop. |
+| `astrid:guest/lifecycle@1.0.0` | 0 | 0 | `mod.rs` | This imported interface declares types only. Guest lifecycle invocation uses the configured linker. |
+| `astrid:http/host@1.0.0` | 8 | 1 | `http/mod.rs` | Bind the V1 request, redirects, credentials and response stream to their admitted destinations. |
+| `astrid:http/host@1.1.0` | 15 | 2 | `http/mod.rs` | Also account for request options, streamed uploads, trailers and ownership of the upload and response resources. |
+| `astrid:identity/host@1.0.0` | 5 | 0 | `identity.rs` | Bind resolve, link, unlink, user creation and link disclosure to their exact store arguments after capacity and policy waits. |
+| `astrid:io/error@1.0.0` | 1 | 1 | `io.rs` | Account for error description disclosure and release of the selected error resource. |
+| `astrid:io/poll@1.0.0` | 3 | 1 | `io.rs` | Preserve resource identity, cancellation and accounting through readiness observation and blocking. |
+| `astrid:io/streams@1.0.0` | 15 | 2 | `io.rs` | Bind reads, writes, flushes and splices to the actual resource table entries, including both ends of a splice. |
+| `astrid:ipc/host@1.0.0` | 7 | 1 | `ipc.rs` | Preserve producer, recipient, topic and subscription authority through publication, receive and destruction. |
+| `astrid:kv/host@1.0.0` | 7 | 0 | `kv.rs` | Bind each lookup, scan, write, prefix clear and compare-and-swap to the admitted principal and namespace. |
+| `astrid:net/host@1.0.0` | 47 | 4 | `net/mod.rs` | Account for socket creation, accept, peer identity, connected I/O, socket options and close on each transport. |
+| `astrid:process/host@1.0.0` | 27 | 1 | `process/compat.rs` | Trace legacy request translation, launch and child-handle operations into the shared process implementation. |
+| `astrid:process/host@1.1.0` | 27 | 1 | `process/mod.rs` | Bind executable, environment, roots, descriptors and process generation across launch, signals, wait and cleanup. |
+| `astrid:request-context/host@1.0.0` | 2 | 0 | `request_context.rs` | Bind returned caller and owner observations to the borrowed connection and its current registration. |
+| `astrid:sys/host@1.0.0` | 10 | 0 | `sys.rs` | Account for config and capability disclosure, log writes, readiness, sleep, clock and randomness. |
+| `astrid:uplink/host@1.0.0` | 2 | 0 | `uplink.rs` | Bind registration and queued inbound delivery to the capsule, selected uplink and platform identity. |
+
 ## Hosted management IPC inventory
 
 The request bus has two management subscribers. The kernel subscriber decodes
