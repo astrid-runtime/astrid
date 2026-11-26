@@ -50,6 +50,7 @@ use serde_json::json;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::auth::CallerContext;
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
 use crate::routes::WorkspaceContext;
 use crate::routes::principals::caller_from;
@@ -187,7 +188,7 @@ fn classify_set_active_reply(reply: &serde_json::Value) -> SetActiveOutcome {
 /// first trusted-source reply on the scoped route is taken.
 async fn registry_round_trip(
     state: &GatewayState,
-    principal_id: &PrincipalId,
+    caller: &CallerContext,
     _workspace: &WorkspaceContext,
     request_topic: &'static str,
     response_topic: &'static str,
@@ -200,6 +201,7 @@ async fn registry_round_trip(
         )));
     };
 
+    let principal_id = &caller.principal;
     let principal = principal_id.to_string();
     ensure_registry_request_subscribed(state, principal_id, request_topic).await?;
     let expected_source_ids = provider_source_ids(state, principal_id, request_topic).await?;
@@ -217,7 +219,7 @@ async fn registry_round_trip(
         response_topic,
         "gateway",
         "gateway::models",
-        Some(Some(principal.clone())),
+        Some(Some(principal)),
     );
 
     // Stamp the request with the caller's principal: it both routes the
@@ -228,15 +230,11 @@ async fn registry_round_trip(
     // client-originated request as the system session. Reply correlation is
     // unaffected: replies are matched by the principal-scoped routed
     // subscription, not by this source id.
-    let msg = IpcMessage::new(
+    let msg = caller.stamp_ipc(IpcMessage::new(
         Topic::from_raw(request_topic),
         IpcPayload::RawJson(payload),
         Uuid::new_v4(),
-    )
-    .with_principal(principal)
-    // Host-stamp the gateway transport origin (a remote API caller), so no
-    // gateway-published message inherits the `System` default.
-    .with_origin(astrid_events::ipc::MessageOrigin::RemoteGateway);
+    ));
     bus.publish(AstridEvent::Ipc {
         metadata: astrid_events::EventMetadata::new("gateway::models"),
         message: msg,
@@ -391,7 +389,7 @@ async fn list_models_inner(
     let caller = caller_from(&req)?;
     let reply = registry_round_trip(
         &state,
-        &caller.principal,
+        caller,
         workspace,
         GET_PROVIDERS_REQUEST,
         GET_PROVIDERS_RESPONSE,
@@ -438,7 +436,7 @@ async fn get_active_model_inner(
     let caller = caller_from(&req)?;
     let reply = registry_round_trip(
         &state,
-        &caller.principal,
+        caller,
         workspace,
         GET_ACTIVE_REQUEST,
         GET_ACTIVE_RESPONSE,
@@ -484,11 +482,7 @@ async fn set_active_model_inner(
     workspace: &WorkspaceContext,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<serde_json::Value>> {
-    // Clone only the principal id, not the whole `CallerContext`: the
-    // round-trip needs nothing else, and `read_json_body` below consumes
-    // `req` (which `caller_from` borrows), so the value we carry past it must
-    // be owned.
-    let principal = caller_from(&req)?.principal.clone();
+    let caller = caller_from(&req)?.clone();
     let body: SetActiveModelRequest = crate::routes::principals::read_json_body(req).await?;
 
     // Reject an empty / whitespace id BEFORE contacting the bus — no point
@@ -509,7 +503,7 @@ async fn set_active_model_inner(
 
     let reply = registry_round_trip(
         &state,
-        &principal,
+        &caller,
         workspace,
         SET_ACTIVE_REQUEST,
         SET_ACTIVE_RESPONSE,
@@ -663,6 +657,14 @@ mod tests {
         let bus = Arc::new(EventBus::new());
         let state = model_test_state(Arc::clone(&bus));
         let principal = PrincipalId::new("alice").expect("valid principal");
+        let bearer = crate::auth::mint_bearer_scoped(
+            &state.signing.signer,
+            &principal,
+            "0123456789abcdef",
+            60,
+        );
+        let caller =
+            crate::auth::verify_bearer(&state, &bearer).expect("authenticated test bearer");
 
         let bus_bg = Arc::clone(&bus);
         tokio::spawn(async move {
@@ -683,7 +685,7 @@ mod tests {
 
         let err = registry_round_trip(
             &state,
-            &principal,
+            &caller,
             &WorkspaceContext::default(),
             GET_ACTIVE_REQUEST,
             GET_ACTIVE_RESPONSE,
@@ -700,6 +702,14 @@ mod tests {
         let bus = Arc::new(EventBus::new());
         let mut state = model_test_state(Arc::clone(&bus));
         let principal = PrincipalId::new("alice").expect("valid principal");
+        let bearer = crate::auth::mint_bearer_scoped(
+            &state.signing.signer,
+            &principal,
+            "0123456789abcdef",
+            60,
+        );
+        let caller =
+            crate::auth::verify_bearer(&state, &bearer).expect("authenticated test bearer");
         let warmed = Arc::new(AtomicBool::new(false));
 
         let warmed_probe = Arc::clone(&warmed);
@@ -717,6 +727,7 @@ mod tests {
         let mut req_rx = bus.subscribe_topic(GET_ACTIVE_REQUEST.to_string());
         let bus_bg = Arc::clone(&bus);
         let warmed_bg = Arc::clone(&warmed);
+        let owner = caller.request_owner;
         let responder = tokio::spawn(async move {
             let event = req_rx.recv().await.expect("request arrives");
             assert!(
@@ -725,6 +736,12 @@ mod tests {
             );
             if let AstridEvent::Ipc { message, .. } = &*event {
                 assert_eq!(message.principal.as_deref(), Some("alice"));
+                assert_eq!(message.device_key_id.as_deref(), Some("0123456789abcdef"));
+                assert_eq!(message.request_owner, Some(owner));
+                assert_eq!(
+                    message.origin,
+                    astrid_events::ipc::MessageOrigin::RemoteGateway
+                );
             } else {
                 panic!("expected an IPC request event");
             }
@@ -744,7 +761,7 @@ mod tests {
 
         let reply = registry_round_trip(
             &state,
-            &principal,
+            &caller,
             &WorkspaceContext::default(),
             GET_ACTIVE_REQUEST,
             GET_ACTIVE_RESPONSE,
