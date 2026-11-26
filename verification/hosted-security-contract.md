@@ -14,6 +14,49 @@ The production Wasmtime linker and the inventory test resolve the same checked-i
 
 Kernel management IPC, enrollment and redemption, MCP invocation, and native capsule execution also require coverage. Their authority may come from authenticated management policy, durable reservations or trusted runtime ownership. Each path needs a specification for its own authorization decision and a connection between that decision and the eventual effect.
 
+## Hosted management IPC inventory
+
+The request bus has two management subscribers. The kernel subscriber decodes
+20 variants of `KernelRequest`, and the admin subscriber decodes 48 variants
+of `AdminRequestKind`. The table lists the methods to account for at the
+effect boundary. A read also has an effect when data leaves its owner's
+domain. The authority for a response must cover its recipient.
+
+| Effect family | Request variants | Target or state the proof must bind |
+| --- | --- | --- |
+| Package publication and recovery | `BeginCapsuleInstallBatch`, `InstallCapsule`, `FinishCapsuleInstallBatch`, `GetInstalledCapsuleIdentity`, `GetCapsuleInstallResumeReceipt`, `PutCapsuleInstallResumeReceipt` | Owner UID, archive digest, installed generation, batch member and durable receipt |
+| Runtime lifecycle | `ReloadCapsules`, `ReloadCapsule`, `UnloadCapsule`, `RemoveCapsule` | Captured runtime generation and owner, including optional state purge |
+| Workspace changes | `PromoteWorkspace`, `RollbackWorkspace` | Workspace owner, source generation and resulting directory state |
+| Runtime visibility | `ListCapsules`, `GetCommands`, `GetCapsuleMetadata`, `GetCapsuleMetadataForPrincipal`, `GetAgentReadiness` | Caller-visible runtime set and recipient of the response |
+| Daemon operations | `Shutdown`, `GetStatus`, `ApproveCapability` | Daemon shutdown, status recipient or exact pending approval |
+| Principal management | `AgentCreate`, `AgentDelete`, `AgentEnable`, `AgentDisable`, `AgentList`, `AgentModify`, `UserPrincipalList`, `UserPrincipalClaim` | Principal alias and UID, source and target of inheritance, ownership and retirement |
+| Quota and usage | `QuotaUserList`, `QuotaAssignUser`, `QuotaSet`, `QuotaGet`, `UsageGet` | Resource ledger owner and assigned user |
+| Environment and secrets | `EnvSet`, `EnvSetIfAbsent`, `EnvList`, `EnvDelete` | Owner, capsule, key, kind and visibility of returned data |
+| Distribution policy | `DistroLockGet`, `DistroLockSet`, `DistroSelfGrant` | Lock owner, desired distribution and policy revision |
+| Groups and capability profiles | `GroupCreate`, `GroupDelete`, `GroupModify`, `GroupList`, `CapsGrant`, `CapsRevoke` | Group definition, affected principal and capability pattern |
+| Capability tokens | `CapsTokenMint`, `CapsTokenRevoke`, `CapsTokenList` | Token owner, audience, scope and durable grant state |
+| Enrollment | `InviteIssue`, `InviteRedeem`, `InviteList`, `InviteRevoke` | Invitation owner, redemption input and durable consumption |
+| Device pairing | `PairDeviceIssue`, `PairDeviceRedeem`, `PairDeviceList`, `PairDeviceRevoke` | Issuing principal and registration, requested child scope, redeemed credential or revoked registration |
+| Audit | `AuditStats`, `AuditPrune`, `AuditHealth`, `AuditHeads`, `AuditExport`, `AuditAnchorMark`, `AuditAnchorStatus` | Selected chains, exported entries, prune boundary and anchor |
+| Storage mounts | `StorageMountIssue`, `StorageMountStatus`, `StorageMountSync`, `StorageMountRevoke` | Mount owner, mount identity, sync target and revocation state |
+
+Two wire paths branch before enum decoding. On the request subscriber,
+`projection_names::try_handle` recognizes `ProjectionNameDiagnosticV1`
+and reads the authenticated caller's catalog. On the admin subscriber,
+`agent_derive::try_dispatch` recognizes `astrid.v1.admin.agent.derive`
+and spawns work that can create a principal. Both require independent
+provenance and reply-delivery arguments. Within the admin enum,
+`handle_redeem_admin_request` dispatches invitation and pairing redemption
+using token possession. The ordinary capability preamble cannot establish
+authorization for those two paths.
+
+The enumerations are in `crates/astrid-core/src/kernel_api/mod.rs`.
+Dispatch and policy selection live in `crates/astrid-kernel/src/kernel_router`,
+including `request_policy.rs`, `admin/request_authorization.rs` and
+`admin/handlers`. Each handler may have several effects, including audit
+writes, profile changes, publication and replies. These rows enumerate entry
+points. The contracts below identify the effects already covered.
+
 ## Guest key-value storage
 
 All seven operations in `astrid:kv/host@1.0.0` enter through `impl kv::Host for HostState` in `crates/astrid-capsule/src/engine/wasm/host/kv.rs`. Get, set, delete and compare-and-swap take a key. List, paginated list and clear take a prefix. Both list operations call the same backend prefix listing. The cursor and limit select a page after that listing returns.
