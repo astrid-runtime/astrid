@@ -35,7 +35,7 @@ impl Counts {
     }
 }
 
-fn little_endian(value: u64) -> (bytes: [u8;8])
+pub(super) fn little_endian(value: u64) -> (bytes: [u8;8])
     ensures bytes@ == vstd::bytes::spec_u64_to_le_bytes(value),
 {
     proof { vstd::bytes::spec_u64_to_le_bytes_to_open(value); }

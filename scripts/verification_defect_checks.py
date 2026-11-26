@@ -118,6 +118,7 @@ INPUTS = [
     KV_ENCODING,
     GUEST_AUTHORITY,
     Path("crates/astrid-storage/src/engine/durable/frontier.rs"),
+    Path("crates/astrid-storage/src/engine/durable/wal/measurement.rs"),
     Path("crates/astrid-storage/src/engine/durable/wal/commit_wire.rs"),
     Path("crates/astrid-storage/src/engine/durable/wal/transaction.rs"),
     Path("crates/astrid-storage/src/engine/durable/wal/record_wire.rs"),
@@ -464,6 +465,36 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "workspace writes select the host administration projection",
             Path("crates/astrid-kernel/src/storage_mount/lease_authority/destination.rs"),
             lambda source: replace_once(source, "(Self::OwnerRoot(Owner::System), OperationClass::Write) =>", "(_, OperationClass::Write) =>"),
+        ),
+        (
+            "WAL measurement counts the wrong stored length",
+            Path("crates/astrid-storage/src/engine/durable/wal/measurement.rs"),
+            lambda source: replace_once(source, "(HEADER_LEN as u64).checked_add(body.len() as u64)", "(HEADER_LEN as u64).checked_add(0)"),
+        ),
+        (
+            "WAL measurement drops the Begin record",
+            Path("crates/astrid-storage/src/engine/durable/wal/measurement.rs"),
+            lambda source: replace_once(source, "sequence, logical: 1, objects: 0", "sequence, logical: 0, objects: 0"),
+        ),
+        (
+            "WAL measurement increments the wrong object counter",
+            Path("crates/astrid-storage/src/engine/durable/wal/measurement.rs"),
+            lambda source: replace_once(source, "next.objects = before.objects.checked_add", "next.roots = before.objects.checked_add"),
+        ),
+        (
+            "WAL measurement advances ordinal twice",
+            Path("crates/astrid-storage/src/engine/durable/wal/measurement.rs"),
+            lambda source: replace_once(source, "next.logical = before.logical.checked_add(1)", "next.logical = before.logical.checked_add(2)"),
+        ),
+        (
+            "WAL measurement digest drops the object flags",
+            Path("crates/astrid-storage/src/engine/durable/wal/measurement.rs"),
+            lambda source: replace_once(source, "header[2] = flags;", "header[2] = 0;"),
+        ),
+        (
+            "WAL measurement digest swaps ordinal and sequence",
+            Path("crates/astrid-storage/src/engine/durable/wal/measurement.rs"),
+            lambda source: replace_once(source, "little_endian(ordinal)", "little_endian(sequence)"),
         ),
         (
             "guest uplink admits registrations at capacity",
@@ -1694,7 +1725,16 @@ def consumer_defects():
             "(live@ == saved@ && same_expected(expected,prior) && same(replacement,next)) ==> outcome.is_ok()"),
         Path("verification/hosted_kv_model.rs"),
     )
+    yield (
+        "WAL measurement loses the encoded marker witness",
+        Path("verification/hosted_wal_model.rs"),
+        lambda source: replace_once(source, "ensures accepted matches Some(m) && m.marker() == marker,", "ensures true,"),
+        Path("verification/hosted_wal_model.rs"),
+    )
     for name, path, clause, weaker in [
+        ("WAL measurement loses the exact stored byte total", "measurement.rs", "c.bytes as int == before.bytes as int + HEADER_LEN as int + body.len(),", "true,"),
+        ("WAL measurement loses the digest transcript", "measurement.rs", "h@ == digest_header(kind,flags,sequence,ordinal,body.len() as u64)", "true"),
+        ("WAL measurement loses overflow completeness", "measurement.rs", "result.is_ok() == (before.logical", "result.is_ok() ==> (before.logical"),
         ("WAL Commit encoding loses its wire contract", "commit_wire.rs", "ensures body@ == self.wire()", "ensures true"),
         ("checked WAL Commit loses the observed digest", "commit_wire.rs", "&& finish_digest.ensures((),self.digest)", "&& true"),
         ("committed prefix loses its ordered descriptors", "transaction.rs", "Ok(Step::Committed(b)) && b == p", "Ok(Step::Committed(b))"),

@@ -6,13 +6,14 @@ use super::super::{PersistentObjectIdentity, PrincipalCodec};
 use super::codec::{
     PHYSICAL_HEADER_LEN, RecordHeader, WAL_MAGIC, checksum_valid, decode_begin_body,
     decode_object_body, decode_object_storage_body, decode_physical_header, decode_record,
-    decode_root_body, digest_record, digest_record_with_flags, logical_record_length, new_digest,
-    validate_logical_body, validate_record_version, wal_physical_limit,
+    decode_root_body, digest_record, digest_record_with_flags, new_digest, validate_logical_body,
+    validate_record_version, wal_physical_limit,
 };
+use super::measurement::{self, Entry};
 use super::types::{
-    WalBeginDescriptor, WalCount, WalError, WalEvent, WalLength, WalLimits, WalObjectDescriptor,
-    WalOffset, WalOrdinal, WalRecordKind, WalResumeState, WalRootDescriptor, WalScanTail,
-    WalSequence, WalTailKind, WalTransactionDescriptor,
+    WalBeginDescriptor, WalError, WalEvent, WalLength, WalLimits, WalObjectDescriptor, WalOffset,
+    WalOrdinal, WalRecordKind, WalResumeState, WalRootDescriptor, WalScanTail, WalSequence,
+    WalTailKind, WalTransactionDescriptor,
 };
 
 /// A scanner-finished stream paired with the exact validated append state.
@@ -66,15 +67,10 @@ struct ActiveScan {
     begin_offset: WalOffset,
     sequence: WalSequence,
     scheme: super::super::IdentityScheme,
-    next_ordinal: WalOrdinal,
-    object_count: WalCount,
-    root_count: WalCount,
-    logical_count: WalCount,
-    logical_bytes: WalLength,
+    counts: super::commit_wire::Counts,
     digest: blake3::Hasher,
     previous_object: Option<crate::storage_model::ObjectId>,
     previous_principal: Option<Vec<u8>>,
-    saw_root: bool,
 }
 
 impl<R, I, C, P> WalScanner<R, I, C, P>
@@ -248,7 +244,7 @@ where
             record.sequence.get(),
             record.ordinal.get(),
             active.sequence.get(),
-            active.next_ordinal.get(),
+            active.counts.logical,
         )
         .map_err(|error| match error {
             super::record_wire::PositionError::Sequence => WalError::SequenceMismatch {
@@ -256,7 +252,7 @@ where
                 found: record.sequence,
             },
             super::record_wire::PositionError::Ordinal => WalError::OrdinalMismatch {
-                expected: active.next_ordinal,
+                expected: WalOrdinal::new(active.counts.logical),
                 found: record.ordinal,
             },
         })?;
@@ -303,7 +299,10 @@ where
         if self.identity.scheme() != scheme {
             return Err(WalError::IdentitySchemeMismatch);
         }
-        let logical_bytes = logical_record_length(body)?;
+        let counts =
+            measurement::begin(record.sequence.get(), body).ok_or(WalError::CountOverflow {
+                field: "logical bytes",
+            })?;
         let mut digest = new_digest();
         digest_record(
             &mut digest,
@@ -311,20 +310,15 @@ where
             record.sequence,
             record.ordinal,
             body,
-        )?;
+        );
         self.active = Some(ActiveScan {
             begin_offset: offset,
             sequence: record.sequence,
             scheme,
-            next_ordinal: WalOrdinal::new(1),
-            object_count: WalCount::new(0),
-            root_count: WalCount::new(0),
-            logical_count: WalCount::new(1),
-            logical_bytes,
+            counts,
             digest,
             previous_object: None,
             previous_principal: None,
-            saw_root: false,
         });
         Ok(Some(WalEvent::Begin(WalBeginDescriptor {
             offset,
@@ -341,19 +335,12 @@ where
         flags: u8,
         body: &[u8],
     ) -> Result<Option<WalEvent>, WalError> {
-        let (scheme, previous, count, logical, saw_root) = {
-            let active = self.active.as_ref().ok_or(WalError::InvalidTransaction(
-                "WAL object has no active transaction",
-            ))?;
-            (
-                active.scheme,
-                active.previous_object,
-                active.object_count,
-                active.logical_bytes,
-                active.saw_root,
-            )
-        };
-        if saw_root {
+        let active = self.active.as_mut().ok_or(WalError::InvalidTransaction(
+            "WAL object has no active transaction",
+        ))?;
+        let scheme = active.scheme;
+        let previous = active.previous_object;
+        if active.counts.roots != 0 {
             return Err(WalError::OrderingViolation);
         }
         let canonical = decode_object_storage_body(body, flags, self.limits, offset)?;
@@ -361,25 +348,12 @@ where
         if previous.is_some_and(|previous| previous >= id) {
             return Err(WalError::OrderingViolation);
         }
-        let next_count = count
-            .checked_inc()
-            .ok_or(WalError::CountOverflow { field: "objects" })?;
-        let logical_record = logical_record_length(body)?;
-        let next_logical = logical
-            .checked_add(logical_record)
-            .ok_or(WalError::CountOverflow {
-                field: "logical bytes",
-            })?;
-        let active = self.active.as_mut().ok_or(WalError::InvalidTransaction(
-            "WAL object transaction disappeared",
-        ))?;
-        let ordinal = active.next_ordinal;
-        let next_ordinal = ordinal
-            .checked_next()
-            .ok_or(WalError::CountOverflow { field: "ordinals" })?;
-        active.object_count = next_count;
-        active.logical_bytes = next_logical;
-        active.next_ordinal = next_ordinal;
+        let counts = measurement::append(active.counts, Entry::Object, body).map_err(|error| {
+            WalError::CountOverflow {
+                field: error.field("ordinals"),
+            }
+        })?;
+        let ordinal = WalOrdinal::new(active.counts.logical);
         active.previous_object = Some(id);
         digest_record_with_flags(
             &mut active.digest,
@@ -388,14 +362,8 @@ where
             active.sequence,
             ordinal,
             body,
-        )?;
-        active.logical_count =
-            active
-                .logical_count
-                .checked_inc()
-                .ok_or(WalError::CountOverflow {
-                    field: "logical records",
-                })?;
+        );
+        active.counts = counts;
         Ok(Some(WalEvent::Object(WalObjectDescriptor {
             offset,
             length: physical_length,
@@ -410,59 +378,30 @@ where
         physical_length: WalLength,
         body: &[u8],
     ) -> Result<Option<WalEvent>, WalError> {
-        let (scheme, previous, count, logical) = {
-            let active = self.active.as_ref().ok_or(WalError::InvalidTransaction(
-                "WAL root has no active transaction",
-            ))?;
-            (
-                active.scheme,
-                active.previous_principal.clone(),
-                active.root_count,
-                active.logical_bytes,
-            )
-        };
+        let active = self.active.as_mut().ok_or(WalError::InvalidTransaction(
+            "WAL root has no active transaction",
+        ))?;
+        let scheme = active.scheme;
+        let previous = active.previous_principal.as_deref();
         let (transition, _body_length) = decode_root_body(body, scheme, &self.codec, offset)?;
-        if previous
-            .as_deref()
-            .is_some_and(|previous| previous >= transition.principal())
-        {
+        if previous.is_some_and(|previous| previous >= transition.principal()) {
             return Err(WalError::OrderingViolation);
         }
-        let next_count = count
-            .checked_inc()
-            .ok_or(WalError::CountOverflow { field: "roots" })?;
-        let logical_record = logical_record_length(body)?;
-        let next_logical = logical
-            .checked_add(logical_record)
-            .ok_or(WalError::CountOverflow {
-                field: "logical bytes",
-            })?;
-        let active = self.active.as_mut().ok_or(WalError::InvalidTransaction(
-            "WAL root transaction disappeared",
-        ))?;
-        let ordinal = active.next_ordinal;
-        let next_ordinal = ordinal
-            .checked_next()
-            .ok_or(WalError::CountOverflow { field: "ordinals" })?;
-        active.root_count = next_count;
-        active.logical_bytes = next_logical;
-        active.next_ordinal = next_ordinal;
+        let counts = measurement::append(active.counts, Entry::Root, body).map_err(|error| {
+            WalError::CountOverflow {
+                field: error.field("ordinals"),
+            }
+        })?;
+        let ordinal = WalOrdinal::new(active.counts.logical);
         active.previous_principal = Some(transition.principal().to_vec());
-        active.saw_root = true;
         digest_record(
             &mut active.digest,
             WalRecordKind::Root,
             active.sequence,
             ordinal,
             body,
-        )?;
-        active.logical_count =
-            active
-                .logical_count
-                .checked_inc()
-                .ok_or(WalError::CountOverflow {
-                    field: "logical records",
-                })?;
+        );
+        active.counts = counts;
         Ok(Some(WalEvent::Root(WalRootDescriptor {
             offset,
             length: physical_length,
@@ -479,7 +418,7 @@ where
         let active = self.active.as_ref().ok_or(WalError::InvalidTransaction(
             "WAL Commit has no active transaction",
         ))?;
-        if !active.saw_root {
+        if active.counts.roots == 0 {
             return Err(WalError::ZeroRoots);
         }
         let marker = super::commit_wire::decode(body).ok_or(WalError::Corrupt {
@@ -490,15 +429,8 @@ where
             offset,
             detail: "WAL Commit sequence is zero",
         })?;
-        let observed = super::commit_wire::Counts {
-            sequence: active.sequence.get(),
-            logical: active.logical_count.get(),
-            objects: active.object_count.get(),
-            roots: active.root_count.get(),
-            bytes: active.logical_bytes.get(),
-        };
         let checked = marker
-            .confirm(&observed, || {
+            .confirm(&active.counts, || {
                 *super::codec::finish_digest(&active.digest).as_bytes()
             })
             .map_err(|mismatch| match mismatch {

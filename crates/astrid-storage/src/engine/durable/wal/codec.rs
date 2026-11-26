@@ -577,8 +577,8 @@ pub(super) fn digest_record(
     sequence: WalSequence,
     ordinal: WalOrdinal,
     body: &[u8],
-) -> Result<(), WalError> {
-    digest_record_with_flags(hasher, kind, 0, sequence, ordinal, body)
+) {
+    digest_record_with_flags(hasher, kind, 0, sequence, ordinal, body);
 }
 
 /// Feed a logical record with feature flags into a transaction digest.
@@ -593,22 +593,22 @@ pub(super) fn digest_record_with_flags(
     sequence: WalSequence,
     ordinal: WalOrdinal,
     body: &[u8],
-) -> Result<(), WalError> {
-    let body_len = u64::try_from(body.len())
-        .map_err(|_| WalError::Encoding("WAL digest body length overflow"))?;
-    if flags == 0 {
-        hasher.update(&[kind.tag()]);
-    } else {
-        hasher.update(&[u8::MAX, kind.tag(), flags]);
-    }
-    hasher.update(&sequence.get().to_le_bytes());
-    hasher.update(&ordinal.get().to_le_bytes());
-    hasher.update(&body_len.to_le_bytes());
-    hasher.update(body);
-    Ok(())
+) {
+    super::measurement::digest_record(
+        kind,
+        flags,
+        sequence.get(),
+        ordinal.get(),
+        body,
+        |header, payload| {
+            hasher.update(header);
+            hasher.update(payload);
+        },
+    );
 }
 
 /// Return the canonical logical record length used by Commit accounting.
+#[cfg(test)]
 pub(super) fn logical_record_length(body: &[u8]) -> Result<WalLength, WalError> {
     let body_length = WalLength::new(
         u64::try_from(body.len()).map_err(|_| WalError::Encoding("WAL logical length overflow"))?,

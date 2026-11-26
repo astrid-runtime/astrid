@@ -65,6 +65,7 @@ impl WalOrdinal {
     }
 
     /// Advance to the next ordinal without wrapping.
+    #[cfg(test)]
     pub(super) const fn checked_next(self) -> Option<Self> {
         match self.0.checked_add(1) {
             Some(next) => Some(Self(next)),
@@ -140,6 +141,7 @@ impl WalLength {
     }
 
     /// Add two lengths without wrapping.
+    #[cfg(test)]
     pub(super) const fn checked_add(self, other: Self) -> Option<Self> {
         match self.0.checked_add(other.0) {
             Some(value) => Some(Self(value)),
@@ -164,6 +166,7 @@ impl WalCount {
     }
 
     /// Add one record without wrapping.
+    #[cfg(test)]
     pub(super) const fn checked_inc(self) -> Option<Self> {
         match self.0.checked_add(1) {
             Some(value) => Some(Self(value)),

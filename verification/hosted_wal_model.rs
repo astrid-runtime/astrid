@@ -47,10 +47,13 @@ fn check_body(body: &[u8], observed: Counts, digest: [u8;32]) -> (accepted: Opti
     }
 }
 
-fn writer_marker_is_readable(marker: Marker) requires marker.counts.sequence != 0 {
+fn writer_marker_is_readable(marker: Marker) -> (accepted: Option<CheckedMarker>)
+    requires marker.counts.sequence != 0,
+    ensures accepted matches Some(m) && m.marker() == marker,
+{
     let bytes = marker.encode();
     let accepted = check_body(&bytes,marker.counts,marker.digest);
-    assert(accepted matches Some(m) && m.marker() == marker);
+    accepted
 }
 
 /// The concrete accumulator retains the order and identity of arbitrary
@@ -124,6 +127,129 @@ fn finish_prefix<'a,O,R>(origin: Origin, objects: &'a [O], roots: &'a [R],
         Ok(Step::Committed(b)) => Some(b),
         _ => None,
     }
+}
+
+}
+
+verus! {
+
+/// Independent mathematical sum over a prefix of stored records. Object bytes
+/// here are the compressed representation when compression was selected.
+spec fn totals(records: Seq<(crate::wal_measurement::Entry,u8,&[u8])>) -> (nat,nat,nat)
+    decreases records.len(),
+{
+    if records.len() == 0 { (0,0,0) } else {
+        let (objects,roots,bytes) = totals(records.drop_last());
+        let (kind,_,body) = records.last();
+        (objects + (if kind is Object {1nat} else {0nat}),
+         roots + (if kind is Root {1nat} else {0nat}),
+         bytes + crate::wal_record_wire::HEADER_LEN as nat + body.len() as nat)
+    }
+}
+
+spec fn fits(begin: &[u8], prefix: Seq<(crate::wal_measurement::Entry,u8,&[u8])>) -> bool {
+    let (objects,roots,bytes) = totals(prefix);
+    &&& 1 + prefix.len() <= u64::MAX
+    &&& objects <= u64::MAX && roots <= u64::MAX
+    &&& crate::wal_record_wire::HEADER_LEN as int + begin.len() + bytes <= u64::MAX
+}
+
+spec fn transcript(begin: &[u8], sequence:u64, records: Seq<(crate::wal_measurement::Entry,u8,&[u8])>) -> Seq<u8>
+    decreases records.len(),
+{
+    use crate::wal_record_wire::WalRecordKind;
+    if records.len() == 0 {
+        crate::wal_measurement::digest_header(WalRecordKind::Begin,0,sequence,0,begin.len() as u64) + begin@
+    } else {
+        let (entry,flags,body) = records.last();
+        let (kind,flags) = match entry {
+            crate::wal_measurement::Entry::Object => (WalRecordKind::Object,flags),
+            crate::wal_measurement::Entry::Root => (WalRecordKind::Root,0u8),
+        };
+        transcript(begin,sequence,records.drop_last()) +
+            crate::wal_measurement::digest_header(kind,flags,sequence,records.len() as u64,body.len() as u64) + body@
+    }
+}
+
+fn extend_digest(prefix:Vec<u8>, kind:crate::wal_record_wire::WalRecordKind, flags:u8,
+    sequence:u64, ordinal:u64, body:&[u8]) -> (out:Vec<u8>)
+    ensures out@ == prefix@ + crate::wal_measurement::digest_header(kind,flags,sequence,ordinal,body.len() as u64) + body@,
+{
+    let ghost prior = prefix@;
+    let update = |header:&[u8],payload:&[u8]| -> (out:Vec<u8>)
+        ensures out@ == prior + header@ + payload@,
+    {
+        let mut next = prefix;
+        next.extend_from_slice(header);
+        next.extend_from_slice(payload);
+        assert(next@ =~= prior + header@ + payload@);
+        next
+    };
+    crate::wal_measurement::digest_record(kind,flags,sequence,ordinal,body,update)
+}
+
+/// Measure arbitrary prefixes with the production writer/scanner transitions,
+/// then serialize and confirm the marker using this exact observation.
+fn measured_marker<F: FnOnce(&[u8]) -> [u8;32]>(sequence: u64, begin: &[u8],
+    records: &[(crate::wal_measurement::Entry,u8,&[u8])], finish:F)
+    -> (result: Option<CheckedMarker>)
+    requires sequence != 0, forall|data:&[u8]| #[trigger] finish.requires((data,)),
+    ensures result.is_some() == (forall|j:int| 0 <= j <= records.len() ==>
+            #[trigger] fits(begin,records@.take(j))),
+        result matches Some(marker) ==> {
+        let (objects,roots,bytes) = totals(records@);
+        let c = marker.marker().counts;
+        &&& c.sequence == sequence && c.logical as int == 1 + records.len()
+        &&& c.objects == objects && c.roots == roots
+        &&& c.bytes as int == crate::wal_record_wire::HEADER_LEN as int + begin.len() + bytes
+        &&& exists|data:&[u8]| data@ == transcript(begin,sequence,records@) && #[trigger] finish.ensures((data,),marker.marker().digest)
+    },
+{
+    let mut counts = match crate::wal_measurement::begin(sequence,begin) {
+        Some(c) => c,
+        None => { assert(!fits(begin,records@.take(0))); return None; },
+    };
+    assert(fits(begin,records@.take(0)));
+    let mut data = extend_digest(Vec::new(),crate::wal_record_wire::WalRecordKind::Begin,0,sequence,0,begin);
+    assert(data@ =~= transcript(begin,sequence,records@.take(0)));
+    let mut i = 0;
+    while i < records.len()
+        invariant data@ == transcript(begin,sequence,records@.take(i as int)),
+            forall|data:&[u8]| #[trigger] finish.requires((data,)), i <= records.len(), counts.sequence == sequence,
+            counts.logical as int == 1 + i,
+            forall|j:int| 0 <= j <= i ==> #[trigger] fits(begin,records@.take(j)),
+            ({ let (o,r,b) = totals(records@.take(i as int));
+               counts.objects == o && counts.roots == r &&
+               counts.bytes as int == crate::wal_record_wire::HEADER_LEN as int + begin.len() + b }),
+        decreases records.len() - i,
+    {
+        let (kind,flags,body) = records[i];
+        proof {
+            let next = records@.take(i as int + 1);
+            assert(next.drop_last() =~= records@.take(i as int));
+            assert(next.last() == (kind,flags,body));
+        }
+        let ordinal = counts.logical;
+        counts = match crate::wal_measurement::append(counts,kind,body) {
+            Ok(next) => next,
+            Err(_) => { assert(!fits(begin,records@.take(i as int + 1))); return None; },
+        };
+        assert(fits(begin,records@.take(i as int + 1)));
+        let (tag,flags) = match kind {
+            crate::wal_measurement::Entry::Object => (crate::wal_record_wire::WalRecordKind::Object,flags),
+            crate::wal_measurement::Entry::Root => (crate::wal_record_wire::WalRecordKind::Root,0u8),
+        };
+        data = extend_digest(data,tag,flags,sequence,ordinal,body);
+        i += 1;
+    }
+    assert(records@.take(i as int) =~= records@);
+    let bytes = data.as_slice();
+    let digest = finish(bytes);
+    assert(finish.ensures((bytes,),digest));
+    let marker = writer_marker_is_readable(Marker { counts,digest });
+    assert(bytes@ == transcript(begin,sequence,records@));
+    assert(finish.ensures((bytes,),marker.unwrap().marker().digest));
+    marker
 }
 
 }

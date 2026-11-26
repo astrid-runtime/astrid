@@ -116,3 +116,64 @@ fn replay_exposes_exactly_the_completed_transactions_at_every_byte_cut() {
         );
     }
 }
+
+#[test]
+fn commit_errors_identify_the_field_that_disagreed_with_the_stream() {
+    let canonical = raw_transaction(1, Some(object_id(1)), b"alice", true);
+    let changed = |position| {
+        let mut bytes = canonical.clone();
+        mutate_record(&mut bytes, 3, |payload| {
+            payload[RECORD_HEADER_LEN + position] ^= 2u8;
+        });
+        scan_events(bytes).unwrap_err()
+    };
+    assert!(
+        matches!(changed(0), WalError::CommitSequenceMismatch { expected, found }
+        if expected == sequence(1) && found == sequence(3))
+    );
+    for (position, label) in [
+        (8, "logical records"),
+        (16, "objects"),
+        (24, "roots"),
+        (32, "logical bytes"),
+    ] {
+        assert!(
+            matches!(changed(position), WalError::CommitCountMismatch {field} if field == label)
+        );
+    }
+    assert!(matches!(changed(40), WalError::DigestMismatch));
+}
+
+#[test]
+fn digest_matches_the_astwal2_transcript_across_record_boundaries() {
+    let mut expected = super::super::codec::new_digest();
+    let mut actual = super::super::codec::new_digest();
+    for (ordinal, (kind, tag, flags, payload)) in [
+        (WalRecordKind::Begin, 1, 0, b"begin".as_slice()),
+        (WalRecordKind::Object, 2, 1, b"compressed".as_slice()),
+        (WalRecordKind::Root, 3, 0, b"root".as_slice()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ordinal = u64::try_from(ordinal).unwrap();
+        if flags != 0 {
+            expected.update(&[255, tag, flags]);
+        } else {
+            expected.update(&[tag]);
+        }
+        expected.update(&513u64.to_le_bytes());
+        expected.update(&ordinal.to_le_bytes());
+        expected.update(&u64::try_from(payload.len()).unwrap().to_le_bytes());
+        expected.update(payload);
+        super::super::codec::digest_record_with_flags(
+            &mut actual,
+            kind,
+            flags,
+            sequence(513),
+            WalOrdinal::new(ordinal),
+            payload,
+        );
+        assert_eq!(actual.finalize(), expected.finalize());
+    }
+}

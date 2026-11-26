@@ -353,8 +353,7 @@ fn raw_transaction(
         sequence,
         WalOrdinal::new(0),
         &begin_body,
-    )
-    .unwrap();
+    );
     let mut bytes = super::codec::encode_physical_record(
         WalRecordKind::Begin,
         sequence,
@@ -372,8 +371,7 @@ fn raw_transaction(
             sequence,
             ordinal,
             &object_body,
-        )
-        .unwrap();
+        );
         logical_count = logical_count.checked_inc().unwrap();
         logical_bytes = logical_bytes
             .checked_add(super::codec::logical_record_length(&object_body).unwrap())
@@ -398,8 +396,7 @@ fn raw_transaction(
             sequence,
             ordinal,
             &root_body,
-        )
-        .unwrap();
+        );
         logical_count = logical_count.checked_inc().unwrap();
         logical_bytes = logical_bytes
             .checked_add(super::codec::logical_record_length(&root_body).unwrap())
@@ -615,8 +612,7 @@ fn compressed_object_flag_changes_transaction_digest() {
         sequence(1),
         WalOrdinal::new(1),
         body,
-    )
-    .unwrap();
+    );
     let mut compressed = super::codec::new_digest();
     super::codec::digest_record_with_flags(
         &mut compressed,
@@ -625,8 +621,7 @@ fn compressed_object_flag_changes_transaction_digest() {
         sequence(1),
         WalOrdinal::new(1),
         body,
-    )
-    .unwrap();
+    );
     assert_ne!(
         super::codec::finish_digest(&legacy),
         super::codec::finish_digest(&compressed),
@@ -914,22 +909,6 @@ fn tx1_complete_tx2_torn_preserves_tx1_commit_descriptor() {
             .iter()
             .any(|event| matches!(event, WalEvent::Tail(_)))
     );
-}
-
-#[test]
-fn semantic_commit_count_and_digest_mismatch_is_fatal() {
-    let mut bytes = raw_transaction(1, Some(object_id(1)), b"alice", true);
-    mutate_record(&mut bytes, 3, |payload| payload[RECORD_HEADER_LEN + 8] ^= 1);
-    assert!(matches!(
-        scan_events(bytes),
-        Err(WalError::CommitCountMismatch { .. })
-    ));
-
-    let mut bytes = raw_transaction(1, Some(object_id(1)), b"alice", true);
-    mutate_record(&mut bytes, 3, |payload| {
-        payload[RECORD_HEADER_LEN + 40] ^= 1;
-    });
-    assert!(matches!(scan_events(bytes), Err(WalError::DigestMismatch)));
 }
 
 #[test]

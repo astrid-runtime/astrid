@@ -61,8 +61,7 @@ fn compressed_transaction() -> Vec<u8> {
         sequence,
         WalOrdinal::new(0),
         &begin_body,
-    )
-    .unwrap();
+    );
     let mut bytes = encode_physical_record(
         WalRecordKind::Begin,
         sequence,
@@ -78,8 +77,7 @@ fn compressed_transaction() -> Vec<u8> {
         sequence,
         WalOrdinal::new(1),
         stored,
-    )
-    .unwrap();
+    );
     logical_bytes = logical_bytes
         .checked_add(logical_record_length(stored).unwrap())
         .unwrap();
@@ -100,8 +98,7 @@ fn compressed_transaction() -> Vec<u8> {
         sequence,
         WalOrdinal::new(2),
         &root_body,
-    )
-    .unwrap();
+    );
     logical_bytes = logical_bytes
         .checked_add(logical_record_length(&root_body).unwrap())
         .unwrap();

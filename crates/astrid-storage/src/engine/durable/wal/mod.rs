@@ -5,6 +5,7 @@
 
 mod codec;
 mod commit_wire;
+mod measurement;
 mod overlay;
 mod record_wire;
 mod replay;
