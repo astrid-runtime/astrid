@@ -1,5 +1,9 @@
 // Verus entry point for transitions used by hosted Astrid.
 
+extern crate self as astrid_core;
+#[path = "../crates/astrid-core/src/storage_filesystem/operation.rs"]
+pub mod storage_filesystem;
+
 #[path = "../crates/astrid-kernel/src/storage_mount/lease_authority/callback.rs"]
 mod storage_callback;
 

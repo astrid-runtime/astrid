@@ -1,5 +1,6 @@
 //! Admission of a decoded operation on a private storage mount callback.
 use vstd::prelude::*;
+use astrid_core::storage_filesystem::StorageFilesystemOperationV1 as Operation;
 
 verus! {
 
@@ -11,6 +12,31 @@ pub(crate) fn live(revoked: bool, now: u64, expires: u64) -> (accepted: bool)
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OperationClass { Read, Write, Sync }
+
+pub(crate) open spec fn access_class(operation: Operation) -> OperationClass {
+    match operation {
+        Operation::Write { .. } | Operation::SetLength { .. } | Operation::Create { .. }
+            | Operation::Remove { .. } | Operation::Rename { .. } => OperationClass::Write,
+        Operation::VolumeInfo | Operation::Stat { .. } | Operation::ReadDirectory { .. }
+            | Operation::Read { .. } => OperationClass::Read,
+        Operation::Sync => OperationClass::Sync,
+    }
+}
+
+fn operation_class(operation: &Operation) -> (class: OperationClass)
+    ensures class == access_class(*operation),
+{
+    match operation {
+        Operation::VolumeInfo | Operation::Stat { .. } | Operation::ReadDirectory { .. }
+            | Operation::Read { .. } => OperationClass::Read,
+        Operation::Write { .. }
+        | Operation::SetLength { .. }
+        | Operation::Create { .. }
+        | Operation::Remove { .. }
+        | Operation::Rename { .. } => OperationClass::Write,
+        Operation::Sync => OperationClass::Sync,
+    }
+}
 
 impl OperationClass {
     pub(crate) fn permits(self, writable: bool) -> (accepted: bool)
@@ -46,16 +72,17 @@ impl<L, O> Admitted<L, O> {
 
 pub(crate) enum Admission<L, O> { Stale, Unauthorized, ReadOnly, Accepted(Admitted<L, O>) }
 
-pub(crate) fn admit<L, O>(
-    lease: L, live: bool, authenticated: bool, writable: bool, operation: O, class: OperationClass,
-) -> (outcome: Admission<L, O>)
+pub(crate) fn admit<L>(
+    lease: L, live: bool, authenticated: bool, writable: bool, operation: Operation,
+) -> (outcome: Admission<L, Operation>)
     ensures
         (outcome is Stale) == !live,
         (outcome is Unauthorized) == (live && !authenticated),
-        (outcome is ReadOnly) == (live && authenticated && class == OperationClass::Write && !writable),
-        (outcome is Accepted) == (live && authenticated && (class != OperationClass::Write || writable)),
-        outcome matches Admission::Accepted(actual) ==> actual.binding() == (lease, operation, class),
+        (outcome is ReadOnly) == (live && authenticated && access_class(operation) == OperationClass::Write && !writable),
+        (outcome is Accepted) == (live && authenticated && (access_class(operation) != OperationClass::Write || writable)),
+        outcome matches Admission::Accepted(actual) ==> actual.binding() == (lease, operation, access_class(operation)),
 {
+    let class = operation_class(&operation);
     if !live { Admission::Stale }
     else if !authenticated { Admission::Unauthorized }
     else if !class.permits(writable) { Admission::ReadOnly }

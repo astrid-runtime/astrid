@@ -717,14 +717,12 @@ async fn dispatch_request(
     let request_id = request.request_id.clone();
     let live = state.is_live();
     let authenticated = live && token_matches(&state.token_hash, &request.lease_token);
-    let class = operation_class(&request.operation);
     let outcome = match admit(
         state,
         live,
         authenticated,
         state.access == StorageProviderAccessV1::ReadWrite,
         request.operation,
-        class,
     ) {
         Admission::Stale => failure("stale-lease", "storage mount lease is expired or revoked"),
         Admission::Unauthorized => failure("unauthorized", "storage mount lease token is invalid"),
@@ -904,21 +902,6 @@ fn failure(code: &str, message: &str) -> StorageFilesystemOutcomeV1 {
         code: code.to_owned(),
         message: message.chars().take(1024).collect(),
     })
-}
-
-fn operation_class(operation: &StorageFilesystemOperationV1) -> OperationClass {
-    use StorageFilesystemOperationV1 as Op;
-    match operation {
-        Op::VolumeInfo | Op::Stat { .. } | Op::ReadDirectory { .. } | Op::Read { .. } => {
-            OperationClass::Read
-        },
-        Op::Write { .. }
-        | Op::SetLength { .. }
-        | Op::Create { .. }
-        | Op::Remove { .. }
-        | Op::Rename { .. } => OperationClass::Write,
-        Op::Sync => OperationClass::Sync,
-    }
 }
 
 fn generate_lease_token() -> Result<(String, [u8; 32]), String> {

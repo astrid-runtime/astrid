@@ -70,6 +70,7 @@ INPUTS = [
     STORAGE_FILE,
     PAIR_RESULT,
     LEASE_CALLBACK,
+    Path("crates/astrid-core/src/storage_filesystem/operation.rs"),
     LEASE_REQUESTER,
     INVOCATION_OWNER,
     MOUNT,
@@ -361,6 +362,11 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "missing invocation workspace falls back to the runtime despite required binding",
             MOUNT,
             lambda text: replace_once(text, "if requires_binding { invocation }", "if requires_binding { runtime }"),
+        ),
+        (
+            "native mount wire rename is classified as a read",
+            LEASE_CALLBACK,
+            lambda text: replace_once(text, "| Operation::Rename { .. } => OperationClass::Write,\n        Operation::Sync", "=> OperationClass::Write,\n        Operation::Rename { .. } => OperationClass::Read,\n        Operation::Sync"),
         ),
         (
             "callback ticket downgrades a write to a read before execution",
