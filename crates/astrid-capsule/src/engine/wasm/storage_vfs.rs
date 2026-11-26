@@ -10,7 +10,7 @@
 
 #![cfg(not(target_family = "wasm"))]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::sync::Arc;
 
 use astrid_capabilities::{DirHandle, FileHandle};
@@ -283,6 +283,15 @@ impl AstridStorageVfs {
         Ok(())
     }
 
+    async fn register_file(&self, handle: FileHandle, file: OpenFile) -> VfsResult<FileHandle> {
+        let mut files = self.open_files.write().await;
+        let Entry::Vacant(entry) = files.entry(handle.clone()) else {
+            return Err(VfsError::Io(std::io::Error::other("file handle collision")));
+        };
+        entry.insert(Mutex::new(file));
+        Ok(handle)
+    }
+
     async fn dir_path(&self, handle: &DirHandle) -> VfsResult<FilesystemPath> {
         self.open_dirs
             .read()
@@ -447,20 +456,17 @@ impl Vfs for AstridStorageVfs {
             ));
         }
         let (bytes, dirty) = self.file_entry(&path, write, truncate).await?;
-        let new_handle = FileHandle::new();
-        let mut files = self.open_files.write().await;
-        let std::collections::hash_map::Entry::Vacant(entry) = files.entry(new_handle.clone())
-        else {
-            return Err(VfsError::Io(std::io::Error::other("file handle collision")));
-        };
-        entry.insert(Mutex::new(OpenFile {
-            path,
-            bytes,
-            offset: 0,
-            writable: write,
-            dirty,
-        }));
-        Ok(new_handle)
+        self.register_file(
+            FileHandle::new(),
+            OpenFile {
+                path,
+                bytes,
+                offset: 0,
+                writable: write,
+                dirty,
+            },
+        )
+        .await
     }
 
     async fn open_dir(
@@ -765,6 +771,35 @@ mod tests {
             .close(&reopened_handle)
             .await
             .expect("close persisted");
+    }
+
+    #[tokio::test]
+    async fn duplicate_file_registration_preserves_the_original_dirty_buffer() {
+        let (_directory, store) = fixture().await;
+        let root = DirHandle::new();
+        let vfs = AstridStorageVfs::new(
+            &store,
+            StateOwner::Principal(PrincipalUid::from_bytes([0x44; 32])),
+            root.clone(),
+        );
+        let original = vfs.open(&root, "original", true, true).await.unwrap();
+        vfs.write(&original, b"saved").await.unwrap();
+        let replacement = OpenFile {
+            path: FilesystemPath::new("replacement").unwrap(),
+            bytes: b"other".to_vec(),
+            offset: 0,
+            writable: true,
+            dirty: true,
+        };
+        assert!(matches!(
+            vfs.register_file(original.clone(), replacement).await,
+            Err(VfsError::Io(_))
+        ));
+        vfs.close(&original).await.unwrap();
+        let read = vfs.open(&root, "original", false, false).await.unwrap();
+        assert_eq!(vfs.read(&read).await.unwrap(), b"saved");
+        vfs.close(&read).await.unwrap();
+        assert!(!vfs.exists(&root, "replacement").await.unwrap());
     }
 
     #[tokio::test]
