@@ -241,9 +241,17 @@ The argument relies on Rust destruction semantics, Tokio channel identity and
 closure, the profile fingerprint projection, filesystem behavior and the OS
 transport. It does not yet prove the complete concurrent transition or the
 response serialization. Previously accepted OS bytes may arrive after local
-retirement. On Unix, profile replacement syncs the temporary file and then
-renames it. A parent-directory durability barrier for power-loss recovery is
-still outstanding. Whole-principal
+retirement. On Unix, profile replacement syncs the temporary file and renames it.
+After cache invalidation and session retirement, the acknowledgement path
+syncs the profile directory. A failed directory sync withholds success after
+the live policy has changed. Persistence across power loss depends on the
+filesystem, the identity of that directory, and the storage device honoring
+those barriers. These assumptions and the recovery reader have yet to be
+joined to the retirement proof. A Unix regression runs the management removal
+in a child process and exits immediately after checking its acknowledgement.
+A fresh kernel reopens the same home and denies the removed key while accepting
+the surviving key. This exercises process exit with an intact filesystem.
+Whole-principal
 deletion, alias reuse and Wasmtime socket resources have separate obligations.
 
 | Native effect | Production path | Outstanding refinement |

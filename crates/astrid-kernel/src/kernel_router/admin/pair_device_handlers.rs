@@ -553,6 +553,42 @@ pub(crate) async fn pair_device_revoke(
     principal: &PrincipalId,
     key_id: &str,
 ) -> AdminResponseBody {
+    #[cfg(unix)]
+    let confirm = confirm_profile_publication;
+    #[cfg(not(unix))]
+    let confirm = |_: &std::path::Path| Ok(());
+    revoke_with_publication_barrier(kernel, principal, key_id, confirm).await
+}
+
+// The replacement file has already been synced. Unix filesystems also
+// require the containing directory to be synced to commit the rename.
+#[cfg(unix)]
+fn confirm_profile_publication(path: &std::path::Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("profile has no parent"))?;
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(all(test, unix))]
+pub(super) async fn revoke_with_failed_directory_sync(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    key_id: &str,
+) -> AdminResponseBody {
+    revoke_with_publication_barrier(kernel, principal, key_id, |path| {
+        assert_eq!(path, kernel.astrid_home.profile_path(principal));
+        Err(std::io::Error::other("test directory sync failure"))
+    })
+    .await
+}
+
+async fn revoke_with_publication_barrier(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    key_id: &str,
+    confirm: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> AdminResponseBody {
     let key_id = match DeviceKeyId::new(key_id) {
         Ok(key_id) => key_id,
         Err(e) => return err_bad_input(e),
@@ -594,6 +630,11 @@ pub(crate) async fn pair_device_revoke(
             ));
         },
     };
+    if let Err(error) = confirm(&profile_path) {
+        return err_internal(format!(
+            "device removed from live profile but persistence is unconfirmed: {error}"
+        ));
+    }
 
     info!(
         principal = receipt.principal(),
