@@ -31,7 +31,8 @@
 
 use astrid_core::local_transport::{self, LocalStream};
 use astrid_core::principal::PrincipalId;
-use astrid_core::profile::DeviceKey;
+use astrid_core::profile::device_sessions::{DeviceSession, DeviceSessions};
+use astrid_core::profile::{DeviceKey, DeviceKeyId};
 use astrid_core::session_token::{
     HandshakeRequest, HandshakeResponse, PRINCIPAL_AUTH_NONCE_LEN, PROTOCOL_VERSION, SessionToken,
     principal_auth_challenge_message,
@@ -53,16 +54,17 @@ const MAX_HANDSHAKE_SIZE: usize = 4096;
 /// challenge path is unit-testable against a tempdir-backed home (the crate
 /// is `#![deny(unsafe_code)]`, so env mutation in tests is impossible).
 ///
-/// Returns `Ok(Some((principal, key_id)))` when the client signed a valid
+/// Returns `Ok(Some((principal, key_id, session)))` when the client signed a valid
 /// challenge for a registered key (`key_id` is the matched [`DeviceKey`]'s
 /// fingerprint, carried forward so the cap-gate can apply that device's
-/// scope), `Ok(None)` for a legacy/unauthenticated handshake, or
+/// scope, and `session` carries the retirement signal), `Ok(None)` for a legacy/unauthenticated handshake, or
 /// `Err(reason)` with a human-readable rejection reason.
 pub(crate) async fn validate_handshake<S>(
     stream: &mut S,
     expected_token: &SessionToken,
     home: &astrid_core::dirs::AstridHome,
-) -> Result<Option<(PrincipalId, String)>, String>
+    sessions: &DeviceSessions,
+) -> Result<Option<(PrincipalId, String, DeviceSession)>, String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -105,7 +107,7 @@ where
     // principal restructures the flow into two frames; absence keeps the
     // legacy single round trip.
     let verified_principal = match request.claimed_principal.clone() {
-        Some(claimed) => Some(run_principal_challenge(stream, &claimed, home).await?),
+        Some(claimed) => Some(run_principal_challenge(stream, &claimed, home, sessions).await?),
         None => None,
     };
 
@@ -156,8 +158,8 @@ where
 /// principal: issue a random nonce, read the signed second frame, and verify
 /// the signature against a registered key.
 ///
-/// Returns the verified [`PrincipalId`] paired with the `key_id` of the
-/// matched [`DeviceKey`] on success, or `Err(reason)` on any failure
+/// Returns the verified [`PrincipalId`], matched device fingerprint and live
+/// session on success, or `Err(reason)` on any failure
 /// (unknown/disabled principal, missing/invalid signature). Sends an
 /// `authentication failed` response before returning an error so the client
 /// observes a uniform rejection. The `key_id` carries the matched device's
@@ -166,7 +168,8 @@ async fn run_principal_challenge<S>(
     stream: &mut S,
     claimed: &str,
     home: &astrid_core::dirs::AstridHome,
-) -> Result<(PrincipalId, String), String>
+    sessions: &DeviceSessions,
+) -> Result<(PrincipalId, String, DeviceSession), String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -180,6 +183,9 @@ where
         },
     };
 
+    let admission = sessions
+        .challenge(principal.clone())
+        .map_err(|e| e.to_string())?;
     // Issue the challenge nonce. Source straight from the OS CSPRNG, matching
     // `sys::random_bytes` and `SessionToken::generate`.
     let nonce_hex = match generate_nonce_hex() {
@@ -211,7 +217,14 @@ where
         },
     };
 
-    Ok((principal, key_id))
+    let session = match admission.bind(DeviceKeyId::new(key_id.clone())?) {
+        Ok(session) => session,
+        Err(error) => {
+            send_auth_failed(stream).await;
+            return Err(error.to_string());
+        },
+    };
+    Ok((principal, key_id, session))
 }
 
 /// Verify `signature_hex` over the challenge message for `principal` against

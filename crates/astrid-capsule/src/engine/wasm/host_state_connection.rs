@@ -3,6 +3,16 @@
 
 use super::*;
 
+impl ConnectionIdentity {
+    pub(crate) fn new(principal: astrid_core::PrincipalId, device_key_id: Option<String>) -> Self {
+        Self {
+            principal,
+            device_key_id,
+            request_owner: astrid_events::ipc::RequestOwnerId::generate(),
+        }
+    }
+}
+
 impl HostState {
     /// Build a fresh, empty per-connection identity registry.
     ///
@@ -17,10 +27,8 @@ impl HostState {
 
     /// Build a fresh, empty per-connection client-lifecycle registry.
     ///
-    /// Distinct from [`new_connection_principals`](Self::new_connection_principals):
-    /// `client_connections` maps a stream rep to the verified principal alone
-    /// (no device id) for the connect/disconnect counter, whereas
-    /// `connection_principals` carries the device-aware [`ConnectionIdentity`].
+    /// Unsigned inbound streams use this map to balance connect and disconnect.
+    /// A signed stream keeps its lifecycle identity on its live transport.
     /// Out-of-pool constructors (lifecycle hooks, the hook handler, tests) use
     /// this so they do not have to name the `dashmap` type.
     #[must_use]
@@ -43,29 +51,17 @@ impl HostState {
         Arc::new(dashmap::DashMap::new())
     }
 
-    /// Bind `principal` and the authenticating device `key_id` to the
-    /// connection identified by stream resource `rep`.
-    ///
-    /// Called by the `net.unix-listener.accept` path after a verified
-    /// per-connection principal challenge-response (issue #45/#852). The
-    /// `device_key_id` is the matched [`DeviceKey`](astrid_core::profile::DeviceKey)
-    /// fingerprint from the handshake; it rides forward so the cap-gate can
-    /// scope the connection. Storage only — see
-    /// [`connection_principals`](Self::connection_principals).
+    /// Install a mock identity for a transport fixture. Signed production
+    /// sockets carry their authenticated identity in the resource itself.
+    #[cfg(test)]
     pub(crate) fn bind_connection_principal(
         &self,
         rep: u32,
         principal: astrid_core::principal::PrincipalId,
         device_key_id: Option<String>,
     ) {
-        self.connection_principals.insert(
-            rep,
-            ConnectionIdentity {
-                principal,
-                device_key_id,
-                request_owner: astrid_events::ipc::RequestOwnerId::generate(),
-            },
-        );
+        self.connection_principals
+            .insert(rep, ConnectionIdentity::new(principal, device_key_id));
     }
 
     /// Return the verified principal bound to the connection identified by

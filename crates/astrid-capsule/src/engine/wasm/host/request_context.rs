@@ -6,18 +6,29 @@ use crate::engine::wasm::bindings::astrid::net::host::{ErrorCode, TcpStream};
 use crate::engine::wasm::bindings::astrid::request_context::host as request_context;
 use crate::engine::wasm::host_state::{HostState, NetStream};
 
+fn resource_identity(
+    state: &HostState,
+    rep: u32,
+) -> Result<Option<crate::engine::wasm::host_state::ConnectionIdentity>, ErrorCode> {
+    let stream = state
+        .resource_table
+        .get::<NetStream>(&Resource::new_borrow(rep))
+        .map_err(|_| ErrorCode::InvalidHandle)?;
+    Ok(match stream {
+        NetStream::Signed(socket) => socket.live_identity(),
+        _ => state
+            .connection_principals
+            .get(&rep)
+            .map(|entry| entry.clone()),
+    })
+}
+
 impl request_context::Host for HostState {
     fn connection_owner(
         &mut self,
         connection: Resource<TcpStream>,
     ) -> Result<Option<String>, ErrorCode> {
-        self.resource_table
-            .get::<NetStream>(&Resource::new_borrow(connection.rep()))
-            .map_err(|_| ErrorCode::InvalidHandle)?;
-
-        Ok(self
-            .connection_principals
-            .get(&connection.rep())
+        Ok(resource_identity(self, connection.rep())?
             .map(|identity| identity.request_owner.to_string()))
     }
 
@@ -25,13 +36,7 @@ impl request_context::Host for HostState {
         &mut self,
         connection: Resource<TcpStream>,
     ) -> Result<Option<String>, ErrorCode> {
-        self.resource_table
-            .get::<NetStream>(&Resource::new_borrow(connection.rep()))
-            .map_err(|_| ErrorCode::InvalidHandle)?;
-
-        Ok(self
-            .connection_principals
-            .get(&connection.rep())
+        Ok(resource_identity(self, connection.rep())?
             .map(|identity| identity.principal.to_string()))
     }
 }

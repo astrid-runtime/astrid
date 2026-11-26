@@ -474,3 +474,135 @@ async fn write_deadline_honours_slot_timeout_else_scales_by_payload() {
         "a Tcp slot without a write_timeout falls back to the default ceiling"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn device_retirement_drains_wasmtime_socket_and_captured_publication() {
+    use crate::engine::wasm::bindings::astrid::ipc::host::{
+        ErrorCode as IpcError, Host as IpcHost,
+    };
+    use crate::engine::wasm::bindings::astrid::request_context::host::Host as RequestContext;
+    use crate::engine::wasm::test_fixtures::minimal_host_state;
+    use astrid_core::profile::DeviceKeyId;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    for start_publication_before_retirement in [false, true] {
+        let rt = tokio::runtime::Handle::current();
+        let mut state = minimal_host_state(rt.clone());
+        state.has_uplink_capability = true;
+        state.system_runtime = true;
+        state.ipc_publish_patterns = vec!["client.v1.*".into()];
+        let registry = state.device_sessions.clone();
+        let principal = astrid_core::PrincipalId::new("alice").unwrap();
+        let key = DeviceKeyId::new("a".repeat(16)).unwrap();
+        let session = registry
+            .challenge(principal.clone())
+            .unwrap()
+            .bind(key.clone())
+            .unwrap();
+        let (socket, mut peer) = tokio::net::UnixStream::pair().unwrap();
+        let mut disconnected = state.event_bus.subscribe_topic("client.v1.disconnect");
+        assert!(state.reserve_net_stream());
+        let rep = super::super::unix_listener::install_accepted(
+            &mut state,
+            socket,
+            Some((principal.clone(), key.as_str().to_owned(), session)),
+        )
+        .unwrap()
+        .rep();
+        assert_eq!(
+            RequestContext::connection_principal(&mut state, Resource::new_borrow(rep))
+                .unwrap()
+                .as_deref(),
+            Some(principal.as_str())
+        );
+
+        let topic = "client.v1.sample";
+        let mut events = state.event_bus.subscribe_topic(topic);
+        let frame = br#"{"topic":"client.v1.sample","payload":{}}"#;
+
+        for admit in [true, false] {
+            peer.write_u32(u32::try_from(frame.len()).unwrap())
+                .await
+                .unwrap();
+            peer.write_all(frame).await.unwrap();
+            let status = HostTcpStream::read(&mut state, Resource::new_borrow(rep)).unwrap();
+            assert!(matches!(status, NetReadStatus::Data(data) if data == frame));
+            if admit {
+                IpcHost::publish_as(&mut state, topic.into(), "{}".into(), "ignored".into())
+                    .await
+                    .unwrap();
+                let event = events.recv().await.unwrap();
+                let astrid_events::AstridEvent::Ipc { message, .. } = event.as_ref() else {
+                    panic!("expected forwarded IPC message")
+                };
+                assert_eq!(message.principal.as_deref(), Some(principal.as_str()));
+                assert_eq!(message.device_key_id.as_deref(), Some(key.as_str()));
+            }
+        }
+
+        // Stop publication at the host's actual I/O admission point.
+        let permits = state.io_semaphore.clone();
+        let held = permits
+            .clone()
+            .acquire_many_owned(u32::try_from(permits.available_permits()).unwrap())
+            .await
+            .unwrap();
+        {
+            let mut forward = std::pin::pin!(IpcHost::publish_as(
+                &mut state,
+                topic.into(),
+                "{}".into(),
+                "ignored".into()
+            ));
+            if start_publication_before_retirement {
+                tokio::select! {
+                    biased;
+                    outcome = &mut forward => panic!("unreserved publication completed: {outcome:?}"),
+                    () = std::future::ready(()) => {}
+                }
+            }
+            let retire = registry.retire(&principal, &key);
+            let outcome = if start_publication_before_retirement {
+                let (done, forward) = tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::join!(retire, forward)
+                })
+                .await
+                .unwrap();
+                done.unwrap();
+                forward
+            } else {
+                tokio::time::timeout(Duration::from_secs(5), retire)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                drop(held);
+                forward.await
+            };
+            assert!(matches!(outcome, Err(IpcError::CapabilityDenied)));
+        }
+        let event = disconnected
+            .try_recv()
+            .expect("disconnect before acknowledgement");
+        let astrid_events::AstridEvent::Ipc { message, .. } = event.as_ref() else {
+            panic!("expected disconnect")
+        };
+        assert_eq!(message.principal.as_deref(), Some(principal.as_str()));
+        assert!(
+            RequestContext::connection_owner(&mut state, Resource::new_borrow(rep))
+                .unwrap()
+                .is_none()
+        );
+        assert!(events.try_recv().is_none());
+        assert_eq!(peer.read(&mut [0u8; 1]).await.unwrap(), 0);
+        assert!(matches!(
+            HostTcpStream::read(&mut state, Resource::new_borrow(rep)),
+            Ok(NetReadStatus::Closed)
+        ));
+        assert!(
+            HostTcpStream::write_bytes(&mut state, Resource::new_borrow(rep), vec![1]).is_err()
+        );
+        HostTcpStream::drop(&mut state, Resource::new_own(rep)).unwrap();
+        assert!(disconnected.try_recv().is_none());
+    }
+}

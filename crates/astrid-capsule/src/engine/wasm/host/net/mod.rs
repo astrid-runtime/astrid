@@ -41,7 +41,7 @@ use crate::engine::wasm::host::http::is_safe_ip;
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::{HostState, NetStream, SharedTcpListener, TcpStreamSlot};
 
-mod client_lifecycle;
+pub(crate) mod client_lifecycle;
 pub(crate) mod handshake;
 mod stream;
 mod tcp_listener;
@@ -407,7 +407,7 @@ where
             op(slot);
             Ok(())
         },
-        NetStream::Unix(_) => Err(ErrorCode::NotTcp),
+        NetStream::Unix(_) | NetStream::Signed(_) => Err(ErrorCode::NotTcp),
     }
 }
 
@@ -429,7 +429,7 @@ where
             });
             result.unwrap_or(Err(ErrorCode::Closed))
         },
-        NetStream::Unix(_) => Err(ErrorCode::NotTcp),
+        NetStream::Unix(_) | NetStream::Signed(_) => Err(ErrorCode::NotTcp),
     }
 }
 

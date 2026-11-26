@@ -135,6 +135,7 @@ impl HostState {
             principal_cancel_tokens: Self::new_principal_cancel_tokens(),
             invocation_cancel_token: None,
             session_token: None,
+            device_sessions: Default::default(),
             interceptor_handles: Vec::new(),
             allowance_store: None,
             // Hooks have no kernel-managed security gate, so no identity store.
@@ -166,6 +167,7 @@ impl HostState {
             ingress_device_key_id: None,
             ingress_request_owner: None,
             ingress_origin: None,
+            ingress_socket: None,
         }
     }
 }
