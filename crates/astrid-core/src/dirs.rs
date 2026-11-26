@@ -702,28 +702,6 @@ impl AstridHome {
         run_dir::validate(self)
     }
 
-    /// Root of the disposable UID-scoped scratch directories in this runtime.
-    #[must_use]
-    pub fn runtime_principal_scratch_root(&self) -> PathBuf {
-        self.run_dir().join("principals")
-    }
-
-    /// Clear stale per-principal runtime scratch from a prior daemon process.
-    ///
-    /// Only the disposable `run/principals/` subtree is touched. The complete
-    /// tree is validated without following redirects before anything is
-    /// removed; symlinks, mount boundaries, and special entries fail closed.
-    /// The subtree root is retained and private UID scratch directories are
-    /// recreated on demand by the capsule runtime.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error and leaves the subtree untouched when a redirect,
-    /// mount boundary, or special entry is present.
-    pub fn clear_runtime_principal_scratch(&self) -> io::Result<()> {
-        crate::runtime_scratch::clear_principal_scratch(&self.runtime_principal_scratch_root())
-    }
-
     /// Canonical runtime socket filename; fixed by the host-local filesystem contract.
     pub const SOCKET_FILE_NAME: &str = "system.sock";
     /// Canonical authentication token filename in the admitted runtime directory.

@@ -420,6 +420,10 @@ mod recv_vfs_tests {
             open_runtime_principal_store,
         };
 
+        assert!(
+            std::env::var_os("ASTRID_RUN_DIR").is_none(),
+            "scratch isolation test requires a private run directory"
+        );
         let root = tempfile::tempdir().expect("runtime store");
         let astrid_home = astrid_core::dirs::AstridHome::from_path(root.path());
         astrid_home.ensure().expect("runtime layout");
@@ -454,7 +458,7 @@ mod recv_vfs_tests {
         state.principal_store = Some(store);
         state.principal_directory = directory;
         state.install_recv_invocation_vfs(Some(&alice));
-        let scratch = astrid_home.run_dir().join("principals");
+        let scratch = astrid_home.runtime_principal_scratch_root();
         let alice_uid = state.principal_directory.uid_for(&alice).unwrap();
         let alice_path = scratch.join(alice_uid.to_string()).join("tmp");
         let tmp = state.invocation_tmp.as_ref().expect("Alice scratch mount");
