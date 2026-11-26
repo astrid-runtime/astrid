@@ -2898,12 +2898,17 @@ impl Kernel {
         principal: &PrincipalId,
     ) -> Result<(), anyhow::Error> {
         let view_guard = self.lock_capsule_view(principal, id).await;
-        let registered = { self.capsules.read().await.get_for(principal, id).is_some() };
-        if registered {
+        let registered = self.capsules.read().await.runtime_id_for(principal, id);
+        if let Some(runtime) = registered {
             if self.capabilities.is_principal_retiring(principal).await {
                 anyhow::bail!("cannot reload capsule '{id}' for retiring principal '{principal}'");
             }
-            self.restart_capsule(id, principal, None).await?;
+            match self.restart_capsule(id, principal, Some(&runtime)).await? {
+                RestartOutcome::Clean | RestartOutcome::OldInstanceLingering => {},
+                RestartOutcome::Superseded => {
+                    anyhow::bail!("capsule '{id}' changed generation during reload")
+                },
+            }
             self.publish_capsules_loaded().await;
         } else {
             drop(view_guard);
