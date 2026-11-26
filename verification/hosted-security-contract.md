@@ -47,6 +47,20 @@ remains in `request_policy::required_capability` and
 checks global list authority on the pinned profile, groups and device scope
 before constructing a cross-principal view.
 
+The install handler captures a durable target UID. Under the environment write
+lock, staging checks the current directory binding against that UID. Rollback
+uses the staged UID. Storage-backed installation uses the captured UID for
+package conflict checks, generation-cache selection, prior metadata, lifecycle
+hooks, durable publication and import validation. The production owner selector
+returns an owner exactly when the observed UID matches the supplied pin, or
+when the caller supplies no pin for initial resolution. A regression reassigns
+the alias before install and checks both package registries for absence.
+
+Live activation rechecks the binding before it dispatches reload by alias.
+That check leaves concurrent alias changes during reload open. Ordering with
+retirement, authenticated request admission and durable commit still needs a
+proof across the full operation.
+
 This proves scope classification for the supplied identities. The authenticated
 origin of the caller, alias-to-UID continuity through handlers, capability-table
 correctness and sink coverage still require production refinement. Invite and
@@ -58,6 +72,6 @@ Native stdio MCP capsules requesting network domains or outbound TCP destination
 
 ## Evidence and trust
 
-The current verifier entry point imports nine production modules and an abstract model of grant and principal authority. Their contracts cover fuel arithmetic, per-principal operation tracking, static pattern matching and containment, token status transitions, the startup marker fold, guest owner selection, KV address encoding, and overlay lookup and update. The model's theorems state what every trace of the grant, tracker and fuel transitions preserves, conditional on the stated storage, settlement and lifecycle obligations: an acknowledged revocation keeps the grant revoked across recovery and an acknowledged consumption keeps it used, a revocation keeps the grant revoked until the next recovery whether or not its write completed, retirement keeps the principal closed until a resume, and committed fuel exceeds the budget only by the fuel charged beyond a promise. Its `apply_*` and `fuel_*` functions show that the production transitions compute the model's steps. The hosted backend regression exercises abrupt exit and reopening. Complete mediation of hosted effects and concurrent runtime refinement remain open.
+The current verifier entry point imports ten production modules and an abstract model of grant and principal authority. Their contracts cover fuel arithmetic, per-principal operation tracking, static pattern matching and containment, token status transitions, the startup marker fold, guest owner selection, KV address encoding, and overlay lookup and update. The model's theorems state what every trace of the grant, tracker and fuel transitions preserves, conditional on the stated storage, settlement and lifecycle obligations: an acknowledged revocation keeps the grant revoked across recovery and an acknowledged consumption keeps it used, a revocation keeps the grant revoked until the next recovery whether or not its write completed, retirement keeps the principal closed until a resume, and committed fuel exceeds the budget only by the fuel charged beyond a promise. Its `apply_*` and `fuel_*` functions show that the production transitions compute the model's steps. The hosted backend regression exercises abrupt exit and reopening. Complete mediation of hosted effects and concurrent runtime refinement remain open.
 
 The hosted security argument must state its assumptions about the OS, hardware, Wasmtime, cryptography, persistent storage, compiler and verifier. Release evidence must identify the source, build configuration, binary digest and proof result. Evidence about an installed instance must also identify the running binary and security-relevant configuration through a measurement mechanism whose trust assumptions are disclosed.

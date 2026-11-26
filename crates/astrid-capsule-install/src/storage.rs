@@ -420,6 +420,26 @@ pub fn publish_directory_package(
         .principal_directory()
         .uid_for(principal)
         .with_context(|| format!("resolve durable uid for principal {principal}"))?;
+    publish_directory_package_for_uid(
+        store,
+        uid,
+        source_dir,
+        target_dir,
+        meta,
+        authority,
+        expected_generation,
+    )
+}
+
+pub(crate) fn publish_directory_package_for_uid(
+    store: &Arc<RuntimePrincipalStore>,
+    uid: astrid_core::identity::PrincipalUid,
+    source_dir: &Path,
+    target_dir: &Path,
+    meta: &CapsuleMeta,
+    authority: &InstalledAuthority,
+    expected_generation: Option<CapsulePackageGeneration>,
+) -> anyhow::Result<()> {
     let (manifest_id, manifest_version) = manifest_identity(source_dir)?;
     if authority.capsule_id != manifest_id
         || authority.version != manifest_version
@@ -481,7 +501,7 @@ pub fn publish_directory_package(
 
     registry
         .install(&owner, &id, &package, expected)
-        .with_context(|| format!("publish durable capsule package {id} for {principal}"))?;
+        .with_context(|| format!("publish durable capsule package {id} for {uid}"))?;
     read_verified_durable_package(store, uid, &id)?
         .ok_or_else(|| anyhow::anyhow!("durable capsule {id} disappeared after publish"))?;
     Ok(())

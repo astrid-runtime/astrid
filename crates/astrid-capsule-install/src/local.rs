@@ -62,7 +62,7 @@ use crate::manifest_check::{
 };
 use crate::meta::{CapsuleMeta, read_meta, write_meta};
 use crate::paths::{resolve_cache_target_dir, resolve_target_dir_for_in_workspace};
-use crate::storage::read_durable_meta;
+use crate::storage::read_verified_durable_package;
 use crate::wasm::{WasmAddressed, content_address_wasm};
 use crate::wit::{content_address_wit, version_map_to_strings};
 
@@ -138,6 +138,8 @@ pub struct InstallOptions {
     /// non-workspace callers fail closed and must route through the typed
     /// kernel install API.
     pub storage: Option<Arc<RuntimePrincipalStore>>,
+    /// Immutable owner captured by the daemon before staging any install effects.
+    pub admitted_uid: Option<astrid_core::PrincipalUid>,
     /// Bounded distro provenance copied into the durable `meta.json` package
     /// record. These fields are integrity/audit metadata only.
     pub provenance_distro: Option<String>,
@@ -610,11 +612,21 @@ pub(crate) fn install_from_local_path_internal(
         authority_for_install_source(source_dir, &manifest, Some(installed_authority))?;
 
     // Pre-flight checks — pure reads, no target mutation.
-    let export_conflicts = if let Some(store) = options.storage.as_ref() {
-        let uid = store
-            .principal_directory()
-            .uid_for(target_principal)
-            .with_context(|| format!("resolve durable uid for principal {target_principal}"))?;
+    let durable = options
+        .storage
+        .as_ref()
+        .map(|store| {
+            store
+                .principal_directory()
+                .bound_uid(target_principal, options.admitted_uid)
+                .map(|uid| (store, uid))
+        })
+        .transpose()?;
+    anyhow::ensure!(
+        durable.is_some() || options.admitted_uid.is_none(),
+        "admitted install owner requires durable storage"
+    );
+    let export_conflicts = if let Some((store, uid)) = durable {
         check_export_conflicts_in_storage(&manifest, store, uid)?
     } else {
         check_export_conflicts_in_workspace(
@@ -632,11 +644,7 @@ pub(crate) fn install_from_local_path_internal(
     // A storage-backed install gets a fresh, owner- and generation-scoped
     // disposable target. The durable registry remains authoritative; the
     // native directory is never used to infer whether an install exists.
-    let cache_scope = if let Some(store) = options.storage.as_ref() {
-        let uid = store
-            .principal_directory()
-            .uid_for(target_principal)
-            .with_context(|| format!("resolve durable uid for principal {target_principal}"))?;
+    let cache_scope = if let Some((_, uid)) = durable {
         let archive = crate::storage::canonical_capsule_archive(source_dir)
             .context("canonicalize capsule archive for cache generation")?;
         let digest = blake3::hash(&archive).to_hex().to_string();
@@ -713,10 +721,11 @@ pub(crate) fn install_from_local_path_internal(
     // store is supplied. The native target is only a disposable cache and may
     // be absent or stale after restart; consulting it would let cache residue
     // overwrite the authoritative generation.
-    let existing_meta = options.storage.as_ref().map_or_else(
-        || Ok(read_meta(&target_dir)),
-        |store| read_durable_meta(store, target_principal, id.as_str()),
-    )?;
+    let existing_meta = match durable {
+        Some((store, uid)) => read_verified_durable_package(store, uid, id.as_str())?
+            .map(|package| package.metadata().clone()),
+        None => read_meta(&target_dir),
+    };
     let (phase, previous_version) = if let Some(ref meta) = existing_meta {
         (InstallPhase::Upgrade, Some(meta.version.clone()))
     } else {
@@ -795,7 +804,7 @@ pub(crate) fn install_from_local_path_internal(
             manifest: &manifest,
             home,
             target_principal,
-            storage: options.storage.as_deref(),
+            storage: durable.map(|(store, uid)| (store.as_ref(), uid)),
             phase: phase.to_lifecycle(),
             previous_version: previous_version.as_deref(),
             services: LifecycleServices {
@@ -844,10 +853,10 @@ pub(crate) fn install_from_local_path_internal(
         rollback(&target_dir, backup_dir.as_deref());
         return Err(e);
     }
-    if let Some(store) = options.storage.as_ref()
-        && let Err(error) = crate::storage::publish_directory_package(
+    if let Some((store, uid)) = durable
+        && let Err(error) = crate::storage::publish_directory_package_for_uid(
             store,
-            target_principal,
+            uid,
             source_dir,
             &target_dir,
             &meta,
@@ -889,11 +898,7 @@ pub(crate) fn install_from_local_path_internal(
 
     let missing_imports = if options.skip_import_check {
         Vec::new()
-    } else if let Some(store) = options.storage.as_ref() {
-        let uid = store
-            .principal_directory()
-            .uid_for(target_principal)
-            .with_context(|| format!("resolve durable uid for principal {target_principal}"))?;
+    } else if let Some((store, uid)) = durable {
         validate_imports_in_storage(&manifest, store, uid)?
     } else {
         validate_imports_in_workspace(

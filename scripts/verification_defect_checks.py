@@ -30,7 +30,9 @@ KV_ENCODING = Path("crates/astrid-storage/src/kv/encoding.rs")
 OVERLAY = Path("crates/astrid-storage/src/kv/tree/overlay/traversal.rs")
 OVERLAY_UPDATE = Path("crates/astrid-storage/src/kv/tree/overlay/update.rs")
 PRINCIPAL_SCOPE = Path("crates/astrid-kernel/src/kernel_router/principal_scope.rs")
+BINDING = Path("crates/astrid-storage/src/principal_directory/binding.rs")
 INPUTS = [
+    BINDING,
     PRINCIPAL_SCOPE,
     OVERLAY_UPDATE,
     OVERLAY,
@@ -116,6 +118,12 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
         for item in PROOF_ITEMS
     ]
     return [
+        (
+            "stale install ownership follows a reassigned alias",
+            BINDING,
+            lambda text: replace_once(text, "uid.as_slice() != observed.as_slice() => None",
+                                      "uid.as_slice() != observed.as_slice() => Some(observed)"),
+        ),
         (
             "shared state accepts a self-scoped grant",
             PRINCIPAL_SCOPE,

@@ -9,6 +9,8 @@ use parking_lot::{RwLock, RwLockReadGuard};
 
 use crate::error::{StorageError, StorageResult};
 
+mod binding;
+
 /// Live, capability-bound mapping between mutable principal aliases and
 /// stable durable UIDs.
 ///
@@ -111,6 +113,22 @@ impl PrincipalDirectory {
                     "principal alias {alias} has no registered durable identity"
                 ))
             })
+    }
+
+    /// Resolve the alias and keep a previously admitted owner when supplied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the alias is missing or has changed owners.
+    pub fn bound_uid(
+        &self,
+        alias: &PrincipalId,
+        expected: Option<PrincipalUid>,
+    ) -> StorageResult<PrincipalUid> {
+        let observed = self.uid_for(alias)?;
+        binding::select(expected.map(|uid| *uid.as_bytes()), *observed.as_bytes())
+            .map(PrincipalUid::from_bytes)
+            .ok_or_else(|| StorageError::InvalidKey(format!("principal {alias} changed owners")))
     }
 
     /// Run a synchronous native operation while this UID remains registered.

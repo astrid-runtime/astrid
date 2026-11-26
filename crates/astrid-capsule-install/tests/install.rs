@@ -83,6 +83,39 @@ fn write_minimal_capsule(base: &std::path::Path, name: &str, version: &str) {
 }
 
 #[test]
+fn reassigned_install_target_cannot_receive_a_previously_admitted_package() {
+    let source = tempfile::tempdir().unwrap();
+    write_minimal_capsule(source.path(), "pinned-owner", "1.0.0");
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path());
+    let storage = install_store(&home);
+    let directory = storage.principal_directory();
+    let alias = astrid_capsule_install::paths::install_principal();
+    let admitted = directory.uid_for(&alias).unwrap();
+    let replacement = astrid_core::PrincipalUid::from_bytes([0x3a; 32]);
+    directory
+        .rename(
+            admitted,
+            &alias,
+            astrid_core::PrincipalId::new("renamed").unwrap(),
+        )
+        .unwrap();
+    directory.register(alias, replacement).unwrap();
+
+    let mut options = install_options(&storage);
+    options.admitted_uid = Some(admitted);
+    let error = install_from_local_path(source.path(), &home, options).unwrap_err();
+    assert!(format!("{error:#}").contains("changed owners"));
+    for uid in [admitted, replacement] {
+        assert!(
+            read_verified_durable_package(&storage, uid, "pinned-owner")
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[test]
 fn storage_install_publishes_wasm_to_system_catalog() {
     let capsule_dir = tempfile::tempdir().unwrap();
     let bytes = wat::parse_str("(component)").unwrap();

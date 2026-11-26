@@ -29,3 +29,6 @@ mod overlay_update;
 
 #[path = "../crates/astrid-kernel/src/kernel_router/principal_scope.rs"]
 mod principal_scope;
+
+#[path = "../crates/astrid-storage/src/principal_directory/binding.rs"]
+mod principal_binding;

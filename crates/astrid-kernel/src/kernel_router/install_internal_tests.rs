@@ -10,6 +10,7 @@ async fn installs_without_env_changes_keep_the_publication_fence() {
     let kernel =
         crate::test_kernel_with_home(astrid_core::dirs::AstridHome::from_path(root.path())).await;
     let principal = PrincipalId::default();
+    let uid = kernel.principal_directory.uid_for(&principal).unwrap();
     let source = root.path().join("fixture");
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(
@@ -22,19 +23,35 @@ async fn installs_without_env_changes_keep_the_publication_fence() {
         value: "unchanged".into(),
         kind: EnvValueKind::Text,
     }];
-    let first = stage_env_values(&kernel, &principal, &source, None, &values)
+    let stale_uid = astrid_core::PrincipalUid::from_bytes([0x6c; 32]);
+    assert!(
+        matches!(stage_env_values(&kernel, &principal, stale_uid, &source, None, &values).await,
+        Err(error) if error.contains("changed owners"))
+    );
+    assert!(
+        kernel
+            .kv
+            .get(
+                &env_namespace(uid, "fixture", EnvValueKind::Text, EnvStorageScope::Agent),
+                &env_storage_key(&values[0])
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let first = stage_env_values(&kernel, &principal, uid, &source, None, &values)
         .await
         .unwrap();
     drop(first); // Successful publication keeps the staged value.
     for values in [&[][..], values.as_slice()] {
-        let transaction = stage_env_values(&kernel, &principal, &source, None, values)
+        let transaction = stage_env_values(&kernel, &principal, uid, &source, None, values)
             .await
             .unwrap()
             .expect("even a no-op environment must fence package publication");
         assert!(transaction.snapshots.is_empty());
         assert!(kernel.env_install_fence.try_write().is_err());
         assert!(
-            stage_env_values(&kernel, &principal, &source, None, values)
+            stage_env_values(&kernel, &principal, uid, &source, None, values)
                 .await
                 .is_err()
         );
@@ -66,15 +83,15 @@ async fn overlapping_failed_installs_cannot_restore_another_staged_value() {
             value: "first-staged".into(),
             kind,
         }];
-        let first = stage_env_values(&kernel, &principal, &source, None, &values)
+        let first = stage_env_values(&kernel, &principal, uid, &source, None, &values)
             .await
             .unwrap()
             .unwrap();
         values[0].value = "second-staged".into();
-        let overlap = stage_env_values(&kernel, &principal, &source, None, &values).await;
+        let overlap = stage_env_values(&kernel, &principal, uid, &source, None, &values).await;
         assert!(matches!(overlap, Err(error) if error.contains("retry the install")));
         first.rollback(&kernel).await;
-        let second = stage_env_values(&kernel, &principal, &source, None, &values)
+        let second = stage_env_values(&kernel, &principal, uid, &source, None, &values)
             .await
             .unwrap()
             .unwrap();
@@ -131,7 +148,7 @@ async fn rollback_restores_other_keys_after_concurrent_set_and_delete() {
                 .await
                 .unwrap();
         }
-        let transaction = stage_env_values(&kernel, &principal, &source, None, &values)
+        let transaction = stage_env_values(&kernel, &principal, uid, &source, None, &values)
             .await
             .unwrap()
             .unwrap();
@@ -189,6 +206,7 @@ async fn conditional_defaults_retry_after_failed_install_rollback() {
         crate::test_kernel_with_home(astrid_core::dirs::AstridHome::from_path(root.path())).await;
     seed_operator(&kernel).await;
     let principal = PrincipalId::default();
+    let uid = kernel.principal_directory.uid_for(&principal).unwrap();
     let source = root.path().join("fixture");
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(
@@ -213,7 +231,7 @@ async fn conditional_defaults_retry_after_failed_install_rollback() {
             value: "temporary".into(),
             kind,
         }];
-        let transaction = stage_env_values(&kernel, &principal, &source, None, &values)
+        let transaction = stage_env_values(&kernel, &principal, uid, &source, None, &values)
             .await
             .unwrap()
             .unwrap();
@@ -233,7 +251,6 @@ async fn conditional_defaults_retry_after_failed_install_rollback() {
         assert!(
             matches!(response, AdminResponseBody::Success(value) if value == serde_json::json!({}))
         );
-        let uid = kernel.principal_directory.uid_for(&principal).unwrap();
         let namespace = env_namespace(uid, "fixture", kind, EnvStorageScope::Agent);
         assert_eq!(
             kernel
@@ -314,7 +331,7 @@ async fn install_env_transaction_restores_existing_text_and_secret_values() {
             kind: EnvValueKind::Secret,
         },
     ];
-    let transaction = stage_env_values(&kernel, &principal, &source, None, &values)
+    let transaction = stage_env_values(&kernel, &principal, uid, &source, None, &values)
         .await
         .unwrap()
         .unwrap();
@@ -409,7 +426,7 @@ async fn env_rollback_does_not_clobber_a_concurrent_edit() {
             kind: EnvValueKind::Secret,
         },
     ];
-    let transaction = stage_env_values(&kernel, &principal, &source, None, &values)
+    let transaction = stage_env_values(&kernel, &principal, uid, &source, None, &values)
         .await
         .unwrap()
         .unwrap();
@@ -510,12 +527,12 @@ async fn install_secret_is_staged_in_system_secret_namespace() {
             kind: EnvValueKind::Secret,
         },
     ];
-    stage_env_values(&kernel, &principal, &source, None, &values)
+    let uid = kernel.principal_directory.uid_for(&principal).unwrap();
+    stage_env_values(&kernel, &principal, uid, &source, None, &values)
         .await
         .unwrap()
         .unwrap();
 
-    let uid = kernel.principal_directory.uid_for(&principal).unwrap();
     let shared_secret = kernel
         .kv
         .get(
