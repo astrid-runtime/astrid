@@ -78,7 +78,7 @@ enum CallbackResponse {
 /// In-memory authority fixed when a native filesystem lease is issued.
 pub(crate) struct StorageMountLeaseState {
     mount_id: StorageMountId,
-    requested_by: PrincipalId,
+    requester_uid: Option<astrid_core::PrincipalUid>,
     owner: StateOwner,
     view: StorageProviderViewV1,
     target: StorageFilesystemTargetV1,
@@ -123,8 +123,11 @@ struct MutationTestGate {
 }
 
 impl StorageMountLeaseState {
-    fn is_owned_by(&self, caller: &PrincipalId) -> bool {
-        &self.requested_by == caller
+    fn is_owned_by(&self, caller: Option<astrid_core::PrincipalUid>) -> bool {
+        lease_authority::same_requester(
+            self.requester_uid.map(|uid| *uid.as_bytes()),
+            caller.map(|uid| *uid.as_bytes()),
+        )
     }
 
     fn is_live(&self) -> bool {
@@ -199,7 +202,34 @@ async fn issue_bound_lease(
     if !mountpoint.is_absolute() {
         return Err("native storage mountpoint must be absolute".to_owned());
     }
-    let (owner, target) = resolve_owner(kernel, &caller, authority, &view, target).await?;
+    let allow_cross_owner = matches!(
+        authority,
+        LeaseAuthority::Management {
+            allow_cross_owner: true
+        }
+    );
+    let requester_uid = match authority {
+        LeaseAuthority::Process(uid) => Some(
+            kernel
+                .principal_directory
+                .bound_uid(&caller, Some(uid))
+                .map_err(|_| "process projection owner changed".to_owned())?,
+        ),
+        LeaseAuthority::Management { .. } => match kernel.principal_directory.uid_for(&caller) {
+            Ok(uid) => Some(uid),
+            Err(_) if allow_cross_owner => None,
+            Err(error) => return Err(format!("resolve storage lease requester: {error}")),
+        },
+    };
+    let (owner, target) = resolve_owner(
+        kernel,
+        &caller,
+        requester_uid,
+        allow_cross_owner,
+        &view,
+        target,
+    )
+    .await?;
     let mount_id = StorageMountId::new();
     #[cfg(unix)]
     let resource_path = private_mount_resource_path(mount_id)?;
@@ -225,7 +255,7 @@ async fn issue_bound_lease(
         .map_err(|error| format!("create private mount resource: {error}"))?;
     let state = Arc::new(StorageMountLeaseState {
         mount_id,
-        requested_by: caller,
+        requester_uid,
         owner,
         view,
         target,
@@ -382,7 +412,7 @@ fn lookup_lease(
     else {
         return Ok(None);
     };
-    if !state.is_owned_by(caller) && !allow_cross_owner {
+    if !allow_cross_owner && !state.is_owned_by(kernel.principal_directory.uid_for(caller).ok()) {
         return Err("storage mount lease belongs to another principal".to_owned());
     }
     Ok(Some(state))

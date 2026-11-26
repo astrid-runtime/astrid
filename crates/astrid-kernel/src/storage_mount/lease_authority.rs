@@ -1,5 +1,8 @@
 //! Resolve mount lease authority and its immutable storage target.
 
+mod requester;
+pub(super) use requester::same_requester;
+
 use super::{
     FilesystemPath, Kernel, PrincipalId, StateOwner, StorageFilesystemTargetV1,
     StorageProviderViewV1, WorkspaceBranchStore,
@@ -14,25 +17,14 @@ pub(super) enum LeaseAuthority {
 pub(super) async fn resolve_owner(
     kernel: &Kernel,
     caller: &PrincipalId,
-    authority: LeaseAuthority,
+    requester_uid: Option<astrid_core::PrincipalUid>,
+    allow_cross_owner: bool,
     view: &StorageProviderViewV1,
     target: StorageFilesystemTargetV1,
 ) -> Result<(StateOwner, StorageFilesystemTargetV1), String> {
-    let allow_cross_owner = matches!(
-        authority,
-        LeaseAuthority::Management {
-            allow_cross_owner: true
-        }
-    );
-    let caller_uid = || match authority {
-        LeaseAuthority::Process(expected) => kernel
-            .principal_directory
-            .bound_uid(caller, Some(expected))
-            .map_err(|_| "process projection owner changed".to_owned()),
-        LeaseAuthority::Management { .. } => kernel
-            .principal_directory
-            .uid_for(caller)
-            .map_err(|error| error.to_string()),
+    let caller_uid = || {
+        requester_uid
+            .ok_or_else(|| format!("principal `{caller}` has no immutable storage identity"))
     };
     let owner = match view {
         StorageProviderViewV1::Principal(principal) => {

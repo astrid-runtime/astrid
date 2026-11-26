@@ -1617,3 +1617,54 @@ async fn internal_workspace_branch_lease_fixes_branch_target() {
         None
     );
 }
+
+#[tokio::test]
+async fn lease_management_follows_the_requester_uid_through_alias_reassignment() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
+    let kernel = crate::test_kernel_with_home(home).await;
+    let alias = PrincipalId::default();
+    let uid = kernel.principal_directory.uid_for(&alias).unwrap();
+    let lease = issue_lease(
+        &kernel,
+        alias.clone(),
+        false,
+        StorageProviderViewV1::Principal(alias.clone()),
+        StorageFilesystemTargetV1::OwnerRoot,
+        StorageProviderAccessV1::ReadWrite,
+        "requester-test".to_owned(),
+        temporary.path().join("mount"),
+    )
+    .await
+    .unwrap();
+    let renamed = PrincipalId::new("renamed-requester").unwrap();
+    kernel
+        .principal_directory
+        .rename(uid, &alias, renamed.clone())
+        .unwrap();
+    kernel
+        .principal_directory
+        .register(
+            alias.clone(),
+            astrid_core::PrincipalUid::from_bytes([0x42; 32]),
+        )
+        .unwrap();
+
+    assert!(lease_status(&kernel, &alias, false, lease.mount_id).is_err());
+    assert!(
+        sync_lease(&kernel, &alias, false, lease.mount_id)
+            .await
+            .is_err()
+    );
+    assert!(
+        revoke_lease(&kernel, &alias, false, lease.mount_id)
+            .await
+            .is_err()
+    );
+    assert!(lease_status(&kernel, &renamed, false, lease.mount_id).is_ok());
+    assert!(lease_status(&kernel, &alias, true, lease.mount_id).is_ok());
+    revoke_lease(&kernel, &renamed, false, lease.mount_id)
+        .await
+        .unwrap();
+    assert!(kernel.storage_mounts.is_empty());
+}

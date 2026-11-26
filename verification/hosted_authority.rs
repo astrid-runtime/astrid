@@ -1,5 +1,8 @@
 // Verus entry point for transitions used by hosted Astrid.
 
+#[path = "../crates/astrid-kernel/src/storage_mount/lease_authority/requester.rs"]
+mod storage_lease_requester;
+
 #[path = "../crates/astrid-capsule/src/engine/wasm/invocation_owner/admission.rs"]
 mod invocation_owner_admission;
 
