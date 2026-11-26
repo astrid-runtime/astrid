@@ -1,5 +1,5 @@
 //! Select the system administration projection only for writes on the system root.
-use super::callback::{OperationClass, access_class, operation_class};
+use super::callback::{OperationClass, operation_class};
 use astrid_core::storage_filesystem::StorageFilesystemOperationV1 as Operation;
 use super::subtree::{BoundSubtree, Owner};
 use vstd::prelude::*;
@@ -22,7 +22,7 @@ impl<P, F, W> Target<P,F,W> {
     pub(crate) fn backend(self, operation: &Operation) -> (result: Backend<P,F,W>)
         ensures
             (result is SystemProjection) ==
-                ((self matches Self::OwnerRoot(Owner::System)) && access_class(*operation) == OperationClass::Write),
+                ((self matches Self::OwnerRoot(Owner::System)) && super::callback::access_class(*operation) == OperationClass::Write),
             result matches Backend::Filesystem(target) ==> target == self,
     {
         match (&self, operation_class(operation)) {
