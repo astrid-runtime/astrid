@@ -485,3 +485,96 @@ async fn quiescence_wait_registers_before_sampling_active_operations() {
         .expect("registered notification must wake quiescence")
         .expect("quiescence task should join");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identity_creation_holds_principal_admission_through_storage() {
+    use crate::engine::wasm::bindings::astrid::identity::host::{
+        ErrorCode, Host, IdentityCreateUserRequest, IdentityLinkRequest, IdentityResolveRequest,
+        IdentityUnlinkRequest,
+    };
+    use astrid_storage::{IdentityStore, KvIdentityStore, MemoryKvStore, ScopedKvStore};
+    use std::time::Duration;
+
+    let tracker = Arc::new(PrincipalInvocationTracker::default());
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    let release = Arc::new(tokio::sync::Barrier::new(2));
+    let backend = Arc::new(BlockingSetStore {
+        inner: MemoryKvStore::new(),
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    });
+    let identities = Arc::new(KvIdentityStore::new(
+        ScopedKvStore::new(backend, "system:identity").unwrap(),
+    ));
+    let principal = alice();
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.caller_context = Some(msg_from(&principal));
+    state.identity_store = Some(identities.clone());
+    state.security = Some(Arc::new(crate::security::AllowAllGate));
+    state.principal_invocations = Some(Arc::clone(&tracker));
+    assert!(install_principal_overlays_sync(
+        &mut state,
+        Some(&principal)
+    ));
+
+    let request = || IdentityCreateUserRequest { display_name: None };
+    let operation = tokio::spawn(async move {
+        let result = state.identity_create_user(request());
+        (state, result)
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.wait())
+        .await
+        .unwrap();
+    tracker.retire(&principal);
+    let drain = tracker.wait_for_quiescence(&principal);
+    tokio::pin!(drain);
+    let was_pending =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(drain.as_mut().poll(cx).is_pending()))
+            .await;
+    release.wait().await;
+    let (mut state, created) = operation.await.unwrap();
+    if was_pending {
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .unwrap();
+    }
+    assert!(
+        was_pending,
+        "retirement must include the blocked identity write"
+    );
+    let user = uuid::Uuid::parse_str(&created.unwrap().user_id).unwrap();
+    assert!(identities.get_user(user).await.unwrap().is_some());
+    assert!(matches!(
+        state.identity_create_user(request()),
+        Err(ErrorCode::CapabilityDenied)
+    ));
+    let platform = "test-platform";
+    let user_key = "test-user";
+    assert!(matches!(
+        state.identity_resolve(IdentityResolveRequest {
+            platform: platform.into(),
+            platform_user_id: user_key.into(),
+        }),
+        Err(ErrorCode::CapabilityDenied)
+    ));
+    assert!(matches!(
+        state.identity_link(IdentityLinkRequest {
+            platform: platform.into(),
+            platform_user_id: user_key.into(),
+            astrid_user_id: user.to_string(),
+            method: "test".into(),
+        }),
+        Err(ErrorCode::CapabilityDenied)
+    ));
+    assert!(matches!(
+        state.identity_unlink(IdentityUnlinkRequest {
+            platform: platform.into(),
+            platform_user_id: user_key.into(),
+        }),
+        Err(ErrorCode::CapabilityDenied)
+    ));
+    assert!(matches!(
+        state.identity_list_links(user.to_string()),
+        Err(ErrorCode::CapabilityDenied)
+    ));
+}
