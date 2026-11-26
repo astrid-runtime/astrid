@@ -2899,53 +2899,6 @@ impl Kernel {
         }
     }
 
-    /// Reload a single capsule by id without a daemon restart.
-    ///
-    /// If the capsule is already registered, [`Self::restart_capsule`] re-reads
-    /// its source directory — picking up the new content-addressed bytes a
-    /// reinstall wrote (a live upgrade / hot-swap). If it isn't registered yet,
-    /// the currently-installed set is discovered and loaded (a fresh add;
-    /// already-loaded capsules are skipped by `load_capsule`'s guard). Either
-    /// way `astrid.v1.capsules_loaded` is published so the tool surface
-    /// refreshes. Backs [`astrid_core::kernel_api::KernelRequest::ReloadCapsule`].
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    pub(crate) async fn reload_one_capsule(
-        &self,
-        id: &astrid_capsule_types::CapsuleId,
-        principal: &PrincipalId,
-    ) -> Result<(), anyhow::Error> {
-        let view_guard = self.lock_capsule_view(principal, id).await;
-        let registered = { self.capsules.read().await.get_for(principal, id).is_some() };
-        if registered {
-            if self.capabilities.is_principal_retiring(principal).await {
-                anyhow::bail!("cannot reload capsule '{id}' for retiring principal '{principal}'");
-            }
-            self.restart_capsule(id, principal, None).await?;
-            self.publish_capsules_loaded().await;
-        } else {
-            drop(view_guard);
-            // Build or refresh this principal's view from its installed set.
-            self.ensure_principal_loaded(principal).await;
-            if self.capsules.read().await.get_for(principal, id).is_none()
-                && let Some((_, dir)) = self
-                    .sorted_principal_capsules(principal)
-                    .into_iter()
-                    .find(|(manifest, _)| manifest.package.name == id.as_str())
-            {
-                self.load_capsule(dir, principal)
-                    .await
-                    .map_err(|error| anyhow::anyhow!("capsule '{id}' failed to load: {error:#}"))?;
-            }
-            if self.capsules.read().await.get_for(principal, id).is_none() {
-                return Err(anyhow::anyhow!(
-                    "capsule '{id}' was not found in the install directories or failed to load"
-                ));
-            }
-            self.publish_capsules_loaded().await;
-        }
-        Ok(())
-    }
-
     /// Remove every capsule view owned by `principal` before that principal's
     /// persistent state is reclaimed.
     ///
@@ -5563,6 +5516,39 @@ mod tests {
             kernel.capsule_view_locks.is_empty(),
             "the final guard must evict its exact dead weak entry"
         );
+    }
+
+    #[tokio::test]
+    async fn queued_install_reload_rechecks_owner_before_discovery() {
+        let (_dir, home) = scratch_home();
+        let kernel = test_kernel_with_home(home).await;
+        let principal = PrincipalId::new("queued-owner").unwrap();
+        let original = astrid_core::PrincipalUid::from_bytes([1; 32]);
+        let other = astrid_core::PrincipalUid::from_bytes([2; 32]);
+        let directory = &kernel.principal_directory;
+        directory.register(principal.clone(), original).unwrap();
+        let id = CapsuleId::new("queued-capsule").unwrap();
+        let guard = kernel.lock_capsule_view(&principal, &id).await;
+        let reload = kernel.reload_capsule_for_owner(&id, &principal, Some(original));
+        tokio::pin!(reload);
+        tokio::select! {
+            biased;
+            result = &mut reload => panic!("reload must wait for the view lock: {result:?}"),
+            () = std::future::ready(()) => {},
+        }
+        directory
+            .rename(
+                original,
+                &principal,
+                PrincipalId::new("moved-owner").unwrap(),
+            )
+            .unwrap();
+        directory.register(principal.clone(), other).unwrap();
+        drop(guard);
+        let error = reload
+            .await
+            .expect_err("queued reload must reject alias reassignment");
+        assert!(error.to_string().contains("changed owners"), "{error}");
     }
 
     #[tokio::test]

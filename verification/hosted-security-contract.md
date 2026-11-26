@@ -68,8 +68,14 @@ Install activation uses the validated capsule ID returned by the installer. The
 install audit takes that same ID and the hash of the receipt-checked manifest
 bytes from the install result.
 
-Live activation rechecks the binding before it dispatches reload by alias.
-That check leaves concurrent alias changes during reload open. Ordering with
+Install reload rechecks the admitted UID after acquiring the capsule view lock.
+For an existing principal runtime it compares that UID to the runtime scope,
+passes the observed generation into restart, and reports a superseded generation
+as a failed reload. Verus checks the production generation allocator: a successful
+reservation returns the previous counter and advances it by one. At exhaustion
+the counter remains unchanged and reservation fails. This covers a single
+registry lifetime. Fresh discovery, singleton views and alias changes before
+final publication still need end-to-end binding. Ordering with
 retirement, authenticated request admission and durable commit still needs a
 proof across the full operation.
 

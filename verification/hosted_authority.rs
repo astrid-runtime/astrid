@@ -35,3 +35,6 @@ mod principal_binding;
 
 #[path = "../crates/astrid-kernel/src/capsule_materialization/cache_address.rs"]
 mod cache_address;
+
+#[path = "../crates/astrid-capsule/src/registry/generation.rs"]
+mod runtime_generation;

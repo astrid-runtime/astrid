@@ -4,6 +4,76 @@ use super::{Kernel, RestartOutcome, capsule_audit, unload_replaced_runtime};
 use astrid_core::PrincipalId;
 
 impl Kernel {
+    /// Reload a single capsule by id without a daemon restart.
+    ///
+    /// If the capsule is already registered, [`Self::restart_capsule`] re-reads
+    /// its source directory — picking up the new content-addressed bytes a
+    /// reinstall wrote (a live upgrade / hot-swap). If it isn't registered yet,
+    /// the currently-installed set is discovered and loaded (a fresh add;
+    /// already-loaded capsules are skipped by `load_capsule`'s guard). Either
+    /// way `astrid.v1.capsules_loaded` is published so the tool surface
+    /// refreshes. Backs [`astrid_core::kernel_api::KernelRequest::ReloadCapsule`].
+    pub(crate) async fn reload_one_capsule(
+        &self,
+        id: &astrid_capsule_types::CapsuleId,
+        principal: &PrincipalId,
+    ) -> Result<(), anyhow::Error> {
+        self.reload_capsule_for_owner(id, principal, None).await
+    }
+
+    pub(crate) async fn reload_capsule_for_owner(
+        &self,
+        id: &astrid_capsule_types::CapsuleId,
+        principal: &PrincipalId,
+        admitted_uid: Option<astrid_core::PrincipalUid>,
+    ) -> Result<(), anyhow::Error> {
+        let view_guard = self.lock_capsule_view(principal, id).await;
+        let registered = self.capsules.read().await.runtime_id_for(principal, id);
+        if let Some(expected) = admitted_uid {
+            self.principal_directory
+                .bound_uid(principal, Some(expected))?;
+        }
+        if let Some(runtime) = registered {
+            if let (Some(expected), astrid_capsule::registry::RuntimeScope::Principal(actual)) =
+                (admitted_uid, runtime.key().scope())
+                && actual != expected
+            {
+                anyhow::bail!("capsule '{id}' belongs to a different principal UID");
+            }
+            if self.capabilities.is_principal_retiring(principal).await {
+                anyhow::bail!("cannot reload capsule '{id}' for retiring principal '{principal}'");
+            }
+            match self.restart_capsule(id, principal, Some(&runtime)).await? {
+                RestartOutcome::Clean | RestartOutcome::OldInstanceLingering => {},
+                RestartOutcome::Superseded => {
+                    anyhow::bail!("capsule '{id}' changed generation during reload")
+                },
+            }
+            self.publish_capsules_loaded().await;
+        } else {
+            drop(view_guard);
+            // Build or refresh this principal's view from its installed set.
+            self.ensure_principal_loaded(principal).await;
+            if self.capsules.read().await.get_for(principal, id).is_none()
+                && let Some((_, dir)) = self
+                    .sorted_principal_capsules(principal)
+                    .into_iter()
+                    .find(|(manifest, _)| manifest.package.name == id.as_str())
+            {
+                self.load_capsule(dir, principal)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("capsule '{id}' failed to load: {error:#}"))?;
+            }
+            if self.capsules.read().await.get_for(principal, id).is_none() {
+                return Err(anyhow::anyhow!(
+                    "capsule '{id}' was not found in the install directories or failed to load"
+                ));
+            }
+            self.publish_capsules_loaded().await;
+        }
+        Ok(())
+    }
+
     /// Restart the exact runtime generation visible to `principal`. Principal
     /// failures affect only that immutable UID. A `SystemResident` failure
     /// rebuilds its explicit singleton and restores its dependent views.

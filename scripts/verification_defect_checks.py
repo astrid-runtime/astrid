@@ -32,7 +32,9 @@ OVERLAY_UPDATE = Path("crates/astrid-storage/src/kv/tree/overlay/update.rs")
 PRINCIPAL_SCOPE = Path("crates/astrid-kernel/src/kernel_router/principal_scope.rs")
 BINDING = Path("crates/astrid-storage/src/principal_directory/binding.rs")
 CACHE_ADDRESS = Path("crates/astrid-kernel/src/capsule_materialization/cache_address.rs")
+GENERATION = Path("crates/astrid-capsule/src/registry/generation.rs")
 INPUTS = [
+    GENERATION,
     CACHE_ADDRESS,
     BINDING,
     PRINCIPAL_SCOPE,
@@ -120,6 +122,16 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
         for item in PROOF_ITEMS
     ]
     return [
+        (
+            "registry reuses the same generation",
+            GENERATION,
+            lambda text: replace_once(text, "*next = successor;", "*next = current;"),
+        ),
+        (
+            "registry returns the successor instead of the reserved generation",
+            GENERATION,
+            lambda text: replace_once(text, "Some(current)", "Some(successor)"),
+        ),
         (
             "cache repair accepts a different owner",
             CACHE_ADDRESS,

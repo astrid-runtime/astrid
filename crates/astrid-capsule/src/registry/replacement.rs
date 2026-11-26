@@ -199,10 +199,10 @@ impl CapsuleRegistry {
         artifact: WasmHash,
         scope: RuntimeScope,
     ) -> CapsuleResult<RuntimeId> {
-        let generation = self.next_generation;
-        self.next_generation = self.next_generation.checked_add(1).ok_or_else(|| {
-            CapsuleError::ExecutionFailed("capsule runtime generation space exhausted".into())
-        })?;
+        let generation =
+            super::generation::reserve(&mut self.next_generation).ok_or_else(|| {
+                CapsuleError::ExecutionFailed("capsule runtime generation space exhausted".into())
+            })?;
         Ok(RuntimeId {
             key: RuntimeKey::new(id, artifact, scope),
             generation,

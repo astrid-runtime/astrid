@@ -719,11 +719,7 @@ async fn activate_installed_capsule(
     id: &astrid_capsule_types::CapsuleId,
 ) -> Result<(), String> {
     kernel
-        .principal_directory
-        .bound_uid(target, Some(admitted_uid))
-        .map_err(|error| format!("validate capsule activation owner: {error}"))?;
-    kernel
-        .reload_one_capsule(id, target)
+        .reload_capsule_for_owner(id, target, Some(admitted_uid))
         .await
         .map_err(|error| format!("capsule installed on disk but live activation failed: {error:#}"))
 }
