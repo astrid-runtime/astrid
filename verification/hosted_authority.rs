@@ -3,6 +3,9 @@
 #[path = "../crates/astrid-kernel/src/kernel_router/admin/pair_issue_result.rs"]
 mod pair_issue_result;
 
+#[path = "../crates/astrid-capsule/src/engine/wasm/storage_file.rs"]
+mod storage_file;
+
 #[path = "../crates/astrid-capsule/src/engine/wasm/mount_selection.rs"]
 mod mount_selection;
 

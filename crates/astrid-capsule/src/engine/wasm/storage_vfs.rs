@@ -10,6 +10,7 @@
 
 #![cfg(not(target_family = "wasm"))]
 
+use super::storage_file::{OpenFile, WriteRange};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -141,19 +142,11 @@ impl StorageBackend for WorkspaceBackend {
     }
 }
 
-struct OpenFile {
-    path: FilesystemPath,
-    bytes: Vec<u8>,
-    offset: usize,
-    writable: bool,
-    dirty: bool,
-}
-
 /// A principal-owned VFS view over `AstridFilesystem`.
 pub(crate) struct AstridStorageVfs {
     filesystem: Box<dyn StorageBackend>,
     open_dirs: RwLock<HashMap<DirHandle, FilesystemPath>>,
-    open_files: RwLock<HashMap<FileHandle, Arc<Mutex<OpenFile>>>>,
+    open_files: RwLock<HashMap<FileHandle, Arc<Mutex<OpenFile<FilesystemPath>>>>>,
 }
 
 impl AstridStorageVfs {
@@ -448,13 +441,7 @@ impl Vfs for AstridStorageVfs {
         let new_handle = FileHandle::new();
         self.open_files.write().await.insert(
             new_handle.clone(),
-            Arc::new(Mutex::new(OpenFile {
-                path,
-                bytes,
-                offset: 0,
-                writable: write,
-                dirty,
-            })),
+            Arc::new(Mutex::new(OpenFile::new(path, bytes, write, dirty))),
         );
         Ok(new_handle)
     }
@@ -506,15 +493,17 @@ impl Vfs for AstridStorageVfs {
             .cloned()
             .ok_or(VfsError::InvalidHandle)?;
         let mut file = file.lock().await;
-        if !file.writable {
-            return Err(VfsError::PermissionDenied(
-                "file was not opened for writing".to_owned(),
-            ));
-        }
-        let end = file
-            .offset
-            .checked_add(content.len())
-            .ok_or_else(|| VfsError::PermissionDenied("file is too large".to_owned()))?;
+        let end = match file.write_range(content.len()) {
+            WriteRange::End(end) => end,
+            WriteRange::ReadOnly => {
+                return Err(VfsError::PermissionDenied(
+                    "file was not opened for writing".to_owned(),
+                ));
+            },
+            WriteRange::Overflow => {
+                return Err(VfsError::PermissionDenied("file is too large".to_owned()));
+            },
+        };
         if end > file.bytes.len() {
             file.bytes.resize(end, 0);
         }
@@ -533,9 +522,9 @@ impl Vfs for AstridStorageVfs {
             .remove(handle)
             .ok_or(VfsError::InvalidHandle)?;
         let file = file.lock().await;
-        if file.writable && file.dirty {
+        if let Some((path, bytes)) = file.publication() {
             self.filesystem
-                .write(&file.path, &file.bytes)
+                .write(path, bytes)
                 .map_err(map_filesystem_error)?;
         }
         Ok(())

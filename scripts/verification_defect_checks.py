@@ -54,9 +54,11 @@ REGISTERED_BEARER = Path("crates/astrid-core/src/session_token/registered_bearer
 PRIVATE_RESPONDER = Path("crates/astrid-capsule/src/elicitation/responder.rs")
 PAIR_DENIES = Path("crates/astrid-kernel/src/kernel_router/admin/pair_device_handlers/deny_patterns.rs")
 RECEIPT = Path("crates/astrid-kernel/src/kernel_router/resume_receipt/validation.rs")
+STORAGE_FILE = Path("crates/astrid-capsule/src/engine/wasm/storage_file.rs")
 MOUNT = Path("crates/astrid-capsule/src/engine/wasm/mount_selection.rs")
 PAIR_RESULT = Path("crates/astrid-kernel/src/kernel_router/admin/pair_issue_result.rs")
 INPUTS = [
+    STORAGE_FILE,
     PAIR_RESULT,
     MOUNT,
     RECEIPT,
@@ -262,6 +264,16 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "receipt acknowledgement accepts equal length but different bytes",
             RECEIPT,
             lambda text: replace_once(text, "Some(bytes) => bytes == expected", "Some(bytes) => bytes.len() == expected.len()"),
+        ),
+        (
+            "a dirty storage handle publishes without write authority",
+            STORAGE_FILE,
+            lambda text: replace_once(text, "if self.writable && self.dirty { Some", "if self.dirty { Some"),
+        ),
+        (
+            "a buffered storage write ignores its open offset",
+            STORAGE_FILE,
+            lambda text: replace_once(text, "Some(end) => WriteRange::End(end)", "Some(end) => WriteRange::End(length)"),
         ),
         (
             "mount selection discards the invocation override",

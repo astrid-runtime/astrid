@@ -83,6 +83,8 @@ mod lifecycle_cpu_tests;
 pub mod limits;
 mod pool;
 mod readiness;
+#[cfg(not(target_family = "wasm"))]
+mod storage_file;
 mod storage_vfs;
 #[cfg(test)]
 mod test_fixtures;

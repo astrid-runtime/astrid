@@ -94,6 +94,21 @@ canonicalization, symlink changes, the relationship between the path checked
 by the manifest gate and the file opened by the VFS, installation of a mount
 under the correct owner, and refinement of backend completion and cancellation remain open.
 
+### Storage-backed file publication
+
+For the owner-backed home and workspace-branch adapters, the checked
+`OpenFile` constructor keeps the resolved destination, initial bytes and
+open mode. Write admission rejects read-only handles and offset overflow.
+On close, the checked publication decision yields the original path and
+the complete current buffer exactly when the handle is writable and dirty.
+The adapter removes the handle from its table and calls its bound backend
+with that path and buffer while holding the file lock. Six adapter tests
+exercise storage, including independent owner views and last-close-wins.
+
+The proof assumes handle lookup returned the intended file. Correct path
+composition, handle-table interleavings, buffer updates, backend ownership
+and durable publication still require refinement.
+
 ## Guest key-value storage
 
 All seven operations in `astrid:kv/host@1.0.0` enter through `impl kv::Host for HostState` in `crates/astrid-capsule/src/engine/wasm/host/kv.rs`. Get, set, delete and compare-and-swap take a key. List, paginated list and clear take a prefix. Both list operations call the same backend prefix listing. The cursor and limit select a page after that listing returns.
