@@ -41,7 +41,7 @@ impl Requester {
 impl StorageMountLeaseState {
     pub(super) fn is_owned_by(&self, caller: Option<astrid_core::PrincipalUid>) -> bool {
         super::lease_authority::same_requester(
-            self.requester.uid().map(|uid| *uid.as_bytes()),
+            self.issued.scope.requester.uid().map(|uid| *uid.as_bytes()),
             caller.map(|uid| *uid.as_bytes()),
         )
     }
@@ -137,7 +137,7 @@ impl<'a> Issue<'a> {
         self.publish(|| {
             kernel
                 .storage_mounts
-                .insert(state.mount_id, Arc::clone(state));
+                .insert(state.issued.scope.id, Arc::clone(state));
         })
     }
 
@@ -176,7 +176,7 @@ pub(crate) async fn retire_requester(
         }
         let mut retired = Vec::new();
         for lease in kernel.storage_mounts.iter() {
-            if lease.requester.retiring(alias, uid) {
+            if lease.issued.scope.requester.retiring(alias, uid) {
                 lease.revoked.store(true, Ordering::Release);
                 let _ = lease.shutdown_tx.send(true);
                 retired.push(Arc::clone(lease.value()));
@@ -189,7 +189,7 @@ pub(crate) async fn retire_requester(
     }
     let _drain = kernel.storage_mount_mutations.lock().await;
     for state in retired {
-        kernel.storage_mounts.remove(&state.mount_id);
+        kernel.storage_mounts.remove(&state.issued.scope.id);
         cleanup_resource(&state.resource_path, &state.callback_path);
     }
 }

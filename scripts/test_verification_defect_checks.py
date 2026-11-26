@@ -78,9 +78,13 @@ class Results(unittest.TestCase):
         self.assertIsNone(checks.verified_counts("error[E0063]: missing field"))
 
     def test_locates_an_error_by_file_name(self) -> None:
-        output = "error: assertion failed\n   --> verification/../crates/x/store/authority.rs:131:13\n"
+        output = "error: assertion failed\n   --> verification/../crates/astrid-capabilities/src/store/authority.rs:131:13\n"
         self.assertTrue(checks.error_in(output, checks.AUTHORITY))
         self.assertFalse(checks.error_in(output, checks.MODEL))
+
+    def test_same_basename_in_another_module_does_not_count(self) -> None:
+        output = "error: assertion failed\n   --> another/module/authority.rs:131:13\n"
+        self.assertFalse(checks.error_in(output, checks.AUTHORITY))
 
     def test_ignores_locations_that_are_not_errors(self) -> None:
         output = "\n".join(
@@ -88,7 +92,7 @@ class Results(unittest.TestCase):
                 "note: automatically chose triggers for this expression:",
                 "   --> verification/hosted_authority_model.rs:449:5",
                 "error: assertion failed",
-                "   --> verification/../crates/x/store/authority.rs:131:13",
+                "   --> verification/../crates/astrid-capabilities/src/store/authority.rs:131:13",
             ]
         )
         self.assertFalse(checks.error_in(output, checks.MODEL))

@@ -7,6 +7,10 @@ use super::*;
 #[path = "cleanup_tests.rs"]
 mod cleanup_tests;
 
+#[cfg(unix)]
+#[path = "restart_tests.rs"]
+mod restart_tests;
+
 #[path = "runtime_tree_tests.rs"]
 mod runtime_tree_tests;
 
@@ -1339,7 +1343,6 @@ async fn revoke_drains_a_worker_after_its_waiter_is_cancelled() {
 }
 
 async fn dispatch_v1_operation(
-    kernel: &Kernel,
     state: &Arc<StorageMountLeaseState>,
     token: &str,
     operation: StorageFilesystemOperationV1,
@@ -1351,7 +1354,6 @@ async fn dispatch_v1_operation(
         operation,
     };
     match dispatch_request(
-        kernel,
         state,
         CallbackRequest {
             request,
@@ -1395,13 +1397,12 @@ fn start_worker(
 ) -> tokio::task::JoinHandle<StorageFilesystemOutcomeV1> {
     tokio::spawn(async move {
         if matches!(case, WorkerCase::CancelledAdminSync) {
-            sync_lease(&kernel, &caller, true, state.mount_id)
+            sync_lease(&kernel, &caller, true, state.issued.scope.id)
                 .await
                 .unwrap();
             return StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done);
         }
         dispatch_v1_operation(
-            &kernel,
             &state,
             &token,
             StorageFilesystemOperationV1::Write {
@@ -1491,13 +1492,8 @@ async fn check_worker_drain(case: WorkerCase) {
     assert_eq!(state.dirty.load(Ordering::Acquire), !sync);
     assert!(!kernel.storage_mounts.contains_key(&lease.mount_id));
     assert!(!lease.callback_path.exists());
-    let fenced = dispatch_v1_operation(
-        &kernel,
-        &state,
-        &lease.lease_token,
-        create("after-revoke.txt"),
-    )
-    .await;
+    let fenced =
+        dispatch_v1_operation(&state, &lease.lease_token, create("after-revoke.txt")).await;
     assert!(matches!(
         fenced,
         StorageFilesystemOutcomeV1::Failure(StorageFilesystemFailureV1 { code, .. })
@@ -1601,6 +1597,8 @@ async fn internal_workspace_branch_lease_fixes_branch_target() {
         .storage_mounts
         .get(&lease.mount_id)
         .expect("internal branch lease is registered")
+        .issued
+        .scope
         .target;
     assert!(matches!(
         target,

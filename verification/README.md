@@ -201,7 +201,9 @@ reservation counters, remain the unverified callers of these transitions.
 
 Run `python3 scripts/verification_defect_checks.py` with the pinned verifier on
 the path. It applies deliberate defects to a scratch copy and fails unless the
-verifier reports an error in the edited file for each. One defect puts a false
+verifier reports an error at the expected source path. Weakening a callback
+binding must fail in its trace consumer. Ordinary implementation mutations
+must fail in the edited file. One defect puts a false
 assertion at the start of every listed theorem, consumer and witness, which
 shows that body is checked. The others edit the production transitions, every
 bridge and the conditions of the proofs. Consumers derive reusable denial from

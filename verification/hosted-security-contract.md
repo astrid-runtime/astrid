@@ -572,11 +572,13 @@ Native mount callbacks decode a V1 operation directly or translate a V2 request
 to that operation. The checked callback gate consumes the decoded operation.
 A revoked lease or an observation after expiry yields a stale response. A live
 lease with a failed token comparison yields an unauthorized response. A write on a read-only lease yields a read-only response. On success, the gate
-issues a single-use value containing the original lease reference, decoded
-operation (including paths and write data), and access class. Verus checks
-that consuming this value returns the same three inputs. The executor takes
-its lease and operation exclusively through that value. These statements concern the
-clock, expiry, revocation and authentication values sampled by the adapter.
+issues a single-use value. Its checked destination binding borrows the target
+and backing from the issued lease. Both effect variants retain the lease.
+The Unix restart regression exits after a real callback without shutdown,
+reopens the same home, and checks old and fresh credentials against the
+replacement callback. The test observes kernel and local transport behavior on
+the tested platform. Admission still assumes the adapter's observations of
+revocation, expiry and token authenticity. Expiry also assumes a valid clock.
 The proof still needs the correspondence to a coherent concurrent observation,
 the V2 decoder, token hashing, backend execution and durable completion.
 
@@ -625,13 +627,20 @@ closes a reservation; a publication claim consumes it. A closed reservation
 cannot publish. The lease trace model represents preparation, publication,
 callback admission, explicit revoke, requester retirement and restart for one
 mount identity. Revocation, matching retirement and restart permanently close
-that identity in the model. The callback refinement uses the production liveness
+that identity in the model. A verified consumer takes a runtime phase equal to
+the trace prefix and proves the composed dispatcher returns no effect after
+closure, even for authenticated writable access. Establishing that phase
+relation under concurrency is a production refinement obligation.
+The callback refinement uses the production liveness
 and operation admission functions and preserves the supplied lease and operation.
-The executor consumes a checked destination choice. A volume query carries the
-backing home supplied at admission. Every filesystem operation carries the
-admitted lease, logical mount target, runtime home, operation and access class.
-The worker uses that target to select the storage interface. Correctness of the
-underlying filesystem and the host volume query remains a separate obligation.
+The callback executor consumes a checked destination choice from the issued
+lease. The scope fixes the mount ID, requester identity and logical target at
+issuance. The backing captures the principal store,
+runtime home and mutation lock at issue. Volume queries use that home.
+Filesystem operations preserve the issued target, lease, operation and access
+class. System-owner mutations call the admin projection against the captured
+runtime home. Correct selection and confinement of the concrete backend, host
+filesystem operations and worker completion require further refinement.
 
 The remaining proof must establish that publication, enumeration of affected
 leases, profile transitions, callback observations and worker completion refine

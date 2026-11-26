@@ -40,7 +40,9 @@ use crate::Kernel;
 
 mod admin_projection;
 mod lease_authority;
-use lease_authority::callback::{Admission, Admitted, Destinations, Effect, OperationClass, admit};
+use lease_authority::callback::{
+    Admission, Admitted, Destinations, Effect, Issued, OperationClass, admit,
+};
 use lease_authority::{
     LeaseAuthority, LeaseTarget, resolve_owner,
     subtree::{BoundSubtree, Subtree},
@@ -82,12 +84,22 @@ enum CallbackResponse {
     V2(StorageFilesystemResponseV2),
 }
 
+struct LeaseScope {
+    id: StorageMountId,
+    requester: Requester,
+    target: LeaseTarget,
+}
+
+struct MountBacking {
+    home: astrid_core::dirs::AstridHome,
+    store: Option<astrid_storage::RuntimePrincipalStore>,
+    mutations: Arc<tokio::sync::Mutex<()>>,
+}
+
 /// In-memory authority fixed when a native filesystem lease is issued.
 pub(crate) struct StorageMountLeaseState {
-    mount_id: StorageMountId,
-    requester: Requester,
     view: StorageProviderViewV1,
-    target: LeaseTarget,
+    issued: Issued<LeaseScope, MountBacking>,
     access: StorageProviderAccessV1,
     provider: String,
     mountpoint: PathBuf,
@@ -153,7 +165,7 @@ impl StorageMountLeaseState {
 
     fn public_lease(&self, token: String) -> StorageMountLeaseV1 {
         StorageMountLeaseV1 {
-            mount_id: self.mount_id,
+            mount_id: self.issued.scope.id,
             view: self.view.clone(),
             access: self.access,
             resource_path: self.resource_path.clone(),
@@ -242,10 +254,19 @@ async fn issue_bound_lease(
     astrid_core::platform_fs::ensure_private_directory(&resource_path)
         .map_err(|error| format!("create private mount resource: {error}"))?;
     let state = Arc::new(StorageMountLeaseState {
-        mount_id,
-        requester,
         view,
-        target,
+        issued: Issued {
+            scope: LeaseScope {
+                id: mount_id,
+                requester,
+                target,
+            },
+            backing: MountBacking {
+                home: kernel.astrid_home.clone(),
+                store: kernel.principal_store.clone(),
+                mutations: Arc::clone(&kernel.storage_mount_mutations),
+            },
+        },
         access,
         provider,
         mountpoint,
@@ -296,9 +317,9 @@ pub(crate) fn lease_status(
     let state = owned_lease(kernel, caller, allow_cross_owner, mount_id)?;
     state.renew();
     Ok(json!({
-        "mount_id": state.mount_id,
+        "mount_id": state.issued.scope.id,
         "view": state.view,
-        "target": state.target.wire(),
+        "target": state.issued.scope.target.wire(),
         "access": state.access,
         "provider": state.provider,
         "mountpoint": state.mountpoint,
@@ -324,11 +345,13 @@ pub(crate) async fn sync_lease(
     if !state.is_live() {
         return Err("storage mount lease is expired or revoked".to_owned());
     }
-    let store = kernel
-        .principal_store
+    let store = state
+        .issued
+        .backing
+        .store
         .clone()
         .ok_or_else(|| "native principal store is unavailable".to_owned())?;
-    let target = state.target;
+    let target = state.issued.scope.target;
     tokio::task::spawn_blocking(move || {
         let _guard = guard;
         #[cfg(test)]
@@ -432,7 +455,7 @@ async fn finish_revoke(kernel: &Kernel, state: Arc<StorageMountLeaseState>) -> R
     state.revoked.store(true, Ordering::Release);
     let _ = state.shutdown_tx.send(true);
     let _mutation_guard = kernel.storage_mount_mutations.lock().await;
-    kernel.storage_mounts.remove(&state.mount_id);
+    kernel.storage_mounts.remove(&state.issued.scope.id);
     cleanup_resource(&state.resource_path, &state.callback_path);
     Ok(())
 }
@@ -517,7 +540,7 @@ async fn serve_listener(
                 if !state.is_live() {
                     state.revoked.store(true, Ordering::Release);
                     if let Some(kernel) = kernel.upgrade() {
-                        kernel.storage_mounts.remove(&state.mount_id);
+                        kernel.storage_mounts.remove(&state.issued.scope.id);
                     }
                     cleanup_resource(&state.resource_path, &state.callback_path);
                     break;
@@ -547,7 +570,8 @@ async fn serve_listener(
 
 #[cfg(any(unix, windows))]
 async fn handle_connection(
-    kernel: Arc<Kernel>,
+    // Keep the issuing kernel alive for this connection.
+    _kernel: Arc<Kernel>,
     state: Arc<StorageMountLeaseState>,
     mut stream: LocalStream,
 ) {
@@ -555,7 +579,7 @@ async fn handle_connection(
         let Ok(Some(request)) = read_request(&mut stream).await else {
             return;
         };
-        let response = dispatch_request(&kernel, &state, request).await;
+        let response = dispatch_request(&state, request).await;
         if write_response(&mut stream, response).await.is_err() {
             return;
         }
@@ -694,7 +718,6 @@ async fn write_response(
 }
 
 async fn dispatch_request(
-    kernel: &Kernel,
     state: &Arc<StorageMountLeaseState>,
     callback: CallbackRequest,
 ) -> CallbackResponse {
@@ -703,11 +726,7 @@ async fn dispatch_request(
     let live = state.is_live();
     let authenticated = live && token_matches(&state.token_hash, &request.lease_token);
     let outcome = match admit(
-        Destinations {
-            lease: state,
-            mount: state.target,
-            home: &kernel.astrid_home,
-        },
+        state.issued.bind(state),
         live,
         authenticated,
         state.access == StorageProviderAccessV1::ReadWrite,
@@ -721,7 +740,7 @@ async fn dispatch_request(
         },
         Admission::Accepted(operation) => {
             state.renew();
-            execute_operation(kernel, operation).await
+            execute_operation(operation).await
         },
     };
     let response = StorageFilesystemResponseV1 {
@@ -767,26 +786,21 @@ fn response_v2(response: StorageFilesystemResponseV1) -> StorageFilesystemRespon
 }
 
 type CallbackAdmission<'a> = Admitted<
-    Destinations<&'a Arc<StorageMountLeaseState>, LeaseTarget, &'a astrid_core::dirs::AstridHome>,
+    Destinations<&'a Arc<StorageMountLeaseState>, &'a LeaseScope, &'a MountBacking>,
     StorageFilesystemOperationV1,
 >;
 
-async fn execute_operation(
-    kernel: &Kernel,
-    admission: CallbackAdmission<'_>,
-) -> StorageFilesystemOutcomeV1 {
-    let (state, target, runtime_home, operation, class) = match admission.into_effect() {
-        Effect::Volume(home) => return volume_info::read(home).await,
-        Effect::Filesystem(state, target, home, operation, class) => {
-            (state, target, home.clone(), operation, class)
+async fn execute_operation(admission: CallbackAdmission<'_>) -> StorageFilesystemOutcomeV1 {
+    let (state, target, backing, operation, class) = match admission.into_effect() {
+        Effect::Volume(_lease, _scope, backing) => return volume_info::read(&backing.home).await,
+        Effect::Filesystem(state, scope, backing, operation, class) => {
+            (state, scope.target, backing, operation, class)
         },
     };
     let is_mutation = matches!(class, OperationClass::Write);
     let is_sync = matches!(class, OperationClass::Sync);
     let guard = if class.requires_serialization() {
-        let guard = Arc::clone(&kernel.storage_mount_mutations)
-            .lock_owned()
-            .await;
+        let guard = Arc::clone(&backing.mutations).lock_owned().await;
         if !state.is_live() {
             return failure("stale-lease", "storage mount lease is expired or revoked");
         }
@@ -794,7 +808,8 @@ async fn execute_operation(
     } else {
         None
     };
-    let Some(store) = kernel.principal_store.clone() else {
+    let runtime_home = backing.home.clone();
+    let Some(store) = backing.store.clone() else {
         return failure("unavailable", "native principal store is unavailable");
     };
     let in_flight = is_mutation.then(|| InFlightMutation::begin(state));

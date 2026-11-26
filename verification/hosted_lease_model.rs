@@ -2,7 +2,7 @@
 use vstd::prelude::*;
 
 use crate::mount_reservation::Reservation;
-use crate::storage_callback::{self, Admission, Destinations, Effect, OperationClass};
+use crate::storage_callback::{self, Admission, Issued, Effect, OperationClass};
 use crate::storage_filesystem::StorageFilesystemOperationV1;
 
 verus! {
@@ -53,13 +53,14 @@ proof fn publication_opens_a_fresh_identity()
 
 // Interpret the issue map entry, listener publication and per-lease revoked bit.
 // Their synchronization and the transport's process lifetime are adapter obligations.
-struct RuntimeLease {
+struct RuntimeLease<T,B> {
+    issued: Issued<T,B>,
     issue: Reservation<()>,
     published: bool,
     revoked: bool,
 }
 
-impl RuntimeLease {
+impl<T,B> RuntimeLease<T,B> {
     spec fn phase(self) -> Phase {
         if self.revoked { Phase::Closed }
         else if self.published { Phase::Published }
@@ -99,22 +100,38 @@ impl RuntimeLease {
     }
 
     /// Compose lease phase, credential and access checks with final dispatch.
-    fn effect<L,T,H>(&self, destinations: Destinations<L,T,H>, now: u64, expires: u64,
+    fn effect<'a,L>(&'a self, lease_id: L, now: u64, expires: u64,
         authenticated: bool, writable: bool, operation: StorageFilesystemOperationV1)
-        -> (result: Option<Effect<L,T,H>>)
+        -> (result: Option<Effect<L,&'a T,&'a B>>)
         ensures
             result.is_some() == (self.phase() == Phase::Published && now <= expires &&
                 authenticated && (storage_callback::access_class(operation) != OperationClass::Write || writable)),
-            result matches Some(Effect::Volume(home)) ==>
-                operation is VolumeInfo && home == destinations.home,
-            result matches Some(Effect::Filesystem(lease, target, home, op, class)) ==>
-                !(operation is VolumeInfo) && lease == destinations.lease && target == destinations.mount &&
-                home == destinations.home && op == operation && class == storage_callback::access_class(operation),
+            result matches Some(Effect::Volume(lease, scope, backing)) ==>
+                operation is VolumeInfo && lease == lease_id && *scope == self.issued.scope && *backing == self.issued.backing,
+            result matches Some(Effect::Filesystem(lease, target, backing, op, class)) ==>
+                !(operation is VolumeInfo) && lease == lease_id && *target == self.issued.scope &&
+                *backing == self.issued.backing && op == operation && class == storage_callback::access_class(operation),
     {
-        match self.callback(destinations, now, expires, authenticated, writable, operation) {
+        match self.callback(self.issued.bind(lease_id), now, expires, authenticated, writable, operation) {
             Admission::Accepted(ticket) => Some(ticket.into_effect()),
             _ => None,
         }
+    }
+
+    /// Once the runtime phase refines this trace prefix, even an authenticated
+    /// caller with write permission can obtain no effect after closure.
+    fn effect_after_closure<'a,L>(&'a self, lease: L, now: u64, expires: u64,
+        operation: StorageFilesystemOperationV1, Ghost(events): Ghost<Seq<Event>>,
+        Ghost(closed): Ghost<int>, Ghost(count): Ghost<int>)
+        -> (result: Option<Effect<L,&'a T,&'a B>>)
+        requires 0 <= closed < count <= events.len(),
+            events[closed] == Event::Revoke || events[closed] == Event::Restart ||
+                events[closed] == (Event::Retire { affected: true }),
+            self.phase() == after(events, count),
+        ensures result.is_none(),
+    {
+        proof { no_admission_after_close(events, closed, count); }
+        self.effect(lease, now, expires, true, true, operation)
     }
 }
 

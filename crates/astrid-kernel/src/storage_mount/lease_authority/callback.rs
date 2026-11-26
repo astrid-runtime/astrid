@@ -62,19 +62,36 @@ impl<L, O> Admitted<L, O> {
     pub(crate) closed spec fn binding(self) -> (L, O, OperationClass) {
         (self.lease, self.operation, self.class)
     }
-
 }
 
-/// The issuer supplies the concrete mount and backing home together with the
-/// lease. Dispatch consumes this evidence exactly once.
+/// Immutable scope and backing selected when the lease is issued.
+pub(crate) struct Issued<T, B> {
+    pub(crate) scope: T,
+    pub(crate) backing: B,
+}
+
+impl<T, B> Issued<T, B> {
+    pub(crate) fn bind<L>(&self, lease: L) -> (bound: Destinations<L, &T, &B>)
+        ensures bound.parts().0 == lease, *bound.parts().1 == self.scope, *bound.parts().2 == self.backing,
+    {
+        Destinations { lease, mount: &self.scope, backing: &self.backing }
+    }
+}
+
 pub(crate) struct Destinations<L, T, H> {
-    pub(crate) lease: L,
-    pub(crate) mount: T,
-    pub(crate) home: H,
+    lease: L,
+    mount: T,
+    backing: H,
+}
+
+impl<L, T, H> Destinations<L, T, H> {
+    pub(crate) closed spec fn parts(self) -> (L, T, H) {
+        (self.lease, self.mount, self.backing)
+    }
 }
 
 pub(crate) enum Effect<L, T, H> {
-    Volume(H),
+    Volume(L, T, H),
     Filesystem(L, T, H, Operation, OperationClass),
 }
 
@@ -82,16 +99,17 @@ impl<L, T, H> Admitted<Destinations<L, T, H>, Operation> {
     pub(crate) fn into_effect(self) -> (effect: Effect<L, T, H>)
         ensures
             (effect is Volume) == (self.binding().1 is VolumeInfo),
-            effect matches Effect::Volume(home) ==> home == self.binding().0.home,
+            effect matches Effect::Volume(lease, scope, backing) ==> lease == self.binding().0.parts().0 &&
+                scope == self.binding().0.parts().1 && backing == self.binding().0.parts().2,
             effect matches Effect::Filesystem(lease, target, home, op, class) ==>
-                lease == self.binding().0.lease && target == self.binding().0.mount &&
-                home == self.binding().0.home && op == self.binding().1 && class == self.binding().2,
+                lease == self.binding().0.parts().0 && target == self.binding().0.parts().1 &&
+                home == self.binding().0.parts().2 && op == self.binding().1 && class == self.binding().2,
     {
         let destinations = self.lease;
         match self.operation {
-            Operation::VolumeInfo => Effect::Volume(destinations.home),
+            Operation::VolumeInfo => Effect::Volume(destinations.lease, destinations.mount, destinations.backing),
             operation => Effect::Filesystem(destinations.lease, destinations.mount,
-                destinations.home, operation, self.class),
+                destinations.backing, operation, self.class),
         }
     }
 }

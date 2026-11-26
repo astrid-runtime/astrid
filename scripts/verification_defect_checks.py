@@ -5,7 +5,7 @@ Every defect is an exact edit applied to a scratch copy of the verifier's
 inputs. A defect that still verifies shows that the proof does not constrain
 what it claims. The unmodified copy must verify with zero errors first. A
 defect counts as rejected only when the verifier reports an error in the
-edited file, so a defect that fails to parse is reported as a failure.
+edited file or the named consumer of a weakened contract, so a defect that fails to parse is reported as a failure.
 
 This checks only the defects listed here and establishes no other property.
 A weaker statement that is still true is not a defect, unless a proof listed
@@ -13,6 +13,7 @@ here derives its conclusion from the stronger one.
 """
 
 import argparse
+import os.path
 from collections.abc import Callable
 from pathlib import Path
 import re
@@ -177,7 +178,7 @@ def verified_counts(output: str) -> tuple[int, int] | None:
 
 def error_in(output: str, relative: Path) -> bool:
     """Report whether the verifier located an error in `relative`."""
-    return any(Path(location).name == relative.name for location in LOCATION.findall(output))
+    return any(Path(os.path.normpath(location)) == relative for location in LOCATION.findall(output))
 
 
 def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
@@ -421,7 +422,12 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
         (
             "callback ticket downgrades a write to a read before execution",
             LEASE_CALLBACK,
-            lambda text: replace_once(text, "destinations.home, operation, self.class)", "destinations.home, operation, OperationClass::Read)"),
+            lambda text: replace_once(text, "destinations.backing, operation, self.class)", "destinations.backing, operation, OperationClass::Read)"),
+        ),
+        (
+            "trace closure no longer establishes the runtime phase for dispatch",
+            Path("verification/hosted_lease_model.rs"),
+            lambda source: replace_once(source, "self.phase() == after(events, count),", "true,"),
         ),
         (
             "published authenticated callback loses its authorized effect",
@@ -431,7 +437,7 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
         (
             "filesystem operation is redirected to backing capacity",
             LEASE_CALLBACK,
-            lambda text: replace_once(text, "operation => Effect::Filesystem", "Operation::Sync => Effect::Volume(destinations.home),\n            operation => Effect::Filesystem"),
+            lambda text: replace_once(text, "operation => Effect::Filesystem", "Operation::Sync => Effect::Volume(destinations.lease, destinations.mount, destinations.backing),\n            operation => Effect::Filesystem"),
         ),
         (
             "callback admission issues a ticket for a read-only write",
@@ -1356,7 +1362,22 @@ def copy_inputs(source: Path, tree: Path) -> None:
         shutil.copyfile(source / relative, tree / relative)
 
 
-def check_defect(verus: str, base: Path, name: str, relative: Path, defect) -> bool:
+def consumer_defects():
+    """Weaken a production guarantee and require its trace consumer to fail."""
+    consumer = Path("verification/hosted_lease_model.rs")
+    for name, clause in [
+        ("issued scope", "*bound.parts().1 == self.scope, "),
+        ("issued backing", ", *bound.parts().2 == self.backing"),
+        ("filesystem scope", "target == self.binding().0.parts().1 &&"),
+        ("volume backing", " && backing == self.binding().0.parts().2"),
+    ]:
+        yield (
+            f"callback contract omits {name}", LEASE_CALLBACK,
+            lambda source, clause=clause: replace_once(source, clause, ""), consumer,
+        )
+
+
+def check_defect(verus: str, base: Path, name: str, relative: Path, defect, expected_error: Path | None = None) -> bool:
     """Apply one defect to a scratch copy and report whether it was rejected."""
     tree = base / "defect"
     copy_inputs(base, tree)
@@ -1375,8 +1396,9 @@ def check_defect(verus: str, base: Path, name: str, relative: Path, defect) -> b
     if counts[1] == 0:
         print(f"FAIL: {name}: the verifier reported no error")
         return False
-    if not error_in(output, relative):
-        print(f"FAIL: {name}: no error in {relative}")
+    location = expected_error or relative
+    if not error_in(output, location):
+        print(f"FAIL: {name}: no error in {location}")
         return False
     print(f"PASS: {name}: rejected")
     return True
@@ -1386,7 +1408,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--verus", default="verus", help="path to the pinned verifier")
     args = parser.parse_args()
-    checks = defects()
+    checks = [(*check, None) for check in defects()] + list(consumer_defects())
     with tempfile.TemporaryDirectory(prefix="astrid-verification-defects-") as scratch:
         base = Path(scratch)
         copy_inputs(ROOT, base)
@@ -1398,8 +1420,7 @@ def main() -> int:
             return 1
         print("PASS: unmodified sources verify with zero errors")
         passed = sum(
-            check_defect(args.verus, base, name, relative, defect)
-            for name, relative, defect in checks
+            check_defect(args.verus, base, *check) for check in checks
         )
     print(f"{passed} of {len(checks)} defects rejected")
     return 0 if passed == len(checks) else 1
