@@ -106,6 +106,15 @@ pub enum MessageOrigin {
     System,
 }
 
+/// Device authority captured at ingress and inherited through IPC.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeviceStamp<'a> {
+    /// Stable key fingerprint, if this caller was device-authenticated.
+    pub fingerprint: Option<&'a str>,
+    /// Generation of that key's registration at authentication.
+    pub registration: Option<Uuid>,
+}
+
 /// A cross-boundary message sent over the event bus between WASM guests and the host.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IpcMessage {
@@ -214,6 +223,15 @@ fn default_unix_epoch() -> DateTime<Utc> {
 }
 
 impl IpcMessage {
+    /// Borrow the device authority carried by this envelope.
+    #[must_use]
+    pub fn device_stamp(&self) -> DeviceStamp<'_> {
+        DeviceStamp {
+            fingerprint: self.device_key_id.as_deref(),
+            registration: self.device_registration_id,
+        }
+    }
+
     /// Create a new IPC message stamped with the current wall-clock
     /// time. Only available when the `clock` feature is enabled
     /// (kernel-side); capsule code constructs `IpcMessage` from

@@ -21,6 +21,7 @@
 //! against the calling capsule's cancellation token so capsule unload
 //! always wins over a stuck wait.
 
+use astrid_events::ipc::DeviceStamp;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -206,11 +207,6 @@ fn check_subscribe_acl(state: &HostState, topic_pattern: &str) -> Result<(), Err
     Ok(())
 }
 
-struct PublishingDevice<'a> {
-    fingerprint: Option<&'a str>,
-    registration: Option<uuid::Uuid>,
-}
-
 /// Shared publish path used by [`ipc::Host::publish`] and
 /// [`ipc::Host::publish_as`].
 ///
@@ -235,7 +231,7 @@ async fn publish_inner(
     topic: String,
     payload: String,
     principal: astrid_core::PrincipalId,
-    device: PublishingDevice<'_>,
+    device: DeviceStamp<'_>,
     request_owner: Option<astrid_events::ipc::RequestOwnerId>,
     origin: astrid_events::ipc::MessageOrigin,
 ) -> Result<(), ErrorCode> {
@@ -414,7 +410,7 @@ async fn publish_for_caller(
         topic,
         payload,
         principal,
-        PublishingDevice {
+        DeviceStamp {
             fingerprint: device_key_id.as_deref(),
             registration,
         },
@@ -524,7 +520,7 @@ impl ipc::Host for HostState {
                 topic,
                 payload,
                 effective,
-                PublishingDevice {
+                DeviceStamp {
                     fingerprint: device_key_id.as_deref(),
                     registration: authority.as_ref().and_then(|s| s.registration),
                 },

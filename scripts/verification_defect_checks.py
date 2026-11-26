@@ -489,6 +489,16 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             lambda text: replace_once(text, "message.push_str(nonce);", "message.push_str(principal);"),
         ),
         (
+            "dispatch accepts a different live registration",
+            DEVICE_REGISTRATION,
+            lambda text: replace_once(text, "(Some(a), Some(b)) => a == b", "(Some(a), Some(b)) => a != b"),
+        ),
+        (
+            "dispatch accepts a missing generation for a versioned record",
+            DEVICE_REGISTRATION,
+            lambda text: replace_once(text, "(None, None) => true,", "(None, None) | (Some(_), None) => true,"),
+        ),
+        (
             "registered bearer omits the pairing generation",
             REGISTERED_BEARER,
             lambda text: replace_once(text, "signed.push_str(registration);", "signed.push_str(claims);"),

@@ -522,6 +522,25 @@ impl PrincipalProfile {
         })
     }
 
+    /// Resolve a captured device registration against the current profile.
+    /// An unversioned capture only matches an unversioned live record.
+    #[must_use]
+    pub fn active_registration<S: AsRef<str>>(
+        &self,
+        id: &DeviceKeyId<S>,
+        generation: Option<uuid::Uuid>,
+    ) -> Option<&DeviceKey> {
+        device_registration::match_generation(
+            self.active_device(id),
+            generation.map(|g| g.as_u128()),
+            |record| {
+                record
+                    .registration_id
+                    .map(|g| uuid::Uuid::from(g).as_u128())
+            },
+        )
+    }
+
     /// Append a device and declare the profile format required to retain its
     /// registration identity on disk.
     pub fn add_device(&mut self, device: DeviceKey) {

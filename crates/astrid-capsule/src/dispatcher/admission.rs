@@ -167,7 +167,9 @@ impl EventDeliveryAdmitter for Admitter {
             &self.registry,
             &topic,
             principal,
-            message.and_then(|message| message.device_key_id.as_deref()),
+            message
+                .map(astrid_events::ipc::IpcMessage::device_stamp)
+                .unwrap_or_default(),
             self.access_resolver.as_ref(),
         )
         .await;

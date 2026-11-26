@@ -176,11 +176,18 @@ fn registry_for(capsule: TestCapsule, principals: &[&str]) -> Arc<RwLock<Capsule
     Arc::new(RwLock::new(registry))
 }
 
+fn stamp(device: &DeviceKey) -> DeviceStamp<'_> {
+    DeviceStamp {
+        fingerprint: Some(&device.key_id),
+        registration: device.registration_id.map(Into::into),
+    }
+}
+
 async fn matching(
     registry: &RwLock<CapsuleRegistry>,
     topic: &str,
     principal: &str,
-    device_key_id: Option<&str>,
+    device: DeviceStamp<'_>,
     resolver: Option<&CapsuleAccessResolver>,
     bus: &EventBus,
 ) -> usize {
@@ -188,7 +195,7 @@ async fn matching(
         registry,
         topic,
         Some(principal),
-        device_key_id,
+        device,
         Some(astrid_events::ipc::RequestOwnerId::generate()),
         resolver,
         bus,
@@ -297,12 +304,7 @@ async fn inventory_visibility_and_execution_authority_are_separate() {
             deny: vec!["capsule:access:any".into()],
         },
     );
-    let ids = [
-        full.key_id.clone(),
-        list_only.key_id.clone(),
-        access_any.key_id.clone(),
-        access_denied.key_id.clone(),
-    ];
+
     write_profile(
         &fixture.home,
         "root",
@@ -310,7 +312,12 @@ async fn inventory_visibility_and_execution_authority_are_separate() {
             groups: vec![BUILTIN_ADMIN.into()],
             auth: AuthConfig {
                 methods: vec![AuthMethod::Keypair],
-                public_keys: vec![full, list_only, access_any, access_denied],
+                public_keys: vec![
+                    full.clone(),
+                    list_only.clone(),
+                    access_any.clone(),
+                    access_denied.clone(),
+                ],
             },
             ..PrincipalProfile::default()
         },
@@ -333,7 +340,7 @@ async fn inventory_visibility_and_execution_authority_are_separate() {
             &global_registry,
             "tool.v1.execute.do_thing",
             "root",
-            None,
+            DeviceStamp::default(),
             Some(&fixture.resolver),
             &bus,
         )
@@ -345,7 +352,7 @@ async fn inventory_visibility_and_execution_authority_are_separate() {
             &global_registry,
             "tool.v1.execute.do_thing",
             "root",
-            Some(&ids[0]),
+            stamp(&full),
             Some(&fixture.resolver),
             &bus,
         )
@@ -357,7 +364,7 @@ async fn inventory_visibility_and_execution_authority_are_separate() {
             &global_registry,
             "tool.v1.request.describe",
             "root",
-            Some(&ids[1]),
+            stamp(&list_only),
             Some(&fixture.resolver),
             &bus,
         )
@@ -369,7 +376,7 @@ async fn inventory_visibility_and_execution_authority_are_separate() {
             &global_registry,
             "tool.v1.execute.do_thing",
             "root",
-            Some(&ids[1]),
+            stamp(&list_only),
             Some(&fixture.resolver),
             &bus,
         )
@@ -382,7 +389,7 @@ async fn inventory_visibility_and_execution_authority_are_separate() {
             &registry,
             "tool.v1.execute.do_thing",
             "root",
-            Some(&ids[1]),
+            stamp(&list_only),
             Some(&fixture.resolver),
             &bus,
         )
@@ -398,7 +405,7 @@ async fn inventory_visibility_and_execution_authority_are_separate() {
             &global_registry,
             "tool.v1.execute.do_thing",
             "root",
-            Some(&ids[2]),
+            stamp(&access_any),
             Some(&fixture.resolver),
             &bus,
         )
@@ -410,7 +417,7 @@ async fn inventory_visibility_and_execution_authority_are_separate() {
             &registry,
             "tool.v1.execute.do_thing",
             "root",
-            Some(&ids[3]),
+            stamp(&access_denied),
             Some(&fixture.resolver),
             &bus,
         )
@@ -433,7 +440,7 @@ async fn direct_capsule_access_any_holder_can_execute() {
             deny: Vec::new(),
         },
     );
-    let device_key_id = device.key_id.clone();
+
     write_profile(
         &fixture.home,
         "operator",
@@ -441,7 +448,7 @@ async fn direct_capsule_access_any_holder_can_execute() {
             grants: vec!["capsule:access:any".into()],
             auth: AuthConfig {
                 methods: vec![AuthMethod::Keypair],
-                public_keys: vec![device],
+                public_keys: vec![device.clone()],
             },
             ..PrincipalProfile::default()
         },
@@ -454,7 +461,7 @@ async fn direct_capsule_access_any_holder_can_execute() {
             &registry,
             "tool.v1.execute.do_thing",
             "operator",
-            Some(&device_key_id),
+            stamp(&device),
             Some(&fixture.resolver),
             &bus,
         )
@@ -490,7 +497,7 @@ async fn disabled_caller_dispatches_nothing_and_emits_no_grant() {
                 &registry,
                 topic,
                 "disabled",
-                None,
+                DeviceStamp::default(),
                 Some(&fixture.resolver),
                 &bus,
             )
@@ -511,7 +518,7 @@ async fn invalid_or_revoked_device_never_falls_back_or_emits_grant() {
         capsules: vec!["secret-tool".into()],
         auth: AuthConfig {
             methods: vec![AuthMethod::Keypair],
-            public_keys: vec![full],
+            public_keys: vec![full.clone()],
         },
         ..PrincipalProfile::default()
     };
@@ -528,7 +535,7 @@ async fn invalid_or_revoked_device_never_falls_back_or_emits_grant() {
             &registry,
             "tool.v1.execute.do_thing",
             "root",
-            Some(&full_id),
+            stamp(&full),
             Some(&fixture.resolver),
             &bus,
         )
@@ -549,7 +556,10 @@ async fn invalid_or_revoked_device_never_falls_back_or_emits_grant() {
                     &registry,
                     topic,
                     "root",
-                    Some(device_key_id),
+                    DeviceStamp {
+                        fingerprint: Some(device_key_id),
+                        ..stamp(&full)
+                    },
                     Some(&fixture.resolver),
                     &bus,
                 )
@@ -558,35 +568,66 @@ async fn invalid_or_revoked_device_never_falls_back_or_emits_grant() {
             );
         }
     }
+    let replacement = device('e', DeviceScope::Full);
+    assert_eq!(full.key_id, replacement.key_id);
+    assert_ne!(full.registration_id, replacement.registration_id);
+    profile.add_device(replacement.clone());
+    write_profile(&fixture.home, "root", &profile);
+    fixture
+        .cache
+        .invalidate(&astrid_core::PrincipalId::new("root").unwrap());
+    for (device, expected) in [
+        (stamp(&full), 0),
+        (
+            DeviceStamp {
+                registration: None,
+                ..stamp(&full)
+            },
+            0,
+        ),
+        (
+            DeviceStamp {
+                fingerprint: None,
+                ..stamp(&replacement)
+            },
+            0,
+        ),
+        (stamp(&replacement), 1),
+    ] {
+        assert_eq!(
+            matching(
+                &registry,
+                "tool.v1.execute.do_thing",
+                "root",
+                device,
+                Some(&fixture.resolver),
+                &bus
+            )
+            .await,
+            expected
+        );
+    }
     assert_no_grant_required(&mut approval).await;
 }
 
 #[tokio::test]
-async fn no_resolver_ignores_device_metadata() {
-    let (capsule, invoked) = TestCapsule::new("legacy", &["tool.v1.execute.do_thing"]);
+async fn device_scoped_dispatch_requires_a_resolver() {
+    let (capsule, _) = TestCapsule::new("legacy", &["tool.v1.execute.do_thing"]);
     let registry = registry_for(capsule, &["default"]);
-    let bus = Arc::new(EventBus::with_capacity(64));
-    let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
-    let handle = tokio::spawn(dispatcher.run());
-    let message = astrid_events::ipc::IpcMessage::new(
-        Topic::from_raw("tool.v1.execute.do_thing"),
-        IpcPayload::Custom {
-            data: serde_json::json!({}),
-        },
-        uuid::Uuid::nil(),
-    )
-    .with_principal("root")
-    .with_device_key_id("not-a-key-id");
-    bus.publish(AstridEvent::Ipc {
-        metadata: astrid_events::EventMetadata::new("test"),
-        message,
-    });
-    tokio::time::timeout(Duration::from_millis(500), async {
-        while !invoked.load(Ordering::SeqCst) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("legacy dispatch");
-    handle.abort();
+    let bus = EventBus::with_capacity(64);
+    let key = device('f', DeviceScope::Full);
+    for (binding, expected) in [(stamp(&key), 0), (DeviceStamp::default(), 1)] {
+        assert_eq!(
+            matching(
+                &registry,
+                "tool.v1.execute.do_thing",
+                "default",
+                binding,
+                None,
+                &bus
+            )
+            .await,
+            expected
+        );
+    }
 }

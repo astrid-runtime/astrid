@@ -4,6 +4,27 @@ use vstd::prelude::*;
 
 verus! {
 
+/// Accept the exact selected record only when it has the generation captured at ingress.
+pub(super) fn match_generation<T, F: Fn(&T) -> Option<u128>>(
+    selected: Option<&T>, expected: Option<u128>, generation: F,
+) -> (result: Option<&T>)
+    requires forall|r: &T| #[trigger] generation.requires((r,)),
+    ensures match selected {
+        None => result.is_none(),
+        Some(record) => exists|live: Option<u128>| generation.ensures((record,), live)
+            && result == (if live == expected { Some(record) } else { None }),
+    },
+{
+    let record = selected?;
+    let live = generation(record);
+    let matches = match (live, expected) {
+        (Some(a), Some(b)) => a == b,
+        (None, None) => true,
+        _ => false,
+    };
+    if matches { Some(record) } else { None }
+}
+
 pub(super) closed spec fn observed<T, F: Fn(&T) -> &str>(
     identify: F, registration: T, requested: &str, matched: bool,
 ) -> bool {

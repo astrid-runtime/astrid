@@ -183,8 +183,19 @@ bearer. On refresh the gateway signs the same registration as the verified input
 Legacy bearers keep their existing format and have no registration ID. The v4
 transcript proof binds the exact first five encoded fields and the canonical UUID.
 Equal transcripts with dot-free registration strings require both inputs to be equal.
-Base64, UUID parsing and Ed25519 remain trusted adapters. Downstream effect
-admission still needs to compare the original generation to the live registration.
+Base64, UUID parsing and Ed25519 remain trusted adapters.
+
+Gateway publications, native socket ingress, signed Wasmtime forwards and guest
+IPC fan-out carry the original registration in host-derived bus metadata.
+Ordinary and reserved dispatcher matching select a unique, enabled fingerprint
+and check its generation. The checked comparison returns the same selected record
+exactly when the captured and live generations agree. A legacy record matches an
+absent generation. Missing profile resolution denies device-stamped matches.
+Tests remove a key, re-pair it and compare the old, absent and new generations.
+
+Matching precedes asynchronous queue waits and handler execution. The proof
+does not yet establish freshness at invocation, revocation of work already admitted,
+or generation enforcement across all kernel management and reply paths.
 
 ## Native local socket transport
 
