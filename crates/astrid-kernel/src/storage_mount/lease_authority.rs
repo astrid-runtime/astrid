@@ -1,5 +1,6 @@
 //! Resolve mount lease authority and its immutable storage target.
 
+pub(super) mod callback;
 mod requester;
 pub(super) use requester::same_requester;
 

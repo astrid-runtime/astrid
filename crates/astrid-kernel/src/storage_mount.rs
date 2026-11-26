@@ -131,8 +131,11 @@ impl StorageMountLeaseState {
     }
 
     fn is_live(&self) -> bool {
-        !self.revoked.load(Ordering::Acquire)
-            && now_epoch_secs() <= self.expires_at_epoch_secs.load(Ordering::Acquire)
+        lease_authority::callback::live(
+            self.revoked.load(Ordering::Acquire),
+            now_epoch_secs(),
+            self.expires_at_epoch_secs.load(Ordering::Acquire),
+        )
     }
 
     #[cfg(test)]
@@ -704,13 +707,17 @@ async fn dispatch_request(
 ) -> CallbackResponse {
     let request = callback.request;
     let request_id = request.request_id.clone();
-    let outcome = if !state.is_live() {
-        failure("stale-lease", "storage mount lease is expired or revoked")
-    } else if !token_matches(&state.token_hash, &request.lease_token) {
-        failure("unauthorized", "storage mount lease token is invalid")
-    } else {
-        state.renew();
-        execute_operation(kernel, state, request.operation).await
+    use lease_authority::callback::{Admission, admit};
+
+    let live = state.is_live();
+    let authenticated = live && token_matches(&state.token_hash, &request.lease_token);
+    let outcome = match admit(live, authenticated, request.operation) {
+        Admission::Stale => failure("stale-lease", "storage mount lease is expired or revoked"),
+        Admission::Unauthorized => failure("unauthorized", "storage mount lease token is invalid"),
+        Admission::Accepted(operation) => {
+            state.renew();
+            execute_operation(kernel, state, operation).await
+        }
     };
     let response = StorageFilesystemResponseV1 {
         protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V1,

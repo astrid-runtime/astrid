@@ -561,3 +561,14 @@ private home, the process projection cache key and the caller checked at lease
 issuance. For a fleet view, authorization still depends on the ownership graph
 and workspace branch descriptor. The proof of UID selection does not discharge
 provider startup, cache lifetime, fleet ownership changes or callback teardown.
+
+
+Native mount callbacks decode a V1 operation directly or translate a V2 request
+to that operation. The checked callback gate consumes the decoded operation.
+A revoked lease or an observation after expiry yields a stale response. A live
+lease with a failed token comparison yields an unauthorized response. The
+accepted branch contains the original operation, including its paths and write
+data, and passes it to the backend dispatcher. These statements concern the
+clock, expiry, revocation and authentication values sampled by the adapter.
+The proof still needs the correspondence to a coherent concurrent observation,
+the V2 decoder, token hashing, backend execution and durable completion.

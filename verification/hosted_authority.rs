@@ -1,5 +1,8 @@
 // Verus entry point for transitions used by hosted Astrid.
 
+#[path = "../crates/astrid-kernel/src/storage_mount/lease_authority/callback.rs"]
+mod storage_callback;
+
 #[path = "../crates/astrid-kernel/src/storage_mount/lease_authority/requester.rs"]
 mod storage_lease_requester;
 

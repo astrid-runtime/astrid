@@ -58,6 +58,7 @@ UID_TEXT = Path("crates/astrid-core/src/identity/principal/text.rs")
 FILESYSTEM_PATH = Path("crates/astrid-storage/src/filesystem/path_validation.rs")
 STORAGE_HANDLES = Path("crates/astrid-capsule/src/engine/wasm/storage_handles.rs")
 STORAGE_FILE = Path("crates/astrid-capsule/src/engine/wasm/storage_file.rs")
+LEASE_CALLBACK = Path("crates/astrid-kernel/src/storage_mount/lease_authority/callback.rs")
 LEASE_REQUESTER = Path("crates/astrid-kernel/src/storage_mount/lease_authority/requester.rs")
 INVOCATION_OWNER = Path("crates/astrid-capsule/src/engine/wasm/invocation_owner/admission.rs")
 MOUNT = Path("crates/astrid-capsule/src/engine/wasm/mount_selection.rs")
@@ -68,6 +69,7 @@ INPUTS = [
     STORAGE_HANDLES,
     STORAGE_FILE,
     PAIR_RESULT,
+    LEASE_CALLBACK,
     LEASE_REQUESTER,
     INVOCATION_OWNER,
     MOUNT,
@@ -359,6 +361,21 @@ def defects() -> list[tuple[str, Path, Callable[[str], str]]]:
             "missing invocation workspace falls back to the runtime despite required binding",
             MOUNT,
             lambda text: replace_once(text, "if requires_binding { invocation }", "if requires_binding { runtime }"),
+        ),
+        (
+            "revoked callback lease is live before its expiry",
+            LEASE_CALLBACK,
+            lambda text: replace_once(text, "\n    !revoked && now <= expires\n", "\n    now <= expires\n"),
+        ),
+        (
+            "callback drops the inclusive expiry boundary",
+            LEASE_CALLBACK,
+            lambda text: replace_once(text, "\n    !revoked && now <= expires\n", "\n    !revoked && now < expires\n"),
+        ),
+        (
+            "private callback executes without token authentication",
+            LEASE_CALLBACK,
+            lambda text: replace_once(text, "else if !authenticated { Admission::Unauthorized }", "else if false { Admission::Unauthorized }"),
         ),
         (
             "missing lease requester can control a native mount",
