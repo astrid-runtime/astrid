@@ -388,21 +388,35 @@ async fn pair_device_dispatch(
     req: AdminRequestKind,
 ) -> AdminResponseBody {
     match req {
-        AdminRequestKind::PairDeviceIssue {
+        ref request @ AdminRequestKind::PairDeviceIssue {
             expires_secs,
-            label,
-            scope,
+            ref label,
+            ref scope,
         } => {
-            super::pair_device_handlers::pair_device_issue(
+            let result = super::pair_device_handlers::pair_device_issue(
                 kernel,
                 caller,
                 authorization,
                 issuer_device_key_id,
                 expires_secs,
-                label,
+                label.clone(),
                 scope,
             )
-            .await
+            .await;
+            if let Some(auth) = authorization {
+                let device = astrid_events::ipc::DeviceStamp {
+                    fingerprint: issuer_device_key_id,
+                    registration: auth.device_registration.map(Into::into),
+                };
+                super::request_authorization::record_pair_issue_outcome(
+                    kernel, caller, device, request, &result,
+                )
+                .await;
+            }
+            result.map_or_else(
+                super::pair_device_handlers::PairIssueError::into_body,
+                AdminResponseBody::PairToken,
+            )
         },
         AdminRequestKind::PairDeviceRedeem { token, public_key } => {
             super::pair_device_handlers::pair_device_redeem(kernel, token, public_key).await
