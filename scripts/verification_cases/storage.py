@@ -626,12 +626,13 @@ def checkpoint_child_consumers():
     child = Path("crates/astrid-storage/src/kv/tree/checkpoint_child.rs")
     reader = Path("crates/astrid-storage/src/kv/tree/checkpoint_key_field.rs")
     for label, path, target, clause, weaker in [
+        ("key validation", child, "child", "field@ == row.0@ && r is Ok", "field@ == row.0@"),
         ("fence", child, "child", "row.0@ == bytes@.subrange(start+4,summary)", "true"),
         ("totals", child, "child", "crate::storage_fields::at(bytes@,summary,row.2.wire())", "true"),
         ("owning target", child, "child", "refs@[index as int].fields() == (edge::wire(edge::Relation::Child,index),row.1,super::ReferenceKind::Owns)", "true"),
-        ("failure explanation", child, "child", "out matches Err(reason) ==> ({", "false ==> out matches Err(reason) ==> ({"),
+        ("failure explanation", child, "child", "ChildError::Empty => exists|t:NodeTotals|", "ChildError::Empty => true || exists|t:NodeTotals|"),
         ("failure cursor", reader, "key_field", "out.is_err() ==> *final(cursor) as int", "false ==> *final(cursor) as int"),
-        ("failure type", reader, "key_field", "out matches Err(e) ==> if start+4 > usize::MAX", "false ==> out matches Err(e) ==> if start+4 > usize::MAX"),
+        ("failure type", reader, "key_field", "e == KeyError::Field(ReadError::Overflow(4))", "true"),
     ]:
         yield (
             f"checkpoint branch binding loses {label}", path,

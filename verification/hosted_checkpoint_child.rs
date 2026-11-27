@@ -40,4 +40,12 @@ fn read_written(bytes: &mut Vec<u8>, fence: &[u8], totals: NodeTotals, suffix: &
     out
 }
 
+
+fn refused(bytes:&[u8],start:usize,refs:&[ObjectReference],index:usize) -> (rejected:bool)
+    ensures rejected,
+{
+    let mut cursor = start;
+    let deny = |_:&[u8]| -> (r:Result<(),()>) ensures r is Err { Err(()) };
+    checkpoint_child::read(bytes,&mut cursor,refs,index,deny).is_err()
+}
 }
