@@ -136,12 +136,17 @@ where
 
     /// Publish complete file bytes.
     pub fn write(&self, path: &FilesystemPath, bytes: &[u8]) -> Result<(), WorkspaceBranchError> {
-        self.require_parent(path)?;
-        if self.directory_exists(path)? {
-            return Err(FilesystemError::IsDirectory(path.clone()).into());
-        }
-        self.branches
-            .write(&self.owner, self.branch, &path.file_name()?, bytes)
+        let write = crate::filesystem::replacement::prepare(
+            (&self.owner, self.branch),
+            path,
+            bytes,
+            |path| self.require_parent(path),
+            |path| self.directory_exists(path),
+            |path| path.file_name().map_err(WorkspaceBranchError::from),
+            |path| FilesystemError::IsDirectory(path.clone()).into(),
+        )?;
+        write
+            .submit(|(owner, branch), name, bytes| self.branches.write(owner, branch, &name, bytes))
     }
 
     /// Atomically publish streamed bytes into this branch, preserving quota checks.

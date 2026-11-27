@@ -72,3 +72,25 @@ def defects():
             return text[:opening] + "    assert(false);\n" + text[opening:]
 
         yield f"storage close vacuity check for {function}", proof, contradict, proof
+    replacement = Path("crates/astrid-storage/src/filesystem/replacement.rs")
+    for label, before, after in [
+        ("parent admission", "Ok(write) => parent.ensures((path,),Ok(())) &&", "Ok(write) =>"),
+        ("file admission", "&& directory.ensures((path,),Ok(false))\n            && key", "\n            && key"),
+        ("key derivation", "key.ensures((path,),Ok(write.arguments().1))", "true"),
+        ("owner and branch", "write.arguments().0 == destination", "true"),
+        ("input bytes", "write.arguments().2 == bytes", "true"),
+        ("parent refusal", "Err(error) => parent.ensures((path,),Err(error))", "Err(error) => true"),
+        ("backend return", "put.ensures(self.arguments(),result)", "true"),
+    ]:
+        yield (f"catalog replacement loses {label}", replacement,
+               lambda s, a=before, b=after: replace_once(s, a, b), consumer)
+    name = Path("crates/astrid-storage/src/content/name.rs")
+    for label, before, after in [
+        ("catalog spelling", "name.spelling() == path@ &&", "true &&"),
+        ("empty key rejection", "Err(ContentNameError::Empty) => path@.len() == 0", "Err(ContentNameError::Empty) => true"),
+        ("null rejection", "Err(ContentNameError::ContainsNull) => path@.len() != 0 && vstd::utf8::encode_utf8(path@).contains(0u8)",
+         "Err(ContentNameError::ContainsNull) => true"),
+        ("emitted spelling", "ensures text@ == self.spelling(),\n    { self.0 }", "ensures true,\n    { self.0 }"),
+    ]:
+        yield (f"catalog replacement loses {label}", name,
+               lambda s, a=before, b=after: replace_once(s, a, b), consumer)

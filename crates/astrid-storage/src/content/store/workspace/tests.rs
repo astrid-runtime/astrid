@@ -29,6 +29,40 @@ fn content_with_engine() -> (Arc<TestContent>, Arc<TestEngine>) {
 }
 
 #[test]
+fn filesystem_replacement_publishes_only_to_the_selected_owner_and_branch() {
+    let content = content();
+    let owner = owner();
+    let other = StateOwner::Principal(PrincipalUid::from_bytes([8; 32]));
+    let backing = crate::AstridFilesystem::new(Arc::clone(&content), owner);
+    let foreign = crate::AstridFilesystem::new(Arc::clone(&content), other);
+    let path = FilesystemPath::new("café-資料").unwrap();
+    backing.write(&path, b"base").unwrap();
+    foreign.write(&path, b"else").unwrap();
+
+    let branches = WorkspaceBranchStore::new(Arc::clone(&content));
+    let first = WorkspaceUid::from_bytes([1; 16]);
+    let second = WorkspaceUid::from_bytes([2; 16]);
+    branches.begin_with_uid(&owner, first).unwrap();
+    branches.begin_with_uid(&owner, second).unwrap();
+    branches
+        .filesystem(owner, first)
+        .write(&path, b"selected")
+        .unwrap();
+
+    let key = ContentName::new(path.as_str()).unwrap();
+    assert_eq!(
+        branches.read(&owner, first, &key).unwrap().unwrap(),
+        b"selected"
+    );
+    assert_eq!(
+        branches.read(&owner, second, &key).unwrap().unwrap(),
+        b"base"
+    );
+    assert_eq!(content.read(&owner, &key).unwrap().unwrap(), b"base");
+    assert_eq!(content.read(&other, &key).unwrap().unwrap(), b"else");
+}
+
+#[test]
 fn workspace_streaming_preserves_base_and_failed_source_does_not_publish() {
     use std::io::{self, Read};
     struct Failing;

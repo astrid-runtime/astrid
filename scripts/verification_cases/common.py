@@ -94,6 +94,8 @@ INPUTS = [
     Path("crates/astrid-capsule/src/engine/wasm/host/process/command.rs"),
     UID_TEXT,
     FILESYSTEM_PATH,
+    Path("crates/astrid-storage/src/filesystem/replacement.rs"),
+    Path("crates/astrid-storage/src/content/name.rs"),
     STORAGE_HANDLES,
     STORAGE_FILE,
     PAIR_RESULT,

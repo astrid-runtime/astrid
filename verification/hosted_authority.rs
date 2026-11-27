@@ -104,6 +104,11 @@ mod storage_file;
 #[path = "../crates/astrid-capsule/src/engine/wasm/storage_handles.rs"]
 mod storage_handles;
 
+#[path = "../crates/astrid-storage/src/filesystem/replacement.rs"]
+mod replacement;
+#[path = "../crates/astrid-storage/src/content/name.rs"]
+mod content_name;
+pub use content_name::ContentName;
 #[path = "../crates/astrid-storage/src/filesystem/path_validation.rs"]
 mod path_validation;
 

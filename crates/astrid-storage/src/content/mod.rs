@@ -13,6 +13,8 @@ mod catalog;
 mod change_detection;
 mod component_labels;
 mod kv_projection;
+mod name;
+pub use name::{ContentName, ContentNameError};
 #[cfg(not(target_family = "wasm"))]
 mod projection_names;
 mod store;
@@ -72,10 +74,6 @@ pub(crate) use catalog::{CatalogValue, LegacyCatalog, encode_legacy_catalog};
 
 use crate::error::StorageError;
 
-/// Canonical name of one principal-owned content value.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ContentName(String);
-
 impl Serialize for ContentName {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -93,18 +91,6 @@ impl<'de> Deserialize<'de> for ContentName {
         let value = String::deserialize(deserializer)?;
         Self::new(value).map_err(serde::de::Error::custom)
     }
-}
-
-/// Failure to validate a principal content name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ContentNameError {
-    /// The name was empty.
-    Empty,
-    /// The name contained a null byte.
-    ContainsNull,
-    /// Persisted name bytes were not valid UTF-8.
-    InvalidUtf8,
 }
 
 impl fmt::Display for ContentNameError {
@@ -132,26 +118,7 @@ impl ContentName {
     /// Returns [`ContentNameError::Empty`] or
     /// [`ContentNameError::ContainsNull`] when validation fails.
     pub fn new(value: impl Into<String>) -> Result<Self, ContentNameError> {
-        let value = value.into();
-        if value.is_empty() {
-            return Err(ContentNameError::Empty);
-        }
-        if value.as_bytes().contains(&0) {
-            return Err(ContentNameError::ContainsNull);
-        }
-        Ok(Self(value))
-    }
-
-    /// Borrow the canonical UTF-8 name.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// Consume the name and return its UTF-8 representation.
-    #[must_use]
-    pub fn into_inner(self) -> String {
-        self.0
+        Self::from_owned(value.into())
     }
 
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, PrincipalContentError> {

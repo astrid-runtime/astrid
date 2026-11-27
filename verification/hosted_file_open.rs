@@ -177,4 +177,63 @@ fn retire_observed<V:Copy>(table:&mut crate::storage_handles::HandleTable<V>, ke
     (observed,retired)
 }
 
+#[derive(PartialEq,Eq)]
+enum StoreError { Parent, Stat, Directory, Name, Put }
+
+/// Each backend receives the checked owner, optional workspace branch, entire key and complete bytes.
+fn catalog_write(owner:u64, branch:Option<u64>, path:&str, bytes:&[u8], parent_ok:bool,
+    directory:Option<bool>, put_ok:bool) -> (out:Result<((u64,Option<u64>),String,Vec<u8>),StoreError>)
+    ensures ({
+        let valid = path@.len() != 0 && !vstd::utf8::encode_utf8(path@).contains(0u8);
+        &&& out.is_ok() == (parent_ok && directory == Some(false) && valid && put_ok)
+        &&& out matches Ok((destination,name,data)) ==> destination == (owner,branch) && name@ == path@ && data@ == bytes@
+        &&& out matches Err(e) ==> e == if !parent_ok { StoreError::Parent } else if directory.is_none() { StoreError::Stat }
+            else if directory == Some(true) { StoreError::Directory } else if !valid { StoreError::Name } else { StoreError::Put }
+    }),
+{
+    let write = crate::replacement::prepare((owner,branch),path,bytes,
+        |_:&str| -> (r:Result<(),StoreError>) ensures r == if parent_ok { Ok(()) } else { Err(StoreError::Parent) },
+            { if parent_ok { Ok(()) } else { Err(StoreError::Parent) } },
+        |_:&str| -> (r:Result<bool,StoreError>) ensures r == match directory { Some(v) => Ok(v), None => Err(StoreError::Stat) },
+            { directory.ok_or(StoreError::Stat) },
+        |p:&str| -> (r:Result<crate::content_name::ContentName,StoreError>)
+            ensures r.is_ok() == (p@.len() != 0 && !vstd::utf8::encode_utf8(p@).contains(0u8)),
+                r matches Ok(n) ==> n.spelling() == p@, r.is_err() ==> r == Err(StoreError::Name),
+            { match crate::ContentName::from_path(p) {
+                Ok(n) => Ok(n), Err(_) => Err(StoreError::Name)
+            } },
+        |_:&str| -> (e:StoreError) ensures e == StoreError::Directory, { StoreError::Directory })?;
+    write.submit(|d:(u64,Option<u64>),name:crate::content_name::ContentName,data:&[u8]|
+        -> (r:Result<((u64,Option<u64>),String,Vec<u8>),StoreError>)
+        ensures r.is_ok() == put_ok, r matches Ok((dd,n,b)) ==> dd == d && n@ == name.spelling() && b@ == data@,
+            r.is_err() ==> r == Err(StoreError::Put), {
+        if !put_ok { return Err(StoreError::Put); }
+        let mut copy = Vec::new();
+        copy.extend_from_slice(data);
+        assert(copy@ =~= data@);
+        Ok((d,name.into_inner(),copy))
+    })
+}
+
+/// A close-time replacement under a selected directory delivers the joined key to its owner or branch.
+fn joined_publication(owner:u64, branch:Option<u64>, base:&str, relative:String, content:&[u8])
+    -> (out:Option<((u64,Option<u64>),String,Vec<u8>)>)
+    ensures ({
+        let key = if base@.len() == 0 { relative@ } else if relative@.len() == 0 { base@ }
+            else { base@.push('/') + relative@ };
+        &&& out.is_some() == (key.len() != 0 && !vstd::utf8::encode_utf8(key).contains(0u8))
+        &&& out matches Some((destination,name,data)) ==> destination == (owner,branch) && name@ == key && data@ == content@
+    }),
+{
+    let path = crate::path_validation::join(base,relative);
+    let mut file = crate::storage_file::open_at(path,None,true,true,
+        |_:&String,_:u64,_:u64| -> Result<Vec<u8>,()> { Err(()) }).ok()?;
+    file.write_bytes(content);
+    assert(file.buffered() =~= content@);
+    file.publish(|p:&String,b:&Vec<u8>| -> (r:Option<((u64,Option<u64>),String,Vec<u8>)>)
+        ensures r.is_some() == (p@.len() != 0 && !vstd::utf8::encode_utf8(p@).contains(0u8)),
+            r matches Some((d,n,v)) ==> d == (owner,branch) && n@ == p@ && v@ == b@,
+        { catalog_write(owner,branch,p.as_str(),b.as_slice(),true,Some(false),true).ok() })?
+}
+
 }
