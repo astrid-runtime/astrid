@@ -32,6 +32,15 @@ def consumer_defects():
             lambda s, a=original, b=changed: replace_once(s, a, b), hop_trace,
         )
     for name, original, changed in [
+        ("loses alias mismatch refusal", "ensures matches == (reader@", "ensures reader@ == creator@ ==> matches == (reader@"),
+        ("loses pinned UID comparison", "ensures matches == (reader@", "ensures expected.is_none() ==> matches == (reader@"),
+    ]:
+        yield (
+            f"stream owner {name}", body,
+            lambda s, a=original, b=changed: replace_once(s, a, b),
+            hop_trace,
+        )
+    for name, original, changed in [
         ("loses the owner binding", "if owner && opening && reading { Some(effect(handle)) }",
          "if opening && reading { Some(effect(handle)) }"),
         ("ignores opening retirement", "if owner && opening && reading { Some(effect(handle)) }",

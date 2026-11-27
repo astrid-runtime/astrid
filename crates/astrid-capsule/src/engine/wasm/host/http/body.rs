@@ -18,6 +18,21 @@ pub(super) fn finish<E>(body: Vec<u8>, read: Option<Option<Result<(), E>>>, clos
     }
 }
 
+/// Compare the reader alias and pinned UID with the opening identity.
+pub(super) fn same_owner(reader: &str, creator: &str, expected: Option<&[u8; 32]>, owner: &[u8; 32])
+    -> (matches: bool)
+    ensures matches == (reader@ == creator@ && match expected {
+        Some(uid) => uid@ == owner@,
+        None => true,
+    }),
+{
+    if reader != creator { return false; }
+    let Some(uid) = expected else { return true; };
+    if uid.as_slice() != owner.as_slice() { return false; }
+    assert(uid@ =~= owner@);
+    true
+}
+
 /// Evaluate the disclosure callback only while the resource and its reader are admitted.
 pub(super) fn disclose<H,T,F:FnOnce(H)->T>(owner:bool, opening:bool, reading:bool, handle:H, effect:F)
     -> (r:Option<T>)

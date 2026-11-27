@@ -30,6 +30,16 @@ fn buffered_receipt(body: Vec<u8>, device_live: bool, invocation_live: bool,
     crate::http_body::finish(body,outcome,closed)
 }
 
+fn pinned_metadata(reader: &str, creator: &str, expected: Option<&[u8; 32]>, owner: &[u8; 32],
+    opening: bool, reading: bool, status: u16) -> (result: Option<u16>)
+    ensures result == if reader@ == creator@ && opening && reading &&
+        (match expected { Some(uid) => uid@ == owner@, None => true }) { Some(status) } else { None },
+{
+    let bound = crate::http_body::same_owner(reader, creator, expected, owner);
+    crate::http_body::disclose(bound, opening, reading, status,
+        |selected: u16| -> (v: u16) ensures v == selected, { selected })
+}
+
 fn stream_release(owner:bool, opening:bool, reader:bool, payload:u64) -> (r:Option<u64>)
     ensures r == if owner && opening && reader { Some(payload) } else { None },
 {

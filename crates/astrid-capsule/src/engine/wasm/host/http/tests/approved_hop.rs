@@ -300,13 +300,26 @@ async fn stream_retirement_drains_idle_and_reading_resources() {
         Caller,
         Responder,
         Principal,
+        Reader,
     }
     for reading in [false, true] {
-        for retiring in [Retire::Caller, Retire::Responder, Retire::Principal] {
+        for retiring in [
+            Retire::Caller,
+            Retire::Responder,
+            Retire::Principal,
+            Retire::Reader,
+        ] {
             tokio::time::timeout(Duration::from_secs(8), async {
                 let dir = tempfile::tempdir().unwrap();
                 let (mut state, principal, owner, caller, responder) = device_host(dir.path());
-                let key = DeviceKeyId::new(if matches!(retiring, Retire::Responder) {
+                let reader = DeviceKey::new("c".repeat(64), DeviceScope::Full, None, 0);
+                let home = AstridHome::from_path(dir.path());
+                let mut profile = PrincipalProfile::load(&home, &principal).unwrap();
+                profile.add_device(reader.clone());
+                profile.save(&home, &principal).unwrap();
+                let key = DeviceKeyId::new(if matches!(retiring, Retire::Reader) {
+                    reader.key_id.clone()
+                } else if matches!(retiring, Retire::Responder) {
                     responder.key_id.clone()
                 } else {
                     caller.key_id.clone()
@@ -364,6 +377,25 @@ async fn stream_retirement_drains_idle_and_reading_resources() {
                 let uid = directory.uid_for(&principal).unwrap();
                 let alias = PrincipalId::new("stream-alias").unwrap();
                 directory.rename(uid, &principal, alias.clone()).unwrap();
+                // The renamed principal still has the opening UID and device.
+                // Only the captured alias differs.
+                PrincipalProfile::load(&home, &principal)
+                    .unwrap()
+                    .save(&home, &alias)
+                    .unwrap();
+                state.caller_context.as_mut().unwrap().principal = Some(alias.to_string());
+                assert!(state.admit_egress_caller().is_some());
+                assert_eq!(
+                    directory.uid_for(&state.effective_principal()).unwrap(),
+                    uid
+                );
+                assert_eq!(stream_status(&mut state, rep), 0);
+                assert!(stream_headers(&mut state, rep).is_empty());
+                assert!(matches!(
+                    stream_read_chunk(&mut state, rep).await,
+                    Err(ErrorCode::Closed)
+                ));
+                state.caller_context.as_mut().unwrap().principal = Some(principal.to_string());
                 let replacement = astrid_core::PrincipalUid::from_bytes([19; 32]);
                 directory.register(principal.clone(), replacement).unwrap();
                 assert_eq!(stream_status(&mut state, rep), 0);
@@ -381,6 +413,13 @@ async fn stream_retirement_drains_idle_and_reading_resources() {
                     .unwrap();
                 directory.rename(uid, &alias, principal.clone()).unwrap();
                 assert_eq!(stream_read_chunk(&mut state, rep).await.unwrap(), b"a");
+                if matches!(retiring, Retire::Reader) {
+                    let context = state.caller_context.as_mut().unwrap();
+                    context.device_key_id = Some(reader.key_id.clone());
+                    context.device_registration_id = reader.registration_id.map(Into::into);
+                    assert_eq!(stream_status(&mut state, rep), 200);
+                }
+                let cache = state.profile_cache.clone().unwrap();
                 let retire = async {
                     if matches!(retiring, Retire::Principal) {
                         assert!(tracker.active(&principal) > 0);
@@ -388,6 +427,11 @@ async fn stream_retirement_drains_idle_and_reading_resources() {
                         owner_cancel.cancel();
                         tracker.wait_for_quiescence(&principal).await;
                     } else {
+                        if matches!(retiring, Retire::Reader) {
+                            profile.auth.remove_device(&key).unwrap();
+                            profile.save(&home, &principal).unwrap();
+                            cache.invalidate(&principal);
+                        }
                         sessions.retire(&principal, &key).await.unwrap();
                     }
                 };
@@ -410,6 +454,12 @@ async fn stream_retirement_drains_idle_and_reading_resources() {
                     stream_read_chunk(&mut state, rep).await,
                     Err(ErrorCode::Closed)
                 ));
+                if matches!(retiring, Retire::Reader) {
+                    let context = state.caller_context.as_mut().unwrap();
+                    context.device_key_id = Some(caller.key_id.clone());
+                    context.device_registration_id = caller.registration_id.map(Into::into);
+                    assert_eq!(stream_status(&mut state, rep), 200);
+                }
                 stream_close(&mut state, rep).unwrap();
                 assert!(state.active_http_streams.is_empty());
             })

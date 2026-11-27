@@ -1,6 +1,7 @@
 //! An idle resource keeps a weak handle. Its transport and original admission
 //! belong to a task that wakes on close, cancellation or device retirement.
 use super::super::consent_egress::EgressAuthority;
+use super::KeyValuePair;
 use crate::engine::wasm::host_state::HostState;
 use astrid_core::{PrincipalId, PrincipalUid};
 use std::sync::{Arc, Weak};
@@ -10,6 +11,8 @@ pub(super) struct OpenResponse {
     // Drop the transport before releasing the admission.
     pub(super) response: tokio::sync::Mutex<reqwest::Response>,
     pub(super) authority: EgressAuthority,
+    pub(super) status: u16,
+    pub(super) headers: Vec<KeyValuePair>,
     owner_cancel: CancellationToken,
     invocation_cancel: CancellationToken,
 }
@@ -30,7 +33,20 @@ impl StreamLifetime {
         authority: EgressAuthority,
         audit: Arc<std::sync::Mutex<super::audit::HttpExchange>>,
     ) -> Self {
+        let status = response.status().as_u16();
+        let mut resp_headers = Vec::new();
+        for (k, v) in response.headers() {
+            if let Ok(v_str) = v.to_str() {
+                resp_headers.push(KeyValuePair {
+                    key: k.as_str().to_string(),
+                    value: v_str.to_string(),
+                });
+            }
+        }
+
         let open = Arc::new(OpenResponse {
+            status,
+            headers: resp_headers,
             response: tokio::sync::Mutex::new(response),
             authority,
             owner_cancel,
@@ -81,7 +97,12 @@ impl StreamLifetime {
             .with_bound_input(&principal, self.owner, open, |open| {
                 let expected = state.invocation_storage_uid.or(state.runtime_owner_uid);
                 super::body::disclose(
-                    &principal == creator && expected.is_none_or(|uid| uid == self.owner),
+                    super::body::same_owner(
+                        principal.as_str(),
+                        creator.as_str(),
+                        expected.as_ref().map(PrincipalUid::as_bytes),
+                        self.owner.as_bytes(),
+                    ),
                     open.live_now(),
                     state.invocation_authority_active() && reader.devices_live(),
                     open,

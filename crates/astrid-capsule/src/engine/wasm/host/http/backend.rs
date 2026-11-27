@@ -92,8 +92,6 @@ async fn check_http_security(
 pub struct ActiveHttpStream {
     lifetime: super::stream_lifetime::StreamLifetime,
     pub creator: astrid_core::principal::PrincipalId,
-    pub status: u16,
-    pub headers: Vec<KeyValuePair>,
     /// Per-chunk read timeout. Caller-overridable via
     /// `timeout-config.between-bytes-ms`; defaults to the host
     /// [`HttpLimits::stream_read_timeout`](crate::engine::wasm::limits::HttpLimits::stream_read_timeout).
@@ -111,8 +109,6 @@ impl ActiveHttpStream {
         Self {
             lifetime: super::stream_lifetime::StreamLifetime::closed(),
             creator: creator.clone(),
-            status: 200,
-            headers: Vec::new(),
             read_timeout: Duration::from_secs(120),
             audit: Arc::default(),
         }
@@ -649,17 +645,6 @@ impl HostState {
         let response = wire.response;
         let mut exchange = wire.exchange;
         exchange.begin_body();
-        let status = response.status().as_u16();
-        let mut resp_headers = Vec::new();
-        for (k, v) in response.headers() {
-            if let Ok(v_str) = v.to_str() {
-                resp_headers.push(KeyValuePair {
-                    key: k.as_str().to_string(),
-                    value: v_str.to_string(),
-                });
-            }
-        }
-
         let audit = Arc::new(std::sync::Mutex::new(exchange));
         let active = ActiveHttpStream {
             lifetime: super::stream_lifetime::StreamLifetime::start(
@@ -671,8 +656,6 @@ impl HostState {
                 audit.clone(),
             ),
             creator: principal.clone(),
-            status,
-            headers: resp_headers,
             read_timeout,
             audit,
         };
@@ -780,7 +763,10 @@ pub(super) fn stream_status(state: &mut HostState, rep: u32) -> u16 {
         return 0;
     };
     live_stream(state, rep)
-        .and_then(|s| s.lifetime.access(state, &s.creator, &reader, |_| s.status))
+        .and_then(|s| {
+            s.lifetime
+                .access(state, &s.creator, &reader, |open| open.status)
+        })
         .unwrap_or(0)
 }
 
@@ -791,7 +777,7 @@ pub(super) fn stream_headers(state: &mut HostState, rep: u32) -> Vec<KeyValuePai
     live_stream(state, rep)
         .and_then(|s| {
             s.lifetime
-                .access(state, &s.creator, &reader, |_| s.headers.clone())
+                .access(state, &s.creator, &reader, |open| open.headers.clone())
         })
         .unwrap_or_default()
 }
