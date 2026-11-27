@@ -89,6 +89,42 @@ proof fn first_difference(a:Seq<u8>,b:Seq<u8>,i:int)
     }
 }
 
+/// The first differing byte, or the end of the shorter prefix.
+proof fn order_witness(a: Seq<u8>, b: Seq<u8>) -> (i: int)
+    requires before(a,b),
+    ensures 0 <= i <= a.len(), i < b.len(), a.take(i) == b.take(i),
+        i < a.len() ==> a[i] < b[i],
+{
+    if a.len() < b.len() && a == b.take(a.len() as int) {
+        assert(a.take(a.len() as int) =~= a);
+        a.len() as int
+    } else {
+        choose|i:int| 0 <= i < a.len() && i < b.len() && a.take(i) == b.take(i)
+            && #[trigger] a[i] < #[trigger] b[i]
+    }
+}
+
+pub(crate) proof fn order_transitive(a: Seq<u8>, b: Seq<u8>, c: Seq<u8>)
+    requires before(a,b), before(b,c),
+    ensures before(a,c),
+{
+    let i = order_witness(a,b);
+    let j = order_witness(b,c);
+    let k = if i < j { i } else { j };
+    assert forall|h:int| 0 <= h < k implies #[trigger] a.take(k)[h] == c.take(k)[h] by {
+        assert(a.take(i)[h] == a[h] && b.take(i)[h] == b[h]);
+        assert(b.take(j)[h] == b[h] && c.take(j)[h] == c[h]);
+    }
+    assert(a.take(k) =~= c.take(k));
+    if k == a.len() {
+        assert(a.take(k) =~= a);
+    } else {
+        if i < j { assert(b.take(j)[i] == b[i] && c.take(j)[i] == c[i]); }
+        if j < i { assert(a.take(i)[j] == a[j] && b.take(i)[j] == b[j]); }
+        assert(a[k] < c[k]);
+    }
+}
+
 impl ObjectId {
     pub(crate) open spec fn digest_before(a:Seq<u8>, b:Seq<u8>) -> bool {before(a,b)}
 
@@ -96,17 +132,7 @@ impl ObjectId {
         requires a.len() == b.len() == c.len(),before(a,b),before(b,c),
         ensures before(a,c),
     {
-        let i = choose|i:int| 0 <= i < a.len() && i < b.len() && a.take(i) == b.take(i) && #[trigger] a[i] < #[trigger] b[i];
-        let j = choose|j:int| 0 <= j < b.len() && j < c.len() && b.take(j) == c.take(j) && #[trigger] b[j] < #[trigger] c[j];
-        let k = if i < j {i} else {j};
-        if i < j {assert(b.take(j)[i] == b[i] && c.take(j)[i] == c[i]);}
-        if j < i {assert(a.take(i)[j] == a[j] && b.take(i)[j] == b[j]);}
-        assert forall|h:int| 0 <= h < k implies #[trigger] a.take(k)[h] == c.take(k)[h] by {
-            assert(a.take(i)[h] == a[h] && b.take(i)[h] == b[h]);
-            assert(b.take(j)[h] == b[h] && c.take(j)[h] == c[h]);
-        }
-        assert(a.take(k) =~= c.take(k));
-        assert(a[k] < c[k]);
+        order_transitive(a,b,c);
     }
 
     pub(crate) fn strictly_before(&self, other:&Self) -> (yes:bool)

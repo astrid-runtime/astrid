@@ -41,14 +41,37 @@ pub(super) open spec fn positioned(refs:Seq<ObjectReference>,label:Seq<u8>,i:int
     &&& forall|j:int| i < j < refs.len() ==> #[trigger] refs[j].fields().0 != label && !ObjectRecord::label_before(refs[j].fields().0,label)
 }
 
+/// The exact reference selected by the decoder, even for noncanonical input.
+pub(super) open spec fn selected(refs: Seq<ObjectReference>, label: Seq<u8>, lo: int, hi: int)
+    -> Option<ObjectReference>
+    decreases hi - lo,
+{
+    if lo < 0 || lo >= hi || hi > refs.len() {
+        None
+    } else {
+        let mid = lo + (hi - lo) / 2;
+        let r = refs[mid];
+        if r.fields().0 == label { Some(r) }
+        else if ObjectRecord::label_before(r.fields().0, label) { selected(refs, label, mid + 1, hi) }
+        else { selected(refs, label, lo, mid) }
+    }
+}
+
+pub(super) open spec fn state_edge(commit: ObjectRecord) -> Option<ObjectReference> {
+    let refs = commit.contents().3;
+    selected(refs, super::commit_candidate::STATE@, 0, refs.len() as int)
+}
+
 pub(super) fn find<'a>(refs:&'a [ObjectReference],label:&[u8]) -> (out:Option<&'a ObjectReference>)
-    ensures out matches Some(r) ==> refs@.contains(*r) && r.fields().0 == label@,
+    ensures (match out { Some(r) => Some(*r), None => None }) == selected(refs@,label@,0,refs.len() as int),
+        out matches Some(r) ==> refs@.contains(*r) && r.fields().0 == label@,
         forall|i:int| #[trigger] positioned(refs@,label@,i) ==> (out matches Some(r) && *r == refs@[i]),
 {
     let mut lo = 0usize;
     let mut hi = refs.len();
     while lo < hi
         invariant lo <= hi <= refs.len(),
+            selected(refs@,label@,lo as int,hi as int) == selected(refs@,label@,0,refs.len() as int),
             forall|i:int| #[trigger] positioned(refs@,label@,i) ==> lo <= i < hi,
         decreases hi-lo,
     {
@@ -85,6 +108,7 @@ pub(super) fn read<P,E,L>(owner:&P,root:RootState,v:ObjectFormatVersion,load:L) 
         &&& load.ensures((owner,root.commit),Ok(g.commit))
         &&& structural(*g.commit,ObjectKind::Commit,v)
         &&& exists|r:ObjectReference| g.commit.contents().3.contains(r)
+            && state_edge(*g.commit) == Some(r)
             && #[trigger] r.fields() == (super::commit_candidate::STATE@,g.state_id,super::ReferenceKind::Owns)
         &&& load.ensures((owner,g.state_id),Ok(g.state))
         &&& structural(*g.state,ObjectKind::PrincipalState,v)
@@ -92,7 +116,7 @@ pub(super) fn read<P,E,L>(owner:&P,root:RootState,v:ObjectFormatVersion,load:L) 
         out matches Err(Error::Read(error)) ==> load.ensures((owner,root.commit),Err(error)) ||
             exists|c:Arc<ObjectRecord>,edge:ObjectReference|
                 #[trigger] load.ensures((owner,root.commit),Ok(c)) && structural(*c,ObjectKind::Commit,v)
-                && c.contents().3.contains(edge) && edge.fields().0 == super::commit_candidate::STATE@
+                && state_edge(*c) == Some(edge) && c.contents().3.contains(edge) && edge.fields().0 == super::commit_candidate::STATE@
                 && edge.fields().2 == super::ReferenceKind::Owns && #[trigger] load.ensures((owner,edge.fields().1),Err(error)),
 {
     let commit = match load(owner,root.commit) { Ok(r)=>r, Err(e)=>return Err(Error::Read(e)) };

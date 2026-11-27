@@ -57,6 +57,26 @@ pub(crate) open spec fn labels_ordered(refs:Seq<ObjectReference>) -> bool {
     forall|i:int| 0 < i < refs.len() ==> #[trigger] Self::label_before(refs[i-1].fields().0,refs[i].fields().0)
 }
 
+    pub(crate) proof fn ordered_pair(refs: Seq<ObjectReference>, i: int, j: int)
+        requires Self::labels_ordered(refs), 0 <= i < j < refs.len(),
+        ensures Self::label_before(refs[i].fields().0, refs[j].fields().0),
+            !Self::label_before(refs[j].fields().0, refs[i].fields().0),
+            refs[i].fields().0 != refs[j].fields().0,
+        decreases j - i,
+    {
+        let a = refs[i].fields().0;
+        let b = refs[j].fields().0;
+        assert(Self::label_before(refs[j-1].fields().0,b));
+        if i < j-1 {
+            Self::ordered_pair(refs,i,j-1);
+            super::object_reference::order_transitive(a,refs[j-1].fields().0,b);
+        }
+        if Self::label_before(b,a) {
+            super::object_reference::order_transitive(a,b,a);
+            assert(!Self::label_before(a,a));
+        }
+    }
+
     pub closed spec fn contents(&self) -> (ObjectKind,u16,Seq<u8>,Seq<ObjectReference>,u64,ObjectClass) {
         (self.kind,self.format_version.number(),self.canonical_bytes@,self.references@,self.logical_bytes,self.class)
     }

@@ -1,6 +1,9 @@
 // Verus entry point for transitions used by hosted Astrid.
 
 extern crate self as astrid_core;
+#[path = "../crates/astrid-storage/src/content/catalog/summary.rs"]
+mod catalog_summary;
+mod hosted_catalog_charge;
 #[path = "../crates/astrid-storage/src/content/store/workspace/reference_transition.rs"]
 mod workspace_references;
 #[path = "../crates/astrid-storage/src/content/store/workspace/retry.rs"]

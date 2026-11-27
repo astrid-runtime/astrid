@@ -1,6 +1,7 @@
 //! Canonical path-copy catalog for principal-owned named content.
 
 mod legacy;
+mod summary;
 mod tree;
 
 pub(crate) const CONTENT_COMPONENT_LABEL: &[u8] = super::component_labels::CONTENT;
@@ -8,7 +9,8 @@ pub(crate) const CONTENT_COMPONENT_LABEL: &[u8] = super::component_labels::CONTE
 pub(crate) use legacy::decode_catalog as decode_legacy_catalog;
 #[cfg(test)]
 pub(crate) use legacy::{LegacyCatalog, encode_catalog as encode_legacy_catalog};
+pub(crate) use summary::CatalogSummary;
 pub(crate) use tree::{
-    CatalogRoot, CatalogSummary, CatalogValidation, CatalogValue, build_catalog, delete, insert,
-    list, list_prefix, lookup, prefix_exists, root_from_record, validate_catalog,
+    CatalogRoot, CatalogValidation, CatalogValue, build_catalog, delete, insert, list, list_prefix,
+    lookup, prefix_exists, root_from_record, validate_catalog,
 };

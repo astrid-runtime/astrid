@@ -94,6 +94,8 @@ def defects():
     for name, old, new in [
         ("commit can belong to another lookup", "&&& load.ensures((owner,root.commit),Ok(g.commit))", "&&& true"),
         ("state can belong to another lookup", "&&& load.ensures((owner,g.state_id),Ok(g.state))", "&&& true"),
+        ("success can substitute a different matching edge", "&& state_edge(*g.commit) == Some(r)", "&& true"),
+        ("failure can substitute a different matching edge", "&& state_edge(*c) == Some(edge)", "&& true"),
         ("state edge can point elsewhere", "r.fields() == (super::commit_candidate::STATE@,g.state_id,super::ReferenceKind::Owns)", "r.fields().0 == super::commit_candidate::STATE@"),
         ("state can carry a different shape", "&&& structural(*g.state,ObjectKind::PrincipalState,v)", "&&& true"),
         ("canonical state edge can be missed", "forall|i:int| #[trigger] positioned(refs@,label@,i) ==> (out matches Some(r) && *r == refs@[i]),", "true,"),
@@ -119,4 +121,17 @@ def defects():
         yield (
             f"owner components {name}", component_source,
             lambda s, a=old, b=new: replace_once(s, a, b), component_trace,
+        )
+
+    source = Path("crates/astrid-storage/src/content/catalog/summary.rs")
+    trace = Path("verification/hosted_catalog_charge.rs")
+    for name, old, new in [
+        ("can omit the name charge", "s.quota_bytes == logical + name.len()", "s.quota_bytes >= logical"),
+        ("can refuse a valid leaf", "out.is_some() == (logical", "out.is_some() ==> (logical"),
+        ("can discard a child charge", "s.quota_bytes == left.quota_bytes + right.quota_bytes", "s.quota_bytes >= left.quota_bytes"),
+        ("can refuse a valid join", "out.is_some() == (left.logical_bytes", "out.is_some() ==> (left.logical_bytes"),
+    ]:
+        yield (
+            f"catalog accounting {name}", source,
+            lambda s, a=old, b=new: replace_once(s, a, b), trace,
         )

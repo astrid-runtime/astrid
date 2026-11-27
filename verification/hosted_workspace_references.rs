@@ -3,7 +3,7 @@ use crate::{ObjectId,ObjectReference,ReferenceKind,workspace_references as refs}
 use vstd::prelude::*;
 
 verus! {
-/// Both observed records must belong to the sampled owner's object table.
+/// Both observed records must match the supplied loader for this owner and selected ID.
 fn decoded_graph<P,E,L>(owner:&P,root:crate::RootState,v:crate::ObjectFormatVersion,load:L,
     table:Ghost<spec_fn(P,ObjectId)->Result<std::sync::Arc<crate::ObjectRecord>,E>>)
     -> (out:Result<crate::header_graph::Graph,crate::header_graph::Error<E>>)
@@ -14,7 +14,7 @@ fn decoded_graph<P,E,L>(owner:&P,root:crate::RootState,v:crate::ObjectFormatVers
         &&& (table@)(*owner,root.commit) == Ok(g.commit)
         &&& g.commit.contents().0 == crate::ObjectKind::Commit && g.commit.contents().1 == v.number()
         &&& g.commit.contents().2.len() == 0 && g.commit.contents().4 == 0 && g.commit.contents().5 == crate::ObjectClass::Metadata
-        &&& exists|edge:ObjectReference| g.commit.contents().3.contains(edge) && #[trigger] edge.fields() == (b"state"@,g.state_id,ReferenceKind::Owns)
+        &&& exists|edge:ObjectReference| g.commit.contents().3.contains(edge) && crate::header_graph::state_edge(*g.commit) == Some(edge) && #[trigger] edge.fields() == (b"state"@,g.state_id,ReferenceKind::Owns)
         &&& (table@)(*owner,g.state_id) == Ok(g.state)
         &&& g.state.contents().0 == crate::ObjectKind::PrincipalState && g.state.contents().1 == v.number()
         &&& g.state.contents().2.len() == 0 && g.state.contents().4 == 0 && g.state.contents().5 == crate::ObjectClass::Metadata
@@ -22,15 +22,26 @@ fn decoded_graph<P,E,L>(owner:&P,root:crate::RootState,v:crate::ObjectFormatVers
         out matches Err(crate::header_graph::Error::Read(e)) ==> (table@)(*owner,root.commit) == Err(e) ||
             exists|c:std::sync::Arc<crate::ObjectRecord>,edge:ObjectReference|
                 (table@)(*owner,root.commit) == Ok(c) && #[trigger] c.contents().3.contains(edge) &&
-                #[trigger] edge.fields() == (b"state"@,edge.fields().1,ReferenceKind::Owns) && (table@)(*owner,edge.fields().1) == Err(e),
+                crate::header_graph::state_edge(*c) == Some(edge) && edge.fields().0 == b"state"@ && edge.fields().2 == ReferenceKind::Owns && (table@)(*owner,edge.fields().1) == Err(e),
 {
     crate::header_graph::read(owner,root,v,load)
 }
 
 fn find_canonical_state(refs:&[ObjectReference],i:Ghost<int>) -> (out:Option<&ObjectReference>)
-    requires crate::header_graph::positioned(refs@,b"state"@,i@),
+    requires crate::ObjectRecord::labels_ordered(refs@), 0 <= i@ < refs.len(), refs@[i@].fields().0 == b"state"@,
     ensures out matches Some(r) && *r == refs@[i@],
 {
+    proof {
+        assert forall|j:int| 0 <= j < i@ implies #[trigger] refs@[j].fields().0 != b"state"@ &&
+            crate::ObjectRecord::label_before(refs@[j].fields().0,b"state"@) by {
+            crate::ObjectRecord::ordered_pair(refs@,j,i@);
+        }
+        assert forall|j:int| i@ < j < refs.len() implies #[trigger] refs@[j].fields().0 != b"state"@ &&
+            !crate::ObjectRecord::label_before(refs@[j].fields().0,b"state"@) by {
+            crate::ObjectRecord::ordered_pair(refs@,i@,j);
+        }
+    }
+    assert(crate::header_graph::positioned(refs@,b"state"@,i@));
     crate::header_graph::find(refs,b"state")
 }
 

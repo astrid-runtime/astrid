@@ -29,14 +29,24 @@ fn state_read_requires_an_owning_edge_and_preserves_the_selected_load_error() {
     let target = ObjectId::new([2; 32]);
     let owner = crate::StateOwner::System;
     for kind in [ReferenceKind::Lineage, ReferenceKind::Owns] {
-        let commit = record(
-            ObjectKind::Commit,
-            vec![ObjectReference::new(
-                ReferenceLabel::new(STATE_LABEL.to_vec()),
-                target,
-                kind,
-            )],
-        );
+        let links = [
+            b"parent".as_slice(),
+            b"stat",
+            STATE_LABEL,
+            b"state-extra",
+            b"z",
+            b"zz",
+        ]
+        .into_iter()
+        .map(|label| {
+            if label == STATE_LABEL {
+                ObjectReference::new(ReferenceLabel::new(label.to_vec()), target, kind)
+            } else {
+                ObjectReference::owns(ReferenceLabel::new(label.to_vec()), root.commit)
+            }
+        })
+        .collect();
+        let commit = record(ObjectKind::Commit, links);
         let calls = RefCell::new(Vec::new());
         let result = header_graph::read(&owner, root, ObjectFormatVersion::V1, |p, id| {
             calls.borrow_mut().push((*p, id));
