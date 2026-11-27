@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use astrid_core::principal::PrincipalId;
 
-use super::{PersistentProcessRegistry, SpawnParams};
+use super::{ErrorCode, PersistentProcessRegistry, SpawnParams};
 
 /// Spawn a real child running `sh -c <script>`, in its own process group
 /// (mirroring the production sandboxed path), with stdout/stderr piped.
