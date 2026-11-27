@@ -221,3 +221,23 @@ def defects():
         ),
         consumer,
     )
+
+    for name, original, changed in [
+        ("reverses the root comparison", "C::below(self.writable_root, path)", "C::below(path, self.writable_root)"),
+        ("skips read grants", "includes_grant::<C>(self.extra_reads, path)", "false"),
+        ("uses metadata as a write grant", "includes_grant::<C>(self.extra_writes, path)", "includes_grant::<C>(self.ancestors, path)"),
+        ("omits injected targets", "includes_grant::<C>(self.injections, path)", "false"),
+        ("tests only the first path", "if C::below(paths[i], root)", "if C::below(paths[0], root)"),
+    ]:
+        yield (
+            f"Seatbelt grant classification {name}", macos,
+            lambda s, a=original, b=changed: replace_once(s, a, b), macos,
+        )
+    yield (
+        "Seatbelt grant classification treats metadata as a grant in contract and implementation", macos,
+        lambda s: replace_once(
+            replace_once(s, "any_below::<C>(self.extra_writes@, root)", "any_below::<C>(self.ancestors@, root)"),
+            "includes_grant::<C>(self.extra_writes, path)", "includes_grant::<C>(self.ancestors, path)",
+        ),
+        consumer,
+    )

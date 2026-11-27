@@ -74,11 +74,24 @@ fn sandbox_path_rule(kind:&crate::seatbelt_profile::PathRule, path:&str) -> (out
     Some(kind.render(value))
 }
 
+spec fn hidden_classification<'a,C:crate::seatbelt_profile::Components>(rules:&crate::seatbelt_profile::Rules<'a>)
+    -> Seq<(&'a str,bool)> {
+    rules.hidden@.map(|_, root| (root,
+        C::parts(root).is_prefix_of(C::parts(rules.writable_root)) ||
+        (exists|i:int| 0 <= i < rules.extra_reads.len() &&
+            C::parts(root).is_prefix_of(C::parts(#[trigger] rules.extra_reads@[i]))) ||
+        (exists|i:int| 0 <= i < rules.extra_writes.len() &&
+            C::parts(root).is_prefix_of(C::parts(#[trigger] rules.extra_writes@[i]))) ||
+        (exists|i:int| 0 <= i < rules.injections.len() &&
+            C::parts(root).is_prefix_of(C::parts(#[trigger] rules.injections@[i])))))
+}
+
 /// Specify the authority of every ordered rule group independently of the renderer.
-spec fn seatbelt_file_policy(rules:&crate::seatbelt_profile::Rules) -> Seq<char> {
+spec fn seatbelt_file_policy<C:crate::seatbelt_profile::Components>(rules:&crate::seatbelt_profile::Rules) -> Seq<char> {
     use crate::seatbelt_profile::{BASE_RULES, hidden_group, PathRule};
-    let early = hidden_group(rules.hidden@, true, rules.hidden@.len());
-    let late = hidden_group(rules.hidden@, false, rules.hidden@.len());
+    let classified = hidden_classification::<C>(rules);
+    let early = hidden_group(classified, true, rules.hidden@.len());
+    let late = hidden_group(classified, false, rules.hidden@.len());
     BASE_RULES@ + PathRule::Hide.group(early, early.len()) +
         "\n(allow file-read-metadata\n"@ +
         PathRule::Literal.group(rules.ancestors@, rules.ancestors@.len()) +
@@ -94,17 +107,18 @@ spec fn seatbelt_file_policy(rules:&crate::seatbelt_profile::Rules) -> Seq<char>
 /// Compare both native policy encodings for the same network setting. The
 /// Linux prefix supplied by the mount builder and Seatbelt file-rule inputs
 /// remain explicit parameters of this result.
-fn platform_network(network:bool, rules:&crate::seatbelt_profile::Rules, mut mounts:Vec<&'static str>)
+fn platform_network<C:crate::seatbelt_profile::Components>(network:bool, rules:&crate::seatbelt_profile::Rules, mut mounts:Vec<&'static str>)
     -> (out:(String,Vec<&'static str>))
     ensures
         out.0@ == "(version 1)\n(deny default)\n(allow process-exec*)\n(allow process-fork)\n"@ +
-            (if network { "(allow network*)"@ } else { seq![] }) + seatbelt_file_policy(rules),
+            (if network { "(allow network*)"@ } else { seq![] }) + seatbelt_file_policy::<C>(rules),
         out.1@ == if network {
             mounts@ + seq!["--unshare-all","--share-net","--die-with-parent","--"]
         } else { mounts@ + seq!["--unshare-all","--die-with-parent","--"] },
 {
     let ghost before = mounts@;
-    let profile = rules.render(network);
+    assert(rules.classified::<C>() =~= hidden_classification::<C>(rules));
+    let profile = rules.render::<C>(network);
     crate::bwrap_flags::finish(&mut mounts,network,
         |s:&'static str| -> (v:&'static str) ensures v == s { s });
     assert(mounts@ =~= if network {
@@ -113,17 +127,17 @@ fn platform_network(network:bool, rules:&crate::seatbelt_profile::Rules, mut mou
     (profile,mounts)
 }
 
-fn capsule_platform_network<D,P>(domains:&[D], peers:&[P], rules:&crate::seatbelt_profile::Rules, mounts:Vec<&'static str>)
+fn capsule_platform_network<D,P,C:crate::seatbelt_profile::Components>(domains:&[D], peers:&[P], rules:&crate::seatbelt_profile::Rules, mounts:Vec<&'static str>)
     -> (out:Option<(String,Vec<&'static str>)>)
     ensures match out {
         None => domains.len() > 0 || peers.len() > 0,
         Some((profile,args)) => domains.len() == 0 && peers.len() == 0 &&
-            profile@ == "(version 1)\n(deny default)\n(allow process-exec*)\n(allow process-fork)\n"@ + seatbelt_file_policy(rules) &&
+            profile@ == "(version 1)\n(deny default)\n(allow process-exec*)\n(allow process-fork)\n"@ + seatbelt_file_policy::<C>(rules) &&
             args@ == mounts@ + seq!["--unshare-all","--die-with-parent","--"],
     },
 {
     let settings = crate::capsule_stdio_network::admit(domains,peers)?;
-    Some(platform_network(settings.allow_network,rules,mounts))
+    Some(platform_network::<C>(settings.allow_network,rules,mounts))
 }
 
 fn registered_peer(servers: &HashMap<String,Option<u64>>, name: &str)

@@ -110,32 +110,38 @@ pub(super) open spec fn hidden_group<'a>(paths: Seq<(&'a str, bool)>, scoped: bo
     }
 }
 
-/// Deny containing roots before explicit child grants and keep other denies trailing.
-fn partition_hidden<'a>(paths: &[(&'a str, bool)]) -> (groups: (Vec<&'a str>, Vec<&'a str>))
-    ensures groups.0@ == hidden_group(paths@, true, paths@.len()),
-            groups.1@ == hidden_group(paths@, false, paths@.len()),
+/// Platform interpretation of lexical path components for a single comparison.
+pub(super) trait Components {
+    spec fn parts(path: &str) -> Seq<Seq<u8>>;
+
+    fn below(path: &str, root: &str) -> (yes: bool)
+        ensures yes == Self::parts(root).is_prefix_of(Self::parts(path));
+}
+
+pub(super) open spec fn any_below<C: Components>(paths: Seq<&str>, root: &str) -> bool {
+    exists|i:int| 0 <= i < paths.len() &&
+        C::parts(root).is_prefix_of(C::parts(#[trigger] paths[i]))
+}
+
+fn includes_grant<C: Components>(paths: &[&str], root: &str) -> (found: bool)
+    ensures found == any_below::<C>(paths@, root),
 {
-    reveal(hidden_group);
-    let mut scoped = Vec::new();
-    let mut trailing = Vec::new();
     let mut i = 0;
     while i < paths.len()
         invariant
             i <= paths.len(),
-            scoped@ == hidden_group(paths@, true, i as nat),
-            trailing@ == hidden_group(paths@, false, i as nat),
+            forall|j:int| 0 <= j < i ==>
+                !C::parts(root).is_prefix_of(C::parts(#[trigger] paths@[j])),
         decreases paths.len() - i,
     {
-        reveal(hidden_group);
-        let (path, grant_below) = paths[i];
-        if grant_below { scoped.push(path); } else { trailing.push(path); }
+        if C::below(paths[i], root) { return true; }
         i = i.saturating_add(1);
     }
-    (scoped, trailing)
+    false
 }
 
 pub(super) struct Rules<'a> {
-    pub(super) hidden: &'a [(&'a str, bool)],
+    pub(super) hidden: &'a [&'a str],
     pub(super) ancestors: &'a [&'a str],
     pub(super) writable_root: &'a str,
     pub(super) extra_reads: &'a [&'a str],
@@ -143,10 +149,49 @@ pub(super) struct Rules<'a> {
     pub(super) extra_writes: &'a [&'a str],
 }
 
-impl Rules<'_> {
-    pub(super) open spec fn remaining_rules(&self) -> Seq<char> {
-        let scoped = hidden_group(self.hidden@, true, self.hidden@.len());
-        let trailing = hidden_group(self.hidden@, false, self.hidden@.len());
+impl<'a> Rules<'a> {
+    pub(super) open spec fn scoped<C: Components>(&self, root: &str) -> bool {
+        C::parts(root).is_prefix_of(C::parts(self.writable_root)) ||
+        any_below::<C>(self.extra_reads@, root) ||
+        any_below::<C>(self.extra_writes@, root) ||
+        any_below::<C>(self.injections@, root)
+    }
+
+    pub(super) open spec fn classified<C: Components>(&self) -> Seq<(&'a str, bool)> {
+        self.hidden@.map(|_, path| (path, self.scoped::<C>(path)))
+    }
+
+    /// Containing-root denies precede explicit child grants. All other denies follow them.
+    fn partition_hidden<C: Components>(&self) -> (groups: (Vec<&'a str>, Vec<&'a str>))
+        ensures groups.0@ == hidden_group(self.classified::<C>(), true, self.hidden@.len()),
+                groups.1@ == hidden_group(self.classified::<C>(), false, self.hidden@.len()),
+    {
+        reveal(hidden_group);
+        let mut scoped = Vec::new();
+        let mut trailing = Vec::new();
+        let mut i = 0;
+        while i < self.hidden.len()
+            invariant
+                i <= self.hidden.len(),
+                scoped@ == hidden_group(self.classified::<C>(), true, i as nat),
+                trailing@ == hidden_group(self.classified::<C>(), false, i as nat),
+            decreases self.hidden.len() - i,
+        {
+            reveal(hidden_group);
+            let path = self.hidden[i];
+            let grant_below = C::below(self.writable_root, path) ||
+                includes_grant::<C>(self.extra_reads, path) ||
+                includes_grant::<C>(self.extra_writes, path) ||
+                includes_grant::<C>(self.injections, path);
+            if grant_below { scoped.push(path); } else { trailing.push(path); }
+            i = i.saturating_add(1);
+        }
+        (scoped, trailing)
+    }
+
+    pub(super) open spec fn remaining_rules<C: Components>(&self) -> Seq<char> {
+        let scoped = hidden_group(self.classified::<C>(), true, self.hidden@.len());
+        let trailing = hidden_group(self.classified::<C>(), false, self.hidden@.len());
         BASE_RULES@ +
         PathRule::Hide.group(scoped, scoped.len()) +
         "\n(allow file-read-metadata\n"@ +
@@ -167,10 +212,10 @@ impl Rules<'_> {
         PathRule::DenyWrite.group(self.injections@, self.injections@.len())
     }
 
-    pub(super) fn render(&self, network: bool) -> (profile: String)
-        ensures profile@ == HEADER@ + (if network { NETWORK@ } else { seq![] }) + self.remaining_rules(),
+    pub(super) fn render<C: Components>(&self, network: bool) -> (profile: String)
+        ensures profile@ == HEADER@ + (if network { NETWORK@ } else { seq![] }) + self.remaining_rules::<C>(),
     {
-        let (scoped, trailing) = partition_hidden(self.hidden);
+        let (scoped, trailing) = self.partition_hidden::<C>();
         let mut profile = HEADER.to_string();
         if network { profile.push_str(NETWORK); }
         profile.push_str(BASE_RULES);

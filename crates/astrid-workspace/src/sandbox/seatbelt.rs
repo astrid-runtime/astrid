@@ -3,6 +3,14 @@ use std::io;
 
 use super::{ProcessSandboxConfig, SandboxPrefix, validate_sandbox_str};
 
+struct NativeComponents;
+
+impl super::seatbelt_profile::Components for NativeComponents {
+    fn below(path: &str, root: &str) -> bool {
+        std::path::Path::new(path).starts_with(root)
+    }
+}
+
 impl ProcessSandboxConfig {
     pub(super) fn build_seatbelt_prefix(&self) -> io::Result<SandboxPrefix> {
         let writable_root_str = validate_sandbox_str(&self.writable_root, "writable root")?;
@@ -23,25 +31,10 @@ impl ProcessSandboxConfig {
             .map(|inj| validate_sandbox_str(&inj.target, "injection target"))
             .collect::<io::Result<Vec<_>>>()?;
 
-        let has_grant_below = |hidden: &std::path::Path| {
-            self.writable_root.starts_with(hidden)
-                || self
-                    .extra_read_paths
-                    .iter()
-                    .any(|path| path.starts_with(hidden))
-                || self
-                    .extra_write_paths
-                    .iter()
-                    .any(|path| path.starts_with(hidden))
-                || self
-                    .ro_injections
-                    .iter()
-                    .any(|injection| injection.target.starts_with(hidden))
-        };
         let hidden = self
             .hidden_paths
             .iter()
-            .map(|p| Ok((validate_sandbox_str(p, "hidden path")?, has_grant_below(p))))
+            .map(|p| validate_sandbox_str(p, "hidden path"))
             .collect::<io::Result<Vec<_>>>()?;
         let ancestors = self.ancestor_metadata_paths()?;
         let profile = super::seatbelt_profile::Rules {
@@ -52,7 +45,7 @@ impl ProcessSandboxConfig {
             injections: &injections,
             extra_writes: &extra_writes,
         }
-        .render(self.allow_network);
+        .render::<NativeComponents>(self.allow_network);
 
         // Pass profile inline via -p to avoid temp file leak.
         let args = vec![OsString::from("-p"), OsString::from(&profile)];
@@ -237,6 +230,34 @@ mod tests {
             "the injection write-deny (offset {deny_pos}) must appear after \
              the allow-write block (offset {allow_write_pos}) so last-match-wins"
         );
+    }
+
+    #[test]
+    fn hidden_classification_uses_grant_components_and_injection_targets() {
+        let prefix = ProcessSandboxConfig::new("/workspace/sub")
+            .with_extra_read("/read/./child")
+            .with_extra_write("/write//child")
+            .with_ro_inject("/source/snapshot", "/target/file")
+            .with_hidden("/work")
+            .with_hidden("/read/")
+            .with_hidden("/source")
+            .with_hidden("/workspace")
+            .with_hidden("/target/file")
+            .with_hidden("/write")
+            .build_seatbelt_prefix()
+            .unwrap();
+        let profile = prefix.args[1].to_str().unwrap();
+        let (early, late) = profile.split_once("(allow file-read-metadata").unwrap();
+        for hidden in ["/workspace", "/read/", "/write", "/target/file"] {
+            let deny = format!("(deny file-read* (subpath \"{hidden}\"))");
+            assert!(early.contains(&deny), "{hidden} contains an explicit grant");
+            assert!(!late.contains(&deny));
+        }
+        for hidden in ["/work", "/source"] {
+            let deny = format!("(deny file-read* (subpath \"{hidden}\"))");
+            assert!(late.contains(&deny), "{hidden} must stay hidden");
+            assert!(!early.contains(&deny));
+        }
     }
 
     #[test]
