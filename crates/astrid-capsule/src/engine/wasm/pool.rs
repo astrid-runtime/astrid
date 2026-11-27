@@ -13,16 +13,11 @@
 //!
 //! ## Free checkout
 //!
-//! Any available instance serves any invocation for the runtime's one durable
-//! principal. This is sound because guest state never crosses PrincipalUid and
-//! interceptor capsules use wasmtime resources (subscriptions, HTTP streams)
-//! *within* a single invocation (subscribe → publish → recv → drop in one
-//! call), so no handle created on one Store is reused on another. The
-//! per-capsule pool-safety audit confirmed this for every pooled capsule;
-//! the one capsule that holds a live resource across invocations
-//! (`astrid-capsule-shell`'s background-process handles) is carved out to
-//! `size == 1` via its `host_process` capability and so never leases a
-//! second Store.
+//! A pool belongs to one authority-scoped runtime. On free checkout, a
+//! completed invocation returns its instance to the pool only after releasing
+//! its host resources. An outstanding resource retires the instance together
+//! with its Store. A size-one `host_process` pool keeps its Store and table
+//! together across successful calls so background process handles persist.
 //!
 //! ## Run-loop capsules are not pooled
 //!
@@ -373,7 +368,8 @@ fn drain_excess<T>(queue: &mut VecDeque<T>, min_idle: usize) -> Vec<T> {
 
 /// RAII lease of one pooled instance.
 ///
-/// Completed calls clear their host state and return to the pool. Interrupted
+/// Completed calls clear invocation state. A free-checkout instance with live
+/// resources is discarded, and other completed instances return to the pool. Interrupted
 /// calls discard the entire Store: clearing host fields cannot repair guest
 /// state or Wasmtime's component-entry state after a trap or cancellation.
 pub(super) struct PoolCheckout {
@@ -670,32 +666,6 @@ mod tests {
         assert!(!state.interceptor_active);
     }
 
-    #[tokio::test]
-    async fn completed_free_checkout_reuses_only_a_clean_instance() {
-        let cancel = CancellationToken::new();
-        let pool = empty_pool(1, 1, &cancel).await;
-        let mut checkout = pool.checkout().await.expect("checkout");
-        checkout.begin_call();
-        let dropped = Arc::new(AtomicBool::new(false));
-        checkout
-            .store_mut()
-            .data_mut()
-            .resource_table
-            .push(DropFlag(Arc::clone(&dropped)))
-            .expect("push resource");
-        checkout.complete_call();
-        drop(checkout);
-        assert!(dropped.load(Ordering::SeqCst));
-        assert!(pool.available.lock().unwrap().is_empty());
-
-        let mut fresh = pool.checkout().await.expect("replacement checkout");
-        fresh.begin_call();
-        fresh.complete_call();
-        drop(fresh);
-        assert_eq!(pool.available.lock().unwrap().len(), 1);
-        cancel.cancel();
-    }
-
     /// Cancellation during host-only setup must return a healthy carve-out
     /// Store without destroying resources that intentionally persist between
     /// guest calls.
@@ -801,7 +771,7 @@ mod tests {
     /// Build a real (but empty) component pool so checkout exercises actual
     /// wasmtime instantiation. An empty `(component)` imports nothing, so a bare
     /// linker instantiates it; that is all we need to lease, grow, and bound.
-    async fn empty_pool(
+    pub(super) async fn empty_pool(
         max: usize,
         min_idle: usize,
         cancel: &CancellationToken,
@@ -990,3 +960,6 @@ mod tests {
         cancel.cancel();
     }
 }
+
+#[cfg(test)]
+mod return_tests;
