@@ -3,6 +3,11 @@
 extern crate self as astrid_core;
 #[path = "../crates/astrid-storage/src/content_dag/file_wire.rs"]
 mod file_wire;
+#[path = "../crates/astrid-storage/src/content_dag/chunk_range.rs"]
+mod chunk_range;
+#[path = "../crates/astrid-storage/src/content_dag/child_range.rs"]
+mod child_range;
+mod hosted_chunk_tree_range;
 #[path = "../crates/astrid-storage/src/storage_words.rs"]
 mod storage_words;
 mod hosted_file_descriptor;

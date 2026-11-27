@@ -22,3 +22,29 @@ def defects():
             f"file descriptor {name}", source,
             lambda s, a=old, b=new: replace_once(s, a, b), trace,
         )
+
+    source = Path("crates/astrid-storage/src/content_dag/chunk_range.rs")
+    local = Path("verification/hosted_file_descriptor.rs")
+    tree = Path("verification/hosted_chunk_tree_range.rs")
+    for name, old, new, trace in [
+        ("can accept another chunk shape", "out.is_some() == valid(", "out.is_some() <== valid(", tree),
+        ("can return another payload", "c.payload() == record.contents().2", "c.payload().len() == record.contents().2.len()", local),
+        ("buffer can substitute bytes", "b == a+s,", "b.len() == a.len()+s.len(),", local),
+        ("count can lose bytes", "b == a+s.len()", "b >= a", local),
+        ("failure can change the sink", "Err(_) => final(output).snapshot() == old(output).snapshot()", "Err(_) => true", local),
+        ("can refuse a valid interval", "out.is_ok() == (base + data.len()", "out.is_ok() ==> (base + data.len()", local),
+    ]:
+        yield (
+            f"chunk range {name}", source,
+            lambda s, a=old, b=new: replace_once(s, a, b), trace,
+        )
+
+    source = Path("crates/astrid-storage/src/content_dag/child_range.rs")
+    for name, old, new in [
+        ("can omit an overlapping child", "plan@ == visits(children@,base,start,end)", "plan.len() <= children.len()"),
+        ("can refuse a representable tree", "out.is_some() == (base + length(children@)", "out.is_some() ==> (base + length(children@)"),
+    ]:
+        yield (
+            f"chunk range {name}", source,
+            lambda s, a=old, b=new: replace_once(s, a, b), tree,
+        )

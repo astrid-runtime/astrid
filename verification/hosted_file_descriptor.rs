@@ -86,4 +86,35 @@ fn content_edge<P,E,F>(record: &crate::ObjectRecord, version: crate::ObjectForma
 {
     crate::file_wire::parse(record,version,profile)
 }
+
+/// A request contained in one chunk reconstructs the specified record bytes.
+/// Both native output modes must retain all previously emitted data.
+fn read_chunk(record: &crate::ObjectRecord, version: crate::ObjectFormatVersion,
+    base:u64, offset:u64, end:u64, output:&mut crate::chunk_range::RangeOutput)
+    -> (out:Result<usize,crate::chunk_range::Error>)
+    requires
+        crate::chunk_range::valid(*record,version,record.contents().2.len() as u64,1,0),
+        base + record.contents().2.len() <= u64::MAX,
+        base <= offset <= end <= base + record.contents().2.len(),
+    ensures ({
+        let data = record.contents().2;
+        let selected = data.subrange(offset-base,end-base);
+        let prior = old(output).snapshot();
+        let after = final(output).snapshot();
+        &&& out.is_ok() == match prior {
+            crate::chunk_range::Output::Count(k) => k + end-offset <= usize::MAX,
+            crate::chunk_range::Output::Bytes(_) => true,
+        }
+        &&& out matches Ok(n) ==> n == end-offset && match (prior,after) {
+            (crate::chunk_range::Output::Bytes(a), crate::chunk_range::Output::Bytes(b)) => b == a+selected,
+            (crate::chunk_range::Output::Count(a), crate::chunk_range::Output::Count(b)) => b == a+selected.len(),
+            _ => false,
+        }
+        &&& out.is_err() ==> prior == after
+    }),
+{
+    let length = record.canonical_bytes().len() as u64;
+    let chunk = crate::chunk_range::Chunk::from_record(record, version, length, 1, 0).unwrap();
+    crate::chunk_range::emit(&chunk,base,offset,end,output)
+}
 }

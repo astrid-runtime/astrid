@@ -361,6 +361,33 @@ fn malformed_content_cannot_mint_a_verification_token() {
 }
 
 #[test]
+fn a_chunk_slice_preserves_existing_output_and_count_overflow_is_atomic() {
+    use super::chunk_range::{Chunk, Error, RangeOutput, emit};
+    let record = ObjectRecord::new(
+        ObjectKind::Chunk,
+        FORMAT_VERSION,
+        vec![9, 8, 7, 6],
+        Vec::new(),
+        0,
+        ObjectClass::Data,
+    )
+    .unwrap();
+    let chunk = Chunk::from_record(&record, FORMAT_VERSION, 4, 1, 0).unwrap();
+    let mut bytes = vec![42];
+    assert!(matches!(
+        emit(&chunk, 20, 21, 99, &mut RangeOutput::Buffer(&mut bytes)),
+        Ok(3)
+    ));
+    assert_eq!(bytes, [42, 8, 7, 6]);
+    let mut count = RangeOutput::Count(usize::MAX - 2);
+    assert!(matches!(
+        emit(&chunk, 20, 21, 99, &mut count),
+        Err(Error::Overflow)
+    ));
+    assert!(matches!(count, RangeOutput::Count(n) if n == usize::MAX - 2));
+}
+
+#[test]
 fn exact_ranges_cross_chunk_and_tree_boundaries() {
     let bytes = deterministic_bytes(5 * 1024 * 1024);
     let built = build_content(&TestIdentity, ChunkingProfile::ASTRID_V1, &bytes).unwrap();

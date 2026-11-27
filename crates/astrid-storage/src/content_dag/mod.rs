@@ -26,6 +26,8 @@ mod append;
 pub(crate) use append::append_verified_content;
 mod boundary;
 mod build;
+mod child_range;
+mod chunk_range;
 pub(crate) mod file_wire;
 mod read;
 mod stream;
