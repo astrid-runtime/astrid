@@ -15,6 +15,7 @@ pub(super) open spec fn nibble(byte: u8) -> Option<u8> {
     else { None }
 }
 
+#[expect(clippy::arithmetic_side_effects, reason = "Verus checks the arithmetic within each hexadecimal digit range")]
 fn digit(byte: u8) -> (out: Option<u8>)
     ensures out == nibble(byte), out matches Some(n) ==> n < 16,
 {
@@ -32,6 +33,7 @@ pub(super) open spec fn decodes(text: Seq<u8>, id: [u8;16]) -> bool {
         && nibble(text[2*i+1]) == Some((id@[i] % 16) as u8)
 }
 
+#[expect(clippy::arithmetic_side_effects, reason = "Verus proves both input indices, the decoded byte and the cursor are in range")]
 fn decode(text: &[u8]) -> (out: Option<[u8;16]>)
     ensures forall|id:[u8;16]| (out == Some(id)) == #[trigger] decodes(text@,id),
 {
@@ -106,6 +108,7 @@ pub(super) fn receipt(label: &[u8]) -> (out: Option<[u8;16]>)
 
 pub(super) open spec fn lower(n: u8) -> u8 { if n < 10 { (48+n) as u8 } else { (87+n) as u8 } }
 
+#[expect(clippy::arithmetic_side_effects, reason = "Verus proves the nibble is below sixteen and each ASCII result fits")]
 fn encode_digit(n: u8) -> (byte: u8)
     requires n < 16,
     ensures byte == lower(n), nibble(byte) == Some(n),
@@ -113,6 +116,7 @@ fn encode_digit(n: u8) -> (byte: u8)
     if n < 10 { b'0' + n } else { b'a' + (n-10) }
 }
 
+#[expect(clippy::arithmetic_side_effects, reason = "Verus checks the fixed prefix and identifier lengths and bounds the cursor")]
 pub(super) fn encode_receipt(id: [u8;16]) -> (bytes: Vec<u8>)
     ensures receipt_label(bytes@,id),
         bytes@.take(29) == BRANCH_RECEIPT_PREFIX_BYTES@ + BRANCH_REF_PREFIX_BYTES@,
@@ -165,6 +169,7 @@ pub(super) open spec fn promotion(reference:ObjectReference, id:[u8;16], target:
 }
 
 /// Stable in-place removal, followed by the promotion receipt when present.
+#[expect(clippy::arithmetic_side_effects, reason = "Verus proves both cursors are below the original vector length before each increment")]
 pub(super) fn rewrite(references: &mut Vec<ObjectReference>, id: [u8;16], receipt_id: Option<ObjectId>)
     ensures ({
         let survivors = old(references)@.filter(|r:ObjectReference| keep(r,id));
