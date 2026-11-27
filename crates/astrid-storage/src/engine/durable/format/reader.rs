@@ -1,23 +1,24 @@
 //! Bounds-checked primitives shared by durable frame decoders.
 
-use super::{IdentityScheme, ObjectId};
+#[cfg(test)]
+use super::IdentityScheme;
 
+#[cfg(test)]
 pub(super) struct SliceReader<'a> {
     bytes: &'a [u8],
     pub(super) offset: usize,
 }
 
+#[cfg(test)]
 impl<'a> SliceReader<'a> {
     pub(super) const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
     }
 
-    #[cfg(test)]
     pub(super) fn remaining(&self) -> usize {
         self.bytes.len().saturating_sub(self.offset)
     }
 
-    #[cfg(test)]
     pub(super) fn references(
         &mut self,
         scheme: IdentityScheme,
@@ -25,12 +26,6 @@ impl<'a> SliceReader<'a> {
     ) -> Result<Vec<super::ObjectReference>, &'static str> {
         super::verified_record::reference_list(self.bytes, &mut self.offset, scheme.into(), count)
             .map_err(super::verified_record::BodyError::detail)
-    }
-
-    pub(super) fn identity(&mut self, scheme: IdentityScheme) -> Result<ObjectId, &'static str> {
-        super::verified_record::identity(self.bytes, &mut self.offset, scheme.into())
-            .map(ObjectId::new)
-            .map_err(super::verified_record::TagError::detail)
     }
 }
 

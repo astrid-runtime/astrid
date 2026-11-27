@@ -805,6 +805,8 @@ impl<P: Ord, I, C> DurableEngine<P, I, C> {
 mod arena_frame;
 mod arena_index;
 mod arena_vectors;
+#[path = "index/admission.rs"]
+mod checkpoint_admission;
 mod direct_placement;
 mod staging;
 
@@ -848,6 +850,7 @@ pub use cache::{
     ObjectCacheCapacity, ObjectCacheConfig, ObjectCacheController, ObjectCacheMemoryBudget,
     ObjectCacheStats, PrincipalObjectCacheBudget,
 };
+use checkpoint_admission::IndexState;
 use compaction::recover_interrupted_compaction;
 pub use compaction::{
     CompactionEvidenceBundle, CompactionFacts, CompactionProofVerifier, CompactionReport,
@@ -864,7 +867,7 @@ use format::{
 };
 #[cfg(test)]
 use format::{frame_checksum, last_batch_spans, open_rw};
-use index::{IndexState, recover_index, replace_index, replace_volume_index};
+use index::{recover_index, replace_index, replace_volume_index};
 use native_io::{
     create_private as create_private_file_capability, open_directory as open_directory_capability,
     open_rw as open_rw_capability, sync_directory as sync_store_directory_capability,

@@ -25,6 +25,7 @@ thread_local! {
 }
 
 mod arena_span;
+mod checkpoint_reader;
 const _: () = assert!(arena_span::HEADER_BYTES == FRAME_HEADER_LEN_USIZE);
 
 mod framed_append;
@@ -58,11 +59,32 @@ pub(super) use location::{
 };
 pub(super) use positioned::read_frame_at;
 pub(super) use prepared::append_prepared_frames;
+#[cfg(test)]
 use reader::SliceReader;
 #[cfg(test)]
 pub(super) use scan::scan_frames_prefix;
 use scan::{FrameScanBound, read_frame_preserving_cursor_within, scan_frames_with_bound};
 pub(super) use scan::{scan_frames, scan_frames_range, scan_frames_with_protected_prefix};
+
+struct CheckpointInput<'a, F>(&'a mut F);
+
+impl<F: DurableIo> checkpoint_reader::Input for CheckpointInput<'_, F> {
+    type Error = io::Error;
+
+    fn length(&self) -> io::Result<u64> {
+        self.0.durable_metadata().map(|metadata| metadata.len())
+    }
+
+    fn seek(&mut self, at: u64) -> io::Result<()> {
+        self.0.seek(SeekFrom::Start(at)).map(|_| ())
+    }
+
+    fn read<const N: usize>(&mut self) -> io::Result<[u8; N]> {
+        let mut field = [0; N];
+        self.0.read_exact(&mut field)?;
+        Ok(field)
+    }
+}
 
 pub(super) fn verify_indexed_location<F: DurableIo>(
     arena: &mut F,
@@ -71,85 +93,55 @@ pub(super) fn verify_indexed_location<F: DurableIo>(
     scheme: IdentityScheme,
     limits: RecoveryLimits,
 ) -> Result<(), DurableError> {
-    let file_len = arena
-        .durable_metadata()
-        .map_err(|source| io_error("read indexed arena metadata", source))?
-        .len();
-    let frame_end = location
-        .offset
-        .checked_add(FRAME_HEADER_LEN)
-        .and_then(|value| value.checked_add(location.payload_len))
-        .ok_or(DurableError::EncodingOverflow)?;
-    if frame_end > file_len {
-        return Err(corrupt(
+    use checkpoint_reader::Error;
+    checkpoint_reader::check(
+        &mut CheckpointInput(arena),
+        ARENA_MAGIC,
+        FRAME_VERSION,
+        location,
+        scheme.into(),
+        expected_id,
+        limits.max_frame_bytes,
+    )
+    .map_err(|error| match error {
+        Error::Length(e) => io_error("read indexed arena metadata", e),
+        Error::Seek(e) => io_error("seek indexed arena header", e),
+        Error::HeaderRead(e) => io_error("read indexed arena header", e),
+        Error::IdentityRead(e) => io_error("read indexed object identity", e),
+        Error::Overflow => DurableError::EncodingOverflow,
+        Error::Extent => corrupt(
             ARENA_FILE,
             location.offset,
             "indexed frame extends beyond the arena",
-        ));
-    }
-    arena
-        .seek(SeekFrom::Start(location.offset))
-        .map_err(|source| io_error("seek indexed arena header", source))?;
-    let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
-    arena
-        .read_exact(&mut header)
-        .map_err(|source| io_error("read indexed arena header", source))?;
-    if header[..8] != ARENA_MAGIC
-        || u16::from_le_bytes([header[8], header[9]]) != FRAME_VERSION
-        || header[10..12] != [0, 0]
-    {
-        return Err(corrupt(
+        ),
+        Error::Header => corrupt(
             ARENA_FILE,
             location.offset,
             "indexed frame header is invalid",
-        ));
-    }
-    let payload_len = u64::from_le_bytes(
-        header[12..20]
-            .try_into()
-            .map_err(|_| DurableError::EncodingOverflow)?,
-    );
-    if payload_len > limits.max_frame_bytes {
-        return Err(DurableError::FrameTooLarge {
+        ),
+        Error::Limit(declared) => DurableError::FrameTooLarge {
             file: ARENA_FILE,
             offset: location.offset,
-            declared: payload_len,
+            declared,
             limit: limits.max_frame_bytes,
-        });
-    }
-    let checksum: [u8; 32] = header[CHECKSUM_START..]
-        .try_into()
-        .map_err(|_| DurableError::EncodingOverflow)?;
-    if payload_len != location.payload_len || checksum != location.checksum {
-        return Err(corrupt(
+        },
+        Error::Placement => corrupt(
             ARENA_FILE,
             location.offset,
             "indexed frame header does not match the cache",
-        ));
-    }
-    let mut identity_bytes = [0_u8; IDENTITY_PREFIX_BYTES + CURRENT_DIGEST_BYTES_USIZE];
-    if payload_len < identity_bytes.len() as u64 {
-        return Err(corrupt(
+        ),
+        Error::Short => corrupt(
             ARENA_FILE,
             location.offset,
             "indexed frame payload is shorter than its object identity",
-        ));
-    }
-    arena
-        .read_exact(&mut identity_bytes)
-        .map_err(|source| io_error("read indexed object identity", source))?;
-    let mut reader = SliceReader::new(&identity_bytes);
-    let actual = reader
-        .identity(scheme)
-        .map_err(|detail| corrupt(ARENA_FILE, location.offset, detail))?;
-    if actual != expected_id {
-        return Err(corrupt(
+        ),
+        Error::Tag(e) => corrupt(ARENA_FILE, location.offset, e.detail()),
+        Error::Name => corrupt(
             ARENA_FILE,
             location.offset,
             "indexed object identity mismatch",
-        ));
-    }
-    Ok(())
+        ),
+    })
 }
 
 pub(super) fn verify_indexed_tail<F: DurableIo>(
@@ -157,17 +149,25 @@ pub(super) fn verify_indexed_tail<F: DurableIo>(
     location: ArenaLocation,
     limits: RecoveryLimits,
 ) -> Result<(), DurableError> {
-    let frame = read_frame_at(arena, ARENA_FILE, ARENA_MAGIC, location.offset, limits)?;
-    let payload_len =
-        u64::try_from(frame.payload().len()).map_err(|_| DurableError::EncodingOverflow)?;
-    if payload_len != location.payload_len || frame.checksum() != location.checksum {
-        return Err(corrupt(
+    arena_span::at_location(
+        location.offset,
+        location.payload_len,
+        location.checksum,
+        |at| {
+            let frame = read_frame_at(arena, ARENA_FILE, ARENA_MAGIC, at, limits)?;
+            let sum = frame.checksum();
+            Ok((frame.into_payload(), sum))
+        },
+    )
+    .map(|_| ())
+    .map_err(|error| match error {
+        arena_span::IndexedError::Read(error) => error,
+        arena_span::IndexedError::Placement => corrupt(
             ARENA_FILE,
             location.offset,
             "indexed arena tail no longer matches the cache",
-        ));
-    }
-    Ok(())
+        ),
+    })
 }
 
 fn validate_positioned_header(

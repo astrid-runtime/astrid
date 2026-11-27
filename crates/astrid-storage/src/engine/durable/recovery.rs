@@ -3,6 +3,9 @@
 #[cfg(test)]
 mod tests;
 
+#[path = "index/rebuild.rs"]
+mod rebuild;
+
 use super::wal::{durable_error as wal_durable_error, recover_wal};
 use super::{
     ARENA_FILE, ArenaReader, DurableEngine, DurableError, DurableFiles, DurableInner, DurableWal,
@@ -72,22 +75,16 @@ where
     let cached = index_cache
         .as_mut()
         .and_then(|file| recover_index(file, &mut arena, scheme, limits, arena_len));
-    let (index, arena_tail) = if let Some(state) = cached {
-        (state.objects, state.arena_tail)
-    } else {
-        let (index, arena_tail) = recover_arena(&mut arena, identity, limits, protected_arena_len)?;
-        let state = IndexState {
-            arena_len: arena
-                .metadata()
-                .map_err(|source| io_error("read recovered arena metadata", source))?
-                .len(),
-            arena_tail,
-            objects: index,
-        };
-        drop(index_cache.take());
-        index_cache = Some(replace_index(store_root, &state, scheme, faults)?);
-        (state.objects, state.arena_tail)
-    };
+    let state = rebuild::select(
+        cached,
+        || scan_index_state(&mut arena, identity, limits, protected_arena_len),
+        |state| {
+            drop(index_cache.take());
+            index_cache = Some(replace_index(store_root, state, scheme, faults)?);
+            Ok(())
+        },
+    )?;
+    let (index, arena_tail) = (state.objects, state.arena_tail);
     generation_zero.validate(&index)?;
     let mut index = index;
     let wal_writer = if let Some(wal_file) = wal_file {
@@ -259,33 +256,46 @@ where
         .metadata()
         .map_err(|source| io_error("read object-arena metadata", source))?
         .len();
-    if let Some(state) = index_cache
+    let cached = index_cache
         .as_mut()
-        .and_then(|file| recover_index(file, arena, scheme, limits, arena_len))
-    {
-        return Ok((state.objects, state.arena_tail));
+        .and_then(|file| recover_index(file, arena, scheme, limits, arena_len));
+    if cached.is_none() {
+        drop(index_cache.take());
     }
+    let state = rebuild::select(
+        cached,
+        || scan_index_state(arena, identity, limits, protected_arena_len),
+        |state| {
+            *index_cache = Some(replace_volume_index(
+                Arc::clone(volume),
+                state,
+                scheme,
+                faults,
+            )?);
+            volume
+                .sync()
+                .map_err(|source| io_error("flush rebuilt volume index", source))
+        },
+    )?;
+    Ok((state.objects, state.arena_tail))
+}
 
-    drop(index_cache.take());
-    let (index, arena_tail) = recover_arena(arena, identity, limits, protected_arena_len)?;
-    let state = IndexState {
-        arena_len: arena
-            .metadata()
-            .map_err(|source| io_error("read recovered arena metadata", source))?
-            .len(),
+fn scan_index_state<I: PersistentObjectIdentity>(
+    arena: &mut super::File,
+    identity: &SharedIdentity<I>,
+    limits: RecoveryLimits,
+    protected_arena_len: u64,
+) -> Result<IndexState, DurableError> {
+    let (objects, arena_tail) = recover_arena(arena, identity, limits, protected_arena_len)?;
+    let arena_len = arena
+        .metadata()
+        .map_err(|source| io_error("read recovered arena metadata", source))?
+        .len();
+    Ok(IndexState {
+        arena_len,
         arena_tail,
-        objects: &index,
-    };
-    *index_cache = Some(replace_volume_index(
-        Arc::clone(volume),
-        &state,
-        scheme,
-        faults,
-    )?);
-    volume
-        .sync()
-        .map_err(|source| io_error("flush rebuilt volume index", source))?;
-    Ok((index, arena_tail))
+        objects,
+    })
 }
 
 fn open_optional_native_wal(

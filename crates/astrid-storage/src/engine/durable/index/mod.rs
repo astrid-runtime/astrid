@@ -28,6 +28,7 @@ use std::sync::Arc;
 
 use super::{format::encode_identity, root_wire};
 
+use super::{IndexState, checkpoint_admission as admission};
 mod key;
 mod snapshot;
 #[cfg(test)]
@@ -41,13 +42,6 @@ use validation::validate_state;
 const SNAPSHOT_RECORD: u8 = 1;
 const DELTA_RECORD: u8 = 2;
 use key::ROW_LEN as LOCATION_BYTES;
-
-/// Recovered disposable object-location state.
-pub(super) struct IndexState<M = BTreeMap<ObjectId, ArenaLocation>> {
-    pub(super) arena_len: u64,
-    pub(super) arena_tail: Option<ArenaLocation>,
-    pub(super) objects: M,
-}
 
 /// One successfully persisted object-arena change cached after publication.
 pub(super) struct IndexDelta<'a> {
@@ -245,30 +239,33 @@ pub(super) fn recover_index(
             Ok(())
         },
     );
-    if recovered.is_err() {
-        return None;
+    let mut reader = CandidateArena {
+        arena,
+        scheme,
+        limits,
+    };
+    IndexState::validated(
+        state,
+        recovered.is_ok(),
+        authoritative_arena_len,
+        &mut reader,
+    )
+}
+
+struct CandidateArena<'a> {
+    arena: &'a mut File,
+    scheme: IdentityScheme,
+    limits: RecoveryLimits,
+}
+
+impl admission::Arena for CandidateArena<'_> {
+    fn entry(&mut self, id: ObjectId, location: ArenaLocation) -> bool {
+        verify_indexed_location(self.arena, id, location, self.scheme, self.limits).is_ok()
     }
-    let state = state?;
-    if state.arena_len != authoritative_arena_len {
-        return None;
+
+    fn tail(&mut self, location: ArenaLocation) -> bool {
+        verify_indexed_tail(self.arena, location, self.limits).is_ok()
     }
-    let mut ordered = state
-        .objects
-        .iter()
-        .map(|(id, location)| (*id, *location))
-        .collect::<Vec<_>>();
-    ordered.sort_by_key(|(_, location)| location.offset);
-    for (id, location) in ordered {
-        if verify_indexed_location(arena, id, location, scheme, limits).is_err() {
-            return None;
-        }
-    }
-    match state.arena_tail {
-        Some(location) if verify_indexed_tail(arena, location, limits).is_err() => return None,
-        None if state.arena_len != 0 => return None,
-        _ => {},
-    }
-    Some(state)
 }
 
 fn decode_record(

@@ -23,9 +23,6 @@ impl fmt::Debug for ValidatedFrame {
 }
 
 impl ValidatedFrame {
-    pub(super) fn payload(&self) -> &[u8] {
-        &self.payload
-    }
     pub(super) const fn checksum(&self) -> [u8; 32] {
         self.checksum
     }

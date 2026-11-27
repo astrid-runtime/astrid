@@ -116,6 +116,29 @@ def consumer_defects():
         lambda s: replace_once(s, "out.is_some() == (forall|i:int| 0 <= i < count",
             "out.is_some() ==> (forall|i:int| 0 <= i < count"), readback,
     )
+    recovery = Path("verification/hosted_checkpoint_recovery.rs")
+    admission = Path("crates/astrid-storage/src/engine/durable/index/admission.rs")
+    rebuild = Path("crates/astrid-storage/src/engine/durable/index/rebuild.rs")
+    image = Path("crates/astrid-storage/src/engine/durable/format/checkpoint_reader.rs")
+    for name, source, original, changed, target in [
+        ("checks a different frame offset", image, "media.seek(loc.offset)", "media.seek(0)", image),
+        ("ignores the embedded identity", image, "if digest.as_slice() != expected.as_bytes().as_slice()", "if false", image),
+        ("reads beyond a short frame", image, "if declared < 40", "if declared < 39", image),
+        ("loses short-frame cursor provenance", image, "loc.payload_len < 40 && final(media).position() == loc.offset as int+52,", "loc.payload_len < 40,", recovery),
+        ("loses the successful image relation", image, "out.is_ok() ==> matches(old(media).image(),magic,version,loc,scheme,expected,limit) &&", "out.is_ok() ==> true &&", recovery),
+        ("changes a physical mapping", admission, "items.push((*id,*loc));", "items.push((*id,ArenaLocation {offset:0,..*loc}));", admission),
+        ("checks the first row repeatedly", admission, "let (id,loc) = rows[i];", "let (id,loc) = rows[0];", admission),
+        ("admits a failed checkpoint scan", admission, "if !complete {return None;}", "if !complete && measured == 0 {return None;}", admission),
+        ("accepts stale coverage", admission, "if covered != measured {return false;}", "if covered < measured {return false;}", admission),
+        ("skips tail verification", admission, "Some(loc) => arena.tail(loc)", "Some(loc) => true", admission),
+        ("drops admission provenance", admission, "complete && candidate == Some(s) &&\n                consistent(s.objects@,s.arena_tail,s.arena_len,measured,old(arena).entries(),old(arena).tails())", "complete && candidate == Some(s)", recovery),
+        ("loses accepted cache identity", rebuild, "Some(s) => out == Ok(s),", "Some(s) => true,", recovery),
+        ("loses completed replacement", rebuild, "exists|value:&T,r:Result<(),E>| *value == s && r.is_ok() && #[trigger] publish.ensures((value,),r)", "true", recovery),
+    ]:
+        yield (
+            f"checkpoint recovery {name}", source,
+            lambda s, a=original, b=changed: replace_once(s, a, b), target,
+        )
     for name, clause, weaker in [
         ("loses acceptance of equal frames", "out.is_ok() == ((*old(self).payload)@ == (*incoming.payload)@)", "out.is_ok() ==> ((*old(self).payload)@ == (*incoming.payload)@)"),
         ("loses the retained record", "final(self).record == old(self).record", "true"),
