@@ -11,6 +11,17 @@ pub(super) open spec fn length(bytes: Seq<u8>, start: int) -> u32 {
         ((bytes[start+2] as u32) << 16) | ((bytes[start+3] as u32) << 24) }
 }
 
+pub(super) open spec fn failure(bytes: Seq<u8>, start:int, end:int, e:KeyError) -> bool {
+    let size = length(bytes,start) as int;
+    &&& start + 4 > bytes.len() || start + 4 + size > bytes.len()
+    &&& end == if start+4 <= bytes.len() { start+4 } else { start }
+    &&& if start+4 > usize::MAX { e == KeyError::Field(ReadError::Overflow(4)) }
+        else if start+4 > bytes.len() { e == KeyError::Field(ReadError::Truncated) }
+        else if size > usize::MAX { e == KeyError::Length }
+        else if start+4+size > usize::MAX { e == KeyError::Field(ReadError::Overflow(size as usize)) }
+        else { e == KeyError::Field(ReadError::Truncated) }
+}
+
 pub(super) proof fn encoded_length(bytes: Seq<u8>, start: int, value: u32)
     requires crate::storage_fields::at(bytes,start,crate::storage_words::word32(value)),
     ensures length(bytes,start) == value,
@@ -27,12 +38,7 @@ pub(super) fn read<'a>(bytes: &'a [u8], cursor: &mut usize) -> (out: Result<&'a 
         let start = *old(cursor) as int;
         let size = length(bytes@,start) as int;
         &&& out.is_ok() == (start + 4 <= bytes.len() && start + 4 + size <= bytes.len())
-        &&& out.is_err() ==> *final(cursor) as int == if start+4 <= bytes.len() { start+4 } else { start }
-        &&& out matches Err(e) ==> if start+4 > usize::MAX { e == KeyError::Field(ReadError::Overflow(4)) }
-            else if start+4 > bytes.len() { e == KeyError::Field(ReadError::Truncated) }
-            else if size > usize::MAX { e == KeyError::Length }
-            else if start+4+size > usize::MAX { e == KeyError::Field(ReadError::Overflow(size as usize)) }
-            else { e == KeyError::Field(ReadError::Truncated) }
+        &&& out matches Err(e) ==> failure(bytes@,start,*final(cursor) as int,e)
         &&& out matches Ok(key) ==> *final(cursor) as int == start + 4 + size &&
             key@ == bytes@.subrange(start+4,start+4+size)
     }),

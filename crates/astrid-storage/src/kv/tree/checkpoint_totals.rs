@@ -12,6 +12,13 @@ pub(super) struct NodeTotals {
 }
 
 
+/// Only complete eight-byte fields advance the cursor.
+pub(super) open spec fn failure(bytes:Seq<u8>,start:int,end:int,error:ReadError) -> bool {
+    &&& start + 24 > bytes.len()
+    &&& end == if start+8 > bytes.len() { start } else if start+16 > bytes.len() { start+8 } else { start+16 }
+    &&& error == if end+8 > usize::MAX { ReadError::Overflow(8) } else { ReadError::Truncated }
+}
+
 impl NodeTotals {
     pub(super) open spec fn wire(self) -> Seq<u8> {
         vstd::bytes::spec_u64_to_le_bytes(self.entries) +
@@ -31,6 +38,7 @@ impl NodeTotals {
     pub(super) fn read(bytes: &[u8], cursor: &mut usize) -> (out: Result<Self,ReadError>)
         ensures
             out.is_ok() == (*old(cursor) as int + 24 <= bytes.len()),
+            out matches Err(e) ==> failure(bytes@,*old(cursor) as int,*final(cursor) as int,e),
             out matches Ok(t) ==> *final(cursor) as int == *old(cursor) as int + 24 &&
                 crate::storage_fields::at(bytes@,*old(cursor) as int,t.wire()),
     {

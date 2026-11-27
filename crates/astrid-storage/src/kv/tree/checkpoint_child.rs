@@ -29,13 +29,16 @@ pub(super) fn read<E,F:FnOnce(&[u8])->Result<(),E>>(
     out matches Err(reason) ==> ({
         let start = *old(cursor) as int;
         let summary = start + 4 + key::length(bytes@,start) as int;
-        match reason {
-            ChildError::Key(_) => start + 4 > bytes.len() || summary > bytes.len(),
-            ChildError::InvalidKey(e) => exists|field:&[u8],r:Result<(),E>|
+        &&& (!(reason is Key) && !(reason is InvalidKey)) ==> exists|field:&[u8],r:Result<(),E>|
+            field@ == bytes@.subrange(start+4,summary) && r is Ok && #[trigger] validate.ensures((field,),r)
+        &&& reason is Reference ==> exists|t:NodeTotals| t.entries > 0 && crate::storage_fields::at(bytes@,summary,#[trigger] t.wire())
+        &&& match reason {
+            ChildError::Key(e) => key::failure(bytes@,start,*final(cursor) as int,e),
+            ChildError::InvalidKey(e) => summary <= bytes.len() && *final(cursor) as int == summary && exists|field:&[u8],r:Result<(),E>|
                 field@ == bytes@.subrange(start+4,summary) && r == Err(e) && #[trigger] validate.ensures((field,),r),
-            ChildError::Totals(_) => summary + 24 > bytes.len(),
-            ChildError::Empty => exists|t:NodeTotals| t.entries == 0 && crate::storage_fields::at(bytes@,summary,#[trigger] t.wire()),
-            ChildError::Reference(e) => if index >= refs.len() { e == edge::Rejection::Missing }
+            ChildError::Totals(e) => summary <= bytes.len() && super::checkpoint_totals::failure(bytes@,summary,*final(cursor) as int,e),
+            ChildError::Empty => *final(cursor) as int == summary+24 && exists|t:NodeTotals| t.entries == 0 && crate::storage_fields::at(bytes@,summary,#[trigger] t.wire()),
+            ChildError::Reference(e) => *final(cursor) as int == summary+24 && if index >= refs.len() { e == edge::Rejection::Missing }
                 else if index > u16::MAX { e == edge::Rejection::IndexOverflow } else {
                     let row = refs@[index as int].fields();
                     e == edge::Rejection::Mismatch && (row.0 != edge::wire(edge::Relation::Child,index) || !(row.2 is Owns))

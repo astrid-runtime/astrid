@@ -626,12 +626,16 @@ def checkpoint_child_consumers():
     child = Path("crates/astrid-storage/src/kv/tree/checkpoint_child.rs")
     reader = Path("crates/astrid-storage/src/kv/tree/checkpoint_key_field.rs")
     for label, path, target, clause, weaker in [
+        ("success cursor", child, "child", "*final(cursor) as int == summary + 24", "true"),
+        ("validator rejection cursor", child, "child", "summary <= bytes.len() && *final(cursor) as int == summary && exists", "summary <= bytes.len() && exists"),
+        ("key error forwarding", child, "child", "key::failure(bytes@,start,*final(cursor) as int,e)", "true"),
+        ("totals error forwarding", child, "child", "super::checkpoint_totals::failure(bytes@,summary,*final(cursor) as int,e)", "true"),
         ("key validation", child, "child", "field@ == row.0@ && r is Ok", "field@ == row.0@"),
         ("fence", child, "child", "row.0@ == bytes@.subrange(start+4,summary)", "true"),
         ("totals", child, "child", "crate::storage_fields::at(bytes@,summary,row.2.wire())", "true"),
         ("owning target", child, "child", "refs@[index as int].fields() == (edge::wire(edge::Relation::Child,index),row.1,super::ReferenceKind::Owns)", "true"),
-        ("failure explanation", child, "child", "ChildError::Empty => exists|t:NodeTotals|", "ChildError::Empty => true || exists|t:NodeTotals|"),
-        ("failure cursor", reader, "key_field", "out.is_err() ==> *final(cursor) as int", "false ==> *final(cursor) as int"),
+        ("failure explanation", child, "child", "ChildError::Empty => *final(cursor) as int == summary+24 && exists", "ChildError::Empty => *final(cursor) as int == summary+24 || exists"),
+        ("failure cursor", reader, "key_field", "&&& end == if start+4", "&&& true || end == if start+4"),
         ("failure type", reader, "key_field", "e == KeyError::Field(ReadError::Overflow(4))", "true"),
     ]:
         yield (
