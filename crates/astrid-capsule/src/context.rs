@@ -195,15 +195,7 @@ mod workspace_commit;
 pub use workspace_commit::WorkspaceCommitOp;
 
 #[cfg(not(target_family = "wasm"))]
-fn attachment(
-    binding: &astrid_storage::WorkspaceBranchBinding<astrid_storage::StateOwner>,
-) -> workspace_commit::Attachment<'_> {
-    workspace_commit::Attachment {
-        live: binding.lifecycle() == astrid_storage::WorkspaceBindingLifecycle::Live,
-        uid: binding.binding_uid().map(|uid| *uid.as_bytes()),
-        prefix: binding.target_prefix().map(|name| name.as_str().as_bytes()),
-    }
-}
+mod workspace_commit_native;
 
 /// Kernel-owned workspace branch service shared by every capsule engine.
 ///
@@ -466,7 +458,9 @@ impl WorkspaceBranchService {
             .branches
             .binding(&binding.owner, binding.branch)
             .map_err(|error| format!("read durable workspace binding: {error}"))?;
-        if !attachment(&durable).matches(*uid.as_bytes(), prefix.as_str().as_bytes()) {
+        if !workspace_commit_native::attachment(&durable)
+            .matches(*uid.as_bytes(), prefix.as_str().as_bytes())
+        {
             return Err("durable workspace binding no longer matches this principal".to_owned());
         }
         Ok(binding)
@@ -518,7 +512,7 @@ impl WorkspaceBranchService {
             .map_err(|error| format!("read durable workspace binding: {error}"))?;
         let mut writer = self;
         workspace_commit::finish(
-            attachment(&durable),
+            workspace_commit_native::attachment(&durable),
             *binding.uid.as_bytes(),
             prefix.as_str().as_bytes(),
             operation,
@@ -645,34 +639,6 @@ impl WorkspaceBranchService {
             }
         }
         Ok(())
-    }
-}
-
-#[cfg(not(target_family = "wasm"))]
-impl workspace_commit::Writer<astrid_storage::StateOwner, astrid_core::WorkspaceUid>
-    for &WorkspaceBranchService
-{
-    type Error = String;
-
-    fn promote(
-        &mut self,
-        owner: astrid_storage::StateOwner,
-        branch: astrid_core::WorkspaceUid,
-    ) -> Result<(), String> {
-        self.branches
-            .promote(&owner, branch)
-            .map(|_| ())
-            .map_err(|error| format!("promote workspace branch: {error}"))
-    }
-
-    fn rollback(
-        &mut self,
-        owner: astrid_storage::StateOwner,
-        branch: astrid_core::WorkspaceUid,
-    ) -> Result<(), String> {
-        self.branches
-            .rollback(&owner, branch)
-            .map_err(|error| format!("rollback workspace branch: {error}"))
     }
 }
 

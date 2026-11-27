@@ -23,6 +23,7 @@ mod helpers;
 mod lifecycle;
 mod model;
 mod operations;
+mod reference_transition;
 mod rename_guards;
 mod retirement;
 
@@ -41,8 +42,7 @@ pub use model::{
     WorkspaceBranchError, WorkspaceBranchStore,
 };
 
-const BRANCH_REF_PREFIX_BYTES: &[u8] = b"workspace/";
-const BRANCH_RECEIPT_PREFIX_BYTES: &[u8] = b"workspace-promoted/";
+use reference_transition::{BRANCH_RECEIPT_PREFIX_BYTES, BRANCH_REF_PREFIX_BYTES};
 const BRANCH_BASE_LABEL: &[u8] = b"base";
 const BRANCH_WORKING_LABEL: &[u8] = b"working";
 const BRANCH_MAGIC: &[u8] = b"astrid-workspace-branch-v1\0";
@@ -69,7 +69,7 @@ use codec::{
 use helpers::{
     BranchState, hydrate_root, is_workspace_receipt_label, map_read_error,
     parse_workspace_receipt_uid, parse_workspace_uid, qualify_name, selected_catalog,
-    selected_name, validate_target_prefix, workspace_receipt_label, workspace_ref_label,
+    selected_name, validate_target_prefix, workspace_ref_label,
 };
 
 pub(crate) fn is_workspace_branch_label(label: &[u8]) -> bool {

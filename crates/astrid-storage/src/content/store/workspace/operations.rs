@@ -19,7 +19,7 @@ use super::{
     WorkspaceFilesystem, WorkspaceUid, list, list_prefix as catalog_list_prefix, lookup,
     make_branch_record, make_branch_record_for_uid, make_promotion_receipt_for_uid, map_read_error,
     parse_workspace_receipt_uid, parse_workspace_uid, prefix_exists as catalog_prefix_exists,
-    selected_catalog, validate_target_prefix, workspace_receipt_label, workspace_ref_label,
+    selected_catalog, validate_target_prefix, workspace_ref_label,
 };
 
 impl<P: Ord, E> WorkspaceBranchStore<P, E> {
@@ -857,14 +857,11 @@ where
             self.enforce_catalog_replacement(owner, &header, branch_quota, merged)?;
             let mut next = header.as_ref().clone();
             next.catalog = merged;
-            next.preserved_state.retain(|reference| {
-                parse_workspace_uid(reference.label().as_bytes()) != Some(id)
-                    && parse_workspace_receipt_uid(reference.label().as_bytes()) != Some(id)
-            });
-            next.preserved_state.push(ObjectReference::owns(
-                workspace_receipt_label(id),
-                receipt_id,
-            ));
+            super::reference_transition::rewrite(
+                &mut next.preserved_state,
+                id.as_bytes(),
+                Some(receipt_id),
+            );
             let transaction =
                 self.content
                     .encode_transaction(owner.clone(), next, None, records)?;
@@ -910,10 +907,7 @@ where
                 return Ok(());
             }
             let mut next = header.as_ref().clone();
-            next.preserved_state.retain(|reference| {
-                parse_workspace_uid(reference.label().as_bytes()) != Some(id)
-                    && parse_workspace_receipt_uid(reference.label().as_bytes()) != Some(id)
-            });
+            super::reference_transition::rewrite(&mut next.preserved_state, id.as_bytes(), None);
             let transaction =
                 self.content
                     .encode_transaction(owner.clone(), next, None, BTreeMap::new())?;

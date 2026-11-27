@@ -58,17 +58,12 @@ pub(super) fn workspace_ref_label(id: WorkspaceUid) -> ReferenceLabel<Vec<u8>> {
     ReferenceLabel::new(branch_label(id).into_bytes())
 }
 
-pub(super) fn workspace_receipt_label(id: WorkspaceUid) -> ReferenceLabel<Vec<u8>> {
-    ReferenceLabel::new(format!("workspace-promoted/{id}").into_bytes())
-}
-
 pub(super) fn parse_workspace_uid(label: &[u8]) -> Option<WorkspaceUid> {
-    std::str::from_utf8(label).ok()?.parse().ok()
+    super::reference_transition::branch(label).map(WorkspaceUid::from_bytes)
 }
 
 pub(super) fn parse_workspace_receipt_uid(label: &[u8]) -> Option<WorkspaceUid> {
-    let suffix = label.strip_prefix(BRANCH_RECEIPT_PREFIX_BYTES)?;
-    std::str::from_utf8(suffix).ok()?.parse().ok()
+    super::reference_transition::receipt(label).map(WorkspaceUid::from_bytes)
 }
 
 pub(super) fn hydrate_root(
