@@ -19,7 +19,12 @@ def defects():
             Path("verification/hosted_runtime_residency.rs"),
         )
     for name, original, changed in [
-        ("loses the issued key or generation", "make.ensures((key,*old(next)),r) &&", "true &&"),
+        ("loses the public runtime key", "ensures value.parts() == self.identity().0", "ensures true"),
+        ("loses the public capsule identifier", "ensures *value == self.parts().0", "ensures true"),
+        ("loses the public artifact", "ensures *value == self.parts().1", "ensures true"),
+        ("loses the public scope", "ensures value == self.parts().2", "ensures true"),
+        ("loses the public generation", "ensures value == self.identity().1", "ensures true"),
+        ("loses the issued key or generation", "r.identity() == ((id,artifact,scope),*old(next)) &&", "true &&"),
         ("consumes a generation after exhaustion", "out.is_none() ==> *final(next) == *old(next)", "out.is_none() ==> true"),
     ]:
         yield (

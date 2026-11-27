@@ -37,9 +37,30 @@ fn issue_runtime(next: &mut u64, id: u64, artifact: [u8;32], allowed: bool, prov
     }),
 {
     let owner = runtime_owner(allowed,provides,uplink,has_servers,principal,expected,observed).ok()?;
-    crate::runtime_generation::issue(next,(id,artifact,owner),
-        |key:(u64,[u8;32],Option<u64>), generation:u64| -> (r:(u64,[u8;32],Option<u64>,u64))
-            ensures r == (key.0,key.1,key.2,generation), { (key.0,key.1,key.2,generation) })
+    let issued = crate::runtime_generation::issue(next,id,artifact,owner)?;
+    let key = issued.key();
+    Some((*key.capsule_id(), *key.artifact(), key.scope(), issued.generation()))
 }
 
+}
+
+verus! {
+// The two keys may be identical. Exhaustion can refuse the second request
+// after the first has consumed the final usable generation.
+fn allocate_pair<I,A,S>(next: &mut u64, first: (I,A,S), second: (I,A,S))
+    -> (out: (Option<crate::runtime_generation::RuntimeId<I,A,S>>,
+              Option<crate::runtime_generation::RuntimeId<I,A,S>>))
+    ensures
+        out.0.is_some() == (*old(next) < u64::MAX),
+        out.1.is_some() == (*old(next) as int + 1 < u64::MAX),
+        out.0 matches Some(a) ==> a.identity() == (first,*old(next)),
+        out.1 matches Some(b) ==> b.identity().0 == second && b.identity().1 as int == *old(next) as int + 1,
+        match (out.0,out.1) { (Some(a),Some(b)) => a.identity().1 < b.identity().1, _ => true },
+        *final(next) as int == *old(next) as int + (if out.0.is_some() { 1int } else { 0int })
+            + (if out.1.is_some() { 1int } else { 0int }),
+{
+    let a = crate::runtime_generation::issue(next, first.0, first.1, first.2);
+    let b = crate::runtime_generation::issue(next, second.0, second.1, second.2);
+    (a,b)
+}
 }

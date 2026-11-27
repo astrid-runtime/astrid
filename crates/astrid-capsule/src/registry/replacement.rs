@@ -4,7 +4,7 @@ use astrid_core::{PrincipalId, PrincipalUid};
 
 use super::{
     Capsule, CapsuleError, CapsuleId, CapsuleRegistry, CapsuleResult, InstanceEntry,
-    ReplacedRuntime, RuntimeId, RuntimeKey, RuntimeScope, WasmHash, capsule_source_uuid,
+    ReplacedRuntime, RuntimeId, RuntimeScope, WasmHash, capsule_source_uuid,
     system_uplink_descriptors,
 };
 
@@ -199,11 +199,7 @@ impl CapsuleRegistry {
         artifact: WasmHash,
         scope: RuntimeScope,
     ) -> CapsuleResult<RuntimeId> {
-        let key = RuntimeKey::new(id, artifact, scope);
-        super::generation::issue(&mut self.next_generation, key, |key, generation| {
-            RuntimeId { key, generation }
-        })
-        .ok_or_else(|| {
+        super::generation::issue(&mut self.next_generation, id, artifact, scope).ok_or_else(|| {
             CapsuleError::ExecutionFailed("capsule runtime generation space exhausted".into())
         })
     }

@@ -56,59 +56,14 @@ impl RuntimeScope {
     }
 }
 
-/// Logical runtime slot. Artifact identity and authority identity are distinct.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RuntimeKey {
-    capsule_id: CapsuleId,
-    artifact: WasmHash,
-    scope: RuntimeScope,
-}
-
-impl RuntimeKey {
-    #[must_use]
-    pub fn new(capsule_id: CapsuleId, artifact: WasmHash, scope: RuntimeScope) -> Self {
-        Self {
-            capsule_id,
-            artifact,
-            scope,
-        }
-    }
-
-    #[must_use]
-    pub fn capsule_id(&self) -> &CapsuleId {
-        &self.capsule_id
-    }
-
-    #[must_use]
-    pub fn artifact(&self) -> &WasmHash {
-        &self.artifact
-    }
-
-    #[must_use]
-    pub const fn scope(&self) -> RuntimeScope {
-        self.scope
-    }
-}
+/// Logical runtime slot identified by the capsule, artifact and authority scope.
+pub type RuntimeKey = super::generation::RuntimeKey<CapsuleId, WasmHash, RuntimeScope>;
 
 /// One incarnation of a logical runtime slot.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RuntimeId {
-    pub(super) key: RuntimeKey,
-    pub(super) generation: u64,
-}
+pub type RuntimeId = super::generation::RuntimeId<CapsuleId, WasmHash, RuntimeScope>;
 
+#[cfg(test)]
 impl RuntimeId {
-    #[must_use]
-    pub const fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    #[must_use]
-    pub const fn key(&self) -> &RuntimeKey {
-        &self.key
-    }
-
-    #[cfg(test)]
     pub(crate) fn for_test(capsule_id: CapsuleId, generation: u64) -> Self {
         Self::for_test_scope(
             capsule_id,
@@ -117,7 +72,6 @@ impl RuntimeId {
         )
     }
 
-    #[cfg(test)]
     pub(crate) fn for_test_scope(
         capsule_id: CapsuleId,
         generation: u64,
@@ -133,3 +87,7 @@ impl RuntimeId {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "issuance_tests.rs"]
+mod issuance_tests;

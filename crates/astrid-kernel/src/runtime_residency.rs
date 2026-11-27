@@ -4,6 +4,7 @@ use vstd::prelude::*;
 verus! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RuntimeResidency { Principal, SystemResident }
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum Refusal { UnapprovedProvider, SystemMcp }
 
 #[derive(Clone, Copy)]
@@ -48,3 +49,7 @@ impl RuntimeResidency {
     }
 }
 }
+
+#[cfg(test)]
+#[path = "runtime_residency_tests.rs"]
+mod tests;
