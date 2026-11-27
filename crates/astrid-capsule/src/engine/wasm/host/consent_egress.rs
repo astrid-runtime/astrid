@@ -307,24 +307,28 @@ impl HostState {
     ///    arbitrary capsule would let it forge local origin and self-approve
     ///    egress. Those authentication and capability boundaries—not this
     ///    origin comparison—are the enforcement floor.
-    /// 2. Else, if `principal` already holds a runtime grant for THIS capsule
+    /// 2. Else, when a profile cache is installed, resolve the principal
+    ///    before either allowance. A failed resolve or `enabled = false`
+    ///    returns `false` with no prompt and no new runtime grant. The
+    ///    resolved `Arc` is the profile this decision admits.
+    /// 3. Else, if `principal` already holds a runtime grant for THIS capsule
     ///    reaching `host:port`, return `true` immediately (no prompt). The grant
     ///    is keyed on `capsule_id` too, so capsule B never short-circuits on
-    ///    capsule A's grant.
-    /// 3. Else, if `principal`'s on-disk profile remembers an `approve_always`
-    ///    grant for THIS capsule reaching `host:port`
-    ///    (`network.capsule_egress[<capsule>]`), return `true` immediately (no
-    ///    prompt). The in-memory store above starts empty after a daemon
-    ///    restart, so this persisted consult is what makes `approve_always`
-    ///    actually survive a restart. It is per-capsule AND per-principal by
-    ///    construction (only this capsule's bucket in this principal's profile
-    ///    is read).
-    /// 4. Else elicit consent (`ApprovalRequired` on `astrid.v1.approval`,
+    ///    capsule A's grant. This check runs only after step 2 succeeds.
+    /// 4. Else, if the admitted profile remembers an `approve_always` grant for
+    ///    THIS capsule reaching `host:port` (`network.capsule_egress[<capsule>]`),
+    ///    return `true` immediately (no prompt). The in-memory store above starts
+    ///    empty after a daemon restart, so this persisted consult is what makes
+    ///    `approve_always` actually survive a restart. It is per-capsule AND
+    ///    per-principal by construction.
+    /// 5. Else elicit consent (`ApprovalRequired` on `astrid.v1.approval`,
     ///    resource = `host:port` only, reason names the capsule) and block,
     ///    bounded by [`CONSENT_TIMEOUT_MS`] and the capsule cancel token.
-    ///    A one-shot approval admits this request. Session approval records an
-    ///    in-memory allowance. Durable approval writes the capsule's profile
-    ///    entry when a profile cache is available. Denial and timeout close the request.
+    ///    A changed admitted profile denies the reply and records no session
+    ///    grant. A one-shot approval admits this request. Session approval
+    ///    records an in-memory allowance. Durable approval writes the capsule's
+    ///    profile entry and rechecks the admitted profile under the write lock.
+    ///    Denial and timeout close the request.
     ///
     /// `host` is the URL host (an IP literal in v1 scope); `port` is the
     /// resolved request port.
@@ -379,14 +383,14 @@ impl HostState {
         } else {
             None
         };
-        // 2. EXISTING-GRANT FAST PATH. A prior consent for this principal +
+        // 3. EXISTING-GRANT FAST PATH. A prior consent for this principal +
         // capsule + endpoint short-circuits the prompt.
         if has_runtime_grant(&store, &principal, &capsule_id, host, port) {
             audit.granted(HostApprovalScope::Session, "session_grant");
             return true;
         }
 
-        // 3. PERSISTED-GRANT FAST PATH. The in-memory store above is empty
+        // 4. PERSISTED-GRANT FAST PATH. The in-memory store above is empty
         // after a daemon restart, so a prior `approve_always` would otherwise be
         // silently forgotten and the operator re-prompted. Consult the
         // principal's on-disk profile for a remembered grant under THIS capsule
@@ -410,7 +414,7 @@ impl HostState {
             return true;
         }
 
-        // 4. ELICIT. Publish `ApprovalRequired` and block for the response.
+        // 5. ELICIT. Publish `ApprovalRequired` and block for the response.
         let decision = self.elicit_egress_consent(&principal, &endpoint, &mut audit);
         if let (Some(cache), Some(admitted)) = (&self.profile_cache, &admitted_profile)
             && !cache

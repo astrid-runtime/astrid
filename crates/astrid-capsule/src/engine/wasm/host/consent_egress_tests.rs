@@ -784,3 +784,149 @@ async fn changed_profile_cancels_a_pending_egress_approval() {
         1234
     ));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn changed_profile_cancels_a_pending_session_egress_approval() {
+    use crate::profile_cache::PrincipalProfileCache;
+    use astrid_core::{PrincipalProfile, dirs::AstridHome};
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path());
+    let principal = PrincipalId::new("alice").unwrap();
+    let path = home.profile_path(&principal);
+    PrincipalProfile::default().save_to_path(&path).unwrap();
+    let cache = Arc::new(PrincipalProfileCache::with_home(home));
+    let store = Arc::new(AllowanceStore::new());
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.allowance_store = Some(store.clone());
+    state.profile_cache = Some(cache.clone());
+    set_caller(&mut state, MessageOrigin::LocalSocket, principal.as_str());
+
+    let target = principal.clone();
+    respond_after(state.event_bus.clone(), "approve_session", move || {
+        std::fs::remove_file(&path).unwrap();
+        cache.invalidate(&target);
+    });
+    assert!(!tokio::task::block_in_place(|| {
+        state.consent_local_egress("127.0.0.1", 1234)
+    }));
+    assert!(
+        !has_runtime_grant(&store, &principal, "test", "127.0.0.1", 1234),
+        "a session approval must not cache a grant after the admitted profile is replaced"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_grant_does_not_bypass_a_disabled_profile() {
+    use crate::profile_cache::PrincipalProfileCache;
+    use astrid_core::{PrincipalProfile, dirs::AstridHome};
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path());
+    let principal = PrincipalId::new("alice").unwrap();
+    let mut profile = PrincipalProfile::default();
+    profile.enabled = false;
+    profile
+        .save_to_path(&home.profile_path(&principal))
+        .unwrap();
+    let cache = Arc::new(PrincipalProfileCache::with_home(home));
+    let store = Arc::new(AllowanceStore::new());
+    add_runtime_grant(&store, &principal, "test", "127.0.0.1", 1234);
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.allowance_store = Some(store);
+    state.profile_cache = Some(cache);
+    set_caller(&mut state, MessageOrigin::LocalSocket, principal.as_str());
+
+    let mut watch = state.event_bus.subscribe_topic("astrid.v1.approval");
+    assert!(!tokio::task::block_in_place(|| {
+        state.consent_local_egress("127.0.0.1", 1234)
+    }));
+    let elicited = tokio::time::timeout(Duration::from_millis(50), watch.recv())
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    assert!(
+        !elicited,
+        "a disabled profile must deny before a session grant can skip the prompt"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_grant_does_not_bypass_a_missing_profile() {
+    use crate::profile_cache::PrincipalProfileCache;
+    use astrid_core::dirs::AstridHome;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path());
+    let principal = PrincipalId::new("alice").unwrap();
+    let cache = Arc::new(PrincipalProfileCache::with_home(home));
+    let store = Arc::new(AllowanceStore::new());
+    add_runtime_grant(&store, &principal, "test", "127.0.0.1", 1234);
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.allowance_store = Some(store);
+    state.profile_cache = Some(cache);
+    set_caller(&mut state, MessageOrigin::LocalSocket, principal.as_str());
+
+    let mut watch = state.event_bus.subscribe_topic("astrid.v1.approval");
+    assert!(!tokio::task::block_in_place(|| {
+        state.consent_local_egress("127.0.0.1", 1234)
+    }));
+    let elicited = tokio::time::timeout(Duration::from_millis(50), watch.recv())
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    assert!(
+        !elicited,
+        "a missing profile must deny before a session grant can skip the prompt"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replaced_profile_without_endpoint_is_not_honored() {
+    use astrid_core::dirs::AstridHome;
+    use astrid_core::profile::PrincipalProfile;
+
+    use crate::profile_cache::PrincipalProfileCache;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path());
+    let principal = PrincipalId::new("alice").unwrap();
+    let path = home.profile_path(&principal);
+    let mut remembered = PrincipalProfile::default();
+    remembered
+        .network
+        .capsule_egress
+        .insert("test".to_string(), vec!["127.0.0.1:1234".to_string()]);
+    remembered.save_to_path(&path).unwrap();
+    let cache = Arc::new(PrincipalProfileCache::with_home(home));
+    let primed = cache
+        .resolve(&principal)
+        .expect("prime the remembered profile");
+    assert!(has_persisted_grant(&primed, "test", "127.0.0.1", 1234));
+
+    PrincipalProfile::default().save_to_path(&path).unwrap();
+    cache.invalidate(&principal);
+
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.allowance_store = Some(Arc::new(AllowanceStore::new()));
+    state.profile_cache = Some(cache);
+    set_caller(&mut state, MessageOrigin::LocalSocket, principal.as_str());
+    let mut watch = state.event_bus.subscribe_topic("astrid.v1.approval");
+    spawn_responder(state.event_bus.clone(), "deny");
+
+    assert!(
+        !tokio::task::block_in_place(|| state.consent_local_egress("127.0.0.1", 1234)),
+        "a replaced profile must not keep the remembered endpoint"
+    );
+    let elicited = tokio::time::timeout(Duration::from_millis(50), watch.recv())
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    assert!(
+        elicited,
+        "dropping the remembered endpoint must elicit, not short-circuit"
+    );
+}
