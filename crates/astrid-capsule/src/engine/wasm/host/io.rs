@@ -356,6 +356,81 @@ mod astrid_streams_impl {
         }
     }
 
+    /// Copy one chunk from `src` to `dst`.
+    ///
+    /// Cancellation is observed only while no bytes have left the source:
+    /// waiting for an I/O permit, for the destination to accept a write, or
+    /// for the source to become readable. `InputStream::blocking_read` awaits
+    /// readiness and then copies synchronously, and this select prefers that
+    /// completed read over a token that became ready in the same poll.
+    ///
+    /// After the read returns, the chunk is owned here. The destination write
+    /// and flush run to completion even if the capsule is cancelled, because
+    /// dropping Wasmtime's combined splice at that point discards the chunk
+    /// and still reports `Closed`.
+    async fn blocking_splice_preserving_input(
+        state: &mut HostState,
+        dst_rep: u32,
+        src_rep: u32,
+        len: u64,
+    ) -> StreamResult<u64> {
+        use wasmtime_wasi::p2::{DynInputStream, DynOutputStream};
+
+        let cancel = state.effective_cancel_token();
+        if cancel.is_cancelled() {
+            return Err(RtStreamError::Closed);
+        }
+        let semaphore = std::sync::Arc::clone(&state.io_semaphore);
+        let _permit = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(RtStreamError::Closed),
+            permit = semaphore.acquire() => {
+                permit.expect("host semaphore closed: capsule HostState was dropped")
+            }
+        };
+
+        let requested = usize::try_from(len).unwrap_or(usize::MAX);
+        let writable = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(RtStreamError::Closed),
+            ready = async {
+                let output = state
+                    .resource_table
+                    .get_mut::<DynOutputStream>(&Resource::new_borrow(dst_rep))
+                    .map_err(RtStreamError::from)?;
+                output.write_ready().await
+            } => ready?,
+        };
+        let requested = requested.min(writable);
+        if requested == 0 {
+            return Ok(0);
+        }
+
+        let contents = tokio::select! {
+            biased;
+            read = async {
+                let input = state
+                    .resource_table
+                    .get_mut::<DynInputStream>(&Resource::new_borrow(src_rep))
+                    .map_err(RtStreamError::from)?;
+                input.blocking_read(requested).await
+            } => read?,
+            () = cancel.cancelled() => return Err(RtStreamError::Closed),
+        };
+        let copied = contents.len();
+        if copied == 0 {
+            return Ok(0);
+        }
+
+        let output = state
+            .resource_table
+            .get_mut::<DynOutputStream>(&Resource::new_borrow(dst_rep))
+            .map_err(RtStreamError::from)?;
+        output.blocking_write_and_flush(contents).await?;
+        u64::try_from(copied)
+            .map_err(|_| RtStreamError::trap("transferred byte count does not fit in u64"))
+    }
+
     impl HostOutputStream for HostState {
         fn check_write(&mut self, self_: Resource<OutputStream>) -> StreamResult<u64> {
             cancel_guard(self)?;
@@ -480,23 +555,7 @@ mod astrid_streams_impl {
         ) -> StreamResult<u64> {
             cancel_guard(self)?;
             let started = Instant::now();
-            let dst = Resource::new_borrow(self_.rep());
-            let src_borrow = Resource::new_borrow(src.rep());
-            let cancel = self.effective_cancel_token();
-            let transfer =
-                wasmtime_wasi::p2::bindings::io::streams::HostOutputStream::blocking_splice(
-                    &mut self.resource_table,
-                    dst,
-                    src_borrow,
-                    len,
-                );
-            let result = super::super::util::bounded_await_cancellable(
-                &self.io_semaphore,
-                &cancel,
-                transfer,
-            )
-            .await
-            .unwrap_or(Err(RtStreamError::Closed));
+            let result = blocking_splice_preserving_input(self, self_.rep(), src.rep(), len).await;
             let bytes = result.as_ref().copied().unwrap_or(0);
             let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             audit_io(
