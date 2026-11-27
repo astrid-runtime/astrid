@@ -38,6 +38,38 @@ pub(super) async fn answer_action_request(
     task.await.expect("host task")
 }
 
+/// Drive one approval round trip for `request` and return the host so later
+/// calls can reuse it, the guest's result, and the family and resource
+/// exactly as the prompt published them.
+pub(super) async fn answer_request_and_show_prompt(
+    mut state: HostState,
+    request: ApprovalRequest,
+    decision: &'static str,
+) -> (
+    HostState,
+    Result<ApprovalResponse, ErrorCode>,
+    (String, String),
+) {
+    let owner = install_request_owner(&mut state);
+    let bus = state.event_bus.clone();
+    let receiver = bus.subscribe_topic(Topic::approval_request().as_str());
+    let task = tokio::task::spawn_blocking(move || {
+        let result = approval::Host::request_approval(&mut state, request);
+        (state, result)
+    });
+    let (id, principal, request_owner, shown) = await_approval_prompt(receiver).await;
+    assert_eq!(request_owner, owner);
+    publish_approval_reply(
+        &bus,
+        &id,
+        principal.as_deref(),
+        Some(request_owner),
+        decision,
+    );
+    let (state, result) = task.await.expect("host task");
+    (state, result, shown)
+}
+
 #[tokio::test]
 async fn always_survives_fresh_host_cache_and_store() {
     let home = tempfile::tempdir().unwrap();
@@ -166,6 +198,111 @@ async fn once_and_session_are_not_saved_as_always() {
             .unwrap()
         );
     }
+}
+
+/// Control characters stop `trim()` from seeing the padding around a family.
+const HIDDEN_PADDING_ACTION: &str = "\0\u{2003}git push \0";
+
+#[tokio::test]
+async fn hidden_padding_action_keeps_the_session_allowance_on_the_shown_family() {
+    let home = tempfile::tempdir().unwrap();
+    let mut state = persistent_test_state(home.path());
+    state.allowance_store = Some(std::sync::Arc::new(AllowanceStore::new()));
+    let (state, result, (action, resource)) = answer_request_and_show_prompt(
+        state,
+        approval_request(HIDDEN_PADDING_ACTION, "git push origin main"),
+        "approve_session",
+    )
+    .await;
+    assert_eq!(result.unwrap().decision, ApprovalDecision::ApprovedSession);
+    assert_eq!(action, "git push");
+    assert_eq!(resource, "git push origin main");
+
+    // Another family still prompts; observing the prompt proves it.
+    let (mut state, result, (action, _)) =
+        answer_request_and_show_prompt(state, approval_request("git status", "git status"), "deny")
+            .await;
+    assert_eq!(action, "git status");
+    assert_eq!(result.unwrap().decision, ApprovalDecision::Denied);
+
+    // Keep the bus alive while the host is owned by the blocking task, or the
+    // closed channel resolves the wait below immediately.
+    let bus = state.event_bus.clone();
+    let mut request_rx = state
+        .event_bus
+        .subscribe_topic(Topic::approval_request().as_str());
+    let response = tokio::task::spawn_blocking(move || {
+        approval::Host::request_approval(
+            &mut state,
+            approval_request("git push", "git push origin other"),
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.decision, ApprovalDecision::Allowance);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), request_rx.recv())
+            .await
+            .is_err(),
+        "the session allowance must cover the family the prompt showed"
+    );
+    drop(bus);
+}
+
+#[tokio::test]
+async fn hidden_padding_action_remembers_only_the_shown_family() {
+    let home = tempfile::tempdir().unwrap();
+    let (_, result, (action, resource)) = answer_request_and_show_prompt(
+        persistent_test_state(home.path()),
+        approval_request(HIDDEN_PADDING_ACTION, "git push origin main"),
+        "approve_always",
+    )
+    .await;
+    assert_eq!(result.unwrap().decision, ApprovalDecision::ApprovedAlways);
+    assert_eq!(action, "git push");
+    assert_eq!(resource, "git push origin main");
+
+    let fresh = persistent_test_state(home.path());
+    let principal = PrincipalId::default();
+    assert!(
+        check_persisted_allowance(&fresh, &principal, "git push origin other").unwrap(),
+        "the remembered grant must cover the family the prompt showed"
+    );
+    for other in ["git pull origin main", "gitpush origin main", "git status"] {
+        assert!(
+            !check_persisted_allowance(&fresh, &principal, other).unwrap(),
+            "the remembered grant must not cover {other}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn whitespace_only_action_cannot_be_remembered() {
+    let home = tempfile::tempdir().unwrap();
+    let mut state = persistent_test_state(home.path());
+    let session_store = std::sync::Arc::new(AllowanceStore::new());
+    state.allowance_store = Some(session_store.clone());
+    let (state, result, (action, _)) = answer_request_and_show_prompt(
+        state,
+        approval_request("\0\u{2003}\0", "anything at all"),
+        "approve_always",
+    )
+    .await;
+    assert_eq!(action, "");
+    assert!(matches!(result, Err(ErrorCode::StoreUnavailable)));
+    assert!(
+        !check_persisted_allowance(&state, &PrincipalId::default(), "anything at all").unwrap()
+    );
+
+    let (_, result, _) = answer_request_and_show_prompt(
+        state,
+        approval_request("\0\u{2003}\0", "anything at all"),
+        "approve_session",
+    )
+    .await;
+    assert_eq!(result.unwrap().decision, ApprovalDecision::ApprovedSession);
+    assert_eq!(session_store.count(), 0);
 }
 
 #[tokio::test]
@@ -744,8 +881,22 @@ pub(super) fn install_request_owner(state: &mut HostState) -> astrid_events::ipc
 }
 
 async fn await_approval_request(
-    mut rx: astrid_events::EventReceiver,
+    rx: astrid_events::EventReceiver,
 ) -> (String, Option<String>, astrid_events::ipc::RequestOwnerId) {
+    let (request_id, principal, owner, _) = await_approval_prompt(rx).await;
+    (request_id, principal, owner)
+}
+
+/// Observe the next approval prompt and return its reply address together
+/// with the family and resource it shows.
+async fn await_approval_prompt(
+    mut rx: astrid_events::EventReceiver,
+) -> (
+    String,
+    Option<String>,
+    astrid_events::ipc::RequestOwnerId,
+    (String, String),
+) {
     let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
         .await
         .expect("approval request observed")
@@ -756,6 +907,8 @@ async fn await_approval_request(
     let IpcPayload::ApprovalRequired {
         request_id,
         request_owner,
+        action,
+        resource,
         ..
     } = &message.payload
     else {
@@ -765,7 +918,12 @@ async fn await_approval_request(
         .request_owner
         .expect("request owner must be stamped");
     assert_eq!(request_owner, &owner.to_string());
-    (request_id.clone(), message.principal.clone(), owner)
+    (
+        request_id.clone(),
+        message.principal.clone(),
+        owner,
+        (action.clone(), resource.clone()),
+    )
 }
 
 #[tokio::test]
@@ -962,6 +1120,21 @@ fn sanitize_action_trims_whitespace() {
     assert_eq!(
         sanitize_action_for_pattern("  git push  ", "test"),
         "git push"
+    );
+}
+
+#[test]
+fn sanitize_action_trims_whitespace_exposed_by_truncation() {
+    let action = format!("\0git push{}\0", " ".repeat(MAX_ACTION_LEN));
+    assert_eq!(sanitize_action_for_pattern(&action, "test"), "git push");
+}
+
+#[test]
+fn sanitize_action_trims_whitespace_at_the_truncation_boundary() {
+    let boundary = format!("\0{} git push\0", "a".repeat(MAX_ACTION_LEN - 1));
+    assert_eq!(
+        sanitize_action_for_pattern(&boundary, "test"),
+        "a".repeat(MAX_ACTION_LEN - 1)
     );
 }
 
