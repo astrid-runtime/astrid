@@ -841,7 +841,12 @@ async fn egress_rechecks_both_device_registrations_after_the_prompt() {
     use astrid_core::{PrincipalProfile, dirs::AstridHome};
 
     for decision in ["approve", "approve_session", "approve_always"] {
-        for (replace_caller, replace_responder) in [(false, false), (true, false), (false, true)] {
+        for (replace_caller, replace_responder, stale_reply) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let home = AstridHome::from_path(dir.path());
             let principal = PrincipalId::new("alice").unwrap();
@@ -863,7 +868,11 @@ async fn egress_rechecks_both_device_registrations_after_the_prompt() {
             let path = home.profile_path(&principal);
             respond_after(state.event_bus.clone(), decision, move |reply| {
                 reply.device_key_id = Some(responder.key_id.clone());
-                reply.device_registration_id = responder.registration_id.map(Into::into);
+                reply.device_registration_id = if stale_reply {
+                    Some(uuid::Uuid::new_v4())
+                } else {
+                    responder.registration_id.map(Into::into)
+                };
                 if replace_caller || replace_responder {
                     let retired = if replace_caller { &caller } else { &responder };
                     let live = if replace_caller { &responder } else { &caller };
@@ -880,7 +889,7 @@ async fn egress_rechecks_both_device_registrations_after_the_prompt() {
             });
             let accepted =
                 tokio::task::block_in_place(|| state.consent_local_egress("127.0.0.1", 1234));
-            let valid = !replace_caller && !replace_responder;
+            let valid = !replace_caller && !replace_responder && !stale_reply;
             assert_eq!(accepted, valid);
             assert_eq!(
                 store.count(),

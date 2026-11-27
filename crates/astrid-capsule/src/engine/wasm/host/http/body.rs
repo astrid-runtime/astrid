@@ -1,4 +1,4 @@
-//! Buffered response publication after device, invocation and transport completion.
+//! Publication of buffered and streaming responses after admission.
 use vstd::prelude::*;
 
 verus! {
@@ -16,6 +16,17 @@ pub(super) fn finish<E>(body: Vec<u8>, read: Option<Option<Result<(), E>>>, clos
         Some(Some(Err(error))) => Err(error),
         _ => Err(closed),
     }
+}
+
+/// Evaluate the disclosure callback only while the resource and its reader are admitted.
+pub(super) fn disclose<H,T,F:FnOnce(H)->T>(owner:bool, opening:bool, reading:bool, handle:H, effect:F)
+    -> (r:Option<T>)
+    requires effect.requires((handle,)),
+    ensures if owner && opening && reading {
+        r matches Some(v) && effect.ensures((handle,),v)
+    } else { r.is_none() },
+{
+    if owner && opening && reading { Some(effect(handle)) } else { None }
 }
 
 }

@@ -31,6 +31,20 @@ def consumer_defects():
             f"buffered HTTP response {name}", body,
             lambda s, a=original, b=changed: replace_once(s, a, b), hop_trace,
         )
+    for name, original, changed in [
+        ("loses the owner binding", "if owner && opening && reading { Some(effect(handle)) }",
+         "if opening && reading { Some(effect(handle)) }"),
+        ("ignores opening retirement", "if owner && opening && reading { Some(effect(handle)) }",
+         "if owner && reading { Some(effect(handle)) }"),
+        ("ignores reader retirement", "if owner && opening && reading { Some(effect(handle)) }",
+         "if owner && opening { Some(effect(handle)) }"),
+        ("loses the selected disclosure", "&& effect.ensures((handle,),v)", ""),
+    ]:
+        yield (
+            f"streaming HTTP response {name}", body,
+            lambda s, a=original, b=changed: replace_once(s, a, b),
+            hop_trace if name == "loses the selected disclosure" else body,
+        )
     egress = Path("crates/astrid-capsule/src/engine/wasm/host/egress_reply.rs")
     egress_trace = Path("verification/hosted_egress_reply.rs")
     for name, original, changed, target in [

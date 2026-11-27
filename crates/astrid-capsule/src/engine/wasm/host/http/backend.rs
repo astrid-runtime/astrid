@@ -90,7 +90,7 @@ async fn check_http_security(
 /// A live HTTP streaming response pinned to the principal that opened it.
 #[derive(Debug, Clone)]
 pub struct ActiveHttpStream {
-    pub response: Arc<tokio::sync::Mutex<reqwest::Response>>,
+    lifetime: super::stream_lifetime::StreamLifetime,
     pub creator: astrid_core::principal::PrincipalId,
     pub status: u16,
     pub headers: Vec<KeyValuePair>,
@@ -105,22 +105,11 @@ pub struct ActiveHttpStream {
 }
 
 impl ActiveHttpStream {
-    /// Build a quota-counting placeholder stream WITHOUT any network. The
-    /// streaming concurrency quota in [`HostState::http_stream_backend`] only
-    /// counts `active_http_streams` entries — it never reads the `response` — so
-    /// tests can pre-populate the map to the cap and assert the next open is
-    /// rejected with `Quota` immediately, instead of opening real streams (which
-    /// would block on the streaming header deadline waiting for a responder).
-    /// The `response` is a synthetic empty-body `200` made from an
-    /// `http::Response`, never an over-the-wire one.
+    /// Closed placeholder for tests that fill the per-capsule stream quota.
     #[cfg(test)]
     pub(crate) fn dummy_for_test(creator: &astrid_core::principal::PrincipalId) -> Self {
-        let http_resp = http::Response::builder()
-            .status(200)
-            .body(reqwest::Body::from(Vec::<u8>::new()))
-            .expect("build synthetic http::Response");
         Self {
-            response: Arc::new(tokio::sync::Mutex::new(reqwest::Response::from(http_resp))),
+            lifetime: super::stream_lifetime::StreamLifetime::closed(),
             creator: creator.clone(),
             status: 200,
             headers: Vec::new(),
@@ -640,6 +629,14 @@ impl HostState {
         if !opts.total_explicit {
             stream_opts.total_timeout = None;
         }
+        let owner_uid = self
+            .principal_directory
+            .bound_uid(
+                &principal,
+                self.invocation_storage_uid.or(self.runtime_owner_uid),
+            )
+            .map_err(|_| ErrorCode::CapabilityDenied)?;
+        let owner_cancel = self.principal_cancel_token_for(&principal);
         let read_timeout = opts
             .between_bytes_timeout
             .unwrap_or(self.http_limits.stream_read_timeout);
@@ -663,28 +660,38 @@ impl HostState {
             }
         }
 
+        let audit = Arc::new(std::sync::Mutex::new(exchange));
         let active = ActiveHttpStream {
-            response: Arc::new(tokio::sync::Mutex::new(response)),
-            creator: principal,
+            lifetime: super::stream_lifetime::StreamLifetime::start(
+                self,
+                owner_uid,
+                owner_cancel,
+                response,
+                wire.authority,
+                audit.clone(),
+            ),
+            creator: principal.clone(),
             status,
             headers: resp_headers,
             read_timeout,
-            audit: Arc::new(std::sync::Mutex::new(exchange)),
+            audit,
         };
-        let resource = self
-            .resource_table
-            .push(active.clone())
-            .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
-        // Mirror the stream into `active_http_streams`, keyed by the resource
-        // rep, so the per-capsule concurrency quota (checked at the top of this
-        // fn) actually counts live streams. Without this the cap was dead — the
-        // resource table is not enumerable. The mirror shares the same
-        // `Arc<Mutex<Response>>`, so `read_chunk` via the resource table stays
-        // consistent; this copy is purely for counting and is removed in
-        // `stream_close` / `stream_drop`.
-        self.active_http_streams
-            .insert(u64::from(resource.rep()), active);
-        Ok(Resource::new_own(resource.rep()))
+        let directory = self.principal_directory.clone();
+        directory
+            .with_bound_input(&principal, owner_uid, active, |active| {
+                if !active.lifetime.live_now() || !self.invocation_authority_active() {
+                    return Err(ErrorCode::Closed);
+                }
+                let resource = self
+                    .resource_table
+                    .push(active.clone())
+                    .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
+                // Both entries share a single stream lifetime and quota slot.
+                self.active_http_streams
+                    .insert(u64::from(resource.rep()), active);
+                Ok(Resource::new_own(resource.rep()))
+            })
+            .map_err(|_| ErrorCode::Closed)?
     }
 }
 
@@ -735,18 +742,29 @@ fn redirect_step(
 // ── Stream-method bodies (shared by both versions, keyed by resource rep) ──
 
 pub(super) fn stream_status(state: &mut HostState, rep: u32) -> u16 {
+    let Some(reader) = state.admit_egress_caller() else {
+        return 0;
+    };
     state
         .resource_table
         .get::<ActiveHttpStream>(&Resource::new_borrow(rep))
-        .map(|s| s.status)
+        .ok()
+        .and_then(|s| s.lifetime.access(state, &s.creator, &reader, |_| s.status))
         .unwrap_or(0)
 }
 
 pub(super) fn stream_headers(state: &mut HostState, rep: u32) -> Vec<KeyValuePair> {
+    let Some(reader) = state.admit_egress_caller() else {
+        return Vec::new();
+    };
     state
         .resource_table
         .get::<ActiveHttpStream>(&Resource::new_borrow(rep))
-        .map(|s| s.headers.clone())
+        .ok()
+        .and_then(|s| {
+            s.lifetime
+                .access(state, &s.creator, &reader, |_| s.headers.clone())
+        })
         .unwrap_or_default()
 }
 
@@ -758,20 +776,31 @@ pub(super) async fn stream_read_chunk(
         .resource_table
         .get::<ActiveHttpStream>(&Resource::new_borrow(rep))
         .map_err(|_| ErrorCode::Closed)?;
-    let response_arc = stream.response.clone();
+    let reader = state.admit_egress_caller().ok_or(ErrorCode::Closed)?;
+    let open = stream
+        .lifetime
+        .access(state, &stream.creator, &reader, |open| open)
+        .ok_or(ErrorCode::Closed)?;
     let audit = Arc::clone(&stream.audit);
     let read_timeout = stream.read_timeout;
     let cancel = state.effective_cancel_token();
     let sem = state.io_semaphore.clone();
     let started = Instant::now();
-    let result = util::bounded_await_cancellable(&sem, &cancel, async {
-        let mut resp = response_arc.lock().await;
+    let read = util::bounded_await_cancellable(&sem, &cancel, async {
+        let mut resp = open.response.lock().await;
         tokio::time::timeout(read_timeout, resp.chunk()).await
-    })
-    .await;
+    });
+    let result = reader
+        .while_live(open.while_live(Box::pin(read)))
+        .await
+        .ok_or(ErrorCode::Closed)?;
     // The audit exchange hashes each delivered chunk and is completed at end
     // of body or on a read error. A per-chunk timeout leaves it open: the
     // guest may read again.
+    let Some(result) = result else {
+        complete_stream(&audit, false, HostAuditOutcome::Failed("authority retired")).await;
+        return Err(ErrorCode::Closed);
+    };
     let bytes_result: Result<Vec<u8>, ErrorCode> = match result {
         None => {
             complete_stream(&audit, false, HostAuditOutcome::Failed("cancelled")).await;
@@ -784,8 +813,19 @@ pub(super) async fn stream_read_chunk(
             Err(error)
         },
         Some(Ok(Ok(Some(bytes)))) => {
-            with_exchange(&audit, |exchange| exchange.digest(&bytes));
-            Ok(bytes.to_vec())
+            match stream
+                .lifetime
+                .access(state, &stream.creator, &reader, |_| {
+                    with_exchange(&audit, |exchange| exchange.digest(&bytes));
+                    bytes.to_vec()
+                }) {
+                Some(data) => Ok(data),
+                None => {
+                    complete_stream(&audit, false, HostAuditOutcome::Failed("authority retired"))
+                        .await;
+                    Err(ErrorCode::Closed)
+                },
+            }
         },
         Some(Ok(Ok(None))) => {
             complete_stream(&audit, true, HostAuditOutcome::Allowed).await;
@@ -831,7 +871,12 @@ fn with_exchange(audit: &std::sync::Mutex<HttpExchange>, f: impl FnOnce(&mut Htt
 /// terminator), so the completion is successful but marked incomplete.
 fn close_stream_exchange(stream: &ActiveHttpStream) {
     with_exchange(&stream.audit, |exchange| {
-        exchange.finish_detached(false, HostAuditOutcome::Allowed);
+        let outcome = if stream.lifetime.live_now() {
+            HostAuditOutcome::Allowed
+        } else {
+            HostAuditOutcome::Failed("authority retired")
+        };
+        exchange.finish_detached(false, outcome);
     });
 }
 

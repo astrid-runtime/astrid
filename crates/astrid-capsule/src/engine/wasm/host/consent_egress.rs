@@ -214,6 +214,13 @@ pub(super) type EgressAuthority = super::consent_reply::ReplyAuthority<
 >;
 
 impl EgressAuthority {
+    pub(super) fn devices_live(&self) -> bool {
+        let (caller, responder) = self.devices();
+        [caller, responder]
+            .into_iter()
+            .all(|s| s.as_ref().is_none_or(|s| !s.is_retired()))
+    }
+
     /// Drop a pending send when either admitted device retires. Both session
     /// guards remain owned by the caller until the transport future is dropped.
     pub(super) async fn while_live<F: Future>(&self, send: F) -> Option<F::Output> {

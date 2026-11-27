@@ -30,4 +30,10 @@ fn buffered_receipt(body: Vec<u8>, device_live: bool, invocation_live: bool,
     crate::http_body::finish(body,outcome,closed)
 }
 
+fn stream_release(owner:bool, opening:bool, reader:bool, payload:u64) -> (r:Option<u64>)
+    ensures r == if owner && opening && reader { Some(payload) } else { None },
+{
+    crate::http_body::disclose(owner,opening,reader,payload,|selected:u64| -> (v:u64) ensures v == selected, {selected})
+}
+
 }

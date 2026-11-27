@@ -746,4 +746,18 @@ fn session_install_excludes_the_device_removal_writer_through_the_callback() {
         })
         .unwrap();
     assert!(cache.state.try_write().is_ok());
+    let snapshot = cache.resolve(&alice).unwrap();
+    let stale = DeviceStamp {
+        registration: Some(uuid::Uuid::new_v4()),
+        ..stamp
+    };
+    for devices in [[stale, stamp], [stamp, stale]] {
+        assert!(
+            cache
+                .with_session_devices(&alice, devices, Some(&snapshot), || panic!(
+                    "installed a stale grant"
+                ))
+                .is_err()
+        );
+    }
 }

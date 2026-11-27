@@ -161,12 +161,45 @@ async fn operator_approved_endpoint_receives_the_selected_hop() {
     }
 }
 
+use crate::engine::wasm::host_state::HostState;
+use crate::profile_cache::PrincipalProfileCache;
+use astrid_core::profile::{AuthMethod, DeviceKey, DeviceKeyId, DeviceScope};
+use astrid_core::{PrincipalId, PrincipalProfile, dirs::AstridHome};
+
+fn device_host(
+    path: &std::path::Path,
+) -> (HostState, PrincipalId, RequestOwnerId, DeviceKey, DeviceKey) {
+    let home = AstridHome::from_path(path);
+    let principal = PrincipalId::new("alice").unwrap();
+    let caller = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+    let responder = DeviceKey::new("b".repeat(64), DeviceScope::Full, None, 0);
+    let mut profile = PrincipalProfile::default();
+    profile.auth.methods.push(AuthMethod::Keypair);
+    profile.add_device(caller.clone());
+    profile.add_device(responder.clone());
+    profile.save(&home, &principal).unwrap();
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.profile_cache = Some(Arc::new(PrincipalProfileCache::with_home(home)));
+    state.security = Some(Arc::new(AllowAllGate));
+    state.allowance_store = Some(Arc::new(astrid_approval::AllowanceStore::new()));
+    let owner = RequestOwnerId::generate();
+    let mut context = IpcMessage::new(
+        Topic::from_raw("test"),
+        IpcPayload::Connect,
+        uuid::Uuid::nil(),
+    )
+    .with_principal("alice")
+    .with_origin(MessageOrigin::LocalSocket)
+    .with_request_owner(owner);
+    context.device_key_id = Some(caller.key_id.clone());
+    context.device_registration_id = caller.registration_id.map(Into::into);
+    state.caller_context = Some(context);
+    (state, principal, owner, caller, responder)
+}
+
 /// Retire each device during dispatch, body I/O admission, and a partial body read.
 #[tokio::test(flavor = "multi_thread")]
 async fn retiring_either_egress_device_cancels_an_admitted_http_send() {
-    use crate::profile_cache::PrincipalProfileCache;
-    use astrid_core::profile::{AuthMethod, DeviceKey, DeviceKeyId, DeviceScope};
-    use astrid_core::{PrincipalId, PrincipalProfile, dirs::AstridHome};
     use std::time::Duration;
 
     #[derive(Clone, Copy)]
@@ -181,31 +214,7 @@ async fn retiring_either_egress_device_cancels_an_admitted_http_send() {
         .flat_map(|responder| [Headers, BodyPermit, BodyChunk].map(|wait| (responder, wait)))
     {
         let dir = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(dir.path());
-        let principal = PrincipalId::new("alice").unwrap();
-        let caller = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
-        let responder = DeviceKey::new("b".repeat(64), DeviceScope::Full, None, 0);
-        let mut profile = PrincipalProfile::default();
-        profile.auth.methods.push(AuthMethod::Keypair);
-        profile.add_device(caller.clone());
-        profile.add_device(responder.clone());
-        profile.save(&home, &principal).unwrap();
-        let mut state = minimal_host_state(tokio::runtime::Handle::current());
-        state.profile_cache = Some(Arc::new(PrincipalProfileCache::with_home(home)));
-        state.security = Some(Arc::new(AllowAllGate));
-        state.allowance_store = Some(Arc::new(astrid_approval::AllowanceStore::new()));
-        let owner = RequestOwnerId::generate();
-        let mut context = IpcMessage::new(
-            Topic::from_raw("test"),
-            IpcPayload::Connect,
-            uuid::Uuid::nil(),
-        )
-        .with_principal("alice")
-        .with_origin(MessageOrigin::LocalSocket)
-        .with_request_owner(owner);
-        context.device_key_id = Some(caller.key_id.clone());
-        context.device_registration_id = caller.registration_id.map(Into::into);
-        state.caller_context = Some(context);
+        let (mut state, principal, owner, caller, responder) = device_host(dir.path());
         let key = DeviceKeyId::new(if retire_responder {
             responder.key_id.clone()
         } else {
@@ -278,5 +287,134 @@ async fn retiring_either_egress_device_cancels_an_admitted_http_send() {
         })
         .await
         .expect("retirement must cancel the send before the peer responds");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_retirement_drains_idle_and_reading_resources() {
+    use super::super::ErrorCode;
+    use super::super::backend::{stream_close, stream_headers, stream_read_chunk, stream_status};
+    use std::time::Duration;
+    #[derive(Clone, Copy)]
+    enum Retire {
+        Caller,
+        Responder,
+        Principal,
+    }
+    for reading in [false, true] {
+        for retiring in [Retire::Caller, Retire::Responder, Retire::Principal] {
+            tokio::time::timeout(Duration::from_secs(8), async {
+                let dir = tempfile::tempdir().unwrap();
+                let (mut state, principal, owner, caller, responder) = device_host(dir.path());
+                let key = DeviceKeyId::new(if matches!(retiring, Retire::Responder) {
+                    responder.key_id.clone()
+                } else {
+                    caller.key_id.clone()
+                })
+                .unwrap();
+                let tracker = Arc::new(
+                    crate::engine::wasm::principal_tracker::PrincipalInvocationTracker::default(),
+                );
+                state.principal_invocations = Some(tracker.clone());
+                let owner_cancel = state.principal_cancel_token_for(&principal);
+                let sessions = state.device_sessions.clone();
+                state.io_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let operator = answer(
+                    state.event_bus.clone(),
+                    owner,
+                    address,
+                    "approve",
+                    Some(responder),
+                );
+                let peer = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut lines = BufReader::new(&mut socket).lines();
+                    while let Some(line) = lines.next_line().await.unwrap() {
+                        if line.is_empty() {
+                            break;
+                        }
+                    }
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nX-Open: yes\r\n\r\na")
+                        .await
+                        .unwrap();
+                    socket
+                });
+                let opts = super::super::options::ResolvedOptions::from_options(
+                    follow_opts(),
+                    &state.http_limits,
+                );
+                let rep = state
+                    .http_stream_backend(get_request(format!("http://{address}/stream")), opts)
+                    .await
+                    .unwrap()
+                    .rep();
+                assert_eq!(operator.await.unwrap(), address.to_string());
+                let _socket = peer.await.unwrap();
+                assert_eq!(stream_status(&mut state, rep), 200);
+                assert!(
+                    stream_headers(&mut state, rep)
+                        .iter()
+                        .any(|h| h.key == "x-open")
+                );
+                // Hold both reader identity and device authority constant while the alias binding changes.
+                let directory = state.principal_directory.clone();
+                let uid = directory.uid_for(&principal).unwrap();
+                let alias = PrincipalId::new("stream-alias").unwrap();
+                directory.rename(uid, &principal, alias.clone()).unwrap();
+                let replacement = astrid_core::PrincipalUid::from_bytes([19; 32]);
+                directory.register(principal.clone(), replacement).unwrap();
+                assert_eq!(stream_status(&mut state, rep), 0);
+                assert!(stream_headers(&mut state, rep).is_empty());
+                assert!(matches!(
+                    stream_read_chunk(&mut state, rep).await,
+                    Err(ErrorCode::Closed)
+                ));
+                directory
+                    .rename(
+                        replacement,
+                        &principal,
+                        PrincipalId::new("replacement").unwrap(),
+                    )
+                    .unwrap();
+                directory.rename(uid, &alias, principal.clone()).unwrap();
+                assert_eq!(stream_read_chunk(&mut state, rep).await.unwrap(), b"a");
+                let retire = async {
+                    if matches!(retiring, Retire::Principal) {
+                        assert!(tracker.active(&principal) > 0);
+                        tracker.retire(&principal);
+                        owner_cancel.cancel();
+                        tracker.wait_for_quiescence(&principal).await;
+                    } else {
+                        sessions.retire(&principal, &key).await.unwrap();
+                    }
+                };
+                if reading {
+                    let io = state.io_semaphore.clone();
+                    let revoke = async {
+                        while io.available_permits() != 0 {
+                            tokio::task::yield_now().await;
+                        }
+                        retire.await;
+                    };
+                    let (result, ()) = tokio::join!(stream_read_chunk(&mut state, rep), revoke);
+                    assert!(matches!(result, Err(ErrorCode::Closed)));
+                } else {
+                    retire.await;
+                }
+                assert_eq!(stream_status(&mut state, rep), 0);
+                assert!(stream_headers(&mut state, rep).is_empty());
+                assert!(matches!(
+                    stream_read_chunk(&mut state, rep).await,
+                    Err(ErrorCode::Closed)
+                ));
+                stream_close(&mut state, rep).unwrap();
+                assert!(state.active_http_streams.is_empty());
+            })
+            .await
+            .expect("retirement must drain before stream close or peer EOF");
+        }
     }
 }

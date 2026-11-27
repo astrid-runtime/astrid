@@ -92,6 +92,20 @@ impl HostState {
         Arc::new(std::sync::Mutex::new(HashMap::new()))
     }
 
+    /// Capture the current principal lifecycle token, including a retirement tombstone.
+    pub(crate) fn principal_cancel_token_for(
+        &self,
+        principal: &astrid_core::PrincipalId,
+    ) -> CancellationToken {
+        let mut map = self
+            .principal_cancel_tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.entry(principal.clone())
+            .or_insert_with(|| self.cancel_token.child_token())
+            .clone()
+    }
+
     /// Install (or clear) the per-invocation cancellation token, mirroring the
     /// lifecycle of the other `invocation_*` overlays.
     ///
@@ -117,15 +131,7 @@ impl HostState {
     ) {
         match principal {
             Some(p) => {
-                let token = {
-                    let mut map = self
-                        .principal_cancel_tokens
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    map.entry(p.clone())
-                        .or_insert_with(|| self.cancel_token.child_token())
-                        .clone()
-                };
+                let token = self.principal_cancel_token_for(p);
                 self.invocation_cancel_token = Some(token);
             },
             None => self.invocation_cancel_token = None,
