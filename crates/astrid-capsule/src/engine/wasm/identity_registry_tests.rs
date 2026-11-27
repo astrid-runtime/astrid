@@ -32,8 +32,10 @@ async fn production_factory_isolates_equal_resource_reps() {
 
     let manifest = crate::discovery::load_manifest(&capsule_dir.path().join("Capsule.toml"))
         .expect("manifest loads");
-    let mut limits = limits::CapsuleRuntimeLimits::default();
-    limits.instance_pool_size = 2;
+    let limits = limits::CapsuleRuntimeLimits {
+        instance_pool_size: 2,
+        ..limits::CapsuleRuntimeLimits::default()
+    };
     let mut engine = WasmEngine::new(
         manifest,
         capsule_dir.path().to_path_buf(),
