@@ -27,6 +27,7 @@ use crate::types::{ServerInfo, ToolDefinition};
 use tokio::sync::mpsc;
 
 mod peer_selection;
+pub(crate) mod tool_call;
 
 /// Type alias for a running MCP client service.
 type McpService = RunningService<RoleClient, AstridClientHandler>;
@@ -649,14 +650,29 @@ impl ServerManager {
     /// Returns an error if the server is not running or not connected.
     pub async fn get_peer(&self, name: &str) -> McpResult<Peer<RoleClient>> {
         let running = self.running.read().await;
-        peer_selection::select(&running, name, RunningServer::peer).map_err(|error| match error {
+        peer_selection::select(&running, name, RunningServer::peer)
+            .map_err(|error| Self::lookup_error(name, &error))
+    }
+
+    pub(crate) async fn bind_call<'a>(
+        &self,
+        name: &str,
+        call: tool_call::ToolCall<'a, serde_json::Value>,
+    ) -> McpResult<tool_call::RoutedCall<'a, Peer<RoleClient>, serde_json::Value>> {
+        let running = self.running.read().await;
+        tool_call::bind(&running, name, call, RunningServer::peer)
+            .map_err(|error| Self::lookup_error(name, &error))
+    }
+
+    fn lookup_error(name: &str, error: &peer_selection::LookupError) -> McpError {
+        match error {
             peer_selection::LookupError::Missing => McpError::ServerNotRunning {
                 name: name.to_owned(),
             },
             peer_selection::LookupError::Disconnected => {
                 McpError::ConnectionFailed(format!("Server {name} is registered but not connected"))
             },
-        })
+        }
     }
 
     /// Stop a server.

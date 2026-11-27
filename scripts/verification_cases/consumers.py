@@ -15,6 +15,21 @@ def consumer_defects():
     yield from workspace_commit.defects()
     yield from file_descriptor.defects()
     yield from retirement.defects()
+    tool_call = Path("crates/astrid-mcp/src/server/tool_call.rs")
+    for label, field, replacement in [
+        ("fixed hook", 'call.parts().0@ == "astrid_hook_intercept"@', "true"),
+        ("hook payload", "encode.ensures((action,payload),call.parts().1)", "true"),
+        ("requested tool", "bound.parts().1 == call.parts().0", "true"),
+        ("request arguments", "bound.parts().2 == call.parts().1", "true"),
+        ("registration", "servers@.contains_key(k) && k@ == requested@", "servers@.contains_key(k)"),
+        ("peer", "peer.ensures((&servers@[k],),Some(bound.parts().0))", "true"),
+        ("send", "ensures send.ensures(self.parts(),out)", "ensures true"),
+    ]:
+        yield (
+            f"MCP tool binding loses {label}", tool_call,
+            lambda s, a=field, b=replacement: replace_once(s, a, b),
+            Path("verification/hosted_mcp_peer.rs"),
+        )
     cleanup = Path("crates/astrid-capsule/src/engine/mcp_cleanup.rs")
     for label, field, replacement in [
         ("registration target", "final(self).name() == Some(target@)", "true"),

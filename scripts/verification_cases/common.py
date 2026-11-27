@@ -47,6 +47,7 @@ MOUNT = Path("crates/astrid-capsule/src/engine/wasm/mount_selection.rs")
 PAIR_RESULT = Path("crates/astrid-kernel/src/kernel_router/admin/pair_issue_result.rs")
 INPUTS = [
     Path("crates/astrid-mcp/src/server/peer_selection.rs"),
+    Path("crates/astrid-mcp/src/server/tool_call.rs"),
     Path("verification/hosted_mcp_peer.rs"),
     Path("crates/astrid-capsule/src/engine/mcp_cleanup.rs"),
     Path("crates/astrid-capsule/src/engine/mcp_registration.rs"),

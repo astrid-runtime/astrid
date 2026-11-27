@@ -324,19 +324,12 @@ impl ExecutionEngine for McpHostEngine {
             CapsuleError::ExecutionFailed(format!("failed to deserialize interceptor payload: {e}"))
         })?;
 
-        // Use call_tool with the `astrid_hook_intercept` tool so we get
-        // a response back (request-response interceptor pattern).
-        let tool_args = serde_json::json!({
-            "hook": action,
-            "payload": params,
-        });
-
         // Interceptor hooks are kernel-internal infrastructure, not
         // user-facing tool calls. Use the bare inner McpClient directly -
         // no capability check needed for the kernel invoking its own hooks.
         let client = self.mcp_client.inner().clone();
 
-        let result = client.call_tool(&server_id, "astrid_hook_intercept", tool_args);
+        let result = client.call_hook(&server_id, action, params);
         let result = tokio::select! {
             () = self.cancelled.cancelled() => {
                 return Err(CapsuleError::ExecutionFailed(

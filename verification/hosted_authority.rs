@@ -373,6 +373,8 @@ mod hosted_retirement_recovery;
 
 #[path = "../crates/astrid-mcp/src/server/peer_selection.rs"]
 mod peer_selection;
+#[path = "../crates/astrid-mcp/src/server/tool_call.rs"]
+mod tool_call;
 #[path = "../crates/astrid-capsule/src/engine/mcp_registration.rs"]
 mod mcp_registration;
 use runtime_generation::RuntimeId as RegistryId;

@@ -101,4 +101,31 @@ fn foreign_cleanup(capsule: &str, server: &str, generation: u64, other: u64)
     let right = current.finish(own_worker);
     assert(right && current is Done);
 }
+
+/// Every successful hook send carries the selected handle, fixed tool and caller-supplied arguments.
+fn registered_hook<'a>(servers: &HashMap<String,Option<u64>>, capsule: &str, server: &str,
+    scope: Option<&str>, generation:u64, action: &'a str, payload:u64)
+    -> (result: Result<(u64,&'static str,(&'a str,u64)),LookupError>)
+    requires hash_map_inv(servers),
+    ensures ({
+        let key = crate::mcp_registration::registration(capsule@,server@,
+            match scope { Some(uid) => Some(uid@), None => None },generation);
+        match result {
+            Ok((handle,tool,args)) => tool@ == "astrid_hook_intercept"@ && args == (action,payload)
+                && exists|k:String| #[trigger] servers@.contains_key(k)
+                    && k@ == key && servers@[k] == Some(handle),
+            Err(LookupError::Disconnected) => exists|k:String| #[trigger] servers@.contains_key(k)
+                && k@ == key && servers@[k].is_none(),
+            Err(LookupError::Missing) => forall|k:String| #[trigger] servers@.contains_key(k) ==> k@ != key,
+        }
+    }),
+{
+    let key = crate::mcp_registration::name(capsule,server,scope,generation);
+    let call = crate::tool_call::ToolCall::hook(action,payload,
+        |name: &'a str, value:u64| -> (args:(&'a str,u64)) ensures args == (name,value) { (name,value) });
+    let bound = crate::tool_call::bind(servers,key.as_str(),call,
+        |entry: &Option<u64>| -> (p:Option<u64>) ensures p == *entry { *entry })?;
+    Ok(bound.send(|peer:u64, tool:&'static str, args:(&'a str,u64)| -> (sent:(u64,&'static str,(&'a str,u64)))
+        ensures sent == (peer,tool,args) { (peer,tool,args) }))
+}
 }

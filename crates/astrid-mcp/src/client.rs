@@ -12,6 +12,7 @@ use crate::capabilities::{CapabilitiesHandler, ServerNotice};
 use crate::config::{ServerConfig, ServersConfig};
 use crate::error::{McpError, McpResult};
 use crate::server::ServerManager;
+use crate::server::tool_call::ToolCall;
 use crate::types::{ToolDefinition, ToolResult};
 
 use tokio::sync::mpsc;
@@ -254,27 +255,50 @@ impl McpClient {
     ///
     /// Returns an error if the server is not running or the tool call fails.
     pub async fn call_tool(&self, server: &str, tool: &str, args: Value) -> McpResult<ToolResult> {
+        self.call_request(server, ToolCall::new(tool, args)).await
+    }
+
+    /// Invoke a native capsule interceptor on its registered MCP server.
+    ///
+    /// # Errors
+    ///
+    /// Returns the lookup or transport error from the underlying tool call.
+    pub async fn call_hook(
+        &self,
+        server: &str,
+        action: &str,
+        payload: Value,
+    ) -> McpResult<ToolResult> {
+        let call = ToolCall::hook(
+            action,
+            payload,
+            |hook, payload| serde_json::json!({ "hook": hook, "payload": payload }),
+        );
+        self.call_request(server, call).await
+    }
+
+    async fn call_request(&self, server: &str, call: ToolCall<'_, Value>) -> McpResult<ToolResult> {
+        let tool = call.tool();
         debug!(server = server, tool = tool, "Calling MCP tool");
+        let bound = self.servers.bind_call(server, call).await?;
+        let result = bound
+            .send(|peer, tool, args| async move {
+                let arguments = match args {
+                    Value::Object(map) => Some(map),
+                    Value::Null => None,
+                    other => {
+                        // Wrap non-object values
+                        let mut map = serde_json::Map::new();
+                        map.insert("value".to_string(), other);
+                        Some(map)
+                    },
+                };
 
-        // Get the peer and make the call
-        let peer = self.servers.get_peer(server).await?;
+                let mut params = CallToolRequestParams::new(tool.to_string());
+                params.arguments = arguments;
 
-        let arguments = match args {
-            Value::Object(map) => Some(map),
-            Value::Null => None,
-            other => {
-                // Wrap non-object values
-                let mut map = serde_json::Map::new();
-                map.insert("value".to_string(), other);
-                Some(map)
-            },
-        };
-
-        let mut params = CallToolRequestParams::new(tool.to_string());
-        params.arguments = arguments;
-
-        let result = peer
-            .call_tool(params)
+                peer.call_tool(params).await
+            })
             .await
             .map_err(|e| McpError::ToolCallFailed {
                 server: server.to_string(),

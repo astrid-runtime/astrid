@@ -34,6 +34,13 @@ impl rmcp::ServerHandler for ModernMrtrServer {
             ])
             .into());
         }
+        if request.name == "astrid_hook_intercept" {
+            let arguments = serde_json::Value::from(request.arguments);
+            return Ok(rmcp::model::CallToolResult::success(vec![
+                rmcp::model::ContentBlock::text(arguments.to_string()),
+            ])
+            .into());
+        }
         if request.input_responses.is_none() {
             let params = rmcp::model::ElicitRequestParams::FormElicitationParams {
                 meta: None,
@@ -229,6 +236,19 @@ async fn tool_call_reaches_only_the_selected_generation_peer() {
         .expect("selected peer should answer");
     assert_eq!(result.text_content(), "pong");
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(old_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let payload = serde_json::json!({"items": [null, 7], "hook": "nested"});
+    let hook = client
+        .call_hook("generation-2", "inspect", payload.clone())
+        .await
+        .unwrap();
+    let observed: serde_json::Value = serde_json::from_str(&hook.text_content()).unwrap();
+    assert_eq!(
+        observed,
+        serde_json::json!({"hook": "inspect", "payload": payload})
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert_eq!(old_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 
     client.server_manager().stop_all().await.unwrap();
