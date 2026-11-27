@@ -254,6 +254,16 @@ def defects():
     for name, old, new, failure in [
         ("compares the leaf to itself", "io.volume(root)", "io.volume(&file)", source),
         ("skips the parent check", "io.directory(parent)", "io.directory(root_directory)", source),
+        ("checks the parent twice", "io.directory(root_directory)", "io.directory(parent)", source),
+        ("checks the directories in reverse order",
+         "io.directory(parent) {\n        return Err(Failure::Native(error));\n    }\n    if let Some(error) = io.directory(root_directory)",
+         "io.directory(root_directory) {\n        return Err(Failure::Native(error));\n    }\n    if let Some(error) = io.directory(parent)", source),
+        ("continues after parent refusal", "return Err(Failure::Native(error));\n    }\n    if let Some(error) = io.directory(root_directory)",
+         "let _ = error;\n    }\n    if let Some(error) = io.directory(root_directory)", source),
+        ("can disregard successful recapture arguments", "calls == root_ok.push(Call::Recapture(*path,*root,None))",
+         "calls.len() == root_ok.len() + 1", trace),
+        ("can disregard failed recapture arguments", "calls == root_ok.push(Call::Recapture(*path,*root,Some(e)))",
+         "calls.len() == root_ok.len() + 1", trace),
         ("recaptures with the leaf", "io.recapture(path,root)", "io.recapture(path,&file)", source),
         ("may return another handle", "accepted == file && calls == root_ok.push", "calls == root_ok.push", trace),
     ]:

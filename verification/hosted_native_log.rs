@@ -111,7 +111,32 @@ fn windows_handle<H,D,P,E,A:crate::windows_append_confirmation::Checks<H,D,P,E>>
                 &&& (calls[prior] matches Call::Volume(leaf,Ok(v)) && leaf == file &&
                     (calls[prior+1] matches Call::Volume(r,Ok(w)) && r == *root && v != w))
             },
-            Err(Failure::Native(_)) => prior < calls.len() <= prior + 5,
+            Err(Failure::Native(error)) => {
+                let n = calls.len() - prior;
+                if n == 1 {
+                    calls[prior] == Call::Volume(file,Err(error))
+                } else {
+                    calls[prior] matches Call::Volume(h,Ok(volume)) && h == file && (
+                        if n == 2 {
+                            calls[prior+1] == Call::Volume(*root,Err(error))
+                        } else {
+                            &&& calls[prior+1] == Call::Volume(*root,Ok(volume))
+                            &&& if n == 3 {
+                                calls[prior+2] == Call::Directory(*parent,Some(error))
+                            } else {
+                                &&& calls[prior+2] == Call::Directory(*parent,None)
+                                &&& if n == 4 {
+                                    calls[prior+3] == Call::Directory(*root_directory,Some(error))
+                                } else {
+                                    &&& n == 5
+                                    &&& calls[prior+3] == Call::Directory(*root_directory,None)
+                                    &&& calls[prior+4] == Call::Recapture(*path,*root,Some(error))
+                                }
+                            }
+                        }
+                    )
+                }
+            },
         }
     }),
 {
