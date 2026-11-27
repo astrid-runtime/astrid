@@ -47,6 +47,7 @@ mod ids;
 mod publication;
 #[cfg(test)]
 mod registry_tests;
+mod retirement;
 mod ring;
 mod selection;
 #[cfg(unix)]
@@ -610,19 +611,12 @@ impl PersistentProcessRegistry {
 
     /// Kill and remove entries owned by one retiring principal only.
     pub fn shutdown_for(&self, principal: &PrincipalId) {
-        let mut removed = Vec::new();
-        {
-            let mut map = self.lock();
-            let keys: Vec<_> = map
-                .iter()
-                .filter_map(|(key, entry)| (entry.creator == *principal).then_some(*key))
-                .collect();
-            for key in keys {
-                if let Some(entry) = map.remove(&key) {
-                    removed.push(entry);
-                }
-            }
-        }
+        let removed = retirement::drain_for(&mut self.lock(), |entry| {
+            retirement::owned_by(
+                principal.as_str().as_bytes(),
+                entry.creator.as_str().as_bytes(),
+            )
+        });
         for entry in removed {
             reap_entry(entry);
         }

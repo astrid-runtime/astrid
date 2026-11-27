@@ -8,6 +8,10 @@ def defects():
     persistent = Path("crates/astrid-capsule/src/engine/wasm/host/process/persistent")
     process_trace = Path("verification/hosted_process_selection.rs")
     for file, name, clause, weakened in [
+        ("retirement", "retirement may omit an owned key", "matches.ensures((&before[k],),keys.contains(k))", "true"),
+        ("retirement", "retirement loses the cleanup target", "&& removed[i] == before[keys[i]]", "&& true"),
+        ("retirement", "retirement can alter a foreign slot", "&& after == before.remove_keys(keys.to_set())", "&& true"),
+        ("retirement", "retirement may duplicate cleanup", "keys.no_duplicates() && keys.len()", "keys.len()"),
         ("publication", "may skip an earlier free digest", "&& forall|j:u8| j < i ==> #[trigger] collided(before,mint,digest,j)", "&& true"),
         ("publication", "can displace an existing token", "&& !before.contains_key(key)", "&& true"),
         ("publication", "can publish an unrelated entry", "&& build.ensures((&token,pending),entry)", "&& true"),

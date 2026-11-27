@@ -195,6 +195,37 @@ async fn spawn_wait_read_and_owner_isolation() {
 }
 
 #[tokio::test]
+async fn retirement_removes_all_owned_capsules_and_preserves_foreign_entries() {
+    let registry = PersistentProcessRegistry::new(tokio::runtime::Handle::current());
+    let alice = PrincipalId::new("alice").unwrap();
+    let bob = PrincipalId::new("bob").unwrap();
+    let register = |owner: &PrincipalId, capsule: &str| {
+        let (child, stdout, stderr, pid) = spawn_raw("exit 0");
+        registry
+            .spawn(params(owner, capsule, child, stdout, stderr, pid, 3))
+            .expect("register child")
+    };
+    let first = register(&alice, "shared");
+    let other = register(&bob, "shared");
+    let second = register(&alice, "another");
+
+    registry.shutdown_for(&alice);
+    registry.shutdown_for(&alice);
+    for (token, capsule) in [(first, "shared"), (second, "another")] {
+        assert!(matches!(
+            registry.status(&token, &alice, capsule),
+            Err(ErrorCode::NoSuchProcess)
+        ));
+    }
+    let exit = registry
+        .wait(&other, &bob, "shared", Duration::from_secs(5))
+        .await
+        .expect("foreign child remains registered");
+    assert_eq!(exit.exit_code, Some(0));
+    registry.release(&other, &bob, "shared").unwrap();
+}
+
+#[tokio::test]
 async fn concurrent_cap_enforced_and_stop_reaps() {
     // macOS regression: constructing the real Wasmtime engine installs its
     // process-wide trap handler. The registry must still be able to spawn and

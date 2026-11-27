@@ -147,4 +147,33 @@ fn release_child<T>(entries:&mut HashMap<[u8;32],Entry<(bool,T)>>, key:&[u8;32],
     { process_selection::matches(principal,capsule,e.creator.as_slice(),e.package.as_slice()) },
         |e:&Entry<(bool,T)>| -> (yes:bool) ensures yes == e.target.0, { e.target.0 })
 }
+
+// Retirement spans every capsule of this principal. A key witness accounts
+// for every entry handed to the cleanup loop, including duplicate payloads.
+fn retire_principal<T>(entries:&mut HashMap<[u8;32],Entry<T>>, principal:&[u8])
+    -> (removed:Vec<Entry<T>>)
+    requires hash_map_inv(old(entries)), obeys_key_model::<[u8;32]>(), obeys_concrete_eq::<[u8;32]>(),
+    ensures ({
+        let before = old(entries)@;
+        &&& final(entries)@ == before.restrict(before.dom().filter(|k| before[k].creator@ != principal@))
+        &&& exists|keys:Seq<[u8;32]>| keys.no_duplicates() && keys.len() == removed@.len()
+            && (forall|k:[u8;32]| #[trigger] before.contains_key(k) ==> (keys.contains(k) == (before[k].creator@ == principal@)))
+            && (forall|i:int| 0 <= i < keys.len() ==> before.contains_key(#[trigger] keys[i]) && removed@[i] == before[keys[i]])
+    }),
+{
+    let ghost before = entries@;
+    let owns = |entry:&Entry<T>| -> (yes:bool) ensures yes == (entry.creator@ == principal@), {
+        crate::process_retirement::owned_by(principal,entry.creator.as_slice())
+    };
+    let removed = crate::process_retirement::drain_for(entries,owns);
+    proof {
+        let keys = choose|keys:Seq<[u8;32]>| crate::process_retirement::retired(before,entries@,keys,removed@,owns);
+        assert forall|k:[u8;32]| #[trigger] before.contains_key(k) implies
+            (keys.contains(k) == (before[k].creator@ == principal@)) by {
+            assert(owns.ensures((&before[k],),keys.contains(k)));
+        }
+        assert(entries@ =~= before.restrict(before.dom().filter(|k| before[k].creator@ != principal@)));
+    }
+    removed
+}
 }

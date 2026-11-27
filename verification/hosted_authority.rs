@@ -5,6 +5,8 @@ extern crate self as astrid_core;
 mod process_command;
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/process/persistent/selection.rs"]
 mod process_selection;
+#[path = "../crates/astrid-capsule/src/engine/wasm/host/process/persistent/retirement.rs"]
+mod process_retirement;
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/process/persistent/publication.rs"]
 mod process_publication;
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/process/persistent/signal_target.rs"]
