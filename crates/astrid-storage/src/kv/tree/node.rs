@@ -1,11 +1,10 @@
 //! Canonical page grammar for the persistent KV B+-tree.
 
-use crate::storage_model::{
-    ObjectClass, ObjectId, ObjectKind, ObjectRecord, ObjectReference, ReferenceKind, ReferenceLabel,
-};
+use crate::storage_model::{ObjectClass, ObjectId, ObjectKind, ObjectRecord, ObjectReference};
 
 use super::super::tree_error::invalid;
 use super::FORMAT_VERSION;
+use super::checkpoint_reference::{self, Rejection, Relation};
 use super::validation::validate_composite_key;
 use crate::error::{StorageError, StorageResult};
 
@@ -16,8 +15,6 @@ pub(super) const MAX_TREE_LEVEL: u16 = 16;
 
 const LEAF_MAGIC: &[u8] = b"astrid-kv-bplus-leaf-v1\0";
 const BRANCH_MAGIC: &[u8] = b"astrid-kv-bplus-branch-v1\0";
-const VALUE_LABEL_PREFIX: &[u8] = b"value/";
-const CHILD_LABEL_PREFIX: &[u8] = b"child/";
 const INLINE_VALUE: u8 = 0;
 const SPILLED_VALUE: u8 = 1;
 
@@ -145,7 +142,8 @@ pub(super) fn leaf_record(entries: &[LeafEntry]) -> StorageResult<ObjectRecord> 
                 }
                 canonical.push(SPILLED_VALUE);
                 references.push(ObjectReference::owns(
-                    indexed_label(VALUE_LABEL_PREFIX, index)?,
+                    checkpoint_reference::label(Relation::Value, index)
+                        .ok_or_else(arithmetic_overflow)?,
                     *object,
                 ));
             },
@@ -191,7 +189,7 @@ pub(super) fn branch_record(children: &[ChildPointer]) -> StorageResult<ObjectRe
         canonical.extend_from_slice(lower_bound);
         push_totals(&mut canonical, child.totals);
         references.push(ObjectReference::owns(
-            indexed_label(CHILD_LABEL_PREFIX, index)?,
+            checkpoint_reference::label(Relation::Child, index).ok_or_else(arithmetic_overflow)?,
             child.object,
         ));
     }
@@ -285,18 +283,20 @@ fn decode_leaf(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
                 if value_length <= u64::try_from(INLINE_VALUE_MAX).unwrap_or(u64::MAX) {
                     return Err(invalid(id, "small KV value was not inlined"));
                 }
-                let reference = record
-                    .references()
-                    .get(reference_index)
-                    .ok_or_else(|| invalid(id, "spilled KV value reference is missing"))?;
-                if reference.label() != &indexed_label(VALUE_LABEL_PREFIX, entry_index)?
-                    || reference.kind() != ReferenceKind::Owns
-                {
-                    return Err(invalid(id, "invalid spilled KV value reference"));
-                }
+                let object = checkpoint_reference::target(
+                    record.references(),
+                    reference_index,
+                    Relation::Value,
+                    entry_index,
+                )
+                .map_err(|reason| match reason {
+                    Rejection::Missing => invalid(id, "spilled KV value reference is missing"),
+                    Rejection::IndexOverflow => arithmetic_overflow(),
+                    Rejection::Mismatch => invalid(id, "invalid spilled KV value reference"),
+                })?;
                 reference_index = reference_index.saturating_add(1);
                 ValueSlot::Spilled {
-                    object: reference.target(),
+                    object,
                     length: value_length,
                 }
             },
@@ -339,13 +339,15 @@ fn decode_branch(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
             if child_totals.entries == 0 {
                 return Err(invalid(id, "empty KV branch child"));
             }
-            let reference = &record.references()[index];
-            if reference.label() != &indexed_label(CHILD_LABEL_PREFIX, index)?
-                || reference.kind() != ReferenceKind::Owns
-            {
-                return Err(invalid(id, "invalid KV branch child reference"));
-            }
-            Ok((cursor, lower_bound, reference.target(), child_totals))
+            let object =
+                checkpoint_reference::target(record.references(), index, Relation::Child, index)
+                    .map_err(|reason| match reason {
+                        Rejection::IndexOverflow => arithmetic_overflow(),
+                        Rejection::Missing | Rejection::Mismatch => {
+                            invalid(id, "invalid KV branch child reference")
+                        },
+                    })?;
+            Ok((cursor, lower_bound, object, child_totals))
         },
         || invalid(id, "invalid KV branch level"),
     )?;
@@ -389,14 +391,6 @@ fn push_count(bytes: &mut Vec<u8>, count: usize) -> StorageResult<()> {
     let count = u16::try_from(count).map_err(|_| arithmetic_overflow())?;
     bytes.extend_from_slice(&count.to_le_bytes());
     Ok(())
-}
-
-fn indexed_label(prefix: &[u8], index: usize) -> StorageResult<ReferenceLabel> {
-    let index = u16::try_from(index).map_err(|_| arithmetic_overflow())?;
-    let mut label = Vec::with_capacity(prefix.len().saturating_add(2));
-    label.extend_from_slice(prefix);
-    label.extend_from_slice(&index.to_be_bytes());
-    Ok(ReferenceLabel::new(label))
 }
 
 fn arithmetic_overflow() -> StorageError {
@@ -510,6 +504,32 @@ mod tests {
         assert_eq!(BRANCH_MAGIC, b"astrid-kv-bplus-branch-v1\0");
         assert_eq!(INLINE_VALUE, 0);
         assert_eq!(SPILLED_VALUE, 1);
+    }
+
+    #[test]
+    fn spilled_reference_uses_leaf_entry_index_after_inline_value() {
+        let target = ObjectId::new([9; 32]);
+        let entries = vec![
+            inline(b"n\0a", b"x"),
+            LeafEntry {
+                key: b"n\0b".to_vec(),
+                value: ValueSlot::Spilled {
+                    object: target,
+                    length: 2_048,
+                },
+            },
+        ];
+        let record = leaf_record(&entries).unwrap();
+        assert_eq!(record.references().len(), 1);
+        assert_eq!(record.references()[0].label().as_bytes(), b"value/\x00\x01");
+        let handle = decode_node(ObjectId::new([1; 32]), &record).unwrap();
+        assert!(matches!(handle.node, Node::Leaf(leaf) if leaf.entries == entries));
+        assert_eq!(
+            checkpoint_reference::label(Relation::Child, 0x1234)
+                .unwrap()
+                .as_bytes(),
+            b"child/\x12\x34"
+        );
     }
 
     #[test]

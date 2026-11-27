@@ -575,3 +575,18 @@ def checkpoint_page_consumers():
             f"checkpoint page loses {label}", path,
             lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker), consumer,
         )
+
+
+def checkpoint_reference_consumers():
+    path = Path("crates/astrid-storage/src/kv/tree/checkpoint_reference.rs")
+    consumer = Path("verification/hosted_checkpoint_reference.rs")
+    for label, clause, weaker in [
+        ("encoded slot", "out matches Some(l) ==> l.value()@ == wire(rel,slot)", "true"),
+        ("encoded availability", "ensures out.is_some() == (slot <= u16::MAX), out matches Some(l)", "ensures out.is_some() ==> (slot <= u16::MAX), out matches Some(l)"),
+        ("kind or label rejection", "ensures out == if position >= refs.len()", "ensures out.is_ok() ==> out == if position >= refs.len()"),
+        ("exact target", "ensures out == if position >= refs.len()", "ensures out.is_err() ==> out == if position >= refs.len()"),
+    ]:
+        yield (
+            f"checkpoint reference loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker), consumer,
+        )

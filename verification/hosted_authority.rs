@@ -287,6 +287,9 @@ mod hosted_checkpoint_range;
 mod checkpoint_leaf;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_page.rs"]
 mod checkpoint_page;
+#[path = "../crates/astrid-storage/src/kv/tree/checkpoint_reference.rs"]
+mod checkpoint_reference;
+mod hosted_checkpoint_reference;
 mod hosted_checkpoint_page;
 mod hosted_checkpoint_leaf;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_progress.rs"]

@@ -10,7 +10,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::engine::{KvProjectionEngine, KvProjectionError};
-use crate::storage_model::{ModelError, RootState};
+use crate::storage_model::{ModelError, ObjectId, ObjectReference, ReferenceLabel, RootState};
 use parking_lot::Mutex;
 
 use self::context::{Replacement, TreeContext};
@@ -33,6 +33,7 @@ mod checkpoint_leaf;
 mod checkpoint_page;
 mod checkpoint_progress;
 mod checkpoint_range;
+mod checkpoint_reference;
 mod checkpoint_walk;
 mod context;
 mod delta;
