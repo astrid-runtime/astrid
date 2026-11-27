@@ -24,6 +24,7 @@ use super::pair_issue_result::{self, Inserted};
 use std::sync::Arc;
 
 use astrid_capabilities::{CapabilityCheck, device_scope_within};
+use astrid_capsule::profile_cache::DeviceRemoval;
 use astrid_core::PrincipalId;
 use astrid_core::groups::GroupConfig;
 use astrid_core::kernel_api::{
@@ -604,29 +605,23 @@ async fn revoke_with_publication_barrier(
     };
     let _guard = kernel.admin_write_lock.lock().await;
     let profile_path = kernel.astrid_home.profile_path(principal);
-    if !profile_path.exists() {
-        return err_bad_input(format!(
-            "principal {principal} does not exist (no profile.toml)"
-        ));
-    }
-    let mut profile = match PrincipalProfile::load_from_path(&profile_path) {
-        Ok(p) => p,
-        Err(e) => return err_internal(format!("profile load failed: {e}")),
+    let removed_key = match kernel
+        .profile_cache
+        .remove_paired_device(principal, &key_id)
+    {
+        Ok(DeviceRemoval::Removed(removed)) => removed,
+        Ok(DeviceRemoval::DeviceMissing) => {
+            return err_bad_input(format!(
+                "no paired device with key_id {key_id} on principal {principal}"
+            ));
+        },
+        Ok(DeviceRemoval::PrincipalMissing) => {
+            return err_bad_input(format!(
+                "principal {principal} does not exist (no profile.toml)"
+            ));
+        },
+        Err(error) => return err_internal(format!("profile update failed: {error}")),
     };
-
-    let Some(removed_key) = profile.auth.remove_device(&key_id) else {
-        return err_bad_input(format!(
-            "no paired device with key_id {key_id} on principal {principal}"
-        ));
-    };
-
-    if let Err(e) = profile.validate() {
-        return err_internal(format!("profile rejected after device removal: {e}"));
-    }
-    if let Err(e) = profile.save_to_path(&profile_path) {
-        return err_internal(format!("profile save failed: {e}"));
-    }
-    kernel.profile_cache.invalidate(principal);
     let receipt = match kernel
         .device_sessions
         .retire_with_receipt(principal, &removed_key)
