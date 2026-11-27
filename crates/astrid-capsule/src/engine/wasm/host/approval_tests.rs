@@ -283,25 +283,28 @@ async fn whitespace_only_action_cannot_be_remembered() {
     let mut state = persistent_test_state(home.path());
     let session_store = std::sync::Arc::new(AllowanceStore::new());
     state.allowance_store = Some(session_store.clone());
-    let (state, result, (action, _)) = answer_request_and_show_prompt(
-        state,
-        approval_request("\0\u{2003}\0", "anything at all"),
-        "approve_always",
-    )
-    .await;
-    assert_eq!(action, "");
-    assert!(matches!(result, Err(ErrorCode::StoreUnavailable)));
+    let mut watch = state
+        .event_bus
+        .subscribe_topic(Topic::approval_request().as_str());
+    let (state, result) = tokio::task::spawn_blocking(move || {
+        let result = approval::Host::request_approval(
+            &mut state,
+            approval_request("\0\u{2003}\0", "anything at all"),
+        );
+        (state, result)
+    })
+    .await
+    .expect("host task");
+    assert!(matches!(result, Err(ErrorCode::InvalidInput)));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), watch.recv())
+            .await
+            .is_err(),
+        "a whitespace-only family must not publish a prompt"
+    );
     assert!(
         !check_persisted_allowance(&state, &PrincipalId::default(), "anything at all").unwrap()
     );
-
-    let (_, result, _) = answer_request_and_show_prompt(
-        state,
-        approval_request("\0\u{2003}\0", "anything at all"),
-        "approve_session",
-    )
-    .await;
-    assert_eq!(result.unwrap().decision, ApprovalDecision::ApprovedSession);
     assert_eq!(session_store.count(), 0);
 }
 
@@ -1135,6 +1138,59 @@ fn sanitize_action_trims_whitespace_at_the_truncation_boundary() {
     assert_eq!(
         sanitize_action_for_pattern(&boundary, "test"),
         "a".repeat(MAX_ACTION_LEN - 1)
+    );
+}
+
+#[test]
+fn sanitize_action_rejects_an_invisible_family() {
+    assert_eq!(sanitize_action_for_pattern("\0\u{200B}\0", "test"), "");
+    assert_eq!(sanitize_action_for_pattern("\u{FEFF}", "test"), "");
+    assert_eq!(sanitize_action_for_pattern("\u{202E}\u{200B}", "test"), "");
+    assert_eq!(
+        sanitize_action_for_pattern("\u{200B}git status", "test"),
+        "\u{200B}git status"
+    );
+}
+
+#[test]
+fn invisible_family_stores_no_session_allowance() {
+    let store = AllowanceStore::new();
+    create_allowance_from_decision(
+        &store,
+        &PrincipalId::default(),
+        "\0\u{200B}\0",
+        "approve_session",
+        None,
+        "test",
+    );
+    assert_eq!(store.count(), 0);
+}
+
+#[tokio::test]
+async fn invisible_family_is_rejected_before_a_prompt() {
+    let home = tempfile::tempdir().unwrap();
+    let mut state = persistent_test_state(home.path());
+    let store = std::sync::Arc::new(AllowanceStore::new());
+    state.allowance_store = Some(store.clone());
+    let mut watch = state
+        .event_bus
+        .subscribe_topic(Topic::approval_request().as_str());
+    let (_state, result) = tokio::task::spawn_blocking(move || {
+        let result = approval::Host::request_approval(
+            &mut state,
+            approval_request("\0\u{200B}\0", "\u{200B} anything"),
+        );
+        (state, result)
+    })
+    .await
+    .expect("host task");
+    assert!(matches!(result, Err(ErrorCode::InvalidInput)));
+    assert_eq!(store.count(), 0);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), watch.recv())
+            .await
+            .is_err(),
+        "an invisible family must not publish a prompt"
     );
 }
 

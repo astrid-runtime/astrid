@@ -189,12 +189,30 @@ fn sanitize_guest_field(s: &mut String, max_len: usize, field_name: &str, capsul
     *s = sanitized;
 }
 
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+    )
+}
+
 /// Sanitize a guest-supplied action string for safe use in glob patterns.
 ///
-/// Defense layer 1: strips control characters and enforces a length cap.
-/// Runs BEFORE [`escape_glob_metacharacters`] (layer 2). Together they
-/// guarantee that no guest input can produce a dangerous or oversized glob
-/// pattern.
+/// Defense layer 1: strips control characters, trims whitespace that filter
+/// exposes, and enforces a length cap. A family that contains only invisible
+/// characters is empty, so it cannot be shown, audited, or remembered. Visible
+/// characters, including a literal `*`, stay for [`escape_glob_metacharacters`].
+/// Runs BEFORE that escape (layer 2). Together they guarantee that no guest
+/// input can produce a dangerous or oversized glob pattern.
 fn sanitize_action_for_pattern(action: &str, capsule_id: &str) -> String {
     let trimmed = action.trim();
     let mut sanitized: String = trimmed
@@ -206,6 +224,11 @@ fn sanitize_action_for_pattern(action: &str, capsule_id: &str) -> String {
 
     // Filtering or truncation can expose whitespace at the boundary.
     sanitized.truncate(sanitized.trim_end().len());
+    // Format characters such as ZWSP, BOM, and RLO are not controls or
+    // whitespace. They are not a family by themselves. A literal `*` is.
+    if sanitized.chars().all(is_invisible_format) {
+        sanitized.clear();
+    }
     let trimmed_chars = trimmed.chars().count();
     let sanitized_chars = sanitized.chars().count();
     if sanitized_chars != trimmed_chars {
@@ -382,6 +405,9 @@ impl approval::Host for HostState {
             return Err(ErrorCode::InvalidInput);
         }
         request.action = sanitize_action_for_pattern(&request.action, &capsule_id);
+        if request.action.is_empty() {
+            return Err(ErrorCode::InvalidInput);
+        }
         sanitize_guest_field(
             &mut request.target_resource,
             MAX_RESOURCE_LEN,
