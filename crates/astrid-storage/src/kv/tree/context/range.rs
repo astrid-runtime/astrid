@@ -19,15 +19,16 @@ mod tests;
 impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
     // Each range consumes its authenticated pages once. Deletion observations
     // carry validated values forward, so subsequent accounting needs no page memo.
-    fn visit_slots_in_range(
-        &mut self,
+    fn fold_slots_in_range<S>(
+        &self,
         root: Option<ObjectId>,
         start: &[u8],
         end: &[u8],
-        mut visit: impl FnMut(&Self, LeafEntry) -> StorageResult<()>,
-    ) -> StorageResult<()> {
+        mut state: S,
+        visit: impl Fn(S, LeafEntry) -> StorageResult<S> + Copy,
+    ) -> StorageResult<S> {
         let Some(root) = root else {
-            return Ok(());
+            return Ok(state);
         };
         let mut stack = vec![Page::Root(root)];
         while let Some(page) = stack.pop() {
@@ -45,23 +46,14 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
             }
             match handle.node {
                 Node::Leaf(leaf) => {
-                    checkpoint_leaf::visit(
-                        leaf.entries,
-                        start,
-                        end,
-                        &mut visit,
-                        |visitor, entry| {
-                            visitor(self, entry)?;
-                            Ok(visitor)
-                        },
-                    )?;
+                    state = checkpoint_leaf::visit(leaf.entries, start, end, state, visit)?;
                 },
                 Node::Branch(branch) => {
                     checkpoint_range::schedule(branch.children, &mut stack, start, end);
                 },
             }
         }
-        Ok(())
+        Ok(state)
     }
 
     pub(in crate::kv::tree) fn projected_deletions_in_range(
@@ -70,29 +62,34 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         start: &[u8],
         end: &[u8],
     ) -> StorageResult<Vec<Replacement>> {
-        let mut observed = BTreeMap::new();
-        self.visit_slots_in_range(header.tree, start, end, |context, entry| {
-            if header.overlay.get(&entry.key).is_none() {
-                // Preserve the existing body validation before deletion, but
-                // reuse this authenticated slot instead of looking it up again.
-                let value = match header.boundary {
-                    Some(certificate) => {
-                        context.read_certified_tree_slot(header, &entry.value, certificate)?
-                    },
-                    None => context.value_bytes(&entry.value)?,
-                };
-                let previous_len = Some(value.len());
-                drop(value);
-                observed.insert(
-                    entry.key,
-                    PreviousValue::Loaded {
-                        previous_len,
-                        unchanged: false,
-                    },
-                );
-            }
-            Ok(())
-        })?;
+        let mut observed = self.fold_slots_in_range(
+            header.tree,
+            start,
+            end,
+            BTreeMap::new(),
+            |mut observed, entry| {
+                if header.overlay.get(&entry.key).is_none() {
+                    // Preserve the existing body validation before deletion, but
+                    // reuse this authenticated slot instead of looking it up again.
+                    let value = match header.boundary {
+                        Some(certificate) => {
+                            self.read_certified_tree_slot(header, &entry.value, certificate)?
+                        },
+                        None => self.value_bytes(&entry.value)?,
+                    };
+                    let previous_len = Some(value.len());
+                    drop(value);
+                    observed.insert(
+                        entry.key,
+                        PreviousValue::Loaded {
+                            previous_len,
+                            unchanged: false,
+                        },
+                    );
+                }
+                Ok(observed)
+            },
+        )?;
         for (key, value) in header.overlay.range(start, end) {
             if value.is_some() {
                 // apply_mutations reads the current overlay before consulting
@@ -117,11 +114,13 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         end: &[u8],
         strip: usize,
     ) -> StorageResult<Vec<String>> {
-        let mut keys = BTreeMap::new();
-        self.visit_slots_in_range(header.tree, start, end, |_, entry| {
-            key_projection::checkpoint(&mut keys, entry.key);
-            Ok(())
-        })?;
+        let mut keys = self.fold_slots_in_range(
+            header.tree,
+            start,
+            end,
+            BTreeMap::new(),
+            checkpoint_leaf::mark,
+        )?;
         header.overlay.project_presence(&mut keys, start, end);
         key_projection::collect(&keys, |key| suffix(key, strip).map(str::to_owned))
     }
@@ -150,20 +149,20 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
         strip: usize,
         mut visit: impl FnMut(&str, &[u8]) -> StorageResult<()>,
     ) -> StorageResult<()> {
-        self.visit_slots_in_range(header.tree, start, end, |context, entry| {
+        self.fold_slots_in_range(header.tree, start, end, &mut visit, |visitor, entry| {
             // Replacements and tombstones shadow checkpoint values before
             // body reconstruction, just as in a point read.
             if header.overlay.get(&entry.key).is_none() {
                 let key = suffix(&entry.key, strip)?;
                 match &entry.value {
-                    ValueSlot::Inline(value) => visit(key, value)?,
+                    ValueSlot::Inline(value) => visitor(key, value)?,
                     ValueSlot::Spilled { .. } => {
-                        let value = context.value_bytes(&entry.value)?;
-                        visit(key, &value)?;
+                        let value = self.value_bytes(&entry.value)?;
+                        visitor(key, &value)?;
                     },
                 }
             }
-            Ok(())
+            Ok(visitor)
         })?;
         for (key, value) in header.overlay.range(start, end) {
             if let Some(value) = value {

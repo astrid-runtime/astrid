@@ -529,8 +529,10 @@ def checkpoint_leaf_consumers():
     path = Path("crates/astrid-storage/src/kv/tree/checkpoint_leaf.rs")
     consumer = Path("verification/hosted_checkpoint_leaf.rs")
     for label, clause, weaker in [
+        ("native presence update", "after.deep_view() == keys.deep_view().insert(entry.key@,true)", "true"),
+        ("infallible presence callback", "Err(_) => false,", "Err(_) => true,"),
         ("completed prefix", "Ok(s) => visited(rows@,rows@.len(),start@,end@,initial,s,callback)", "Ok(_) => true"),
-        ("earlier deliveries", "visited(rows@,i as nat,start@,end@,initial,s,callback) &&", "true &&"),
+        ("earlier deliveries", "Err(e) => exists|i:int,s:S| 0 <= i < rows.len() &&\n            visited(rows@,i as nat,start@,end@,initial,s,callback) &&", "Err(e) => exists|i:int,s:S| 0 <= i < rows.len() &&"),
         ("rejected range", "encoding::range_contains(start@,end@,rows@[i].key@) &&", "true &&"),
         ("original failure", "#[trigger] callback.ensures((s,rows@[i]),Err(e)),",
          "(#[trigger] callback.requires((s,rows@[i])) || callback.ensures((s,rows@[i]),Err(e))),"),

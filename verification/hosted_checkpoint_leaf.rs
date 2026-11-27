@@ -82,3 +82,67 @@ fn collect_until_refusal(rows:Vec<Row>, start:&[u8], end:&[u8], refused:u64)
     result
 }
 }
+
+use std::collections::BTreeMap;
+use vstd::{laws_cmp::{obeys_cmp,obeys_cmp_deep_eq},std_specs::btree::btree_map_inv};
+type Presence = BTreeMap<Vec<u8>,bool>;
+
+verus! {
+spec fn checkpoint_keys<V>(before:Map<Seq<u8>,bool>,rows:Seq<Entry<V>>,n:nat,start:Seq<u8>,end:Seq<u8>)
+    -> Map<Seq<u8>,bool>
+    decreases n,
+{
+    if n == 0 { before } else {
+        let prior = checkpoint_keys(before,rows,(n-1) as nat,start,end);
+        let key = rows[n-1].key@;
+        if encoding::range_contains(start,end,key) { prior.insert(key,true) } else { prior }
+    }
+}
+
+proof fn marks<V,E,F:Fn(Presence,Entry<V>)->Result<Presence,E>>(
+    rows:Seq<Entry<V>>, n:nat,start:Seq<u8>,end:Seq<u8>,initial:Presence,after:Presence,callback:F,
+)
+    requires n <= rows.len(), btree_map_inv(&initial), visited(rows,n,start,end,initial,after,callback),
+        forall|s:Presence,r:Entry<V>,o:Result<Presence,E>| btree_map_inv(&s) && #[trigger] callback.ensures((s,r),o) ==>
+            match o { Ok(a) => btree_map_inv(&a) && a.deep_view() == s.deep_view().insert(r.key@,true), Err(_) => false },
+    ensures btree_map_inv(&after), after.deep_view() == checkpoint_keys(initial.deep_view(),rows,n,start,end),
+    decreases n,
+{
+    if n == 0 { return; }
+    let r = rows[n-1];
+    if encoding::range_contains(start,end,r.key@) {
+        let prior = choose|p:Presence| visited(rows,(n-1) as nat,start,end,initial,p,callback) &&
+            #[trigger] callback.ensures((p,r),Ok(after));
+        marks(rows,(n-1) as nat,start,end,initial,prior,callback);
+    } else { marks(rows,(n-1) as nat,start,end,initial,after,callback); }
+}
+
+// Use the function item passed by projected_keys_in_range, including the
+// same callback type and owned map passed between checkpoint leaves.
+fn enumerate_slots<V,E>(rows:Vec<Entry<V>>,start:&[u8],end:&[u8],keys:Presence) -> (out:Result<Presence,E>)
+    requires btree_map_inv(&keys), obeys_cmp::<Vec<u8>>(), obeys_cmp_deep_eq::<Vec<u8>>(),
+    ensures match out { Ok(after) => btree_map_inv(&after) && after.deep_view() ==
+        checkpoint_keys(keys.deep_view(),rows@,rows@.len(),start@,end@), Err(_) => false },
+{
+    let callback = checkpoint_leaf::mark::<V,E>;
+    assert forall|i:int,s:Presence| 0 <= i < rows.len() && visited(rows@,i as nat,start@,end@,keys,s,callback)
+        && encoding::range_contains(start@,end@,rows@[i].key@) implies #[trigger] callback.requires((s,rows@[i])) by {
+        marks(rows@,i as nat,start@,end@,keys,s,callback);
+    }
+    let out = checkpoint_leaf::visit(rows,start,end,keys,callback);
+    let ghost observed = out;
+    proof {
+        match observed {
+            Ok(after) => marks(rows@,rows@.len(),start@,end@,keys,after,callback),
+            Err(e) => {
+                let (i,s) = choose|i:int,s:Presence| 0 <= i < rows.len() &&
+                    visited(rows@,i as nat,start@,end@,keys,s,callback) &&
+                    encoding::range_contains(start@,end@,rows@[i].key@) &&
+                    #[trigger] callback.ensures((s,rows@[i]),Err(e));
+                marks(rows@,i as nat,start@,end@,keys,s,callback);
+            },
+        }
+    }
+    out
+}
+}
