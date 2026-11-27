@@ -276,5 +276,9 @@ mod io_disposal;
 mod hosted_io_disposal;
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/net/destinations.rs"]
 mod tcp_destinations;
+#[path = "../crates/astrid-capsule/src/engine/wasm/host/net/bind_target.rs"]
+mod tcp_bind_target;
+#[path = "../crates/astrid-capsule/src/engine/wasm/host/net/reservation.rs"]
+mod net_reservation;
 mod hosted_tcp_destinations;
 mod hosted_io_splice;

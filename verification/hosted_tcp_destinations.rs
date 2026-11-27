@@ -33,3 +33,27 @@ fn dial(answers:&[(bool,u16,u128)], port:u16) -> (out:Result<&[(bool,u16,u128)],
     out
 }
 }
+
+verus! {
+fn accepted_listener(request: crate::tcp_bind_target::Address, port: u16,
+    actual: crate::tcp_bind_target::Address, assigned: u16) -> (out: Option<(crate::tcp_bind_target::Address,u16)>)
+    ensures out == if request.loopback() && actual == request && assigned != 0 && (port == 0 || assigned == port) {
+        Some((request,port))
+    } else { None },
+{
+    let target = crate::tcp_bind_target::Target::admit(request, port)?;
+    if target.matches_bound(actual, assigned) { Some(target.endpoint()) } else { None }
+}
+}
+
+verus! {
+// A contender that observes a committed change must use the new occupancy.
+fn successive_reservations(count: usize, limit: usize) -> (second: Option<usize>)
+    ensures if count as int + 2 <= limit as int {
+        second matches Some(n) && n as int == count as int + 2
+    } else { second.is_none() },
+{
+    let first = crate::net_reservation::reserve(count, limit)?;
+    crate::net_reservation::reserve(first, limit)
+}
+}

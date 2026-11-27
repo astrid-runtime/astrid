@@ -63,7 +63,7 @@ impl Pollable for TcpListenerReadiness {
         if pending
             .stream_count
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                (count < MAX_ACTIVE_STREAMS).then_some(count + 1)
+                super::reservation::reserve(count, MAX_ACTIVE_STREAMS)
             })
             .is_err()
         {

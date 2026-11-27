@@ -53,6 +53,20 @@ def consumer_defects():
             f"immediate stream access {name}", dispatch,
             lambda s, a=original, b=changed: replace_once(s, a, b), splice_trace,
         )
+    inbound = Path("crates/astrid-capsule/src/engine/wasm/host/net/bind_target.rs")
+    quota = inbound.with_name("reservation.rs")
+    inbound_trace = Path("verification/hosted_tcp_destinations.rs")
+    for name, source, original, changed in [
+        ("changes the admitted address", inbound, "t.requested() == (address, port)", "t.requested().1 == port"),
+        ("forgets the OS operand", inbound, "out == self.requested()", "out.1 == self.requested().1"),
+        ("permits a mismatched endpoint", inbound, "ensures ok == (actual", "ensures ok <== (actual"),
+        ("loses the reserved unit", quota, "n as int == count as int + 1", "n > count"),
+        ("loses full-capacity refusal", quota, "else { next.is_none() }", "else { true }"),
+    ]:
+        yield (
+            f"inbound TCP {name}", source,
+            lambda s, a=original, b=changed: replace_once(s, a, b), inbound_trace,
+        )
     tcp = Path("crates/astrid-capsule/src/engine/wasm/host/net/destinations.rs")
     tcp_trace = Path("verification/hosted_tcp_destinations.rs")
     for name, original, changed in [

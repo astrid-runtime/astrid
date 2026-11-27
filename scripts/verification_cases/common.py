@@ -52,6 +52,8 @@ INPUTS = [
     Path("verification/hosted_io_disposal.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/host/io/disposal.rs"),
     Path("verification/hosted_tcp_destinations.rs"),
+    Path("crates/astrid-capsule/src/engine/wasm/host/net/reservation.rs"),
+    Path("crates/astrid-capsule/src/engine/wasm/host/net/bind_target.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/host/net/destinations.rs"),
     Path("verification/hosted_pool_return.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/pool/return_policy.rs"),

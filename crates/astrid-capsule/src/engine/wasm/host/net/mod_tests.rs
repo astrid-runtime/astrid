@@ -321,22 +321,22 @@ fn validate_host_accepts_max_length() {
 
 #[test]
 fn loopback_bind_host_accepts_loopback() {
-    assert!(is_loopback_bind_host("127.0.0.1"));
-    assert!(is_loopback_bind_host("127.0.0.5"));
-    assert!(is_loopback_bind_host("::1"));
-    assert!(is_loopback_bind_host("localhost"));
-    assert!(is_loopback_bind_host("LOCALHOST"));
+    assert!(bind_target("127.0.0.1", 0).is_some());
+    assert!(bind_target("127.0.0.5", 0).is_some());
+    assert!(bind_target("::1", 0).is_some());
+    assert!(bind_target("localhost", 0).is_some());
+    assert!(bind_target("LOCALHOST", 0).is_some());
 }
 
 #[test]
 fn loopback_bind_host_rejects_non_loopback() {
-    assert!(!is_loopback_bind_host("0.0.0.0"));
-    assert!(!is_loopback_bind_host("192.168.1.10"));
-    assert!(!is_loopback_bind_host("8.8.8.8"));
-    assert!(!is_loopback_bind_host("::"));
+    assert!(bind_target("0.0.0.0", 0).is_none());
+    assert!(bind_target("192.168.1.10", 0).is_none());
+    assert!(bind_target("8.8.8.8", 0).is_none());
+    assert!(bind_target("::", 0).is_none());
     // A hostname other than localhost is refused (not resolved).
-    assert!(!is_loopback_bind_host("example.com"));
-    assert!(!is_loopback_bind_host(""));
+    assert!(bind_target("example.com", 0).is_none());
+    assert!(bind_target("", 0).is_none());
 }
 
 #[tokio::test]
@@ -368,4 +368,36 @@ async fn outbound_connect_checks_all_resolved_answers_before_dialling() {
         accepted.peer_addr().unwrap(),
         connection.local_addr().unwrap()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn equivalent_ipv6_spellings_publish_the_same_worker_listener() {
+    let probe = match std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrNotAvailable => return,
+        Err(error) => panic!("IPv6 loopback probe failed: {error}"),
+    };
+    let endpoint = probe.local_addr().unwrap();
+    drop(probe);
+    let mut first = worker_host_state(tokio::runtime::Handle::current());
+    let mut second = worker_host_state(tokio::runtime::Handle::current());
+    second.shared_listeners = Arc::clone(&first.shared_listeners);
+    second.tcp_listener_count = Arc::clone(&first.tcp_listener_count);
+    let a = first
+        .bind_tcp("0:0:0:0:0:0:0:1".into(), endpoint.port())
+        .unwrap();
+    let b = second.bind_tcp("::1".into(), endpoint.port()).unwrap();
+    assert_eq!(
+        first.local_addr(Resource::new_borrow(a.rep())).unwrap(),
+        endpoint.to_string()
+    );
+    assert_eq!(
+        second.local_addr(Resource::new_borrow(b.rep())).unwrap(),
+        endpoint.to_string()
+    );
+    assert_eq!(first.tcp_listener_count.load(Ordering::Acquire), 1);
+    HostTcpListener::drop(&mut first, a).unwrap();
+    HostTcpListener::drop(&mut second, b).unwrap();
+    assert_eq!(first.tcp_listener_count.load(Ordering::Acquire), 0);
+    assert!(first.shared_listeners.is_empty());
 }

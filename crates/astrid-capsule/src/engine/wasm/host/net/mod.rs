@@ -43,9 +43,11 @@ use crate::engine::wasm::host_state::{HostState, NetStream, SharedTcpListener, T
 
 pub(crate) mod client_lifecycle;
 pub(crate) use client_lifecycle::disconnect_remaining_clients;
+mod bind_target;
 mod destinations;
 pub(crate) mod handshake;
 mod ingress_frame;
+mod reservation;
 pub(crate) use ingress_frame::{
     PublicationGuard, matches_publication, publication_guard, take_publication,
 };
@@ -73,7 +75,7 @@ impl HostState {
         let reserved = self
             .capsule_net_stream_count
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                (count < MAX_ACTIVE_STREAMS).then_some(count + 1)
+                reservation::reserve(count, MAX_ACTIVE_STREAMS)
             })
             .is_ok();
         if reserved {
@@ -234,13 +236,31 @@ pub(super) fn validate_host(host: &str) -> Result<(), ErrorCode> {
 /// or the literal `localhost`. A hostname other than `localhost` is refused
 /// rather than resolved — binding must name a concrete local interface, and
 /// resolving arbitrary names for a bind target is an SSRF-shaped footgun.
-pub(super) fn is_loopback_bind_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
+fn bind_target(host: &str, port: u16) -> Option<bind_target::Target> {
+    let ip = if host.eq_ignore_ascii_case("localhost") {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    } else {
+        host.parse().ok()?
+    };
+    bind_target::Target::admit(ip.into(), port)
+}
+
+impl From<std::net::IpAddr> for bind_target::Address {
+    fn from(ip: std::net::IpAddr) -> Self {
+        match ip {
+            std::net::IpAddr::V4(ip) => Self::V4(ip.to_bits()),
+            std::net::IpAddr::V6(ip) => Self::V6(ip.to_bits()),
+        }
     }
-    host.parse::<std::net::IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false)
+}
+
+impl From<bind_target::Address> for std::net::IpAddr {
+    fn from(ip: bind_target::Address) -> Self {
+        match ip {
+            bind_target::Address::V4(bits) => Self::V4(std::net::Ipv4Addr::from_bits(bits)),
+            bind_target::Address::V6(bits) => Self::V6(std::net::Ipv6Addr::from_bits(bits)),
+        }
+    }
 }
 
 /// Classify a tokio io::Error into the typed `net::ErrorCode`.
@@ -512,11 +532,11 @@ impl net::Host for HostState {
         // mirrors `connect-tcp`, which runs its `is_safe_ip` airlock AFTER the
         // capability gate. A non-loopback bind is refused here, not silently
         // downgraded.
-        if !is_loopback_bind_host(&host) {
+        let Some(target) = bind_target(&host, port) else {
             let reason = "non-loopback TCP bind refused (capsule servers are loopback-only)";
             audit_net_bind(self, &bind_addr, HostAuditOutcome::Failed(reason));
             return Err(ErrorCode::AirlockRejected);
-        }
+        };
         admit_net(self, HostAuditEvent::NetBind { addr: &bind_addr })?;
 
         // Resolve the listener via the shared registry so a run-loop capsule's
@@ -542,11 +562,9 @@ impl net::Host for HostState {
         // map it to a non-loopback address. Bind a concrete loopback literal.
         // Normalized BEFORE the registry key so `localhost` and `127.0.0.1`
         // dedupe onto one entry rather than racing for the same OS port.
-        let host = if host.eq_ignore_ascii_case("localhost") {
-            "127.0.0.1".to_string()
-        } else {
-            host
-        };
+        let (ip, port) = target.endpoint();
+        let endpoint = std::net::SocketAddr::new(ip.into(), port);
+        let host = endpoint.ip().to_string();
         // Sharing is a worker-Store feature (`share_tcp_listeners`), not a
         // property of the port. N=1 and interceptor HostStates must attempt a
         // real OS bind so a second bind_tcp on the same state is AddressInUse
@@ -560,17 +578,16 @@ impl net::Host for HostState {
         let listener: Arc<tokio::net::TcpListener> = if !shareable {
             let rt = self.runtime_handle.clone();
             let sem = self.blocking_semaphore.clone();
-            let host_owned = host.clone();
             let bind_result: Result<tokio::net::TcpListener, std::io::Error> =
                 util::bounded_block_on(&rt, &sem, async move {
-                    tokio::net::TcpListener::bind((host_owned.as_str(), port)).await
+                    tokio::net::TcpListener::bind(endpoint).await
                 });
             match bind_result {
                 Ok(l) => {
                     if self
                         .tcp_listener_count
                         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                            (count < MAX_ACTIVE_TCP_LISTENERS).then_some(count + 1)
+                            reservation::reserve(count, MAX_ACTIVE_TCP_LISTENERS)
                         })
                         .is_err()
                     {
@@ -606,10 +623,9 @@ impl net::Host for HostState {
                 dashmap::mapref::entry::Entry::Vacant(vacant) => {
                     let rt = self.runtime_handle.clone();
                     let sem = self.blocking_semaphore.clone();
-                    let host_owned = host.clone();
                     let bind_result: Result<tokio::net::TcpListener, std::io::Error> =
                         util::bounded_block_on(&rt, &sem, async move {
-                            tokio::net::TcpListener::bind((host_owned.as_str(), port)).await
+                            tokio::net::TcpListener::bind(endpoint).await
                         });
                     match bind_result {
                         Ok(l) => {
@@ -618,7 +634,7 @@ impl net::Host for HostState {
                             if self
                                 .tcp_listener_count
                                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                                    (count < MAX_ACTIVE_TCP_LISTENERS).then_some(count + 1)
+                                    reservation::reserve(count, MAX_ACTIVE_TCP_LISTENERS)
                                 })
                                 .is_err()
                             {
@@ -658,9 +674,11 @@ impl net::Host for HostState {
             });
         }
         let actual_addr = match listener.local_addr() {
-            Ok(addr) if addr.ip().is_loopback() => format!("tcp:{addr}"),
+            Ok(addr) if target.matches_bound(addr.ip().into(), addr.port()) => {
+                format!("tcp:{addr}")
+            },
             Ok(addr) => {
-                let reason = format!("resolved bind escaped loopback: {addr}");
+                let reason = format!("bound TCP endpoint {addr} differs from requested {endpoint}");
                 audit_net_bind(self, &bind_addr, HostAuditOutcome::Failed(&reason));
                 if let Some(share) = share {
                     share.release();
