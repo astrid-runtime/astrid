@@ -304,14 +304,20 @@ impl HostProcessHandle for HostState {
             .ok_or(ErrorCode::Closed)
     }
 
-    fn subscribe_exit(&mut self, _self_: Resource<ProcessHandle>) -> Resource<DynPollable> {
+    fn subscribe_exit(
+        &mut self,
+        _self_: Resource<ProcessHandle>,
+    ) -> wasmtime::Result<Resource<DynPollable>> {
         // Real wiring (sourced from try_wait readiness on the child)
         // lands with the pollable commit. Always-ready sentinel until
         // then — guests poll, then `wait` blocks on the actual exit.
         super::super::stubs::always_ready_pollable(&mut self.resource_table)
     }
 
-    fn subscribe_logs(&mut self, _self_: Resource<ProcessHandle>) -> Resource<DynPollable> {
+    fn subscribe_logs(
+        &mut self,
+        _self_: Resource<ProcessHandle>,
+    ) -> wasmtime::Result<Resource<DynPollable>> {
         // Same pattern — guests poll, then `read-logs` drains whatever
         // the reader thread has buffered (or returns empty if nothing
         // is available yet, which is honest non-blocking semantics).

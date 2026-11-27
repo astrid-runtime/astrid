@@ -68,7 +68,10 @@ impl HostUdpSocket for HostState {
         Err(ErrorCode::CapabilityDenied)
     }
 
-    fn subscribe_readable(&mut self, _self_: Resource<UdpSocket>) -> Resource<DynPollable> {
+    fn subscribe_readable(
+        &mut self,
+        _self_: Resource<UdpSocket>,
+    ) -> wasmtime::Result<Resource<DynPollable>> {
         super::super::stubs::always_ready_pollable(&mut self.resource_table)
     }
 

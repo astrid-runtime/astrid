@@ -240,11 +240,14 @@ impl http_v10::HostHttpStream for HostState {
     fn subscribe_readable(
         &mut self,
         _self_: Resource<http_v10::HttpStream>,
-    ) -> Resource<DynPollable> {
+    ) -> wasmtime::Result<Resource<DynPollable>> {
         super::stubs::always_ready_pollable(&mut self.resource_table)
     }
 
-    fn body_stream(&mut self, _self_: Resource<http_v10::HttpStream>) -> Resource<InputStream> {
+    fn body_stream(
+        &mut self,
+        _self_: Resource<http_v10::HttpStream>,
+    ) -> wasmtime::Result<Resource<InputStream>> {
         super::stubs::closed_input_stream(&mut self.resource_table)
     }
 
@@ -330,13 +333,19 @@ impl http_v11::HostHttpStream for HostState {
         stream_close(self, self_.rep())
     }
 
-    fn subscribe_readable(&mut self, _self_: Resource<HttpStream>) -> Resource<DynPollable> {
+    fn subscribe_readable(
+        &mut self,
+        _self_: Resource<HttpStream>,
+    ) -> wasmtime::Result<Resource<DynPollable>> {
         // Reuse the @1.0.0 stub; the real pollable adapter is a separate
         // follow-up shared by both versions.
         super::stubs::always_ready_pollable(&mut self.resource_table)
     }
 
-    fn body_stream(&mut self, _self_: Resource<HttpStream>) -> Resource<InputStream> {
+    fn body_stream(
+        &mut self,
+        _self_: Resource<HttpStream>,
+    ) -> wasmtime::Result<Resource<InputStream>> {
         // Reuse the @1.0.0 stub; the real stream-half adapter is a separate
         // follow-up shared by both versions.
         super::stubs::closed_input_stream(&mut self.resource_table)
@@ -359,14 +368,20 @@ impl http_v11::HostHttpStream for HostState {
 }
 
 impl http_v11::HostHttpUpload for HostState {
-    fn body_sink(&mut self, _self_: Resource<HttpUpload>) -> Resource<OutputStream> {
+    fn body_sink(
+        &mut self,
+        _self_: Resource<HttpUpload>,
+    ) -> wasmtime::Result<Resource<OutputStream>> {
         // TODO(http@1.1.0): streaming request body — follow-up. `http_upload_start`
         // never hands out an `http-upload` handle, so these methods are
         // unreachable; the closed-on-write stub keeps the trait total.
         super::stubs::closed_output_stream(&mut self.resource_table)
     }
 
-    fn subscribe_writable(&mut self, _self_: Resource<HttpUpload>) -> Resource<DynPollable> {
+    fn subscribe_writable(
+        &mut self,
+        _self_: Resource<HttpUpload>,
+    ) -> wasmtime::Result<Resource<DynPollable>> {
         // Unreachable (see `body_sink`); always-ready stub.
         super::stubs::always_ready_pollable(&mut self.resource_table)
     }

@@ -784,7 +784,10 @@ impl HostSubscription for HostState {
         result
     }
 
-    fn subscribe_readiness(&mut self, _self_: Resource<Subscription>) -> Resource<DynPollable> {
+    fn subscribe_readiness(
+        &mut self,
+        _self_: Resource<Subscription>,
+    ) -> wasmtime::Result<Resource<DynPollable>> {
         // Real pollable wiring (sourced from the receiver's notify
         // channel) lands with the dedicated pollable commit. Until
         // then, hand out an always-ready sentinel so guests get a
