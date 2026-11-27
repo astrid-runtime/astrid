@@ -84,6 +84,25 @@ def defects():
             Path("verification/hosted_registry_lookup.rs"),
         )
     lookup = Path("crates/astrid-capsule/src/registry/view_lookup.rs")
+    for name, clause, weaker in [
+        ("can select an uninstalled handle", "Some(id) => instances@.contains_key(id) &&", "Some(id) =>"),
+        ("can select a different package, artifact or scope", "id.identity().0 == (*package,*artifact,super::RuntimeScope::SystemResident),", "true,"),
+        ("can miss an installed shared generation", "None => forall|id:RuntimeId<K,A,super::RuntimeScope>|", "None => false ==> forall|id:RuntimeId<K,A,super::RuntimeScope>|"),
+    ]:
+        yield (
+            f"runtime shared selection {name}", lookup,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_registry_lookup.rs"),
+        )
+    for name, clause in [
+        ("can alter another principal", "final(views)@.remove(principal) == old(views)@.remove(principal)"),
+        ("can bind an unrelated package", "final(views)@[principal]@ == (if old(views)@.contains_key(principal)"),
+    ]:
+        yield (
+            f"runtime view publication {name}", lookup,
+            lambda s, a=clause: replace_once(s, a, "false ==> " + a),
+            Path("verification/hosted_registry_lookup.rs"),
+        )
     for name, clause, weakened in [
         ("loses the installed generation and handle",
          "out == match slot(old(views)@,*principal,*capsule)", "instances@.len() == 0 ==> out == match slot(old(views)@,*principal,*capsule)"),

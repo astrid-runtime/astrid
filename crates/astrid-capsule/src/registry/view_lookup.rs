@@ -1,15 +1,113 @@
 //! Resolve the principal and capsule slot before consulting the instance map.
-use super::instance_swap::{self, Entry};
+use super::{
+    generation::RuntimeId,
+    instance_swap::{self, Entry},
+};
 use std::{collections::HashMap, hash::Hash, sync::Arc};
 use vstd::prelude::*;
 #[cfg(verus_keep_ghost)]
 use vstd::{
     laws_eq::obeys_concrete_eq,
     std_specs::hash::{hash_map_inv, obeys_key_model},
+    std_specs::iter::IteratorSpec,
 };
 
 verus! {
 broadcast use vstd::std_specs::hash::group_hash_axioms;
+
+fn matches_shared<K: Eq,A: Eq>(id: &RuntimeId<K,A,super::RuntimeScope>, package: &K, artifact: &A)
+    -> (yes: bool)
+    requires obeys_concrete_eq::<K>(), obeys_concrete_eq::<A>(),
+    ensures yes == (id.identity().0 == (*package,*artifact,super::RuntimeScope::SystemResident)),
+{
+    proof { reveal(obeys_concrete_eq); }
+    let key = id.key();
+    if let super::RuntimeScope::Principal(_) = key.scope() { return false; }
+    let candidate = key.capsule_id();
+    if !K::eq(candidate,package) { return false; }
+    let bytes = key.artifact();
+    A::eq(bytes,artifact)
+}
+
+/// Select an installed shareable generation with the requested package and artifact.
+pub(super) fn shared<K: Eq + Hash + Clone,A: Eq + Hash + Clone,E>(
+    instances: &HashMap<RuntimeId<K,A,super::RuntimeScope>,E>, package: &K, artifact: &A)
+    -> (out: Option<RuntimeId<K,A,super::RuntimeScope>>)
+    requires hash_map_inv(instances), obeys_key_model::<RuntimeId<K,A,super::RuntimeScope>>(),
+        obeys_concrete_eq::<K>(), obeys_concrete_eq::<A>(),
+        vstd::pervasive::obeys_clone_eq::<RuntimeId<K,A,super::RuntimeScope>>(),
+    ensures match out {
+        Some(id) => instances@.contains_key(id) &&
+            id.identity().0 == (*package,*artifact,super::RuntimeScope::SystemResident),
+        None => forall|id:RuntimeId<K,A,super::RuntimeScope>| instances@.contains_key(id) ==>
+            id.identity().0 != (*package,*artifact,super::RuntimeScope::SystemResident),
+    },
+{
+    proof { reveal(obeys_concrete_eq); reveal(vstd::pervasive::obeys_clone_eq); }
+    let mut rows = instances.iter();
+    let ghost all = rows.remaining();
+    let ghost mut n:int = 0;
+    loop
+        invariant
+            obeys_concrete_eq::<K>(), obeys_concrete_eq::<A>(),
+            vstd::pervasive::obeys_clone_eq::<RuntimeId<K,A,super::RuntimeScope>>(),
+            0 <= n <= all.len(), all.len() == instances@.dom().len(), rows.remaining() == all.skip(n),
+            forall|id:RuntimeId<K,A,super::RuntimeScope>| instances@.contains_key(id) ==> all.contains((&id,&instances@[id])),
+            forall|i:int| 0 <= i < all.len() ==> instances@.contains_key(*all[i].0),
+            forall|i:int| 0 <= i < n ==> (#[trigger] all[i].0).identity().0 != (*package,*artifact,super::RuntimeScope::SystemResident),
+        decreases instances@.dom().len() - n,
+    {
+        let Some((id,_)) = rows.next() else {
+            assert(n == all.len());
+            assert forall|id:RuntimeId<K,A,super::RuntimeScope>| instances@.contains_key(id) implies
+                id.identity().0 != (*package,*artifact,super::RuntimeScope::SystemResident) by {
+                let i = all.index_of((&id,&instances@[id]));
+                assert(all[i].0 == &id);
+            }
+            return None;
+        };
+        assert(all[n].0 == id);
+        assert(instances@.contains_key(*id));
+        if matches_shared(id,package,artifact) {
+            let selected = id.clone();
+            assert(vstd::pervasive::cloned(*id,selected));
+            assert(selected == *id);
+            assert(id.identity().0 == (*package,*artifact,super::RuntimeScope::SystemResident));
+            return Some(selected);
+        }
+        assert(id.identity().0 != (*package,*artifact,super::RuntimeScope::SystemResident));
+        assert(rows.remaining() =~= all.skip(n+1));
+        proof { n = n+1; }
+    }
+}
+
+/// Publish the generation under the package carried by its own runtime identity.
+pub(super) fn bind<P: Eq + Hash,K: Eq + Hash + Clone,A,S>(
+    views: &mut HashMap<P,HashMap<K,RuntimeId<K,A,S>>>, principal: P, runtime: RuntimeId<K,A,S>)
+    requires hash_map_inv(old(views)), obeys_key_model::<P>(), obeys_concrete_eq::<P>(),
+        obeys_key_model::<K>(), obeys_concrete_eq::<K>(), vstd::pervasive::obeys_clone_eq::<K>(),
+        old(views)@.contains_key(principal) ==> hash_map_inv(&old(views)@[principal]),
+    ensures hash_map_inv(final(views)), final(views)@.contains_key(principal),
+        hash_map_inv(&final(views)@[principal]),
+        final(views)@.remove(principal) == old(views)@.remove(principal),
+        final(views)@[principal]@ == (if old(views)@.contains_key(principal) { old(views)@[principal]@ }
+            else { Map::empty() }).insert(runtime.identity().0.0,runtime),
+{
+    proof { reveal(vstd::pervasive::obeys_clone_eq); }
+    let key = runtime.key().capsule_id();
+    let package = key.clone();
+    assert(vstd::pervasive::cloned(*key,package));
+    match views.entry(principal) {
+        std::collections::hash_map::Entry::Occupied(mut row) => {
+            row.get_mut().insert(package,runtime);
+        },
+        std::collections::hash_map::Entry::Vacant(row) => {
+            let mut packages = HashMap::new();
+            packages.insert(package,runtime);
+            row.insert(packages);
+        },
+    }
+}
 
 pub(super) open spec fn slot<P,K,V>(views: Map<P,HashMap<K,V>>, principal: P, capsule: K) -> Option<V> {
     if views.contains_key(principal) && views[principal]@.contains_key(capsule) {

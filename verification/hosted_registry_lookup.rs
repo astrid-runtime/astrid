@@ -151,6 +151,78 @@ fn detach_with_peer<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
     (handle.unwrap(),decision)
 }
 
+// Fresh publication and attachment to a shared runtime both derive their
+// package slot from the generation. Preserve that property across all views.
+fn publish_view(views: &mut HashMap<u64,HashMap<u64,Id>>, principal: u64, runtime: Id)
+    requires hash_map_inv(old(views)),
+        forall|p:u64| old(views)@.contains_key(p) ==> hash_map_inv(&old(views)@[p]),
+        forall|p:u64,k:u64| old(views)@.contains_key(p) && old(views)@[p]@.contains_key(k) ==>
+            (#[trigger] old(views)@[p]@[k]).identity().0.0 == k,
+    ensures final(views)@.contains_key(principal),
+        final(views)@[principal]@.contains_key(runtime.identity().0.0),
+        final(views)@[principal]@[runtime.identity().0.0] == runtime,
+        final(views)@[principal]@.remove(runtime.identity().0.0) ==
+            (if old(views)@.contains_key(principal) { old(views)@[principal]@ } else { Map::empty() }).remove(runtime.identity().0.0),
+        forall|p:u64| final(views)@.contains_key(p) ==> hash_map_inv(&final(views)@[p]),
+        final(views)@.remove(principal) == old(views)@.remove(principal),
+        forall|p:u64,k:u64| final(views)@.contains_key(p) && final(views)@[p]@.contains_key(k) ==>
+            (#[trigger] final(views)@[p]@[k]).identity().0.0 == k,
+        forall|k:u64| k != runtime.identity().0.0 && final(views)@[principal]@.contains_key(k) ==>
+            (#[trigger] final(views)@[principal]@[k]) != runtime,
+{
+    let ghost before = views@;
+    view_lookup::bind(views,principal,runtime);
+    assert(views@[principal]@.remove(runtime.identity().0.0) =~=
+        (if before.contains_key(principal) { before[principal]@ } else { Map::empty() }).remove(runtime.identity().0.0));
+    assert forall|p:u64| views@.contains_key(p) implies hash_map_inv(&views@[p]) by {
+        if p != principal {
+            assert(views@.remove(principal).contains_key(p));
+            assert(views@.remove(principal)[p] == before.remove(principal)[p]);
+        }
+    }
+    assert forall|p:u64,k:u64| views@.contains_key(p) && views@[p]@.contains_key(k) implies
+        (#[trigger] views@[p]@[k]).identity().0.0 == k by {
+        if p != principal {
+            assert(views@.remove(principal).contains_key(p));
+            assert(before.contains_key(p));
+            assert(views@.remove(principal)[p] == before.remove(principal)[p]);
+            assert(views@[p] == before[p]);
+        }
+        if p != principal || k != runtime.identity().0.0 {
+            assert(before.contains_key(p));
+            assert(before[p]@.contains_key(k));
+            assert(views@[p]@[k] == before[p]@[k]);
+            assert(before[p]@[k].identity().0.0 == k);
+        }
+    }
+}
+
+// Bind a selected shared generation to one principal, including its exact
+// installed handle. A miss cannot publish a route to a principal-owned runtime.
+fn select_and_publish_shared<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
+    instances: &HashMap<Id,Entry<C,u64>>, principal: u64, package: u64, artifact: [u8;32])
+    -> (out: Option<Arc<C>>)
+    requires hash_map_inv(old(views)), hash_map_inv(instances), obeys_key_model::<Id>(),
+        vstd::pervasive::obeys_clone_eq::<Id>(), obeys_concrete_eq::<Id>(), obeys_concrete_eq::<[u8;32]>(),
+        old(views)@.contains_key(principal) ==> hash_map_inv(&old(views)@[principal]),
+    ensures match out {
+        Some(handle) => ({
+            let selected = final(views)@[principal]@[package];
+            &&& final(views)@.contains_key(principal) && final(views)@[principal]@.contains_key(package)
+            &&& selected.identity().0 == (package,artifact,RuntimeScope::SystemResident)
+            &&& instances@.contains_key(selected) && instances@[selected].capsule == handle
+            &&& final(views)@.remove(principal) == old(views)@.remove(principal)
+        }),
+        None => final(views)@ == old(views)@ &&
+            forall|id:Id| instances@.contains_key(id) ==> id.identity().0 != (package,artifact,RuntimeScope::SystemResident),
+    },
+{
+    let selected = view_lookup::shared(instances,&package,&artifact)?;
+    let installed = crate::instance_swap::installed(instances,&selected);
+    view_lookup::bind(views,principal,selected);
+    installed
+}
+
 // A system owner's departure may affect many packages in a peer's view. The
 // report names each affected peer once and retains every different generation.
 fn remove_system_owner<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,

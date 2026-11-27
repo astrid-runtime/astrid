@@ -125,3 +125,43 @@ fn missing_scoped_instance_shadows_live_legacy_alias() -> Result<(), Box<dyn std
     );
     Ok(())
 }
+
+#[test]
+fn shared_attachment_routes_to_the_selected_package_and_artifact()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut registry = CapsuleRegistry::new();
+    let owner = pid("owner");
+    let peer = pid("peer");
+    let artifact = test_hash("identical-bytes");
+    let wanted = CapsuleId::from_static("service");
+    let sibling = CapsuleId::from_static("sibling");
+    for package in [&wanted, &sibling] {
+        registry.register_system_runtime(
+            Box::new(MockCapsule::new(package.as_str())),
+            artifact.clone(),
+            &owner,
+        )?;
+    }
+    let original = registry.get_for(&owner, &wanted).unwrap();
+    registry.register_existing(&sibling, &artifact, &peer)?;
+    let sibling_handle = registry.get_for(&peer, &sibling).unwrap();
+    assert!(
+        registry
+            .register_existing(&wanted, &test_hash("other-bytes"), &peer)
+            .is_err()
+    );
+    assert!(registry.get_for(&peer, &wanted).is_none());
+
+    registry.register_existing(&wanted, &artifact, &peer)?;
+    let source = registry.source_id_for(&owner, &wanted).unwrap();
+    assert!(Arc::ptr_eq(
+        &original,
+        &registry.find_instance_by_uuid_for(&peer, &source).unwrap()
+    ));
+    assert!(Arc::ptr_eq(
+        &sibling_handle,
+        &registry.get_for(&peer, &sibling).unwrap()
+    ));
+    assert!(!Arc::ptr_eq(&original, &sibling_handle));
+    Ok(())
+}

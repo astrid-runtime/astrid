@@ -315,10 +315,7 @@ impl CapsuleRegistry {
                 owner_alias,
             },
         );
-        self.views
-            .entry(view_principal.clone())
-            .or_default()
-            .insert(id.clone(), runtime_id.clone());
+        view_lookup::bind(&mut self.views, view_principal.clone(), runtime_id.clone());
         self.uuid_map
             .insert((source_uuid, view_principal.clone()), runtime_id.clone());
         self.source_uuid_by_runtime
@@ -416,12 +413,7 @@ impl CapsuleRegistry {
     }
 
     fn system_runtime_for_hash(&self, id: &CapsuleId, hash: &WasmHash) -> Option<RuntimeId> {
-        self.instances.keys().find_map(|runtime_id| {
-            (runtime_id.key().scope() == RuntimeScope::SystemResident
-                && runtime_id.key().capsule_id() == id
-                && runtime_id.key().artifact() == hash)
-                .then(|| runtime_id.clone())
-        })
+        view_lookup::shared(&self.instances, id, hash)
     }
 
     /// Whether this exact capsule artifact has an explicit System runtime.
@@ -451,10 +443,7 @@ impl CapsuleRegistry {
                 entry.capsule.id()
             )));
         }
-        self.views
-            .entry(principal.clone())
-            .or_default()
-            .insert(id.clone(), runtime_id.clone());
+        view_lookup::bind(&mut self.views, principal.clone(), runtime_id.clone());
         if let Some(source_uuid) = self.source_uuid_by_runtime.get(runtime_id).copied() {
             self.uuid_map
                 .insert((source_uuid, principal.clone()), runtime_id.clone());
