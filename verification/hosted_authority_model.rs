@@ -444,13 +444,34 @@ fn fenced_token_admission<K: Eq + std::hash::Hash + Clone>(
         vstd::std_specs::hash::obeys_key_model::<K>(), vstd::laws_eq::obeys_concrete_eq::<K>(), vstd::pervasive::obeys_clone_eq::<K>(), *id != *peer,
 {
     let prior = crate::token_authority::status(authority, peer);
+    let previous_target = crate::token_authority::status(authority, id);
     let (namespace, target) = crate::token_authority::fence_revocation(authority, id);
     assert(namespace@ == "caps:revoked"@ && *target == *id);
     let fenced = crate::token_authority::status(authority, target);
+    assert(fenced.used() == previous_target.used());
     let decision = fenced.admit(single_use);
     assert(decision is Revoked);
     let unchanged = crate::token_authority::status(authority, peer);
     assert(store_state(unchanged) == store_state(prior));
+}
+
+/// Bind the recovered UUID bytes to the token that the live map fenced.
+/// Native code projects TokenId through Uuid::as_bytes.
+fn marker_round_trip<K: Eq + std::hash::Hash + Clone, F: Fn(&K) -> [u8; 16]>(
+    authority: &mut std::collections::HashMap<K, TokenStatus>, id: &K, bytes: F,
+)
+    requires vstd::std_specs::hash::hash_map_inv(old(authority)),
+        vstd::std_specs::hash::obeys_key_model::<K>(), vstd::laws_eq::obeys_concrete_eq::<K>(),
+        vstd::pervasive::obeys_clone_eq::<K>(), bytes.requires((id,)),
+{
+    let (namespace, target) = crate::token_authority::fence_revocation(authority, id);
+    let original = bytes(target);
+    let key = crate::marker_key::encode(&original);
+    let recovered = crate::marker_key::decode(&key);
+    assert(namespace@ == "caps:revoked"@ && recovered == Some(original));
+    assert(bytes.ensures((id,), original));
+    let fenced = crate::token_authority::status(authority, id);
+    assert(fenced.revoked());
 }
 
 /// The store's single-use consumption is the model's consume transition, and

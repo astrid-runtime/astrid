@@ -164,6 +164,9 @@ mod principal_invocation_state;
 #[path = "../crates/astrid-core/src/capability_grammar/matcher.rs"]
 mod matcher;
 
+#[path = "../crates/astrid-capabilities/src/store/marker_key.rs"]
+mod marker_key;
+
 #[path = "../crates/astrid-capabilities/src/store/authority.rs"]
 mod token_authority;
 

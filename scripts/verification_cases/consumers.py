@@ -16,12 +16,21 @@ def consumer_defects():
     for label, clause in [
         ("marker namespace", 'address.0@ == "caps:revoked"@'),
         ("marker identity", "*address.1 == *id"),
+        ("prior consumption", "final(authority)@[*id].used() == (old(authority)@.contains_key(*id) && old(authority)@[*id].used())"),
         ("live refusal", "final(authority)@[*id].revoked()"),
         ("peer isolation", "final(authority)@ == old(authority)@.insert(*id, final(authority)@[*id])"),
     ]:
         yield (
             f"token revocation fence loses {label}", AUTHORITY,
             lambda s, clause=clause: replace_once(s, clause, "true"), MODEL,
+        )
+    for label, clause in [
+        ("writer identity", "ensures spells(id@, text@),"),
+        ("reader identity", "ensures forall|id: [u8; 16]| #[trigger] spells(id@, text@) ==> out == Some(id),"),
+    ]:
+        yield (
+            f"token marker codec loses {label}", Path("crates/astrid-capabilities/src/store/marker_key.rs"),
+            lambda s, clause=clause: replace_once(s, clause, "ensures true,"), MODEL,
         )
     yield from persistent_process.defects()
     yield from workspace_commit.defects()

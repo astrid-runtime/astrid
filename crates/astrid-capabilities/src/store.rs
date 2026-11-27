@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 mod authority;
+mod marker_key;
 use authority::{Admission, Marker, TokenStatus};
 
 use crate::error::{CapabilityError, CapabilityResult};
@@ -44,6 +45,10 @@ fn token_key(principal: &PrincipalId, token_id: &TokenId) -> String {
 /// [`KvStore::list_keys_with_prefix`].
 fn token_key_prefix(principal: &PrincipalId) -> String {
     format!("{principal}/")
+}
+
+fn marker_text(encoded: &[u8; 36]) -> CapabilityResult<&str> {
+    std::str::from_utf8(encoded).map_err(|error| CapabilityError::StorageError(error.to_string()))
 }
 
 /// Tombstone value for presence-only KV entries (revoked/used markers).
@@ -118,7 +123,9 @@ impl CapabilityStore {
                 .await
                 .map_err(|error| CapabilityError::StorageError(error.to_string()))?
             {
-                let id = uuid::Uuid::parse_str(&key)
+                let id = marker_key::decode(key.as_bytes())
+                    .map(uuid::Uuid::from_bytes)
+                    .map_or_else(|| uuid::Uuid::parse_str(&key), Ok)
                     .map(TokenId::from_uuid)
                     .map_err(|error| {
                         CapabilityError::StorageError(format!(
@@ -520,9 +527,10 @@ impl CapabilityStore {
             let mut authority = self.authority.write().await;
             let (namespace, fenced_id) = authority::fence_revocation(&mut authority, token_id);
             if let Some(store) = &self.persistent_store {
-                let key = fenced_id.0.to_string();
+                let encoded = marker_key::encode(fenced_id.0.as_bytes());
+                let key = marker_text(&encoded)?;
                 store
-                    .set(namespace, &key, PRESENCE_MARKER.to_vec())
+                    .set(namespace, key, PRESENCE_MARKER.to_vec())
                     .await
                     .map_err(|error| CapabilityError::StorageError(error.to_string()))?;
             }
@@ -683,9 +691,11 @@ impl CapabilityStore {
         // A canceled or ambiguous write can have committed. Requiring
         // durable absence atomically prevents a retry from winning twice.
         let won = if let Some(store) = &self.persistent_store {
-            let (namespace, key) = Marker::Consumed.address(token_id.0.to_string());
+            let (namespace, id) = Marker::Consumed.address(token_id);
+            let encoded = marker_key::encode(id.0.as_bytes());
+            let key = marker_text(&encoded)?;
             store
-                .compare_and_swap(namespace, &key, None, PRESENCE_MARKER.to_vec())
+                .compare_and_swap(namespace, key, None, PRESENCE_MARKER.to_vec())
                 .await
                 .map_err(|error| CapabilityError::StorageError(error.to_string()))?
         } else {

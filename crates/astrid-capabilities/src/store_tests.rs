@@ -836,3 +836,36 @@ async fn unreadable_marker_identity_prevents_authority_startup() {
         Err(CapabilityError::StorageError(_)),
     ));
 }
+
+#[tokio::test]
+async fn token_markers_keep_uuid_wire_format_and_accept_legacy_spellings() {
+    let uuid = uuid::Uuid::from_bytes([
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
+        0x10,
+    ]);
+    let id = TokenId::from_uuid(uuid);
+    let canonical = "01234567-89ab-cdef-fedc-ba9876543210";
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let store = CapabilityStore::with_kv_store(Arc::clone(&kv))
+        .await
+        .unwrap();
+    store.mark_used(&id).await.unwrap();
+    store.revoke(&id).await.unwrap();
+    for namespace in [NS_REVOKED, NS_USED] {
+        assert_eq!(kv.list_keys(namespace).await.unwrap(), [canonical]);
+    }
+    for spelling in [
+        uuid.simple().to_string(),
+        canonical.to_uppercase(),
+        uuid.urn().to_string(),
+        uuid.braced().to_string(),
+    ] {
+        let legacy: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+        legacy
+            .set(NS_USED, &spelling, PRESENCE_MARKER.to_vec())
+            .await
+            .unwrap();
+        let recovered = CapabilityStore::with_kv_store(legacy).await.unwrap();
+        assert!(recovered.is_used(&id).await);
+    }
+}

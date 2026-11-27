@@ -206,9 +206,7 @@ Startup replays each token's markers through
 the verified `TokenStatus::recover_markers`. Under the live authority write lock,
 `revoke` calls the checked `fence_revocation` map update. The returned marker
 namespace and token ID identify the fenced entry. Subsequent lookups of that
-entry deny both token lifetimes and every other entry is preserved. UUID text
-encoding, asynchronous KV writes, and startup enumeration remain trusted
-at this boundary. The surrounding `revoke` adapter, `consume`,
+entry deny both token lifetimes and every other entry is preserved. Verus checks that the canonical lowercase hyphenated key written for all 16 UUID bytes decodes to exactly those bytes on startup. Native UUID byte access, UTF-8 conversion, the compatibility parser for legacy spellings, asynchronous KV writes and startup enumeration remain trusted at this boundary. The surrounding `revoke` adapter, `consume`,
 `is_available` and `use_checked` adapters, and the limiter's window and
 reservation counters, remain the unverified callers of these transitions.
 
