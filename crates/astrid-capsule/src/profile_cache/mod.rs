@@ -26,7 +26,20 @@ use load::{ProfileLoad, ProfileLoadToken};
 
 use astrid_core::dirs::AstridHome;
 use astrid_core::principal::PrincipalId;
-use astrid_core::profile::{CommandAlwaysGrant, PrincipalProfile, ProfileError, ProfileResult};
+use astrid_core::profile::{
+    AuthMethod, CommandAlwaysGrant, DeviceKeyId, PrincipalProfile, ProfileError, ProfileResult,
+};
+
+/// Outcome of removing a key from an existing principal profile.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeviceRemoval {
+    /// The profile file did not exist when the update began.
+    PrincipalMissing,
+    /// The profile exists and has no matching key.
+    DeviceMissing,
+    /// The updated file is published and the cached principal invalidated.
+    Removed,
+}
 
 /// Lazy, process-lifetime cache of resolved [`PrincipalProfile`] values.
 ///
@@ -166,6 +179,45 @@ impl PrincipalProfileCache {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.invalidate(principal);
+    }
+
+    /// Remove a paired device while serializing the full profile update with consent writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a profile error if the existing file cannot be read, validated or saved.
+    pub fn remove_paired_device(
+        &self,
+        principal: &PrincipalId,
+        key: &DeviceKeyId,
+    ) -> ProfileResult<DeviceRemoval> {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut profile = match PrincipalProfile::load_required(&self.astrid_home, principal) {
+            Err(ProfileError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(DeviceRemoval::PrincipalMissing);
+            },
+            result => result?,
+        };
+        let before = profile.auth.public_keys.len();
+        profile
+            .auth
+            .public_keys
+            .retain(|device| device.key_id != key.as_str());
+        if before == profile.auth.public_keys.len() {
+            return Ok(DeviceRemoval::DeviceMissing);
+        }
+        if profile.auth.public_keys.is_empty() {
+            profile
+                .auth
+                .methods
+                .retain(|method| *method != AuthMethod::Keypair);
+        }
+        profile.save(&self.astrid_home, principal)?;
+        state.invalidate(principal);
+        Ok(DeviceRemoval::Removed)
     }
 
     /// Persist an operator-consented local-egress endpoint to `principal`'s

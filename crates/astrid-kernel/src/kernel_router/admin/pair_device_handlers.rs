@@ -16,6 +16,7 @@
 //! hashes. Audit redaction lives in `admin::mod::sanitize_admin_audit_params`
 //! so neither the raw token nor the ed25519 key ever reaches the audit log.
 
+use astrid_capsule::profile_cache::DeviceRemoval;
 use std::sync::Arc;
 
 use astrid_capabilities::{CapabilityCheck, device_scope_within};
@@ -558,42 +559,23 @@ pub(crate) async fn pair_device_revoke(
         Err(e) => return err_bad_input(e),
     };
     let _guard = kernel.admin_write_lock.lock().await;
-    let profile_path = kernel.astrid_home.profile_path(principal);
-    if !profile_path.exists() {
-        return err_bad_input(format!(
-            "principal {principal} does not exist (no profile.toml)"
-        ));
+    match kernel
+        .profile_cache
+        .remove_paired_device(principal, &key_id)
+    {
+        Ok(DeviceRemoval::Removed) => {},
+        Ok(DeviceRemoval::DeviceMissing) => {
+            return err_bad_input(format!(
+                "no paired device with key_id {key_id} on principal {principal}"
+            ));
+        },
+        Ok(DeviceRemoval::PrincipalMissing) => {
+            return err_bad_input(format!(
+                "principal {principal} does not exist (no profile.toml)"
+            ));
+        },
+        Err(error) => return err_internal(format!("profile update failed: {error}")),
     }
-    let mut profile = match PrincipalProfile::load_from_path(&profile_path) {
-        Ok(p) => p,
-        Err(e) => return err_internal(format!("profile load failed: {e}")),
-    };
-
-    let before = profile.auth.public_keys.len();
-    profile
-        .auth
-        .public_keys
-        .retain(|k| k.key_id != key_id.as_str());
-    if profile.auth.public_keys.len() == before {
-        return err_bad_input(format!(
-            "no paired device with key_id {key_id} on principal {principal}"
-        ));
-    }
-
-    // If that was the last keypair, drop the Keypair auth method so the
-    // profile's declared auth surface matches its registered keys (mirrors the
-    // add-side logic in redeem).
-    if profile.auth.public_keys.is_empty() {
-        profile.auth.methods.retain(|m| *m != AuthMethod::Keypair);
-    }
-
-    if let Err(e) = profile.validate() {
-        return err_internal(format!("profile rejected after device removal: {e}"));
-    }
-    if let Err(e) = profile.save_to_path(&profile_path) {
-        return err_internal(format!("profile save failed: {e}"));
-    }
-    kernel.profile_cache.invalidate(principal);
 
     info!(
         principal = %principal,
