@@ -26,6 +26,8 @@ use crate::types::{ServerInfo, ToolDefinition};
 
 use tokio::sync::mpsc;
 
+mod peer_selection;
+
 /// Type alias for a running MCP client service.
 type McpService = RunningService<RoleClient, AstridClientHandler>;
 
@@ -647,14 +649,13 @@ impl ServerManager {
     /// Returns an error if the server is not running or not connected.
     pub async fn get_peer(&self, name: &str) -> McpResult<Peer<RoleClient>> {
         let running = self.running.read().await;
-        let server = running
-            .get(name)
-            .ok_or_else(|| McpError::ServerNotRunning {
-                name: name.to_string(),
-            })?;
-
-        server.peer().ok_or_else(|| {
-            McpError::ConnectionFailed(format!("Server {name} is registered but not connected"))
+        peer_selection::select(&running, name, RunningServer::peer).map_err(|error| match error {
+            peer_selection::LookupError::Missing => McpError::ServerNotRunning {
+                name: name.to_owned(),
+            },
+            peer_selection::LookupError::Disconnected => {
+                McpError::ConnectionFailed(format!("Server {name} is registered but not connected"))
+            },
         })
     }
 

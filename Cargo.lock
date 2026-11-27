@@ -863,6 +863,7 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "vstd",
  "which",
 ]
 

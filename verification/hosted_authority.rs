@@ -370,3 +370,7 @@ use principal_binding::recovery_aliases;
 #[path = "../crates/astrid-storage/src/ownership/recovery.rs"]
 mod recovery;
 mod hosted_retirement_recovery;
+
+#[path = "../crates/astrid-mcp/src/server/peer_selection.rs"]
+mod peer_selection;
+mod hosted_mcp_peer;

@@ -28,6 +28,12 @@ impl rmcp::ServerHandler for ModernMrtrServer {
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if request.name == "ping" {
+            return Ok(rmcp::model::CallToolResult::success(vec![
+                rmcp::model::ContentBlock::text("pong"),
+            ])
+            .into());
+        }
         if request.input_responses.is_none() {
             let params = rmcp::model::ElicitRequestParams::FormElicitationParams {
                 meta: None,
@@ -168,8 +174,13 @@ async fn client_lifecycle_falls_back_to_legacy_initialize() {
     );
 }
 
-#[tokio::test]
-async fn modern_tool_call_drives_mrtr_through_astrid_elicitation() {
+async fn test_peer(
+    name: &str,
+) -> (
+    McpService,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
     let server = ModernMrtrServer::default();
     let calls = Arc::clone(&server.calls);
     let (server_transport, client_transport) = tokio::io::duplex(8192);
@@ -183,10 +194,55 @@ async fn modern_tool_call_drives_mrtr_through_astrid_elicitation() {
 
     let mut capabilities = CapabilitiesHandler::new();
     capabilities.elicitation = Some(Box::new(TestElicitationHandler));
-    let client = AstridClientHandler::new("test-server", Arc::new(capabilities))
+    let client = AstridClientHandler::new(name, Arc::new(capabilities))
         .serve_with_lifecycle(client_transport, mcp_client_lifecycle())
         .await
         .expect("Astrid client should negotiate modern MCP");
+    (client, calls, server_task)
+}
+
+async fn register_test_peer(
+    manager: &ServerManager,
+    name: &str,
+) -> (
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (client, calls, server_task) = test_peer(name).await;
+    // Complete discovery with the same tools/list exchange used at registration.
+    client.list_all_tools().await.unwrap();
+    let mut entry = RunningServer::new(ServerConfig::stdio(name, "fixture"));
+    entry.service = Some(client);
+    manager.running.write().await.insert(name.to_owned(), entry);
+    (calls, server_task)
+}
+
+#[tokio::test]
+async fn tool_call_reaches_only_the_selected_generation_peer() {
+    let manager = ServerManager::new(ServersConfig::default());
+    let (old_calls, old_task) = register_test_peer(&manager, "generation-1").await;
+    let (calls, task) = register_test_peer(&manager, "generation-2").await;
+    let client = crate::McpClient::new(manager);
+    let result = client
+        .call_tool("generation-2", "ping", serde_json::Value::Null)
+        .await
+        .expect("selected peer should answer");
+    assert_eq!(result.text_content(), "pong");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(old_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    client.server_manager().stop_all().await.unwrap();
+    for server in [old_task, task] {
+        tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .expect("server should stop after its client disconnects")
+            .expect("server task should not panic");
+    }
+}
+
+#[tokio::test]
+async fn modern_tool_call_drives_mrtr_through_astrid_elicitation() {
+    let (client, calls, server_task) = test_peer("test-server").await;
     let result = client
         .call_tool(rmcp::model::CallToolRequestParams::new("greet"))
         .await

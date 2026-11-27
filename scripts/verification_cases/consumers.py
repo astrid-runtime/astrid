@@ -15,6 +15,18 @@ def consumer_defects():
     yield from workspace_commit.defects()
     yield from file_descriptor.defects()
     yield from retirement.defects()
+    peer = Path("crates/astrid-mcp/src/server/peer_selection.rs")
+    for name, original, changed in [
+        ("loses the requested registration", "k@ == requested@ && peer.ensures((&servers@[k],),Some(handle))", "peer.ensures((&servers@[k],),Some(handle))"),
+        ("can substitute the connected handle", "peer.ensures((&servers@[k],),Some(handle))", "true"),
+        ("can misreport a disconnected server", "peer.ensures((&servers@[k],),None)", "true"),
+        ("can misreport a missing server", "servers@.contains_key(k) ==> k@ != requested@", "servers@.contains_key(k) ==> true"),
+    ]:
+        yield (
+            f"MCP peer selection {name}", peer,
+            lambda s, a=original, b=changed: replace_once(s, a, b),
+            Path("verification/hosted_mcp_peer.rs"),
+        )
     splice = Path("crates/astrid-capsule/src/engine/wasm/host/io/splice.rs")
     splice_trace = Path("verification/hosted_io_splice.rs")
     for name, original, changed in [

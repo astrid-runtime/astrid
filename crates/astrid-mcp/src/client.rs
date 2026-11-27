@@ -254,13 +254,6 @@ impl McpClient {
     ///
     /// Returns an error if the server is not running or the tool call fails.
     pub async fn call_tool(&self, server: &str, tool: &str, args: Value) -> McpResult<ToolResult> {
-        // Verify server is running
-        if !self.servers.is_running(server).await {
-            return Err(McpError::ServerNotRunning {
-                name: server.to_string(),
-            });
-        }
-
         debug!(server = server, tool = tool, "Calling MCP tool");
 
         // Get the peer and make the call
