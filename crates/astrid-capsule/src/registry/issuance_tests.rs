@@ -3,7 +3,8 @@ use super::*;
 use crate::registry::CapsuleRegistry;
 
 #[test]
-fn registry_issues_the_exact_key_and_last_available_generation() {
+fn registry_issues_the_exact_key_and_last_available_generation()
+-> Result<(), Box<dyn std::error::Error>> {
     let mut registry = CapsuleRegistry::new();
     registry.next_generation = u64::MAX - 2;
     for (generation, name, hash, scope) in [
@@ -20,21 +21,20 @@ fn registry_issues_the_exact_key_and_last_available_generation() {
             RuntimeScope::SystemResident,
         ),
     ] {
-        let id = CapsuleId::new(name).unwrap();
+        let id = CapsuleId::new(name)?;
         let artifact = WasmHash::from_raw(hash);
-        let issued = registry
-            .reserve_runtime_id(id.clone(), artifact.clone(), scope)
-            .unwrap();
+        let issued = registry.reserve_runtime_id(id.clone(), artifact.clone(), scope)?;
         assert_eq!(issued.key().capsule_id(), &id);
         assert_eq!(issued.key().artifact(), &artifact);
         assert_eq!(issued.key().scope(), scope);
         assert_eq!(issued.generation(), generation);
     }
     let refused = registry.reserve_runtime_id(
-        CapsuleId::new("third").unwrap(),
+        CapsuleId::new("third")?,
         WasmHash::from_raw("artifact-c"),
         RuntimeScope::SystemResident,
     );
     assert!(refused.is_err());
     assert_eq!(registry.next_generation, u64::MAX);
+    Ok(())
 }

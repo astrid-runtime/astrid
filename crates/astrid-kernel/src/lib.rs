@@ -1818,10 +1818,7 @@ impl Kernel {
                     "cannot load capsule '{id}' for unadmitted principal '{principal}': {error}"
                 )
             })?;
-        let scope = principal_uid.map_or(
-            astrid_capsule::registry::RuntimeScope::SystemResident,
-            astrid_capsule::registry::RuntimeScope::Principal,
-        );
+        let scope = astrid_capsule::registry::RuntimeScope::from_owner(principal_uid);
         let runtime_id =
             self.capsules
                 .write()
@@ -2022,10 +2019,7 @@ impl Kernel {
             bound.as_ref().map(|b| b.uid),
             |owner, expected| self.principal_directory.bound_uid(owner, expected),
         )?;
-        let actual_scope = principal_uid.map_or(
-            astrid_capsule::registry::RuntimeScope::SystemResident,
-            astrid_capsule::registry::RuntimeScope::Principal,
-        );
+        let actual_scope = astrid_capsule::registry::RuntimeScope::from_owner(principal_uid);
         if actual_scope != expected_scope {
             anyhow::bail!(
                 "capsule '{id}' cannot change runtime scope during live replacement: \

@@ -23,7 +23,7 @@ impl CapsuleRegistry {
         uid: PrincipalUid,
     ) -> CapsuleResult<ReplacedRuntime> {
         let id = replacement.id().clone();
-        if expected.key.scope() != RuntimeScope::Principal(uid)
+        if expected.key().scope() != RuntimeScope::Principal(uid)
             || self.runtime_id_for(principal, &id).as_ref() != Some(expected)
         {
             return Err(CapsuleError::ExecutionFailed(format!(
@@ -50,8 +50,8 @@ impl CapsuleRegistry {
         uid: PrincipalUid,
     ) -> CapsuleResult<ReplacedRuntime> {
         let id = replacement.id().clone();
-        if runtime_id.key.scope() != RuntimeScope::Principal(uid)
-            || runtime_id.key.capsule_id() != &id
+        if runtime_id.key().scope() != RuntimeScope::Principal(uid)
+            || runtime_id.key().capsule_id() != &id
         {
             return Err(CapsuleError::ExecutionFailed(format!(
                 "reserved runtime identity does not match principal replacement '{id}'"
@@ -62,7 +62,7 @@ impl CapsuleRegistry {
                 "uplink capsule '{id}' requires explicit system runtime scope"
             )));
         }
-        if expected.key.scope() != RuntimeScope::Principal(uid)
+        if expected.key().scope() != RuntimeScope::Principal(uid)
             || self.runtime_id_for(principal, &id).as_ref() != Some(expected)
         {
             return Err(CapsuleError::ExecutionFailed(format!(
@@ -89,17 +89,17 @@ impl CapsuleRegistry {
         artifact: WasmHash,
     ) -> CapsuleResult<ReplacedRuntime> {
         let id = replacement.id().clone();
-        if expected.key.scope() != RuntimeScope::SystemResident
+        if expected.key().scope() != RuntimeScope::SystemResident
             || !self.instances.contains_key(expected)
         {
             return Err(CapsuleError::ExecutionFailed(format!(
                 "system runtime generation changed before replacing '{id}'"
             )));
         }
-        if expected.key.capsule_id() != &id {
+        if expected.key().capsule_id() != &id {
             return Err(CapsuleError::ExecutionFailed(format!(
                 "replacement capsule id '{id}' does not match runtime '{}'",
-                expected.key.capsule_id()
+                expected.key().capsule_id()
             )));
         }
 
@@ -152,24 +152,24 @@ impl CapsuleRegistry {
         runtime_id: &RuntimeId,
     ) -> CapsuleResult<()> {
         let id = replacement.id().clone();
-        if runtime_id.key.scope() != RuntimeScope::SystemResident
-            || runtime_id.key.capsule_id() != &id
+        if runtime_id.key().scope() != RuntimeScope::SystemResident
+            || runtime_id.key().capsule_id() != &id
         {
             return Err(CapsuleError::ExecutionFailed(format!(
                 "reserved runtime identity does not match system replacement '{id}'"
             )));
         }
-        if expected.key.scope() != RuntimeScope::SystemResident
+        if expected.key().scope() != RuntimeScope::SystemResident
             || !self.instances.contains_key(expected)
         {
             return Err(CapsuleError::ExecutionFailed(format!(
                 "system runtime generation changed before replacing '{id}'"
             )));
         }
-        if expected.key.capsule_id() != &id {
+        if expected.key().capsule_id() != &id {
             return Err(CapsuleError::ExecutionFailed(format!(
                 "replacement capsule id '{id}' does not match runtime '{}'",
-                expected.key.capsule_id()
+                expected.key().capsule_id()
             )));
         }
         let descriptors = system_uplink_descriptors(replacement)?;
@@ -211,7 +211,7 @@ impl CapsuleRegistry {
         replacement: Box<dyn Capsule>,
         owner_alias: Option<PrincipalId>,
     ) -> CapsuleResult<Arc<dyn Capsule>> {
-        let previous_artifact = expected.key.artifact().clone();
+        let previous_artifact = expected.key().artifact().clone();
         let previous = self
             .instances
             .remove(expected)
@@ -243,7 +243,7 @@ impl CapsuleRegistry {
             self.uuid_id_map.remove(&previous_source);
         }
         let source_uuid =
-            capsule_source_uuid(runtime_id.key.capsule_id(), runtime_id.key.artifact());
+            capsule_source_uuid(runtime_id.key().capsule_id(), runtime_id.key().artifact());
         for (principal, view) in &self.views {
             if view
                 .values()
@@ -256,7 +256,7 @@ impl CapsuleRegistry {
         self.source_uuid_by_runtime
             .insert(runtime_id.clone(), source_uuid);
         self.uuid_id_map
-            .insert(source_uuid, runtime_id.key.capsule_id().clone());
+            .insert(source_uuid, runtime_id.key().capsule_id().clone());
         self.remove_legacy_uuid_mappings_if_unused(&previous_artifact);
         Ok(previous)
     }

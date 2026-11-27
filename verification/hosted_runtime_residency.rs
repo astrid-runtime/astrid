@@ -1,6 +1,7 @@
 //! An ownerless runtime requires operator admission. A principal runtime carries
 //! the UID obtained for the selected caller and expected binding, or refuses.
 use crate::runtime_residency::classify;
+use crate::runtime_scope::RuntimeScope;
 use vstd::prelude::*;
 
 verus! {
@@ -37,9 +38,14 @@ fn issue_runtime(next: &mut u64, id: u64, artifact: [u8;32], allowed: bool, prov
     }),
 {
     let owner = runtime_owner(allowed,provides,uplink,has_servers,principal,expected,observed).ok()?;
-    let issued = crate::runtime_generation::issue(next,id,artifact,owner)?;
+    let scope = RuntimeScope::from_owner(owner);
+    let issued = crate::runtime_generation::issue(next,id,artifact,scope)?;
     let key = issued.key();
-    Some((*key.capsule_id(), *key.artifact(), key.scope(), issued.generation()))
+    let issued_owner = match key.scope() {
+        RuntimeScope::Principal(uid) => Some(uid),
+        RuntimeScope::SystemResident => None,
+    };
+    Some((*key.capsule_id(), *key.artifact(), issued_owner, issued.generation()))
 }
 
 }

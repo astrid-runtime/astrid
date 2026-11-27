@@ -255,14 +255,14 @@ impl CapsuleRegistry {
         owner_alias: Option<PrincipalId>,
     ) -> CapsuleResult<RuntimeId> {
         let id = capsule.id().clone();
-        if runtime_id.key.capsule_id() != &id {
+        if runtime_id.key().capsule_id() != &id {
             return Err(CapsuleError::ExecutionFailed(format!(
                 "reserved runtime belongs to '{}', not '{id}'",
-                runtime_id.key.capsule_id()
+                runtime_id.key().capsule_id()
             )));
         }
-        let artifact = runtime_id.key.artifact().clone();
-        let scope = runtime_id.key.scope();
+        let artifact = runtime_id.key().artifact().clone();
+        let scope = runtime_id.key().scope();
         if matches!(scope, RuntimeScope::Principal(_)) && !capsule.manifest().uplinks.is_empty() {
             return Err(CapsuleError::UnsupportedEntryPoint(format!(
                 "uplink capsule '{id}' requires explicit system runtime scope"
@@ -278,7 +278,7 @@ impl CapsuleRegistry {
             )));
         }
 
-        let generation = runtime_id.generation;
+        let generation = runtime_id.generation();
         let descriptors = if scope == RuntimeScope::SystemResident {
             system_uplink_descriptors(capsule.as_ref())?
         } else {
@@ -344,13 +344,13 @@ impl CapsuleRegistry {
         view_principal: &PrincipalId,
     ) -> CapsuleResult<()> {
         let id = capsule.id();
-        if runtime_id.key.capsule_id() != id {
+        if runtime_id.key().capsule_id() != id {
             return Err(CapsuleError::ExecutionFailed(format!(
                 "reserved runtime belongs to '{}', not '{id}'",
-                runtime_id.key.capsule_id()
+                runtime_id.key().capsule_id()
             )));
         }
-        if matches!(runtime_id.key.scope(), RuntimeScope::Principal(_))
+        if matches!(runtime_id.key().scope(), RuntimeScope::Principal(_))
             && !capsule.manifest().uplinks.is_empty()
         {
             return Err(CapsuleError::UnsupportedEntryPoint(format!(
@@ -409,9 +409,9 @@ impl CapsuleRegistry {
 
     fn system_runtime_for_hash(&self, id: &CapsuleId, hash: &WasmHash) -> Option<RuntimeId> {
         self.instances.keys().find_map(|runtime_id| {
-            (runtime_id.key.scope() == RuntimeScope::SystemResident
-                && runtime_id.key.capsule_id() == id
-                && runtime_id.key.artifact() == hash)
+            (runtime_id.key().scope() == RuntimeScope::SystemResident
+                && runtime_id.key().capsule_id() == id
+                && runtime_id.key().artifact() == hash)
                 .then(|| runtime_id.clone())
         })
     }
@@ -432,7 +432,7 @@ impl CapsuleRegistry {
             .instances
             .get(runtime_id)
             .ok_or_else(|| CapsuleError::NotFound(format!("runtime {runtime_id:?}")))?;
-        if runtime_id.key.scope() != RuntimeScope::SystemResident {
+        if runtime_id.key().scope() != RuntimeScope::SystemResident {
             return Err(CapsuleError::UnsupportedEntryPoint(
                 "only explicit system runtimes may have multiple principal views".into(),
             ));
@@ -451,7 +451,7 @@ impl CapsuleRegistry {
             self.uuid_map
                 .insert((source_uuid, principal.clone()), runtime_id.clone());
         }
-        info!(capsule_id = %id, principal = %principal, generation = runtime_id.generation, "Registered explicit system capsule view");
+        info!(capsule_id = %id, principal = %principal, generation = runtime_id.generation(), "Registered explicit system capsule view");
         Ok(())
     }
 
@@ -502,7 +502,7 @@ impl CapsuleRegistry {
             == Some(principal);
         // Principal runtimes have exactly one view. Explicit System runtimes
         // are removed with their operator owner or their final dependent view.
-        let torn_down = runtime_id.key.scope() != RuntimeScope::SystemResident
+        let torn_down = runtime_id.key().scope() != RuntimeScope::SystemResident
             || owner_departed
             || !self
                 .views
@@ -510,7 +510,7 @@ impl CapsuleRegistry {
                 .any(|view| view.values().any(|candidate| candidate == &runtime_id));
         let mut removed_principals = vec![principal.clone()];
         if torn_down {
-            if owner_departed && runtime_id.key.scope() == RuntimeScope::SystemResident {
+            if owner_departed && runtime_id.key().scope() == RuntimeScope::SystemResident {
                 for (affected, view) in &mut self.views {
                     let previous_len = view.len();
                     view.retain(|_, candidate| candidate != &runtime_id);
@@ -534,13 +534,13 @@ impl CapsuleRegistry {
             {
                 self.uuid_id_map.remove(&source_uuid);
             }
-            self.remove_legacy_uuid_mappings_if_unused(runtime_id.key.artifact());
-            info!(capsule_id = %id, principal = %principal, generation = runtime_id.generation, "Unregistered capsule runtime");
+            self.remove_legacy_uuid_mappings_if_unused(runtime_id.key().artifact());
+            info!(capsule_id = %id, principal = %principal, generation = runtime_id.generation(), "Unregistered capsule runtime");
         } else {
             if let Some(source_uuid) = self.source_uuid_by_runtime.get(&runtime_id) {
                 self.uuid_map.remove(&(*source_uuid, principal.clone()));
             }
-            info!(capsule_id = %id, principal = %principal, generation = runtime_id.generation, "Unregistered system capsule view (runtime retained)");
+            info!(capsule_id = %id, principal = %principal, generation = runtime_id.generation(), "Unregistered system capsule view (runtime retained)");
         }
 
         Ok(Unregistered {
@@ -592,7 +592,7 @@ impl CapsuleRegistry {
         } else {
             let artifact = self.legacy_uuid_map.get(uuid)?;
             let mut matches = self.views.get(principal)?.values().filter(|runtime_id| {
-                runtime_id.key.artifact() == artifact && self.instances.contains_key(*runtime_id)
+                runtime_id.key().artifact() == artifact && self.instances.contains_key(*runtime_id)
             });
             let first = matches.next()?;
             if matches.next().is_some() {
@@ -615,7 +615,7 @@ impl CapsuleRegistry {
                 Box::new(
                     self.instances
                         .keys()
-                        .filter(move |runtime_id| runtime_id.key.artifact() == artifact),
+                        .filter(move |runtime_id| runtime_id.key().artifact() == artifact),
                 )
             } else {
                 Box::new(
@@ -645,7 +645,7 @@ impl CapsuleRegistry {
     pub fn contains_hash(&self, hash: &WasmHash) -> bool {
         self.instances
             .keys()
-            .any(|runtime_id| runtime_id.key.artifact() == hash)
+            .any(|runtime_id| runtime_id.key().artifact() == hash)
     }
 
     fn remove_legacy_uuid_mappings_if_unused(&mut self, artifact: &WasmHash) {
@@ -734,7 +734,7 @@ impl CapsuleRegistry {
     pub fn cloned_system_runtimes(&self) -> Vec<(RuntimeId, Arc<dyn Capsule>)> {
         self.instances
             .iter()
-            .filter(|(runtime_id, _)| runtime_id.key.scope() == RuntimeScope::SystemResident)
+            .filter(|(runtime_id, _)| runtime_id.key().scope() == RuntimeScope::SystemResident)
             .map(|(runtime_id, entry)| (runtime_id.clone(), Arc::clone(&entry.capsule)))
             .collect()
     }
@@ -788,7 +788,7 @@ impl CapsuleRegistry {
         self.views
             .get(principal)?
             .get(id)
-            .map(|runtime_id| runtime_id.key.artifact().clone())
+            .map(|runtime_id| runtime_id.key().artifact().clone())
     }
 
     /// Kernel-stamped IPC source ID for the runtime visible as `id` to
@@ -877,7 +877,7 @@ impl CapsuleRegistry {
                 if let Some(entry) = self.instances.get(runtime_id) {
                     out.push((
                         principal.clone(),
-                        runtime_id.key.artifact().clone(),
+                        runtime_id.key().artifact().clone(),
                         Arc::clone(&entry.capsule),
                     ));
                 }
@@ -900,7 +900,7 @@ impl CapsuleRegistry {
             .iter()
             .filter(|(_, view)| {
                 view.get(id)
-                    .is_some_and(|runtime_id| runtime_id.key.artifact() == hash)
+                    .is_some_and(|runtime_id| runtime_id.key().artifact() == hash)
             })
             .map(|(principal, _)| principal.clone())
             .collect()
@@ -950,7 +950,7 @@ impl CapsuleRegistry {
             .views
             .values()
             .flat_map(HashMap::values)
-            .filter(|runtime_id| runtime_id.key.artifact() == hash)
+            .filter(|runtime_id| runtime_id.key().artifact() == hash)
             .count();
         (count > 0).then_some(count)
     }

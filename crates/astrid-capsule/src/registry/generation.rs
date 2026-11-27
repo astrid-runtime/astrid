@@ -53,8 +53,8 @@ impl<I,A,S: Copy> RuntimeKey<I,A,S> {
 /// One incarnation of a logical runtime slot.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RuntimeId<I,A,S> {
-    pub(super) key: RuntimeKey<I,A,S>,
-    pub(super) generation: u64,
+    key: RuntimeKey<I,A,S>,
+    generation: u64,
 }
 
 impl<I,A,S> RuntimeId<I,A,S> {

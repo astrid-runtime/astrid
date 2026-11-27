@@ -18,7 +18,20 @@ def defects():
             lambda s, a=original, b=changed: replace_once(s, a, b),
             Path("verification/hosted_runtime_residency.rs"),
         )
+    yield (
+        "runtime issuance loses the admitted scope mapping",
+        Path("crates/astrid-capsule/src/registry/runtime_scope.rs"),
+        lambda s: replace_once(s, "ensures scope == match owner", "ensures owner.is_none() ==> scope == match owner"),
+        Path("verification/hosted_runtime_residency.rs"),
+    )
+    yield (
+        "runtime issuance loses the concrete constructor fields", GENERATION,
+        lambda s: replace_once(s, "ensures key.parts() == (capsule_id,artifact,scope)", "ensures true"),
+        GENERATION,
+    )
     for name, original, changed in [
+        ("loses success below exhaustion", "ensures out.is_some() == (*old(next) < u64::MAX)", "ensures true"),
+        ("loses exact success advance", "&& *final(next) as int == *old(next) as int + 1", "&& true"),
         ("loses the public runtime key", "ensures value.parts() == self.identity().0", "ensures true"),
         ("loses the public capsule identifier", "ensures *value == self.parts().0", "ensures true"),
         ("loses the public artifact", "ensures *value == self.parts().1", "ensures true"),

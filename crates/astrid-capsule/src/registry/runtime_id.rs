@@ -34,14 +34,9 @@ impl std::fmt::Display for WasmHash {
     }
 }
 
-/// Authority scope of one executable runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RuntimeScope {
-    /// Mutable runtime state belongs exclusively to this durable principal.
-    Principal(PrincipalUid),
-    /// Explicit kernel service runtime with neutral host state.
-    SystemResident,
-}
+#[path = "runtime_scope.rs"]
+mod runtime_scope;
+pub use runtime_scope::RuntimeScope;
 
 impl RuntimeScope {
     /// Compare a pinned viewer to the instance owner. System residency has
@@ -77,14 +72,13 @@ impl RuntimeId {
         generation: u64,
         scope: RuntimeScope,
     ) -> Self {
-        Self {
-            key: RuntimeKey::new(
-                capsule_id,
-                WasmHash::from_raw(format!("test-artifact-{generation}")),
-                scope,
-            ),
-            generation,
-        }
+        super::generation::issue(
+            &mut { generation },
+            capsule_id,
+            WasmHash::from_raw(format!("test-artifact-{generation}")),
+            scope,
+        )
+        .expect("test runtime generation must be reservable")
     }
 }
 

@@ -51,7 +51,7 @@ fn runtime_residency_policy_distinguishes_grants_from_providers() {
 #[test]
 fn both_uplink_roles_require_operator_approval_for_system_residency() {
     for (provides, capability) in [(true, false), (true, true), (false, true)] {
-        assert_eq!(
+        assert!(matches!(
             classify(
                 true,
                 Uplinks {
@@ -60,8 +60,8 @@ fn both_uplink_roles_require_operator_approval_for_system_residency() {
                 },
                 true
             ),
-            Err(Refusal::SystemMcp),
-        );
+            Err(Refusal::SystemMcp)
+        ));
         let unlisted = classify(
             false,
             Uplinks {
@@ -71,9 +71,9 @@ fn both_uplink_roles_require_operator_approval_for_system_residency() {
             true,
         );
         if provides {
-            assert_eq!(unlisted, Err(Refusal::UnapprovedProvider));
+            assert!(matches!(unlisted, Err(Refusal::UnapprovedProvider)));
         } else {
-            assert_eq!(unlisted, Ok(RuntimeResidency::Principal));
+            assert!(matches!(unlisted, Ok(RuntimeResidency::Principal)));
         }
     }
 }

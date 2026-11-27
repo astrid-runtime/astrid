@@ -82,9 +82,19 @@ def defects():
             lambda text: replace_once(text, "else { return true; }", "else { return false; }"),
         ),
         (
+            "staged gate starts published",
+            ROUTE_GATE,
+            lambda text: replace_once(text, "if published { PUBLISHED } else { STAGED }", "PUBLISHED"),
+        ),
+        (
             "publication reopens retired gates",
             ROUTE_GATE,
-            lambda text: replace_once(text, "_ => RETIRED", "_ => PUBLISHED"),
+            lambda text: replace_once(text, "compare_exchange(STAGED, PUBLISHED)", "compare_exchange(RETIRED, PUBLISHED)"),
+        ),
+        (
+            "retirement leaves the route published",
+            ROUTE_GATE,
+            lambda text: replace_once(text, "=> store(RETIRED)", "=> store(PUBLISHED)"),
         ),
         (
             "route admission accepts staged gates",

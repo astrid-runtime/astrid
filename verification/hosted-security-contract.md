@@ -403,9 +403,15 @@ device redemption have separate admission paths.
 Hosted capsule construction stages the composite delivery gate. A successful
 load and internal activation leave it staged until runtime publication. Each
 subsequent load retires the old gate before installing a fresh one.
-The gate’s checked byte transition opens a staged gate, preserves a published
-gate and maps every other value to retirement. The checked release function
-returns the exact pending payload only for the published byte. Single receive,
+The production gate uses a sequentially consistent atomic byte. Verus checks
+its compare-and-exchange from staged to published, its retirement store and
+its load against an invariant at each atomic operation. Retirement sets an
+erased flag that publication preserves. Once retired, the same gate cannot
+reopen, including when publication races retirement. The checked release
+function returns the exact pending payload or held commit guard only for the
+published byte. Gate identity across registry replacement, association with
+the correct route, the native commit mutex and wakeup scheduling remain
+integration obligations. Single receive,
 blocking receive and batch drain apply it after private queue extraction.
 Retirement wakes a waiting receiver and prevents delivery of buffered events
 on the next admission check.
@@ -694,7 +700,7 @@ The atomic update used by the two TCP listener bind paths, direct stream reserva
 
 ### Runtime scope at initial load and live replacement
 
-Both paths pass the manifest's uplink capability, presence of provided uplinks and MCP server declarations, and the operator's capsule allowlist observation to the same classifier. An unapproved uplink provider is refused. System residency requires operator approval and an uplink capability or provider. The hosted classifier refuses a system-resident manifest with any MCP server declaration. Otherwise the runtime is principal-scoped. On new instance allocation, the owner selector uses the caller and expected UID at the directory lookup. A lookup error refuses allocation and a successful principal lookup carries its exact UID. Only the system branch can return an absent owner. Registry allocation constructs the actual runtime key and ID in verified code. Production specializes those records with CapsuleId, WasmHash and RuntimeScope. The proof consumer reads the result through the same public capsule, artifact, scope and generation accessors used by registry clients. A composed theorem checks the capsule ID, artifact hash and selected optional owner in that key, exact generation advance on success and no advance on classification refusal, lookup error or exhaustion. A second theorem allows arbitrary keys, including identical keys, and proves that two successive successful allocations receive strictly increasing generations. That result assumes callers serialize updates to the same live counter. A fresh registry starts its counter at one. Cross-restart authority requires independent evidence that a handle from a former registry cannot be presented as a current one. The proof assumes the manifest extraction, allowlist snapshot and directory callback. The kernel also checks live replacement against the running scope. That check, attachment to an existing instance, and subsequent socket access have independent obligations.
+Both paths pass the manifest's uplink capability, presence of provided uplinks and MCP server declarations, and the operator's capsule allowlist observation to the same classifier. An unapproved uplink provider is refused. System residency requires operator approval and an uplink capability or provider. The hosted classifier refuses a system-resident manifest with any MCP server declaration. Otherwise the runtime is principal-scoped. On new instance allocation, the owner selector uses the caller and expected UID at the directory lookup. A lookup error refuses allocation and a successful principal lookup carries its exact UID. Only the system branch can return an absent owner. Registry allocation constructs the actual runtime key and ID in verified code. Production specializes those records with CapsuleId, WasmHash and RuntimeScope. The proof consumer reads the result through the same public capsule, artifact, scope and generation accessors used by registry clients. Initial load and replacement both convert the admitted optional UID through the verified RuntimeScope constructor. A composed theorem uses that enum and represents the opaque capsule ID, artifact and UID with model values. It checks those values through the issued key, exact generation advance on success and no advance on classification refusal, lookup error or exhaustion. A second theorem allows arbitrary keys, including identical keys, and proves that two successive successful allocations receive strictly increasing generations. That result assumes callers serialize updates to the same live counter. A fresh registry starts its counter at one. Cross-restart authority requires independent evidence that a handle from a former registry cannot be presented as a current one. The proof assumes the manifest extraction, allowlist snapshot and directory callback. The kernel also checks live replacement against the running scope. That check, attachment to an existing instance, and subsequent socket access have independent obligations.
 
 ### Lifetime of a live TCP handle
 

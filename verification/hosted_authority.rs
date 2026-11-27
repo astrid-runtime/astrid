@@ -195,6 +195,11 @@ mod principal_binding;
 #[path = "../crates/astrid-kernel/src/capsule_materialization/cache_address.rs"]
 mod cache_address;
 
+// The scope operation only moves and compares the admitted opaque UID.
+type PrincipalUid = u64;
+#[path = "../crates/astrid-capsule/src/registry/runtime_scope.rs"]
+mod runtime_scope;
+
 #[path = "../crates/astrid-capsule/src/registry/generation.rs"]
 mod runtime_generation;
 
