@@ -189,7 +189,7 @@ impl PrincipalProfileCache {
     pub fn remove_paired_device(
         &self,
         principal: &PrincipalId,
-        key: &DeviceKeyId,
+        key: &DeviceKeyId<impl AsRef<str>>,
     ) -> ProfileResult<DeviceRemoval> {
         let mut state = self
             .state
