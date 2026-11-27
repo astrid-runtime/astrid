@@ -119,9 +119,9 @@ pub(super) fn leaf_record(entries: &[LeafEntry]) -> StorageResult<ObjectRecord> 
     totals.append(&mut canonical);
     let mut references = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
-        let key_length = u32::try_from(entry.key.len()).map_err(|_| arithmetic_overflow())?;
-        canonical.extend_from_slice(&key_length.to_le_bytes());
-        canonical.extend_from_slice(&entry.key);
+        if !super::checkpoint_key_field::append(&mut canonical, &entry.key) {
+            return Err(arithmetic_overflow());
+        }
         canonical.extend_from_slice(&entry.value.length()?.to_le_bytes());
         match &entry.value {
             ValueSlot::Inline(value) => {
@@ -178,10 +178,9 @@ pub(super) fn branch_record(children: &[ChildPointer]) -> StorageResult<ObjectRe
     totals.append(&mut canonical);
     let mut references = Vec::with_capacity(children.len());
     for (index, child) in children.iter().enumerate() {
-        let lower_bound = child.lower_bound.as_slice();
-        let key_length = u32::try_from(lower_bound.len()).map_err(|_| arithmetic_overflow())?;
-        canonical.extend_from_slice(&key_length.to_le_bytes());
-        canonical.extend_from_slice(lower_bound);
+        if !super::checkpoint_key_field::append(&mut canonical, &child.lower_bound) {
+            return Err(arithmetic_overflow());
+        }
         child.totals.append(&mut canonical);
         references.push(ObjectReference::owns(
             checkpoint_reference::label(Relation::Child, index).ok_or_else(arithmetic_overflow)?,
@@ -261,8 +260,7 @@ fn decode_leaf(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
     let mut entries = Vec::with_capacity(count);
     let mut reference_index = 0_usize;
     for entry_index in 0..count {
-        let key_length = cursor.u32_usize()?;
-        let key = cursor.take(key_length)?.to_vec();
+        let key = cursor.key()?.to_vec();
         validate_composite_key(id, &key)?;
         let value_length = cursor.u64()?;
         let value = match cursor.u8()? {
@@ -327,8 +325,7 @@ fn decode_branch(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
         count,
         cursor,
         |mut cursor, index| {
-            let key_length = cursor.u32_usize()?;
-            let lower_bound = cursor.take(key_length)?.to_vec();
+            let lower_bound = cursor.key()?.to_vec();
             validate_composite_key(id, &lower_bound)?;
             let child_totals = cursor.totals()?;
             if child_totals.entries == 0 {
@@ -441,9 +438,13 @@ impl<'a> Cursor<'a> {
         Ok(u16::from_le_bytes(self.array()?))
     }
 
-    fn u32_usize(&mut self) -> StorageResult<usize> {
-        usize::try_from(u32::from_le_bytes(self.array()?))
-            .map_err(|_| invalid(self.id, "persistent KV length is too large"))
+    fn key(&mut self) -> StorageResult<&'a [u8]> {
+        use super::checkpoint_key_field::{self, KeyError};
+
+        checkpoint_key_field::read(self.bytes, &mut self.offset).map_err(|reason| match reason {
+            KeyError::Field(error) => page_read_error(self.id, error),
+            KeyError::Length => invalid(self.id, "persistent KV length is too large"),
+        })
     }
 
     fn u64(&mut self) -> StorageResult<u64> {

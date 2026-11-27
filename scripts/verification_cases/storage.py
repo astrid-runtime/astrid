@@ -605,3 +605,18 @@ def checkpoint_totals_consumers():
             f"checkpoint totals lose {label}", path,
             lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker), consumer,
         )
+
+
+def checkpoint_key_field_consumers():
+    path = Path("crates/astrid-storage/src/kv/tree/checkpoint_key_field.rs")
+    consumer = Path("verification/hosted_checkpoint_key_field.rs")
+    for label, clause, weaker in [
+        ("writer bytes", "wrote ==> final(bytes)@ == old(bytes)@ +", "false ==> final(bytes)@ == old(bytes)@ +"),
+        ("decoded fence", "key@ == bytes@.subrange(start+4,start+4+size)", "true"),
+        ("next field position", "*final(cursor) as int == start + 4 + size", "true"),
+        ("short prefix or body rejection", "out.is_ok() == (start + 4", "out.is_ok() <== (start + 4"),
+    ]:
+        yield (
+            f"checkpoint key field loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker), consumer,
+        )
