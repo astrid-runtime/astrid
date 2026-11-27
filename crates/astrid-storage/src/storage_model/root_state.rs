@@ -48,6 +48,22 @@ pub struct RootState {
     /// Immutable commit object naming the principal state.
     pub commit: ObjectId,
 }
+
+impl RootState {
+    /// Compare the generation and full immutable commit identity.
+    pub(crate) fn same(self,other:Self) -> (equal:bool)
+        ensures equal == (self == other),
+    {
+        if self.generation.get() != other.generation.get() ||
+            self.commit.as_bytes().as_slice() != other.commit.as_bytes().as_slice() { return false; }
+        proof {
+            self.generation.same_value(other.generation);
+            assert(self.commit.digest() =~= other.commit.digest());
+            ObjectId::same_digest(self.commit,other.commit);
+        }
+        true
+    }
+}
 }
 
 impl RootGeneration {

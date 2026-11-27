@@ -3,6 +3,33 @@ use crate::{ObjectId,ObjectReference,ReferenceKind,workspace_references as refs}
 use vstd::prelude::*;
 
 verus! {
+/// Starting at the writer's published root map, distinguish an exact cache
+/// hit from every fallback. A miss or stale value must preserve decode errors.
+fn sampled_header<P:Ord,H,E,L,D>(roots:&std::collections::BTreeMap<P,crate::RootState>,owner:&P,
+    lookup:L,decode:D, entries:Ghost<spec_fn(P,ObjectId)->Option<(Option<crate::RootState>,H)>>)
+    -> (out:Result<H,E>)
+    where L:FnOnce(&P,ObjectId)->Option<(Option<crate::RootState>,H)>,
+          D:FnOnce(&P,Option<crate::RootState>)->Result<H,E>,
+    requires vstd::laws_cmp::obeys_cmp::<P>(), vstd::laws_cmp::obeys_cmp_concrete_eq::<P>(),
+        vstd::std_specs::btree::btree_map_inv(roots),
+        forall|p:&P,id:ObjectId| #[trigger] lookup.requires((p,id)),
+        forall|p:&P,id:ObjectId,x:Option<(Option<crate::RootState>,H)>| #[trigger] lookup.ensures((p,id),x) ==> x == (entries@)(*p,id),
+        forall|p:&P,r:Option<crate::RootState>| #[trigger] decode.requires((p,r)),
+    ensures ({
+        let root = if roots@.contains_key(*owner) { Some(roots@[*owner]) } else { None };
+        match root {
+            Some(r) => match (entries@)(*owner,r.commit) {
+                Some((Some(cached),header)) if cached == r => out == Ok(header),
+                _ => decode.ensures((owner,root),out),
+            },
+            None => decode.ensures((owner,None),out),
+        }
+    }),
+{
+    let root = crate::root_transition::published(roots,owner);
+    crate::header_cache::read(owner,root,lookup,decode)
+}
+
 /// Each attempted mutation immediately follows its own sample. Only an explicit
 /// commit conflict may be followed by another sample in the same operation.
 fn checked_retry<P,I:Copy,H,T,E,B:crate::workspace_retry::Backend<P,I,H,T,E>>(b:&mut B,owner:&P,id:I) -> (out:Result<T,E>)

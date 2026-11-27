@@ -67,3 +67,23 @@ def defects():
             f"workspace retry {name}", source,
             lambda s, a=old, b=new: replace_once(s, a, b), trace,
         )
+
+    source = Path("crates/astrid-storage/src/content/store/header_cache.rs")
+    for name, old, new in [
+        ("cache hit can return another header", "(out matches Ok(h) && lookup.ensures((owner,r.commit),Some((Some(r),h))))", "out.is_ok()"),
+        ("missing published root can mask a decode failure", "None => decode.ensures((owner,root),out)", "None => true"),
+        ("stale cache entry can mask a decode failure", "(decode.ensures((owner,root),out) &&", "(true &&"),
+        ("matching current entry can be discarded", "h:H| observed != root && #[trigger]", "h:H| true && #[trigger]"),
+    ]:
+        yield (
+            f"content header {name}", source,
+            lambda s, a=old, b=new: replace_once(s, a, b), trace,
+        )
+
+    yield (
+        "content header published lookup can select a peer root",
+        Path("crates/astrid-storage/src/engine/durable/root_transition.rs"),
+        lambda s: replace_once(s, "ensures root == if roots@.contains_key(*owner) { Some(roots@[*owner]) } else { None },",
+                               "ensures root.is_some() == roots@.contains_key(*owner),"),
+        trace,
+    )

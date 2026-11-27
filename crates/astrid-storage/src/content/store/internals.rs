@@ -16,6 +16,39 @@ where
     P: Clone + Ord + Send + Sync,
     E: PrincipalProjectionEngine<P>,
 {
+    pub(super) fn header_at_epoch(
+        &self,
+        principal: &P,
+        epoch: crate::kv::MemoEpoch,
+    ) -> Result<Arc<ContentHeader>, PrincipalContentError> {
+        let root = self.engine.current_root(principal)?;
+        super::header_cache::read(
+            principal,
+            root,
+            |owner, commit| {
+                let header = self
+                    .engine
+                    .load_projection_cache(owner, commit, super::DECODED_HEADER_CACHE_KEY)?
+                    .downcast::<ContentHeader>()?;
+                Some((header.root, header))
+            },
+            |principal, root| {
+                let header = self.decode_header(principal, root, epoch)?;
+                let Some(root) = root else {
+                    return Ok(Arc::new(header));
+                };
+                let header = Arc::new(header);
+                let _ = self.engine.retain_projection_cache(
+                    principal,
+                    root.commit,
+                    super::DECODED_HEADER_CACHE_KEY,
+                    super::ProjectionCacheEntry::from_shared(Arc::clone(&header)),
+                );
+                Ok(header)
+            },
+        )
+    }
+
     pub(super) fn finish_catalog_commit(
         &self,
         principal: &P,

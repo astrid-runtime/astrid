@@ -7,6 +7,8 @@ mod workspace_references;
 mod workspace_retry;
 #[path = "../crates/astrid-storage/src/content/store/commit_candidate.rs"]
 mod commit_candidate;
+#[path = "../crates/astrid-storage/src/content/store/header_cache.rs"]
+mod header_cache;
 mod hosted_workspace_references;
 #[path = "../crates/astrid-capsule/src/context/workspace_commit.rs"]
 mod workspace_commit;

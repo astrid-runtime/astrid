@@ -937,35 +937,6 @@ where
     fn header(&self, principal: &P) -> Result<Arc<ContentHeader>, PrincipalContentError> {
         self.header_at_epoch(principal, self.validated_kv.memo_epoch())
     }
-
-    fn header_at_epoch(
-        &self,
-        principal: &P,
-        epoch: crate::kv::MemoEpoch,
-    ) -> Result<Arc<ContentHeader>, PrincipalContentError> {
-        let root = self.engine.current_root(principal)?;
-        if let Some(root) = root
-            && let Some(header) = self
-                .engine
-                .load_projection_cache(principal, root.commit, DECODED_HEADER_CACHE_KEY)
-                .and_then(|entry| entry.downcast::<ContentHeader>())
-            && header.root == Some(root)
-        {
-            return Ok(header);
-        }
-        let header = self.decode_header(principal, root, epoch)?;
-        let Some(root) = root else {
-            return Ok(Arc::new(header));
-        };
-        let header = Arc::new(header);
-        let _ = self.engine.retain_projection_cache(
-            principal,
-            root.commit,
-            DECODED_HEADER_CACHE_KEY,
-            ProjectionCacheEntry::from_shared(Arc::clone(&header)),
-        );
-        Ok(header)
-    }
 }
 
 mod append;
@@ -973,6 +944,9 @@ mod bulk;
 mod commit_candidate;
 mod constructors;
 mod handoff;
+mod header_cache;
+#[cfg(all(test, not(target_family = "wasm")))]
+mod header_cache_tests;
 mod internals;
 mod native;
 mod pending_catalog;

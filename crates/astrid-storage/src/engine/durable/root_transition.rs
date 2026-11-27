@@ -80,6 +80,14 @@ pub(super) fn advance(actual: Option<Version>, expected: Option<Version>) -> (de
     }
 }
 
+/// Read the entry for this principal from the published root map.
+pub(super) fn published<P:Ord,R:Copy>(roots:&BTreeMap<P,R>, owner:&P) -> (root:Option<R>)
+    requires obeys_cmp::<P>(), obeys_cmp_concrete_eq::<P>(), btree_map_inv(roots),
+    ensures root == if roots@.contains_key(*owner) { Some(roots@[*owner]) } else { None },
+{
+    roots.get(owner).copied()
+}
+
 /// Group preparation observes the latest accepted entry for this owner.
 pub(super) fn current<P:Ord,R:Copy>(pending:&BTreeMap<P,R>, published:&BTreeMap<P,R>, owner:&P)
     -> (root:Option<R>)
@@ -87,7 +95,7 @@ pub(super) fn current<P:Ord,R:Copy>(pending:&BTreeMap<P,R>, published:&BTreeMap<
     ensures root == if pending@.contains_key(*owner) { Some(pending@[*owner]) }
         else if published@.contains_key(*owner) { Some(published@[*owner]) } else { None },
 {
-    if let Some(root) = pending.get(owner) { Some(*root) } else { published.get(owner).copied() }
+    if let Some(root) = pending.get(owner) { Some(*root) } else { self::published(published,owner) }
 }
 
 /// Compare the full root selected for this owner with the caller's sampled root.

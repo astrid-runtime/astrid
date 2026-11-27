@@ -659,7 +659,10 @@ where
     /// Returns a recovery error when authoritative reopen cannot complete.
     pub fn root(&self, principal: &P) -> Result<Option<RootState>, DurableError> {
         let inner = self.lock_usable()?;
-        Ok(inner.roots_by_principal.get(principal).copied())
+        Ok(super::root_transition::published(
+            &inner.roots_by_principal,
+            principal,
+        ))
     }
 
     pub(crate) fn root_if_ready(&self, principal: &P) -> Option<crate::engine::ReadyKvRoot> {
