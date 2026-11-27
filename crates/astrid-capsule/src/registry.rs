@@ -495,16 +495,12 @@ impl CapsuleRegistry {
         let mut removed_principals = vec![principal.clone()];
         let torn_down = dependent_views::depart(
             &mut self.views,
+            &mut self.instances,
             &runtime_id,
-            runtime_id.key().scope(),
-            self.instances
-                .get(&runtime_id)
-                .and_then(|entry| entry.owner_alias.as_ref()),
             principal,
             &mut removed_principals,
         );
         if torn_down {
-            self.instances.remove(&runtime_id);
             if self.any_principal_with(id).is_none() {
                 self.unregister_capsule_uplinks(id);
             }

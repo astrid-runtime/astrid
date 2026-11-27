@@ -15,6 +15,16 @@ def defects():
             Path("verification/hosted_route_retirement.rs"),
         )
     sweep = Path("crates/astrid-capsule/src/registry/dependent_views.rs")
+    installed = "final(instances)@ == if tear_down { old(instances)@.remove(*runtime) } else { old(instances)@ }"
+    for name, clause in [
+        ("can forget to remove the selected generation", "tear_down || final(instances)@ == old(instances)@"),
+        ("can alter the retained instance table", "!tear_down || final(instances)@ == old(instances)@.remove(*runtime)"),
+    ]:
+        yield (
+            f"runtime instance departure {name}", sweep,
+            lambda s, b=clause: replace_once(s, installed, b),
+            Path("verification/hosted_registry_lookup.rs"),
+        )
     for name, clause, weakened in [
         ("can change views on a retained runtime", "else { final(views)@ == before && final(removed)@ == old(removed)@ }",
          "else { final(removed)@ == old(removed)@ }"),

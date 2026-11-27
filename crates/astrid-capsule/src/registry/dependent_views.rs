@@ -1,4 +1,5 @@
 //! Sweep view slots belonging to a retired system runtime generation.
+use super::{RuntimeScope, generation::RuntimeId, instance_swap::Entry};
 use std::{collections::HashMap, hash::Hash};
 use vstd::prelude::*;
 #[cfg(verus_keep_ghost)]
@@ -7,6 +8,8 @@ use vstd::{
     pervasive::obeys_clone_eq,
     std_specs::hash::{hash_map_inv, obeys_key_model},
 };
+
+type Id<K, A> = RuntimeId<K, A, RuntimeScope>;
 
 verus! {
 broadcast use {vstd::std_specs::hash::group_hash_axioms, vstd::seq_lib::group_seq_properties};
@@ -143,30 +146,37 @@ fn sweep<P: Eq + Hash + Clone,K: Eq + Hash + Clone,V: Eq>(
 }
 
 /// Apply the view cleanup that accompanies the registry's teardown decision.
-pub(super) fn depart<P: Eq + Hash + Clone,K: Eq + Hash + Clone,V: Eq>(
-    views: &mut HashMap<P,HashMap<K,V>>, runtime: &V, scope: super::RuntimeScope,
-    owner: Option<&P>, departing: &P, removed: &mut Vec<P>)
+pub(super) fn depart<P: Eq + Hash + Clone,K: Eq + Hash + Clone,A: Eq + Hash,C: ?Sized>(
+    views: &mut HashMap<P,HashMap<K,Id<K,A>>>, instances: &mut HashMap<Id<K,A>,Entry<C,P>>,
+    runtime: &Id<K,A>, departing: &P, removed: &mut Vec<P>)
     -> (tear_down: bool)
-    requires hash_map_inv(old(views)), obeys_key_model::<P>(), obeys_concrete_eq::<P>(),
-        obeys_key_model::<K>(), obeys_concrete_eq::<K>(), obeys_concrete_eq::<V>(),
-        obeys_clone_eq::<P>(), obeys_clone_eq::<K>(),
+    requires hash_map_inv(old(views)), hash_map_inv(old(instances)),
+        old(instances)@.contains_key(*runtime),
+        obeys_key_model::<P>(), obeys_concrete_eq::<P>(), obeys_key_model::<K>(), obeys_concrete_eq::<K>(),
+        obeys_key_model::<Id<K,A>>(), obeys_concrete_eq::<Id<K,A>>(), obeys_clone_eq::<P>(), obeys_clone_eq::<K>(),
         forall|p:P| old(views)@.contains_key(p) ==> hash_map_inv(&old(views)@[p]),
-    ensures hash_map_inv(final(views)), ({
+    ensures hash_map_inv(final(views)), hash_map_inv(final(instances)),
+        final(instances)@ == if tear_down { old(instances)@.remove(*runtime) } else { old(instances)@ },
+        ({
         let before = old(views)@;
-        let system = scope is SystemResident;
-        let owns = owner == Some(departing);
+        let system = runtime.identity().0.2 is SystemResident;
+        let owns = old(instances)@[*runtime].owner_alias == Some(*departing);
         &&& tear_down == (!system || owns || !(exists|p:P| before.contains_key(p) && (#[trigger] before[p])@.values().contains(*runtime)))
         &&& if system && owns { swept(before,final(views)@,*runtime,old(removed)@,final(removed)@) }
             else { final(views)@ == before && final(removed)@ == old(removed)@ }
     }),
 {
-    match super::viewers::departure(views,runtime,scope,owner,departing) {
-        super::viewers::Departure::KeepRuntime => false,
-        super::viewers::Departure::RemoveRuntime => true,
-        super::viewers::Departure::RemoveRuntimeAndViews => {
-            sweep(views,runtime,removed);
-            true
-        },
+    let owner = match instances.get(runtime) {
+        Some(entry) => entry.owner_alias.as_ref(),
+        None => None,
+    };
+    assert((owner == Some(departing)) == (instances@[*runtime].owner_alias == Some(*departing)));
+    match super::viewers::departure(views,runtime,runtime.key().scope(),owner,departing) {
+        super::viewers::Departure::KeepRuntime => return false,
+        super::viewers::Departure::RemoveRuntime => {},
+        super::viewers::Departure::RemoveRuntimeAndViews => sweep(views,runtime,removed),
     }
+    instances.remove(runtime);
+    true
 }
 }

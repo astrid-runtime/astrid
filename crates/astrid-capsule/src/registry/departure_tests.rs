@@ -30,8 +30,12 @@ fn removing_system_owner_revokes_every_dependent_view() {
         .unwrap();
     let survivor = registry.get_for(&alice, &sibling).unwrap();
 
+    let retiring_generation = registry.runtime_id_for(&owner, &id).unwrap();
+    let retiring_handle = registry.get_for(&owner, &id).unwrap();
     let removed = registry.unregister_for(&owner, &id).unwrap();
     assert!(removed.torn_down);
+    assert!(!registry.instances.contains_key(&retiring_generation));
+    assert!(Arc::ptr_eq(&removed.capsule, &retiring_handle));
     assert!(registry.get_for(&alice, &id).is_none());
     assert!(registry.get_for(&bob, &id).is_none());
     assert_eq!(registry.len(), 1);
