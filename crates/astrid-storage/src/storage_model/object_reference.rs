@@ -174,6 +174,12 @@ impl ObjectReference {
         self.label.0.as_slice()
     }
 
+    pub(crate) fn label_less_than(&self, label:&[u8]) -> (yes:bool)
+        ensures yes == before(self.fields().0,label@),
+    {
+        bytes_before(self.label.0.as_slice(),label)
+    }
+
     pub(super) fn label_before(&self,next:&Self) -> (yes:bool)
         ensures yes == before(self.fields().0,next.fields().0),
     {

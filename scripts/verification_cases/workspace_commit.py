@@ -38,6 +38,8 @@ def defects():
 
     source = Path("crates/astrid-storage/src/content/store/commit_candidate.rs")
     for name, old, new in [
+        ("preserved commit reference can change", "&&& after.take(before.len() as int) == before", "&&& true"),
+        ("extra commit links can be appended", "&&& after.len() == before.len() + (if expected.is_some() { 2int } else { 1int })", "&&& after.len() >= before.len() + (if expected.is_some() { 2int } else { 1int })"),
         ("owner can change", "p == self.parts().0 &&", "true &&"),
         ("expected root can change", "r == self.parts().1", "true"),
         ("commit can differ from encoder result", "&& seal.ensures((self.parts().2,),Ok((id,b)))", "&& true"),
@@ -87,3 +89,17 @@ def defects():
                                "ensures root.is_some() == roots@.contains_key(*owner),"),
         trace,
     )
+
+    source = Path("crates/astrid-storage/src/content/store/header_graph.rs")
+    for name, old, new in [
+        ("commit can belong to another lookup", "&&& load.ensures((owner,root.commit),Ok(g.commit))", "&&& true"),
+        ("state can belong to another lookup", "&&& load.ensures((owner,g.state_id),Ok(g.state))", "&&& true"),
+        ("state edge can point elsewhere", "r.fields() == (super::commit_candidate::STATE@,g.state_id,super::ReferenceKind::Owns)", "r.fields().0 == super::commit_candidate::STATE@"),
+        ("state can carry a different shape", "&&& structural(*g.state,ObjectKind::PrincipalState,v)", "&&& true"),
+        ("canonical state edge can be missed", "forall|i:int| #[trigger] positioned(refs@,label@,i) ==> (out matches Some(r) && *r == refs@[i]),", "true,"),
+        ("read error may come from another object", "out matches Err(Error::Read(error)) ==> load.ensures((owner,root.commit),Err(error))", "out matches Err(Error::Read(error)) ==> true"),
+    ]:
+        yield (
+            f"content graph {name}", source,
+            lambda s, a=old, b=new: replace_once(s, a, b), trace,
+        )

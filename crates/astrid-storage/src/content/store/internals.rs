@@ -2,12 +2,11 @@ use super::workspace::{is_workspace_branch_label, workspace_branch_quota};
 use super::{
     Arc, BTreeMap, BuiltContent, CONTENT_COMPONENT_LABEL, CatalogRoot, CatalogSummary,
     CatalogValue, ContentBatchExpectation, ContentError, ContentHeader, ContentName,
-    KV_COMPONENT_LABEL, LEGACY_PRINCIPAL_GRAPH_VERSION, ModelError, ObjectClass,
-    ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ObjectReference, PARENT_LABEL,
-    PRINCIPAL_GRAPH_VERSION, PrincipalContentError, PrincipalContentStore, PrincipalKvAdapter,
-    PrincipalProjectionEngine, PrincipalProjectionError, ReferenceKind, ReferenceLabel, RootState,
-    RootTransaction, STATE_LABEL, invalid, lookup, owned_target, require_structural,
-    root_from_record, validate_catalog, validated_projection_quota,
+    KV_COMPONENT_LABEL, LEGACY_PRINCIPAL_GRAPH_VERSION, ModelError, ObjectClass, ObjectId,
+    ObjectKind, ObjectRecord, ObjectReference, PARENT_LABEL, PRINCIPAL_GRAPH_VERSION,
+    PrincipalContentError, PrincipalContentStore, PrincipalKvAdapter, PrincipalProjectionEngine,
+    PrincipalProjectionError, ReferenceKind, ReferenceLabel, RootState, RootTransaction,
+    STATE_LABEL, invalid, lookup, root_from_record, validate_catalog, validated_projection_quota,
 };
 use crate::content::catalog::prefix_exists as catalog_prefix_exists;
 
@@ -95,21 +94,11 @@ where
         let Some(root) = root else {
             return Ok(ContentHeader::empty());
         };
-        let commit = self.load_typed(
-            principal,
-            root.commit,
-            ObjectKind::Commit,
-            PRINCIPAL_GRAPH_VERSION,
-        )?;
-        require_structural(root.commit, &commit)?;
-        let state_id = owned_target(root.commit, &commit, STATE_LABEL)?;
-        let state = self.load_typed(
-            principal,
+        let super::header_graph::Graph {
+            commit,
             state_id,
-            ObjectKind::PrincipalState,
-            PRINCIPAL_GRAPH_VERSION,
-        )?;
-        require_structural(state_id, &state)?;
+            state,
+        } = self.read_header_graph(principal, root)?;
 
         let mut catalog = None;
         let mut other_quota_bytes = 0_u64;
@@ -209,24 +198,20 @@ where
         .map_err(|_| invalid(object, "invalid KV component accounting"))
     }
 
-    pub(super) fn load_typed(
+    pub(super) fn read_header_graph(
         &self,
-        principal: &P,
-        object: ObjectId,
-        kind: ObjectKind,
-        version: ObjectFormatVersion,
-    ) -> Result<Arc<ObjectRecord>, PrincipalContentError> {
-        let record = self
-            .engine
-            .load_shared_object_for(principal, object)?
-            .ok_or(ContentError::MissingObject(object))?;
-        if record.kind() != kind || record.format_version() != version {
-            return Err(invalid(
-                object,
-                "principal object has wrong kind or version",
-            ));
-        }
-        Ok(record)
+        owner: &P,
+        root: RootState,
+    ) -> Result<super::header_graph::Graph, PrincipalContentError> {
+        super::header_graph::read(owner, root, PRINCIPAL_GRAPH_VERSION, |owner, id| {
+            self.engine
+                .load_shared_object_for(owner, id)?
+                .ok_or_else(|| ContentError::MissingObject(id).into())
+        })
+        .map_err(|error| match error {
+            super::header_graph::Error::Read(e) => e,
+            super::header_graph::Error::Invalid(id, why) => invalid(id, why),
+        })
     }
 
     pub(super) fn load_migration_graph_object(

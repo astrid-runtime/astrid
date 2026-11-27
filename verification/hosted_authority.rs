@@ -9,6 +9,8 @@ mod workspace_retry;
 mod commit_candidate;
 #[path = "../crates/astrid-storage/src/content/store/header_cache.rs"]
 mod header_cache;
+#[path = "../crates/astrid-storage/src/content/store/header_graph.rs"]
+mod header_graph;
 mod hosted_workspace_references;
 #[path = "../crates/astrid-capsule/src/context/workspace_commit.rs"]
 mod workspace_commit;

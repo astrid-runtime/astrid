@@ -947,6 +947,9 @@ mod handoff;
 mod header_cache;
 #[cfg(all(test, not(target_family = "wasm")))]
 mod header_cache_tests;
+mod header_graph;
+#[cfg(test)]
+mod header_graph_tests;
 mod internals;
 mod native;
 mod pending_catalog;

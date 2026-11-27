@@ -3,6 +3,37 @@ use crate::{ObjectId,ObjectReference,ReferenceKind,workspace_references as refs}
 use vstd::prelude::*;
 
 verus! {
+/// Both observed records must belong to the sampled owner's object table.
+fn decoded_graph<P,E,L>(owner:&P,root:crate::RootState,v:crate::ObjectFormatVersion,load:L,
+    table:Ghost<spec_fn(P,ObjectId)->Result<std::sync::Arc<crate::ObjectRecord>,E>>)
+    -> (out:Result<crate::header_graph::Graph,crate::header_graph::Error<E>>)
+    where L:Fn(&P,ObjectId)->Result<std::sync::Arc<crate::ObjectRecord>,E>,
+    requires forall|id:ObjectId| #[trigger] load.requires((owner,id)),
+        forall|id:ObjectId,x:Result<std::sync::Arc<crate::ObjectRecord>,E>| #[trigger] load.ensures((owner,id),x) ==> x == (table@)(*owner,id),
+    ensures out matches Ok(g) ==> {
+        &&& (table@)(*owner,root.commit) == Ok(g.commit)
+        &&& g.commit.contents().0 == crate::ObjectKind::Commit && g.commit.contents().1 == v.number()
+        &&& g.commit.contents().2.len() == 0 && g.commit.contents().4 == 0 && g.commit.contents().5 == crate::ObjectClass::Metadata
+        &&& exists|edge:ObjectReference| g.commit.contents().3.contains(edge) && #[trigger] edge.fields() == (b"state"@,g.state_id,ReferenceKind::Owns)
+        &&& (table@)(*owner,g.state_id) == Ok(g.state)
+        &&& g.state.contents().0 == crate::ObjectKind::PrincipalState && g.state.contents().1 == v.number()
+        &&& g.state.contents().2.len() == 0 && g.state.contents().4 == 0 && g.state.contents().5 == crate::ObjectClass::Metadata
+    },
+        out matches Err(crate::header_graph::Error::Read(e)) ==> (table@)(*owner,root.commit) == Err(e) ||
+            exists|c:std::sync::Arc<crate::ObjectRecord>,edge:ObjectReference|
+                (table@)(*owner,root.commit) == Ok(c) && #[trigger] c.contents().3.contains(edge) &&
+                #[trigger] edge.fields() == (b"state"@,edge.fields().1,ReferenceKind::Owns) && (table@)(*owner,edge.fields().1) == Err(e),
+{
+    crate::header_graph::read(owner,root,v,load)
+}
+
+fn find_canonical_state(refs:&[ObjectReference],i:Ghost<int>) -> (out:Option<&ObjectReference>)
+    requires crate::header_graph::positioned(refs@,b"state"@,i@),
+    ensures out matches Some(r) && *r == refs@[i@],
+{
+    crate::header_graph::find(refs,b"state")
+}
+
 /// Starting at the writer's published root map, distinguish an exact cache
 /// hit from every fallback. A miss or stale value must preserve decode errors.
 fn sampled_header<P:Ord,H,E,L,D>(roots:&std::collections::BTreeMap<P,crate::RootState>,owner:&P,

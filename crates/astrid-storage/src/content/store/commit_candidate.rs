@@ -34,17 +34,17 @@ impl<P> Candidate<P> {
         (self.owner,self.expected,self.refs)
     }
 
-    pub(super) fn new(owner:P, expected:Option<RootState>, mut refs:Vec<ObjectReference>, state:ObjectId)
+    pub(super) fn new(owner:P, expected:Option<RootState>, prior:Vec<ObjectReference>, state:ObjectId)
         -> (out:Self)
         ensures out.parts().0 == owner, out.parts().1 == expected,
-            references(refs@,out.parts().2@,expected,state),
+            references(prior@,out.parts().2@,expected,state),
     {
-        let ghost prior = refs@;
+        let mut refs = prior;
         if let Some(previous) = expected {
             refs.push(ObjectReference::new(label(PARENT),previous.commit,ReferenceKind::Lineage));
         }
         refs.push(ObjectReference::owns(label(STATE),state));
-        assert(refs@.take(prior.len() as int) =~= prior);
+        assert(refs@.take(prior@.len() as int) =~= prior@);
         Self {owner,expected,refs}
     }
 

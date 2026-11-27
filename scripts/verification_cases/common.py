@@ -145,6 +145,7 @@ INPUTS = [
     Path("verification/hosted_process_selection.rs"),
     Path("crates/astrid-storage/src/content/store/commit_candidate.rs"),
     Path("crates/astrid-storage/src/content/store/header_cache.rs"),
+    Path("crates/astrid-storage/src/content/store/header_graph.rs"),
     Path("crates/astrid-storage/src/content/store/workspace/retry.rs"),
     Path("crates/astrid-storage/src/content/store/workspace/reference_transition.rs"),
     Path("verification/hosted_workspace_commit.rs"),
