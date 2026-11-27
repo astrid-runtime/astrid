@@ -29,6 +29,9 @@ use crate::principal_graph::PRINCIPAL_GRAPH_VERSION;
 use super::encoding;
 
 mod adapter;
+#[cfg(verus_keep_ghost)]
+use crate::storage_model::ReferenceKind;
+mod checkpoint_child;
 mod checkpoint_key_field;
 mod checkpoint_leaf;
 mod checkpoint_page;

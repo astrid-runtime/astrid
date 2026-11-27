@@ -39,4 +39,24 @@ fn incomplete(bytes: &[u8], start: usize) -> (rejected: bool)
     let mut cursor = start;
     key::read(bytes,&mut cursor).is_err()
 }
+
+// A malformed length never moves the cursor into a partial body.
+fn failed_read(bytes: &[u8], start: usize) -> (out: (usize,Result<&[u8],key::KeyError>))
+    requires start as int + 4 > bytes.len() ||
+        start as int + 4 + key::length(bytes@,start as int) > bytes.len(),
+    ensures
+        out.0 as int == if start as int + 4 <= bytes.len() { start as int + 4 } else { start as int },
+        out.1 == if start as int + 4 > usize::MAX { Err(key::KeyError::Field(crate::storage_fields::ReadError::Overflow(4))) }
+            else if start as int + 4 > bytes.len() { Err(key::KeyError::Field(crate::storage_fields::ReadError::Truncated)) }
+            else {
+                let size = key::length(bytes@,start as int) as int;
+                if size > usize::MAX { Err(key::KeyError::Length) }
+                else if start as int + 4 + size > usize::MAX { Err(key::KeyError::Field(crate::storage_fields::ReadError::Overflow(size as usize))) }
+                else { Err(key::KeyError::Field(crate::storage_fields::ReadError::Truncated)) }
+            },
+{
+    let mut cursor = start;
+    let out = key::read(bytes,&mut cursor);
+    (cursor,out)
+}
 }

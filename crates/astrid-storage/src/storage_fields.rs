@@ -14,6 +14,7 @@ pub(crate) fn take<'a>(bytes: &'a [u8], cursor: &mut usize, len: usize)
             field@ == bytes@.subrange(*old(cursor) as int,*final(cursor) as int),
         read.is_err() ==> *final(cursor) == *old(cursor),
         (read matches Err(ReadError::Overflow(_))) == (*old(cursor) as int + len > usize::MAX),
+        read matches Err(ReadError::Overflow(n)) ==> n == len,
 {
     let Some(end) = cursor.checked_add(len) else { return Err(ReadError::Overflow(len)); };
     if end > bytes.len() { return Err(ReadError::Truncated); }
@@ -43,6 +44,8 @@ pub(crate) fn fixed<const N: usize>(bytes: &[u8], cursor: &mut usize) -> (value:
         value matches Ok(array) ==> *final(cursor) as int == *old(cursor) as int + N
             && at(bytes@,*old(cursor) as int,array@),
         value.is_err() ==> *final(cursor) == *old(cursor),
+        (value matches Err(ReadError::Overflow(_))) == (*old(cursor) as int + N > usize::MAX),
+        value matches Err(ReadError::Overflow(n)) ==> n == N,
 {
     let field = take(bytes, cursor, N)?;
     let mut array = [0u8;N];

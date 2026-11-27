@@ -21,16 +21,23 @@ fn round_trip(bytes: &mut Vec<u8>, totals: NodeTotals, tail: &[u8])
             assert(bytes@.subrange(start,start+24) =~= totals.wire());
         }
         if let Ok(t) = out {
-            assert(t.wire() == totals.wire());
-            assert(t.wire().subrange(0,8) =~= vstd::bytes::spec_u64_to_le_bytes(t.entries));
-            assert(t.wire().subrange(8,16) =~= vstd::bytes::spec_u64_to_le_bytes(t.logical_bytes));
-            assert(t.wire().subrange(16,24) =~= vstd::bytes::spec_u64_to_le_bytes(t.quota_bytes));
-            assert(totals.wire().subrange(0,8) =~= vstd::bytes::spec_u64_to_le_bytes(totals.entries));
-            assert(totals.wire().subrange(8,16) =~= vstd::bytes::spec_u64_to_le_bytes(totals.logical_bytes));
-            assert(totals.wire().subrange(16,24) =~= vstd::bytes::spec_u64_to_le_bytes(totals.quota_bytes));
+            same(t,totals);
         }
     }
     out
+}
+
+pub(super) proof fn same(a:NodeTotals,b:NodeTotals)
+    requires a.wire() == b.wire(),
+    ensures a == b,
+{
+    vstd::bytes::lemma_auto_spec_u64_to_from_le_bytes();
+    assert(a.wire().subrange(0,8) =~= vstd::bytes::spec_u64_to_le_bytes(a.entries));
+    assert(b.wire().subrange(0,8) =~= vstd::bytes::spec_u64_to_le_bytes(b.entries));
+    assert(a.wire().subrange(8,16) =~= vstd::bytes::spec_u64_to_le_bytes(a.logical_bytes));
+    assert(b.wire().subrange(8,16) =~= vstd::bytes::spec_u64_to_le_bytes(b.logical_bytes));
+    assert(a.wire().subrange(16,24) =~= vstd::bytes::spec_u64_to_le_bytes(a.quota_bytes));
+    assert(b.wire().subrange(16,24) =~= vstd::bytes::spec_u64_to_le_bytes(b.quota_bytes));
 }
 
 fn truncated(bytes: &[u8], start: usize) -> (rejected: bool)

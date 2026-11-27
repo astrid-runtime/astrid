@@ -325,20 +325,30 @@ fn decode_branch(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
         count,
         cursor,
         |mut cursor, index| {
-            let lower_bound = cursor.key()?.to_vec();
-            validate_composite_key(id, &lower_bound)?;
-            let child_totals = cursor.totals()?;
-            if child_totals.entries == 0 {
-                return Err(invalid(id, "empty KV branch child"));
-            }
-            let object =
-                checkpoint_reference::target(record.references(), index, Relation::Child, index)
-                    .map_err(|reason| match reason {
-                        Rejection::IndexOverflow => arithmetic_overflow(),
-                        Rejection::Missing | Rejection::Mismatch => {
-                            invalid(id, "invalid KV branch child reference")
-                        },
-                    })?;
+            use super::checkpoint_child::{self, ChildError};
+            use super::checkpoint_key_field::KeyError;
+
+            let (lower_bound, object, child_totals) = checkpoint_child::read(
+                cursor.bytes,
+                &mut cursor.offset,
+                record.references(),
+                index,
+                |field| validate_composite_key(id, field),
+            )
+            .map_err(|reason| match reason {
+                ChildError::Key(KeyError::Field(e)) | ChildError::Totals(e) => {
+                    page_read_error(id, e)
+                },
+                ChildError::Key(KeyError::Length) => {
+                    invalid(id, "persistent KV length is too large")
+                },
+                ChildError::InvalidKey(e) => e,
+                ChildError::Empty => invalid(id, "empty KV branch child"),
+                ChildError::Reference(Rejection::IndexOverflow) => arithmetic_overflow(),
+                ChildError::Reference(Rejection::Missing | Rejection::Mismatch) => {
+                    invalid(id, "invalid KV branch child reference")
+                },
+            })?;
             Ok((cursor, lower_bound, object, child_totals))
         },
         || invalid(id, "invalid KV branch level"),

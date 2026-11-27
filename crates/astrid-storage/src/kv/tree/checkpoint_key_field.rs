@@ -6,8 +6,9 @@ verus! {
 pub(super) enum KeyError { Field(ReadError), Length }
 
 pub(super) open spec fn length(bytes: Seq<u8>, start: int) -> u32 {
+    if start < 0 || start + 4 > bytes.len() { 0 } else {
     (bytes[start] as u32) | ((bytes[start+1] as u32) << 8) |
-        ((bytes[start+2] as u32) << 16) | ((bytes[start+3] as u32) << 24)
+        ((bytes[start+2] as u32) << 16) | ((bytes[start+3] as u32) << 24) }
 }
 
 pub(super) proof fn encoded_length(bytes: Seq<u8>, start: int, value: u32)
@@ -26,6 +27,12 @@ pub(super) fn read<'a>(bytes: &'a [u8], cursor: &mut usize) -> (out: Result<&'a 
         let start = *old(cursor) as int;
         let size = length(bytes@,start) as int;
         &&& out.is_ok() == (start + 4 <= bytes.len() && start + 4 + size <= bytes.len())
+        &&& out.is_err() ==> *final(cursor) as int == if start+4 <= bytes.len() { start+4 } else { start }
+        &&& out matches Err(e) ==> if start+4 > usize::MAX { e == KeyError::Field(ReadError::Overflow(4)) }
+            else if start+4 > bytes.len() { e == KeyError::Field(ReadError::Truncated) }
+            else if size > usize::MAX { e == KeyError::Length }
+            else if start+4+size > usize::MAX { e == KeyError::Field(ReadError::Overflow(size as usize)) }
+            else { e == KeyError::Field(ReadError::Truncated) }
         &&& out matches Ok(key) ==> *final(cursor) as int == start + 4 + size &&
             key@ == bytes@.subrange(start+4,start+4+size)
     }),

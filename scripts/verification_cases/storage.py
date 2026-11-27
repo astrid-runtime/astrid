@@ -620,3 +620,21 @@ def checkpoint_key_field_consumers():
             f"checkpoint key field loses {label}", path,
             lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker), consumer,
         )
+
+
+def checkpoint_child_consumers():
+    child = Path("crates/astrid-storage/src/kv/tree/checkpoint_child.rs")
+    reader = Path("crates/astrid-storage/src/kv/tree/checkpoint_key_field.rs")
+    for label, path, target, clause, weaker in [
+        ("fence", child, "child", "row.0@ == bytes@.subrange(start+4,summary)", "true"),
+        ("totals", child, "child", "crate::storage_fields::at(bytes@,summary,row.2.wire())", "true"),
+        ("owning target", child, "child", "refs@[index as int].fields() == (edge::wire(edge::Relation::Child,index),row.1,super::ReferenceKind::Owns)", "true"),
+        ("failure explanation", child, "child", "out matches Err(reason) ==> ({", "false ==> out matches Err(reason) ==> ({"),
+        ("failure cursor", reader, "key_field", "out.is_err() ==> *final(cursor) as int", "false ==> *final(cursor) as int"),
+        ("failure type", reader, "key_field", "out matches Err(e) ==> if start+4 > usize::MAX", "false ==> out matches Err(e) ==> if start+4 > usize::MAX"),
+    ]:
+        yield (
+            f"checkpoint branch binding loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker),
+            Path(f"verification/hosted_checkpoint_{target}.rs"),
+        )
