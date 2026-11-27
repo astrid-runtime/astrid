@@ -79,6 +79,7 @@ wasmtime::component::bindgen!({
         "astrid:io/streams.stream-error" => wasmtime_wasi::p2::StreamError,
     },
     imports: {
+        "astrid:io/streams.[method]output-stream.blocking-splice": async | trappable,
         "astrid:io/streams": trappable,
         // Resource exhaustion must reach the guest as a trap before a handle is returned.
         "astrid:http/host.[method]http-stream.subscribe-readable": trappable,
