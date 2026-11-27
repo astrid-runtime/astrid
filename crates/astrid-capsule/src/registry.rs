@@ -500,26 +500,21 @@ impl CapsuleRegistry {
             principal,
             &mut removed_principals,
         );
+        dependent_views::revoke_sources(
+            &mut self.uuid_map,
+            &mut self.source_uuid_by_runtime,
+            &mut self.uuid_id_map,
+            &runtime_id,
+            principal,
+            torn_down,
+        );
         if torn_down {
             if self.any_principal_with(id).is_none() {
                 self.unregister_capsule_uplinks(id);
             }
-            self.uuid_map
-                .retain(|_, mapped_runtime| mapped_runtime != &runtime_id);
-            if let Some(source_uuid) = self.source_uuid_by_runtime.remove(&runtime_id)
-                && !self
-                    .source_uuid_by_runtime
-                    .values()
-                    .any(|candidate| candidate == &source_uuid)
-            {
-                self.uuid_id_map.remove(&source_uuid);
-            }
             self.remove_legacy_uuid_mappings_if_unused(runtime_id.key().artifact());
             info!(capsule_id = %id, principal = %principal, generation = runtime_id.generation(), "Unregistered capsule runtime");
         } else {
-            if let Some(source_uuid) = self.source_uuid_by_runtime.get(&runtime_id) {
-                self.uuid_map.remove(&(*source_uuid, principal.clone()));
-            }
             info!(capsule_id = %id, principal = %principal, generation = runtime_id.generation(), "Unregistered system capsule view (runtime retained)");
         }
 

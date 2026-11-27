@@ -32,8 +32,35 @@ fn removing_system_owner_revokes_every_dependent_view() {
 
     let retiring_generation = registry.runtime_id_for(&owner, &id).unwrap();
     let retiring_handle = registry.get_for(&owner, &id).unwrap();
+    let departing_source = registry.source_id_for(&owner, &id).unwrap();
+    let surviving_source = registry.source_id_for(&alice, &sibling).unwrap();
+    for principal in [&owner, &alice, &bob] {
+        assert!(Arc::ptr_eq(
+            &registry
+                .find_instance_by_uuid_for(principal, &departing_source)
+                .unwrap(),
+            &retiring_handle,
+        ));
+    }
+    let detached = registry.unregister_for(&bob, &id).unwrap();
+    assert!(!detached.torn_down);
+    assert!(
+        registry
+            .find_instance_by_uuid_for(&bob, &departing_source)
+            .is_none()
+    );
+    assert!(Arc::ptr_eq(
+        &registry
+            .find_instance_by_uuid_for(&alice, &departing_source)
+            .unwrap(),
+        &retiring_handle,
+    ));
+    assert_eq!(registry.find_by_uuid(&departing_source), Some(&id));
+    registry.register_existing(&id, &artifact, &bob).unwrap();
     let removed = registry.unregister_for(&owner, &id).unwrap();
     assert!(removed.torn_down);
+    assert!(registry.find_by_uuid(&departing_source).is_none());
+    assert_eq!(registry.find_by_uuid(&surviving_source), Some(&sibling));
     assert!(!registry.instances.contains_key(&retiring_generation));
     assert!(Arc::ptr_eq(&removed.capsule, &retiring_handle));
     assert!(registry.get_for(&alice, &id).is_none());
@@ -43,8 +70,24 @@ fn removing_system_owner_revokes_every_dependent_view() {
         &registry.get_for(&alice, &sibling).unwrap(),
         &survivor
     ));
+    assert!(Arc::ptr_eq(
+        &registry
+            .find_instance_by_uuid_for(&alice, &surviving_source)
+            .unwrap(),
+        &survivor,
+    ));
     assert_eq!(removed.removed_principals.len(), 3);
     for principal in [&owner, &alice, &bob] {
         assert!(removed.removed_principals.contains(principal));
+        assert!(
+            !registry
+                .uuid_map
+                .contains_key(&(departing_source, principal.clone()))
+        );
+        assert!(
+            registry
+                .find_instance_by_uuid_for(principal, &departing_source)
+                .is_none()
+        );
     }
 }

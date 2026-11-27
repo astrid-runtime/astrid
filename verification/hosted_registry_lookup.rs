@@ -154,9 +154,11 @@ fn detach_with_peer<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
 // A system owner's departure may affect many packages in a peer's view. The
 // report names each affected peer once and retains every different generation.
 fn remove_system_owner<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
-    instances: &mut HashMap<Id,Entry<C,u64>>, owner: u64, package: u64)
+    instances: &mut HashMap<Id,Entry<C,u64>>, routes: &mut HashMap<(u64,u64),Id>, sources: &mut HashMap<Id,u64>, names: &mut HashMap<u64,u64>, owner: u64, package: u64)
     -> (out: (Arc<C>, bool, Vec<u64>))
     requires hash_map_inv(old(views)), hash_map_inv(old(instances)), obeys_key_model::<Id>(), obeys_concrete_eq::<Id>(),
+        hash_map_inv(old(routes)), hash_map_inv(old(sources)), hash_map_inv(old(names)),
+        obeys_key_model::<(u64,u64)>(), obeys_concrete_eq::<(u64,u64)>(), vstd::pervasive::obeys_clone_eq::<(u64,u64)>(),
         old(views)@.contains_key(owner), old(views)@[owner]@.dom() == set![package],
         forall|p:u64| old(views)@.contains_key(p) ==> hash_map_inv(&old(views)@[p]),
         old(views)@[owner]@[package].identity().0.2 is SystemResident,
@@ -168,6 +170,11 @@ fn remove_system_owner<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
         let id = before[owner]@[package];
         let report = out.2@;
         &&& out.0 == old(instances)@[id].capsule && out.1
+        &&& final(sources)@ == old(sources)@.remove(id)
+        &&& final(names)@ == if old(sources)@.contains_key(id) && !old(sources)@.remove(id).values().contains(old(sources)@[id]) {
+            old(names)@.remove(old(sources)@[id])
+        } else { old(names)@ }
+        &&& final(routes)@ == crate::dependent_views::kept(old(routes)@,id)
         &&& final(instances)@ == old(instances)@.remove(id)
         &&& report.len() > 0 && report[0] == owner && report.no_duplicates()
         &&& forall|p:u64| #[trigger] report.contains(p) == (before.contains_key(p) && before[p]@.values().contains(id))
@@ -183,6 +190,7 @@ fn remove_system_owner<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
     let mut report = Vec::new();
     report.push(owner);
     let tear_down = crate::dependent_views::depart(views,instances,&id,&owner,&mut report);
+    crate::dependent_views::revoke_sources(routes,sources,names,&id,&owner,tear_down);
     proof {
         let peers = report@.skip(1);
         assert(report@ == seq![owner] + peers);
@@ -225,17 +233,22 @@ fn remove_system_owner<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
 // Non-owner removal keeps a shared generation referenced by any remaining
 // package, preserving the entire view map and the caller's pending reports.
 fn retain_shared_generation<C: ?Sized>(instances: &mut HashMap<Id,Entry<C,u64>>, views: &mut HashMap<u64,HashMap<u64,Id>>, id: &Id,
-    operator: u64, departing: u64, peer: u64, package: u64, report: &mut Vec<u64>) -> (teardown: bool)
-    requires operator != departing, id.identity().0.2 is SystemResident,
+    routes: &mut HashMap<(u64,u64),Id>, sources: &mut HashMap<Id,u64>, names: &mut HashMap<u64,u64>, operator: u64, departing: u64, peer: u64, package: u64, report: &mut Vec<u64>) -> (teardown: bool)
+    requires hash_map_inv(old(routes)), hash_map_inv(old(sources)), hash_map_inv(old(names)),
+        obeys_key_model::<(u64,u64)>(), obeys_concrete_eq::<(u64,u64)>(), vstd::pervasive::obeys_clone_eq::<(u64,u64)>(), operator != departing, id.identity().0.2 is SystemResident,
         hash_map_inv(old(instances)), obeys_key_model::<Id>(), old(instances)@.contains_key(*id),
         old(instances)@[*id].owner_alias == Some(operator),
         hash_map_inv(old(views)), obeys_concrete_eq::<Id>(),
         forall|p:u64| old(views)@.contains_key(p) ==> hash_map_inv(&old(views)@[p]),
         old(views)@.contains_key(peer), old(views)@[peer]@.contains_key(package),
         old(views)@[peer]@[package] == *id,
-    ensures !teardown, final(instances)@ == old(instances)@, final(views)@ == old(views)@, final(report)@ == old(report)@,
+    ensures final(sources)@ == old(sources)@, final(names)@ == old(names)@,
+        final(routes)@ == if old(sources)@.contains_key(*id) { old(routes)@.remove((old(sources)@[*id],departing)) } else { old(routes)@ },
+        !teardown, final(instances)@ == old(instances)@, final(views)@ == old(views)@, final(report)@ == old(report)@,
 {
     assert(views@[peer]@.values().contains(*id));
-    crate::dependent_views::depart(views,instances,id,&departing,report)
+    let teardown = crate::dependent_views::depart(views,instances,id,&departing,report);
+    crate::dependent_views::revoke_sources(routes,sources,names,id,&departing,teardown);
+    teardown
 }
 }

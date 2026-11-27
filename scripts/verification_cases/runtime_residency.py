@@ -15,6 +15,24 @@ def defects():
             Path("verification/hosted_route_retirement.rs"),
         )
     sweep = Path("crates/astrid-capsule/src/registry/dependent_views.rs")
+    for name, clause in [
+        ("loses full-generation route removal", "tear_down ==> final(routes)@ == kept(old(routes)@,*runtime)"),
+        ("loses retained peer route preservation", "!tear_down ==> final(routes)@ == if old(sources)@.contains_key(*runtime)"),
+    ]:
+        yield (
+            f"scoped source departure {name}", sweep,
+            lambda s, a=clause: replace_once(s, a, a.replace("==>", "&& false ==>")),
+            Path("verification/hosted_registry_lookup.rs"),
+        )
+    for name, clause in [
+        ("can change the reverse runtime index", "final(sources)@ == if tear_down"),
+        ("can remove a shared public source name", "final(names)@ == if tear_down"),
+    ]:
+        yield (
+            f"scoped source departure {name}", sweep,
+            lambda s, a=clause: replace_once(s, a, "false ==> " + a),
+            Path("verification/hosted_registry_lookup.rs"),
+        )
     installed = "final(instances)@ == if tear_down { old(instances)@.remove(*runtime) } else { old(instances)@ }"
     for name, clause in [
         ("can forget to remove the selected generation", "tear_down || final(instances)@ == old(instances)@"),

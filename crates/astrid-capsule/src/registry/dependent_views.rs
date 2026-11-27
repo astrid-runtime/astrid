@@ -59,6 +59,40 @@ fn remove_generation<K: Eq + Hash + Clone,V: Eq>(view: &mut HashMap<K,V>, runtim
     !keys.is_empty()
 }
 
+/// Update the principal-scoped source routes under the same registry write lock.
+pub(super) fn revoke_sources<U: Eq + Hash + Copy,P: Eq + Hash + Clone,V: Eq + Hash,I>(
+    routes: &mut HashMap<(U,P),V>, sources: &mut HashMap<V,U>, names: &mut HashMap<U,I>, runtime: &V,
+    principal: &P, tear_down: bool)
+    requires hash_map_inv(old(routes)), hash_map_inv(old(sources)), hash_map_inv(old(names)),
+        obeys_key_model::<U>(), obeys_concrete_eq::<U>(), obeys_key_model::<V>(),
+        obeys_key_model::<(U,P)>(), obeys_concrete_eq::<V>(), obeys_concrete_eq::<(U,P)>(),
+        obeys_clone_eq::<P>(), obeys_clone_eq::<(U,P)>(),
+    ensures hash_map_inv(final(routes)), hash_map_inv(final(sources)), hash_map_inv(final(names)),
+        final(sources)@ == if tear_down { old(sources)@.remove(*runtime) } else { old(sources)@ },
+        final(names)@ == if tear_down && old(sources)@.contains_key(*runtime) &&
+            !old(sources)@.remove(*runtime).values().contains(old(sources)@[*runtime]) {
+            old(names)@.remove(old(sources)@[*runtime])
+        } else { old(names)@ },
+        tear_down ==> final(routes)@ == kept(old(routes)@,*runtime),
+        !tear_down ==> final(routes)@ == if old(sources)@.contains_key(*runtime) {
+            old(routes)@.remove((old(sources)@[*runtime],*principal))
+        } else { old(routes)@ },
+{
+    if tear_down {
+        remove_generation(routes,runtime);
+        if let Some(source) = sources.remove(runtime) {
+            if !super::viewers::attached(sources,&source) {
+                names.remove(&source);
+            }
+        }
+    } else if let Some(source) = sources.get(runtime) {
+        proof { reveal(obeys_clone_eq); }
+        let departing = principal.clone();
+        assert(vstd::pervasive::cloned(*principal,departing));
+        routes.remove(&(*source,departing));
+    }
+}
+
 pub(super) open spec fn kept<K,V>(view: Map<K,V>, runtime: V) -> Map<K,V> {
     view.restrict(view.dom().filter(|k:K| view[k] != runtime))
 }
