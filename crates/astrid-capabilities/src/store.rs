@@ -513,6 +513,16 @@ impl CapabilityStore {
         self.retiring_principals.write().await.insert(principal);
     }
 
+    /// Restore a retirement fence while this store is exclusively owned.
+    ///
+    /// Startup calls this before wrapping the store in `Arc` or handing it to
+    /// MCP. `get_mut` borrows the set without an async lock, so the directory
+    /// recovery callback can update it synchronously. It is not a substitute
+    /// for [`Self::begin_principal_retirement`] once other tasks can admit tokens.
+    pub fn restore_principal_retirement(&mut self, principal: PrincipalId) {
+        self.retiring_principals.get_mut().insert(principal);
+    }
+
     /// Return whether new authority for `principal` is currently fenced.
     ///
     /// Lifecycle code uses this at other admission edges, such as capsule

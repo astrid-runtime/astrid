@@ -131,6 +131,18 @@ impl OwnershipSnapshot {
         self.principal_deletions.contains_key(&uid)
     }
 
+    /// Durable deletions in stable UID order, with the alias retained at reservation.
+    ///
+    /// `None` means the reservation recorded no alias. Startup pairs that with the
+    /// live directory under one read guard; this iterator does not observe the directory.
+    pub(crate) fn pending_retirement_targets(
+        &self,
+    ) -> impl Iterator<Item = (PrincipalUid, Option<&PrincipalId>)> {
+        self.principal_deletions
+            .iter()
+            .map(|(uid, reservation)| (*uid, reservation.alias.as_ref()))
+    }
+
     /// Iterate over users in stable UID order.
     pub fn users(&self) -> impl Iterator<Item = &UserIdentity> {
         self.users.values()

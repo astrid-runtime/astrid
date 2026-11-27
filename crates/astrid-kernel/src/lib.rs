@@ -86,6 +86,10 @@ mod shutdown;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod user_resources;
 pub use native_input::native_input_device_is_live;
+/// Restore admission fences for durable retirement before startup shares authority.
+mod authority_recovery;
+#[cfg(test)]
+mod authority_recovery_tests;
 /// Deterministic CLI-root user/fleet bootstrap and unowned-principal upgrade.
 mod ownership_bootstrap;
 /// Persistent pair-device token store (issue #756).
@@ -1002,35 +1006,10 @@ impl Kernel {
 
         // Bootstrap the capability store (persistent) over the injected KV.
         // Key rotation invalidates persisted tokens (fail-secure by design).
-        let capabilities = Arc::new(
-            CapabilityStore::with_kv_store(Arc::clone(&kv))
-                .await
-                .map_err(|e| {
-                    std::io::Error::other(format!("Failed to init capability store: {e}"))
-                })?,
-        );
-
-        // Initialize the MCP process manager with its security layer. Native
-        // only — the MCP host surface belongs to the Wasmtime engine, which the
-        // browser profile does not build. `workspace_root` is set so sandboxed
-        // MCP servers have a writable directory.
-        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let mcp = {
-            let mcp_config = ServersConfig::load_default().unwrap_or_default();
-            let mcp_manager = ServerManager::new(mcp_config)
-                .with_workspace_root(workspace_root.clone())
-                // MCP is a system service, not a principal-home projection.
-                // Keep native operational logs under the top-level log tree
-                // so boot never recreates `home/<alias>/.local/log`.
-                .with_capsule_log_dir(home.log_dir().join("system").join("mcp"));
-            let mcp_client = McpClient::new(mcp_manager);
-            SecureMcpClient::new(
-                mcp_client,
-                Arc::clone(&capabilities),
-                Arc::clone(&audit_log),
-                session_id.clone(),
-            )
-        };
+        // Keep it exclusively owned until retirement fences are restored.
+        let capabilities = CapabilityStore::with_kv_store(Arc::clone(&kv))
+            .await
+            .map_err(|e| std::io::Error::other(format!("Failed to init capability store: {e}")))?;
 
         // Establish the physical security boundary (sandbox handle).
         let root_handle = DirHandle::new();
@@ -1056,7 +1035,6 @@ impl Kernel {
             root_handle.clone(),
         ));
 
-        let allowance_store = Arc::new(astrid_approval::AllowanceStore::new());
         // Create system-wide identity store backed by the shared KV.
         let identity_kv = astrid_storage::ScopedKvStore::new(Arc::clone(&kv), "system:identity")
             .map_err(|e| std::io::Error::other(format!("Failed to create identity KV: {e}")))?;
@@ -1079,9 +1057,39 @@ impl Kernel {
                     std::io::Error::other(format!("Failed to create ownership store: {error}"))
                 })?,
         );
-        ownership_store.load().await.map_err(|error| {
+        let ownership = ownership_store.load().await.map_err(|error| {
             std::io::Error::other(format!("Failed to load ownership graph: {error}"))
         })?;
+        // Missing ownership data decodes to the default snapshot, so a fresh
+        // home replays no fences. Install fences before either store is shared.
+        let (capabilities, allowance_store) = authority_recovery::restore_retirement_fences(
+            &ownership,
+            &principal_directory,
+            capabilities,
+            astrid_approval::AllowanceStore::new(),
+        )?;
+
+        // Initialize the MCP process manager with its security layer. Native
+        // only — the MCP host surface belongs to the Wasmtime engine, which the
+        // browser profile does not build. `workspace_root` is set so sandboxed
+        // MCP servers have a writable directory.
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let mcp = {
+            let mcp_config = ServersConfig::load_default().unwrap_or_default();
+            let mcp_manager = ServerManager::new(mcp_config)
+                .with_workspace_root(workspace_root.clone())
+                // MCP is a system service, not a principal-home projection.
+                // Keep native operational logs under the top-level log tree
+                // so boot never recreates `home/<alias>/.local/log`.
+                .with_capsule_log_dir(home.log_dir().join("system").join("mcp"));
+            let mcp_client = McpClient::new(mcp_manager);
+            SecureMcpClient::new(
+                mcp_client,
+                Arc::clone(&capabilities),
+                Arc::clone(&audit_log),
+                session_id.clone(),
+            )
+        };
 
         // Load group config (issue #670). Boot-loaded once, then swapped
         // atomically by Layer 6 admin topics (issue #672). Missing file
@@ -3333,11 +3341,9 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
     // A test helper opening the legacy import source directly would let kernel
     // tests pass against a runtime topology that production cannot select.
     let (kv, principal_directory, principal_store) = open_test_runtime_kv(&home).await;
-    let capabilities = Arc::new(
-        CapabilityStore::with_kv_store(Arc::clone(&kv))
-            .await
-            .expect("test kernel: capability store"),
-    );
+    let capabilities = CapabilityStore::with_kv_store(Arc::clone(&kv))
+        .await
+        .expect("test kernel: capability store");
 
     // Audit log uses the same system-owned principal-store projection as
     // production; no principal-home directory is authoritative.
@@ -3371,8 +3377,21 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         seed_test_migration_ledger(&home);
     }
 
+    let ownership = ownership_store
+        .load()
+        .await
+        .expect("test kernel: ownership snapshot");
+    let (capabilities, allowance_store) = authority_recovery::restore_retirement_fences(
+        &ownership,
+        &principal_directory,
+        capabilities,
+        astrid_approval::AllowanceStore::new(),
+    )
+    .expect("test kernel: restore retirement fences");
+
     // MCP: use a no-op secure client wrapped around an empty manager.
-    // Admin handlers do not touch MCP.
+    // Admin handlers do not touch MCP. Fences are installed before it receives
+    // the capability store.
     let mcp_manager = ServerManager::new(ServersConfig::default());
     let mcp_client = McpClient::new(mcp_manager);
     let mcp = SecureMcpClient::new(
@@ -3392,8 +3411,6 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         home.root().to_path_buf(),
         root_handle.clone(),
     ));
-
-    let allowance_store = Arc::new(astrid_approval::AllowanceStore::new());
 
     let groups = Arc::new(ArcSwap::from_pointee(
         GroupConfig::load(&home).expect("test kernel: load groups"),
