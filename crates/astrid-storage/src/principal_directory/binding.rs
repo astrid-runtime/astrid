@@ -29,4 +29,17 @@ pub(super) fn matches_pair(
     true
 }
 
+/// Supply the original operand only under a matching forward and reverse binding.
+pub(super) fn with_pair<T,R,F:FnOnce(T)->R>(
+    alias: &[u8], uid: &[u8; 32], forward: Option<&[u8; 32]>, reverse: Option<&[u8]>,
+    input: T, operation: F,
+) -> (out: Result<R,T>)
+    requires operation.requires((input,)),
+    ensures if (forward matches Some(f) && f@ == uid@) && (reverse matches Some(r) && r@ == alias@) {
+        out matches Ok(value) && operation.ensures((input,),value)
+    } else { out == Err(input) },
+{
+    if matches_pair(alias,uid,forward,reverse) { Ok(operation(input)) } else { Err(input) }
+}
+
 }

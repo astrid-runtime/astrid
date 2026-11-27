@@ -9,6 +9,28 @@ from .common import (
 
 def consumer_defects():
     """Weaken a production guarantee and require its trace consumer to fail."""
+    splice = Path("crates/astrid-capsule/src/engine/wasm/host/io/splice.rs")
+    splice_trace = Path("verification/hosted_io_splice.rs")
+    for name, original, changed in [
+        ("loses source or destination", "operation.args() == self && check.ensures", "operation.args().mode == self.mode && check.ensures"),
+        ("loses retained admission", "check.ensures((self,), Ok(operation.authority()))", "true"),
+        ("loses the refusal", "Err(error) => check.ensures((self,), Err(error))", "Err(error) => true"),
+        ("loses selected transfer", "out matches Some(value) && sink.ensures((&self.authority(), table, r), value)", "out.is_some()"),
+        ("allows a mode substitution", "} else { out.is_none() }", "} else { true }"),
+    ]:
+        yield (
+            f"I/O splice {name}", splice,
+            lambda s, a=original, b=changed: replace_once(s, a, b), splice_trace,
+        )
+    binding = Path("crates/astrid-storage/src/principal_directory/binding.rs")
+    for name, original, changed in [
+        ("loses allowed operands", "out matches Ok(value) && operation.ensures((input,),value)", "out.is_ok()"),
+        ("loses refused operands", "else { out == Err(input) }", "else { out.is_err() }"),
+    ]:
+        yield (
+            f"I/O splice {name}", binding,
+            lambda s, a=original, b=changed: replace_once(s, a, b), splice_trace,
+        )
     pool = Path("crates/astrid-capsule/src/engine/wasm/pool/return_policy.rs")
     pool_trace = Path("verification/hosted_pool_return.rs")
     for name, original, changed in [

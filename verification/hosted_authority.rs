@@ -266,3 +266,7 @@ mod registered_bearer;
 #[path = "../crates/astrid-capsule/src/engine/wasm/pool/return_policy.rs"]
 mod pool_return;
 mod hosted_pool_return;
+
+#[path = "../crates/astrid-capsule/src/engine/wasm/host/io/splice.rs"]
+mod io_splice;
+mod hosted_io_splice;
