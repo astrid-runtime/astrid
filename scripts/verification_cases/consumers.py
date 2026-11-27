@@ -31,6 +31,14 @@ def consumer_defects():
             f"I/O splice {name}", binding,
             lambda s, a=original, b=changed: replace_once(s, a, b), splice_trace,
         )
+    for name, original, changed in [
+        ("uses the observed UID as its own authority", "with_pair(guard.0,guard.1,forward", "with_pair(guard.0,forward.unwrap_or(guard.1),forward"),
+        ("sends source in place of destination", "(t,r.destination,r.source,r.length),", "(t,r.source,r.source,r.length),"),
+    ]:
+        yield (
+            f"rebound splice {name}", splice_trace,
+            lambda s, a=original, b=changed: replace_once(s, a, b), splice_trace,
+        )
     pool = Path("crates/astrid-capsule/src/engine/wasm/pool/return_policy.rs")
     pool_trace = Path("verification/hosted_pool_return.rs")
     for name, original, changed in [
