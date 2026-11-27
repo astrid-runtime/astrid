@@ -207,17 +207,22 @@ impl PrincipalDirectory {
             })
     }
 
-    /// Select the retained and distinct live aliases of a pending deletion at startup.
-    /// Both names reflect one directory observation before the returned iterator is consumed.
+    /// Visit the retirement targets of a loaded ownership snapshot under one directory read guard.
+    /// Consume synchronously at startup. Directory writers wait until the iterator is dropped.
+    /// The consumer must not re-enter the directory.
     #[must_use = "consume the aliases to restore their retirement fences"]
-    pub fn retirement_aliases(
-        &self,
-        uid: PrincipalUid,
-        retained: Option<PrincipalId>,
-    ) -> impl Iterator<Item = PrincipalId> {
-        binding::recovery_aliases(&self.inner.read().principals, &uid, retained)
-            .into_iter()
-            .flatten()
+    pub fn pending_retirement_aliases<'a>(
+        &'a self,
+        ownership: &'a crate::OwnershipSnapshot,
+    ) -> impl Iterator<Item = PrincipalId> + 'a {
+        let state = self.inner.read();
+        ownership
+            .pending_principal_deletions()
+            .flat_map(move |(uid, retained)| {
+                binding::recovery_aliases(&state.principals, &uid, retained.cloned())
+                    .into_iter()
+                    .flatten()
+            })
     }
 
     /// Whether a durable UID currently names an admitted live principal.

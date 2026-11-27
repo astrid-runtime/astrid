@@ -15,13 +15,11 @@ pub(super) fn restore_retirement_fences(
     mut capabilities: CapabilityStore,
     allowances: AllowanceStore,
 ) -> std::io::Result<(Arc<CapabilityStore>, Arc<AllowanceStore>)> {
-    for (uid, retained_alias) in ownership.pending_principal_deletions() {
-        for alias in principals.retirement_aliases(uid, retained_alias.cloned()) {
-            capabilities.restore_principal_retirement(alias.clone());
-            allowances
-                .begin_principal_retirement(&alias)
-                .map_err(std::io::Error::other)?;
-        }
+    for alias in principals.pending_retirement_aliases(ownership) {
+        capabilities.restore_principal_retirement(alias.clone());
+        allowances
+            .begin_principal_retirement(&alias)
+            .map_err(std::io::Error::other)?;
     }
     Ok((Arc::new(capabilities), Arc::new(allowances)))
 }

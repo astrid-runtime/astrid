@@ -208,3 +208,24 @@ fn batch_membership_yields_to_pending_writers_before_completing() {
     writer.join().unwrap();
     progressed.expect("a pending writer must progress before the batch finishes");
 }
+
+#[test]
+fn recovery_observes_one_directory_across_reservations() {
+    let directory = PrincipalDirectory::default();
+    let first = uid(1);
+    let second = uid(2);
+    directory.register(alias("first"), first).unwrap();
+    directory.register(alias("second"), second).unwrap();
+    let mut stored = serde_json::to_value(crate::OwnershipSnapshot::default()).unwrap();
+    stored["principal_deletions"] =
+        serde_json::json!({ first.to_string(): {}, second.to_string(): {} });
+    let ownership = serde_json::from_value(stored).unwrap();
+
+    let mut targets = directory.pending_retirement_aliases(&ownership);
+    assert_eq!(targets.next(), Some(alias("first")));
+    assert!(directory.inner.try_write().is_none());
+    assert_eq!(targets.next(), Some(alias("second")));
+    assert_eq!(targets.next(), None);
+    drop(targets);
+    assert!(directory.inner.try_write().is_some());
+}
