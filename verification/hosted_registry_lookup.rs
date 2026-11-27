@@ -355,10 +355,12 @@ fn replace_source_indexes(sources: &mut HashMap<Id,u64>, names: &mut HashMap<u64
 
 // Replace a live runtime and resolve the viewer from its pre-restart package slot.
 fn route_replacement<C: ?Sized>(instances: &mut HashMap<Id,Entry<C,u64>>,
-    routes: &mut HashMap<(u64,u64),Id>, views: &mut HashMap<u64,HashMap<u64,Id>>, aliases: &HashMap<u64,[u8;32]>,
+    routes: &mut HashMap<(u64,u64),Id>, views: &mut HashMap<u64,HashMap<u64,Id>>, aliases: &mut HashMap<u64,[u8;32]>,
+    sources: &mut HashMap<Id,u64>, names: &mut HashMap<u64,u64>, owner_alias: Option<u64>,
     expected: Id, reserved: Id, replacement: Arc<C>, source:u64, viewer:u64, package:u64, outsider:u64)
     -> (out:Option<(Arc<C>,Arc<C>)>)
-    requires hash_map_inv(old(instances)), hash_map_inv(old(routes)), hash_map_inv(old(views)), hash_map_inv(aliases),
+    requires hash_map_inv(old(instances)), hash_map_inv(old(routes)), hash_map_inv(old(views)), hash_map_inv(old(aliases)),
+        hash_map_inv(old(sources)), hash_map_inv(old(names)),
         obeys_key_model::<Id>(), obeys_concrete_eq::<Id>(), vstd::pervasive::obeys_clone_eq::<Id>(),
         obeys_key_model::<(u64,u64)>(), obeys_concrete_eq::<(u64,u64)>(), obeys_concrete_eq::<[u8;32]>(),
         vstd::pervasive::obeys_clone_eq::<(u64,u64)>(),
@@ -367,20 +369,24 @@ fn route_replacement<C: ?Sized>(instances: &mut HashMap<Id,Entry<C,u64>>,
         old(views)@.contains_key(outsider) ==> !old(views)@[outsider]@.values().contains(reserved) &&
             !old(views)@[outsider]@.values().contains(expected),
     ensures if old(instances)@.contains_key(expected) {
-        &&& final(instances)@ == old(instances)@.remove(expected).insert(reserved,Entry { capsule:replacement, owner_alias:None })
+        &&& final(instances)@ == old(instances)@.remove(expected).insert(reserved,Entry { capsule:replacement, owner_alias })
+        &&& final(sources)@ == old(sources)@.remove(expected).insert(reserved,source)
+        &&& final(names)@.contains_key(source) && final(names)@[source] == reserved.identity().0.0
+        &&& final(aliases)@ == if exists|id:Id| final(instances)@.contains_key(id) && id.identity().0.1 == expected.identity().0.1 {
+            old(aliases)@
+        } else { crate::dependent_views::kept(old(aliases)@,expected.identity().0.1) }
         &&& out == Some((old(instances)@[expected].capsule,replacement))
         &&& final(routes)@.contains_key((source,viewer)) && final(routes)@[(source,viewer)] == reserved
         &&& final(routes)@.contains_key((source,outsider)) == (old(routes)@.contains_key((source,outsider)) && old(routes)@[(source,outsider)] != expected)
         &&& final(routes)@.contains_key((source,outsider)) ==> final(routes)@[(source,outsider)] == old(routes)@[(source,outsider)]
-    } else { out.is_none() && final(views)@ == old(views)@ && final(routes)@ == old(routes)@ && final(instances)@ == old(instances)@ },
+    } else { out.is_none() && final(aliases)@ == old(aliases)@ && final(names)@ == old(names)@ &&
+        final(sources)@ == old(sources)@ && final(views)@ == old(views)@ && final(routes)@ == old(routes)@ && final(instances)@ == old(instances)@ },
 {
-    proof { reveal(vstd::pervasive::obeys_clone_eq); }
-    let installed_key = reserved.clone();
-    assert(vstd::pervasive::cloned(reserved,installed_key));
-    assert(installed_key == reserved);
-    let old_handle = crate::instance_swap::replace(instances,&expected,installed_key,replacement,None)?;
     let ghost before = views@;
-    crate::registration::replace_viewer_routes(views,routes,source,&expected,&reserved);
+    let publication = crate::generation_replacement::Replacement {
+        expected:&expected, reserved:&reserved, source, entry:Entry {capsule:replacement,owner_alias}
+    };
+    let old_handle = publication.apply(instances,views,routes,sources,names,aliases)?;
     assert(views@[viewer]@[package] == reserved);
     assert(views@[viewer]@.values().contains(reserved));
     proof { if views@.contains_key(outsider) && views@[outsider]@.values().contains(reserved) {

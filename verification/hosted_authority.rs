@@ -295,6 +295,8 @@ use runtime_scope::RuntimeScope;
 #[path = "../crates/astrid-capsule/src/registry/generation.rs"]
 mod runtime_generation;
 use runtime_generation as generation;
+#[path = "../crates/astrid-capsule/src/registry/generation_replacement.rs"]
+mod generation_replacement;
 #[path = "../crates/astrid-capsule/src/registry/instance_swap.rs"]
 mod instance_swap;
 #[path = "../crates/astrid-capsule/src/registry/source_lookup.rs"]

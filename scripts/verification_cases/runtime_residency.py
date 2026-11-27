@@ -110,6 +110,20 @@ def defects():
             lambda s, a=original, b=weakened: replace_once(s, a, b),
             registration,
         )
+    replacement = Path("crates/astrid-capsule/src/registry/generation_replacement.rs")
+    for name, clause in [
+        ("loses the retired handle", "previous == Some(old(instances)@[retired].capsule)"),
+        ("loses the installed generation", "final(instances)@ == old(instances)@.remove(retired).insert(next,self.entry)"),
+        ("loses reverse provenance", "final(sources)@ == reverse.insert(next,self.source)"),
+        ("loses the public package", "final(names)@ == retained_names.insert(self.source,next.identity().0.0)"),
+        ("loses legacy alias retirement", "final(aliases)@ == if exists|id:Id<K,A>|"),
+        ("can change aliases when stale", "final(aliases)@ == old(aliases)@"),
+    ]:
+        yield (
+            f"production replacement {name}", replacement,
+            lambda s, a=clause: replace_once(s, a, "true" if "if exists" not in a else "false ==> " + a),
+            Path("verification/hosted_registry_lookup.rs"),
+        )
     route_domain = "final(routes)@.contains_key(key) ==\n            ((old(routes)"
     route_value = "forall|key:(U,P)| final(routes)@.contains_key(key) ==> #[trigger] final(routes)@[key] ==\n            if key.0 == source && final(views)@"
     for name, clause, weakened in [
@@ -119,7 +133,7 @@ def defects():
         yield (
             f"replacement transition {name}", registration,
             lambda s, a=clause, b=weakened: replace_once(s, a, b),
-            Path("verification/hosted_registry_lookup.rs"),
+            replacement,
         )
     viewers = Path("crates/astrid-capsule/src/registry/viewers.rs")
     for name, original, weakened in [

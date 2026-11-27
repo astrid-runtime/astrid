@@ -56,6 +56,7 @@ fn system_uplink_descriptors(capsule: &dyn Capsule) -> CapsuleResult<Vec<UplinkD
 }
 
 mod dependent_views;
+mod generation_replacement;
 mod instance_swap;
 mod registration;
 mod source_lookup;

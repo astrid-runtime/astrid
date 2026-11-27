@@ -198,36 +198,25 @@ impl CapsuleRegistry {
         replacement: Box<dyn Capsule>,
         owner_alias: Option<PrincipalId>,
     ) -> CapsuleResult<ReplacedRuntime> {
-        let previous_artifact = expected.key().artifact().clone();
-        let previous = super::instance_swap::replace(
-            &mut self.instances,
+        let replacement = super::generation_replacement::Replacement {
             expected,
-            runtime_id.clone(),
-            Arc::from(replacement),
-            owner_alias,
-        )
-        .ok_or_else(|| CapsuleError::NotFound(format!("runtime {expected:?}")))?;
-        super::dependent_views::withdraw_source(
-            &mut self.source_uuid_by_runtime,
-            &mut self.uuid_id_map,
-            expected,
-        );
-        let source_uuid =
-            capsule_source_uuid(runtime_id.key().capsule_id(), runtime_id.key().artifact());
-        super::registration::replace_viewer_routes(
-            &mut self.views,
-            &mut self.uuid_map,
-            source_uuid,
-            expected,
-            &runtime_id,
-        );
-        super::registration::record_source(
-            &mut self.source_uuid_by_runtime,
-            &mut self.uuid_id_map,
-            &runtime_id,
-            source_uuid,
-        );
-        self.remove_legacy_uuid_mappings_if_unused(&previous_artifact);
+            reserved: &runtime_id,
+            source: capsule_source_uuid(runtime_id.key().capsule_id(), runtime_id.key().artifact()),
+            entry: super::instance_swap::Entry {
+                capsule: Arc::from(replacement),
+                owner_alias,
+            },
+        };
+        let previous = replacement
+            .apply(
+                &mut self.instances,
+                &mut self.views,
+                &mut self.uuid_map,
+                &mut self.source_uuid_by_runtime,
+                &mut self.uuid_id_map,
+                &mut self.legacy_uuid_map,
+            )
+            .ok_or_else(|| CapsuleError::NotFound(format!("runtime {expected:?}")))?;
         Ok(ReplacedRuntime {
             runtime_id,
             previous,
