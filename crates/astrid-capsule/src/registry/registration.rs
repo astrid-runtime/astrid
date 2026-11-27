@@ -156,4 +156,27 @@ pub(super) fn publish_viewer_routes<P: Eq + Hash + Clone,K: Eq + Hash,U: Eq + Ha
     }
 }
 
+
+/// Retarget views, withdraw all scoped routes to the retired identity and publish to current viewers.
+pub(super) fn replace_viewer_routes<P: Eq + Hash + Clone,K: Eq + Hash + Clone,U: Eq + Hash + Copy,V: Eq + Clone>(
+    views: &mut HashMap<P,HashMap<K,V>>, routes: &mut HashMap<(U,P),V>, source: U, retired: &V, replacement: &V)
+    requires hash_map_inv(old(views)), hash_map_inv(old(routes)), obeys_key_model::<P>(), obeys_concrete_eq::<P>(),
+        obeys_key_model::<K>(), obeys_concrete_eq::<K>(), obeys_key_model::<(U,P)>(), obeys_concrete_eq::<(U,P)>(),
+        obeys_concrete_eq::<V>(), obeys_clone_eq::<V>(), obeys_clone_eq::<P>(), obeys_clone_eq::<K>(), obeys_clone_eq::<(U,P)>(),
+        forall|p:P| old(views)@.contains_key(p) ==> hash_map_inv(&old(views)@[p]),
+    ensures hash_map_inv(final(views)), hash_map_inv(final(routes)), final(views)@.dom() == old(views)@.dom(),
+        forall|p:P| final(views)@.contains_key(p) ==> hash_map_inv(&final(views)@[p]) &&
+            super::instance_swap::retargeted(old(views)@[p]@,(#[trigger] final(views)@[p])@,*retired,*replacement),
+        forall|key:(U,P)| #[trigger] final(routes)@.contains_key(key) ==
+            ((old(routes)@.contains_key(key) && old(routes)@[key] != *retired) ||
+            (key.0 == source && final(views)@.contains_key(key.1) && final(views)@[key.1]@.values().contains(*replacement))),
+        forall|key:(U,P)| final(routes)@.contains_key(key) ==> #[trigger] final(routes)@[key] ==
+            if key.0 == source && final(views)@.contains_key(key.1) && final(views)@[key.1]@.values().contains(*replacement) {
+                *replacement
+            } else { old(routes)@[key] },
+{
+    super::instance_swap::retarget_views(views,retired,replacement);
+    super::dependent_views::remove_generation(routes,retired);
+    publish_viewer_routes(views,routes,source,replacement);
+}
 }

@@ -207,13 +207,6 @@ impl CapsuleRegistry {
             owner_alias,
         )
         .ok_or_else(|| CapsuleError::NotFound(format!("runtime {expected:?}")))?;
-        for view in self.views.values_mut() {
-            for mapped in view.values_mut() {
-                super::instance_swap::retarget(mapped, expected, &runtime_id);
-            }
-        }
-        self.uuid_map
-            .retain(|_, mapped_runtime| mapped_runtime != expected);
         super::dependent_views::withdraw_source(
             &mut self.source_uuid_by_runtime,
             &mut self.uuid_id_map,
@@ -221,10 +214,11 @@ impl CapsuleRegistry {
         );
         let source_uuid =
             capsule_source_uuid(runtime_id.key().capsule_id(), runtime_id.key().artifact());
-        super::registration::publish_viewer_routes(
-            &self.views,
+        super::registration::replace_viewer_routes(
+            &mut self.views,
             &mut self.uuid_map,
             source_uuid,
+            expected,
             &runtime_id,
         );
         super::registration::record_source(

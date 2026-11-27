@@ -102,12 +102,23 @@ def defects():
             Path("verification/hosted_registry_lookup.rs"),
         )
     for name, original, weakened in [
-        ("loses route membership", "forall|key:(U,P)| #[trigger] final(routes)@.contains_key(key) ==", "forall|key:(U,P)| #[trigger] final(routes)@.contains_key(key) ==>"),
-        ("loses route values", "forall|key:(U,P)| final(routes)@.contains_key(key) ==> #[trigger] final(routes)@[key] ==", "forall|key:(U,P)| false && final(routes)@.contains_key(key) ==> #[trigger] final(routes)@[key] =="),
+        ("loses route membership", "forall|key:(U,P)| #[trigger] final(routes)@.contains_key(key) == (old(routes)", "forall|key:(U,P)| #[trigger] final(routes)@.contains_key(key) ==> (old(routes)"),
+        ("loses route values", "forall|key:(U,P)| final(routes)@.contains_key(key) ==> #[trigger] final(routes)@[key] ==\n            if key.0 == source && views@", "forall|key:(U,P)| false && final(routes)@.contains_key(key) ==> #[trigger] final(routes)@[key] ==\n            if key.0 == source && views@"),
     ]:
         yield (
             f"replacement source {name}", Path("crates/astrid-capsule/src/registry/registration.rs"),
             lambda s, a=original, b=weakened: replace_once(s, a, b),
+            registration,
+        )
+    route_domain = "final(routes)@.contains_key(key) ==\n            ((old(routes)"
+    route_value = "forall|key:(U,P)| final(routes)@.contains_key(key) ==> #[trigger] final(routes)@[key] ==\n            if key.0 == source && final(views)@"
+    for name, clause, weakened in [
+        ("loses scoped membership", route_domain, route_domain.replace(" ==", " ==>")),
+        ("loses scoped values", route_value, route_value.replace(" ==> ", " && false ==> ")),
+    ]:
+        yield (
+            f"replacement transition {name}", registration,
+            lambda s, a=clause, b=weakened: replace_once(s, a, b),
             Path("verification/hosted_registry_lookup.rs"),
         )
     viewers = Path("crates/astrid-capsule/src/registry/viewers.rs")
@@ -212,6 +223,16 @@ def defects():
             Path("verification/hosted_runtime_residency.rs"),
         )
     swap = Path("crates/astrid-capsule/src/registry/instance_swap.rs")
+    slot_values = "forall|k:K| final(view)@.contains_key(k) ==> #[trigger] final(view)@[k] =="
+    row_values = "retargeted(old(views)@[p]@,(#[trigger] final(views)@[p])@,*expected,*reserved)"
+    for name, clause, weaker, consumer in [
+        ("loses the package slot value", slot_values, slot_values.replace(" ==> ", " && false ==> "), swap),
+        ("loses the principal row values", row_values, "false ==> " + row_values, registration),
+    ]:
+        yield (
+            f"replacement transition {name}", swap,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), consumer,
+        )
     for name, original, weaker in [
         ("can rewrite an unrelated view", "ensures *final(slot) == if *old(slot) == *expected { *reserved } else { *old(slot) }", "ensures *old(slot) == *expected ==> *final(slot) == *reserved"),
         ("loses retired handle", "out == Some(before[*expected].capsule)", "out.is_some()"),

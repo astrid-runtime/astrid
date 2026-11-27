@@ -353,31 +353,42 @@ fn replace_source_indexes(sources: &mut HashMap<Id,u64>, names: &mut HashMap<u64
     crate::registration::record_source(sources,names,replacement,new_source);
 }
 
-// The view snapshot is the one after retargeting. Broadcast source routes from
-// that state and resolve one viewer, while conserving an arbitrary non-viewer's route.
+// Replace a live runtime and resolve the viewer from its pre-restart package slot.
 fn route_replacement<C: ?Sized>(instances: &mut HashMap<Id,Entry<C,u64>>,
-    routes: &mut HashMap<(u64,u64),Id>, views: &HashMap<u64,HashMap<u64,Id>>, aliases: &HashMap<u64,[u8;32]>,
-    expected: Id, reserved: Id, replacement: Arc<C>, source:u64, viewer:u64, outsider:u64)
+    routes: &mut HashMap<(u64,u64),Id>, views: &mut HashMap<u64,HashMap<u64,Id>>, aliases: &HashMap<u64,[u8;32]>,
+    expected: Id, reserved: Id, replacement: Arc<C>, source:u64, viewer:u64, package:u64, outsider:u64)
     -> (out:Option<(Arc<C>,Arc<C>)>)
-    requires hash_map_inv(old(instances)), hash_map_inv(old(routes)), hash_map_inv(views), hash_map_inv(aliases),
+    requires hash_map_inv(old(instances)), hash_map_inv(old(routes)), hash_map_inv(old(views)), hash_map_inv(aliases),
         obeys_key_model::<Id>(), obeys_concrete_eq::<Id>(), vstd::pervasive::obeys_clone_eq::<Id>(),
         obeys_key_model::<(u64,u64)>(), obeys_concrete_eq::<(u64,u64)>(), obeys_concrete_eq::<[u8;32]>(),
-        forall|p:u64| views@.contains_key(p) ==> hash_map_inv(&views@[p]),
-        views@.contains_key(viewer) && views@[viewer]@.values().contains(reserved),
-        !(views@.contains_key(outsider) && views@[outsider]@.values().contains(reserved)),
+        vstd::pervasive::obeys_clone_eq::<(u64,u64)>(),
+        forall|p:u64| old(views)@.contains_key(p) ==> hash_map_inv(&old(views)@[p]),
+        old(views)@.contains_key(viewer) && old(views)@[viewer]@.contains_key(package) && old(views)@[viewer]@[package] == expected,
+        old(views)@.contains_key(outsider) ==> !old(views)@[outsider]@.values().contains(reserved) &&
+            !old(views)@[outsider]@.values().contains(expected),
     ensures if old(instances)@.contains_key(expected) {
+        &&& final(instances)@ == old(instances)@.remove(expected).insert(reserved,Entry { capsule:replacement, owner_alias:None })
         &&& out == Some((old(instances)@[expected].capsule,replacement))
         &&& final(routes)@.contains_key((source,viewer)) && final(routes)@[(source,viewer)] == reserved
-        &&& final(routes)@.contains_key((source,outsider)) == old(routes)@.contains_key((source,outsider))
+        &&& final(routes)@.contains_key((source,outsider)) == (old(routes)@.contains_key((source,outsider)) && old(routes)@[(source,outsider)] != expected)
         &&& final(routes)@.contains_key((source,outsider)) ==> final(routes)@[(source,outsider)] == old(routes)@[(source,outsider)]
-    } else { out.is_none() && final(routes)@ == old(routes)@ && final(instances)@ == old(instances)@ },
+    } else { out.is_none() && final(views)@ == old(views)@ && final(routes)@ == old(routes)@ && final(instances)@ == old(instances)@ },
 {
     proof { reveal(vstd::pervasive::obeys_clone_eq); }
     let installed_key = reserved.clone();
     assert(vstd::pervasive::cloned(reserved,installed_key));
     assert(installed_key == reserved);
     let old_handle = crate::instance_swap::replace(instances,&expected,installed_key,replacement,None)?;
-    crate::registration::publish_viewer_routes(views,routes,source,&reserved);
+    let ghost before = views@;
+    crate::registration::replace_viewer_routes(views,routes,source,&expected,&reserved);
+    assert(views@[viewer]@[package] == reserved);
+    assert(views@[viewer]@.values().contains(reserved));
+    proof { if views@.contains_key(outsider) && views@[outsider]@.values().contains(reserved) {
+        let k = choose|k:u64| views@[outsider]@.contains_key(k) && views@[outsider]@[k] == reserved;
+        assert(before[outsider]@.contains_key(k));
+        assert(before[outsider]@.values().contains(before[outsider]@[k]));
+        assert(before[outsider]@[k] != expected && before[outsider]@[k] != reserved);
+    } }
     assert(routes@.contains_key((source,viewer)));
     assert(routes@[(source,viewer)] == reserved);
     assert(instances@.contains_key(reserved));

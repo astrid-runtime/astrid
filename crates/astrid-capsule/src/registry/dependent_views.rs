@@ -16,7 +16,7 @@ verus! {
 broadcast use {vstd::std_specs::hash::group_hash_axioms, vstd::seq_lib::group_seq_properties};
 
 /// Remove every package slot pointing to this exact generation within a view.
-fn remove_generation<K: Eq + Hash + Clone,V: Eq>(view: &mut HashMap<K,V>, runtime: &V)
+pub(super) fn remove_generation<K: Eq + Hash + Clone,V: Eq>(view: &mut HashMap<K,V>, runtime: &V)
     -> (changed: bool)
     requires hash_map_inv(old(view)), obeys_key_model::<K>(), obeys_concrete_eq::<K>(),
         obeys_clone_eq::<K>(), obeys_concrete_eq::<V>(),
