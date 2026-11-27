@@ -1094,3 +1094,44 @@ fn sanitize_guest_field_empty_string() {
     sanitize_guest_field(&mut s, MAX_RESOURCE_LEN, "resource", "test");
     assert!(s.is_empty());
 }
+
+#[tokio::test]
+async fn transformed_display_text_requires_a_new_approval() {
+    let home = tempfile::tempdir().unwrap();
+    for durable in [false, true] {
+        let mut state = persistent_test_state(home.path());
+        let principal = state.effective_principal();
+        if durable {
+            state
+                .profile_cache
+                .as_ref()
+                .unwrap()
+                .persist_command_always(&principal, "list", state.hosted_workspace_root.to_str())
+                .unwrap();
+        } else {
+            let store = AllowanceStore::new();
+            create_allowance_from_decision(
+                &store,
+                &principal,
+                "list",
+                "approve_session",
+                Some(state.workspace_root.clone()),
+                "test",
+            );
+            state.allowance_store = Some(std::sync::Arc::new(store));
+        }
+        for resource in [
+            "list items ".to_owned(),
+            format!("list {}", "a".repeat(MAX_RESOURCE_LEN)),
+        ] {
+            let response =
+                approval::Host::request_approval(&mut state, approval_request("list", &resource))
+                    .unwrap();
+            assert_eq!(response.decision, ApprovalDecision::Denied);
+        }
+        let exact =
+            approval::Host::request_approval(&mut state, approval_request("list", "list items"))
+                .unwrap();
+        assert_eq!(exact.decision, ApprovalDecision::Allowance);
+    }
+}
