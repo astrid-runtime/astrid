@@ -95,4 +95,67 @@ fn competing_claims<T,E>(entries:&mut std::collections::HashMap<[u8;32],u64>,
     assert(entries@ =~= if outcome.is_ok() { before.insert(id,next) } else { before });
     result
 }
+
+/// Observe the consent input and the complete envelope at the publishing callback.
+fn consent_and_publication<'a>(name:&'a str, args:&'a Vec<u8>, id:&'a str)
+    -> (out:((&'a str,&'a Vec<u8>),(&'static str,&'a str,(&'a str,&'a str,&'a Vec<u8>))))
+    ensures out.0 == (name,args), out.1.0@ == "astrid.v1.request.mcp.tool.call"@,
+        out.1.1 == id, out.1.2 == (id,out.0.0,out.0.1),
+{
+    let invocation = crate::invocation::Invocation::new(name,args);
+    let consent = invocation.consent_context();
+    let sent = invocation.publish(id,
+        |r:&'a str,n:&'a str,a:&'a Vec<u8>| -> (b:(&'a str,&'a str,&'a Vec<u8>))
+            ensures b == (r,n,a), { (r,n,a) },
+        |t:&'static str,r:&'a str,b:(&'a str,&'a str,&'a Vec<u8>)| -> (s:(&'static str,&'a str,(&'a str,&'a str,&'a Vec<u8>)))
+            ensures s == (t,r,b), { (t,r,b) });
+    (consent,sent)
+}
+
+/// A peer reading the full client frame consumes precisely the first payload,
+/// even when the transport has already delivered bytes of subsequent frames.
+fn receive_serialized_call(body:&[u8], tail:&[u8], limit:usize, chunk:usize) -> (out:(Vec<u8>,usize))
+    requires chunk > 0, body.len() <= u32::MAX, body.len() <= limit,
+        4 + body.len() + tail.len() <= usize::MAX,
+    ensures out.0@ == body@, out.1 == 4 + body.len(),
+{
+    use crate::native_frame_segments::{body_prefix, declared, incoming, FrameSegments, Incoming};
+    let prefix = body_prefix(body).unwrap();
+    let mut stream = Vec::new();
+    let mut frame = FrameSegments::new(&prefix,body);
+    loop
+        invariant chunk > 0, stream@ + frame.remaining() == prefix@ + body@,
+        ensures stream@ == prefix@ + body@,
+        decreases frame.remaining().len(),
+    {
+        let offer = frame.next();
+        if offer.is_empty() {
+            assert(frame.remaining() =~= Seq::<u8>::empty());
+            assert(stream@ =~= prefix@ + body@);
+            break;
+        }
+        let count = offer.len().min(chunk);
+        assert(0 < count <= frame.offered());
+        let (written,_) = offer.split_at(count);
+        let ghost remaining = frame.remaining();
+        stream.extend_from_slice(written);
+        let accepted = frame.accept(count);
+        assert(accepted);
+        assert(written@ + frame.remaining() =~= remaining);
+        assert(stream@ + frame.remaining() =~= prefix@ + body@);
+    }
+    assert(stream@ =~= prefix@ + body@);
+    stream.extend_from_slice(tail);
+    assert(stream@.take(4) =~= prefix@);
+    assert(declared(stream@) == body.len());
+    assert(stream@.subrange(4,4 + body.len()) =~= body@);
+    match incoming(&stream,limit) {
+        Incoming::Complete { body:payload, consumed } => {
+            let mut received = Vec::new();
+            received.extend_from_slice(payload);
+            (received,consumed)
+        },
+        _ => { assert(false); (Vec::new(),0) },
+    }
+}
 }

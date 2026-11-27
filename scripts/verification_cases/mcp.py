@@ -5,6 +5,32 @@ from .common import replace_once
 
 
 def defects():
+    invocation = Path("crates/astrid-cli/src/commands/mcp/server/invocation.rs")
+    for label, original, changed in [
+        ("requested tool", "call.parts() == (name,arguments)", "call.parts().1 == arguments"),
+        ("normalized arguments", "call.parts() == (name,arguments)", "call.parts().0 == name"),
+        ("consent input", "ensures pair == self.parts()", "ensures true"),
+        ("encoded body", "ensures exists|b:B| encode.ensures((id,self.parts().0,self.parts().1),b)", "ensures exists|b:B| true"),
+        ("published envelope", "&& #[trigger] send.ensures((TOOL_CALL_TOPIC,id,b),out)", "&& (exists|other:R| #[trigger] send.ensures((TOOL_CALL_TOPIC,id,b),other))"),
+        ("operation topic", '"astrid.v1.request.mcp.tool.call"', '"astrid.v1.request.mcp.tools.list"'),
+    ]:
+        yield (
+            f"broker tool invocation loses {label}", invocation,
+            lambda s, a=original, b=changed: replace_once(s, a, b),
+            Path("verification/hosted_mrtr_context.rs"),
+        )
+    frames = Path("crates/astrid-uplink/src/frame_segments.rs")
+    for label, original, changed in [
+        ("payload", "body@ == bytes@.subrange(4, consumed as int)", "body.len() == consumed - 4"),
+        ("boundary", "consumed == 4 + declared(bytes@)", "consumed >= 4 + declared(bytes@)"),
+        ("offered bytes", "bytes@ == self.remaining().take(bytes.len() as int)", "true"),
+        ("advanced bytes", "old(self).remaining().skip(count as int)", "final(self).remaining()"),
+    ]:
+        yield (
+            f"broker frame round trip loses {label}", frames,
+            lambda s, a=original, b=changed: replace_once(s, a, b),
+            Path("verification/hosted_mrtr_context.rs"),
+        )
     redemption = Path("crates/astrid-cli/src/commands/mcp/mrtr_redemption.rs")
     for label, original, changed in [
         ("exact broker outcome", "ensures reply == outcome,", "ensures true,"),

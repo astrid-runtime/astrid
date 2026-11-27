@@ -59,12 +59,12 @@ use super::ingress;
 use super::mrtr::{ConsentResolution, MrtrBridge, ResolvedConsent};
 
 mod consent;
+mod invocation;
+use invocation::{Invocation, TOOL_CALL_TOPIC};
+type ToolInvocation<'a> = Invocation<'a, Value>;
 
 /// Request topic for the broker `tools/list` front door.
 pub(super) const TOOLS_LIST_TOPIC: &str = "astrid.v1.request.mcp.tools.list";
-/// Request topic for the broker `tools/call` front door.
-const TOOL_CALL_TOPIC: &str = "astrid.v1.request.mcp.tool.call";
-
 /// Shim-side deadline for a single broker round trip. The broker bounds
 /// its own tool drain at 50 s; this sits just above that so a slow tool
 /// surfaces as a broker-side `isError` reply rather than a shim timeout.
@@ -407,19 +407,8 @@ impl ConsentProtocol {
     }
 }
 
-struct ToolInvocation {
-    name: String,
-    arguments: Value,
-}
-
-impl ToolInvocation {
-    fn body(&self, req_id: &str) -> Value {
-        json!({
-            "req_id": req_id,
-            "name": self.name,
-            "arguments": self.arguments,
-        })
-    }
+fn tool_call_body(id: &str, name: &str, arguments: &Value) -> Value {
+    json!({ "req_id": id, "name": name, "arguments": arguments })
 }
 
 enum CallFlow<T> {
@@ -521,10 +510,8 @@ impl ServerHandler for AstridMcpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let protocol = ConsentProtocol::from_context(&context);
-        let invocation = ToolInvocation {
-            name: request.name.clone().into_owned(),
-            arguments: request.arguments.clone().map_or(Value::Null, Value::Object),
-        };
+        let arguments = request.arguments.clone().map_or(Value::Null, Value::Object);
+        let invocation = ToolInvocation::new(request.name.as_ref(), &arguments);
         let grants_resolved = match self.resume_mrtr(&invocation, &request, protocol).await? {
             CallFlow::Continue(count) => count,
             CallFlow::Complete(result) => return Ok(result),
@@ -852,6 +839,25 @@ mod tests {
     /// Running a tool (MCP `tools/call`) may have ALREADY executed on the
     /// broker before the connection died — never auto-retry it, or a mutating
     /// tool could run twice.
+    #[test]
+    fn consent_and_retry_preserve_tool_arguments_in_the_broker_body() {
+        let name = "capsule.read";
+        for arguments in [Value::Null, json!({"path": ["a", "b"]})] {
+            let call = ToolInvocation::new(name, &arguments);
+            assert_eq!(call.consent_context(), (name, &arguments));
+            for id in ["initial", "after-consent"] {
+                call.publish(id, tool_call_body, |topic, correlation, body| {
+                    assert_eq!(topic, "astrid.v1.request.mcp.tool.call");
+                    assert_eq!(correlation, id);
+                    assert_eq!(
+                        body,
+                        json!({"req_id": id, "name": name, "arguments": arguments})
+                    );
+                });
+            }
+        }
+    }
+
     #[test]
     fn tool_call_is_not_retriable() {
         assert!(!is_request_retriable(TOOL_CALL_TOPIC));

@@ -20,7 +20,7 @@ use astrid_core::session_token::{
 };
 use astrid_types::Topic;
 use astrid_types::ipc::{IpcMessage, IpcPayload};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tracing::warn;
 
 #[cfg(all(test, unix))]
@@ -467,12 +467,7 @@ impl SocketClient {
             msg.principal = Some(self.principal.to_string());
         }
         let bytes = serde_json::to_vec(&msg)?;
-        let len =
-            u32::try_from(bytes.len()).context("IPC message too large (exceeds 4 GiB limit)")?;
-
-        self.write_half.write_all(&len.to_be_bytes()).await?;
-        self.write_half.write_all(&bytes).await?;
-        self.write_half.flush().await?;
+        crate::frame_writer::write_frame(&mut self.write_half, &bytes).await?;
         Ok(())
     }
 }
@@ -613,14 +608,10 @@ async fn send_request_read_response(
 ) -> Result<HandshakeResponse> {
     let request_bytes =
         serde_json::to_vec(request).context("Failed to serialize handshake request")?;
-    let len = u32::try_from(request_bytes.len()).context("Handshake request too large")?;
-
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-        stream.write_all(&len.to_be_bytes()).await?;
-        stream.write_all(&request_bytes).await?;
-        stream.flush().await?;
-        Ok::<(), std::io::Error>(())
-    })
+    tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        crate::frame_writer::write_frame(stream, &request_bytes),
+    )
     .await
     .context("Handshake request write timed out")?
     .context("Failed to send handshake request")?;

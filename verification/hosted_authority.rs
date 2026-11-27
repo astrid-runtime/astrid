@@ -319,7 +319,7 @@ mod native_recipient;
 #[path = "../crates/astrid-uplink/src/native/topic_policy.rs"]
 mod native_topic_policy;
 
-#[path = "../crates/astrid-uplink/src/native/frame_segments.rs"]
+#[path = "../crates/astrid-uplink/src/frame_segments.rs"]
 mod native_frame_segments;
 #[path = "../crates/astrid-uplink/src/native/delivery_queue.rs"]
 mod native_delivery_queue;
@@ -386,3 +386,5 @@ mod mrtr_context;
 #[path = "../crates/astrid-cli/src/commands/mcp/mrtr_redemption.rs"]
 mod mrtr_redemption;
 mod hosted_mrtr_context;
+#[path = "../crates/astrid-cli/src/commands/mcp/server/invocation.rs"]
+mod invocation;

@@ -27,6 +27,8 @@
 //! gateway independently resolves its signed bearer principal.
 
 pub mod admin_client;
+mod frame_segments;
+mod frame_writer;
 pub mod kernel_client;
 #[cfg(not(target_family = "wasm"))]
 #[doc(hidden)]

@@ -1,32 +1,12 @@
 //! Cancellation-safe length-prefixed IPC framing.
 
 use astrid_types::ipc::IpcMessage;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::MAX_FRAME_BYTES;
-use super::frame_segments::{Incoming, incoming};
+use crate::frame_segments::{Incoming, incoming};
 
-/// The connection owner closes the transport on error or task cancellation.
-pub(super) async fn write_frame(
-    writer: &mut (impl AsyncWrite + Unpin),
-    body: &[u8],
-) -> std::io::Result<()> {
-    let prefix = super::frame_segments::body_prefix(body)
-        .ok_or_else(|| std::io::Error::other("frame exceeds 4 GiB"))?;
-    let mut frame = super::frame_segments::FrameSegments::new(&prefix, body);
-    while !frame.next().is_empty() {
-        let count = writer.write(frame.next()).await?;
-        if count == 0 {
-            return Err(std::io::ErrorKind::WriteZero.into());
-        }
-        if !frame.accept(count) {
-            return Err(std::io::Error::other(
-                "transport reported more bytes than offered",
-            ));
-        }
-    }
-    writer.flush().await
-}
+pub(super) use crate::frame_writer::write_frame;
 
 pub(super) struct FramedReader<R> {
     reader: R,

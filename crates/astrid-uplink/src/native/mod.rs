@@ -5,7 +5,6 @@
 
 mod delivery_queue;
 mod egress;
-mod frame_segments;
 mod framing;
 mod handshake;
 mod input;

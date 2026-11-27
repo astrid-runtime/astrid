@@ -26,7 +26,7 @@ NATIVE_TOPIC = Path("crates/astrid-uplink/src/native/topic_policy.rs")
 NATIVE_RECIPIENT = Path("crates/astrid-uplink/src/native/recipient.rs")
 NATIVE_QUEUE = Path("crates/astrid-uplink/src/native/delivery_queue.rs")
 NATIVE_REPLY = Path("crates/astrid-uplink/src/native/reply_claim.rs")
-NATIVE_FRAME = Path("crates/astrid-uplink/src/native/frame_segments.rs")
+NATIVE_FRAME = Path("crates/astrid-uplink/src/frame_segments.rs")
 DEVICE_SESSIONS = Path("crates/astrid-core/src/profile/device_sessions/phase.rs")
 DEVICE_REGISTRATION = Path("crates/astrid-core/src/profile/device_registration.rs")
 DEVICE_CHALLENGE = Path("crates/astrid-core/src/profile/device_challenge.rs")
@@ -51,6 +51,7 @@ INPUTS = [
     Path("verification/hosted_mcp_peer.rs"),
     Path("crates/astrid-cli/src/commands/mcp/mrtr_context.rs"),
     Path("verification/hosted_mrtr_context.rs"),
+    Path("crates/astrid-cli/src/commands/mcp/server/invocation.rs"),
     Path("crates/astrid-cli/src/commands/mcp/mrtr_redemption.rs"),
     Path("crates/astrid-capsule/src/engine/mcp_cleanup.rs"),
     Path("crates/astrid-capsule/src/engine/mcp_registration.rs"),
