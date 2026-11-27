@@ -71,8 +71,8 @@ pub(super) struct RedemptionLease {
 }
 
 impl RedemptionLease {
-    pub(super) fn commit(mut self) {
-        self.claim.commit();
+    pub(super) fn finish<T, E>(mut self, outcome: Result<T, E>) -> Result<T, E> {
+        self.claim.finish(outcome)
     }
 }
 
@@ -386,7 +386,7 @@ mod tests {
             resolved.decision,
             ConsentResolution::Ingress(true)
         ));
-        resolved.redemption.commit();
+        resolved.redemption.finish(Ok::<_, ()>(())).unwrap();
         assert!(
             bridge
                 .resolve(&alice, "fs.read", &arguments, &state, Some(&responses))
@@ -415,7 +415,14 @@ mod tests {
         let completed = bridge
             .resolve(&alice, "fs.read", &arguments, &state, Some(&responses))
             .expect("dropping an uncommitted lease must permit a safe retry");
-        completed.redemption.commit();
+        assert_eq!(
+            completed.redemption.finish(Err::<(), _>("lost reply")),
+            Err("lost reply")
+        );
+        let retried = bridge
+            .resolve(&alice, "fs.read", &arguments, &state, Some(&responses))
+            .expect("transport failure must release the local claim");
+        assert_eq!(retried.redemption.finish(Ok::<_, ()>(false)), Ok(false));
 
         assert!(
             bridge
@@ -452,7 +459,11 @@ mod tests {
         let error = results.iter().find_map(|r| r.as_ref().err()).unwrap();
         assert!(error.message.contains("already been redeemed"));
         drop(results);
-        resolve().unwrap().redemption.commit();
+        resolve()
+            .unwrap()
+            .redemption
+            .finish(Ok::<_, ()>(()))
+            .unwrap();
         assert!(resolve().is_err());
     }
 

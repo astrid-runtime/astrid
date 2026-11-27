@@ -43,9 +43,12 @@ impl AstridMcpServer {
         )?;
         match decision {
             ConsentResolution::Ingress(approved) => {
-                let granted = !approved || self.record_ingress_accept().await?;
-                redemption.commit();
-                if approved && granted {
+                let outcome = if approved {
+                    self.record_ingress_accept().await
+                } else {
+                    Ok(false)
+                };
+                if redemption.finish(outcome)? {
                     Ok(CallFlow::Continue(0))
                 } else {
                     Ok(CallFlow::Complete(consent_denied_result()))
@@ -56,19 +59,18 @@ impl AstridMcpServer {
                 approved,
                 grants_resolved,
             } => {
-                let granted = self.forward_grant_decision(&request, approved).await?;
-                redemption.commit();
-                if granted {
+                let outcome = self.forward_grant_decision(&request, approved).await;
+                if redemption.finish(outcome)? {
                     Ok(CallFlow::Continue(grants_resolved.saturating_add(1)))
                 } else {
                     Ok(CallFlow::Complete(grant_denied_result()))
                 }
             },
             ConsentResolution::Approval { request, choice } => {
-                let reply = self
+                let outcome = self
                     .forward_approval_decision(&request, choice.verb())
-                    .await?;
-                redemption.commit();
+                    .await;
+                let reply = redemption.finish(outcome)?;
                 Ok(CallFlow::Complete(
                     call_tool_result_from_reply(&reply).into(),
                 ))

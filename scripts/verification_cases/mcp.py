@@ -7,6 +7,10 @@ from .common import replace_once
 def defects():
     redemption = Path("crates/astrid-cli/src/commands/mcp/mrtr_redemption.rs")
     for label, original, changed in [
+        ("exact broker outcome", "ensures reply == outcome,", "ensures true,"),
+        ("successful settlement", "final(self).settled() == (old(self).settled() || outcome.is_ok())", "final(self).settled() ==> (old(self).settled() || outcome.is_ok())"),
+        ("failed settlement", "final(self).settled() == (old(self).settled() || outcome.is_ok())", "(old(self).settled() || outcome.is_ok()) ==> final(self).settled()"),
+        ("settlement digest", "final(self).id() == old(self).id()", "true"),
         ("duplicate refusal", "claim.is_some() == !old(entries)@.contains_key(digest)", "!old(entries)@.contains_key(digest) ==> claim.is_some()"),
         ("digest identity", "c.id() == digest && !c.settled()", "!c.settled()"),
         ("rollback eligibility", "c.id() == digest && !c.settled()", "c.id() == digest"),

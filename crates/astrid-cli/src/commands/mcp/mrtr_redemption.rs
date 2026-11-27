@@ -16,9 +16,14 @@ impl Claim {
     pub(super) closed spec fn id(&self) -> [u8;32] { self.digest }
     pub(super) closed spec fn settled(&self) -> bool { self.committed }
 
-    pub(super) fn commit(&mut self)
-        ensures final(self).settled(), final(self).id() == old(self).id(),
-    { self.committed = true; }
+    pub(super) fn finish<T,E>(&mut self, outcome:Result<T,E>) -> (reply:Result<T,E>)
+        ensures reply == outcome,
+            final(self).settled() == (old(self).settled() || outcome.is_ok()),
+            final(self).id() == old(self).id(),
+    {
+        if outcome.is_ok() { self.committed = true; }
+        outcome
+    }
 
     pub(super) fn committed(&self) -> (yes:bool)
         ensures yes == self.settled(),
