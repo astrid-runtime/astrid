@@ -697,6 +697,39 @@ mod tests {
     }
 
     #[test]
+    fn retained_device_loses_capsule_access_when_keypair_is_disabled() {
+        let (_dir, home, cache, resolver) = fixture_with_cache();
+        let principal = PrincipalId::new("operator").unwrap();
+        let key = device('b', DeviceScope::Full);
+        let mut profile = PrincipalProfile {
+            auth: AuthConfig {
+                methods: vec![AuthMethod::Keypair],
+                public_keys: vec![key.clone()],
+            },
+            ..PrincipalProfile::default()
+        };
+        write(&home, "operator", &profile);
+        assert!(
+            resolver
+                .resolve_access(Some("operator"), stamp(&key))
+                .is_some()
+        );
+
+        profile
+            .auth
+            .methods
+            .retain(|method| *method != AuthMethod::Keypair);
+        write(&home, "operator", &profile);
+        cache.invalidate(&principal);
+        assert!(resolver.resolve_access(Some("operator"), None).is_some());
+        assert!(
+            resolver
+                .resolve_access(Some("operator"), stamp(&key))
+                .is_none()
+        );
+    }
+
+    #[test]
     fn one_dispatch_snapshot_cannot_fall_back_after_revocation() {
         let (_d, home, cache, r) = fixture_with_cache();
         let full = device('e', DeviceScope::Full);

@@ -101,6 +101,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retained_device_loses_management_scope_when_keypair_is_disabled() {
+        use astrid_core::profile::AuthMethod;
+
+        let caller = PrincipalId::default();
+        let key = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+        let key_id = key.key_id.clone();
+        let mut profile = PrincipalProfile::default();
+        profile.auth.methods.push(AuthMethod::Keypair);
+        profile.auth.public_keys.push(key);
+        assert!(
+            resolve_device(&profile, &caller, Some(&key_id), "agent:create")
+                .unwrap()
+                .is_some()
+        );
+
+        profile
+            .auth
+            .methods
+            .retain(|method| *method != AuthMethod::Keypair);
+        assert!(matches!(
+            resolve_device(&profile, &caller, Some(&key_id), "agent:create"),
+            Err(PermissionError::DeviceScopeDenied { principal, required })
+                if principal == caller && required == "agent:create"
+        ));
+    }
+
+    #[test]
     fn credential_resolution_preserves_exact_device_and_has_no_legacy_fallback() {
         let caller = PrincipalId::default();
         let first = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);

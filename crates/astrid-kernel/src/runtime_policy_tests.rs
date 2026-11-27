@@ -136,6 +136,26 @@ async fn malformed_and_unknown_device_ids_fail_closed() {
 }
 
 #[tokio::test]
+async fn retained_device_loses_runtime_capability_when_keypair_is_disabled() {
+    let (_dir, kernel, principal) = fixture().await;
+    let device = full_device('a');
+    let key_id = device.key_id.clone();
+    seed(&kernel, &principal, vec![device]);
+    assert!(kernel.runtime_capability_allows(&principal, Some(&key_id), AUDIT_FIREHOSE_CAP));
+
+    let mut profile = PrincipalProfile::load(&kernel.astrid_home, &principal).unwrap();
+    profile
+        .auth
+        .methods
+        .retain(|method| *method != AuthMethod::Keypair);
+    profile.save(&kernel.astrid_home, &principal).unwrap();
+    kernel.profile_cache.invalidate(&principal);
+
+    assert!(kernel.runtime_capability_allows(&principal, None, AUDIT_FIREHOSE_CAP));
+    assert!(!kernel.runtime_capability_allows(&principal, Some(&key_id), AUDIT_FIREHOSE_CAP));
+}
+
+#[tokio::test]
 async fn revoked_device_id_fails_closed() {
     let (_dir, kernel, principal) = fixture().await;
     let device = full_device('a');
