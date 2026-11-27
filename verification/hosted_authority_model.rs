@@ -501,6 +501,26 @@ fn apply_recovery(markers: &[Marker]) -> (status: TokenStatus)
     TokenStatus::recover_markers(markers)
 }
 
+/// Admission in the rebuilt production map for any requested token.
+fn admission_after_reopen<K: Eq + std::hash::Hash>(
+    recorded: std::collections::HashMap<K,Vec<Marker>>, id: &K, single_use: bool,
+)
+    requires vstd::std_specs::hash::hash_map_inv(&recorded),
+        vstd::std_specs::hash::obeys_key_model::<K>(), vstd::laws_eq::obeys_concrete_eq::<K>(),
+{
+    let ghost source = recorded@;
+    let live = crate::token_authority::recover_authority(recorded);
+    let status = crate::token_authority::status(&live,id);
+    let decision = status.admit(single_use);
+    let ghost markers = if source.contains_key(*id) { source[*id]@ } else { Seq::empty() };
+    proof { crate::token_authority::replay_keeps_markers(markers); }
+    assert((decision is Revoked) == markers.contains(Marker::Revoked));
+    assert((decision is AlreadyUsed) == (!markers.contains(Marker::Revoked)
+        && single_use && markers.contains(Marker::Consumed)));
+    assert((decision is Allowed) == (!markers.contains(Marker::Revoked)
+        && (!single_use || !markers.contains(Marker::Consumed))));
+}
+
 // ---- One principal ----
 
 /// No resume transition occurs strictly between `i` and `k`.

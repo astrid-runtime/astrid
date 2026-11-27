@@ -4,6 +4,8 @@ use std::{collections::HashMap, hash::Hash};
 use vstd::prelude::*;
 #[cfg(verus_keep_ghost)]
 use vstd::std_specs::hash::{hash_map_inv, obeys_key_model};
+#[cfg(verus_keep_ghost)]
+use vstd::std_specs::iter::IteratorSpec;
 
 verus! {
 
@@ -37,6 +39,69 @@ pub(super) fn fence_revocation<'a, K: Eq + Hash + Clone>(
     assert(vstd::pervasive::cloned(*id, key));
     authority.insert(key, live);
     Marker::Revoked.address(id)
+}
+
+/// Rebuild the complete live map before the store becomes available.
+pub(super) fn recover_authority<K: Eq + Hash>(
+    recorded: HashMap<K, Vec<Marker>>,
+) -> (live: HashMap<K, TokenStatus>)
+    requires hash_map_inv(&recorded), obeys_key_model::<K>(), vstd::laws_eq::obeys_concrete_eq::<K>(),
+    ensures hash_map_inv(&live), live@.dom() == recorded@.dom(),
+        forall|id: K| recorded@.contains_key(id) ==> (#[trigger] live@[id].revoked(), live@[id].used())
+            == replay(recorded@[id]@),
+{
+    let ghost source = recorded@;
+    let mut live = HashMap::<K, TokenStatus>::with_capacity(recorded.len());
+    let mut rows = recorded.into_iter();
+    proof {
+        let entries = rows.remaining();
+        assert(entries.to_set() == source.kv_pairs());
+        assert forall|k: K| #[trigger] source.contains_key(k) implies entries.contains((k,source[k])) by {
+            assert(source.kv_pairs().contains((k,source[k])));
+            assert(entries.to_set().contains((k,source[k])));
+        }
+        assert forall|i: int| 0 <= i < entries.len() implies ({
+            let row = #[trigger] entries[i];
+            source.contains_key(row.0) && row.1 == source[row.0]
+        }) by {
+            let row = entries[i];
+            assert(entries.contains(row));
+            assert(source.kv_pairs().contains(row));
+            let k = choose|k: K| source.dom().contains(k) && (k,source[k]) == row;
+        }
+    }
+    let ghost mut left = vstd::std_specs::hash::into_iter_entries(rows).len() as int;
+    loop
+        invariant source == recorded@, left == rows.remaining().len(), hash_map_inv(&live), obeys_key_model::<K>(), vstd::laws_eq::obeys_concrete_eq::<K>(),
+            forall|id: K| #[trigger] source.contains_key(id) ==> live@.contains_key(id)
+                || rows.remaining().contains((id,source[id])),
+            forall|i: int| 0 <= i < rows.remaining().len() ==> ({
+                let row = #[trigger] rows.remaining()[i];
+                source.contains_key(row.0) && row.1 == source[row.0]
+            }),
+            forall|id: K| #[trigger] live@.contains_key(id) ==> source.contains_key(id)
+                && (live@[id].revoked(), live@[id].used()) == replay(source[id]@),
+        decreases left,
+    {
+        let ghost before = rows.remaining();
+        let Some((id,markers)) = rows.next() else {
+            assert(live@.dom() =~= source.dom());
+            return live;
+        };
+        assert(before[0] == (id,markers));
+        assert(source.contains_key(id) && markers == source[id]);
+        let status = TokenStatus::recover_markers(&markers);
+        live.insert(id,status);
+        assert forall|k: K| #[trigger] source.contains_key(k) implies live@.contains_key(k)
+            || rows.remaining().contains((k,source[k])) by {
+            if !live@.contains_key(k) {
+                let i = choose|i:int| 0 <= i < before.len() && before[i] == (k,source[k]);
+                assert(i > 0);
+                assert(rows.remaining()[i-1] == before[i]);
+            }
+        }
+        proof { left = left - 1; };
+    }
 }
 
 /// Revocation and consumption can coexist. Each record is monotone.

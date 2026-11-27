@@ -139,10 +139,7 @@ impl CapabilityStore {
         // reports for it, as `TokenStatus::recover_markers` verifies. A token
         // has at most one marker in each namespace, so each list is short and
         // this map is released once the authority map is built.
-        let authority = recorded
-            .into_iter()
-            .map(|(id, markers)| (id, TokenStatus::recover_markers(&markers)))
-            .collect();
+        let authority = authority::recover_authority(recorded);
         Ok(Self {
             persistent_store: Some(store),
             authority: tokio::sync::RwLock::new(authority),

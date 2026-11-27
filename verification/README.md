@@ -202,8 +202,9 @@ Production calls the transitions directly. Each carries the verified
 postcondition that the `apply_*` and `fuel_*` functions restate in the model's
 terms. Those functions record the grant and tracker transitions, decide
 admission and compute settlement, and do not update the limiter's counters.
-Startup replays each token's markers through
-the verified `TokenStatus::recover_markers`. Under the live authority write lock,
+Startup rebuilds the live map with `recover_authority`, which invokes
+`TokenStatus::recover_markers` for each grouped token ID. The verified loop
+returns exactly the grouped keys with their own replayed status. Under the live authority write lock,
 `revoke` calls the checked `fence_revocation` map update. The returned marker
 namespace and token ID identify the fenced entry. Subsequent lookups of that
 entry deny both token lifetimes and every other entry is preserved. Verus checks that the canonical lowercase hyphenated key written for all 16 UUID bytes decodes to exactly those bytes on startup. Native UUID byte access, UTF-8 conversion, the compatibility parser for legacy spellings, asynchronous KV writes and startup enumeration remain trusted at this boundary. The surrounding `revoke` adapter, `consume`,

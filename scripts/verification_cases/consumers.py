@@ -32,6 +32,14 @@ def consumer_defects():
             f"token marker codec loses {label}", Path("crates/astrid-capabilities/src/store/marker_key.rs"),
             lambda s, clause=clause: replace_once(s, clause, "ensures true,"), MODEL,
         )
+    for label, clause in [
+        ("key coverage", "live@.dom() == recorded@.dom()"),
+        ("marker history", "forall|id: K| recorded@.contains_key(id) ==> (#[trigger] live@[id].revoked(), live@[id].used())\n            == replay(recorded@[id]@)"),
+    ]:
+        yield (
+            f"token recovery map loses {label}", AUTHORITY,
+            lambda s, clause=clause: replace_once(s, clause, "true"), MODEL,
+        )
     yield from persistent_process.defects()
     yield from workspace_commit.defects()
     yield from file_descriptor.defects()
