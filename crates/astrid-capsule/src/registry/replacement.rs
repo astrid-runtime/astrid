@@ -41,6 +41,11 @@ impl CapsuleRegistry {
     }
 
     /// Atomically publish a preallocated principal generation.
+    ///
+    /// The reservation must be strictly newer than `expected` and must not
+    /// already name an installed runtime. The current generation, an older
+    /// reservation, and any live identity are refused before the registry
+    /// changes.
     pub fn replace_principal_runtime_reserved(
         &mut self,
         expected: &RuntimeId,
@@ -69,6 +74,7 @@ impl CapsuleRegistry {
                 "runtime generation changed before replacing '{id}' for '{principal}'"
             )));
         }
+        self.admit_reserved_replacement(expected, &runtime_id)?;
         let previous = self.swap_runtime(
             expected,
             runtime_id.clone(),
@@ -120,6 +126,10 @@ impl CapsuleRegistry {
     }
 
     /// Atomically publish a preallocated system generation.
+    ///
+    /// The reservation must be strictly newer than `expected` and must not
+    /// already name an installed runtime. Refusal leaves the current
+    /// generation, its uplinks, and every unrelated runtime untouched.
     pub fn replace_system_runtime_reserved(
         &mut self,
         expected: &RuntimeId,
@@ -189,6 +199,26 @@ impl CapsuleRegistry {
                     descriptor.id
                 )));
             }
+        }
+        self.admit_reserved_replacement(expected, runtime_id)
+    }
+
+    /// A reservation may be published only when it is strictly newer than the
+    /// installed generation and is not already installed. This read happens
+    /// before any index, uplink, or view change.
+    fn admit_reserved_replacement(
+        &self,
+        expected: &RuntimeId,
+        reserved: &RuntimeId,
+    ) -> CapsuleResult<()> {
+        if reserved == expected
+            || self.instances.contains_key(reserved)
+            || reserved.generation() <= expected.generation()
+        {
+            return Err(CapsuleError::ExecutionFailed(format!(
+                "reserved runtime generation cannot replace '{}'",
+                expected.key.capsule_id()
+            )));
         }
         Ok(())
     }
