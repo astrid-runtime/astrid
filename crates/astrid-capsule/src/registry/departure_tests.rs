@@ -143,3 +143,44 @@ fn legacy_alias_table_survives_departure_of_one_of_two_generations() {
     assert!(registry.unregister_for(&bob, &package).unwrap().torn_down);
     assert!(registry.legacy_uuid_map.is_empty());
 }
+
+#[test]
+fn removing_one_system_package_preserves_the_owners_other_generation() {
+    let mut registry = CapsuleRegistry::new();
+    let owner = pid("owner");
+    let peer = pid("peer");
+    let retiring = CapsuleId::from_static("retiring-service");
+    let remaining = CapsuleId::from_static("remaining-service");
+    let artifact = test_hash("retiring-bytes");
+    registry
+        .register_system_runtime(
+            Box::new(MockCapsule::new("retiring-service")),
+            artifact.clone(),
+            &owner,
+        )
+        .unwrap();
+    registry
+        .register_existing(&retiring, &artifact, &peer)
+        .unwrap();
+    registry
+        .register_system_runtime(
+            Box::new(MockCapsule::new("remaining-service")),
+            test_hash("remaining-bytes"),
+            &owner,
+        )
+        .unwrap();
+    let survivor = registry.get_for(&owner, &remaining).unwrap();
+
+    let removed = registry.unregister_for(&owner, &retiring).unwrap();
+    assert!(removed.torn_down);
+    assert_eq!(
+        removed.removed_principals,
+        vec![owner.clone(), peer.clone()]
+    );
+    assert!(registry.get_for(&owner, &retiring).is_none());
+    assert!(registry.get_for(&peer, &retiring).is_none());
+    assert!(Arc::ptr_eq(
+        &survivor,
+        &registry.get_for(&owner, &remaining).unwrap()
+    ));
+}

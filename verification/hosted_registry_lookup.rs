@@ -160,7 +160,9 @@ fn remove_system_owner<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
         hash_map_inv(old(legacy)), obeys_concrete_eq::<[u8;32]>(),
         hash_map_inv(old(routes)), hash_map_inv(old(sources)), hash_map_inv(old(names)),
         obeys_key_model::<(u64,u64)>(), obeys_concrete_eq::<(u64,u64)>(), vstd::pervasive::obeys_clone_eq::<(u64,u64)>(),
-        old(views)@.contains_key(owner), old(views)@[owner]@.dom() == set![package],
+        old(views)@.contains_key(owner), old(views)@[owner]@.contains_key(package),
+        forall|k:u64| k != package && old(views)@[owner]@.contains_key(k) ==>
+            (#[trigger] old(views)@[owner]@[k]) != old(views)@[owner]@[package],
         forall|p:u64| old(views)@.contains_key(p) ==> hash_map_inv(&old(views)@[p]),
         old(views)@[owner]@[package].identity().0.2 is SystemResident,
         old(instances)@.contains_key(old(views)@[owner]@[package]),
@@ -189,8 +191,27 @@ fn remove_system_owner<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
 {
     let ghost before = views@;
     let (id,handle) = view_lookup::detach(views,instances,&owner,&package).unwrap();
-    assert(before[owner]@.remove(package).is_empty());
-    assert(views@ == before.remove(owner));
+    let ghost middle = views@;
+    proof {
+        let remaining = before[owner]@.remove(package);
+        assert(middle.remove(owner) == before.remove(owner));
+        assert forall|p:u64| p != owner implies
+            (middle.contains_key(p) == before.contains_key(p) &&
+             (middle.contains_key(p) ==> middle[p] == before[p])) by {
+            assert(middle.remove(owner).contains_key(p) == before.remove(owner).contains_key(p));
+            if middle.contains_key(p) { assert(middle.remove(owner)[p] == before.remove(owner)[p]); }
+        }
+        assert forall|p:u64| middle.contains_key(p) implies hash_map_inv(&middle[p]) by {
+            if p != owner { assert(middle[p] == before[p]); }
+        }
+        if !remaining.is_empty() {
+            assert(middle[owner]@ == remaining);
+            assert forall|k:u64| remaining.contains_key(k) implies #[trigger] remaining[k] != id by {
+                assert(k != package);
+            }
+            assert(!remaining.values().contains(id));
+        }
+    }
     let mut report = Vec::new();
     report.push(owner);
     let tear_down = crate::dependent_views::depart(views,instances,&id,&owner,&mut report);
@@ -216,11 +237,15 @@ fn remove_system_owner<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
         }
         assert forall|p:u64| #[trigger] views@.contains_key(p) ==
             (before.contains_key(p) && exists|k:u64| before[p]@.contains_key(k) && before[p]@[k] != id) by {
-            let middle = before.remove(owner);
             assert(views@.contains_key(p) == (middle.contains_key(p) && !crate::dependent_views::kept(middle[p]@,id).is_empty()));
             if before.contains_key(p) {
                 let surviving = crate::dependent_views::kept(before[p]@,id);
-                if p == owner { assert(surviving =~= Map::<u64,Id>::empty()); }
+                if p == owner {
+                    assert(surviving =~= before[p]@.remove(package));
+                    if middle.contains_key(p) {
+                        assert(crate::dependent_views::kept(middle[p]@,id) =~= surviving);
+                    }
+                }
                 if !surviving.is_empty() {
                     let k = choose|k:u64| surviving.contains_key(k);
                     assert(before[p]@.contains_key(k) && before[p]@[k] != id);
