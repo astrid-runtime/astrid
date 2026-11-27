@@ -14,6 +14,12 @@ def defects():
             lambda s, a=original: replace_once(s, a, "ensures true" if a.startswith("ensures ") else "true"),
             Path("verification/hosted_route_retirement.rs"),
         )
+    yield (
+        "reverse publication loses the outstanding reservation number", GENERATION,
+        lambda s: replace_once(s, "r.identity() == ((id,artifact,scope),*old(next)) &&",
+                               "r.identity().0 == (id,artifact,scope) &&"),
+        Path("verification/hosted_registry_lookup.rs"),
+    )
     registration = Path("crates/astrid-capsule/src/registry/registration.rs")
     for name, clause in [
         ("can return another generation", "ensures runtime == self.runtime"),

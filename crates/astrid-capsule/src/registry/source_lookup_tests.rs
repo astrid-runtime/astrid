@@ -227,3 +227,55 @@ fn private_registration_dispatch_and_removal_restore_existing_source_indexes()
     assert_eq!(registry.uuid_id_map, names);
     Ok(())
 }
+
+#[test]
+fn reversed_reserved_publication_preserves_both_scoped_handles()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut registry = CapsuleRegistry::new();
+    let package = CapsuleId::from_static("out-of-order");
+    let artifact = test_hash("same-bytes");
+    let source = capsule_source_uuid(&package, &artifact);
+    let left = pid("left");
+    let right = pid("right");
+    let a = registry.reserve_runtime_id(
+        package.clone(),
+        artifact.clone(),
+        RuntimeScope::Principal(uid(1)),
+    )?;
+    let b =
+        registry.reserve_runtime_id(package.clone(), artifact, RuntimeScope::Principal(uid(2)))?;
+    assert!(a.generation() < b.generation());
+    registry
+        .try_register_reserved_runtime(
+            Box::new(MockCapsule::new(package.as_str())),
+            b.clone(),
+            &right,
+            Some(right.clone()),
+        )
+        .map_err(|failure| failure.error)?;
+    let earlier_handle = registry.get_for(&right, &package).unwrap();
+    registry
+        .try_register_reserved_runtime(
+            Box::new(MockCapsule::new(package.as_str())),
+            a.clone(),
+            &left,
+            Some(left.clone()),
+        )
+        .map_err(|failure| failure.error)?;
+    let later_handle = registry.get_for(&left, &package).unwrap();
+    assert!(!Arc::ptr_eq(&earlier_handle, &later_handle));
+    for (principal, generation, expected) in [(&right, b, earlier_handle), (&left, a, later_handle)]
+    {
+        assert_eq!(
+            registry.runtime_id_for(principal, &package),
+            Some(generation)
+        );
+        assert!(Arc::ptr_eq(
+            &registry
+                .find_instance_by_uuid_for(principal, &source)
+                .unwrap(),
+            &expected
+        ));
+    }
+    Ok(())
+}

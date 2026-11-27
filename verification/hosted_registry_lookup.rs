@@ -232,6 +232,70 @@ fn register_and_resolve<C: ?Sized>(instances: &mut HashMap<Id,Entry<C,u64>>,
     (runtime,by_package,by_source)
 }
 
+// Outstanding reservations can complete out of order. Equal package bytes and
+// source UUID still dispatch to the handle installed for each principal.
+fn publish_reserved_pair<C: ?Sized>(next: &mut u64, instances: &mut HashMap<Id,Entry<C,u64>>,
+    views: &mut HashMap<u64,HashMap<u64,Id>>, routes: &mut HashMap<(u64,u64),Id>,
+    sources: &mut HashMap<Id,u64>, names: &mut HashMap<u64,u64>, aliases: &HashMap<u64,[u8;32]>,
+    left: u64, right: u64, left_uid: u64, right_uid: u64, package: u64, artifact: [u8;32],
+    source: u64, left_handle: Arc<C>, right_handle: Arc<C>) -> (out:Option<(Id,Id,Arc<C>,Arc<C>)>)
+    requires left != right, left_uid != right_uid,
+        hash_map_inv(old(instances)), hash_map_inv(old(views)), hash_map_inv(old(routes)),
+        hash_map_inv(old(sources)), hash_map_inv(old(names)), hash_map_inv(aliases),
+        !old(views)@.contains_key(left), !old(views)@.contains_key(right),
+        forall|id:Id| old(instances)@.contains_key(id) ==> id.identity().1 < *old(next),
+        obeys_key_model::<Id>(), obeys_concrete_eq::<Id>(), vstd::pervasive::obeys_clone_eq::<Id>(),
+        obeys_key_model::<(u64,u64)>(), obeys_concrete_eq::<(u64,u64)>(), obeys_concrete_eq::<[u8;32]>(),
+    ensures ({
+        if *old(next) as int + 1 >= u64::MAX {
+            &&& out.is_none() && *final(next) == u64::MAX
+            &&& final(instances)@ == old(instances)@ && final(views)@ == old(views)@
+            &&& final(routes)@ == old(routes)@ && final(sources)@ == old(sources)@ && final(names)@ == old(names)@
+        } else {
+            &&& out.is_some() && *final(next) as int == *old(next) as int + 2
+            &&& ({
+                let (a,b,ha,hb) = out.unwrap();
+                &&& a.identity() == ((package,artifact,RuntimeScope::Principal(left_uid)),*old(next))
+                &&& b.identity().0 == (package,artifact,RuntimeScope::Principal(right_uid))
+                &&& b.identity().1 as int == a.identity().1 as int + 1 && a != b
+                &&& ha == left_handle && hb == right_handle
+                &&& final(instances)@ == old(instances)@.insert(b,Entry { capsule:right_handle,owner_alias:Some(right) })
+                    .insert(a,Entry { capsule:left_handle,owner_alias:Some(left) })
+                &&& final(instances)@.remove(a).remove(b) == old(instances)@
+                &&& final(views)@.contains_key(left) && final(views)@.contains_key(right)
+                &&& final(views)@[left]@ == Map::empty().insert(package,a)
+                &&& final(views)@[right]@ == Map::empty().insert(package,b)
+                &&& final(views)@.remove(left).remove(right) == old(views)@
+                &&& final(routes)@ == old(routes)@.insert((source,right),b).insert((source,left),a)
+                &&& final(sources)@ == old(sources)@.insert(b,source).insert(a,source)
+                &&& final(names)@ == old(names)@.insert(source,package)
+            })
+        }
+    }),
+{
+    let ghost initial_names = names@;
+    let ghost initial_views = views@;
+    let a = crate::runtime_generation::issue(next,package,artifact,RuntimeScope::Principal(left_uid))?;
+    let b = crate::runtime_generation::issue(next,package,artifact,RuntimeScope::Principal(right_uid))?;
+    assert(!instances@.contains_key(a) && !instances@.contains_key(b));
+    let rb = crate::registration::Registration { runtime:b, principal:right, source,
+        entry:Entry { capsule:right_handle,owner_alias:Some(right) } }.publish(instances,views,routes,sources,names);
+    assert(views@.remove(right).contains_key(left) == views@.contains_key(left));
+    assert(views@.remove(right) =~= initial_views);
+    assert(views@[right]@ == Map::empty().insert(package,rb));
+    let ra = crate::registration::Registration { runtime:a, principal:left, source,
+        entry:Entry { capsule:left_handle,owner_alias:Some(left) } }.publish(instances,views,routes,sources,names);
+    assert(views@.remove(left).contains_key(right));
+    assert(views@.remove(left)[right] == views@[right]);
+    assert(views@.remove(left).remove(right) =~= initial_views);
+    assert(views@[left]@ == Map::empty().insert(package,ra));
+    assert(views@[right]@ == Map::empty().insert(package,rb));
+    assert(names@ =~= initial_names.insert(source,package));
+    let ha = crate::source_lookup::capsule_for(routes,aliases,instances,views,(source,left)).unwrap();
+    let hb = crate::source_lookup::capsule_for(routes,aliases,instances,views,(source,right)).unwrap();
+    Some((ra,rb,ha,hb))
+}
+
 // A first registration for this principal and source can be removed without
 // changing any pre-existing index. Capture the dispatched handle before detaching.
 fn round_trip_private_registration<C: ?Sized>(instances: &mut HashMap<Id,Entry<C,u64>>,
