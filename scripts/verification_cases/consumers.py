@@ -10,6 +10,19 @@ from .common import (
 
 def consumer_defects():
     """Weaken a production guarantee and require its trace consumer to fail."""
+    persistent = Path("crates/astrid-capsule/src/engine/wasm/host/process/persistent")
+    process_trace = Path("verification/hosted_process_selection.rs")
+    for file, name, clause, weakened in [
+        ("selection", "loses owner equality", "ensures yes == (principal@", "ensures yes ==> (principal@"),
+        ("selection", "loses token target", "&& *entry == entries@[*key]", "&& true"),
+        ("selection", "admits a foreign process", "&& owns.ensures((entry,),true)", "&& true"),
+        ("signal_target", "loses direct signal failure", "&& process.ensures(args,Err(e))", "&& true"),
+        ("signal_target", "loses successful fallback", "&& process.ensures(args,Ok::<(),E>(unit))", "&& true"),
+    ]:
+        yield (
+            f"persistent process {name}", persistent / f"{file}.rs",
+            lambda s, a=clause, b=weakened: replace_once(s, a, b), process_trace,
+        )
     splice = Path("crates/astrid-capsule/src/engine/wasm/host/io/splice.rs")
     splice_trace = Path("verification/hosted_io_splice.rs")
     for name, original, changed in [

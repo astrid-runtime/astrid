@@ -99,6 +99,15 @@ pub(super) struct PersistentEntry {
 }
 
 impl PersistentEntry {
+    pub(super) fn owned_by(&self, principal: &PrincipalId, capsule_id: &str) -> bool {
+        super::selection::matches(
+            principal.as_str().as_bytes(),
+            capsule_id.as_bytes(),
+            self.creator.as_str().as_bytes(),
+            self.capsule_id.as_bytes(),
+        )
+    }
+
     pub(super) fn is_live(&self) -> bool {
         self.core
             .lock()
@@ -292,15 +301,10 @@ pub(super) fn send_signal(pid: u32, sig: HostSignal) -> Result<(), ErrorCode> {
     // Refuse pid 0: `killpg(0)` / `kill(0)` target the CALLER's (daemon's) own
     // process group — never the child. A reaped child surfaces pid `None`
     // (stored as 0); guard here as defense-in-depth (spawn also rejects it).
-    if pid == 0 {
-        return Err(ErrorCode::Closed);
-    }
     #[cfg(unix)]
     {
         use nix::sys::signal::Signal;
 
-        let raw = i32::try_from(pid).map_err(|_| ErrorCode::InvalidInput)?;
-        let target = nix::unistd::Pid::from_raw(raw);
         let native = match sig {
             HostSignal::Term => Signal::SIGTERM,
             HostSignal::Hup => Signal::SIGHUP,
@@ -311,15 +315,28 @@ pub(super) fn send_signal(pid: u32, sig: HostSignal) -> Result<(), ErrorCode> {
             HostSignal::Cont => Signal::SIGCONT,
             HostSignal::Kill => Signal::SIGKILL,
         };
-        if nix::sys::signal::killpg(target, native).is_err() {
-            nix::sys::signal::kill(target, native)
-                .map_err(|e| ErrorCode::Unknown(format!("signal {sig:?}: {e}")))?;
-        }
-        Ok(())
+        super::signal_target::deliver(
+            pid,
+            native,
+            |target, signal| {
+                nix::sys::signal::killpg(nix::unistd::Pid::from_raw(target), signal).is_ok()
+            },
+            |target, signal| nix::sys::signal::kill(nix::unistd::Pid::from_raw(target), signal),
+        )
+        .map_err(|error| match error {
+            super::signal_target::DeliveryError::Closed => ErrorCode::Closed,
+            super::signal_target::DeliveryError::InvalidPid => ErrorCode::InvalidInput,
+            super::signal_target::DeliveryError::Send(e) => {
+                ErrorCode::Unknown(format!("signal {sig:?}: {e}"))
+            },
+        })
     }
     #[cfg(not(unix))]
     {
-        let _ = (pid, sig);
+        if pid == 0 {
+            return Err(ErrorCode::Closed);
+        }
+        let _ = sig;
         Err(ErrorCode::Unknown(
             "process signals unsupported on this platform".to_string(),
         ))

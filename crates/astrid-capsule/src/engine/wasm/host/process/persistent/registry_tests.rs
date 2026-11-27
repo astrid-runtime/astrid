@@ -173,6 +173,18 @@ async fn spawn_wait_read_and_owner_isolation() {
 
     // Exited but retained → still resolvable; release reaps it.
     assert!(reg.status(&id, &alice, "cap-a").is_ok());
+    assert!(matches!(
+        reg.release(&id, &bob, "cap-a"),
+        Err(ErrorCode::NoSuchProcess)
+    ));
+    assert!(
+        reg.status_many(std::slice::from_ref(&id), &alice, "cap-b")
+            .is_empty()
+    );
+    assert_eq!(
+        reg.status_many(std::slice::from_ref(&id), &alice, "cap-a")[0].id,
+        id
+    );
     reg.release(&id, &alice, "cap-a").expect("release");
     assert!(reg.status(&id, &alice, "cap-a").is_err());
 }
@@ -385,4 +397,46 @@ async fn write_stdin_delivers_survives_reset_and_close_eofs() {
     ));
 
     reg.release(&id, &alice, "cap").expect("release");
+}
+
+#[cfg(unix)]
+#[test]
+fn group_signal_fallback_uses_the_same_positive_pid_and_signal() {
+    use super::signal_target::{DeliveryError, deliver};
+    use std::cell::RefCell;
+
+    for (pid, group_ok) in [(0, false), (u32::MAX, false), (73, true), (73, false)] {
+        let calls = RefCell::new(Vec::new());
+        let result = deliver(
+            pid,
+            15u8,
+            |p, s| {
+                calls.borrow_mut().push(("group", p, s));
+                group_ok
+            },
+            |p, s| {
+                calls.borrow_mut().push(("process", p, s));
+                Err(7u8)
+            },
+        );
+        let observed = calls.into_inner();
+        match pid {
+            0 => {
+                assert!(matches!(result, Err(DeliveryError::Closed)));
+                assert!(observed.is_empty());
+            },
+            u32::MAX => {
+                assert!(matches!(result, Err(DeliveryError::InvalidPid)));
+                assert!(observed.is_empty());
+            },
+            _ if group_ok => {
+                assert!(result.is_ok());
+                assert_eq!(observed, [("group", 73, 15)]);
+            },
+            _ => {
+                assert!(matches!(result, Err(DeliveryError::Send(7))));
+                assert_eq!(observed, [("group", 73, 15), ("process", 73, 15)]);
+            },
+        }
+    }
 }

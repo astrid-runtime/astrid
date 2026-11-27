@@ -3,6 +3,11 @@
 extern crate self as astrid_core;
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/process/command.rs"]
 mod process_command;
+#[path = "../crates/astrid-capsule/src/engine/wasm/host/process/persistent/selection.rs"]
+mod process_selection;
+#[path = "../crates/astrid-capsule/src/engine/wasm/host/process/persistent/signal_target.rs"]
+mod signal_target;
+mod hosted_process_selection;
 #[path = "../crates/astrid-capsule/src/profile_cache/command.rs"]
 mod profile_command;
 mod hosted_process_command;

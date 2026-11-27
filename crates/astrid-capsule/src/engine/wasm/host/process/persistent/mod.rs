@@ -35,13 +35,12 @@
 //! # Security model
 //!
 //! The `process-id` is a 256-bit host-minted CSPRNG token (lowercase base32,
-//! see [`ids`]). The registry stores only a keyed BLAKE3 hash of the id,
-//! never the raw token. Possession is necessary but NOT sufficient: every
+//! see [`ids`]). A keyed BLAKE3 digest indexes each entry. The entry retains
+//! the token so its owner can recover it through status and list. Possession is necessary but NOT sufficient: every
 //! id-keyed call re-resolves the live `(principal, capsule)` and checks them
 //! against the recorded creator before touching the entry, so a leaked token
-//! is inert across the principal/capsule boundary. Unknown / wrong-owner /
-//! wrong-capsule / reaped / malformed all collapse to `no-such-process` with
-//! no distinguishing oracle.
+//! is inert across the principal/capsule boundary. Lookup refuses an absent or foreign entry. Release is idempotent for
+//! an absent entry and refuses a foreign entry.
 
 mod config;
 mod entry;
@@ -49,6 +48,10 @@ mod ids;
 #[cfg(test)]
 mod registry_tests;
 mod ring;
+mod selection;
+#[cfg(unix)]
+mod signal_target;
+use selection::Selection;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -166,10 +169,11 @@ impl PersistentProcessRegistry {
     ) -> Result<entry::Resolved, ErrorCode> {
         let key = self.key_of(id);
         let map = self.lock();
-        let entry = map.get(&key).ok_or(ErrorCode::NoSuchProcess)?;
-        if &entry.creator != principal || &*entry.capsule_id != capsule_id {
+        let Selection::Owned(entry) =
+            selection::select(&map, &key, |e| e.owned_by(principal, capsule_id))
+        else {
             return Err(ErrorCode::NoSuchProcess);
-        }
+        };
         if let Ok(mut core) = entry.core.lock() {
             core.last_touch = Instant::now();
         }
@@ -307,10 +311,11 @@ impl PersistentProcessRegistry {
     ) -> Result<ProcessInfo, ErrorCode> {
         let key = self.key_of(id);
         let map = self.lock();
-        let entry = map.get(&key).ok_or(ErrorCode::NoSuchProcess)?;
-        if &entry.creator != principal || &*entry.capsule_id != capsule_id {
+        let Selection::Owned(entry) =
+            selection::select(&map, &key, |e| e.owned_by(principal, capsule_id))
+        else {
             return Err(ErrorCode::NoSuchProcess);
-        }
+        };
         Ok(entry.info())
     }
 
@@ -324,9 +329,12 @@ impl PersistentProcessRegistry {
         let map = self.lock();
         ids.iter()
             .filter_map(|id| {
-                let entry = map.get(&self.key_of(id))?;
-                (entry.creator == *principal && &*entry.capsule_id == capsule_id)
-                    .then(|| entry.info())
+                match selection::select(&map, &self.key_of(id), |e| {
+                    e.owned_by(principal, capsule_id)
+                }) {
+                    Selection::Owned(entry) => Some(entry.info()),
+                    Selection::Foreign | Selection::Absent => None,
+                }
             })
             .collect()
     }
@@ -341,7 +349,7 @@ impl PersistentProcessRegistry {
     ) -> Vec<ProcessInfo> {
         let map = self.lock();
         map.values()
-            .filter(|e| e.creator == *principal && &*e.capsule_id == capsule_id)
+            .filter(|e| e.owned_by(principal, capsule_id))
             .filter(|e| label_filter.is_none_or(|f| e.label.contains(f)))
             .map(PersistentEntry::info)
             .collect()
@@ -540,12 +548,11 @@ impl PersistentProcessRegistry {
     ) -> Result<(), ErrorCode> {
         let key = self.key_of(id);
         let mut map = self.lock();
-        let Some(entry) = map.get(&key) else {
-            return Ok(());
+        let entry = match selection::select(&map, &key, |e| e.owned_by(principal, capsule_id)) {
+            Selection::Owned(entry) => entry,
+            Selection::Absent => return Ok(()),
+            Selection::Foreign => return Err(ErrorCode::NoSuchProcess),
         };
-        if entry.creator != *principal || &*entry.capsule_id != capsule_id {
-            return Err(ErrorCode::NoSuchProcess);
-        }
         if entry.is_live() {
             return Err(ErrorCode::InvalidInput);
         }
