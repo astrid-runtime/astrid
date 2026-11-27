@@ -541,9 +541,13 @@ where
         let published = match persisted {
             Err(failure) => Err(failure),
             Ok(group) => group.publish(|persisted| {
-                for location in persisted.locations {
-                    inner.index.insert(location.0, location.1);
-                    inner.pending_index_locations.push(location);
+                for (id, location) in persisted.locations {
+                    super::arena_index::publish(
+                        &mut inner.index,
+                        &mut inner.pending_index_locations,
+                        id,
+                        location,
+                    );
                 }
                 debug_assert!(
                     live_files_mut(&mut inner.files)

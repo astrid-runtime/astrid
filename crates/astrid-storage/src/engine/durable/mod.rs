@@ -807,6 +807,8 @@ impl<P: Ord, I, C> DurableEngine<P, I, C> {
     }
 }
 
+mod arena_index;
+mod direct_placement;
 mod staging;
 
 use crate::engine::durable_cache as cache;

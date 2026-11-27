@@ -354,16 +354,17 @@ where
             }
             if !new_payloads.is_empty() {
                 let appended = append_frames(&mut files.arena, ARENA_MAGIC, &new_payloads)?;
-                if appended.len() != new_ids.len() {
+                if !super::arena_index::publish_batch(
+                    &mut inner.index,
+                    &mut inner.pending_index_locations,
+                    &new_ids,
+                    &appended,
+                ) {
                     return Err(DurableError::Corrupt {
                         file: super::ARENA_FILE,
                         offset: 0,
                         detail: "WAL overlay fold returned the wrong object count",
                     });
-                }
-                for (id, location) in new_ids.iter().copied().zip(appended) {
-                    inner.index.insert(id, location);
-                    inner.pending_index_locations.push((id, location));
                 }
             }
             let journals = pending

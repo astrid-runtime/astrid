@@ -86,9 +86,14 @@ where
     let persisted = persist_restore(&mut inner, &objects, &journal);
     match persisted {
         Ok((locations, arena_len)) => {
-            for location in locations {
-                inner.index.insert(location.0, location.1);
-                inner.pending_index_locations.push(location);
+            let state = &mut *inner;
+            for (id, location) in locations {
+                super::arena_index::publish(
+                    &mut state.index,
+                    &mut state.pending_index_locations,
+                    id,
+                    location,
+                );
             }
             inner.validated.extend(validated);
             inner.roots_by_principal = restore.roots;

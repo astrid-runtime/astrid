@@ -43,6 +43,24 @@ def consumer_defects():
         lambda s: replace_once(s, "record_at(frame@,40,scheme,r) &&\n            (exists|digest:[u8;32]| digest@ == id.digest() && #[trigger] identify.ensures((&r,),digest))",
             "record_at(frame@,40,scheme,r)"), record_trace,
     )
+    placement_trace = Path("verification/hosted_arena_placement.rs")
+    index = Path("crates/astrid-storage/src/engine/durable/arena_index.rs")
+    placement = Path("crates/astrid-storage/src/engine/durable/direct_placement.rs")
+    for name, source, clause, change, target in [
+        ("assigns the next index slot", index, "publish(index,delta,keys[i],locations[i]);", "publish(index,delta,keys[i],locations[0]);", index),
+        ("loses the lookup key", index, "location == index@[key] &&", "true &&", placement_trace),
+        ("loses the description key", index, "*d == direct@[key]", "true", placement_trace),
+        ("publishes the first direct location repeatedly", placement, "install(direct,description,locations[i]);", "install(direct,description,locations[0]);", placement),
+        ("loses the index updates", placement, "final(index)@ == super::arena_index::applied(old(index)@,ids@,locations@,ids@.len())", "true", placement_trace),
+        ("loses the checkpoint delta", placement, "final(delta)@ == old(delta)@ + Seq::new(ids@.len(),|i:int| (ids@[i],locations@[i]))", "true", placement_trace),
+        ("loses catalogue updates", placement, "final(direct)@ == catalogue(old(direct)@,descriptions@,locations@,ids@.len())", "true", placement_trace),
+        ("loses the profile-bound blob", placement, "identify.ensures((profile,bytes),Ok(prepared.fields().1))", "true", placement_trace),
+        ("loses the canonical body", record, "body@ == bytes@.skip(40)", "true", placement_trace),
+    ]:
+        yield (
+            f"arena staging {name}", source,
+            lambda s, a=clause, b=change: replace_once(s, a, b), target,
+        )
     overlay = Path("crates/astrid-storage/src/engine/durable/wal/overlay_object.rs")
     for name, clause, weaker in [
         ("loses acceptance of equal frames", "out.is_ok() == ((*old(self).payload)@ == (*incoming.payload)@)", "out.is_ok() ==> ((*old(self).payload)@ == (*incoming.payload)@)"),

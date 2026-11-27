@@ -113,7 +113,12 @@ where
         prepared: &[BTreeMap<ObjectId, Arc<[u8]>>],
     ) -> Result<(), DurableError> {
         for (id, record) in staged {
-            let location = inner.index.get(id).copied().ok_or(DurableError::Corrupt {
+            let (location, direct) = super::super::arena_index::placement(
+                *id,
+                &inner.index,
+                &inner.pending_direct_objects,
+            )
+            .ok_or(DurableError::Corrupt {
                 file: ARENA_FILE,
                 offset: 0,
                 detail: "WAL staged object is missing its arena location",
@@ -125,7 +130,7 @@ where
                 payload,
                 Arc::new(record.clone()),
                 location,
-                inner.pending_direct_objects.get(id).cloned(),
+                direct.cloned(),
             )?;
         }
         for objects in prepared {

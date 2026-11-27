@@ -114,11 +114,16 @@ use object_record::{ObjectRecord,ObjectFormatVersion};
 use object_reference::{ObjectId, ObjectReference, ReferenceLabel};
 #[path = "../crates/astrid-storage/src/engine/durable/format/arena_span.rs"]
 mod arena_span;
+#[path = "../crates/astrid-storage/src/engine/durable/arena_index.rs"]
+mod arena_index;
+#[path = "../crates/astrid-storage/src/engine/durable/direct_placement.rs"]
+mod direct_placement;
 #[path = "../crates/astrid-storage/src/engine/durable/format/positional_read.rs"]
 mod positional_read;
 #[path = "../crates/astrid-storage/src/engine/durable/format/verified_record.rs"]
 mod verified_record;
 mod hosted_record_model;
+mod hosted_arena_placement;
 mod hosted_record_roundtrip;
 mod hosted_closure_model;
 

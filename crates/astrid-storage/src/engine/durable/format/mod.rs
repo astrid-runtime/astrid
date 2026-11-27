@@ -513,13 +513,8 @@ pub(super) fn canonical_record_bytes(
     frame_payload: &[u8],
     scheme: IdentityScheme,
 ) -> Result<&[u8], DurableError> {
-    let mut reader = SliceReader::new(frame_payload);
-    reader
-        .identity(scheme)
-        .map_err(|detail| corrupt(ARENA_FILE, 0, detail))?;
-    frame_payload
-        .get(reader.offset..)
-        .ok_or(DurableError::EncodingOverflow)
+    verified_record::canonical_suffix(frame_payload, scheme.into())
+        .map_err(|error| corrupt(ARENA_FILE, 0, error.detail()))
 }
 
 pub(super) fn decode_object_frame(

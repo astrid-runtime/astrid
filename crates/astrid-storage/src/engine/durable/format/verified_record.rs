@@ -61,6 +61,16 @@ pub(super) open spec fn wire(scheme:Scheme,id:[u8;32]) -> Seq<u8> {
     scheme.algorithm@ + scheme.construction@ + seq![32u8,0u8,0u8,0u8] + id@
 }
 
+/// Return only the canonical body after validating the identity scheme and tag.
+pub(super) fn canonical_suffix(bytes:&[u8],scheme:Scheme) -> (out:Result<&[u8],TagError>)
+    ensures out.is_ok() == tag(bytes@,0,scheme),
+        out matches Ok(body) ==> body@ == bytes@.skip(40),
+{
+    let mut cursor = 0;
+    identity(bytes,&mut cursor,scheme)?;
+    Ok(&bytes[cursor..])
+}
+
 pub(super) fn append_identity(bytes:&mut Vec<u8>,scheme:Scheme,id:[u8;32])
     ensures final(bytes)@ == old(bytes)@ + wire(scheme,id),
 {

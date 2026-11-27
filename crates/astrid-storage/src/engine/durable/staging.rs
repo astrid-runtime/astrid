@@ -347,8 +347,13 @@ where
                         return Err(error);
                     },
                 };
-                inner.index.insert(id, location);
-                inner.pending_index_locations.push((id, location));
+                let state = &mut *inner;
+                super::arena_index::publish(
+                    &mut state.index,
+                    &mut state.pending_index_locations,
+                    id,
+                    location,
+                );
                 if let Some(direct) = direct {
                     inner.pending_direct_objects.insert(id, direct);
                 }
@@ -586,20 +591,18 @@ where
         direct: Vec<Option<PreparedDirectArenaObject>>,
         locations: &[ArenaLocation],
     ) -> Result<(), DurableError> {
-        if ids.len() != locations.len() || ids.len() != direct.len() {
+        if !super::direct_placement::install_appended(
+            &mut inner.index,
+            &mut inner.pending_index_locations,
+            &mut inner.pending_direct_objects,
+            ids,
+            direct,
+            locations,
+        ) {
             self.mark_requires_recovery(inner);
             return Err(DurableError::InvalidRepresentationState(
                 "prepared staging batch lengths disagree",
             ));
-        }
-        for (id, location) in ids.iter().copied().zip(locations.iter().copied()) {
-            inner.index.insert(id, location);
-            inner.pending_index_locations.push((id, location));
-        }
-        for (prepared, location) in direct.into_iter().zip(locations.iter().copied()) {
-            if let Some(object) = prepared.map(|prepared| prepared.place(location)) {
-                inner.pending_direct_objects.insert(object.object, object);
-            }
         }
         Ok(())
     }

@@ -596,8 +596,12 @@ where
                 return Err(error);
             },
         };
-        inner.index.insert(id, location);
-        inner.pending_index_locations.push((id, location));
+        super::arena_index::publish(
+            &mut inner.index,
+            &mut inner.pending_index_locations,
+            id,
+            location,
+        );
         inner.validated.insert(id);
         debug_assert_eq!(
             previous_arena_len,
