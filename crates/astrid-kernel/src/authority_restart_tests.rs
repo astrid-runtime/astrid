@@ -129,11 +129,8 @@ async fn hosted_token_revocation_and_consumption_survive_storage_reopen() {
         signature: KeyPair::generate().sign(b"retirement test allowance"),
     };
     allowances.add_allowance(allowance.clone()).unwrap();
-    super::authority_recovery::restore_retirement_fences(
-        &snapshot,
-        &directory,
-        &reopened,
-        &allowances,
+    let (reopened, allowances) = super::authority_recovery::restore_retirement_fences(
+        &snapshot, &directory, reopened, allowances,
     )
     .await
     .unwrap();
@@ -194,11 +191,11 @@ async fn restored_fences_cover_legacy_and_renamed_reservations_in_both_stores() 
         .unwrap();
     let capabilities = CapabilityStore::in_memory();
     let allowances = AllowanceStore::new();
-    super::authority_recovery::restore_retirement_fences(
+    let (capabilities, allowances) = super::authority_recovery::restore_retirement_fences(
         &snapshot,
         &recovered,
-        &capabilities,
-        &allowances,
+        capabilities,
+        allowances,
     )
     .await
     .unwrap();

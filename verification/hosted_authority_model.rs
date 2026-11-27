@@ -868,14 +868,15 @@ fn fuel_settlement(spent: u64, reserved: u64, released: u64, actual: u64) -> (ne
 verus! {
 /// After both stores consume the recovery targets, a probe sees exactly its
 /// previous fence or a name of this deletion. Repeated observations are idempotent.
-fn recovered_fence_membership(
+pub(super) fn recovered_fence_membership(
     directory: &std::collections::HashMap<u64,u64>, uid: u64, retained: Option<u64>,
     capabilities: &mut std::collections::HashSet<u64>, allowances: &mut std::collections::HashSet<u64>,
     probe: u64,
 ) -> (closed: (bool,bool))
     requires vstd::std_specs::hash::hash_map_inv(directory),
         vstd::std_specs::hash::hash_set_inv(old(capabilities)), vstd::std_specs::hash::hash_set_inv(old(allowances)),
-    ensures ({
+    ensures vstd::std_specs::hash::hash_set_inv(final(capabilities)), vstd::std_specs::hash::hash_set_inv(final(allowances)),
+        closed == (final(capabilities)@.contains(probe),final(allowances)@.contains(probe)), ({
         let named = retained == Some(probe) || directory@.get(uid) == Some(probe);
         closed == (old(capabilities)@.contains(probe) || named, old(allowances)@.contains(probe) || named)
     }),

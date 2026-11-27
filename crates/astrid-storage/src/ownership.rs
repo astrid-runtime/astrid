@@ -19,6 +19,7 @@ use crate::{KvStore, PrincipalDirectory, ScopedKvStore, StorageError};
 
 mod deletion;
 mod derived;
+mod pending;
 mod provision;
 mod resources;
 mod shared_snapshot;
@@ -83,12 +84,22 @@ pub struct OwnershipSnapshot {
     local_user_binding_initialized: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PrincipalDeletionReservation {
-    alias: Option<PrincipalId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    fleet: Option<FleetUid>,
+type PrincipalDeletionReservation = pending::Reservation<PrincipalId, FleetUid>;
+
+struct PendingDeletions<'a>(
+    std::collections::btree_map::Iter<'a, PrincipalUid, PrincipalDeletionReservation>,
+);
+
+impl<'a> Iterator for PendingDeletions<'a> {
+    type Item = (PrincipalUid, Option<&'a PrincipalId>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        pending::next(&mut self.0)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
 }
 
 impl Default for OwnershipSnapshot {
@@ -136,9 +147,7 @@ impl OwnershipSnapshot {
     pub fn pending_principal_deletions(
         &self,
     ) -> impl Iterator<Item = (PrincipalUid, Option<&PrincipalId>)> {
-        self.principal_deletions
-            .iter()
-            .map(|(&uid, reservation)| (uid, reservation.alias.as_ref()))
+        PendingDeletions(pending::scan(&self.principal_deletions))
     }
 
     /// Iterate over users in stable UID order.

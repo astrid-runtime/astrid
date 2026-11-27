@@ -362,3 +362,7 @@ mod hosted_runtime_residency;
 
 #[path = "../crates/astrid-core/src/principal/retirement.rs"]
 mod principal_fences;
+
+#[path = "../crates/astrid-storage/src/ownership/pending.rs"]
+mod pending_deletions;
+mod hosted_retirement_recovery;

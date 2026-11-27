@@ -1005,35 +1005,9 @@ impl Kernel {
 
         // Bootstrap the capability store (persistent) over the injected KV.
         // Key rotation invalidates persisted tokens (fail-secure by design).
-        let capabilities = Arc::new(
-            CapabilityStore::with_kv_store(Arc::clone(&kv))
-                .await
-                .map_err(|e| {
-                    std::io::Error::other(format!("Failed to init capability store: {e}"))
-                })?,
-        );
-
-        // Initialize the MCP process manager with its security layer. Native
-        // only — the MCP host surface belongs to the Wasmtime engine, which the
-        // browser profile does not build. `workspace_root` is set so sandboxed
-        // MCP servers have a writable directory.
-        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let mcp = {
-            let mcp_config = ServersConfig::load_default().unwrap_or_default();
-            let mcp_manager = ServerManager::new(mcp_config)
-                .with_workspace_root(workspace_root.clone())
-                // MCP is a system service, not a principal-home projection.
-                // Keep native operational logs under the top-level log tree
-                // so boot never recreates `home/<alias>/.local/log`.
-                .with_capsule_log_dir(home.log_dir().join("system").join("mcp"));
-            let mcp_client = McpClient::new(mcp_manager);
-            SecureMcpClient::new(
-                mcp_client,
-                Arc::clone(&capabilities),
-                Arc::clone(&audit_log),
-                session_id.clone(),
-            )
-        };
+        let capabilities = CapabilityStore::with_kv_store(Arc::clone(&kv))
+            .await
+            .map_err(|e| std::io::Error::other(format!("Failed to init capability store: {e}")))?;
 
         // Establish the physical security boundary (sandbox handle).
         let root_handle = DirHandle::new();
@@ -1059,7 +1033,6 @@ impl Kernel {
             root_handle.clone(),
         ));
 
-        let allowance_store = Arc::new(astrid_approval::AllowanceStore::new());
         // Create system-wide identity store backed by the shared KV.
         let identity_kv = astrid_storage::ScopedKvStore::new(Arc::clone(&kv), "system:identity")
             .map_err(|e| std::io::Error::other(format!("Failed to create identity KV: {e}")))?;
@@ -1085,13 +1058,35 @@ impl Kernel {
         let ownership = ownership_store.load().await.map_err(|error| {
             std::io::Error::other(format!("Failed to load ownership graph: {error}"))
         })?;
-        authority_recovery::restore_retirement_fences(
+        let (capabilities, allowance_store) = authority_recovery::restore_retirement_fences(
             &ownership,
             &principal_directory,
-            &capabilities,
-            &allowance_store,
+            capabilities,
+            astrid_approval::AllowanceStore::new(),
         )
         .await?;
+
+        // Initialize the MCP process manager with its security layer. Native
+        // only — the MCP host surface belongs to the Wasmtime engine, which the
+        // browser profile does not build. `workspace_root` is set so sandboxed
+        // MCP servers have a writable directory.
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let mcp = {
+            let mcp_config = ServersConfig::load_default().unwrap_or_default();
+            let mcp_manager = ServerManager::new(mcp_config)
+                .with_workspace_root(workspace_root.clone())
+                // MCP is a system service, not a principal-home projection.
+                // Keep native operational logs under the top-level log tree
+                // so boot never recreates `home/<alias>/.local/log`.
+                .with_capsule_log_dir(home.log_dir().join("system").join("mcp"));
+            let mcp_client = McpClient::new(mcp_manager);
+            SecureMcpClient::new(
+                mcp_client,
+                Arc::clone(&capabilities),
+                Arc::clone(&audit_log),
+                session_id.clone(),
+            )
+        };
 
         // Load group config (issue #670). Boot-loaded once, then swapped
         // atomically by Layer 6 admin topics (issue #672). Missing file
