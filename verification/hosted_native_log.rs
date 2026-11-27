@@ -61,4 +61,29 @@ fn log_operation<'a>(tracker:&u64,owner:&u64,held:Option<&'a (u64,Option<u64>)>,
     };
     crate::native_log_admission::admit(tracker,owner,held,covers,begin)
 }
+
+/// On Unix, either exclusive creation returned this handle, or the open
+/// of the same parent and leaf returned it and identity confirmation passed.
+fn append_handle<T,I,H,E,A:crate::private_append_leaf::LeafAccess<T,I,H,E>>(io:&mut A,target:&T)
+    -> (out:Result<H,E>)
+    ensures ({
+        let prior = old(io).calls().len();
+        let calls = final(io).calls();
+        &&& prior < calls.len() <= prior + 5
+        &&& match out {
+            Ok(h) => match calls.last() {
+                crate::private_append_leaf::Call::Create(t,Ok(created)) => t == *target && created == h,
+                crate::private_append_leaf::Call::Confirm(t,id,opened,Ok(())) => t == *target && opened == h &&
+                    calls[calls.len()-2] == crate::private_append_leaf::Call::Open(*target,Ok(h)) &&
+                    calls[calls.len()-3] == crate::private_append_leaf::Call::Observe(*target,Ok(id)),
+                _ => false,
+            },
+            Err(_) => true,
+        }
+    }),
+{
+    let out = crate::private_append_leaf::open(io,target);
+    out
+}
+
 }

@@ -238,3 +238,14 @@ def defects():
             f"live UID {name}", source,
             lambda s, a=old, b=new: replace_once(s, a, b), trace,
         )
+
+    source = Path("crates/astrid-core/src/platform_fs/private_projection/unix/append/selection.rs")
+    for name, old, new, failure in [
+        ("skips identity confirmation", "io.confirm(target,id,&file)?;", "let _ = id;", source),
+        ("retries an unrelated create error", "Err(CreateError::Other(e)) => Err(e)", "Err(CreateError::Other(_)) => existing(io,target)", source),
+        ("can return an unconfirmed handle", "Ok(result) => result == h && after ==", "Ok(_result) => after ==", trace),
+    ]:
+        yield (
+            f"Unix append {name}", source,
+            lambda s, a=old, b=new: replace_once(s, a, b), failure,
+        )

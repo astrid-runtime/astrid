@@ -1,5 +1,7 @@
 //! Immutable root authority; per-open chains never enter a shared cache.
 
+mod selection;
+
 use super::anchor::{DirectoryChain, Root, WalkPolicy};
 use super::{
     Identity, MountBoundary, RelativePath, entry_stat, fstat, invalid, invalid_path, nix_io_error,
@@ -80,26 +82,48 @@ impl AppendRoot {
 }
 
 fn open_leaf(parent: &File, name: &OsStr) -> io::Result<File> {
-    if entry_stat(parent, name)?.is_some() {
-        return open_existing(parent, name);
-    }
-    let flags = append_flags() | OFlag::O_CREAT | OFlag::O_EXCL;
-    match openat(parent, name, flags, Mode::from_bits_truncate(0o600)) {
-        Ok(file) => Ok(File::from(file)),
-        // Another sink may create the same daily file. Acquire and validate its
-        // current identity once; never retry indefinitely or overwrite it.
-        Err(nix::errno::Errno::EEXIST) => open_existing(parent, name),
-        Err(error) => Err(nix_io_error(error)),
-    }
+    selection::open(&mut NativeLeafAccess, &(parent, name))
 }
 
-fn open_existing(parent: &File, name: &OsStr) -> io::Result<File> {
-    let before = entry_stat(parent, name)?.ok_or_else(|| invalid("append leaf disappeared"))?;
-    require_regular(&before)?;
-    let file =
-        File::from(openat(parent, name, append_flags(), Mode::empty()).map_err(nix_io_error)?);
-    verify_identity(parent, name, &file, Identity::read(&before))?;
-    Ok(file)
+struct NativeLeafAccess;
+
+impl selection::LeafAccess<(&File, &OsStr), Identity, File, io::Error> for NativeLeafAccess {
+    fn probe(&mut self, &(parent, name): &(&File, &OsStr)) -> io::Result<bool> {
+        Ok(entry_stat(parent, name)?.is_some())
+    }
+
+    fn create(
+        &mut self,
+        &(parent, name): &(&File, &OsStr),
+    ) -> Result<File, selection::CreateError<io::Error>> {
+        let flags = append_flags() | OFlag::O_CREAT | OFlag::O_EXCL;
+        match openat(parent, name, flags, Mode::from_bits_truncate(0o600)) {
+            Ok(file) => Ok(File::from(file)),
+            Err(nix::errno::Errno::EEXIST) => Err(selection::CreateError::Exists),
+            Err(error) => Err(selection::CreateError::Other(nix_io_error(error))),
+        }
+    }
+
+    fn observe(&mut self, &(parent, name): &(&File, &OsStr)) -> io::Result<Identity> {
+        let before = entry_stat(parent, name)?.ok_or_else(|| invalid("append leaf disappeared"))?;
+        require_regular(&before)?;
+        Ok(Identity::read(&before))
+    }
+
+    fn open_existing(&mut self, &(parent, name): &(&File, &OsStr)) -> io::Result<File> {
+        openat(parent, name, append_flags(), Mode::empty())
+            .map(File::from)
+            .map_err(nix_io_error)
+    }
+
+    fn confirm(
+        &mut self,
+        &(parent, name): &(&File, &OsStr),
+        expected: Identity,
+        file: &File,
+    ) -> io::Result<()> {
+        verify_identity(parent, name, file, expected)
+    }
 }
 
 fn append_flags() -> OFlag {
