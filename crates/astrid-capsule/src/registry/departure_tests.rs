@@ -107,3 +107,39 @@ fn removing_system_owner_revokes_every_dependent_view() {
         );
     }
 }
+
+#[test]
+fn legacy_alias_table_survives_departure_of_one_of_two_generations() {
+    let mut registry = CapsuleRegistry::new();
+    let package = CapsuleId::from_static("shared-artifact");
+    let artifact = test_hash("shared-bytes");
+    let alice = pid("alice");
+    let bob = pid("bob");
+    for (principal, user) in [(&alice, uid(1)), (&bob, uid(2))] {
+        registry
+            .register_principal_runtime(
+                Box::new(MockCapsule::new("shared-artifact")),
+                artifact.clone(),
+                principal,
+                user,
+            )
+            .unwrap();
+    }
+    let aliases = [Uuid::new_v4(), Uuid::new_v4()];
+    for alias in aliases {
+        registry.register_instance_uuid(alias, artifact.clone());
+    }
+
+    let before = registry.legacy_uuid_map.clone();
+    let peer = registry.get_for(&bob, &package).unwrap();
+    assert!(registry.unregister_for(&alice, &package).unwrap().torn_down);
+    assert_eq!(registry.legacy_uuid_map, before);
+    for alias in aliases {
+        assert!(Arc::ptr_eq(
+            &registry.find_instance_by_uuid_for(&bob, &alias).unwrap(),
+            &peer
+        ));
+    }
+    assert!(registry.unregister_for(&bob, &package).unwrap().torn_down);
+    assert!(registry.legacy_uuid_map.is_empty());
+}
