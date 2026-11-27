@@ -271,6 +271,9 @@ mod hosted_pool_return;
 mod io_splice;
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/io/dispatch.rs"]
 mod io_dispatch;
+#[path = "../crates/astrid-capsule/src/engine/wasm/host/io/disposal.rs"]
+mod io_disposal;
+mod hosted_io_disposal;
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/net/destinations.rs"]
 mod tcp_destinations;
 mod hosted_tcp_destinations;

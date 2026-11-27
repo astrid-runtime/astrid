@@ -85,6 +85,8 @@ wasmtime::component::bindgen!({
         "astrid:io/streams.[method]output-stream.blocking-flush": async | trappable,
         "astrid:io/streams.[method]output-stream.blocking-write-zeroes-and-flush": async | trappable,
         "astrid:io/streams.[method]output-stream.blocking-splice": async | trappable,
+        "astrid:io/streams.[drop]input-stream": async | trappable,
+        "astrid:io/streams.[drop]output-stream": async | trappable,
         "astrid:io/streams": trappable,
         // Resource exhaustion must reach the guest as a trap before a handle is returned.
         "astrid:http/host.[method]http-stream.subscribe-readable": trappable,

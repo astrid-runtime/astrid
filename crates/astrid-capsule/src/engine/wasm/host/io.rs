@@ -16,6 +16,8 @@
 
 mod authority;
 mod dispatch;
+mod disposal;
+mod release;
 mod splice;
 mod transfer;
 
@@ -143,7 +145,7 @@ impl astrid_poll::HostPollable for HostState {
     }
 
     fn drop(&mut self, rep: Resource<Pollable>) -> WResult<()> {
-        wasi_poll::HostPollable::drop(&mut self.resource_table, rep)
+        release::from_table(&mut self.resource_table, rep, wasi_poll::HostPollable::drop)?
     }
 }
 
@@ -170,9 +172,9 @@ mod astrid_error_impl {
         }
 
         fn drop(&mut self, rep: Resource<Error>) -> WResult<()> {
-            let _ = self
-                .resource_table
-                .delete::<IoError>(Resource::new_own(rep.rep()));
+            super::release::from_table(&mut self.resource_table, rep, |table, error| {
+                table.delete(error).map(drop)
+            })??;
             Ok(())
         }
     }
@@ -330,11 +332,13 @@ mod astrid_streams_impl {
             )
         }
 
-        fn drop(&mut self, rep: Resource<InputStream>) -> WResult<()> {
-            wasi_streams::HostInputStream::drop(
+        async fn drop(&mut self, rep: Resource<InputStream>) -> WResult<()> {
+            super::release::from_table(
                 &mut self.resource_table,
-                Resource::new_own(rep.rep()),
-            )
+                rep,
+                async_streams::HostInputStream::drop,
+            )?
+            .await
         }
     }
 
@@ -475,11 +479,13 @@ mod astrid_streams_impl {
             result
         }
 
-        fn drop(&mut self, rep: Resource<OutputStream>) -> WResult<()> {
-            wasi_streams::HostOutputStream::drop(
+        async fn drop(&mut self, rep: Resource<OutputStream>) -> WResult<()> {
+            super::release::from_table(
                 &mut self.resource_table,
-                Resource::new_own(rep.rep()),
-            )
+                rep,
+                async_streams::HostOutputStream::drop,
+            )?
+            .await
         }
     }
 }
@@ -492,3 +498,6 @@ mod splice_tests;
 
 #[cfg(test)]
 mod access_tests;
+
+#[cfg(test)]
+mod disposal_tests;

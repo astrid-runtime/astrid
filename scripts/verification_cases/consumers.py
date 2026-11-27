@@ -69,6 +69,19 @@ def consumer_defects():
             f"blocking stream completion {name}", dispatch,
             lambda s, a=original, b=changed: replace_once(s, a, b), splice_trace,
         )
+    disposal = Path("crates/astrid-capsule/src/engine/wasm/host/io/disposal.rs")
+    disposal_trace = Path("verification/hosted_io_disposal.rs")
+    for name, original, changed in [
+        ("loses borrowed refusal", "Err(Refusal::Borrowed) => owned.ensures((&handle,),false)", "Err(Refusal::Borrowed) => true"),
+        ("loses the lookup error", "children.ensures((&table,&handle),Err(e))", "true"),
+        ("loses child-edge refusal", "children.ensures((&table,&handle),Ok(true))", "true"),
+        ("allows removal with live children", "children.ensures((&table,&handle),Ok(false))", "true"),
+        ("loses the selected handle or table", "&& remove.ensures((table,handle),r)", "&& true"),
+    ]:
+        yield (
+            f"I/O disposal {name}", disposal,
+            lambda s, a=original, b=changed: replace_once(s, a, b), disposal_trace,
+        )
     pool = Path("crates/astrid-capsule/src/engine/wasm/pool/return_policy.rs")
     pool_trace = Path("verification/hosted_pool_return.rs")
     for name, original, changed in [
