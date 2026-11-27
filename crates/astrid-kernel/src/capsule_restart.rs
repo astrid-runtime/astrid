@@ -84,28 +84,24 @@ impl Kernel {
                 prepared.capsule.unload().await?;
                 return Ok(RestartOutcome::Superseded);
             }
-            if prepared.system_runtime
-                && let Err(error) = registry.validate_system_runtime_replacement(
-                    &current_runtime,
-                    prepared.capsule.as_ref(),
-                    &prepared.runtime_id,
-                )
-            {
-                drop(registry);
-                drop(load_guard);
-                prepared.capsule.retire();
-                prepared.capsule.request_cancel();
-                if let Err(cleanup) = prepared.capsule.unload().await {
-                    tracing::warn!(capsule_id = %id, %cleanup, "Failed to unload rejected replacement publication");
-                }
-                return Err(anyhow::anyhow!(error));
-            }
             let replaced = if prepared.system_runtime {
-                registry.replace_system_runtime_reserved(
+                match registry.try_replace_system_runtime_reserved(
                     &current_runtime,
                     prepared.capsule,
                     prepared.runtime_id,
-                )?
+                ) {
+                    Ok(replaced) => replaced,
+                    Err(mut rejected) => {
+                        drop(registry);
+                        drop(load_guard);
+                        rejected.capsule.retire();
+                        rejected.capsule.request_cancel();
+                        if let Err(cleanup) = rejected.capsule.unload().await {
+                            tracing::warn!(capsule_id = %id, %cleanup, "Failed to unload rejected replacement publication");
+                        }
+                        return Err(anyhow::anyhow!(rejected.error));
+                    },
+                }
             } else {
                 registry.replace_principal_runtime_reserved(
                     &current_runtime,

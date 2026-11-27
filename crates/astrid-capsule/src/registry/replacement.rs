@@ -4,8 +4,8 @@ use astrid_core::{PrincipalId, PrincipalUid, UplinkDescriptor};
 
 use super::{
     Capsule, CapsuleError, CapsuleId, CapsuleRegistry, CapsuleResult, InstanceEntry,
-    ReplacedRuntime, RuntimeId, RuntimeKey, RuntimeScope, WasmHash, capsule_source_uuid,
-    system_uplink_descriptors,
+    ReplacedRuntime, RuntimeId, RuntimeKey, RuntimePublicationError, RuntimeScope, WasmHash,
+    capsule_source_uuid, system_uplink_descriptors,
 };
 
 /// Descriptors checked against the registered owners and each other before publication.
@@ -96,12 +96,14 @@ impl CapsuleRegistry {
                 "runtime generation changed before replacing '{id}' for '{principal}'"
             )));
         }
-        let previous = self.swap_runtime(
-            expected,
-            runtime_id.clone(),
-            replacement,
-            Some(principal.clone()),
-        )?;
+        let previous = self
+            .swap_runtime(
+                expected,
+                runtime_id.clone(),
+                replacement,
+                Some(principal.clone()),
+            )
+            .map_err(|rejected| rejected.error)?;
         Ok(ReplacedRuntime {
             runtime_id,
             previous,
@@ -122,6 +124,7 @@ impl CapsuleRegistry {
             RuntimeScope::SystemResident,
         )?;
         self.publish_system_replacement(expected, replacement, runtime_id, descriptors)
+            .map_err(|rejected| rejected.error)
     }
 
     /// Atomically publish a preallocated system generation.
@@ -131,8 +134,31 @@ impl CapsuleRegistry {
         replacement: Box<dyn Capsule>,
         runtime_id: RuntimeId,
     ) -> CapsuleResult<ReplacedRuntime> {
+        self.try_replace_system_runtime_reserved(expected, replacement, runtime_id)
+            .map_err(|rejected| rejected.error)
+    }
+
+    /// Publish a reserved system replacement or return its candidate for teardown.
+    ///
+    /// # Errors
+    ///
+    /// A stale generation, mismatched reservation or conflicting uplink leaves the registry unchanged.
+    pub fn try_replace_system_runtime_reserved(
+        &mut self,
+        expected: &RuntimeId,
+        replacement: Box<dyn Capsule>,
+        runtime_id: RuntimeId,
+    ) -> Result<ReplacedRuntime, RuntimePublicationError> {
         let descriptors =
-            self.reserved_system_uplinks(expected, replacement.as_ref(), &runtime_id)?;
+            match self.reserved_system_uplinks(expected, replacement.as_ref(), &runtime_id) {
+                Ok(descriptors) => descriptors,
+                Err(error) => {
+                    return Err(RuntimePublicationError {
+                        capsule: replacement,
+                        error,
+                    });
+                },
+            };
         self.publish_system_replacement(expected, replacement, runtime_id, descriptors)
     }
 
@@ -142,7 +168,7 @@ impl CapsuleRegistry {
         replacement: Box<dyn Capsule>,
         runtime_id: RuntimeId,
         descriptors: CheckedSystemUplinks,
-    ) -> CapsuleResult<ReplacedRuntime> {
+    ) -> Result<ReplacedRuntime, RuntimePublicationError> {
         let owner_alias = self
             .instances
             .get(expected)
@@ -231,13 +257,15 @@ impl CapsuleRegistry {
         runtime_id: RuntimeId,
         replacement: Box<dyn Capsule>,
         owner_alias: Option<PrincipalId>,
-    ) -> CapsuleResult<Arc<dyn Capsule>> {
+    ) -> Result<Arc<dyn Capsule>, RuntimePublicationError> {
         let previous_artifact = expected.key.artifact().clone();
-        let previous = self
-            .instances
-            .remove(expected)
-            .ok_or_else(|| CapsuleError::NotFound(format!("runtime {expected:?}")))?
-            .capsule;
+        let Some(previous) = self.instances.remove(expected) else {
+            return Err(RuntimePublicationError {
+                error: CapsuleError::NotFound(format!("runtime {expected:?}")),
+                capsule: replacement,
+            });
+        };
+        let previous = previous.capsule;
         self.instances.insert(
             runtime_id.clone(),
             InstanceEntry {

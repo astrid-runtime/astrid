@@ -82,3 +82,50 @@ fn system_replacement_builds_the_published_uplink_descriptors_once() -> CapsuleR
     }
     Ok(())
 }
+
+#[test]
+fn rejected_system_publication_returns_the_candidate_and_preserves_the_old_runtime()
+-> CapsuleResult<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mut registry = CapsuleRegistry::new();
+    let package = CapsuleId::from_static("service");
+    let principal = pid("operator");
+    let expected = registry.register_system_runtime(
+        Box::new(MockCapsule::new("service")),
+        test_hash("old"),
+        &principal,
+    )?;
+    let old_handle = registry.get_for(&principal, &package).unwrap();
+    let uplink = astrid_core::UplinkDescriptor::builder("console", "cli").build();
+    let old_uplink = uplink.id;
+    registry.register_uplink(&package, uplink)?;
+
+    let invalid = registry.reserve_runtime_id(
+        package.clone(),
+        test_hash("new"),
+        RuntimeScope::Principal(uid(1)),
+    )?;
+    let mut candidate = MockCapsule::new("service");
+    let reads = Arc::new(AtomicUsize::new(0));
+    candidate.manifest_reads = Some(reads.clone());
+    let Err(rejected) =
+        registry.try_replace_system_runtime_reserved(&expected, Box::new(candidate), invalid)
+    else {
+        panic!("principal reservation was accepted as a system replacement");
+    };
+    assert!(matches!(rejected.error, CapsuleError::ExecutionFailed(_)));
+    assert_eq!(reads.load(Ordering::Relaxed), 0);
+    assert_eq!(rejected.capsule.manifest().package.name, "service");
+    assert_eq!(reads.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        registry.runtime_id_for(&principal, &package),
+        Some(expected)
+    );
+    assert!(Arc::ptr_eq(
+        &old_handle,
+        &registry.get_for(&principal, &package).unwrap()
+    ));
+    assert_eq!(registry.get_uplink(&old_uplink).unwrap().name, "console");
+    Ok(())
+}
