@@ -662,3 +662,30 @@ def checkpoint_branch_consumers():
             f"checkpoint branch layout loses {label}", path,
             lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker), consumer,
         )
+
+
+def checkpoint_summary_consumers():
+    finish = Path("crates/astrid-storage/src/kv/tree/checkpoint_summary.rs")
+    branch = Path("crates/astrid-storage/src/kv/tree/checkpoint_branch.rs")
+    consumer = Path("verification/hosted_checkpoint_summary.rs")
+    for label, path, clause, weaker in [
+        ("finish result", finish, "ensures out == finished(end,length,level,children,totals)", "ensures out.is_err() ==> out == finished(end,length,level,children,totals)"),
+        ("finish rejection", finish, "ensures out == finished(end,length,level,children,totals)", "ensures out.is_ok() ==> out == finished(end,length,level,children,totals)"),
+        ("header rejection", branch, "(out matches Err(DecodeError::Header)) == !self.valid(refs.len())", "(out matches Err(DecodeError::Header)) ==> !self.valid(refs.len())"),
+        ("ordered fences", branch, "&&& checkpoint_summary::ordered(b.children@,self.count as nat)", "&&& true"),
+        ("accounted totals", branch, "&&& checkpoint_summary::counts(b.children@,self.count as nat) ==", "&&& false ==> checkpoint_summary::counts(b.children@,self.count as nat) =="),
+    ]:
+        yield (
+            f"checkpoint branch summary loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker), consumer,
+        )
+
+
+def checkpoint_decode_consumers():
+    yield from checkpoint_page_consumers()
+    yield from checkpoint_reference_consumers()
+    yield from checkpoint_totals_consumers()
+    yield from checkpoint_key_field_consumers()
+    yield from checkpoint_child_consumers()
+    yield from checkpoint_branch_consumers()
+    yield from checkpoint_summary_consumers()

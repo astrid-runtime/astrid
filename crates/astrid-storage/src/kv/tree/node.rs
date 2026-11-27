@@ -10,8 +10,7 @@ use crate::error::{StorageError, StorageResult};
 
 pub(super) const INLINE_VALUE_MAX: usize = 1_024;
 pub(super) const NODE_MAX_RETAINED_BYTES: u64 = 4_096;
-pub(super) const NODE_MAX_ENTRIES: usize = 64;
-pub(super) const MAX_TREE_LEVEL: u16 = 16;
+pub(super) use super::checkpoint_branch::{MAX_TREE_LEVEL, NODE_MAX_ENTRIES};
 
 const LEAF_MAGIC: &[u8] = b"astrid-kv-bplus-leaf-v1\0";
 const BRANCH_MAGIC: &[u8] = b"astrid-kv-bplus-branch-v1\0";
@@ -71,7 +70,6 @@ impl LeafEntry {
 pub(super) type ChildPointer = super::checkpoint_range::Child<ObjectId, NodeTotals>;
 
 pub(super) type LeafNode = super::checkpoint_page::Leaf<ValueSlot, NodeTotals>;
-pub(super) type BranchNode = super::checkpoint_page::Branch<ObjectId, NodeTotals>;
 pub(super) type Node = super::checkpoint_page::Node<ObjectId, NodeTotals, ValueSlot>;
 
 impl Node {
@@ -170,7 +168,7 @@ pub(super) fn branch_record(children: &[ChildPointer]) -> StorageResult<ObjectRe
         .checked_add(1)
         .filter(|level| *level <= MAX_TREE_LEVEL)
         .ok_or_else(arithmetic_overflow)?;
-    let totals = sum_totals(children.iter().map(|child| child.totals))?;
+    let totals = super::checkpoint_summary::sum(children).ok_or_else(arithmetic_overflow)?;
     let mut canonical = Vec::new();
     canonical.extend_from_slice(BRANCH_MAGIC);
     canonical.extend_from_slice(&level.to_le_bytes());
@@ -308,33 +306,28 @@ fn decode_leaf(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
 }
 
 fn decode_branch(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
-    use super::checkpoint_branch::{self, RowsError};
+    use super::checkpoint_branch::{DecodeError, Header, RowsError};
     use super::checkpoint_child::ChildError;
     use super::checkpoint_key_field::KeyError;
+    use super::checkpoint_summary::FinishError;
 
     let mut cursor = Cursor::new(id, record.canonical_bytes());
     cursor.require(BRANCH_MAGIC)?;
     let level = cursor.u16()?;
     let count = cursor.count()?;
     let totals = cursor.totals()?;
-    if level == 0
-        || level > MAX_TREE_LEVEL
-        || !(2..=NODE_MAX_ENTRIES).contains(&count)
-        || record.references().len() != count
-    {
-        return Err(invalid(id, "invalid KV branch header"));
-    }
-    let (end, children) = checkpoint_branch::read(
-        cursor.bytes,
-        record.references(),
+    let branch = Header {
         level,
         count,
-        cursor.offset,
-        |field| validate_composite_key(id, field),
-    )
-    .map_err(|(_, reason)| match reason {
-        RowsError::Level => invalid(id, "invalid KV branch level"),
-        RowsError::Child(reason) => match reason {
+        totals,
+    }
+    .decode(cursor.bytes, record.references(), cursor.offset, |field| {
+        validate_composite_key(id, field)
+    })
+    .map_err(|reason| match reason {
+        DecodeError::Header => invalid(id, "invalid KV branch header"),
+        DecodeError::Rows(RowsError::Level) => invalid(id, "invalid KV branch level"),
+        DecodeError::Rows(RowsError::Child(reason)) => match reason {
             ChildError::Key(KeyError::Field(e)) | ChildError::Totals(e) => page_read_error(id, e),
             ChildError::Key(KeyError::Length) => invalid(id, "persistent KV length is too large"),
             ChildError::InvalidKey(e) => e,
@@ -344,21 +337,15 @@ fn decode_branch(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
                 invalid(id, "invalid KV branch child reference")
             },
         },
+        DecodeError::Finish(FinishError::Trailing) => {
+            invalid(id, "trailing persistent KV page bytes")
+        },
+        DecodeError::Finish(FinishError::NonCanonical) => {
+            invalid(id, "non-canonical persistent KV branch")
+        },
+        DecodeError::Finish(FinishError::Overflow) => arithmetic_overflow(),
     })?;
-    cursor.offset = end;
-    cursor.done()?;
-    if children
-        .windows(2)
-        .any(|pair| pair[0].lower_bound >= pair[1].lower_bound)
-        || sum_totals(children.iter().map(|child| child.totals))? != totals
-    {
-        return Err(invalid(id, "non-canonical persistent KV branch"));
-    }
-    Ok(Node::Branch(BranchNode {
-        level,
-        children,
-        totals,
-    }))
+    Ok(Node::Branch(branch))
 }
 
 fn leaf_totals(entries: &[LeafEntry]) -> StorageResult<NodeTotals> {

@@ -299,6 +299,9 @@ mod checkpoint_key_field;
 mod checkpoint_child;
 #[path = "../crates/astrid-storage/src/kv/tree/checkpoint_branch.rs"]
 mod checkpoint_branch;
+#[path = "../crates/astrid-storage/src/kv/tree/checkpoint_summary.rs"]
+mod checkpoint_summary;
+mod hosted_checkpoint_summary;
 mod hosted_checkpoint_branch;
 mod hosted_checkpoint_child;
 mod hosted_checkpoint_key_field;
