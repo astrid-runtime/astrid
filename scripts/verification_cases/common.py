@@ -49,6 +49,8 @@ INPUTS = [
     Path("crates/astrid-mcp/src/server/peer_selection.rs"),
     Path("crates/astrid-mcp/src/server/tool_call.rs"),
     Path("crates/astrid-workspace/src/sandbox/prefix_policy.rs"),
+    Path("crates/astrid-workspace/src/sandbox/seatbelt_profile.rs"),
+    Path("crates/astrid-workspace/src/sandbox/bwrap_flags.rs"),
     Path("verification/hosted_mcp_peer.rs"),
     Path("crates/astrid-capsule/src/engine/mcp/network.rs"),
     Path("crates/astrid-mcp/src/server/stdio_policy.rs"),

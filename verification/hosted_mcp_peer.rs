@@ -54,6 +54,41 @@ fn sandbox_child<C,P,E,H,T,B:crate::prefix_policy::Platform<C,P,E>,A:crate::stdi
     crate::stdio_policy::assemble(assembler,prefix,child)
 }
 
+/// Compare both native policy encodings for the same network setting. The
+/// Linux prefix supplied by the mount builder and Seatbelt file-rule inputs
+/// remain explicit parameters of this result.
+fn platform_network(network:bool, rules:&crate::seatbelt_profile::Rules, mut mounts:Vec<&'static str>)
+    -> (out:(String,Vec<&'static str>))
+    ensures
+        out.0@ == "(version 1)\n(deny default)\n(allow process-exec*)\n(allow process-fork)\n"@ +
+            (if network { "(allow network*)"@ } else { seq![] }) + rules.remaining_rules(),
+        out.1@ == if network {
+            mounts@ + seq!["--unshare-all","--share-net","--die-with-parent","--"]
+        } else { mounts@ + seq!["--unshare-all","--die-with-parent","--"] },
+{
+    let ghost before = mounts@;
+    let profile = rules.render(network);
+    crate::bwrap_flags::finish(&mut mounts,network,
+        |s:&'static str| -> (v:&'static str) ensures v == s { s });
+    assert(mounts@ =~= if network {
+        before + seq!["--unshare-all","--share-net","--die-with-parent","--"]
+    } else { before + seq!["--unshare-all","--die-with-parent","--"] });
+    (profile,mounts)
+}
+
+fn capsule_platform_network<D,P>(domains:&[D], peers:&[P], rules:&crate::seatbelt_profile::Rules, mounts:Vec<&'static str>)
+    -> (out:Option<(String,Vec<&'static str>)>)
+    ensures match out {
+        None => domains.len() > 0 || peers.len() > 0,
+        Some((profile,args)) => domains.len() == 0 && peers.len() == 0 &&
+            profile@ == "(version 1)\n(deny default)\n(allow process-exec*)\n(allow process-fork)\n"@ + rules.remaining_rules() &&
+            args@ == mounts@ + seq!["--unshare-all","--die-with-parent","--"],
+    },
+{
+    let settings = crate::capsule_stdio_network::admit(domains,peers)?;
+    Some(platform_network(settings.allow_network,rules,mounts))
+}
+
 fn registered_peer(servers: &HashMap<String,Option<u64>>, name: &str)
     -> (result: Result<u64,LookupError>)
     requires hash_map_inv(servers),

@@ -417,6 +417,10 @@ mod capsule_stdio_network;
 mod stdio_policy;
 #[path = "../crates/astrid-workspace/src/sandbox/prefix_policy.rs"]
 mod prefix_policy;
+#[path = "../crates/astrid-workspace/src/sandbox/seatbelt_profile.rs"]
+mod seatbelt_profile;
+#[path = "../crates/astrid-workspace/src/sandbox/bwrap_flags.rs"]
+mod bwrap_flags;
 mod hosted_mcp_peer;
 #[path = "../crates/astrid-cli/src/commands/mcp/mrtr_context.rs"]
 mod mrtr_context;

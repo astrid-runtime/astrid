@@ -7,6 +7,8 @@ use std::{fs::File, os::fd::AsRawFd};
 
 #[cfg(target_os = "linux")]
 mod bwrap;
+#[cfg(target_os = "linux")]
+mod bwrap_flags;
 mod prefix_policy;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod runtime_media;
@@ -14,6 +16,8 @@ mod runtime_media;
 mod runtime_media_unsupported;
 #[cfg(target_os = "macos")]
 mod seatbelt;
+#[cfg(target_os = "macos")]
+mod seatbelt_profile;
 mod setup_probe;
 pub use prefix_policy::SandboxPolicy;
 

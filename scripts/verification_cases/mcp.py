@@ -166,3 +166,19 @@ def defects():
             f"sandbox prefix {name}", source,
             lambda s, a=original, b=changed: replace_once(s, a, b), error,
         )
+
+    linux = Path("crates/astrid-workspace/src/sandbox/bwrap_flags.rs")
+    macos = Path("crates/astrid-workspace/src/sandbox/seatbelt_profile.rs")
+    for name, source, original, changed, error in [
+        ("Linux shares network unconditionally", linux, 'if network { args.push(encode("--share-net")); }', 'args.push(encode("--share-net"));', linux),
+        ("Linux loses the option terminator", linux, 'args.push(encode("--"));', 'args.push(encode("--die-with-parent"));', linux),
+        ("Linux may change a mount argument", linux, "after.take(i) == before", "true", consumer),
+        ("Linux may share without the explicit option", linux, 'network ==> encode.ensures(("--share-net",),after[i+1])', "true", consumer),
+        ("Seatbelt allows networking with no grant", macos, "if network { profile.push_str(NETWORK); }", "profile.push_str(NETWORK);", macos),
+        ("Seatbelt omits a trailing deny", macos, "profile.push_str(self.injected_denies);", "profile.push_str(self.injected_reads);", macos),
+        ("Seatbelt loses default deny", macos, "(deny default)", "(allow default)", consumer),
+    ]:
+        yield (
+            f"platform network policy {name}", source,
+            lambda s, a=original, b=changed: replace_once(s, a, b), error,
+        )

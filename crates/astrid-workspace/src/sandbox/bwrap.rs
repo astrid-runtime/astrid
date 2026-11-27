@@ -344,19 +344,7 @@ impl ProcessSandboxConfig {
             ]);
         }
 
-        // Drop all namespaces
-        args.push(OsString::from("--unshare-all"));
-
-        // Conditionally re-enable network
-        if self.allow_network {
-            args.push(OsString::from("--share-net"));
-        }
-
-        // Prevent orphan processes
-        args.push(OsString::from("--die-with-parent"));
-
-        // Separator before the inner command
-        args.push(OsString::from("--"));
+        super::bwrap_flags::finish(&mut args, self.allow_network, OsString::from);
 
         SandboxPrefix {
             program: OsString::from(packaged_bwrap_path().unwrap_or(PACKAGED_BWRAP_PATHS[0])),

@@ -8,13 +8,6 @@ impl ProcessSandboxConfig {
     pub(super) fn build_seatbelt_prefix(&self) -> io::Result<SandboxPrefix> {
         let writable_root_str = validate_sandbox_str(&self.writable_root, "writable root")?;
 
-        // Build the network rule conditionally
-        let network_rule = if self.allow_network {
-            "(allow network*)"
-        } else {
-            ""
-        };
-
         // Build exact read grants applied after any containing hidden root is
         // denied. This exposes the selected principal path without exposing
         // sibling principals under the same runtime home.
@@ -111,48 +104,17 @@ impl ProcessSandboxConfig {
 
         let ancestor_metadata_rules = self.ancestor_metadata_rules()?;
 
-        let profile = format!(
-            r#"(version 1)
-(deny default)
-(allow process-exec*)
-(allow process-fork)
-{network_rule}
-(allow sysctl-read)
-(allow ipc-posix-shm)
-(allow mach*)
-(allow file-read*
-    (subpath "/usr")
-    (subpath "/bin")
-    (subpath "/sbin")
-    (subpath "/System")
-    (subpath "/Library")
-    (subpath "/opt")
-    (subpath "/dev")
-    (subpath "/private/tmp")
-    (subpath "/var/folders")
-    (literal "/")
-)
-(allow file-write*
-    (subpath "/private/tmp")
-    (subpath "/var/folders")
-    (literal "/dev/null")
-)
-{scoped_hidden_deny_rules}
-(allow file-read-metadata
-{ancestor_metadata_rules}
-)
-(allow file-read*
-    (subpath "{writable_root_str}")
-{extra_read_rules}
-{inject_read_rules}
-)
-(allow file-write*
-    (subpath "{writable_root_str}")
-{extra_write_rules}
-)
-{hidden_deny_rules}
-{inject_deny_rules}"#
-        );
+        let profile = super::seatbelt_profile::Rules {
+            scoped_denies: &scoped_hidden_deny_rules,
+            ancestors: &ancestor_metadata_rules,
+            writable_root: writable_root_str,
+            extra_reads: &extra_read_rules,
+            injected_reads: &inject_read_rules,
+            extra_writes: &extra_write_rules,
+            hidden_denies: &hidden_deny_rules,
+            injected_denies: &inject_deny_rules,
+        }
+        .render(self.allow_network);
 
         // Pass profile inline via -p to avoid temp file leak.
         let args = vec![OsString::from("-p"), OsString::from(&profile)];
@@ -229,6 +191,56 @@ mod tests {
 
         let profile = prefix.args[1].to_string_lossy().to_string();
         assert!(!profile.contains("(allow network*)"));
+    }
+
+    #[test]
+    fn network_setting_controls_a_real_loopback_connection() {
+        if !sandbox_exec_can_apply() {
+            eprintln!(
+                "sandbox-exec cannot apply a profile here; skipping network enforcement test"
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port().to_string();
+        for network in [true, false] {
+            let prefix = ProcessSandboxConfig::new(root.path())
+                .with_policy(crate::SandboxPolicy::Required)
+                .with_network(network)
+                .sandbox_prefix()
+                .unwrap()
+                .unwrap();
+            // Distinguish refusal to connect from failure to load the profile.
+            assert!(
+                prefix
+                    .clone()
+                    .into_command()
+                    .arg("/usr/bin/true")
+                    .status_bounded()
+                    .unwrap()
+                    .expect("profile load timed out")
+                    .success()
+            );
+            let status = prefix
+                .into_command()
+                .args(["/usr/bin/nc", "-n", "-z", "-w", "1", "127.0.0.1", &port])
+                .status_bounded()
+                .unwrap()
+                .expect("loopback check timed out");
+            assert_eq!(status.success(), network);
+            if network {
+                listener
+                    .accept()
+                    .expect("enabled child must reach this listener");
+            } else {
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    io::ErrorKind::WouldBlock
+                );
+            }
+        }
     }
 
     #[test]
