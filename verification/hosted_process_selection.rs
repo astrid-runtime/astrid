@@ -6,6 +6,53 @@ use vstd::std_specs::hash::{hash_map_inv,obeys_key_model};
 use vstd::laws_eq::obeys_concrete_eq;
 
 verus! {
+/// Every preparation uses the owner observed on this call and the command that
+/// passed both policy checks and write-ahead admission.
+fn persistent_spawn<P,E,M,G:crate::spawn_admission::Gate<P,E,M>>(gate:&mut G,
+    names:&[String], capsule:&str, command:&str, idle:Option<u64>)
+    -> (out:Result<(P,M),crate::spawn_admission::Refusal<E>>)
+    ensures ({
+        use crate::spawn_admission::{Check,Refusal};
+        let before = old(gate).checks();
+        let after = final(gate).checks();
+        let count = before.len();
+        let granted = exists|i:int| 0 <= i < names.len() && (#[trigger] names@[i])@ == "allow_persistent"@;
+        match out {
+            Ok((owner,mount)) => granted && idle != Some(0) && after == before +
+                seq![Check::Principal(command@,true), Check::Host(capsule@,command@,None),
+                     Check::Owner(Some(owner)), Check::Cancelled(false), Check::Audit(command@,None),
+                     Check::Prepare(owner,command@,Ok(mount))],
+            Err(Refusal::Prepare(error)) => granted && idle != Some(0) && exists|owner:P| after == before +
+                seq![Check::Principal(command@,true), Check::Host(capsule@,command@,None),
+                     Check::Owner(Some(owner)), Check::Cancelled(false), Check::Audit(command@,None),
+                     Check::Prepare(owner,command@,Err(error))],
+            Err(_) => after.take(count as int) == before && forall|i:int| count <= i < after.len() ==>
+                !(#[trigger] after[i] is Prepare),
+        }
+    }),
+{
+    let ghost before = gate.checks();
+    let out = crate::spawn_admission::authorize(gate,names,capsule,command,idle);
+    let ghost observed = out;
+    proof {
+        use crate::spawn_admission::Check;
+        match observed {
+            Ok((p,m)) => assert(gate.checks() =~= before + seq![
+                Check::Principal(command@,true),Check::Host(capsule@,command@,None),
+                Check::Owner(Some(p)),Check::Cancelled(false),Check::Audit(command@,None),Check::Prepare(p,command@,Ok(m))]),
+            Err(crate::spawn_admission::Refusal::Prepare(e)) => {
+                let p = choose|p:P| gate.checks() == before.push(Check::Principal(command@,true))
+                    .push(Check::Host(capsule@,command@,None)).push(Check::Owner(Some(p)))
+                    .push(Check::Cancelled(false)).push(Check::Audit(command@,None)).push(Check::Prepare(p,command@,Err(e)));
+                assert(gate.checks() =~= before + seq![Check::Principal(command@,true),Check::Host(capsule@,command@,None),
+                    Check::Owner(Some(p)),Check::Cancelled(false),Check::Audit(command@,None),Check::Prepare(p,command@,Err(e))]);
+            },
+            Err(_) => { assert(gate.checks().take(before.len() as int) =~= before); },
+        }
+    }
+    out
+}
+
 struct Entry<T> { creator: Vec<u8>, package: Vec<u8>, target: T }
 
 fn resolve<'a,T>(entries: &'a HashMap<[u8;32],Entry<T>>, key: &[u8;32],

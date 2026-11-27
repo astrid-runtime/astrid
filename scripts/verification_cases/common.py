@@ -99,6 +99,7 @@ INPUTS = [
     Path("crates/astrid-capsule/src/profile_cache/command.rs"),
     Path("verification/hosted_process_command.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/host/process/command.rs"),
+    Path("crates/astrid-capsule/src/engine/wasm/host/process/spawn_admission.rs"),
     UID_TEXT,
     FILESYSTEM_PATH,
     Path("crates/astrid-storage/src/filesystem/replacement.rs"),

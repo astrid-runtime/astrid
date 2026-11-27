@@ -7,6 +7,26 @@ from .common import edit_function, replace_once
 def defects():
     persistent = Path("crates/astrid-capsule/src/engine/wasm/host/process/persistent")
     process_trace = Path("verification/hosted_process_selection.rs")
+    admission = persistent.parent / "spawn_admission.rs"
+    for name, original, changed in [
+        ("checks a different capsule", "gate.host(capsule, command)", "gate.host(command, command)"),
+        ("omits persistence capability", "if !allows_persistence(names)", "if false"),
+        ("ignores zero idle timeout", "if idle == Some(0)", "if false"),
+        ("skips cancellation", "if gate.cancelled()", "if false"),
+        ("audits another command", "gate.audit(command)", "gate.audit(capsule)"),
+        ("prepares another command", "gate.prepare(&principal, command)", "gate.prepare(&principal, capsule)"),
+    ]:
+        yield (
+            f"persistent spawn admission {name}", admission,
+            lambda s, a=original, b=changed: replace_once(s, a, b), admission,
+        )
+    yield (
+        "persistent spawn admission loses the returned projection", admission,
+        lambda s: replace_once(s,
+            "after == host.push(Check::Owner(Some(p))).push(Check::Cancelled(false)).push(Check::Audit(command@,None))\n                    .push(Check::Prepare(p,command@,Ok(m))),",
+            "exists|other:M| after == host.push(Check::Owner(Some(p))).push(Check::Cancelled(false)).push(Check::Audit(command@,None)).push(Check::Prepare(p,command@,Ok(other))),"),
+        process_trace,
+    )
     for file, name, clause, weakened in [
         ("cleanup", "shutdown may leave a live slot", "final(entries)@ == Map::<K,T>::empty()", "true"),
         ("cleanup", "shutdown can detach the wrong map", "drained@ == old(entries)@", "true"),

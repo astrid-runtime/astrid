@@ -49,6 +49,8 @@ mod hosted_workspace_references;
 #[path = "../crates/astrid-capsule/src/context/workspace_commit.rs"]
 mod workspace_commit;
 mod hosted_workspace_commit;
+#[path = "../crates/astrid-capsule/src/engine/wasm/host/process/spawn_admission.rs"]
+mod spawn_admission;
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/process/registry_keys.rs"]
 mod registry_keys;
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/process/process_batch.rs"]

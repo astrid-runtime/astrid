@@ -43,6 +43,7 @@
 
 use super::{process_batch, registry_keys};
 
+mod admission;
 mod cleanup;
 mod config;
 mod entry;
@@ -55,6 +56,7 @@ mod ring;
 mod selection;
 #[cfg(unix)]
 mod signal_target;
+pub(super) use admission::admit_and_prepare;
 use selection::Selection;
 
 use std::collections::HashMap;
