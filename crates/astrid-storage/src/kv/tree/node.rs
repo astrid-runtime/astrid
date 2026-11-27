@@ -78,53 +78,11 @@ impl LeafEntry {
 
 pub(super) type ChildPointer = super::checkpoint_range::Child<ObjectId, NodeTotals>;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct LeafNode {
-    pub(super) entries: Vec<LeafEntry>,
-    pub(super) totals: NodeTotals,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct BranchNode {
-    pub(super) level: u16,
-    pub(super) children: Vec<ChildPointer>,
-    pub(super) totals: NodeTotals,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Node {
-    Leaf(LeafNode),
-    Branch(BranchNode),
-}
+pub(super) type LeafNode = super::checkpoint_page::Leaf<ValueSlot, NodeTotals>;
+pub(super) type BranchNode = super::checkpoint_page::Branch<ObjectId, NodeTotals>;
+pub(super) type Node = super::checkpoint_page::Node<ObjectId, NodeTotals, ValueSlot>;
 
 impl Node {
-    pub(super) const fn level(&self) -> u16 {
-        match self {
-            Self::Leaf(_) => 0,
-            Self::Branch(branch) => branch.level,
-        }
-    }
-
-    pub(super) const fn totals(&self) -> NodeTotals {
-        match self {
-            Self::Leaf(leaf) => leaf.totals,
-            Self::Branch(branch) => branch.totals,
-        }
-    }
-
-    pub(super) fn minimum_key(&self) -> &[u8] {
-        match self {
-            Self::Leaf(leaf) => leaf
-                .entries
-                .first()
-                .map_or(&[], |entry| entry.key.as_slice()),
-            Self::Branch(branch) => branch
-                .children
-                .first()
-                .map_or(&[], |child| child.lower_bound.as_slice()),
-        }
-    }
-
     pub(super) fn entry_slots(&self) -> usize {
         match self {
             Self::Leaf(leaf) => leaf.entries.len(),
@@ -133,11 +91,7 @@ impl Node {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(super) struct NodeHandle {
-    pub(super) object: ObjectId,
-    pub(super) node: Node,
-}
+pub(super) type NodeHandle = super::checkpoint_page::Handle<ObjectId, NodeTotals, ValueSlot>;
 
 impl NodeHandle {
     pub(super) fn pointer(&self) -> ChildPointer {
@@ -373,31 +327,28 @@ fn decode_branch(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
     {
         return Err(invalid(id, "invalid KV branch header"));
     }
-    let child_level = level
-        .checked_sub(1)
-        .ok_or_else(|| invalid(id, "invalid KV branch level"))?;
-    let mut children = Vec::with_capacity(count);
-    for index in 0..count {
-        let key_length = cursor.u32_usize()?;
-        let lower_bound = cursor.take(key_length)?.to_vec();
-        validate_composite_key(id, &lower_bound)?;
-        let child_totals = cursor.totals()?;
-        if child_totals.entries == 0 {
-            return Err(invalid(id, "empty KV branch child"));
-        }
-        let reference = &record.references()[index];
-        if reference.label() != &indexed_label(CHILD_LABEL_PREFIX, index)?
-            || reference.kind() != ReferenceKind::Owns
-        {
-            return Err(invalid(id, "invalid KV branch child reference"));
-        }
-        children.push(ChildPointer {
-            lower_bound,
-            object: reference.target(),
-            level: child_level,
-            totals: child_totals,
-        });
-    }
+    let (cursor, children) = super::checkpoint_page::children(
+        level,
+        count,
+        cursor,
+        |mut cursor, index| {
+            let key_length = cursor.u32_usize()?;
+            let lower_bound = cursor.take(key_length)?.to_vec();
+            validate_composite_key(id, &lower_bound)?;
+            let child_totals = cursor.totals()?;
+            if child_totals.entries == 0 {
+                return Err(invalid(id, "empty KV branch child"));
+            }
+            let reference = &record.references()[index];
+            if reference.label() != &indexed_label(CHILD_LABEL_PREFIX, index)?
+                || reference.kind() != ReferenceKind::Owns
+            {
+                return Err(invalid(id, "invalid KV branch child reference"));
+            }
+            Ok((cursor, lower_bound, reference.target(), child_totals))
+        },
+        || invalid(id, "invalid KV branch level"),
+    )?;
     cursor.done()?;
     if children
         .windows(2)

@@ -3,16 +3,11 @@
 use std::collections::BTreeMap;
 
 use super::{
-    KvProjectionEngine, LeafEntry, Node, ObjectId, PreviousValue, Replacement, StorageError,
+    KvProjectionEngine, LeafEntry, ObjectId, PreviousValue, Replacement, StorageError,
     StorageResult, TreeContext, TreeHeader, ValueSlot, decode_node, invalid,
 };
 
-use crate::kv::tree::{
-    checkpoint_leaf,
-    checkpoint_range::Page,
-    checkpoint_walk::{self, Contents},
-    key_projection,
-};
+use crate::kv::tree::{checkpoint_leaf, checkpoint_page, checkpoint_walk, key_projection};
 
 #[cfg(test)]
 mod tests;
@@ -34,22 +29,11 @@ impl<P: Ord, E: KvProjectionEngine<P>> TreeContext<'_, P, E> {
             end,
             state,
             |page| {
-                let object = page.object();
-                let handle = decode_node(object, &self.record(object)?)?;
-                if let Page::Child(expected) = page
-                    && !expected.matches(
-                        &handle.object,
-                        handle.node.minimum_key(),
-                        handle.node.level(),
-                        &handle.node.totals(),
-                    )
-                {
-                    return Err(invalid(object, "persistent KV child summary disagrees"));
-                }
-                Ok(match handle.node {
-                    Node::Leaf(leaf) => Contents::Leaf(leaf.entries),
-                    Node::Branch(branch) => Contents::Branch(branch.level, branch.children),
-                })
+                checkpoint_page::read(
+                    &page,
+                    |object| decode_node(object, &self.record(object)?),
+                    |object| invalid(object, "persistent KV child summary disagrees"),
+                )
             },
             visit,
         )

@@ -167,7 +167,12 @@ fn enumerate<I,T,V,E,R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>>(
                         0 <= i < rows.len() && visited(rows@,i as nat,start@,end@,s,prior,f) &&
                         encoding::range_contains(start@,end@,rows@[i].key@) && #[trigger] f.ensures((prior,rows@[i]),Err(e));
                     marks(rows@,i as nat,start@,end@,s,prior,f);
+                    assert(btree_map_inv(&prior));
+                    assert(f.ensures((prior,rows@[i]),Err(e)));
+                    assert(writer(f));
+                    assert(false);
                 }
+                assert(read.ensures((stack.last(),),Err(e)));
             }
         }
     }

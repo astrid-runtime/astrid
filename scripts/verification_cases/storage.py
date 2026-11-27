@@ -558,3 +558,20 @@ def checkpoint_walk_consumers():
             f"checkpoint walk loses {label}", path,
             lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker), consumer,
         )
+
+
+def checkpoint_page_consumers():
+    path = Path("crates/astrid-storage/src/kv/tree/checkpoint_page.rs")
+    consumer = Path("verification/hosted_checkpoint_page.rs")
+    for label, clause, weaker in [
+        ("child levels", "\n        &&& c.level as nat+1 == level", "\n        &&& true"),
+        ("indexed row", "\n        &&& fetch.ensures((states[i],i as usize),Ok((states[i+1],c.lower_bound,c.object,c.totals)))", "\n        &&& true"),
+        ("branch arity", "pair.1.len() == count", "true"),
+        ("scheduled summary", "agrees(*page,h) && contents == h.node.contents()", "contents == h.node.contents()"),
+        ("decoded payload", "agrees(*page,h) && contents == h.node.contents()", "agrees(*page,h)"),
+        ("fetch error", "Err(e) => fetch.ensures((object(*page),),Err(e)) ||", "Err(e) => true ||"),
+    ]:
+        yield (
+            f"checkpoint page loses {label}", path,
+            lambda text, clause=clause, weaker=weaker: replace_once(text, clause, weaker), consumer,
+        )

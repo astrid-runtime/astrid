@@ -66,7 +66,13 @@ proof fn advance<I,T,V,S,E,R:Fn(Page<I,T>)->Result<Contents<I,T,V>,E>,F:Fn(S,Ent
     let all = old.push((after,state));
     assert forall|i:int| 0 <= i < old.len() implies step((#[trigger] all[i]).0,all[i].1,all[i+1].0,all[i+1].1,start,end,read,visit) by {
         assert(all[i] == old[i]);
-        if i < path.len() { assert(all[i+1] == old[i+1]); }
+        if i < path.len() {
+            assert(all[i+1] == old[i+1]);
+        } else {
+            assert(all[i] == (before,prior));
+            assert(all[i+1] == (after,state));
+            assert(step(before,prior,after,state,start,end,read,visit));
+        }
     }
 }
 
