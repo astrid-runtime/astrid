@@ -118,4 +118,63 @@ fn storage_preserve(path:u64, existing:Option<u64>, write:bool, truncate:bool, b
         })
 }
 
+/// Slot indices stand for mutex identities. The table chooses both the write and close targets.
+fn storage_handles<'a>(first_key:String, other_key:String, path:&'a str, other_path:&'a str,
+    bytes:&[u8]) -> (out:Option<(&'a str,Vec<u8>)>)
+    requires first_key@ != other_key@,
+    ensures out matches Some((target,data)) && target == path && data@ == bytes@,
+{
+    let mut table = crate::storage_handles::HandleTable::new();
+    let mut files = [
+        crate::storage_file::open_at(path,None,true,true,|_:&&str,_:u64,_:u64| -> Result<Vec<u8>,()> { Err(()) }).ok()?,
+        crate::storage_file::open_at(other_path,None,true,true,|_:&&str,_:u64,_:u64| -> Result<Vec<u8>,()> { Err(()) }).ok()?,
+    ];
+    let first = first_key.clone();
+    let other = other_key.clone();
+    let ghost first_owned = first;
+    let ghost other_owned = other;
+    proof { table.membership(first_key@); }
+    if !table.register(first,0usize) { return None; }
+    proof { table.membership(other_key@); }
+    if !table.register(other,1usize) { return None; }
+    proof { table.registered_key(first_owned); }
+    if table.register(first_key.clone(),1usize) { return None; }
+    proof { table.registered_key(first_owned); }
+    let slot = *table.lookup(first_key.as_str())?;
+    proof { table.unique_binding(first_key@,0,slot); }
+    files[slot].write_bytes(bytes);
+    let ghost before = table;
+    proof { table.registered_key(other_owned); }
+    let other = table.retire(other_key.as_str())?;
+    proof { before.retired_key(other_owned,other,&table); }
+    assert(files[other as int].buffered().len() == 0);
+    let ghost before = table;
+    proof { table.registered_key(first_owned); }
+    let slot = table.retire(first_key.as_str())?;
+    proof { before.retired_key(first_owned,slot,&table); }
+    if table.retire(first_key.as_str()).is_some() { return None; }
+    let call = files[slot].publish(|p:&&'a str,b:&Vec<u8>| -> (r:(&'a str,Vec<u8>))
+        ensures r.0 == *p && r.1@ == b@, { (*p,b.clone()) })?;
+    assert(call.1@ =~= bytes@);
+    Some(call)
+}
+
+/// At any table size, retiring a borrowed key returns the same slot selected for I/O.
+fn retire_observed<V:Copy>(table:&mut crate::storage_handles::HandleTable<V>, key:&str)
+    -> (out:(Option<V>,Option<V>))
+    requires old(table).valid(),
+    ensures out.0 == out.1, out.0.is_some() == old(table).has(key@),
+        !final(table).has(key@), final(table).valid(),
+        out.1 matches Some(v) ==> old(table).removed(key@,v,final(table)),
+        out.1.is_none() ==> final(table).contents() == old(table).contents(),
+{
+    let observed = match table.lookup(key) { Some(slot) => Some(*slot), None => None };
+    let ghost before = *table;
+    let retired = table.retire(key);
+    proof {
+        if let (Some(a),Some(b)) = (observed,retired) { before.unique_binding(key@,a,b); }
+    }
+    (observed,retired)
+}
+
 }

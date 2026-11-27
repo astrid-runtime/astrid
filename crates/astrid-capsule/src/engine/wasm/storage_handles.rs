@@ -97,10 +97,8 @@ impl<V> HandleTable<V> {
 
     pub(super) fn lookup(&self, key: &str) -> (value: Option<&V>)
         requires self.valid(),
-        ensures match value {
-            Some(v) => self.binds(key@, *v),
-            None => !self.has(key@),
-        },
+        ensures value.is_some() == self.has(key@),
+            value matches Some(v) ==> self.binds(key@, *v),
     {
         self.entries.get(key)
     }
@@ -111,11 +109,35 @@ impl<V> HandleTable<V> {
             && next.contents() == self.contents().remove(k)
     }
 
+    /// Project borrowed-key operations onto the owned keys in the map snapshot.
+    pub(super) proof fn membership(&self, text:Seq<char>)
+        ensures self.has(text) ==> (exists|k:String| #[trigger] self.contents().contains_key(k) && k@ == text),
+    {
+        if self.has(text) {
+            let k = choose|k:String| #[trigger] self.entries@.contains_key(k) && k@ == text;
+            assert(self.contents().contains_key(k));
+        }
+    }
+
+    pub(super) proof fn registered_key(&self, key:String)
+        requires self.contents().contains_key(key),
+        ensures self.has(key@), self.binds(key@,self.contents()[key]),
+    {}
+
+    pub(super) proof fn retired_key(&self, key:String, value:V, next:&Self)
+        requires self.valid(), self.contents().contains_key(key), self.removed(key@,value,next),
+        ensures self.contents()[key] == value, next.contents() == self.contents().remove(key),
+    {
+        let k = choose|k:String| #[trigger] self.entries@.contains_key(k)
+            && k@ == key@ && self.entries@[k] == value && next.contents() == self.contents().remove(k);
+        assert(k == key);
+    }
+
     pub(super) fn retire(&mut self, key: &str) -> (value: Option<V>)
         requires old(self).valid(),
-        ensures final(self).valid(), !final(self).has(key@),
+        ensures final(self).valid(), !final(self).has(key@), value.is_some() == old(self).has(key@),
             match value {
-                Some(v) => old(self).removed(key@, v, final(self)),
+                Some(v) => old(self).binds(key@,v) && old(self).removed(key@, v, final(self)),
                 None => !old(self).has(key@) && final(self).contents() == old(self).contents(),
             },
     {

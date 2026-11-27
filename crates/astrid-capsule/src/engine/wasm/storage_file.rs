@@ -136,7 +136,8 @@ impl<P> OpenFile<P> {
 
     /// Capture the original destination and the complete buffered bytes for publication.
     pub(super) fn publication(&self) -> (target: Option<(&P, &Vec<u8>)>)
-        ensures target.is_some() == (self.can_write() && self.changed()),
+        ensures target matches Some(args) ==> args == self.arguments(),
+            target.is_some() == (self.can_write() && self.changed()),
             match target {
                 Some((path, bytes)) => *path == self.destination() && bytes@ == self.buffered(),
                 None => true,
@@ -144,6 +145,21 @@ impl<P> OpenFile<P> {
     {
         if self.writable && self.dirty { Some((&self.path, &self.bytes)) } else { None }
     }
+
+    pub(super) closed spec fn arguments(&self) -> (&P,&Vec<u8>) {
+        (&self.path,&self.bytes)
+    }
+
+    pub(super) fn publish<'a,R,F:FnOnce(&'a P,&'a Vec<u8>)->R>(&'a self, write:F) -> (out:Option<R>)
+        requires write.requires(self.arguments()),
+        ensures out.is_some() == (self.can_write() && self.changed()),
+            *self.arguments().0 == self.destination(), self.arguments().1@ == self.buffered(),
+            out matches Some(r) ==> write.ensures(self.arguments(),r),
+    {
+        let (path,bytes) = self.publication()?;
+        Some(write(path,bytes))
+    }
+
 }
 
 }

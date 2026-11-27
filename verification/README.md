@@ -54,6 +54,10 @@ authenticated ingress for forwarded requests, bus implementation, or global
 coverage of privileged effects. The cancellation check and adapter tests remain
 part of the assurance argument for this path.
 
+## Guest filesystem
+
+The physical-path, VFS-address and file-open proofs follow a guest path through admission, mount selection and native open options. For storage-backed files they also cover buffer construction, handle selection and the close-time publication callback. The [filesystem contract](hosted-security-contract.md#physical-and-logical-filesystem-authorization-paths) identifies the native locks, path operations and durable store behaviour that the proofs assume.
+
 ## Durable guest KV addresses
 
 The verifier checks two stages of durable point addressing. The namespace selector

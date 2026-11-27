@@ -486,10 +486,8 @@ impl Vfs for AstridStorageVfs {
             .retire(&handle.0)
             .ok_or(VfsError::InvalidHandle)?;
         let file = file.into_inner();
-        if let Some((path, bytes)) = file.publication() {
-            self.filesystem
-                .write(path, bytes)
-                .map_err(map_filesystem_error)?;
+        if let Some(result) = file.publish(|path, bytes| self.filesystem.write(path, bytes)) {
+            result.map_err(map_filesystem_error)?;
         }
         Ok(())
     }
@@ -779,6 +777,13 @@ mod tests {
             vfs.register_file(original.clone(), replacement).await,
             Err(VfsError::Io(_))
         ));
+        let sibling = vfs.open(&root, "sibling", true, true).await.unwrap();
+        vfs.write(&sibling, b"independent").await.unwrap();
+        vfs.close(&sibling).await.unwrap();
+        assert!(!vfs.exists(&root, "original").await.unwrap());
+        let read_sibling = vfs.open(&root, "sibling", false, false).await.unwrap();
+        assert_eq!(vfs.read(&read_sibling).await.unwrap(), b"independent");
+        vfs.close(&read_sibling).await.unwrap();
         vfs.close(&original).await.unwrap();
         let read = vfs.open(&root, "original", false, false).await.unwrap();
         assert_eq!(vfs.read(&read).await.unwrap(), b"saved");
