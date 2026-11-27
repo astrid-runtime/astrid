@@ -62,6 +62,27 @@ def consumer_defects():
             lambda s, a=clause, b=change: replace_once(s, a, b), target,
         )
     overlay = Path("crates/astrid-storage/src/engine/durable/wal/overlay_object.rs")
+    append = Path("crates/astrid-storage/src/engine/durable/arena_frame.rs")
+    vectors = Path("crates/astrid-storage/src/engine/durable/arena_vectors.rs")
+    readback = Path("verification/hosted_arena_append.rs")
+    for name, source, original, changed, target in [
+        ("omits the frame header width", append, "offset.checked_add(WIDTH as u64)?.checked_add(size)?", "offset.checked_add(size)?", append),
+        ("reverses a vector pair", vectors, "parts.push(P::borrow(header));\n        parts.push(P::borrow(payload));", "parts.push(P::borrow(payload));\n        parts.push(P::borrow(header));", vectors),
+        ("advances past an unwritten byte", vectors, "cursor.advance(n);", "cursor.advance(n.saturating_add(1));", vectors),
+        ("loses the prepared checksum binding", append, "hashed(hash,magic,payload@,f.sum()),", "true,", readback),
+        ("forgets the published offset", append, "loc.offset as int == base as int + prefix(frames@,i as nat).len()", "true", readback),
+        ("forgets the returned checksum", append, "loc.checksum == frames@[i].sum()", "true", readback),
+        ("forgets submitted bytes", append, "&&& final(sink).sent() == old(sink).sent() + bytes", "&&& true", readback),
+        ("allows spurious sink failure", append, "failed_chunk::<S>(old(sink).sent(),frames@,batch_size,e) &&", "true &&", readback),
+        ("loses the prefix on a failed batch", append, "exists|n:int| 0 <= n <= bytes.len() && final(sink).sent() == old(sink).sent() + bytes.take(n),", "true,", readback),
+        ("drops vector ordering", vectors, "flatten(parts@,parts@.len()) == prefix(batch@,batch@.len()),", "true,", readback),
+        ("loses completion of short writes", vectors, "out.is_ok() ==> final(cursor).sent() == old(cursor).sent()+old(cursor).remaining()", "true", readback),
+        ("overwrites the first WAL object on equal bytes", overlay, "if before != after {return Err(());}", "if before != after {return Err(());} self.record = incoming.record;", overlay),
+    ]:
+        yield (
+            f"arena append {name}", source,
+            lambda s, a=original, b=changed: replace_once(s, a, b), target,
+        )
     for name, clause, weaker in [
         ("loses acceptance of equal frames", "out.is_ok() == ((*old(self).payload)@ == (*incoming.payload)@)", "out.is_ok() ==> ((*old(self).payload)@ == (*incoming.payload)@)"),
         ("loses the retained record", "final(self).record == old(self).record", "true"),

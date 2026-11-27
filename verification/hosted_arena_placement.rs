@@ -5,7 +5,7 @@ use vstd::prelude::*;
 verus! {
 
 /// A later row for another key cannot change this object's physical placement.
-proof fn last_placement<K,L>(initial:Map<K,L>,keys:Seq<K>,locations:Seq<L>,row:int,n:nat)
+pub(super) proof fn last_placement<K,L>(initial:Map<K,L>,keys:Seq<K>,locations:Seq<L>,row:int,n:nat)
     requires 0 <= row < n <= keys.len() == locations.len(),
         forall|j:int| row < j < n ==> #[trigger] keys[j] != keys[row],
     ensures ({

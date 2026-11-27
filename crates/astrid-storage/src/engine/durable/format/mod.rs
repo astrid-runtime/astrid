@@ -57,7 +57,7 @@ pub(super) use location::{
     scan_frames_range_with_source, scan_frames_with_source,
 };
 pub(super) use positioned::read_frame_at;
-pub(super) use prepared::{PreparedFrame, append_prepared_frames};
+pub(super) use prepared::append_prepared_frames;
 use reader::SliceReader;
 #[cfg(test)]
 pub(super) use scan::scan_frames_prefix;
@@ -447,12 +447,7 @@ pub(super) fn frame_header(
     payload_len: u64,
     checksum: [u8; 32],
 ) -> [u8; FRAME_HEADER_LEN_USIZE] {
-    let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
-    header[..8].copy_from_slice(&magic);
-    header[8..10].copy_from_slice(&FRAME_VERSION.to_le_bytes());
-    header[12..20].copy_from_slice(&payload_len.to_le_bytes());
-    header[CHECKSUM_START..].copy_from_slice(&checksum);
-    header
+    super::arena_frame::header(magic, FRAME_VERSION, payload_len, checksum)
 }
 
 pub(super) fn corrupt(file: &'static str, offset: u64, detail: &'static str) -> DurableError {

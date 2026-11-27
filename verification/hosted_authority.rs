@@ -116,6 +116,10 @@ use object_reference::{ObjectId, ObjectReference, ReferenceLabel};
 mod arena_span;
 #[path = "../crates/astrid-storage/src/engine/durable/arena_index.rs"]
 mod arena_index;
+#[path = "../crates/astrid-storage/src/engine/durable/arena_frame.rs"]
+mod arena_frame;
+#[path = "../crates/astrid-storage/src/engine/durable/arena_vectors.rs"]
+mod arena_vectors;
 #[path = "../crates/astrid-storage/src/engine/durable/direct_placement.rs"]
 mod direct_placement;
 #[path = "../crates/astrid-storage/src/engine/durable/format/positional_read.rs"]
@@ -124,6 +128,7 @@ mod positional_read;
 mod verified_record;
 mod hosted_record_model;
 mod hosted_arena_placement;
+mod hosted_arena_append;
 mod hosted_record_roundtrip;
 mod hosted_closure_model;
 

@@ -543,12 +543,7 @@ impl From<ContentError> for DurableError {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ArenaLocation {
-    offset: u64,
-    payload_len: u64,
-    checksum: [u8; 32],
-}
+use arena_frame::{ArenaLocation, PreparedFrame};
 
 #[derive(Debug)]
 struct DurableInner<P: Ord> {
@@ -807,7 +802,9 @@ impl<P: Ord, I, C> DurableEngine<P, I, C> {
     }
 }
 
+mod arena_frame;
 mod arena_index;
+mod arena_vectors;
 mod direct_placement;
 mod staging;
 
@@ -859,7 +856,7 @@ pub use compaction::{
 };
 pub use faults::{FaultInjector, FaultPoint, NoFaults};
 use format::{
-    FramedAppendStream, PreparedFrame, append_frame, append_frames, append_prepared_frames,
+    FramedAppendStream, append_frame, append_frames, append_prepared_frames,
     canonical_record_bytes, corrupt, decode_object_frame, encode_object_frame,
     ensure_payload_limit, io_error, read_indexed_object, read_indexed_object_with_payload,
     read_indexed_objects, recover_arena, scan_frames, verify_indexed_location, verify_indexed_tail,
