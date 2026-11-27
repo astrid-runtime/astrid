@@ -435,6 +435,24 @@ fn apply_revocation(status: &mut TokenStatus, completed: bool)
     status.record_revocation();
 }
 
+/// The live fence addresses the same token for persistence, closes admission
+/// for both token lifetimes, and preserves any other token's authority.
+fn fenced_token_admission<K: Eq + std::hash::Hash + Clone>(
+    authority: &mut std::collections::HashMap<K, TokenStatus>, id: &K, peer: &K, single_use: bool,
+)
+    requires vstd::std_specs::hash::hash_map_inv(old(authority)),
+        vstd::std_specs::hash::obeys_key_model::<K>(), vstd::laws_eq::obeys_concrete_eq::<K>(), vstd::pervasive::obeys_clone_eq::<K>(), *id != *peer,
+{
+    let prior = crate::token_authority::status(authority, peer);
+    let (namespace, target) = crate::token_authority::fence_revocation(authority, id);
+    assert(namespace@ == "caps:revoked"@ && *target == *id);
+    let fenced = crate::token_authority::status(authority, target);
+    let decision = fenced.admit(single_use);
+    assert(decision is Revoked);
+    let unchanged = crate::token_authority::status(authority, peer);
+    assert(store_state(unchanged) == store_state(prior));
+}
+
 /// The store's single-use consumption is the model's consume transition, and
 /// the admission it reports is the model's.
 fn apply_consumption(status: &mut TokenStatus, won: bool) -> (admitted: bool)

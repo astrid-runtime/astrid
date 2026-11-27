@@ -4,6 +4,8 @@ from pathlib import Path
 
 from . import file_descriptor, file_open, http, mcp, persistent_process, retirement, runtime_residency, storage, workspace_commit
 from .common import (
+    AUTHORITY,
+    MODEL,
     LEASE_CALLBACK,
     replace_once,
 )
@@ -11,6 +13,16 @@ from .common import (
 
 def consumer_defects():
     """Weaken a production guarantee and require its trace consumer to fail."""
+    for label, clause in [
+        ("marker namespace", 'address.0@ == "caps:revoked"@'),
+        ("marker identity", "*address.1 == *id"),
+        ("live refusal", "final(authority)@[*id].revoked()"),
+        ("peer isolation", "final(authority)@ == old(authority)@.insert(*id, final(authority)@[*id])"),
+    ]:
+        yield (
+            f"token revocation fence loses {label}", AUTHORITY,
+            lambda s, clause=clause: replace_once(s, clause, "true"), MODEL,
+        )
     yield from persistent_process.defects()
     yield from workspace_commit.defects()
     yield from file_descriptor.defects()

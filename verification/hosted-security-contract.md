@@ -6,6 +6,9 @@ For each supported hosted configuration, every privileged effect caused by an un
 
 The specification must identify the admission point for each operation. Revocation prevents subsequent admissions under the revoked grant. A previously admitted operation may finish where the interface permits it. Acknowledged durable revocation survives every supported restart. A single-use grant permits at most one successful admission across retries and restarts. Reissuing an alias must never transfer the authority of its previous owner.
 
+For token revocation, the capability store takes its live authority write lock and fences the requested token before awaiting the durable marker write. The checked map transition preserves consumption and every other token's status. It returns the revocation namespace and the exact fenced token ID for the write. Both single-use and reusable admissions read that token as revoked. The proof assumes the token key's hash, equality and clone laws. The lock and future semantics, conversion between UUIDs and durable keys, and recovery of all acknowledged marker writes across a crash remain open.
+
+
 ## How to discharge the claim
 
 A refinement proof must map each production execution to a permitted sequence of abstract events. Internal steps may leave the abstract state unchanged. Each externally visible effect requires a matching admission. Recovery must reconstruct a state consistent with the acknowledged durable history. The argument must include concurrent calls, canceled futures, errors after a durable write and recovery before admission reopens.

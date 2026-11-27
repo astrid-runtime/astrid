@@ -143,13 +143,6 @@ impl CapabilityStore {
         })
     }
 
-    fn status(authority: &HashMap<TokenId, TokenStatus>, id: &TokenId) -> TokenStatus {
-        authority
-            .get(id)
-            .copied()
-            .unwrap_or_else(|| TokenStatus::recover(false, false))
-    }
-
     fn ensure_admission(
         status: TokenStatus,
         id: &TokenId,
@@ -252,7 +245,7 @@ impl CapabilityStore {
     pub async fn get(&self, token_id: &TokenId) -> CapabilityResult<Option<CapabilityToken>> {
         let retirement = self.retiring_principals.read().await;
         let authority = self.authority.read().await;
-        Self::ensure_admission(Self::status(&authority, token_id), token_id, false)?;
+        Self::ensure_admission(authority::status(&authority, token_id), token_id, false)?;
         self.lookup(token_id, &retirement).await
     }
 
@@ -370,7 +363,7 @@ impl CapabilityStore {
     async fn is_available(&self, token: &CapabilityToken) -> bool {
         let authority = self.authority.read().await;
         matches!(
-            Self::status(&authority, &token.id).admit(token.is_single_use()),
+            authority::status(&authority, &token.id).admit(token.is_single_use()),
             Admission::Allowed
         )
     }
@@ -525,12 +518,9 @@ impl CapabilityStore {
         // Only a successful durable write provides the restart guarantee.
         {
             let mut authority = self.authority.write().await;
-            authority
-                .entry(token_id.clone())
-                .or_insert_with(|| TokenStatus::recover(false, false))
-                .record_revocation();
+            let (namespace, fenced_id) = authority::fence_revocation(&mut authority, token_id);
             if let Some(store) = &self.persistent_store {
-                let (namespace, key) = Marker::Revoked.address(token_id.0.to_string());
+                let key = fenced_id.0.to_string();
                 store
                     .set(namespace, &key, PRESENCE_MARKER.to_vec())
                     .await
@@ -687,7 +677,7 @@ impl CapabilityStore {
         authority: &mut HashMap<TokenId, TokenStatus>,
         token_id: &TokenId,
     ) -> CapabilityResult<()> {
-        let mut status = Self::status(authority, token_id);
+        let mut status = authority::status(authority, token_id);
         Self::ensure_admission(status, token_id, true)?;
 
         // A canceled or ambiguous write can have committed. Requiring
@@ -713,7 +703,7 @@ impl CapabilityStore {
 
     /// Check if a single-use token has been used.
     pub async fn is_used(&self, token_id: &TokenId) -> bool {
-        Self::status(&*self.authority.read().await, token_id).is_used()
+        authority::status(&*self.authority.read().await, token_id).is_used()
     }
 
     /// Validate and optionally consume a token.
@@ -736,7 +726,7 @@ impl CapabilityStore {
         let retirement = self.retiring_principals.read().await;
         {
             let authority = self.authority.read().await;
-            Self::ensure_admission(Self::status(&authority, token_id), token_id, false)?;
+            Self::ensure_admission(authority::status(&authority, token_id), token_id, false)?;
         }
         let token = self.lookup(token_id, &retirement).await?.ok_or_else(|| {
             CapabilityError::TokenNotFound {
@@ -756,7 +746,7 @@ impl CapabilityStore {
         } else {
             let authority = self.authority.read().await;
             token.check_admission_expiry()?;
-            Self::ensure_admission(Self::status(&authority, token_id), token_id, false)?;
+            Self::ensure_admission(authority::status(&authority, token_id), token_id, false)?;
         }
         Ok(token)
     }
@@ -778,7 +768,8 @@ impl CapabilityStore {
                 .map_err(|e| CapabilityError::StorageError(e.to_string()))?;
             for principal_map in session.values() {
                 for token in principal_map.values() {
-                    if !token.is_expired() && !Self::status(&authority, &token.id).is_revoked() {
+                    if !token.is_expired() && !authority::status(&authority, &token.id).is_revoked()
+                    {
                         tokens.push(token.clone());
                     }
                 }
@@ -797,7 +788,7 @@ impl CapabilityStore {
                 };
                 if let Some(bytes) = data
                     && let Ok(token) = serde_json::from_slice::<CapabilityToken>(&bytes)
-                    && !Self::status(&authority, &token.id).is_revoked()
+                    && !authority::status(&authority, &token.id).is_revoked()
                     && !token.is_expired()
                 {
                     tokens.push(token);

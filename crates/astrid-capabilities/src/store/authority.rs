@@ -1,8 +1,43 @@
 //! Token authority derived from revocation and single-use records.
 
+use std::{collections::HashMap, hash::Hash};
 use vstd::prelude::*;
+#[cfg(verus_keep_ghost)]
+use vstd::std_specs::hash::{hash_map_inv, obeys_key_model};
 
 verus! {
+
+broadcast use vstd::std_specs::hash::group_hash_axioms;
+
+/// Read the live authority for the requested token, including never-marked tokens.
+pub(super) fn status<K: Eq + Hash>(authority: &HashMap<K, TokenStatus>, id: &K) -> (out: TokenStatus)
+    requires hash_map_inv(authority), obeys_key_model::<K>(), vstd::laws_eq::obeys_concrete_eq::<K>(),
+    ensures if authority@.contains_key(*id) { out == authority@[*id] }
+        else { !out.revoked() && !out.used() },
+{
+    match authority.get(id) {
+        Some(existing) => *existing,
+        None => TokenStatus::recover(false, false),
+    }
+}
+
+/// Fence this token and return the same identity for the persistent write.
+pub(super) fn fence_revocation<'a, K: Eq + Hash + Clone>(
+    authority: &mut HashMap<K, TokenStatus>, id: &'a K,
+) -> (address: (&'static str, &'a K))
+    requires hash_map_inv(old(authority)), obeys_key_model::<K>(), vstd::laws_eq::obeys_concrete_eq::<K>(), vstd::pervasive::obeys_clone_eq::<K>(),
+    ensures hash_map_inv(final(authority)), address.0@ == "caps:revoked"@, *address.1 == *id,
+        final(authority)@.contains_key(*id), final(authority)@[*id].revoked(),
+        final(authority)@[*id].used() == (old(authority)@.contains_key(*id) && old(authority)@[*id].used()),
+        final(authority)@ == old(authority)@.insert(*id, final(authority)@[*id]),
+{
+    let mut live = status(authority, id);
+    live.record_revocation();
+    let key = id.clone();
+    assert(vstd::pervasive::cloned(*id, key));
+    authority.insert(key, live);
+    Marker::Revoked.address(id)
+}
 
 /// Revocation and consumption can coexist. Each record is monotone.
 #[derive(Clone, Copy)]
@@ -125,7 +160,6 @@ impl TokenStatus {
     /// for each token it reads, so neither the order nor a duplicate record
     /// can reopen authority. A token has at most one marker in each of the
     /// two namespaces, so the list is short.
-    #[expect(clippy::arithmetic_side_effects, reason = "the early return leaves a non-empty slice")]
     pub(super) fn recover_markers(markers: &[Marker]) -> (status: Self)
         ensures
             (status.revoked(), status.used()) == replay(markers@),
@@ -134,7 +168,7 @@ impl TokenStatus {
         let Some(last) = markers.last() else {
             return Self::recover(false, false);
         };
-        let (prefix, _) = markers.split_at(markers.len() - 1);
+        let (prefix, _) = markers.split_at(markers.len().saturating_sub(1));
         let mut status = Self::recover_markers(prefix);
         proof {
             markers@.lemma_add_last_back();
