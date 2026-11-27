@@ -9,6 +9,7 @@ rust-version.workspace = true
 description = "Virtual File System and Capability sandbox for Astrid agent runtime"
 
 [dependencies]
+vstd = { workspace = true }
 astrid-capabilities = { workspace = true }
 astrid-core = { workspace = true }
 async-trait = { workspace = true }

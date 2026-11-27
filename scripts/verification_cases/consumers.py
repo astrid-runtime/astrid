@@ -16,6 +16,23 @@ def consumer_defects():
     yield from file_descriptor.defects()
     yield from retirement.defects()
     yield from mcp.defects()
+    native_address = Path("crates/astrid-vfs/src/host_address.rs")
+    for label, before, after in [
+        ("registered handle", "out.is_some() == table@.contains_key(*handle)", "out.is_some() ==> table@.contains_key(*handle)"),
+        ("registration update", "final(table)@ == old(table)@.insert(handle,entry)", "final(table)@.contains_key(handle)"),
+        ("close isolation", "final(table)@ == old(table)@.remove(*handle)", "!final(table)@.contains_key(*handle)"),
+        ("close status", "removed == old(table)@.contains_key(*handle)", "true"),
+        ("captured owner", "owner == table@[*handle]", "true"),
+        ("retained directory", "out.parts().0 == directory, normalize", "true, normalize"),
+        ("worker address", "normalize.ensures((path,),out.parts().1)", "true"),
+        ("root path probe", "*p == self.parts().1", "true"),
+        ("worker arguments", "operation.ensures(self.parts(),out)", "true"),
+    ]:
+        yield (
+            f"native VFS target loses {label}", native_address,
+            lambda s, a=before, b=after: replace_once(s, a, b),
+            Path("verification/hosted_vfs_address.rs"),
+        )
     for label, before, after in [
         ("policy evidence", "=> check.ensures((gate,),Ok(guard))", "=> true"),
         ("mount identity", "Some(mount) == selected && address == path", "address == path"),

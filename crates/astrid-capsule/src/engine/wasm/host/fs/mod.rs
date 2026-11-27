@@ -25,6 +25,8 @@
 mod file_handle;
 mod physical;
 mod resolve;
+#[cfg(test)]
+mod retirement_tests;
 
 use wasmtime::component::Resource;
 

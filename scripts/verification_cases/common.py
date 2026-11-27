@@ -141,6 +141,8 @@ INPUTS = [
     LEASE_REQUESTER,
     INVOCATION_OWNER,
     MOUNT,
+    Path("crates/astrid-vfs/src/host_address.rs"),
+    Path("verification/hosted_vfs_address.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/host/fs/physical.rs"),
     Path("verification/hosted_physical_path.rs"),
     RECEIPT,

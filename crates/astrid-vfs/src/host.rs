@@ -8,6 +8,7 @@ use cap_std::fs::Dir;
 use tokio::fs;
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
+use crate::host_address::{self, Address, retain};
 use crate::{Vfs, VfsDirEntry, VfsError, VfsMetadata, VfsResult};
 
 /// An open file and its associated semaphore permit, tying the FD quota to the struct's lifetime.
@@ -71,7 +72,7 @@ impl HostVfs {
         let dir = Dir::open_ambient_dir(physical_path, cap_std::ambient_authority())
             .map_err(classify_io_error)?;
         let mut open_dirs = HashMap::new();
-        open_dirs.insert(handle, Arc::new(dir));
+        host_address::install(&mut open_dirs, handle, Arc::new(dir));
         Ok(Self {
             open_dirs: RwLock::new(open_dirs),
             open_files: RwLock::new(HashMap::new()),
@@ -97,7 +98,7 @@ impl HostVfs {
             Ok(dir) => {
                 let mut dirs: tokio::sync::RwLockWriteGuard<'_, HashMap<DirHandle, Arc<Dir>>> =
                     self.open_dirs.write().await;
-                dirs.insert(handle, Arc::new(dir));
+                host_address::install(&mut dirs, handle, Arc::new(dir));
                 Ok(())
             },
             Err(e) => {
@@ -107,10 +108,20 @@ impl HostVfs {
         }
     }
 
-    async fn get_dir(&self, handle: &DirHandle) -> VfsResult<Arc<Dir>> {
-        let dirs: tokio::sync::RwLockReadGuard<'_, HashMap<DirHandle, Arc<Dir>>> =
-            self.open_dirs.read().await;
-        dirs.get(handle).cloned().ok_or(VfsError::InvalidHandle)
+    async fn address(&self, handle: &DirHandle, path: &str) -> VfsResult<Address<Dir, PathBuf>> {
+        let dir = retain(&*self.open_dirs.read().await, handle).ok_or(VfsError::InvalidHandle)?;
+        Ok(Address::new(dir, path, |text| {
+            make_relative(text).to_path_buf()
+        }))
+    }
+}
+
+impl Address<Dir, PathBuf> {
+    fn blocking<T: Send + 'static>(
+        self,
+        work: impl FnOnce(Arc<Dir>, PathBuf) -> T + Send + 'static,
+    ) -> tokio::task::JoinHandle<T> {
+        tokio::task::spawn_blocking(move || self.run(work))
     }
 }
 
@@ -123,110 +134,110 @@ impl Default for HostVfs {
 #[async_trait]
 impl Vfs for HostVfs {
     async fn exists(&self, handle: &DirHandle, path: &str) -> VfsResult<bool> {
-        let dir = self.get_dir(handle).await?;
-        let safe_path = make_relative(path).to_path_buf();
-        if safe_path.as_os_str().is_empty() {
+        let address = self.address(handle, path).await?;
+        if address.path().as_os_str().is_empty() {
             return Ok(true);
         }
-        let res = tokio::task::spawn_blocking(move || dir.exists(&safe_path))
+        let res = address
+            .blocking(move |dir, safe_path| dir.exists(&safe_path))
             .await
             .expect("spawn_blocking panicked");
         Ok(res)
     }
 
     async fn readdir(&self, handle: &DirHandle, path: &str) -> VfsResult<Vec<VfsDirEntry>> {
-        let dir = self.get_dir(handle).await?;
-        let safe_path = make_relative(path).to_path_buf();
+        let address = self.address(handle, path).await?;
 
-        tokio::task::spawn_blocking(move || {
-            let iter = if safe_path.as_os_str().is_empty() {
-                dir.entries()
-            } else {
-                dir.read_dir(&safe_path)
-            }
-            .map_err(classify_io_error)?;
+        address
+            .blocking(move |dir, safe_path| {
+                let iter = if safe_path.as_os_str().is_empty() {
+                    dir.entries()
+                } else {
+                    dir.read_dir(&safe_path)
+                }
+                .map_err(classify_io_error)?;
 
-            let mut entries = Vec::new();
-            for entry_res in iter {
-                let entry = entry_res.map_err(classify_io_error)?;
-                let is_dir = entry.file_type().is_ok_and(|ft| ft.is_dir());
-                entries.push(VfsDirEntry {
-                    name: entry.file_name().to_string_lossy().to_string(),
-                    is_dir,
-                });
-            }
-            Ok(entries)
-        })
-        .await
-        .expect("spawn_blocking panicked")
+                let mut entries = Vec::new();
+                for entry_res in iter {
+                    let entry = entry_res.map_err(classify_io_error)?;
+                    let is_dir = entry.file_type().is_ok_and(|ft| ft.is_dir());
+                    entries.push(VfsDirEntry {
+                        name: entry.file_name().to_string_lossy().to_string(),
+                        is_dir,
+                    });
+                }
+                Ok(entries)
+            })
+            .await
+            .expect("spawn_blocking panicked")
     }
 
     async fn stat(&self, handle: &DirHandle, path: &str) -> VfsResult<VfsMetadata> {
-        let dir = self.get_dir(handle).await?;
-        let safe_path = make_relative(path).to_path_buf();
+        let address = self.address(handle, path).await?;
 
-        tokio::task::spawn_blocking(move || {
-            let meta = if safe_path.as_os_str().is_empty() {
-                dir.dir_metadata()
-            } else {
-                dir.symlink_metadata(&safe_path)
-            }
-            .map_err(classify_io_error)?;
+        address
+            .blocking(move |dir, safe_path| {
+                let meta = if safe_path.as_os_str().is_empty() {
+                    dir.dir_metadata()
+                } else {
+                    dir.symlink_metadata(&safe_path)
+                }
+                .map_err(classify_io_error)?;
 
-            let mtime = meta
-                .modified()
-                .ok()
-                .map(cap_std::time::SystemTime::into_std)
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0u64, |d| d.as_secs());
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .map(cap_std::time::SystemTime::into_std)
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0u64, |d| d.as_secs());
 
-            Ok(VfsMetadata {
-                is_dir: meta.is_dir(),
-                is_file: meta.is_file(),
-                size: meta.len(),
-                mtime,
+                Ok(VfsMetadata {
+                    is_dir: meta.is_dir(),
+                    is_file: meta.is_file(),
+                    size: meta.len(),
+                    mtime,
+                })
             })
-        })
-        .await
-        .expect("spawn_blocking panicked")
+            .await
+            .expect("spawn_blocking panicked")
     }
 
     async fn mkdir(&self, handle: &DirHandle, path: &str) -> VfsResult<()> {
-        let dir = self.get_dir(handle).await?;
-        let safe_path = make_relative(path).to_path_buf();
-        if safe_path.as_os_str().is_empty() {
+        let address = self.address(handle, path).await?;
+        if address.path().as_os_str().is_empty() {
             return Err(VfsError::PermissionDenied(
                 "Cannot operate on capability root directly".into(),
             ));
         }
 
-        tokio::task::spawn_blocking(move || dir.create_dir_all(&safe_path))
+        address
+            .blocking(move |dir, safe_path| dir.create_dir_all(&safe_path))
             .await
             .expect("spawn_blocking panicked")
             .map_err(classify_io_error)
     }
 
     async fn unlink(&self, handle: &DirHandle, path: &str) -> VfsResult<()> {
-        let dir = self.get_dir(handle).await?;
-        let safe_path = make_relative(path).to_path_buf();
-        if safe_path.as_os_str().is_empty() {
+        let address = self.address(handle, path).await?;
+        if address.path().as_os_str().is_empty() {
             return Err(VfsError::PermissionDenied(
                 "Cannot operate on capability root directly".into(),
             ));
         }
 
-        tokio::task::spawn_blocking(move || {
-            let meta = dir
-                .symlink_metadata(&safe_path)
-                .map_err(classify_io_error)?;
-            if meta.is_dir() {
-                dir.remove_dir(&safe_path).map_err(classify_io_error)
-            } else {
-                dir.remove_file(&safe_path).map_err(classify_io_error)
-            }
-        })
-        .await
-        .expect("spawn_blocking panicked")
+        address
+            .blocking(move |dir, safe_path| {
+                let meta = dir
+                    .symlink_metadata(&safe_path)
+                    .map_err(classify_io_error)?;
+                if meta.is_dir() {
+                    dir.remove_dir(&safe_path).map_err(classify_io_error)
+                } else {
+                    dir.remove_file(&safe_path).map_err(classify_io_error)
+                }
+            })
+            .await
+            .expect("spawn_blocking panicked")
     }
 
     async fn open(
@@ -236,8 +247,7 @@ impl Vfs for HostVfs {
         write: bool,
         truncate: bool,
     ) -> VfsResult<FileHandle> {
-        let dir = self.get_dir(handle).await?;
-        let safe_path = make_relative(path).to_path_buf();
+        let address = self.address(handle, path).await?;
 
         // Prevent transient FD exhaustion via semaphore before calling the OS
         let permit = self
@@ -246,18 +256,19 @@ impl Vfs for HostVfs {
             .try_acquire_owned()
             .map_err(|_| VfsError::PermissionDenied("Too many open files".into()))?;
 
-        let std_file = tokio::task::spawn_blocking(move || {
-            let mut options = cap_std::fs::OpenOptions::new();
-            options
-                .read(true)
-                .write(write)
-                .create(write)
-                .truncate(truncate);
-            dir.open_with(&safe_path, &options)
-        })
-        .await
-        .expect("spawn_blocking panicked")
-        .map_err(classify_io_error)?;
+        let std_file = address
+            .blocking(move |dir, safe_path| {
+                let mut options = cap_std::fs::OpenOptions::new();
+                options
+                    .read(true)
+                    .write(write)
+                    .create(write)
+                    .truncate(truncate);
+                dir.open_with(&safe_path, &options)
+            })
+            .await
+            .expect("spawn_blocking panicked")
+            .map_err(classify_io_error)?;
 
         // Convert the cap_std File into a tokio async File
         let tokio_file = tokio::fs::File::from_std(std_file.into_std());
@@ -269,7 +280,8 @@ impl Vfs for HostVfs {
         }
 
         let new_handle = FileHandle::new();
-        files.insert(
+        host_address::install(
+            &mut files,
             new_handle.clone(),
             Arc::new(RwLock::new((tokio_file, permit))),
         );
@@ -283,19 +295,19 @@ impl Vfs for HostVfs {
         path: &str,
         new_handle: DirHandle,
     ) -> VfsResult<()> {
-        let dir = self.get_dir(handle).await?;
-        let safe_path = make_relative(path).to_path_buf();
+        let address = self.address(handle, path).await?;
 
-        let new_dir = tokio::task::spawn_blocking(move || {
-            if safe_path.as_os_str().is_empty() {
-                dir.try_clone()
-            } else {
-                dir.open_dir(&safe_path)
-            }
-        })
-        .await
-        .expect("spawn_blocking panicked")
-        .map_err(classify_io_error)?;
+        let new_dir = address
+            .blocking(move |dir, safe_path| {
+                if safe_path.as_os_str().is_empty() {
+                    dir.try_clone()
+                } else {
+                    dir.open_dir(&safe_path)
+                }
+            })
+            .await
+            .expect("spawn_blocking panicked")
+            .map_err(classify_io_error)?;
 
         let mut dirs: tokio::sync::RwLockWriteGuard<'_, HashMap<DirHandle, Arc<Dir>>> =
             self.open_dirs.write().await;
@@ -305,14 +317,14 @@ impl Vfs for HostVfs {
             ));
         }
 
-        dirs.insert(new_handle, Arc::new(new_dir));
+        host_address::install(&mut dirs, new_handle, Arc::new(new_dir));
         Ok(())
     }
 
     async fn close_dir(&self, handle: &DirHandle) -> VfsResult<()> {
         let mut dirs: tokio::sync::RwLockWriteGuard<'_, HashMap<DirHandle, Arc<Dir>>> =
             self.open_dirs.write().await;
-        if dirs.remove(handle).is_none() {
+        if !host_address::close(&mut dirs, handle) {
             return Err(VfsError::InvalidHandle);
         }
         Ok(())
@@ -323,7 +335,7 @@ impl Vfs for HostVfs {
         let file_arc = {
             let files: tokio::sync::RwLockReadGuard<'_, HashMap<FileHandle, OpenFileEntry>> =
                 self.open_files.read().await;
-            files.get(handle).cloned().ok_or(VfsError::InvalidHandle)?
+            retain(&*files, handle).ok_or(VfsError::InvalidHandle)?
         };
 
         let mut file_tuple = file_arc.write().await;
@@ -358,7 +370,7 @@ impl Vfs for HostVfs {
         let file_arc = {
             let files: tokio::sync::RwLockReadGuard<'_, HashMap<FileHandle, OpenFileEntry>> =
                 self.open_files.read().await;
-            files.get(handle).cloned().ok_or(VfsError::InvalidHandle)?
+            retain(&*files, handle).ok_or(VfsError::InvalidHandle)?
         };
 
         let mut file_tuple = file_arc.write().await;
@@ -371,7 +383,7 @@ impl Vfs for HostVfs {
     async fn close(&self, handle: &FileHandle) -> VfsResult<()> {
         let mut files: tokio::sync::RwLockWriteGuard<'_, HashMap<FileHandle, OpenFileEntry>> =
             self.open_files.write().await;
-        if files.remove(handle).is_none() {
+        if !host_address::close(&mut files, handle) {
             return Err(VfsError::InvalidHandle);
         }
         Ok(())
@@ -390,6 +402,41 @@ mod tests {
         let vfs = HostVfs::with_registered_dir(handle.clone(), root.path()).expect("VFS");
 
         assert!(vfs.exists(&handle, "visible.txt").await.expect("exists"));
+    }
+
+    #[tokio::test]
+    async fn queued_address_keeps_the_registered_directory_through_close_and_rebind() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        for (root, contents) in [
+            (&first, b"first".as_slice()),
+            (&second, b"second".as_slice()),
+        ] {
+            std::fs::write(root.path().join("item"), contents).unwrap();
+        }
+        let handle = DirHandle::new();
+        let vfs = HostVfs::with_registered_dir(handle.clone(), first.path()).unwrap();
+        let captured = vfs.address(&handle, "/item").await.unwrap();
+        vfs.close_dir(&handle).await.unwrap();
+        assert!(matches!(
+            vfs.address(&handle, "item").await,
+            Err(VfsError::InvalidHandle)
+        ));
+        vfs.register_dir(handle.clone(), second.path().to_path_buf())
+            .await
+            .unwrap();
+        let replacement = vfs.address(&handle, "item").await.unwrap();
+        for (address, expected) in [
+            (captured, b"first".as_slice()),
+            (replacement, b"second".as_slice()),
+        ] {
+            let bytes = address
+                .blocking(|dir, path| dir.read(path))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(bytes, expected);
+        }
     }
 
     #[tokio::test]

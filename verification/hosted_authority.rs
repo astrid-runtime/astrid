@@ -115,6 +115,9 @@ mod mount_selection;
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/fs/physical.rs"]
 mod physical;
 mod hosted_physical_path;
+#[path = "../crates/astrid-vfs/src/host_address.rs"]
+mod host_address;
+mod hosted_vfs_address;
 
 #[path = "../crates/astrid-kernel/src/kernel_router/resume_receipt/validation.rs"]
 mod receipt_validation;
