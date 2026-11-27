@@ -16,14 +16,30 @@ pub(super) struct Update<P> {
 
 #[derive(Debug)]
 pub(super) struct Declaration<P,A> {
-    pub(super) update:Update<P>,
-    pub(super) identity:IdentityProof<A>,
+    update:Update<P>,
+    identity:IdentityProof<A>,
 }
 
 impl<P,A> Declaration<P,A> {
+    pub(super) closed spec fn payload(&self) -> Update<P> { self.update }
+    pub(super) closed spec fn proof_source(&self) -> IdentityProof<A> { self.identity }
+
+    pub(super) const fn update(&self) -> (u:&Update<P>)
+        ensures *u == self.payload(),
+    { &self.update }
+
+    pub(super) fn is_sealed(&self) -> (sealed:bool)
+        ensures sealed == (self.proof_source() is Engine),
+    { matches!(self.identity,IdentityProof::Engine(_)) }
+
+    /// The native identity session provides the authority paired with its hasher.
+    pub(super) fn sealed(update:Update<P>,authority:A) -> (out:Self)
+        ensures out.payload() == update, out.proof_source() == IdentityProof::Engine(authority),
+    { Self {update,identity:IdentityProof::Engine(authority)} }
+
     pub(super) const fn untrusted(principal:P,expected:Option<RootState>,commit:ObjectId,records:Vec<(ObjectId,ObjectRecord)>)
         -> (out:Self)
-        ensures out.update == (Update { principal,expected,commit,records }), out.identity is Untrusted,
+        ensures out.payload() == (Update { principal,expected,commit,records }), out.proof_source() is Untrusted,
     {
         Self {update:Update {principal,expected,commit,records},identity:IdentityProof::Untrusted}
     }
@@ -33,15 +49,15 @@ impl<P,A> Declaration<P,A> {
         requires forall|bound:&A| #[trigger] same.requires((bound,current)),
             forall|r:&ObjectRecord| #[trigger] identify.requires((r,)),
         ensures match out {
-            Ok((update,kind)) => update == self.update && match kind {
-                Admission::SameEngine => self.identity.compared(current,same,true),
-                Admission::Rechecked => self.identity.compared(current,same,false) &&
+            Ok((update,kind)) => update == self.payload() && match kind {
+                Admission::SameEngine => self.proof_source().compared(current,same,true),
+                Admission::Rechecked => self.proof_source().compared(current,same,false) &&
                     forall|i:int| 0 <= i < update.records.len() ==> #[trigger] authentic(update.records@[i],identify),
             },
-            Err((name,computed)) => self.identity.compared(current,same,false) &&
-                exists|i:int| 0 <= i < self.update.records.len() && name == self.update.records@[i].0 &&
-                    #[trigger] identify.ensures((&self.update.records@[i].1,),computed) && computed.digest() != name.digest() &&
-                    forall|j:int| 0 <= j < i ==> #[trigger] authentic(self.update.records@[j],identify),
+            Err((name,computed)) => self.proof_source().compared(current,same,false) &&
+                exists|i:int| 0 <= i < self.payload().records.len() && name == self.payload().records@[i].0 &&
+                    #[trigger] identify.ensures((&self.payload().records@[i].1,),computed) && computed.digest() != name.digest() &&
+                    forall|j:int| 0 <= j < i ==> #[trigger] authentic(self.payload().records@[j],identify),
         },
     {
         let admission = self.identity.admit(current,same,&self.update.records,identify)?;

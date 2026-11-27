@@ -53,23 +53,19 @@ impl<'a> KvIdentitySession<'a> {
         records: Vec<(ObjectId, ObjectRecord)>,
     ) -> RootTransaction<P> {
         RootTransaction {
-            declaration: super::root_declaration::Declaration {
-                update: super::root_declaration::Update {
+            declaration: super::root_declaration::Declaration::sealed(
+                super::root_declaration::Update {
                     principal,
                     expected,
                     commit,
                     records,
                 },
-                identity: IdentityProof::Engine(Arc::clone(self.authority)),
-            },
+                Arc::clone(self.authority),
+            ),
             kv_checkpoint_publication: None,
         }
     }
 }
-
-/// Process-local proof that a transaction's declared identities were computed
-/// by the same engine instance that now consumes it.
-pub(crate) type IdentityProof = super::transaction_records::IdentityProof<Arc<()>>;
 
 impl<P> super::root_declaration::Declaration<P, Arc<()>> {
     pub(super) fn admit_records(

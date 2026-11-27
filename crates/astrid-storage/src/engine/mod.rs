@@ -49,7 +49,6 @@ pub use durable::{
     RecoveryRetryPolicy, TransactionWalPolicy, VerifiedCompactionPlan,
     deterministic_compaction_proof,
 };
-pub(crate) use identity::IdentityProof;
 pub use identity::KvIdentitySession;
 pub use kv::{
     KvProjectionEngine, KvProjectionError, KvState, KvStateSnapshot, ReadyKvRoot,
@@ -115,7 +114,7 @@ impl<P> RootTransaction<P> {
         mut self,
         publication: impl FnOnce() -> crate::kv::KvCheckpointPublication,
     ) -> Self {
-        if matches!(self.declaration.identity, IdentityProof::Engine(_)) {
+        if self.declaration.is_sealed() {
             self.kv_checkpoint_publication = Some(publication());
         }
         self
@@ -124,42 +123,42 @@ impl<P> RootTransaction<P> {
     /// Borrow the target principal.
     #[must_use]
     pub const fn principal(&self) -> &P {
-        &self.declaration.update.principal
+        &self.declaration.update().principal
     }
 
     /// Return the exact root expected by the caller.
     #[must_use]
     pub const fn expected(&self) -> Option<RootState> {
-        self.declaration.update.expected
+        self.declaration.update().expected
     }
 
     /// Return the immutable commit that becomes current on success.
     #[must_use]
     pub const fn commit(&self) -> ObjectId {
-        self.declaration.update.commit
+        self.declaration.update().commit
     }
 
     /// Borrow the transaction's declared immutable records.
     #[must_use]
     pub fn records(&self) -> &[(ObjectId, ObjectRecord)] {
-        &self.declaration.update.records
+        &self.declaration.update().records
     }
 }
 
 impl<P: Clone> Clone for RootTransaction<P> {
     fn clone(&self) -> Self {
         Self::new(
-            self.declaration.update.principal.clone(),
-            self.declaration.update.expected,
-            self.declaration.update.commit,
-            self.declaration.update.records.clone(),
+            self.declaration.update().principal.clone(),
+            self.declaration.update().expected,
+            self.declaration.update().commit,
+            self.declaration.update().records.clone(),
         )
     }
 }
 
 impl<P: PartialEq> PartialEq for RootTransaction<P> {
     fn eq(&self, other: &Self) -> bool {
-        self.declaration.update == other.declaration.update
+        self.declaration.update() == other.declaration.update()
     }
 }
 

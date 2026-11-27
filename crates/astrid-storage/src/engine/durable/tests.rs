@@ -12,14 +12,15 @@ mod bootstrap_exclusion;
 fn commit_reports_the_first_misnamed_record_before_admission() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open(dir.path());
-    let (_, mut txn) = transaction("alice", None, b"commit");
+    let (_, txn) = transaction("alice", None, b"commit");
     let (_, other) = transaction("bob", None, b"other");
-    let rows = &mut txn.declaration.update.records;
-    rows.extend(other.declaration.update.records);
+    let mut rows = txn.records().to_vec();
+    rows.extend_from_slice(other.records());
     let first = ObjectId::new([0x51; 32]);
     let computed = engine.identify(&rows[1].1);
     rows[1].0 = first;
     rows[3].0 = ObjectId::new([0x52; 32]);
+    let txn = RootTransaction::new(txn.principal().clone(), txn.expected(), txn.commit(), rows);
     assert!(
         matches!(engine.commit(txn), Err(DurableError::Model(ModelError::ObjectIdentityMismatch {
         declared,computed:actual
@@ -63,12 +64,11 @@ fn durable_admission_rechecks_a_foreign_seal_with_the_receiving_identity() {
     let session = local.captured_identity_session();
     let sealed = || {
         let (_, txn) = transaction("alice", None, b"sealed");
-        let update = txn.declaration.update;
         session.seal_transaction(
-            update.principal,
-            update.expected,
-            update.commit,
-            update.records,
+            txn.principal().clone(),
+            txn.expected(),
+            txn.commit(),
+            txn.records().to_vec(),
         )
     };
     let attempt = sealed();

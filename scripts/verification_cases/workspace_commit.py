@@ -174,10 +174,12 @@ def defects():
     trace = Path("verification/hosted_wal_writer_trace.rs")
     source = Path("crates/astrid-storage/src/engine/root_declaration.rs")
     for name, old, new in [
-        ("constructor may issue a local seal", "out.identity is Untrusted,", "true,"),
-        ("admission may retarget a valid batch", "update == self.update && match kind", "update.records == self.update.records && match kind"),
-        ("admission may exchange input rows", "update == self.update && match kind", "(update.principal == self.update.principal && update.expected == self.update.expected && update.commit == self.update.commit) && match kind"),
-        ("identity failure may skip an earlier row", "forall|j:int| 0 <= j < i ==> #[trigger] authentic(self.update.records@[j],identify),", "true,"),
+        ("seal may name another issuer", "out.proof_source() == IdentityProof::Engine(authority)", "out.proof_source() is Engine"),
+        ("seal may change the update", "ensures out.payload() == update, out.proof_source()", "ensures true, out.proof_source()"),
+        ("constructor may issue a local seal", "out.proof_source() is Untrusted,", "true,"),
+        ("admission may retarget a valid batch", "update == self.payload() && match kind", "update.records == self.payload().records && match kind"),
+        ("admission may exchange input rows", "update == self.payload() && match kind", "(update.principal == self.payload().principal && update.expected == self.payload().expected && update.commit == self.payload().commit) && match kind"),
+        ("identity failure may skip an earlier row", "forall|j:int| 0 <= j < i ==> #[trigger] authentic(self.payload().records@[j],identify),", "true,"),
     ]:
         yield (
             f"root declaration {name}", source,
@@ -193,6 +195,6 @@ def defects():
         ("admission may skip a generation", "Some(old) => root.generation.value() == old.generation.value() + 1", "Some(old) => root.generation.value() > old.generation.value()"),
     ]:
         yield (
-            f"root declaration {name}", source,
+            f"durable root selection {name}", source,
             lambda s, a=old, b=new: replace_once(s, a, b), trace,
         )

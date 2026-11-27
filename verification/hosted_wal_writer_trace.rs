@@ -49,6 +49,31 @@ fn admit_content<P:Ord,H:Fn(&ObjectRecord)->ObjectId>(pending:&BTreeMap<P,RootSt
     }
 }
 
+/// Model the native engine identity relation by equality on opaque authority
+/// names. Only a matching session may transfer its private checkpoint.
+fn admit_sealed<P,C,H:Fn(&ObjectRecord)->ObjectId>(update:root_declaration::Update<P>,
+    issuer:u64,receiver:u64,checkpoint:&mut Option<C>,identify:H)
+    -> (out:Result<(root_declaration::Update<P>,Option<C>),(ObjectId,ObjectId)>)
+    requires forall|r:&ObjectRecord| #[trigger] identify.requires((r,)),
+    ensures match out {
+        Ok((accepted,hint)) => accepted == update && (if issuer == receiver {
+            hint == *old(checkpoint) && final(checkpoint).is_none()
+        } else {
+            hint.is_none() && *final(checkpoint) == *old(checkpoint) &&
+                forall|i:int| 0 <= i < update.records.len() ==> #[trigger] transaction_records::authentic(update.records@[i],identify)
+        }),
+        Err((bad,computed)) => issuer != receiver && *final(checkpoint) == *old(checkpoint) &&
+            exists|i:int| 0 <= i < update.records.len() && update.records@[i].0 == bad &&
+                #[trigger] identify.ensures((&update.records@[i].1,),computed) && computed.digest() != bad.digest() &&
+                forall|j:int| 0 <= j < i ==> #[trigger] transaction_records::authentic(update.records@[j],identify),
+    },
+{
+    let declaration = root_declaration::Declaration::sealed(update,issuer);
+    let same = |a:&u64,b:&u64| -> (equal:bool) ensures equal == (*a == *b) { *a == *b };
+    let (accepted,kind) = declaration.admit(&receiver,same,identify)?;
+    Ok((accepted,kind.take_checkpoint(checkpoint)))
+}
+
 /// The journal callback receives the root retained across closure validation.
 fn journal_selected<P,E,T,F,W>(selected:root_transition::SelectedRoot<P>,encoder:F,write:W)
     -> (out:Result<(root_transition::PreparedRoot<P,RootState>,T),E>)
