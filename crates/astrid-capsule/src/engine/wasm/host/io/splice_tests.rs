@@ -136,3 +136,87 @@ async fn queued_splice_refuses_a_rebound_owner_before_touching_either_stream() {
     );
     assert!(sink.contents().is_empty());
 }
+
+#[tokio::test]
+async fn retiring_a_registered_device_drains_a_queued_transfer_without_consuming_input() {
+    use astrid_core::dirs::AstridHome;
+    use astrid_core::profile::{AuthMethod, DeviceKey, DeviceKeyId, DeviceScope, PrincipalProfile};
+    use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
+    use std::sync::Arc;
+
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    let principal = state.effective_principal();
+    let temp = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(temp.path());
+    let key = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+    let key_id = DeviceKeyId::new(key.key_id.clone()).unwrap();
+    let mut profile = PrincipalProfile::default();
+    profile.auth.methods.push(AuthMethod::Keypair);
+    profile.add_device(key.clone());
+    profile.save(&home, &principal).unwrap();
+    state.profile_cache = Some(Arc::new(
+        crate::profile_cache::PrincipalProfileCache::with_home(home),
+    ));
+    let mut message = IpcMessage::new(
+        Topic::from_raw("splice.test"),
+        IpcPayload::RawJson(serde_json::Value::Null),
+        uuid::Uuid::new_v4(),
+    )
+    .with_principal(principal.to_string());
+    message.device_key_id = Some(key.key_id);
+    message.device_registration_id = key.registration_id.map(Into::into);
+    state.caller_context = Some(message);
+
+    let sessions = state.device_sessions.clone();
+    let tracker = Arc::new(crate::engine::wasm::PrincipalInvocationTracker::default());
+    state.principal_invocations = Some(tracker.clone());
+    state.io_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut input = MemoryInputPipe::new("keep");
+    let src = state
+        .resource_table
+        .push::<DynInputStream>(Box::new(input.clone()))
+        .unwrap();
+    let sink = MemoryOutputPipe::new(16);
+    let dst = state
+        .resource_table
+        .push::<DynOutputStream>(Box::new(sink.clone()))
+        .unwrap();
+    let mut transfer = Box::pin(state.blocking_splice(
+        Resource::new_borrow(dst.rep()),
+        Resource::new_borrow(src.rep()),
+        4,
+    ));
+    tokio::select! {
+        biased;
+        result = &mut transfer => panic!("expected queued transfer, got {result:?}"),
+        () = std::future::ready(()) => {}
+    }
+    let mut retirement = Box::pin(sessions.retire(&principal, &key_id));
+    tokio::select! {
+        biased;
+        result = &mut retirement => panic!("expected live device session, got {result:?}"),
+        () = std::future::ready(()) => {}
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        assert!(matches!(transfer.await, Err(StreamError::Closed)));
+        retirement.await.unwrap();
+    })
+    .await
+    .expect("device retirement must drain the queued transfer");
+    tracker.retire(&principal);
+    assert!(matches!(
+        state.splice(
+            Resource::new_borrow(dst.rep()),
+            Resource::new_borrow(src.rep()),
+            4
+        ),
+        Err(StreamError::Closed)
+    ));
+    assert_eq!(
+        wasmtime_wasi::p2::InputStream::read(&mut input, 4)
+            .unwrap()
+            .as_ref(),
+        b"keep"
+    );
+    assert!(sink.contents().is_empty());
+}
