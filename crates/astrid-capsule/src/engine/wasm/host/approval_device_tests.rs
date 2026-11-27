@@ -178,6 +178,26 @@ async fn command_writer_checks_both_registrations_after_admission_and_before_sav
                 responder: message,
             },
         );
+        let store = AllowanceStore::new();
+        let session = CommandGrants {
+            state: &state,
+            responder: message,
+        }
+        .session(Decision::Session, &principal, || {
+            create_allowance_from_decision(
+                &store,
+                &principal,
+                "git push",
+                "approve_session",
+                None,
+                "test",
+            );
+        });
+        assert_eq!(session.is_ok(), removed_index.is_none());
+        assert_eq!(
+            check_allowance(&store, &principal, "git push origin main", None),
+            removed_index.is_none()
+        );
         let saved = PrincipalProfile::load_required(&home, &principal).unwrap();
         if removed_index.is_some() {
             assert!(matches!(result, Err(ErrorCode::StoreUnavailable)));

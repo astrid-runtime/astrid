@@ -30,6 +30,18 @@ use astrid_core::principal::PrincipalId;
 use astrid_core::profile::{
     CommandAlwaysGrant, DeviceKeyId, PrincipalProfile, ProfileError, ProfileResult,
 };
+use astrid_events::ipc::DeviceStamp;
+
+fn current_command_device(profile: &PrincipalProfile, stamp: DeviceStamp<'_>) -> bool {
+    match stamp.fingerprint {
+        Some(raw) => DeviceKeyId::new(raw).ok().is_some_and(|key| {
+            profile
+                .active_registration(&key, stamp.registration)
+                .is_some()
+        }),
+        None => stamp.registration.is_none(),
+    }
+}
 
 /// Outcome of removing a key from an existing principal profile.
 #[derive(Debug, PartialEq, Eq)]
@@ -398,6 +410,22 @@ impl PrincipalProfileCache {
         )
     }
 
+    /// Keep paired-device removal excluded until the in-memory session grant is installed.
+    pub(crate) fn with_session_devices(
+        &self,
+        principal: &PrincipalId,
+        devices: [DeviceStamp<'_>; 2],
+        install: impl FnOnce(),
+    ) -> ProfileResult<()> {
+        let _guard = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let profile = self.load_consent_profile(principal)?;
+        command::on_current_profile(profile, devices, current_command_device, |_| install())
+            .ok_or_else(|| ProfileError::Invalid("approval device registration changed".into()))
+    }
+
     pub(crate) fn persist_command_at(
         &self,
         principal: &PrincipalId,
@@ -439,38 +467,26 @@ impl PrincipalProfileCache {
         // Approval cannot resurrect a principal removed while the prompt was open.
         let profile = self.load_consent_profile(principal)?;
         // Device removal can have published since the registry guards were acquired.
-        command::on_current_profile(
-            profile,
-            devices,
-            |profile, stamp| match stamp.fingerprint {
-                Some(raw) => DeviceKeyId::new(raw).ok().is_some_and(|key| {
-                    profile
-                        .active_registration(&key, stamp.registration)
-                        .is_some()
-                }),
-                None => stamp.registration.is_none(),
-            },
-            |mut profile| {
-                let already = profile.approvals.command_always.iter().any(|grant| {
-                    grant.command == command
-                        && grant.location == location
-                        && grant.workspace_root.as_deref() == workspace_root
-                });
-                if already {
-                    guard.profiles.insert(principal.clone(), Arc::new(profile));
-                    return Ok(());
-                }
+        command::on_current_profile(profile, devices, current_command_device, |mut profile| {
+            let already = profile.approvals.command_always.iter().any(|grant| {
+                grant.command == command
+                    && grant.location == location
+                    && grant.workspace_root.as_deref() == workspace_root
+            });
+            if already {
+                guard.profiles.insert(principal.clone(), Arc::new(profile));
+                return Ok(());
+            }
 
-                profile.approvals.command_always.push(CommandAlwaysGrant {
-                    command: command.to_string(),
-                    location,
-                    workspace_root: workspace_root.map(str::to_string),
-                });
-                profile.save_to_path(&path)?;
-                guard.invalidate(principal);
-                Ok(())
-            },
-        )
+            profile.approvals.command_always.push(CommandAlwaysGrant {
+                command: command.to_string(),
+                location,
+                workspace_root: workspace_root.map(str::to_string),
+            });
+            profile.save_to_path(&path)?;
+            guard.invalidate(principal);
+            Ok(())
+        })
         .ok_or_else(|| ProfileError::Invalid("approval device registration changed".into()))?
     }
 

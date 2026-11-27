@@ -153,19 +153,11 @@ struct CommandGrants<'a> {
     responder: &'a IpcMessage,
 }
 
-impl CommandGrants<'_> {
-    fn write(
+impl<'a> CommandGrants<'a> {
+    fn devices(
         &self,
         owner: &PrincipalId,
-        family: &str,
-        path: Option<&str>,
-        location: CommandApprovalLocation,
-    ) -> Result<(), ErrorCode> {
-        let cache = self
-            .state
-            .profile_cache
-            .as_ref()
-            .ok_or(ErrorCode::StoreUnavailable)?;
+    ) -> Result<[astrid_events::ipc::DeviceStamp<'a>; 2], ErrorCode> {
         let mut devices = [Default::default(); 2];
         for (slot, message) in devices
             .iter_mut()
@@ -181,6 +173,56 @@ impl CommandGrants<'_> {
                 *slot = stamp;
             }
         }
+        Ok(devices)
+    }
+
+    fn session(
+        &self,
+        outcome: Decision,
+        owner: &PrincipalId,
+        install: impl FnOnce(),
+    ) -> Result<(), ErrorCode> {
+        use consent_reply::SessionRoute;
+        let caller = self
+            .state
+            .caller_context
+            .as_ref()
+            .map(IpcMessage::device_stamp)
+            .unwrap_or_default();
+        let responder = self.responder.device_stamp();
+        match consent_reply::session_route(
+            outcome,
+            (caller.fingerprint, caller.registration),
+            (responder.fingerprint, responder.registration),
+        ) {
+            SessionRoute::Skip => Ok(()),
+            SessionRoute::Unstamped => {
+                install();
+                Ok(())
+            },
+            SessionRoute::CheckProfile => self
+                .state
+                .profile_cache
+                .as_ref()
+                .ok_or(ErrorCode::StoreUnavailable)?
+                .with_session_devices(owner, self.devices(owner)?, install)
+                .map_err(|_| ErrorCode::StoreUnavailable),
+        }
+    }
+
+    fn write(
+        &self,
+        owner: &PrincipalId,
+        family: &str,
+        path: Option<&str>,
+        location: CommandApprovalLocation,
+    ) -> Result<(), ErrorCode> {
+        let cache = self
+            .state
+            .profile_cache
+            .as_ref()
+            .ok_or(ErrorCode::StoreUnavailable)?;
+        let devices = self.devices(owner)?;
         cache
             .persist_command_at(owner, family, path, location, devices)
             .map_err(|error| {
@@ -568,19 +610,39 @@ impl approval::Host for HostState {
                                 );
                                 ErrorCode::StoreUnavailable
                             })?;
+                            let mut grants = CommandGrants {
+                                state: self,
+                                responder: message,
+                            };
                             let outcome = authority
                                 .apply(
                                     decision.as_bytes(),
                                     &principal,
                                     request.action.as_str(),
                                     destination,
-                                    &mut CommandGrants {
-                                        state: self,
-                                        responder: message,
-                                    },
+                                    &mut grants,
                                 )
                                 .inspect_err(|_| {
                                     audit.denied("user", "approve_always could not be persisted");
+                                })?;
+                            grants
+                                .session(outcome, &principal, || {
+                                    if let Some(ref store) = allowance_store {
+                                        create_allowance_from_decision(
+                                            store,
+                                            &principal,
+                                            &request.action,
+                                            decision,
+                                            Some(workspace_root.clone()),
+                                            &capsule_id,
+                                        );
+                                    }
+                                })
+                                .inspect_err(|_| {
+                                    audit.denied(
+                                        "authority_unavailable",
+                                        "session approval device changed",
+                                    )
                                 })?;
                             let typed = match outcome {
                                 Decision::Once => ApprovalDecision::Approved,
@@ -600,19 +662,6 @@ impl approval::Host for HostState {
                                 },
                                 _ => audit.denied("user", "denied by user"),
                             }
-                            if matches!(outcome, Decision::Session)
-                                && let Some(ref store) = allowance_store
-                            {
-                                create_allowance_from_decision(
-                                    store,
-                                    &principal,
-                                    &request.action,
-                                    decision,
-                                    Some(workspace_root.clone()),
-                                    &capsule_id,
-                                );
-                            }
-
                             tracing::info!(
                                 plugin = %capsule_id,
                                 action = %request.action,

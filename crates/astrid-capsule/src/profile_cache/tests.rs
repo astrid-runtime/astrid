@@ -714,3 +714,30 @@ fn revocation_and_consent_updates_survive_a_fresh_profile_cache() {
         assert_eq!(profile.network.capsule_egress["react"], ["127.0.0.1:1234"]);
     }
 }
+
+#[test]
+fn session_install_excludes_the_device_removal_writer_through_the_callback() {
+    use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope};
+
+    let (_dir, cache) = fixture();
+    let alice = principal("alice");
+    let device = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+    let stamp = DeviceStamp {
+        fingerprint: Some(&device.key_id),
+        registration: device.registration_id.map(Into::into),
+    };
+    let mut profile = PrincipalProfile::default();
+    profile.auth.methods.push(AuthMethod::Keypair);
+    profile.add_device(device.clone());
+    profile.save(&cache.astrid_home, &alice).unwrap();
+
+    cache
+        .with_session_devices(&alice, [stamp; 2], || {
+            assert!(matches!(
+                cache.state.try_write(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+        })
+        .unwrap();
+    assert!(cache.state.try_write().is_ok());
+}

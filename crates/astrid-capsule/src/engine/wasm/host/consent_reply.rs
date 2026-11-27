@@ -27,6 +27,23 @@ pub(super) fn classify(bytes:&[u8]) -> (result:Decision)
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Destination<W> { Hosted(W), AstridWorkspace }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SessionRoute { Skip, Unstamped, CheckProfile }
+
+/// A generation without a key still requires validation, which rejects the incomplete stamp.
+pub(super) fn session_route<K: Copy, G: Copy>(decision: Decision,
+    caller: (Option<K>, Option<G>), responder: (Option<K>, Option<G>)) -> (r: SessionRoute)
+    ensures r == if decision != Decision::Session { SessionRoute::Skip }
+        else if caller.0.is_none() && caller.1.is_none()
+            && responder.0.is_none() && responder.1.is_none() { SessionRoute::Unstamped }
+        else { SessionRoute::CheckProfile },
+{
+    if !matches!(decision, Decision::Session) { SessionRoute::Skip }
+    else if caller.0.is_some() || caller.1.is_some() || responder.0.is_some() || responder.1.is_some() {
+        SessionRoute::CheckProfile
+    } else { SessionRoute::Unstamped }
+}
+
 /// Each primitive records exactly one attempted profile write, including
 /// attempts that report a storage error.
 pub(super) trait Writer<P:Copy,A:Copy,W:Copy> {

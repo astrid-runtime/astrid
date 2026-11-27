@@ -106,4 +106,15 @@ fn signed_answer<'a>(
         action,target,profile)
 }
 
+/// On the wire, only session consent can install a session grant. A lone
+/// responder generation still routes through the profile transaction.
+fn session_generation_route(bytes:&[u8], generation:u128) -> (r:crate::consent_reply::SessionRoute)
+    ensures r == if bytes@ == b"approve_session"@ { crate::consent_reply::SessionRoute::CheckProfile }
+        else { crate::consent_reply::SessionRoute::Skip },
+{
+    assert(b"approve"@.len() != b"approve_session"@.len());
+    let decision = crate::consent_reply::classify(bytes);
+    crate::consent_reply::session_route::<u128,u128>(decision,(None,None),(None,Some(generation)))
+}
+
 }
