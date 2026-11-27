@@ -49,3 +49,21 @@ def defects():
             f"content commit {name}", source,
             lambda s, a=old, b=new: replace_once(s, a, b), trace,
         )
+
+    source = Path("crates/astrid-storage/src/content/store/workspace/retry.rs")
+    for name, old, new in [
+        ("historical events can be discarded", "ensures final(backend).events().take(old(backend).events().len() as int) == old(backend).events(),", "ensures true,"),
+        ("prior attempts can target another branch", "trace[2*i+1] == Event::Apply(owner,id,h,Ok(Step::Conflict))", "true"),
+        (
+            "completion can use another sampled header",
+            "trace[2*(n as int)+1] == Event::Apply(owner,id,h,match out {\n"
+            "                Ok(t) => Ok(Step::Done(t)), Err(e) => Err(e),\n            })",
+            "match trace[2*(n as int)+1] { Event::Apply(q,key,_,r) => q == owner && key == id && "
+            "r == match out { Ok(t) => Ok(Step::Done(t)), Err(e) => Err(e) }, _ => false }",
+        ),
+        ("failed read may report a different error", "trace[2*(n as int)] == Event::Read(owner,Err(e))", "true"),
+    ]:
+        yield (
+            f"workspace retry {name}", source,
+            lambda s, a=old, b=new: replace_once(s, a, b), trace,
+        )

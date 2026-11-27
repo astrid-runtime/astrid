@@ -26,11 +26,15 @@ mod operations;
 mod reference_transition;
 mod rename_guards;
 mod retirement;
+mod retry;
+mod retry_native;
 
 #[cfg(test)]
 mod rename_tests;
 #[cfg(test)]
 mod retirement_tests;
+#[cfg(all(test, not(target_family = "wasm")))]
+mod retry_tests;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]

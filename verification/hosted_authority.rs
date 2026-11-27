@@ -3,6 +3,8 @@
 extern crate self as astrid_core;
 #[path = "../crates/astrid-storage/src/content/store/workspace/reference_transition.rs"]
 mod workspace_references;
+#[path = "../crates/astrid-storage/src/content/store/workspace/retry.rs"]
+mod workspace_retry;
 #[path = "../crates/astrid-storage/src/content/store/commit_candidate.rs"]
 mod commit_candidate;
 mod hosted_workspace_references;

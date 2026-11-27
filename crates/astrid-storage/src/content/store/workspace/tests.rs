@@ -483,43 +483,6 @@ async fn promote_preserves_concurrent_kv_commit() {
 }
 
 #[test]
-fn promotion_rebuilds_from_branch_write_that_wins_the_root_cas() {
-    let (engine, branches, owner, id) = super::test_support::fixture();
-    let name = ContentName::new("note").unwrap();
-    branches.write(&owner, id, &name, b"first").unwrap();
-
-    let concurrent = branches.clone();
-    let key = name.clone();
-    *engine.before_commit.lock() = Some(Box::new(move || {
-        concurrent.write(&owner, id, &key, b"second").unwrap();
-    }));
-
-    let promoted = branches.promote(&owner, id).unwrap();
-    assert_eq!(
-        branches.content.read(&owner, &name).unwrap().as_deref(),
-        Some(b"second".as_slice())
-    );
-    assert_eq!(branches.promote(&owner, id).unwrap(), promoted);
-}
-
-#[test]
-fn rollback_rebuilds_from_owner_root_with_new_peer_branch() {
-    let (engine, branches, owner, id) = super::test_support::fixture();
-    let peer = WorkspaceUid::from_bytes([92; 16]);
-    let concurrent = branches.clone();
-    *engine.before_commit.lock() = Some(Box::new(move || {
-        concurrent.begin_with_uid(&owner, peer).unwrap();
-    }));
-
-    branches.rollback(&owner, id).unwrap();
-    let live = branches.list_branches(&owner).unwrap();
-    assert_eq!(live.len(), 1);
-    assert_eq!(live[0].id(), peer);
-    branches.rollback(&owner, id).unwrap();
-    assert_eq!(branches.describe(&owner, peer).unwrap(), live[0]);
-}
-
-#[test]
 fn deterministic_begin_is_idempotent_but_mutated_uid_collides() {
     let content = content();
     let branches = WorkspaceBranchStore::new(Arc::clone(&content));

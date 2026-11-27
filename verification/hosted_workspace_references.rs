@@ -3,6 +3,46 @@ use crate::{ObjectId,ObjectReference,ReferenceKind,workspace_references as refs}
 use vstd::prelude::*;
 
 verus! {
+/// Each attempted mutation immediately follows its own sample. Only an explicit
+/// commit conflict may be followed by another sample in the same operation.
+fn checked_retry<P,I:Copy,H,T,E,B:crate::workspace_retry::Backend<P,I,H,T,E>>(b:&mut B,owner:&P,id:I) -> (out:Result<T,E>)
+    ensures ({
+        let log = final(b).events();
+        let start = old(b).events().len() as int;
+        let calls = log.skip(start);
+        &&& log.take(start) == old(b).events()
+        &&& calls.len() > 0
+        &&& forall|k:int| 0 <= k && 2*k+1 < calls.len() ==> match (#[trigger] calls[2*k],calls[2*k+1]) {
+            (crate::workspace_retry::Event::Read(p,Ok(header)),crate::workspace_retry::Event::Apply(q,branch,used,result)) =>
+                p == *owner && q == *owner && branch == id && used == header &&
+                if 2*k+2 < calls.len() { result == Ok(crate::workspace_retry::Step::Conflict) }
+                else { result == match out { Ok(t)=>Ok(crate::workspace_retry::Step::Done(t)), Err(e)=>Err(e) } },
+            _ => false,
+        }
+        &&& calls.len()%2 == 1 ==> match out {
+            Err(e) => calls.last() == crate::workspace_retry::Event::Read(*owner,Err(e)),
+            Ok(_) => false,
+        }
+    }),
+{
+    use crate::workspace_retry::{self as retry,Event,Step};
+    let ghost start = b.events().len() as int;
+    let out = retry::run(b,owner,id);
+    proof {
+        let calls = b.events().skip(start);
+        let n = choose|n:nat| #[trigger] retry::complete(calls,*owner,id,n,out);
+        let before = calls.take(2*(n as int));
+        assert forall|k:int| 0 <= k && 2*k+1 < calls.len() implies match (#[trigger] calls[2*k],calls[2*k+1]) {
+            (Event::Read(p,Ok(header)),Event::Apply(q,branch,used,result)) =>
+                p == *owner && q == *owner && branch == id && used == header &&
+                if 2*k+2 < calls.len() { result == Ok(Step::Conflict) }
+                else { result == match out { Ok(t)=>Ok(Step::Done(t)), Err(e)=>Err(e) } },
+            _ => false,
+        } by { if k < n { assert(before[2*k] == calls[2*k]); assert(before[2*k+1] == calls[2*k+1]); } }
+    }
+    out
+}
+
 spec fn commit_links(before:Seq<ObjectReference>,links:Seq<ObjectReference>,r:Option<crate::RootState>,state:ObjectId) -> bool {
     &&& links.take(before.len() as int) == before
     &&& links.last().fields() == (b"state"@,state,ReferenceKind::Owns)

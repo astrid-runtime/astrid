@@ -12,6 +12,7 @@ use crate::engine::{PrincipalProjectionEngine, PrincipalProjectionError};
 use crate::storage_model::{ModelError, ObjectId, ObjectRecord, ObjectReference};
 
 use super::super::pending_catalog::retain_final_catalog_records;
+use super::retry::Step;
 
 use super::{
     EngineIdentity, EngineSource, MAX_WORKSPACE_BRANCHES, WorkspaceBindingLifecycle,
@@ -804,19 +805,18 @@ where
         owner: &P,
         id: WorkspaceUid,
     ) -> Result<WorkspaceBranchDescriptor<P>, WorkspaceBranchError> {
-        loop {
-            let header = self.content.header(owner)?;
+        self.retry_with_header(owner, id, |owner, id, header| {
             let branches = self.decode_branches(owner, &header)?;
             let Some(branch) = branches.iter().find(|branch| branch.id == id) else {
                 if let Some(receipt) = self.completion_receipt(owner, &header, id)? {
-                    return Ok(WorkspaceBranchDescriptor::new(
+                    return Ok(Step::Done(WorkspaceBranchDescriptor::new(
                         owner.clone(),
                         id,
                         receipt.binding_uid,
                         receipt.target_prefix,
                         receipt.base.map(|root| root.object),
                         receipt.working.map(|root| root.object),
-                    ));
+                    )));
                 }
                 return Err(WorkspaceBranchError::NotFound(id));
             };
@@ -866,23 +866,20 @@ where
                 self.content
                     .encode_transaction(owner.clone(), next, None, records)?;
             match self.content.engine.commit_root(transaction) {
-                Ok(_) => {
-                    return Ok(WorkspaceBranchDescriptor::new(
-                        owner.clone(),
-                        id,
-                        branch.binding_uid,
-                        branch.target_prefix.clone(),
-                        base,
-                        branch.working.map(|root| root.object),
-                    ));
-                },
+                Ok(_) => Ok(Step::Done(WorkspaceBranchDescriptor::new(
+                    owner.clone(),
+                    id,
+                    branch.binding_uid,
+                    branch.target_prefix.clone(),
+                    base,
+                    branch.working.map(|root| root.object),
+                ))),
                 Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {
-                    // A concurrent KV (or unrelated owner component) update
-                    // is harmless; reload and compare the latest content root.
+                    Ok(Step::Conflict)
                 },
-                Err(error) => return Err(error.into()),
+                Err(error) => Err(error.into()),
             }
-        }
+        })
     }
 
     /// Remove a branch without changing the owner's main content view.
@@ -892,8 +889,7 @@ where
 
     /// Drop a branch and release its immutable DAG on the next owner-root GC.
     pub fn drop(&self, owner: &P, id: WorkspaceUid) -> Result<(), WorkspaceBranchError> {
-        loop {
-            let header = self.content.header(owner)?;
+        self.retry_with_header(owner, id, |owner, id, header| {
             let has_branch = self
                 .decode_branches(owner, &header)?
                 .iter()
@@ -904,7 +900,7 @@ where
             // spurious NotFound, while an explicit drop of a promotion
             // receipt also releases that durable completion marker.
             if !has_branch && !has_receipt {
-                return Ok(());
+                return Ok(Step::Done(()));
             }
             let mut next = header.as_ref().clone();
             super::reference_transition::rewrite(&mut next.preserved_state, id.as_bytes(), None);
@@ -912,10 +908,12 @@ where
                 self.content
                     .encode_transaction(owner.clone(), next, None, BTreeMap::new())?;
             match self.content.engine.commit_root(transaction) {
-                Ok(_) => return Ok(()),
-                Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
-                Err(error) => return Err(error.into()),
+                Ok(_) => Ok(Step::Done(())),
+                Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {
+                    Ok(Step::Conflict)
+                },
+                Err(error) => Err(error.into()),
             }
-        }
+        })
     }
 }
