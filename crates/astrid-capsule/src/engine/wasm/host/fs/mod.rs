@@ -22,6 +22,7 @@
 //! resolved physical path; durable home operations record the canonical
 //! logical `home://<relative>` spelling because no host path exists.
 
+mod access;
 mod file_handle;
 mod physical;
 mod resolve;
@@ -322,13 +323,7 @@ fn gate_write_path(
     Ok(operation)
 }
 
-#[derive(Clone, Copy)]
-enum FsAccess {
-    Probe,
-    Read,
-    Write(Option<astrid_crypto::ContentHash>),
-    Delete,
-}
+type FsAccess = access::Access<astrid_crypto::ContentHash>;
 
 impl FsAccess {
     fn event(self, path: &str) -> HostAuditEvent<'_> {
@@ -642,15 +637,7 @@ impl fs::Host for HostState {
                     TOO_LARGE_TAG.to_string(),
                 ));
             }
-            let handle = vfs_path
-                .vfs
-                .open(
-                    &vfs_path.handle,
-                    vfs_path.relative.to_string_lossy().as_ref(),
-                    false,
-                    false,
-                )
-                .await?;
+            let handle = vfs_path.open().await?;
             let data = vfs_path.vfs.read(&handle).await;
             let _ = vfs_path.vfs.close(&handle).await;
             data
@@ -696,15 +683,7 @@ impl fs::Host for HostState {
         let access = FsAccess::Write(content_hash);
         admit(self, access.event(&resolved.gate_path))?;
         let result = with_vfs_operation(self, access, &resolved.gate_path, async {
-            let handle = vfs_path
-                .vfs
-                .open(
-                    &vfs_path.handle,
-                    vfs_path.relative.to_string_lossy().as_ref(),
-                    true,
-                    true,
-                )
-                .await?;
+            let handle = vfs_path.open().await?;
             let write_result = vfs_path.vfs.write(&handle, &content).await;
             let close_result = vfs_path.vfs.close(&handle).await;
             write_result?;

@@ -116,6 +116,24 @@ impl HostVfs {
     }
 }
 
+impl crate::open_options::Options for cap_std::fs::OpenOptions {
+    fn new() -> Self {
+        Self::new()
+    }
+    fn read(&mut self, value: bool) {
+        self.read(value);
+    }
+    fn write(&mut self, value: bool) {
+        self.write(value);
+    }
+    fn create(&mut self, value: bool) {
+        self.create(value);
+    }
+    fn truncate(&mut self, value: bool) {
+        self.truncate(value);
+    }
+}
+
 impl Address<Dir, PathBuf> {
     fn blocking<T: Send + 'static>(
         self,
@@ -258,13 +276,13 @@ impl Vfs for HostVfs {
 
         let std_file = address
             .blocking(move |dir, safe_path| {
-                let mut options = cap_std::fs::OpenOptions::new();
-                options
-                    .read(true)
-                    .write(write)
-                    .create(write)
-                    .truncate(truncate);
-                dir.open_with(&safe_path, &options)
+                crate::open_options::open_with(
+                    dir,
+                    safe_path,
+                    write,
+                    truncate,
+                    |dir, path, options: cap_std::fs::OpenOptions| dir.open_with(path, &options),
+                )
             })
             .await
             .expect("spawn_blocking panicked")

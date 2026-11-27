@@ -126,10 +126,27 @@ pub(super) struct ResolvedPath {
 /// Phase-2 resolution: the VFS instance and capability handle to use
 /// for the actual filesystem operation.
 pub(super) struct ResolvedVfsPath {
+    access: super::FsAccess,
     _operation: Option<crate::engine::wasm::PrincipalInvocationGuard>,
     pub(super) relative: PathBuf,
     pub(super) vfs: Arc<dyn astrid_vfs::Vfs>,
     pub(super) handle: astrid_capabilities::DirHandle,
+}
+
+impl ResolvedVfsPath {
+    pub(super) async fn open(&self) -> astrid_vfs::VfsResult<astrid_capabilities::FileHandle> {
+        let path = self.relative.to_string_lossy();
+        self.access
+            .open(&self.handle, path.as_ref(), |dir, path, write, truncate| {
+                self.vfs.open(dir, path, write, truncate)
+            })
+            .ok_or_else(|| {
+                astrid_vfs::VfsError::PermissionDenied(
+                    "file open requires read or write admission".into(),
+                )
+            })?
+            .await
+    }
 }
 
 /// Phase 1: resolve a raw guest path to a physical path and determine
@@ -229,22 +246,25 @@ pub(super) fn admit_vfs(
         state.effective_home(),
         state.effective_tmp(),
     );
-    let (guard, mount, relative) = resolved.target.admitted(
+    let ((guard, access), mount, relative) = resolved.target.admitted(
         resolved.gate_path.as_str(),
         &resolved.relative,
         mounts,
         super::ErrorCode::CapabilityDenied,
-        |path| match access {
-            super::FsAccess::Probe | super::FsAccess::Read => super::gate_read_path(state, path),
-            super::FsAccess::Write(_) => {
-                super::gate_write_path(state, path, super::WriteKind::Write)
-            },
-            super::FsAccess::Delete => {
-                super::gate_write_path(state, path, super::WriteKind::Delete)
-            },
+        |path| {
+            access.authorize(path, |policy, path| match policy {
+                super::access::Policy::Read => super::gate_read_path(state, path),
+                super::access::Policy::Write => {
+                    super::gate_write_path(state, path, super::WriteKind::Write)
+                },
+                super::access::Policy::Delete => {
+                    super::gate_write_path(state, path, super::WriteKind::Delete)
+                },
+            })
         },
     )?;
     Ok(ResolvedVfsPath {
+        access,
         _operation: guard,
         relative: relative.clone(),
         vfs: mount.vfs.clone(),
@@ -300,6 +320,55 @@ mod tests {
             state.invocation_home = None;
             state.invocation_tmp = None;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manifest_file_access_controls_native_creation_and_replacement() {
+        use crate::engine::wasm::{
+            bindings::astrid::fs::host::{ErrorCode, Host},
+            host_state::{PrincipalMount, PrincipalMountLocation},
+            test_fixtures::minimal_host_state,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().canonicalize().unwrap();
+        std::fs::write(dir.join("input"), b"preserved").unwrap();
+        let mut manifest: crate::manifest::CapsuleManifest =
+            toml::from_str("[package]\nname = 'file-access'\nversion = '0.1.0'").unwrap();
+        manifest.capabilities.fs_read = vec!["cwd://input".into()];
+        manifest.capabilities.fs_write = vec!["cwd://output".into()];
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        let handle = astrid_capabilities::DirHandle::new();
+        state.workspace_root = dir.clone();
+        state.workspace = Some(PrincipalMount {
+            location: PrincipalMountLocation::Native(dir.clone()),
+            vfs: Arc::new(astrid_vfs::HostVfs::with_registered_dir(handle.clone(), &dir).unwrap()),
+            handle,
+        });
+        state.security = Some(Arc::new(crate::security::ManifestSecurityGate::new(
+            manifest,
+            dir.clone(),
+            None,
+        )));
+        assert_eq!(state.read_file("input".into()).unwrap(), b"preserved");
+        assert!(matches!(
+            state.write_file("input".into(), b"blocked".to_vec()),
+            Err(ErrorCode::CapabilityDenied)
+        ));
+        assert_eq!(std::fs::read(dir.join("input")).unwrap(), b"preserved");
+        assert!(matches!(
+            state.write_file("other".into(), vec![1]),
+            Err(ErrorCode::CapabilityDenied)
+        ));
+        assert!(!dir.join("other").exists());
+        state
+            .write_file("output".into(), b"created".to_vec())
+            .unwrap();
+        state.write_file("output".into(), b"new".to_vec()).unwrap();
+        assert_eq!(std::fs::read(dir.join("output")).unwrap(), b"new");
+        assert!(matches!(
+            state.read_file("output".into()),
+            Err(ErrorCode::CapabilityDenied)
+        ));
     }
 
     #[test]

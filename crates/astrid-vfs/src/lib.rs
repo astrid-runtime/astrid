@@ -18,6 +18,7 @@ pub mod error;
 /// Host-backed virtual filesystem implementation.
 pub mod host;
 mod host_address;
+mod open_options;
 /// Overlay (copy-on-write) virtual filesystem implementation.
 pub mod overlay;
 /// Per-principal registry of [`OverlayVfs`] instances (Layer 4, issue #668).

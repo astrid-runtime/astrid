@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from . import file_descriptor, http, mcp, persistent_process, retirement, runtime_residency, storage, workspace_commit
+from . import file_descriptor, file_open, http, mcp, persistent_process, retirement, runtime_residency, storage, workspace_commit
 from .common import (
     LEASE_CALLBACK,
     replace_once,
@@ -14,6 +14,7 @@ def consumer_defects():
     yield from persistent_process.defects()
     yield from workspace_commit.defects()
     yield from file_descriptor.defects()
+    yield from file_open.defects()
     yield from retirement.defects()
     yield from mcp.defects()
     native_address = Path("crates/astrid-vfs/src/host_address.rs")

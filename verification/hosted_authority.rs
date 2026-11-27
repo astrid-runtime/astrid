@@ -118,6 +118,11 @@ mod hosted_physical_path;
 #[path = "../crates/astrid-vfs/src/host_address.rs"]
 mod host_address;
 mod hosted_vfs_address;
+#[path = "../crates/astrid-vfs/src/open_options.rs"]
+mod open_options;
+#[path = "../crates/astrid-capsule/src/engine/wasm/host/fs/access.rs"]
+mod file_access;
+mod hosted_file_open;
 
 #[path = "../crates/astrid-kernel/src/kernel_router/resume_receipt/validation.rs"]
 mod receipt_validation;
