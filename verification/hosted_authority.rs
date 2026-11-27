@@ -204,6 +204,9 @@ mod runtime_scope;
 mod runtime_generation;
 #[path = "../crates/astrid-capsule/src/registry/instance_swap.rs"]
 mod instance_swap;
+#[path = "../crates/astrid-capsule/src/registry/view_lookup.rs"]
+mod view_lookup;
+mod hosted_registry_lookup;
 #[path = "../crates/astrid-capsule/src/registry/viewers.rs"]
 mod viewers;
 
@@ -212,6 +215,7 @@ mod view_owner;
 
 #[path = "../crates/astrid-events/src/route/gate/state.rs"]
 mod route_gate;
+mod hosted_route_retirement;
 
 #[path = "../crates/astrid-events/src/route/scope.rs"]
 mod route_scope;

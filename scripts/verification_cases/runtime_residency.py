@@ -5,7 +5,32 @@ from .common import GENERATION, replace_once
 
 
 def defects():
+    for name, original in [
+        ("loses the retiring gate identity", "ensures retired@.id() == self.location()"),
+        ("loses permanent refusal", "witness.is_some() ==> byte == RETIRED"),
+    ]:
+        yield (
+            f"route retirement witness {name}", Path("crates/astrid-events/src/route/gate/state.rs"),
+            lambda s, a=original: replace_once(s, a, "ensures true" if a.startswith("ensures ") else "true"),
+            Path("verification/hosted_route_retirement.rs"),
+        )
+    lookup = Path("crates/astrid-capsule/src/registry/view_lookup.rs")
+    for name, original, weakened in [
+        ("loses equality with the captured generation", "ensures yes == (slot", "ensures yes ==> (slot"),
+        ("admits a stale generation", "ensures yes == (slot", "ensures yes <== (slot"),
+        ("loses selected instance", "ensures out == match slot(views@,*principal,*capsule) {\n", "ensures instances@.len() == 0 ==> out == match slot(views@,*principal,*capsule) {\n"),
+    ]:
+        yield (
+            f"registry view lookup {name}", lookup,
+            lambda s, a=original, b=weakened: replace_once(s, a, b),
+            Path("verification/hosted_registry_lookup.rs"),
+        )
     viewers = Path("crates/astrid-capsule/src/registry/viewers.rs")
+    yield (
+        "restart viewer selection can ignore a matching slot", viewers,
+        lambda s: replace_once(s, "ensures found == view@.values()", "ensures found ==> view@.values()"),
+        viewers,
+    )
     for name, original, weakened in [
         ("omits an attached principal", "out@.contains(p) <==>\n        views@", "out@.contains(p) ==>\n        views@"),
         ("admits an unrelated principal", "out@.contains(p) <==>\n        views@", "out@.contains(p) <==\n        views@"),

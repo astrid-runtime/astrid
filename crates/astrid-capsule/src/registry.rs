@@ -56,6 +56,7 @@ fn system_uplink_descriptors(capsule: &dyn Capsule) -> CapsuleResult<Vec<UplinkD
 }
 
 mod instance_swap;
+mod view_lookup;
 mod viewers;
 type InstanceEntry = instance_swap::Entry<dyn Capsule, PrincipalId>;
 
@@ -674,16 +675,24 @@ impl CapsuleRegistry {
     /// the registry lock.
     #[must_use]
     pub fn get_for(&self, principal: &PrincipalId, id: &CapsuleId) -> Option<Arc<dyn Capsule>> {
-        let runtime_id = self.views.get(principal)?.get(id)?;
-        self.instances
-            .get(runtime_id)
-            .map(|entry| Arc::clone(&entry.capsule))
+        view_lookup::capsule_for(&self.views, &self.instances, principal, id)
     }
 
     /// Runtime incarnation currently visible as `id` to `principal`.
     #[must_use]
     pub fn runtime_id_for(&self, principal: &PrincipalId, id: &CapsuleId) -> Option<RuntimeId> {
-        self.views.get(principal)?.get(id).cloned()
+        view_lookup::resolve(&self.views, principal, id).cloned()
+    }
+
+    /// Check the captured generation against this principal's current capsule view.
+    #[must_use]
+    pub fn is_current_runtime(
+        &self,
+        principal: &PrincipalId,
+        id: &CapsuleId,
+        expected: &RuntimeId,
+    ) -> bool {
+        view_lookup::current(&self.views, principal, id, expected)
     }
 
     /// Runtime identities and handles visible to one principal.

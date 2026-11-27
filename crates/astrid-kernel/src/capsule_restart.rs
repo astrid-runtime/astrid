@@ -162,7 +162,7 @@ impl Kernel {
         }
         let (mut previous, replacement) = {
             let mut registry = self.capsules.write().await;
-            if registry.runtime_id_for(principal, id).as_ref() != Some(&current_runtime) {
+            if !registry.is_current_runtime(principal, id, &current_runtime) {
                 drop(registry);
                 drop(load_guard);
                 prepared.capsule.request_cancel();

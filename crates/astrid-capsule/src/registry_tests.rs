@@ -263,6 +263,11 @@ fn principal_generation_replacement_is_atomic_and_stale_safe() {
 
     let current = replaced.installed(&registry).unwrap();
     assert!(replaced.runtime_id.generation() > old.generation());
+    assert!(!registry.is_current_runtime(&alice, &id, &old));
+    assert_eq!(
+        registry.principals_viewing_runtime(&replaced.runtime_id),
+        vec![alice.clone()]
+    );
     assert_eq!(
         registry.runtime_id_for(&alice, &id),
         Some(replaced.runtime_id.clone())
@@ -313,8 +318,8 @@ fn system_generation_replacement_swaps_every_view() {
     let carol = pid("carol");
     registry
         .register_principal_runtime(
-            Box::new(MockCapsule::new("unrelated")),
-            test_hash("unrelated"),
+            Box::new(MockCapsule::new("system-service")),
+            test_hash("private-artifact"),
             &carol,
             uid(3),
         )
@@ -751,6 +756,9 @@ fn same_hash_creates_one_runtime_per_principal() {
     let bob_capsule = registry.get_for(&bob, &id).expect("bob sees capsule");
     assert!(!Arc::ptr_eq(&alice_capsule, &bob_capsule));
     assert_ne!(alice_runtime, bob_runtime);
+    assert!(registry.is_current_runtime(&alice, &id, &alice_runtime));
+    assert!(!registry.is_current_runtime(&bob, &id, &alice_runtime));
+    assert!(!registry.is_current_runtime(&alice, &id, &bob_runtime));
     assert_eq!(registry.len(), 2);
     assert_eq!(registry.refcount_for_hash(&hash), Some(2));
 

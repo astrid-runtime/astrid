@@ -12,6 +12,7 @@ broadcast use vstd::std_specs::hash::group_hash_axioms;
 
 pub(super) struct Entry<C: ?Sized, A> {
     pub(super) capsule: Arc<C>,
+    /// Diagnostic alias. Authority belongs to the immutable runtime identity used as the map key.
     pub(super) owner_alias: Option<A>,
 }
 

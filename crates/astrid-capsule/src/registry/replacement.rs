@@ -23,7 +23,7 @@ impl CapsuleRegistry {
     ) -> CapsuleResult<ReplacedRuntime> {
         let id = replacement.id().clone();
         if expected.key().scope() != RuntimeScope::Principal(uid)
-            || self.runtime_id_for(principal, &id).as_ref() != Some(expected)
+            || !self.is_current_runtime(principal, &id, expected)
         {
             return Err(CapsuleError::ExecutionFailed(format!(
                 "runtime generation changed before replacing '{id}' for '{principal}'"
@@ -62,7 +62,7 @@ impl CapsuleRegistry {
             )));
         }
         if expected.key().scope() != RuntimeScope::Principal(uid)
-            || self.runtime_id_for(principal, &id).as_ref() != Some(expected)
+            || !self.is_current_runtime(principal, &id, expected)
         {
             return Err(CapsuleError::ExecutionFailed(format!(
                 "runtime generation changed before replacing '{id}' for '{principal}'"
