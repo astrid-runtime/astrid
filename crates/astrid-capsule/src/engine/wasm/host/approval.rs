@@ -183,8 +183,14 @@ impl Writer<&PrincipalId, &str, &str> for CommandGrants<'_> {
 ///
 /// Trims whitespace, strips control characters, and enforces a character-count
 /// length cap. Logs a warning (with plugin ID and field name) when control
-/// characters were stripped or the string was truncated.
-fn sanitize_guest_field(s: &mut String, max_len: usize, field_name: &str, capsule_id: &str) {
+/// characters were stripped or the string was truncated. Returns whether the
+/// display text still equals the complete guest-supplied value.
+fn sanitize_guest_field(
+    s: &mut String,
+    max_len: usize,
+    field_name: &str,
+    capsule_id: &str,
+) -> bool {
     let trimmed = s.trim();
     let sanitized: String = trimmed
         .chars()
@@ -205,7 +211,9 @@ fn sanitize_guest_field(s: &mut String, max_len: usize, field_name: &str, capsul
         );
     }
 
+    let unchanged = *s == sanitized;
     *s = sanitized;
+    unchanged
 }
 
 /// Sanitize a guest-supplied action string for safe use in glob patterns.
@@ -392,7 +400,7 @@ impl approval::Host for HostState {
             return Err(ErrorCode::InvalidInput);
         }
         request.action = sanitize_action_for_pattern(&request.action, &capsule_id);
-        sanitize_guest_field(
+        let exact_resource = sanitize_guest_field(
             &mut request.target_resource,
             MAX_RESOURCE_LEN,
             "resource",
@@ -410,7 +418,8 @@ impl approval::Host for HostState {
         let request_device = self
             .begin_device_operation()
             .map_err(|()| ErrorCode::StoreUnavailable)?;
-        if check_persisted_allowance(self, &principal, &request.target_resource)? {
+        if exact_resource && check_persisted_allowance(self, &principal, &request.target_resource)?
+        {
             audit.granted(HostApprovalScope::Always, "remembered_consent");
             return Ok(ApprovalResponse {
                 decision: ApprovalDecision::Allowance,
@@ -418,7 +427,8 @@ impl approval::Host for HostState {
         }
 
         // Fast path: check existing allowances.
-        if let Some(ref store) = allowance_store
+        if exact_resource
+            && let Some(ref store) = allowance_store
             && check_allowance(store, &principal, &request.target_resource, ws_path)
         {
             tracing::debug!(
