@@ -3,10 +3,9 @@
 use std::collections::BTreeMap;
 
 use super::{
-    ARENA_FILE, ARENA_MAGIC, ArenaLocation, CHECKSUM_START, DurableError, DurableIo,
-    FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE, FRAME_VERSION, ObjectId, ObjectRecord,
-    PersistentObjectIdentity, RecoveryLimits, corrupt, frame_checksum, io_error, read_exact_at,
-    read_frame_at,
+    ARENA_FILE, ARENA_MAGIC, ArenaLocation, DurableError, DurableIo, FRAME_HEADER_LEN,
+    FRAME_VERSION, ObjectId, ObjectRecord, PersistentObjectIdentity, RecoveryLimits, corrupt,
+    frame_checksum, io_error, read_exact_at, read_frame_at,
 };
 
 #[cfg(test)]
@@ -39,18 +38,26 @@ pub(in crate::engine::durable) fn read_indexed_object_with_payload<
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<(ObjectRecord, Vec<u8>), DurableError> {
+    use super::arena_span::IndexedError;
     let scheme = identity.scheme();
-    let frame = read_frame_at(arena, ARENA_FILE, ARENA_MAGIC, location.offset, limits)?;
-    let payload_len =
-        u64::try_from(frame.payload().len()).map_err(|_| DurableError::EncodingOverflow)?;
-    if payload_len != location.payload_len || frame.checksum() != location.checksum {
-        return Err(corrupt(
+    let payload = super::arena_span::at_location(
+        location.offset,
+        location.payload_len,
+        location.checksum,
+        |offset| {
+            let frame = read_frame_at(arena, ARENA_FILE, ARENA_MAGIC, offset, limits)?;
+            let checksum = frame.checksum();
+            Ok((frame.into_payload(), checksum))
+        },
+    )
+    .map_err(|error| match error {
+        IndexedError::Read(error) => error,
+        IndexedError::Placement => corrupt(
             ARENA_FILE,
             location.offset,
             "indexed frame location no longer matches the arena",
-        ));
-    }
-    let payload = frame.into_payload();
+        ),
+    })?;
     let record = verified_payload(&payload, expected_id, location.offset, scheme, identity)?;
     Ok((record, payload))
 }
@@ -139,23 +146,11 @@ pub(in crate::engine::durable) fn visit_indexed_objects<
             .map_err(|source| io_error("read coalesced durable frames", source))?;
 
         for (expected_id, location) in &ordered[first..end] {
-            let relative = location
-                .offset
-                .checked_sub(span_start)
-                .ok_or(DurableError::EncodingOverflow)?;
-            let relative = usize::try_from(relative).map_err(|_| DurableError::EncodingOverflow)?;
-            let frame_len = usize::try_from(frame_len(*location)?)
-                .map_err(|_| DurableError::EncodingOverflow)?;
-            let relative_end = relative
-                .checked_add(frame_len)
-                .ok_or(DurableError::EncodingOverflow)?;
-            let frame = span
-                .get(relative..relative_end)
-                .ok_or(DurableError::EncodingOverflow)?;
-            let record = decode_indexed_frame(frame, *expected_id, *location, identity, limits)?;
-            let payload = frame
-                .get(FRAME_HEADER_LEN_USIZE..)
-                .ok_or(DurableError::EncodingOverflow)?;
+            let frame =
+                super::arena_span::frame(&span, span_start, location.offset, location.payload_len)
+                    .ok_or(DurableError::EncodingOverflow)?;
+            let (record, payload) =
+                decode_indexed_frame(frame, *expected_id, *location, identity, limits)?;
             accept(*expected_id, *location, record, payload)?;
         }
         first = end;
@@ -175,81 +170,51 @@ pub(in crate::engine::durable) fn reset_last_batch_spans() {
     LAST_BATCH_SPANS.set(0);
 }
 
-fn decode_indexed_frame<I: PersistentObjectIdentity>(
-    frame: &[u8],
+fn decode_indexed_frame<'a, I: PersistentObjectIdentity>(
+    frame: &'a [u8],
     expected_id: ObjectId,
     location: ArenaLocation,
     identity: &I,
     limits: RecoveryLimits,
-) -> Result<ObjectRecord, DurableError> {
-    let header = frame
-        .get(..FRAME_HEADER_LEN_USIZE)
-        .ok_or_else(|| corrupt(ARENA_FILE, location.offset, "coalesced frame is truncated"))?;
-    if header[..8] != ARENA_MAGIC {
-        return Err(corrupt(ARENA_FILE, location.offset, "frame magic mismatch"));
-    }
-    if u16::from_le_bytes([header[8], header[9]]) != FRAME_VERSION {
-        return Err(corrupt(
-            ARENA_FILE,
-            location.offset,
-            "unsupported frame version",
-        ));
-    }
-    if header[10..12] != [0, 0] {
-        return Err(corrupt(
-            ARENA_FILE,
-            location.offset,
-            "reserved header bytes are non-zero",
-        ));
-    }
-    let payload_len = u64::from_le_bytes(
-        header[12..20]
-            .try_into()
-            .map_err(|_| DurableError::EncodingOverflow)?,
-    );
-    if payload_len > limits.max_frame_bytes {
-        return Err(DurableError::FrameTooLarge {
-            file: ARENA_FILE,
-            offset: location.offset,
-            declared: payload_len,
-            limit: limits.max_frame_bytes,
-        });
-    }
-    if payload_len != location.payload_len {
-        return Err(corrupt(
-            ARENA_FILE,
-            location.offset,
-            "indexed frame length no longer matches the arena",
-        ));
-    }
-    let payload = frame
-        .get(FRAME_HEADER_LEN_USIZE..)
-        .ok_or(DurableError::EncodingOverflow)?;
-    if u64::try_from(payload.len()).map_err(|_| DurableError::EncodingOverflow)? != payload_len {
-        return Err(corrupt(
-            ARENA_FILE,
-            location.offset,
-            "coalesced frame payload is truncated",
-        ));
-    }
-    let header_checksum: [u8; 32] = header[CHECKSUM_START..]
-        .try_into()
-        .map_err(|_| DurableError::EncodingOverflow)?;
-    let actual_checksum = frame_checksum(ARENA_MAGIC, payload_len, payload);
-    if actual_checksum != header_checksum || actual_checksum != location.checksum {
-        return Err(corrupt(
-            ARENA_FILE,
-            location.offset,
-            "indexed frame checksum no longer matches the arena",
-        ));
-    }
-    verified_payload(
+) -> Result<(ObjectRecord, &'a [u8]), DurableError> {
+    use super::arena_span::Error;
+    let payload = super::arena_span::payload(
+        frame,
+        ARENA_MAGIC,
+        FRAME_VERSION,
+        location.payload_len,
+        location.checksum,
+        limits.max_frame_bytes,
+        frame_checksum,
+    )
+    .map_err(|error| {
+        let detail = match error {
+            Error::Truncated => "coalesced frame is truncated",
+            Error::Magic => "frame magic mismatch",
+            Error::Version => "unsupported frame version",
+            Error::Reserved => "reserved header bytes are non-zero",
+            Error::Limit(declared) => {
+                return DurableError::FrameTooLarge {
+                    file: ARENA_FILE,
+                    offset: location.offset,
+                    declared,
+                    limit: limits.max_frame_bytes,
+                };
+            },
+            Error::Length => "indexed frame length no longer matches the arena",
+            Error::Payload => "coalesced frame payload is truncated",
+            Error::Checksum => "indexed frame checksum no longer matches the arena",
+        };
+        corrupt(ARENA_FILE, location.offset, detail)
+    })?;
+    let record = verified_payload(
         payload,
         expected_id,
         location.offset,
         identity.scheme(),
         identity,
-    )
+    )?;
+    Ok((record, payload))
 }
 
 fn verified_payload<I: PersistentObjectIdentity>(

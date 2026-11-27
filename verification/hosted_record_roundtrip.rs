@@ -135,4 +135,23 @@ fn round_trip<H:Fn(&ObjectRecord)->[u8;32]>(source:&ObjectRecord,scheme:Scheme,i
 }
 
 
+/// Instantiate the conditional identity theorem with an executable name that
+/// depends on the actual decoded record. This witnesses satisfiability, while
+/// the production digest still needs its own refinement.
+fn logical_size_witness(source:&ObjectRecord, scheme:Scheme, empty:[u8;32], nonempty:[u8;32])
+    -> (out:Result<ObjectRecord,wire::Error<wire::BodyError>>)
+    requires scheme.algorithm@ != seq![0u8,0u8], scheme.construction@ != seq![0u8,0u8],
+        ObjectRecord::labels_ordered(source.contents().3),
+    ensures match out {
+        Ok(decoded) => same_fields(decoded,*source),
+        Err(e) => source.contents().3.len() > 0 && e matches wire::Error::Decode(wire::DecodeError::Record(wire::BodyError::Allocation)),
+    },
+{
+    let identify = |r:&ObjectRecord| -> (digest:[u8;32])
+        ensures digest == (if r.contents().4 == 0 {empty} else {nonempty}),
+    { if r.logical_bytes() == 0 {empty} else {nonempty} };
+    let id = ObjectId::new(identify(source));
+    round_trip(source,scheme,id,identify)
+}
+
 }

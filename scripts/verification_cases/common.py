@@ -67,6 +67,8 @@ INPUTS = [
     Path("verification/hosted_closure_model.rs"),
     Path("verification/hosted_record_model.rs"),
     Path("verification/hosted_record_roundtrip.rs"),
+    Path("crates/astrid-storage/src/engine/durable/format/arena_span.rs"),
+    Path("crates/astrid-storage/src/engine/durable/format/positional_read.rs"),
     Path("crates/astrid-storage/src/engine/durable/format/verified_record.rs"),
     Path("crates/astrid-storage/src/storage_model/object_codes.rs"),
     Path("crates/astrid-storage/src/storage_model/reference_kind.rs"),

@@ -373,4 +373,56 @@ fn two_references(prefix:&[u8],suffix:&[u8],name:&[u8],other:&[u8],owner:[u8;32]
     Some(rows)
 }
 
+/// Follow the coalesced reader's absolute offset through envelope validation
+/// and typed decoding, including short positional reads from a stable provider.
+fn indexed_region<M:crate::positional_read::Media,H:Fn([u8;8],u64,&[u8])->[u8;32],I:Fn(&crate::ObjectRecord)->[u8;32]>(
+    media:&M,span:&mut [u8],start:u64,offset:u64,size:u64,magic:[u8;8],version:u16,checksum:[u8;32],
+    limit:u64,id:crate::ObjectId,scheme:Scheme,hash:H,identify:I,
+    Ghost(identity):Ghost<spec_fn(crate::ObjectRecord)->[u8;32]>,
+) -> (out:Option<crate::ObjectRecord>)
+    requires forall|n:u64,p:&[u8]| #[trigger] hash.requires((magic,n,p)),
+        forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
+        forall|r:&crate::ObjectRecord,d:[u8;32]| #[trigger] identify.ensures((r,),d) ==> d == identity(*r),
+    ensures out matches Some(r) ==> {
+        let at = offset as int-start;
+        let bytes = media.image().subrange(offset as int+52,offset as int+52+size);
+        &&& start <= offset && at+52+size <= old(span).len() && offset as int+52+size <= media.image().len() && size <= limit
+        &&& media.image().subrange(offset as int,offset as int+8) == magic@ && media.image().subrange(offset as int+20,offset as int+52) == checksum@
+        &&& record::record_at(bytes,40,scheme,r) && identity(r)@ == id.digest() && id.digest() == bytes.subrange(8,40)
+        &&& exists|p:&[u8]| p@ == bytes && #[trigger] hash.ensures((magic,size,p),checksum)
+    },
+{
+    crate::positional_read::exact(media,start,span).ok()?;
+    let frame = crate::arena_span::frame(span,start,offset,size)?;
+    let p = crate::arena_span::payload(frame,magic,version,size,checksum,limit,hash).ok()?;
+    let r = record::confirmed(p,scheme,id,identify).ok()?;
+    let ghost at = offset as int-start;
+    assert(p@ =~= span@.subrange(at+52,at+52+size));
+    assert(span@.subrange(at,at+8) =~= frame@.take(8));
+    assert(span@.subrange(at+20,at+52) =~= frame@.subrange(20,52));
+    assert(p@ =~= media.image().subrange(offset as int+52,offset as int+52+size));
+    assert(frame@.take(8) =~= media.image().subrange(offset as int,offset as int+8));
+    assert(frame@.subrange(20,52) =~= media.image().subrange(offset as int+20,offset as int+52));
+    Some(r)
+}
+
+/// A one-frame media source distinguishes this physical placement from every
+/// other address. A mismatched index, size, or checksum cannot return a record.
+/// A correctly placed valid leaf must return its actual data.
+fn placed_leaf(data:Vec<u8>,physical:u64,requested:u64,stored:[u8;32],expected:[u8;32],size:u64,
+    id:crate::ObjectId,scheme:Scheme) -> (out:Option<(crate::ObjectRecord,Vec<u8>)>)
+    requires record::tag(data@,0,scheme), record::leaf_body(data@,40), id.digest() == data@.subrange(8,40),
+    ensures out.is_some() == (requested == physical && expected == stored && size == data.len()),
+        out matches Some((r,payload)) ==> payload@ == data@ && record::record_at(data@,40,scheme,r),
+{
+    let ghost bytes = data@;
+    let read = move |at:u64| -> (result:Result<(Vec<u8>,[u8;32]),()>)
+        ensures match result {Ok((p,sum)) => at == physical && p@ == bytes && sum == stored, Err(_) => at != physical},
+    { if at == physical {Ok((data,stored))} else {Err(())} };
+    let payload = crate::arena_span::at_location(requested,size,expected,read).ok()?;
+    let identify = |_:&crate::ObjectRecord| -> (d:[u8;32]) ensures d@ == id.digest(), { *id.as_bytes() };
+    let r = record::confirmed(&payload,scheme,id,identify).ok()?;
+    Some((r,payload))
+}
+
 }

@@ -24,9 +24,13 @@ thread_local! {
     static RECOVERY_ARENA_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+mod arena_span;
+const _: () = assert!(arena_span::HEADER_BYTES == FRAME_HEADER_LEN_USIZE);
+
 mod framed_append;
 mod indexed;
 mod location;
+mod positional_read;
 mod positioned;
 #[cfg(test)]
 mod positioned_tests;
@@ -210,30 +214,24 @@ fn validate_positioned_payload(
     Ok(actual)
 }
 
-fn read_exact_at<F: DurableIo>(file: &F, buffer: &mut [u8], offset: u64) -> io::Result<()> {
-    let mut filled = 0_usize;
-    while filled != buffer.len() {
-        let relative = u64::try_from(filled)
-            .map_err(|_| io::Error::other("positional read offset overflow"))?;
-        let position = offset
-            .checked_add(relative)
-            .ok_or_else(|| io::Error::other("positional read offset overflow"))?;
-        let read = positioned_read(file, &mut buffer[filled..], position)?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "positional read reached end of file",
-            ));
-        }
-        filled = filled
-            .checked_add(read)
-            .ok_or_else(|| io::Error::other("positional read length overflow"))?;
+impl<F: DurableIo> positional_read::Media for F {
+    type Error = io::Error;
+
+    fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+        self.durable_read_at(buffer, offset)
     }
-    Ok(())
 }
 
-fn positioned_read<F: DurableIo>(file: &F, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
-    file.durable_read_at(buffer, offset)
+fn read_exact_at<F: DurableIo>(file: &F, buffer: &mut [u8], offset: u64) -> io::Result<()> {
+    positional_read::exact(file, offset, buffer).map_err(|error| match error {
+        positional_read::Error::Offset => io::Error::other("positional read offset overflow"),
+        positional_read::Error::Length => io::Error::other("positional read length overflow"),
+        positional_read::Error::Short => io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "positional read reached end of file",
+        ),
+        positional_read::Error::Io(error) => error,
+    })
 }
 
 #[cfg(test)]

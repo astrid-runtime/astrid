@@ -17,6 +17,32 @@ def consumer_defects():
     )
     record = Path("crates/astrid-storage/src/engine/durable/format/verified_record.rs")
     record_trace = Path("verification/hosted_record_model.rs")
+    arena = Path("crates/astrid-storage/src/engine/durable/format/arena_span.rs")
+    for name, clause, weaker, target in [
+        ("shifts the physical frame", "offset.checked_sub(start)?", "offset.checked_sub(start)?.checked_add(1)?", arena),
+        ("ignores the frame checksum", "sum.as_slice() != &bytes[20..52] || ", "", arena),
+        ("forgets the addressed payload", "Ok(p) => p@ == bytes@.skip(52)", "Ok(p) => true", record_trace),
+        ("forgets the read offset", "read.ensures((offset,),Ok((data,checksum)))", "true", record_trace),
+        ("allows rejection of a matching placement", "(data.len() != size || sum != checksum) &&", "true &&", record_trace),
+    ]:
+        yield (
+            f"indexed arena {name}", arena,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), target,
+        )
+    positional = Path("crates/astrid-storage/src/engine/durable/format/positional_read.rs")
+    for name, clause, weaker, target in [
+        ("restarts a short read at the initial offset", "media.read_at(position,part)", "media.read_at(offset,part)", positional),
+        ("forgets the stable media interval", "final(buffer)@ == media.image().subrange(offset as int,offset as int + final(buffer).len())", "true", record_trace),
+    ]:
+        yield (
+            f"indexed arena {name}", positional,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b), target,
+        )
+    yield (
+        "indexed arena loses the decoded record identity", record,
+        lambda s: replace_once(s, "record_at(frame@,40,scheme,r) &&\n            (exists|digest:[u8;32]| digest@ == id.digest() && #[trigger] identify.ensures((&r,),digest))",
+            "record_at(frame@,40,scheme,r)"), record_trace,
+    )
     overlay = Path("crates/astrid-storage/src/engine/durable/wal/overlay_object.rs")
     for name, clause, weaker in [
         ("loses acceptance of equal frames", "out.is_ok() == ((*old(self).payload)@ == (*incoming.payload)@)", "out.is_ok() ==> ((*old(self).payload)@ == (*incoming.payload)@)"),
