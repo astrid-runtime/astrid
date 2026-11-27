@@ -780,19 +780,21 @@ where
                 self.identify(record)
             })?;
         let kv_checkpoint_publication = admission.take_checkpoint(&mut kv_checkpoint_publication);
-        let actual =
-            super::root_transition::current(pending_roots, &inner.roots_by_principal, &principal);
-        let generation =
-            match super::root_transition::advance(actual.map(Into::into), expected.map(Into::into))
-            {
-                super::root_transition::Advance::Conflict => {
-                    return Err(ModelError::RootConflict { expected, actual }.into());
-                },
-                super::root_transition::Advance::Overflow => {
-                    return Err(ModelError::ArithmeticOverflow.into());
-                },
-                super::root_transition::Advance::Next(next) => RootGeneration::new(next),
-            };
+        let (actual, decision) = super::root_transition::admit_current(
+            pending_roots,
+            &inner.roots_by_principal,
+            &principal,
+            expected,
+        );
+        let generation = match decision {
+            super::root_transition::Advance::Conflict => {
+                return Err(ModelError::RootConflict { expected, actual }.into());
+            },
+            super::root_transition::Advance::Overflow => {
+                return Err(ModelError::ArithmeticOverflow.into());
+            },
+            super::root_transition::Advance::Next(next) => RootGeneration::new(next),
+        };
         let root = RootState {
             generation,
             commit: commit_id,

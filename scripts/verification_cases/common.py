@@ -109,6 +109,7 @@ INPUTS = [
     Path("crates/astrid-storage/src/storage_model/object_codes.rs"),
     Path("crates/astrid-storage/src/storage_model/reference_kind.rs"),
     Path("crates/astrid-storage/src/storage_model/object_reference.rs"),
+    Path("crates/astrid-storage/src/storage_model/root_state.rs"),
     Path("crates/astrid-storage/src/storage_model/object_record.rs"),
     Path("verification/hosted_uplink_model.rs"),
     Path("verification/hosted_kv_model.rs"),

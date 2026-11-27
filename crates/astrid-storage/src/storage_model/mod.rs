@@ -29,7 +29,9 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::num::NonZeroU32;
 mod object_reference;
+mod root_state;
 pub use object_reference::{ObjectId, ObjectReference, ReferenceLabel};
+pub use root_state::{RootGeneration, RootState};
 mod object_codes;
 pub use object_codes::{ObjectClass, ObjectKind};
 mod reference_kind;
@@ -289,49 +291,6 @@ pub use proof::{
     OwnedSubtreePatch, ReferencePath, StateSelector, StateViewProof, TransitionWitness,
     VerifiedStateView,
 };
-
-/// Monotonic generation of one principal root.
-///
-/// A generation is scoped by principal and advances only after a successful
-/// compare-and-swap. The newtype prevents generations from being confused
-/// with byte counts, epochs, or other numeric storage fields.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RootGeneration(u64);
-
-impl RootGeneration {
-    /// Generation assigned to a principal's first committed root.
-    pub const INITIAL: Self = Self(0);
-
-    /// Construct a root generation from its persisted value.
-    #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Return the persisted numeric generation.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-
-    /// Advance to the next generation.
-    #[must_use]
-    pub const fn checked_next(self) -> Option<Self> {
-        match self.0.checked_add(1) {
-            Some(next) => Some(Self(next)),
-            None => None,
-        }
-    }
-}
-
-/// Current committed root of a principal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RootState {
-    /// Monotonically increasing compare-and-swap generation.
-    pub generation: RootGeneration,
-    /// Immutable commit object naming the principal state.
-    pub commit: ObjectId,
-}
 
 /// Result of inserting an immutable object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

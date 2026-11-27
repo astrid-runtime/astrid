@@ -833,14 +833,6 @@ mod root_transition;
 mod root_wire;
 mod roots;
 
-impl From<RootState> for root_transition::Version {
-    fn from(root: RootState) -> Self {
-        Self {
-            generation: root.generation.get(),
-            commit: *root.commit.as_bytes(),
-        }
-    }
-}
 mod validation;
 mod wal;
 

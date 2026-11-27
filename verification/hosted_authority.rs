@@ -137,6 +137,9 @@ mod reference_kind;
 use reference_kind::ReferenceKind;
 #[path = "../crates/astrid-storage/src/storage_model/object_reference.rs"]
 mod object_reference;
+#[path = "../crates/astrid-storage/src/storage_model/root_state.rs"]
+mod root_state;
+use root_state::RootState;
 #[path = "../crates/astrid-storage/src/storage_model/object_record.rs"]
 mod object_record;
 use object_record::{ObjectRecord,ObjectFormatVersion};

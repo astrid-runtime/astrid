@@ -1,4 +1,5 @@
 //! Compare durable roots by their generation and the full commit identity.
+use super::RootState;
 use std::collections::BTreeMap;
 use vstd::prelude::*;
 #[cfg(verus_keep_ghost)]
@@ -14,6 +15,25 @@ verus! {
 pub(super) struct Version {
     pub(super) generation: u64,
     pub(super) commit: [u8; 32],
+}
+
+pub(super) open spec fn represents(v:Version,r:RootState) -> bool {
+    v.generation == r.generation.value() && v.commit@ == r.commit.digest()
+}
+
+pub(super) fn version(r:RootState) -> (v:Version)
+    ensures represents(v,r),
+{
+    Version { generation:r.generation.get(), commit:*r.commit.as_bytes() }
+}
+
+fn optional(root:Option<RootState>) -> (v:Option<Version>)
+    ensures match root {
+        Some(r) => v matches Some(v) && represents(v,r),
+        None => v.is_none(),
+    },
+{
+    root.map(|r:RootState| -> (v:Version) ensures represents(v,r) { version(r) })
 }
 
 #[derive(Clone, Copy)]
@@ -68,6 +88,33 @@ pub(super) fn current<P:Ord,R:Copy>(pending:&BTreeMap<P,R>, published:&BTreeMap<
         else if published@.contains_key(*owner) { Some(published@[*owner]) } else { None },
 {
     if let Some(root) = pending.get(owner) { Some(*root) } else { published.get(owner).copied() }
+}
+
+/// Compare the full root selected for this owner with the caller's sampled root.
+pub(super) fn admit_current<P:Ord>(pending:&BTreeMap<P,RootState>,published:&BTreeMap<P,RootState>,
+    owner:&P, expected:Option<RootState>) -> (out:(Option<RootState>,Advance))
+    requires obeys_cmp::<P>(), obeys_cmp_concrete_eq::<P>(), btree_map_inv(pending), btree_map_inv(published),
+    ensures out.0 == if pending@.contains_key(*owner) {Some(pending@[*owner])}
+        else if published@.contains_key(*owner) {Some(published@[*owner])} else {None},
+        (out.1 is Conflict) == (out.0 != expected),
+        (out.1 is Overflow) == (out.0 == expected && (expected matches Some(r) && r.generation.value() == u64::MAX)),
+        out.1 matches Advance::Next(n) ==> out.0 == expected && match expected {
+            None => n == 0, Some(r) => n as int == r.generation.value() as int + 1,
+        },
+{
+    let actual = current(pending,published,owner);
+    let a = optional(actual);
+    let e = optional(expected);
+    let decision = advance(a,e);
+    proof {
+        if let (Some(x),Some(y)) = (actual,expected) {
+            if matches_root(a,e) {
+                super::ObjectId::same_digest(x.commit,y.commit);
+                x.generation.same_value(y.generation);
+            }
+        }
+    }
+    (actual,decision)
 }
 
 /// A WAL descriptor must name the successor permitted at preparation.
@@ -164,4 +211,10 @@ impl<P,R: Copy> PreparedRoot<P,R> {
     }
 }
 
+}
+
+impl From<RootState> for Version {
+    fn from(root: RootState) -> Self {
+        version(root)
+    }
 }

@@ -456,10 +456,17 @@ def group_root_consumer_defects():
     for name, old, new in [
         ("staging can overwrite another owner", "final(pending)@ == old(pending)@.insert(self.binding().0,self.binding().2)", "final(pending)@.contains_key(self.binding().0)"),
         (
+            "stale and exhausted roots can report the wrong refusal",
+            "(out.1 is Conflict) == (out.0 != expected),\n"
+            "        (out.1 is Overflow) == (out.0 == expected && (expected matches Some(r) && r.generation.value() == u64::MAX)),",
+            "true,",
+        ),
+        ("success may skip a generation", "n as int == r.generation.value() as int + 1", "n as int > r.generation.value() as int"),
+        (
             "lookup can return an unrelated version",
-            "ensures root == if pending@.contains_key(*owner) { Some(pending@[*owner]) }\n"
-            "        else if published@.contains_key(*owner) { Some(published@[*owner]) } else { None },",
-            "ensures root.is_some() == (pending@.contains_key(*owner) || published@.contains_key(*owner)),",
+            "ensures out.0 == if pending@.contains_key(*owner) {Some(pending@[*owner])}\n"
+            "        else if published@.contains_key(*owner) {Some(published@[*owner])} else {None},",
+            "ensures out.0.is_some() == (pending@.contains_key(*owner) || published@.contains_key(*owner)),",
         ),
     ]:
         yield (

@@ -10,8 +10,8 @@ verus! {
 
 /// Between two preparations under the group writer lock, the same owner sees
 /// its staged version and every other owner still sees its prior effective root.
-fn subsequent_prepare<P:Ord+Clone>(pending:&mut BTreeMap<P,Version>,published:&BTreeMap<P,Version>,
-    accepted:&root_transition::PreparedRoot<P,Version>,owner:&P,expected:Option<Version>)
+fn subsequent_prepare<P:Ord+Clone>(pending:&mut BTreeMap<P,crate::RootState>,published:&BTreeMap<P,crate::RootState>,
+    accepted:&root_transition::PreparedRoot<P,crate::RootState>,owner:&P,expected:Option<crate::RootState>)
     -> (out:root_transition::Advance)
     requires obeys_cmp::<P>(), obeys_cmp_concrete_eq::<P>(), vstd::pervasive::obeys_clone_eq::<P>(),
         btree_map_inv(old(pending)), btree_map_inv(published),
@@ -20,16 +20,16 @@ fn subsequent_prepare<P:Ord+Clone>(pending:&mut BTreeMap<P,Version>,published:&B
         let (p,_,r,_) = accepted.binding();
         let observed = if *owner == p { Some(r) } else if before.contains_key(*owner) { Some(before[*owner]) }
             else if published@.contains_key(*owner) { Some(published@[*owner]) } else { None };
-        &&& (out is Conflict) == !root_transition::matches_root(observed,expected)
-        &&& (out is Overflow) == (root_transition::matches_root(observed,expected)
-            && (observed matches Some(v) && v.generation == u64::MAX))
+        &&& (out is Conflict) == (observed != expected)
+        &&& (out is Overflow) == (observed == expected
+            && (observed matches Some(v) && v.generation.value() == u64::MAX))
         &&& out matches root_transition::Advance::Next(n) ==> match observed {
-            None => n == 0, Some(v) => n as int == v.generation as int + 1,
+            None => n == 0, Some(v) => n as int == v.generation.value() as int + 1,
         }
     }),
 {
     accepted.stage(pending);
-    root_transition::advance(root_transition::current(pending,published,owner),expected)
+    root_transition::admit_current(pending,published,owner,expected).1
 }
 
 spec fn frame_bytes(payload:Seq<u8>,version:u8,checksum:spec_fn(Seq<u8>)->[u8;32]) -> Seq<u8> {
