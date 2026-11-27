@@ -48,3 +48,26 @@ def defects():
             f"chunk range {name}", source,
             lambda s, a=old, b=new: replace_once(s, a, b), tree,
         )
+
+    trace = Path("verification/hosted_batch_slots.rs")
+    source = Path("crates/astrid-storage/src/engine/durable/batch_slots.rs")
+    for name, old, new in [
+        ("cache scan may forget the requested owner and ID", "#[trigger] lookup.ensures((owner,ids@[i]),out.records@[i])", "#[trigger] out.records@[i] == out.records@[i]"),
+        ("a cache miss may be absent from the index", "out.records@[i].is_none() == waiting(out.missing@,ids@[i],i)", "waiting(out.missing@,ids@[i],i) ==> out.records@[i].is_none()"),
+        ("publication may overwrite a cache hit", "if waiting(old(batch).missing@,id,j) { Some(cached) } else { old(batch).records@[j] }", "if waiting(old(batch).missing@,id,j) { Some(cached) } else { final(batch).records@[j] }"),
+    ]:
+        yield (
+            f"storage batch {name}", source,
+            lambda s, a=old, b=new: replace_once(s, a, b), trace,
+        )
+    source = Path("crates/astrid-storage/src/content_dag/child_range.rs")
+    for name, old, new in [
+        ("can pair a child with another record", "rows@[i] == Some(pairs@[i].1)", "rows@[i].is_some()"),
+        ("can hide a missing predecessor", "forall|j:int| 0 <= j < i ==> (#[trigger] rows@[j]).is_some(),", "true,"),
+        ("can report an arbitrary source failure", "read.ensures((ids,),Err(e)),", "true,"),
+        ("can reject a complete batch for length", "rows.len() != plan.len(),", "true,"),
+    ]:
+        yield (
+            f"storage batch {name}", source,
+            lambda s, a=old, b=new: replace_once(s, a, b), trace,
+        )

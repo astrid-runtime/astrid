@@ -7,6 +7,9 @@ mod file_wire;
 mod chunk_range;
 #[path = "../crates/astrid-storage/src/content_dag/child_range.rs"]
 mod child_range;
+#[path = "../crates/astrid-storage/src/engine/durable/batch_slots.rs"]
+mod batch_slots;
+mod hosted_batch_slots;
 mod hosted_chunk_tree_range;
 #[path = "../crates/astrid-storage/src/storage_words.rs"]
 mod storage_words;

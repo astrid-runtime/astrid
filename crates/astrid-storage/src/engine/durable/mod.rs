@@ -805,6 +805,7 @@ impl<P: Ord, I, C> DurableEngine<P, I, C> {
 mod arena_frame;
 mod arena_index;
 mod arena_vectors;
+mod batch_slots;
 #[path = "index/admission.rs"]
 mod checkpoint_admission;
 mod direct_placement;

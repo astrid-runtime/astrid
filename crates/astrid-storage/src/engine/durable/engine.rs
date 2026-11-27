@@ -187,24 +187,19 @@ where
     ) -> Result<Vec<Option<Arc<ObjectRecord>>>, DurableError> {
         let mut recovery = RecoveryScope::default();
         self.ensure_cached_read_usable_with(&mut recovery)?;
-        let mut results = vec![None; ids.len()];
-        let mut missing = BTreeMap::<ObjectId, Vec<usize>>::new();
-        for (index, id) in ids.iter().copied().enumerate() {
-            if let Some(record) = self.object_cache.get(principal, id) {
-                results[index] = Some(record);
-            } else {
-                missing.entry(id).or_default().push(index);
-            }
-        }
-        if missing.is_empty() {
-            return Ok(results);
+        let mut batch = super::batch_slots::prepare(principal, ids, |owner, id| {
+            self.object_cache.get(owner, id)
+        });
+        if batch.missing.is_empty() {
+            return Ok(batch.records);
         }
 
         loop {
             let (pending, locations, generation) = {
                 let inner = self.lock_usable_with(&mut recovery)?;
                 let mut pending = Vec::new();
-                let locations = missing
+                let locations = batch
+                    .missing
                     .keys()
                     .filter_map(|id| {
                         if let Some(object) = inner.pending_wal.get_object(id) {
@@ -233,14 +228,15 @@ where
                 continue;
             }
             for (id, record) in loaded {
-                let cached = self.object_cache.insert(principal, id, record);
-                if let Some(indices) = missing.get(&id) {
-                    for index in indices {
-                        results[*index] = Some(Arc::clone(&cached));
-                    }
-                }
+                super::batch_slots::publish(
+                    &mut batch,
+                    principal,
+                    id,
+                    record,
+                    |owner, object, loaded| self.object_cache.insert(owner, object, loaded),
+                );
             }
-            return Ok(results);
+            return Ok(batch.records);
         }
     }
 

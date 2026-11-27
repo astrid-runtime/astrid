@@ -536,9 +536,21 @@ fn append_tree_range<S: ContentSource>(
     )
     .ok_or(ContentError::LengthOverflow)?;
     drop(children);
-    let ids: Vec<_> = selected.iter().map(|visit| visit.object).collect();
-    let records = load_many(source, &ids)?;
-    for (visit, record) in selected.into_iter().zip(records) {
+    let loaded = child_range::load(&selected, |ids| source.load_shared_content_objects(&ids))
+        .map_err(|error| match error {
+            child_range::LoadError::Source(error) => ContentReadError::Source(error),
+            child_range::LoadError::Length(object) => {
+                ContentReadError::Content(ContentError::InvalidObject {
+                    object,
+                    detail: "content source returned the wrong batch length",
+                })
+            },
+            child_range::LoadError::Missing(object) => {
+                ContentReadError::Content(ContentError::MissingObject(object))
+            },
+        })?;
+    drop(selected);
+    for (visit, record) in loaded {
         let child_path = if traversal.boundaries.is_some() {
             let mut child_path = path.clone();
             child_path.push(TreeStep {
@@ -571,33 +583,6 @@ fn append_tree_range<S: ContentSource>(
         )?;
     }
     Ok(())
-}
-
-fn load_many<S: ContentSource>(
-    source: &S,
-    objects: &[ObjectId],
-) -> Result<Vec<Arc<ObjectRecord>>, ContentReadError<S::Error>> {
-    let Some(first) = objects.first().copied() else {
-        return Ok(Vec::new());
-    };
-    let records = source
-        .load_shared_content_objects(objects)
-        .map_err(ContentReadError::Source)?;
-    if records.len() != objects.len() {
-        return Err(ContentError::InvalidObject {
-            object: first,
-            detail: "content source returned the wrong batch length",
-        }
-        .into());
-    }
-    objects
-        .iter()
-        .copied()
-        .zip(records)
-        .map(|(object, record)| {
-            record.ok_or_else(|| ContentReadError::Content(ContentError::MissingObject(object)))
-        })
-        .collect()
 }
 
 fn load_chunk_at_offset<S: ContentSource>(

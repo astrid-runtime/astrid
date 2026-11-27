@@ -865,14 +865,27 @@ fn transaction_wal_shared_batch_reads_match_single_before_fold() {
         "shared read publication rejects a committed WAL-only object"
     );
     let unknown = ObjectId::new([255; 32]);
-    let ids = [commit, expected[0].0, unknown, commit, arena_id];
+    let ids = [
+        commit,
+        expected[0].0,
+        unknown,
+        commit,
+        arena_id,
+        arena_id,
+        unknown,
+    ];
+    let batch = engine.shared_objects_for(&principal, &ids).unwrap();
     let singles = ids
         .iter()
         .map(|id| engine.shared_object_for(&principal, *id).unwrap())
         .collect::<Vec<_>>();
     assert!(singles[0].is_some());
     assert!(singles[2].is_none());
-    let batch = engine.shared_objects_for(&principal, &ids).unwrap();
+    assert!(Arc::ptr_eq(
+        batch[4].as_ref().unwrap(),
+        batch[5].as_ref().unwrap()
+    ));
+    assert!(batch[6].is_none());
     assert_eq!(batch, singles, "batch lost committed pending-WAL objects");
     assert!(Arc::ptr_eq(
         batch[0].as_ref().unwrap(),
