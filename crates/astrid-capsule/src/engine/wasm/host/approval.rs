@@ -197,12 +197,15 @@ fn sanitize_guest_field(s: &mut String, max_len: usize, field_name: &str, capsul
 /// pattern.
 fn sanitize_action_for_pattern(action: &str, capsule_id: &str) -> String {
     let trimmed = action.trim();
-    let sanitized: String = trimmed
+    let mut sanitized: String = trimmed
         .chars()
         .filter(|c| !c.is_control())
+        .skip_while(|c| c.is_whitespace())
         .take(MAX_ACTION_LEN)
         .collect();
 
+    // Filtering or truncation can expose whitespace at the boundary.
+    sanitized.truncate(sanitized.trim_end().len());
     let trimmed_chars = trimmed.chars().count();
     let sanitized_chars = sanitized.chars().count();
     if sanitized_chars != trimmed_chars {

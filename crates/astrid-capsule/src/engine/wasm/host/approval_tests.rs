@@ -956,6 +956,10 @@ fn sanitize_action_truncates_multibyte_chars() {
 #[test]
 fn sanitize_action_trims_whitespace() {
     assert_eq!(
+        sanitize_action_for_pattern("\0\u{2003}git push \0", "test"),
+        "git push"
+    );
+    assert_eq!(
         sanitize_action_for_pattern("  git push  ", "test"),
         "git push"
     );
