@@ -885,33 +885,6 @@ impl ProcessSandboxConfig {
         prefix_policy::select(&mut NativePlatform, self, self.policy)
     }
 
-    fn required_prefix(&self) -> io::Result<SandboxPrefix> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        self.validate_protected_runtime_grants()?;
-
-        #[cfg(target_os = "linux")]
-        {
-            if bwrap::bwrap_available() {
-                return self.build_pinned_bwrap_prefix();
-            }
-            Err(Self::unavailable_error(linux_unavailable_hint()))
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            // Seatbelt is shipped with macOS and effectively always
-            // available; a failure here is genuinely exceptional (e.g.
-            // path validation tripping a sub-builder), so it surfaces
-            // through `build_seatbelt_prefix` regardless of policy.
-            self.build_seatbelt_prefix()
-        }
-
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            Err(Self::unavailable_error(unsupported_os_hint()))
-        }
-    }
-
     #[cfg(not(target_os = "macos"))]
     fn unavailable_error(hint: &str) -> io::Error {
         io::Error::other(format!(
@@ -953,7 +926,35 @@ impl prefix_policy::Platform<ProcessSandboxConfig, SandboxPrefix, io::Error> for
     }
 
     fn prefix(&mut self, config: &ProcessSandboxConfig) -> io::Result<SandboxPrefix> {
-        config.required_prefix()
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        config.validate_protected_runtime_grants()?;
+
+        #[cfg(target_os = "linux")]
+        {
+            if bwrap::bwrap_available() {
+                return config.build_pinned_bwrap_prefix();
+            }
+            Err(ProcessSandboxConfig::unavailable_error(
+                linux_unavailable_hint(),
+            ))
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            // Seatbelt is shipped with macOS and effectively always
+            // available; a failure here is genuinely exceptional (e.g.
+            // path validation tripping a sub-builder), so it surfaces
+            // through `build_seatbelt_prefix` regardless of policy.
+            config.build_seatbelt_prefix()
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = config;
+            Err(ProcessSandboxConfig::unavailable_error(
+                unsupported_os_hint(),
+            ))
+        }
     }
 }
 
