@@ -26,13 +26,23 @@ def consumer_defects():
         ("substitutes an environment value", "pair.1.as_str()", "pair.0.as_str()", command),
         ("replays the request after injections", "apply_environment(&mut builder, injections);",
          "apply_environment(&mut builder, environment);", command),
-        ("loses host precedence", "Step::Directory(cwd), Step::Clear] + assignments(environment) + assignments(injections),",
-         "Step::Directory(cwd), Step::Clear] + assignments(environment) + assignments(injections) || true,",
-         Path("verification/hosted_process_command.rs")),
     ]:
         yield (
             f"process construction {name}", command,
             lambda s, a=original, b=changed: replace_once(s, a, b), target,
+        )
+    prefix = "builder.steps() == seq![Step::Program(program), Step::Arguments(args),\n        "
+    suffix = "Step::Directory(cwd), Step::Clear] + assignments(environment) + assignments(injections)"
+    guarantee = prefix + suffix
+    for name, alternate in [
+        ("loses host precedence", suffix.replace("assignments(injections)", "assignments(environment)")),
+        ("permits an uncleared environment", suffix.replace(", Step::Clear", "")),
+        ("permits an omitted directory", suffix.replace("Step::Directory(cwd), ", "")),
+    ]:
+        yield (
+            f"process construction {name}", command,
+            lambda s, alt=alternate: replace_once(s, guarantee, guarantee + " || " + prefix + alt),
+            Path("verification/hosted_process_command.rs"),
         )
     reply = Path("crates/astrid-capsule/src/engine/wasm/host/consent_reply.rs")
     trace = Path("verification/hosted_consent_reply.rs")

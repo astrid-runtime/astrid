@@ -146,6 +146,7 @@ pub(super) fn prepare_sandboxed_command(
     inject_env: &[(String, String)],
     extra_masks: &[std::path::PathBuf],
 ) -> Result<Command, String> {
+    // The host has confined cwd to the workspace or an authorized home:// root.
     let inner_cmd =
         super::command::build(cmd, args, context.cwd.as_path(), &context.env, inject_env);
 
@@ -161,6 +162,7 @@ pub(super) fn prepare_sandboxed_command(
     .map_err(|e| format!("failed to wrap command in sandbox: {e}"))
 }
 
+// Native adapter for the verified constructor. Its contract relies on std::process::Command.
 impl<'a> super::command::Builder<'a, &'a std::path::Path> for Command {
     fn new(program: &'a str) -> Self {
         Command::new(program)
