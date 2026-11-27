@@ -174,6 +174,8 @@ mod closure_load;
 mod overlay_object;
 #[path = "../crates/astrid-storage/src/engine/transaction_records.rs"]
 mod transaction_records;
+#[path = "../crates/astrid-storage/src/engine/root_declaration.rs"]
+mod root_declaration;
 #[path = "../crates/astrid-storage/src/engine/durable/closure_walk.rs"]
 mod closure_walk;
 #[path = "../crates/astrid-storage/src/storage_model/object_codes.rs"]
@@ -186,7 +188,7 @@ use reference_kind::ReferenceKind;
 mod object_reference;
 #[path = "../crates/astrid-storage/src/storage_model/root_state.rs"]
 mod root_state;
-use root_state::RootState;
+use root_state::{RootGeneration, RootState};
 #[path = "../crates/astrid-storage/src/storage_model/object_record.rs"]
 mod object_record;
 use object_record::{ObjectRecord,ObjectFormatVersion};

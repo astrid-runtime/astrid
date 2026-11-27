@@ -35,6 +35,7 @@ mod kv;
 mod muninn;
 mod projection;
 mod refinery;
+mod root_declaration;
 pub(crate) mod transaction_records;
 
 #[cfg(not(target_family = "wasm"))]
@@ -89,11 +90,7 @@ pub use refinery::{
 /// engine-bound and are discarded by cloning or untrusted reconstruction.
 #[derive(Debug)]
 pub struct RootTransaction<P> {
-    principal: P,
-    expected: Option<RootState>,
-    commit: ObjectId,
-    records: Vec<(ObjectId, ObjectRecord)>,
-    identity_proof: IdentityProof,
+    declaration: root_declaration::Declaration<P, std::sync::Arc<()>>,
     kv_checkpoint_publication: Option<crate::kv::KvCheckpointPublication>,
 }
 
@@ -107,11 +104,9 @@ impl<P> RootTransaction<P> {
         records: Vec<(ObjectId, ObjectRecord)>,
     ) -> Self {
         Self {
-            principal,
-            expected,
-            commit,
-            records,
-            identity_proof: IdentityProof::Untrusted,
+            declaration: root_declaration::Declaration::untrusted(
+                principal, expected, commit, records,
+            ),
             kv_checkpoint_publication: None,
         }
     }
@@ -120,7 +115,7 @@ impl<P> RootTransaction<P> {
         mut self,
         publication: impl FnOnce() -> crate::kv::KvCheckpointPublication,
     ) -> Self {
-        if matches!(self.identity_proof, IdentityProof::Engine(_)) {
+        if matches!(self.declaration.identity, IdentityProof::Engine(_)) {
             self.kv_checkpoint_publication = Some(publication());
         }
         self
@@ -129,47 +124,42 @@ impl<P> RootTransaction<P> {
     /// Borrow the target principal.
     #[must_use]
     pub const fn principal(&self) -> &P {
-        &self.principal
+        &self.declaration.update.principal
     }
 
     /// Return the exact root expected by the caller.
     #[must_use]
     pub const fn expected(&self) -> Option<RootState> {
-        self.expected
+        self.declaration.update.expected
     }
 
     /// Return the immutable commit that becomes current on success.
     #[must_use]
     pub const fn commit(&self) -> ObjectId {
-        self.commit
+        self.declaration.update.commit
     }
 
     /// Borrow the transaction's declared immutable records.
     #[must_use]
     pub fn records(&self) -> &[(ObjectId, ObjectRecord)] {
-        &self.records
+        &self.declaration.update.records
     }
 }
 
 impl<P: Clone> Clone for RootTransaction<P> {
     fn clone(&self) -> Self {
-        Self {
-            principal: self.principal.clone(),
-            expected: self.expected,
-            commit: self.commit,
-            records: self.records.clone(),
-            identity_proof: IdentityProof::Untrusted,
-            kv_checkpoint_publication: None,
-        }
+        Self::new(
+            self.declaration.update.principal.clone(),
+            self.declaration.update.expected,
+            self.declaration.update.commit,
+            self.declaration.update.records.clone(),
+        )
     }
 }
 
 impl<P: PartialEq> PartialEq for RootTransaction<P> {
     fn eq(&self, other: &Self) -> bool {
-        self.principal == other.principal
-            && self.expected == other.expected
-            && self.commit == other.commit
-            && self.records == other.records
+        self.declaration.update == other.declaration.update
     }
 }
 
@@ -406,17 +396,19 @@ impl<P: Ord, I: ObjectIdentity> InMemoryEngine<P, I> {
     /// root-conflict failures also admit no transaction record.
     pub fn commit(&self, transaction: RootTransaction<P>) -> Result<CommitOutcome, ModelError> {
         let RootTransaction {
-            principal,
-            expected,
-            commit,
-            records,
-            identity_proof,
+            declaration,
             mut kv_checkpoint_publication,
         } = transaction;
-        let admission =
-            identity_proof.admit_records(&self.preparation_authority, &records, |record| {
-                self.identify(record)
-            })?;
+        let (
+            crate::engine::root_declaration::Update {
+                principal,
+                expected,
+                commit,
+                records,
+            },
+            admission,
+        ) = declaration
+            .admit_records(&self.preparation_authority, |record| self.identify(record))?;
         let world = self.world.upgradable_read();
         let (world, root, objects_inserted) =
             World::commit_closure_owned(world, principal, expected, commit, records)?;

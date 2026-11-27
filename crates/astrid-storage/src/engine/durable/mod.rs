@@ -28,7 +28,7 @@ use arc_swap::ArcSwap;
 use fs2::FileExt;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
-use crate::engine::{CommitOutcome, RootSnapshot, RootTransaction};
+use crate::engine::{CommitOutcome, RootSnapshot, RootTransaction, root_declaration};
 use group::CommitGroup;
 pub use group::GroupCommitPolicy;
 

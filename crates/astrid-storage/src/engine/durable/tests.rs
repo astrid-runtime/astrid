@@ -14,11 +14,12 @@ fn commit_reports_the_first_misnamed_record_before_admission() {
     let engine = open(dir.path());
     let (_, mut txn) = transaction("alice", None, b"commit");
     let (_, other) = transaction("bob", None, b"other");
-    txn.records.extend(other.records);
+    let rows = &mut txn.declaration.update.records;
+    rows.extend(other.declaration.update.records);
     let first = ObjectId::new([0x51; 32]);
-    let computed = engine.identify(&txn.records[1].1);
-    txn.records[1].0 = first;
-    txn.records[3].0 = ObjectId::new([0x52; 32]);
+    let computed = engine.identify(&rows[1].1);
+    rows[1].0 = first;
+    rows[3].0 = ObjectId::new([0x52; 32]);
     assert!(
         matches!(engine.commit(txn), Err(DurableError::Model(ModelError::ObjectIdentityMismatch {
         declared,computed:actual
@@ -62,7 +63,13 @@ fn durable_admission_rechecks_a_foreign_seal_with_the_receiving_identity() {
     let session = local.captured_identity_session();
     let sealed = || {
         let (_, txn) = transaction("alice", None, b"sealed");
-        session.seal_transaction(txn.principal, txn.expected, txn.commit, txn.records)
+        let update = txn.declaration.update;
+        session.seal_transaction(
+            update.principal,
+            update.expected,
+            update.commit,
+            update.records,
+        )
     };
     let attempt = sealed();
     let declared = attempt.records()[0].0;

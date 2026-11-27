@@ -167,3 +167,29 @@ def defects():
             f"metadata staging {name}", source,
             lambda s, a=old, b=new: replace_once(s, a, b), trace,
         )
+
+    trace = Path("verification/hosted_wal_writer_trace.rs")
+    source = Path("crates/astrid-storage/src/engine/root_declaration.rs")
+    for name, old, new in [
+        ("constructor may issue a local seal", "out.identity is Untrusted,", "true,"),
+        ("admission may retarget a valid batch", "update == self.update && match kind", "update.records == self.update.records && match kind"),
+        ("admission may exchange input rows", "update == self.update && match kind", "(update.principal == self.update.principal && update.expected == self.update.expected && update.commit == self.update.commit) && match kind"),
+        ("identity failure may skip an earlier row", "forall|j:int| 0 <= j < i ==> #[trigger] authentic(self.update.records@[j],identify),", "true,"),
+    ]:
+        yield (
+            f"root declaration {name}", source,
+            lambda s, a=old, b=new: replace_once(s, a, b), trace,
+        )
+    source = Path("crates/astrid-storage/src/engine/durable/root_transition.rs")
+    for name, old, new in [
+        ("selection may forward unrelated rows", "p == owner && e == update.expected && rows == update.records", "p == owner && e == update.expected"),
+        ("journal may rebind a selected root", "(owner,expected,root) == self.binding()", "true"),
+        ("journal may hand off other bytes", "&&& encoder.ensures((&owner,expected,root),Ok(bytes))", "&&& true"),
+        ("conflict may report another observed root", "a == actual && expected != a", "expected != a"),
+        ("admission may select a different commit", "actual == update.expected && root.commit == update.commit", "actual == update.expected"),
+        ("admission may skip a generation", "Some(old) => root.generation.value() == old.generation.value() + 1", "Some(old) => root.generation.value() > old.generation.value()"),
+    ]:
+        yield (
+            f"root declaration {name}", source,
+            lambda s, a=old, b=new: replace_once(s, a, b), trace,
+        )

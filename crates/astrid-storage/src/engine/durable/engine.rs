@@ -3,8 +3,8 @@ use super::{
     DurableInner, FaultPoint, InsertOutcome, LIFECYCLE_CLOSED, LIFECYCLE_REQUIRES_RECOVERY,
     LIFECYCLE_USABLE, ModelError, ObjectCacheStats, ObjectId, ObjectRecord,
     PersistentObjectIdentity, Prepared, PrincipalCodec, PrincipalUsage, ProjectionCacheEntry,
-    ProjectionCacheKey, ROOT_FILE, RecoveryScope, RootGeneration, RootSnapshot, RootState,
-    RootTransaction, append_frame, canonical_record_bytes, encode_object_frame, encode_root_record,
+    ProjectionCacheKey, ROOT_FILE, RecoveryScope, RootSnapshot, RootState, RootTransaction,
+    append_frame, canonical_record_bytes, encode_object_frame, encode_root_record,
     ensure_payload_limit, io_error, live_files_mut, materialize_closure, read_indexed_object,
     read_indexed_objects, usage_from_closure, validate_incremental_closure,
 };
@@ -767,37 +767,23 @@ where
         observer: Option<&dyn ProjectionObserver>,
     ) -> Result<Prepared<P>, DurableError> {
         let RootTransaction {
-            principal,
-            expected,
-            commit: commit_id,
-            records,
-            identity_proof,
+            declaration,
             mut kv_checkpoint_publication,
         } = transaction;
-        let admission =
-            identity_proof.admit_records(&self.preparation_authority, &records, |record| {
-                self.identify(record)
-            })?;
+        let (update, admission) = declaration
+            .admit_records(&self.preparation_authority, |record| self.identify(record))?;
         let kv_checkpoint_publication = admission.take_checkpoint(&mut kv_checkpoint_publication);
-        let (actual, decision) = super::root_transition::admit_current(
-            pending_roots,
-            &inner.roots_by_principal,
-            &principal,
-            expected,
-        );
-        let generation = match decision {
-            super::root_transition::Advance::Conflict => {
-                return Err(ModelError::RootConflict { expected, actual }.into());
-            },
-            super::root_transition::Advance::Overflow => {
-                return Err(ModelError::ArithmeticOverflow.into());
-            },
-            super::root_transition::Advance::Next(next) => RootGeneration::new(next),
-        };
-        let root = RootState {
-            generation,
-            commit: commit_id,
-        };
+        let (selected, records) =
+            super::root_transition::select_update(pending_roots, &inner.roots_by_principal, update)
+                .map_err(|error| match error {
+                    super::root_transition::SelectionError::Conflict { expected, actual } => {
+                        ModelError::RootConflict { expected, actual }
+                    },
+                    super::root_transition::SelectionError::Overflow => {
+                        ModelError::ArithmeticOverflow
+                    },
+                })?;
+        let commit_id = selected.replacement().commit;
 
         let unique = crate::engine::transaction_records::unique(records)
             .map_err(ModelError::ObjectCollision)?;
@@ -841,15 +827,10 @@ where
                 objects.push((id, payload));
             }
         }
-        let root = super::root_transition::PreparedRoot::encode(
-            principal,
-            expected,
-            root,
-            |owner, expected, replacement| {
-                let bytes = self.principal_codec.encode(owner);
-                encode_root_record(self.identity.scheme(), &bytes, expected, replacement)
-            },
-        )?;
+        let root = selected.encode(|owner, expected, replacement| {
+            let bytes = self.principal_codec.encode(owner);
+            encode_root_record(self.identity.scheme(), &bytes, expected, replacement)
+        })?;
         ensure_payload_limit(ROOT_FILE, 0, root.journal().len(), self.limits)?;
 
         Ok(Prepared {

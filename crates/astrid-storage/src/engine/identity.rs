@@ -53,11 +53,15 @@ impl<'a> KvIdentitySession<'a> {
         records: Vec<(ObjectId, ObjectRecord)>,
     ) -> RootTransaction<P> {
         RootTransaction {
-            principal,
-            expected,
-            commit,
-            records,
-            identity_proof: IdentityProof::Engine(Arc::clone(self.authority)),
+            declaration: super::root_declaration::Declaration {
+                update: super::root_declaration::Update {
+                    principal,
+                    expected,
+                    commit,
+                    records,
+                },
+                identity: IdentityProof::Engine(Arc::clone(self.authority)),
+            },
             kv_checkpoint_publication: None,
         }
     }
@@ -67,14 +71,19 @@ impl<'a> KvIdentitySession<'a> {
 /// by the same engine instance that now consumes it.
 pub(crate) type IdentityProof = super::transaction_records::IdentityProof<Arc<()>>;
 
-impl IdentityProof {
-    pub(crate) fn admit_records(
-        &self,
+impl<P> super::root_declaration::Declaration<P, Arc<()>> {
+    pub(super) fn admit_records(
+        self,
         authority: &Arc<()>,
-        records: &[(ObjectId, ObjectRecord)],
         identify: impl Fn(&ObjectRecord) -> ObjectId,
-    ) -> Result<super::transaction_records::Admission, ModelError> {
-        self.admit(authority, Arc::ptr_eq, records, identify)
+    ) -> Result<
+        (
+            super::root_declaration::Update<P>,
+            super::transaction_records::Admission,
+        ),
+        ModelError,
+    > {
+        self.admit(authority, Arc::ptr_eq, identify)
             .map_err(|(declared, computed)| ModelError::ObjectIdentityMismatch {
                 declared,
                 computed,

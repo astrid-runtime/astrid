@@ -36,6 +36,76 @@ fn optional(root:Option<RootState>) -> (v:Option<Version>)
     root.map(|r:RootState| -> (v:Version) ensures represents(v,r) { version(r) })
 }
 
+pub(super) enum SelectionError {
+    Conflict { expected:Option<RootState>, actual:Option<RootState> },
+    Overflow,
+}
+
+/// CAS selection retains the complete root transition during object validation.
+pub(super) struct SelectedRoot<P> {
+    owner:P,
+    expected:Option<RootState>,
+    replacement:RootState,
+}
+
+impl<P> SelectedRoot<P> {
+    pub(super) closed spec fn binding(&self) -> (P,Option<RootState>,RootState) {
+        (self.owner,self.expected,self.replacement)
+    }
+
+    pub(super) fn replacement(&self) -> (r:RootState)
+        ensures r == self.binding().2,
+    { self.replacement }
+
+    pub(super) fn encode<E,F:FnOnce(&P,Option<RootState>,RootState)->Result<Vec<u8>,E>>(self,encoder:F)
+        -> (out:Result<PreparedRoot<P,RootState>,E>)
+        requires encoder.requires((&self.binding().0,self.binding().1,self.binding().2)),
+        ensures match out {
+            Ok(prepared) => {
+                let (owner,expected,root,bytes) = prepared.binding();
+                &&& (owner,expected,root) == self.binding()
+                &&& encoder.ensures((&owner,expected,root),Ok(bytes))
+            },
+            Err(e) => encoder.ensures((&self.binding().0,self.binding().1,self.binding().2),Err(e)),
+        },
+    {
+        PreparedRoot::encode(self.owner,self.expected,self.replacement,encoder)
+    }
+}
+
+type DeclaredRows = Vec<(super::ObjectId,super::ObjectRecord)>;
+
+pub(super) fn select_update<P:Ord>(pending:&BTreeMap<P,RootState>,published:&BTreeMap<P,RootState>,
+    update:super::root_declaration::Update<P>) -> (out:Result<(SelectedRoot<P>,DeclaredRows),SelectionError>)
+    requires obeys_cmp::<P>(), obeys_cmp_concrete_eq::<P>(), btree_map_inv(pending), btree_map_inv(published),
+    ensures ({
+        let owner = update.principal;
+        let actual = if pending@.contains_key(owner) {Some(pending@[owner])}
+            else if published@.contains_key(owner) {Some(published@[owner])} else {None};
+        match out {
+            Err(SelectionError::Conflict {expected,actual:a}) => expected == update.expected && a == actual && expected != a,
+            Err(SelectionError::Overflow) => actual == update.expected && (actual matches Some(r) && r.generation.value() == u64::MAX),
+            Ok((selected,rows)) => {
+                let (p,e,root) = selected.binding();
+                &&& p == owner && e == update.expected && rows == update.records
+                &&& actual == update.expected && root.commit == update.commit
+                &&& match actual {
+                None => root.generation.value() == 0,
+                Some(old) => root.generation.value() == old.generation.value() + 1,
+                }
+            },
+        }
+    }),
+{
+    let (actual,decision) = admit_current(pending,published,&update.principal,update.expected);
+    match decision {
+        Advance::Conflict => Err(SelectionError::Conflict {expected:update.expected,actual}),
+        Advance::Overflow => Err(SelectionError::Overflow),
+        Advance::Next(n) => Ok((SelectedRoot { owner:update.principal,expected:update.expected,
+            replacement:RootState {generation:super::RootGeneration::new(n),commit:update.commit} },update.records)),
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum Advance { Conflict, Overflow, Next(u64) }
 

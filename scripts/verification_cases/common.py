@@ -228,6 +228,7 @@ INPUTS = [
     Path("crates/astrid-storage/src/engine/durable/closure_load.rs"),
     Path("crates/astrid-storage/src/engine/durable/wal/overlay_object.rs"),
     Path("crates/astrid-storage/src/engine/transaction_records.rs"),
+    Path("crates/astrid-storage/src/engine/root_declaration.rs"),
     Path("crates/astrid-storage/src/engine/durable/wal/root_history.rs"),
     ENTRY,
     MODEL,

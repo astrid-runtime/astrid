@@ -1,5 +1,6 @@
 //! Construct a complete layout from the real Begin, Root and Commit encoders.
 use super::*;
+use crate::{ObjectId,ObjectRecord,RootState,root_declaration,transaction_records};
 use std::collections::BTreeMap;
 use crate::wal_root_history::{self as table,Decision};
 use vstd::{laws_cmp::{obeys_cmp,obeys_cmp_concrete_eq},std_specs::btree::btree_map_inv};
@@ -7,6 +8,68 @@ use crate::{owner_codec::{self,Owner},root_wire,root_transition::{self,Version,R
 use vstd::prelude::*;
 
 verus! {
+
+/// An unsealed content transaction must recheck every supplied row before the
+/// durable preparation can select a generation under the transaction's owner.
+fn admit_content<P:Ord,H:Fn(&ObjectRecord)->ObjectId>(pending:&BTreeMap<P,RootState>,published:&BTreeMap<P,RootState>,
+    owner:P,expected:Option<RootState>,commit:ObjectId,rows:Vec<(ObjectId,ObjectRecord)>,identify:H)
+    -> (out:Result<Result<RootState,root_transition::SelectionError>,(ObjectId,ObjectId)>)
+    requires obeys_cmp::<P>(),obeys_cmp_concrete_eq::<P>(),btree_map_inv(pending),btree_map_inv(published),
+        forall|r:&ObjectRecord| #[trigger] identify.requires((r,)),
+    ensures ({
+        let actual = if pending@.contains_key(owner) {Some(pending@[owner])}
+            else if published@.contains_key(owner) {Some(published@[owner])} else {None};
+        match out {
+            Err((bad,computed)) => exists|i:int| 0 <= i < rows.len() && rows@[i].0 == bad &&
+                #[trigger] identify.ensures((&rows@[i].1,),computed) && computed.digest() != bad.digest() &&
+                forall|j:int| 0 <= j < i ==> #[trigger] transaction_records::authentic(rows@[j],identify),
+            Ok(selected) => {
+                &&& forall|j:int| 0 <= j < rows.len() ==> #[trigger] transaction_records::authentic(rows@[j],identify)
+                &&& match selected {
+                    Err(root_transition::SelectionError::Conflict {expected:e,actual:a}) => e == expected && a == actual && a != e,
+                    Err(root_transition::SelectionError::Overflow) => expected == actual && (actual matches Some(r) && r.generation.value() == u64::MAX),
+                    Ok(r) => r.commit == commit && actual == expected && match actual {
+                        None => r.generation.value() == 0, Some(old) => r.generation.value() == old.generation.value()+1,
+                    },
+                }
+            },
+        }
+    }),
+{
+    let declaration = root_declaration::Declaration::<P,u8>::untrusted(owner,expected,commit,rows);
+    let (update,kind) = declaration.admit(&0,|a:&u8,b:&u8| *a == *b,identify)?;
+    assert(kind is Rechecked);
+    match root_transition::select_update(pending,published,update) {
+        Ok((selected,batch)) => {
+            assert(batch == rows);
+            assert(selected.binding().0 == owner && selected.binding().1 == expected);
+            Ok(Ok(selected.replacement()))
+        },
+        Err(e) => Ok(Err(e)),
+    }
+}
+
+/// The journal callback receives the root retained across closure validation.
+fn journal_selected<P,E,T,F,W>(selected:root_transition::SelectedRoot<P>,encoder:F,write:W)
+    -> (out:Result<(root_transition::PreparedRoot<P,RootState>,T),E>)
+    where F:FnOnce(&P,Option<RootState>,RootState)->Result<Vec<u8>,E>,
+        W:FnOnce(&P,Option<RootState>,RootState,&Vec<u8>)->T,
+    requires encoder.requires((&selected.binding().0,selected.binding().1,selected.binding().2)),
+        forall|bytes:&Vec<u8>| #[trigger] write.requires((&selected.binding().0,selected.binding().1,selected.binding().2,bytes)),
+    ensures match out {
+        Ok((prepared,t)) => {
+            let (p,e,r,bytes) = prepared.binding();
+            &&& (p,e,r) == selected.binding()
+            &&& encoder.ensures((&p,e,r),Ok(bytes))
+            &&& write.ensures((&p,e,r,&bytes),t)
+        },
+        Err(error) => encoder.ensures((&selected.binding().0,selected.binding().1,selected.binding().2),Err(error)),
+    },
+{
+    let prepared = selected.encode(encoder)?;
+    let t = prepared.write_wal(write);
+    Ok((prepared,t))
+}
 
 /// Between two preparations under the group writer lock, the same owner sees
 /// its staged version and every other owner still sees its prior effective root.
