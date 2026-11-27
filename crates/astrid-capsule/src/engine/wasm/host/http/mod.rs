@@ -29,6 +29,7 @@ mod backend;
 mod credentials;
 mod body;
 mod hop;
+mod slots;
 mod stream_lifetime;
 mod options;
 // The SSRF host airlock. Private: every consumer is an `http` descendant that

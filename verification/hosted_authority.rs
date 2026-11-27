@@ -232,6 +232,9 @@ mod egress_reply;
 mod http_hop;
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/http/body.rs"]
 mod http_body;
+#[path = "../crates/astrid-capsule/src/engine/wasm/host/http/slots.rs"]
+mod http_slots;
+mod hosted_http_slots;
 mod hosted_http_hop;
 mod hosted_egress_reply;
 mod hosted_consent_reply;

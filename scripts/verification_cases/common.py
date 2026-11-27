@@ -47,6 +47,8 @@ MOUNT = Path("crates/astrid-capsule/src/engine/wasm/mount_selection.rs")
 PAIR_RESULT = Path("crates/astrid-kernel/src/kernel_router/admin/pair_issue_result.rs")
 INPUTS = [
     Path("verification/hosted_http_hop.rs"),
+    Path("verification/hosted_http_slots.rs"),
+    Path("crates/astrid-capsule/src/engine/wasm/host/http/slots.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/host/http/body.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/host/http/hop.rs"),
     Path("verification/hosted_egress_reply.rs"),

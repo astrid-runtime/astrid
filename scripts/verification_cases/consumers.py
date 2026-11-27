@@ -45,6 +45,21 @@ def consumer_defects():
             lambda s, a=original, b=changed: replace_once(s, a, b),
             hop_trace if name == "loses the selected disclosure" else body,
         )
+    slots = Path("crates/astrid-capsule/src/engine/wasm/host/http/slots.rs")
+    slot_trace = Path("verification/hosted_http_slots.rs")
+    for name, original, changed in [
+        ("loses the returned handle", "result == Ok(rep) && final(streams)@", "result.is_ok() && final(streams)@"),
+        ("loses the occupied response", "result == Err(Refusal::Occupied) && final(streams)@ == before",
+         "result == Err(Refusal::Occupied)"),
+        ("loses the released response", "removed == if before.contains_key(key) { Some(before[key]) } else { None }",
+         "removed.is_some() == before.contains_key(key)"),
+        ("loses the destructor update", "final(streams)@ == if deleted {before.remove(key)} else {before}",
+         "true"),
+    ]:
+        yield (
+            f"HTTP stream slot {name}", slots,
+            lambda s, a=original, b=changed: replace_once(s, a, b), slot_trace,
+        )
     egress = Path("crates/astrid-capsule/src/engine/wasm/host/egress_reply.rs")
     egress_trace = Path("verification/hosted_egress_reply.rs")
     for name, original, changed, target in [

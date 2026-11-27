@@ -521,8 +521,8 @@ impl HostState {
         } else {
             None
         };
-        // The loop hands back the bytes read so far even on failure, so the
-        // completion commits to exactly what the host received.
+        // Keep the accepted prefix outside the cancellable future so a failed
+        // completion can still commit to the bytes already appended.
         let cancel = self.effective_cancel_token();
         let mut body = Vec::new();
         let read = util::bounded_await_cancellable(&io_semaphore, &cancel, async {
@@ -608,7 +608,7 @@ impl HostState {
         // length is the per-capsule count. A separate, SMALLER per-principal
         // limit would be needed for true per-principal isolation (one principal
         // not starving others within the capsule) — out of scope here.
-        if self.active_http_streams.len() >= max_streams {
+        if !super::slots::room(&self.active_http_streams, max_streams) {
             return Err(ErrorCode::Quota);
         }
 
@@ -746,10 +746,25 @@ pub(super) fn register_stream(
         .resource_table
         .push(HttpStreamSlot)
         .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
-    state
-        .active_http_streams
-        .insert(u64::from(slot.rep()), active);
-    Ok(Resource::new_own(slot.rep()))
+    match super::slots::publish(
+        &mut state.active_http_streams,
+        state.http_limits.max_concurrent_streams,
+        slot.rep(),
+        active,
+    ) {
+        Ok(rep) => Ok(Resource::new_own(rep)),
+        Err(refusal) => {
+            // The just-allocated marker has no children and has not escaped.
+            state
+                .resource_table
+                .delete(slot)
+                .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
+            Err(match refusal {
+                super::slots::Refusal::Full => ErrorCode::Quota,
+                super::slots::Refusal::Occupied => ErrorCode::Closed,
+            })
+        },
+    }
 }
 
 fn live_stream(state: &HostState, rep: u32) -> Option<&ActiveHttpStream> {
@@ -907,28 +922,25 @@ async fn complete_stream(
 }
 
 pub(super) fn stream_close(state: &mut HostState, rep: u32) -> Result<(), ErrorCode> {
-    release_response(state, rep);
+    if let Some(stream) = super::slots::release(&mut state.active_http_streams, rep) {
+        close_stream_exchange(&stream);
+    }
     Ok(())
 }
 
-fn release_response(state: &mut HostState, rep: u32) {
-    if let Some(stream) = state.active_http_streams.remove(&u64::from(rep)) {
-        close_stream_exchange(&stream);
-    }
-}
-
 pub(super) fn stream_drop(state: &mut HostState, rep: u32) {
-    // Wasmtime deletes the underlying entry before downcasting its value.
-    if state
-        .resource_table
-        .get::<HttpStreamSlot>(&Resource::new_borrow(rep))
-        .is_ok()
-        && state
-            .resource_table
-            .delete::<HttpStreamSlot>(Resource::new_own(rep))
+    let table = &mut state.resource_table;
+    let stream = super::slots::drop_owned(&mut state.active_http_streams, rep, |slot| {
+        // Wasmtime deletes the underlying entry before downcasting its value.
+        table
+            .get::<HttpStreamSlot>(&Resource::new_borrow(slot))
             .is_ok()
-    {
-        release_response(state, rep);
+            && table
+                .delete::<HttpStreamSlot>(Resource::new_own(slot))
+                .is_ok()
+    });
+    if let Some(stream) = stream {
+        close_stream_exchange(&stream);
     }
 }
 
