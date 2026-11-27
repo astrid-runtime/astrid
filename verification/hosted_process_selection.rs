@@ -325,4 +325,26 @@ fn shutdown_and_reap<T>(entries: &mut HashMap<[u8;32],Entry<T>>, cleanup: &mut C
         }
     }
 }
+
+// Independent observer for the two operations on a detached entry. Distinct
+// monitors remain distinct even for entries carrying the same numeric PID.
+struct ObservedDisposal { history: Vec<crate::process_reap::Action<u64>> }
+
+impl crate::process_reap::Disposal<u64> for ObservedDisposal {
+    closed spec fn calls(&self) -> Seq<crate::process_reap::Action<u64>> { self.history@ }
+    fn kill(&mut self, pid: u32) { self.history.push(crate::process_reap::Action::Kill(pid)); }
+    fn abort(&mut self, monitor: u64) { self.history.push(crate::process_reap::Action::Abort(monitor)); }
+}
+
+fn reap_live_then_exited(pid: u32, old_monitor: u64, new_monitor: u64, sink: &mut ObservedDisposal)
+    ensures final(sink).history@ == old(sink).history@ + seq![
+        crate::process_reap::Action::Kill(pid), crate::process_reap::Action::Abort(old_monitor),
+        crate::process_reap::Action::Abort(new_monitor)],
+{
+    crate::process_reap::dispose(true, pid, old_monitor, sink);
+    crate::process_reap::dispose(false, pid, new_monitor, sink);
+    assert(sink.history@ =~= old(sink).history@ + seq![
+        crate::process_reap::Action::Kill(pid), crate::process_reap::Action::Abort(old_monitor),
+        crate::process_reap::Action::Abort(new_monitor)]);
+}
 }

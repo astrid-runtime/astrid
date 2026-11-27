@@ -203,6 +203,7 @@ INPUTS = [
     Path("verification/hosted_ephemeral_process.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/host/process/process_batch.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/host/process/persistent/publication.rs"),
+    Path("crates/astrid-capsule/src/engine/wasm/host/process/persistent/reap.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/host/process/persistent/signal_target.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/host/process/registry_keys.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/host/process/tracker_registry.rs"),

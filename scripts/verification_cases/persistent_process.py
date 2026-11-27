@@ -7,6 +7,23 @@ from .common import edit_function, replace_once
 def defects():
     persistent = Path("crates/astrid-capsule/src/engine/wasm/host/process/persistent")
     process_trace = Path("verification/hosted_process_selection.rs")
+    disposal = persistent / "reap.rs"
+    for name, original, changed in [
+        ("skips a live child", "if live {\n        sink.kill(pid);", "if !live {\n        sink.kill(pid);"),
+        ("signals the wrong PID", "sink.kill(pid);", "sink.kill(0);"),
+        ("omits monitor abort", "sink.abort(monitor);", ""),
+    ]:
+        yield (
+            f"persistent child disposal {name}", disposal,
+            lambda s, a=original, b=changed: replace_once(s, a, b), disposal,
+        )
+    yield (
+        "persistent child disposal loses the ordered kill and monitor target", disposal,
+        lambda s: replace_once(s,
+            "final(sink).calls() == (if live { old(sink).calls().push(Action::Kill(pid)) }\n        else { old(sink).calls() }).push(Action::Abort(monitor))",
+            "true"),
+        process_trace,
+    )
     admission = persistent.parent / "spawn_admission.rs"
     for name, original, changed in [
         ("checks a different capsule", "gate.host(capsule, command)", "gate.host(command, command)"),

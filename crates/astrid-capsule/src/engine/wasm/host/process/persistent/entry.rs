@@ -262,10 +262,24 @@ pub(super) fn spawn_ring_reader<R>(
 /// Reap an entry removed from the map: SIGKILL the group (best effort) and
 /// abort the monitor (dropping its `Child`, the `kill_on_drop` backstop).
 pub(super) fn reap_entry(entry: PersistentEntry) {
-    if entry.is_live() {
-        let _ = send_signal(entry.os_pid, HostSignal::Kill);
+    super::reap::dispose(
+        entry.is_live(),
+        entry.os_pid,
+        &entry.monitor,
+        &mut NativeDisposal,
+    );
+}
+
+struct NativeDisposal;
+
+impl super::reap::Disposal<&tokio::task::JoinHandle<()>> for NativeDisposal {
+    fn kill(&mut self, pid: u32) {
+        let _ = send_signal(pid, HostSignal::Kill);
     }
-    entry.monitor.abort();
+
+    fn abort(&mut self, monitor: &tokio::task::JoinHandle<()>) {
+        monitor.abort();
+    }
 }
 
 /// Platform-neutral signal understood by the persistent-process registry.

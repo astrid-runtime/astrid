@@ -68,6 +68,8 @@ mod process_cleanup;
 mod process_retirement;
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/process/persistent/publication.rs"]
 mod process_publication;
+#[path = "../crates/astrid-capsule/src/engine/wasm/host/process/persistent/reap.rs"]
+mod process_reap;
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/process/persistent/signal_target.rs"]
 mod signal_target;
 mod hosted_process_selection;
