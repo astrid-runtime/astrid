@@ -132,6 +132,10 @@ def consumer_defects():
         ("accepts stale coverage", admission, "if covered != measured {return false;}", "if covered < measured {return false;}", admission),
         ("skips tail verification", admission, "Some(loc) => arena.tail(loc)", "Some(loc) => true", admission),
         ("drops admission provenance", admission, "complete && candidate == Some(s) &&\n                consistent(s.objects@,s.arena_tail,s.arena_len,measured,old(arena).entries(),old(arena).tails())", "complete && candidate == Some(s)", recovery),
+        ("skips a physical gap", admission, "if loc.offset != end {return false;}", "if loc.offset < end {return false;}", admission),
+        ("drops the final frame extent", admission, "if end != measured {return false;}", "if end > measured {return false;}", admission),
+        ("advances past the declared frame", admission, "end = next;", "end = next.saturating_add(1);", admission),
+        ("loses the accepted physical partition", admission, " && can_cover(s.objects@,measured),", ",", recovery),
         ("loses accepted cache identity", rebuild, "Some(s) => out == Ok(s),", "Some(s) => true,", recovery),
         ("loses completed replacement", rebuild, "exists|value:&T,r:Result<(),E>| *value == s && r.is_ok() && #[trigger] publish.ensures((value,),r)", "true", recovery),
     ]:

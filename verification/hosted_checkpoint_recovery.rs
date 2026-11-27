@@ -67,7 +67,7 @@ fn recover(candidate:IndexState, complete:bool, bytes:&[u8],checked_tail:ArenaLo
             (forall|p:(ObjectId,ArenaLocation)| #[trigger] candidate.objects@.kv_pairs().contains(p) ==>
                 reader::matches(bytes@,magic,version,p.1,scheme,p.0,limit)) &&
             (match candidate.arena_tail {Some(loc) => loc == checked_tail, None => candidate.arena_len == 0});
-        out == if valid {Ok(candidate)} else {
+        out == if valid && admission::can_cover(candidate.objects@,bytes.len() as u64) {Ok(candidate)} else {
             match scan_error {Some(e) => Err(e), None => match write_error {Some(e) => Err(e),None => Ok(scanned)}}
         }
     }),
@@ -81,6 +81,77 @@ fn recover(candidate:IndexState, complete:bool, bytes:&[u8],checked_tail:ArenaLo
         |value:&IndexState| -> (r:Result<(),u8>)
             ensures match write_error {Some(e) => r == Err(e), None => if value.arena_len == expected_len {r.is_ok()} else {r == Err(99u8)}}
         {match write_error {Some(e) => Err(e),None => if value.arena_len == expected_len {Ok(())} else {Err(99)}}})
+}
+
+/// A walk starting at byte zero and following the lengths in the actual frame
+/// headers cannot find a tagged object omitted by an accepted checkpoint.
+proof fn physical_prefix(bytes:Seq<u8>, rows:Seq<(ObjectId,ArenaLocation)>,
+    walk:Seq<(ObjectId,ArenaLocation)>, n:int, magic:[u8;8],version:u16,scheme:Scheme,limit:u64)
+    requires 0 <= n <= walk.len(), bytes.len() <= u64::MAX,
+        admission::partition(rows,bytes.len() as u64),
+        forall|i:int| 0 <= i < rows.len() ==> reader::matches(bytes,magic,version,(#[trigger] rows[i]).1,scheme,rows[i].0,limit),
+        forall|i:int| 0 <= i < walk.len() ==> {
+            &&& (#[trigger] walk[i]).1.offset == admission::frontier(walk,i)
+            &&& reader::matches(bytes,magic,version,walk[i].1,scheme,walk[i].0,limit)
+        },
+    ensures n <= rows.len(), forall|i:int| 0 <= i < n ==> #[trigger] walk[i] == rows[i],
+    decreases n,
+{
+    if n > 0 {
+        let i = n-1;
+        physical_prefix(bytes,rows,walk,i,magic,version,scheme,limit);
+        if i > 0 {assert(walk[i-1] == rows[i-1]);}
+        assert(admission::frontier(rows,i) == admission::frontier(walk,i));
+        let (id,loc) = walk[i];
+        assert(reader::matches(bytes,magic,version,loc,scheme,id,limit));
+        assert(i < rows.len());
+        let (cached,at) = rows[i];
+        assert(at.offset == loc.offset);
+        assert(reader::matches(bytes,magic,version,at,scheme,cached,limit));
+        assert(at.checksum =~= loc.checksum);
+        ObjectId::same_digest(cached,id);
+        assert(walk[i] == rows[i]);
+    }
+}
+
+proof fn includes_physical_objects(bytes:Seq<u8>, map:Map<ObjectId,ArenaLocation>,
+    walk:Seq<(ObjectId,ArenaLocation)>,magic:[u8;8],version:u16,scheme:Scheme,limit:u64)
+    requires bytes.len() <= u64::MAX, admission::can_cover(map,bytes.len() as u64),
+        forall|p:(ObjectId,ArenaLocation)| #[trigger] map.kv_pairs().contains(p) ==> reader::matches(bytes,magic,version,p.1,scheme,p.0,limit),
+        forall|i:int| 0 <= i < walk.len() ==> {
+            &&& (#[trigger] walk[i]).1.offset == admission::frontier(walk,i)
+            &&& reader::matches(bytes,magic,version,walk[i].1,scheme,walk[i].0,limit)
+        },
+    ensures forall|i:int| 0 <= i < walk.len() ==> map.kv_pairs().contains(#[trigger] walk[i]),
+{
+    let rows = choose|s:Seq<(ObjectId,ArenaLocation)>| #[trigger] admission::ordered(s,map) && admission::partition(s,bytes.len() as u64);
+    rows.to_set_ensures();
+    assert forall|i:int| 0 <= i < rows.len() implies reader::matches(bytes,magic,version,(#[trigger] rows[i]).1,scheme,rows[i].0,limit) by {
+        assert(rows.to_set().contains(rows[i]));
+    }
+    physical_prefix(bytes,rows,walk,walk.len() as int,magic,version,scheme,limit);
+    assert forall|i:int| 0 <= i < walk.len() implies map.kv_pairs().contains(#[trigger] walk[i]) by {
+        assert(rows.to_set().contains(rows[i]));
+    }
+}
+
+/// Bind reverse coverage to production admission on the same stable bytes.
+fn admitted_objects(candidate:IndexState, complete:bool, bytes:&[u8], checked_tail:ArenaLocation,
+    magic:[u8;8],version:u16,scheme:Scheme,limit:u64, Ghost(walk):Ghost<Seq<(ObjectId,ArenaLocation)>>)
+    -> (out:Option<IndexState>)
+    requires btree_map_inv(&candidate.objects),obeys_cmp::<ObjectId>(),obeys_cmp_concrete_eq::<ObjectId>(),
+        forall|i:int| 0 <= i < walk.len() ==> {
+            &&& (#[trigger] walk[i]).1.offset == admission::frontier(walk,i)
+            &&& reader::matches(bytes@,magic,version,walk[i].1,scheme,walk[i].0,limit)
+        },
+    ensures out matches Some(s) ==> forall|i:int| 0 <= i < walk.len() ==> s.objects@.kv_pairs().contains(#[trigger] walk[i]),
+{
+    let mut arena = Candidate {media:Image {bytes,cursor:0},magic,version,scheme,limit,checked_tail};
+    let out = IndexState::validated(Some(candidate),complete,bytes.len() as u64,&mut arena);
+    proof {if let Some(s) = &out {
+        includes_physical_objects(bytes@,s.objects@,walk,magic,version,scheme,limit);
+    }}
+    out
 }
 
 /// At a nonzero offset, check the name and placement written by the arena

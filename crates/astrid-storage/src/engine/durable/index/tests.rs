@@ -210,3 +210,51 @@ fn checkpoint_rows_reject_duplicate_reversed_and_foreign_names() {
         ));
     }
 }
+
+#[test]
+fn recovery_requires_the_cache_to_cover_every_physical_frame() {
+    use super::super::recover_arena;
+    use super::super::tests::{TEST_IDENTITY_SCHEME, TestIdentity, open, transaction};
+
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let (_, transaction) = transaction("alice", None, b"checkpoint coverage");
+    engine.commit(transaction).unwrap();
+    engine.flush().unwrap();
+    drop(engine);
+
+    let mut arena = File::native(std::fs::File::open(directory.path().join(ARENA_FILE)).unwrap());
+    let length = arena.seek(SeekFrom::End(0)).unwrap();
+    let limits = RecoveryLimits::process_addressable();
+    let (objects, arena_tail) = recover_arena(&mut arena, &TestIdentity, limits, length).unwrap();
+    assert_eq!(objects.len(), 2);
+
+    for omitted in std::iter::once(None).chain(objects.keys().copied().map(Some)) {
+        let mut state = IndexState {
+            arena_len: length,
+            arena_tail,
+            objects: objects.clone(),
+        };
+        if let Some(id) = omitted {
+            state.objects.remove(&id);
+        }
+        let cache = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(directory.path().join(INDEX_FILE))
+            .unwrap();
+        let mut cache = File::native(cache);
+        Snapshot::new(&state, TEST_IDENTITY_SCHEME)
+            .unwrap()
+            .append(&mut cache)
+            .unwrap();
+        let admitted = recover_index(&mut cache, &mut arena, TEST_IDENTITY_SCHEME, limits, length);
+        assert_eq!(admitted.is_some(), omitted.is_none());
+        drop(cache);
+        let reopened = open(directory.path());
+        for id in objects.keys() {
+            assert!(reopened.object(*id).unwrap().is_some());
+        }
+    }
+}
