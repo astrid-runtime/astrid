@@ -641,7 +641,7 @@ impl approval::Host for HostState {
                                 .inspect_err(|_| {
                                     audit.denied(
                                         "authority_unavailable",
-                                        "session approval device changed",
+                                        "could not establish current session approval authority",
                                     )
                                 })?;
                             let typed = match outcome {

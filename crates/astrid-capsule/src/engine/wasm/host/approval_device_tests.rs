@@ -8,6 +8,15 @@ use astrid_core::profile::{AuthMethod, DeviceKey, DeviceKeyId, DeviceScope, Prin
 
 #[tokio::test]
 async fn replacement_registration_cannot_authorize_queued_command_grant() {
+    exercise_signed_reply(Decision::Always).await;
+}
+
+#[tokio::test]
+async fn session_reply_checks_the_profile_on_disk_before_installing_an_allowance() {
+    exercise_signed_reply(Decision::Session).await;
+}
+
+async fn exercise_signed_reply(scope: Decision) {
     for (caller_stale, responder_stale) in [(false, false), (true, false), (false, true)] {
         let dir = tempfile::tempdir().unwrap();
         let home = astrid_core::dirs::AstridHome::from_path(dir.path());
@@ -30,6 +39,9 @@ async fn replacement_registration_cannot_authorize_queued_command_grant() {
         let requests = bus.subscribe_topic(Topic::approval_request().as_str());
         let sessions = state.device_sessions.clone();
         let cache = state.profile_cache.clone().unwrap();
+        let store = std::sync::Arc::new(AllowanceStore::new());
+        state.allowance_store = Some(store.clone());
+        let workspace = state.workspace_root.clone();
         let task = tokio::task::spawn_blocking(move || {
             approval::Host::request_approval(
                 &mut state,
@@ -44,21 +56,43 @@ async fn replacement_registration_cannot_authorize_queued_command_grant() {
         profile.add_device(replacement);
         profile.add_device(current.clone());
         profile.save(&home, &principal).unwrap();
-        cache.invalidate(&principal);
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            sessions.retire(
-                &principal,
-                &DeviceKeyId::new(original.key_id.clone()).unwrap(),
-            ),
-        )
-        .await
-        .expect("device retirement finishes while the prompt waits")
-        .unwrap();
+        let decision = match scope {
+            Decision::Always => {
+                cache.invalidate(&principal);
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    sessions.retire(
+                        &principal,
+                        &DeviceKeyId::new(original.key_id.clone()).unwrap(),
+                    ),
+                )
+                .await
+                .expect("device retirement finishes while the prompt waits")
+                .unwrap();
+
+                "approve_always"
+            },
+            Decision::Session => {
+                // The registry lookup still admits both original stamps from cache.
+                // Only the locked publication check sees the replacement on disk.
+                assert!(
+                    cache
+                        .resolve(&principal)
+                        .unwrap()
+                        .active_registration(
+                            &DeviceKeyId::new(original.key_id.as_str()).unwrap(),
+                            original.registration_id.map(Into::into),
+                        )
+                        .is_some()
+                );
+                "approve_session"
+            },
+            _ => unreachable!(),
+        };
 
         let responder = if responder_stale { &original } else { &current };
         let mut reply =
-            approval_response_event(&id, Some(principal.as_str()), Some(owner), "approve_always");
+            approval_response_event(&id, Some(principal.as_str()), Some(owner), decision);
         let AstridEvent::Ipc { message, .. } = &mut reply else {
             unreachable!()
         };
@@ -67,8 +101,15 @@ async fn replacement_registration_cannot_authorize_queued_command_grant() {
         bus.publish(reply);
         let result = task.await.unwrap();
         let saved = PrincipalProfile::load_required(&home, &principal).unwrap();
+        assert_eq!(
+            check_allowance(&store, &principal, "git push origin main", Some(&workspace)),
+            scope == Decision::Session && !caller_stale && !responder_stale
+        );
         if caller_stale || responder_stale {
             assert!(matches!(result, Err(ErrorCode::StoreUnavailable)));
+            assert!(saved.approvals.command_always.is_empty());
+        } else if scope == Decision::Session {
+            assert_eq!(result.unwrap().decision, ApprovalDecision::ApprovedSession);
             assert!(saved.approvals.command_always.is_empty());
         } else {
             assert_eq!(result.unwrap().decision, ApprovalDecision::ApprovedAlways);

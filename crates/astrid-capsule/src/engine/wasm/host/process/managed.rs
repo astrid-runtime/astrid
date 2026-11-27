@@ -146,7 +146,7 @@ pub(super) fn prepare_sandboxed_command(
     inject_env: &[(String, String)],
     extra_masks: &[std::path::PathBuf],
 ) -> Result<Command, String> {
-    // The host has confined cwd to the workspace or an authorized home:// root.
+    // The host has confined cwd to the workspace or an authorized home:// or shared:// root.
     let inner_cmd =
         super::command::build(cmd, args, context.cwd.as_path(), &context.env, inject_env);
 
