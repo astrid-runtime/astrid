@@ -216,4 +216,66 @@ fn publish_then_retire<T>(entries: &mut HashMap<[u8;32],Entry<(u8,T)>>,
     }
     (Some(i), removed)
 }
+
+struct Cleanup<T> { received: Vec<T> }
+
+impl<T> crate::process_cleanup::Reaper<T> for Cleanup<T> {
+    closed spec fn calls(&self) -> Seq<T> { self.received@ }
+    fn reap(&mut self, entry: T) { self.received.push(entry); }
+}
+
+// Follow retirement past mutex release to the sequence of cleanup calls.
+// The reaper may have received earlier batches.
+fn retire_and_reap<T>(entries: &mut HashMap<[u8;32],Entry<T>>, principal: &[u8],
+    cleanup: &mut Cleanup<Entry<T>>)
+    requires hash_map_inv(old(entries)), obeys_key_model::<[u8;32]>(), obeys_concrete_eq::<[u8;32]>(),
+    ensures ({
+        let before = old(entries)@;
+        let prior = old(cleanup).received@;
+        let after = final(cleanup).received@;
+        &&& final(entries)@ == before.restrict(before.dom().filter(|k| before[k].creator@ != principal@))
+        &&& exists|keys:Seq<[u8;32]>, batch:Seq<Entry<T>>| after == prior + batch
+            && keys.no_duplicates() && keys.len() == batch.len()
+            && (forall|k:[u8;32]| #[trigger] before.contains_key(k) ==> (keys.contains(k) == (before[k].creator@ == principal@)))
+            && (forall|i:int| 0 <= i < keys.len() ==> before.contains_key(#[trigger] keys[i]) && batch[i] == before[keys[i]])
+    }),
+{
+    let ghost before = entries@;
+    let batch = retire_principal(entries,principal);
+    crate::process_cleanup::reap_batch(batch,cleanup);
+    proof {
+        let keys = choose|ks:Seq<[u8;32]>| ks.no_duplicates() && ks.len() == batch@.len()
+            && (forall|k:[u8;32]| #[trigger] before.contains_key(k) ==> (ks.contains(k) == (before[k].creator@ == principal@)))
+            && (forall|i:int| 0 <= i < ks.len() ==> before.contains_key(#[trigger] ks[i]) && batch@[i] == before[ks[i]]);
+        assert(cleanup.received@ == old(cleanup).received@ + batch@);
+    }
+}
+
+// Graceful daemon shutdown detaches every token, including two different
+// tokens that refer to equal abstract values. The witness binds each callback
+// to a distinct original (token, entry) pair in arbitrary map iteration order.
+fn shutdown_and_reap<T>(entries: &mut HashMap<[u8;32],Entry<T>>, cleanup: &mut Cleanup<Entry<T>>)
+    requires hash_map_inv(old(entries)), obeys_key_model::<[u8;32]>(),
+    ensures final(entries)@ == Map::<[u8;32],Entry<T>>::empty(), ({
+        let before = old(entries)@;
+        let prior = old(cleanup).received@;
+        let after = final(cleanup).received@;
+        exists|order:Seq<([u8;32],Entry<T>)>| order.no_duplicates() && order.to_set() == before.kv_pairs()
+            && after.len() == prior.len() + order.len() && after.take(prior.len() as int) == prior
+            && (forall|i:int| 0 <= i < order.len() ==> after[prior.len()+i] == (#[trigger] order[i]).1)
+    }),
+{
+    let drained = crate::process_cleanup::take_all(entries);
+    crate::process_cleanup::reap_all(drained,cleanup);
+    proof {
+        let prior = old(cleanup).received@;
+        let after = cleanup.received@;
+        let order = choose|order:Seq<([u8;32],Entry<T>)>| order.no_duplicates()
+            && order.to_set() == drained@.kv_pairs() && after == prior + crate::process_cleanup::values(order);
+        assert(after.take(prior.len() as int) =~= prior);
+        assert forall|i:int| 0 <= i < order.len() implies after[prior.len()+i] == (#[trigger] order[i]).1 by {
+            assert(after[prior.len()+i] == crate::process_cleanup::values(order)[i]);
+        }
+    }
+}
 }

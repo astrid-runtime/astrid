@@ -226,6 +226,39 @@ async fn retirement_removes_all_owned_capsules_and_preserves_foreign_entries() {
 }
 
 #[tokio::test]
+async fn graceful_shutdown_detaches_every_token_and_finishes_its_monitor() {
+    let registry = PersistentProcessRegistry::new(tokio::runtime::Handle::current());
+    let mut children = Vec::new();
+    for name in ["alice", "bob"] {
+        let owner = PrincipalId::new(name).unwrap();
+        let (child, stdout, stderr, pid) = spawn_raw("exec sleep 30");
+        let token = registry
+            .spawn(params(&owner, "shared", child, stdout, stderr, pid, 1))
+            .expect("register child");
+        let monitor = registry.lock()[&registry.key_of(&token)]
+            .monitor
+            .abort_handle();
+        assert!(!monitor.is_finished());
+        children.push((owner, token, monitor));
+    }
+    registry.shutdown();
+    registry.shutdown();
+    for (owner, token, monitor) in children {
+        assert!(matches!(
+            registry.status(&token, &owner, "shared"),
+            Err(ErrorCode::NoSuchProcess)
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !monitor.is_finished() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("shutdown finishes the selected child's monitor");
+    }
+}
+
+#[tokio::test]
 async fn concurrent_cap_enforced_and_stop_reaps() {
     // macOS regression: constructing the real Wasmtime engine installs its
     // process-wide trap handler. The registry must still be able to spawn and

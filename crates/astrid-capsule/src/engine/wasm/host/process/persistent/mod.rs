@@ -41,6 +41,7 @@
 //! Possession of another capsule’s token grants no access. Release is idempotent
 //! for an absent entry and refuses a foreign entry.
 
+mod cleanup;
 mod config;
 mod entry;
 mod ids;
@@ -595,18 +596,14 @@ impl PersistentProcessRegistry {
         }
         // Reap (killpg + abort) outside the map lock.
         let n = reaped.len();
-        for entry in reaped {
-            reap_entry(entry);
-        }
+        cleanup::reap_batch(reaped, &mut NativeReaper);
         n
     }
 
     /// Kill + clear every entry (capsule unload / daemon graceful shutdown).
     pub fn shutdown(&self) {
-        let drained: Vec<PersistentEntry> = self.lock().drain().map(|(_, e)| e).collect();
-        for entry in drained {
-            reap_entry(entry);
-        }
+        let drained = cleanup::take_all(&mut self.lock());
+        cleanup::reap_all(drained, &mut NativeReaper);
     }
 
     /// Kill and remove entries owned by one retiring principal only.
@@ -617,9 +614,15 @@ impl PersistentProcessRegistry {
                 entry.creator.as_str().as_bytes(),
             )
         });
-        for entry in removed {
-            reap_entry(entry);
-        }
+        cleanup::reap_batch(removed, &mut NativeReaper);
+    }
+}
+
+struct NativeReaper;
+
+impl cleanup::Reaper<PersistentEntry> for NativeReaper {
+    fn reap(&mut self, entry: PersistentEntry) {
+        reap_entry(entry);
     }
 }
 

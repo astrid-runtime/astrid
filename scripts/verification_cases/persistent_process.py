@@ -1,13 +1,19 @@
 """Caller, target, and token publication guarantees used by persistent process operations."""
 from pathlib import Path
 
-from .common import replace_once
+from .common import edit_function, replace_once
 
 
 def defects():
     persistent = Path("crates/astrid-capsule/src/engine/wasm/host/process/persistent")
     process_trace = Path("verification/hosted_process_selection.rs")
     for file, name, clause, weakened in [
+        ("cleanup", "batch cleanup may skip entries", "ensures final(reaper).calls() == old(reaper).calls() + entries@", "ensures true"),
+        ("cleanup", "shutdown may leave a live slot", "final(entries)@ == Map::<K,T>::empty()", "true"),
+        ("cleanup", "shutdown can detach the wrong map", "drained@ == old(entries)@", "true"),
+        ("cleanup", "shutdown cleanup may omit a registered pair", "&& order.to_set() == drained@.kv_pairs()", "&& true"),
+        ("cleanup", "shutdown may clean a pair twice", "order.no_duplicates() && order.to_set()", "order.to_set()"),
+        ("cleanup", "shutdown loses cleanup arguments", "&& final(reaper).calls() == old(reaper).calls() + values(order)", "&& true"),
         ("retirement", "retirement may omit an owned key", "matches.ensures((&before[k],),keys.contains(k))", "true"),
         ("retirement", "retirement loses the cleanup target", "&& removed[i] == before[keys[i]]", "&& true"),
         ("retirement", "retirement can alter a foreign slot", "&& after == before.remove_keys(keys.to_set())", "&& true"),
@@ -38,6 +44,6 @@ def defects():
     ]:
         yield (
             f"persistent process publication then retirement no longer {name}", process_trace,
-            lambda s, a=clause: replace_once(s, a, "true" if not a.startswith("&&") else "&& true"),
+            lambda s, a=clause: edit_function(s, "retire_principal<T>", a, "true" if not a.startswith("&&") else "&& true"),
             process_trace,
         )
