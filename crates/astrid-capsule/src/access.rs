@@ -721,7 +721,11 @@ mod tests {
             .retain(|method| *method != AuthMethod::Keypair);
         write(&home, "operator", &profile);
         cache.invalidate(&principal);
-        assert!(resolver.resolve_access(Some("operator"), None).is_some());
+        assert!(
+            resolver
+                .resolve_access(Some("operator"), DeviceStamp::default())
+                .is_some()
+        );
         assert!(
             resolver
                 .resolve_access(Some("operator"), stamp(&key))
