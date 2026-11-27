@@ -257,10 +257,20 @@ pub(super) fn recover_index(
         .map(|(id, location)| (*id, *location))
         .collect::<Vec<_>>();
     ordered.sort_by_key(|(_, location)| location.offset);
+    // A valid tail alone cannot account for a missing object in the prefix.
+    // The authoritative scanner resolves any gap, including duplicate frames.
+    let mut covered = 0;
     for (id, location) in ordered {
+        if location.offset != covered {
+            return None;
+        }
+        covered = validation::location_end(&location).ok()?;
         if verify_indexed_location(arena, id, location, scheme, limits).is_err() {
             return None;
         }
+    }
+    if covered != authoritative_arena_len {
+        return None;
     }
     match state.arena_tail {
         Some(location) if verify_indexed_tail(arena, location, limits).is_err() => return None,
