@@ -17,8 +17,8 @@ impl<'a,D> Replacement<'a,D> {
 }
 
 /// Both namespaces require a live parent and reject directory targets before deriving a file key.
-pub(crate) fn prepare<'a,D,P:Copy,E,A,G,K,T>(destination:D, path:P, bytes:&'a [u8],
-    parent:A, directory:G, key:K, is_directory:T) -> (out:Result<Replacement<'a,D>,E>)
+pub(crate) fn prepare<D,P:Copy,E,A,G,K,T>(destination:D, path:P, bytes:&[u8],
+    parent:A, directory:G, key:K, is_directory:T) -> (out:Result<Replacement<'_,D>,E>)
     where A:FnOnce(P)->Result<(),E>, G:FnOnce(P)->Result<bool,E>, K:FnOnce(P)->Result<ContentName,E>, T:FnOnce(P)->E,
     requires parent.requires((path,)),directory.requires((path,)),key.requires((path,)),is_directory.requires((path,)),
     ensures match out {

@@ -31,7 +31,8 @@ impl ContentName {
         },
     {
         if value.is_empty() { return Err(ContentNameError::Empty); }
-        if value.as_str().as_bytes().contains(&0) { return Err(ContentNameError::ContainsNull); }
+        let text = value.as_str();
+        if text.as_bytes().contains(&0) { return Err(ContentNameError::ContainsNull); }
         Ok(Self(value))
     }
 
