@@ -376,4 +376,6 @@ mod peer_selection;
 #[path = "../crates/astrid-capsule/src/engine/mcp_registration.rs"]
 mod mcp_registration;
 use runtime_generation::RuntimeId as RegistryId;
+#[path = "../crates/astrid-capsule/src/engine/mcp_cleanup.rs"]
+mod mcp_cleanup;
 mod hosted_mcp_peer;

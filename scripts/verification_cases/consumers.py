@@ -15,6 +15,21 @@ def consumer_defects():
     yield from workspace_commit.defects()
     yield from file_descriptor.defects()
     yield from retirement.defects()
+    cleanup = Path("crates/astrid-capsule/src/engine/mcp_cleanup.rs")
+    for label, field, replacement in [
+        ("registration target", "final(self).name() == Some(target@)", "true"),
+        ("worker identity", "task.name() == old(self).name()", "true"),
+        ("draining target", "final(self).name() == task.name()", "true"),
+        ("duplicate start", "work.is_some() == ((*old(self)) is Open)", "((*old(self)) is Open) ==> work.is_some()"),
+        ("rejected registration", "!accepted ==> *final(self) == *old(self)", "!accepted ==> true"),
+        ("foreign completion", "completed == ((*old(self)) is Draining", "completed <== ((*old(self)) is Draining"),
+        ("completion state", "completed ==> (*final(self)) is Done", "completed ==> true"),
+    ]:
+        yield (
+            f"MCP cleanup loses {label}", cleanup,
+            lambda s, a=field, b=replacement: replace_once(s, a, b),
+            Path("verification/hosted_mcp_peer.rs"),
+        )
     registration = Path("crates/astrid-capsule/src/engine/mcp_registration.rs")
     for label, field, replacement in [
         ("capsule", "registration(capsule@,", "registration(Seq::empty(),"),
