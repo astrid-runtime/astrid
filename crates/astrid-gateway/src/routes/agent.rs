@@ -460,7 +460,8 @@ pub async fn get_requests(
 /// continuation (deltas + final `response`) streams back over the still-open
 /// `POST /api/agent/prompt` SSE connection — NOT this request.
 ///
-/// The reply is stamped with the authenticated caller, device, request owner and gateway origin. The host waiter
+/// The gateway stamps the reply with the authenticated principal, request owner,
+/// gateway origin and any authenticated device identity. The host waiter
 /// enforces same-principal: a reply whose principal differs from the one the
 /// elicit is being collected for is rejected, so a caller who merely observed
 /// another principal's forwarded `request_id` cannot answer or cancel it.
