@@ -211,6 +211,25 @@ fn batch_membership_yields_to_pending_writers_before_completing() {
 
 #[test]
 fn recovery_observes_one_directory_across_reservations() {
+    struct Observer<'a> {
+        directory: &'a PrincipalDirectory,
+        targets: Vec<PrincipalId>,
+        fail: bool,
+    }
+    impl crate::RetirementSink<PrincipalId> for Observer<'_> {
+        type Error = &'static str;
+
+        fn restore(&mut self, alias: PrincipalId) -> Result<(), Self::Error> {
+            assert!(self.directory.inner.try_write().is_none());
+            self.targets.push(alias);
+            if self.fail {
+                Err("recovery stopped")
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     let directory = PrincipalDirectory::default();
     let first = uid(1);
     let second = uid(2);
@@ -221,11 +240,22 @@ fn recovery_observes_one_directory_across_reservations() {
         serde_json::json!({ first.to_string(): {}, second.to_string(): {} });
     let ownership = serde_json::from_value(stored).unwrap();
 
-    let mut targets = directory.pending_retirement_aliases(&ownership);
-    assert_eq!(targets.next(), Some(alias("first")));
-    assert!(directory.inner.try_write().is_none());
-    assert_eq!(targets.next(), Some(alias("second")));
-    assert_eq!(targets.next(), None);
-    drop(targets);
+    let mut observer = Observer {
+        directory: &directory,
+        targets: Vec::new(),
+        fail: true,
+    };
+    assert_eq!(
+        directory.replay_retirements(&ownership, &mut observer),
+        Err("recovery stopped")
+    );
+    assert_eq!(observer.targets, [alias("first")]);
+    assert!(directory.inner.try_write().is_some());
+    observer.fail = false;
+    observer.targets.clear();
+    directory
+        .replay_retirements(&ownership, &mut observer)
+        .unwrap();
+    assert_eq!(observer.targets, [alias("first"), alias("second")]);
     assert!(directory.inner.try_write().is_some());
 }

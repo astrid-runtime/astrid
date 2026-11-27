@@ -31,6 +31,18 @@ def defects():
             lambda s, a=original, b=changed: replace_once(s, a, b),
             Path("verification/hosted_authority_model.rs"),
         )
+    replay = Path("crates/astrid-storage/src/ownership/recovery.rs")
+    consumer = Path("verification/hosted_retirement_recovery.rs")
+    for name, original, changed, location in [
+        ("skips the retained alias", "if let Some(alias) = first { sink.restore(alias)?; }", "let _ = first;", replay),
+        ("skips the live alias", "if let Some(alias) = second { sink.restore(alias)?; }", "let _ = second;", replay),
+        ("loses the failure result", "final(sink).failure() == (match result { Ok(()) => None, Err(e) => Some(e) })", "true", consumer),
+        ("may omit an unrelated bucket", "else { old(sink).authority(key) },\n{", "else { final(sink).authority(key) },\n{", consumer),
+    ]:
+        yield (
+            f"production replay {name}", replay,
+            lambda s, a=original, b=changed: replace_once(s, a, b), location,
+        )
     cursor = Path("crates/astrid-storage/src/ownership/pending.rs")
     for name, original, changed in [
         ("loses a reservation", "cursor.remaining().contains((&k,&v)) == (map@.get(k) == Some(v)),", "cursor.remaining().contains((&k,&v)) ==> (map@.get(k) == Some(v)),"),
@@ -41,7 +53,7 @@ def defects():
         yield (
             f"recovery cursor {name}", cursor,
             lambda s, a=original, b=changed: replace_once(s, a, b),
-            Path("verification/hosted_retirement_recovery.rs"),
+            replay,
         )
     for name, original, changed in [
         ("loses another grant bucket", "final(grants)@ == old(grants)@.remove(*principal)", "!final(grants)@.contains_key(*principal)"),

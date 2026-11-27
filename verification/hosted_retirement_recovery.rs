@@ -1,96 +1,64 @@
-//! Recover membership from every reservation in the loaded ownership snapshot.
+//! Consume the production recovery driver with the actual fence and grant transitions.
 use std::collections::{BTreeMap, HashMap, HashSet};
 use vstd::prelude::*;
 #[cfg(verus_keep_ghost)]
-use vstd::std_specs::{btree::btree_map_wf, hash::{hash_map_inv,hash_set_inv}, iter::IteratorSpec};
+use vstd::std_specs::{btree::btree_map_wf, hash::{hash_map_inv,hash_set_inv}};
+use crate::recovery::RetirementSink;
 
 type Reservation = crate::pending_deletions::Reservation<u64,u64>;
 
 verus! {
-spec fn names(uid: u64, retained: Option<u64>, directory: Map<u64,u64>, probe: u64) -> bool {
-    retained == Some(probe) || directory.get(uid) == Some(probe)
+struct Stores {
+    capabilities: HashSet<u64>,
+    allowances: HashSet<u64>,
+    grants: HashMap<u64,u64>,
 }
 
-spec fn pending(rows: Seq<(&u64,&Reservation)>, directory: Map<u64,u64>, probe: u64) -> bool {
-    exists|row: (&u64,&Reservation)| #[trigger] rows.contains(row) && names(*row.0,row.1.alias,directory,probe)
+impl RetirementSink<u64> for Stores {
+    type Error = ();
+    #[cfg(verus_keep_ghost)]
+    type Bucket = u64;
+
+    closed spec fn valid(&self) -> bool {
+        hash_set_inv(&self.capabilities) && hash_set_inv(&self.allowances) && hash_map_inv(&self.grants)
+    }
+    closed spec fn failure(&self) -> Option<()> { None }
+    closed spec fn authority(&self,key:u64) -> (bool,bool,Option<u64>) {
+        (self.capabilities@.contains(key),self.allowances@.contains(key),self.grants@.get(key))
+    }
+
+    fn restore(&mut self, key:u64) -> (result: Result<(),()>) {
+        let receipt = crate::principal_fences::restore_capability(&mut self.capabilities,key);
+        crate::principal_fences::restore_allowances(receipt,&mut self.allowances,&mut self.grants);
+        Ok(())
+    }
 }
 
-proof fn split(rows: Seq<(&u64,&Reservation)>, directory: Map<u64,u64>, probe: u64)
-    requires rows.len() > 0,
-    ensures pending(rows,directory,probe) == (names(*rows[0].0,rows[0].1.alias,directory,probe)
-        || pending(rows.drop_first(),directory,probe)),
+fn recover(reservations: &BTreeMap<u64,Reservation>, directory: &HashMap<u64,u64>, stores: &mut Stores)
+    -> (result: Result<(),()>)
+    requires old(stores).valid(), btree_map_wf(reservations), hash_map_inv(directory),
+    ensures result.is_ok(), forall|probe:u64| {
+        let named = exists|uid:u64| #[trigger] reservations@.contains_key(uid) &&
+            (reservations@[uid].alias == Some(probe) || directory@.get(uid) == Some(probe));
+        #[trigger] final(stores).authority(probe) ==
+            if named { (true,true,None) } else { old(stores).authority(probe) }
+    },
 {
-    assert forall|r: (&u64,&Reservation)| #[trigger] rows.contains(r) == (rows[0] == r || rows.drop_first().contains(r)) by {
-        if rows.contains(r) {
-            let i = rows.index_of(r);
-            if i > 0 { assert(rows.drop_first()[i-1] == r); }
-        }
-        if rows.drop_first().contains(r) {
-            let i = rows.drop_first().index_of(r);
-            assert(rows[i+1] == r);
-        }
-    }
-    if pending(rows,directory,probe) {
-        let r = choose|r: (&u64,&Reservation)| rows.contains(r) && names(*r.0,r.1.alias,directory,probe);
-        if r != rows[0] {
-            assert(rows.drop_first().contains(r));
-            assert(pending(rows.drop_first(),directory,probe));
-        }
-    }
-    if pending(rows.drop_first(),directory,probe) {
-        let r = choose|r: (&u64,&Reservation)| rows.drop_first().contains(r) && names(*r.0,r.1.alias,directory,probe);
-        assert(rows.contains(r));
-    }
-    assert(rows.contains(rows[0]));
+    crate::recovery::replay(reservations,directory,stores)
 }
 
-fn recover(reservations: &BTreeMap<u64,Reservation>, directory: &HashMap<u64,u64>,
-    capabilities: &mut HashSet<u64>, allowances: &mut HashSet<u64>, grants: &mut HashMap<u64,u64>, probe: u64)
-    requires hash_map_inv(old(grants)), btree_map_wf(reservations), hash_map_inv(directory),
-        hash_set_inv(old(capabilities)), hash_set_inv(old(allowances)),
-    ensures ({
-        let named = exists|uid:u64| #[trigger] reservations@.contains_key(uid)
-            && names(uid,reservations@[uid].alias,directory@,probe);
-        &&& final(grants)@.get(probe) == if named { None } else { old(grants)@.get(probe) }
-        &&& final(capabilities)@.contains(probe) == (old(capabilities)@.contains(probe) || named)
-        &&& final(allowances)@.contains(probe) == (old(allowances)@.contains(probe) || named)
-    }),
+// Both observations describe the same final state of one invocation.
+fn recover_renamed(reservations: &BTreeMap<u64,Reservation>, directory: &HashMap<u64,u64>,
+    stores: &mut Stores, uid: u64, retained: u64, live: u64)
+    requires old(stores).valid(), btree_map_wf(reservations), hash_map_inv(directory),
+        reservations@.contains_key(uid), reservations@[uid].alias == Some(retained), directory@.get(uid) == Some(live),
+    ensures final(stores).capabilities@.contains(retained), final(stores).capabilities@.contains(live),
+        final(stores).allowances@.contains(retained), final(stores).allowances@.contains(live),
+        !final(stores).grants@.contains_key(retained), !final(stores).grants@.contains_key(live),
 {
-    let mut cursor = crate::pending_deletions::scan(reservations);
-    let ghost initial = cursor.remaining();
-    let ghost named = exists|uid:u64| #[trigger] reservations@.contains_key(uid)
-        && names(uid,reservations@[uid].alias,directory@,probe);
-    assert(pending(initial,directory@,probe) == named) by {
-        if pending(initial,directory@,probe) {
-            let r = choose|r: (&u64,&Reservation)| initial.contains(r) && names(*r.0,r.1.alias,directory@,probe);
-            assert(reservations@.get(*r.0) == Some(*r.1));
-        }
-        if named {
-            let k = choose|k:u64| reservations@.contains_key(k) && names(k,reservations@[k].alias,directory@,probe);
-            assert(initial.contains((&k,&reservations@[k])));
-        }
-    }
-    loop
-        invariant hash_map_inv(grants), hash_map_inv(directory), cursor.decrease().is_some(),
-            named == (exists|uid:u64| #[trigger] reservations@.contains_key(uid) && names(uid,reservations@[uid].alias,directory@,probe)), hash_set_inv(capabilities), hash_set_inv(allowances),
-            (if pending(cursor.remaining(),directory@,probe) { None } else { grants@.get(probe) })
-                == (if named { None } else { old(grants)@.get(probe) }),
-            (capabilities@.contains(probe) || pending(cursor.remaining(),directory@,probe))
-                == (old(capabilities)@.contains(probe) || named),
-            (allowances@.contains(probe) || pending(cursor.remaining(),directory@,probe))
-                == (old(allowances)@.contains(probe) || named),
-        decreases cursor.decrease().unwrap(),
-    {
-        let ghost prior = cursor.remaining();
-        let row = crate::pending_deletions::next(&mut cursor);
-        let Some((uid,alias)) = row else {
-            assert(prior.len() == 0);
-            assert(!pending(prior,directory@,probe));
-            return;
-        };
-        proof { split(prior,directory@,probe); }
-        crate::model::recovered_fence_membership(directory,uid,alias.copied(),capabilities,allowances,grants,probe);
-    }
+    let _ = recover(reservations,directory,stores);
+    assert(stores.authority(retained) == (true,true,None));
+    assert(stores.authority(live) == (true,true,None));
 }
 }
 

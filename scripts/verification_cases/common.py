@@ -64,6 +64,7 @@ INPUTS = [
     Path("verification/hosted_tcp_destinations.rs"),
     Path("crates/astrid-core/src/principal/retirement.rs"),
     Path("crates/astrid-storage/src/ownership/pending.rs"),
+    Path("crates/astrid-storage/src/ownership/recovery.rs"),
     Path("verification/hosted_retirement_recovery.rs"),
     Path("verification/hosted_runtime_residency.rs"),
     Path("crates/astrid-kernel/src/runtime_residency.rs"),

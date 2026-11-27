@@ -20,6 +20,9 @@ use crate::{KvStore, PrincipalDirectory, ScopedKvStore, StorageError};
 mod deletion;
 mod derived;
 mod pending;
+mod recovery;
+use crate::principal_directory::recovery_aliases;
+pub use recovery::RetirementSink;
 mod provision;
 mod resources;
 mod shared_snapshot;
@@ -86,22 +89,6 @@ pub struct OwnershipSnapshot {
 
 type PrincipalDeletionReservation = pending::Reservation<PrincipalId, FleetUid>;
 
-struct PendingDeletions<'a>(
-    std::collections::btree_map::Iter<'a, PrincipalUid, PrincipalDeletionReservation>,
-);
-
-impl<'a> Iterator for PendingDeletions<'a> {
-    type Item = (PrincipalUid, Option<&'a PrincipalId>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        pending::next(&mut self.0)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.0.size_hint()
-    }
-}
-
 impl Default for OwnershipSnapshot {
     fn default() -> Self {
         Self {
@@ -142,12 +129,12 @@ impl OwnershipSnapshot {
         self.principal_deletions.contains_key(&uid)
     }
 
-    /// Retirements that still reserve their principal generation at this
-    /// snapshot. The retained alias can survive deletion of the identity.
-    pub fn pending_principal_deletions(
+    pub(crate) fn replay_retirements<S: RetirementSink<PrincipalId>>(
         &self,
-    ) -> impl Iterator<Item = (PrincipalUid, Option<&PrincipalId>)> {
-        PendingDeletions(pending::scan(&self.principal_deletions))
+        directory: &std::collections::HashMap<PrincipalUid, PrincipalId>,
+        sink: &mut S,
+    ) -> Result<(), S::Error> {
+        recovery::replay(&self.principal_deletions, directory, sink)
     }
 
     /// Iterate over users in stable UID order.

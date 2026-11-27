@@ -56,7 +56,7 @@ verus! {
 broadcast use vstd::std_specs::hash::group_hash_axioms;
 
 /// Return the retained name and any distinct live name of this generation.
-pub(super) fn recovery_aliases<U: Eq + Hash, A: Eq + Clone>(directory: &HashMap<U,A>, uid: &U, retained: Option<A>)
+pub(crate) fn recovery_aliases<U: Eq + Hash, A: Eq + Clone>(directory: &HashMap<U,A>, uid: &U, retained: Option<A>)
     -> (targets: [Option<A>;2])
     requires hash_map_inv(directory), obeys_key_model::<U>(), obeys_concrete_eq::<U>(),
         obeys_concrete_eq::<A>(), obeys_clone_eq::<A>(),

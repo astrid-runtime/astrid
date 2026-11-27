@@ -2,9 +2,24 @@
 
 use std::sync::Arc;
 
-use astrid_approval::AllowanceStore;
+use astrid_approval::{AllowanceStore, ApprovalError};
 use astrid_capabilities::CapabilityStore;
-use astrid_storage::{OwnershipSnapshot, PrincipalDirectory};
+use astrid_core::PrincipalId;
+use astrid_storage::{OwnershipSnapshot, PrincipalDirectory, RetirementSink};
+
+struct RecoveringStores {
+    capabilities: CapabilityStore,
+    allowances: AllowanceStore,
+}
+
+impl RetirementSink<PrincipalId> for RecoveringStores {
+    type Error = ApprovalError;
+
+    fn restore(&mut self, alias: PrincipalId) -> Result<(), Self::Error> {
+        let fence = self.capabilities.restore_principal_retirement(alias);
+        self.allowances.restore_principal_retirement(fence)
+    }
+}
 
 /// Install local retirement fences before startup exposes either store.
 /// The durable ownership reservation remains the authority to resume or
@@ -12,14 +27,15 @@ use astrid_storage::{OwnershipSnapshot, PrincipalDirectory};
 pub(super) fn restore_retirement_fences(
     ownership: &OwnershipSnapshot,
     principals: &PrincipalDirectory,
-    mut capabilities: CapabilityStore,
-    mut allowances: AllowanceStore,
+    capabilities: CapabilityStore,
+    allowances: AllowanceStore,
 ) -> std::io::Result<(Arc<CapabilityStore>, Arc<AllowanceStore>)> {
-    for alias in principals.pending_retirement_aliases(ownership) {
-        let fence = capabilities.restore_principal_retirement(alias);
-        allowances
-            .restore_principal_retirement(fence)
-            .map_err(std::io::Error::other)?;
-    }
-    Ok((Arc::new(capabilities), Arc::new(allowances)))
+    let mut stores = RecoveringStores {
+        capabilities,
+        allowances,
+    };
+    principals
+        .replay_retirements(ownership, &mut stores)
+        .map_err(std::io::Error::other)?;
+    Ok((Arc::new(stores.capabilities), Arc::new(stores.allowances)))
 }

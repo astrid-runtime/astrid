@@ -124,6 +124,8 @@ Previously admitted operations can finish. Single-use consumption uses a
 durable insert-if-absent, so retry after an ambiguous or canceled write cannot
 win a second CAS.
 
+Before sharing either authority store, hosted startup replays the loaded deletion reservations under one principal-directory read guard. Verus checks this production loop. For every alias, successful recovery preserves unrelated authority and fences the retained and live names of each reservation in both stores while clearing their allowance grants. The proof starts with the decoded ownership map and a sink whose store updates have the specified effects. The two native store adapters and the provenance of the decoded state remain assumptions. See the [hosted security contract](hosted-security-contract.md#restoring-retirement-fences-before-serving).
+
 Startup loads both marker namespaces before exposing the store. Verus checks the two-element recovery schedule, the exact namespace used for each marker kind, and preservation of the supplied token key when constructing the write address. UUID formatting and parsing and complete enumeration by the backend remain assumptions. It also uses
 the authoritative ownership snapshot to restore capability and allowance
 fences for pending principal deletions. The authenticated kernel and admin

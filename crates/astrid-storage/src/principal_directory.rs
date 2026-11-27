@@ -10,6 +10,7 @@ use parking_lot::{RwLock, RwLockReadGuard};
 use crate::error::{StorageError, StorageResult};
 
 mod binding;
+pub(crate) use binding::recovery_aliases;
 
 /// Live, capability-bound mapping between mutable principal aliases and
 /// stable durable UIDs.
@@ -207,22 +208,18 @@ impl PrincipalDirectory {
             })
     }
 
-    /// Visit the retirement targets of a loaded ownership snapshot under one directory read guard.
-    /// Consume synchronously at startup. Directory writers wait until the iterator is dropped.
-    /// The consumer must not re-enter the directory.
-    #[must_use = "consume the aliases to restore their retirement fences"]
-    pub fn pending_retirement_aliases<'a>(
-        &'a self,
-        ownership: &'a crate::OwnershipSnapshot,
-    ) -> impl Iterator<Item = PrincipalId> + 'a {
-        let state = self.inner.read();
-        ownership
-            .pending_principal_deletions()
-            .flat_map(move |(uid, retained)| {
-                binding::recovery_aliases(&state.principals, &uid, retained.cloned())
-                    .into_iter()
-                    .flatten()
-            })
+    /// Replay the ownership snapshot under one stable principal-directory read guard.
+    /// The sink runs synchronously and must not re-enter the directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error from the sink and stops recovery.
+    pub fn replay_retirements<S: crate::RetirementSink<PrincipalId>>(
+        &self,
+        ownership: &crate::OwnershipSnapshot,
+        sink: &mut S,
+    ) -> Result<(), S::Error> {
+        ownership.replay_retirements(&self.inner.read().principals, sink)
     }
 
     /// Whether a durable UID currently names an admitted live principal.
