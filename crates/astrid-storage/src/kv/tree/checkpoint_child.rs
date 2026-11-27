@@ -11,6 +11,27 @@ pub(super) enum ChildError<E> {
     Key(key::KeyError), InvalidKey(E), Totals(ReadError), Empty, Reference(edge::Rejection),
 }
 
+pub(super) open spec fn failure<E,F:FnOnce(&[u8])->Result<(),E>>(
+    bytes:Seq<u8>,refs:Seq<ObjectReference>,index:usize,start:int,end:int,validate:F,reason:ChildError<E>,
+) -> bool {
+        let summary = start + 4 + key::length(bytes,start) as int;
+        &&& (!(reason is Key) && !(reason is InvalidKey)) ==> exists|field:&[u8],r:Result<(),E>|
+            field@ == bytes.subrange(start+4,summary) && r is Ok && #[trigger] validate.ensures((field,),r)
+        &&& reason is Reference ==> exists|t:NodeTotals| t.entries > 0 && crate::storage_fields::at(bytes,summary,#[trigger] t.wire())
+        &&& match reason {
+            ChildError::Key(e) => key::failure(bytes,start,end,e),
+            ChildError::InvalidKey(e) => summary <= bytes.len() && end == summary && exists|field:&[u8],r:Result<(),E>|
+                field@ == bytes.subrange(start+4,summary) && r == Err(e) && #[trigger] validate.ensures((field,),r),
+            ChildError::Totals(e) => summary <= bytes.len() && super::checkpoint_totals::failure(bytes,summary,end,e),
+            ChildError::Empty => end == summary+24 && exists|t:NodeTotals| t.entries == 0 && crate::storage_fields::at(bytes,summary,#[trigger] t.wire()),
+            ChildError::Reference(e) => end == summary+24 && if index >= refs.len() { e == edge::Rejection::Missing }
+                else if index > u16::MAX { e == edge::Rejection::IndexOverflow } else {
+                    let row = refs[index as int].fields();
+                    e == edge::Rejection::Mismatch && (row.0 != edge::wire(edge::Relation::Child,index) || !(row.2 is Owns))
+                },
+        }
+}
+
 pub(super) fn read<E,F:FnOnce(&[u8])->Result<(),E>>(
     bytes: &[u8], cursor: &mut usize, refs: &[ObjectReference], index: usize, validate: F,
 ) -> (out: Result<(Vec<u8>,ObjectId,NodeTotals),ChildError<E>>)
@@ -26,25 +47,7 @@ pub(super) fn read<E,F:FnOnce(&[u8])->Result<(),E>>(
         &&& index < refs.len() && index <= u16::MAX
         &&& refs@[index as int].fields() == (edge::wire(edge::Relation::Child,index),row.1,super::ReferenceKind::Owns)
     }),
-    out matches Err(reason) ==> ({
-        let start = *old(cursor) as int;
-        let summary = start + 4 + key::length(bytes@,start) as int;
-        &&& (!(reason is Key) && !(reason is InvalidKey)) ==> exists|field:&[u8],r:Result<(),E>|
-            field@ == bytes@.subrange(start+4,summary) && r is Ok && #[trigger] validate.ensures((field,),r)
-        &&& reason is Reference ==> exists|t:NodeTotals| t.entries > 0 && crate::storage_fields::at(bytes@,summary,#[trigger] t.wire())
-        &&& match reason {
-            ChildError::Key(e) => key::failure(bytes@,start,*final(cursor) as int,e),
-            ChildError::InvalidKey(e) => summary <= bytes.len() && *final(cursor) as int == summary && exists|field:&[u8],r:Result<(),E>|
-                field@ == bytes@.subrange(start+4,summary) && r == Err(e) && #[trigger] validate.ensures((field,),r),
-            ChildError::Totals(e) => summary <= bytes.len() && super::checkpoint_totals::failure(bytes@,summary,*final(cursor) as int,e),
-            ChildError::Empty => *final(cursor) as int == summary+24 && exists|t:NodeTotals| t.entries == 0 && crate::storage_fields::at(bytes@,summary,#[trigger] t.wire()),
-            ChildError::Reference(e) => *final(cursor) as int == summary+24 && if index >= refs.len() { e == edge::Rejection::Missing }
-                else if index > u16::MAX { e == edge::Rejection::IndexOverflow } else {
-                    let row = refs@[index as int].fields();
-                    e == edge::Rejection::Mismatch && (row.0 != edge::wire(edge::Relation::Child,index) || !(row.2 is Owns))
-                },
-        }
-    }),
+    out matches Err(reason) ==> failure(bytes@,refs@,index,*old(cursor) as int,*final(cursor) as int,validate,reason),
 {
     let ghost start = *cursor as int;
     let field = match key::read(bytes,cursor) {

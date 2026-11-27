@@ -308,6 +308,10 @@ fn decode_leaf(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
 }
 
 fn decode_branch(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
+    use super::checkpoint_branch::{self, RowsError};
+    use super::checkpoint_child::ChildError;
+    use super::checkpoint_key_field::KeyError;
+
     let mut cursor = Cursor::new(id, record.canonical_bytes());
     cursor.require(BRANCH_MAGIC)?;
     let level = cursor.u16()?;
@@ -320,39 +324,28 @@ fn decode_branch(id: ObjectId, record: &ObjectRecord) -> StorageResult<Node> {
     {
         return Err(invalid(id, "invalid KV branch header"));
     }
-    let (cursor, children) = super::checkpoint_page::children(
+    let (end, children) = checkpoint_branch::read(
+        cursor.bytes,
+        record.references(),
         level,
         count,
-        cursor,
-        |mut cursor, index| {
-            use super::checkpoint_child::{self, ChildError};
-            use super::checkpoint_key_field::KeyError;
-
-            let (lower_bound, object, child_totals) = checkpoint_child::read(
-                cursor.bytes,
-                &mut cursor.offset,
-                record.references(),
-                index,
-                |field| validate_composite_key(id, field),
-            )
-            .map_err(|reason| match reason {
-                ChildError::Key(KeyError::Field(e)) | ChildError::Totals(e) => {
-                    page_read_error(id, e)
-                },
-                ChildError::Key(KeyError::Length) => {
-                    invalid(id, "persistent KV length is too large")
-                },
-                ChildError::InvalidKey(e) => e,
-                ChildError::Empty => invalid(id, "empty KV branch child"),
-                ChildError::Reference(Rejection::IndexOverflow) => arithmetic_overflow(),
-                ChildError::Reference(Rejection::Missing | Rejection::Mismatch) => {
-                    invalid(id, "invalid KV branch child reference")
-                },
-            })?;
-            Ok((cursor, lower_bound, object, child_totals))
+        cursor.offset,
+        |field| validate_composite_key(id, field),
+    )
+    .map_err(|(_, reason)| match reason {
+        RowsError::Level => invalid(id, "invalid KV branch level"),
+        RowsError::Child(reason) => match reason {
+            ChildError::Key(KeyError::Field(e)) | ChildError::Totals(e) => page_read_error(id, e),
+            ChildError::Key(KeyError::Length) => invalid(id, "persistent KV length is too large"),
+            ChildError::InvalidKey(e) => e,
+            ChildError::Empty => invalid(id, "empty KV branch child"),
+            ChildError::Reference(Rejection::IndexOverflow) => arithmetic_overflow(),
+            ChildError::Reference(Rejection::Missing | Rejection::Mismatch) => {
+                invalid(id, "invalid KV branch child reference")
+            },
         },
-        || invalid(id, "invalid KV branch level"),
-    )?;
+    })?;
+    cursor.offset = end;
     cursor.done()?;
     if children
         .windows(2)
