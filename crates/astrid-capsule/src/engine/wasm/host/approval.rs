@@ -520,15 +520,19 @@ impl approval::Host for HostState {
                         IpcPayload::ApprovalResponse {
                             decision, reason, ..
                         } => {
-                            let _principal = self
-                                .begin_host_operation()
-                                .map_err(|()| ErrorCode::StoreUnavailable)?;
-                            let devices = consent_reply::admit(
-                                self.begin_device_operation(),
-                                self.begin_message_device_operation(message),
+                            let authority = consent_reply::admit(
+                                self.begin_host_operation(),
+                                || self.begin_device_operation(),
+                                || self.begin_message_device_operation(message),
                             )
-                            .ok_or(ErrorCode::StoreUnavailable)?;
-                            let outcome = devices
+                            .ok_or_else(|| {
+                                audit.denied(
+                                    "authority_unavailable",
+                                    "could not re-admit the approval reply",
+                                );
+                                ErrorCode::StoreUnavailable
+                            })?;
+                            let outcome = authority
                                 .apply(
                                     decision.as_bytes(),
                                     &principal,

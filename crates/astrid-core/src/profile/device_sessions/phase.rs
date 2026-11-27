@@ -132,7 +132,7 @@ pub(super) closed spec fn target<S>(entry: Entry<S>, owner: &str, key: &str) -> 
     entry.owner@ == owner@ && entry.phase.bound() == Some(key@)
 }
 
-pub(super) closed spec fn updated<S>(before: Entry<S>, after: Entry<S>, owner: &str, key: &str) -> bool {
+pub(super) open spec fn updated<S>(before: Entry<S>, after: Entry<S>, owner: &str, key: &str) -> bool {
     &&& before.owner == after.owner
     &&& before.signal == after.signal
     &&& after.phase.consistent()

@@ -77,3 +77,73 @@ async fn replacement_registration_cannot_authorize_queued_command_grant() {
         }
     }
 }
+
+#[tokio::test]
+async fn retirement_during_reply_lookup_rejects_an_unchanged_profile_record() {
+    use astrid_core::profile::device_sessions::{DeviceSessionError, DeviceSessions};
+    let key = DeviceKey::new("c".repeat(64), DeviceScope::Full, None, 0);
+    let mut profile = PrincipalProfile::default();
+    profile.auth.methods.push(AuthMethod::Keypair);
+    profile.add_device(key.clone());
+    let principal = PrincipalId::default();
+    let registry = DeviceSessions::default();
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        for retire in [false, true] {
+            let bound = registry.bind_current(
+                &principal,
+                DeviceKeyId::new(key.key_id.clone()).unwrap(),
+                |owner, fingerprint| {
+                    let live = profile
+                        .active_registration(fingerprint, key.registration_id.map(Into::into))
+                        .unwrap();
+                    if retire {
+                        runtime
+                            .block_on(registry.retire(owner, fingerprint))
+                            .unwrap();
+                    }
+                    Ok(live.registration_id)
+                },
+            );
+            assert_eq!(matches!(bound, Err(DeviceSessionError::Retired)), retire);
+            assert_eq!(
+                consent_reply::admit(Ok(()), || Ok(()), || bound.map_err(|_| ())).is_some(),
+                !retire
+            );
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn principal_retirement_during_approval_prevents_persistent_grant() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = persistent_test_state(dir.path());
+    let owner = install_request_owner(&mut state);
+    let principal = state.effective_principal();
+    let tracker = std::sync::Arc::new(crate::engine::wasm::PrincipalInvocationTracker::default());
+    state.principal_invocations = Some(tracker.clone());
+    let bus = state.event_bus.clone();
+    let requests = bus.subscribe_topic(Topic::approval_request().as_str());
+    let task = tokio::task::spawn_blocking(move || {
+        approval::Host::request_approval(
+            &mut state,
+            approval_request("git push", "git push origin main"),
+        )
+    });
+    let (id, _, _) = await_approval_request(requests).await;
+    tracker.retire(&principal);
+    bus.publish(approval_response_event(
+        &id,
+        Some(principal.as_str()),
+        Some(owner),
+        "approve_always",
+    ));
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(ErrorCode::StoreUnavailable)
+    ));
+    let fresh = persistent_test_state(dir.path());
+    assert!(!check_persisted_allowance(&fresh, &principal, "git push origin main").unwrap());
+}

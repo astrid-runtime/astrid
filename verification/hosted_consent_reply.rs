@@ -51,39 +51,41 @@ impl<'a> Writer<&'a [u8],&'a [u8],&'a [u8]> for Profile<'a> {
 }
 
 fn answer<'a>(principal:&'a [u8],owner:u128,stamped:Option<&[u8]>,stamped_owner:Option<u128>,wire:&[u8],
-    caller:Result<Option<u128>,()>,responder:Result<Option<u128>,()>,
+    owner_guard:Result<(),()>,caller:Result<Option<u128>,()>,responder:Result<Option<u128>,()>,
     action:&'a [u8],target:Result<Destination<&'a [u8]>,Error>,profile:&mut Profile<'a>)
     -> (out:Option<Result<Decision,Error>>)
     ensures ({
         let matched = stamped matches Some(p) && p@ == principal@ && stamped_owner == Some(owner);
         let decision = consent_reply::scope(wire@);
         &&& final(profile).calls@ == match target {
-            Ok(d) if matched && caller.is_ok() && responder.is_ok() && decision == Decision::Always => old(profile).calls@.push((principal,action,d)),
+            Ok(d) if matched && owner_guard.is_ok() && caller.is_ok() && responder.is_ok() && decision == Decision::Always => old(profile).calls@.push((principal,action,d)),
             _ => old(profile).calls@,
         }
-        &&& out == if !matched {None} else if caller.is_err() || responder.is_err() {Some(Err(Error::Retired))} else if decision != Decision::Always {Some(Ok(decision))}
+        &&& out == if !matched {None} else if owner_guard.is_err() || caller.is_err() || responder.is_err() {Some(Err(Error::Retired))} else if decision != Decision::Always {Some(Ok(decision))}
             else {Some(match target {Err(e) => Err(e),Ok(d) => match old(profile).result(principal,action,d) {
                 Ok(()) => Ok(Decision::Always),Err(e) => Err(e)
             }})}
     }),
 {
     if !consent_identity::matches(principal,owner,stamped,stamped_owner) {return None;}
-    let Some(held) = consent_reply::admit(caller,responder) else {return Some(Err(Error::Retired));};
-    assert(held.guards() == (caller.unwrap(),responder.unwrap()));
+    let Some(held) = consent_reply::admit(owner_guard,
+        || -> (r:Result<Option<u128>,()>) ensures r == caller { caller },
+        || -> (r:Result<Option<u128>,()>) ensures r == responder { responder }) else {return Some(Err(Error::Retired));};
+    assert(held.guards() == (owner_guard.unwrap(),caller.unwrap(),responder.unwrap()));
     Some(held.apply(wire,principal,action,target,profile))
 }
 
-/// Persistent write trace for two signed envelopes. Registry binding is a
-/// premise per envelope; profile eligibility is computed by the production selector.
+/// Persistent write trace for two signed envelopes. The model executes registry transitions and
+/// computes profile eligibility independently for both envelope observations.
 fn signed_answer<'a>(
     principal:&'a [u8], owner:u128, stamped:Option<&[u8]>, stamped_owner:Option<u128>,
-    caller:&crate::hosted_device_profile::SignedLookup,
+    owner_guard:Result<(),()>,caller:&crate::hosted_device_profile::SignedLookup,
     responder:&crate::hosted_device_profile::SignedLookup, wire:&[u8],
     action:&'a [u8], target:Result<Destination<&'a [u8]>,Error>, profile:&mut Profile<'a>,
 ) -> (out:Option<Result<Decision,Error>>)
     ensures ({
         let matched = stamped matches Some(p) && p@ == principal@ && stamped_owner == Some(owner);
-        let live = caller.permitted() && responder.permitted();
+        let live = owner_guard.is_ok() && caller.permitted() && responder.permitted();
         let decision = consent_reply::scope(wire@);
         &&& final(profile).calls@ == match target {
             Ok(d) if matched && live && decision == Decision::Always =>
@@ -100,7 +102,7 @@ fn signed_answer<'a>(
     }),
 {
     if !consent_identity::matches(principal,owner,stamped,stamped_owner) {return None;}
-    answer(principal,owner,stamped,stamped_owner,wire,caller.admission(),responder.admission(),
+    answer(principal,owner,stamped,stamped_owner,wire,owner_guard,caller.admission(),responder.admission(),
         action,target,profile)
 }
 

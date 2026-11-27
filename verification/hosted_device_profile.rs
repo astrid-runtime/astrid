@@ -1,5 +1,6 @@
 //! Read the profile admission contract as an exact predicate on live rows.
 use crate::device_registration::{self, observed, unique_at};
+use crate::device_session_phase::{self as registry, Binding, Entry, Phase};
 use vstd::prelude::*;
 
 verus! {
@@ -49,16 +50,51 @@ fn resolve<'a>(enabled:bool, keypair:bool,rows:&'a [Registration],key:&str,expec
     result
 }
 
+spec fn fenced(owner:&str,key:&str,retire:Option<(&str,&str)>) -> bool {
+    retire matches Some((who,which)) && who@ == owner@ && which@ == key@
+}
+
+fn same_channel(a:&u64,b:&u64) -> (same:bool)
+    ensures same == (*a == *b),
+{ *a == *b }
+
+/// Append one fresh challenge to a consistent registry. Other channels may
+/// already be serving or pending for this principal or any other principal.
+fn bind_after_lookup(mut entries:Vec<Entry<u64>>, channel:u64, owner:&str, key:&str,
+    retire:Option<(&str,&str)>) -> (accepted:bool)
+    requires forall|i:int| 0 <= i < entries.len() ==> (#[trigger] entries@[i]).phase.consistent()
+        && entries@[i].signal != channel,
+    ensures accepted == !fenced(owner,key,retire),
+{
+    let ghost n = entries@.len() as int;
+    entries.push(Entry { owner:owner.to_string(), phase:Phase::challenge(), signal:channel });
+    let ghost before = entries@;
+    if let Some((who,which)) = retire {
+        let _drains = registry::retire_entries(entries.as_mut_slice(),who,which);
+        assert(registry::updated(before[n],entries@[n],who,which));
+    }
+    assert(entries@[n].phase.excludes(key@) == fenced(owner,key,retire));
+    assert forall|j:int| 0 <= j < n implies (#[trigger] entries@[j]).signal != channel by {
+        if let Some((who,which)) = retire {
+            assert(registry::updated(before[j],entries@[j],who,which));
+        }
+    }
+    let ghost prior = entries@;
+    let outcome = registry::bind_registered(entries.as_mut_slice(),&channel,key.to_string(),same_channel);
+    assert forall|i:int| 0 <= i < prior.len() && prior[i].signal == channel implies i == n by {};
+    match outcome {Binding::Bound => true, _ => false}
+}
+
 /// One signed envelope and the profile observed when re-entering its authority.
 /// The two sides of a reply can observe different snapshots.
 pub(super) struct SignedLookup<'a> {
     enabled:bool, keypair:bool, rows:&'a [Registration], fingerprint:&'a str,
-    generation:Option<u128>, registry_accepts:bool,
+    generation:Option<u128>, principal:&'a str, retirement:Option<(&'a str,&'a str)>,
 }
 
 impl SignedLookup<'_> {
     pub(super) closed spec fn permitted(&self) -> bool {
-        self.enabled && self.keypair && self.registry_accepts
+        self.enabled && self.keypair && !fenced(self.principal,self.fingerprint,self.retirement)
             && exists|i:int| eligible(self.rows@,self.fingerprint,self.generation,i)
     }
 
@@ -66,7 +102,7 @@ impl SignedLookup<'_> {
         ensures r.is_ok() == self.permitted(),
     {
         if resolve(self.enabled,self.keypair,self.rows,self.fingerprint,self.generation).is_some()
-            && self.registry_accepts { Ok(self.generation) } else { Err(()) }
+            && bind_after_lookup(Vec::new(),0,self.principal,self.fingerprint,self.retirement) { Ok(self.generation) } else { Err(()) }
     }
 }
 

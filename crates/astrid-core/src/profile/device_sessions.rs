@@ -61,6 +61,26 @@ impl DeviceSessions {
         })
     }
 
+    /// Register the challenge before resolving the current profile, then bind the
+    /// selected key under the same challenge. A concurrent removal can fence
+    /// the pending challenge even when the profile lookup still sees that key.
+    ///
+    /// # Errors
+    /// Returns the lookup error, a registry failure, or retirement during lookup.
+    pub fn bind_current(
+        &self,
+        principal: &PrincipalId,
+        key: DeviceKeyId,
+        resolve: impl FnOnce(
+            &PrincipalId,
+            &DeviceKeyId,
+        ) -> Result<Option<DeviceRegistrationId>, DeviceSessionError>,
+    ) -> Result<DeviceSession, DeviceSessionError> {
+        let challenge = self.challenge(principal.clone())?;
+        let generation = resolve(principal, &key)?;
+        challenge.bind(key, generation)
+    }
+
     /// After durable removal, invalidate outstanding challenges for this key
     /// and wait until every matching admitted connection stops serving.
     ///

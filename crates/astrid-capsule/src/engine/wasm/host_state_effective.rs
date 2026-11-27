@@ -56,18 +56,21 @@ impl HostState {
         key: astrid_core::profile::DeviceKeyId,
         registration: Option<uuid::Uuid>,
     ) -> Result<astrid_core::profile::device_sessions::DeviceSession, ()> {
-        let challenge = self
-            .device_sessions
-            .challenge(principal.clone())
-            .map_err(|_| ())?;
-        let profile = self
-            .profile_cache
-            .as_ref()
-            .ok_or(())?
-            .resolve(principal)
-            .map_err(|_| ())?;
-        let record = profile.active_registration(&key, registration).ok_or(())?;
-        challenge.bind(key, record.registration_id).map_err(|_| ())
+        use astrid_core::profile::device_sessions::DeviceSessionError;
+        self.device_sessions
+            .bind_current(principal, key, |owner, fingerprint| {
+                let profile = self
+                    .profile_cache
+                    .as_ref()
+                    .ok_or(DeviceSessionError::Unavailable)?
+                    .resolve(owner)
+                    .map_err(|_| DeviceSessionError::Unavailable)?;
+                let record = profile
+                    .active_registration(fingerprint, registration)
+                    .ok_or(DeviceSessionError::Unavailable)?;
+                Ok(record.registration_id)
+            })
+            .map_err(|_| ())
     }
 
     /// Return the effective KV store for the current invocation.

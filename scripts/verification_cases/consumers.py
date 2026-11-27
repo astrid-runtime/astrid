@@ -12,8 +12,8 @@ def consumer_defects():
     reply = Path("crates/astrid-capsule/src/engine/wasm/host/consent_reply.rs")
     trace = Path("verification/hosted_consent_reply.rs")
     for name, original, changed, target in [
-        ("loses retirement rejection", "_ => held.is_none()", "_ => true", trace),
-        ("drops live device admission", "held matches Some(h) && h.guards() == (c,s)", "true", trace),
+        ("loses retirement rejection", "Err(()) => held.is_none(),\n        Ok(p)", "Err(()) => true,\n        Ok(p)", trace),
+        ("drops live device admission", "held matches Some(h) && h.guards() == (p,c,s)", "true", trace),
         ("grants unknown decisions", "else {Decision::Deny}\n}\n\n/// Hosted", "else {Decision::Once}\n}\n\n/// Hosted", reply),
         ("skips persistent publication", "save_at(p,a,destination,writer)?;", "let _ = destination;", reply),
         ("reports the wrong scope", "Ok(decision)\n}", "Ok(Decision::Always)\n}", reply),
@@ -43,12 +43,21 @@ def consumer_defects():
         )
     for name, original, changed, expected_file in [
         ("loses signed lookup rejection", "ensures r.is_ok() == self.permitted()", "ensures true", trace),
-        ("ignores a retiring registry", "&& self.registry_accepts { Ok(self.generation)", "{ Ok(self.generation)", profile_trace),
+        ("ignores a retiring registry", "&& bind_after_lookup(Vec::new(),0,self.principal,self.fingerprint,self.retirement) { Ok(self.generation)", "{ Ok(self.generation)", profile_trace),
     ]:
         yield (
             f"device profile {name}", profile_trace,
             lambda s, a=original, b=changed: replace_once(s, a, b),
             expected_file,
+        )
+    for name, original, changed, source, expected_file in [
+        ("ignores rejected principal admission", "wire,owner_guard,caller.admission()", "wire,Ok(()),caller.admission()", trace, trace),
+        ("retires an unrelated owner", "entries.as_mut_slice(),who,which", "entries.as_mut_slice(),key,which", profile_trace, profile_trace),
+        ("ignores the observed retirement", "self.fingerprint,self.retirement) { Ok(self.generation)", "self.fingerprint,None) { Ok(self.generation)", profile_trace, profile_trace),
+    ]:
+        yield (
+            f"approval registry {name}", source,
+            lambda s, a=original, b=changed: replace_once(s, a, b), expected_file,
         )
     copies = Path("crates/astrid-storage/src/engine/durable/format/duplicates.rs")
     copies_trace = Path("verification/hosted_duplicate_recovery.rs")
