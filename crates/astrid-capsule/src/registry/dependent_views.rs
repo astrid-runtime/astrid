@@ -6,8 +6,8 @@ use vstd::prelude::*;
 use vstd::{
     laws_eq::obeys_concrete_eq,
     pervasive::obeys_clone_eq,
-    std_specs::iter::IteratorSpec,
     std_specs::hash::{hash_map_inv, obeys_key_model},
+    std_specs::iter::IteratorSpec,
 };
 
 type Id<K, A> = RuntimeId<K, A, RuntimeScope>;
