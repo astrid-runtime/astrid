@@ -49,13 +49,13 @@ mod config;
 mod entry;
 mod ids;
 mod publication;
-#[cfg(unix)]
 mod reap;
 #[cfg(test)]
 mod registry_tests;
 mod retirement;
 mod ring;
 mod selection;
+#[cfg(unix)]
 mod signal_target;
 pub(super) use admission::admit_and_prepare;
 use selection::Selection;
