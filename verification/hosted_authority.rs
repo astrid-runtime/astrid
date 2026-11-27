@@ -411,6 +411,10 @@ mod mcp_registration;
 use runtime_generation::RuntimeId as RegistryId;
 #[path = "../crates/astrid-capsule/src/engine/mcp_cleanup.rs"]
 mod mcp_cleanup;
+#[path = "../crates/astrid-capsule/src/engine/mcp/network.rs"]
+mod capsule_stdio_network;
+#[path = "../crates/astrid-mcp/src/server/stdio_policy.rs"]
+mod stdio_policy;
 mod hosted_mcp_peer;
 #[path = "../crates/astrid-cli/src/commands/mcp/mrtr_context.rs"]
 mod mrtr_context;

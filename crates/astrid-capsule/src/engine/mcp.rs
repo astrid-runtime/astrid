@@ -1,3 +1,5 @@
+mod network;
+
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -82,6 +84,11 @@ impl McpHostEngine {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn prepared_config(&self) -> Option<&astrid_mcp::ServerConfig> {
+        self.pending_config.as_ref()
+    }
+
     #[must_use]
     pub(crate) fn with_runtime_id(
         mut self,
@@ -121,13 +128,14 @@ impl ExecutionEngine for McpHostEngine {
 
         // Native process sandboxes expose an on/off network switch. A
         // destination grant must never be widened to that switch.
-        if !self.manifest.capabilities.net.is_empty()
-            || !self.manifest.capabilities.net_connect.is_empty()
-        {
+        let Some(settings) = network::admit(
+            &self.manifest.capabilities.net,
+            &self.manifest.capabilities.net_connect,
+        ) else {
             return Err(CapsuleError::UnsupportedEntryPoint(
                 "native stdio MCP cannot enforce destination-scoped network access; use an Astrid WASM component for network requests".into(),
             ));
-        }
+        };
 
         let mut command_str = original_command_str.clone();
 
@@ -214,7 +222,9 @@ impl ExecutionEngine for McpHostEngine {
             env: resolved_env,
             cwd: Some(self.capsule_dir.clone()),
             restart_policy: astrid_mcp::RestartPolicy::Always, // Host engines should restart on crash
-            allow_network: false,
+            transport: astrid_mcp::Transport::Stdio,
+            trusted: settings.trusted,
+            allow_network: settings.allow_network,
             ..Default::default()
         };
 

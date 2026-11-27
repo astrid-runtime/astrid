@@ -6,6 +6,22 @@ use vstd::prelude::*;
 use vstd::std_specs::hash::hash_map_inv;
 
 verus! {
+/// Compose manifest admission with the two authority fields read by stdio
+/// command preparation. The native ServerConfig assembly transfers the fields.
+fn native_capsule_command<D,P,C,T,E,B:crate::stdio_policy::Builder<C,T,E>>(
+    builder:&mut B, domains:&[D], peers:&[P], program:&str, config:&C,
+) -> (out:Option<Result<T,E>>)
+    ensures if domains.len() > 0 || peers.len() > 0 {
+        out.is_none() && final(builder).calls() == old(builder).calls()
+    } else {
+        out matches Some(result) && final(builder).calls() == old(builder).calls().push(
+            crate::stdio_policy::Build::Sandboxed(program@,*config,false,result))
+    },
+{
+    let settings = crate::capsule_stdio_network::admit(domains,peers)?;
+    Some(crate::stdio_policy::prepare(builder,program,config,settings.trusted,settings.allow_network))
+}
+
 fn registered_peer(servers: &HashMap<String,Option<u64>>, name: &str)
     -> (result: Result<u64,LookupError>)
     requires hash_map_inv(servers),

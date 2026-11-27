@@ -50,7 +50,7 @@ fn check_protected_grants_in_child() {
                 config.cwd = Some(denied.to_path_buf());
             }
             let error = manager
-                .build_sandboxed_command("test", "echo", &config)
+                .prepare_stdio_command("test", "echo", &config)
                 .expect_err("protected runtime grant must be denied");
             assert!(
                 matches!(error, McpError::ServerStartFailed { .. }),

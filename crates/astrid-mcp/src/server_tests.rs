@@ -740,7 +740,7 @@ fn test_build_sandboxed_command_adds_sandbox_prefix() {
     let config = ServerConfig::stdio("test", "echo").with_args(["hello"]);
 
     let cmd = manager
-        .build_sandboxed_command("test", "echo", &config)
+        .prepare_stdio_command("test", "echo", &config)
         .expect("should build sandboxed command");
 
     let program = cmd.as_std().get_program().to_string_lossy().to_string();
@@ -790,7 +790,7 @@ fn test_build_sandboxed_command_resolves_absolute_binary_path() {
     let config = ServerConfig::stdio("test", "echo");
 
     let cmd = manager
-        .build_sandboxed_command("test", "echo", &config)
+        .prepare_stdio_command("test", "echo", &config)
         .expect("should build sandboxed command");
 
     // The resolved binary should appear as an absolute path — either in
@@ -820,7 +820,7 @@ fn test_build_sandboxed_command_rejects_unresolvable_binary() {
 
     let config = ServerConfig::stdio("test", "nonexistent-binary-xyz-12345");
 
-    let result = manager.build_sandboxed_command("test", "nonexistent-binary-xyz-12345", &config);
+    let result = manager.prepare_stdio_command("test", "nonexistent-binary-xyz-12345", &config);
     assert!(result.is_err(), "unresolvable binary should fail");
     let err = result.unwrap_err().to_string();
     assert!(
@@ -832,9 +832,9 @@ fn test_build_sandboxed_command_rejects_unresolvable_binary() {
 #[test]
 fn test_trusted_server_bypasses_sandbox() {
     let config = ServerConfig::stdio("test", "echo").trusted();
-
-    let cmd = build_unsandboxed_command("test", "echo", &config);
-
+    let cmd = ServerManager::new(ServersConfig::default())
+        .prepare_stdio_command("test", "echo", &config)
+        .unwrap();
     let program = cmd.as_std().get_program().to_string_lossy().to_string();
     assert_eq!(
         program, "echo",
@@ -853,7 +853,7 @@ fn test_sandboxed_command_clears_env() {
     let config = ServerConfig::stdio("test", "echo").with_env("SAFE_VAR", "value");
 
     let cmd = manager
-        .build_sandboxed_command("test", "echo", &config)
+        .prepare_stdio_command("test", "echo", &config)
         .expect("should build command");
 
     let envs: Vec<_> = cmd
@@ -906,7 +906,7 @@ fn test_sandboxed_command_blocks_dangerous_env() {
         .with_env("SAFE_VAR", "ok");
 
     let cmd = manager
-        .build_sandboxed_command("test", "echo", &config)
+        .prepare_stdio_command("test", "echo", &config)
         .expect("should build command");
 
     let envs: Vec<_> = cmd
@@ -946,7 +946,7 @@ fn test_writable_root_priority_cwd_first() {
     config.cwd = Some(cwd_dir.clone());
 
     let cmd = manager
-        .build_sandboxed_command("test", "echo", &config)
+        .prepare_stdio_command("test", "echo", &config)
         .expect("should build command");
 
     let current_dir = cmd.as_std().get_current_dir();
@@ -971,7 +971,7 @@ fn test_writable_root_priority_workspace_second() {
     // No cwd set, should fall back to workspace_root for sandbox config.
 
     let cmd = manager
-        .build_sandboxed_command("test", "echo", &config)
+        .prepare_stdio_command("test", "echo", &config)
         .expect("should build command");
 
     // Under Off the sandbox prefix is suppressed, so the assertion is
@@ -1008,7 +1008,7 @@ fn test_relative_allowed_paths_rejected() {
     let config = ServerConfig::stdio("test", "echo")
         .with_read_path(std::path::PathBuf::from("relative/path"));
 
-    let result = manager.build_sandboxed_command("test", "echo", &config);
+    let result = manager.prepare_stdio_command("test", "echo", &config);
     assert!(
         matches!(result, Err(McpError::ConfigError(_))),
         "relative allowed_read_paths should be rejected"
@@ -1017,7 +1017,7 @@ fn test_relative_allowed_paths_rejected() {
     let config = ServerConfig::stdio("test", "echo")
         .with_write_path(std::path::PathBuf::from("another/relative"));
 
-    let result = manager.build_sandboxed_command("test", "echo", &config);
+    let result = manager.prepare_stdio_command("test", "echo", &config);
     assert!(
         matches!(result, Err(McpError::ConfigError(_))),
         "relative allowed_write_paths should be rejected"
@@ -1033,7 +1033,7 @@ fn test_double_quote_in_paths_rejected() {
     let config = ServerConfig::stdio("test", "echo")
         .with_read_path(std::path::PathBuf::from("/data/tricky\"path"));
 
-    let result = manager.build_sandboxed_command("test", "echo", &config);
+    let result = manager.prepare_stdio_command("test", "echo", &config);
     assert!(
         matches!(result, Err(McpError::ConfigError(_))),
         "paths with double-quotes should be rejected to prevent SBPL injection"
@@ -1042,7 +1042,7 @@ fn test_double_quote_in_paths_rejected() {
     let config = ServerConfig::stdio("test", "echo")
         .with_write_path(std::path::PathBuf::from("/output/also\"bad"));
 
-    let result = manager.build_sandboxed_command("test", "echo", &config);
+    let result = manager.prepare_stdio_command("test", "echo", &config);
     assert!(
         matches!(result, Err(McpError::ConfigError(_))),
         "write paths with double-quotes should also be rejected"
@@ -1104,7 +1104,7 @@ fn test_build_sandboxed_command_rejects_non_utf8_workspace_root() {
     let manager = ServerManager::new(configs).with_workspace_root(bad_path);
 
     let config = ServerConfig::stdio("test", "echo");
-    let result = manager.build_sandboxed_command("test", "echo", &config);
+    let result = manager.prepare_stdio_command("test", "echo", &config);
     assert!(
         matches!(result, Err(McpError::ConfigError(_))),
         "non-UTF-8 workspace root should be rejected through build_sandboxed_command, got: {result:?}"

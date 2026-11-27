@@ -19,6 +19,8 @@ use crate::capabilities::{AstridClientHandler, ServerNotice};
 use crate::config::{RestartPolicy, ServerConfig, ServersConfig, Transport};
 use crate::error::{McpError, McpResult};
 use crate::process_transport::OwnedProcessTransport;
+mod command;
+mod stdio_policy;
 use crate::server_process::{
     build_unsandboxed_command, mcp_client_lifecycle, today_date_string, wrap_process_tree,
 };
@@ -331,11 +333,7 @@ impl ServerManager {
             McpError::ConfigError(format!("No command specified for stdio server {name}"))
         })?;
 
-        let mut cmd = if config.trusted {
-            build_unsandboxed_command(name, command, config)
-        } else {
-            self.build_sandboxed_command(name, command, config)?
-        };
+        let mut cmd = self.prepare_stdio_command(name, command, config)?;
 
         // Redirect capsule stderr to a per-capsule daily log file if configured.
         if let Some(ref log_dir) = self.capsule_log_dir {
@@ -429,6 +427,7 @@ impl ServerManager {
         name: &str,
         command: &str,
         config: &ServerConfig,
+        allow_network: bool,
     ) -> McpResult<tokio::process::Command> {
         use astrid_workspace::ProcessSandboxConfig;
 
@@ -461,7 +460,7 @@ impl ServerManager {
 
         // Build sandbox config
         let mut sandbox_config = ProcessSandboxConfig::new(&writable_root)
-            .with_network(config.allow_network)
+            .with_network(allow_network)
             .with_protected_runtime_home(astrid_home);
         if let Some(policy) = self.sandbox_policy_override {
             sandbox_config = sandbox_config.with_policy(policy);
@@ -596,7 +595,7 @@ impl ServerManager {
         info!(
             server = name,
             writable_root = %writable_root.display(),
-            allow_network = config.allow_network,
+            allow_network,
             "Spawning sandboxed MCP server"
         );
 

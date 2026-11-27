@@ -119,7 +119,7 @@ mod tests {
             std::sync::Arc::new(astrid_events::EventBus::new()),
             None,
         );
-        for tcp in [false, true] {
+        for (domain, tcp) in [(false, false), (true, false), (false, true), (true, true)] {
             let mut manifest = dummy_manifest("test-command", vec!["test-command"]);
             manifest.capabilities.uplink = true;
             if tcp {
@@ -127,7 +127,8 @@ mod tests {
                     .capabilities
                     .net_connect
                     .push("example.org:443".into());
-            } else {
+            }
+            if domain {
                 manifest.capabilities.net.push("example.org".into());
             }
             let server = manifest.mcp_servers[0].clone();
@@ -136,7 +137,19 @@ mod tests {
                 server,
                 root.path().into(),
                 test_secure_mcp_client(),
-            );
+            )
+            .with_runtime_id(Some(crate::registry::RuntimeId::for_test(
+                crate::capsule::CapsuleId::from_static("test-capsule"),
+                1,
+            )));
+            if !domain && !tcp {
+                engine.load(&context).await.unwrap();
+                let config = engine.prepared_config().unwrap();
+                assert_eq!(config.transport, astrid_mcp::Transport::Stdio);
+                assert_eq!(config.command.as_deref(), Some("test-command"));
+                assert!(!config.trusted && !config.allow_network);
+                continue;
+            }
             assert!(
                 engine
                     .load(&context)

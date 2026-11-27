@@ -134,3 +134,20 @@ def defects():
             lambda s, a=original, b=changed: replace_once(s, a, b),
             Path("verification/hosted_mcp_peer.rs"),
         )
+
+    policy = Path("crates/astrid-capsule/src/engine/mcp/network.rs")
+    command = Path("crates/astrid-mcp/src/server/stdio_policy.rs")
+    consumer = Path("verification/hosted_mcp_peer.rs")
+    for name, source, original, changed, error in [
+        ("ignores TCP peer restrictions", policy, "domains.is_empty() && peers.is_empty()", "domains.is_empty()", policy),
+        ("may admit a trusted capsule", policy, "!settings.trusted && !settings.allow_network", "!settings.allow_network", consumer),
+        ("may admit unrestricted networking", policy, "!settings.trusted && !settings.allow_network", "!settings.trusted", consumer),
+        ("may reject an empty manifest", policy, "None => domains.len() > 0 || peers.len() > 0", "None => true", consumer),
+        ("widens the sandbox network flag", command, "builder.sandboxed(program,config,allow_network)", "builder.sandboxed(program,config,true)", command),
+        ("retries a sandbox error directly", command, "builder.sandboxed(program,config,allow_network)",
+         "match builder.sandboxed(program,config,allow_network) { Ok(t) => Ok(t), Err(_) => Ok(builder.direct(program,config)) }", command),
+    ]:
+        yield (
+            f"native stdio launch {name}", source,
+            lambda s, a=original, b=changed: replace_once(s, a, b), error,
+        )
