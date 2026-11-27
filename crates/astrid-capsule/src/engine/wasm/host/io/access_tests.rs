@@ -36,9 +36,16 @@ async fn immediate_operations_preserve_the_streams_on_owner_refusal() {
         state.write_zeroes(dst(), 2),
         Err(StreamError::Closed)
     ));
+    assert!(HostInputStream::subscribe(&mut state, src()).is_err());
+    assert!(HostOutputStream::subscribe(&mut state, dst()).is_err());
     assert!(sink.contents().is_empty());
 
     state.invocation_storage_uid = Some(owner);
+    let input_ready = HostInputStream::subscribe(&mut state, src()).unwrap();
+    let output_ready = HostOutputStream::subscribe(&mut state, dst()).unwrap();
+    assert_ne!(input_ready.rep(), output_ready.rep());
+    assert!(state.resource_table.get(&input_ready).is_ok());
+    assert!(state.resource_table.get(&output_ready).is_ok());
     assert_eq!(state.read(src(), 2).unwrap(), b"pa");
     assert_eq!(state.skip(src(), 2).unwrap(), 2);
     assert_eq!(state.read(src(), 3).unwrap(), b"oad");
@@ -47,4 +54,142 @@ async fn immediate_operations_preserve_the_streams_on_owner_refusal() {
     state.write_zeroes(dst(), 2).unwrap();
     state.flush(dst()).unwrap();
     assert_eq!(sink.contents().as_ref(), b"data\0\0");
+}
+
+#[tokio::test]
+async fn blocking_stream_methods_bind_the_owner_and_use_the_admitted_operands() {
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    let input = state
+        .resource_table
+        .push::<DynInputStream>(Box::new(MemoryInputPipe::new("payload")))
+        .unwrap();
+    let sink = MemoryOutputPipe::new(32);
+    let output = state
+        .resource_table
+        .push::<DynOutputStream>(Box::new(sink.clone()))
+        .unwrap();
+    let src = || Resource::new_borrow(input.rep());
+    let dst = || Resource::new_borrow(output.rep());
+    let uid = state
+        .principal_directory
+        .uid_for(&state.effective_principal())
+        .unwrap();
+    state.invocation_storage_uid = Some(astrid_core::PrincipalUid::from_bytes([99; 32]));
+    assert!(matches!(
+        state.blocking_read(src(), 2).await,
+        Err(StreamError::Closed)
+    ));
+    assert!(matches!(
+        state.blocking_skip(src(), 2).await,
+        Err(StreamError::Closed)
+    ));
+    assert!(matches!(
+        state
+            .blocking_write_and_flush(dst(), b"private".to_vec())
+            .await,
+        Err(StreamError::Closed)
+    ));
+    assert!(matches!(
+        state.blocking_flush(dst()).await,
+        Err(StreamError::Closed)
+    ));
+    assert!(matches!(
+        state.blocking_write_zeroes_and_flush(dst(), 2).await,
+        Err(StreamError::Closed)
+    ));
+    assert!(sink.contents().is_empty());
+    state.invocation_storage_uid = Some(uid);
+    assert_eq!(state.blocking_read(src(), 2).await.unwrap(), b"pa");
+    assert_eq!(state.blocking_skip(src(), 2).await.unwrap(), 2);
+    assert_eq!(state.blocking_read(src(), 3).await.unwrap(), b"oad");
+    state
+        .blocking_write_and_flush(dst(), b"data".to_vec())
+        .await
+        .unwrap();
+    state
+        .blocking_write_zeroes_and_flush(dst(), 2)
+        .await
+        .unwrap();
+    state.blocking_flush(dst()).await.unwrap();
+    assert_eq!(sink.contents().as_ref(), b"data\0\0");
+}
+
+#[tokio::test]
+async fn rebound_owner_cannot_receive_a_pending_blocking_read() {
+    use tokio::io::AsyncWriteExt;
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    let principal = state.effective_principal();
+    let directory = state.principal_directory.clone();
+    let uid = directory.uid_for(&principal).unwrap();
+    let (reader, mut writer) = tokio::io::duplex(16);
+    let source = wasmtime_wasi::p2::pipe::AsyncReadStream::new(reader);
+    let input = state
+        .resource_table
+        .push::<DynInputStream>(Box::new(source))
+        .unwrap();
+    let mut read = Box::pin(state.blocking_read(Resource::new_borrow(input.rep()), 4));
+    tokio::select! {
+        biased;
+        value = &mut read => panic!("expected pending input, got {value:?}"),
+        () = std::future::ready(()) => {}
+    }
+    directory
+        .rename(
+            uid,
+            &principal,
+            astrid_core::PrincipalId::new("renamed").unwrap(),
+        )
+        .unwrap();
+    writer.write_all(b"keep").await.unwrap();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), read)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, Err(StreamError::Closed)));
+}
+
+#[tokio::test]
+async fn cancellation_and_retirement_after_capture_refuse_the_immediate_sink() {
+    use super::authority::Authority;
+    use wasmtime_wasi::p2::bindings::sync::io::streams::HostOutputStream as WasiOutput;
+    for retire_device in [false, true] {
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        let temp = tempfile::tempdir().unwrap();
+        let key =
+            crate::engine::wasm::test_fixtures::register_stream_caller(&mut state, temp.path());
+        let sink = MemoryOutputPipe::new(16);
+        let output = state
+            .resource_table
+            .push::<DynOutputStream>(Box::new(sink.clone()))
+            .unwrap();
+        let admission = Authority::capture(&state).unwrap();
+        let cancel = state.effective_cancel_token();
+        let sessions = state.device_sessions.clone();
+        let principal = state.effective_principal();
+        let mut retirement = Box::pin(sessions.retire(&principal, &key));
+        if retire_device {
+            tokio::select! {
+                biased;
+                result = &mut retirement => panic!("expected admitted device, got {result:?}"),
+                () = std::future::ready(()) => {}
+            }
+        } else {
+            cancel.cancel();
+        }
+        assert!(matches!(
+            admission.start(
+                &state.principal_directory,
+                &cancel,
+                &mut state.resource_table,
+                Resource::new_borrow(output.rep()),
+                b"data".to_vec(),
+                WasiOutput::write
+            ),
+            Err(StreamError::Closed)
+        ));
+        assert!(sink.contents().is_empty());
+        drop(admission);
+        if retire_device {
+            retirement.await.unwrap();
+        }
+    }
 }

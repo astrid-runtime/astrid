@@ -35,37 +35,98 @@ impl Authority {
             device,
         })
     }
+
+    pub(super) fn start<'a, S: 'static, A, R, F>(
+        &self,
+        directory: &astrid_storage::PrincipalDirectory,
+        cancel: &tokio_util::sync::CancellationToken,
+        table: &'a mut ResourceTable,
+        stream: Resource<S>,
+        args: A,
+        operation: F,
+    ) -> Result<R, StreamError>
+    where
+        F: FnOnce(&'a mut ResourceTable, Resource<S>, A) -> R,
+    {
+        directory
+            .with_bound_input(
+                &self.principal,
+                self.owner,
+                (stream, args, operation),
+                |bound| {
+                    super::dispatch::dispatch(
+                        cancel.is_cancelled(),
+                        self.device.as_ref().is_some_and(DeviceSession::is_retired),
+                        table,
+                        bound,
+                    )
+                },
+            )
+            .ok()
+            .flatten()
+            .ok_or(StreamError::Closed)
+    }
 }
 
 /// Keep both lifetime guards and the current owner binding through a synchronous
 /// table operation. The typed resource and its arguments travel together.
-pub(super) fn access<S: 'static, A, R>(
+pub(super) fn access<S: 'static, A, R, E: From<StreamError>>(
     state: &mut HostState,
     stream: Resource<S>,
     args: A,
-    operation: impl FnOnce(&mut ResourceTable, Resource<S>, A) -> Result<R, StreamError>,
-) -> Result<R, StreamError> {
+    operation: impl FnOnce(&mut ResourceTable, Resource<S>, A) -> Result<R, E>,
+) -> Result<R, E> {
     let admission = Authority::capture(state)?;
     let cancel = state.effective_cancel_token();
+    admission.start(
+        &state.principal_directory,
+        &cancel,
+        &mut state.resource_table,
+        stream,
+        args,
+        operation,
+    )?
+}
+
+/// Check the current owner after capacity becomes available, then revalidate
+/// before disclosing the result. The directory lock never spans a WASI wait.
+pub(super) async fn blocking_access<'a, S: 'static, A, R, F>(
+    state: &'a mut HostState,
+    stream: Resource<S>,
+    args: A,
+    operation: impl FnOnce(&'a mut ResourceTable, Resource<S>, A) -> F,
+) -> Result<R, StreamError>
+where
+    F: Future<Output = Result<R, StreamError>>,
+{
+    let admission = Authority::capture(state)?;
+    let cancel = state.effective_cancel_token();
+    let directory = &state.principal_directory;
     let table = &mut state.resource_table;
-    state
-        .principal_directory
-        .with_bound_input(
-            &admission.principal,
-            admission.owner,
-            (stream, args, operation),
-            |bound| {
-                super::dispatch::dispatch(
-                    cancel.is_cancelled(),
-                    admission
-                        .device
-                        .as_ref()
-                        .is_some_and(DeviceSession::is_retired),
-                    table,
-                    bound,
-                )
-                .unwrap_or(Err(StreamError::Closed))
-            },
-        )
+    let io = crate::engine::wasm::host::util::bounded_await_cancellable(
+        &state.io_semaphore,
+        &cancel,
+        async {
+            let work = admission.start(directory, &cancel, table, stream, args, operation)?;
+            work.await
+        },
+    );
+    let result = match &admission.device {
+        Some(device) => device.while_live(io).await.flatten(),
+        None => io.await,
+    }
+    .ok_or(StreamError::Closed)?;
+    directory
+        .with_bound_input(&admission.principal, admission.owner, result, |result| {
+            super::dispatch::disclose(
+                cancel.is_cancelled(),
+                admission
+                    .device
+                    .as_ref()
+                    .is_some_and(DeviceSession::is_retired),
+                result,
+            )
+            .unwrap_or(Err(StreamError::Closed))
+        })
         .unwrap_or(Err(StreamError::Closed))
 }

@@ -61,6 +61,14 @@ def consumer_defects():
             f"TCP dial {name}", tcp,
             lambda s, a=original, b=changed: replace_once(s, a, b), tcp_trace,
         )
+    for name, original, changed in [
+        ("loses the observed result", "ensures out == if cancelled || retired { None } else { Some(observed) }", "ensures out.is_some() == (!cancelled && !retired)"),
+        ("loses the refusal", "ensures out == if cancelled || retired { None } else { Some(observed) }", "ensures !cancelled && !retired ==> out == Some(observed)"),
+    ]:
+        yield (
+            f"blocking stream completion {name}", dispatch,
+            lambda s, a=original, b=changed: replace_once(s, a, b), splice_trace,
+        )
     pool = Path("crates/astrid-capsule/src/engine/wasm/pool/return_policy.rs")
     pool_trace = Path("verification/hosted_pool_return.rs")
     for name, original, changed in [

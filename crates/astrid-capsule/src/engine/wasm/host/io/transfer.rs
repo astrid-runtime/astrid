@@ -42,6 +42,7 @@ pub(super) fn immediate(
     use wasmtime_wasi::p2::bindings::sync::io::streams::HostOutputStream;
     let operation = admit(state, Mode::Immediate, dst, src, len)?;
     let directory = &state.principal_directory;
+    let cancel = state.effective_cancel_token();
     operation
         .start(
             Mode::Immediate,
@@ -49,7 +50,9 @@ pub(super) fn immediate(
             |guard, table, request| {
                 directory
                     .with_bound_input(&guard.principal, guard.owner, request, |target| {
-                        if guard.device.as_ref().is_some_and(DeviceSession::is_retired) {
+                        if cancel.is_cancelled()
+                            || guard.device.as_ref().is_some_and(DeviceSession::is_retired)
+                        {
                             return Err(StreamError::Closed);
                         }
                         HostOutputStream::splice(

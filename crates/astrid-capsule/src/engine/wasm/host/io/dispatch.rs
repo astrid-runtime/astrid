@@ -13,4 +13,11 @@ pub(super) fn dispatch<T,S,A,R,F: FnOnce(T,S,A) -> R>(
     let (stream,args,operation) = input;
     Some(operation(table,stream,args))
 }
+/// Release the original native result only while the caller remains live.
+pub(super) fn disclose<R>(cancelled:bool, retired:bool, observed:R) -> (out:Option<R>)
+    ensures out == if cancelled || retired { None } else { Some(observed) },
+{
+    if cancelled || retired { None } else { Some(observed) }
+}
+
 }

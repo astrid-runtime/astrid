@@ -139,34 +139,12 @@ async fn queued_splice_refuses_a_rebound_owner_before_touching_either_stream() {
 
 #[tokio::test]
 async fn retiring_a_registered_device_drains_a_queued_transfer_without_consuming_input() {
-    use astrid_core::dirs::AstridHome;
-    use astrid_core::profile::{AuthMethod, DeviceKey, DeviceKeyId, DeviceScope, PrincipalProfile};
-    use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
     use std::sync::Arc;
-
     let mut state = minimal_host_state(tokio::runtime::Handle::current());
     let principal = state.effective_principal();
     let temp = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(temp.path());
-    let key = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
-    let key_id = DeviceKeyId::new(key.key_id.clone()).unwrap();
-    let mut profile = PrincipalProfile::default();
-    profile.auth.methods.push(AuthMethod::Keypair);
-    profile.add_device(key.clone());
-    profile.save(&home, &principal).unwrap();
-    state.profile_cache = Some(Arc::new(
-        crate::profile_cache::PrincipalProfileCache::with_home(home),
-    ));
-    let mut message = IpcMessage::new(
-        Topic::from_raw("splice.test"),
-        IpcPayload::RawJson(serde_json::Value::Null),
-        uuid::Uuid::new_v4(),
-    )
-    .with_principal(principal.to_string());
-    message.device_key_id = Some(key.key_id);
-    message.device_registration_id = key.registration_id.map(Into::into);
-    state.caller_context = Some(message);
-
+    let key_id =
+        crate::engine::wasm::test_fixtures::register_stream_caller(&mut state, temp.path());
     let sessions = state.device_sessions.clone();
     let tracker = Arc::new(crate::engine::wasm::PrincipalInvocationTracker::default());
     state.principal_invocations = Some(tracker.clone());

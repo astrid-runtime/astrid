@@ -76,4 +76,19 @@ fn stream_access<T,S,A,R,F:FnOnce(T,S,A)->R>(
         { crate::io_dispatch::dispatch(cancelled,retired,table,bound) }).ok()?
 }
 
+// The completion snapshot may differ from both opening and start. Preserve the
+// exact observed bytes or error only if the captured UID still owns the alias.
+fn blocking_completion<R>(alias:&[u8],expected:Option<[u8;32]>, opening:[u8;32],
+    forward:Option<&[u8;32]>,reverse:Option<&[u8]>,cancelled:bool,retired:bool,
+    observed:R) -> (out:Option<R>)
+    ensures out == if (expected matches Some(e) ==> e@ == opening@)
+        && (forward matches Some(f) && f@ == opening@) && (reverse matches Some(r) && r@ == alias@)
+        && !cancelled && !retired { Some(observed) } else { None },
+{
+    let uid = crate::principal_binding::select(expected,opening)?;
+    crate::principal_binding::with_pair(alias,&uid,forward,reverse,observed,
+        |result:R| -> (value:Option<R>) ensures value == if cancelled || retired { None } else { Some(result) },
+        { crate::io_dispatch::disclose(cancelled,retired,result) }).ok()?
+}
+
 }

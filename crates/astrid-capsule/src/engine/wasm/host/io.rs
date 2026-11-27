@@ -181,24 +181,12 @@ mod astrid_error_impl {
 // ────────────────────────────────────────────────────────────────────────
 // astrid:io/streams — input-stream / output-stream
 //
-// Delegates the underlying byte movement to wasmtime-wasi-sync (whose
-// stream impls operate on the same DynInputStream / DynOutputStream
-// types we store via the bindgen `with:` map). What this layer adds is
-// the Astrid envelope:
+// The table stores WASI dynamic stream types. Immediate operations use the
+// synchronous trait. Blocking operations await the asynchronous trait under
+// caller admission and bounded I/O capacity. Both paths pass the selected
+// handle and arguments through the directory binding before dispatch.
 //
-//   - cancel-token check on the blocking-* paths so capsule unload
-//     wins over a stuck read/write,
-//   - per-call audit emission under target = "astrid.audit.io" with
-//     capsule + principal + bytes + elapsed,
-//   - structural conversion from wasi's StreamError variant to our
-//     own (both carry `Resource<wasmtime_wasi::p2::IoError>` in the
-//     `last-operation-failed` arm — same underlying storage type via
-//     the bindgen `with:` substitution).
-//
-// On the hermit-rs unikernel target, the inner wasi-sync calls swap
-// for native unikernel I/O; the audit/cancel/conversion envelope is
-// unchanged.
-// ────────────────────────────────────────────────────────────────────────
+// The WIT error translation preserves the shared IoError resource type.
 
 mod astrid_streams_impl {
     use super::*;
@@ -208,6 +196,7 @@ mod astrid_streams_impl {
     };
     use wasmtime::component::Resource;
     use wasmtime_wasi::p2::StreamError as RtStreamError;
+    use wasmtime_wasi::p2::bindings::io::streams as async_streams;
     use wasmtime_wasi::p2::bindings::sync::io::streams as wasi_streams;
 
     /// `trappable_error_type` in `bindings.rs` rewrites every fallible
@@ -217,29 +206,6 @@ mod astrid_streams_impl {
     /// back to the on-wire `astrid:io/streams.stream-error` variant for
     /// the guest.
     type StreamResult<T> = Result<T, RtStreamError>;
-
-    /// Reject the call up front if the capsule is unloading.
-    ///
-    /// Both blocking and non-blocking stream methods run through this
-    /// guard, even though `read` / `write` / `check-write` / `flush`
-    /// / `skip` / `write-zeroes` are documented as non-blocking in
-    /// the WIT. The deviation is deliberate: a cancelled capsule
-    /// should observe its streams as closed (one consistent failure
-    /// mode), not continue to read/write for one more poll before
-    /// noticing on the next call. Capsules already handle `closed`
-    /// as the canonical end-of-stream signal, so unloading surfaces
-    /// through the same code path.
-    ///
-    /// Streams don't have a typed `cancelled` variant on the wire —
-    /// `Closed` carries the "no more bytes will be produced /
-    /// accepted" semantic that matches.
-    fn cancel_guard(state: &HostState) -> Result<(), RtStreamError> {
-        if state.effective_cancel_token().is_cancelled() {
-            Err(RtStreamError::Closed)
-        } else {
-            Ok(())
-        }
-    }
 
     fn audit_io<T, E: std::fmt::Debug>(
         state: &HostState,
@@ -312,16 +278,19 @@ mod astrid_streams_impl {
             result
         }
 
-        fn blocking_read(
+        async fn blocking_read(
             &mut self,
             self_: Resource<InputStream>,
             len: u64,
         ) -> StreamResult<Vec<u8>> {
-            cancel_guard(self)?;
             let started = Instant::now();
-            let stream = Resource::new_borrow(self_.rep());
-            let result =
-                wasi_streams::HostInputStream::blocking_read(&mut self.resource_table, stream, len);
+            let result = super::authority::blocking_access(
+                self,
+                self_,
+                len,
+                async_streams::HostInputStream::blocking_read,
+            )
+            .await;
             let bytes = result.as_ref().map(|v| v.len() as u64).unwrap_or(0);
             let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             audit_io(
@@ -338,16 +307,27 @@ mod astrid_streams_impl {
             super::authority::access(self, self_, len, wasi_streams::HostInputStream::skip)
         }
 
-        fn blocking_skip(&mut self, self_: Resource<InputStream>, len: u64) -> StreamResult<u64> {
-            cancel_guard(self)?;
-            let stream = Resource::new_borrow(self_.rep());
-            wasi_streams::HostInputStream::blocking_skip(&mut self.resource_table, stream, len)
+        async fn blocking_skip(
+            &mut self,
+            self_: Resource<InputStream>,
+            len: u64,
+        ) -> StreamResult<u64> {
+            super::authority::blocking_access(
+                self,
+                self_,
+                len,
+                async_streams::HostInputStream::blocking_skip,
+            )
+            .await
         }
 
         fn subscribe(&mut self, self_: Resource<InputStream>) -> WResult<Resource<Pollable>> {
-            let stream = Resource::new_borrow(self_.rep());
-            let p = wasi_streams::HostInputStream::subscribe(&mut self.resource_table, stream)?;
-            Ok(Resource::new_own(p.rep()))
+            super::authority::access(
+                self,
+                Resource::new_borrow(self_.rep()),
+                (),
+                |table, stream, ()| wasi_streams::HostInputStream::subscribe(table, stream),
+            )
         }
 
         fn drop(&mut self, rep: Resource<InputStream>) -> WResult<()> {
@@ -385,20 +365,20 @@ mod astrid_streams_impl {
             result
         }
 
-        fn blocking_write_and_flush(
+        async fn blocking_write_and_flush(
             &mut self,
             self_: Resource<OutputStream>,
             contents: Vec<u8>,
         ) -> StreamResult<()> {
-            cancel_guard(self)?;
             let started = Instant::now();
             let bytes = contents.len() as u64;
-            let stream = Resource::new_borrow(self_.rep());
-            let result = wasi_streams::HostOutputStream::blocking_write_and_flush(
-                &mut self.resource_table,
-                stream,
+            let result = super::authority::blocking_access(
+                self,
+                self_,
                 contents,
-            );
+                async_streams::HostOutputStream::blocking_write_and_flush,
+            )
+            .await;
             let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             audit_io(
                 self,
@@ -416,16 +396,20 @@ mod astrid_streams_impl {
             })
         }
 
-        fn blocking_flush(&mut self, self_: Resource<OutputStream>) -> StreamResult<()> {
-            cancel_guard(self)?;
-            let stream = Resource::new_borrow(self_.rep());
-            wasi_streams::HostOutputStream::blocking_flush(&mut self.resource_table, stream)
+        async fn blocking_flush(&mut self, self_: Resource<OutputStream>) -> StreamResult<()> {
+            super::authority::blocking_access(self, self_, (), |table, stream, ()| {
+                async_streams::HostOutputStream::blocking_flush(table, stream)
+            })
+            .await
         }
 
         fn subscribe(&mut self, self_: Resource<OutputStream>) -> WResult<Resource<Pollable>> {
-            let stream = Resource::new_borrow(self_.rep());
-            let p = wasi_streams::HostOutputStream::subscribe(&mut self.resource_table, stream)?;
-            Ok(Resource::new_own(p.rep()))
+            super::authority::access(
+                self,
+                Resource::new_borrow(self_.rep()),
+                (),
+                |table, stream, ()| wasi_streams::HostOutputStream::subscribe(table, stream),
+            )
         }
 
         fn write_zeroes(&mut self, self_: Resource<OutputStream>, len: u64) -> StreamResult<()> {
@@ -437,18 +421,18 @@ mod astrid_streams_impl {
             )
         }
 
-        fn blocking_write_zeroes_and_flush(
+        async fn blocking_write_zeroes_and_flush(
             &mut self,
             self_: Resource<OutputStream>,
             len: u64,
         ) -> StreamResult<()> {
-            cancel_guard(self)?;
-            let stream = Resource::new_borrow(self_.rep());
-            wasi_streams::HostOutputStream::blocking_write_zeroes_and_flush(
-                &mut self.resource_table,
-                stream,
+            super::authority::blocking_access(
+                self,
+                self_,
                 len,
+                async_streams::HostOutputStream::blocking_write_zeroes_and_flush,
             )
+            .await
         }
 
         fn splice(
