@@ -169,6 +169,10 @@ mod marker_key;
 
 #[path = "../crates/astrid-capabilities/src/store/authority.rs"]
 mod token_authority;
+use token_authority as authority;
+#[path = "../crates/astrid-capabilities/src/store/marker_batch.rs"]
+mod marker_batch;
+mod hosted_token_recovery;
 
 #[path = "hosted_authority_model.rs"]
 mod model;

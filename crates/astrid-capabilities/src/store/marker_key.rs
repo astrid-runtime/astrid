@@ -110,4 +110,19 @@ pub(super) fn decode(text: &[u8]) -> (out: Option<[u8; 16]>)
     }
     Some(bytes)
 }
+/// Canonical keys use the checked decoder. Older UUID spellings retain the
+/// legacy parser, with its result returned unchanged for these same bytes.
+pub(super) fn decode_compatible<E,F: FnOnce(&[u8]) -> Result<[u8; 16],E>>(
+    key: &[u8], legacy: F,
+) -> (out: Result<[u8; 16],E>)
+    requires legacy.requires((key,)),
+    ensures forall|id: [u8; 16]| #[trigger] spells(id@,key@) ==> out == Ok(id),
+        !(exists|id: [u8; 16]| #[trigger] spells(id@,key@)) ==> legacy.ensures((key,),out),
+{
+    match decode(key) {
+        Some(id) => Ok(id),
+        None => (legacy)(key),
+    }
+}
+
 }

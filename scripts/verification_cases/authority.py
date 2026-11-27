@@ -1,5 +1,7 @@
 """Implementation mutations for authority verification."""
 
+from pathlib import Path
+
 from .common import (
     AUTHORITY,
     MODEL,
@@ -276,3 +278,18 @@ def defects():
             ),
         ),
     ]
+
+
+def marker_batch_consumers():
+    for label, clause, weaker in [
+        ("complete enumeration", "Ok(()) => ids.len() == keys.len()", "Ok(()) => ids.len() <= keys.len()"),
+        ("decoded identity", "&& decoded(keys@,ids,decode) && match out", "&& match out"),
+        ("failed row", "&& decode.ensures((&keys@[ids.len() as int],),Err(e))", ""),
+        ("namespace membership", "#[trigger] has(after,id,tag) ==",
+         "#[trigger] has(after,id,tag) ==>"),
+    ]:
+        yield (
+            f"token marker batch loses {label}", Path("crates/astrid-capabilities/src/store/marker_batch.rs"),
+            lambda s, clause=clause, weaker=weaker: replace_once(s, clause, weaker),
+            Path("verification/hosted_token_recovery.rs"),
+        )

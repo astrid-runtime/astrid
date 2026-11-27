@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 mod authority;
+mod marker_batch;
 mod marker_key;
 use authority::{Admission, Marker, TokenStatus};
 
@@ -118,27 +119,29 @@ impl CapabilityStore {
         let mut recorded: HashMap<TokenId, Vec<Marker>> = HashMap::new();
         for marker in Marker::recovery_order() {
             let namespace = marker.namespace();
-            for key in store
+            let keys = store
                 .list_keys(namespace)
                 .await
-                .map_err(|error| CapabilityError::StorageError(error.to_string()))?
-            {
-                let id = marker_key::decode(key.as_bytes())
-                    .map(uuid::Uuid::from_bytes)
-                    .map_or_else(|| uuid::Uuid::parse_str(&key), Ok)
-                    .map(TokenId::from_uuid)
-                    .map_err(|error| {
-                        CapabilityError::StorageError(format!(
-                            "invalid token marker in {namespace}: {error}"
-                        ))
-                    })?;
-                recorded.entry(id).or_default().push(marker);
-            }
+                .map_err(|error| CapabilityError::StorageError(error.to_string()))?;
+            marker_batch::group(&mut recorded, &keys, marker, |key| {
+                marker_key::decode_compatible(key.as_bytes(), |bytes| {
+                    let text = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
+                    uuid::Uuid::parse_str(text)
+                        .map(uuid::Uuid::into_bytes)
+                        .map_err(|error| error.to_string())
+                })
+                .map(uuid::Uuid::from_bytes)
+                .map(TokenId::from_uuid)
+                .map_err(|error| {
+                    CapabilityError::StorageError(format!(
+                        "invalid token marker in {namespace}: {error}"
+                    ))
+                })
+            })?;
         }
         // Each token's live authority is replayed from the markers the store
         // reports for it, as `TokenStatus::recover_markers` verifies. A token
-        // has at most one marker in each namespace, so each list is short and
-        // this map is released once the authority map is built.
+        // can have multiple spellings in legacy storage. Replay tolerates duplicates.
         let authority = authority::recover_authority(recorded);
         Ok(Self {
             persistent_store: Some(store),

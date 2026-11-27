@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from . import file_descriptor, file_open, http, mcp, persistent_process, retirement, runtime_residency, storage, workspace_commit
+from . import authority, file_descriptor, file_open, http, mcp, persistent_process, retirement, runtime_residency, storage, workspace_commit
 from .common import (
     AUTHORITY,
     MODEL,
@@ -40,6 +40,7 @@ def consumer_defects():
             f"token recovery map loses {label}", AUTHORITY,
             lambda s, clause=clause: replace_once(s, clause, "true"), MODEL,
         )
+    yield from authority.marker_batch_consumers()
     yield from persistent_process.defects()
     yield from workspace_commit.defects()
     yield from file_descriptor.defects()

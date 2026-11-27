@@ -251,6 +251,8 @@ INPUTS = [
     ENTRY,
     MODEL,
     AUTHORITY,
+    Path("verification/hosted_token_recovery.rs"),
+    Path("crates/astrid-capabilities/src/store/marker_batch.rs"),
     Path("crates/astrid-capabilities/src/store/marker_key.rs"),
     Path("crates/astrid-capsule-types/src/fuel_ledger/arithmetic.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/principal_tracker/state.rs"),
