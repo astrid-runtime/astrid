@@ -176,4 +176,44 @@ fn retire_principal<T>(entries:&mut HashMap<[u8;32],Entry<T>>, principal:&[u8])
     }
     removed
 }
+
+// Publication and retirement share the same map. At this order an admitted
+// child is either handed to its owner's cleanup or stays at the minted key.
+fn publish_then_retire<T>(entries: &mut HashMap<[u8;32],Entry<(u8,T)>>,
+    keys: &[[u8;32];9], candidate: Entry<T>, retiring: &[u8])
+    -> (out: (Option<u8>,Vec<Entry<(u8,T)>>))
+    requires hash_map_inv(old(entries)), obeys_key_model::<[u8;32]>(), obeys_concrete_eq::<[u8;32]>(),
+    ensures match out.0 {
+        Some(i) => {
+            let k = keys@[i as int];
+            let published = Entry { creator: candidate.creator, package: candidate.package, target: (i,candidate.target) };
+            &&& i < 9 && !old(entries)@.contains_key(k)
+            &&& if candidate.creator@ == retiring@ {
+                !final(entries)@.contains_key(k) && out.1@.contains(published)
+            } else {
+                final(entries)@.contains_key(k) && final(entries)@[k] == published
+            }
+        },
+        None => final(entries)@ == old(entries)@ && out.1@.len() == 0,
+    },
+{
+    let Ok(i) = publish_child(entries,keys,candidate) else { return (None, Vec::new()); };
+    let ghost admitted = entries@;
+    let removed = retire_principal(entries,retiring);
+    proof {
+        let k = keys@[i as int];
+        if candidate.creator@ == retiring@ {
+            let removed_keys = choose|ks:Seq<[u8;32]>| ks.no_duplicates() && ks.len() == removed@.len()
+                && (forall|k:[u8;32]| #[trigger] admitted.contains_key(k) ==> (ks.contains(k) == (admitted[k].creator@ == retiring@)))
+                && (forall|j:int| 0 <= j < ks.len() ==> admitted.contains_key(#[trigger] ks[j]) && removed@[j] == admitted[ks[j]]);
+            assert(admitted.contains_key(k));
+            assert(admitted[k].creator == candidate.creator);
+            assert(removed_keys.contains(k));
+            let j = removed_keys.index_of(k);
+            assert(removed_keys[j] == k && removed@[j] == admitted[k]);
+            assert(removed@.contains(admitted[k]));
+        }
+    }
+    (Some(i), removed)
+}
 }

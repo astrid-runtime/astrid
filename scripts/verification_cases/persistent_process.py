@@ -31,3 +31,13 @@ def defects():
             f"persistent process {name}", persistent / f"{file}.rs",
             lambda s, a=clause, b=weakened: replace_once(s, a, b), process_trace,
         )
+
+    for name, clause in [
+        ("preserves the published foreign child", "final(entries)@ == before.restrict(before.dom().filter(|k| before[k].creator@ != principal@))"),
+        ("hands the published child to cleanup", "&& removed@[i] == before[keys[i]]"),
+    ]:
+        yield (
+            f"persistent process publication then retirement no longer {name}", process_trace,
+            lambda s, a=clause: replace_once(s, a, "true" if not a.startswith("&&") else "&& true"),
+            process_trace,
+        )
