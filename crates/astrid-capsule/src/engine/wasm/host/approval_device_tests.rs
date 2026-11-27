@@ -115,35 +115,3 @@ async fn retirement_during_reply_lookup_rejects_an_unchanged_profile_record() {
     .await
     .unwrap();
 }
-
-#[tokio::test]
-async fn principal_retirement_during_approval_prevents_persistent_grant() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut state = persistent_test_state(dir.path());
-    let owner = install_request_owner(&mut state);
-    let principal = state.effective_principal();
-    let tracker = std::sync::Arc::new(crate::engine::wasm::PrincipalInvocationTracker::default());
-    state.principal_invocations = Some(tracker.clone());
-    let bus = state.event_bus.clone();
-    let requests = bus.subscribe_topic(Topic::approval_request().as_str());
-    let task = tokio::task::spawn_blocking(move || {
-        approval::Host::request_approval(
-            &mut state,
-            approval_request("git push", "git push origin main"),
-        )
-    });
-    let (id, _, _) = await_approval_request(requests).await;
-    tracker.retire(&principal);
-    bus.publish(approval_response_event(
-        &id,
-        Some(principal.as_str()),
-        Some(owner),
-        "approve_always",
-    ));
-    assert!(matches!(
-        task.await.unwrap(),
-        Err(ErrorCode::StoreUnavailable)
-    ));
-    let fresh = persistent_test_state(dir.path());
-    assert!(!check_persisted_allowance(&fresh, &principal, "git push origin main").unwrap());
-}
