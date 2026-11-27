@@ -726,6 +726,31 @@ fn format_one_content_constants_are_stable() {
 }
 
 #[test]
+fn version_one_file_descriptor_matches_the_persisted_byte_layout() {
+    let seed = 0x1716_1514_1312_1110;
+    let logical = 0x2726_2524_2322_2120;
+    let count = 0x3736_3534_3332_3130;
+    let profile = ChunkingProfile::fastcdc_v2020(257, 1024, 65_538, seed).unwrap();
+    let wire = [
+        1, 1, 0, 1, 1, 1, 0, 0, 0, 4, 0, 0, 2, 0, 1, 0, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
+        0x17, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35,
+        0x36, 0x37,
+    ];
+    assert_eq!(encode_file_header(profile, logical, count), wire);
+    let file = ObjectId::new([3; 32]);
+    assert_eq!(
+        super::decode_file_header(file, &wire).unwrap(),
+        (profile, logical, count)
+    );
+    for index in 0..4 {
+        let mut invalid = wire;
+        invalid[index] ^= 1;
+        assert!(matches!(super::decode_file_header(file, &invalid),
+            Err(ContentError::InvalidObject { object, .. }) if object == file));
+    }
+}
+
+#[test]
 fn merged_final_fastcdc_chunks_are_rejected() {
     let profile = ChunkingProfile::ASTRID_V1;
     let bytes = deterministic_bytes(1024 * 1024);

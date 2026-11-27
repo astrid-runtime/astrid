@@ -1,23 +1,8 @@
 //! Transition payload shared by the root journal and the write-ahead log.
+pub(super) use crate::storage_words::little_endian;
 use vstd::prelude::*;
 
 verus! {
-
-pub(super) fn little_endian(value: u64) -> (bytes: [u8;8])
-    ensures bytes@ == vstd::bytes::spec_u64_to_le_bytes(value),
-{
-    proof { vstd::bytes::spec_u64_to_le_bytes_to_open(value); }
-    let bytes = [
-        (value & 255) as u8, ((value >> 8) & 255) as u8,
-        ((value >> 16) & 255) as u8, ((value >> 24) & 255) as u8,
-        ((value >> 32) & 255) as u8, ((value >> 40) & 255) as u8,
-        ((value >> 48) & 255) as u8, ((value >> 56) & 255) as u8,
-    ];
-    assert(bytes@ =~= vstd::bytes::spec_u64_to_le_bytes_open(value));
-    bytes
-}
-
-
 
 #[derive(Clone, Copy)]
 pub(super) struct Scheme {

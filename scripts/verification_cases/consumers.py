@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from . import persistent_process, runtime_residency, storage, workspace_commit
+from . import file_descriptor, persistent_process, runtime_residency, storage, workspace_commit
 from .common import (
     LEASE_CALLBACK,
     replace_once,
@@ -13,6 +13,7 @@ def consumer_defects():
     """Weaken a production guarantee and require its trace consumer to fail."""
     yield from persistent_process.defects()
     yield from workspace_commit.defects()
+    yield from file_descriptor.defects()
     splice = Path("crates/astrid-capsule/src/engine/wasm/host/io/splice.rs")
     splice_trace = Path("verification/hosted_io_splice.rs")
     for name, original, changed in [

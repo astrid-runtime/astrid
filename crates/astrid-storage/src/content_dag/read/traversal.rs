@@ -1,13 +1,11 @@
 use alloc::{sync::Arc, vec::Vec};
 
-use crate::storage_model::{
-    ObjectClass, ObjectId, ObjectKind, ObjectRecord, ReferenceKind, ReferenceLabel,
-};
+use crate::storage_model::{ObjectClass, ObjectId, ObjectKind, ObjectRecord, ReferenceKind};
 
 use crate::content_dag::{
-    CHUNK_TREE_FANOUT, CONTENT_LABEL, ChunkingProfile, ContentError, FORMAT_VERSION,
+    CHUNK_TREE_FANOUT, ChunkingProfile, ContentError, FORMAT_VERSION,
     boundary::{is_canonical_boundary, is_canonical_final_chunk},
-    decode_file_header,
+    file_wire,
 };
 
 use super::{
@@ -727,54 +725,8 @@ pub(super) fn decode_file(
     object: ObjectId,
     record: &ObjectRecord,
 ) -> Result<(ChunkingProfile, u64, u64, Option<ObjectId>), ContentError> {
-    if record.kind() != ObjectKind::File
-        || record.format_version() != FORMAT_VERSION
-        || record.class() != ObjectClass::Metadata
-        || record.logical_bytes() != 0
-    {
-        return Err(ContentError::InvalidObject {
-            object,
-            detail: "invalid file object type or accounting",
-        });
-    }
-    let (profile, logical_bytes, chunk_count) =
-        decode_file_header(object, record.canonical_bytes())?;
-    if logical_bytes != 0
-        && (chunk_count == 1) != (logical_bytes <= u64::from(profile.maximum_bytes()))
-    {
-        return Err(ContentError::InvalidObject {
-            object,
-            detail: "file chunk count violates the whole-object threshold",
-        });
-    }
-    let label = ReferenceLabel::new(CONTENT_LABEL);
-    let content = record.reference(&label);
-    match (
-        logical_bytes,
-        chunk_count,
-        content,
-        record.references().len(),
-    ) {
-        (0, 0, None, 0) => Ok((profile, 0, 0, None)),
-        (0, _, _, _) => Err(ContentError::InvalidObject {
-            object,
-            detail: "empty file has chunks or content",
-        }),
-        (_, 0, _, _) => Err(ContentError::InvalidObject {
-            object,
-            detail: "non-empty file has no chunks",
-        }),
-        (_, _, Some(reference), 1) if reference.kind() == ReferenceKind::Owns => Ok((
-            profile,
-            logical_bytes,
-            chunk_count,
-            Some(reference.target()),
-        )),
-        _ => Err(ContentError::InvalidObject {
-            object,
-            detail: "invalid file content reference",
-        }),
-    }
+    file_wire::parse(record, FORMAT_VERSION, ChunkingProfile::fastcdc_v2020)
+        .map_err(|error| error.at(object))
 }
 
 fn validate_chunk(

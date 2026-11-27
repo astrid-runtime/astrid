@@ -1,6 +1,11 @@
 // Verus entry point for transitions used by hosted Astrid.
 
 extern crate self as astrid_core;
+#[path = "../crates/astrid-storage/src/content_dag/file_wire.rs"]
+mod file_wire;
+#[path = "../crates/astrid-storage/src/storage_words.rs"]
+mod storage_words;
+mod hosted_file_descriptor;
 #[path = "../crates/astrid-storage/src/content/catalog/summary.rs"]
 mod catalog_summary;
 mod hosted_catalog_charge;

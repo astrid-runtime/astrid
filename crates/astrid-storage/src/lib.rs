@@ -64,6 +64,7 @@ pub mod resources;
 pub mod secret;
 /// Portable executable model for principal state.
 pub mod storage_model;
+mod storage_words;
 pub mod volume;
 
 pub use capsule_registry::{

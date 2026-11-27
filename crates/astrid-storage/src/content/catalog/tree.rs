@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::convert::Infallible;
 
-use crate::content_dag::{ContentReadError, ContentSource, describe_content};
+use crate::content_dag::{ChunkingProfile, FORMAT_VERSION, file_wire};
 use crate::storage_model::{
     ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ObjectReference,
     ReferenceKind, ReferenceLabel,
@@ -564,35 +563,23 @@ fn validate_file_length(
     value: CatalogValue,
     load: &mut impl FnMut(ObjectId) -> Result<ObjectRecord, PrincipalContentError>,
 ) -> Result<(), PrincipalContentError> {
-    let record = load(value.file)?;
-    let source = SingleObjectSource {
-        object: value.file,
-        record,
-    };
-    let descriptor = describe_content(&source, value.file).map_err(|error| match error {
-        ContentReadError::Content(error) => PrincipalContentError::Content(error),
-        ContentReadError::Source(error) => match error {},
-    })?;
-    if descriptor.logical_bytes() != value.logical_bytes {
-        return Err(invalid(
+    file_wire::check_length(
+        value.file,
+        value.logical_bytes,
+        FORMAT_VERSION,
+        load,
+        ChunkingProfile::fastcdc_v2020,
+    )
+    .map_err(|error| match error {
+        file_wire::LengthError::Load(error) => error,
+        file_wire::LengthError::Decode(error) => {
+            PrincipalContentError::Content(error.at(value.file))
+        },
+        file_wire::LengthError::Mismatch => invalid(
             value.file,
             "content catalog and file logical lengths disagree",
-        ));
-    }
-    Ok(())
-}
-
-struct SingleObjectSource {
-    object: ObjectId,
-    record: ObjectRecord,
-}
-
-impl ContentSource for SingleObjectSource {
-    type Error = Infallible;
-
-    fn load_content_object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, Self::Error> {
-        Ok((id == self.object).then(|| self.record.clone()))
-    }
+        ),
+    })
 }
 
 fn descend(

@@ -46,6 +46,9 @@ INVOCATION_OWNER = Path("crates/astrid-capsule/src/engine/wasm/invocation_owner/
 MOUNT = Path("crates/astrid-capsule/src/engine/wasm/mount_selection.rs")
 PAIR_RESULT = Path("crates/astrid-kernel/src/kernel_router/admin/pair_issue_result.rs")
 INPUTS = [
+    Path("crates/astrid-storage/src/storage_words.rs"),
+    Path("crates/astrid-storage/src/content_dag/file_wire.rs"),
+    Path("verification/hosted_file_descriptor.rs"),
     Path("crates/astrid-storage/src/content/catalog/summary.rs"),
     Path("verification/hosted_catalog_charge.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/host/io/splice.rs"),
