@@ -46,4 +46,32 @@ fn restart_snapshot<C: ?Sized,A>(views: &HashMap<u64,HashMap<u64,Id>>, instances
     view_lookup::snapshot(views,instances,&principal,&package,expected)
 }
 
+// Compose the installed snapshot with the reservation made during preparation.
+// A new artifact is allowed, while the running owner scope is preserved.
+fn prepare_restart<C: ?Sized,A>(next: &mut u64, views: &HashMap<u64,HashMap<u64,Id>>,
+    instances: &HashMap<Id,Entry<C,A>>, principal: u64, package: u64,
+    expected: Option<&Id>, observed_owner: Option<u64>, artifact: [u8;32])
+    -> (out: Option<(Arc<C>,Id)>)
+    requires hash_map_inv(views), hash_map_inv(instances), obeys_key_model::<Id>(), obeys_concrete_eq::<Id>(),
+        vstd::pervasive::obeys_clone_eq::<Id>(), obeys_concrete_eq::<RuntimeScope>(),
+        views@.contains_key(principal) ==> hash_map_inv(&views@[principal]),
+    ensures ({
+        let live = views@[principal]@[package];
+        let scope = match observed_owner { Some(uid) => RuntimeScope::Principal(uid), None => RuntimeScope::SystemResident };
+        if views@.contains_key(principal) && views@[principal]@.contains_key(package)
+            && instances@.contains_key(live) && (expected.is_none() || *expected.unwrap() == live)
+            && live.identity().0.2 == scope && *old(next) < u64::MAX {
+            &&& out matches Some((handle,id)) && handle == instances@[live].capsule
+                && id.identity() == ((package,artifact,live.identity().0.2),*old(next))
+            &&& *final(next) as int == *old(next) as int + 1
+        } else { out.is_none() && *final(next) == *old(next) }
+    }),
+{
+    let view_lookup::RestartSnapshot::Current(running,handle) =
+        restart_snapshot(views,instances,principal,package,expected) else { return None; };
+    let candidate = crate::hosted_runtime_residency::reserve_replacement(
+        next,package,artifact,running.key().scope(),observed_owner)?;
+    Some((handle,candidate))
+}
+
 }

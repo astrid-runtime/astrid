@@ -48,8 +48,7 @@ fn issue_runtime(next: &mut u64, id: u64, artifact: [u8;32], allowed: bool, prov
     Some((*key.capsule_id(), *key.artifact(), issued_owner, issued.generation()))
 }
 
-
-fn reserve_replacement(next: &mut u64, package: u64, artifact: [u8;32],
+pub(super) fn reserve_replacement(next: &mut u64, package: u64, artifact: [u8;32],
     running: RuntimeScope, observed_owner: Option<u64>)
     -> (out: Option<crate::runtime_generation::RuntimeId<u64,[u8;32],RuntimeScope>>)
     requires vstd::laws_eq::obeys_concrete_eq::<RuntimeScope>(),

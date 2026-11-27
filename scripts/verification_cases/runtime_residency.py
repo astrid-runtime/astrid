@@ -35,6 +35,15 @@ def defects():
             lambda s, c=clause: replace_once(s, c, c.split("=>")[0] + "=> out,"),
             Path("verification/hosted_registry_lookup.rs"),
         )
+    for name, original, weakened in [
+        ("loses captured scope", "id.identity() == ((package,artifact,running),*old(next))", "id.identity().1 == *old(next)"),
+        ("consumes a generation on refusal", "out.is_none() && *final(next) == *old(next)\n        } else {\n            out matches Some(id)", "out.is_none()\n        } else {\n            out matches Some(id)"),
+    ]:
+        yield (
+            f"composed restart preparation {name}", Path("verification/hosted_runtime_residency.rs"),
+            lambda s, a=original, b=weakened: replace_once(s, a, b),
+            Path("verification/hosted_registry_lookup.rs"),
+        )
     viewers = Path("crates/astrid-capsule/src/registry/viewers.rs")
     yield (
         "restart viewer selection can ignore a matching slot", viewers,
