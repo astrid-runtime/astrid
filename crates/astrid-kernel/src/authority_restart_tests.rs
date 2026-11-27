@@ -191,6 +191,29 @@ async fn restored_fences_cover_legacy_and_renamed_reservations_in_both_stores() 
         .unwrap();
     let capabilities = CapabilityStore::in_memory();
     let allowances = AllowanceStore::new();
+    let grant = |alias: &PrincipalId| Allowance {
+        id: AllowanceId::new(),
+        principal: alias.clone(),
+        action_pattern: AllowancePattern::ServerTools {
+            server: "test".to_owned(),
+        },
+        created_at: Timestamp::now(),
+        expires_at: None,
+        max_uses: None,
+        uses_remaining: None,
+        session_only: true,
+        workspace_root: None,
+        signature: KeyPair::generate().sign(b"recovery"),
+    };
+    let cases = [
+        (old, true),
+        (renamed, true),
+        (legacy, true),
+        (unrelated, false),
+    ];
+    for (alias, _) in &cases {
+        allowances.add_allowance(grant(alias)).unwrap();
+    }
     let (capabilities, allowances) = super::authority_recovery::restore_retirement_fences(
         &snapshot,
         &recovered,
@@ -199,27 +222,17 @@ async fn restored_fences_cover_legacy_and_renamed_reservations_in_both_stores() 
     )
     .await
     .unwrap();
-    for (alias, expected) in [
-        (old, true),
-        (renamed, true),
-        (legacy, true),
-        (unrelated, false),
-    ] {
+    for (alias, expected) in cases {
         assert_eq!(capabilities.is_principal_retiring(&alias).await, expected);
-        let allowance = Allowance {
-            id: AllowanceId::new(),
-            principal: alias,
-            action_pattern: AllowancePattern::ServerTools {
-                server: "test".to_owned(),
-            },
-            created_at: Timestamp::now(),
-            expires_at: None,
-            max_uses: None,
-            uses_remaining: None,
-            session_only: true,
-            workspace_root: None,
-            signature: KeyPair::generate().sign(b"recovery"),
-        };
-        assert_eq!(allowances.add_allowance(allowance).is_err(), expected);
+        assert_eq!(allowances.count_for(&alias), usize::from(!expected));
+        let result = allowances.add_allowance(grant(&alias));
+        if expected {
+            assert!(
+                matches!(result, Err(astrid_approval::ApprovalError::Storage(message))
+                if message == format!("principal {alias} is retiring"))
+            );
+        } else {
+            result.unwrap();
+        }
     }
 }

@@ -274,7 +274,7 @@ impl AllowanceStore {
             .allowances
             .write()
             .map_err(|e| ApprovalError::Storage(e.to_string()))?;
-        allowances.remove(principal);
+        retirement::purge_grants(&mut allowances, principal);
         Ok(())
     }
 

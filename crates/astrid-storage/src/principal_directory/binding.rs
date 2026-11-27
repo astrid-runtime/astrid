@@ -1,5 +1,13 @@
 //! Immutable owner selection for staged principal operations.
 
+use std::{collections::HashMap, hash::Hash};
+#[cfg(verus_keep_ghost)]
+use vstd::{
+    laws_eq::obeys_concrete_eq,
+    pervasive::{cloned, obeys_clone_eq},
+    std_specs::hash::{hash_map_inv, obeys_key_model},
+};
+
 use vstd::prelude::*;
 
 verus! {
@@ -43,14 +51,6 @@ pub(super) fn with_pair<T,R,F:FnOnce(T)->R>(
 }
 
 }
-
-use std::{collections::HashMap, hash::Hash};
-#[cfg(verus_keep_ghost)]
-use vstd::{
-    laws_eq::obeys_concrete_eq,
-    pervasive::{cloned, obeys_clone_eq},
-    std_specs::hash::{hash_map_inv, obeys_key_model},
-};
 
 verus! {
 broadcast use vstd::std_specs::hash::group_hash_axioms;

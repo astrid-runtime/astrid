@@ -1,13 +1,13 @@
 //! Membership of principal retirement fences in the authority stores.
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     hash::{BuildHasher, Hash},
 };
 use vstd::prelude::*;
 #[cfg(verus_keep_ghost)]
 use vstd::{
     laws_eq::obeys_concrete_eq,
-    std_specs::hash::{builds_valid_hashers, hash_set_inv, obeys_key_model},
+    std_specs::hash::{builds_valid_hashers, hash_map_inv, hash_set_inv, obeys_key_model},
 };
 
 verus! {
@@ -27,6 +27,14 @@ pub fn fenced<K: Eq + Hash, S: BuildHasher>(set: &HashSet<K,S>, principal: &K) -
     ensures closed == set@.contains(*principal),
 {
     set.contains(principal)
+}
+
+/// Remove the entire grant bucket of a fenced principal.
+pub fn purge_grants<K: Eq + Hash,V,S: BuildHasher>(grants: &mut HashMap<K,V,S>, principal: &K)
+    requires builds_valid_hashers::<S>(), hash_map_inv(old(grants)), obeys_key_model::<K>(), obeys_concrete_eq::<K>(),
+    ensures hash_map_inv(final(grants)), final(grants)@ == old(grants)@.remove(*principal),
+{
+    grants.remove(principal);
 }
 
 /// Reopen only the named principal after reclamation.

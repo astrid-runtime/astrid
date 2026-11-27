@@ -207,7 +207,9 @@ impl PrincipalDirectory {
             })
     }
 
-    /// Select the retained and distinct live aliases to fence for a pending deletion at startup.
+    /// Select the retained and distinct live aliases of a pending deletion at startup.
+    /// Both names reflect one directory observation before the returned iterator is consumed.
+    #[must_use = "consume the aliases to restore their retirement fences"]
     pub fn retirement_aliases(
         &self,
         uid: PrincipalUid,

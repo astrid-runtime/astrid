@@ -45,12 +45,13 @@ proof fn split(rows: Seq<(&u64,&Reservation)>, directory: Map<u64,u64>, probe: u
 }
 
 fn recover(reservations: &BTreeMap<u64,Reservation>, directory: &HashMap<u64,u64>,
-    capabilities: &mut HashSet<u64>, allowances: &mut HashSet<u64>, probe: u64)
-    requires btree_map_wf(reservations), hash_map_inv(directory),
+    capabilities: &mut HashSet<u64>, allowances: &mut HashSet<u64>, grants: &mut HashMap<u64,u64>, probe: u64)
+    requires hash_map_inv(old(grants)), btree_map_wf(reservations), hash_map_inv(directory),
         hash_set_inv(old(capabilities)), hash_set_inv(old(allowances)),
     ensures ({
         let named = exists|uid:u64| #[trigger] reservations@.contains_key(uid)
             && names(uid,reservations@[uid].alias,directory@,probe);
+        &&& final(grants)@.get(probe) == if named { None } else { old(grants)@.get(probe) }
         &&& final(capabilities)@.contains(probe) == (old(capabilities)@.contains(probe) || named)
         &&& final(allowances)@.contains(probe) == (old(allowances)@.contains(probe) || named)
     }),
@@ -70,8 +71,10 @@ fn recover(reservations: &BTreeMap<u64,Reservation>, directory: &HashMap<u64,u64
         }
     }
     loop
-        invariant hash_map_inv(directory), cursor.decrease().is_some(),
+        invariant hash_map_inv(grants), hash_map_inv(directory), cursor.decrease().is_some(),
             named == (exists|uid:u64| #[trigger] reservations@.contains_key(uid) && names(uid,reservations@[uid].alias,directory@,probe)), hash_set_inv(capabilities), hash_set_inv(allowances),
+            (if pending(cursor.remaining(),directory@,probe) { None } else { grants@.get(probe) })
+                == (if named { None } else { old(grants)@.get(probe) }),
             (capabilities@.contains(probe) || pending(cursor.remaining(),directory@,probe))
                 == (old(capabilities)@.contains(probe) || named),
             (allowances@.contains(probe) || pending(cursor.remaining(),directory@,probe))
@@ -86,7 +89,18 @@ fn recover(reservations: &BTreeMap<u64,Reservation>, directory: &HashMap<u64,u64
             return;
         };
         proof { split(prior,directory@,probe); }
-        crate::model::recovered_fence_membership(directory,uid,alias.copied(),capabilities,allowances,probe);
+        crate::model::recovered_fence_membership(directory,uid,alias.copied(),capabilities,allowances,grants,probe);
     }
+}
+}
+
+verus! {
+// Finishing one reclamation can never reopen another principal's fence.
+fn release_fence(closed: &mut HashSet<u64>, finished: u64, probe: u64) -> (still_closed: bool)
+    requires hash_set_inv(old(closed)),
+    ensures still_closed == (old(closed)@.contains(probe) && probe != finished),
+{
+    crate::principal_fences::release(closed,&finished);
+    crate::principal_fences::fenced(closed,&probe)
 }
 }

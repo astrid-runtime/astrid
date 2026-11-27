@@ -581,6 +581,7 @@ fn apply_tracker_event<K: Eq + std::hash::Hash + Clone>(
         let before = OperationState { retired,active };
         let full = event is Begin && active == usize::MAX;
         let expected = if full { before } else { operation_step(before,event) };
+        &&& (event is Finish || event is Resume) ==> final(entries)@.contains_key(key) == (expected.retired || expected.active > 0)
         &&& admitted == (event is Begin && !retired && !full)
         &&& crate::principal_invocation_state::binding(final(entries)@,key) == (expected.retired,expected.active)
         &&& final(entries)@.get(other) == old(entries)@.get(other)
@@ -871,26 +872,29 @@ verus! {
 pub(super) fn recovered_fence_membership(
     directory: &std::collections::HashMap<u64,u64>, uid: u64, retained: Option<u64>,
     capabilities: &mut std::collections::HashSet<u64>, allowances: &mut std::collections::HashSet<u64>,
-    probe: u64,
+    grants: &mut std::collections::HashMap<u64,u64>, probe: u64,
 ) -> (closed: (bool,bool))
-    requires vstd::std_specs::hash::hash_map_inv(directory),
+    requires vstd::std_specs::hash::hash_map_inv(old(grants)), vstd::std_specs::hash::hash_map_inv(directory),
         vstd::std_specs::hash::hash_set_inv(old(capabilities)), vstd::std_specs::hash::hash_set_inv(old(allowances)),
-    ensures vstd::std_specs::hash::hash_set_inv(final(capabilities)), vstd::std_specs::hash::hash_set_inv(final(allowances)),
+    ensures vstd::std_specs::hash::hash_map_inv(final(grants)), vstd::std_specs::hash::hash_set_inv(final(capabilities)), vstd::std_specs::hash::hash_set_inv(final(allowances)),
         closed == (final(capabilities)@.contains(probe),final(allowances)@.contains(probe)), ({
         let named = retained == Some(probe) || directory@.get(uid) == Some(probe);
-        closed == (old(capabilities)@.contains(probe) || named, old(allowances)@.contains(probe) || named)
+        &&& final(grants)@.get(probe) == if named { None } else { old(grants)@.get(probe) }
+        &&& closed == (old(capabilities)@.contains(probe) || named, old(allowances)@.contains(probe) || named)
     }),
 {
-    use crate::principal_fences::{fence,fenced};
+    use crate::principal_fences::{fence,fenced,purge_grants};
     let targets = crate::principal_binding::recovery_aliases(directory,&uid,retained);
     assert(targets[0].is_some() && targets[1].is_some() ==> targets[0] != targets[1]);
     if let Some(first) = targets[0] {
         fence(capabilities,first);
         fence(allowances,first);
+        purge_grants(grants,&first);
     }
     if let Some(second) = targets[1] {
         fence(capabilities,second);
         fence(allowances,second);
+        purge_grants(grants,&second);
     }
     (fenced(capabilities,&probe),fenced(allowances,&probe))
 }

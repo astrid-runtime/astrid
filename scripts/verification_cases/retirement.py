@@ -32,8 +32,19 @@ def defects():
             lambda s, a=original, b=changed: replace_once(s, a, b),
             Path("verification/hosted_retirement_recovery.rs"),
         )
+    for name, original, changed in [
+        ("loses another grant bucket", "final(grants)@ == old(grants)@.remove(*principal)", "!final(grants)@.contains_key(*principal)"),
+        ("may release another fence", "final(set)@ == old(set)@.remove(*principal)", "!final(set)@.contains(*principal)"),
+    ]:
+        yield (
+            f"completed retirement {name}", fences,
+            lambda s, a=original, b=changed: replace_once(s, a, b),
+            Path("verification/hosted_retirement_recovery.rs") if "fence" in name else Path("verification/hosted_authority_model.rs"),
+        )
     tracker = Path("crates/astrid-capsule/src/engine/wasm/principal_tracker/state.rs")
     for name, original, changed in [
+        ("may retain a drained idle entry", "final(entries)@.contains_key(key) == (after.0 || after.1 > 0)", "(after.0 || after.1 > 0) ==> final(entries)@.contains_key(key)"),
+        ("drain may erase another principal", "&&& final(entries)@.remove(key) == old(entries)@.remove(key)\n", "&&& true\n"),
         ("loses guard owner", "guard == if allowed { Some(*principal) } else { None }", "guard.is_some() == allowed"),
         ("may erase another retirement", "final(entries)@.remove(key) == old(entries)@.remove(key),", "true,"),
         ("loses the drain observation", "n == binding(entries@,*key).1", "true"),
