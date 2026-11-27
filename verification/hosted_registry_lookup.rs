@@ -384,9 +384,12 @@ fn route_replacement<C: ?Sized>(instances: &mut HashMap<Id,Entry<C,u64>>,
 {
     let ghost before = views@;
     let publication = crate::generation_replacement::Replacement {
-        expected:&expected, reserved:&reserved, source, entry:Entry {capsule:replacement,owner_alias}
+        expected:&expected, reserved:&reserved, source, materialize:|v:Arc<C>| -> (out:Arc<C>) ensures out == v, { v }, candidate:replacement, owner_alias
     };
-    let old_handle = publication.apply(instances,views,routes,sources,names,aliases)?;
+    let old_handle = match publication.apply(instances,views,routes,sources,names,aliases) {
+        Ok(previous) => previous,
+        Err(rejected) => { assert(rejected == replacement); return None; },
+    };
     assert(views@[viewer]@[package] == reserved);
     assert(views@[viewer]@.values().contains(reserved));
     proof { if views@.contains_key(outsider) && views@[outsider]@.values().contains(reserved) {
@@ -464,9 +467,9 @@ fn publish_principal_if_current<C: ?Sized>(instances:&mut HashMap<Id,Entry<C,u64
     crate::generation_replacement::admit_principal(views,&principal,&package,uid,expected,reserved,
         || -> (out:bool) ensures out == provides, { provides })?;
     let publication = crate::generation_replacement::Replacement {
-        expected, reserved, source, entry:Entry { capsule:replacement, owner_alias:Some(principal) }
+        expected, reserved, source, materialize:|v:Arc<C>| -> (out:Arc<C>) ensures out == v, { v }, candidate:replacement, owner_alias:Some(principal)
     };
-    if publication.apply(instances,views,routes,sources,names,aliases).is_none() { return Ok(None); }
+    if publication.apply(instances,views,routes,sources,names,aliases).is_err() { return Ok(None); }
     assert(views@[principal]@[package] == *reserved);
     assert(views@[principal]@.values().contains(*reserved));
     assert(routes@.contains_key((source,principal)));

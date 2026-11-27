@@ -103,15 +103,15 @@ fn swap_and_retry(instances: &mut std::collections::HashMap<u64, crate::instance
         crate::instance_swap::Entry { capsule: candidate, owner_alias: owner }),
 {
     let ghost before = instances@;
-    let replaced = crate::instance_swap::replace(instances, &old_id, new_id, candidate.clone(), owner);
-    assert(replaced == Some(before[old_id].capsule));
+    let replaced = crate::instance_swap::replace(instances, &old_id, new_id, candidate.clone(), owner, |v:std::sync::Arc<u64>| -> (out:std::sync::Arc<u64>) ensures out == v, { v });
+    assert(replaced == Ok(before[old_id].capsule));
     let installed = crate::instance_swap::installed(instances, &new_id);
     assert(installed == Some(candidate));
     let removed = crate::instance_swap::installed(instances, &old_id);
     assert(removed.is_none());
     assert(!instances@.contains_key(old_id));
-    let retry = crate::instance_swap::replace(instances, &old_id, new_id, candidate, owner);
-    assert(retry.is_none());
+    let retry = crate::instance_swap::replace(instances, &old_id, new_id, candidate, owner, |v:std::sync::Arc<u64>| -> (out:std::sync::Arc<u64>) ensures out == v, { v });
+    assert(retry == Err(candidate));
 }
 }
 

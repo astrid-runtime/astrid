@@ -112,8 +112,10 @@ def defects():
         )
     replacement = Path("crates/astrid-capsule/src/registry/generation_replacement.rs")
     for name, clause in [
-        ("loses the retired handle", "previous == Some(old(instances)@[retired].capsule)"),
-        ("loses the installed generation", "final(instances)@ == old(instances)@.remove(retired).insert(next,self.entry)"),
+        ("loses the rejected candidate", "previous == Err(self.candidate)"),
+        ("loses the installed capsule", "self.materialize.ensures((self.candidate,),final(instances)@[next].capsule)"),
+        ("loses the retired handle", "previous == Ok(old(instances)@[retired].capsule)"),
+        ("loses the installed generation", "final(instances)@ == old(instances)@.remove(retired).insert(next,instance_swap::Entry { capsule:final(instances)@[next].capsule, owner_alias:self.owner_alias })"),
         ("loses reverse provenance", "final(sources)@ == reverse.insert(next,self.source)"),
         ("loses the public package", "final(names)@ == retained_names.insert(self.source,next.identity().0.0)"),
         ("loses legacy alias retirement", "final(aliases)@ == if exists|id:Id<K,A>|"),
@@ -289,10 +291,11 @@ def defects():
         )
     for name, original, weaker in [
         ("can rewrite an unrelated view", "ensures *final(slot) == if *old(slot) == *expected { *reserved } else { *old(slot) }", "ensures *old(slot) == *expected ==> *final(slot) == *reserved"),
-        ("loses retired handle", "out == Some(before[*expected].capsule)", "out.is_some()"),
+        ("loses rejected candidate", "out == Err(candidate) && final(instances)@ == before", "out.is_err() && final(instances)@ == before"),
+        ("loses retired handle", "out == Ok(before[*expected].capsule)", "out.is_ok()"),
         ("loses installed handle", "ensures out == if instances@.contains_key", "ensures false ==> out == if instances@.contains_key"),
-        ("loses installed entry", "final(instances)@ == before.remove(*expected).insert(reserved, Entry { capsule, owner_alias })", "true"),
-        ("permits stale retry to change another entry", "out.is_none() && final(instances)@ == before", "out.is_none()"),
+        ("loses installed entry", "final(instances)@ == before.remove(*expected).insert(reserved, Entry { capsule: final(instances)@[reserved].capsule, owner_alias })", "true"),
+        ("permits stale retry to change another entry", "out == Err(candidate) && final(instances)@ == before", "out == Err(candidate)"),
     ]:
         yield (
             f"registry replacement {name}", swap,

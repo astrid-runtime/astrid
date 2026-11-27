@@ -51,20 +51,23 @@ pub(super) fn admit_principal<K: Eq + Hash,A: Eq + Hash,P: Eq + Hash,F: FnOnce()
     Ok(())
 }
 
-pub(super) struct Replacement<'a,K,A,P,U,C: ?Sized> {
+pub(super) struct Replacement<'a,K,A,P,U,T,F> {
     pub(super) expected: &'a Id<K,A>,
     pub(super) reserved: &'a Id<K,A>,
     pub(super) source: U,
-    pub(super) entry: instance_swap::Entry<C,P>,
+    pub(super) candidate: T,
+    pub(super) materialize: F,
+    pub(super) owner_alias: Option<P>,
 }
 
-impl<K: Eq + Hash + Clone,A: Eq + Hash + Clone,P: Eq + Hash + Clone,U: Eq + Hash + Copy,C: ?Sized>
-    Replacement<'_,K,A,P,U,C> {
-    pub(super) fn apply(self, instances: &mut HashMap<Id<K,A>,instance_swap::Entry<C,P>>,
+impl<K: Eq + Hash + Clone,A: Eq + Hash + Clone,P: Eq + Hash + Clone,U: Eq + Hash + Copy,T,F>
+    Replacement<'_,K,A,P,U,T,F> {
+    pub(super) fn apply<C: ?Sized>(self, instances: &mut HashMap<Id<K,A>,instance_swap::Entry<C,P>>,
         views: &mut HashMap<P,HashMap<K,Id<K,A>>>, routes: &mut HashMap<(U,P),Id<K,A>>,
         sources: &mut HashMap<Id<K,A>,U>, names: &mut HashMap<U,K>, aliases: &mut HashMap<U,A>)
-        -> (previous:Option<Arc<C>>)
-        requires hash_map_inv(old(instances)), hash_map_inv(old(views)), hash_map_inv(old(routes)),
+        -> (previous:Result<Arc<C>,T>)
+        where F: FnOnce(T) -> Arc<C>
+        requires self.materialize.requires((self.candidate,)), hash_map_inv(old(instances)), hash_map_inv(old(views)), hash_map_inv(old(routes)),
             hash_map_inv(old(sources)), hash_map_inv(old(names)), hash_map_inv(old(aliases)),
             forall|p:P| old(views)@.contains_key(p) ==> hash_map_inv(&old(views)@[p]),
             obeys_key_model::<Id<K,A>>(), obeys_concrete_eq::<Id<K,A>>(), obeys_clone_eq::<Id<K,A>>(),
@@ -78,7 +81,7 @@ impl<K: Eq + Hash + Clone,A: Eq + Hash + Clone,P: Eq + Hash + Clone,U: Eq + Hash
                 let retired = *self.expected;
                 let next = *self.reserved;
                 if !old(instances)@.contains_key(retired) {
-                    &&& previous.is_none()
+                    &&& previous == Err(self.candidate)
                     &&& final(instances)@ == old(instances)@ && final(views)@ == old(views)@ && final(routes)@ == old(routes)@
                     &&& final(sources)@ == old(sources)@ && final(names)@ == old(names)@ && final(aliases)@ == old(aliases)@
                 } else {
@@ -87,8 +90,9 @@ impl<K: Eq + Hash + Clone,A: Eq + Hash + Clone,P: Eq + Hash + Clone,U: Eq + Hash
                     let retained_names = if old(sources)@.contains_key(retired) && !reverse.values().contains(old_source) {
                         old(names)@.remove(old_source)
                     } else { old(names)@ };
-                    &&& previous == Some(old(instances)@[retired].capsule)
-                    &&& final(instances)@ == old(instances)@.remove(retired).insert(next,self.entry)
+                    &&& previous == Ok(old(instances)@[retired].capsule)
+                    &&& self.materialize.ensures((self.candidate,),final(instances)@[next].capsule)
+                    &&& final(instances)@ == old(instances)@.remove(retired).insert(next,instance_swap::Entry { capsule:final(instances)@[next].capsule, owner_alias:self.owner_alias })
                     &&& final(sources)@ == reverse.insert(next,self.source)
                     &&& final(names)@ == retained_names.insert(self.source,next.identity().0.0)
                     &&& final(aliases)@ == if exists|id:Id<K,A>| final(instances)@.contains_key(id) &&
@@ -110,12 +114,12 @@ impl<K: Eq + Hash + Clone,A: Eq + Hash + Clone,P: Eq + Hash + Clone,U: Eq + Hash
         proof { reveal(obeys_clone_eq); }
         let installed = self.reserved.clone();
         assert(vstd::pervasive::cloned(*self.reserved,installed));
-        let previous = instance_swap::replace(instances,self.expected,installed,self.entry.capsule,self.entry.owner_alias)?;
+        let previous = instance_swap::replace(instances,self.expected,installed,self.candidate,self.owner_alias,self.materialize)?;
         dependent_views::withdraw_source(sources,names,self.expected);
         registration::replace_viewer_routes(views,routes,self.source,self.expected,self.reserved);
         registration::record_source(sources,names,self.reserved,self.source);
         dependent_views::prune_legacy(aliases,instances,self.expected.key().artifact());
-        Some(previous)
+        Ok(previous)
     }
 }
 }

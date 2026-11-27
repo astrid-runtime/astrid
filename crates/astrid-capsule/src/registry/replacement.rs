@@ -209,10 +209,9 @@ impl CapsuleRegistry {
             expected,
             reserved: &runtime_id,
             source: capsule_source_uuid(runtime_id.key().capsule_id(), runtime_id.key().artifact()),
-            entry: super::instance_swap::Entry {
-                capsule: Arc::from(replacement),
-                owner_alias,
-            },
+            candidate: replacement,
+            materialize: Arc::from,
+            owner_alias,
         };
         let previous = replacement
             .apply(
@@ -223,7 +222,7 @@ impl CapsuleRegistry {
                 &mut self.uuid_id_map,
                 &mut self.legacy_uuid_map,
             )
-            .ok_or_else(|| CapsuleError::NotFound(format!("runtime {expected:?}")))?;
+            .map_err(|_| CapsuleError::NotFound(format!("runtime {expected:?}")))?;
         Ok(ReplacedRuntime {
             runtime_id,
             previous,

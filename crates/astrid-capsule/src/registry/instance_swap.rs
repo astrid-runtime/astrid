@@ -17,24 +17,26 @@ pub(super) struct Entry<C: ?Sized, A> {
 }
 
 /// Return the previous capsule and install the candidate at the reserved key.
-pub(super) fn replace<K: Eq + Hash, C: ?Sized, A>(
+pub(super) fn replace<K: Eq + Hash, C: ?Sized, A,T,F: FnOnce(T) -> Arc<C>>(
     instances: &mut HashMap<K, Entry<C, A>>, expected: &K, reserved: K,
-    capsule: Arc<C>, owner_alias: Option<A>,
-) -> (out: Option<Arc<C>>)
-    requires hash_map_inv(old(instances)), obeys_key_model::<K>(), obeys_concrete_eq::<K>(),
+    candidate: T, owner_alias: Option<A>, materialize: F,
+) -> (out: Result<Arc<C>,T>)
+    requires materialize.requires((candidate,)), hash_map_inv(old(instances)), obeys_key_model::<K>(), obeys_concrete_eq::<K>(),
     ensures hash_map_inv(final(instances)), ({
         let before = old(instances)@;
         if before.contains_key(*expected) {
-            &&& out == Some(before[*expected].capsule)
-            &&& final(instances)@ == before.remove(*expected).insert(reserved, Entry { capsule, owner_alias })
+            &&& out == Ok(before[*expected].capsule)
+            &&& materialize.ensures((candidate,),final(instances)@[reserved].capsule)
+            &&& final(instances)@ == before.remove(*expected).insert(reserved, Entry { capsule: final(instances)@[reserved].capsule, owner_alias })
         } else {
-            out.is_none() && final(instances)@ == before
+            out == Err(candidate) && final(instances)@ == before
         }
     }),
 {
-    let prior = instances.remove(expected)?;
+    let Some(prior) = instances.remove(expected) else { return Err(candidate); };
+    let capsule = materialize(candidate);
     instances.insert(reserved, Entry { capsule, owner_alias });
-    Some(prior.capsule)
+    Ok(prior.capsule)
 }
 
 /// Resolve the exact installed generation, including its artifact and scope.
