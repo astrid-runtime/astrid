@@ -8,12 +8,23 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 
 use crate::content::{ContentName, PrincipalContentError, PrincipalContentStore};
 use crate::engine::PrincipalProjectionEngine;
+use crate::storage_model::RootState;
+
+/// Directories confirmed against one principal-root generation.
+///
+/// A hit is valid only while `root` is still the current projection root.
+/// A newer generation drops confirmations that were not re-proved, so a
+/// removal published by another view cannot survive.
+struct ConfirmedDirectories {
+    root: Option<RootState>,
+    paths: HashSet<String>,
+}
 
 /// One validated relative path inside an Astrid filesystem view.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -167,19 +178,15 @@ pub enum FilesystemError {
 pub struct AstridFilesystem<P: Ord, E> {
     content: Arc<PrincipalContentStore<P, E>>,
     owner: P,
-    confirmed_directories: OnceLock<Arc<Mutex<HashSet<String>>>>,
+    confirmed_directories: Arc<Mutex<ConfirmedDirectories>>,
 }
 
 impl<P: Clone + Ord, E> Clone for AstridFilesystem<P, E> {
     fn clone(&self) -> Self {
-        let confirmed_directories = OnceLock::new();
-        if let Some(cache) = self.confirmed_directories.get() {
-            let _ = confirmed_directories.set(Arc::clone(cache));
-        }
         Self {
             content: Arc::clone(&self.content),
             owner: self.owner.clone(),
-            confirmed_directories,
+            confirmed_directories: Arc::clone(&self.confirmed_directories),
         }
     }
 }
@@ -187,11 +194,14 @@ impl<P: Clone + Ord, E> Clone for AstridFilesystem<P, E> {
 impl<P: Ord, E> AstridFilesystem<P, E> {
     /// Bind a filesystem view to one already-authorized owner.
     #[must_use]
-    pub const fn new(content: Arc<PrincipalContentStore<P, E>>, owner: P) -> Self {
+    pub fn new(content: Arc<PrincipalContentStore<P, E>>, owner: P) -> Self {
         Self {
             content,
             owner,
-            confirmed_directories: OnceLock::new(),
+            confirmed_directories: Arc::new(Mutex::new(ConfirmedDirectories {
+                root: None,
+                paths: HashSet::new(),
+            })),
         }
     }
 
@@ -534,8 +544,11 @@ where
         if self.directory_exists(path)? {
             return Err(FilesystemError::IsDirectory(path.clone()));
         }
-        self.content.put(&self.owner, &path.file_name()?, bytes)?;
-        self.remember_directory(&path.parent());
+        let published = self
+            .content
+            .put(&self.owner, &path.file_name()?, bytes)?
+            .principal_root();
+        self.remember_directory_at(&path.parent(), published);
         Ok(())
     }
 
@@ -557,9 +570,11 @@ where
         if self.directory_exists(path)? {
             return Err(FilesystemError::IsDirectory(path.clone()));
         }
-        self.content
-            .put_streaming(&self.owner, &path.file_name()?, source)?;
-        self.remember_directory(&path.parent());
+        let published = self
+            .content
+            .put_streaming(&self.owner, &path.file_name()?, source)?
+            .principal_root();
+        self.remember_directory_at(&path.parent(), published);
         Ok(())
     }
 
@@ -599,9 +614,12 @@ where
         if self.entry_exists(path)? {
             return Err(FilesystemError::AlreadyExists(path.clone()));
         }
-        self.content
-            .put(&self.owner, &path.directory_marker()?, &[])?;
-        self.remember_directory(path);
+        let published = self
+            .content
+            .put(&self.owner, &path.directory_marker()?, &[])?
+            .principal_root();
+        self.remember_directory_at(&path.parent(), published);
+        self.remember_directory_at(path, published);
         Ok(())
     }
 
@@ -761,10 +779,7 @@ where
             FilesystemEntry {
                 kind: FilesystemEntryKind::Directory,
                 ..
-            } => {
-                self.remember_directory(&parent);
-                Ok(())
-            },
+            } => Ok(()),
             _ => Err(FilesystemError::NotDirectory(parent)),
         }
     }
@@ -784,42 +799,59 @@ where
         if self.cached_directory(path) {
             return Ok(true);
         }
+        let observed = self.content.projection_root(&self.owner)?;
         if self
             .content
             .describe(&self.owner, &path.directory_marker()?)?
             .is_some()
         {
-            self.remember_directory(path);
+            if let Some(root) = observed {
+                self.remember_directory_at(path, root);
+            }
             return Ok(true);
         }
         let prefix = path.directory_prefix();
         if self.content.prefix_exists(&self.owner, &prefix)? {
-            self.remember_directory(path);
+            if let Some(root) = observed {
+                self.remember_directory_at(path, root);
+            }
             return Ok(true);
         }
         Ok(false)
     }
 
     fn cached_directory(&self, path: &FilesystemPath) -> bool {
-        self.confirmed_directories
-            .get()
-            .is_some_and(|cache| cache.lock().contains(path.as_str()))
+        // Freeze the confirmation set before sampling the root. A commit that
+        // lands before the sample must not match an older snapshot.
+        let cache = self.confirmed_directories.lock();
+        let Ok(Some(root)) = self.content.projection_root(&self.owner) else {
+            return false;
+        };
+        cache.root == Some(root) && cache.paths.contains(path.as_str())
     }
 
-    fn remember_directory(&self, path: &FilesystemPath) {
-        if path.as_str().is_empty() {
-            return;
+    fn remember_directory_at(&self, path: &FilesystemPath, published: RootState) {
+        let mut cache = self.confirmed_directories.lock();
+        if let Some(cached) = cache.root {
+            if published.generation < cached.generation {
+                return;
+            }
+            if cached != published {
+                cache.paths.clear();
+                cache.root = Some(published);
+            }
+        } else {
+            cache.root = Some(published);
         }
-        self.confirmed_directories
-            .get_or_init(|| Arc::new(Mutex::new(HashSet::new())))
-            .lock()
-            .insert(path.as_str().to_owned());
+        if !path.as_str().is_empty() {
+            cache.paths.insert(path.as_str().to_owned());
+        }
     }
 
     fn invalidate_directory_cache(&self) {
-        if let Some(cache) = self.confirmed_directories.get() {
-            cache.lock().clear();
-        }
+        let mut cache = self.confirmed_directories.lock();
+        cache.root = None;
+        cache.paths.clear();
     }
 }
 

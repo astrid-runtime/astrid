@@ -304,6 +304,60 @@ async fn removed_directory_is_not_cached_as_still_present() {
 }
 
 #[tokio::test]
+async fn independent_views_do_not_keep_a_removed_directory() {
+    let (_directory, first) = filesystem().await;
+    let second = AstridFilesystem::new(Arc::clone(&first.content), first.owner);
+    let early = first.clone();
+    let directory = FilesystemPath::new("docs").unwrap();
+    let notes = FilesystemPath::new("notes").unwrap();
+    let child = FilesystemPath::new("docs/note").unwrap();
+    first.create_dir(&directory).unwrap();
+    first.create_dir(&notes).unwrap();
+    assert_eq!(
+        second.stat(&directory).unwrap().kind(),
+        FilesystemEntryKind::Directory
+    );
+    assert_eq!(
+        early.stat(&notes).unwrap().kind(),
+        FilesystemEntryKind::Directory
+    );
+    second.remove(&notes).unwrap();
+    assert_eq!(
+        first.stat(&directory).unwrap().kind(),
+        FilesystemEntryKind::Directory
+    );
+    assert!(matches!(
+        first.stat(&notes),
+        Err(FilesystemError::NotFound(_))
+    ));
+    assert!(matches!(
+        early.stat(&notes),
+        Err(FilesystemError::NotFound(_))
+    ));
+    assert!(matches!(
+        second.stat(&notes),
+        Err(FilesystemError::NotFound(_))
+    ));
+    first.remove(&directory).unwrap();
+    assert!(matches!(
+        second.stat(&directory),
+        Err(FilesystemError::NotFound(_))
+    ));
+    assert!(matches!(
+        early.stat(&directory),
+        Err(FilesystemError::NotFound(_))
+    ));
+    assert!(matches!(
+        second.write(&child, b"x"),
+        Err(FilesystemError::NotFound(_))
+    ));
+    assert!(matches!(
+        early.write(&child, b"x"),
+        Err(FilesystemError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
 async fn renamed_directory_is_not_cached_under_the_old_name() {
     let (_directory, filesystem) = filesystem().await;
     let from = FilesystemPath::new("from").unwrap();
