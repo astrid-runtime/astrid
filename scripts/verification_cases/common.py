@@ -212,6 +212,7 @@ INPUTS = [
     Path("crates/astrid-capsule/src/engine/wasm/host/process/persistent/selection.rs"),
     Path("crates/astrid-capsule/src/registry/source_lookup.rs"),
     Path("crates/astrid-capsule/src/registry/view_lookup.rs"),
+    Path("crates/astrid-capsule/src/registry/registration.rs"),
     Path("crates/astrid-capsule/src/registry/viewers.rs"),
     Path("crates/astrid-capsule/src/registry/dependent_views.rs"),
     Path("crates/astrid-capsule/src/registry/instance_swap.rs"),

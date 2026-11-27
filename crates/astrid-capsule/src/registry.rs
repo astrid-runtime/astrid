@@ -57,6 +57,7 @@ fn system_uplink_descriptors(capsule: &dyn Capsule) -> CapsuleResult<Vec<UplinkD
 
 mod dependent_views;
 mod instance_swap;
+mod registration;
 mod source_lookup;
 mod view_lookup;
 pub use view_lookup::RestartSnapshot;
@@ -262,14 +263,14 @@ impl CapsuleRegistry {
         view_principal: &PrincipalId,
         owner_alias: Option<PrincipalId>,
     ) -> CapsuleResult<RuntimeId> {
-        let id = capsule.id().clone();
-        if runtime_id.key().capsule_id() != &id {
+        let id = runtime_id.key().capsule_id();
+        if id != capsule.id() {
             return Err(CapsuleError::ExecutionFailed(format!(
-                "reserved runtime belongs to '{}', not '{id}'",
-                runtime_id.key().capsule_id()
+                "reserved runtime belongs to '{id}', not '{}'",
+                capsule.id()
             )));
         }
-        let artifact = runtime_id.key().artifact().clone();
+        let artifact = runtime_id.key().artifact();
         let scope = runtime_id.key().scope();
         if matches!(scope, RuntimeScope::Principal(_)) && !capsule.manifest().uplinks.is_empty() {
             return Err(CapsuleError::UnsupportedEntryPoint(format!(
@@ -279,7 +280,7 @@ impl CapsuleRegistry {
         if self
             .views
             .get(view_principal)
-            .is_some_and(|view| view.contains_key(&id))
+            .is_some_and(|view| view.contains_key(id))
         {
             return Err(CapsuleError::UnsupportedEntryPoint(format!(
                 "Already registered: {id}"
@@ -307,21 +308,23 @@ impl CapsuleRegistry {
         }
 
         info!(capsule_id = %id, ?scope, view = %view_principal, hash = %artifact, generation, "Registered authority-scoped capsule runtime");
-        let source_uuid = capsule_source_uuid(&id, &artifact);
-        self.instances.insert(
-            runtime_id.clone(),
-            InstanceEntry {
+        let source_uuid = capsule_source_uuid(id, artifact);
+        Ok(registration::Registration {
+            runtime: runtime_id,
+            principal: view_principal.clone(),
+            source: source_uuid,
+            entry: InstanceEntry {
                 capsule,
                 owner_alias,
             },
-        );
-        view_lookup::bind(&mut self.views, view_principal.clone(), runtime_id.clone());
-        self.uuid_map
-            .insert((source_uuid, view_principal.clone()), runtime_id.clone());
-        self.source_uuid_by_runtime
-            .insert(runtime_id.clone(), source_uuid);
-        self.uuid_id_map.insert(source_uuid, id);
-        Ok(runtime_id)
+        }
+        .publish(
+            &mut self.instances,
+            &mut self.views,
+            &mut self.uuid_map,
+            &mut self.source_uuid_by_runtime,
+            &mut self.uuid_id_map,
+        ))
     }
 
     /// Publish a reserved runtime while preserving the candidate on error.

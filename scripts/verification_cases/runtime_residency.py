@@ -14,6 +14,21 @@ def defects():
             lambda s, a=original: replace_once(s, a, "ensures true" if a.startswith("ensures ") else "true"),
             Path("verification/hosted_route_retirement.rs"),
         )
+    registration = Path("crates/astrid-capsule/src/registry/registration.rs")
+    for name, clause in [
+        ("can return another generation", "ensures runtime == self.runtime"),
+        ("can lose the installed handle or owner", "final(instances)@ == old(instances)@.insert(runtime,self.entry)"),
+        ("can redirect scoped dispatch", "final(routes)@ == old(routes)@.insert((self.source,self.principal),runtime)"),
+        ("can lose reverse provenance", "final(sources)@ == old(sources)@.insert(runtime,self.source)"),
+        ("can change the public package name", "final(names)@ == old(names)@.insert(self.source,runtime.identity().0.0)"),
+        ("can alter a foreign principal", "final(views)@.remove(self.principal) == old(views)@.remove(self.principal)"),
+        ("can discard a sibling package", "final(views)@[self.principal]@ == (if old(views)@.contains_key(self.principal)"),
+    ]:
+        yield (
+            f"runtime registration {name}", registration,
+            lambda s, a=clause: replace_once(s, a, a.replace("ensures ", "ensures false ==> ") if a.startswith("ensures ") else "false ==> " + a),
+            Path("verification/hosted_registry_lookup.rs"),
+        )
     sweep = Path("crates/astrid-capsule/src/registry/dependent_views.rs")
     for name, clause in [
         ("loses full-generation route removal", "tear_down ==> final(routes)@ == kept(old(routes)@,*runtime)"),

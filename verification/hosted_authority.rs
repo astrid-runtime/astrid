@@ -302,6 +302,8 @@ mod source_lookup;
 mod hosted_source_lookup;
 #[path = "../crates/astrid-capsule/src/registry/view_lookup.rs"]
 mod view_lookup;
+#[path = "../crates/astrid-capsule/src/registry/registration.rs"]
+mod registration;
 mod hosted_registry_lookup;
 #[path = "../crates/astrid-capsule/src/registry/viewers.rs"]
 mod viewers;

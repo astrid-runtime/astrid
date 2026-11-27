@@ -165,3 +165,65 @@ fn shared_attachment_routes_to_the_selected_package_and_artifact()
     assert!(!Arc::ptr_eq(&original, &sibling_handle));
     Ok(())
 }
+
+#[test]
+fn private_registration_dispatch_and_removal_restore_existing_source_indexes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut registry = CapsuleRegistry::new();
+    let peer = pid("peer");
+    let principal = pid("new-owner");
+    let existing = CapsuleId::from_static("existing-service");
+    let package = CapsuleId::from_static("fresh-service");
+    let artifact = test_hash("new-bytes");
+    let peer_artifact = test_hash("peer-bytes");
+    registry.register_principal_runtime(
+        Box::new(MockCapsule::new(existing.as_str())),
+        peer_artifact.clone(),
+        &peer,
+        uid(1),
+    )?;
+    let peer_handle = registry.get_for(&peer, &existing).unwrap();
+    let source = capsule_source_uuid(&package, &artifact);
+    registry.register_instance_uuid(source, peer_artifact);
+    let views = registry.views.clone();
+    let routes = registry.uuid_map.clone();
+    let sources = registry.source_uuid_by_runtime.clone();
+    let names = registry.uuid_id_map.clone();
+
+    let generation = registry.register_principal_runtime(
+        Box::new(MockCapsule::new(package.as_str())),
+        artifact,
+        &principal,
+        uid(2),
+    )?;
+    let handle = registry.get_for(&principal, &package).unwrap();
+    assert_eq!(
+        registry.runtime_id_for(&principal, &package),
+        Some(generation.clone())
+    );
+    assert!(Arc::ptr_eq(
+        &handle,
+        &registry
+            .find_instance_by_uuid_for(&principal, &source)
+            .unwrap()
+    ));
+    assert!(Arc::ptr_eq(
+        &peer_handle,
+        &registry.find_instance_by_uuid_for(&peer, &source).unwrap()
+    ));
+    let removed = registry.unregister_for(&principal, &package)?;
+    assert!(removed.torn_down);
+    assert_eq!(removed.removed_principals, vec![principal]);
+    assert!(Arc::ptr_eq(&removed.capsule, &handle));
+    assert!(!registry.instances.contains_key(&generation));
+    assert_eq!(registry.instances.len(), 1);
+    assert!(Arc::ptr_eq(
+        &peer_handle,
+        &registry.get_for(&peer, &existing).unwrap()
+    ));
+    assert_eq!(registry.views, views);
+    assert_eq!(registry.uuid_map, routes);
+    assert_eq!(registry.source_uuid_by_runtime, sources);
+    assert_eq!(registry.uuid_id_map, names);
+    Ok(())
+}

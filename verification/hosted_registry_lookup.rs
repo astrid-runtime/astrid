@@ -197,6 +197,79 @@ fn publish_view(views: &mut HashMap<u64,HashMap<u64,Id>>, principal: u64, runtim
     }
 }
 
+// Registration publishes the concrete handle and owner alias, then both
+// production lookup paths must resolve that same handle, even with a legacy alias.
+fn register_and_resolve<C: ?Sized>(instances: &mut HashMap<Id,Entry<C,u64>>,
+    views: &mut HashMap<u64,HashMap<u64,Id>>, routes: &mut HashMap<(u64,u64),Id>,
+    sources: &mut HashMap<Id,u64>, names: &mut HashMap<u64,u64>, aliases: &HashMap<u64,[u8;32]>,
+    registration: crate::registration::Registration<u64,[u8;32],u64,u64,C>) -> (out:(Id,Arc<C>,Arc<C>))
+    requires hash_map_inv(old(instances)), hash_map_inv(old(views)), hash_map_inv(old(routes)),
+        hash_map_inv(old(sources)), hash_map_inv(old(names)), hash_map_inv(aliases),
+        obeys_key_model::<Id>(), obeys_concrete_eq::<Id>(), vstd::pervasive::obeys_clone_eq::<Id>(),
+        obeys_key_model::<(u64,u64)>(), obeys_concrete_eq::<(u64,u64)>(), obeys_concrete_eq::<[u8;32]>(),
+        old(views)@.contains_key(registration.principal) ==> hash_map_inv(&old(views)@[registration.principal]),
+    ensures ({
+        let id = registration.runtime;
+        let p = registration.principal;
+        let u = registration.source;
+        let k = id.identity().0.0;
+        &&& out == (id,registration.entry.capsule,registration.entry.capsule)
+        &&& final(instances)@ == old(instances)@.insert(id,registration.entry)
+        &&& final(routes)@ == old(routes)@.insert((u,p),id)
+        &&& final(sources)@ == old(sources)@.insert(id,u)
+        &&& final(names)@ == old(names)@.insert(u,k)
+        &&& final(views)@.remove(p) == old(views)@.remove(p)
+        &&& final(views)@.contains_key(p) && final(views)@[p]@ ==
+            (if old(views)@.contains_key(p) { old(views)@[p]@ } else { Map::empty() }).insert(k,id)
+    }),
+{
+    let principal = registration.principal;
+    let source = registration.source;
+    let runtime = registration.publish(instances,views,routes,sources,names);
+    let package = runtime.key().capsule_id();
+    let by_package = view_lookup::capsule_for(views,instances,&principal,package).unwrap();
+    let by_source = crate::source_lookup::capsule_for(routes,aliases,instances,views,(source,principal)).unwrap();
+    (runtime,by_package,by_source)
+}
+
+// A first registration for this principal and source can be removed without
+// changing any pre-existing index. Capture the dispatched handle before detaching.
+fn round_trip_private_registration<C: ?Sized>(instances: &mut HashMap<Id,Entry<C,u64>>,
+    views: &mut HashMap<u64,HashMap<u64,Id>>, routes: &mut HashMap<(u64,u64),Id>,
+    sources: &mut HashMap<Id,u64>, names: &mut HashMap<u64,u64>, aliases: &HashMap<u64,[u8;32]>,
+    registration: crate::registration::Registration<u64,[u8;32],u64,u64,C>) -> (out:(Arc<C>,Arc<C>,Vec<u64>))
+    requires hash_map_inv(old(instances)), hash_map_inv(old(views)), hash_map_inv(old(routes)),
+        hash_map_inv(old(sources)), hash_map_inv(old(names)), hash_map_inv(aliases),
+        obeys_key_model::<Id>(), obeys_concrete_eq::<Id>(), vstd::pervasive::obeys_clone_eq::<Id>(),
+        obeys_key_model::<(u64,u64)>(), obeys_concrete_eq::<(u64,u64)>(),
+        vstd::pervasive::obeys_clone_eq::<(u64,u64)>(), obeys_concrete_eq::<[u8;32]>(),
+        forall|p:u64| old(views)@.contains_key(p) ==> hash_map_inv(&old(views)@[p]),
+        registration.runtime.identity().0.2 is Principal,
+        !old(instances)@.contains_key(registration.runtime), !old(views)@.contains_key(registration.principal),
+        !old(routes)@.contains_key((registration.source,registration.principal)), !old(routes)@.values().contains(registration.runtime),
+        !old(sources)@.contains_key(registration.runtime), !old(sources)@.values().contains(registration.source),
+        !old(names)@.contains_key(registration.source),
+    ensures out.0 == registration.entry.capsule, out.1 == out.0, out.2@ == seq![registration.principal],
+        final(instances)@ == old(instances)@, final(views)@ == old(views)@, final(routes)@ == old(routes)@,
+        final(sources)@ == old(sources)@, final(names)@ == old(names)@,
+{
+    let ghost initial_views = views@;
+    let ghost initial_routes = routes@;
+    let principal = registration.principal;
+    let source = registration.source;
+    let id = registration.publish(instances,views,routes,sources,names);
+    let handle = crate::source_lookup::capsule_for(routes,aliases,instances,views,(source,principal)).unwrap();
+    let (captured,previous) = view_lookup::detach(views,instances,&principal,id.key().capsule_id()).unwrap();
+    assert(views@ =~= initial_views);
+    let mut removed = Vec::new();
+    removed.push(principal);
+    let torn_down = crate::dependent_views::depart(views,instances,&captured,&principal,&mut removed);
+    assert(torn_down);
+    crate::dependent_views::revoke_sources(routes,sources,names,&captured,&principal,torn_down);
+    assert(routes@ =~= initial_routes);
+    (handle,previous.unwrap(),removed)
+}
+
 // Bind a selected shared generation to one principal, including its exact
 // installed handle. A miss cannot publish a route to a principal-owned runtime.
 fn select_and_publish_shared<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
