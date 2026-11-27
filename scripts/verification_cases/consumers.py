@@ -13,12 +13,15 @@ def consumer_defects():
     trace = Path("verification/hosted_consent_reply.rs")
     for name, original, changed, target in [
         ("grants unknown decisions", "else {Decision::Deny}\n}\n\n/// Hosted", "else {Decision::Once}\n}\n\n/// Hosted", reply),
-        ("skips persistent publication", "save(principal,action)?;", "let _ = (principal,action);", reply),
+        ("skips persistent publication", "save_at(p,a,destination,writer)?;", "let _ = destination;", reply),
         ("reports the wrong scope", "Ok(decision)\n}", "Ok(Decision::Always)\n}", reply),
-        ("loses persistent acknowledgement", "value == Decision::Always && save.ensures((principal,action),Ok(()))", "value == Decision::Always", trace),
-        ("loses the persistence error", "Err(error) => save.ensures((principal,action),Err(error))", "Err(error) => true", trace),
-        ("loses the hosted workspace", "hosted.ensures((principal,action,path),out)", "true", trace),
-        ("loses the Astrid workspace scope", "workspace.ensures((principal,action),out)", "true", trace),
+        ("loses persistent acknowledgement", "value == Decision::Always && old(writer).permits(p,a,d,Ok(()))", "value == Decision::Always", trace),
+        ("loses the persistence error", "Err(error) => old(writer).permits(p,a,d,Err(error))", "Err(error) => true", trace),
+        ("writes both workspace scopes", "Destination::Hosted(path) => writer.hosted(p,a,path)", "Destination::Hosted(path) => {let _ = writer.workspace(p,a); writer.hosted(p,a,path)}", reply),
+        ("misroutes a hosted write", "Destination::Hosted(path) => writer.hosted(p,a,path)", "Destination::Hosted(path) => writer.workspace(p,a)", reply),
+        ("writes after a nonpersistent reply", "save_at(p,a,destination,writer)?;\n    }", "save_at(p,a,destination,writer)?;\n    } else if let Ok(d) = target {let _ = save_at(p,a,d,writer);}", reply),
+        ("loses the exclusive write history", "final(writer).attempts() == match target {", "true || final(writer).attempts() == match target {", trace),
+        ("suppresses an unusable destination", "Err(e) => out == Err(e)", "Err(e) => true", trace),
     ]:
         yield (
             f"approval reply {name}", reply,

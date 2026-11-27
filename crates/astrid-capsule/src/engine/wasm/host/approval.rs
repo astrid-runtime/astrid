@@ -5,12 +5,14 @@
 //! then the shared [`AllowanceStore`] (instant path), then publishes an
 //! [`ApprovalRequired`] IPC event and blocks until the frontend responds.
 
+use super::consent_reply::{self, Decision, Destination, Writer};
 use crate::audit_sink::HostApprovalScope;
 use crate::engine::wasm::bindings::astrid::approval::host::{
     self as approval, ApprovalDecision, ApprovalRequest, ApprovalResponse, ErrorCode,
 };
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
+use crate::profile_cache::PrincipalProfileCache;
 use astrid_approval::action::SensitiveAction;
 use astrid_approval::{Allowance, AllowanceId, AllowancePattern, AllowanceStore};
 use astrid_core::principal::PrincipalId;
@@ -134,33 +136,47 @@ fn approval_location(state: &HostState) -> CommandApprovalLocation {
     }
 }
 
-/// An Always response is truthful only after its profile write succeeds.
-/// Failed persistence is an error, not a silently downgraded approval.
-fn persist_always(
-    state: &HostState,
-    principal: &PrincipalId,
-    action: &str,
-) -> Result<(), ErrorCode> {
-    let cache = state
-        .profile_cache
-        .as_ref()
-        .ok_or(ErrorCode::StoreUnavailable)?;
-    use super::consent_reply::{Destination, save_at};
-    let destination = match approval_location(state) {
-        CommandApprovalLocation::AstridWorkspace => Destination::AstridWorkspace,
-        CommandApprovalLocation::Hosted => Destination::Hosted(hosted_workspace_identity(state)?),
-    };
-    let persisted = save_at(
-        principal,
-        action,
-        destination,
-        |owner, family, path| cache.persist_command_always(owner, family, Some(path)),
-        |owner, family| cache.persist_astrid_command_always(owner, family),
-    );
-    persisted.map_err(|error| {
-        tracing::warn!(%error, "Cannot persist Always approval");
-        ErrorCode::StoreUnavailable
-    })
+struct CommandGrants<'a>(&'a HostState);
+
+impl<'a> CommandGrants<'a> {
+    fn destination(&self) -> Result<Destination<&'a str>, ErrorCode> {
+        self.0
+            .profile_cache
+            .as_ref()
+            .ok_or(ErrorCode::StoreUnavailable)?;
+        match approval_location(self.0) {
+            CommandApprovalLocation::AstridWorkspace => Ok(Destination::AstridWorkspace),
+            CommandApprovalLocation::Hosted => {
+                Ok(Destination::Hosted(hosted_workspace_identity(self.0)?))
+            },
+        }
+    }
+
+    fn write(
+        &self,
+        publish: impl FnOnce(&PrincipalProfileCache) -> Result<(), astrid_core::profile::ProfileError>,
+    ) -> Result<(), ErrorCode> {
+        let cache = self
+            .0
+            .profile_cache
+            .as_deref()
+            .ok_or(ErrorCode::StoreUnavailable)?;
+        publish(cache).map_err(|error| {
+            tracing::warn!(%error, "Cannot persist Always approval");
+            ErrorCode::StoreUnavailable
+        })
+    }
+}
+
+impl Writer<&PrincipalId, &str, &str> for CommandGrants<'_> {
+    type Error = ErrorCode;
+
+    fn hosted(&mut self, owner: &PrincipalId, family: &str, path: &str) -> Result<(), ErrorCode> {
+        self.write(|cache| cache.persist_command_always(owner, family, Some(path)))
+    }
+    fn workspace(&mut self, owner: &PrincipalId, family: &str) -> Result<(), ErrorCode> {
+        self.write(|cache| cache.persist_astrid_command_always(owner, family))
+    }
 }
 
 /// Sanitize a guest-supplied display field in place.
@@ -430,6 +446,8 @@ impl approval::Host for HostState {
                 decision: ApprovalDecision::Denied,
             });
         };
+        let mut grants = CommandGrants(self);
+        let destination = grants.destination();
         let request_id = Uuid::new_v4().to_string();
         let response_topic = Topic::approval_response(&request_id);
         // Durable before the prompt is published.
@@ -494,12 +512,12 @@ impl approval::Host for HostState {
                         IpcPayload::ApprovalResponse {
                             decision, reason, ..
                         } => {
-                            use super::consent_reply::{Decision, apply};
-                            let outcome = apply(
+                            let outcome = consent_reply::apply(
                                 decision.as_bytes(),
                                 &principal,
                                 request.action.as_str(),
-                                |owner, action| persist_always(self, owner, action),
+                                destination,
+                                &mut grants,
                             )
                             .inspect_err(|_| {
                                 audit.denied("user", "approve_always could not be persisted");

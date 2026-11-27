@@ -24,39 +24,56 @@ pub(super) fn classify(bytes:&[u8]) -> (result:Decision)
 
 /// Hosted grants carry the pristine workspace path. Astrid workspace grants
 /// are scoped by the principal and do not carry a host path.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Destination<W> { Hosted(W), AstridWorkspace }
 
-pub(super) fn save_at<P:Copy,A:Copy,W:Copy,E,H:FnOnce(P,A,W)->Result<(),E>,S:FnOnce(P,A)->Result<(),E>>(
-    principal:P, action:A, destination:Destination<W>, hosted:H, workspace:S,
-) -> (out:Result<(),E>)
-    requires match destination {
-        Destination::Hosted(path) => hosted.requires((principal,action,path)),
-        Destination::AstridWorkspace => workspace.requires((principal,action)),
-    },
-    ensures match destination {
-        Destination::Hosted(path) => hosted.ensures((principal,action,path),out),
-        Destination::AstridWorkspace => workspace.ensures((principal,action),out),
-    },
+/// Each primitive records exactly one attempted profile write, including
+/// attempts that report a storage error.
+pub(super) trait Writer<P:Copy,A:Copy,W:Copy> {
+    type Error;
+    spec fn attempts(&self) -> Seq<(P,A,Destination<W>)>;
+    spec fn permits(&self,p:P,a:A,d:Destination<W>,r:Result<(),Self::Error>) -> bool;
+
+    fn hosted(&mut self,p:P,a:A,path:W) -> (r:Result<(),Self::Error>)
+        ensures final(self).attempts() == old(self).attempts().push((p,a,Destination::Hosted(path))),
+            old(self).permits(p,a,Destination::Hosted(path),r);
+    fn workspace(&mut self,p:P,a:A) -> (r:Result<(),Self::Error>)
+        ensures final(self).attempts() == old(self).attempts().push((p,a,Destination::AstridWorkspace)),
+            old(self).permits(p,a,Destination::AstridWorkspace,r);
+}
+
+pub(super) fn save_at<P:Copy,A:Copy,W:Copy,R:Writer<P,A,W>>(p:P,a:A,d:Destination<W>,writer:&mut R)
+    -> (r:Result<(),R::Error>)
+    ensures final(writer).attempts() == old(writer).attempts().push((p,a,d)), old(writer).permits(p,a,d,r),
 {
-    match destination {
-        Destination::Hosted(path) => hosted(principal,action,path),
-        Destination::AstridWorkspace => workspace(principal,action),
+    match d {
+        Destination::Hosted(path) => writer.hosted(p,a,path),
+        Destination::AstridWorkspace => writer.workspace(p,a),
     }
 }
 
-/// The persistent callback uses the principal and action of the pending prompt.
-pub(super) fn apply<P:Copy,A:Copy,E,F:FnOnce(P,A)->Result<(),E>>(bytes:&[u8],principal:P,action:A,save:F)
-    -> (out:Result<Decision,E>)
-    requires save.requires((principal,action)),
+/// An unusable prompt destination affects only a request for persistence.
+pub(super) fn apply<P:Copy,A:Copy,W:Copy,R:Writer<P,A,W>>(bytes:&[u8],p:P,a:A,
+    target:Result<Destination<W>,R::Error>,writer:&mut R) -> (out:Result<Decision,R::Error>)
     ensures
+        final(writer).attempts() == match target {
+            Ok(d) if scope(bytes@) == Decision::Always => old(writer).attempts().push((p,a,d)),
+            _ => old(writer).attempts(),
+        },
         scope(bytes@) != Decision::Always ==> out == Ok(scope(bytes@)),
-        scope(bytes@) == Decision::Always ==> match out {
-            Ok(value) => value == Decision::Always && save.ensures((principal,action),Ok(())),
-            Err(error) => save.ensures((principal,action),Err(error)),
+        scope(bytes@) == Decision::Always ==> match target {
+            Err(e) => out == Err(e),
+            Ok(d) => match out {
+                Ok(value) => value == Decision::Always && old(writer).permits(p,a,d,Ok(())),
+                Err(error) => old(writer).permits(p,a,d,Err(error)),
+            },
         },
 {
     let decision = classify(bytes);
-    if matches!(decision,Decision::Always) { save(principal,action)?; }
+    if matches!(decision,Decision::Always) {
+        let destination = target?;
+        save_at(p,a,destination,writer)?;
+    }
     Ok(decision)
 }
 

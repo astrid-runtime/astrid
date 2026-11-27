@@ -151,8 +151,8 @@ async fn hosted_approval_does_not_authorize_native_workspace() {
 }
 
 #[tokio::test]
-async fn once_and_session_are_not_saved_as_always() {
-    for decision in ["approve", "approve_session"] {
+async fn only_persistent_approval_can_change_the_saved_profile() {
+    for decision in ["approve", "approve_session", "deny", "unknown", ""] {
         let home = tempfile::tempdir().unwrap();
         answer_action_request(persistent_test_state(home.path()), decision)
             .await
