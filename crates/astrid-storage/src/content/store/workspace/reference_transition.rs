@@ -5,7 +5,7 @@ use super::{ObjectId, ObjectReference, ReferenceLabel};
 use vstd::prelude::*;
 
 verus! {
-pub(super) const BRANCH_REF_PREFIX_BYTES: &[u8;10] = b"workspace/";
+pub(super) const BRANCH_REF_PREFIX_BYTES: &[u8;10] = super::component_labels::WORKSPACE;
 pub(super) const BRANCH_RECEIPT_PREFIX_BYTES: &[u8;19] = b"workspace-promoted/";
 
 pub(super) open spec fn nibble(byte: u8) -> Option<u8> {

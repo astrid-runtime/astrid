@@ -11,6 +11,11 @@ mod commit_candidate;
 mod header_cache;
 #[path = "../crates/astrid-storage/src/content/store/header_graph.rs"]
 mod header_graph;
+#[path = "../crates/astrid-storage/src/content/store/components.rs"]
+mod header_components;
+#[path = "../crates/astrid-storage/src/content/component_labels.rs"]
+mod component_labels;
+mod hosted_header_components;
 mod hosted_workspace_references;
 #[path = "../crates/astrid-capsule/src/context/workspace_commit.rs"]
 mod workspace_commit;

@@ -103,3 +103,20 @@ def defects():
             f"content graph {name}", source,
             lambda s, a=old, b=new: replace_once(s, a, b), trace,
         )
+
+    component_source = Path("crates/astrid-storage/src/content/store/components.rs")
+    component_trace = Path("verification/hosted_header_components.rs")
+    for name, old, new in [
+        ("can accept non-owning state relations", "&&& kind == super::ReferenceKind::Owns", "&&& true"),
+        ("can substitute the selected catalog", "parts.catalog == last_catalog(obs) && forall", "true && forall"),
+        ("can substitute the aggregate charge", "parts.other_bytes == #[trigger] total(obs)", "parts.other_bytes >= #[trigger] total(obs)"),
+        ("can discard preserved references", "&&& parts.preserved@.map_values(|r:ObjectReference| r.fields()) == refs@.filter(|r:ObjectReference| r.fields().0 != CONTENT@).map_values(|r:ObjectReference| r.fields())", "&&& true"),
+        ("can substitute a KV charge", "charge.ensures((owner,Charge::Kv,r,root),Ok(n))", "true"),
+        ("can substitute a workspace charge", "charge.ensures((owner,Charge::Workspace,r,root),Ok(n))", "true"),
+        ("can report overflow without exceeding the budget", "Ok(n)) && bytes+n > u64::MAX", "Ok(n))"),
+        ("can substitute the catalog error", "catalog.ensures((owner,id,root),Err(err))", "true"),
+    ]:
+        yield (
+            f"owner components {name}", component_source,
+            lambda s, a=old, b=new: replace_once(s, a, b), component_trace,
+        )

@@ -174,6 +174,12 @@ impl ObjectReference {
         self.label.0.as_slice()
     }
 
+    pub(crate) fn duplicate(&self) -> (r:Self) ensures r.fields() == self.fields() {
+        let label = self.label.0.clone();
+        assert(label@ =~= self.label.0@);
+        Self { label:ReferenceLabel(label), target:self.target, kind:self.kind }
+    }
+
     pub(crate) fn label_less_than(&self, label:&[u8]) -> (yes:bool)
         ensures yes == before(self.fields().0,label@),
     {

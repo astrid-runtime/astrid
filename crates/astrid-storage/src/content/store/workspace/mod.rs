@@ -15,7 +15,7 @@ use crate::storage_model::{
     ObjectFormatVersion, ObjectId, ObjectRecord, ObjectReference, ReferenceKind,
 };
 
-use super::{root_from_record, validate_catalog};
+use super::{component_labels, root_from_record, validate_catalog};
 
 mod codec;
 mod filesystem;

@@ -11,6 +11,7 @@ pub(crate) use projection_names::{
 
 mod catalog;
 mod change_detection;
+mod component_labels;
 mod kv_projection;
 #[cfg(not(target_family = "wasm"))]
 mod projection_names;

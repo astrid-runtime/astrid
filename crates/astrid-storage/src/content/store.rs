@@ -26,6 +26,7 @@ use super::catalog::{
     build_catalog, decode_legacy_catalog, delete, insert, list, list_prefix as catalog_list_prefix,
     lookup, root_from_record, validate_catalog,
 };
+use super::component_labels;
 use super::kv_projection::PrincipalKvAdapter;
 use super::{
     ContentBatchExpectation, ContentEntry, ContentName, ContentReadBatchEntry, ContentWriteOutcome,
@@ -34,7 +35,6 @@ use super::{
 use crate::kv::{KvQuotaResolver, KvValidationCache, validated_projection_quota};
 use crate::principal_graph::{LEGACY_PRINCIPAL_GRAPH_VERSION, PRINCIPAL_GRAPH_VERSION};
 
-const KV_COMPONENT_LABEL: &[u8] = b"kv";
 const PARENT_LABEL: &[u8] = commit_candidate::PARENT;
 pub(super) const STATE_LABEL: &[u8] = commit_candidate::STATE;
 // Native content transfer target, shared by batched writers and restoration.
@@ -942,6 +942,9 @@ where
 mod append;
 mod bulk;
 mod commit_candidate;
+mod components;
+#[cfg(test)]
+mod components_tests;
 mod constructors;
 mod handoff;
 mod header_cache;

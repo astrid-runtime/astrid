@@ -3,7 +3,7 @@
 mod legacy;
 mod tree;
 
-pub(crate) const CONTENT_COMPONENT_LABEL: &[u8] = b"content";
+pub(crate) const CONTENT_COMPONENT_LABEL: &[u8] = super::component_labels::CONTENT;
 
 pub(crate) use legacy::decode_catalog as decode_legacy_catalog;
 #[cfg(test)]

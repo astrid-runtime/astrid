@@ -1,12 +1,13 @@
-use super::workspace::{is_workspace_branch_label, workspace_branch_quota};
+use super::components::{self, Charge};
+use super::workspace::workspace_branch_quota;
 use super::{
     Arc, BTreeMap, BuiltContent, CONTENT_COMPONENT_LABEL, CatalogRoot, CatalogSummary,
     CatalogValue, ContentBatchExpectation, ContentError, ContentHeader, ContentName,
-    KV_COMPONENT_LABEL, LEGACY_PRINCIPAL_GRAPH_VERSION, ModelError, ObjectClass, ObjectId,
-    ObjectKind, ObjectRecord, ObjectReference, PARENT_LABEL, PRINCIPAL_GRAPH_VERSION,
-    PrincipalContentError, PrincipalContentStore, PrincipalKvAdapter, PrincipalProjectionEngine,
-    PrincipalProjectionError, ReferenceKind, ReferenceLabel, RootState, RootTransaction,
-    STATE_LABEL, invalid, lookup, root_from_record, validate_catalog, validated_projection_quota,
+    LEGACY_PRINCIPAL_GRAPH_VERSION, ModelError, ObjectClass, ObjectId, ObjectKind, ObjectRecord,
+    ObjectReference, PARENT_LABEL, PRINCIPAL_GRAPH_VERSION, PrincipalContentError,
+    PrincipalContentStore, PrincipalKvAdapter, PrincipalProjectionEngine, PrincipalProjectionError,
+    ReferenceLabel, RootState, RootTransaction, STATE_LABEL, invalid, lookup, root_from_record,
+    validate_catalog, validated_projection_quota,
 };
 use crate::content::catalog::prefix_exists as catalog_prefix_exists;
 
@@ -100,67 +101,25 @@ where
             state,
         } = self.read_header_graph(principal, root)?;
 
-        let mut catalog = None;
-        let mut other_quota_bytes = 0_u64;
-        let mut preserved_state = Vec::new();
-        for reference in state.references() {
-            if reference.kind() != ReferenceKind::Owns {
-                return Err(invalid(state_id, "principal component is not owning"));
-            }
-            match reference.label().as_bytes() {
-                CONTENT_COMPONENT_LABEL => {
-                    let record = self
-                        .engine
-                        .load_shared_object_for(principal, reference.target())?
-                        .ok_or_else(|| ContentError::MissingObject(reference.target()))?;
-                    let captured_root = root;
-                    let root = root_from_record(reference.target(), &record)?;
-                    let cached = self
-                        .validated_catalogs
-                        .lock()
-                        .get(principal)
-                        .copied()
-                        .filter(|validation| validation.root == Some(root.object));
-                    let validation = if let Some(validation) = cached {
-                        validation
-                    } else {
-                        #[cfg(test)]
-                        self.catalog_validation_invocations
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let validation = validate_catalog(Some(root), &mut |object| {
-                            self.load_required_for(principal, object)
-                        })?;
-                        self.validated_kv.publish_catalog_if_current(
-                            &self.validated_catalogs, principal, epoch, validation,
-                            || matches!(self.engine.current_root(principal), Ok(Some(current)) if current == captured_root),
-                        );
-                        validation
-                    };
-                    if validation.summary != root.summary {
-                        return Err(invalid(
-                            root.object,
-                            "content catalog validation totals disagree",
-                        ));
-                    }
-                    catalog = Some(root);
-                },
-                KV_COMPONENT_LABEL => {
-                    other_quota_bytes = other_quota_bytes
-                        .checked_add(self.kv_quota(principal, reference.target(), root, epoch)?)
-                        .ok_or(PrincipalContentError::AccountingOverflow)?;
-                    preserved_state.push(reference.clone());
-                },
-                label if is_workspace_branch_label(label) => {
-                    other_quota_bytes = other_quota_bytes
-                        .checked_add(workspace_branch_quota(self, principal, reference)?)
-                        .ok_or(PrincipalContentError::AccountingOverflow)?;
-                    preserved_state.push(reference.clone());
-                },
-                _ => {
-                    preserved_state.push(reference.clone());
-                },
-            }
-        }
+        let components::Components {
+            catalog,
+            other_bytes: other_quota_bytes,
+            preserved: preserved_state,
+        } = components::fold(
+            principal,
+            root,
+            state.references(),
+            |owner, target, root| self.validated_content_root(owner, target, root, epoch),
+            |owner, kind, reference, root| match kind {
+                Charge::Kv => self.kv_quota(owner, reference.target(), root, epoch),
+                Charge::Workspace => workspace_branch_quota(self, owner, reference),
+            },
+        )
+        .map_err(|error| match error {
+            components::Error::NotOwning => invalid(state_id, "principal component is not owning"),
+            components::Error::Overflow => PrincipalContentError::AccountingOverflow,
+            components::Error::Storage(e) => e,
+        })?;
         let preserved_commit = commit
             .references()
             .iter()
@@ -178,6 +137,48 @@ where
             preserved_state,
             preserved_commit,
         })
+    }
+
+    fn validated_content_root(
+        &self,
+        principal: &P,
+        target: ObjectId,
+        captured_root: RootState,
+        epoch: crate::kv::MemoEpoch,
+    ) -> Result<CatalogRoot, PrincipalContentError> {
+        let record = self
+            .engine
+            .load_shared_object_for(principal, target)?
+            .ok_or(ContentError::MissingObject(target))?;
+        let root = root_from_record(target, &record)?;
+        let cached = self
+            .validated_catalogs
+            .lock()
+            .get(principal)
+            .copied()
+            .filter(|validation| validation.root == Some(root.object));
+        let validation = if let Some(validation) = cached {
+            validation
+        } else {
+            #[cfg(test)]
+            self.catalog_validation_invocations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let validation = validate_catalog(Some(root), &mut |object| {
+                self.load_required_for(principal, object)
+            })?;
+            self.validated_kv.publish_catalog_if_current(
+                            &self.validated_catalogs, principal, epoch, validation,
+                            || matches!(self.engine.current_root(principal), Ok(Some(current)) if current == captured_root),
+                        );
+            validation
+        };
+        if validation.summary != root.summary {
+            return Err(invalid(
+                root.object,
+                "content catalog validation totals disagree",
+            ));
+        }
+        Ok(root)
     }
 
     pub(super) fn kv_quota(
