@@ -101,6 +101,10 @@ pub(super) fn admit<P,C,S,F:FnOnce()->Result<C,()>,H:FnOnce()->Result<S,()>>(
 impl<Owner,C,S> ReplyAuthority<Owner,C,S> {
 pub(super) closed spec fn guards(&self) -> (Owner,C,S) { (self._principal,self._caller,self._responder) }
 
+pub(super) fn devices(&self) -> (r:(&C,&S))
+    ensures (*r.0, *r.1) == (self.guards().1,self.guards().2),
+{ (&self._caller,&self._responder) }
+
 /// An unusable prompt destination affects only a request for persistence.
 pub(super) fn apply<P:Copy,A:Copy,W:Copy,R:Writer<P,A,W>>(&self,bytes:&[u8],p:P,a:A,
     target:Result<Destination<W>,R::Error>,writer:&mut R) -> (out:Result<Decision,R::Error>)

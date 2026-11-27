@@ -32,7 +32,7 @@ use astrid_core::profile::{
 };
 use astrid_events::ipc::DeviceStamp;
 
-fn current_command_device(profile: &PrincipalProfile, stamp: DeviceStamp<'_>) -> bool {
+fn current_consent_device(profile: &PrincipalProfile, stamp: DeviceStamp<'_>) -> bool {
     match stamp.fingerprint {
         Some(raw) => DeviceKeyId::new(raw).ok().is_some_and(|key| {
             profile
@@ -273,7 +273,13 @@ impl PrincipalProfileCache {
         capsule_id: &str,
         endpoint: &str,
     ) -> ProfileResult<()> {
-        self.persist_egress_for_profile(principal, capsule_id, endpoint, None)
+        self.persist_egress_for_profile(
+            principal,
+            capsule_id,
+            endpoint,
+            None,
+            [DeviceStamp::default(); 2],
+        )
     }
 
     pub(crate) fn persist_egress_for_profile(
@@ -282,6 +288,7 @@ impl PrincipalProfileCache {
         capsule_id: &str,
         endpoint: &str,
         expected: Option<&Arc<PrincipalProfile>>,
+        devices: [DeviceStamp<'_>; 2],
     ) -> ProfileResult<()> {
         // Serialize the load-modify-save against any other writer on this cache
         // (and against a concurrent `resolve` populating the same key) by
@@ -315,6 +322,14 @@ impl PrincipalProfileCache {
         if expected.is_some_and(|admitted| admitted.as_ref() != &profile) {
             return Err(ProfileError::Invalid(
                 "principal profile changed on disk during consent".into(),
+            ));
+        }
+        if !devices
+            .into_iter()
+            .all(|stamp| current_consent_device(&profile, stamp))
+        {
+            return Err(ProfileError::Invalid(
+                "egress approval device registration changed".into(),
             ));
         }
         let entries = profile
@@ -415,14 +430,26 @@ impl PrincipalProfileCache {
         &self,
         principal: &PrincipalId,
         devices: [DeviceStamp<'_>; 2],
+        expected: Option<&Arc<PrincipalProfile>>,
         install: impl FnOnce(),
     ) -> ProfileResult<()> {
-        let _guard = self
+        let guard = self
             .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let profile = self.load_consent_profile(principal)?;
-        command::on_current_profile(profile, devices, current_command_device, |_| install())
+        if expected.is_some_and(|snapshot| {
+            !guard
+                .profiles
+                .get(principal)
+                .is_some_and(|p| Arc::ptr_eq(p, snapshot))
+                || snapshot.as_ref() != &profile
+        }) {
+            return Err(ProfileError::Invalid(
+                "principal profile changed during consent".into(),
+            ));
+        }
+        command::on_current_profile(profile, devices, current_consent_device, |_| install())
             .ok_or_else(|| ProfileError::Invalid("approval device registration changed".into()))
     }
 
@@ -467,7 +494,7 @@ impl PrincipalProfileCache {
         // Approval cannot resurrect a principal removed while the prompt was open.
         let profile = self.load_consent_profile(principal)?;
         // Device removal can have published since the registry guards were acquired.
-        command::on_current_profile(profile, devices, current_command_device, |mut profile| {
+        command::on_current_profile(profile, devices, current_consent_device, |mut profile| {
             let already = profile.approvals.command_always.iter().any(|grant| {
                 grant.command == command
                     && grant.location == location

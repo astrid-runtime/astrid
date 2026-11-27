@@ -205,7 +205,7 @@ impl<'a> CommandGrants<'a> {
                 .profile_cache
                 .as_ref()
                 .ok_or(ErrorCode::StoreUnavailable)?
-                .with_session_devices(owner, self.devices(owner)?, install)
+                .with_session_devices(owner, self.devices(owner)?, None, install)
                 .map_err(|_| ErrorCode::StoreUnavailable),
         }
     }

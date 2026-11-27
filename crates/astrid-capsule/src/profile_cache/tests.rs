@@ -301,7 +301,13 @@ fn replaced_profile_cannot_inherit_a_pending_egress_approval() {
     assert_eq!(replacement, captured);
     assert!(
         cache
-            .persist_egress_for_profile(&principal, "react", "127.0.0.1:443", Some(&captured))
+            .persist_egress_for_profile(
+                &principal,
+                "react",
+                "127.0.0.1:443",
+                Some(&captured),
+                [Default::default(); 2]
+            )
             .is_err()
     );
     let current = PrincipalProfile::load_required(&cache.astrid_home, &principal).unwrap();
@@ -732,7 +738,7 @@ fn session_install_excludes_the_device_removal_writer_through_the_callback() {
     profile.save(&cache.astrid_home, &alice).unwrap();
 
     cache
-        .with_session_devices(&alice, [stamp; 2], || {
+        .with_session_devices(&alice, [stamp; 2], None, || {
             assert!(matches!(
                 cache.state.try_write(),
                 Err(std::sync::TryLockError::WouldBlock)

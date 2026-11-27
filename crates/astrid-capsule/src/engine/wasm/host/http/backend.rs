@@ -274,15 +274,16 @@ impl HostState {
             return Err(error);
         }
 
-        let (hop, exempt_host) = match super::hop::admit(method, parsed, |_, target| {
-            self.egress_decision_with_consent(target)
-        }) {
-            Ok(admission) => admission,
-            Err(error) => {
-                deny(self, &error_text(&error));
-                return Err(error);
-            },
-        };
+        let (hop, (exempt_host, authority)) =
+            match super::hop::admit(method, parsed, |_, target| {
+                self.egress_decision_with_consent(target)
+            }) {
+                Ok(admission) => admission,
+                Err(error) => {
+                    deny(self, &error_text(&error));
+                    return Err(error);
+                },
+            };
         let exempt = exempt_host.is_some();
 
         // Host-side credential injection: `{{secret:NAME}}` placeholders in
@@ -335,13 +336,19 @@ impl HostState {
         // hangs before sending headers would block this future forever
         // (executor starvation).
         let header_deadline = header_deadline(opts, self.http_limits.header_deadline_floor);
-        let sent = util::bounded_await(&io_semaphore, async move {
+        let cancel = self.effective_cancel_token();
+        let send = util::bounded_await_cancellable(&io_semaphore, &cancel, async move {
             match tokio::time::timeout(header_deadline, request_builder.send()).await {
                 Ok(result) => result.map_err(|e| airlock_or(&tripped, &dns_failed, &e)),
                 Err(_elapsed) => Err(ErrorCode::Timeout),
             }
-        })
-        .await;
+        });
+        let sent = authority
+            .while_live(send)
+            .await
+            .flatten()
+            .unwrap_or(Err(ErrorCode::Closed));
+        drop(authority);
         let response = match sent {
             Ok(response) => response,
             Err(error) => {

@@ -25,7 +25,8 @@ pub use identity::IdentityOperation;
 /// to permit or deny the operation.
 #[async_trait]
 pub trait CapsuleSecurityGate: Send + Sync {
-    /// Check whether the capsule is allowed to make an HTTP request.
+    /// Check whether the capsule is allowed to make an HTTP request. The hosted
+    /// HTTP backend supplies the serialized, parsed URL of the current hop.
     async fn check_http_request(
         &self,
         capsule_id: &str,

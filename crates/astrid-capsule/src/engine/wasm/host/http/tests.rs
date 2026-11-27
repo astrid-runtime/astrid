@@ -344,7 +344,7 @@ async fn consent_grant_yields_exempt_host() {
         &reqwest::Url::parse("http://127.0.0.1:1234/v1/models").unwrap(),
     );
     assert_eq!(
-        decision.unwrap().as_deref(),
+        decision.unwrap().0.as_deref(),
         Some("127.0.0.1"),
         "a consent-granted endpoint must return the exempt host"
     );
@@ -581,7 +581,7 @@ mod e2e {
         let limits = state.http_limits;
         let err = state
             .http_stream_backend(
-                get_request("https://denied.example.invalid/v1/stream".to_string()),
+                get_request("HTTPS://DENIED.EXAMPLE.invalid/v1/stream".to_string()),
                 super::super::options::ResolvedOptions::from_options(follow_opts(), &limits),
             )
             .await

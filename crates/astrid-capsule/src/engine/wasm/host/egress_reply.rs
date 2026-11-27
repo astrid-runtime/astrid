@@ -34,7 +34,7 @@ pub(super) open spec fn destination(decision: Decision, has_profile: bool) -> Op
     }
 }
 
-pub(super) fn apply<T:Copy, W:Writer<T>>(bytes:&[u8], has_profile:bool, target:T, writer:&mut W)
+pub(super) fn apply<P,C,S,T:Copy, W:Writer<T>>(_authority:&consent_reply::ReplyAuthority<P,C,S>, bytes:&[u8], has_profile:bool, target:T, writer:&mut W)
     -> (out:Result<Decision,W::Error>)
     ensures ({
         let decision = consent_reply::scope(bytes@);

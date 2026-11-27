@@ -282,25 +282,35 @@ impl HostState {
     pub(super) fn egress_decision_with_consent(
         &mut self,
         url: &reqwest::Url,
-    ) -> Result<Option<Arc<str>>, ErrorCode> {
+    ) -> Result<
+        (
+            Option<Arc<str>>,
+            super::super::consent_egress::EgressAuthority,
+        ),
+        ErrorCode,
+    > {
         match egress_decision(&self.local_egress, url) {
             Err(ErrorCode::AirlockRejected) => {
                 let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
                     return Err(ErrorCode::AirlockRejected);
                 };
-                if self.consent_local_egress(host, port) {
+                if let Some(authority) = self.admit_local_egress(host, port) {
                     // Consent granted: re-enter the EXEMPT path. The host is
                     // propagated to `SafeDnsResolver.exempt_host` and
                     // `build_redirect_policy(exempt = true)`, so a
                     // consent-granted endpoint behaves identically to a
                     // pre-blessed one (keeps its private literal, refuses
                     // redirects).
-                    Ok(Some(Arc::from(host)))
+                    Ok((Some(Arc::from(host)), authority))
                 } else {
                     Err(ErrorCode::AirlockRejected)
                 }
             },
-            other => other,
+            Ok(exempt) => self
+                .admit_egress_caller()
+                .map(|authority| (exempt, authority))
+                .ok_or(ErrorCode::CapabilityDenied),
+            Err(error) => Err(error),
         }
     }
 }

@@ -37,10 +37,14 @@ fn answer(
     owner: RequestOwnerId,
     address: std::net::SocketAddr,
     approved: &'static str,
+    device: Option<astrid_core::profile::DeviceKey>,
 ) -> tokio::task::JoinHandle<String> {
     let mut requests = bus.subscribe_topic(Topic::approval_request().as_str());
     tokio::spawn(async move {
-        let event = requests.recv().await.unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(8), requests.recv())
+            .await
+            .expect("timed out waiting for an egress prompt")
+            .unwrap();
         let AstridEvent::Ipc { message, .. } = &*event else {
             panic!("expected consent prompt")
         };
@@ -57,7 +61,7 @@ fn answer(
         } else {
             approved
         };
-        let response = IpcMessage::new(
+        let mut response = IpcMessage::new(
             Topic::approval_response(request_id),
             IpcPayload::ApprovalResponse {
                 request_id: request_id.clone(),
@@ -68,6 +72,10 @@ fn answer(
         )
         .with_principal("alice")
         .with_request_owner(owner);
+        if let Some(device) = device {
+            response.device_key_id = Some(device.key_id);
+            response.device_registration_id = device.registration_id.map(Into::into);
+        }
         bus.publish(AstridEvent::Ipc {
             message: response,
             metadata: EventMetadata::default(),
@@ -104,7 +112,7 @@ async fn operator_approved_endpoint_receives_the_selected_hop() {
         } else {
             "approve"
         };
-        let operator = answer(state.event_bus.clone(), owner, address, approved);
+        let operator = answer(state.event_bus.clone(), owner, address, approved, None);
         let mut request = get_request(format!("http://{address}/v1/models?group=a%2Fb"));
         request.method = HttpMethod::Post;
         let opts =
@@ -144,8 +152,92 @@ async fn operator_approved_endpoint_receives_the_selected_hop() {
                 .is_some(),
             streaming
         );
-        let (line, host) = peer.await.unwrap();
+        let (line, host) = tokio::time::timeout(std::time::Duration::from_secs(8), peer)
+            .await
+            .expect("timed out waiting for the approved request")
+            .unwrap();
         assert_eq!(line, "POST /v1/models?group=a%2Fb HTTP/1.1");
         assert_eq!(host.unwrap(), operator.await.unwrap());
+    }
+}
+
+/// Hold the peer's response headers until retirement finishes. A guard that
+/// drops at consent time or merely waits for the send deadline fails this test.
+#[tokio::test(flavor = "multi_thread")]
+async fn retiring_either_egress_device_cancels_an_admitted_http_send() {
+    use crate::profile_cache::PrincipalProfileCache;
+    use astrid_core::profile::{AuthMethod, DeviceKey, DeviceKeyId, DeviceScope};
+    use astrid_core::{PrincipalId, PrincipalProfile, dirs::AstridHome};
+    use std::time::Duration;
+
+    for retire_responder in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(dir.path());
+        let principal = PrincipalId::new("alice").unwrap();
+        let caller = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+        let responder = DeviceKey::new("b".repeat(64), DeviceScope::Full, None, 0);
+        let mut profile = PrincipalProfile::default();
+        profile.auth.methods.push(AuthMethod::Keypair);
+        profile.add_device(caller.clone());
+        profile.add_device(responder.clone());
+        profile.save(&home, &principal).unwrap();
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        state.profile_cache = Some(Arc::new(PrincipalProfileCache::with_home(home)));
+        state.security = Some(Arc::new(AllowAllGate));
+        state.allowance_store = Some(Arc::new(astrid_approval::AllowanceStore::new()));
+        let owner = RequestOwnerId::generate();
+        let mut context = IpcMessage::new(
+            Topic::from_raw("test"),
+            IpcPayload::Connect,
+            uuid::Uuid::nil(),
+        )
+        .with_principal("alice")
+        .with_origin(MessageOrigin::LocalSocket)
+        .with_request_owner(owner);
+        context.device_key_id = Some(caller.key_id.clone());
+        context.device_registration_id = caller.registration_id.map(Into::into);
+        state.caller_context = Some(context);
+        let key = DeviceKeyId::new(if retire_responder {
+            responder.key_id.clone()
+        } else {
+            caller.key_id.clone()
+        })
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let operator = answer(
+            state.event_bus.clone(),
+            owner,
+            address,
+            "approve",
+            Some(responder),
+        );
+        let sessions = state.device_sessions.clone();
+        let task = tokio::spawn(async move {
+            let opts = super::super::options::ResolvedOptions::from_options(
+                follow_opts(),
+                &state.http_limits,
+            );
+            state
+                .http_request_backend(get_request(format!("http://{address}/waiting")), opts)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(8), async {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut lines = BufReader::new(socket).lines();
+            assert_eq!(
+                lines.next_line().await.unwrap().unwrap(),
+                "GET /waiting HTTP/1.1"
+            );
+            assert_eq!(operator.await.unwrap(), address.to_string());
+            sessions.retire(&principal, &key).await.unwrap();
+            assert!(matches!(
+                task.await.unwrap(),
+                Err(super::super::ErrorCode::Closed)
+            ));
+            drop(lines);
+        })
+        .await
+        .expect("retirement must cancel the send before the peer responds");
     }
 }

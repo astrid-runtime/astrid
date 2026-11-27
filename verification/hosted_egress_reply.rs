@@ -30,7 +30,7 @@ impl<'a> Writer<Target<'a>> for Grants<'a> {
     }
 }
 
-fn receipt<'a>(wire:&[u8],profile:bool,principal:&'a str,capsule:&'a str,host:&'a str,
+fn receipt<'a,P,C,S>(authority:&consent_reply::ReplyAuthority<P,C,S>,wire:&[u8],profile:bool,principal:&'a str,capsule:&'a str,host:&'a str,
     port:u16,grants:&mut Grants<'a>) -> (out:Result<Decision,u8>)
     ensures ({
         let d = consent_reply::scope(wire@);
@@ -47,6 +47,6 @@ fn receipt<'a>(wire:&[u8],profile:bool,principal:&'a str,capsule:&'a str,host:&'
         }
     }),
 {
-    egress_reply::apply(wire,profile,Target {principal,capsule,host,port},grants)
+    egress_reply::apply(authority,wire,profile,Target {principal,capsule,host,port},grants)
 }
 }

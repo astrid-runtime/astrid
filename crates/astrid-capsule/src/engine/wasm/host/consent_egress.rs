@@ -207,6 +207,32 @@ use super::egress_reply::GrantTarget;
 
 type LocalTarget<'a> = GrantTarget<&'a PrincipalId, &'a str, &'a str>;
 
+pub(super) type EgressAuthority = super::consent_reply::ReplyAuthority<
+    Option<crate::engine::wasm::PrincipalInvocationGuard>,
+    Option<astrid_core::profile::device_sessions::DeviceSession>,
+    Option<astrid_core::profile::device_sessions::DeviceSession>,
+>;
+
+impl EgressAuthority {
+    /// Drop a pending send when either admitted device retires. Both session
+    /// guards remain owned by the caller until the transport future is dropped.
+    pub(super) async fn while_live<F: Future>(&self, send: F) -> Option<F::Output> {
+        async fn guarded<F: Future>(
+            session: Option<&astrid_core::profile::device_sessions::DeviceSession>,
+            work: F,
+        ) -> Option<F::Output> {
+            match session {
+                Some(session) => session.while_live(work).await,
+                None => Some(work.await),
+            }
+        }
+        let (caller, responder) = self.devices();
+        guarded(caller.as_ref(), guarded(responder.as_ref(), send))
+            .await
+            .flatten()
+    }
+}
+
 impl LocalTarget<'_> {
     fn endpoint(&self) -> String {
         format!("{}:{}", self.host, self.port)
@@ -214,6 +240,7 @@ impl LocalTarget<'_> {
 }
 
 struct GrantWriter<'a> {
+    devices: [astrid_events::ipc::DeviceStamp<'a>; 2],
     store: &'a AllowanceStore,
     profile: Option<(
         &'a crate::profile_cache::PrincipalProfileCache,
@@ -231,13 +258,24 @@ impl super::egress_reply::Writer<LocalTarget<'_>> for GrantWriter<'_> {
     ) -> Result<(), Self::Error> {
         match store {
             super::egress_reply::Store::Session => {
-                add_runtime_grant(
-                    self.store,
-                    target.principal,
-                    target.capsule,
-                    target.host,
-                    target.port,
-                );
+                let install = || {
+                    add_runtime_grant(
+                        self.store,
+                        target.principal,
+                        target.capsule,
+                        target.host,
+                        target.port,
+                    )
+                };
+                if let Some((cache, snapshot)) = &self.profile {
+                    return cache.with_session_devices(
+                        target.principal,
+                        self.devices,
+                        Some(snapshot),
+                        install,
+                    );
+                }
+                install();
                 Ok(())
             },
             super::egress_reply::Store::Profile => {
@@ -250,6 +288,7 @@ impl super::egress_reply::Writer<LocalTarget<'_>> for GrantWriter<'_> {
                     target.capsule,
                     &target.endpoint(),
                     Some(snapshot),
+                    self.devices,
                 )
             },
         }
@@ -367,6 +406,18 @@ impl HostState {
     /// `host` is the URL host (an IP literal in v1 scope); `port` is the
     /// resolved request port.
     pub fn consent_local_egress(&mut self, host: &str, port: u16) -> bool {
+        self.admit_local_egress(host, port).is_some()
+    }
+
+    pub(super) fn admit_egress_caller(&self) -> Option<EgressAuthority> {
+        super::consent_reply::admit(
+            self.begin_host_operation(),
+            || self.begin_device_operation(),
+            || Ok(None),
+        )
+    }
+
+    pub(super) fn admit_local_egress(&mut self, host: &str, port: u16) -> Option<EgressAuthority> {
         // 1. ORIGIN GATE (fail-closed). Only a verified local-operator request
         // may even be considered. Everything else — remote gateway callers,
         // system events, unbound local connections — is refused silently,
@@ -381,13 +432,13 @@ impl HostState {
                 origin = ?self.effective_origin(),
                 "local-egress consent declined: non-local transport origin (fail-closed)"
             );
-            return false;
+            return None;
         }
 
         let Some(store) = self.allowance_store.clone() else {
             // No allowance store wired (minimal/test host): cannot cache or
             // look up a grant, so cannot consent. Fail closed.
-            return false;
+            return None;
         };
         let principal = self.effective_principal();
         // The grant is scoped to THIS capsule: a grant for capsule A reaching
@@ -408,16 +459,21 @@ impl HostState {
             &endpoint,
         );
 
+        let Some(prompt_authority) = self.admit_egress_caller() else {
+            audit.denied("authority_unavailable", "could not admit the egress caller");
+            return None;
+        };
+
         // Pin the profile used for this decision before consulting either
         // allowance source. Invalidation while a prompt is open cancels it.
         let admitted_profile = if let Some(cache) = &self.profile_cache {
             let Ok(profile) = cache.resolve(&principal) else {
                 audit.denied("profile", "principal profile unavailable");
-                return false;
+                return None;
             };
             if !profile.enabled {
                 audit.denied("profile", "principal disabled");
-                return false;
+                return None;
             }
             Some((cache.as_ref(), profile))
         } else {
@@ -427,7 +483,7 @@ impl HostState {
         // capsule + endpoint short-circuits the prompt.
         if has_runtime_grant(&store, &principal, &capsule_id, host, port) {
             audit.granted(HostApprovalScope::Session, "session_grant");
-            return true;
+            return Some(prompt_authority);
         }
 
         // 3. PERSISTED-GRANT FAST PATH. The in-memory store above is empty
@@ -451,24 +507,52 @@ impl HostState {
                 "local-egress consent: honoring persisted approve_always grant (no prompt)"
             );
             audit.granted(HostApprovalScope::Always, "remembered_consent");
-            return true;
+            return Some(prompt_authority);
         }
 
         // 4. ELICIT. Publish `ApprovalRequired` and block for the response.
-        let decision = self.elicit_egress_consent(&principal, &endpoint, &mut audit);
+        let event =
+            self.elicit_egress_consent(&principal, &endpoint, &mut audit, prompt_authority)?;
+        let AstridEvent::Ipc { message, .. } = &*event else {
+            audit.denied("error", "unexpected response event");
+            return None;
+        };
+        let IpcPayload::ApprovalResponse { decision, .. } = &message.payload else {
+            audit.denied("error", "unexpected response payload");
+            return None;
+        };
+        let Some(authority) = super::consent_reply::admit(
+            self.begin_host_operation(),
+            || self.begin_device_operation(),
+            || self.begin_message_device_operation(message),
+        ) else {
+            audit.denied(
+                "authority_unavailable",
+                "could not re-admit the egress reply",
+            );
+            return None;
+        };
         if let Some((cache, admitted)) = &admitted_profile
             && !cache
                 .resolve(&principal)
                 .is_ok_and(|current| std::sync::Arc::ptr_eq(admitted, &current))
         {
             audit.denied("profile", "principal profile changed during consent");
-            return false;
+            return None;
         }
         let mut writer = GrantWriter {
+            devices: [
+                self.caller_context
+                    .as_ref()
+                    .map(IpcMessage::device_stamp)
+                    .unwrap_or_default(),
+                message.device_stamp(),
+            ],
             store: &store,
             profile: admitted_profile,
         };
         let outcome = match super::egress_reply::apply(
+            &authority,
             decision.as_bytes(),
             writer.profile.is_some(),
             target,
@@ -479,7 +563,7 @@ impl HostState {
                 tracing::warn!(security_event = true, %principal, %endpoint, %error,
                     "could not persist local egress approval");
                 audit.denied("profile", "could not persist egress approval");
-                return false;
+                return None;
             },
         };
         match outcome {
@@ -493,9 +577,20 @@ impl HostState {
                     decision = %decision,
                     "local-egress consent: not approved; request stays blocked (fail-closed)"
                 );
-                false
+                None
             },
             Decision::Once => {
+                if let Some((cache, snapshot)) = &writer.profile
+                    && cache
+                        .with_session_devices(&principal, writer.devices, Some(snapshot), || {})
+                        .is_err()
+                {
+                    audit.denied(
+                        "authority_unavailable",
+                        "egress profile changed before approval",
+                    );
+                    return None;
+                }
                 // Approved for this request only — let it through, cache
                 // nothing. The next request to the same endpoint prompts again.
                 tracing::info!(
@@ -506,7 +601,7 @@ impl HostState {
                     "local-egress consent: approved once"
                 );
                 audit.granted(HostApprovalScope::Once, "user");
-                true
+                Some(authority)
             },
             Decision::Session => {
                 tracing::info!(
@@ -517,7 +612,7 @@ impl HostState {
                     "local-egress consent: approved for session"
                 );
                 audit.granted(HostApprovalScope::Session, "user");
-                true
+                Some(authority)
             },
             Decision::Always => {
                 tracing::info!(
@@ -528,14 +623,14 @@ impl HostState {
                     "local-egress consent: approved always"
                 );
                 audit.granted(HostApprovalScope::Always, "user");
-                true
+                Some(authority)
             },
         }
     }
 
     /// Publish an `ApprovalRequired` for the local-egress endpoint and block for
-    /// the operator's response. Returns the raw decision string (`""` on
-    /// timeout / cancel / malformed reply, treated as deny by the caller).
+    /// the operator's response. Returns the matched event so admission can
+    /// validate the responding device before applying its decision.
     ///
     /// The resource is the `host:port` ONLY (no URL path / query — the consent
     /// is for the endpoint, not a specific request), and the reason names the
@@ -567,7 +662,8 @@ impl HostState {
         principal: &PrincipalId,
         endpoint: &str,
         audit: &mut super::approval_audit::ApprovalAudit,
-    ) -> String {
+        prompt_guards: EgressAuthority,
+    ) -> Option<std::sync::Arc<AstridEvent>> {
         let event_bus = self.event_bus.clone();
         let runtime_handle = self.runtime_handle.clone();
         let cancel_token = self.effective_cancel_token();
@@ -587,7 +683,7 @@ impl HostState {
                 "local-egress consent has no authenticated request owner; denying"
             );
             audit.denied("no_request_owner", "no authenticated request owner");
-            return String::new();
+            return None;
         };
 
         let request_id = Uuid::new_v4().to_string();
@@ -620,6 +716,7 @@ impl HostState {
             metadata: astrid_events::EventMetadata::default(),
         });
 
+        drop(prompt_guards);
         let event = util::bounded_block_on_cancellable(
             &runtime_handle,
             &blocking_semaphore,
@@ -638,31 +735,14 @@ impl HostState {
         )
         .flatten();
 
-        match event {
-            Some(event) => match &*event {
-                AstridEvent::Ipc { message, .. } => match &message.payload {
-                    IpcPayload::ApprovalResponse { decision, .. } => decision.clone(),
-                    // Unexpected payload on the response topic — treat as deny.
-                    _ => {
-                        audit.denied("error", "unexpected response payload");
-                        String::new()
-                    },
-                },
-                _ => {
-                    audit.denied("error", "unexpected response event");
-                    String::new()
-                },
-            },
-            // Timeout or cancellation — deny (fail closed).
-            None => {
-                if cancel_token.is_cancelled() {
-                    audit.denied("cancelled", "invocation cancelled");
-                } else {
-                    audit.denied("timeout", "no response before the timeout");
-                }
-                String::new()
-            },
+        if event.is_none() {
+            if cancel_token.is_cancelled() {
+                audit.denied("cancelled", "invocation cancelled");
+            } else {
+                audit.denied("timeout", "no response before the timeout");
+            }
         }
+        event
     }
 }
 
