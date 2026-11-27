@@ -76,7 +76,7 @@ impl sys::Host for HostState {
         };
         let capsule_id = self.capsule_id.as_str().to_owned();
         let resolved = crate::engine::wasm::native_logs::resolve(self, operation.as_ref());
-        let log_file = resolved.file.as_ref();
+        let log_file = resolved.file();
 
         let level_str = match level {
             LogLevel::Trace => "TRACE",

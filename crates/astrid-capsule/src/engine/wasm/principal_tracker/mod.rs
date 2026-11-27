@@ -114,7 +114,13 @@ impl PrincipalInvocationGuard {
         tracker: &Arc<PrincipalInvocationTracker>,
         principal: &astrid_core::PrincipalId,
     ) -> bool {
-        Arc::ptr_eq(&self.tracker, tracker) && self.principal.as_ref() == Some(principal)
+        state::covers(
+            &self.tracker,
+            self.principal.as_ref(),
+            tracker,
+            principal,
+            Arc::ptr_eq,
+        )
     }
 }
 

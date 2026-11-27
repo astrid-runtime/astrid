@@ -11,6 +11,8 @@ mod child_range;
 mod batch_slots;
 #[path = "../crates/astrid-storage/src/kv/tree/memo_admission.rs"]
 mod memo_admission;
+#[path = "../crates/astrid-capsule/src/engine/wasm/native_logs/admission.rs"]
+mod native_log_admission;
 mod hosted_batch_slots;
 mod hosted_chunk_tree_range;
 #[path = "../crates/astrid-storage/src/storage_words.rs"]

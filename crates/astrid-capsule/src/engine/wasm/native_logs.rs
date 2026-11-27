@@ -8,13 +8,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use astrid_core::PrincipalUid;
 use astrid_core::dirs::AstridHome;
-use astrid_core::{PrincipalId, PrincipalUid};
 use astrid_storage::PrincipalDirectory;
 
 use super::host_state::HostState;
 use super::{PrincipalInvocationGuard, PrincipalInvocationTracker};
 
+mod admission;
 pub(super) mod eager;
 
 type LogFile = Arc<Mutex<File>>;
@@ -225,33 +226,35 @@ pub(super) fn install_invocation(state: &mut HostState, uid: PrincipalUid) {
     state.deferred_logs.invocation = binding.bound;
 }
 
-pub(super) struct ResolvedLog {
-    pub(super) file: Option<LogFile>,
+pub(super) struct ResolvedLog<'a> {
+    file: Option<LogFile>,
     // A different owner's first-open/write must drain under that owner's fence,
     // not merely under the invoking principal's already-admitted operation.
-    _owner_operation: Option<PrincipalInvocationGuard>,
+    _owner_operation: Option<admission::Operation<'a, PrincipalInvocationGuard>>,
+}
+
+impl ResolvedLog<'_> {
+    pub(super) fn file(&self) -> Option<&Mutex<File>> {
+        self.file.as_deref()
+    }
 }
 
 impl BoundLog {
-    fn admit(
+    fn resolve<'a>(
         &self,
-        principal: &PrincipalId,
-        admitted: Option<&PrincipalInvocationGuard>,
-    ) -> Option<Option<PrincipalInvocationGuard>> {
-        let covered = admitted.is_some_and(|guard| guard.belongs_to(&self.tracker, principal));
-        if covered {
-            Some(None)
-        } else {
-            self.tracker.begin(principal).map(Some)
-        }
-    }
-
-    fn resolve(&self, admitted: Option<&PrincipalInvocationGuard>) -> Option<ResolvedLog> {
+        admitted: Option<&'a PrincipalInvocationGuard>,
+    ) -> Option<ResolvedLog<'a>> {
         // Resolve only the immutable UID's current live alias. A rename keeps
         // the UID/date destination; alias reuse can never select another UID.
         self.directory
             .with_live_uid_binding(self.uid, |current| {
-                let Some(operation) = self.admit(current, admitted) else {
+                let Some(operation) = admission::admit(
+                    &self.tracker,
+                    current,
+                    admitted,
+                    PrincipalInvocationGuard::belongs_to,
+                    PrincipalInvocationTracker::begin,
+                ) else {
                     return Ok(None);
                 };
                 // Admission failure deliberately does not initialize the cache:
@@ -271,7 +274,7 @@ impl BoundLog {
                 };
                 Ok(opened.map(|opened| ResolvedLog {
                     file: Some(Arc::clone(opened)),
-                    _owner_operation: operation,
+                    _owner_operation: Some(operation),
                 }))
             })
             .ok()
@@ -280,10 +283,10 @@ impl BoundLog {
     }
 }
 
-pub(super) fn resolve(
+pub(super) fn resolve<'a>(
     state: &mut HostState,
-    admitted: Option<&PrincipalInvocationGuard>,
-) -> ResolvedLog {
+    admitted: Option<&'a PrincipalInvocationGuard>,
+) -> ResolvedLog<'a> {
     // Explicit file injection always wins. The public getter remains pure and
     // never realizes pending state, including for external hook/recv contexts.
     if let Some(file) = &state.invocation_capsule_log {
@@ -312,11 +315,11 @@ pub(super) fn resolve(
     }
 }
 
-fn resolve_file(
+fn resolve_file<'a>(
     file: &LogFile,
     pending: Option<&Arc<BoundLog>>,
-    admitted: Option<&PrincipalInvocationGuard>,
-) -> ResolvedLog {
+    admitted: Option<&'a PrincipalInvocationGuard>,
+) -> ResolvedLog<'a> {
     // All engine-bound handles carry their owner fence on every write.
     // Arbitrary explicit File injections retain the existing eager interface.
     let cached = pending.filter(|pending| {

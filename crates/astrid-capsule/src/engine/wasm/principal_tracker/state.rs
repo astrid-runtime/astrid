@@ -86,6 +86,20 @@ use vstd::{
 verus! {
 broadcast use vstd::std_specs::hash::group_hash_axioms;
 
+/// A retained guard covers a new operation only in the same tracker and for
+/// its still-bound owner. Native callers supply allocation identity for trackers.
+pub(super) fn covers<T,K:PartialEq,F:FnOnce(&T,&T)->bool>(
+    issuer:&T,bound:Option<&K>,requested:&T,owner:&K,same_tracker:F,
+) -> (covered:bool)
+    requires obeys_concrete_eq::<K>(), same_tracker.requires((issuer,requested)),
+    ensures if covered { bound == Some(owner) && same_tracker.ensures((issuer,requested),true) }
+        else { bound != Some(owner) || same_tracker.ensures((issuer,requested),false) },
+{
+    reveal(obeys_concrete_eq);
+    if !same_tracker(issuer,requested) { return false; }
+    match bound { Some(key) => *key == *owner, None => false }
+}
+
 pub(super) open spec fn binding<K>(m: Map<K,PrincipalInvocation>, k: K) -> (bool,int) {
     if m.contains_key(k) { (m[k].is_retired(),m[k].active_count() as int) } else { (false,0) }
 }

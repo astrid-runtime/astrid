@@ -215,3 +215,15 @@ def defects():
             f"KV memo {name}", source,
             lambda s, a=old, b=new: replace_once(s, a, b), trace,
         )
+
+    source = Path("crates/astrid-capsule/src/engine/wasm/native_logs/admission.rs")
+    trace = Path("verification/hosted_authority_model.rs")
+    for name, old, new in [
+        ("borrow may ignore coverage", "existing == Some(g) && covers.ensures((g,tracker,principal),true)", "existing == Some(g)"),
+        ("fresh guard may ignore admission", "uncovered && begin.ensures((tracker,principal),Some(g))", "uncovered"),
+        ("refusal may ignore existing guard", "None => uncovered && begin.ensures", "None => begin.ensures"),
+    ]:
+        yield (
+            f"native log {name}", source,
+            lambda s, a=old, b=new: replace_once(s, a, b), trace,
+        )

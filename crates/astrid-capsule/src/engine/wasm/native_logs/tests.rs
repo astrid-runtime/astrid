@@ -6,6 +6,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use super::*;
 use crate::engine::wasm::bindings::astrid::sys::host::{Host as SysHost, LogLevel};
 use crate::engine::wasm::test_fixtures::{minimal_host_state, open_log};
+use astrid_core::PrincipalId;
 use astrid_storage::identity::IdentityStore as _;
 
 fn bind(
@@ -304,6 +305,8 @@ async fn already_admitted_matching_guard_can_finish_first_open_after_retirement(
         .resolve(Some(&guard))
         .expect("admitted operation must not re-enter admission");
     assert!(resolved.file.is_some());
+    assert!(matches!(&resolved._owner_operation,
+        Some(admission::Operation::Borrowed { _borrowed: held }) if std::ptr::eq(*held, &guard)));
     assert!(root.home.root().join(&owner.deferred().target).exists());
     assert_eq!(tracker.active(&state.principal), 1);
     drop(resolved);
@@ -679,13 +682,8 @@ async fn live_uid_rename_keeps_pinned_destination_and_admits_the_current_alias()
     tracker.resume(&current_alias);
     state.log(LogLevel::Info, "renamed UID still logs".into());
     let admitted = pending.resolve(None).unwrap();
-    assert!(
-        admitted
-            ._owner_operation
-            .as_ref()
-            .unwrap()
-            .belongs_to(&tracker, &current_alias)
-    );
+    assert!(matches!(&admitted._owner_operation,
+        Some(admission::Operation::Owned { _owned: guard }) if guard.belongs_to(&tracker, &current_alias)));
     drop(admitted);
     assert_eq!(pending.deferred().target, target);
     assert!(contents(&root, &pending).contains("renamed UID still logs"));
