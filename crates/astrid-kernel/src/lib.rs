@@ -49,6 +49,8 @@ mod capsule_removal_tests;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod capsule_restart;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use capsule_restart::RestartOutcome;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod capsule_runtime;
 mod capsules_loaded;
 #[cfg(test)]
@@ -4093,60 +4095,6 @@ impl RestartTracker {
     }
 }
 
-/// Whether [`Kernel::restart_capsule`] fully tore the old instance down.
-///
-/// A restart publishes a fresh generation either way; this is a diagnostic of what
-/// happened to the OLD one. It deliberately does NOT drive the retry cap: the
-/// cap counts consecutive HEALTH failures (a lingering old instance is a normal,
-/// harmless state for a busy capsule whose dispatcher consumer still holds a
-/// clone — it is NOT a restart failure), and the health monitor prunes a
-/// tracker when the capsule RECOVERS, not on the restart-call outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-enum RestartOutcome {
-    /// The old runtime was exclusively unloaded after the fresh generation was
-    /// atomically published.
-    Clean,
-    /// The old runtime's exclusive `unload` was skipped because an `Arc` clone
-    /// (e.g. a live dispatcher consumer holding a clone for up to its idle
-    /// grace) was still held. Its run-loop and subprocesses were cooperatively
-    /// cancelled — no CPU/process leak — and its memory reclaims when the last
-    /// clone drops. This is common for a capsule under load and is NOT counted
-    /// as a restart failure.
-    OldInstanceLingering,
-    /// The observed failed generation was already replaced before restart.
-    Superseded,
-}
-
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-async fn unload_replaced_runtime(
-    id: &astrid_capsule_types::CapsuleId,
-    previous: &mut Arc<dyn astrid_capsule::capsule::Capsule>,
-) -> RestartOutcome {
-    for retry in 0..20_u32 {
-        if let Some(capsule) = Arc::get_mut(previous) {
-            if let Err(error) = capsule.unload().await {
-                tracing::warn!(
-                    capsule_id = %id,
-                    error = %error,
-                    "Capsule unload failed after generation replacement"
-                );
-            }
-            return RestartOutcome::Clean;
-        }
-        if retry < 19 {
-            astrid_runtime::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
-    tracing::warn!(
-        capsule_id = %id,
-        strong_count = Arc::strong_count(previous),
-        "Old capsule generation remains referenced after replacement; autonomous \
-         work was cancelled and memory reclaims when the last reference drops"
-    );
-    RestartOutcome::OldInstanceLingering
-}
-
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 async fn activate_and_wait_ready(
     id: &astrid_capsule_types::CapsuleId,
@@ -4236,6 +4184,10 @@ async fn attempt_capsule_restart(
                 attempt,
                 "Capsule restarted (old instance fully unloaded)"
             );
+        },
+        Ok(RestartOutcome::OldInstanceUnloadFailed(error)) => {
+            tracing::warn!(capsule_id = %id_str, %principal, attempt, %error,
+                "Capsule restarted but the old runtime failed to unload");
         },
         Ok(RestartOutcome::OldInstanceLingering) => {
             // Fresh instance loaded; the old one could not be exclusively
@@ -6723,13 +6675,6 @@ mod tests {
             "recovering between failures resets the budget; got {flap_attempts} attempts, \
              disabled={flap_disabled}"
         );
-    }
-
-    #[test]
-    fn restart_outcome_is_diagnostic_only_not_a_cap_signal() {
-        // The outcome enum is retained for diagnostics but must not itself gate
-        // the cap; both variants exist and are distinct.
-        assert_ne!(RestartOutcome::Clean, RestartOutcome::OldInstanceLingering);
     }
 
     // ── Bootstrap admin-group seeding (issue #670) ───────────────────
