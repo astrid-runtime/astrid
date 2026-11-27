@@ -74,6 +74,49 @@ fn build_headers_accepts_non_ascii_value() {
 
 // ── FIX 3: max_redirects clamped to the host ceiling ───────────────────
 
+/// Each owned component resource keeps its identity after the borrowed close.
+#[tokio::test]
+async fn dropping_a_closed_stream_preserves_the_next_response() {
+    use super::{http_v10, http_v11};
+    use wasmtime::component::Resource;
+
+    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec();
+    let Some((first_addr, first_peer)) = one_shot_server(response.clone()).await else {
+        return;
+    };
+    let Some((second_addr, second_peer)) = one_shot_server(response).await else {
+        return;
+    };
+    let mut state = exempt_state(tokio::runtime::Handle::current(), first_addr.port());
+    state.local_egress.push(second_addr.to_string());
+    let opts = super::options::ResolvedOptions::v10_defaults(&state.http_limits);
+    let first = state
+        .http_stream_backend(get_request(format!("http://{first_addr}/")), opts.clone())
+        .await
+        .unwrap();
+    http_v10::HostHttpStream::close(&mut state, Resource::new_borrow(first.rep())).unwrap();
+    let second = state
+        .http_stream_backend(get_request(format!("http://{second_addr}/")), opts)
+        .await
+        .unwrap();
+    http_v10::HostHttpStream::close(&mut state, Resource::new_borrow(first.rep())).unwrap();
+    http_v10::HostHttpStream::drop(&mut state, Resource::new_own(first.rep())).unwrap();
+    assert_eq!(
+        http_v11::HostHttpStream::status(&mut state, Resource::new_borrow(second.rep())),
+        200
+    );
+    assert_eq!(
+        http_v11::HostHttpStream::read_chunk(&mut state, Resource::new_borrow(second.rep()))
+            .await
+            .unwrap(),
+        b"ok"
+    );
+    http_v11::HostHttpStream::drop(&mut state, second).unwrap();
+    assert!(state.active_http_streams.is_empty());
+    first_peer.await.unwrap();
+    second_peer.await.unwrap();
+}
+
 /// A caller-requested `max_redirects` above the host ceiling must clamp down
 /// to `MAX_HTTP_REDIRECTS`, never raise it. Fails without the `.min(...)`.
 #[test]
@@ -210,15 +253,15 @@ async fn stream_quota_triggers_and_releases() {
         let cap = limits.max_concurrent_streams;
         let principal = state.effective_principal();
 
-        // Fill the quota map to the cap with synthetic streams (no network),
-        // keyed by rep so `stream_close` / `stream_drop` can remove by rep.
-        let reps: Vec<u32> = (0..cap as u32).collect();
-        for &rep in &reps {
-            state.active_http_streams.insert(
-                u64::from(rep),
+        let open = |state: &mut crate::engine::wasm::host_state::HostState| {
+            super::backend::register_stream(
+                state,
                 super::backend::ActiveHttpStream::dummy_for_test(&principal),
-            );
-        }
+            )
+            .unwrap()
+            .rep()
+        };
+        let reps: Vec<_> = (0..cap).map(|_| open(&mut state)).collect();
         assert_eq!(
             state.active_http_streams.len(),
             cap,
@@ -253,9 +296,17 @@ async fn stream_quota_triggers_and_releases() {
         );
 
         // Re-fill to the cap, then `stream_drop` releases a slot too.
-        state.active_http_streams.insert(
-            u64::from(reps[0]),
-            super::backend::ActiveHttpStream::dummy_for_test(&principal),
+        let replacement = open(&mut state);
+        assert_ne!(
+            replacement, reps[0],
+            "the borrowed handle still owns its table slot"
+        );
+        super::backend::stream_close(&mut state, reps[0]).unwrap();
+        super::backend::stream_drop(&mut state, reps[0]);
+        assert!(
+            state
+                .active_http_streams
+                .contains_key(&u64::from(replacement))
         );
         assert_eq!(state.active_http_streams.len(), cap);
         super::backend::stream_drop(&mut state, reps[1]);
