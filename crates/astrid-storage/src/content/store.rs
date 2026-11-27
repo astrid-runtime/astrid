@@ -11,6 +11,7 @@ use crate::content_dag::{
     VerifiedContent, build_content, build_content_streaming, describe_content, open_content,
     read_opened_content_and_verify,
 };
+use crate::engine::transaction_records;
 use crate::engine::{
     PrincipalProjectionEngine, PrincipalProjectionError, ProjectionCacheEntry, ProjectionCacheKey,
     ProjectionCachePayload, RootTransaction,

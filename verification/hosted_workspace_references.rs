@@ -122,6 +122,38 @@ spec fn commit_links(before:Seq<ObjectReference>,links:Seq<ObjectReference>,r:Op
     }
 }
 
+/// The pending commit points to the actual staged state record and retains the
+/// owner and expected root from this attempt. An invalid list or collision leaves
+/// the staging map unchanged, including entries for unrelated objects.
+fn stage_candidate<P,F:FnOnce(&crate::ObjectRecord)->ObjectId>(
+    map:&mut std::collections::BTreeMap<ObjectId,crate::ObjectRecord>,owner:P,
+    expected:Option<crate::RootState>,prior:Vec<ObjectReference>,version:crate::ObjectFormatVersion,
+    refs:Vec<ObjectReference>,identify:F) -> (out:Result<crate::commit_candidate::Candidate<P>,crate::commit_candidate::MetadataError>)
+    requires vstd::std_specs::btree::btree_map_inv(old(map)),vstd::laws_cmp::obeys_cmp::<ObjectId>(),
+        vstd::laws_cmp::obeys_cmp_concrete_eq::<ObjectId>(),vstd::laws_eq::obeys_concrete_eq::<crate::ObjectRecord>(),
+        forall|r:&crate::ObjectRecord| #[trigger] identify.requires((r,)),
+    ensures match out {
+        Ok(candidate) => {
+            let (p,r,links) = candidate.parts();
+            let state = links@.last().fields().1;
+            let record = final(map)@[state];
+            &&& p == owner && r == expected && commit_links(prior@,links@,expected,state)
+            &&& final(map)@.contains_key(state) && final(map)@ == old(map)@.insert(state,record)
+            &&& !old(map)@.contains_key(state) || old(map)@[state] == record
+            &&& record.contents() == (crate::ObjectKind::PrincipalState,version.number(),Seq::empty(),refs@,0,crate::ObjectClass::Metadata)
+            &&& crate::ObjectRecord::labels_ordered(refs@) && identify.ensures((&record,),state)
+        },
+        Err(crate::commit_candidate::MetadataError::NonCanonicalReferences) =>
+            !crate::ObjectRecord::labels_ordered(refs@) && final(map)@ == old(map)@,
+        Err(crate::commit_candidate::MetadataError::Collision(id)) => final(map)@ == old(map)@ && old(map)@.contains_key(id) &&
+            exists|r:crate::ObjectRecord| r.contents() == (crate::ObjectKind::PrincipalState,version.number(),Seq::empty(),refs@,0,crate::ObjectClass::Metadata)
+                && old(map)@[id] != r && #[trigger] identify.ensures((&r,),id),
+    },
+{
+    let state = crate::commit_candidate::stage_metadata(map,crate::ObjectKind::PrincipalState,version,refs,identify)?;
+    Ok(crate::commit_candidate::Candidate::new(owner,expected,prior,state))
+}
+
 /// Check the arguments observed by the native transaction constructor against
 /// the header from which the candidate commit references were prepared.
 fn encoded_candidate<P,B,E,S>(owner:P,expected:Option<crate::RootState>,prior:Vec<ObjectReference>,state:ObjectId,seal:S)

@@ -3,7 +3,7 @@ use super::workspace::workspace_branch_quota;
 use super::{
     Arc, BTreeMap, BuiltContent, CONTENT_COMPONENT_LABEL, CatalogRoot, CatalogSummary,
     CatalogValue, ContentBatchExpectation, ContentError, ContentHeader, ContentName,
-    LEGACY_PRINCIPAL_GRAPH_VERSION, ModelError, ObjectClass, ObjectId, ObjectKind, ObjectRecord,
+    LEGACY_PRINCIPAL_GRAPH_VERSION, ModelError, ObjectId, ObjectKind, ObjectRecord,
     ObjectReference, PARENT_LABEL, PRINCIPAL_GRAPH_VERSION, PrincipalContentError,
     PrincipalContentStore, PrincipalKvAdapter, PrincipalProjectionEngine, PrincipalProjectionError,
     ReferenceLabel, RootState, RootTransaction, STATE_LABEL, invalid, lookup, root_from_record,
@@ -336,16 +336,8 @@ where
             ));
         }
         state_references.sort();
-        let state = ObjectRecord::new(
-            ObjectKind::PrincipalState,
-            PRINCIPAL_GRAPH_VERSION,
-            Vec::new(),
-            state_references,
-            0,
-            ObjectClass::Metadata,
-        )
-        .map_err(PrincipalProjectionError::Model)?;
-        let state = self.insert(&mut records, state)?;
+        let state =
+            self.stage_metadata(&mut records, ObjectKind::PrincipalState, state_references)?;
 
         let (owner, expected, commit, records) = super::commit_candidate::Candidate::new(
             principal,
@@ -355,16 +347,7 @@ where
         )
         .seal(|mut references| {
             references.sort();
-            let commit = ObjectRecord::new(
-                ObjectKind::Commit,
-                PRINCIPAL_GRAPH_VERSION,
-                Vec::new(),
-                references,
-                0,
-                ObjectClass::Metadata,
-            )
-            .map_err(PrincipalProjectionError::Model)?;
-            let commit = self.insert(&mut records, commit)?;
+            let commit = self.stage_metadata(&mut records, ObjectKind::Commit, references)?;
             Ok::<_, PrincipalContentError>((commit, records.into_iter().collect()))
         })?;
         Ok(RootTransaction::new(owner, expected, commit, records))
@@ -456,24 +439,34 @@ where
             .ok_or_else(|| ContentError::MissingObject(object).into())
     }
 
+    fn stage_metadata(
+        &self,
+        records: &mut BTreeMap<ObjectId, ObjectRecord>,
+        kind: ObjectKind,
+        references: Vec<ObjectReference>,
+    ) -> Result<ObjectId, PrincipalContentError> {
+        use super::commit_candidate::{self, MetadataError};
+        commit_candidate::stage_metadata(records, kind, PRINCIPAL_GRAPH_VERSION, references, |r| {
+            self.engine.identify_object(r)
+        })
+        .map_err(|error| {
+            PrincipalProjectionError::Model(match error {
+                MetadataError::NonCanonicalReferences => ModelError::NonCanonicalReferences,
+                MetadataError::Collision(id) => ModelError::ObjectCollision(id),
+            })
+            .into()
+        })
+    }
+
     pub(super) fn insert(
         &self,
         records: &mut BTreeMap<ObjectId, ObjectRecord>,
         record: ObjectRecord,
     ) -> Result<ObjectId, PrincipalContentError> {
-        let id = self.engine.identify_object(&record);
-        match records.get(&id) {
-            Some(existing) if existing == &record => {},
-            Some(_) => {
-                return Err(
-                    PrincipalProjectionError::Model(ModelError::ObjectCollision(id)).into(),
-                );
-            },
-            None => {
-                records.insert(id, record);
-            },
-        }
-        Ok(id)
+        crate::engine::transaction_records::stage(records, record, |r| {
+            self.engine.identify_object(r)
+        })
+        .map_err(|id| PrincipalProjectionError::Model(ModelError::ObjectCollision(id)).into())
     }
 }
 

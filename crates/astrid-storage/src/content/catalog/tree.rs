@@ -691,14 +691,8 @@ fn intern(
     identify: &impl Fn(&ObjectRecord) -> ObjectId,
     records: &mut BTreeMap<ObjectId, ObjectRecord>,
 ) -> Result<CatalogRoot, PrincipalContentError> {
-    let object = identify(&record);
-    match records.get(&object) {
-        Some(existing) if existing == &record => {},
-        Some(_) => return Err(invalid(object, "content catalog identity collision")),
-        None => {
-            records.insert(object, record);
-        },
-    }
+    let object = crate::engine::transaction_records::stage(records, record, identify)
+        .map_err(|id| invalid(id, "content catalog identity collision"))?;
     Ok(CatalogRoot { object, summary })
 }
 

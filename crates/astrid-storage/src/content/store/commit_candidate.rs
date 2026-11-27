@@ -1,6 +1,16 @@
 //! Bind a content commit's lineage and state references to the root used for CAS.
-use super::{ObjectId, ObjectReference, ReferenceKind, ReferenceLabel, RootState};
+use super::{
+    ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, ObjectReference,
+    ReferenceKind, ReferenceLabel, RootState, transaction_records,
+};
+use std::collections::BTreeMap;
 use vstd::prelude::*;
+#[cfg(verus_keep_ghost)]
+use vstd::{
+    laws_cmp::{obeys_cmp, obeys_cmp_concrete_eq},
+    laws_eq::obeys_concrete_eq,
+    std_specs::btree::btree_map_inv,
+};
 
 verus! {
 
@@ -13,6 +23,55 @@ pub(super) open spec fn references(before:Seq<ObjectReference>, after:Seq<Object
     &&& after.take(before.len() as int) == before
     &&& after.last().fields() == (STATE@,state,ReferenceKind::Owns)
     &&& expected matches Some(root) ==> after[before.len() as int].fields() == (PARENT@,root.commit,ReferenceKind::Lineage)
+}
+
+pub(super) enum MetadataError {
+    NonCanonicalReferences,
+    Collision(ObjectId),
+}
+
+pub(super) open spec fn metadata(record:ObjectRecord, kind:ObjectKind, version:ObjectFormatVersion,
+    refs:Seq<ObjectReference>) -> bool {
+    record.contents() == (kind,version.number(),Seq::empty(),refs,0,ObjectClass::Metadata)
+}
+
+/// Validate the sorted references and stage exactly the record used to derive its identity.
+pub(super) fn stage_metadata<F:FnOnce(&ObjectRecord)->ObjectId>(
+    records:&mut BTreeMap<ObjectId,ObjectRecord>, kind:ObjectKind, version:ObjectFormatVersion,
+    refs:Vec<ObjectReference>, identify:F) -> (out:Result<ObjectId,MetadataError>)
+    requires btree_map_inv(old(records)), obeys_cmp::<ObjectId>(), obeys_cmp_concrete_eq::<ObjectId>(),
+        obeys_concrete_eq::<ObjectRecord>(), forall|r:&ObjectRecord| #[trigger] identify.requires((r,)),
+    ensures btree_map_inv(final(records)),
+        match out {
+            Err(MetadataError::NonCanonicalReferences) => !ObjectRecord::labels_ordered(refs@) && final(records)@ == old(records)@,
+            Err(MetadataError::Collision(id)) => ObjectRecord::labels_ordered(refs@) && final(records)@ == old(records)@ &&
+                old(records)@.contains_key(id) && exists|r:ObjectRecord| metadata(r,kind,version,refs@) &&
+                    old(records)@[id] != r && #[trigger] identify.ensures((&r,),id),
+            Ok(id) => ObjectRecord::labels_ordered(refs@) && final(records)@.contains_key(id) && ({
+                let r = final(records)@[id];
+                &&& metadata(r,kind,version,refs@)
+                &&& identify.ensures((&r,),id)
+                &&& final(records)@ == old(records)@.insert(id,r)
+                &&& !old(records)@.contains_key(id) || old(records)@[id] == r
+            }),
+        },
+{
+    let record = ObjectRecord::from_fields(kind,version,Vec::new(),refs,0,ObjectClass::Metadata)
+        .ok_or(MetadataError::NonCanonicalReferences)?;
+    assert(metadata(record,kind,version,refs@));
+    match transaction_records::stage(records,record,identify) {
+        Ok(id) => {
+            assert(records@[id] == record);
+            Ok(id)
+        },
+        Err(id) => {
+            assert(exists|r:ObjectRecord| metadata(r,kind,version,refs@) &&
+                old(records)@[id] != r && #[trigger] identify.ensures((&r,),id)) by {
+                assert(identify.ensures((&record,),id));
+            }
+            Err(MetadataError::Collision(id))
+        },
+    }
 }
 
 pub(super) struct Candidate<P> {

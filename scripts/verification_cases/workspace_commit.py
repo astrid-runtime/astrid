@@ -152,3 +152,18 @@ def defects():
             f"catalog quota {name}", source,
             lambda s, a=old, b=new: replace_once(s, a, b), trace,
         )
+
+    source = Path("crates/astrid-storage/src/content/store/commit_candidate.rs")
+    trace = Path("verification/hosted_workspace_references.rs")
+    for name, old, new in [
+        ("noncanonical refusal may mutate other rows", "!ObjectRecord::labels_ordered(refs@) && final(records)@ == old(records)@", "!ObjectRecord::labels_ordered(refs@)"),
+        ("collision may name an identical record", "old(records)@[id] != r && #[trigger] identify.ensures((&r,),id),", "true && #[trigger] identify.ensures((&r,),id),"),
+        ("success may discard another record", "&&& final(records)@ == old(records)@.insert(id,r)", "&&& true"),
+        ("success may replace a different record", "&&& !old(records)@.contains_key(id) || old(records)@[id] == r", "&&& true"),
+        ("success may omit the identity check", "&&& identify.ensures((&r,),id)", "&&& true"),
+        ("success may stage different metadata", "&&& metadata(r,kind,version,refs@)", "&&& true"),
+    ]:
+        yield (
+            f"metadata staging {name}", source,
+            lambda s, a=old, b=new: replace_once(s, a, b), trace,
+        )

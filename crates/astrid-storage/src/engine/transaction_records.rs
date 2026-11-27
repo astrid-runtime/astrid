@@ -129,6 +129,27 @@ pub(crate) fn insert<K:Ord+Copy,R:PartialEq>(map:&mut BTreeMap<K,R>,id:K,record:
     }
 }
 
+/// Bind a newly built record to the engine's identity before inserting it.
+pub(crate) fn stage<K:Ord+Copy,R:PartialEq,F:FnOnce(&R)->K>(map:&mut BTreeMap<K,R>,record:R,derive_id:F)
+    -> (out:Result<K,K>)
+    requires obeys_cmp::<K>(), obeys_cmp_concrete_eq::<K>(), btree_map_inv(old(map)), obeys_concrete_eq::<R>(),
+        derive_id.requires((&record,)),
+    ensures btree_map_inv(final(map)),
+        match out {
+            Ok(id) => derive_id.ensures((&record,),id) && final(map)@ == old(map)@.insert(id,record)
+                && (!old(map)@.contains_key(id) || old(map)@[id] == record),
+            Err(id) => derive_id.ensures((&record,),id) && final(map)@ == old(map)@
+                && old(map)@.contains_key(id) && old(map)@[id] != record,
+        },
+{
+    let (id,row) = identify(record,derive_id);
+    let out = insert(map,id,row);
+    proof { if out.is_ok() && old(map)@.contains_key(id) {
+        assert(old(map)@.insert(id,record) =~= old(map)@);
+    } }
+    out
+}
+
 pub(crate) open spec fn represents<K,R>(map:Map<K,R>,rows:Seq<(K,R)>) -> bool {
     &&& forall|i:int| 0 <= i < rows.len() ==> map.contains_key(#[trigger] rows[i].0) && map[rows[i].0] == rows[i].1
     &&& forall|k:K| #[trigger] map.contains_key(k) ==> exists|i:int| 0 <= i < rows.len() && #[trigger] rows[i].0 == k
