@@ -128,6 +128,13 @@ pub(super) fn verify_indexed_location<F: DurableIo>(
         ));
     }
     let mut identity_bytes = [0_u8; IDENTITY_PREFIX_BYTES + CURRENT_DIGEST_BYTES_USIZE];
+    if payload_len < identity_bytes.len() as u64 {
+        return Err(corrupt(
+            ARENA_FILE,
+            location.offset,
+            "indexed frame payload is shorter than its object identity",
+        ));
+    }
     arena
         .read_exact(&mut identity_bytes)
         .map_err(|source| io_error("read indexed object identity", source))?;

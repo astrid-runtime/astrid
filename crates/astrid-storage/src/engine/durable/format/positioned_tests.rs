@@ -431,3 +431,31 @@ fn indexed_tail_preserves_header_checksum_and_index_length_guards() {
         verify_indexed_tail(&mut source, location, RecoveryLimits::process_addressable()).is_err()
     );
 }
+
+#[test]
+fn indexed_identity_read_stays_inside_the_declared_frame() {
+    use crate::engine::durable::tests::TEST_IDENTITY_SCHEME;
+
+    let id = ObjectId::new([7; 32]);
+    let mut identity = Vec::new();
+    encode_identity(&mut identity, TEST_IDENTITY_SCHEME, id);
+    let limits = RecoveryLimits::process_addressable();
+    let mut arena = ObservedSource::new();
+    let short = append_frame(&mut arena, ARENA_MAGIC, &identity[..identity.len() - 1]).unwrap();
+    let exact = append_frame(&mut arena, ARENA_MAGIC, &identity).unwrap();
+
+    assert!(matches!(
+        verify_indexed_location(&mut arena, id, short, TEST_IDENTITY_SCHEME, limits),
+        Err(DurableError::Corrupt { file: ARENA_FILE, offset, .. }) if offset == short.offset
+    ));
+    assert_eq!(
+        arena.stream_position().unwrap(),
+        short.offset + FRAME_HEADER_LEN
+    );
+
+    verify_indexed_location(&mut arena, id, exact, TEST_IDENTITY_SCHEME, limits).unwrap();
+    assert_eq!(
+        arena.stream_position().unwrap(),
+        exact.offset + FRAME_HEADER_LEN + exact.payload_len
+    );
+}
