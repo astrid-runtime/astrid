@@ -226,6 +226,9 @@ mod device_admission;
 mod consent_identity;
 #[path = "../crates/astrid-capsule/src/engine/wasm/host/consent_reply.rs"]
 mod consent_reply;
+#[path = "../crates/astrid-capsule/src/engine/wasm/host/egress_reply.rs"]
+mod egress_reply;
+mod hosted_egress_reply;
 mod hosted_consent_reply;
 mod hosted_device_profile;
 

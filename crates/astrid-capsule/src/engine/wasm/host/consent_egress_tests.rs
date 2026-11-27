@@ -116,19 +116,14 @@ fn publish_consent_reply(
 
 #[test]
 fn classify_decision_maps_approve_variants() {
-    assert!(matches!(classify_decision("approve"), Decision::Once));
-    assert!(matches!(
-        classify_decision("approve_session"),
-        Decision::Session
-    ));
-    assert!(matches!(
-        classify_decision("approve_always"),
-        Decision::Always
-    ));
+    use super::super::consent_reply::classify;
+    assert!(matches!(classify(b"approve"), Decision::Once));
+    assert!(matches!(classify(b"approve_session"), Decision::Session));
+    assert!(matches!(classify(b"approve_always"), Decision::Always));
     // Everything else is a deny (fail-closed).
-    assert!(matches!(classify_decision("deny"), Decision::Deny));
-    assert!(matches!(classify_decision("garbage"), Decision::Deny));
-    assert!(matches!(classify_decision(""), Decision::Deny));
+    assert!(matches!(classify(b"deny"), Decision::Deny));
+    assert!(matches!(classify(b"garbage"), Decision::Deny));
+    assert!(matches!(classify(b""), Decision::Deny));
 }
 
 #[test]
@@ -783,4 +778,50 @@ async fn changed_profile_cancels_a_pending_egress_approval() {
         "127.0.0.1",
         1234
     ));
+}
+
+#[test]
+fn durable_egress_writes_only_the_selected_profile_endpoint() {
+    use crate::profile_cache::PrincipalProfileCache;
+    use astrid_core::{PrincipalProfile, dirs::AstridHome};
+
+    for invalidate in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(dir.path());
+        let alice = PrincipalId::new("alice").unwrap();
+        let bob = PrincipalId::new("bob").unwrap();
+        for principal in [&alice, &bob] {
+            PrincipalProfile::default().save(&home, principal).unwrap();
+        }
+        let cache = PrincipalProfileCache::with_home(home.clone());
+        let store = AllowanceStore::new();
+        let snapshot = cache.resolve(&alice).unwrap();
+        if invalidate {
+            cache.invalidate(&alice);
+        }
+        let mut writer = GrantWriter {
+            store: &store,
+            profile: Some((&cache, snapshot)),
+        };
+        let target = LocalTarget {
+            principal: &alice,
+            capsule: "chat",
+            host: "127.0.0.1",
+            port: 1234,
+        };
+        let result =
+            super::super::egress_reply::apply(b"approve_always", true, target, &mut writer);
+        assert_eq!(result.is_ok(), !invalidate);
+        assert_eq!(store.count(), 0);
+        let fresh = PrincipalProfileCache::with_home(home);
+        let a = fresh.resolve(&alice).unwrap();
+        let b = fresh.resolve(&bob).unwrap();
+        assert_eq!(
+            has_persisted_grant(&a, "chat", "127.0.0.1", 1234),
+            !invalidate
+        );
+        assert!(!has_persisted_grant(&a, "chat", "127.0.0.1", 1235));
+        assert!(!has_persisted_grant(&a, "other", "127.0.0.1", 1234));
+        assert!(!has_persisted_grant(&b, "chat", "127.0.0.1", 1234));
+    }
 }

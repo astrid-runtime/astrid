@@ -9,6 +9,23 @@ from .common import (
 
 def consumer_defects():
     """Weaken a production guarantee and require its trace consumer to fail."""
+    egress = Path("crates/astrid-capsule/src/engine/wasm/host/egress_reply.rs")
+    egress_trace = Path("verification/hosted_egress_reply.rs")
+    for name, original, changed, target in [
+        ("writes on denial", "_ => {},", "_ => writer.install(Store::Session, target)?,", egress),
+        ("loses a profile failure", "Decision::Always if has_profile => writer.install(Store::Profile, target)?,",
+         "Decision::Always if has_profile => { let _ = writer.install(Store::Profile, target); },", egress),
+        ("routes a session grant to disk", "Decision::Session => writer.install(Store::Session, target)?,",
+         "Decision::Session => writer.install(Store::Profile, target)?,", egress),
+        ("loses the unchanged history for one shot", "None => final(writer).attempts() == old(writer).attempts() && out == Ok(decision)",
+         "None => out == Ok(decision)", egress_trace),
+        ("loses which endpoint was written", "final(writer).attempts() == old(writer).attempts().push((store,target))\n                &&",
+         "final(writer).attempts().len() == old(writer).attempts().len()+1\n                &&", egress_trace),
+    ]:
+        yield (
+            f"local egress reply {name}", egress,
+            lambda s, a=original, b=changed: replace_once(s, a, b), target,
+        )
     publication = Path("crates/astrid-capsule/src/profile_cache/command.rs")
     for name, original, changed, target in [
         ("ignores caller retirement", "if current(&profile, devices[0]) &&", "if", publication),

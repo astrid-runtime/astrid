@@ -19,6 +19,7 @@ mod audit_sink_tests;
 pub(crate) mod consent_egress;
 mod consent_identity;
 mod consent_reply;
+mod egress_reply;
 /// Elicit API (interactive user input collection).
 pub(crate) mod elicit;
 /// File system operations for plugins.

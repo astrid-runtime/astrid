@@ -203,8 +203,57 @@ fn add_runtime_grant(
 
 use super::consent_reply::Decision;
 
-fn classify_decision(decision: &str) -> Decision {
-    super::consent_reply::classify(decision.as_bytes())
+use super::egress_reply::GrantTarget;
+
+type LocalTarget<'a> = GrantTarget<&'a PrincipalId, &'a str, &'a str>;
+
+impl LocalTarget<'_> {
+    fn endpoint(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+}
+
+struct GrantWriter<'a> {
+    store: &'a AllowanceStore,
+    profile: Option<(
+        &'a crate::profile_cache::PrincipalProfileCache,
+        std::sync::Arc<astrid_core::PrincipalProfile>,
+    )>,
+}
+
+impl super::egress_reply::Writer<LocalTarget<'_>> for GrantWriter<'_> {
+    type Error = astrid_core::profile::ProfileError;
+
+    fn install(
+        &mut self,
+        store: super::egress_reply::Store,
+        target: LocalTarget<'_>,
+    ) -> Result<(), Self::Error> {
+        match store {
+            super::egress_reply::Store::Session => {
+                add_runtime_grant(
+                    self.store,
+                    target.principal,
+                    target.capsule,
+                    target.host,
+                    target.port,
+                );
+                Ok(())
+            },
+            super::egress_reply::Store::Profile => {
+                let (cache, snapshot) = self
+                    .profile
+                    .as_ref()
+                    .ok_or_else(|| Self::Error::Invalid("egress profile unavailable".into()))?;
+                cache.persist_egress_for_profile(
+                    target.principal,
+                    target.capsule,
+                    &target.endpoint(),
+                    Some(snapshot),
+                )
+            },
+        }
+    }
 }
 
 fn event_principal(event: &AstridEvent) -> Option<&str> {
@@ -344,7 +393,13 @@ impl HostState {
         // The grant is scoped to THIS capsule: a grant for capsule A reaching
         // H:P must never exempt capsule B reaching H:P for the same principal.
         let capsule_id = self.capsule_id.to_string();
-        let endpoint = format!("{host}:{port}");
+        let target = LocalTarget {
+            principal: &principal,
+            capsule: &capsule_id,
+            host,
+            port,
+        };
+        let endpoint = target.endpoint();
 
         let mut audit = super::approval_audit::ApprovalAudit::new(
             self,
@@ -364,7 +419,7 @@ impl HostState {
                 audit.denied("profile", "principal disabled");
                 return false;
             }
-            Some(profile)
+            Some((cache.as_ref(), profile))
         } else {
             None
         };
@@ -385,7 +440,7 @@ impl HostState {
         // This short-circuits only the ELICIT — the origin gate and SSRF airlock
         // upstream still bind (we are only reached on a `LocalSocket`,
         // airlock-rejected IP-literal endpoint).
-        if let Some(profile) = &admitted_profile
+        if let Some((_, profile)) = &admitted_profile
             && has_persisted_grant(profile, &capsule_id, host, port)
         {
             tracing::debug!(
@@ -401,7 +456,7 @@ impl HostState {
 
         // 4. ELICIT. Publish `ApprovalRequired` and block for the response.
         let decision = self.elicit_egress_consent(&principal, &endpoint, &mut audit);
-        if let (Some(cache), Some(admitted)) = (&self.profile_cache, &admitted_profile)
+        if let Some((cache, admitted)) = &admitted_profile
             && !cache
                 .resolve(&principal)
                 .is_ok_and(|current| std::sync::Arc::ptr_eq(admitted, &current))
@@ -409,7 +464,25 @@ impl HostState {
             audit.denied("profile", "principal profile changed during consent");
             return false;
         }
-        match classify_decision(&decision) {
+        let mut writer = GrantWriter {
+            store: &store,
+            profile: admitted_profile,
+        };
+        let outcome = match super::egress_reply::apply(
+            decision.as_bytes(),
+            writer.profile.is_some(),
+            target,
+            &mut writer,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::warn!(security_event = true, %principal, %endpoint, %error,
+                    "could not persist local egress approval");
+                audit.denied("profile", "could not persist egress approval");
+                return false;
+            },
+        };
+        match outcome {
             Decision::Deny => {
                 audit.denied("user", "not approved");
                 tracing::info!(
@@ -436,7 +509,6 @@ impl HostState {
                 true
             },
             Decision::Session => {
-                add_runtime_grant(&store, &principal, &capsule_id, host, port);
                 tracing::info!(
                     security_event = true,
                     capsule_id = %self.capsule_id.as_str(),
@@ -448,21 +520,6 @@ impl HostState {
                 true
             },
             Decision::Always => {
-                if let Some(cache) = self.profile_cache.as_ref() {
-                    if let Err(error) = cache.persist_egress_for_profile(
-                        &principal,
-                        &capsule_id,
-                        &endpoint,
-                        admitted_profile.as_ref(),
-                    ) {
-                        tracing::warn!(security_event = true, %principal, %endpoint, %error,
-                            "could not persist local egress approval");
-                        audit.denied("profile", "could not persist egress approval");
-                        return false;
-                    }
-                } else {
-                    add_runtime_grant(&store, &principal, &capsule_id, host, port);
-                }
                 tracing::info!(
                     security_event = true,
                     capsule_id = %self.capsule_id.as_str(),
