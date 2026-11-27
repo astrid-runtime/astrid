@@ -30,6 +30,13 @@ fn removing_system_owner_revokes_every_dependent_view() {
         .unwrap();
     let survivor = registry.get_for(&alice, &sibling).unwrap();
 
+    let legacy = Uuid::new_v4();
+    let second_alias = Uuid::new_v4();
+    let survivor_alias = Uuid::new_v4();
+    registry.register_instance_uuid(legacy, artifact.clone());
+    registry.register_instance_uuid(second_alias, artifact.clone());
+    registry.register_instance_uuid(survivor_alias, test_hash("peer-bytes"));
+
     let retiring_generation = registry.runtime_id_for(&owner, &id).unwrap();
     let retiring_handle = registry.get_for(&owner, &id).unwrap();
     let departing_source = registry.source_id_for(&owner, &id).unwrap();
@@ -44,6 +51,7 @@ fn removing_system_owner_revokes_every_dependent_view() {
     }
     let detached = registry.unregister_for(&bob, &id).unwrap();
     assert!(!detached.torn_down);
+    assert_eq!(registry.legacy_uuid_map.get(&legacy), Some(&artifact));
     assert!(
         registry
             .find_instance_by_uuid_for(&bob, &departing_source)
@@ -59,6 +67,14 @@ fn removing_system_owner_revokes_every_dependent_view() {
     registry.register_existing(&id, &artifact, &bob).unwrap();
     let removed = registry.unregister_for(&owner, &id).unwrap();
     assert!(removed.torn_down);
+    assert!(!registry.legacy_uuid_map.contains_key(&legacy));
+    assert!(!registry.legacy_uuid_map.contains_key(&second_alias));
+    assert!(Arc::ptr_eq(
+        &registry
+            .find_instance_by_uuid_for(&alice, &survivor_alias)
+            .unwrap(),
+        &survivor,
+    ));
     assert!(registry.find_by_uuid(&departing_source).is_none());
     assert_eq!(registry.find_by_uuid(&surviving_source), Some(&sibling));
     assert!(!registry.instances.contains_key(&retiring_generation));

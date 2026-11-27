@@ -609,16 +609,11 @@ impl CapsuleRegistry {
     /// Whether any runtime currently uses this immutable artifact hash.
     #[must_use]
     pub fn contains_hash(&self, hash: &WasmHash) -> bool {
-        self.instances
-            .keys()
-            .any(|runtime_id| runtime_id.key().artifact() == hash)
+        dependent_views::uses_artifact(&self.instances, hash)
     }
 
     fn remove_legacy_uuid_mappings_if_unused(&mut self, artifact: &WasmHash) {
-        if !self.contains_hash(artifact) {
-            self.legacy_uuid_map
-                .retain(|_, mapped_artifact| mapped_artifact != artifact);
-        }
+        dependent_views::prune_legacy(&mut self.legacy_uuid_map, &self.instances, artifact);
     }
 
     /// Get a shared reference to a capsule by ID.

@@ -33,6 +33,15 @@ def defects():
             lambda s, a=clause: replace_once(s, a, "false ==> " + a),
             Path("verification/hosted_registry_lookup.rs"),
         )
+    for name, clause, weaker in [
+        ("can discard a shared artifact", "old(legacy)@\n        } else { kept(old(legacy)@,*artifact) }", "final(legacy)@\n        } else { kept(old(legacy)@,*artifact) }"),
+        ("can retain an unused artifact", "else { kept(old(legacy)@,*artifact) }", "else { final(legacy)@ }"),
+    ]:
+        yield (
+            f"legacy source departure {name}", sweep,
+            lambda s, a=clause, b=weaker: replace_once(s, a, b),
+            Path("verification/hosted_registry_lookup.rs"),
+        )
     installed = "final(instances)@ == if tear_down { old(instances)@.remove(*runtime) } else { old(instances)@ }"
     for name, clause in [
         ("can forget to remove the selected generation", "tear_down || final(instances)@ == old(instances)@"),

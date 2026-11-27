@@ -6,6 +6,7 @@ use vstd::prelude::*;
 use vstd::{
     laws_eq::obeys_concrete_eq,
     pervasive::obeys_clone_eq,
+    std_specs::iter::IteratorSpec,
     std_specs::hash::{hash_map_inv, obeys_key_model},
 };
 
@@ -57,6 +58,45 @@ fn remove_generation<K: Eq + Hash + Clone,V: Eq>(view: &mut HashMap<K,V>, runtim
         }
     }
     !keys.is_empty()
+}
+
+/// Legacy UUIDs address an artifact shared by potentially distinct generations.
+pub(super) fn uses_artifact<K: Eq + Hash,A: Eq + Hash,E>(
+    instances: &HashMap<Id<K,A>,E>, artifact: &A) -> (used: bool)
+    requires hash_map_inv(instances), obeys_key_model::<Id<K,A>>(), obeys_concrete_eq::<A>(),
+    ensures used == (exists|id:Id<K,A>| instances@.contains_key(id) && id.identity().0.1 == *artifact),
+{
+    proof { reveal(obeys_concrete_eq); }
+    let mut rows = instances.iter();
+    let ghost all = rows.remaining();
+    let found = rows.any(|pair:(&Id<K,A>,&E)| -> (yes:bool)
+        ensures yes == (pair.0.identity().0.1 == *artifact),
+        { A::eq(pair.0.key().artifact(),artifact) });
+    proof {
+        if found {
+            let i = all.len() - rows.remaining().len() - 1;
+            assert(instances@.contains_key(*all[i].0));
+            assert(all[i].0.identity().0.1 == *artifact);
+        } else if exists|id:Id<K,A>| instances@.contains_key(id) && id.identity().0.1 == *artifact {
+            let id = choose|id:Id<K,A>| instances@.contains_key(id) && id.identity().0.1 == *artifact;
+            assert(all.contains((&id,&instances@[id])));
+            let i = all.index_of((&id,&instances@[id]));
+            assert(all[i].0.identity().0.1 == *artifact);
+        }
+    }
+    found
+}
+
+pub(super) fn prune_legacy<U: Eq + Hash + Clone,K: Eq + Hash,A: Eq + Hash,E>(
+    legacy: &mut HashMap<U,A>, instances: &HashMap<Id<K,A>,E>, artifact: &A)
+    requires hash_map_inv(old(legacy)), hash_map_inv(instances), obeys_key_model::<Id<K,A>>(),
+        obeys_key_model::<U>(), obeys_concrete_eq::<U>(), obeys_clone_eq::<U>(), obeys_concrete_eq::<A>(),
+    ensures hash_map_inv(final(legacy)), final(legacy)@ ==
+        if exists|id:Id<K,A>| instances@.contains_key(id) && id.identity().0.1 == *artifact {
+            old(legacy)@
+        } else { kept(old(legacy)@,*artifact) },
+{
+    if !uses_artifact(instances,artifact) { remove_generation(legacy,artifact); }
 }
 
 /// Update the principal-scoped source routes under the same registry write lock.

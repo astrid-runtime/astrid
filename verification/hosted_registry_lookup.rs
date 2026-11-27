@@ -154,9 +154,10 @@ fn detach_with_peer<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
 // A system owner's departure may affect many packages in a peer's view. The
 // report names each affected peer once and retains every different generation.
 fn remove_system_owner<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
-    instances: &mut HashMap<Id,Entry<C,u64>>, routes: &mut HashMap<(u64,u64),Id>, sources: &mut HashMap<Id,u64>, names: &mut HashMap<u64,u64>, owner: u64, package: u64)
+    instances: &mut HashMap<Id,Entry<C,u64>>, routes: &mut HashMap<(u64,u64),Id>, sources: &mut HashMap<Id,u64>, names: &mut HashMap<u64,u64>, legacy: &mut HashMap<u64,[u8;32]>, owner: u64, package: u64)
     -> (out: (Arc<C>, bool, Vec<u64>))
     requires hash_map_inv(old(views)), hash_map_inv(old(instances)), obeys_key_model::<Id>(), obeys_concrete_eq::<Id>(),
+        hash_map_inv(old(legacy)), obeys_concrete_eq::<[u8;32]>(),
         hash_map_inv(old(routes)), hash_map_inv(old(sources)), hash_map_inv(old(names)),
         obeys_key_model::<(u64,u64)>(), obeys_concrete_eq::<(u64,u64)>(), vstd::pervasive::obeys_clone_eq::<(u64,u64)>(),
         old(views)@.contains_key(owner), old(views)@[owner]@.dom() == set![package],
@@ -170,6 +171,9 @@ fn remove_system_owner<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
         let id = before[owner]@[package];
         let report = out.2@;
         &&& out.0 == old(instances)@[id].capsule && out.1
+        &&& final(legacy)@ == if exists|peer:Id| old(instances)@.remove(id).contains_key(peer)
+            && peer.identity().0.1 == id.identity().0.1 { old(legacy)@ }
+            else { crate::dependent_views::kept(old(legacy)@,id.identity().0.1) }
         &&& final(sources)@ == old(sources)@.remove(id)
         &&& final(names)@ == if old(sources)@.contains_key(id) && !old(sources)@.remove(id).values().contains(old(sources)@[id]) {
             old(names)@.remove(old(sources)@[id])
@@ -191,6 +195,7 @@ fn remove_system_owner<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,
     report.push(owner);
     let tear_down = crate::dependent_views::depart(views,instances,&id,&owner,&mut report);
     crate::dependent_views::revoke_sources(routes,sources,names,&id,&owner,tear_down);
+    if tear_down { crate::dependent_views::prune_legacy(legacy,instances,id.key().artifact()); }
     proof {
         let peers = report@.skip(1);
         assert(report@ == seq![owner] + peers);
