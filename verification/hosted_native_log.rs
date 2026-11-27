@@ -1,6 +1,8 @@
 //! Compose the native UID lookup and log admission with the locked tracker transition.
 use std::collections::HashMap;
 use vstd::{prelude::*,std_specs::hash::hash_map_inv};
+use crate::native_log_admission::Operation;
+use crate::native_log_dispatch::{DaemonPolicy,Destination,Event,Output};
 use crate::windows_append_confirmation::{Call,Failure};
 use crate::principal_invocation_state::{PrincipalInvocation,acquire,binding};
 
@@ -61,6 +63,44 @@ fn log_operation<'a>(tracker:&u64,owner:&u64,held:Option<&'a (u64,Option<u64>)>,
         }
     };
     crate::native_log_admission::admit(tracker,owner,held,covers,begin)
+}
+
+/// Compose the locked tracker decision with dispatch for a single managed file.
+/// The native resolver supplies the candidate and classifies injected files.
+fn managed_write<'a,F,R,O:Output<F,Operation<'a,(u64,Option<u64>)>,R>>(
+    output:&mut O, file:F, record:&R, policy:DaemonPolicy, tracker:u64, owner:u64,
+    held:Option<&'a (u64,Option<u64>)>, entries:HashMap<u64,PrincipalInvocation>,
+)
+    requires hash_map_inv(&entries),
+    ensures ({
+        let prior = old(output).events();
+        let after = final(output).events();
+        let covers = held matches Some(g) && *g == (tracker,Some(owner));
+        if !covers && !available(entries@,owner) {
+            after == prior.push(Event::Daemon(*record))
+        } else {
+            match after[prior.len() as int] {
+                Event::Write(f,Some(guard),line,written) => {
+                    &&& f == file && line == *record
+                    &&& match guard {
+                        Operation::Borrowed{_borrowed:g} => covers && held == Some(g),
+                        Operation::Owned{_owned:g} => !covers && available(entries@,owner) && g == (tracker,Some(owner)),
+                    }
+                    &&& {
+                        let first = prior.push(Event::Write(file,Some(guard),*record,written));
+                        after == if !written || policy is Always { first.push(Event::Daemon(*record)) } else { first }
+                    }
+                },
+                _ => false,
+            }
+        }
+    }),
+{
+    let destination = match log_operation(&tracker,&owner,held,entries) {
+        Some(guard) => Destination::Managed(file,guard),
+        None => Destination::Absent,
+    };
+    crate::native_log_dispatch::dispatch(output,&destination,record,policy);
 }
 
 /// On Unix, either exclusive creation returned this handle, or the open

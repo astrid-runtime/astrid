@@ -179,6 +179,7 @@ INPUTS = [
     Path("crates/astrid-storage/src/content/store/commit_candidate.rs"),
     Path("crates/astrid-storage/src/content/store/header_cache.rs"),
     Path("crates/astrid-storage/src/kv/tree/memo_admission.rs"),
+    Path("crates/astrid-capsule/src/engine/wasm/native_logs/dispatch.rs"),
     Path("crates/astrid-capsule/src/engine/wasm/native_logs/admission.rs"),
     Path("verification/hosted_native_log.rs"),
     Path("crates/astrid-core/src/platform_fs/windows/projection_session/append/confirmation.rs"),

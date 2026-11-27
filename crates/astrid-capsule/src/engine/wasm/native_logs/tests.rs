@@ -1,5 +1,7 @@
 //! Real first-write routing, sealed opt-in, failure and identity fencing.
 
+mod mirror;
+
 use std::cell::RefCell;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
@@ -232,13 +234,13 @@ async fn existing_history_keeps_eager_today_and_nonempty_previous_logs() {
     );
     state.deferred_logs.owner = binding.bound;
     state.capsule_log = binding.file;
-    assert!(resolve(&mut state, None).file.is_some());
+    assert!(resolve(&mut state, None).file().is_some());
     tracker.retire(&state.principal);
-    assert!(resolve(&mut state, None).file.is_none());
+    assert!(resolve(&mut state, None).file().is_none());
     tracker.resume(&state.principal);
-    assert!(resolve(&mut state, None).file.is_some());
+    assert!(resolve(&mut state, None).file().is_some());
     state.capsule_log = None;
-    assert!(resolve(&mut state, None).file.is_none());
+    assert!(resolve(&mut state, None).file().is_none());
 }
 
 #[tokio::test]
@@ -304,9 +306,9 @@ async fn already_admitted_matching_guard_can_finish_first_open_after_retirement(
     let resolved = owner
         .resolve(Some(&guard))
         .expect("admitted operation must not re-enter admission");
-    assert!(resolved.file.is_some());
-    assert!(matches!(&resolved._owner_operation,
-        Some(admission::Operation::Borrowed { _borrowed: held }) if std::ptr::eq(*held, &guard)));
+    assert!(resolved.file().is_some());
+    assert!(matches!(&resolved,
+        ResolvedLog::Managed(_, admission::Operation::Borrowed { _borrowed: held }) if std::ptr::eq(*held, &guard)));
     assert!(root.home.root().join(&owner.deferred().target).exists());
     assert_eq!(tracker.active(&state.principal), 1);
     drop(resolved);
@@ -322,11 +324,11 @@ async fn retired_pending_owner_cannot_borrow_a_different_callers_guard() {
     caller(&mut state, &alice);
     let guard = state.begin_host_operation().unwrap().unwrap();
     tracker.retire(&state.principal);
-    assert!(resolve(&mut state, Some(&guard)).file.is_none());
+    assert!(resolve(&mut state, Some(&guard)).file().is_none());
     assert!(!root.home.root().join(&owner.deferred().target).exists());
     tracker.resume(&state.principal);
     let resolved = resolve(&mut state, Some(&guard));
-    assert!(resolved.file.is_some());
+    assert!(resolved.file().is_some());
     assert_eq!(tracker.active(&state.principal), 1);
     drop(resolved);
     assert_eq!(tracker.active(&state.principal), 0);
@@ -547,8 +549,6 @@ async fn realized_file_poison_preserves_existing_tracing_fallback_behavior() {
     assert!(file.is_poisoned());
     state.log(LogLevel::Error, "fallback after poison".into());
     assert_eq!(contents(&root, &owner).lines().count(), 1);
-    // ERROR duplication and failed-write/poison routing retain the unchanged
-    // sys::log body and its existing should_emit_to_daemon_log regressions.
 }
 
 #[tokio::test]
@@ -682,8 +682,8 @@ async fn live_uid_rename_keeps_pinned_destination_and_admits_the_current_alias()
     tracker.resume(&current_alias);
     state.log(LogLevel::Info, "renamed UID still logs".into());
     let admitted = pending.resolve(None).unwrap();
-    assert!(matches!(&admitted._owner_operation,
-        Some(admission::Operation::Owned { _owned: guard }) if guard.belongs_to(&tracker, &current_alias)));
+    assert!(matches!(&admitted,
+        ResolvedLog::Managed(_, admission::Operation::Owned { _owned: guard }) if guard.belongs_to(&tracker, &current_alias)));
     drop(admitted);
     assert_eq!(pending.deferred().target, target);
     assert!(contents(&root, &pending).contains("renamed UID still logs"));
@@ -775,7 +775,7 @@ async fn warm_log_cannot_borrow_a_reused_alias_guard() {
         .unwrap();
     let peer_operation = tracker.begin(&previous).unwrap();
     tracker.retire(&current);
-    assert!(resolve(&mut state, Some(&peer_operation)).file.is_none());
+    assert!(resolve(&mut state, Some(&peer_operation)).file().is_none());
 }
 
 #[test]

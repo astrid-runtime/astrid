@@ -16,6 +16,7 @@ use super::host_state::HostState;
 use super::{PrincipalInvocationGuard, PrincipalInvocationTracker};
 
 mod admission;
+pub(super) mod dispatch;
 pub(super) mod eager;
 
 type LogFile = Arc<Mutex<File>>;
@@ -226,18 +227,8 @@ pub(super) fn install_invocation(state: &mut HostState, uid: PrincipalUid) {
     state.deferred_logs.invocation = binding.bound;
 }
 
-pub(super) struct ResolvedLog<'a> {
-    file: Option<LogFile>,
-    // A different owner's first-open/write must drain under that owner's fence,
-    // not merely under the invoking principal's already-admitted operation.
-    _owner_operation: Option<admission::Operation<'a, PrincipalInvocationGuard>>,
-}
-
-impl ResolvedLog<'_> {
-    pub(super) fn file(&self) -> Option<&Mutex<File>> {
-        self.file.as_deref()
-    }
-}
+pub(super) type ResolvedLog<'a> =
+    dispatch::Destination<LogFile, admission::Operation<'a, PrincipalInvocationGuard>>;
 
 impl BoundLog {
     fn resolve<'a>(
@@ -272,10 +263,7 @@ impl BoundLog {
                         })
                         .as_ref(),
                 };
-                Ok(opened.map(|opened| ResolvedLog {
-                    file: Some(Arc::clone(opened)),
-                    _owner_operation: Some(operation),
-                }))
+                Ok(opened.map(|opened| ResolvedLog::Managed(Arc::clone(opened), operation)))
             })
             .ok()
             .flatten()
@@ -296,7 +284,7 @@ pub(super) fn resolve<'a>(
         && matches!(pending.source, LogSource::Deferred(_))
         && let Some(resolved) = pending.resolve(admitted)
     {
-        state.invocation_capsule_log = resolved.file.clone();
+        state.invocation_capsule_log = resolved.file().cloned();
         return resolved;
     }
     if let Some(file) = &state.capsule_log {
@@ -306,13 +294,10 @@ pub(super) fn resolve<'a>(
         && matches!(pending.source, LogSource::Deferred(_))
         && let Some(resolved) = pending.resolve(admitted)
     {
-        state.capsule_log = resolved.file.clone();
+        state.capsule_log = resolved.file().cloned();
         return resolved;
     }
-    ResolvedLog {
-        file: None,
-        _owner_operation: None,
-    }
+    ResolvedLog::Absent
 }
 
 fn resolve_file<'a>(
@@ -333,15 +318,9 @@ fn resolve_file<'a>(
         // The FD stays UID-bound, but aliases and their lifecycle views can
         // change. Reuse the same live-binding admission for warm writes;
         // the initialized OnceLock performs no filesystem open or lookup.
-        return pending.resolve(admitted).unwrap_or(ResolvedLog {
-            file: None,
-            _owner_operation: None,
-        });
+        return pending.resolve(admitted).unwrap_or(ResolvedLog::Absent);
     }
-    ResolvedLog {
-        file: Some(Arc::clone(file)),
-        _owner_operation: None,
-    }
+    ResolvedLog::Explicit(Arc::clone(file))
 }
 
 pub(super) fn valid_name(capsule: &str) -> bool {

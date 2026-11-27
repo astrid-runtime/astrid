@@ -271,3 +271,19 @@ def defects():
             f"Windows append {name}", source,
             lambda s, a=old, b=new: replace_once(s, a, b), failure,
         )
+
+    source = Path("crates/astrid-capsule/src/engine/wasm/native_logs/dispatch.rs")
+    for name, old, new, failure in [
+        ("managed write drops owner guard", "output.write(file, Some(guard), record)", "output.write(file, None, record)", source),
+        ("file write may be repeated", "Destination::Explicit(file) => output.write(file, None, record),",
+         "Destination::Explicit(file) => { output.write(file, None, record); output.write(file, None, record) },", source),
+        ("failed file attempt skips daemon", "if policy.emit(written)", "if written && policy.emit(written)", source),
+        ("absent destination permits another effect", "Destination::Absent => after == prior.push(Event::Daemon(*record))",
+         "Destination::Absent => true", trace),
+        ("attempt can omit or redirect fallback", "after == if !written || policy is Always { attempted.push(Event::Daemon(*record)) } else { attempted }",
+         "after.len() >= attempted.len()", trace),
+    ]:
+        yield (
+            f"guest log dispatch {name}", source,
+            lambda s, a=old, b=new: replace_once(s, a, b), failure,
+        )

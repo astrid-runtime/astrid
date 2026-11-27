@@ -3,7 +3,7 @@ use vstd::prelude::*;
 
 verus! {
 
-pub(super) enum Operation<'a,G> {
+pub(crate) enum Operation<'a,G> {
     Borrowed { _borrowed: &'a G },
     Owned { _owned: G },
 }
