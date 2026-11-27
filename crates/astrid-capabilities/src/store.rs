@@ -487,6 +487,11 @@ impl CapabilityStore {
         retirement::fence(&mut *self.retiring_principals.write().await, principal);
     }
 
+    /// Restore a retirement fence during startup, while the store is exclusively owned.
+    pub fn restore_principal_retirement(&mut self, principal: PrincipalId) {
+        retirement::fence(self.retiring_principals.get_mut(), principal);
+    }
+
     /// Return whether new authority for `principal` is currently fenced.
     ///
     /// Lifecycle code uses this at other admission edges, such as capsule

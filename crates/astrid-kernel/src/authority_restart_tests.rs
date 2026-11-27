@@ -132,7 +132,6 @@ async fn hosted_token_revocation_and_consumption_survive_storage_reopen() {
     let (reopened, allowances) = super::authority_recovery::restore_retirement_fences(
         &snapshot, &directory, reopened, allowances,
     )
-    .await
     .unwrap();
     assert_eq!(allowances.count_for(&retiring_alias), 0);
     assert!(allowances.add_allowance(allowance).is_err());
@@ -220,7 +219,6 @@ async fn restored_fences_cover_legacy_and_renamed_reservations_in_both_stores() 
         capabilities,
         allowances,
     )
-    .await
     .unwrap();
     for (alias, expected) in cases {
         assert_eq!(capabilities.is_principal_retiring(&alias).await, expected);

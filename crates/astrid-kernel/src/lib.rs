@@ -1063,8 +1063,7 @@ impl Kernel {
             &principal_directory,
             capabilities,
             astrid_approval::AllowanceStore::new(),
-        )
-        .await?;
+        )?;
 
         // Initialize the MCP process manager with its security layer. Native
         // only — the MCP host surface belongs to the Wasmtime engine, which the
