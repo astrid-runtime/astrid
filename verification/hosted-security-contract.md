@@ -676,6 +676,10 @@ duplicate process-lifetime allowance. Direct filesystem edits, alias ownership
 across profile replacement, and the interval between consent and socket
 connection still require separate treatment.
 
+## Outbound TCP destination selection
+
+After host policy and capability checks, the TCP connector resolves the requested host and port once. Its checked selector rejects an empty answer list and rejects the whole list if any address fails the address policy or carries a different port. On success the dial callback receives the original slice in resolver order, including every candidate Tokio may try. The native adapter supplies the IP classifier and the observed socket port. This theorem covers the selection decision. DNS answer authenticity, the configured IP policy, Tokio and the OS connection, and ownership of the resulting stream across calls remain outside it.
+
 ## Native MCP network authority
 
 Native stdio MCP capsules requesting network domains or outbound TCP destinations fail during load. The process sandbox accepts only a Boolean network setting and cannot express the manifest's destination policy. Accepted native capsule configurations request networking disabled, including for uplinks. The scope of this decision is the capsule host engine. Standalone MCP server configurations and operator-selected sandbox policies require separate treatment in the hosted security argument.

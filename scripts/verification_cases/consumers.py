@@ -49,6 +49,18 @@ def consumer_defects():
             f"immediate stream access {name}", dispatch,
             lambda s, a=original, b=changed: replace_once(s, a, b), splice_trace,
         )
+    tcp = Path("crates/astrid-capsule/src/engine/wasm/host/net/destinations.rs")
+    tcp_trace = Path("verification/hosted_tcp_destinations.rs")
+    for name, original, changed in [
+        ("loses empty-answer refusal", "(out matches Err(Refusal::Empty)) == (answers.len() == 0)", "answers.len() == 0 ==> (out matches Err(Refusal::Empty))"),
+        ("loses the rejected address", "&& #[trigger] check.ensures((&answers@[i],port),false)", "&& (#[trigger] check.ensures((&answers@[i],port),false) || port == 0)"),
+        ("loses a successful address check", "==> #[trigger] check.ensures((&answers@[i],port),true)", "==> (#[trigger] check.ensures((&answers@[i],port),true) || port == 0)"),
+        ("loses the exact dial list", "out matches Ok(r) ==> dial.ensures((answers,),r)", "out matches Ok(r) ==> true"),
+    ]:
+        yield (
+            f"TCP dial {name}", tcp,
+            lambda s, a=original, b=changed: replace_once(s, a, b), tcp_trace,
+        )
     pool = Path("crates/astrid-capsule/src/engine/wasm/pool/return_policy.rs")
     pool_trace = Path("verification/hosted_pool_return.rs")
     for name, original, changed in [

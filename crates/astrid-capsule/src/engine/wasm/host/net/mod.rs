@@ -43,6 +43,7 @@ use crate::engine::wasm::host_state::{HostState, NetStream, SharedTcpListener, T
 
 pub(crate) mod client_lifecycle;
 pub(crate) use client_lifecycle::disconnect_remaining_clients;
+mod destinations;
 pub(crate) mod handshake;
 mod ingress_frame;
 pub(crate) use ingress_frame::{
@@ -768,17 +769,7 @@ impl net::Host for HostState {
                             .await
                             .map_err(|_| ErrorCode::NameUnresolvable)?
                             .collect();
-                    if addrs.is_empty() {
-                        return Err(ErrorCode::NameUnresolvable);
-                    }
-                    for addr in &addrs {
-                        if !is_safe_ip(addr.ip()) {
-                            return Err(ErrorCode::AirlockRejected);
-                        }
-                    }
-                    tokio::net::TcpStream::connect(&addrs[..])
-                        .await
-                        .map_err(map_io_err)
+                    stream::connect_resolved(&addrs, port, is_safe_ip).await
                 })
                 .await
                 .map_err(|_| ErrorCode::Timeout)

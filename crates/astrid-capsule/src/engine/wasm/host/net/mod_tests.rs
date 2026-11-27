@@ -338,3 +338,34 @@ fn loopback_bind_host_rejects_non_loopback() {
     assert!(!is_loopback_bind_host("example.com"));
     assert!(!is_loopback_bind_host(""));
 }
+
+#[tokio::test]
+async fn outbound_connect_checks_all_resolved_answers_before_dialling() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap();
+    let port = target.port();
+    let other_port = if port == u16::MAX { port - 1 } else { port + 1 };
+    let mut other = target;
+    other.set_port(other_port);
+    assert!(matches!(
+        stream::connect_resolved(&[], port, |_| true).await,
+        Err(ErrorCode::NameUnresolvable)
+    ));
+    assert!(matches!(
+        stream::connect_resolved(&[target, other], port, |_| true).await,
+        Err(ErrorCode::AirlockRejected)
+    ));
+    assert!(matches!(
+        stream::connect_resolved(&[target], port, |_| false).await,
+        Err(ErrorCode::AirlockRejected)
+    ));
+    let connection = stream::connect_resolved(&[target], port, |ip| ip == target.ip())
+        .await
+        .unwrap();
+    let (accepted, _) = listener.accept().await.unwrap();
+    assert_eq!(connection.peer_addr().unwrap(), target);
+    assert_eq!(
+        accepted.peer_addr().unwrap(),
+        connection.local_addr().unwrap()
+    );
+}
