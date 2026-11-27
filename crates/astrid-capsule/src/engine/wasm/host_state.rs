@@ -687,16 +687,11 @@ pub struct HostState {
     /// principal challenge-response (issue #45/#852) and torn down when the
     /// stream resource drops.
     ///
-    /// `Arc<DashMap>` so the binding is SHARED across a capsule's pooled
-    /// interceptor `HostState` instances exactly like [`process_tracker`](Self::process_tracker):
-    /// the same socket-owning capsule may serve a connection from a
-    /// different pooled instance than the one that accepted it. Run-loop
-    /// workers do not share this map: each worker owns a ResourceTable, so
-    /// Wasmtime `u32` reps collide across workers. Each entry
-    /// carries the verified principal AND the `key_id` of the device that
+    /// Resource reps are local to a single Store. Each binding carries the
+    /// verified principal and the key of the device that
     /// authenticated it ([`ConnectionIdentity`]) so the cap-gate can apply the
     /// device's scope as an attenuation floor on the principal's authority.
-    pub connection_principals: Arc<dashmap::DashMap<u32, ConnectionIdentity>>,
+    pub connection_principals: dashmap::DashMap<u32, ConnectionIdentity>,
     /// The verified principal of the source connection whose inbound frame is
     /// currently in flight — the ENFORCEMENT side of
     /// [`connection_principals`](Self::connection_principals) (issue #45/#852).
@@ -772,9 +767,8 @@ pub struct HostState {
     ///
     /// Distinct from [`connection_principals`](Self::connection_principals),
     /// which stores only authenticated principals (absence ⇒ `publish-as`
-    /// anonymous fallback). `Arc<DashMap>` so the binding survives drop landing
-    /// on a different pooled instance than the one that accepted.
-    pub client_connections: Arc<dashmap::DashMap<u32, astrid_core::principal::PrincipalId>>,
+    /// anonymous fallback). The owning Store pairs accept with teardown.
+    pub client_connections: dashmap::DashMap<u32, astrid_core::principal::PrincipalId>,
     /// Bound loopback TCP listeners shared across a run-loop capsule's worker
     /// Stores, keyed by `(host, port)`. When `bind_workers > 1`, each of the N
     /// worker Stores runs `run()` and calls `bind_tcp` for the same address;

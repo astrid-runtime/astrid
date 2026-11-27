@@ -137,3 +137,47 @@ async fn disconnect_is_idempotent_after_entry_removed() {
         "a second disconnect for an already-removed rep must not emit"
     );
 }
+
+#[tokio::test]
+async fn clearing_a_resource_table_disconnects_only_its_own_clients() {
+    use crate::engine::wasm::pool::clear_on_return;
+
+    let mut first = minimal_host_state(tokio::runtime::Handle::current());
+    let mut second = minimal_host_state(tokio::runtime::Handle::current());
+    second.event_bus = first.event_bus.clone();
+    let mut rx = first.event_bus.subscribe_topic_as("client.v1.*", "test");
+    let first_rep = first.resource_table.push(()).unwrap().rep();
+    let second_rep = second.resource_table.push(()).unwrap().rep();
+    assert_eq!(first_rep, second_rep);
+    for (state, rep, name) in [(&first, first_rep, "alice"), (&second, second_rep, "bob")] {
+        let principal = PrincipalId::new(name).unwrap();
+        state.bind_connection_principal(rep, principal.clone(), None);
+        register_and_emit_connect(state, rep, principal);
+        assert_eq!(
+            next_client_event(&mut rx),
+            ("client.v1.connect".into(), Some(name.into()))
+        );
+    }
+    clear_on_return(&mut first, true);
+    assert_eq!(
+        next_client_event(&mut rx),
+        ("client.v1.disconnect".into(), Some("alice".into()))
+    );
+    assert!(first.connection_principals.is_empty());
+    assert_eq!(
+        second
+            .connection_principals
+            .get(&second_rep)
+            .unwrap()
+            .principal
+            .as_str(),
+        "bob"
+    );
+    clear_on_return(&mut first, true);
+    assert!(rx.try_recv().is_none());
+    clear_on_return(&mut second, true);
+    assert_eq!(
+        next_client_event(&mut rx),
+        ("client.v1.disconnect".into(), Some("bob".into()))
+    );
+}

@@ -162,6 +162,59 @@ async fn framed_read_records_then_clears_verified_ingress_principal() {
     );
 }
 
+/// Exercise stamp lifetime through the production host calls. Reacquire a
+/// frame before each operation so every check starts with live credentials.
+#[tokio::test(flavor = "multi_thread")]
+async fn ingress_stamp_expires_at_each_new_read_and_at_connection_drop() {
+    use crate::engine::wasm::test_fixtures::minimal_host_state;
+    use tokio::io::AsyncWriteExt;
+
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.has_uplink_capability = true;
+    let Some((stream, mut peer)) = framed_test_stream_pair().await else {
+        return;
+    };
+    assert!(state.reserve_net_stream());
+    let rep = state.resource_table.push(stream).unwrap().rep();
+    state.bind_connection_principal(
+        rep,
+        astrid_core::PrincipalId::new("operator").unwrap(),
+        Some("device".into()),
+    );
+    for operation in [
+        "invalid framed read",
+        "invalid byte read",
+        "stream half",
+        "drop",
+    ] {
+        peer.write_all(&[0, 0, 0, 1, 42]).await.unwrap();
+        assert!(matches!(
+            HostTcpStream::read(&mut state, Resource::new_borrow(rep)),
+            Ok(NetReadStatus::Data(_))
+        ));
+        assert!(state.ingress_request_owner.is_some());
+        match operation {
+            "invalid framed read" => {
+                assert!(HostTcpStream::read(&mut state, Resource::new_borrow(u32::MAX)).is_err())
+            },
+            "invalid byte read" => assert!(
+                HostTcpStream::read_bytes(&mut state, Resource::new_borrow(u32::MAX), 1).is_err()
+            ),
+            "stream half" => {
+                let _ = HostTcpStream::read_stream(&mut state, Resource::new_borrow(rep));
+            },
+            "drop" => {
+                HostTcpStream::drop(&mut state, Resource::new_own(rep)).unwrap();
+            },
+            _ => unreachable!(),
+        }
+        assert!(state.ingress_principal.is_none(), "{operation}");
+        assert!(state.ingress_device_key_id.is_none(), "{operation}");
+        assert!(state.ingress_request_owner.is_none(), "{operation}");
+        assert!(state.ingress_origin.is_none(), "{operation}");
+    }
+}
+
 /// A non-uplink capsule never records an ingress principal even when it
 /// reads a (hypothetically) bound stream — the gate keeps the registry
 /// lookup off every non-uplink framed read and prevents any cross-capsule

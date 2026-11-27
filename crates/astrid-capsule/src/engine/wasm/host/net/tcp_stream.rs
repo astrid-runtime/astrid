@@ -56,6 +56,7 @@ use crate::engine::wasm::host::util;
 
 impl HostTcpStream for HostState {
     fn read(&mut self, self_: Resource<TcpStream>) -> Result<NetReadStatus, ErrorCode> {
+        self.clear_ingress_frame();
         let stream = net_stream(&self.resource_table, self_.rep())?;
         let rt = self.runtime_handle.clone();
         let sem = self.blocking_semaphore.clone();
@@ -83,64 +84,41 @@ impl HostTcpStream for HostState {
             // Closed terminates the read loop cleanly.
             None => Ok(NetReadStatus::Closed),
         };
-        // ENFORCEMENT side of the per-connection identity registry
-        // (issue #45/#852): when this framed read pulls a client frame off a
-        // kernel-bound connection, record that connection's verified principal
-        // AND the device key_id that authenticated it, so the uplink's
-        // subsequent `publish-as` stamps THAT principal in place of the
-        // capsule-supplied name (the self-stamp fix) and THAT device's key_id
-        // so the kernel cap-gate can apply the device's scope. A non-data read
-        // (closed / pending) clears BOTH in lockstep, so a stale principal or
-        // device id can never leak onto a later forward. Gated on the uplink
-        // capability: only the uplink forwards client frames, and only its
-        // accept path ever binds an entry, so a non-uplink read stays inert
-        // and skips the registry lookup.
-        if self.has_uplink_capability {
-            let bound = match &result {
-                Ok(NetReadStatus::Data(_)) => self
-                    .connection_principals
-                    .get(&self_.rep())
-                    .map(|entry| entry.clone()),
-                _ => None,
-            };
-            match bound {
-                Some(identity) => {
-                    // Record which capsule earned the LocalSocket stamp. The
-                    // downstream egress-consent gate trusts LocalSocket as "the
-                    // local operator"; that trust holds ONLY while this stamp is
-                    // reachable solely from the uplink capsule (the
-                    // `has_uplink_capability` gate above). Surfacing the
-                    // capsule_id here makes an unexpected stamper — a non-uplink
-                    // capsule that somehow earned the capability — observable in
-                    // the audit trail rather than silent. Emit before the move
-                    // below so the verified principal is still borrowable.
-                    tracing::debug!(
-                        target: "astrid.audit.net",
-                        capsule_id = %self.capsule_id.as_str(),
-                        principal = %identity.principal,
-                        "tcp-stream.read stamped LocalSocket origin (uplink-gated)"
-                    );
-                    self.ingress_principal = Some(identity.principal);
-                    self.ingress_device_key_id = identity.device_key_id;
-                    self.ingress_request_owner = Some(identity.request_owner);
-                    // A data frame off a kernel-BOUND (handshake-verified)
-                    // connection is the positive local-operator signal: stamp
-                    // the transport origin so a `publish-as` forward carries it
-                    // to the egress site. An UNBOUND connection never reaches
-                    // this arm (it has no ConnectionIdentity → `bound` is None),
-                    // so it stays `System` (fail-closed, non-local) — parallel
-                    // to the `anonymous` principal an unbound forward earns.
-                    self.ingress_origin = Some(astrid_events::ipc::MessageOrigin::LocalSocket);
-                },
-                None => {
-                    self.ingress_principal = None;
-                    self.ingress_device_key_id = None;
-                    self.ingress_request_owner = None;
-                    // Cleared in LOCKSTEP so a stale local origin can never leak
-                    // onto a later forward off a closed/pending/unbound read.
-                    self.ingress_origin = None;
-                },
-            }
+        let binding = self
+            .connection_principals
+            .get(&self_.rep())
+            .map(|entry| entry.clone());
+        if let Some(identity) = super::ingress_frame::select(
+            self.has_uplink_capability,
+            matches!(&result, Ok(NetReadStatus::Data(_))),
+            binding,
+        ) {
+            // Record which capsule earned the LocalSocket stamp. The
+            // downstream egress-consent gate trusts LocalSocket as "the
+            // local operator"; that trust holds ONLY while this stamp is
+            // reachable solely from the uplink capsule (the
+            // `has_uplink_capability` gate above). Surfacing the
+            // capsule_id here makes an unexpected stamper — a non-uplink
+            // capsule that somehow earned the capability — observable in
+            // the audit trail rather than silent. Emit before the move
+            // below so the verified principal is still borrowable.
+            tracing::debug!(
+                target: "astrid.audit.net",
+                capsule_id = %self.capsule_id.as_str(),
+                principal = %identity.principal,
+                "tcp-stream.read stamped LocalSocket origin (uplink-gated)"
+            );
+            self.ingress_principal = Some(identity.principal);
+            self.ingress_device_key_id = identity.device_key_id;
+            self.ingress_request_owner = Some(identity.request_owner);
+            // A data frame off a kernel-BOUND (handshake-verified)
+            // connection is the positive local-operator signal: stamp
+            // the transport origin so a `publish-as` forward carries it
+            // to the egress site. An UNBOUND connection never reaches
+            // this arm (it has no ConnectionIdentity → `bound` is None),
+            // so it stays `System` (fail-closed, non-local) — parallel
+            // to the `anonymous` principal an unbound forward earns.
+            self.ingress_origin = Some(astrid_events::ipc::MessageOrigin::LocalSocket);
         }
         let bytes = match &result {
             Ok(NetReadStatus::Data(d)) => d.len() as u64,
@@ -204,6 +182,7 @@ impl HostTcpStream for HostState {
         self_: Resource<TcpStream>,
         max_bytes: u32,
     ) -> Result<Vec<u8>, ErrorCode> {
+        self.clear_ingress_frame();
         let stream = net_stream(&self.resource_table, self_.rep())?;
         let rt = self.runtime_handle.clone();
         let sem = self.blocking_semaphore.clone();
@@ -501,6 +480,7 @@ impl HostTcpStream for HostState {
     }
 
     fn read_stream(&mut self, _self_: Resource<TcpStream>) -> Resource<InputStream> {
+        self.clear_ingress_frame();
         // Real adapter (wasmtime-wasi-io InputStream impl over our
         // NetStream) lands with the stream-half commit. Closed-on-read
         // sentinel until then — capsules use read / read-bytes
@@ -518,9 +498,17 @@ impl HostTcpStream for HostState {
         if self
             .resource_table
             .delete::<NetStream>(Resource::new_own(table_rep))
-            .is_ok()
+            .is_err()
         {
-            self.release_net_stream();
+            return Ok(());
+        }
+        self.release_net_stream();
+        if self
+            .connection_principals
+            .get(&table_rep)
+            .is_some_and(|identity| Some(identity.request_owner) == self.ingress_request_owner)
+        {
+            self.clear_ingress_frame();
         }
         // Drop any verified per-connection principal binding (issue #45/#852)
         // so the registry does not leak entries for closed connections. A
