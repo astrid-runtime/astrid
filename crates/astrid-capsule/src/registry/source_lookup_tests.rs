@@ -315,3 +315,49 @@ fn replacement_keeps_the_old_source_name_until_its_last_generation_leaves()
     assert_eq!(registry.find_by_uuid(&new_source), Some(&package));
     Ok(())
 }
+
+#[test]
+fn reserved_replacement_binds_the_owner_uid_and_current_package_slot()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut registry = CapsuleRegistry::new();
+    let package = CapsuleId::from_static("replace-owner");
+    let capsule = || Box::new(MockCapsule::new("replace-owner"));
+    let owner = pid("owner");
+    let peer = pid("peer");
+    let current =
+        registry.register_principal_runtime(capsule(), test_hash("old"), &owner, uid(1))?;
+    let reserved = registry.reserve_runtime_id(
+        package.clone(),
+        test_hash("new"),
+        RuntimeScope::Principal(uid(1)),
+    )?;
+    let original = registry.get_for(&owner, &package).unwrap();
+    for (caller, admitted_uid) in [(&owner, uid(2)), (&peer, uid(1))] {
+        assert!(
+            registry
+                .replace_principal_runtime_reserved(
+                    &current,
+                    capsule(),
+                    reserved.clone(),
+                    caller,
+                    admitted_uid
+                )
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(
+            &original,
+            &registry.get_for(&owner, &package).unwrap()
+        ));
+        assert!(!registry.instances.contains_key(&reserved));
+    }
+    let replaced = registry.replace_principal_runtime_reserved(
+        &current,
+        capsule(),
+        reserved.clone(),
+        &owner,
+        uid(1),
+    )?;
+    assert_eq!(replaced.runtime_id, reserved);
+    assert!(Arc::ptr_eq(&original, &replaced.previous));
+    Ok(())
+}

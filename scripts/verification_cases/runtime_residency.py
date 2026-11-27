@@ -124,6 +124,17 @@ def defects():
             lambda s, a=clause: replace_once(s, a, "true" if "if exists" not in a else "false ==> " + a),
             Path("verification/hosted_registry_lookup.rs"),
         )
+    for name, clause, weakened in [
+        ("can admit a foreign reservation", "decision == Err(PrincipalRefusal::Reservation)", "true"),
+        ("can admit a provider", "Err(PrincipalRefusal::Uplink)\n        } else if", "decision\n        } else if"),
+        ("can admit a stale package slot", "Err(PrincipalRefusal::Superseded)\n        } else { Ok(()) }",
+         "decision\n        } else { Ok(()) }"),
+    ]:
+        yield (
+            f"principal replacement preflight {name}", replacement,
+            lambda s, a=clause, b=weakened: replace_once(s, a, b),
+            Path("verification/hosted_registry_lookup.rs"),
+        )
     route_domain = "final(routes)@.contains_key(key) ==\n            ((old(routes)"
     route_value = "forall|key:(U,P)| final(routes)@.contains_key(key) ==> #[trigger] final(routes)@[key] ==\n            if key.0 == source && final(views)@"
     for name, clause, weakened in [

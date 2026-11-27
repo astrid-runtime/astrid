@@ -402,6 +402,47 @@ fn route_replacement<C: ?Sized>(instances: &mut HashMap<Id,Entry<C,u64>>,
     Some((old_handle,new_handle))
 }
 
+// Bind the principal preflight to the six-map publication and an actual scoped lookup.
+fn publish_principal_if_current<C: ?Sized>(instances:&mut HashMap<Id,Entry<C,u64>>,
+    views:&mut HashMap<u64,HashMap<u64,Id>>, routes:&mut HashMap<(u64,u64),Id>,
+    sources:&mut HashMap<Id,u64>, names:&mut HashMap<u64,u64>, aliases:&mut HashMap<u64,[u8;32]>,
+    principal:u64, uid:u64, package:u64, expected:&Id, reserved:&Id, source:u64, replacement:Arc<C>, provides:bool)
+    -> (result:Result<Option<Arc<C>>,crate::generation_replacement::PrincipalRefusal>)
+    requires hash_map_inv(old(instances)), hash_map_inv(old(views)), hash_map_inv(old(routes)),
+        hash_map_inv(old(sources)), hash_map_inv(old(names)), hash_map_inv(old(aliases)),
+        forall|p:u64| old(views)@.contains_key(p) ==> hash_map_inv(&old(views)@[p]),
+        obeys_key_model::<Id>(), obeys_concrete_eq::<Id>(), vstd::pervasive::obeys_clone_eq::<Id>(),
+        obeys_key_model::<(u64,u64)>(), obeys_concrete_eq::<(u64,u64)>(), vstd::pervasive::obeys_clone_eq::<(u64,u64)>(),
+        obeys_concrete_eq::<RuntimeScope>(), obeys_concrete_eq::<[u8;32]>(),
+    ensures ({
+        let authorized = reserved.identity().0.2 == RuntimeScope::Principal(uid) && reserved.identity().0.0 == package &&
+            !provides && expected.identity().0.2 == RuntimeScope::Principal(uid) &&
+            view_lookup::slot(old(views)@,principal,package) == Some(*expected);
+        &&& result.is_ok() == authorized
+        &&& if authorized && old(instances)@.contains_key(*expected) {
+            &&& result == Ok(Some(replacement))
+            &&& final(instances)@[*reserved].owner_alias == Some(principal)
+            &&& final(views)@[principal]@[package] == *reserved
+            &&& final(routes)@[(source,principal)] == *reserved
+        } else {
+            &&& authorized ==> result == Ok(None)
+            &&& final(instances)@ == old(instances)@ && final(views)@ == old(views)@ && final(routes)@ == old(routes)@
+            &&& final(sources)@ == old(sources)@ && final(names)@ == old(names)@ && final(aliases)@ == old(aliases)@
+        }
+    }),
+{
+    crate::generation_replacement::admit_principal(views,&principal,&package,uid,expected,reserved,
+        || -> (out:bool) ensures out == provides, { provides })?;
+    let publication = crate::generation_replacement::Replacement {
+        expected, reserved, source, entry:Entry { capsule:replacement, owner_alias:Some(principal) }
+    };
+    if publication.apply(instances,views,routes,sources,names,aliases).is_none() { return Ok(None); }
+    assert(views@[principal]@[package] == *reserved);
+    assert(views@[principal]@.values().contains(*reserved));
+    assert(routes@.contains_key((source,principal)));
+    Ok(crate::source_lookup::capsule_for(routes,aliases,instances,views,(source,principal)))
+}
+
 // Bind a selected shared generation to one principal, including its exact
 // installed handle. A miss cannot publish a route to a principal-owned runtime.
 fn select_and_publish_shared<C: ?Sized>(views: &mut HashMap<u64,HashMap<u64,Id>>,

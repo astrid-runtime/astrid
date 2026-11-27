@@ -14,6 +14,43 @@ type Id<K, A> = RuntimeId<K, A, RuntimeScope>;
 verus! {
 broadcast use vstd::std_specs::hash::group_hash_axioms;
 
+pub(super) enum PrincipalRefusal {
+    Reservation,
+    Uplink,
+    Superseded,
+}
+
+/// Check the reserved scope, candidate package and principal's current slot in error-reporting order.
+pub(super) fn admit_principal<K: Eq + Hash,A: Eq + Hash,P: Eq + Hash,F: FnOnce() -> bool>(
+    views: &HashMap<P,HashMap<K,Id<K,A>>>, principal: &P, package: &K, uid: super::PrincipalUid,
+    expected: &Id<K,A>, reserved: &Id<K,A>, has_uplinks: F)
+    -> (decision:Result<(),PrincipalRefusal>)
+    requires has_uplinks.requires(()), hash_map_inv(views), views@.contains_key(*principal) ==> hash_map_inv(&views@[*principal]),
+        obeys_key_model::<P>(), obeys_concrete_eq::<P>(), obeys_key_model::<K>(), obeys_concrete_eq::<K>(),
+        obeys_concrete_eq::<Id<K,A>>(), obeys_concrete_eq::<RuntimeScope>(),
+    ensures if reserved.identity().0.2 != RuntimeScope::Principal(uid) || reserved.identity().0.0 != *package {
+        decision == Err(PrincipalRefusal::Reservation)
+    } else {
+        exists|provides:bool| #[trigger] has_uplinks.ensures((),provides) && decision == if provides {
+            Err(PrincipalRefusal::Uplink)
+        } else if expected.identity().0.2 != RuntimeScope::Principal(uid) ||
+            super::view_lookup::slot(views@,*principal,*package) != Some(*expected) {
+            Err(PrincipalRefusal::Superseded)
+        } else { Ok(()) }
+    },
+{
+    proof { reveal(obeys_concrete_eq); }
+    let scope = RuntimeScope::Principal(uid);
+    if !RuntimeScope::eq(&reserved.key().scope(),&scope) || !K::eq(reserved.key().capsule_id(),package) {
+        return Err(PrincipalRefusal::Reservation);
+    }
+    if has_uplinks() { return Err(PrincipalRefusal::Uplink); }
+    if !RuntimeScope::eq(&expected.key().scope(),&scope) || !super::view_lookup::current(views,principal,package,expected) {
+        return Err(PrincipalRefusal::Superseded);
+    }
+    Ok(())
+}
+
 pub(super) struct Replacement<'a,K,A,P,U,C: ?Sized> {
     pub(super) expected: &'a Id<K,A>,
     pub(super) reserved: &'a Id<K,A>,

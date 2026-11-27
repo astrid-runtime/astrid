@@ -48,26 +48,33 @@ impl CapsuleRegistry {
         principal: &PrincipalId,
         uid: PrincipalUid,
     ) -> CapsuleResult<ReplacedRuntime> {
-        let id = replacement.id().clone();
-        if runtime_id.key().scope() != RuntimeScope::Principal(uid)
-            || runtime_id.key().capsule_id() != &id
-        {
-            return Err(CapsuleError::ExecutionFailed(format!(
-                "reserved runtime identity does not match principal replacement '{id}'"
-            )));
-        }
-        if !replacement.manifest().uplinks.is_empty() {
-            return Err(CapsuleError::UnsupportedEntryPoint(format!(
-                "uplink capsule '{id}' requires explicit system runtime scope"
-            )));
-        }
-        if expected.key().scope() != RuntimeScope::Principal(uid)
-            || !self.is_current_runtime(principal, &id, expected)
-        {
-            return Err(CapsuleError::ExecutionFailed(format!(
-                "runtime generation changed before replacing '{id}' for '{principal}'"
-            )));
-        }
+        let id = replacement.id();
+        super::generation_replacement::admit_principal(
+            &self.views,
+            principal,
+            id,
+            uid,
+            expected,
+            &runtime_id,
+            || !replacement.manifest().uplinks.is_empty(),
+        )
+        .map_err(|reason| match reason {
+            super::generation_replacement::PrincipalRefusal::Reservation => {
+                CapsuleError::ExecutionFailed(format!(
+                    "reserved runtime identity does not match principal replacement '{id}'"
+                ))
+            },
+            super::generation_replacement::PrincipalRefusal::Uplink => {
+                CapsuleError::UnsupportedEntryPoint(format!(
+                    "uplink capsule '{id}' requires explicit system runtime scope"
+                ))
+            },
+            super::generation_replacement::PrincipalRefusal::Superseded => {
+                CapsuleError::ExecutionFailed(format!(
+                    "runtime generation changed before replacing '{id}' for '{principal}'"
+                ))
+            },
+        })?;
         self.swap_runtime(expected, runtime_id, replacement, Some(principal.clone()))
     }
 
