@@ -204,6 +204,8 @@ mod runtime_scope;
 mod runtime_generation;
 #[path = "../crates/astrid-capsule/src/registry/instance_swap.rs"]
 mod instance_swap;
+#[path = "../crates/astrid-capsule/src/registry/viewers.rs"]
+mod viewers;
 
 #[path = "../crates/astrid-capsule/src/registry/view_owner.rs"]
 mod view_owner;

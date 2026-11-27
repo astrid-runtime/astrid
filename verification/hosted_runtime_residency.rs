@@ -107,3 +107,18 @@ fn replace_view_pair(old_key: u64, new_key: u64, unrelated: u64)
     (attached, other)
 }
 }
+
+verus! {
+// A shared runtime may appear in multiple views. Reusing a capsule name with
+// a different runtime identity does not add that principal to the resume list.
+fn restart_viewers(views: &std::collections::HashMap<u64,std::collections::HashMap<u64,u64>>,
+    runtime: u64, member: u64, outsider: u64) -> (out: Vec<u64>)
+    requires vstd::std_specs::hash::hash_map_inv(views),
+        forall|p:u64| views@.contains_key(p) ==> vstd::std_specs::hash::hash_map_inv(&views@[p]),
+        views@.contains_key(member), views@[member]@.values().contains(runtime),
+        !views@.contains_key(outsider) || !views@[outsider]@.values().contains(runtime),
+    ensures out@.contains(member), !out@.contains(outsider), out@.no_duplicates(),
+{
+    crate::viewers::viewers(views, &runtime)
+}
+}

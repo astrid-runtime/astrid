@@ -310,6 +310,15 @@ fn system_generation_replacement_swaps_every_view() {
         )
         .unwrap();
     registry.register_existing(&id, &old_hash, &bob).unwrap();
+    let carol = pid("carol");
+    registry
+        .register_principal_runtime(
+            Box::new(MockCapsule::new("unrelated")),
+            test_hash("unrelated"),
+            &carol,
+            uid(3),
+        )
+        .expect("register an unrelated principal view");
     let previous = registry.get_for(&bob, &id).unwrap();
 
     let replaced = registry
@@ -320,6 +329,10 @@ fn system_generation_replacement_swaps_every_view() {
         )
         .unwrap();
 
+    let viewers = registry.principals_viewing_runtime(&replaced.runtime_id);
+    assert_eq!(viewers.len(), 2);
+    assert!(viewers.contains(&alice) && viewers.contains(&bob));
+    assert!(registry.principals_viewing_runtime(&old).is_empty());
     let current = replaced.installed(&registry).unwrap();
     assert_eq!(
         registry.runtime_id_for(&alice, &id),

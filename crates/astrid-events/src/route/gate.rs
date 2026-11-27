@@ -147,6 +147,8 @@ mod tests {
             retiree.retire();
         });
 
+        // Exercise a late publication through a clone regardless of which thread won.
+        publisher.publish();
         let replacement = RouteAdmissionGate::staged();
         replacement.publish();
         assert!(replacement.commit_guard().is_some());

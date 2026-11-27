@@ -226,10 +226,7 @@ impl CapsuleRegistry {
         let source_uuid =
             capsule_source_uuid(runtime_id.key().capsule_id(), runtime_id.key().artifact());
         for (principal, view) in &self.views {
-            if view
-                .values()
-                .any(|mapped_runtime| mapped_runtime == &runtime_id)
-            {
+            if super::viewers::attached(view, &runtime_id) {
                 self.uuid_map
                     .insert((source_uuid, principal.clone()), runtime_id.clone());
             }

@@ -5,6 +5,17 @@ from .common import GENERATION, replace_once
 
 
 def defects():
+    viewers = Path("crates/astrid-capsule/src/registry/viewers.rs")
+    for name, original, weakened in [
+        ("omits an attached principal", "out@.contains(p) <==>\n        views@", "out@.contains(p) ==>\n        views@"),
+        ("admits an unrelated principal", "out@.contains(p) <==>\n        views@", "out@.contains(p) <==\n        views@"),
+        ("repeats a principal", "ensures out@.no_duplicates(),", "ensures true,"),
+    ]:
+        yield (
+            f"restart viewer selection {name}", viewers,
+            lambda s, a=original, b=weakened: replace_once(s, a, b),
+            Path("verification/hosted_runtime_residency.rs"),
+        )
     swap = Path("crates/astrid-capsule/src/registry/instance_swap.rs")
     for name, original, weaker in [
         ("can rewrite an unrelated view", "ensures *final(slot) == if *old(slot) == *expected { *reserved } else { *old(slot) }", "ensures *old(slot) == *expected ==> *final(slot) == *reserved"),

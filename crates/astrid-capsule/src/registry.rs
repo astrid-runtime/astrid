@@ -56,6 +56,7 @@ fn system_uplink_descriptors(capsule: &dyn Capsule) -> CapsuleResult<Vec<UplinkD
 }
 
 mod instance_swap;
+mod viewers;
 type InstanceEntry = instance_swap::Entry<dyn Capsule, PrincipalId>;
 
 /// Outcome of removing one principal's runtime view.
@@ -912,11 +913,7 @@ impl CapsuleRegistry {
     /// Every alias whose view targets this exact runtime generation.
     #[must_use]
     pub fn principals_viewing_runtime(&self, runtime_id: &RuntimeId) -> Vec<PrincipalId> {
-        self.views
-            .iter()
-            .filter(|(_, view)| view.values().any(|candidate| candidate == runtime_id))
-            .map(|(principal, _)| principal.clone())
-            .collect()
+        viewers::viewers(&self.views, runtime_id)
     }
 
     /// Snapshot of cloned `Arc` handles visible to `principal`.
