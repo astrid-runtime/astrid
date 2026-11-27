@@ -1333,6 +1333,37 @@ async fn dirty_tracks_only_successfully_acknowledged_unsynced_mutations() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revoke_drains_an_in_flight_mutation_and_fences_new_mutation() {
+    check_worker_drain(WorkerCase::Write).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_drains_a_worker_after_its_waiter_is_cancelled() {
+    check_worker_drain(WorkerCase::CancelledWrite).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_drains_administrative_sync_after_its_waiter_is_cancelled() {
+    check_worker_drain(WorkerCase::CancelledAdminSync).await;
+}
+
+#[derive(Clone, Copy)]
+enum WorkerCase {
+    Write,
+    CancelledWrite,
+    CancelledAdminSync,
+}
+
+fn hold_worker(state: &StorageMountLeaseState) -> Arc<MutationTestGate> {
+    let gate = Arc::new(MutationTestGate {
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    *state.mutation_test_gate.lock().unwrap() = Some(Arc::clone(&gate));
+    gate
+}
+
+async fn check_worker_drain(case: WorkerCase) {
+    let sync = matches!(case, WorkerCase::CancelledAdminSync);
     let temporary = tempfile::tempdir().unwrap();
     let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
     let kernel = Arc::new(crate::test_kernel_with_home(home).await);
@@ -1353,18 +1384,23 @@ async fn revoke_drains_an_in_flight_mutation_and_fences_new_mutation() {
         callback(&lease, &lease.lease_token, create("in-flight.bin")).await,
         StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done)
     );
-    sync_lease(&kernel, &caller, true, lease.mount_id)
-        .await
-        .unwrap();
+    if !sync {
+        sync_lease(&kernel, &caller, true, lease.mount_id)
+            .await
+            .unwrap();
+    }
     let state = Arc::clone(kernel.storage_mounts.get(&lease.mount_id).unwrap().value());
-    let gate = Arc::new(MutationTestGate {
-        entered: tokio::sync::Semaphore::new(0),
-        release: tokio::sync::Semaphore::new(0),
-    });
-    *state.mutation_test_gate.lock().unwrap() = Some(Arc::clone(&gate));
+    let gate = hold_worker(&state);
     let mutation_kernel = Arc::clone(&kernel);
     let mutation_state = Arc::clone(&state);
+    let worker_caller = caller.clone();
     let mutation = tokio::spawn(async move {
+        if sync {
+            sync_lease(&mutation_kernel, &worker_caller, true, lease.mount_id)
+                .await
+                .unwrap();
+            return StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done);
+        }
         execute_operation(
             &mutation_kernel,
             &mutation_state,
@@ -1377,8 +1413,19 @@ async fn revoke_drains_an_in_flight_mutation_and_fences_new_mutation() {
         .await
     });
     gate.entered.acquire().await.unwrap().forget();
-    assert_eq!(state.in_flight_mutations.load(Ordering::Acquire), 1);
-    assert!(!state.dirty.load(Ordering::Acquire));
+    assert_eq!(
+        state.in_flight_mutations.load(Ordering::Acquire),
+        u64::from(!sync)
+    );
+    assert_eq!(state.dirty.load(Ordering::Acquire), sync);
+    let waiter = match case {
+        WorkerCase::Write => Some(mutation),
+        WorkerCase::CancelledWrite | WorkerCase::CancelledAdminSync => {
+            mutation.abort();
+            assert!(mutation.await.unwrap_err().is_cancelled());
+            None
+        },
+    };
     let revocation_kernel = Arc::clone(&kernel);
     let revocation_caller = caller.clone();
     let revocation = tokio::spawn(async move {
@@ -1388,17 +1435,22 @@ async fn revoke_drains_an_in_flight_mutation_and_fences_new_mutation() {
         tokio::task::yield_now().await;
     }
     assert!(!revocation.is_finished());
-    assert_eq!(state.in_flight_mutations.load(Ordering::Acquire), 1);
+    assert!(kernel.storage_mount_mutations.try_lock().is_err());
+    assert_eq!(
+        state.in_flight_mutations.load(Ordering::Acquire),
+        u64::from(!sync)
+    );
     gate.release.add_permits(1);
 
-    let outcome = mutation.await.unwrap();
-    assert!(matches!(
-        outcome,
-        StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Written(64))
-    ));
+    if let Some(waiter) = waiter {
+        assert!(matches!(
+            waiter.await.unwrap(),
+            StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Written(64))
+        ));
+    }
     revocation.await.unwrap().unwrap();
     assert_eq!(state.in_flight_mutations.load(Ordering::Acquire), 0);
-    assert!(state.dirty.load(Ordering::Acquire));
+    assert_eq!(state.dirty.load(Ordering::Acquire), !sync);
     assert!(!kernel.storage_mounts.contains_key(&lease.mount_id));
     assert!(!lease.callback_path.exists());
     let fenced = execute_operation(&kernel, &state, create("after-revoke.txt")).await;
